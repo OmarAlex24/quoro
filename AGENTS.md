@@ -41,7 +41,7 @@ Read the ADRs that touch your task before you change anything. Maintainer coordi
 
 - Commits: `<type>: <description>`, for example `feat: add microVM start endpoint`. Types: `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `ci`.
 - PRs that belong to one plan or workstream are stacked with `gh stack`. Parallel workstreams are separate PRs.
-- Only the maintainer merges. An authorization to merge applies only to the PR the maintainer names, never as a standing rule.
+- Only the maintainer merges, or a maintainer agent the maintainer has authorized to merge. Pushing tags and creating or publishing releases always need the maintainer's explicit approval.
 - If the previous PR was already merged, start a new branch and a new PR from the updated base.
 - PR test plans contain only checked boxes: list only what you actually ran.
 - Every PR from an external contributor requires the signed CLA (see `CONTRIBUTING.md`).
