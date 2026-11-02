@@ -1,0 +1,855 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quoro.dev/schemas/events/v1.json",
+  "title": "Quoro event",
+  "description": "One Quoro event. The envelope is identical everywhere it appears: on the SSE stream (GET /api/v1/events/stream), in GET /api/v1/events, in webhook delivery bodies, and in node-agent `event` messages. A node-agent `event` message carries the same envelope without `seq`: the node assigns `id` when it emits the event, and the primary assigns `seq` on receipt, so `seq` is required for every event that a client reads from the API, the stream or a webhook. The node-agent protocol document defines that message form. The `$id` URL is a placeholder identifier; this schema is published inside the repository, not fetched from that address. Payloads are additive within schema_version 1. Id prefixes, status enums and event types are the shared vocabulary of docs/contracts/README.md; the event log is the notify step of the AI-native loop (D-0032) and the envelope carries the incident and grant context that the loop needs (D-0030, D-0031).",
+
+  "type": "object",
+  "required": ["schema_version", "id", "seq", "type", "time", "source", "subject", "data"],
+  "additionalProperties": false,
+
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "description": "Envelope version. New optional payload fields do not change it; a breaking change does."
+    },
+    "id": {
+      "$ref": "#/$defs/EventId",
+      "description": "Event id, assigned by the emitter (the control plane or the node agent)."
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Gap-free position in the event log, assigned by the primary when it accepts the event."
+    },
+    "type": {
+      "type": "string",
+      "description": "Event type, `<subject>.<what>`.",
+      "enum": [
+        "node.enrolled",
+        "node.connected",
+        "node.disconnected",
+        "node.fenced",
+        "node.disk_low",
+        "vm.created",
+        "vm.started",
+        "vm.stopped",
+        "vm.crashed",
+        "vm.deleted",
+        "app.created",
+        "app.updated",
+        "app.deleted",
+        "app.down",
+        "app.up",
+        "app.restarted",
+        "deployment.started",
+        "deployment.succeeded",
+        "deployment.failed",
+        "certificate.issued",
+        "certificate.expiring",
+        "certificate.failed",
+        "grant.created",
+        "grant.revoked",
+        "grant.expired",
+        "approval.requested",
+        "approval.approved",
+        "approval.denied",
+        "approval.expired",
+        "incident.opened",
+        "incident.resolved",
+        "audit.chain_broken"
+      ]
+    },
+    "time": { "$ref": "#/$defs/Timestamp" },
+    "source": { "$ref": "#/$defs/Source" },
+    "subject": { "$ref": "#/$defs/Subject" },
+    "project_id": { "$ref": "#/$defs/ProjectId" },
+    "incident_id": { "$ref": "#/$defs/IncidentId" },
+    "request_id": { "$ref": "#/$defs/RequestId" },
+    "actor": { "$ref": "#/$defs/Actor" },
+    "data": {
+      "type": "object",
+      "description": "Type-specific payload. The schema for this object is fixed by `type` in the allOf below."
+    }
+  },
+
+  "allOf": [
+    { "if": { "required": ["type"], "properties": { "type": { "const": "node.enrolled" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_node_enrolled" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "node.connected" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_node_connected" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "node.disconnected" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_node_disconnected" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "node.fenced" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_node_fenced" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "node.disk_low" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_node_disk_low" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "vm.created" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_vm_created" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "vm.started" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_vm_started" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "vm.stopped" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_vm_stopped" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "vm.crashed" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_vm_crashed" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "vm.deleted" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_vm_deleted" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "app.created" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_app_created" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "app.updated" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_app_updated" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "app.deleted" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_app_deleted" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "app.down" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_app_down" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "app.up" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_app_up" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "app.restarted" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_app_restarted" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "deployment.started" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_deployment_started" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "deployment.succeeded" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_deployment_succeeded" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "deployment.failed" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_deployment_failed" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "certificate.issued" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_certificate_issued" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "certificate.expiring" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_certificate_expiring" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "certificate.failed" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_certificate_failed" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "grant.created" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_grant_created" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "grant.revoked" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_grant_revoked" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "grant.expired" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_grant_expired" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "approval.requested" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_approval_requested" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "approval.approved" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_approval_approved" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "approval.denied" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_approval_denied" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "approval.expired" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_approval_expired" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "incident.opened" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_incident_opened" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "incident.resolved" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_incident_resolved" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "audit.chain_broken" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_audit_chain_broken" } } } }
+  ],
+
+  "$defs": {
+    "ClusterId": { "type": "string", "pattern": "^cls_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Cluster id (`cls_` + ULID)." },
+    "NodeId": { "type": "string", "pattern": "^nod_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Node id (`nod_` + ULID)." },
+    "NodeJoinTokenId": { "type": "string", "pattern": "^njt_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Node join token id (`njt_` + ULID)." },
+    "ProjectId": { "type": "string", "pattern": "^prj_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Project id (`prj_` + ULID)." },
+    "VmId": { "type": "string", "pattern": "^vm_[0-9A-HJKMNP-TV-Z]{26}$", "description": "VM id (`vm_` + ULID)." },
+    "AppId": { "type": "string", "pattern": "^app_[0-9A-HJKMNP-TV-Z]{26}$", "description": "App id (`app_` + ULID)." },
+    "DeploymentId": { "type": "string", "pattern": "^dep_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Deployment id (`dep_` + ULID)." },
+    "DomainId": { "type": "string", "pattern": "^dom_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Domain id (`dom_` + ULID)." },
+    "VolumeId": { "type": "string", "pattern": "^vol_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Volume id (`vol_` + ULID)." },
+    "LeaseId": { "type": "string", "pattern": "^lse_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Lease id (`lse_` + ULID)." },
+    "UserId": { "type": "string", "pattern": "^usr_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Human user id (`usr_` + ULID)." },
+    "ApiTokenId": { "type": "string", "pattern": "^tok_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Human API token id (`tok_` + ULID)." },
+    "AgentId": { "type": "string", "pattern": "^agt_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Agent id (`agt_` + ULID)." },
+    "AgentKeyId": { "type": "string", "pattern": "^akey_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Agent key id (`akey_` + ULID)." },
+    "AccessTokenId": { "type": "string", "pattern": "^atk_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Agent access token id (`atk_` + ULID)." },
+    "GrantId": { "type": "string", "pattern": "^grt_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Grant id (`grt_` + ULID)." },
+    "ApprovalId": { "type": "string", "pattern": "^apr_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Approval request id (`apr_` + ULID)." },
+    "IncidentId": { "type": "string", "pattern": "^inc_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Incident id (`inc_` + ULID)." },
+    "EventId": { "type": "string", "pattern": "^evt_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Event id (`evt_` + ULID)." },
+    "WebhookId": { "type": "string", "pattern": "^whk_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Webhook id (`whk_` + ULID)." },
+    "WebhookDeliveryId": { "type": "string", "pattern": "^whd_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Webhook delivery id (`whd_` + ULID)." },
+    "RequestId": { "type": "string", "pattern": "^req_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Correlation id of one API or MCP call (`req_` + ULID)." },
+
+    "Timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339 timestamp in UTC, for example `2026-11-02T09:15:00Z`."
+    },
+    "Hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Lowercase hex SHA-256 digest, 64 characters."
+    },
+    "Scope": {
+      "type": "string",
+      "pattern": "^(cluster|node|project|vm|app|agent|grant|approval|incident|audit|event|webhook|user):[a-z_]+$",
+      "description": "One scope, `<resource>:<verb>`; the complete list is in the contracts README."
+    },
+
+    "Source": {
+      "type": "object",
+      "description": "Where the event was emitted: the control plane itself, or a specific node.",
+      "required": ["kind"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["control_plane", "node"] },
+        "node_id": { "$ref": "#/$defs/NodeId" }
+      },
+      "additionalProperties": false
+    },
+
+    "Subject": {
+      "type": "object",
+      "description": "The resource the event is about. `type` is the resource kind in the same words the id prefixes use (node, vm, app, deployment, domain, volume, project, lease, grant, approval, incident, agent, user, cluster, webhook); `id` is that resource's id. For certificate events the subject is the domain; for audit.chain_broken it is the cluster.",
+      "required": ["type", "id"],
+      "properties": {
+        "type": { "type": "string", "pattern": "^[a-z_]+$" },
+        "id": { "type": "string", "pattern": "^[a-z]+_[0-9A-HJKMNP-TV-Z]{26}$" }
+      },
+      "additionalProperties": false
+    },
+
+    "Actor": {
+      "type": "object",
+      "description": "Who caused the change, when the event was caused by an identifiable actor. Absent for events produced by observation only.",
+      "required": ["type", "id"],
+      "properties": {
+        "type": { "type": "string", "enum": ["user", "agent", "node", "system"] },
+        "id": { "type": "string", "description": "`usr_`, `agt_` or `nod_` id; `system` for the control plane itself." }
+      },
+      "additionalProperties": false
+    },
+
+    "Selector": {
+      "type": "object",
+      "description": "Resource selector of a grant. A resource matches if it matches any listed entry; an app matches `projects` through its project. `{\"all\": true}` matches everything and `{}` matches nothing.",
+      "properties": {
+        "all": { "type": "boolean", "const": true },
+        "projects": { "type": "array", "items": { "type": "string", "pattern": "^[a-z0-9-]{1,40}$" } },
+        "apps": { "type": "array", "items": { "$ref": "#/$defs/AppId" } },
+        "nodes": { "type": "array", "items": { "$ref": "#/$defs/NodeId" } }
+      },
+      "additionalProperties": false
+    },
+
+    "NodeStatus": {
+      "type": "string",
+      "enum": ["pending", "connected", "disconnected", "fenced", "removed"]
+    },
+    "VmDesiredStatus": {
+      "type": "string",
+      "enum": ["running", "stopped"]
+    },
+    "VmObservedStatus": {
+      "type": "string",
+      "enum": ["creating", "stopped", "starting", "running", "stopping", "crashed", "deleted", "unknown"]
+    },
+    "AppStatus": {
+      "type": "string",
+      "enum": ["deploying", "running", "degraded", "down", "stopped"]
+    },
+    "DeploymentStatus": {
+      "type": "string",
+      "enum": ["pending", "preparing", "starting", "succeeded", "failed", "superseded"]
+    },
+    "DeploymentPhase": {
+      "type": "string",
+      "enum": ["pull", "rootfs", "boot", "health", "build"]
+    },
+    "CertStatus": {
+      "type": "string",
+      "enum": ["pending", "issued", "renewing", "failed", "not_applicable"]
+    },
+    "GrantStatus": {
+      "type": "string",
+      "enum": ["active", "expired", "revoked", "exhausted"]
+    },
+    "ApprovalStatus": {
+      "type": "string",
+      "enum": ["pending", "approved", "denied", "expired"]
+    },
+    "IncidentStatus": {
+      "type": "string",
+      "enum": ["open", "resolved"]
+    },
+    "LeaseMode": {
+      "type": "string",
+      "description": "Lease mode (D-0047). `local` for HA policy `none` and `cold`; `expiring` for `warm` and `hot`.",
+      "enum": ["local", "expiring"]
+    },
+    "LeaseState": {
+      "type": "string",
+      "description": "Lease state as seen by a node (node-agent protocol).",
+      "enum": ["held", "uncertain", "expired", "revoked"]
+    },
+    "WebhookDeliveryStatus": {
+      "type": "string",
+      "enum": ["pending", "delivered", "failed"]
+    },
+
+    "data_node_enrolled": {
+      "type": "object",
+      "description": "A node completed enrollment. Payload fields are additive within schema_version 1.",
+      "required": ["node_id", "name", "roles"],
+      "properties": {
+        "node_id": { "$ref": "#/$defs/NodeId" },
+        "name": { "type": "string" },
+        "roles": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["node", "witness", "edge"] }
+        },
+        "address": { "type": ["string", "null"] }
+      },
+      "additionalProperties": true
+    },
+
+    "data_node_connected": {
+      "type": "object",
+      "description": "A node's session started (D-0011). Payload fields are additive within schema_version 1.",
+      "required": ["node_id"],
+      "properties": {
+        "node_id": { "$ref": "#/$defs/NodeId" },
+        "agent_version": { "type": "string" },
+        "log_seq": { "type": "integer", "minimum": 0, "description": "Last change-log seq the node had verified when the session opened." }
+      },
+      "additionalProperties": true
+    },
+
+    "data_node_disconnected": {
+      "type": "object",
+      "description": "A node's session ended or the node missed heartbeats. Payload fields are additive within schema_version 1.",
+      "required": ["node_id", "last_seen_at", "reason"],
+      "properties": {
+        "node_id": { "$ref": "#/$defs/NodeId" },
+        "last_seen_at": { "$ref": "#/$defs/Timestamp" },
+        "reason": { "type": "string", "enum": ["session_closed", "heartbeat_timeout"] }
+      },
+      "additionalProperties": true
+    },
+
+    "data_node_fenced": {
+      "type": "object",
+      "description": "A node self-fenced its stateful apps after losing their leases (D-0019). Payload fields are additive within schema_version 1.",
+      "required": ["node_id", "app_ids", "lease_ids", "reason"],
+      "properties": {
+        "node_id": { "$ref": "#/$defs/NodeId" },
+        "app_ids": { "type": "array", "items": { "$ref": "#/$defs/AppId" } },
+        "lease_ids": { "type": "array", "items": { "$ref": "#/$defs/LeaseId" } },
+        "reason": { "type": "string", "enum": ["lease_expired", "lease_revoked"] }
+      },
+      "additionalProperties": true
+    },
+
+    "data_node_disk_low": {
+      "type": "object",
+      "description": "A node's free disk fell below its threshold (D-0032). Payload fields are additive within schema_version 1.",
+      "required": ["node_id", "free_gb", "threshold_gb"],
+      "properties": {
+        "node_id": { "$ref": "#/$defs/NodeId" },
+        "free_gb": { "type": "number", "minimum": 0 },
+        "threshold_gb": { "type": "number", "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+
+    "data_vm_created": {
+      "type": "object",
+      "description": "A VM was created. Payload fields are additive within schema_version 1.",
+      "required": ["vm_id", "node_id"],
+      "properties": {
+        "vm_id": { "$ref": "#/$defs/VmId" },
+        "node_id": { "$ref": "#/$defs/NodeId" },
+        "app_id": { "$ref": "#/$defs/AppId" }
+      },
+      "additionalProperties": true
+    },
+
+    "data_vm_started": {
+      "type": "object",
+      "description": "A VM reached `running`. Payload fields are additive within schema_version 1.",
+      "required": ["vm_id", "node_id"],
+      "properties": {
+        "vm_id": { "$ref": "#/$defs/VmId" },
+        "node_id": { "$ref": "#/$defs/NodeId" },
+        "app_id": { "$ref": "#/$defs/AppId" },
+        "ip": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "data_vm_stopped": {
+      "type": "object",
+      "description": "A VM stopped on request. Payload fields are additive within schema_version 1.",
+      "required": ["vm_id", "node_id"],
+      "properties": {
+        "vm_id": { "$ref": "#/$defs/VmId" },
+        "node_id": { "$ref": "#/$defs/NodeId" },
+        "app_id": { "$ref": "#/$defs/AppId" },
+        "exit_code": { "type": "integer" }
+      },
+      "additionalProperties": true
+    },
+
+    "data_vm_crashed": {
+      "type": "object",
+      "description": "A VM exited without being asked to stop. Payload fields are additive within schema_version 1.",
+      "required": ["vm_id", "node_id", "restart_count"],
+      "properties": {
+        "vm_id": { "$ref": "#/$defs/VmId" },
+        "node_id": { "$ref": "#/$defs/NodeId" },
+        "app_id": { "$ref": "#/$defs/AppId" },
+        "exit_code": { "type": "integer" },
+        "restart_count": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+
+    "data_vm_deleted": {
+      "type": "object",
+      "description": "A VM was deleted. Payload fields are additive within schema_version 1.",
+      "required": ["vm_id", "node_id"],
+      "properties": {
+        "vm_id": { "$ref": "#/$defs/VmId" },
+        "node_id": { "$ref": "#/$defs/NodeId" },
+        "app_id": { "$ref": "#/$defs/AppId" }
+      },
+      "additionalProperties": true
+    },
+
+    "data_app_created": {
+      "type": "object",
+      "description": "An app was created. Payload fields are additive within schema_version 1.",
+      "required": ["app_id", "project_id", "name", "image"],
+      "properties": {
+        "app_id": { "$ref": "#/$defs/AppId" },
+        "project_id": { "$ref": "#/$defs/ProjectId" },
+        "name": { "type": "string", "pattern": "^[a-z0-9-]{1,40}$" },
+        "image": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "data_app_updated": {
+      "type": "object",
+      "description": "An app's settings changed. `changed` lists the app field names that were written. Payload fields are additive within schema_version 1.",
+      "required": ["app_id", "changed"],
+      "properties": {
+        "app_id": { "$ref": "#/$defs/AppId" },
+        "changed": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": true
+    },
+
+    "data_app_deleted": {
+      "type": "object",
+      "description": "An app was deleted. Payload fields are additive within schema_version 1.",
+      "required": ["app_id", "project_id", "name"],
+      "properties": {
+        "app_id": { "$ref": "#/$defs/AppId" },
+        "project_id": { "$ref": "#/$defs/ProjectId" },
+        "name": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "data_app_down": {
+      "type": "object",
+      "description": "An app's health check failed past its threshold, or its VM crashed (D-0032). Payload fields are additive within schema_version 1.",
+      "required": ["app_id", "node_id", "check", "failures"],
+      "properties": {
+        "app_id": { "$ref": "#/$defs/AppId" },
+        "node_id": { "$ref": "#/$defs/NodeId" },
+        "vm_id": { "$ref": "#/$defs/VmId" },
+        "check": { "type": "string", "enum": ["health_check", "vm_crashed"] },
+        "failures": { "type": "integer", "minimum": 1 },
+        "last_error": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "data_app_up": {
+      "type": "object",
+      "description": "An app recovered. Payload fields are additive within schema_version 1.",
+      "required": ["app_id"],
+      "properties": {
+        "app_id": { "$ref": "#/$defs/AppId" },
+        "down_since": { "$ref": "#/$defs/Timestamp" }
+      },
+      "additionalProperties": true
+    },
+
+    "data_app_restarted": {
+      "type": "object",
+      "description": "An app's instances were restarted. `restart_generation` is the new value of the app's counter. Payload fields are additive within schema_version 1.",
+      "required": ["app_id", "restart_generation"],
+      "properties": {
+        "app_id": { "$ref": "#/$defs/AppId" },
+        "restart_generation": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+
+    "data_deployment_started": {
+      "type": "object",
+      "description": "A deployment began. Payload fields are additive within schema_version 1.",
+      "required": ["deployment_id", "app_id", "image", "trigger"],
+      "properties": {
+        "deployment_id": { "$ref": "#/$defs/DeploymentId" },
+        "app_id": { "$ref": "#/$defs/AppId" },
+        "image": { "type": "string" },
+        "trigger": { "type": "string", "enum": ["api", "redeploy", "rollback", "build"] }
+      },
+      "additionalProperties": true
+    },
+
+    "data_deployment_succeeded": {
+      "type": "object",
+      "description": "A deployment's instances are healthy. Payload fields are additive within schema_version 1.",
+      "required": ["deployment_id", "app_id"],
+      "properties": {
+        "deployment_id": { "$ref": "#/$defs/DeploymentId" },
+        "app_id": { "$ref": "#/$defs/AppId" },
+        "image_digest": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "data_deployment_failed": {
+      "type": "object",
+      "description": "A deployment failed at a named phase; image builds report with `phase: build` (D-0032). Payload fields are additive within schema_version 1.",
+      "required": ["deployment_id", "app_id", "phase", "error"],
+      "properties": {
+        "deployment_id": { "$ref": "#/$defs/DeploymentId" },
+        "app_id": { "$ref": "#/$defs/AppId" },
+        "phase": { "$ref": "#/$defs/DeploymentPhase" },
+        "error": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "data_certificate_issued": {
+      "type": "object",
+      "description": "A TLS certificate was obtained or renewed. Payload fields are additive within schema_version 1.",
+      "required": ["domain_id", "hostname", "expires_at"],
+      "properties": {
+        "domain_id": { "$ref": "#/$defs/DomainId" },
+        "hostname": { "type": "string" },
+        "expires_at": { "$ref": "#/$defs/Timestamp" }
+      },
+      "additionalProperties": true
+    },
+
+    "data_certificate_expiring": {
+      "type": "object",
+      "description": "A certificate expires within its warning window (D-0032). Payload fields are additive within schema_version 1.",
+      "required": ["domain_id", "hostname", "expires_at", "days_left"],
+      "properties": {
+        "domain_id": { "$ref": "#/$defs/DomainId" },
+        "hostname": { "type": "string" },
+        "expires_at": { "$ref": "#/$defs/Timestamp" },
+        "days_left": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+
+    "data_certificate_failed": {
+      "type": "object",
+      "description": "Obtaining or renewing a certificate failed. Payload fields are additive within schema_version 1.",
+      "required": ["domain_id", "hostname", "tls_mode", "error"],
+      "properties": {
+        "domain_id": { "$ref": "#/$defs/DomainId" },
+        "hostname": { "type": "string" },
+        "tls_mode": { "type": "string", "enum": ["acme", "tunnel"] },
+        "error": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "data_grant_created": {
+      "type": "object",
+      "description": "A grant was issued (D-0030). `kind` selects what authorized it: a standing grant, an incident, or an approval. Payload fields are additive within schema_version 1.",
+      "required": ["grant_id", "agent_id", "kind", "scopes", "selector", "expires_at", "on_behalf_of"],
+      "properties": {
+        "grant_id": { "$ref": "#/$defs/GrantId" },
+        "agent_id": { "$ref": "#/$defs/AgentId" },
+        "kind": { "type": "string", "enum": ["standard", "incident", "approval"] },
+        "scopes": { "type": "array", "items": { "$ref": "#/$defs/Scope" } },
+        "selector": { "$ref": "#/$defs/Selector" },
+        "expires_at": { "$ref": "#/$defs/Timestamp" },
+        "max_uses": { "type": "integer", "minimum": 1 },
+        "incident_id": { "$ref": "#/$defs/IncidentId" },
+        "approval_id": { "$ref": "#/$defs/ApprovalId" },
+        "on_behalf_of": { "$ref": "#/$defs/UserId" }
+      },
+      "additionalProperties": true
+    },
+
+    "data_grant_revoked": {
+      "type": "object",
+      "description": "A grant was revoked; the agent loses its access within seconds (D-0030). Payload fields are additive within schema_version 1.",
+      "required": ["grant_id", "agent_id", "revoked_by"],
+      "properties": {
+        "grant_id": { "$ref": "#/$defs/GrantId" },
+        "agent_id": { "$ref": "#/$defs/AgentId" },
+        "revoked_by": { "$ref": "#/$defs/UserId" },
+        "reason": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "data_grant_expired": {
+      "type": "object",
+      "description": "A grant's TTL passed (`ttl`) or its uses ran out (`max_uses`). Payload fields are additive within schema_version 1.",
+      "required": ["grant_id", "agent_id", "reason"],
+      "properties": {
+        "grant_id": { "$ref": "#/$defs/GrantId" },
+        "agent_id": { "$ref": "#/$defs/AgentId" },
+        "reason": { "type": "string", "enum": ["ttl", "max_uses"] }
+      },
+      "additionalProperties": true
+    },
+
+    "data_approval_requested": {
+      "type": "object",
+      "description": "An agent filed an approval request for a destructive action (D-0030). Payload fields are additive within schema_version 1.",
+      "required": ["approval_id", "agent_id", "scope", "target", "operation", "justification", "expires_at"],
+      "properties": {
+        "approval_id": { "$ref": "#/$defs/ApprovalId" },
+        "agent_id": { "$ref": "#/$defs/AgentId" },
+        "scope": { "$ref": "#/$defs/Scope" },
+        "target": {
+          "type": "object",
+          "required": ["type", "id"],
+          "properties": {
+            "type": { "type": "string" },
+            "id": { "type": "string" }
+          },
+          "additionalProperties": false
+        },
+        "operation": { "type": "string" },
+        "justification": { "type": "string" },
+        "incident_id": { "$ref": "#/$defs/IncidentId" },
+        "expires_at": { "$ref": "#/$defs/Timestamp" }
+      },
+      "additionalProperties": true
+    },
+
+    "data_approval_approved": {
+      "type": "object",
+      "description": "A human approved a request; `grant_id` is the short-lived extra grant issued for it. Payload fields are additive within schema_version 1.",
+      "required": ["approval_id", "agent_id", "scope", "decided_by"],
+      "properties": {
+        "approval_id": { "$ref": "#/$defs/ApprovalId" },
+        "agent_id": { "$ref": "#/$defs/AgentId" },
+        "scope": { "$ref": "#/$defs/Scope" },
+        "decided_by": { "$ref": "#/$defs/UserId" },
+        "grant_id": { "$ref": "#/$defs/GrantId" }
+      },
+      "additionalProperties": true
+    },
+
+    "data_approval_denied": {
+      "type": "object",
+      "description": "A human denied a request. Payload fields are additive within schema_version 1.",
+      "required": ["approval_id", "agent_id", "scope", "decided_by"],
+      "properties": {
+        "approval_id": { "$ref": "#/$defs/ApprovalId" },
+        "agent_id": { "$ref": "#/$defs/AgentId" },
+        "scope": { "$ref": "#/$defs/Scope" },
+        "decided_by": { "$ref": "#/$defs/UserId" },
+        "decision_note": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "data_approval_expired": {
+      "type": "object",
+      "description": "A request expired undecided. Payload fields are additive within schema_version 1.",
+      "required": ["approval_id", "agent_id", "scope"],
+      "properties": {
+        "approval_id": { "$ref": "#/$defs/ApprovalId" },
+        "agent_id": { "$ref": "#/$defs/AgentId" },
+        "scope": { "$ref": "#/$defs/Scope" }
+      },
+      "additionalProperties": true
+    },
+
+    "data_incident_opened": {
+      "type": "object",
+      "description": "A detection opened an incident and scoped the grants that follow it (D-0032). Payload fields are additive within schema_version 1.",
+      "required": ["incident_id", "title", "trigger_event_id", "subject"],
+      "properties": {
+        "incident_id": { "$ref": "#/$defs/IncidentId" },
+        "title": { "type": "string" },
+        "trigger_event_id": { "$ref": "#/$defs/EventId" },
+        "subject": { "$ref": "#/$defs/Subject" }
+      },
+      "additionalProperties": true
+    },
+
+    "data_incident_resolved": {
+      "type": "object",
+      "description": "An incident was resolved. Payload fields are additive within schema_version 1.",
+      "required": ["incident_id", "resolved_by_type", "resolved_by_id"],
+      "properties": {
+        "incident_id": { "$ref": "#/$defs/IncidentId" },
+        "resolved_by_type": { "type": "string", "enum": ["user", "agent", "system"] },
+        "resolved_by_id": { "type": "string" },
+        "resolution_note": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "data_audit_chain_broken": {
+      "type": "object",
+      "description": "Audit verification found a broken hash link (D-0031). `broken_at_seq` is the first record whose chain does not verify; `expected_hash` is the link the previous record implies and `found_hash` is the stored one. Payload fields are additive within schema_version 1.",
+      "required": ["broken_at_seq", "expected_hash", "found_hash"],
+      "properties": {
+        "broken_at_seq": { "type": "integer", "minimum": 1 },
+        "expected_hash": { "$ref": "#/$defs/Hash" },
+        "found_hash": { "$ref": "#/$defs/Hash" }
+      },
+      "additionalProperties": true
+    }
+  },
+
+  "examples": [
+    {
+      "schema_version": 1,
+      "id": "evt_01JC9Z6Q5W8N3K4T7R2M1XHB0D",
+      "seq": 41,
+      "type": "app.down",
+      "time": "2026-11-02T09:15:00Z",
+      "source": { "kind": "control_plane" },
+      "subject": { "type": "app", "id": "app_01JC9Z6Q5W8N3K4T7R2M1XHB0X" },
+      "project_id": "prj_01JC9Z6Q5W8N3K4T7R2M1XHB0P",
+      "actor": { "type": "system", "id": "system" },
+      "data": {
+        "app_id": "app_01JC9Z6Q5W8N3K4T7R2M1XHB0X",
+        "node_id": "nod_01JC9Z6Q5W8N3K4T7R2M1XHB0N",
+        "vm_id": "vm_01JC9Z6Q5W8N3K4T7R2M1XHB0V",
+        "check": "health_check",
+        "failures": 3,
+        "last_error": "connect: connection refused"
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "evt_01JC9Z6Q5W8N3K4T7R2M1XHB0E",
+      "seq": 42,
+      "type": "incident.opened",
+      "time": "2026-11-02T09:15:02Z",
+      "source": { "kind": "control_plane" },
+      "subject": { "type": "incident", "id": "inc_01JC9Z6Q5W8N3K4T7R2M1XHB0C" },
+      "project_id": "prj_01JC9Z6Q5W8N3K4T7R2M1XHB0P",
+      "incident_id": "inc_01JC9Z6Q5W8N3K4T7R2M1XHB0C",
+      "actor": { "type": "system", "id": "system" },
+      "data": {
+        "incident_id": "inc_01JC9Z6Q5W8N3K4T7R2M1XHB0C",
+        "title": "blog is down: health check failed 3 times",
+        "trigger_event_id": "evt_01JC9Z6Q5W8N3K4T7R2M1XHB0D",
+        "subject": { "type": "app", "id": "app_01JC9Z6Q5W8N3K4T7R2M1XHB0X" }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "evt_01JC9Z6Q5W8N3K4T7R2M1XHB0F",
+      "seq": 43,
+      "type": "grant.created",
+      "time": "2026-11-02T09:15:03Z",
+      "source": { "kind": "control_plane" },
+      "subject": { "type": "grant", "id": "grt_01JC9Z6Q5W8N3K4T7R2M1XHB0G" },
+      "incident_id": "inc_01JC9Z6Q5W8N3K4T7R2M1XHB0C",
+      "actor": { "type": "system", "id": "system" },
+      "data": {
+        "grant_id": "grt_01JC9Z6Q5W8N3K4T7R2M1XHB0G",
+        "agent_id": "agt_01JC9Z6Q5W8N3K4T7R2M1XHB0A",
+        "kind": "incident",
+        "scopes": ["app:read", "app:restart", "app:logs", "incident:resolve"],
+        "selector": { "apps": ["app_01JC9Z6Q5W8N3K4T7R2M1XHB0X"] },
+        "expires_at": "2026-11-02T10:15:03Z",
+        "incident_id": "inc_01JC9Z6Q5W8N3K4T7R2M1XHB0C",
+        "on_behalf_of": "usr_01JC9Z6Q5W8N3K4T7R2M1XHB0S"
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "evt_01JC9Z6Q5W8N3K4T7R2M1XHB0H",
+      "seq": 44,
+      "type": "app.restarted",
+      "time": "2026-11-02T09:20:11Z",
+      "source": { "kind": "control_plane" },
+      "subject": { "type": "app", "id": "app_01JC9Z6Q5W8N3K4T7R2M1XHB0X" },
+      "project_id": "prj_01JC9Z6Q5W8N3K4T7R2M1XHB0P",
+      "incident_id": "inc_01JC9Z6Q5W8N3K4T7R2M1XHB0C",
+      "request_id": "req_01JC9Z6Q5W8N3K4T7R2M1XHB0R",
+      "actor": { "type": "agent", "id": "agt_01JC9Z6Q5W8N3K4T7R2M1XHB0A" },
+      "data": {
+        "app_id": "app_01JC9Z6Q5W8N3K4T7R2M1XHB0X",
+        "restart_generation": 4
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "evt_01JC9Z6Q5W8N3K4T7R2M1XHB0J",
+      "seq": 45,
+      "type": "approval.requested",
+      "time": "2026-11-02T09:31:40Z",
+      "source": { "kind": "control_plane" },
+      "subject": { "type": "approval", "id": "apr_01JC9Z6Q5W8N3K4T7R2M1XHB0K" },
+      "project_id": "prj_01JC9Z6Q5W8N3K4T7R2M1XHB0P",
+      "request_id": "req_01JC9Z6Q5W8N3K4T7R2M1XHB0S",
+      "actor": { "type": "agent", "id": "agt_01JC9Z6Q5W8N3K4T7R2M1XHB0A" },
+      "data": {
+        "approval_id": "apr_01JC9Z6Q5W8N3K4T7R2M1XHB0K",
+        "agent_id": "agt_01JC9Z6Q5W8N3K4T7R2M1XHB0A",
+        "scope": "app:delete",
+        "target": { "type": "app", "id": "app_01JC9Z6Q5W8N3K4T7R2M1XHB0X" },
+        "operation": "DELETE /api/v1/apps/{app_id}",
+        "justification": "The blog app was replaced by a new project; deleting it frees the only node's disk.",
+        "expires_at": "2026-11-02T10:31:40Z"
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "evt_01JC9Z6Q5W8N3K4T7R2M1XHB0M",
+      "seq": 46,
+      "type": "node.fenced",
+      "time": "2026-11-02T09:44:00Z",
+      "source": { "kind": "node", "node_id": "nod_01JC9Z6Q5W8N3K4T7R2M1XHB0N" },
+      "subject": { "type": "node", "id": "nod_01JC9Z6Q5W8N3K4T7R2M1XHB0N" },
+      "actor": { "type": "node", "id": "nod_01JC9Z6Q5W8N3K4T7R2M1XHB0N" },
+      "data": {
+        "node_id": "nod_01JC9Z6Q5W8N3K4T7R2M1XHB0N",
+        "app_ids": ["app_01JC9Z6Q5W8N3K4T7R2M1XHB0X"],
+        "lease_ids": ["lse_01JC9Z6Q5W8N3K4T7R2M1XHB0H"],
+        "reason": "lease_expired"
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "evt_01JC9Z6Q5W8N3K4T7R2M1XHB0Q",
+      "seq": 47,
+      "type": "deployment.failed",
+      "time": "2026-11-02T09:50:12Z",
+      "source": { "kind": "control_plane" },
+      "subject": { "type": "deployment", "id": "dep_01JC9Z6Q5W8N3K4T7R2M1XHB0T" },
+      "project_id": "prj_01JC9Z6Q5W8N3K4T7R2M1XHB0P",
+      "actor": { "type": "system", "id": "system" },
+      "data": {
+        "deployment_id": "dep_01JC9Z6Q5W8N3K4T7R2M1XHB0T",
+        "app_id": "app_01JC9Z6Q5W8N3K4T7R2M1XHB0X",
+        "phase": "pull",
+        "error": "manifest unknown: tag v1.4.0 not found"
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "evt_01JC9Z6Q5W8N3K4T7R2M1XHB0W",
+      "seq": 48,
+      "type": "audit.chain_broken",
+      "time": "2026-11-02T10:02:30Z",
+      "source": { "kind": "control_plane" },
+      "subject": { "type": "cluster", "id": "cls_01JC9Z6Q5W8N3K4T7R2M1XHB0B" },
+      "actor": { "type": "system", "id": "system" },
+      "data": {
+        "broken_at_seq": 812,
+        "expected_hash": "3d1f0e5a9b7c2244e1c0a8f6b5d4c3e2f1908a7b6c5d4e3f2a1b0c9d8e7f6a5b",
+        "found_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "evt_01JC9Z6Q5W8N3K4T7R2M1XHB0Y",
+      "seq": 49,
+      "type": "node.disk_low",
+      "time": "2026-11-02T10:10:00Z",
+      "source": { "kind": "node", "node_id": "nod_01JC9Z6Q5W8N3K4T7R2M1XHB0N" },
+      "subject": { "type": "node", "id": "nod_01JC9Z6Q5W8N3K4T7R2M1XHB0N" },
+      "actor": { "type": "node", "id": "nod_01JC9Z6Q5W8N3K4T7R2M1XHB0N" },
+      "data": {
+        "node_id": "nod_01JC9Z6Q5W8N3K4T7R2M1XHB0N",
+        "free_gb": 4.5,
+        "threshold_gb": 10
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "evt_01JC9Z6Q5W8N3K4T7R2M1XHB0Z",
+      "seq": 50,
+      "type": "certificate.expiring",
+      "time": "2026-11-02T10:12:00Z",
+      "source": { "kind": "control_plane" },
+      "subject": { "type": "domain", "id": "dom_01JC9Z6Q5W8N3K4T7R2M1XHB0F" },
+      "project_id": "prj_01JC9Z6Q5W8N3K4T7R2M1XHB0P",
+      "actor": { "type": "system", "id": "system" },
+      "data": {
+        "domain_id": "dom_01JC9Z6Q5W8N3K4T7R2M1XHB0F",
+        "hostname": "blog.example.com",
+        "expires_at": "2026-11-12T00:00:00Z",
+        "days_left": 9
+      }
+    }
+  ]
+}
