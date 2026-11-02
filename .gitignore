@@ -3,3 +3,6 @@
 
 # Cargo build output
 /target/
+
+# Release build output (packaging/build-release.sh)
+/dist/

@@ -1,0 +1,127 @@
+# Release builds. GitHub-hosted runners only: a self-hosted runner would put
+# the signing identity and the release bytes on a machine we do not control,
+# and it would break the reproducibility claim (the toolchain must match).
+#
+# The workflow creates a DRAFT release. The maintainer reviews the artifacts
+# and publishes it; nothing here publishes on its own.
+#
+# Signing is keyless: GitHub artifact attestations (Sigstore, SLSA build
+# provenance) via actions/attest-build-provenance. There are no long-lived
+# signing keys. Verify with packaging/verify-release.sh.
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build, attest and draft the release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # musl-gcc is what a future C dependency (bundled SQLite) would use; the
+      # build script picks it up when it is on PATH.
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      # rustup is preinstalled on the runner; install exactly the toolchain
+      # pinned in rust-toolchain.toml before anything calls cargo.
+      - name: Toolchain
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal
+          rustup show active-toolchain
+
+      # The tag and the Cargo version must agree, otherwise the artifact name
+      # (which carries the tag version) would lie about the binary.
+      - name: Resolve version
+        id: version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${REF_NAME#v}"
+          case "$version" in
+            "" | *[!A-Za-z0-9.+_-]*)
+              echo "error: unexpected tag: $REF_NAME" >&2
+              exit 1
+              ;;
+          esac
+          package="${QUORO_PACKAGE:-quoro}"
+          cargo_version="$(
+            cargo metadata --format-version 1 --no-deps --locked |
+              python3 -I -c 'import json,sys; p=sys.argv[1]; ms=[x["version"] for x in json.load(sys.stdin)["packages"] if x["name"]==p]; print(ms[0] if ms else sys.exit("package not found in cargo metadata: "+p))' "$package"
+          )"
+          if [ "$cargo_version" != "$version" ]; then
+            echo "error: tag version $version does not match the Cargo version" \
+              "$cargo_version of package $package" >&2
+            exit 1
+          fi
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+
+      - name: Build release artifacts
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: packaging/build-release.sh "$VERSION"
+
+      - name: Attest build provenance
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/quoro-*.tar.gz
+
+      # Publish the bundle next to the artifact so verify-release.sh can use
+      # it offline, and so it ships with the release.
+      - name: Store the attestation bundle
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -eu
+          set -- dist/quoro-*.tar.gz
+          if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+            echo "error: expected exactly one dist/quoro-*.tar.gz, found $#" >&2
+            exit 1
+          fi
+          cp "$BUNDLE_PATH" "$1.sigstore.jsonl"
+
+      # Same checks a user runs, against the files that are about to be
+      # uploaded. A broken attestation fails the release here, not for users.
+      - name: Verify the release artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          packaging/verify-release.sh \
+            "dist/quoro-${VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            "$GITHUB_REF_NAME"
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" \
+            --draft \
+            --verify-tag \
+            --title "Quoro $VERSION" \
+            --notes "Draft release. The binaries are signed with GitHub artifact attestations (Sigstore, SLSA build provenance); verify with packaging/verify-release.sh and rebuild with packaging/reproduce-release.sh." \
+            dist/*.tar.gz dist/SHA256SUMS dist/*.sigstore.jsonl

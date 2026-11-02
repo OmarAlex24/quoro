@@ -34,6 +34,9 @@ Rules:
 
 | Tool | Where | Why |
 | --- | --- | --- |
-| `actions/checkout`, pinned by commit SHA | `.github/workflows/ci.yml` | Checks out the repository in CI; the only third-party action |
+| `actions/checkout`, pinned by commit SHA | `.github/workflows/ci.yml`, `.github/workflows/release.yml` | Checks out the repository in CI and in the release workflow |
 | `pyyaml`, `jsonschema`, `openapi-spec-validator`, pinned versions | `.github/scripts/requirements.txt` | Validate `openapi.yaml` against OpenAPI 3.1 and `events.schema.json` against JSON Schema 2020-12 in CI (`docs/contracts/README.md`, "Validation"); `scripts/check_contracts.py` stays standard-library only |
 | `cargo-deny` 0.20.2, pinned by version and sha256 | `.github/workflows/ci.yml`, `deny.toml` | Enforces the ADR 0080 license allowlist, RustSec advisories, the duplicate-version report and the crates.io-only source policy |
+| `actions/attest-build-provenance` v4.2.2, pinned by commit SHA | `.github/workflows/release.yml` | Signs the release tarball keylessly: SLSA build provenance through Sigstore, bound to the release workflow and the tag (ADR 0027); no signing key to hold or leak |
+| `musl-tools` (Ubuntu package, not pinned) | `.github/workflows/release.yml` | `musl-gcc` for C dependencies of the static musl build; Rust code is linked with the toolchain's `rust-lld`, so the host linker stays out of the build |
+| `gh` (preinstalled on the GitHub-hosted runner) | `.github/workflows/release.yml` | Self-checks the attestation with `packaging/verify-release.sh` and creates the draft release |

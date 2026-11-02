@@ -1,0 +1,32 @@
+# Quoro: one microVM per app on Cloud Hypervisor + KVM.
+#
+# Installed by installer/install.sh to /etc/systemd/system/quoro.service and
+# shipped inside the release tarball as quoro.service.
+
+[Unit]
+Description=Quoro (hypervisor and app deploy)
+Documentation=https://github.com/OmarAlex24/quoro
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=quoro
+Group=quoro
+# /dev/kvm access for Cloud Hypervisor. systemd refuses to start the unit when
+# this group does not exist, so a host without a kvm group needs this line
+# removed (see installer/README.md); the installer adds quoro to kvm when the
+# group exists.
+SupplementaryGroups=kvm
+Environment=QUORO_CONFIG=/etc/quoro/quoro.toml
+ExecStart=/usr/local/bin/quoro serve
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+# Logs go to journald by default: read them with journalctl -u quoro.
+#
+# The engine will need extra capabilities later (networking: bridges, taps and
+# veth pairs). They are added when the engine requires them, not before.
+
+[Install]
+WantedBy=multi-user.target
