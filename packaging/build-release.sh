@@ -16,8 +16,14 @@ package named by QUORO_PACKAGE (default: quoro).
 Environment:
   QUORO_PACKAGE      Cargo package to build (default: quoro)
   QUORO_ALLOW_DIRTY  set to 1 to build from a dirty tree (not a release build)
+  QUORO_SKIP_PANEL   set to 1 to skip rebuilding the panel (not a release build);
+                     panel/dist must already exist
   SOURCE_DATE_EPOCH  build timestamp; defaults to the last commit time
   CARGO_HOME         defaults to $HOME/.cargo
+
+The panel is built before cargo because rust-embed compiles panel/dist into the
+binary. The panel toolchain is pinned in packaging/node.txt: put that Node.js
+first on PATH (packaging/fetch-node.sh <dir> prints its bin directory).
 EOF
 }
 
@@ -114,6 +120,50 @@ case "$SOURCE_DATE_EPOCH" in
 esac
 export SOURCE_DATE_EPOCH
 
+# The panel is compiled into the binary by rust-embed, so its bytes are part of
+# the release. Build it first, with the Node.js pinned in packaging/node.txt:
+# npm comes with that Node, and a different Node produces different panel bytes
+# (ADR 0027). The dirty-tree check above runs before this, which is safe because
+# panel/dist, panel/node_modules and panel/src/api/generated are gitignored.
+node_pin_arch=$(uname -m) || die "cannot determine the machine architecture"
+node_pins=$(
+	awk -v arch="$node_pin_arch" '
+		NF && $1 !~ /^#/ && $2 == arch { print $1 }
+	' packaging/node.txt
+) || die "cannot read packaging/node.txt"
+[ -n "$node_pins" ] ||
+	die "packaging/node.txt has no Node.js pin for $node_pin_arch"
+[ "$(printf '%s\n' "$node_pins" | wc -l | tr -d ' ')" -eq 1 ] ||
+	die "more than one Node.js pin for $node_pin_arch in packaging/node.txt"
+node_pin=$node_pins
+
+if [ "${QUORO_SKIP_PANEL:-0}" = "1" ]; then
+	note "warning: QUORO_SKIP_PANEL=1: the panel was not rebuilt; this is NOT a release build"
+	[ -f panel/dist/index.html ] ||
+		die "QUORO_SKIP_PANEL=1 but panel/dist/index.html is missing; build the panel first or unset QUORO_SKIP_PANEL"
+else
+	command -v node >/dev/null 2>&1 ||
+		die "node is not on PATH; run packaging/fetch-node.sh <dir> and put <dir>/bin first on PATH (the panel needs Node $node_pin)"
+	node_version=$(node --version) || die "cannot run node --version"
+	[ "$node_version" = "$node_pin" ] ||
+		die "node $node_version is on PATH but packaging/node.txt pins $node_pin for $node_pin_arch; run packaging/fetch-node.sh <dir> and put <dir>/bin first on PATH"
+	command -v npm >/dev/null 2>&1 ||
+		die "npm is not on PATH; it ships with the pinned Node.js"
+	[ -f panel/package-lock.json ] ||
+		die "panel/package-lock.json is missing; npm ci needs it"
+
+	note "building the panel with Node $node_version"
+	rm -rf panel/dist
+	(
+		cd panel &&
+			npm ci --no-audit --no-fund &&
+			npm run build
+	) || die "the panel build failed (npm ci + npm run build in panel/)"
+	[ -f panel/dist/index.html ] ||
+		die "the panel build did not produce panel/dist/index.html"
+	note "panel built into panel/dist"
+fi
+
 # One pinned toolchain, taken from rust-toolchain.toml, for local builds and CI.
 channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
 [ -n "$channel" ] || die "cannot read channel from rust-toolchain.toml"
@@ -155,14 +205,23 @@ else
 	note "note: musl-gcc not found; C dependencies would fall back to the default compiler"
 fi
 
+# Both binaries ship: quoro is the service, quoro-init is PID 1 inside every
+# microVM. One invocation so they share the exact same environment.
 cargo +"$channel" build --release --locked --target x86_64-unknown-linux-musl \
-	-p "$QUORO_PACKAGE" --bin quoro
+	-p "$QUORO_PACKAGE" --bin quoro \
+	-p quoro-init --bin quoro-init
 
 binary="$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/quoro"
+init_binary="$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/quoro-init"
 [ -f "$binary" ] || die "build succeeded but $binary is missing"
+[ -f "$init_binary" ] || die "build succeeded but $init_binary is missing"
 [ -f LICENSE ] || die "LICENSE is missing from the repository root"
 [ -f packaging/systemd/quoro.service ] ||
 	die "packaging/systemd/quoro.service is missing; the release needs the systemd unit"
+# install.sh fetches Cloud Hypervisor and the guest kernel and verifies them
+# against these pins, so the engine's pinned versions travel with the release.
+[ -f crates/engine/pins.txt ] ||
+	die "crates/engine/pins.txt is missing; the release needs the engine pins"
 
 name="quoro-$version-x86_64-unknown-linux-musl"
 
@@ -176,14 +235,18 @@ trap 'exit 143' TERM
 
 mkdir -p "$stage/$name"
 install -m 0755 "$binary" "$stage/$name/quoro"
+install -m 0755 "$init_binary" "$stage/$name/quoro-init"
 install -m 0644 LICENSE "$stage/$name/LICENSE"
 install -m 0644 packaging/systemd/quoro.service "$stage/$name/quoro.service"
+install -m 0644 crates/engine/pins.txt "$stage/$name/pins.txt"
 
 # Normalise every staged timestamp, including symlinks and the directory
 # entries themselves, because tar records all of them.
 touch -h -d "@$SOURCE_DATE_EPOCH" "$stage/$name/quoro"
+touch -h -d "@$SOURCE_DATE_EPOCH" "$stage/$name/quoro-init"
 touch -h -d "@$SOURCE_DATE_EPOCH" "$stage/$name/LICENSE"
 touch -h -d "@$SOURCE_DATE_EPOCH" "$stage/$name/quoro.service"
+touch -h -d "@$SOURCE_DATE_EPOCH" "$stage/$name/pins.txt"
 touch -h -d "@$SOURCE_DATE_EPOCH" "$stage/$name"
 touch -h -d "@$SOURCE_DATE_EPOCH" "$stage"
 
@@ -219,4 +282,5 @@ rm -f "$archive"
 
 printf 'built: dist/%s\n' "$tarball"
 printf 'sha256(binary): %s\n' "$(sha256sum "$binary")"
+printf 'sha256(quoro-init): %s\n' "$(sha256sum "$init_binary")"
 printf 'sha256(tarball): %s\n' "$(sha256sum "dist/$tarball")"

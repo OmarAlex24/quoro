@@ -1,0 +1,10 @@
+# Node.js used to build the panel for releases (ADR 0027: the toolchain is part
+# of the build). The single source of truth: read by packaging/fetch-node.sh,
+# which verifies the sha256 and extracts the tarball, and by
+# packaging/build-release.sh, which refuses a `node` whose version differs.
+#
+# Bumping a pin is its own pull request: a different Node builds different
+# panel bytes.
+#
+# version arch file url sha256
+v24.22.2 x86_64 node-v24.22.2-linux-x64.tar.xz https://nodejs.org/dist/v24.22.2/node-v24.22.2-linux-x64.tar.xz 48cc0e21e048790e54c0cf5749c2725005313d652651c40b7a21feb9697aaf75

@@ -109,7 +109,7 @@ External facts behind this milestone are verified in the research files. Cloud H
 - [ ] On a freshly reinstalled lab-1, the one-command install completes and `quoro` answers a version command.
 - [ ] On lab-1, creating a VM through the API returns an id, starting it makes it appear as running, and stopping then deleting it leaves no VM behind.
 - [ ] On lab-1, the same create/start/stop/delete sequence works from the panel in a browser, with the state shown in the list after each step.
-- [ ] On lab-2, the release binary's signature verifies against the published key [D-0027].
+- [ ] On lab-2, the release binary's signature verifies against the published signer identity and the Sigstore trust root [D-0027, D-0081].
 - [ ] On lab-2, rebuilding from the same source produces a byte-identical artifact to the published one [D-0027].
 
 #### Demo script

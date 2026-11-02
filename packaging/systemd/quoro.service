@@ -11,22 +11,27 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=quoro
-Group=quoro
-# /dev/kvm access for Cloud Hypervisor. systemd refuses to start the unit when
-# this group does not exist, so a host without a kvm group needs this line
-# removed (see installer/README.md); the installer adds quoro to kvm when the
-# group exists.
-SupplementaryGroups=kvm
+# Runs as root: the engine creates the quoro0 bridge and TAP devices, writes
+# the nftables rules that route guest traffic, and converts images with their
+# ownership preserved.
 Environment=QUORO_CONFIG=/etc/quoro/quoro.toml
 ExecStart=/usr/local/bin/quoro serve
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=65536
+# quoro serve exits 78 when this host cannot run the engine: no /dev/kvm, no
+# vmx/svm, a kernel that is too old, or missing artifacts. Restarting would not
+# help, so let the unit stay failed and read the journal instead.
+RestartPreventExitStatus=78
+# Hardening the engine tolerates. It writes /proc/sys/net/ipv4/ip_forward,
+# opens /dev/kvm and /dev/net/tun and talks netlink, so PrivateDevices,
+# ProtectKernelTunables, ProtectKernelModules, RestrictAddressFamilies and
+# CapabilityBoundingSet are deliberately not set here.
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+ProtectSystem=full
 # Logs go to journald by default: read them with journalctl -u quoro.
-#
-# The engine will need extra capabilities later (networking: bridges, taps and
-# veth pairs). They are added when the engine requires them, not before.
 
 [Install]
 WantedBy=multi-user.target
