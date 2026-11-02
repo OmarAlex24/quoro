@@ -2,10 +2,13 @@
 //! The KVM integration suite of the Cloud Hypervisor engine (contract §5).
 //!
 //! Every test is `#[ignore]`d: it needs `/dev/kvm`, passwordless root, the
-//! pinned artifacts and a real network namespace, which only the lab host has.
-//! Set `QUORO_ENGINE_LAB=1` and the variables below, then run
-//! `cargo test -p quoro-engine --test ch_lab -- --ignored --test-threads=1`.
+//! pinned artifacts and a real network namespace, which only a lab host has.
+//! Run with `crates/engine/scripts/lab-suite.sh` (it fetches the pinned
+//! artifacts, builds `quoro-init` and the probe images, resolves the alpine
+//! digest and runs every lab suite as root); the variables below are what it
+//! sets.
 //!
+//! - `QUORO_ENGINE_LAB=1`: the lab switch every test checks.
 //! - `QUORO_ENGINE_ARTIFACTS`: directory with the pinned Cloud Hypervisor and
 //!   guest kernel under their pinned file names.
 //! - `QUORO_ENGINE_INIT`: the static musl `quoro-init` binary.

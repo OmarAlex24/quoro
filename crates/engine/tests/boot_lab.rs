@@ -6,10 +6,12 @@
 //! the status record the init writes back.
 //!
 //! `#[ignore]`d: it needs `/dev/kvm`, root, network access to Docker Hub and
-//! the pinned artifacts. Run it on the lab host with
-//! `QUORO_ENGINE_LAB=1 cargo test -p quoro-engine --test boot_lab -- --ignored`
-//! and:
+//! the pinned artifacts. Run with `crates/engine/scripts/lab-suite.sh` (it
+//! fetches the pinned artifacts, builds `quoro-init` and the probe images,
+//! resolves the alpine digest and runs every lab suite as root); the variables
+//! below are what it sets.
 //!
+//! - `QUORO_ENGINE_LAB=1`: the lab switch every test checks.
 //! - `QUORO_ENGINE_ARTIFACTS`: directory with the pinned Cloud Hypervisor and
 //!   guest kernel under their pinned file names (`scripts/fetch-pinned.sh`).
 //! - `QUORO_ENGINE_INIT`: the static musl `quoro-init` binary.

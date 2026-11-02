@@ -1,12 +1,18 @@
 //! `quoro serve`: the HTTPS listener of D-0054 and the local node driver.
 //!
-//! One listener serves the API, the embedded panel (and, from later milestones, MCP)
-//! on a self-signed certificate. The engine is chosen here, with a `match` over
-//! [`EngineKind`], because the [`Engine`] trait is not object safe: adding the
-//! Cloud Hypervisor backend is one more arm of that match and nothing else.
+//! One listener serves the API, the embedded panel (and, from later milestones,
+//! MCP) on a self-signed certificate. The engine is chosen here, with a `match`
+//! over [`EngineKind`], because the [`Engine`] trait is not object safe: each
+//! backend is one arm of that match and nothing else.
+//!
+//! The Cloud Hypervisor arm is the Linux node (ADR 0007, ADR 0009): it builds
+//! the backend from the `[cloud_hypervisor]` table, refuses to serve on a host
+//! that cannot run guests, and then hands the same driver the real engine and
+//! the registry-backed image resolver. Every refusal exits with
+//! [`EX_CONFIG`] so systemd stops restarting a node that will never boot.
 
 use crate::config::{Config, EngineKind};
-use crate::local_node;
+use crate::local_node::{self, ImageResolver, NodeNetworkConfig, ReferenceAsDigest};
 use crate::tls;
 use axum_server::Handle;
 use quoro_control_plane::store::Store;
@@ -16,6 +22,13 @@ use std::net::TcpListener;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::info;
+
+/// The exit status of a configuration the process cannot recover from
+/// (`EX_CONFIG`, sysexits.h).
+///
+/// The systemd unit turns this into `RestartPreventExitStatus=78`, so a node
+/// without KVM or with missing artifacts stops instead of looping.
+pub const EX_CONFIG: i32 = 78;
 
 /// Runs the server until SIGTERM or Ctrl-C. Returns the process exit code.
 ///
@@ -34,22 +47,134 @@ pub async fn run(config: Config) -> Result<i32, String> {
     let material = tls::load_or_generate(&config.data_dir, &config.node_name, config.listen)
         .map_err(|e| format!("cannot load the TLS material: {e}"))?;
 
+    // Both engines attach VMs to the same node network; only the config table
+    // differs, so the driver takes the same shape either way.
+    let network = NodeNetworkConfig::from(&config.cloud_hypervisor);
+
     match config.engine {
         // The fake engine has no hypervisor and no privileges; it is what the
-        // end-to-end test and first-run experiments use.
-        EngineKind::Fake => serve_with(FakeEngine::new(), config, store, material).await,
+        // end-to-end test and first-run experiments use. The reference stands
+        // in for the digest, which is what that engine caches by.
+        EngineKind::Fake => {
+            serve_with(
+                FakeEngine::new(),
+                ReferenceAsDigest,
+                network,
+                config,
+                store,
+                material,
+            )
+            .await
+        }
         EngineKind::CloudHypervisor => {
-            eprintln!(
-                "the cloud-hypervisor engine is not built into this binary yet; set engine = \"fake\""
-            );
-            Ok(2)
+            serve_cloud_hypervisor(config, network, store, material).await
         }
     }
 }
 
+/// Builds the Cloud Hypervisor backend, checks the host and serves on it.
+///
+/// The host check is the engine's own `probe_host`, not a second copy of it:
+/// the backend already knows where KVM, the CPU flags and the kernel release
+/// live, and a duplicated check would drift from it.
+#[cfg(target_os = "linux")]
+async fn serve_cloud_hypervisor(
+    config: Config,
+    network: NodeNetworkConfig,
+    store: Store,
+    material: tls::Material,
+) -> Result<i32, String> {
+    use quoro_engine::ch::{ChConfig, ChEngine};
+    use tracing::warn;
+
+    let ch = &config.cloud_hypervisor;
+    let dns = ch.dns();
+    let mut ch_config = ChConfig::new(
+        ch.state_dir(&config.data_dir),
+        ch.artifacts_dir.clone(),
+        ch.init_binary.clone(),
+    );
+    ch_config.dns.clone_from(&dns);
+
+    // A pin mismatch, a missing `nft` or a broken artifact lands here; the
+    // engine's message already names the cause, so it is passed through.
+    let engine = match ChEngine::new(ch_config).await {
+        Ok(engine) => engine,
+        Err(e) => {
+            eprintln!("cannot start the cloud-hypervisor engine: {e}");
+            return Ok(EX_CONFIG);
+        }
+    };
+
+    let capabilities = engine.capabilities().await;
+    info!(version = %capabilities.version, "cloud-hypervisor engine ready");
+
+    let probe = match engine.probe_host().await {
+        Ok(probe) => probe,
+        Err(e) => {
+            eprintln!("cannot probe this host for the cloud-hypervisor engine: {e}");
+            return Ok(EX_CONFIG);
+        }
+    };
+    if !probe.kvm_available {
+        eprintln!(
+            "/dev/kvm is missing or not accessible: the cloud-hypervisor engine needs KVM (ADR 0009)"
+        );
+        return Ok(EX_CONFIG);
+    }
+    if !(probe.cpu_vmx || probe.cpu_svm) {
+        eprintln!("the CPU exposes neither vmx nor svm: enable hardware or nested virtualization");
+        return Ok(EX_CONFIG);
+    }
+    if !probe.kernel_supported {
+        eprintln!(
+            "kernel {} is older than the engine's supported minimum (6.8)",
+            probe.kernel_release
+        );
+        return Ok(EX_CONFIG);
+    }
+
+    if dns.is_empty() {
+        // The engine still starts; guests just cannot resolve names.
+        warn!("no DNS server found: guests get an empty resolv.conf and cannot resolve names");
+    } else {
+        let servers = dns
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        info!(servers = %servers, "guest DNS servers");
+    }
+
+    serve_with(
+        engine,
+        local_node::RegistryResolver,
+        network,
+        config,
+        store,
+        material,
+    )
+    .await
+}
+
+/// The Cloud Hypervisor backend is Linux-only; on any other platform the
+/// configuration is accepted but cannot be served.
+#[cfg(not(target_os = "linux"))]
+async fn serve_cloud_hypervisor(
+    _config: Config,
+    _network: NodeNetworkConfig,
+    _store: Store,
+    _material: tls::Material,
+) -> Result<i32, String> {
+    eprintln!("the cloud-hypervisor engine runs on Linux only");
+    Ok(EX_CONFIG)
+}
+
 /// Serves the control plane with `engine` behind the driver.
-async fn serve_with<E: Engine + 'static>(
+async fn serve_with<E: Engine + 'static, R: ImageResolver>(
     engine: E,
+    resolver: R,
+    network: NodeNetworkConfig,
     config: Config,
     store: Store,
     material: tls::Material,
@@ -65,9 +190,16 @@ async fn serve_with<E: Engine + 'static>(
         Some(tx),
     );
 
-    let (node_id, driver) = local_node::start(engine, store.clone(), rx, config.node_name.clone())
-        .await
-        .map_err(|e| format!("cannot start the local node driver: {e:?}"))?;
+    let (node_id, driver) = local_node::start(
+        engine,
+        resolver,
+        network,
+        store.clone(),
+        rx,
+        config.node_name.clone(),
+    )
+    .await
+    .map_err(|e| format!("cannot start the local node driver: {e:?}"))?;
     let owner_exists = owner_exists(&store)
         .await
         .map_err(|e| format!("cannot read the user table: {e}"))?;

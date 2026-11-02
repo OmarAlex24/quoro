@@ -11,6 +11,11 @@
 //! (where it is an engine error the control plane can see) reported as
 //! `unknown`, so the next notification retries the VM and the rest of the node
 //! keeps working.
+//!
+//! The driver is generic over two seams so the same loop serves the fake
+//! engine in tests and the Cloud Hypervisor backend on a Linux node: the
+//! [`Engine`] itself and an [`ImageResolver`] that turns the image reference
+//! the control plane stores into the content digest the engine caches by.
 
 use quoro_control_plane::driver::{
     self, Capacity, DesiredStatus, Kvm, LocalNode, Observation, ObservedStatus,
@@ -22,31 +27,112 @@ use quoro_engine::{
     NetAttach, NodeNetwork, StopMode, VmId, VmSpec, VmState,
 };
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
-/// The node bridge every VM is attached to.
-const BRIDGE: &str = "quoro0";
-/// The node subnet; VMs take `10.42.0.N` with `N >= 2`.
-const SUBNET: &str = "10.42.0.0/24";
-/// The address of the node on that bridge.
-const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 42, 0, 1);
 /// How long a graceful stop may wait for the guest.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The node network the driver hands guest addresses out of and attaches VMs
+/// to.
+///
+/// It is passed in rather than compiled in so `quoro.toml` can move the node
+/// onto an address range that does not collide with the operator's own
+/// networks. The subnet is carried both as the CIDR string the engine records
+/// and as its parsed parts, because address allocation works on numbers.
+#[derive(Clone, Debug)]
+pub struct NodeNetworkConfig {
+    /// Bridge every VM is attached to.
+    pub bridge: String,
+    /// The subnet as a CIDR string, for example `10.42.0.0/24`.
+    pub subnet: String,
+    /// The network address of that subnet (`10.42.0.0` in the example).
+    pub network: Ipv4Addr,
+    /// The prefix length of that subnet.
+    pub prefix: u8,
+    /// The node's own address on the bridge, never handed to a VM.
+    pub gateway: Ipv4Addr,
+}
+
+impl From<&crate::config::CloudHypervisorConfig> for NodeNetworkConfig {
+    fn from(config: &crate::config::CloudHypervisorConfig) -> Self {
+        Self {
+            bridge: config.bridge.clone(),
+            subnet: config.subnet.to_string(),
+            network: config.subnet.network(),
+            prefix: config.subnet.prefix(),
+            gateway: config.subnet.gateway(),
+        }
+    }
+}
+
+impl NodeNetworkConfig {
+    /// The last address of the subnet (all host bits set), the broadcast
+    /// address no VM may take.
+    fn broadcast(&self) -> Ipv4Addr {
+        let host_bits = 32 - u32::from(self.prefix.min(32));
+        let mask = u32::MAX.checked_shl(host_bits).unwrap_or(0);
+        Ipv4Addr::from(u32::from(self.network) | !mask)
+    }
+}
+
+/// Turns an image reference into the content digest the engine caches by.
+///
+/// The control plane stores whatever reference the user typed; the engine
+/// needs a digest, so the driver asks this seam for one before preparing the
+/// image. Keeping it a trait lets the fake engine keep treating the reference
+/// as the digest, while a real node resolves it against a registry.
+pub trait ImageResolver: Send + Sync + 'static {
+    /// Resolves `reference` to an image digest.
+    fn resolve(&self, reference: &str) -> impl Future<Output = Result<ImageDigest, String>> + Send;
+}
+
+/// Treats the reference as the digest, which is what the fake engine caches
+/// by. It keeps the end-to-end test offline and unchanged.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReferenceAsDigest;
+
+impl ImageResolver for ReferenceAsDigest {
+    async fn resolve(&self, reference: &str) -> Result<ImageDigest, String> {
+        Ok(ImageDigest(reference.to_owned()))
+    }
+}
+
+/// Resolves a reference against its OCI registry: a digest that is already
+/// pinned is used as is, a tag is turned into the manifest digest it points at.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RegistryResolver;
+
+#[cfg(target_os = "linux")]
+impl ImageResolver for RegistryResolver {
+    async fn resolve(&self, reference: &str) -> Result<ImageDigest, String> {
+        quoro_engine::image::resolve_digest(reference)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
 /// Registers this machine as the primary node, resyncs every VM it knows
 /// about and starts the reconciliation loop.
+///
+/// `resolver` turns the control plane's image references into the digests the
+/// engine caches by; `network` is the node network addresses are handed out
+/// of.
 ///
 /// Returns the `nod_` id and the loop's task handle.
 ///
 /// # Errors
 ///
 /// A database error while registering the node or reading the initial VM list.
-pub async fn start<E: Engine + 'static>(
+pub async fn start<E: Engine + 'static, R: ImageResolver>(
     engine: E,
+    resolver: R,
+    network: NodeNetworkConfig,
     store: Store,
     rx: mpsc::UnboundedReceiver<String>,
     node_name: String,
@@ -89,12 +175,12 @@ pub async fn start<E: Engine + 'static>(
     let node_id = driver::register_local_node(&store, &node).await?;
     info!(engine = %capabilities.engine, "local node registered");
 
-    let network = NodeNetwork {
-        bridge: BRIDGE.to_string(),
-        subnet: SUBNET.to_string(),
-        gateway: GATEWAY,
+    let engine_network = NodeNetwork {
+        bridge: network.bridge.clone(),
+        subnet: network.subnet.clone(),
+        gateway: network.gateway,
     };
-    if let Err(e) = engine.ensure_network(&network).await {
+    if let Err(e) = engine.ensure_network(&engine_network).await {
         // A bridge usually needs root; the driver keeps running so the node
         // stays visible and the failure is reported on the next start.
         error!(error = ?e, "could not ensure the node network");
@@ -113,9 +199,11 @@ pub async fn start<E: Engine + 'static>(
 
     let driver = NodeDriver {
         engine,
+        resolver,
         store,
         node_id: node_id.clone(),
         ips: HashMap::new(),
+        network,
     };
     let handle = tokio::spawn(driver.run(ids, rx));
     Ok((node_id, handle))
@@ -148,18 +236,22 @@ enum Input {
     Event(EngineEvent),
 }
 
-/// The driver's state: the engine, the database, its node id and the addresses
-/// it has handed out.
-struct NodeDriver<E: Engine> {
+/// The driver's state: the engine, the image resolver, the database, its node
+/// id, the node network and the addresses it has handed out.
+struct NodeDriver<E: Engine, R: ImageResolver> {
     engine: E,
+    /// Turns the control plane's image reference into a digest per create.
+    resolver: R,
     store: Store,
     node_id: String,
     /// Address per VM id, so a VM keeps its address across reconciles and the
     /// lowest free one is reused after a delete.
     ips: HashMap<String, Ipv4Addr>,
+    /// The subnet addresses are handed out of and the bridge they live on.
+    network: NodeNetworkConfig,
 }
 
-impl<E: Engine> NodeDriver<E> {
+impl<E: Engine, R: ImageResolver> NodeDriver<E, R> {
     /// Reconciles the initial set, then every notification and engine event
     /// until the control plane closes the channel.
     async fn run(mut self, initial: Vec<String>, mut rx: mpsc::UnboundedReceiver<String>) {
@@ -268,11 +360,20 @@ impl<E: Engine> NodeDriver<E> {
         desired: &driver::DesiredVm,
     ) -> Option<(quoro_engine::VmInfo, Ipv4Addr)> {
         let vm_id = desired.id.as_str();
-        // Until the OCI pipeline lands the reference stands in for the digest:
-        // the engine caches images by digest and the reference is stable.
+        // The control plane stores the reference; the engine caches by digest.
+        // A tag still resolves (that is the resolver's job), but a pinned
+        // digest avoids a registry round-trip at every create.
+        let digest = match self.resolver.resolve(&desired.image).await {
+            Ok(digest) => digest,
+            Err(e) => {
+                error!(vm_id, image = %desired.image, error = %e, "could not resolve the VM image digest");
+                self.report_unknown(vm_id).await;
+                return None;
+            }
+        };
         let image = ImageRef {
             reference: desired.image.clone(),
-            digest: ImageDigest(desired.image.clone()),
+            digest,
         };
         let prepared = match self.engine.prepare_image(&image).await {
             Ok(prepared) => prepared,
@@ -294,7 +395,7 @@ impl<E: Engine> NodeDriver<E> {
             volumes: Vec::new(),
             net: NetAttach {
                 ip,
-                gateway: GATEWAY,
+                gateway: self.network.gateway,
                 mac: mac_for(ip),
             },
             init: InitConfig {
@@ -489,27 +590,37 @@ impl<E: Engine> NodeDriver<E> {
         }
     }
 
-    /// The lowest address `10.42.0.N`, `N >= 2`, not already handed out. The
-    /// bridge address is `.1` and `.255` is the broadcast address, so the last
-    /// usable address is `.254`.
+    /// The lowest host address of the subnet that is neither the gateway nor
+    /// the broadcast address and is not already handed out.
+    ///
+    /// The network address, the gateway (the first host) and the broadcast
+    /// address are never usable by a guest; everything between them is, so a
+    /// `/29` gives the guests `.2` through `.6`.
     fn allocate_ip(&self) -> Ipv4Addr {
-        let used: HashSet<u8> = self.ips.values().map(|ip| ip.octets()[3]).collect();
-        for last in 2..=254u8 {
-            if !used.contains(&last) {
-                return Ipv4Addr::new(10, 42, 0, last);
+        let used: HashSet<Ipv4Addr> = self.ips.values().copied().collect();
+        let broadcast = u32::from(self.network.broadcast());
+        let first = u32::from(self.network.network).saturating_add(1);
+        for raw in first..broadcast {
+            let ip = Ipv4Addr::from(raw);
+            if ip != self.network.gateway && !used.contains(&ip) {
+                return ip;
             }
         }
-        // Every address is taken; the engine will refuse the duplicate address
-        // and the error is reported like any other create failure.
-        Ipv4Addr::new(10, 42, 0, 254)
+        // Every address is taken. Handing out the highest one again lets the
+        // engine refuse the duplicate address, and that error is reported like
+        // any other create failure; panicking would take the whole node down.
+        Ipv4Addr::from(broadcast.saturating_sub(1))
     }
 }
 
 /// A MAC address derived from the VM's IP: locally administered (`0x52` has
 /// the unicast bit clear and the local bit set) and unique per address.
+///
+/// All four IPv4 octets are used, so two addresses in different subnets of the
+/// same node never collide either.
 fn mac_for(ip: Ipv4Addr) -> MacAddr {
     let octets = ip.octets();
-    MacAddr([0x52, 0x55, 0x0a, 0x42, octets[2], octets[3]])
+    MacAddr([0x52, 0x55, octets[0], octets[1], octets[2], octets[3]])
 }
 
 /// Awaits the next engine event. `poll_fn` is all that is needed; a `futures`
@@ -522,16 +633,29 @@ async fn next_event(stream: &mut EventStream) -> Option<EngineEvent> {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn addresses_skip_the_gateway_and_reuse_freed_slots() {
-        let engine = quoro_engine::FakeEngine::new();
-        let store = Store::open_in_memory().await.unwrap();
-        let mut driver = NodeDriver {
-            engine,
+    /// The default node network, which is what the binary's defaults produce.
+    fn default_network() -> NodeNetworkConfig {
+        NodeNetworkConfig::from(&crate::config::Config::default().cloud_hypervisor)
+    }
+
+    fn driver(
+        network: NodeNetworkConfig,
+        store: Store,
+    ) -> NodeDriver<quoro_engine::FakeEngine, ReferenceAsDigest> {
+        NodeDriver {
+            engine: quoro_engine::FakeEngine::new(),
+            resolver: ReferenceAsDigest,
             store,
             node_id: "nod_test".to_string(),
             ips: HashMap::new(),
-        };
+            network,
+        }
+    }
+
+    #[tokio::test]
+    async fn addresses_skip_the_gateway_and_reuse_freed_slots() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut driver = driver(default_network(), store);
         assert_eq!(driver.allocate_ip(), Ipv4Addr::new(10, 42, 0, 2));
         driver.ips.insert("a".into(), Ipv4Addr::new(10, 42, 0, 2));
         assert_eq!(driver.allocate_ip(), Ipv4Addr::new(10, 42, 0, 3));
@@ -541,15 +665,54 @@ mod tests {
         assert_eq!(driver.allocate_ip(), Ipv4Addr::new(10, 42, 0, 2));
     }
 
+    #[tokio::test]
+    async fn a_small_subnet_only_hands_out_its_host_addresses() {
+        let store = Store::open_in_memory().await.unwrap();
+        // 10.9.8.0/29: `.0` is the network, `.1` the gateway and `.7` the
+        // broadcast, so exactly `.2` through `.6` are usable.
+        let network = NodeNetworkConfig {
+            bridge: "quoro0".to_string(),
+            subnet: "10.9.8.0/29".to_string(),
+            network: Ipv4Addr::new(10, 9, 8, 0),
+            prefix: 29,
+            gateway: Ipv4Addr::new(10, 9, 8, 1),
+        };
+        let mut driver = driver(network, store);
+        let mut handed_out = Vec::new();
+        for _ in 0..5 {
+            let ip = driver.allocate_ip();
+            driver.ips.insert(ip.to_string(), ip);
+            handed_out.push(ip);
+        }
+        assert_eq!(
+            handed_out,
+            vec![
+                Ipv4Addr::new(10, 9, 8, 2),
+                Ipv4Addr::new(10, 9, 8, 3),
+                Ipv4Addr::new(10, 9, 8, 4),
+                Ipv4Addr::new(10, 9, 8, 5),
+                Ipv4Addr::new(10, 9, 8, 6),
+            ]
+        );
+        // Exhausted: no panic and no silent wrap into the next subnet.
+        assert_eq!(driver.allocate_ip(), Ipv4Addr::new(10, 9, 8, 6));
+    }
+
     #[test]
     fn mac_is_local_and_unique_per_address() {
         let mac = mac_for(Ipv4Addr::new(10, 42, 0, 7));
         assert_eq!(mac.0[0] & 0b11, 0b10, "locally administered unicast");
         assert_eq!(mac.0[5], 7);
+        assert_eq!(&mac.0[2..4], &[10, 42], "all four IP octets are used");
         assert_ne!(
             mac,
             mac_for(Ipv4Addr::new(10, 42, 0, 8)),
             "each address gets its own MAC"
+        );
+        assert_ne!(
+            mac,
+            mac_for(Ipv4Addr::new(10, 43, 0, 7)),
+            "the same host address in another subnet differs too"
         );
     }
 }

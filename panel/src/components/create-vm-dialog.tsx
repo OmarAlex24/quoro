@@ -12,7 +12,10 @@ import { Input } from './ui/input';
 import { ProblemBanner } from './ui/problem-banner';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 
-const DEFAULT_IMAGE = 'docker.io/library/alpine:3.22';
+// A VM runs its image's default command, and M1 has no field to override it:
+// an image whose command exits at once (alpine's shell) stops right after it
+// starts. whoami is a small static HTTP server that keeps running.
+const DEFAULT_IMAGE = 'docker.io/traefik/whoami:v1.11';
 
 interface FormState {
   name: string;
