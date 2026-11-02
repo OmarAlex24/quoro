@@ -1,0 +1,19 @@
+# Workspace root. Members follow the workspace layout in
+# docs/architecture/architecture.md section 17; only the crates M0 needs exist.
+# Every dependency must be justified: see DEPENDENCIES.md.
+[workspace]
+resolver = "3"
+members = [
+    "crates/engine",
+    "crates/proto",
+    "crates/node-agent",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

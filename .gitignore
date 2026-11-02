@@ -1,2 +1,5 @@
 .claude/settings.local.json
 .claude/*.local.*
+
+# Cargo build output
+/target/
