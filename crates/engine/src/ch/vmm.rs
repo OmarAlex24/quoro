@@ -631,18 +631,21 @@ mod tests {
 #[cfg(test)]
 mod lab {
     //! Lab-only tests of the VMM process layer, below the engine: they need
-    //! KVM and root, plus
+    //! KVM and root. Run with `crates/engine/scripts/lab-suite.sh` (it fetches
+    //! the pinned artifacts, builds `quoro-init` and the probe images, resolves
+    //! the alpine digest and runs every lab suite as root); the variables below
+    //! are what it sets.
     //!
+    //! - `QUORO_ENGINE_LAB=1`: the lab switch every test checks;
     //! - `QUORO_ENGINE_ARTIFACTS`: the pinned `cloud-hypervisor-static` and
     //!   guest kernel (`scripts/fetch-pinned.sh`);
     //! - `QUORO_ENGINE_PROBE_DIR`: two raw ext4 root filesystems booted with
     //!   `init=/quoro/init`: `probe.ext4`, whose init powers the guest off at
-    //!   once, and `pb.ext4`, whose init waits for the ACPI power button and
-    //!   then powers off.
+    //!   once, and `pb.ext4`, whose init ignores the ACPI power button and
+    //!   keeps running.
     //!
-    //! Scratch files go under `/var/tmp/quoro-vmm-lab`. Run with
-    //! `QUORO_ENGINE_LAB=1 cargo test -p quoro-engine ch:: -- --ignored --test-threads=1`.
-    //! The end-to-end engine suite is `tests/ch_lab.rs`.
+    //! Scratch files go under `/var/tmp/quoro-vmm-lab`. The end-to-end engine
+    //! suite is `tests/ch_lab.rs`.
 
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};

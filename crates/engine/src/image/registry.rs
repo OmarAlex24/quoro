@@ -23,7 +23,7 @@ use crate::image::oci::{
     ACCEPTED_MANIFEST_TYPES, ConfigDoc, Descriptor, Kind, Manifest, classify, parse_image_config,
     parse_index, parse_manifest, select_platform,
 };
-use crate::{EngineError, ImageConfig, ImageRef};
+use crate::{EngineError, ImageConfig, ImageDigest, ImageRef};
 
 /// One layer, downloaded and ready to apply.
 pub(crate) struct PulledLayer {
@@ -65,6 +65,42 @@ pub(crate) fn digest_hex(digest: &str) -> Result<&str, EngineError> {
 /// `sha256:<lowercase hex>` of `bytes`.
 pub(crate) fn sha256_digest(bytes: &[u8]) -> String {
     format!("sha256:{}", crate::image::hex(&Sha256::digest(bytes)))
+}
+
+/// Resolves `reference` to `sha256:<digest>`.
+///
+/// A digest already on the reference costs no network access; anything else is
+/// a `HEAD` (or a `GET`) against the registry the reference names.
+///
+/// # Errors
+///
+/// `Image` when the reference cannot be parsed, a pinned digest is malformed,
+/// the registry refuses or cannot be reached, or it answers with a digest that
+/// is not `sha256`.
+pub(crate) async fn resolve_digest(reference: &str) -> Result<ImageDigest, EngineError> {
+    let parsed: Reference = Reference::try_from(reference).map_err(|err| {
+        EngineError::Image(format!("invalid image reference {reference:?}: {err}"))
+    })?;
+    if let Some(digest) = parsed.digest() {
+        digest_hex(digest).map_err(|_| {
+            EngineError::Image(format!(
+                "image reference {reference:?} pins {digest}; expected sha256: followed by 64 lowercase hex digits"
+            ))
+        })?;
+        return Ok(ImageDigest(digest.to_owned()));
+    }
+
+    let client = Client::new(ClientConfig::default());
+    let digest = client
+        .fetch_manifest_digest(&parsed, &RegistryAuth::Anonymous)
+        .await
+        .map_err(|err| EngineError::Image(format!("resolving the digest of {reference}: {err}")))?;
+    digest_hex(&digest).map_err(|_| {
+        EngineError::Image(format!(
+            "the registry answered {digest} for {reference}; only sha256 is supported"
+        ))
+    })?;
+    Ok(ImageDigest(digest))
 }
 
 /// Resolves the reference to pull by digest.

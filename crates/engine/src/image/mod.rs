@@ -7,6 +7,10 @@
 //! `mkfs.ext4 -d`, record the image's [`ImageConfig`], and cache the result by
 //! digest.
 //!
+//! The engine caches by digest, so a caller that only has the reference the
+//! user typed ([`resolve_digest`]) can ask the registry what it points at
+//! before preparing it.
+//!
 //! Only anonymous registry authentication is implemented. Private registries
 //! are a later item; a registry that requires credentials fails with the
 //! registry's own message.
@@ -38,6 +42,22 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
         text.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
     }
     text
+}
+
+/// Resolves an image reference to the digest the store caches by.
+///
+/// A reference that already pins a digest (`name@sha256:…`) resolves offline:
+/// the digest is validated and used as is. A tag or a bare name asks the
+/// registry for the manifest digest it currently points at, which is how a
+/// control plane that stores `ghcr.io/example/app:latest` still gets a stable
+/// cache key.
+///
+/// # Errors
+///
+/// `Image` when the reference or its digest is malformed, or when the registry
+/// cannot be reached or answers with a digest other than `sha256`.
+pub async fn resolve_digest(reference: &str) -> Result<ImageDigest, EngineError> {
+    registry::resolve_digest(reference).await
 }
 
 /// Where the store keeps its files and which tools it runs.
@@ -305,6 +325,32 @@ mod tests {
             Err(EngineError::Image(_))
         ));
         std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn resolve_digest_uses_a_pinned_digest_without_network() {
+        let reference = format!("docker.io/library/alpine@sha256:{HEX}");
+        assert_eq!(
+            resolve_digest(&reference).await.expect("pinned digest"),
+            digest(HEX)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_digest_rejects_a_malformed_pin_without_network() {
+        for reference in [
+            "docker.io/library/alpine@sha256:beef".to_string(),
+            "docker.io/library/alpine@sha512:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_string(),
+            String::new(),
+        ] {
+            assert!(
+                matches!(
+                    resolve_digest(&reference).await,
+                    Err(EngineError::Image(_))
+                ),
+                "{reference:?} should be refused before any network use"
+            );
+        }
     }
 
     #[tokio::test]

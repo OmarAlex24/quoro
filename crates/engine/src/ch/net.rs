@@ -640,6 +640,10 @@ table ip quoro_qw5br0 {
     }
 
     // --- lab tests: need root and a real network namespace -------------------
+    //
+    // Run them with `crates/engine/scripts/lab-suite.sh --only net`; it builds
+    // the test binaries as the normal user, sets `QUORO_ENGINE_LAB=1` and runs
+    // the suite as root.
 
     fn lab_enabled() -> bool {
         std::env::var("QUORO_ENGINE_LAB").is_ok_and(|value| value == "1")
