@@ -1,0 +1,96 @@
+[package]
+name = "quoro"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "quoro"
+path = "src/main.rs"
+
+[dependencies]
+quoro-control-plane = { path = "../control-plane" }
+quoro-engine = { path = "../engine" }
+quoro-types = { path = "../types" }
+# The async runtime: listener, signals, the driver channel and the driver loop.
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "signal",
+    "sync",
+    "time",
+] }
+# The router the control plane returns, and `into_make_service` for the listener.
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "tokio",
+] }
+# HTTPS listener on top of axum (D-0054: one TLS port). The no-provider feature
+# leaves the crypto provider to `rustls` below, so aws-lc-rs never enters the
+# build (D-0080).
+axum-server = { version = "0.7", default-features = false, features = [
+    "tls-rustls-no-provider",
+] }
+# TLS for the listener; `ring` is the provider D-0080 allows.
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
+# Generates the self-signed certificate at first start, with the same provider.
+rcgen = { version = "0.13", default-features = false, features = [
+    "ring",
+    "pem",
+] }
+# `/etc/quoro/quoro.toml` is TOML (D-0054).
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+# `Config` is deserialized from that file.
+serde = { version = "1", default-features = false, features = [
+    "derive",
+    "std",
+] }
+# Structured logs to stderr, which systemd forwards to journald (D-0054).
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+# The log subscriber; `ansi` is left off because journald stores plain text.
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt",
+    "std",
+] }
+# Polls the engine's `EventStream` with `std::future::poll_fn` (no `futures`).
+futures-core = { version = "0.3", default-features = false }
+# `quoro setup-token` refuses once an owner exists. The store exposes its pool
+# but no query helper, so the binary runs that one `SELECT` itself.
+sqlx = { version = "0.8", default-features = false, features = [
+    "sqlite",
+    "runtime-tokio",
+] }
+
+[dev-dependencies]
+# The end-to-end test drives the binary over real HTTPS with a cookie jar.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "cookies",
+    "rustls-tls-manual-roots-no-provider",
+] }
+# The test installs the ring provider reqwest's no-provider TLS feature needs.
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+] }
+# The test reads the JSON bodies of the API.
+serde_json = { version = "1", default-features = false, features = ["std"] }
+# The test spawns the binary (`process`), reads its stderr (`io-util`) and
+# polls with a timeout (`time`).
+tokio = { version = "1", features = [
+    "process",
+    "macros",
+    "rt-multi-thread",
+    "time",
+    "io-util",
+] }

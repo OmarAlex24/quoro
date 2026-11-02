@@ -1,0 +1,16 @@
+[package]
+name = "quoro-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Ids, scopes and roles are serialized in API bodies and audit records.
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
+# Ids are ULIDs; the random part comes from the OS generator.
+getrandom = { version = "0.3", default-features = false }

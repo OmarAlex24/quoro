@@ -7,6 +7,9 @@ members = [
     "crates/engine",
     "crates/proto",
     "crates/node-agent",
+    "crates/types",
+    "crates/control-plane",
+    "crates/quoro",
 ]
 
 [workspace.package]
