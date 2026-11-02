@@ -12,6 +12,8 @@ Rules:
   where the crate allows it.
 - Test-only needs go in `[dev-dependencies]` and are listed separately.
 - `Cargo.lock` is committed and every build and test in CI runs with `--locked`.
+- A new dependency must pass `cargo deny check`: its license is on the ADR 0080
+  allowlist and it comes from crates.io.
 
 ## Runtime dependencies
 
@@ -34,3 +36,4 @@ Rules:
 | --- | --- | --- |
 | `actions/checkout`, pinned by commit SHA | `.github/workflows/ci.yml` | Checks out the repository in CI; the only third-party action |
 | `pyyaml`, `jsonschema`, `openapi-spec-validator`, pinned versions | `.github/scripts/requirements.txt` | Validate `openapi.yaml` against OpenAPI 3.1 and `events.schema.json` against JSON Schema 2020-12 in CI (`docs/contracts/README.md`, "Validation"); `scripts/check_contracts.py` stays standard-library only |
+| `cargo-deny` 0.20.2, pinned by version and sha256 | `.github/workflows/ci.yml`, `deny.toml` | Enforces the ADR 0080 license allowlist, RustSec advisories, the duplicate-version report and the crates.io-only source policy |

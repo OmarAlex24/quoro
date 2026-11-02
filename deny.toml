@@ -1,0 +1,66 @@
+# cargo-deny configuration for the Quoro workspace.
+#
+# Implements ADR 0080 (dependency license policy for the AGPL-3.0-only core) and
+# the dependency rules in DEPENDENCIES.md. CI runs this file, so a change here is
+# a policy change: it needs a decision, not a local workaround.
+
+[graph]
+# No `targets` list: every target of the workspace is checked, and
+# dev-dependencies are included with the defaults.
+
+[licenses]
+version = 2
+# Every license a dependency is under must be one of these. ADR 0080 is the
+# source of the list; do not add a license here without a superseding ADR.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "AGPL-3.0-only",
+]
+# Licenses are compared after normalisation; require a confident detection.
+confidence-threshold = 0.93
+# The allowlist is the policy, not a list of what is used today.
+unused-allowed-license = "allow"
+
+# No `exceptions`: an exception for one crate is a policy decision and needs a
+# recorded decision (ADR 0080). Add it to the allowlist through a new ADR
+# instead of exempting a single crate.
+
+[licenses.private]
+# Our own crates are `publish = false` and AGPL-3.0-only. They are checked
+# against the allowlist like every other crate, so the workspace license cannot
+# drift away from ADR 0080 unnoticed.
+ignore = false
+
+[advisories]
+version = 2
+# `vulnerability` keeps its default of "deny": a known vulnerability fails CI.
+unmaintained = "workspace"
+yanked = "deny"
+# No advisory is ignored today. An ignore is a policy decision and needs a
+# recorded decision with the advisory id, the reason and the date.
+ignore = []
+
+[bans]
+# Duplicate versions are reported by the check but are not fatal: a duplicate is
+# a finding for review, not a build failure.
+multiple-versions = "warn"
+# Wildcard version requirements hide which version is actually used.
+wildcards = "deny"
+# Workspace members depend on each other by path, which is not a wildcard.
+allow-wildcard-paths = true
+highlight = "all"
+
+[sources]
+# crates.io is the only source; anything else must be a recorded decision.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
