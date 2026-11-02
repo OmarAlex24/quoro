@@ -17,13 +17,14 @@ Rules:
 
 | Crate | Used by | Features | Why |
 | --- | --- | --- | --- |
-| (none yet) | | | |
+| `tokio` | `crates/engine` | `io-util`, `sync`, `time` (no default features) | The engine trait is async; `io-util` gives the `AsyncRead`/`AsyncWrite` bounds the contract's console stream uses and the fake's in-memory console pipe, `sync` the fake's event and output channels, `time` the fake's injected stop delays |
+| `futures-core` | `crates/engine` | no default features | `EventStream` and `LineStream` in `docs/contracts/engine-trait.md` section 2 are `futures_core::Stream` trait objects |
 
 ## Test-only dependencies
 
 | Crate | Used by | Features | Why |
 | --- | --- | --- | --- |
-| (none yet) | | | |
+| `tokio` | `crates/engine` | `macros`, `rt`, `test-util`, `io-util`, `sync`, `time` | `#[tokio::test]` needs the macro and a runtime; `test-util` pauses the clock so the injected stop sleeps are deterministic |
 
 ## Tooling outside Cargo
 
