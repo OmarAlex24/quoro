@@ -63,8 +63,8 @@ disk").
 
 ## Results (2026-11-02)
 
-Host: a Debian 13 VM (kernel 6.12, 2 vCPU, 4 GB) with nested KVM on an Intel
-i7-10700T. **Nested virtualization: these numbers check correctness only and are
+Host: a Debian 13 VM (kernel 6.12, 2 vCPU, 4 GB) with nested KVM.
+**Nested virtualization: these numbers check correctness only and are
 not benchmarks.**
 
 Serial console of the alpine run (kernel lines omitted):
