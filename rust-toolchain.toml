@@ -1,0 +1,6 @@
+# One pinned toolchain for local builds and CI, so a clean clone builds the
+# same way everywhere. Bump it in its own PR.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

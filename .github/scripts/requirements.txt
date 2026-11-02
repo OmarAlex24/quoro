@@ -1,0 +1,4 @@
+# Pinned validators for .github/scripts/validate_contracts.py.
+pyyaml==6.0.3
+jsonschema==4.26.0
+openapi-spec-validator==0.9.0
