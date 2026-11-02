@@ -26,7 +26,11 @@ tag, for example the source of a workflow_dispatch dry run (ADR 0082). The
 version is then the Cargo version, as in the dry run, and --sums is required:
 pass the SHA256SUMS from the dry run's workflow artifact.
 
+The work directory is created under TMPDIR (default /tmp) and needs about
+5 GB free; /tmp is often a small tmpfs, so point TMPDIR at a disk.
+
 Environment:
+  TMPDIR                  where the work directory is created
   QUORO_REPO_URL          repository to fetch (default: https://github.com/OmarAlex24/quoro)
   QUORO_KEEP              set to 1 to keep the work directory (its path is printed)
   QUORO_CONTAINER_ENGINE  podman or docker (default: podman if installed)
@@ -134,6 +138,19 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+# The build tree (target/, node_modules, crate cache) takes a few GB. Fail now
+# instead of minutes into the build when the work directory sits on a small
+# tmpfs.
+need_kb=$((5 * 1024 * 1024))
+free_kb=$(df -Pk "$work" | awk 'NR == 2 { print $4 }') ||
+	die "cannot read the free space in $work"
+case "$free_kb" in
+'' | *[!0-9]*) die "cannot read the free space in $work" ;;
+esac
+if [ "$free_kb" -lt "$need_kb" ]; then
+	die "only $((free_kb / 1024)) MB free in $work; the rebuild needs about 5 GB. Set TMPDIR to a directory on a larger disk"
+fi
 
 # Read the checksum file first: a bad path or URL should fail before a long
 # build. HTTPS only, so a redirect or a plain-http URL cannot downgrade the

@@ -178,7 +178,10 @@ artifacts only; it never creates a tag, a release or a draft release.
 
 ## Reproduce a release
 
-Needs an x86_64 Linux host with podman (preferred) or docker, git and curl.
+Needs an x86_64 Linux host with podman (preferred) or docker, git and curl,
+and about 5 GB free where the work directory is created. That is `TMPDIR`
+(default `/tmp`); `/tmp` is often a small tmpfs, so point `TMPDIR` at a disk,
+for example `TMPDIR=$HOME/quoro-reproduce` (the directory must exist).
 
 ```sh
 packaging/reproduce-release.sh v0.1.0
