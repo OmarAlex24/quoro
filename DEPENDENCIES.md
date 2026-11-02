@@ -41,6 +41,7 @@ Rules:
 | `tracing` | `crates/quoro` | `std` | Structured start, driver and error logs |
 | `tracing-subscriber` | `crates/quoro` | `fmt`, `std` (no default features, so no ANSI colours) | Writes those logs as plain text to stderr, which systemd forwards to journald |
 | `futures-core` | `crates/quoro` | no default features | Polls the engine's `EventStream` with `std::future::poll_fn` instead of pulling in `futures` |
+| `rust-embed` | `crates/quoro` | `deterministic-timestamps` (no default features) | Compiles `panel/dist` into the binary so one file serves the panel (D-0056); `allow_missing` lets a Rust-only build compile, and deterministic timestamps keep release builds reproducible (ADR 0027). It brings a second `sha2` (0.11, for its own file hashes) next to the 0.10 the control plane uses; every 8.x release does |
 | `sqlx` | `crates/quoro` | `sqlite`, `runtime-tokio` | `quoro setup-token` checks for an existing owner with one query on the store's pool |
 
 ## Test-only dependencies
