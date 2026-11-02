@@ -131,7 +131,7 @@ pub struct Vm {
     #[schema(minimum = 1)]
     pub memory_mb: i64,
     /// Root disk in gibibytes.
-    #[schema(minimum = 0)]
+    #[schema(minimum = 1)]
     pub disk_gb: i64,
     /// OCI reference with digest, the rootfs the VM boots.
     pub image: String,
@@ -193,7 +193,7 @@ pub struct CreateVmRequest {
     #[schema(minimum = 1)]
     pub memory_mb: i64,
     /// Root disk in gibibytes.
-    #[schema(minimum = 0)]
+    #[schema(minimum = 1)]
     pub disk_gb: i64,
     /// OCI reference the VM boots.
     pub image: String,
@@ -327,8 +327,7 @@ fn validate_create(body: &CreateVmRequest) -> Result<(), ApiError> {
     if body.memory_mb < 1 {
         return Err(ApiError::validation("memory_mb must be at least 1"));
     }
-    // The contract (`CreateVmRequest.disk_gb`) allows 0 but `vms.disk_gb` has
-    // `CHECK (disk_gb >= 1)`, so 0 is refused until Q-0088 is decided.
+    // `CreateVmRequest.disk_gb` has `minimum: 1`, matching `CHECK (disk_gb >= 1)`.
     if body.disk_gb < 1 {
         return Err(ApiError::validation("disk_gb must be at least 1"));
     }
