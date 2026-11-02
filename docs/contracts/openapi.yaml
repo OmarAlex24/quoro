@@ -2296,6 +2296,7 @@ components:
         - node:read
         - node:enroll
         - node:remove
+        - node:fence_ack
         - project:read
         - project:write
         - project:delete
