@@ -7,3 +7,27 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# The engine trait is async and the fake engine uses channels, duplex streams
+# and the paused test clock; only those modules are enabled.
+tokio = { version = "1", default-features = false, features = [
+    "io-util",
+    "sync",
+    "time",
+] }
+# The contract's `EventStream` and `LineStream` are `futures_core::Stream`
+# trait objects; the concrete stream is implemented in this crate.
+futures-core = { version = "0.3", default-features = false }
+
+[dev-dependencies]
+# Tests need the `#[tokio::test]` macro, a runtime, and the paused clock
+# (`test-util`) to make the injected sleeps deterministic.
+tokio = { version = "1", features = [
+    "macros",
+    "rt",
+    "test-util",
+    "io-util",
+    "sync",
+    "time",
+] }
