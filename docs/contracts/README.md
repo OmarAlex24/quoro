@@ -172,7 +172,8 @@ Event `type` is `<subject>.<what>` in lowercase with underscores. The complete l
 | `node.enrolled` | A node completed enrollment | |
 | `node.connected` | A node's session started | |
 | `node.disconnected` | A node's session ended or missed heartbeats | |
-| `node.fenced` | A node self-fenced stateful apps after losing a lease | |
+| `node.fenced` | A node self-fenced stateful apps after losing a lease, every bound VM confirmed stopped | |
+| `node.fence_failed` | A node could not confirm a fence stopped its stateful VMs; it marked itself failed | |
 | `node.disk_low` | A node's free disk fell below its threshold | disk full |
 | `vm.created` | A VM was created | |
 | `vm.started` | A VM reached `running` | |
@@ -267,8 +268,6 @@ Defined in db-schema.sql: `meta`, `change_log`, `nodes`, `node_join_tokens`, `pr
 
 | Element | Recommended | Open alternative |
 | --- | --- | --- |
-| Cluster key custody on promotion | Replicate both keys wrapped to each replica's node key | Re-key on promotion with an operator-confirmed re-pin (open, Q-0024) |
-| OCI image to rootfs conversion and minimal init | Own Rust init and own OCI-to-ext4 pipeline, settled by the M0 spike (engine-trait.md) | Reuse an existing guest agent and tooling (open, Q-0003) |
-| Snapshot primitive under the chunk engine | Reflink snapshots with a full chunk scan for M5a (engine-trait.md) | lvm-thin, ZFS or btrfs, or own dirty tracking (open, Q-0004) |
+| Cluster key custody on promotion | Replicate both keys wrapped to each replica's node key | Re-key on promotion with an operator-confirmed re-pin (open; decided with manual promotion in M5b, D-0067) |
 
-None of these rows blocks the contract freeze: promotion arrives in M5 and the key files and message shapes it needs already exist; the `Engine` trait shape is fixed and only the implementation behind `prepare_image` and `snapshot_volume` is open. Every other element formerly listed here is decided (D-0047, D-0048, D-0050, D-0051, D-0052, D-0053, D-0054, D-0056, D-0057).
+Only key custody on promotion is still open. It does not block the freeze: promotion arrives in M5b and the key files and message shapes it needs already exist. The image pipeline and init are decided (D-0061), and so is the M5a snapshot primitive (D-0062), with an lvm-thin vs btrfs spike before M5b. Every other element formerly listed here is decided (D-0047, D-0048, D-0050, D-0051, D-0052, D-0053, D-0054, D-0056, D-0057, D-0061, D-0062, D-0067, D-0071, D-0072, D-0073, D-0074).

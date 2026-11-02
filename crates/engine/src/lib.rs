@@ -1,17 +1,18 @@
 //! The `Engine` boundary behind which a virtual machine monitor sits.
 //!
 //! `docs/contracts/engine-trait.md` is the binding contract for every type and
-//! method in this crate. Section 2 is reproduced here unchanged, plus additive
-//! items the contract leaves to the implementation: derives that make the types
-//! cloneable and comparable, the [`MacAddr`] newtype, `Display` and `Error` for
-//! [`EngineError`], a blanket [`ConsoleIo`] implementation for tokio's duplex
-//! and socket streams, and [`VmSpec::canonical`] for the idempotency rule in
-//! section 3.6.
+//! method in this crate. Section 2 is reproduced here unchanged. The additive
+//! items added during M0 are part of the contract too (D-0071): derives that
+//! make the types cloneable and comparable, the [`MacAddr`] newtype, `Display`
+//! and `Error` for [`EngineError`], a blanket [`ConsoleIo`] implementation for
+//! tokio's duplex and socket streams, and [`VmSpec::canonical`] for the
+//! idempotency rule in section 3.6.
 //!
 //! [`FakeEngine`] is an in-memory implementation for tests; it lives in
 //! [`fake`].
 
 use std::fmt;
+use std::future::Future;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -285,44 +286,69 @@ pub type ConsoleStream = Pin<Box<dyn ConsoleIo>>;
 
 /// The boundary behind which a virtual machine monitor sits.
 ///
-/// The contract chooses `async fn` in traits and enum dispatch instead of
-/// `dyn`, per section 1, so the lint about missing `Send` bounds on the
-/// futures is accepted deliberately.
-#[allow(async_fn_in_trait)]
+/// The async methods return `impl Future<Output = _> + Send`, so a caller
+/// generic over `E: Engine` can spawn an engine call on the tokio runtime
+/// (D-0071). A backend still implements them with `async fn`. The trait is not
+/// object-safe, which is why the node agent selects a backend through an enum;
+/// a `dyn` need would be met by boxed futures with otherwise identical
+/// signatures.
 pub trait Engine: Send + Sync {
     // Host and node preparation
-    async fn capabilities(&self) -> Capabilities;
-    async fn probe_host(&self) -> Result<HostProbe, EngineError>;
-    async fn ensure_network(&self, net: &NodeNetwork) -> Result<(), EngineError>;
+    fn capabilities(&self) -> impl Future<Output = Capabilities> + Send;
+    fn probe_host(&self) -> impl Future<Output = Result<HostProbe, EngineError>> + Send;
+    fn ensure_network(
+        &self,
+        net: &NodeNetwork,
+    ) -> impl Future<Output = Result<(), EngineError>> + Send;
 
     // Images
-    async fn prepare_image(&self, image: &ImageRef) -> Result<PreparedImage, EngineError>;
-    async fn remove_image(&self, digest: &ImageDigest) -> Result<(), EngineError>;
+    fn prepare_image(
+        &self,
+        image: &ImageRef,
+    ) -> impl Future<Output = Result<PreparedImage, EngineError>> + Send;
+    fn remove_image(
+        &self,
+        digest: &ImageDigest,
+    ) -> impl Future<Output = Result<(), EngineError>> + Send;
 
     // Lifecycle
-    async fn create(&self, spec: &VmSpec) -> Result<VmInfo, EngineError>;
-    async fn start(&self, id: &VmId) -> Result<VmInfo, EngineError>;
-    async fn stop(&self, id: &VmId, mode: StopMode) -> Result<VmInfo, EngineError>;
-    async fn delete(&self, id: &VmId) -> Result<(), EngineError>;
-    async fn inspect(&self, id: &VmId) -> Result<VmInfo, EngineError>;
-    async fn list(&self) -> Result<Vec<VmInfo>, EngineError>;
+    fn create(&self, spec: &VmSpec) -> impl Future<Output = Result<VmInfo, EngineError>> + Send;
+    fn start(&self, id: &VmId) -> impl Future<Output = Result<VmInfo, EngineError>> + Send;
+    fn stop(
+        &self,
+        id: &VmId,
+        mode: StopMode,
+    ) -> impl Future<Output = Result<VmInfo, EngineError>> + Send;
+    fn delete(&self, id: &VmId) -> impl Future<Output = Result<(), EngineError>> + Send;
+    fn inspect(&self, id: &VmId) -> impl Future<Output = Result<VmInfo, EngineError>> + Send;
+    fn list(&self) -> impl Future<Output = Result<Vec<VmInfo>, EngineError>> + Send;
 
     // Observation
     fn events(&self) -> EventStream;
     fn output(&self, id: &VmId) -> Result<LineStream, EngineError>;
     fn console(&self, id: &VmId) -> Result<ConsoleStream, EngineError>;
-    async fn counters(&self, id: &VmId) -> Result<VmCounters, EngineError>;
+    fn counters(&self, id: &VmId) -> impl Future<Output = Result<VmCounters, EngineError>> + Send;
 
     // Volumes (M5; default implementations return Unsupported)
-    async fn snapshot_volume(&self, _id: &VolumeId) -> Result<VolumeSnapshot, EngineError> {
-        Err(EngineError::Unsupported(
-            "volume snapshots are not implemented by this engine".into(),
-        ))
+    fn snapshot_volume(
+        &self,
+        _id: &VolumeId,
+    ) -> impl Future<Output = Result<VolumeSnapshot, EngineError>> + Send {
+        async {
+            Err(EngineError::Unsupported(
+                "volume snapshots are not implemented by this engine".into(),
+            ))
+        }
     }
-    async fn delete_volume_snapshot(&self, _snap: &VolumeSnapshot) -> Result<(), EngineError> {
-        Err(EngineError::Unsupported(
-            "volume snapshots are not implemented by this engine".into(),
-        ))
+    fn delete_volume_snapshot(
+        &self,
+        _snap: &VolumeSnapshot,
+    ) -> impl Future<Output = Result<(), EngineError>> + Send {
+        async {
+            Err(EngineError::Unsupported(
+                "volume snapshots are not implemented by this engine".into(),
+            ))
+        }
     }
 }
 

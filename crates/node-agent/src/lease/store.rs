@@ -83,6 +83,14 @@ pub trait LeaseStore {
     fn record_fence(&self, record: FenceRecord);
     /// Every recorded self-fence.
     fn fences(&self) -> Vec<FenceRecord>;
+    /// Sets the node's failed mark (section 12 `node_meta`).
+    ///
+    /// The mark means the node may still be running a VM whose lease it lost.
+    /// Clearing it is an operator action that arrives later; the agent only
+    /// ever sets it.
+    fn set_node_failed(&self, failed: bool);
+    /// Whether the node is marked failed (section 12 `node_meta`).
+    fn node_failed(&self) -> bool;
 }
 
 /// Everything the store keeps, behind one mutex.
@@ -91,6 +99,7 @@ struct Inner {
     leases: Vec<StoredLease>,
     highest: Vec<((ResourceType, String), u64)>,
     fences: Vec<FenceRecord>,
+    failed: bool,
 }
 
 /// An in-memory [`LeaseStore`].
@@ -152,5 +161,13 @@ impl LeaseStore for MemoryLeaseStore {
 
     fn fences(&self) -> Vec<FenceRecord> {
         self.lock().fences.clone()
+    }
+
+    fn set_node_failed(&self, failed: bool) {
+        self.lock().failed = failed;
+    }
+
+    fn node_failed(&self) -> bool {
+        self.lock().failed
     }
 }

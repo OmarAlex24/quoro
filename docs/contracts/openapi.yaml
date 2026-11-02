@@ -1770,9 +1770,11 @@ components:
       type: object
       title: Lease
       description: |
-        A lease on an app or on the primary status. `fencing_token` increases
-        strictly per resource and is never reused, so a stale holder can be fenced
-        (D-0019). Shape only in the API until M5b.
+        A lease on an app or on the primary status. `fencing_token` changes only
+        on ownership change: it stays the same across renewals by the same holder
+        and increases strictly when the lease goes to a new holder or is granted
+        again after expiry or revoke; never reused (D-0019, D-0073). Shape only in
+        the API until M5b.
       required:
         - id
         - resource_type
@@ -1808,7 +1810,7 @@ components:
         fencing_token:
           type: integer
           minimum: 1
-          description: Strictly increasing token per resource, never reused.
+          description: Changes only on ownership change; the same across renewals by the same holder, strictly higher for a new holder or a grant after expiry or revoke; never reused.
         duration_ms:
           type: [integer, 'null']
           description: Lease duration in milliseconds; expiring leases only.
@@ -2703,6 +2705,7 @@ components:
         - node.connected
         - node.disconnected
         - node.fenced
+        - node.fence_failed
         - node.disk_low
         - vm.created
         - vm.started

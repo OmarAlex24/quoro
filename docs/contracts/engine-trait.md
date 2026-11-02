@@ -13,18 +13,21 @@ This file is a contract about behaviour, not about file layout. Names of modules
 | Property | Choice | Why |
 | --- | --- | --- |
 | Language | Rust, async, `tokio` runtime | The node agent is Rust and async; the engine runs in its process |
-| Dispatch | One trait, implemented per backend, selected by an enum at start-up | No `dyn` requirement, so `async fn` in traits is usable |
+| Dispatch | One trait, implemented per backend, selected by an enum at start-up | The trait is not object-safe, so there is no `dyn`; boxed futures would meet one |
 | Ownership | One engine instance per node, shared by the node agent as `Arc` | Serialization of per-VM operations happens above the engine |
 | Process model | One VMM process per VM, outside the agent process | A VMM survives an agent restart, so an upgrade does not restart apps (D-0011) |
 | State | The engine owns node-local files; the cluster state is the node agent's | Desired state is signed and stored by the agent, not by the engine (D-0011) |
 | Telemetry | The engine exposes streams and counters; it stores no logs | Logs and metrics stay on the node (D-0014) |
 
-**Recommendation, not a frozen choice:** the trait uses `async fn` in traits instead of `#[async_trait]`, on the Rust 2024 edition. **Hypothesis:** `async fn` in traits is stable on that edition and is not object-safe, which is why the node agent selects a backend through an enum (`enum Backend { CloudHypervisor(ChEngine), Fake(FakeEngine) }`) rather than `Box<dyn Engine>`. If the M0 spike finds a reason to need `dyn`, the change is mechanical: return boxed futures, keep every signature otherwise identical.
+The async methods are declared as `fn ... -> impl Future<Output = ...> + Send`, so a caller generic over `E: Engine` can `tokio::spawn` an engine call (D-0071); backends still implement them with `async fn`. The trait is not object-safe, which is why the node agent selects a backend through an enum (`enum Backend { CloudHypervisor(ChEngine), Fake(FakeEngine) }`) rather than `Box<dyn Engine>`; a need for `dyn` would be met by boxed futures with otherwise identical signatures.
 
 ## 2. The trait
 
 ```rust
-// Rust 2024 edition. Recommendation pending the M0 spike.
+// Rust 2024 edition (D-0071).
+use std::fmt;
+use std::future::Future;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::{Duration, SystemTime};
@@ -43,16 +46,22 @@ pub struct VolumeId(pub String);
 /// "sha256:<64 hex>".
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ImageDigest(pub String);
+
+/// A MAC address, six bytes in the order the guest sees them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MacAddr(pub [u8; 6]);
 ```
 
 ```rust
 /// An image as requested, and the digest it resolved to.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageRef {
     pub reference: String,
     pub digest: ImageDigest,
 }
 
 /// A rootfs that is ready to boot. Cached by digest.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedImage {
     pub digest: ImageDigest,
     pub rootfs_path: PathBuf,
@@ -61,6 +70,7 @@ pub struct PreparedImage {
 }
 
 /// What the image says about how to run it, read from its OCI config.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageConfig {
     pub entrypoint: Vec<String>,
     pub cmd: Vec<String>,
@@ -73,6 +83,7 @@ pub struct ImageConfig {
 
 ```rust
 /// Everything needed to create one microVM.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VmSpec {
     pub id: VmId,
     pub vcpus: u8,
@@ -87,18 +98,47 @@ pub struct VmSpec {
     pub console: ConsoleMode,
 }
 
+impl VmSpec {
+    /// The canonical form used to decide whether two specs are the same.
+    ///
+    /// Section 3.6 compares the same `id` by the canonical form of `VmSpec`,
+    /// so `env` is sorted by `(name, value)` and `volumes` by
+    /// `(volume_id, mount_path)`. Everything else keeps its order: it is
+    /// either a scalar or an ordered list where order is meaningful.
+    #[must_use]
+    pub fn canonical(&self) -> VmSpec {
+        let mut canonical = self.clone();
+        canonical
+            .init
+            .env
+            .sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        canonical.volumes.sort_by(|a, b| {
+            a.volume_id
+                .0
+                .cmp(&b.volume_id.0)
+                .then_with(|| a.mount_path.cmp(&b.mount_path))
+        });
+        canonical
+    }
+}
+
+/// A volume attached to a VM at a mount path inside the guest.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VolumeAttach {
     pub volume_id: VolumeId,
     pub mount_path: String,
 }
 
+/// The VM's network attachment on the node bridge.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NetAttach {
-    pub ip: std::net::Ipv4Addr,
-    pub gateway: std::net::Ipv4Addr,
+    pub ip: Ipv4Addr,
+    pub gateway: Ipv4Addr,
     pub mac: MacAddr,
 }
 
 /// The app's command line and identity, as the minimal init must apply it.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InitConfig {
     pub entrypoint: Vec<String>,
     pub cmd: Vec<String>,
@@ -107,6 +147,8 @@ pub struct InitConfig {
     pub workdir: Option<String>,
 }
 
+/// How (and whether) a console device is attached.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConsoleMode {
     /// No console device.
     Off,
@@ -118,6 +160,8 @@ pub enum ConsoleMode {
 ```
 
 ```rust
+/// How a stop is requested.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StopMode {
     /// Ask the guest to stop and wait at most this long.
     Graceful { timeout: Duration },
@@ -138,6 +182,8 @@ pub enum VmState {
     Unknown,
 }
 
+/// One VM's observed state.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VmInfo {
     pub id: VmId,
     pub state: VmState,
@@ -147,23 +193,31 @@ pub struct VmInfo {
     pub exit_code: Option<i32>,
 }
 
+/// A lifecycle event for any VM on the node. Section 3.12.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EngineEvent {
     Started { id: VmId },
     Exited { id: VmId, code: i32 },
     Crashed { id: VmId, reason: String },
 }
 
+/// One tagged line of app output.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutputLine {
     pub stream: OutputStream,
     pub time: SystemTime,
     pub line: String,
 }
 
+/// Which of the app's two output streams a line came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OutputStream {
     Stdout,
     Stderr,
 }
 
+/// Cumulative counters since VM start. Section 3.15.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VmCounters {
     pub cpu_time_ms: u64,
     pub memory_rss_bytes: u64,
@@ -173,9 +227,11 @@ pub struct VmCounters {
     pub block_write_bytes: u64,
 }
 
+/// What this backend and build support. Section 3.1.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Capabilities {
-    pub engine: String,          // "cloud-hypervisor"
-    pub version: String,         // the pinned release
+    pub engine: String,  // "cloud-hypervisor"
+    pub version: String, // the pinned release
     pub kvm: bool,
     pub text_console: bool,      // true
     pub graphical_console: bool, // false
@@ -183,12 +239,16 @@ pub struct Capabilities {
     pub volume_snapshot: bool,
 }
 
+/// The node network a VM is attached to. Section 3.3.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeNetwork {
     pub bridge: String,
-    pub subnet: String,  // CIDR, for example "10.42.1.0/24"
-    pub gateway: std::net::Ipv4Addr,
+    pub subnet: String, // CIDR, for example "10.42.1.0/24"
+    pub gateway: Ipv4Addr,
 }
 
+/// A point-in-time volume snapshot descriptor. Section 3.16.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VolumeSnapshot {
     pub volume_id: VolumeId,
     pub snapshot_id: String,
@@ -198,6 +258,8 @@ pub struct VolumeSnapshot {
     pub location: PathBuf,
 }
 
+/// Every method is total: it either succeeds or returns one of these.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EngineError {
     NotFound,
     Conflict(String),
@@ -208,49 +270,109 @@ pub enum EngineError {
     Io(String),
     Timeout,
 }
+
+impl fmt::Display for EngineError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // one short lowercase phrase per variant
+        ...
+    }
+}
+
+impl std::error::Error for EngineError {}
 ```
 
 ```rust
+/// A stream of every lifecycle event on the node.
 pub type EventStream = Pin<Box<dyn Stream<Item = EngineEvent> + Send>>;
+
+/// A stream of one VM's tagged output lines.
 pub type LineStream = Pin<Box<dyn Stream<Item = OutputLine> + Send>>;
 
 /// Bidirectional byte stream on a text console (serial or virtio-console).
 pub trait ConsoleIo: AsyncRead + AsyncWrite + Send + Unpin {}
+
+/// Any async byte stream is a console stream; tokio's duplex and UNIX socket
+/// streams satisfy this without an adapter.
+impl<T: AsyncRead + AsyncWrite + Send + Unpin + ?Sized> ConsoleIo for T {}
+
+/// One end of a text console connection.
 pub type ConsoleStream = Pin<Box<dyn ConsoleIo>>;
 
+/// The boundary behind which a virtual machine monitor sits.
+///
+/// The async methods return `impl Future<Output = _> + Send`, so a caller
+/// generic over `E: Engine` can spawn an engine call on the tokio runtime
+/// (D-0071). A backend still implements them with `async fn`. The trait is not
+/// object-safe, which is why the node agent selects a backend through an enum;
+/// a `dyn` need would be met by boxed futures with otherwise identical
+/// signatures.
 pub trait Engine: Send + Sync {
     // Host and node preparation
-    async fn capabilities(&self) -> Capabilities;
-    async fn probe_host(&self) -> Result<HostProbe, EngineError>;
-    async fn ensure_network(&self, net: &NodeNetwork) -> Result<(), EngineError>;
+    fn capabilities(&self) -> impl Future<Output = Capabilities> + Send;
+    fn probe_host(&self) -> impl Future<Output = Result<HostProbe, EngineError>> + Send;
+    fn ensure_network(
+        &self,
+        net: &NodeNetwork,
+    ) -> impl Future<Output = Result<(), EngineError>> + Send;
 
     // Images
-    async fn prepare_image(&self, image: &ImageRef) -> Result<PreparedImage, EngineError>;
-    async fn remove_image(&self, digest: &ImageDigest) -> Result<(), EngineError>;
+    fn prepare_image(
+        &self,
+        image: &ImageRef,
+    ) -> impl Future<Output = Result<PreparedImage, EngineError>> + Send;
+    fn remove_image(
+        &self,
+        digest: &ImageDigest,
+    ) -> impl Future<Output = Result<(), EngineError>> + Send;
 
     // Lifecycle
-    async fn create(&self, spec: &VmSpec) -> Result<VmInfo, EngineError>;
-    async fn start(&self, id: &VmId) -> Result<VmInfo, EngineError>;
-    async fn stop(&self, id: &VmId, mode: StopMode) -> Result<VmInfo, EngineError>;
-    async fn delete(&self, id: &VmId) -> Result<(), EngineError>;
-    async fn inspect(&self, id: &VmId) -> Result<VmInfo, EngineError>;
-    async fn list(&self) -> Result<Vec<VmInfo>, EngineError>;
+    fn create(&self, spec: &VmSpec) -> impl Future<Output = Result<VmInfo, EngineError>> + Send;
+    fn start(&self, id: &VmId) -> impl Future<Output = Result<VmInfo, EngineError>> + Send;
+    fn stop(
+        &self,
+        id: &VmId,
+        mode: StopMode,
+    ) -> impl Future<Output = Result<VmInfo, EngineError>> + Send;
+    fn delete(&self, id: &VmId) -> impl Future<Output = Result<(), EngineError>> + Send;
+    fn inspect(&self, id: &VmId) -> impl Future<Output = Result<VmInfo, EngineError>> + Send;
+    fn list(&self) -> impl Future<Output = Result<Vec<VmInfo>, EngineError>> + Send;
 
     // Observation
     fn events(&self) -> EventStream;
     fn output(&self, id: &VmId) -> Result<LineStream, EngineError>;
     fn console(&self, id: &VmId) -> Result<ConsoleStream, EngineError>;
-    async fn counters(&self, id: &VmId) -> Result<VmCounters, EngineError>;
+    fn counters(&self, id: &VmId) -> impl Future<Output = Result<VmCounters, EngineError>> + Send;
 
     // Volumes (M5; default implementations return Unsupported)
-    async fn snapshot_volume(&self, id: &VolumeId) -> Result<VolumeSnapshot, EngineError>;
-    async fn delete_volume_snapshot(&self, snap: &VolumeSnapshot) -> Result<(), EngineError>;
+    fn snapshot_volume(
+        &self,
+        _id: &VolumeId,
+    ) -> impl Future<Output = Result<VolumeSnapshot, EngineError>> + Send {
+        async {
+            Err(EngineError::Unsupported(
+                "volume snapshots are not implemented by this engine".into(),
+            ))
+        }
+    }
+    fn delete_volume_snapshot(
+        &self,
+        _snap: &VolumeSnapshot,
+    ) -> impl Future<Output = Result<(), EngineError>> + Send {
+        async {
+            Err(EngineError::Unsupported(
+                "volume snapshots are not implemented by this engine".into(),
+            ))
+        }
+    }
 }
 
+/// The result of the host check in section 3.2.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostProbe {
     pub kvm_available: bool,
     pub kernel_release: String,
-    /// True when the kernel is old enough for the backend; see the version rule below.
+    /// True when the kernel is recent enough for the backend (6.8 or later for
+    /// Cloud Hypervisor v54, section 3.2).
     pub kernel_supported: bool,
     pub cpu_vmx: bool,
     pub cpu_svm: bool,
@@ -258,7 +380,7 @@ pub struct HostProbe {
 }
 ```
 
-`MacAddr` is a small newtype over six bytes, defined next to the trait. `events`, `output` and `console` are not `async` because they only build a stream; the first item is produced by the stream itself.
+The derives, `MacAddr`, the blanket `ConsoleIo` implementation, `Display` and `Error` for `EngineError` and `VmSpec::canonical` (section 3.6) are contract items (D-0071), added additively during M0. `events`, `output` and `console` are not `async` because they only build a stream; the first item is produced by the stream itself.
 
 ## 3. Method semantics
 
@@ -290,7 +412,7 @@ Pulls the OCI image, verifies that the pulled content matches `ImageRef::digest`
 - Precondition: `reference` and `digest` are well formed.
 - Postcondition: `PreparedImage::rootfs_path` exists and boots; a second call with the same digest returns the cached value without network access.
 - Idempotent by digest. A digest mismatch between the reference and the pulled content is `Image`.
-- The conversion approach is **open** (Q-0003). Writing our own OCI-to-ext4 pipeline with a Rust registry client and `mkfs.ext4 -d` is **recommended, pending maintainer decision**; the alternative is reusing an existing toolchain, or sharing a rootfs over virtio-fs, which needs an external daemon and shared memory (`docs/research/cloud-hypervisor.md`).
+- The conversion approach is decided (D-0061): Quoro's own OCI-to-ext4 pipeline, with a Rust registry client and `mkfs.ext4 -d`, validated by the M0 spike in `spikes/oci-microvm`. Three gaps must be closed before the pipeline ships: resolve layer paths inside the rootfs with `openat2` `RESOLVE_IN_ROOT` instead of refusing absolute-symlink parents, support zstd layers, and deliver the configuration through a config disk or the kernel command line instead of baking it into the rootfs.
 
 ### 3.5 `remove_image`
 
@@ -301,7 +423,7 @@ Removes a cached prepared rootfs by digest. Deleting a VM must not remove an ima
 Creates the VM and its runtime state without starting it. One microVM per app instance, booted from a rootfs built from the OCI image (D-0008), with the lifecycle split that M1 requires (D-0033). Postcondition on success: a VMM process exists (or the backend's equivalent), the VM is inspectable, and `state` is `Stopped` once creation finishes — `Creating` is only observable while the call is in flight.
 
 - The same `id` with an equal spec returns `Ok` and the existing `VmInfo`.
-- The same `id` with a different spec is `Conflict`. Equality is compared on the canonical form of `VmSpec`, so field order and `Vec` ordering of `env` must be normalized before comparison.
+- The same `id` with a different spec is `Conflict`. Equality is compared on the canonical form of `VmSpec`, `VmSpec::canonical()`, which sorts `env` by `(name, value)` and `volumes` by `(volume_id, mount_path)`; everything else keeps its order, so field order and the ordering of those two lists must be normalized before comparison.
 - Resources are reserved at `create`, so `ResourceExhausted` is returned here rather than at `start`.
 - Precondition: `rootfs` is the digest of a prepared image, `net` is inside a network already ensured by `ensure_network`, and `volumes` are attached to this node.
 
@@ -317,7 +439,7 @@ Boots a created or stopped VM. Postcondition on success: `state` is `Running` an
 Stops a VM.
 
 - `Graceful { timeout }` asks the guest to exit — the power-button path, which the minimal init turns into `SIGTERM` to the app (section 7) — and waits at most `timeout`. On expiry it falls back to forced stop. The call returns `Ok` only when the VM is stopped.
-- `Force` stops without cooperation.
+- `Force` stops without cooperation from the guest. If the VMM does not confirm the stop (its API does not answer, or the process does not exit within the call), the backend escalates to `SIGKILL` on the VMM process and reaps it. `Force` returns `Ok` only when the VMM process is gone; an error from `Force` means the VM may still be running, and the node agent must treat it that way (`node-agent-protocol.md` section 8.5, D-0074).
 - Stopping a stopped VM returns `Ok`. Stopping an unknown id is `NotFound`.
 - Postcondition: `state` is `Stopped`, `exit_code` reports the app's code when the guest reported one, and `EngineEvent::Exited` has been or will be emitted.
 
@@ -353,7 +475,7 @@ Returns the VM's counters for metrics (M4, D-0033). Unknown id is `NotFound`. Va
 
 The point-in-time disk primitive the chunk engine needs (D-0023). Both are `Unsupported` in the default implementation, and only the M5 code path calls them.
 
-- The primitive itself is **open** (Q-0004). Reflink snapshots with a full chunk scan for M5a, and a spike comparing lvm-thin and btrfs before M5b, are **recommended, pending maintainer decision**.
+- The primitive for M5a is decided (D-0062): reflink snapshots with a full content-defined chunk scan for cold backups. Before M5b, a spike comparing lvm-thin and btrfs chooses the primitive for warm volumes.
 - They must **not** be implemented with Cloud Hypervisor VM snapshots. A CH snapshot is a paused VM's `config.json`, `memory-ranges` and `state.json`; it contains guest RAM and device state but no disk contents, and CH exposes no dirty bitmap (F-0035). A volume snapshot is about the disk.
 - If implemented with a filesystem primitive, the call takes no VMM lock: it snapshots the volume of a stopped or running VM as the chosen primitive allows, and the chunk engine handles crash consistency (D-0023).
 
@@ -373,7 +495,7 @@ One `cloud-hypervisor` process per VM with its own `--api-socket`, because the V
 | `capabilities` | Reports the pinned release compiled into the node-agent build, plus values observed at start-up | Runs the binary once for its version; no VM call |
 | `probe_host` | Reads `/dev/kvm`, the kernel release and the CPU flags | No backend call |
 | `ensure_network` | Creates the bridge, the gateway address and the forwarding rules; each VM gets a TAP on that bridge | No backend call; the TAP is created per VM with the network device |
-| `prepare_image` | Pulls, verifies the digest, builds the rootfs, extracts `ImageConfig`, caches by digest (Q-0003, pending maintainer decision) | No backend call |
+| `prepare_image` | Pulls, verifies the digest, builds the rootfs, extracts `ImageConfig`, caches by digest (D-0061) | No backend call |
 | `remove_image` | Deletes the cached rootfs directory | No backend call |
 | `create` | Creates the runtime directory, starts the VMM with `--api-socket <dir>/api.sock`, then configures the VM: direct kernel boot of the Quoro-provided guest kernel, rootfs as a virtio-blk disk, the writable disk and any volumes as further virtio-blk disks, the network device on the node bridge, the console socket | Process start, then `/vm.create` |
 | `start` | Boots the configured VM | `/vm.boot` |
@@ -386,7 +508,7 @@ One `cloud-hypervisor` process per VM with its own `--api-socket`, because the V
 | `output` | Connects to the VM's virtio-console socket and parses the init's tagged lines | Reads the `--console socket=` endpoint |
 | `console` | Connects to the VM's serial socket and relays bytes in both directions, one client at a time | Reads and writes the `--serial socket=` endpoint (F-0034) |
 | `counters` | Reads the VM's I/O and device counters and maps them to `VmCounters`; the exact field names of the backend's counter document are not fixed by `docs/research/cloud-hypervisor.md`, so the mapping is **Hypothesis** | `/vm.counters` |
-| `snapshot_volume` | Default: `Unsupported`. When implemented: a filesystem-level snapshot of the volume (pending maintainer decision, Q-0004 open) | No `/vm.snapshot` call (F-0035) |
+| `snapshot_volume` | Default: `Unsupported`. When implemented: a filesystem-level snapshot of the volume (reflink snapshot for M5a, D-0062) | No `/vm.snapshot` call (F-0035) |
 | `delete_volume_snapshot` | Default: `Unsupported`. When implemented: removes the filesystem-level snapshot | No backend call |
 
 Details that follow from the research file:
@@ -398,9 +520,9 @@ Details that follow from the research file:
 
 ## 6. Guest contract with the minimal init
 
-The minimal init is part of the engine workstream and is the only process Quoro puts inside the microVM. It is PID 1; the app runs under it (D-0008). Whether it is written for Quoro or reused is **open** (Q-0003); writing a small Rust init is **recommended, pending maintainer decision**, because the init is on the audit path and a large guest agent would be a black box.
+The minimal init is part of the engine workstream and is the only process Quoro puts inside the microVM. It is PID 1; the app runs under it (D-0008). It is Quoro's own small Rust init (D-0061), because the init is on the audit path and a large guest agent would be a black box.
 
-**What the init receives.** A small machine-readable configuration, read before the app starts: a config disk or the kernel command line. The choice is part of the open Q-0003. The configuration carries:
+**What the init receives.** A small machine-readable configuration, read before the app starts: a config disk or the kernel command line. The delivery choice is settled during M1 implementation, not baked into the rootfs (D-0061). The configuration carries:
 
 | Item | Content |
 | --- | --- |
@@ -451,4 +573,4 @@ The node agent runs its protocol tests against `FakeEngine`: the M0 lease tests 
 | M1 | `create`, `start`, `stop`, `delete`, `list`, `inspect`, `prepare_image`, `ensure_network` (D-0033) |
 | M2 | `output` feeds live app logs (D-0014, D-0033) |
 | M4 | `console` and `counters` (D-0033) |
-| M5a/M5b | `snapshot_volume` and `delete_volume_snapshot`, once Q-0004 is decided (D-0023, Q-0004) |
+| M5a/M5b | `snapshot_volume` and `delete_volume_snapshot`: reflink snapshots for M5a, the primitive chosen by the lvm-thin vs btrfs spike for M5b (D-0023, D-0062) |

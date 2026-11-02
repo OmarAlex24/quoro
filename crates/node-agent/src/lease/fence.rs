@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::task::Poll;
 use std::time::Duration;
 
-use quoro_engine::{Engine, EngineError, StopMode, VmId};
+use quoro_engine::{Engine, EngineError, StopMode, VmId, VmState};
 use quoro_proto::LeaseMode;
 
 use crate::lease::machine::{Lease, margin};
@@ -25,11 +25,17 @@ pub struct FenceTimers {
 pub enum VmFenceOutcome {
     /// The graceful stop succeeded.
     Stopped,
-    /// The graceful stop did not finish in time and the forced stop succeeded.
+    /// The graceful stop did not finish in time and the forced stop succeeded
+    /// or was confirmed afterwards.
     Forced,
     /// The engine did not know the VM; there is nothing running.
     Gone,
     /// Neither stop confirmed; the VM may still be running.
+    ///
+    /// The engine's `Force` already escalates to `SIGKILL` (engine-trait.md
+    /// 3.8), so `Failed` means that even the kill could not be confirmed: the
+    /// forced stop returned an error or timed out and a bounded `inspect` did
+    /// not find the VM stopped without a pid.
     Failed(String),
 }
 
@@ -75,9 +81,10 @@ type StopFuture<'a> = Pin<Box<dyn Future<Output = (VmId, VmFenceOutcome)> + 'a>>
 /// Stops every VM in `vms`, all at the same time and inside one shared budget:
 /// the bound applies to the whole lease, not to each VM (section 8.5).
 ///
-/// The futures are polled by hand instead of spawned: the engine's `async fn`
-/// futures are not `Send`, so `tokio::spawn` and `JoinSet` are not available.
-/// Results come back in the same order as `vms`.
+/// The futures are polled by hand instead of spawned because the engine is
+/// borrowed (`&E`, not `'static`), so `tokio::spawn` cannot take it; polling
+/// by hand still runs the whole group as one future and returns the results in
+/// the same order as `vms`.
 pub async fn stop_vms<E: Engine>(engine: &E, vms: &[VmId], timers: FenceTimers) -> FenceReport {
     let mut futures: Vec<StopFuture<'_>> = Vec::with_capacity(vms.len());
     for vm in vms {
@@ -128,13 +135,26 @@ async fn stop_one<E: Engine>(engine: &E, id: VmId, timers: FenceTimers) -> (VmId
 
     // Section 8.5 step 1: then forced, bounded by `T_force`.
     let forced = engine.stop(&id, StopMode::Force);
-    match tokio::time::timeout(timers.force, forced).await {
-        Ok(Ok(_)) => (id, VmFenceOutcome::Forced),
+    let failure = match tokio::time::timeout(timers.force, forced).await {
+        Ok(Ok(_)) => return (id, VmFenceOutcome::Forced),
+        Ok(Err(EngineError::NotFound)) => return (id, VmFenceOutcome::Gone),
+        Ok(Err(error)) => error.to_string(),
+        Err(_) => "forced stop timed out".to_string(),
+    };
+
+    // D-0074: the forced stop could not confirm anything, so look at the VM
+    // once, inside the same bound. Only a stopped VM without a pid is proof;
+    // everything else means the VM may still run.
+    match tokio::time::timeout(timers.force, engine.inspect(&id)).await {
         Ok(Err(EngineError::NotFound)) => (id, VmFenceOutcome::Gone),
-        Ok(Err(error)) => (id, VmFenceOutcome::Failed(error.to_string())),
-        Err(_) => (
-            id,
-            VmFenceOutcome::Failed("forced stop timed out".to_string()),
-        ),
+        Ok(Ok(info))
+            if matches!(
+                info.state,
+                VmState::Stopped | VmState::Crashed | VmState::Deleted
+            ) && info.pid.is_none() =>
+        {
+            (id, VmFenceOutcome::Forced)
+        }
+        _ => (id, VmFenceOutcome::Failed(failure)),
     }
 }

@@ -399,7 +399,7 @@ The primary assigns `seq` on receipt and deduplicates by `id`, so a node that re
 | `lease_id` | string (`lse_`) | yes | Lease being renewed |
 | `fencing_token` | integer | yes | Token the node believes it holds |
 
-The primary answers with `lease_grant` and sets `re` to this message's `id`. A renewal whose token is lower than the primary's current token, or for a lease that no longer exists, is answered with `lease_revoke`. `local` leases are never renewed.
+The primary answers with a `lease_grant` that carries the same `fencing_token` when the node still holds the lease — renewals keep the token, they never change it (D-0073) — with `re` set to this message's `id`. A renewal whose token is lower than the primary's current token, or for a lease that no longer exists, is answered with `lease_revoke`. The node also sends one `lease_renew` immediately after a first grant (section 8.4). `local` leases are never renewed.
 
 ```json
 {
@@ -655,11 +655,11 @@ A replica node that holds a copy of the change log but is not the primary never 
 | `resource_type` | string | yes | `app` or `primary` |
 | `resource_id` | string | yes | `app_` or `nod_` id |
 | `mode` | string | yes | `local` or `expiring` |
-| `fencing_token` | integer | yes | Strictly increasing per resource, never reused |
+| `fencing_token` | integer | yes | Changes only when ownership changes: the same value as the node's current token when the grant answers a renewal by the current holder; a strictly higher value than any earlier token for the resource when the lease goes to a new holder or is granted again after expiry or revoke. Never reused (D-0073). |
 | `duration_ms` | integer | no | Present for `expiring`, absent for `local` |
 | `granted_at` | string | yes | Authority's wall-clock time of the grant |
 
-A grant with a `fencing_token` not higher than the node's current token for that resource is a bug in the authority and is refused with `error` code `bad_message`, non-fatal: the node keeps its current state and does not start or stop anything.
+A grant whose token is lower than the highest token the node has seen for that resource, or equal to it while the node does not hold that lease (state `held` or `uncertain`) under that token, is a bug in the authority and is refused with `error` code `bad_message`, non-fatal: the node keeps its current state and starts or stops nothing.
 
 ```json
 {
@@ -672,7 +672,7 @@ A grant with a `fencing_token` not higher than the node's current token for that
     "resource_type": "app",
     "resource_id": "app_01JC9Z7B3N5Q7S9Z1W3Y5A7C9E",
     "mode": "expiring",
-    "fencing_token": 8,
+    "fencing_token": 7,
     "duration_ms": 15000,
     "granted_at": "2026-11-02T10:15:33Z"
   }
@@ -687,10 +687,12 @@ A grant with a `fencing_token` not higher than the node's current token for that
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
 | `lease_id` | string (`lse_`) | yes | Lease to revoke |
-| `fencing_token` | integer | yes | Token of the revoke; must be at least the node's current token |
+| `fencing_token` | integer | yes | Token of the revoke; at least the node's current token for the lease |
 | `reason` | string | yes | `moved`, `deleted`, `declared_lost` or `superseded` |
 
-On receipt the node stops the stateful VMs bound to the lease, records the stop locally, moves the lease to `revoked`, and answers `command_result` **before** it processes any later message of the session.
+A revoke whose token is lower than the node's current token predates the node's latest grant; it is refused with `error` code `bad_message`, non-fatal, and the node keeps the lease and its VMs as they are (D-0073).
+
+On receipt the node stops the stateful VMs bound to the lease, records the stop locally, moves the lease to `revoked`, and answers `command_result` **before** it processes any later message of the session. If the self-fence cannot confirm that every bound VM stopped, the answer is `command_result` with status `error` and the node follows section 8.5's failed-fence path.
 
 ```json
 {
@@ -957,7 +959,7 @@ The order exists so that a VM never starts on a network that is not ready, and n
 
 ### 6.4 Stateful starts
 
-A stateful VM starts only while the node holds that app's lease in state `held` **and** the lease's `fencing_token` equals the `fencing_token` in the VM spec. If either condition fails the VM stays `stopped`, the fact is recorded locally, and the node reports the VM as `stopped` with `health: unknown`; it does not report an error to the primary, because the primary is the one that moved the lease (D-0019).
+A stateful VM starts only while the node holds that app's lease in state `held` **and** the lease's `fencing_token` equals the `fencing_token` in the VM spec. If either condition fails the VM stays `stopped`, the fact is recorded locally, and the node reports the VM as `stopped` with `health: unknown`; it does not report an error to the primary, because the primary is the one that moved the lease (D-0019). Because renewals keep the token (D-0073), the equality holds for the whole time one holder owns the lease; it changes only when ownership changes, and then the primary issues a new `desired_state` carrying the new token. A node that marked itself failed (section 8.5) starts no stateful VM at all.
 
 ### 6.5 While disconnected
 
@@ -967,10 +969,10 @@ Everything continues: running VMs keep running, restarts still happen, health ch
 
 Every change to cluster state is a numbered entry in an append-only, hash-chained log (D-0013, D-0015). Replica nodes follow it so that a manual promotion (D-0016) needs no protocol change: a node that already holds a current copy can serve reads and forward writes.
 
-- **Which nodes follow:** every node with the role `node`, from M2 on. Nothing in this protocol distinguishes a future primary from any other follower, which is what keeps promotion cheap. When promotion happens (M5; the milestone half is open, Q-0024) the promoted node stops being a follower and starts issuing `desired_state` for its own nodes.
+- **Which nodes follow:** every node with the role `node`, from M2 on. Nothing in this protocol distinguishes a future primary from any other follower, which is what keeps promotion cheap. When promotion happens (manual promotion in M5b, D-0067) the promoted node stops being a follower and starts issuing `desired_state` for its own nodes.
 - **Delivery:** `log_entries` with `from_seq` and up to 500 entries. The node verifies each entry's `hash` over the RFC 8785 serialization of the entry without `hash`, and that `prev_hash` equals the previous entry's `hash`, then stores it and sends `log_ack`.
 - **On `hello`:** the primary compares the node's `log_seq` and `log_hash` with its own hash at that sequence. If they differ, the primary sends `error` with code `log_diverged`, non-fatal. The node moves its local copy aside as a quarantined copy — never deleting it, because divergent local writes must never be silently dropped (D-0022) — and refollows from `seq` 1.
-- **Secrets in the log:** `app_env` values, webhook secrets and provider secrets are stored encrypted with the cluster data-encryption key (AEAD, `db-schema.sql`), so a follower holds ciphertext it cannot read. How a promoted replica obtains the cluster data-encryption key is **open** and is decided together with manual promotion (Q-0024); until then the key does not leave the primary.
+- **Secrets in the log:** `app_env` values, webhook secrets and provider secrets are stored encrypted with the cluster data-encryption key (AEAD, `db-schema.sql`), so a follower holds ciphertext it cannot read. How a promoted replica obtains the cluster data-encryption key is **open** and is decided together with manual promotion in M5b (D-0067); until then the key does not leave the primary.
 
 ## 8. Leases and self-fencing
 
@@ -1017,7 +1019,8 @@ Definitions, all on the node's monotonic clock:
 | --- | --- |
 | `D` | `duration_ms` from the grant |
 | `M` | `margin = max(1000 ms, D / 10)` |
-| `t_send` | Node monotonic time at which it sent the `lease_renew` that the current grant answers |
+| `t_send` | Node monotonic time at which it sent the `lease_renew` that the current grant answers. A grant that answers no outstanding renewal has no `t_send` and never sets or extends `valid_until`. |
+| Renewal interval | `D / 3`; a renewal left unanswered for one interval is late |
 | `valid_until` | `t_send + D - M` |
 | Fence deadline | `valid_until + M = t_send + D` |
 | `T_grace` | Graceful-stop timeout used when fencing |
@@ -1030,17 +1033,22 @@ M           = max(1000, D / 10)
 
 The authority never grants a `duration_ms` below 3 000 ms: with the floor margin of 1 000 ms that keeps `valid_until` at least 2 000 ms after the renewal, so the node has a real window to renew before it must fence. A grant below that floor is refused with `error` code `bad_message`, non-fatal.
 
+**First grant.** An `expiring` grant that does not answer an outstanding renewal of the node — the first grant of a lease to this node, a grant after `expired` or `revoked`, or a higher-token grant while the node already holds the lease — records the token, leaves the lease (or puts it) in `uncertain`, and makes the node send a `lease_renew` at once. The lease becomes `held` only when the authority answers that renewal with the same token; `valid_until` is then computed from that renewal's send time. Until then the node starts nothing stateful for it, and an existing `valid_until` (a higher-token grant while held) is kept, never extended. This removes any assumption about how long the grant took to arrive (D-0072). A `local` grant needs no renewal and is `held` on receipt.
+
 **Node state machine.**
 
 | From | Trigger | To | Action |
 | --- | --- | --- | --- |
-| — | `lease_grant` | `held` | Record the token, compute the next renewal time |
-| `held` | a renewal succeeds | `held` | Recompute `valid_until` from the new `t_send` |
-| `held` | a renewal is late, or the authority is unreachable | `uncertain` | Keep running; start nothing new stateful |
-| `uncertain` | a renewal succeeds | `held` | Recompute `valid_until` |
+| — , `held`, `expired`, `revoked` | `lease_grant`, `local` mode, token higher than any seen | `held` | Record the token |
+| — , `expired`, `revoked` | `lease_grant`, `expiring` mode, token higher than any seen | `uncertain` | Record the token, send `lease_renew` at once |
+| `held`, `uncertain` | `expiring` `lease_grant` with a higher token that answers no renewal (ownership changed) | `uncertain` | Record the token, keep `valid_until`, send `lease_renew` at once |
+| `uncertain` | `lease_grant` with the same token answering an outstanding renewal | `held` | Compute `valid_until` from that renewal's `t_send` |
+| `held` | a renewal is answered with the same token | `held` | Recompute `valid_until` from the new `t_send` |
+| `held` | a renewal is late, or the session is lost | `uncertain` | Keep running; start nothing new stateful |
 | `held`, `uncertain` | monotonic clock reaches `valid_until` | `expired` | Self-fence (section 8.5) |
-| any | `lease_revoke` | `revoked` | Self-fence, answer `command_result` |
-| `expired`, `revoked` | `lease_grant` with a higher token | `held` | May start stateful VMs again |
+| any | `lease_revoke` with a token at least the current one | `revoked` | Self-fence, answer `command_result` |
+
+A `local` grant repeated with the same token while `held` changes nothing.
 
 `uncertain` is deliberate. It is "the arbiter is unreachable", not "the lease is lost": stopping every stateful app during a control-plane or arbiter outage would break D-0011, while starting a new stateful VM in that window could produce the double-run D-0019 forbids. The distinction between the two situations is exactly what the lease research asks for (`docs/research/r2-conditional-writes.md`, `docs/research/durable-objects.md`).
 
@@ -1057,7 +1065,7 @@ F = valid_until + M = t_send + D
 T_grace + T_force <= M
 ```
 
-`T_grant >= t_send` (the grant is sent after the renewal it answers arrived), so on a shared time base:
+`T_grant >= t_send` (the grant is sent after the renewal it answers arrived; a held lease always has a `t_send`, because only an answered renewal makes a lease `held`), so on a shared time base:
 
 ```
 F - T_gate <= (t_send + D) - (t_send + D + 2M) = -2M
@@ -1079,27 +1087,33 @@ Worked example with `D = 15000`:
 
 **What the authority must enforce.** The gate is the authority's obligation, not the node's: the primary (or the arbiter) records the send time of the last grant to a holder and refuses to grant the same lease to anyone else before `D + 2M` have passed on its own clock. An authority that grants earlier can hand the same app to two nodes. That obligation is why an arbiter with a real single-writer critical section (a Durable Object, or a conditional write on strongly consistent storage) matters at M5b (`docs/research/durable-objects.md`, `docs/research/r2-conditional-writes.md`).
 
+**Agent restart.** `expiring` leases that were `held` or `uncertain` survive an agent restart within the same host boot. The node persists, for each such lease, the remaining validity measured on `CLOCK_BOOTTIME` together with the host's kernel boot id (`/proc/sys/kernel/random/boot_id`, stored as `host_boot_id` in `node_meta`, section 12; not the per-process `boot_id` of `hello`). On restart, if the kernel boot id is unchanged and the remaining validity has not run out on `CLOCK_BOOTTIME`, the lease comes back `uncertain` with that remaining `valid_until` and renews at once; otherwise it comes back `expired` and is fenced. `CLOCK_BOOTTIME` keeps counting while the machine is suspended, so a suspend can only shorten the remaining validity. The VMMs outlive the agent (section 6.3), so an agent upgrade does not stop warm apps. Required before `expiring` leases ship in M5b (D-0072); M0 restores such leases as `expired` and fences them, which is the conservative behaviour.
+
 ### 8.5 Self-fence procedure
 
 When a lease reaches `expired` or `revoked`, the node:
 
-1. Stops every stateful VM bound to that lease with `StopMode::Graceful { timeout: T_grace }`, then with `StopMode::Force` if the timeout passes, so the whole stop finishes within `T_grace + T_force <= M` (`engine-trait.md`).
+1. Stops every stateful VM bound to that lease with `StopMode::Graceful { timeout: T_grace }`, then with `StopMode::Force` if the timeout passes, so the whole stop finishes within `T_grace + T_force <= M` (`engine-trait.md`). The forced stop escalates to `SIGKILL` on the VMM process inside the engine (`engine-trait.md` section 3.8).
 2. Records the stop locally: lease id, token, VM ids, time and the reason (`expired` or `revoked`), so the fact survives an agent restart.
-3. Emits `node.fenced` with the lease, the token and the VM ids. If the session is down the event is buffered (section 6.5) and delivered later.
+3. Emits `node.fenced` with the lease, the token and the VM ids — only when every bound VM is confirmed stopped or gone. If the session is down the event is buffered (section 6.5) and delivered later.
 4. Starts nothing stateful for that resource until a new `lease_grant` arrives with a higher `fencing_token`.
 
 The node also emits `node.fenced` when an operator declaration invalidated its token without a message reaching it — it learns that when the primary refuses its next `lease_renew` or when a `hello` is answered with a `lease_revoke`.
 
+**Failed fence.** If a forced stop fails or times out and the node cannot confirm the VM stopped (the engine reports it neither stopped nor gone), the VM may still be running. The node then never emits `node.fenced` for that fence; it records the failed fence locally, emits `node.fence_failed` with the lease, the apps and the VM ids that may still run, marks itself failed in its local store (`node_meta`, section 12) so the mark survives an agent restart, starts no stateful VM for any lease while failed, and answers a `lease_revoke` with `command_result` status `error`. The lease stays unstartable on this node. The primary treats `node.fence_failed` like the loss of the node: it does not grant the lease to anyone else until an operator acknowledges the fence, as when declaring a node lost (section 8.3) (D-0074). Clearing the failed mark is an operator action on the node; its command arrives with a later contract change.
+
+**Concurrency.** Fences of different leases must run concurrently, and an agent crash in the middle of a fence must leave the lease fenced on restart; both are covered by mandatory tests before `expiring` leases ship (D-0075). M0 fences one lease at a time, which is acceptable only because no `expiring` lease exists outside tests.
+
 ### 8.6 Fencing tokens
 
-- A token is a strictly increasing integer per leased resource, never reused. The current token lives on the lease row (`fencing_token` in the shared entity model) and is echoed in every `lease_grant`, `lease_revoke`, `lease_renew`, `hello` and stateful VM spec.
+- A token is an integer per leased resource that increases strictly on every ownership change — a grant to a new holder, or a grant after expiry or revoke — and stays the same across renewals by the same holder (D-0073). It is never reused. The current token lives on the lease row (`fencing_token` in the shared entity model) and is echoed in every `lease_grant`, `lease_revoke`, `lease_renew`, `hello` and stateful VM spec.
 - Every write to shared storage carries the token: the chunk store and object store from M5, and the replication stream (D-0023). A receiver rejects any write whose token is lower than the highest it has seen for that resource, and records the rejection.
 - Tokens are what makes the lease safe against a paused node: a node that was frozen past its expiry can still act on stale intent, and only the token at the storage layer stops it (`docs/research/r2-conditional-writes.md`).
 - Arbiters do not remove the need for tokens. A Durable Object can bump a token inside its critical section, and R2 has no server-side expiry at all, but in both cases the node and the storage must still enforce the token (`docs/research/durable-objects.md`).
 
 ### 8.7 What exists in M0, and the milestone table
 
-M0 ships the protocol, not the HA feature: the messages, the four node-side states, the self-fence code path, and two tests — one that revokes a `local` lease and one that expires a test-only short `expiring` lease. Both run against the in-process primary and the `FakeEngine` (`engine-trait.md`), so the path is exercised on machines without KVM. This is the "self-fencing from M0" requirement of D-0019.
+M0 ships the protocol, not the HA feature: the messages, the four node-side states, the self-fence code path, and tests — revoking a `local` lease, expiring a test-only short `expiring` lease, and a failed forced stop that ends in `node.fence_failed` instead of `node.fenced`, among others. They run against the in-process primary and the `FakeEngine` (`engine-trait.md`), so the path is exercised on machines without KVM. This is the "self-fencing from M0" requirement of D-0019.
 
 | Milestone | Authority | Modes in use | What the node does |
 | --- | --- | --- | --- |
@@ -1109,7 +1123,7 @@ M0 ships the protocol, not the HA feature: the messages, the four node-side stat
 | M3 | Primary | `local` | Same; the agent-driven calls arrive as desired-state changes from the API and MCP |
 | M4 | Primary | `local` | Adds console and metrics streams; leases unchanged |
 | M5a | Primary | `local` | Cold backups; operator declaration of a lost node adds a lease revoke with a new token |
-| M5b | Primary plus witness quorum or external arbiter | `local`, `expiring` (`warm`) | Warm: renewal loop, `uncertain` handling, replication writes carrying tokens |
+| M5b | Primary plus witness quorum or external arbiter | `local`, `expiring` (`warm`) | Warm: renewal loop, `uncertain` handling, replication writes carrying tokens, restart persistence of held leases (section 8.4), concurrent fences (section 8.5) |
 | M6 | Quorum | `local`, `expiring` (`warm`, `hot`) | Automatic failover and `hot`; the same messages also carry `resource_type: primary` leases |
 
 ## 9. Node return
@@ -1153,10 +1167,10 @@ The node keeps a SQLite file, owned by root, that holds everything it needs to r
 
 | Table | Holds | Why |
 | --- | --- | --- |
-| `node_meta` | `node_id`, `cluster_id`, `boot_id`, agent and engine versions, the cluster public key and its `key_id`, a reference to the credential | Identity across restarts |
+| `node_meta` | `node_id`, `cluster_id`, `boot_id`, `host_boot_id` (the kernel boot id), the failed mark, agent and engine versions, the cluster public key and its `key_id`, a reference to the credential | Identity across restarts |
 | `desired_state` | One row per accepted `rev`: the full signed body, its hash, `issued_at`, `term` | The snapshot to reconcile from, and the signature to re-verify |
 | `applied_state` | Per VM the last applied spec digest, observed status, restart count, last exit code | Detects drift without the primary |
-| `leases` | Lease id, resource, mode, token, state, `valid_until`, duration | Survives an agent restart: a fenced lease stays fenced |
+| `leases` | Lease id, resource, mode, token, state, `valid_until`, duration, remaining validity on `CLOCK_BOOTTIME` for `held` and `uncertain` expiring leases | Survives an agent restart: a fenced lease stays fenced, a held one keeps its remaining validity within the same host boot |
 | `event_buffer` | Buffered events with their `evt_` id and time, plus the dropped counter | Bounded at 10 000; delivered after reconnect |
 | `change_log` | Followed entries in `seq` order with `prev_hash` and `hash`, and the last acked `seq` | Verifies the chain and resumes follow |
 | `quarantine` | Metadata for each quarantined divergent copy: path, time, reason | Nothing divergent is deleted (D-0022) |

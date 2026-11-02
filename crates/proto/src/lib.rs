@@ -169,6 +169,29 @@ pub struct NodeFenced {
     pub reason: FenceReason,
 }
 
+/// Data of the `node.fence_failed` event (section 8.5, `events.schema.json`
+/// `data_node_fence_failed`).
+///
+/// The node lost the lease and could not confirm that every bound stateful VM
+/// stopped, so the VM may still be running for a resource someone else may now
+/// own. The node marks itself failed until an operator clears the mark
+/// (section 12 `node_meta`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeFenceFailed {
+    /// The node that failed to fence itself.
+    pub node_id: String,
+    /// The apps whose stateful VMs could not be stopped.
+    pub app_ids: Vec<String>,
+    /// The leases that were fenced.
+    pub lease_ids: Vec<LeaseId>,
+    /// Only the VMs whose stop could not be confirmed.
+    pub vm_ids: Vec<String>,
+    /// Why the node fenced.
+    pub reason: FenceReason,
+    /// The stop failures, joined, when there is one.
+    pub error: Option<String>,
+}
+
 /// The envelope around every message (section 3.3).
 ///
 /// `v` and `type` are implied by the enum variant that carries the envelope
@@ -225,4 +248,7 @@ pub struct NodeEvent {
 pub enum NodeEventData {
     /// A node self-fenced its stateful apps after losing their leases.
     NodeFenced(NodeFenced),
+    /// A node lost a lease but could not confirm that the bound VMs stopped
+    /// (section 8.5, `data_node_fence_failed`).
+    NodeFenceFailed(NodeFenceFailed),
 }
