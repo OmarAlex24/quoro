@@ -45,11 +45,11 @@ Quoro uses this CLA instead of the Developer Certificate of Origin. There is no 
 
 Quoro is open-core:
 
-- The core is licensed under **AGPL-3.0**. See [`LICENSE`](LICENSE).
-- The `ee/` directory, once it exists, holds enterprise code under a separate license. Contributions there are by invitation only [to be confirmed by the maintainer] and are governed by that license.
-- Everything outside `ee/` is AGPL-3.0.
+- The core is licensed under **AGPL-3.0-only**. See [`LICENSE`](LICENSE).
+- The `ee/` directory, once it exists, holds enterprise code under its own separate license, not AGPL-3.0. If you want to contribute there, open an issue first.
+- Everything outside `ee/` is AGPL-3.0-only.
 
-Contributions outside `ee/` are distributed as part of the AGPL-3.0 core. The rights you grant the maintainer are the ones in the CLA.
+Contributions outside `ee/` are distributed as part of the AGPL-3.0-only core. The rights you grant the maintainer are the ones in the CLA.
 
 ## Code of conduct
 

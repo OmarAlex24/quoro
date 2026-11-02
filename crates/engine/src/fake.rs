@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The in-memory [`FakeEngine`] from `docs/contracts/engine-trait.md` section 7.
 //!
 //! It implements the same trait with no hypervisor: VMs are records, lifecycle

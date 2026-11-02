@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! In-process primary and helpers for the lease tests.
 //!
 //! This is `tests/common/mod.rs`, so cargo does not build it as its own test

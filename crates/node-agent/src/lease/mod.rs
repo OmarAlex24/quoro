@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The lease state machine and the self-fence path of
 //! `docs/contracts/node-agent-protocol.md` section 8.
 //!

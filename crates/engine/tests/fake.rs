@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Behaviour of the in-memory `FakeEngine` and its injection hooks.
 
 mod common;

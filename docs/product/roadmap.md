@@ -4,7 +4,7 @@ Status: draft for review. Source: D-0033 (milestones), D-0034 (out of scope), D-
 
 This turns D-0033 into a gated plan and adds no features: where another decision explains how an item behaves, the decision is cited next to the item, and every claim that rests on an unverified external fact is either answered in `docs/research/` or marked as a hypothesis.
 
-> **Open callout: first public release (Q-0006).** What exactly ships first — the M3 demo or the complete M4 experience — is open (Q-0006); options: release the M3 demo, or release M4 complete. This roadmap gates both milestones the same way and does not assume either answer.
+> **Release callout: first public release (D-0064).** M3 tags v0.1.0 as an experimental preview with signed builds, not for production; M4 complete is the first general release and the broad announcement [D-0064]. The domain and trademark checks (Q-0008) come before the M3 tag [D-0064].
 
 ---
 
@@ -61,7 +61,7 @@ High availability and backups are not part of the MVP, but the MVP architecture 
 - The bases documents: PRD, ADRs, architecture, contracts, threat model, roadmap, workstream briefs, glossary, OSS files [D-0040].
 - The Engine trait, so other backends can be added later without rewriting the control plane [D-0007].
 
-External facts behind this milestone are verified in the research files. Cloud Hypervisor: v54.0, Apache-2.0 AND BSD-3-Clause, an HTTP API over a UNIX socket, snapshots that hold RAM and device state but not disks, virtio-fs that needs an external virtiofsd, text consoles only (serial, virtio-console; no VNC or framebuffer) and a host kernel of 6.8 or later (docs/research/cloud-hypervisor.md); boot under 100 ms remains a Hypothesis. The OCI-to-rootfs conversion and the minimal init: **open (Q-0003)**; options: write our own conversion and init, or reuse an existing component. utoipa 6 with orval or openapi-ts generates usable client code from the spec, with one known orval break (docs/research/rust-api-and-mcp-tooling.md).
+External facts behind this milestone are verified in the research files. Cloud Hypervisor: v54.0, Apache-2.0 AND BSD-3-Clause, an HTTP API over a UNIX socket, snapshots that hold RAM and device state but not disks, virtio-fs that needs an external virtiofsd, text consoles only (serial, virtio-console; no VNC or framebuffer) and a host kernel of 6.8 or later (docs/research/cloud-hypervisor.md); boot under 100 ms remains a Hypothesis. The OCI-to-rootfs conversion and the minimal init are ours: a minimal Rust init and our own OCI-to-ext4 pipeline, with layer paths resolved inside the rootfs (`openat2` with `RESOLVE_IN_ROOT`), zstd layers, and config delivered through a config disk or the kernel command line [D-0061]. utoipa 6 with orval or openapi-ts generates usable client code from the spec, with one known orval break (docs/research/rust-api-and-mcp-tooling.md).
 
 #### Definition of Done
 
@@ -82,8 +82,8 @@ External facts behind this milestone are verified in the research files. Cloud H
 #### Dependencies
 
 - Nothing precedes M0. The rootfs pipeline (`mkfs.ext4 -d` plus an OCI registry client) is verified by the M0 spike.
-- Must be answered during M0: Q-0003 (rootfs conversion and minimal init).
-- Realtime transport, lease modes, text-only consoles, the OpenAPI source of truth, provider credentials, cluster keys and the host layout with the one-time setup token are decided [D-0057, D-0047, D-0056, D-0048, D-0051, D-0050, D-0054]. Custody of the cluster keys on promotion stays open with Q-0024 and does not block the freeze.
+- Q-0003 (rootfs conversion and minimal init) is answered by the M0 spike: our own conversion pipeline and init, validated there [D-0061].
+- Realtime transport, lease modes, text-only consoles, the OpenAPI source of truth, provider credentials, cluster keys and the host layout with the one-time setup token are decided [D-0057, D-0047, D-0056, D-0048, D-0051, D-0050, D-0054]. Custody of the cluster keys on promotion stays open and is decided with promotion in M5b [D-0067]; it does not block the freeze.
 - Contracts freeze at the end of M0; any later change is a standalone PR [D-0036].
 
 #### Explicitly out of scope
@@ -143,7 +143,7 @@ External facts behind this milestone are verified in the research files. Cloud H
 - Ingress: a reverse proxy with ACME for hosts that have a public IP, or Cloudflare Tunnel for homelabs behind NAT, both behind one interface [D-0024]. The lab has no public IP, so ACME HTTP-01 cannot run there; lab TLS goes through Cloudflare Tunnel, with ACME exercised separately through DNS-01 [D-0055].
 - The control plane stays the single writer; on a single node that node is the control-plane primary [D-0012].
 
-The proxy implementation is **open (Q-0001)**; options: drive Caddy through its admin API (the proven option), or embed a Rust reverse proxy. Q-0005 (node mesh) is needed before M5a (cross-node replica traffic); the control-plane session is TLS dial-out (D-0011), so M2 needs no mesh. The recommendation (kernel WireGuard driven by Quoro) is pending maintainer decision. Cloudflare Tunnel behaviour: the load balancer sees all replicas of one tunnel as one endpoint and cloudflared replicas have no app health check, so per-node failover needs one tunnel per node behind a load balancer (docs/research/cloudflare-lb-and-tunnel.md).
+The ingress backend is an embedded Rust reverse proxy — hyper, rustls and an ACME client crate — behind the ingress interface that the Cloudflare Tunnel backend also implements; Caddy driven through its admin API stays as a fallback backend if the M2 spike shows ACME is too costly [D-0059]. The maturity of the ACME crate is a research task before M2 (Hypothesis until it is verified) [D-0059]. The node mesh is not needed here: the control-plane session is TLS dial-out (D-0011), and the mesh is first needed in M5a for cross-node replica traffic [D-0063]. Cloudflare Tunnel behaviour: the load balancer sees all replicas of one tunnel as one endpoint and cloudflared replicas have no app health check, so per-node failover needs one tunnel per node behind a load balancer (docs/research/cloudflare-lb-and-tunnel.md).
 
 #### Definition of Done
 
@@ -169,7 +169,7 @@ The proxy implementation is **open (Q-0001)**; options: drive Caddy through its 
 - An ACME/TLS crate spike before M2 (obtain and renew one certificate).
 - D-0011 (dial-out and local reconciliation) and D-0024 (ingress).
 - Provider credentials (Cloudflare API and tunnel tokens, DNS zones, S3 keys) are entered and stored through the human-only providers API (`/api/v1/providers`, scope `provider:manage`) with encrypted secrets [D-0051].
-- Needed before or during M2: Q-0001 (proxy).
+- Needed before or during M2: an ACME crate maturity check, with the Caddy admin-API backend as the fallback [D-0059].
 
 #### Explicitly out of scope
 
@@ -188,10 +188,11 @@ The proxy implementation is **open (Q-0001)**; options: drive Caddy through its 
 - Grants with scope, resource selector, TTL and optional maximum uses; incident-scoped grants that auto-expire; just-in-time approval for destructive actions [D-0030].
 - Audit log, append-only and hash-chained, written by the same path as the API; destructive actions and refusals included [D-0031].
 - Event webhooks per event, so a webhook can wake an agent with incident context [D-0032].
+- Documentation stays Markdown in the repository; the docs-site tooling is picked during M3 planning together with the v0.1.0 preview [D-0065].
 
 rmcp 3.8 is the official Rust MCP SDK, with three semver-major releases between March and July 2026, so the MCP surface is pinned to a checked version (docs/research/rust-api-and-mcp-tooling.md).
 
-> **Open callout: first public release (Q-0006).** Whether this milestone's demo is the first public release, or whether release waits for M4 complete, is open (Q-0006); options: release the M3 demo, or release M4 complete.
+> **Release callout (D-0064).** This milestone ends with the v0.1.0 tag: an experimental preview with signed builds, not for production [D-0064]. M4 complete is the first general release and the broad announcement [D-0064]. The domain and trademark checks (Q-0008) must be done before this tag [D-0064].
 
 #### Definition of Done
 
@@ -233,12 +234,13 @@ rmcp 3.8 is the official Rust MCP SDK, with three semver-major releases between 
 
 #### Scope
 
-- Git builds, starting with Dockerfile builds [D-0033]. Railpack and Nixpacks are to be verified: **open (Q-0002)**; options: Dockerfile only, Railpack, or Nixpacks.
+- Git builds, starting with Dockerfile-only builds [D-0033, D-0060]. A BuildKit daemon runs inside an ephemeral builder microVM (Hypothesis: not yet tried under Cloud Hypervisor) and its output goes to a node-local OCI layout, which then enters the normal OCI-to-rootfs path [D-0060]. Railpack and Nixpacks are re-verified before M4 (Hypothesis: Nixpacks is in maintenance and Railpack is its successor), and a zero-config builder may be added later as a second Builder implementation [D-0060].
 - Metrics per app and per node, surfaced in the panel; telemetry and app logs stay on each node, only state is replicated [D-0014].
 - Web terminal into the panel [D-0033].
 - VM console for a microVM: a text console over the microVM's serial or virtio-console socket, shown with xterm.js (docs/research/cloud-hypervisor.md: no VNC or framebuffer); consoles are text-only and there is no noVNC in the stack [D-0056].
+- Decide the curated catalog's format, owner, location and signature scheme at M4 planning, before the first template ships [D-0070].
 
-> **Open callout: first public release (Q-0006).** If the first public release is M4 complete, this milestone is the release gate; if it is the M3 demo, this milestone still needs the same demo and approval before M5a [D-0036]. Open (Q-0006); options: M3 demo, or M4 complete.
+> **Release callout (D-0064).** M4 complete is the first general release and the broad announcement [D-0064]; the experimental v0.1.0 preview is tagged at the end of M3. This milestone still needs its demo and approval before M5a [D-0036].
 
 #### Definition of Done
 
@@ -260,14 +262,14 @@ rmcp 3.8 is the official Rust MCP SDK, with three semver-major releases between 
 - M3 (audit and grants, so terminal and console access are attributable).
 - D-0014 constrains where telemetry lives.
 - Standalone contract PRs for the web terminal, VM console and metrics endpoints, merged before the feature work (D-0036).
-- Needed before or during M4: Q-0002 (build method).
-- Q-0006 decides whether this milestone is the release gate.
+- Needed before or during M4: Dockerfile-only builds, with Railpack and Nixpacks re-verified before M4 [D-0060].
+- This milestone is the first general release [D-0064].
 
 #### Explicitly out of scope
 
 - App replicas and edge load balancing: M5a.
 - Any backup or restore UI: M5a.
-- A docs site: the tooling is **open (Q-0009)**; no options are recorded yet. It belongs to the installer/releases/docs-site workstream, not to a product milestone (see docs/architecture/architecture.md §17).
+- A docs site: documentation stays Markdown in the repo until the first public release, and the docs-site tooling is picked during M3 planning together with the v0.1.0 preview (Q-0009, D-0065). It belongs to the installer/releases/docs-site workstream, not to a product milestone (see docs/architecture/architecture.md §17).
 
 ---
 
@@ -279,13 +281,14 @@ rmcp 3.8 is the official Rust MCP SDK, with three semver-major releases between 
 - Edge load balancing, with the edge as its own role of the same binary and able to combine with witness [D-0012, D-0018].
 - Backups to S3 or R2, at the `cold` policy: backups only [D-0020, D-0023].
 - The content-addressed chunk engine, used for backups first [D-0023].
+- Backups of the control-plane SQLite database and of catalog templates go through that same chunk engine with client-side encryption, taken from consistent snapshots (the SQLite backup API or `VACUUM INTO`), not through Litestream [D-0069].
 - HA policies are named `none`, `cold`, `warm` and `hot`, and the panel shows what each costs [D-0020].
 - Local, non-replicated persistent volumes: create, attach to an app, survive redeploy [D-0052].
 - Off-site copy of the audit log to an S3-compatible bucket with object lock [D-0031, D-0053].
 
 Cloudflare Load Balancing is a paid add-on from $5/month; an HTTPS monitor on the app hostname tests the app; the load balancer sees all replicas of one tunnel as one endpoint; cloudflared replicas have no documented app health check (Hypothesis); per-node failover needs one tunnel per node behind a load balancer (docs/research/cloudflare-lb-and-tunnel.md).
 
-D-0016 places manual promotion of a replica node to primary in M5, but D-0033's split of M5 into M5a and M5b does not list it in either half. Which half owns it is open (Q-0024); options: M5a, M5b, or a separate item before M5a; until it is answered, neither M5a nor M5b has a DoD item for it.
+D-0016 places manual promotion of a replica node to primary in M5, and it ships in M5b alongside leases and fencing [D-0016, D-0067]. Promotion is manual: a command or a button, or an agent doing it with human approval [D-0016].
 
 #### Definition of Done
 
@@ -314,8 +317,8 @@ D-0016 places manual promotion of a replica node to primary in M5, but D-0033's 
 - Briefs for the sync/chunk engine and the witness/edge workstreams are written and approved before M5a starts.
 - Local, non-replicated volumes ship in M5a [D-0052]; a standalone post-freeze contract PR adds the volume endpoints before M5a.
 - A standalone contract PR adds the HA policy cost and N+1 capacity fields.
-- Q-0005 (node mesh) is needed before M5a (cross-node replica traffic); the control-plane session is TLS dial-out (D-0011), so M2 needs no mesh. The recommendation (kernel WireGuard driven by Quoro) is pending maintainer decision.
-- Needed before or during M5a: Q-0001 if the proxy is still unsettled, Q-0004 for the snapshot primitive the chunk engine reads from.
+- The node mesh is kernel WireGuard configured by Quoro over netlink (no wg-quick), with a per-node keypair and peers plus allowed IPs in the desired state; boringtun in userspace is only a fallback and our own implementation is rejected [D-0063]. It is first needed in M5a for cross-node replica traffic; the control-plane session is TLS dial-out (D-0011), so M2 needs no mesh, and a publicly reachable peer acts as the relay hub for NAT [D-0063].
+- The snapshot primitive the chunk engine reads from: reflink snapshots plus a full content-defined chunk scan for the M5a `cold` backups [D-0062].
 - The off-site audit-log copy [D-0031] ships in M5a with the S3-compatible path [D-0053].
 - Object lock in compliance mode must be verified per provider (R2, S3, B2, MinIO) before M5a (research task).
 - Object storage choice: S3-compatible; R2 offers an atomic conditional PUT at 1 write/s per key with no TTL, and is only needed as a lease arbiter from M5b (docs/research/r2-conditional-writes.md).
@@ -342,7 +345,7 @@ D-0016 places manual promotion of a replica node to primary in M5, but D-0033's 
 - A planned switchover is available when the user prefers the original node: wait for lag near zero, wait for a low-traffic window, freeze writes, final sync, move the lease, shift traffic, drain connections; it loses no data [D-0022].
 - The edge can also be the third voter, as the witness+edge combination of the same binary [D-0018].
 
-External arbiters are optional and their behaviour is verified. R2 conditional writes as a lease arbiter: an atomic conditional PUT, 1 write/s per key, no TTL, and fencing tokens are still required (docs/research/r2-conditional-writes.md). Cloudflare Durable Objects as the arbiter: fits on the Workers Free plan, needs a Cloudflare account and a Worker, and fencing tokens are still required (docs/research/durable-objects.md). The snapshot primitive under the chunk engine is **open (Q-0004)**; options: our own block diff and dirty tracking, lvm-thin, ZFS, or btrfs send.
+External arbiters are optional and their behaviour is verified. R2 conditional writes as a lease arbiter: an atomic conditional PUT, 1 write/s per key, no TTL, and fencing tokens are still required (docs/research/r2-conditional-writes.md). Cloudflare Durable Objects as the arbiter: fits on the Workers Free plan, needs a Cloudflare account and a Worker, and fencing tokens are still required (docs/research/durable-objects.md). The snapshot primitive under the chunk engine is reflink snapshots plus a full content-defined chunk scan for the M5a `cold` backups; a spike comparing lvm-thin and btrfs chooses the primitive for `warm` before M5b, and the `Engine` trait's `snapshot_volume` hooks keep it swappable [D-0062].
 
 Failure domains: all three lab VMs run on one physical host. The lab therefore simulates separate failure domains by stopping VMs or cutting the network between them. The real requirement that the witness sits in a different failure domain [D-0017] is documented here, not proven by the lab.
 
@@ -358,6 +361,9 @@ Failure domains: all three lab VMs run on one physical host. The lab therefore s
 - [ ] Bring lab-1 back; it starts nothing stateful, its copy of the app becomes the `warm` copy following lab-2 (lab-2 is now the lease holder and source of truth), and its divergent writes appear as a quarantined snapshot recorded in the audit log [D-0022].
 - [ ] Write a known record to the app, then run a planned switchover back to lab-1; it completes, the app serves from lab-1, and the record is present [D-0022].
 - [ ] The N+1 indicator answers "if lab-1 dies, do its apps fit?" with yes, or with no plus the missing resources [D-0021].
+- [ ] An operator promotes a replica node to primary; the promotion is refused while the old primary may still hold expiring leases unless the operator acknowledges the fence [D-0067].
+- [ ] Before expiring leases ship, the concurrent-fence and mid-fence crash tests pass [D-0075].
+- [ ] A held expiring lease survives an agent restart within the same host boot [D-0072].
 
 #### Demo script
 
@@ -372,7 +378,7 @@ Failure domains: all three lab VMs run on one physical host. The lab therefore s
 - M5a (edge, app replicas, chunk engine, bucket).
 - D-0017, D-0018, D-0019, D-0020, D-0021, D-0022, D-0023.
 - A standalone contract PR adds the HA policy cost and N+1 capacity fields.
-- Needed before or during M5b: Q-0004 (snapshot primitive).
+- Needed before or during M5b: the lvm-thin versus btrfs spike that chooses the `warm` snapshot primitive [D-0062].
 - This milestone does not deliver automatic promotion of the control plane; that is M6 [D-0016].
 
 #### Explicitly out of scope
@@ -414,7 +420,7 @@ All three lab VMs are on one physical host. The lab simulates a split by cutting
 
 - M5b (witness, leases, replication).
 - D-0016, D-0019, D-0020, D-0022.
-- Needed before or during M6: Q-0004 for snapshot consistency of hot volumes.
+- Needed before or during M6: snapshot consistency of `hot` volumes with the chosen primitive.
 
 #### Explicitly out of scope
 
@@ -449,17 +455,9 @@ Open questions are open. This table lists them with options where the ledger giv
 
 | Q-id | Question | Needed by milestone |
 |---|---|---|
-| Q-0001 | Ingress proxy: drive Caddy through its admin API, or embed a Rust reverse proxy? | M2 |
-| Q-0002 | Git builds: Dockerfile only, Railpack, or Nixpacks? | M4 |
-| Q-0003 | OCI image to microVM rootfs conversion and minimal init: own or reuse an existing component? | M0 |
-| Q-0004 | Snapshot primitive under the chunk engine: own block diff and dirty tracking, lvm-thin, ZFS, or btrfs send? | M5a, M5b |
-| Q-0005 | Node mesh: kernel WireGuard driven by Quoro, userspace, or our own? (recommendation pending maintainer decision) | M5a (cross-node replica traffic) |
-| Q-0006 | What exactly is the first public release: the M3 demo or M4 complete? | M3, M4 |
-| Q-0008 | Domain and trademark check | before the first public release (Q-0006) |
-| Q-0009 | Docs site tooling | M4 or later, with the docs-site workstream |
-| Q-0024 | Manual promotion of a replica node: owned by M5a or M5b? | M5a or M5b |
-| Q-0026 | Encrypted SQLite backups (Litestream 0.5 has no client-side encryption) | M5a |
-| Q-0060 | Curated catalog: format, owner, milestone, signature scheme | before the first catalog template (M4 at the earliest) |
+| Q-0008 | Domain and trademark check | before the M3 v0.1.0 tag (D-0064) |
+
+Decided and no longer open: the ingress proxy [D-0059], the Git build method [D-0060], the OCI-to-rootfs conversion and init [D-0061], the snapshot primitive [D-0062], the node mesh [D-0063], the first public release [D-0064], manual promotion of a replica node [D-0067], docs-site timing [D-0065], encrypted SQLite and template backups [D-0069] and when the curated catalog is decided [D-0070].
 
 ### Answered verification questions
 

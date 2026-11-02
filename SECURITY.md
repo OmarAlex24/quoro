@@ -28,7 +28,7 @@ Do not include secrets, credentials or personal data belonging to others in the 
 
 ### What to expect
 
-- **Acknowledgement:** [to be set by the maintainer before publishing: response time, e.g. 5 business days].
+- **Acknowledgement:** within 7 days of the report, on a best-effort basis. This is a volunteer project and there is no service-level agreement.
 - We will confirm the report, agree on a disclosure timeline with you, and keep you updated while a fix is developed.
 - Please give us a reasonable window to ship a fix before any public disclosure.
 - Credit is given in the published advisory unless you ask otherwise.

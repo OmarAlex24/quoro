@@ -162,7 +162,7 @@ What exists per milestone:
 
 - M1 to M4 have exactly one primary, which is also a node, plus nodes that run the node agent and dial out to it (D-0016, D-0033).
 - Witness, edge and leases with expiry arrive with M5 (D-0033): `witness` in M5b, `edge` in M5a.
-- Replica nodes serve reads and forward writes to the primary (D-0012). Turning that serving on requires promoting a replica to primary; whether manual promotion belongs to M5a, M5b or a separate item is open (Q-0024).
+- Replica nodes serve reads and forward writes to the primary (D-0012). Turning that serving on requires promoting a replica to primary; manual promotion ships in M5b, alongside leases and fencing, and refuses while the old primary may still hold expiring leases unless an operator acknowledges the fence (D-0067).
 
 Design choice, stated as such: from M2 every enrolled node already follows the change log over its session and keeps a verified copy, so a later manual promotion needs no protocol change (D-0013). The M2 node agent therefore implements the follow path even though nothing else in M2 uses a replica. This costs storage on each node and buys the ability to promote without a redesign.
 
@@ -278,14 +278,16 @@ Some tables are local and are not replicated: `sessions`, `access_tokens` and `w
 - **Secrets.** Session tokens and agent access tokens are the local secrets. Copying them to every replica node multiplies the places they can leak from, and a replica does not need them to serve reads on behalf of a caller who authenticated to that replica.
 - **Churn.** Webhook delivery attempts change on every retry and are of interest only to the node that dispatched them. Replicating them would put the noisiest table on the replication path.
 
-Backing up the primary's database off-site is not in the MVP (D-0033), but the design has to name a path. Litestream was suggested in D-0015; Litestream 0.5 has no client-side encryption, which conflicts with the encrypted-backup expectation of D-0023 (F-0040). The options are open (Q-0026) and this document does not choose:
+Backing up the primary's database off-site is not in the MVP (D-0033), but the design has to name a path. Litestream was suggested in D-0015; Litestream 0.5 has no client-side encryption, which conflicts with the encrypted-backup expectation of D-0023 (F-0040). D-0069 settles the default: SQLite and catalog-template backups go through Quoro's own chunk engine with client-side encryption, taken from consistent snapshots via the SQLite backup API or `VACUUM INTO`. Litestream is not used. The rejected and optional paths, kept for the record:
 
 | Option | What it means | Consequence |
 | --- | --- | --- |
 | 1. Accept SSE-C | Litestream encrypts nothing; the bucket does it, with a key Quoro holds and sends per request | Provider stores ciphertext at rest, but the key travels with each request |
-| 2. Pin Litestream 0.3.x with age | The older line still has client-side encryption | Older, unmaintained line; hypothesis per Q-0026 |
-| 3. Quoro's own chunk engine | Periodic consistent snapshots via `VACUUM INTO` or the SQLite backup API, encrypted client-side like every other chunk (D-0023) | Loses Litestream's ~1 s RPO |
+| 2. Pin Litestream 0.3.x with age | The older line still has client-side encryption | Its 0.3 line is unmaintained (hypothesis); not used (D-0069) |
+| 3. Quoro's own chunk engine | Periodic consistent snapshots via `VACUUM INTO` or the SQLite backup API, encrypted client-side like every other chunk (D-0023) | Loses Litestream's ~1 s RPO. This is the decided path (D-0069) |
 | 4. Encrypting S3 proxy | An encrypting proxy in front of the bucket | One more component on the backup path |
+
+Litestream with SSE-C may be added later as an optional backend for a lower RPO (D-0069).
 
 ### Cluster keys
 
@@ -295,7 +297,7 @@ Decided (D-0050), three keys:
 - **Cluster data-encryption key** (DEK, 256-bit XChaCha20-Poly1305). Encrypts every `*_enc` column; a `*_enc` column stores the key id, the nonce and the ciphertext, so a row records which key wrote it.
 - **Node-local key.** Encrypts a node's local copy of the secrets for the apps placed on it.
 
-Storage and rotation: the keys are generated at first start and stored as 0600 files in `/var/lib/quoro`, outside the SQLite file, and backed up separately, because losing the data-encryption key loses every secret. The signing key rotates through the node-agent message `signing_key_rotate`, signed by the old key. The data-encryption key rotates by re-encrypting rows under a new key id. Custody of both keys when a replica is promoted is still open (Q-0024): recommended (replicate both keys wrapped to each replica's node key), pending maintainer decision, settled together with Q-0024.
+Storage and rotation: the keys are generated at first start and stored as 0600 files in `/var/lib/quoro`, outside the SQLite file, and backed up separately, because losing the data-encryption key loses every secret. The signing key rotates through the node-agent message `signing_key_rotate`, signed by the old key. The data-encryption key rotates by re-encrypting rows under a new key id. Custody of both keys when a replica is promoted is decided together with manual promotion in M5b (D-0067); the open part is whether the keys are replicated wrapped to each replica's node key or re-keyed with an operator-confirmed re-pin.
 
 ## 7. Telemetry locality
 
@@ -327,9 +329,9 @@ Cloud Hypervisor specifics:
 - **License**: Apache-2.0 AND BSD-3-Clause (F-0036). Cloud Hypervisor is Apache-2.0 AND BSD-3-Clause; compatibility with an AGPL-3.0 Quoro that runs it as a separate process is a **Hypothesis** (section 19).
 - **Host requirements**: a KVM-capable host (D-0009) and host kernel >= 6.8 (F-0036).
 - **Nested virtualization**: rare on cheap VPS. Hetzner Cloud, Hostinger, Contabo VPS and netcup VPS state that they do not support it (F-0044, `docs/research/vps-nested-virt.md`). The installer therefore probes `/dev/kvm`, the vmx/svm CPU flag and a real microVM boot instead of trusting provider marketing. A host that fails the probe is refused during install rather than at first deploy.
-- **Image path**: OCI image -> root disk -> boot with a minimal init (D-0008). How that conversion and the init are built is open (Q-0003); the recommended path is an own Rust init plus an own OCI-to-ext4 pipeline, settled by the M0 spike (recommended, pending maintainer decision).
+- **Image path**: OCI image -> root disk -> boot with a minimal init (D-0008). Quoro ships its own minimal Rust init and its own OCI-to-ext4 pipeline (D-0061), validated by the M0 spike (`spikes/oci-microvm`); the pipeline resolves layer paths inside the rootfs with `openat2` and `RESOLVE_IN_ROOT`, and also covers zstd layers and config delivery through a config disk or the kernel command line. The guest kernel is built by Quoro and pinned reproducibly (D-0027).
 - **Consoles are text-only.** Cloud Hypervisor has no VNC, virtual GPU or framebuffer device (F-0034). The microVM console is the serial or virtio-console UNIX socket, relayed by the node agent, so consoles are xterm.js over serial or virtio-console only.
-- **Disks and snapshots.** Cloud Hypervisor snapshots hold guest RAM and device state, not disk contents, and there is no incremental or dirty-bitmap API (F-0035). The chunk engine (D-0023) therefore needs its own disk snapshot primitive; which one is open (Q-0004), with a recommendation to keep it open and use reflink snapshots plus a full chunk scan for M5a cold backups (recommended, pending maintainer decision).
+- **Disks and snapshots.** Cloud Hypervisor snapshots hold guest RAM and device state, not disk contents, and there is no incremental or dirty-bitmap API (F-0035). The chunk engine (D-0023) therefore needs its own disk snapshot primitive. The interim primitive is reflink snapshots plus a full content-defined chunk scan for M5a cold backups, and a spike comparing lvm-thin with btrfs before M5b picks the primitive for warm backups at few-second intervals (D-0062); the `Engine` trait's `snapshot_volume` hooks keep it swappable.
 - **virtio-fs** needs an external virtiofsd (`docs/research/cloud-hypervisor.md`). The engine therefore does not depend on it: apps boot from a disk image, and virtio-fs is at most an optimisation for a later milestone.
 - **No live migration** (D-0034). Moving a running microVM between nodes is not a goal; moving an app is a stop/start with a lease, not a migration.
 
@@ -362,9 +364,9 @@ A worked proposal for the address plan: one cluster range (for example `10.42.0.
 
 Two rules keep this from drifting. Addresses are recorded in state, so a reinstall of a node does not hand out an address that a recorded volume or VM still refers to. And isolation is a default that a project can widen for itself, never one that another project can widen for it.
 
-**Node mesh.** Nodes are independent machines, often at different providers (D-0010), so cross-node traffic — edge-to-replica traffic in M5a, node-to-node volume replication for `warm` in M5b, the chunk engine, and any future node-to-node call — runs over WireGuard (D-0010). The implementation is open (Q-0005); the recommendation is kernel WireGuard configured by Quoro over netlink with no `wg-quick`, distributing per-node keys and allowed IPs through desired state (recommended, pending maintainer decision). It is first needed in M5a; the control-plane session does not depend on it, because that is TLS dial-out (D-0011), so a single-node M2 works with no mesh at all.
+**Node mesh.** Nodes are independent machines, often at different providers (D-0010), so cross-node traffic — edge-to-replica traffic in M5a, node-to-node volume replication for `warm` in M5b, the chunk engine, and any future node-to-node call — runs over WireGuard (D-0010). The mesh is kernel WireGuard configured by Quoro over netlink, with no `wg-quick`, per-node keypairs and peers plus allowed IPs in desired state; userspace boringtun is only a fallback, and an own implementation is rejected for crypto risk (D-0063). It is first needed in M5a, for cross-node replica traffic, and M2 does not need it; the control-plane session does not depend on it, because that is TLS dial-out (D-0011), so a single-node M2 works with no mesh at all.
 
-Two nodes behind NAT cannot reach each other directly. The mesh therefore assumes at least one publicly reachable peer — a public node or the edge — as a relay hub, or falls back to the dial-out path (recommended, pending maintainer decision). This is a limitation of the mesh, not of the control plane.
+Two nodes behind NAT cannot reach each other directly. The mesh therefore assumes at least one publicly reachable peer — a public node or the edge — as a relay hub, or falls back to the dial-out path (D-0063). This is a limitation of the mesh, not of the control plane.
 
 ## 10. Ingress
 
@@ -375,7 +377,7 @@ Ingress is one `Ingress` interface with two backends (D-0024):
 | Reverse proxy with ACME | Hosts with a public IP | ACME (HTTP-01 or TLS-ALPN-01) obtains and renews certificates locally |
 | Cloudflare Tunnel | Hosts behind NAT | cloudflared dials out; TLS terminates at the provider |
 
-The proxy implementation is open (Q-0001). The options are Caddy driven through its admin API — the proven ACME path, at the cost of a second Go process to ship and update — or an embedded Rust reverse proxy, which keeps one binary and full control of health-aware routing and slow start, at the cost of owning the ACME edge cases. The recommendation is the embedded proxy, behind the same interface, keeping Caddy as a fallback backend (recommended, pending maintainer decision).
+The reverse proxy is an embedded Rust proxy — hyper + rustls + an ACME client crate — behind the same interface, which keeps one binary and full control of health-aware routing and slow start at the cost of owning the ACME edge cases (D-0059). Caddy driven through its admin API stays a fallback backend, to be used if the M2 spike shows that owning ACME is too costly; crate maturity is a research task before M2.
 
 The route table is derived from desired state: each domain maps to the app instances that may serve it (D-0024). It is written by the control plane and applied by the node, so a route change is a state change with a change-log entry, and a node that cannot reach the primary keeps serving the last applied table (section 4).
 
@@ -406,7 +408,7 @@ Anything Quoro asks of an external service goes through a provider interface (D-
 
 - **Conditional PUT** (`If-Match` / `If-None-Match`). Not portable: R2 and AWS S3 support it, MinIO AIStor documents it, Backblaze B2 apparently does not (F-0038). Anything that depends on it — the conditional-write lease arbiter in section 14 — must be probed per provider at setup.
 - **Object lock.** Not yet researched: whether a given provider supports it, and in which mode, is a **Hypothesis** per provider. The off-site audit copy depends on it (D-0031) and is gated by an object-lock probe per provider (D-0053); a research task verifies compliance-mode object lock for R2, S3, B2 and MinIO before M5a.
-- **SSE-C.** Presence and behaviour are recorded by the probe, because Q-0026's first option depends on it (F-0040).
+- **SSE-C.** Presence and behaviour are recorded by the probe, because an optional Litestream backend with SSE-C would depend on it (D-0069, F-0040).
 
 R2 specifics: one write per second per key, and no conditional delete (F-0037). Those two limits rule out using a single object as a high-frequency lease register and rule out a delete-as-lock-release pattern; any arbiter built on R2 must renew at a rate below the write limit and must treat lease release as an overwrite, not a delete.
 
@@ -522,9 +524,10 @@ HA and backups are out of the MVP but prepared for (D-0033). "Prepared for" is a
 | Lease modes `local` and `expiring` | M0 protocol (D-0047) | M5b |
 | Lease states `held`, `uncertain`, `expired`, `revoked` | M0 vocabulary | M5b |
 | Fencing tokens | M0 protocol field | M5b |
+| Concurrent fences and a mid-fence crash | — | M5b, mandatory before expiring leases ship (D-0075) |
 | HA policy field on apps (`none`, `cold`, `warm`, `hot`) | M0 schema; only `none` implemented (D-0020) | M5a (`cold`), M5b (`warm`), M6 (`hot`) |
 | Node resource reports feeding the N+1 indicator | Node agent reports from M2 (D-0021) | M5b |
-| Manual promotion | Replica nodes follow the log from M2 (D-0013) | M5, half open (Q-0024) |
+| Manual promotion | Replica nodes follow the log from M2 (D-0013) | M5b (D-0067) |
 | Witness and three votes | — | M5b (D-0017) |
 | Edge as third voter | — | M5b (D-0018; a single edge is a traffic single point of failure) |
 | Failback sequence | — | M5b (D-0022) |
@@ -665,8 +668,9 @@ D-0056 fixes the baseline stack, keeping the same items D-0028 listed and replac
 | Consoles | xterm.js; no noVNC (D-0056) | Confirmed (D-0056) | There is no VNC (F-0034): Cloud Hypervisor has no display device, so consoles are text-only, xterm.js over serial or virtio-console |
 | Metrics | uPlot | Confirmed | Fed by on-demand node telemetry (D-0014) |
 | Realtime | SSE for one-way streams, WebSockets for bidirectional sessions (D-0057) | Confirmed (D-0057) | Section 13: SSE for the event stream, live logs and deployment progress; WebSockets for terminal and VM console |
+| Builds | Dockerfile only, run by BuildKit inside an ephemeral builder microVM, output to a node-local OCI layout (D-0060) | Confirmed (D-0060) | The OCI layout feeds the normal OCI-to-rootfs path; that BuildKit runs under Cloud Hypervisor is a **Hypothesis** (section 19); Railpack/Nixpacks are re-verified before M4, and a zero-config builder may be added later as a second `Builder` implementation |
 | Docker client | bollard | Not needed | Confirmed: there is no Docker on nodes (D-0008) |
-| Backup | Litestream was suggested (D-0015) | Open | Litestream 0.5 has no client-side encryption (F-0040); four options open (Q-0026) |
+| Backup | Quoro's own chunk engine with client-side encryption (D-0069) | Confirmed (D-0069) | Litestream 0.5 has no client-side encryption (F-0040), so SQLite snapshots come from the SQLite backup API or `VACUUM INTO` and are chunked and encrypted locally; a Litestream backend for a lower RPO may be added later as an option (D-0069) |
 
 Two of the "confirmed" rows carry a caveat about the dependency rather than about the choice. rmcp's release cadence means the MCP layer must be isolated behind the service-layer boundary so a minor-version upgrade is a contained change (D-0048). utoipa's empty-description behaviour (F-0042) means the API contract has a lint rule, not just a convention: every response must carry a non-empty description. Every dependency in the list must still be justified individually (D-0056).
 
@@ -684,7 +688,8 @@ D-0056 requires that every dependency be justified, so each one above carries a 
 | rust-embed | One binary, no asset directory to lose (D-0012) | Nothing planned |
 | xterm.js | Text consoles over the serial or virtio-console (F-0034) | Nothing planned |
 | uPlot | Metrics rendering without a large charting stack | Nothing planned |
-| hyper + rustls + an ACME client | Only if Q-0001 resolves to the embedded proxy (pending maintainer decision) | Choosing Caddy instead (Q-0001) |
+| hyper + rustls + an ACME client | The embedded reverse proxy that serves ingress on hosts with a public IP (D-0059) | The M2 spike showing that owning ACME is too costly, in which case Caddy's admin API becomes the backend |
+| BuildKit, in an ephemeral builder microVM | Dockerfile-only builds in M4 (D-0060) | A different builder backend behind the same `Builder` implementation |
 
 Not on the list: bollard, because there is no Docker on nodes (D-0008); noVNC, because consoles are text-only (D-0056, F-0034); a container runtime, because a container Engine is a later implementation (D-0009).
 
@@ -737,17 +742,22 @@ Every open item this document depends on. None of them is decided here.
 
 | Id | Question | Options | Recommendation | Needed by |
 | --- | --- | --- | --- | --- |
-| Q-0001 | Ingress proxy: Caddy via admin API, or an embedded Rust proxy? | (a) Caddy via its admin API: proven ACME, but a second Go process to ship and update, routing split across two processes. (b) Embedded Rust proxy: one binary, full control of health and slow start, but more code and ACME edge cases owned by us | (b) embedded proxy, with (a) kept as a fallback backend — recommended, pending maintainer decision | M2 |
-| Q-0002 | Git builds: Dockerfile only, Railpack, or Nixpacks? | Dockerfile only; Railpack; Nixpacks | Dockerfile only in M4, run by BuildKit inside an ephemeral builder microVM, output as a node-local OCI layout; re-verify Railpack/Nixpacks before M4 — recommended, pending maintainer decision | M4 |
-| Q-0003 | OCI image -> rootfs conversion and minimal init: own or reuse? | (a) own Rust init plus own OCI-to-ext4 pipeline; (b) reuse a guest agent and Go tooling; (c) share the rootfs over virtio-fs | (a); settled by the M0 spike — recommended, pending maintainer decision | M0 |
-| Q-0004 | Snapshot primitive under the chunk engine: own dirty tracking, lvm-thin, ZFS, or btrfs? | (a) own block dirty tracking; (b) lvm-thin + `thin_delta`; (c) ZFS send; (d) btrfs snapshots/send; (e) reflink copy + content-defined chunking | (e) for M5a cold backups; spike (b) vs (d) before M5b; Q-0004 stays open — recommended, pending maintainer decision | M5a, M5b |
-| Q-0005 | Node mesh: kernel WireGuard driven by Quoro, userspace, or own? | (a) kernel WireGuard over netlink; (b) userspace boringtun over TUN; (c) own implementation (rejected: crypto risk) | (a), mesh deferred to M5a; (b) only as a fallback backend — recommended, pending maintainer decision | M5a |
-| Q-0024 | Manual promotion of a replica node, and custody of the cluster keys when a replica is promoted: M5a, M5b, or its own item? | (a) M5a, needs no witness or lease; (b) M5b, alongside leases; (c) a separate small item before M5a. Custody: replicate the keys wrapped to each replica's node key, or re-key with an operator-confirmed re-pin | None; custody is settled with Q-0024 | M5 |
-| Q-0026 | Encrypted backups for SQLite now that Litestream 0.5 has no client-side encryption: which option? | (1) accept SSE-C; (2) pin Litestream 0.3.x with age; (3) own chunk engine with `VACUUM INTO` snapshots; (4) encrypting S3 proxy | None | M5a |
-| Q-0060 | Image catalog: format, owner, milestone and signature scheme | Not restated here: Q-0060 carries the options | None | M0 |
+| — | Custody of the cluster keys when a replica is promoted to primary | (a) wrap both keys to each replica's node key; (b) re-key on promotion with an operator-confirmed re-pin | (a), as recorded with D-0050 | M5b, with manual promotion (D-0067) |
 
 Decided since the first draft, and therefore no longer listed above:
 
+- Ingress proxy: D-0059.
+- Git builds: D-0060.
+- Image path, rootfs conversion and minimal init: D-0061.
+- Disk snapshot primitive: D-0062.
+- Node mesh: D-0063.
+- Release milestones: D-0064.
+- Manual promotion: D-0067.
+- SQLite and catalog-template backups: D-0069 (answers Q-0026; a Litestream backend with SSE-C for a lower RPO may be added later as an option).
+- Curated catalog: format, owner, location and signature scheme are decided at M4 planning, before the first template ships: D-0070 (answers Q-0060).
+- HA policy costs for `none` and `cold`: D-0068 (answers Q-0025).
+- Docs-site timing: D-0065 (answers Q-0009).
+- Prerequisites for shipping expiring leases in M5b: D-0075.
 - Realtime transport: D-0057 (supersedes D-0044).
 - Graphical console dropped from the baseline stack: D-0056 (supersedes D-0028).
 - Lease modes `local` and `expiring`: D-0047.
@@ -760,11 +770,9 @@ Decided since the first draft, and therefore no longer listed above:
 - Host layout, CLI and setup token: D-0054.
 - Lab TLS for the M2 demonstration: D-0055.
 
-Q-0024 and Q-0026 have no recommendation on purpose: both are scope or risk trade-offs that belong to the maintainer, and picking one in a document would decide them by accident. Q-0060 has no recommendation either, for the same reason.
+Custody of the cluster keys on promotion is the only open row. Q-0024 fixed when promotion ships (M5b, D-0067) but not how a promoted replica obtains the keys; until promotion exists the keys do not leave the primary.
 
-Three of the rows shape the rest of this document more than the others. Q-0003 decides the image path in section 8 and is settled by the M0 spike, so an answer that contradicts that recommendation changes the engine workstream's first task rather than the architecture. Q-0001 decides whether the ingress workstream owns an ACME implementation or an integration with an existing proxy, which is a difference in the code the project has to maintain for years. Q-0024 decides who can read replicated history after a promotion.
-
-The remaining rows are contained: Q-0002 affects M4 only, and Q-0004 and Q-0026 affect the backup path.
+Q-0001 to Q-0006, Q-0009, Q-0024, Q-0025, Q-0026 and Q-0060 are decided (D-0059 to D-0065, D-0067 to D-0070) and are therefore absent from the table.
 
 ## 19. Hypotheses to verify
 
@@ -772,16 +780,16 @@ Every claim marked **Hypothesis** in this document, and what would settle it.
 
 - **Axum supports SSE and WebSockets natively.** Used in section 13. Verify by building one `text/event-stream` route and one WebSocket route in the current Axum version and running them in CI; settle before the M3 event stream ships.
 - **An object store can support object lock on every provider we target.** Used in section 11 for the off-site audit copy. Verify per provider with a real bucket: create a locked object, try to overwrite and delete it, and record the result.
-- **The available Rust ACME and TLS crates are mature enough to own the proxy path.** Used in section 10 as the cost of Q-0001's recommended option. Verify with a spike before M2: obtain and renew one certificate for a real domain through the embedded proxy.
-- **An encrypting S3 proxy or SSE-C is operationally acceptable as a backup path.** Used in section 6, option 1 and 4 of Q-0026. Verify by restoring a primary snapshot from the bucket in a drill, not by reading documentation.
-- **BuildKit inside a builder microVM works under Cloud Hypervisor.** Used in section 16 and the Q-0002 recommendation. Verify with an M4 spike that runs one Dockerfile build end to end and produces an OCI layout.
-- **Railpack/Nixpacks are viable zero-config builders, with Nixpacks in maintenance and Railpack as its successor.** Used in the Q-0002 recommendation. Verify before M4 by building one real repository with each.
-- **Running Cloud Hypervisor as a separate process keeps the AGPL-3.0 and Apache-2.0/BSD-3-Clause licenses cleanly separated.** Used in section 2. This is a legal reading, not a reviewed conclusion. Verify with a license review before the first public release: a lawyer confirms that process separation is enough, or the distribution model changes.
+- **The available Rust ACME and TLS crates are mature enough to own the proxy path.** Used in section 10 and D-0059. Verify with a spike before M2: obtain and renew one certificate for a real domain through the embedded proxy.
+- **An encrypting S3 proxy or SSE-C is operationally acceptable as a backup path.** Used in section 6, options 1 and 4, and D-0069's optional Litestream backend. Verify by restoring a primary snapshot from the bucket in a drill, not by reading documentation.
+- **BuildKit inside a builder microVM works under Cloud Hypervisor.** Used in section 16 and D-0060. Verify with an M4 spike that runs one Dockerfile build end to end and produces an OCI layout.
+- **Railpack/Nixpacks are viable zero-config builders, with Nixpacks in maintenance and Railpack as its successor.** Used in D-0060, which re-verifies them before M4. Verify before M4 by building one real repository with each.
+- **Running Cloud Hypervisor as a separate process keeps the AGPL-3.0 and Apache-2.0/BSD-3-Clause licenses cleanly separated.** Used in section 2. This is a legal reading, not a reviewed conclusion. Verify with a license review before the first public release, which is the M3 preview (D-0064): a lawyer confirms that process separation is enough, or the distribution model changes.
 - **A crash-consistent block copy of a running database is not sufficient, so native replication is needed.** Used in section 14 and D-0023's exception for databases. Verify by restoring a chunk-engine copy of a running database and measuring what it contains.
-- **A `local` lease that never expires does not let two writers exist.** Used in section 14 and the lease-mode recommendation. Verify with the M5b partition test: with the control plane unreachable, confirm that no other node can be told to start the stateful app.
+- **A `local` lease that never expires does not let two writers exist.** Used in section 14 and D-0047. Verify with the M5b partition test: with the control plane unreachable, confirm that no other node can be told to start the stateful app.
 - **The witness can be small enough to run on any cheap machine in a different failure domain.** Used in section 3 and D-0017, which puts the witness in a different failure domain from the nodes. Verify in M5b by running it on a third machine and cutting each link in turn.
 - **Decision to verify, D-0018: a single edge is a traffic single point of failure.** With the edge also a voter, losing it removes both the traffic path and one vote. D-0018's mitigations are Cloudflare as the traffic edge with the small VPS acting only as witness, or two edges with DNS failover. Verify in M5b that the chosen mitigation keeps both traffic and quorum when the edge dies.
 - **One tunnel per node with an HTTPS monitor on the app hostname gives per-node failover.** Used in section 10. Verify in M5a by powering off a node behind its own tunnel and confirming the load balancer removes that endpoint and keeps serving from the other.
 - **The load-balancer health check interval is short enough for the RTO the `warm` policy promises.** Used in section 14. Verify by measuring detection-to-recovery time in M5b.
-- **`mkfs.ext4 -d` plus a Rust OCI registry client is a workable rootfs pipeline.** Used in section 8 and the Q-0003 recommendation. Verify in the M0 spike by booting a microVM from a converted image.
+- **`mkfs.ext4 -d` plus a Rust OCI registry client is a workable rootfs pipeline.** Used in section 8 and D-0061. Verify in the M0 spike by booting a microVM from a converted image.
 - **virtio-fs is only an optimisation and never a requirement.** Used in section 8. Verify by confirming the M2 deploy path boots from a disk image with no virtiofsd present.

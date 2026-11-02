@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The engine's async methods return `Send` futures (D-0071), so a caller
 //! generic over `E: Engine` can spawn an engine call on the tokio runtime.
 //!

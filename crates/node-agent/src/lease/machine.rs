@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The pure lease state machine of `docs/contracts/node-agent-protocol.md`
 //! section 8: no I/O, no async, no clock reads.
 //!

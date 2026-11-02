@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Runs the engine conformance suite against the in-memory fake.
 
 mod common;

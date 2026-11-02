@@ -73,7 +73,7 @@ Also out of scope for now:
 
 **Self-hosted for real.** The static panel can be hosted anywhere, but the stateful API stays self-hosted [D-0012]. There is no vendor lock-in: DNS, LB and object storage sit behind provider interfaces, and Cloudflare is the first implementation, not the only one [D-0025].
 
-**Supply-chain safety.** Binaries are signed and builds reproducible, because the installer is a pipe to a shell and the tool controls infrastructure [D-0027]. The catalog pins upstream images with verifiable signatures [D-0026].
+**Supply-chain safety.** Binaries are signed and builds reproducible, because the installer is a pipe to a shell and the tool controls infrastructure [D-0027]. The catalog pins upstream images with verifiable signatures [D-0026], and its format, owner, location and signature scheme are decided at M4 planning, before the first template ships [D-0070].
 
 ## 7. Feature set mapped to milestones
 
@@ -85,14 +85,14 @@ Every milestone below is exactly as recorded in the roadmap decision; nothing is
 | M1 | Skeleton: one-command installer, engine create/start/stop/delete, basic panel | [D-0033] |
 | M2 | Deploy: node agent, deploy an OCI image with domain and TLS, live logs | [D-0033, D-0024] |
 | M3 | AI-native: MCP read plus restart/redeploy, scoped grants, audit log, event webhooks | [D-0033, D-0029, D-0030, D-0031, D-0032] |
-| M4 | Full experience: Git builds (Dockerfile; Railpack/Nixpacks to verify), metrics, web terminal, VM console | [D-0033, Q-0002] |
+| M4 | Full experience: Git builds (Dockerfile only, in an ephemeral BuildKit builder microVM), metrics, web terminal, VM console | [D-0033, D-0060] |
 | M5a | Stateless app replicas + edge LB + backups to S3/R2 (cold) + local non-replicated volumes + off-site audit-log copy | [D-0033, D-0020, D-0023, D-0052, D-0053] |
 | M5b | Witness, leases, fencing, replicated volumes (warm), capacity indicator | [D-0033, D-0017, D-0019, D-0020, D-0021] |
 | M6 | Automatic failover + hot | [D-0033, D-0016, D-0020] |
 
 HA and backups are out of the MVP, but the MVP architecture prepares them [D-0033]. For example, self-fencing is part of the node-agent protocol from M0 so it is not redesigned later [D-0019].
 
-Which milestone is the first public release is open (Q-0006): options are the M3 demo or M4 complete.
+M3 tags v0.1.0 as an experimental preview with signed builds, not for production; M4 complete is the first general release and the broad announcement [D-0064]. The domain and trademark checks (Q-0008) must be done before the M3 tag [D-0064].
 
 Definitions of Done for each milestone live in `docs/product/roadmap.md`.
 
@@ -140,7 +140,7 @@ Telemetry — app logs and metrics — stays on each node and is not replicated;
 
 ### 9.2 Leader election roadmap
 
-Single node in the MVP; manual promotion in M5 (which half, M5a or M5b, is open: Q-0024); automatic failover with Raft and at least three votes later, in M6 [D-0016, D-0033]. Manual promotion means a command or a button, or an agent doing it with human approval [D-0016]. Automatic election with only two nodes causes split-brain, because after a network cut both sides can believe they are primary [D-0016].
+Single node in the MVP; manual promotion of a replica node to primary ships in M5b, alongside leases and fencing [D-0016, D-0033, D-0067]; automatic failover with Raft and at least three votes later, in M6 [D-0016, D-0033]. Manual promotion means a command or a button, or an agent doing it with human approval [D-0016]. Automatic election with only two nodes causes split-brain, because after a network cut both sides can believe they are primary [D-0016].
 
 ### 9.3 Why three votes, and the witness
 
@@ -169,8 +169,8 @@ Each app carries one policy, and the panel shows what it costs [D-0020].
 
 | Policy | What exists on other nodes | RPO | RTO | Cost |
 |---|---|---|---|---|
-| `none` | Nothing | Not applicable | Not applicable | No reserved resources (inferred, pending Q-0025) |
-| `cold` | Backups only | Since the last backup | Restore time | Backup storage (inferred, pending Q-0025) [D-0023] |
+| `none` | Nothing | Not applicable | Not applicable | No reserved resources [D-0068] |
+| `cold` | Backups only | Since the last backup | Restore time | Backup storage and restore time [D-0023, D-0068] |
 | `warm` | Data continuously replicated, image pulled, instance stopped | Seconds | MicroVM boot | Disk |
 | `hot` | Instance running and replicating | Near zero | Near zero | Disk + RAM + CPU |
 
@@ -186,9 +186,9 @@ The N+1 capacity indicator answers a different question in plain language: "if n
 
 The sync engine is ours: control-plane log replication plus a content-addressed chunk engine for volumes [D-0023]. A volume is snapshotted, split into content-addressed chunks — deduplicated and encrypted — and only new chunks are shipped; to another node this is `warm` replication, to S3 or R2 it is a `cold` backup [D-0023]. The first implementation uses incremental snapshots every few seconds, so RPO equals the interval [D-0023].
 
-Databases are the exception: they use their native replication orchestrated by Quoro — Postgres streaming, Litestream for SQLite — offered as catalog templates, because block-level copies of a running database are only crash-consistent [D-0023] (Litestream 0.5 has no client-side encryption; the option is open, Q-0026; see `docs/research/rust-api-and-mcp-tooling.md`).
+Databases are the exception: they use their native replication orchestrated by Quoro — Postgres streaming for Postgres — offered as catalog templates, because block-level copies of a running database are only crash-consistent [D-0023]. SQLite databases and catalog templates are backed up by Quoro's own chunk engine with client-side encryption, taken from consistent snapshots (the SQLite backup API or `VACUUM INTO`), not by Litestream, whose 0.3 line is unmaintained; Litestream with SSE-C may be added later as an optional backend for a lower RPO (see `docs/research/rust-api-and-mcp-tooling.md`) [D-0069].
 
-The snapshot primitive underneath the chunk engine is open (Q-0004); options are our own block diff and dirty tracking, or lvm-thin, ZFS or btrfs send.
+The snapshot primitive underneath the chunk engine is, for now, reflink snapshots plus a full content-defined chunk scan for M5a `cold` backups; a spike comparing lvm-thin and btrfs before M5b chooses the primitive for `warm`, and the `Engine` trait's `snapshot_volume` hooks keep it swappable [D-0062].
 
 ### 9.8 Failback and planned switchover
 
@@ -209,7 +209,7 @@ A planned switchover loses no data. Data loss of seconds happens only in surpris
 
 Two ingress paths cover the two main users [D-0024]: a reverse proxy with ACME for hosts with a public IP, and Cloudflare Tunnel for homelabs behind NAT, which avoids opening ports and fighting TLS.
 
-The proxy implementation is open (Q-0001); options are driving Caddy through its admin API, the proven option, or embedding a Rust reverse proxy. Both sit behind a common interface [D-0024].
+The proxy is an embedded Rust reverse proxy — hyper, rustls and an ACME client crate — behind the ingress interface that the Cloudflare Tunnel backend also implements; Caddy driven through its admin API stays as a fallback backend if the M2 spike shows ACME is too costly [D-0059]. The maturity of the ACME crate is a research task before M2 [D-0059]. Both sit behind a common interface [D-0024].
 
 Multiple cloudflared replicas on the same tunnel give host-level failover only; whether they expose any app health check is a **Hypothesis** to be confirmed, and per-node failover needs one tunnel per node behind a load balancer. Cloudflare Load Balancing is a paid add-on from $5/month, its HTTPS monitors with the app hostname test the app, there are no TCP monitors for tunnels, and an LB sees all replicas of one tunnel as one endpoint; see `docs/research/cloudflare-lb-and-tunnel.md` [D-0024].
 
@@ -262,17 +262,9 @@ All of the following are open. This document does not choose between the options
 
 | Id | Question | Options (if known) |
 |---|---|---|
-| Q-0001 | Ingress proxy implementation | Caddy driven through its admin API; embedded Rust reverse proxy |
-| Q-0002 | Git build method | Dockerfile only; Railpack; Nixpacks (verify current state of each) |
-| Q-0003 | OCI image to microVM rootfs conversion and minimal init | Write our own; reuse an existing component |
-| Q-0004 | Snapshot primitive under the chunk engine | Own block diff / dirty tracking; lvm-thin; ZFS; btrfs send |
-| Q-0005 | Node mesh | Kernel WireGuard driven by Quoro; userspace such as boringtun; own implementation |
-| Q-0006 | First public release | The M3 demo; M4 complete |
-| Q-0008 | Domain registration and trademark check (IMPI/USPTO) | Before going public with the name |
-| Q-0009 | Docs site tooling | Not decided |
-| Q-0024 | Which half of M5 owns manual promotion of a replica node (D-0016 says M5; D-0033 lists it in neither M5a nor M5b) | M5a; M5b; a separate item before M5a |
-| Q-0025 | HA policy costs for `none` and `cold` as stated in this document | Confirm or correct the inferred "no reserved resources" and "backup storage" costs |
-| Q-0026 | Encrypted SQLite backups now that Litestream 0.5 has no client-side encryption | Accept SSE-C; pin Litestream 0.3.x with age; back up with Quoro's own encrypted chunk engine; an encrypting S3 proxy |
+| Q-0008 | Domain registration and trademark check (IMPI/USPTO) | Before the M3 v0.1.0 tag (D-0064) |
+
+The ingress proxy, Git build method, OCI-to-rootfs conversion and init, snapshot primitive, node mesh, first public release and manual promotion of a replica node are decided in D-0059 to D-0064 and D-0067; docs-site timing in D-0065, the HA policy costs in D-0068, encrypted SQLite and template backups in D-0069, and when the curated catalog is decided in D-0070.
 
 Realtime transport is decided: SSE carries one-way streams (event stream, live logs, deployment progress) and WebSockets carry bidirectional sessions (terminal, VM console); see `docs/architecture/architecture.md` §13 [D-0057].
 

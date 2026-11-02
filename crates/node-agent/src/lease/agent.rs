@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The async lease driver: feeds the pure state machine, sends renewals,
 //! executes self-fences and answers revokes (sections 4.2, 8.4, 8.5).
 

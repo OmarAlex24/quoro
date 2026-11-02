@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! `oci2rootfs` — pull an OCI image from a registry and write it, plus the
 //! Quoro init, into an ext4 root disk. Throwaway spike (issue #10).
 

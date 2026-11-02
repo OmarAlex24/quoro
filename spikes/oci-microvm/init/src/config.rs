@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Parser for `/quoro/config`.
 //!
 //! The format is specified in `../../config-format.md`: one `key=value` per

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! `quoro-init`: static PID 1 for the Quoro OCI microVM spike.
 //!
 //! What it does, in order (see `../../config-format.md` for the config file and

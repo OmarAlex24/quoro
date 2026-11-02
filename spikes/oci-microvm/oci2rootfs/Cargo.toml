@@ -2,6 +2,7 @@
 name = "oci2rootfs"
 version = "0.1.0"
 edition = "2021"
+license = "AGPL-3.0-only"
 description = "Spike: turn an OCI image from a public registry into an ext4 root disk"
 
 [lib]

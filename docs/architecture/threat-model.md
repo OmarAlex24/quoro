@@ -157,7 +157,7 @@ options and never presents one as decided.
 | 6 | human/agent -> API | Bearer token or session cookie, `Quoro-Justification` | Scope check, grant check, audit write in the same transaction (`../contracts/permission-model.md`) |
 | 7 | primary -> webhook receiver | Event payload and `Quoro-Signature` | HMAC-SHA256 over `<t>.<raw body>`, 5 minute window (D-0032, `../contracts/README.md`) |
 | 8 | Quoro -> providers | DNS records, LB pools, tunnel config, objects in a bucket | Provider API tokens scoped per provider; separate credentials per purpose (D-0025) |
-| 9 | node <-> node | Replication traffic, chunk shipping (from M5a) | Mesh (Q-0005, open), fencing tokens on every write (D-0019) |
+| 9 | node <-> node | Replication traffic, chunk shipping (from M5a) | Mesh: kernel WireGuard over netlink, per-node keys and peers in desired state (D-0063), fencing tokens on every write (D-0019) |
 | 10 | release pipeline -> host | A binary executed as root by the installer | Signature check plus reproducible build (D-0027) |
 
 Boundary 5 is the most important one in the product: it is the only path by which instructions reach
@@ -251,7 +251,7 @@ and needs the same scope as the matching endpoint (D-0031, `../contracts/README.
 | T-NODE-11 | D | A node is flooded with frames or oversized messages | One JSON message per text frame, 1 MiB maximum, heartbeat every 5 s and disconnect after 15 s without a frame | `../contracts/node-agent-protocol.md` | A slow-loris style session can hold the single session slot until it times out |
 | T-NODE-12 | E | A node sends a message type or version the primary does not expect | Unknown fields are ignored, an unknown `type` is answered with a non-fatal `error`, and a major version mismatch is a fatal `unsupported_version` | `../contracts/node-agent-protocol.md` | A downgrade attack has nothing to gain: the protocol has one major version |
 | T-NODE-13 | T | A removed node keeps receiving desired state | `DELETE /api/v1/nodes/{node_id}` ends the session with a fatal `node_removed` and the node stops dialing | `../contracts/node-agent-protocol.md` | Its VMs are left as they are; removal never destroys data remotely, by design |
-| T-NODE-14 | E | A compromised primary takes over the cluster | Nothing in the protocol stops it: it holds the cluster signing key, the state and the audit log | D-0012, D-0031 | Full control. Signed desired state does not help, because the primary is the signer. This is why the audit copy must be out of reach of whoever operates the server (D-0031) and why a promoted replica must obtain the key through a defined custody path (Q-0024, open) |
+| T-NODE-14 | E | A compromised primary takes over the cluster | Nothing in the protocol stops it: it holds the cluster signing key, the state and the audit log | D-0012, D-0031 | Full control. Signed desired state does not help, because the primary is the signer. This is why the audit copy must be out of reach of whoever operates the server (D-0031) and why a promoted replica must obtain the key through the custody path decided with manual promotion in M5b (D-0067) |
 
 ### (f) Leases and fencing
 
@@ -276,7 +276,7 @@ and needs the same scope as the matching endpoint (D-0031, `../contracts/README.
 | T-VM-02 | E | A guest attacks the host kernel through KVM | The kernel is trusted (assumption 2.1) and the guest runs unprivileged | D-0009 | Kernel vulnerabilities are out of scope; patch cadence is the operator's |
 | T-VM-03 | D | One app starves another (noisy neighbour) | Each microVM gets its own vCPU and memory allocation from `resources`, and virtio I/O can be throttled with token buckets | `../contracts/engine-trait.md`, `docs/research/cloud-hypervisor.md` | CPU shares are not a hard cap on every host; a sustained load still affects neighbours |
 | T-VM-04 | T | One app reaches another app's network | Each app has its own TAP on the node bridge and a private address; isolation between projects is enforced with nftables rules generated with the network | D-0008, `../contracts/engine-trait.md`, design choice of this document for the nftables default-deny | A misgenerated rule set can open a path; rules must be derived from desired state and tested |
-| T-VM-05 | T | A malicious image compromises the node during preparation | Images are referenced with a digest and verified before conversion; the catalog pins images with verifiable signatures — **mitigation pending**: the catalog format and signature scheme are open (Q-0060) | D-0026, `../contracts/engine-trait.md` | Conversion runs as root on the node; a parser bug in the image path is host code |
+| T-VM-05 | T | A malicious image compromises the node during preparation | Images are referenced with a digest and verified before conversion; the OCI-to-ext4 pipeline resolves layer paths inside the rootfs with `openat2` and `RESOLVE_IN_ROOT` (D-0061); the catalog pins images with verifiable signatures — **mitigation pending**: the catalog format and signature scheme are decided at M4 planning (D-0070) | D-0026, D-0061, `../contracts/engine-trait.md` | Conversion runs as root on the node; a parser bug in the image path is host code, which `RESOLVE_IN_ROOT` narrows but does not remove |
 | T-VM-06 | I | A volume snapshot leaks guest secrets | A Cloud Hypervisor snapshot contains full guest RAM and no disk contents, so RAM must be treated as secret-bearing; the chunk engine encrypts chunks | `docs/research/cloud-hypervisor.md` (F-0035 finding), D-0023 | Snapshot contents include whatever the app had in memory, including keys |
 | T-VM-07 | E | The guest's init is subverted to escape the microVM | The minimal init is PID 1 inside the guest and trusts nothing from the guest application; the app runs as PID 2 under the configured user | `../contracts/engine-trait.md`, D-0008 | The init is Quoro code inside a trusted boundary; a bug there is a guest-internal bug, not a host escape |
 | T-VM-08 | D | A guest exhausts host disk with its rootfs or logs | Per-VM disk size from the VM spec, and `node.disk_low` is emitted when free disk falls below the node's threshold | `../contracts/README.md` event types, `../contracts/node-agent-protocol.md` | A full disk affects every app on that node before anyone reacts |
@@ -303,9 +303,9 @@ and needs the same scope as the matching endpoint (D-0031, `../contracts/README.
 | T-PRV-01 | E | A Cloudflare API token with account-wide scope is used to change unrelated DNS | Providers sit behind interfaces with per-provider credentials; the token should be scoped to the zone and to the products used | D-0025, design choice of this document for the least-privilege default | A user who pastes a global token gets global authority; Quoro cannot narrow it after the fact |
 | T-PRV-02 | I | Backup credentials can also delete the audit copy | Backup and audit-copy credentials are separate: the audit-copy credential is its own put-only `object_store` provider entry (D-0051) | D-0051, `../contracts/audit-log-format.md`, D-0025 | The separation is a deployment property; both live on the same primary |
 | T-PRV-03 | T | An S3-compatible provider silently ignores conditional writes, giving two nodes the same lease | The provider adapter probes the capability at setup and refuses to enable the arbiter if the probe fails | F-0038, `docs/research/r2-conditional-writes.md`, D-0017 | Community MinIO and Backblaze B2 status is **Hypothesis**; the probe is the only defence |
-| T-PRV-04 | I | Stored backups are readable by the provider | Chunk-engine chunks are encrypted client-side; Litestream backups are not, because 0.5.x has no client-side encryption | D-0023, F-0040, Q-0026 (open) | Q-0026 lists the options (SSE-C with a Quoro-held key, pinning 0.3.x, own chunk engine with periodic snapshots, an encrypting proxy) and none is chosen |
+| T-PRV-04 | I | Stored backups are readable by the provider | Chunk-engine chunks are encrypted client-side; SQLite and template backups go through that same chunk engine from consistent snapshots, so nothing is stored unencrypted (D-0069) | D-0023, D-0069, F-0040 | Litestream with SSE-C may be added later as an optional backend (D-0069); such a backend would rely on the provider for encryption, with a Quoro-held key sent per request |
 | T-PRV-05 | D | A provider rate limit (R2 allows 1 write per second per key) stalls the off-site copy | Segment keys are unique, so the per-key limit does not bind the audit copy; retries back off | F-0037, `../contracts/audit-log-format.md` | A provider-wide outage pauses the copy; the local chain continues |
-| T-PRV-06 | I | Secrets in the change log are readable to a replica node | Replicated secret columns are encrypted with the cluster key, and a replica holds ciphertext | D-0013, `../contracts/node-agent-protocol.md` | How a promoted replica obtains the cluster key is open (Q-0024); custody determines who can read history |
+| T-PRV-06 | I | Secrets in the change log are readable to a replica node | Replicated secret columns are encrypted with the cluster key, and a replica holds ciphertext | D-0013, `../contracts/node-agent-protocol.md` | How a promoted replica obtains the cluster key is decided with manual promotion in M5b (D-0067); custody determines who can read history |
 | T-PRV-07 | T | A provider changes a DNS record outside Quoro | Desired state is the source of truth and reconciliation rewrites drift | D-0011, D-0025 | Drift between reconciliations is unobserved unless a route check reports it |
 | T-PRV-08 | I | Provider secrets read back through the API or the audit log | Provider secrets are write-only, encrypted with the data-encryption key in `secret_enc`, never returned by a read call, redacted from audit parameters, and reachable only under the human-only `provider:manage` scope | D-0051, D-0050 | A compromised primary holding the DEK can decrypt them |
 
@@ -339,7 +339,7 @@ and needs the same scope as the matching endpoint (D-0031, `../contracts/README.
 | T-SUP-01 | T | A tampered download is piped into a root shell | Binaries are signed and builds reproducible, so the installer can verify the signature before running the binary | D-0027 | The verification step is code in the installer; if it is skipped, the pipe still runs |
 | T-SUP-02 | T | A build host is compromised and produces a malicious, correctly signed binary | Reproducible builds let anyone rebuild from source and compare; a mismatch is detectable | D-0027 | Detection needs someone to rebuild; the signature alone would not catch it |
 | T-SUP-03 | S | The release signing key is stolen | It is a release-pipeline secret, never on the operator's host; releases are signed, so key custody is the control | D-0027 | A stolen key mints valid signatures; rotation and revocation are not defined in M0 |
-| T-SUP-04 | T | An upstream catalog image is replaced with a different one | The catalog pins images by digest with verifiable signatures — **mitigation pending**: the catalog format and signature scheme are open (Q-0060) | D-0026 | A publisher that signs a malicious image passes every check; the signature proves origin, not intent |
+| T-SUP-04 | T | An upstream catalog image is replaced with a different one | The catalog pins images by digest with verifiable signatures — **mitigation pending**: the catalog format and signature scheme are decided at M4 planning, before the first template ships (D-0070) | D-0026, D-0070 | A publisher that signs a malicious image passes every check; the signature proves origin, not intent |
 | T-SUP-05 | T | A dependency upgrade breaks a security invariant (for example MCP auth) | rmcp is pinned to a minor version and majors are budgeted; the API spec is frozen and diffed in CI | F-0041, F-0042, D-0048, D-0036 | A pinned old version accumulates unpatched issues; the upgrade budget is a process, not a guarantee |
 | T-SUP-06 | E | A contributor merges a backdoor | Review before merge, one maintainer merges, and contracts are standalone pull requests | D-0004, D-0036 | Review is human; a subtle change can pass |
 | T-SUP-07 | T | The panel client is generated from a hand-edited spec that diverged from the server | The hand-written `../contracts/openapi.yaml` is frozen and CI fails on a semantic diff against the utoipa output; orval generates the panel client from it | D-0048, F-0042 | CI compares documents, not behaviour; a handler can still differ from its annotation |
@@ -388,6 +388,10 @@ decisions with a single narrow threat.
 | D-0051 (human-only `providers` resource, write-only secrets) | T-PRV-01, T-PRV-02, T-PRV-08 |
 | D-0053 (off-site copy in M5a, object-lock probe) | T-AUD-06, T-PRV-05 |
 | D-0054 (setup token, listener and pin model) | T-API-11 |
+| D-0059 (embedded reverse proxy behind the `Ingress` interface) | T-ING-01 to T-ING-09 (the proxy and its certificate handling are Quoro code; Caddy remains a fallback backend) |
+| D-0061 (own init, own OCI-to-ext4 pipeline with `RESOLVE_IN_ROOT`) | T-VM-05 (layer paths cannot escape the rootfs), T-VM-07 (PID 1 is Quoro's own init) |
+| D-0063 (kernel WireGuard configured over netlink) | Boundary 9, node <-> node: replication traffic and chunks cross it under per-node keys instead of trusting the network |
+| D-0069 (own chunk engine for SQLite and template backups) | T-PRV-04, T-AUD-06 (consistent snapshots make the copy worth restoring) |
 
 ## 8. Residual risks and open items
 
@@ -401,7 +405,7 @@ off-site copy exists".
 
 ### 8.2 Single primary until promotion exists
 
-Until M5 (manual promotion, which half is open: Q-0024) and M6 (automatic election), one primary is
+Until M5b (manual promotion, D-0067) and M6 (automatic election), one primary is
 a single point of write failure and a single point of trust. Losing it means no changes until an
 operator acts; compromising it means full control (T-NODE-14). Replica nodes reduce the data-loss
 risk, not the authority risk.
@@ -411,7 +415,8 @@ risk, not the authority risk.
 Replicated secret columns are encrypted with the cluster key (D-0013, `../contracts/node-agent-protocol.md`).
 A promoted replica must obtain that key or it cannot read the state it now owns. The algorithms, the
 storage and the rotation of the cluster keys are decided (D-0050; architecture section 6, "Cluster
-keys"); custody on promotion is still open (Q-0024). Until then, any answer would be invented.
+keys"); custody on promotion is decided together with manual promotion in M5b (D-0067). That is why
+promotion is not offered before M5b: a replica promoted earlier would own state it cannot decrypt.
 
 ### 8.4 Object lock portability
 
@@ -421,13 +426,15 @@ report "locked" when the probe fails (`../contracts/audit-log-format.md`). A pro
 probe but degrades later is not covered. Object-lock support per provider is **Hypothesis**: it is not
 in `docs/research/`.
 
-### 8.5 Litestream encryption
+### 8.5 Database backups and encryption
 
-Litestream 0.5.x has no client-side encryption (F-0040). A SQLite catalog template backed up through
-Litestream therefore relies on provider-side SSE-C or SSE-KMS. Q-0026 is open and lists four options:
-accept SSE-C with a Quoro-held key, pin the older 0.3.x line with age (**Hypothesis** on its
-maintenance state), back up SQLite with Quoro's own chunk engine at a lower RPO, or place an
-encrypting proxy in front of the bucket. This document does not choose.
+Litestream 0.5.x has no client-side encryption (F-0040), so a SQLite backup taken through it would
+rely on provider-side SSE-C or SSE-KMS. D-0069 settles the default instead: SQLite and catalog-template
+backups use Quoro's own chunk engine with client-side encryption, from consistent snapshots taken with
+the SQLite backup API or `VACUUM INTO`. Litestream is not used. A Litestream backend with SSE-C may be
+added later as an optional path for a lower RPO; it would then rely on the provider for encryption,
+with a Quoro-held key sent per request, and pinning the older 0.3.x line with age stays a
+**Hypothesis** on its maintenance state.
 
 ### 8.6 Hypotheses carried by this document
 
@@ -517,7 +524,7 @@ each names the threat it exercises.
 | Run the object-lock probe against the configured bucket and confirm the panel reports locked or not-locked truthfully | T-AUD-03, T-PRV-03 |
 | Attempt to delete a locked audit segment with the audit-copy credential: refused | T-AUD-09, T-PRV-02 |
 | Read a backup chunk from the bucket and confirm it is ciphertext | T-PRV-04 |
-| Read a Litestream backup and confirm whether it is plaintext, and record the answer against Q-0026 | T-PRV-04 |
+| Restore a primary snapshot taken through the SQLite backup API and confirm the off-site copy is ciphertext, encrypted client-side with the cluster key | T-PRV-04 |
 
 ### M5b — witness, leases, fencing
 
@@ -528,6 +535,9 @@ each names the threat it exercises.
 | Reconnect lab-1: it starts nothing stateful, its copy becomes the warm copy, and the quarantined snapshot is in the audit log | T-NODE-06, T-LEASE-09 |
 | Make the arbiter unreachable, if an external arbiter is used, and confirm the node reports `uncertain` and does not fence before `valid_until` | T-LEASE-03, T-LEASE-07 |
 | Present a stale fencing token to the chunk store and confirm the write is rejected | T-LEASE-01, T-LEASE-05 |
+| Let several `expiring` leases on one node expire at the same time and confirm every fence runs concurrently and finishes within its own bound, `t_send + D` (D-0075) | T-LEASE-01, T-LEASE-02 |
+| Crash a node in the middle of a fence and confirm that, after restart, its stateful apps stay stopped and no lease is granted elsewhere until an operator acknowledges the fence (D-0075) | T-LEASE-02, T-LEASE-09 |
+| Ask for manual promotion while the old primary may still hold expiring leases: refused until an operator acknowledges the fence (D-0067) | T-AVL-02, T-AVL-03 |
 
 ### M6 — election and hot
 

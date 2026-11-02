@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Node-agent protocol message types, shared by the node agent and the
 //! control plane.
 //!
