@@ -149,6 +149,9 @@ def check_events_schema(fails, path, events):
     )
 
 
+MIGRATION_RE = re.compile(r"^([0-9]{4})-[a-z0-9-]+\.sql$")
+
+
 def check_db_schema(fails, path, tables):
     try:
         script = read(path)
@@ -162,6 +165,39 @@ def check_db_schema(fails, path, tables):
         fail(fails, f"db-schema.sql: sqlite error: {exc}")
         con.close()
         return
+
+    # Post-freeze schema changes are numbered migrations applied in order on
+    # top of the frozen base; each one bumps meta.schema_version by one.
+    migrations_dir = os.path.join(os.path.dirname(path), "migrations")
+    migrations = []
+    if os.path.isdir(migrations_dir):
+        for name in sorted(os.listdir(migrations_dir)):
+            match = MIGRATION_RE.match(name)
+            if not match:
+                fail(fails, f"migrations/{name}: name is not NNNN-<slug>.sql")
+                continue
+            migrations.append((int(match.group(1)), name))
+    for expected_number, (number, name) in enumerate(migrations, start=1):
+        if number != expected_number:
+            fail(fails, f"migrations/{name}: expected number {expected_number:04d}")
+            con.close()
+            return
+        try:
+            con.executescript(read(os.path.join(migrations_dir, name)))
+        except (OSError, sqlite3.Error) as exc:
+            fail(fails, f"migrations/{name}: {exc}")
+            con.close()
+            return
+    version = con.execute(
+        "select value from meta where key = 'schema_version'"
+    ).fetchone()
+    expected_version = str(1 + len(migrations))
+    if version is None or version[0] != expected_version:
+        fail(
+            fails,
+            f"db schema: schema_version {version and version[0]!r}, "
+            f"expected {expected_version!r} after {len(migrations)} migrations",
+        )
     names = {
         row[0]
         for row in con.execute("select name from sqlite_master where type='table'")
@@ -175,7 +211,10 @@ def check_db_schema(fails, path, tables):
     for extra in sorted(names - expected):
         fail(fails, f"db-schema.sql: table {extra} not in README")
 
-    print("db-schema.sql: %d tables, loaded into sqlite" % len(names))
+    print(
+        "db-schema.sql: %d tables, loaded into sqlite with %d migrations"
+        % (len(names), len(migrations))
+    )
 
 
 def operation_blocks(lines):

@@ -16,6 +16,7 @@ These files are the interfaces that Quoro's workstreams build against in paralle
 | [audit-log-format.md](audit-log-format.md) | Audit record format, hash chaining, verification, off-site copy with object lock | control-plane, mcp, panel |
 | [permission-model.md](permission-model.md) | Identities, scopes, resource selectors, grants (TTL, max uses), incident grants, JIT approval | control-plane, mcp, panel |
 | [db-schema.sql](db-schema.sql) | Control-plane SQLite schema: numbered change log and the state tables derived from it (D-0015) | control-plane |
+| [migrations/](migrations/) | Numbered schema migrations applied in order on top of the frozen `db-schema.sql`; each bumps `schema_version` | control-plane |
 | [engine-trait.md](engine-trait.md) | The Rust `Engine` trait, its types and semantics; Cloud Hypervisor is the first implementation (D-0007) | engine, node-agent |
 
 The architecture these contracts implement is described in [../architecture/architecture.md](../architecture/architecture.md); threats and mitigations are in [../architecture/threat-model.md](../architecture/threat-model.md). Terms follow [../glossary.md](../glossary.md).
@@ -24,7 +25,7 @@ The architecture these contracts implement is described in [../architecture/arch
 
 Two checks run on every contract change.
 
-- `scripts/check_contracts.py` (Python 3 standard library only; run `python3 scripts/check_contracts.py`): `events.schema.json` parses as JSON, its event-type list equals the Event types table, and every example's `type` is in that list and carries the schema's required top-level keys; `db-schema.sql` loads into an in-memory SQLite database and its tables equal the Database tables list; in `openapi.yaml` (checked line by line, without a YAML parser) the document declares OpenAPI 3.1, every operation has `x-quoro-scope` with a scope from the table or a special value, every response has a `description` or a `$ref`, every `x-quoro-mcp-tool` matches the MCP tools table (endpoint and scope), and every event type is mentioned; every backticked scope in the markdown contracts exists in the Scopes table; the node-agent message names listed below equal the message headings of node-agent-protocol.md section 5, and every JSON example block in that file parses.
+- `scripts/check_contracts.py` (Python 3 standard library only; run `python3 scripts/check_contracts.py`): `events.schema.json` parses as JSON, its event-type list equals the Event types table, and every example's `type` is in that list and carries the schema's required top-level keys; `db-schema.sql` loads into an in-memory SQLite database, the migrations in `migrations/` apply in order on top of it with `schema_version` ending at one plus their count, and its tables equal the Database tables list; in `openapi.yaml` (checked line by line, without a YAML parser) the document declares OpenAPI 3.1, every operation has `x-quoro-scope` with a scope from the table or a special value, every response has a `description` or a `$ref`, every `x-quoro-mcp-tool` matches the MCP tools table (endpoint and scope), and every event type is mentioned; every backticked scope in the markdown contracts exists in the Scopes table; the node-agent message names listed below equal the message headings of node-agent-protocol.md section 5, and every JSON example block in that file parses.
 - Full semantic validation of `openapi.yaml` against OpenAPI 3.1 and of `events.schema.json` against JSON Schema 2020-12 needs third-party validators; it is not in the standard-library script and is added to CI with the cargo workspace in M0.
 
 `openapi.yaml` is hand-written and is the frozen source of truth for the HTTP API (D-0048). The implementation's utoipa output is generated and diffed against it in CI, and the panel client is generated from it with orval.
@@ -114,6 +115,7 @@ A scope is `<resource>:<verb>` (D-0030). The complete list:
 | `node:read` | List and read nodes | |
 | `node:enroll` | Create node join tokens | human-only |
 | `node:remove` | Remove a node from the cluster | destructive, human-only |
+| `node:fence_ack` | Acknowledge a node's failed fence after verifying its VMs are stopped, so its leases may be granted again | human-only |
 | `project:read` | List and read projects | |
 | `project:write` | Create and update projects | |
 | `project:delete` | Delete an empty project | destructive |
@@ -262,7 +264,7 @@ Defined in node-agent-protocol.md. Node to control plane: `hello`, `heartbeat`, 
 
 ### Database tables
 
-Defined in db-schema.sql: `meta`, `change_log`, `nodes`, `node_join_tokens`, `projects`, `vms`, `apps`, `app_env`, `deployments`, `domains`, `volumes`, `leases`, `users`, `api_tokens`, `sessions`, `agents`, `agent_keys`, `access_tokens`, `grants`, `approvals`, `incidents`, `events`, `webhooks`, `webhook_deliveries`, `providers`, `audit_log`, `audit_exports`. Tables marked local in that file are not replicated through the change log.
+Defined in db-schema.sql and changed only by the numbered files in `migrations/`: `meta`, `change_log`, `nodes`, `node_join_tokens`, `projects`, `vms`, `apps`, `app_env`, `deployments`, `domains`, `volumes`, `leases`, `users`, `api_tokens`, `sessions`, `agents`, `agent_keys`, `access_tokens`, `grants`, `approvals`, `incidents`, `events`, `webhooks`, `webhook_deliveries`, `providers`, `audit_log`, `audit_exports`. Tables marked local in that file are not replicated through the change log.
 
 ## Open items before the freeze
 
