@@ -1,0 +1,32 @@
+[package]
+name = "oci2rootfs"
+version = "0.1.0"
+edition = "2021"
+description = "Spike: turn an OCI image from a public registry into an ext4 root disk"
+
+[lib]
+name = "oci2rootfs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "oci2rootfs"
+path = "src/main.rs"
+
+[dependencies]
+# The crate under evaluation: OCI distribution protocol (anonymous token auth,
+# manifest/index resolution, blob pull).
+# default features off: they only add `test-registry`; `rustls-tls` keeps TLS on
+# rustls so no OpenSSL/native-tls is pulled in.
+oci-client = { version = "0.18", default-features = false, features = ["rustls-tls"] }
+# oci-client's API is async; we only need a current-thread runtime and #[tokio::main]-free select/macros.
+tokio = { version = "1", features = ["rt", "macros"] }
+# Verify every downloaded blob digest ourselves, independently of oci-client.
+sha2 = "0.10"
+# Read the (tar) layer tarballs, including safe `unpack_in` path handling.
+tar = "0.4"
+# Decompress gzip layers.
+flate2 = "1"
+# Parse the image config blob (Entrypoint/Cmd/Env/User/WorkingDir).
+serde_json = "1"
+# Error context and reporting.
+anyhow = "1"

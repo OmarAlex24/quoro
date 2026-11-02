@@ -1,0 +1,13 @@
+[package]
+name = "quoro-init"
+version = "0.1.0"
+edition = "2021"
+description = "Static PID 1 for the Quoro OCI microVM spike"
+
+[[bin]]
+name = "quoro-init"
+path = "src/main.rs"
+
+[dependencies]
+# raw syscalls for mount/reboot/signalfd/setuid; no other crate needed
+libc = "0.2"
