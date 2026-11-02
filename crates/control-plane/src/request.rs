@@ -187,6 +187,35 @@ impl CallCtx {
         }
     }
 
+    /// Records an idempotent replay (`IdempotencyKey`: D-0031 records the call
+    /// either way): `ok`, with no change-log link because nothing changed.
+    ///
+    /// # Errors
+    ///
+    /// An internal error if the record could not be written.
+    pub async fn audit_replay(
+        &self,
+        state: &AppState,
+        scope: Scope,
+        target: &Target,
+        project_id: Option<&str>,
+        params: &Value,
+    ) -> Result<(), ApiError> {
+        let record = self.record(
+            Some(scope),
+            Some(target),
+            project_id,
+            params,
+            Outcome::Ok,
+            None,
+            None,
+        );
+        let mut w = state.store.begin_write().await?;
+        audit::append(&mut w.tx, &record).await?;
+        w.commit().await?;
+        Ok(())
+    }
+
     /// Records an authorized call that then failed (`result: error`), in its
     /// own transaction, after the failed one rolled back.
     ///

@@ -127,6 +127,35 @@ async fn setup_is_idempotent_under_idempotency_key() {
     // The replay returns the original result, not the 409 a new setup gets.
     assert_eq!(ids[0], ids[1]);
     assert_eq!(ids[0].0, 201);
+
+    // Both calls are audited `ok` as the owner (IdempotencyKey: D-0031 records
+    // the call either way); only the first points at a change, and no record
+    // holds the password.
+    let audit: Vec<(String, String, Option<i64>, String)> = sqlx::query_as(
+        "SELECT result, actor_id, change_seq, params FROM audit_log WHERE operation = 'POST /api/v1/setup' ORDER BY seq",
+    )
+    .fetch_all(server.state.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(audit.len(), 2, "{audit:?}");
+    for (result, actor, _, params) in &audit {
+        assert_eq!(result, "ok");
+        assert_eq!(Some(actor.as_str()), ids[0].1.as_str());
+        assert!(!params.contains(OWNER_PASSWORD));
+    }
+    assert!(audit[0].2.is_some() && audit[1].2.is_none());
+
+    // A replay with a different token is not the same call.
+    let res = server
+        .client()
+        .post(server.url("/api/v1/setup"))
+        .header("Quoro-Setup-Token", "qst_other")
+        .header("Idempotency-Key", "first-run")
+        .json(&owner_body())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(problem(res).await.0, 409);
 }
 
 #[tokio::test]

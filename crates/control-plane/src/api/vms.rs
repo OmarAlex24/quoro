@@ -529,7 +529,18 @@ pub async fn create_vm(
             .begin(&ctx.identity.user_id, CREATE_VM, key, &params)
         {
             Begin::Proceed => {}
-            Begin::Replay(status, body) => return Ok((status, Json(body)).into_response()),
+            Begin::Replay(status, body) => {
+                let id = body["id"].as_str().unwrap_or_default();
+                ctx.audit_replay(
+                    &state,
+                    Scope::VmCreate,
+                    &vm_target(id),
+                    body["project_id"].as_str(),
+                    &params,
+                )
+                .await?;
+                return Ok((status, Json(body)).into_response());
+            }
             Begin::Conflict => {
                 let error = ApiError::conflict("Idempotency-Key reused");
                 ctx.audit_error(

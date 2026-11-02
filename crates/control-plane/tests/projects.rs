@@ -177,4 +177,17 @@ async fn an_idempotency_key_replays_the_first_create() {
         .await
         .unwrap();
     assert_eq!(rows, 1);
+
+    // The replay is audited too (IdempotencyKey: D-0031 records the call
+    // either way), `ok` and without a change-log link.
+    let audit: Vec<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT result, change_seq FROM audit_log WHERE operation = 'POST /api/v1/projects' AND target_id = ? ORDER BY seq",
+    )
+    .bind(first["id"].as_str().unwrap())
+    .fetch_all(server.state.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(audit.len(), 2, "{audit:?}");
+    assert!(audit.iter().all(|(result, _)| result == "ok"));
+    assert!(audit[0].1.is_some() && audit[1].1.is_none(), "{audit:?}");
 }

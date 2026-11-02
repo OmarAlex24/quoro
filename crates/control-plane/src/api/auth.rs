@@ -419,7 +419,10 @@ pub async fn setup(
     if let Some(key) = &key {
         match state.idempotency.begin("public", SETUP, key, &fingerprint) {
             Begin::Proceed => {}
-            Begin::Replay(status, value) => return Ok((status, Json(value)).into_response()),
+            Begin::Replay(status, value) => {
+                audit_setup_replay(&state, &extensions, &params, &value).await?;
+                return Ok((status, Json(value)).into_response());
+            }
             Begin::Conflict => return Err(ApiError::conflict("Idempotency-Key reused")),
         }
     }
@@ -440,6 +443,52 @@ pub async fn setup(
             Err(e)
         }
     }
+}
+
+/// A replayed setup is recorded too (`IdempotencyKey`: D-0031 records the
+/// call either way): `ok`, as the owner it created, with no change-log link
+/// because nothing changed.
+async fn audit_setup_replay(
+    state: &AppState,
+    extensions: &Extensions,
+    params: &Value,
+    user: &Value,
+) -> Result<(), ApiError> {
+    let id = user["id"]
+        .as_str()
+        .ok_or_else(|| ApiError::internal(&"replayed setup has no user id"))?
+        .to_string();
+    let mut w = state.store.begin_write().await?;
+    audit::append(
+        &mut w.tx,
+        &Record {
+            actor: Actor {
+                kind: ActorType::User,
+                id: id.clone(),
+            },
+            agent_model: None,
+            on_behalf_of: None,
+            channel: Channel::Api,
+            operation: SETUP.to_string(),
+            scope: None,
+            target_type: Some("user".into()),
+            target_id: Some(id),
+            project_id: None,
+            params: params.clone(),
+            justification: None,
+            trigger_event_id: None,
+            incident_id: None,
+            grant_id: None,
+            approval_id: None,
+            request_id: request_id_of(extensions),
+            result: Outcome::Ok,
+            result_detail: None,
+            change_seq: None,
+        },
+    )
+    .await?;
+    w.commit().await?;
+    Ok(())
 }
 
 async fn run_setup(

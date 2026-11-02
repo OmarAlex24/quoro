@@ -372,9 +372,17 @@ async fn vm_authorization_and_validation() {
     .await;
     assert_eq!((status, code.as_str()), (404, "not_found"));
 
-    // The successful create is exactly one ok audit record.
+    // The create and its replay are both audited `ok` (IdempotencyKey: D-0031
+    // records the call either way); only the create points at a change.
     let vm_id = first["id"].as_str().unwrap().to_string();
     let records = audit_records(&server, "POST /api/v1/vms", &vm_id).await;
-    assert_eq!(records.len(), 1, "{records:?}");
-    assert_eq!(records[0].0, "ok");
+    assert_eq!(records, vec![("ok".into(), None), ("ok".into(), None)]);
+    let seqs: Vec<(Option<i64>,)> = sqlx::query_as(
+        "SELECT change_seq FROM audit_log WHERE operation = 'POST /api/v1/vms' AND target_id = ? ORDER BY seq",
+    )
+    .bind(&vm_id)
+    .fetch_all(server.state.store.pool())
+    .await
+    .unwrap();
+    assert!(seqs[0].0.is_some() && seqs[1].0.is_none(), "{seqs:?}");
 }

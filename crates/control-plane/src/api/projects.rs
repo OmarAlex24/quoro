@@ -235,6 +235,18 @@ pub async fn create_project(
             Begin::Replay(status, stored) => {
                 let project: Project = serde_json::from_value(stored)
                     .map_err(|e| ApiError::internal(&format!("replayed project: {e}")))?;
+                let target = Target {
+                    kind: "project".to_string(),
+                    id: project.id.clone(),
+                };
+                ctx.audit_replay(
+                    &state,
+                    Scope::ProjectWrite,
+                    &target,
+                    Some(&project.id),
+                    &params,
+                )
+                .await?;
                 return Ok((status, Json(project)));
             }
             Begin::Conflict => return Err(ApiError::conflict("Idempotency-Key reused")),
