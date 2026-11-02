@@ -1,0 +1,1165 @@
+# Node-agent protocol
+
+Status: M0 draft for review. Contracts freeze at the end of M0 (D-0036); after the freeze a change to this file is a standalone contract pull request, never part of feature work.
+
+This file fixes the wire protocol between a node agent and the control plane: enrollment, the dial-out session, the message set, desired-state reconciliation, change-log follow, and leases with self-fencing. It is the contract named in `README.md` for the node-agent, control-plane and engine workstreams.
+
+Names used here — roles, node status, VM observed status, lease modes and node-side lease states, scopes, event types, message types — come from `README.md` and are used exactly as defined there. Field names come from the shared entity model used by `openapi.yaml`, `db-schema.sql` and `events.schema.json`. Terminology follows `../glossary.md`; in particular a **replica node** is not an **app replica**, and a **lease holder** is the only node that may run a stateful app (D-0019).
+
+## 1. Purpose and principles
+
+### 1.1 What this contract fixes
+
+- The enrollment flow and the credential a node receives.
+- The transport, the envelope and the message set in both directions.
+- How desired state is delivered, verified, persisted and applied.
+- How a node follows the change log (D-0013) and what it does when its copy diverges.
+- The lease lifecycle and the self-fence procedure that D-0019 requires from M0.
+- The order of operations when a node returns after a failure (D-0022).
+- What the node stores locally, so the data plane can run without the control plane (D-0011).
+
+It does not fix: the HTTP API around it (`openapi.yaml`), the event payloads (`events.schema.json`), how the engine drives Cloud Hypervisor (`engine-trait.md`), or the panel's realtime transport.
+
+### 1.2 Principles
+
+| Principle | Consequence in this protocol | Source |
+| --- | --- | --- |
+| Nodes dial out, never are dialed into | The node opens one outbound WebSocket to the primary; the primary never connects to the node. Works behind NAT and lets the control plane live anywhere. | D-0011 |
+| The node is autonomous | The node stores signed desired state locally and reconciles it without the control plane. Losing the session blocks changes, not workloads. | D-0011 |
+| Self-fencing exists from M0 | The lease messages, the node-side lease state machine and the self-fence path ship before any HA feature is used, so the protocol is not redesigned later. | D-0019 |
+| One writer | Only the primary issues desired state, leases and commands. A replica node forwards to the primary; it never speaks this protocol as an authority. | D-0012 |
+| State is replicated, telemetry is not | Logs, console bytes and metrics travel on demand over this session and are not stored by the primary. | D-0014 |
+| Every change is numbered | Desired state carries a monotonic `rev`; the change log carries a gap-free `seq` with a hash chain. | D-0011, D-0013 |
+
+## 2. Enrollment
+
+Enrollment is a one-time exchange over the HTTP API. It happens before any session exists and uses the API's `application/problem+json` error codes on failure (`README.md`).
+
+### 2.1 Join token
+
+A human with the `node:enroll` scope creates a join token:
+
+```
+POST /api/v1/nodes/join-tokens
+```
+
+The token is a one-time secret with a default lifetime of 1 hour; the API returns the secret once and stores only its hash. `node:enroll` is human-only, so an agent can never enroll a machine (`README.md`).
+
+### 2.2 Join command
+
+The panel and the CLI render a join command (the API returns it as `join_command`) that carries exactly three values:
+
+| Value | Purpose |
+| --- | --- |
+| primary URL | Where to open the session, for example `wss://quoro.example.com` |
+| join token | The one-time secret from `POST /api/v1/nodes/join-tokens` |
+| certificate fingerprint | SHA-256 of the primary's TLS certificate (DER), so a self-signed certificate is safe to accept |
+
+The fingerprint is a pin, not a trust-on-first-use decision: the node refuses any certificate whose digest differs, and a certificate rotation requires a new join command.
+
+### 2.3 Enroll request
+
+The node generates an Ed25519 keypair, keeps the private key locally and sends the public key:
+
+```
+POST /api/v1/nodes/enroll
+```
+
+The call is `x-quoro-scope: public`: the node has no credential yet and the join token is the proof. A token can be consumed once; a used or expired token is `409` or `422` in the API's error format (`openapi.yaml`).
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `join_token` | string | yes | The join token secret |
+| `name` | string | yes | Operator-visible node name, unique in the cluster |
+| `public_key` | string | yes | Base64 Ed25519 public key of the node |
+| `roles` | array of string | yes | Any of `node`, `witness`, `edge` (`README.md`) |
+| `capacity` | object | yes | `cpus`, `memory_mb`, `disk_gb` |
+| `kvm` | object | yes | `available` (bool), `kernel` (string), `nested` (bool, optional) |
+
+The `kvm` object is filled from a probe at enrollment: `/dev/kvm` exists and is writable, a `vmx`/`svm` flag is present in the CPU flags, and the kernel release is recorded. The probe procedure follows `docs/research/vps-nested-virt.md`; presence of `/dev/kvm` alone does not prove that a guest can start, so the first real boot is the confirmation and a failed boot is reported as a deployment failure in the `boot` phase.
+
+### 2.4 Enroll response
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `node_id` | string (`nod_`) | Identity of this node |
+| `cluster_id` | string (`cls_`) | The cluster it joined |
+| `primary_url` | string | Base URL the node dials for this and later sessions |
+| `credential` | string | Node session credential, returned once |
+| `cluster_public_key` | string | Base64 Ed25519 public key that signs desired state |
+
+The credential is 32 random bytes, base64-encoded, and stored root-only on the node. The primary stores only its hash, so a database read does not yield a usable credential.
+
+Desired state and lease messages are signed with the cluster signing key (Ed25519), whose public key the node pins at enrollment; that key is separate from the cluster data-encryption key that protects data at rest (D-0050). The signing key is Ed25519; data at rest uses a 256-bit cluster data-encryption key with XChaCha20-Poly1305, plus a node-local key that encrypts this node's copy of desired-state secrets. All keys are files mode 0600 in `/var/lib/quoro` on the primary, outside the SQLite file, generated at first start and backed up separately from the database. Custody of the keys when a replica is promoted is open (Q-0024).
+
+### 2.5 After enrollment
+
+The primary records the node with status `pending` and emits `node.enrolled`. The node writes the credential, the cluster public key and its `node_id` to its local store, then opens a session. `pending` becomes `connected` when the first session starts; the node never re-enrolls on its own — a lost credential is recovered by removing and re-enrolling the node by a human.
+
+## 3. Transport
+
+### 3.1 Connection
+
+```
+GET /api/v1/nodes/session
+Authorization: Bearer <node credential>
+```
+
+- WebSocket over TLS, upgraded from the same API listener. The node is the client; the primary is the server.
+- The node verifies the TLS certificate against the pinned fingerprint from the join command.
+- One session per node. A new session for the same `node_id` closes the older one, so a stale connection can never deliver messages alongside a fresh one.
+- The operation is annotated `x-quoro-scope: node` in `openapi.yaml` (`README.md`): a node credential authorizes the session and nothing else.
+
+### 3.2 Frames
+
+- Text frames only, one JSON message per frame.
+- Maximum message size 1 MiB. A larger frame is a protocol violation: the receiver answers `error` with code `bad_message` and `fatal: false`, and ignores the frame.
+- Binary frames are not used in v1.
+
+### 3.3 Envelope
+
+```json
+{
+  "v": 1,
+  "type": "heartbeat",
+  "id": "msg_01JC9Z7A4M8Q2V6B3N5T9R1KXW",
+  "re": "msg_01JC9Z6Q5W8N3K4T7R2M1XHB0D",
+  "body": { "time": "2026-11-02T10:15:32Z" }
+}
+```
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `v` | integer | yes | Envelope major version; `1` in v1 |
+| `type` | string | yes | One of the message types in `README.md` |
+| `id` | string (`msg_`) | yes | Identity of this message |
+| `re` | string (`msg_`) | no | `id` of the message this one answers |
+| `body` | object | yes | Message-specific body; may be `{}` |
+
+`msg_` ids are message-local. They exist to pair a request with its answer inside one session, they are never persisted, never appear in the API, the database, the change log, the audit log or an event, and they are not part of the identifier table in `README.md`. A message id may be reused after a reconnect.
+
+### 3.4 Versioning, unknown fields and unknown types
+
+- Unknown fields inside a known body are ignored. This allows additive changes without a new version.
+- An unknown `type` is answered with `error`, code `bad_message`, `fatal: false`; the session continues.
+- A `v` whose major version the receiver does not implement is answered with `error`, code `unsupported_version`, `fatal: true`; the session ends.
+- Minor changes (new optional fields, new message bodies of the same type) do not change `v`. A new required field or a changed meaning is a major change and a standalone contract pull request (D-0036).
+
+### 3.5 Relation to the panel's realtime transport
+
+This WebSocket is the node protocol and is independent of how the panel receives live data. The panel's transport is decided (D-0057): SSE for one-way streams and WebSockets for interactive sessions. The node session is a WebSocket regardless, so nothing in this file depends on that choice.
+
+## 4. Session lifecycle
+
+### 4.1 Sequence
+
+```
+node agent                                          primary
+    |                                                  |
+    |-- TLS + GET /api/v1/nodes/session (credential) -->|
+    |-- hello ---------------------------------------->|
+    |<---------------------------------------- welcome  |
+    |<----------------------------------- lease_revoke  |  0..n stale or superseded leases
+    |-- command_result ------------------------------>|
+    |<---------------------------------- desired_state |
+    |-- command_result (stored) --------------------->|
+    |<----------------------------------- log_entries  |
+    |-- log_ack ------------------------------------->|
+    |== reconcile: network, images, stop, start, routes ==|
+    |-- status_report (applied_rev) ------------------>|
+    |-- heartbeat every 5 s -------------------------->|
+    |-- status_report on change and every 30 s ------->|
+    |-- event (buffered while disconnected) ---------->|
+    |<--------------------------------------- command  |  on demand
+    |-- command_result ------------------------------>|
+    |<------------------------------------- stream_open |
+    |-- stream_data ... stream_end ------------------>|
+    |<------------------------------------ lease_grant |
+    |-- lease_renew every duration/3 (expiring only) ->|
+    |                                                  |
+```
+
+### 4.2 Rules of the order
+
+1. `hello` is the first message the node sends on every session.
+2. `welcome` is the first message the primary sends.
+3. The primary sends any `lease_revoke` before anything else. The node stops the stateful VMs bound to those leases and answers `command_result` for each revoke before it processes the next message.
+4. Only then does the primary send `desired_state`. The node verifies, persists, answers `command_result` with `ok`, and reconciles.
+5. `log_entries` follow the desired state; the node acknowledges with `log_ack` as it verifies the chain.
+6. Steady state begins: `heartbeat` every 5 s, `status_report` on any observed change and at least every 30 s, `event` whenever something happens, streams on demand.
+
+### 4.3 Timers
+
+| Timer | Value | Owner | Source |
+| --- | --- | --- | --- |
+| Heartbeat interval | 5 000 ms | node sends, both expect | this file |
+| Session timeout | 15 000 ms without any frame | primary | this file |
+| Status report interval | 30 000 ms | node | this file |
+| Redial backoff | 1 s doubling to 60 s, full jitter | node | this file |
+| Event buffer | 10 000 entries | node | D-0011, this file |
+| Concurrent streams | 32 per session | primary enforces | this file |
+| Maximum message | 1 MiB | both | this file |
+
+The values above are carried in `welcome` (`heartbeat_interval_ms`, `session_timeout_ms`), so the primary can change them without a protocol change; the node uses the values from the current `welcome` and falls back to the defaults above when a session has not yet received one.
+
+### 4.4 Disconnect and redial
+
+The primary marks the node `disconnected` after 15 s without any frame from it and emits `node.disconnected` with `data.reason` either `heartbeat_timeout` (no frame within the timeout) or `session_closed` (the socket closed or the server ended the session). A node that reconnects is `connected` again and the primary emits `node.connected`.
+
+The node redials with exponential backoff from 1 s doubling to 60 s with full jitter, and resets the backoff after a session that stayed up for at least 60 s. A `fatal` error stops redialing until an operator acts, except for `unsupported_version`, where the node keeps dialing (an upgraded primary may accept it) but logs the mismatch locally.
+
+## 5. Message reference
+
+All bodies are objects. Field names are snake_case. Timestamps are RFC 3339 UTC strings. Ids use the prefixes in `README.md`.
+
+### 5.1 `hello`
+
+**Direction:** node to control plane.
+**When:** first message of every session, before any other message.
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `node_id` | string (`nod_`) | yes | The node's identity; must match the credential |
+| `agent_version` | string | yes | Version of the node agent binary |
+| `engine_version` | string | yes | Version of the engine backend, for example the pinned Cloud Hypervisor release (`docs/research/cloud-hypervisor.md`) |
+| `boot_id` | string | yes | Random value generated at agent process start; identifies this run of the agent |
+| `stored_rev` | integer | yes | Newest desired-state `rev` persisted locally |
+| `applied_rev` | integer | yes | Newest desired-state `rev` fully reconciled |
+| `log_seq` | integer | yes | Last change-log `seq` verified locally; 0 if none |
+| `log_hash` | string | yes | Hex SHA-256 the node holds at `log_seq`; 64 zeros when `log_seq` is 0 |
+| `leases` | array of object | yes | Leases known locally, see below |
+| `capacity` | object | yes | `cpus`, `memory_mb`, `disk_gb` |
+| `allocated` | object | yes | Same shape, currently allocated |
+| `kvm` | object | yes | `available`, `kernel`, `nested` (optional) |
+| `dropped_events` | integer | yes | Local events dropped from the buffer since the last successful delivery; 0 when none |
+
+Each lease entry:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `lease_id` | string (`lse_`) | Lease identity |
+| `resource_type` | string | `app` or `primary` |
+| `resource_id` | string | `app_` or `nod_` id |
+| `mode` | string | `local` or `expiring` |
+| `fencing_token` | integer | Last token this node saw for the lease |
+| `state` | string | `held`, `uncertain`, `expired` or `revoked` |
+
+`leases` lets the primary detect a node that believes it holds a lease the primary has already moved, before any desired state is sent. A lease the primary does not know, or one whose `fencing_token` is lower than the primary's, is revoked immediately after `welcome`.
+
+```json
+{
+  "v": 1,
+  "type": "hello",
+  "id": "msg_01JC9Z6Q5W8N3K4T7R2M1XHB0D",
+  "body": {
+    "node_id": "nod_01JC9Y2M4Q7V8B1N6T3R5K9XZP",
+    "agent_version": "0.1.0",
+    "engine_version": "cloud-hypervisor v54.0",
+    "boot_id": "8f1c2a4e-6b3d-4f5a-9c7e-1a2b3c4d5e6f",
+    "stored_rev": 412,
+    "applied_rev": 412,
+    "log_seq": 902,
+    "log_hash": "3b1f0c9a5e7d2b8f4a6c1d9e0f3a5b7c9d1e3f5a7b9c1d3e5f7a9b1c3d5e7f90",
+    "leases": [
+      {
+        "lease_id": "lse_01JC9Z8K2M4P6R8T0V2X4Z6B8D",
+        "resource_type": "app",
+        "resource_id": "app_01JC9Z7B3N5Q7S9Z1W3Y5A7C9E",
+        "mode": "local",
+        "fencing_token": 7,
+        "state": "held"
+      }
+    ],
+    "capacity": { "cpus": 8, "memory_mb": 16384, "disk_gb": 200 },
+    "allocated": { "cpus": 2, "memory_mb": 2048, "disk_gb": 20 },
+    "kvm": { "available": true, "kernel": "6.11.2", "nested": true },
+    "dropped_events": 0
+  }
+}
+```
+
+### 5.2 `heartbeat`
+
+**Direction:** node to control plane.
+**When:** every `heartbeat_interval_ms`, from the end of the handshake for as long as the session is open.
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `time` | string | yes | Node wall-clock time when the heartbeat was sent |
+| `busy` | boolean | no | True while a long apply loop is running; purely informational |
+
+```json
+{
+  "v": 1,
+  "type": "heartbeat",
+  "id": "msg_01JC9Z9C4P6R8T0V2X4Z6B8D0F",
+  "body": { "time": "2026-11-02T10:15:32Z", "busy": false }
+}
+```
+
+### 5.3 `status_report`
+
+**Direction:** node to control plane.
+**When:** after the first reconciliation of a session, on any observed change, and at least every 30 s.
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `applied_rev` | integer | yes | Newest desired-state `rev` fully reconciled |
+| `vms` | array of object | yes | One entry per VM the node runs or is changing |
+| `routes` | array of object | yes | One entry per hostname the node serves |
+| `capacity` | object | yes | `cpus`, `memory_mb`, `disk_gb` |
+| `allocated` | object | yes | Same shape, currently allocated |
+| `disk_free_gb` | number | yes | Free space on the volume filesystem |
+
+VM entry: `vm_id` (string, `vm_`), `observed_status` (one of `creating`, `stopped`, `starting`, `running`, `stopping`, `crashed`, `deleted`, `unknown`), `health` (`passing`, `failing`, `unknown`), `ip` (string, optional), `restart_count` (integer), `last_exit_code` (integer, optional).
+
+Route entry: `hostname` (string), `cert_status` (one of `pending`, `issued`, `renewing`, `failed`, `not_applicable`), `cert_expires_at` (string, optional).
+
+The primary treats a VM it knows and the node does not report as `unknown` rather than assuming it is gone; only an explicit `deleted` or a successful `inspect` removes it.
+
+```json
+{
+  "v": 1,
+  "type": "status_report",
+  "id": "msg_01JC9ZA0D5Q7S9Z1W3Y5A7C9E1",
+  "body": {
+    "applied_rev": 412,
+    "vms": [
+      {
+        "vm_id": "vm_01JC9Z7C4P6R8T0V2X4Z6B8D0F",
+        "observed_status": "running",
+        "health": "passing",
+        "ip": "10.42.1.11",
+        "restart_count": 0
+      }
+    ],
+    "routes": [
+      {
+        "hostname": "blog.example.com",
+        "cert_status": "issued",
+        "cert_expires_at": "2027-01-31T09:00:00Z"
+      }
+    ],
+    "capacity": { "cpus": 8, "memory_mb": 16384, "disk_gb": 200 },
+    "allocated": { "cpus": 2, "memory_mb": 2048, "disk_gb": 20 },
+    "disk_free_gb": 128.4
+  }
+}
+```
+
+### 5.4 `event`
+
+**Direction:** node to control plane.
+**When:** when something the cluster should know about happens on the node — a VM crash, an app going down, a node fencing itself, free disk crossing its threshold.
+
+The body is the event envelope from `events.schema.json` **without** `seq`, which the primary assigns:
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `schema_version` | integer | yes | Envelope version; `1` in v1. New optional payload fields do not change it |
+| `id` | string (`evt_`) | yes | Event identity, generated by the node |
+| `type` | string | yes | One of the event types in `README.md` |
+| `time` | string | yes | When it happened, node clock |
+| `source` | object | yes | `{ "kind": "node", "node_id": <nod_> }`, `node_id` must match the session |
+| `subject` | object | yes | `{ "type": ..., "id": ... }` |
+| `project_id` | string (`prj_`) | no | Project the subject belongs to |
+| `incident_id` | string (`inc_`) | no | Set only when the primary correlates it |
+| `request_id` | string (`req_`) | no | Present when the event answers an API call |
+| `actor` | object | no | `{ "type": "node", "id": <nod_> }` for node-originated events |
+| `data` | object | yes | Type-specific payload; may be `{}` |
+
+The primary assigns `seq` on receipt and deduplicates by `id`, so a node that resends an event after a reconnect cannot produce two rows. The node buffers events while disconnected (section 6.5).
+
+```json
+{
+  "v": 1,
+  "type": "event",
+  "id": "msg_01JC9ZB1E6R8T0V2X4Z6B8D0F2",
+  "body": {
+    "schema_version": 1,
+    "id": "evt_01JC9Z91A2B3C4D5E6F7G8H9J0",
+    "type": "app.down",
+    "time": "2026-11-02T10:16:05Z",
+    "source": { "kind": "node", "node_id": "nod_01JC9Y2M4Q7V8B1N6T3R5K9XZP" },
+    "subject": { "type": "app", "id": "app_01JC9Z7B3N5Q7S9Z1W3Y5A7C9E" },
+    "project_id": "prj_01JC9Z5A1B2C3D4E5F6G7H8J9K",
+    "actor": { "type": "node", "id": "nod_01JC9Y2M4Q7V8B1N6T3R5K9XZP" },
+    "data": { "failures": 3, "vm_id": "vm_01JC9Z7C4P6R8T0V2X4Z6B8D0F" }
+  }
+}
+```
+
+### 5.5 `lease_renew`
+
+**Direction:** node to control plane.
+**When:** `expiring` leases only, every `duration_ms / 3` while the lease is `held` or `uncertain`.
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `lease_id` | string (`lse_`) | yes | Lease being renewed |
+| `fencing_token` | integer | yes | Token the node believes it holds |
+
+The primary answers with `lease_grant` and sets `re` to this message's `id`. A renewal whose token is lower than the primary's current token, or for a lease that no longer exists, is answered with `lease_revoke`. `local` leases are never renewed.
+
+```json
+{
+  "v": 1,
+  "type": "lease_renew",
+  "id": "msg_01JC9ZC2F7S9Z1W3Y5A7C9E1G3",
+  "body": { "lease_id": "lse_01JC9Z8K2M4P6R8T0V2X4Z6B8D", "fencing_token": 7 }
+}
+```
+
+### 5.6 `log_ack`
+
+**Direction:** node to control plane.
+**When:** after the node has verified and stored a batch of `log_entries`.
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `seq` | integer | yes | Highest contiguous `seq` verified |
+| `hash` | string | yes | The `hash` of that entry, hex SHA-256 |
+
+The primary keeps sending from `seq + 1`. An ack that skips a sequence is ignored: the node must verify every entry in order, because the point of the log is that a gap or a broken link is detectable (D-0013).
+
+```json
+{
+  "v": 1,
+  "type": "log_ack",
+  "id": "msg_01JC9ZD3G8T0V2X4Z6B8D0F2H4",
+  "body": {
+    "seq": 950,
+    "hash": "9c7e1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f90a1b2c3d4e5f6a7b8c9d0e1"
+  }
+}
+```
+
+### 5.7 `stream_data`
+
+**Direction:** node to control plane.
+**When:** while a stream opened by `stream_open` is producing data.
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `stream_id` | string (`msg_`) | yes | Stream the data belongs to, chosen by the primary in `stream_open` |
+| `seq` | integer | yes | Per-stream sequence, gap-free from 1 |
+| `lines` | array of object | no | Log lines; present for `app_logs` and `deployment_logs` |
+| `data` | string | no | Base64 bytes; reserved for byte-oriented kinds |
+
+Exactly one of `lines` and `data` is present. A log line is `{ "time": <RFC 3339>, "stream": "stdout"|"stderr", "line": <string without trailing newline> }`. Lines come from the engine's output stream, which the minimal init tags by stream on the guest side (`engine-trait.md`); the node does not guess.
+
+```json
+{
+  "v": 1,
+  "type": "stream_data",
+  "id": "msg_01JC9ZE4H9Z1W3Y5A7C9E1G3J5",
+  "body": {
+    "stream_id": "msg_01JC9ZD9K2M4P6R8T0V2X4Z6B8",
+    "seq": 17,
+    "lines": [
+      { "time": "2026-11-02T10:16:30Z", "stream": "stdout", "line": "listening on :8080" }
+    ]
+  }
+}
+```
+
+### 5.8 `stream_end`
+
+**Direction:** node to control plane.
+**When:** the stream finished, failed, or was closed by either side.
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `stream_id` | string (`msg_`) | yes | Stream that ended |
+| `reason` | string | yes | `completed`, `error` or `cancelled` |
+| `message` | string | no | Human-readable detail, for example the engine error |
+
+The primary closes the matching API or panel consumer. `cancelled` is the answer to `stream_close`; `error` carries whatever `EngineError` the node saw.
+
+```json
+{
+  "v": 1,
+  "type": "stream_end",
+  "id": "msg_01JC9ZF5J0V2X4Z6B8D0F2H4K6",
+  "body": {
+    "stream_id": "msg_01JC9ZD9K2M4P6R8T0V2X4Z6B8",
+    "reason": "completed"
+  }
+}
+```
+
+### 5.9 `command_result`
+
+**Direction:** node to control plane.
+**When:** as the answer to `desired_state`, `lease_revoke`, `command`, `signing_key_rotate`, and a `stream_open` that could not start.
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `status` | string | yes | `ok` or `error` |
+| `detail` | string | no | Short human-readable detail |
+| `error` | object | no | `{ "code": ..., "message": ... }` using the `error` codes in section 5.18 |
+
+`re` identifies the message being answered. For `desired_state` the answer means **stored**: the signature was verified and the snapshot was persisted atomically. It does not mean applied — that is `applied_rev` in `status_report`. For `lease_revoke` the answer means the stateful VMs bound to the lease are stopped and recorded.
+
+```json
+{
+  "v": 1,
+  "type": "command_result",
+  "id": "msg_01JC9ZG6K1W3Y5A7C9E1G3J5M7",
+  "re": "msg_01JC9ZF9W2M4P6R8T0V2X4Z6B8",
+  "body": { "status": "ok", "detail": "stored rev 412" }
+}
+```
+
+### 5.10 `welcome`
+
+**Direction:** control plane to node.
+**When:** immediately after a valid `hello`, as the first message from the primary.
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `cluster_id` | string (`cls_`) | yes | Cluster the session belongs to |
+| `term` | integer | yes | Cluster term; `1` until elections exist |
+| `server_time` | string | yes | Primary's wall-clock time |
+| `heartbeat_interval_ms` | integer | yes | 5 000 in v1 |
+| `session_timeout_ms` | integer | yes | 15 000 in v1 |
+| `primary_node_id` | string (`nod_`) | yes | The node holding the primary status |
+
+```json
+{
+  "v": 1,
+  "type": "welcome",
+  "id": "msg_01JC9ZH7W2X4Z6B8D0F2H4K6N8",
+  "re": "msg_01JC9Z6Q5W8N3K4T7R2M1XHB0D",
+  "body": {
+    "cluster_id": "cls_01JC9Z0000000000000000000Q",
+    "term": 1,
+    "server_time": "2026-11-02T10:15:30Z",
+    "heartbeat_interval_ms": 5000,
+    "session_timeout_ms": 15000,
+    "primary_node_id": "nod_01JC9Z0000000000000000000Q"
+  }
+}
+```
+
+### 5.11 `desired_state`
+
+**Direction:** control plane to node.
+**When:** once per session after `welcome` and any `lease_revoke`, and again whenever the desired state for this node changes.
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `rev` | integer | yes | Monotonic revision of the node's desired state |
+| `issued_at` | string | yes | When the primary produced it |
+| `term` | integer | yes | Cluster term at issue time |
+| `spec` | object | yes | `vms`, `routes`, `network` |
+| `signature` | string | yes | Base64 Ed25519 signature by the cluster signing key |
+
+**Signature.** The signature covers the RFC 8785 (JSON Canonicalization Scheme) serialization of the whole `body` object with the `signature` member removed. The node verifies it against `cluster_public_key` before it parses anything else, persists the verified snapshot atomically, answers `command_result` with `ok`, and only then reconciles. An invalid signature is answered with `error` code `bad_signature` and the snapshot is discarded; the node keeps running on its previously stored snapshot.
+
+**Full snapshot only.** v1 has no deltas. Every `desired_state` is the complete set of VMs and routes for this node, so a lost message is harmless and a node that missed several revisions converges on the next snapshot.
+
+**`spec.vms[]`:**
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `vm_id` | string (`vm_`) | yes | VM identity |
+| `project_id` | string (`prj_`) | yes | Owning project |
+| `app_id` | string (`app_`) | no | Set when this VM is an instance of an app; absent for a standalone VM |
+| `name` | string | yes | Operator-visible name |
+| `image` | string | yes | OCI reference as requested |
+| `image_digest` | string | yes | Resolved digest |
+| `vcpus` | integer | yes | vCPUs |
+| `memory_mb` | integer | yes | Memory in MiB |
+| `disk_gb` | integer | yes | Root disk size |
+| `port` | integer | no | Container port the app listens on |
+| `env` | object | yes | Environment values, decrypted for this node; `{}` when none |
+| `health_check` | object | no | `path`, `interval_s`, `timeout_s`, `failures` |
+| `desired_status` | string | yes | `running` or `stopped` |
+| `restart_generation` | integer | yes | Incremented by the primary on an explicit restart |
+| `stateful` | boolean | yes | Whether the VM may run only while its lease is held |
+| `lease_id` | string (`lse_`) | no | Required when `stateful` is true |
+| `fencing_token` | integer | no | Required when `stateful` is true |
+| `volumes` | array of object | yes | empty until local volumes ship in M5a (D-0052). Each `{ "volume_id": <vol_>, "mount_path": <string> }` |
+
+**`spec.routes[]`:**
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `hostname` | string | yes | Host to serve |
+| `app_id` | string (`app_`) | yes | App behind the route |
+| `vm_ids` | array of string | yes | Candidate backends, one per app replica |
+| `port` | integer | yes | Backend port |
+| `tls_mode` | string | yes | `acme` or `tunnel` |
+
+**`spec.network`:** `subnet` (CIDR for the node bridge) and `gateway` (address on that bridge). The addresses in `status_report` must fall inside the subnet.
+
+**Environment values.** `env` carries plaintext values because the node must be able to start the process. It is sent only over the authenticated, pinned session, never over a webhook or an API read, and the node stores it encrypted with the node-local key. The primary stores the same values encrypted with the cluster data-encryption key (AEAD), and the API returns only names (`README.md`, `db-schema.sql`).
+
+```json
+{
+  "v": 1,
+  "type": "desired_state",
+  "id": "msg_01JC9ZJ8M3Y5A7C9E1G3J5M7P9",
+  "body": {
+    "rev": 413,
+    "issued_at": "2026-11-02T10:15:31Z",
+    "term": 1,
+    "spec": {
+      "vms": [
+        {
+          "vm_id": "vm_01JC9Z7C4P6R8T0V2X4Z6B8D0F",
+          "project_id": "prj_01JC9Z5A1B2C3D4E5F6G7H8J9K",
+          "app_id": "app_01JC9Z7B3N5Q7S9Z1W3Y5A7C9E",
+          "name": "blog-web",
+          "image": "ghcr.io/example/blog:1.4.2",
+          "image_digest": "sha256:5c1f0d2a9b8e7f6a5d4c3b2a1908f7e6d5c4b3a29180f7e6d5c4b3a291807f6e",
+          "vcpus": 2,
+          "memory_mb": 512,
+          "disk_gb": 4,
+          "port": 8080,
+          "env": { "DATABASE_URL": "postgres://blog@10.42.1.5/blog" },
+          "health_check": { "path": "/", "interval_s": 10, "timeout_s": 2, "failures": 3 },
+          "desired_status": "running",
+          "restart_generation": 1,
+          "stateful": false,
+          "volumes": []
+        }
+      ],
+      "routes": [
+        {
+          "hostname": "blog.example.com",
+          "app_id": "app_01JC9Z7B3N5Q7S9Z1W3Y5A7C9E",
+          "vm_ids": ["vm_01JC9Z7C4P6R8T0V2X4Z6B8D0F"],
+          "port": 8080,
+          "tls_mode": "acme"
+        }
+      ],
+      "network": { "subnet": "10.42.1.0/24", "gateway": "10.42.1.1" }
+    },
+    "signature": "MEUCIQDf3k...c2lnbmF0dXJl"
+  }
+}
+```
+
+A replica node that holds a copy of the change log but is not the primary never sends `desired_state`; it can only be the primary's job, because the primary is the single writer (D-0012).
+
+### 5.12 `lease_grant`
+
+**Direction:** control plane to node.
+**When:** when the primary (or, from M5b, the authority behind it) grants a lease, and as the answer to every successful `lease_renew`.
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `lease_id` | string (`lse_`) | yes | Lease identity |
+| `resource_type` | string | yes | `app` or `primary` |
+| `resource_id` | string | yes | `app_` or `nod_` id |
+| `mode` | string | yes | `local` or `expiring` |
+| `fencing_token` | integer | yes | Strictly increasing per resource, never reused |
+| `duration_ms` | integer | no | Present for `expiring`, absent for `local` |
+| `granted_at` | string | yes | Authority's wall-clock time of the grant |
+
+A grant with a `fencing_token` not higher than the node's current token for that resource is a bug in the authority and is refused with `error` code `bad_message`, non-fatal: the node keeps its current state and does not start or stop anything.
+
+```json
+{
+  "v": 1,
+  "type": "lease_grant",
+  "id": "msg_01JC9ZK9N4Z6B8D0F2H4K6N8Q0",
+  "re": "msg_01JC9ZC2F7S9Z1W3Y5A7C9E1G3",
+  "body": {
+    "lease_id": "lse_01JC9Z8K2M4P6R8T0V2X4Z6B8D",
+    "resource_type": "app",
+    "resource_id": "app_01JC9Z7B3N5Q7S9Z1W3Y5A7C9E",
+    "mode": "expiring",
+    "fencing_token": 8,
+    "duration_ms": 15000,
+    "granted_at": "2026-11-02T10:15:33Z"
+  }
+}
+```
+
+### 5.13 `lease_revoke`
+
+**Direction:** control plane to node.
+**When:** the lease moved to another node, the resource was deleted, an operator declared this node lost, or a higher token superseded it.
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `lease_id` | string (`lse_`) | yes | Lease to revoke |
+| `fencing_token` | integer | yes | Token of the revoke; must be at least the node's current token |
+| `reason` | string | yes | `moved`, `deleted`, `declared_lost` or `superseded` |
+
+On receipt the node stops the stateful VMs bound to the lease, records the stop locally, moves the lease to `revoked`, and answers `command_result` **before** it processes any later message of the session.
+
+```json
+{
+  "v": 1,
+  "type": "lease_revoke",
+  "id": "msg_01JC9ZM0P5B8D0F2H4K6N8Q0S2",
+  "body": {
+    "lease_id": "lse_01JC9Z8K2M4P6R8T0V2X4Z6B8D",
+    "fencing_token": 8,
+    "reason": "moved"
+  }
+}
+```
+
+### 5.14 `log_entries`
+
+**Direction:** control plane to node.
+**When:** after the desired state of a session, then continuously as the change log grows.
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `from_seq` | integer | yes | `seq` of the first entry in `entries` |
+| `entries` | array of object | yes | Change-log entries, at most 500 |
+
+Each entry has exactly the change-log fields from the shared entity model: `seq` (gap-free from 1), `term`, `time`, `actor_type`, `actor_id`, `entity_type`, `entity_id`, `op` (`create`, `update`, `delete`), `payload` (full new row for create and update, `{}` for delete), `prev_hash` (64 hex, 64 zeros for `seq` 1) and `hash` (hex SHA-256 over the RFC 8785 serialization of the entry without `hash`).
+
+```json
+{
+  "v": 1,
+  "type": "log_entries",
+  "id": "msg_01JC9ZN1Q6C8D0F2H4K6N8Q0S2",
+  "body": {
+    "from_seq": 903,
+    "entries": [
+      {
+        "seq": 903,
+        "term": 1,
+        "time": "2026-11-02T10:15:31Z",
+        "actor_type": "agent",
+        "actor_id": "agt_01JC9Z7D5Q7S9Z1W3Y5A7C9E1G",
+        "entity_type": "app",
+        "entity_id": "app_01JC9Z7B3N5Q7S9Z1W3Y5A7C9E",
+        "op": "update",
+        "payload": { "id": "app_01JC9Z7B3N5Q7S9Z1W3Y5A7C9E", "name": "blog" },
+        "prev_hash": "3b1f0c9a5e7d2b8f4a6c1d9e0f3a5b7c9d1e3f5a7b9c1d3e5f7a9b1c3d5e7f90",
+        "hash": "9c7e1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f90a1b2c3d4e5f6a7b8c9d0e1"
+      }
+    ]
+  }
+}
+```
+
+### 5.15 `stream_open`
+
+**Direction:** control plane to node.
+**When:** a human or an agent reads live logs, or the panel opens a stream.
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `stream_id` | string (`msg_`) | yes | Stream identity chosen by the primary |
+| `kind` | string | yes | `app_logs` or `deployment_logs` in v1 |
+| `params` | object | yes | Kind-specific selector |
+
+`params` for `app_logs`: `app_id` or `vm_id` (exactly one), optional `tail` (integer, default 0). `params` for `deployment_logs`: `deployment_id`, optional `phase`. The kinds `console` and `terminal` are reserved for M4 and are added by a standalone contract pull request (D-0036); a node that receives them now answers `command_result` with `error` code `bad_message`.
+
+The primary enforces 32 concurrent streams per session. A 33rd open is answered with `command_result` status `error`, code `bad_message`, detail `stream_limit`, without touching the node's streams.
+
+```json
+{
+  "v": 1,
+  "type": "stream_open",
+  "id": "msg_01JC9ZP2R7D0F2H4K6N8Q0S2T4",
+  "body": {
+    "stream_id": "msg_01JC9ZD9K2M4P6R8T0V2X4Z6B8",
+    "kind": "app_logs",
+    "params": { "app_id": "app_01JC9Z7B3N5Q7S9Z1W3Y5A7C9E", "tail": 100 }
+  }
+}
+```
+
+### 5.16 `stream_close`
+
+**Direction:** control plane to node.
+**When:** the consumer went away — the HTTP request ended, the panel tab closed, the agent's token expired.
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `stream_id` | string (`msg_`) | yes | Stream to stop |
+
+The node stops producing, releases the stream slot, and answers `stream_end` with reason `cancelled`. Closing an unknown stream id is ignored.
+
+```json
+{
+  "v": 1,
+  "type": "stream_close",
+  "id": "msg_01JC9ZQ3S8F2H4K6N8Q0S2T4Z6",
+  "body": { "stream_id": "msg_01JC9ZD9K2M4P6R8T0V2X4Z6B8" }
+}
+```
+
+### 5.17 `command`
+
+**Direction:** control plane to node.
+**When:** the primary needs a one-off action that is not a change of desired state.
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `kind` | string | yes | `logs_query` or `probe` in v1 |
+| `params` | object | yes | Kind-specific parameters |
+
+`logs_query` params: `app_id` or `vm_id` (exactly one), `since` (RFC 3339, optional), `until` (RFC 3339, optional), `tail` (integer, optional). The answer is a `command_result` carrying the lines, then `status: ok`.
+
+`probe` params: `{}`. The node re-runs the KVM probe (`/dev/kvm`, CPU flags, kernel release) and answers with a `command_result` whose `detail` summarizes it; the primary updates the node's `kvm` record and `engine_version`.
+
+Restarts and stops are **never** commands. They are changes of desired state — `restart_generation` for a restart, `desired_status` for a stop — so they are idempotent, survive a reconnect, and cannot be lost with a dropped message (D-0011).
+
+```json
+{
+  "v": 1,
+  "type": "command",
+  "id": "msg_01JC9ZR4T9H4K6N8Q0S2T4Z6V8",
+  "body": {
+    "kind": "logs_query",
+    "params": {
+      "vm_id": "vm_01JC9Z7C4P6R8T0V2X4Z6B8D0F",
+      "since": "2026-11-02T10:00:00Z",
+      "tail": 200
+    }
+  }
+}
+```
+
+### 5.18 `error`
+
+**Direction:** either side.
+**When:** a message could not be accepted, or the session must end.
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `code` | string | yes | One of the codes below |
+| `message` | string | yes | Human-readable detail |
+| `fatal` | boolean | yes | Whether the session ends |
+| `re` | string (`msg_`) | no | The message that caused it, in the envelope |
+
+| Code | Fatal | Meaning |
+| --- | --- | --- |
+| `unsupported_version` | yes | Envelope major version not implemented |
+| `unauthenticated` | yes | Credential rejected; the node stops dialing |
+| `node_removed` | yes | The node was removed from the cluster (section 10) |
+| `bad_signature` | no | A `desired_state` or `signing_key_rotate` signature did not verify; the message was discarded |
+| `bad_message` | no | Malformed frame, unknown type, unknown command kind, oversized frame |
+| `log_diverged` | no | The node's change-log copy does not match the primary's (section 7) |
+
+A fatal error ends the session immediately; the node applies its redial rule (section 4.4). A non-fatal error leaves the session usable.
+
+```json
+{
+  "v": 1,
+  "type": "error",
+  "id": "msg_01JC9ZS5Z0J6N8Q0S2T4Z6V8W0",
+  "re": "msg_01JC9ZJ8M3Y5A7C9E1G3J5M7P9",
+  "body": {
+    "code": "bad_signature",
+    "message": "desired_state signature does not verify against the cluster signing key",
+    "fatal": false
+  }
+}
+```
+
+### 5.19 `ping`
+
+**Direction:** either side.
+**When:** to test liveness outside the heartbeat cadence, or to keep a connection warm through an intermediary that closes idle sockets.
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| (none) | — | — | Body is `{}` |
+
+The receiver answers `pong` with `re` set to the `ping` id. A `ping` is not a heartbeat and does not reset the primary's 15 s timer by itself; any frame does.
+
+```json
+{
+  "v": 1,
+  "type": "ping",
+  "id": "msg_01JC9ZT6V1K8Q0S2T4Z6V8W0X2",
+  "body": {}
+}
+```
+
+### 5.20 `pong`
+
+**Direction:** either side.
+**When:** as the answer to a `ping`.
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| (none) | — | — | Body is `{}` |
+
+```json
+{
+  "v": 1,
+  "type": "pong",
+  "id": "msg_01JC9ZZ7W2W0S2T4Z6V8W0X2Y4",
+  "re": "msg_01JC9ZT6V1K8Q0S2T4Z6V8W0X2",
+  "body": {}
+}
+```
+
+### 5.21 `signing_key_rotate`
+
+**Direction:** control plane to node.
+**When:** when the cluster signing key is rotated (D-0050).
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `key_id` | string | yes | Id of the new cluster signing key: the lowercase hex SHA-256 of its raw 32-byte public key |
+| `public_key` | string | yes | Base64 Ed25519 public key of the new signing key |
+| `signature` | string | yes | Base64 Ed25519 signature by the current pinned signing key |
+
+**Signature.** As for `desired_state` (section 5.11), the signature covers the RFC 8785 serialization of the whole `body` object with the `signature` member removed. The node verifies it against the cluster public key it currently has pinned.
+
+**Node behaviour.** On a valid signature the node persists the new public key and the `key_id` in its local store (`node_meta`, section 12), and from then on accepts only signatures by the new key. It answers with a `command_result` (`re` set to this message's `id`) meaning persisted, the same acknowledgement `desired_state` and `lease_revoke` use. A signature that does not verify is answered with `error` code `bad_signature`, and the node keeps the old pin and the old key.
+
+```json
+{
+  "v": 1,
+  "type": "signing_key_rotate",
+  "id": "msg_01JC9ZV9X3Y0S2T4Z6V8W0X2Y4A6",
+  "body": {
+    "key_id": "3f9a1c0e7b52d4a86e1f09c3b7d25e4a90c18f6b2d73e5a41c0b98f7e26d1a35",
+    "public_key": "9pQ2m0Yb1s7Tq3Vx6Kd8Lw5Rc4Nh2Jf0Gz1Xe7Ua3Ik=",
+    "signature": "MEUCIQDf3k2m9Qx1s7Tq3Vx6Kd8Lw5Rc4Nh2Jf0Gz1Xe7Ua3I..."
+  }
+}
+```
+
+## 6. Reconciliation
+
+### 6.1 Source of truth on the node
+
+The node always acts on the newest verified snapshot in its local store. It never acts on a message that is still in memory: `desired_state` is persisted before `command_result` is sent, so a crash between receipt and apply cannot lose the revision.
+
+- `rev` only increases. A `desired_state` with a `rev` lower than or equal to the stored one is acknowledged with `command_result` status `ok` and ignored.
+- An older revision arriving after a newer one is a primary bug; the node keeps the newer snapshot and reports it.
+
+### 6.2 Apply loop order
+
+An apply run always follows this order, whatever changed:
+
+1. **Network.** Ensure the bridge, subnet and gateway from `spec.network`, and the per-VM TAP devices.
+2. **Images.** Prepare every image referenced by a VM whose rootfs is missing or has a different digest, and remove rootfs images no longer referenced.
+3. **Stop.** Stop VMs that are no longer desired, or whose spec requires a recreate (image digest, disk size, network identity).
+4. **Start.** Start desired VMs that are not running.
+5. **Routes.** Update the reverse proxy for the hostnames in `spec.routes`.
+
+The order exists so that a VM never starts on a network that is not ready, and no route points at a VM that is being replaced. It is the reconciliation described in D-0011 and the deployments in D-0033.
+
+### 6.3 Restart, crash and health
+
+- A VM that exits without being asked to stop is `crashed`; the node restarts it with backoff from 1 s doubling to 5 min. The backoff resets after the VM has been healthy for 10 minutes. `restart_generation` in the spec is what a human-initiated restart changes; the crash path does not increment it.
+- Health checks use the app's `health_check` (`path` default `/`, `interval_s` default 10, `timeout_s` default 2, `failures` default 3). After `failures` consecutive failures the node reports the app as `failing` and emits `app.down`; on recovery it reports `passing` and emits `app.up`.
+- Image preparation is cached by digest. Two VMs with the same digest share one prepared rootfs; the digest, not the tag, is the key.
+- An agent restart does not restart VMs. VMMs are separate processes that outlive the agent, and the agent rediscovers them on start (`engine-trait.md`, D-0011). This is what makes an agent upgrade invisible to running apps.
+
+### 6.4 Stateful starts
+
+A stateful VM starts only while the node holds that app's lease in state `held` **and** the lease's `fencing_token` equals the `fencing_token` in the VM spec. If either condition fails the VM stays `stopped`, the fact is recorded locally, and the node reports the VM as `stopped` with `health: unknown`; it does not report an error to the primary, because the primary is the one that moved the lease (D-0019).
+
+### 6.5 While disconnected
+
+Everything continues: running VMs keep running, restarts still happen, health checks still run, and the node keeps reconciling against its stored snapshot. Events are buffered in the local store, bounded at 10 000 entries. On overflow the oldest entries are dropped, a counter is incremented, and the next `hello` reports it as `dropped_events` so that a primary never assumes silence means "nothing happened".
+
+## 7. Change-log follow
+
+Every change to cluster state is a numbered entry in an append-only, hash-chained log (D-0013, D-0015). Replica nodes follow it so that a manual promotion (D-0016) needs no protocol change: a node that already holds a current copy can serve reads and forward writes.
+
+- **Which nodes follow:** every node with the role `node`, from M2 on. Nothing in this protocol distinguishes a future primary from any other follower, which is what keeps promotion cheap. When promotion happens (M5; the milestone half is open, Q-0024) the promoted node stops being a follower and starts issuing `desired_state` for its own nodes.
+- **Delivery:** `log_entries` with `from_seq` and up to 500 entries. The node verifies each entry's `hash` over the RFC 8785 serialization of the entry without `hash`, and that `prev_hash` equals the previous entry's `hash`, then stores it and sends `log_ack`.
+- **On `hello`:** the primary compares the node's `log_seq` and `log_hash` with its own hash at that sequence. If they differ, the primary sends `error` with code `log_diverged`, non-fatal. The node moves its local copy aside as a quarantined copy — never deleting it, because divergent local writes must never be silently dropped (D-0022) — and refollows from `seq` 1.
+- **Secrets in the log:** `app_env` values, webhook secrets and provider secrets are stored encrypted with the cluster data-encryption key (AEAD, `db-schema.sql`), so a follower holds ciphertext it cannot read. How a promoted replica obtains the cluster data-encryption key is **open** and is decided together with manual promotion (Q-0024); until then the key does not leave the primary.
+
+## 8. Leases and self-fencing
+
+This section is the core of the contract. It exists because starting a stateful app on node B while it is still running on node A produces two diverging copies of the same data (D-0019).
+
+The lease modes are decided (D-0047): `local` for HA policy `none` and `cold`, `expiring` (M5b and later) for `warm` and `hot`. The node-side states `held`, `uncertain`, `expired` and `revoked` are fixed.
+
+### 8.1 Who arbitrates
+
+| Period | Lease authority | Consequence |
+| --- | --- | --- |
+| M0 to M5a | The primary, in process | One control plane; a `local` lease survives its absence (D-0011) |
+| M5b and later | The primary backed by a quorum with the witness, or an external arbiter | Same messages; the authority behind them is stronger (D-0017) |
+
+The external arbiter options are an S3/R2 conditional write or a Cloudflare Durable Object. Both are researched and both require the fencing token to stay (F-0037, F-0038, `docs/research/r2-conditional-writes.md`, `docs/research/durable-objects.md`): object storage has no server-side expiry, and a Durable Object restart can kill an in-flight write, so "the lease expired" is always inferred and always enforced by the node and by the token.
+
+The same mechanism also serves primary election (D-0019). Leases with `resource_type: primary` appear when automatic failover exists (M6); in M0-M5 the only leases are `resource_type: app`.
+
+### 8.2 Messages
+
+| Message | Direction | Purpose |
+| --- | --- | --- |
+| `lease_grant` | control plane to node | Grant a lease, with mode, token and duration; also the answer to `lease_renew` |
+| `lease_renew` | node to control plane | Ask to extend an `expiring` lease every `duration_ms / 3` |
+| `lease_revoke` | control plane to node | End a lease: `moved`, `deleted`, `declared_lost`, `superseded` |
+
+### 8.3 `local` mode
+
+Issued for the HA policies where no other copy of the app can start (`none`, `cold`, D-0047), so nobody is waiting to take the lease.
+
+- It never expires because the session is gone or the control plane is unreachable. This is what keeps D-0011 true: an app keeps running when the panel is down.
+- It ends only by:
+  - `lease_revoke` with reason `moved`, `deleted`, `superseded`; or
+  - an operator declaring the node lost (part of the `local` lease mode, D-0047), which is a manual action from M5a and needs an endpoint that a later contract pull request adds. Declaring a node lost increments the lease's `fencing_token` (D-0019), so the old holder's token is stale even though the old holder never received a message.
+- A `local` lease on a node whose session is gone is a normal state, not an incident. The primary reports the node `disconnected`, not `fenced`.
+
+### 8.4 `expiring` mode timing
+
+Used for `warm` and `hot`, where a second copy is ready and will start as soon as the lease moves (D-0047).
+
+Definitions, all on the node's monotonic clock:
+
+| Symbol | Value |
+| --- | --- |
+| `D` | `duration_ms` from the grant |
+| `M` | `margin = max(1000 ms, D / 10)` |
+| `t_send` | Node monotonic time at which it sent the `lease_renew` that the current grant answers |
+| `valid_until` | `t_send + D - M` |
+| Fence deadline | `valid_until + M = t_send + D` |
+| `T_grace` | Graceful-stop timeout used when fencing |
+| `T_force` | Upper bound for the forced stop that follows |
+
+```
+valid_until = t_send + D - M
+M           = max(1000, D / 10)
+```
+
+The authority never grants a `duration_ms` below 3 000 ms: with the floor margin of 1 000 ms that keeps `valid_until` at least 2 000 ms after the renewal, so the node has a real window to renew before it must fence. A grant below that floor is refused with `error` code `bad_message`, non-fatal.
+
+**Node state machine.**
+
+| From | Trigger | To | Action |
+| --- | --- | --- | --- |
+| — | `lease_grant` | `held` | Record the token, compute the next renewal time |
+| `held` | a renewal succeeds | `held` | Recompute `valid_until` from the new `t_send` |
+| `held` | a renewal is late, or the authority is unreachable | `uncertain` | Keep running; start nothing new stateful |
+| `uncertain` | a renewal succeeds | `held` | Recompute `valid_until` |
+| `held`, `uncertain` | monotonic clock reaches `valid_until` | `expired` | Self-fence (section 8.5) |
+| any | `lease_revoke` | `revoked` | Self-fence, answer `command_result` |
+| `expired`, `revoked` | `lease_grant` with a higher token | `held` | May start stateful VMs again |
+
+`uncertain` is deliberate. It is "the arbiter is unreachable", not "the lease is lost": stopping every stateful app during a control-plane or arbiter outage would break D-0011, while starting a new stateful VM in that window could produce the double-run D-0019 forbids. The distinction between the two situations is exactly what the lease research asks for (`docs/research/r2-conditional-writes.md`, `docs/research/durable-objects.md`).
+
+**Why the node finishes fencing before another holder may start.** Let `T_grant` be the authority's send time of the grant the node is currently holding. The authority grants the same lease to another holder no earlier than:
+
+```
+T_gate = T_grant + D + 2M
+```
+
+The node starts fencing at `valid_until = t_send + D - M` and must be done by:
+
+```
+F = valid_until + M = t_send + D
+T_grace + T_force <= M
+```
+
+`T_grant >= t_send` (the grant is sent after the renewal it answers arrived), so on a shared time base:
+
+```
+F - T_gate <= (t_send + D) - (t_send + D + 2M) = -2M
+```
+
+The fence therefore completes at least `2M` before the gate opens. The two clocks are not shared, so let `δ` be the bound on their drift and offset over the lease lifetime: the fence completion, expressed on the authority's clock, is at most `t_send + D + δ`, and the gate is at least `t_send + D + 2M - δ`. The remaining gap is `2M - 2δ`, which is strictly positive whenever `δ < M`. The margin `M` must therefore be larger than the bounded drift and the messaging delay between the machines; that the drift is bounded by such a value is a **Hypothesis** to be measured on the lab, and a node whose clock steps backwards or forwards by more than `M` must be treated as a failed node.
+
+Worked example with `D = 15000`:
+
+| Quantity | Value |
+| --- | --- |
+| `M` | 1 500 ms |
+| `valid_until` | `t_send + 13 500 ms` |
+| Fence deadline `F` | `t_send + 15 000 ms` |
+| Gate `T_gate` | not before `t_send + 18 000 ms` |
+| Chosen `T_grace` / `T_force` | 1 000 ms / 300 ms, sum 1 300 ms ≤ `M` |
+| Actual fence completion, worst case | `t_send + 14 800 ms` |
+| Slack before the gate | at least 3 200 ms, minus 2δ |
+
+**What the authority must enforce.** The gate is the authority's obligation, not the node's: the primary (or the arbiter) records the send time of the last grant to a holder and refuses to grant the same lease to anyone else before `D + 2M` have passed on its own clock. An authority that grants earlier can hand the same app to two nodes. That obligation is why an arbiter with a real single-writer critical section (a Durable Object, or a conditional write on strongly consistent storage) matters at M5b (`docs/research/durable-objects.md`, `docs/research/r2-conditional-writes.md`).
+
+### 8.5 Self-fence procedure
+
+When a lease reaches `expired` or `revoked`, the node:
+
+1. Stops every stateful VM bound to that lease with `StopMode::Graceful { timeout: T_grace }`, then with `StopMode::Force` if the timeout passes, so the whole stop finishes within `T_grace + T_force <= M` (`engine-trait.md`).
+2. Records the stop locally: lease id, token, VM ids, time and the reason (`expired` or `revoked`), so the fact survives an agent restart.
+3. Emits `node.fenced` with the lease, the token and the VM ids. If the session is down the event is buffered (section 6.5) and delivered later.
+4. Starts nothing stateful for that resource until a new `lease_grant` arrives with a higher `fencing_token`.
+
+The node also emits `node.fenced` when an operator declaration invalidated its token without a message reaching it — it learns that when the primary refuses its next `lease_renew` or when a `hello` is answered with a `lease_revoke`.
+
+### 8.6 Fencing tokens
+
+- A token is a strictly increasing integer per leased resource, never reused. The current token lives on the lease row (`fencing_token` in the shared entity model) and is echoed in every `lease_grant`, `lease_revoke`, `lease_renew`, `hello` and stateful VM spec.
+- Every write to shared storage carries the token: the chunk store and object store from M5, and the replication stream (D-0023). A receiver rejects any write whose token is lower than the highest it has seen for that resource, and records the rejection.
+- Tokens are what makes the lease safe against a paused node: a node that was frozen past its expiry can still act on stale intent, and only the token at the storage layer stops it (`docs/research/r2-conditional-writes.md`).
+- Arbiters do not remove the need for tokens. A Durable Object can bump a token inside its critical section, and R2 has no server-side expiry at all, but in both cases the node and the storage must still enforce the token (`docs/research/durable-objects.md`).
+
+### 8.7 What exists in M0, and the milestone table
+
+M0 ships the protocol, not the HA feature: the messages, the four node-side states, the self-fence code path, and two tests — one that revokes a `local` lease and one that expires a test-only short `expiring` lease. Both run against the in-process primary and the `FakeEngine` (`engine-trait.md`), so the path is exercised on machines without KVM. This is the "self-fencing from M0" requirement of D-0019.
+
+| Milestone | Authority | Modes in use | What the node does |
+| --- | --- | --- | --- |
+| M0 | In-process primary | `local` (message-complete), `expiring` only in tests | Runs the state machine and the self-fence path against the fake engine |
+| M1 | Primary | `local` | Single node; the engine lifecycle runs, no stateful app exists yet |
+| M2 | Primary | `local` | Enrolls, follows the change log, reconciles desired state, emits events |
+| M3 | Primary | `local` | Same; the agent-driven calls arrive as desired-state changes from the API and MCP |
+| M4 | Primary | `local` | Adds console and metrics streams; leases unchanged |
+| M5a | Primary | `local` | Cold backups; operator declaration of a lost node adds a lease revoke with a new token |
+| M5b | Primary plus witness quorum or external arbiter | `local`, `expiring` (`warm`) | Warm: renewal loop, `uncertain` handling, replication writes carrying tokens |
+| M6 | Quorum | `local`, `expiring` (`warm`, `hot`) | Automatic failover and `hot`; the same messages also carry `resource_type: primary` leases |
+
+## 9. Node return
+
+A node that comes back after a failure may hold writes nobody else has and may be missing everything that happened while it was gone, which is why failback is never automatic (D-0022).
+
+Order on reconnect:
+
+1. `hello`, carrying `stored_rev`, `applied_rev`, `log_seq`, `log_hash` and every lease the node believes it holds.
+2. The primary revokes every stale lease: held by a node the primary no longer considers the holder, or carrying a lower token than the primary's. The node fences those first, before anything else (section 4.2).
+3. Only after fencing, the primary sends a full `desired_state`. A node that returned fenced starts nothing stateful, exactly as D-0022 step 1 requires.
+4. The node reconciles. Because the snapshot is complete and `rev` is monotonic, reconciliation cannot start a duplicate app: a stateful VM appears in the snapshot only if the node holds the matching lease token, which it does not until the primary grants it again.
+5. Log follow resumes. If the hash chain no longer matches, the divergent copy is quarantined and the node refollows from `seq` 1 (section 7).
+
+Divergent local writes are kept as a quarantined snapshot and recorded in the audit log from M5b (D-0022 step 3, D-0031). There is no automatic failback: the default is that roles simply swap, and a return to the previous node is a planned switchover with a write freeze, a final sync and a lease move (D-0022).
+
+## 10. Node removal
+
+```
+DELETE /api/v1/nodes/{node_id}
+```
+
+- The scope is `node:remove`, destructive and human-only (`README.md`), so an agent cannot remove a node.
+- If the node is connected, the primary first sends `lease_revoke` for every lease the node holds and waits for each `command_result`, so the node fences its stateful VMs; then it ends the session with a fatal `error` code `node_removed` and marks the node `removed`. If the node is not connected, removal increments the fencing token of each of its leases, exactly like declaring the node lost (section 8.3), so the old copy can no longer write to shared storage. Only then may the app start elsewhere; the node itself is not asked to destroy anything.
+- The node stops dialing permanently. It leaves its stateless VMs running and its fenced stateful VMs stopped, because deleting them is a data decision, not a protocol step.
+- Removing a node never destroys data remotely. Purging local state — disks, rootfs images, the node's store — is a local CLI command run on that machine by whoever has root there. A node that is gone for good therefore keeps its data until someone with access deletes it, which is the safe default.
+
+## 11. Security notes
+
+Threats and their mitigations are in `../architecture/threat-model.md`; this section states only what the protocol does.
+
+- **Credential storage.** The node credential and the node's private key are stored root-only on the node. The primary stores only a hash of the credential.
+- **Desired-state signature.** A node accepts a snapshot only if the Ed25519 signature verifies against the cluster public key it received at enrollment. A compromised intermediate or a different cluster cannot make a node start an arbitrary microVM. The signature does not protect against the primary itself: whatever the primary signs, the node runs. The signing key rotates with a `signing_key_rotate` signed by the old key (D-0050), so a new key is accepted only from the holder of the old one.
+- **Certificate pinning.** The node refuses a TLS certificate whose SHA-256 differs from the fingerprint in the join command, so a self-signed primary is as safe as a CA-issued one, and a stolen DNS name does not redirect a node.
+- **A compromised primary** can read everything the cluster stores — state, ciphertext it can decrypt with the cluster data-encryption key, and the telemetry that nodes stream on demand — and can issue desired state, lease grants and commands to every node. Until M5b it is also the lease authority, so it can grant the same lease to two nodes and run a stateful app twice; only a storage receiver that tracks the highest fencing token on its own side limits the damage. From M5b a quorum or external arbiter takes that power away from a single primary (D-0017). It cannot read a node's local store or its private key.
+- **A compromised node** can lie about observed state, emit false events and, within its lease, run whatever its stored desired state allows. It cannot forge desired state for other nodes, cannot mint credentials, and cannot write to shared storage with a stale token. Its blast radius is its own workloads, which is why stateful data stays protected by the lease and the token rather than by the honesty of the node.
+
+## 12. Local node store
+
+The node keeps a SQLite file, owned by root, that holds everything it needs to run without the control plane (D-0011, D-0015 for the choice of SQLite elsewhere). The tables below are described, not specified: they are local to the node, are not part of `db-schema.sql`, are never replicated, and their exact columns may change without a contract change.
+
+| Table | Holds | Why |
+| --- | --- | --- |
+| `node_meta` | `node_id`, `cluster_id`, `boot_id`, agent and engine versions, the cluster public key and its `key_id`, a reference to the credential | Identity across restarts |
+| `desired_state` | One row per accepted `rev`: the full signed body, its hash, `issued_at`, `term` | The snapshot to reconcile from, and the signature to re-verify |
+| `applied_state` | Per VM the last applied spec digest, observed status, restart count, last exit code | Detects drift without the primary |
+| `leases` | Lease id, resource, mode, token, state, `valid_until`, duration | Survives an agent restart: a fenced lease stays fenced |
+| `event_buffer` | Buffered events with their `evt_` id and time, plus the dropped counter | Bounded at 10 000; delivered after reconnect |
+| `change_log` | Followed entries in `seq` order with `prev_hash` and `hash`, and the last acked `seq` | Verifies the chain and resumes follow |
+| `quarantine` | Metadata for each quarantined divergent copy: path, time, reason | Nothing divergent is deleted (D-0022) |
+| `cmd_results` | `msg_` id and outcome of the last answered intrusive messages | Makes a redelivered `lease_revoke` idempotent |
+
+The store is the reason a node can be restarted, upgraded or disconnected without stopping apps: it holds the signed intent, the applied reality, and the fencing state, and nothing in it depends on the control plane being reachable.
