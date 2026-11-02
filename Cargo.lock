@@ -40,6 +40,11 @@ dependencies = [
 [[package]]
 name = "quoro-node-agent"
 version = "0.0.0"
+dependencies = [
+ "quoro-engine",
+ "quoro-proto",
+ "tokio",
+]
 
 [[package]]
 name = "quoro-proto"
