@@ -381,4 +381,8 @@ pub mod boot;
 #[cfg(target_os = "linux")]
 pub mod image;
 
+/// The Cloud Hypervisor backend: [`ch::ChEngine`] implements [`Engine`].
+#[cfg(target_os = "linux")]
+pub mod ch;
+
 pub use fake::{FakeEngine, FakeOp};
