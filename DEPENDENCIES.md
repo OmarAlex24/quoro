@@ -40,3 +40,4 @@ Rules:
 | `actions/attest-build-provenance` v4.2.2, pinned by commit SHA | `.github/workflows/release.yml` | Signs the release tarball keylessly: SLSA build provenance through Sigstore, bound to the release workflow and the tag (ADR 0027); no signing key to hold or leak |
 | `musl-tools` (Ubuntu package, not pinned) | `.github/workflows/release.yml` | `musl-gcc` for C dependencies of the static musl build; Rust code is linked with the toolchain's `rust-lld`, so the host linker stays out of the build |
 | `gh` (preinstalled on the GitHub-hosted runner) | `.github/workflows/release.yml` | Self-checks the attestation with `packaging/verify-release.sh` and creates the draft release |
+| GitHub CLI `gh` 2.103.3, pinned by version and sha256 | `installer/install.sh` | Downloaded to a temporary directory by the installer to verify the release attestation before anything is installed, then deleted; `cosign` was not used because its binary is ten times larger |
