@@ -368,4 +368,17 @@ pub struct HostProbe {
 
 pub mod fake;
 
+/// Pinned Cloud Hypervisor and guest kernel artifacts, verified by sha256.
+#[cfg(target_os = "linux")]
+pub mod pins;
+
+/// Boot artifacts the engine builds for every VM: the initramfs that carries
+/// `quoro-init`, the config disk and the writable data disk.
+#[cfg(target_os = "linux")]
+pub mod boot;
+
+/// The OCI-to-ext4 pipeline behind `prepare_image` (D-0061).
+#[cfg(target_os = "linux")]
+pub mod image;
+
 pub use fake::{FakeEngine, FakeOp};

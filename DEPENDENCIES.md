@@ -13,7 +13,8 @@ Rules:
 - Test-only needs go in `[dev-dependencies]` and are listed separately.
 - `Cargo.lock` is committed and every build and test in CI runs with `--locked`.
 - A new dependency must pass `cargo deny check`: its license is on the ADR 0080
-  allowlist and it comes from crates.io.
+  allowlist and it comes from crates.io. The check covers the Linux targets
+  Quoro ships (listed in `deny.toml`), not targets it never builds for.
 
 ## Runtime dependencies
 
@@ -45,6 +46,15 @@ Rules:
 | `futures-core` | `crates/quoro` | no default features | Polls the engine's `EventStream` with `std::future::poll_fn` instead of pulling in `futures` |
 | `rust-embed` | `crates/quoro` | `deterministic-timestamps` (no default features) | Compiles `panel/dist` into the binary so one file serves the panel (D-0056); `allow_missing` lets a Rust-only build compile, and deterministic timestamps keep release builds reproducible (ADR 0027). It brings a second `sha2` (0.11, for its own file hashes) next to the 0.10 the control plane uses; every 8.x release does |
 | `sqlx` | `crates/quoro` | `sqlite`, `runtime-tokio` | `quoro setup-token` checks for an existing owner with one query on the store's pool |
+| `quoro-init` (workspace crate) | `crates/engine` (Linux) | none | The config-disk and status-record formats shared with the guest init, so the engine and the init use one copy of the encoder and decoder |
+| `tokio` | `crates/engine` (Linux) | adds `rt`, `fs`, `net`, `process`, `macros` | Image conversion runs on `spawn_blocking` (`rt`); blobs stream to files (`fs`); the Cloud Hypervisor API is HTTP over a UNIX socket and VMM exits are watched through a pidfd (`net`); VMM processes are spawned and reaped (`process`); `select!` in the per-VM supervisor (`macros`) |
+| `oci-client` | `crates/engine` (Linux) | `rustls-tls` only | OCI distribution protocol for `prepare_image`: anonymous token auth, manifest and index fetch, blob streaming (D-0061, validated by the M0 spike). Writing a registry client by hand is more code to review than this crate. Pulls `reqwest`, `hyper`, `rustls` with `aws-lc-rs`; every crate in that tree is under an allowlisted license (D-0080) |
+| `sha2` | `crates/engine` (Linux) | no default features | The engine verifies every manifest, config, compressed layer and uncompressed layer (`diff_ids`) digest itself instead of trusting the client, and checks the pinned Cloud Hypervisor and kernel sha256 at start (F-0206). Same major as `oci-client` uses, so no duplicate |
+| `tar` | `crates/engine` (Linux) | no default features | Reads OCI layer tarballs (GNU and PAX headers, long names, xattrs). Entries are applied by the engine's own in-root code, never with `tar::Archive::unpack` |
+| `flate2` | `crates/engine` (Linux) | `rust_backend` only | gzip-compressed layers, the common case; pure-Rust `miniz_oxide` backend, no C zlib |
+| `serde`, `serde_json` | `crates/engine` (Linux) | `std`, `derive` / `std` | OCI image config and index JSON, the cached image metadata, Cloud Hypervisor's JSON API, and the per-VM state files the engine reads back after an agent restart |
+| `rustix` | `crates/engine` (Linux) | `std`, `fs`, `process` | Safe wrappers for `openat2(RESOLVE_IN_ROOT)` and the `*at` calls that apply layers inside the rootfs (engine-trait.md section 3.4), and for `pidfd_open` and `kill` in VMM supervision, so the workspace keeps `unsafe_code = "forbid"` |
+| `rustix` | `crates/init` (Linux) | `std`, `fs`, `mount`, `net`, `process`, `system`, `termios` | The guest PID 1 needs mount, move-mount, chroot, reboot, rtnetlink sockets, `waitpid` on any child and `tcsetattr` (raw output on the app console), none of which `std` offers. `rustix` keeps the init free of `unsafe`; the M0 spike used raw `libc` instead |
 
 ## Test-only dependencies
 
@@ -63,6 +73,8 @@ Rules:
 | `tokio` | `crates/quoro` | `process`, `io-util`, `time` and the runtime features | The test spawns the binary, reads its stderr for the start lines and waits with timeouts |
 
 ## Tooling outside Cargo
+
+Host programs the engine runs (packaged by the installer, not linked): `mkfs.ext4` from e2fsprogs >= 1.43 (`-d`) for root and data disks, `ip` from iproute2 for the bridge and TAP devices, `nft` from nftables for egress NAT and isolation, and the pinned `cloud-hypervisor-static` binary and guest kernel listed in `crates/engine/pins.txt`.
 
 | Tool | Where | Why |
 | --- | --- | --- |

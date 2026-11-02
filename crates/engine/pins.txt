@@ -1,0 +1,11 @@
+# Pinned artifacts for the Cloud Hypervisor engine. The single source of truth:
+# read by crates/engine/src/pins.rs (include_str!) and by
+# crates/engine/scripts/fetch-pinned.sh.
+#
+# Upstream publishes no signatures, SUMS files or attestations (F-0206); the
+# sha256 below is GitHub's release-asset digest, checked on every engine start.
+# Bumping a pin is its own pull request.
+#
+# name version arch file url sha256
+cloud-hypervisor v54.0 x86_64 cloud-hypervisor-static https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v54.0/cloud-hypervisor-static 4f4f98a3d661a40f3e5272627cc895a1b2e525f2f6bedf5f895f9cd21ba5c65b
+guest-kernel ch-release-v7.2.8-20261009 x86_64 vmlinux-x86_64 https://github.com/cloud-hypervisor/linux/releases/download/ch-release-v7.2.8-20261009/vmlinux-x86_64 edfeb8a8a6c04ff2979e9f1c700feaa29b8f564f952261834ef0b7d2e673a853

@@ -1,0 +1,35 @@
+[package]
+name = "quoro-init"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "PID 1 inside every Quoro microVM, and the config format the engine writes for it"
+
+[lints]
+workspace = true
+
+[lib]
+name = "quoro_init"
+path = "src/lib.rs"
+
+[[bin]]
+name = "quoro-init"
+path = "src/main.rs"
+
+# The library (the config and status formats) is pure Rust with no
+# dependencies, so the engine can link it on any platform. The binary is PID 1
+# in a Linux guest; rustix gives it safe wrappers for the syscalls std does not
+# cover (mount, chroot, reboot, netlink, waitpid on any child, termios), so the crate
+# keeps the workspace's `unsafe_code = "forbid"`.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1", default-features = false, features = [
+    "std",
+    "fs",
+    "mount",
+    "net",
+    "process",
+    "system",
+    "termios",
+] }

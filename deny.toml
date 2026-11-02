@@ -5,8 +5,16 @@
 # a policy change: it needs a decision, not a local workaround.
 
 [graph]
-# No `targets` list: every target of the workspace is checked, and
-# dev-dependencies are included with the defaults.
+# Only the targets Quoro ships are checked, so the policy applies to exactly
+# what can end up in a release binary (KVM hosts, ADR 0009). A crate pulled in
+# only for another target (for example wasm32) is out of scope. Adding a
+# shipped target means adding it here. Dev-dependencies are included.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-unknown-linux-musl",
+]
 
 [licenses]
 version = 2
