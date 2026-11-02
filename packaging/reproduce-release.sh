@@ -85,6 +85,15 @@ git clone --depth 1 --branch "$tag" "$repo_url" "$work/quoro" ||
 	die "cannot clone $repo_url at $tag"
 
 printf 'rebuilding %s from the clone\n' "$version" >&2
+
+# The build needs the Node.js pinned in the clone's packaging/node.txt; the
+# fetch script prints the bin directory to put first on PATH.
+node_bin=$("$work/quoro/packaging/fetch-node.sh" "$work/node") ||
+	die "cannot fetch the pinned Node.js"
+[ -d "$node_bin" ] || die "fetch-node.sh did not print a bin directory"
+PATH="$node_bin:$PATH"
+export PATH
+
 "$work/quoro/packaging/build-release.sh" "$version"
 
 tarball="quoro-$version-x86_64-unknown-linux-musl.tar.gz"

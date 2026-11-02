@@ -2,8 +2,14 @@
 # the signing identity and the release bytes on a machine we do not control,
 # and it would break the reproducibility claim (the toolchain must match).
 #
-# The workflow creates a DRAFT release. The maintainer reviews the artifacts
-# and publishes it; nothing here publishes on its own.
+# A tag push creates a DRAFT release. The maintainer reviews the artifacts and
+# publishes it; nothing here publishes on its own.
+#
+# Workflow dispatch is a dry run (ADR 0082): it builds, attests and uploads
+# WORKFLOW ARTIFACTS ONLY. It never creates a tag, a release or a draft release,
+# and its attestation is bound to the branch ref it ran on, not to a tag. Use it
+# to try the release path before tagging; the artifacts are named so they cannot
+# be mistaken for a release.
 #
 # Signing is keyless: GitHub artifact attestations (Sigstore, SLSA build
 # provenance) via actions/attest-build-provenance. There are no long-lived
@@ -13,6 +19,7 @@ name: Release
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  workflow_dispatch:
 
 permissions: {}
 
@@ -50,32 +57,52 @@ jobs:
           rustup toolchain install "$channel" --profile minimal
           rustup show active-toolchain
 
-      # The tag and the Cargo version must agree, otherwise the artifact name
-      # (which carries the tag version) would lie about the binary.
+      # The panel is compiled into the binary, so its toolchain is a build input
+      # too (ADR 0027). Fetch the Node.js pinned in packaging/node.txt and put it
+      # first on PATH instead of trusting whatever the runner ships.
+      - name: Pinned Node.js
+        run: |
+          set -euo pipefail
+          node_bin="$(packaging/fetch-node.sh "$RUNNER_TEMP/node")"
+          printf 'node bin: %s\n' "$node_bin"
+          printf '%s\n' "$node_bin" >>"$GITHUB_PATH"
+
+      # On a tag push the tag and the Cargo version must agree, otherwise the
+      # artifact name (which carries the tag version) would lie about the
+      # binary. A dry run has no tag: the Cargo version names the artifact and
+      # the attestation is bound to the branch ref.
       - name: Resolve version
         id: version
         env:
+          EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          version="${REF_NAME#v}"
-          case "$version" in
-            "" | *[!A-Za-z0-9.+_-]*)
-              echo "error: unexpected tag: $REF_NAME" >&2
-              exit 1
-              ;;
-          esac
           package="${QUORO_PACKAGE:-quoro}"
           cargo_version="$(
             cargo metadata --format-version 1 --no-deps --locked |
               python3 -I -c 'import json,sys; p=sys.argv[1]; ms=[x["version"] for x in json.load(sys.stdin)["packages"] if x["name"]==p]; print(ms[0] if ms else sys.exit("package not found in cargo metadata: "+p))' "$package"
           )"
-          if [ "$cargo_version" != "$version" ]; then
-            echo "error: tag version $version does not match the Cargo version" \
-              "$cargo_version of package $package" >&2
-            exit 1
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            version=$cargo_version
+            dry_run=true
+          else
+            version="${REF_NAME#v}"
+            dry_run=false
+            if [ "$cargo_version" != "$version" ]; then
+              echo "error: tag version $version does not match the Cargo version" \
+                "$cargo_version of package $package" >&2
+              exit 1
+            fi
           fi
+          case "$version" in
+            "" | *[!A-Za-z0-9.+_-]*)
+              echo "error: unexpected version: $version" >&2
+              exit 1
+              ;;
+          esac
           echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "dry_run=$dry_run" >>"$GITHUB_OUTPUT"
 
       - name: Build release artifacts
         env:
@@ -104,16 +131,45 @@ jobs:
 
       # Same checks a user runs, against the files that are about to be
       # uploaded. A broken attestation fails the release here, not for users.
+      # A dry run must be dispatched from a branch, so its source ref is that
+      # branch and not a tag.
       - name: Verify the release artifacts
         env:
           GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          packaging/verify-release.sh \
-            "dist/quoro-${VERSION}-x86_64-unknown-linux-musl.tar.gz" \
-            "$GITHUB_REF_NAME"
+          set -eu
+          tarball="dist/quoro-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            case "$GITHUB_REF" in
+              refs/heads/*) ;;
+              *)
+                echo "error: a dry run must be dispatched from a branch, got $GITHUB_REF" >&2
+                exit 1
+                ;;
+            esac
+            packaging/verify-release.sh "$tarball" --dry-run-ref "$GITHUB_REF"
+          else
+            packaging/verify-release.sh "$tarball" "$GITHUB_REF_NAME"
+          fi
+
+      # Dry runs keep their artifacts as workflow artifacts. The name carries
+      # "dry-run" and the commit sha so it cannot be taken for a release asset.
+      - name: Upload dry-run artifacts
+        if: steps.version.outputs.dry_run == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: quoro-${{ steps.version.outputs.version }}-dry-run-${{ github.sha }}
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+            dist/*.sigstore.jsonl
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Create draft release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
