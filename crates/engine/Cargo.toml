@@ -21,6 +21,46 @@ tokio = { version = "1", default-features = false, features = [
 # trait objects; the concrete stream is implemented in this crate.
 futures-core = { version = "0.3", default-features = false }
 
+# Everything below backs the Linux-only modules (`image`, `boot`, `pins`, and
+# the Cloud Hypervisor backend). The trait and `FakeEngine` above still build
+# on any platform, so FakeEngine tests run on laptops (engine-trait.md §7).
+[target.'cfg(target_os = "linux")'.dependencies]
+# The config and status formats shared with the guest init (one copy).
+quoro-init = { path = "../init" }
+# Blocking image work runs on `spawn_blocking` (`rt`); the registry client and
+# the VMM supervision need files, UNIX sockets, child processes and timers.
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "fs",
+    "net",
+    "process",
+    "macros",
+] }
+# OCI distribution protocol: anonymous token auth, index -> platform manifest,
+# blob pull (D-0061). rustls only, no OpenSSL.
+oci-client = { version = "0.18", default-features = false, features = [
+    "rustls-tls",
+] }
+# Every manifest, config and layer digest is verified by the engine itself,
+# compressed and uncompressed (diff_ids). Same major as oci-client's.
+sha2 = { version = "0.11", default-features = false }
+# Layer tarballs; entries are applied by hand, never with `unpack`.
+tar = { version = "0.4", default-features = false }
+# gzip layers (pure-Rust miniz_oxide backend).
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# OCI image config, cached image metadata, Cloud Hypervisor's JSON API, and
+# the per-VM state files.
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+# Safe wrappers for openat2(RESOLVE_IN_ROOT) and the *at() calls that apply
+# layers inside the rootfs (engine-trait.md §3.4), pidfd_open and kill for VMM
+# supervision. Keeps `unsafe_code = "forbid"`.
+rustix = { version = "1.1", default-features = false, features = [
+    "std",
+    "fs",
+    "process",
+] }
+
 [dev-dependencies]
 # Tests need the `#[tokio::test]` macro, a runtime, and the paused clock
 # (`test-util`) to make the injected sleeps deterministic.
