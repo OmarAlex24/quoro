@@ -30,6 +30,7 @@
         "node.connected",
         "node.disconnected",
         "node.fenced",
+        "node.fence_failed",
         "node.disk_low",
         "vm.created",
         "vm.started",
@@ -78,6 +79,7 @@
     { "if": { "required": ["type"], "properties": { "type": { "const": "node.connected" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_node_connected" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "node.disconnected" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_node_disconnected" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "node.fenced" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_node_fenced" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "node.fence_failed" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_node_fence_failed" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "node.disk_low" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_node_disk_low" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "vm.created" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_vm_created" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "vm.started" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_vm_started" } } } },
@@ -297,6 +299,21 @@
         "app_ids": { "type": "array", "items": { "$ref": "#/$defs/AppId" } },
         "lease_ids": { "type": "array", "items": { "$ref": "#/$defs/LeaseId" } },
         "reason": { "type": "string", "enum": ["lease_expired", "lease_revoked"] }
+      },
+      "additionalProperties": true
+    },
+
+    "data_node_fence_failed": {
+      "type": "object",
+      "description": "A node could not confirm that a fence stopped every stateful VM bound to a lost lease, so a VM may still be running; the node marked itself failed and the lease stays unstartable until an operator acknowledges the fence (D-0074). Payload fields are additive within schema_version 1.",
+      "required": ["node_id", "app_ids", "lease_ids", "vm_ids", "reason"],
+      "properties": {
+        "node_id": { "$ref": "#/$defs/NodeId" },
+        "app_ids": { "type": "array", "items": { "$ref": "#/$defs/AppId" } },
+        "lease_ids": { "type": "array", "items": { "$ref": "#/$defs/LeaseId" } },
+        "vm_ids": { "type": "array", "items": { "$ref": "#/$defs/VmId" } },
+        "reason": { "type": "string", "enum": ["lease_expired", "lease_revoked"] },
+        "error": { "type": "string", "description": "The engine error of the forced stop." }
       },
       "additionalProperties": true
     },
@@ -789,8 +806,26 @@
     },
     {
       "schema_version": 1,
-      "id": "evt_01JC9Z6Q5W8N3K4T7R2M1XHB0Q",
+      "id": "evt_01JC9Z6Q5W8N3K4T7R2M1XHB0V",
       "seq": 47,
+      "type": "node.fence_failed",
+      "time": "2026-11-02T09:44:20Z",
+      "source": { "kind": "node", "node_id": "nod_01JC9Z6Q5W8N3K4T7R2M1XHB0N" },
+      "subject": { "type": "node", "id": "nod_01JC9Z6Q5W8N3K4T7R2M1XHB0N" },
+      "actor": { "type": "node", "id": "nod_01JC9Z6Q5W8N3K4T7R2M1XHB0N" },
+      "data": {
+        "node_id": "nod_01JC9Z6Q5W8N3K4T7R2M1XHB0N",
+        "app_ids": ["app_01JC9Z6Q5W8N3K4T7R2M1XHB0X"],
+        "lease_ids": ["lse_01JC9Z6Q5W8N3K4T7R2M1XHB0H"],
+        "vm_ids": ["vm_01JC9Z6Q5W8N3K4T7R2M1XHB0B"],
+        "reason": "lease_revoked",
+        "error": "VMM process did not exit after SIGKILL"
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "evt_01JC9Z6Q5W8N3K4T7R2M1XHB0Q",
+      "seq": 48,
       "type": "deployment.failed",
       "time": "2026-11-02T09:50:12Z",
       "source": { "kind": "control_plane" },
@@ -807,7 +842,7 @@
     {
       "schema_version": 1,
       "id": "evt_01JC9Z6Q5W8N3K4T7R2M1XHB0W",
-      "seq": 48,
+      "seq": 49,
       "type": "audit.chain_broken",
       "time": "2026-11-02T10:02:30Z",
       "source": { "kind": "control_plane" },
@@ -822,7 +857,7 @@
     {
       "schema_version": 1,
       "id": "evt_01JC9Z6Q5W8N3K4T7R2M1XHB0Y",
-      "seq": 49,
+      "seq": 50,
       "type": "node.disk_low",
       "time": "2026-11-02T10:10:00Z",
       "source": { "kind": "node", "node_id": "nod_01JC9Z6Q5W8N3K4T7R2M1XHB0N" },
@@ -837,7 +872,7 @@
     {
       "schema_version": 1,
       "id": "evt_01JC9Z6Q5W8N3K4T7R2M1XHB0Z",
-      "seq": 50,
+      "seq": 51,
       "type": "certificate.expiring",
       "time": "2026-11-02T10:12:00Z",
       "source": { "kind": "control_plane" },

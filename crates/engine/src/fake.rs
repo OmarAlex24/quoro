@@ -16,7 +16,8 @@
 //! Injection hooks are documented on the methods that provide them. They exist
 //! so every error path and every event the node agent must map is reachable:
 //! `fail_next` returns an error once, `crash` and `schedule_crash` produce a
-//! `Crashed` event, and `set_console_echo` makes a console round-trip.
+//! `Crashed` event, `set_console_echo` makes a console round-trip, and
+//! `set_unkillable` makes every stop fail as a VMM that survives `SIGKILL`.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -68,6 +69,9 @@ struct VmRecord {
     ignores_power_button: bool,
     /// Injection: every stop call takes this long before acting.
     stop_delay: Duration,
+    /// Injection: the VMM process survives `SIGKILL`, so every stop fails and
+    /// the VM keeps the state it had.
+    unkillable: bool,
     /// Manual-clock deadline at which this VM crashes, if scheduled.
     scheduled_crash: Option<Duration>,
     /// The live output subscriber, if one exists.
@@ -248,6 +252,17 @@ impl FakeEngine {
     pub fn set_stop_delay(&self, id: &VmId, delay: Duration) {
         if let Some(record) = self.lock().vms.get_mut(id) {
             record.stop_delay = delay;
+        }
+    }
+
+    /// Injection: every `stop` call for this VM, graceful or forced, fails with
+    /// `EngineError::Hypervisor("VMM process did not exit after SIGKILL")` and
+    /// the VM keeps its state (a `Running` VM stays `Running`, keeps its pid),
+    /// as when the VMM process cannot be killed. `inspect` keeps reporting the
+    /// real state.
+    pub fn set_unkillable(&self, id: &VmId, unkillable: bool) {
+        if let Some(record) = self.lock().vms.get_mut(id) {
+            record.unkillable = unkillable;
         }
     }
 
@@ -493,6 +508,7 @@ impl Engine for FakeEngine {
                 info: info.clone(),
                 ignores_power_button: false,
                 stop_delay: Duration::ZERO,
+                unkillable: false,
                 scheduled_crash: None,
                 output: None,
                 console_far: None,
@@ -534,7 +550,7 @@ impl Engine for FakeEngine {
             return Err(err);
         }
 
-        let (delay, ignores, already_stopped) = {
+        let (delay, ignores, unkillable, already_stopped) = {
             let mut state = self.lock();
             let Some(record) = state.vms.get(id) else {
                 return Err(EngineError::NotFound);
@@ -542,11 +558,17 @@ impl Engine for FakeEngine {
             let snapshot = (
                 record.stop_delay,
                 record.ignores_power_button,
+                record.unkillable,
                 record.info.state == VmState::Stopped,
             );
             state.stop_log.push((id.clone(), mode.clone()));
             snapshot
         };
+        if unkillable {
+            return Err(EngineError::Hypervisor(
+                "VMM process did not exit after SIGKILL".into(),
+            ));
+        }
         if already_stopped {
             return self.inspect(id).await;
         }

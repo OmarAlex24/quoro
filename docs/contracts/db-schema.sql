@@ -51,8 +51,8 @@
 -- data directory /var/lib/quoro, outside the SQLite file; the operator must back
 -- them up separately from the database, and losing the DEK loses every secret.
 -- The signing key rotates with a key-change message signed by the old key, which
--- nodes accept. Custody of the keys when a replica is promoted is open
--- (Q-0024).
+-- nodes accept. Custody of the keys when a replica is promoted is open; the
+-- promotion itself ships in M5b (D-0067).
 --
 -- **Hypothesis**: the SQLite version bundled with the control-plane image
 -- supports STRICT tables and the JSON functions used here (json_valid,

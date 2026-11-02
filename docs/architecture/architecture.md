@@ -562,7 +562,7 @@ Two properties matter in the table. Recovery from `uncertain` back to `held` is 
 
 The authority never grants the lease to another holder before `D + 2M` after its last grant, so the old holder's fencing completes first ([../contracts/node-agent-protocol.md](../contracts/node-agent-protocol.md) section 8.4).
 
-Fencing tokens are monotonic per resource and travel on every write to shared storage — chunk store, object store, replication stream — and receivers reject stale tokens (D-0019). A token is what makes "the old holder is definitely not writing" enforceable by the storage layer rather than by good behaviour.
+Fencing tokens increase on every ownership change and stay the same across renewals (D-0073); they travel on every write to shared storage — chunk store, object store, replication stream — and receivers reject stale tokens (D-0019). A token is what makes "the old holder is definitely not writing" enforceable by the storage layer rather than by good behaviour.
 
 ### Lease arbiter options
 
@@ -637,7 +637,7 @@ Four rules hold in every flow:
 3. The node itself keeps running and reconciling its last desired state; local leases stay `held`, because a `local` lease does not expire while the arbiter is unreachable (D-0047). It redials with backoff and jitter.
 4. Nothing is started elsewhere automatically before M6 (D-0016, D-0033). The panel shows the app as degraded and the N+1 indicator answers whether its apps would fit on the remaining nodes (D-0021).
 5. To restore a stateful app elsewhere from a `cold` backup (M5a), an operator must first declare the node lost, as part of the `local` lease mode (D-0047), and acknowledge the manual fence. That revokes its leases and increments the fencing token, so a node that comes back cannot keep writing (D-0019).
-6. From M5b, with `expiring` leases: the node's renewals start failing, it goes `uncertain` (keep running, start nothing new), then `expired`, self-fences its stateful apps, and buffers `node.fenced` for replay on reconnect.
+6. From M5b, with `expiring` leases: the node's renewals start failing, it goes `uncertain` (keep running, start nothing new), then `expired`, self-fences its stateful apps, and buffers `node.fenced` for replay on reconnect; if a forced stop cannot confirm a VM stopped, it emits `node.fence_failed` instead, marks itself failed, and the lease is not granted elsewhere until an operator acknowledges the fence (D-0074).
 7. A `warm` copy may start only after the old lease has expired on the arbiter's side plus the safety margin (D-0019). That ordering, not the detection time, is what prevents two writers.
 
 ### (d) Node return

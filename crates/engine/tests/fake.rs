@@ -170,6 +170,54 @@ async fn a_stop_delay_is_awaited_before_acting() {
     assert_eq!(info.exit_code, Some(137));
 }
 
+#[tokio::test(start_paused = true)]
+async fn an_unkillable_vm_keeps_its_state_and_every_stop_fails() {
+    let (engine, id) = created().await;
+    engine.start(&id).await.expect("start succeeds");
+    let running = engine.inspect(&id).await.expect("inspect succeeds");
+    assert_eq!(running.state, VmState::Running);
+    engine.set_unkillable(&id, true);
+
+    let began = tokio::time::Instant::now();
+    let graceful = engine
+        .stop(
+            &id,
+            StopMode::Graceful {
+                timeout: Duration::from_secs(30),
+            },
+        )
+        .await;
+    assert_eq!(
+        graceful,
+        Err(EngineError::Hypervisor(
+            "VMM process did not exit after SIGKILL".to_string()
+        ))
+    );
+
+    let forced = engine.stop(&id, StopMode::Force).await;
+    assert_eq!(
+        forced,
+        Err(EngineError::Hypervisor(
+            "VMM process did not exit after SIGKILL".to_string()
+        ))
+    );
+    // The failure is immediate: neither the stop delay nor the timeout is awaited.
+    assert_eq!(began.elapsed(), Duration::ZERO);
+
+    let info = engine.inspect(&id).await.expect("inspect succeeds");
+    assert_eq!(info.state, VmState::Running);
+    assert_eq!(info.pid, running.pid);
+    assert_eq!(engine.stop_calls().len(), 2);
+
+    engine.set_unkillable(&id, false);
+    let info = engine
+        .stop(&id, StopMode::Force)
+        .await
+        .expect("a forced stop succeeds once the VMM is killable");
+    assert_eq!(info.state, VmState::Stopped);
+    assert_eq!(info.exit_code, Some(137));
+}
+
 #[tokio::test]
 async fn output_allows_one_reader_until_it_is_dropped() {
     let (engine, id) = created().await;

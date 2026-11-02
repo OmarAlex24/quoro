@@ -7,7 +7,8 @@ use std::time::SystemTime;
 use quoro_engine::{Engine, VmId};
 use quoro_proto::{
     CommandResult, CommandStatus, Envelope, ErrorBody, ErrorCode, FenceReason, FromNode, LeaseId,
-    LeaseRenew, MsgId, NodeEvent, NodeEventData, NodeFenced, ProtocolError, ResourceType, ToNode,
+    LeaseRenew, MsgId, NodeEvent, NodeEventData, NodeFenceFailed, NodeFenced, ProtocolError,
+    ResourceType, ToNode,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
@@ -41,13 +42,18 @@ pub struct LeaseAgent<'e, E: Engine, S: LeaseStore> {
     answered: HashMap<MsgId, CommandResult>,
     /// Fences that the restore found and that must run before anything else.
     pending_fences: Vec<Action>,
+    /// The node's failed mark (section 12 `node_meta`): a fence could not
+    /// confirm that every VM stopped, so nothing stateful may start.
+    failed: bool,
 }
 
 impl<'e, E: Engine, S: LeaseStore> LeaseAgent<'e, E, S> {
     /// Builds an agent, restoring the lease table from the local store.
     ///
     /// Fences that the restore requires (section 8.5 step 2) are kept and run
-    /// first by [`Self::run`].
+    /// first by [`Self::run`]. The node's failed mark is restored too, so a
+    /// restart stays failed until an operator clears it (section 12
+    /// `node_meta`).
     pub fn new(
         engine: &'e E,
         store: S,
@@ -56,6 +62,7 @@ impl<'e, E: Engine, S: LeaseStore> LeaseAgent<'e, E, S> {
     ) -> Self {
         let (table, pending_fences) =
             LeaseTable::restore(store.load_leases(), store.load_highest_tokens());
+        let failed = store.node_failed();
         Self {
             engine,
             store,
@@ -67,6 +74,7 @@ impl<'e, E: Engine, S: LeaseStore> LeaseAgent<'e, E, S> {
             next_evt: 0,
             answered: HashMap::new(),
             pending_fences,
+            failed,
         }
     }
 
@@ -85,9 +93,18 @@ impl<'e, E: Engine, S: LeaseStore> LeaseAgent<'e, E, S> {
     }
 
     /// Section 6.4: whether a stateful VM with this spec token may start.
+    ///
+    /// Nothing stateful starts on a node that is marked failed: a VM whose
+    /// lease it lost may still be running somewhere (D-0074).
     #[must_use]
     pub fn may_start_stateful(&self, lease_id: &LeaseId, spec_token: u64) -> bool {
-        self.table.may_start_stateful(lease_id, spec_token)
+        !self.failed && self.table.may_start_stateful(lease_id, spec_token)
+    }
+
+    /// Whether the node is marked failed (section 12 `node_meta`).
+    #[must_use]
+    pub fn is_failed(&self) -> bool {
+        self.failed
     }
 
     /// Runs until the stop flag is set.
@@ -99,7 +116,9 @@ impl<'e, E: Engine, S: LeaseStore> LeaseAgent<'e, E, S> {
     /// fenced, another `expiring` lease that reaches `valid_until` starts its
     /// own fence only afterwards, which can push it past `t_send + D`. M0 has
     /// no `expiring` lease outside tests; running fences concurrently is
-    /// required before `expiring` leases are used (M5b).
+    /// required before `expiring` leases are used (M5b). Concurrent fences and
+    /// a mid-fence crash test are mandatory before `expiring` leases ship
+    /// (D-0075).
     pub async fn run(
         &mut self,
         inbound: &mut mpsc::UnboundedReceiver<ToNode>,
@@ -244,23 +263,61 @@ impl<'e, E: Engine, S: LeaseStore> LeaseAgent<'e, E, S> {
 
         // Step 2: record the stop so it survives an agent restart. An
         // incomplete fence is recorded too: it must not be forgotten.
+        let complete = report.complete();
         self.store.record_fence(FenceRecord {
             lease_id: lease_id.clone(),
             token,
             vm_ids: vms,
             at: SystemTime::now(),
             reason,
-            complete: report.complete(),
+            complete,
         });
         if let Some(lease) = self.table.get(lease_id) {
             self.save(lease);
         }
 
-        // Step 3: emit `node.fenced` with the lease and the app.
         let app_ids = match resource_type {
             ResourceType::App => vec![resource_id],
             ResourceType::Primary => Vec::new(),
         };
+
+        if !complete {
+            // D-0074: the forced stop could not be confirmed, so the VM may
+            // still run. Emit `node.fence_failed` instead of `node.fenced` and
+            // mark the node failed: nothing stateful starts until an operator
+            // clears the mark (section 12 `node_meta`).
+            let mut vm_ids: Vec<String> = Vec::new();
+            let mut errors: Vec<String> = Vec::new();
+            for (vm, outcome) in &report.vms {
+                if let VmFenceOutcome::Failed(error) = outcome {
+                    vm_ids.push(vm.0.clone());
+                    errors.push(format!("{}: {error}", vm.0));
+                }
+            }
+            let event_id = self.next_event_id();
+            let envelope_id = self.next_message_id();
+            self.send(FromNode::Event(Envelope {
+                id: envelope_id,
+                re: None,
+                body: NodeEvent {
+                    id: event_id,
+                    time: SystemTime::now(),
+                    data: NodeEventData::NodeFenceFailed(NodeFenceFailed {
+                        node_id: self.config.node_id.clone(),
+                        app_ids,
+                        lease_ids: vec![lease_id.clone()],
+                        vm_ids,
+                        reason,
+                        error: Some(errors.join(", ")),
+                    }),
+                },
+            }));
+            self.failed = true;
+            self.store.set_node_failed(true);
+            return report;
+        }
+
+        // Step 3: emit `node.fenced` with the lease and the app.
         let event_id = self.next_event_id();
         let envelope_id = self.next_message_id();
         self.send(FromNode::Event(Envelope {

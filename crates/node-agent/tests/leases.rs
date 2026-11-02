@@ -8,16 +8,16 @@
 mod common;
 
 use common::{
-    APP, NODE, command_result_of, config, error_of, event_of, lease_state, millis, pair, renew_of,
-    run_phase, running_vm, settle, stop_counts,
+    APP, NODE, command_result_of, config, error_of, event_of, fence_failed_of, fenced_of,
+    lease_state, millis, pair, renew_of, run_phase, running_vm, settle, stop_counts,
 };
 use quoro_engine::{Engine, FakeEngine, StopMode, VmId, VmState};
 use quoro_node_agent::{
     FenceTimers, LeaseAgent, LeaseState, LeaseStore, MemoryLeaseStore, budget_for, margin,
 };
 use quoro_proto::{
-    CommandStatus, ErrorCode, FenceReason, FromNode, LeaseGrant, LeaseId, LeaseMode, NodeEventData,
-    ResourceType, RevokeReason,
+    CommandStatus, ErrorCode, FenceReason, FromNode, LeaseGrant, LeaseId, LeaseMode, ResourceType,
+    RevokeReason,
 };
 use tokio::time::Instant;
 
@@ -52,7 +52,7 @@ async fn revoking_a_local_lease_fences_its_vm() {
 
     let event = event_of(event);
     assert!(event.id.starts_with("evt_"));
-    let NodeEventData::NodeFenced(fenced) = event.data;
+    let fenced = fenced_of(event);
     assert_eq!(fenced.node_id, NODE);
     assert_eq!(fenced.app_ids, vec![APP.to_string()]);
     assert_eq!(fenced.lease_ids, vec![lease_id.clone()]);
@@ -110,17 +110,21 @@ async fn revoking_a_local_lease_fences_its_vm() {
 /// What one run of the short-expiry scenario observed.
 struct ExpiryRun {
     t0: Instant,
+    /// The send instant of the renewal that confirmed the grant; the lease's
+    /// `valid_until` is based on it (D-0072).
+    t_send: Instant,
+    /// The send instant of the first renewal that went unanswered.
     renew_at: Instant,
     fenced_at: Instant,
     stop_calls: Vec<(VmId, StopMode)>,
     vm_state: VmState,
     lease_state: LeaseState,
     budget: FenceTimers,
-    fenced: NodeEventData,
+    fenced: quoro_proto::NodeFenced,
 }
 
-/// Grants an expiring lease, never answers its renewals, and waits for the
-/// fence.
+/// Grants an expiring lease, confirms it, never answers a later renewal, and
+/// waits for the fence.
 async fn run_expiring_fence(duration_ms: u64) -> ExpiryRun {
     let engine = FakeEngine::new();
     let store = MemoryLeaseStore::new();
@@ -135,34 +139,39 @@ async fn run_expiring_fence(duration_ms: u64) -> ExpiryRun {
     agent.bind_vm(lease_id.clone(), vm.clone());
 
     let t0 = Instant::now();
+    let mut t_send = None;
     let mut renew_at = None;
     let mut fenced_at = None;
     let mut fenced = None;
     run_phase(&mut agent, &mut inbound, async {
-        primary.grant_expiring(EXPIRING_LEASE, APP, 1, duration_ms, None);
+        // The first grant is `uncertain` until a renewal is answered.
+        let (_confirmed, sent) = primary
+            .grant_and_confirm(EXPIRING_LEASE, APP, 1, duration_ms)
+            .await;
+        t_send = Some(sent);
         let (_id, at) = primary.recv_renew().await;
         renew_at = Some(at);
         let message = primary.recv().await;
         fenced_at = Some(Instant::now());
-        fenced = Some(event_of(message));
+        fenced = Some(fenced_of(event_of(message)));
     })
     .await;
 
     let fenced = fenced.expect("a node.fenced event");
-    let NodeEventData::NodeFenced(fenced) = fenced.data;
     let budget = budget_for(
         agent.table().get(&lease_id).expect("the lease"),
         config().timers,
     );
     ExpiryRun {
         t0,
+        t_send: t_send.expect("the confirming renewal"),
         renew_at: renew_at.expect("a lease_renew"),
         fenced_at: fenced_at.expect("a fence time"),
         stop_calls: engine.stop_calls(),
         vm_state: engine.inspect(&vm).await.expect("inspect").state,
         lease_state: lease_state(&agent, &lease_id),
         budget,
-        fenced: NodeEventData::NodeFenced(fenced),
+        fenced,
     }
 }
 
@@ -170,10 +179,14 @@ async fn run_expiring_fence(duration_ms: u64) -> ExpiryRun {
 /// worked example of section 8.4.
 #[tokio::test(start_paused = true)]
 async fn a_short_expiring_lease_expires_and_fences_within_the_bound() {
-    // Variant 1: D = 3000, so M = 1000 and valid_until = t0 + 2000.
+    // Variant 1: D = 3000, so M = 1000 and valid_until = t_send + 2000.
     let short = run_expiring_fence(3000).await;
+    assert_eq!(
+        short.t_send, short.t0,
+        "the confirming renewal is immediate"
+    );
     assert_eq!(short.renew_at - short.t0, millis(1000));
-    let NodeEventData::NodeFenced(fenced) = &short.fenced;
+    let fenced = &short.fenced;
     assert_eq!(fenced.reason, FenceReason::LeaseExpired);
     assert_eq!(fenced.app_ids, vec![APP.to_string()]);
     assert_eq!(fenced.lease_ids, vec![lease(EXPIRING_LEASE)]);
@@ -183,7 +196,11 @@ async fn a_short_expiring_lease_expires_and_fences_within_the_bound() {
         millis(2800),
         "the fence starts at valid_until and fits in M"
     );
-    assert!(short.fenced_at <= short.t0 + millis(3000));
+    assert!(short.fenced_at <= short.t_send + millis(3000));
+    assert!(
+        short.fenced_at >= short.t_send + millis(2000),
+        "no early fence"
+    );
     assert_eq!(short.vm_state, VmState::Stopped);
     assert_eq!(short.lease_state, LeaseState::Expired);
     assert_eq!(stop_counts(&short.stop_calls), (1, 1));
@@ -204,6 +221,7 @@ async fn a_short_expiring_lease_expires_and_fences_within_the_bound() {
     agent.bind_vm(lease_id.clone(), vm.clone());
 
     let t0 = Instant::now();
+    let mut t_send = None;
     let mut first_renew = None;
     let mut second_renew = None;
     let mut running_at = None;
@@ -211,7 +229,10 @@ async fn a_short_expiring_lease_expires_and_fences_within_the_bound() {
     let mut fenced_at = None;
     let mut fenced = None;
     run_phase(&mut agent, &mut inbound, async {
-        primary.grant_expiring(EXPIRING_LEASE, APP, 1, 15000, None);
+        let (_confirmed, sent) = primary
+            .grant_and_confirm(EXPIRING_LEASE, APP, 1, 15000)
+            .await;
+        t_send = Some(sent);
         let (_id, at) = primary.recv_renew().await;
         first_renew = Some(at);
 
@@ -224,10 +245,11 @@ async fn a_short_expiring_lease_expires_and_fences_within_the_bound() {
 
         let message = primary.recv().await;
         fenced_at = Some(Instant::now());
-        fenced = Some(event_of(message));
+        fenced = Some(fenced_of(event_of(message)));
     })
     .await;
 
+    assert_eq!(t_send.expect("the confirming renewal"), t0);
     assert_eq!(first_renew.expect("a renewal") - t0, millis(5000));
     assert_eq!(second_renew.expect("a late renewal") - t0, millis(10000));
     assert_eq!(
@@ -238,7 +260,7 @@ async fn a_short_expiring_lease_expires_and_fences_within_the_bound() {
     assert_eq!(stops_at, Some(0), "uncertain stops nothing");
 
     let fenced_at = fenced_at.expect("a fence time");
-    let NodeEventData::NodeFenced(fenced) = fenced.expect("a node.fenced event").data;
+    let fenced = fenced.expect("a node.fenced event");
     assert_eq!(fenced.reason, FenceReason::LeaseExpired);
     assert_eq!(fenced.lease_ids, vec![lease_id.clone()]);
     // valid_until (13 500) + T_grace (700) + the slow VMM's forced stop (100).
@@ -248,6 +270,7 @@ async fn a_short_expiring_lease_expires_and_fences_within_the_bound() {
         "the fence starts at valid_until and finishes by t_send + D"
     );
     assert!(fenced_at <= t0 + millis(15000));
+    assert!(fenced_at >= t0 + millis(13500), "no early fence");
 
     assert_eq!(
         engine.inspect(&vm).await.expect("inspect").state,
@@ -278,7 +301,9 @@ async fn uncertain_never_stops_and_returns_to_held() {
     let t0 = Instant::now();
     let mut first_renew = None;
     run_phase(&mut agent, &mut inbound, async {
-        primary.grant_expiring(EXPIRING_LEASE, APP, 1, 15000, None);
+        let (_confirmed, _sent) = primary
+            .grant_and_confirm(EXPIRING_LEASE, APP, 1, 15000)
+            .await;
         let (_id, at) = primary.recv_renew().await;
         first_renew = Some(at);
         // The renewal is late at +10000: a whole renewal interval passed.
@@ -308,7 +333,10 @@ async fn uncertain_never_stops_and_returns_to_held() {
     let (_renew_id, answered_at) = answered.expect("an answered renewal");
     assert_eq!(answered_at - t0, millis(10000));
     assert_eq!(lease_state(&agent, &lease_id), LeaseState::Held);
-    assert!(agent.may_start_stateful(&lease_id, 2));
+    let lease = agent.table().get(&lease_id).expect("the lease");
+    assert_eq!(lease.token, 1, "an answered renewal keeps the token");
+    assert_eq!(lease.valid_until, Some(answered_at + millis(13500)));
+    assert!(agent.may_start_stateful(&lease_id, 1));
     assert_eq!(engine.stop_calls().len(), 0);
     assert!(store.fences().is_empty());
     assert!(
@@ -332,7 +360,9 @@ async fn renewals_answered_in_time_keep_the_lease_held() {
     let t0 = Instant::now();
     let mut last = None;
     run_phase(&mut agent, &mut inbound, async {
-        primary.grant_expiring(EXPIRING_LEASE, APP, 1, 15000, None);
+        let (_confirmed, _sent) = primary
+            .grant_and_confirm(EXPIRING_LEASE, APP, 1, 15000)
+            .await;
         last = primary
             .serve_renewals(EXPIRING_LEASE, APP, 15000, 1, t0 + millis(60000))
             .await;
@@ -343,14 +373,15 @@ async fn renewals_answered_in_time_keep_the_lease_held() {
     let lease = agent.table().get(&lease_id).expect("the lease");
     assert_eq!(lease.state, LeaseState::Held);
     assert_eq!(
-        lease.token, 12,
-        "one higher token per answered renewal (11 renewals in 60 s)"
+        lease.token, 1,
+        "D-0073: an answered renewal keeps the token"
     );
     assert_eq!(
         lease.valid_until,
         Some(last_send + millis(13500)),
         "valid_until is t_send + D - M"
     );
+    assert_eq!(last_send - t0, millis(55000), "11 renewals in 60 s");
     assert_eq!(lease_state(&agent, &lease_id), LeaseState::Held);
     assert_eq!(engine.stop_calls().len(), 0);
     assert!(store.fences().is_empty());
@@ -364,7 +395,7 @@ async fn renewals_answered_in_time_keep_the_lease_held() {
         engine.inspect(&vm).await.expect("inspect").state,
         VmState::Running
     );
-    assert!(agent.may_start_stateful(&lease_id, 12));
+    assert!(agent.may_start_stateful(&lease_id, 1));
 }
 
 /// Section 5.12 and 8.4: a `duration_ms` below 3 000 is refused, non-fatally.
@@ -423,7 +454,9 @@ async fn a_local_grant_with_a_duration_is_refused() {
     assert_eq!(agent.table().leases().count(), 0, "nothing changed");
 }
 
-/// Section 5.12: a token not higher than the one already seen is refused.
+/// Section 5.12 and D-0073: a token equal to the highest is a no-op only while
+/// the lease that holds it is still live; a lower token, or an equal token
+/// after the lease was revoked, is refused.
 #[tokio::test(start_paused = true)]
 async fn a_stale_token_grant_is_refused_and_changes_nothing() {
     let engine = FakeEngine::new();
@@ -433,17 +466,30 @@ async fn a_stale_token_grant_is_refused_and_changes_nothing() {
     let mut agent = LeaseAgent::new(&engine, store.clone(), config(), outbound);
 
     let mut refused = Vec::new();
+    let mut revoke = None;
     run_phase(&mut agent, &mut inbound, async {
         primary.grant_local(LOCAL_LEASE, APP, 5);
         settle().await;
-        for token in [5, 4] {
-            let id = primary.grant_local(LOCAL_LEASE, APP, token);
-            refused.push((id, primary.recv().await));
-        }
+        // D-0073: the same token for the held lease is accepted and changes
+        // nothing (no error is sent).
+        primary.grant_local(LOCAL_LEASE, APP, 5);
+        settle().await;
+        // A lower token is a bug in the authority.
+        let id = primary.grant_local(LOCAL_LEASE, APP, 4);
+        refused.push((id, primary.recv().await));
+        settle().await;
+        // Once revoked, the same token needs a strictly higher one.
+        let id = primary.revoke(LOCAL_LEASE, 5, RevokeReason::Moved);
+        let _event = event_of(primary.recv().await);
+        let _result = command_result_of(primary.recv().await);
+        revoke = Some(id);
+        let id = primary.grant_local(LOCAL_LEASE, APP, 5);
+        refused.push((id, primary.recv().await));
         settle().await;
     })
     .await;
 
+    assert!(revoke.is_some());
     for (grant, error) in refused {
         let (answered, error) = error_of(error);
         assert_eq!(answered, grant);
@@ -451,10 +497,10 @@ async fn a_stale_token_grant_is_refused_and_changes_nothing() {
         assert!(!error.fatal);
     }
     let tracked = agent.table().get(&lease_id).expect("the lease");
-    assert_eq!(tracked.state, LeaseState::Held);
+    assert_eq!(tracked.state, LeaseState::Revoked);
     assert_eq!(tracked.token, 5);
     assert_eq!(agent.table().highest_for(ResourceType::App, APP), 5);
-    assert!(agent.may_start_stateful(&lease_id, 5));
+    assert!(!agent.may_start_stateful(&lease_id, 5));
 }
 
 /// Section 5.9 and 12 `cmd_results`: a redelivered revoke gets the same answer
@@ -583,23 +629,23 @@ async fn a_restart_keeps_fenced_leases_fenced_and_tokens_monotonic() {
     let t0 = Instant::now();
     run_phase(&mut agent, &mut inbound, async {
         primary.grant_local(LOCAL_LEASE, APP, 1);
-        primary.grant_expiring(EXPIRING_LEASE, "app_expiring", 1, 15000, None);
+        // Confirm the expiring lease so it is held, not merely uncertain.
+        let (_confirmed, sent) = primary
+            .grant_and_confirm(EXPIRING_LEASE, "app_expiring", 1, 15000)
+            .await;
+        assert_eq!(sent, t0);
         primary.revoke(LOCAL_LEASE, 1, RevokeReason::Moved);
         let revoke_event = event_of(primary.recv().await);
-        let NodeEventData::NodeFenced(fenced) = revoke_event.data;
+        let fenced = fenced_of(revoke_event);
         assert_eq!(fenced.reason, FenceReason::LeaseRevoked);
         let _result = command_result_of(primary.recv().await);
-
-        // Keep the expiring lease held until the restart: answer its renewal.
-        let (renew_id, at) = primary.recv_renew().await;
-        assert_eq!(at - t0, millis(5000));
-        primary.grant_expiring(EXPIRING_LEASE, "app_expiring", 2, 15000, Some(renew_id));
         settle().await;
     })
     .await;
 
     assert_eq!(lease_state(&agent, &local_id), LeaseState::Revoked);
     assert_eq!(lease_state(&agent, &expiring_id), LeaseState::Held);
+    assert_eq!(agent.table().get(&expiring_id).expect("the lease").token, 1);
     assert_eq!(store.fences().len(), 1);
 
     // A second agent on the same store models the restart.
@@ -612,14 +658,14 @@ async fn a_restart_keeps_fenced_leases_fenced_and_tokens_monotonic() {
         "an expiring lease cannot prove itself after a restart"
     );
     assert!(!agent.may_start_stateful(&local_id, 1));
-    assert!(!agent.may_start_stateful(&expiring_id, 2));
+    assert!(!agent.may_start_stateful(&expiring_id, 1));
 
     let mut refused = None;
     let mut accepted = None;
     run_phase(&mut agent, &mut inbound, async {
         // The restore fence runs before anything else.
         let restore_event = primary.recv().await;
-        let NodeEventData::NodeFenced(fenced) = event_of(restore_event).data;
+        let fenced = fenced_of(event_of(restore_event));
         assert_eq!(fenced.reason, FenceReason::LeaseExpired);
         assert_eq!(fenced.lease_ids, vec![expiring_id.clone()]);
 
@@ -642,7 +688,10 @@ async fn a_restart_keeps_fenced_leases_fenced_and_tokens_monotonic() {
     let fences = store.fences();
     assert_eq!(fences.len(), 2, "the restart fence is recorded too");
     assert_eq!(fences[1].reason, FenceReason::LeaseExpired);
-    assert_eq!(fences[1].token, 2);
+    assert_eq!(
+        fences[1].token, 1,
+        "the expiring lease was held with token 1"
+    );
 }
 
 /// Section 8.5: the fence stops every bound VM concurrently, inside one
@@ -667,7 +716,9 @@ async fn fencing_stops_all_bound_vms_concurrently() {
     let mut renew_at = None;
     let mut fenced_at = None;
     run_phase(&mut agent, &mut inbound, async {
-        primary.grant_expiring(EXPIRING_LEASE, APP, 1, 3000, None);
+        let (_confirmed, _sent) = primary
+            .grant_and_confirm(EXPIRING_LEASE, APP, 1, 3000)
+            .await;
         let (_id, at) = primary.recv_renew().await;
         renew_at = Some(at);
         let _event = event_of(primary.recv().await);
@@ -718,4 +769,141 @@ async fn a_renewal_carries_the_held_token() {
     let (_id, body) = observed.expect("a lease_renew");
     assert_eq!(body.lease_id, lease_id);
     assert_eq!(body.fencing_token, 1);
+}
+
+/// D-0074: a forced stop that cannot be confirmed emits `node.fence_failed`,
+/// never `node.fenced`, and marks the node failed until an operator clears it.
+#[tokio::test(start_paused = true)]
+async fn a_failed_forced_stop_emits_fence_failed_and_marks_the_node_failed() {
+    let engine = FakeEngine::new();
+    let store = MemoryLeaseStore::new();
+    let (mut primary, mut inbound, outbound) = pair();
+    let vm = running_vm(&engine, "vm_stuck", 2).await;
+    // The VMM survives every stop, including SIGKILL, and keeps running.
+    engine.set_unkillable(&vm, true);
+    let lease_id = lease(LOCAL_LEASE);
+    let mut agent = LeaseAgent::new(&engine, store.clone(), config(), outbound);
+    agent.bind_vm(lease_id.clone(), vm.clone());
+
+    let mut observed = None;
+    run_phase(&mut agent, &mut inbound, async {
+        primary.grant_local(LOCAL_LEASE, APP, 1);
+        settle().await;
+        let revoke = primary.revoke(LOCAL_LEASE, 1, RevokeReason::Moved);
+        let event = primary.recv().await;
+        let result = primary.recv().await;
+        settle().await;
+        observed = Some((revoke, event, result));
+    })
+    .await;
+
+    let (revoke, event, result) = observed.expect("the phase observed the failed fence");
+    let failed = fence_failed_of(event_of(event));
+    assert_eq!(failed.node_id, NODE);
+    assert_eq!(failed.app_ids, vec![APP.to_string()]);
+    assert_eq!(failed.lease_ids, vec![lease_id.clone()]);
+    assert_eq!(failed.vm_ids, vec![vm.0.clone()]);
+    assert_eq!(failed.reason, FenceReason::LeaseRevoked);
+    let error = failed.error.expect("the joined failure texts");
+    assert!(
+        error.contains("vm_stuck") && error.contains("SIGKILL"),
+        "the error names the VM and the failed kill, got {error:?}"
+    );
+    assert!(
+        primary.try_recv().is_none(),
+        "a failed fence emits no node.fenced"
+    );
+
+    let (answered, result) = command_result_of(result);
+    assert_eq!(answered, revoke, "the result answers the revoke");
+    assert_eq!(result.status, CommandStatus::Error);
+
+    assert_eq!(
+        engine.inspect(&vm).await.expect("inspect").state,
+        VmState::Running,
+        "the VM may still run"
+    );
+    let fences = store.fences();
+    assert_eq!(fences.len(), 1);
+    assert!(!fences[0].complete);
+    assert_eq!(fences[0].vm_ids, vec![vm.clone()]);
+    assert!(agent.is_failed());
+    assert!(store.node_failed());
+    assert!(!agent.may_start_stateful(&lease_id, 1));
+
+    // A higher-token grant re-holds the lease but cannot un-fail the node.
+    run_phase(&mut agent, &mut inbound, async {
+        primary.grant_local(LOCAL_LEASE, APP, 2);
+        settle().await;
+    })
+    .await;
+    assert_eq!(lease_state(&agent, &lease_id), LeaseState::Held);
+    assert!(agent.table().get(&lease_id).expect("the lease").token == 2);
+    assert!(
+        !agent.may_start_stateful(&lease_id, 2),
+        "nothing stateful starts on a failed node"
+    );
+
+    // The mark survives a restart: a new agent on the same store is failed.
+    let (_primary, _inbound, outbound) = pair();
+    let restarted = LeaseAgent::new(&engine, store.clone(), config(), outbound);
+    assert!(restarted.is_failed());
+    assert!(!restarted.may_start_stateful(&lease_id, 2));
+}
+
+/// D-0074: the expiring variant. Letting a confirmed lease expire on a VM that
+/// cannot be stopped reports `node.fence_failed` with reason `lease_expired`.
+#[tokio::test(start_paused = true)]
+async fn an_expiring_lease_that_cannot_be_stopped_reports_fence_failed() {
+    let engine = FakeEngine::new();
+    let store = MemoryLeaseStore::new();
+    let (mut primary, mut inbound, outbound) = pair();
+    let vm = running_vm(&engine, "vm_expiry_stuck", 2).await;
+    engine.set_unkillable(&vm, true);
+    let lease_id = lease(EXPIRING_LEASE);
+    let mut agent = LeaseAgent::new(&engine, store.clone(), config(), outbound);
+    agent.bind_vm(lease_id.clone(), vm.clone());
+
+    let t0 = Instant::now();
+    let mut observed = None;
+    let mut fenced_at = None;
+    run_phase(&mut agent, &mut inbound, async {
+        let (_confirmed, sent) = primary
+            .grant_and_confirm(EXPIRING_LEASE, APP, 1, 3000)
+            .await;
+        assert_eq!(sent, t0);
+        // The unanswered renewal at +1000 comes first.
+        let (_id, at) = primary.recv_renew().await;
+        assert_eq!(at - t0, millis(1000));
+        let event = primary.recv().await;
+        fenced_at = Some(Instant::now());
+        settle().await;
+        observed = Some(event_of(event));
+    })
+    .await;
+
+    let failed = fence_failed_of(observed.expect("a node.fence_failed event"));
+    assert_eq!(failed.reason, FenceReason::LeaseExpired);
+    assert_eq!(failed.lease_ids, vec![lease_id.clone()]);
+    assert_eq!(failed.vm_ids, vec![vm.0.clone()]);
+    assert_eq!(failed.app_ids, vec![APP.to_string()]);
+    assert!(failed.error.is_some());
+    assert!(
+        primary.try_recv().is_none(),
+        "a failed fence emits no node.fenced"
+    );
+    assert_eq!(
+        fenced_at.expect("a fence time") - t0,
+        millis(2000),
+        "the fence starts at valid_until"
+    );
+    assert_eq!(lease_state(&agent, &lease_id), LeaseState::Expired);
+    assert!(agent.is_failed());
+    assert!(store.node_failed());
+    assert_eq!(store.fences().len(), 1);
+    assert!(!store.fences()[0].complete);
+    assert_eq!(
+        engine.inspect(&vm).await.expect("inspect").state,
+        VmState::Running
+    );
 }

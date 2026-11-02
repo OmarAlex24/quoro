@@ -16,7 +16,8 @@ use quoro_engine::{
 use quoro_node_agent::{FenceTimers, LeaseAgent, LeaseAgentConfig, LeaseState, MemoryLeaseStore};
 use quoro_proto::{
     CommandResult, Envelope, FromNode, LeaseGrant, LeaseId, LeaseMode, LeaseRenew, LeaseRevoke,
-    MsgId, NodeEvent, ProtocolError, ResourceType, RevokeReason, ToNode,
+    MsgId, NodeEvent, NodeEventData, NodeFenceFailed, NodeFenced, ProtocolError, ResourceType,
+    RevokeReason, ToNode,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
@@ -198,8 +199,9 @@ impl Primary {
         }
     }
 
-    /// Answers the next `lease_renew` with a grant that carries the next token
-    /// (section 5.12 refuses a grant that is not higher).
+    /// Answers the next `lease_renew` with a grant that carries the same token
+    /// (D-0073: only an ownership change raises the token) and answers the
+    /// renewal with `re`.
     pub async fn answer_renewal(
         &mut self,
         lease: &str,
@@ -208,7 +210,35 @@ impl Primary {
         token: u64,
     ) -> (MsgId, Instant) {
         let (id, at) = self.recv_renew().await;
-        self.grant_expiring(lease, app, token + 1, duration_ms, Some(id.clone()));
+        self.grant_expiring(lease, app, token, duration_ms, Some(id.clone()));
+        (id, at)
+    }
+
+    /// Sends the first `expiring` grant and confirms it: the node asks for a
+    /// renewal at once (D-0072), and answering it with the same token is what
+    /// makes the lease `held` with `valid_until = t_send + D - M`.
+    ///
+    /// Returns the answered renewal's id and its send instant, which is the
+    /// `t_send` the lease's validity is based on.
+    pub async fn grant_and_confirm(
+        &mut self,
+        lease: &str,
+        app: &str,
+        token: u64,
+        duration_ms: u64,
+    ) -> (MsgId, Instant) {
+        self.grant_expiring(lease, app, token, duration_ms, None);
+        let message = self.recv().await;
+        let at = Instant::now();
+        let FromNode::LeaseRenew(envelope) = message else {
+            panic!("expected the immediate lease_renew, got {message:?}");
+        };
+        assert_eq!(
+            envelope.body.fencing_token, token,
+            "the immediate renewal echoes the granted token"
+        );
+        let id = envelope.id;
+        self.grant_expiring(lease, app, token, duration_ms, Some(id.clone()));
         (id, at)
     }
 
@@ -218,7 +248,7 @@ impl Primary {
         lease: &str,
         app: &str,
         duration_ms: u64,
-        mut token: u64,
+        token: u64,
         until: Instant,
     ) -> Option<(MsgId, Instant)> {
         let mut last = None;
@@ -234,7 +264,7 @@ impl Primary {
             match message {
                 FromNode::LeaseRenew(envelope) => {
                     let at = Instant::now();
-                    token += 1;
+                    // D-0073: a renewal answer keeps the token.
                     self.grant_expiring(lease, app, token, duration_ms, Some(envelope.id.clone()));
                     last = Some((envelope.id, at));
                 }
@@ -248,8 +278,8 @@ impl Primary {
 /// Runs one phase of the agent until the script is done, then sets the stop
 /// flag so the agent's loop returns.
 ///
-/// The agent and the script live in the same task: the engine's futures are
-/// not `Send`, so the agent cannot be spawned.
+/// The agent and the script run in the same task, so both share the paused test
+/// clock and the script can set the stop flag the agent is watching.
 pub async fn run_phase<F>(
     agent: &mut LeaseAgent<'_, FakeEngine, MemoryLeaseStore>,
     inbound: &mut mpsc::UnboundedReceiver<ToNode>,
@@ -315,6 +345,22 @@ pub fn event_of(message: FromNode) -> NodeEvent {
     match message {
         FromNode::Event(envelope) => envelope.body,
         other => panic!("expected event, got {other:?}"),
+    }
+}
+
+/// The `node.fenced` payload, or a panic naming the event that arrived.
+pub fn fenced_of(event: NodeEvent) -> NodeFenced {
+    match event.data {
+        NodeEventData::NodeFenced(fenced) => fenced,
+        other => panic!("expected node.fenced, got {other:?}"),
+    }
+}
+
+/// The `node.fence_failed` payload, or a panic naming the event that arrived.
+pub fn fence_failed_of(event: NodeEvent) -> NodeFenceFailed {
+    match event.data {
+        NodeEventData::NodeFenceFailed(failed) => failed,
+        other => panic!("expected node.fence_failed, got {other:?}"),
     }
 }
 

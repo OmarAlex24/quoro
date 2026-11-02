@@ -258,7 +258,7 @@ and needs the same scope as the matching endpoint (D-0031, `../contracts/README.
 | Id | S | Threat | Mitigation | Reference | Residual risk |
 | --- | --- | --- | --- | --- | --- |
 | T-LEASE-01 | T | Split brain: two nodes run the same stateful app and diverge | A stateful VM starts only while its node holds the app's lease in state `held` with the same `fencing_token` as the VM spec; every write to shared storage carries the token and receivers reject a lower one | D-0019, `../contracts/node-agent-protocol.md`, `docs/research/r2-conditional-writes.md` | Fencing depends on every receiver checking the token; a new shared resource added later must implement it |
-| T-LEASE-02 | T | An old lease holder keeps writing after losing the lease | The lease is expiring mode with a monotonic duration, and the node self-fences at `valid_until` | D-0019, `../contracts/node-agent-protocol.md` | A paused process can act between `valid_until` and the actual stop; the fencing token is what protects the data, not the timer |
+| T-LEASE-02 | T | An old lease holder keeps writing after losing the lease | The lease is expiring mode with a monotonic duration, and the node self-fences at `valid_until`; a failed forced stop never reports fenced (D-0074) | D-0019, `../contracts/node-agent-protocol.md` | A paused process can act between `valid_until` and the actual stop; the fencing token is what protects the data, not the timer |
 | T-LEASE-03 | D | The arbiter is unreachable and nodes treat it as lease loss, stopping apps needlessly | "Arbiter unreachable" maps to `uncertain`: keep running, start nothing new stateful, and fence only at `valid_until`; local-mode leases never expire because the control plane is gone | D-0047, D-0011, `docs/research/r2-conditional-writes.md` | A long arbiter outage (a 59 minute R2 outage is recorded) still fences every expiring lease eventually |
 | T-LEASE-04 | T | Clock drift between nodes makes a lease look valid after it expired | Durations are computed on the node's monotonic clock, with `margin = max(1000 ms, duration_ms / 10)`; the authority only regrants after `duration_ms + 2 * margin` | `../contracts/node-agent-protocol.md`; the drift bound itself is **Hypothesis** | The margin is a guess until measured on the lab; a large enough drift or a suspended VM breaks the arithmetic |
 | T-LEASE-05 | T | R2 answers 404 for a read while a conditional write is in flight, so a node believes it holds a lease it lost | Ambiguous outcomes are resolved with `If-None-Match: *` retries, and the fencing token, not the read result, decides what a shared resource accepts | `docs/research/r2-conditional-writes.md`, D-0019 | The negative-read window is a documented trap; the retry rule must be implemented, not assumed |
@@ -465,6 +465,7 @@ each names the threat it exercises.
 | Send a `desired_state` with `rev` lower than the stored one and confirm it is rejected | T-NODE-05 |
 | Revoke a local lease and confirm the node runs the self-fence path and emits `node.fenced` | T-LEASE-01 |
 | Expire a test-only short expiring lease and confirm the node fences before `valid_until + margin` | T-LEASE-10, T-LEASE-04 |
+| Make a forced stop fail during a fence and confirm the node emits `node.fence_failed`, not `node.fenced`, and starts no stateful VM | T-LEASE-01 |
 
 ### M1 — installer and engine
 
