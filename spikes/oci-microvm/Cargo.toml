@@ -1,0 +1,13 @@
+# Throwaway spike (issue #10). Its own workspace on purpose: it is NOT part of the
+# repository's cargo workspace. If a root workspace exists, it must list
+# "spikes/*" under `exclude`.
+[workspace]
+resolver = "2"
+members = ["init", "oci2rootfs"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
