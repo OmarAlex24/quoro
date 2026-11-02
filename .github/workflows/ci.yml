@@ -43,6 +43,35 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+  deny:
+    name: Dependencies (cargo-deny)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      # Pinned by version and by the sha256 of the release tarball, so a
+      # replaced or truncated download fails the check instead of running.
+      CARGO_DENY_VERSION: 0.20.2
+      CARGO_DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # cargo-deny reads the dependency graph through `cargo metadata`, so the
+      # toolchain pinned in rust-toolchain.toml has to be installed first.
+      - name: Toolchain
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal
+          rustup show active-toolchain
+      - name: Install cargo-deny
+        run: |
+          curl -fsSL --proto '=https' --tlsv1.2 -o "$RUNNER_TEMP/cargo-deny.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/$CARGO_DENY_VERSION/cargo-deny-$CARGO_DENY_VERSION-x86_64-unknown-linux-musl.tar.gz"
+          echo "$CARGO_DENY_SHA256  $RUNNER_TEMP/cargo-deny.tar.gz" | sha256sum -c -
+          tar xzf "$RUNNER_TEMP/cargo-deny.tar.gz" -C "$RUNNER_TEMP"
+      - name: Licenses, advisories, bans, sources
+        run: '"$RUNNER_TEMP/cargo-deny-$CARGO_DENY_VERSION-x86_64-unknown-linux-musl/cargo-deny" --all-features --locked check'
+
   contracts:
     name: Contracts
     runs-on: ubuntu-24.04
