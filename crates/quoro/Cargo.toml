@@ -64,6 +64,11 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 ] }
 # Polls the engine's `EventStream` with `std::future::poll_fn` (no `futures`).
 futures-core = { version = "0.3", default-features = false }
+# Compiles `panel/dist` into the binary (D-0056). Deterministic timestamps keep
+# the release build reproducible (ADR 0027); MIME types are mapped by hand.
+rust-embed = { version = "8", default-features = false, features = [
+    "deterministic-timestamps",
+] }
 # `quoro setup-token` refuses once an owner exists. The store exposes its pool
 # but no query helper, so the binary runs that one `SELECT` itself.
 sqlx = { version = "0.8", default-features = false, features = [

@@ -1,0 +1,45 @@
+{
+  "name": "quoro-panel",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Quoro web panel: setup, login and virtual machine control.",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "generate": "orval --config orval.config.ts",
+    "dev": "npm run generate && vite",
+    "dev:mock": "npm run generate && vite --mode mock",
+    "build": "npm run generate && tsc --noEmit && vite build",
+    "typecheck": "npm run generate && tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@fontsource-variable/archivo": "5.3.0",
+    "@radix-ui/react-dialog": "1.3.1",
+    "@radix-ui/react-select": "2.4.1",
+    "@radix-ui/react-slot": "1.5.0",
+    "@tanstack/react-query": "5.105.2",
+    "@tanstack/react-router": "1.170.46",
+    "class-variance-authority": "0.7.1",
+    "clsx": "2.1.1",
+    "lucide-react": "1.66.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "tailwind-merge": "3.7.0"
+  },
+  "devDependencies": {
+    "@faker-js/faker": "10.6.0",
+    "@tailwindcss/vite": "4.3.3",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.2.1",
+    "msw": "3.0.3",
+    "orval": "8.46.0",
+    "tailwindcss": "4.3.3",
+    "typescript": "5.9.3",
+    "vite": "8.3.5",
+    "vitest": "5.1.0"
+  }
+}

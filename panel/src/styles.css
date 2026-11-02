@@ -1,0 +1,218 @@
+@import 'tailwindcss';
+
+/*
+ * The machine-room chassis. Every colour in the panel comes from these tokens;
+ * the lamp palette encodes desired (outer ring) vs observed (core) state.
+ */
+@theme {
+  --font-sans: 'Archivo Variable', ui-sans-serif, system-ui, sans-serif;
+
+  --color-enamel: #dce1e5;
+  --color-panel: #f3f5f7;
+  --color-rail: #c5ccd3;
+  --color-recess: #cdd4da;
+
+  --color-ink: #142030;
+  --color-ink-muted: #5b6878;
+
+  --color-cobalt: #2643b5;
+  --color-cobalt-deep: #1a3290;
+
+  --color-lamp-run: #1f9d5a;
+  --color-lamp-shift: #e3a008;
+  --color-lamp-fault: #d0412f;
+  --color-lamp-idle: #9aa5b1;
+  --color-lamp-unknown: #6b5fa8;
+
+  --radius-bay: 6px;
+}
+
+@layer base {
+  html {
+    background-color: var(--color-enamel);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-size: 15px;
+    line-height: 1.5;
+    font-variation-settings:
+      'wdth' 100,
+      'wght' 400;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    margin: 0;
+    min-height: 100dvh;
+  }
+
+  ::selection {
+    background-color: var(--color-cobalt);
+    color: #fff;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-cobalt);
+    outline-offset: 2px;
+  }
+
+  input,
+  select,
+  button,
+  textarea {
+    font: inherit;
+    color: inherit;
+  }
+
+  h1,
+  h2,
+  h3,
+  p {
+    margin: 0;
+  }
+}
+
+@layer components {
+  /* Engraved plate lettering: expanded, heavy, spaced capitals. */
+  .type-display {
+    font-variation-settings:
+      'wdth' 125,
+      'wght' 750;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+
+  .type-display-light {
+    font-variation-settings:
+      'wdth' 125,
+      'wght' 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+
+  /* Data: semi-condensed, tabular figures, never a monospace face. */
+  .type-data {
+    font-variation-settings:
+      'wdth' 87,
+      'wght' 500;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.01em;
+  }
+
+  .type-body-medium {
+    font-variation-settings:
+      'wdth' 100,
+      'wght' 500;
+  }
+
+  .type-bay-title {
+    font-variation-settings:
+      'wdth' 112,
+      'wght' 650;
+    letter-spacing: 0.01em;
+  }
+
+  /* An engraved plate: a light edge above, a dark edge below. */
+  .nameplate {
+    text-shadow:
+      0 1px 0 rgb(255 255 255 / 0.75),
+      0 -1px 0 rgb(20 32 48 / 0.22);
+  }
+
+  .field {
+    height: 36px;
+    width: 100%;
+    border-radius: var(--radius-bay);
+    border: 1px solid var(--color-rail);
+    background-color: var(--color-panel);
+    padding: 0 10px;
+    font-size: 15px;
+    box-shadow: inset 0 1px 2px rgb(20 32 48 / 0.06);
+    transition:
+      border-color 120ms ease,
+      box-shadow 120ms ease;
+  }
+
+  .field:hover {
+    border-color: var(--color-ink-muted);
+  }
+
+  .field:focus-visible {
+    outline: 2px solid var(--color-cobalt);
+    outline-offset: 1px;
+    border-color: var(--color-cobalt);
+  }
+
+  .field[aria-invalid='true'] {
+    border-color: var(--color-lamp-fault);
+  }
+
+  .bay-shadow {
+    box-shadow:
+      0 1px 0 rgb(20 32 48 / 0.05),
+      inset 0 1px 0 rgb(255 255 255 / 0.6);
+  }
+
+  /* The lamp: still when desired and observed agree, a slow pulse while not. */
+  @keyframes lamp-pulse {
+    0%,
+    100% {
+      opacity: 1;
+      box-shadow:
+        0 0 0 1px var(--lamp-ring),
+        0 0 7px -1px var(--lamp-ring);
+    }
+    50% {
+      opacity: 0.55;
+      box-shadow:
+        0 0 0 1px var(--lamp-ring),
+        0 0 1px -1px var(--lamp-ring);
+    }
+  }
+
+  .lamp-pulse {
+    animation: lamp-pulse 1.9s ease-in-out infinite;
+  }
+
+  @keyframes dialog-fade {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+
+  @keyframes dialog-rise {
+    from {
+      opacity: 0;
+      transform: translate(-50%, -47%) scale(0.985);
+    }
+    to {
+      opacity: 1;
+      transform: translate(-50%, -50%) scale(1);
+    }
+  }
+
+  .dialog-overlay[data-state='open'] {
+    animation: dialog-fade 120ms ease-out;
+  }
+
+  .dialog-content[data-state='open'] {
+    animation: dialog-rise 140ms ease-out;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .lamp-pulse {
+      animation: none;
+    }
+
+    *,
+    *::before,
+    *::after {
+      transition-duration: 0.01ms !important;
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+    }
+  }
+}

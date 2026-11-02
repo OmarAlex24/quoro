@@ -1,6 +1,6 @@
 //! `quoro serve`: the HTTPS listener of D-0054 and the local node driver.
 //!
-//! One listener serves the API (and, from later milestones, the panel and MCP)
+//! One listener serves the API, the embedded panel (and, from later milestones, MCP)
 //! on a self-signed certificate. The engine is chosen here, with a `match` over
 //! [`EngineKind`], because the [`Engine`] trait is not object safe: adding the
 //! Cloud Hypervisor backend is one more arm of that match and nothing else.
@@ -98,7 +98,11 @@ async fn serve_with<E: Engine + 'static>(
         axum_server::tls_rustls::RustlsConfig::from_config(material.config),
     )
     .handle(handle)
-    .serve(router(state).into_make_service())
+    .serve(
+        router(state)
+            .fallback(crate::panel::serve)
+            .into_make_service(),
+    )
     .await
     .map_err(|e| format!("the listener stopped: {e}"))?;
 

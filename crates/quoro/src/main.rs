@@ -8,6 +8,7 @@
 
 mod config;
 mod local_node;
+mod panel;
 mod serve;
 mod tls;
 
