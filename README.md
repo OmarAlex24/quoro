@@ -14,4 +14,4 @@ Status: design stage — nothing to run yet.
 
 ## License
 
-AGPL-3.0, see [LICENSE](LICENSE).
+AGPL-3.0-only, see [LICENSE](LICENSE).

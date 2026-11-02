@@ -16,7 +16,7 @@ Terms used across Quoro's documents. Bracketed ids point to the decision ledger;
 
 **audit log**: An append-only, hash-chained record of every action, holding who, on behalf of whom, the triggering event, the tool or endpoint, the parameters, the result and the agent's stated justification. It can be copied off-site to S3/R2 with object lock, and MCP writes through the same service layer and the same log. [D-0031]
 
-**catalog**: Curated templates kept in the repository, pointing to pinned upstream images with verifiable signatures; Quoro runs no image registry of its own for now. Also: template. [D-0026]
+**catalog**: Curated templates kept in the repository, pointing to pinned upstream images with verifiable signatures; Quoro runs no image registry of its own for now. Its format, owner, location and signature scheme are decided at M4 planning, before the first template ships. Also: template. [D-0026, D-0070]
 
 **change log**: The numbered, append-only, hash-chained sequence of state changes that a replica node asks for ("give me everything after N") and verifies by hash. Also: state log. [D-0013, D-0015]
 
@@ -26,7 +26,7 @@ Terms used across Quoro's documents. Bracketed ids point to the decision ledger;
 
 **Cloud Hypervisor**: The Rust virtual machine monitor, driven through its HTTP/JSON API over a UNIX socket, that Quoro's engine builds on together with KVM. It is v54.0 under Apache-2.0 AND BSD-3-Clause; snapshots hold RAM and device state but not disks, with no incremental API; virtio-fs needs an external virtiofsd; consoles are text-only (serial, virtio-console), with no VNC or GPU; the host kernel must be 6.8 or newer (see `docs/research/cloud-hypervisor.md`; its "under 100 ms" boot claim is unbenchmarked and stays a **Hypothesis**). [D-0007]
 
-**cold**: HA policy where other nodes hold backups only, so RPO is the time since the last backup and RTO is a restore. No copy of the app runs elsewhere, so a failure means restoring from backup. Its cost is backup storage (inferred, pending Q-0025). [D-0020]
+**cold**: HA policy where other nodes hold backups only, so RPO is the time since the last backup and RTO is a restore. No copy of the app runs elsewhere, so a failure means restoring from backup. Its cost is backup storage and restore time (D-0068). [D-0020]
 
 **console**: A terminal in the panel for a microVM, text-only, rendered with xterm.js; there is no graphical console and no noVNC. [D-0056]
 
@@ -60,7 +60,7 @@ Terms used across Quoro's documents. Bracketed ids point to the decision ledger;
 
 **incident grant**: A grant with just the scopes needed for the incident that woke an agent, issued when an event wakes it and expiring automatically. [D-0030]
 
-**ingress**: The entry layer for app traffic: a reverse proxy with ACME for hosts with a public IP, Cloudflare Tunnel for hosts behind NAT, both behind a common interface; the proxy implementation is open (Q-0001). [D-0024]
+**ingress**: The entry layer for app traffic: a reverse proxy with ACME for hosts with a public IP, Cloudflare Tunnel for hosts behind NAT, both behind a common interface; the proxy is an embedded Rust proxy (hyper + rustls with an ACME client crate), with Caddy driven through its admin API kept as a fallback backend (D-0059). [D-0024, D-0059]
 
 **JIT approval**: See approval request. [D-0030]
 
@@ -72,17 +72,17 @@ Terms used across Quoro's documents. Bracketed ids point to the decision ledger;
 
 **majority**: See quorum. [D-0016, D-0017]
 
-**manual promotion**: The M5 action (M5a or M5b is open, Q-0024) that promotes a replica node to primary, either as a command or button or by an agent with human approval. [D-0016]
+**manual promotion**: The M5b action (D-0067) that promotes a replica node to primary, either as a command or button or by an agent with human approval. [D-0016, D-0067]
 
 **MCP**: Model Context Protocol server exposing Quoro to agents; it is first-class from day one and uses the same service layer and audit log as the HTTP API. [D-0002, D-0031]
 
-**mesh**: The WireGuard network connecting nodes across providers; its implementation is open (Q-0005). [D-0010]
+**mesh**: The WireGuard network connecting nodes across providers, configured by Quoro over netlink against kernel WireGuard with no `wg-quick`, per-node keypairs and peers in desired state (D-0063). [D-0010, D-0063]
 
 **microVM**: The unit of app isolation, one per app, booted with a minimal init; nodes run no Docker. [D-0008]
 
 **milestone**: A roadmap stage (M0, M1, M2, M3, M4, M5a, M5b, M6, then Later) that ends with a demo on the lab and the maintainer's approval before the next one starts. [D-0033, D-0036]
 
-**minimal init**: The small init process that boots inside a microVM in place of a full distribution init; how it is built or reused is open (Q-0003). [D-0008]
+**minimal init**: The small init process that boots inside a microVM in place of a full distribution init; Quoro writes its own minimal Rust init (D-0061). [D-0008, D-0061]
 
 **N+1 capacity indicator**: The panel answer to "if node A dies, do its apps fit on the others?", given as yes or as no plus what is missing, for example 6 GB of RAM. [D-0021]
 
@@ -90,9 +90,9 @@ Terms used across Quoro's documents. Bracketed ids point to the decision ledger;
 
 **node agent**: The per-node component that stores desired state locally, reconciles it, dials out to the control plane and self-fences when it loses its lease (for an `expiring` lease, only once it is `expired`). [D-0011, D-0019]
 
-**none**: HA policy where nothing runs on other nodes, so no resources are reserved elsewhere (inferred, pending Q-0025) and no RPO or RTO is promised for the app. [D-0020]
+**none**: HA policy where nothing runs on other nodes, so no resources are reserved elsewhere (D-0068) and no RPO or RTO is promised for the app. [D-0020]
 
-**OCI image**: The container image a deploy is built from; Quoro converts it into a root disk and boots it in a microVM, with the conversion path open (Q-0003). [D-0008]
+**OCI image**: The container image a deploy is built from; Quoro converts it into a root disk and boots it in a microVM, through its own OCI-to-ext4 pipeline with layer paths resolved inside the rootfs (D-0061). [D-0008, D-0061]
 
 **planned switchover**: A deliberate handover of an app to another node: wait for replication lag near zero and a low-traffic window, freeze writes briefly, do a final sync, move the lease, shift traffic at the load balancer and drain connections. It loses no data, unlike a surprise failure, which can lose seconds. Also: relevo, "relevo inteligente". [D-0022]
 
@@ -140,7 +140,7 @@ Terms used across Quoro's documents. Bracketed ids point to the decision ledger;
 
 **state log**: See change log. [D-0013, D-0015]
 
-**sync engine**: Quoro's own replication layer, made of control-plane log replication and the chunk engine for volumes; databases instead use their native replication, offered as catalog templates (Litestream 0.5 has no client-side encryption, so encrypted SQLite backups are an open option, Q-0026). [D-0023]
+**sync engine**: Quoro's own replication layer, made of control-plane log replication and the chunk engine for volumes; databases instead use their native replication, offered as catalog templates (Litestream 0.5 has no client-side encryption, so SQLite backups use Quoro's own chunk engine from consistent snapshots instead, D-0069; a Litestream-based lower-RPO backend may be added later as an option). [D-0023, D-0069]
 
 **telemetry**: App logs and metrics, which stay on each node and are queried through the primary on demand, with optional archive to S3/R2; only state is replicated. [D-0014]
 

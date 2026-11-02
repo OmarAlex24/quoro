@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # run.sh - boot a Cloud Hypervisor microVM from an ext4 rootfs built by
 # oci2rootfs and check the Quoro spike markers on the serial console.

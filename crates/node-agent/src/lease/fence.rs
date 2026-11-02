@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The self-fence stop of `docs/contracts/node-agent-protocol.md` section 8.5
 //! step 1: stop every stateful VM bound to a lost lease, within the margin.
 

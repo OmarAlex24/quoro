@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Shared test support: a sample spec and the generic conformance suite.
 //!
 //! Each integration-test binary compiles this module separately and uses a

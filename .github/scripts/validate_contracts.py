@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """Third-party validation of the machine-readable contracts.
 
 Usage: python3 -I .github/scripts/validate_contracts.py [repo_root]

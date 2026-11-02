@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Testable building blocks of `oci2rootfs`.
 //!
 //! Everything here is plain filesystem work: applying OCI layers with whiteout

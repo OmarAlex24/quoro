@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The `Engine` boundary behind which a virtual machine monitor sits.
 //!
 //! `docs/contracts/engine-trait.md` is the binding contract for every type and

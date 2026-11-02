@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # Build the spike init + oci2rootfs and turn an image into an ext4 root disk.
 #
 #   ./build-rootfs.sh <image-ref> <out.ext4> [extra oci2rootfs args...]

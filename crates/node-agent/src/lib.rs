@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The node agent: local store, reconciliation, the control-plane session and
 //! the lease state machine with self-fencing.
 //!

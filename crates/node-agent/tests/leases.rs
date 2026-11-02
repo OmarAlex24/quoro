@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The M0 lease tests of `docs/contracts/node-agent-protocol.md` section 8.7:
 //! a revoked `local` lease and an expired short `expiring` lease, both against
 //! the in-process primary and the `FakeEngine`.

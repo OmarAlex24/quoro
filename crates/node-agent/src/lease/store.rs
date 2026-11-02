@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! What the node must keep across an agent restart (section 8.5 step 2,
 //! section 12 `leases`).
 //!

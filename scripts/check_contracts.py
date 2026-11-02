@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """Standard-library consistency checks for docs/contracts.
 
 Usage: python3 scripts/check_contracts.py [repo_root]
