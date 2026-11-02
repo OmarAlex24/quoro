@@ -1,0 +1,514 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! What the init is told, and the Cloud Hypervisor configuration built from a
+//! spec (engine-trait.md §5, §6).
+//!
+//! Two pure builders live here. [`guest_config`] is the init's configuration:
+//! the guest contract of §6 as a [`GuestConfig`], validated by the same encoder
+//! the init uses, so a VM that would fail its boot is rejected at create time.
+//! [`vm_create_body`] is the JSON body of `PUT /api/v1/vm.create` for Cloud
+//! Hypervisor v54. Neither touches the host: the caller owns every path and
+//! device name, which keeps the mapping testable without KVM.
+
+use std::net::Ipv4Addr;
+use std::path::Path;
+use std::time::Duration;
+
+use quoro_init::{GuestConfig, LogConsole, NetConfig};
+use serde_json::{Value, json};
+
+use crate::ch::net::Subnet;
+use crate::ch::state::VmPaths;
+use crate::{ConsoleMode, EngineError, MacAddr, VmId, VmSpec};
+
+/// The longest `stop_timeout_ms` the init's grammar accepts: one day.
+const MAX_STOP_TIMEOUT_MS: u64 = 86_400_000;
+
+/// Largest hostname the init accepts.
+const MAX_HOSTNAME_CHARS: usize = 63;
+
+/// One megabyte in bytes, the unit of `memory.size` in the VMM API.
+const MIB: u64 = 1_048_576;
+
+/// The host paths a VM boots from.
+#[derive(Clone, Copy, Debug)]
+pub struct BootFiles<'a> {
+    /// The Quoro-provided guest kernel.
+    pub kernel: &'a Path,
+    /// The initramfs that carries `quoro-init`.
+    pub initramfs: &'a Path,
+    /// The prepared image, attached read-only.
+    pub rootfs: &'a Path,
+}
+
+/// The init's configuration for this VM (contract §6).
+///
+/// # Errors
+///
+/// `Conflict("VM <id> has no command: entrypoint and cmd are both empty")`
+/// when there is nothing to run, and
+/// `Conflict("invalid guest configuration: …")` when the configuration the
+/// spec implies would not encode — a bad user, workdir, hostname, environment
+/// name or network prefix.
+pub fn guest_config(
+    spec: &VmSpec,
+    subnet: &Subnet,
+    dns: &[Ipv4Addr],
+    stop_timeout: Duration,
+) -> Result<GuestConfig, EngineError> {
+    let mut args = spec.init.entrypoint.clone();
+    args.extend(spec.init.cmd.iter().cloned());
+    if args.is_empty() {
+        return Err(EngineError::Conflict(format!(
+            "VM {} has no command: entrypoint and cmd are both empty",
+            spec.id.0
+        )));
+    }
+
+    let config = GuestConfig {
+        args,
+        env: spec.init.env.clone(),
+        user: spec.init.user.clone(),
+        workdir: spec.init.workdir.clone(),
+        hostname: Some(hostname_for(&spec.id)),
+        log_console: match &spec.console {
+            ConsoleMode::VirtioConsole { .. } => LogConsole::Virtio,
+            ConsoleMode::Serial { .. } => LogConsole::Serial,
+            ConsoleMode::Off => LogConsole::None,
+        },
+        net: Some(NetConfig {
+            mac: spec.net.mac.0,
+            address: spec.net.ip,
+            prefix_len: subnet.prefix_len,
+            gateway: spec.net.gateway,
+        }),
+        dns: dns.to_vec(),
+        stop_timeout_ms: stop_timeout_ms(stop_timeout),
+    };
+    config
+        .encode()
+        .map_err(|err| EngineError::Conflict(format!("invalid guest configuration: {err}")))?;
+    Ok(config)
+}
+
+/// The stop timeout in milliseconds, saturating and capped at one day, so the
+/// init never rejects the configuration for it.
+fn stop_timeout_ms(timeout: Duration) -> u64 {
+    let millis = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+    millis.min(MAX_STOP_TIMEOUT_MS)
+}
+
+/// The VM id as a hostname: lowercase, `_` → `-`, anything outside
+/// `[a-z0-9-]` → `-`, trimmed of `-`, cut to 63 characters, `"vm"` if empty.
+///
+/// The result is trimmed of `-` again after the cut, so a truncation can never
+/// produce a hostname the init rejects for ending in `-`.
+#[must_use]
+pub fn hostname_for(id: &VmId) -> String {
+    let mapped: String =
+        id.0.chars()
+            .map(|character| {
+                let lower = character.to_ascii_lowercase();
+                if lower.is_ascii_lowercase() || lower.is_ascii_digit() || lower == '-' {
+                    lower
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+    let trimmed = mapped.trim_matches('-');
+    let cut: String = trimmed.chars().take(MAX_HOSTNAME_CHARS).collect();
+    let cut = cut.trim_end_matches('-');
+    if cut.is_empty() {
+        "vm".to_string()
+    } else {
+        cut.to_string()
+    }
+}
+
+/// Formats a MAC address the way the VMM API wants it.
+fn format_mac(mac: MacAddr) -> String {
+    let [a, b, c, d, e, f] = mac.0;
+    format!("{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}")
+}
+
+/// The body of `PUT /api/v1/vm.create` for Cloud Hypervisor v54 (contract §5).
+///
+/// All paths are used as given. `tap` is the TAP device the caller created on
+/// the node bridge. A `Serial` console becomes a socket and the serial log is
+/// not used; every other mode logs the serial port to `paths.serial_log` and
+/// attaches a virtio-console socket only for [`ConsoleMode::VirtioConsole`].
+#[must_use]
+pub fn vm_create_body(spec: &VmSpec, paths: &VmPaths, boot: &BootFiles<'_>, tap: &str) -> Value {
+    let serial = match &spec.console {
+        ConsoleMode::Serial { socket } => json!({"mode": "Socket", "socket": socket}),
+        ConsoleMode::Off | ConsoleMode::VirtioConsole { .. } => {
+            json!({"mode": "File", "file": paths.serial_log})
+        }
+    };
+    let console = match &spec.console {
+        ConsoleMode::VirtioConsole { socket } => json!({"mode": "Socket", "socket": socket}),
+        ConsoleMode::Off | ConsoleMode::Serial { .. } => json!({"mode": "Off"}),
+    };
+
+    json!({
+        "cpus": {"boot_vcpus": spec.vcpus, "max_vcpus": spec.vcpus},
+        "memory": {"size": u64::from(spec.memory_mb) * MIB},
+        "payload": {
+            "kernel": boot.kernel,
+            "initramfs": boot.initramfs,
+            "cmdline": crate::boot::kernel_cmdline(),
+        },
+        "disks": [
+            {
+                "id": "root",
+                "path": boot.rootfs,
+                "readonly": true,
+                "image_type": "Raw",
+                "serial": quoro_init::SERIAL_ROOT,
+            },
+            {
+                "id": "data",
+                "path": paths.data_disk,
+                "image_type": "Raw",
+                "serial": quoro_init::SERIAL_DATA,
+            },
+            {
+                "id": "config",
+                "path": paths.config_disk,
+                "image_type": "Raw",
+                "serial": quoro_init::SERIAL_CONFIG,
+            },
+        ],
+        "net": [{"id": "net0", "tap": tap, "mac": format_mac(spec.net.mac)}],
+        "serial": serial,
+        "console": console,
+        "rng": {"src": "/dev/urandom"},
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    use super::{BootFiles, guest_config, hostname_for, stop_timeout_ms, vm_create_body};
+    use crate::ch::net::Subnet;
+    use crate::ch::state::VmPaths;
+    use crate::{
+        ConsoleMode, EngineError, ImageDigest, InitConfig, MacAddr, NetAttach, VmId, VmSpec,
+        VolumeAttach, VolumeId,
+    };
+
+    fn subnet() -> Subnet {
+        Subnet {
+            network: "10.42.1.0".parse().expect("network"),
+            prefix_len: 24,
+        }
+    }
+
+    fn make_spec(console: ConsoleMode) -> VmSpec {
+        VmSpec {
+            id: VmId("vm_01HX8Z4Q2M9W7T3YV6B1C0D5EF".to_string()),
+            vcpus: 2,
+            memory_mb: 512,
+            rootfs: ImageDigest("sha256:bb".to_string()),
+            disk_gb: 1,
+            volumes: vec![VolumeAttach {
+                volume_id: VolumeId("vol_01HX8Z4Q2M9W7T3YV6B1C0D5EF".to_string()),
+                mount_path: "/data".to_string(),
+            }],
+            net: NetAttach {
+                ip: "10.42.1.7".parse().expect("ip"),
+                gateway: "10.42.1.1".parse().expect("gateway"),
+                mac: MacAddr([0x02, 0, 0, 0, 0, 1]),
+            },
+            init: InitConfig {
+                entrypoint: vec!["/app/server".to_string()],
+                cmd: vec!["--port".to_string(), "8080".to_string()],
+                env: vec![
+                    ("PORT".to_string(), "8080".to_string()),
+                    ("RUST_LOG".to_string(), "info".to_string()),
+                ],
+                user: Some("nobody:nogroup".to_string()),
+                workdir: Some("/app".to_string()),
+            },
+            console,
+        }
+    }
+
+    fn paths() -> VmPaths {
+        VmPaths::new(
+            Path::new("/var/lib/quoro/vms"),
+            &VmId("vm_01HX8Z4Q2M9W7T3YV6B1C0D5EF".to_string()),
+        )
+    }
+
+    fn boot() -> (PathBuf, PathBuf, PathBuf) {
+        (
+            PathBuf::from("/var/lib/quoro/kernel/vmlinux"),
+            PathBuf::from("/var/lib/quoro/boot/initramfs"),
+            PathBuf::from("/var/lib/quoro/images/sha256-bb/rootfs.img"),
+        )
+    }
+
+    #[test]
+    fn guest_config_maps_every_field() {
+        let spec = make_spec(ConsoleMode::VirtioConsole {
+            socket: PathBuf::from("/run/quoro/vm/console.sock"),
+        });
+        let config = guest_config(
+            &spec,
+            &subnet(),
+            &[
+                "1.1.1.1".parse().expect("dns"),
+                "9.9.9.9".parse().expect("dns"),
+            ],
+            Duration::from_secs(10),
+        )
+        .expect("guest config");
+
+        assert_eq!(
+            config.args,
+            vec![
+                "/app/server".to_string(),
+                "--port".to_string(),
+                "8080".to_string()
+            ]
+        );
+        assert_eq!(config.env, spec.init.env);
+        assert_eq!(config.user.as_deref(), Some("nobody:nogroup"));
+        assert_eq!(config.workdir.as_deref(), Some("/app"));
+        assert_eq!(
+            config.hostname.as_deref(),
+            Some("vm-01hx8z4q2m9w7t3yv6b1c0d5ef")
+        );
+        assert_eq!(config.log_console, quoro_init::LogConsole::Virtio);
+        let net = config.net.as_ref().expect("net");
+        assert_eq!(net.mac, [0x02, 0, 0, 0, 0, 1]);
+        assert_eq!(net.address, "10.42.1.7".parse::<Ipv4Addr>().expect("ip"));
+        assert_eq!(net.prefix_len, 24);
+        assert_eq!(
+            net.gateway,
+            "10.42.1.1".parse::<Ipv4Addr>().expect("gateway")
+        );
+        assert_eq!(
+            config.dns,
+            vec![
+                "1.1.1.1".parse::<Ipv4Addr>().expect("dns"),
+                "9.9.9.9".parse::<Ipv4Addr>().expect("dns")
+            ]
+        );
+        assert_eq!(config.stop_timeout_ms, 10_000);
+        assert!(config.encode().is_ok());
+    }
+
+    #[test]
+    fn guest_config_console_mapping() {
+        let off = guest_config(&make_spec(ConsoleMode::Off), &subnet(), &[], Duration::ZERO)
+            .expect("guest config");
+        assert_eq!(off.log_console, quoro_init::LogConsole::None);
+
+        let serial = guest_config(
+            &make_spec(ConsoleMode::Serial {
+                socket: PathBuf::from("/run/quoro/vm/serial.sock"),
+            }),
+            &subnet(),
+            &[],
+            Duration::ZERO,
+        )
+        .expect("guest config");
+        assert_eq!(serial.log_console, quoro_init::LogConsole::Serial);
+    }
+
+    #[test]
+    fn guest_config_rejects_an_empty_command() {
+        let mut spec = make_spec(ConsoleMode::Off);
+        spec.init.entrypoint.clear();
+        spec.init.cmd.clear();
+        match guest_config(&spec, &subnet(), &[], Duration::ZERO) {
+            Err(EngineError::Conflict(reason)) => assert_eq!(
+                reason,
+                "VM vm_01HX8Z4Q2M9W7T3YV6B1C0D5EF has no command: entrypoint and cmd are both empty"
+            ),
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn guest_config_with_only_a_cmd() {
+        let mut spec = make_spec(ConsoleMode::Off);
+        spec.init.entrypoint.clear();
+        let config = guest_config(&spec, &subnet(), &[], Duration::ZERO).expect("guest config");
+        assert_eq!(config.args, vec!["--port".to_string(), "8080".to_string()]);
+    }
+
+    #[test]
+    fn guest_config_reports_an_unencodable_configuration() {
+        let mut spec = make_spec(ConsoleMode::Off);
+        spec.init.user = Some("bad user".to_string());
+        match guest_config(&spec, &subnet(), &[], Duration::ZERO) {
+            Err(EngineError::Conflict(reason)) => {
+                assert!(
+                    reason.starts_with("invalid guest configuration: "),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+
+        // A workdir that is not absolute is rejected by the init's rules.
+        let mut spec = make_spec(ConsoleMode::Off);
+        spec.init.workdir = Some("relative".to_string());
+        assert!(matches!(
+            guest_config(&spec, &subnet(), &[], Duration::ZERO),
+            Err(EngineError::Conflict(reason))
+                if reason.starts_with("invalid guest configuration: ")
+        ));
+    }
+
+    #[test]
+    fn stop_timeout_is_saturating_and_capped() {
+        assert_eq!(stop_timeout_ms(Duration::ZERO), 0);
+        assert_eq!(stop_timeout_ms(Duration::from_millis(1500)), 1500);
+        assert_eq!(stop_timeout_ms(Duration::from_secs(86_401)), 86_400_000);
+        assert_eq!(stop_timeout_ms(Duration::MAX), 86_400_000);
+    }
+
+    #[test]
+    fn hostname_rules() {
+        assert_eq!(hostname_for(&VmId("vm_suite".to_string())), "vm-suite");
+        assert_eq!(
+            hostname_for(&VmId("VM_01HX8Z4Q2M9W7T3YV6B1C0D5EF".to_string())),
+            "vm-01hx8z4q2m9w7t3yv6b1c0d5ef"
+        );
+        assert_eq!(hostname_for(&VmId("__a.b__".to_string())), "a-b");
+        assert_eq!(hostname_for(&VmId("___".to_string())), "vm");
+        assert_eq!(hostname_for(&VmId(String::new())), "vm");
+        assert_eq!(hostname_for(&VmId("--a--".to_string())), "a");
+
+        let long = hostname_for(&VmId("a".repeat(80)));
+        assert_eq!(long.len(), 63);
+        assert!(long.chars().all(|c| c == 'a'));
+
+        // A cut that lands on '-' is trimmed, so the init accepts it.
+        let dashes = format!("{}-b", "a".repeat(63));
+        let cut = hostname_for(&VmId(dashes));
+        assert_eq!(cut, "a".repeat(63));
+        assert!(!cut.ends_with('-'));
+    }
+
+    #[test]
+    fn create_body_for_off() {
+        let spec = make_spec(ConsoleMode::Off);
+        let paths = paths();
+        let (kernel, initramfs, rootfs) = boot();
+        let body = vm_create_body(
+            &spec,
+            &paths,
+            &BootFiles {
+                kernel: &kernel,
+                initramfs: &initramfs,
+                rootfs: &rootfs,
+            },
+            "tap0",
+        );
+
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "cpus": {"boot_vcpus": 2, "max_vcpus": 2},
+                "memory": {"size": 536_870_912_u64},
+                "payload": {
+                    "kernel": "/var/lib/quoro/kernel/vmlinux",
+                    "initramfs": "/var/lib/quoro/boot/initramfs",
+                    "cmdline": crate::boot::kernel_cmdline(),
+                },
+                "disks": [
+                    {
+                        "id": "root",
+                        "path": "/var/lib/quoro/images/sha256-bb/rootfs.img",
+                        "readonly": true,
+                        "image_type": "Raw",
+                        "serial": "quoro-root",
+                    },
+                    {
+                        "id": "data",
+                        "path": "/var/lib/quoro/vms/vm_01HX8Z4Q2M9W7T3YV6B1C0D5EF/data.img",
+                        "image_type": "Raw",
+                        "serial": "quoro-data",
+                    },
+                    {
+                        "id": "config",
+                        "path": "/var/lib/quoro/vms/vm_01HX8Z4Q2M9W7T3YV6B1C0D5EF/config.img",
+                        "image_type": "Raw",
+                        "serial": "quoro-config",
+                    },
+                ],
+                "net": [{"id": "net0", "tap": "tap0", "mac": "02:00:00:00:00:01"}],
+                "serial": {
+                    "mode": "File",
+                    "file": "/var/lib/quoro/vms/vm_01HX8Z4Q2M9W7T3YV6B1C0D5EF/serial.log",
+                },
+                "console": {"mode": "Off"},
+                "rng": {"src": "/dev/urandom"},
+            })
+        );
+    }
+
+    #[test]
+    fn create_body_for_serial() {
+        let console = ConsoleMode::Serial {
+            socket: PathBuf::from("/run/quoro/vm/serial.sock"),
+        };
+        let paths = paths();
+        let (kernel, initramfs, rootfs) = boot();
+        let body = vm_create_body(
+            &make_spec(console),
+            &paths,
+            &BootFiles {
+                kernel: &kernel,
+                initramfs: &initramfs,
+                rootfs: &rootfs,
+            },
+            "tap7",
+        );
+        assert_eq!(
+            body["serial"],
+            serde_json::json!({"mode": "Socket", "socket": "/run/quoro/vm/serial.sock"})
+        );
+        assert_eq!(body["console"], serde_json::json!({"mode": "Off"}));
+        assert_eq!(body["net"][0]["tap"], "tap7");
+    }
+
+    #[test]
+    fn create_body_for_virtio_console() {
+        let console = ConsoleMode::VirtioConsole {
+            socket: PathBuf::from("/run/quoro/vm/console.sock"),
+        };
+        let paths = paths();
+        let (kernel, initramfs, rootfs) = boot();
+        let body = vm_create_body(
+            &make_spec(console),
+            &paths,
+            &BootFiles {
+                kernel: &kernel,
+                initramfs: &initramfs,
+                rootfs: &rootfs,
+            },
+            "tap1",
+        );
+        assert_eq!(
+            body["console"],
+            serde_json::json!({"mode": "Socket", "socket": "/run/quoro/vm/console.sock"})
+        );
+        assert_eq!(
+            body["serial"],
+            serde_json::json!({
+                "mode": "File",
+                "file": "/var/lib/quoro/vms/vm_01HX8Z4Q2M9W7T3YV6B1C0D5EF/serial.log",
+            })
+        );
+        assert_eq!(body["memory"]["size"], 536_870_912_u64);
+    }
+}
