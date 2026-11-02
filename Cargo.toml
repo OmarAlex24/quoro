@@ -22,3 +22,12 @@ license = "AGPL-3.0-only"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+# Dev and test builds keep line tables for our crates (readable backtraces) and
+# no debug info for dependencies: target/ shrinks by more than half and links
+# faster. Release builds are not affected.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
