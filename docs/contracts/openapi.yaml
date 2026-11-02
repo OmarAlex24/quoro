@@ -1139,7 +1139,7 @@ components:
           description: Memory in mebibytes.
         disk_gb:
           type: integer
-          minimum: 0
+          minimum: 1
           description: Root disk in gibibytes.
         image:
           type: string
@@ -1239,7 +1239,7 @@ components:
           description: Memory in mebibytes.
         disk_gb:
           type: integer
-          minimum: 0
+          minimum: 1
           description: Root disk in gibibytes.
         image:
           type: string
