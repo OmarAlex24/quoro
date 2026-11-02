@@ -1,6 +1,10 @@
 # Release builds. GitHub-hosted runners only: a self-hosted runner would put
-# the signing identity and the release bytes on a machine we do not control,
-# and it would break the reproducibility claim (the toolchain must match).
+# the signing identity and the release bytes on a machine we do not control.
+#
+# The build itself runs in the release build image (ADR 0090,
+# packaging/container/Containerfile) through packaging/build-in-container.sh,
+# the same script packaging/reproduce-release.sh uses, so the runner's own
+# compilers and packages never reach the release bytes.
 #
 # A tag push creates a DRAFT release. The maintainer reviews the artifacts and
 # publishes it; nothing here publishes on its own.
@@ -36,37 +40,19 @@ jobs:
       contents: write
       id-token: write
       attestations: write
+    env:
+      # Docker is preinstalled on the runner; reproduce-release.sh prefers
+      # podman. Both run the same image.
+      QUORO_CONTAINER_ENGINE: docker
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # musl-gcc is what a future C dependency (bundled SQLite) would use; the
-      # build script picks it up when it is on PATH.
-      - name: Install musl toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends musl-tools
-
-      # rustup is preinstalled on the runner; install exactly the toolchain
-      # pinned in rust-toolchain.toml before anything calls cargo.
-      - name: Toolchain
-        run: |
-          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
-          rustup toolchain install "$channel" --profile minimal
-          rustup show active-toolchain
-
-      # The panel is compiled into the binary, so its toolchain is a build input
-      # too (ADR 0027). Fetch the Node.js pinned in packaging/node.txt and put it
-      # first on PATH instead of trusting whatever the runner ships.
-      - name: Pinned Node.js
-        run: |
-          set -euo pipefail
-          node_bin="$(packaging/fetch-node.sh "$RUNNER_TEMP/node")"
-          printf 'node bin: %s\n' "$node_bin"
-          printf '%s\n' "$node_bin" >>"$GITHUB_PATH"
-
+      # The Rust toolchain, Node.js, the C compiler and musl all come from the
+      # release build image; the first build-in-container.sh call builds it.
+      #
       # On a tag push the tag and the Cargo version must agree, otherwise the
       # artifact name (which carries the tag version) would lie about the
       # binary. A dry run has no tag: the Cargo version names the artifact and
@@ -79,10 +65,7 @@ jobs:
         run: |
           set -euo pipefail
           package="${QUORO_PACKAGE:-quoro}"
-          cargo_version="$(
-            cargo metadata --format-version 1 --no-deps --locked |
-              python3 -I -c 'import json,sys; p=sys.argv[1]; ms=[x["version"] for x in json.load(sys.stdin)["packages"] if x["name"]==p]; print(ms[0] if ms else sys.exit("package not found in cargo metadata: "+p))' "$package"
-          )"
+          cargo_version="$(packaging/build-in-container.sh --print-version)"
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             version=$cargo_version
             dry_run=true
@@ -107,7 +90,7 @@ jobs:
       - name: Build release artifacts
         env:
           VERSION: ${{ steps.version.outputs.version }}
-        run: packaging/build-release.sh "$VERSION"
+        run: packaging/build-in-container.sh "$VERSION"
 
       - name: Attest build provenance
         id: attest

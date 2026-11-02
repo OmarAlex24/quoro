@@ -1,0 +1,102 @@
+# The release build image (ADR 0090). Release builds in CI and every
+# packaging/reproduce-release.sh rebuild run packaging/build-release.sh inside
+# an image built from this file, so the C compiler, binutils, musl, git, tar and
+# gzip are the same bytes on every host. Rust and Node.js stay pinned by
+# rust-toolchain.toml and packaging/node.txt and are installed here.
+#
+# Every input is pinned:
+#   - the base image by its linux/amd64 manifest digest;
+#   - apt packages through snapshot.ubuntu.com at a fixed timestamp, and every
+#     package installed by name at an exact version, so the dependency closure
+#     is fixed too;
+#   - rustup-init by version and sha256;
+#   - the Rust toolchain by rust-toolchain.toml, the Node.js tarball by
+#     packaging/node.txt (sha256-verified by packaging/fetch-node.sh).
+#
+# Bumping any pin changes the release bytes: do it in its own pull request and
+# update the "Tooling outside Cargo" table in DEPENDENCIES.md.
+#
+# packaging/build-in-container.sh builds this image from a context that holds
+# only this file, rust-toolchain.toml, packaging/node.txt and
+# packaging/fetch-node.sh.
+FROM docker.io/library/ubuntu:24.04@sha256:78d4744ead1f5b19b04d0df558ab182a5300903900755e515b2ca4d10eb2044d
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LC_ALL=C \
+    TZ=UTC
+
+# apt from the Ubuntu snapshot service at one fixed timestamp.
+#
+# snapshot.ubuntu.com is HTTPS-only and the base image has no CA bundle, so the
+# first update and the ca-certificates install skip TLS peer verification.
+# apt still checks the InRelease signature against the Ubuntu archive key in
+# the base image and every .deb against the signed index. What an unverified
+# TLS hop could do is serve a different (validly signed) snapshot; pinning
+# ca-certificates to an exact version keeps that from changing what gets
+# installed. Peer verification is back on for every step after it: the second
+# update refetches the indexes from the pinned snapshot over verified TLS.
+RUN set -eu; \
+    rm -f /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; \
+    printf '%s\n' \
+        'Types: deb' \
+        'URIs: https://snapshot.ubuntu.com/ubuntu/20261102T000000Z' \
+        'Suites: noble noble-updates noble-security' \
+        'Components: main universe' \
+        'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' \
+        >/etc/apt/sources.list.d/snapshot.sources; \
+    apt-get -o Acquire::https::Verify-Peer=false update; \
+    apt-get -o Acquire::https::Verify-Peer=false install -y --no-install-recommends \
+        ca-certificates=20260816ubuntu0.24.04.1; \
+    rm -rf /var/lib/apt/lists/*; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        binutils=2.42-4ubuntu2.10 \
+        ca-certificates=20260816ubuntu0.24.04.1 \
+        curl=8.5.0-2ubuntu10.16 \
+        gcc=4:13.2.0-7ubuntu1 \
+        gcc-13=13.3.0-6ubuntu2~24.04.1 \
+        git=1:2.43.0-1ubuntu7.4 \
+        libc6-dev=2.39-0ubuntu8.9 \
+        musl=1.2.4-2 \
+        musl-dev=1.2.4-2 \
+        musl-tools=1.2.4-2 \
+        python3=3.12.3-0ubuntu2.1 \
+        xz-utils=5.6.1+really5.4.5-1ubuntu0.4; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*
+
+# Rust: rustup-init pinned by version and sha256, then exactly the toolchain,
+# profile and components that rust-toolchain.toml names, plus the musl target.
+# The proxies live in /opt/rust/cargo/bin; build-in-container.sh points
+# CARGO_HOME at a per-checkout cache at run time, which the proxies do not need.
+ENV RUSTUP_HOME=/opt/rust/rustup \
+    CARGO_HOME=/opt/rust/cargo \
+    PATH=/opt/node/current/bin:/opt/rust/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+COPY rust-toolchain.toml /opt/quoro/rust-toolchain.toml
+RUN set -eu; \
+    cd /opt/quoro; \
+    curl -fsSL --proto '=https' --tlsv1.2 -o rustup-init \
+        https://static.rust-lang.org/rustup/archive/1.29.2/x86_64-unknown-linux-gnu/rustup-init; \
+    echo '5be191e8c70a5007074254cb74d78dbfdd25cd5a61c27de7b8e5410122ec24f4  rustup-init' | sha256sum -c -; \
+    chmod 0755 rustup-init; \
+    ./rustup-init -y --no-modify-path --profile minimal --default-toolchain none; \
+    rm -f rustup-init; \
+    rustup set auto-self-update disable; \
+    rustup toolchain install; \
+    rustup target add x86_64-unknown-linux-musl; \
+    rustc -vV; \
+    rm -rf /opt/rust/cargo/registry /opt/rust/rustup/downloads /opt/rust/rustup/tmp
+
+# Node.js for the panel build, verified against packaging/node.txt.
+COPY node.txt fetch-node.sh /opt/quoro/packaging/
+RUN set -eu; \
+    node_bin=$(sh /opt/quoro/packaging/fetch-node.sh /opt/node); \
+    ln -s "$(dirname "$node_bin")" /opt/node/current; \
+    node --version
+
+# packaging/build-release.sh looks for this file: a build without it is not a
+# release build.
+RUN printf '%s\n' 'quoro release build image (packaging/container/Containerfile, ADR 0090)' \
+    >/etc/quoro-release-build
+
+WORKDIR /build/quoro

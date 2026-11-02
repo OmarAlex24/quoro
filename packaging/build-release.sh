@@ -2,16 +2,25 @@
 # Build the release artifact for one version: a static musl binary tarball and
 # its SHA256SUMS. The build is reproducible: every input that can leak into
 # the bytes (clock, paths, locale, archive metadata, toolchain flags) is
-# pinned here. See packaging/README.md and ADR 0027.
+# pinned here, and the build environment itself (C compiler, binutils, musl)
+# is pinned by the release build image. Release builds run this script through
+# packaging/build-in-container.sh. See packaging/README.md, ADR 0027 and
+# ADR 0090.
 set -eu
 
 usage() {
 	cat <<'EOF'
 usage: packaging/build-release.sh [VERSION]
+       packaging/build-release.sh --print-version
 
 Builds dist/quoro-VERSION-x86_64-unknown-linux-musl.tar.gz and dist/SHA256SUMS
 from the current checkout. VERSION defaults to the version of the Cargo
-package named by QUORO_PACKAGE (default: quoro).
+package named by QUORO_PACKAGE (default: quoro). --print-version prints that
+default on stdout and exits without building.
+
+A release build runs inside the release build image: use
+packaging/build-in-container.sh, which takes the same arguments. Run directly
+on a host, the result works but does not match the published bytes.
 
 Environment:
   QUORO_PACKAGE      Cargo package to build (default: quoro)
@@ -36,10 +45,19 @@ note() {
 	printf '%s\n' "$*" >&2
 }
 
+print_version=0
 case "${1:-}" in
 -h | --help)
 	usage
 	exit 0
+	;;
+--print-version)
+	print_version=1
+	shift
+	;;
+-*)
+	usage >&2
+	exit 2
 	;;
 esac
 
@@ -58,6 +76,11 @@ umask 022
 
 QUORO_PACKAGE="${QUORO_PACKAGE:-quoro}"
 [ -n "$QUORO_PACKAGE" ] || die "QUORO_PACKAGE is empty"
+
+if [ "$print_version" = "1" ] && [ "$#" -ne 0 ]; then
+	usage >&2
+	exit 2
+fi
 
 if [ "$#" -eq 1 ]; then
 	version=$1
@@ -95,6 +118,22 @@ case "$version" in
 	die "VERSION contains characters that are unsafe in a file name: $version"
 	;;
 esac
+
+if [ "$print_version" = "1" ]; then
+	printf '%s\n' "$version"
+	exit 0
+fi
+
+# The release build image (packaging/container/Containerfile) pins the C
+# compiler, binutils and musl, which reach the binary through C dependencies.
+# Outside it the build still works, but its bytes depend on the host.
+release_image=0
+if [ -f /etc/quoro-release-build ]; then
+	release_image=1
+	note "build environment: $(cat /etc/quoro-release-build) ${QUORO_BUILD_IMAGE:-}"
+else
+	note "warning: not running in the release build image; the result will NOT match the published release (use packaging/build-in-container.sh)"
+fi
 
 # A release must be built from exactly the tree that the tag points at.
 status=$(git status --porcelain) || die "cannot read the git status"
@@ -168,8 +207,15 @@ fi
 channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
 [ -n "$channel" ] || die "cannot read channel from rust-toolchain.toml"
 
-rustup toolchain install "$channel" --profile minimal
-rustup target add --toolchain "$channel" x86_64-unknown-linux-musl
+# The release build image already carries the toolchain and the musl target;
+# install them only when they are missing (a host build), so the image's
+# toolchain directory is never written to.
+if ! rustup toolchain list | grep -q "^$channel-"; then
+	rustup toolchain install "$channel" --profile minimal
+fi
+if ! rustup target list --installed --toolchain "$channel" | grep -qx x86_64-unknown-linux-musl; then
+	rustup target add --toolchain "$channel" x86_64-unknown-linux-musl
+fi
 rustc +"$channel" -vV
 
 # Deterministic rustc/cargo behaviour.
@@ -195,8 +241,12 @@ unset RUSTC_WRAPPER
 # commands just like RUSTC_WRAPPER does.
 unset RUSTC_WORKSPACE_WRAPPER
 
-# C code (a bundled SQLite later on) is compiled by the host C compiler, so
-# pin it to musl-gcc and strip the build paths from its debug info as well.
+# C code (ring, aws-lc, the bundled SQLite) is compiled by the C compiler of
+# the build environment, so pin it to musl-gcc and strip the build paths from
+# its debug info as well. The release build image always has musl-gcc.
+if [ "$release_image" = "1" ] && ! command -v musl-gcc >/dev/null 2>&1; then
+	die "musl-gcc is missing from the release build image"
+fi
 if command -v musl-gcc >/dev/null 2>&1; then
 	CC_x86_64_unknown_linux_musl=musl-gcc
 	CFLAGS_x86_64_unknown_linux_musl="-ffile-prefix-map=$PWD=/build/quoro -ffile-prefix-map=$CARGO_HOME=/build/cargo"
