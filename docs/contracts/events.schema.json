@@ -305,7 +305,7 @@
 
     "data_node_fence_failed": {
       "type": "object",
-      "description": "A node could not confirm that a fence stopped every stateful VM bound to a lost lease, so a VM may still be running; the node marked itself failed and the lease stays unstartable until an operator acknowledges the fence (D-0074). Payload fields are additive within schema_version 1.",
+      "description": "A node could not confirm that a fence stopped every stateful VM bound to a lost lease, so a VM may still be running; the node marked itself failed and the lease stays unstartable until an operator acknowledges the fence with POST /api/v1/nodes/{node_id}/fence-ack (D-0074, D-0079). Payload fields are additive within schema_version 1.",
       "required": ["node_id", "app_ids", "lease_ids", "vm_ids", "reason"],
       "properties": {
         "node_id": { "$ref": "#/$defs/NodeId" },

@@ -161,6 +161,8 @@ node agent                                          primary
     |<---------------------------------------- welcome  |
     |<----------------------------------- lease_revoke  |  0..n stale or superseded leases
     |-- command_result ------------------------------>|
+    |<----------------------------- command fence_ack  |  0..1 when an acknowledgement is pending
+    |-- command_result ------------------------------>|
     |<---------------------------------- desired_state |
     |-- command_result (stored) --------------------->|
     |<----------------------------------- log_entries  |
@@ -184,9 +186,10 @@ node agent                                          primary
 1. `hello` is the first message the node sends on every session.
 2. `welcome` is the first message the primary sends.
 3. The primary sends any `lease_revoke` before anything else. The node stops the stateful VMs bound to those leases and answers `command_result` for each revoke before it processes the next message.
-4. Only then does the primary send `desired_state`. The node verifies, persists, answers `command_result` with `ok`, and reconciles.
-5. `log_entries` follow the desired state; the node acknowledges with `log_ack` as it verifies the chain.
-6. Steady state begins: `heartbeat` every 5 s, `status_report` on any observed change and at least every 30 s, `event` whenever something happens, streams on demand.
+4. If an operator acknowledged a failed fence of this node and the node has not yet confirmed it, the primary then sends `command` kind `fence_ack` (sections 5.17 and 8.5) and waits for its `command_result`.
+5. Only then does the primary send `desired_state`. The node verifies, persists, answers `command_result` with `ok`, and reconciles.
+6. `log_entries` follow the desired state; the node acknowledges with `log_ack` as it verifies the chain.
+7. Steady state begins: `heartbeat` every 5 s, `status_report` on any observed change and at least every 30 s, `event` whenever something happens, streams on demand.
 
 ### 4.3 Timers
 
@@ -499,7 +502,7 @@ The primary closes the matching API or panel consumer. `cancelled` is the answer
 | `detail` | string | no | Short human-readable detail |
 | `error` | object | no | `{ "code": ..., "message": ... }` using the `error` codes in section 5.18 |
 
-`re` identifies the message being answered. For `desired_state` the answer means **stored**: the signature was verified and the snapshot was persisted atomically. It does not mean applied — that is `applied_rev` in `status_report`. For `lease_revoke` the answer means the stateful VMs bound to the lease are stopped and recorded.
+`re` identifies the message being answered. For `desired_state` the answer means **stored**: the signature was verified and the snapshot was persisted atomically. It does not mean applied — that is `applied_rev` in `status_report`. For `lease_revoke` the answer means the stateful VMs bound to the lease are stopped and recorded. A `lease_revoke` whose self-fence could not confirm that every bound VM stopped is answered with `status: error` and `error.code` `fence_failed` (sections 5.18 and 8.5); `detail` names the VMs that may still run.
 
 ```json
 {
@@ -508,6 +511,25 @@ The primary closes the matching API or panel consumer. `cancelled` is the answer
   "id": "msg_01JC9ZG6K1W3Y5A7C9E1G3J5M7",
   "re": "msg_01JC9ZF9W2M4P6R8T0V2X4Z6B8",
   "body": { "status": "ok", "detail": "stored rev 412" }
+}
+```
+
+A `lease_revoke` whose fence failed:
+
+```json
+{
+  "v": 1,
+  "type": "command_result",
+  "id": "msg_01JC9ZG7M2X4Z6B8D0F2H4K6N8",
+  "re": "msg_01JC9ZF0X3N5Q7S9V1W3Y5A7C9",
+  "body": {
+    "status": "error",
+    "detail": "vm_01JC9Z7C4P6R8T0V2X4Z6B8D0F neither stopped nor gone after the forced stop",
+    "error": {
+      "code": "fence_failed",
+      "message": "self-fence of lse_01JC9Z8K2M4P6R8T0V2X4Z6B8D could not confirm every bound VM stopped"
+    }
+  }
 }
 ```
 
@@ -800,12 +822,14 @@ The node stops producing, releases the stream slot, and answers `stream_end` wit
 
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
-| `kind` | string | yes | `logs_query` or `probe` in v1 |
+| `kind` | string | yes | `logs_query`, `probe` or `fence_ack` in v1 |
 | `params` | object | yes | Kind-specific parameters |
 
 `logs_query` params: `app_id` or `vm_id` (exactly one), `since` (RFC 3339, optional), `until` (RFC 3339, optional), `tail` (integer, optional). The answer is a `command_result` carrying the lines, then `status: ok`.
 
 `probe` params: `{}`. The node re-runs the KVM probe (`/dev/kvm`, CPU flags, kernel release) and answers with a `command_result` whose `detail` summarizes it; the primary updates the node's `kvm` record and `engine_version`.
+
+`fence_ack` params: `lease_ids` (array of `lse_` ids, at least one). It carries an operator's acknowledgement of failed fences, recorded through `POST /api/v1/nodes/{node_id}/fence-ack` (section 8.5). The node clears the failed fence it recorded for each listed lease, and clears its failed mark once no failed fence remains. It answers `command_result` with `status: ok`; when failed fences of other leases remain, the node stays failed and `detail` names them. A listed lease with no recorded failed fence is not an error, so a redelivered `fence_ack` is harmless. The listed leases stay `revoked` or `expired` on the node: it starts nothing stateful for them until a `lease_grant` arrives with a higher `fencing_token` (section 8.5 step 4).
 
 Restarts and stops are **never** commands. They are changes of desired state — `restart_generation` for a restart, `desired_status` for a stop — so they are idempotent, survive a reconnect, and cannot be lost with a dropped message (D-0011).
 
@@ -820,6 +844,20 @@ Restarts and stops are **never** commands. They are changes of desired state —
       "vm_id": "vm_01JC9Z7C4P6R8T0V2X4Z6B8D0F",
       "since": "2026-11-02T10:00:00Z",
       "tail": 200
+    }
+  }
+}
+```
+
+```json
+{
+  "v": 1,
+  "type": "command",
+  "id": "msg_01JC9ZR5V0J5M7P9R1T3W5Y7A9",
+  "body": {
+    "kind": "fence_ack",
+    "params": {
+      "lease_ids": ["lse_01JC9Z8K2M4P6R8T0V2X4Z6B8D"]
     }
   }
 }
@@ -845,6 +883,7 @@ Restarts and stops are **never** commands. They are changes of desired state —
 | `bad_signature` | no | A `desired_state` or `signing_key_rotate` signature did not verify; the message was discarded |
 | `bad_message` | no | Malformed frame, unknown type, unknown command kind, oversized frame |
 | `log_diverged` | no | The node's change-log copy does not match the primary's (section 7) |
+| `fence_failed` | no | A self-fence could not confirm that every stateful VM bound to the lease stopped, so a VM may still run (section 8.5). Carried in the `error` of the `command_result` that answers a `lease_revoke`; the node has marked itself failed |
 
 A fatal error ends the session immediately; the node applies its redial rule (section 4.4). A non-fatal error leaves the session usable.
 
@@ -1100,7 +1139,15 @@ When a lease reaches `expired` or `revoked`, the node:
 
 The node also emits `node.fenced` when an operator declaration invalidated its token without a message reaching it — it learns that when the primary refuses its next `lease_renew` or when a `hello` is answered with a `lease_revoke`.
 
-**Failed fence.** If a forced stop fails or times out and the node cannot confirm the VM stopped (the engine reports it neither stopped nor gone), the VM may still be running. The node then never emits `node.fenced` for that fence; it records the failed fence locally, emits `node.fence_failed` with the lease, the apps and the VM ids that may still run, marks itself failed in its local store (`node_meta`, section 12) so the mark survives an agent restart, starts no stateful VM for any lease while failed, and answers a `lease_revoke` with `command_result` status `error`. The lease stays unstartable on this node. The primary treats `node.fence_failed` like the loss of the node: it does not grant the lease to anyone else until an operator acknowledges the fence, as when declaring a node lost (section 8.3) (D-0074). Clearing the failed mark is an operator action on the node; its command arrives with a later contract change.
+**Failed fence.** If a forced stop fails or times out and the node cannot confirm the VM stopped (the engine reports it neither stopped nor gone), the VM may still be running. The node then never emits `node.fenced` for that fence; it records the failed fence locally, emits `node.fence_failed` with the lease, the apps and the VM ids that may still run, marks itself failed in its local store (`node_meta`, section 12) so the mark survives an agent restart, starts no stateful VM for any lease while failed, and answers a `lease_revoke` with `command_result` status `error` and error code `fence_failed` (section 5.18). The lease stays unstartable on this node. The primary treats `node.fence_failed` like the loss of the node: it does not grant the lease to anyone else until an operator acknowledges the fence, as when declaring a node lost (section 8.3) (D-0074).
+
+**Acknowledging a failed fence** (D-0079). Only a human clears a failed fence, after checking out of band that the VMs it names are stopped (for example by power-cycling the host):
+
+1. When the primary receives `node.fence_failed`, or a `lease_revoke` answered with `fence_failed`, it records the failure on the node: the lease, app and VM ids are added to the node's `fence_failure` (`db-schema.sql` migration 0001; `Node.fence_failure` in `openapi.yaml`). While a lease is listed there, the primary grants it to no node.
+2. An operator calls `POST /api/v1/nodes/{node_id}/fence-ack` with the lease ids they verified. The scope `node:fence_ack` is human-only, so no agent can clear a fence, and the call is audited (D-0031). The list must equal the node's outstanding `fence_failure` lease ids, so an acknowledgement cannot cover a failure the operator has not seen.
+3. In the same transaction the primary increments the `fencing_token` of each listed lease, exactly as when declaring a node lost (section 8.3), clears the node's `fence_failure`, and records the acknowledgement as pending delivery (`fence_ack_pending`). From then on the leases may be granted again, to this node or another, with the new token.
+4. The primary sends `command` kind `fence_ack` with those lease ids (section 5.17): at once when the node is connected, otherwise at its next session after the stale-lease revokes and before `desired_state` (section 4.2). A `command_result` with `status: ok` clears `fence_ack_pending`; until then the primary sends it again at each session start.
+5. The node clears the listed failed fences and, when none remains, its failed mark. A node that never receives the command stays failed, which is the safe side: it starts nothing stateful.
 
 **Concurrency.** Fences of different leases must run concurrently, and an agent crash in the middle of a fence must leave the lease fenced on restart; both are covered by mandatory tests before `expiring` leases ship (D-0075). M0 fences one lease at a time, which is acceptable only because no `expiring` lease exists outside tests.
 
@@ -1167,7 +1214,7 @@ The node keeps a SQLite file, owned by root, that holds everything it needs to r
 
 | Table | Holds | Why |
 | --- | --- | --- |
-| `node_meta` | `node_id`, `cluster_id`, `boot_id`, `host_boot_id` (the kernel boot id), the failed mark, agent and engine versions, the cluster public key and its `key_id`, a reference to the credential | Identity across restarts |
+| `node_meta` | `node_id`, `cluster_id`, `boot_id`, `host_boot_id` (the kernel boot id), the failed mark and the failed fences it covers (cleared by `command` kind `fence_ack`, section 5.17), agent and engine versions, the cluster public key and its `key_id`, a reference to the credential | Identity across restarts |
 | `desired_state` | One row per accepted `rev`: the full signed body, its hash, `issued_at`, `term` | The snapshot to reconcile from, and the signature to re-verify |
 | `applied_state` | Per VM the last applied spec digest, observed status, restart count, last exit code | Detects drift without the primary |
 | `leases` | Lease id, resource, mode, token, state, `valid_until`, duration, remaining validity on `CLOCK_BOOTTIME` for `held` and `uncertain` expiring leases | Survives an agent restart: a fenced lease stays fenced, a held one keeps its remaining validity within the same host boot |

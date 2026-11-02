@@ -706,6 +706,7 @@ components:
         - desired_rev
         - applied_rev
         - log_seq
+        - fence_failure
         - created_at
       properties:
         id:
@@ -783,6 +784,14 @@ components:
           type: integer
           minimum: 0
           description: Last change-log seq the node has verified.
+        fence_failure:
+          description: |
+            Failed fences of this node that no operator has acknowledged yet, or
+            null. While a lease is listed here the primary grants it to no node
+            (D-0074); `POST /api/v1/nodes/{node_id}/fence-ack` clears it (D-0079).
+          oneOf:
+            - $ref: '#/components/schemas/NodeFenceFailure'
+            - type: 'null'
         last_seen_at:
           type: [string, 'null']
           description: Last heartbeat or message from the node.
@@ -790,6 +799,61 @@ components:
           type: string
           format: date-time
           description: When the node first enrolled.
+    NodeFenceFailure:
+      type: object
+      title: NodeFenceFailure
+      description: |
+        Unacknowledged failed fences of a node: a forced stop could not confirm
+        that these VMs stopped, so they may still run (D-0074,
+        node-agent-protocol.md section 8.5). Ids accumulate across failures
+        until an operator acknowledges them.
+      required:
+        - detected_at
+        - lease_ids
+        - app_ids
+        - vm_ids
+      properties:
+        detected_at:
+          type: string
+          format: date-time
+          description: When the primary recorded the first of these failures.
+        lease_ids:
+          type: array
+          description: Leases whose fence failed; none of them is granted again until acknowledged.
+          items:
+            type: string
+            pattern: '^lse_[0-9A-HJKMNP-TV-Z]{26}$'
+        app_ids:
+          type: array
+          description: Apps bound to those leases.
+          items:
+            type: string
+            pattern: '^app_[0-9A-HJKMNP-TV-Z]{26}$'
+        vm_ids:
+          type: array
+          description: VMs the node could not confirm stopped.
+          items:
+            type: string
+            pattern: '^vm_[0-9A-HJKMNP-TV-Z]{26}$'
+    FenceAckRequest:
+      type: object
+      title: FenceAckRequest
+      description: |
+        The failed fences an operator verified out of band (for example by
+        power-cycling the host). `lease_ids` must equal the node's outstanding
+        `fence_failure.lease_ids`, so an acknowledgement never covers a failure
+        the operator has not seen.
+      required:
+        - lease_ids
+      properties:
+        lease_ids:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          description: Lease ids of the failed fences being acknowledged.
+          items:
+            type: string
+            pattern: '^lse_[0-9A-HJKMNP-TV-Z]{26}$'
     NodeList:
       type: object
       title: NodeList
@@ -2232,6 +2296,7 @@ components:
         - node:read
         - node:enroll
         - node:remove
+        - node:fence_ack
         - project:read
         - project:write
         - project:delete
@@ -3830,6 +3895,55 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/NotPrimary'
+  /api/v1/nodes/{node_id}/fence-ack:
+    post:
+      tags: [nodes]
+      operationId: ackNodeFence
+      summary: Acknowledge a node's failed fences
+      description: |
+        Records a human's acknowledgement that the VMs of the listed failed
+        fences are stopped (D-0074, D-0079). The scope is human-only: an agent is
+        refused with `forbidden` and `reason: human_only`. `lease_ids` must equal
+        the node's outstanding `fence_failure.lease_ids`; a node without one, or a
+        list that differs, is refused with `conflict`. In one transaction the
+        primary increments the fencing token of each listed lease, as when a node
+        is declared lost, clears `fence_failure`, and queues the `fence_ack`
+        command for the node (node-agent-protocol.md sections 5.17 and 8.5); from
+        then on those leases may be granted again. The call is audited (D-0031).
+      x-quoro-scope: node:fence_ack
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+      requestBody:
+        required: true
+        description: The lease ids of the failed fences being acknowledged.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FenceAckRequest'
+      responses:
+        '200':
+          description: The acknowledgement was recorded; the node is returned with `fence_failure` null.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Node'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
         '429':
           $ref: '#/components/responses/RateLimited'
         '503':

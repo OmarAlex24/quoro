@@ -86,6 +86,7 @@ A scope is `<resource>:<verb>` and is the unit of authority in both human roles 
 | `node:read` | List and read nodes | |
 | `node:enroll` | Create node join tokens | human-only |
 | `node:remove` | Remove a node from the cluster | destructive, human-only |
+| `node:fence_ack` | Acknowledge a node's failed fence after verifying its VMs are stopped, so its leases may be granted again | human-only |
 | `project:read` | List and read projects | |
 | `project:write` | Create and update projects | |
 | `project:delete` | Delete an empty project | destructive |
@@ -137,10 +138,10 @@ Making destructive scopes grantable in standing grants would be a change to this
 
 ### 4.2 Human-only scopes
 
-Eight scopes are human-only: `node:enroll`, `node:remove`, `agent:write`, `grant:write`, `approval:decide`, `webhook:write`, `provider:manage` and `user:write` (README.md, "Scopes").
+Nine scopes are human-only: `node:enroll`, `node:remove`, `node:fence_ack`, `agent:write`, `grant:write`, `approval:decide`, `webhook:write`, `provider:manage` and `user:write` (README.md, "Scopes").
 
 - A grant whose `scopes` contains a human-only scope is refused at creation with `validation_failed`, and a hypothetical row that contained one is refused at call time with reason `human_only` (README.md, "Errors").
-- The set is chosen so an agent can never widen its own power (`agent:write`, `grant:write`, `webhook:write`), approve its own request (`approval:decide`), take over cluster membership (`node:enroll`, `node:remove`) or hold external credentials (`provider:manage`) (D-0030, D-0051).
+- The set is chosen so an agent can never widen its own power (`agent:write`, `grant:write`, `webhook:write`), approve its own request (`approval:decide`), take over cluster membership (`node:enroll`, `node:remove`), declare a possibly running VM stopped so its lease moves (`node:fence_ack`, D-0079) or hold external credentials (`provider:manage`) (D-0030, D-0051).
 - Because `approval:decide` is human-only, "an agent approves its own destructive request" is not a policy that could be misconfigured; it is unrepresentable (D-0030).
 
 ### 4.3 Wildcards
