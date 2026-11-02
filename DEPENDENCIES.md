@@ -13,7 +13,8 @@ Rules:
 - Test-only needs go in `[dev-dependencies]` and are listed separately.
 - `Cargo.lock` is committed and every build and test in CI runs with `--locked`.
 - A new dependency must pass `cargo deny check`: its license is on the ADR 0080
-  allowlist and it comes from crates.io.
+  allowlist and it comes from crates.io. The check covers the Linux targets
+  Quoro ships (listed in `deny.toml`), not targets it never builds for.
 
 ## Runtime dependencies
 
