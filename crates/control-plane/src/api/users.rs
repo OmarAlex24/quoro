@@ -65,6 +65,7 @@ impl UserPage {
             headers(("Quoro-Request-Id" = String, description = "Correlation id of this call."))),
         (status = 401, response = crate::openapi::Unauthenticated),
         (status = 403, response = crate::openapi::Forbidden),
+        (status = 422, response = crate::openapi::ValidationFailed),
         (status = 429, response = crate::openapi::RateLimited),
     )
 )]
