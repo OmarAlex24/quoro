@@ -34,6 +34,8 @@ Rules:
 | `argon2` | `crates/control-plane` | `alloc`, `password-hash` | Argon2id password hashes in `users.password_hash`, as `permission-model.md` and `openapi.yaml` require |
 | `time` | `crates/control-plane` | `std` | UTC calendar fields for the fixed-width RFC 3339 timestamps stored and compared as strings |
 | `tracing` | `crates/control-plane` | `std` | Server-side logging of internal errors and failed logins without putting them in responses |
+| `chacha20poly1305` | `crates/control-plane` | `alloc`, `zeroize` (no default features) | XChaCha20-Poly1305 AEAD for the `*_enc` columns under the cluster data-encryption key (ADR 0050), starting with `providers.secret_enc` (ADR 0051); RustCrypto, pure Rust. Nonces come from `getrandom`, so its `getrandom` feature stays off |
+| `zeroize` | `crates/control-plane` | `alloc` | Wipes the data-encryption key and decrypted provider secrets from memory when they are dropped |
 | `tokio` | `crates/quoro` | `rt-multi-thread`, `macros`, `net`, `signal`, `sync`, `time` (no default features) | The binary's runtime: the listener, SIGTERM/Ctrl-C shutdown (`signal`), the driver channel and its loop |
 | `axum` | `crates/quoro` | `http1`, `tokio` | Turns the control-plane router into the service the TLS listener serves |
 | `axum-server` | `crates/quoro` | `tls-rustls-no-provider` (no default features) | The HTTPS listener of D-0054 (one TLS port, 8443) with graceful shutdown; the no-provider feature keeps aws-lc-rs out of the build (D-0080) |

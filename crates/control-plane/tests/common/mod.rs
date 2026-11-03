@@ -5,10 +5,12 @@
 #![allow(dead_code)]
 
 use quoro_control_plane::auth::setup_token;
+use quoro_control_plane::crypto::DataKey;
 use quoro_control_plane::store::{Store, random_secret};
 use quoro_control_plane::{AppState, ServerConfig, router};
 use serde_json::{Value, json};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 pub const OWNER_EMAIL: &str = "owner@example.com";
@@ -108,6 +110,7 @@ pub async fn start() -> Server {
             secure_cookies: false,
         },
         Some(tx),
+        Arc::new(DataKey::ephemeral()),
     );
     let app = router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

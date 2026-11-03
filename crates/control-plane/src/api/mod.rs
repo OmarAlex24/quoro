@@ -7,6 +7,7 @@ pub mod health;
 pub mod nodes;
 pub mod page;
 pub mod projects;
+pub mod providers;
 pub mod vms;
 
 use crate::AppState;
@@ -28,6 +29,18 @@ pub fn routes() -> Router<AppState> {
             get(projects::list_projects).post(projects::create_project),
         )
         .route("/api/v1/projects/{project_id}", get(projects::get_project))
+        .route(
+            "/api/v1/providers",
+            get(providers::list_providers).post(providers::create_provider),
+        )
+        .route(
+            "/api/v1/providers/{provider_id}",
+            get(providers::get_provider).delete(providers::delete_provider),
+        )
+        .route(
+            "/api/v1/providers/{provider_id}/rotate",
+            post(providers::rotate_provider_secret),
+        )
         .route("/api/v1/vms", get(vms::list_vms).post(vms::create_vm))
         .route(
             "/api/v1/vms/{vm_id}",

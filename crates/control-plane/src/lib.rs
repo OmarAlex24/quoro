@@ -12,6 +12,7 @@ pub mod api;
 pub mod audit;
 pub mod auth;
 pub mod changelog;
+pub mod crypto;
 pub mod driver;
 pub mod error;
 pub mod events;
@@ -42,6 +43,9 @@ pub struct AppState {
     pub store: store::Store,
     pub config: Arc<ServerConfig>,
     pub idempotency: idempotency::Cache,
+    /// The cluster data-encryption keyring (D-0050); every `*_enc` column is
+    /// encrypted and decrypted through it.
+    pub data_key: Arc<crypto::DataKey>,
     /// Notified with a `vm_` id whenever a VM's desired state changes.
     pub driver: Option<mpsc::UnboundedSender<String>>,
 }
@@ -52,11 +56,13 @@ impl AppState {
         store: store::Store,
         config: ServerConfig,
         driver: Option<mpsc::UnboundedSender<String>>,
+        data_key: Arc<crypto::DataKey>,
     ) -> Self {
         Self {
             store,
             config: Arc::new(config),
             idempotency: idempotency::Cache::default(),
+            data_key,
             driver,
         }
     }
