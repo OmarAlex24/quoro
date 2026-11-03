@@ -430,31 +430,28 @@ async fn a_mutating_call_without_justification_reaches_the_service_layer_and_is_
 }
 
 #[tokio::test]
-async fn unknown_and_pending_tools_are_jsonrpc_errors() {
+async fn an_unknown_tool_is_a_jsonrpc_error() {
     let seeded = seeded().await;
-    let mut names = vec!["nope"];
-    names.extend_from_slice(quoro_mcp::tools::PENDING);
 
-    for name in names {
-        let (status, body) = rpc(
-            &seeded.server,
-            Some(&seeded.access_token),
-            json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": { "name": name, "arguments": {} },
-            }),
-        )
-        .await;
-        assert_eq!(status, 200, "{name}: {body}");
-        assert!(
-            body.get("result").is_none(),
-            "{name}: expected a JSON-RPC error, got a result: {body}"
-        );
-        assert_eq!(
-            body["error"]["code"], -32602,
-            "{name}: expected -32602, got {body}"
-        );
-    }
+    let name = "nope";
+    let (status, body) = rpc(
+        &seeded.server,
+        Some(&seeded.access_token),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": {} },
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{name}: {body}");
+    assert!(
+        body.get("result").is_none(),
+        "{name}: expected a JSON-RPC error, got a result: {body}"
+    );
+    assert_eq!(
+        body["error"]["code"], -32602,
+        "{name}: expected -32602, got {body}"
+    );
 }

@@ -125,9 +125,11 @@ Rules:
 | `rcgen` | `crates/ingress` | `ring`, `pem` | Self-signed certificates for the TLS listener tests |
 | `quoro-control-plane` (workspace crate) | `crates/ingress` (example only) | none | The lab example reads a provider credential from the node's database through the in-process accessor, never over HTTP |
 | `tracing-subscriber` | `crates/ingress` (example only) | `fmt`, `std` | Logs of the lab example |
-| `tokio`, `axum` | `crates/mcp` | `macros`, `rt-multi-thread`, `net` / `http1`, `tokio` | The integration tests serve the control-plane router and `/mcp` on an ephemeral port, as `quoro serve` merges them |
+| `tokio`, `axum` | `crates/mcp` | `macros`, `rt-multi-thread`, `net`, `time` / `http1`, `tokio` | The integration tests serve the control-plane router and `/mcp` on an ephemeral port, as `quoro serve` merges them; `time` paces the wait for a node event to open its incident |
 | `reqwest`, `rustls` | `crates/mcp` | `json`, `cookies` / `ring`, `std` | Drive `/mcp` and the API over real HTTP; the cookie jar proves a session cookie is refused by `/mcp` |
 | `sqlx` | `crates/mcp` | `sqlite`, `runtime-tokio` | The tests read the audit log to compare an MCP call with the same HTTP call; the crate itself never touches the database |
+| `quoro-proto` (workspace crate) | `crates/mcp` | none | The incident test signs and frames node messages to open a real node session, so an `app.down` event opens an incident the MCP tools then read and resolve |
+| `tokio-tungstenite`, `futures-util` | `crates/mcp` | `handshake` (no default features) / `sink`, `std` | The same versions and features as `crates/control-plane`: the incident test drives the node session websocket as the node agent does. Enrolling and opening that session is the only way an `app.down` incident exists to test against |
 | `serde_norway` | `crates/mcp` | no default features | The contract test derives each tool's input schema from the frozen `openapi.yaml` (ADR 0048) and compares it with the served one |
 
 ## Tooling outside Cargo

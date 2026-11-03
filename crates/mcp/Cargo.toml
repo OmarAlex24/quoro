@@ -29,7 +29,13 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+# `time` is the incident test's polling wait for the node's event to be applied.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+# The incident test enrolls a node and drives its websocket session, so an
+# `app.down` event opens a real incident, exactly as the node agent does.
+quoro-proto = { path = "../proto" }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "cookies"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

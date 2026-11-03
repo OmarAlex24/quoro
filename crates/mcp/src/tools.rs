@@ -42,15 +42,6 @@ pub struct ToolSpec {
     pub input_schema: fn() -> Value,
 }
 
-/// Tools whose service functions land later. Calling one is an unknown tool.
-pub const PENDING: &[&str] = &[
-    "list_events",
-    "list_incidents",
-    "get_incident",
-    "resolve_incident",
-    "list_audit",
-];
-
 /// The wired tools, in the order of the README "MCP tools" table.
 const SPECS: &[ToolSpec] = &[
     ToolSpec {
@@ -135,6 +126,42 @@ const SPECS: &[ToolSpec] = &[
         input_schema: schema_get_app_logs,
     },
     ToolSpec {
+        name: "list_events",
+        operation_id: "listEvents",
+        scope: "event:read",
+        mutating: false,
+        destructive: false,
+        title: "List events",
+        input_schema: schema_list_events,
+    },
+    ToolSpec {
+        name: "list_incidents",
+        operation_id: "listIncidents",
+        scope: "incident:read",
+        mutating: false,
+        destructive: false,
+        title: "List incidents",
+        input_schema: schema_list_incidents,
+    },
+    ToolSpec {
+        name: "get_incident",
+        operation_id: "getIncident",
+        scope: "incident:read",
+        mutating: false,
+        destructive: false,
+        title: "Read one incident with its trigger event and grants",
+        input_schema: schema_get_incident,
+    },
+    ToolSpec {
+        name: "resolve_incident",
+        operation_id: "resolveIncident",
+        scope: "incident:resolve",
+        mutating: true,
+        destructive: false,
+        title: "Resolve an incident",
+        input_schema: schema_resolve_incident,
+    },
+    ToolSpec {
         name: "restart_app",
         operation_id: "restartApp",
         scope: "app:restart",
@@ -178,6 +205,15 @@ const SPECS: &[ToolSpec] = &[
         destructive: false,
         title: "Read one approval request",
         input_schema: schema_get_approval,
+    },
+    ToolSpec {
+        name: "list_audit",
+        operation_id: "listAudit",
+        scope: "audit:read",
+        mutating: false,
+        destructive: false,
+        title: "List audit records",
+        input_schema: schema_list_audit,
     },
 ];
 
@@ -253,6 +289,15 @@ fn approval_id() -> Value {
     })
 }
 
+/// The path parameter `incident_id` (`components/parameters/IncidentId`).
+fn incident_path_id() -> Value {
+    json!({
+        "type": "string",
+        "pattern": "^inc_[0-9A-HJKMNP-TV-Z]{26}$",
+        "description": "Incident id (`inc_...`)."
+    })
+}
+
 /// The query parameter `limit` (`components/parameters/Limit`).
 fn limit() -> Value {
     json!({
@@ -261,6 +306,15 @@ fn limit() -> Value {
         "maximum": 500,
         "default": 50,
         "description": "Maximum number of items to return (default 50, maximum 500)."
+    })
+}
+
+/// The query parameter `after_seq` (`components/parameters/AfterSeq`).
+fn after_seq() -> Value {
+    json!({
+        "type": "integer",
+        "minimum": 0,
+        "description": "Return only entries whose `seq` is greater than this value."
     })
 }
 
@@ -458,6 +512,126 @@ fn schema_get_app_logs() -> Value {
     )
 }
 
+/// The `EventType` component (`components/schemas/EventType`), inlined because
+/// the args validator does not resolve `$ref`.
+///
+/// The `|` block description keeps its raw YAML line breaks: only the
+/// parameter-level description is normalized, so the inlined `items` schema
+/// carries the component's text as `resolve_schema` produces it.
+fn event_type() -> Value {
+    json!({
+        "type": "string",
+        "title": "EventType",
+        "description": "Event type, `<subject>.<what>` in lowercase with underscores. The list is\nclosed; new types are added to the contract in a standalone change.\n",
+        "enum": [
+            "node.enrolled",
+            "node.connected",
+            "node.disconnected",
+            "node.fenced",
+            "node.fence_failed",
+            "node.disk_low",
+            "vm.created",
+            "vm.started",
+            "vm.stopped",
+            "vm.crashed",
+            "vm.deleted",
+            "app.created",
+            "app.updated",
+            "app.deleted",
+            "app.down",
+            "app.up",
+            "app.restarted",
+            "deployment.started",
+            "deployment.succeeded",
+            "deployment.failed",
+            "certificate.issued",
+            "certificate.expiring",
+            "certificate.failed",
+            "grant.created",
+            "grant.revoked",
+            "grant.expired",
+            "approval.requested",
+            "approval.approved",
+            "approval.denied",
+            "approval.expired",
+            "incident.opened",
+            "incident.resolved",
+            "audit.chain_broken"
+        ]
+    })
+}
+
+fn schema_list_events() -> Value {
+    schema(
+        vec![
+            (
+                "type",
+                json!({
+                    "type": "array",
+                    "items": event_type(),
+                    "description": "Only events of this type. Repeat the parameter to select several."
+                }),
+            ),
+            (
+                "subject_id",
+                json!({
+                    "type": "string",
+                    "description": "Only events about this resource id."
+                }),
+            ),
+            ("after_seq", after_seq()),
+            ("limit", limit()),
+            ("cursor", cursor()),
+        ],
+        &[],
+    )
+}
+
+fn schema_list_incidents() -> Value {
+    schema(
+        vec![
+            (
+                "status",
+                json!({
+                    "type": "string",
+                    "enum": ["open", "resolved"],
+                    "description": "Only incidents in this status."
+                }),
+            ),
+            ("limit", limit()),
+            ("cursor", cursor()),
+        ],
+        &[],
+    )
+}
+
+fn schema_get_incident() -> Value {
+    schema(vec![("incident_id", incident_path_id())], &["incident_id"])
+}
+
+/// The tool carries one `incident_id`: the path parameter, which is both the
+/// incident to resolve and the call's context incident. `call()` reads it into
+/// the [`CallCtx`] for every mutating tool, so `Quoro-Incident` adds no second
+/// property and the same id feeds the audit record. The body's
+/// `resolution_note` follows the header-derived properties.
+fn schema_resolve_incident() -> Value {
+    schema(
+        vec![
+            ("incident_id", incident_path_id()),
+            ("justification", justification()),
+            (
+                "resolution_note",
+                json!({
+                    "type": "string",
+                    "maxLength": 2000,
+                    "description": "What was done to resolve it. Recorded in the audit log."
+                }),
+            ),
+        ],
+        &["incident_id", "justification"],
+    )
+}
+
 fn schema_restart_app() -> Value {
     schema(
         vec![
@@ -527,6 +701,47 @@ fn schema_get_approval() -> Value {
     schema(vec![("approval_id", approval_id())], &["approval_id"])
 }
 
+fn schema_list_audit() -> Value {
+    schema(
+        vec![
+            (
+                "actor_id",
+                json!({
+                    "type": "string",
+                    "description": "Only records of this actor (user, agent or node id)."
+                }),
+            ),
+            (
+                "target_id",
+                json!({
+                    "type": "string",
+                    "description": "Only records about this resource id."
+                }),
+            ),
+            (
+                "result",
+                json!({
+                    "type": "string",
+                    "enum": ["ok", "refused", "error"],
+                    "description": "Only records with this result."
+                }),
+            ),
+            (
+                "incident_id",
+                json!({
+                    "type": "string",
+                    "pattern": "^inc_[0-9A-HJKMNP-TV-Z]{26}$",
+                    "description": "Only records that belong to this incident."
+                }),
+            ),
+            ("after_seq", after_seq()),
+            ("limit", limit()),
+            ("cursor", cursor()),
+        ],
+        &[],
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Listing
 // ---------------------------------------------------------------------------
@@ -589,7 +804,7 @@ fn annotations(spec: &ToolSpec) -> ToolAnnotations {
 ///
 /// # Errors
 ///
-/// A JSON-RPC error for an unknown tool (including a [`PENDING`] one).
+/// A JSON-RPC error for an unknown tool.
 pub async fn call(
     state: &AppState,
     identity: Identity,
@@ -681,6 +896,30 @@ async fn dispatch(
             let query = query::<api::logs::AppLogsQuery>(arguments, &["app_id"])?;
             to_value(service::logs::get_app_logs(state, ctx, app_id, &query).await)
         }
+        "list_events" => {
+            let query = events_query(arguments)?;
+            to_value(service::events::list_events(state, ctx, &query).await)
+        }
+        "list_incidents" => {
+            let query = query::<api::incidents::ListIncidentsQuery>(arguments, &[])?;
+            to_value(service::incidents::list_incidents(state, ctx, &query).await)
+        }
+        "get_incident" => {
+            let incident_id = id(arguments, "incident_id");
+            to_value(service::incidents::get_incident(state, ctx, incident_id).await)
+        }
+        "resolve_incident" => {
+            let incident_id = id(arguments, "incident_id");
+            let resolution_note = text(arguments, "resolution_note");
+            to_value(
+                service::incidents::resolve_incident(state, ctx, incident_id, resolution_note)
+                    .await,
+            )
+        }
+        "list_audit" => {
+            let query = query::<api::audit::ListAuditQuery>(arguments, &[])?;
+            to_value(service::audit::list_audit(state, ctx, &query).await)
+        }
         "restart_app" => {
             let app_id = id(arguments, "app_id");
             to_value(service::apps::restart_app(state, ctx, app_id).await)
@@ -743,6 +982,35 @@ fn text(arguments: &JsonObject, name: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Builds the `list_events` query from the arguments. `ListEventsQuery` has no
+/// `Deserialize`, because `type` repeats, so the arguments become the raw
+/// query pairs HTTP would carry and [`api::events::ListEventsQuery::parse`]
+/// validates them (unknown event type, negative `after_seq`, bad cursor).
+fn events_query(arguments: &JsonObject) -> Result<api::events::ListEventsQuery, ApiError> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    if let Some(Value::Array(types)) = arguments.get("type") {
+        for value in types {
+            if let Some(name) = value.as_str() {
+                pairs.push(("type".to_string(), name.to_string()));
+            }
+        }
+    }
+    for name in ["subject_id", "after_seq", "limit", "cursor"] {
+        if let Some(value) = arguments.get(name) {
+            pairs.push((name.to_string(), scalar(value)));
+        }
+    }
+    api::events::ListEventsQuery::parse(&pairs)
+}
+
+/// A scalar argument as it would appear in a query string.
+fn scalar(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
 /// A required string argument. Shape validation already guarantees it; an
 /// empty id simply has no target and the service answers `not_found`.
 fn id<'a>(arguments: &'a JsonObject, name: &str) -> &'a str {
@@ -753,11 +1021,9 @@ fn id<'a>(arguments: &'a JsonObject, name: &str) -> &'a str {
 }
 
 /// Deserializes the query parameters from the arguments, dropping the
-/// properties that are not fields of `T`.
+/// properties in `omit` (path parameters, which are not fields of `T`).
 fn query<T: DeserializeOwned>(arguments: &JsonObject, omit: &[&str]) -> Result<T, ApiError> {
     let mut map = arguments.clone();
-    map.remove("justification");
-    map.remove("incident_id");
     for name in omit {
         map.remove(*name);
     }
@@ -814,7 +1080,7 @@ mod tests {
     }
 
     #[test]
-    fn specs_and_pending_cover_the_readme_table() {
+    fn specs_cover_the_readme_table() {
         let expected = [
             "get_cluster",
             "list_nodes",
@@ -837,7 +1103,6 @@ mod tests {
             "list_audit",
         ];
         let mut actual: Vec<&str> = specs().iter().map(|spec| spec.name).collect();
-        actual.extend_from_slice(PENDING);
         let mut expected = expected.to_vec();
         actual.sort_unstable();
         expected.sort_unstable();
@@ -847,5 +1112,63 @@ mod tests {
     #[test]
     fn list_matches_the_specs() {
         assert_eq!(list().len(), specs().len());
+    }
+
+    /// A syntactically valid incident id (`inc_` plus 26 Crockford characters).
+    const INCIDENT: &str = "inc_01JC9Z6Q5W8N3K4T7R2M1XHB0D";
+
+    fn spec(name: &str) -> &'static ToolSpec {
+        specs()
+            .iter()
+            .find(|spec| spec.name == name)
+            .unwrap_or_else(|| panic!("{name} is not a wired tool"))
+    }
+
+    #[test]
+    fn list_events_arguments_build_the_query() {
+        let mut arguments = JsonObject::new();
+        arguments.insert("type".to_string(), json!(["app.down", "vm.crashed"]));
+        arguments.insert("after_seq".to_string(), json!(42));
+
+        let query = events_query(&arguments).expect("the arguments are valid");
+        assert_eq!(
+            query.types,
+            Some(vec!["app.down".to_string(), "vm.crashed".to_string()])
+        );
+        assert_eq!(query.after_seq, Some(42));
+    }
+
+    #[test]
+    fn the_audit_query_keeps_the_incident_filter() {
+        let mut arguments = JsonObject::new();
+        arguments.insert("incident_id".to_string(), json!(INCIDENT));
+        arguments.insert("result".to_string(), json!("refused"));
+
+        let query =
+            query::<api::audit::ListAuditQuery>(&arguments, &[]).expect("the arguments are valid");
+        assert_eq!(query.incident_id.as_deref(), Some(INCIDENT));
+        assert_eq!(query.result.as_deref(), Some("refused"));
+    }
+
+    #[test]
+    fn validate_rejects_an_unknown_event_type() {
+        let schema = schema_of(spec("list_events"));
+        let mut arguments = JsonObject::new();
+        arguments.insert("type".to_string(), json!(["app.exploded"]));
+
+        let reason = args::validate(&schema, &arguments).expect_err("the event type is unknown");
+        assert!(reason.starts_with("type[0]: must be one of"), "{reason}");
+    }
+
+    #[test]
+    fn validate_requires_the_incident_id_to_resolve() {
+        let schema = schema_of(spec("resolve_incident"));
+        let mut arguments = JsonObject::new();
+        arguments.insert("justification".to_string(), json!("J"));
+
+        assert_eq!(
+            args::validate(&schema, &arguments),
+            Err("incident_id: is required".to_string())
+        );
     }
 }
