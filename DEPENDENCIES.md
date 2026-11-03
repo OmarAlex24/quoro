@@ -61,6 +61,7 @@ Rules:
 | `sqlx` | `crates/node-agent` | `sqlite`, `runtime-tokio` | The local node store (section 12): signed desired state, applied state and the event buffer survive agent restarts in SQLite, like the control plane's state |
 | `serde`, `serde_json` | `crates/node-agent` | `derive`, `std` / `std` | Rows of that store and the node identity file |
 | `sha2` | `crates/node-agent` | no default features | SHA-256 of the primary's certificate for the pin |
+| `chacha20poly1305` | `crates/node-agent` | `alloc`, `zeroize` (no default features) | XChaCha20-Poly1305 AEAD for the stored `desired_state` bodies, which hold the spec's `env` secrets, under the node-local key (section 12: "a node-local key that encrypts this node's copy of desired-state secrets"); RustCrypto, pure Rust. Nonces come from `getrandom`, so its `getrandom` feature stays off |
 | `getrandom` | `crates/node-agent` | no default features | The node's Ed25519 seed, the agent `boot_id` and message ids come from the OS generator |
 | `tracing` | `crates/node-agent` | `std` | Session, reconcile and redial logs |
 | `quoro-node-agent` (workspace crate) | `crates/quoro` | none | `quoro join`, `quoro node` and the primary's own local node agent |

@@ -13,14 +13,18 @@
 
 use std::net::Ipv4Addr;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
 use sqlx::Row as _;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use tokio::sync::broadcast;
 
 use crate::AgentError;
+use crate::localkey::LocalKey;
+use crate::logs::CapturedLine;
 use crate::util;
 
 /// How many accepted revisions are kept; older ones are pruned after each
@@ -46,6 +50,7 @@ CREATE TABLE IF NOT EXISTS node_meta (
 CREATE TABLE IF NOT EXISTS desired_state (
     rev        INTEGER PRIMARY KEY,
     body       TEXT NOT NULL,
+    body_enc   BLOB,
     issued_at  TEXT NOT NULL,
     term       INTEGER NOT NULL,
     stored_at  TEXT NOT NULL
@@ -63,12 +68,82 @@ CREATE TABLE IF NOT EXISTS event_buffer (
     evt_id TEXT UNIQUE NOT NULL,
     body   TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS log_lines (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    vm_id   TEXT NOT NULL,
+    app_id  TEXT,
+    time_ns INTEGER NOT NULL,
+    stream  TEXT NOT NULL,
+    line    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS log_lines_by_vm ON log_lines (vm_id, time_ns);
+CREATE INDEX IF NOT EXISTS log_lines_by_app ON log_lines (app_id, time_ns);
+CREATE TABLE IF NOT EXISTS deployment_lines (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    deployment_id TEXT NOT NULL,
+    phase         TEXT NOT NULL,
+    time_ns       INTEGER NOT NULL,
+    message       TEXT NOT NULL,
+    vm_id         TEXT
+);
+CREATE INDEX IF NOT EXISTS deployment_lines_by_deployment
+    ON deployment_lines (deployment_id, time_ns);
 ";
+
+/// Capacity of the live log fan-out channel. A stream that falls further
+/// behind loses lines and carries on, so a slow reader never blocks capture.
+const LOG_BROADCAST_CAPACITY: usize = 1_024;
 
 /// The node's SQLite store.
 #[derive(Clone)]
 pub struct NodeStore {
-    pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
+    /// Root-owned data directory the store was opened in.
+    pub(crate) data_dir: std::path::PathBuf,
+    /// The node-local key that seals desired-state bodies.
+    pub(crate) key: Arc<LocalKey>,
+    /// The strictly increasing node-wide log clock.
+    pub(crate) clock: Arc<LogClock>,
+    /// Newly captured log lines, for open streams.
+    pub(crate) logs_tx: broadcast::Sender<CapturedLine>,
+    /// Serializes log appends, so instants are committed and broadcast in
+    /// the order they were handed out and a live stream never sees one go
+    /// backwards.
+    pub(crate) log_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// A node-wide monotonic clock in nanoseconds since the Unix epoch.
+///
+/// The wall clock may repeat a value or step backwards (NTP); the control
+/// plane uses these instants as cursors, so every value handed out is strictly
+/// greater than the previous one.
+pub(crate) struct LogClock {
+    last: Mutex<i64>,
+}
+
+impl LogClock {
+    fn new(last: i64) -> Self {
+        Self {
+            last: Mutex::new(last),
+        }
+    }
+
+    /// The next instant: the wall clock when it moved forward, otherwise the
+    /// last value plus one.
+    fn next(&self) -> i64 {
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = util::now_ns();
+        let value = if now > *last {
+            now
+        } else {
+            last.saturating_add(1)
+        };
+        *last = value;
+        value
+    }
 }
 
 /// One VM's applied row.
@@ -112,18 +187,76 @@ impl NodeStore {
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .foreign_keys(true)
+            // Deleted rows (pruned log lines, resealed plaintext bodies) are
+            // overwritten, not left in free pages.
+            .pragma("secure_delete", "ON")
             .busy_timeout(Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(4)
             .connect_with(options)
             .await
             .map_err(store_error)?;
-        let store = Self { pool };
         sqlx::raw_sql(SCHEMA)
-            .execute(&store.pool)
+            .execute(&pool)
             .await
             .map_err(store_error)?;
-        Ok(store)
+        migrate(&pool).await?;
+
+        let key = Arc::new(LocalKey::load_or_create(data_dir)?);
+        reseal_legacy(&pool, &key).await?;
+        let last_log = max_log_instant(&pool).await?;
+        let (logs_tx, _) = broadcast::channel(LOG_BROADCAST_CAPACITY);
+        Ok(Self {
+            pool,
+            data_dir: data_dir.to_path_buf(),
+            key,
+            clock: Arc::new(LogClock::new(last_log)),
+            logs_tx,
+            log_gate: Arc::new(tokio::sync::Mutex::new(())),
+        })
+    }
+
+    /// The data directory the store lives in.
+    #[must_use]
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// The console socket path for `vm_id`, creating `<data_dir>/consoles`
+    /// `0700` when it does not exist.
+    ///
+    /// The path is derived from the VM id alone, so it is reconstructible
+    /// after an agent restart, and it stays short for the AF_UNIX limit.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Io`] when the directory cannot be created.
+    pub fn console_socket(&self, vm_id: &str) -> Result<std::path::PathBuf, AgentError> {
+        let dir = self.data_dir.join("consoles");
+        if !dir.exists() {
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| AgentError::io("create the console socket directory", e))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                    .map_err(|e| AgentError::io("secure the console socket directory", e))?;
+            }
+        }
+        Ok(dir.join(format!("{vm_id}.sock")))
+    }
+
+    /// The next strictly increasing node-wide log instant, in nanoseconds
+    /// since the Unix epoch.
+    #[must_use]
+    pub fn next_log_time(&self) -> i64 {
+        self.clock.next()
+    }
+
+    /// Subscribes to newly captured log lines.
+    #[must_use]
+    pub fn subscribe_logs(&self) -> broadcast::Receiver<CapturedLine> {
+        self.logs_tx.subscribe()
     }
 
     /// The node metadata for `key`.
@@ -170,18 +303,30 @@ impl NodeStore {
     ///
     /// [`AgentError::Store`] on a SQLite failure or a body that is not JSON.
     pub async fn latest_desired(&self) -> Result<Option<(u64, Value)>, AgentError> {
-        let row = sqlx::query("SELECT rev, body FROM desired_state ORDER BY rev DESC LIMIT 1")
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(store_error)?;
+        let row =
+            sqlx::query("SELECT rev, body, body_enc FROM desired_state ORDER BY rev DESC LIMIT 1")
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(store_error)?;
         let Some(row) = row else {
             return Ok(None);
         };
         let rev: i64 = row.try_get("rev").map_err(store_error)?;
-        let body: String = row.try_get("body").map_err(store_error)?;
+        let rev = u64::try_from(rev).unwrap_or(0);
+        let sealed: Option<Vec<u8>> = row.try_get("body_enc").map_err(store_error)?;
+        let body = match sealed {
+            Some(blob) => {
+                let plaintext = self.key.open(rev, &blob)?;
+                String::from_utf8(plaintext).map_err(|_| {
+                    AgentError::Store("the stored desired state is not UTF-8".to_owned())
+                })?
+            }
+            // A row written before encryption existed: read it as plaintext.
+            None => row.try_get("body").map_err(store_error)?,
+        };
         let body = serde_json::from_str::<Value>(&body)
             .map_err(|e| AgentError::Store(format!("stored desired state is not JSON: {e}")))?;
-        Ok(Some((u64::try_from(rev).unwrap_or(0), body)))
+        Ok(Some((rev, body)))
     }
 
     /// Persists one accepted `desired_state` body atomically.
@@ -196,6 +341,7 @@ impl NodeStore {
     pub async fn store_desired(&self, rev: u64, body: &Value) -> Result<(), AgentError> {
         let text = serde_json::to_string(body)
             .map_err(|e| AgentError::Store(format!("could not encode desired state: {e}")))?;
+        let sealed = self.key.seal(rev, text.as_bytes());
         let issued_at = body
             .get("issued_at")
             .and_then(Value::as_str)
@@ -205,14 +351,14 @@ impl NodeStore {
 
         let mut tx = self.pool.begin().await.map_err(store_error)?;
         sqlx::query(
-            "INSERT INTO desired_state (rev, body, issued_at, term, stored_at) \
-             VALUES (?, ?, ?, ?, ?) \
-             ON CONFLICT(rev) DO UPDATE SET body = excluded.body, \
+            "INSERT INTO desired_state (rev, body, body_enc, issued_at, term, stored_at) \
+             VALUES (?, '', ?, ?, ?, ?) \
+             ON CONFLICT(rev) DO UPDATE SET body = '', body_enc = excluded.body_enc, \
              issued_at = excluded.issued_at, term = excluded.term, \
              stored_at = excluded.stored_at",
         )
         .bind(rev)
-        .bind(text)
+        .bind(sealed)
         .bind(issued_at)
         .bind(i64::try_from(term).unwrap_or(i64::MAX))
         .bind(util::now_rfc3339())
@@ -560,6 +706,61 @@ fn store_error(error: sqlx::Error) -> AgentError {
     AgentError::Store(error.to_string())
 }
 
+/// Adds `desired_state.body_enc` to a database created before bodies were
+/// encrypted. New databases get the column from [`SCHEMA`]; existing ones are
+/// altered once, and the old plaintext `body` rows keep loading.
+async fn migrate(pool: &SqlitePool) -> Result<(), AgentError> {
+    let columns = sqlx::query("PRAGMA table_info(desired_state)")
+        .fetch_all(pool)
+        .await
+        .map_err(store_error)?;
+    let has_enc = columns.iter().any(|row| {
+        row.try_get::<String, _>("name")
+            .is_ok_and(|name| name == "body_enc")
+    });
+    if !has_enc {
+        sqlx::query("ALTER TABLE desired_state ADD COLUMN body_enc BLOB")
+            .execute(pool)
+            .await
+            .map_err(store_error)?;
+    }
+    Ok(())
+}
+
+/// Encrypts every desired-state row still stored as plaintext by an older
+/// agent, so env values written before the node-local key existed do not
+/// stay readable on disk.
+async fn reseal_legacy(pool: &SqlitePool, key: &LocalKey) -> Result<(), AgentError> {
+    let rows: Vec<(i64, String)> =
+        sqlx::query_as("SELECT rev, body FROM desired_state WHERE body_enc IS NULL AND body <> ''")
+            .fetch_all(pool)
+            .await
+            .map_err(store_error)?;
+    for (rev, body) in rows {
+        let sealed = key.seal(u64::try_from(rev).unwrap_or(0), body.as_bytes());
+        sqlx::query("UPDATE desired_state SET body = '', body_enc = ? WHERE rev = ?")
+            .bind(sealed)
+            .bind(rev)
+            .execute(pool)
+            .await
+            .map_err(store_error)?;
+    }
+    Ok(())
+}
+
+/// The newest log instant already stored, so a restart never reuses one.
+async fn max_log_instant(pool: &SqlitePool) -> Result<i64, AgentError> {
+    let logs: Option<i64> = sqlx::query_scalar("SELECT MAX(time_ns) FROM log_lines")
+        .fetch_one(pool)
+        .await
+        .map_err(store_error)?;
+    let deployments: Option<i64> = sqlx::query_scalar("SELECT MAX(time_ns) FROM deployment_lines")
+        .fetch_one(pool)
+        .await
+        .map_err(store_error)?;
+    Ok(logs.unwrap_or(0).max(deployments.unwrap_or(0)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,5 +864,71 @@ mod tests {
         assert_eq!(store.applied_rev().await.unwrap(), 0);
         store.set_applied_rev(42).await.unwrap();
         assert_eq!(store.applied_rev().await.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn legacy_plaintext_rows_still_load() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let body =
+            json!({"rev": 3, "issued_at": "2026-11-02T10:15:31Z", "term": 1, "signature": "old"});
+        sqlx::query(
+            "INSERT INTO desired_state (rev, body, issued_at, term, stored_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(3i64)
+        .bind(body.to_string())
+        .bind("2026-11-02T10:15:31Z")
+        .bind(1i64)
+        .bind("2026-11-02T10:15:32Z")
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let (rev, loaded) = store.latest_desired().await.unwrap().unwrap();
+        assert_eq!(rev, 3);
+        assert_eq!(loaded["signature"], "old");
+
+        // The next start reseals it: no plaintext stays on disk.
+        drop(store);
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let (plain, sealed): (String, Option<Vec<u8>>) =
+            sqlx::query_as("SELECT body, body_enc FROM desired_state WHERE rev = 3")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert!(plain.is_empty());
+        assert!(sealed.is_some());
+        let (_, loaded) = store.latest_desired().await.unwrap().unwrap();
+        assert_eq!(loaded["signature"], "old");
+    }
+
+    #[tokio::test]
+    async fn a_new_row_is_ciphertext_and_a_tampered_one_fails() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let body =
+            json!({"rev": 9, "issued_at": "2026-11-02T10:15:31Z", "term": 1, "signature": "x"});
+        store.store_desired(9, &body).await.unwrap();
+
+        let row = sqlx::query("SELECT body, body_enc FROM desired_state WHERE rev = 9")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        let plaintext: String = row.try_get("body").unwrap();
+        assert!(plaintext.is_empty(), "no plaintext is kept for new rows");
+        let mut sealed: Vec<u8> = row.try_get("body_enc").unwrap();
+        assert!(!sealed.is_empty());
+
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0x01;
+        sqlx::query("UPDATE desired_state SET body_enc = ? WHERE rev = 9")
+            .bind(sealed)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.latest_desired().await,
+            Err(AgentError::LocalKey(_))
+        ));
     }
 }

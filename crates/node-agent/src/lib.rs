@@ -3,16 +3,19 @@
 //! the lease state machine with self-fencing.
 //!
 //! See `docs/contracts/node-agent-protocol.md`. The lease modules date from M0;
-//! [`identity`], [`tls`], [`enroll`], [`store`], [`reconcile`] and [`session`]
-//! are the M2 agent the binary starts.
+//! [`identity`], [`tls`], [`enroll`], [`store`], [`localkey`], [`logs`],
+//! [`health`], [`reconcile`] and [`session`] are the M2 agent the binary starts.
 //!
 //! The two entry points the binary calls are [`join`] (one-time enrollment,
 //! section 2) and [`run`] (reconciler plus dial-out session, sections 3-6).
 
 mod agent;
 pub mod enroll;
+pub mod health;
 pub mod identity;
 pub mod lease;
+pub mod localkey;
+pub mod logs;
 pub mod reconcile;
 pub mod session;
 pub mod store;
@@ -117,6 +120,9 @@ pub enum AgentError {
     Protocol(String),
     /// The local SQLite store failed.
     Store(String),
+    /// The node-local key file is missing, malformed or a body cannot be
+    /// decrypted with it.
+    LocalKey(String),
     /// The engine returned an error where the agent could not continue.
     Engine(String),
     /// The session ended in a way that must stop the agent (section 4.4).
@@ -159,6 +165,7 @@ impl fmt::Display for AgentError {
             Self::Tls(reason) => write!(f, "TLS: {reason}"),
             Self::Protocol(reason) => write!(f, "protocol: {reason}"),
             Self::Store(reason) => write!(f, "local store: {reason}"),
+            Self::LocalKey(reason) => write!(f, "node-local key: {reason}"),
             Self::Engine(reason) => write!(f, "engine: {reason}"),
             Self::Fatal(reason) => write!(f, "session ended: {reason}"),
         }

@@ -55,6 +55,7 @@ pub async fn run<E: Engine + 'static>(
         },
         ReconcileOptions::default(),
     );
+    let reconciler = reconciler.with_node_id(identity.get().node_id);
 
     let (stop, stop_rx) = watch::channel(false);
     let shutdown_stop = stop.clone();
