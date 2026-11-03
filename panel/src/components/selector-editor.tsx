@@ -86,8 +86,9 @@ export function SelectorEditor({
 
       <div className={cn('flex flex-col gap-2', everything && 'opacity-45')} aria-disabled={everything}>
         {groups.map((group) => (
-          <div key={group.kind} className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+          <div key={group.kind} className="grid grid-cols-[72px_minmax(0,1fr)] items-baseline gap-x-3">
             <span className="type-body-medium w-[72px] shrink-0 text-[13px] text-ink-muted">{group.label}</span>
+            <span className="flex flex-wrap gap-x-3 gap-y-1">
             {group.options.length === 0 ? (
               <span className="text-[13px] text-ink-muted">None yet</span>
             ) : (
@@ -106,6 +107,7 @@ export function SelectorEditor({
                 </label>
               ))
             )}
+            </span>
           </div>
         ))}
       </div>

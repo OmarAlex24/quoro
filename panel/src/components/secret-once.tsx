@@ -19,7 +19,7 @@ export function SecretOnce({
     <div className="rounded-[6px] border border-rail border-l-4 border-l-lamp-shift bg-panel px-3.5 py-3">
       <p className="type-body-medium text-[13px] text-ink">{label}</p>
       <div className="mt-2 flex flex-wrap items-center gap-2">
-        <code className="min-w-0 flex-1 break-all rounded-[4px] border border-rail bg-enamel px-2.5 py-1.5 type-data text-[14px] text-ink select-all">
+        <code className="min-w-0 flex-1 break-all rounded-[4px] border border-rail bg-enamel px-2.5 py-1.5 font-sans type-data text-[14px] text-ink select-all">
           {secret}
         </code>
         <CopyButton value={secret} label="Copy secret" />
