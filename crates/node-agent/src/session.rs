@@ -297,12 +297,23 @@ impl Session {
             tokio::select! {
                 () = &mut stop => return Ok(SessionEnd::Shutdown),
                 _ = heartbeat_tick.tick() => {
-                    let heartbeat = NodeMessage::Heartbeat(Heartbeat {
+                    let beat = NodeMessage::Heartbeat(Heartbeat {
                         time: util::now_rfc3339(),
                         busy: None,
                     });
-                    if let Err(e) = write_message(&mut sink, heartbeat, None).await {
+                    if let Err(e) = write_message(&mut sink, beat, None).await {
                         warn!(error = %e, "could not send a heartbeat; reconnecting");
+                        return Ok(SessionEnd::Reconnect);
+                    }
+                    // The primary sends nothing while it has nothing to say,
+                    // and only it enforces the session timeout (section 4.3).
+                    // A quiet session is probed with `ping`, whose `pong`
+                    // resets the node's own timer, so a half-open connection
+                    // is still noticed without dropping a healthy idle one.
+                    if last_rx.elapsed() >= heartbeat
+                        && let Err(e) = write_message(&mut sink, NodeMessage::Ping, None).await
+                    {
+                        warn!(error = %e, "could not send a ping; reconnecting");
                         return Ok(SessionEnd::Reconnect);
                     }
                 }

@@ -198,3 +198,67 @@ async fn fake_primary_owned(server: DuplexStream, key: SigningKey) {
 fn key_verifying(key: &SigningKey) -> String {
     sign::public_key_to_base64(&key.verifying_key())
 }
+
+/// A primary that says nothing after `welcome` but answers every `ping`, as the
+/// real one does: only the primary enforces the session timeout (section 4.3).
+async fn quiet_primary(server: DuplexStream) {
+    let mut ws = tokio_tungstenite::accept_async(server).await.unwrap();
+    let hello = read_frame(&mut ws).await;
+    send(
+        &mut ws,
+        ControlMessage::Welcome(Welcome {
+            cluster_id: "cls_test".to_owned(),
+            term: 1,
+            server_time: "2026-11-02T10:15:30Z".to_owned(),
+            heartbeat_interval_ms: 20,
+            session_timeout_ms: 120,
+            primary_node_id: "nod_primary".to_owned(),
+        })
+        .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
+        .to_text(),
+    )
+    .await;
+    while let Some(Ok(message)) = ws.next().await {
+        if let Message::Text(text) = message {
+            let frame: Value = serde_json::from_str(text.as_str()).unwrap();
+            if frame["type"] == "ping" {
+                let pong = ControlMessage::Pong
+                    .to_frame("msg_pong", frame["id"].as_str())
+                    .to_text();
+                send(&mut ws, pong).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_idle_session_with_a_live_primary_stays_up() {
+    let dir = TempDir::new();
+    let key = sign::signing_key_from_seed(&[5; 32]);
+    let identity = identity_files(dir.path(), &key);
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let (desired, _desired_rx) = watch::channel(None);
+    let (_observed_tx, observed_rx) = watch::channel(Vec::new());
+    let mut session = Session::new(SessionSetup {
+        identity,
+        store,
+        facts: facts(),
+        desired,
+        observed: observed_rx,
+        current: None,
+    });
+
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let primary = tokio::spawn(quiet_primary(server));
+    let (client_ws, _response) = client_async("ws://primary.test/api/v1/nodes/session", client)
+        .await
+        .unwrap();
+    let serving =
+        tokio::spawn(async move { session.serve(client_ws, std::future::pending::<()>()).await });
+
+    // Ten session timeouts of silence from the primary, apart from pongs.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(!serving.is_finished(), "the idle session was dropped");
+    serving.abort();
+    primary.abort();
+}
