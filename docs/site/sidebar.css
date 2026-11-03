@@ -1,0 +1,6 @@
+/* The only change to mdBook's default theme. The sidebar numbers every
+   chapter ("9.1."), which doubles up with the ADR numbers in their titles
+   ("0001:"); the numbers are decorative (aria-hidden), so hide them. */
+.chapter-item a > strong[aria-hidden="true"] {
+  display: none;
+}
