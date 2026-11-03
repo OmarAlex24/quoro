@@ -19,6 +19,7 @@ from fake_backend import FakeBackend
 APP_ID = "app_01JTESTAPP00000000000000"
 INCIDENT_ID = "inc_01JTESTINCIDENT0000000000"
 AGENT_ID = "agt_01JTESTAGENT00000000000000"
+GRANT_ID = "grt_01JTESTGRANT00000000000000"
 
 TOOLS = ["get_incident", "get_app", "restart_app", "resolve_incident"]
 
@@ -50,19 +51,26 @@ class FakeSession:
             return ToolResult(
                 ok=False, problem={"code": "forbidden", "reason": "scope_missing"}
             )
+        if name == "get_app":
+            return ToolResult(ok=True, value={"instances": [{"status": "running"}]})
         return ToolResult(ok=True, value={})
 
 
-def _wake() -> Wake:
+def _wake(grant_id: str | None = None) -> Wake:
+    wake = {"agent_id": AGENT_ID}
+    if grant_id is not None:
+        wake["grant_id"] = grant_id
     return Wake(
         incident_id=INCIDENT_ID,
         agent_id=AGENT_ID,
+        grant_id=grant_id,
         event={
             "type": "incident.opened",
             "data": {
                 "incident_id": INCIDENT_ID,
                 "title": "health check failed",
-                "wake": {"agent_id": AGENT_ID},
+                "subject": {"type": "app", "id": APP_ID},
+                "wake": wake,
             },
         },
     )
@@ -169,6 +177,31 @@ class DeterministicPolicyTests(unittest.TestCase):
         self.assertEqual([call["tool"] for call in session.calls], ["get_incident"])
         self.assertIsNone(outcome.recovered)
         self.assertIn("not an app", outcome.summary)
+
+    def test_the_grant_is_named_wherever_the_incident_is(self) -> None:
+        session = FakeSession()
+        policy = DeterministicRestartPolicy(
+            resolve_incident=True, poll_interval_s=0.0, poll_attempts=1
+        )
+
+        policy.handle(_wake(GRANT_ID), session)  # type: ignore[arg-type]
+
+        restart = next(call for call in session.calls if call["tool"] == "restart_app")
+        self.assertIn(GRANT_ID, restart["arguments"]["justification"])
+        resolve = next(
+            call for call in session.calls if call["tool"] == "resolve_incident"
+        )
+        self.assertIn(GRANT_ID, resolve["arguments"]["justification"])
+
+    def test_no_grant_id_leaves_the_text_unchanged(self) -> None:
+        session = FakeSession()
+
+        DeterministicRestartPolicy(
+            poll_interval_s=0.0, poll_attempts=1
+        ).handle(_wake(), session)  # type: ignore[arg-type]
+
+        restart = next(call for call in session.calls if call["tool"] == "restart_app")
+        self.assertNotIn("grant grt_", restart["arguments"]["justification"])
 
 
 if __name__ == "__main__":

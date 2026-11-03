@@ -81,6 +81,12 @@ grant the only thing the agent can use.
    human-only scopes are refused, so a webhook cannot widen what an agent may do.
    Keep the webhook secret Quoro shows once and write it to
    `/etc/agent-runner/webhook-secret` (mode 0600).
+
+   When the webhook has `wake`, the delivery also carries `data.wake` with the
+   `agent_id` it wakes and the `grant_id` of the incident grant Quoro just
+   issued for it. The runner acts as that agent, and names the grant in the
+   justifications it sends. A webhook without `wake` — and every test delivery —
+   carries no `data.wake`, so the runner falls back to `default_agent_id`.
 4. **Write the runner config.** Copy `runner.example.toml` to `runner.toml` and
    fill in the listen address, Quoro's URL, the TLS option you use, the secret
    path and one `[agents."agt_..."]` entry per agent the runner may wake.
@@ -113,7 +119,7 @@ deliveries for one incident never run concurrently.
 | `ca_file` | system trust | PEM file used to verify Quoro's certificate. Do not set together with `tls_fingerprint`. |
 | `webhook_secret_file` | required* | File holding the webhook secret. |
 | `webhook_secret_env` | required* | Environment variable holding the webhook secret. Set exactly one of the two. |
-| `default_agent_id` | none | Agent used when a delivery names none in `data.wake.agent_id`. Must have an `[agents]` entry. |
+| `default_agent_id` | none | Agent used when a delivery carries no usable `data.wake.agent_id` (absent, not an `agt_` id, or not an object). Must have an `[agents]` entry. |
 | `policy` | `deterministic` | `deterministic` or `llm`. |
 | `check_url` | none | After a restart, `GET` this URL and require 200 before calling the app recovered. Uses system trust. |
 | `resolve_incident` | `false` | Resolve the incident after a successful recovery, when the scope and tool are available. |
@@ -145,7 +151,13 @@ class Policy(Protocol):
     def handle(self, wake: Wake, mcp: McpSession) -> Outcome: ...
 ```
 
-`Wake` carries the `incident_id`, the `agent_id` and the event envelope.
+`Wake` carries the `incident_id`, the `agent_id`, the event envelope, and the
+`grant_id` of the incident grant when the delivery named one (`None` otherwise).
+An `agent_id` from `data.wake` is used only when it is a well-formed `agt_` id;
+anything else falls back to `default_agent_id`, and a delivery that names an
+agent without a configured key is ignored as `unknown_agent` rather than
+retried as the default. A `grant_id` is kept only when it is a well-formed
+`grt_` id, and the policies name it wherever they name the incident.
 `Outcome` records the actions taken, whether the app recovered, whether the
 incident was resolved, and a one-line summary. `McpSession` exposes
 `tool_names()`, `list_tools()` and `call(name, arguments, justification=None)`.
@@ -184,6 +196,7 @@ python3 -m unittest discover -s tests -v
 ```
 
 They cover signature verification, the HTTP receiver against a fake Quoro
-(token minting, tool calls, deduplication, unknown agents, refusals), TLS
-fingerprint comparison, the MCP client's JSON and event-stream parsing, the
-mutating-call rules, config validation and the LLM policy with a fake backend.
+(token minting, tool calls, deduplication, agent selection from `data.wake` and
+the default, malformed wakes, unknown agents, refusals), TLS fingerprint
+comparison, the MCP client's JSON and event-stream parsing, the mutating-call
+rules, config validation and the LLM policy with a fake backend.
