@@ -122,6 +122,7 @@ fn network() -> NodeNetwork {
         bridge: BRIDGE.to_string(),
         subnet: SUBNET.to_string(),
         gateway: GATEWAY.parse().expect("gateway"),
+        dns: Vec::new(),
     }
 }
 
@@ -185,6 +186,7 @@ fn lab_spec(
             ip: ip.parse().expect("address"),
             gateway: GATEWAY.parse().expect("gateway"),
             mac: MacAddr([0x02, 0x00, 0x00, 0x00, 0x77, seed]),
+            isolation_group: None,
         },
         init: InitConfig {
             entrypoint: Vec::new(),

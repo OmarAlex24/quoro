@@ -222,6 +222,7 @@ mod tests {
                 ip: "10.42.1.7".parse().expect("ip"),
                 gateway: "10.42.1.1".parse().expect("gateway"),
                 mac: MacAddr([0x02, 0, 0, 0, 0, 1]),
+                isolation_group: None,
             },
             init: InitConfig {
                 entrypoint: vec!["/app/server".to_string()],

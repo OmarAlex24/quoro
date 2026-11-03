@@ -88,7 +88,7 @@ The `kvm` object is filled from a probe at enrollment: `/dev/kvm` exists and is 
 | `credential` | string | Node session credential, returned once |
 | `cluster_public_key` | string | Base64 Ed25519 public key that signs desired state |
 
-The credential is 32 random bytes, base64-encoded, and stored root-only on the node. The primary stores only its hash, so a database read does not yield a usable credential.
+The credential is 32 random bytes, base64-encoded, and stored root-only on the node. The primary stores only its SHA-256 hash, in the local table `node_credentials` (`db-schema.sql` migration 0002), so a database read does not yield a usable credential and the hash never travels in the change log.
 
 Desired state and lease messages are signed with the cluster signing key (Ed25519), whose public key the node pins at enrollment; that key is separate from the cluster data-encryption key that protects data at rest (D-0050). The signing key is Ed25519; data at rest uses a 256-bit cluster data-encryption key with XChaCha20-Poly1305, plus a node-local key that encrypts this node's copy of desired-state secrets. All keys are files mode 0600 in `/var/lib/quoro` on the primary, outside the SQLite file, generated at first start and backed up separately from the database. Custody of the keys when a replica is promoted is open (Q-0024).
 
@@ -449,7 +449,7 @@ The primary keeps sending from `seq + 1`. An ack that skips a sequence is ignore
 | `lines` | array of object | no | Log lines; present for `app_logs` and `deployment_logs` |
 | `data` | string | no | Base64 bytes; reserved for byte-oriented kinds |
 
-Exactly one of `lines` and `data` is present. A log line is `{ "time": <RFC 3339>, "stream": "stdout"|"stderr", "line": <string without trailing newline> }`. Lines come from the engine's output stream, which the minimal init tags by stream on the guest side (`engine-trait.md`); the node does not guess.
+Exactly one of `lines` and `data` is present. A log line is `{ "time": <RFC 3339>, "stream": "stdout"|"stderr", "line": <string without trailing newline>, "vm_id": <vm_> }`; `vm_id` is optional and names the VM that produced the line, so a stream opened for an app with several VMs stays attributable. Lines come from the engine's output stream, which the minimal init tags by stream on the guest side (`engine-trait.md`); the node does not guess.
 
 ```json
 {
@@ -501,6 +501,7 @@ The primary closes the matching API or panel consumer. `cancelled` is the answer
 | `status` | string | yes | `ok` or `error` |
 | `detail` | string | no | Short human-readable detail |
 | `error` | object | no | `{ "code": ..., "message": ... }` using the `error` codes in section 5.18 |
+| `lines` | array of object | no | Log lines, oldest first, in the line shape of section 5.7; present only in the answer to `command` kind `logs_query` |
 
 `re` identifies the message being answered. For `desired_state` the answer means **stored**: the signature was verified and the snapshot was persisted atomically. It does not mean applied — that is `applied_rev` in `status_report`. For `lease_revoke` the answer means the stateful VMs bound to the lease are stopped and recorded. A `lease_revoke` whose self-fence could not confirm that every bound VM stopped is answered with `status: error` and `error.code` `fence_failed` (sections 5.18 and 8.5); `detail` names the VMs that may still run.
 
@@ -588,6 +589,7 @@ A `lease_revoke` whose fence failed:
 | `vm_id` | string (`vm_`) | yes | VM identity |
 | `project_id` | string (`prj_`) | yes | Owning project |
 | `app_id` | string (`app_`) | no | Set when this VM is an instance of an app; absent for a standalone VM |
+| `deployment_id` | string (`dep_`) | no | The deployment that produced this VM, when it is an app instance; selects the VM for `stream_open` kind `deployment_logs` |
 | `name` | string | yes | Operator-visible name |
 | `image` | string | yes | OCI reference as requested |
 | `image_digest` | string | yes | Resolved digest |
@@ -825,7 +827,7 @@ The node stops producing, releases the stream slot, and answers `stream_end` wit
 | `kind` | string | yes | `logs_query`, `probe` or `fence_ack` in v1 |
 | `params` | object | yes | Kind-specific parameters |
 
-`logs_query` params: `app_id` or `vm_id` (exactly one), `since` (RFC 3339, optional), `until` (RFC 3339, optional), `tail` (integer, optional). The answer is a `command_result` carrying the lines, then `status: ok`.
+`logs_query` params: `app_id` or `vm_id` (exactly one), `since` (RFC 3339, optional), `until` (RFC 3339, optional), `tail` (integer, optional). The answer is one `command_result` with `status: ok` and the matching lines in `lines` (section 5.9), each carrying its `vm_id`. The answer must fit the 1 MiB message limit: the node keeps the newest lines that fit and says in `detail` that older ones were left out.
 
 `probe` params: `{}`. The node re-runs the KVM probe (`/dev/kvm`, CPU flags, kernel release) and answers with a `command_result` whose `detail` summarizes it; the primary updates the node's `kvm` record and `engine_version`.
 
@@ -981,7 +983,7 @@ The node always acts on the newest verified snapshot in its local store. It neve
 
 An apply run always follows this order, whatever changed:
 
-1. **Network.** Ensure the bridge, subnet and gateway from `spec.network`, and the per-VM TAP devices.
+1. **Network.** Ensure the bridge, subnet and gateway from `spec.network`, and the per-VM TAP devices. Each VM is attached with its `project_id` as its isolation group, so the VMs of one project reach each other and VMs of different projects do not (`engine-trait.md` section 3.3, D-0084). The DNS servers handed to guests come from the node's own configuration, not from `spec.network`.
 2. **Images.** Prepare every image referenced by a VM whose rootfs is missing or has a different digest, and remove rootfs images no longer referenced.
 3. **Stop.** Stop VMs that are no longer desired, or whose spec requires a recreate (image digest, disk size, network identity).
 4. **Start.** Start desired VMs that are not running.

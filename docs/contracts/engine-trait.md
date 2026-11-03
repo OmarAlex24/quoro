@@ -135,6 +135,11 @@ pub struct NetAttach {
     pub ip: Ipv4Addr,
     pub gateway: Ipv4Addr,
     pub mac: MacAddr,
+    /// Isolation group of the VM. VMs on the same bridge that carry the same
+    /// group reach each other; VMs in different groups, and a VM with `None`,
+    /// reach no other VM. The node agent sets it to the VM's project id
+    /// (`prj_`). Section 3.3.
+    pub isolation_group: Option<String>,
 }
 
 /// The app's command line and identity, as the minimal init must apply it.
@@ -245,6 +250,10 @@ pub struct NodeNetwork {
     pub bridge: String,
     pub subnet: String, // CIDR, for example "10.42.1.0/24"
     pub gateway: Ipv4Addr,
+    /// DNS servers handed to the guests created on this network, in order.
+    /// Taken from the node's configuration; empty means guests get no
+    /// resolver. Not part of the network's identity. Section 3.3.
+    pub dns: Vec<Ipv4Addr>,
 }
 
 /// A point-in-time volume snapshot descriptor. Section 3.16.
@@ -405,6 +414,10 @@ The procedure follows `docs/research/vps-nested-virt.md`. A successful probe is 
 
 Brings the node network to the requested `NodeNetwork`: the bridge exists, carries the gateway address, and forwards app traffic. Quoro owns the networking layer — bridges, TAP devices, addresses, firewall rules — rather than delegating it (D-0007). Precondition: `subnet` and `gateway` are consistent. Postcondition: a VM with an address inside `subnet` can reach the gateway. Idempotent: calling it twice with the same values changes nothing. An existing bridge with a different subnet is `Conflict`, never a silent reconfiguration.
 
+The identity of a network is `bridge`, `subnet` and `gateway`. `dns` is not part of it: a call that repeats the identity with a different `dns` is `Ok` and changes the servers given to VMs created afterwards; a VM that already exists keeps the servers it was created with until it is recreated. The node agent fills `dns` from the node's own configuration, so guest resolvers are a property of the node, not of the control plane.
+
+**Isolation groups.** Every VM on the bridge is isolated from every other VM on it, except from the VMs that carry the same `NetAttach::isolation_group` (D-0084). Two VMs with the same group exchange traffic over the bridge in both directions; two VMs with different groups, or a VM whose group is `None`, exchange nothing — neither frames on the bridge nor packets routed through the gateway. Every VM still reaches the gateway and, through it, the outside, and the host still opens connections to every VM, because the ingress runs on the host. The node agent sets the group to the VM's `project_id`, so the VMs of one project reach each other and VMs of different projects do not. The rule is enforced by the engine and holds across VM creates, deletes and an agent restart; the group is part of the VM's spec, so it is compared by `create` (section 3.6) like every other field.
+
 ### 3.4 `prepare_image`
 
 Pulls the OCI image, verifies that the pulled content matches `ImageRef::digest`, converts it into a rootfs image, records the extracted `ImageConfig`, and caches the result by digest.
@@ -530,7 +543,7 @@ The minimal init is part of the engine workstream and is the only process Quoro 
 | Environment | Name and value pairs, already decrypted by the node agent |
 | User | The user the app must run as |
 | Working directory | The app's working directory |
-| Network | Address, prefix length, gateway and interface name |
+| Network | Address, prefix length, gateway, interface name and the DNS servers of the node network (`NodeNetwork::dns`) |
 | Console | Which console carries log lines |
 
 **What the init must do.**
@@ -571,6 +584,6 @@ The node agent runs its protocol tests against `FakeEngine`: the M0 lease tests 
 | --- | --- |
 | M0 | The trait, `FakeEngine`, and the spike that boots a microVM from an OCI image (D-0033) |
 | M1 | `create`, `start`, `stop`, `delete`, `list`, `inspect`, `prepare_image`, `ensure_network` (D-0033) |
-| M2 | `output` feeds live app logs (D-0014, D-0033) |
+| M2 | `output` feeds live app logs (D-0014, D-0033); isolation groups on `NetAttach` and guest DNS on `NodeNetwork` (D-0084) |
 | M4 | `console` and `counters` (D-0033) |
 | M5a/M5b | `snapshot_volume` and `delete_volume_snapshot`: reflink snapshots for M5a, the primitive chosen by the lvm-thin vs btrfs spike for M5b (D-0023, D-0062) |

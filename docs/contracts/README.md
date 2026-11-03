@@ -264,7 +264,7 @@ Defined in node-agent-protocol.md. Node to control plane: `hello`, `heartbeat`, 
 
 ### Database tables
 
-Defined in db-schema.sql and changed only by the numbered files in `migrations/`: `meta`, `change_log`, `nodes`, `node_join_tokens`, `projects`, `vms`, `apps`, `app_env`, `deployments`, `domains`, `volumes`, `leases`, `users`, `api_tokens`, `sessions`, `agents`, `agent_keys`, `access_tokens`, `grants`, `approvals`, `incidents`, `events`, `webhooks`, `webhook_deliveries`, `providers`, `audit_log`, `audit_exports`. Tables marked local in that file are not replicated through the change log.
+Defined in db-schema.sql and changed only by the numbered files in `migrations/`: `meta`, `change_log`, `nodes`, `node_join_tokens`, `node_credentials`, `projects`, `vms`, `apps`, `app_env`, `deployments`, `domains`, `volumes`, `leases`, `users`, `api_tokens`, `sessions`, `agents`, `agent_keys`, `access_tokens`, `grants`, `approvals`, `incidents`, `events`, `webhooks`, `webhook_deliveries`, `providers`, `audit_log`, `audit_exports`. Tables marked local in that file are not replicated through the change log.
 
 ## Open items before the freeze
 

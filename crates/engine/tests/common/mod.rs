@@ -38,6 +38,7 @@ pub fn sample_spec(rootfs: &ImageDigest, id: &str) -> VmSpec {
             ip: "10.42.1.10".parse().expect("sample address"),
             gateway: "10.42.1.1".parse().expect("sample gateway"),
             mac: MacAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]),
+            isolation_group: None,
         },
         init: InitConfig {
             entrypoint: vec!["/app".to_string()],

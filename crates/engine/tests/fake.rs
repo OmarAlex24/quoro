@@ -368,6 +368,7 @@ async fn ensure_network_is_idempotent_and_conflicts_on_a_different_value() {
         bridge: "br0".to_string(),
         subnet: "10.42.1.0/24".to_string(),
         gateway: "10.42.1.1".parse().expect("sample gateway"),
+        dns: Vec::new(),
     };
     engine.ensure_network(&net).await.expect("first call");
     engine.ensure_network(&net).await.expect("same values");
