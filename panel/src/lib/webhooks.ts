@@ -1,0 +1,182 @@
+import {
+  EventType,
+  type CreateWebhookRequest,
+  type Selector,
+  type UpdateWebhookRequest,
+  type Webhook,
+  type WebhookDelivery,
+  type WebhookDeliveryStatus,
+  type WebhookWake,
+} from '../api/generated/model';
+import { formatDuration } from './agency-format';
+import type { LampTone } from './lamp';
+
+/** The subjects an event type is grouped under, in contract order. */
+const EVENT_SUBJECTS = [
+  'node',
+  'vm',
+  'app',
+  'deployment',
+  'certificate',
+  'grant',
+  'approval',
+  'incident',
+  'audit',
+] as const;
+
+export const allEventTypes = (): EventType[] => Object.values(EventType);
+
+/**
+ * Every `EventType` grouped by its subject prefix, preserving the order the
+ * contract lists them in. The add dialog paints one group per subject.
+ */
+export const eventTypesBySubject = (): Array<{ subject: string; types: EventType[] }> =>
+  EVENT_SUBJECTS.map((subject) => ({
+    subject,
+    types: allEventTypes().filter((type) => type.startsWith(`${subject}.`)),
+  })).filter((group) => group.types.length > 0);
+
+/** "Every event", the list when it is short, or a count when it is long. */
+export const describeEventTypes = (types: readonly EventType[]): string => {
+  if (types.length === 0) return 'Every event';
+  if (types.length <= 3) return types.join(', ');
+  return `${types.length} event types`;
+};
+
+/**
+ * A receiver URL: HTTPS anywhere, or plain HTTP only to localhost for testing
+ * (`Webhook.url` in the contract). Spaces and non-URL text are refused before
+ * the request goes out.
+ */
+export const isValidWebhookUrl = (value: string): boolean => {
+  const trimmed = value.trim();
+  if (trimmed === '' || /\s/.test(trimmed)) return false;
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol === 'https:') return parsed.hostname !== '';
+  if (parsed.protocol !== 'http:') return false;
+  return parsed.hostname === 'localhost';
+};
+
+export interface DeliveryLamp {
+  readonly tone: LampTone;
+  readonly pulse: boolean;
+  readonly word: string;
+}
+
+const DELIVERY_LAMPS: Record<WebhookDeliveryStatus, DeliveryLamp> = {
+  pending: { tone: 'shift', pulse: true, word: 'Pending' },
+  delivered: { tone: 'run', pulse: false, word: 'Delivered' },
+  failed: { tone: 'fault', pulse: false, word: 'Failed' },
+};
+
+/** The lamp and word for one delivery: delivered runs, pending shifts, failed faults. */
+export const deliveryLamp = (status: WebhookDeliveryStatus): DeliveryLamp =>
+  DELIVERY_LAMPS[status];
+
+/** Every 2 s while an attempt is still pending, otherwise every 15 s. */
+export const deliveryPollingInterval = (
+  deliveries: ReadonlyArray<Pick<WebhookDelivery, 'status'>>,
+): number => (deliveries.some((delivery) => delivery.status === 'pending') ? 2_000 : 15_000);
+
+/** The wake configuration with the contract defaults filled in. */
+export const normalizeWake = (wake: WebhookWake): WebhookWake => ({
+  agent_id: wake.agent_id,
+  grant_scopes: wake.grant_scopes ?? [],
+  grant_ttl_s: wake.grant_ttl_s ?? 3_600,
+  grant_max_uses: wake.grant_max_uses ?? null,
+});
+
+/**
+ * One sentence for a list bay: "Wakes on-call with app:read, app:logs for 1 h",
+ * or "Notifies only" when the webhook has no wake configuration.
+ */
+export const wakeSummary = (wake: WebhookWake | undefined, agentName: string): string => {
+  if (!wake) return 'Notifies only';
+  const scopes = wake.grant_scopes ?? [];
+  const ttl = wake.grant_ttl_s ?? 3_600;
+  const withScopes = scopes.length > 0 ? ` with ${scopes.join(', ')}` : '';
+  return `Wakes ${agentName}${withScopes} for ${formatDuration(ttl)}`;
+};
+
+/** What the add and edit forms hold, before it becomes a request body. */
+export interface WebhookForm {
+  name: string;
+  url: string;
+  event_types: EventType[];
+  selector: Selector;
+  enabled: boolean;
+  wake?: WebhookWake;
+}
+
+/** The form the edit dialog starts from. `wake` is copied, never aliased. */
+export const formFromWebhook = (webhook: Webhook): WebhookForm => ({
+  name: webhook.name,
+  url: webhook.url,
+  event_types: [...webhook.event_types],
+  selector: { ...webhook.selector },
+  enabled: webhook.enabled,
+  ...(webhook.wake ? { wake: normalizeWake(webhook.wake) } : {}),
+});
+
+const normalizeSelector = (selector: Selector) => ({
+  all: selector.all === true,
+  projects: selector.projects ?? [],
+  apps: selector.apps ?? [],
+  nodes: selector.nodes ?? [],
+});
+
+const sameSelector = (left: Selector, right: Selector): boolean =>
+  JSON.stringify(normalizeSelector(left)) === JSON.stringify(normalizeSelector(right));
+
+const sameEventTypes = (left: readonly EventType[], right: readonly EventType[]): boolean =>
+  left.length === right.length && left.every((type, index) => type === right[index]);
+
+/**
+ * The create body: an empty `event_types` list means every event, and the wake
+ * block is absent unless the form is waking an agent.
+ */
+export const buildCreateWebhookBody = (form: WebhookForm): CreateWebhookRequest => {
+  const body: CreateWebhookRequest = {
+    name: form.name.trim(),
+    url: form.url.trim(),
+    event_types: [...form.event_types],
+    selector: form.selector,
+    enabled: form.enabled,
+  };
+  if (form.wake?.agent_id) body.wake = normalizeWake(form.wake);
+  return body;
+};
+
+/**
+ * The PATCH body: only fields whose value changed. An absent field stays as it
+ * is on the server, which is why the wake block is never sent empty.
+ */
+export const buildUpdateWebhookBody = (
+  current: Webhook,
+  form: WebhookForm,
+): UpdateWebhookRequest => {
+  const body: UpdateWebhookRequest = {};
+  const name = form.name.trim();
+  if (name !== current.name) body.name = name;
+  const url = form.url.trim();
+  if (url !== current.url) body.url = url;
+  if (!sameEventTypes(form.event_types, current.event_types)) {
+    body.event_types = [...form.event_types];
+  }
+  if (!sameSelector(form.selector, current.selector)) body.selector = form.selector;
+  if (form.enabled !== current.enabled) body.enabled = form.enabled;
+  if (form.wake?.agent_id) {
+    const next = normalizeWake(form.wake);
+    const before = current.wake ? normalizeWake(current.wake) : null;
+    if (JSON.stringify(next) !== JSON.stringify(before)) body.wake = next;
+  }
+  return body;
+};
+
+export const updateHasChanges = (body: UpdateWebhookRequest): boolean =>
+  Object.keys(body).length > 0;
