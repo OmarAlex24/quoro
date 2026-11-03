@@ -29,7 +29,10 @@ use quoro_proto::wire::{DesiredState, DesiredStatus, Health, ObservedStatus, Spe
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
+use crate::health::{FIRST_PROBE_DELAY, HealthTarget, is_passing, probe};
+use crate::logs::LogCollector;
 use crate::store::NodeStore;
+use crate::util;
 
 /// The verified snapshot the reconciler acts on.
 #[derive(Clone, Debug, PartialEq)]
@@ -94,6 +97,22 @@ struct VmTiming {
     retry_at: Option<Instant>,
     backoff: Duration,
     running_since: Option<Instant>,
+}
+
+/// The app and deployment a desired VM belongs to, from the current snapshot.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SpecMeta {
+    app_id: Option<String>,
+    deployment_id: Option<String>,
+}
+
+/// One VM's health-check state.
+#[derive(Clone, Debug)]
+struct HealthState {
+    target: HealthTarget,
+    status: Health,
+    failures: u32,
+    next_at: Instant,
 }
 
 /// A parsed IPv4 subnet.
@@ -165,9 +184,13 @@ pub struct Reconciler<E: Engine> {
     last_states: HashMap<String, VmState>,
     once_only: Vec<VmStatus>,
     published: Option<Vec<VmStatus>>,
+    collector: LogCollector<E>,
+    node_id: Option<String>,
+    spec_meta: HashMap<String, SpecMeta>,
+    health: HashMap<String, HealthState>,
 }
 
-impl<E: Engine> Reconciler<E> {
+impl<E: Engine + 'static> Reconciler<E> {
     /// Builds a reconciler and the channel it publishes observations on.
     #[must_use]
     pub fn new(
@@ -177,6 +200,7 @@ impl<E: Engine> Reconciler<E> {
         options: ReconcileOptions,
     ) -> (Self, watch::Receiver<Vec<VmStatus>>) {
         let (observed, receiver) = watch::channel(Vec::new());
+        let collector = LogCollector::new(Arc::clone(&engine), store.clone());
         (
             Self {
                 engine,
@@ -190,9 +214,21 @@ impl<E: Engine> Reconciler<E> {
                 last_states: HashMap::new(),
                 once_only: Vec::new(),
                 published: None,
+                collector,
+                node_id: None,
+                spec_meta: HashMap::new(),
+                health: HashMap::new(),
             },
             receiver,
         )
+    }
+
+    /// Sets the `nod_` id node-originated events carry. Without it those
+    /// events are not emitted.
+    #[must_use]
+    pub fn with_node_id(mut self, node_id: String) -> Self {
+        self.node_id = Some(node_id);
+        self
     }
 
     /// Runs passes until `shutdown` resolves: immediately, when the snapshot
@@ -207,6 +243,8 @@ impl<E: Engine> Reconciler<E> {
         let mut events_open = true;
         let mut ticker = tokio::time::interval(self.options.tick);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut health_tick = tokio::time::interval(Duration::from_millis(500));
+        health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut current = snapshots.borrow_and_update().clone();
 
         loop {
@@ -242,6 +280,10 @@ impl<E: Engine> Reconciler<E> {
                 _ = ticker.tick() => {
                     self.reconcile_once(current.as_ref()).await;
                 }
+                _ = health_tick.tick() => {
+                    self.health_pass(current.as_ref()).await;
+                    self.publish().await;
+                }
             }
         }
         info!("reconciler stopped");
@@ -256,6 +298,19 @@ impl<E: Engine> Reconciler<E> {
             return self.published.clone().unwrap_or_default();
         };
         let spec = &snapshot.state.spec;
+        self.spec_meta = spec
+            .vms
+            .iter()
+            .map(|vm| {
+                (
+                    vm.vm_id.clone(),
+                    SpecMeta {
+                        app_id: vm.app_id.clone(),
+                        deployment_id: vm.deployment_id.clone(),
+                    },
+                )
+            })
+            .collect();
 
         let Some(subnet) = Subnet::parse(&spec.network.subnet, &spec.network.gateway) else {
             warn!(
@@ -318,6 +373,7 @@ impl<E: Engine> Reconciler<E> {
             warn!(error = %e, "could not record the applied revision");
         }
 
+        self.health_pass(Some(snapshot)).await;
         self.publish().await
     }
 
@@ -390,10 +446,15 @@ impl<E: Engine> Reconciler<E> {
                 match self.engine.start(&id).await {
                     Ok(started) => {
                         info!(vm_id, "VM restarted for a new restart_generation");
+                        self.deployment_line(vm, "boot", "VM started").await;
                         info = started;
                     }
                     Err(e) => {
                         warn!(vm_id, error = ?e, "could not start the VM after its restart");
+                        let error = e.to_string();
+                        self.deployment_line(vm, "boot", &format!("VM start failed: {error}"))
+                            .await;
+                        self.deployment_failed(vm, "boot", &error).await;
                         reached = false;
                     }
                 }
@@ -435,10 +496,19 @@ impl<E: Engine> Reconciler<E> {
                         match self.engine.start(&id).await {
                             Ok(started) => {
                                 debug!(vm_id, "VM started");
+                                self.deployment_line(vm, "boot", "VM started").await;
                                 info = started;
                             }
                             Err(e) => {
                                 warn!(vm_id, error = ?e, "could not start the VM");
+                                let error = e.to_string();
+                                self.deployment_line(
+                                    vm,
+                                    "boot",
+                                    &format!("VM start failed: {error}"),
+                                )
+                                .await;
+                                self.deployment_failed(vm, "boot", &error).await;
                                 reached = false;
                             }
                         }
@@ -512,15 +582,33 @@ impl<E: Engine> Reconciler<E> {
             reference: vm.image.clone(),
             digest: ImageDigest(vm.image_digest.clone()),
         };
+        self.deployment_line(vm, "pull", &format!("pulling {}", vm.image))
+            .await;
         let prepared = match self.engine.prepare_image(&image).await {
             Ok(prepared) => prepared,
             Err(e) => {
                 warn!(vm_id, image = %vm.image, error = ?e, "could not prepare the VM image");
+                let error = e.to_string();
+                self.deployment_line(vm, "pull", &error).await;
+                self.deployment_failed(vm, "pull", &error).await;
                 return None;
             }
         };
+        self.deployment_line(
+            vm,
+            "rootfs",
+            &format!("rootfs ready ({})", prepared.digest.0),
+        )
+        .await;
 
         let ip = self.address_for(&vm_id, subnet).await?;
+        let console = match self.store.console_socket(&vm_id) {
+            Ok(socket) => ConsoleMode::VirtioConsole { socket },
+            Err(e) => {
+                warn!(vm_id, error = %e, "could not prepare the VM's console socket");
+                return None;
+            }
+        };
         let spec = VmSpec {
             id: id.clone(),
             vcpus: u8::try_from(vm.vcpus.max(1)).unwrap_or(u8::MAX),
@@ -537,7 +625,7 @@ impl<E: Engine> Reconciler<E> {
                 isolation_group: Some(vm.project_id.clone()),
             },
             init: init_config(&prepared.config, &vm.env),
-            console: ConsoleMode::Off,
+            console,
         };
 
         match self.engine.create(&spec).await {
@@ -556,12 +644,199 @@ impl<E: Engine> Reconciler<E> {
                 {
                     warn!(vm_id, error = %e, "could not record the created image digest");
                 }
+                self.deployment_line(vm, "boot", "VM created").await;
                 info!(vm_id, %ip, project = %vm.project_id, "VM created");
                 Some(info)
             }
             Err(e) => {
                 warn!(vm_id, error = ?e, "could not create the VM");
+                let error = e.to_string();
+                self.deployment_line(vm, "boot", &format!("VM create failed: {error}"))
+                    .await;
+                self.deployment_failed(vm, "boot", &error).await;
                 None
+            }
+        }
+    }
+
+    /// Records one deployment-progress line, when the VM belongs to a
+    /// deployment.
+    async fn deployment_line(&self, vm: &SpecVm, phase: &str, message: &str) {
+        let Some(deployment_id) = vm.deployment_id.as_deref() else {
+            return;
+        };
+        if let Err(e) = self
+            .store
+            .append_deployment_line(deployment_id, phase, message, Some(&vm.vm_id))
+            .await
+        {
+            warn!(vm_id = %vm.vm_id, error = %e, "could not record a deployment line");
+        }
+    }
+
+    /// Buffers one `deployment.failed` event, at most once per deployment.
+    async fn deployment_failed(&self, vm: &SpecVm, phase: &str, error: &str) {
+        let Some(deployment_id) = vm.deployment_id.as_deref() else {
+            return;
+        };
+        let Some(node_id) = self.node_id.as_deref() else {
+            debug!("no node id; not emitting deployment.failed");
+            return;
+        };
+        let key = deployment_failed_key(deployment_id);
+        match self.store.meta(&key).await {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(e) => {
+                warn!(deployment_id, error = %e, "could not read the deployment.failed mark");
+                return;
+            }
+        }
+        let evt_id = util::event_id();
+        let body = serde_json::json!({
+            "schema_version": 1,
+            "id": evt_id,
+            "type": "deployment.failed",
+            "time": util::rfc3339_nanos(self.store.next_log_time()),
+            "source": {"kind": "node", "node_id": node_id},
+            "subject": {"type": "deployment", "id": deployment_id},
+            "project_id": vm.project_id,
+            "actor": {"type": "node", "id": node_id},
+            "data": {
+                "deployment_id": deployment_id,
+                "app_id": vm.app_id,
+                "phase": phase,
+                "error": error,
+            },
+        });
+        if let Err(e) = self.store.push_event(&evt_id, &body).await {
+            warn!(deployment_id, error = %e, "could not buffer deployment.failed");
+            return;
+        }
+        if let Err(e) = self.store.set_meta(&key, "1").await {
+            warn!(deployment_id, error = %e, "could not record the deployment.failed mark");
+        }
+        info!(deployment_id, phase, "deployment.failed buffered");
+    }
+
+    /// Probes every running VM whose health check is due and records changes.
+    ///
+    /// Runs from the agent loop every 500 ms and at the end of a reconcile
+    /// pass, so a deployment sees its first pass about a second after the VM
+    /// reaches running.
+    pub async fn health_pass(&mut self, snapshot: Option<&Snapshot>) {
+        let Some(snapshot) = snapshot else {
+            return;
+        };
+        let infos = match self.engine.list().await {
+            Ok(infos) => infos,
+            Err(e) => {
+                warn!(error = ?e, "could not list VMs for health checks");
+                return;
+            }
+        };
+        let running: HashSet<String> = infos
+            .iter()
+            .filter(|info| info.state == VmState::Running)
+            .map(|info| info.id.0.clone())
+            .collect();
+
+        let mut targets: HashMap<String, (HealthTarget, Option<String>)> = HashMap::new();
+        for vm in &snapshot.state.spec.vms {
+            if vm.desired_status != DesiredStatus::Running || !running.contains(&vm.vm_id) {
+                continue;
+            }
+            let ip = self
+                .store
+                .vm_record(&vm.vm_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|record| record.ip);
+            let Some(ip) = ip else {
+                continue;
+            };
+            if let Some(target) = HealthTarget::for_vm(vm, ip) {
+                targets.insert(vm.vm_id.clone(), (target, vm.deployment_id.clone()));
+            }
+        }
+
+        // Forget VMs that stopped, were removed or lost their port.
+        self.health
+            .retain(|vm_id, _| running.contains(vm_id) && targets.contains_key(vm_id));
+
+        let now = Instant::now();
+        let ids: Vec<String> = targets.keys().cloned().collect();
+        for vm_id in ids {
+            let Some((target, deployment_id)) = targets.remove(&vm_id) else {
+                continue;
+            };
+            let mut state = self.health.remove(&vm_id).unwrap_or_else(|| HealthState {
+                target: target.clone(),
+                status: Health::Unknown,
+                failures: 0,
+                next_at: now + FIRST_PROBE_DELAY,
+            });
+            if state.target != target {
+                state.target = target.clone();
+                state.status = Health::Unknown;
+                state.failures = 0;
+                state.next_at = now + FIRST_PROBE_DELAY;
+            }
+            if now < state.next_at {
+                self.health.insert(vm_id, state);
+                continue;
+            }
+
+            let previous = state.status;
+            let outcome = probe(&state.target).await;
+            let (status, passing, reason) = match &outcome {
+                Ok(code) if is_passing(*code) => (Health::Passing, true, None),
+                Ok(code) => {
+                    state.failures = state.failures.saturating_add(1);
+                    let status = if state.failures >= state.target.failures {
+                        Health::Failing
+                    } else {
+                        previous
+                    };
+                    (status, false, Some(format!("status {code}")))
+                }
+                Err(reason) => {
+                    state.failures = state.failures.saturating_add(1);
+                    let status = if state.failures >= state.target.failures {
+                        Health::Failing
+                    } else {
+                        previous
+                    };
+                    (status, false, Some(reason.clone()))
+                }
+            };
+            if passing {
+                state.failures = 0;
+            }
+            state.status = status;
+            state.next_at = now + state.target.interval;
+            let changed = status != previous;
+            self.health.insert(vm_id.clone(), state);
+
+            if let Some(deployment_id) = deployment_id
+                && changed
+            {
+                let line = if status == Health::Passing {
+                    Some("health check passing".to_owned())
+                } else if status == Health::Failing {
+                    reason.map(|reason| format!("health check failing: {reason}"))
+                } else {
+                    None
+                };
+                if let Some(line) = line
+                    && let Err(e) = self
+                        .store
+                        .append_deployment_line(&deployment_id, "health", &line, Some(&vm_id))
+                        .await
+                {
+                    warn!(vm_id, error = %e, "could not record a health progress line");
+                }
             }
         }
     }
@@ -700,6 +975,8 @@ impl<E: Engine> Reconciler<E> {
                         warn!(vm_id, error = %e, "could not forget the removed VM's digest");
                     }
                     self.timings.remove(&vm_id);
+                    self.health.remove(&vm_id);
+                    self.collector.detach(&vm_id);
                     self.once_only.push(VmStatus {
                         vm_id: vm_id.clone(),
                         observed_status: ObservedStatus::Deleted,
@@ -728,6 +1005,16 @@ impl<E: Engine> Reconciler<E> {
                     if !info.id.0.starts_with("vm_") {
                         continue;
                     }
+                    // A VM the agent did not create in this process (an
+                    // adopted one, or a restart of an existing VMM) still gets
+                    // exactly one reader.
+                    if matches!(info.state, VmState::Running | VmState::Starting) {
+                        let app_id = self
+                            .spec_meta
+                            .get(&info.id.0)
+                            .and_then(|meta| meta.app_id.clone());
+                        self.collector.attach(&info.id.0, app_id);
+                    }
                     let record = self
                         .store
                         .vm_record(&info.id.0)
@@ -735,11 +1022,17 @@ impl<E: Engine> Reconciler<E> {
                         .ok()
                         .flatten()
                         .unwrap_or_default();
+                    let health = if info.state == VmState::Running {
+                        self.health
+                            .get(&info.id.0)
+                            .map_or(Health::Unknown, |health| health.status)
+                    } else {
+                        Health::Unknown
+                    };
                     statuses.push(VmStatus {
                         vm_id: info.id.0.clone(),
                         observed_status: observed_status(info.state),
-                        // Health checks arrive after M2.
-                        health: Health::Unknown,
+                        health,
                         ip: record.ip.map(|ip| ip.to_string()),
                         restart_count: record.restart_count,
                         last_exit_code: record.last_exit_code,
@@ -766,6 +1059,11 @@ impl<E: Engine> Reconciler<E> {
 /// The `node_meta` key that remembers one VM's create-time image digest.
 fn digest_key(vm_id: &str) -> String {
     format!("image_digest:{vm_id}")
+}
+
+/// The `node_meta` key that remembers a `deployment.failed` was emitted.
+fn deployment_failed_key(deployment_id: &str) -> String {
+    format!("deployment_failed:{deployment_id}")
 }
 
 /// The init configuration: the image's own command line, overlaid with the
@@ -857,5 +1155,199 @@ mod tests {
             ]
         );
         assert_eq!(init.entrypoint, vec!["/app".to_owned()]);
+    }
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "quoro-health-{}",
+                crate::util::hex(&crate::util::random_bytes::<8>())
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn health_snapshot(port: u16) -> Snapshot {
+        use quoro_proto::wire::{HealthCheck, Spec, SpecNetwork};
+
+        Snapshot {
+            rev: 1,
+            state: DesiredState {
+                rev: 1,
+                issued_at: "2026-11-02T10:15:31Z".to_owned(),
+                term: 1,
+                spec: Spec {
+                    vms: vec![SpecVm {
+                        vm_id: "vm_health".to_owned(),
+                        project_id: "prj_1".to_owned(),
+                        app_id: Some("app_1".to_owned()),
+                        deployment_id: Some("dep_1".to_owned()),
+                        name: "vm_health".to_owned(),
+                        image: "img".to_owned(),
+                        image_digest: "sha256:aa".to_owned(),
+                        vcpus: 1,
+                        memory_mb: 128,
+                        disk_gb: 1,
+                        port: Some(port),
+                        env: BTreeMap::new(),
+                        health_check: Some(HealthCheck {
+                            path: Some("/".to_owned()),
+                            interval_s: Some(1),
+                            timeout_s: Some(1),
+                            failures: Some(1),
+                        }),
+                        desired_status: DesiredStatus::Running,
+                        restart_generation: 0,
+                        stateful: false,
+                        lease_id: None,
+                        fencing_token: None,
+                        volumes: Vec::new(),
+                    }],
+                    routes: Vec::new(),
+                    network: SpecNetwork {
+                        subnet: "127.0.0.0/8".to_owned(),
+                        gateway: "127.0.0.2".to_owned(),
+                    },
+                },
+                signature: String::new(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_prepare_buffers_one_deployment_failed_event() {
+        use quoro_engine::{FakeEngine, FakeOp};
+
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let engine = Arc::new(FakeEngine::new());
+        engine.fail_next(
+            FakeOp::PrepareImage,
+            quoro_engine::EngineError::Image("pull refused".to_owned()),
+        );
+        let (reconciler, _observed) = Reconciler::new(
+            engine,
+            store.clone(),
+            ReconcileConfig {
+                bridge: "quoro0".to_owned(),
+                dns: Vec::new(),
+            },
+            ReconcileOptions {
+                tick: Duration::from_millis(10),
+                stop_timeout: Duration::from_millis(20),
+                backoff_base: Duration::from_millis(1),
+                backoff_max: Duration::from_millis(8),
+                healthy_after: Duration::from_secs(60),
+            },
+        );
+        let mut reconciler = reconciler.with_node_id("nod_test".to_owned());
+        let snapshot = health_snapshot(8080);
+
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        let events = store.buffered_events().await.unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let body = &events[0].body;
+        assert_eq!(body["type"], "deployment.failed");
+        assert_eq!(body["subject"]["id"], "dep_1");
+        assert_eq!(body["source"]["node_id"], "nod_test");
+        assert_eq!(body["data"]["phase"], "pull");
+        assert!(
+            body["data"]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("pull refused"))
+        );
+        let lines = store
+            .query_deployment_lines("dep_1", Some("pull"))
+            .await
+            .unwrap();
+        assert!(
+            lines
+                .last()
+                .is_some_and(|line| line.message.contains("pull refused"))
+        );
+
+        // The next pass pulls successfully; the failure is not emitted twice.
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        assert_eq!(store.buffered_events().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn health_goes_passing_then_failing() {
+        use quoro_engine::FakeEngine;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = [0u8; 512];
+                let _ = socket.read(&mut buffer).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let engine = Arc::new(FakeEngine::new());
+        let (mut reconciler, _observed) = Reconciler::new(
+            engine,
+            store.clone(),
+            ReconcileConfig {
+                bridge: "quoro0".to_owned(),
+                dns: Vec::new(),
+            },
+            ReconcileOptions {
+                tick: Duration::from_millis(10),
+                stop_timeout: Duration::from_millis(20),
+                backoff_base: Duration::from_millis(1),
+                backoff_max: Duration::from_millis(8),
+                healthy_after: Duration::from_secs(60),
+            },
+        );
+        let snapshot = health_snapshot(port);
+
+        let statuses = reconciler.reconcile_once(Some(&snapshot)).await;
+        assert_eq!(statuses[0].health, Health::Unknown, "probed a second later");
+
+        tokio::time::sleep(FIRST_PROBE_DELAY + Duration::from_millis(100)).await;
+        let statuses = reconciler.reconcile_once(Some(&snapshot)).await;
+        assert_eq!(statuses[0].health, Health::Passing);
+        let lines = store
+            .query_deployment_lines("dep_1", Some("health"))
+            .await
+            .unwrap();
+        assert_eq!(
+            lines.last().map(|line| line.message.as_str()),
+            Some("health check passing")
+        );
+
+        server.abort();
+        tokio::time::sleep(Duration::from_secs(1) + Duration::from_millis(100)).await;
+        let statuses = reconciler.reconcile_once(Some(&snapshot)).await;
+        assert_eq!(statuses[0].health, Health::Failing);
+        let lines = store
+            .query_deployment_lines("dep_1", Some("health"))
+            .await
+            .unwrap();
+        assert!(
+            lines
+                .last()
+                .is_some_and(|line| line.message.starts_with("health check failing")),
+            "{lines:?}"
+        );
     }
 }

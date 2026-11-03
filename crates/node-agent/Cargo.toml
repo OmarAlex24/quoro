@@ -45,6 +45,10 @@ serde = { version = "1", default-features = false, features = ["derive", "std"] 
 serde_json = { version = "1", default-features = false, features = ["std"] }
 # The certificate pin is SHA-256 over the DER certificate.
 sha2 = { version = "0.10", default-features = false }
+# XChaCha20-Poly1305 AEAD for the desired-state bodies at rest, under the
+# node-local key (section 12); nonces come from `getrandom`, so the crate's
+# `getrandom` feature stays off.
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 # Node keypair seeds, boot ids and message ids come from the OS generator.
 getrandom = { version = "0.3", default-features = false }
