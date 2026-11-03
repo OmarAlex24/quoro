@@ -1272,8 +1272,9 @@ async fn update_app_tx(
     Ok((app, vm_ids))
 }
 
-/// Deletes an app and its data. Agents need the approval flow, which arrives
-/// in M3; until then the call is refused with `approval_required`.
+/// Deletes an app and its data. A human with `app:delete` calls it directly;
+/// an agent reaches it through an approval grant (permission-model.md
+/// section 9), otherwise the call is refused with `approval_required`.
 ///
 /// # Errors
 ///

@@ -1,10 +1,11 @@
-//! The grant expiry sweeper.
+//! The expiry sweeper.
 //!
-//! A grant is already unusable at `expires_at` because the decision procedure
-//! compares the timestamp on every call (permission-model.md section 6.3), so
-//! the sweeper is about the stored status and the event stream: every 15 s it
-//! moves stored `active` grants past their TTL to `expired`, appends the
-//! change-log entry and emits `grant.expired` with `reason: ttl`.
+//! A grant or approval is already unusable at `expires_at` because the
+//! decision procedure compares the timestamp on every call
+//! (permission-model.md section 6.3), so the sweeper is about the stored
+//! status and the event stream: every 15 s it moves stored `active` grants and
+//! `pending` approvals past their TTL to `expired`, appends the change-log
+//! entry and emits `grant.expired` (`reason: ttl`) or `approval.expired`.
 
 use crate::AppState;
 use std::time::Duration;
@@ -21,6 +22,9 @@ pub fn spawn(state: AppState) {
             ticker.tick().await;
             if let Err(error) = crate::service::grants::expire_due(&state).await {
                 tracing::warn!(error = ?error, "grant expiry sweep failed");
+            }
+            if let Err(error) = crate::service::approvals::expire_due(&state).await {
+                tracing::warn!(error = ?error, "approval expiry sweep failed");
             }
         }
     });

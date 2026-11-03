@@ -87,6 +87,11 @@ pub struct RateLimited(Problem);
         crate::api::grants::create_grant,
         crate::api::grants::get_grant,
         crate::api::grants::revoke_grant,
+        crate::api::approvals::list_approvals,
+        crate::api::approvals::create_approval,
+        crate::api::approvals::get_approval,
+        crate::api::approvals::approve_approval,
+        crate::api::approvals::deny_approval,
         crate::api::cluster::get_cluster,
         crate::api::nodes::list_nodes,
         crate::api::nodes::get_node,
@@ -127,6 +132,11 @@ pub struct RateLimited(Problem);
             crate::api::auth::Grant,
             crate::api::grants::GrantList,
             crate::api::grants::CreateGrantRequest,
+            crate::api::approvals::Approval,
+            crate::api::approvals::ApprovalList,
+            crate::api::approvals::ApprovalStatus,
+            crate::api::approvals::CreateApprovalRequest,
+            crate::api::approvals::DecisionRequest,
             crate::api::auth::Selector,
             crate::api::auth::ScopeSchema,
             crate::api::nodes::Node,
@@ -210,6 +220,23 @@ impl utoipa::Modify for Security {
             .and_then(|operation| operation.request_body.as_mut())
         {
             body.required = Some(utoipa::openapi::Required::False);
+        }
+
+        // The approve and deny requests take an optional note; like
+        // `NodeJoinTokenRequest` the schema itself is a plain object.
+        for path in [
+            "/api/v1/approvals/{approval_id}/approve",
+            "/api/v1/approvals/{approval_id}/deny",
+        ] {
+            if let Some(body) = openapi
+                .paths
+                .paths
+                .get_mut(path)
+                .and_then(|item| item.post.as_mut())
+                .and_then(|operation| operation.request_body.as_mut())
+            {
+                body.required = Some(utoipa::openapi::Required::False);
+            }
         }
     }
 }

@@ -15,6 +15,7 @@
 //! channel it came through.
 
 pub mod agents;
+pub mod approvals;
 pub mod apps;
 pub mod cluster;
 pub mod deployments;
