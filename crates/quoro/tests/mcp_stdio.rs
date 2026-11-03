@@ -4,7 +4,8 @@
 //! and a `cluster:read` grant. `quoro mcp stdio` then runs with that key in a
 //! `0600` file and the primary's certificate fingerprint, and the test speaks
 //! newline-delimited JSON-RPC on its stdin: `initialize`, the `initialized`
-//! notification, `tools/list` and a `get_cluster` call. The audit log must
+//! notification, `tools/list` and a `get_cluster` call. A second session
+//! negotiates an older protocol version and calls the same tool. The audit log must
 //! show the call as the agent's, on the `mcp` channel, because the relay only
 //! forwards to the primary's `/mcp` and adds nothing of its own (ADR 0031).
 //!
@@ -365,6 +366,65 @@ async fn a_stdio_session_lists_tools_and_reads_through_the_primary() {
         .await
         .expect("read stderr");
     assert!(!stderr_text.contains(&key), "the agent key is never logged");
+
+    // A client that asks for another supported protocol version is answered
+    // with it (issue #139): the relay sends no version header on
+    // `initialize`, and later messages carry the version the primary chose.
+    let mut relay = spawn_relay(&primary, &key_file, &primary.fingerprint);
+    let mut stdin = relay.stdin.take().expect("stdin is piped");
+    let mut stdout = Answers {
+        lines: BufReader::new(relay.stdout.take().expect("stdout is piped")).lines(),
+        early: Vec::new(),
+    };
+    let older = [
+        json!({
+            "jsonrpc": "2.0", "id": 11, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "stdio-test-older", "version": "0" },
+            },
+        }),
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+    ];
+    stdin
+        .write_all(send(older[0].clone()).as_bytes())
+        .await
+        .expect("write initialize");
+    let initialized = stdout.response(11).await;
+    assert_eq!(
+        initialized["result"]["protocolVersion"], "2025-06-18",
+        "the primary negotiated the client's version: {initialized}"
+    );
+    for message in [
+        older[1].clone(),
+        json!({
+            "jsonrpc": "2.0", "id": 12, "method": "tools/call",
+            "params": { "name": "get_cluster", "arguments": {} },
+        }),
+    ] {
+        stdin
+            .write_all(send(message).as_bytes())
+            .await
+            .expect("write a message");
+    }
+    let called = stdout.response(12).await;
+    assert_ne!(
+        called["result"]["isError"], true,
+        "get_cluster succeeded under 2025-06-18: {called}"
+    );
+    assert!(
+        called["result"]["structuredContent"]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("cls_")),
+        "get_cluster returned the cluster: {called}"
+    );
+    drop(stdin);
+    let status = timeout(WAIT, relay.wait())
+        .await
+        .expect("the relay exits")
+        .expect("wait");
+    assert!(status.success(), "the relay exits 0 at end of input");
 
     // The primary audited the call as the agent's, on the MCP channel: the
     // relay sent it to `/mcp` and built nothing itself.
