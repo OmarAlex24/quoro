@@ -1,0 +1,45 @@
+# Quoro node agent: runs this machine's microVMs on Cloud Hypervisor + KVM.
+#
+# Installed by installer/install.sh to /etc/systemd/system/quoro-node.service
+# on every machine that runs VMs, the primary included, and shipped inside the
+# release tarball as quoro-node.service. It dials the primary, stores the
+# signed desired state locally and keeps the VMs running while the primary is
+# unreachable (ADR 0011).
+
+[Unit]
+Description=Quoro node agent (microVMs)
+Documentation=https://github.com/OmarAlex24/quoro
+After=network-online.target quoro.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as root (ADR 0089): the engine creates the quoro0 bridge and TAP
+# devices, writes the nftables rules that route and isolate guest traffic, and
+# converts images with their ownership preserved. It is the only privileged
+# Quoro process.
+Environment=QUORO_CONFIG=/etc/quoro/quoro.toml
+ExecStart=/usr/local/bin/quoro node
+Restart=always
+RestartSec=5s
+LimitNOFILE=65536
+# quoro node exits 78 when this host cannot run the engine: no /dev/kvm, no
+# vmx/svm, a kernel that is too old, or missing artifacts. Restarting would not
+# help, so let the unit stay failed and read the journal instead.
+RestartPreventExitStatus=78
+# Stopping or restarting the agent must not stop the VMs: only the agent
+# process is signalled, the VMMs it spawned keep running, and the next agent
+# adopts them from the engine state.
+KillMode=process
+# Hardening the engine tolerates. It writes /proc/sys/net/ipv4/ip_forward,
+# opens /dev/kvm and /dev/net/tun and talks netlink, so PrivateDevices,
+# ProtectKernelTunables, ProtectKernelModules, RestrictAddressFamilies and
+# CapabilityBoundingSet are deliberately not set here.
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+ProtectSystem=full
+# Logs go to journald: read them with journalctl -u quoro-node.
+
+[Install]
+WantedBy=multi-user.target

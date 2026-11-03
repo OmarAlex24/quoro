@@ -268,6 +268,8 @@ init_binary="$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/quoro-init"
 [ -f LICENSE ] || die "LICENSE is missing from the repository root"
 [ -f packaging/systemd/quoro.service ] ||
 	die "packaging/systemd/quoro.service is missing; the release needs the systemd unit"
+[ -f packaging/systemd/quoro-node.service ] ||
+	die "packaging/systemd/quoro-node.service is missing; the release needs the node agent's systemd unit"
 # install.sh fetches Cloud Hypervisor and the guest kernel and verifies them
 # against these pins, so the engine's pinned versions travel with the release.
 [ -f crates/engine/pins.txt ] ||
@@ -288,6 +290,7 @@ install -m 0755 "$binary" "$stage/$name/quoro"
 install -m 0755 "$init_binary" "$stage/$name/quoro-init"
 install -m 0644 LICENSE "$stage/$name/LICENSE"
 install -m 0644 packaging/systemd/quoro.service "$stage/$name/quoro.service"
+install -m 0644 packaging/systemd/quoro-node.service "$stage/$name/quoro-node.service"
 install -m 0644 crates/engine/pins.txt "$stage/$name/pins.txt"
 
 # Normalise every staged timestamp, including symlinks and the directory
@@ -296,6 +299,7 @@ touch -h -d "@$SOURCE_DATE_EPOCH" "$stage/$name/quoro"
 touch -h -d "@$SOURCE_DATE_EPOCH" "$stage/$name/quoro-init"
 touch -h -d "@$SOURCE_DATE_EPOCH" "$stage/$name/LICENSE"
 touch -h -d "@$SOURCE_DATE_EPOCH" "$stage/$name/quoro.service"
+touch -h -d "@$SOURCE_DATE_EPOCH" "$stage/$name/quoro-node.service"
 touch -h -d "@$SOURCE_DATE_EPOCH" "$stage/$name/pins.txt"
 touch -h -d "@$SOURCE_DATE_EPOCH" "$stage/$name"
 touch -h -d "@$SOURCE_DATE_EPOCH" "$stage"

@@ -9,6 +9,7 @@
 mod config;
 mod node;
 mod panel;
+mod privilege;
 mod serve;
 mod tls;
 
@@ -183,6 +184,20 @@ async fn issue_token(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // Run as root on a host where the control plane has its own user, the
+    // token and SQLite's side files must still belong to that user.
+    if let Some(dropped) = privilege::run_as_data_dir_owner(&config.data_dir) {
+        return match dropped {
+            Ok(code) => exit_code(code),
+            Err(e) => {
+                eprintln!(
+                    "quoro setup-token: cannot run as the owner of {}: {e}",
+                    config.data_dir.display()
+                );
+                ExitCode::from(1)
+            }
+        };
+    }
     if let Err(e) = config::ensure_data_dir(&config.data_dir) {
         eprintln!(
             "quoro setup-token: cannot create {}: {e}",
