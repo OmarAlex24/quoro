@@ -44,8 +44,10 @@ check_url = "https://app.example/healthz"
 # incident:resolve scope in the webhook's wake.grant_scopes.
 resolve_incident = false
 
-# Recovery polling: how many times to read the app, and how long to wait between
-# reads. The defaults are 12 attempts, 5 seconds apart (one minute).
+# Recovery wait: how many times to read the app, and how long to wait between
+# reads, until Quoro reports it healthy (its health check passes, not just its VM
+# running). The defaults are 12 attempts, 5 seconds apart (one minute); cover the
+# node's stop timeout, the boot and the first passing health checks.
 poll_attempts = 12
 poll_interval_s = 5.0
 

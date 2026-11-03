@@ -194,10 +194,13 @@ class IncidentFlowTests(RunnerTestCase):
 
         names = [call["tool"] for call in self.fake.calls]
         self.assertEqual(names[0], "get_incident")
-        self.assertGreaterEqual(names.count("get_app"), 2, "no recovery poll happened")
-        last_get_app = max(index for index, name in enumerate(names) if name == "get_app")
-        self.assertGreater(last_get_app, names.index("restart_app"))
-        self.assertEqual(self.fake.instance_status, "running")
+        restart = names.index("restart_app")
+        # The VM runs right after the restart, but the runner waits until
+        # Quoro reports the app healthy: two reads in the fake.
+        self.assertEqual(
+            names[restart + 1 :], ["get_app", "get_app", "get_incident", "resolve_incident"]
+        )
+        self.assertEqual(self.fake.health, "passing")
 
         resolves = self.fake.calls_named("resolve_incident")
         self.assertEqual(len(resolves), 1)
@@ -370,6 +373,55 @@ class WakeSelectionTests(RunnerTestCase):
         self.assertTrue(self.server.app.wait_idle(timeout=5.0))
         self.assertEqual(self.policy.wakes, [])
         self.assertEqual(self.fake.mints, [])
+
+
+class HealthWaitTests(RunnerTestCase):
+    """What the runner reports depends on the app's health, not on its VM."""
+
+    def run_incident(self) -> str:
+        """Deliver one incident and return the outcome the runner logged."""
+        with self.assertLogs("agent_runner.server", level="INFO") as logs:
+            status, _ = self.deliver(self.event())
+            self.assertEqual(status, 202)
+            self.assertTrue(self.server.app.wait_idle(timeout=5.0))
+        outcomes = [line for line in logs.output if "outcome for incident" in line]
+        self.assertEqual(len(outcomes), 1, logs.output)
+        return outcomes[0]
+
+    def test_a_running_vm_with_failing_health_is_not_recovered(self) -> None:
+        self.fake.health_passes_after_reads = None
+
+        outcome = self.run_incident()
+
+        self.assertIn("did not report healthy", outcome)
+        self.assertIn("last status down", outcome)
+        self.assertEqual(self.fake.instance_status, "running")
+        # The pre-restart read and the whole poll budget, then nothing more.
+        self.assertEqual(len(self.fake.calls_named("get_app")), 1 + self.config.poll_attempts)
+        self.assertEqual(self.fake.calls_named("resolve_incident"), [])
+
+    def test_app_up_resolving_the_incident_is_a_recovery(self) -> None:
+        self.fake.app_up_resolves = True
+
+        outcome = self.run_incident()
+
+        self.assertIn("recovered after restart", outcome)
+        self.assertEqual(self.fake.resolved_by_type, "system")
+        self.assertEqual(
+            self.fake.calls_named("resolve_incident"), [], "the incident was already resolved"
+        )
+
+    def test_a_revoked_grant_without_other_reads_is_not_confirmed(self) -> None:
+        self.fake.app_up_resolves = True
+        self.fake.standing_reads = False
+
+        outcome = self.run_incident()
+
+        self.assertIn("did not report healthy", outcome)
+        self.assertIn("not confirmed", outcome)
+        names = [call["tool"] for call in self.fake.calls]
+        self.assertEqual(names[-2:], ["get_app", "get_incident"])
+        self.assertEqual(self.fake.calls_named("resolve_incident"), [])
 
 
 class RefusalTests(RunnerTestCase):
