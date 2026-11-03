@@ -2,9 +2,13 @@
 //! generated document can be diffed against the frozen `openapi.yaml`
 //! (D-0048, `tests/openapi_diff.rs`).
 
+pub mod apps;
 pub mod auth;
+pub mod deployments;
+pub mod domains;
 pub mod enroll;
 pub mod health;
+pub mod logs;
 pub mod nodes;
 pub mod page;
 pub mod projects;
@@ -55,4 +59,8 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/v1/vms/{vm_id}/start", post(vms::start_vm))
         .route("/api/v1/vms/{vm_id}/stop", post(vms::stop_vm))
+        // Apps, deployments and domains (`apps::routes`), and the on-demand
+        // log reads and the live-log SSE stream (`logs::routes`).
+        .merge(apps::routes())
+        .merge(logs::routes())
 }

@@ -150,6 +150,11 @@ struct Security;
 
 impl utoipa::Modify for Security {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        // The apps and logs modules keep their own documents; they are merged
+        // first so the fixes below see every operation.
+        openapi.merge(crate::api::apps::AppsDoc::openapi());
+        openapi.merge(crate::api::logs::LogsDoc::openapi());
+
         use utoipa::openapi::security::{
             ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme,
         };

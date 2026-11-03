@@ -9,10 +9,12 @@
 //! live session. Observed state arrives back through [`driver`].
 
 pub mod api;
+pub mod app_env;
 pub mod audit;
 pub mod auth;
 pub mod changelog;
 pub mod crypto;
+pub mod deploy;
 pub mod driver;
 pub mod error;
 pub mod events;
@@ -159,6 +161,7 @@ impl AppState {
             Arc::clone(&keys),
             cluster_id.clone(),
             resolver,
+            Arc::clone(&data_key),
         );
         hub.reset_stale_connections().await?;
         Ok(Self {

@@ -31,9 +31,11 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
 # Wipes key material and decrypted secrets from memory when they are dropped.
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
+# The live-log SSE body is a stream built with `stream::unfold` (ADR 0057).
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
 quoro-types = { path = "../types" }
 # The HTTP harness serves the router with `axum::serve`.
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
