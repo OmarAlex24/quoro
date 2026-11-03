@@ -26,12 +26,12 @@
 //! per-hostname certificate state is published in `status_report.routes` and
 //! the transitions are buffered as `certificate.*` node events.
 //!
-//! **Contract gap.** `events.schema.json` requires `data.domain_id` and a
-//! `domain` subject for every `certificate.*` event, but the desired state the
-//! node receives carries no domain id (`spec.routes[]` has only `app_id`,
-//! `hostname`, `vm_ids`, `port` and `tls_mode`). The node therefore buffers a
-//! certificate event only when a hostname-to-domain mapping is known; until
-//! the contract carries that mapping the transition is logged instead of
+//! **Domain ids.** `events.schema.json` requires `data.domain_id` and a
+//! `domain` subject for every `certificate.*` event. The primary names each
+//! route's domain in `spec.routes[].domain_id` (section 5.11, ADR 0099), and
+//! every apply refreshes the hostname-to-domain map from it. A route without a
+//! domain id (sent by an older primary) gets its certificate state reported
+//! in `status_report.routes` only: the transition is logged instead of
 //! emitted, rather than inventing an id.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -294,15 +294,15 @@ impl IngressConfig {
 
 /// The `certificate.*` node events, buffered for the primary.
 ///
-/// A hostname is only emitted when a domain id is known, because the event
-/// schema requires one and the desired state does not carry it (see the module
-/// docs). `domains` is empty today and the mapping is the gap to close in the
-/// contract.
+/// A hostname is only emitted when its domain id is known, because the event
+/// schema requires one (see the module docs). The map comes from the
+/// `domain_id` of the routes of the last applied snapshot.
 #[derive(Clone)]
 pub struct CertificateEvents {
     store: NodeStore,
     node_id: Option<String>,
-    domains: BTreeMap<String, String>,
+    /// Lowercased hostname to `dom_` id.
+    domains: Arc<RwLock<BTreeMap<String, String>>>,
     logged: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -312,22 +312,34 @@ impl CertificateEvents {
         Self {
             store,
             node_id,
-            domains: BTreeMap::new(),
+            domains: Arc::new(RwLock::new(BTreeMap::new())),
             logged: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
-    /// Supplies the hostname-to-domain mapping once the protocol carries it.
-    #[must_use]
-    pub fn with_domains(mut self, domains: BTreeMap<String, String>) -> Self {
-        self.domains = domains;
-        self
+    /// Replaces the hostname-to-domain map with the `domain_id` of every route
+    /// of one apply. A route without one, or a hostname that left the spec,
+    /// has no domain afterwards.
+    pub fn set_routes(&self, routes: &[SpecRoute]) {
+        let domains: BTreeMap<String, String> = routes
+            .iter()
+            .filter_map(|route| {
+                let domain_id = route.domain_id.as_ref()?;
+                Some((route.hostname.to_ascii_lowercase(), domain_id.clone()))
+            })
+            .collect();
+        *self
+            .domains
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = domains;
     }
 
-    fn domain_for(&self, hostname: &str) -> Option<&str> {
+    fn domain_for(&self, hostname: &str) -> Option<String> {
         self.domains
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&hostname.to_ascii_lowercase())
-            .map(String::as_str)
+            .cloned()
     }
 
     /// Buffers one certificate event, or logs why it cannot be buffered. The
@@ -349,20 +361,18 @@ impl CertificateEvents {
                 warn!(
                     %hostname,
                     kind,
-                    "the desired state carries no domain id, which a certificate event requires; logging the transition instead of emitting it"
+                    "the route carries no domain id, which a certificate event requires; logging the transition instead of emitting it"
                 );
             }
             return;
         };
         let evt_id = util::event_id();
-        data.insert(
-            "domain_id".to_string(),
-            Value::String(domain_id.to_string()),
-        );
+        data.insert("domain_id".to_string(), Value::String(domain_id.clone()));
         data.insert("hostname".to_string(), Value::String(hostname.to_string()));
         let body = certificate_event_body(
+            &evt_id,
             kind,
-            domain_id,
+            &domain_id,
             node_id,
             util::rfc3339_nanos(self.store.next_log_time()),
             Value::Object(data),
@@ -375,6 +385,7 @@ impl CertificateEvents {
 
 /// One `certificate.*` envelope, in the shape `events.schema.json` requires.
 fn certificate_event_body(
+    evt_id: &str,
     kind: &str,
     domain_id: &str,
     node_id: &str,
@@ -383,7 +394,7 @@ fn certificate_event_body(
 ) -> Value {
     serde_json::json!({
         "schema_version": 1,
-        "id": util::event_id(),
+        "id": evt_id,
         "type": kind,
         "time": time,
         "source": {"kind": "node", "node_id": node_id},
@@ -867,6 +878,7 @@ async fn supervise(
 
 impl Runtime {
     async fn apply(&mut self, desired: &DesiredRoutes) {
+        self.events.set_routes(&desired.routes);
         let tables = build_tables(&desired.routes, &desired.addresses);
         self.apply_tunnel(desired, &tables.tunnel).await;
         self.apply_public(&tables.acme).await;
@@ -1487,6 +1499,7 @@ mod tests {
     #[test]
     fn a_certificate_event_carries_the_envelope_the_schema_requires() {
         let body = certificate_event_body(
+            "evt_01JC9Z0000000000000000000Q",
             "certificate.issued",
             "dom_01JC9Z0000000000000000000Q",
             "nod_01JC9Z0000000000000000000Q",
@@ -1502,7 +1515,99 @@ mod tests {
         assert_eq!(body["source"]["kind"], "node");
         assert_eq!(body["subject"]["type"], "domain");
         assert_eq!(body["data"]["hostname"], "app.example.com");
-        assert!(body["id"].as_str().unwrap().starts_with("evt_"));
+        assert_eq!(body["id"], "evt_01JC9Z0000000000000000000Q");
+    }
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "quoro-node-ingress-{}",
+                util::hex(&util::random_bytes::<8>())
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const DOMAIN: &str = "dom_01JC9Z8D5Q7S9V1X3Z5B7D9F1H";
+    const NODE: &str = "nod_01JC9Y2M4Q7V8B1N6T3R5K9XZP";
+
+    #[tokio::test]
+    async fn certificate_events_name_the_domain_of_the_route() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let events = CertificateEvents::new(store.clone(), Some(NODE.to_string()));
+        let mut with_id = route("App.Example.com", &[], 80, "acme");
+        with_id.domain_id = Some(DOMAIN.to_string());
+        let without_id = route("old.example.com", &[], 80, "acme");
+        events.set_routes(&[with_id, without_id]);
+
+        let mut data = serde_json::Map::new();
+        data.insert(
+            "expires_at".to_string(),
+            Value::String("2027-01-31T10:15:30Z".to_string()),
+        );
+        events
+            .emit("certificate.issued", "app.example.com", data.clone())
+            .await;
+        // A route from an older primary has no domain id: no event.
+        events
+            .emit("certificate.issued", "old.example.com", data)
+            .await;
+
+        let buffered = store.buffered_events().await.unwrap();
+        assert_eq!(buffered.len(), 1);
+        let event = &buffered[0];
+        assert_eq!(event.body["id"], event.evt_id.as_str());
+        assert_eq!(event.body["type"], "certificate.issued");
+        assert_eq!(event.body["subject"]["type"], "domain");
+        assert_eq!(event.body["subject"]["id"], DOMAIN);
+        assert_eq!(event.body["source"]["node_id"], NODE);
+        assert_eq!(event.body["data"]["domain_id"], DOMAIN);
+        assert_eq!(event.body["data"]["hostname"], "app.example.com");
+        assert_eq!(event.body["data"]["expires_at"], "2027-01-31T10:15:30Z");
+    }
+
+    #[tokio::test]
+    async fn a_failed_certificate_event_follows_the_latest_routes() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let events = CertificateEvents::new(store.clone(), Some(NODE.to_string()));
+        let mut acme = route("app.example.com", &[], 80, "acme");
+        acme.domain_id = Some(DOMAIN.to_string());
+        events.set_routes(std::slice::from_ref(&acme));
+
+        let mut data = serde_json::Map::new();
+        data.insert("tls_mode".to_string(), Value::String("acme".to_string()));
+        data.insert(
+            "error".to_string(),
+            Value::String("order refused".to_string()),
+        );
+        events
+            .emit("certificate.failed", "app.example.com", data.clone())
+            .await;
+        // The hostname left the spec: its domain id is forgotten.
+        events.set_routes(&[]);
+        events
+            .emit("certificate.failed", "app.example.com", data)
+            .await;
+
+        let buffered = store.buffered_events().await.unwrap();
+        assert_eq!(buffered.len(), 1);
+        let body = &buffered[0].body;
+        assert_eq!(body["type"], "certificate.failed");
+        assert_eq!(body["subject"]["id"], DOMAIN);
+        assert_eq!(body["data"]["domain_id"], DOMAIN);
+        assert_eq!(body["data"]["tls_mode"], "acme");
+        assert_eq!(body["data"]["error"], "order refused");
     }
 
     #[test]
