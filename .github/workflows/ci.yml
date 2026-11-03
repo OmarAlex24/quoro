@@ -89,6 +89,39 @@ jobs:
       - name: OpenAPI 3.1 and JSON Schema 2020-12 validation
         run: '"$RUNNER_TEMP/venv/bin/python" -I .github/scripts/validate_contracts.py'
 
+  docs:
+    name: Docs (mdBook)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      # Pinned by version and by the sha256 of the release tarball, so a
+      # replaced or truncated download fails the check instead of running.
+      # mdBook reads MDBOOK_* variables as configuration, so the pins use
+      # another prefix.
+      PINNED_MDBOOK_VERSION: v0.5.4
+      PINNED_MDBOOK_SHA256: 5222beabd3e37dc5be0d18ff99b79058469354db5c220153a1b92db5ba12be89
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install mdBook
+        run: |
+          set -euo pipefail
+          curl -fsSL --proto '=https' --tlsv1.2 -o "$RUNNER_TEMP/mdbook.tar.gz" \
+            "https://github.com/rust-lang/mdBook/releases/download/$PINNED_MDBOOK_VERSION/mdbook-$PINNED_MDBOOK_VERSION-x86_64-unknown-linux-musl.tar.gz"
+          echo "$PINNED_MDBOOK_SHA256  $RUNNER_TEMP/mdbook.tar.gz" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/mdbook"
+          tar xzf "$RUNNER_TEMP/mdbook.tar.gz" -C "$RUNNER_TEMP/mdbook"
+          "$RUNNER_TEMP/mdbook/mdbook" --version
+      # Builds docs/ as it is (docs/book.toml) into target/book. Nothing is
+      # published from here.
+      - name: Build the book
+        run: '"$RUNNER_TEMP/mdbook/mdbook" build docs'
+      # mdBook has no built-in link checker: every Markdown file must be in
+      # docs/SUMMARY.md and every relative link and anchor must resolve.
+      - name: Chapters and links
+        run: python3 -I scripts/check_docs_site.py
+
   panel:
     name: Panel (typecheck, test, build)
     runs-on: ubuntu-24.04

@@ -1,0 +1,40 @@
+# mdBook configuration for the documentation site (ADR 0065). The Markdown
+# stays where it is: docs/ is the book source, so every relative link that
+# works on GitHub works in the built site too. Chapters are listed in
+# SUMMARY.md; a Markdown file that is not listed there is not rendered.
+#
+# Build: mdbook build docs   (output in target/book, ignored by git)
+
+[book]
+title = "Quoro"
+description = "Self-hosted microVMs and app deploys on Cloud Hypervisor + KVM, operable by AI agents."
+language = "en"
+src = "."
+
+[build]
+build-dir = "../target/book"
+# Fail on a chapter listed in SUMMARY.md that has no file, instead of
+# creating an empty one.
+create-missing = false
+# mdBook's default "index" preprocessor renames every README.md to
+# index.html but leaves the links that point at README.md, so they would
+# break. Keep README.md as README.html (the first chapter is also written as
+# index.html) and enable only the "links" preprocessor, which {{#include}}
+# needs.
+use-default-preprocessors = false
+
+[preprocessor.links]
+
+[output.html]
+git-repository-url = "https://github.com/OmarAlex24/quoro"
+additional-css = ["site/sidebar.css"]
+
+# Collapse nested chapters (the 80-odd ADRs) in the sidebar until opened.
+[output.html.fold]
+enable = true
+level = 0
+
+# A directory link renders as a GitHub file listing but has no page in the
+# book; send it to the same listing on GitHub.
+[output.html.redirect]
+"/contracts/migrations/index.html" = "https://github.com/OmarAlex24/quoro/tree/main/docs/contracts/migrations"
