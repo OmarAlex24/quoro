@@ -231,6 +231,7 @@ impl<'e, E: Engine, S: LeaseStore> LeaseAgent<'e, E, S> {
                                 status: CommandStatus::Ok,
                                 detail: Some("unknown lease".to_string()),
                                 error: None,
+                                lines: None,
                             },
                         );
                     }
@@ -403,6 +404,7 @@ fn revoke_result(lease_id: &LeaseId, report: &FenceReport) -> CommandResult {
             status: CommandStatus::Ok,
             detail: None,
             error: None,
+            lines: None,
         };
     }
     let failed: Vec<String> = report
@@ -421,13 +423,12 @@ fn revoke_result(lease_id: &LeaseId, report: &FenceReport) -> CommandResult {
     CommandResult {
         status: CommandStatus::Error,
         detail: Some(detail.clone()),
-        // Contract gap: section 5.18 has no code for "the node could not stop
-        // a VM". `bad_message` is the only non-fatal, non-specific code, so it
-        // is used and the detail carries the truth. The session stays usable.
+        // Section 5.18 `fence_failed` (ADR 0079); `detail` names the VMs.
         error: Some(ErrorBody {
-            code: ErrorCode::BadMessage,
+            code: ErrorCode::FenceFailed,
             message: detail,
         }),
+        lines: None,
     }
 }
 

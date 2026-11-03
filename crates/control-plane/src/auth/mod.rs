@@ -64,6 +64,18 @@ impl Identity {
             id: self.user_id.clone(),
         }
     }
+
+    /// Whether this identity is a human. M1 authenticates humans only: an
+    /// agent access token (`atk_`) is refused as an unknown credential until
+    /// the agent endpoints arrive in M3, so both credential kinds here are
+    /// human ones.
+    #[must_use]
+    pub fn is_human(&self) -> bool {
+        matches!(
+            self.credential,
+            Credential::Session { .. } | Credential::ApiToken { .. }
+        )
+    }
 }
 
 /// The value of the session cookie in `headers`, if any.

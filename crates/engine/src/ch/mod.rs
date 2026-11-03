@@ -11,7 +11,6 @@
 //! D-0011); [`engine::Inner`] holds that state, [`supervise`] watches each VMM
 //! process, and [`host`] reads the host facts the trait reports.
 
-use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,9 +53,6 @@ pub struct ChConfig {
     pub artifacts_dir: PathBuf,
     /// The static (musl) quoro-init binary that goes into the initramfs.
     pub init_binary: PathBuf,
-    /// DNS servers written into every guest's resolv.conf (ledger Q-0089: not
-    /// in the trait).
-    pub dns: Vec<Ipv4Addr>,
     /// The guest init's SIGTERM→SIGKILL grace after the power button (default
     /// 30 s).
     pub guest_stop_timeout: Duration,
@@ -67,14 +63,14 @@ pub struct ChConfig {
 
 impl ChConfig {
     /// A configuration with the documented defaults: a 30 s guest stop grace,
-    /// 512 MiB of reserved host memory and no DNS servers.
+    /// 512 MiB of reserved host memory. Guest DNS servers come from the
+    /// node network (`NodeNetwork::dns`, contract §3.3).
     #[must_use]
     pub fn new(state_dir: PathBuf, artifacts_dir: PathBuf, init_binary: PathBuf) -> Self {
         Self {
             state_dir,
             artifacts_dir,
             init_binary,
-            dns: Vec::new(),
             guest_stop_timeout: Duration::from_secs(30),
             reserved_memory_mb: 512,
         }

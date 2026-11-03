@@ -11,7 +11,12 @@ workspace = true
 
 [dependencies]
 quoro-types = { path = "../types" }
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+# Wire messages, RFC 8785 canonical JSON and the desired-state signature.
+quoro-proto = { path = "../proto" }
+# `ws` serves the node-agent session (GET /api/v1/nodes/session).
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
+# Node public keys and credentials are base64 (node-agent-protocol.md section 2).
+base64 = { version = "0.22", default-features = false, features = ["std"] }
 tokio = { version = "1", default-features = false, features = ["sync", "time", "rt", "macros"] }
 sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio"] }
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
@@ -41,3 +46,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "coo
 # In a workspace build, feature unification gives reqwest the binary's
 # no-provider rustls feature, so the tests install the ring provider first.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# The node-session tests speak the WebSocket protocol against the router.
+# `connect_async` needs the `connect` feature, so the tests dial a plain
+# `TcpStream` and hand it to `client_async`, as the node agent does.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }

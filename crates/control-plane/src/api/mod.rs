@@ -3,6 +3,7 @@
 //! (D-0048, `tests/openapi_diff.rs`).
 
 pub mod auth;
+pub mod enroll;
 pub mod health;
 pub mod nodes;
 pub mod page;
@@ -23,6 +24,12 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/auth/logout", post(auth::logout))
         .route("/api/v1/auth/me", get(auth::get_me))
         .route("/api/v1/nodes", get(nodes::list_nodes))
+        .route("/api/v1/nodes/join-tokens", post(enroll::create_join_token))
+        .route("/api/v1/nodes/enroll", post(enroll::enroll_node))
+        .route(
+            "/api/v1/nodes/session",
+            get(crate::session::open_node_session),
+        )
         .route("/api/v1/nodes/{node_id}", get(nodes::get_node))
         .route(
             "/api/v1/projects",

@@ -1,19 +1,17 @@
-//! The control-plane side of the in-process node driver (M1).
+//! What a node reports, written into the control plane's state.
 //!
-//! In M1 the primary is the only node and there is no node-agent session yet
-//! (that is M2). The binary runs a local driver that owns the engine; this
-//! module is everything it may ask of the control plane:
+//! The node-agent session (`crate::session`) calls these with each node's
+//! `status_report`:
 //!
-//! - [`register_local_node`] records the primary itself as a node at start.
-//! - [`desired_vm`] / [`vms_on_node`] read desired state. A VM whose row is
-//!   gone was deleted: the driver stops and deletes it on the engine, then
-//!   calls [`report_deleted`].
 //! - [`report_observed`] writes what the engine reports back, as the node's
 //!   identity, through the change log, emitting `vm.started`, `vm.stopped` and
 //!   `vm.crashed` on the matching transitions.
+//! - [`report_deleted`] removes the row of a VM the node deleted.
 //!
-//! From M2 the node-agent session calls the same functions with the remote
-//! node's reports, so the services do not change.
+//! [`register_local_node`] is the M1 registration of the primary as a node.
+//! Nothing calls it at run time any more (the primary's own agent enrolls
+//! like any node and adopts that row); it stays to build an upgraded v0.0.1
+//! state in tests.
 
 use crate::audit::{self, Channel, Outcome, Record};
 use crate::changelog::{self, Actor, ActorType, Op};
@@ -85,22 +83,6 @@ impl ObservedStatus {
             Self::Unknown => "unknown",
         }
     }
-}
-
-/// The desired state of one VM, as the driver needs it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DesiredVm {
-    pub id: String,
-    pub node_id: String,
-    pub vcpus: u32,
-    pub memory_mb: u32,
-    pub disk_gb: u32,
-    pub image: String,
-    pub desired_status: DesiredStatus,
-    pub observed_status: ObservedStatus,
-    /// Address last reported for the VM, so a restarted driver keeps it.
-    pub ip: Option<String>,
-    pub restart_generation: i64,
 }
 
 /// One observation of a VM by the node.
@@ -229,61 +211,6 @@ pub async fn register_local_node(store: &Store, node: &LocalNode) -> Result<Stri
     .await?;
     w.commit().await?;
     Ok(id)
-}
-
-/// The desired state of `vm_id`, or `None` if the VM row does not exist
-/// (never created, or deleted).
-///
-/// # Errors
-///
-/// A database error.
-pub async fn desired_vm(store: &Store, vm_id: &str) -> Result<Option<DesiredVm>, ApiError> {
-    let row = sqlx::query(
-        "SELECT id, node_id, vcpus, memory_mb, disk_gb, image, desired_status, observed_status, \
-         ip, restart_generation FROM vms WHERE id = ?",
-    )
-    .bind(vm_id)
-    .fetch_optional(store.pool())
-    .await?;
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    let vcpus: i64 = row.try_get("vcpus")?;
-    let memory_mb: i64 = row.try_get("memory_mb")?;
-    let disk_gb: i64 = row.try_get("disk_gb")?;
-    let desired: String = row.try_get("desired_status")?;
-    let observed: String = row.try_get("observed_status")?;
-    Ok(Some(DesiredVm {
-        id: row.try_get("id")?,
-        node_id: row.try_get("node_id")?,
-        vcpus: u32::try_from(vcpus).map_err(|e| ApiError::internal(&format!("vms.vcpus: {e}")))?,
-        memory_mb: u32::try_from(memory_mb)
-            .map_err(|e| ApiError::internal(&format!("vms.memory_mb: {e}")))?,
-        disk_gb: u32::try_from(disk_gb)
-            .map_err(|e| ApiError::internal(&format!("vms.disk_gb: {e}")))?,
-        image: row.try_get("image")?,
-        desired_status: if desired == "running" {
-            DesiredStatus::Running
-        } else {
-            DesiredStatus::Stopped
-        },
-        observed_status: parse_observed(&observed),
-        ip: row.try_get("ip")?,
-        restart_generation: row.try_get("restart_generation")?,
-    }))
-}
-
-/// Ids of every VM row placed on `node_id`, for the resync at driver start.
-///
-/// # Errors
-///
-/// A database error.
-pub async fn vms_on_node(store: &Store, node_id: &str) -> Result<Vec<String>, ApiError> {
-    let rows: Vec<(String,)> = sqlx::query_as("SELECT id FROM vms WHERE node_id = ? ORDER BY id")
-        .bind(node_id)
-        .fetch_all(store.pool())
-        .await?;
-    Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
 /// Writes an observation of `vm_id` by `node_id` (actor `node`). A no-op when
@@ -458,21 +385,6 @@ pub async fn report_deleted(store: &Store, node_id: &str, vm_id: &str) -> Result
     Ok(())
 }
 
-/// Maps `vms.observed_status` to [`ObservedStatus`]; an unknown value reads
-/// as [`ObservedStatus::Unknown`].
-fn parse_observed(status: &str) -> ObservedStatus {
-    match status {
-        "creating" => ObservedStatus::Creating,
-        "stopped" => ObservedStatus::Stopped,
-        "starting" => ObservedStatus::Starting,
-        "running" => ObservedStatus::Running,
-        "stopping" => ObservedStatus::Stopping,
-        "crashed" => ObservedStatus::Crashed,
-        "deleted" => ObservedStatus::Deleted,
-        _ => ObservedStatus::Unknown,
-    }
-}
-
 /// The audit record of a system-initiated driver call.
 fn system_record(
     actor: Actor,
@@ -518,7 +430,7 @@ fn optional_json_value(text: Option<String>) -> Result<Value, ApiError> {
 }
 
 /// The full `nodes` row as JSON, the change-log payload of a node change.
-async fn node_payload(conn: &mut SqliteConnection, id: &str) -> Result<Value, ApiError> {
+pub(crate) async fn node_payload(conn: &mut SqliteConnection, id: &str) -> Result<Value, ApiError> {
     let row = sqlx::query("SELECT * FROM nodes WHERE id = ?")
         .bind(id)
         .fetch_one(&mut *conn)

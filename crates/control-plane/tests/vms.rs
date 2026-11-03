@@ -82,7 +82,7 @@ async fn audit_records(
 
 #[tokio::test]
 async fn vm_lifecycle_over_http() {
-    let (mut server, owner, node_id, project_id) = setup().await;
+    let (server, owner, node_id, project_id) = setup().await;
 
     // create → 201 with the desired and observed status of a fresh VM.
     let res = owner
@@ -102,11 +102,6 @@ async fn vm_lifecycle_over_http() {
     assert!(vm["app_id"].is_null());
     assert_eq!(vm["restart_generation"], 0);
     assert_eq!(vm["restart_count"], 0);
-    assert_eq!(
-        server.driver_rx.try_recv().unwrap(),
-        vm_id,
-        "the driver is told about the new VM"
-    );
 
     // list shows it.
     let res = owner.get(server.url("/api/v1/vms")).send().await.unwrap();
@@ -144,7 +139,6 @@ async fn vm_lifecycle_over_http() {
     assert_eq!(res.status(), 202, "stop: {}", res.text().await.unwrap());
     let stopped: Value = res.json().await.unwrap();
     assert_eq!(stopped["desired_status"], "stopped");
-    assert_eq!(server.driver_rx.try_recv().unwrap(), vm_id);
 
     driver::report_observed(
         &server.state.store,
@@ -181,7 +175,6 @@ async fn vm_lifecycle_over_http() {
         .unwrap();
     assert_eq!(res.status(), 202);
     let _: Value = res.json().await.unwrap();
-    assert_eq!(server.driver_rx.try_recv().unwrap(), vm_id);
     let after: (i64,) = sqlx::query_as("SELECT count(*) FROM change_log WHERE entity_type = 'vm'")
         .fetch_one(server.state.store.pool())
         .await
@@ -200,7 +193,6 @@ async fn vm_lifecycle_over_http() {
     assert_eq!(res.status(), 202, "start: {}", res.text().await.unwrap());
     let started: Value = res.json().await.unwrap();
     assert_eq!(started["desired_status"], "running");
-    assert_eq!(server.driver_rx.try_recv().unwrap(), vm_id);
 
     // delete → 202 with the record as it was, desired stopped.
     let res = owner
@@ -212,7 +204,6 @@ async fn vm_lifecycle_over_http() {
     let deleted: Value = res.json().await.unwrap();
     assert_eq!(deleted["id"], vm_id);
     assert_eq!(deleted["desired_status"], "stopped");
-    assert_eq!(server.driver_rx.try_recv().unwrap(), vm_id);
 
     // list is empty, get is 404.
     let list: Value = owner

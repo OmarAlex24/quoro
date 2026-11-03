@@ -6,7 +6,7 @@ use crate::AppState;
 use crate::audit::{self, Channel, Outcome, Record};
 use crate::auth::Identity;
 use crate::error::{ApiError, Reason, Target};
-use axum::extract::{FromRequest, Request};
+use axum::extract::{FromRequest, OptionalFromRequest, Request};
 use axum::http::{HeaderMap, HeaderValue};
 use axum::middleware::Next;
 use axum::response::Response;
@@ -49,8 +49,24 @@ where
     type Rejection = ApiError;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        match axum::Json::<T>::from_request(req, state).await {
+        match <axum::Json<T> as FromRequest<S>>::from_request(req, state).await {
             Ok(axum::Json(value)) => Ok(Self(value)),
+            Err(rejection) => Err(ApiError::validation(rejection.body_text())),
+        }
+    }
+}
+
+impl<T, S> OptionalFromRequest<S> for ApiJson<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Option<Self>, Self::Rejection> {
+        match <axum::Json<T> as OptionalFromRequest<S>>::from_request(req, state).await {
+            Ok(Some(axum::Json(value))) => Ok(Some(Self(value))),
+            Ok(None) => Ok(None),
             Err(rejection) => Err(ApiError::validation(rejection.body_text())),
         }
     }
@@ -148,6 +164,42 @@ impl CallCtx {
         audit::append(&mut w.tx, &record).await?;
         w.commit().await?;
         Err(error)
+    }
+
+    /// Authorizes a human-only mutating call (`README.md` special scope value
+    /// `human`, for example `node:enroll`). An agent identity is refused with
+    /// `reason: human_only`; the refusal is audited like any other.
+    ///
+    /// # Errors
+    ///
+    /// `forbidden` with `reason: human_only` or `scope_missing`, or an internal
+    /// error if the refusal could not be recorded.
+    pub async fn authorize_human(
+        &self,
+        state: &AppState,
+        scope: Scope,
+        target: Option<&Target>,
+        project_id: Option<&str>,
+        params: &Value,
+    ) -> Result<(), ApiError> {
+        if !self.identity.is_human() {
+            let error = ApiError::forbidden(Reason::HumanOnly, Some(scope.as_str()));
+            let record = self.record(
+                Some(scope),
+                target,
+                project_id,
+                params,
+                Outcome::Refused,
+                Some(error.audit_detail()),
+                None,
+            );
+            let mut w = state.store.begin_write().await?;
+            audit::append(&mut w.tx, &record).await?;
+            w.commit().await?;
+            return Err(error);
+        }
+        self.authorize(state, scope, target, project_id, params)
+            .await
     }
 
     /// The audit record for this call.

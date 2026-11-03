@@ -7,26 +7,33 @@
 use quoro_control_plane::auth::setup_token;
 use quoro_control_plane::crypto::DataKey;
 use quoro_control_plane::store::{Store, random_secret};
-use quoro_control_plane::{AppState, ServerConfig, router};
+use quoro_control_plane::{AppState, NodeNetwork, ReferenceAsDigest, ServerConfig, router};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
 pub const OWNER_EMAIL: &str = "owner@example.com";
 pub const OWNER_PASSWORD: &str = "correct horse battery staple";
+
+pub const TLS_FINGERPRINT: &str = concat!(
+    "sha256:",
+    "0000000000000000000000000000000000000000000000000000000000000000"
+);
 
 pub struct Server {
     pub base: String,
     pub data_dir: PathBuf,
     pub state: AppState,
-    /// Receives the `vm_` ids the services notify the driver about.
-    pub driver_rx: mpsc::UnboundedReceiver<String>,
 }
 
 impl Server {
     pub fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base)
+    }
+
+    /// The `host:port` the test listener bound.
+    pub fn address(&self) -> String {
+        self.base.trim_start_matches("http://").to_string()
     }
 
     /// A client with its own cookie jar.
@@ -102,16 +109,25 @@ pub async fn start() -> Server {
     let data_dir = std::env::temp_dir().join(format!("quoro-test-{}", &random_secret()[..16]));
     std::fs::create_dir_all(&data_dir).unwrap();
     let store = Store::open(&data_dir.join("quoro.db")).await.unwrap();
-    let (tx, driver_rx) = mpsc::unbounded_channel();
-    let state = AppState::new(
+    let state = AppState::open(
         store,
         ServerConfig {
             data_dir: data_dir.clone(),
             secure_cookies: false,
+            public_url: Some("https://primary.example:8443".to_string()),
+            tls_fingerprint: TLS_FINGERPRINT.to_string(),
+            node_network: NodeNetwork {
+                subnet: "10.42.1.0/24".to_string(),
+                gateway: "10.42.1.1".to_string(),
+            },
+            heartbeat_interval_ms: 200,
+            session_timeout_ms: 800,
         },
-        Some(tx),
+        Arc::new(ReferenceAsDigest),
         Arc::new(DataKey::ephemeral()),
-    );
+    )
+    .await
+    .unwrap();
     let app = router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -122,7 +138,6 @@ pub async fn start() -> Server {
         base,
         data_dir,
         state,
-        driver_rx,
     }
 }
 

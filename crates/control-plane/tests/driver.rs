@@ -86,21 +86,6 @@ async fn registers_once_observes_and_serves_the_node() {
     .await
     .unwrap();
 
-    // desired_vm reads it, vms_on_node lists it.
-    let desired = driver::desired_vm(&store, &vm_id).await.unwrap().unwrap();
-    assert_eq!(desired.observed_status, ObservedStatus::Starting);
-    assert_eq!(desired.memory_mb, 512);
-    assert_eq!(
-        driver::vms_on_node(&store, &node_id).await.unwrap(),
-        vec![vm_id.clone()]
-    );
-    assert!(
-        driver::desired_vm(&store, "vm_01JC9Z6Q5W8N3K4T7R2M1XHB0D")
-            .await
-            .unwrap()
-            .is_none()
-    );
-
     // Entering running emits vm.started.
     driver::report_observed(
         &store,

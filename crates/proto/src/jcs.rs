@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! RFC 8785 JSON Canonicalization Scheme for the values Quoro hashes.
 //!
 //! The change log and the audit log hash `SHA-256(JCS(entry))`

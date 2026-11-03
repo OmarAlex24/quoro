@@ -28,7 +28,7 @@ Rules:
 | `axum` | `crates/control-plane` | `http1`, `json`, `query`, `tokio` | The HTTP API server and router of D-0056 |
 | `tokio` | `crates/control-plane` | `sync`, `time`, `rt`, `macros` | The single-writer gate (`sync`), timers, and the runtime axum runs on |
 | `sqlx` | `crates/control-plane` | `sqlite`, `runtime-tokio` | SQLite access for the change log and state tables (D-0015); runtime queries only, no compile-time macros, so the build needs no database |
-| `serde_json` | `crates/control-plane` | `std` | JSON bodies, change-log payloads and audit params; the RFC 8785 canonical form is computed in-crate (`jcs.rs`) over `serde_json::Value` |
+| `serde_json` | `crates/control-plane` | `std` | JSON bodies, change-log payloads and audit params; the RFC 8785 canonical form comes from `quoro-proto` (`jcs.rs`) |
 | `utoipa` | `crates/control-plane` | `macros` | Handler annotations that generate the OpenAPI document diffed against the frozen `openapi.yaml` (D-0048) |
 | `sha2` | `crates/control-plane` | no default features | SHA-256 for the change-log and audit hash chains and for hashing session and setup secrets |
 | `argon2` | `crates/control-plane` | `alloc`, `password-hash` | Argon2id password hashes in `users.password_hash`, as `permission-model.md` and `openapi.yaml` require |
@@ -48,6 +48,22 @@ Rules:
 | `futures-core` | `crates/quoro` | no default features | Polls the engine's `EventStream` with `std::future::poll_fn` instead of pulling in `futures` |
 | `rust-embed` | `crates/quoro` | `deterministic-timestamps` (no default features) | Compiles `panel/dist` into the binary so one file serves the panel (D-0056); `allow_missing` lets a Rust-only build compile, and deterministic timestamps keep release builds reproducible (ADR 0027). It brings a second `sha2` (0.11, for its own file hashes) next to the 0.10 the control plane uses; every 8.x release does |
 | `sqlx` | `crates/quoro` | `sqlite`, `runtime-tokio` | `quoro setup-token` checks for an existing owner with one query on the store's pool |
+| `serde`, `serde_json` | `crates/proto` | `derive`, `std` / `std` | Every node-agent message is one JSON text frame (`node-agent-protocol.md` section 3.2); the RFC 8785 canonical form (`jcs.rs`, moved here from the control plane) is computed over `serde_json::Value` |
+| `ed25519-dalek` | `crates/proto` | `std`, `fast`, `zeroize` (no default features) | The cluster signing key signs `desired_state` and `signing_key_rotate`; nodes verify against the pinned public key (section 5.11, ADR 0050). Pure Rust, BSD-3-Clause; keys come from 32-byte seeds read from the OS generator, so no `rand` feature |
+| `base64` | `crates/proto`, `crates/control-plane`, `crates/node-agent` | `std` (no default features) | Public keys, signatures and node credentials are standard base64 on the wire (section 2) |
+| `quoro-proto` (workspace crate) | `crates/control-plane` | none | The session's wire types, the signature helpers and the canonical JSON the change log hashes |
+| `axum` | `crates/control-plane` | adds `ws` | Serves `GET /api/v1/nodes/session` as a WebSocket (section 3.1); brings `tokio-tungstenite`, the same version the node agent dials with |
+| `tokio` | `crates/node-agent` | adds `net`, `rt`, `fs`, `io-util` | The dial-out TCP connection (`net`), spawned session and reconciler tasks (`rt`), the key files (`fs`) and the TLS stream (`io-util`) |
+| `rustls`, `tokio-rustls` | `crates/node-agent` | `ring`, `std`, `tls12` / `ring`, `tls12` (no default features) | TLS to the primary with a verifier that accepts only the certificate whose SHA-256 matches the join command's fingerprint (section 2.2); no root store, so no `webpki-roots` |
+| `tokio-tungstenite` | `crates/node-agent` | `handshake` (no default features) | The WebSocket client over that pinned TLS stream (section 3.1); its own TLS features are off because they would bring a root store instead of the pin |
+| `futures-util` | `crates/node-agent` | `sink`, `std` (no default features) | `StreamExt` and `SinkExt` on the WebSocket; already in the tree through axum |
+| `hyper`, `hyper-util`, `http-body-util` | `crates/node-agent` | `client`, `http1` / `tokio` / none | The one enrollment POST (section 2.3) over the same pinned TLS stream; all three are already in the tree through axum |
+| `sqlx` | `crates/node-agent` | `sqlite`, `runtime-tokio` | The local node store (section 12): signed desired state, applied state and the event buffer survive agent restarts in SQLite, like the control plane's state |
+| `serde`, `serde_json` | `crates/node-agent` | `derive`, `std` / `std` | Rows of that store and the node identity file |
+| `sha2` | `crates/node-agent` | no default features | SHA-256 of the primary's certificate for the pin |
+| `getrandom` | `crates/node-agent` | no default features | The node's Ed25519 seed, the agent `boot_id` and message ids come from the OS generator |
+| `tracing` | `crates/node-agent` | `std` | Session, reconcile and redial logs |
+| `quoro-node-agent` (workspace crate) | `crates/quoro` | none | `quoro join`, `quoro node` and the primary's own local node agent |
 | `quoro-init` (workspace crate) | `crates/engine` (Linux) | none | The config-disk and status-record formats shared with the guest init, so the engine and the init use one copy of the encoder and decoder |
 | `tokio` | `crates/engine` (Linux) | adds `rt`, `fs`, `net`, `process`, `macros` | Image conversion runs on `spawn_blocking` (`rt`); blobs stream to files (`fs`); the Cloud Hypervisor API is HTTP over a UNIX socket and VMM exits are watched through a pidfd (`net`); VMM processes are spawned and reaped (`process`); `select!` in the per-VM supervisor (`macros`) |
 | `oci-client` | `crates/engine` (Linux) | `rustls-tls` only | OCI distribution protocol for `prepare_image`: anonymous token auth, manifest and index fetch, blob streaming (D-0061, validated by the M0 spike). Writing a registry client by hand is more code to review than this crate. Pulls `reqwest`, `hyper`, `rustls` with `aws-lc-rs`; every crate in that tree is under an allowlisted license (D-0080) |

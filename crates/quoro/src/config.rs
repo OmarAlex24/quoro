@@ -32,6 +32,11 @@ pub const DEFAULT_PATH: &str = "/etc/quoro/quoro.toml";
 /// Where the installer puts the database, the TLS material and the token.
 pub const DEFAULT_DATA_DIR: &str = "/var/lib/quoro";
 
+/// The node agent's own data directory: its identity, local store and the
+/// engine state. A sibling of the control plane's, never inside it, so the
+/// two can belong to different users (ADR 0089).
+pub const DEFAULT_NODE_DATA_DIR: &str = "/var/lib/quoro-node";
+
 /// The one HTTPS port of D-0054.
 pub const DEFAULT_LISTEN: &str = "0.0.0.0:8443";
 
@@ -126,18 +131,6 @@ impl Subnet {
         })
     }
 
-    /// The network address (`10.42.0.0` for `10.42.0.0/24`).
-    #[must_use]
-    pub const fn network(self) -> Ipv4Addr {
-        self.network
-    }
-
-    /// The prefix length.
-    #[must_use]
-    pub const fn prefix(self) -> u8 {
-        self.prefix
-    }
-
     /// The node's own address on the bridge: the first host address.
     #[must_use]
     pub fn gateway(self) -> Ipv4Addr {
@@ -190,7 +183,7 @@ pub struct CloudHypervisorConfig {
     #[serde(default = "default_init_binary")]
     pub init_binary: PathBuf,
     /// The engine's state root (`vms/`, `images/`, `boot/`). Absent means
-    /// `<data_dir>/engine`, which only the caller knows at this point.
+    /// `<node data_dir>/engine`, which only the caller knows at this point.
     pub state_dir: Option<PathBuf>,
     /// The bridge every VM is attached to.
     #[serde(default = "default_bridge")]
@@ -218,12 +211,13 @@ impl Default for CloudHypervisorConfig {
 }
 
 impl CloudHypervisorConfig {
-    /// The engine's state root: `state_dir` when set, else `<data_dir>/engine`.
+    /// The engine's state root: `state_dir` when set, else
+    /// `<node data_dir>/engine`.
     #[must_use]
-    pub fn state_dir(&self, data_dir: &Path) -> PathBuf {
+    pub fn state_dir(&self, node_data_dir: &Path) -> PathBuf {
         self.state_dir
             .clone()
-            .unwrap_or_else(|| data_dir.join("engine"))
+            .unwrap_or_else(|| node_data_dir.join("engine"))
     }
 
     /// The guest DNS servers: `dns` when set, else the host's upstream
@@ -257,6 +251,35 @@ pub struct Config {
     /// The Cloud Hypervisor engine's node network and artifact paths.
     #[serde(default)]
     pub cloud_hypervisor: CloudHypervisorConfig,
+    /// Base URL nodes dial and join commands carry, for example
+    /// `https://primary.example.com:8443`. Unset: the `Host` of the request
+    /// that created the join token.
+    #[serde(default)]
+    pub public_url: Option<String>,
+    /// The node agent on this machine.
+    #[serde(default)]
+    pub node: NodeConfig,
+}
+
+/// The `[node]` table: the node agent on this machine.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NodeConfig {
+    /// Identity, local store and engine state of the node agent.
+    pub data_dir: PathBuf,
+    /// Whether `quoro serve` also runs this machine's node agent in its own
+    /// process, dialing its own listener through the same session as any
+    /// other node. `false` once the agent runs as its own service.
+    pub local: bool,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            data_dir: PathBuf::from(DEFAULT_NODE_DATA_DIR),
+            local: true,
+        }
+    }
 }
 
 impl Default for Config {
@@ -267,6 +290,8 @@ impl Default for Config {
             engine: EngineKind::default(),
             node_name: default_node_name(),
             cloud_hypervisor: CloudHypervisorConfig::default(),
+            public_url: None,
+            node: NodeConfig::default(),
         }
     }
 }
@@ -401,6 +426,26 @@ mod tests {
     }
 
     #[test]
+    fn the_node_table_defaults_to_a_local_agent_beside_the_control_plane() {
+        let config = Config::default();
+        assert_eq!(config.node.data_dir, PathBuf::from(DEFAULT_NODE_DATA_DIR));
+        assert!(config.node.local, "a single host runs its own node agent");
+        assert!(config.public_url.is_none());
+
+        let parsed: Config = toml::from_str(
+            "public_url = \"https://primary.example:8443\"\n[node]\ndata_dir = \"/srv/node\"\nlocal = false\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.public_url.as_deref(),
+            Some("https://primary.example:8443")
+        );
+        assert_eq!(parsed.node.data_dir, PathBuf::from("/srv/node"));
+        assert!(!parsed.node.local);
+        assert!(toml::from_str::<Config>("[node]\nbogus = 1\n").is_err());
+    }
+
+    #[test]
     fn cloud_hypervisor_defaults_are_the_documented_ones() {
         let config = Config::default();
         let ch = &config.cloud_hypervisor;
@@ -408,8 +453,8 @@ mod tests {
         assert_eq!(ch.init_binary, PathBuf::from(DEFAULT_INIT_BINARY));
         assert_eq!(ch.bridge, DEFAULT_BRIDGE);
         assert_eq!(ch.subnet.to_string(), DEFAULT_SUBNET);
-        assert_eq!(ch.subnet.network(), Ipv4Addr::new(10, 42, 0, 0));
-        assert_eq!(ch.subnet.prefix(), 24);
+        assert_eq!(ch.subnet.network, Ipv4Addr::new(10, 42, 0, 0));
+        assert_eq!(ch.subnet.prefix, 24);
         assert_eq!(ch.subnet.gateway(), Ipv4Addr::new(10, 42, 0, 1));
         // Absent `state_dir` follows `data_dir`, which a table cannot know.
         assert_eq!(

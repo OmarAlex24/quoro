@@ -2,8 +2,9 @@
 //!
 //! The test drives the real binary over real HTTPS: a temporary data
 //! directory, `listen = "127.0.0.1:0"`, the port read from the start log, then
-//! setup, login, one node, one project and one VM through its whole lifecycle
-//! on the fake engine. Nothing here is mocked, so a failure points at the
+//! setup, login, the primary's own node agent, one project and one VM through
+//! its whole lifecycle on the fake engine, and finally a second machine that
+//! joins with a join token, runs `quoro node` and runs a VM of its own. Nothing here is mocked, so a failure points at the
 //! binary, the TLS material or the control plane's handlers rather than at a
 //! harness.
 
@@ -48,15 +49,44 @@ impl Drop for TempDir {
     }
 }
 
-/// Writes the configuration the server and `setup-token` both read.
-fn write_config(dir: &Path) -> PathBuf {
+/// Writes the configuration the server and `setup-token` both read. The node
+/// agent keeps its own data directory beside the control plane's.
+fn write_config(dir: &Path, node_name: &str) -> PathBuf {
     let path = dir.join("quoro.toml");
     let body = format!(
-        "listen = \"127.0.0.1:0\"\ndata_dir = \"{}\"\nengine = \"fake\"\nnode_name = \"test-node\"\n",
-        dir.display()
+        "listen = \"127.0.0.1:0\"\ndata_dir = \"{}\"\nengine = \"fake\"\nnode_name = \"{node_name}\"\n\n[node]\ndata_dir = \"{}\"\n",
+        dir.join("cp").display(),
+        dir.join("node").display(),
     );
     std::fs::write(&path, body).expect("write quoro.toml");
     path
+}
+
+/// Polls the node list until `name` is `connected`, and returns that node.
+async fn wait_for_node(client: &reqwest::Client, base: &str, name: &str) -> Value {
+    let deadline = Instant::now() + LIFECYCLE_TIMEOUT;
+    loop {
+        let response = client
+            .get(format!("{base}/api/v1/nodes"))
+            .send()
+            .await
+            .expect("GET /api/v1/nodes");
+        let nodes = json(response, 200).await;
+        let found = nodes["items"]
+            .as_array()
+            .and_then(|items| items.iter().find(|node| node["name"] == name))
+            .cloned();
+        if let Some(node) = found
+            && node["status"] == "connected"
+        {
+            return node;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "node {name} did not connect: {nodes}"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Runs the binary with `args` and `--config <path>`.
@@ -118,7 +148,7 @@ async fn the_binary_serves_the_whole_lifecycle_over_https() {
         .expect("the ring provider installs once per process");
 
     let dir = TempDir::new("serve");
-    let config = write_config(dir.path());
+    let config = write_config(dir.path(), "test-node");
 
     // `quoro version` needs no server and no configuration.
     let version = Command::new(env!("CARGO_BIN_EXE_quoro"))
@@ -147,18 +177,28 @@ async fn the_binary_serves_the_whole_lifecycle_over_https() {
     let mut lines = BufReader::new(stderr).lines();
     // Kept so a server that dies before it listens explains itself.
     let mut log: Vec<String> = Vec::new();
-    let port = timeout(Duration::from_secs(30), async {
+    let (port, fingerprint) = timeout(Duration::from_secs(30), async {
+        let mut port = None;
         loop {
             match lines.next_line().await {
                 Ok(Some(line)) => {
                     if let Some(rest) = line.split("listening on https://").nth(1) {
                         let address = rest.split_whitespace().next().expect("the address");
-                        return address
-                            .rsplit(':')
-                            .next()
-                            .expect("a port")
-                            .parse::<u16>()
-                            .expect("a numeric port");
+                        port = Some(
+                            address
+                                .rsplit(':')
+                                .next()
+                                .expect("a port")
+                                .parse::<u16>()
+                                .expect("a numeric port"),
+                        );
+                    }
+                    if let Some(rest) = line.split("tls fingerprint: ").nth(1) {
+                        let fingerprint = rest.split_whitespace().next().expect("a fingerprint");
+                        return (
+                            port.expect("the address is logged first"),
+                            fingerprint.to_string(),
+                        );
                     }
                     log.push(line);
                 }
@@ -170,7 +210,7 @@ async fn the_binary_serves_the_whole_lifecycle_over_https() {
     .await
     .unwrap_or_else(|_| {
         panic!(
-            "the server logged no listening address within 30s:\n{}",
+            "the server logged no listening address and fingerprint within 30s:\n{}",
             log.join("\n")
         )
     });
@@ -231,22 +271,14 @@ async fn the_binary_serves_the_whole_lifecycle_over_https() {
     let me = json(response, 200).await;
     assert_eq!(me["type"], "user", "login answers the identity: {me}");
 
-    // ---- the primary node registered itself ------------------------------
-    let response = client
-        .get(format!("{base}/api/v1/nodes"))
-        .send()
-        .await
-        .expect("GET /api/v1/nodes");
-    let nodes = json(response, 200).await;
-    let node = &nodes["items"][0];
-    assert_eq!(
-        nodes["items"].as_array().map(Vec::len),
-        Some(1),
-        "the primary is the only node in M1: {nodes}"
-    );
+    // ---- the primary's own node agent enrolled over loopback -------------
+    let node = wait_for_node(&client, &base, "test-node").await;
     assert_eq!(node["cp_status"], "primary", "the node: {node}");
-    assert_eq!(node["status"], "connected", "the node: {node}");
     let node_id = node["id"].as_str().expect("the node id").to_string();
+    assert!(
+        !dir.path().join("cp/local-node-join.json").exists(),
+        "the local join file is consumed by the enrollment"
+    );
 
     // ---- a project and a VM on that node --------------------------------
     let response = client
@@ -335,6 +367,100 @@ async fn the_binary_serves_the_whole_lifecycle_over_https() {
         sleep(Duration::from_millis(100)).await;
     }
 
+    // ---- a second machine joins with a join token -----------------------
+    let response = client
+        .post(format!("{base}/api/v1/nodes/join-tokens"))
+        .json(&json!({}))
+        .send()
+        .await
+        .expect("POST /api/v1/nodes/join-tokens");
+    let created = json(response, 201).await;
+    let join_token = created["token"]
+        .as_str()
+        .expect("the join token")
+        .to_string();
+    assert!(join_token.starts_with("njt_"), "a join token: {created}");
+
+    let second_dir = TempDir::new("node");
+    let second = write_config(second_dir.path(), "second-node");
+    let joined = Command::new(env!("CARGO_BIN_EXE_quoro"))
+        .args([
+            "join",
+            &base,
+            "--token",
+            &join_token,
+            "--fingerprint",
+            &fingerprint,
+        ])
+        .arg("--config")
+        .arg(&second)
+        .output()
+        .await
+        .expect("run quoro join");
+    assert!(
+        joined.status.success(),
+        "quoro join exits 0: {}",
+        String::from_utf8_lossy(&joined.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&joined.stdout).contains("enrolled as nod_"),
+        "join prints the node id: {}",
+        String::from_utf8_lossy(&joined.stdout)
+    );
+
+    // The token is single use.
+    let again = run_with_config(
+        &[
+            "join",
+            &base,
+            "--token",
+            &join_token,
+            "--fingerprint",
+            &fingerprint,
+        ],
+        &write_config(TempDir::new("again").path(), "third-node"),
+    )
+    .await;
+    assert!(!again.status.success(), "a used join token is refused");
+
+    let mut agent = Command::new(env!("CARGO_BIN_EXE_quoro"))
+        .arg("node")
+        .arg("--config")
+        .arg(&second)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn quoro node");
+
+    let second_node = wait_for_node(&client, &base, "second-node").await;
+    assert!(
+        second_node["cp_status"].is_null(),
+        "a joined node is not a primary: {second_node}"
+    );
+    let second_id = second_node["id"].as_str().expect("the node id").to_string();
+
+    let response = client
+        .post(format!("{base}/api/v1/vms"))
+        .json(&json!({
+            "project_id": project_id,
+            "node_id": second_id,
+            "name": "remote",
+            "vcpus": 1,
+            "memory_mb": 256,
+            "disk_gb": 1,
+            "image": "ghcr.io/quoro/hello:latest",
+        }))
+        .send()
+        .await
+        .expect("POST /api/v1/vms on the second node");
+    let vm = json(response, 201).await;
+    let remote_id = vm["id"].as_str().expect("the VM id").to_string();
+    assert_eq!(vm["node_id"], second_id, "placed on the second node: {vm}");
+    wait_for_observed(&client, &base, &remote_id, "running").await;
+
+    agent.kill().await.expect("stop the node agent");
+    let _ = agent.wait().await;
     server.kill().await.expect("stop the server");
     let _ = server.wait().await;
 }
