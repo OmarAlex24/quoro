@@ -21,12 +21,14 @@ use crate::error::{ApiError, Code};
 use crate::events::{self, StoredEvent};
 use crate::keys::ClusterKeys;
 use crate::store::{Store, now_rfc3339, sha256_hex};
+use crate::tunnel::{CloudflareEndpoints, TunnelKick};
 use crate::{DigestResolver, ServerConfig};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequestParts, State};
 use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
 use quoro_proto::wire::{self, ControlMessage, NodeMessage};
+use quoro_providers::DnsProvider;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -181,7 +183,20 @@ struct HubInner {
     digests: desired::DigestCache,
     /// `vm_` id to node, kept for VMs whose row is already deleted.
     vm_nodes: Mutex<HashMap<String, String>>,
+    /// The tunnel manager, so a session can ask for a route reconcile.
+    tunnels: Mutex<Option<TunnelKick>>,
+    /// Where the Cloudflare clients point (section 5.22, ADR 0094).
+    endpoints: Mutex<CloudflareEndpoints>,
+    /// DNS-01 records this primary created, per node: `record_id` to it.
+    dns_records: Mutex<HashMap<String, HashMap<String, DnsRecord>>>,
     generation: AtomicU64,
+}
+
+/// A DNS-01 TXT record the primary created for one node (section 5.22).
+#[derive(Clone, Debug)]
+struct DnsRecord {
+    hostname: String,
+    provider_id: String,
 }
 
 /// The live node sessions, shared by every handler.
@@ -207,6 +222,9 @@ impl NodeHub {
             sessions: Mutex::new(HashMap::new()),
             digests: desired::DigestCache::default(),
             vm_nodes: Mutex::new(HashMap::new()),
+            tunnels: Mutex::new(None),
+            endpoints: Mutex::new(CloudflareEndpoints::production()),
+            dns_records: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
         }))
     }
@@ -227,6 +245,84 @@ impl NodeHub {
         let inner = Arc::clone(&self.0);
         let vm_id = vm_id.to_string();
         tokio::spawn(async move { inner.vm_changed(&vm_id).await });
+    }
+
+    /// Tells the live session of `node_id` to rebuild and resend its desired
+    /// state (section 5.11). A node without a session is left alone: it gets
+    /// the new snapshot when it dials.
+    pub fn node_changed(&self, node_id: &str) {
+        let changed = {
+            let sessions = self.0.sessions.lock().expect("session lock");
+            sessions
+                .get(node_id)
+                .map(|handle| Arc::clone(&handle.changed))
+        };
+        if let Some(changed) = changed {
+            changed.notify_one();
+        }
+    }
+
+    /// Asks the tunnel manager to reconcile `node_id` after a snapshot was
+    /// sent (section 5.11, ADR 0094).
+    pub(crate) fn tunnel_changed(&self, node_id: &str) {
+        let kick = {
+            let tunnels = self.0.tunnels.lock().expect("tunnel handle lock");
+            tunnels.clone()
+        };
+        if let Some(kick) = kick {
+            kick.kick(node_id);
+        }
+    }
+
+    /// Registers the tunnel manager.
+    pub(crate) fn set_tunnel_manager(&self, manager: &crate::tunnel::TunnelManager) {
+        *self.0.tunnels.lock().expect("tunnel handle lock") = Some(manager.kick_handle());
+    }
+
+    /// Points the Cloudflare clients at other endpoints (tests).
+    pub(crate) fn set_cloudflare_endpoints(&self, endpoints: CloudflareEndpoints) {
+        *self.0.endpoints.lock().expect("endpoints lock") = endpoints;
+    }
+
+    /// Where the Cloudflare clients point.
+    #[must_use]
+    pub(crate) fn cloudflare_endpoints(&self) -> CloudflareEndpoints {
+        self.0.endpoints.lock().expect("endpoints lock").clone()
+    }
+
+    /// Remembers a DNS-01 record this primary created for `node_id`.
+    fn remember_dns_record(&self, node_id: &str, record_id: &str, record: DnsRecord) {
+        self.0
+            .dns_records
+            .lock()
+            .expect("dns records lock")
+            .entry(node_id.to_string())
+            .or_default()
+            .insert(record_id.to_string(), record);
+    }
+
+    /// A DNS-01 record of this node, if the primary created it.
+    fn dns_record(&self, node_id: &str, record_id: &str) -> Option<DnsRecord> {
+        self.0
+            .dns_records
+            .lock()
+            .expect("dns records lock")
+            .get(node_id)
+            .and_then(|records| records.get(record_id))
+            .cloned()
+    }
+
+    /// Forgets a DNS-01 record once its TXT record is gone.
+    fn take_dns_record(&self, node_id: &str, record_id: &str) {
+        if let Some(records) = self
+            .0
+            .dns_records
+            .lock()
+            .expect("dns records lock")
+            .get_mut(node_id)
+        {
+            records.remove(record_id);
+        }
     }
 
     /// Sends one `command` to `node_id` and waits for its `command_result`
@@ -1086,9 +1182,44 @@ impl Session {
                 Some(&raw.id),
             )),
             // No leases or change-log follow exist in M2.
-            NodeMessage::LeaseRenew(_) | NodeMessage::LogAck(_) | NodeMessage::DnsChallenge(_) => {}
+            NodeMessage::LeaseRenew(_) | NodeMessage::LogAck(_) => {}
+            NodeMessage::DnsChallenge(challenge) => {
+                let acme_routes: HashSet<String> = self
+                    .last_spec
+                    .as_ref()
+                    .map(|spec| {
+                        spec.routes
+                            .iter()
+                            .filter(|route| route.tls_mode == "acme")
+                            .map(|route| route.hostname.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.start_dns_challenge(challenge, raw.id.clone(), acme_routes);
+            }
         }
         false
+    }
+
+    /// Answers one `dns_challenge` off the session loop (section 5.22). The
+    /// result goes back through the session's outbox with `re` set to the
+    /// challenge's id.
+    fn start_dns_challenge(
+        &self,
+        challenge: wire::DnsChallenge,
+        re: String,
+        acme_routes: HashSet<String>,
+    ) {
+        let hub = self.hub.clone();
+        let node_id = self.node_id.clone();
+        let generation = self.generation;
+        tokio::spawn(async move {
+            let result = dns_challenge(&hub, &node_id, &challenge, &acme_routes).await;
+            let text = ControlMessage::DnsChallengeResult(result)
+                .to_frame(&new_msg_id(), Some(&re))
+                .to_text();
+            hub.0.send_text(&node_id, generation, text);
+        });
     }
 
     /// Builds the snapshot, persists the new `rev` and queues the signed frame.
@@ -1162,6 +1293,7 @@ impl Session {
         }
         self.desired_rev = rev;
         self.last_spec = Some(spec);
+        self.hub.tunnel_changed(&self.node_id);
         Ok(())
     }
 
@@ -1200,6 +1332,153 @@ impl Session {
 // ---------------------------------------------------------------------------
 // Database work
 // ---------------------------------------------------------------------------
+
+/// A failed `dns_challenge_result` (section 5.23).
+fn failed_challenge(message: &str) -> wire::DnsChallengeResult {
+    wire::DnsChallengeResult {
+        ok: false,
+        record_id: None,
+        message: Some(message.to_string()),
+    }
+}
+
+/// Handles one `dns_challenge` (section 5.22): the node names a hostname it
+/// serves as an `acme` route, and the primary writes or removes the
+/// `_acme-challenge.<hostname>` TXT record with the domain's `dns` provider.
+async fn dns_challenge(
+    hub: &NodeHub,
+    node_id: &str,
+    challenge: &wire::DnsChallenge,
+    acme_routes: &HashSet<String>,
+) -> wire::DnsChallengeResult {
+    match challenge.action {
+        wire::DnsChallengeAction::Set => {
+            if !acme_routes.contains(&challenge.hostname) {
+                return failed_challenge("the hostname is not an acme route of this node");
+            }
+            // A DNS-01 value is a base64url SHA-256 digest (RFC 8555 section
+            // 8.4): 43 characters, nothing else may be written into the zone.
+            let Some(value) = challenge.value.as_deref().filter(|value| {
+                value.len() == 43
+                    && value
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            }) else {
+                return failed_challenge("set needs a DNS-01 digest value");
+            };
+            let provider_id: Option<String> = match sqlx::query_scalar(
+                "SELECT provider_id FROM domains WHERE hostname = ?",
+            )
+            .bind(&challenge.hostname)
+            .fetch_optional(hub.0.store.pool())
+            .await
+            {
+                Ok(provider_id) => provider_id,
+                Err(e) => {
+                    tracing::warn!(node_id, error = %e, "cannot read the domain of a dns challenge");
+                    return failed_challenge("the domain could not be read");
+                }
+            };
+            let Some(provider_id) = provider_id else {
+                return failed_challenge("the hostname has no domain provider");
+            };
+            let dns = match dns_client(hub, &provider_id).await {
+                Ok(dns) => dns,
+                Err(message) => return failed_challenge(&message),
+            };
+            let name = format!("_acme-challenge.{}", challenge.hostname);
+            match dns.create_txt(&name, value).await {
+                Ok(record_id) => {
+                    hub.remember_dns_record(
+                        node_id,
+                        &record_id.0,
+                        DnsRecord {
+                            hostname: challenge.hostname.clone(),
+                            provider_id,
+                        },
+                    );
+                    wire::DnsChallengeResult {
+                        ok: true,
+                        record_id: Some(record_id.0),
+                        message: None,
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(node_id, hostname = %challenge.hostname, error = %e, "cannot write a dns-01 record");
+                    failed_challenge("the provider refused the record")
+                }
+            }
+        }
+        wire::DnsChallengeAction::Clear => {
+            let Some(record_id) = challenge.record_id.as_deref() else {
+                return failed_challenge("clear needs a record_id");
+            };
+            let Some(record) = hub.dns_record(node_id, record_id) else {
+                return failed_challenge(
+                    "the record was not created by this primary for this node",
+                );
+            };
+            let dns = match dns_client(hub, &record.provider_id).await {
+                Ok(dns) => dns,
+                Err(message) => return failed_challenge(&message),
+            };
+            match dns
+                .delete_record(&quoro_providers::RecordId(record_id.to_string()))
+                .await
+            {
+                Ok(()) => {
+                    hub.take_dns_record(node_id, record_id);
+                    wire::DnsChallengeResult {
+                        ok: true,
+                        record_id: None,
+                        message: None,
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(node_id, hostname = %record.hostname, error = %e, "cannot remove a dns-01 record");
+                    failed_challenge("the provider refused the deletion")
+                }
+            }
+        }
+    }
+}
+
+/// The DNS client of the domain's provider. Messages never carry a credential.
+async fn dns_client(
+    hub: &NodeHub,
+    provider_id: &str,
+) -> Result<quoro_providers::cloudflare::CloudflareDns, String> {
+    let (record, secret) =
+        crate::api::providers::provider_secret_in(&hub.0.store, &hub.0.data_key, provider_id)
+            .await
+            .map_err(|e| {
+                if e.code == crate::error::Code::NotFound {
+                    "the domain's provider is gone".to_string()
+                } else {
+                    "the domain's provider could not be read".to_string()
+                }
+            })?;
+    if record.kind != "dns" {
+        return Err("the domain's provider is not a dns provider".to_string());
+    }
+    let zone_id = record
+        .config
+        .get("zone_id")
+        .and_then(Value::as_str)
+        .filter(|zone| !zone.is_empty())
+        .ok_or_else(|| "the domain's provider has no zone_id".to_string())?;
+    let endpoints = hub.cloudflare_endpoints();
+    let cf = quoro_providers::cloudflare::Cloudflare::with_endpoints(
+        quoro_providers::Token::new(secret.expose().to_string()),
+        &endpoints.api_base,
+        &endpoints.doh_base,
+    )
+    .map_err(|e| {
+        tracing::warn!(error = %e, "cannot build the cloudflare client");
+        "the provider client could not be built".to_string()
+    })?;
+    Ok(cf.dns(zone_id))
+}
 
 fn i64_of(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
@@ -1412,7 +1691,75 @@ async fn apply_status_report(
             }
         }
     }
-    set_applied_rev(hub, node_id, report.applied_rev).await
+    set_applied_rev(hub, node_id, report.applied_rev).await?;
+    apply_route_statuses(hub, node_id, &report.routes).await
+}
+
+/// The certificate state a node reported for the hostnames it serves
+/// (`status_report.routes[]`, section 5.3), written to `domains` when it
+/// changed.
+async fn apply_route_statuses(
+    hub: &NodeHub,
+    node_id: &str,
+    routes: &[wire::RouteStatus],
+) -> Result<(), String> {
+    if routes.is_empty() {
+        return Ok(());
+    }
+    let mut changed = Vec::new();
+    for route in routes {
+        let Some(status) = crate::api::domains::CertStatus::parse(&route.cert_status) else {
+            tracing::warn!(
+                node_id,
+                cert_status = %route.cert_status,
+                "the node reported an unknown certificate status"
+            );
+            continue;
+        };
+        let row = sqlx::query(&format!(
+            "SELECT {} FROM domains d WHERE d.hostname = ?1 \
+             AND EXISTS (SELECT 1 FROM vms v WHERE v.app_id = d.app_id AND v.node_id = ?2)",
+            crate::api::domains::DOMAIN_COLUMNS
+        ))
+        .bind(&route.hostname)
+        .bind(node_id)
+        .fetch_optional(hub.0.store.pool())
+        .await
+        .map_err(|e| format!("cannot read the domain of a route status: {e}"))?;
+        let Some(row) = row else {
+            continue;
+        };
+        let mut domain =
+            crate::api::domains::domain_from_row(&row).map_err(|e| format!("{e:?}"))?;
+        if domain.cert_status == status && domain.cert_expires_at == route.cert_expires_at {
+            continue;
+        }
+        domain.cert_status = status;
+        domain.cert_expires_at.clone_from(&route.cert_expires_at);
+        changed.push(domain);
+    }
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let actor = Actor {
+        kind: ActorType::Node,
+        id: node_id.to_string(),
+    };
+    let mut w = hub.0.store.begin_write().await.map_err(|e| e.to_string())?;
+    for domain in &changed {
+        sqlx::query("UPDATE domains SET cert_status = ?, cert_expires_at = ? WHERE id = ?")
+            .bind(domain.cert_status.as_str())
+            .bind(&domain.cert_expires_at)
+            .bind(&domain.id)
+            .execute(&mut *w.tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        let payload = serde_json::to_value(domain).map_err(|e| format!("domain payload: {e}"))?;
+        changelog::append(&mut w.tx, &actor, "domain", &domain.id, Op::Update, payload)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    w.commit().await.map_err(|e| e.to_string())
 }
 
 fn driver_observed(status: wire::ObservedStatus) -> DriverObservedStatus {

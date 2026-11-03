@@ -103,13 +103,33 @@ impl Server {
 
 /// Starts a control plane on 127.0.0.1 with an empty database.
 pub async fn start() -> Server {
+    start_inner(200, 800, None).await
+}
+
+/// Starts a control plane whose Cloudflare clients reach a local mock, with a
+/// session timeout long enough for a test to poll the API while a node stays
+/// connected.
+pub async fn start_with_cloudflare(api_base: &str, doh_base: &str) -> Server {
+    start_inner(
+        5_000,
+        60_000,
+        Some((api_base.to_string(), doh_base.to_string())),
+    )
+    .await
+}
+
+async fn start_inner(
+    heartbeat_interval_ms: u64,
+    session_timeout_ms: u64,
+    cloudflare: Option<(String, String)>,
+) -> Server {
     // reqwest may carry the binary's no-provider rustls feature in a workspace
     // build; an earlier test having installed it already is fine.
     let _ = rustls::crypto::ring::default_provider().install_default();
     let data_dir = std::env::temp_dir().join(format!("quoro-test-{}", &random_secret()[..16]));
     std::fs::create_dir_all(&data_dir).unwrap();
     let store = Store::open(&data_dir.join("quoro.db")).await.unwrap();
-    let state = AppState::open(
+    let mut state = AppState::open(
         store,
         ServerConfig {
             data_dir: data_dir.clone(),
@@ -120,14 +140,17 @@ pub async fn start() -> Server {
                 subnet: "10.42.1.0/24".to_string(),
                 gateway: "10.42.1.1".to_string(),
             },
-            heartbeat_interval_ms: 200,
-            session_timeout_ms: 800,
+            heartbeat_interval_ms,
+            session_timeout_ms,
         },
         Arc::new(ReferenceAsDigest),
         Arc::new(DataKey::ephemeral()),
     )
     .await
     .unwrap();
+    if let Some((api_base, doh_base)) = cloudflare {
+        state = state.with_cloudflare_endpoints(api_base, doh_base);
+    }
     let app = router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());

@@ -26,6 +26,7 @@ pub mod openapi;
 pub mod request;
 pub mod session;
 pub mod store;
+pub mod tunnel;
 
 use crate::keys::ClusterKeys;
 use crate::session::NodeHub;
@@ -121,6 +122,8 @@ pub struct AppState {
     pub data_key: Arc<crypto::DataKey>,
     /// The live node-agent sessions (`node-agent-protocol.md` section 3).
     pub hub: NodeHub,
+    /// The Cloudflare Tunnel manager (ADR 0094, 0095).
+    pub tunnel: tunnel::TunnelManager,
     /// The cluster signing key, loaded at start (ADR 0050).
     pub keys: Arc<ClusterKeys>,
     /// `cls_` id of this cluster, from `meta`.
@@ -164,15 +167,35 @@ impl AppState {
             Arc::clone(&data_key),
         );
         hub.reset_stale_connections().await?;
+        let tunnel = tunnel::TunnelManager::new(store.clone(), Arc::clone(&data_key), hub.clone());
+        hub.set_tunnel_manager(&tunnel);
+        tunnel.start();
         Ok(Self {
             store,
             config,
             idempotency: idempotency::Cache::default(),
             data_key,
             hub,
+            tunnel,
             keys,
             cluster_id,
         })
+    }
+
+    /// Points the Cloudflare clients of this process at other endpoints. The
+    /// tests use it to reach a local mock; production keeps the public API.
+    #[must_use]
+    pub fn with_cloudflare_endpoints(
+        self,
+        api_base: impl Into<String>,
+        doh_base: impl Into<String>,
+    ) -> Self {
+        self.hub
+            .set_cloudflare_endpoints(tunnel::CloudflareEndpoints {
+                api_base: api_base.into(),
+                doh_base: doh_base.into(),
+            });
+        self
     }
 
     /// Tells the session hub that `vm_id` needs reconciling. The rebuild runs
