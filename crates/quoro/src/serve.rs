@@ -38,6 +38,12 @@ const NODE_STOP_GRACE: Duration = Duration::from_secs(15);
 /// A message for the operator when the data directory, the database, the TLS
 /// material or the listener cannot be brought up.
 pub async fn run(config: Config) -> Result<i32, String> {
+    // The control plane's webhook clients use reqwest's no-provider rustls
+    // feature, so the process must install one before `AppState::open` starts
+    // the dispatcher; `ring` is the provider ADR 0080 allows. The listener
+    // and the node agent pass ring explicitly and do not depend on this.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     crate::config::ensure_data_dir(&config.data_dir)
         .map_err(|e| format!("cannot create {}: {e}", config.data_dir.display()))?;
 
