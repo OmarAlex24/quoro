@@ -401,6 +401,7 @@ pub enum NodeMessage {
     StreamData(StreamData),
     StreamEnd(StreamEnd),
     CommandResult(CommandResult),
+    DnsChallenge(DnsChallenge),
     Error(ProtocolError),
     Ping,
     Pong,
@@ -420,6 +421,7 @@ impl NodeMessage {
             Self::StreamData(_) => "stream_data",
             Self::StreamEnd(_) => "stream_end",
             Self::CommandResult(_) => "command_result",
+            Self::DnsChallenge(_) => "dns_challenge",
             Self::Error(_) => "error",
             Self::Ping => "ping",
             Self::Pong => "pong",
@@ -440,6 +442,7 @@ impl NodeMessage {
             Self::StreamData(b) => frame(kind, id, re, b),
             Self::StreamEnd(b) => frame(kind, id, re, b),
             Self::CommandResult(b) => frame(kind, id, re, b),
+            Self::DnsChallenge(b) => frame(kind, id, re, b),
             Self::Error(b) => frame(kind, id, re, b),
             Self::Ping | Self::Pong => frame(kind, id, re, &empty_object()),
         }
@@ -461,6 +464,7 @@ impl NodeMessage {
             "stream_data" => Self::StreamData(raw.body_as()?),
             "stream_end" => Self::StreamEnd(raw.body_as()?),
             "command_result" => Self::CommandResult(raw.body_as()?),
+            "dns_challenge" => Self::DnsChallenge(raw.body_as()?),
             "error" => Self::Error(raw.body_as()?),
             "ping" => Self::Ping,
             "pong" => Self::Pong,
@@ -571,6 +575,70 @@ pub struct Spec {
     pub vms: Vec<SpecVm>,
     pub routes: Vec<SpecRoute>,
     pub network: SpecNetwork,
+    /// Present when the node runs a tunnel (section 5.11, D-0094).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress: Option<SpecIngress>,
+}
+
+/// `spec.ingress` (section 5.11).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecIngress {
+    /// The node's tunnel, present when the node is mapped to a `tunnel`
+    /// provider and the tunnel exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel: Option<SpecTunnel>,
+}
+
+/// `spec.ingress.tunnel` (section 5.11): only the node's own tunnel id, its
+/// run token and the loopback origin port. Never the account credential.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecTunnel {
+    pub tunnel_id: String,
+    /// The tunnel's run token, plaintext. `Debug` redacts it; never log it.
+    pub token: String,
+    pub origin_port: u16,
+}
+
+impl std::fmt::Debug for SpecTunnel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpecTunnel")
+            .field("tunnel_id", &self.tunnel_id)
+            .field("token", &"<redacted>")
+            .field("origin_port", &self.origin_port)
+            .finish()
+    }
+}
+
+/// `action` of `dns_challenge` (section 5.22).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsChallengeAction {
+    Set,
+    Clear,
+}
+
+/// Body of `dns_challenge` (section 5.22), node to control plane.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsChallenge {
+    pub action: DnsChallengeAction,
+    pub hostname: String,
+    /// `set` only: the DNS-01 key authorization digest (base64url).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// `clear` only: the id from the `dns_challenge_result` of the `set`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_id: Option<String>,
+}
+
+/// Body of `dns_challenge_result` (section 5.23), control plane to node.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsChallengeResult {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_id: Option<String>,
+    /// Present when `ok` is false; never a credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// Body of `desired_state` (section 5.11).
@@ -652,6 +720,7 @@ pub enum ControlMessage {
     Command(Command),
     /// The raw signed body (section 5.21).
     SigningKeyRotate(Value),
+    DnsChallengeResult(DnsChallengeResult),
     Error(ProtocolError),
     Ping,
     Pong,
@@ -671,6 +740,7 @@ impl ControlMessage {
             Self::StreamClose(_) => "stream_close",
             Self::Command(_) => "command",
             Self::SigningKeyRotate(_) => "signing_key_rotate",
+            Self::DnsChallengeResult(_) => "dns_challenge_result",
             Self::Error(_) => "error",
             Self::Ping => "ping",
             Self::Pong => "pong",
@@ -690,6 +760,7 @@ impl ControlMessage {
             Self::StreamOpen(b) => frame(kind, id, re, b),
             Self::StreamClose(b) => frame(kind, id, re, b),
             Self::Command(b) => frame(kind, id, re, b),
+            Self::DnsChallengeResult(b) => frame(kind, id, re, b),
             Self::Error(b) => frame(kind, id, re, b),
             Self::Ping | Self::Pong => frame(kind, id, re, &empty_object()),
         }
@@ -711,6 +782,7 @@ impl ControlMessage {
             "stream_close" => Self::StreamClose(raw.body_as()?),
             "command" => Self::Command(raw.body_as()?),
             "signing_key_rotate" => Self::SigningKeyRotate(raw.body.clone()),
+            "dns_challenge_result" => Self::DnsChallengeResult(raw.body_as()?),
             "error" => Self::Error(raw.body_as()?),
             "ping" => Self::Ping,
             "pong" => Self::Pong,
@@ -747,6 +819,50 @@ mod tests {
         assert_eq!(hello.stored_rev, 412);
         assert_eq!(hello.leases[0].mode, crate::LeaseMode::Local);
         assert_eq!(hello.kvm.nested, Some(true));
+    }
+
+    #[test]
+    fn the_dns_challenge_examples_decode_and_round_trip() {
+        let text = r#"{"v":1,"type":"dns_challenge","id":"msg_01JC9ZW2A4C6E8G0J2M4P6R8T0",
+            "body":{"action":"set","hostname":"blog.example.com",
+            "value":"LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0"}}"#;
+        let raw = RawFrame::parse(text).unwrap();
+        let message = NodeMessage::from_raw(&raw).unwrap();
+        let NodeMessage::DnsChallenge(challenge) = &message else {
+            panic!("not a dns_challenge");
+        };
+        assert_eq!(challenge.action, DnsChallengeAction::Set);
+        assert_eq!(challenge.record_id, None);
+        let again = message.to_frame(&raw.id, None);
+        assert_eq!(NodeMessage::from_raw(&again).unwrap(), message);
+
+        let text = r#"{"v":1,"type":"dns_challenge_result","id":"msg_01JC9ZW3B5D7F9H1K3N5Q7S9V1",
+            "re":"msg_01JC9ZW2A4C6E8G0J2M4P6R8T0",
+            "body":{"ok":true,"record_id":"372e67954025e0ba6aaa6d586b9e0b59"}}"#;
+        let raw = RawFrame::parse(text).unwrap();
+        let ControlMessage::DnsChallengeResult(result) = ControlMessage::from_raw(&raw).unwrap()
+        else {
+            panic!("not a dns_challenge_result");
+        };
+        assert!(result.ok);
+        assert_eq!(result.message, None);
+    }
+
+    #[test]
+    fn a_tunnel_token_never_shows_in_debug_output() {
+        let ingress = SpecIngress {
+            tunnel: Some(SpecTunnel {
+                tunnel_id: "c1744f8b".to_owned(),
+                token: "eyJhIjoidG9rZW4ifQ".to_owned(),
+                origin_port: 8081,
+            }),
+        };
+        let printed = format!("{ingress:?}");
+        assert!(!printed.contains("eyJhIjoidG9rZW4ifQ"), "{printed}");
+        let value = serde_json::to_value(&ingress).unwrap();
+        assert_eq!(value["tunnel"]["origin_port"], 8081);
+        let back: SpecIngress = serde_json::from_value(value).unwrap();
+        assert_eq!(back, ingress);
     }
 
     #[test]
@@ -843,6 +959,7 @@ mod tests {
                     subnet: "10.42.0.0/24".to_owned(),
                     gateway: "10.42.0.1".to_owned(),
                 },
+                ingress: None,
             },
             signature: String::new(),
         };

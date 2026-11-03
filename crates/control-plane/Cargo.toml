@@ -13,6 +13,10 @@ workspace = true
 quoro-types = { path = "../types" }
 # Wire messages, RFC 8785 canonical JSON and the desired-state signature.
 quoro-proto = { path = "../proto" }
+# Ingress backends: the primary-side tunnel controller (ADR 0094).
+quoro-ingress = { path = "../ingress" }
+# Provider clients: Cloudflare DNS and tunnels (ADR 0025, 0055).
+quoro-providers = { path = "../providers" }
 # `ws` serves the node-agent session (GET /api/v1/nodes/session).
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
 # Node public keys and credentials are base64 (node-agent-protocol.md section 2).

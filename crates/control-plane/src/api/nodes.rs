@@ -5,19 +5,27 @@
 
 use crate::AppState;
 use crate::api::page::finish;
+use crate::audit::{self, Outcome};
 use crate::auth::Identity;
-use crate::error::ApiError;
-use crate::request::{CallCtx, RequestId};
+use crate::changelog::{self, Op};
+use crate::error::{ApiError, Target};
+use crate::request::{ApiJson, CallCtx, RequestId};
+use crate::store::now_rfc3339;
 use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
-use axum::http::HeaderMap;
-use quoro_types::Scope;
+use axum::http::{HeaderMap, StatusCode};
+use quoro_types::{Prefix, Scope, is_id};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::Row;
+use sqlx::SqliteConnection;
 use sqlx::sqlite::SqliteRow;
 use std::collections::BTreeMap;
 use utoipa::{IntoParams, ToSchema};
+
+/// The operation string recorded in the audit log.
+const SET_TUNNEL_OPERATION: &str = "PUT /api/v1/nodes/{node_id}/tunnel";
+const DELETE_TUNNEL_OPERATION: &str = "DELETE /api/v1/nodes/{node_id}/tunnel";
 
 /// A machine running the Quoro binary (D-0012).
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -164,6 +172,24 @@ pub struct NodeTunnel {
     pub origin_port: u16,
 }
 
+/// Body of `setNodeTunnel` (`openapi.yaml` `SetNodeTunnelRequest`).
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+#[schema(
+    title = "SetNodeTunnelRequest",
+    description = "Map a node to the `tunnel` provider that runs its tunnel."
+)]
+pub struct SetNodeTunnelRequest {
+    /// A provider of kind `tunnel`; any other kind is refused with
+    /// `validation_failed`.
+    #[schema(pattern = "^prv_[0-9A-HJKMNP-TV-Z]{26}$")]
+    pub provider_id: String,
+    /// Loopback port on the node where its proxy accepts the tunnel's
+    /// traffic.
+    #[serde(default)]
+    #[schema(value_type = u16, minimum = 1, maximum = 65535, default = 8081, required = false)]
+    pub origin_port: Option<u16>,
+}
+
 /// One page of nodes.
 #[derive(Clone, Debug, Serialize, ToSchema)]
 #[schema(title = "NodeList")]
@@ -254,12 +280,34 @@ fn node_from_row(row: &SqliteRow) -> Result<Node, ApiError> {
         applied_rev: row.try_get("applied_rev")?,
         log_seq: row.try_get("log_seq")?,
         fence_failure: optional_json_column(row, "fence_failure")?,
-        // `node_tunnels` rows are written only once the tunnel mapping
-        // endpoint lands with the ingress work (D-0094, D-0095).
+        // Filled by `attach_tunnel` from `node_tunnels` (ADR 0095).
         tunnel: None,
         last_seen_at: row.try_get("last_seen_at")?,
         created_at: row.try_get("created_at")?,
     })
+}
+
+/// The node's tunnel mapping, without the run token (`NodeTunnel`).
+async fn tunnel_of<'e, E>(executor: E, node_id: &str) -> Result<Option<NodeTunnel>, ApiError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let row = sqlx::query(
+        "SELECT provider_id, tunnel_id, origin_port FROM node_tunnels WHERE node_id = ?",
+    )
+    .bind(node_id)
+    .fetch_optional(executor)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let origin_port: i64 = row.try_get("origin_port")?;
+    Ok(Some(NodeTunnel {
+        provider_id: row.try_get("provider_id")?,
+        tunnel_id: row.try_get("tunnel_id")?,
+        origin_port: u16::try_from(origin_port)
+            .map_err(|e| ApiError::internal(&format!("node_tunnels.origin_port: {e}")))?,
+    }))
 }
 
 /// All nodes of the cluster.
@@ -304,6 +352,10 @@ pub async fn list_nodes(
         .iter()
         .map(node_from_row)
         .collect::<Result<Vec<_>, _>>()?;
+    let mut nodes = nodes;
+    for node in &mut nodes {
+        node.tunnel = tunnel_of(state.store.pool(), &node.id).await?;
+    }
     let (items, next_cursor) = finish(nodes, limit, |node| node.id.clone());
     Ok(Json(NodeList { items, next_cursor }))
 }
@@ -357,5 +409,388 @@ pub async fn get_node(
         .fetch_optional(state.store.pool())
         .await?
         .ok_or_else(|| ApiError::not_found("node"))?;
-    Ok(Json(node_from_row(&row)?))
+    let mut node = node_from_row(&row)?;
+    node.tunnel = tunnel_of(state.store.pool(), &node_id).await?;
+    Ok(Json(node))
+}
+
+/// Maps a node to the `tunnel` provider that runs its tunnel (ADR 0094,
+/// 0095). The account credential never leaves the primary; the node later
+/// receives only its own tunnel id, run token and origin port.
+#[utoipa::path(
+    put,
+    path = "/api/v1/nodes/{node_id}/tunnel",
+    tag = "nodes",
+    operation_id = "setNodeTunnel",
+    extensions(("x-quoro-scope" = json!("provider:manage"))),
+    params(
+        ("node_id" = String, Path, description = "Node id (`nod_...`).", pattern = "^nod_[0-9A-HJKMNP-TV-Z]{26}$"),
+    ),
+    request_body = SetNodeTunnelRequest,
+    responses(
+        (status = 200, description = "The mapping was recorded; the node is returned with its `tunnel`.", body = Node,
+            headers(("Quoro-Request-Id" = String, description = "Correlation id of this call."))),
+        (status = 401, response = crate::openapi::Unauthenticated),
+        (status = 403, response = crate::openapi::Forbidden),
+        (status = 404, response = crate::openapi::NotFound),
+        (status = 409, response = crate::openapi::Conflict),
+        (status = 422, response = crate::openapi::ValidationFailed),
+        (status = 429, response = crate::openapi::RateLimited),
+        (status = 503, response = crate::openapi::NotPrimary),
+    )
+)]
+///
+/// # Errors
+///
+/// `forbidden` for an agent or without `provider:manage`, `not_found` for an
+/// unknown node, `validation_failed` for a provider that is missing or is not
+/// a `tunnel` provider with `account_id` and `zone_id`, `conflict` when the
+/// node still serves `tunnel` domains under another provider, or a database
+/// error.
+pub async fn set_node_tunnel(
+    State(state): State<AppState>,
+    identity: Identity,
+    headers: HeaderMap,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Path(node_id): Path<String>,
+    ApiJson(body): ApiJson<SetNodeTunnelRequest>,
+) -> Result<Json<Node>, ApiError> {
+    let origin_port = body.origin_port.unwrap_or(8081);
+    if origin_port == 0 {
+        return Err(ApiError::validation(
+            "origin_port must be between 1 and 65535",
+        ));
+    }
+    let params = json!({ "provider_id": &body.provider_id, "origin_port": origin_port });
+    let target = Target {
+        kind: "node".to_string(),
+        id: node_id.clone(),
+    };
+    let ctx = CallCtx::new(identity, request_id, SET_TUNNEL_OPERATION, &headers);
+    ctx.authorize_human(&state, Scope::ProviderManage, Some(&target), None, &params)
+        .await?;
+    match set_tunnel_tx(
+        &state,
+        &ctx,
+        &node_id,
+        &body.provider_id,
+        origin_port,
+        &params,
+    )
+    .await
+    {
+        Ok(node) => {
+            state.hub.node_changed(&node_id);
+            state.tunnel.kick(&node_id);
+            Ok(Json(node))
+        }
+        Err(error) => {
+            ctx.audit_error(
+                &state,
+                Some(Scope::ProviderManage),
+                Some(&target),
+                None,
+                &params,
+                &error,
+            )
+            .await?;
+            Err(error)
+        }
+    }
+}
+
+/// Validates the provider, writes the row, its change-log entry and the audit
+/// record in one transaction.
+async fn set_tunnel_tx(
+    state: &AppState,
+    ctx: &CallCtx,
+    node_id: &str,
+    provider_id: &str,
+    origin_port: u16,
+    params: &Value,
+) -> Result<Node, ApiError> {
+    let mut w = state.store.begin_write().await?;
+    if !is_id(Prefix::Node, node_id) {
+        return Err(ApiError::not_found("node"));
+    }
+    let node = sqlx::query("SELECT * FROM nodes WHERE id = ?")
+        .bind(node_id)
+        .fetch_optional(&mut *w.tx)
+        .await?
+        .ok_or_else(|| ApiError::not_found("node"))?;
+    tunnel_provider(&mut w.tx, provider_id).await?;
+    let existing: Option<(String,)> =
+        sqlx::query_as("SELECT provider_id FROM node_tunnels WHERE node_id = ?")
+            .bind(node_id)
+            .fetch_optional(&mut *w.tx)
+            .await?;
+    let now = now_rfc3339();
+    let op = match &existing {
+        Some((current,)) if current == provider_id => {
+            sqlx::query(
+                "UPDATE node_tunnels SET origin_port = ?, updated_at = ? WHERE node_id = ?",
+            )
+            .bind(i64::from(origin_port))
+            .bind(&now)
+            .bind(node_id)
+            .execute(&mut *w.tx)
+            .await?;
+            Op::Update
+        }
+        Some(_) => {
+            if serves_tunnel_domains(&mut w.tx, node_id).await? {
+                return Err(ApiError::conflict(
+                    "the node still serves tunnel domains; remove them before changing its provider",
+                ));
+            }
+            sqlx::query(
+                "INSERT INTO node_tunnels (node_id, provider_id, tunnel_id, token_enc, origin_port, created_at, updated_at) \
+                 VALUES (?, ?, NULL, NULL, ?, ?, ?) \
+                 ON CONFLICT (node_id) DO UPDATE SET provider_id = excluded.provider_id, \
+                 tunnel_id = NULL, token_enc = NULL, origin_port = excluded.origin_port, \
+                 updated_at = excluded.updated_at",
+            )
+            .bind(node_id)
+            .bind(provider_id)
+            .bind(i64::from(origin_port))
+            .bind(&now)
+            .bind(&now)
+            .execute(&mut *w.tx)
+            .await?;
+            Op::Update
+        }
+        None => {
+            sqlx::query(
+                "INSERT INTO node_tunnels (node_id, provider_id, tunnel_id, token_enc, origin_port, created_at, updated_at) \
+                 VALUES (?, ?, NULL, NULL, ?, ?, ?)",
+            )
+            .bind(node_id)
+            .bind(provider_id)
+            .bind(i64::from(origin_port))
+            .bind(&now)
+            .bind(&now)
+            .execute(&mut *w.tx)
+            .await?;
+            Op::Create
+        }
+    };
+    // The change log is the replicated state: it carries the ciphertext as
+    // hex and never the plaintext run token.
+    let (tunnel_id, token_enc): (Option<String>, Option<Vec<u8>>) =
+        sqlx::query_as("SELECT tunnel_id, token_enc FROM node_tunnels WHERE node_id = ?")
+            .bind(node_id)
+            .fetch_one(&mut *w.tx)
+            .await?;
+    let payload = json!({
+        "node_id": node_id,
+        "provider_id": provider_id,
+        "tunnel_id": tunnel_id,
+        "token_enc": token_enc.map(|blob| crate::tunnel::hex(&blob)),
+        "origin_port": origin_port,
+        "updated_at": now,
+    });
+    let seq = changelog::append(
+        &mut w.tx,
+        &ctx.identity.actor(),
+        "node_tunnel",
+        node_id,
+        op,
+        payload,
+    )
+    .await?;
+    let target = Target {
+        kind: "node".to_string(),
+        id: node_id.to_string(),
+    };
+    let record = ctx.record(
+        Some(Scope::ProviderManage),
+        Some(&target),
+        None,
+        params,
+        Outcome::Ok,
+        None,
+        Some(seq),
+    );
+    audit::append(&mut w.tx, &record).await?;
+    let tunnel = tunnel_of(&mut *w.tx, node_id).await?;
+    w.commit().await?;
+    let mut node = node_from_row(&node)?;
+    node.tunnel = tunnel;
+    Ok(node)
+}
+
+/// Checks that `provider_id` is a `tunnel` provider whose `config` carries a
+/// string `account_id` and `zone_id`.
+async fn tunnel_provider(conn: &mut SqliteConnection, provider_id: &str) -> Result<(), ApiError> {
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT kind, config_json FROM providers WHERE id = ?")
+            .bind(provider_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let Some((kind, config_json)) = row else {
+        return Err(ApiError::validation("provider_id names no provider"));
+    };
+    if kind != "tunnel" {
+        return Err(ApiError::validation(
+            "provider_id must name a provider of kind tunnel",
+        ));
+    }
+    let config: Value = serde_json::from_str(&config_json)
+        .map_err(|e| ApiError::internal(&format!("stored provider config: {e}")))?;
+    for field in ["account_id", "zone_id"] {
+        if config
+            .get(field)
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return Err(ApiError::validation(format!(
+                "the tunnel provider needs a string {field} in its config"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whether any `tunnel` domain of an app with a VM on the node still needs
+/// this node's tunnel.
+async fn serves_tunnel_domains(
+    conn: &mut SqliteConnection,
+    node_id: &str,
+) -> Result<bool, ApiError> {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM domains d JOIN vms v ON v.app_id = d.app_id \
+         WHERE d.tls_mode = 'tunnel' AND v.node_id = ?1)",
+    )
+    .bind(node_id)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(row.0 != 0)
+}
+
+/// Removes a node's tunnel mapping (ADR 0094, 0095). The manager then removes
+/// the tunnel at the provider and the node's next snapshot stops carrying
+/// `spec.ingress`.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/nodes/{node_id}/tunnel",
+    tag = "nodes",
+    operation_id = "deleteNodeTunnel",
+    extensions(("x-quoro-scope" = json!("provider:manage"))),
+    params(
+        ("node_id" = String, Path, description = "Node id (`nod_...`).", pattern = "^nod_[0-9A-HJKMNP-TV-Z]{26}$"),
+    ),
+    responses(
+        (status = 204, description = "The mapping was removed.",
+            headers(("Quoro-Request-Id" = String, description = "Correlation id of this call."))),
+        (status = 401, response = crate::openapi::Unauthenticated),
+        (status = 403, response = crate::openapi::Forbidden),
+        (status = 404, response = crate::openapi::NotFound),
+        (status = 409, response = crate::openapi::Conflict),
+        (status = 429, response = crate::openapi::RateLimited),
+        (status = 503, response = crate::openapi::NotPrimary),
+    )
+)]
+///
+/// # Errors
+///
+/// `forbidden` for an agent or without `provider:manage`, `not_found` for an
+/// unknown node or a node without a mapping, `conflict` while the node still
+/// serves `tunnel` domains, or a database error.
+pub async fn delete_node_tunnel(
+    State(state): State<AppState>,
+    identity: Identity,
+    headers: HeaderMap,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Path(node_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let params = json!({ "node_id": &node_id });
+    let target = Target {
+        kind: "node".to_string(),
+        id: node_id.clone(),
+    };
+    let ctx = CallCtx::new(identity, request_id, DELETE_TUNNEL_OPERATION, &headers);
+    ctx.authorize_human(&state, Scope::ProviderManage, Some(&target), None, &params)
+        .await?;
+    match delete_tunnel_tx(&state, &ctx, &node_id, &params).await {
+        Ok(()) => {
+            state.hub.node_changed(&node_id);
+            state.tunnel.kick(&node_id);
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Err(error) => {
+            ctx.audit_error(
+                &state,
+                Some(Scope::ProviderManage),
+                Some(&target),
+                None,
+                &params,
+                &error,
+            )
+            .await?;
+            Err(error)
+        }
+    }
+}
+
+/// Deletes the row, its change-log entry and the audit record in one
+/// transaction.
+async fn delete_tunnel_tx(
+    state: &AppState,
+    ctx: &CallCtx,
+    node_id: &str,
+    params: &Value,
+) -> Result<(), ApiError> {
+    let mut w = state.store.begin_write().await?;
+    if !is_id(Prefix::Node, node_id) {
+        return Err(ApiError::not_found("node"));
+    }
+    let node: Option<(String,)> = sqlx::query_as("SELECT id FROM nodes WHERE id = ?")
+        .bind(node_id)
+        .fetch_optional(&mut *w.tx)
+        .await?;
+    if node.is_none() {
+        return Err(ApiError::not_found("node"));
+    }
+    let mapping: Option<(String,)> =
+        sqlx::query_as("SELECT provider_id FROM node_tunnels WHERE node_id = ?")
+            .bind(node_id)
+            .fetch_optional(&mut *w.tx)
+            .await?;
+    if mapping.is_none() {
+        return Err(ApiError::not_found("node tunnel"));
+    }
+    if serves_tunnel_domains(&mut w.tx, node_id).await? {
+        return Err(ApiError::conflict(
+            "the node still serves tunnel domains; remove them first",
+        ));
+    }
+    sqlx::query("DELETE FROM node_tunnels WHERE node_id = ?")
+        .bind(node_id)
+        .execute(&mut *w.tx)
+        .await?;
+    let seq = changelog::append(
+        &mut w.tx,
+        &ctx.identity.actor(),
+        "node_tunnel",
+        node_id,
+        Op::Delete,
+        json!({ "node_id": node_id }),
+    )
+    .await?;
+    let target = Target {
+        kind: "node".to_string(),
+        id: node_id.to_string(),
+    };
+    let record = ctx.record(
+        Some(Scope::ProviderManage),
+        Some(&target),
+        None,
+        params,
+        Outcome::Ok,
+        None,
+        Some(seq),
+    );
+    audit::append(&mut w.tx, &record).await?;
+    w.commit().await?;
+    Ok(())
 }

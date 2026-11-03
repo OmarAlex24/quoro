@@ -15,10 +15,12 @@ use crate::app_env;
 use crate::crypto::DataKey;
 use crate::deploy;
 use crate::{DigestResolver, NodeNetwork, store::Store};
-use quoro_proto::wire::{DesiredStatus, HealthCheck, Spec, SpecNetwork, SpecRoute, SpecVm};
+use quoro_proto::wire::{
+    DesiredStatus, HealthCheck, Spec, SpecIngress, SpecNetwork, SpecRoute, SpecTunnel, SpecVm,
+};
 use sqlx::sqlite::SqliteConnection;
 use sqlx::{Row, SqlitePool};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 /// The resolved digests, keyed by image reference, shared by every session.
@@ -176,6 +178,7 @@ pub async fn build_spec(
     drop(conn);
 
     let routes = build_routes(store.pool(), &apps, &vms).await?;
+    let ingress = build_ingress(store.pool(), data_key, node_id).await?;
 
     Ok(BuiltSpec {
         spec: Spec {
@@ -185,6 +188,7 @@ pub async fn build_spec(
                 subnet: network.subnet.clone(),
                 gateway: network.gateway.clone(),
             },
+            ingress,
         },
         held_back,
     })
@@ -298,6 +302,76 @@ async fn build_routes(
     }
     routes.sort_by(|a, b| a.hostname.cmp(&b.hostname));
     Ok(routes)
+}
+
+/// The `tunnel` hostnames this node serves: the domains of apps with at least
+/// one running VM on the node (the same rule as [`build_routes`]). The tunnel
+/// manager uses it to reconcile the provider's ingress rules and CNAMEs.
+///
+/// # Errors
+///
+/// A database error.
+pub async fn tunnel_hostnames(
+    pool: &SqlitePool,
+    node_id: &str,
+) -> Result<BTreeSet<String>, String> {
+    let rows = sqlx::query(
+        "SELECT DISTINCT d.hostname FROM domains d \
+         JOIN vms v ON v.app_id = d.app_id \
+         WHERE d.tls_mode = 'tunnel' AND v.node_id = ? AND v.desired_status = 'running' \
+         ORDER BY d.hostname",
+    )
+    .bind(node_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("cannot read the tunnel domains of {node_id}: {e}"))?;
+    rows.iter()
+        .map(|row| {
+            row.try_get::<String, _>("hostname")
+                .map_err(|e| e.to_string())
+        })
+        .collect()
+}
+
+/// `spec.ingress` (section 5.11, ADR 0094): present only when the node has a
+/// tunnel that exists at the provider. This is the one place the run token is
+/// decrypted; a token that does not decrypt leaves the node without ingress
+/// and logs the node id only.
+async fn build_ingress(
+    pool: &SqlitePool,
+    data_key: &DataKey,
+    node_id: &str,
+) -> Result<Option<SpecIngress>, String> {
+    let row =
+        sqlx::query("SELECT tunnel_id, token_enc, origin_port FROM node_tunnels WHERE node_id = ?")
+            .bind(node_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("cannot read the tunnel of {node_id}: {e}"))?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let tunnel_id: Option<String> = row.try_get("tunnel_id").map_err(|e| e.to_string())?;
+    let token_enc: Option<Vec<u8>> = row.try_get("token_enc").map_err(|e| e.to_string())?;
+    let origin_port: i64 = row.try_get("origin_port").map_err(|e| e.to_string())?;
+    let (Some(tunnel_id), Some(token_enc)) = (tunnel_id, token_enc) else {
+        return Ok(None);
+    };
+    let token = match crate::tunnel::decrypt_token(data_key, node_id, &token_enc) {
+        Ok(token) => token,
+        Err(error) => {
+            tracing::warn!(node_id, error = %error, "cannot decrypt the tunnel run token");
+            return Ok(None);
+        }
+    };
+    Ok(Some(SpecIngress {
+        tunnel: Some(SpecTunnel {
+            tunnel_id,
+            token: token.expose().to_string(),
+            origin_port: u16::try_from(origin_port)
+                .map_err(|e| format!("node_tunnels.origin_port of {node_id}: {e}"))?,
+        }),
+    }))
 }
 
 /// Resolves `reference`, or returns the cached digest. A VM's image must not

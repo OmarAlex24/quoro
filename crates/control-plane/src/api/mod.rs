@@ -17,7 +17,7 @@ pub mod vms;
 
 use crate::AppState;
 use axum::Router;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 
 /// Every implemented route.
 pub fn routes() -> Router<AppState> {
@@ -35,6 +35,10 @@ pub fn routes() -> Router<AppState> {
             get(crate::session::open_node_session),
         )
         .route("/api/v1/nodes/{node_id}", get(nodes::get_node))
+        .route(
+            "/api/v1/nodes/{node_id}/tunnel",
+            put(nodes::set_node_tunnel).delete(nodes::delete_node_tunnel),
+        )
         .route(
             "/api/v1/projects",
             get(projects::list_projects).post(projects::create_project),
