@@ -22,6 +22,7 @@ pub enum Prefix {
     Request,
     Lease,
     Event,
+    Provider,
     Session,
 }
 
@@ -37,6 +38,7 @@ impl Prefix {
             Self::Request => "req",
             Self::Lease => "lse",
             Self::Event => "evt",
+            Self::Provider => "prv",
             // Session rows have no contract prefix; the id never leaves the
             // server and only names the `sessions` row.
             Self::Session => "ses",

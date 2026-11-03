@@ -22,6 +22,10 @@ argon2 = { version = "0.5", default-features = false, features = ["alloc", "pass
 getrandom = { version = "0.3", default-features = false }
 time = { version = "0.3", default-features = false, features = ["std", "formatting", "parsing"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+# AEAD for the `*_enc` columns under the cluster data-encryption key (D-0050).
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
+# Wipes key material and decrypted secrets from memory when they are dropped.
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }

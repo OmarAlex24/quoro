@@ -15,10 +15,12 @@ use crate::config::{Config, EngineKind};
 use crate::local_node::{self, ImageResolver, NodeNetworkConfig, ReferenceAsDigest};
 use crate::tls;
 use axum_server::Handle;
+use quoro_control_plane::crypto::DataKey;
 use quoro_control_plane::store::Store;
 use quoro_control_plane::{AppState, ServerConfig, router};
 use quoro_engine::{Engine, FakeEngine};
 use std::net::TcpListener;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::info;
@@ -46,6 +48,12 @@ pub async fn run(config: Config) -> Result<i32, String> {
         .map_err(|e| format!("cannot open {}: {e}", database.display()))?;
     let material = tls::load_or_generate(&config.data_dir, &config.node_name, config.listen)
         .map_err(|e| format!("cannot load the TLS material: {e}"))?;
+    // D-0050: the cluster data-encryption key is generated on first start,
+    // before the listener opens, so a node never serves before it can encrypt.
+    let data_key = DataKey::load_or_create(&config.data_dir)
+        .map_err(|e| format!("cannot load the data-encryption key: {e}"))?;
+    info!("data-encryption key ready: {}", data_key.key_id_hex());
+    let data_key = Arc::new(data_key);
 
     // Both engines attach VMs to the same node network; only the config table
     // differs, so the driver takes the same shape either way.
@@ -63,11 +71,12 @@ pub async fn run(config: Config) -> Result<i32, String> {
                 config,
                 store,
                 material,
+                data_key,
             )
             .await
         }
         EngineKind::CloudHypervisor => {
-            serve_cloud_hypervisor(config, network, store, material).await
+            serve_cloud_hypervisor(config, network, store, material, data_key).await
         }
     }
 }
@@ -83,6 +92,7 @@ async fn serve_cloud_hypervisor(
     network: NodeNetworkConfig,
     store: Store,
     material: tls::Material,
+    data_key: Arc<DataKey>,
 ) -> Result<i32, String> {
     use quoro_engine::ch::{ChConfig, ChEngine};
     use tracing::warn;
@@ -153,6 +163,7 @@ async fn serve_cloud_hypervisor(
         config,
         store,
         material,
+        data_key,
     )
     .await
 }
@@ -165,6 +176,7 @@ async fn serve_cloud_hypervisor(
     _network: NodeNetworkConfig,
     _store: Store,
     _material: tls::Material,
+    _data_key: Arc<DataKey>,
 ) -> Result<i32, String> {
     eprintln!("the cloud-hypervisor engine runs on Linux only");
     Ok(EX_CONFIG)
@@ -178,6 +190,7 @@ async fn serve_with<E: Engine + 'static, R: ImageResolver>(
     config: Config,
     store: Store,
     material: tls::Material,
+    data_key: Arc<DataKey>,
 ) -> Result<i32, String> {
     let (tx, rx) = mpsc::unbounded_channel();
     let state = AppState::new(
@@ -188,6 +201,7 @@ async fn serve_with<E: Engine + 'static, R: ImageResolver>(
             secure_cookies: true,
         },
         Some(tx),
+        data_key,
     );
 
     let (node_id, driver) = local_node::start(
