@@ -9,7 +9,7 @@
 use crate::AppState;
 use crate::audit::{self, Channel, Outcome, Record};
 use crate::auth::{
-    Credential, Identity, SESSION_COOKIE, SESSION_TTL_SECONDS, password, setup_token,
+    Credential, Identity, Principal, SESSION_COOKIE, SESSION_TTL_SECONDS, password, setup_token,
 };
 use crate::changelog::{self, Actor, ActorType, Op};
 use crate::error::{ApiError, Target};
@@ -129,32 +129,9 @@ pub struct MeResponse {
     pub grants: Option<Vec<Grant>>,
 }
 
-/// An AI identity (D-0029). Schema only in M1: agents arrive in M3.
-#[derive(Clone, Debug, Serialize, ToSchema)]
-#[schema(title = "Agent")]
-pub struct Agent {
-    /// Agent id.
-    #[schema(pattern = "^agt_[0-9A-HJKMNP-TV-Z]{26}$")]
-    pub id: String,
-    /// Agent name, unique in the cluster.
-    #[schema(min_length = 1, max_length = 200)]
-    pub name: String,
-    /// Free-text model identifier the agent runs.
-    pub model: String,
-    /// Human who owns the agent.
-    #[schema(pattern = "^usr_[0-9A-HJKMNP-TV-Z]{26}$")]
-    pub owner_user_id: String,
-    /// What the agent is for.
-    pub description: Option<String>,
-    /// A disabled agent cannot mint access tokens.
-    pub disabled: bool,
-    /// When the agent was created.
-    #[schema(format = "date-time")]
-    pub created_at: String,
-    /// When the agent record last changed.
-    #[schema(format = "date-time")]
-    pub updated_at: String,
-}
+/// An AI identity (D-0029). Defined with the agent operations in
+/// [`crate::api::agents`] and re-exported here for [`MeResponse`].
+pub use crate::api::agents::Agent;
 
 /// The `Scope` component: one scope string from the README table.
 pub struct ScopeSchema;
@@ -736,7 +713,7 @@ pub async fn logout(
     );
     let target = Target {
         kind: "user".into(),
-        id: ctx.identity.user_id.clone(),
+        id: ctx.identity.id().to_string(),
     };
     let mut w = state.store.begin_write().await?;
     if let Credential::Session { session_id } = &ctx.identity.credential {
@@ -785,10 +762,29 @@ pub async fn get_me(
     State(state): State<AppState>,
     identity: Identity,
 ) -> Result<Json<MeResponse>, ApiError> {
+    // A bearer access token resolves to an agent; a session cookie only ever
+    // resolves to a human (auth/mod.rs).
+    if let Principal::Agent(agent) = &identity.principal {
+        let row: Option<crate::api::agents::AgentRow> = sqlx::query_as(
+            "SELECT id, name, model, owner_user_id, description, disabled, created_at, updated_at \
+             FROM agents WHERE id = ?",
+        )
+        .bind(&agent.agent_id)
+        .fetch_optional(state.store.pool())
+        .await?;
+        let row = row.ok_or_else(ApiError::unauthenticated)?;
+        return Ok(Json(MeResponse {
+            kind: IdentityType::Agent,
+            user: None,
+            agent: Some(crate::api::agents::agent_from_tuple(row)),
+            // Active grants arrive with the grant operations; empty until then.
+            grants: Some(Vec::new()),
+        }));
+    }
     let row: Option<UserRow> = sqlx::query_as(
         "SELECT id, email, name, role, disabled, created_at FROM users WHERE id = ?",
     )
-    .bind(&identity.user_id)
+    .bind(identity.id())
     .fetch_optional(state.store.pool())
     .await?;
     let row = row.ok_or_else(ApiError::unauthenticated)?;

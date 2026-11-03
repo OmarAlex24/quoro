@@ -187,7 +187,7 @@ pub async fn create_join_token(
     if let Some(key) = &key {
         match state
             .idempotency
-            .begin(&ctx.identity.user_id, CREATE_JOIN_TOKEN, key, &params)
+            .begin(ctx.identity.id(), CREATE_JOIN_TOKEN, key, &params)
         {
             Begin::Proceed => {}
             Begin::Replay(status, body) => {
@@ -210,7 +210,7 @@ pub async fn create_join_token(
         Ok(created) => {
             if let Some(key) = &key {
                 state.idempotency.finish(
-                    &ctx.identity.user_id,
+                    ctx.identity.id(),
                     CREATE_JOIN_TOKEN,
                     key,
                     StatusCode::CREATED,
@@ -223,7 +223,7 @@ pub async fn create_join_token(
             if let Some(key) = &key {
                 state
                     .idempotency
-                    .abandon(&ctx.identity.user_id, CREATE_JOIN_TOKEN, key);
+                    .abandon(ctx.identity.id(), CREATE_JOIN_TOKEN, key);
             }
             ctx.audit_error(&state, Some(Scope::NodeEnroll), None, None, &params, &error)
                 .await?;
@@ -280,7 +280,7 @@ async fn issue_token(
     )
     .bind(&id)
     .bind(&token_hash)
-    .bind(&ctx.identity.user_id)
+    .bind(ctx.identity.id())
     .bind(&expires_at)
     .execute(&mut *w.tx)
     .await?;
@@ -296,7 +296,7 @@ async fn issue_token(
         Op::Create,
         json!({
             "id": id,
-            "created_by": ctx.identity.user_id,
+            "created_by": ctx.identity.id(),
             "expires_at": expires_at,
             "used_at": null,
             "node_id": null,
@@ -305,16 +305,15 @@ async fn issue_token(
     .await?;
 
     let target = token_target(&id);
-    let record = ctx.record(
+    ctx.append_ok(
+        &mut w.tx,
         Some(Scope::NodeEnroll),
         Some(&target),
         None,
         params,
-        Outcome::Ok,
-        None,
         Some(change_seq),
-    );
-    audit::append(&mut w.tx, &record).await?;
+    )
+    .await?;
     w.commit().await?;
 
     let primary_url = state.config.primary_url(headers);

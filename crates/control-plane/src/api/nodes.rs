@@ -4,8 +4,7 @@
 //! into the contract's component schemas.
 
 use crate::AppState;
-use crate::api::page::finish;
-use crate::audit::{self, Outcome};
+
 use crate::auth::Identity;
 use crate::changelog::{self, Op};
 use crate::error::{ApiError, Target};
@@ -206,14 +205,14 @@ pub struct NodeList {
 pub struct PageParams {
     /// Maximum number of items to return (default 50, maximum 500).
     #[param(minimum = 1, maximum = 500, default = 50)]
-    limit: Option<i64>,
+    pub limit: Option<i64>,
     /// Opaque cursor returned as `next_cursor` by the previous page.
-    cursor: Option<String>,
+    pub cursor: Option<String>,
 }
 
 impl PageParams {
     /// The validated limit.
-    fn limit(&self) -> Result<i64, ApiError> {
+    pub(crate) fn limit(&self) -> Result<i64, ApiError> {
         match self.limit {
             None => Ok(crate::api::page::DEFAULT_LIMIT),
             Some(n) if (1..=crate::api::page::MAX_LIMIT).contains(&n) => Ok(n),
@@ -225,7 +224,7 @@ impl PageParams {
     }
 
     /// The cursor, or the empty string, which sorts before every id.
-    fn after(&self) -> &str {
+    pub(crate) fn after(&self) -> &str {
         self.cursor.as_deref().unwrap_or("")
     }
 }
@@ -251,7 +250,7 @@ fn optional_json_column<T: DeserializeOwned>(
 }
 
 /// Builds a [`Node`] from a `nodes` row.
-fn node_from_row(row: &SqliteRow) -> Result<Node, ApiError> {
+pub(crate) fn node_from_row(row: &SqliteRow) -> Result<Node, ApiError> {
     let cp_status: Option<NodeCpStatus> = row
         .try_get::<Option<String>, _>("cp_status")?
         .map(|text| {
@@ -288,7 +287,10 @@ fn node_from_row(row: &SqliteRow) -> Result<Node, ApiError> {
 }
 
 /// The node's tunnel mapping, without the run token (`NodeTunnel`).
-async fn tunnel_of<'e, E>(executor: E, node_id: &str) -> Result<Option<NodeTunnel>, ApiError>
+pub(crate) async fn tunnel_of<'e, E>(
+    executor: E,
+    node_id: &str,
+) -> Result<Option<NodeTunnel>, ApiError>
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
@@ -341,23 +343,8 @@ pub async fn list_nodes(
     Query(page): Query<PageParams>,
 ) -> Result<Json<NodeList>, ApiError> {
     let ctx = CallCtx::new(identity, request_id, "GET /api/v1/nodes", &headers);
-    ctx.authorize_read(Scope::NodeRead)?;
-    let limit = page.limit()?;
-    let rows = sqlx::query("SELECT * FROM nodes WHERE id > ? ORDER BY id LIMIT ?")
-        .bind(page.after())
-        .bind(limit + 1)
-        .fetch_all(state.store.pool())
-        .await?;
-    let nodes = rows
-        .iter()
-        .map(node_from_row)
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut nodes = nodes;
-    for node in &mut nodes {
-        node.tunnel = tunnel_of(state.store.pool(), &node.id).await?;
-    }
-    let (items, next_cursor) = finish(nodes, limit, |node| node.id.clone());
-    Ok(Json(NodeList { items, next_cursor }))
+    let list = crate::service::nodes::list_nodes(&state, &ctx, &page).await?;
+    Ok(Json(list))
 }
 
 /// One node.
@@ -400,17 +387,7 @@ pub async fn get_node(
         "GET /api/v1/nodes/{node_id}",
         &headers,
     );
-    ctx.authorize_read(Scope::NodeRead)?;
-    if !quoro_types::is_id(quoro_types::Prefix::Node, &node_id) {
-        return Err(ApiError::not_found("node"));
-    }
-    let row = sqlx::query("SELECT * FROM nodes WHERE id = ?")
-        .bind(&node_id)
-        .fetch_optional(state.store.pool())
-        .await?
-        .ok_or_else(|| ApiError::not_found("node"))?;
-    let mut node = node_from_row(&row)?;
-    node.tunnel = tunnel_of(state.store.pool(), &node_id).await?;
+    let node = crate::service::nodes::get_node(&state, &ctx, &node_id).await?;
     Ok(Json(node))
 }
 
@@ -602,16 +579,15 @@ async fn set_tunnel_tx(
         kind: "node".to_string(),
         id: node_id.to_string(),
     };
-    let record = ctx.record(
+    ctx.append_ok(
+        &mut w.tx,
         Some(Scope::ProviderManage),
         Some(&target),
         None,
         params,
-        Outcome::Ok,
-        None,
         Some(seq),
-    );
-    audit::append(&mut w.tx, &record).await?;
+    )
+    .await?;
     let tunnel = tunnel_of(&mut *w.tx, node_id).await?;
     w.commit().await?;
     let mut node = node_from_row(&node)?;
@@ -781,16 +757,15 @@ async fn delete_tunnel_tx(
         kind: "node".to_string(),
         id: node_id.to_string(),
     };
-    let record = ctx.record(
+    ctx.append_ok(
+        &mut w.tx,
         Some(Scope::ProviderManage),
         Some(&target),
         None,
         params,
-        Outcome::Ok,
-        None,
         Some(seq),
-    );
-    audit::append(&mut w.tx, &record).await?;
+    )
+    .await?;
     w.commit().await?;
     Ok(())
 }

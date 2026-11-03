@@ -7,7 +7,7 @@
 
 use crate::AppState;
 use crate::api::page::{self, PageQuery};
-use crate::audit::{self, Outcome};
+
 use crate::changelog::{self, Op};
 use crate::error::{ApiError, Target};
 use crate::events::{self, NewEvent, Source};
@@ -366,49 +366,76 @@ pub async fn list_vms(
     Query(query): Query<ListVmsQuery>,
 ) -> Result<Json<VmList>, ApiError> {
     let ctx = CallCtx::new(identity, request_id.0, "GET /api/v1/vms", &headers);
-    ctx.authorize_read(Scope::VmRead)?;
-
-    if let Some(project_id) = &query.project_id
-        && !is_id(Prefix::Project, project_id)
-    {
-        return Err(ApiError::validation("project_id is not a valid project id"));
-    }
-    if let Some(node_id) = &query.node_id
-        && !is_id(Prefix::Node, node_id)
-    {
-        return Err(ApiError::validation("node_id is not a valid node id"));
-    }
-
-    let page_query = query.page();
-    let limit = page_query.limit()?;
-    let after = page_query.after();
-
-    let mut sql = format!("SELECT {VM_COLUMNS} FROM vms WHERE id > ?");
-    if query.project_id.is_some() {
-        sql.push_str(" AND project_id = ?");
-    }
-    if query.node_id.is_some() {
-        sql.push_str(" AND node_id = ?");
-    }
-    sql.push_str(" ORDER BY id LIMIT ?");
-
-    let mut statement = sqlx::query(&sql).bind(after);
+    let mut params = serde_json::Map::new();
     if let Some(project_id) = &query.project_id {
-        statement = statement.bind(project_id);
+        params.insert("project_id".to_string(), json!(project_id));
     }
     if let Some(node_id) = &query.node_id {
-        statement = statement.bind(node_id);
+        params.insert("node_id".to_string(), json!(node_id));
     }
-    let rows = statement
-        .bind(limit + 1)
-        .fetch_all(state.store.pool())
+    if let Some(limit) = query.limit {
+        params.insert("limit".to_string(), json!(limit));
+    }
+    if let Some(cursor) = &query.cursor {
+        params.insert("cursor".to_string(), json!(cursor));
+    }
+    let access = ctx
+        .authorize_read(&state, Scope::VmRead, None, &Value::Object(params))
         .await?;
-    let vms = rows
-        .iter()
-        .map(vm_from_row)
-        .collect::<Result<Vec<_>, _>>()?;
-    let (items, next_cursor) = page::finish(vms, limit, |vm| vm.id.clone());
-    Ok(Json(VmList { items, next_cursor }))
+    let result: Result<_, ApiError> = async {
+        if let Some(project_id) = &query.project_id
+            && !is_id(Prefix::Project, project_id)
+        {
+            return Err(ApiError::validation("project_id is not a valid project id"));
+        }
+        if let Some(node_id) = &query.node_id
+            && !is_id(Prefix::Node, node_id)
+        {
+            return Err(ApiError::validation("node_id is not a valid node id"));
+        }
+
+        let page_query = query.page();
+        let limit = page_query.limit()?;
+        let after = page_query.after();
+
+        let mut sql = format!("SELECT {VM_COLUMNS} FROM vms WHERE id > ?");
+        if query.project_id.is_some() {
+            sql.push_str(" AND project_id = ?");
+        }
+        if query.node_id.is_some() {
+            sql.push_str(" AND node_id = ?");
+        }
+        sql.push_str(" ORDER BY id LIMIT ?");
+
+        let mut statement = sqlx::query(&sql).bind(after);
+        if let Some(project_id) = &query.project_id {
+            statement = statement.bind(project_id);
+        }
+        if let Some(node_id) = &query.node_id {
+            statement = statement.bind(node_id);
+        }
+        let rows = statement
+            .bind(limit + 1)
+            .fetch_all(state.store.pool())
+            .await?;
+        let vms = rows
+            .iter()
+            .map(vm_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        let (items, next_cursor) = page::finish(vms, limit, |vm| vm.id.clone());
+        let items = access
+            .filter(&state, items, |vm| crate::request::Resource {
+                kind: "vm",
+                id: &vm.id,
+                app_id: vm.app_id.as_deref(),
+                project_id: Some(&vm.project_id),
+                node_id: Some(&vm.node_id),
+            })
+            .await?;
+        Ok(Json(VmList { items, next_cursor }))
+    }
+    .await;
+    ctx.finish_read(&state, access, result).await
 }
 
 /// `GET /api/v1/vms/{vm_id}`.
@@ -444,19 +471,34 @@ pub async fn get_vm(
     Path(vm_id): Path<String>,
 ) -> Result<Json<Vm>, ApiError> {
     let ctx = CallCtx::new(identity, request_id.0, "GET /api/v1/vms/{vm_id}", &headers);
-    ctx.authorize_read(Scope::VmRead)?;
-
-    if !is_id(Prefix::Vm, &vm_id) {
-        return Err(ApiError::not_found("vm"));
-    }
-    let row = sqlx::query(&format!("SELECT {VM_COLUMNS} FROM vms WHERE id = ?"))
-        .bind(&vm_id)
-        .fetch_optional(state.store.pool())
+    let target = vm_target(&vm_id);
+    let mut access = ctx
+        .authorize_read(
+            &state,
+            Scope::VmRead,
+            Some(&target),
+            &json!({ "vm_id": vm_id }),
+        )
         .await?;
-    match row {
-        Some(row) => Ok(Json(vm_from_row(&row)?)),
-        None => Err(ApiError::not_found("vm")),
+    let result: Result<_, ApiError> = async {
+        if !is_id(Prefix::Vm, &vm_id) {
+            return Err(ApiError::not_found("vm"));
+        }
+        let row = sqlx::query(&format!("SELECT {VM_COLUMNS} FROM vms WHERE id = ?"))
+            .bind(&vm_id)
+            .fetch_optional(state.store.pool())
+            .await?;
+        match row {
+            Some(row) => {
+                let vm = vm_from_row(&row)?;
+                access.set_project(Some(&vm.project_id));
+                Ok(Json(vm))
+            }
+            None => Err(ApiError::not_found("vm")),
+        }
     }
+    .await;
+    ctx.finish_read(&state, access, result).await
 }
 
 /// `POST /api/v1/vms`.
@@ -525,7 +567,7 @@ pub async fn create_vm(
     if let Some(key) = &key {
         match state
             .idempotency
-            .begin(&ctx.identity.user_id, CREATE_VM, key, &params)
+            .begin(ctx.identity.id(), CREATE_VM, key, &params)
         {
             Begin::Proceed => {}
             Begin::Replay(status, body) => {
@@ -560,7 +602,7 @@ pub async fn create_vm(
         Ok(vm) => {
             if let Some(key) = &key {
                 state.idempotency.finish(
-                    &ctx.identity.user_id,
+                    ctx.identity.id(),
                     CREATE_VM,
                     key,
                     StatusCode::CREATED,
@@ -572,9 +614,7 @@ pub async fn create_vm(
         }
         Err(error) => {
             if let Some(key) = &key {
-                state
-                    .idempotency
-                    .abandon(&ctx.identity.user_id, CREATE_VM, key);
+                state.idempotency.abandon(ctx.identity.id(), CREATE_VM, key);
             }
             ctx.audit_error(
                 &state,
@@ -685,16 +725,15 @@ async fn insert_vm(
     .await?;
 
     let target = vm_target(&vm.id);
-    let record = ctx.record(
+    ctx.append_ok(
+        &mut w.tx,
         Some(Scope::VmCreate),
         Some(&target),
         Some(&vm.project_id),
         params,
-        Outcome::Ok,
-        None,
         Some(change_seq),
-    );
-    audit::append(&mut w.tx, &record).await?;
+    )
+    .await?;
     w.commit().await?;
     Ok(vm)
 }
@@ -806,16 +845,15 @@ async fn delete_vm_tx(
     )
     .await?;
     let target = vm_target(&vm.id);
-    let record = ctx.record(
+    ctx.append_ok(
+        &mut w.tx,
         Some(Scope::VmDelete),
         Some(&target),
         Some(&vm.project_id),
         params,
-        Outcome::Ok,
-        None,
         Some(change_seq),
-    );
-    audit::append(&mut w.tx, &record).await?;
+    )
+    .await?;
     w.commit().await?;
 
     // The response is the record as it was, with the desired status the
@@ -850,16 +888,15 @@ async fn set_desired(
     if vm.desired_status == desired {
         // No state change, so no change-log entry; the call is still audited
         // as ok and the driver is notified again.
-        let record = ctx.record(
+        ctx.append_ok(
+            &mut w.tx,
             Some(scope),
             Some(&target),
             Some(&vm.project_id),
             params,
-            Outcome::Ok,
             None,
-            None,
-        );
-        audit::append(&mut w.tx, &record).await?;
+        )
+        .await?;
         w.commit().await?;
         return Ok(vm);
     }
@@ -877,16 +914,15 @@ async fn set_desired(
     let payload = serde_json::to_value(&vm).map_err(|e| ApiError::internal(&e))?;
     let change_seq =
         changelog::append(&mut w.tx, &actor, "vm", &vm.id, Op::Update, payload).await?;
-    let record = ctx.record(
+    ctx.append_ok(
+        &mut w.tx,
         Some(scope),
         Some(&target),
         Some(&vm.project_id),
         params,
-        Outcome::Ok,
-        None,
         Some(change_seq),
-    );
-    audit::append(&mut w.tx, &record).await?;
+    )
+    .await?;
     w.commit().await?;
     Ok(vm)
 }

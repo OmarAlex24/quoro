@@ -8,7 +8,7 @@
 
 use crate::AppState;
 use crate::api::page::finish;
-use crate::audit::{self, Outcome};
+
 use crate::auth::Identity;
 use crate::changelog::{self, Op};
 use crate::crypto::Secret;
@@ -295,19 +295,41 @@ pub async fn list_providers(
     Query(page): Query<PageParams>,
 ) -> Result<Json<ProviderList>, ApiError> {
     let ctx = CallCtx::new(identity, request_id, LIST_OPERATION, &headers);
-    ctx.authorize_read(Scope::ProviderManage)?;
-    let limit = page.limit()?;
-    let rows = sqlx::query("SELECT * FROM providers WHERE id > ? ORDER BY id LIMIT ?")
-        .bind(page.after())
-        .bind(limit + 1)
-        .fetch_all(state.store.pool())
+    let mut params = serde_json::Map::new();
+    if let Some(limit) = page.limit {
+        params.insert("limit".to_string(), json!(limit));
+    }
+    if let Some(cursor) = &page.cursor {
+        params.insert("cursor".to_string(), json!(cursor));
+    }
+    let access = ctx
+        .authorize_read(&state, Scope::ProviderManage, None, &Value::Object(params))
         .await?;
-    let providers = rows
-        .iter()
-        .map(provider_from_row)
-        .collect::<Result<Vec<_>, _>>()?;
-    let (items, next_cursor) = finish(providers, limit, |provider| provider.id.clone());
-    Ok(Json(ProviderList { items, next_cursor }))
+    let result: Result<_, ApiError> = async {
+        let limit = page.limit()?;
+        let rows = sqlx::query("SELECT * FROM providers WHERE id > ? ORDER BY id LIMIT ?")
+            .bind(page.after())
+            .bind(limit + 1)
+            .fetch_all(state.store.pool())
+            .await?;
+        let providers = rows
+            .iter()
+            .map(provider_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        let (items, next_cursor) = finish(providers, limit, |provider| provider.id.clone());
+        let items = access
+            .filter(&state, items, |provider| crate::request::Resource {
+                kind: "provider",
+                id: &provider.id,
+                app_id: None,
+                project_id: None,
+                node_id: None,
+            })
+            .await?;
+        Ok(Json(ProviderList { items, next_cursor }))
+    }
+    .await;
+    ctx.finish_read(&state, access, result).await
 }
 
 /// Stores credentials for an external provider. The secret is encrypted with
@@ -354,7 +376,7 @@ pub async fn create_provider(
     } = body;
     let secret = Secret::new(secret);
     validate(&name, &config, &secret)?;
-    let identity_id = identity.user_id.clone();
+    let identity_id = identity.id().to_string();
     let audit_params = audit_params(kind, &name, &config);
     // The plaintext never reaches the idempotency cache; its hash is enough to
     // tell a replay from a reused key with a different body.
@@ -450,7 +472,7 @@ async fn insert_provider(
     }
     let id = new_id(Prefix::Provider);
     let now = now_rfc3339();
-    let created_by = ctx.identity.user_id.clone();
+    let created_by = ctx.identity.id().to_string();
     let secret_enc = state
         .data_key
         .encrypt(SECRET_CONTEXT, &id, secret.expose().as_bytes());
@@ -503,16 +525,15 @@ async fn insert_provider(
         kind: "provider".to_string(),
         id: id.clone(),
     };
-    let record = ctx.record(
+    ctx.append_ok(
+        &mut w.tx,
         Some(Scope::ProviderManage),
         Some(&target),
         None,
         params,
-        Outcome::Ok,
-        None,
         Some(seq),
-    );
-    audit::append(&mut w.tx, &record).await?;
+    )
+    .await?;
     w.commit().await?;
     Ok(provider)
 }
@@ -549,16 +570,31 @@ pub async fn get_provider(
     Path(provider_id): Path<String>,
 ) -> Result<Json<Provider>, ApiError> {
     let ctx = CallCtx::new(identity, request_id, GET_OPERATION, &headers);
-    ctx.authorize_read(Scope::ProviderManage)?;
-    if !is_id(Prefix::Provider, &provider_id) {
-        return Err(ApiError::not_found("provider"));
+    let target = Target {
+        kind: "provider".to_string(),
+        id: provider_id.clone(),
+    };
+    let access = ctx
+        .authorize_read(
+            &state,
+            Scope::ProviderManage,
+            Some(&target),
+            &json!({ "provider_id": provider_id }),
+        )
+        .await?;
+    let result: Result<_, ApiError> = async {
+        if !is_id(Prefix::Provider, &provider_id) {
+            return Err(ApiError::not_found("provider"));
+        }
+        let row = sqlx::query("SELECT * FROM providers WHERE id = ?")
+            .bind(&provider_id)
+            .fetch_optional(state.store.pool())
+            .await?
+            .ok_or_else(|| ApiError::not_found("provider"))?;
+        Ok(Json(provider_from_row(&row)?))
     }
-    let row = sqlx::query("SELECT * FROM providers WHERE id = ?")
-        .bind(&provider_id)
-        .fetch_optional(state.store.pool())
-        .await?
-        .ok_or_else(|| ApiError::not_found("provider"))?;
-    Ok(Json(provider_from_row(&row)?))
+    .await;
+    ctx.finish_read(&state, access, result).await
 }
 
 /// Deletes the provider entry and its stored secret.
@@ -672,16 +708,15 @@ async fn delete_provider_tx(
         kind: "provider".to_string(),
         id: provider_id.to_string(),
     };
-    let record = ctx.record(
+    ctx.append_ok(
+        &mut w.tx,
         Some(Scope::ProviderManage),
         Some(&target),
         None,
         params,
-        Outcome::Ok,
-        None,
         Some(seq),
-    );
-    audit::append(&mut w.tx, &record).await?;
+    )
+    .await?;
     w.commit().await?;
     Ok(())
 }
@@ -809,16 +844,15 @@ async fn rotate_provider_tx(
         kind: "provider".to_string(),
         id: provider_id.to_string(),
     };
-    let record = ctx.record(
+    ctx.append_ok(
+        &mut w.tx,
         Some(Scope::ProviderManage),
         Some(&target),
         None,
         params,
-        Outcome::Ok,
-        None,
         Some(seq),
-    );
-    audit::append(&mut w.tx, &record).await?;
+    )
+    .await?;
     w.commit().await?;
     Ok(provider)
 }

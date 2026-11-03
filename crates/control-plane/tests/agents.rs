@@ -1,0 +1,472 @@
+//! `/api/v1/agents*` and `POST /api/v1/auth/agent-token` over real HTTP.
+//!
+//! The security-critical parts: the agent key secret is shown once and never
+//! stored or logged, `agent:write` is human-only, and an agent access token
+//! carries no scope of its own.
+
+mod common;
+
+use common::{problem, start};
+use quoro_control_plane::driver::{self, Capacity, Kvm, LocalNode};
+use quoro_control_plane::store::{rfc3339_in, sha256_hex};
+use quoro_types::{Prefix, is_id};
+use serde_json::{Value, json};
+
+fn local_node() -> LocalNode {
+    LocalNode {
+        name: "test-node".to_string(),
+        capacity: Capacity {
+            cpus: 8,
+            memory_mb: 16_384,
+            disk_gb: 100,
+        },
+        kvm: Kvm {
+            available: true,
+            kernel: "6.8.0".to_string(),
+            nested: Some(true),
+        },
+        engine_version: "test-engine".to_string(),
+        agent_version: "test-agent".to_string(),
+    }
+}
+
+async fn create_agent(
+    owner: &reqwest::Client,
+    server: &common::Server,
+    name: &str,
+    owner_user_id: &str,
+) -> Value {
+    let res = owner
+        .post(server.url("/api/v1/agents"))
+        .json(&json!({
+            "name": name,
+            "model": "test-model",
+            "owner_user_id": owner_user_id,
+            "description": "a test agent",
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = res.status();
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(status, 201, "create agent: {body}");
+    body
+}
+
+async fn create_key(owner: &reqwest::Client, server: &common::Server, agent_id: &str) -> Value {
+    let res = owner
+        .post(server.url(&format!("/api/v1/agents/{agent_id}/keys")))
+        .send()
+        .await
+        .unwrap();
+    let status = res.status();
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(status, 201, "create key: {body}");
+    body
+}
+
+async fn mint(
+    server: &common::Server,
+    key: &str,
+    justification: Option<&str>,
+) -> reqwest::Response {
+    let client = reqwest::Client::new();
+    let mut request = client
+        .post(server.url("/api/v1/auth/agent-token"))
+        .header("Authorization", format!("Bearer {key}"));
+    if let Some(justification) = justification {
+        request = request.header("Quoro-Justification", justification);
+    }
+    request.send().await.unwrap()
+}
+
+async fn owner_id(owner: &reqwest::Client, server: &common::Server) -> String {
+    let me: Value = owner
+        .get(server.url("/api/v1/auth/me"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    me["user"]["id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn agent_lifecycle_keys_and_tokens() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let owner_id = owner_id(&owner, &server).await;
+
+    let agent = create_agent(&owner, &server, "watcher", &owner_id).await;
+    let agent_id = agent["id"].as_str().unwrap();
+    assert!(is_id(Prefix::Agent, agent_id), "{agent_id}");
+    assert_eq!(agent["name"], "watcher");
+    assert_eq!(agent["owner_user_id"], owner_id);
+    assert_eq!(agent["disabled"], false);
+
+    // List and get.
+    let list: Value = owner
+        .get(server.url("/api/v1/agents"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list["items"].as_array().unwrap().len(), 1);
+    assert_eq!(list["items"][0]["id"], agent_id);
+
+    let got: Value = owner
+        .get(server.url(&format!("/api/v1/agents/{agent_id}")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(got["id"], agent_id);
+
+    // Patch name and model.
+    let patched: Value = owner
+        .patch(server.url(&format!("/api/v1/agents/{agent_id}")))
+        .json(&json!({ "name": "watcher-2", "model": "test-model-2" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(patched["name"], "watcher-2");
+    assert_eq!(patched["model"], "test-model-2");
+    assert_eq!(patched["created_at"], agent["created_at"]);
+
+    // Validation and conflicts.
+    let (status, code, _) = problem(
+        owner
+            .post(server.url("/api/v1/agents"))
+            .json(&json!({
+                "name": "orphan",
+                "model": "m",
+                "owner_user_id": "usr_01JC9Z6Q5W8N3K4T7R2M1XHB0D",
+            }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!((status, code.as_str()), (422, "validation_failed"));
+    let (status, code, _) = problem(
+        owner
+            .post(server.url("/api/v1/agents"))
+            .json(&json!({
+                "name": "watcher-2",
+                "model": "m",
+                "owner_user_id": owner_id,
+            }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!((status, code.as_str()), (409, "conflict"));
+    let (status, code, _) = problem(
+        owner
+            .get(server.url("/api/v1/agents/agt_01JC9Z6Q5W8N3K4T7R2M1XHB0D"))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!((status, code.as_str()), (404, "not_found"));
+
+    // A key: the secret starts with `akey_`, differs from the id, and only
+    // its hash is stored.
+    let created = create_key(&owner, &server, agent_id).await;
+    let key_id = created["id"].as_str().unwrap();
+    let secret = created["key"].as_str().unwrap();
+    assert!(is_id(Prefix::AgentKey, key_id), "{key_id}");
+    assert!(secret.starts_with("akey_"), "{secret}");
+    assert_ne!(secret, key_id);
+    assert_eq!(created["agent_id"], agent_id);
+    let stored: (String,) = sqlx::query_as("SELECT key_hash FROM agent_keys WHERE id = ?")
+        .bind(key_id)
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(stored.0, sha256_hex(secret.as_bytes()));
+    // Neither the change log nor the audit record carries the secret.
+    let payloads: Vec<(String,)> =
+        sqlx::query_as("SELECT payload FROM change_log WHERE entity_type = 'agent_key'")
+            .fetch_all(server.state.store.pool())
+            .await
+            .unwrap();
+    for (payload,) in payloads {
+        assert!(
+            !payload.contains(secret),
+            "change log leaked the key: {payload}"
+        );
+        assert!(
+            !payload.contains("key_hash"),
+            "change log leaked the hash: {payload}"
+        );
+    }
+    let params: Vec<(String,)> = sqlx::query_as(
+        "SELECT params FROM audit_log WHERE operation = 'POST /api/v1/agents/{agent_id}/keys'",
+    )
+    .fetch_all(server.state.store.pool())
+    .await
+    .unwrap();
+    for (params,) in params {
+        assert!(
+            !params.contains(secret),
+            "audit log leaked the key: {params}"
+        );
+    }
+
+    // Mint an access token with the key and a justification.
+    let res = mint(&server, secret, Some("checking the app")).await;
+    let status = res.status();
+    let body = res.text().await.unwrap();
+    assert_eq!(status, 200, "mint: {body}");
+    let token: Value = serde_json::from_str(&body).unwrap();
+    let atk = token["access_token"].as_str().unwrap();
+    assert!(is_id(Prefix::AccessToken, atk), "{atk}");
+    let expires_at = token["expires_at"].as_str().unwrap();
+    assert!(
+        expires_at >= rfc3339_in(280).as_str() && expires_at <= rfc3339_in(320).as_str(),
+        "expires_at {expires_at} is not about five minutes away"
+    );
+
+    // The access token authenticates `/auth/me` as the agent.
+    let me: Value = reqwest::Client::new()
+        .get(server.url("/api/v1/auth/me"))
+        .header("Authorization", format!("Bearer {atk}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(me["type"], "agent");
+    assert_eq!(me["agent"]["id"], agent_id);
+    assert_eq!(me["agent"]["model"], "test-model-2");
+    assert_eq!(me["grants"], json!([]));
+
+    // An agent key is accepted only by the mint endpoint.
+    let res = reqwest::Client::new()
+        .get(server.url("/api/v1/agents"))
+        .header("Authorization", format!("Bearer {secret}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 401);
+
+    // A cookie never yields an agent.
+    let me: Value = owner
+        .get(server.url("/api/v1/auth/me"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(me["type"], "user");
+    assert!(!me["user"].is_null());
+    let res = owner
+        .post(server.url("/api/v1/auth/agent-token"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 401);
+
+    // An access token past its expiry is unauthenticated.
+    sqlx::query("UPDATE access_tokens SET expires_at = ? WHERE token_hash = ?")
+        .bind("2000-01-01T00:00:00.000Z")
+        .bind(sha256_hex(atk.as_bytes()))
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+    let res = reqwest::Client::new()
+        .get(server.url("/api/v1/auth/me"))
+        .header("Authorization", format!("Bearer {atk}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 401);
+
+    // A key without a justification is a validation error, audited as error.
+    let res = mint(&server, secret, None).await;
+    let (status, code, _) = problem(res).await;
+    assert_eq!((status, code.as_str()), (422, "validation_failed"));
+
+    // Revocation is immediate for minting and idempotent for the call itself.
+    let res = owner
+        .delete(server.url(&format!("/api/v1/agents/{agent_id}/keys/{key_id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 204);
+    let res = owner
+        .delete(server.url(&format!("/api/v1/agents/{agent_id}/keys/{key_id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 204);
+    let res = mint(&server, secret, Some("after revocation")).await;
+    assert_eq!(res.status(), 401);
+
+    // A disabled agent cannot mint, and the refusal is audited.
+    let second = create_key(&owner, &server, agent_id).await;
+    let second_secret = second["key"].as_str().unwrap();
+    let res = owner
+        .patch(server.url(&format!("/api/v1/agents/{agent_id}")))
+        .json(&json!({ "disabled": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let res = mint(&server, second_secret, Some("still watching")).await;
+    let (status, code, reason) = problem(res).await;
+    assert_eq!((status, code.as_str()), (403, "forbidden"));
+    assert_eq!(reason.as_deref(), Some("agent_disabled"));
+    let refused: (String, String, Option<String>) = sqlx::query_as(
+        "SELECT actor_type, result, result_detail FROM audit_log \
+         WHERE operation = 'POST /api/v1/auth/agent-token' AND result = 'refused' ORDER BY seq DESC LIMIT 1",
+    )
+    .fetch_one(server.state.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(refused.0, "agent");
+    assert_eq!(refused.1, "refused");
+    assert_eq!(refused.2.as_deref(), Some("agent_disabled"));
+}
+
+#[tokio::test]
+async fn agent_calls_are_human_only_and_scope_checked() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let owner_id = owner_id(&owner, &server).await;
+    driver::register_local_node(&server.state.store, &local_node())
+        .await
+        .unwrap();
+    let project: Value = owner
+        .post(server.url("/api/v1/projects"))
+        .json(&json!({ "slug": "demo", "name": "Demo" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let project_id = project["id"].as_str().unwrap();
+    let app: Value = owner
+        .post(server.url("/api/v1/apps"))
+        .json(&json!({
+            "project_id": project_id,
+            "name": "web",
+            "image": "ghcr.io/example/web@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "port": 8080,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let app_id = app["id"].as_str().unwrap();
+
+    let agent = create_agent(&owner, &server, "operator-agent", &owner_id).await;
+    let agent_id = agent["id"].as_str().unwrap();
+    let key = create_key(&owner, &server, agent_id).await;
+    let secret = key["key"].as_str().unwrap();
+    let token: Value = mint(&server, secret, Some("acting on the incident"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let atk = token["access_token"].as_str().unwrap();
+    let agent_client = reqwest::Client::new();
+    let bearer =
+        |request: reqwest::RequestBuilder| request.header("Authorization", format!("Bearer {atk}"));
+
+    // `agent:write` is human-only even for an agent with no grants.
+    let res = bearer(agent_client.post(server.url("/api/v1/agents")))
+        .header("Quoro-Justification", "trying to make a friend")
+        .json(&json!({
+            "name": "friend",
+            "model": "m",
+            "owner_user_id": owner_id,
+        }))
+        .send()
+        .await
+        .unwrap();
+    let (status, code, reason) = problem(res).await;
+    assert_eq!((status, code.as_str()), (403, "forbidden"));
+    assert_eq!(reason.as_deref(), Some("human_only"));
+    let refusal: (String, String, Option<String>, String) = sqlx::query_as(
+        "SELECT actor_type, result, result_detail, agent_model FROM audit_log \
+         WHERE operation = 'POST /api/v1/agents' AND actor_type = 'agent' ORDER BY seq DESC LIMIT 1",
+    )
+    .fetch_one(server.state.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(refusal.0, "agent");
+    assert_eq!(refusal.1, "refused");
+    assert_eq!(refusal.2.as_deref(), Some("human_only"));
+    assert_eq!(refusal.3, "test-model");
+
+    // With no grants, a non-destructive scope is `scope_missing`.
+    let res = bearer(agent_client.post(server.url(&format!("/api/v1/apps/{app_id}/restart"))))
+        .header("Quoro-Justification", "restarting the app")
+        .send()
+        .await
+        .unwrap();
+    let (status, code, reason) = problem(res).await;
+    assert_eq!((status, code.as_str()), (403, "forbidden"));
+    assert_eq!(reason.as_deref(), Some("scope_missing"));
+
+    // A destructive scope asks for approval and names the scope and target.
+    let res = bearer(agent_client.delete(server.url(&format!("/api/v1/apps/{app_id}"))))
+        .header("Quoro-Justification", "deleting the app")
+        .send()
+        .await
+        .unwrap();
+    let status = res.status().as_u16();
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(status, 403);
+    assert_eq!(body["code"], "approval_required");
+    assert_eq!(body["scope"], "app:delete");
+    assert_eq!(body["target"]["type"], "app");
+    assert_eq!(body["target"]["id"], app_id);
+
+    // The refusal is in the audit log as a refused agent call.
+    let refused: (String, String, Option<String>) = sqlx::query_as(
+        "SELECT actor_type, result, result_detail FROM audit_log \
+         WHERE operation = 'DELETE /api/v1/apps/{app_id}' AND actor_type = 'agent' \
+         ORDER BY seq DESC LIMIT 1",
+    )
+    .fetch_one(server.state.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        refused,
+        (
+            "agent".to_string(),
+            "refused".to_string(),
+            Some("approval_required".to_string())
+        )
+    );
+
+    // A human read is not audited, and a human is still a user.
+    let me: Value = owner
+        .get(server.url("/api/v1/auth/me"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(me["type"], "user");
+    assert!(me["agent"].is_null());
+}
