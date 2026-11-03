@@ -160,7 +160,7 @@ pub struct AppResources {
     #[schema(minimum = 1)]
     pub memory_mb: i64,
     /// Disk in gibibytes.
-    #[schema(minimum = 0)]
+    #[schema(minimum = 1)]
     pub disk_gb: i64,
 }
 
@@ -592,8 +592,8 @@ fn validate_resources(resources: &AppResources) -> Result<(), ApiError> {
             "resources.memory_mb must be at least 1",
         ));
     }
-    // The contract allows 0, but `vms` has `CHECK (disk_gb >= 1)` and the app's
-    // instance is a VM.
+    // `AppResources.disk_gb` has `minimum: 1`, matching `CHECK (disk_gb >= 1)`
+    // on `vms`, because every app instance is a VM.
     if resources.disk_gb < 1 {
         return Err(ApiError::validation("resources.disk_gb must be at least 1"));
     }

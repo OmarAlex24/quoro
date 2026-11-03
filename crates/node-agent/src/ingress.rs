@@ -1191,6 +1191,7 @@ mod tests {
             vm_ids: vm_ids.iter().map(ToString::to_string).collect(),
             port,
             tls_mode: tls_mode.to_string(),
+            domain_id: None,
         }
     }
 

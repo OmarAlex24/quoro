@@ -558,6 +558,11 @@ pub struct SpecRoute {
     pub port: u16,
     /// `acme` or `tunnel`.
     pub tls_mode: String,
+    /// The domain this route serves (`dom_`), named by the node's
+    /// `certificate.*` events. Optional and additive: a primary that predates
+    /// it sends none, and an older node ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_id: Option<String>,
 }
 
 /// `spec.network` (section 5.11).
@@ -976,6 +981,31 @@ mod tests {
         let parsed = DesiredState::from_value(&received).unwrap();
         assert_eq!(parsed.spec, state.spec);
         assert!(!parsed.signature.is_empty());
+    }
+
+    #[test]
+    fn a_route_domain_id_is_optional_on_the_wire() {
+        // A route from a primary that predates `domain_id` still decodes.
+        let old: SpecRoute = serde_json::from_value(json!({
+            "hostname": "blog.example.com",
+            "app_id": "app_01JC9Z7B3N5Q7S9Z1W3Y5A7C9E",
+            "vm_ids": ["vm_01JC9Z7C4P6R8T0V2X4Z6B8D0F"],
+            "port": 8080,
+            "tls_mode": "acme",
+        }))
+        .unwrap();
+        assert_eq!(old.domain_id, None);
+        // An absent id is not serialized, so an older node sees the old shape.
+        let value = serde_json::to_value(&old).unwrap();
+        assert!(value.get("domain_id").is_none());
+
+        let new = SpecRoute {
+            domain_id: Some("dom_01JC9Z8D5Q7S9V1X3Z5B7D9F1H".to_owned()),
+            ..old
+        };
+        let value = serde_json::to_value(&new).unwrap();
+        assert_eq!(value["domain_id"], "dom_01JC9Z8D5Q7S9V1X3Z5B7D9F1H");
+        assert_eq!(serde_json::from_value::<SpecRoute>(value).unwrap(), new);
     }
 
     #[test]
