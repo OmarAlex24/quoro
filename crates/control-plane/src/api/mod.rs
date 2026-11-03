@@ -3,6 +3,7 @@
 //! (D-0048, `tests/openapi_diff.rs`).
 
 pub mod agents;
+pub mod approvals;
 pub mod apps;
 pub mod auth;
 pub mod cluster;
@@ -51,6 +52,22 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/v1/grants",
             get(grants::list_grants).post(grants::create_grant),
+        )
+        .route(
+            "/api/v1/approvals",
+            get(approvals::list_approvals).post(approvals::create_approval),
+        )
+        .route(
+            "/api/v1/approvals/{approval_id}",
+            get(approvals::get_approval),
+        )
+        .route(
+            "/api/v1/approvals/{approval_id}/approve",
+            post(approvals::approve_approval),
+        )
+        .route(
+            "/api/v1/approvals/{approval_id}/deny",
+            post(approvals::deny_approval),
         )
         .route("/api/v1/grants/{grant_id}", get(grants::get_grant))
         .route(
