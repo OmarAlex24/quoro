@@ -137,6 +137,29 @@ impl NodeHub {
         tokio::spawn(async move { inner.vm_changed(&vm_id).await });
     }
 
+    /// Marks every node the database still calls `connected` as
+    /// `disconnected`, emitting `node.disconnected` for each.
+    ///
+    /// Runs once at start, before the listener opens: no session can be live
+    /// yet, and a node whose session ended with the previous process (a
+    /// restart, a crash) must not stay `connected` until it dials again, or
+    /// forever if it never does.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn reset_stale_connections(&self) -> Result<(), String> {
+        let stale: Vec<(String,)> =
+            sqlx::query_as("SELECT id FROM nodes WHERE status = 'connected'")
+                .fetch_all(self.0.store.pool())
+                .await
+                .map_err(|e| format!("cannot read the node list: {e}"))?;
+        for (node_id,) in stale {
+            disconnect_node(self, &node_id, "session_closed").await?;
+        }
+        Ok(())
+    }
+
     /// Ends every live session, for a clean shutdown.
     pub fn shutdown(&self) {
         let mut sessions = self.0.sessions.lock().expect("session lock");

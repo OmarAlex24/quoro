@@ -160,6 +160,7 @@ impl AppState {
             cluster_id.clone(),
             resolver,
         );
+        hub.reset_stale_connections().await?;
         Ok(Self {
             store,
             config,

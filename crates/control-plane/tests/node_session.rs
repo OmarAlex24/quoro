@@ -592,3 +592,56 @@ async fn protocol_errors_are_non_fatal_except_an_unsupported_version() {
     .await;
     assert!(closed.is_ok(), "the session ends");
 }
+
+#[tokio::test]
+async fn a_restarted_primary_does_not_keep_nodes_connected() {
+    // The previous process left a node `connected` (an M1 primary row is
+    // written that way); a new process has no session for it yet.
+    let server = start().await;
+    let node_id = driver::register_local_node(
+        &server.state.store,
+        &LocalNode {
+            name: "left-connected".to_string(),
+            capacity: Capacity {
+                cpus: 1,
+                memory_mb: 1_024,
+                disk_gb: 10,
+            },
+            kvm: Kvm {
+                available: true,
+                kernel: "6.8.0".to_string(),
+                nested: None,
+            },
+            engine_version: "engine".to_string(),
+            agent_version: "agent".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    let status = || async {
+        sqlx::query_scalar::<_, String>("SELECT status FROM nodes WHERE id = ?")
+            .bind(&node_id)
+            .fetch_one(server.state.store.pool())
+            .await
+            .unwrap()
+    };
+    assert_eq!(status().await, "connected");
+
+    quoro_control_plane::AppState::open(
+        server.state.store.clone(),
+        (*server.state.config).clone(),
+        std::sync::Arc::new(quoro_control_plane::ReferenceAsDigest),
+        std::sync::Arc::clone(&server.state.data_key),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status().await, "disconnected");
+    let events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE type = 'node.disconnected' AND json_extract(subject, '$.id') = ?",
+    )
+    .bind(&node_id)
+    .fetch_one(server.state.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(events, 1);
+}
