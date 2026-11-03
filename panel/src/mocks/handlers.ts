@@ -37,6 +37,14 @@ import { getAppsMock } from '../api/generated/apps/apps.msw';
 import { getDeploymentsMock } from '../api/generated/deployments/deployments.msw';
 import { getDomainsMock } from '../api/generated/domains/domains.msw';
 import { getLogsMock } from '../api/generated/logs/logs.msw';
+import { getUsersMock } from '../api/generated/users/users.msw';
+import { getAgentsMock } from '../api/generated/agents/agents.msw';
+import { getGrantsMock } from '../api/generated/grants/grants.msw';
+import { getApprovalsMock } from '../api/generated/approvals/approvals.msw';
+import { getIncidentsMock } from '../api/generated/incidents/incidents.msw';
+import { getAuditMock } from '../api/generated/audit/audit.msw';
+import { getEventsMock } from '../api/generated/events/events.msw';
+import { getWebhooksMock } from '../api/generated/webhooks/webhooks.msw';
 import { formatSseFrame } from '../lib/log-buffer';
 import { SLUG_PATTERN } from '../lib/slug';
 import {
@@ -49,47 +57,21 @@ import {
   runDeployment,
   schedule,
 } from './db';
-
-type JsonBody = Parameters<typeof HttpResponse.json>[0];
-type JsonInit = Parameters<typeof HttpResponse.json>[1];
-
-/** A JSON response typed as a plain `Response`, so handlers can mix outcomes. */
-const json = (body: JsonBody, init?: JsonInit): Response =>
-  HttpResponse.json(body, init);
-
-const problem = (
-  status: number,
-  code: ProblemCode,
-  extra: Partial<Problem> = {},
-): Response =>
-  json(
-    { status, code, ...extra },
-    { status, headers: { 'Content-Type': 'application/problem+json' } },
-  );
-
-const unauthorized = () =>
-  problem(401, 'unauthenticated', { detail: 'Log in to continue.' });
-
-const signedIn = (): User | null =>
-  db.owner && db.sessionUserId === db.owner.id ? db.owner : null;
-
-const writeRefusal = (scope: string) =>
-  problem(403, 'forbidden', {
-    reason: 'scope_missing',
-    scope,
-    detail: `Your role can't use ${scope}.`,
-  });
-
-const readJson = async <T>(request: Request): Promise<T | null> => {
-  try {
-    return (await request.json()) as T;
-  } catch {
-    return null;
-  }
-};
-
-const isIntAtLeast = (value: unknown, minimum: number): value is number =>
-  typeof value === 'number' && Number.isInteger(value) && value >= minimum;
+import {
+  isIntAtLeast,
+  json,
+  problem,
+  readJson,
+  signedIn,
+  unauthorized,
+  writeRefusal,
+} from './http';
+import { agentsHandlers } from './handlers-agents';
+import { approvalsHandlers } from './handlers-approvals';
+import { auditHandlers } from './handlers-audit';
+import { grantsHandlers } from './handlers-grants';
+import { incidentsHandlers } from './handlers-incidents';
+import { webhooksHandlers } from './handlers-webhooks';
 
 const findVm = (vmId: string): Vm | undefined =>
   db.vms.find((candidate) => candidate.id === vmId);
@@ -849,6 +831,14 @@ export const handlers = [
     });
   }),
 
+  // The agency screens: agents, grants, approvals, audit, webhooks, incidents.
+  ...agentsHandlers,
+  ...grantsHandlers,
+  ...approvalsHandlers,
+  ...auditHandlers,
+  ...webhooksHandlers,
+  ...incidentsHandlers,
+
   // Generated fallbacks, kept last so every stateful route above wins.
   ...getHealthMock(),
   ...getAuthMock(),
@@ -859,4 +849,12 @@ export const handlers = [
   ...getDeploymentsMock(),
   ...getDomainsMock(),
   ...getLogsMock(),
+  ...getUsersMock(),
+  ...getAgentsMock(),
+  ...getGrantsMock(),
+  ...getApprovalsMock(),
+  ...getIncidentsMock(),
+  ...getAuditMock(),
+  ...getEventsMock(),
+  ...getWebhooksMock(),
 ];

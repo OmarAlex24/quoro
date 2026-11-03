@@ -1,0 +1,37 @@
+import type { MeResponse } from '../api/generated/model';
+
+/**
+ * What the signed-in identity may do in the agency screens. The server always
+ * decides; the panel only hides controls the session could never use.
+ *
+ * `agent:write`, `grant:write`, `approval:decide` and `webhook:write` are
+ * human-only (permission-model.md, section 4.2): an agent session never sees
+ * them, whatever grants it holds. Among humans, `viewer` holds read scopes
+ * only, while `owner` and `operator` hold all four.
+ */
+
+/** The credential belongs to a human, not to an agent. */
+export const isHumanSession = (me: MeResponse | undefined): boolean =>
+  me?.type === 'user' && me.user !== undefined && !me.user.disabled;
+
+const humanWriter = (me: MeResponse | undefined): boolean =>
+  isHumanSession(me) && (me?.user?.role === 'owner' || me?.user?.role === 'operator');
+
+/**
+ * Approve or deny an approval request (`approval:decide`). An agent can never
+ * decide, so it cannot approve its own request (permission-model.md, section 9).
+ */
+export const canDecideApprovals = humanWriter;
+
+/** Create, change, disable or delete agents and their keys (`agent:write`). */
+export const canManageAgents = humanWriter;
+
+/** Create and revoke grants (`grant:write`). */
+export const canManageGrants = humanWriter;
+
+/** Create, change, delete and test webhooks (`webhook:write`). */
+export const canManageWebhooks = humanWriter;
+
+/** Read the user list to show names instead of ids (`user:write`, owner only). */
+export const canListUsers = (me: MeResponse | undefined): boolean =>
+  isHumanSession(me) && me?.user?.role === 'owner';
