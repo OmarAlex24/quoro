@@ -575,7 +575,7 @@ A `lease_revoke` whose fence failed:
 | `rev` | integer | yes | Monotonic revision of the node's desired state |
 | `issued_at` | string | yes | When the primary produced it |
 | `term` | integer | yes | Cluster term at issue time |
-| `spec` | object | yes | `vms`, `routes`, `network` |
+| `spec` | object | yes | `vms`, `routes`, `network`, and `ingress` when the node runs a tunnel |
 | `signature` | string | yes | Base64 Ed25519 signature by the cluster signing key |
 
 **Signature.** The signature covers the RFC 8785 (JSON Canonicalization Scheme) serialization of the whole `body` object with the `signature` member removed. The node verifies it against `cluster_public_key` before it parses anything else, persists the verified snapshot atomically, answers `command_result` with `ok`, and only then reconciles. An invalid signature is answered with `error` code `bad_signature` and the snapshot is discarded; the node keeps running on its previously stored snapshot.
@@ -618,7 +618,23 @@ A `lease_revoke` whose fence failed:
 
 **`spec.network`:** `subnet` (CIDR for the node bridge) and `gateway` (address on that bridge). The addresses in `status_report` must fall inside the subnet.
 
-**Environment values.** `env` carries plaintext values because the node must be able to start the process. It is sent only over the authenticated, pinned session, never over a webhook or an API read, and the node stores it encrypted with the node-local key. The primary stores the same values encrypted with the cluster data-encryption key (AEAD), and the API returns only names (`README.md`, `db-schema.sql`).
+**`spec.ingress`** (optional; absent when the node runs no tunnel):
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `tunnel` | object | no | The node's Cloudflare Tunnel (D-0024, D-0094); present when the node is mapped to a `tunnel` provider (`node_tunnels`, migration 0003) and the tunnel exists |
+
+**`spec.ingress.tunnel`:**
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `tunnel_id` | string | yes | The provider's id of this node's tunnel |
+| `token` | string | yes | The tunnel's run token, plaintext; it lets the holder run this one tunnel and nothing else |
+| `origin_port` | integer | yes | Loopback port where the node's proxy accepts the tunnel's traffic |
+
+**Tunnels (D-0094).** One tunnel per node. The primary creates or looks up the node's tunnel with the account credential of the `tunnel` provider, writes the tunnel's ingress rules (each `tunnel` route's hostname to `http://127.0.0.1:<origin_port>`) and the proxied DNS records itself, and sends the node only `tunnel_id`, `token` and `origin_port`. The node runs the tunnel connector with the token and serves the `tunnel` routes of `spec.routes` from its proxy on `127.0.0.1:<origin_port>`. The account credential never leaves the primary. A changed `token` (rotation) replaces the running connector; an absent `tunnel` stops it.
+
+**Environment values.** `env` carries plaintext values because the node must be able to start the process. It is sent only over the authenticated, pinned session, never over a webhook or an API read, and the node stores it encrypted with the node-local key. The primary stores the same values encrypted with the cluster data-encryption key (AEAD), and the API returns only names (`README.md`, `db-schema.sql`). `spec.ingress.tunnel.token` is handled the same way: plaintext only inside the signed snapshot on the session, encrypted with the node-local key at rest on the node, encrypted with the cluster data-encryption key on the primary (`node_tunnels.token_enc`), never returned by the API.
 
 ```json
 {
@@ -970,6 +986,56 @@ The receiver answers `pong` with `re` set to the `ping` id. A `ping` is not a he
 }
 ```
 
+### 5.22 `dns_challenge`
+
+**Direction:** node to control plane.
+**When:** while the node obtains or renews an ACME certificate for an `acme` route (D-0094). The node holds no DNS credential: the primary writes the DNS-01 TXT record on its behalf with the domain's `dns` provider (`domains.provider_id`).
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `action` | string | yes | `set` to publish the TXT record, `clear` to remove it |
+| `hostname` | string | yes | The route's hostname the certificate is for |
+| `value` | string | `set` only | The DNS-01 key authorization digest (base64url, RFC 8555 section 8.4) |
+| `record_id` | string | `clear` only | The id returned by the `dns_challenge_result` that answered the `set` |
+
+**Authorization.** The primary accepts a `set` only for a hostname that is an `acme` route in the node's current desired state and whose domain has a `dns` provider. The record name is always `_acme-challenge.<hostname>`; the node cannot choose another name. A `clear` removes only a record the primary created for this node. Anything else is answered with `dns_challenge_result` `ok: false`.
+
+```json
+{
+  "v": 1,
+  "type": "dns_challenge",
+  "id": "msg_01JC9ZW2A4C6E8G0J2M4P6R8T0",
+  "body": {
+    "action": "set",
+    "hostname": "blog.example.com",
+    "value": "LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0"
+  }
+}
+```
+
+### 5.23 `dns_challenge_result`
+
+**Direction:** control plane to node.
+**When:** answers each `dns_challenge`, with `re` set to its `id`.
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `ok` | boolean | yes | Whether the record was written (`set`) or removed (`clear`) |
+| `record_id` | string | no | Present on a successful `set`: the id to pass in the later `clear` |
+| `message` | string | no | Present when `ok` is false: human-readable reason, never a credential |
+
+A successful `set` means the provider accepted the record, not that resolvers already see it: the node checks propagation itself before it tells the ACME server the challenge is ready. A failed `set` fails that issuance attempt, which the node retries with backoff and reports as `certificate.failed`.
+
+```json
+{
+  "v": 1,
+  "type": "dns_challenge_result",
+  "id": "msg_01JC9ZW3B5D7F9H1K3N5Q7S9V1",
+  "re": "msg_01JC9ZW2A4C6E8G0J2M4P6R8T0",
+  "body": { "ok": true, "record_id": "372e67954025e0ba6aaa6d586b9e0b59" }
+}
+```
+
 ## 6. Reconciliation
 
 ### 6.1 Source of truth on the node
@@ -987,7 +1053,7 @@ An apply run always follows this order, whatever changed:
 2. **Images.** Prepare every image referenced by a VM whose rootfs is missing or has a different digest, and remove rootfs images no longer referenced.
 3. **Stop.** Stop VMs that are no longer desired, or whose spec requires a recreate (image digest, disk size, network identity).
 4. **Start.** Start desired VMs that are not running.
-5. **Routes.** Update the reverse proxy for the hostnames in `spec.routes`.
+5. **Routes.** Update the reverse proxy for the hostnames in `spec.routes`, and start, replace or stop the tunnel connector to match `spec.ingress.tunnel`. Certificates for `acme` routes are obtained in the background through `dns_challenge` (section 5.22); a route keeps serving its previous certificate until a new one is issued.
 
 The order exists so that a VM never starts on a network that is not ready, and no route points at a VM that is being replaced. It is the reconciliation described in D-0011 and the deployments in D-0033.
 
@@ -1207,6 +1273,7 @@ Threats and their mitigations are in `../architecture/threat-model.md`; this sec
 - **Credential storage.** The node credential and the node's private key are stored root-only on the node. The primary stores only a hash of the credential.
 - **Desired-state signature.** A node accepts a snapshot only if the Ed25519 signature verifies against the cluster public key it received at enrollment. A compromised intermediate or a different cluster cannot make a node start an arbitrary microVM. The signature does not protect against the primary itself: whatever the primary signs, the node runs. The signing key rotates with a `signing_key_rotate` signed by the old key (D-0050), so a new key is accepted only from the holder of the old one.
 - **Certificate pinning.** The node refuses a TLS certificate whose SHA-256 differs from the fingerprint in the join command, so a self-signed primary is as safe as a CA-issued one, and a stolen DNS name does not redirect a node.
+- **Provider credentials stay on the primary (D-0094).** A node never receives a provider's account credential. For a tunnel it receives only that tunnel's run token, which cannot create tunnels, write DNS records or reach another node's tunnel. For ACME it asks the primary to write `_acme-challenge.<hostname>` TXT records, and only for the `acme` routes of its own desired state (section 5.22), so a compromised node cannot write arbitrary records in the zone or obtain certificates for hostnames it does not serve.
 - **A compromised primary** can read everything the cluster stores — state, ciphertext it can decrypt with the cluster data-encryption key, and the telemetry that nodes stream on demand — and can issue desired state, lease grants and commands to every node. Until M5b it is also the lease authority, so it can grant the same lease to two nodes and run a stateful app twice; only a storage receiver that tracks the highest fencing token on its own side limits the damage. From M5b a quorum or external arbiter takes that power away from a single primary (D-0017). It cannot read a node's local store or its private key.
 - **A compromised node** can lie about observed state, emit false events and, within its lease, run whatever its stored desired state allows. It cannot forge desired state for other nodes, cannot mint credentials, and cannot write to shared storage with a stale token. Its blast radius is its own workloads, which is why stateful data stays protected by the lease and the token rather than by the honesty of the node.
 

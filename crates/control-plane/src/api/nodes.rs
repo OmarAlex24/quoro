@@ -64,6 +64,9 @@ pub struct Node {
     /// Unacknowledged failed fences of this node, or null.
     #[schema(required)]
     pub fence_failure: Option<NodeFenceFailure>,
+    /// The node's tunnel mapping (D-0094, D-0095), or null.
+    #[schema(required)]
+    pub tunnel: Option<NodeTunnel>,
     /// Last heartbeat or message from the node.
     pub last_seen_at: Option<String>,
     /// When the node first enrolled.
@@ -143,6 +146,22 @@ pub struct NodeFenceFailure {
     /// VMs the node could not confirm stopped.
     #[schema(pattern = "^vm_[0-9A-HJKMNP-TV-Z]{26}$")]
     pub vm_ids: Vec<String>,
+}
+
+/// Which `tunnel` provider runs a node's tunnel (D-0094, D-0095). The run
+/// token is never returned.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(title = "NodeTunnel")]
+pub struct NodeTunnel {
+    /// The `tunnel` provider whose account holds the tunnel.
+    #[schema(pattern = "^prv_[0-9A-HJKMNP-TV-Z]{26}$")]
+    pub provider_id: String,
+    /// The provider's id of the tunnel, or null until the primary created it.
+    #[schema(required)]
+    pub tunnel_id: Option<String>,
+    /// Loopback port on the node where its proxy accepts the tunnel's traffic.
+    #[schema(minimum = 1, maximum = 65535)]
+    pub origin_port: u16,
 }
 
 /// One page of nodes.
@@ -235,6 +254,9 @@ fn node_from_row(row: &SqliteRow) -> Result<Node, ApiError> {
         applied_rev: row.try_get("applied_rev")?,
         log_seq: row.try_get("log_seq")?,
         fence_failure: optional_json_column(row, "fence_failure")?,
+        // `node_tunnels` rows are written only once the tunnel mapping
+        // endpoint lands with the ingress work (D-0094, D-0095).
+        tunnel: None,
         last_seen_at: row.try_get("last_seen_at")?,
         created_at: row.try_get("created_at")?,
     })

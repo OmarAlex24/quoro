@@ -20,6 +20,7 @@ const BASE_SCHEMA: &str = include_str!("../../../docs/contracts/db-schema.sql");
 const MIGRATIONS: &[&str] = &[
     include_str!("../../../docs/contracts/migrations/0001-node-fence-failure.sql"),
     include_str!("../../../docs/contracts/migrations/0002-node-credentials.sql"),
+    include_str!("../../../docs/contracts/migrations/0003-provider-references.sql"),
 ];
 
 /// 64 zeros: `prev_hash` of the first entry of a chain.

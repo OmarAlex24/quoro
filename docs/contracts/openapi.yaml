@@ -707,6 +707,7 @@ components:
         - applied_rev
         - log_seq
         - fence_failure
+        - tunnel
         - created_at
       properties:
         id:
@@ -792,6 +793,14 @@ components:
           oneOf:
             - $ref: '#/components/schemas/NodeFenceFailure'
             - type: 'null'
+        tunnel:
+          description: |
+            The node's Cloudflare Tunnel mapping, or null when the node is not
+            mapped to a `tunnel` provider (D-0094, D-0095). Set with
+            `PUT /api/v1/nodes/{node_id}/tunnel`. The run token is never returned.
+          oneOf:
+            - $ref: '#/components/schemas/NodeTunnel'
+            - type: 'null'
         last_seen_at:
           type: [string, 'null']
           description: Last heartbeat or message from the node.
@@ -835,6 +844,50 @@ components:
           items:
             type: string
             pattern: '^vm_[0-9A-HJKMNP-TV-Z]{26}$'
+    NodeTunnel:
+      type: object
+      title: NodeTunnel
+      description: |
+        Which `tunnel` provider runs this node's tunnel (D-0094, D-0095). One
+        tunnel per node. The primary creates or looks up the tunnel with the
+        provider's account credential and sends the node only the tunnel id and
+        its run token (node-agent-protocol.md section 5.11); the account
+        credential never leaves the primary and the run token is never returned
+        by the API.
+      required:
+        - provider_id
+        - tunnel_id
+        - origin_port
+      properties:
+        provider_id:
+          type: string
+          pattern: '^prv_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: The `tunnel` provider whose account holds the tunnel.
+        tunnel_id:
+          type: [string, 'null']
+          description: The provider's id of the tunnel, or null until the primary has created it.
+        origin_port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          description: Loopback port on the node where its proxy accepts the tunnel's traffic.
+    SetNodeTunnelRequest:
+      type: object
+      title: SetNodeTunnelRequest
+      description: Map a node to the `tunnel` provider that runs its tunnel.
+      required:
+        - provider_id
+      properties:
+        provider_id:
+          type: string
+          pattern: '^prv_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: A provider of kind `tunnel`; any other kind is refused with `validation_failed`.
+        origin_port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          default: 8081
+          description: Loopback port on the node where its proxy accepts the tunnel's traffic.
     FenceAckRequest:
       type: object
       title: FenceAckRequest
@@ -1756,6 +1809,15 @@ components:
         cert_expires_at:
           type: [string, 'null']
           description: Expiry of the current certificate, when one exists.
+        provider_id:
+          type: [string, 'null']
+          pattern: '^prv_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: |
+            The provider whose credential manages the hostname's DNS records: a
+            `dns` provider for `acme` (the primary writes the DNS-01 TXT records
+            with it) or a `tunnel` provider for `tunnel` (the primary writes the
+            tunnel ingress rule and the proxied CNAME with it) (D-0094, D-0095).
+            Null only for domains created before the field existed.
         created_at:
           type: string
           format: date-time
@@ -1793,6 +1855,14 @@ components:
           enum:
             - acme
             - tunnel
+        provider_id:
+          type: string
+          pattern: '^prv_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: |
+            The provider that manages the hostname's DNS records: kind `dns` for
+            `acme`, kind `tunnel` for `tunnel`. Optional when exactly one provider
+            of that kind exists, which is then used; with none or several, or a
+            provider of the wrong kind, the request fails with `validation_failed`.
     Volume:
       type: object
       title: Volume
@@ -3948,6 +4018,86 @@ paths:
           $ref: '#/components/responses/RateLimited'
         '503':
           $ref: '#/components/responses/NotPrimary'
+  /api/v1/nodes/{node_id}/tunnel:
+    put:
+      tags: [nodes]
+      operationId: setNodeTunnel
+      summary: Map a node to a tunnel provider
+      description: |
+        Records which `tunnel` provider runs this node's tunnel (D-0094, D-0095).
+        The primary then creates or looks up the node's tunnel with that
+        provider's account credential and sends the node only the tunnel id and
+        its run token in desired state (node-agent-protocol.md section 5.11).
+        Replacing the provider of a node that serves `tunnel` domains is refused
+        with `conflict`; remove those domains first. Mapping nodes to provider
+        credentials is human-only: an agent's access token is refused with
+        `forbidden` and `reason: human_only` (D-0029, D-0051). The call is
+        audited (D-0031).
+      x-quoro-scope: provider:manage
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+      requestBody:
+        required: true
+        description: The tunnel provider and the node's loopback origin port.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetNodeTunnelRequest'
+      responses:
+        '200':
+          description: The mapping was recorded; the node is returned with its `tunnel`.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Node'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/NotPrimary'
+    delete:
+      tags: [nodes]
+      operationId: deleteNodeTunnel
+      summary: Remove a node's tunnel mapping
+      description: |
+        Removes the node's tunnel mapping. The primary deletes the node's tunnel
+        at the provider and stops sending `spec.ingress.tunnel`, so the node stops
+        its tunnel connector. A node that still serves `tunnel` domains is refused
+        with `conflict`. Human-only like the other provider operations (D-0051).
+        The call is audited (D-0031).
+      x-quoro-scope: provider:manage
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+      responses:
+        '204':
+          description: The mapping was removed.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/NotPrimary'
   /api/v1/nodes/join-tokens:
     post:
       tags: [nodes]
@@ -5040,8 +5190,9 @@ paths:
       summary: Route a hostname to an app
       description: |
         Adds a domain. TLS is obtained with ACME for a public-IP host or provided by
-        a Cloudflare Tunnel for a host behind NAT (D-0024). A hostname already
-        routed elsewhere is refused with `conflict`. `Quoro-Justification` is
+        a Cloudflare Tunnel for a host behind NAT (D-0024). The domain records the
+        provider that manages its DNS records (`provider_id`, D-0095). A hostname
+        already routed elsewhere is refused with `conflict`. `Quoro-Justification` is
         required when the caller is an agent (D-0031).
       x-quoro-scope: app:update
       parameters:
@@ -6668,8 +6819,9 @@ paths:
       summary: Delete a provider
       description: |
         Deletes the provider entry and its stored secret. A provider that is still
-        referenced by a domain, a tunnel or the off-site audit copy cannot be
-        deleted. Managing providers is human-only: an agent's access token is
+        referenced by a domain (`provider_id`), a node's tunnel mapping
+        (`PUT /api/v1/nodes/{node_id}/tunnel`) or the off-site audit copy cannot
+        be deleted and is refused with `conflict` (D-0095). Managing providers is human-only: an agent's access token is
         refused with `forbidden` and `reason: human_only` (D-0029, D-0051).
       x-quoro-scope: provider:manage
       parameters:
