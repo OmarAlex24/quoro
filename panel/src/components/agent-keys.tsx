@@ -217,7 +217,7 @@ export function AgentKeys({
       )}
 
       {canWrite ? (
-        <div className="mt-4 flex flex-wrap items-center gap-x-3 gap-y-2 border-t border-rail pt-3">
+        <div className="mt-4 flex flex-wrap items-center gap-x-3 gap-y-2">
           <Button
             variant="primary"
             disabled={create.isPending}
