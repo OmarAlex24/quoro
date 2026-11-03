@@ -699,7 +699,7 @@ async fn tunnel_mapping_reaches_the_node_and_never_leaks_the_token() {
     .await;
     let provider_id = provider["id"].as_str().unwrap().to_string();
     let app_id = setup_project_and_app(&server, &owner).await;
-    create_domain(
+    let domain = create_domain(
         &server,
         &owner,
         &app_id,
@@ -716,6 +716,11 @@ async fn tunnel_mapping_reaches_the_node_and_never_leaks_the_token() {
     assert_eq!(
         snapshot["body"]["spec"]["routes"][0]["hostname"],
         "tunnel.example.com"
+    );
+    // Every route names its domain, for the node's `certificate.*` events.
+    assert_eq!(
+        snapshot["body"]["spec"]["routes"][0]["domain_id"],
+        domain["id"]
     );
 
     // PUT maps the node; the manager creates the tunnel and resends the
@@ -1057,7 +1062,7 @@ async fn dns_challenges_are_written_by_the_primary_for_the_owning_node() {
     let beta = enrolled(&server, &owner, "node-beta").await;
     let dns = create_provider(&server, &owner, "dns", "Dns", json!({ "zone_id": ZONE_ID })).await;
     let app_id = setup_project_and_app(&server, &owner).await;
-    create_domain(
+    let domain = create_domain(
         &server,
         &owner,
         &app_id,
@@ -1071,6 +1076,10 @@ async fn dns_challenges_are_written_by_the_primary_for_the_owning_node() {
 
     let (mut a, snapshot) = open(&server, &alpha).await;
     assert_eq!(snapshot["body"]["spec"]["routes"][0]["tls_mode"], "acme");
+    assert_eq!(
+        snapshot["body"]["spec"]["routes"][0]["domain_id"],
+        domain["id"]
+    );
     let (mut b, _) = open(&server, &beta).await;
 
     // `set` for an acme route writes the TXT record and answers with its id.

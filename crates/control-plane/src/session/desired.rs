@@ -249,7 +249,8 @@ async fn app_env_of(
 }
 
 /// `spec.routes`: every domain of an app with at least one running VM on this
-/// node, sorted by hostname so the snapshot is deterministic.
+/// node, sorted by hostname so the snapshot is deterministic. Each route names
+/// its domain (`domain_id`) so the node's `certificate.*` events can carry it.
 async fn build_routes(
     pool: &SqlitePool,
     apps: &HashMap<String, AppInfo>,
@@ -262,12 +263,13 @@ async fn build_routes(
         }
     }
 
-    let rows = sqlx::query("SELECT hostname, app_id, tls_mode FROM domains ORDER BY hostname")
+    let rows = sqlx::query("SELECT id, hostname, app_id, tls_mode FROM domains ORDER BY hostname")
         .fetch_all(pool)
         .await
         .map_err(|e| format!("cannot read the domains: {e}"))?;
     let mut routes = Vec::new();
     for row in &rows {
+        let domain_id: String = row.try_get("id").map_err(|e| e.to_string())?;
         let hostname: String = row.try_get("hostname").map_err(|e| e.to_string())?;
         let app_id: String = row.try_get("app_id").map_err(|e| e.to_string())?;
         let tls_mode: String = row.try_get("tls_mode").map_err(|e| e.to_string())?;
@@ -298,7 +300,7 @@ async fn build_routes(
             vm_ids,
             port: app.port,
             tls_mode,
-            domain_id: None,
+            domain_id: Some(domain_id),
         });
     }
     routes.sort_by(|a, b| a.hostname.cmp(&b.hostname));
