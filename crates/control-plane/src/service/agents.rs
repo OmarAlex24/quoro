@@ -4,8 +4,9 @@
 
 use crate::AppState;
 use crate::api::agents::{
-    AccessTokenResponse, Agent, AgentKey, AgentKeyCreated, AgentList, CREATE_KEY_OPERATION,
-    CREATE_OPERATION, CreateAgentRequest, UpdateAgentRequest, agent_from_tuple, agent_target,
+    AccessTokenResponse, Agent, AgentKey, AgentKeyCreated, AgentKeyList, AgentList,
+    CREATE_KEY_OPERATION, CREATE_OPERATION, CreateAgentRequest, UpdateAgentRequest,
+    agent_from_tuple, agent_target,
 };
 use crate::changelog::{self, Op};
 use crate::error::{ApiError, Reason, Target};
@@ -452,6 +453,72 @@ async fn update_agent_tx(
     .await?;
     w.commit().await?;
     Ok(updated)
+}
+
+/// Lists one agent's keys, newest first, revoked keys included. The secret and
+/// its hash are never part of the response.
+///
+/// # Errors
+///
+/// `forbidden` without `agent:read`, `not_found` for an unknown or malformed
+/// agent id, or a database error.
+pub async fn list_agent_keys(
+    state: &AppState,
+    ctx: &CallCtx,
+    agent_id: &str,
+    limit: i64,
+    after: &str,
+) -> Result<AgentKeyList, ApiError> {
+    let params = json!({ "agent_id": agent_id, "limit": limit });
+    let target = agent_target(agent_id);
+    let access = ctx
+        .authorize_read(state, Scope::AgentRead, Some(&target), &params)
+        .await?;
+    let result: Result<_, ApiError> = async {
+        if !is_id(Prefix::Agent, agent_id) {
+            return Err(ApiError::not_found("agent"));
+        }
+        let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM agents WHERE id = ?")
+            .bind(agent_id)
+            .fetch_optional(state.store.pool())
+            .await?;
+        if exists.is_none() {
+            return Err(ApiError::not_found("agent"));
+        }
+        // Newest first; ids are ULIDs, so descending id is descending creation.
+        let mut sql = String::from(
+            "SELECT id, agent_id, created_at, revoked_at, last_used_at FROM agent_keys \
+             WHERE agent_id = ?",
+        );
+        if !after.is_empty() {
+            sql.push_str(" AND id < ?");
+        }
+        sql.push_str(" ORDER BY id DESC LIMIT ?");
+        let mut statement = sqlx::query(&sql).bind(agent_id);
+        if !after.is_empty() {
+            statement = statement.bind(after);
+        }
+        let rows = statement
+            .bind(limit + 1)
+            .fetch_all(state.store.pool())
+            .await?;
+        let keys = rows
+            .iter()
+            .map(|row| -> Result<AgentKey, sqlx::Error> {
+                Ok(AgentKey {
+                    id: row.try_get("id")?,
+                    agent_id: row.try_get("agent_id")?,
+                    created_at: row.try_get("created_at")?,
+                    revoked_at: row.try_get("revoked_at")?,
+                    last_used_at: row.try_get("last_used_at")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?;
+        let (items, next_cursor) = crate::api::page::finish(keys, limit, |key| key.id.clone());
+        Ok(AgentKeyList { items, next_cursor })
+    }
+    .await;
+    ctx.finish_read(state, access, result).await
 }
 
 /// Creates a key for an agent and returns its secret once.

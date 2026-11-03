@@ -410,8 +410,8 @@ async fn incident_opened_wakes_the_agent_once() {
     let project_id = create_project(&owner, &server, "site").await;
     let app_id = create_app(&owner, &server, &project_id).await;
     let agent_id = create_agent(&owner, &server, &owner_user_id).await;
-    let (_recorder, url) = start_receiver(500).await;
-    let (created, _secret) = create_webhook(
+    let (recorder, url) = start_receiver(500).await;
+    let (created, secret) = create_webhook(
         &owner,
         &server,
         json!({
@@ -554,6 +554,265 @@ async fn incident_opened_wakes_the_agent_once() {
         .await
         .unwrap();
     assert_eq!(count, 1);
+
+    // Every attempt carries the same `data.wake`, inside the signed bytes.
+    let captured = wait_for(|| async {
+        let captured = recorder.requests().await;
+        (captured.len() >= 2).then_some(captured)
+    })
+    .await;
+    let grant_id = grant.get::<String, _>("id");
+    for request in &captured {
+        let signed = request
+            .headers
+            .get("quoro-signature")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let (timestamp, value) = signed.split_once(',').unwrap();
+        let timestamp = timestamp.strip_prefix("t=").unwrap();
+        assert_eq!(
+            signature(&secret, timestamp, &request.body),
+            value,
+            "the signature covers data.wake"
+        );
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["data"]["wake"]["agent_id"], agent_id);
+        assert_eq!(body["data"]["wake"]["grant_id"], grant_id);
+    }
+
+    // The event log never carries `wake`.
+    let events: Value = owner
+        .get(server.url("/api/v1/events"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for event in events["items"].as_array().unwrap() {
+        assert!(
+            event["data"].get("wake").is_none(),
+            "the event log carries wake: {event}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn two_wake_webhooks_get_their_own_grant() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let owner_user_id = owner_id(&owner, &server).await;
+    let project_id = create_project(&owner, &server, "site").await;
+    let app_id = create_app(&owner, &server, &project_id).await;
+    let agent_id = create_agent(&owner, &server, &owner_user_id).await;
+    let (recorder, url) = start_receiver(200).await;
+    let webhook_ids = {
+        let mut ids = Vec::new();
+        for name in ["first", "second"] {
+            let (created, _secret) = create_webhook(
+                &owner,
+                &server,
+                json!({
+                    "name": name,
+                    "url": url,
+                    "event_types": ["incident.opened"],
+                    "selector": { "apps": [app_id] },
+                    "wake": {
+                        "agent_id": agent_id,
+                        "grant_scopes": ["app:read"],
+                        "grant_ttl_s": 600,
+                    },
+                }),
+            )
+            .await;
+            ids.push(created["id"].as_str().unwrap().to_string());
+        }
+        ids
+    };
+
+    let trigger = emit_app_event(&server, &app_id, "app.down").await;
+    let incident_id = quoro_types::new_id(quoro_types::Prefix::Incident);
+    let mut w = server.state.store.begin_write().await.unwrap();
+    sqlx::query(
+        "INSERT INTO incidents (id, status, title, trigger_event_id, subject, project_id, opened_at) \
+         VALUES (?, 'open', ?, ?, ?, ?, ?)",
+    )
+    .bind(&incident_id)
+    .bind("web is down")
+    .bind(&trigger)
+    .bind(json!({ "type": "app", "id": app_id }).to_string())
+    .bind(&project_id)
+    .bind(now_rfc3339())
+    .execute(&mut *w.tx)
+    .await
+    .unwrap();
+    let event_id = quoro_types::new_id(quoro_types::Prefix::Event);
+    events::insert(
+        &mut w.tx,
+        StoredEvent {
+            id: &event_id,
+            time: &now_rfc3339(),
+            kind: "incident.opened",
+            source: json!({ "kind": "control_plane" }),
+            subject: json!({ "type": "incident", "id": incident_id }),
+            project_id: Some(&project_id),
+            incident_id: Some(&incident_id),
+            request_id: None,
+            actor: None,
+            data: json!({ "incident_id": incident_id, "app_id": app_id }),
+            change_actor: Actor::system("tests"),
+        },
+    )
+    .await
+    .unwrap();
+    w.commit().await.unwrap();
+
+    let captured = wait_for(|| async {
+        let captured = recorder.requests().await;
+        (captured.len() >= 2).then_some(captured)
+    })
+    .await;
+    let mut wake_grants = Vec::new();
+    for request in &captured {
+        assert_eq!(
+            request
+                .headers
+                .get("quoro-event-id")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            event_id
+        );
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["data"]["wake"]["agent_id"], agent_id);
+        wake_grants.push(
+            body["data"]["wake"]["grant_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+    assert_ne!(wake_grants[0], wake_grants[1], "one grant per webhook");
+
+    let mut grants: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM grants WHERE incident_id = ? ORDER BY id")
+            .bind(&incident_id)
+            .fetch_all(server.state.store.pool())
+            .await
+            .unwrap();
+    grants.sort();
+    wake_grants.sort();
+    assert_eq!(grants, wake_grants);
+    assert_eq!(grants.len(), 2);
+    for webhook_id in &webhook_ids {
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM webhook_deliveries WHERE webhook_id = ?")
+                .bind(webhook_id)
+                .fetch_one(server.state.store.pool())
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
+    }
+}
+
+#[tokio::test]
+async fn test_delivery_never_wakes_the_agent() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let owner_user_id = owner_id(&owner, &server).await;
+    let project_id = create_project(&owner, &server, "site").await;
+    let app_id = create_app(&owner, &server, &project_id).await;
+    let agent_id = create_agent(&owner, &server, &owner_user_id).await;
+    let (recorder, url) = start_receiver(200).await;
+    // The type filter keeps the real dispatcher out of this incident; the test
+    // delivery replays the newest event, which is the `incident.opened`.
+    let (created, _secret) = create_webhook(
+        &owner,
+        &server,
+        json!({
+            "name": "tester",
+            "url": url,
+            "event_types": ["incident.resolved"],
+            "selector": { "all": true },
+            "wake": {
+                "agent_id": agent_id,
+                "grant_scopes": ["app:read"],
+                "grant_ttl_s": 600,
+            },
+        }),
+    )
+    .await;
+    let webhook_id = created["id"].as_str().unwrap().to_string();
+
+    let trigger = emit_app_event(&server, &app_id, "app.down").await;
+    let incident_id = quoro_types::new_id(quoro_types::Prefix::Incident);
+    let mut w = server.state.store.begin_write().await.unwrap();
+    sqlx::query(
+        "INSERT INTO incidents (id, status, title, trigger_event_id, subject, project_id, opened_at) \
+         VALUES (?, 'open', ?, ?, ?, ?, ?)",
+    )
+    .bind(&incident_id)
+    .bind("web is down")
+    .bind(&trigger)
+    .bind(json!({ "type": "app", "id": app_id }).to_string())
+    .bind(&project_id)
+    .bind(now_rfc3339())
+    .execute(&mut *w.tx)
+    .await
+    .unwrap();
+    events::insert(
+        &mut w.tx,
+        StoredEvent {
+            id: &quoro_types::new_id(quoro_types::Prefix::Event),
+            time: &now_rfc3339(),
+            kind: "incident.opened",
+            source: json!({ "kind": "control_plane" }),
+            subject: json!({ "type": "incident", "id": incident_id }),
+            project_id: Some(&project_id),
+            incident_id: Some(&incident_id),
+            request_id: None,
+            actor: None,
+            data: json!({ "incident_id": incident_id, "app_id": app_id }),
+            change_actor: Actor::system("tests"),
+        },
+    )
+    .await
+    .unwrap();
+    w.commit().await.unwrap();
+
+    let res = owner
+        .post(server.url(&format!("/api/v1/webhooks/{webhook_id}/test")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 202, "test: {}", res.text().await.unwrap());
+    let delivery: Value = res.json().await.unwrap();
+    assert_eq!(delivery["status"], "delivered");
+    let delivery_id = delivery["id"].as_str().unwrap().to_string();
+
+    let captured = wait_for(|| async {
+        let captured = recorder.requests().await;
+        (!captured.is_empty()).then_some(captured)
+    })
+    .await;
+    let request = captured
+        .iter()
+        .find(|request| {
+            request
+                .headers
+                .get("quoro-delivery-id")
+                .is_some_and(|value| value.to_str().unwrap() == delivery_id)
+        })
+        .expect("the test delivery reached the receiver");
+    let body: Value = serde_json::from_slice(&request.body).unwrap();
+    assert!(body["data"].get("wake").is_none(), "{body}");
+    let (grants,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM grants WHERE incident_id = ?")
+        .bind(&incident_id)
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(grants, 0);
 }
 
 #[tokio::test]
@@ -698,4 +957,247 @@ async fn test_delivery_is_signed_and_recorded() {
         .await
         .unwrap();
     assert_eq!(list["items"][0]["id"], delivery_id);
+}
+
+/// One delivery row of a webhook, by test flag.
+async fn delivery_row(
+    server: &Server,
+    webhook_id: &str,
+    test: i64,
+) -> Option<(String, i64, String, Option<String>)> {
+    let row = sqlx::query(
+        "SELECT id, attempt, status, next_attempt_at FROM webhook_deliveries \
+         WHERE webhook_id = ? AND test = ? ORDER BY created_at LIMIT 1",
+    )
+    .bind(webhook_id)
+    .bind(test)
+    .fetch_optional(server.state.store.pool())
+    .await
+    .unwrap()?;
+    Some((
+        row.get("id"),
+        row.get("attempt"),
+        row.get("status"),
+        row.get("next_attempt_at"),
+    ))
+}
+
+/// A test delivery after a real delivery of the same event: the partial unique
+/// index lets both attempt 1 rows coexist (#127).
+#[tokio::test]
+async fn test_delivery_after_a_real_delivery_does_not_collide() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let project_id = create_project(&owner, &server, "site").await;
+    let app_id = create_app(&owner, &server, &project_id).await;
+    let (_recorder, url) = start_receiver(200).await;
+    let (created, _secret) = create_webhook(
+        &owner,
+        &server,
+        json!({
+            "name": "receiver",
+            "url": url,
+            "event_types": ["app.up"],
+            "selector": { "apps": [app_id] },
+        }),
+    )
+    .await;
+    let webhook_id = created["id"].as_str().unwrap().to_string();
+    let event_id = emit_app_event(&server, &app_id, "app.up").await;
+
+    let real = wait_for(|| async {
+        let row = delivery_row(&server, &webhook_id, 0).await?;
+        (row.2 == "delivered").then_some(row)
+    })
+    .await;
+    assert_eq!(real.1, 1);
+
+    let res = owner
+        .post(server.url(&format!("/api/v1/webhooks/{webhook_id}/test")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 202, "test: {}", res.text().await.unwrap());
+    let delivery: Value = res.json().await.unwrap();
+    assert_eq!(delivery["status"], "delivered");
+    assert_eq!(delivery["event_id"], event_id);
+    let replay = delivery_row(&server, &webhook_id, 1)
+        .await
+        .expect("the test row exists next to the real one");
+    assert_eq!(replay.1, 1);
+    assert_eq!(replay.2, "delivered");
+    assert!(replay.3.is_none());
+}
+
+/// A test delivery of an event before the dispatcher reaches it does not block
+/// the real delivery (#127).
+#[tokio::test]
+async fn test_delivery_before_the_real_one_does_not_block_it() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let project_id = create_project(&owner, &server, "site").await;
+    let app_id = create_app(&owner, &server, &project_id).await;
+    let (_recorder, url) = start_receiver(200).await;
+    let (created, _secret) = create_webhook(
+        &owner,
+        &server,
+        json!({
+            "name": "receiver",
+            "url": url,
+            "event_types": ["app.up"],
+            "selector": { "apps": [app_id] },
+        }),
+    )
+    .await;
+    let webhook_id = created["id"].as_str().unwrap().to_string();
+
+    emit_app_event(&server, &app_id, "app.up").await;
+    let res = owner
+        .post(server.url(&format!("/api/v1/webhooks/{webhook_id}/test")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 202, "test: {}", res.text().await.unwrap());
+    let test_delivery: Value = res.json().await.unwrap();
+    assert_eq!(test_delivery["status"], "delivered");
+
+    let real = wait_for(|| async {
+        let row = delivery_row(&server, &webhook_id, 0).await?;
+        (row.2 == "delivered").then_some(row)
+    })
+    .await;
+    assert_eq!(real.1, 1);
+    let test_row = delivery_row(&server, &webhook_id, 1)
+        .await
+        .expect("the test row exists next to the real one");
+    assert_eq!(test_row.1, 1);
+}
+
+/// Two test deliveries of the same event in a row both answer 202.
+#[tokio::test]
+async fn two_test_deliveries_of_one_event_do_not_collide() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let project_id = create_project(&owner, &server, "site").await;
+    let app_id = create_app(&owner, &server, &project_id).await;
+    let (_recorder, url) = start_receiver(200).await;
+    let (created, _secret) = create_webhook(
+        &owner,
+        &server,
+        json!({
+            "name": "tester",
+            "url": url,
+            "event_types": ["incident.resolved"],
+            "selector": { "all": true },
+        }),
+    )
+    .await;
+    let webhook_id = created["id"].as_str().unwrap().to_string();
+    emit_app_event(&server, &app_id, "app.up").await;
+
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let res = owner
+            .post(server.url(&format!("/api/v1/webhooks/{webhook_id}/test")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 202, "test: {}", res.text().await.unwrap());
+        let delivery: Value = res.json().await.unwrap();
+        assert_eq!(delivery["status"], "delivered");
+        ids.push(delivery["id"].as_str().unwrap().to_string());
+    }
+    assert_ne!(ids[0], ids[1]);
+    let (rows,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM webhook_deliveries WHERE webhook_id = ? AND test = 1")
+            .bind(&webhook_id)
+            .fetch_one(server.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(rows, 2);
+}
+
+/// A failed test delivery is attempted once and never retried.
+#[tokio::test]
+async fn failed_test_delivery_is_not_retried() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let project_id = create_project(&owner, &server, "site").await;
+    let app_id = create_app(&owner, &server, &project_id).await;
+    let (_recorder, url) = start_receiver(500).await;
+    let (created, _secret) = create_webhook(
+        &owner,
+        &server,
+        json!({
+            "name": "tester",
+            "url": url,
+            "event_types": ["incident.resolved"],
+            "selector": { "all": true },
+        }),
+    )
+    .await;
+    let webhook_id = created["id"].as_str().unwrap().to_string();
+    emit_app_event(&server, &app_id, "app.up").await;
+
+    let res = owner
+        .post(server.url(&format!("/api/v1/webhooks/{webhook_id}/test")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 202, "test: {}", res.text().await.unwrap());
+    let delivery: Value = res.json().await.unwrap();
+    assert_eq!(delivery["status"], "failed");
+
+    // Give the dispatcher several ticks: a test row is never retried.
+    wait_for(|| async {
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM webhook_deliveries WHERE webhook_id = ?")
+                .bind(&webhook_id)
+                .fetch_one(server.state.store.pool())
+                .await
+                .unwrap();
+        (count > 0).then_some(())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM webhook_deliveries WHERE webhook_id = ?")
+            .bind(&webhook_id)
+            .fetch_one(server.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(count, 1);
+    let row = delivery_row(&server, &webhook_id, 1).await.unwrap();
+    assert_eq!(row.1, 1);
+    assert_eq!(row.2, "failed");
+    assert!(row.3.is_none());
+}
+
+/// A test delivery with an empty event log is a validation error.
+#[tokio::test]
+async fn test_delivery_without_an_event_is_refused() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let (_recorder, url) = start_receiver(200).await;
+    let (created, _secret) = create_webhook(
+        &owner,
+        &server,
+        json!({
+            "name": "tester",
+            "url": url,
+            "event_types": ["incident.resolved"],
+            "selector": { "all": true },
+        }),
+    )
+    .await;
+    let webhook_id = created["id"].as_str().unwrap().to_string();
+    let (status, code, _) = problem(
+        owner
+            .post(server.url(&format!("/api/v1/webhooks/{webhook_id}/test")))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!((status, code.as_str()), (422, "validation_failed"));
 }

@@ -231,9 +231,9 @@ pub use crate::api::grants::Grant;
 // Helpers
 // ---------------------------------------------------------------------------
 
-type UserRow = (String, String, String, String, i64, String);
+pub(crate) type UserRow = (String, String, String, String, i64, String);
 
-fn user_from(row: UserRow) -> Result<User, ApiError> {
+pub(crate) fn user_from(row: UserRow) -> Result<User, ApiError> {
     let (id, email, name, role, disabled, created_at) = row;
     let role = Role::parse(&role)
         .ok_or_else(|| ApiError::internal(&format!("user {id} has unknown role {role}")))?;

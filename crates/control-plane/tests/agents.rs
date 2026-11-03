@@ -342,6 +342,141 @@ async fn agent_lifecycle_keys_and_tokens() {
     assert_eq!(refused.2.as_deref(), Some("agent_disabled"));
 }
 
+async fn list_keys(
+    client: &reqwest::Client,
+    server: &common::Server,
+    agent_id: &str,
+    query: &[(&str, &str)],
+) -> reqwest::Response {
+    client
+        .get(server.url(&format!("/api/v1/agents/{agent_id}/keys")))
+        .query(query)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn every_role_lists_an_agents_keys_including_revoked_ones() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let owner_id = owner_id(&owner, &server).await;
+    let agent = create_agent(&owner, &server, "watcher", &owner_id).await;
+    let agent_id = agent["id"].as_str().unwrap().to_string();
+    let first = create_key(&owner, &server, &agent_id).await;
+    let second = create_key(&owner, &server, &agent_id).await;
+    let first_id = first["id"].as_str().unwrap().to_string();
+    let second_id = second["id"].as_str().unwrap().to_string();
+    let res = owner
+        .delete(server.url(&format!("/api/v1/agents/{agent_id}/keys/{first_id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 204);
+
+    server
+        .insert_user("operator@example.com", "operator-password", "operator")
+        .await;
+    server
+        .insert_user("viewer@example.com", "viewer-password", "viewer")
+        .await;
+    for (email, password) in [
+        (common::OWNER_EMAIL, common::OWNER_PASSWORD),
+        ("operator@example.com", "operator-password"),
+        ("viewer@example.com", "viewer-password"),
+    ] {
+        let client = server.client();
+        server.login(&client, email, password).await;
+        let res = list_keys(&client, &server, &agent_id, &[]).await;
+        assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+        let body: Value = res.json().await.unwrap();
+        let items = body["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2, "{body}");
+        let ids: Vec<&str> = items
+            .iter()
+            .map(|key| key["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&first_id.as_str()), "{ids:?}");
+        assert!(ids.contains(&second_id.as_str()), "{ids:?}");
+        let revoked = items
+            .iter()
+            .find(|key| key["id"] == first_id)
+            .expect("the revoked key is listed");
+        assert!(revoked["revoked_at"].as_str().is_some(), "{revoked}");
+        let live = items
+            .iter()
+            .find(|key| key["id"] == second_id)
+            .expect("the live key is listed");
+        assert!(live["revoked_at"].is_null(), "{live}");
+        assert!(live["last_used_at"].is_null(), "{live}");
+        for key in items {
+            assert!(key.get("key").is_none(), "{key}");
+            assert!(key.get("key_hash").is_none(), "{key}");
+        }
+        assert!(
+            !res_text_has_secret(&body, first["key"].as_str().unwrap()),
+            "a key secret leaked"
+        );
+    }
+}
+
+fn res_text_has_secret(body: &Value, secret: &str) -> bool {
+    body.to_string().contains(secret)
+}
+
+#[tokio::test]
+async fn agent_keys_page_with_a_cursor() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let owner_id = owner_id(&owner, &server).await;
+    let agent = create_agent(&owner, &server, "watcher", &owner_id).await;
+    let agent_id = agent["id"].as_str().unwrap().to_string();
+    let first = create_key(&owner, &server, &agent_id).await;
+    let second = create_key(&owner, &server, &agent_id).await;
+
+    let res = list_keys(&owner, &server, &agent_id, &[("limit", "1")]).await;
+    let page: Value = res.json().await.unwrap();
+    assert_eq!(page["items"].as_array().unwrap().len(), 1);
+    assert_eq!(page["items"][0]["id"], second["id"]);
+    let cursor = page["next_cursor"]
+        .as_str()
+        .expect("another page follows")
+        .to_string();
+
+    let res = list_keys(
+        &owner,
+        &server,
+        &agent_id,
+        &[("limit", "1"), ("cursor", &cursor)],
+    )
+    .await;
+    let last: Value = res.json().await.unwrap();
+    assert_eq!(last["items"].as_array().unwrap().len(), 1);
+    assert_eq!(last["items"][0]["id"], first["id"]);
+    assert!(last["next_cursor"].is_null());
+}
+
+#[tokio::test]
+async fn listing_keys_of_an_unknown_agent_is_not_found() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let (status, code, _) =
+        problem(list_keys(&owner, &server, "agt_01JC9Z6Q5W8N3K4T7R2M1XHB0D", &[]).await).await;
+    assert_eq!((status, code.as_str()), (404, "not_found"));
+}
+
+#[tokio::test]
+async fn listing_keys_with_a_bad_limit_is_refused() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let owner_id = owner_id(&owner, &server).await;
+    let agent = create_agent(&owner, &server, "watcher", &owner_id).await;
+    let agent_id = agent["id"].as_str().unwrap();
+    let (status, code, _) =
+        problem(list_keys(&owner, &server, agent_id, &[("limit", "0")]).await).await;
+    assert_eq!((status, code.as_str()), (422, "validation_failed"));
+}
+
 #[tokio::test]
 async fn agent_calls_are_human_only_and_scope_checked() {
     let server = start().await;
