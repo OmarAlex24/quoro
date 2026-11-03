@@ -1609,7 +1609,7 @@ dependencies = [
 
 [[package]]
 name = "quoro"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "axum",
  "axum-server",
@@ -1632,7 +1632,7 @@ dependencies = [
 
 [[package]]
 name = "quoro-control-plane"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "argon2",
  "axum",
@@ -1653,7 +1653,7 @@ dependencies = [
 
 [[package]]
 name = "quoro-engine"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "flate2",
  "futures-core",
@@ -1669,14 +1669,14 @@ dependencies = [
 
 [[package]]
 name = "quoro-init"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "rustix",
 ]
 
 [[package]]
 name = "quoro-node-agent"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "quoro-engine",
  "quoro-proto",
@@ -1685,11 +1685,11 @@ dependencies = [
 
 [[package]]
 name = "quoro-proto"
-version = "0.0.0"
+version = "0.0.1"
 
 [[package]]
 name = "quoro-types"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "getrandom 0.3.4",
  "serde",
