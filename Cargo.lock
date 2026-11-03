@@ -2082,7 +2082,9 @@ name = "quoro-mcp"
 version = "0.0.2"
 dependencies = [
  "axum",
+ "futures-util",
  "quoro-control-plane",
+ "quoro-proto",
  "quoro-types",
  "reqwest 0.12.28",
  "rmcp",
@@ -2092,6 +2094,7 @@ dependencies = [
  "serde_norway",
  "sqlx",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
 ]
 

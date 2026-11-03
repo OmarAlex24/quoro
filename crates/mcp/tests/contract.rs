@@ -6,7 +6,7 @@
 //! input schema. The last test is the static half of ADR 0031: the adapter
 //! depends on no database crate and never builds an audit record.
 
-use quoro_mcp::tools::{PENDING, ToolSpec, list, specs};
+use quoro_mcp::tools::{ToolSpec, list, specs};
 use serde_json::{Map, Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -379,6 +379,30 @@ fn has_justification(doc: &Value, operation: &Value) -> bool {
     })
 }
 
+/// The `required` flag of the path or query parameter named `name`, or `None`
+/// when the operation declares no such parameter (so the property can only
+/// come from the `Quoro-Incident` header).
+fn parameter(doc: &Value, operation: &Value, name: &str) -> Option<bool> {
+    operation
+        .get("parameters")
+        .and_then(Value::as_array)
+        .and_then(|parameters| {
+            parameters.iter().find_map(|parameter| {
+                let parameter = resolve_parameter(doc, parameter);
+                let is_named = matches!(
+                    parameter.get("in").and_then(Value::as_str),
+                    Some("path" | "query")
+                ) && parameter.get("name").and_then(Value::as_str) == Some(name);
+                is_named.then(|| {
+                    parameter
+                        .get("required")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                })
+            })
+        })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -388,20 +412,12 @@ fn tool_set_matches_the_contract_table() {
     let rows = table();
     let mut expected: Vec<&str> = rows.iter().map(|row| row.tool.as_str()).collect();
     let mut actual: Vec<&str> = specs().iter().map(|spec| spec.name).collect();
-    actual.extend_from_slice(PENDING);
     expected.sort_unstable();
     actual.sort_unstable();
     assert_eq!(
         actual, expected,
-        "specs() + PENDING must equal the README MCP tools table"
+        "specs() must equal the README MCP tools table"
     );
-
-    for pending in PENDING {
-        assert!(
-            !specs().iter().any(|spec| spec.name == *pending),
-            "{pending} is both wired and pending"
-        );
-    }
 
     for spec in specs() {
         let row = rows
@@ -421,8 +437,7 @@ fn tool_set_matches_the_contract_table() {
 fn every_tool_maps_to_its_annotated_operation() {
     let doc = openapi();
     let rows = table();
-    let mut known: Vec<&str> = specs().iter().map(|spec| spec.name).collect();
-    known.extend_from_slice(PENDING);
+    let known: Vec<&str> = specs().iter().map(|spec| spec.name).collect();
 
     for operation in operations(&doc) {
         if let Some(name) = operation
@@ -432,7 +447,7 @@ fn every_tool_maps_to_its_annotated_operation() {
         {
             assert!(
                 known.contains(&name),
-                "{} {} is annotated with tool {name}, which is neither wired nor pending",
+                "{} {} is annotated with tool {name}, which is not a wired tool",
                 operation.method,
                 operation.path
             );
@@ -521,6 +536,7 @@ fn every_schema_is_fully_validated() {
 
 #[test]
 fn mutating_tools_require_a_justification_and_accept_an_incident() {
+    let doc = openapi();
     for spec in specs() {
         let schema = schema_of(spec);
         let properties = schema
@@ -528,6 +544,7 @@ fn mutating_tools_require_a_justification_and_accept_an_incident() {
             .and_then(Value::as_object)
             .unwrap_or_else(|| panic!("{}: no properties", spec.name));
         let required = required_names(&schema);
+        let operation = operation(&doc, spec.operation_id);
         if spec.mutating {
             assert!(
                 properties.contains_key("justification"),
@@ -544,9 +561,13 @@ fn mutating_tools_require_a_justification_and_accept_an_incident() {
                 "{}: a mutating tool has no incident_id property",
                 spec.name
             );
-            assert!(
-                !required.iter().any(|name| name == "incident_id"),
-                "{}: incident_id must stay optional",
+            // `resolve_incident` names the incident in its path, so it is
+            // required there. Everywhere else `incident_id` is the
+            // `Quoro-Incident` header context and stays optional.
+            assert_eq!(
+                required.iter().any(|name| name == "incident_id"),
+                parameter(&doc, operation.value, "incident_id") == Some(true),
+                "{}: incident_id is required exactly when the operation declares it so",
                 spec.name
             );
         } else {
@@ -556,13 +577,18 @@ fn mutating_tools_require_a_justification_and_accept_an_incident() {
                 spec.name
             );
             assert!(
-                !properties.contains_key("incident_id"),
-                "{}: a read tool must not take incident_id",
-                spec.name
-            );
-            assert!(
                 !required.iter().any(|name| name == "justification"),
                 "{}: a read tool must not require justification",
+                spec.name
+            );
+            // `list_audit` filters by `incident_id` and `get_incident` names
+            // the incident in its path, so a read tool may carry the property —
+            // but only when the operation declares it as a path or query
+            // parameter, never as the `Quoro-Incident` header context.
+            assert_eq!(
+                properties.contains_key("incident_id"),
+                parameter(&doc, operation.value, "incident_id").is_some(),
+                "{}: a read tool takes incident_id only as a path or query parameter",
                 spec.name
             );
         }
@@ -607,11 +633,7 @@ fn mutating_tools_require_a_justification_and_accept_an_incident() {
 fn no_tool_named_after_approval_decide() {
     let tools = list();
     let listed: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
-    let names: Vec<&str> = specs()
-        .iter()
-        .map(|spec| spec.name)
-        .chain(PENDING.iter().copied())
-        .collect();
+    let names: Vec<&str> = specs().iter().map(|spec| spec.name).collect();
 
     for name in names.iter().chain(listed.iter()) {
         let lower = name.to_ascii_lowercase();
