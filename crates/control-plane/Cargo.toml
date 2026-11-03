@@ -33,6 +33,11 @@ time = { version = "0.3", default-features = false, features = ["std", "formatti
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 # AEAD for the `*_enc` columns under the cluster data-encryption key (D-0050).
 chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
+# HMAC-SHA256 signatures of webhook deliveries (D-0032).
+hmac = { version = "0.12", default-features = false }
+# POSTs webhook deliveries over HTTPS, with the same native-roots, no-provider
+# rustls setup as the provider client (D-0032).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots-no-provider"] }
 # Wipes key material and decrypted secrets from memory when they are dropped.
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
 # The live-log SSE body is a stream built with `stream::unfold` (ADR 0057).

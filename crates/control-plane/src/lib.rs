@@ -16,6 +16,7 @@ pub mod authz;
 pub mod changelog;
 pub mod crypto;
 pub mod deploy;
+pub mod dispatcher;
 pub mod driver;
 pub mod error;
 pub mod events;
@@ -184,6 +185,7 @@ impl AppState {
             cluster_id,
         };
         sweeper::spawn(state.clone());
+        dispatcher::spawn(state.clone());
         Ok(state)
     }
 

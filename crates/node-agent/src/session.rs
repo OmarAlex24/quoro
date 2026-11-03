@@ -55,6 +55,8 @@ pub const MAX_STREAMS: usize = 32;
 const STREAM_BATCH_LINES: usize = 200;
 /// How often a partially filled stream batch is flushed.
 const STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+/// How often an open session sends the events recorded since the last flush.
+const EVENT_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 /// Space kept free in every frame for the envelope and the line array.
 const FRAME_HEADROOM: usize = 64 * 1024;
 
@@ -380,6 +382,11 @@ impl Session {
             tokio::time::interval(Duration::from_millis(wire::STATUS_REPORT_INTERVAL_MS));
         status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         status_tick.reset();
+        // Section 6.5: events wait in the buffer only while disconnected.
+        // During a session they leave within a second of being recorded.
+        let mut event_tick = tokio::time::interval(EVENT_FLUSH_INTERVAL);
+        event_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        event_tick.reset();
         // A clone keeps the select's borrow off `self`, so a branch may still
         // build a status report that reads the store and the snapshot.
         let mut observed = self.observed.clone();
@@ -407,6 +414,12 @@ impl Session {
                         && let Err(e) = write_message(&mut sink, NodeMessage::Ping, None).await
                     {
                         warn!(error = %e, "could not send a ping; reconnecting");
+                        return Ok(SessionEnd::Reconnect);
+                    }
+                }
+                _ = event_tick.tick() => {
+                    if let Err(e) = self.flush_events(&mut sink).await {
+                        warn!(error = %e, "could not deliver buffered events; reconnecting");
                         return Ok(SessionEnd::Reconnect);
                     }
                 }
@@ -1010,8 +1023,9 @@ impl Session {
             .collect()
     }
 
-    /// Sends the buffered events after `welcome`, removing each one from the
-    /// buffer only after its frame was written (section 6.5).
+    /// Sends the buffered events, after `welcome` and then every
+    /// [`EVENT_FLUSH_INTERVAL`] while the session is up, removing each one from
+    /// the buffer only after its frame was written (section 6.5).
     async fn flush_events<S>(
         &mut self,
         sink: &mut SplitSink<WebSocketStream<S>, Message>,

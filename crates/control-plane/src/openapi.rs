@@ -111,6 +111,13 @@ pub struct RateLimited(Problem);
         crate::api::providers::get_provider,
         crate::api::providers::delete_provider,
         crate::api::providers::rotate_provider_secret,
+        crate::api::webhooks::list_webhooks,
+        crate::api::webhooks::create_webhook,
+        crate::api::webhooks::get_webhook,
+        crate::api::webhooks::update_webhook,
+        crate::api::webhooks::delete_webhook,
+        crate::api::webhooks::test_webhook,
+        crate::api::webhooks::list_webhook_deliveries,
         crate::api::vms::list_vms,
         crate::api::vms::create_vm,
         crate::api::vms::get_vm,
@@ -168,6 +175,16 @@ pub struct RateLimited(Problem);
             crate::api::vms::Vm,
             crate::api::vms::VmList,
             crate::api::vms::CreateVmRequest,
+            crate::api::webhooks::EventType,
+            crate::api::webhooks::WebhookWake,
+            crate::api::webhooks::Webhook,
+            crate::api::webhooks::WebhookList,
+            crate::api::webhooks::WebhookCreated,
+            crate::api::webhooks::CreateWebhookRequest,
+            crate::api::webhooks::UpdateWebhookRequest,
+            crate::api::webhooks::WebhookDelivery,
+            crate::api::webhooks::WebhookDeliveryList,
+            crate::api::webhooks::DeliveryStatus,
         ),
         responses(
             Unauthenticated,
@@ -195,6 +212,8 @@ impl utoipa::Modify for Security {
         // first so the fixes below see every operation.
         openapi.merge(crate::api::apps::AppsDoc::openapi());
         openapi.merge(crate::api::logs::LogsDoc::openapi());
+        openapi.merge(crate::api::events::EventsDoc::openapi());
+        openapi.merge(crate::api::incidents::IncidentsDoc::openapi());
 
         use utoipa::openapi::security::{
             ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme,
@@ -246,6 +265,16 @@ impl utoipa::Modify for Security {
             {
                 body.required = Some(utoipa::openapi::Required::False);
             }
+        }
+        // The resolution note is optional: resolving needs no body at all.
+        if let Some(body) = openapi
+            .paths
+            .paths
+            .get_mut("/api/v1/incidents/{incident_id}/resolve")
+            .and_then(|item| item.post.as_mut())
+            .and_then(|operation| operation.request_body.as_mut())
+        {
+            body.required = Some(utoipa::openapi::Required::False);
         }
     }
 }

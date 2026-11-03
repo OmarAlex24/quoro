@@ -11,14 +11,17 @@ pub mod cluster;
 pub mod deployments;
 pub mod domains;
 pub mod enroll;
+pub mod events;
 pub mod grants;
 pub mod health;
+pub mod incidents;
 pub mod logs;
 pub mod nodes;
 pub mod page;
 pub mod projects;
 pub mod providers;
 pub mod vms;
+pub mod webhooks;
 
 use crate::AppState;
 use axum::Router;
@@ -78,6 +81,17 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/audit", get(audit::list_audit))
         .route("/api/v1/audit/verify", post(audit::verify_audit))
         .route("/api/v1/audit/{seq}", get(audit::get_audit_record))
+        .route("/api/v1/events", get(events::list_events))
+        .route("/api/v1/events/stream", get(events::stream_events))
+        .route("/api/v1/incidents", get(incidents::list_incidents))
+        .route(
+            "/api/v1/incidents/{incident_id}",
+            get(incidents::get_incident),
+        )
+        .route(
+            "/api/v1/incidents/{incident_id}/resolve",
+            post(incidents::resolve_incident),
+        )
         .route("/api/v1/nodes", get(nodes::list_nodes))
         .route("/api/v1/nodes/join-tokens", post(enroll::create_join_token))
         .route("/api/v1/nodes/enroll", post(enroll::enroll_node))
@@ -106,6 +120,24 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/v1/providers/{provider_id}/rotate",
             post(providers::rotate_provider_secret),
+        )
+        .route(
+            "/api/v1/webhooks",
+            get(webhooks::list_webhooks).post(webhooks::create_webhook),
+        )
+        .route(
+            "/api/v1/webhooks/{webhook_id}",
+            get(webhooks::get_webhook)
+                .patch(webhooks::update_webhook)
+                .delete(webhooks::delete_webhook),
+        )
+        .route(
+            "/api/v1/webhooks/{webhook_id}/test",
+            post(webhooks::test_webhook),
+        )
+        .route(
+            "/api/v1/webhooks/{webhook_id}/deliveries",
+            get(webhooks::list_webhook_deliveries),
         )
         .route("/api/v1/vms", get(vms::list_vms).post(vms::create_vm))
         .route(

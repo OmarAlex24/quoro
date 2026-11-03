@@ -1812,6 +1812,12 @@ async fn insert_node_event(
     )
     .await
     .map_err(|e| e.to_string())?;
+    // A node report is a detection: `app.down` opens the incident for that app
+    // and `app.up` resolves it, in the same transaction (D-0032,
+    // permission-model.md section 8.2).
+    crate::service::incidents::apply_node_event(&mut w.tx, event)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
     w.commit().await.map_err(|e| e.to_string())
 }
 

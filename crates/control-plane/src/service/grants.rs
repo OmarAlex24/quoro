@@ -751,7 +751,6 @@ async fn revoke_grant_tx(
 /// # Errors
 ///
 /// A database error.
-#[allow(dead_code)] // The incident-resolve task calls it.
 pub(crate) async fn revoke_for_incident(
     conn: &mut SqliteConnection,
     incident_id: &str,

@@ -263,3 +263,92 @@ async fn an_idle_session_with_a_live_primary_stays_up() {
     serving.abort();
     primary.abort();
 }
+
+/// A primary like [`quiet_primary`] that hands every `event` frame to the test.
+async fn listening_primary(server: DuplexStream, events: tokio::sync::mpsc::Sender<Value>) {
+    let mut ws = tokio_tungstenite::accept_async(server).await.unwrap();
+    let hello = read_frame(&mut ws).await;
+    send(
+        &mut ws,
+        ControlMessage::Welcome(Welcome {
+            cluster_id: "cls_test".to_owned(),
+            term: 1,
+            server_time: "2026-11-02T10:15:30Z".to_owned(),
+            heartbeat_interval_ms: 20,
+            session_timeout_ms: 120,
+            primary_node_id: "nod_primary".to_owned(),
+        })
+        .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
+        .to_text(),
+    )
+    .await;
+    while let Some(Ok(message)) = ws.next().await {
+        if let Message::Text(text) = message {
+            let frame: Value = serde_json::from_str(text.as_str()).unwrap();
+            if frame["type"] == "ping" {
+                let pong = ControlMessage::Pong
+                    .to_frame("msg_pong", frame["id"].as_str())
+                    .to_text();
+                send(&mut ws, pong).await;
+            } else if frame["type"] == "event" {
+                let _ = events.send(frame).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_event_recorded_during_a_session_is_sent_without_a_reconnect() {
+    let dir = TempDir::new();
+    let key = sign::signing_key_from_seed(&[6; 32]);
+    let identity = identity_files(dir.path(), &key);
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let (desired, _desired_rx) = watch::channel(None);
+    let (_observed_tx, observed_rx) = watch::channel(Vec::new());
+    let mut session = Session::new(SessionSetup {
+        identity,
+        store: store.clone(),
+        facts: facts(),
+        desired,
+        observed: observed_rx,
+        current: None,
+    });
+
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(4);
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let primary = tokio::spawn(listening_primary(server, events_tx));
+    let (client_ws, _response) = client_async("ws://primary.test/api/v1/nodes/session", client)
+        .await
+        .unwrap();
+    let serving =
+        tokio::spawn(async move { session.serve(client_ws, std::future::pending::<()>()).await });
+
+    // The session is up; the node then records an event (an app went down).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let body = serde_json::json!({
+        "schema_version": 1,
+        "id": "evt_01JC9Z6Q5W8N3K4T7R2M1XHB0E",
+        "type": "app.down",
+        "time": "2026-11-02T10:15:40.000000000Z",
+        "source": {"kind": "node", "node_id": "nod_test"},
+        "subject": {"type": "app", "id": "app_01JC9Z6Q5W8N3K4T7R2M1XHB0D"},
+        "actor": {"type": "node", "id": "nod_test"},
+        "data": {"app_id": "app_01JC9Z6Q5W8N3K4T7R2M1XHB0D", "node_id": "nod_test",
+                 "check": "health_check", "failures": 2},
+    });
+    store
+        .push_event("evt_01JC9Z6Q5W8N3K4T7R2M1XHB0E", &body)
+        .await
+        .unwrap();
+
+    let frame = tokio::time::timeout(Duration::from_secs(3), events_rx.recv())
+        .await
+        .expect("the event left within the flush interval")
+        .expect("the primary saw an event");
+    assert_eq!(frame["body"]["type"], "app.down");
+    assert!(!serving.is_finished(), "no reconnect was needed");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(store.buffered_events().await.unwrap().is_empty());
+    serving.abort();
+    primary.abort();
+}

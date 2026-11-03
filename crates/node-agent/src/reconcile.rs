@@ -108,6 +108,16 @@ struct SpecMeta {
     deployment_id: Option<String>,
 }
 
+/// What a health check needs from the VM's spec beyond the probe target: where
+/// a transition to failing or passing is reported.
+#[derive(Clone, Debug)]
+struct HealthTargetInfo {
+    target: HealthTarget,
+    deployment_id: Option<String>,
+    app_id: Option<String>,
+    project_id: String,
+}
+
 /// One VM's health-check state.
 #[derive(Clone, Debug)]
 struct HealthState {
@@ -765,6 +775,76 @@ impl<E: Engine + 'static> Reconciler<E> {
         info!(deployment_id, phase, "deployment.failed buffered");
     }
 
+    /// Buffers one `app.down` event for a health check that failed past its
+    /// threshold (`data_app_down`): the app, this node, the check and how many
+    /// consecutive failures the transition took.
+    async fn emit_app_down(
+        &self,
+        app_id: &str,
+        project_id: &str,
+        vm_id: &str,
+        failures: u32,
+        last_error: Option<&str>,
+    ) {
+        let Some(node_id) = self.node_id.as_deref() else {
+            debug!("no node id; not emitting app.down");
+            return;
+        };
+        let evt_id = util::event_id();
+        let mut data = serde_json::json!({
+            "app_id": app_id,
+            "node_id": node_id,
+            "vm_id": vm_id,
+            "check": "health_check",
+            "failures": failures.max(1),
+        });
+        if let Some(last_error) = last_error {
+            data["last_error"] = serde_json::json!(last_error);
+        }
+        let body = serde_json::json!({
+            "schema_version": 1,
+            "id": evt_id,
+            "type": "app.down",
+            "time": util::rfc3339_nanos(self.store.next_log_time()),
+            "source": {"kind": "node", "node_id": node_id},
+            "subject": {"type": "app", "id": app_id},
+            "project_id": project_id,
+            "actor": {"type": "node", "id": node_id},
+            "data": data,
+        });
+        if let Err(e) = self.store.push_event(&evt_id, &body).await {
+            warn!(app_id, error = %e, "could not buffer app.down");
+            return;
+        }
+        info!(app_id, vm_id, failures, "app.down buffered");
+    }
+
+    /// Buffers one `app.up` event when a failing health check recovers
+    /// (`data_app_up`).
+    async fn emit_app_up(&self, app_id: &str, project_id: &str) {
+        let Some(node_id) = self.node_id.as_deref() else {
+            debug!("no node id; not emitting app.up");
+            return;
+        };
+        let evt_id = util::event_id();
+        let body = serde_json::json!({
+            "schema_version": 1,
+            "id": evt_id,
+            "type": "app.up",
+            "time": util::rfc3339_nanos(self.store.next_log_time()),
+            "source": {"kind": "node", "node_id": node_id},
+            "subject": {"type": "app", "id": app_id},
+            "project_id": project_id,
+            "actor": {"type": "node", "id": node_id},
+            "data": {"app_id": app_id},
+        });
+        if let Err(e) = self.store.push_event(&evt_id, &body).await {
+            warn!(app_id, error = %e, "could not buffer app.up");
+            return;
+        }
+        info!(app_id, "app.up buffered");
+    }
+
     /// Probes every running VM whose health check is due and records changes.
     ///
     /// Runs from the agent loop every 500 ms and at the end of a reconcile
@@ -787,7 +867,7 @@ impl<E: Engine + 'static> Reconciler<E> {
             .map(|info| info.id.0.clone())
             .collect();
 
-        let mut targets: HashMap<String, (HealthTarget, Option<String>)> = HashMap::new();
+        let mut targets: HashMap<String, HealthTargetInfo> = HashMap::new();
         for vm in &snapshot.state.spec.vms {
             if vm.desired_status != DesiredStatus::Running || !running.contains(&vm.vm_id) {
                 continue;
@@ -803,7 +883,15 @@ impl<E: Engine + 'static> Reconciler<E> {
                 continue;
             };
             if let Some(target) = HealthTarget::for_vm(vm, ip) {
-                targets.insert(vm.vm_id.clone(), (target, vm.deployment_id.clone()));
+                targets.insert(
+                    vm.vm_id.clone(),
+                    HealthTargetInfo {
+                        target,
+                        deployment_id: vm.deployment_id.clone(),
+                        app_id: vm.app_id.clone(),
+                        project_id: vm.project_id.clone(),
+                    },
+                );
             }
         }
 
@@ -814,9 +902,15 @@ impl<E: Engine + 'static> Reconciler<E> {
         let now = Instant::now();
         let ids: Vec<String> = targets.keys().cloned().collect();
         for vm_id in ids {
-            let Some((target, deployment_id)) = targets.remove(&vm_id) else {
+            let Some(info) = targets.remove(&vm_id) else {
                 continue;
             };
+            let HealthTargetInfo {
+                target,
+                deployment_id,
+                app_id,
+                project_id,
+            } = info;
             let mut state = self.health.remove(&vm_id).unwrap_or_else(|| HealthState {
                 target: target.clone(),
                 status: Health::Unknown,
@@ -863,7 +957,20 @@ impl<E: Engine + 'static> Reconciler<E> {
             state.status = status;
             state.next_at = now + state.target.interval;
             let changed = status != previous;
+            let failures = state.failures;
             self.health.insert(vm_id.clone(), state);
+
+            // One event per health transition, never per probe: `app.down`
+            // when it fails past its threshold and `app.up` when it recovers.
+            // The primary opens and resolves the incident from these.
+            if changed && let Some(app_id) = &app_id {
+                if status == Health::Failing && previous != Health::Failing {
+                    self.emit_app_down(app_id, &project_id, &vm_id, failures, reason.as_deref())
+                        .await;
+                } else if status == Health::Passing && previous == Health::Failing {
+                    self.emit_app_up(app_id, &project_id).await;
+                }
+            }
 
             if let Some(deployment_id) = deployment_id
                 && changed
@@ -1325,6 +1432,102 @@ mod tests {
         // The next pass pulls successfully; the failure is not emitted twice.
         reconciler.reconcile_once(Some(&snapshot)).await;
         assert_eq!(store.buffered_events().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_health_transition_buffers_one_app_down_then_one_app_up() {
+        use quoro_engine::FakeEngine;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let healthy = Arc::new(AtomicBool::new(true));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let flag = Arc::clone(&healthy);
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = [0u8; 512];
+                let _ = socket.read(&mut buffer).await;
+                let status = if flag.load(Ordering::Relaxed) {
+                    "200 OK"
+                } else {
+                    "503 Service Unavailable"
+                };
+                let _ = socket
+                    .write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes())
+                    .await;
+            }
+        });
+
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let engine = Arc::new(FakeEngine::new());
+        let (reconciler, _observed) = Reconciler::new(
+            engine,
+            store.clone(),
+            ReconcileConfig {
+                bridge: "quoro0".to_owned(),
+                dns: Vec::new(),
+            },
+            ReconcileOptions {
+                tick: Duration::from_millis(10),
+                stop_timeout: Duration::from_millis(20),
+                backoff_base: Duration::from_millis(1),
+                backoff_max: Duration::from_millis(8),
+                healthy_after: Duration::from_secs(60),
+            },
+        );
+        let mut reconciler = reconciler.with_node_id("nod_test".to_owned());
+        let snapshot = health_snapshot(port);
+        let wait = FIRST_PROBE_DELAY + Duration::from_millis(100);
+        let app_events = |events: &[crate::store::BufferedEvent]| {
+            events
+                .iter()
+                .filter(|event| matches!(event.body["type"].as_str(), Some("app.down" | "app.up")))
+                .map(|event| event.body.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // Healthy from the start: passing, and no app event.
+        let statuses = reconciler.reconcile_once(Some(&snapshot)).await;
+        assert_eq!(statuses[0].health, Health::Unknown);
+        tokio::time::sleep(wait).await;
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        assert!(app_events(&store.buffered_events().await.unwrap()).is_empty());
+
+        // It fails past its threshold: exactly one app.down.
+        healthy.store(false, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(1) + Duration::from_millis(100)).await;
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        let events = app_events(&store.buffered_events().await.unwrap());
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["type"], "app.down");
+        assert_eq!(events[0]["subject"]["id"], "app_1");
+        assert_eq!(events[0]["source"]["node_id"], "nod_test");
+        assert_eq!(events[0]["data"]["app_id"], "app_1");
+        assert_eq!(events[0]["data"]["node_id"], "nod_test");
+        assert_eq!(events[0]["data"]["check"], "health_check");
+        assert_eq!(events[0]["data"]["failures"], 1);
+
+        // Still failing: no second event.
+        tokio::time::sleep(Duration::from_secs(1) + Duration::from_millis(100)).await;
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        assert_eq!(app_events(&store.buffered_events().await.unwrap()).len(), 1);
+
+        // Recovered: one app.up, and never another app.down.
+        healthy.store(true, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(1) + Duration::from_millis(100)).await;
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        let events = app_events(&store.buffered_events().await.unwrap());
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[1]["type"], "app.up");
+        assert_eq!(events[1]["subject"]["id"], "app_1");
+        assert_eq!(events[1]["source"]["node_id"], "nod_test");
+        assert_eq!(events[1]["data"]["app_id"], "app_1");
+        server.abort();
     }
 
     #[tokio::test]
