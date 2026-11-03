@@ -44,16 +44,27 @@ Answer with exactly one action per turn."""
 
 @dataclass(frozen=True)
 class Wake:
-    """The delivery that woke the agent."""
+    """The delivery that woke the agent.
+
+    ``grant_id`` names the incident grant Quoro issued alongside the delivery
+    (``data.wake.grant_id``). It is ``None`` when the delivery carried no wake,
+    which is what a webhook without wake and a test delivery send.
+    """
 
     incident_id: str
     agent_id: str
+    grant_id: str | None = None
     event: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def data(self) -> Mapping[str, Any]:
         data = self.event.get("data")
         return data if isinstance(data, dict) else {}
+
+    @property
+    def grant_note(self) -> str:
+        """Text naming the grant, to append where the incident is named."""
+        return f" under incident grant {self.grant_id}" if self.grant_id else ""
 
 
 @dataclass(frozen=True)
@@ -211,8 +222,8 @@ class DeterministicRestartPolicy:
             return outcome
 
         justification = (
-            f"Incident {wake.incident_id}: app {app_id} reported down ({title}); "
-            "restarting its instances as allowed by the incident grant."
+            f"Incident {wake.incident_id}{wake.grant_note}: app {app_id} reported down "
+            f"({title}); restarting its instances as allowed by the incident grant."
         )
         restart = mcp.call(
             "restart_app",
@@ -251,8 +262,8 @@ class DeterministicRestartPolicy:
 
         if outcome.recovered and self._resolve_incident and "resolve_incident" in tools:
             note = (
-                f"Incident {wake.incident_id}: app {app_id} recovered after restart "
-                "issued by the agent runner."
+                f"Incident {wake.incident_id}{wake.grant_note}: app {app_id} recovered "
+                "after restart issued by the agent runner."
             )
             resolved = mcp.call(
                 "resolve_incident",
@@ -375,7 +386,7 @@ def _incident_prompt(wake: Wake, tools: list[Mapping[str, Any]]) -> str:
         tool.get("name") for tool in tools if isinstance(tool.get("name"), str)
     )
     lines = [
-        f"Incident {wake.incident_id} opened for agent {wake.agent_id}.",
+        f"Incident {wake.incident_id}{wake.grant_note} opened for agent {wake.agent_id}.",
         f"Event payload: {dict(wake.data)}",
         f"Tools available: {', '.join(names) if names else 'none'}",
         "Decide the next action, or say done with a short summary.",

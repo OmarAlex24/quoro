@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -30,6 +31,9 @@ LOGGER = logging.getLogger("agent_runner.server")
 WEBHOOK_PATH = "/webhook"
 SEEN_DELIVERY_LIMIT = 10_000
 ADDRESS_IN_USE_HINT = "another process may already be listening on this address"
+
+AGENT_ID_PATTERN = re.compile(r"^agt_[0-9A-HJKMNP-TV-Z]{26}$")
+GRANT_ID_PATTERN = re.compile(r"^grt_[0-9A-HJKMNP-TV-Z]{26}$")
 
 
 class SeenDeliveries:
@@ -118,9 +122,28 @@ class App:
             LOGGER.warning("incident.opened delivery carries no incident id")
             return HTTPStatus.ACCEPTED, {"status": "ignored", "error": "no_incident_id"}
 
-        wake_config = data.get("wake")
-        wake_config = wake_config if isinstance(wake_config, dict) else {}
-        agent_id = wake_config.get("agent_id") or self.config.default_agent_id
+        wake_payload = data.get("wake")
+        wake_agent_id, grant_id = _wake_ids(wake_payload)
+        if wake_agent_id is not None:
+            agent_id = wake_agent_id
+            LOGGER.info(
+                "incident %s wakes agent %s from data.wake (grant %s)",
+                incident_id,
+                agent_id,
+                grant_id or "not named",
+            )
+        else:
+            if wake_payload is not None:
+                LOGGER.warning(
+                    "incident %s carries a data.wake without a usable agent_id; "
+                    "falling back to default_agent_id",
+                    incident_id,
+                )
+            agent_id = self.config.default_agent_id
+            if agent_id:
+                LOGGER.info(
+                    "incident %s uses default_agent_id %s", incident_id, agent_id
+                )
         if not isinstance(agent_id, str) or not agent_id:
             LOGGER.warning(
                 "incident %s names no agent and no default_agent_id is configured",
@@ -135,9 +158,19 @@ class App:
             )
             return HTTPStatus.ACCEPTED, {"status": "ignored", "error": "unknown_agent"}
 
-        wake = Wake(incident_id=incident_id, agent_id=agent_id, event=event)
+        wake = Wake(
+            incident_id=incident_id,
+            agent_id=agent_id,
+            grant_id=grant_id,
+            event=event,
+        )
         self._spawn(wake)
-        LOGGER.info("accepted delivery for incident %s (agent %s)", incident_id, agent_id)
+        LOGGER.info(
+            "accepted delivery for incident %s (agent %s, grant %s)",
+            incident_id,
+            agent_id,
+            grant_id or "none",
+        )
         return HTTPStatus.ACCEPTED, {"status": "accepted", "incident_id": incident_id}
 
     def _spawn(self, wake: Wake) -> None:
@@ -165,13 +198,14 @@ class App:
         agent = self.config.agents[wake.agent_id]
         subject = wake.event.get("subject") or {}
         target = f"{subject.get('type', 'resource')} {subject.get('id', '')}".strip()
+        grant = f" under incident grant {wake.grant_id}" if wake.grant_id else ""
         client = QuoroClient(
             self._transport_factory(),
             agent.read_key(),
             wake.agent_id,
             justification=(
                 f"Incident {wake.incident_id}: agent woken by incident.opened to "
-                f"handle {target}."
+                f"handle {target}{grant}."
             ),
         )
         session = McpSession(client)
@@ -192,6 +226,28 @@ class App:
                 return True
             running[0].join(0.05)
         return False
+
+
+def _wake_ids(wake: Any) -> tuple[str | None, str | None]:
+    """Validate ``data.wake`` and return its ``(agent_id, grant_id)``.
+
+    Both fields are optional at this layer: a delivery without ``data.wake``
+    (no wake on the webhook, or a test delivery) and a malformed one are left
+    for the caller to handle. A value that is present but does not match the
+    contract's ULID shape is treated as absent.
+    """
+    if not isinstance(wake, dict):
+        return None, None
+
+    agent_id = wake.get("agent_id")
+    if not isinstance(agent_id, str) or not AGENT_ID_PATTERN.match(agent_id):
+        # A grant without the agent it was issued to is not useful either.
+        return None, None
+
+    grant_id = wake.get("grant_id")
+    if not isinstance(grant_id, str) or not GRANT_ID_PATTERN.match(grant_id):
+        grant_id = None
+    return agent_id, grant_id
 
 
 def _header(headers: Mapping[str, str], name: str) -> str | None:

@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from agent_runner.config import AgentConfig, RunnerConfig
+from agent_runner.policy import Outcome, Wake
 from agent_runner.server import create_server
 from agent_runner.signature import sign
 from fake_quoro import ACCESS_TOKEN, AGENT_KEY, FakeQuoro
@@ -24,6 +25,9 @@ from fake_quoro import ACCESS_TOKEN, AGENT_KEY, FakeQuoro
 APP_ID = "app_01JTESTAPP00000000000000"
 INCIDENT_ID = "inc_01JTESTINCIDENT0000000000"
 AGENT_ID = "agt_01JTESTAGENT00000000000000"
+DEFAULT_AGENT_ID = "agt_01JTESTSTANDBY000000000000"
+UNKNOWN_AGENT_ID = "agt_01JXNNVWNAGENT000000000000"
+GRANT_ID = "grt_01JTESTGRANT00000000000000"
 WEBHOOK_SECRET = "test-webhook-secret"
 WEBHOOK_SECRET_ENV = "QUORO_TEST_WEBHOOK_SECRET"
 AGENT_KEY_ENV = "QUORO_TEST_AGENT_KEY"
@@ -41,6 +45,23 @@ def _post(
         return response.status, json.loads(payload) if payload else {}
     finally:
         connection.close()
+
+
+UNWAKED = object()
+
+
+class RecordingPolicy:
+    """A policy that records the wakes it receives and does nothing else."""
+
+    def __init__(self) -> None:
+        self.wakes: list[Wake] = []
+        self._lock = threading.Lock()
+
+    def handle(self, wake: Wake, mcp: Any) -> Outcome:
+        del mcp
+        with self._lock:
+            self.wakes.append(wake)
+        return Outcome(incident_id=wake.incident_id, summary="recorded")
 
 
 class RunnerTestCase(unittest.TestCase):
@@ -63,6 +84,10 @@ class RunnerTestCase(unittest.TestCase):
             http_timeout_s=5.0,
         )
 
+    def make_policy(self) -> Any:
+        """The policy to run; ``None`` builds the configured one."""
+        return None
+
     def setUp(self) -> None:
         os.environ[WEBHOOK_SECRET_ENV] = WEBHOOK_SECRET
         os.environ[AGENT_KEY_ENV] = AGENT_KEY
@@ -71,7 +96,7 @@ class RunnerTestCase(unittest.TestCase):
         self.addCleanup(self.fake.stop)
 
         self.config = self.make_config()
-        self.server = create_server(self.config)
+        self.server = create_server(self.config, policy=self.make_policy())
         self.port = int(self.server.server_address[1])
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -88,9 +113,29 @@ class RunnerTestCase(unittest.TestCase):
         *,
         event_type: str = "incident.opened",
         agent_id: str | None = AGENT_ID,
+        grant_id: str | None = None,
+        wake: Any = UNWAKED,
         incident_id: str = INCIDENT_ID,
     ) -> dict[str, Any]:
-        wake = {"agent_id": agent_id} if agent_id is not None else {}
+        """Build an ``incident.opened`` delivery.
+
+        ``wake`` overrides the whole ``data.wake`` value: pass ``None`` for a
+        delivery without wake (the webhook had none, or it is a test delivery)
+        or any other value for a malformed one.
+        """
+        if wake is UNWAKED:
+            wake = {"agent_id": agent_id} if agent_id is not None else {}
+            if grant_id is not None:
+                wake["grant_id"] = grant_id
+
+        data: dict[str, Any] = {
+            "incident_id": incident_id,
+            "title": "health check failed",
+            "trigger_event_id": "evt_01JTESTEVENT000000000000",
+            "subject": {"type": "app", "id": APP_ID},
+        }
+        if wake is not None:
+            data["wake"] = wake
         return {
             "schema_version": 1,
             "id": "evt_01JTESTEVENT000000000000",
@@ -100,13 +145,7 @@ class RunnerTestCase(unittest.TestCase):
             "source": "primary",
             "subject": {"type": "app", "id": APP_ID},
             "incident_id": incident_id,
-            "data": {
-                "incident_id": incident_id,
-                "title": "health check failed",
-                "trigger_event_id": "evt_01JTESTEVENT000000000000",
-                "subject": {"type": "app", "id": APP_ID},
-                "wake": wake,
-            },
+            "data": data,
         }
 
     def deliver(
@@ -215,12 +254,11 @@ class IncidentFlowTests(RunnerTestCase):
         self.assertEqual(self.fake.calls, [])
 
     def test_an_unknown_agent_is_ignored(self) -> None:
-        status, payload = self.deliver(
-            self.event(agent_id="agt_01JUNKNOWNAGENT0000000000")
-        )
+        status, payload = self.deliver(self.event(agent_id=UNKNOWN_AGENT_ID))
 
         self.assertEqual(status, 202)
         self.assertEqual(payload["status"], "ignored")
+        self.assertEqual(payload["error"], "unknown_agent")
         self.assertTrue(self.server.app.wait_idle(timeout=5.0))
         self.assertEqual(self.fake.mints, [])
         self.assertEqual(self.fake.calls, [])
@@ -230,6 +268,14 @@ class IncidentFlowTests(RunnerTestCase):
 
         self.assertEqual(status, 202)
         self.assertEqual(payload["error"], "no_agent")
+        self.assertEqual(self.fake.calls, [])
+
+    def test_a_delivery_without_wake_is_ignored_without_a_default(self) -> None:
+        status, payload = self.deliver(self.event(wake=None))
+
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["error"], "no_agent")
+        self.assertTrue(self.server.app.wait_idle(timeout=5.0))
         self.assertEqual(self.fake.calls, [])
 
 
@@ -246,6 +292,84 @@ class DefaultAgentTests(RunnerTestCase):
         self.assertEqual(payload["status"], "accepted")
         self.assertTrue(self.server.app.wait_idle(timeout=5.0))
         self.assertEqual(len(self.fake.calls_named("restart_app")), 1)
+
+    def test_a_malformed_agent_id_falls_back_to_the_default(self) -> None:
+        status, payload = self.deliver(self.event(agent_id="agt_not-a-ulid"))
+
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["status"], "accepted")
+        self.assertTrue(self.server.app.wait_idle(timeout=5.0))
+        self.assertEqual(len(self.fake.calls_named("restart_app")), 1)
+
+
+class WakeSelectionTests(RunnerTestCase):
+    """``data.wake`` chooses the agent; only a valid one is honoured."""
+
+    def make_config(self) -> RunnerConfig:
+        return replace(
+            super().make_config(),
+            default_agent_id=DEFAULT_AGENT_ID,
+            agents={
+                AGENT_ID: AgentConfig(agent_id=AGENT_ID, key_env=AGENT_KEY_ENV),
+                DEFAULT_AGENT_ID: AgentConfig(
+                    agent_id=DEFAULT_AGENT_ID, key_env=AGENT_KEY_ENV
+                ),
+            },
+        )
+
+    def make_policy(self) -> Any:
+        self.policy = RecordingPolicy()
+        return self.policy
+
+    def _wake_after(self, event: dict[str, Any]) -> Wake:
+        status, payload = self.deliver(event)
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["status"], "accepted")
+        self.assertTrue(self.server.app.wait_idle(timeout=5.0))
+        self.assertTrue(self.policy.wakes, "the policy never received a wake")
+        return self.policy.wakes[-1]
+
+    def test_wake_names_the_agent_and_its_grant(self) -> None:
+        wake = self._wake_after(self.event(agent_id=AGENT_ID, grant_id=GRANT_ID))
+
+        self.assertEqual(wake.agent_id, AGENT_ID)
+        self.assertEqual(wake.grant_id, GRANT_ID)
+
+    def test_a_malformed_grant_id_is_dropped(self) -> None:
+        wake = self._wake_after(self.event(agent_id=AGENT_ID, grant_id="grt_nope"))
+
+        self.assertEqual(wake.agent_id, AGENT_ID)
+        self.assertIsNone(wake.grant_id)
+
+    def test_no_wake_uses_the_default_agent(self) -> None:
+        wake = self._wake_after(self.event(wake=None))
+
+        self.assertEqual(wake.agent_id, DEFAULT_AGENT_ID)
+        self.assertIsNone(wake.grant_id)
+
+    def test_a_wake_that_is_not_a_dict_uses_the_default_agent(self) -> None:
+        wake = self._wake_after(self.event(wake="agt_01JTESTAGENT00000000000000"))
+
+        self.assertEqual(wake.agent_id, DEFAULT_AGENT_ID)
+
+    def test_a_wake_without_a_valid_pattern_uses_the_default_agent(self) -> None:
+        wake = self._wake_after(
+            self.event(wake={"agent_id": "agt_not-a-ulid", "grant_id": GRANT_ID})
+        )
+
+        self.assertEqual(wake.agent_id, DEFAULT_AGENT_ID)
+        self.assertIsNone(
+            wake.grant_id, "a grant id without the agent it was issued to was kept"
+        )
+
+    def test_a_wake_naming_an_agent_without_a_key_is_unknown(self) -> None:
+        status, payload = self.deliver(self.event(agent_id=UNKNOWN_AGENT_ID))
+
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["error"], "unknown_agent")
+        self.assertTrue(self.server.app.wait_idle(timeout=5.0))
+        self.assertEqual(self.policy.wakes, [])
+        self.assertEqual(self.fake.mints, [])
 
 
 class RefusalTests(RunnerTestCase):

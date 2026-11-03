@@ -23,7 +23,10 @@ tls_fingerprint = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef012345
 webhook_secret_file = "/etc/agent-runner/webhook-secret"
 # webhook_secret_env = "QUORO_WEBHOOK_SECRET"
 
-# Used when a delivery names no agent in data.wake.agent_id. The agent must also
+# A delivery from a webhook with wake names its agent and the incident grant it
+# acts under in data.wake. The runner uses that agent when it is a well-formed
+# agt_ id and otherwise falls back to this one, which is also what a delivery
+# with no wake (a webhook without wake, or a test delivery) gets. The agent must
 # have an [agents] entry below; the runner never has a key it was not configured
 # with.
 default_agent_id = "agt_01JAAAAAAAAAAAAAAAAAAAAAAA"
