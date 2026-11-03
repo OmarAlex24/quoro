@@ -1,0 +1,28 @@
+[package]
+name = "quoro-providers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# HTTPS client for the Cloudflare API. Native roots read the host's CA store
+# (webpki-roots is CDLA-Permissive-2.0, outside ADR 0080); no-provider leaves
+# the crypto provider to rustls with `ring`.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+tokio = { version = "1", default-features = false, features = ["time"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+# Wipes API tokens from memory when they are dropped.
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+# A local mock of the Cloudflare API for the client tests.
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }

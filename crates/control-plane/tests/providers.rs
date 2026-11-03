@@ -440,3 +440,52 @@ async fn rotate_replaces_the_secret_and_delete_removes_the_row() {
         .unwrap();
     assert_eq!(common::problem(res).await.0, 404);
 }
+
+#[tokio::test]
+async fn delete_is_refused_while_the_provider_is_referenced() {
+    let server = common::start().await;
+    let owner = server.owner().await;
+    let provider = insert_provider(
+        &server,
+        &owner,
+        &json!({
+            "kind": "object_store",
+            "name": "Audit copy",
+            "config": { "bucket": "b" },
+            "secret": SECRET,
+        }),
+    )
+    .await;
+    let id = provider["id"].as_str().unwrap().to_string();
+    let pool = server.state.store.pool();
+    sqlx::query(
+        "INSERT INTO audit_exports (id, target, updated_at, provider_id)
+         VALUES ('aex_1', 's3://b/audit', '2026-11-03T00:00:00Z', ?)",
+    )
+    .bind(&id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let delete = || async {
+        owner
+            .delete(server.url(&format!("/api/v1/providers/{id}")))
+            .send()
+            .await
+            .unwrap()
+    };
+    let (status, code, _) = common::problem(delete().await).await;
+    assert_eq!((status, code.as_str()), (409, "conflict"));
+    let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM providers WHERE id = ?")
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+
+    sqlx::query("UPDATE audit_exports SET provider_id = NULL")
+        .execute(pool)
+        .await
+        .unwrap();
+    assert_eq!(delete().await.status(), 204);
+}

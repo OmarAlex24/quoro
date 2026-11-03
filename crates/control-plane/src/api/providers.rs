@@ -586,7 +586,8 @@ pub async fn get_provider(
 /// # Errors
 ///
 /// `forbidden` without `provider:manage`, `not_found` for an unknown or
-/// malformed id, or a database error.
+/// malformed id, `conflict` while the provider is referenced, or a database
+/// error.
 pub async fn delete_provider(
     State(state): State<AppState>,
     identity: Identity,
@@ -638,9 +639,22 @@ async fn delete_provider_tx(
     if taken.is_none() {
         return Err(ApiError::not_found("provider"));
     }
-    // TODO(contract question): the contract's 409 "still referenced by a
-    // domain, tunnel or the off-site audit copy" cannot be checked yet; those
-    // tables do not exist in the M2 schema.
+    // ADR 0095: a provider still referenced by a domain, a node's tunnel
+    // mapping or the off-site audit copy is refused (the foreign keys refuse
+    // it too, but with a storage error instead of `conflict`).
+    let (referenced,): (i64,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM domains WHERE provider_id = ?1)
+             OR EXISTS (SELECT 1 FROM node_tunnels WHERE provider_id = ?1)
+             OR EXISTS (SELECT 1 FROM audit_exports WHERE provider_id = ?1)",
+    )
+    .bind(provider_id)
+    .fetch_one(&mut *w.tx)
+    .await?;
+    if referenced != 0 {
+        return Err(ApiError::conflict(
+            "provider is still referenced by a domain, a node tunnel or the audit copy",
+        ));
+    }
     sqlx::query("DELETE FROM providers WHERE id = ?")
         .bind(provider_id)
         .execute(&mut *w.tx)
@@ -820,16 +834,29 @@ pub async fn provider_secret(
     state: &AppState,
     provider_id: &str,
 ) -> Result<(ProviderRecord, Secret), ApiError> {
+    provider_secret_in(&state.store, &state.data_key, provider_id).await
+}
+
+/// [`provider_secret`] from a store and the data-encryption key alone, for
+/// in-process callers that do not build a full [`AppState`].
+///
+/// # Errors
+///
+/// As [`provider_secret`].
+pub async fn provider_secret_in(
+    store: &crate::store::Store,
+    data_key: &crate::crypto::DataKey,
+    provider_id: &str,
+) -> Result<(ProviderRecord, Secret), ApiError> {
     let row =
         sqlx::query("SELECT id, kind, name, config_json, secret_enc FROM providers WHERE id = ?")
             .bind(provider_id)
-            .fetch_optional(state.store.pool())
+            .fetch_optional(store.pool())
             .await?
             .ok_or_else(|| ApiError::not_found("provider"))?;
     let record = record_from_row(&row)?;
     let secret_enc: Vec<u8> = row.try_get("secret_enc")?;
-    let secret = state
-        .data_key
+    let secret = data_key
         .decrypt(SECRET_CONTEXT, provider_id, &secret_enc)
         .map_err(|error| ApiError::internal(&error))?;
     Ok((record, secret))
