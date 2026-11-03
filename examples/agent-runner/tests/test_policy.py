@@ -3,15 +3,21 @@
 
 from __future__ import annotations
 
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Mapping
 
+from agent_runner import __version__
 from agent_runner.policy import (
+    USER_AGENT,
     DeterministicRestartPolicy,
     LlmPolicy,
     Outcome,
+    UrlCheck,
     Wake,
     app_recovered,
+    check_url,
 )
 from agent_runner.quoro import ToolResult
 from fake_backend import FakeBackend
@@ -90,6 +96,60 @@ class AppRecoveredTests(unittest.TestCase):
         self.assertFalse(app_recovered({"instances": []}))
         self.assertFalse(app_recovered({"instances": [{}]}))
         self.assertTrue(app_recovered({"instances": [{"observed_status": "running"}]}))
+
+
+class EdgeHandler(BaseHTTPRequestHandler):
+    """An edge that refuses the default urllib agent, as some CDNs do."""
+
+    seen: list[str] = []
+
+    def do_GET(self) -> None:  # noqa: N802
+        agent = self.headers.get("User-Agent", "")
+        EdgeHandler.seen.append(agent)
+        if self.path == "/down":
+            status = 503
+        elif agent.startswith("Python-urllib"):
+            status = 403
+        else:
+            status = 200
+        self.send_response(status)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, format: str, *args: Any) -> None:
+        del format, args
+
+
+class CheckUrlTests(unittest.TestCase):
+    def setUp(self) -> None:
+        EdgeHandler.seen = []
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), EdgeHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def test_sends_the_runner_user_agent(self) -> None:
+        seen = check_url(f"{self.base}/", 5.0)
+
+        self.assertEqual(seen, UrlCheck(ok=True, detail="HTTP 200"))
+        self.assertEqual(EdgeHandler.seen, [f"quoro-agent-runner/{__version__}"])
+        self.assertEqual(USER_AGENT, f"quoro-agent-runner/{__version__}")
+
+    def test_reports_the_status_it_saw(self) -> None:
+        seen = check_url(f"{self.base}/down", 5.0)
+
+        self.assertEqual(seen, UrlCheck(ok=False, detail="HTTP 503"))
+
+    def test_reports_a_url_that_does_not_answer(self) -> None:
+        port = self.server.server_address[1]
+        self.server.shutdown()
+        self.server.server_close()
+
+        seen = check_url(f"http://127.0.0.1:{port}/", 2.0)
+
+        self.assertFalse(seen.ok)
+        self.assertTrue(seen.detail.startswith("no answer"), seen.detail)
 
 
 class LlmPolicyTests(unittest.TestCase):
@@ -192,6 +252,24 @@ class DeterministicPolicyTests(unittest.TestCase):
             call for call in session.calls if call["tool"] == "resolve_incident"
         )
         self.assertIn(GRANT_ID, resolve["arguments"]["justification"])
+
+    def test_a_refused_check_url_names_the_status_in_the_outcome(self) -> None:
+        session = FakeSession()
+        policy = DeterministicRestartPolicy(
+            check_url="https://app.example/",
+            resolve_incident=True,
+            poll_interval_s=0.0,
+            poll_attempts=1,
+            health_check=lambda url: UrlCheck(ok=False, detail="HTTP 403"),
+        )
+
+        outcome = policy.handle(_wake(), session)  # type: ignore[arg-type]
+
+        self.assertFalse(outcome.recovered)
+        self.assertIn("answered HTTP 403", outcome.summary)
+        self.assertNotIn(
+            "resolve_incident", [call["tool"] for call in session.calls]
+        )
 
     def test_no_grant_id_leaves_the_text_unchanged(self) -> None:
         session = FakeSession()

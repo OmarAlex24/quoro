@@ -121,7 +121,7 @@ deliveries for one incident never run concurrently.
 | `webhook_secret_env` | required* | Environment variable holding the webhook secret. Set exactly one of the two. |
 | `default_agent_id` | none | Agent used when a delivery carries no usable `data.wake.agent_id` (absent, not an `agt_` id, or not an object). Must have an `[agents]` entry. |
 | `policy` | `deterministic` | `deterministic` or `llm`. |
-| `check_url` | none | After a restart, `GET` this URL and require 200 before calling the app recovered. Uses system trust. |
+| `check_url` | none | After a restart, `GET` this URL and require 200 before calling the app recovered. Uses system trust and sends `User-Agent: quoro-agent-runner/<version>`; the outcome names the status the URL answered. |
 | `resolve_incident` | `false` | Resolve the incident after a successful recovery, when the scope and tool are available. |
 | `poll_attempts` | `12` | How many times to read the app while waiting for recovery. |
 | `poll_interval_s` | `5.0` | Seconds between recovery reads. |
