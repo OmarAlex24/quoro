@@ -5,23 +5,61 @@
 //! The snapshot is complete: every `vms` row placed on the node, ordered by
 //! id. Image digests come from the [`DigestResolver`] and are cached for the
 //! process lifetime, so a tag that moves never silently changes a running VM.
+//!
+//! An app VM carries what only the app knows: its container `port`, its
+//! decrypted `env` (never logged), the parsed `health_check` and the
+//! `deployment_id` that produced it. Routes are built from the app's `domains`
+//! rows, pointing at the app's running VMs on this node.
 
+use crate::app_env;
+use crate::crypto::DataKey;
+use crate::deploy;
 use crate::{DigestResolver, NodeNetwork, store::Store};
-use quoro_proto::wire::{DesiredStatus, Spec, SpecNetwork, SpecVm};
-use sqlx::Row;
+use quoro_proto::wire::{DesiredStatus, HealthCheck, Spec, SpecNetwork, SpecRoute, SpecVm};
+use sqlx::sqlite::SqliteConnection;
+use sqlx::{Row, SqlitePool};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 /// The resolved digests, keyed by image reference, shared by every session.
 pub type DigestCache = Arc<Mutex<HashMap<String, String>>>;
 
+/// An app VM that an image did not resolve for in this build, with the
+/// resolver's error (which never holds an environment value).
+#[derive(Clone, Debug)]
+pub struct HeldBack {
+    /// The VM left out of the snapshot.
+    pub vm_id: String,
+    /// The app it belongs to; `None` for a standalone VM.
+    pub app_id: Option<String>,
+    /// Why the resolver failed.
+    pub error: String,
+}
+
+/// One built snapshot and the VMs it had to leave out.
+#[derive(Clone, Debug)]
+pub struct BuiltSpec {
+    /// The snapshot to send.
+    pub spec: Spec,
+    /// App VMs held back while their image does not resolve.
+    pub held_back: Vec<HeldBack>,
+}
+
+/// What an app row contributes to its VMs and routes.
+struct AppInfo {
+    port: u16,
+    health_check: Option<HealthCheck>,
+    current_deployment_id: Option<String>,
+}
+
 /// Builds the full snapshot for `node_id`.
 ///
 /// # Errors
 ///
-/// A database error, or an image reference of a VM the node may already run
-/// that the resolver could not resolve. On an error the caller keeps the
-/// snapshot it already sent and retries.
+/// A database error, an undecryptable `app_env` value, an invalid app
+/// `health_check`, or an image reference of a VM the node may already run that
+/// the resolver could not resolve. On an error the caller keeps the snapshot it
+/// already sent and retries.
 ///
 /// A VM that is still `creating` and was not in `previous` (the snapshot this
 /// session sent last) is left out while its image does not resolve: the node
@@ -33,8 +71,9 @@ pub async fn build_spec(
     network: &NodeNetwork,
     resolver: &dyn DigestResolver,
     cache: &DigestCache,
+    data_key: &DataKey,
     previous: Option<&Spec>,
-) -> Result<Spec, String> {
+) -> Result<BuiltSpec, String> {
     let rows = sqlx::query(
         "SELECT id, project_id, app_id, name, image, vcpus, memory_mb, disk_gb, \
          desired_status, observed_status, restart_generation FROM vms WHERE node_id = ? ORDER BY id",
@@ -44,9 +83,22 @@ pub async fn build_spec(
     .await
     .map_err(|e| format!("cannot read the desired state of {node_id}: {e}"))?;
 
+    let apps = load_apps(store.pool()).await?;
+    let deployments = deploy::deployment_ids_for_node(store, node_id)
+        .await
+        .map_err(|e| format!("cannot link the VMs to their deployments: {e}"))?;
+    let mut conn = store
+        .pool()
+        .acquire()
+        .await
+        .map_err(|e| format!("cannot open a connection: {e}"))?;
+    let mut env_cache: HashMap<String, BTreeMap<String, String>> = HashMap::new();
+
     let mut vms = Vec::with_capacity(rows.len());
+    let mut held_back = Vec::new();
     for row in &rows {
         let vm_id: String = row.try_get("id").map_err(|e| e.to_string())?;
+        let app_id: Option<String> = row.try_get("app_id").map_err(|e| e.to_string())?;
         let image: String = row.try_get("image").map_err(|e| e.to_string())?;
         let image_digest = match resolve_digest(resolver, cache, &image).await {
             Ok(digest) => digest,
@@ -60,6 +112,11 @@ pub async fn build_spec(
                     Some(digest) => digest,
                     None if observed == "creating" => {
                         tracing::warn!(vm_id, image, error = %e, "cannot resolve the image; the VM waits for it");
+                        held_back.push(HeldBack {
+                            vm_id,
+                            app_id,
+                            error: e,
+                        });
                         continue;
                     }
                     None => return Err(format!("cannot resolve {image} for {vm_id}: {e}")),
@@ -73,20 +130,37 @@ pub async fn build_spec(
         let restart_generation: i64 = row
             .try_get("restart_generation")
             .map_err(|e| e.to_string())?;
+
+        let (port, health_check, env, deployment_id) = match &app_id {
+            Some(app_id) => {
+                let app = apps
+                    .get(app_id)
+                    .ok_or_else(|| format!("app {app_id} of {vm_id} is missing"))?;
+                let env = app_env_of(&mut conn, data_key, app_id, &mut env_cache).await?;
+                (
+                    Some(app.port),
+                    app.health_check.clone(),
+                    env,
+                    deployments.get(&vm_id).cloned(),
+                )
+            }
+            None => (None, None, BTreeMap::new(), None),
+        };
+
         vms.push(SpecVm {
             vm_id,
             project_id: row.try_get("project_id").map_err(|e| e.to_string())?,
-            app_id: row.try_get("app_id").map_err(|e| e.to_string())?,
-            deployment_id: None,
+            app_id,
+            deployment_id,
             name: row.try_get("name").map_err(|e| e.to_string())?,
             image,
             image_digest,
             vcpus: u32::try_from(vcpus).map_err(|e| format!("vms.vcpus: {e}"))?,
             memory_mb: u32::try_from(memory_mb).map_err(|e| format!("vms.memory_mb: {e}"))?,
             disk_gb: u32::try_from(disk_gb).map_err(|e| format!("vms.disk_gb: {e}"))?,
-            port: None,
-            env: BTreeMap::new(),
-            health_check: None,
+            port,
+            env,
+            health_check,
             desired_status: if desired_status == "running" {
                 DesiredStatus::Running
             } else {
@@ -99,16 +173,131 @@ pub async fn build_spec(
             volumes: Vec::new(),
         });
     }
+    drop(conn);
 
-    Ok(Spec {
-        vms,
-        // No domains exist before the app workstream; routes are empty in M2.
-        routes: Vec::new(),
-        network: SpecNetwork {
-            subnet: network.subnet.clone(),
-            gateway: network.gateway.clone(),
+    let routes = build_routes(store.pool(), &apps, &vms).await?;
+
+    Ok(BuiltSpec {
+        spec: Spec {
+            vms,
+            routes,
+            network: SpecNetwork {
+                subnet: network.subnet.clone(),
+                gateway: network.gateway.clone(),
+            },
         },
+        held_back,
     })
+}
+
+/// Every app row, keyed by app id.
+async fn load_apps(pool: &SqlitePool) -> Result<HashMap<String, AppInfo>, String> {
+    let rows = sqlx::query("SELECT id, port, health_check, current_deployment_id FROM apps")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("cannot read the apps: {e}"))?;
+    let mut apps = HashMap::with_capacity(rows.len());
+    for row in &rows {
+        let id: String = row.try_get("id").map_err(|e| e.to_string())?;
+        let port: i64 = row.try_get("port").map_err(|e| e.to_string())?;
+        let health_json: String = row.try_get("health_check").map_err(|e| e.to_string())?;
+        let health_check: HealthCheck = serde_json::from_str(&health_json)
+            .map_err(|e| format!("apps.health_check of {id} is invalid: {e}"))?;
+        let current_deployment_id: Option<String> = row
+            .try_get("current_deployment_id")
+            .map_err(|e| e.to_string())?;
+        apps.insert(
+            id,
+            AppInfo {
+                port: u16::try_from(port).map_err(|e| format!("apps.port: {e}"))?,
+                health_check: Some(health_check),
+                current_deployment_id,
+            },
+        );
+    }
+    Ok(apps)
+}
+
+/// The decrypted environment of `app_id`, cached per build. A value that does
+/// not decrypt fails the whole build; the error names the variable, never the
+/// value.
+async fn app_env_of(
+    conn: &mut SqliteConnection,
+    data_key: &DataKey,
+    app_id: &str,
+    cache: &mut HashMap<String, BTreeMap<String, String>>,
+) -> Result<BTreeMap<String, String>, String> {
+    if let Some(env) = cache.get(app_id) {
+        return Ok(env.clone());
+    }
+    let loaded = app_env::load_plain(conn, data_key, app_id)
+        .await
+        .map_err(|e| {
+            tracing::warn!(app_id, error = %e, "cannot read the app environment");
+            e.to_string()
+        })?;
+    let env: BTreeMap<String, String> = loaded
+        .into_iter()
+        .map(|(name, value)| (name, value.expose().to_string()))
+        .collect();
+    cache.insert(app_id.to_string(), env.clone());
+    Ok(env)
+}
+
+/// `spec.routes`: every domain of an app with at least one running VM on this
+/// node, sorted by hostname so the snapshot is deterministic.
+async fn build_routes(
+    pool: &SqlitePool,
+    apps: &HashMap<String, AppInfo>,
+    vms: &[SpecVm],
+) -> Result<Vec<SpecRoute>, String> {
+    let mut by_app: HashMap<&str, Vec<&SpecVm>> = HashMap::new();
+    for vm in vms {
+        if let Some(app_id) = &vm.app_id {
+            by_app.entry(app_id.as_str()).or_default().push(vm);
+        }
+    }
+
+    let rows = sqlx::query("SELECT hostname, app_id, tls_mode FROM domains ORDER BY hostname")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("cannot read the domains: {e}"))?;
+    let mut routes = Vec::new();
+    for row in &rows {
+        let hostname: String = row.try_get("hostname").map_err(|e| e.to_string())?;
+        let app_id: String = row.try_get("app_id").map_err(|e| e.to_string())?;
+        let tls_mode: String = row.try_get("tls_mode").map_err(|e| e.to_string())?;
+        let Some(app_vms) = by_app.get(app_id.as_str()) else {
+            continue;
+        };
+        let app = apps
+            .get(&app_id)
+            .ok_or_else(|| format!("app {app_id} of domain {hostname} is missing"))?;
+        // The VM of the app's current deployment first, then the rest in the
+        // snapshot's order.
+        let current = app.current_deployment_id.as_deref();
+        let mut ordered: Vec<&SpecVm> = app_vms
+            .iter()
+            .copied()
+            .filter(|vm| vm.desired_status == DesiredStatus::Running)
+            .collect();
+        if let Some(current) = current {
+            ordered.sort_by_key(|vm| vm.deployment_id.as_deref() != Some(current));
+        }
+        let vm_ids: Vec<String> = ordered.iter().map(|vm| vm.vm_id.clone()).collect();
+        if vm_ids.is_empty() {
+            continue;
+        }
+        routes.push(SpecRoute {
+            hostname,
+            app_id,
+            vm_ids,
+            port: app.port,
+            tls_mode,
+        });
+    }
+    routes.sort_by(|a, b| a.hostname.cmp(&b.hostname));
+    Ok(routes)
 }
 
 /// Resolves `reference`, or returns the cached digest. A VM's image must not
@@ -207,9 +396,19 @@ mod tests {
             gateway: "10.42.1.1".to_string(),
         };
         let cache = DigestCache::default();
-        let spec = build_spec(&store, &node_id, &network, &ReferenceAsDigest, &cache, None)
-            .await
-            .unwrap();
+        let key = DataKey::ephemeral();
+        let built = build_spec(
+            &store,
+            &node_id,
+            &network,
+            &ReferenceAsDigest,
+            &cache,
+            &key,
+            None,
+        )
+        .await
+        .unwrap();
+        let spec = built.spec;
         let mut ids: Vec<&str> = spec.vms.iter().map(|vm| vm.vm_id.as_str()).collect();
         ids.sort_unstable();
         let mut expected = vec![a.as_str(), b.as_str()];
@@ -261,20 +460,24 @@ mod tests {
             subnet: "10.42.1.0/24".to_string(),
             gateway: "10.42.1.1".to_string(),
         };
+        let key = DataKey::ephemeral();
 
         // A new VM waits; the other one is sent.
-        let spec = build_spec(
+        let built = build_spec(
             &store,
             &node_id,
             &network,
             &FailsOnB,
             &DigestCache::default(),
+            &key,
             None,
         )
         .await
         .unwrap();
-        let ids: Vec<&str> = spec.vms.iter().map(|vm| vm.vm_id.as_str()).collect();
+        let ids: Vec<&str> = built.spec.vms.iter().map(|vm| vm.vm_id.as_str()).collect();
         assert_eq!(ids, [a.as_str()]);
+        assert_eq!(built.held_back.len(), 1);
+        assert_eq!(built.held_back[0].vm_id, b);
 
         // Once the node reported it, leaving it out would delete it: refuse.
         sqlx::query("UPDATE vms SET observed_status = 'running' WHERE id = ?")
@@ -289,6 +492,7 @@ mod tests {
                 &network,
                 &FailsOnB,
                 &DigestCache::default(),
+                &key,
                 None
             )
             .await
@@ -296,22 +500,28 @@ mod tests {
         );
 
         // A digest this session already sent is kept.
-        let mut previous = spec.clone();
+        let mut previous = built.spec.clone();
         let mut sent = previous.vms[0].clone();
         sent.vm_id.clone_from(&b);
         sent.image_digest = "sha256:earlier".to_string();
         previous.vms.push(sent);
-        let spec = build_spec(
+        let built = build_spec(
             &store,
             &node_id,
             &network,
             &FailsOnB,
             &DigestCache::default(),
+            &key,
             Some(&previous),
         )
         .await
         .unwrap();
-        let kept = spec.vms.iter().find(|vm| vm.vm_id == b).expect("b is sent");
+        let kept = built
+            .spec
+            .vms
+            .iter()
+            .find(|vm| vm.vm_id == b)
+            .expect("b is sent");
         assert_eq!(kept.image_digest, "sha256:earlier");
     }
 }

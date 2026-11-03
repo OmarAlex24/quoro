@@ -29,7 +29,7 @@ use utoipa::{IntoParams, ToSchema};
 const CREATE_VM: &str = "POST /api/v1/vms";
 
 /// Columns of [`Vm`], in the order [`vm_from_row`] expects them.
-const VM_COLUMNS: &str = "id, project_id, app_id, node_id, name, vcpus, memory_mb, disk_gb, image, \
+pub(crate) const VM_COLUMNS: &str = "id, project_id, app_id, node_id, name, vcpus, memory_mb, disk_gb, image, \
      desired_status, observed_status, ip, restart_generation, restart_count, last_exit_code, \
      created_at, updated_at";
 
@@ -226,7 +226,7 @@ impl ListVmsQuery {
 }
 
 /// Rows of `vms` as [`Vm`].
-fn vm_from_row(row: &SqliteRow) -> Result<Vm, ApiError> {
+pub(crate) fn vm_from_row(row: &SqliteRow) -> Result<Vm, ApiError> {
     let desired: String = row.get("desired_status");
     let observed: String = row.get("observed_status");
     Ok(Vm {

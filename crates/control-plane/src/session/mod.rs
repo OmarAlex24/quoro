@@ -14,6 +14,8 @@ pub mod desired;
 
 use crate::AppState;
 use crate::changelog::{self, Actor, ActorType, Op};
+use crate::crypto::DataKey;
+use crate::deploy;
 use crate::driver::{self, ObservedStatus as DriverObservedStatus};
 use crate::error::{ApiError, Code};
 use crate::events::{self, StoredEvent};
@@ -29,11 +31,96 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::time::{Duration, Instant};
 
 /// How often a failed desired-state build is retried on its own.
 const SNAPSHOT_RETRY: Duration = Duration::from_secs(30);
+
+/// Consecutive builds in which an app VM's image may fail to resolve before
+/// its deployment is failed (section 5.11; the retry budget of D-0014).
+const MAX_DIGEST_FAILURES: u32 = 3;
+
+/// Concurrent log streams one node session may hold (section 5.15).
+const MAX_STREAMS: usize = 32;
+
+/// The outbox sender of one session.
+type SessionSender = mpsc::UnboundedSender<String>;
+/// The pending commands and streams of one session.
+type SessionPending = Arc<Mutex<Pending>>;
+
+/// Why a command or a stream through a node session could not be used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HubError {
+    /// The node has no live session.
+    NotConnected,
+    /// The node did not answer in time.
+    Timeout,
+    /// The session ended while the command or stream was pending.
+    Closed,
+    /// The session already holds [`MAX_STREAMS`] open streams.
+    StreamLimit,
+}
+
+impl std::fmt::Display for HubError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotConnected => write!(f, "the node has no live session"),
+            Self::Timeout => write!(f, "the node did not answer in time"),
+            Self::Closed => write!(f, "the node session ended"),
+            Self::StreamLimit => write!(f, "the node session holds too many open streams"),
+        }
+    }
+}
+
+impl std::error::Error for HubError {}
+
+/// One event of a [`NodeStream`] (sections 5.7 and 5.8).
+#[derive(Clone, Debug)]
+pub enum StreamEvent {
+    /// A batch of log lines, oldest first.
+    Lines(Vec<wire::LogLine>),
+    /// The stream ended. `reason` is `completed`, `error` or `cancelled`.
+    End { reason: String, message: String },
+}
+
+/// One open stream of a session: where its events go and the last `seq` seen.
+struct StreamSlot {
+    tx: mpsc::UnboundedSender<StreamEvent>,
+    last_seq: u64,
+}
+
+/// The commands and streams waiting on one live session (sections 5.7-5.9).
+#[derive(Default)]
+struct Pending {
+    /// `command` msg id to the answer's channel.
+    commands: HashMap<String, oneshot::Sender<Result<quoro_proto::CommandResult, HubError>>>,
+    /// `stream_id` to its event channel and sequence cursor.
+    streams: HashMap<String, StreamSlot>,
+    /// `stream_open` msg id to the stream it opened, so a failed open ends it.
+    opens: HashMap<String, String>,
+}
+
+impl Pending {
+    /// Whether a new stream would exceed [`MAX_STREAMS`] (section 5.15).
+    fn at_stream_limit(&self) -> bool {
+        self.streams.len() >= MAX_STREAMS
+    }
+
+    /// Fails every waiter because the session ended.
+    fn fail_all(&mut self) {
+        for (_, tx) in self.commands.drain() {
+            let _ = tx.send(Err(HubError::Closed));
+        }
+        for (_, slot) in self.streams.drain() {
+            let _ = slot.tx.send(StreamEvent::End {
+                reason: "error".to_string(),
+                message: "the node session ended".to_string(),
+            });
+        }
+        self.opens.clear();
+    }
+}
 
 /// A fresh `msg_` id (`wire::msg_id` takes 16 random bytes).
 fn new_msg_id() -> String {
@@ -79,6 +166,8 @@ struct SessionHandle {
     closed: watch::Sender<bool>,
     /// Wakes the task when the node's desired state may have changed.
     changed: Arc<Notify>,
+    /// Commands and streams waiting on this session.
+    pending: Arc<Mutex<Pending>>,
 }
 
 struct HubInner {
@@ -87,6 +176,7 @@ struct HubInner {
     keys: Arc<ClusterKeys>,
     cluster_id: String,
     resolver: Arc<dyn DigestResolver>,
+    data_key: Arc<DataKey>,
     sessions: Mutex<HashMap<String, SessionHandle>>,
     digests: desired::DigestCache,
     /// `vm_` id to node, kept for VMs whose row is already deleted.
@@ -105,6 +195,7 @@ impl NodeHub {
         keys: Arc<ClusterKeys>,
         cluster_id: String,
         resolver: Arc<dyn DigestResolver>,
+        data_key: Arc<DataKey>,
     ) -> Self {
         Self(Arc::new(HubInner {
             store,
@@ -112,6 +203,7 @@ impl NodeHub {
             keys,
             cluster_id,
             resolver,
+            data_key,
             sessions: Mutex::new(HashMap::new()),
             digests: desired::DigestCache::default(),
             vm_nodes: Mutex::new(HashMap::new()),
@@ -135,6 +227,117 @@ impl NodeHub {
         let inner = Arc::clone(&self.0);
         let vm_id = vm_id.to_string();
         tokio::spawn(async move { inner.vm_changed(&vm_id).await });
+    }
+
+    /// Sends one `command` to `node_id` and waits for its `command_result`
+    /// (section 5.17).
+    ///
+    /// # Errors
+    ///
+    /// [`HubError::NotConnected`] without a live session, [`HubError::Timeout`]
+    /// when no answer arrives within `timeout`, or [`HubError::Closed`] when
+    /// the session ends first.
+    pub async fn command(
+        &self,
+        node_id: &str,
+        kind: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<quoro_proto::CommandResult, HubError> {
+        let (_generation, tx, pending) = self.session_for(node_id)?;
+        let id = new_msg_id();
+        let (sender, receiver) = oneshot::channel();
+        pending
+            .lock()
+            .expect("pending lock")
+            .commands
+            .insert(id.clone(), sender);
+        let text = ControlMessage::Command(wire::Command {
+            kind: kind.to_string(),
+            params,
+        })
+        .to_frame(&id, None)
+        .to_text();
+        if tx.send(text).is_err() {
+            pending.lock().expect("pending lock").commands.remove(&id);
+            return Err(HubError::Closed);
+        }
+        match tokio::time::timeout(timeout, receiver).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(HubError::Closed),
+            Err(_) => {
+                pending.lock().expect("pending lock").commands.remove(&id);
+                Err(HubError::Timeout)
+            }
+        }
+    }
+
+    /// Opens a log stream on `node_id` (section 5.15).
+    ///
+    /// # Errors
+    ///
+    /// [`HubError::NotConnected`] without a live session, [`HubError::Closed`]
+    /// when it ends at once, or [`HubError::StreamLimit`] when the session
+    /// already holds [`MAX_STREAMS`] streams.
+    pub fn open_stream(
+        &self,
+        node_id: &str,
+        kind: &str,
+        params: Value,
+    ) -> Result<NodeStream, HubError> {
+        let (generation, tx, pending) = self.session_for(node_id)?;
+        let stream_id = new_msg_id();
+        let open_id = new_msg_id();
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        {
+            let mut pending = pending.lock().expect("pending lock");
+            if pending.at_stream_limit() {
+                return Err(HubError::StreamLimit);
+            }
+            pending.streams.insert(
+                stream_id.clone(),
+                StreamSlot {
+                    tx: events_tx,
+                    last_seq: 0,
+                },
+            );
+            pending.opens.insert(open_id.clone(), stream_id.clone());
+        }
+        let text = ControlMessage::StreamOpen(wire::StreamOpen {
+            stream_id: stream_id.clone(),
+            kind: kind.to_string(),
+            params,
+        })
+        .to_frame(&open_id, None)
+        .to_text();
+        if tx.send(text).is_err() {
+            let mut pending = pending.lock().expect("pending lock");
+            pending.streams.remove(&stream_id);
+            pending.opens.remove(&open_id);
+            return Err(HubError::Closed);
+        }
+        Ok(NodeStream {
+            inner: Arc::clone(&self.0),
+            node_id: node_id.to_string(),
+            generation,
+            stream_id,
+            rx: events_rx,
+            ended: false,
+        })
+    }
+
+    /// The generation, outbox and pending maps of `node_id`'s live session.
+    fn session_for(&self, node_id: &str) -> Result<(u64, SessionSender, SessionPending), HubError> {
+        let sessions = self.0.sessions.lock().expect("session lock");
+        sessions
+            .get(node_id)
+            .map_or(Err(HubError::NotConnected), |handle| {
+                Ok((
+                    handle.generation,
+                    handle.tx.clone(),
+                    Arc::clone(&handle.pending),
+                ))
+            })
     }
 
     /// Marks every node the database still calls `connected` as
@@ -163,8 +366,9 @@ impl NodeHub {
     /// Ends every live session, for a clean shutdown.
     pub fn shutdown(&self) {
         let mut sessions = self.0.sessions.lock().expect("session lock");
-        for handle in sessions.drain().map(|(_, handle)| handle) {
+        for (_, handle) in sessions.drain() {
             let _ = handle.closed.send(true);
+            handle.pending.lock().expect("pending lock").fail_all();
         }
     }
 
@@ -183,6 +387,7 @@ impl NodeHub {
             // Section 3.1: one session per node; the older one closes and must
             // not mark the node disconnected.
             let _ = old.closed.send(true);
+            old.pending.lock().expect("pending lock").fail_all();
         }
         let generation = self.0.generation.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = mpsc::unbounded_channel();
@@ -195,19 +400,23 @@ impl NodeHub {
                 tx,
                 closed,
                 changed: Arc::clone(&changed),
+                pending: Arc::new(Mutex::new(Pending::default())),
             },
         );
         (generation, rx, closed_rx, changed)
     }
 
-    /// Removes the session if it is still the current generation.
-    fn detach(&self, node_id: &str, generation: u64) {
+    /// Removes the session if it is still the current generation, returning
+    /// its pending commands and streams so the caller can fail them.
+    fn detach(&self, node_id: &str, generation: u64) -> Option<Arc<Mutex<Pending>>> {
         let mut sessions = self.0.sessions.lock().expect("session lock");
         if sessions
             .get(node_id)
             .is_some_and(|handle| handle.generation == generation)
         {
-            sessions.remove(node_id);
+            sessions.remove(node_id).map(|handle| handle.pending)
+        } else {
+            None
         }
     }
 
@@ -275,6 +484,183 @@ impl HubInner {
             if let Some(changed) = changed {
                 changed.notify_one();
             }
+        }
+    }
+
+    /// The pending maps of `node_id`'s session, when it is this generation.
+    fn pending_of(&self, node_id: &str, generation: u64) -> Option<Arc<Mutex<Pending>>> {
+        let sessions = self.sessions.lock().expect("session lock");
+        sessions
+            .get(node_id)
+            .filter(|handle| handle.generation == generation)
+            .map(|handle| Arc::clone(&handle.pending))
+    }
+
+    /// Routes one `command_result` to its waiter, or ends a stream whose
+    /// `stream_open` failed (sections 5.9 and 5.15).
+    fn resolve_command_result(
+        &self,
+        node_id: &str,
+        generation: u64,
+        re: &str,
+        result: quoro_proto::CommandResult,
+    ) {
+        let Some(pending) = self.pending_of(node_id, generation) else {
+            return;
+        };
+        let mut pending = pending.lock().expect("pending lock");
+        if let Some(sender) = pending.commands.remove(re) {
+            let _ = sender.send(Ok(result));
+            return;
+        }
+        let Some(stream_id) = pending.opens.remove(re) else {
+            return;
+        };
+        if result.status == quoro_proto::CommandStatus::Error
+            && let Some(slot) = pending.streams.remove(&stream_id)
+        {
+            let message = result
+                .error
+                .map(|error| error.message)
+                .or(result.detail)
+                .unwrap_or_else(|| "the node could not open the stream".to_string());
+            let _ = slot.tx.send(StreamEvent::End {
+                reason: "error".to_string(),
+                message,
+            });
+        }
+    }
+
+    /// Routes one `stream_data` to its stream (section 5.7). Data for an
+    /// unknown stream id is dropped, as is reserved byte data.
+    fn resolve_stream_data(&self, node_id: &str, generation: u64, data: wire::StreamData) {
+        let Some(pending) = self.pending_of(node_id, generation) else {
+            return;
+        };
+        let mut pending = pending.lock().expect("pending lock");
+        let Some(slot) = pending.streams.get_mut(&data.stream_id) else {
+            return;
+        };
+        if data.seq <= slot.last_seq {
+            tracing::warn!(
+                stream_id = %data.stream_id,
+                seq = data.seq,
+                last_seq = slot.last_seq,
+                "stream_data is out of order"
+            );
+        }
+        slot.last_seq = data.seq;
+        if let Some(lines) = data.lines
+            && !lines.is_empty()
+        {
+            let _ = slot.tx.send(StreamEvent::Lines(lines));
+        }
+    }
+
+    /// Routes one `stream_end` to its stream (section 5.8).
+    fn resolve_stream_end(&self, node_id: &str, generation: u64, end: wire::StreamEnd) {
+        let Some(pending) = self.pending_of(node_id, generation) else {
+            return;
+        };
+        let mut pending = pending.lock().expect("pending lock");
+        if let Some(slot) = pending.streams.remove(&end.stream_id) {
+            pending
+                .opens
+                .retain(|_, stream_id| stream_id != &end.stream_id);
+            let _ = slot.tx.send(StreamEvent::End {
+                reason: stream_reason(end.reason).to_string(),
+                message: end.message.unwrap_or_default(),
+            });
+        }
+    }
+
+    /// Unregisters a dropped stream and tells the node to stop producing it
+    /// (section 5.16).
+    fn close_stream(&self, node_id: &str, generation: u64, stream_id: &str) {
+        let Some(pending) = self.pending_of(node_id, generation) else {
+            return;
+        };
+        let removed = {
+            let mut pending = pending.lock().expect("pending lock");
+            pending
+                .opens
+                .retain(|_, open_stream| open_stream != stream_id);
+            pending.streams.remove(stream_id).is_some()
+        };
+        if removed {
+            let text = ControlMessage::StreamClose(wire::StreamClose {
+                stream_id: stream_id.to_string(),
+            })
+            .to_frame(&new_msg_id(), None)
+            .to_text();
+            self.send_text(node_id, generation, text);
+        }
+    }
+
+    /// Queues one text frame to `generation` of the node's session.
+    fn send_text(&self, node_id: &str, generation: u64, text: String) -> bool {
+        let tx = {
+            let sessions = self.sessions.lock().expect("session lock");
+            sessions
+                .get(node_id)
+                .filter(|handle| handle.generation == generation)
+                .map(|handle| handle.tx.clone())
+        };
+        match tx {
+            Some(tx) => tx.send(text).is_ok(),
+            None => false,
+        }
+    }
+}
+
+/// The wire form of a [`wire::StreamEndReason`].
+fn stream_reason(reason: wire::StreamEndReason) -> &'static str {
+    match reason {
+        wire::StreamEndReason::Completed => "completed",
+        wire::StreamEndReason::Error => "error",
+        wire::StreamEndReason::Cancelled => "cancelled",
+    }
+}
+
+/// A log stream opened through a node session (sections 5.7, 5.8 and 5.16).
+///
+/// Dropping a stream that has not ended sends `stream_close` for it, so the
+/// node stops producing as soon as the HTTP consumer of the stream is gone.
+pub struct NodeStream {
+    inner: Arc<HubInner>,
+    node_id: String,
+    generation: u64,
+    stream_id: String,
+    rx: mpsc::UnboundedReceiver<StreamEvent>,
+    ended: bool,
+}
+
+impl NodeStream {
+    /// Waits for the next event, or `None` once the stream ended.
+    pub async fn next(&mut self) -> Option<StreamEvent> {
+        if self.ended {
+            return None;
+        }
+        match self.rx.recv().await {
+            Some(event) => {
+                if matches!(event, StreamEvent::End { .. }) {
+                    self.ended = true;
+                }
+                Some(event)
+            }
+            None => {
+                self.ended = true;
+                None
+            }
+        }
+    }
+}
+
+impl Drop for NodeStream {
+    fn drop(&mut self) {
+        if !self.ended {
+            self.inner
+                .close_stream(&self.node_id, self.generation, &self.stream_id);
         }
     }
 }
@@ -381,6 +767,8 @@ struct Session {
     last_spec: Option<wire::Spec>,
     notified_deleted: HashSet<String>,
     retry_pending: bool,
+    /// Consecutive builds in which an app VM's image did not resolve.
+    digest_failures: HashMap<String, u32>,
 }
 
 async fn run_session(hub: NodeHub, node_id: String, mut socket: WebSocket) {
@@ -397,6 +785,7 @@ async fn run_session(hub: NodeHub, node_id: String, mut socket: WebSocket) {
         last_spec: None,
         notified_deleted: HashSet::new(),
         retry_pending: false,
+        digest_failures: HashMap::new(),
     };
     let mut superseded = false;
     let mut reason = "session_closed";
@@ -489,7 +878,9 @@ async fn run_session(hub: NodeHub, node_id: String, mut socket: WebSocket) {
         }
     }
 
-    session.hub.detach(&session.node_id, generation);
+    if let Some(pending) = session.hub.detach(&session.node_id, generation) {
+        pending.lock().expect("pending lock").fail_all();
+    }
     if session.connected
         && !superseded
         && let Err(e) = disconnect_node(&session.hub, &session.node_id, reason).await
@@ -627,17 +1018,58 @@ impl Session {
                         false,
                         Some(&raw.id),
                     ));
-                } else if let Err(e) = insert_node_event(&self.hub, &self.node_id, &event).await {
-                    tracing::warn!(%e, event_id = %event.id, "cannot store a node event");
+                } else {
+                    match insert_node_event(&self.hub, &self.node_id, &event).await {
+                        Ok(()) => {
+                            if event.kind == "deployment.failed" {
+                                match deploy::on_node_deployment_failed(
+                                    &self.hub.0.store,
+                                    &self.node_id,
+                                    &event.data,
+                                )
+                                .await
+                                {
+                                    Ok(vms) => {
+                                        for vm_id in vms {
+                                            self.hub.vm_changed(&vm_id);
+                                        }
+                                    }
+                                    Err(e) => tracing::warn!(
+                                        node_id = %self.node_id,
+                                        code = %e.code.as_str(),
+                                        "cannot fail the deployment"
+                                    ),
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(%e, event_id = %event.id, "cannot store a node event");
+                        }
+                    }
                 }
             }
             NodeMessage::CommandResult(result) => {
-                tracing::debug!(
-                    node_id = %self.node_id,
-                    status = ?result.status,
-                    detail = ?result.detail,
-                    "command_result"
-                );
+                if let Some(re) = raw.re.as_deref() {
+                    self.hub
+                        .0
+                        .resolve_command_result(&self.node_id, self.generation, re, result);
+                } else {
+                    tracing::debug!(
+                        node_id = %self.node_id,
+                        status = ?result.status,
+                        "command_result without re"
+                    );
+                }
+            }
+            NodeMessage::StreamData(data) => {
+                self.hub
+                    .0
+                    .resolve_stream_data(&self.node_id, self.generation, data);
+            }
+            NodeMessage::StreamEnd(end) => {
+                self.hub
+                    .0
+                    .resolve_stream_end(&self.node_id, self.generation, end);
             }
             NodeMessage::Error(error) => {
                 tracing::warn!(
@@ -653,11 +1085,8 @@ impl Session {
                 false,
                 Some(&raw.id),
             )),
-            // No leases, log follow or streams exist in M2.
-            NodeMessage::LeaseRenew(_)
-            | NodeMessage::LogAck(_)
-            | NodeMessage::StreamData(_)
-            | NodeMessage::StreamEnd(_) => {}
+            // No leases or change-log follow exist in M2.
+            NodeMessage::LeaseRenew(_) | NodeMessage::LogAck(_) => {}
         }
         false
     }
@@ -666,15 +1095,18 @@ impl Session {
     /// `floor` is the node's stored revision on the first send (section 4.2),
     /// `0` afterwards.
     async fn refresh(&mut self, floor: u64, force: bool) -> Result<(), String> {
-        let spec = desired::build_spec(
+        let built = desired::build_spec(
             &self.hub.0.store,
             &self.node_id,
             &self.hub.0.config.node_network,
             self.hub.0.resolver.as_ref(),
             &self.hub.0.digests,
+            &self.hub.0.data_key,
             self.last_spec.as_ref(),
         )
         .await?;
+        self.note_holdbacks(&built.held_back).await;
+        let spec = built.spec;
         if !self.hub.is_current(&self.node_id, self.generation) {
             return Ok(());
         }
@@ -713,9 +1145,55 @@ impl Session {
             // send its own snapshot and must not receive this one.
             return Ok(());
         }
+        let app_vms: Vec<(String, String)> = spec
+            .vms
+            .iter()
+            .filter(|vm| vm.app_id.is_some())
+            .map(|vm| (vm.vm_id.clone(), vm.image_digest.clone()))
+            .collect();
+        if !app_vms.is_empty()
+            && let Err(e) = deploy::on_spec_sent(&self.hub.0.store, &self.node_id, &app_vms).await
+        {
+            tracing::warn!(
+                node_id = %self.node_id,
+                code = %e.code.as_str(),
+                "cannot record the sent snapshot"
+            );
+        }
         self.desired_rev = rev;
         self.last_spec = Some(spec);
         Ok(())
+    }
+
+    /// Counts the builds in which each app VM's image did not resolve and
+    /// fails the deployment after [`MAX_DIGEST_FAILURES`] in a row.
+    async fn note_holdbacks(&mut self, held_back: &[desired::HeldBack]) {
+        let current: HashSet<&str> = held_back.iter().map(|held| held.vm_id.as_str()).collect();
+        self.digest_failures
+            .retain(|vm_id, _| current.contains(vm_id.as_str()));
+        for held in held_back {
+            if held.app_id.is_none() {
+                continue;
+            }
+            let count = self.digest_failures.entry(held.vm_id.clone()).or_insert(0);
+            *count += 1;
+            if *count < MAX_DIGEST_FAILURES {
+                continue;
+            }
+            match deploy::on_image_unresolvable(&self.hub.0.store, &held.vm_id, &held.error).await {
+                Ok(vms) => {
+                    for vm_id in vms {
+                        self.hub.vm_changed(&vm_id);
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    vm_id = %held.vm_id,
+                    code = %e.code.as_str(),
+                    "cannot fail the unresolvable deployment"
+                ),
+            }
+            self.digest_failures.remove(&held.vm_id);
+        }
     }
 }
 
@@ -890,13 +1368,14 @@ async fn apply_status_report(
     notified_deleted: &mut HashSet<String>,
 ) -> Result<(), String> {
     for vm in &report.vms {
-        let owner: Option<(String,)> = sqlx::query_as("SELECT node_id FROM vms WHERE id = ?")
-            .bind(&vm.vm_id)
-            .fetch_optional(hub.0.store.pool())
-            .await
-            .map_err(|e| format!("cannot read vms.node_id: {e}"))?;
+        let owner: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT node_id, app_id FROM vms WHERE id = ?")
+                .bind(&vm.vm_id)
+                .fetch_optional(hub.0.store.pool())
+                .await
+                .map_err(|e| format!("cannot read vms.node_id: {e}"))?;
         match owner {
-            Some((owner,)) if owner == node_id => {
+            Some((owner, app_id)) if owner == node_id => {
                 let observation = driver::Observation {
                     status: driver_observed(vm.observed_status),
                     ip: vm.ip.clone(),
@@ -906,6 +1385,20 @@ async fn apply_status_report(
                 driver::report_observed(&hub.0.store, node_id, &vm.vm_id, &observation)
                     .await
                     .map_err(|e| format!("{e:?}"))?;
+                if app_id.is_some() {
+                    match deploy::on_vm_observed(&hub.0.store, node_id, vm).await {
+                        Ok(vms) => {
+                            for changed in vms {
+                                hub.vm_changed(&changed);
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            vm_id = %vm.vm_id,
+                            code = %e.code.as_str(),
+                            "cannot apply the observed VM to its deployment"
+                        ),
+                    }
+                }
             }
             Some(_) => {}
             None => {
@@ -1021,5 +1514,19 @@ mod tests {
         ] {
             assert_eq!(driver_observed(proto), driver);
         }
+    }
+
+    #[test]
+    fn a_session_holds_at_most_32_streams() {
+        let mut pending = Pending::default();
+        for index in 0..MAX_STREAMS {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            pending
+                .streams
+                .insert(format!("msg_{index}"), StreamSlot { tx, last_seq: 0 });
+        }
+        assert!(pending.at_stream_limit());
+        pending.streams.remove("msg_0");
+        assert!(!pending.at_stream_limit());
     }
 }

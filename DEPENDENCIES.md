@@ -23,6 +23,7 @@ Rules:
 | `tokio` | `crates/engine` | `io-util`, `sync`, `time` (no default features) | The engine trait is async; `io-util` gives the `AsyncRead`/`AsyncWrite` bounds the contract's console stream uses and the fake's in-memory console pipe, `sync` the fake's event and output channels, `time` the fake's injected stop delays |
 | `tokio` | `crates/node-agent` | `sync`, `time`, `macros` (no default features) | The lease agent uses channels for the session and the stop flag (`sync`), the paused monotonic clock every lease timestamp is taken from (`time`), and `tokio::select!` in the agent loop (`macros`) |
 | `futures-core` | `crates/engine` | no default features | `EventStream` and `LineStream` in `docs/contracts/engine-trait.md` section 2 are `futures_core::Stream` trait objects |
+| `futures-util` | `crates/control-plane` | `std` (no default features) | The live-log SSE body is built from `stream::unfold` over the node session (ADR 0057); already in the tree through axum |
 | `serde` | `crates/types`, `crates/control-plane` | `derive`, `std` | Ids, scopes, request and response bodies are (de)serialized as JSON |
 | `getrandom` | `crates/types`, `crates/control-plane` | no default features | The random part of ULID ids, session secrets, setup tokens and password salts come straight from the OS generator; no userspace RNG crate is needed |
 | `axum` | `crates/control-plane` | `http1`, `json`, `query`, `tokio` | The HTTP API server and router of D-0056 |
@@ -97,7 +98,7 @@ Rules:
 | --- | --- | --- | --- |
 | `tokio` | `crates/engine` | `macros`, `rt`, `test-util`, `io-util`, `sync`, `time` | `#[tokio::test]` needs the macro and a runtime; `test-util` pauses the clock so the injected stop sleeps are deterministic |
 | `tokio` | `crates/node-agent` | `macros`, `rt`, `test-util`, `sync`, `time` | `#[tokio::test]` needs the macro and a current-thread runtime; `test-util` pauses the clock so lease timing and the injected stop delays are exact. The engine's `async fn` futures are not `Send`, so the tests drive the agent and the in-process primary in one task instead of spawning |
-| `tokio` | `crates/control-plane` | `macros`, `rt-multi-thread`, `net` | `#[tokio::test]` and a TCP listener for the HTTP integration tests |
+| `tokio` | `crates/control-plane` | `macros`, `rt-multi-thread`, `net`, `io-util` | `#[tokio::test]` and a TCP listener for the HTTP integration tests; `io-util` reads and writes the raw HTTP/1.0 connection the live-log SSE test holds open |
 | `axum` | `crates/control-plane` | as above | The test harness serves the router with `axum::serve` on an ephemeral port |
 | `reqwest` | `crates/control-plane` | `json`, `cookies` (no TLS) | Integration tests drive the API over real HTTP with a cookie jar, as the panel does |
 | `serde_norway` | `crates/control-plane` | no default features | Parses the frozen `openapi.yaml` in the D-0048 diff test; the maintained `serde_yaml` fork that utoipa itself offers |
