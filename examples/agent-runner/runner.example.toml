@@ -36,7 +36,8 @@ default_agent_id = "agt_01JAAAAAAAAAAAAAAAAAAAAAAA"
 policy = "deterministic"
 
 # Optional: after a restart, GET this URL and require 200 before calling the app
-# recovered. It uses the system trust store, not the Quoro TLS options.
+# recovered. It uses the system trust store, not the Quoro TLS options, and
+# sends User-Agent quoro-agent-runner/<version>; some edges refuse Python's default.
 check_url = "https://app.example/healthz"
 
 # Optional: resolve the incident after a successful check. Needs the

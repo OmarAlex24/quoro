@@ -18,10 +18,15 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol
 
+from . import __version__
 from .config import RunnerConfig
 from .quoro import MUTATING_TOOLS, McpSession
 
 LOGGER = logging.getLogger("agent_runner.policy")
+
+USER_AGENT = f"quoro-agent-runner/{__version__}"
+"""The ``User-Agent`` of the ``check_url`` request. Some edges refuse the
+default ``Python-urllib`` agent, so the runner names itself."""
 
 DEFAULT_MAX_STEPS = 8
 
@@ -86,6 +91,34 @@ class Outcome:
     recovered: bool | None = None
     resolved: bool = False
     summary: str = ""
+
+
+@dataclass(frozen=True)
+class UrlCheck:
+    """What a ``check_url`` request saw: whether it answered 200, and how."""
+
+    ok: bool
+    detail: str
+
+
+def check_url(url: str, timeout_s: float) -> UrlCheck:
+    """``GET`` ``url`` with system trust and the runner's ``User-Agent``.
+
+    Only 200 is healthy. ``detail`` names the status the URL answered
+    (``HTTP 403``) or why no answer arrived, so a refusal by an edge in front
+    of the app is told apart from the app being down.
+    """
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_s) as response:
+            status = response.status
+    except urllib.error.HTTPError as error:
+        with error:
+            status = error.code
+    except (urllib.error.URLError, OSError, ValueError) as error:
+        reason = getattr(error, "reason", None) or error
+        return UrlCheck(ok=False, detail=f"no answer ({reason})")
+    return UrlCheck(ok=status == 200, detail=f"HTTP {status}")
 
 
 class Policy(Protocol):
@@ -167,7 +200,7 @@ class DeterministicRestartPolicy:
         poll_interval_s: float = 5.0,
         health_timeout_s: float = 10.0,
         sleep: Callable[[float], None] = time.sleep,
-        health_check: Callable[[str], bool] | None = None,
+        health_check: Callable[[str], UrlCheck] | None = None,
     ) -> None:
         self._check_url = check_url
         self._resolve_incident = resolve_incident
@@ -175,16 +208,10 @@ class DeterministicRestartPolicy:
         self._poll_interval_s = max(0.0, poll_interval_s)
         self._health_timeout_s = health_timeout_s
         self._sleep = sleep
-        self._health_check = health_check or self._http_ok
+        self._health_check = health_check or self._http_check
 
-    def _http_ok(self, url: str) -> bool:
-        """GET ``url`` with system trust and require status 200."""
-        try:
-            with urllib.request.urlopen(url, timeout=self._health_timeout_s) as response:
-                return response.status == 200
-        except (urllib.error.URLError, OSError, ValueError) as error:
-            LOGGER.warning("health check of %s failed: %s", url, error)
-            return False
+    def _http_check(self, url: str) -> UrlCheck:
+        return check_url(url, self._health_timeout_s)
 
     def handle(self, wake: Wake, mcp: McpSession) -> Outcome:
         outcome = Outcome(incident_id=wake.incident_id)
@@ -251,14 +278,20 @@ class DeterministicRestartPolicy:
             return outcome
 
         outcome.recovered = self._wait_for_recovery(app_id, mcp, outcome)
+        url_note = ""
         if outcome.recovered and self._check_url:
-            if not self._health_check(self._check_url):
+            seen = self._health_check(self._check_url)
+            url_note = f"; check_url {self._check_url} answered {seen.detail}"
+            if seen.ok:
+                LOGGER.info("check_url %s answered %s", self._check_url, seen.detail)
+            else:
+                LOGGER.warning("check_url %s answered %s", self._check_url, seen.detail)
                 outcome.recovered = False
 
         if outcome.recovered:
-            outcome.summary = f"app {app_id} recovered after restart"
+            outcome.summary = f"app {app_id} recovered after restart{url_note}"
         else:
-            outcome.summary = f"app {app_id} did not report healthy after restart"
+            outcome.summary = f"app {app_id} did not report healthy after restart{url_note}"
 
         if outcome.recovered and self._resolve_incident and "resolve_incident" in tools:
             note = (
