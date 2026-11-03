@@ -4,7 +4,11 @@
 //! directory, `listen = "127.0.0.1:0"`, the port read from the start log, then
 //! setup, login, the primary's own node agent, one project and one VM through
 //! its whole lifecycle on the fake engine, and finally a second machine that
-//! joins with a join token, runs `quoro node` and runs a VM of its own. Nothing here is mocked, so a failure points at the
+//! joins with a join token, runs `quoro node` and runs a VM of its own. Along
+//! the way a webhook points at a receiver the test runs, so the binary's own
+//! dispatcher and test delivery must reach it: the test process installs a
+//! rustls crypto provider for its client, but the spawned binary has to
+//! install its own. Nothing here is mocked, so a failure points at the
 //! binary, the TLS material or the control plane's handlers rather than at a
 //! harness.
 
@@ -12,8 +16,10 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt as _, BufReader};
+use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
+use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep, timeout};
 
 const EMAIL: &str = "owner@example.test";
@@ -139,6 +145,88 @@ async fn wait_for_observed(client: &reqwest::Client, base: &str, vm_id: &str, wa
     }
 }
 
+/// One request a webhook receiver got: lowercased header names, and the body.
+struct Received {
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl Received {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// A plain-HTTP webhook receiver on loopback. It answers every request with
+/// 200 and hands it to the returned channel. Webhook URLs accept plain HTTP
+/// only for `localhost`, so the caller builds the URL from the port.
+async fn start_receiver() -> (u16, mpsc::UnboundedReceiver<Received>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the webhook receiver");
+    let port = listener
+        .local_addr()
+        .expect("the receiver's address")
+        .port();
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                if let Some(received) = read_request(stream).await {
+                    let _ = tx.send(received);
+                }
+            });
+        }
+    });
+    (port, rx)
+}
+
+/// Reads one HTTP/1.1 request with a `Content-Length` body and answers 200.
+async fn read_request(mut stream: TcpStream) -> Option<Received> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    let head_end = loop {
+        if let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+            break end;
+        }
+        let read = stream.read(&mut chunk).await.ok()?;
+        if read == 0 {
+            return None;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    };
+    let head = String::from_utf8_lossy(&buffer[..head_end]).into_owned();
+    let headers: Vec<(String, String)> = head
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .map(|(key, value)| (key.trim().to_ascii_lowercase(), value.trim().to_string()))
+        .collect();
+    let length = headers
+        .iter()
+        .find(|(key, _)| key == "content-length")
+        .and_then(|(_, value)| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = buffer.split_off(head_end + 4);
+    while body.len() < length {
+        let read = stream.read(&mut chunk).await.ok()?;
+        if read == 0 {
+            return None;
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+    stream
+        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+        .await
+        .ok()?;
+    let _ = stream.shutdown().await;
+    Some(Received { headers, body })
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_binary_serves_the_whole_lifecycle_over_https() {
     // reqwest's no-provider TLS feature leaves the provider to the process;
@@ -215,8 +303,18 @@ async fn the_binary_serves_the_whole_lifecycle_over_https() {
         )
     });
 
-    // Keep draining stderr so a chatty server never blocks on a full pipe.
-    tokio::spawn(async move { while matches!(lines.next_line().await, Ok(Some(_))) {} });
+    // Keep draining stderr so a chatty server never blocks on a full pipe,
+    // and keep the lines: a background task that panics only says so there.
+    let server_log = std::sync::Arc::new(std::sync::Mutex::new(log));
+    let drained = tokio::spawn({
+        let server_log = std::sync::Arc::clone(&server_log);
+        async move {
+            while let Ok(Some(line)) = lines.next_line().await {
+                server_log.lock().expect("the log lock").push(line);
+            }
+        }
+    });
+    let server_log_text = || server_log.lock().expect("the log lock").join("\n");
 
     let base = format!("https://127.0.0.1:{port}");
 
@@ -271,6 +369,23 @@ async fn the_binary_serves_the_whole_lifecycle_over_https() {
     let me = json(response, 200).await;
     assert_eq!(me["type"], "user", "login answers the identity: {me}");
 
+    // ---- a webhook pointed at a receiver this test runs ------------------
+    let (receiver_port, mut deliveries) = start_receiver().await;
+    let response = client
+        .post(format!("{base}/api/v1/webhooks"))
+        .json(&json!({
+            "name": "smoke receiver",
+            "url": format!("http://localhost:{receiver_port}/hook"),
+            "event_types": ["vm.started"],
+            // An empty selector matches nothing (openapi.yaml, Selector).
+            "selector": { "all": true },
+        }))
+        .send()
+        .await
+        .expect("POST /api/v1/webhooks");
+    let webhook = json(response, 201).await;
+    let webhook_id = webhook["id"].as_str().expect("the webhook id").to_string();
+
     // ---- the primary's own node agent enrolled over loopback -------------
     let node = wait_for_node(&client, &base, "test-node").await;
     assert_eq!(node["cp_status"], "primary", "the node: {node}");
@@ -320,6 +435,49 @@ async fn the_binary_serves_the_whole_lifecycle_over_https() {
         "the node reports the address it handed out: {running}"
     );
 
+    // ---- the dispatcher delivers the vm.started event --------------------
+    // The binary's own HTTP client sends it, so this fails if `quoro serve`
+    // never installed a crypto provider for its rustls client.
+    let Ok(delivered) = timeout(LIFECYCLE_TIMEOUT, deliveries.recv()).await else {
+        let attempts = client
+            .get(format!("{base}/api/v1/webhooks/{webhook_id}/deliveries"))
+            .send()
+            .await
+            .expect("GET the webhook's deliveries");
+        let attempts = json(attempts, 200).await;
+        let events = client
+            .get(format!("{base}/api/v1/events"))
+            .send()
+            .await
+            .expect("GET /api/v1/events");
+        let events = json(events, 200).await;
+        panic!(
+            "the dispatcher delivered no webhook within the timeout\n\
+             deliveries: {attempts}\nevents: {events}\nserver log:\n{}",
+            server_log_text()
+        );
+    };
+    let delivered = delivered.expect("the receiver is still running");
+    assert_eq!(
+        delivered.header("quoro-event-type"),
+        Some("vm.started"),
+        "the delivered event type: {:?}",
+        delivered.headers
+    );
+    assert!(
+        delivered
+            .header("quoro-signature")
+            .is_some_and(|signature| signature.starts_with("t=") && signature.contains(",v1=")),
+        "the delivery is signed: {:?}",
+        delivered.headers
+    );
+    let envelope: Value =
+        serde_json::from_slice(&delivered.body).expect("the delivery body is JSON");
+    assert_eq!(
+        envelope["data"]["vm_id"], vm_id,
+        "the event names the VM: {envelope}"
+    );
+
     // ---- stop, start, delete ---------------------------------------------
     let response = client
         .post(format!("{base}/api/v1/vms/{vm_id}/stop"))
@@ -329,6 +487,36 @@ async fn the_binary_serves_the_whole_lifecycle_over_https() {
     let vm = json(response, 202).await;
     assert_eq!(vm["desired_status"], "stopped", "the VM: {vm}");
     wait_for_observed(&client, &base, &vm_id, "stopped").await;
+
+    // ---- a test delivery goes out from the request handler --------------
+    // It resends the newest event, now `vm.stopped`, which this webhook's
+    // filter kept the dispatcher from delivering.
+    let response = client
+        .post(format!("{base}/api/v1/webhooks/{webhook_id}/test"))
+        .send()
+        .await
+        .expect("POST the test delivery");
+    assert_eq!(
+        response.status().as_u16(),
+        202,
+        "the test delivery failed; server log:\n{}",
+        server_log_text()
+    );
+    let attempt = json(response, 202).await;
+    assert_eq!(
+        attempt["status"], "delivered",
+        "the test delivery reached the receiver: {attempt}"
+    );
+    let tested = timeout(LIFECYCLE_TIMEOUT, deliveries.recv())
+        .await
+        .expect("the receiver saw no test delivery")
+        .expect("the receiver is still running");
+    assert_eq!(
+        tested.header("quoro-delivery-id"),
+        attempt["id"].as_str(),
+        "the receiver got the recorded test delivery: {:?}",
+        tested.headers
+    );
 
     let response = client
         .post(format!("{base}/api/v1/vms/{vm_id}/start"))
@@ -463,4 +651,7 @@ async fn the_binary_serves_the_whole_lifecycle_over_https() {
     let _ = agent.wait().await;
     server.kill().await.expect("stop the server");
     let _ = server.wait().await;
+    drained.await.expect("the stderr drain task");
+    let log = server_log_text();
+    assert!(!log.contains("panicked"), "the server panicked:\n{log}");
 }

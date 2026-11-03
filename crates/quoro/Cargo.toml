@@ -98,12 +98,14 @@ rustls = { version = "0.23", default-features = false, features = [
 ] }
 # The test reads the JSON bodies of the API.
 serde_json = { version = "1", default-features = false, features = ["std"] }
-# The test spawns the binary (`process`), reads its stderr (`io-util`) and
-# polls with a timeout (`time`).
+# The test spawns the binary (`process`), reads its stderr (`io-util`), polls
+# with a timeout (`time`) and runs a webhook receiver (`net`, `sync`).
 tokio = { version = "1", features = [
     "process",
     "macros",
     "rt-multi-thread",
     "time",
     "io-util",
+    "net",
+    "sync",
 ] }
