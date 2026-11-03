@@ -487,7 +487,9 @@ impl Session {
             ControlMessage::Ping => {
                 write_message(sink, NodeMessage::Pong, Some(&raw.id)).await?;
             }
-            ControlMessage::Pong | ControlMessage::LogEntries(_) => {
+            ControlMessage::Pong
+            | ControlMessage::LogEntries(_)
+            | ControlMessage::DnsChallengeResult(_) => {
                 // Change-log follow is a follow-up.
             }
             ControlMessage::StreamClose(close) => {

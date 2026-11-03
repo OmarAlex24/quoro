@@ -1217,6 +1217,7 @@ mod tests {
                         subnet: "127.0.0.0/8".to_owned(),
                         gateway: "127.0.0.2".to_owned(),
                     },
+                    ingress: None,
                 },
                 signature: String::new(),
             },

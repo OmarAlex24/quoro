@@ -33,6 +33,7 @@ fn desired_frame(rev: u64, key: &SigningKey, id: &str) -> String {
                 subnet: SUBNET.to_owned(),
                 gateway: GATEWAY.to_owned(),
             },
+            ingress: None,
         },
         signature: String::new(),
     };

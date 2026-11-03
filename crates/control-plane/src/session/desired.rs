@@ -185,6 +185,7 @@ pub async fn build_spec(
                 subnet: network.subnet.clone(),
                 gateway: network.gateway.clone(),
             },
+            ingress: None,
         },
         held_back,
     })

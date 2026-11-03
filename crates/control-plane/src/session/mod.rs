@@ -1086,7 +1086,7 @@ impl Session {
                 Some(&raw.id),
             )),
             // No leases or change-log follow exist in M2.
-            NodeMessage::LeaseRenew(_) | NodeMessage::LogAck(_) => {}
+            NodeMessage::LeaseRenew(_) | NodeMessage::LogAck(_) | NodeMessage::DnsChallenge(_) => {}
         }
         false
     }

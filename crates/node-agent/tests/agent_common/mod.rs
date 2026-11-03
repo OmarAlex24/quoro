@@ -132,6 +132,7 @@ pub fn snapshot(rev: u64, vms: Vec<SpecVm>) -> Snapshot {
                     subnet: SUBNET.to_owned(),
                     gateway: GATEWAY.to_owned(),
                 },
+                ingress: None,
             },
             signature: String::new(),
         },
