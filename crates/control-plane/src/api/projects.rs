@@ -2,8 +2,7 @@
 //! `GET /api/v1/projects/{project_id}`.
 
 use crate::AppState;
-use crate::api::page::finish;
-use crate::audit::{self, Outcome};
+
 use crate::auth::Identity;
 use crate::changelog::{self, Op};
 use crate::error::{ApiError, Target};
@@ -73,14 +72,14 @@ pub struct CreateProjectRequest {
 pub struct PageParams {
     /// Maximum number of items to return (default 50, maximum 500).
     #[param(minimum = 1, maximum = 500, default = 50)]
-    limit: Option<i64>,
+    pub limit: Option<i64>,
     /// Opaque cursor returned as `next_cursor` by the previous page.
-    cursor: Option<String>,
+    pub cursor: Option<String>,
 }
 
 impl PageParams {
     /// The validated limit.
-    fn limit(&self) -> Result<i64, ApiError> {
+    pub(crate) fn limit(&self) -> Result<i64, ApiError> {
         match self.limit {
             None => Ok(crate::api::page::DEFAULT_LIMIT),
             Some(n) if (1..=crate::api::page::MAX_LIMIT).contains(&n) => Ok(n),
@@ -92,13 +91,13 @@ impl PageParams {
     }
 
     /// The cursor, or the empty string, which sorts before every id.
-    fn after(&self) -> &str {
+    pub(crate) fn after(&self) -> &str {
         self.cursor.as_deref().unwrap_or("")
     }
 }
 
 /// Builds a [`Project`] from a `projects` row.
-fn project_from_row(row: &SqliteRow) -> Result<Project, ApiError> {
+pub(crate) fn project_from_row(row: &SqliteRow) -> Result<Project, ApiError> {
     Ok(Project {
         id: row.try_get("id")?,
         slug: row.try_get("slug")?,
@@ -162,19 +161,8 @@ pub async fn list_projects(
     Query(page): Query<PageParams>,
 ) -> Result<Json<ProjectList>, ApiError> {
     let ctx = CallCtx::new(identity, request_id, "GET /api/v1/projects", &headers);
-    ctx.authorize_read(Scope::ProjectRead)?;
-    let limit = page.limit()?;
-    let rows = sqlx::query("SELECT * FROM projects WHERE id > ? ORDER BY id LIMIT ?")
-        .bind(page.after())
-        .bind(limit + 1)
-        .fetch_all(state.store.pool())
-        .await?;
-    let projects = rows
-        .iter()
-        .map(project_from_row)
-        .collect::<Result<Vec<_>, _>>()?;
-    let (items, next_cursor) = finish(projects, limit, |project| project.id.clone());
-    Ok(Json(ProjectList { items, next_cursor }))
+    let list = crate::service::projects::list_projects(&state, &ctx, &page).await?;
+    Ok(Json(list))
 }
 
 /// Creates a project with a unique slug. `Quoro-Justification` is required
@@ -215,7 +203,7 @@ pub async fn create_project(
     ApiJson(body): ApiJson<CreateProjectRequest>,
 ) -> Result<(StatusCode, Json<Project>), ApiError> {
     validate(&body)?;
-    let identity_id = identity.user_id.clone();
+    let identity_id = identity.id().to_string();
     let params = json!({ "slug": &body.slug, "name": &body.name });
     // Authorize before claiming the idempotency slot: a refused call must not
     // leave the key in flight.
@@ -344,16 +332,15 @@ async fn insert_project(
         kind: "project".to_string(),
         id: id.clone(),
     };
-    let record = ctx.record(
+    ctx.append_ok(
+        &mut w.tx,
         Some(Scope::ProjectWrite),
         Some(&target),
         Some(&id),
         params,
-        Outcome::Ok,
-        None,
         Some(seq),
-    );
-    audit::append(&mut w.tx, &record).await?;
+    )
+    .await?;
     w.commit().await?;
     Ok(project)
 }
@@ -395,14 +382,6 @@ pub async fn get_project(
         "GET /api/v1/projects/{project_id}",
         &headers,
     );
-    ctx.authorize_read(Scope::ProjectRead)?;
-    if !quoro_types::is_id(Prefix::Project, &project_id) {
-        return Err(ApiError::not_found("project"));
-    }
-    let row = sqlx::query("SELECT * FROM projects WHERE id = ?")
-        .bind(&project_id)
-        .fetch_optional(state.store.pool())
-        .await?
-        .ok_or_else(|| ApiError::not_found("project"))?;
-    Ok(Json(project_from_row(&row)?))
+    let project = crate::service::projects::get_project(&state, &ctx, &project_id).await?;
+    Ok(Json(project))
 }

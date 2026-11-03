@@ -299,7 +299,7 @@ fn parse_trigger(value: &str) -> Option<DeploymentTrigger> {
 }
 
 use crate::AppState;
-use crate::audit::{self, Outcome};
+
 use crate::deploy;
 use crate::error::Target;
 use crate::idempotency::Begin;
@@ -357,40 +357,8 @@ pub async fn list_app_deployments(
         "GET /api/v1/apps/{app_id}/deployments",
         &headers,
     );
-    ctx.authorize_read(Scope::AppRead)?;
-    if !deploy::is_id_with_prefix("app", &app_id) {
-        return Err(ApiError::not_found("app"));
-    }
-    let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM apps WHERE id = ?")
-        .bind(&app_id)
-        .fetch_optional(state.store.pool())
-        .await?;
-    if exists.is_none() {
-        return Err(ApiError::not_found("app"));
-    }
-    let page_query = query.page();
-    let limit = page_query.limit()?;
-
-    let mut sql = format!("SELECT {DEPLOYMENT_COLUMNS} FROM deployments WHERE app_id = ?");
-    if page_query.cursor.is_some() {
-        sql.push_str(" AND id < ?");
-    }
-    sql.push_str(" ORDER BY id DESC LIMIT ?");
-    let mut statement = sqlx::query(&sql).bind(&app_id);
-    if let Some(cursor) = &page_query.cursor {
-        statement = statement.bind(cursor);
-    }
-    let rows = statement
-        .bind(limit + 1)
-        .fetch_all(state.store.pool())
-        .await?;
-    let deployments = rows
-        .iter()
-        .map(deployment_from_row)
-        .collect::<Result<Vec<_>, _>>()?;
-    let (items, next_cursor) =
-        crate::api::page::finish(deployments, limit, |deployment| deployment.id.clone());
-    Ok(Json(DeploymentList { items, next_cursor }))
+    let list = crate::service::deployments::list_deployments(&state, &ctx, &app_id, &query).await?;
+    Ok(Json(list))
 }
 
 /// Starts a deployment of a new image. A deployment that is still in progress
@@ -454,7 +422,7 @@ pub async fn create_deployment(
     let key = crate::api::apps::idempotency_key(&headers)?;
     if let Some(key) = &key {
         match state.idempotency.begin(
-            &ctx.identity.user_id,
+            ctx.identity.id(),
             "POST /api/v1/apps/{app_id}/deployments",
             key,
             &params,
@@ -485,7 +453,7 @@ pub async fn create_deployment(
         Ok(created) => {
             if let Some(key) = &key {
                 state.idempotency.finish(
-                    &ctx.identity.user_id,
+                    ctx.identity.id(),
                     "POST /api/v1/apps/{app_id}/deployments",
                     key,
                     StatusCode::ACCEPTED,
@@ -500,7 +468,7 @@ pub async fn create_deployment(
         Err(error) => {
             if let Some(key) = &key {
                 state.idempotency.abandon(
-                    &ctx.identity.user_id,
+                    ctx.identity.id(),
                     "POST /api/v1/apps/{app_id}/deployments",
                     key,
                 );
@@ -535,16 +503,15 @@ async fn create_deployment_tx(
         kind: "deployment".to_string(),
         id: created.deployment.id.clone(),
     };
-    let record = ctx.record(
+    ctx.append_ok(
+        &mut w.tx,
         Some(Scope::AppDeploy),
         Some(&target),
         Some(&created.project_id),
         params,
-        Outcome::Ok,
-        None,
         Some(created.change_seq),
-    );
-    audit::append(&mut w.tx, &record).await?;
+    )
+    .await?;
     w.commit().await?;
     Ok(created)
 }
@@ -590,16 +557,7 @@ pub async fn get_deployment(
         "GET /api/v1/deployments/{deployment_id}",
         &headers,
     );
-    ctx.authorize_read(Scope::AppRead)?;
-    if !deploy::is_id_with_prefix("dep", &deployment_id) {
-        return Err(ApiError::not_found("deployment"));
-    }
-    let row = sqlx::query(&format!(
-        "SELECT {DEPLOYMENT_COLUMNS} FROM deployments WHERE id = ?"
-    ))
-    .bind(&deployment_id)
-    .fetch_optional(state.store.pool())
-    .await?
-    .ok_or_else(|| ApiError::not_found("deployment"))?;
-    Ok(Json(deployment_from_row(&row)?))
+    let deployment =
+        crate::service::deployments::get_deployment(&state, &ctx, &deployment_id).await?;
+    Ok(Json(deployment))
 }

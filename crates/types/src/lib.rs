@@ -25,6 +25,14 @@ pub enum Prefix {
     Provider,
     Session,
     NodeJoinToken,
+    Agent,
+    AgentKey,
+    AccessToken,
+    Grant,
+    Approval,
+    Incident,
+    Webhook,
+    WebhookDelivery,
 }
 
 impl Prefix {
@@ -44,6 +52,14 @@ impl Prefix {
             // server and only names the `sessions` row.
             Self::Session => "ses",
             Self::NodeJoinToken => "njt",
+            Self::Agent => "agt",
+            Self::AgentKey => "akey",
+            Self::AccessToken => "atk",
+            Self::Grant => "grt",
+            Self::Approval => "apr",
+            Self::Incident => "inc",
+            Self::Webhook => "whk",
+            Self::WebhookDelivery => "whd",
         }
     }
 }
@@ -73,6 +89,35 @@ pub fn new_id(prefix: Prefix) -> String {
         let index = ((value >> (5 * i)) & 0x1F) as usize;
         out.push(char::from(CROCKFORD[index]));
     }
+    out
+}
+
+/// A new bearer secret `<prefix>_<26 Crockford base32 characters>`, all of
+/// them random (130 bits), so it matches the same pattern as an id but carries
+/// no timestamp. Used for agent access tokens (`atk_`), whose response pattern
+/// in `openapi.yaml` is the id pattern. Never use [`new_id`] for a secret: its
+/// first ten characters are the creation time.
+///
+/// # Panics
+///
+/// Panics if the operating system's random generator fails.
+#[must_use]
+pub fn new_secret(prefix: Prefix) -> String {
+    let mut random = [0u8; 17];
+    getrandom::fill(&mut random).expect("OS random generator");
+    let mut value: u128 = 0;
+    for byte in &random[..16] {
+        value = (value << 8) | u128::from(*byte);
+    }
+    let mut out = String::with_capacity(prefix.as_str().len() + 27);
+    out.push_str(prefix.as_str());
+    out.push('_');
+    // 25 characters from the first 125 bits, the last from the 17th byte.
+    for i in (0..25).rev() {
+        let index = ((value >> (5 * i + 3)) & 0x1F) as usize;
+        out.push(char::from(CROCKFORD[index]));
+    }
+    out.push(char::from(CROCKFORD[usize::from(random[16] & 0x1F)]));
     out
 }
 
@@ -258,6 +303,13 @@ impl Scope {
         }
     }
 
+    /// Parses a scope string exactly as README "Scopes" spells it. Wildcards
+    /// such as `app:*` are not scopes and return `None`.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|scope| scope.as_str() == value)
+    }
+
     /// README "Scopes": destructive scopes need JIT approval for agents.
     #[must_use]
     pub const fn is_destructive(self) -> bool {
@@ -352,6 +404,14 @@ mod tests {
         assert!(!is_id(Prefix::Vm, "vm_01JC9Z6Q5W8N3K4T7R2M1XHB0"));
         assert!(!is_id(Prefix::Vm, "vm_01JC9Z6Q5W8N3K4T7R2M1XHB0I"));
         assert!(!is_id(Prefix::Vm, "prj_01JC9Z6Q5W8N3K4T7R2M1XHB0D"));
+    }
+
+    #[test]
+    fn secrets_match_the_id_pattern_and_differ() {
+        let a = new_secret(Prefix::AccessToken);
+        let b = new_secret(Prefix::AccessToken);
+        assert!(is_id(Prefix::AccessToken, &a), "{a}");
+        assert_ne!(a, b);
     }
 
     #[test]

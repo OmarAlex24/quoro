@@ -206,7 +206,7 @@ pub(crate) fn valid_hostname(hostname: &str) -> bool {
 }
 
 use crate::AppState;
-use crate::audit::{self, Outcome};
+
 use crate::changelog::{self, Op};
 use crate::deploy;
 use crate::error::Target;
@@ -267,33 +267,64 @@ pub async fn list_app_domains(
         "GET /api/v1/apps/{app_id}/domains",
         &headers,
     );
-    ctx.authorize_read(Scope::AppRead)?;
-    if !deploy::is_id_with_prefix("app", &app_id) {
-        return Err(ApiError::not_found("app"));
+    let mut params = serde_json::Map::new();
+    params.insert("app_id".to_string(), json!(app_id));
+    if let Some(limit) = query.limit {
+        params.insert("limit".to_string(), json!(limit));
     }
-    let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM apps WHERE id = ?")
-        .bind(&app_id)
-        .fetch_optional(state.store.pool())
+    if let Some(cursor) = &query.cursor {
+        params.insert("cursor".to_string(), json!(cursor));
+    }
+    let access = ctx
+        .authorize_read(&state, Scope::AppRead, None, &Value::Object(params))
         .await?;
-    if exists.is_none() {
-        return Err(ApiError::not_found("app"));
+    let result: Result<_, ApiError> = async {
+        if !deploy::is_id_with_prefix("app", &app_id) {
+            return Err(ApiError::not_found("app"));
+        }
+        let project: Option<(String,)> = sqlx::query_as("SELECT project_id FROM apps WHERE id = ?")
+            .bind(&app_id)
+            .fetch_optional(state.store.pool())
+            .await?;
+        let Some((project_id,)) = project else {
+            return Err(ApiError::not_found("app"));
+        };
+        let page_query = query.page();
+        let limit = page_query.limit()?;
+        let rows = sqlx::query(&format!(
+            "SELECT {DOMAIN_COLUMNS} FROM domains WHERE app_id = ? AND id > ? ORDER BY id LIMIT ?"
+        ))
+        .bind(&app_id)
+        .bind(page_query.after())
+        .bind(limit + 1)
+        .fetch_all(state.store.pool())
+        .await?;
+        let domains = rows
+            .iter()
+            .map(domain_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        let entries: Vec<(Domain, String)> = domains
+            .into_iter()
+            .map(|domain| (domain, project_id.clone()))
+            .collect();
+        let (entries, next_cursor) =
+            crate::api::page::finish(entries, limit, |(domain, _)| domain.id.clone());
+        let entries = access
+            .filter(&state, entries, |(domain, project_id)| {
+                crate::request::Resource {
+                    kind: "domain",
+                    id: &domain.id,
+                    app_id: Some(&domain.app_id),
+                    project_id: Some(project_id),
+                    node_id: None,
+                }
+            })
+            .await?;
+        let items = entries.into_iter().map(|(domain, _)| domain).collect();
+        Ok(Json(DomainList { items, next_cursor }))
     }
-    let page_query = query.page();
-    let limit = page_query.limit()?;
-    let rows = sqlx::query(&format!(
-        "SELECT {DOMAIN_COLUMNS} FROM domains WHERE app_id = ? AND id > ? ORDER BY id LIMIT ?"
-    ))
-    .bind(&app_id)
-    .bind(page_query.after())
-    .bind(limit + 1)
-    .fetch_all(state.store.pool())
-    .await?;
-    let domains = rows
-        .iter()
-        .map(domain_from_row)
-        .collect::<Result<Vec<_>, _>>()?;
-    let (items, next_cursor) = crate::api::page::finish(domains, limit, |domain| domain.id.clone());
-    Ok(Json(DomainList { items, next_cursor }))
+    .await;
+    ctx.finish_read(&state, access, result).await
 }
 
 /// Routes a hostname to an app. TLS is obtained with ACME for a public-IP host
@@ -366,7 +397,7 @@ pub async fn create_app_domain(
     let key = crate::api::apps::idempotency_key(&headers)?;
     if let Some(key) = &key {
         match state.idempotency.begin(
-            &ctx.identity.user_id,
+            ctx.identity.id(),
             "POST /api/v1/apps/{app_id}/domains",
             key,
             &params,
@@ -405,7 +436,7 @@ pub async fn create_app_domain(
         Ok((domain, vm_ids)) => {
             if let Some(key) = &key {
                 state.idempotency.finish(
-                    &ctx.identity.user_id,
+                    ctx.identity.id(),
                     "POST /api/v1/apps/{app_id}/domains",
                     key,
                     StatusCode::CREATED,
@@ -420,7 +451,7 @@ pub async fn create_app_domain(
         Err(error) => {
             if let Some(key) = &key {
                 state.idempotency.abandon(
-                    &ctx.identity.user_id,
+                    ctx.identity.id(),
                     "POST /api/v1/apps/{app_id}/domains",
                     key,
                 );
@@ -507,16 +538,15 @@ async fn create_app_domain_tx(
     let change_seq =
         changelog::append(&mut w.tx, &actor, "domain", &domain.id, Op::Create, payload).await?;
     let vm_ids = crate::api::apps::app_vm_ids(&mut w.tx, app_id).await?;
-    let record = ctx.record(
+    ctx.append_ok(
+        &mut w.tx,
         Some(Scope::AppUpdate),
         Some(&domain_target(&domain.id)),
         None,
         params,
-        Outcome::Ok,
-        None,
         Some(change_seq),
-    );
-    audit::append(&mut w.tx, &record).await?;
+    )
+    .await?;
     w.commit().await?;
     Ok((domain, vm_ids))
 }
@@ -671,16 +701,15 @@ async fn delete_domain_tx(
     )
     .await?;
     let vm_ids = crate::api::apps::app_vm_ids(&mut w.tx, &domain.app_id).await?;
-    let record = ctx.record(
+    ctx.append_ok(
+        &mut w.tx,
         Some(Scope::AppUpdate),
         Some(&domain_target(domain_id)),
         None,
         params,
-        Outcome::Ok,
         None,
-        None,
-    );
-    audit::append(&mut w.tx, &record).await?;
+    )
+    .await?;
     w.commit().await?;
     Ok(vm_ids)
 }

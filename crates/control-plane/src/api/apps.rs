@@ -11,9 +11,9 @@ use crate::api::deployments::{
     DEPLOYMENT_COLUMNS, Deployment, DeploymentTrigger, deployment_from_row,
 };
 use crate::api::domains::{DOMAIN_COLUMNS, Domain, domain_from_row};
-use crate::api::page::{self, PageQuery};
+use crate::api::page::PageQuery;
 use crate::api::vms::{VM_COLUMNS, Vm, vm_from_row};
-use crate::audit::{self, Outcome};
+
 use crate::changelog::{self, Op};
 use crate::deploy;
 use crate::error::ApiError;
@@ -33,7 +33,7 @@ use sqlx::sqlite::SqliteRow;
 use utoipa::{IntoParams, ToSchema};
 
 /// Columns of [`App`], in the order [`app_from_row`] expects them.
-const APP_COLUMNS: &str = "id, project_id, name, stateful, ha_policy, image, port, health_check, \
+pub(crate) const APP_COLUMNS: &str = "id, project_id, name, stateful, ha_policy, image, port, health_check, \
      resources, placement, status, current_deployment_id, restart_generation, created_at, \
      updated_at";
 
@@ -452,7 +452,7 @@ pub struct ListAppsQuery {
 impl ListAppsQuery {
     /// `limit` and `cursor` in the shared page shape.
     #[must_use]
-    fn page(&self) -> PageQuery {
+    pub(crate) fn page(&self) -> PageQuery {
         PageQuery {
             limit: self.limit,
             cursor: self.cursor.clone(),
@@ -461,7 +461,7 @@ impl ListAppsQuery {
 }
 
 /// Builds an [`App`] from an `apps` row.
-fn app_from_row(row: &SqliteRow) -> Result<App, ApiError> {
+pub(crate) fn app_from_row(row: &SqliteRow) -> Result<App, ApiError> {
     let ha_policy: String = row.try_get("ha_policy")?;
     let ha_policy = match ha_policy.as_str() {
         "none" => HaPolicy::None,
@@ -504,7 +504,7 @@ fn app_from_row(row: &SqliteRow) -> Result<App, ApiError> {
 /// Audit/MCP operation string of `createApp`; also its idempotency key scope.
 const CREATE_APP: &str = "POST /api/v1/apps";
 
-fn app_target(app_id: &str) -> crate::error::Target {
+pub(crate) fn app_target(app_id: &str) -> crate::error::Target {
     crate::error::Target {
         kind: "app".to_string(),
         id: app_id.to_string(),
@@ -701,7 +701,10 @@ fn validate_update(body: &UpdateAppRequest) -> Result<(), ApiError> {
 }
 
 /// The app's VM rows, oldest first.
-async fn app_vms(conn: &mut sqlx::SqliteConnection, app_id: &str) -> Result<Vec<Vm>, ApiError> {
+pub(crate) async fn app_vms(
+    conn: &mut sqlx::SqliteConnection,
+    app_id: &str,
+) -> Result<Vec<Vm>, ApiError> {
     let rows = sqlx::query(&format!(
         "SELECT {VM_COLUMNS} FROM vms WHERE app_id = ? ORDER BY id"
     ))
@@ -764,35 +767,8 @@ pub async fn list_apps(
     Query(query): Query<ListAppsQuery>,
 ) -> Result<Json<AppList>, ApiError> {
     let ctx = CallCtx::new(identity, request_id.0, "GET /api/v1/apps", &headers);
-    ctx.authorize_read(Scope::AppRead)?;
-    if let Some(project_id) = &query.project_id
-        && !is_id(Prefix::Project, project_id)
-    {
-        return Err(ApiError::validation("project_id is not a valid project id"));
-    }
-    let page_query = query.page();
-    let limit = page_query.limit()?;
-    let after = page_query.after();
-
-    let mut sql = format!("SELECT {APP_COLUMNS} FROM apps WHERE id > ?");
-    if query.project_id.is_some() {
-        sql.push_str(" AND project_id = ?");
-    }
-    sql.push_str(" ORDER BY id LIMIT ?");
-    let mut statement = sqlx::query(&sql).bind(after);
-    if let Some(project_id) = &query.project_id {
-        statement = statement.bind(project_id);
-    }
-    let rows = statement
-        .bind(limit + 1)
-        .fetch_all(state.store.pool())
-        .await?;
-    let apps = rows
-        .iter()
-        .map(app_from_row)
-        .collect::<Result<Vec<_>, _>>()?;
-    let (items, next_cursor) = page::finish(apps, limit, |app| app.id.clone());
-    Ok(Json(AppList { items, next_cursor }))
+    let list = crate::service::apps::list_apps(&state, &ctx, &query).await?;
+    Ok(Json(list))
 }
 
 /// Creates an app record. The image is rolled out by a separate deployment.
@@ -855,7 +831,7 @@ pub async fn create_app(
     if let Some(key) = &key {
         match state
             .idempotency
-            .begin(&ctx.identity.user_id, CREATE_APP, key, &params)
+            .begin(ctx.identity.id(), CREATE_APP, key, &params)
         {
             Begin::Proceed => {}
             Begin::Replay(status, body) => {
@@ -890,7 +866,7 @@ pub async fn create_app(
         Ok(app) => {
             if let Some(key) = &key {
                 state.idempotency.finish(
-                    &ctx.identity.user_id,
+                    ctx.identity.id(),
                     CREATE_APP,
                     key,
                     StatusCode::CREATED,
@@ -903,7 +879,7 @@ pub async fn create_app(
             if let Some(key) = &key {
                 state
                     .idempotency
-                    .abandon(&ctx.identity.user_id, CREATE_APP, key);
+                    .abandon(ctx.identity.id(), CREATE_APP, key);
             }
             ctx.audit_error(
                 &state,
@@ -1022,16 +998,15 @@ async fn insert_app(
     )
     .await?;
     let target = app_target(&app.id);
-    let record = ctx.record(
+    ctx.append_ok(
+        &mut w.tx,
         Some(Scope::AppCreate),
         Some(&target),
         Some(&app.project_id),
         params,
-        Outcome::Ok,
-        None,
         Some(change_seq),
-    );
-    audit::append(&mut w.tx, &record).await?;
+    )
+    .await?;
     w.commit().await?;
     Ok(app)
 }
@@ -1077,33 +1052,8 @@ pub async fn get_app(
         "GET /api/v1/apps/{app_id}",
         &headers,
     );
-    ctx.authorize_read(Scope::AppRead)?;
-    if !deploy::is_id_with_prefix("app", &app_id) {
-        return Err(ApiError::not_found("app"));
-    }
-    let mut conn = state.store.pool().acquire().await?;
-    let row = sqlx::query(&format!("SELECT {APP_COLUMNS} FROM apps WHERE id = ?"))
-        .bind(&app_id)
-        .fetch_optional(&mut *conn)
-        .await?
-        .ok_or_else(|| ApiError::not_found("app"))?;
-    let app = app_from_row(&row)?;
-    let instances = app_vms(&mut conn, &app_id).await?;
-    let rows = sqlx::query(&format!(
-        "SELECT {DOMAIN_COLUMNS} FROM domains WHERE app_id = ? ORDER BY id"
-    ))
-    .bind(&app_id)
-    .fetch_all(&mut *conn)
-    .await?;
-    let domains = rows
-        .iter()
-        .map(domain_from_row)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Json(AppDetail {
-        app,
-        instances,
-        domains,
-    }))
+    let app = crate::service::apps::get_app(&state, &ctx, &app_id).await?;
+    Ok(Json(app))
 }
 
 /// Changes app settings. The image is not changed here: a new image is rolled
@@ -1298,27 +1248,25 @@ async fn update_app_tx(
             },
         )
         .await?;
-        let record = ctx.record(
+        ctx.append_ok(
+            &mut w.tx,
             Some(Scope::AppUpdate),
             Some(&target),
             Some(&app.project_id),
             params,
-            Outcome::Ok,
-            None,
             Some(change_seq),
-        );
-        audit::append(&mut w.tx, &record).await?;
+        )
+        .await?;
     } else {
-        let record = ctx.record(
+        ctx.append_ok(
+            &mut w.tx,
             Some(Scope::AppUpdate),
             Some(&target),
             Some(&app.project_id),
             params,
-            Outcome::Ok,
             None,
-            None,
-        );
-        audit::append(&mut w.tx, &record).await?;
+        )
+        .await?;
     }
     w.commit().await?;
     Ok((app, vm_ids))
@@ -1373,53 +1321,11 @@ pub async fn delete_app(
         "DELETE /api/v1/apps/{app_id}",
         &headers,
     );
-    let params = json!({ "app_id": app_id });
-    let target = app_target(&app_id);
-    ctx.authorize(&state, Scope::AppDelete, Some(&target), None, &params)
-        .await?;
-
-    if !ctx.identity.is_human() {
-        let mut error = ApiError::new(
-            crate::error::Code::ApprovalRequired,
-            "deleting an app needs a just-in-time approval (D-0030)",
-        );
-        error.scope = Some(Scope::AppDelete.as_str().to_string());
-        error.target = Some(target.clone());
-        ctx.audit_error(
-            &state,
-            Some(Scope::AppDelete),
-            Some(&target),
-            None,
-            &params,
-            &error,
-        )
-        .await?;
-        return Err(error);
-    }
-
-    match delete_app_tx(&state, &ctx, &app_id, &params).await {
-        Ok((app, vm_ids)) => {
-            for vm_id in vm_ids {
-                state.notify_driver(&vm_id);
-            }
-            Ok((StatusCode::ACCEPTED, Json(app)).into_response())
-        }
-        Err(error) => {
-            ctx.audit_error(
-                &state,
-                Some(Scope::AppDelete),
-                Some(&target),
-                None,
-                &params,
-                &error,
-            )
-            .await?;
-            Err(error)
-        }
-    }
+    let app = crate::service::apps::delete_app(&state, &ctx, &app_id).await?;
+    Ok((StatusCode::ACCEPTED, Json(app)).into_response())
 }
 
-async fn delete_app_tx(
+pub(crate) async fn delete_app_tx(
     state: &AppState,
     ctx: &CallCtx,
     app_id: &str,
@@ -1554,16 +1460,15 @@ async fn delete_app_tx(
         },
     )
     .await?;
-    let record = ctx.record(
+    ctx.append_ok(
+        &mut w.tx,
         Some(Scope::AppDelete),
         Some(&target),
         Some(&app.project_id),
         params,
-        Outcome::Ok,
-        None,
         Some(change_seq),
-    );
-    audit::append(&mut w.tx, &record).await?;
+    )
+    .await?;
     w.commit().await?;
     Ok((app, vm_ids))
 }
@@ -1618,34 +1523,11 @@ pub async fn restart_app(
         "POST /api/v1/apps/{app_id}/restart",
         &headers,
     );
-    let params = json!({ "app_id": app_id });
-    let target = app_target(&app_id);
-    ctx.authorize(&state, Scope::AppRestart, Some(&target), None, &params)
-        .await?;
-
-    match restart_app_tx(&state, &ctx, &app_id, &params).await {
-        Ok((app, vm_ids)) => {
-            for vm_id in vm_ids {
-                state.notify_driver(&vm_id);
-            }
-            Ok((StatusCode::ACCEPTED, Json(app)).into_response())
-        }
-        Err(error) => {
-            ctx.audit_error(
-                &state,
-                Some(Scope::AppRestart),
-                Some(&target),
-                None,
-                &params,
-                &error,
-            )
-            .await?;
-            Err(error)
-        }
-    }
+    let app = crate::service::apps::restart_app(&state, &ctx, &app_id).await?;
+    Ok((StatusCode::ACCEPTED, Json(app)).into_response())
 }
 
-async fn restart_app_tx(
+pub(crate) async fn restart_app_tx(
     state: &AppState,
     ctx: &CallCtx,
     app_id: &str,
@@ -1725,16 +1607,15 @@ async fn restart_app_tx(
     .await?;
     let vm_ids = app_vm_ids(&mut w.tx, app_id).await?;
     let target = app_target(app_id);
-    let record = ctx.record(
+    ctx.append_ok(
+        &mut w.tx,
         Some(Scope::AppRestart),
         Some(&target),
         Some(&app.project_id),
         params,
-        Outcome::Ok,
-        None,
         Some(change_seq),
-    );
-    audit::append(&mut w.tx, &record).await?;
+    )
+    .await?;
     w.commit().await?;
     Ok((app, vm_ids))
 }
@@ -1788,34 +1669,11 @@ pub async fn redeploy_app(
         "POST /api/v1/apps/{app_id}/redeploy",
         &headers,
     );
-    let params = json!({ "app_id": app_id });
-    let target = app_target(&app_id);
-    ctx.authorize(&state, Scope::AppRedeploy, Some(&target), None, &params)
-        .await?;
-
-    match redeploy_app_tx(&state, &ctx, &app_id, &params).await {
-        Ok((deployment, created)) => {
-            for vm_id in std::iter::once(&created.vm_id).chain(created.retired_vm_ids.iter()) {
-                state.notify_driver(vm_id);
-            }
-            Ok((StatusCode::ACCEPTED, Json(deployment)).into_response())
-        }
-        Err(error) => {
-            ctx.audit_error(
-                &state,
-                Some(Scope::AppRedeploy),
-                Some(&target),
-                None,
-                &params,
-                &error,
-            )
-            .await?;
-            Err(error)
-        }
-    }
+    let deployment = crate::service::apps::redeploy_app(&state, &ctx, &app_id).await?;
+    Ok((StatusCode::ACCEPTED, Json(deployment)).into_response())
 }
 
-async fn redeploy_app_tx(
+pub(crate) async fn redeploy_app_tx(
     state: &AppState,
     ctx: &CallCtx,
     app_id: &str,
@@ -1845,16 +1703,15 @@ async fn redeploy_app_tx(
         kind: "deployment".to_string(),
         id: deployment.id.clone(),
     };
-    let record = ctx.record(
+    ctx.append_ok(
+        &mut w.tx,
         Some(Scope::AppRedeploy),
         Some(&target),
         Some(&created.project_id),
         params,
-        Outcome::Ok,
-        None,
         Some(created.change_seq),
-    );
-    audit::append(&mut w.tx, &record).await?;
+    )
+    .await?;
     w.commit().await?;
     Ok((deployment, created))
 }
@@ -2083,16 +1940,15 @@ async fn set_desired_tx(
     }
     let vm_ids = app_vm_ids(&mut w.tx, app_id).await?;
     let target = app_target(app_id);
-    let record = ctx.record(
+    ctx.append_ok(
+        &mut w.tx,
         Some(scope),
         Some(&target),
         Some(&app.project_id),
         params,
-        Outcome::Ok,
         None,
-        None,
-    );
-    audit::append(&mut w.tx, &record).await?;
+    )
+    .await?;
     w.commit().await?;
     Ok((app, vm_ids))
 }
@@ -2136,31 +1992,40 @@ pub async fn get_app_env(
         "GET /api/v1/apps/{app_id}/env",
         &headers,
     );
-    ctx.authorize_read(Scope::AppRead)?;
-    if !deploy::is_id_with_prefix("app", &app_id) {
-        return Err(ApiError::not_found("app"));
-    }
-    let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM apps WHERE id = ?")
-        .bind(&app_id)
-        .fetch_optional(state.store.pool())
+    let target = app_target(&app_id);
+    let params = json!({ "app_id": app_id });
+    let mut access = ctx
+        .authorize_read(&state, Scope::AppRead, Some(&target), &params)
         .await?;
-    if exists.is_none() {
-        return Err(ApiError::not_found("app"));
-    }
-    let rows: Vec<(String, String)> =
-        sqlx::query_as("SELECT name, updated_at FROM app_env WHERE app_id = ? ORDER BY name")
+    let result: Result<_, ApiError> = async {
+        if !deploy::is_id_with_prefix("app", &app_id) {
+            return Err(ApiError::not_found("app"));
+        }
+        let project: Option<(String,)> = sqlx::query_as("SELECT project_id FROM apps WHERE id = ?")
             .bind(&app_id)
-            .fetch_all(state.store.pool())
+            .fetch_optional(state.store.pool())
             .await?;
-    let items = rows
-        .into_iter()
-        .map(|(name, updated_at)| AppEnvVar {
-            app_id: app_id.clone(),
-            name,
-            updated_at,
-        })
-        .collect();
-    Ok(Json(AppEnvList { items }))
+        let Some((project_id,)) = project else {
+            return Err(ApiError::not_found("app"));
+        };
+        access.set_project(Some(&project_id));
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT name, updated_at FROM app_env WHERE app_id = ? ORDER BY name")
+                .bind(&app_id)
+                .fetch_all(state.store.pool())
+                .await?;
+        let items = rows
+            .into_iter()
+            .map(|(name, updated_at)| AppEnvVar {
+                app_id: app_id.clone(),
+                name,
+                updated_at,
+            })
+            .collect();
+        Ok(Json(AppEnvList { items }))
+    }
+    .await;
+    ctx.finish_read(&state, access, result).await
 }
 
 /// Full replacement of an app's environment; variables not listed are removed.
@@ -2381,16 +2246,15 @@ async fn replace_app_env_tx(
 
     let vm_ids = app_vm_ids(&mut w.tx, app_id).await?;
     let target = app_target(app_id);
-    let record = ctx.record(
+    ctx.append_ok(
+        &mut w.tx,
         Some(Scope::AppUpdate),
         Some(&target),
         None,
         params,
-        Outcome::Ok,
         None,
-        None,
-    );
-    audit::append(&mut w.tx, &record).await?;
+    )
+    .await?;
     w.commit().await?;
     Ok((items, vm_ids))
 }

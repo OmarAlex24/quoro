@@ -34,7 +34,7 @@ use tokio::time::Instant;
 use utoipa::{OpenApi, ToResponse, ToSchema};
 
 /// How long one node gets to answer a log query or finish a stream.
-const NODE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const NODE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often the SSE response keeps a quiet connection alive.
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
@@ -192,16 +192,16 @@ pub struct LogsDoc;
 pub struct AppLogsQuery {
     /// Only lines recorded at or after this time.
     #[param(format = "date-time")]
-    since: Option<String>,
+    pub since: Option<String>,
     /// Only lines recorded at or before this time.
     #[param(format = "date-time")]
-    until: Option<String>,
+    pub until: Option<String>,
     /// Maximum number of trailing lines to return.
     #[param(minimum = 1, maximum = 5000, default = 200)]
-    tail: Option<i64>,
+    pub tail: Option<i64>,
     /// Only lines of this VM (an instance of the app).
     #[param(pattern = "^vm_[0-9A-HJKMNP-TV-Z]{26}$")]
-    instance: Option<String>,
+    pub instance: Option<String>,
 }
 
 /// Query of `streamAppLogs`.
@@ -210,10 +210,10 @@ pub struct AppLogsQuery {
 pub struct AppLogsStreamQuery {
     /// Only stream this VM (an instance of the app).
     #[param(pattern = "^vm_[0-9A-HJKMNP-TV-Z]{26}$")]
-    instance: Option<String>,
+    pub instance: Option<String>,
     /// Number of existing lines to replay before live output.
     #[param(minimum = 0, maximum = 5000, default = 0)]
-    tail: Option<i64>,
+    pub tail: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -300,61 +300,8 @@ pub async fn get_app_logs(
         "GET /api/v1/apps/{app_id}/logs",
         &headers,
     );
-    ctx.authorize_read(Scope::AppLogs)?;
-    require_app(&state, &app_id).await?;
-    let tail = tail_arg(query.tail, 200, 1)?;
-    let instance = validate_instance(&state, &app_id, query.instance.as_deref()).await?;
-    let vms = app_vms(&state, &app_id).await?;
-    let selected: Vec<&(String, String)> = match &instance {
-        Some(instance) => vms.iter().filter(|(id, _)| id == instance).collect(),
-        None => vms.iter().collect(),
-    };
-    if selected.is_empty() {
-        return Ok(Json(LogList { items: Vec::new() }));
-    }
-    let fallback = if selected.len() == 1 {
-        Some(selected[0].0.clone())
-    } else {
-        None
-    };
-    let nodes = distinct_nodes(&selected);
-
-    let mut params = selector(&app_id, instance.as_deref());
-    params.insert("tail".to_string(), json!(tail));
-    if let Some(since) = &query.since {
-        params.insert("since".to_string(), json!(since));
-    }
-    if let Some(until) = &query.until {
-        params.insert("until".to_string(), json!(until));
-    }
-
-    let mut items = Vec::new();
-    for node in &nodes {
-        let result = state
-            .hub
-            .command(
-                node,
-                "logs_query",
-                Value::Object(params.clone()),
-                NODE_TIMEOUT,
-            )
-            .await
-            .map_err(hub_error)?;
-        if result.status == quoro_proto::CommandStatus::Error {
-            return Err(command_error(result));
-        }
-        for line in result.lines.unwrap_or_default() {
-            if let Some(entry) = log_entry(&line, instance.as_deref(), fallback.as_deref()) {
-                items.push(entry);
-            }
-        }
-    }
-    items.sort_by(|a, b| a.time.cmp(&b.time));
-    let tail = usize::try_from(tail).unwrap_or(usize::MAX);
-    if items.len() > tail {
-        items.drain(0..items.len() - tail);
-    }
-    Ok(Json(LogList { items }))
+    let logs = crate::service::logs::get_app_logs(&state, &ctx, &app_id, &query).await?;
+    Ok(Json(logs))
 }
 
 // ---------------------------------------------------------------------------
@@ -407,81 +354,101 @@ pub async fn stream_app_logs(
         "GET /api/v1/apps/{app_id}/logs/stream",
         &headers,
     );
-    ctx.authorize_read(Scope::AppLogs)?;
-    require_app(&state, &app_id).await?;
-    let tail = tail_arg(query.tail, 0, 0)?;
-    let instance = validate_instance(&state, &app_id, query.instance.as_deref()).await?;
-    let vms = app_vms(&state, &app_id).await?;
-    let selected: Vec<&(String, String)> = match &instance {
-        Some(instance) => vms.iter().filter(|(id, _)| id == instance).collect(),
-        None => vms.iter().collect(),
-    };
-    if selected.is_empty() {
-        return Ok(sse(stream::once(async {
-            Ok::<_, Infallible>(end_event())
-        })));
+    let mut params = serde_json::Map::new();
+    params.insert("app_id".to_string(), json!(app_id));
+    if let Some(instance) = &query.instance {
+        params.insert("instance".to_string(), json!(instance));
     }
-    let fallback = if selected.len() == 1 {
-        Some(selected[0].0.clone())
-    } else {
-        None
-    };
-    let nodes = distinct_nodes(&selected);
-    for node in &nodes {
-        if !state.hub.is_connected(node) {
-            return Err(hub_error(HubError::NotConnected));
-        }
+    if let Some(tail) = query.tail {
+        params.insert("tail".to_string(), json!(tail));
     }
-
-    // `Last-Event-ID` is the nanosecond instant of the last line the client
-    // saw. An unparsable value is ignored and the stream starts live.
-    let resume = headers
-        .get("last-event-id")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<i128>().ok());
-
-    let mut streams: Vec<(NodeStream, i128)> = Vec::with_capacity(nodes.len());
-    let mut pending: VecDeque<(usize, wire::LogLine)> = VecDeque::new();
-    let mut min_ns: Vec<i128> = Vec::with_capacity(nodes.len());
-
-    for (index, node) in nodes.iter().enumerate() {
-        let stream = open_app_stream(&state, node, &app_id, instance.as_deref(), tail)?;
-        let floor = match resume {
-            Some(last) => {
-                // Open the live stream first so nothing produced during the
-                // gap query is lost, then fill the gap from history.
-                let mut params = selector(&app_id, instance.as_deref());
-                params.insert("since".to_string(), json!(ns_to_rfc3339(last)));
-                let result = state
-                    .hub
-                    .command(node, "logs_query", Value::Object(params), NODE_TIMEOUT)
-                    .await
-                    .map_err(hub_error)?;
-                if result.status == quoro_proto::CommandStatus::Error {
-                    return Err(command_error(result));
-                }
-                let mut history: Vec<wire::LogLine> = result
-                    .lines
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|line| line_ns(&line.time).is_some_and(|ns| ns > last))
-                    .collect();
-                history.sort_by(|a, b| a.time.cmp(&b.time));
-                pending.extend(history.into_iter().map(|line| (index, line)));
-                last
-            }
-            None => -1,
+    let target = crate::api::apps::app_target(&app_id);
+    let access = ctx
+        .authorize_read(
+            &state,
+            Scope::AppLogs,
+            Some(&target),
+            &Value::Object(params),
+        )
+        .await?;
+    let result: Result<_, ApiError> = async {
+        require_app(&state, &app_id).await?;
+        let tail = tail_arg(query.tail, 0, 0)?;
+        let instance = validate_instance(&state, &app_id, query.instance.as_deref()).await?;
+        let vms = app_vms(&state, &app_id).await?;
+        let selected: Vec<&(String, String)> = match &instance {
+            Some(instance) => vms.iter().filter(|(id, _)| id == instance).collect(),
+            None => vms.iter().collect(),
         };
-        min_ns.push(floor);
-        streams.push((stream, floor));
-    }
+        if selected.is_empty() {
+            return Ok(sse(stream::once(async {
+                Ok::<_, Infallible>(end_event())
+            })));
+        }
+        let fallback = if selected.len() == 1 {
+            Some(selected[0].0.clone())
+        } else {
+            None
+        };
+        let nodes = distinct_nodes(&selected);
+        for node in &nodes {
+            if !state.hub.is_connected(node) {
+                return Err(hub_error(HubError::NotConnected));
+            }
+        }
 
-    let feed = MergedFeed::start(streams, pending, min_ns, instance.clone(), fallback.clone());
-    Ok(sse(stream::unfold(feed, |mut feed| async move {
-        feed.next_event()
-            .await
-            .map(|event| (Ok::<_, Infallible>(event), feed))
-    })))
+        // `Last-Event-ID` is the nanosecond instant of the last line the client
+        // saw. An unparsable value is ignored and the stream starts live.
+        let resume = headers
+            .get("last-event-id")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<i128>().ok());
+
+        let mut streams: Vec<(NodeStream, i128)> = Vec::with_capacity(nodes.len());
+        let mut pending: VecDeque<(usize, wire::LogLine)> = VecDeque::new();
+        let mut min_ns: Vec<i128> = Vec::with_capacity(nodes.len());
+
+        for (index, node) in nodes.iter().enumerate() {
+            let stream = open_app_stream(&state, node, &app_id, instance.as_deref(), tail)?;
+            let floor = match resume {
+                Some(last) => {
+                    // Open the live stream first so nothing produced during the
+                    // gap query is lost, then fill the gap from history.
+                    let mut params = selector(&app_id, instance.as_deref());
+                    params.insert("since".to_string(), json!(ns_to_rfc3339(last)));
+                    let result = state
+                        .hub
+                        .command(node, "logs_query", Value::Object(params), NODE_TIMEOUT)
+                        .await
+                        .map_err(hub_error)?;
+                    if result.status == quoro_proto::CommandStatus::Error {
+                        return Err(command_error(result));
+                    }
+                    let mut history: Vec<wire::LogLine> = result
+                        .lines
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|line| line_ns(&line.time).is_some_and(|ns| ns > last))
+                        .collect();
+                    history.sort_by(|a, b| a.time.cmp(&b.time));
+                    pending.extend(history.into_iter().map(|line| (index, line)));
+                    last
+                }
+                None => -1,
+            };
+            min_ns.push(floor);
+            streams.push((stream, floor));
+        }
+
+        let feed = MergedFeed::start(streams, pending, min_ns, instance.clone(), fallback.clone());
+        Ok(sse(stream::unfold(feed, |mut feed| async move {
+            feed.next_event()
+                .await
+                .map(|event| (Ok::<_, Infallible>(event), feed))
+        })))
+    }
+    .await;
+    ctx.finish_read(&state, access, result).await
 }
 
 // ---------------------------------------------------------------------------
@@ -527,89 +494,110 @@ pub async fn get_deployment_logs(
         "GET /api/v1/deployments/{deployment_id}/logs",
         &headers,
     );
-    ctx.authorize_read(Scope::AppLogs)?;
-    if !deployment_id.starts_with("dep_") {
-        return Err(ApiError::not_found("deployment"));
-    }
-    let app_id: Option<(String,)> = sqlx::query_as("SELECT app_id FROM deployments WHERE id = ?")
+    let target = crate::error::Target {
+        kind: "deployment".to_string(),
+        id: deployment_id.clone(),
+    };
+    let mut access = ctx
+        .authorize_read(
+            &state,
+            Scope::AppLogs,
+            Some(&target),
+            &json!({ "deployment_id": deployment_id }),
+        )
+        .await?;
+    let result: Result<_, ApiError> = async {
+        if !deployment_id.starts_with("dep_") {
+            return Err(ApiError::not_found("deployment"));
+        }
+        let app_id: Option<(String,)> =
+            sqlx::query_as("SELECT app_id FROM deployments WHERE id = ?")
+                .bind(&deployment_id)
+                .fetch_optional(state.store.pool())
+                .await?;
+        let Some((app_id,)) = app_id else {
+            return Err(ApiError::not_found("deployment"));
+        };
+        let project: Option<(String,)> = sqlx::query_as("SELECT project_id FROM apps WHERE id = ?")
+            .bind(&app_id)
+            .fetch_optional(state.store.pool())
+            .await?;
+        access.set_project(project.as_ref().map(|(project_id,)| project_id.as_str()));
+
+        // The link rule of `deploy` (module documentation): the deployment's VM
+        // shares the app and `created_at`. If that row is gone, any VM of the app
+        // still names the node that holds its history.
+        let node: Option<(String,)> = sqlx::query_as(
+            "SELECT v.node_id FROM vms v JOIN deployments d \
+             ON d.app_id = v.app_id AND d.created_at = v.created_at \
+             WHERE d.id = ? LIMIT 1",
+        )
         .bind(&deployment_id)
         .fetch_optional(state.store.pool())
         .await?;
-    let Some((app_id,)) = app_id else {
-        return Err(ApiError::not_found("deployment"));
-    };
-
-    // The link rule of `deploy` (module documentation): the deployment's VM
-    // shares the app and `created_at`. If that row is gone, any VM of the app
-    // still names the node that holds its history.
-    let node: Option<(String,)> = sqlx::query_as(
-        "SELECT v.node_id FROM vms v JOIN deployments d \
-         ON d.app_id = v.app_id AND d.created_at = v.created_at \
-         WHERE d.id = ? LIMIT 1",
-    )
-    .bind(&deployment_id)
-    .fetch_optional(state.store.pool())
-    .await?;
-    let node = match node {
-        Some((node,)) => Some(node),
-        None => sqlx::query_as::<_, (String,)>(
-            "SELECT node_id FROM vms WHERE app_id = ? ORDER BY id LIMIT 1",
-        )
-        .bind(&app_id)
-        .fetch_optional(state.store.pool())
-        .await?
-        .map(|(node,)| node),
-    };
-    let Some(node) = node else {
-        return Ok(Json(DeploymentLogList { items: Vec::new() }));
-    };
-    if !state.hub.is_connected(&node) {
-        return Err(hub_error(HubError::NotConnected));
-    }
-
-    let mut streams: Vec<(DeploymentPhase, NodeStream)> = Vec::new();
-    for phase in DeploymentPhase::ALL {
-        let stream = state
-            .hub
-            .open_stream(
-                &node,
-                "deployment_logs",
-                json!({
-                    "deployment_id": deployment_id,
-                    "phase": phase.as_str(),
-                }),
+        let node = match node {
+            Some((node,)) => Some(node),
+            None => sqlx::query_as::<_, (String,)>(
+                "SELECT node_id FROM vms WHERE app_id = ? ORDER BY id LIMIT 1",
             )
-            .map_err(hub_error)?;
-        streams.push((phase, stream));
-    }
+            .bind(&app_id)
+            .fetch_optional(state.store.pool())
+            .await?
+            .map(|(node,)| node),
+        };
+        let Some(node) = node else {
+            return Ok(Json(DeploymentLogList { items: Vec::new() }));
+        };
+        if !state.hub.is_connected(&node) {
+            return Err(hub_error(HubError::NotConnected));
+        }
 
-    let deadline = Instant::now() + NODE_TIMEOUT;
-    let mut items = Vec::new();
-    for (phase, mut stream) in streams {
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(hub_error(HubError::Timeout));
-            }
-            let event = tokio::time::timeout(remaining, stream.next())
-                .await
-                .map_err(|_| hub_error(HubError::Timeout))?;
-            match event {
-                None | Some(StreamEvent::End { .. }) => break,
-                Some(StreamEvent::Lines(lines)) => {
-                    for line in lines {
-                        items.push(DeploymentLogEntry {
-                            time: line.time,
-                            phase,
-                            message: line.line,
-                        });
+        let mut streams: Vec<(DeploymentPhase, NodeStream)> = Vec::new();
+        for phase in DeploymentPhase::ALL {
+            let stream = state
+                .hub
+                .open_stream(
+                    &node,
+                    "deployment_logs",
+                    json!({
+                        "deployment_id": deployment_id,
+                        "phase": phase.as_str(),
+                    }),
+                )
+                .map_err(hub_error)?;
+            streams.push((phase, stream));
+        }
+
+        let deadline = Instant::now() + NODE_TIMEOUT;
+        let mut items = Vec::new();
+        for (phase, mut stream) in streams {
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(hub_error(HubError::Timeout));
+                }
+                let event = tokio::time::timeout(remaining, stream.next())
+                    .await
+                    .map_err(|_| hub_error(HubError::Timeout))?;
+                match event {
+                    None | Some(StreamEvent::End { .. }) => break,
+                    Some(StreamEvent::Lines(lines)) => {
+                        for line in lines {
+                            items.push(DeploymentLogEntry {
+                                time: line.time,
+                                phase,
+                                message: line.line,
+                            });
+                        }
                     }
                 }
             }
         }
+        items.sort_by(|a, b| a.time.cmp(&b.time));
+        Ok(Json(DeploymentLogList { items }))
     }
-    items.sort_by(|a, b| a.time.cmp(&b.time));
-    Ok(Json(DeploymentLogList { items }))
+    .await;
+    ctx.finish_read(&state, access, result).await
 }
 
 // ---------------------------------------------------------------------------
@@ -750,7 +738,7 @@ fn open_app_stream(
 }
 
 /// The `app_id` or `vm_id` selector of `logs_query`/`app_logs` (exactly one).
-fn selector(app_id: &str, instance: Option<&str>) -> serde_json::Map<String, Value> {
+pub(crate) fn selector(app_id: &str, instance: Option<&str>) -> serde_json::Map<String, Value> {
     let mut params = serde_json::Map::new();
     match instance {
         Some(instance) => {
@@ -764,7 +752,7 @@ fn selector(app_id: &str, instance: Option<&str>) -> serde_json::Map<String, Val
 }
 
 /// The `tail` bound of a log read.
-fn tail_arg(tail: Option<i64>, default: i64, minimum: i64) -> Result<i64, ApiError> {
+pub(crate) fn tail_arg(tail: Option<i64>, default: i64, minimum: i64) -> Result<i64, ApiError> {
     match tail {
         None => Ok(default),
         Some(value) if (minimum..=5000).contains(&value) => Ok(value),
@@ -775,7 +763,7 @@ fn tail_arg(tail: Option<i64>, default: i64, minimum: i64) -> Result<i64, ApiErr
 }
 
 /// Rejects an unknown or malformed app id (404).
-async fn require_app(state: &AppState, app_id: &str) -> Result<(), ApiError> {
+pub(crate) async fn require_app(state: &AppState, app_id: &str) -> Result<(), ApiError> {
     if !app_id.starts_with("app_") {
         return Err(ApiError::not_found("app"));
     }
@@ -787,7 +775,7 @@ async fn require_app(state: &AppState, app_id: &str) -> Result<(), ApiError> {
 }
 
 /// `instance` must name a VM of this app (422 when it does not).
-async fn validate_instance(
+pub(crate) async fn validate_instance(
     state: &AppState,
     app_id: &str,
     instance: Option<&str>,
@@ -814,7 +802,10 @@ async fn validate_instance(
 }
 
 /// `(vm_id, node_id)` of every VM of the app, ordered by VM id.
-async fn app_vms(state: &AppState, app_id: &str) -> Result<Vec<(String, String)>, ApiError> {
+pub(crate) async fn app_vms(
+    state: &AppState,
+    app_id: &str,
+) -> Result<Vec<(String, String)>, ApiError> {
     let rows: Vec<(String, String)> =
         sqlx::query_as("SELECT id, node_id FROM vms WHERE app_id = ? ORDER BY id")
             .bind(app_id)
@@ -824,7 +815,7 @@ async fn app_vms(state: &AppState, app_id: &str) -> Result<Vec<(String, String)>
 }
 
 /// The distinct nodes of the selected VMs, sorted for a deterministic order.
-fn distinct_nodes(vms: &[&(String, String)]) -> Vec<String> {
+pub(crate) fn distinct_nodes(vms: &[&(String, String)]) -> Vec<String> {
     let mut nodes: Vec<String> = vms.iter().map(|(_, node)| node.clone()).collect();
     nodes.sort();
     nodes.dedup();
@@ -833,7 +824,7 @@ fn distinct_nodes(vms: &[&(String, String)]) -> Vec<String> {
 
 /// The `LogEntry` of one line, with the instance or the app's only VM filling
 /// a missing `vm_id`; `None` when the line cannot be attributed.
-fn log_entry(
+pub(crate) fn log_entry(
     line: &wire::LogLine,
     instance: Option<&str>,
     fallback: Option<&str>,
@@ -852,12 +843,12 @@ fn log_entry(
 }
 
 /// Maps a [`HubError`] to the contract's `node_unreachable` (504).
-fn hub_error(error: HubError) -> ApiError {
+pub(crate) fn hub_error(error: HubError) -> ApiError {
     ApiError::new(Code::NodeUnreachable, error.to_string())
 }
 
 /// A `command_result` with `status: error` is a node problem for a log read.
-fn command_error(result: quoro_proto::CommandResult) -> ApiError {
+pub(crate) fn command_error(result: quoro_proto::CommandResult) -> ApiError {
     let detail = result
         .error
         .map(|error| error.message)
