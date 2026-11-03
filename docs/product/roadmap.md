@@ -147,13 +147,13 @@ The ingress backend is an embedded Rust reverse proxy — hyper, rustls and an A
 
 #### Definition of Done
 
-- [ ] Roles: lab-1 runs the control plane (control-plane primary); lab-2 runs a node agent that dials out to lab-1 [D-0011, D-0012].
-- [ ] On lab-2, deploying an image through the panel yields an app that answers HTTP 200 on its domain.
-- [ ] On lab-2, the app is served over TLS for its domain through Cloudflare Tunnel with a test domain the maintainer controls [D-0024, D-0055].
-- [ ] On the lab, the ACME path issues a certificate through DNS-01 against a test zone (separate ingress task) [D-0055].
-- [ ] On lab-2, the panel's live log view shows new lines within the same session while the app writes to stdout; live logs are streamed over SSE [D-0057].
-- [ ] Stop the control plane on lab-1; the app on lab-2 keeps answering HTTP 200 and the node agent keeps reporting its desired state locally [D-0011].
-- [ ] On lab-2, kill the app's process while the control plane on lab-1 is still stopped; the node agent restarts it and the domain answers 200 again [D-0011].
+- [x] Roles: lab-1 runs the control plane (control-plane primary); lab-2 runs a node agent that dials out to lab-1 [D-0011, D-0012].
+- [x] On lab-2, deploying an image through the panel yields an app that answers HTTP 200 on its domain.
+- [x] On lab-2, the app is served over TLS for its domain through Cloudflare Tunnel with a test domain the maintainer controls [D-0024, D-0055].
+- [x] On the lab, the ACME path issues a certificate through DNS-01 against a test zone (separate ingress task) [D-0055].
+- [x] On lab-2, the panel's live log view shows new lines within the same session while the app writes to stdout; live logs are streamed over SSE [D-0057].
+- [x] Stop the control plane on lab-1; the app on lab-2 keeps answering HTTP 200 and the node agent keeps reporting its desired state locally [D-0011].
+- [x] On lab-2, kill the app's process while the control plane on lab-1 is still stopped; the node agent restarts it and the domain answers 200 again [D-0011].
 
 #### Demo script
 
