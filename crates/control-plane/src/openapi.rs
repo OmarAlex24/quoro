@@ -92,6 +92,9 @@ pub struct RateLimited(Problem);
         crate::api::approvals::get_approval,
         crate::api::approvals::approve_approval,
         crate::api::approvals::deny_approval,
+        crate::api::audit::list_audit,
+        crate::api::audit::get_audit_record,
+        crate::api::audit::verify_audit,
         crate::api::cluster::get_cluster,
         crate::api::nodes::list_nodes,
         crate::api::nodes::get_node,
@@ -128,6 +131,10 @@ pub struct RateLimited(Problem);
             crate::api::agents::AgentKey,
             crate::api::agents::AgentKeyCreated,
             crate::api::agents::AccessTokenResponse,
+            crate::api::audit::AuditRecord,
+            crate::api::audit::AuditList,
+            crate::api::audit::AuditVerificationRequest,
+            crate::api::audit::AuditVerificationResult,
             crate::api::cluster::Cluster,
             crate::api::auth::Grant,
             crate::api::grants::GrantList,
@@ -212,14 +219,16 @@ impl utoipa::Modify for Security {
         // body is written `Option<T>`, which also marks the schema nullable.
         // The contract's `NodeJoinTokenRequest` is a plain object, so the
         // annotation names the type and only the body is marked optional here.
-        if let Some(body) = openapi
-            .paths
-            .paths
-            .get_mut("/api/v1/nodes/join-tokens")
-            .and_then(|item| item.post.as_mut())
-            .and_then(|operation| operation.request_body.as_mut())
-        {
-            body.required = Some(utoipa::openapi::Required::False);
+        for path in ["/api/v1/nodes/join-tokens", "/api/v1/audit/verify"] {
+            if let Some(body) = openapi
+                .paths
+                .paths
+                .get_mut(path)
+                .and_then(|item| item.post.as_mut())
+                .and_then(|operation| operation.request_body.as_mut())
+            {
+                body.required = Some(utoipa::openapi::Required::False);
+            }
         }
 
         // The approve and deny requests take an optional note; like

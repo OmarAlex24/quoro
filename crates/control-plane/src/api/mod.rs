@@ -5,6 +5,7 @@
 pub mod agents;
 pub mod approvals;
 pub mod apps;
+pub mod audit;
 pub mod auth;
 pub mod cluster;
 pub mod deployments;
@@ -74,6 +75,9 @@ pub fn routes() -> Router<AppState> {
             "/api/v1/grants/{grant_id}/revoke",
             post(grants::revoke_grant),
         )
+        .route("/api/v1/audit", get(audit::list_audit))
+        .route("/api/v1/audit/verify", post(audit::verify_audit))
+        .route("/api/v1/audit/{seq}", get(audit::get_audit_record))
         .route("/api/v1/nodes", get(nodes::list_nodes))
         .route("/api/v1/nodes/join-tokens", post(enroll::create_join_token))
         .route("/api/v1/nodes/enroll", post(enroll::enroll_node))
