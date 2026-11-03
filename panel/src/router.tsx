@@ -5,6 +5,9 @@ import {
   Outlet,
 } from '@tanstack/react-router';
 import { ChassisHeader } from './components/chassis-header';
+import { AppsScreen } from './screens/apps-screen';
+import { AppScreen } from './screens/app-screen';
+import { DeployScreen } from './screens/deploy-screen';
 import { LoginScreen } from './screens/login-screen';
 import { SetupScreen } from './screens/setup-screen';
 import { VmsScreen } from './screens/vms-screen';
@@ -23,9 +26,27 @@ function RootLayout() {
 
 const rootRoute = createRootRoute({ component: RootLayout });
 
-const indexRoute = createRoute({
+const appsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/',
+  component: AppsScreen,
+});
+
+const appDeployRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/apps/new',
+  component: DeployScreen,
+});
+
+const appDetailRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/apps/$appId',
+  component: AppScreen,
+});
+
+const vmsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/vms',
   component: VmsScreen,
 });
 
@@ -41,7 +62,14 @@ const setupRoute = createRoute({
   component: SetupScreen,
 });
 
-const routeTree = rootRoute.addChildren([indexRoute, loginRoute, setupRoute]);
+const routeTree = rootRoute.addChildren([
+  appsRoute,
+  appDeployRoute,
+  appDetailRoute,
+  vmsRoute,
+  loginRoute,
+  setupRoute,
+]);
 
 export const router = createRouter({
   routeTree,
