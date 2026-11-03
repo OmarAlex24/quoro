@@ -147,7 +147,7 @@ A scope is `<resource>:<verb>` (D-0030). The complete list:
 | `event:read` | Read events and the event stream | |
 | `webhook:read` | List and read webhooks and deliveries | |
 | `webhook:write` | Create, update, delete, test webhooks | human-only |
-| `provider:manage` | Create, list, read, delete providers and rotate their secrets | human-only |
+| `provider:manage` | Create, list, read, delete providers and rotate their secrets; map nodes to tunnel providers | human-only |
 | `user:write` | Manage human users and their roles | human-only |
 
 - **destructive** scopes need JIT approval when an agent uses them: the agent files an approval request, a human approves it, and a short-lived extra grant is issued (D-0030).
@@ -260,11 +260,11 @@ Every action reaches the same service layer through one of these channels, recor
 
 ### Node-agent message types
 
-Defined in node-agent-protocol.md. Node to control plane: `hello`, `heartbeat`, `status_report`, `event`, `lease_renew`, `log_ack`, `stream_data`, `stream_end`, `command_result`. Control plane to node: `welcome`, `desired_state`, `lease_grant`, `lease_revoke`, `log_entries`, `stream_open`, `stream_close`, `command`, `signing_key_rotate`, `error`. Either side: `ping`, `pong`.
+Defined in node-agent-protocol.md. Node to control plane: `hello`, `heartbeat`, `status_report`, `event`, `lease_renew`, `log_ack`, `stream_data`, `stream_end`, `command_result`, `dns_challenge`. Control plane to node: `welcome`, `desired_state`, `lease_grant`, `lease_revoke`, `log_entries`, `stream_open`, `stream_close`, `command`, `signing_key_rotate`, `dns_challenge_result`, `error`. Either side: `ping`, `pong`.
 
 ### Database tables
 
-Defined in db-schema.sql and changed only by the numbered files in `migrations/`: `meta`, `change_log`, `nodes`, `node_join_tokens`, `node_credentials`, `projects`, `vms`, `apps`, `app_env`, `deployments`, `domains`, `volumes`, `leases`, `users`, `api_tokens`, `sessions`, `agents`, `agent_keys`, `access_tokens`, `grants`, `approvals`, `incidents`, `events`, `webhooks`, `webhook_deliveries`, `providers`, `audit_log`, `audit_exports`. Tables marked local in that file are not replicated through the change log.
+Defined in db-schema.sql and changed only by the numbered files in `migrations/`: `meta`, `change_log`, `nodes`, `node_join_tokens`, `node_credentials`, `node_tunnels`, `projects`, `vms`, `apps`, `app_env`, `deployments`, `domains`, `volumes`, `leases`, `users`, `api_tokens`, `sessions`, `agents`, `agent_keys`, `access_tokens`, `grants`, `approvals`, `incidents`, `events`, `webhooks`, `webhook_deliveries`, `providers`, `audit_log`, `audit_exports`. Tables marked local in that file are not replicated through the change log.
 
 ## Open items before the freeze
 

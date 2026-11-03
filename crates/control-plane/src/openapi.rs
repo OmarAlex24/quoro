@@ -111,6 +111,7 @@ pub struct RateLimited(Problem);
             crate::api::nodes::NodeCapacity,
             crate::api::nodes::KvmInfo,
             crate::api::nodes::NodeFenceFailure,
+            crate::api::nodes::NodeTunnel,
             crate::api::enroll::NodeJoinTokenRequest,
             crate::api::enroll::NodeJoinTokenCreated,
             crate::api::enroll::EnrollNodeRequest,
