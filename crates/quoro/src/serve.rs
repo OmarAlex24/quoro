@@ -1,8 +1,8 @@
 //! `quoro serve`: the HTTPS listener of D-0054 and, on a single host, the
 //! primary's own node agent.
 //!
-//! One listener serves the API, the embedded panel (and, from later milestones,
-//! MCP) on a self-signed certificate. Nodes dial the same listener for their
+//! One listener serves the API, the embedded panel and MCP (`/mcp`) on a
+//! self-signed certificate. Nodes dial the same listener for their
 //! session (`node-agent-protocol.md`), so the control plane never touches a
 //! hypervisor itself: it signs desired state and the node agents run it.
 //!
@@ -140,7 +140,8 @@ pub async fn run(config: Config) -> Result<i32, String> {
     )
     .handle(handle.clone())
     .serve(
-        router(state)
+        router(state.clone())
+            .merge(quoro_mcp::router(state))
             .fallback(crate::panel::serve)
             .into_make_service(),
     );

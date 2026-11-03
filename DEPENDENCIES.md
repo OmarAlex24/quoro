@@ -95,6 +95,13 @@ Rules:
 | `rcgen` | `crates/ingress` | `ring`, `pem` (no default features) | A fresh P-256 key and CSR per issuance. Same major `instant-acme` uses; `crates/quoro` still uses 0.13 for the listener certificate, a duplicate the bans check reports as a warning |
 | `x509-parser` | `crates/ingress` | no default features | Reads `notBefore`/`notAfter` of stored certificates for the renewal policy; same major `instant-acme` uses |
 | `time` | `crates/ingress` | `std` (no default features) | Unix timestamps and RFC 3339 rendering of certificate expiry in events |
+| `rmcp` | `crates/mcp` | `server`, `transport-streamable-http-server` (no default features, so no macros and no client) | The official MCP SDK (Apache-2.0): the server handler model and the Streamable HTTP transport, a Tower service mounted at `/mcp` on the one listener (ADR 0054). Pinned to one minor version (`~3.8`) because it ships breaking majors often (ADR 0048). It brings `schemars` (its tool-schema model; Quoro writes its schemas by hand), `sse-stream`, `uuid`, `pastey`, `futures`, `dyn-clone` and `ref-cast` |
+| `axum` | `crates/mcp` | `json` | The `/mcp` route, the bearer-token middleware in front of rmcp's service and the problem response of a refused credential |
+| `serde`, `serde_json` | `crates/mcp` | `derive`, `std` / `std` | Tool arguments and results are JSON; service results are serialized into the tool's structured content |
+| `tracing` | `crates/mcp` | `std` | Logs the internal error of a call that reached the handler without an identity |
+| `quoro-control-plane` (workspace crate) | `crates/mcp` | none | The service layer every tool calls, `CallCtx` and bearer authentication; the MCP crate has no database dependency of its own (ADR 0031) |
+| `quoro-types` (workspace crate) | `crates/mcp` | none | `req_` request ids for each tool call |
+| `quoro-mcp` (workspace crate) | `crates/quoro` | none | The `/mcp` route the binary merges into the control plane's router |
 
 ## Test-only dependencies
 
@@ -116,6 +123,10 @@ Rules:
 | `rcgen` | `crates/ingress` | `ring`, `pem` | Self-signed certificates for the TLS listener tests |
 | `quoro-control-plane` (workspace crate) | `crates/ingress` (example only) | none | The lab example reads a provider credential from the node's database through the in-process accessor, never over HTTP |
 | `tracing-subscriber` | `crates/ingress` (example only) | `fmt`, `std` | Logs of the lab example |
+| `tokio`, `axum` | `crates/mcp` | `macros`, `rt-multi-thread`, `net` / `http1`, `tokio` | The integration tests serve the control-plane router and `/mcp` on an ephemeral port, as `quoro serve` merges them |
+| `reqwest`, `rustls` | `crates/mcp` | `json`, `cookies` / `ring`, `std` | Drive `/mcp` and the API over real HTTP; the cookie jar proves a session cookie is refused by `/mcp` |
+| `sqlx` | `crates/mcp` | `sqlite`, `runtime-tokio` | The tests read the audit log to compare an MCP call with the same HTTP call; the crate itself never touches the database |
+| `serde_norway` | `crates/mcp` | no default features | The contract test derives each tool's input schema from the frozen `openapi.yaml` (ADR 0048) and compares it with the served one |
 
 ## Tooling outside Cargo
 

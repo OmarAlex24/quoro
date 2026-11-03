@@ -1,0 +1,40 @@
+[package]
+name = "quoro-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+# The MCP server is a thin adapter over the control plane's service layer
+# (ADR 0031): it depends on no database crate, so it cannot query SQL or build
+# an audit record even by accident.
+[dependencies]
+quoro-control-plane = { path = "../control-plane" }
+# Request ids (`req_`) and id-shape checks for tool arguments.
+quoro-types = { path = "../types" }
+# The official MCP SDK, pinned to one minor version (ADR 0048): the server
+# handler model and the Streamable HTTP transport as a Tower service.
+rmcp = { version = "~3.8", default-features = false, features = [
+    "server",
+    "transport-streamable-http-server",
+] }
+# The `/mcp` route, the bearer-token middleware and the problem response.
+axum = { version = "0.8", default-features = false, features = ["json"] }
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "cookies"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# Tests read the audit log to compare an MCP call with the same HTTP call;
+# only the tests touch the database, never the crate itself.
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio"] }
+# The schema test reads the frozen openapi.yaml (ADR 0048).
+serde_norway = { version = "0.9", default-features = false }
