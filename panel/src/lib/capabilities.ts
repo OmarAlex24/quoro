@@ -32,6 +32,9 @@ export const canManageGrants = humanWriter;
 /** Create, change, delete and test webhooks (`webhook:write`). */
 export const canManageWebhooks = humanWriter;
 
-/** Read the user list to show names instead of ids (`user:write`, owner only). */
-export const canListUsers = (me: MeResponse | undefined): boolean =>
-  isHumanSession(me) && me?.user?.role === 'owner';
+/**
+ * Read the user list to show names instead of ids (`user:read`). Every human
+ * role holds it, so owner, operator and viewer all see names; an agent session
+ * never lists users.
+ */
+export const canListUsers = (me: MeResponse | undefined): boolean => isHumanSession(me);

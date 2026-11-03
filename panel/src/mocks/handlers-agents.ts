@@ -3,11 +3,12 @@ import type {
   Agent,
   AgentKey,
   AgentKeyCreated,
+  AgentKeyList,
   AgentList,
   CreateAgentRequest,
   UpdateAgentRequest,
 } from '../api/generated/model';
-import { agency, appendAudit, findAgent } from './agency';
+import { agency, agentKeys, appendAudit, findAgent } from './agency';
 import { db, mockId, now } from './db';
 import {
   conflict,
@@ -236,6 +237,14 @@ export const agentsHandlers: HttpHandler[] = [
     });
 
     return noContent();
+  }),
+
+  http.get('*/api/v1/agents/:agentId/keys', ({ request, params }) => {
+    if (!signedIn()) return unauthorized();
+    const agentId = String(params.agentId);
+    if (!findAgent(agentId)) return notFound('That agent');
+    const list: AgentKeyList = page(agentKeys(agentId), request);
+    return json(list);
   }),
 
   http.post('*/api/v1/agents/:agentId/keys', ({ params }) => {

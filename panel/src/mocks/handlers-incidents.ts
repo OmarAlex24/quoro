@@ -2,11 +2,11 @@ import { http, type HttpHandler } from 'msw';
 import type { IncidentDetail, User, UserList } from '../api/generated/model';
 import { agency } from './agency';
 import { db } from './db';
-import { json, notFound, page, signedIn, unauthorized, writeRefusal } from './http';
+import { json, notFound, page, signedIn, unauthorized } from './http';
 
 /**
  * Incidents (read only: the grant form picks one, the audit view links one)
- * and the user list, which needs `user:write` and so answers the owner only.
+ * and the user list, which needs `user:read` and so answers every human role.
  */
 export const incidentsHandlers: HttpHandler[] = [
   http.get('*/api/v1/incidents', ({ request }) => {
@@ -34,9 +34,7 @@ export const incidentsHandlers: HttpHandler[] = [
   }),
 
   http.get('*/api/v1/users', ({ request }) => {
-    const user = signedIn();
-    if (!user) return unauthorized();
-    if (user.role !== 'owner') return writeRefusal('user:write');
+    if (!signedIn()) return unauthorized();
     const users: User[] = db.owner ? [db.owner] : [];
     const list: UserList = page(users, request);
     return json(list);

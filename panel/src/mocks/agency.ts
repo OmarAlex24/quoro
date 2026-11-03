@@ -153,6 +153,21 @@ export const agency = (): AgencyState => {
 export const findAgent = (agentId: string): Agent | undefined =>
   state.agents.find((agent) => agent.id === agentId);
 
+/**
+ * An agent's keys, newest first, revoked keys included. Keys minted in the same
+ * millisecond keep the later one first, so a just-created key leads the list.
+ */
+export const agentKeys = (agentId: string): AgentKey[] =>
+  state.keys
+    .map((key, index) => ({ key, index }))
+    .filter(({ key }) => key.agent_id === agentId)
+    .sort(
+      (left, right) =>
+        right.key.created_at.localeCompare(left.key.created_at) ||
+        right.index - left.index,
+    )
+    .map(({ key }) => key);
+
 // ---------------------------------------------------------------- audit and events
 
 /** What a handler passes: everything but the chain fields, which are computed here. */
@@ -324,6 +339,13 @@ const seedAgency = (): void => {
       created_at: minutesAgo(178),
       revoked_at: null,
       last_used_at: minutesAgo(12),
+    },
+    {
+      id: mockId('akey'),
+      agent_id: restarter.id,
+      created_at: minutesAgo(3_900),
+      revoked_at: minutesAgo(1_000),
+      last_used_at: minutesAgo(1_100),
     },
     {
       id: mockId('akey'),
