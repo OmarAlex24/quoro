@@ -1940,7 +1940,7 @@ dependencies = [
 
 [[package]]
 name = "quoro"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "axum",
  "axum-server",
@@ -1965,7 +1965,7 @@ dependencies = [
 
 [[package]]
 name = "quoro-control-plane"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "argon2",
  "axum",
@@ -1994,7 +1994,7 @@ dependencies = [
 
 [[package]]
 name = "quoro-engine"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "flate2",
  "futures-core",
@@ -2010,7 +2010,7 @@ dependencies = [
 
 [[package]]
 name = "quoro-ingress"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "bytes",
  "http-body-util",
@@ -2033,14 +2033,14 @@ dependencies = [
 
 [[package]]
 name = "quoro-init"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "rustix",
 ]
 
 [[package]]
 name = "quoro-node-agent"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
@@ -2067,7 +2067,7 @@ dependencies = [
 
 [[package]]
 name = "quoro-proto"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -2077,7 +2077,7 @@ dependencies = [
 
 [[package]]
 name = "quoro-providers"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "axum",
  "reqwest 0.12.28",
@@ -2091,7 +2091,7 @@ dependencies = [
 
 [[package]]
 name = "quoro-types"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "getrandom 0.3.4",
  "serde",
