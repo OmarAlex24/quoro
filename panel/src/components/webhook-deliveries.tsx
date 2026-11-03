@@ -1,7 +1,12 @@
+import { FlaskConical } from 'lucide-react';
 import { useListWebhookDeliveries } from '../api/generated/webhooks/webhooks';
 import { expiryWords, shortId } from '../lib/agency-format';
 import { relativeTime } from '../lib/app-status';
-import { deliveryLamp, deliveryPollingInterval } from '../lib/webhooks';
+import {
+  deliveryAttemptWords,
+  deliveryLamp,
+  deliveryPollingInterval,
+} from '../lib/webhooks';
 import { CopyButton } from './copy-button';
 import { ToneLamp } from './tone-lamp';
 
@@ -43,9 +48,21 @@ export function WebhookDeliveries({ webhookId }: { webhookId: string }) {
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
                     <span className="type-body-medium text-[14px] text-ink">{lamp.word}</span>
-                    <span className="type-data text-[13px] text-ink-muted">
-                      Attempt {delivery.attempt}
-                    </span>
+                    {delivery.test ? (
+                      <span className="inline-flex items-center gap-1 text-[13px] font-medium text-ink">
+                        <FlaskConical
+                          aria-hidden
+                          size={14}
+                          strokeWidth={2}
+                          className="text-cobalt"
+                        />
+                        {deliveryAttemptWords(delivery)}
+                      </span>
+                    ) : (
+                      <span className="type-data text-[13px] text-ink-muted">
+                        {deliveryAttemptWords(delivery)}
+                      </span>
+                    )}
                     <span className="type-data text-[13px] text-ink-muted">
                       {delivery.response_code === null ||
                       delivery.response_code === undefined

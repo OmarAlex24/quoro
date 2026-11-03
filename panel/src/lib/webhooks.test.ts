@@ -3,6 +3,7 @@ import type { Webhook } from '../api/generated/model';
 import {
   buildCreateWebhookBody,
   buildUpdateWebhookBody,
+  deliveryAttemptWords,
   deliveryLamp,
   deliveryPollingInterval,
   describeEventTypes,
@@ -187,5 +188,16 @@ describe('buildUpdateWebhookBody', () => {
     expect(buildUpdateWebhookBody(webhook, form).wake).toMatchObject({
       grant_ttl_s: 14_400,
     });
+  });
+});
+
+describe('deliveryAttemptWords', () => {
+  it('numbers the attempts of a real delivery', () => {
+    expect(deliveryAttemptWords({ attempt: 1, test: false })).toBe('Attempt 1');
+    expect(deliveryAttemptWords({ attempt: 3, test: false })).toBe('Attempt 3');
+  });
+
+  it('names a test delivery instead of numbering it', () => {
+    expect(deliveryAttemptWords({ attempt: 1, test: true })).toBe('Test delivery');
   });
 });

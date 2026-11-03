@@ -400,6 +400,19 @@ async fn failed_attempt_schedules_a_retry() {
             .get::<Option<String>, _>("next_attempt_at")
             .is_some()
     );
+
+    // The first attempt and its retry are real deliveries.
+    let list: Value = owner
+        .get(server.url(&format!("/api/v1/webhooks/{webhook_id}/deliveries")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let items = list["items"].as_array().unwrap();
+    assert!(items.len() >= 2);
+    assert!(items.iter().all(|item| item["test"] == false), "{list}");
 }
 
 #[tokio::test]
@@ -913,6 +926,7 @@ async fn test_delivery_is_signed_and_recorded() {
     assert_eq!(delivery["status"], "delivered");
     assert_eq!(delivery["response_code"], 200);
     assert_eq!(delivery["event_id"], event_id);
+    assert_eq!(delivery["test"], true);
     let delivery_id = delivery["id"].as_str().unwrap().to_string();
 
     let captured = wait_for(|| async {
@@ -957,6 +971,7 @@ async fn test_delivery_is_signed_and_recorded() {
         .await
         .unwrap();
     assert_eq!(list["items"][0]["id"], delivery_id);
+    assert_eq!(list["items"][0]["test"], true);
 }
 
 /// One delivery row of a webhook, by test flag.
@@ -1027,6 +1042,27 @@ async fn test_delivery_after_a_real_delivery_does_not_collide() {
     assert_eq!(replay.1, 1);
     assert_eq!(replay.2, "delivered");
     assert!(replay.3.is_none());
+    assert_eq!(delivery["test"], true);
+
+    // The list tells the test delivery from the real one of the same event.
+    let list: Value = owner
+        .get(server.url(&format!("/api/v1/webhooks/{webhook_id}/deliveries")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let flag_of = |id: &str| {
+        list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == id)
+            .map(|item| item["test"].clone())
+    };
+    assert_eq!(flag_of(&replay.0), Some(json!(true)), "{list}");
+    assert_eq!(flag_of(&real.0), Some(json!(false)), "{list}");
 }
 
 /// A test delivery of an event before the dispatcher reaches it does not block

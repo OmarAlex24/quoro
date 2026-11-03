@@ -274,8 +274,9 @@ export const webhooksHandlers: HttpHandler[] = [
       params: { webhook_id: webhook.id, delivery_id: delivery.id, url: webhook.url },
     });
 
-    // The receiver answers a moment later. A URL containing "fail" fails, so
-    // the retry path can be seen in the panel.
+    // The receiver answers a moment later. A URL containing "fail" fails. A
+    // test delivery is attempted once and never retried, so it gets no next
+    // attempt.
     schedule(() => {
       const current = state.deliveries.find((candidate) => candidate.id === delivery.id);
       if (!current || current.status !== 'pending') return;
@@ -283,7 +284,6 @@ export const webhooksHandlers: HttpHandler[] = [
         current.status = 'failed';
         current.response_code = 500;
         current.error = 'receiver answered 500 Internal Server Error';
-        current.next_attempt_at = new Date(Date.now() + 10_000).toISOString();
       } else {
         current.status = 'delivered';
         current.response_code = 200;

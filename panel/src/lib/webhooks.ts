@@ -78,6 +78,14 @@ const DELIVERY_LAMPS: Record<WebhookDeliveryStatus, DeliveryLamp> = {
 export const deliveryLamp = (status: WebhookDeliveryStatus): DeliveryLamp =>
   DELIVERY_LAMPS[status];
 
+/**
+ * What the attempt slot of a delivery row says. A test delivery is always
+ * attempt 1 and never retried, so it says "Test delivery" instead of a number.
+ */
+export const deliveryAttemptWords = (
+  delivery: Pick<WebhookDelivery, 'attempt' | 'test'>,
+): string => (delivery.test ? 'Test delivery' : `Attempt ${delivery.attempt}`);
+
 /** Every 2 s while an attempt is still pending, otherwise every 15 s. */
 export const deliveryPollingInterval = (
   deliveries: ReadonlyArray<Pick<WebhookDelivery, 'status'>>,

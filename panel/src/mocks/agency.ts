@@ -428,6 +428,18 @@ const seedAgency = (): void => {
     },
     {
       id: mockId('whd'),
+      webhook_id: webhook.id,
+      event_id: appDown.id,
+      attempt: 1,
+      status: 'delivered',
+      response_code: 200,
+      error: null,
+      next_attempt_at: null,
+      test: true,
+      created_at: minutesAgo(12),
+    },
+    {
+      id: mockId('whd'),
       webhook_id: notifier.id,
       event_id: appDown.id,
       attempt: 3,
