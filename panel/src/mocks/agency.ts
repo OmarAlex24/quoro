@@ -198,46 +198,50 @@ export const appendAudit = (input: AuditInput): AuditRecord => {
   return draft;
 };
 
-/** Recompute the links over `[from, to]`; the first mismatch is the broken seq. */
+/**
+ * Re-walk `[from, to]` as audit-log-format.md section 6 does: a seq gap, then
+ * the record's own hash, then its link to the record before. The first
+ * failure is the broken seq; `checked` counts the records verified before it.
+ */
 export const verifyAuditChain = (from?: number, to?: number): AuditVerificationResult => {
   const records = state.audit;
   const last = records[records.length - 1];
   const firstSeq = Math.max(1, from ?? 1);
   const lastSeq = Math.min(last?.seq ?? 1, to ?? last?.seq ?? 1);
+  const headHash = records.find((record) => record.seq === lastSeq)?.hash ?? ZERO_HASH;
+  let prev = firstSeq === 1 ? ZERO_HASH : (records.find((r) => r.seq === firstSeq - 1)?.hash ?? ZERO_HASH);
+  let expectSeq = firstSeq;
   let checked = 0;
-  for (const record of records) {
-    if (record.seq < firstSeq || record.seq > lastSeq) continue;
-    checked += 1;
-    const expectedPrev = record.seq === 1 ? ZERO_HASH : records[record.seq - 2]?.hash;
-    if (record.prev_hash !== expectedPrev) {
-      return broken(record.seq, 'prev_hash does not match the hash of the record before it');
-    }
-    if (auditHash(record) !== record.hash) {
-      return broken(record.seq, 'hash does not match the record contents');
-    }
-  }
-  return {
-    ok: true,
-    checked,
-    first_seq: firstSeq,
-    last_seq: lastSeq,
-    head_hash: last?.hash ?? ZERO_HASH,
-    broken_at_seq: null,
-    reason: null,
-  };
 
-  function broken(seq: number, reason: string): AuditVerificationResult {
+  const broken = (seq: number, reason: 'seq_gap' | 'hash_mismatch' | 'prev_mismatch'): AuditVerificationResult => {
     emitEvent('audit.chain_broken', { type: 'cluster', id: 'cluster' }, { broken_at_seq: seq, reason });
     return {
       ok: false,
       checked,
       first_seq: firstSeq,
       last_seq: lastSeq,
-      head_hash: last?.hash ?? ZERO_HASH,
+      head_hash: headHash,
       broken_at_seq: seq,
       reason,
     };
+  };
+
+  for (const record of records) {
+    if (record.seq < firstSeq || record.seq > lastSeq) continue;
+    if (record.seq !== expectSeq) return broken(record.seq, 'seq_gap');
+    if (auditHash(record) !== record.hash) return broken(record.seq, 'hash_mismatch');
+    if (record.prev_hash !== prev) return broken(record.seq, 'prev_mismatch');
+    prev = record.hash;
+    expectSeq += 1;
+    checked += 1;
   }
+  return {
+    ok: true,
+    checked,
+    first_seq: firstSeq,
+    last_seq: lastSeq,
+    head_hash: headHash,
+  };
 };
 
 /** Append one event to the event log. */

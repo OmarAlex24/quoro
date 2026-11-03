@@ -1,0 +1,301 @@
+import { getRouteApi, Link } from '@tanstack/react-router';
+import type { ReactNode } from 'react';
+import { useGetAgent } from '../api/generated/agents/agents';
+import { useGetAuditRecord } from '../api/generated/audit/audit';
+import type { AuditRecord } from '../api/generated/model';
+import { isApiProblem } from '../api/fetcher';
+import { shortHash, shortId } from '../lib/agency-format';
+import {
+  actorWords,
+  AUDIT_DETAIL_FIELDS,
+  channelWords,
+  localTime,
+  resultLamp,
+  resultWords,
+  type AuditDetailFieldKey,
+} from '../lib/audit';
+import { problemView } from '../lib/problem';
+import { CopyButton } from './copy-button';
+import { AgentName, UserName } from './identity-name';
+import { ToneLamp } from './tone-lamp';
+import { Button } from './ui/button';
+import { ProblemBanner } from './ui/problem-banner';
+
+/** A record field the format omits when it has no value. */
+const hasText = (value: string | null | undefined): value is string =>
+  typeof value === 'string' && value.length > 0;
+
+function NotRecorded() {
+  return <span className="text-ink-muted">Not recorded</span>;
+}
+
+function DetailRow({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="grid gap-0.5 border-b border-rail/60 py-2 last:border-b-0 sm:grid-cols-[9.5rem_minmax(0,1fr)] sm:gap-3">
+      <dt className="text-[12px] leading-snug text-ink-muted">{label}</dt>
+      <dd className="min-w-0 text-[13px] leading-snug text-ink [overflow-wrap:anywhere]">{children}</dd>
+    </div>
+  );
+}
+
+/** The owner of an agent, read from the agent itself (only for agent actors). */
+function AgentOwner({ agentId }: { agentId: string }) {
+  const agent = useGetAgent(agentId, { query: { retry: false, staleTime: 30_000 } });
+  const owner = agent.data?.owner_user_id;
+  return hasText(owner) ? <UserName id={owner} /> : <NotRecorded />;
+}
+
+function Parameters({ params }: { params: AuditRecord['params'] }) {
+  const entries = Object.entries(params ?? {});
+  if (entries.length === 0) {
+    return <span className="text-ink-muted">No parameters recorded.</span>;
+  }
+  return (
+    <dl className="flex flex-col gap-1.5">
+      {entries.map(([key, value]) => (
+        <div key={key} className="min-w-0">
+          <dt className="type-data text-[12px] text-ink-muted">{key}</dt>
+          <dd className="min-w-0 [overflow-wrap:anywhere]">
+            {value !== null && typeof value === 'object' ? (
+              <pre className="font-sans type-data mt-0.5 max-w-full overflow-x-auto whitespace-pre-wrap break-words text-[12px] leading-snug text-ink">
+                {JSON.stringify(value, null, 2)}
+              </pre>
+            ) : (
+              <span className="type-data break-words text-[12px] text-ink">
+                {value === null ? 'null' : String(value)}
+              </span>
+            )}
+          </dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+function HashLine({ value }: { value: string }) {
+  return (
+    <div className="min-w-0">
+      <span className="type-data block break-all text-[12px] leading-snug">{value}</span>
+      <CopyButton value={value} label="Copy hash" />
+    </div>
+  );
+}
+
+function TargetValue({ record }: { record: AuditRecord }) {
+  if (!hasText(record.target_type) && !hasText(record.target_id)) return <NotRecorded />;
+  const type = record.target_type ?? 'target';
+  if (!hasText(record.target_id)) return <span className="type-data">{type}</span>;
+  const id = record.target_id;
+  return (
+    <span className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+      <span className="text-ink-muted">{type}</span>
+      {type === 'app' ? (
+        <Link
+          to="/apps/$appId"
+          params={{ appId: id }}
+          title={id}
+          className="type-data text-ink underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+        >
+          {shortId(id)}
+        </Link>
+      ) : (
+        <span className="type-data break-all" title={id}>
+          {shortId(id)}
+        </span>
+      )}
+    </span>
+  );
+}
+
+export function AuditRecordPanel({ seq, onClose }: { seq: number; onClose: () => void }) {
+  const search = getRouteApi('/audit').useSearch();
+  const recordQuery = useGetAuditRecord(seq);
+
+  const missing = isApiProblem(recordQuery.error) && recordQuery.error.code === 'not_found';
+  const record = recordQuery.data;
+
+  const renderValue = (key: AuditDetailFieldKey, value: AuditRecord): ReactNode => {
+    switch (key) {
+      case 'seq':
+        return <span className="type-data text-[14px]">{value.seq}</span>;
+      case 'time':
+        return (
+          <span className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+            <span className="type-data text-[13px]">{localTime(value.time)}</span>
+            <span className="type-data text-[12px] text-ink-muted" title="RFC 3339">
+              {value.time}
+            </span>
+          </span>
+        );
+      case 'actor':
+        return (
+          <span className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+            <span className="text-ink-muted">{actorWords[value.actor_type]}</span>
+            {value.actor_type === 'agent' ? (
+              <AgentName id={value.actor_id} />
+            ) : value.actor_type === 'user' ? (
+              <UserName id={value.actor_id} />
+            ) : (
+              <span className="type-data break-all" title={value.actor_id}>
+                {shortId(value.actor_id)}
+              </span>
+            )}
+          </span>
+        );
+      case 'agent_model':
+        return hasText(value.agent_model) ? (
+          <span className="type-data">{value.agent_model}</span>
+        ) : (
+          <NotRecorded />
+        );
+      case 'agent_owner':
+        return value.actor_type === 'agent' ? (
+          <AgentOwner agentId={value.actor_id} />
+        ) : (
+          <NotRecorded />
+        );
+      case 'on_behalf_of':
+        return hasText(value.on_behalf_of) ? <UserName id={value.on_behalf_of} /> : <NotRecorded />;
+      case 'channel':
+        return <span>{channelWords[value.channel]}</span>;
+      case 'operation':
+        return <span className="type-data break-all">{value.operation}</span>;
+      case 'scope':
+        return hasText(value.scope) ? (
+          <span className="type-data">{value.scope}</span>
+        ) : (
+          <NotRecorded />
+        );
+      case 'target':
+        return <TargetValue record={value} />;
+      case 'project':
+        return hasText(value.project_id) ? (
+          <span className="type-data break-all" title={value.project_id}>
+            {shortId(value.project_id)}
+          </span>
+        ) : (
+          <NotRecorded />
+        );
+      case 'params':
+        return <Parameters params={value.params} />;
+      case 'justification':
+        return hasText(value.justification) ? (
+          <span>{value.justification}</span>
+        ) : (
+          <NotRecorded />
+        );
+      case 'trigger_event':
+        return hasText(value.trigger_event_id) ? (
+          <span className="type-data break-all" title={value.trigger_event_id}>
+            {shortId(value.trigger_event_id)}
+          </span>
+        ) : (
+          <NotRecorded />
+        );
+      case 'incident':
+        return hasText(value.incident_id) ? (
+          <Link
+            to="/audit"
+            search={{ ...search, incident_id: value.incident_id, seq: undefined }}
+            title={value.incident_id}
+            className="type-data text-ink underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+          >
+            {shortId(value.incident_id)}
+          </Link>
+        ) : (
+          <NotRecorded />
+        );
+      case 'grant':
+        return hasText(value.grant_id) ? (
+          <span className="type-data break-all" title={value.grant_id}>
+            {shortId(value.grant_id)}
+          </span>
+        ) : (
+          <NotRecorded />
+        );
+      case 'approval':
+        return hasText(value.approval_id) ? (
+          <span className="type-data break-all" title={value.approval_id}>
+            {shortId(value.approval_id)}
+          </span>
+        ) : (
+          <NotRecorded />
+        );
+      case 'request_id':
+        return (
+          <span className="flex flex-wrap items-center gap-2">
+            <span className="type-data break-all" title={value.request_id}>
+              {shortId(value.request_id)}
+            </span>
+            <CopyButton value={value.request_id} label="Copy request id" />
+          </span>
+        );
+      case 'result':
+        return (
+          <span className="inline-flex items-center gap-1.5">
+            <ToneLamp
+              tone={resultLamp(value.result)}
+              size={13}
+              label={resultWords[value.result]}
+            />
+            <span>{resultWords[value.result]}</span>
+          </span>
+        );
+      case 'result_detail':
+        return hasText(value.result_detail) ? (
+          <span className="type-data">{value.result_detail}</span>
+        ) : (
+          <NotRecorded />
+        );
+      case 'change_seq':
+        return typeof value.change_seq === 'number' ? (
+          <span className="type-data">{value.change_seq}</span>
+        ) : (
+          <NotRecorded />
+        );
+      case 'prev_hash':
+        return <HashLine value={value.prev_hash} />;
+      case 'hash':
+        return <HashLine value={value.hash} />;
+    }
+  };
+
+  return (
+    <section
+      aria-label={`Audit entry ${seq}`}
+      className="rounded-[6px] border border-rail bg-panel bay-shadow"
+    >
+      <div className="flex items-start justify-between gap-3 border-b border-rail px-4 py-3">
+        <div className="min-w-0">
+          <h2 className="type-bay-title text-[16px] leading-tight">
+            Entry <span className="type-data">{seq}</span>
+          </h2>
+          <p className="mt-0.5 type-data text-[11px] text-ink-muted" title={record?.hash}>
+            {record ? shortHash(record.hash) : 'reading the record'}
+          </p>
+        </div>
+        <Button variant="quiet" onClick={onClose}>
+          Close
+        </Button>
+      </div>
+
+      <div className="px-4 py-3">
+        {recordQuery.isPending ? (
+          <p className="text-[13px] text-ink-muted">Reading entry {seq}…</p>
+        ) : missing ? (
+          <p className="text-[13px] text-ink">No entry with that sequence number.</p>
+        ) : recordQuery.error ? (
+          <ProblemBanner view={problemView(recordQuery.error, 'read this entry')} />
+        ) : record ? (
+          <dl>
+            {AUDIT_DETAIL_FIELDS.map((field) => (
+              <DetailRow key={field.key} label={field.label}>
+                {renderValue(field.key, record)}
+              </DetailRow>
+            ))}
+          </dl>
+        ) : null}
+      </div>
+    </section>
+  );
+}
