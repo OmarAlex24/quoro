@@ -63,6 +63,12 @@ pub async fn list_agents(
         .authorize_read(state, Scope::AgentRead, None, &json!({}))
         .await?;
     let result: Result<_, ApiError> = async {
+        if access.reads_nothing() {
+            return Ok(AgentList {
+                items: Vec::new(),
+                next_cursor: None,
+            });
+        }
         let rows = sqlx::query(
             "SELECT id, name, model, owner_user_id, description, disabled, created_at, updated_at \
              FROM agents WHERE id > ? ORDER BY id LIMIT ?",
