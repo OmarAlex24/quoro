@@ -48,8 +48,6 @@ pub const PENDING: &[&str] = &[
     "list_incidents",
     "get_incident",
     "resolve_incident",
-    "request_approval",
-    "get_approval",
     "list_audit",
 ];
 
@@ -163,6 +161,24 @@ const SPECS: &[ToolSpec] = &[
         title: "Delete an app and its data",
         input_schema: schema_delete_app,
     },
+    ToolSpec {
+        name: "request_approval",
+        operation_id: "createApproval",
+        scope: "approval:create",
+        mutating: true,
+        destructive: false,
+        title: "File an approval request",
+        input_schema: schema_request_approval,
+    },
+    ToolSpec {
+        name: "get_approval",
+        operation_id: "getApproval",
+        scope: "approval:read",
+        mutating: false,
+        destructive: false,
+        title: "Read one approval request",
+        input_schema: schema_get_approval,
+    },
 ];
 
 /// Every wired tool spec.
@@ -179,7 +195,10 @@ pub fn specs() -> &'static [ToolSpec] {
 // description. `Quoro-Justification` becomes the required `justification`
 // property of a mutating tool, `Quoro-Incident` the optional `incident_id`;
 // every other header is skipped. `required` lists the path parameters, the
-// required query parameters and `justification`.
+// required query parameters and `justification`. A JSON request body follows,
+// its properties appended in YAML order after the parameter-derived ones and
+// skipping names that already exist; its `required` names are added. The body's
+// `$ref`s are inlined verbatim (the args validator does not resolve them).
 // ---------------------------------------------------------------------------
 
 /// Assembles an input schema object. `required` is omitted when empty.
@@ -225,6 +244,15 @@ fn deployment_id() -> Value {
     })
 }
 
+/// The path parameter `approval_id` (`components/parameters/ApprovalId`).
+fn approval_id() -> Value {
+    json!({
+        "type": "string",
+        "pattern": "^apr_[0-9A-HJKMNP-TV-Z]{26}$",
+        "description": "Approval request id (`apr_...`)."
+    })
+}
+
 /// The query parameter `limit` (`components/parameters/Limit`).
 fn limit() -> Value {
     json!({
@@ -260,6 +288,77 @@ fn incident_id() -> Value {
         "type": "string",
         "pattern": "^inc_[0-9A-HJKMNP-TV-Z]{26}$",
         "description": "The incident (`inc_...`) the call belongs to, when an agent acts on an incident (D-0032). Recorded in the audit log and used to evaluate incident grants (D-0030)."
+    })
+}
+
+/// The `CreateApprovalRequest` body's `scope` (`components/schemas/Scope`),
+/// inlined because the args validator does not resolve `$ref`.
+fn scope() -> Value {
+    json!({
+        "type": "string",
+        "title": "Scope",
+        "description": "One scope, `<resource>:<verb>` (D-0030). Wildcards are not allowed in\ngrants; scopes are listed explicitly.\n",
+        "enum": [
+            "cluster:read",
+            "node:read",
+            "node:enroll",
+            "node:remove",
+            "node:fence_ack",
+            "project:read",
+            "project:write",
+            "project:delete",
+            "vm:read",
+            "vm:create",
+            "vm:start",
+            "vm:stop",
+            "vm:delete",
+            "app:read",
+            "app:create",
+            "app:update",
+            "app:restart",
+            "app:redeploy",
+            "app:deploy",
+            "app:start",
+            "app:stop",
+            "app:delete",
+            "app:logs",
+            "agent:read",
+            "agent:write",
+            "grant:read",
+            "grant:write",
+            "approval:read",
+            "approval:create",
+            "approval:decide",
+            "incident:read",
+            "incident:resolve",
+            "audit:read",
+            "event:read",
+            "webhook:read",
+            "webhook:write",
+            "provider:manage",
+            "user:write"
+        ]
+    })
+}
+
+/// The `CreateApprovalRequest` body's `target` (`components/schemas/Target`),
+/// inlined.
+fn target() -> Value {
+    json!({
+        "type": "object",
+        "title": "Target",
+        "description": "One addressed resource.",
+        "required": ["type", "id"],
+        "properties": {
+            "type": {
+                "type": "string",
+                "description": "Resource kind, for example `app`, `vm`, `project` or `node`."
+            },
+            "id": {
+                "type": "string",
+                "description": "Id of the resource."
+            }
+        }
     })
 }
 
@@ -392,6 +491,42 @@ fn schema_delete_app() -> Value {
     )
 }
 
+/// The tool carries one `justification` and one `incident_id`: the MCP
+/// equivalents of the `Quoro-Justification` and `Quoro-Incident` headers and,
+/// for `request_approval`, of the body fields of the same names. The body's
+/// properties are appended after the header ones, so the duplicates are
+/// skipped and `justification` stays first.
+fn schema_request_approval() -> Value {
+    schema(
+        vec![
+            ("justification", justification()),
+            ("incident_id", incident_id()),
+            ("scope", scope()),
+            ("target", target()),
+            (
+                "operation",
+                json!({
+                    "type": "string",
+                    "description": "Endpoint template or MCP tool name the agent intends to call."
+                }),
+            ),
+            (
+                "params",
+                json!({
+                    "type": "object",
+                    "additionalProperties": true,
+                    "description": "The intended call parameters."
+                }),
+            ),
+        ],
+        &["justification", "scope", "target", "operation", "params"],
+    )
+}
+
+fn schema_get_approval() -> Value {
+    schema(vec![("approval_id", approval_id())], &["approval_id"])
+}
+
 // ---------------------------------------------------------------------------
 // Listing
 // ---------------------------------------------------------------------------
@@ -424,8 +559,9 @@ fn description(spec: &ToolSpec) -> String {
 }
 
 /// What MCP clients may assume about a call: reads are read-only and
-/// idempotent; restart and redeploy are neither; delete is idempotent and
-/// destructive. Every tool stays within Quoro's closed world.
+/// idempotent; restart, redeploy and filing an approval request are neither;
+/// delete is idempotent and destructive. Every tool stays within Quoro's
+/// closed world.
 fn annotations(spec: &ToolSpec) -> ToolAnnotations {
     if spec.mutating {
         ToolAnnotations::new()
@@ -557,8 +693,39 @@ async fn dispatch(
             let app_id = id(arguments, "app_id");
             to_value(service::apps::delete_app(state, ctx, app_id).await)
         }
+        "request_approval" => {
+            let body = approval_request(arguments)?;
+            to_value(service::approvals::create_approval(state, ctx, &body, None).await)
+        }
+        "get_approval" => {
+            let approval_id = id(arguments, "approval_id");
+            to_value(service::approvals::get_approval(state, ctx, approval_id).await)
+        }
         _ => Err(ApiError::internal(&format!("tool {name} has no dispatch"))),
     }
+}
+
+/// Builds the body of `request_approval`. The tool has one `justification` and
+/// one `incident_id`, the MCP equivalents of the header and of the body field,
+/// so the argument feeds both the [`CallCtx`] and the body. No idempotency key
+/// travels over MCP: a repeated call files a second request.
+///
+/// A missing `justification` is refused here instead of by the service: the
+/// body type requires it, and over HTTP a body without it is rejected before
+/// the service, unaudited.
+fn approval_request(
+    arguments: &JsonObject,
+) -> Result<api::approvals::CreateApprovalRequest, ApiError> {
+    let justification = text(arguments, "justification")
+        .ok_or_else(|| ApiError::validation("justification is required"))?;
+    Ok(api::approvals::CreateApprovalRequest {
+        scope: text(arguments, "scope").unwrap_or_default(),
+        target: arguments.get("target").cloned().unwrap_or(Value::Null),
+        operation: text(arguments, "operation").unwrap_or_default(),
+        params: arguments.get("params").cloned().unwrap_or(Value::Null),
+        justification,
+        incident_id: text(arguments, "incident_id"),
+    })
 }
 
 /// Serializes a service value, mapping a serialization failure to an internal
