@@ -89,6 +89,58 @@ jobs:
       - name: OpenAPI 3.1 and JSON Schema 2020-12 validation
         run: '"$RUNNER_TEMP/venv/bin/python" -I .github/scripts/validate_contracts.py'
 
+  panel:
+    name: Panel (typecheck, test, build)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: panel
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The same Node.js the release build uses (ADR 0027, ADR 0090): pinned
+      # in packaging/node.txt and verified against its sha256 before use.
+      - name: Node.js
+        run: |
+          set -euo pipefail
+          bin="$("$GITHUB_WORKSPACE/packaging/fetch-node.sh" "$RUNNER_TEMP/node")"
+          printf '%s\n' "$bin" >> "$GITHUB_PATH"
+          "$bin/node" --version
+          "$bin/npm" --version
+      # Exactly the lockfile, with the flags the release build uses.
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+      # typecheck generates the API client from the contract first; the tests
+      # import it, so they run after it.
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test
+        run: npm test
+      - name: Production build
+        run: npm run build
+
+  agent-runner:
+    name: Agent runner (test)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: examples/agent-runner
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The runner uses only the standard library; test on the oldest Python
+      # it supports, so nothing newer slips in.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+      # Offline: the tests start a fake Quoro and the runner on 127.0.0.1.
+      - name: Test
+        run: python -m unittest discover -s tests -v
+
   release-image:
     name: Release build image
     runs-on: ubuntu-24.04
