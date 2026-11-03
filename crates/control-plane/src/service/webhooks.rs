@@ -32,8 +32,8 @@ const WEBHOOK_COLUMNS: &str = "id, name, url, event_types, selector, secret_enc,
      updated_at";
 
 /// Every column of [`WebhookDelivery`].
-const DELIVERY_COLUMNS: &str =
-    "id, webhook_id, event_id, attempt, status, response_code, error, next_attempt_at, created_at";
+const DELIVERY_COLUMNS: &str = "id, webhook_id, event_id, attempt, status, response_code, error, next_attempt_at, \
+     test, created_at";
 
 /// A `webhooks` row, including the encrypted secret. Only the dispatcher and
 /// the service layer read the secret.
@@ -158,6 +158,7 @@ fn delivery_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<WebhookDelivery, A
         response_code: row.try_get("response_code")?,
         error: row.try_get("error")?,
         next_attempt_at: row.try_get("next_attempt_at")?,
+        test: row.try_get("test")?,
         created_at: row.try_get("created_at")?,
     })
 }

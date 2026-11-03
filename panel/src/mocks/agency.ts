@@ -423,6 +423,7 @@ const seedAgency = (): void => {
       response_code: 202,
       error: null,
       next_attempt_at: null,
+      test: false,
       created_at: minutesAgo(15),
     },
     {
@@ -434,6 +435,7 @@ const seedAgency = (): void => {
       response_code: 503,
       error: 'receiver answered 503 Service Unavailable',
       next_attempt_at: minutesAhead(25),
+      test: false,
       created_at: minutesAgo(5),
     },
   );
