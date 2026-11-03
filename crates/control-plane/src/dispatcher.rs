@@ -166,6 +166,32 @@ pub(crate) fn signature(secret: &str, timestamp: i64, body: &[u8]) -> String {
     out
 }
 
+/// The incident grant a wake delivery carries in `data.wake` (section 8.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WakeRef {
+    pub agent_id: String,
+    pub grant_id: String,
+}
+
+/// The delivery body: the event envelope, plus `data.wake` for a wake delivery.
+///
+/// Only a copy is extended; [`envelope`] stays untouched so the event log and
+/// the SSE stream never carry `wake`. The extra field is inserted before
+/// serialization, so `Quoro-Signature` covers it like the rest of the body.
+#[must_use]
+fn delivery_body(event: &EventRow, wake: Option<&WakeRef>) -> Value {
+    let mut body = envelope(event);
+    if let Some(wake) = wake
+        && let Value::Object(data) = &mut body["data"]
+    {
+        data.insert(
+            "wake".to_string(),
+            json!({ "agent_id": wake.agent_id, "grant_id": wake.grant_id }),
+        );
+    }
+    body
+}
+
 /// Outcome of one POST.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SendOutcome {
@@ -182,15 +208,17 @@ impl SendOutcome {
     }
 }
 
-/// POSTs the signed envelope to the webhook receiver.
+/// POSTs the signed envelope to the webhook receiver. A test delivery passes
+/// no `wake`, so it never carries `data.wake`.
 pub(crate) async fn send_once(
     client: &reqwest::Client,
     webhook: &WebhookRow,
     event: &EventRow,
     delivery_id: &str,
     secret: &str,
+    wake: Option<&WakeRef>,
 ) -> SendOutcome {
-    let body = match serde_json::to_vec(&envelope(event)) {
+    let body = match serde_json::to_vec(&delivery_body(event, wake)) {
         Ok(body) => body,
         Err(error) => {
             return SendOutcome {
@@ -323,7 +351,17 @@ async fn dispatch_event(
     drop(conn);
 
     for row in &rows {
-        let webhook = webhook_row_from_row(row)?;
+        let webhook = match webhook_row_from_row(row) {
+            Ok(webhook) => webhook,
+            Err(error) => {
+                tracing::warn!(
+                    event_id = %event.id,
+                    error = ?error,
+                    "webhook row is unreadable; delivery skipped"
+                );
+                continue;
+            }
+        };
         if !webhook.event_types.is_empty()
             && !webhook
                 .event_types
@@ -335,50 +373,66 @@ async fn dispatch_event(
         if !webhook.selector.matches(&resolved) {
             continue;
         }
-        let delivery_id = new_id(Prefix::WebhookDelivery);
-        let now = now_rfc3339();
-        let mut w = state.store.begin_write().await?;
-        sqlx::query(
-            "INSERT INTO webhook_deliveries (id, webhook_id, event_id, attempt, status, response_code, error, next_attempt_at, created_at) \
-             VALUES (?, ?, ?, 1, 'pending', NULL, NULL, NULL, ?)",
-        )
-        .bind(&delivery_id)
-        .bind(&webhook.id)
-        .bind(&event.id)
-        .bind(&now)
-        .execute(&mut *w.tx)
-        .await?;
-        // Wake before sending, in the same transaction as the delivery row.
-        if event.kind == "incident.opened"
-            && webhook.wake.is_some()
-            && let Err(error) = issue_wake(&mut w.tx, &webhook, event).await
-        {
+        // One webhook's failure must not stop the event's remaining deliveries.
+        if let Err(error) = deliver_to_webhook(state, client, event, &webhook).await {
             tracing::warn!(
                 webhook_id = %webhook.id,
                 event_id = %event.id,
                 error = ?error,
-                "incident grant not issued; delivery skipped"
+                "webhook delivery failed"
             );
-            continue;
         }
-        w.commit().await?;
-
-        let secret = match decrypt_secret(state, &webhook) {
-            Ok(secret) => secret,
-            Err(error) => {
-                tracing::warn!(webhook_id = %webhook.id, error = ?error, "webhook secret unavailable");
-                let outcome = SendOutcome {
-                    response_code: None,
-                    error: Some("the webhook secret cannot be decrypted".to_string()),
-                };
-                record_outcome(state, &webhook.id, event, &delivery_id, 1, &outcome).await?;
-                continue;
-            }
-        };
-        let outcome = send_once(client, &webhook, event, &delivery_id, &secret).await;
-        record_outcome(state, &webhook.id, event, &delivery_id, 1, &outcome).await?;
     }
     Ok(())
+}
+
+/// Delivers one event to one matched webhook, recording the attempt.
+async fn deliver_to_webhook(
+    state: &AppState,
+    client: &reqwest::Client,
+    event: &EventRow,
+    webhook: &WebhookRow,
+) -> Result<(), ApiError> {
+    let delivery_id = new_id(Prefix::WebhookDelivery);
+    let now = now_rfc3339();
+    let mut w = state.store.begin_write().await?;
+    sqlx::query(
+        "INSERT INTO webhook_deliveries (id, webhook_id, event_id, attempt, status, response_code, error, next_attempt_at, created_at, test) \
+         VALUES (?, ?, ?, 1, 'pending', NULL, NULL, NULL, ?, 0)",
+    )
+    .bind(&delivery_id)
+    .bind(&webhook.id)
+    .bind(&event.id)
+    .bind(&now)
+    .execute(&mut *w.tx)
+    .await?;
+    // Wake before sending, in the same transaction as the delivery row.
+    let wake =
+        match (event.kind.as_str(), &webhook.wake) {
+            ("incident.opened", Some(configured)) => issue_wake(&mut w.tx, webhook, event)
+                .await?
+                .map(|grant_id| WakeRef {
+                    agent_id: configured.agent_id.clone(),
+                    grant_id,
+                }),
+            _ => None,
+        };
+    w.commit().await?;
+
+    let secret = match decrypt_secret(state, webhook) {
+        Ok(secret) => secret,
+        Err(error) => {
+            tracing::warn!(webhook_id = %webhook.id, error = ?error, "webhook secret unavailable");
+            let outcome = SendOutcome {
+                response_code: None,
+                error: Some("the webhook secret cannot be decrypted".to_string()),
+            };
+            record_outcome(state, &webhook.id, event, &delivery_id, 1, &outcome).await?;
+            return Ok(());
+        }
+    };
+    let outcome = send_once(client, webhook, event, &delivery_id, &secret, wake.as_ref()).await;
+    record_outcome(state, &webhook.id, event, &delivery_id, 1, &outcome).await
 }
 
 /// Processes pending retry rows whose `next_attempt_at` has come.
@@ -393,64 +447,112 @@ async fn deliver_due_retries(state: &AppState, client: &reqwest::Client) -> Resu
     .fetch_all(state.store.pool())
     .await?;
     for row in &rows {
-        let id: String = row.try_get("id")?;
-        let webhook_id: String = row.try_get("webhook_id")?;
-        let event_id: String = row.try_get("event_id")?;
-        let attempt: i64 = row.try_get("attempt")?;
-        let mut conn = state.store.pool().acquire().await?;
-        let webhook_row = sqlx::query("SELECT * FROM webhooks WHERE id = ?")
-            .bind(&webhook_id)
-            .fetch_optional(&mut *conn)
-            .await?;
-        let Some(webhook_row) = webhook_row else {
-            drop(conn);
-            // The webhook was deleted; its deliveries cascade.
-            continue;
-        };
-        let webhook = webhook_row_from_row(&webhook_row)?;
-        if !webhook.enabled {
-            let outcome = SendOutcome {
-                response_code: None,
-                error: Some("webhook is disabled".to_string()),
-            };
-            drop(conn);
-            // A disabled webhook does not retry: record the attempt as the last.
-            record_outcome(
-                state,
-                &webhook.id,
-                &dummy_event(&event_id),
-                &id,
-                MAX_ATTEMPTS,
-                &outcome,
-            )
-            .await?;
-            continue;
+        // One failing row must not abort the rest of the batch.
+        if let Err(error) = deliver_retry(state, client, row).await {
+            let id = row.try_get::<String, _>("id").unwrap_or_default();
+            tracing::warn!(delivery_id = %id, error = ?error, "webhook retry failed");
         }
-        let event = match read_event(&mut conn, &event_id).await {
-            Ok(event) => event,
-            Err(error) => {
-                drop(conn);
-                tracing::warn!(event_id = %event_id, error = ?error, "retry event is gone");
-                continue;
-            }
-        };
-        drop(conn);
-        let secret = match decrypt_secret(state, &webhook) {
-            Ok(secret) => secret,
-            Err(error) => {
-                tracing::warn!(webhook_id = %webhook.id, error = ?error, "webhook secret unavailable");
-                let outcome = SendOutcome {
-                    response_code: None,
-                    error: Some("the webhook secret cannot be decrypted".to_string()),
-                };
-                record_outcome(state, &webhook.id, &event, &id, attempt, &outcome).await?;
-                continue;
-            }
-        };
-        let outcome = send_once(client, &webhook, &event, &id, &secret).await;
-        record_outcome(state, &webhook.id, &event, &id, attempt, &outcome).await?;
     }
     Ok(())
+}
+
+/// Processes one due retry row.
+async fn deliver_retry(
+    state: &AppState,
+    client: &reqwest::Client,
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<(), ApiError> {
+    let id: String = row.try_get("id")?;
+    let webhook_id: String = row.try_get("webhook_id")?;
+    let event_id: String = row.try_get("event_id")?;
+    let attempt: i64 = row.try_get("attempt")?;
+    let mut conn = state.store.pool().acquire().await?;
+    let webhook_row = sqlx::query("SELECT * FROM webhooks WHERE id = ?")
+        .bind(&webhook_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    let Some(webhook_row) = webhook_row else {
+        drop(conn);
+        // The webhook was deleted; its deliveries cascade.
+        return Ok(());
+    };
+    let webhook = webhook_row_from_row(&webhook_row)?;
+    if !webhook.enabled {
+        let outcome = SendOutcome {
+            response_code: None,
+            error: Some("webhook is disabled".to_string()),
+        };
+        drop(conn);
+        // A disabled webhook does not retry: record the attempt as the last.
+        record_outcome(
+            state,
+            &webhook.id,
+            &dummy_event(&event_id),
+            &id,
+            MAX_ATTEMPTS,
+            &outcome,
+        )
+        .await?;
+        return Ok(());
+    }
+    let event = match read_event(&mut conn, &event_id).await {
+        Ok(event) => event,
+        Err(error) => {
+            drop(conn);
+            tracing::warn!(event_id = %event_id, error = ?error, "retry event is gone");
+            return Ok(());
+        }
+    };
+    // A wake retry carries the grant attempt 1 issued, recorded in the audit
+    // log by `issue_wake` in the same transaction as that attempt.
+    let wake = retry_wake(&mut conn, &webhook, &event).await?;
+    drop(conn);
+    let secret = match decrypt_secret(state, &webhook) {
+        Ok(secret) => secret,
+        Err(error) => {
+            tracing::warn!(webhook_id = %webhook.id, error = ?error, "webhook secret unavailable");
+            let outcome = SendOutcome {
+                response_code: None,
+                error: Some("the webhook secret cannot be decrypted".to_string()),
+            };
+            record_outcome(state, &webhook.id, &event, &id, attempt, &outcome).await?;
+            return Ok(());
+        }
+    };
+    let outcome = send_once(client, &webhook, &event, &id, &secret, wake.as_ref()).await;
+    record_outcome(state, &webhook.id, &event, &id, attempt, &outcome).await
+}
+
+/// Recovers the wake grant of a retried delivery from the audit record
+/// `issue_wake` wrote for it. Only an `incident.opened` event delivered to a
+/// webhook with `wake` ever has one; every other retry sends no `data.wake`.
+async fn retry_wake(
+    conn: &mut SqliteConnection,
+    webhook: &WebhookRow,
+    event: &EventRow,
+) -> Result<Option<WakeRef>, ApiError> {
+    if event.kind != "incident.opened" {
+        return Ok(None);
+    }
+    if webhook.wake.is_none() {
+        return Ok(None);
+    }
+    // The agent comes from the issued grant's record, not from the webhook's
+    // current `wake`, which a PATCH may have pointed at another agent since.
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT grant_id, json_extract(params, '$.agent_id') FROM audit_log \
+         WHERE operation = 'grant.issue' \
+         AND json_extract(params, '$.webhook_id') = ? \
+         AND json_extract(params, '$.event_id') = ? \
+         AND grant_id IS NOT NULL \
+         AND json_extract(params, '$.agent_id') IS NOT NULL \
+         ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(&webhook.id)
+    .bind(&event.id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(row.map(|(grant_id, agent_id)| WakeRef { agent_id, grant_id }))
 }
 
 /// A placeholder only used when a retry row has no readable event; scheduling
@@ -502,8 +604,8 @@ async fn record_outcome(
         let next = new_id(Prefix::WebhookDelivery);
         let due = rfc3339_in(retry_delay(attempt));
         sqlx::query(
-            "INSERT INTO webhook_deliveries (id, webhook_id, event_id, attempt, status, response_code, error, next_attempt_at, created_at) \
-             VALUES (?, ?, ?, ?, 'pending', NULL, NULL, ?, ?)",
+            "INSERT INTO webhook_deliveries (id, webhook_id, event_id, attempt, status, response_code, error, next_attempt_at, created_at, test) \
+             VALUES (?, ?, ?, ?, 'pending', NULL, NULL, ?, ?, 0)",
         )
         .bind(&next)
         .bind(webhook_id)

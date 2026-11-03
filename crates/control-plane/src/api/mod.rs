@@ -20,6 +20,7 @@ pub mod nodes;
 pub mod page;
 pub mod projects;
 pub mod providers;
+pub mod users;
 pub mod vms;
 pub mod webhooks;
 
@@ -47,7 +48,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/api/v1/agents/{agent_id}/keys",
-            post(agents::create_agent_key),
+            get(agents::list_agent_keys).post(agents::create_agent_key),
         )
         .route(
             "/api/v1/agents/{agent_id}/keys/{key_id}",
@@ -78,6 +79,7 @@ pub fn routes() -> Router<AppState> {
             "/api/v1/grants/{grant_id}/revoke",
             post(grants::revoke_grant),
         )
+        .route("/api/v1/users", get(users::list_users))
         .route("/api/v1/audit", get(audit::list_audit))
         .route("/api/v1/audit/verify", post(audit::verify_audit))
         .route("/api/v1/audit/{seq}", get(audit::get_audit_record))

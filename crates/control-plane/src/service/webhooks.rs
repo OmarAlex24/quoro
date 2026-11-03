@@ -866,9 +866,12 @@ async fn test_webhook_tx(
     let delivery_id = new_id(Prefix::WebhookDelivery);
     let created_at = now_rfc3339();
     let mut w = state.store.begin_write().await?;
+    // A test delivery is its own row (`test = 1`, attempt 1, never retried), so
+    // it neither collides with nor blocks a real delivery of the same event
+    // (migration 0004).
     sqlx::query(
-        "INSERT INTO webhook_deliveries (id, webhook_id, event_id, attempt, status, response_code, error, next_attempt_at, created_at) \
-         VALUES (?, ?, ?, 1, 'pending', NULL, NULL, NULL, ?)",
+        "INSERT INTO webhook_deliveries (id, webhook_id, event_id, attempt, status, response_code, error, next_attempt_at, created_at, test) \
+         VALUES (?, ?, ?, 1, 'pending', NULL, NULL, NULL, ?, 1)",
     )
     .bind(&delivery_id)
     .bind(webhook_id)
@@ -899,8 +902,9 @@ async fn test_webhook_tx(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| ApiError::internal(&format!("HTTP client: {error}")))?;
+    // A test delivery never carries `data.wake` and never issues a grant.
     let outcome: SendOutcome =
-        dispatcher::send_once(&client, &webhook, &event, &delivery_id, &secret).await;
+        dispatcher::send_once(&client, &webhook, &event, &delivery_id, &secret, None).await;
     let mut w = state.store.begin_write().await?;
     sqlx::query(
         "UPDATE webhook_deliveries SET status = ?, response_code = ?, error = ? WHERE id = ?",

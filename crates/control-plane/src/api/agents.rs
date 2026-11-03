@@ -164,6 +164,17 @@ impl utoipa::ToSchema for AgentKeyCreated {
     }
 }
 
+/// One page of an agent's keys, newest first, revoked keys included. A key
+/// never carries its secret here.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[schema(title = "AgentKeyList")]
+pub struct AgentKeyList {
+    pub items: Vec<AgentKey>,
+    /// Cursor for the next page, or null on the last page.
+    #[schema(required)]
+    pub next_cursor: Option<String>,
+}
+
 /// A short-lived agent access token minted from an agent key.
 #[derive(Clone, Debug, Serialize, ToSchema)]
 #[schema(title = "AccessTokenResponse")]
@@ -408,6 +419,58 @@ pub async fn update_agent(
     );
     let agent = crate::service::agents::update_agent(&state, &ctx, &agent_id, &body).await?;
     Ok(Json(agent))
+}
+
+/// The agent's keys, newest first, revoked keys included. Secrets are never
+/// returned: a key's secret is shown once, by `createAgentKey`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/agents/{agent_id}/keys",
+    tag = "agents",
+    operation_id = "listAgentKeys",
+    extensions(("x-quoro-scope" = json!("agent:read"))),
+    params(
+        ("agent_id" = String, Path, description = "Agent id (`agt_...`).", pattern = "^agt_[0-9A-HJKMNP-TV-Z]{26}$"),
+        AgentPage,
+    ),
+    responses(
+        (status = 200, description = "One page of the agent's keys.", body = AgentKeyList,
+            headers(("Quoro-Request-Id" = String, description = "Correlation id of this call."))),
+        (status = 401, response = crate::openapi::Unauthenticated),
+        (status = 403, response = crate::openapi::Forbidden),
+        (status = 404, response = crate::openapi::NotFound),
+        (status = 422, response = crate::openapi::ValidationFailed),
+        (status = 429, response = crate::openapi::RateLimited),
+    )
+)]
+///
+/// # Errors
+///
+/// `forbidden` without `agent:read`, `not_found` for an unknown or malformed
+/// agent id, `validation_failed` for a bad page, or a database error.
+pub async fn list_agent_keys(
+    State(state): State<AppState>,
+    identity: Identity,
+    headers: HeaderMap,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Path(agent_id): Path<String>,
+    Query(page): Query<AgentPage>,
+) -> Result<Json<AgentKeyList>, ApiError> {
+    let ctx = CallCtx::new(
+        identity,
+        request_id,
+        "GET /api/v1/agents/{agent_id}/keys",
+        &headers,
+    );
+    let list = crate::service::agents::list_agent_keys(
+        &state,
+        &ctx,
+        &agent_id,
+        page.limit()?,
+        page.after(),
+    )
+    .await?;
+    Ok(Json(list))
 }
 
 /// Creates an agent key and returns its secret once.
