@@ -16,6 +16,8 @@ path = "src/main.rs"
 [dependencies]
 quoro-control-plane = { path = "../control-plane" }
 quoro-engine = { path = "../engine" }
+# The node agent: `quoro join`, `quoro node` and the primary's local node.
+quoro-node-agent = { path = "../node-agent" }
 quoro-types = { path = "../types" }
 # The async runtime: listener, signals, the driver channel and the driver loop.
 tokio = { version = "1", default-features = false, features = [

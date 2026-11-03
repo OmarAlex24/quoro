@@ -11,7 +11,12 @@ workspace = true
 
 [dependencies]
 quoro-types = { path = "../types" }
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+# Wire messages, RFC 8785 canonical JSON and the desired-state signature.
+quoro-proto = { path = "../proto" }
+# `ws` serves the node-agent session (GET /api/v1/nodes/session).
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
+# Node public keys and credentials are base64 (node-agent-protocol.md section 2).
+base64 = { version = "0.22", default-features = false, features = ["std"] }
 tokio = { version = "1", default-features = false, features = ["sync", "time", "rt", "macros"] }
 sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio"] }
 serde = { version = "1", default-features = false, features = ["derive", "std"] }

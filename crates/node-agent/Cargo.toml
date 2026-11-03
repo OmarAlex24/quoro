@@ -22,7 +22,33 @@ tokio = { version = "1", default-features = false, features = [
     "sync",
     "time",
     "macros",
+    "net",
+    "rt",
+    "fs",
+    "io-util",
 ] }
+# TLS to the primary, pinned to its certificate fingerprint (section 2.2); the
+# ring provider is the one ADR 0080 allows.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# The dial-out WebSocket session over that TLS stream (section 3.1).
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+# `StreamExt`/`SinkExt` on the WebSocket.
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# The enrollment POST over the same pinned TLS stream (section 2.3).
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = { version = "0.1", default-features = false }
+# The local node store (section 12) is SQLite, like the control plane's.
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio"] }
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+# The certificate pin is SHA-256 over the DER certificate.
+sha2 = { version = "0.10", default-features = false }
+base64 = { version = "0.22", default-features = false, features = ["std"] }
+# Node keypair seeds, boot ids and message ids come from the OS generator.
+getrandom = { version = "0.3", default-features = false }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # Tests need the `#[tokio::test]` macro, a runtime, and `test-util` to pause the

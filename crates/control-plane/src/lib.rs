@@ -17,7 +17,8 @@ pub mod driver;
 pub mod error;
 pub mod events;
 pub mod idempotency;
-pub mod jcs;
+/// RFC 8785 canonical JSON, shared with the node agent through `quoro-proto`.
+pub use quoro_proto::jcs;
 pub mod openapi;
 pub mod request;
 pub mod store;

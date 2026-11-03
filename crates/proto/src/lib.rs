@@ -4,23 +4,33 @@
 //!
 //! See `docs/contracts/node-agent-protocol.md`.
 //!
-//! M0 runs the node agent and the in-process primary in the same process, so
-//! these types are plain Rust values with no serialization yet; the wire form
-//! (serde) arrives with the session work.
+//! The lease types below date from M0, when the node agent and the primary ran
+//! in one process; they now also carry the serde attributes of their wire
+//! form. [`wire`] has the envelope and every other message body, [`sign`] the
+//! cluster signature and [`jcs`] the RFC 8785 canonical JSON both use.
 
 use std::time::SystemTime;
 
+use serde::{Deserialize, Serialize};
+
+pub mod jcs;
+pub mod sign;
+pub mod wire;
+
 /// A message id (`msg_`). Message-local: it pairs a request with its answer
 /// inside one session and is never persisted (section 3.3).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct MsgId(pub String);
 
 /// A lease id (`lse_`) (section 5.12).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct LeaseId(pub String);
 
 /// What a lease protects (section 5.12, `resource_type`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ResourceType {
     /// A stateful application.
     App,
@@ -29,7 +39,8 @@ pub enum ResourceType {
 }
 
 /// How long a lease stays valid without the authority (section 8.3, 8.4).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LeaseMode {
     /// No expiry: it ends only by a revoke (section 8.3).
     Local,
@@ -38,7 +49,8 @@ pub enum LeaseMode {
 }
 
 /// Why a lease was revoked (section 5.13, `reason`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RevokeReason {
     /// The lease moved to another node.
     Moved,
@@ -51,7 +63,8 @@ pub enum RevokeReason {
 }
 
 /// The outcome of an intrusive message (section 5.9).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CommandStatus {
     /// The command was carried out.
     Ok,
@@ -60,7 +73,8 @@ pub enum CommandStatus {
 }
 
 /// Protocol error codes (section 5.18).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     /// Envelope major version not implemented (fatal).
     UnsupportedVersion,
@@ -74,6 +88,9 @@ pub enum ErrorCode {
     BadMessage,
     /// The node's change-log copy diverged from the primary's.
     LogDiverged,
+    /// A self-fence could not confirm that every bound VM stopped (section
+    /// 5.18, ADR 0079).
+    FenceFailed,
 }
 
 /// The `data.reason` enum of the `node.fenced` event (section 8.5,
@@ -87,7 +104,7 @@ pub enum FenceReason {
 }
 
 /// Body of `lease_grant` (section 5.12).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseGrant {
     /// The lease being granted.
     pub lease_id: LeaseId,
@@ -100,13 +117,14 @@ pub struct LeaseGrant {
     /// Strictly increasing per resource, never reused (section 8.6).
     pub fencing_token: u64,
     /// Present for `expiring`, absent for `local` (section 5.12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
     /// The authority's wall-clock time of the grant.
     pub granted_at: String,
 }
 
 /// Body of `lease_renew` (section 5.5).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseRenew {
     /// The lease being renewed.
     pub lease_id: LeaseId,
@@ -115,7 +133,7 @@ pub struct LeaseRenew {
 }
 
 /// Body of `lease_revoke` (section 5.13).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseRevoke {
     /// The lease to revoke.
     pub lease_id: LeaseId,
@@ -126,18 +144,23 @@ pub struct LeaseRevoke {
 }
 
 /// Body of `command_result` (section 5.9).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandResult {
     /// `ok` or `error`.
     pub status: CommandStatus,
     /// Short human-readable detail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     /// Structured error, when `status` is `error`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorBody>,
+    /// Log lines answering `command` kind `logs_query` (section 5.9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines: Option<Vec<wire::LogLine>>,
 }
 
 /// The `error` object of a `command_result` (section 5.9).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorBody {
     /// One of the section 5.18 codes.
     pub code: ErrorCode,
@@ -146,7 +169,7 @@ pub struct ErrorBody {
 }
 
 /// Body of `error` (section 5.18).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolError {
     /// One of the codes below the section 5.18 table.
     pub code: ErrorCode,

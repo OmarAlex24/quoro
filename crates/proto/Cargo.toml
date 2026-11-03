@@ -8,3 +8,13 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# Every message is JSON on the wire (node-agent-protocol.md section 3.2).
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+# desired_state and signing_key_rotate are signed with the cluster's Ed25519
+# key (section 5.11, ADR 0050); both sides sign or verify through this crate.
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast", "zeroize"] }
+# Keys and signatures travel as standard base64 (section 2.4).
+base64 = { version = "0.22", default-features = false, features = ["std"] }
