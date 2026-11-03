@@ -1,0 +1,19 @@
+# Throwaway spike (issue #65): obtain and renew one certificate through ACME
+# DNS-01 with instant-acme. Its own workspace on purpose: it is NOT part of the
+# repository's cargo workspace.
+[workspace]
+
+[package]
+name = "acme-dns01-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "AGPL-3.0-only"
+
+[dependencies]
+instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls", "time", "x509-parser"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots-no-provider"] }
+serde_json = "1"
