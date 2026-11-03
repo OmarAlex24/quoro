@@ -3,11 +3,23 @@
 //! nftables rules that isolate the VMs from each other (architecture.md
 //! section 9).
 //!
-//! Every VM on the bridge is isolated from every other VM on it: bridge port
-//! isolation drops the L2 hairpin, and the `forward` chain drops bridge to
-//! bridge for the L3 path. A VM still reaches the gateway (ICMP and replies)
-//! and the internet through masquerade, and the host can still open
-//! connections to a VM, because the ingress runs on the host.
+//! Every VM on the bridge is isolated from every other VM on it, except from
+//! the VMs of its own isolation group (engine-trait.md section 3.3, ADR 0084).
+//! Three layers enforce it:
+//!
+//! - a bridge-family `forward` chain accepts a frame between two TAP ports only
+//!   when the `(in, out)` pair is in the bridge's `peers` set, which holds
+//!   every ordered pair of TAPs that share a group, and drops every other
+//!   port-to-port frame;
+//! - bridge port isolation stays on for a VM without a group, so the kernel
+//!   itself drops its frames to every other isolated port;
+//! - the `ip` `forward` chain drops bridge to bridge for the routed path, except
+//!   frames the bridge chain marked as same-group (that only matters when
+//!   `br_netfilter` sends bridged traffic through the `ip` hooks).
+//!
+//! A VM still reaches the gateway (ICMP and replies) and the internet through
+//! masquerade, and the host can still open connections to a VM, because the
+//! ingress runs on the host.
 //!
 //! The bridge is never reconfigured silently: an existing bridge that does not
 //! carry exactly the requested gateway address is `Conflict`
@@ -25,6 +37,10 @@ use crate::{NodeNetwork, VmId};
 
 /// Where Linux exposes one directory per network interface.
 const SYS_CLASS_NET: &str = "/sys/class/net";
+
+/// The packet mark the bridge chain sets on a same-group frame, so the `ip`
+/// `forward` chain lets it through when `br_netfilter` is loaded.
+pub const PEER_MARK: u32 = 0x5155_0084;
 
 /// The forwarding switch the bridge needs to route between its own ports and
 /// the node's uplink.
@@ -179,6 +195,10 @@ pub fn ruleset(bridge: &str, subnet: &Subnet) -> String {
     );
     let _ = writeln!(
         rules,
+        "        iifname \"{bridge}\" oifname \"{bridge}\" meta mark {PEER_MARK:#010x} accept"
+    );
+    let _ = writeln!(
+        rules,
         "        iifname \"{bridge}\" oifname \"{bridge}\" drop"
     );
     let _ = writeln!(
@@ -218,7 +238,82 @@ pub fn ruleset(bridge: &str, subnet: &Subnet) -> String {
     );
     let _ = writeln!(rules, "    }}");
     let _ = writeln!(rules, "}}");
+    let _ = writeln!(rules, "table bridge {table} {{}}");
+    let _ = writeln!(rules, "delete table bridge {table}");
+    let _ = writeln!(rules, "table bridge {table} {{");
+    let _ = writeln!(rules, "    set peers {{");
+    let _ = writeln!(rules, "        type ifname . ifname");
+    let _ = writeln!(rules, "    }}");
+    let _ = writeln!(rules, "    chain forward {{");
+    let _ = writeln!(
+        rules,
+        "        type filter hook forward priority filter; policy accept;"
+    );
+    let _ = writeln!(
+        rules,
+        "        meta ibrname \"{bridge}\" iifname . oifname @peers meta mark set {PEER_MARK:#010x} accept"
+    );
+    let _ = writeln!(rules, "        meta ibrname \"{bridge}\" drop");
+    let _ = writeln!(rules, "    }}");
+    let _ = writeln!(rules, "}}");
     rules
+}
+
+/// Every ordered pair of TAPs that share an isolation group, sorted.
+///
+/// `members` is `(tap, group)` for every VM on one bridge; a VM without a
+/// group pairs with nobody.
+#[must_use]
+pub fn peer_pairs(members: &[(String, Option<String>)]) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    for (tap, group) in members {
+        let Some(group) = group else { continue };
+        for (other, other_group) in members {
+            if other != tap && other_group.as_ref() == Some(group) {
+                pairs.push((tap.clone(), other.clone()));
+            }
+        }
+    }
+    pairs.sort();
+    pairs.dedup();
+    pairs
+}
+
+/// The `nft -f -` script that replaces the bridge's `peers` set with `pairs`,
+/// in one transaction.
+#[must_use]
+pub fn peers_script(bridge: &str, pairs: &[(String, String)]) -> String {
+    let table = table_name(bridge);
+    let mut script = format!("flush set bridge {table} peers\n");
+    if !pairs.is_empty() {
+        let elements = pairs
+            .iter()
+            .map(|(a, b)| format!("\"{a}\" . \"{b}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(script, "add element bridge {table} peers {{ {elements} }}");
+    }
+    script
+}
+
+/// Replaces the bridge's `peers` set (see [`peers_script`]).
+///
+/// # Errors
+///
+/// `Conflict` for a malformed bridge or TAP name (they are written into the
+/// script), `Io`/`Timeout` when `nft` fails.
+pub async fn sync_peers(
+    tools: &HostTools,
+    bridge: &str,
+    pairs: &[(String, String)],
+) -> Result<(), EngineError> {
+    validate_bridge_name(bridge)?;
+    for (a, b) in pairs {
+        validate_bridge_name(a)?;
+        validate_bridge_name(b)?;
+    }
+    tools::run_with_stdin(&tools.nft, &["-f", "-"], &peers_script(bridge, pairs)).await?;
+    Ok(())
 }
 
 /// The nftables table that holds one bridge's rules.
@@ -245,6 +340,10 @@ pub fn tap_name(id: &VmId) -> String {
 
 /// Creates the VM's TAP device on the bridge, or repairs an existing one.
 ///
+/// `isolated` is bridge port isolation: on for a VM without an isolation
+/// group, off for a grouped VM, whose frames the bridge chain filters by the
+/// `peers` set instead (engine-trait.md section 3.3).
+///
 /// Idempotent: the four `ip` calls below are all "bring it to this state"
 /// operations.
 ///
@@ -252,7 +351,12 @@ pub fn tap_name(id: &VmId) -> String {
 ///
 /// `Conflict` when an interface with the TAP's name exists but is not a TAP
 /// device; `Io`/`Timeout` from the host tools.
-pub async fn create_tap(tools: &HostTools, tap: &str, bridge: &str) -> Result<(), EngineError> {
+pub async fn create_tap(
+    tools: &HostTools,
+    tap: &str,
+    bridge: &str,
+    isolated: bool,
+) -> Result<(), EngineError> {
     let ip = tools.ip.as_path();
     if interface_exists(tap) {
         if !is_tap(tap) {
@@ -264,8 +368,9 @@ pub async fn create_tap(tools: &HostTools, tap: &str, bridge: &str) -> Result<()
         tools::run(ip, &["tuntap", "add", "dev", tap, "mode", "tap"]).await?;
     }
 
-    // Port isolation is what keeps one VM's frames from reaching another VM on
-    // the same bridge; the ruleset closes the routed path.
+    // Port isolation keeps an ungrouped VM's frames from reaching another
+    // isolated port even without the bridge chain; the ruleset closes the
+    // rest.
     tools::run(ip, &["link", "set", "dev", tap, "master", bridge]).await?;
     tools::run(
         ip,
@@ -277,7 +382,7 @@ pub async fn create_tap(tools: &HostTools, tap: &str, bridge: &str) -> Result<()
             "type",
             "bridge_slave",
             "isolated",
-            "on",
+            if isolated { "on" } else { "off" },
         ],
     )
     .await?;
@@ -523,6 +628,7 @@ delete table ip quoro_qw5br0
 table ip quoro_qw5br0 {
     chain forward {
         type filter hook forward priority filter - 1; policy accept;
+        iifname \"qw5br0\" oifname \"qw5br0\" meta mark 0x51550084 accept
         iifname \"qw5br0\" oifname \"qw5br0\" drop
         iifname \"qw5br0\" ip saddr != 10.99.5.0/24 drop
         iifname \"qw5br0\" accept
@@ -540,8 +646,58 @@ table ip quoro_qw5br0 {
         ip saddr 10.99.5.0/24 oifname != \"qw5br0\" masquerade
     }
 }
+table bridge quoro_qw5br0 {}
+delete table bridge quoro_qw5br0
+table bridge quoro_qw5br0 {
+    set peers {
+        type ifname . ifname
+    }
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+        meta ibrname \"qw5br0\" iifname . oifname @peers meta mark set 0x51550084 accept
+        meta ibrname \"qw5br0\" drop
+    }
+}
 ";
         assert_eq!(ruleset("qw5br0", &subnet("10.99.5.0/24")), expected);
+    }
+
+    #[test]
+    fn peer_pairs_join_only_members_of_one_group() {
+        let members = vec![
+            ("qta".to_string(), Some("prj_a".to_string())),
+            ("qtb".to_string(), Some("prj_a".to_string())),
+            ("qtc".to_string(), Some("prj_b".to_string())),
+            ("qtd".to_string(), None),
+            ("qte".to_string(), None),
+        ];
+        assert_eq!(
+            peer_pairs(&members),
+            vec![
+                ("qta".to_string(), "qtb".to_string()),
+                ("qtb".to_string(), "qta".to_string()),
+            ]
+        );
+        assert!(peer_pairs(&members[2..]).is_empty());
+    }
+
+    #[test]
+    fn peers_script_flushes_then_adds() {
+        assert_eq!(
+            peers_script("qw5br0", &[]),
+            "flush set bridge quoro_qw5br0 peers\n"
+        );
+        assert_eq!(
+            peers_script(
+                "qw5br0",
+                &[
+                    ("qta".to_string(), "qtb".to_string()),
+                    ("qtb".to_string(), "qta".to_string())
+                ]
+            ),
+            "flush set bridge quoro_qw5br0 peers\n\
+             add element bridge quoro_qw5br0 peers { \"qta\" . \"qtb\", \"qtb\" . \"qta\" }\n"
+        );
     }
 
     #[test]
@@ -743,11 +899,11 @@ table ip quoro_qw5br0 {
             .expect("ensure");
         let tap = tap_name(&VmId("vm_lab_tap".to_owned()));
 
-        create_tap(&tools, &tap, LAB_BRIDGE)
+        create_tap(&tools, &tap, LAB_BRIDGE, true)
             .await
             .expect("first create");
         assert!(is_tap(&tap), "{tap} is not a TAP device");
-        create_tap(&tools, &tap, LAB_BRIDGE)
+        create_tap(&tools, &tap, LAB_BRIDGE, true)
             .await
             .expect("second create");
 
@@ -763,7 +919,7 @@ table ip quoro_qw5br0 {
 
         // An existing interface that is not a TAP is a conflict.
         assert!(matches!(
-            create_tap(&tools, "lo", LAB_BRIDGE).await,
+            create_tap(&tools, "lo", LAB_BRIDGE, true).await,
             Err(EngineError::Conflict(_))
         ));
 

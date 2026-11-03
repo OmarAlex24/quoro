@@ -87,6 +87,12 @@ pub(super) struct Inner {
     pub(super) networks: Mutex<HashMap<String, (NodeNetwork, Subnet)>>,
     pub(super) subscribers: StdMutex<Subscriptions>,
     pub(super) vms: StdMutex<HashMap<VmId, Arc<VmEntry>>>,
+    /// TAPs of VMs whose `create` is in flight, with their bridge and group,
+    /// so a concurrent peer sync does not drop them before their record is
+    /// visible in `vms`.
+    pub(super) inflight_peers: StdMutex<HashMap<String, (String, Option<String>)>>,
+    /// Serializes peer-set syncs, so the last one applied saw the latest state.
+    pub(super) peers_sync: Mutex<()>,
 }
 
 /// Where a lifecycle call on one VM stands, for `inspect` while it is in
@@ -250,6 +256,8 @@ impl Inner {
             networks,
             subscribers: StdMutex::new(Subscriptions::default()),
             vms: StdMutex::new(HashMap::new()),
+            inflight_peers: StdMutex::new(HashMap::new()),
+            peers_sync: Mutex::new(()),
         });
         inner.rediscover(&vms_root).await?;
         Ok(inner)
@@ -406,7 +414,31 @@ impl Inner {
         }
         let subnet = net::ensure_network(&self.tools, net).await?;
         networks.insert(net.bridge.clone(), (net.clone(), subnet));
-        persist_networks(&self.config.state_dir.join(NETWORKS_FILE), &networks)
+        persist_networks(&self.config.state_dir.join(NETWORKS_FILE), &networks)?;
+        drop(networks);
+        // Applying the ruleset recreated the bridge table with an empty
+        // `peers` set; put the isolation groups back (§3.3).
+        self.sync_peers(&net.bridge).await
+    }
+
+    /// Rewrites the bridge's `peers` set from every VM recorded on it plus the
+    /// creates in flight (§3.3).
+    async fn sync_peers(&self, bridge: &str) -> Result<(), EngineError> {
+        let _sync = self.peers_sync.lock().await;
+        let mut members: Vec<(String, Option<String>)> = Vec::new();
+        for (_, entry) in self.entries() {
+            if let Some(record) = entry.spec()
+                && record.bridge == bridge
+            {
+                members.push((record.tap, record.spec.net.isolation_group));
+            }
+        }
+        for (tap, (tap_bridge, group)) in lock(&self.inflight_peers).iter() {
+            if tap_bridge == bridge && !members.iter().any(|(known, _)| known == tap) {
+                members.push((tap.clone(), group.clone()));
+            }
+        }
+        net::sync_peers(&self.tools, bridge, &net::peer_pairs(&members)).await
     }
 
     /// Pulls and converts one image (§3.4).
@@ -457,20 +489,53 @@ impl Inner {
         let prepared = self.images.cached(&spec.rootfs)?.ok_or_else(|| {
             EngineError::Image(format!("rootfs {} is not a prepared image", spec.rootfs.0))
         })?;
-        let config = vmconfig::guest_config(
-            spec,
-            &subnet,
-            &self.config.dns,
-            self.config.guest_stop_timeout,
-        )?;
+        let config =
+            vmconfig::guest_config(spec, &subnet, &network.dns, self.config.guest_stop_timeout)?;
         let tap = net::tap_name(&spec.id);
         let record = SpecRecord::new(spec, &tap, &network.bridge);
+
+        // The peer set learns the new TAP before the TAP joins the bridge, so
+        // a grouped VM is never briefly cut off from its group, and an
+        // ungrouped one is never in any pair (§3.3).
+        lock(&self.inflight_peers).insert(
+            tap.clone(),
+            (network.bridge.clone(), spec.net.isolation_group.clone()),
+        );
+        let created = self
+            .create_reserved(
+                &entry, spec, &paths, &network, &prepared, config, record, &tap,
+            )
+            .await;
+        lock(&self.inflight_peers).remove(&tap);
+        if created.is_err() {
+            // Best effort: drop the pairs of the TAP that never came up.
+            let _ = self.sync_peers(&network.bridge).await;
+        }
+        created
+    }
+
+    /// The part of `create` after the reservation; split out so the peer
+    /// bookkeeping above wraps every exit path.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_reserved(
+        self: &Arc<Self>,
+        entry: &Arc<VmEntry>,
+        spec: &VmSpec,
+        paths: &VmPaths,
+        network: &NodeNetwork,
+        prepared: &PreparedImage,
+        config: quoro_init::GuestConfig,
+        record: SpecRecord,
+        tap: &str,
+    ) -> Result<VmInfo, EngineError> {
+        let tap = tap.to_owned();
+        self.sync_peers(&network.bridge).await?;
 
         entry.set_phase(Phase::Starting);
         let tmp_dir = self
             .vms_root()
             .join(format!(".tmp-{}-{}", spec.id.0, std::process::id()));
-        let tmp = rebased(&paths, &tmp_dir);
+        let tmp = rebased(paths, &tmp_dir);
         let built = self.build_files(&tmp, &record, &config, spec.disk_gb).await;
         if let Err(err) = built {
             let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
@@ -483,7 +548,14 @@ impl Inner {
             return Err(io_error(&paths.dir, &err));
         }
 
-        if let Err(err) = net::create_tap(&self.tools, &tap, &network.bridge).await {
+        if let Err(err) = net::create_tap(
+            &self.tools,
+            &tap,
+            &network.bridge,
+            spec.net.isolation_group.is_none(),
+        )
+        .await
+        {
             let _ = tokio::fs::remove_dir_all(&paths.dir).await;
             entry.set_phase(Phase::Idle);
             return Err(err);
@@ -508,7 +580,7 @@ impl Inner {
             initramfs: &self.initramfs,
             rootfs: &prepared.rootfs_path,
         };
-        let body = vmconfig::vm_create_body(spec, &paths, &boot_files, &tap);
+        let body = vmconfig::vm_create_body(spec, paths, &boot_files, &tap);
         if let Err(err) = ApiClient::new(&paths.api_socket).create(&body).await {
             let _ = vmm.sigkill();
             let _ = vmm.wait_exit(SETTLE_AFTER_SIGKILL).await;
@@ -536,7 +608,7 @@ impl Inner {
         *lock(&entry.vmm) = Some(vmm.clone());
         entry.booted.store(false, Ordering::SeqCst);
         entry.set_phase(Phase::Idle);
-        supervise::start(Arc::clone(self), Arc::clone(&entry), vmm.clone());
+        supervise::start(Arc::clone(self), Arc::clone(entry), vmm.clone());
         Ok(VmInfo {
             id: spec.id.clone(),
             state: VmState::Stopped,
@@ -584,7 +656,14 @@ impl Inner {
         }
 
         entry.set_phase(Phase::Starting);
-        if let Err(err) = net::create_tap(&self.tools, &record.tap, &record.bridge).await {
+        if let Err(err) = net::create_tap(
+            &self.tools,
+            &record.tap,
+            &record.bridge,
+            spec.net.isolation_group.is_none(),
+        )
+        .await
+        {
             entry.set_phase(Phase::Idle);
             return Err(err);
         }
@@ -715,8 +794,10 @@ impl Inner {
             }
         }
 
+        let mut bridge = None;
         if let Some(record) = state::read_json::<SpecRecord>(&entry.paths.spec)? {
             net::delete_tap(&self.tools, &record.tap).await?;
+            bridge = Some(record.bridge.clone());
             if let Ok(spec) = record.to_spec() {
                 for socket in console_sockets(&spec) {
                     let _ = std::fs::remove_file(socket);
@@ -727,6 +808,10 @@ impl Inner {
             .await
             .map_err(|err| io_error(&entry.paths.dir, &err))?;
         self.remove_entry(id);
+        if let Some(bridge) = bridge {
+            // Best effort: a stale pair names a TAP that no longer exists.
+            let _ = self.sync_peers(&bridge).await;
+        }
         Ok(())
     }
 

@@ -96,19 +96,11 @@ fn reset_state() {
 
 /// The engine configuration from the environment.
 fn config() -> ChConfig {
-    let mut config = ChConfig::new(
+    ChConfig::new(
         state_dir(),
         env_path("QUORO_ENGINE_ARTIFACTS"),
         env_path("QUORO_ENGINE_INIT"),
-    );
-    if let Ok(dns) = std::env::var("QUORO_ENGINE_DNS") {
-        config.dns = dns
-            .split(',')
-            .filter(|server| !server.trim().is_empty())
-            .map(|server| server.trim().parse::<Ipv4Addr>().expect("valid DNS server"))
-            .collect();
-    }
-    config
+    )
 }
 
 /// A fresh engine on the current state directory.
@@ -122,7 +114,14 @@ fn network() -> NodeNetwork {
         bridge: BRIDGE.to_string(),
         subnet: SUBNET.to_string(),
         gateway: GATEWAY.parse().expect("gateway"),
-        dns: Vec::new(),
+        dns: std::env::var("QUORO_ENGINE_DNS")
+            .map(|dns| {
+                dns.split(',')
+                    .filter(|server| !server.trim().is_empty())
+                    .map(|server| server.trim().parse::<Ipv4Addr>().expect("valid DNS server"))
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 

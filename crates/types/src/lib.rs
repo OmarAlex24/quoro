@@ -24,6 +24,7 @@ pub enum Prefix {
     Event,
     Provider,
     Session,
+    NodeJoinToken,
 }
 
 impl Prefix {
@@ -42,6 +43,7 @@ impl Prefix {
             // Session rows have no contract prefix; the id never leaves the
             // server and only names the `sessions` row.
             Self::Session => "ses",
+            Self::NodeJoinToken => "njt",
         }
     }
 }
