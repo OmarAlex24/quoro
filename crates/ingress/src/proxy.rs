@@ -1,0 +1,729 @@
+//! The embedded reverse proxy core (ADR 0059).
+//!
+//! One request path shared by every listener: the port-80 redirect listener, the
+//! port-443 TLS listener and the loopback listener `cloudflared` dials into. The
+//! listeners only differ in how they accept a connection and in [`ListenerMode`];
+//! host validation, routing, backend selection and header rewriting live here.
+//!
+//! Routing reads the current [`RouteTable`] once per request, so a
+//! [`ProxyCore::set_table`] swap never affects a request already in flight.
+
+use bytes::Bytes;
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Full};
+use hyper::body::{Body, Frame, Incoming};
+use hyper::header::{
+    CONNECTION, HOST, HeaderMap, HeaderName, HeaderValue, TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
+};
+use hyper::service::service_fn;
+use hyper::{Request, Response, StatusCode, Uri, Version};
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use rustls::ServerConfig;
+use rustls::server::ResolvesServerCert;
+use std::convert::Infallible;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{Semaphore, watch};
+use tokio::task::JoinSet;
+use tokio_rustls::TlsAcceptor;
+
+use crate::route::valid_hostname;
+use crate::{RouteTable, TlsMode};
+
+/// Concurrent connections a listener will hold before it stops accepting.
+const MAX_CONNECTIONS: usize = 4096;
+/// How long to wait for a backend TCP connection.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a client may take to send its request headers.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a TLS handshake may take.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long in-flight connections may finish after shutdown.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
+
+/// Which routes a listener serves and how it labels requests.
+#[derive(Clone, Copy, Debug)]
+pub struct ListenerMode {
+    /// Only routes with this TLS mode are served on this listener; others answer 404.
+    pub serves: TlsMode,
+    /// Value of X-Forwarded-Proto sent to backends ("https" for the TLS listener and the tunnel loopback listener). A trusted connector's own `http` or `https` value wins.
+    pub forwarded_proto: &'static str,
+    /// Trust an incoming X-Forwarded-For / CF-Connecting-IP (only for the loopback listener that cloudflared connects to, and only when the peer address is loopback). Otherwise incoming X-Forwarded-* headers are dropped and replaced.
+    pub trust_forwarded: bool,
+}
+
+/// The proxy's shared state: the current route table, the backend client and
+/// the round-robin cursor.
+pub struct ProxyCore {
+    table: RwLock<Arc<RouteTable>>,
+    client: Client<HttpConnector, UpstreamBody>,
+    next_backend: AtomicUsize,
+    permits: Arc<Semaphore>,
+}
+
+impl std::fmt::Debug for ProxyCore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyCore")
+            .field("routes", &self.table().len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProxyCore {
+    /// A core with an empty table. It serves 404 for every host until
+    /// [`set_table`](Self::set_table) is called.
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        let mut connector = HttpConnector::new();
+        connector.set_connect_timeout(Some(CONNECT_TIMEOUT));
+        connector.set_nodelay(true);
+        let client = Client::builder(TokioExecutor::new())
+            .retry_canceled_requests(false)
+            .set_host(false)
+            .build(connector);
+        Arc::new(Self {
+            table: RwLock::new(Arc::new(RouteTable::default())),
+            client,
+            next_backend: AtomicUsize::new(0),
+            permits: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+        })
+    }
+
+    /// Replaces the route table. Requests already in flight keep the table they
+    /// started with.
+    pub fn set_table(&self, table: RouteTable) {
+        let mut current = self
+            .table
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *current = Arc::new(table);
+    }
+
+    /// The table new requests are routed with.
+    #[must_use]
+    pub fn table(&self) -> Arc<RouteTable> {
+        Arc::clone(
+            &self
+                .table
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+}
+
+/// Serves plain HTTP on `listener` until `shutdown` turns true, then stops
+/// accepting and lets in-flight connections finish (up to 10 s).
+///
+/// # Errors
+///
+/// Only returned if the listener task itself fails; per-connection errors are
+/// logged and do not stop the listener.
+pub async fn serve_http(
+    listener: TcpListener,
+    core: Arc<ProxyCore>,
+    mode: ListenerMode,
+    shutdown: watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    serve(
+        listener,
+        Spec::Proxy {
+            core,
+            mode,
+            tls: None,
+        },
+        shutdown,
+    )
+    .await
+}
+
+/// Port-80 listener of the public proxy: every request gets 308 Permanent
+/// Redirect to `https://{host}{path_and_query}` when host is a served Acme
+/// route; unknown host -> 404. Same shutdown semantics as [`serve_http`].
+///
+/// # Errors
+///
+/// Only returned if the listener task itself fails.
+pub async fn serve_redirect(
+    listener: TcpListener,
+    core: Arc<ProxyCore>,
+    shutdown: watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    serve(listener, Spec::Redirect { core }, shutdown).await
+}
+
+/// TLS listener (port 443): rustls handshake with `tls`, then the same handling
+/// as [`serve_http`].
+///
+/// # Errors
+///
+/// Only returned if the listener task itself fails.
+pub async fn serve_https(
+    listener: TcpListener,
+    core: Arc<ProxyCore>,
+    mode: ListenerMode,
+    tls: Arc<ServerConfig>,
+    shutdown: watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    serve(
+        listener,
+        Spec::Proxy {
+            core,
+            mode,
+            tls: Some(TlsAcceptor::from(tls)),
+        },
+        shutdown,
+    )
+    .await
+}
+
+/// Server config with the ring provider explicitly, no client auth, the given
+/// cert resolver and ALPN `http/1.1`.
+///
+/// # Errors
+///
+/// The requested protocol versions are unsupported by the provider.
+pub fn tls_server_config(
+    resolver: Arc<dyn ResolvesServerCert>,
+) -> Result<Arc<ServerConfig>, rustls::Error> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
+}
+
+#[derive(Clone)]
+enum Spec {
+    Proxy {
+        core: Arc<ProxyCore>,
+        mode: ListenerMode,
+        tls: Option<TlsAcceptor>,
+    },
+    Redirect {
+        core: Arc<ProxyCore>,
+    },
+}
+
+async fn serve(
+    listener: TcpListener,
+    spec: Spec,
+    mut shutdown: watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    let permits = match &spec {
+        Spec::Proxy { core, .. } => Arc::clone(&core.permits),
+        Spec::Redirect { .. } => Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+    };
+    let mut connections: JoinSet<()> = JoinSet::new();
+    loop {
+        let permit = tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut shutdown) => break,
+            permit = Arc::clone(&permits).acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => break,
+            },
+        };
+        let (stream, peer) = tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut shutdown) => break,
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    tracing::debug!(error = %error, "accept failed");
+                    // EMFILE and friends: give the process a moment to recover.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            },
+        };
+        let spec = spec.clone();
+        connections.spawn(async move {
+            let _permit = permit;
+            match spec {
+                Spec::Proxy { core, mode, tls } => match tls {
+                    Some(acceptor) => {
+                        let stream = match tokio::time::timeout(
+                            TLS_HANDSHAKE_TIMEOUT,
+                            acceptor.accept(stream),
+                        )
+                        .await
+                        {
+                            Ok(Ok(stream)) => stream,
+                            Ok(Err(error)) => {
+                                tracing::debug!(%peer, error = %error, "tls handshake failed");
+                                return;
+                            }
+                            Err(_) => {
+                                tracing::debug!(%peer, "tls handshake timed out");
+                                return;
+                            }
+                        };
+                        let sni = stream
+                            .get_ref()
+                            .1
+                            .server_name()
+                            .map(str::to_ascii_lowercase);
+                        serve_proxied(stream, core, mode, sni, peer).await;
+                    }
+                    None => serve_proxied(stream, core, mode, None, peer).await,
+                },
+                Spec::Redirect { core } => serve_redirect_connection(stream, core, peer).await,
+            }
+        });
+        // Reap finished connections so the set does not grow without bound.
+        while connections.try_join_next().is_some() {}
+    }
+
+    let drained = async { while connections.join_next().await.is_some() {} };
+    if tokio::time::timeout(DRAIN_TIMEOUT, drained).await.is_err() {
+        tracing::debug!("draining connections timed out");
+    }
+    Ok(())
+}
+
+async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+        // A closed sender means nobody can ask for shutdown any more; stop.
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn serve_proxied<I>(
+    io: I,
+    core: Arc<ProxyCore>,
+    mode: ListenerMode,
+    sni: Option<String>,
+    peer: SocketAddr,
+) where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let service = service_fn(move |request: Request<Incoming>| {
+        let core = Arc::clone(&core);
+        let sni = sni.clone();
+        async move { Ok::<_, Infallible>(handle_request(&core, mode, request, peer, sni).await) }
+    });
+    let mut builder = hyper::server::conn::http1::Builder::new();
+    builder
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT)
+        .keep_alive(true);
+    if let Err(error) = builder
+        .serve_connection(TokioIo::new(io), service)
+        .with_upgrades()
+        .await
+    {
+        tracing::debug!(%peer, error = %error, "connection closed with error");
+    }
+}
+
+async fn serve_redirect_connection(stream: TcpStream, core: Arc<ProxyCore>, peer: SocketAddr) {
+    let service = service_fn(move |request: Request<Incoming>| {
+        let core = Arc::clone(&core);
+        async move { Ok::<_, Infallible>(handle_redirect(&core, request)) }
+    });
+    let mut builder = hyper::server::conn::http1::Builder::new();
+    builder
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT)
+        .keep_alive(true);
+    if let Err(error) = builder
+        .serve_connection(TokioIo::new(stream), service)
+        .await
+    {
+        tracing::debug!(%peer, error = %error, "redirect connection closed with error");
+    }
+}
+
+fn plain(status: StatusCode, body: &'static str) -> Response<ProxyBody> {
+    let mut response = Response::new(box_body(Full::new(Bytes::from_static(body.as_bytes()))));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        hyper::header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
+fn box_body<B>(body: B) -> ProxyBody
+where
+    B: Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<BoxError>,
+{
+    body.map_err(Into::into).boxed_unsync()
+}
+
+/// The host of a request, lowercased with any `:port` suffix stripped, or an
+/// error message when the header is missing or not a valid hostname.
+fn request_host(headers: &HeaderMap) -> Result<String, &'static str> {
+    let value = headers.get(HOST).ok_or("missing host\n")?;
+    let host = value.to_str().map_err(|_| "invalid host\n")?;
+    let host = match host.rsplit_once(':') {
+        Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => name,
+        _ => host,
+    };
+    let host = host.to_ascii_lowercase();
+    if !valid_hostname(&host) {
+        return Err("invalid host\n");
+    }
+    Ok(host)
+}
+
+fn path_and_query(uri: &Uri) -> &str {
+    uri.path_and_query()
+        .map(hyper::http::uri::PathAndQuery::as_str)
+        .unwrap_or("/")
+}
+
+fn handle_redirect(core: &ProxyCore, request: Request<Incoming>) -> Response<ProxyBody> {
+    let parts = request.into_parts().0;
+    let host = match request_host(&parts.headers) {
+        Ok(host) => host,
+        Err(message) => return plain(StatusCode::BAD_REQUEST, message),
+    };
+    let table = core.table();
+    if table
+        .get(&host)
+        .is_none_or(|route| route.tls != TlsMode::Acme)
+    {
+        return plain(StatusCode::NOT_FOUND, "no route for this host\n");
+    }
+    let location = format!("https://{host}{}", path_and_query(&parts.uri));
+    let mut response = plain(StatusCode::PERMANENT_REDIRECT, "");
+    match HeaderValue::from_str(&location) {
+        Ok(value) => {
+            response
+                .headers_mut()
+                .insert(hyper::header::LOCATION, value);
+        }
+        Err(_) => return plain(StatusCode::BAD_REQUEST, "invalid host\n"),
+    }
+    response
+}
+
+async fn handle_request(
+    core: &ProxyCore,
+    mode: ListenerMode,
+    mut request: Request<Incoming>,
+    peer: SocketAddr,
+    sni: Option<String>,
+) -> Response<ProxyBody> {
+    let host = match request_host(request.headers()) {
+        Ok(host) => host,
+        Err(message) => return plain(StatusCode::BAD_REQUEST, message),
+    };
+    // A certificate for one name must not be usable to reach another: when SNI
+    // was sent it has to name the same host as the Host header.
+    if let Some(sni) = sni.as_deref()
+        && !sni.eq_ignore_ascii_case(&host)
+    {
+        return plain(StatusCode::MISDIRECTED_REQUEST, "misdirected request\n");
+    }
+    let table = core.table();
+    let Some(route) = table.get(&host).filter(|route| route.tls == mode.serves) else {
+        return plain(StatusCode::NOT_FOUND, "no route for this host\n");
+    };
+
+    let wants_upgrade = is_upgrade(request.headers());
+    let client_upgrade = wants_upgrade.then(|| hyper::upgrade::on(&mut request));
+    let query = path_and_query(request.uri()).to_string();
+
+    let headers = request.headers_mut();
+    strip_hop_by_hop(headers, wants_upgrade);
+    forwarded_headers(headers, peer, mode);
+    if wants_upgrade {
+        // The two headers are hop-by-hop, but an upgrade needs them forwarded.
+        headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+        if !headers.contains_key(UPGRADE) {
+            headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
+        }
+    }
+    let (parts, body) = request.into_parts();
+
+    let state = Arc::new(BodyState {
+        inner: Mutex::new(Some(body)),
+        started: AtomicBool::new(false),
+    });
+    let attempts = route.backends.len();
+    let Some(&first_backend) = route.backends.first() else {
+        return plain(StatusCode::BAD_GATEWAY, "backend unavailable\n");
+    };
+    let start = core.next_backend.fetch_add(1, Ordering::Relaxed);
+    let mut response = None;
+    let mut used_backend = first_backend;
+    for offset in 0..attempts {
+        let backend = route.backends[(start + offset) % attempts];
+        let Some(uri) = upstream_uri(backend, &query) else {
+            continue;
+        };
+        let mut upstream = Request::new(UpstreamBody {
+            state: Arc::clone(&state),
+        });
+        *upstream.method_mut() = parts.method.clone();
+        *upstream.uri_mut() = uri;
+        *upstream.version_mut() = Version::HTTP_11;
+        *upstream.headers_mut() = parts.headers.clone();
+        match core.client.request(upstream).await {
+            Ok(backend_response) => {
+                response = Some(backend_response);
+                used_backend = backend;
+                break;
+            }
+            Err(error) => {
+                // Retrying is only safe while the body has not started to
+                // stream; after that the request may already be in the app.
+                let sent = state.started.load(Ordering::SeqCst);
+                tracing::debug!(host = %host, backend = %backend, sent, error = %error, "backend request failed");
+                if sent {
+                    break;
+                }
+            }
+        }
+    }
+    let Some(mut response) = response else {
+        return plain(StatusCode::BAD_GATEWAY, "backend unavailable\n");
+    };
+    let status = response.status();
+    tracing::debug!(
+        host = %host,
+        method = %parts.method,
+        status = status.as_u16(),
+        backend = %used_backend,
+        "proxied request"
+    );
+
+    if wants_upgrade && status == StatusCode::SWITCHING_PROTOCOLS {
+        if let Some(client_upgrade) = client_upgrade {
+            let backend_upgrade = hyper::upgrade::on(&mut response);
+            tokio::spawn(async move {
+                match tokio::try_join!(client_upgrade, backend_upgrade) {
+                    Ok((client, backend)) => {
+                        let mut client = TokioIo::new(client);
+                        let mut backend = TokioIo::new(backend);
+                        if let Err(error) =
+                            tokio::io::copy_bidirectional(&mut client, &mut backend).await
+                        {
+                            tracing::debug!(error = %error, "upgraded stream closed with error");
+                        }
+                    }
+                    Err(error) => tracing::debug!(error = %error, "upgrade failed"),
+                }
+            });
+        }
+        let (mut parts, _) = response.into_parts();
+        parts.headers.remove(hyper::header::CONTENT_LENGTH);
+        let mut out = Response::new(box_body(Full::new(Bytes::new())));
+        *out.status_mut() = status;
+        *out.headers_mut() = parts.headers;
+        return out;
+    }
+
+    let (mut parts, body) = response.into_parts();
+    strip_hop_by_hop(&mut parts.headers, false);
+    let mut out = Response::new(box_body(body));
+    *out.status_mut() = status;
+    *out.headers_mut() = parts.headers;
+    out
+}
+
+/// Marks whether the outgoing request body has been polled. A body that was
+/// never polled was never sent, so the request may be retried on the next
+/// backend; once hyper starts reading it, retrying would duplicate it.
+#[derive(Default)]
+struct BodyState {
+    inner: Mutex<Option<Incoming>>,
+    started: AtomicBool,
+}
+
+/// The outgoing request body. It takes the client body on first poll, which lets
+/// a connect failure to one backend try the next one without the body having
+/// been consumed.
+struct UpstreamBody {
+    state: Arc<BodyState>,
+}
+
+impl Body for UpstreamBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        self.state.started.store(true, Ordering::SeqCst);
+        let mut inner = self
+            .state
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(body) = inner.as_mut() else {
+            return Poll::Ready(None);
+        };
+        match Pin::new(body).poll_frame(cx) {
+            Poll::Ready(None) => {
+                *inner = None;
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(Box::new(error)))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.state
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+    }
+}
+
+fn is_upgrade(headers: &HeaderMap) -> bool {
+    let connection = headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+        });
+    connection && headers.contains_key(UPGRADE)
+}
+
+fn header_names_in_connection(headers: &HeaderMap) -> Vec<HeaderName> {
+    let mut names = Vec::new();
+    for value in headers.get_all(CONNECTION) {
+        if let Ok(value) = value.to_str() {
+            for token in value.split(',') {
+                let token = token.trim();
+                if let Ok(name) = HeaderName::from_bytes(token.as_bytes()) {
+                    names.push(name);
+                }
+            }
+        }
+    }
+    names
+}
+
+/// Removes hop-by-hop headers: `Connection` and everything it names, the
+/// proxy-only headers, `Keep-Alive`, `TE`, `Trailer` and `Transfer-Encoding`.
+/// `Upgrade` and `Connection` survive only when `keep_upgrade` is set.
+fn strip_hop_by_hop(headers: &mut HeaderMap, keep_upgrade: bool) {
+    let mut keep: Vec<HeaderName> = Vec::new();
+    if keep_upgrade {
+        keep.push(CONNECTION);
+        keep.push(UPGRADE);
+    }
+    for name in header_names_in_connection(headers) {
+        // A malicious `Connection: host` must not strip the Host header the
+        // route was chosen from; the backend always needs it.
+        if name == HOST || keep.contains(&name) {
+            continue;
+        }
+        headers.remove(name);
+    }
+    for name in [
+        CONNECTION,
+        HeaderName::from_static("keep-alive"),
+        TE,
+        TRAILER,
+        TRANSFER_ENCODING,
+        HeaderName::from_static("proxy-connection"),
+        HeaderName::from_static("proxy-authenticate"),
+        HeaderName::from_static("proxy-authorization"),
+    ] {
+        if !keep.contains(&name) {
+            headers.remove(name);
+        }
+    }
+    if !keep_upgrade {
+        headers.remove(UPGRADE);
+    }
+}
+
+fn forwarded_headers(headers: &mut HeaderMap, peer: SocketAddr, mode: ListenerMode) {
+    let trusted = mode.trust_forwarded && peer.ip().is_loopback();
+    if trusted {
+        let existing = headers
+            .get(hyper::header::HeaderName::from_static("x-forwarded-for"))
+            .cloned();
+        let cloudflare = headers.get("cf-connecting-ip").cloned();
+        headers.remove("cf-connecting-ip");
+        let value = match existing {
+            Some(existing) => match existing.to_str() {
+                Ok(existing) => format!("{existing}, {}", peer.ip()),
+                Err(_) => peer.ip().to_string(),
+            },
+            None => cloudflare
+                .as_ref()
+                .and_then(|value| value.to_str().ok())
+                .map_or_else(|| peer.ip().to_string(), str::to_string),
+        };
+        if let Ok(value) = HeaderValue::from_str(&value) {
+            headers.insert(
+                hyper::header::HeaderName::from_static("x-forwarded-for"),
+                value,
+            );
+        }
+    } else {
+        let forwarded: Vec<HeaderName> = headers
+            .keys()
+            .filter(|name| name.as_str().starts_with("x-forwarded-"))
+            .cloned()
+            .collect();
+        for name in forwarded {
+            headers.remove(name);
+        }
+        headers.remove("cf-connecting-ip");
+        if let Ok(value) = HeaderValue::from_str(&peer.ip().to_string()) {
+            headers.insert(
+                hyper::header::HeaderName::from_static("x-forwarded-for"),
+                value,
+            );
+        }
+    }
+    // A trusted connector (cloudflared) knows the scheme the visitor used at
+    // the edge; keep it when it is a plain `http` or `https`.
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| trusted && matches!(*value, "http" | "https"))
+        .map_or(mode.forwarded_proto, |value| {
+            if value == "http" { "http" } else { "https" }
+        });
+    headers.insert(
+        hyper::header::HeaderName::from_static("x-forwarded-proto"),
+        HeaderValue::from_static(proto),
+    );
+    // The host is always the one the route matched; no client value survives.
+    let host = headers.get(HOST).cloned();
+    headers.remove(hyper::header::HeaderName::from_static("x-forwarded-host"));
+    if let Some(host) = host {
+        headers.insert(
+            hyper::header::HeaderName::from_static("x-forwarded-host"),
+            host,
+        );
+    }
+}
+
+fn upstream_uri(backend: SocketAddr, path_and_query: &str) -> Option<Uri> {
+    format!("http://{backend}{path_and_query}").parse().ok()
+}

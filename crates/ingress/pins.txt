@@ -1,0 +1,9 @@
+# Pinned cloudflared binaries for the Cloudflare Tunnel backend (ADR 0024,
+# 0055). cloudflared is a separate process under Apache-2.0, run by the
+# ingress, not linked. Upstream lists the sha256 of every asset in the release
+# notes; it matches GitHub's release-asset digest. Bumping a pin is its own
+# pull request.
+#
+# name version arch file url sha256
+cloudflared 2026.10.7 x86_64 cloudflared-linux-amd64 https://github.com/cloudflare/cloudflared/releases/download/2026.10.7/cloudflared-linux-amd64 1f99fb518b83dec2ba8d870a7cc991d82a77e6196295a3d2754ba17ab9f91872
+cloudflared 2026.10.7 aarch64 cloudflared-linux-arm64 https://github.com/cloudflare/cloudflared/releases/download/2026.10.7/cloudflared-linux-arm64 3df43aedc9ff291d1735b5cb576cb97e0b157488796db2e32b28aecabb445775

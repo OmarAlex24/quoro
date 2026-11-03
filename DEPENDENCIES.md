@@ -73,6 +73,22 @@ Rules:
 | `serde`, `serde_json` | `crates/engine` (Linux) | `std`, `derive` / `std` | OCI image config and index JSON, the cached image metadata, Cloud Hypervisor's JSON API, and the per-VM state files the engine reads back after an agent restart |
 | `rustix` | `crates/engine` (Linux) | `std`, `fs`, `process` | Safe wrappers for `openat2(RESOLVE_IN_ROOT)` and the `*at` calls that apply layers inside the rootfs (engine-trait.md section 3.4), and for `pidfd_open` and `kill` in VMM supervision, so the workspace keeps `unsafe_code = "forbid"` |
 | `rustix` | `crates/init` (Linux) | `std`, `fs`, `mount`, `net`, `process`, `system`, `termios` | The guest PID 1 needs mount, move-mount, chroot, reboot, rtnetlink sockets, `waitpid` on any child and `tcsetattr` (raw output on the app console), none of which `std` offers. `rustix` keeps the init free of `unsafe`; the M0 spike used raw `libc` instead |
+| `reqwest` | `crates/providers` | `json`, `rustls-tls-native-roots-no-provider` (no default features) | HTTPS client for the Cloudflare API and DNS-over-HTTPS propagation checks (ADR 0025). Native roots read the host's CA store, which keeps `webpki-roots` (CDLA-Permissive-2.0, outside ADR 0080) out; no-provider leaves the crypto to `rustls` with `ring`. Redirects are disabled so the API token cannot follow one |
+| `rustls` | `crates/providers`, `crates/ingress` | `ring`, `std`, `tls12` (no default features) | The `ring` provider for the provider client and for the ingress TLS listener, built with an explicit provider because the workspace also enables aws-lc-rs through `oci-client` |
+| `serde`, `serde_json` | `crates/providers`, `crates/ingress` | `derive`, `std` / `std` | Cloudflare API envelopes and the tunnel ingress configuration |
+| `tokio` | `crates/providers` | `time` (no default features) | Backoff between retries of idempotent API calls |
+| `tracing` | `crates/providers`, `crates/ingress` | `std` | Method-and-path debug logs (never a token), certificate and connector logs |
+| `zeroize` | `crates/providers` | `alloc` | Wipes API and tunnel tokens from memory when they are dropped |
+| `quoro-providers` (workspace crate) | `crates/ingress` | none | `DnsProvider` for DNS-01 and the Cloudflare tunnel API |
+| `tokio` | `crates/ingress` | `rt`, `net`, `sync`, `time`, `macros`, `process`, `fs`, `io-util` (no default features) | Listeners and connection tasks, the route-table swap and event channel, renewal timers, the `cloudflared` child process and its log pipes |
+| `hyper` | `crates/ingress` | `http1`, `server`, `client` (no default features) | The embedded reverse proxy (ADR 0059): HTTP/1.1 server for clients, client to the VM backends, upgrades for WebSocket. Already in the tree through `reqwest` |
+| `hyper-util` | `crates/ingress` | `tokio`, `server`, `server-auto`, `client-legacy`, `http1` (no default features) | Tokio I/O adapters, the timer for the header-read timeout, and the pooled backend client |
+| `http-body-util`, `bytes` | `crates/ingress` | none / `std` | Streaming request and response bodies through the proxy without buffering |
+| `tokio-rustls` | `crates/ingress` | `ring`, `tls12` (no default features) | TLS termination on 443 with the SNI resolver over node-local certificates |
+| `instant-acme` | `crates/ingress` | `ring`, `hyper-rustls`, `time`, `x509-parser` (no default features) | ACME client for DNS-01 issuance and ARI renewal (RFC 9773), chosen by the spike for issue #65: maintained by rustls maintainers, Apache-2.0, `ring` without aws-lc-rs. Its `ring` feature also pulls `rcgen` 0.14 |
+| `rcgen` | `crates/ingress` | `ring`, `pem` (no default features) | A fresh P-256 key and CSR per issuance. Same major `instant-acme` uses; `crates/quoro` still uses 0.13 for the listener certificate, a duplicate the bans check reports as a warning |
+| `x509-parser` | `crates/ingress` | no default features | Reads `notBefore`/`notAfter` of stored certificates for the renewal policy; same major `instant-acme` uses |
+| `time` | `crates/ingress` | `std` (no default features) | Unix timestamps and RFC 3339 rendering of certificate expiry in events |
 
 ## Test-only dependencies
 
@@ -89,6 +105,11 @@ Rules:
 | `rustls` | `crates/quoro` | `ring`, `std` | The provider that end-to-end test installs for reqwest |
 | `serde_json` | `crates/quoro` | `std` | Reads the API's JSON bodies in that test |
 | `tokio` | `crates/quoro` | `process`, `io-util`, `time` and the runtime features | The test spawns the binary, reads its stderr for the start lines and waits with timeouts |
+| `tokio` | `crates/providers`, `crates/ingress` | `macros`, `rt-multi-thread`, `net`, `test-util`, `signal` | `#[tokio::test]` and local mock servers; `signal` for the lab example's Ctrl-C |
+| `axum` | `crates/providers` | `http1`, `json`, `query`, `tokio` | A local mock of the Cloudflare API for the client tests |
+| `rcgen` | `crates/ingress` | `ring`, `pem` | Self-signed certificates for the TLS listener tests |
+| `quoro-control-plane` (workspace crate) | `crates/ingress` (example only) | none | The lab example reads a provider credential from the node's database through the in-process accessor, never over HTTP |
+| `tracing-subscriber` | `crates/ingress` (example only) | `fmt`, `std` | Logs of the lab example |
 
 ## Tooling outside Cargo
 
@@ -107,3 +128,4 @@ Host programs the engine runs (packaged by the installer, not linked): `mkfs.ext
 | podman or docker (host) | `packaging/build-in-container.sh`, `packaging/reproduce-release.sh`, `.github/workflows/release.yml`, `.github/workflows/ci.yml` | Builds and runs the release build image; podman is preferred, the GitHub-hosted runner uses its preinstalled docker. The engine does not reach the release bytes |
 | `gh` (preinstalled on the GitHub-hosted runner) | `.github/workflows/release.yml` | Self-checks the attestation with `packaging/verify-release.sh` and creates the draft release |
 | GitHub CLI `gh` 2.103.3, pinned by version and sha256 | `installer/install.sh` | Downloaded to a temporary directory by the installer to verify the release attestation before anything is installed, then deleted; `cosign` was not used because its binary is ten times larger |
+| `cloudflared` 2026.10.7, pinned by version and sha256 in `crates/ingress/pins.txt` | Cloudflare Tunnel backend (`crates/ingress`) | A separate Apache-2.0 process the tunnel backend runs and supervises (ADR 0024, 0055); it gets the tunnel run token only through its environment. Packaging it with the installer is installer work |
