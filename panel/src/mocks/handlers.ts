@@ -1,7 +1,21 @@
 import { HttpResponse, http } from 'msw';
 import type {
+  App,
+  AppDetail,
+  AppEnvList,
+  AppEnvReplaceRequest,
+  AppEnvVar,
+  AppList,
+  CreateAppRequest,
+  CreateDeploymentRequest,
+  CreateDomainRequest,
   CreateProjectRequest,
   CreateVmRequest,
+  Deployment,
+  DeploymentList,
+  DeploymentLogList,
+  Domain,
+  DomainList,
   LoginRequest,
   MeResponse,
   NodeList,
@@ -19,8 +33,22 @@ import { getAuthMock } from '../api/generated/auth/auth.msw';
 import { getNodesMock } from '../api/generated/nodes/nodes.msw';
 import { getProjectsMock } from '../api/generated/projects/projects.msw';
 import { getVmsMock } from '../api/generated/vms/vms.msw';
+import { getAppsMock } from '../api/generated/apps/apps.msw';
+import { getDeploymentsMock } from '../api/generated/deployments/deployments.msw';
+import { getDomainsMock } from '../api/generated/domains/domains.msw';
+import { getLogsMock } from '../api/generated/logs/logs.msw';
+import { formatSseFrame } from '../lib/log-buffer';
 import { SLUG_PATTERN } from '../lib/slug';
-import { converge, db, mockId, now } from './db';
+import {
+  converge,
+  db,
+  findApp,
+  findDeployment,
+  mockId,
+  now,
+  runDeployment,
+  schedule,
+} from './db';
 
 type JsonBody = Parameters<typeof HttpResponse.json>[0];
 type JsonInit = Parameters<typeof HttpResponse.json>[1];
@@ -65,6 +93,19 @@ const isIntAtLeast = (value: unknown, minimum: number): value is number =>
 
 const findVm = (vmId: string): Vm | undefined =>
   db.vms.find((candidate) => candidate.id === vmId);
+
+const findDomain = (domainId: string): Domain | undefined =>
+  db.domains.find((candidate) => candidate.id === domainId);
+
+const APP_NAME_PATTERN = /^[a-z0-9-]{1,40}$/;
+const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const TLS_MODES = new Set(['acme', 'tunnel']);
+
+const appDetail = (app: App): AppDetail => ({
+  ...app,
+  instances: db.vms.filter((vm) => vm.app_id === app.id),
+  domains: db.domains.filter((domain) => domain.app_id === app.id),
+});
 
 /**
  * Stateful handlers first: setup, session, projects and VMs answer from
@@ -381,10 +422,441 @@ export const handlers = [
     );
   }),
 
+  http.get('*/api/v1/apps', ({ request }) => {
+    if (!signedIn()) return unauthorized();
+    const url = new URL(request.url);
+    const projectId = url.searchParams.get('project_id');
+    const items = db.apps.filter(
+      (app) => projectId === null || app.project_id === projectId,
+    );
+    const list: AppList = { items, next_cursor: null };
+    return json(list);
+  }),
+
+  http.post('*/api/v1/apps', async ({ request }) => {
+    const user = signedIn();
+    if (!user) return unauthorized();
+    if (user.role === 'viewer') return writeRefusal('app:create');
+
+    const body = await readJson<CreateAppRequest>(request);
+    if (!body) {
+      return problem(422, 'validation_failed', {
+        detail: 'The form could not be read. Try again.',
+      });
+    }
+
+    const name = (body.name ?? '').trim();
+    if (!APP_NAME_PATTERN.test(name)) {
+      return problem(422, 'validation_failed', {
+        detail: 'App name must be 1-40 lowercase letters, digits or dashes.',
+      });
+    }
+    if ((body.image ?? '').trim() === '') {
+      return problem(422, 'validation_failed', {
+        detail: 'An image reference is required.',
+      });
+    }
+    if (!isIntAtLeast(body.port, 1) || body.port > 65_535) {
+      return problem(422, 'validation_failed', {
+        detail: 'Port must be a whole number between 1 and 65535.',
+      });
+    }
+    if (!db.projects.some((project) => project.id === body.project_id)) {
+      return problem(422, 'validation_failed', {
+        detail: 'That project does not exist. Choose another one.',
+      });
+    }
+    if (db.apps.some((app) => app.project_id === body.project_id && app.name === name)) {
+      return problem(409, 'conflict', {
+        detail: `An app named "${name}" already exists in that project.`,
+      });
+    }
+
+    const createdAt = now();
+    const app: App = {
+      id: mockId('app'),
+      project_id: body.project_id,
+      name,
+      stateful: body.stateful ?? false,
+      ha_policy: 'none',
+      image: body.image.trim(),
+      port: body.port,
+      health_check: body.health_check ?? {
+        path: '/',
+        interval_s: 10,
+        timeout_s: 2,
+        failures: 3,
+      },
+      resources: body.resources ?? { vcpus: 1, memory_mb: 512, disk_gb: 2 },
+      placement: body.placement ?? { node_ids: [db.node.id] },
+      status: 'stopped',
+      current_deployment_id: null,
+      restart_generation: 0,
+      created_at: createdAt,
+      updated_at: createdAt,
+    };
+    db.apps.push(app);
+    db.appEnv[app.id] = [];
+    return json(app, { status: 201 });
+  }),
+
+  http.get('*/api/v1/apps/:appId', ({ params }) => {
+    if (!signedIn()) return unauthorized();
+    const app = findApp(String(params.appId));
+    if (!app) {
+      return problem(404, 'not_found', { detail: 'That app no longer exists.' });
+    }
+    return json(appDetail(app));
+  }),
+
+  http.delete('*/api/v1/apps/:appId', ({ params }) => {
+    const user = signedIn();
+    if (!user) return unauthorized();
+    if (user.role === 'viewer') return writeRefusal('app:delete');
+
+    const appId = String(params.appId);
+    const app = findApp(appId);
+    if (!app) {
+      return problem(404, 'not_found', { detail: 'That app no longer exists.' });
+    }
+
+    db.apps = db.apps.filter((candidate) => candidate.id !== appId);
+    db.vms = db.vms.filter((vm) => vm.app_id !== appId);
+    db.domains = db.domains.filter((domain) => domain.app_id !== appId);
+    for (const deployment of db.deployments.filter((item) => item.app_id === appId)) {
+      delete db.deploymentLogs[deployment.id];
+    }
+    db.deployments = db.deployments.filter((item) => item.app_id !== appId);
+    delete db.appEnv[appId];
+
+    return json({ ...app, updated_at: now() }, { status: 202 });
+  }),
+
+  http.post('*/api/v1/apps/:appId/start', ({ params }) => {
+    const user = signedIn();
+    if (!user) return unauthorized();
+    if (user.role === 'viewer') return writeRefusal('app:start');
+
+    const app = findApp(String(params.appId));
+    if (!app) {
+      return problem(404, 'not_found', { detail: 'That app no longer exists.' });
+    }
+    app.status = 'running';
+    app.updated_at = now();
+    for (const vm of db.vms.filter((candidate) => candidate.app_id === app.id)) {
+      vm.desired_status = 'running';
+      if (vm.observed_status !== 'running') {
+        vm.observed_status = 'starting';
+        converge(vm.id, [[1_200, 'running']]);
+      }
+    }
+    return json(app, { status: 202 });
+  }),
+
+  http.post('*/api/v1/apps/:appId/stop', ({ params }) => {
+    const user = signedIn();
+    if (!user) return unauthorized();
+    if (user.role === 'viewer') return writeRefusal('app:stop');
+
+    const app = findApp(String(params.appId));
+    if (!app) {
+      return problem(404, 'not_found', { detail: 'That app no longer exists.' });
+    }
+    app.status = 'stopped';
+    app.updated_at = now();
+    for (const vm of db.vms.filter((candidate) => candidate.app_id === app.id)) {
+      vm.desired_status = 'stopped';
+      if (vm.observed_status !== 'stopped') {
+        vm.observed_status = 'stopping';
+        converge(vm.id, [[1_200, 'stopped']]);
+      }
+    }
+    return json(app, { status: 202 });
+  }),
+
+  http.post('*/api/v1/apps/:appId/restart', ({ params }) => {
+    const user = signedIn();
+    if (!user) return unauthorized();
+    if (user.role === 'viewer') return writeRefusal('app:restart');
+
+    const app = findApp(String(params.appId));
+    if (!app) {
+      return problem(404, 'not_found', { detail: 'That app no longer exists.' });
+    }
+    app.status = 'running';
+    app.restart_generation += 1;
+    app.updated_at = now();
+    for (const vm of db.vms.filter((candidate) => candidate.app_id === app.id)) {
+      vm.restart_generation = app.restart_generation;
+      vm.restart_count += 1;
+      vm.desired_status = 'running';
+      vm.observed_status = 'starting';
+      converge(vm.id, [[1_200, 'running']]);
+    }
+    return json(app, { status: 202 });
+  }),
+
+  http.post('*/api/v1/apps/:appId/redeploy', ({ params }) => {
+    const user = signedIn();
+    if (!user) return unauthorized();
+    if (user.role === 'viewer') return writeRefusal('app:redeploy');
+
+    const app = findApp(String(params.appId));
+    if (!app) {
+      return problem(404, 'not_found', { detail: 'That app no longer exists.' });
+    }
+    const deployment = runDeployment(app.id, app.image, 'redeploy');
+    return json(deployment, { status: 202 });
+  }),
+
+  http.get('*/api/v1/apps/:appId/env', ({ params }) => {
+    if (!signedIn()) return unauthorized();
+    const app = findApp(String(params.appId));
+    if (!app) {
+      return problem(404, 'not_found', { detail: 'That app no longer exists.' });
+    }
+    const list: AppEnvList = { items: db.appEnv[app.id] ?? [] };
+    return json(list);
+  }),
+
+  http.put('*/api/v1/apps/:appId/env', async ({ request, params }) => {
+    const user = signedIn();
+    if (!user) return unauthorized();
+    if (user.role === 'viewer') return writeRefusal('app:update');
+
+    const app = findApp(String(params.appId));
+    if (!app) {
+      return problem(404, 'not_found', { detail: 'That app no longer exists.' });
+    }
+    const body = await readJson<AppEnvReplaceRequest>(request);
+    if (!body || !Array.isArray(body.items)) {
+      return problem(422, 'validation_failed', {
+        detail: 'The variable list could not be read.',
+      });
+    }
+
+    const seen = new Set<string>();
+    const items: AppEnvVar[] = [];
+    for (const item of body.items) {
+      const name = (item.name ?? '').trim();
+      if (!ENV_NAME_PATTERN.test(name)) {
+        return problem(422, 'validation_failed', {
+          detail: `"${name}" is not a valid variable name.`,
+        });
+      }
+      if (seen.has(name)) {
+        return problem(422, 'validation_failed', {
+          detail: `The variable ${name} is listed twice.`,
+        });
+      }
+      seen.add(name);
+      items.push({ app_id: app.id, name, updated_at: now() });
+    }
+
+    db.appEnv[app.id] = items;
+    return json({ items } satisfies AppEnvList);
+  }),
+
+  http.get('*/api/v1/apps/:appId/deployments', ({ params }) => {
+    if (!signedIn()) return unauthorized();
+    const app = findApp(String(params.appId));
+    if (!app) {
+      return problem(404, 'not_found', { detail: 'That app no longer exists.' });
+    }
+    const items = db.deployments
+      .filter((deployment) => deployment.app_id === app.id)
+      .slice()
+      .reverse();
+    const list: DeploymentList = { items, next_cursor: null };
+    return json(list);
+  }),
+
+  http.post('*/api/v1/apps/:appId/deployments', async ({ request, params }) => {
+    const user = signedIn();
+    if (!user) return unauthorized();
+    if (user.role === 'viewer') return writeRefusal('app:deploy');
+
+    const app = findApp(String(params.appId));
+    if (!app) {
+      return problem(404, 'not_found', { detail: 'That app no longer exists.' });
+    }
+    const body = await readJson<CreateDeploymentRequest>(request);
+    if (!body || (body.image ?? '').trim() === '') {
+      return problem(422, 'validation_failed', {
+        detail: 'An image reference is required.',
+      });
+    }
+    const deployment = runDeployment(app.id, body.image.trim(), 'api');
+    return json(deployment, { status: 202 });
+  }),
+
+  http.get('*/api/v1/deployments/:deploymentId', ({ params }) => {
+    if (!signedIn()) return unauthorized();
+    const deployment = findDeployment(String(params.deploymentId));
+    if (!deployment) {
+      return problem(404, 'not_found', {
+        detail: 'That deployment no longer exists.',
+      });
+    }
+    return json(deployment);
+  }),
+
+  http.get('*/api/v1/deployments/:deploymentId/logs', ({ params }) => {
+    if (!signedIn()) return unauthorized();
+    const deployment = findDeployment(String(params.deploymentId));
+    if (!deployment) {
+      return problem(404, 'not_found', {
+        detail: 'That deployment no longer exists.',
+      });
+    }
+    const list: DeploymentLogList = {
+      items: db.deploymentLogs[deployment.id] ?? [],
+    };
+    return json(list);
+  }),
+
+  http.get('*/api/v1/apps/:appId/domains', ({ params }) => {
+    if (!signedIn()) return unauthorized();
+    const app = findApp(String(params.appId));
+    if (!app) {
+      return problem(404, 'not_found', { detail: 'That app no longer exists.' });
+    }
+    const list: DomainList = {
+      items: db.domains.filter((domain) => domain.app_id === app.id),
+      next_cursor: null,
+    };
+    return json(list);
+  }),
+
+  http.post('*/api/v1/apps/:appId/domains', async ({ request, params }) => {
+    const user = signedIn();
+    if (!user) return unauthorized();
+    if (user.role === 'viewer') return writeRefusal('app:update');
+
+    const app = findApp(String(params.appId));
+    if (!app) {
+      return problem(404, 'not_found', { detail: 'That app no longer exists.' });
+    }
+    const body = await readJson<CreateDomainRequest>(request);
+    if (!body) {
+      return problem(422, 'validation_failed', {
+        detail: 'The form could not be read. Try again.',
+      });
+    }
+    const hostname = (body.hostname ?? '').trim().toLowerCase();
+    if (hostname === '' || hostname.includes(' ')) {
+      return problem(422, 'validation_failed', {
+        detail: 'Enter a hostname like blog.example.com.',
+      });
+    }
+    if (!TLS_MODES.has(body.tls_mode)) {
+      return problem(422, 'validation_failed', {
+        detail: 'Choose Cloudflare Tunnel or an ACME certificate.',
+      });
+    }
+    if (db.domains.some((domain) => domain.hostname === hostname)) {
+      return problem(409, 'conflict', {
+        detail: `${hostname} is already routed somewhere.`,
+      });
+    }
+
+    const domain: Domain = {
+      id: mockId('dom'),
+      app_id: app.id,
+      hostname,
+      tls_mode: body.tls_mode,
+      cert_status: body.tls_mode === 'tunnel' ? 'not_applicable' : 'pending',
+      cert_expires_at: null,
+      created_at: now(),
+    };
+    db.domains.push(domain);
+    if (body.tls_mode === 'acme') {
+      schedule(() => {
+        const current = findDomain(domain.id);
+        if (current && current.cert_status === 'pending') current.cert_status = 'issued';
+      }, 2_000);
+    }
+    return json(domain, { status: 201 });
+  }),
+
+  http.delete('*/api/v1/domains/:domainId', ({ params }) => {
+    const user = signedIn();
+    if (!user) return unauthorized();
+    if (user.role === 'viewer') return writeRefusal('app:update');
+
+    const domainId = String(params.domainId);
+    const domain = findDomain(domainId);
+    if (!domain) {
+      return problem(404, 'not_found', {
+        detail: 'That domain is already gone.',
+      });
+    }
+    db.domains = db.domains.filter((candidate) => candidate.id !== domainId);
+    return new HttpResponse(null, { status: 204 });
+  }),
+
+  http.get('*/api/v1/apps/:appId/logs/stream', ({ params }) => {
+    if (!signedIn()) return unauthorized();
+    const app = findApp(String(params.appId));
+    if (!app) {
+      return problem(404, 'not_found', { detail: 'That app no longer exists.' });
+    }
+
+    const vmId = db.vms.find((vm) => vm.app_id === app.id)?.id ?? mockId('vm');
+    const encoder = new TextEncoder();
+    let sequence = 0;
+    let timer: ReturnType<typeof setInterval> | undefined;
+
+    const line = () => {
+      sequence += 1;
+      const paths = ['/', '/health', '/assets/app.css', '/favicon.ico'];
+      const status = sequence % 11 === 0 ? 404 : 200;
+      const path = paths[sequence % paths.length] ?? '/';
+      return {
+        time: now(),
+        vm_id: vmId,
+        stream: 'stdout',
+        line: `10.0.0.1 - - [${new Date().toUTCString()}] "GET ${path} HTTP/1.1" ${status} 615 "-" "Mozilla/5.0"`,
+      };
+    };
+
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const emit = () => {
+          controller.enqueue(
+            encoder.encode(
+              formatSseFrame({
+                id: sequence + 1,
+                event: 'log',
+                data: JSON.stringify(line()),
+              }),
+            ),
+          );
+        };
+        emit();
+        timer = setInterval(emit, 1_000);
+      },
+      cancel() {
+        if (timer !== undefined) clearInterval(timer);
+      },
+    });
+
+    return new HttpResponse(stream, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+      },
+    });
+  }),
+
   // Generated fallbacks, kept last so every stateful route above wins.
   ...getHealthMock(),
   ...getAuthMock(),
   ...getNodesMock(),
   ...getProjectsMock(),
   ...getVmsMock(),
+  ...getAppsMock(),
+  ...getDeploymentsMock(),
+  ...getDomainsMock(),
+  ...getLogsMock(),
 ];
