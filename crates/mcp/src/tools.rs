@@ -390,6 +390,7 @@ fn scope() -> Value {
             "webhook:read",
             "webhook:write",
             "provider:manage",
+            "user:read",
             "user:write"
         ]
     })

@@ -148,12 +148,13 @@ A scope is `<resource>:<verb>` (D-0030). The complete list:
 | `webhook:read` | List and read webhooks and deliveries | |
 | `webhook:write` | Create, update, delete, test webhooks | human-only |
 | `provider:manage` | Create, list, read, delete providers and rotate their secrets; map nodes to tunnel providers | human-only |
+| `user:read` | List human users, to resolve user ids to names | human-only |
 | `user:write` | Manage human users and their roles | human-only |
 
 - **destructive** scopes need JIT approval when an agent uses them: the agent files an approval request, a human approves it, and a short-lived extra grant is issued (D-0030).
 - **human-only** scopes can never appear in an agent's grant, so an agent cannot widen its own power or approve its own requests.
 - The wildcard `app:*` style is not allowed in grants; scopes are listed explicitly.
-- Human roles are fixed scope bundles: `owner` (every scope), `operator` (every scope except `user:write`), `viewer` (every `:read` scope plus `app:logs`).
+- Human roles are fixed scope bundles: `owner` (every scope), `operator` (every scope except `user:write`), `viewer` (every `:read` scope plus `app:logs`). `user:read` is a `:read` scope, so every role holds it.
 
 ### Resource selectors
 

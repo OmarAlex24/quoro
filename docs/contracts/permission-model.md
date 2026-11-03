@@ -71,6 +71,7 @@ Consequences of the bundles:
 
 - A `viewer` can read apps, deployments, nodes, events, incidents, grants, approvals and the audit log, and can stream app logs, but cannot mutate anything (README.md, "Scopes").
 - An `operator` cannot create or change human users; that is `user:write` and owner-only (README.md, "Scopes").
+- Every role holds `user:read`, so an `operator` or `viewer` can list users and turn a user id (`owner_user_id`, `on_behalf_of`, `decided_by`, `created_by`) into a name. `user:read` is human-only: agents never list users.
 - Human roles are not grantable to agents. An agent never receives a "role"; it receives grants (D-0029, D-0030).
 - `role` is a column on the user (`users.role`), so changing a role changes every subsequent decision for that human with no re-issue step (D-0029).
 
@@ -119,6 +120,7 @@ A scope is `<resource>:<verb>` and is the unit of authority in both human roles 
 | `webhook:read` | List and read webhooks and deliveries | |
 | `webhook:write` | Create, update, delete, test webhooks | human-only |
 | `provider:manage` | Create, list, read, delete providers and rotate their secrets | human-only |
+| `user:read` | List human users, to resolve user ids to names | human-only |
 | `user:write` | Manage human users and their roles | human-only |
 
 ### 4.1 Destructive scopes
@@ -138,10 +140,10 @@ Making destructive scopes grantable in standing grants would be a change to this
 
 ### 4.2 Human-only scopes
 
-Nine scopes are human-only: `node:enroll`, `node:remove`, `node:fence_ack`, `agent:write`, `grant:write`, `approval:decide`, `webhook:write`, `provider:manage` and `user:write` (README.md, "Scopes").
+Ten scopes are human-only: `node:enroll`, `node:remove`, `node:fence_ack`, `agent:write`, `grant:write`, `approval:decide`, `webhook:write`, `provider:manage`, `user:read` and `user:write` (README.md, "Scopes").
 
 - A grant whose `scopes` contains a human-only scope is refused at creation with `validation_failed`, and a hypothetical row that contained one is refused at call time with reason `human_only` (README.md, "Errors").
-- The set is chosen so an agent can never widen its own power (`agent:write`, `grant:write`, `webhook:write`), approve its own request (`approval:decide`), take over cluster membership (`node:enroll`, `node:remove`), declare a possibly running VM stopped so its lease moves (`node:fence_ack`, D-0079) or hold external credentials (`provider:manage`) (D-0030, D-0051).
+- The set is chosen so an agent can never widen its own power (`agent:write`, `grant:write`, `webhook:write`), approve its own request (`approval:decide`), take over cluster membership (`node:enroll`, `node:remove`), declare a possibly running VM stopped so its lease moves (`node:fence_ack`, D-0079) or hold external credentials (`provider:manage`) (D-0030, D-0051). `user:read` is human-only so an agent never reads the list of human identities and their emails.
 - Because `approval:decide` is human-only, "an agent approves its own destructive request" is not a policy that could be misconfigured; it is unrepresentable (D-0030).
 
 ### 4.3 Wildcards
@@ -398,6 +400,7 @@ A webhook may carry a `wake` object (shared entity model; [events.schema.json](e
 - `grant_scopes` is validated when the webhook is saved: a human-only scope or a destructive scope receives `validation_failed`. A webhook therefore cannot be used to route around section 4.1 (D-0032).
 - `webhook:write` is human-only, so the agent that will be woken cannot configure its own future grant (README.md, "Scopes").
 - `created_by` is the human who saved the webhook and becomes `on_behalf_of` of every incident grant the webhook causes, which is how "on whose behalf" is answered for a wake nobody was present for (D-0029).
+- `wake` can be changed with `PATCH /api/v1/webhooks/{webhook_id}` but not removed. To stop a webhook from waking an agent, delete the webhook and create it again without `wake`; the new webhook gets a new signing secret.
 
 ### 8.2 When the grant is issued
 
@@ -414,6 +417,7 @@ A webhook may carry a `wake` object (shared entity model; [events.schema.json](e
    - `on_behalf_of` = `webhook.created_by`;
    - `created_by_type` `system`, `reason` naming the incident and the webhook.
 4. `grant.created` is emitted and the issuance is audited with `actor_type` `system`.
+5. The delivery body is the `incident.opened` event with `data.wake` = `{agent_id, grant_id}` added: the woken agent and the incident grant just issued ([events.schema.json](events.schema.json), `data_incident_opened`). The signature covers it like the rest of the body, and every retry of that delivery carries the same `data.wake`. A delivery whose webhook issued no grant (no `wake`, or the incident was resolved before the delivery) carries no `data.wake`. The event log itself never carries it.
 
 ### 8.3 When the grant ends
 

@@ -660,7 +660,17 @@
         "incident_id": { "$ref": "#/$defs/IncidentId" },
         "title": { "type": "string" },
         "trigger_event_id": { "$ref": "#/$defs/EventId" },
-        "subject": { "$ref": "#/$defs/Subject" }
+        "subject": { "$ref": "#/$defs/Subject" },
+        "wake": {
+          "type": "object",
+          "description": "Present only in a webhook delivery from a webhook with `wake` that issued an incident grant for this incident: the agent the delivery wakes and the incident grant it acts under (D-0032). Never in the event log (`GET /api/v1/events`, the event stream) and never in a test delivery. The delivery signature covers it like the rest of the body.",
+          "required": ["agent_id", "grant_id"],
+          "properties": {
+            "agent_id": { "$ref": "#/$defs/AgentId" },
+            "grant_id": { "$ref": "#/$defs/GrantId" }
+          },
+          "additionalProperties": false
+        }
       },
       "additionalProperties": true
     },

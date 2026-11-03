@@ -2326,6 +2326,23 @@ components:
               type: string
               readOnly: true
               description: The key secret. Shown only in this response.
+    AgentKeyList:
+      type: object
+      title: AgentKeyList
+      description: |
+        One page of an agent's keys, newest first, revoked keys included. A key
+        never carries its secret here.
+      required:
+        - items
+        - next_cursor
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AgentKey'
+        next_cursor:
+          type: [string, 'null']
+          description: Cursor for the next page, or null on the last page.
     Selector:
       type: object
       title: Selector
@@ -2399,6 +2416,7 @@ components:
         - webhook:read
         - webhook:write
         - provider:manage
+        - user:read
         - user:write
     Grant:
       type: object
@@ -3125,7 +3143,9 @@ components:
       title: UpdateWebhookRequest
       description: |
         Change a webhook. Absent fields stay unchanged. The signing secret cannot
-        be changed: delete and recreate the webhook to rotate it.
+        be changed: delete and recreate the webhook to rotate it. `wake` cannot
+        be cleared here; delete and recreate the webhook without it (its secret
+        rotates).
       properties:
         name:
           type: string
@@ -5402,9 +5422,12 @@ paths:
       operationId: listUsers
       summary: List human users
       description: |
-        Every human identity with its role. Managing users is human-only
-        (D-0030): an agent is refused with `forbidden` and `reason: human_only`.
-      x-quoro-scope: user:write
+        Every human identity with its role, so a reader can turn a user id
+        (`owner_user_id`, `on_behalf_of`, `decided_by`, `created_by`) into a
+        name. `user:read` is in every role bundle; it is human-only, so an agent
+        is refused with `forbidden` and `reason: human_only` (D-0030). Changing
+        users still needs `user:write`.
+      x-quoro-scope: user:read
       parameters:
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
@@ -5712,6 +5735,39 @@ paths:
         '503':
           $ref: '#/components/responses/NotPrimary'
   /api/v1/agents/{agent_id}/keys:
+    get:
+      tags: [agents]
+      operationId: listAgentKeys
+      summary: List an agent's keys
+      description: |
+        The agent's keys, newest first, including revoked ones, with when each
+        was created, last used and revoked. Secrets are never returned: a key's
+        secret is shown once, by `createAgentKey`.
+      x-quoro-scope: agent:read
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of the agent's keys.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentKeyList'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '429':
+          $ref: '#/components/responses/RateLimited'
     post:
       tags: [agents]
       operationId: createAgentKey
@@ -6141,7 +6197,9 @@ paths:
       summary: List incidents
       description: |
         Incidents opened by a detection, newest first: the subject, the triggering
-        event and whether they are still open (D-0032). Exposed as the MCP tool
+        event and whether they are still open (D-0032). Pages follow the incident
+        id newest first; `next_cursor` is an opaque string that continues after
+        the last incident of the page. Exposed as the MCP tool
         `list_incidents` (D-0033).
       x-quoro-scope: incident:read
       x-quoro-mcp-tool: list_incidents
@@ -6379,7 +6437,8 @@ paths:
       description: |
         The event log in ascending `seq` order. `type` may be repeated to select
         several types; `subject_id` narrows to one resource and `after_seq` resumes
-        a read (D-0032). Exposed as the MCP tool `list_events` (D-0033).
+        a read (D-0032). Pages follow `seq` ascending; `next_cursor` is an opaque
+        string that continues after the last event of the page. Exposed as the MCP tool `list_events` (D-0033).
       x-quoro-scope: event:read
       x-quoro-mcp-tool: list_events
       parameters:
@@ -6586,7 +6645,10 @@ paths:
       description: |
         Changes name, URL, event filter, selector, wake configuration or the
         `enabled` flag. The signing secret cannot be changed; delete and recreate
-        the webhook to rotate it. Human-only (D-0030). `Quoro-Justification` is
+        the webhook to rotate it. `wake` can be changed but not removed: an
+        absent `wake` leaves it unchanged and `null` is not accepted. To stop a
+        webhook from waking an agent, delete it and create it again without
+        `wake`; the new webhook has a new signing secret. Human-only (D-0030). `Quoro-Justification` is
         required when the caller is an agent (D-0031).
       x-quoro-scope: webhook:write
       parameters:
@@ -6626,8 +6688,9 @@ paths:
       operationId: deleteWebhook
       summary: Delete a webhook
       description: |
-        Deletes the subscription. Deliveries already attempted stay in the delivery
-        history. Human-only (D-0030). `Quoro-Justification` is required when the
+        Deletes the subscription together with its delivery history: its
+        delivery rows are deleted with it (db-schema.sql, ON DELETE CASCADE).
+        Pending retries stop. Human-only (D-0030). `Quoro-Justification` is required when the
         caller is an agent (D-0031).
       x-quoro-scope: webhook:write
       parameters:
@@ -6658,8 +6721,14 @@ paths:
       description: |
         Sends one test delivery to the receiver, signed like a real delivery, and
         records it in the delivery history. It is the fastest way to check the
-        receiver verifies `Quoro-Signature` correctly. Human-only (D-0030).
-        `Quoro-Justification` is required when the caller is an agent (D-0031).
+        receiver verifies `Quoro-Signature` correctly. Quoro has no test event
+        type: the body is the newest event of the event log, replayed as-is, and
+        an empty event log answers `validation_failed` (422). A test delivery is
+        attempted once, never retried, never issues an incident grant and never
+        carries `data.wake`. It is recorded as its own delivery, separate from
+        the real deliveries of the same event, so it never replaces, blocks or
+        collides with them. Human-only (D-0030). `Quoro-Justification` is
+        required when the caller is an agent (D-0031).
       x-quoro-scope: webhook:write
       parameters:
         - $ref: '#/components/parameters/WebhookId'
@@ -6680,6 +6749,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
         '429':
           $ref: '#/components/responses/RateLimited'
   /api/v1/webhooks/{webhook_id}/deliveries:

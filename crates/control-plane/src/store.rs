@@ -21,6 +21,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../../docs/contracts/migrations/0001-node-fence-failure.sql"),
     include_str!("../../../docs/contracts/migrations/0002-node-credentials.sql"),
     include_str!("../../../docs/contracts/migrations/0003-provider-references.sql"),
+    include_str!("../../../docs/contracts/migrations/0004-webhook-test-deliveries.sql"),
 ];
 
 /// 64 zeros: `prev_hash` of the first entry of a chain.
