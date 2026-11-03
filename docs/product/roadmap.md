@@ -196,14 +196,14 @@ rmcp 3.8 is the official Rust MCP SDK, with three semver-major releases between 
 
 #### Definition of Done
 
-- [ ] On lab-1, tell an agent the app on lab-2 is down; the agent restarts it through MCP, the app answers 200, and the audit log holds an entry naming the agent, the human who authorized it and the reason [D-0033, D-0029].
-- [ ] On lab-1, an agent holding a read-only grant attempts a restart and is refused; the refusal appears in the audit log [D-0030, D-0031].
-- [ ] On lab-1, an agent whose grant TTL has passed is refused on the next call, with the reason shown as grant expired [D-0030].
-- [ ] On lab-1, revoke an agent's grant in the panel; the agent's next call is refused [D-0030].
-- [ ] On lab-1, an agent attempts a delete without approval; instead of executing, the panel shows a pending approval request, and approving it lets the action run under a short-lived extra grant [D-0030].
-- [ ] On lab-1, the audit chain verifies from the first entry to the last; after one entry is edited in the local copy, verification reports the exact entry as broken [D-0013, D-0031].
-- [ ] On lab-1, an event webhook fires on an app-down event and an agent is woken with the incident context [D-0032].
-- [ ] On lab-1, the reference agent runner in `examples/agent-runner/` receives the wake webhook, verifies its signature, mints an access token with its own agent key and acts through MCP within the incident grant, passing `incident_id` and `justification` [D-0049, D-0032].
+- [x] On lab-1, tell an agent the app on lab-2 is down; the agent restarts it through MCP, the app answers 200, and the audit log holds an entry naming the agent, the human who authorized it and the reason [D-0033, D-0029].
+- [x] On lab-1, an agent holding a read-only grant attempts a restart and is refused; the refusal appears in the audit log [D-0030, D-0031].
+- [x] On lab-1, an agent whose grant TTL has passed is refused on the next call, with the reason shown as grant expired [D-0030].
+- [x] On lab-1, revoke an agent's grant in the panel; the agent's next call is refused [D-0030].
+- [x] On lab-1, an agent attempts a delete without approval; instead of executing, the panel shows a pending approval request, and approving it lets the action run under a short-lived extra grant [D-0030].
+- [x] On lab-1, the audit chain verifies from the first entry to the last; after one entry is edited in the local copy, verification reports the exact entry as broken [D-0013, D-0031].
+- [x] On lab-1, an event webhook fires on an app-down event and an agent is woken with the incident context [D-0032].
+- [x] On lab-1, the reference agent runner in `examples/agent-runner/` receives the wake webhook, verifies its signature, mints an access token with its own agent key and acts through MCP within the incident grant, passing `incident_id` and `justification` [D-0049, D-0032].
 
 #### Demo script
 
