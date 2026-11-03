@@ -47,9 +47,6 @@ const MCP_PATH: &str = quoro_mcp::MCP_PATH;
 const AGENT_KEY_PREFIX: &str = "akey_";
 /// The prefix of the access token the primary mints.
 const ACCESS_TOKEN_PREFIX: &str = "atk_";
-/// The protocol version sent before the client's `initialize` has been
-/// answered; afterwards the version the primary chose is sent.
-const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-25";
 /// An access token lives five minutes (openapi.yaml, `AccessTokenResponse`);
 /// this is assumed when `expires_at` cannot be read.
 const TOKEN_LIFETIME: Duration = Duration::from_secs(300);
@@ -114,7 +111,7 @@ async fn start(options: Options) -> Result<Relay, String> {
     Ok(Relay {
         primary,
         tokens: Mutex::new(tokens),
-        protocol_version: Mutex::new(DEFAULT_PROTOCOL_VERSION.to_string()),
+        protocol_version: Mutex::new(None),
     })
 }
 
@@ -363,7 +360,9 @@ fn describe_problem(status: StatusCode, body: &[u8]) -> String {
 struct Relay {
     primary: Primary,
     tokens: Mutex<Tokens>,
-    protocol_version: Mutex<String>,
+    /// The protocol version the primary chose in its answer to `initialize`;
+    /// `None` until that answer arrives.
+    protocol_version: Mutex<Option<String>>,
 }
 
 impl Relay {
@@ -433,7 +432,7 @@ impl Relay {
         let is_initialize = message.get("method").and_then(Value::as_str) == Some("initialize");
         let body = message.to_string().into_bytes();
 
-        let reply = match self.post_mcp(body).await {
+        let reply = match self.post_mcp(body, is_initialize).await {
             Ok(reply) => reply,
             Err(e) => {
                 tracing::error!(error = %e, "cannot forward a message to the primary");
@@ -472,25 +471,17 @@ impl Relay {
 
     /// POSTs one message to `/mcp`, minting a new token once when the primary
     /// answers 401 (the token lapsed or was refused).
-    async fn post_mcp(&self, body: Vec<u8>) -> Result<Reply, String> {
+    async fn post_mcp(&self, body: Vec<u8>, is_initialize: bool) -> Result<Reply, String> {
         let mut retried = false;
         loop {
             let token = self.tokens.lock().await.get(&self.primary).await?;
-            let authorization = format!("Bearer {token}");
-            let version = self.protocol_version.lock().await.clone();
-            let reply = self
-                .primary
-                .post(
-                    MCP_PATH,
-                    &[
-                        ("authorization", &authorization),
-                        ("content-type", "application/json"),
-                        ("accept", "application/json, text/event-stream"),
-                        ("mcp-protocol-version", &version),
-                    ],
-                    body.clone(),
-                )
-                .await?;
+            let negotiated = self.protocol_version.lock().await.clone();
+            let headers = mcp_headers(&token, negotiated.as_deref(), is_initialize);
+            let headers: Vec<(&str, &str)> = headers
+                .iter()
+                .map(|(name, value)| (*name, value.as_str()))
+                .collect();
+            let reply = self.primary.post(MCP_PATH, &headers, body.clone()).await?;
             if reply.status == StatusCode::UNAUTHORIZED && !retried {
                 retried = true;
                 let mut tokens = self.tokens.lock().await;
@@ -507,13 +498,40 @@ impl Relay {
     /// Keeps the protocol version the primary chose in `initialize`, which
     /// every later request names in `MCP-Protocol-Version`.
     async fn remember_protocol_version(&self, messages: &[Value]) {
-        let chosen = messages
-            .iter()
-            .find_map(|m| m["result"]["protocolVersion"].as_str());
-        if let Some(version) = chosen {
-            *self.protocol_version.lock().await = version.to_string();
+        if let Some(version) = negotiated_version(messages) {
+            *self.protocol_version.lock().await = Some(version.to_string());
         }
     }
+}
+
+/// The headers of one POST to `/mcp`.
+///
+/// `initialize` carries no `MCP-Protocol-Version`: the version is still being
+/// negotiated, it is named in the body, and a header that differs from the
+/// body is refused. Every later message carries the version the primary
+/// chose; before that answer there is none to send, and the primary then
+/// assumes its default (MCP, "Protocol Version Header").
+fn mcp_headers(
+    token: &str,
+    negotiated: Option<&str>,
+    is_initialize: bool,
+) -> Vec<(&'static str, String)> {
+    let mut headers = vec![
+        ("authorization", format!("Bearer {token}")),
+        ("content-type", "application/json".to_string()),
+        ("accept", "application/json, text/event-stream".to_string()),
+    ];
+    if let Some(version) = negotiated.filter(|_| !is_initialize) {
+        headers.push(("mcp-protocol-version", version.to_string()));
+    }
+    headers
+}
+
+/// The `protocolVersion` of the first `initialize` result among `messages`.
+fn negotiated_version(messages: &[Value]) -> Option<&str> {
+    messages
+        .iter()
+        .find_map(|m| m["result"]["protocolVersion"].as_str())
 }
 
 /// The JSON-RPC messages in a successful `/mcp` answer: a JSON body (one
@@ -663,6 +681,39 @@ mod tests {
             "192.0.2.1:8443"
         );
         assert_eq!(host_header(&endpoint("https://[::1]:8443")), "[::1]:8443");
+    }
+
+    #[test]
+    fn initialize_carries_no_version_and_later_messages_the_negotiated_one() {
+        let version_of = |headers: &[(&str, String)]| {
+            headers
+                .iter()
+                .find(|(name, _)| *name == "mcp-protocol-version")
+                .map(|(_, value)| value.clone())
+        };
+        // The first initialize, and a repeated one, never send the header.
+        assert_eq!(version_of(&mcp_headers("atk_x", None, true)), None);
+        assert_eq!(
+            version_of(&mcp_headers("atk_x", Some("2025-06-18"), true)),
+            None
+        );
+        // Nothing negotiated yet: no header, so the primary uses its default.
+        assert_eq!(version_of(&mcp_headers("atk_x", None, false)), None);
+
+        let answer = [json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "protocolVersion": "2025-06-18", "capabilities": {} },
+        })];
+        let negotiated = negotiated_version(&answer);
+        assert_eq!(negotiated, Some("2025-06-18"));
+        let headers = mcp_headers("atk_x", negotiated, false);
+        assert_eq!(version_of(&headers).as_deref(), Some("2025-06-18"));
+        assert!(headers.contains(&("authorization", "Bearer atk_x".to_string())));
+
+        assert_eq!(
+            negotiated_version(&[json!({"jsonrpc": "2.0", "id": 1, "error": {}})]),
+            None
+        );
     }
 
     #[test]
