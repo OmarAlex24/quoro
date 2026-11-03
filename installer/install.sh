@@ -39,7 +39,18 @@
 #                                           with the insecure flag
 #   QUORO_INSTALL_INSECURE_SKIP_SIGNATURE=1 skip Sigstore verification; only honored
 #                                           together with QUORO_INSTALL_FROM
-#   QUORO_NO_START=1                        install files, do not start the service
+#   QUORO_NO_START=1                        install files, do not start the services
+#   QUORO_ROLE=primary|node                 what this host runs (default: primary).
+#                                           A primary runs the unprivileged control
+#                                           plane and its own node agent; a node runs
+#                                           only the node agent and joins a primary
+#                                           (ADR 0089).
+#   QUORO_JOIN_URL=<https url>              the primary's URL, for QUORO_ROLE=node.
+#   QUORO_JOIN_TOKEN=<token>                a join token from the primary, for
+#                                           QUORO_ROLE=node. Never logged.
+#   QUORO_JOIN_FINGERPRINT=sha256:<hex>     the primary's TLS fingerprint, for
+#                                           QUORO_ROLE=node. Not needed when this
+#                                           host is already enrolled.
 
 set -eu
 umask 022
@@ -57,6 +68,7 @@ QUORO_GH_URL="https://github.com/cli/cli/releases/download/v${QUORO_GH_VERSION}/
 
 TARGET=''
 VERSION=''
+ROLE=''
 WORK_DIR=''
 TARBALL=''
 CHECKSUMS=''
@@ -64,7 +76,13 @@ BUNDLE=''
 ARTIFACT_ROOT=''
 BINARY_CHANGED=0
 UNIT_CHANGED=0
+NODE_UNIT_CHANGED=0
 ENGINE_CHANGED=0
+
+# Where the node agent keeps its identity, local store and engine state. It is a
+# sibling of the control plane's data directory, never inside it, so the two can
+# belong to different users (ADR 0089).
+NODE_DATA_DIR='/var/lib/quoro-node'
 
 # --- Output helpers ---------------------------------------------------------
 
@@ -80,6 +98,57 @@ die() {
 cleanup() {
     if [ -n "${WORK_DIR:-}" ] && [ -d "$WORK_DIR" ]; then
         rm -rf "$WORK_DIR"
+    fi
+}
+
+# --- Roles ------------------------------------------------------------------
+
+# Whether this host already holds a complete node enrollment (ADR 0089): the
+# identity, the session credential and the private-key seed.
+node_is_enrolled() {
+    [ -f "$NODE_DATA_DIR/identity.json" ] &&
+        [ -f "$NODE_DATA_DIR/credential" ] &&
+        [ -f "$NODE_DATA_DIR/node-ed25519.seed" ]
+}
+
+# Reads QUORO_ROLE. A node runs only the node agent, a primary runs the control
+# plane and its own agent.
+resolve_role() {
+    ROLE=${QUORO_ROLE:-primary}
+    case $ROLE in
+        primary | node) : ;;
+        *) die "invalid QUORO_ROLE '${QUORO_ROLE}': expected primary or node" ;;
+    esac
+}
+
+# A node enrolls with a join token, so it needs the primary's URL, its token and
+# its TLS fingerprint. Checking them here means a missing one fails before any
+# file is written; the token itself is never printed, logged or traced.
+check_node_join_credentials() {
+    if node_is_enrolled; then
+        log "this host is already enrolled ($NODE_DATA_DIR); no join token needed"
+        return 0
+    fi
+
+    _missing=''
+    [ -n "${QUORO_JOIN_URL:-}" ] || _missing="$_missing QUORO_JOIN_URL"
+    [ -n "${QUORO_JOIN_TOKEN:-}" ] || _missing="$_missing QUORO_JOIN_TOKEN"
+    [ -n "${QUORO_JOIN_FINGERPRINT:-}" ] || _missing="$_missing QUORO_JOIN_FINGERPRINT"
+    [ -z "$_missing" ] ||
+        die "QUORO_ROLE=node needs$_missing to enroll this host; create a join token on the primary first"
+
+    case ${QUORO_JOIN_URL} in
+        https://?*) : ;;
+        *) die 'QUORO_JOIN_URL must start with https:// and name the primary, for example https://quoro.example.com:8443' ;;
+    esac
+}
+
+# A host that already ran a control plane keeps its database and its TLS
+# material there. Turning it into a node would leave that data orphaned with no
+# API to serve it, so refuse instead of installing over it.
+check_node_host_is_not_a_primary() {
+    if [ -e /etc/systemd/system/quoro.service ] || [ -e /var/lib/quoro/quoro.db ]; then
+        die 'this host runs a Quoro control plane (found /etc/systemd/system/quoro.service or /var/lib/quoro/quoro.db); installing it as a node would orphan that data. Uninstall the control plane first, then install it as a node'
     fi
 }
 
@@ -164,6 +233,8 @@ check_preconditions() {
 
     [ -d /run/systemd/system ] || die 'systemd is not running on this host (/run/systemd/system is missing)'
 
+    resolve_role
+
     if [ "${QUORO_INSTALL_INSECURE_SKIP_SIGNATURE:-}" = '1' ] && [ -z "${QUORO_INSTALL_FROM:-}" ]; then
         die 'QUORO_INSTALL_INSECURE_SKIP_SIGNATURE=1 is only honored together with QUORO_INSTALL_FROM; refusing'
     fi
@@ -207,11 +278,22 @@ check_preconditions() {
             die "missing host tools:$_missing and no apt-get on this host; install the packages e2fsprogs, iproute2 and nftables"
     fi
 
+    case $ROLE in
+        primary)
+            # The control plane runs as this system user; useradd creates it.
+            has_host_tool useradd || die 'useradd is missing; the primary needs it to create the quoro-api system user'
+            ;;
+        node)
+            check_node_join_credentials
+            check_node_host_is_not_a_primary
+            ;;
+    esac
+
     if [ ! -e /dev/kvm ]; then
-        log 'warning: this host has no /dev/kvm; quoro.service will refuse to start the cloud-hypervisor engine (ADR 0009)'
+        log 'warning: this host has no /dev/kvm; quoro-node.service will refuse to start the cloud-hypervisor engine (ADR 0009)'
     fi
 
-    log "host checks passed (Linux, root, systemd, $TARGET)"
+    log "host checks passed (Linux, root, systemd, $TARGET, role $ROLE)"
 }
 
 # --- Version ----------------------------------------------------------------
@@ -472,7 +554,7 @@ extract_artifacts() {
     fi
 
     ARTIFACT_ROOT="$WORK_DIR/x/$_top"
-    for _f in quoro quoro.service quoro-init pins.txt; do
+    for _f in quoro quoro.service quoro-node.service quoro-init pins.txt; do
         if [ ! -f "$ARTIFACT_ROOT/$_f" ] || [ -h "$ARTIFACT_ROOT/$_f" ]; then
             die "$TARBALL does not contain $_top/$_f as a regular file"
         fi
@@ -630,24 +712,87 @@ install_host_packages() {
 install_dirs() {
     # Older installs created a quoro system user that ran the service. The
     # engine manages a bridge, TAP devices and nftables rules and converts
-    # images with ownership preserved, so the service runs as root now.
+    # images with ownership preserved, so the node agent runs as root now.
     if id -u quoro >/dev/null 2>&1; then
-        log 'user quoro exists from an older install; it is no longer used (the service runs as root)'
+        log 'user quoro exists from an older install; it is no longer used'
     fi
 
-    _data='/var/lib/quoro'
-    if [ -d "$_data" ]; then
-        # Older installs owned it by quoro; move it to root and close it down.
-        chown root:root "$_data" || die "could not change the owner of $_data to root:root"
-        chmod 0700 "$_data" || die "could not set the mode of $_data to 0700"
-        log "kept $_data (root:root 0700; older installs had it owned by quoro)"
+    # The node agent's own directory belongs to root on both roles: only
+    # quoro-node.service, which runs as root, reads it.
+    if [ -d "$NODE_DATA_DIR" ]; then
+        chown root:root "$NODE_DATA_DIR" || die "could not change the owner of $NODE_DATA_DIR to root:root"
+        chmod 0700 "$NODE_DATA_DIR" || die "could not set the mode of $NODE_DATA_DIR to 0700"
+        log "kept $NODE_DATA_DIR (root:root 0700)"
     else
-        install -d -m 0700 -o root -g root "$_data" || die "could not create $_data"
-        log "created $_data (root:root 0700)"
+        install -d -m 0700 -o root -g root "$NODE_DATA_DIR" || die "could not create $NODE_DATA_DIR"
+        log "created $NODE_DATA_DIR (root:root 0700)"
     fi
 
     install -d -m 0755 /etc/quoro || die 'could not create /etc/quoro'
     log 'config directory /etc/quoro is in place'
+}
+
+# The control plane's system user (ADR 0089). It never gets a home, a shell or a
+# password: it exists so the API and panel run without privileges, and so the
+# data directory has an owner that is not root and not a human.
+install_api_user() {
+    _user='quoro-api'
+
+    if id -u "$_user" >/dev/null 2>&1; then
+        _uid=$(id -u "$_user") || die "could not read the uid of $_user"
+        if [ "$_uid" -ge 1000 ]; then
+            die "user $_user exists with uid $_uid, which is a login account; refusing to hand /var/lib/quoro to a human account. Remove it and re-run: userdel $_user"
+        fi
+        log "user $_user exists (uid $_uid); left as is"
+        return 0
+    fi
+
+    # Prefer the nologin shell; the first one present is used.
+    _shell='/usr/sbin/nologin'
+    if [ ! -x "$_shell" ]; then
+        _shell='/sbin/nologin'
+    fi
+    if [ ! -x "$_shell" ]; then
+        _shell='/bin/false'
+    fi
+
+    useradd --system --user-group --no-create-home --home-dir /var/lib/quoro --shell "$_shell" "$_user" ||
+        die "could not create the system user $_user"
+    log "created the system user $_user (no home, $_shell)"
+}
+
+# /var/lib/quoro belongs to the unprivileged control plane, with one exception:
+# engine/ is the M1 engine state, written by the root service of ADR 0088. The
+# control plane must not read it, so it stays root-owned.
+install_primary_data_dir() {
+    _data='/var/lib/quoro'
+
+    if [ ! -d "$_data" ]; then
+        install -d -m 0700 -o quoro-api -g quoro-api "$_data" || die "could not create $_data"
+        log "created $_data (quoro-api:quoro-api 0700)"
+        return 0
+    fi
+
+    if [ -d "$_data/engine" ]; then
+        log "$_data/engine is the M1 engine state and stays root-owned; the node agent keeps its engine state in $NODE_DATA_DIR/engine from now on, and VMs created by M1 are not adopted"
+    fi
+
+    # A service still running as root holds the database open and can recreate a
+    # file under root after the ownership changed, so stop it first. It starts
+    # again as quoro.service later in this run.
+    if systemctl is-active --quiet quoro.service 2>/dev/null &&
+        [ -n "$(find "$_data" -maxdepth 0 ! -user quoro-api 2>/dev/null)" ]; then
+        systemctl stop quoro.service || die 'could not stop quoro.service before changing the owner of /var/lib/quoro'
+        log 'stopped quoro.service before handing /var/lib/quoro to quoro-api'
+    fi
+
+    # On an upgrade from M1 everything here is root-owned. Hand it to the API
+    # user except engine/, which keeps root.
+    find "$_data" -mindepth 1 -maxdepth 1 ! -name engine -exec chown -R quoro-api:quoro-api {} + ||
+        die "could not change the owner of $_data to quoro-api:quoro-api"
+    chown quoro-api:quoro-api "$_data" || die "could not change the owner of $_data to quoro-api:quoro-api"
+    chmod 0700 "$_data" || die "could not set the mode of $_data to 0700"
+    log "kept $_data (quoro-api:quoro-api 0700)"
 }
 
 config_has_engine() {
@@ -655,26 +800,101 @@ config_has_engine() {
     grep -q '^[[:space:]]*engine[[:space:]]*=' "$1" 2>/dev/null
 }
 
+config_has_node_table() {
+    [ -r "$1" ] || return 1
+    grep -q '^[[:space:]]*\[node\][[:space:]]*$' "$1" 2>/dev/null
+}
+
+config_has_node_local_false() {
+    [ -r "$1" ] || return 1
+    grep -q '^[[:space:]]*local[[:space:]]*=[[:space:]]*false[[:space:]]*$' "$1" 2>/dev/null
+}
+
 install_config() {
+    if [ "$ROLE" = 'node' ]; then
+        install_node_config
+    else
+        install_primary_config
+    fi
+}
+
+install_primary_config() {
     _conf='/etc/quoro/quoro.toml'
     if [ -f "$_conf" ]; then
         log "kept existing $_conf"
         if ! config_has_engine "$_conf"; then
             log 'note: the existing config has no engine line, so quoro runs the fake engine; add engine = "cloud-hypervisor" to use the hypervisor (the defaults are in installer/README.md)'
         fi
+
+        # Without this table, quoro serve would also try to run the node agent
+        # in its own unprivileged process and refuse (ADR 0089).
+        if ! config_has_node_table "$_conf"; then
+            printf '\n[node]\n# The node agent runs as quoro-node.service (ADR 0089).\nlocal = false\n' >> "$_conf" ||
+                die "could not append the [node] table to $_conf"
+            log "appended the [node] table (local = false) to $_conf"
+        elif ! config_has_node_local_false "$_conf"; then
+            log "warning: $_conf has a [node] table without 'local = false'; quoro serve would also try to run the node agent unprivileged and refuse. Set local = false in that table"
+        fi
+
+        # The API must be able to read the config and only root may write it.
+        chown root:quoro-api "$_conf" || die "could not change the owner of $_conf to root:quoro-api"
+        chmod 0640 "$_conf" || die "could not set the mode of $_conf to 0640"
         return 0
     fi
 
     _tmp="$WORK_DIR/quoro.toml"
     printf '%s\n' \
-        '# Quoro configuration (ADR 0054 host layout).' \
-        '# Edit this file and restart quoro: systemctl restart quoro' \
+        '# Quoro configuration (ADR 0054 host layout, ADR 0089 privilege split).' \
+        '# Edit this file and restart quoro: systemctl restart quoro quoro-node' \
         '' \
         '# One TLS listener for API, panel and MCP. Ingress keeps 80/443.' \
         'listen = "0.0.0.0:8443"' \
         '' \
-        '# SQLite database, cluster key files (0600) and engine state.' \
+        '# SQLite database, cluster key files (0600) and the local join file.' \
         'data_dir = "/var/lib/quoro"' \
+        '' \
+        '# Engine: "cloud-hypervisor" runs one microVM per app; "fake" runs nothing' \
+        '# and exists for development only.' \
+        'engine = "cloud-hypervisor"' \
+        '' \
+        '# Base URL nodes dial, for example "https://quoro.example.com:8443".' \
+        '# Unset, it defaults to the Host header of the request that created the' \
+        '# join token, which is right for most installs.' \
+        '# public_url = "https://<this host>:8443"' \
+        '' \
+        '# Engine settings. The values below are the defaults, and the block is' \
+        '# commented out; uncomment a line only to change it. Guest DNS defaults' \
+        "# to this host's non-loopback resolvers; set dns to override them." \
+        '# [cloud_hypervisor]' \
+        '# artifacts_dir = "/usr/local/lib/quoro"' \
+        '# init_binary = "/usr/local/lib/quoro/quoro-init"' \
+        '# state_dir = "/var/lib/quoro-node/engine"' \
+        '# bridge = "quoro0"' \
+        '# subnet = "10.42.0.0/24"' \
+        '# dns = ["192.0.2.53"]' \
+        '' \
+        '[node]' \
+        '# The node agent runs as quoro-node.service, separate from the' \
+        '# unprivileged control plane (ADR 0089).' \
+        'local = false' > "$_tmp"
+
+    install -m 0640 -o root -g quoro-api "$_tmp" "$_conf" || die "could not create $_conf"
+    log "wrote $_conf (root:quoro-api 0640)"
+}
+
+install_node_config() {
+    _conf='/etc/quoro/quoro.toml'
+    if [ -f "$_conf" ]; then
+        log "kept existing $_conf"
+        return 0
+    fi
+
+    _tmp="$WORK_DIR/quoro.toml"
+    printf '%s\n' \
+        '# Quoro configuration (ADR 0089 privilege split).' \
+        '# This host is a node: it runs microVMs for its primary and runs no' \
+        '# control plane. Edit this file and restart with:' \
+        '#   systemctl restart quoro-node' \
         '' \
         '# Engine: "cloud-hypervisor" runs one microVM per app; "fake" runs nothing' \
         '# and exists for development only.' \
@@ -686,13 +906,17 @@ install_config() {
         '# [cloud_hypervisor]' \
         '# artifacts_dir = "/usr/local/lib/quoro"' \
         '# init_binary = "/usr/local/lib/quoro/quoro-init"' \
-        '# state_dir = "/var/lib/quoro/engine"' \
+        '# state_dir = "/var/lib/quoro-node/engine"' \
         '# bridge = "quoro0"' \
         '# subnet = "10.42.0.0/24"' \
-        '# dns = ["192.0.2.53"]' > "$_tmp"
+        '# dns = ["192.0.2.53"]' \
+        '' \
+        '[node]' \
+        '# The identity, local store and engine state of the agent on this host.' \
+        '# data_dir = "/var/lib/quoro-node"' > "$_tmp"
 
     install -m 0640 -o root -g root "$_tmp" "$_conf" || die "could not create $_conf"
-    log "wrote $_conf"
+    log "wrote $_conf (root:root 0640)"
 }
 
 install_binary() {
@@ -766,55 +990,78 @@ install_engine_runtime() {
     fi
 }
 
+# Installs one unit from the tarball and enables it. $1 is the unit name without
+# its .service suffix; the result is recorded for the start decision below.
 install_unit() {
-    _unit='/etc/systemd/system/quoro.service'
+    _name=$1
+    _unit="/etc/systemd/system/${_name}.service"
 
-    UNIT_CHANGED=1
-    if [ -f "$_unit" ] && cmp -s "$ARTIFACT_ROOT/quoro.service" "$_unit"; then
-        UNIT_CHANGED=0
+    _changed=1
+    if [ -f "$_unit" ] && cmp -s "$ARTIFACT_ROOT/${_name}.service" "$_unit"; then
+        _changed=0
     fi
 
-    install -m 0644 -o root -g root "$ARTIFACT_ROOT/quoro.service" "$_unit" || die "could not install $_unit"
+    install -m 0644 -o root -g root "$ARTIFACT_ROOT/${_name}.service" "$_unit" || die "could not install $_unit"
     systemctl daemon-reload || die 'systemctl daemon-reload failed'
-    if ! systemctl enable quoro.service >/dev/null 2>&1; then
-        die 'systemctl enable quoro.service failed'
+    if ! systemctl enable "${_name}.service" >/dev/null 2>&1; then
+        die "systemctl enable ${_name}.service failed"
     fi
 
-    if [ "$UNIT_CHANGED" -eq 1 ]; then
-        log "installed $_unit and enabled quoro.service"
+    if [ "$_changed" -eq 1 ]; then
+        log "installed $_unit and enabled ${_name}.service"
     else
-        log "kept $_unit (unchanged) and made sure quoro.service is enabled"
+        log "kept $_unit (unchanged) and made sure ${_name}.service is enabled"
     fi
+
+    case $_name in
+        quoro) UNIT_CHANGED=$_changed ;;
+        quoro-node) NODE_UNIT_CHANGED=$_changed ;;
+    esac
 }
 
-start_service() {
-    if [ "${QUORO_NO_START:-}" = '1' ]; then
-        log 'QUORO_NO_START=1: not starting quoro.service'
+# A primary runs the control plane and its own node agent, a node runs the agent
+# alone (ADR 0089). The control plane goes first so its unit is enabled first.
+install_units() {
+    if [ "$ROLE" = 'primary' ]; then
+        install_unit 'quoro'
+    fi
+    install_unit 'quoro-node'
+}
+
+# Enrolls this host with its primary, before the unit starts. The token is only
+# passed as an argument: quoro join prints the node id or its own error, never
+# the token.
+enroll_node() {
+    if node_is_enrolled; then
+        log "this host is already enrolled ($NODE_DATA_DIR); not joining again"
         return 0
     fi
 
-    if [ "$BINARY_CHANGED" -eq 1 ] || [ "$UNIT_CHANGED" -eq 1 ] || [ "$ENGINE_CHANGED" -eq 1 ] ||
-        ! systemctl is-active --quiet quoro.service; then
-        log 'starting quoro.service'
-        # A failing restart is reported through the state check below, so the
-        # operator always gets the same journal hint.
-        if ! systemctl restart quoro.service; then
-            log 'systemctl restart quoro.service reported an error'
-        fi
-    else
-        log 'quoro.service already active, left running'
+    log "enrolling this host with $QUORO_JOIN_URL"
+    _status=0
+    _out=$(/usr/local/bin/quoro join "$QUORO_JOIN_URL" \
+        --token "$QUORO_JOIN_TOKEN" \
+        --fingerprint "$QUORO_JOIN_FINGERPRINT" 2> "$WORK_DIR/join.err") || _status=$?
+    if [ "$_status" -ne 0 ]; then
+        cat "$WORK_DIR/join.err" >&2 || true
+        die 'enrollment failed; a join token is single use and expires, so create a new one on the primary and pass it in QUORO_JOIN_TOKEN'
     fi
+    log "enrolled: $_out"
+}
 
-    # Type=simple counts as active as soon as the process runs, and quoro serve
-    # checks the host (KVM, CPU flags, kernel, artifacts) after that. Require
-    # five consecutive active seconds, so a refusal (exit 78) is reported here.
+# Waits until $1 has been active for five consecutive seconds. Type=simple
+# counts as active as soon as the process runs, and quoro checks the host after
+# that, so a refusal (exit 78) is reported here instead of a moment later.
+wait_until_active() {
+    _unit=$1
+
     _i=0
     _up=0
     while [ "$_i" -lt 20 ]; do
-        if systemctl is-active --quiet quoro.service; then
+        if systemctl is-active --quiet "$_unit"; then
             _up=$((_up + 1))
             if [ "$_up" -ge 5 ]; then
-                log 'quoro.service is active'
+                log "$_unit is active"
                 return 0
             fi
         else
@@ -824,14 +1071,52 @@ start_service() {
         _i=$((_i + 1))
     done
 
-    log 'quoro.service did not stay active; recent journal:'
-    journalctl -u quoro -n 50 --no-pager >&2 || true
-    die 'quoro.service failed to start; check the journal: journalctl -u quoro -n 50 --no-pager'
+    log "$_unit did not stay active; recent journal:"
+    journalctl -u "$_unit" -n 50 --no-pager >&2 || true
+    die "$_unit failed to start; check the journal: journalctl -u $_unit -n 50 --no-pager"
+}
+
+# Restarts $1 when the binary, the engine runtime or its own unit changed, or
+# when it is not running, then waits for it to stay active. $2 says whether the
+# unit file changed.
+start_unit() {
+    _unit=$1
+    _unit_changed=$2
+
+    if [ "$BINARY_CHANGED" -eq 0 ] && [ "$ENGINE_CHANGED" -eq 0 ] &&
+        [ "$_unit_changed" -eq 0 ] && systemctl is-active --quiet "$_unit"; then
+        log "$_unit already active, left running"
+        return 0
+    fi
+
+    log "starting $_unit"
+    # A failing restart is reported through the state check below, so the
+    # operator always gets the same journal hint.
+    if ! systemctl restart "$_unit"; then
+        log "systemctl restart $_unit reported an error"
+    fi
+    wait_until_active "$_unit"
+}
+
+start_services() {
+    if [ "${QUORO_NO_START:-}" = '1' ]; then
+        log 'QUORO_NO_START=1: not starting any unit'
+        return 0
+    fi
+
+    # quoro.service first: on a primary it writes the local join file that
+    # quoro-node.service reads to enroll itself, so the order is required.
+    if [ "$ROLE" = 'primary' ]; then
+        start_unit 'quoro.service' "$UNIT_CHANGED"
+        start_unit 'quoro-node.service' "$NODE_UNIT_CHANGED"
+    else
+        start_unit 'quoro-node.service' "$NODE_UNIT_CHANGED"
+    fi
 }
 
 # --- Report -----------------------------------------------------------------
 
-report() {
+print_installed_version() {
     _version_out=''
     if _version_out=$(/usr/local/bin/quoro version 2>/dev/null); then
         log "installed version: $_version_out"
@@ -840,10 +1125,38 @@ report() {
     else
         die 'the installed quoro binary does not report a version (quoro version and quoro --version both failed)'
     fi
+}
 
+# Reads node_id out of the enrolled identity. No jq on a fresh host, so a sed
+# reads the one JSON member needed.
+node_id_from_identity() {
+    sed -n 's/.*"node_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$NODE_DATA_DIR/identity.json" 2>/dev/null |
+        head -n 1
+}
+
+# The primary's TLS fingerprint is the value a node pins, so printing it here
+# saves the operator a journal read. quoro serve logs it at start.
+print_fingerprint() {
+    _fp=''
+    if _line=$(journalctl -u quoro -n 200 --no-pager 2>/dev/null | grep 'tls fingerprint:' | tail -n 1); then
+        _fp=${_line##*tls fingerprint: }
+        _fp=${_fp%% *}
+    fi
+
+    case $_fp in
+        sha256:*)
+            printf '\nThis host'"'"'s TLS fingerprint (QUORO_JOIN_FINGERPRINT on a node):\n\n    %s\n\n' "$_fp"
+            ;;
+        *)
+            log 'could not read the TLS fingerprint from the journal; see journalctl -u quoro'
+            ;;
+    esac
+}
+
+report_primary() {
     _token=''
     if [ "${QUORO_NO_START:-}" = '1' ]; then
-        log 'service not started, so no setup token was issued'
+        log 'services not started, so no setup token was issued'
     elif _token=$(/usr/local/bin/quoro setup-token 2>/dev/null); then
         if [ -n "$_token" ]; then
             printf '\nSetup token for the first-run /setup form:\n\n    %s\n\n' "$_token"
@@ -854,12 +1167,24 @@ report() {
         log 'warning: could not read a setup token; run "sudo quoro setup-token" yourself'
     fi
 
+    print_fingerprint
+
     cat <<'EOF'
 Next steps
 
   1. Open https://<host>:8443/ in a browser (<host> is this machine's address).
      The certificate is self-signed, so accept the browser warning once.
   2. Paste the setup token into the setup form within the hour.
+  3. To add another host as a node, create a join token in the panel or with
+     POST /api/v1/nodes/join-tokens, then run on that host:
+
+         curl -fsSL https://raw.githubusercontent.com/OmarAlex24/quoro/main/installer/install.sh \
+           | sudo QUORO_ROLE=node QUORO_JOIN_URL=<this host's https URL> \
+                  QUORO_JOIN_TOKEN=<token> \
+                  QUORO_JOIN_FINGERPRINT=<fingerprint above> sh
+
+     The join token is single use and expires, so pass it right after creating
+     it. Its QUORO_JOIN_FINGERPRINT is the value printed above.
 
 The setup token is single use and expires one hour after it is issued. Print
 it again with:
@@ -870,6 +1195,38 @@ Back up the cluster key files under /var/lib/quoro separately from the SQLite
 database (ADR 0050). A database copy alone does not contain them, and losing
 the data-encryption key loses every stored secret.
 EOF
+}
+
+report_node() {
+    _node_id=$(node_id_from_identity)
+    if [ -n "$_node_id" ]; then
+        log "node id: $_node_id"
+    else
+        log "warning: could not read the node id from $NODE_DATA_DIR/identity.json"
+    fi
+
+    cat <<'EOF'
+Next steps
+
+  This host is a node: it runs microVMs for its primary and serves no API or
+  panel of its own. When the agent runs, the node shows as connected on the
+  primary's Nodes page.
+
+  The agent keeps its VMs running while it is stopped or restarted
+  (KillMode=process): manage and stop them from the primary. Read the agent's
+  journal with:
+
+      journalctl -u quoro-node
+EOF
+}
+
+report() {
+    print_installed_version
+    if [ "$ROLE" = 'node' ]; then
+        report_node
+    else
+        report_primary
+    fi
 }
 
 # --- Entry point ------------------------------------------------------------
@@ -883,7 +1240,7 @@ main() {
     trap 'exit 130' INT
     trap 'exit 143' TERM
 
-    log "installing quoro $VERSION for $TARGET"
+    log "installing quoro $VERSION for $TARGET (role $ROLE)"
     fetch_artifacts
     verify_checksum
     verify_signature
@@ -892,11 +1249,20 @@ main() {
 
     install_host_packages
     install_dirs
+    if [ "$ROLE" = 'primary' ]; then
+        install_api_user
+        install_primary_data_dir
+    fi
     install_config
     install_binary
     install_engine_runtime
-    install_unit
-    start_service
+    # Enrollment writes identity files only; it starts nothing, so it also runs
+    # with QUORO_NO_START=1. It needs the binary and the config in place.
+    if [ "$ROLE" = 'node' ]; then
+        enroll_node
+    fi
+    install_units
+    start_services
     report
 }
 

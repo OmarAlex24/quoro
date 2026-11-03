@@ -123,14 +123,16 @@ There is one OS process per machine, not one per component (D-0012). Inside it:
 
 The process model follows from two constraints. Nothing that can block a request may run on the request path, because a deploy that waits on a registry pull must not make the panel unresponsive. And nothing that runs a guest may share an address space with the control plane, because a compromised app must not reach Quoro's memory (D-0008).
 
+Privileges are split the same way (ADR 0089, which replaces the M1 root service of ADR 0088). The control plane (`quoro serve`, unit `quoro.service`) runs as the `quoro-api` system user with an empty capability bounding set, `NoNewPrivileges` and a read-only system except its data directory `/var/lib/quoro`: it signs desired state and never touches a hypervisor, a bridge or a firewall. The node agent (`quoro node`, unit `quoro-node.service`) is the only privileged process: it runs the engine as root, keeps its state in `/var/lib/quoro-node`, and dials the control plane like any other node, over loopback on a primary. Its unit uses `KillMode=process`, so restarting the agent leaves the VMMs running and the next agent adopts them. A development host may still run both in one process with `[node] local = true`, which then needs root.
+
 ### Host layout, ports and CLI
 
 Decided (D-0054):
 
 - **One listener.** One HTTPS listener, default port 8443 and configurable, serves the API, the panel and MCP. `ingress` owns 80 and 443 on the same host, so the control plane never competes with a customer's domain for those ports.
 - **Certificate.** The primary's certificate is self-signed at install, and the join command carries its SHA-256 fingerprint, which is the pin model of section 5. Rotating that certificate therefore invalidates every outstanding join command. An operator may later replace it with an ACME certificate.
-- **Paths.** Data lives in `/var/lib/quoro`, configuration in `/etc/quoro/quoro.toml` (TOML), and logs go to journald.
-- **CLI.** `quoro serve --role node|witness|edge`, `quoro version`, `quoro join <url> --token --fingerprint`, `quoro mcp stdio`, `quoro setup-token`.
+- **Paths.** Control-plane data lives in `/var/lib/quoro`, node-agent data in `/var/lib/quoro-node` (siblings, never nested), configuration in `/etc/quoro/quoro.toml` (TOML), and logs go to journald.
+- **CLI.** `quoro serve --role node|witness|edge`, `quoro version`, `quoro join <url> --token --fingerprint`, `quoro node`, `quoro mcp stdio`, `quoro setup-token`. `quoro join` only enrolls; `quoro node` runs the node agent.
 - **First run.** The installer prints a one-time setup token that `POST /api/v1/setup` requires in the `Quoro-Setup-Token` header: single use, valid for one hour. The primary keeps only the token's SHA-256 hash and its expiry in the data directory. `quoro setup-token` issues a fresh token, invalidating the previous unused one, and refuses once an owner exists.
 
 Alternatives not chosen: ACME for the listener from install, which needs a public name and fails behind NAT; and binding `/setup` to localhost, which breaks remote installs.

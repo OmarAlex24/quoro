@@ -24,12 +24,17 @@ The tarball holds exactly one top-level directory:
 
 ```
 quoro-0.1.0-x86_64-unknown-linux-musl/
-├── quoro          0755  static x86_64-musl binary; the web panel is embedded
-├── quoro-init     0755  static x86_64-musl binary; PID 1 inside every microVM
-├── LICENSE        0644  AGPL-3.0-only, copied from the repository root
-├── quoro.service  0644  systemd unit, from packaging/systemd/quoro.service
-└── pins.txt       0644  engine pins, copied from crates/engine/pins.txt
+├── quoro               0755  static x86_64-musl binary; the web panel is embedded
+├── quoro-init          0755  static x86_64-musl binary; PID 1 inside every microVM
+├── LICENSE             0644  AGPL-3.0-only, copied from the repository root
+├── quoro.service       0644  systemd unit, from packaging/systemd/quoro.service
+├── quoro-node.service  0644  systemd unit, from packaging/systemd/quoro-node.service
+└── pins.txt            0644  engine pins, copied from crates/engine/pins.txt
 ```
+
+`quoro.service` is the control plane and `quoro-node.service` the node agent:
+the installer enables the first on a primary and the second on both roles (ADR
+0089).
 
 `pins.txt` is the engine's list of pinned Cloud Hypervisor and guest-kernel
 artifacts. `install.sh` reads it, downloads those artifacts and verifies each

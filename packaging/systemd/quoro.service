@@ -1,37 +1,52 @@
-# Quoro: one microVM per app on Cloud Hypervisor + KVM.
+# Quoro control plane: the API, the panel and the node sessions (ADR 0089).
 #
-# Installed by installer/install.sh to /etc/systemd/system/quoro.service and
-# shipped inside the release tarball as quoro.service.
+# Installed by installer/install.sh to /etc/systemd/system/quoro.service on a
+# primary and shipped inside the release tarball as quoro.service. The node
+# agent, which keeps the privileges the engine needs, is quoro-node.service.
 
 [Unit]
-Description=Quoro (hypervisor and app deploy)
+Description=Quoro control plane (API and panel)
 Documentation=https://github.com/OmarAlex24/quoro
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-# Runs as root: the engine creates the quoro0 bridge and TAP devices, writes
-# the nftables rules that route guest traffic, and converts images with their
-# ownership preserved.
+# Unprivileged (ADR 0089): the control plane signs desired state and never
+# touches a hypervisor, a bridge or a firewall. Port 8443 needs no capability.
+User=quoro-api
+Group=quoro-api
 Environment=QUORO_CONFIG=/etc/quoro/quoro.toml
 ExecStart=/usr/local/bin/quoro serve
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=65536
-# quoro serve exits 78 when this host cannot run the engine: no /dev/kvm, no
-# vmx/svm, a kernel that is too old, or missing artifacts. Restarting would not
-# help, so let the unit stay failed and read the journal instead.
 RestartPreventExitStatus=78
-# Hardening the engine tolerates. It writes /proc/sys/net/ipv4/ip_forward,
-# opens /dev/kvm and /dev/net/tun and talks netlink, so PrivateDevices,
-# ProtectKernelTunables, ProtectKernelModules, RestrictAddressFamilies and
-# CapabilityBoundingSet are deliberately not set here.
+# No capability can be gained: the bounding and ambient sets are empty and
+# setuid binaries do not elevate.
+CapabilityBoundingSet=
+AmbientCapabilities=
 NoNewPrivileges=yes
+# The only writable path is the data directory.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/quoro
 ProtectHome=yes
 PrivateTmp=yes
-ProtectSystem=full
-# Logs go to journald by default: read them with journalctl -u quoro.
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+UMask=0077
+# Logs go to journald: read them with journalctl -u quoro.
 
 [Install]
 WantedBy=multi-user.target
