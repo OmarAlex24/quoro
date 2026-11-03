@@ -211,13 +211,15 @@ pub enum Scope {
     WebhookWrite,
     #[serde(rename = "provider:manage")]
     ProviderManage,
+    #[serde(rename = "user:read")]
+    UserRead,
     #[serde(rename = "user:write")]
     UserWrite,
 }
 
 impl Scope {
     /// Every scope, in README table order.
-    pub const ALL: [Scope; 38] = [
+    pub const ALL: [Scope; 39] = [
         Self::ClusterRead,
         Self::NodeRead,
         Self::NodeEnroll,
@@ -255,6 +257,7 @@ impl Scope {
         Self::WebhookRead,
         Self::WebhookWrite,
         Self::ProviderManage,
+        Self::UserRead,
         Self::UserWrite,
     ];
 
@@ -299,6 +302,7 @@ impl Scope {
             Self::WebhookRead => "webhook:read",
             Self::WebhookWrite => "webhook:write",
             Self::ProviderManage => "provider:manage",
+            Self::UserRead => "user:read",
             Self::UserWrite => "user:write",
         }
     }
@@ -332,6 +336,7 @@ impl Scope {
                 | Self::ApprovalDecide
                 | Self::WebhookWrite
                 | Self::ProviderManage
+                | Self::UserRead
                 | Self::UserWrite
         )
     }
@@ -380,7 +385,8 @@ impl Role {
     }
 
     /// `owner` holds every scope, `operator` every scope except `user:write`,
-    /// `viewer` every `:read` scope plus `app:logs`.
+    /// `viewer` every `:read` scope plus `app:logs`. `user:read` is a `:read`
+    /// scope, so every role holds it.
     #[must_use]
     pub fn holds(self, scope: Scope) -> bool {
         match self {
@@ -464,7 +470,10 @@ mod tests {
         assert!(Role::Viewer.holds(Scope::AppLogs));
         assert!(!Role::Viewer.holds(Scope::VmCreate));
         assert!(!Role::Viewer.holds(Scope::ProviderManage));
-        assert_eq!(Scope::ALL.iter().filter(|s| s.is_human_only()).count(), 9);
+        assert!(Role::Operator.holds(Scope::UserRead));
+        assert!(Role::Viewer.holds(Scope::UserRead));
+        assert!(!Role::Viewer.holds(Scope::UserWrite));
+        assert_eq!(Scope::ALL.iter().filter(|s| s.is_human_only()).count(), 10);
         assert_eq!(Scope::ALL.iter().filter(|s| s.is_destructive()).count(), 4);
     }
 }

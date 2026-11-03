@@ -683,6 +683,7 @@ pub async fn delete_webhook(
         (status = 401, response = crate::openapi::Unauthenticated),
         (status = 403, response = crate::openapi::Forbidden),
         (status = 404, response = crate::openapi::NotFound),
+        (status = 422, response = crate::openapi::ValidationFailed),
         (status = 429, response = crate::openapi::RateLimited),
     )
 )]
