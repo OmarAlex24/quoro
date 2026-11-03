@@ -1,11 +1,11 @@
 # ADR 0088: quoro.service runs as root while the Cloud Hypervisor engine is in-process (M1)
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR 0096](0096-m2-process-model-quoro-service-is-the-unprivileged-control.md)
 - **Date:** 2026-11-02
 - **Ledger id:** D-0088
 - **Tags:** installer, engine, security
 - **Supersedes:** none
-- **Superseded by:** none
+- **Superseded by:** [ADR 0096](0096-m2-process-model-quoro-service-is-the-unprivileged-control.md)
 - **Related:** none
 
 ## Context
@@ -20,7 +20,7 @@ Implemented in the M1 integration PRs: unit without User=, hardened with NoNewPr
 
 ## Consequences
 
-- This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
+- Superseded by [ADR 0096](0096-m2-process-model-quoro-service-is-the-unprivileged-control.md); this decision is no longer binding and is kept for history.
 
 ---
 Generated from decision D-0088 in the project decision ledger. Do not edit by hand; changes go through a new decision.
