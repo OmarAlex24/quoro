@@ -9,7 +9,25 @@ export default defineConfig({
     input: {
       target: '../docs/contracts/openapi.yaml',
       filters: {
-        tags: ['health', 'auth', 'nodes', 'projects', 'vms', 'apps', 'deployments', 'domains', 'logs'],
+        tags: [
+          'health',
+          'auth',
+          'nodes',
+          'projects',
+          'vms',
+          'apps',
+          'deployments',
+          'domains',
+          'logs',
+          'users',
+          'agents',
+          'grants',
+          'approvals',
+          'incidents',
+          'audit',
+          'events',
+          'webhooks',
+        ],
       },
     },
     output: {

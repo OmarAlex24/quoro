@@ -1,20 +1,50 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Link, useNavigate, useRouterState } from '@tanstack/react-router';
 import { logout } from '../api/generated/auth/auth';
+import { useListApprovals } from '../api/generated/approvals/approvals';
 import { useListNodes } from '../api/generated/nodes/nodes';
 import { authEvents } from '../api/auth-store';
 import { useSession } from '../session';
 import { cn } from '../lib/utils';
 import { Button } from './ui/button';
 
+interface NavItem {
+  to: '/' | '/vms' | '/agents' | '/grants' | '/approvals' | '/audit' | '/webhooks';
+  label: string;
+  match: (pathname: string) => boolean;
+}
+
+const under = (prefix: string) => (pathname: string) =>
+  pathname === prefix || pathname.startsWith(`${prefix}/`);
+
+/** What runs: apps and their machines. */
+const MACHINE_SECTIONS: NavItem[] = [
+  { to: '/', label: 'Apps', match: (pathname) => pathname === '/' || under('/apps')(pathname) },
+  { to: '/vms', label: 'Virtual machines', match: under('/vms') },
+];
+
+/** Who may act on it, and the record of what they did. */
+const AGENCY_SECTIONS: NavItem[] = [
+  { to: '/agents', label: 'Agents', match: under('/agents') },
+  { to: '/grants', label: 'Grants', match: under('/grants') },
+  { to: '/approvals', label: 'Approvals', match: under('/approvals') },
+  { to: '/audit', label: 'Audit log', match: under('/audit') },
+  { to: '/webhooks', label: 'Webhooks', match: under('/webhooks') },
+];
+
 const roleLabel = (role: string) => role.charAt(0).toUpperCase() + role.slice(1);
 
-/** Panel-colour header: the nameplate, the two sections and who is signed in. */
+/** Panel-colour header: the nameplate, the sections and who is signed in. */
 export function ChassisHeader() {
   const { user } = useSession();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const nodes = useListNodes(undefined, { query: { staleTime: 10_000 } });
+  const pending = useListApprovals(
+    { status: 'pending' },
+    { query: { enabled: user !== undefined, refetchInterval: 10_000, retry: false } },
+  );
+  const pendingCount = pending.data?.items.length ?? 0;
   const pathname = useRouterState({ select: (state) => state.location.pathname });
 
   const logoutMutation = useMutation({
@@ -38,8 +68,34 @@ export function ChassisHeader() {
 
   if (!user) return null;
 
-  const appsActive = pathname === '/' || pathname.startsWith('/apps');
-  const vmsActive = pathname === '/vms' || pathname.startsWith('/vms/');
+  const sectionLink = (item: NavItem) => {
+    const active = item.match(pathname);
+    return (
+      <Link
+        key={item.to}
+        to={item.to}
+        className={cn(
+          'flex items-center gap-1.5 border-b-2 pt-0.5 text-[14px] underline-offset-4 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt',
+          active
+            ? 'border-cobalt text-ink'
+            : 'border-transparent text-ink-muted hover:border-rail hover:text-ink',
+        )}
+        aria-current={active ? 'page' : undefined}
+      >
+        {item.label}
+        {item.to === '/approvals' && pendingCount > 0 ? (
+          <span className="type-data inline-flex items-center gap-1 text-[12px] text-ink">
+            <span
+              aria-hidden="true"
+              className="inline-block h-2 w-2 rounded-full bg-lamp-shift"
+            />
+            {pendingCount}
+            <span className="sr-only"> waiting</span>
+          </span>
+        ) : null}
+      </Link>
+    );
+  };
 
   return (
     <header className="border-b border-rail bg-panel">
@@ -47,34 +103,16 @@ export function ChassisHeader() {
         <span className="type-display text-[18px] leading-none">Quoro</span>
         <span aria-hidden="true" className="hidden h-5 w-px bg-rail sm:block" />
 
-        <nav aria-label="Sections" className="flex items-stretch gap-4 self-stretch">
-          <Link
-            to="/"
-            className={cn(
-              'flex items-center border-b-2 pt-0.5 text-[14px] underline-offset-4 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt',
-              appsActive
-                ? 'border-cobalt text-ink'
-                : 'border-transparent text-ink-muted hover:border-rail hover:text-ink',
-            )}
-            aria-current={appsActive ? 'page' : undefined}
-          >
-            Apps
-          </Link>
-          <Link
-            to="/vms"
-            className={cn(
-              'flex items-center border-b-2 pt-0.5 text-[14px] underline-offset-4 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt',
-              vmsActive
-                ? 'border-cobalt text-ink'
-                : 'border-transparent text-ink-muted hover:border-rail hover:text-ink',
-            )}
-            aria-current={vmsActive ? 'page' : undefined}
-          >
-            Virtual machines
-          </Link>
+        <nav
+          aria-label="Sections"
+          className="flex flex-wrap items-stretch gap-x-4 gap-y-1 self-stretch"
+        >
+          {MACHINE_SECTIONS.map(sectionLink)}
+          <span aria-hidden="true" className="my-auto h-4 w-px bg-rail" />
+          {AGENCY_SECTIONS.map(sectionLink)}
         </nav>
 
-        <p className="type-data hidden min-w-0 truncate text-[13px] text-ink-muted md:block">
+        <p className="type-data hidden min-w-0 truncate text-[13px] text-ink-muted xl:block">
           {clusterLine}
         </p>
         <div className="ml-auto flex items-center gap-2 sm:gap-3">
