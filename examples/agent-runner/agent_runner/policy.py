@@ -2,10 +2,10 @@
 """The decision step: what the woken agent does about an incident.
 
 Two policies ship. :class:`DeterministicRestartPolicy` is the predictable one
-used by the tests and the lab demo: read, restart, wait for the app, optionally
-check a URL and resolve. :class:`LlmPolicy` hands the decision to a pluggable
-backend while keeping the same rules (act inside the grant, justify every
-mutation, never work around a refusal).
+used by the tests and the lab demo: read, restart, wait for the app's health,
+optionally check a URL and resolve. :class:`LlmPolicy` hands the decision to a
+pluggable backend while keeping the same rules (act inside the grant, justify
+every mutation, never work around a refusal).
 """
 
 from __future__ import annotations
@@ -144,22 +144,41 @@ class LlmBackend(Protocol):
         ...
 
 
-def _running(instance: Any) -> bool:
-    """Whether one instance reports itself healthy, tolerating absent fields."""
-    if not isinstance(instance, dict):
-        return False
-    status = instance.get("status", instance.get("observed_status"))
-    return status == "running"
+def app_healthy(detail: Mapping[str, Any] | None) -> bool:
+    """Whether Quoro reports the app healthy.
+
+    The app's aggregated ``status`` is ``running`` only while its instance runs
+    *and* its health check passes; a failing health check makes it ``down``.
+    An instance's ``observed_status`` follows the VM process alone, so a VM
+    that runs while the app does not answer still says ``running`` there and
+    is never read as a recovery.
+    """
+    return bool(detail) and detail.get("status") == "running"
 
 
-def app_recovered(detail: Mapping[str, Any] | None) -> bool:
-    """Whether every instance of an app reports ``running``."""
-    if not detail:
-        return False
-    instances = detail.get("instances")
-    if not isinstance(instances, list) or not instances:
-        return False
-    return all(_running(instance) for instance in instances)
+def resolved_by_app_up(incident: Mapping[str, Any] | None) -> bool:
+    """Whether the system resolved the incident, which ``app.up`` does."""
+    return (
+        bool(incident)
+        and incident.get("status") == "resolved"
+        and incident.get("resolved_by_type") == "system"
+    )
+
+
+@dataclass(frozen=True)
+class Recovery:
+    """What the wait after a restart found.
+
+    ``healthy`` is ``True`` when Quoro reported the app healthy, ``False`` when
+    it did not within the budget or a read was refused, and ``None`` when the
+    incident grant was revoked before any health signal could be read (only
+    ``check_url`` can then tell). ``incident_closed`` is set when the incident
+    is already resolved, so the policy does not try to resolve it again.
+    """
+
+    healthy: bool | None
+    note: str
+    incident_closed: bool = False
 
 
 def _subject_of(wake: Wake, detail: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
@@ -277,23 +296,33 @@ class DeterministicRestartPolicy:
             LOGGER.warning("%s", outcome.summary)
             return outcome
 
-        outcome.recovered = self._wait_for_recovery(app_id, mcp, outcome)
-        url_note = ""
-        if outcome.recovered and self._check_url:
+        recovery = self._wait_for_recovery(app_id, wake, mcp, tools)
+        notes = [recovery.note]
+        recovered = recovery.healthy
+        if recovered is not False and self._check_url:
             seen = self._health_check(self._check_url)
-            url_note = f"; check_url {self._check_url} answered {seen.detail}"
+            notes.append(f"check_url {self._check_url} answered {seen.detail}")
             if seen.ok:
                 LOGGER.info("check_url %s answered %s", self._check_url, seen.detail)
             else:
                 LOGGER.warning("check_url %s answered %s", self._check_url, seen.detail)
-                outcome.recovered = False
+            recovered = seen.ok
+        outcome.recovered = bool(recovered)
 
         if outcome.recovered:
-            outcome.summary = f"app {app_id} recovered after restart{url_note}"
+            outcome.summary = f"app {app_id} recovered after restart: {'; '.join(notes)}"
         else:
-            outcome.summary = f"app {app_id} did not report healthy after restart{url_note}"
+            outcome.summary = (
+                f"app {app_id} did not report healthy after restart: {'; '.join(notes)}"
+            )
 
-        if outcome.recovered and self._resolve_incident and "resolve_incident" in tools:
+        if (
+            outcome.recovered
+            and self._resolve_incident
+            and "resolve_incident" in tools
+            and not recovery.incident_closed
+            and not self._already_resolved(wake, mcp, tools)
+        ):
             note = (
                 f"Incident {wake.incident_id}{wake.grant_note}: app {app_id} recovered "
                 "after restart issued by the agent runner."
@@ -318,24 +347,87 @@ class DeterministicRestartPolicy:
         LOGGER.info("%s", outcome.summary)
         return outcome
 
+    def _already_resolved(self, wake: Wake, mcp: McpSession, tools: set[str]) -> bool:
+        """Whether the incident is resolved already, which app.up does on its own."""
+        if "get_incident" not in tools:
+            return False
+        incident = mcp.call("get_incident", {"incident_id": wake.incident_id})
+        value = incident.value if incident.ok and isinstance(incident.value, dict) else {}
+        if value.get("status") == "resolved":
+            LOGGER.info(
+                "incident %s is already resolved by %s; not resolving it again",
+                wake.incident_id,
+                value.get("resolved_by_type"),
+            )
+            return True
+        return False
+
     def _wait_for_recovery(
-        self, app_id: str, mcp: McpSession, outcome: Outcome
-    ) -> bool:
-        """Poll ``get_app`` until every instance runs, or the attempt budget ends."""
+        self, app_id: str, wake: Wake, mcp: McpSession, tools: set[str]
+    ) -> Recovery:
+        """Poll ``get_app`` until Quoro reports the app healthy.
+
+        The wait is bounded: at most ``poll_attempts`` reads,
+        ``poll_interval_s`` apart. Quoro resolves the incident when the app
+        comes back (``app.up``) and revokes the incident grant with it, so a
+        read refused with ``grant_revoked`` is not a failure: the incident is
+        read to learn whether ``app.up`` closed it, which it can only be when
+        the agent holds another grant with ``incident:read``.
+        """
+        total_s = self._poll_attempts * self._poll_interval_s
+        budget = f"{self._poll_attempts} reads over {total_s:g}s"
+        last_status = None
         for attempt in range(self._poll_attempts):
             if attempt:
                 self._sleep(self._poll_interval_s)
             result = mcp.call("get_app", {"app_id": app_id})
-            if not result.ok:
-                LOGGER.warning(
-                    "get_app refused while polling (%s); stopping the poll",
-                    result.problem_code,
-                )
-                return False
-            if app_recovered(result.value):
-                LOGGER.info("app %s reports every instance running", app_id)
-                return True
-        return False
+            if result.ok:
+                if app_healthy(result.value):
+                    LOGGER.info("app %s is running with its health check passing", app_id)
+                    return Recovery(
+                        True, "Quoro reports the app running with its health check passing"
+                    )
+                value = result.value if isinstance(result.value, dict) else {}
+                last_status = value.get("status")
+                LOGGER.info("app %s status %s; waiting for its health check", app_id, last_status)
+                continue
+            if result.problem_reason == "grant_revoked":
+                return self._after_revocation(wake, mcp, tools)
+            LOGGER.warning(
+                "get_app refused while waiting (%s); stopping the wait", result.problem_code
+            )
+            return Recovery(False, f"get_app was refused ({result.problem_code}) while waiting")
+        return Recovery(
+            False,
+            f"Quoro did not report the app healthy within {budget} (last status {last_status})",
+        )
+
+    def _after_revocation(self, wake: Wake, mcp: McpSession, tools: set[str]) -> Recovery:
+        """The incident grant was revoked while waiting: learn why, if allowed."""
+        LOGGER.info("the incident grant was revoked while waiting; reading the incident")
+        if "get_incident" in tools:
+            incident = mcp.call("get_incident", {"incident_id": wake.incident_id})
+            if incident.ok:
+                if resolved_by_app_up(incident.value):
+                    return Recovery(
+                        True,
+                        "Quoro resolved the incident when the app came back up (app.up)",
+                        incident_closed=True,
+                    )
+                value = incident.value if isinstance(incident.value, dict) else {}
+                if value.get("status") == "resolved":
+                    return Recovery(
+                        None,
+                        f"the incident was resolved by {value.get('resolved_by_type')} "
+                        "before the app's health was read",
+                        incident_closed=True,
+                    )
+        return Recovery(
+            None,
+            "the incident grant was revoked before the app's health could be read; recovery "
+            "is not confirmed by Quoro (give the agent a standing app:read and incident:read "
+            "grant, or set check_url)",
+        )
 
 
 class LlmPolicy:

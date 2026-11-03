@@ -51,12 +51,30 @@ TOOLS = [
 
 
 class FakeQuoro:
-    """An HTTP server that answers the two endpoints the runner uses."""
+    """An HTTP server that answers the two endpoints the runner uses.
+
+    The app starts the way an incident finds it: its VM runs but its health
+    check fails, so Quoro reports the app ``down``. A restart keeps the VM
+    ``running``; the health check passes again only after
+    ``health_passes_after_reads`` reads of the app (``None``: never). When it
+    passes, Quoro emits ``app.up``, which (with ``app_up_resolves``) resolves
+    the incident as the system and revokes the incident grant. Without ``standing_reads`` the agent holds
+    no other grant, so every later call is refused with ``grant_revoked``.
+    """
 
     def __init__(self, *, app_id: str, incident_id: str) -> None:
         self.app_id = app_id
         self.incident_id = incident_id
-        self.instance_status = "stopped"
+        self.instance_status = "running"
+        self.health = "failing"
+        self.restarted = False
+        self.reads_after_restart = 0
+        self.health_passes_after_reads: int | None = 2
+        self.app_up_resolves = False
+        self.standing_reads = True
+        self.incident_status = "open"
+        self.resolved_by_type: str | None = None
+        self.grant_revoked = False
         self.refuse_restart: Mapping[str, Any] | None = None
         self.mints: list[dict[str, Any]] = []
         self.calls: list[dict[str, Any]] = []
@@ -190,23 +208,46 @@ def _handler_class() -> type[BaseHTTPRequestHandler]:
             arguments = params.get("arguments") or {}
             fake.record_call(name, arguments, self.headers.get("Authorization", "").removeprefix("Bearer "))
 
+            if name == "get_app" and fake.restarted:
+                fake.reads_after_restart += 1
+                due = fake.health_passes_after_reads
+                if fake.health != "passing" and due is not None and fake.reads_after_restart >= due:
+                    fake.health = "passing"
+                    if fake.app_up_resolves and fake.incident_status == "open":
+                        # app.up: the system resolves the incident and revokes its grant.
+                        fake.incident_status = "resolved"
+                        fake.resolved_by_type = "system"
+                        fake.grant_revoked = True
+
+            reads = name in ("get_app", "get_incident")
+            if fake.grant_revoked and not (reads and fake.standing_reads):
+                return {
+                    "content": [],
+                    "isError": True,
+                    "structuredContent": {"code": "forbidden", "reason": "grant_revoked"},
+                }
+
             if name == "get_incident":
                 return {
                     "content": [],
                     "structuredContent": {
                         "id": fake.incident_id,
-                        "status": "open",
+                        "status": fake.incident_status,
                         "title": "health check failed",
                         "subject": {"type": "app", "id": fake.app_id},
+                        "resolved_by_type": fake.resolved_by_type,
                     },
                 }
             if name == "get_app":
+                healthy = fake.instance_status == "running" and fake.health == "passing"
                 return {
                     "content": [],
                     "structuredContent": {
                         "id": fake.app_id,
-                        "status": "down" if fake.instance_status != "running" else "running",
-                        "instances": [{"id": "vm_test", "status": fake.instance_status}],
+                        "status": "running" if healthy else "down",
+                        "instances": [
+                            {"id": "vm_test", "observed_status": fake.instance_status}
+                        ],
                     },
                 }
             if name == "restart_app":
@@ -217,8 +258,12 @@ def _handler_class() -> type[BaseHTTPRequestHandler]:
                         "structuredContent": dict(fake.refuse_restart),
                     }
                 fake.instance_status = "running"
+                fake.restarted = True
+                fake.reads_after_restart = 0
                 return {"content": [], "structuredContent": {"id": fake.app_id, "restart_generation": 2}}
             if name == "resolve_incident":
+                fake.incident_status = "resolved"
+                fake.resolved_by_type = "agent"
                 return {
                     "content": [],
                     "structuredContent": {"id": fake.incident_id, "status": "resolved"},

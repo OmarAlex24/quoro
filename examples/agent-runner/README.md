@@ -13,7 +13,7 @@ agent an incident grant: a handful of scopes on the affected app for a limited
 time. The agent acts inside that grant and nothing else.
 
 The reference flow is a deterministic one: read the incident, read the app,
-restart it, wait until every instance reports `running`, optionally check a URL,
+restart it, wait until its health check passes, optionally check a URL,
 and optionally resolve the incident. A second policy plugs in an LLM backend
 without changing any of the rules.
 
@@ -87,6 +87,13 @@ grant the only thing the agent can use.
    issued for it. The runner acts as that agent, and names the grant in the
    justifications it sends. A webhook without `wake` — and every test delivery —
    carries no `data.wake`, so the runner falls back to `default_agent_id`.
+
+   Optionally, give the agent a standing grant with `app:read` and
+   `incident:read` on the apps it looks after. Quoro resolves an incident on
+   its own when the app comes back up (`app.up`) and revokes the incident
+   grant with it, so without another read grant the runner's next read is
+   refused with `grant_revoked` and it cannot see the recovery in Quoro; it
+   then relies on `check_url`.
 4. **Write the runner config.** Copy `runner.example.toml` to `runner.toml` and
    fill in the listen address, Quoro's URL, the TLS option you use, the secret
    path and one `[agents."agt_..."]` entry per agent the runner may wake.
@@ -123,7 +130,7 @@ deliveries for one incident never run concurrently.
 | `policy` | `deterministic` | `deterministic` or `llm`. |
 | `check_url` | none | After a restart, `GET` this URL and require 200 before calling the app recovered. Uses system trust and sends `User-Agent: quoro-agent-runner/<version>`; the outcome names the status the URL answered. |
 | `resolve_incident` | `false` | Resolve the incident after a successful recovery, when the scope and tool are available. |
-| `poll_attempts` | `12` | How many times to read the app while waiting for recovery. |
+| `poll_attempts` | `12` | How many times to read the app while waiting for its health check to pass. Together with `poll_interval_s` this bounds the wait. |
 | `poll_interval_s` | `5.0` | Seconds between recovery reads. |
 | `max_body_bytes` | `1048576` | Largest accepted webhook body; larger deliveries get `413`. |
 | `http_timeout_s` | `30.0` | Timeout for calls to Quoro. |
@@ -165,8 +172,17 @@ incident was resolved, and a one-line summary. `McpSession` exposes
 `DeterministicRestartPolicy` is the default. It reads the incident (through
 `get_incident` when the tool is listed, otherwise from the event payload), checks
 that the subject is an app, reads it, restarts it with a justification naming the
-incident, polls until every instance reports `running`, optionally checks
-`check_url`, and optionally resolves the incident. A refusal stops the run.
+incident, and waits, at most `poll_attempts` reads `poll_interval_s` apart, until
+Quoro reports the app healthy. The signal is the app's `status`: it is `running`
+only while the instance runs and its health check passes. An instance's
+`observed_status` follows the VM process, so a VM that runs while the app does
+not answer is not taken as a recovery. When a read is refused with
+`grant_revoked` (Quoro resolves the incident on `app.up` and revokes the
+incident grant), the policy reads the incident: resolved by the system means the
+app came back up. If it cannot tell, recovery is not confirmed unless
+`check_url` answers 200. With a health signal it then checks `check_url` when
+set, and resolves the incident when asked to and it is still open. Any other
+refusal stops the run.
 
 `LlmPolicy` is provider-agnostic. It loads `[llm].backend` (an importable
 `module:Class`), instantiates it with the rest of the `[llm]` table as keyword
@@ -197,6 +213,7 @@ python3 -m unittest discover -s tests -v
 
 They cover signature verification, the HTTP receiver against a fake Quoro
 (token minting, tool calls, deduplication, agent selection from `data.wake` and
-the default, malformed wakes, unknown agents, refusals), TLS fingerprint
+the default, malformed wakes, unknown agents, refusals, waiting for the app's
+health rather than its VM), the `check_url` request, TLS fingerprint
 comparison, the MCP client's JSON and event-stream parsing, the mutating-call
 rules, config validation and the LLM policy with a fake backend.

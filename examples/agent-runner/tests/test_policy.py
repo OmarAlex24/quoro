@@ -16,8 +16,9 @@ from agent_runner.policy import (
     Outcome,
     UrlCheck,
     Wake,
-    app_recovered,
+    app_healthy,
     check_url,
+    resolved_by_app_up,
 )
 from agent_runner.quoro import ToolResult
 from fake_backend import FakeBackend
@@ -33,9 +34,16 @@ TOOLS = ["get_incident", "get_app", "restart_app", "resolve_incident"]
 class FakeSession:
     """An MCP session that records calls and can refuse selected tools."""
 
-    def __init__(self, tools: list[str] = TOOLS, refuse: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        tools: list[str] = TOOLS,
+        refuse: set[str] | None = None,
+        answers: Mapping[str, list[ToolResult]] | None = None,
+    ) -> None:
         self._tools = [{"name": name, "description": name, "inputSchema": {}} for name in tools]
         self._refuse = refuse or set()
+        # Scripted answers per tool, consumed in order; the last one repeats.
+        self._answers = {name: list(results) for name, results in (answers or {}).items()}
         self.calls: list[dict[str, Any]] = []
 
     def list_tools(self) -> list[Mapping[str, Any]]:
@@ -57,9 +65,28 @@ class FakeSession:
             return ToolResult(
                 ok=False, problem={"code": "forbidden", "reason": "scope_missing"}
             )
+        script = self._answers.get(name)
+        if script:
+            return script.pop(0) if len(script) > 1 else script[0]
         if name == "get_app":
-            return ToolResult(ok=True, value={"instances": [{"status": "running"}]})
+            return HEALTHY
         return ToolResult(ok=True, value={})
+
+    def count(self, name: str) -> int:
+        return sum(1 for call in self.calls if call["tool"] == name)
+
+
+def _app(status: str) -> ToolResult:
+    """A ``get_app`` answer: the VM runs whatever the app's health says."""
+    return ToolResult(
+        ok=True,
+        value={"status": status, "instances": [{"observed_status": "running"}]},
+    )
+
+
+HEALTHY = _app("running")
+FAILING = _app("down")
+REVOKED = ToolResult(ok=False, problem={"code": "forbidden", "reason": "grant_revoked"})
 
 
 def _wake(grant_id: str | None = None) -> Wake:
@@ -82,20 +109,25 @@ def _wake(grant_id: str | None = None) -> Wake:
     )
 
 
-class AppRecoveredTests(unittest.TestCase):
-    def test_all_instances_running(self) -> None:
-        self.assertTrue(app_recovered({"instances": [{"status": "running"}]}))
+class AppHealthyTests(unittest.TestCase):
+    def test_the_app_status_carries_the_health_check(self) -> None:
+        self.assertTrue(app_healthy({"status": "running"}))
+        for status in ("down", "degraded", "deploying", "stopped"):
+            self.assertFalse(app_healthy({"status": status}), status)
 
-    def test_one_instance_down(self) -> None:
-        self.assertFalse(
-            app_recovered({"instances": [{"status": "running"}, {"status": "crashed"}]})
-        )
+    def test_a_running_vm_with_failing_health_is_not_healthy(self) -> None:
+        self.assertFalse(app_healthy(FAILING.value))
 
     def test_tolerates_missing_fields(self) -> None:
-        self.assertFalse(app_recovered({}))
-        self.assertFalse(app_recovered({"instances": []}))
-        self.assertFalse(app_recovered({"instances": [{}]}))
-        self.assertTrue(app_recovered({"instances": [{"observed_status": "running"}]}))
+        self.assertFalse(app_healthy(None))
+        self.assertFalse(app_healthy({}))
+        self.assertFalse(app_healthy({"instances": [{"observed_status": "running"}]}))
+
+    def test_only_the_system_resolving_means_app_up(self) -> None:
+        self.assertTrue(resolved_by_app_up({"status": "resolved", "resolved_by_type": "system"}))
+        self.assertFalse(resolved_by_app_up({"status": "resolved", "resolved_by_type": "user"}))
+        self.assertFalse(resolved_by_app_up({"status": "open", "resolved_by_type": None}))
+        self.assertFalse(resolved_by_app_up(None))
 
 
 class EdgeHandler(BaseHTTPRequestHandler):
@@ -221,6 +253,116 @@ class LlmPolicyTests(unittest.TestCase):
 
         self.assertEqual(len(session.calls), 3)
         self.assertIn("3 steps", outcome.summary)
+
+
+class RecoveryWaitTests(unittest.TestCase):
+    """The deterministic policy waits for the app's health, not the VM."""
+
+    def policy(self, **options: Any) -> DeterministicRestartPolicy:
+        self.slept: list[float] = []
+        options.setdefault("poll_attempts", 4)
+        options.setdefault("poll_interval_s", 5.0)
+        return DeterministicRestartPolicy(sleep=self.slept.append, **options)
+
+    def test_a_running_vm_with_failing_health_never_recovers(self) -> None:
+        session = FakeSession(answers={"get_app": [FAILING]})
+
+        outcome = self.policy(resolve_incident=True).handle(_wake(), session)  # type: ignore[arg-type]
+
+        self.assertFalse(outcome.recovered)
+        self.assertIn("did not report healthy", outcome.summary)
+        self.assertIn("4 reads over 20s", outcome.summary)
+        self.assertIn("last status down", outcome.summary)
+        # One read before the restart, then the whole bounded budget.
+        self.assertEqual(session.count("get_app"), 1 + 4)
+        self.assertEqual(self.slept, [5.0, 5.0, 5.0])
+        self.assertEqual(session.count("resolve_incident"), 0)
+
+    def test_recovers_once_the_health_check_passes(self) -> None:
+        session = FakeSession(answers={"get_app": [FAILING, FAILING, FAILING, HEALTHY]})
+
+        outcome = self.policy(resolve_incident=True).handle(_wake(), session)  # type: ignore[arg-type]
+
+        self.assertTrue(outcome.recovered)
+        self.assertIn("health check passing", outcome.summary)
+        # The pre-restart read, two failing polls, then the healthy one.
+        self.assertEqual(session.count("get_app"), 4)
+        self.assertEqual(session.count("resolve_incident"), 1)
+        self.assertTrue(outcome.resolved)
+
+    def test_a_revoked_grant_after_app_up_reads_the_incident(self) -> None:
+        resolved = ToolResult(
+            ok=True,
+            value={"id": INCIDENT_ID, "status": "resolved", "resolved_by_type": "system"},
+        )
+        session = FakeSession(
+            answers={
+                "get_app": [FAILING, FAILING, REVOKED],
+                "get_incident": [ToolResult(ok=True, value={}), resolved],
+            }
+        )
+
+        outcome = self.policy(resolve_incident=True).handle(_wake(), session)  # type: ignore[arg-type]
+
+        self.assertTrue(outcome.recovered)
+        self.assertIn("app.up", outcome.summary)
+        self.assertEqual(session.count("resolve_incident"), 0, "already resolved")
+        self.assertFalse(outcome.resolved)
+
+    def test_a_revoked_grant_without_a_readable_incident_is_not_a_recovery(self) -> None:
+        session = FakeSession(
+            answers={
+                "get_app": [FAILING, REVOKED],
+                "get_incident": [ToolResult(ok=True, value={}), REVOKED],
+            }
+        )
+
+        outcome = self.policy().handle(_wake(), session)  # type: ignore[arg-type]
+
+        self.assertFalse(outcome.recovered)
+        self.assertIn("not confirmed", outcome.summary)
+
+    def test_a_revoked_grant_leaves_the_verdict_to_check_url(self) -> None:
+        session = FakeSession(
+            answers={
+                "get_app": [FAILING, REVOKED],
+                "get_incident": [ToolResult(ok=True, value={}), REVOKED],
+            }
+        )
+        policy = self.policy(
+            check_url="https://app.example/",
+            health_check=lambda url: UrlCheck(ok=True, detail="HTTP 200"),
+        )
+
+        outcome = policy.handle(_wake(), session)  # type: ignore[arg-type]
+
+        self.assertTrue(outcome.recovered)
+        self.assertIn("answered HTTP 200", outcome.summary)
+
+    def test_check_url_is_not_asked_while_quoro_reports_the_app_down(self) -> None:
+        asked: list[str] = []
+        session = FakeSession(answers={"get_app": [FAILING]})
+        policy = self.policy(
+            check_url="https://app.example/",
+            health_check=lambda url: asked.append(url) or UrlCheck(ok=True, detail="HTTP 200"),
+        )
+
+        outcome = policy.handle(_wake(), session)  # type: ignore[arg-type]
+
+        self.assertFalse(outcome.recovered)
+        self.assertEqual(asked, [])
+
+    def test_another_refusal_stops_the_wait(self) -> None:
+        scope_missing = ToolResult(
+            ok=False, problem={"code": "forbidden", "reason": "scope_missing"}
+        )
+        session = FakeSession(answers={"get_app": [FAILING, scope_missing]})
+
+        outcome = self.policy().handle(_wake(), session)  # type: ignore[arg-type]
+
+        self.assertFalse(outcome.recovered)
+        self.assertIn("refused (forbidden)", outcome.summary)
+        self.assertEqual(session.count("get_app"), 2)
 
 
 class DeterministicPolicyTests(unittest.TestCase):
