@@ -615,6 +615,9 @@ A `lease_revoke` whose fence failed:
 | `vm_ids` | array of string | yes | Candidate backends, one per app replica |
 | `port` | integer | yes | Backend port |
 | `tls_mode` | string | yes | `acme` or `tunnel` |
+| `domain_id` | string (`dom_`) | no | The domain this route serves (`domains.id`); filled by the primary for every route it builds from a domain |
+
+**Domain ids and certificate events.** The node names the domain of a route in every `certificate.*` event it emits (`certificate.issued`, `certificate.expiring`, `certificate.failed`; section 5.4): `subject` is `{ "type": "domain", "id": <domain_id> }` and `data.domain_id` carries the same id, as `events.schema.json` requires. `domain_id` is an additive optional field: a node that does not know it ignores it, and a node that receives a route without it (from an older primary) reports the certificate state in `status_report.routes` only and emits no `certificate.*` event for that hostname, because it never invents an id.
 
 **`spec.network`:** `subnet` (CIDR for the node bridge) and `gateway` (address on that bridge). The addresses in `status_report` must fall inside the subnet.
 
@@ -672,7 +675,8 @@ A `lease_revoke` whose fence failed:
           "app_id": "app_01JC9Z7B3N5Q7S9Z1W3Y5A7C9E",
           "vm_ids": ["vm_01JC9Z7C4P6R8T0V2X4Z6B8D0F"],
           "port": 8080,
-          "tls_mode": "acme"
+          "tls_mode": "acme",
+          "domain_id": "dom_01JC9Z8D5Q7S9V1X3Z5B7D9F1H"
         }
       ],
       "network": { "subnet": "10.42.1.0/24", "gateway": "10.42.1.1" }

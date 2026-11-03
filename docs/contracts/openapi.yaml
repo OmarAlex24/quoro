@@ -1345,7 +1345,7 @@ components:
           description: Memory in mebibytes.
         disk_gb:
           type: integer
-          minimum: 0
+          minimum: 1
           description: Disk in gibibytes.
     AppPlacement:
       type: object

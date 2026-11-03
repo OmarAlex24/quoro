@@ -298,6 +298,7 @@ async fn build_routes(
             vm_ids,
             port: app.port,
             tls_mode,
+            domain_id: None,
         });
     }
     routes.sort_by(|a, b| a.hostname.cmp(&b.hostname));
