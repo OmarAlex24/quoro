@@ -115,6 +115,13 @@
   - [0096: M2 process model: quoro.service is the unprivileged control plane (User=quoro-api, empty capability bounding set) and quoro-node.service is the root node agent with KillMode=process; node data in /var/lib/quoro-node](adr/0096-m2-process-model-quoro-service-is-the-unprivileged-control.md)
   - [0098: AppResources.disk_gb minimum is 1 in openapi.yaml, matching vms CHECK (disk_gb >= 1)](adr/0098-appresources-disk-gb-minimum-is-1-in-openapi-yaml-matching.md)
   - [0099: Add domain_id to desired_state spec.routes\[\] so node certificate.* events can name their domain](adr/0099-add-domain-id-to-desired-state-spec-routes-so-node.md)
+  - [0102: M3 demo agent runner uses the built-in deterministic policy; an LLM backend (Claude, Anthropic API) stays optional, configured at the runner with the operator's own key, never required by the DoD](adr/0102-m3-demo-agent-runner-uses-the-built-in-deterministic-policy.md)
+  - [0103: A webhook delivery from a webhook with wake carries data.wake = {agent_id, grant_id} in the incident.opened payload (additive, schema_version 1)](adr/0103-a-webhook-delivery-from-a-webhook-with-wake-carries-data.md)
+  - [0104: Ratify the provisional webhook and event contract choices from #116](adr/0104-ratify-the-provisional-webhook-and-event-contract-choices.md)
+  - [0105: M3 ships without deleteAgent; disabling an agent (PATCH) is the lockout; delete semantics are decided later](adr/0105-m3-ships-without-deleteagent-disabling-an-agent-patch-is.md)
+  - [0106: Add GET /api/v1/agents/{agent_id}/keys to openapi.yaml so the panel can list an agent's keys](adr/0106-add-get-api-v1-agents-agent-id-keys-to-openapi-yaml-so-the.md)
+  - [0107: Let operators and viewers resolve user ids to names (a read path for users)](adr/0107-let-operators-and-viewers-resolve-user-ids-to-names-a-read.md)
+  - [0109: Docs site: mdBook built from the repo's Markdown, published to GitHub Pages together with the v0.1.0 tag](adr/0109-docs-site-mdbook-built-from-the-repo-s-markdown-published.md)
 
 # Background research
 
