@@ -158,6 +158,10 @@ pub struct NetFile {
     pub gateway: String,
     /// The MAC address, as `"02:00:00:00:00:01"`.
     pub mac: String,
+    /// The isolation group (engine-trait.md section 3.3). Absent in files
+    /// written before groups existed, which read as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation_group: Option<String>,
 }
 
 /// The app's identity in a [`SpecFile`].
@@ -208,6 +212,7 @@ impl From<&VmSpec> for SpecFile {
                 ip: spec.net.ip.to_string(),
                 gateway: spec.net.gateway.to_string(),
                 mac: format_mac(spec.net.mac),
+                isolation_group: spec.net.isolation_group.clone(),
             },
             init: InitFile {
                 entrypoint: spec.init.entrypoint.clone(),
@@ -268,7 +273,12 @@ impl SpecFile {
                     mount_path: volume.mount_path.clone(),
                 })
                 .collect(),
-            net: NetAttach { ip, gateway, mac },
+            net: NetAttach {
+                ip,
+                gateway,
+                mac,
+                isolation_group: self.net.isolation_group.clone(),
+            },
             init: InitConfig {
                 entrypoint: self.init.entrypoint.clone(),
                 cmd: self.init.cmd.clone(),
@@ -705,6 +715,7 @@ mod tests {
                 ip: "10.42.1.7".parse().expect("ip"),
                 gateway: "10.42.1.1".parse().expect("gateway"),
                 mac: MacAddr([0x02, 0, 0, 0, 0, 1]),
+                isolation_group: None,
             },
             init: InitConfig {
                 entrypoint: vec!["/bin/sh".to_string()],

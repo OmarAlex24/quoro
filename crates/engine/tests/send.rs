@@ -67,6 +67,7 @@ async fn a_generic_caller_can_spawn_an_engine_call() {
         bridge: "quoro0".to_string(),
         subnet: "10.42.1.0/24".to_string(),
         gateway: "10.42.1.1".parse().expect("sample gateway"),
+        dns: Vec::new(),
     };
     let volume = VolumeId("vol_01".to_string());
     let snapshot = VolumeSnapshot {

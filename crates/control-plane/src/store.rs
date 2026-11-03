@@ -17,9 +17,10 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 const BASE_SCHEMA: &str = include_str!("../../../docs/contracts/db-schema.sql");
 
 /// Migrations in order; migration `n` moves `schema_version` from `n` to `n + 1`.
-const MIGRATIONS: &[&str] = &[include_str!(
-    "../../../docs/contracts/migrations/0001-node-fence-failure.sql"
-)];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../../../docs/contracts/migrations/0001-node-fence-failure.sql"),
+    include_str!("../../../docs/contracts/migrations/0002-node-credentials.sql"),
+];
 
 /// 64 zeros: `prev_hash` of the first entry of a chain.
 pub const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";

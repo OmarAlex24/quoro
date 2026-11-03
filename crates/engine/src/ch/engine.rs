@@ -194,6 +194,9 @@ struct NetworkRecord {
     bridge: String,
     subnet: String,
     gateway: Ipv4Addr,
+    /// Absent in files written before guest DNS moved onto the network.
+    #[serde(default)]
+    dns: Vec<Ipv4Addr>,
 }
 
 impl Inner {
@@ -1284,6 +1287,7 @@ fn load_networks(path: &Path) -> Result<HashMap<String, (NodeNetwork, Subnet)>, 
                     bridge: record.bridge,
                     subnet: record.subnet,
                     gateway: record.gateway,
+                    dns: record.dns,
                 },
                 subnet,
             ),
@@ -1303,6 +1307,7 @@ fn persist_networks(
             bridge: net.bridge.clone(),
             subnet: net.subnet.clone(),
             gateway: net.gateway,
+            dns: net.dns.clone(),
         })
         .collect();
     records.sort_by(|a, b| a.bridge.cmp(&b.bridge));

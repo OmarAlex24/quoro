@@ -618,6 +618,7 @@ table ip quoro_qw5br0 {
             bridge: bridge.to_owned(),
             subnet: subnet.to_owned(),
             gateway,
+            dns: Vec::new(),
         }
     }
 

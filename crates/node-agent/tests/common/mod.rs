@@ -326,6 +326,7 @@ pub async fn running_vm(engine: &FakeEngine, id: &str, index: u8) -> VmId {
             ip: Ipv4Addr::new(10, 0, 0, 2 + index),
             gateway: Ipv4Addr::new(10, 0, 0, 1),
             mac: MacAddr([0x02, 0, 0, 0, 0, index]),
+            isolation_group: None,
         },
         init: InitConfig {
             entrypoint: Vec::new(),

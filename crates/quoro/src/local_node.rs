@@ -56,6 +56,8 @@ pub struct NodeNetworkConfig {
     pub prefix: u8,
     /// The node's own address on the bridge, never handed to a VM.
     pub gateway: Ipv4Addr,
+    /// DNS servers handed to guests, from the node's configuration.
+    pub dns: Vec<Ipv4Addr>,
 }
 
 impl From<&crate::config::CloudHypervisorConfig> for NodeNetworkConfig {
@@ -66,6 +68,7 @@ impl From<&crate::config::CloudHypervisorConfig> for NodeNetworkConfig {
             network: config.subnet.network(),
             prefix: config.subnet.prefix(),
             gateway: config.subnet.gateway(),
+            dns: config.dns(),
         }
     }
 }
@@ -179,6 +182,7 @@ pub async fn start<E: Engine + 'static, R: ImageResolver>(
         bridge: network.bridge.clone(),
         subnet: network.subnet.clone(),
         gateway: network.gateway,
+        dns: network.dns.clone(),
     };
     if let Err(e) = engine.ensure_network(&engine_network).await {
         // A bridge usually needs root; the driver keeps running so the node
@@ -397,6 +401,9 @@ impl<E: Engine, R: ImageResolver> NodeDriver<E, R> {
                 ip,
                 gateway: self.network.gateway,
                 mac: mac_for(ip),
+                // Every VM stays isolated until the node agent sets the
+                // project as the group (ADR 0084).
+                isolation_group: None,
             },
             init: InitConfig {
                 entrypoint: prepared.config.entrypoint,
@@ -676,6 +683,7 @@ mod tests {
             network: Ipv4Addr::new(10, 9, 8, 0),
             prefix: 29,
             gateway: Ipv4Addr::new(10, 9, 8, 1),
+            dns: Vec::new(),
         };
         let mut driver = driver(network, store);
         let mut handed_out = Vec::new();

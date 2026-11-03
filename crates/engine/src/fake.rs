@@ -433,7 +433,12 @@ impl Engine for FakeEngine {
     async fn ensure_network(&self, net: &NodeNetwork) -> Result<(), EngineError> {
         let mut state = self.lock();
         match state.networks.get(&net.bridge) {
-            Some(existing) if existing == net => Ok(()),
+            // `dns` is not part of the network's identity (contract §3.3): the
+            // same bridge, subnet and gateway with other servers is an update.
+            Some(existing) if existing.subnet == net.subnet && existing.gateway == net.gateway => {
+                state.networks.insert(net.bridge.clone(), net.clone());
+                Ok(())
+            }
             Some(existing) => Err(EngineError::Conflict(format!(
                 "bridge {} already exists with subnet {} and gateway {}",
                 existing.bridge, existing.subnet, existing.gateway

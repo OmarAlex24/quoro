@@ -118,6 +118,11 @@ pub struct NetAttach {
     pub ip: Ipv4Addr,
     pub gateway: Ipv4Addr,
     pub mac: MacAddr,
+    /// Isolation group of the VM. VMs on the same bridge that carry the same
+    /// group reach each other; VMs in different groups, and a VM with `None`,
+    /// reach no other VM. The node agent sets it to the VM's project id
+    /// (`prj_`). Section 3.3.
+    pub isolation_group: Option<String>,
 }
 
 /// The app's command line and identity, as the minimal init must apply it.
@@ -226,6 +231,10 @@ pub struct NodeNetwork {
     pub bridge: String,
     pub subnet: String, // CIDR, for example "10.42.1.0/24"
     pub gateway: Ipv4Addr,
+    /// DNS servers handed to the guests created on this network, in order.
+    /// Taken from the node's configuration; empty means guests get no
+    /// resolver. Not part of the network's identity. Section 3.3.
+    pub dns: Vec<Ipv4Addr>,
 }
 
 /// A point-in-time volume snapshot descriptor. Section 3.16.
