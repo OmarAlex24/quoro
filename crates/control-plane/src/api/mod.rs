@@ -9,6 +9,7 @@ pub mod cluster;
 pub mod deployments;
 pub mod domains;
 pub mod enroll;
+pub mod grants;
 pub mod health;
 pub mod logs;
 pub mod nodes;
@@ -46,6 +47,15 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/v1/agents/{agent_id}/keys/{key_id}",
             delete(agents::revoke_agent_key),
+        )
+        .route(
+            "/api/v1/grants",
+            get(grants::list_grants).post(grants::create_grant),
+        )
+        .route("/api/v1/grants/{grant_id}", get(grants::get_grant))
+        .route(
+            "/api/v1/grants/{grant_id}/revoke",
+            post(grants::revoke_grant),
         )
         .route("/api/v1/nodes", get(nodes::list_nodes))
         .route("/api/v1/nodes/join-tokens", post(enroll::create_join_token))

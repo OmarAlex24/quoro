@@ -222,60 +222,10 @@ pub enum GrantCreator {
     System,
 }
 
-/// Scope plus resource selector plus a mandatory expiry (D-0030). Schema
-/// only in M1: grants arrive in M3.
-#[derive(Clone, Debug, Serialize, ToSchema)]
-#[schema(title = "Grant")]
-pub struct Grant {
-    /// Grant id.
-    #[schema(pattern = "^grt_[0-9A-HJKMNP-TV-Z]{26}$")]
-    pub id: String,
-    /// Agent the grant authorizes.
-    #[schema(pattern = "^agt_[0-9A-HJKMNP-TV-Z]{26}$")]
-    pub agent_id: String,
-    /// What the grant is for.
-    #[schema(inline)]
-    pub kind: GrantKind,
-    /// Incident the grant is scoped to.
-    #[schema(pattern = "^inc_[0-9A-HJKMNP-TV-Z]{26}$")]
-    pub incident_id: Option<String>,
-    /// Approval request that produced the grant.
-    #[schema(pattern = "^apr_[0-9A-HJKMNP-TV-Z]{26}$")]
-    pub approval_id: Option<String>,
-    /// Scopes granted. Listed explicitly; no wildcards.
-    #[schema(value_type = Vec<ScopeSchema>)]
-    pub scopes: Vec<String>,
-    pub selector: Selector,
-    /// Expiry; a TTL is mandatory.
-    #[schema(format = "date-time")]
-    pub expires_at: String,
-    /// Maximum number of uses, or null when unlimited until expiry.
-    #[schema(minimum = 1)]
-    pub max_uses: Option<i64>,
-    /// Uses consumed so far.
-    #[schema(minimum = 0)]
-    pub uses: i64,
-    /// Grant status.
-    #[schema(inline)]
-    pub status: GrantStatus,
-    /// Human who authorized the grant.
-    #[schema(pattern = "^usr_[0-9A-HJKMNP-TV-Z]{26}$")]
-    pub on_behalf_of: String,
-    /// Kind of identity that created the grant.
-    #[schema(inline)]
-    pub created_by_type: GrantCreator,
-    /// Id of the identity that created the grant.
-    pub created_by_id: String,
-    /// Why the grant was issued.
-    pub reason: String,
-    /// When the grant was issued.
-    #[schema(format = "date-time")]
-    pub created_at: String,
-    /// When the grant was revoked.
-    pub revoked_at: Option<String>,
-    /// Id of the identity that revoked the grant.
-    pub revoked_by: Option<String>,
-}
+/// Scope plus resource selector plus a mandatory expiry (D-0030). Defined
+/// with the grant operations in [`crate::api::grants`] and re-exported here
+/// for [`MeResponse`].
+pub use crate::api::grants::Grant;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -773,12 +723,15 @@ pub async fn get_me(
         .fetch_optional(state.store.pool())
         .await?;
         let row = row.ok_or_else(ApiError::unauthenticated)?;
+        // The grants the agent can use right now (permission-model.md
+        // section 6.2): active, not past the TTL and with uses left.
+        let grants =
+            crate::service::grants::active_grants_for_agent(&state, &agent.agent_id).await?;
         return Ok(Json(MeResponse {
             kind: IdentityType::Agent,
             user: None,
             agent: Some(crate::api::agents::agent_from_tuple(row)),
-            // Active grants arrive with the grant operations; empty until then.
-            grants: Some(Vec::new()),
+            grants: Some(grants),
         }));
     }
     let row: Option<UserRow> = sqlx::query_as(

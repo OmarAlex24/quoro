@@ -18,6 +18,7 @@ pub mod agents;
 pub mod apps;
 pub mod cluster;
 pub mod deployments;
+pub mod grants;
 pub mod logs;
 pub mod nodes;
 pub mod projects;

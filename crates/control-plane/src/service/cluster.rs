@@ -19,6 +19,13 @@ pub async fn get_cluster(state: &AppState, ctx: &CallCtx) -> Result<Cluster, Api
         .authorize_read(state, Scope::ClusterRead, None, &json!({}))
         .await?;
     let result: Result<_, ApiError> = async {
+        // Section 5.1: matched by any non-empty selector, so `{}` alone reads nothing.
+        if access.reads_nothing() {
+            return Err(ApiError::forbidden(
+                crate::error::Reason::SelectorMismatch,
+                Some(Scope::ClusterRead.as_str()),
+            ));
+        }
         let name: Option<(String,)> =
             sqlx::query_as("SELECT value FROM meta WHERE key = 'cluster_name'")
                 .fetch_optional(state.store.pool())

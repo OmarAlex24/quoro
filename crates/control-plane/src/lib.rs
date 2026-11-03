@@ -28,6 +28,7 @@ pub mod request;
 pub mod service;
 pub mod session;
 pub mod store;
+pub mod sweeper;
 pub mod tunnel;
 
 use crate::keys::ClusterKeys;
@@ -172,7 +173,7 @@ impl AppState {
         let tunnel = tunnel::TunnelManager::new(store.clone(), Arc::clone(&data_key), hub.clone());
         hub.set_tunnel_manager(&tunnel);
         tunnel.start();
-        Ok(Self {
+        let state = Self {
             store,
             config,
             idempotency: idempotency::Cache::default(),
@@ -181,7 +182,9 @@ impl AppState {
             tunnel,
             keys,
             cluster_id,
-        })
+        };
+        sweeper::spawn(state.clone());
+        Ok(state)
     }
 
     /// Points the Cloudflare clients of this process at other endpoints. The

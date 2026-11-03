@@ -4,17 +4,21 @@
 
 use crate::AppState;
 use crate::audit::{self, Channel, Outcome, Record};
-use crate::auth::{Identity, Principal};
+use crate::auth::{AgentIdentity, Identity, Principal};
 use crate::authz;
+use crate::changelog::{self, Actor, Op};
 use crate::error::{ApiError, Code, Reason, Target};
+use crate::events::{self, NewEvent, Source};
+use crate::store::now_rfc3339;
 use axum::extract::{FromRequest, OptionalFromRequest, Request};
 use axum::http::{HeaderMap, HeaderValue};
 use axum::middleware::Next;
 use axum::response::Response;
 use quoro_types::{Prefix, Scope, new_id};
 use serde::de::DeserializeOwned;
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::SqliteConnection;
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 /// Correlation id of the call, `req_...`, echoed as `Quoro-Request-Id`.
@@ -100,6 +104,9 @@ pub struct Authority {
 pub enum ReadFilter {
     /// Every row.
     All,
+    /// Rows matched by any of these selectors (the agent's usable grants
+    /// with the scope).
+    Selectors(Vec<authz::Selector>),
 }
 
 /// What a row is, for selector matching (permission-model.md section 5): its
@@ -142,13 +149,71 @@ impl ReadAccess {
     /// A database error while resolving project slugs.
     pub async fn filter<T>(
         &self,
-        _state: &AppState,
+        state: &AppState,
         items: Vec<T>,
-        _describe: impl Fn(&T) -> Resource<'_>,
+        describe: impl Fn(&T) -> Resource<'_>,
     ) -> Result<Vec<T>, ApiError> {
-        match self.filter {
-            ReadFilter::All => Ok(items),
+        let selectors = match &self.filter {
+            ReadFilter::All => return Ok(items),
+            ReadFilter::Selectors(selectors) => selectors,
+        };
+        let mut slugs: HashMap<String, Option<String>> = HashMap::new();
+        let mut kept = Vec::with_capacity(items.len());
+        for item in items {
+            let resource = describe(&item);
+            let mut resolved = authz::ResolvedResource::default();
+            let app_id = resource
+                .app_id
+                .or((resource.kind == "app").then_some(resource.id));
+            let node_id = resource
+                .node_id
+                .or((resource.kind == "node").then_some(resource.id));
+            let project_id = resource
+                .project_id
+                .or((resource.kind == "project").then_some(resource.id));
+            if let Some(app_id) = app_id {
+                resolved.apps.insert(app_id.to_string());
+            }
+            if let Some(node_id) = node_id {
+                resolved.nodes.insert(node_id.to_string());
+            }
+            if let Some(project_id) = project_id {
+                if !slugs.contains_key(project_id) {
+                    let slug: Option<(String,)> =
+                        sqlx::query_as("SELECT slug FROM projects WHERE id = ?")
+                            .bind(project_id)
+                            .fetch_optional(state.store.pool())
+                            .await?;
+                    slugs.insert(project_id.to_string(), slug.map(|s| s.0));
+                }
+                if let Some(Some(slug)) = slugs.get(project_id) {
+                    resolved.project_slugs.insert(slug.clone());
+                }
+            }
+            if selectors.iter().any(|s| s.matches(&resolved)) {
+                kept.push(item);
+            }
         }
+        Ok(kept)
+    }
+
+    /// Whether the caller sees every row (a human, or an agent whose grant
+    /// selector is `{"all": true}`). Cluster-level reads that cannot describe
+    /// their rows as a [`Resource`] use it to decide what to return.
+    #[must_use]
+    pub fn sees_all(&self) -> bool {
+        match &self.filter {
+            ReadFilter::All => true,
+            ReadFilter::Selectors(selectors) => selectors.iter().any(authz::Selector::is_all),
+        }
+    }
+
+    /// Whether the caller's grants carry only `{}` selectors: a list then
+    /// answers an empty page and a cluster-level read is refused with
+    /// `selector_mismatch` (permission-model.md sections 5 and 5.1).
+    #[must_use]
+    pub fn reads_nothing(&self) -> bool {
+        matches!(&self.filter, ReadFilter::Selectors(selectors) if selectors.is_empty())
     }
 
     /// Sets the project recorded on the agent's read audit record, once the
@@ -177,6 +242,76 @@ pub struct CallCtx {
     pub incident_id: Option<String>,
     /// Set once by a successful agent authorization.
     authority: Arc<OnceLock<Authority>>,
+}
+
+/// Section 7.2 step i: inside the action's transaction, re-reads the grant,
+/// refuses if it stopped being usable since the decision (revoked, expired
+/// or out of uses), and counts the use. The last use exhausts the grant and
+/// emits `grant.expired` with `reason: max_uses`.
+async fn consume_grant(
+    conn: &mut SqliteConnection,
+    agent: &AgentIdentity,
+    grant_id: &str,
+    scope: Option<Scope>,
+    request_id: &str,
+) -> Result<(), ApiError> {
+    let row = sqlx::query(&format!(
+        "SELECT {} FROM grants WHERE id = ?",
+        authz::GRANT_COLUMNS
+    ))
+    .bind(grant_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let scope_name = scope.map(Scope::as_str);
+    let Some(row) = row else {
+        return Err(ApiError::forbidden(Reason::GrantRevoked, scope_name));
+    };
+    let mut grant = authz::grant_from_row(&row)?;
+    if let Some(reason) = grant.unusable(&now_rfc3339()) {
+        return Err(ApiError::forbidden(reason, scope_name));
+    }
+    grant.uses += 1;
+    let exhausted = grant.max_uses.is_some_and(|max| grant.uses >= max);
+    if exhausted {
+        grant.status = "exhausted".to_string();
+    }
+    sqlx::query("UPDATE grants SET uses = ?, status = ? WHERE id = ?")
+        .bind(grant.uses)
+        .bind(&grant.status)
+        .bind(grant_id)
+        .execute(&mut *conn)
+        .await?;
+    let actor = Actor::system("grants");
+    changelog::append(
+        conn,
+        &actor,
+        "grant",
+        grant_id,
+        Op::Update,
+        json!({ "id": grant_id, "uses": grant.uses, "status": grant.status }),
+    )
+    .await?;
+    if exhausted {
+        events::emit(
+            conn,
+            NewEvent {
+                kind: "grant.expired",
+                source: Source::ControlPlane,
+                subject_type: "grant",
+                subject_id: grant_id,
+                project_id: None,
+                request_id: Some(request_id),
+                actor: None,
+                data: json!({
+                    "grant_id": grant_id,
+                    "agent_id": agent.agent_id,
+                    "reason": "max_uses",
+                }),
+            },
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 impl CallCtx {
@@ -277,12 +412,94 @@ impl CallCtx {
                 }
             }
             Principal::Agent(agent) => {
-                let error = authz::refuse_agent(agent, scope, target);
-                self.audit_refusal(state, scope, target, None, params, &error)
-                    .await?;
-                Err(error)
+                let allowed = match self.decide_agent(state, agent, scope, target, params).await {
+                    Ok(allowed) => allowed,
+                    Err(error) => {
+                        self.audit_refusal(state, scope, target, None, params, &error)
+                            .await?;
+                        return Err(error);
+                    }
+                };
+                let mut access = access;
+                access.project_id = allowed.resolved.as_ref().and_then(|r| r.project_id.clone());
+                if target.is_none() && !allowed.selectors.iter().any(authz::Selector::is_all) {
+                    access.filter = ReadFilter::Selectors(allowed.selectors.clone());
+                }
+                if let Err(error) = self.adopt(state, &allowed).await {
+                    let detail = error.audit_detail();
+                    let record = self.record(
+                        Some(scope),
+                        target,
+                        access.project_id.as_deref(),
+                        params,
+                        Outcome::Error,
+                        Some(detail),
+                        None,
+                    );
+                    let mut w = state.store.begin_write().await?;
+                    audit::append(&mut w.tx, &record).await?;
+                    w.commit().await?;
+                    return Err(error);
+                }
+                Ok(access)
             }
         }
+    }
+
+    /// Runs the agent half of the decision procedure on its own connection.
+    async fn decide_agent(
+        &self,
+        state: &AppState,
+        agent: &AgentIdentity,
+        scope: Scope,
+        target: Option<&Target>,
+        params: &Value,
+    ) -> Result<authz::Allowed, ApiError> {
+        let mut conn = state.store.pool().acquire().await?;
+        authz::decide(&mut conn, agent, scope, target, params).await
+    }
+
+    /// Records the authority an allowed agent call runs under: the matched
+    /// grant, its human, and the incident context (the `Quoro-Incident`
+    /// header or the incident an incident grant was issued for, and the
+    /// event that opened it).
+    ///
+    /// # Errors
+    ///
+    /// `validation_failed` for an incident id that names no incident.
+    async fn adopt(&self, state: &AppState, allowed: &authz::Allowed) -> Result<(), ApiError> {
+        let grant = allowed.grant.as_ref();
+        let incident_id = self
+            .incident_id
+            .clone()
+            .or_else(|| grant.and_then(|g| g.incident_id.clone()));
+        let mut trigger_event_id = None;
+        if let Some(incident_id) = &incident_id {
+            let row: Option<(String,)> =
+                sqlx::query_as("SELECT trigger_event_id FROM incidents WHERE id = ?")
+                    .bind(incident_id)
+                    .fetch_optional(state.store.pool())
+                    .await?;
+            match row {
+                Some((event_id,)) => trigger_event_id = Some(event_id),
+                None => {
+                    return Err(ApiError::validation(format!(
+                        "incident {incident_id} does not exist"
+                    )));
+                }
+            }
+        }
+        let authority = Authority {
+            grant_id: grant.map(|g| g.id.clone()),
+            on_behalf_of: grant.map(|g| g.on_behalf_of.clone()),
+            approval_id: grant.and_then(|g| g.approval_id.clone()),
+            incident_id,
+            trigger_event_id,
+        };
+        // A context authorizes one call; a second authorization of the same
+        // context keeps the first authority.
+        let _ = self.authority.set(authority);
+        Ok(())
     }
 
     /// Ends an authorized read: an agent's read is audited with `ok` or with
@@ -347,7 +564,37 @@ impl CallCtx {
                 }
                 ApiError::forbidden(Reason::ScopeMissing, Some(scope.as_str()))
             }
-            Principal::Agent(agent) => authz::refuse_agent(agent, scope, target),
+            Principal::Agent(agent) => {
+                match self.decide_agent(state, agent, scope, target, params).await {
+                    Ok(allowed) => {
+                        let project_id = project_id.map(str::to_string).or_else(|| {
+                            allowed.resolved.as_ref().and_then(|r| r.project_id.clone())
+                        });
+                        // Section 10 and the `Quoro-Justification` header: a
+                        // mutating agent call states why, or it does not run.
+                        let check = match self.adopt(state, &allowed).await {
+                            Ok(()) if self.justification.is_none() => Err(ApiError::validation(
+                                "a justification is required for an agent's mutating call",
+                            )),
+                            other => other,
+                        };
+                        if let Err(error) = check {
+                            self.audit_error(
+                                state,
+                                Some(scope),
+                                target,
+                                project_id.as_deref(),
+                                params,
+                                &error,
+                            )
+                            .await?;
+                            return Err(error);
+                        }
+                        return Ok(());
+                    }
+                    Err(error) => error,
+                }
+            }
         };
         self.audit_refusal(state, scope, target, project_id, params, &error)
             .await?;
@@ -399,6 +646,12 @@ impl CallCtx {
         params: &Value,
         change_seq: Option<i64>,
     ) -> Result<i64, ApiError> {
+        if let (Some(agent), Some(grant_id)) = (
+            self.identity.agent(),
+            self.authority().and_then(|a| a.grant_id.as_deref()),
+        ) {
+            consume_grant(conn, agent, grant_id, scope, &self.request_id).await?;
+        }
         let record = self.record(
             scope,
             target,
