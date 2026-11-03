@@ -1,13 +1,15 @@
 //! The `quoro` binary (D-0054).
 //!
 //! One binary serves the HTTPS listener, issues the first-run setup token,
-//! joins a cluster and runs the node agent (`join`, `node`), and, from a later
-//! milestone, serves MCP over stdio (`mcp`, M3). The command line is parsed by hand: it has five
-//! commands and a handful of flags, so a parser dependency would be more code
-//! and one more licence than the `match` below.
+//! joins a cluster and runs the node agent (`join`, `node`), and relays MCP
+//! over stdio to a primary for a local MCP client (`mcp stdio`). The command
+//! line is parsed by hand: it has a few commands and a handful of flags, so a
+//! parser dependency would be more code and one more licence than the `match`
+//! below.
 
 mod audit_cli;
 mod config;
+mod mcp_stdio;
 mod node;
 mod panel;
 mod privilege;
@@ -30,13 +32,24 @@ commands:
   join <url> --token TOKEN --fingerprint FINGERPRINT [--config PATH]
                                         enroll this machine as a node
   node [--config PATH]                  run the node agent
-  mcp stdio                             serve MCP over stdio (arrives in M3)
+  mcp stdio --url URL --fingerprint FINGERPRINT --key-file PATH
+            [--justification TEXT]
+                                        serve MCP over stdio for a local MCP
+                                        client, relayed to the primary's /mcp
   audit verify --file PATH [--prev-hash HEX]
                                         verify an exported JSON Lines segment
   audit verify --db PATH                verify a database's audit_log, offline
 
 The configuration file defaults to /etc/quoro/quoro.toml; a missing file means
-the built-in defaults.";
+the built-in defaults.
+
+quoro mcp stdio speaks MCP on stdin/stdout as one agent. The agent key
+(akey_...) is read from --key-file, a file only its owner may read (chmod 600);
+it is never accepted on the command line. The key is exchanged for a
+five-minute access token, renewed before it expires, and every message goes
+to the primary at --url over TLS pinned to --fingerprint (the sha256: value a
+join command carries). The primary authorizes and audits every tool call;
+--justification is recorded with each token the session mints.";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -60,10 +73,7 @@ async fn main() -> ExitCode {
         "join" => join_command(rest).await,
         "node" => node_command(rest).await,
         "audit" => audit_cli::run(rest).await,
-        "mcp" => {
-            eprintln!("quoro mcp arrives in M3");
-            ExitCode::from(2)
-        }
+        "mcp" => mcp_command(rest).await,
         "--help" | "-h" | "help" => usage(),
         other => {
             eprintln!("quoro: unknown command '{other}'");
@@ -139,6 +149,39 @@ async fn join_command(args: &[String]) -> ExitCode {
         fingerprint: fingerprint.to_string(),
     };
     exit_code(node::join(&config, &target).await)
+}
+
+/// `quoro mcp stdio --url URL --fingerprint FINGERPRINT --key-file PATH
+/// [--justification TEXT]`.
+async fn mcp_command(args: &[String]) -> ExitCode {
+    let Some((transport, rest)) = args.split_first() else {
+        return usage_error("mcp needs a transport: quoro mcp stdio ...");
+    };
+    if transport != "stdio" {
+        return usage_error(&format!(
+            "unknown MCP transport '{transport}'; expected stdio"
+        ));
+    }
+    let flags = match parse_flags(rest, &["url", "fingerprint", "key-file", "justification"]) {
+        Ok(flags) => flags,
+        Err(e) => return usage_error(&e),
+    };
+    let (Some(url), Some(fingerprint), Some(key_file)) = (
+        flag(&flags, "url"),
+        flag(&flags, "fingerprint"),
+        flag(&flags, "key-file"),
+    ) else {
+        return usage_error("mcp stdio needs --url, --fingerprint and --key-file");
+    };
+    mcp_stdio::run(mcp_stdio::Options {
+        url: url.to_string(),
+        fingerprint: fingerprint.to_string(),
+        key_file: PathBuf::from(key_file),
+        justification: flag(&flags, "justification")
+            .unwrap_or(mcp_stdio::DEFAULT_JUSTIFICATION)
+            .to_string(),
+    })
+    .await
 }
 
 /// `quoro node [--config PATH]`: the node agent alone, until SIGTERM.

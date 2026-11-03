@@ -33,7 +33,18 @@ tokio = { version = "1", default-features = false, features = [
     "signal",
     "sync",
     "time",
+    "io-std",
+    "io-util",
 ] }
+# `quoro mcp stdio` posts to the primary over the same pinned TLS stream
+# `quoro join` uses (`quoro_node_agent::tls`), with the HTTP/1 client the
+# node agent already builds on; same versions and features, no new crates.
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = { version = "0.1", default-features = false }
+# Reads the access token's RFC 3339 `expires_at`, so `quoro mcp stdio` renews
+# it before it lapses; the version the control plane already uses.
+time = { version = "0.3", default-features = false, features = ["std", "parsing"] }
 # The router the control plane returns, and `into_make_service` for the listener.
 axum = { version = "0.8", default-features = false, features = [
     "http1",
