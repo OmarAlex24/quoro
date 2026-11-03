@@ -14,6 +14,7 @@ export const HUMAN_ONLY_SCOPES: ReadonlySet<Scope> = new Set<Scope>([
   'approval:decide',
   'webhook:write',
   'provider:manage',
+  'user:read',
   'user:write',
 ]);
 

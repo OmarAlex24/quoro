@@ -1,29 +1,91 @@
-import { useMutation } from '@tanstack/react-query';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
+import type { AgentKey } from '../api/generated/model';
 import {
   createAgentKey,
+  getListAgentKeysQueryKey,
   revokeAgentKey,
+  useListAgentKeys,
 } from '../api/generated/agents/agents';
 import { isApiProblem } from '../api/fetcher';
 import { relativeTime } from '../lib/app-status';
 import { shortId } from '../lib/agency-format';
-import { isAgentKeyId } from '../lib/agents';
 import { problemView, type ProblemView } from '../lib/problem';
 import { Button } from './ui/button';
-import { Input } from './ui/input';
+import { Dialog, DialogContent } from './ui/dialog';
 import { NoticeLine, ProblemBanner } from './ui/problem-banner';
 import { CopyButton } from './copy-button';
 import { SecretOnce } from './secret-once';
+import { ToneLamp } from './tone-lamp';
 
 const revokeProblem = (error: unknown): ProblemView =>
   isApiProblem(error) && error.status === 404
     ? { message: 'No key with that id belongs to this agent.' }
     : problemView(error, 'revoke keys');
 
+/** One key in the list: the lamp burns while it can still mint tokens. */
+function KeyRow({
+  agentKey,
+  canWrite,
+  onRevoke,
+}: {
+  agentKey: AgentKey;
+  canWrite: boolean;
+  onRevoke: (agentKey: AgentKey) => void;
+}) {
+  const revoked = agentKey.revoked_at !== null && agentKey.revoked_at !== undefined;
+  const statusWords = revoked ? 'Revoked' : 'Active';
+
+  return (
+    <li className="flex flex-wrap items-start gap-x-3 gap-y-2 py-3">
+      <ToneLamp
+        tone={revoked ? 'idle' : 'run'}
+        size={20}
+        label={statusWords}
+        className="mt-0.5"
+      />
+
+      <div className="min-w-0 flex-1 basis-[min(100%,260px)]">
+        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+          <span className="type-body-medium text-[14px] text-ink">{statusWords}</span>
+          <span className="inline-flex min-w-0 items-center gap-1">
+            <span className="type-data text-[13px] text-ink" title={agentKey.id}>
+              {shortId(agentKey.id)}
+            </span>
+            <CopyButton value={agentKey.id} label="Copy key id" />
+          </span>
+          <span className="type-data text-[13px] text-ink-muted" title={agentKey.created_at}>
+            created {relativeTime(agentKey.created_at)}
+          </span>
+        </div>
+
+        <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px] text-ink-muted">
+          <span className="type-data">
+            {agentKey.last_used_at
+              ? `last used ${relativeTime(agentKey.last_used_at)}`
+              : 'last used never'}
+          </span>
+          {agentKey.revoked_at ? (
+            <span className="type-data" title={agentKey.revoked_at}>
+              revoked {relativeTime(agentKey.revoked_at)}
+            </span>
+          ) : null}
+        </div>
+      </div>
+
+      {canWrite && !revoked ? (
+        <Button variant="danger" size="compact" className="ml-auto" onClick={() => onRevoke(agentKey)}>
+          Revoke
+        </Button>
+      ) : null}
+    </li>
+  );
+}
+
 /**
- * The keys block. A key only mints 5-minute access tokens, so it says that
- * once and then shows the one secret the API returns, straight from the
- * mutation result: never cached, stored or put in the URL.
+ * The keys block: the agent's keys newest first, with the one secret the API
+ * returns straight from the mutation result and never cached, stored or put in
+ * the URL. A key only mints 5-minute access tokens; grants decide what it may do.
  */
 export function AgentKeys({
   agentId,
@@ -34,9 +96,17 @@ export function AgentKeys({
   agentName: string;
   canWrite: boolean;
 }) {
-  const [keyId, setKeyId] = useState('');
+  const queryClient = useQueryClient();
   const [problem, setProblem] = useState<ProblemView | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [revokeTarget, setRevokeTarget] = useState<AgentKey | null>(null);
+  const [revokeError, setRevokeError] = useState<ProblemView | null>(null);
+
+  const keys = useListAgentKeys(
+    agentId,
+    { limit: 200 },
+    { query: { enabled: agentId !== '', staleTime: 15_000, retry: false } },
+  );
 
   const create = useMutation({
     mutationFn: () =>
@@ -46,6 +116,7 @@ export function AgentKeys({
     onSuccess: (created) => {
       setProblem(null);
       setNotice(`Created key ${shortId(created.id)} for ${agentName}.`);
+      void queryClient.invalidateQueries({ queryKey: getListAgentKeysQueryKey(agentId) });
     },
     onError: (error) => {
       setNotice(null);
@@ -57,16 +128,22 @@ export function AgentKeys({
     mutationFn: (id: string) => revokeAgentKey(agentId, id),
     onSuccess: (_data, id) => {
       setProblem(null);
+      setRevokeError(null);
       setNotice(`Revoked key ${shortId(id)}; tokens it minted stop within 5 minutes.`);
-      setKeyId('');
-      create.reset();
+      setRevokeTarget(null);
+      void queryClient.invalidateQueries({ queryKey: getListAgentKeysQueryKey(agentId) });
     },
     onError: (error) => {
       setNotice(null);
-      setProblem(revokeProblem(error));
+      setRevokeError(revokeProblem(error));
     },
   });
 
+  const items = keys.data?.items ?? [];
+  const listError =
+    keys.error !== null && keys.error !== undefined
+      ? problemView(keys.error, 'read keys')
+      : null;
   const created = create.data;
 
   return (
@@ -99,17 +176,6 @@ export function AgentKeys({
               created {relativeTime(created.created_at)}
             </span>
             <Button
-              variant="danger"
-              disabled={revoke.isPending}
-              onClick={() => {
-                setNotice(null);
-                setProblem(null);
-                revoke.mutate(created.id);
-              }}
-            >
-              Revoke this key
-            </Button>
-            <Button
               variant="secondary"
               onClick={() => {
                 setNotice(null);
@@ -123,70 +189,99 @@ export function AgentKeys({
         </div>
       ) : null}
 
-      {canWrite ? (
-        <div className="mt-4 flex flex-col gap-3 border-t border-rail pt-3">
-          <div>
-            <Button
-              variant="primary"
-              disabled={create.isPending}
-              onClick={() => {
+      {listError ? (
+        <ProblemBanner view={listError} className="mt-2" />
+      ) : keys.isPending ? (
+        <p className="mt-3 text-[13px] text-ink-muted">Loading keys…</p>
+      ) : items.length === 0 ? (
+        <p className="mt-3 border-y border-rail py-3 text-[13px] text-ink-muted">
+          No keys yet
+        </p>
+      ) : (
+        <ul className="mt-3 flex flex-col divide-y divide-rail border-y border-rail">
+          {items.map((agentKey) => (
+            <KeyRow
+              key={agentKey.id}
+              agentKey={agentKey}
+              canWrite={canWrite}
+              onRevoke={(target) => {
                 setNotice(null);
                 setProblem(null);
-                create.mutate();
+                setRevokeError(null);
+                revoke.reset();
+                setRevokeTarget(target);
               }}
-            >
-              {create.isPending ? 'Creating…' : 'Create a key'}
-            </Button>
-          </div>
+            />
+          ))}
+        </ul>
+      )}
 
-          <form
-            className="flex flex-col gap-2 sm:flex-row sm:items-start"
-            onSubmit={(event) => {
-              event.preventDefault();
-              const value = keyId.trim();
-              if (!isAgentKeyId(value)) {
-                setNotice(null);
-                setProblem({
-                  message:
-                    'A key id starts with akey_ and has 26 more characters. Check the id and try again.',
-                });
-                return;
-              }
+      {canWrite ? (
+        <div className="mt-4 flex flex-wrap items-center gap-x-3 gap-y-2">
+          <Button
+            variant="primary"
+            disabled={create.isPending}
+            onClick={() => {
               setNotice(null);
               setProblem(null);
-              revoke.mutate(value);
+              create.mutate();
             }}
           >
-            <div className="flex min-w-0 flex-col gap-1.5 sm:flex-1">
-              <label
-                htmlFor="agent-key-id"
-                className="text-[13px] text-ink-muted"
-              >
-                Key id
-              </label>
-              <Input
-                id="agent-key-id"
-                value={keyId}
-                onChange={(event) => setKeyId(event.target.value)}
-                placeholder="akey_…"
-                spellCheck={false}
-                autoComplete="off"
-              />
-              <p className="text-[13px] leading-snug text-ink-muted">
-                To revoke an earlier key, enter its id.
-              </p>
-            </div>
-            <Button
-              variant="danger"
-              type="submit"
-              className="sm:mt-[26px]"
-              disabled={revoke.isPending}
-            >
-              {revoke.isPending ? 'Revoking…' : 'Revoke key'}
-            </Button>
-          </form>
+            {create.isPending ? 'Creating…' : 'Create a key'}
+          </Button>
+          <p className="text-[13px] text-ink-muted">
+            Use a new key per agent host, so revoking one leaves the others working.
+          </p>
         </div>
       ) : null}
+
+      <Dialog
+        open={revokeTarget !== null}
+        onOpenChange={(open) => {
+          if (!open && !revoke.isPending) {
+            setRevokeTarget(null);
+            setRevokeError(null);
+          }
+        }}
+      >
+        <DialogContent
+          title="Revoke key"
+          description={
+            revokeTarget
+              ? `Key ${shortId(revokeTarget.id)} for ${agentName} ends now.`
+              : undefined
+          }
+        >
+          <div className="flex flex-col gap-4">
+            {revokeError ? <ProblemBanner view={revokeError} /> : null}
+            <p className="text-[14px] leading-snug text-ink">
+              Tokens this key already minted stop working within 5 minutes. The agent needs
+              another key to mint new ones.
+            </p>
+            <div className="flex flex-wrap justify-end gap-2 border-t border-rail pt-4">
+              <Button
+                variant="secondary"
+                disabled={revoke.isPending}
+                onClick={() => {
+                  setRevokeTarget(null);
+                  setRevokeError(null);
+                }}
+              >
+                Keep key
+              </Button>
+              <Button
+                variant="danger"
+                disabled={revoke.isPending}
+                onClick={() => {
+                  if (revokeTarget) revoke.mutate(revokeTarget.id);
+                }}
+              >
+                {revoke.isPending ? 'Revoking…' : 'Revoke key'}
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
     </section>
   );
 }

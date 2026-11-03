@@ -24,8 +24,8 @@ export function AgentName({ id, link = true }: { id: string; link?: boolean }) {
 }
 
 /**
- * A user id shown as a name. Only the owner can read the user list
- * (`user:write`), so other roles see "you" for themselves and the id otherwise.
+ * A user id shown as a name. Every human role can read the user list
+ * (`user:read`), so the panel shows names and "(you)" for the signed-in user.
  */
 export function UserName({ id }: { id: string }) {
   const { me, user } = useSession();

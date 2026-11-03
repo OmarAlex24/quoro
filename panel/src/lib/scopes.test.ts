@@ -8,8 +8,8 @@ import {
 } from './scopes';
 
 describe('scopes', () => {
-  it('names nine human-only and four destructive scopes', () => {
-    expect(HUMAN_ONLY_SCOPES.size).toBe(9);
+  it('names ten human-only and four destructive scopes', () => {
+    expect(HUMAN_ONLY_SCOPES.size).toBe(10);
     expect(DESTRUCTIVE_SCOPES.size).toBe(4);
   });
 

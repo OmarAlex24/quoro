@@ -63,9 +63,14 @@ describe('capabilities', () => {
     }
   });
 
-  it('lets only the owner list users', () => {
+  it('lets every human role list users', () => {
     expect(canListUsers(user('owner'))).toBe(true);
-    expect(canListUsers(user('operator'))).toBe(false);
-    expect(canListUsers(user('viewer'))).toBe(false);
+    expect(canListUsers(user('operator'))).toBe(true);
+    expect(canListUsers(user('viewer'))).toBe(true);
+  });
+
+  it('refuses a disabled human the user list', () => {
+    expect(canListUsers(user('operator', true))).toBe(false);
+    expect(canListUsers(undefined)).toBe(false);
   });
 });
