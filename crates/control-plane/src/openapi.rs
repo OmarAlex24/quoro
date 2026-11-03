@@ -78,6 +78,9 @@ pub struct RateLimited(Problem);
         crate::api::auth::get_me,
         crate::api::nodes::list_nodes,
         crate::api::nodes::get_node,
+        crate::api::enroll::create_join_token,
+        crate::api::enroll::enroll_node,
+        crate::session::open_node_session,
         crate::api::projects::list_projects,
         crate::api::projects::create_project,
         crate::api::projects::get_project,
@@ -108,6 +111,10 @@ pub struct RateLimited(Problem);
             crate::api::nodes::NodeCapacity,
             crate::api::nodes::KvmInfo,
             crate::api::nodes::NodeFenceFailure,
+            crate::api::enroll::NodeJoinTokenRequest,
+            crate::api::enroll::NodeJoinTokenCreated,
+            crate::api::enroll::EnrollNodeRequest,
+            crate::api::enroll::EnrollNodeResponse,
             crate::api::projects::Project,
             crate::api::projects::ProjectList,
             crate::api::projects::CreateProjectRequest,
@@ -136,8 +143,8 @@ pub struct RateLimited(Problem);
 pub struct ApiDoc;
 
 /// Adds the security schemes of the frozen document: `bearerAuth` (human API
-/// token or agent access token) and `sessionCookie` (`quoro_session`). Other
-/// schemes (`agentKey`, `nodeCredential`) arrive with their operations.
+/// token or agent access token), `sessionCookie` (`quoro_session`) and
+/// `nodeCredential` (the node session credential).
 struct Security;
 
 impl utoipa::Modify for Security {
@@ -156,5 +163,23 @@ impl utoipa::Modify for Security {
                 crate::auth::SESSION_COOKIE,
             ))),
         );
+        components.add_security_scheme(
+            "nodeCredential",
+            SecurityScheme::Http(HttpBuilder::new().scheme(HttpAuthScheme::Bearer).build()),
+        );
+
+        // utoipa has no `required = false` for a request body: an optional
+        // body is written `Option<T>`, which also marks the schema nullable.
+        // The contract's `NodeJoinTokenRequest` is a plain object, so the
+        // annotation names the type and only the body is marked optional here.
+        if let Some(body) = openapi
+            .paths
+            .paths
+            .get_mut("/api/v1/nodes/join-tokens")
+            .and_then(|item| item.post.as_mut())
+            .and_then(|operation| operation.request_body.as_mut())
+        {
+            body.required = Some(utoipa::openapi::Required::False);
+        }
     }
 }

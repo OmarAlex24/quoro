@@ -1,13 +1,13 @@
 //! The `quoro` binary (D-0054).
 //!
-//! One binary serves the HTTPS listener, issues the first-run setup token and,
-//! from later milestones, joins a cluster (`join`, M2) and serves MCP over
-//! stdio (`mcp`, M3). The command line is parsed by hand: it has five
+//! One binary serves the HTTPS listener, issues the first-run setup token,
+//! joins a cluster and runs the node agent (`join`, `node`), and, from a later
+//! milestone, serves MCP over stdio (`mcp`, M3). The command line is parsed by hand: it has five
 //! commands and a handful of flags, so a parser dependency would be more code
 //! and one more licence than the `match` below.
 
 mod config;
-mod local_node;
+mod node;
 mod panel;
 mod serve;
 mod tls;
@@ -25,7 +25,9 @@ commands:
   serve [--config PATH] [--role node]   run the HTTPS listener (D-0054)
   setup-token [--config PATH]           print a one-time first-run setup token
   version                               print the version
-  join <url> --token --fingerprint      join a cluster (arrives in M2)
+  join <url> --token TOKEN --fingerprint FINGERPRINT [--config PATH]
+                                        enroll this machine as a node
+  node [--config PATH]                  run the node agent
   mcp stdio                             serve MCP over stdio (arrives in M3)
 
 The configuration file defaults to /etc/quoro/quoro.toml; a missing file means
@@ -50,10 +52,8 @@ async fn main() -> ExitCode {
         }
         "serve" => serve_command(rest).await,
         "setup-token" => issue_token(rest).await,
-        "join" => {
-            eprintln!("quoro join arrives in M2");
-            ExitCode::from(2)
-        }
+        "join" => join_command(rest).await,
+        "node" => node_command(rest).await,
         "mcp" => {
             eprintln!("quoro mcp arrives in M3");
             ExitCode::from(2)
@@ -103,12 +103,69 @@ async fn serve_command(args: &[String]) -> ExitCode {
     };
 
     match serve::run(config).await {
-        Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
+        Ok(code) => exit_code(code),
         Err(e) => {
             eprintln!("quoro serve: {e}");
             ExitCode::from(1)
         }
     }
+}
+
+/// `quoro join <url> --token TOKEN --fingerprint FINGERPRINT [--config PATH]`.
+async fn join_command(args: &[String]) -> ExitCode {
+    let Some((url, rest)) = args.split_first().filter(|(url, _)| !url.starts_with("--")) else {
+        return usage_error("join needs the primary's URL");
+    };
+    let flags = match parse_flags(rest, &["config", "token", "fingerprint"]) {
+        Ok(flags) => flags,
+        Err(e) => return usage_error(&e),
+    };
+    let (Some(token), Some(fingerprint)) = (flag(&flags, "token"), flag(&flags, "fingerprint"))
+    else {
+        return usage_error("join needs --token and --fingerprint");
+    };
+    let Some(config) = load_config("join", &config_path(&flags)) else {
+        return ExitCode::from(1);
+    };
+    let target = quoro_node_agent::JoinTarget {
+        url: url.clone(),
+        token: token.to_string(),
+        fingerprint: fingerprint.to_string(),
+    };
+    exit_code(node::join(&config, &target).await)
+}
+
+/// `quoro node [--config PATH]`: the node agent alone, until SIGTERM.
+async fn node_command(args: &[String]) -> ExitCode {
+    let flags = match parse_flags(args, &["config"]) {
+        Ok(flags) => flags,
+        Err(e) => return usage_error(&e),
+    };
+    let Some(config) = load_config("node", &config_path(&flags)) else {
+        return ExitCode::from(1);
+    };
+    match node::run(&config, serve::signal()).await {
+        Ok(code) => exit_code(code),
+        Err(e) => {
+            eprintln!("quoro node: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Loads `quoro.toml`, printing the failure under `command`.
+fn load_config(command: &str, path: &std::path::Path) -> Option<config::Config> {
+    match config::Config::load(path) {
+        Ok(config) => Some(config),
+        Err(e) => {
+            eprintln!("quoro {command}: cannot read {}: {e}", path.display());
+            None
+        }
+    }
+}
+
+fn exit_code(code: i32) -> ExitCode {
+    ExitCode::from(u8::try_from(code).unwrap_or(1))
 }
 
 /// `quoro setup-token [--config PATH]`: a fresh token, unless an owner exists.

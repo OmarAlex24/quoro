@@ -1,8 +1,7 @@
 //! `GET /api/v1/nodes` and `GET /api/v1/nodes/{node_id}`.
 //!
-//! Rows come from the driver's [`crate::driver::register_local_node`]; M1 has
-//! no enrollment endpoint yet. JSON columns are parsed into the contract's
-//! component schemas.
+//! Rows come from enrollment (`crate::api::enroll`). JSON columns are parsed
+//! into the contract's component schemas.
 
 use crate::AppState;
 use crate::api::page::finish;

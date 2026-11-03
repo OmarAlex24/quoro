@@ -18,6 +18,10 @@ quoro-control-plane = { path = "../control-plane" }
 quoro-engine = { path = "../engine" }
 # The node agent: `quoro join`, `quoro node` and the primary's local node.
 quoro-node-agent = { path = "../node-agent" }
+# Wire shapes (capacity, KVM) the node agent reports.
+quoro-proto = { path = "../proto" }
+# The control plane's local join file is JSON.
+serde_json = { version = "1", default-features = false, features = ["std"] }
 quoro-types = { path = "../types" }
 # The async runtime: listener, signals, the driver channel and the driver loop.
 tokio = { version = "1", default-features = false, features = [
