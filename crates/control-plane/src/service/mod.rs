@@ -17,6 +17,7 @@
 pub mod agents;
 pub mod approvals;
 pub mod apps;
+pub mod audit;
 pub mod cluster;
 pub mod deployments;
 pub mod grants;

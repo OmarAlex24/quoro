@@ -6,6 +6,7 @@
 //! commands and a handful of flags, so a parser dependency would be more code
 //! and one more licence than the `match` below.
 
+mod audit_cli;
 mod config;
 mod node;
 mod panel;
@@ -30,6 +31,9 @@ commands:
                                         enroll this machine as a node
   node [--config PATH]                  run the node agent
   mcp stdio                             serve MCP over stdio (arrives in M3)
+  audit verify --file PATH [--prev-hash HEX]
+                                        verify an exported JSON Lines segment
+  audit verify --db PATH                verify a database's audit_log, offline
 
 The configuration file defaults to /etc/quoro/quoro.toml; a missing file means
 the built-in defaults.";
@@ -55,6 +59,7 @@ async fn main() -> ExitCode {
         "setup-token" => issue_token(rest).await,
         "join" => join_command(rest).await,
         "node" => node_command(rest).await,
+        "audit" => audit_cli::run(rest).await,
         "mcp" => {
             eprintln!("quoro mcp arrives in M3");
             ExitCode::from(2)
@@ -245,7 +250,7 @@ async fn issue_token(args: &[String]) -> ExitCode {
     }
 }
 
-fn usage_error(message: &str) -> ExitCode {
+pub(crate) fn usage_error(message: &str) -> ExitCode {
     eprintln!("quoro: {message}");
     usage()
 }
@@ -256,7 +261,7 @@ fn config_path(flags: &[(String, String)]) -> PathBuf {
 }
 
 /// The value of `--name`, when it was given.
-fn flag<'a>(flags: &'a [(String, String)], name: &str) -> Option<&'a str> {
+pub(crate) fn flag<'a>(flags: &'a [(String, String)], name: &str) -> Option<&'a str> {
     flags
         .iter()
         .rev()
@@ -266,7 +271,10 @@ fn flag<'a>(flags: &'a [(String, String)], name: &str) -> Option<&'a str> {
 
 /// Reads `--name value` pairs, refusing an unknown option, a flag without a
 /// value and a positional argument.
-fn parse_flags(args: &[String], names: &[&str]) -> Result<Vec<(String, String)>, String> {
+pub(crate) fn parse_flags(
+    args: &[String],
+    names: &[&str],
+) -> Result<Vec<(String, String)>, String> {
     let mut flags = Vec::with_capacity(args.len() / 2);
     let mut args = args.iter();
     while let Some(argument) = args.next() {
