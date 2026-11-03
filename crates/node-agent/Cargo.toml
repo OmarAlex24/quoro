@@ -15,6 +15,11 @@ quoro-proto = { path = "../proto" }
 # The self-fence path stops stateful VMs through the engine trait; tests use
 # the fake engine behind it.
 quoro-engine = { path = "../engine" }
+# The node-side reverse proxy, tunnel connector and ACME manager it supervises
+# (ADR 0024, 0094, 0096).
+quoro-ingress = { path = "../ingress" }
+# Tunnel run tokens and DNS records: the node holds no provider credential.
+quoro-providers = { path = "../providers" }
 # Channels for the session and the stop flag (`sync`), the paused monotonic
 # clock the lease timing runs on (`time`), and `tokio::select!` in the agent
 # loop (`macros`); no default features.

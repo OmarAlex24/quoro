@@ -97,6 +97,10 @@ fn config(dir: &TempDir) -> AgentConfig {
         bridge: "quoro0".to_owned(),
         dns: vec!["9.9.9.9".parse().unwrap()],
         roles: vec!["node".to_owned()],
+        cloudflared_binary: dir.path().join("cloudflared"),
+        cloudflared_metrics: "127.0.0.1:20241".parse().unwrap(),
+        acme_directory_url: quoro_node_agent::DEFAULT_ACME_DIRECTORY.to_owned(),
+        acme_contact: Vec::new(),
     }
 }
 

@@ -13,6 +13,7 @@ mod agent;
 pub mod enroll;
 pub mod health;
 pub mod identity;
+pub mod ingress;
 pub mod lease;
 pub mod localkey;
 pub mod logs;
@@ -23,16 +24,25 @@ pub mod tls;
 mod util;
 
 use std::fmt;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
 pub use agent::run;
 pub use identity::{Identity, is_enrolled};
+pub use ingress::{DnsBridge, IngressConfig, IngressSupervisor};
 pub use lease::{
     Action, FenceRecord, FenceReport, FenceTimers, Lease, LeaseAgent, LeaseAgentConfig, LeaseState,
     LeaseStore, LeaseTable, MIN_DURATION, MemoryLeaseStore, Refusal, RevokeOutcome, StoredLease,
     VmFenceOutcome, budget_for, margin, stop_vms,
 };
+
+/// The ACME directory `acme` routes use unless the configuration names another
+/// one (a staging directory for tests and labs).
+pub use quoro_ingress::acme::LETS_ENCRYPT_PRODUCTION as DEFAULT_ACME_DIRECTORY;
+
+/// Loopback metrics address of the `cloudflared` connector unless configured
+/// otherwise.
+pub const DEFAULT_CLOUDFLARED_METRICS: &str = "127.0.0.1:20241";
 
 /// Everything the agent needs from the node's configuration.
 #[derive(Clone, Debug)]
@@ -48,6 +58,35 @@ pub struct AgentConfig {
     pub dns: Vec<Ipv4Addr>,
     /// Roles sent at enrollment: any of `node`, `witness`, `edge`.
     pub roles: Vec<String>,
+    /// The `cloudflared` connector for `tunnel` routes, under the artifacts
+    /// directory (`<artifacts dir>/cloudflared` by default).
+    pub cloudflared_binary: PathBuf,
+    /// Loopback `--metrics` address of that connector.
+    pub cloudflared_metrics: SocketAddr,
+    /// ACME directory URL for `acme` routes.
+    pub acme_directory_url: String,
+    /// ACME account contacts (`mailto:`); may be empty.
+    pub acme_contact: Vec<String>,
+}
+
+impl AgentConfig {
+    /// The ingress settings this node's directories imply.
+    #[must_use]
+    pub fn ingress_config(&self) -> IngressConfig {
+        let mut config = IngressConfig::new(
+            &self.data_dir,
+            quoro_ingress::cloudflared::CloudflaredConfig {
+                binary: self.cloudflared_binary.clone(),
+                metrics: self.cloudflared_metrics,
+                extra_args: Vec::new(),
+            },
+        );
+        config
+            .acme_directory_url
+            .clone_from(&self.acme_directory_url);
+        config.acme_contact.clone_from(&self.acme_contact);
+        config
+    }
 }
 
 /// The three values a join command carries (section 2.2).

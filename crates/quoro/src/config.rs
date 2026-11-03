@@ -259,6 +259,9 @@ pub struct Config {
     /// The node agent on this machine.
     #[serde(default)]
     pub node: NodeConfig,
+    /// What the node runs to serve the app routes of its desired state.
+    #[serde(default)]
+    pub ingress: IngressConfig,
 }
 
 /// The `[node]` table: the node agent on this machine.
@@ -282,6 +285,51 @@ impl Default for NodeConfig {
     }
 }
 
+/// The `[ingress]` table: the reverse proxy, tunnel connector and ACME
+/// settings of the node agent (ADR 0024, 0094, 0096).
+///
+/// The defaults are the production ones, so a node that serves routes needs no
+/// `[ingress]` table. A test lab points `acme_directory_url` at a staging
+/// directory so it never asks the production CA for real certificates.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IngressConfig {
+    /// The `cloudflared` connector. Absent means
+    /// `<cloud_hypervisor.artifacts_dir>/cloudflared`, next to the pinned
+    /// `cloud-hypervisor-static`.
+    pub cloudflared_binary: Option<PathBuf>,
+    /// Loopback `--metrics` address of the connector.
+    pub cloudflared_metrics: SocketAddr,
+    /// ACME directory URL used for `acme` routes.
+    pub acme_directory_url: String,
+    /// ACME account contacts (`mailto:`); may be empty.
+    pub acme_contact: Vec<String>,
+}
+
+impl Default for IngressConfig {
+    fn default() -> Self {
+        Self {
+            cloudflared_binary: None,
+            cloudflared_metrics: quoro_node_agent::DEFAULT_CLOUDFLARED_METRICS
+                .parse()
+                .expect("DEFAULT_CLOUDFLARED_METRICS is a socket address"),
+            acme_directory_url: quoro_node_agent::DEFAULT_ACME_DIRECTORY.to_string(),
+            acme_contact: Vec::new(),
+        }
+    }
+}
+
+impl IngressConfig {
+    /// The connector binary: the configured path, else `cloudflared` under the
+    /// artifacts directory the engine already uses.
+    #[must_use]
+    pub fn cloudflared_binary(&self, artifacts_dir: &Path) -> PathBuf {
+        self.cloudflared_binary
+            .clone()
+            .unwrap_or_else(|| artifacts_dir.join("cloudflared"))
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -292,6 +340,7 @@ impl Default for Config {
             cloud_hypervisor: CloudHypervisorConfig::default(),
             public_url: None,
             node: NodeConfig::default(),
+            ingress: IngressConfig::default(),
         }
     }
 }
@@ -443,6 +492,53 @@ mod tests {
         assert_eq!(parsed.node.data_dir, PathBuf::from("/srv/node"));
         assert!(!parsed.node.local);
         assert!(toml::from_str::<Config>("[node]\nbogus = 1\n").is_err());
+    }
+
+    #[test]
+    fn ingress_defaults_are_the_production_ones_and_follow_the_artifacts_dir() {
+        let config = Config::default();
+        assert_eq!(
+            config
+                .ingress
+                .cloudflared_binary(Path::new(DEFAULT_ARTIFACTS_DIR)),
+            PathBuf::from("/usr/local/lib/quoro/cloudflared")
+        );
+        assert_eq!(
+            config.ingress.cloudflared_metrics.to_string(),
+            quoro_node_agent::DEFAULT_CLOUDFLARED_METRICS
+        );
+        assert_eq!(
+            config.ingress.acme_directory_url,
+            quoro_node_agent::DEFAULT_ACME_DIRECTORY
+        );
+        assert!(config.ingress.acme_contact.is_empty());
+
+        let parsed: Config = toml::from_str(
+            r#"
+[ingress]
+cloudflared_binary = "/opt/quoro/bin/cloudflared"
+cloudflared_metrics = "127.0.0.1:20999"
+acme_directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory"
+acme_contact = ["mailto:ops@example.com"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed
+                .ingress
+                .cloudflared_binary(Path::new(DEFAULT_ARTIFACTS_DIR)),
+            PathBuf::from("/opt/quoro/bin/cloudflared")
+        );
+        assert_eq!(
+            parsed.ingress.cloudflared_metrics.to_string(),
+            "127.0.0.1:20999"
+        );
+        assert_eq!(
+            parsed.ingress.acme_directory_url,
+            "https://acme-staging-v02.api.letsencrypt.org/directory"
+        );
+        assert_eq!(parsed.ingress.acme_contact, ["mailto:ops@example.com"]);
+        assert!(toml::from_str::<Config>("[ingress]\nbogus = 1\n").is_err());
     }
 
     #[test]

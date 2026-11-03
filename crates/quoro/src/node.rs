@@ -39,6 +39,12 @@ fn agent_config(config: &Config) -> AgentConfig {
         bridge: config.cloud_hypervisor.bridge.clone(),
         dns: config.cloud_hypervisor.dns(),
         roles: vec!["node".to_string()],
+        cloudflared_binary: config
+            .ingress
+            .cloudflared_binary(&config.cloud_hypervisor.artifacts_dir),
+        cloudflared_metrics: config.ingress.cloudflared_metrics,
+        acme_directory_url: config.ingress.acme_directory_url.clone(),
+        acme_contact: config.ingress.acme_contact.clone(),
     }
 }
 
