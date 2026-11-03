@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::stream::{SplitSink, SplitStream};
@@ -37,6 +38,7 @@ use tokio_tungstenite::{WebSocketStream, client_async_with_config};
 use tracing::{debug, info, warn};
 
 use crate::identity::{Identity, IdentityHandle};
+use crate::ingress::{DnsBridge, DnsRequest, IngressSupervisor};
 use crate::logs::{LogFilter, StoredLogLine};
 use crate::reconcile::Snapshot;
 use crate::store::NodeStore;
@@ -104,6 +106,25 @@ impl Drop for SessionStreams {
     }
 }
 
+/// Keeps the DNS bridge attached for the life of one session and detaches it
+/// when the session ends, however it ends.
+struct DnsSession {
+    bridge: Arc<DnsBridge>,
+}
+
+impl DnsSession {
+    fn attach(bridge: Arc<DnsBridge>) -> (Self, mpsc::Receiver<DnsRequest>) {
+        let rx = bridge.attach();
+        (Self { bridge }, rx)
+    }
+}
+
+impl Drop for DnsSession {
+    fn drop(&mut self) {
+        self.bridge.detach();
+    }
+}
+
 /// Everything a [`Session`] needs, assembled by [`crate::run`].
 pub struct SessionSetup {
     /// The enrolled identity and its current pin.
@@ -129,6 +150,10 @@ pub struct Session {
     observed: watch::Receiver<Vec<VmStatus>>,
     current: Option<Snapshot>,
     boot_id: String,
+    /// The app-route supervisor (M2 apps), when the agent runs one.
+    ingress: Option<Arc<IngressSupervisor>>,
+    /// The DNS-01 bridge the ingress supervisor's provider sends through.
+    dns: Option<Arc<DnsBridge>>,
 }
 
 impl Session {
@@ -151,7 +176,19 @@ impl Session {
             observed,
             current,
             boot_id: util::hex(&util::random_bytes::<16>()),
+            ingress: None,
+            dns: None,
         }
+    }
+
+    /// Attaches the app-route supervisor: its per-hostname certificate state
+    /// fills `status_report.routes`, and its ACME worker's DNS-01 records go
+    /// out on this session.
+    #[must_use]
+    pub fn with_ingress(mut self, ingress: Arc<IngressSupervisor>, dns: Arc<DnsBridge>) -> Self {
+        self.ingress = Some(ingress);
+        self.dns = Some(dns);
+        self
     }
 
     /// The identity in use.
@@ -259,6 +296,17 @@ impl Session {
         // Stream tasks hand their frames to the session loop, which owns the
         // sink; a task never blocks the loop while it waits for lines.
         let (stream_tx, mut stream_rx) = mpsc::channel::<NodeMessage>(256);
+
+        // The ingress supervisor's ACME worker asks for DNS-01 records through
+        // this session. The guard detaches the bridge on every return path, so
+        // a dropped session fails the next challenge instead of hanging.
+        let (_dns_guard, mut dns_rx) = match &self.dns {
+            Some(bridge) => {
+                let (guard, rx) = DnsSession::attach(Arc::clone(bridge));
+                (Some(guard), Some(rx))
+            }
+            None => (None, None),
+        };
 
         // 1. `hello` is the first message on every session (section 4.2).
         let hello = self.hello().await;
@@ -388,6 +436,24 @@ impl Session {
                         return Ok(SessionEnd::Reconnect);
                     }
                 }
+                challenge = async {
+                    match dns_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(request) = challenge
+                        && let Err(e) = write_message(
+                            &mut sink,
+                            NodeMessage::DnsChallenge(request.challenge),
+                            Some(&request.id),
+                        )
+                        .await
+                    {
+                        warn!(error = %e, "could not send a dns_challenge; reconnecting");
+                        return Ok(SessionEnd::Reconnect);
+                    }
+                }
                 frame = next_frame(&mut source) => {
                     last_rx = Instant::now();
                     match frame {
@@ -487,10 +553,21 @@ impl Session {
             ControlMessage::Ping => {
                 write_message(sink, NodeMessage::Pong, Some(&raw.id)).await?;
             }
-            ControlMessage::Pong
-            | ControlMessage::LogEntries(_)
-            | ControlMessage::DnsChallengeResult(_) => {
+            ControlMessage::Pong | ControlMessage::LogEntries(_) => {
                 // Change-log follow is a follow-up.
+            }
+            ControlMessage::DnsChallengeResult(result) => {
+                let Some(re) = raw.re.as_deref() else {
+                    warn!("dns_challenge_result without re; dropping it");
+                    return Ok(None);
+                };
+                let matched = self
+                    .dns
+                    .as_ref()
+                    .is_some_and(|bridge| bridge.complete(re, result));
+                if !matched {
+                    debug!(re, "dns_challenge_result has no waiting challenge");
+                }
             }
             ControlMessage::StreamClose(close) => {
                 self.on_stream_close(&close, streams, stream_tx).await?;
@@ -909,27 +986,28 @@ impl Session {
     }
 
     fn routes(&self) -> Vec<RouteStatus> {
-        self.current
-            .as_ref()
-            .map(|snapshot| {
-                snapshot
-                    .state
-                    .spec
-                    .routes
-                    .iter()
-                    .map(|route| RouteStatus {
-                        hostname: route.hostname.clone(),
-                        cert_status: if route.tls_mode == "tunnel" {
-                            "not_applicable".to_owned()
-                        } else {
-                            // The reverse proxy and ACME arrive after M2.
-                            "pending".to_owned()
-                        },
-                        cert_expires_at: None,
-                    })
-                    .collect()
+        let Some(snapshot) = self.current.as_ref() else {
+            return Vec::new();
+        };
+        let routes = &snapshot.state.spec.routes;
+        if let Some(ingress) = &self.ingress {
+            return ingress.route_statuses(routes);
+        }
+        // Without a supervisor (tests and the join path) the node reports the
+        // state it would start from: `tunnel` needs no certificate, `acme`
+        // is pending until the public backend issues one.
+        routes
+            .iter()
+            .map(|route| RouteStatus {
+                hostname: route.hostname.clone(),
+                cert_status: if route.tls_mode == "tunnel" {
+                    "not_applicable".to_owned()
+                } else {
+                    "pending".to_owned()
+                },
+                cert_expires_at: None,
             })
-            .unwrap_or_default()
+            .collect()
     }
 
     /// Sends the buffered events after `welcome`, removing each one from the

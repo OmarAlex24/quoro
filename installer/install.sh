@@ -17,6 +17,9 @@
 #      passed. Upstream publishes no signatures for them, so the pins inside
 #      the attested tarball are the integrity anchor: TLS to GitHub -> attested
 #      tarball -> pins.txt -> sha256.
+#   5. The cloudflared connector, the same way and against the same kind of
+#      pins, in ingress-pins.txt: TLS to GitHub -> attested tarball ->
+#      ingress-pins.txt -> sha256 (ADR 0024, ADR 0055).
 #
 # The repository, signer workflow, source ref and GitHub CLI pins are constants
 # on purpose: no environment variable can redirect them. The single, opt-in
@@ -78,6 +81,7 @@ BINARY_CHANGED=0
 UNIT_CHANGED=0
 NODE_UNIT_CHANGED=0
 ENGINE_CHANGED=0
+INGRESS_CHANGED=0
 
 # Where the node agent keeps its identity, local store and engine state. It is a
 # sibling of the control plane's data directory, never inside it, so the two can
@@ -578,6 +582,97 @@ copy_if_pinned() {
     [ "$_actual" = "$3" ]
 }
 
+# Sets MACHINE_ARCH to the architecture name the pins files use.
+resolve_pin_arch() {
+    if ! MACHINE_ARCH=$(uname -m); then
+        die 'could not detect the machine architecture'
+    fi
+    case $MACHINE_ARCH in
+        amd64) MACHINE_ARCH='x86_64' ;;
+    esac
+}
+
+# Rejects a pin line whose file name could escape the staging directory, whose
+# sha256 is not 64 lowercase hex digits, or whose URL is not on the pinned
+# upstream. $1 is the pins file name for the message, $2 the line number, $3 the
+# pinned file, $4 its sha256, $5 its URL and $6 the URL prefix that upstream
+# publishes its releases under.
+validate_pin_fields() {
+    _pin_label=$1
+    _pin_line_no=$2
+    _pin_file=$3
+    _pin_sha=$4
+    _pin_url=$5
+    _pin_url_prefix=$6
+
+    case $_pin_file in
+        '' | . | .. | *[!A-Za-z0-9._-]*)
+            die "$_pin_label line $_pin_line_no: unsafe file name '$_pin_file'"
+            ;;
+    esac
+    if [ "${#_pin_sha}" -ne 64 ]; then
+        die "$_pin_label line $_pin_line_no: sha256 must be 64 lowercase hex digits"
+    fi
+    case $_pin_sha in
+        *[!0-9a-f]*) die "$_pin_label line $_pin_line_no: sha256 must be 64 lowercase hex digits" ;;
+    esac
+    case $_pin_url in
+        "$_pin_url_prefix"*) : ;;
+        *) die "$_pin_label line $_pin_line_no: url must start with $_pin_url_prefix" ;;
+    esac
+}
+
+# Stages one pinned artifact at $1/$2 after checking it against the sha256 in
+# $3. It tries QUORO_INSTALL_FROM first, then the installed /usr/local/lib/quoro,
+# then the URL in $4. A local candidate that does not match is ignored with a
+# warning and the next source is tried; a download that does not match is fatal.
+# $5 and $6 name the artifact and its version for the log. On success the source
+# that matched is left in STAGED_SOURCE. It is a variable and not stdout so a
+# failure dies in this shell rather than in a command substitution.
+stage_pinned_artifact() {
+    _stage_dir=$1
+    _stage_file=$2
+    _stage_sha=$3
+    _stage_url=$4
+    _stage_name=$5
+    _stage_version=$6
+
+    STAGED_SOURCE=''
+    _stage_dest="$_stage_dir/$_stage_file"
+
+    if [ -n "${QUORO_INSTALL_FROM:-}" ]; then
+        if copy_if_pinned "$QUORO_INSTALL_FROM/$_stage_file" "$_stage_dest" "$_stage_sha"; then
+            STAGED_SOURCE="QUORO_INSTALL_FROM=$QUORO_INSTALL_FROM"
+        else
+            rm -f "$_stage_dest"
+            if [ -e "$QUORO_INSTALL_FROM/$_stage_file" ]; then
+                log "warning: $QUORO_INSTALL_FROM/$_stage_file does not match the $_stage_name pin (or is not a regular file); ignoring it"
+            fi
+        fi
+    fi
+
+    if [ -z "$STAGED_SOURCE" ] && [ -e "/usr/local/lib/quoro/$_stage_file" ]; then
+        if copy_if_pinned "/usr/local/lib/quoro/$_stage_file" "$_stage_dest" "$_stage_sha"; then
+            STAGED_SOURCE='the existing /usr/local/lib/quoro'
+        else
+            rm -f "$_stage_dest"
+            log "warning: the installed /usr/local/lib/quoro/$_stage_file does not match the $_stage_name pin (or is not a regular file); ignoring it"
+        fi
+    fi
+
+    if [ -z "$STAGED_SOURCE" ]; then
+        log "downloading $_stage_name $_stage_version from $_stage_url"
+        if ! download "$_stage_url" "$_stage_dest"; then
+            signature_failed "could not download $_stage_file for $_stage_name $_stage_version"
+        fi
+        _stage_actual=$(file_sha256 "$_stage_dest") || signature_failed "could not hash the downloaded $_stage_file"
+        if [ "$_stage_actual" != "$_stage_sha" ]; then
+            signature_failed "$_stage_file did not match its pin (expected $_stage_sha, got $_stage_actual), nothing was installed"
+        fi
+        STAGED_SOURCE=$_stage_url
+    fi
+}
+
 # Reads the sha256 pins shipped in the attested tarball and stages every
 # artifact for this architecture in $WORK_DIR/runtime, verified against its pin.
 # Runs before anything is written outside the temporary directory.
@@ -588,10 +683,8 @@ fetch_engine_runtime() {
     install -d -m 0700 "$_runtime" || die 'could not create the engine runtime staging directory'
     : > "$_list" || die 'could not create the engine runtime list'
 
-    _machine=$(uname -m) || die 'could not detect the machine architecture'
-    case $_machine in
-        amd64) _machine='x86_64' ;;
-    esac
+    resolve_pin_arch
+    _machine=$MACHINE_ARCH
 
     _line_no=0
     _have_hypervisor=0
@@ -607,56 +700,11 @@ fetch_engine_runtime() {
         fi
         [ "$_arch" = "$_machine" ] || continue
 
-        case $_file in
-            '' | . | .. | *[!A-Za-z0-9._-]*)
-                die "pins.txt line $_line_no: unsafe file name '$_file'"
-                ;;
-        esac
-        if [ "${#_sha}" -ne 64 ]; then
-            die "pins.txt line $_line_no: sha256 must be 64 lowercase hex digits"
-        fi
-        case $_sha in
-            *[!0-9a-f]*) die "pins.txt line $_line_no: sha256 must be 64 lowercase hex digits" ;;
-        esac
-        case $_url in
-            https://github.com/cloud-hypervisor/*) : ;;
-            *) die "pins.txt line $_line_no: url must start with https://github.com/cloud-hypervisor/" ;;
-        esac
+        validate_pin_fields 'pins.txt' "$_line_no" "$_file" "$_sha" "$_url" \
+            'https://github.com/cloud-hypervisor/'
 
-        _dest="$_runtime/$_file"
-        _source=''
-
-        if [ -n "${QUORO_INSTALL_FROM:-}" ]; then
-            if copy_if_pinned "$QUORO_INSTALL_FROM/$_file" "$_dest" "$_sha"; then
-                _source="QUORO_INSTALL_FROM=$QUORO_INSTALL_FROM"
-            else
-                rm -f "$_dest"
-                if [ -e "$QUORO_INSTALL_FROM/$_file" ]; then
-                    log "warning: $QUORO_INSTALL_FROM/$_file does not match the $_name pin (or is not a regular file); ignoring it"
-                fi
-            fi
-        fi
-
-        if [ -z "$_source" ] && [ -e "/usr/local/lib/quoro/$_file" ]; then
-            if copy_if_pinned "/usr/local/lib/quoro/$_file" "$_dest" "$_sha"; then
-                _source="the existing /usr/local/lib/quoro"
-            else
-                rm -f "$_dest"
-                log "warning: the installed /usr/local/lib/quoro/$_file does not match the $_name pin (or is not a regular file); ignoring it"
-            fi
-        fi
-
-        if [ -z "$_source" ]; then
-            log "downloading $_name $_version from $_url"
-            if ! download "$_url" "$_dest"; then
-                signature_failed "could not download $_file for $_name $_version"
-            fi
-            _actual=$(file_sha256 "$_dest") || signature_failed "could not hash the downloaded $_file"
-            if [ "$_actual" != "$_sha" ]; then
-                signature_failed "$_file did not match its pin (expected $_sha, got $_actual), nothing was installed"
-            fi
-            _source=$_url
-        fi
+        stage_pinned_artifact "$_runtime" "$_file" "$_sha" "$_url" "$_name" "$_version"
+        _source=$STAGED_SOURCE
 
         log "engine runtime verified: $_name $_version ($_file from $_source, sha256 $_sha)"
         printf '%s %s %s %s\n' "$_name" "$_version" "$_file" "$_sha" >> "$_list" ||
@@ -671,6 +719,60 @@ fetch_engine_runtime() {
     [ "$_have_hypervisor" -ge 1 ] || die "pins.txt has no cloud-hypervisor pin for $_machine"
     [ "$_have_kernel" -ge 1 ] || die "pins.txt has no guest-kernel pin for $_machine"
     log "engine runtime for $_machine is staged and verified"
+}
+
+# Stages the cloudflared connector the node agent runs to serve app hostnames
+# through Cloudflare Tunnel (ADR 0024, ADR 0055), from the ingress pins in the
+# same attested tarball. An older tarball has no ingress pins file: the install
+# then continues without a connector and says so, because the rest of the host
+# is still usable and a node can be updated later.
+fetch_ingress_runtime() {
+    _pins="$ARTIFACT_ROOT/ingress-pins.txt"
+    if [ ! -f "$_pins" ] || [ -h "$_pins" ]; then
+        log "warning: $TARBALL has no ingress-pins.txt (older release); cloudflared is not installed, so the node agent cannot run the Cloudflare Tunnel connector"
+        return 0
+    fi
+
+    _ingress="$WORK_DIR/ingress"
+    _list="$WORK_DIR/ingress.list"
+    install -d -m 0700 "$_ingress" || die 'could not create the connector staging directory'
+    : > "$_list" || die 'could not create the connector list'
+
+    resolve_pin_arch
+    _machine=$MACHINE_ARCH
+
+    _line_no=0
+    _have_connector=0
+
+    while read -r _name _version _arch _file _url _sha _extra; do
+        _line_no=$((_line_no + 1))
+        case $_name in
+            '' | '#'*) continue ;;
+        esac
+        if [ -z "$_sha" ] || [ -n "$_extra" ]; then
+            die "ingress-pins.txt line $_line_no: expected 6 fields (name version arch file url sha256)"
+        fi
+        [ "$_arch" = "$_machine" ] || continue
+        if [ "$_name" != 'cloudflared' ]; then
+            die "ingress-pins.txt line $_line_no: unknown artifact '$_name'; only cloudflared is pinned here"
+        fi
+
+        validate_pin_fields 'ingress-pins.txt' "$_line_no" "$_file" "$_sha" "$_url" \
+            'https://github.com/cloudflare/cloudflared/releases/download/'
+
+        stage_pinned_artifact "$_ingress" "$_file" "$_sha" "$_url" "$_name" "$_version"
+        _source=$STAGED_SOURCE
+
+        log "connector verified: $_name $_version ($_file from $_source, sha256 $_sha)"
+        printf '%s %s %s %s\n' "$_name" "$_version" "$_file" "$_sha" >> "$_list" ||
+            die 'could not record the verified connector'
+
+        _have_connector=$((_have_connector + 1))
+    done < "$_pins"
+
+    [ "$_have_connector" -ge 1 ] ||
+        die "ingress-pins.txt has no cloudflared pin for $_machine"
+    log "cloudflared for $_machine is staged and verified"
 }
 
 # --- Installation -----------------------------------------------------------
@@ -990,6 +1092,45 @@ install_engine_runtime() {
     fi
 }
 
+# Installs the verified connector. The node agent runs it from this exact path,
+# so it gets the fixed name cloudflared whatever the upstream asset is called.
+# An older tarball carried no ingress pins, so an empty list is not an error.
+install_ingress_runtime() {
+    if [ ! -s "$WORK_DIR/ingress.list" ]; then
+        return 0
+    fi
+
+    _lib='/usr/local/lib/quoro'
+    install -d -m 0755 -o root -g root "$_lib" || die "could not create $_lib"
+
+    INGRESS_CHANGED=0
+    while read -r _name _version _file _sha; do
+        [ -n "$_file" ] || die 'malformed entry in the connector list'
+        _src="$WORK_DIR/ingress/$_file"
+        _dst="$_lib/cloudflared"
+
+        # Hash the staged copy again so a file swapped between verification and
+        # installation is still caught.
+        _actual=$(file_sha256 "$_src") || die "could not hash $_src"
+        [ "$_actual" = "$_sha" ] || die "$_file changed since it was verified; refusing to install it"
+
+        _changed=1
+        if [ -f "$_dst" ] && [ ! -h "$_dst" ] && cmp -s "$_src" "$_dst"; then
+            _changed=0
+        fi
+
+        install -m 0755 -o root -g root "$_src" "$_dst.new" || die "could not stage $_dst"
+        mv -f "$_dst.new" "$_dst" || die "could not install $_dst"
+
+        if [ "$_changed" -eq 1 ]; then
+            INGRESS_CHANGED=1
+            log "installed $_dst ($_name $_version)"
+        else
+            log "kept $_dst ($_name $_version, unchanged)"
+        fi
+    done < "$WORK_DIR/ingress.list"
+}
+
 # Installs one unit from the tarball and enables it. $1 is the unit name without
 # its .service suffix; the result is recorded for the start decision below.
 install_unit() {
@@ -1076,14 +1217,15 @@ wait_until_active() {
     die "$_unit failed to start; check the journal: journalctl -u $_unit -n 50 --no-pager"
 }
 
-# Restarts $1 when the binary, the engine runtime or its own unit changed, or
-# when it is not running, then waits for it to stay active. $2 says whether the
-# unit file changed.
+# Restarts $1 when the binary, the engine runtime, the connector or its own unit
+# changed, or when it is not running, then waits for it to stay active. $2 says
+# whether the unit file changed.
 start_unit() {
     _unit=$1
     _unit_changed=$2
 
     if [ "$BINARY_CHANGED" -eq 0 ] && [ "$ENGINE_CHANGED" -eq 0 ] &&
+        [ "$INGRESS_CHANGED" -eq 0 ] &&
         [ "$_unit_changed" -eq 0 ] && systemctl is-active --quiet "$_unit"; then
         log "$_unit already active, left running"
         return 0
@@ -1246,6 +1388,7 @@ main() {
     verify_signature
     extract_artifacts
     fetch_engine_runtime
+    fetch_ingress_runtime
 
     install_host_packages
     install_dirs
@@ -1256,6 +1399,7 @@ main() {
     install_config
     install_binary
     install_engine_runtime
+    install_ingress_runtime
     # Enrollment writes identity files only; it starts nothing, so it also runs
     # with QUORO_NO_START=1. It needs the binary and the config in place.
     if [ "$ROLE" = 'node' ]; then

@@ -274,6 +274,11 @@ init_binary="$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/quoro-init"
 # against these pins, so the engine's pinned versions travel with the release.
 [ -f crates/engine/pins.txt ] ||
 	die "crates/engine/pins.txt is missing; the release needs the engine pins"
+# install.sh stages the cloudflared connector from these pins the same way, so
+# the tunnel binary ships verified against the attested tarball too (ADR 0024,
+# ADR 0055).
+[ -f crates/ingress/pins.txt ] ||
+	die "crates/ingress/pins.txt is missing; the release needs the ingress pins"
 
 name="quoro-$version-x86_64-unknown-linux-musl"
 
@@ -292,6 +297,7 @@ install -m 0644 LICENSE "$stage/$name/LICENSE"
 install -m 0644 packaging/systemd/quoro.service "$stage/$name/quoro.service"
 install -m 0644 packaging/systemd/quoro-node.service "$stage/$name/quoro-node.service"
 install -m 0644 crates/engine/pins.txt "$stage/$name/pins.txt"
+install -m 0644 crates/ingress/pins.txt "$stage/$name/ingress-pins.txt"
 
 # Normalise every staged timestamp, including symlinks and the directory
 # entries themselves, because tar records all of them.
@@ -301,6 +307,7 @@ touch -h -d "@$SOURCE_DATE_EPOCH" "$stage/$name/LICENSE"
 touch -h -d "@$SOURCE_DATE_EPOCH" "$stage/$name/quoro.service"
 touch -h -d "@$SOURCE_DATE_EPOCH" "$stage/$name/quoro-node.service"
 touch -h -d "@$SOURCE_DATE_EPOCH" "$stage/$name/pins.txt"
+touch -h -d "@$SOURCE_DATE_EPOCH" "$stage/$name/ingress-pins.txt"
 touch -h -d "@$SOURCE_DATE_EPOCH" "$stage/$name"
 touch -h -d "@$SOURCE_DATE_EPOCH" "$stage"
 

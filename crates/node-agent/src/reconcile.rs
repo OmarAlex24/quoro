@@ -25,7 +25,9 @@ use quoro_engine::{
     ConsoleMode, Engine, EngineError, EngineEvent, EventStream, ImageConfig, ImageDigest, ImageRef,
     InitConfig, MacAddr, NetAttach, NodeNetwork, StopMode, VmId, VmInfo, VmSpec, VmState,
 };
-use quoro_proto::wire::{DesiredState, DesiredStatus, Health, ObservedStatus, SpecVm, VmStatus};
+use quoro_proto::wire::{
+    DesiredState, DesiredStatus, Health, ObservedStatus, SpecRoute, SpecVm, VmStatus,
+};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
@@ -188,6 +190,9 @@ pub struct Reconciler<E: Engine> {
     node_id: Option<String>,
     spec_meta: HashMap<String, SpecMeta>,
     health: HashMap<String, HealthState>,
+    /// The app-route supervisor, when the agent runs one (worker hook for
+    /// `M2` apps). `None` in tests that only exercise the engine.
+    ingress: Option<Arc<crate::ingress::IngressSupervisor>>,
 }
 
 impl<E: Engine + 'static> Reconciler<E> {
@@ -218,9 +223,18 @@ impl<E: Engine + 'static> Reconciler<E> {
                 node_id: None,
                 spec_meta: HashMap::new(),
                 health: HashMap::new(),
+                ingress: None,
             },
             receiver,
         )
+    }
+
+    /// Attaches the app-route supervisor: every applied snapshot and every
+    /// change of a VM's address feeds it the complete route set.
+    #[must_use]
+    pub fn with_ingress(mut self, ingress: Arc<crate::ingress::IngressSupervisor>) -> Self {
+        self.ingress = Some(ingress);
+        self
     }
 
     /// Sets the `nod_` id node-originated events carry. Without it those
@@ -366,6 +380,17 @@ impl<E: Engine + 'static> Reconciler<E> {
             reached = false;
         }
 
+        // --- ingress hook (M2 apps): step 5 "Routes" of section 6.2 ---
+        // The complete route set goes to the supervisor on every pass, so a
+        // VM that got or changed its address (for example after a VMM restart)
+        // is a backend from the next pass on. The call never blocks: the
+        // supervisor keeps the newest set.
+        if let Some(ingress) = self.ingress.clone() {
+            let addresses = self.ingress_addresses(&spec.routes).await;
+            ingress.update(&spec.routes, spec.ingress.as_ref(), addresses);
+        }
+        // --- end ingress hook ---
+
         if reached
             && snapshot.rev > self.store.applied_rev().await.unwrap_or(0)
             && let Err(e) = self.store.set_applied_rev(snapshot.rev).await
@@ -375,6 +400,27 @@ impl<E: Engine + 'static> Reconciler<E> {
 
         self.health_pass(Some(snapshot)).await;
         self.publish().await
+    }
+
+    /// The observed address of every VM a route lists, for the ingress
+    /// supervisor. A VM with no recorded address is absent; its route is
+    /// retried on the next pass.
+    async fn ingress_addresses(&self, routes: &[SpecRoute]) -> HashMap<String, Ipv4Addr> {
+        let mut addresses = HashMap::new();
+        let mut checked: HashSet<&str> = HashSet::new();
+        for route in routes {
+            for vm_id in &route.vm_ids {
+                if !checked.insert(vm_id.as_str()) {
+                    continue;
+                }
+                if let Ok(Some(record)) = self.store.vm_record(vm_id).await
+                    && let Some(ip) = record.ip
+                {
+                    addresses.insert(vm_id.clone(), ip);
+                }
+            }
+        }
+        addresses
     }
 
     /// Makes one desired VM match its spec. Returns `false` when it has not

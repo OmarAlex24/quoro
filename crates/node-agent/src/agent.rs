@@ -18,6 +18,7 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::identity::IdentityHandle;
+use crate::ingress::{CertificateEvents, DnsBridge, IngressSupervisor};
 use crate::reconcile::{ReconcileConfig, ReconcileOptions, Reconciler, Snapshot};
 use crate::session::{Session, SessionSetup, wait_stop};
 use crate::store::NodeStore;
@@ -45,6 +46,16 @@ pub async fn run<E: Engine + 'static>(
 
     let current = load_verified_snapshot(&identity, &store).await;
 
+    // The ingress supervisor serves the routes of the snapshot. It outlives a
+    // session drop by design: the last applied table keeps serving while the
+    // primary is unreachable (section 6.5).
+    let dns = Arc::new(DnsBridge::new());
+    let ingress = Arc::new(IngressSupervisor::new(
+        config.ingress_config(),
+        Arc::clone(&dns),
+        CertificateEvents::new(store.clone(), Some(identity.get().node_id)),
+    ));
+
     let (desired, desired_rx) = watch::channel(current.clone());
     let (reconciler, observed) = Reconciler::new(
         Arc::new(engine),
@@ -55,7 +66,9 @@ pub async fn run<E: Engine + 'static>(
         },
         ReconcileOptions::default(),
     );
-    let reconciler = reconciler.with_node_id(identity.get().node_id);
+    let reconciler = reconciler
+        .with_node_id(identity.get().node_id)
+        .with_ingress(Arc::clone(&ingress));
 
     let (stop, stop_rx) = watch::channel(false);
     let shutdown_stop = stop.clone();
@@ -72,11 +85,13 @@ pub async fn run<E: Engine + 'static>(
         desired,
         observed,
         current,
-    });
+    })
+    .with_ingress(Arc::clone(&ingress), dns);
     let outcome = session.run(stop_rx).await;
 
     let _ = stop.send(true);
     let _ = reconcile_task.await;
+    ingress.shutdown().await;
     shutdown_task.abort();
     outcome
 }

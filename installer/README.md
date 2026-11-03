@@ -1,8 +1,8 @@
 # Quoro installer
 
 One command installs Quoro on a Linux host: the static binary, the Cloud
-Hypervisor runtime it runs apps on, two systemd units, the data directories and
-the config file.
+Hypervisor runtime it runs apps on, the `cloudflared` connector it serves app
+hostnames through, two systemd units, the data directories and the config file.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/OmarAlex24/quoro/main/installer/install.sh | sudo sh
@@ -117,16 +117,30 @@ without deleting anything; uninstall the control plane first.
    signatures for these artifacts, so the integrity anchor is the chain TLS to
    GitHub → attested tarball → `pins.txt` → sha256, and the engine re-verifies
    the same pins on every start.
+5. **The tunnel connector against its own pins in the tarball.** Nodes behind
+   NAT serve app hostnames through Cloudflare Tunnel, which the node agent runs
+   as a `cloudflared` child process (ADR 0024, ADR 0055). The tarball carries
+   `ingress-pins.txt` (`crates/ingress/pins.txt`) in the same format, one
+   `cloudflared` line per architecture. The installer reads the line for this
+   architecture, requires it to be `cloudflared`, requires its URL to be under
+   `https://github.com/cloudflare/cloudflared/releases/download/`, and stages
+   the file with the same rules as (4): `QUORO_INSTALL_FROM`, then an existing
+   `/usr/local/lib/quoro`, then the pinned URL; a local candidate that does not
+   match is ignored with a warning, a download that does not match is fatal.
+   The integrity chain is the same one: TLS to GitHub → attested tarball →
+   `ingress-pins.txt` → sha256. A tarball from an older release has no
+   `ingress-pins.txt`; the installer then warns and installs without a
+   connector, because only the tunnel needs it.
 
-   The repository, signer workflow, tag ref and GitHub CLI version/sha256 are
-   constants in the script. No environment variable overrides them. The one
-   exception is `QUORO_INSTALL_DRY_RUN_REF`, which replaces only the attested
-   source ref, requires local artifacts and cannot be combined with the insecure
-   flag; it exists so a dry-run build can be verified before a release, and the
-   attestation check is otherwise unchanged. Changing any other constant is a
-   reviewed change (ADR 0027).
+The repository, signer workflow, tag ref and GitHub CLI version/sha256 are
+constants in the script. No environment variable overrides them. The one
+exception is `QUORO_INSTALL_DRY_RUN_REF`, which replaces only the attested
+source ref, requires local artifacts and cannot be combined with the insecure
+flag; it exists so a dry-run build can be verified before a release, and the
+attestation check is otherwise unchanged. Changing any other constant is a
+reviewed change (ADR 0027).
 
-Any failure in (2), (3) or (4) aborts with
+Any failure in (2), (3), (4) or (5) aborts with
 
     signature verification failed, nothing was installed
 
@@ -140,6 +154,7 @@ installed only after every check passed.
 | `/usr/local/bin/quoro` | both | Static binary, mode 0755, replaced atomically via `quoro.new` + `mv`. |
 | `/usr/local/lib/quoro/cloud-hypervisor-static` | both | Cloud Hypervisor, mode 0755, verified against `pins.txt`. |
 | `/usr/local/lib/quoro/vmlinux-x86_64` | both | Guest kernel, mode 0644, verified against `pins.txt`. |
+| `/usr/local/lib/quoro/cloudflared` | both | Cloudflare Tunnel connector, mode 0755, owner `root:root`, verified against `ingress-pins.txt`. The node agent runs it from this exact path for app hostnames (ADR 0024, ADR 0055). |
 | `/usr/local/lib/quoro/quoro-init` | both | PID 1 inside every microVM, mode 0755. |
 | `/etc/systemd/system/quoro-node.service` | both | Unit from `packaging/systemd/quoro-node.service`, mode 0644. Runs as root; stopping it leaves the VMs running. |
 | `/var/lib/quoro-node` | both | Node agent directory, mode 0700, owner `root:root`: `identity.json`, `credential` and the private-key seed (0600), the local store, and the engine state in `engine/`. |
@@ -277,14 +292,16 @@ Re-running the installer is safe:
   edit is the appended `[node]` table when it is missing.
 - The binary, the units and the engine runtime files are compared with `cmp -s`
   before replacement; when unchanged they are reinstalled identically and the
-  services are left running.
+  services are left running. The connector at
+  `/usr/local/lib/quoro/cloudflared` is compared the same way.
 - `/var/lib/quoro-node` is created or confirmed as `root:root` 0700, never
   recreated. `/var/lib/quoro` is the same for `quoro-api:quoro-api` 0700, and
   the ownership change is skipped when the directory already has that owner.
 - A node that is already enrolled is not enrolled again, so no join token is
   needed on a re-run.
 - Each unit is restarted only when the binary changed, its unit changed, an
-  engine runtime file changed, or it is not active; the installer then waits up
+  engine runtime file changed, the connector changed, or it is not active; the
+  installer then waits up
   to 20 s for it to stay active for five consecutive seconds (so a refusal right
   after start is caught) and fails with that unit's
   `journalctl -u <unit> -n 50` hint otherwise. On a primary `quoro.service`

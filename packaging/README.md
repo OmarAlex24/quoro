@@ -29,7 +29,8 @@ quoro-0.1.0-x86_64-unknown-linux-musl/
 ├── LICENSE             0644  AGPL-3.0-only, copied from the repository root
 ├── quoro.service       0644  systemd unit, from packaging/systemd/quoro.service
 ├── quoro-node.service  0644  systemd unit, from packaging/systemd/quoro-node.service
-└── pins.txt            0644  engine pins, copied from crates/engine/pins.txt
+├── pins.txt            0644  engine pins, copied from crates/engine/pins.txt
+└── ingress-pins.txt    0644  tunnel connector pins, copied from crates/ingress/pins.txt
 ```
 
 `quoro.service` is the control plane and `quoro-node.service` the node agent:
@@ -40,6 +41,14 @@ the installer enables the first on a primary and the second on both roles (ADR
 artifacts. `install.sh` reads it, downloads those artifacts and verifies each
 against the sha256 in the file, so the release pins the hypervisor it was tested
 with instead of resolving "latest" at install time.
+
+`ingress-pins.txt` is the same shape (name version arch file url sha256) for the
+`cloudflared` connector the node agent runs to serve app hostnames through
+Cloudflare Tunnel (ADR 0024, ADR 0055), one line per architecture. `install.sh`
+stages it as `/usr/local/lib/quoro/cloudflared` only when the sha256 matches, so
+a tunnel binary is never run that the attested tarball did not pin. It is a
+separate file from `pins.txt` because the two are consumed by different parts of
+the host and bump on their own schedules.
 
 `SHA256SUMS` is `sha256sum` format and covers the tarball only. The
 `.sigstore.jsonl` bundle is the offline copy of the attestation; it is
