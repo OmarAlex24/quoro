@@ -65,7 +65,9 @@ PRAGMA foreign_keys = ON;
 -- ---------------------------------------------------------------------------
 
 -- Keys: schema_version ('1', written below), cluster_id (cls_), cluster_name,
--- term (current election term, 1 until elections exist, D-0016) and created_at.
+-- term (current election term, 1 until elections exist, D-0016), created_at and
+-- webhook_cursor (the seq of the last event the local webhook dispatcher has
+-- dispatched; written by the dispatcher, local like webhook_deliveries, ADR 0140).
 CREATE TABLE meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
