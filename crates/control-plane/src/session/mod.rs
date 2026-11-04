@@ -247,6 +247,10 @@ struct SessionHandle {
     pending: Arc<Mutex<Pending>>,
 }
 
+/// A source of `welcome.primary_urls` (section 5.10). The binary installs one
+/// that enumerates the host's addresses; tests install a fixed list.
+pub type AdvertisedUrls = dyn Fn() -> Vec<String> + Send + Sync;
+
 struct HubInner {
     store: Store,
     config: Arc<ServerConfig>,
@@ -262,6 +266,9 @@ struct HubInner {
     tunnels: Mutex<Option<TunnelKick>>,
     /// Where the Cloudflare clients point (section 5.22, ADR 0094).
     endpoints: Mutex<CloudflareEndpoints>,
+    /// The base URLs other than `public_url` where this primary's listener
+    /// can be reached, handed out in `welcome.primary_urls` (section 5.10).
+    advertised_urls: Mutex<Option<Arc<AdvertisedUrls>>>,
     /// DNS-01 records this primary created, per node: `record_id` to it.
     dns_records: Mutex<HashMap<String, HashMap<String, DnsRecord>>>,
     generation: AtomicU64,
@@ -299,6 +306,7 @@ impl NodeHub {
             vm_nodes: Mutex::new(HashMap::new()),
             tunnels: Mutex::new(None),
             endpoints: Mutex::new(CloudflareEndpoints::production()),
+            advertised_urls: Mutex::new(None),
             dns_records: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
         }))
@@ -363,6 +371,37 @@ impl NodeHub {
     #[must_use]
     pub(crate) fn cloudflare_endpoints(&self) -> CloudflareEndpoints {
         self.0.endpoints.lock().expect("endpoints lock").clone()
+    }
+
+    /// Installs the source of `welcome.primary_urls` (section 5.10).
+    pub(crate) fn set_advertised_urls(&self, provider: Arc<AdvertisedUrls>) {
+        *self.0.advertised_urls.lock().expect("advertised urls lock") = Some(provider);
+    }
+
+    /// The `welcome.primary_urls` this primary hands out: `https://` entries
+    /// only, deduplicated, at most [`wire::MAX_PRIMARY_URLS`] (section 5.10).
+    #[must_use]
+    pub(crate) fn advertised_urls(&self) -> Vec<String> {
+        let provider = self
+            .0
+            .advertised_urls
+            .lock()
+            .expect("advertised urls lock")
+            .clone();
+        let Some(provider) = provider else {
+            return Vec::new();
+        };
+        let mut urls: Vec<String> = Vec::new();
+        for url in provider() {
+            if !url.starts_with("https://") || urls.contains(&url) {
+                continue;
+            }
+            urls.push(url);
+            if urls.len() == wire::MAX_PRIMARY_URLS {
+                break;
+            }
+        }
+        urls
     }
 
     /// Remembers a DNS-01 record this primary created for `node_id`.
@@ -1270,6 +1309,7 @@ impl Session {
                     heartbeat_interval_ms: self.hub.0.config.heartbeat_interval_ms,
                     session_timeout_ms: self.hub.0.config.session_timeout_ms,
                     primary_node_id,
+                    primary_urls: self.hub.advertised_urls(),
                 })
                 .to_frame(&new_msg_id(), Some(&raw.id))
                 .to_text(),

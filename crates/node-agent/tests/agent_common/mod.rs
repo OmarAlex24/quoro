@@ -205,6 +205,7 @@ pub fn identity_files_with_url(
             node_id: "nod_test".to_owned(),
             cluster_id: "cls_test".to_owned(),
             primary_url: primary_url.to_owned(),
+            primary_urls: Vec::new(),
             fingerprint: format!(
                 "sha256:{}",
                 "3f9a1c0e7b52d4a86e1f09c3b7d25e4a90c18f6b2d73e5a41c0b98f7e26d1a35"

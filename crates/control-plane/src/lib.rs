@@ -218,6 +218,18 @@ impl AppState {
         self
     }
 
+    /// Installs the source of the `welcome.primary_urls` list a node receives
+    /// (section 5.10). The binary installs the host's advertised addresses;
+    /// without a provider the list is empty and the field is left off.
+    #[must_use]
+    pub fn with_advertised_urls(
+        self,
+        provider: impl Fn() -> Vec<String> + Send + Sync + 'static,
+    ) -> Self {
+        self.hub.set_advertised_urls(std::sync::Arc::new(provider));
+        self
+    }
+
     /// Tells the session hub that `vm_id` needs reconciling. The rebuild runs
     /// in the background and never blocks the request.
     pub fn notify_driver(&self, vm_id: &str) {

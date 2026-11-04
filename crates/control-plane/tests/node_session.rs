@@ -685,3 +685,37 @@ async fn a_restarted_primary_does_not_keep_nodes_connected() {
     .unwrap();
     assert_eq!(events, 1);
 }
+
+#[tokio::test]
+async fn the_welcome_carries_the_advertised_urls() {
+    let server = start().await;
+    let mut advertised = vec!["http://plain.example:8443".to_string()];
+    advertised.push("https://primary.example:8443".to_string());
+    advertised.push("https://a.example:8443".to_string());
+    advertised.push("https://a.example:8443".to_string());
+    for index in 0..10 {
+        advertised.push(format!("https://h{index}.example:8443"));
+    }
+    // The provider lives on the shared hub, so setting it on a clone reaches
+    // the router that is already serving.
+    let _ = server
+        .state
+        .clone()
+        .with_advertised_urls(move || advertised.clone());
+
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, "node-advertised").await;
+    let mut socket = connect(&server, &node.credential).await;
+    send(&mut socket, hello(&node.node_id)).await;
+    let welcome = recv_type(&mut socket, "welcome").await;
+
+    let urls = welcome["body"]["primary_urls"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no primary_urls: {welcome}"));
+    let expected: Vec<Value> = std::iter::once("https://primary.example:8443".to_string())
+        .chain(std::iter::once("https://a.example:8443".to_string()))
+        .chain((0..6).map(|index| format!("https://h{index}.example:8443")))
+        .map(Value::String)
+        .collect();
+    assert_eq!(urls, &expected, "{welcome}");
+}

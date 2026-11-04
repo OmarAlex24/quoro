@@ -252,6 +252,11 @@ pub struct Session {
     interactive: Option<Interactive>,
     /// The build manager's handle, when the agent runs one.
     builds: Option<BuildsHandle>,
+    /// The URL `dial` used for the current session, set after a successful
+    /// dial and read once `welcome` arrives to promote a fallback address
+    /// (section 5.10). `None` when the session was handed a stream directly
+    /// (tests driving [`Session::serve`]).
+    dialed_url: Option<String>,
 }
 
 impl Session {
@@ -280,6 +285,7 @@ impl Session {
             metrics: None,
             interactive: None,
             builds,
+            dialed_url: None,
         }
     }
 
@@ -329,7 +335,8 @@ impl Session {
             }
             let started = Instant::now();
             match self.dial().await {
-                Ok(ws) => {
+                Ok((ws, url)) => {
+                    self.dialed_url = Some(url);
                     let end = self.serve(ws, wait_stop(stop.clone())).await?;
                     match end {
                         SessionEnd::Shutdown => return Ok(()),
@@ -355,42 +362,38 @@ impl Session {
         }
     }
 
-    /// Opens one connection and upgrades it to the node protocol.
-    async fn dial(&self) -> Result<WebSocketStream<TlsStream<tokio::net::TcpStream>>, AgentError> {
+    /// One redial attempt (section 4.4): dials `primary_url` and, when that
+    /// fails, each URL the primary advertised in `welcome.primary_urls` in
+    /// order, with the same pin and credential and no backoff between them.
+    /// Returns the stream and the URL that accepted it.
+    async fn dial(
+        &self,
+    ) -> Result<(WebSocketStream<TlsStream<tokio::net::TcpStream>>, String), AgentError> {
         let identity = self.identity.get();
         let credential = self.identity.credential()?;
-        let url = session_url(&identity.primary_url)?;
-        let stream = tls::connect(&url, &identity.fingerprint).await?;
-
-        let mut request = url.as_str().into_client_request().map_err(|e| {
-            AgentError::Protocol(format!("could not build the session request: {e}"))
-        })?;
-        let authorization =
-            HeaderValue::from_str(&format!("Bearer {credential}")).map_err(|_| {
-                AgentError::Protocol("the credential is not a valid header value".to_owned())
-            })?;
-        request.headers_mut().insert("authorization", authorization);
-
-        let config = WebSocketConfig::default()
-            .max_message_size(Some(wire::MAX_MESSAGE_BYTES))
-            .max_frame_size(Some(wire::MAX_MESSAGE_BYTES));
-        match client_async_with_config(request, stream, Some(config)).await {
-            Ok((ws, _response)) => Ok(ws),
-            Err(tokio_tungstenite::tungstenite::Error::Http(response))
-                if matches!(response.status().as_u16(), 401 | 403) =>
-            {
-                Err(AgentError::Fatal(FatalReason::Unauthenticated))
+        let mut candidates = Vec::with_capacity(1 + identity.primary_urls.len());
+        candidates.push(identity.primary_url.clone());
+        for url in &identity.primary_urls {
+            if url != &identity.primary_url && !candidates.contains(url) {
+                candidates.push(url.clone());
             }
-            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
-                Err(AgentError::Protocol(format!(
-                    "the primary answered the upgrade with HTTP {}",
-                    response.status()
-                )))
-            }
-            Err(e) => Err(AgentError::Protocol(format!(
-                "the WebSocket upgrade failed: {e}"
-            ))),
         }
+
+        let mut last_error = None;
+        for url in candidates {
+            match dial_one(&url, &credential, &identity.fingerprint).await {
+                Ok(ws) => return Ok((ws, url)),
+                // A `401`/`403` from a host that passed the pin is fatal
+                // wherever it came from; no other address can help.
+                Err(e @ AgentError::Fatal(_)) => return Err(e),
+                Err(e) => {
+                    warn!(url = %url, error = %e, "could not dial this primary address; trying the next");
+                    last_error = Some(e);
+                }
+            }
+        }
+        Err(last_error
+            .unwrap_or_else(|| AgentError::Tls("there is no primary address to dial".to_owned())))
     }
 
     /// Runs one session to its end.
@@ -495,6 +498,35 @@ impl Session {
             term = welcome.term,
             "session established"
         );
+
+        // Section 5.10: a session that reached `welcome` through one of the
+        // advertised URLs becomes the address the node dials from now on, and
+        // every welcome replaces the stored list when it carries one.
+        if let Some(url) = self.dialed_url.take()
+            && url != self.identity.get().primary_url
+        {
+            let old = self.identity.get().primary_url;
+            match self.identity.promote(&url) {
+                Ok(()) => info!(
+                    old = %old,
+                    new = %url,
+                    "following the primary to a new address"
+                ),
+                Err(e) => warn!(error = %e, "could not persist the primary's new address"),
+            }
+        }
+        if !welcome.primary_urls.is_empty() {
+            match self.identity.set_primary_urls(&welcome.primary_urls) {
+                Ok(true) => info!(
+                    count = welcome.primary_urls.len(),
+                    "stored the primary's advertised addresses"
+                ),
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(error = %e, "could not persist the primary's advertised addresses");
+                }
+            }
+        }
 
         // 3. Buffered events go out once the session is up, then are removed
         //    from the buffer (section 6.5).
@@ -1975,6 +2007,47 @@ fn parse_control(text: &str) -> Result<ControlMessage, AgentError> {
     ControlMessage::from_raw(&raw).map_err(|e| AgentError::Protocol(format!("bad message: {e}")))
 }
 
+/// Opens one pinned TLS connection to `base_url` and upgrades it to the node
+/// protocol (section 3.1).
+async fn dial_one(
+    base_url: &str,
+    credential: &str,
+    fingerprint: &str,
+) -> Result<WebSocketStream<TlsStream<tokio::net::TcpStream>>, AgentError> {
+    let url = session_url(base_url)?;
+    let stream = tls::connect(&url, fingerprint).await?;
+
+    let mut request = url
+        .as_str()
+        .into_client_request()
+        .map_err(|e| AgentError::Protocol(format!("could not build the session request: {e}")))?;
+    let authorization = HeaderValue::from_str(&format!("Bearer {credential}")).map_err(|_| {
+        AgentError::Protocol("the credential is not a valid header value".to_owned())
+    })?;
+    request.headers_mut().insert("authorization", authorization);
+
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(wire::MAX_MESSAGE_BYTES))
+        .max_frame_size(Some(wire::MAX_MESSAGE_BYTES));
+    match client_async_with_config(request, stream, Some(config)).await {
+        Ok((ws, _response)) => Ok(ws),
+        Err(tokio_tungstenite::tungstenite::Error::Http(response))
+            if matches!(response.status().as_u16(), 401 | 403) =>
+        {
+            Err(AgentError::Fatal(FatalReason::Unauthenticated))
+        }
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            Err(AgentError::Protocol(format!(
+                "the primary answered the upgrade with HTTP {}",
+                response.status()
+            )))
+        }
+        Err(e) => Err(AgentError::Protocol(format!(
+            "the WebSocket upgrade failed: {e}"
+        ))),
+    }
+}
+
 /// The `wss://host:port/api/v1/nodes/session` URL for a primary base URL.
 ///
 /// # Errors
@@ -2073,6 +2146,7 @@ mod tests {
                 node_id: "nod_test".to_owned(),
                 cluster_id: "cls_test".to_owned(),
                 primary_url: "https://primary.test".to_owned(),
+                primary_urls: Vec::new(),
                 fingerprint: format!(
                     "sha256:{}",
                     "3f9a1c0e7b52d4a86e1f09c3b7d25e4a90c18f6b2d73e5a41c0b98f7e26d1a35"
@@ -2132,6 +2206,7 @@ mod tests {
                 heartbeat_interval_ms: 500,
                 session_timeout_ms: 5_000,
                 primary_node_id: "nod_primary".to_owned(),
+                primary_urls: Vec::new(),
             })
             .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
             .to_text(),
@@ -2876,6 +2951,7 @@ mod tests {
                         heartbeat_interval_ms: 500,
                         session_timeout_ms: 5_000,
                         primary_node_id: "nod_primary".to_owned(),
+                        primary_urls: Vec::new(),
                     })
                     .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
                     .to_text(),

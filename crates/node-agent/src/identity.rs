@@ -42,6 +42,11 @@ pub struct Identity {
     pub cluster_id: String,
     /// Base URL the node dials for this and later sessions.
     pub primary_url: String,
+    /// Other base URLs the primary advertised in `welcome.primary_urls`
+    /// (section 5.10), tried in order when `primary_url` fails to dial.
+    /// Older identity files do not have it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub primary_urls: Vec<String>,
     /// `sha256:<64 hex>` pin of the primary's TLS certificate.
     pub fingerprint: String,
     /// Base64 Ed25519 public key that signs desired state.
@@ -290,6 +295,79 @@ impl IdentityHandle {
         Ok(updated)
     }
 
+    /// Stores the base URLs a `welcome` advertised (section 5.10).
+    ///
+    /// Entries that are not `https://` URLs are dropped, as are duplicates; at
+    /// most `MAX_PRIMARY_URLS` are kept. The entry equal to the current
+    /// [`Identity::primary_url`] is kept too: when `primary_url` is later
+    /// changed to an address that does not answer (by hand, or by
+    /// `quoro node set-primary` to a wrong host that happens to hold the key),
+    /// the address that worked is still in the list. The dial loop skips it
+    /// while it is the primary URL. The file is written only when the result
+    /// differs from the stored list.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Io`] when `identity.json` cannot be written.
+    pub fn set_primary_urls(&self, urls: &[String]) -> Result<bool, AgentError> {
+        let mut identity = self.lock();
+        let mut kept: Vec<String> = Vec::new();
+        for url in urls {
+            let Some(url) = normalize_primary_url(url) else {
+                continue;
+            };
+            if kept.contains(&url) {
+                continue;
+            }
+            kept.push(url);
+            if kept.len() == quoro_proto::wire::MAX_PRIMARY_URLS {
+                break;
+            }
+        }
+        if kept == identity.primary_urls {
+            return Ok(false);
+        }
+        let mut updated = identity.clone();
+        updated.primary_urls = kept;
+        save_identity(&self.data_dir, &updated)?;
+        *identity = updated;
+        Ok(true)
+    }
+
+    /// Makes `url` the address the node dials (section 5.10) after a session
+    /// reached it through `welcome.primary_urls`.
+    ///
+    /// The previous [`Identity::primary_url`] goes to the front of
+    /// `primary_urls`, so the old address is still tried when the new one
+    /// fails; `url` itself leaves the list.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Identity`] when `url` is not an `https://` URL,
+    /// [`AgentError::Io`] when `identity.json` cannot be written.
+    pub fn promote(&self, url: &str) -> Result<(), AgentError> {
+        let url = normalize_primary_url(url)
+            .ok_or_else(|| AgentError::Identity(format!("{url:?} is not an https primary URL")))?;
+        let mut identity = self.lock();
+        if identity.primary_url == url {
+            return Ok(());
+        }
+        let mut urls = Vec::with_capacity(identity.primary_urls.len() + 1);
+        urls.push(identity.primary_url.clone());
+        for stored in &identity.primary_urls {
+            if stored != &url && !urls.contains(stored) {
+                urls.push(stored.clone());
+            }
+        }
+        urls.truncate(quoro_proto::wire::MAX_PRIMARY_URLS);
+        let mut updated = identity.clone();
+        updated.primary_url = url;
+        updated.primary_urls = urls;
+        save_identity(&self.data_dir, &updated)?;
+        *identity = updated;
+        Ok(())
+    }
+
     fn lock(&self) -> MutexGuard<'_, Identity> {
         // A panic before a write could poison the lock; the identity is still
         // complete, so recover rather than propagate.
@@ -297,6 +375,20 @@ impl IdentityHandle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+/// Normalizes one `welcome.primary_urls` entry to an `https://<host>:<port>`
+/// base URL with no path, or `None` when it is not an `https://` URL.
+fn normalize_primary_url(url: &str) -> Option<String> {
+    if !url.starts_with("https://") {
+        return None;
+    }
+    let endpoint = crate::tls::Endpoint::parse(url).ok()?;
+    Some(if endpoint.host.contains(':') {
+        format!("https://[{}]:{}", endpoint.host, endpoint.port)
+    } else {
+        format!("https://{}:{}", endpoint.host, endpoint.port)
+    })
 }
 
 /// The message for a missing identity file, which is the common case on a node
