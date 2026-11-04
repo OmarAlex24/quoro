@@ -21,6 +21,23 @@
 //! masquerade, and the host can still open connections to a VM, because the
 //! ingress runs on the host.
 //!
+//! An egress-only VM (§3.3, ADR 0118) is stricter. Its TAP joins the bridge's
+//! `egress` set, and the tuple of that TAP, its MAC address and the address the
+//! spec assigned joins `egress_addrs`; a bridge-family `prerouting` chain drops
+//! every frame from the TAP that is neither IPv4 nor ARP, drops a frame whose
+//! Ethernet source, ARP sender hardware address, ARP sender address or IPv4
+//! source address is not the VM's own, and marks the rest. The `ip` chains key
+//! on that mark: input accepts DNS to the network's servers and drops
+//! everything else from the VM, and forward drops link-local addresses and the
+//! bridge's own subnet. The mark is set from the bridge port, never from the
+//! source address, because the guest can spoof one inside the subnet; the
+//! address and MAC checks stop it claiming a neighbour's address or MAC. Both
+//! would send host-originated traffic for that neighbour to it: a spoofed
+//! address redirects the neighbour table, and a spoofed Ethernet source moves
+//! the neighbour's MAC to this port in the bridge's forwarding database, which
+//! the frame reaches only after the bridge `prerouting` hook, so dropping the
+//! frame there stops the bridge from learning it.
+//!
 //! The bridge is never reconfigured silently: an existing bridge that does not
 //! carry exactly the requested gateway address is `Conflict`
 //! (engine-trait.md section 3.3).
@@ -33,7 +50,7 @@ use sha2::{Digest, Sha256};
 
 use crate::EngineError;
 use crate::ch::tools::{self, HostTools};
-use crate::{NodeNetwork, VmId};
+use crate::{MacAddr, NodeNetwork, VmId};
 
 /// Where Linux exposes one directory per network interface.
 const SYS_CLASS_NET: &str = "/sys/class/net";
@@ -41,6 +58,14 @@ const SYS_CLASS_NET: &str = "/sys/class/net";
 /// The packet mark the bridge chain sets on a same-group frame, so the `ip`
 /// `forward` chain lets it through when `br_netfilter` is loaded.
 pub const PEER_MARK: u32 = 0x5155_0084;
+
+/// The packet mark the bridge chain sets on a frame from an egress-only VM
+/// (engine-trait.md section 3.3). The `ip` chains key on it, never on the
+/// source address: the guest can spoof an address inside the subnet.
+pub const EGRESS_MARK: u32 = 0x5155_0088;
+
+/// The link-local range no egress-only VM may reach.
+const LINK_LOCAL: &str = "169.254.0.0/16";
 
 /// The forwarding switch the bridge needs to route between its own ports and
 /// the node's uplink.
@@ -172,7 +197,12 @@ pub async fn ensure_network(tools: &HostTools, net: &NodeNetwork) -> Result<Subn
     tokio::fs::write(IP_FORWARD, "1")
         .await
         .map_err(|err| EngineError::Io(format!("{IP_FORWARD}: {err}")))?;
-    tools::run_with_stdin(&tools.nft, &["-f", "-"], &ruleset(bridge, &subnet)).await?;
+    tools::run_with_stdin(
+        &tools.nft,
+        &["-f", "-"],
+        &ruleset(bridge, &subnet, &net.dns),
+    )
+    .await?;
     Ok(subnet)
 }
 
@@ -181,8 +211,11 @@ pub async fn ensure_network(tools: &HostTools, net: &NodeNetwork) -> Result<Subn
 /// The first two lines declare and then delete the table, so applying the file
 /// replaces Quoro's rules for this bridge in one transaction instead of
 /// stacking duplicates. A bridge added later starts from an empty table.
+///
+/// `dns` is the `NodeNetwork::dns` list: the only host addresses an egress-only
+/// VM reaches, on port 53.
 #[must_use]
-pub fn ruleset(bridge: &str, subnet: &Subnet) -> String {
+pub fn ruleset(bridge: &str, subnet: &Subnet, dns: &[Ipv4Addr]) -> String {
     let table = table_name(bridge);
     let mut rules = String::with_capacity(1024);
     let _ = writeln!(rules, "table ip {table} {{}}");
@@ -205,6 +238,14 @@ pub fn ruleset(bridge: &str, subnet: &Subnet) -> String {
         rules,
         "        iifname \"{bridge}\" ip saddr != {subnet} drop"
     );
+    let _ = writeln!(
+        rules,
+        "        iifname \"{bridge}\" meta mark {EGRESS_MARK:#010x} ip daddr {LINK_LOCAL} drop"
+    );
+    let _ = writeln!(
+        rules,
+        "        iifname \"{bridge}\" meta mark {EGRESS_MARK:#010x} ip daddr {subnet} drop"
+    );
     let _ = writeln!(rules, "        iifname \"{bridge}\" accept");
     let _ = writeln!(
         rules,
@@ -220,6 +261,25 @@ pub fn ruleset(bridge: &str, subnet: &Subnet) -> String {
     let _ = writeln!(
         rules,
         "        iifname \"{bridge}\" ct state established,related accept"
+    );
+    if !dns.is_empty() {
+        let servers = dns
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        for protocol in ["udp", "tcp"] {
+            let _ = writeln!(
+                rules,
+                "        iifname \"{bridge}\" meta mark {EGRESS_MARK:#010x} ip daddr {{ {servers} }} {protocol} dport 53 accept"
+            );
+        }
+    }
+    // A marked packet that got this far is not DNS to a configured server; it
+    // may not reach the host, ICMP included.
+    let _ = writeln!(
+        rules,
+        "        iifname \"{bridge}\" meta mark {EGRESS_MARK:#010x} drop"
     );
     let _ = writeln!(
         rules,
@@ -243,6 +303,41 @@ pub fn ruleset(bridge: &str, subnet: &Subnet) -> String {
     let _ = writeln!(rules, "table bridge {table} {{");
     let _ = writeln!(rules, "    set peers {{");
     let _ = writeln!(rules, "        type ifname . ifname");
+    let _ = writeln!(rules, "    }}");
+    let _ = writeln!(rules, "    set egress {{");
+    let _ = writeln!(rules, "        type ifname");
+    let _ = writeln!(rules, "    }}");
+    let _ = writeln!(rules, "    set egress_addrs {{");
+    let _ = writeln!(rules, "        type ifname . ether_addr . ipv4_addr");
+    let _ = writeln!(rules, "    }}");
+    let _ = writeln!(rules, "    chain prerouting {{");
+    let _ = writeln!(
+        rules,
+        "        type filter hook prerouting priority filter; policy accept;"
+    );
+    let _ = writeln!(
+        rules,
+        "        meta ibrname \"{bridge}\" iifname @egress ether type != ip ether type != arp drop"
+    );
+    // An egress-only VM may only speak for the address and the MAC its spec
+    // assigned: a spoofed ARP, Ethernet source or source address would make
+    // the host send a neighbour's traffic to it.
+    let _ = writeln!(
+        rules,
+        "        meta ibrname \"{bridge}\" iifname @egress ether type arp iifname . ether saddr . arp saddr ip != @egress_addrs drop"
+    );
+    let _ = writeln!(
+        rules,
+        "        meta ibrname \"{bridge}\" iifname @egress ether type arp iifname . arp saddr ether . arp saddr ip != @egress_addrs drop"
+    );
+    let _ = writeln!(
+        rules,
+        "        meta ibrname \"{bridge}\" iifname @egress ether type ip iifname . ether saddr . ip saddr != @egress_addrs drop"
+    );
+    let _ = writeln!(
+        rules,
+        "        meta ibrname \"{bridge}\" iifname @egress meta mark set {EGRESS_MARK:#010x}"
+    );
     let _ = writeln!(rules, "    }}");
     let _ = writeln!(rules, "    chain forward {{");
     let _ = writeln!(
@@ -314,6 +409,67 @@ pub async fn sync_peers(
     }
     tools::run_with_stdin(&tools.nft, &["-f", "-"], &peers_script(bridge, pairs)).await?;
     Ok(())
+}
+
+/// The `nft -f -` script that replaces the bridge's `egress` and
+/// `egress_addrs` sets with `entries`, in one transaction.
+///
+/// `entries` is `(tap, mac, ip)` for every egress-only VM on the bridge: the
+/// TAP joins `egress`, which the mark rule reads, and the tuple joins
+/// `egress_addrs`, which the address and MAC checks read.
+#[must_use]
+pub fn egress_script(bridge: &str, entries: &[(String, MacAddr, Ipv4Addr)]) -> String {
+    let table = table_name(bridge);
+    let mut script =
+        format!("flush set bridge {table} egress\nflush set bridge {table} egress_addrs\n");
+    if !entries.is_empty() {
+        let taps = entries
+            .iter()
+            .map(|(tap, _, _)| format!("\"{tap}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(script, "add element bridge {table} egress {{ {taps} }}");
+        let tuples = entries
+            .iter()
+            .map(|(tap, mac, ip)| format!("\"{tap}\" . {} . {ip}", mac_text(*mac)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(
+            script,
+            "add element bridge {table} egress_addrs {{ {tuples} }}"
+        );
+    }
+    script
+}
+
+/// Replaces the bridge's `egress` and `egress_addrs` sets: the TAPs of
+/// egress-only VMs, with their assigned addresses and MAC addresses (§3.3).
+///
+/// The MAC comes from [`MacAddr`], so every element is written from bytes and
+/// nothing unvalidated reaches `nft`.
+///
+/// # Errors
+///
+/// `Conflict` for a malformed bridge or TAP name (they are written into the
+/// script), `Io`/`Timeout` when `nft` fails.
+pub async fn sync_egress(
+    tools: &HostTools,
+    bridge: &str,
+    entries: &[(String, MacAddr, Ipv4Addr)],
+) -> Result<(), EngineError> {
+    validate_bridge_name(bridge)?;
+    for (tap, _, _) in entries {
+        validate_bridge_name(tap)?;
+    }
+    tools::run_with_stdin(&tools.nft, &["-f", "-"], &egress_script(bridge, entries)).await?;
+    Ok(())
+}
+
+/// A MAC address the way `nft` writes an `ether_addr` element,
+/// `02:00:00:00:00:01`.
+fn mac_text(mac: MacAddr) -> String {
+    let [a, b, c, d, e, f] = mac.0;
+    format!("{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}")
 }
 
 /// The nftables table that holds one bridge's rules.
@@ -631,6 +787,8 @@ table ip quoro_qw5br0 {
         iifname \"qw5br0\" oifname \"qw5br0\" meta mark 0x51550084 accept
         iifname \"qw5br0\" oifname \"qw5br0\" drop
         iifname \"qw5br0\" ip saddr != 10.99.5.0/24 drop
+        iifname \"qw5br0\" meta mark 0x51550088 ip daddr 169.254.0.0/16 drop
+        iifname \"qw5br0\" meta mark 0x51550088 ip daddr 10.99.5.0/24 drop
         iifname \"qw5br0\" accept
         oifname \"qw5br0\" ct state established,related accept
         oifname \"qw5br0\" drop
@@ -638,6 +796,7 @@ table ip quoro_qw5br0 {
     chain input {
         type filter hook input priority filter - 1; policy accept;
         iifname \"qw5br0\" ct state established,related accept
+        iifname \"qw5br0\" meta mark 0x51550088 drop
         iifname \"qw5br0\" ip protocol icmp accept
         iifname \"qw5br0\" drop
     }
@@ -652,6 +811,20 @@ table bridge quoro_qw5br0 {
     set peers {
         type ifname . ifname
     }
+    set egress {
+        type ifname
+    }
+    set egress_addrs {
+        type ifname . ether_addr . ipv4_addr
+    }
+    chain prerouting {
+        type filter hook prerouting priority filter; policy accept;
+        meta ibrname \"qw5br0\" iifname @egress ether type != ip ether type != arp drop
+        meta ibrname \"qw5br0\" iifname @egress ether type arp iifname . ether saddr . arp saddr ip != @egress_addrs drop
+        meta ibrname \"qw5br0\" iifname @egress ether type arp iifname . arp saddr ether . arp saddr ip != @egress_addrs drop
+        meta ibrname \"qw5br0\" iifname @egress ether type ip iifname . ether saddr . ip saddr != @egress_addrs drop
+        meta ibrname \"qw5br0\" iifname @egress meta mark set 0x51550088
+    }
     chain forward {
         type filter hook forward priority filter; policy accept;
         meta ibrname \"qw5br0\" iifname . oifname @peers meta mark set 0x51550084 accept
@@ -659,7 +832,20 @@ table bridge quoro_qw5br0 {
     }
 }
 ";
-        assert_eq!(ruleset("qw5br0", &subnet("10.99.5.0/24")), expected);
+        assert_eq!(ruleset("qw5br0", &subnet("10.99.5.0/24"), &[]), expected);
+    }
+
+    #[test]
+    fn ruleset_accepts_dns_to_each_configured_server_only() {
+        let dns = [Ipv4Addr::new(10, 99, 5, 1), Ipv4Addr::new(1, 1, 1, 1)];
+        let rules = ruleset("qw5br0", &subnet("10.99.5.0/24"), &dns);
+        let udp = "        iifname \"qw5br0\" meta mark 0x51550088 ip daddr { 10.99.5.1, 1.1.1.1 } udp dport 53 accept";
+        let tcp = "        iifname \"qw5br0\" meta mark 0x51550088 ip daddr { 10.99.5.1, 1.1.1.1 } tcp dport 53 accept";
+        assert!(rules.contains(udp), "{rules}");
+        assert!(rules.contains(tcp), "{rules}");
+        let drop = "        iifname \"qw5br0\" meta mark 0x51550088 drop";
+        assert!(rules.find(udp) < rules.find(drop), "{rules}");
+        assert!(rules.find(tcp) < rules.find(drop), "{rules}");
     }
 
     #[test]
@@ -701,8 +887,38 @@ table bridge quoro_qw5br0 {
     }
 
     #[test]
+    fn egress_script_flushes_then_adds_the_taps_addresses_and_macs() {
+        assert_eq!(
+            egress_script("qw5br0", &[]),
+            "flush set bridge quoro_qw5br0 egress\n\
+             flush set bridge quoro_qw5br0 egress_addrs\n"
+        );
+        assert_eq!(
+            egress_script(
+                "qw5br0",
+                &[
+                    (
+                        "qta".to_string(),
+                        MacAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]),
+                        Ipv4Addr::new(10, 99, 5, 7),
+                    ),
+                    (
+                        "qtb".to_string(),
+                        MacAddr([0x02, 0x1a, 0x2b, 0x3c, 0x4d, 0xef]),
+                        Ipv4Addr::new(10, 99, 5, 8),
+                    ),
+                ]
+            ),
+            "flush set bridge quoro_qw5br0 egress\n\
+             flush set bridge quoro_qw5br0 egress_addrs\n\
+             add element bridge quoro_qw5br0 egress { \"qta\", \"qtb\" }\n\
+             add element bridge quoro_qw5br0 egress_addrs { \"qta\" . 02:00:00:00:00:01 . 10.99.5.7, \"qtb\" . 02:1a:2b:3c:4d:ef . 10.99.5.8 }\n"
+        );
+    }
+
+    #[test]
     fn ruleset_table_name_flattens_dashes() {
-        let rules = ruleset("quoro-br-1", &subnet("10.99.5.0/24"));
+        let rules = ruleset("quoro-br-1", &subnet("10.99.5.0/24"), &[]);
         assert!(
             rules.starts_with("table ip quoro_quoro_br_1 {}\n"),
             "{rules}"

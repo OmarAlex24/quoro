@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use quoro_engine::ch::net::{self, tap_name};
 use quoro_engine::ch::state::{self, VmmRecord};
-use quoro_engine::ch::tools::HostTools;
+use quoro_engine::ch::tools::{self, HostTools};
 use quoro_engine::ch::{ChConfig, ChEngine};
 use quoro_engine::{
     ByteStream, ConsoleMode, Engine, EngineError, EngineEvent, ExecRequest, ImageDigest, ImageRef,
@@ -160,6 +160,20 @@ async fn prepare(engine: &ChEngine) -> ImageDigest {
 /// The runtime directory of one VM.
 fn vm_dir(id: &VmId) -> PathBuf {
     state_dir().join("vms").join(&id.0)
+}
+
+/// What `nft list set` prints for one set of the lab bridge's table, with
+/// whitespace runs collapsed to one space so a wrapped element list still
+/// matches.
+///
+/// The table name follows the ruleset's rule: `quoro_` plus the bridge with
+/// dashes flattened.
+async fn listed_set(tools: &HostTools, set: &str) -> String {
+    let table = format!("quoro_{}", BRIDGE.replace('-', "_"));
+    let text = tools::run(&tools.nft, &["list", "set", "bridge", &table, set])
+        .await
+        .unwrap_or_else(|err| panic!("nft list set {set}: {err}"));
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The console socket of one VM, under the state directory.
@@ -627,6 +641,145 @@ async fn rediscovery_after_engine_restart() {
     assert_no_leftovers(&id);
 
     let tools = HostTools::discover().expect("host tools");
+    net::remove_network(&tools, BRIDGE)
+        .await
+        .expect("remove the network");
+}
+
+#[tokio::test]
+#[ignore = "needs /dev/kvm, root and the pinned artifacts on the lab host"]
+async fn egress_only_vm_reaches_only_the_outside() {
+    if !enter_lab() {
+        return;
+    }
+    let _guard = Guard::new();
+    let engine = new_engine().await;
+    let rootfs = prepare(&engine).await;
+
+    let peer_ip = "10.77.0.11";
+    let link_local = "169.254.169.254";
+    let outside = "1.1.1.1";
+    let dns = network().dns;
+    let dns_app = match dns.first() {
+        Some(server) => format!(
+            "if nslookup example.com {server} >/dev/null 2>&1; then \
+                echo egress-dns-ok; else echo egress-dns-blocked; fi\n"
+        ),
+        None => String::new(),
+    };
+
+    // A listener on the gateway address: an egress-only VM may not reach it,
+    // whatever port it uses.
+    let listener =
+        tokio::net::TcpListener::bind((GATEWAY.parse::<Ipv4Addr>().expect("gateway"), 0))
+            .await
+            .expect("bind a listener on the gateway");
+    let port = listener.local_addr().expect("listener address").port();
+
+    let app = format!(
+        "if ping -c 1 -W 2 {peer_ip} >/dev/null 2>&1; then echo egress-peer-reachable; \
+            else echo egress-peer-blocked; fi\n\
+         if nc -w 2 {GATEWAY} {port} </dev/null >/dev/null 2>&1; then echo egress-gateway-reachable; \
+            else echo egress-gateway-blocked; fi\n\
+         if ping -c 1 -W 2 {link_local} >/dev/null 2>&1; then echo egress-link-local-reachable; \
+            else echo egress-link-local-blocked; fi\n\
+         {dns_app}\
+         if nc -w 5 {outside} 443 </dev/null >/dev/null 2>&1; then echo egress-outside-ok; \
+            else echo egress-outside-blocked; fi\n\
+         echo egress-done; sleep 60"
+    );
+
+    let peer = VmId("vm_w7b_egress_peer".to_string());
+    let builder = VmId("vm_w7b_egress".to_string());
+    let peer_spec = lab_spec(&peer, &rootfs, ConsoleMode::Off, peer_ip, "sleep 120", 21);
+    let mut builder_spec = console_spec(&builder, &rootfs, "10.77.0.10", &app, 20);
+    builder_spec.net.egress_only = true;
+    assert!(builder_spec.net.isolation_group.is_none());
+
+    engine.create(&peer_spec).await.expect("create the peer");
+    engine
+        .create(&builder_spec)
+        .await
+        .expect("create the builder");
+
+    // The anti-spoofing sets name the builder's TAP with the one address and
+    // MAC its spec assigned, so a frame from it claiming another address or
+    // MAC is dropped before the bridge learns it.
+    let tools = HostTools::discover().expect("host tools");
+    let tap = tap_name(&builder);
+    let addrs = listed_set(&tools, "egress_addrs").await;
+    // The lab spec above gave the builder the MAC `02:00:00:00:77:14` (seed 20).
+    assert!(
+        addrs.contains(&format!("\"{tap}\" . 02:00:00:00:77:14 . 10.77.0.10")),
+        "the egress address set does not hold the builder's tuple: {addrs}"
+    );
+    let taps = listed_set(&tools, "egress").await;
+    assert!(
+        taps.contains(&format!("\"{tap}\"")),
+        "the egress set does not hold the builder's TAP: {taps}"
+    );
+
+    start_vm(&engine, &peer).await;
+    start_vm(&engine, &builder).await;
+
+    let mut output = engine.output(&builder).expect("open the builder's output");
+    let peer_line = read_output(&mut output, "egress-peer-", Duration::from_secs(60)).await;
+    assert_eq!(
+        peer_line.line, "egress-peer-blocked",
+        "an egress-only VM reached another VM"
+    );
+    let gateway_line = read_output(&mut output, "egress-gateway-", Duration::from_secs(30)).await;
+    assert_eq!(
+        gateway_line.line, "egress-gateway-blocked",
+        "an egress-only VM reached a host port"
+    );
+    let link_local_line =
+        read_output(&mut output, "egress-link-local-", Duration::from_secs(30)).await;
+    assert_eq!(
+        link_local_line.line, "egress-link-local-blocked",
+        "an egress-only VM reached 169.254.0.0/16"
+    );
+    if !dns.is_empty() {
+        let dns_line = read_output(&mut output, "egress-dns-", Duration::from_secs(60)).await;
+        assert_eq!(
+            dns_line.line, "egress-dns-ok",
+            "an egress-only VM could not query its configured DNS server"
+        );
+    }
+    let outside_line = read_output(&mut output, "egress-outside-", Duration::from_secs(60)).await;
+    assert_eq!(
+        outside_line.line, "egress-outside-ok",
+        "an egress-only VM could not reach the outside"
+    );
+    read_output(&mut output, "egress-done", Duration::from_secs(30)).await;
+    drop(output);
+    drop(listener);
+
+    engine
+        .stop(&builder, StopMode::Force)
+        .await
+        .expect("stop the builder");
+    engine
+        .stop(&peer, StopMode::Force)
+        .await
+        .expect("stop the peer");
+    engine.delete(&builder).await.expect("delete the builder");
+    engine.delete(&peer).await.expect("delete the peer");
+    assert_no_leftovers(&builder);
+    assert_no_leftovers(&peer);
+
+    // Deleting the builder took its address back out of both sets.
+    let addrs = listed_set(&tools, "egress_addrs").await;
+    assert!(
+        !addrs.contains("elements") && !addrs.contains(&tap),
+        "the egress address set still holds a deleted VM: {addrs}"
+    );
+    let taps = listed_set(&tools, "egress").await;
+    assert!(
+        !taps.contains("elements") && !taps.contains(&tap),
+        "the egress set still holds a deleted VM: {taps}"
+    );
+
     net::remove_network(&tools, BRIDGE)
         .await
         .expect("remove the network");

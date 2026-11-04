@@ -14,7 +14,7 @@ use rustix::io::Errno;
 use rustix::mount::{MountFlags, mount, mount_move};
 use rustix::process::{chdir, chroot};
 
-use crate::guest::Fault;
+use crate::guest::{Fault, diag};
 
 /// Mount a filesystem. `data` is the comma-separated option string, when the
 /// filesystem takes one. `EBUSY` means it is already mounted, which the boot
@@ -118,8 +118,8 @@ pub(crate) fn switch_root() -> Result<(), Fault> {
     Ok(())
 }
 
-/// Steps 5: the pseudo-filesystems and the `/dev` symlinks the app expects,
-/// created only where the image has a place for them.
+/// Steps 5: the pseudo-filesystems, the `/dev` symlinks the app expects, and
+/// the cgroup hierarchy, created only where the image has a place for them.
 pub(crate) fn mount_late() -> Result<(), Fault> {
     make_dir("/dev/pts", 0o755)?;
     mount_fs(
@@ -151,6 +151,8 @@ pub(crate) fn mount_late() -> Result<(), Fault> {
         )?;
     }
 
+    mount_cgroup2();
+
     if !Path::new("/tmp").exists() {
         make_dir("/tmp", 0o1777)?;
     }
@@ -168,4 +170,24 @@ pub(crate) fn mount_late() -> Result<(), Fault> {
     }
 
     Ok(())
+}
+
+/// `cgroup2` on `/sys/fs/cgroup`, when the image has that directory.
+///
+/// BuildKit needs a cgroup hierarchy and app images may expect one, but no app
+/// depends on it to boot: an old kernel without cgroup v2, an image that mounts
+/// something of its own there, or a missing directory is a diagnostic line, not
+/// a boot failure.
+fn mount_cgroup2() {
+    let target = "/sys/fs/cgroup";
+    if !Path::new(target).is_dir() {
+        diag::log("cgroup2: no /sys/fs/cgroup directory in the image; not mounted");
+        return;
+    }
+    let flags = MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC;
+    match mount_fs("cgroup2", target, "cgroup2", flags, None) {
+        Ok(()) => diag::log("cgroup2: mounted on /sys/fs/cgroup"),
+        // `mount_fs` treats `EBUSY` as success, so this is a real failure.
+        Err(fault) => diag::log(&format!("cgroup2: {}", fault.message)),
+    }
 }

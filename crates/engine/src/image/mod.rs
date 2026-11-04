@@ -30,6 +30,7 @@ use crate::{EngineError, ImageDigest, ImageRef, PreparedImage};
 pub(crate) mod cache;
 pub(crate) mod ext4;
 pub(crate) mod layer;
+pub(crate) mod layout;
 pub(crate) mod oci;
 pub(crate) mod registry;
 
@@ -190,18 +191,33 @@ async fn convert(
     tmp: &Path,
 ) -> Result<(), EngineError> {
     let blobs = tmp.join("blobs");
-    let staging = tmp.join("staging");
     tokio::fs::create_dir_all(&blobs)
         .await
         .map_err(|err| io_error(&blobs, &err))?;
+
+    let pulled = registry::pull(image, &blobs).await?;
+    finalize(config, image, &pulled.config, pulled.layers, tmp).await
+}
+
+/// The shared tail of every conversion: apply `layers` to a staging tree,
+/// build the ext4 root disk, write `image.json` and drop the scratch data.
+///
+/// `tmp` holds the layer blobs under `tmp/blobs` and becomes the cache entry,
+/// so the caller only has to have produced the blobs and their `diff_ids`.
+pub(crate) async fn finalize(
+    config: &ImageStoreConfig,
+    image: &ImageRef,
+    image_config: &crate::ImageConfig,
+    layers: Vec<registry::PulledLayer>,
+    tmp: &Path,
+) -> Result<(), EngineError> {
+    let staging = tmp.join("staging");
     tokio::fs::create_dir_all(&staging)
         .await
         .map_err(|err| io_error(&staging, &err))?;
 
-    let pulled = registry::pull(image, &blobs).await?;
-
     let mut stats = layer::LayerStats::default();
-    for (index, blob) in pulled.layers.iter().enumerate() {
+    for (index, blob) in layers.iter().enumerate() {
         let root = staging.clone();
         let path = blob.path.clone();
         let diff_id = blob.diff_id.clone();
@@ -224,11 +240,11 @@ async fn convert(
         .await
         .map_err(|err| EngineError::Io(format!("ext4 build task failed: {err}")))??;
 
-    cache::write_entry(tmp, image, &pulled.config, size_bytes)?;
+    cache::write_entry(tmp, image, image_config, size_bytes)?;
 
     // Only the finished artifacts remain before the rename.
     remove_dir(&staging).await;
-    remove_dir(&blobs).await;
+    remove_dir(&tmp.join("blobs")).await;
     Ok(())
 }
 

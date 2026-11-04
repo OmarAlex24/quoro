@@ -6,8 +6,8 @@ mod common;
 use std::time::Duration;
 
 use quoro_engine::{
-    Engine, EngineError, EngineEvent, FakeEngine, FakeOp, NodeNetwork, OutputStream, StopMode,
-    VmCounters, VmId, VmState, VolumeId,
+    Engine, EngineError, EngineEvent, FakeEngine, FakeOp, ImageDigest, NodeNetwork, OciLayout,
+    OutputStream, StopMode, VmCounters, VmId, VmState, VolumeId, WorkDisk,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -594,4 +594,118 @@ async fn next_bytes(stream: &mut quoro_engine::ByteStream) -> Vec<u8> {
     std::future::poll_fn(|cx| stream.as_mut().poll_next(cx))
         .await
         .expect("a chunk")
+}
+
+/// A temporary file that stands in for a builder's OCI layout.
+fn layout_file(label: &str) -> std::path::PathBuf {
+    let path =
+        std::env::temp_dir().join(format!("quoro-fake-layout-{label}-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    path
+}
+
+fn layout(path: std::path::PathBuf, digest: &str) -> OciLayout {
+    OciLayout {
+        path,
+        manifest_digest: ImageDigest(digest.to_string()),
+    }
+}
+
+const LAYOUT_DIGEST: &str =
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+
+#[tokio::test]
+async fn prepare_layout_caches_by_manifest_digest() {
+    let engine = FakeEngine::new();
+    let path = layout_file("cached");
+    let request = layout(path.clone(), LAYOUT_DIGEST);
+
+    assert!(
+        matches!(
+            engine.prepare_layout(&request).await,
+            Err(EngineError::Image(_))
+        ),
+        "a missing layout is an image error"
+    );
+
+    std::fs::write(&path, b"layout").expect("layout file");
+    let prepared = engine
+        .prepare_layout(&request)
+        .await
+        .expect("prepare a layout that exists");
+    assert_eq!(prepared.digest, ImageDigest(LAYOUT_DIGEST.to_string()));
+
+    std::fs::remove_file(&path).expect("remove the layout");
+    let cached = engine
+        .prepare_layout(&request)
+        .await
+        .expect("a cached digest does not need the layout");
+    assert_eq!(cached, prepared);
+}
+
+fn work_disk(path: &str, size_gb: u32, serial: &str) -> WorkDisk {
+    WorkDisk {
+        path: std::path::PathBuf::from(path),
+        size_gb,
+        serial: serial.to_string(),
+    }
+}
+
+#[tokio::test]
+async fn create_records_work_disks_and_refuses_a_shared_path() {
+    let engine = FakeEngine::new();
+    let prepared = engine
+        .prepare_image(&common::image_ref())
+        .await
+        .expect("prepare_image succeeds");
+
+    let mut first = common::sample_spec(&prepared.digest, "vm_work_a");
+    first.work_disks = vec![work_disk("/var/lib/quoro/work/a.img", 8, "quoro-work")];
+    engine.create(&first).await.expect("create A");
+
+    let mut same = first.clone();
+    same.work_disks[0].size_gb = 9;
+    assert!(
+        matches!(engine.create(&same).await, Err(EngineError::Conflict(_))),
+        "work_disks are part of the spec"
+    );
+
+    let mut second = common::sample_spec(&prepared.digest, "vm_work_b");
+    second.net.mac.0[5] = 2;
+    second.work_disks = vec![work_disk("/var/lib/quoro/work/a.img", 1, "quoro-out")];
+    assert!(
+        matches!(engine.create(&second).await, Err(EngineError::Conflict(_))),
+        "two VMs may not name the same work-disk path"
+    );
+
+    second.work_disks = vec![work_disk("/var/lib/quoro/work/b.img", 1, "quoro-out")];
+    engine
+        .create(&second)
+        .await
+        .expect("a VM with its own work disk is created");
+}
+
+#[tokio::test]
+async fn create_refuses_egress_only_with_an_isolation_group() {
+    let engine = FakeEngine::new();
+    let prepared = engine
+        .prepare_image(&common::image_ref())
+        .await
+        .expect("prepare_image succeeds");
+
+    let mut spec = common::sample_spec(&prepared.digest, "vm_egress");
+    spec.net.egress_only = true;
+    spec.net.isolation_group = Some("prj_01".to_string());
+    match engine.create(&spec).await {
+        Err(EngineError::Conflict(reason)) => {
+            assert!(reason.contains("egress only"), "{reason}");
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+
+    spec.net.isolation_group = None;
+    engine
+        .create(&spec)
+        .await
+        .expect("egress only without a group is valid");
 }

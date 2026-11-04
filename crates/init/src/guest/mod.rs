@@ -17,11 +17,11 @@ mod mounts;
 mod netlink;
 mod power;
 mod shutdown;
+mod teardown;
 mod user;
 
 use std::path::Path;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use quoro_init::{GuestConfig, SERIAL_CONFIG, SERIAL_DATA, SERIAL_ROOT};
 use rustix::io::Errno;
@@ -245,8 +245,8 @@ fn supervise(app_pid: Pid, pumps: Option<console::Pumps>) -> i32 {
     if let Some(pumps) = pumps {
         pumps.wait(Duration::from_secs(2));
     }
-    kill_remaining();
-    reap_remaining(Duration::from_secs(1));
+    teardown::signal_everyone(rustix::process::Signal::KILL);
+    teardown::reap_remaining(Duration::from_secs(1));
     code
 }
 
@@ -259,47 +259,4 @@ fn exit_code(status: WaitStatus) -> i32 {
         return 128 + signal;
     }
     1
-}
-
-/// SIGKILL every process except ourselves (`/proc/1`).
-fn kill_remaining() {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        let Ok(raw) = name.parse::<i32>() else {
-            continue;
-        };
-        if raw <= 1 {
-            continue;
-        }
-        if let Some(pid) = Pid::from_raw(raw) {
-            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
-        }
-    }
-}
-
-/// Reap the processes [`kill_remaining`] just killed, for at most `budget`.
-fn reap_remaining(budget: Duration) {
-    let deadline = Instant::now() + budget;
-    loop {
-        match rustix::process::wait(WaitOptions::NOHANG) {
-            Ok(Some((pid, status))) => {
-                exec::reaped(pid, status);
-                continue;
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    return;
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(Errno::INTR) => continue,
-            Err(_) => return,
-        }
-    }
 }

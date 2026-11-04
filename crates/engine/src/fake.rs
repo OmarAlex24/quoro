@@ -36,8 +36,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::{
     ByteStream, Capabilities, ConsoleMode, ConsoleStream, Engine, EngineError, EngineEvent,
     EventStream, ExecRequest, ExecSession, HostProbe, ImageConfig, ImageDigest, ImageRef,
-    LineStream, NodeNetwork, OutputLine, OutputStream, PreparedImage, SerialMode, StopMode,
-    VmCounters, VmId, VmInfo, VmSpec, VmState, VolumeId, VolumeSnapshot,
+    LineStream, NodeNetwork, OciLayout, OutputLine, OutputStream, PreparedImage, SerialMode,
+    StopMode, VmCounters, VmId, VmInfo, VmSpec, VmState, VolumeId, VolumeSnapshot,
 };
 
 /// Capacity of one event subscriber's channel. A subscriber that falls further
@@ -616,6 +616,23 @@ impl FakeEngine {
     }
 }
 
+/// The prepared image the fake records for `digest`.
+fn fake_image(digest: &ImageDigest) -> PreparedImage {
+    PreparedImage {
+        digest: digest.clone(),
+        rootfs_path: PathBuf::from(format!("/fake/images/{}", digest.0)),
+        size_bytes: 0,
+        config: ImageConfig {
+            entrypoint: Vec::new(),
+            cmd: Vec::new(),
+            env: Vec::new(),
+            user: None,
+            workdir: None,
+            exposed_ports: Vec::new(),
+        },
+    }
+}
+
 /// Emits an event to every live subscriber, counting the ones that could not
 /// be delivered to a full buffer and removing the closed ones.
 fn emit(state: &mut State, event: EngineEvent) {
@@ -707,19 +724,7 @@ impl Engine for FakeEngine {
         if let Some(cached) = state.images.get(&image.digest) {
             return Ok(cached.clone());
         }
-        let prepared = PreparedImage {
-            digest: image.digest.clone(),
-            rootfs_path: PathBuf::from(format!("/fake/images/{}", image.digest.0)),
-            size_bytes: 0,
-            config: ImageConfig {
-                entrypoint: Vec::new(),
-                cmd: Vec::new(),
-                env: Vec::new(),
-                user: None,
-                workdir: None,
-                exposed_ports: Vec::new(),
-            },
-        };
+        let prepared = fake_image(&image.digest);
         state.images.insert(image.digest.clone(), prepared.clone());
         Ok(prepared)
     }
@@ -727,6 +732,24 @@ impl Engine for FakeEngine {
     async fn remove_image(&self, digest: &ImageDigest) -> Result<(), EngineError> {
         self.lock().images.remove(digest);
         Ok(())
+    }
+
+    async fn prepare_layout(&self, layout: &OciLayout) -> Result<PreparedImage, EngineError> {
+        let mut state = self.lock();
+        if let Some(cached) = state.images.get(&layout.manifest_digest) {
+            return Ok(cached.clone());
+        }
+        if !layout.path.exists() {
+            return Err(EngineError::Image(format!(
+                "layout {} does not exist",
+                layout.path.display()
+            )));
+        }
+        let prepared = fake_image(&layout.manifest_digest);
+        state
+            .images
+            .insert(layout.manifest_digest.clone(), prepared.clone());
+        Ok(prepared)
     }
 
     async fn create(&self, spec: &VmSpec) -> Result<VmInfo, EngineError> {
@@ -748,6 +771,28 @@ impl Engine for FakeEngine {
                 "VM {} already exists with a different spec",
                 spec.id.0
             )));
+        }
+        if spec.net.egress_only && spec.net.isolation_group.is_some() {
+            return Err(EngineError::Conflict(format!(
+                "VM {} is egress only and cannot carry an isolation group",
+                spec.id.0
+            )));
+        }
+        for disk in &spec.work_disks {
+            for (other_id, record) in &state.vms {
+                if record
+                    .spec
+                    .work_disks
+                    .iter()
+                    .any(|other| other.path == disk.path)
+                {
+                    return Err(EngineError::Conflict(format!(
+                        "work disk {} is already attached to VM {}",
+                        disk.path.display(),
+                        other_id.0
+                    )));
+                }
+            }
         }
         let info = VmInfo {
             id: spec.id.clone(),
