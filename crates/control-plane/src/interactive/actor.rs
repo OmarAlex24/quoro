@@ -473,6 +473,30 @@ impl Actor {
         }
     }
 
+    /// Section 5.8: a primary-side close of a live terminal asks the node to
+    /// stop the stream and waits, bounded, for the answering `stream_end` that
+    /// carries the transcript fields, so `session.end` can record them
+    /// whatever ended the session. Data that arrives meanwhile is discarded.
+    async fn request_transcript(&mut self) -> Option<(String, u64)> {
+        if self.stream.is_ended() || !self.stream.request_close() {
+            return None;
+        }
+        let deadline = Instant::now() + self.timings.stream_close_wait;
+        loop {
+            match tokio::time::timeout_at(deadline, self.stream.next()).await {
+                Ok(Some(StreamEvent::SessionEnd {
+                    transcript_sha256,
+                    transcript_bytes,
+                    ..
+                })) => {
+                    return transcript_sha256.map(|sha| (sha, transcript_bytes.unwrap_or(0)));
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => return None,
+            }
+        }
+    }
+
     /// Writes the one `session.end`, tells the client why, and forgets the
     /// session. Returns whether the record was written (false when the session
     /// had already ended).
@@ -485,7 +509,10 @@ impl Actor {
         }
         self.ended = true;
         let transcript = if self.row.kind == "terminal" && self.connected {
-            ending.transcript
+            match ending.transcript {
+                Some(transcript) => Some(transcript),
+                None => self.request_transcript().await,
+            }
         } else {
             None
         };

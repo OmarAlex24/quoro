@@ -898,6 +898,31 @@ impl NodeStream {
         &self.stream_id
     }
 
+    /// Whether this stream already ended (`stream_end` received, or the
+    /// session's channel closed).
+    #[must_use]
+    pub fn is_ended(&self) -> bool {
+        self.ended
+    }
+
+    /// Asks the node to stop producing this stream (section 5.16) without
+    /// unregistering its routing, so a following `stream_end` — and the
+    /// transcript fields it carries — still reaches [`Self::next`]. Unlike
+    /// dropping an unended stream, this leaves the cleanup to `Drop`.
+    /// Returns whether the frame reached the session's outbox.
+    #[must_use]
+    pub fn request_close(&self) -> bool {
+        self.inner.send_text(
+            &self.node_id,
+            self.generation,
+            ControlMessage::StreamClose(wire::StreamClose {
+                stream_id: self.stream_id.clone(),
+            })
+            .to_frame(&new_msg_id(), None)
+            .to_text(),
+        )
+    }
+
     /// Sends one `stream_input` (section 5.24): input bytes, a new window size,
     /// or the end of input. `seq` is gap-free from 1 per stream. Returns whether
     /// the frame reached the session's outbox.
