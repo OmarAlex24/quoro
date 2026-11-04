@@ -25,6 +25,9 @@ concurrency:
 jobs:
   deploy:
     name: Build and deploy the docs site
+    # Guest kernel releases (guest-kernel-*, guest-kernel.yml) publish too;
+    # only Quoro releases (v*) deploy the site.
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'v')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

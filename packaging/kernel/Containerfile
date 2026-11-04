@@ -1,0 +1,104 @@
+# The guest kernel build image (ADR 0152), a sibling of the release build image
+# (packaging/container/Containerfile, ADR 0090): the same base image digest and
+# the same apt snapshot, with the packages a kernel build needs instead of
+# musl, Rust and Node.js. The guest kernel workflow and every
+# packaging/kernel/reproduce-kernel.sh rebuild run
+# packaging/kernel/build-kernel.sh inside an image built from this file, so the
+# compiler, binutils, make, flex, bison, perl and libelf are the same bytes on
+# every host.
+#
+# Every input is pinned:
+#   - the base image by its linux/amd64 manifest digest;
+#   - apt packages through snapshot.ubuntu.com at a fixed timestamp, and every
+#     package installed by name at an exact version, so the dependency closure
+#     is fixed too.
+#
+# Bumping any pin changes the kernel bytes: do it in its own pull request, bump
+# REVISION in packaging/kernel/kernel.txt and update the "Tooling outside
+# Cargo" table in DEPENDENCIES.md.
+#
+# packaging/kernel/build-kernel-in-container.sh builds this image from a
+# context that holds only this file.
+FROM docker.io/library/ubuntu:24.04@sha256:78d4744ead1f5b19b04d0df558ab182a5300903900755e515b2ca4d10eb2044d
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LC_ALL=C \
+    TZ=UTC
+
+# apt from the Ubuntu snapshot service at one fixed timestamp, exactly as in
+# packaging/container/Containerfile, which explains the bootstrap without TLS
+# peer verification and the retry wrapper. In short: apt verifies the signed
+# indexes and every .deb whatever the transport, ca-certificates is pinned to
+# an exact version, and every step after it verifies TLS again.
+#
+# Packages and why:
+#   gcc, gcc-13, binutils, libc6-dev, make   the compiler and linker
+#   bc, bison, flex, perl, python3           Kconfig and build-time generators
+#                                            (python3 also runs diffconfig)
+#   libelf-dev, libssl-dev                   objtool and the host tools that
+#                                            read certificates
+#   curl, ca-certificates, xz-utils          fetch and unpack the tarball
+#   gpg, gpgv                                verify kernel.org's signature
+#   git                                      git apply for the vendored patch
+RUN set -eu; \
+    rm -f /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; \
+    printf '%s\n' \
+        'Types: deb' \
+        'URIs: https://snapshot.ubuntu.com/ubuntu/20261102T000000Z' \
+        'Suites: noble noble-updates noble-security' \
+        'Components: main universe' \
+        'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' \
+        >/etc/apt/sources.list.d/snapshot.sources; \
+    printf '%s\n' \
+        'Acquire::Retries "5";' \
+        'APT::Update::Error-Mode "any";' \
+        >/etc/apt/apt.conf.d/80-quoro-retries; \
+    attempt() { \
+        n=1; \
+        until "$@"; do \
+            if [ "$n" -ge 5 ]; then return 1; fi; \
+            echo "apt stage failed (attempt $n of 5); retrying in $((n * 30)) s" >&2; \
+            sleep $((n * 30)); \
+            n=$((n + 1)); \
+        done; \
+    }; \
+    bootstrap() { \
+        rm -rf /var/lib/apt/lists/*; \
+        apt-get -o Acquire::https::Verify-Peer=false update && \
+        apt-get -o Acquire::https::Verify-Peer=false install -y --no-install-recommends \
+            ca-certificates=20260816ubuntu0.24.04.1; \
+    }; \
+    toolchain() { \
+        rm -rf /var/lib/apt/lists/*; \
+        apt-get update && \
+        apt-get install -y --no-install-recommends \
+            bc=1.07.1-3ubuntu4 \
+            binutils=2.42-4ubuntu2.10 \
+            bison=2:3.8.2+dfsg-1ubuntu0.24.04.1 \
+            ca-certificates=20260816ubuntu0.24.04.1 \
+            curl=8.5.0-2ubuntu10.16 \
+            flex=2.6.4-8.2build1 \
+            gcc=4:13.2.0-7ubuntu1 \
+            gcc-13=13.3.0-6ubuntu2~24.04.1 \
+            git=1:2.43.0-1ubuntu7.4 \
+            gpg=2.4.4-2ubuntu17.6 \
+            gpgv=2.4.4-2ubuntu17.6 \
+            libc6-dev=2.39-0ubuntu8.9 \
+            libelf-dev=0.190-1.1ubuntu0.1 \
+            libssl-dev=3.0.13-0ubuntu3.16 \
+            make=4.3-4.1build2 \
+            perl=5.38.2-3.2ubuntu0.6 \
+            python3=3.12.3-0ubuntu2.1 \
+            xz-utils=5.6.1+really5.4.5-1ubuntu0.4; \
+    }; \
+    attempt bootstrap; \
+    attempt toolchain; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/* /etc/apt/apt.conf.d/80-quoro-retries
+
+# packaging/kernel/build-kernel.sh looks for this file: a build without it is
+# not a guest kernel release build.
+RUN printf '%s\n' 'quoro guest kernel build image (packaging/kernel/Containerfile, ADR 0152)' \
+    >/etc/quoro-kernel-build
+
+WORKDIR /build/quoro

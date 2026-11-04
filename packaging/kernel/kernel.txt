@@ -1,0 +1,43 @@
+# The guest kernel recipe (ADR 0152). packaging/kernel/build-kernel.sh reads
+# this file; nothing else decides what goes into the guest kernel.
+#
+# One KEY=VALUE per line. Values are literal: no quotes, no expansion.
+# Bumping any line changes the kernel bytes: do it in its own pull request,
+# bump REVISION or VERSION, and tag guest-kernel-<VERSION>-<REVISION>.
+
+# Upstream stable release, from https://www.kernel.org/releases.json.
+VERSION=7.2.15
+# Quoro build of that release. A new recipe for the same VERSION (patch,
+# config or build image change) gets the next revision: q2, q3, ...
+REVISION=q1
+
+# The release tarball, its sha256 (also listed in kernel.org's signed
+# sha256sums.asc) and its detached signature over the uncompressed tar.
+TARBALL_URL=https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.15.tar.xz
+TARBALL_SHA256=d0f6b1d7324c937ccaeb5c4ca7084bfcf71db2edb3e2d3a31f0ad83a681809ab
+SIGNATURE_URL=https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.15.tar.sign
+# Primary key fingerprint the signature must be made with (Greg Kroah-Hartman,
+# Linux kernel stable release signing key). The public key is
+# packaging/kernel/keys/stable-signing-key.asc, copied from kernel.org's
+# pgpkeys.git (keys/38DBBDC86092693E.asc).
+SIGNER_FINGERPRINT=647F28654894E3BD457199BE38DBBDC86092693E
+SIGNING_KEY_SHA256=f5f41e7bf85b5a11c9bef6af6a1431459ac1e64e57eba1d25251ca55771e9f3a
+
+# Cloud Hypervisor's guest kernel changes, vendored as one patch
+# (packaging/kernel/patches/; regenerate-patch.sh rebuilds it from these
+# commits). CH_BASE is "Linux 7.2.8"; CH_HEAD is the commit behind the release
+# ch-release-v7.2.8-20261009 that Quoro pinned before.
+CH_REPOSITORY=https://github.com/cloud-hypervisor/linux
+CH_BASE=9a66fdc0d7fd55f54235524a73435af99051e46f
+CH_HEAD=639d0886248cd90799b0b590f7a62a1a3565a815
+PATCH=patches/cloud-hypervisor.patch
+# The defconfig the patch adds; the build runs "make <DEFCONFIG>".
+DEFCONFIG=ch_defconfig
+
+# Fixed build identity, so two builds of this recipe produce the same bytes.
+# The timestamp is the upstream release date; GNU date must parse it, because
+# the built-in initramfs uses it too.
+KBUILD_BUILD_TIMESTAMP=2026-11-01 00:00:00 UTC
+KBUILD_BUILD_USER=quoro
+KBUILD_BUILD_HOST=quoro
+KBUILD_BUILD_VERSION=1

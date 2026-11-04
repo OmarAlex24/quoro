@@ -1,0 +1,181 @@
+# Guest kernel builds (ADR 0152). GitHub-hosted runners only: a self-hosted
+# runner would put the signing identity and the kernel bytes on a machine we do
+# not control.
+#
+# The kernel is built from packaging/kernel/kernel.txt (upstream stable plus
+# Cloud Hypervisor's guest patches and ch_defconfig) inside the guest kernel
+# build image (packaging/kernel/Containerfile, a sibling of the ADR 0090
+# release image) through packaging/kernel/build-kernel-in-container.sh, the
+# same script packaging/kernel/reproduce-kernel.sh uses.
+#
+# Triggers: a guest-kernel-<version>-<revision> tag push creates a DRAFT
+# prerelease. The maintainer reviews it and publishes it; nothing here
+# publishes on its own. Workflow dispatch is a dry run (ADR 0082): it builds,
+# attests and uploads WORKFLOW ARTIFACTS ONLY, never a tag or a release. It
+# never runs on a branch push or a pull request.
+#
+# The release is a prerelease and is never marked latest, because install.sh
+# resolves "the latest release" to find Quoro itself.
+#
+# Signing is keyless: GitHub artifact attestations (Sigstore, SLSA build
+# provenance) via actions/attest-build-provenance, as in release.yml (ADR
+# 0081). Only the release job can write to the repository, and it runs only
+# on a tag.
+name: Guest kernel
+
+on:
+  push:
+    tags: ["guest-kernel-*"]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: guest-kernel-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and attest the guest kernel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      tag: ${{ steps.recipe.outputs.tag }}
+      artifact: ${{ steps.recipe.outputs.artifact }}
+    env:
+      # Docker is preinstalled on the runner; reproduce-kernel.sh prefers
+      # podman. Both run the same image.
+      QUORO_CONTAINER_ENGINE: docker
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # A tag must name exactly the recipe it builds, so the release name
+      # cannot lie about the kernel. A dry run must start from a branch; its
+      # attestation is bound to that branch.
+      - name: Resolve the recipe
+        id: recipe
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          tag="$(packaging/kernel/build-kernel-in-container.sh --print-tag)"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            case "$GITHUB_REF" in
+              refs/heads/*) ;;
+              *)
+                echo "error: a dry run must be dispatched from a branch, got $GITHUB_REF" >&2
+                exit 1
+                ;;
+            esac
+            artifact="$tag-dry-run-$SHA"
+          else
+            if [ "$REF_NAME" != "$tag" ]; then
+              echo "error: tag $REF_NAME does not match the recipe in packaging/kernel/kernel.txt ($tag)" >&2
+              exit 1
+            fi
+            artifact="$tag"
+          fi
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+          echo "artifact=$artifact" >>"$GITHUB_OUTPUT"
+
+      - name: Build the guest kernel
+        run: packaging/kernel/build-kernel-in-container.sh
+
+      # Everything the release carries. The upstream tarball, its signature,
+      # the patch and the config are the corresponding source of the GPL-2.0
+      # binary; build-kernel.sh already checked the tarball's sha256 and
+      # signature.
+      - name: Collect the release files
+        run: |
+          set -euo pipefail
+          out=dist/guest-kernel
+          mkdir -p "$out"
+          cp dist/kernel/vmlinux-x86_64 dist/kernel/config-x86_64 "$out/"
+          cp packaging/kernel/patches/cloud-hypervisor.patch "$out/"
+          tarball_url="$(awk -F= '$1 == "TARBALL_URL" { print $2 }' packaging/kernel/kernel.txt)"
+          signature_url="$(awk -F= '$1 == "SIGNATURE_URL" { print $2 }' packaging/kernel/kernel.txt)"
+          tarball="${tarball_url##*/}"
+          signature="${signature_url##*/}"
+          cp "target/kernel-build/work/dl/$tarball" "target/kernel-build/work/dl/$signature" "$out/"
+          (cd "$out" && sha256sum vmlinux-x86_64 config-x86_64 cloud-hypervisor.patch \
+            "$tarball" "$signature" >SHA256SUMS)
+          cat "$out/SHA256SUMS"
+
+      - name: Attest build provenance
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/guest-kernel/vmlinux-x86_64
+            dist/guest-kernel/config-x86_64
+            dist/guest-kernel/cloud-hypervisor.patch
+
+      # The same check a maintainer runs before bumping crates/engine/pins.txt,
+      # against the files about to be uploaded. A broken attestation fails here.
+      - name: Store and verify the attestation bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+          TAG: ${{ steps.recipe.outputs.tag }}
+        run: |
+          set -euo pipefail
+          bundle="dist/guest-kernel/$TAG.sigstore.jsonl"
+          cp "$BUNDLE_PATH" "$bundle"
+          for file in vmlinux-x86_64 config-x86_64 cloud-hypervisor.patch; do
+            gh attestation verify "dist/guest-kernel/$file" \
+              --bundle "$bundle" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/guest-kernel.yml" \
+              --source-ref "$GITHUB_REF" \
+              --deny-self-hosted-runners
+          done
+
+      - name: Upload the build
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.recipe.outputs.artifact }}
+          path: dist/guest-kernel/
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Draft the guest kernel release
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/guest-kernel-')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download the build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.build.outputs.artifact }}
+          path: dist/guest-kernel
+
+      - name: Create the draft prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cd dist/guest-kernel
+          sha256sum --check SHA256SUMS
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --prerelease \
+            --latest=false \
+            --verify-tag \
+            --title "Guest kernel ${TAG#guest-kernel-}" \
+            --notes "Quoro's guest kernel (ADR 0152): upstream Linux stable plus Cloud Hypervisor's guest patches and ch_defconfig, built from packaging/kernel/ at this tag. GPL-2.0-only; a separate artifact the engine boots, not linked into Quoro. The corresponding source is attached: the kernel.org tarball and its signature, the patch and the resolved config. Verify with gh attestation verify (see packaging/kernel/README.md) and rebuild with packaging/kernel/reproduce-kernel.sh $TAG. A prerelease so it is never the latest release, which install.sh uses to find Quoro." \
+            -- *
