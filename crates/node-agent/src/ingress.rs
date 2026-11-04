@@ -42,6 +42,7 @@ use std::time::Duration;
 
 use quoro_ingress::acme::AcmeConfig;
 use quoro_ingress::cloudflared::CloudflaredConfig;
+use quoro_ingress::proxy::{BackendObserver, ProxyCore};
 use quoro_ingress::public::{PublicConfig, PublicIngress};
 use quoro_ingress::tunnel::{TunnelConfig, TunnelIngress, TunnelRun};
 use quoro_ingress::{Ingress as _, IngressEvent, Route, RouteTable, TlsMode};
@@ -82,7 +83,7 @@ struct DesiredRoutes {
 }
 
 /// The TLS mode a route is served with, parsed from `spec.routes[].tls_mode`.
-fn tls_mode(mode: &str) -> Option<TlsMode> {
+pub(crate) fn tls_mode(mode: &str) -> Option<TlsMode> {
     match mode {
         "acme" => Some(TlsMode::Acme),
         "tunnel" => Some(TlsMode::Tunnel),
@@ -97,6 +98,18 @@ pub struct RouteTables {
     pub tunnel: RouteTable,
     /// Hostnames terminated by the public backend with an ACME certificate.
     pub acme: RouteTable,
+}
+
+/// The edge's routes and tunnel, as the edge manager hands them to the
+/// supervisor. It is a watch value of its own so a rotation change takes
+/// effect without waiting for a new desired-state snapshot.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EdgeRoutes {
+    /// Hostnames the edge serves, already filtered to the backends in rotation.
+    pub tables: RouteTables,
+    /// The edge's own tunnel (`spec.edge.tunnel`), used when the snapshot has
+    /// no `spec.ingress.tunnel`.
+    pub tunnel: Option<SpecTunnel>,
 }
 
 /// Builds the complete tables from `spec.routes` and the observed VM
@@ -139,6 +152,8 @@ pub fn build_tables(routes: &[SpecRoute], addresses: &HashMap<String, Ipv4Addr>)
             hostname,
             backends,
             tls: mode,
+            retry: quoro_ingress::RetryPolicy::Unsent,
+            response_timeout: None,
         };
         match mode {
             TlsMode::Tunnel => tunnel.push(route),
@@ -156,6 +171,46 @@ pub fn build_tables(routes: &[SpecRoute], addresses: &HashMap<String, Ipv4Addr>)
     RouteTables {
         tunnel: table(tunnel),
         acme: table(acme),
+    }
+}
+
+/// Combines the node's route tables with the edge's. A hostname served by both
+/// keeps the node route, and the collision is logged once per hostname.
+pub(crate) fn union_tables(
+    node: &RouteTables,
+    edge: &RouteTables,
+    warned: &mut HashSet<String>,
+) -> RouteTables {
+    let node_hosts: HashSet<String> = node
+        .tunnel
+        .iter()
+        .chain(node.acme.iter())
+        .map(|route| route.hostname.clone())
+        .collect();
+    let mut merge = |node: &RouteTable, edge: &RouteTable| -> RouteTable {
+        let mut routes: Vec<Route> = node.iter().cloned().collect();
+        for route in edge.iter() {
+            if node_hosts.contains(&route.hostname) {
+                if warned.insert(route.hostname.clone()) {
+                    warn!(
+                        hostname = %route.hostname,
+                        "hostname is served by both the node and the edge; keeping the node route"
+                    );
+                }
+                continue;
+            }
+            routes.push(route.clone());
+        }
+        RouteTable::new(routes).unwrap_or_else(|e| {
+            // Individual routes were already validated; a collision that still
+            // got here is a bug, and an empty table is the safe answer.
+            error!(error = %e, "could not build the union of node and edge routes");
+            RouteTable::default()
+        })
+    };
+    RouteTables {
+        tunnel: merge(&node.tunnel, &edge.tunnel),
+        acme: merge(&node.acme, &edge.acme),
     }
 }
 
@@ -690,8 +745,10 @@ impl DnsProvider for SessionDns {
 /// The supervisor the agent creates once and stops on shutdown.
 pub struct IngressSupervisor {
     desired: watch::Sender<DesiredRoutes>,
+    edge: watch::Sender<EdgeRoutes>,
     status: Arc<RwLock<BTreeMap<String, HostStatus>>>,
     dns: Arc<DnsBridge>,
+    observer: Arc<RwLock<Option<Arc<dyn BackendObserver>>>>,
     shutdown: watch::Sender<bool>,
     task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -702,26 +759,42 @@ impl IngressSupervisor {
     #[must_use]
     pub fn new(config: IngressConfig, dns: Arc<DnsBridge>, events: CertificateEvents) -> Self {
         let (desired, desired_rx) = watch::channel(DesiredRoutes::default());
+        let (edge, edge_rx) = watch::channel(EdgeRoutes::default());
         let (shutdown, shutdown_rx) = watch::channel(false);
         let (event_tx, event_rx) = mpsc::channel(256);
         let status = Arc::new(RwLock::new(BTreeMap::new()));
+        let observer = Arc::new(RwLock::new(None));
         let task = tokio::spawn(supervise(
             config,
             Arc::clone(&dns),
             events,
             desired_rx,
+            edge_rx,
             shutdown_rx,
             event_tx,
             Arc::clone(&status),
+            Arc::clone(&observer),
             event_rx,
         ));
         Self {
             desired,
+            edge,
             status,
             dns,
+            observer,
             shutdown,
             task: Mutex::new(Some(task)),
         }
+    }
+
+    /// Sets the observer the proxy cores report backend failures to. It is
+    /// attached to a backend when it starts, and to one that is already
+    /// running on the next apply.
+    pub fn set_observer(&self, observer: Arc<dyn BackendObserver>) {
+        *self
+            .observer
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observer);
     }
 
     /// Hands the supervisor the complete route set of one apply. Never blocks
@@ -737,6 +810,14 @@ impl IngressSupervisor {
             tunnel: ingress.and_then(|ingress| ingress.tunnel.clone()),
             addresses,
         });
+    }
+
+    /// Hands the supervisor the edge routes and tunnel of the current
+    /// verified snapshot, with only the backends in rotation. The supervisor
+    /// unions them with the node routes, keeping a node route on a hostname
+    /// collision. Never blocks the edge manager: the newest set wins.
+    pub fn update_edge(&self, routes: EdgeRoutes) {
+        let _ = self.edge.send_replace(routes);
     }
 
     /// The certificate state of every route, in `status_report` shape.
@@ -803,6 +884,7 @@ struct Runtime {
     events: CertificateEvents,
     event_tx: mpsc::Sender<IngressEvent>,
     status: Arc<RwLock<BTreeMap<String, HostStatus>>>,
+    observer: Arc<RwLock<Option<Arc<dyn BackendObserver>>>>,
     tunnel: Option<TunnelIngress>,
     running: Option<TunnelIdentity>,
     public: Option<PublicIngress<SessionDns>>,
@@ -812,6 +894,8 @@ struct Runtime {
     applied_acme: Option<RouteTable>,
     /// Hostnames announced as unserved, so the log line is written once.
     warned: HashSet<String>,
+    /// Hostnames served by both the node and the edge, logged once.
+    warned_overlap: HashSet<String>,
     missing_binary_logged: bool,
     /// Backoff for a failed public-ingress start (port 80/443 busy, bad cert
     /// directory); without it a 2 s reconcile tick would retry and log forever.
@@ -824,9 +908,11 @@ async fn supervise(
     dns: Arc<DnsBridge>,
     events: CertificateEvents,
     mut desired: watch::Receiver<DesiredRoutes>,
+    mut edge: watch::Receiver<EdgeRoutes>,
     mut shutdown: watch::Receiver<bool>,
     event_tx: mpsc::Sender<IngressEvent>,
     status: Arc<RwLock<BTreeMap<String, HostStatus>>>,
+    observer: Arc<RwLock<Option<Arc<dyn BackendObserver>>>>,
     mut event_rx: mpsc::Receiver<IngressEvent>,
 ) {
     let mut runtime = Runtime {
@@ -835,17 +921,20 @@ async fn supervise(
         events,
         event_tx,
         status,
+        observer,
         tunnel: None,
         running: None,
         public: None,
         applied_tunnel: None,
         applied_acme: None,
         warned: HashSet::new(),
+        warned_overlap: HashSet::new(),
         missing_binary_logged: false,
         public_retry_at: None,
     };
     let mut current = desired.borrow_and_update().clone();
-    runtime.apply(&current).await;
+    let mut current_edge = edge.borrow_and_update().clone();
+    runtime.apply(&current, &current_edge).await;
     loop {
         tokio::select! {
             changed = desired.changed() => {
@@ -853,7 +942,14 @@ async fn supervise(
                     break;
                 }
                 current = desired.borrow_and_update().clone();
-                runtime.apply(&current).await;
+                runtime.apply(&current, &current_edge).await;
+            }
+            changed = edge.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                current_edge = edge.borrow_and_update().clone();
+                runtime.apply(&current, &current_edge).await;
             }
             event = event_rx.recv() => {
                 if let Some(event) = event {
@@ -877,17 +973,54 @@ async fn supervise(
 }
 
 impl Runtime {
-    async fn apply(&mut self, desired: &DesiredRoutes) {
+    async fn apply(&mut self, desired: &DesiredRoutes, edge: &EdgeRoutes) {
         self.events.set_routes(&desired.routes);
-        let tables = build_tables(&desired.routes, &desired.addresses);
-        self.apply_tunnel(desired, &tables.tunnel).await;
+        let node = build_tables(&desired.routes, &desired.addresses);
+        let tables = union_tables(&node, &edge.tables, &mut self.warned_overlap);
+        self.attach_observer();
+        // A node's own tunnel wins when both are present; the edge runs
+        // `spec.edge.tunnel` only when the snapshot has no `spec.ingress.tunnel`.
+        let tunnel = desired.tunnel.as_ref().or(edge.tunnel.as_ref());
+        self.apply_tunnel(tunnel, &tables.tunnel).await;
         self.apply_public(&tables.acme).await;
         self.record_statuses(&tables);
     }
 
-    /// Starts, replaces or stops `cloudflared` to match `spec.ingress.tunnel`.
-    async fn apply_tunnel(&mut self, desired: &DesiredRoutes, table: &RouteTable) {
-        let wanted = desired.tunnel.as_ref().map(|tunnel| TunnelIdentity {
+    /// Attaches the backend observer to any proxy core that is already
+    /// running, so an observer set after the backend started still sees
+    /// failures.
+    fn attach_observer(&self) {
+        let observer = self
+            .observer
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(observer) = observer else {
+            return;
+        };
+        if let Some(tunnel) = &self.tunnel {
+            tunnel.core().set_observer(Arc::clone(&observer));
+        }
+        if let Some(public) = &self.public {
+            public.core().set_observer(observer);
+        }
+    }
+
+    /// Attaches the current observer to one proxy core, when there is one.
+    fn attach_core(&self, core: &Arc<ProxyCore>) {
+        let observer = self
+            .observer
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(observer) = observer {
+            core.set_observer(observer);
+        }
+    }
+
+    /// Starts, replaces or stops `cloudflared` to match the effective tunnel.
+    async fn apply_tunnel(&mut self, tunnel: Option<&SpecTunnel>, table: &RouteTable) {
+        let wanted = tunnel.map(|tunnel| TunnelIdentity {
             tunnel_id: tunnel.tunnel_id.clone(),
             token: Token::new(tunnel.token.clone()),
             origin_port: tunnel.origin_port,
@@ -929,6 +1062,7 @@ impl Runtime {
                 match TunnelIngress::start(config, run).await {
                     Ok(tunnel) => {
                         self.forward_events(tunnel.subscribe());
+                        self.attach_core(tunnel.core());
                         self.tunnel = Some(tunnel);
                         self.applied_tunnel = None;
                         info!(origin_port = wanted.origin_port, "tunnel ingress started");
@@ -962,18 +1096,18 @@ impl Runtime {
                 }
                 self.running = None;
                 self.applied_tunnel = None;
-                info!("spec.ingress.tunnel is absent; tunnel connector stopped");
+                info!("the tunnel is absent; tunnel connector stopped");
             }
         }
 
         // `tunnel` routes without a tunnel are not served, once per hostname.
-        match (&self.tunnel, desired.tunnel.is_some()) {
+        match (&self.tunnel, tunnel.is_some()) {
             (None, false) => {
                 for route in table.iter() {
                     if self.warned.insert(route.hostname.clone()) {
                         warn!(
                             hostname = %route.hostname,
-                            "tunnel route has no spec.ingress.tunnel on this node; not served"
+                            "tunnel route has no tunnel on this machine; not served"
                         );
                     }
                 }
@@ -1029,6 +1163,7 @@ impl Runtime {
             {
                 Ok(public) => {
                     self.forward_events(public.subscribe());
+                    self.attach_core(public.core());
                     self.public = Some(public);
                     self.applied_acme = None;
                     self.public_retry_at = None;
@@ -1636,5 +1771,52 @@ mod tests {
             status.cert_expires_at.as_deref(),
             Some("2027-01-31T10:15:30Z")
         );
+    }
+
+    #[test]
+    fn node_and_edge_tables_are_unioned_and_a_node_route_wins() {
+        let node = RouteTables {
+            tunnel: RouteTable::new([Route {
+                hostname: "shared.example.com".to_string(),
+                backends: vec!["10.42.0.2:8080".parse().unwrap()],
+                tls: TlsMode::Tunnel,
+                retry: quoro_ingress::RetryPolicy::Unsent,
+                response_timeout: None,
+            }])
+            .unwrap(),
+            acme: RouteTable::default(),
+        };
+        let edge = RouteTables {
+            tunnel: RouteTable::default(),
+            acme: RouteTable::new([
+                Route {
+                    hostname: "shared.example.com".to_string(),
+                    backends: vec!["10.42.1.2:8080".parse().unwrap()],
+                    tls: TlsMode::Acme,
+                    retry: quoro_ingress::RetryPolicy::IdempotentOnce,
+                    response_timeout: Some(Duration::from_secs(60)),
+                },
+                Route {
+                    hostname: "edge-only.example.com".to_string(),
+                    backends: Vec::new(),
+                    tls: TlsMode::Acme,
+                    retry: quoro_ingress::RetryPolicy::IdempotentOnce,
+                    response_timeout: Some(Duration::from_secs(60)),
+                },
+            ])
+            .unwrap(),
+        };
+
+        let mut warned = HashSet::new();
+        let union = union_tables(&node, &edge, &mut warned);
+
+        // The shared hostname keeps the node route and its tunnel mode.
+        assert!(union.tunnel.get("shared.example.com").is_some());
+        assert!(union.acme.get("shared.example.com").is_none());
+        // The edge-only route keeps its retry policy and timeout.
+        let route = union.acme.get("edge-only.example.com").unwrap();
+        assert_eq!(route.retry, quoro_ingress::RetryPolicy::IdempotentOnce);
+        assert_eq!(route.response_timeout, Some(Duration::from_secs(60)));
+        assert!(warned.contains("shared.example.com"));
     }
 }

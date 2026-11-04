@@ -745,3 +745,258 @@ async fn a_hello_mesh_key_is_stored_with_a_mesh_address() {
     assert_eq!(stored.as_deref(), Some(key));
     assert_eq!(address.as_deref(), Some("10.43.0.1"));
 }
+
+/// Enrolls a machine with an explicit role set. A machine without the `node`
+/// role sends no KVM probe, as an edge does (D-0143).
+async fn enrolled_with_roles(
+    server: &Server,
+    owner: &reqwest::Client,
+    name: &str,
+    roles: &[&str],
+) -> Enrolled {
+    let token = create_token(server, owner).await;
+    let mut body = enroll_body(token["token"].as_str().unwrap(), name);
+    body["roles"] = json!(roles);
+    if !roles.contains(&"node") {
+        body.as_object_mut().unwrap().remove("kvm");
+    }
+    let res = server
+        .client()
+        .post(server.url("/api/v1/nodes/enroll"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = res.status().as_u16();
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(status, 201, "enroll: {body}");
+    Enrolled {
+        node_id: body["node_id"].as_str().unwrap().to_string(),
+        credential: body["credential"].as_str().unwrap().to_string(),
+        cluster_public_key: body["cluster_public_key"].as_str().unwrap().to_string(),
+    }
+}
+
+#[tokio::test]
+async fn an_edge_reports_backend_health_and_a_replicated_app_gets_degraded() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let edge = enrolled_with_roles(&server, &owner, "edge-1", &["edge"]).await;
+    // An edge-only machine needs no guest subnet and no KVM (D-0143).
+    let (subnet,): (Option<String>,) = sqlx::query_as("SELECT subnet FROM nodes WHERE id = ?")
+        .bind(&edge.node_id)
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+    assert!(subnet.is_none(), "an edge machine has no subnet");
+
+    // Two placement nodes, never connected: they only count for eligibility.
+    let first = enrolled_with_roles(&server, &owner, "node-one", &["node"]).await;
+    let second = enrolled_with_roles(&server, &owner, "node-two", &["node"]).await;
+
+    let project: Value = owner
+        .post(server.url("/api/v1/projects"))
+        .json(&json!({ "slug": "edge", "name": "Edge" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let project_id = project["id"].as_str().unwrap();
+    let res = owner
+        .post(server.url("/api/v1/apps"))
+        .json(&json!({
+            "project_id": project_id,
+            "name": "web",
+            "image": "img@sha256:1",
+            "port": 8080,
+            "replicas": 2,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        201,
+        "create app: {}",
+        res.text().await.unwrap()
+    );
+    let app: Value = res.json().await.unwrap();
+    let app_id = app["id"].as_str().unwrap().to_string();
+
+    let (mut socket, snapshot) = open(&server, &edge).await;
+    let rev = snapshot["body"]["rev"].as_u64().unwrap();
+    let first_vm = "vm_00000000000000000000000001";
+    let second_vm = "vm_00000000000000000000000002";
+    send(
+        &mut socket,
+        NodeMessage::StatusReport(StatusReport {
+            applied_rev: rev,
+            vms: Vec::new(),
+            routes: Vec::new(),
+            capacity: WireCapacity {
+                cpus: 2,
+                memory_mb: 2_048,
+                disk_gb: 20,
+            },
+            allocated: WireCapacity::default(),
+            disk_free_gb: 18.0,
+            builds: Vec::new(),
+            edge_backends: vec![
+                wire::EdgeBackendStatus {
+                    app_id: app_id.clone(),
+                    vm_id: first_vm.to_string(),
+                    node_id: first.node_id.clone(),
+                    in_rotation: true,
+                    since: "2026-11-04T10:00:00Z".to_string(),
+                    reason: None,
+                    last_error: None,
+                },
+                wire::EdgeBackendStatus {
+                    app_id: app_id.clone(),
+                    vm_id: second_vm.to_string(),
+                    node_id: second.node_id.clone(),
+                    in_rotation: false,
+                    since: "2026-11-04T10:00:05Z".to_string(),
+                    reason: Some(wire::EdgeOutReason::HealthCheck),
+                    last_error: Some("connection refused".to_string()),
+                },
+            ],
+        }),
+    )
+    .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let detail = loop {
+        let res = owner
+            .get(server.url(&format!("/api/v1/apps/{app_id}")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let detail: Value = res.json().await.unwrap();
+        if detail["edge_backends"]
+            .as_array()
+            .is_some_and(|b| b.len() == 2)
+        {
+            break detail;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the edge's report never reached AppDetail: {detail}"
+        );
+        heartbeat(&mut socket).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let backends = detail["edge_backends"].as_array().unwrap();
+    let down = backends
+        .iter()
+        .find(|backend| backend["vm_id"] == second_vm)
+        .expect("the out-of-rotation backend is listed");
+    assert_eq!(down["edge_node_id"], edge.node_id);
+    assert_eq!(down["node_id"], second.node_id);
+    assert_eq!(down["in_rotation"], false);
+    assert_eq!(down["reason"], "health_check");
+    assert_eq!(down["last_error"], "connection refused");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let degraded = loop {
+        let (degraded,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM events WHERE type = 'app.degraded' \
+             AND json_extract(subject, '$.id') = ?",
+        )
+        .bind(&app_id)
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+        if degraded > 0 {
+            break degraded;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no app.degraded event was emitted"
+        );
+        heartbeat(&mut socket).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(degraded, 1);
+    // `app.degraded` opens no incident (ADR 0143).
+    let (no_incident,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM incidents WHERE json_extract(subject, '$.id') = ?")
+            .bind(&app_id)
+            .fetch_one(server.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(no_incident, 0);
+
+    // Every backend out is `app.down` with `check: edge_health`, and that one
+    // opens the app's incident as any other `app.down` does (ADR 0143).
+    send(
+        &mut socket,
+        NodeMessage::StatusReport(StatusReport {
+            applied_rev: rev,
+            vms: Vec::new(),
+            routes: Vec::new(),
+            capacity: WireCapacity {
+                cpus: 2,
+                memory_mb: 2_048,
+                disk_gb: 20,
+            },
+            allocated: WireCapacity::default(),
+            disk_free_gb: 18.0,
+            builds: Vec::new(),
+            edge_backends: vec![
+                wire::EdgeBackendStatus {
+                    app_id: app_id.clone(),
+                    vm_id: first_vm.to_string(),
+                    node_id: first.node_id.clone(),
+                    in_rotation: false,
+                    since: "2026-11-04T10:05:00Z".to_string(),
+                    reason: Some(wire::EdgeOutReason::ConnectFailed),
+                    last_error: Some("connection reset".to_string()),
+                },
+                wire::EdgeBackendStatus {
+                    app_id: app_id.clone(),
+                    vm_id: second_vm.to_string(),
+                    node_id: second.node_id.clone(),
+                    in_rotation: false,
+                    since: "2026-11-04T10:00:05Z".to_string(),
+                    reason: Some(wire::EdgeOutReason::HealthCheck),
+                    last_error: Some("connection refused".to_string()),
+                },
+            ],
+        }),
+    )
+    .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let incidents = loop {
+        let (down,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM events WHERE type = 'app.down' \
+             AND json_extract(subject, '$.id') = ? AND json_extract(data, '$.check') = 'edge_health'",
+        )
+        .bind(&app_id)
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+        let (incidents,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM incidents WHERE status = 'open' \
+             AND json_extract(subject, '$.id') = ?",
+        )
+        .bind(&app_id)
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+        if down > 0 && incidents > 0 {
+            break incidents;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no app.down event or incident for the all-out report"
+        );
+        heartbeat(&mut socket).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(incidents, 1);
+}

@@ -10,12 +10,16 @@
 //! The engine is chosen here, with a `match` over [`EngineKind`], because the
 //! `Engine` trait is not object safe. The Cloud Hypervisor arm refuses to run
 //! on a host that cannot run guests and exits with [`EX_CONFIG`], so systemd
-//! stops restarting a node that will never boot.
+//! stops restarting a node that will never boot. An edge-only machine (the
+//! role persisted by `quoro join --role edge`) runs [`NullEngine`] instead,
+//! which starts no VM and needs no KVM (ADR 0143).
 
 use crate::config::{Config, EngineKind};
+use crate::null_engine::NullEngine;
 use quoro_engine::{Engine, FakeEngine};
 use quoro_node_agent::{AgentConfig, JoinTarget, NodeFacts};
 use quoro_proto::wire::{Capacity, Kvm};
+use std::fmt;
 use std::future::Future;
 use std::path::Path;
 use tracing::{info, warn};
@@ -31,14 +35,111 @@ pub const EX_CONFIG: i32 = 78;
 /// loopback URL, a one-time token and the certificate fingerprint.
 pub const LOCAL_JOIN_FILE: &str = "local-node-join.json";
 
-/// The node agent's configuration from `quoro.toml`.
-fn agent_config(config: &Config) -> AgentConfig {
+/// The file under the node data directory that records the role this machine
+/// enrolled with. It holds one word, `node` or `edge`, is written `0600` like
+/// the other identity files, and is absent on installs from before edge
+/// existed, which means [`Role::Node`].
+pub const ROLE_FILE: &str = "role";
+
+/// The role a machine took when it enrolled (ADR 0143).
+///
+/// A `node` runs microVMs and needs KVM; an `edge` runs the proxy and the mesh
+/// only, so it runs the agent without an engine. A machine may hold both roles
+/// in the protocol, but `quoro join` records one, and a machine that runs VMs
+/// enrolls as a node.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Role {
+    /// Runs microVMs for the primary; needs KVM and Cloud Hypervisor.
+    #[default]
+    Node,
+    /// Runs the edge proxy and the mesh only; holds no engine.
+    Edge,
+}
+
+impl Role {
+    /// Reads `node` or `edge`; anything else is a usage error.
+    ///
+    /// # Errors
+    ///
+    /// A message naming the accepted values when `text` is neither.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        match text {
+            "node" => Ok(Self::Node),
+            "edge" => Ok(Self::Edge),
+            other => Err(format!(
+                "unknown role '{other}'; expected node or edge (a primary runs 'quoro serve' instead)"
+            )),
+        }
+    }
+
+    /// The word the role file and the enrollment request carry.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Edge => "edge",
+        }
+    }
+
+    /// The roles sent in the enrollment request (section 2.3).
+    #[must_use]
+    pub fn enrollment_roles(self) -> Vec<String> {
+        vec![self.as_str().to_string()]
+    }
+
+    /// Whether this machine runs guests. Only a node does.
+    #[must_use]
+    pub const fn runs_vms(self) -> bool {
+        matches!(self, Self::Node)
+    }
+}
+
+impl fmt::Display for Role {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The role this machine enrolled with; a missing or unreadable file means
+/// [`Role::Node`], so installs from before edge existed keep working.
+#[must_use]
+pub fn read_role(data_dir: &Path) -> Role {
+    let path = data_dir.join(ROLE_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match Role::parse(text.trim()) {
+            Ok(role) => role,
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "unknown role; running as node");
+                Role::Node
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Role::Node,
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "cannot read the role; running as node");
+            Role::Node
+        }
+    }
+}
+
+/// Records the role `quoro join` enrolled with, `0600` next to the identity.
+///
+/// # Errors
+///
+/// A message for the operator when the file cannot be written.
+pub fn write_role(data_dir: &Path, role: Role) -> Result<(), String> {
+    quoro_node_agent::identity::write_private(data_dir, ROLE_FILE, role.as_str().as_bytes())
+        .map_err(|e| format!("cannot write the role in {}: {e}", data_dir.display()))
+}
+
+/// The node agent's configuration from `quoro.toml`, with the roles this
+/// machine enrolled with.
+fn agent_config(config: &Config, role: Role) -> AgentConfig {
     AgentConfig {
         data_dir: config.node.data_dir.clone(),
         node_name: config.node_name.clone(),
         bridge: config.cloud_hypervisor.bridge.clone(),
         dns: config.cloud_hypervisor.dns(),
-        roles: vec!["node".to_string()],
+        roles: role.enrollment_roles(),
         cloudflared_binary: config
             .ingress
             .cloudflared_binary(&config.cloud_hypervisor.artifacts_dir),
@@ -48,11 +149,12 @@ fn agent_config(config: &Config) -> AgentConfig {
     }
 }
 
-/// `quoro join <url> --token --fingerprint`: enrolls this machine and writes
-/// its identity, without starting anything. `quoro node` (or its systemd unit)
-/// then runs the agent. Returns the process exit code.
-pub async fn join(config: &Config, target: &JoinTarget) -> i32 {
-    let agent = agent_config(config);
+/// `quoro join <url> --token --fingerprint [--role node|edge]`: enrolls this
+/// machine and writes its identity and role, without starting anything.
+/// `quoro node` (or its systemd unit) then runs the agent. Returns the process
+/// exit code.
+pub async fn join(config: &Config, target: &JoinTarget, role: Role) -> i32 {
+    let agent = agent_config(config, role);
     if quoro_node_agent::is_enrolled(&agent.data_dir) {
         eprintln!(
             "this machine is already enrolled ({}); remove the node and its data directory to join again",
@@ -60,13 +162,19 @@ pub async fn join(config: &Config, target: &JoinTarget) -> i32 {
         );
         return 1;
     }
-    let facts = match facts_for(config).await {
+    let facts = match join_facts(config, role).await {
         Ok(facts) => facts,
         Err(code) => return code,
     };
     match quoro_node_agent::join(&agent, target, &facts).await {
         Ok(identity) => {
-            println!("enrolled as {}", identity.node_id);
+            // The role is written after the enrollment, so a refused join
+            // leaves no role behind for `quoro node` to act on.
+            if let Err(e) = write_role(&agent.data_dir, role) {
+                eprintln!("quoro join: {e}");
+                return 1;
+            }
+            println!("enrolled as {} ({role})", identity.node_id);
             0
         }
         Err(e) => {
@@ -184,6 +292,10 @@ fn systemctl(action: &str) -> Result<(), String> {
 /// control plane's local join file, which lives in the control plane's data
 /// directory; any other machine must have run `quoro join`.
 ///
+/// The role persisted at enrollment picks the engine. An edge-only machine
+/// holds no engine at all, so [`NullEngine`] lets the agent run on a host
+/// without KVM (ADR 0143); a node needs Cloud Hypervisor as before.
+///
 /// # Errors
 ///
 /// A message for the operator; refusals to run on this host are returned as
@@ -192,19 +304,25 @@ pub async fn run(
     config: &Config,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<i32, String> {
+    let role = read_role(&config.node.data_dir);
+    if !role.runs_vms() {
+        info!("running as {role} without an engine: this machine starts no VMs");
+        return run_with(config, role, NullEngine::new(), shutdown).await;
+    }
     match config.engine {
-        EngineKind::Fake => run_with(config, FakeEngine::new(), shutdown).await,
-        EngineKind::CloudHypervisor => run_cloud_hypervisor(config, shutdown).await,
+        EngineKind::Fake => run_with(config, role, FakeEngine::new(), shutdown).await,
+        EngineKind::CloudHypervisor => run_cloud_hypervisor(config, role, shutdown).await,
     }
 }
 
 #[cfg(target_os = "linux")]
 async fn run_cloud_hypervisor(
     config: &Config,
+    role: Role,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<i32, String> {
     match cloud_hypervisor_engine(config).await {
-        Ok(engine) => run_with(config, engine, shutdown).await,
+        Ok(engine) => run_with(config, role, engine, shutdown).await,
         Err(code) => Ok(code),
     }
 }
@@ -212,6 +330,7 @@ async fn run_cloud_hypervisor(
 #[cfg(not(target_os = "linux"))]
 async fn run_cloud_hypervisor(
     _config: &Config,
+    _role: Role,
     _shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<i32, String> {
     eprintln!("the cloud-hypervisor engine runs on Linux only");
@@ -276,10 +395,11 @@ async fn cloud_hypervisor_engine(config: &Config) -> Result<quoro_engine::ch::Ch
 /// Enrolls through the local join file when needed, then runs the agent.
 async fn run_with<E: Engine + 'static>(
     config: &Config,
+    role: Role,
     engine: E,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<i32, String> {
-    let agent = agent_config(config);
+    let agent = agent_config(config, role);
     let facts = facts_of(&engine).await;
     let dns = &agent.dns;
     if dns.is_empty() {
@@ -351,7 +471,17 @@ fn parse_local_join(text: &str) -> Result<JoinTarget, String> {
     })
 }
 
-/// The facts `quoro join` reports, from the engine the node will run.
+/// The facts `quoro join` reports, from the engine the machine will run.
+async fn join_facts(config: &Config, role: Role) -> Result<NodeFacts, i32> {
+    if !role.runs_vms() {
+        // An edge enrolls without KVM and without an engine; the probe still
+        // reports /dev/kvm as it finds it (section 2.3).
+        return Ok(facts_of(&NullEngine::new()).await);
+    }
+    facts_for(config).await
+}
+
+/// The facts `quoro join` reports for a node, from the engine it will run.
 async fn facts_for(config: &Config) -> Result<NodeFacts, i32> {
     match config.engine {
         EngineKind::Fake => Ok(facts_of(&FakeEngine::new()).await),
@@ -434,5 +564,62 @@ mod tests {
         assert_eq!(target.token, "njt_x");
         assert_eq!(target.fingerprint, "sha256:ab");
         assert!(parse_local_join("{}").is_err());
+    }
+
+    #[test]
+    fn roles_parse_and_refuse_anything_else() {
+        assert_eq!(Role::default(), Role::Node, "an unasked machine is a node");
+        assert_eq!(Role::parse("node"), Ok(Role::Node));
+        assert_eq!(Role::parse("edge"), Ok(Role::Edge));
+        for bad in ["primary", "witness", "Edge", ""] {
+            let err = Role::parse(bad).expect_err("only node and edge are join roles");
+            assert!(err.contains("expected node or edge"), "{err}");
+        }
+        assert_eq!(Role::Edge.enrollment_roles(), vec!["edge".to_string()]);
+        assert_eq!(Role::Node.enrollment_roles(), vec!["node".to_string()]);
+        assert!(!Role::Edge.runs_vms());
+        assert!(Role::Node.runs_vms());
+    }
+
+    #[test]
+    fn the_persisted_role_round_trips_and_missing_means_node() {
+        let dir = test_dir("role-round-trip");
+        assert_eq!(
+            read_role(&dir),
+            Role::Node,
+            "a data directory without a role file is a node"
+        );
+
+        write_role(&dir, Role::Edge).unwrap();
+        assert_eq!(read_role(&dir), Role::Edge);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(dir.join(ROLE_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "the role is private like the identity");
+        }
+
+        write_role(&dir, Role::Node).unwrap();
+        assert_eq!(read_role(&dir), Role::Node);
+
+        std::fs::write(dir.join(ROLE_FILE), "nonsense").unwrap();
+        assert_eq!(
+            read_role(&dir),
+            Role::Node,
+            "an unreadable value falls back to the safe role"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A fresh directory for one test, named after it.
+    fn test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("quoro-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }

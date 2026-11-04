@@ -446,6 +446,9 @@ pub async fn create_app_domain(
             for vm_id in vm_ids {
                 state.notify_driver(&vm_id);
             }
+            // A domain of a replicated app is an edge route even when the app
+            // runs no VM yet (ADR 0143).
+            state.hub.edge_changed();
             Ok((StatusCode::CREATED, Json(domain)).into_response())
         }
         Err(error) => {
@@ -650,6 +653,7 @@ pub async fn delete_domain(
             for vm_id in vm_ids {
                 state.notify_driver(&vm_id);
             }
+            state.hub.edge_changed();
             Ok(StatusCode::NO_CONTENT)
         }
         Err(error) => {

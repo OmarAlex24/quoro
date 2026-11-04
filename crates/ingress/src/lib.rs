@@ -45,7 +45,7 @@ pub mod public;
 pub mod route;
 pub mod tunnel;
 
-pub use route::{Route, RouteTable, TlsMode};
+pub use route::{RetryPolicy, Route, RouteTable, TlsMode};
 
 use std::fmt;
 use std::future::Future;

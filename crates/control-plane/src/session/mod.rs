@@ -32,7 +32,8 @@ use base64::Engine as _;
 use quoro_proto::wire::{self, ControlMessage, NodeMessage};
 use quoro_providers::DnsProvider;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use sqlx::Row;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -276,6 +277,11 @@ struct HubInner {
     /// The source address each node's session came from, in memory only: the
     /// edge's WireGuard endpoint (ADR 0144).
     session_ips: Mutex<HashMap<String, IpAddr>>,
+    /// The newest `edge_backends` report of each edge machine, in memory only
+    /// (section 5.3, ADR 0143).
+    edge_reports: Mutex<HashMap<String, Vec<wire::EdgeBackendStatus>>>,
+    /// The edge's health view of each app between reports (ADR 0143).
+    edge_health: Mutex<BTreeMap<String, crate::edge_health::AppHealth>>,
     generation: AtomicU64,
 }
 
@@ -314,6 +320,8 @@ impl NodeHub {
             advertised_urls: Mutex::new(None),
             dns_records: Mutex::new(HashMap::new()),
             session_ips: Mutex::new(HashMap::new()),
+            edge_reports: Mutex::new(HashMap::new()),
+            edge_health: Mutex::new(BTreeMap::new()),
             generation: AtomicU64::new(0),
         }))
     }
@@ -349,6 +357,14 @@ impl NodeHub {
         if let Some(changed) = changed {
             changed.notify_one();
         }
+    }
+
+    /// Tells every edge machine's live session to rebuild its snapshot and to
+    /// reconcile its tunnel, because an input of `spec.edge` changed (ADR
+    /// 0143): a VM, a domain, an app or the edge's own tunnel mapping.
+    pub fn edge_changed(&self) {
+        let inner = Arc::clone(&self.0);
+        tokio::spawn(async move { inner.edge_changed().await });
     }
 
     /// Tells every live session to rebuild and resend its desired state
@@ -404,6 +420,20 @@ impl NodeHub {
         if let Some(kick) = kick {
             kick.kick(node_id);
         }
+    }
+
+    /// The newest `edge_backends` report of each edge machine, keyed by edge
+    /// node id and ordered by it. Empty while no edge reported since the
+    /// primary started: the report is kept in memory only (ADR 0143).
+    #[must_use]
+    pub fn edge_reports(&self) -> Vec<(String, Vec<wire::EdgeBackendStatus>)> {
+        let reports = self.0.edge_reports.lock().expect("edge report lock");
+        let mut reports: Vec<(String, Vec<wire::EdgeBackendStatus>)> = reports
+            .iter()
+            .map(|(node_id, entries)| (node_id.clone(), entries.clone()))
+            .collect();
+        reports.sort_by(|a, b| a.0.cmp(&b.0));
+        reports
     }
 
     /// Registers the tunnel manager.
@@ -743,6 +773,58 @@ impl HubInner {
             };
             if let Some(changed) = changed {
                 changed.notify_one();
+            }
+        }
+        // The edge's `spec.edge` lists this VM's address and port, whichever
+        // node runs it (ADR 0143).
+        self.edge_changed().await;
+    }
+
+    /// Tells every edge machine with a live session to rebuild its snapshot
+    /// and to reconcile its tunnel, since `spec.edge` reads `vms`, `domains`
+    /// and `apps.replicas` of the whole cluster.
+    async fn edge_changed(&self) {
+        let rows: Vec<(String, String)> = match sqlx::query_as(
+            "SELECT id, roles FROM nodes WHERE status <> 'removed' ORDER BY id",
+        )
+        .fetch_all(self.store.pool())
+        .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(%e, "cannot read the edge machines");
+                return;
+            }
+        };
+        for (node_id, roles) in rows {
+            let holds_role = match serde_json::from_str::<Vec<String>>(&roles) {
+                Ok(roles) => roles.iter().any(|role| role == "edge"),
+                Err(e) => {
+                    tracing::warn!(%e, node_id, "the stored roles are not a JSON array");
+                    false
+                }
+            };
+            if !holds_role {
+                continue;
+            }
+            let changed = {
+                let sessions = self.sessions.lock().expect("session lock");
+                sessions
+                    .get(&node_id)
+                    .map(|handle| Arc::clone(&handle.changed))
+            };
+            let Some(changed) = changed else {
+                // A machine without a session gets the new snapshot when it
+                // dials.
+                continue;
+            };
+            changed.notify_one();
+            let kick = {
+                let tunnels = self.tunnels.lock().expect("tunnel handle lock");
+                tunnels.clone()
+            };
+            if let Some(kick) = kick {
+                kick.kick(&node_id);
             }
         }
     }
@@ -1986,6 +2068,17 @@ async fn set_applied_rev(hub: &NodeHub, node_id: &str, rev: u64) -> Result<(), S
     w.commit().await.map_err(|e| e.to_string())
 }
 
+/// The fields of a VM row [`apply_status_report`] reads before it applies an
+/// observation: its node, app, address, observed status and the app's replica
+/// count, so a change can refresh the VM's node and the edge.
+struct ObservedVm {
+    node_id: String,
+    app_id: Option<String>,
+    ip: Option<String>,
+    observed_status: String,
+    replicas: Option<i64>,
+}
+
 /// Applies a `status_report` (section 5.3): observed VM state goes through the
 /// same [`driver`] functions the in-process driver used, so the `vm.*` events
 /// stay in one place. VMs of other nodes are ignored.
@@ -1996,14 +2089,27 @@ async fn apply_status_report(
     notified_deleted: &mut HashSet<String>,
 ) -> Result<(), String> {
     for vm in &report.vms {
-        let owner: Option<(String, Option<String>)> =
-            sqlx::query_as("SELECT node_id, app_id FROM vms WHERE id = ?")
-                .bind(&vm.vm_id)
-                .fetch_optional(hub.0.store.pool())
-                .await
-                .map_err(|e| format!("cannot read vms.node_id: {e}"))?;
+        let row = sqlx::query(
+            "SELECT node_id, app_id, ip, observed_status, \
+                    (SELECT replicas FROM apps WHERE apps.id = vms.app_id) AS replicas \
+             FROM vms WHERE id = ?",
+        )
+        .bind(&vm.vm_id)
+        .fetch_optional(hub.0.store.pool())
+        .await
+        .map_err(|e| format!("cannot read vms.node_id: {e}"))?;
+        let owner = match row {
+            Some(row) => Some(ObservedVm {
+                node_id: row.try_get("node_id").map_err(|e| e.to_string())?,
+                app_id: row.try_get("app_id").map_err(|e| e.to_string())?,
+                ip: row.try_get("ip").map_err(|e| e.to_string())?,
+                observed_status: row.try_get("observed_status").map_err(|e| e.to_string())?,
+                replicas: row.try_get("replicas").map_err(|e| e.to_string())?,
+            }),
+            None => None,
+        };
         match owner {
-            Some((owner, app_id)) if owner == node_id => {
+            Some(owner) if owner.node_id == node_id => {
                 let observation = driver::Observation {
                     status: driver_observed(vm.observed_status),
                     ip: vm.ip.clone(),
@@ -2013,7 +2119,22 @@ async fn apply_status_report(
                 driver::report_observed(&hub.0.store, node_id, &vm.vm_id, &observation)
                     .await
                     .map_err(|e| format!("{e:?}"))?;
-                if app_id.is_some() {
+                // `spec.edge` lists the backend's address, and a node's
+                // `spec.mesh.allow` its address and port: a change to either
+                // refreshes both (ADR 0143, ADR 0144).
+                let ip_changed = vm
+                    .ip
+                    .as_deref()
+                    .is_some_and(|ip| owner.ip.as_deref() != Some(ip));
+                let status_changed =
+                    driver_observed(vm.observed_status).as_str() != owner.observed_status.as_str();
+                if ip_changed || status_changed {
+                    if owner.replicas.is_some_and(|replicas| replicas > 1) {
+                        hub.node_changed(node_id);
+                    }
+                    hub.edge_changed();
+                }
+                if owner.app_id.is_some() {
                     match deploy::on_vm_observed(&hub.0.store, node_id, vm).await {
                         Ok(vms) => {
                             for changed in vms {
@@ -2040,6 +2161,9 @@ async fn apply_status_report(
             }
         }
     }
+    if let Err(e) = apply_edge_report(hub, node_id, &report.edge_backends).await {
+        tracing::warn!(%e, node_id, "cannot apply the edge's backend report");
+    }
     for build in &report.builds {
         match crate::build::apply_build_status(&hub.0.store, node_id, build).await {
             Ok(true) => hub.node_changed(node_id),
@@ -2053,6 +2177,116 @@ async fn apply_status_report(
     }
     set_applied_rev(hub, node_id, report.applied_rev).await?;
     apply_route_statuses(hub, node_id, &report.routes).await
+}
+
+/// Keeps the newest `edge_backends` of an edge machine in memory and turns a
+/// change of an app's rotation state into `app.degraded`, `app.down` or
+/// `app.up` (section 5.3, ADR 0143). Nothing is written to the
+/// database except the events; a machine without the `edge` role is ignored.
+async fn apply_edge_report(
+    hub: &NodeHub,
+    node_id: &str,
+    report: &[wire::EdgeBackendStatus],
+) -> Result<(), String> {
+    if !has_edge_role(hub, node_id).await? {
+        return Ok(());
+    }
+    {
+        let mut reports = hub.0.edge_reports.lock().expect("edge report lock");
+        if report.is_empty() {
+            reports.remove(node_id);
+        } else {
+            reports.insert(node_id.to_string(), report.to_vec());
+        }
+    }
+    if report.is_empty() {
+        return Ok(());
+    }
+
+    let mut app_ids: Vec<String> = report.iter().map(|entry| entry.app_id.clone()).collect();
+    app_ids.sort_unstable();
+    app_ids.dedup();
+    let mut apps = BTreeMap::new();
+    for app_id in app_ids {
+        let row: Option<(String, i64)> =
+            sqlx::query_as("SELECT project_id, replicas FROM apps WHERE id = ?")
+                .bind(&app_id)
+                .fetch_optional(hub.0.store.pool())
+                .await
+                .map_err(|e| format!("cannot read the app of an edge backend: {e}"))?;
+        if let Some((project_id, replicas)) = row {
+            apps.insert(
+                app_id,
+                crate::edge_health::AppFacts {
+                    project_id,
+                    replicas,
+                },
+            );
+        }
+    }
+    let events = {
+        let mut state = hub.0.edge_health.lock().expect("edge health lock");
+        crate::edge_health::apply(&mut state, node_id, report, &apps)
+    };
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    let mut w = hub.0.store.begin_write().await.map_err(|e| e.to_string())?;
+    for event in events {
+        let Some(facts) = apps.get(&event.app_id) else {
+            continue;
+        };
+        let id = events::emit(
+            &mut w.tx,
+            events::NewEvent {
+                kind: event.kind,
+                source: events::Source::ControlPlane,
+                subject_type: "app",
+                subject_id: &event.app_id,
+                project_id: Some(&facts.project_id),
+                request_id: None,
+                actor: None,
+                data: event.data.clone(),
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        // `app.down` and `app.up` move the app's incident exactly as a node's
+        // detection does; `app.degraded` opens none (ADR 0143).
+        if event.kind != "app.degraded" {
+            let detection = wire::EventBody {
+                schema_version: 1,
+                id,
+                kind: event.kind.to_string(),
+                time: now_rfc3339(),
+                source: json!({ "kind": "control_plane" }),
+                subject: json!({ "type": "app", "id": event.app_id }),
+                project_id: Some(facts.project_id.clone()),
+                incident_id: None,
+                request_id: None,
+                actor: None,
+                data: event.data,
+            };
+            crate::service::incidents::apply_node_event(&mut w.tx, &detection)
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+        }
+    }
+    w.commit().await.map_err(|e| e.to_string())
+}
+
+/// Whether `node_id` is a non-removed machine with the `edge` role.
+async fn has_edge_role(hub: &NodeHub, node_id: &str) -> Result<bool, String> {
+    let roles: Option<String> =
+        sqlx::query_scalar("SELECT roles FROM nodes WHERE id = ? AND status <> 'removed'")
+            .bind(node_id)
+            .fetch_optional(hub.0.store.pool())
+            .await
+            .map_err(|e| format!("cannot read the roles of {node_id}: {e}"))?;
+    Ok(roles
+        .and_then(|roles| serde_json::from_str::<Vec<String>>(&roles).ok())
+        .is_some_and(|roles| roles.iter().any(|role| role == "edge")))
 }
 
 /// The certificate state a node reported for the hostnames it serves

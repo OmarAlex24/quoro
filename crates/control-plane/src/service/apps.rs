@@ -3,8 +3,8 @@
 
 use crate::AppState;
 use crate::api::apps::{
-    APP_COLUMNS, App, AppDetail, AppList, ListAppsQuery, app_from_row, app_target, app_vms,
-    delete_app_tx, redeploy_app_tx, restart_app_tx,
+    APP_COLUMNS, App, AppDetail, AppList, EdgeBackend, ListAppsQuery, app_from_row, app_target,
+    app_vms, delete_app_tx, redeploy_app_tx, restart_app_tx,
 };
 use crate::api::deployments::Deployment;
 use crate::api::domains::{DOMAIN_COLUMNS, domain_from_row};
@@ -12,6 +12,7 @@ use crate::api::page;
 use crate::deploy;
 use crate::error::ApiError;
 use crate::request::{CallCtx, Resource};
+use quoro_proto::wire::EdgeOutReason;
 use quoro_types::{Prefix, Scope, is_id};
 use serde_json::{Map, Value, json};
 
@@ -127,13 +128,38 @@ pub async fn get_app(state: &AppState, ctx: &CallCtx, app_id: &str) -> Result<Ap
             app,
             instances,
             domains,
-            // Filled from the edge's in-memory report once the edge serves
-            // routes (ADR 0143).
-            edge_backends: Vec::new(),
+            edge_backends: edge_backends(state, app_id),
         })
     }
     .await;
     ctx.finish_read(state, access, result).await
+}
+
+/// The app's backends as the edge machines see them, from each edge's newest
+/// in-memory `status_report` (ADR 0143). Empty while no edge reports
+/// the app.
+fn edge_backends(state: &AppState, app_id: &str) -> Vec<EdgeBackend> {
+    let mut backends = Vec::new();
+    for (edge_node_id, entries) in state.hub.edge_reports() {
+        for entry in entries {
+            if entry.app_id != app_id {
+                continue;
+            }
+            backends.push(EdgeBackend {
+                edge_node_id: edge_node_id.clone(),
+                vm_id: entry.vm_id,
+                node_id: entry.node_id,
+                in_rotation: entry.in_rotation,
+                since: entry.since,
+                reason: entry.reason.map(|reason| match reason {
+                    EdgeOutReason::HealthCheck => "health_check".to_string(),
+                    EdgeOutReason::ConnectFailed => "connect_failed".to_string(),
+                }),
+                last_error: entry.last_error,
+            });
+        }
+    }
+    backends
 }
 
 /// Deletes an app and its data. The authorization path refuses an agent
@@ -158,6 +184,8 @@ pub async fn delete_app(state: &AppState, ctx: &CallCtx, app_id: &str) -> Result
             for node_id in build_nodes {
                 state.hub.node_changed(&node_id);
             }
+            // The app's routes leave `spec.edge` of the edge.
+            state.hub.edge_changed();
             Ok(app)
         }
         Err(error) => {

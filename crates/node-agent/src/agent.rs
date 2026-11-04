@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use quoro_engine::Engine;
+use quoro_ingress::proxy::BackendObserver;
 use quoro_proto::sign;
 use quoro_proto::wire::DesiredState;
 use tokio::sync::watch;
@@ -22,6 +23,7 @@ use crate::build::buildkit::{
     BuilderConfig, DEFAULT_FETCH_TIMEOUT, DockerfileBuilder, find_git, pinned_image,
 };
 use crate::build::manager::BuildManager;
+use crate::edge::EdgeManager;
 use crate::identity::IdentityHandle;
 use crate::ingress::{CertificateEvents, DnsBridge, IngressSupervisor};
 use crate::interactive::Interactive;
@@ -67,6 +69,11 @@ pub async fn run<E: Engine + 'static>(
         Arc::clone(&dns),
         CertificateEvents::new(store.clone(), Some(identity.get().node_id)),
     ));
+    // The edge manager runs on every machine; it does nothing while the
+    // snapshot has no `spec.edge`. It is also the proxy's backend observer, so
+    // a connection failure takes a backend out of rotation at once.
+    let edge = Arc::new(EdgeManager::new(Arc::clone(&ingress)));
+    ingress.set_observer(Arc::clone(&edge) as Arc<dyn BackendObserver>);
 
     // One engine handle serves every loop: the reconciler runs the app VMs,
     // the builder runs one builder VM per build (ADR 0117, ADR 0118), and the
@@ -121,6 +128,8 @@ pub async fn run<E: Engine + 'static>(
         MeshManager::new(PlatformMeshDriver::new(), mesh_key)
             .run(desired.subscribe(), wait_stop(stop_rx.clone())),
     );
+    let edge_task =
+        tokio::spawn(Arc::clone(&edge).run(desired.subscribe(), wait_stop(stop_rx.clone())));
 
     // Terminal transcripts are pruned at agent start and then hourly; each
     // terminal session also prunes once it ends (section 3.3).
@@ -153,6 +162,7 @@ pub async fn run<E: Engine + 'static>(
     })
     .with_ingress(Arc::clone(&ingress), dns)
     .with_metrics(metrics)
+    .with_edge(Arc::clone(&edge))
     .with_mesh_key(mesh_public_key)
     .with_interactive(interactive);
     let outcome = session.run(stop_rx).await;
@@ -163,6 +173,7 @@ pub async fn run<E: Engine + 'static>(
     let _ = metrics_task.await;
     let _ = build_task.await;
     let _ = mesh_task.await;
+    let _ = edge_task.await;
     ingress.shutdown().await;
     shutdown_task.abort();
     outcome

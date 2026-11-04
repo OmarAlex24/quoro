@@ -11,14 +11,16 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use quoro_ingress::certs::CertStore;
 use quoro_ingress::proxy::{
-    ListenerMode, ProxyCore, serve_http, serve_https, serve_redirect, tls_server_config,
+    BackendObserver, ListenerMode, ProxyCore, serve_http, serve_https, serve_redirect,
+    tls_server_config,
 };
-use quoro_ingress::{Route, RouteTable, TlsMode};
+use quoro_ingress::{RetryPolicy, Route, RouteTable, TlsMode};
 use rustls::pki_types::{CertificateDer, ServerName};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -44,6 +46,18 @@ fn route(host: &str, backends: Vec<SocketAddr>, tls: TlsMode) -> Route {
         hostname: host.to_string(),
         backends,
         tls,
+        retry: quoro_ingress::RetryPolicy::Unsent,
+        response_timeout: None,
+    }
+}
+
+fn edge_route(host: &str, backends: Vec<SocketAddr>, tls: TlsMode) -> Route {
+    Route {
+        hostname: host.to_string(),
+        backends,
+        tls,
+        retry: RetryPolicy::IdempotentOnce,
+        response_timeout: Some(Duration::from_secs(60)),
     }
 }
 
@@ -688,5 +702,136 @@ async fn shutdown_stops_accepting() {
     assert!(
         TcpStream::connect(addr).await.is_err(),
         "listener still accepting"
+    );
+}
+
+#[derive(Default)]
+struct RecordingObserver {
+    failures: Mutex<Vec<(String, SocketAddr, String)>>,
+}
+
+impl BackendObserver for RecordingObserver {
+    fn connect_failed(&self, hostname: &str, backend: SocketAddr, error: &str) {
+        self.failures
+            .lock()
+            .unwrap()
+            .push((hostname.to_string(), backend, error.to_string()));
+    }
+}
+
+#[tokio::test]
+async fn an_edge_route_retries_a_connect_failure_once_for_get_and_head_only() {
+    let dead = unused_port();
+    let live = spawn_backend("L").await;
+    let core = ProxyCore::new();
+    core.set_table(table(vec![edge_route(
+        "edge.example.com",
+        vec![dead, live],
+        TlsMode::Acme,
+    )]));
+    let (addr, _shutdown, _handle) = spawn_http(core, mode(TlsMode::Acme, "https", false)).await;
+    let client = client();
+
+    // GET starts on the dead backend and is retried on the live one.
+    let (status, body) = get(&client, addr, "edge.example.com", "/").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("backend: L"), "{body}");
+
+    // HEAD is idempotent too.
+    let head = Request::builder()
+        .method("HEAD")
+        .uri(format!("http://{addr}/"))
+        .header(HOST, "edge.example.com")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let response = client.request(head).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // POST is never sent twice: with the dead backend first it answers 502.
+    let core = ProxyCore::new();
+    core.set_table(table(vec![edge_route(
+        "edge.example.com",
+        vec![dead, live],
+        TlsMode::Acme,
+    )]));
+    let (addr, _shutdown, _handle) = spawn_http(core, mode(TlsMode::Acme, "https", false)).await;
+    let (status, body) = request(
+        &client,
+        addr,
+        Some("edge.example.com"),
+        "POST",
+        "/",
+        Bytes::from_static(b"payload"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+}
+
+#[tokio::test]
+async fn the_observer_sees_a_backend_that_cannot_connect() {
+    let dead = unused_port();
+    let observer = Arc::new(RecordingObserver::default());
+    let core = ProxyCore::new();
+    core.set_observer(Arc::clone(&observer) as Arc<dyn BackendObserver>);
+    core.set_table(table(vec![edge_route(
+        "edge.example.com",
+        vec![dead],
+        TlsMode::Acme,
+    )]));
+    let (addr, _shutdown, _handle) = spawn_http(core, mode(TlsMode::Acme, "https", false)).await;
+
+    let (status, _) = get(&client(), addr, "edge.example.com", "/").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+    let failures = observer.failures.lock().unwrap();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert_eq!(failures[0].0, "edge.example.com");
+    assert_eq!(failures[0].1, dead);
+    assert!(!failures[0].2.is_empty());
+}
+
+#[tokio::test]
+async fn a_route_with_no_backend_answers_502() {
+    let core = ProxyCore::new();
+    core.set_table(table(vec![edge_route(
+        "edge.example.com",
+        Vec::new(),
+        TlsMode::Acme,
+    )]));
+    let (addr, _shutdown, _handle) = spawn_http(core, mode(TlsMode::Acme, "https", false)).await;
+    let (status, body) = get(&client(), addr, "edge.example.com", "/").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body, "backend unavailable\n");
+}
+
+#[tokio::test]
+async fn a_backend_that_never_sends_headers_hits_the_response_timeout() {
+    // The listener accepts and then never answers.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend = listener.local_addr().unwrap();
+    let accepted = Arc::new(Mutex::new(Vec::new()));
+    let held = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            held.lock().unwrap().push(stream);
+        }
+    });
+
+    let core = ProxyCore::new();
+    core.set_table(table(vec![Route {
+        hostname: "edge.example.com".to_string(),
+        backends: vec![backend],
+        tls: TlsMode::Acme,
+        retry: RetryPolicy::IdempotentOnce,
+        response_timeout: Some(Duration::from_millis(200)),
+    }]));
+    let (addr, _shutdown, _handle) = spawn_http(core, mode(TlsMode::Acme, "https", false)).await;
+
+    let started = std::time::Instant::now();
+    let (status, body) = get(&client(), addr, "edge.example.com", "/").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the response timeout did not fire"
     );
 }

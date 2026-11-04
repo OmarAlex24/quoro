@@ -20,6 +20,7 @@ use base64::Engine as _;
 use quoro_proto::wire::{MeshAllow, MeshPeer, SpecMesh};
 use serde_json::json;
 use sqlx::Row;
+use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnection;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -185,6 +186,31 @@ impl MeshNode {
     fn is_mesh_member(&self) -> bool {
         self.public_key.is_some() && self.address.is_some()
     }
+}
+
+/// The id of the edge machine (ADR 0143): the non-removed `nodes` row whose
+/// `roles` array contains `edge`, the smallest id if several. `None` when no
+/// machine holds the role.
+///
+/// # Errors
+///
+/// A message when a row cannot be read or a stored `roles` value is not a JSON
+/// array.
+pub(crate) async fn edge_node_id(pool: &SqlitePool) -> Result<Option<String>, String> {
+    let rows = sqlx::query("SELECT id, roles FROM nodes WHERE status <> 'removed' ORDER BY id")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("cannot read the nodes for the edge: {e}"))?;
+    for row in &rows {
+        let id: String = row.try_get("id").map_err(|e| e.to_string())?;
+        let roles: String = row.try_get("roles").map_err(|e| e.to_string())?;
+        let roles: Vec<String> = serde_json::from_str(&roles)
+            .map_err(|e| format!("cannot read the roles of {id}: {e}"))?;
+        if roles.iter().any(|role| role == "edge") {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
 }
 
 /// Builds `spec.mesh` for `node_id` (section 5.11, ADR 0144).

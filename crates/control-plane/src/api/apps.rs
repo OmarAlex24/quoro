@@ -1519,6 +1519,8 @@ pub async fn update_app(
             for vm_id in vm_ids {
                 state.notify_driver(&vm_id);
             }
+            // `replicas`, `port` and the health check shape `spec.edge`.
+            state.hub.edge_changed();
             Ok(Json(app))
         }
         Err(error) => {

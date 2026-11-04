@@ -11,6 +11,7 @@
 
 mod agent;
 pub mod build;
+pub mod edge;
 pub mod enroll;
 pub mod health;
 pub mod identity;

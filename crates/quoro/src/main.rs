@@ -12,6 +12,7 @@ mod audit_cli;
 mod config;
 mod mcp_stdio;
 mod node;
+mod null_engine;
 mod panel;
 mod privilege;
 mod serve;
@@ -31,8 +32,11 @@ commands:
   setup-token [--config PATH]           print a one-time first-run setup token
   version                               print the version
   join <url> --token TOKEN --fingerprint FINGERPRINT [--config PATH]
-                                        enroll this machine as a node
-  node [--config PATH]                  run the node agent
+            [--role node|edge]
+                                        enroll this machine as a node (the
+                                        default, runs microVMs) or as an edge
+                                        (runs the proxy, no engine, no KVM)
+  node [--config PATH]                  run the node agent with the role joined
   node set-primary <url> [--config PATH] [--no-restart]
                                         point this enrolled node at its
                                         primary's new address
@@ -104,8 +108,15 @@ async fn serve_command(args: &[String]) -> ExitCode {
     // D-0054 defines three roles; M1 runs the primary, which is the node role.
     match role {
         "node" => {}
-        "witness" | "edge" => {
+        "witness" => {
             eprintln!("role {role} arrives in M5");
+            return ExitCode::from(2);
+        }
+        "edge" => {
+            // An edge is its own agent on its own machine, not a primary role.
+            eprintln!(
+                "an edge is not a serve role; enroll the machine with 'quoro join --role edge' and run 'quoro node'"
+            );
             return ExitCode::from(2);
         }
         other => {
@@ -131,18 +142,23 @@ async fn serve_command(args: &[String]) -> ExitCode {
     }
 }
 
-/// `quoro join <url> --token TOKEN --fingerprint FINGERPRINT [--config PATH]`.
+/// `quoro join <url> --token TOKEN --fingerprint FINGERPRINT [--config PATH]
+/// [--role node|edge]`.
 async fn join_command(args: &[String]) -> ExitCode {
     let Some((url, rest)) = args.split_first().filter(|(url, _)| !url.starts_with("--")) else {
         return usage_error("join needs the primary's URL");
     };
-    let flags = match parse_flags(rest, &["config", "token", "fingerprint"]) {
+    let flags = match parse_flags(rest, &["config", "token", "fingerprint", "role"]) {
         Ok(flags) => flags,
         Err(e) => return usage_error(&e),
     };
     let (Some(token), Some(fingerprint)) = (flag(&flags, "token"), flag(&flags, "fingerprint"))
     else {
         return usage_error("join needs --token and --fingerprint");
+    };
+    let role = match join_role(&flags) {
+        Ok(role) => role,
+        Err(e) => return usage_error(&e),
     };
     let Some(config) = load_config("join", &config_path(&flags)) else {
         return ExitCode::from(1);
@@ -152,7 +168,15 @@ async fn join_command(args: &[String]) -> ExitCode {
         token: token.to_string(),
         fingerprint: fingerprint.to_string(),
     };
-    exit_code(node::join(&config, &target).await)
+    exit_code(node::join(&config, &target, role).await)
+}
+
+/// The `--role` of a join command: `node` when it was not given (ADR 0143).
+fn join_role(flags: &[(String, String)]) -> Result<node::Role, String> {
+    match flag(flags, "role") {
+        Some(text) => node::Role::parse(text),
+        None => Ok(node::Role::default()),
+    }
 }
 
 /// `quoro mcp stdio --url URL --fingerprint FINGERPRINT --key-file PATH
@@ -437,6 +461,23 @@ mod tests {
         );
         assert!(parse_set_primary_flags(&args(&["--config"])).is_err());
         assert!(parse_set_primary_flags(&args(&["https://example.com"])).is_err());
+    }
+
+    #[test]
+    fn join_role_defaults_to_node_and_refuses_unknown_roles() {
+        assert_eq!(
+            join_role(&[]).unwrap(),
+            node::Role::Node,
+            "a join without --role enrolls a node"
+        );
+        let flags = parse_flags(&args(&["--role", "edge"]), &["role"]).unwrap();
+        assert_eq!(join_role(&flags).unwrap(), node::Role::Edge);
+        let flags = parse_flags(&args(&["--role", "node"]), &["role"]).unwrap();
+        assert_eq!(join_role(&flags).unwrap(), node::Role::Node);
+
+        let flags = parse_flags(&args(&["--role", "primary"]), &["role"]).unwrap();
+        let err = join_role(&flags).expect_err("a primary does not join");
+        assert!(err.contains("expected node or edge"), "{err}");
     }
 
     #[test]
