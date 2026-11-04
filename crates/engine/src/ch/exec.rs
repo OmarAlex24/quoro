@@ -7,6 +7,10 @@
 //! `OK <port>\n`; after that the connection carries the frames of
 //! [`quoro_init::exec`], the same codec the guest init uses.
 //!
+//! The `OK` names the host-side port the VMM allocated for this connection
+//! (Cloud Hypervisor counts up from 2^30), not the guest port, so any port
+//! number is a success; a guest port without a listener gets no `OK` at all.
+//!
 //! The relay bridges the vsock connection and an in-memory duplex pair handed
 //! out as [`ExecSession::io`]. The duplex is fixed-size, so when the client
 //! stops reading, the relay stops reading vsock, virtio-vsock's credit flow
@@ -46,8 +50,8 @@ const READ_BYTES: usize = 64 * 1024;
 /// # Errors
 ///
 /// `Conflict` when the request breaks the format, when the socket refuses the
-/// connection, or when the handshake is not an `OK` for the exec port — the
-/// last is what a VM whose init predates M4 answers.
+/// connection, or when the handshake ends without an `OK` — the last is what
+/// a VM whose init predates M4 answers.
 pub(super) async fn open(
     vm: &str,
     socket: &Path,
@@ -67,7 +71,7 @@ pub(super) async fn open(
         Ok(Ok(reply)) => reply,
         Ok(Err(_)) | Err(_) => return Err(refused(vm)),
     };
-    if !accepts_exec_port(&reply) {
+    if !is_connect_ok(&reply) {
         return Err(refused(vm));
     }
     let frame = HostFrame::Open(open)
@@ -123,18 +127,16 @@ async fn handshake(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
     Ok(reply)
 }
 
-/// True when `reply` is `OK <port>\n` for the exec port.
-fn accepts_exec_port(reply: &[u8]) -> bool {
+/// True when `reply` is the VMM's `OK <port>\n`. The port is the host-side
+/// port of the connection, which the VMM picks, so only its form is checked.
+fn is_connect_ok(reply: &[u8]) -> bool {
     let Some(line) = reply.strip_suffix(b"\n") else {
         return false;
     };
     let Some(port) = line.strip_prefix(b"OK ") else {
         return false;
     };
-    std::str::from_utf8(port)
-        .ok()
-        .and_then(|text| text.trim().parse::<u32>().ok())
-        == Some(quoro_init::EXEC_PORT)
+    std::str::from_utf8(port).is_ok_and(|text| text.parse::<u32>().is_ok())
 }
 
 /// How one session ended.
@@ -327,7 +329,7 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::{UnixListener, UnixStream};
 
-    use super::{accepts_exec_port, open};
+    use super::{is_connect_ok, open};
     use crate::{EngineError, ExecRequest};
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -389,7 +391,8 @@ mod tests {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let line = read_line(&mut stream).await;
             assert_eq!(line, b"CONNECT 1024\n");
-            stream.write_all(b"OK 1024\n").await.expect("reply");
+            // Cloud Hypervisor answers with the host-side port it allocated.
+            stream.write_all(b"OK 1073741824\n").await.expect("reply");
             guest(stream, FrameReader::new()).await;
         });
     }
@@ -623,12 +626,15 @@ mod tests {
     }
 
     #[test]
-    fn the_reply_must_name_the_exec_port() {
-        assert!(accepts_exec_port(b"OK 1024\n"));
-        assert!(!accepts_exec_port(b"OK 1024"));
-        assert!(!accepts_exec_port(b"OK 2048\n"));
-        assert!(!accepts_exec_port(b"ERR 1024\n"));
-        assert!(!accepts_exec_port(b"OK 1024\nOK 1024\n"));
-        assert!(!accepts_exec_port(b""));
+    fn the_reply_is_ok_with_any_host_side_port() {
+        assert!(is_connect_ok(b"OK 1073741824\n"));
+        assert!(is_connect_ok(b"OK 1024\n"));
+        assert!(!is_connect_ok(b"OK 1073741824"));
+        assert!(!is_connect_ok(b"OK \n"));
+        assert!(!is_connect_ok(b"OK port\n"));
+        assert!(!is_connect_ok(b"OK 99999999999\n"));
+        assert!(!is_connect_ok(b"ERR 1024\n"));
+        assert!(!is_connect_ok(b"OK 1024\nOK 1024\n"));
+        assert!(!is_connect_ok(b""));
     }
 }
