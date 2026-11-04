@@ -5,6 +5,7 @@ import {
   canListUsers,
   canManageAgents,
   canManageGrants,
+  canManageUsers,
   canManageWebhooks,
   isHumanSession,
 } from './capabilities';
@@ -72,5 +73,14 @@ describe('capabilities', () => {
   it('refuses a disabled human the user list', () => {
     expect(canListUsers(user('operator', true))).toBe(false);
     expect(canListUsers(undefined)).toBe(false);
+  });
+
+  it('lets only an owner change users', () => {
+    expect(canManageUsers(user('owner'))).toBe(true);
+    expect(canManageUsers(user('operator'))).toBe(false);
+    expect(canManageUsers(user('viewer'))).toBe(false);
+    expect(canManageUsers(user('owner', true))).toBe(false);
+    expect(canManageUsers(agentSession)).toBe(false);
+    expect(canManageUsers(undefined)).toBe(false);
   });
 });

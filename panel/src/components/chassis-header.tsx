@@ -9,7 +9,15 @@ import { cn } from '../lib/utils';
 import { Button } from './ui/button';
 
 interface NavItem {
-  to: '/' | '/vms' | '/agents' | '/grants' | '/approvals' | '/audit' | '/webhooks';
+  to:
+    | '/'
+    | '/vms'
+    | '/agents'
+    | '/grants'
+    | '/approvals'
+    | '/audit'
+    | '/webhooks'
+    | '/users';
   label: string;
   match: (pathname: string) => boolean;
 }
@@ -30,6 +38,7 @@ const AGENCY_SECTIONS: NavItem[] = [
   { to: '/approvals', label: 'Approvals', match: under('/approvals') },
   { to: '/audit', label: 'Audit log', match: under('/audit') },
   { to: '/webhooks', label: 'Webhooks', match: under('/webhooks') },
+  { to: '/users', label: 'Users', match: under('/users') },
 ];
 
 const roleLabel = (role: string) => role.charAt(0).toUpperCase() + role.slice(1);

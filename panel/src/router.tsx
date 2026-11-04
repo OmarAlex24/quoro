@@ -18,6 +18,7 @@ import { AppScreen } from './screens/app-screen';
 import { DeployScreen } from './screens/deploy-screen';
 import { LoginScreen } from './screens/login-screen';
 import { SetupScreen } from './screens/setup-screen';
+import { UsersScreen } from './screens/users-screen';
 import { VmsScreen } from './screens/vms-screen';
 import { SessionProvider } from './session';
 
@@ -141,6 +142,12 @@ const webhookDetailRoute = createRoute({
   component: WebhookScreen,
 });
 
+const usersRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/users',
+  component: UsersScreen,
+});
+
 const loginRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/login',
@@ -165,6 +172,7 @@ const routeTree = rootRoute.addChildren([
   auditRoute,
   webhooksRoute,
   webhookDetailRoute,
+  usersRoute,
   loginRoute,
   setupRoute,
 ]);
