@@ -98,7 +98,14 @@ RUN set -eu; \
 
 # packaging/kernel/build-kernel.sh looks for this file: a build without it is
 # not a guest kernel release build.
+#
+# /build/src holds the source and build tree inside the container's own
+# filesystem, not on a host mount: the kernel has file names that differ only
+# in case, which a case-insensitive host disk (macOS) cannot hold, and the tree
+# is discarded with the container. Any user may write there, because the build
+# runs as the invoking user.
 RUN printf '%s\n' 'quoro guest kernel build image (packaging/kernel/Containerfile, ADR 0152)' \
-    >/etc/quoro-kernel-build
+        >/etc/quoro-kernel-build; \
+    mkdir -p -m 1777 /build/src
 
 WORKDIR /build/quoro

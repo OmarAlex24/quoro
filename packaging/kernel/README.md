@@ -31,8 +31,9 @@ stable has one.
    Checks the tarball's sha256 against `kernel.txt`, then checks kernel.org's
    signature over the uncompressed tar with `gpgv`. The signature must be made
    by the pinned primary key fingerprint.
-2. Unpacks it to a fixed path and applies the patch with `git apply`, which
-   refuses fuzz.
+2. Unpacks it to a fixed path inside the container (`/build/src`) and applies
+   the patch with `git apply`, which refuses fuzz. The tree never touches a
+   host disk, so a case-insensitive one (macOS) works too.
 3. Runs `make ch_defconfig` and requires the options the guests depend on:
    virtio block, net, console, entropy and vsock (ADR 0113), the PVH entry
    point, the 8250 serial console, ext4, overlayfs, the cgroup v2 controllers,
@@ -114,11 +115,15 @@ gh attestation verify vmlinux-x86_64 \
 
 ## Build or reproduce locally
 
-Needs an x86_64 Linux host with podman (preferred) or docker. Expect about
-3 GB in `target/kernel-build/` and 10 to 40 minutes, depending on the CPU count.
+Needs podman (preferred) or docker on an x86_64 Linux host, or Docker Desktop
+on a Mac, which runs the linux/amd64 image emulated and slower. Expect about
+150 MB in `target/kernel-build/`, about 3 GB in the container while it runs, and
+10 to 40 minutes, depending on the CPU count.
 
 ```sh
 QUORO_KERNEL_JOBS=4 packaging/kernel/build-kernel-in-container.sh
+# on a shared machine, cap the container too:
+QUORO_CONTAINER_CPUS=2 QUORO_KERNEL_JOBS=2 packaging/kernel/build-kernel-in-container.sh
 cat dist/kernel/SHA256SUMS
 ```
 

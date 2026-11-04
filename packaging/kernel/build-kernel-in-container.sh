@@ -22,10 +22,13 @@ Environment:
                           otherwise docker)
   QUORO_KERNEL_JOBS       parallel make jobs inside the container (default:
                           all CPUs); it does not change the output
+  QUORO_CONTAINER_CPUS    CPU limit for the build container (--cpus), for a
+                          shared machine; it does not change the output
 
 The image is tagged quoro-kernel-build:<hash of its inputs> and kept, so the
-next build reuses it. The source tarball and the build tree live in
-target/kernel-build/ (about 2 GB), which cargo clean removes.
+next build reuses it. The source tarball is cached in target/kernel-build/
+(about 150 MB, removed by cargo clean); the build tree (about 2 GB) lives in
+the container and is discarded with it.
 EOF
 }
 
@@ -99,9 +102,10 @@ else
 	die "sha256sum or shasum is required"
 fi
 
-# The image context holds only the Containerfile; the work directory (tarball
-# cache and build tree) is mounted at a fixed path outside the checkout's
-# mount, so the tree is never inside a git repository.
+# The image context holds only the Containerfile. The download cache is
+# mounted at a fixed path outside the checkout's mount; the build tree stays in
+# the container (/build/src), so it is never inside a git repository and never
+# on a case-insensitive host disk.
 state="$repo/target/kernel-build"
 context="$state/context"
 work="$state/work"
@@ -135,11 +139,19 @@ env_opts=
 if [ -n "${QUORO_KERNEL_JOBS+x}" ]; then
 	env_opts="--env=QUORO_KERNEL_JOBS"
 fi
+cpu_opts=
+if [ -n "${QUORO_CONTAINER_CPUS:-}" ]; then
+	case "$QUORO_CONTAINER_CPUS" in
+	*[!0-9.]* | .*) die "QUORO_CONTAINER_CPUS must be a number, not: $QUORO_CONTAINER_CPUS" ;;
+	esac
+	cpu_opts="--cpus=$QUORO_CONTAINER_CPUS"
+fi
 
 note "running packaging/kernel/build-kernel.sh in $image"
-# shellcheck disable=SC2086 # user_opts and env_opts are word lists on purpose
+# shellcheck disable=SC2086 # user_opts, env_opts and cpu_opts are word lists on purpose
 exec "$engine" run --rm --platform linux/amd64 \
 	$user_opts \
+	$cpu_opts \
 	--volume "$repo:/build/quoro:z" \
 	--volume "$work:/build/work:z" \
 	--workdir /build/quoro \

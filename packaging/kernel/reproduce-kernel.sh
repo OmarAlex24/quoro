@@ -33,6 +33,7 @@ Environment:
   QUORO_KEEP              set to 1 to keep the work directory (its path is printed)
   QUORO_CONTAINER_ENGINE  podman or docker (default: podman if installed)
   QUORO_KERNEL_JOBS       parallel make jobs (default: all CPUs)
+  QUORO_CONTAINER_CPUS    CPU limit for the build container (--cpus)
 EOF
 }
 

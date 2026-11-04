@@ -3,8 +3,9 @@
 #
 # Runs inside the guest kernel build image (packaging/kernel/Containerfile)
 # through packaging/kernel/build-kernel-in-container.sh, which mounts the
-# checkout at /build/quoro and a work directory at /build/work. It never runs
-# on a bare host: the host compiler would change the bytes.
+# checkout at /build/quoro and a download cache at /build/work. The source and
+# build tree live in /build/src, inside the container. It never runs on a bare
+# host: the host compiler would change the bytes.
 #
 # Steps: download the upstream tarball and check its sha256 and kernel.org's
 # signature, unpack it, apply the vendored Cloud Hypervisor patch, run
@@ -54,12 +55,14 @@ esac
 
 readonly CHECKOUT=/build/quoro
 readonly WORK=/build/work
+readonly SRC_ROOT=/build/src
 readonly HERE="$CHECKOUT/packaging/kernel"
 readonly RECIPE="$HERE/kernel.txt"
 readonly OUT="$CHECKOUT/dist/kernel"
 
 [ -r "$RECIPE" ] || die "cannot read $RECIPE"
 [ -d "$WORK" ] || die "$WORK is not mounted"
+[ -d "$SRC_ROOT" ] && [ -w "$SRC_ROOT" ] || die "$SRC_ROOT is missing or not writable"
 
 # Options the guests depend on. The defconfig enables them today; the build
 # fails if a recipe change ever drops one.
@@ -193,11 +196,11 @@ printf '%s\n' "$status" | awk -v fpr="$signer" '$2 == "VALIDSIG" && $NF == fpr {
 rm -rf "$gnupg"
 note "signature OK: ${tarball##*/} signed by $signer"
 
-# 2. A fresh source tree at a fixed path, with the vendored patch applied
-# exactly (git apply refuses fuzz).
-src="$WORK/linux-$version"
+# 2. A fresh source tree at a fixed path inside the container, with the
+# vendored patch applied exactly (git apply refuses fuzz).
+src="$SRC_ROOT/linux-$version"
 rm -rf "$src"
-tar -xJf "$tarball" -C "$WORK" --no-same-owner
+tar -xJf "$tarball" -C "$SRC_ROOT" --no-same-owner
 [ -f "$src/Makefile" ] || die "${tarball##*/} did not unpack to $src"
 # The tree is not a git repository, so git apply works like patch(1) and
 # setlocalversion adds nothing to the release string.
