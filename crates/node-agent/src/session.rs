@@ -1273,6 +1273,7 @@ impl Session {
             // Free space needs `statvfs`, which the standard library does not
             // expose; the binary fills a real figure in a later milestone.
             disk_free_gb: 0.0,
+            builds: Vec::new(),
         };
         write_message(sink, NodeMessage::StatusReport(report), None).await
     }
@@ -1460,6 +1461,8 @@ fn stored_to_wire(line: StoredLogLine) -> LogLine {
         stream: line.stream,
         line: line.line,
         vm_id: Some(line.vm_id),
+        vertex: None,
+        seq: None,
     }
 }
 
@@ -1597,6 +1600,8 @@ async fn run_app_logs(
                                 stream: line.stream,
                                 line: line.line,
                                 vm_id: Some(line.vm_id),
+                                vertex: None,
+                                seq: None,
                             });
                             if batch.len() >= STREAM_BATCH_LINES {
                                 let lines = std::mem::take(&mut batch);
@@ -1699,6 +1704,8 @@ fn spawn_deployment_logs(
                 stream: quoro_proto::wire::LogStream::Stdout,
                 line: line.message,
                 vm_id: line.vm_id,
+                vertex: None,
+                seq: None,
             })
             .collect();
         let mut seq = 1u64;

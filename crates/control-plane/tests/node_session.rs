@@ -376,6 +376,7 @@ async fn vm_changes_push_snapshots_and_observations_land() {
                 disk_gb: 4,
             },
             disk_free_gb: 90.0,
+            builds: Vec::new(),
         }),
     )
     .await;

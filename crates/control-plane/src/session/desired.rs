@@ -173,6 +173,7 @@ pub async fn build_spec(
             lease_id: None,
             fencing_token: None,
             volumes: Vec::new(),
+            build_id: None,
         });
     }
     drop(conn);
@@ -189,6 +190,7 @@ pub async fn build_spec(
                 gateway: network.gateway.clone(),
             },
             ingress,
+            builds: Vec::new(),
         },
         held_back,
     })

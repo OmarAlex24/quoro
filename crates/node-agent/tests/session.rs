@@ -34,6 +34,7 @@ fn desired_frame(rev: u64, key: &SigningKey, id: &str) -> String {
                 gateway: GATEWAY.to_owned(),
             },
             ingress: None,
+            builds: Vec::new(),
         },
         signature: String::new(),
     };

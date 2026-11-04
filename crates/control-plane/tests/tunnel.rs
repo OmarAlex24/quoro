@@ -1185,6 +1185,7 @@ async fn dns_challenges_are_written_by_the_primary_for_the_owning_node() {
             },
             allocated: WireCapacity::default(),
             disk_free_gb: 80.0,
+            builds: Vec::new(),
         }),
     )
     .await;

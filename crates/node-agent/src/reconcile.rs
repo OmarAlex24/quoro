@@ -1390,6 +1390,7 @@ mod tests {
                         lease_id: None,
                         fencing_token: None,
                         volumes: Vec::new(),
+                        build_id: None,
                     }],
                     routes: Vec::new(),
                     network: SpecNetwork {
@@ -1397,6 +1398,7 @@ mod tests {
                         gateway: "127.0.0.2".to_owned(),
                     },
                     ingress: None,
+                    builds: Vec::new(),
                 },
                 signature: String::new(),
             },

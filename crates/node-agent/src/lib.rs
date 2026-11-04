@@ -10,6 +10,7 @@
 //! section 2) and [`run`] (reconciler plus dial-out session, sections 3-6).
 
 mod agent;
+pub mod build;
 pub mod enroll;
 pub mod health;
 pub mod identity;

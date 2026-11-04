@@ -114,6 +114,7 @@ pub fn spec_vm(vm_id: &str, project_id: &str, desired_status: DesiredStatus) -> 
         lease_id: None,
         fencing_token: None,
         volumes: Vec::new(),
+        build_id: None,
     }
 }
 
@@ -134,6 +135,7 @@ pub fn snapshot(rev: u64, vms: Vec<SpecVm>) -> Snapshot {
                     gateway: GATEWAY.to_owned(),
                 },
                 ingress: None,
+                builds: Vec::new(),
             },
             signature: String::new(),
         },
