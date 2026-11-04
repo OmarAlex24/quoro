@@ -272,8 +272,11 @@ async fn set_token_env(server: &Server, owner: &reqwest::Client, app_id: &str) {
 }
 
 async fn start_build(server: &Server, owner: &reqwest::Client, app_id: &str) -> Value {
+    // The body is optional; the panel's generated client still sends a JSON
+    // content type with nothing after it.
     let res = owner
         .post(server.url(&format!("/api/v1/apps/{app_id}/builds")))
+        .header("Content-Type", "application/json")
         .send()
         .await
         .unwrap();

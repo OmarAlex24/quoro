@@ -70,7 +70,22 @@ where
 {
     type Rejection = ApiError;
 
+    /// An empty body is no body, whatever its `Content-Type`: generated clients
+    /// send `application/json` with nothing after it when an optional body is
+    /// left out.
     async fn from_request(req: Request, state: &S) -> Result<Option<Self>, Self::Rejection> {
+        let (parts, body) = req.into_parts();
+        // `Bytes` keeps the router's body limit.
+        let bytes = <axum::body::Bytes as FromRequest<S>>::from_request(
+            Request::from_parts(parts.clone(), body),
+            state,
+        )
+        .await
+        .map_err(|rejection| ApiError::validation(rejection.body_text()))?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        let req = Request::from_parts(parts, axum::body::Body::from(bytes));
         match <axum::Json<T> as OptionalFromRequest<S>>::from_request(req, state).await {
             Ok(Some(axum::Json(value))) => Ok(Some(Self(value))),
             Ok(None) => Ok(None),
