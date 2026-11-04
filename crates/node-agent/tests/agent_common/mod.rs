@@ -17,8 +17,9 @@ use quoro_engine::{
     ByteStream, Capabilities, ConsoleStream, Engine, EngineError, EngineEvent, EventStream,
     ExecRequest, ExecSession, FakeEngine, HostProbe, ImageConfig, ImageDigest, ImageRef,
     LineStream, NodeNetwork, PreparedImage, StopMode, VmCounters, VmId, VmInfo, VmSpec, VolumeId,
-    VolumeSnapshot,
+    VolumeInfo, VolumeSnapshot,
 };
+use quoro_node_agent::LeaseTable;
 use quoro_node_agent::NodeFacts;
 use quoro_node_agent::identity::{self, Identity, IdentityHandle};
 use quoro_node_agent::reconcile::{ReconcileConfig, ReconcileOptions, Reconciler, Snapshot};
@@ -26,7 +27,9 @@ use quoro_node_agent::store::NodeStore;
 use quoro_proto::sign::{self, SigningKey};
 use quoro_proto::wire::{
     BuildLimits, Capacity, DesiredState, DesiredStatus, Kvm, Spec, SpecBuild, SpecNetwork, SpecVm,
+    SpecVolume, SpecVolumeFile, SpecVolumeState,
 };
+use quoro_proto::{LeaseGrant, LeaseId, LeaseMode, ResourceType};
 
 /// A temporary directory under the platform temp dir, removed on drop.
 pub struct TempDir(PathBuf);
@@ -123,11 +126,21 @@ pub fn spec_vm(vm_id: &str, project_id: &str, desired_status: DesiredStatus) -> 
 /// A snapshot with `vms` and no signature check (the reconciler takes an
 /// already verified snapshot).
 pub fn snapshot(rev: u64, vms: Vec<SpecVm>) -> Snapshot {
-    snapshot_with(rev, vms, Vec::new())
+    snapshot_full(rev, vms, Vec::new(), Vec::new())
 }
 
 /// A snapshot with `vms` and `builds`, and no signature check.
 pub fn snapshot_with(rev: u64, vms: Vec<SpecVm>, builds: Vec<SpecBuild>) -> Snapshot {
+    snapshot_full(rev, vms, builds, Vec::new())
+}
+
+/// A snapshot with `vms`, `builds` and `volumes`, and no signature check.
+pub fn snapshot_full(
+    rev: u64,
+    vms: Vec<SpecVm>,
+    builds: Vec<SpecBuild>,
+    volumes: Vec<SpecVolumeFile>,
+) -> Snapshot {
     Snapshot {
         rev,
         state: DesiredState {
@@ -145,9 +158,94 @@ pub fn snapshot_with(rev: u64, vms: Vec<SpecVm>, builds: Vec<SpecBuild>) -> Snap
                 builds,
                 mesh: None,
                 edge: None,
+                volumes,
+                backups: Vec::new(),
+                backup_repository: None,
             },
             signature: String::new(),
         },
+    }
+}
+
+/// One `spec.volumes[]` entry (section 5.11).
+pub fn spec_volume(
+    volume_id: &str,
+    app_id: &str,
+    size_gb: u32,
+    state: SpecVolumeState,
+) -> SpecVolumeFile {
+    SpecVolumeFile {
+        volume_id: volume_id.to_owned(),
+        app_id: app_id.to_owned(),
+        size_gb,
+        state,
+        restore: None,
+    }
+}
+
+/// One `spec.vms[].volumes` entry.
+pub fn volume_attach(volume_id: &str, mount_path: &str) -> SpecVolume {
+    SpecVolume {
+        volume_id: volume_id.to_owned(),
+        serial: String::new(),
+        mount_path: mount_path.to_owned(),
+    }
+}
+
+/// A stateful `spec.vms[]` entry bound to a lease with `token`.
+pub fn stateful_vm(vm_id: &str, lease_id: &str, token: u64, volumes: Vec<SpecVolume>) -> SpecVm {
+    SpecVm {
+        stateful: true,
+        lease_id: Some(lease_id.to_owned()),
+        fencing_token: Some(token),
+        volumes,
+        ..spec_vm(vm_id, "prj_1", DesiredStatus::Running)
+    }
+}
+
+/// A lease table holding one `local` app lease.
+pub fn local_lease_table(lease_id: &str, app_id: &str, token: u64) -> LeaseTable {
+    let mut table = LeaseTable::new();
+    table
+        .on_grant(
+            &LeaseGrant {
+                lease_id: LeaseId(lease_id.to_owned()),
+                resource_type: ResourceType::App,
+                resource_id: app_id.to_owned(),
+                mode: LeaseMode::Local,
+                fencing_token: token,
+                duration_ms: None,
+                granted_at: "2026-11-02T10:15:33Z".to_owned(),
+            },
+            None,
+            tokio::time::Instant::now(),
+        )
+        .expect("a valid local grant");
+    table
+}
+
+/// A scratch directory under the checkout's `target/`, removed on drop.
+pub struct TargetDir(PathBuf);
+
+impl TargetDir {
+    /// Creates a unique directory under `target/test-scratch`.
+    pub fn new(name: &str) -> Self {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-scratch")
+            .join(format!("{name}-{}", quoro_node_agent_test_id()));
+        std::fs::create_dir_all(&path).expect("create the test directory");
+        Self(path)
+    }
+
+    /// The directory path.
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TargetDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -397,6 +495,23 @@ impl Engine for RecordingEngine {
 
     async fn counters(&self, id: &VmId) -> Result<VmCounters, EngineError> {
         self.inner.counters(id).await
+    }
+
+    async fn ensure_volume(&self, id: &VolumeId, size_gb: u32) -> Result<VolumeInfo, EngineError> {
+        self.inner.ensure_volume(id, size_gb).await
+    }
+
+    async fn import_volume(
+        &self,
+        id: &VolumeId,
+        size_gb: u32,
+        from: &Path,
+    ) -> Result<VolumeInfo, EngineError> {
+        self.inner.import_volume(id, size_gb, from).await
+    }
+
+    async fn delete_volume(&self, id: &VolumeId) -> Result<(), EngineError> {
+        self.inner.delete_volume(id).await
     }
 
     async fn snapshot_volume(&self, id: &VolumeId) -> Result<VolumeSnapshot, EngineError> {

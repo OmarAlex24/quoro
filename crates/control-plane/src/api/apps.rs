@@ -1645,6 +1645,12 @@ async fn update_app_tx(
     if let Some(placement) = &body.placement
         && *placement != app.placement
     {
+        // A stateful app may run only on its volume's node (ADR 0145).
+        if app.stateful {
+            return Err(ApiError::conflict(
+                "a stateful app's placement is pinned to its volume's node",
+            ));
+        }
         check_placement_nodes(&mut w.tx, placement).await?;
         app.placement = placement.clone();
         changed.push("placement");
@@ -1926,6 +1932,34 @@ pub(crate) async fn delete_app_tx(
         )
         .await?;
     }
+
+    // `volumes.app_id` is ON DELETE CASCADE, but a cascade would leave the
+    // change log without the removal and a replica with the rows, so every
+    // volume goes explicitly and the app's `local` lease ends with it.
+    let volumes = sqlx::query(&format!(
+        "SELECT {} FROM volumes WHERE app_id = ?",
+        crate::api::volumes::VOLUME_COLUMNS
+    ))
+    .bind(app_id)
+    .fetch_all(&mut *w.tx)
+    .await?;
+    for row in &volumes {
+        let volume = crate::api::volumes::volume_from_row(row)?;
+        sqlx::query("DELETE FROM volumes WHERE id = ?")
+            .bind(&volume.id)
+            .execute(&mut *w.tx)
+            .await?;
+        changelog::append(
+            &mut w.tx,
+            &actor,
+            "volume",
+            &volume.id,
+            Op::Delete,
+            volume.payload()?,
+        )
+        .await?;
+    }
+    crate::leases::revoke_app_lease(&mut w.tx, app_id, &actor).await?;
 
     sqlx::query("DELETE FROM apps WHERE id = ?")
         .bind(app_id)

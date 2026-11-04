@@ -480,6 +480,7 @@ fn hello(node_id: &str) -> NodeMessage {
         },
         dropped_events: 0,
         mesh_public_key: None,
+        volume_snapshot: None,
     })
 }
 
@@ -1188,6 +1189,8 @@ async fn dns_challenges_are_written_by_the_primary_for_the_owning_node() {
             disk_free_gb: 80.0,
             builds: Vec::new(),
             edge_backends: Vec::new(),
+            backups: Vec::new(),
+            volumes: Vec::new(),
         }),
     )
     .await;

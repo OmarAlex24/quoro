@@ -92,6 +92,7 @@ fn hello(node_id: &str) -> NodeMessage {
         },
         dropped_events: 0,
         mesh_public_key: None,
+        volume_snapshot: None,
     })
 }
 

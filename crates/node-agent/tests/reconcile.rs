@@ -12,12 +12,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_common::{
-    BRIDGE, GATEWAY, RecordingEngine, SUBNET, TempDir, dns, reconciler, snapshot, spec_vm,
+    BRIDGE, GATEWAY, RecordingEngine, SUBNET, TargetDir, TempDir, dns, local_lease_table,
+    reconciler, snapshot, snapshot_full, spec_vm, spec_volume, stateful_vm, volume_attach,
 };
-use quoro_engine::{Engine, StopMode, VmId, VmState};
+use quoro_engine::{Engine, EngineError, FakeOp, StopMode, VmId, VmState, VolumeId};
+use quoro_node_agent::LeaseView;
 use quoro_node_agent::reconcile::Snapshot;
-use quoro_node_agent::store::NodeStore;
-use quoro_proto::wire::{DesiredStatus, ObservedStatus, SpecNetwork, SpecVm};
+use quoro_node_agent::store::{NodeStore, VolumeRecord};
+use quoro_proto::wire::VolumeStatus;
+use quoro_proto::wire::{
+    DesiredStatus, Health, ObservedStatus, SpecNetwork, SpecVm, SpecVolumeState, VolumeState,
+};
 
 fn ip_of(text: Option<&String>) -> Ipv4Addr {
     text.expect("the status report carries an IP")
@@ -358,4 +363,371 @@ async fn a_snapshot_without_a_network_creates_nothing_and_does_not_fail() {
     assert_eq!(statuses[0].observed_status, ObservedStatus::Running);
     assert_eq!(engine.create_count(), 1);
     assert_eq!(engine.networks().last().unwrap().subnet, SUBNET);
+}
+
+// --- volumes and stateful starts (M5a, sections 6.2, 6.4, 6.7) -------------
+
+fn volume_in(statuses: &[VolumeStatus], volume_id: &str) -> Option<VolumeStatus> {
+    statuses
+        .iter()
+        .find(|status| status.volume_id == volume_id)
+        .cloned()
+}
+
+#[tokio::test]
+async fn a_present_volume_is_created_and_reported_creating_then_ready() {
+    let dir = TargetDir::new("volume-create");
+    let engine = Arc::new(RecordingEngine::new());
+    engine.inner().set_volume_dir(dir.path());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let (mut reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let mut volumes = reconciler.volume_statuses();
+
+    let snap = snapshot_full(
+        1,
+        Vec::new(),
+        Vec::new(),
+        vec![spec_volume("vol_1", "app_1", 1, SpecVolumeState::Present)],
+    );
+    let passing = tokio::spawn(async move { reconciler.reconcile_once(Some(&snap)).await });
+
+    let mut seen = Vec::new();
+    while !passing.is_finished() {
+        if volumes.changed().await.is_ok() {
+            seen.push(volumes.borrow_and_update().clone());
+        }
+    }
+    assert!(passing.await.unwrap().is_empty());
+
+    let states: Vec<VolumeState> = seen
+        .iter()
+        .filter_map(|statuses| volume_in(statuses, "vol_1").map(|status| status.state))
+        .collect();
+    assert!(
+        states.contains(&VolumeState::Creating),
+        "the volume is reported `creating` first, saw {states:?}"
+    );
+    assert_eq!(
+        states.last(),
+        Some(&VolumeState::Ready),
+        "the last report is `ready`"
+    );
+
+    let volume = VolumeId("vol_1".to_owned());
+    assert_eq!(
+        engine.inner().volumes(),
+        vec![(volume, 1)],
+        "the engine holds the file"
+    );
+    assert!(
+        dir.path().join("vol_1").exists(),
+        "the file exists in the volume directory"
+    );
+    let row = store.volume("vol_1").await.unwrap().expect("a volume row");
+    assert_eq!(row.state, VolumeState::Ready);
+    assert_eq!(row.size_gb, 1);
+    assert!(row.allocated_bytes.is_some());
+}
+
+#[tokio::test]
+async fn a_stateful_vm_starts_only_with_a_held_lease_of_its_token() {
+    let dir = TargetDir::new("volume-stateful");
+    let engine = Arc::new(RecordingEngine::new());
+    engine.inner().set_volume_dir(dir.path());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let (reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    // The node holds `lse_1` with token 2.
+    let mut reconciler = reconciler.with_lease_view(LeaseView::new(
+        local_lease_table("lse_1", "app_1", 2),
+        false,
+    ));
+
+    let snap = snapshot_full(
+        1,
+        vec![
+            stateful_vm("vm_ok", "lse_1", 2, vec![volume_attach("vol_ok", "/data")]),
+            stateful_vm(
+                "vm_bad",
+                "lse_1",
+                1,
+                vec![volume_attach("vol_bad", "/data")],
+            ),
+            spec_vm("vm_plain", "prj_1", DesiredStatus::Running),
+        ],
+        Vec::new(),
+        vec![
+            spec_volume("vol_ok", "app_1", 1, SpecVolumeState::Present),
+            spec_volume("vol_bad", "app_1", 1, SpecVolumeState::Present),
+        ],
+    );
+    let statuses = reconciler.reconcile_once(Some(&snap)).await;
+
+    let status = |vm_id: &str| {
+        statuses
+            .iter()
+            .find(|status| status.vm_id == vm_id)
+            .cloned()
+            .unwrap_or_else(|| panic!("a status for {vm_id}: {statuses:?}"))
+    };
+    assert_eq!(status("vm_ok").observed_status, ObservedStatus::Running);
+    assert_eq!(status("vm_bad").observed_status, ObservedStatus::Stopped);
+    assert_eq!(status("vm_bad").health, Health::Unknown);
+    assert_eq!(status("vm_plain").observed_status, ObservedStatus::Running);
+
+    // The VM with the wrong token was created but never started.
+    let bad = VmId("vm_bad".to_owned());
+    assert_eq!(engine.inspect(&bad).await.unwrap().state, VmState::Stopped);
+
+    // The attached volumes reached the engine with their mount paths.
+    let ok_spec = engine
+        .created()
+        .into_iter()
+        .find(|spec| spec.id.0 == "vm_ok")
+        .expect("vm_ok was created");
+    assert_eq!(ok_spec.volumes.len(), 1);
+    assert_eq!(ok_spec.volumes[0].volume_id.0, "vol_ok");
+    assert_eq!(ok_spec.volumes[0].mount_path, "/data");
+    assert_eq!(ok_spec.volumes[0].serial, "quoro-vol-0");
+}
+
+#[tokio::test]
+async fn a_deleted_entry_removes_the_file_only_after_the_vm_is_gone() {
+    let dir = TargetDir::new("volume-delete");
+    let engine = Arc::new(RecordingEngine::new());
+    engine.inner().set_volume_dir(dir.path());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let (reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let mut reconciler = reconciler.with_lease_view(LeaseView::new(
+        local_lease_table("lse_1", "app_1", 1),
+        false,
+    ));
+
+    let running = snapshot_full(
+        1,
+        vec![stateful_vm(
+            "vm_hold",
+            "lse_1",
+            1,
+            vec![volume_attach("vol_gone", "/data")],
+        )],
+        Vec::new(),
+        vec![spec_volume(
+            "vol_gone",
+            "app_1",
+            1,
+            SpecVolumeState::Present,
+        )],
+    );
+    reconciler.reconcile_once(Some(&running)).await;
+    let file = dir.path().join("vol_gone");
+    std::fs::write(&file, b"keep").unwrap();
+
+    // The primary names the volume `deleted` while the VM still attaches it:
+    // the file stays.
+    let deleted_while_attached = snapshot_full(
+        2,
+        running.state.spec.vms.clone(),
+        Vec::new(),
+        vec![spec_volume(
+            "vol_gone",
+            "app_1",
+            1,
+            SpecVolumeState::Deleted,
+        )],
+    );
+    reconciler
+        .reconcile_once(Some(&deleted_while_attached))
+        .await;
+    assert!(file.exists(), "an attached volume is never removed");
+
+    // The VM leaves the spec in the same snapshot as the `deleted` entry.
+    let deleted = snapshot_full(
+        3,
+        Vec::new(),
+        Vec::new(),
+        vec![spec_volume(
+            "vol_gone",
+            "app_1",
+            1,
+            SpecVolumeState::Deleted,
+        )],
+    );
+    let statuses = reconciler.reconcile_once(Some(&deleted)).await;
+    assert!(statuses.iter().any(
+        |status| status.vm_id == "vm_hold" && status.observed_status == ObservedStatus::Deleted
+    ));
+    assert!(!file.exists(), "the file is removed once the VM is gone");
+    let volumes = reconciler.volume_statuses().borrow().clone();
+    assert_eq!(
+        volume_in(&volumes, "vol_gone").map(|status| status.state),
+        Some(VolumeState::Deleted)
+    );
+
+    // Once the primary stops naming it, the local row goes away.
+    let forgotten = snapshot_full(4, Vec::new(), Vec::new(), Vec::new());
+    reconciler.reconcile_once(Some(&forgotten)).await;
+    assert_eq!(store.volume("vol_gone").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn an_unknown_local_volume_is_orphaned_and_kept() {
+    let dir = TargetDir::new("volume-orphan");
+    let engine = Arc::new(RecordingEngine::new());
+    engine.inner().set_volume_dir(dir.path());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    engine
+        .inner()
+        .ensure_volume(&VolumeId("vol_orphan".to_owned()), 1)
+        .await
+        .expect("create the orphan file");
+    store
+        .save_volume(&VolumeRecord {
+            volume_id: "vol_orphan".to_owned(),
+            app_id: "app_1".to_owned(),
+            size_gb: 1,
+            state: VolumeState::Ready,
+            error: None,
+            allocated_bytes: Some(0),
+        })
+        .await
+        .unwrap();
+
+    let (mut reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let snap = snapshot_full(1, Vec::new(), Vec::new(), Vec::new());
+    reconciler.reconcile_once(Some(&snap)).await;
+
+    let volumes = reconciler.volume_statuses().borrow().clone();
+    assert_eq!(
+        volume_in(&volumes, "vol_orphan").map(|status| status.state),
+        Some(VolumeState::Orphaned)
+    );
+    assert!(
+        engine
+            .inner()
+            .volumes()
+            .iter()
+            .any(|(volume, _)| volume.0 == "vol_orphan"),
+        "an orphaned volume is never deleted"
+    );
+    assert!(dir.path().join("vol_orphan").exists());
+    assert!(store.volume("vol_orphan").await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_failed_ensure_volume_reports_failed_with_the_reason() {
+    let dir = TargetDir::new("volume-failed");
+    let engine = Arc::new(RecordingEngine::new());
+    engine.inner().set_volume_dir(dir.path());
+    engine.inner().fail_next(
+        FakeOp::EnsureVolume,
+        EngineError::ResourceExhausted("the disk is full".to_owned()),
+    );
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let (mut reconciler, _observed) = reconciler(engine.clone(), store.clone());
+
+    let snap = snapshot_full(
+        1,
+        Vec::new(),
+        Vec::new(),
+        vec![spec_volume("vol_big", "app_1", 1, SpecVolumeState::Present)],
+    );
+    reconciler.reconcile_once(Some(&snap)).await;
+
+    let volumes = reconciler.volume_statuses().borrow().clone();
+    let status = volume_in(&volumes, "vol_big").expect("a volume status");
+    assert_eq!(status.state, VolumeState::Failed);
+    let error = status.error.unwrap_or_default();
+    assert!(
+        error.contains("disk is full"),
+        "the reason is reported: {error}"
+    );
+    assert!(!error.contains('\n'), "the error is one line");
+    let row = store
+        .volume("vol_big")
+        .await
+        .unwrap()
+        .expect("a volume row");
+    assert_eq!(row.state, VolumeState::Failed);
+    assert!(row.error.is_some());
+}
+
+#[tokio::test]
+async fn a_redeploy_swaps_the_vm_and_keeps_the_volume() {
+    let dir = TargetDir::new("volume-redeploy");
+    let engine = Arc::new(RecordingEngine::new());
+    engine.inner().set_volume_dir(dir.path());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let (reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let mut reconciler = reconciler.with_lease_view(LeaseView::new(
+        local_lease_table("lse_1", "app_1", 1),
+        false,
+    ));
+
+    let first = snapshot_full(
+        1,
+        vec![stateful_vm(
+            "vm_a",
+            "lse_1",
+            1,
+            vec![volume_attach("vol_data", "/data")],
+        )],
+        Vec::new(),
+        vec![spec_volume(
+            "vol_data",
+            "app_1",
+            1,
+            SpecVolumeState::Present,
+        )],
+    );
+    reconciler.reconcile_once(Some(&first)).await;
+    let file = dir.path().join("vol_data");
+    std::fs::write(&file, b"the app's data").unwrap();
+
+    let second = snapshot_full(
+        2,
+        vec![stateful_vm(
+            "vm_b",
+            "lse_1",
+            1,
+            vec![volume_attach("vol_data", "/data")],
+        )],
+        Vec::new(),
+        vec![spec_volume(
+            "vol_data",
+            "app_1",
+            1,
+            SpecVolumeState::Present,
+        )],
+    );
+    let statuses = reconciler.reconcile_once(Some(&second)).await;
+
+    let ids: Vec<&str> = statuses
+        .iter()
+        .filter(|status| status.observed_status != ObservedStatus::Deleted)
+        .map(|status| status.vm_id.as_str())
+        .collect();
+    assert_eq!(ids, vec!["vm_b"], "only the new VM is reported");
+    assert_eq!(
+        engine
+            .inspect(&VmId("vm_b".to_owned()))
+            .await
+            .unwrap()
+            .state,
+        VmState::Running,
+        "the replacement started"
+    );
+    assert!(
+        engine.inspect(&VmId("vm_a".to_owned())).await.is_err(),
+        "the old VM was deleted before the new one was created"
+    );
+    assert_eq!(
+        engine.inner().volumes(),
+        vec![(VolumeId("vol_data".to_owned()), 1)],
+        "the volume outlived the redeploy"
+    );
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        b"the app's data",
+        "the file content is unchanged"
+    );
 }

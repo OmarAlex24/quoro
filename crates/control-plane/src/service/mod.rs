@@ -29,4 +29,5 @@ pub mod logs;
 pub mod nodes;
 pub mod projects;
 pub mod users;
+pub mod volumes;
 pub mod webhooks;

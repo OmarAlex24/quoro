@@ -17,6 +17,13 @@
 //! values of the app's environment variables it names as BuildKit secrets
 //! (section 5.11, ADR 0117).
 //!
+//! `spec.volumes` carries every volume row on the node: `present` while it is
+//! `creating`, `ready` or `restoring`, and `deleted` once a delete was
+//! accepted (section 5.11, ADR 0145). A VM of an app with a `ready` or
+//! `creating` volume here is `stateful`: it carries the app's `local` lease,
+//! its fencing token and the one volume to attach, because the volume may be
+//! attached to one VM at a time.
+//!
 //! Routes are built from the app's `domains` rows: the domains of an app with
 //! one replica point at the app's running VMs on this node, and the domains of
 //! an app with more replicas go to the edge machine as `spec.edge` (ADR 0143).
@@ -28,7 +35,8 @@ use crate::deploy;
 use crate::{DigestResolver, store::Store};
 use quoro_proto::wire::{
     BuildLimits, DesiredStatus, EdgeBackend, EdgeRoute, HealthCheck, Spec, SpecBuild, SpecEdge,
-    SpecIngress, SpecNetwork, SpecRoute, SpecTunnel, SpecVm,
+    SpecIngress, SpecNetwork, SpecRoute, SpecTunnel, SpecVm, SpecVolume, SpecVolumeFile,
+    SpecVolumeState,
 };
 use sqlx::sqlite::SqliteConnection;
 use sqlx::{Row, SqlitePool};
@@ -124,6 +132,8 @@ pub async fn build_spec(
     .map_err(|e| format!("cannot read the desired state of {node_id}: {e}"))?;
 
     let apps = load_apps(store.pool()).await?;
+    let (volumes, attachments) = load_node_volumes(store.pool(), node_id).await?;
+    let leases = load_app_leases(store.pool(), node_id).await?;
     let deployments = deploy::deployment_ids_for_node(store, node_id)
         .await
         .map_err(|e| format!("cannot link the VMs to their deployments: {e}"))?;
@@ -209,6 +219,34 @@ pub async fn build_spec(
             None => (None, None, BTreeMap::new(), None),
         };
 
+        // A stateful VM attaches the app's volume on this node and runs only
+        // while it holds the app's lease (sections 5.11, 6.4, ADR 0145).
+        let (stateful, lease_id, fencing_token, attached) = match &app_id {
+            Some(app_id) => match (attachments.get(app_id), leases.get(app_id)) {
+                (Some((volume_id, mount_path)), Some((lease_id, token))) => (
+                    true,
+                    Some(lease_id.clone()),
+                    Some(*token),
+                    vec![SpecVolume {
+                        volume_id: volume_id.clone(),
+                        serial: "quoro-vol-0".to_string(),
+                        mount_path: mount_path.clone(),
+                    }],
+                ),
+                (Some((volume_id, _)), None) => {
+                    tracing::warn!(
+                        vm_id,
+                        app_id,
+                        volume_id,
+                        "a volume has no lease: the VM stays stateless"
+                    );
+                    (false, None, None, Vec::new())
+                }
+                _ => (false, None, None, Vec::new()),
+            },
+            None => (false, None, None, Vec::new()),
+        };
+
         vms.push(SpecVm {
             vm_id,
             project_id: row.try_get("project_id").map_err(|e| e.to_string())?,
@@ -229,10 +267,10 @@ pub async fn build_spec(
                 DesiredStatus::Stopped
             },
             restart_generation: u64::try_from(restart_generation.max(0)).unwrap_or(0),
-            stateful: false,
-            lease_id: None,
-            fencing_token: None,
-            volumes: Vec::new(),
+            stateful,
+            lease_id,
+            fencing_token,
+            volumes: attached,
             build_id,
         });
     }
@@ -256,9 +294,87 @@ pub async fn build_spec(
             builds,
             mesh,
             edge,
+            backup_repository: None,
+            backups: Vec::new(),
+            volumes,
         },
         held_back,
     })
+}
+
+/// The volume entries for `node_id` and the volumes its VMs may attach:
+/// `app_id` to `(volume_id, mount_path)` for the app's `ready` or `creating`
+/// volume here (section 5.11, ADR 0145). At most one volume per app is
+/// attached, so the first by id wins.
+async fn load_node_volumes(
+    pool: &SqlitePool,
+    node_id: &str,
+) -> Result<(Vec<SpecVolumeFile>, HashMap<String, (String, String)>), String> {
+    let rows = sqlx::query(
+        "SELECT id, app_id, size_gb, mount_path, state FROM volumes \
+         WHERE node_id = ? ORDER BY id",
+    )
+    .bind(node_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("cannot read the volumes of {node_id}: {e}"))?;
+    let mut files = Vec::new();
+    let mut attachments = HashMap::new();
+    for row in &rows {
+        let volume_id: String = row.try_get("id").map_err(|e| e.to_string())?;
+        let app_id: String = row.try_get("app_id").map_err(|e| e.to_string())?;
+        let size_gb: i64 = row.try_get("size_gb").map_err(|e| e.to_string())?;
+        let mount_path: String = row.try_get("mount_path").map_err(|e| e.to_string())?;
+        let state: String = row.try_get("state").map_err(|e| e.to_string())?;
+        let spec_state = match state.as_str() {
+            "creating" | "ready" | "restoring" => SpecVolumeState::Present,
+            "deleting" => SpecVolumeState::Deleted,
+            // A `failed` volume left no file behind; a `detached` one stays
+            // untouched on the node and is reported `orphaned` (section 6.7).
+            _ => continue,
+        };
+        // Only a `creating` or `ready` volume is attached (section 6.4: the
+        // volume must be `ready` before a VM starts, and a `creating` one
+        // turns ready on the same node).
+        if matches!(state.as_str(), "creating" | "ready") {
+            attachments
+                .entry(app_id.clone())
+                .or_insert((volume_id.clone(), mount_path));
+        }
+        files.push(SpecVolumeFile {
+            volume_id,
+            app_id,
+            size_gb: u32::try_from(size_gb).map_err(|e| format!("volumes.size_gb: {e}"))?,
+            state: spec_state,
+            restore: None,
+        });
+    }
+    Ok((files, attachments))
+}
+
+/// The app leases `node_id` holds, `app_id` to `(lease_id, token)` (sections
+/// 5.12 and 8.6). A lease held by another node never makes a VM here stateful.
+async fn load_app_leases(
+    pool: &SqlitePool,
+    node_id: &str,
+) -> Result<HashMap<String, (String, u64)>, String> {
+    let rows = sqlx::query(
+        "SELECT id, resource_id, fencing_token FROM leases \
+         WHERE resource_type = 'app' AND holder_node_id = ? AND revoked_at IS NULL",
+    )
+    .bind(node_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("cannot read the app leases of {node_id}: {e}"))?;
+    let mut leases = HashMap::new();
+    for row in &rows {
+        let lease_id: String = row.try_get("id").map_err(|e| e.to_string())?;
+        let app_id: String = row.try_get("resource_id").map_err(|e| e.to_string())?;
+        let token: i64 = row.try_get("fencing_token").map_err(|e| e.to_string())?;
+        let token = u64::try_from(token).map_err(|e| format!("leases.fencing_token: {e}"))?;
+        leases.insert(app_id, (lease_id, token));
+    }
+    Ok(leases)
 }
 
 /// `spec.builds`: every build of this node that is not terminal, from the

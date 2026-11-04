@@ -24,17 +24,19 @@ use futures_util::StreamExt as _;
 use quoro_engine::{
     ConsoleMode, Engine, EngineError, EngineEvent, EventStream, ImageConfig, ImageDigest, ImageRef,
     InitConfig, MacAddr, NetAttach, NodeNetwork, SerialMode, StopMode, VmId, VmInfo, VmSpec,
-    VmState, VsockAttach,
+    VmState, VolumeAttach, VolumeId, VsockAttach,
 };
 use quoro_proto::wire::{
-    DesiredState, DesiredStatus, Health, ObservedStatus, SpecRoute, SpecVm, VmStatus,
+    DesiredState, DesiredStatus, Health, ObservedStatus, Spec, SpecRoute, SpecVm, SpecVolumeFile,
+    SpecVolumeState, VmStatus, VolumeState, VolumeStatus,
 };
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::health::{FIRST_PROBE_DELAY, HealthTarget, is_passing, probe};
+use crate::lease::LeaseView;
 use crate::logs::LogCollector;
-use crate::store::NodeStore;
+use crate::store::{NodeStore, VolumeRecord};
 use crate::util;
 
 /// The guest context id of every VM's vsock device: each VM has its own vsock
@@ -263,6 +265,12 @@ pub struct Reconciler<E: Engine> {
     /// The app-route supervisor, when the agent runs one (worker hook for
     /// `M2` apps). `None` in tests that only exercise the engine.
     ingress: Option<Arc<crate::ingress::IngressSupervisor>>,
+    /// The leases the node holds, shared with the lease service (section 6.4).
+    lease: LeaseView,
+    /// The volume statuses the session reports (section 5.3).
+    volumes_out: watch::Sender<Vec<VolumeStatus>>,
+    /// The volumes that are `ready` on this node in the current pass.
+    ready_volumes: HashSet<String>,
 }
 
 impl<E: Engine + 'static> Reconciler<E> {
@@ -275,6 +283,7 @@ impl<E: Engine + 'static> Reconciler<E> {
         options: ReconcileOptions,
     ) -> (Self, watch::Receiver<Vec<VmStatus>>) {
         let (observed, receiver) = watch::channel(Vec::new());
+        let (volumes_out, _) = watch::channel(Vec::new());
         let collector = LogCollector::new(Arc::clone(&engine), store.clone());
         (
             Self {
@@ -294,9 +303,27 @@ impl<E: Engine + 'static> Reconciler<E> {
                 spec_meta: HashMap::new(),
                 health: HashMap::new(),
                 ingress: None,
+                lease: LeaseView::default(),
+                volumes_out,
+                ready_volumes: HashSet::new(),
             },
             receiver,
         )
+    }
+
+    /// Attaches the lease table the lease service fills: a stateful VM may
+    /// start only through it (section 6.4).
+    #[must_use]
+    pub fn with_lease_view(mut self, lease: LeaseView) -> Self {
+        self.lease = lease;
+        self
+    }
+
+    /// The volume statuses this reconciler publishes (section 5.3), which the
+    /// session reports.
+    #[must_use]
+    pub fn volume_statuses(&self) -> watch::Receiver<Vec<VolumeStatus>> {
+        self.volumes_out.subscribe()
     }
 
     /// Attaches the app-route supervisor: every applied snapshot and every
@@ -427,6 +454,22 @@ impl<E: Engine + 'static> Reconciler<E> {
         let network_ok = !self.network_failed && self.network.is_some();
 
         let mut reached = true;
+
+        // Step 3 (section 6.2): stop and delete the VMs that left the spec
+        // before anything is created. On a redeploy the old VM and its
+        // replacement attach the same volume in one snapshot, and the engine
+        // refuses to create a VM while another existing VM attaches that
+        // volume, so the removal must come first.
+        let desired: HashSet<&str> = spec.vms.iter().map(|vm| vm.vm_id.as_str()).collect();
+        if !self.remove_extra_vms(&desired).await {
+            reached = false;
+        }
+
+        // Step 4, first half (section 6.2): volumes, before any VM starts.
+        if !self.reconcile_volumes(spec).await {
+            reached = false;
+        }
+
         let mut vms: Vec<&SpecVm> = spec.vms.iter().collect();
         vms.sort_by(|a, b| a.vm_id.cmp(&b.vm_id));
 
@@ -434,11 +477,6 @@ impl<E: Engine + 'static> Reconciler<E> {
             if !self.reconcile_vm(vm, &subnet, network_ok).await {
                 reached = false;
             }
-        }
-
-        let desired: HashSet<&str> = spec.vms.iter().map(|vm| vm.vm_id.as_str()).collect();
-        if !self.remove_extra_vms(&desired).await {
-            reached = false;
         }
 
         // --- ingress hook (M2 apps): step 5 "Routes" of section 6.2 ---
@@ -549,6 +587,243 @@ impl<E: Engine + 'static> Reconciler<E> {
         addresses
     }
 
+    /// Creates, removes and reports the volume files of `spec.volumes`
+    /// (section 6.2 step 4, section 6.7).
+    ///
+    /// A file `spec.volumes` does not name is `orphaned` and never removed
+    /// here; only a `deleted` entry removes one. Returns `false` while some
+    /// volume work is still pending, so `applied_rev` is not recorded.
+    async fn reconcile_volumes(&mut self, spec: &Spec) -> bool {
+        let stored = match self.store.volumes().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(error = %e, "could not read the volume rows");
+                return false;
+            }
+        };
+        let rows: HashMap<String, VolumeRecord> = stored
+            .into_iter()
+            .map(|row| (row.volume_id.clone(), row))
+            .collect();
+
+        // Start from what each named volume last reported, plus one entry per
+        // orphan, which is what this pass begins with.
+        let mut statuses: BTreeMap<String, VolumeStatus> = BTreeMap::new();
+        for entry in &spec.volumes {
+            statuses.insert(
+                entry.volume_id.clone(),
+                match rows.get(&entry.volume_id) {
+                    Some(row) => VolumeStatus {
+                        volume_id: row.volume_id.clone(),
+                        state: row.state,
+                        allocated_bytes: row.allocated_bytes,
+                        error: row.error.clone(),
+                    },
+                    None => VolumeStatus {
+                        volume_id: entry.volume_id.clone(),
+                        state: VolumeState::Creating,
+                        allocated_bytes: None,
+                        error: None,
+                    },
+                },
+            );
+        }
+        for row in rows.values() {
+            if row.state == VolumeState::Deleted
+                || spec
+                    .volumes
+                    .iter()
+                    .any(|entry| entry.volume_id == row.volume_id)
+            {
+                continue;
+            }
+            statuses.insert(
+                row.volume_id.clone(),
+                VolumeStatus {
+                    volume_id: row.volume_id.clone(),
+                    state: VolumeState::Orphaned,
+                    allocated_bytes: row.allocated_bytes,
+                    error: None,
+                },
+            );
+        }
+        self.publish_volumes(statuses.values().cloned().collect());
+        self.ready_volumes.clear();
+
+        let attached: HashSet<&str> = spec
+            .vms
+            .iter()
+            .flat_map(|vm| vm.volumes.iter().map(|volume| volume.volume_id.as_str()))
+            .collect();
+        let mut reached = true;
+
+        for entry in &spec.volumes {
+            let row = rows.get(&entry.volume_id);
+            match entry.state {
+                SpecVolumeState::Present => {
+                    if entry.restore.is_some() {
+                        // Backups and restores arrive in a later task.
+                        self.record_volume(
+                            &mut statuses,
+                            entry,
+                            VolumeState::Failed,
+                            Some(RESTORE_UNSUPPORTED.to_owned()),
+                            None,
+                        )
+                        .await;
+                        continue;
+                    }
+                    if row.is_some_and(|row| {
+                        row.state == VolumeState::Ready && row.size_gb == entry.size_gb
+                    }) {
+                        self.ready_volumes.insert(entry.volume_id.clone());
+                        continue;
+                    }
+                    self.record_volume(
+                        &mut statuses,
+                        entry,
+                        VolumeState::Creating,
+                        None,
+                        row.and_then(|row| row.allocated_bytes),
+                    )
+                    .await;
+                    let id = VolumeId(entry.volume_id.clone());
+                    match self.engine.ensure_volume(&id, entry.size_gb).await {
+                        Ok(info) => {
+                            self.record_volume(
+                                &mut statuses,
+                                entry,
+                                VolumeState::Ready,
+                                None,
+                                Some(info.allocated_bytes),
+                            )
+                            .await;
+                            self.ready_volumes.insert(entry.volume_id.clone());
+                        }
+                        Err(e) => {
+                            warn!(
+                                volume_id = %entry.volume_id,
+                                error = ?e,
+                                "could not create the volume"
+                            );
+                            reached = false;
+                            self.record_volume(
+                                &mut statuses,
+                                entry,
+                                VolumeState::Failed,
+                                Some(e.to_string()),
+                                None,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                SpecVolumeState::Deleted => {
+                    if row.is_some_and(|row| row.state == VolumeState::Deleted) {
+                        continue;
+                    }
+                    // Section 6.7: remove the file only once no VM of the spec
+                    // attaches it; the engine also refuses while a VM it knows
+                    // attaches it.
+                    if attached.contains(entry.volume_id.as_str()) {
+                        continue;
+                    }
+                    match self
+                        .engine
+                        .delete_volume(&VolumeId(entry.volume_id.clone()))
+                        .await
+                    {
+                        Ok(()) => {
+                            self.record_volume(
+                                &mut statuses,
+                                entry,
+                                VolumeState::Deleted,
+                                None,
+                                None,
+                            )
+                            .await;
+                        }
+                        Err(EngineError::Conflict(_)) => {
+                            debug!(
+                                volume_id = %entry.volume_id,
+                                "a VM still attaches the volume; retrying on the next pass"
+                            );
+                            reached = false;
+                        }
+                        Err(e) => {
+                            warn!(
+                                volume_id = %entry.volume_id,
+                                error = ?e,
+                                "could not delete the volume"
+                            );
+                            reached = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        // A `deleted` row the primary stopped naming is forgotten; every other
+        // row it does not name stays as an orphan (section 6.7).
+        for row in rows.values() {
+            if row.state != VolumeState::Deleted
+                || spec
+                    .volumes
+                    .iter()
+                    .any(|entry| entry.volume_id == row.volume_id)
+            {
+                continue;
+            }
+            if let Err(e) = self.store.delete_volume(&row.volume_id).await {
+                warn!(volume_id = %row.volume_id, error = %e, "could not forget the volume");
+            }
+        }
+
+        self.publish_volumes(statuses.values().cloned().collect());
+        reached
+    }
+
+    /// Records one volume state in the local table and in the published set.
+    async fn record_volume(
+        &self,
+        statuses: &mut BTreeMap<String, VolumeStatus>,
+        entry: &SpecVolumeFile,
+        state: VolumeState,
+        error: Option<String>,
+        allocated_bytes: Option<u64>,
+    ) {
+        let error = error.map(|error| truncate_error(&error));
+        statuses.insert(
+            entry.volume_id.clone(),
+            VolumeStatus {
+                volume_id: entry.volume_id.clone(),
+                state,
+                allocated_bytes,
+                error: error.clone(),
+            },
+        );
+        if let Err(e) = self
+            .store
+            .save_volume(&VolumeRecord {
+                volume_id: entry.volume_id.clone(),
+                app_id: entry.app_id.clone(),
+                size_gb: entry.size_gb,
+                state,
+                error,
+                allocated_bytes,
+            })
+            .await
+        {
+            warn!(volume_id = %entry.volume_id, error = %e, "could not record the volume");
+        }
+        self.publish_volumes(statuses.values().cloned().collect());
+    }
+
+    fn publish_volumes(&self, mut statuses: Vec<VolumeStatus>) {
+        statuses.sort_by(|a, b| a.volume_id.cmp(&b.volume_id));
+        self.volumes_out.send_replace(statuses);
+    }
+
     /// Makes one desired VM match its spec. Returns `false` when it has not
     /// reached the target yet, so `applied_rev` is not recorded.
     async fn reconcile_vm(&mut self, vm: &SpecVm, subnet: &Subnet, network_ok: bool) -> bool {
@@ -563,7 +838,57 @@ impl<E: Engine + 'static> Reconciler<E> {
             }
         };
 
+        // Section 6.2 step 3: a changed attached-volume set needs a recreate.
+        let signature = volumes_signature(&vm.volumes);
+        let recorded = self.store.meta(&volumes_key(&vm_id)).await.ok().flatten();
+        if info.is_some()
+            && (recorded.is_some() || !vm.volumes.is_empty())
+            && recorded.as_deref() != Some(signature.as_str())
+        {
+            info!(vm_id, "the VM's attached volumes changed; recreating it");
+            if let Some(current) = &info
+                && matches!(
+                    current.state,
+                    VmState::Running | VmState::Starting | VmState::Stopping
+                )
+                && let Err(e) = self.engine.stop(&id, StopMode::Force).await
+            {
+                warn!(vm_id, error = ?e, "could not stop the VM for a recreate");
+                return false;
+            }
+            match self.engine.delete(&id).await {
+                Ok(()) => {
+                    if let Err(e) = self.store.forget_vm(&vm_id).await {
+                        warn!(vm_id, error = %e, "could not forget the recreated VM");
+                    }
+                    self.last_states.remove(&vm_id);
+                    self.timings.remove(&vm_id);
+                    self.health.remove(&vm_id);
+                    info = None;
+                }
+                Err(e) => {
+                    warn!(vm_id, error = ?e, "could not delete the VM for a recreate");
+                    return false;
+                }
+            }
+        }
+
+        let volumes_ready = vm
+            .volumes
+            .iter()
+            .all(|volume| self.ready_volumes.contains(&volume.volume_id));
+        let lease_allowed = !vm.stateful
+            || matches!(
+                (&vm.lease_id, vm.fencing_token),
+                (Some(lease_id), Some(token)) if self.lease.may_start_stateful(lease_id, token)
+            );
+        let may_start = volumes_ready && lease_allowed;
+
         if info.is_none() {
+            if !volumes_ready {
+                debug!(vm_id, "not creating the VM before its volume is ready");
+                return false;
+            }
             if !network_ok {
                 debug!(vm_id, "not creating the VM before the network is ensured");
                 return false;
@@ -577,6 +902,34 @@ impl<E: Engine + 'static> Reconciler<E> {
             return false;
         };
         let mut reached = true;
+
+        // Section 6.4: a stateful VM starts only while its lease is `held`
+        // with exactly the spec's token, and a VM whose volume is not `ready`
+        // stays stopped. Neither is an error: the primary moved the lease or
+        // the volume work is still running.
+        if vm.desired_status == DesiredStatus::Running && !may_start {
+            if matches!(
+                info.state,
+                VmState::Running | VmState::Starting | VmState::Stopping
+            ) {
+                match self.stop_vm(&id).await {
+                    Ok(stopped) => info = stopped,
+                    Err(e) => {
+                        warn!(vm_id, error = ?e, "could not stop a VM that may not start");
+                        return false;
+                    }
+                }
+            }
+            debug!(
+                vm_id,
+                stateful = vm.stateful,
+                volumes_ready,
+                lease_allowed,
+                "the VM waits to start"
+            );
+            self.remember(&vm_id, info.state);
+            return true;
+        }
 
         if let Some(known) = self.known_digest(&vm_id).await
             && !known.is_empty()
@@ -597,7 +950,7 @@ impl<E: Engine + 'static> Reconciler<E> {
             .flatten()
             .map_or(0, |record| record.restart_generation);
 
-        if vm.restart_generation > applied_generation {
+        if vm.restart_generation > applied_generation && may_start {
             if matches!(info.state, VmState::Running | VmState::Starting) {
                 match self.stop_vm(&id).await {
                     Ok(stopped) => info = stopped,
@@ -811,7 +1164,7 @@ impl<E: Engine + 'static> Reconciler<E> {
             memory_mb: vm.memory_mb,
             rootfs: prepared.digest.clone(),
             disk_gb: vm.disk_gb,
-            volumes: Vec::new(),
+            volumes: volume_attaches(vm),
             net: NetAttach {
                 ip,
                 gateway: subnet.gateway,
@@ -843,6 +1196,13 @@ impl<E: Engine + 'static> Reconciler<E> {
                     .await
                 {
                     warn!(vm_id, error = %e, "could not record the created image digest");
+                }
+                if let Err(e) = self
+                    .store
+                    .set_meta(&volumes_key(&vm_id), &volumes_signature(&vm.volumes))
+                    .await
+                {
+                    warn!(vm_id, error = %e, "could not record the created volumes");
                 }
                 self.deployment_line(vm, "boot", "VM created").await;
                 info!(vm_id, %ip, project = %vm.project_id, "VM created");
@@ -1353,6 +1713,59 @@ impl<E: Engine + 'static> Reconciler<E> {
     }
 }
 
+/// The reason a `present` volume with a `restore` reports: backups and
+/// restores arrive in a later task.
+const RESTORE_UNSUPPORTED: &str = "restore is not supported by this agent yet";
+
+/// The engine attachments for a VM's `spec.vms[].volumes` (section 5.11,
+/// `engine-trait.md` section 3.6). A snapshot that names no serial gets the
+/// contract's `quoro-vol-<n>`, numbered in order.
+fn volume_attaches(vm: &SpecVm) -> Vec<VolumeAttach> {
+    vm.volumes
+        .iter()
+        .enumerate()
+        .map(|(index, volume)| VolumeAttach {
+            volume_id: VolumeId(volume.volume_id.clone()),
+            mount_path: volume.mount_path.clone(),
+            serial: if volume.serial.is_empty() {
+                format!("quoro-vol-{index}")
+            } else {
+                volume.serial.clone()
+            },
+        })
+        .collect()
+}
+
+/// The canonical form of a VM's attached volumes, compared across passes so a
+/// change forces a recreate (section 6.2 step 3).
+fn volumes_signature(volumes: &[quoro_proto::wire::SpecVolume]) -> String {
+    let mut parts: Vec<String> = volumes
+        .iter()
+        .map(|volume| {
+            format!(
+                "{}|{}|{}",
+                volume.volume_id, volume.mount_path, volume.serial
+            )
+        })
+        .collect();
+    parts.sort();
+    parts.join("\n")
+}
+
+/// The `node_meta` key that remembers one VM's attached-volume signature.
+fn volumes_key(vm_id: &str) -> String {
+    format!("vm_volumes:{vm_id}")
+}
+
+/// A one-line error of at most 2 000 characters (section 5.3).
+fn truncate_error(error: &str) -> String {
+    let one_line: String = error
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    one_line.chars().take(2_000).collect()
+}
+
 /// The `node_meta` key that remembers one VM's create-time image digest.
 fn digest_key(vm_id: &str) -> String {
     format!("image_digest:{vm_id}")
@@ -1568,6 +1981,9 @@ mod tests {
                     builds: Vec::new(),
                     mesh: None,
                     edge: None,
+                    volumes: Vec::new(),
+                    backups: Vec::new(),
+                    backup_repository: None,
                 },
                 signature: String::new(),
             },

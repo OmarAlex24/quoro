@@ -105,6 +105,7 @@ fn hello(node_id: &str) -> NodeMessage {
         },
         dropped_events: 0,
         mesh_public_key: None,
+        volume_snapshot: None,
     })
 }
 
@@ -215,6 +216,8 @@ fn report(builds: Vec<BuildStatus>) -> NodeMessage {
         disk_free_gb: 64.0,
         builds,
         edge_backends: Vec::new(),
+        backups: Vec::new(),
+        volumes: Vec::new(),
     })
 }
 

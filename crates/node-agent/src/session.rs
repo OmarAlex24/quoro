@@ -22,9 +22,9 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use quoro_proto::wire::{
     self, Capacity, Command, ControlMessage, DesiredState, EventBody, Heartbeat, Hello, LogLine,
     NodeMessage, RawFrame, RouteStatus, StatusReport, StreamClose, StreamData, StreamEnd,
-    StreamEndReason, StreamOpen, VmStatus,
+    StreamEndReason, StreamOpen, VmStatus, VolumeStatus,
 };
-use quoro_proto::{CommandResult, CommandStatus, ErrorBody, ErrorCode, ProtocolError};
+use quoro_proto::{CommandResult, CommandStatus, ErrorBody, ErrorCode, MsgId, ProtocolError};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -42,6 +42,7 @@ use crate::edge::EdgeManager;
 use crate::identity::{Identity, IdentityHandle};
 use crate::ingress::{DnsBridge, DnsRequest, IngressSupervisor};
 use crate::interactive::{Door, Interactive, OpenError, StreamKind};
+use crate::lease::LeaseLink;
 use crate::logs::{LogFilter, StoredLogLine};
 use crate::metrics::{MetricsRing, Tick, parse_metrics_params, tick_report};
 use crate::reconcile::Snapshot;
@@ -258,6 +259,13 @@ pub struct Session {
     /// The edge manager, when the agent runs one, for
     /// `status_report.edge_backends`.
     edge: Option<Arc<EdgeManager>>,
+    /// The lease service, when the agent runs one (sections 5.12, 5.13).
+    leases: Option<LeaseLink>,
+    /// How this node snapshots a volume (section 5.1); `None` for an engine
+    /// without volumes.
+    volume_snapshot: Option<wire::SnapshotMethod>,
+    /// The volume statuses the reconciler publishes (section 5.3).
+    volumes: Option<watch::Receiver<Vec<VolumeStatus>>>,
     /// The URL `dial` used for the current session, set after a successful
     /// dial and read once `welcome` arrives to promote a fallback address
     /// (section 5.10). `None` when the session was handed a stream directly
@@ -293,8 +301,34 @@ impl Session {
             interactive: None,
             builds,
             edge: None,
+            leases: None,
+            volume_snapshot: None,
+            volumes: None,
             dialed_url: None,
         }
+    }
+
+    /// Attaches the lease service: `lease_grant` and `lease_revoke` are applied
+    /// through it (sections 5.12, 5.13) and `hello` reports its leases.
+    #[must_use]
+    pub fn with_leases(mut self, leases: LeaseLink) -> Self {
+        self.leases = Some(leases);
+        self
+    }
+
+    /// Sets what `hello.volume_snapshot` reports (section 5.1).
+    #[must_use]
+    pub fn with_volume_snapshot(mut self, method: Option<wire::SnapshotMethod>) -> Self {
+        self.volume_snapshot = method;
+        self
+    }
+
+    /// Attaches the reconciler's volume statuses, reported in every
+    /// `status_report.volumes` (section 5.3).
+    #[must_use]
+    pub fn with_volumes(mut self, volumes: watch::Receiver<Vec<VolumeStatus>>) -> Self {
+        self.volumes = Some(volumes);
+        self
     }
 
     /// Attaches the interactive handles: `terminal`, `console` and `transcript`
@@ -854,24 +888,47 @@ impl Session {
                 self.on_stream_open(&open, &raw, streams, stream_tx, sink)
                     .await?;
             }
-            ControlMessage::LeaseGrant(_) => {
-                // No stateful app exists in this version (M2, section 8.7).
-                let error = ProtocolError {
-                    code: ErrorCode::BadMessage,
-                    message: "no stateful apps run in this version".to_owned(),
-                    fatal: false,
-                };
-                write_message(sink, NodeMessage::Error(error), Some(&raw.id)).await?;
+            ControlMessage::LeaseGrant(grant) => {
+                match &self.leases {
+                    Some(leases) => {
+                        let id = MsgId(raw.id.clone());
+                        let re = raw.re.clone().map(MsgId);
+                        if let Err(error) = leases.grant(id, re, grant).await {
+                            write_message(sink, NodeMessage::Error(error), Some(&raw.id)).await?;
+                        }
+                    }
+                    None => {
+                        // No stateful app exists without a lease service (M2,
+                        // section 8.7).
+                        let error = ProtocolError {
+                            code: ErrorCode::BadMessage,
+                            message: "no stateful apps run in this version".to_owned(),
+                            fatal: false,
+                        };
+                        write_message(sink, NodeMessage::Error(error), Some(&raw.id)).await?;
+                    }
+                }
             }
-            ControlMessage::LeaseRevoke(_) => {
-                let body = CommandResult {
-                    status: CommandStatus::Ok,
-                    detail: Some("unknown lease".to_owned()),
-                    error: None,
-                    lines: None,
-                    metrics: None,
+            ControlMessage::LeaseRevoke(revoke) => {
+                let result = match &self.leases {
+                    Some(leases) => {
+                        let id = MsgId(raw.id.clone());
+                        let re = raw.re.clone().map(MsgId);
+                        match leases.revoke(id, re, revoke).await {
+                            Ok(body) => NodeMessage::CommandResult(body),
+                            Err(error) => NodeMessage::Error(error),
+                        }
+                    }
+                    // Without a service no lease is known.
+                    None => NodeMessage::CommandResult(CommandResult {
+                        status: CommandStatus::Ok,
+                        detail: Some("unknown lease".to_owned()),
+                        error: None,
+                        lines: None,
+                        metrics: None,
+                    }),
                 };
-                write_message(sink, NodeMessage::CommandResult(body), Some(&raw.id)).await?;
+                write_message(sink, result, Some(&raw.id)).await?;
             }
             ControlMessage::Welcome(welcome) => {
                 debug!(
@@ -1393,12 +1450,13 @@ impl Session {
             applied_rev,
             log_seq: 0,
             log_hash: ZERO_HASH.to_owned(),
-            leases: Vec::new(),
+            leases: self.leases.as_ref().map_or_else(Vec::new, LeaseLink::hello),
             capacity: self.facts.capacity,
             allocated: self.allocated(),
             kvm: self.facts.kvm.clone(),
             dropped_events,
             mesh_public_key: self.mesh_public_key.clone(),
+            volume_snapshot: self.volume_snapshot,
         })
     }
 
@@ -1439,6 +1497,11 @@ impl Session {
                 .edge
                 .as_ref()
                 .map_or_else(Vec::new, |edge| edge.statuses()),
+            volumes: self
+                .volumes
+                .as_ref()
+                .map_or_else(Vec::new, |volumes| volumes.borrow().clone()),
+            backups: Vec::new(),
         };
         write_message(sink, NodeMessage::StatusReport(report), None).await
     }
@@ -2767,6 +2830,9 @@ mod tests {
                     builds,
                     mesh: None,
                     edge: None,
+                    volumes: Vec::new(),
+                    backups: Vec::new(),
+                    backup_repository: None,
                 },
                 signature: String::new(),
             },

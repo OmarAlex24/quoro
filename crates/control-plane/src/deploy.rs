@@ -21,6 +21,14 @@
 //!   deployment `succeeded`, becomes the app's `current_deployment_id`, and
 //!   the app's older VMs are deleted. A failure deletes every VM of the
 //!   deployment and leaves the previous deployment's VMs running.
+//! - **Stateful apps.** A stateful app's volume is attached to one VM at a
+//!   time (ADR 0145), so a deployment of a stateful app deletes the app's
+//!   previous VM rows in the same transaction that writes the new one: the
+//!   node stops and deletes the old VM before it starts the new one. A
+//!   stateful redeploy therefore has a short downtime, and a redeploy that
+//!   fails leaves no instance running — the previous VM is already gone. A
+//!   stateful app has exactly one instance: `replicas` above 1 is refused
+//!   while it has a volume (ADR 0142, ADR 0145).
 //!
 //! Every function that changes desired state returns the `vm_` ids whose
 //! desired state changed; the caller (the session or a handler) passes each
@@ -132,6 +140,7 @@ struct AppSnapshot {
     project_id: String,
     name: String,
     status: AppStatus,
+    stateful: bool,
     restart_generation: i64,
     resources: AppResources,
     placement: AppPlacement,
@@ -141,7 +150,8 @@ struct AppSnapshot {
 /// Loads the fields of `app_id` a deployment needs.
 async fn load_app(conn: &mut SqliteConnection, app_id: &str) -> Result<AppSnapshot, ApiError> {
     let row = sqlx::query(
-        "SELECT project_id, name, status, restart_generation, resources, placement, replicas \
+        "SELECT project_id, name, status, stateful, restart_generation, resources, placement, \
+         replicas \
          FROM apps WHERE id = ?",
     )
     .bind(app_id)
@@ -161,6 +171,7 @@ async fn load_app(conn: &mut SqliteConnection, app_id: &str) -> Result<AppSnapsh
         project_id: row.try_get("project_id")?,
         name: row.try_get("name")?,
         status,
+        stateful: row.try_get("stateful")?,
         restart_generation: row.try_get("restart_generation")?,
         resources,
         placement,
@@ -542,6 +553,37 @@ pub(crate) async fn create_deployment_with(
         &now,
     )
     .await?;
+
+    // A stateful app's volume attaches to one VM at a time (ADR 0145), so
+    // every older VM of the app leaves the desired state in this same
+    // transaction: the node stops and deletes it before it starts the new
+    // one. A stateful redeploy therefore has a short downtime, and a failed
+    // one leaves no instance running.
+    if app.stateful {
+        let older: Vec<(String,)> =
+            sqlx::query_as("SELECT id FROM vms WHERE app_id = ? AND id != ?")
+                .bind(app_id)
+                .bind(&vm_id)
+                .fetch_all(&mut *conn)
+                .await?;
+        for (older_id,) in older {
+            sqlx::query("DELETE FROM vms WHERE id = ?")
+                .bind(&older_id)
+                .execute(&mut *conn)
+                .await?;
+            changelog::append(
+                conn,
+                &deploy_actor(),
+                "vm",
+                &older_id,
+                Op::Delete,
+                json!({}),
+            )
+            .await?;
+            retired_vm_ids.push(older_id);
+        }
+    }
+
     let created = CreatedDeployment {
         deployment,
         project_id: app.project_id,

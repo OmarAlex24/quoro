@@ -103,6 +103,7 @@ fn hello(node_id: &str) -> NodeMessage {
         },
         dropped_events: 0,
         mesh_public_key: None,
+        volume_snapshot: None,
     })
 }
 
@@ -881,6 +882,8 @@ async fn a_status_report_for_an_app_vm_is_accepted() {
             disk_free_gb: 90.0,
             builds: Vec::new(),
             edge_backends: Vec::new(),
+            backups: Vec::new(),
+            volumes: Vec::new(),
         }),
     )
     .await;

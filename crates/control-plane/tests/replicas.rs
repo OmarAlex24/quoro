@@ -621,3 +621,48 @@ async fn an_app_with_one_of_two_instances_crashed_is_degraded() {
         .unwrap();
     assert_eq!(app["status"], "degraded");
 }
+
+#[tokio::test]
+async fn an_app_with_a_volume_keeps_exactly_one_instance() {
+    let (server, owner, project_id) =
+        setup(&[(NODE_A, &["node"]), (NODE_B, &["node"]), (EDGE, &["edge"])]).await;
+
+    // A volume attaches to one instance, so a replicated app cannot get one
+    // (ADR 0142, ADR 0145).
+    let many = create_app(&owner, &server, &project_id, "many", 2, None).await;
+    let many_id = many["id"].as_str().unwrap();
+    let res = owner
+        .post(server.url(&format!("/api/v1/apps/{many_id}/volumes")))
+        .json(&json!({ "size_gb": 1, "mount_path": "/data" }))
+        .send()
+        .await
+        .unwrap();
+    let (status, _, detail) = failure(res).await;
+    assert_eq!(status, 409, "{detail}");
+    assert!(detail.contains("replica"), "{detail}");
+
+    // A single-replica app gets the volume, and then cannot scale out.
+    let solo = create_app(&owner, &server, &project_id, "solo", 1, None).await;
+    let solo_id = solo["id"].as_str().unwrap();
+    let res = owner
+        .post(server.url(&format!("/api/v1/apps/{solo_id}/volumes")))
+        .json(&json!({ "size_gb": 1, "mount_path": "/data" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        201,
+        "create volume: {}",
+        res.text().await.unwrap()
+    );
+    let res = owner
+        .patch(server.url(&format!("/api/v1/apps/{solo_id}")))
+        .json(&json!({ "replicas": 2 }))
+        .send()
+        .await
+        .unwrap();
+    let (status, _, detail) = failure(res).await;
+    assert_eq!(status, 409, "{detail}");
+    assert!(detail.contains("stateless"), "{detail}");
+}
