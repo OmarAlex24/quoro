@@ -2,7 +2,7 @@
 
 Status: M0 draft for review.
 
-This contract fixes the shape of the audit log, how records chain, how the chain is verified and how a copy is written off-site. It implements D-0031: the audit log is append-only, hash-chained, optionally copied to S3-compatible storage with object lock, and MCP writes through the same path as the HTTP API. It also implements the "everything must be reconstructable" requirement of D-0029 and rides on the replicated change log of D-0013.
+This contract fixes the shape of the audit log, how records chain, how the chain is verified and how a copy is written off-site. It implements D-0031: the audit log is append-only, hash-chained, optionally copied to S3-compatible storage locked as strongly as its provider allows (ADR 0149), and MCP writes through the same path as the HTTP API. It also implements the "everything must be reconstructable" requirement of D-0029 and rides on the replicated change log of D-0013.
 
 The permission rules that decide *whether* a call may happen are in [permission-model.md](permission-model.md). This file assumes that decision has been made and describes what is written once it has.
 
@@ -18,7 +18,7 @@ The principles:
 2. **One record per action, in the action's transaction.** A record is written in the same SQLite transaction as the change it describes, so an action without its record cannot exist (D-0031; D-0013).
 3. **Hash-chained.** Each record names the hash of its predecessor, so a modified or reordered record is detectable (D-0031; D-0013).
 4. **Same path for every channel.** API, panel, CLI, MCP and Quoro's own automation write through one service layer and therefore one log (D-0031).
-5. **Copyable out of reach.** An optional off-site copy with object lock exists so that the person operating the server cannot silently rewrite the record (D-0031; section 8).
+5. **Copyable out of reach.** An optional off-site copy, locked as strongly as its provider allows, exists so that the person operating the server cannot silently rewrite the record (D-0031, ADR 0149; section 8).
 6. **Records are not events.** The audit log and the event stream are different logs with different consumers (section 10).
 
 ## 2. Record format
@@ -36,7 +36,7 @@ An audit record has no prefixed id; it is identified by its `seq`, which is gap-
 | `channel` | `api` \| `panel` \| `mcp` \| `cli` \| `system` | yes | how the action arrived |
 | `operation` | string | yes | the endpoint (`DELETE /api/v1/apps/{app_id}`), the MCP tool name (`delete_app`), or `session.end` for the close of an interactive session (section 3.3) |
 | `scope` | scope string | no | the scope the call was authorized under; absent when the call needed none |
-| `target_type` | string | no | `app`, `vm`, `deployment`, `build`, `domain`, `project`, `node`, `incident`, `approval`, `grant`, `webhook`, `user`, `cluster` |
+| `target_type` | string | no | `app`, `vm`, `deployment`, `build`, `domain`, `volume`, `backup`, `backup_repository`, `audit_export`, `project`, `node`, `incident`, `approval`, `grant`, `webhook`, `user`, `cluster` |
 | `target_id` | string | no | id of that target |
 | `project_id` | `prj_` id | no | project the target belongs to, when it has one |
 | `params` | JSON object | yes | the request parameters, secrets redacted (section 4) |
@@ -168,6 +168,7 @@ Each call or action in the rows marked "yes" below produces exactly one record (
 | reads by humans (panel browsing, API reads) | no | — |
 | approval requests filed, approved, denied, expired | yes | `ok` |
 | system actions: incident opened and resolved, incident grant issued and revoked, fencing-related lease revocations, node enrollment and removal | yes | `ok` / `error` |
+| storage system actions (M5a): a scheduled backup dispatched, a backup sealed or failed, retention pruning, a garbage-collection sweep, a control-plane backup, a `local` lease granted or moved, an audit-export probe (section 3.5) | yes | `ok` / `error` |
 | audit verification runs | yes | `ok` / `error` |
 | the open of a terminal or console session (its `POST`) | yes, for every identity, as a mutating call | `ok` / `refused` / `error` |
 | the close of a terminal or console session, for any reason | yes: one `session.end` record (section 3.3) | `ok` / `error` |
@@ -262,13 +263,43 @@ Because `session.end` is chained like every record, a transcript edited after th
 
 `params` carries both keys, redacted (section 4): `{"current_password": "[redacted]", "new_password": "[redacted]"}`. The `wrong_password` records are the trail of someone guessing a password with a stolen session. A request without a session cookie, or with an `Authorization` header, has no identity to attribute and is not recorded (section 7).
 
+### 3.5 Storage actions (M5a)
+
+Volumes, backups and the audit export add calls and system actions (ADR 0145 to ADR 0149). The calls are recorded like any mutating call, with these targets:
+
+| Operation | `scope` | `target_type` / `target_id` | Notes |
+| --- | --- | --- | --- |
+| `createVolume` | `app:update` | `app` / the app | `params` is the request body; the new `vol_` id is in `result_detail` only on error, and in the change log |
+| `deleteVolume` | `app:delete` | `volume` / the volume | Destructive: an agent's call carries `approval_id` (permission-model.md section 9) |
+| `createBackup` | `backup:write` | `app` / the app | |
+| `restoreBackup` | `backup:restore` | `backup` / the backup | Destructive; `params` is `{node_id}` |
+| `createBackupRepository` | `backup:manage` | `backup_repository` / the new repository | Human only. The recovery key is in the response, never in `params`, and never in any record |
+| `updateBackupRepository` | `backup:manage` | `backup_repository` / the repository | |
+| `rotateBackupRecoveryKey` | `backup:manage` | `backup_repository` / the repository | `params` is `{}`; the new key's fingerprint is in the change log |
+| `createAuditExport` | `provider:manage` | `audit_export` / the new export | |
+| `probeAuditExport` | `provider:manage` | `audit_export` / the export | `result_detail` absent on success; the observed strength is in the change log |
+
+System records, with `actor_type` `system`, `channel` `system` and no `scope`:
+
+| `operation` | `actor_id` | `target_type` / `target_id` | When |
+| --- | --- | --- | --- |
+| `backup.dispatch` | `backups` | `backup` / the backup | A scheduled backup (`trigger: schedule` or `upgrade`) is queued |
+| `backup.seal` | `backups` | `backup` / the backup | The primary sealed a backup (`ok`) or recorded it failed (`error`, `result_detail` the reason) |
+| `backup.prune` | `backups` | `backup` / the backup | Retention removed its seal and manifest |
+| `backup.gc` | `backups` | `backup_repository` / the repository | A garbage-collection sweep ran; `params` holds the counts of objects it deleted |
+| `lease.grant` | `leases` | `app` / the app | A `local` lease was granted at placement or after a restore; `params` is `{node_id, fencing_token}` |
+| `lease.revoke` | `leases` | `app` / the app | A lease was revoked with reason `moved` or `deleted`; `params` is `{node_id, fencing_token, reason}` |
+| `audit_export.probe` | `audit_export` | `audit_export` / the export | The daily probe ran; `ok` with the strength in the change log, or `error` |
+
+A control-plane backup is a `backup.dispatch` and a `backup.seal` with the backup as target. Restoring the control plane with `quoro restore` is offline and writes no record. The restored log ends where the backup ends, so verification against the off-site copy reports `tail_truncated` (section 8.3), which is the truth: the records after the backup are gone locally and kept off-site. How the export continues after such a restore is part of the storage epic; it never overwrites the existing copy.
+
 ## 4. Redaction
 
 Requests can carry secrets. The audit record stores the request parameters, so it must not become a second secret store (D-0031).
 
 The redaction rule:
 
-- The values of the keys `value`, `values`, `secret`, `password`, `current_password`, `new_password`, `token` and `key` are replaced by the string `"[redacted]"`, at any depth of the `params` object.
+- The values of the keys `value`, `values`, `secret`, `password`, `current_password`, `new_password`, `token`, `key` and `recovery_key` are replaced by the string `"[redacted]"`, at any depth of the `params` object.
 - **Every environment variable value** is replaced by `"[redacted]"`, whatever the key is called. Environment variable *names* are kept, because a name is not a secret and the record of which variable changed is the useful part (D-0031; [openapi.yaml](openapi.yaml), `app_env`).
 - Everything else is stored as sent.
 
@@ -410,7 +441,7 @@ It does **not** detect:
 - **Truncation of the tail.** Deleting the last N records leaves a chain that verifies perfectly, because nothing after them points back. Only a head hash recorded somewhere else catches this.
 - **A complete rewrite.** Someone with write access to the database and the code can recompute every hash from `seq` 1 and produce a consistent, valid chain.
 
-The only defence against both is that the head is known outside the server that produced it: the off-site copy (section 8) plus anchoring the head hash somewhere the operator does not control (D-0031). This is precisely why D-0031 asks for a copy out of reach of whoever operates the server, and why the design does not claim that the local chain alone is enough.
+The only defence against both is that the head is known outside the server that produced it: the off-site copy (section 8) plus anchoring the head hash somewhere the operator does not control (D-0031). This is precisely why D-0031 asks for a copy out of reach of whoever operates the server, and why the design does not claim that the local chain alone is enough. Section 8.3 says how the copy is used to detect both, and section 8.2 how far the copy itself is out of reach on each provider.
 
 Two further honest limits:
 
@@ -419,7 +450,7 @@ Two further honest limits:
 
 ## 8. Off-site copy
 
-The off-site copy ships in M5a with the S3-compatible path (D-0053), gated by an object-lock probe per provider. Object-lock support per provider is unverified (Hypothesis) until the research task before M5a and the probe.
+The off-site copy ships in M5a (ADR 0149, which supersedes ADR 0053). It goes to the bucket of an `object_store` provider through the S3-compatible API, and it reports the **lock strength** the bucket actually gives, per provider, instead of promising object lock everywhere. It is configured with `POST /api/v1/audit-exports` and re-probed with `POST /api/v1/audit-exports/{export_id}/probe`, both under the human-only `provider:manage`; `GET /api/v1/audit-exports` shows its state under `audit:read` ([openapi.yaml](openapi.yaml), `AuditExport`). One export per cluster in M5a.
 
 ### 8.1 Segments
 
@@ -439,21 +470,50 @@ The off-site copy ships in M5a with the S3-compatible path (D-0053), gated by an
 
   containing `{ "last_seq": ..., "head_hash": "...", "time": "..." }`.
 
-- Each object is written **once**. Segment keys are unique (the seq range is in the key), so an export never overwrites a previous segment.
-- Each object is written with an **object-lock retention in compliance mode**, so the store itself refuses deletion or overwrite until the retention passes (D-0031).
-- The exporter's credentials are limited to put: no delete, no overwrite of a locked object. A credential that can delete defeats the purpose of the copy (D-0031).
-- Progress is recorded in `audit_exports` (`target`, `last_exported_seq`, `object_lock`, `updated_at`), so a restarted exporter resumes after the last closed segment (shared entity model; [db-schema.sql](db-schema.sql)).
+- **Every object is written once, with `If-None-Match: *`.** Segment and head keys are unique (the seq range is in the key), and the conditional header makes the store refuse a second write of the same key (`412` on S3, B2 and R2). Quoro itself therefore never creates a second version of an exported object, and its own retries cannot replace one.
+- On a bucket whose lock strength is `compliance`, each object is written with `x-amz-object-lock-mode: COMPLIANCE` and a retain-until date, or under the bucket's default retention. On a `bucket_rule` bucket the rule on the audit prefix does the same job; on a `none` bucket nothing does.
+- The exporter's credential is a separate `object_store` provider entry that may put, get and list, and should not be able to delete. It is never the backup repository's entry (`backup-format.md` section 10), and it never leaves the primary (D-0031).
+- Progress is recorded in `audit_exports`: `last_exported_seq` and `last_exported_hash` (the `head_hash` of the last acknowledged head object), `lock_strength`, `probed_at`, `probe_detail`, `last_error` and `updated_at` ([db-schema.sql](db-schema.sql), migration 0006). A restarted exporter resumes after the last closed segment.
+- A failed put is retried; a segment counts as exported only after its put and its head object's put are acknowledged. After a crash between put and bookkeeping, the exporter lists the keys after `last_exported_seq` before cutting a new segment, and adopts an existing segment and head object whose content verifies instead of writing again: the conditional put would refuse the write, and a re-cut range would overlap.
 
-### 8.2 Provider caveats
+### 8.2 Lock strength and the probe
 
-- **Object lock and conditional writes are not portable across S3-compatible providers** (F-0038; `docs/research/r2-conditional-writes.md`). The provider adapter probes the capability at setup, and **refuses to report the copy as "locked" if the probe fails**: `audit_exports.object_lock` stays false and the panel says so, rather than promising a lock the store does not enforce.
-- Whether a given provider implements object lock in the form this contract needs is **Hypothesis**, not covered by `docs/research/`; F-0038 covers conditional writes only, and object-lock support per provider must be probed the same way.
-- **R2 limits concurrent writes to the same key to one per second** (F-0037). Segment keys are unique and each object is written once, so the limit does not bind this design. The head object has one key per `last_seq`, also unique, so it does not bind either.
-- A failed put is retried; a segment is only recorded as exported in `audit_exports` after the put is acknowledged. After a crash between put and bookkeeping, the exporter lists the keys after `last_exported_seq` before cutting a new segment and adopts an existing segment (and its head object) whose content verifies, instead of writing again: a locked object cannot be overwritten, and a re-cut range would overlap.
+What "the copy cannot be rewritten" means depends on the provider (ADR 0149; `docs/research/m5a-backups-and-chunks.md` section 1):
 
-### 8.3 What the copy does and does not solve
+| `lock_strength` | Provider | What an overwrite or delete of an exported object does | Who can still remove the protection |
+| --- | --- | --- | --- |
+| `compliance` | AWS S3, Backblaze B2 with Object Lock in compliance mode | A plain `PUT` adds a new version and a plain `DELETE` adds a delete marker; the locked version stays intact and readable by its version id until its retention ends | Nobody, the account root included, before the retention ends |
+| `bucket_rule` | Cloudflare R2 with a bucket lock rule on the audit prefix | Refused with `409` | Anyone whose credential may edit the bucket's settings: the rule is bucket configuration |
+| `none` | Any bucket without a lock, or one whose probe failed | Whatever the credential allows | — |
 
-It solves tail truncation and full rewrite *on the server*, because the segments and the head hashes live somewhere the operator of the server cannot rewrite (D-0031). It does not solve a compromised provider account, and it does not make the local log immutable. The honest statement is: the local chain plus an out-of-reach copy make silent rewriting detectable by anyone who compares the two heads (section 7).
+**The probe** runs when the export is created, on `probeAuditExport`, and once a day. With the exporter's own credential it:
+
+1. writes a probe object under `<prefix>/<cluster_id>/audit/probe/` with `If-None-Match: *` (and, where the provider takes them, the compliance-mode headers with a one-day retention);
+2. tries to overwrite it, then to delete it;
+3. reads it back, by version id where the bucket is versioned, and reads its retention.
+
+It reports `compliance` when the original version survived both and its retention reads back as `COMPLIANCE`; `bucket_rule` when both were refused with `409`; `none` otherwise, including any probe error. It never reports a stronger strength than it observed. `probe_detail` records what it saw, for example the status codes of the overwrite and the delete.
+
+**Setting the lock.** On S3 and B2 the operator enables Object Lock on the bucket, or Quoro sets the compliance headers per object as above. On R2 the S3 API cannot set a lock at all: in M5a **the operator adds the bucket lock rule on the audit prefix** in the Cloudflare dashboard or API, then re-probes. Quoro adding the rule itself through the account credential of a provider entry is allowed by ADR 0149 and left for later.
+
+**What the panel shows.** The strength, the time of the last probe and, for `bucket_rule`, that the rule can be removed by whoever may edit the bucket's settings. For `none` it says that the copy is not protected against overwrite or delete.
+
+**Definition of done (ADR 0149).** An overwrite or delete of the exported segment is refused (R2: `409`) or leaves the locked version intact (S3/B2), and the panel shows the strength.
+
+**R2 limits concurrent writes to the same key to one per second** (F-0037). Segment and head keys are unique and each is written once, so the limit does not bind this design.
+
+### 8.3 Verifying against the copy
+
+From M5a, while an export exists, `POST /api/v1/audit/verify` (section 6) and a daily background run also compare the local log with the copy:
+
+- **By version.** On a `compliance` bucket the verifier reads each head and segment by the version id of its first version, or lists the key's versions, so a newer version or a delete marker cannot hide the original. On `bucket_rule` and `none` it reads the current object.
+- **Tail truncation.** The verifier reads the newest head object. If the local log ends before its `last_seq`, the chain is broken with reason `tail_truncated`: `broken_at_seq` is the first missing local `seq`, `expected_hash` is that record's hash in the copy, and `found_hash` is 64 zeros.
+- **Divergence.** If the local `hash` at an exported `seq` differs from the copy's, the chain is broken with reason `copy_mismatch` at that `seq`. The verifier checks every head object's `head_hash` against the local record at its `last_seq`.
+- Either outcome emits `audit.chain_broken` with the `reason` ([events.schema.json](events.schema.json)) and is recorded like any verification run. A missing or unreadable head, when `last_exported_seq` says one should exist, sets `last_error` and raises `audit.chain_broken` only when the object is gone, not when the provider is unreachable.
+
+### 8.4 What the copy does and does not solve
+
+It solves tail truncation and full rewrite *on the server*, because the segments and the head hashes live somewhere the operator of the server cannot rewrite (D-0031), to the degree the lock strength says. With `compliance` that holds against everyone until the retention ends. With `bucket_rule` it holds against the server's operator unless they also control the Cloudflare account. With `none` it holds only as long as nobody with the credential, or with the account, deletes or replaces objects. It does not solve a compromised provider account, and it does not make the local log immutable. The honest statement is: the local chain plus an out-of-reach copy make silent rewriting detectable by anyone who compares the two heads (section 7).
 
 ## 9. Retention
 

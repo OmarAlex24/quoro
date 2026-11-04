@@ -110,6 +110,11 @@ async fn app_lifecycle_over_http() {
     assert_eq!(app["resources"]["disk_gb"], 1);
     assert!(app["placement"]["node_ids"].as_array().unwrap().is_empty());
     assert!(app["current_deployment_id"].is_null());
+    assert_eq!(
+        app["backup_schedule"],
+        json!({ "interval_h": 24, "keep": 7 })
+    );
+    assert!(app.get("ha_cost").is_none());
 
     // list and filters.
     let list: Value = owner
@@ -620,6 +625,44 @@ async fn app_validation_and_authorization() {
     )
     .await;
     assert_eq!((status, code.as_str()), (409, "conflict"));
+    // The backup schedule is stored; `cold` needs a stateful app and a
+    // backup repository (409), `warm` and `hot` wait for M5b and M6 (422),
+    // and a schedule out of range is 422 (ADR 0147).
+    let res = owner
+        .patch(server.url(&format!("/api/v1/apps/{app_id}")))
+        .json(&json!({ "backup_schedule": { "interval_h": 6, "keep": 3 } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "schedule: {}", res.text().await.unwrap());
+    let updated: Value = res.json().await.unwrap();
+    assert_eq!(
+        updated["backup_schedule"],
+        json!({ "interval_h": 6, "keep": 3 })
+    );
+    for (body, expected) in [
+        (json!({ "ha_policy": "cold" }), (409, "conflict")),
+        (json!({ "ha_policy": "warm" }), (422, "validation_failed")),
+        (
+            json!({ "backup_schedule": { "interval_h": 0, "keep": 7 } }),
+            (422, "validation_failed"),
+        ),
+        (
+            json!({ "backup_schedule": { "interval_h": 24, "keep": 101 } }),
+            (422, "validation_failed"),
+        ),
+    ] {
+        let (status, code, _) = problem(
+            owner
+                .patch(server.url(&format!("/api/v1/apps/{app_id}")))
+                .json(&body)
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!((status, code.as_str()), expected, "{body}");
+    }
     // A Git source cannot be added to an app created from an image.
     let (status, code, _) = problem(
         owner

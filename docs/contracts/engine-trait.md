@@ -28,7 +28,7 @@ The async methods are declared as `fn ... -> impl Future<Output = ...> + Send`, 
 use std::fmt;
 use std::future::Future;
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::{Duration, SystemTime};
 
@@ -144,11 +144,36 @@ impl VmSpec {
     }
 }
 
-/// A volume attached to a VM at a mount path inside the guest.
+/// A volume attached to a VM at a mount path inside the guest. The volume
+/// must exist on this node (`ensure_volume` or `import_volume`). Section 3.20.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VolumeAttach {
     pub volume_id: VolumeId,
     pub mount_path: String,
+    /// virtio-blk serial the guest init finds the disk by: `quoro-vol-<n>`,
+    /// `n` from 0 in the order of `VmSpec::volumes`. Added in M5a.
+    pub serial: String,
+}
+
+/// A volume file on this node. Added in M5a. Section 3.20.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VolumeInfo {
+    pub volume_id: VolumeId,
+    pub size_gb: u32,
+    /// Bytes the sparse file uses on the host's disk.
+    pub allocated_bytes: u64,
+    /// Node-local location of the file; not part of any API.
+    pub path: PathBuf,
+}
+
+/// How `snapshot_volume` takes a snapshot on this node (ADR 0146). Added in
+/// M5a. Section 3.16.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotMethod {
+    /// `ioctl(FICLONE)` of the volume file; the VM keeps running.
+    Reflink,
+    /// Pause the VM, copy the sparse file, resume the VM.
+    PauseCopy,
 }
 
 /// The VM's network attachment on the node bridge.
@@ -304,6 +329,9 @@ pub struct Capabilities {
     pub volume_snapshot: bool,
     /// Whether `exec` works on this backend and build (section 3.18). Added in M4.
     pub exec: bool,
+    /// The method `snapshot_volume` uses on this node, probed once at start-up
+    /// (section 3.16); `None` when the engine has no volumes. Added in M5a.
+    pub volume_snapshot_method: Option<SnapshotMethod>,
 }
 
 /// The node network a VM is attached to. Section 3.3.
@@ -327,6 +355,11 @@ pub struct VolumeSnapshot {
     pub size_bytes: u64,
     /// Node-local location of the snapshot; not part of any API.
     pub location: PathBuf,
+    /// How it was taken. Added in M5a.
+    pub method: SnapshotMethod,
+    /// How long the VM using the volume was paused; zero for `Reflink` or
+    /// when no VM was running. Added in M5a.
+    pub pause: Duration,
 }
 
 /// Every method is total: it either succeeds or returns one of these.
@@ -472,6 +505,31 @@ pub trait Engine: Send + Sync {
     }
 
     // Volumes (M5; default implementations return Unsupported)
+    /// Added in M5a; section 3.20.
+    fn ensure_volume(
+        &self,
+        _id: &VolumeId,
+        _size_gb: u32,
+    ) -> impl Future<Output = Result<VolumeInfo, EngineError>> + Send {
+        async { Err(EngineError::Unsupported("volumes are not implemented by this engine".into())) }
+    }
+    /// Added in M5a; section 3.20.
+    fn import_volume(
+        &self,
+        _id: &VolumeId,
+        _size_gb: u32,
+        _from: &Path,
+    ) -> impl Future<Output = Result<VolumeInfo, EngineError>> + Send {
+        async { Err(EngineError::Unsupported("volumes are not implemented by this engine".into())) }
+    }
+    /// Added in M5a; section 3.20.
+    fn delete_volume(
+        &self,
+        _id: &VolumeId,
+    ) -> impl Future<Output = Result<(), EngineError>> + Send {
+        async { Err(EngineError::Unsupported("volumes are not implemented by this engine".into())) }
+    }
+    /// Section 3.16.
     fn snapshot_volume(
         &self,
         _id: &VolumeId,
@@ -511,6 +569,8 @@ pub struct HostProbe {
 The derives, `MacAddr`, the blanket `ConsoleIo` implementation, `Display` and `Error` for `EngineError` and `VmSpec::canonical` (section 3.6) are contract items (D-0071), added additively during M0. `events`, `output`, `console` and `serial_output` are not `async` because they only build a stream; the first item is produced by the stream itself.
 
 M4 adds, additively: `VmSpec::serial`, `VmSpec::vsock` and `VmSpec::work_disks` with `SerialMode`, `VsockAttach` and `WorkDisk`; `NetAttach::egress_only`; `Capabilities::exec`; `OciLayout`, `ByteStream`, `ExecRequest` and `ExecSession`; and the methods `prepare_layout`, `exec` and `serial_output`, whose default implementations return `Unsupported`, so a backend that does not offer them still compiles. Code that builds a `VmSpec`, `NetAttach` or `Capabilities` literal sets the new fields to `SerialMode::File` (the M1-M3 serial log), `None`, an empty list, `false` and `false`, which keeps the M1-M3 behaviour. `VmSpec::canonical` keeps `work_disks` in order: their serials are unique, so the order carries no meaning, but the node agent always builds them in the same order.
+
+M5a adds, additively: `VolumeAttach::serial`, `VolumeInfo`, `SnapshotMethod`, `Capabilities::volume_snapshot_method`, `VolumeSnapshot::method` and `VolumeSnapshot::pause`, and the methods `ensure_volume`, `import_volume` and `delete_volume`, whose default implementations return `Unsupported` like `snapshot_volume` and `delete_volume_snapshot`. Code that builds a `Capabilities` literal sets the new field to `None`; `VmSpec::canonical` keeps sorting `volumes` by `(volume_id, mount_path)`, and the serial follows the volume.
 
 ## 3. Method semantics
 
@@ -562,7 +622,7 @@ Creates the VM and its runtime state without starting it. One microVM per app in
 - The same `id` with an equal spec returns `Ok` and the existing `VmInfo`.
 - The same `id` with a different spec is `Conflict`. Equality is compared on the canonical form of `VmSpec`, `VmSpec::canonical()`, which sorts `env` by `(name, value)` and `volumes` by `(volume_id, mount_path)`; everything else keeps its order, so field order and the ordering of those two lists must be normalized before comparison.
 - Resources are reserved at `create`, so `ResourceExhausted` is returned here rather than at `start`.
-- Precondition: `rootfs` is the digest of a prepared image, `net` is inside a network already ensured by `ensure_network`, and `volumes` are attached to this node.
+- Precondition: `rootfs` is the digest of a prepared image, `net` is inside a network already ensured by `ensure_network`, and every volume in `volumes` exists on this node (section 3.20). A missing volume is `NotFound`, never created here. Each volume is attached as a writable virtio-blk disk with its `serial`; serials are unique within the spec, or the spec is `Conflict`. A volume attached to another VM that exists is `Conflict`: in M5a a volume belongs to one VM at a time.
 - `serial: Socket` makes the engine connect to the serial socket as soon as it exists, before boot, so the ring of section 3.19 holds the whole boot. `vsock` attaches the device; its socket lives in the VM's runtime directory, which only root can enter.
 - Each `WorkDisk` is attached as a writable virtio-blk disk with its serial. A missing file is created as an empty ext4 filesystem of `size_gb`; an existing file is attached as it is. Two VMs that name the same work-disk path at once is `Conflict`. The engine never removes a work disk (section 3.9).
 
@@ -616,11 +676,16 @@ The M4 metrics use two of them (ADR 0014, `node-agent-protocol.md` sections 5.15
 
 ### 3.16 `snapshot_volume` and `delete_volume_snapshot`
 
-The point-in-time disk primitive the chunk engine needs (D-0023). Both are `Unsupported` in the default implementation, and only the M5 code path calls them.
+The point-in-time disk primitive the chunk engine needs (D-0023). Both are `Unsupported` in the default implementation, and only the M5 code path calls them. ADR 0146 decides the method for M5a and supersedes ADR 0062 on hosts whose filesystem has no reflink.
 
-- The primitive for M5a is decided (D-0062): reflink snapshots with a full content-defined chunk scan for cold backups. Before M5b, a spike comparing lvm-thin and btrfs chooses the primitive for warm volumes.
-- They must **not** be implemented with Cloud Hypervisor VM snapshots. A CH snapshot is a paused VM's `config.json`, `memory-ranges` and `state.json`; it contains guest RAM and device state but no disk contents, and CH exposes no dirty bitmap (F-0035). A volume snapshot is about the disk.
-- If implemented with a filesystem primitive, the call takes no VMM lock: it snapshots the volume of a stopped or running VM as the chosen primitive allows, and the chunk engine handles crash consistency (D-0023).
+- **Probe.** At start-up the engine creates a scratch file in the directory that holds volumes and tries `ioctl(FICLONE)` into a second one. If the clone succeeds, the method is `Reflink`; otherwise `PauseCopy`. It removes both files and reports the method in `Capabilities::volume_snapshot_method`, which the node agent sends in `hello` (`node-agent-protocol.md` section 5.1). XFS with reflink and btrfs give `Reflink`; ext4 gives `PauseCopy`.
+- **`Reflink`.** The engine clones the volume file into a snapshot file next to it with `FICLONE`, without touching the VM. The snapshot is crash-consistent at the instant of the clone; `pause` is zero.
+- **`PauseCopy`.** If a VM that attaches the volume is `Running`, the engine pauses it (`/vm.pause`), copies the volume file into a snapshot file keeping holes (`SEEK_DATA` and `SEEK_HOLE`), and resumes it (`/vm.resume`), whatever the copy's outcome. `pause` is the time between the pause and the resume. A volume no running VM attaches is copied without a pause. A resume that fails is `Hypervisor`, and the VM is left for the node agent's crash handling.
+- **Crash consistency.** Both methods give the guest the guarantee of a power cut: an ext4 volume replays its journal after a restore. An app that needs more uses its own dump (ADR 0023). A guest-side freeze through the exec channel may shorten the pause later; it is not part of M5a.
+- The snapshot is a node-local file that only the chunk engine reads. It is never attached to a VM and never mounted. `delete_volume_snapshot` removes it; a missing snapshot is `Ok`. Snapshots left by a crash are removed by the node agent at start.
+- At most one snapshot per volume exists at a time; a second `snapshot_volume` while one exists is `Conflict`. An unknown volume is `NotFound`. Too little free space for a `PauseCopy` is `ResourceExhausted`, checked before the pause.
+- They must **not** be implemented with Cloud Hypervisor VM snapshots. A CH snapshot is a paused VM's `config.json`, `memory-ranges` and `state.json`; it contains guest RAM and device state but no disk contents, and CH exposes no dirty bitmap (F-0035). `/vm.pause` and `/vm.resume` are the only VMM calls this method makes.
+- Before M5b, a spike comparing lvm-thin and btrfs chooses the primitive for warm volumes.
 
 ### 3.17 `prepare_layout`
 
@@ -654,6 +719,16 @@ A read-only stream of a VM's serial output: first up to `tail_bytes` of the newe
 - An unknown id is `NotFound`. A VM whose `serial` is not `Socket` is `Conflict`.
 - Input is never written to the serial port: nothing in the guest reads it.
 
+### 3.20 `ensure_volume`, `import_volume` and `delete_volume`
+
+The local volumes of ADR 0145: one sparse raw file per volume in the node's data directory, named by the volume id, owned by root and never mounted on the host. Added in M5a; the default implementations return `Unsupported`.
+
+- `ensure_volume` creates the file as an empty ext4 filesystem of `size_gb` gibibytes, sparse, with `mkfs.ext4` run on the file itself, never on a mount. A file that exists with the same size returns its `VolumeInfo`; one with another size is `Conflict`, because M5a has no resize. Too little free disk for the filesystem's metadata is `ResourceExhausted`. Idempotent.
+- `import_volume` moves a raw file that the node agent wrote from a backup (`backup-format.md` section 8.1) into place as the volume's file, in one rename on the same filesystem. The file must be exactly `size_gb` gibibytes. The engine does not parse its content: a filesystem a guest wrote is checked by the guest when it mounts it. A volume that already exists is `Conflict`.
+- `delete_volume` removes the file. A missing file is `Ok`. A volume attached to a VM that exists is `Conflict`; the node agent deletes the VM first.
+- `delete` of a VM never removes its volumes (section 3.9); only `delete_volume` does.
+- The node agent, not the engine, decides when a volume is created, imported or deleted (`node-agent-protocol.md` section 6.7).
+
 ## 4. Concurrency
 
 - Operations on one `VmId` are serialized by the caller. The node agent holds one lock per VM, so it never issues `start` and `delete` for the same id concurrently. The engine does not promise ordering for concurrent calls on one id and may return `Conflict`.
@@ -686,8 +761,11 @@ One `cloud-hypervisor` process per VM with its own `--api-socket`, because the V
 | `exec` | Connects to `<vm dir>/vsock.sock`, sends `CONNECT` for the exec port, then the open frame; relays frames to the PTY stream (section 3.18) | Hybrid vsock socket; no API call |
 | `serial_output` | Reads the node-local ring, then follows the engine's own serial client (section 3.19) | No backend call; the client reads the `--serial socket=` endpoint |
 | `counters` | Reads the VM's I/O and device counters and maps them to `VmCounters`; the exact field names of the backend's counter document are not fixed by `docs/research/cloud-hypervisor.md`, so the mapping is **Hypothesis** | `/vm.counters` |
-| `snapshot_volume` | Default: `Unsupported`. When implemented: a filesystem-level snapshot of the volume (reflink snapshot for M5a, D-0062) | No `/vm.snapshot` call (F-0035) |
-| `delete_volume_snapshot` | Default: `Unsupported`. When implemented: removes the filesystem-level snapshot | No backend call |
+| `snapshot_volume` | `FICLONE` of the volume file, or pause, sparse copy and resume (section 3.16, ADR 0146) | `/vm.pause` and `/vm.resume` for `PauseCopy` only; never `/vm.snapshot` (F-0035) |
+| `delete_volume_snapshot` | Removes the snapshot file | No backend call |
+| `ensure_volume` | Creates the sparse file and runs `mkfs.ext4` on it (section 3.20) | No backend call |
+| `import_volume` | Renames the restored file into place (section 3.20) | No backend call |
+| `delete_volume` | Removes the volume file (section 3.20) | No backend call |
 
 Details that follow from the research file:
 
@@ -712,6 +790,7 @@ The minimal init is part of the engine workstream and is the only process Quoro 
 | Network | Address, prefix length, gateway, interface name and the DNS servers of the node network (`NodeNetwork::dns`) |
 | Console | Which console carries log lines |
 | Exec port | The vsock port the init listens on for exec sessions (M4) |
+| Volumes | For each attached volume, its disk serial and mount path (M5a) |
 
 **What the init must do.**
 
@@ -724,8 +803,11 @@ The minimal init is part of the engine workstream and is the only process Quoro 
 7. Report the app's exit code so the engine can surface it as `exit_code` and as `EngineEvent::Exited`.
 8. From M4, mount `cgroup2` on `/sys/fs/cgroup`, which BuildKit needs and app images may expect (ADR 0118).
 9. From M4, listen for exec sessions (below), and unmount or remount read-only every writable disk before powering off, so a work disk is clean for the next VM that attaches it, without journal recovery (ADR 0118).
+10. From M5a, after the switch into the app's root and before the app starts, find each volume's disk by its serial and mount it at its mount path inside the app's root, creating the directory if it is missing. A volume that cannot be found or mounted is a failed boot. Volumes are unmounted with the other writable disks before power-off.
 
 **Configuration version 2 (M4).** The init's configuration grammar refuses unknown keys, so M4 adds one: the header becomes `quoro-init-config v2`, and one line `exec_port=<u32>` follows `stop_timeout_ms` (`crates/init/README.md`). The engine writes `exec_port=1024`. The init still accepts a `v1` configuration and then starts no exec listener. The engine and the init ship together: the initramfs is rebuilt from the installed init, so a VM gets the new init at its next start, and a VM that kept running across the upgrade answers `exec` with `Conflict` until it restarts.
+
+**Configuration version 3 (M5a).** The header becomes `quoro-init-config v3`, and zero or more lines `volume=<serial>:<mount_path>` follow `exec_port`, one per attached volume in the order of `VmSpec::volumes` (`crates/init/README.md`). `serial` matches `quoro-vol-[0-9]+`; `mount_path` is absolute, at most 255 bytes, holds no `:`, no empty, `.` or `..` segment and no trailing `/`, and is not `/` nor under `/proc`, `/sys` or `/dev`; any other line is a configuration error. The engine writes `v3` for every VM from M5a, with no `volume=` line for a VM without volumes. The init still accepts `v1` and `v2`. A VM started before its node got the M5a init boots as before; a VM with a volume needs the M5a init, which it gets at its next start.
 
 **Exec sessions (M4).** After the switch into the app's root and before the app starts, the init listens on vsock port `exec_port` for the VM's lifetime; vsock delivers only connections from the host to a guest listener (ADR 0113). One connection is one session. Every frame is `[u8 type][u32 length, big-endian][payload]`, with a payload of at most 64 KiB; a larger or unknown frame ends the session. Host to guest: `1` open (JSON `{"argv":[...],"user":null|"...","rows":R,"cols":C}`, exactly once, first), `2` input bytes, `3` resize (`u16 rows`, `u16 cols`, big-endian), `4` close. Guest to host: `129` output bytes, `130` exit (`i32` big-endian, `128 + signal` when a signal ended the program), `131` error (UTF-8 message, then the guest closes). Per session the init allocates a PTY and starts the program as a session leader with the PTY as its controlling terminal, the app's environment with `TERM=xterm-256color`, the app's working directory, and the app's user unless the open names another. Because the workspace forbids `unsafe`, the init re-executes itself (`/proc/self/exe` with a helper argument) as a small helper that calls `setsid`, takes the PTY as its controlling terminal on stdin, stdout and stderr, and replaces itself with the program. A close, or the host dropping the connection, sends `SIGHUP` to the session's process group. The exec listener never writes to the app's stdout or to the log console.
 
@@ -740,7 +822,7 @@ Tests must run on machines without KVM, including CI and the laptops of people w
 - Injectable: a test can make a VM crash after N seconds, make `start` return `ResourceExhausted`, make `prepare_image` return `Image`, and make the console echo, so every error path and every event the node agent must map is reachable.
 - Streams: `events`, `output`, `console` and `serial_output` are real streams over in-memory channels, so the node agent's stream handling is exercised, not stubbed.
 - M4 methods: `prepare_layout` caches a fake prepared image by manifest digest; `exec` returns an in-memory session that echoes input and can be told to exit with a code; `serial_output` replays and follows an injectable byte buffer. `Capabilities::exec` is `true`.
-- Volume methods: `snapshot_volume` and `delete_volume_snapshot` succeed and record a snapshot descriptor, so the M5 chunk-engine code is testable before a real primitive exists.
+- Volume methods: `ensure_volume`, `import_volume` and `delete_volume` keep volume records in memory with their size; `snapshot_volume` and `delete_volume_snapshot` succeed and record a snapshot descriptor, so the M5 chunk-engine code is testable before a real primitive exists. `Capabilities::volume_snapshot_method` is injectable and defaults to `Reflink`; with `PauseCopy` the fake records a pause and resume of the VM that attaches the volume.
 
 The node agent runs its protocol tests against `FakeEngine`: the M0 lease tests — revoking a `local` lease and expiring a test-only short `expiring` lease — need no VM at all beyond a fake (`node-agent-protocol.md`).
 
@@ -760,4 +842,5 @@ The node agent runs its protocol tests against `FakeEngine`: the M0 lease tests 
 | M1 | `create`, `start`, `stop`, `delete`, `list`, `inspect`, `prepare_image`, `ensure_network` (D-0033) |
 | M2 | `output` feeds live app logs (D-0014, D-0033); isolation groups on `NetAttach` and guest DNS on `NodeNetwork` (D-0084) |
 | M4 | `counters` for metrics (D-0033, ADR 0014); `serial_output` and `VmSpec::serial` for the read-only console (ADR 0116); `exec` and `VmSpec::vsock` for the web terminal, with init configuration v2 (ADR 0113); `prepare_layout`, `VmSpec::work_disks` and `NetAttach::egress_only` for builds (ADR 0117, ADR 0118). `console` is superseded |
-| M5a/M5b | `snapshot_volume` and `delete_volume_snapshot`: reflink snapshots for M5a, the primitive chosen by the lvm-thin vs btrfs spike for M5b (D-0023, D-0062) |
+| M5a | `ensure_volume`, `import_volume`, `delete_volume` and `VolumeAttach::serial` for local volumes, with init configuration v3 (ADR 0145); `snapshot_volume` and `delete_volume_snapshot` with the `Reflink` or `PauseCopy` method probed per node (ADR 0146) |
+| M5b | The primitive for warm volumes chosen by the lvm-thin vs btrfs spike (D-0023) |

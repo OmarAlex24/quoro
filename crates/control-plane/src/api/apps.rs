@@ -33,9 +33,9 @@ use sqlx::sqlite::SqliteRow;
 use utoipa::{IntoParams, ToSchema};
 
 /// Columns of [`App`], in the order [`app_from_row`] expects them.
-pub(crate) const APP_COLUMNS: &str = "id, project_id, name, stateful, ha_policy, image, source, port, \
-     health_check, resources, placement, status, current_deployment_id, restart_generation, \
-     created_at, updated_at";
+pub(crate) const APP_COLUMNS: &str = "id, project_id, name, stateful, ha_policy, backup_schedule, \
+     image, source, port, health_check, resources, placement, status, current_deployment_id, \
+     restart_generation, created_at, updated_at";
 
 /// `apps.status` (`App.status`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -75,8 +75,8 @@ impl AppStatus {
     }
 }
 
-/// `apps.ha_policy` (`App.ha_policy`). Only `none` is accepted before M5a
-/// (D-0020).
+/// `apps.ha_policy` (`App.ha_policy`). M5a accepts `none` and `cold`; `warm`
+/// and `hot` are refused until M5b and M6 (ADR 0020).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HaPolicy {
@@ -98,6 +98,114 @@ impl HaPolicy {
             Self::Hot => "hot",
         }
     }
+}
+
+/// When scheduled backups run and how many are kept (`openapi.yaml`
+/// `BackupSchedule`, ADR 0147). Stored in `apps.backup_schedule` as JSON.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(
+    title = "BackupSchedule",
+    description = "When scheduled backups run and how many are kept (ADR 0147)."
+)]
+pub struct BackupSchedule {
+    /// Hours between two scheduled backups, counted from the last succeeded one.
+    #[schema(minimum = 1, maximum = 168)]
+    pub interval_h: i64,
+    /// Succeeded backups kept per source.
+    #[schema(minimum = 1, maximum = 100)]
+    pub keep: i64,
+}
+
+impl Default for BackupSchedule {
+    fn default() -> Self {
+        Self {
+            interval_h: 24,
+            keep: 7,
+        }
+    }
+}
+
+/// How a node snapshots a volume (`openapi.yaml` `AppHaCost.snapshot_method`,
+/// ADR 0146).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotMethod {
+    Reflink,
+    PauseCopy,
+}
+
+/// Why an HA policy is not available to an app (`openapi.yaml`
+/// `HaPolicyCost.unavailable_reason`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HaUnavailableReason {
+    Stateless,
+    NoRepository,
+    NotInThisRelease,
+}
+
+/// Capacity an HA policy reserves on other nodes (`openapi.yaml` `HaCapacity`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(
+    title = "HaCapacity",
+    description = "Capacity an HA policy reserves on other nodes for this app."
+)]
+pub struct HaCapacity {
+    /// Virtual CPUs kept for the app on other nodes.
+    #[schema(minimum = 0)]
+    pub vcpus: i64,
+    /// Memory in mebibytes kept for the app on other nodes.
+    #[schema(minimum = 0)]
+    pub memory_mb: i64,
+    /// Disk in gibibytes kept for the app on other nodes.
+    #[schema(minimum = 0)]
+    pub disk_gb: i64,
+}
+
+/// What one HA policy costs an app (`openapi.yaml` `HaPolicyCost`, ADR 0020).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(
+    title = "HaPolicyCost",
+    description = "What one HA policy costs this app (ADR 0020). Estimates, not reservations."
+)]
+pub struct HaPolicyCost {
+    /// The HA policy this entry prices.
+    #[schema(inline)]
+    pub policy: HaPolicy,
+    /// Whether the app may switch to this policy now.
+    pub available: bool,
+    /// Why `available` is false, or null.
+    #[serde(default)]
+    #[schema(inline, required = false)]
+    pub unavailable_reason: Option<HaUnavailableReason>,
+    /// Capacity reserved on other nodes.
+    pub reserved: HaCapacity,
+    /// Bytes this policy keeps in object storage, or null when not computed.
+    #[schema(minimum = 0, required = true)]
+    pub storage_bytes: Option<i64>,
+    /// For `cold`, seconds to restore the latest backup; null otherwise.
+    #[schema(minimum = 0, required = true)]
+    pub restore_estimate_s: Option<i64>,
+    /// For `cold`, how long each backup pauses the app; null otherwise.
+    #[schema(minimum = 0, required = true)]
+    pub pause_estimate_ms: Option<i64>,
+}
+
+/// The cost of each HA policy for one app (`openapi.yaml` `AppHaCost`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(
+    title = "AppHaCost",
+    description = "The cost of each HA policy for one app (ADR 0020)."
+)]
+pub struct AppHaCost {
+    /// How the node that holds the app's volume snapshots it, or null.
+    #[schema(inline, required = true)]
+    pub snapshot_method: Option<SnapshotMethod>,
+    /// One entry per policy, in the order `none`, `cold`, `warm`, `hot`.
+    pub policies: Vec<HaPolicyCost>,
+    /// When the primary computed these values.
+    #[schema(format = "date-time")]
+    pub computed_at: String,
 }
 
 /// Health check an app declares (`openapi.yaml` `HealthCheck`); the node probes
@@ -206,7 +314,7 @@ impl ToSchema for NodeIdItem {}
 #[derive(Clone, Debug, Serialize, ToSchema)]
 #[schema(
     title = "App",
-    description = "A deployable service. It runs as one microVM per instance (D-0008); in M1-M4 an app has one instance. `ha_policy` exists from M0 but only `none` is accepted before M5a (D-0020). An app either deploys images given by reference (`source` null) or builds them from a Git source (ADR 0117)."
+    description = "A deployable service. It runs as one microVM per instance (D-0008); in M1-M4 an app has one instance. `ha_policy` exists from M0; M5a accepts `none` and `cold` (ADR 0020, ADR 0147). An app either deploys images given by reference (`source` null) or builds them from a Git source (ADR 0117). An app is stateful exactly when it has a volume (ADR 0145)."
 )]
 pub struct App {
     /// App id.
@@ -218,13 +326,17 @@ pub struct App {
     /// Name, unique in the project.
     #[schema(pattern = "^[a-z0-9-]{1,40}$")]
     pub name: String,
-    /// Whether the app has volumes. A stateful app may run only on its lease
-    /// holder (D-0019); volumes are used from M5.
+    /// Whether the app has a volume; derived (ADR 0145).
     pub stateful: bool,
-    /// HA policy. Only `none` is accepted before M5a; other values return
-    /// `validation_failed` (D-0020).
+    /// HA policy. M5a accepts `none` and `cold` (ADR 0020, ADR 0147).
     #[schema(inline)]
     pub ha_policy: HaPolicy,
+    /// The app's `cold` backup schedule (ADR 0147).
+    pub backup_schedule: BackupSchedule,
+    /// What each HA policy costs this app; absent until the primary computes it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(required = false)]
+    pub ha_cost: Option<AppHaCost>,
     /// Current OCI reference of the app. For an app with a Git source, the
     /// reference of its last successful build, or `""` before the first one.
     pub image: String,
@@ -416,14 +528,18 @@ pub struct CreateAppRequest {
     /// Container port the app listens on.
     #[schema(minimum = 1, maximum = 65535)]
     pub port: i64,
-    /// Whether the app has volumes (used from M5).
+    /// Kept for compatibility; only `false` is accepted (ADR 0145).
     #[serde(default)]
     #[schema(default = false, required = false)]
     pub stateful: bool,
-    /// HA policy. Only `none` before M5a (D-0020).
+    /// HA policy. Only `none` at creation (ADR 0145).
     #[serde(default)]
     #[schema(inline, default = "none", required = false)]
     pub ha_policy: HaPolicy,
+    /// The app's `cold` backup schedule (ADR 0147).
+    #[serde(default)]
+    #[schema(value_type = BackupSchedule, required = false)]
+    pub backup_schedule: Option<BackupSchedule>,
     /// Health check the node probes.
     #[serde(default)]
     #[schema(value_type = HealthCheck, required = false)]
@@ -457,10 +573,15 @@ pub struct UpdateAppRequest {
     #[serde(default)]
     #[schema(value_type = AppSource, required = false)]
     pub source: Option<AppSource>,
-    /// HA policy. Only `none` before M5a (D-0020).
+    /// HA policy: `none`, or `cold` for a stateful app with a backup
+    /// repository (ADR 0020, ADR 0147).
     #[serde(default)]
     #[schema(value_type = HaPolicy, inline, required = false)]
     pub ha_policy: Option<HaPolicy>,
+    /// New `cold` backup schedule (ADR 0147).
+    #[serde(default)]
+    #[schema(value_type = BackupSchedule, required = false)]
+    pub backup_schedule: Option<BackupSchedule>,
     /// New health check.
     #[serde(default)]
     #[schema(value_type = HealthCheck, required = false)]
@@ -577,6 +698,9 @@ pub(crate) fn app_from_row(row: &SqliteRow) -> Result<App, ApiError> {
     let placement: String = row.try_get("placement")?;
     let placement = serde_json::from_str(&placement)
         .map_err(|error| ApiError::internal(&format!("stored placement: {error}")))?;
+    let backup_schedule: String = row.try_get("backup_schedule")?;
+    let backup_schedule = serde_json::from_str(&backup_schedule)
+        .map_err(|error| ApiError::internal(&format!("stored backup_schedule: {error}")))?;
     let source: Option<String> = row.try_get("source")?;
     let source = match source {
         Some(source) => Some(
@@ -591,6 +715,8 @@ pub(crate) fn app_from_row(row: &SqliteRow) -> Result<App, ApiError> {
         name: row.try_get("name")?,
         stateful: row.try_get("stateful")?,
         ha_policy,
+        backup_schedule,
+        ha_cost: None,
         image: row.try_get("image")?,
         source,
         port: row.try_get("port")?,
@@ -684,6 +810,20 @@ fn validate_health(health: &HealthCheck) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn validate_backup_schedule(schedule: &BackupSchedule) -> Result<(), ApiError> {
+    if !(1..=168).contains(&schedule.interval_h) {
+        return Err(ApiError::validation(
+            "backup_schedule.interval_h is outside 1-168",
+        ));
+    }
+    if !(1..=100).contains(&schedule.keep) {
+        return Err(ApiError::validation(
+            "backup_schedule.keep is outside 1-100",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_resources(resources: &AppResources) -> Result<(), ApiError> {
     if !(1..=255).contains(&resources.vcpus) {
         return Err(ApiError::validation(format!(
@@ -763,17 +903,20 @@ fn validate_create(body: &CreateAppRequest) -> Result<(), ApiError> {
     if !(1..=65535).contains(&body.port) {
         return Err(ApiError::validation("port is outside 1-65535"));
     }
-    // Volumes ship in M5 (D-0019).
+    // An app becomes stateful when a volume is created for it (ADR 0145).
     if body.stateful {
         return Err(ApiError::validation(
-            "stateful apps are not supported before M5",
+            "stateful is derived: create a volume for the app instead",
         ));
     }
-    // Only `none` is accepted before M5a (D-0020).
+    // `cold` needs a volume, which is created after the app (ADR 0145).
     if body.ha_policy != HaPolicy::None {
         return Err(ApiError::validation(
-            "ha_policy other than none is not supported before M5a",
+            "ha_policy must be none when the app is created",
         ));
+    }
+    if let Some(schedule) = &body.backup_schedule {
+        validate_backup_schedule(schedule)?;
     }
     if let Some(health) = &body.health_check {
         validate_health(health)?;
@@ -799,12 +942,23 @@ fn validate_update(body: &UpdateAppRequest) -> Result<(), ApiError> {
     {
         return Err(ApiError::validation("port is outside 1-65535"));
     }
-    if let Some(policy) = body.ha_policy
-        && policy != HaPolicy::None
-    {
-        return Err(ApiError::validation(
-            "ha_policy other than none is not supported before M5a",
-        ));
+    match body.ha_policy {
+        None | Some(HaPolicy::None) => {}
+        // `cold` needs a stateful app and a backup repository (ADR 0147); no
+        // app can hold a volume until the storage epic ships.
+        Some(HaPolicy::Cold) => {
+            return Err(ApiError::conflict(
+                "ha_policy cold needs a stateful app and a backup repository",
+            ));
+        }
+        Some(HaPolicy::Warm | HaPolicy::Hot) => {
+            return Err(ApiError::validation(
+                "ha_policy warm and hot are not supported before M5b and M6",
+            ));
+        }
+    }
+    if let Some(schedule) = &body.backup_schedule {
+        validate_backup_schedule(schedule)?;
     }
     if let Some(health) = &body.health_check {
         validate_health(health)?;
@@ -1035,6 +1189,8 @@ async fn insert_app(
         name: body.name.clone(),
         stateful: false,
         ha_policy: HaPolicy::None,
+        backup_schedule: body.backup_schedule.unwrap_or_default(),
+        ha_cost: None,
         image: body.image.clone().unwrap_or_default(),
         source,
         port: body.port,
@@ -1077,20 +1233,23 @@ async fn insert_app(
         .map_err(|error| ApiError::internal(&format!("resources: {error}")))?;
     let placement = serde_json::to_string(&app.placement)
         .map_err(|error| ApiError::internal(&format!("placement: {error}")))?;
+    let backup_schedule = serde_json::to_string(&app.backup_schedule)
+        .map_err(|error| ApiError::internal(&format!("backup_schedule: {error}")))?;
     let source = match &app.source {
         Some(source) => Some(crate::build::source_json(source)?),
         None => None,
     };
     sqlx::query(
-        "INSERT INTO apps (id, project_id, name, stateful, ha_policy, image, source, port, \
-         health_check, resources, placement, status, current_deployment_id, restart_generation, \
-         created_at, updated_at) \
-         VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, ?)",
+        "INSERT INTO apps (id, project_id, name, stateful, ha_policy, backup_schedule, image, \
+         source, port, health_check, resources, placement, status, current_deployment_id, \
+         restart_generation, created_at, updated_at) \
+         VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, ?)",
     )
     .bind(&app.id)
     .bind(&app.project_id)
     .bind(&app.name)
     .bind(app.ha_policy.as_str())
+    .bind(&backup_schedule)
     .bind(&app.image)
     .bind(&source)
     .bind(app.port)
@@ -1331,6 +1490,12 @@ async fn update_app_tx(
         app.ha_policy = policy;
         changed.push("ha_policy");
     }
+    if let Some(schedule) = body.backup_schedule
+        && schedule != app.backup_schedule
+    {
+        app.backup_schedule = schedule;
+        changed.push("backup_schedule");
+    }
     if let Some(health) = &body.health_check
         && *health != app.health_check
     {
@@ -1361,17 +1526,21 @@ async fn update_app_tx(
             .map_err(|error| ApiError::internal(&format!("resources: {error}")))?;
         let placement = serde_json::to_string(&app.placement)
             .map_err(|error| ApiError::internal(&format!("placement: {error}")))?;
+        let backup_schedule = serde_json::to_string(&app.backup_schedule)
+            .map_err(|error| ApiError::internal(&format!("backup_schedule: {error}")))?;
         let source = match &app.source {
             Some(source) => Some(crate::build::source_json(source)?),
             None => None,
         };
         sqlx::query(
-            "UPDATE apps SET name = ?, port = ?, ha_policy = ?, health_check = ?, resources = ?, \
-             placement = ?, source = ?, updated_at = ? WHERE id = ?",
+            "UPDATE apps SET name = ?, port = ?, ha_policy = ?, backup_schedule = ?, \
+             health_check = ?, resources = ?, placement = ?, source = ?, updated_at = ? \
+             WHERE id = ?",
         )
         .bind(&app.name)
         .bind(app.port)
         .bind(app.ha_policy.as_str())
+        .bind(&backup_schedule)
         .bind(&health_check)
         .bind(&resources)
         .bind(&placement)

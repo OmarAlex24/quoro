@@ -85,6 +85,10 @@ tags:
     description: Node and app CPU and memory read on demand from the nodes.
   - name: interactive
     description: Web terminal and read-only serial console sessions over WebSocket.
+  - name: volumes
+    description: Local persistent disks of stateful apps, one node each.
+  - name: backups
+    description: Encrypted backups of volumes and of the control-plane database in object storage, and their restore.
 components:
   securitySchemes:
     bearerAuth:
@@ -320,6 +324,38 @@ components:
       schema:
         type: string
         pattern: '^trm_[0-9A-HJKMNP-TV-Z]{26}$'
+    VolumeId:
+      name: volume_id
+      in: path
+      required: true
+      description: Volume id (`vol_...`).
+      schema:
+        type: string
+        pattern: '^vol_[0-9A-HJKMNP-TV-Z]{26}$'
+    BackupId:
+      name: backup_id
+      in: path
+      required: true
+      description: Backup id (`bkp_...`).
+      schema:
+        type: string
+        pattern: '^bkp_[0-9A-HJKMNP-TV-Z]{26}$'
+    BackupRepositoryId:
+      name: repository_id
+      in: path
+      required: true
+      description: Backup repository id (`brp_...`).
+      schema:
+        type: string
+        pattern: '^brp_[0-9A-HJKMNP-TV-Z]{26}$'
+    AuditExportId:
+      name: export_id
+      in: path
+      required: true
+      description: Audit export id (`aex_...`).
+      schema:
+        type: string
+        pattern: '^aex_[0-9A-HJKMNP-TV-Z]{26}$'
     Seq:
       name: seq
       in: path
@@ -1409,15 +1445,17 @@ components:
       title: App
       description: |
         A deployable service. It runs as one microVM per instance (D-0008); in
-        M1-M4 an app has one instance. `ha_policy` exists from M0 but only `none`
-        is accepted before M5a (D-0020). An app either deploys images given by
-        reference (`source` null) or builds them from a Git source (ADR 0117).
+        M1-M4 an app has one instance. `ha_policy` exists from M0; M5a accepts
+        `none` and `cold` (ADR 0020, ADR 0147). An app either deploys images
+        given by reference (`source` null) or builds them from a Git source
+        (ADR 0117). An app is stateful exactly when it has a volume (ADR 0145).
       required:
         - id
         - project_id
         - name
         - stateful
         - ha_policy
+        - backup_schedule
         - image
         - port
         - health_check
@@ -1443,18 +1481,32 @@ components:
         stateful:
           type: boolean
           description: |
-            Whether the app has volumes. A stateful app may run only on its lease
-            holder (D-0019); volumes are used from M5.
+            Whether the app has a volume. Derived: it turns true when a volume
+            is created and false when the last one is deleted (ADR 0145). A
+            stateful app runs only on its volume's node, which holds a `local`
+            lease on it (ADR 0019).
         ha_policy:
           type: string
           description: |
-            HA policy. Only `none` is accepted before M5a; other values return
-            `validation_failed` (D-0020).
+            HA policy. M5a accepts `none` and `cold`; `cold` only for a stateful
+            app while the cluster has a backup repository, and it runs the app's
+            `backup_schedule` (ADR 0147). `warm` and `hot` return
+            `validation_failed` until M5b and M6 (ADR 0020).
           enum:
             - none
             - cold
             - warm
             - hot
+        backup_schedule:
+          $ref: '#/components/schemas/BackupSchedule'
+        ha_cost:
+          description: |
+            What each HA policy costs this app, computed by the primary. Absent
+            on a primary that does not compute it yet; null while it cannot be
+            computed (no node holds the app's volume yet).
+          oneOf:
+            - $ref: '#/components/schemas/AppHaCost'
+            - type: 'null'
         image:
           type: string
           description: |
@@ -1576,16 +1628,23 @@ components:
         stateful:
           type: boolean
           default: false
-          description: Whether the app has volumes (used from M5).
+          description: |
+            Kept for compatibility; only `false` is accepted. An app becomes
+            stateful when a volume is created for it (ADR 0145); `true` here
+            answers `validation_failed`.
         ha_policy:
           type: string
           default: none
-          description: HA policy. Only `none` before M5a (D-0020).
+          description: |
+            HA policy. Only `none` at creation: `cold` needs a volume, which is
+            created after the app (ADR 0145). Others answer `validation_failed`.
           enum:
             - none
             - cold
             - warm
             - hot
+        backup_schedule:
+          $ref: '#/components/schemas/BackupSchedule'
         health_check:
           $ref: '#/components/schemas/HealthCheck'
         resources:
@@ -1615,12 +1674,18 @@ components:
           $ref: '#/components/schemas/AppSource'
         ha_policy:
           type: string
-          description: HA policy. Only `none` before M5a (D-0020).
+          description: |
+            HA policy. `none` or `cold`; `cold` only for a stateful app while
+            the cluster has a backup repository, otherwise `conflict` (409).
+            `warm` and `hot` answer `validation_failed` until M5b and M6
+            (ADR 0020).
           enum:
             - none
             - cold
             - warm
             - hot
+        backup_schedule:
+          $ref: '#/components/schemas/BackupSchedule'
         health_check:
           $ref: '#/components/schemas/HealthCheck'
         resources:
@@ -2237,15 +2302,20 @@ components:
       type: object
       title: Volume
       description: |
-        Persistent disk of a stateful app. Shape only: used from M5 (D-0019). No
-        endpoint manages volumes in M1-M4.
+        Local persistent disk of a stateful app: a sparse file on one node's
+        data disk, attached to the app's microVM as a virtio-blk device and
+        mounted by the guest init at `mount_path` (ADR 0145). It is not
+        replicated: its data lives on that node and in its backups. In M5a an
+        app has at most one volume in `creating`, `ready` or `restoring`.
       required:
         - id
         - app_id
         - node_id
         - size_gb
         - mount_path
+        - state
         - created_at
+        - updated_at
       properties:
         id:
           type: string
@@ -2262,14 +2332,585 @@ components:
         size_gb:
           type: integer
           minimum: 1
+          maximum: 1024
           description: Size in gibibytes.
         mount_path:
           type: string
-          description: Mount path inside the app.
+          description: Absolute mount path inside the app.
+        state:
+          type: string
+          description: |
+            `creating` until the node reports the file; `ready` when it can be
+            attached and backed up; `restoring` while a restore writes it;
+            `failed` with `error` when creation or a restore failed;
+            `detached` once a restore was accepted to replace it: its file stays
+            untouched on its node and it is never attached again; `deleting`
+            until the node removes the file.
+          enum:
+            - creating
+            - ready
+            - restoring
+            - failed
+            - detached
+            - deleting
+        allocated_bytes:
+          type: [integer, 'null']
+          minimum: 0
+          description: Bytes the sparse file uses on the node's disk, as last reported; null before the first report.
+        restored_from_backup_id:
+          type: [string, 'null']
+          pattern: '^bkp_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: The backup this volume was restored from, or null for a volume created empty.
+        error:
+          type: [string, 'null']
+          maxLength: 2000
+          description: One-line reason, in `failed`.
         created_at:
           type: string
           format: date-time
           description: When the volume was created.
+        updated_at:
+          type: string
+          format: date-time
+          description: When the volume record last changed.
+    BackupSchedule:
+      type: object
+      title: BackupSchedule
+      description: |
+        When scheduled backups run and how many are kept (ADR 0147). On an app
+        it applies while `ha_policy` is `cold`; for the control-plane database it
+        is set on the backup repository (ADR 0148).
+      required:
+        - interval_h
+        - keep
+      properties:
+        interval_h:
+          type: integer
+          minimum: 1
+          maximum: 168
+          description: |
+            Hours between two scheduled backups, counted from the last succeeded
+            one. The default is 24 for an app and 6 for the control-plane
+            database.
+        keep:
+          type: integer
+          minimum: 1
+          maximum: 100
+          description: |
+            Succeeded backups kept per source; the oldest beyond this count is
+            pruned (`backup-format.md` section 7). The default is 7.
+    HaCapacity:
+      type: object
+      title: HaCapacity
+      description: Capacity an HA policy reserves on other nodes for this app.
+      required:
+        - vcpus
+        - memory_mb
+        - disk_gb
+      properties:
+        vcpus:
+          type: integer
+          minimum: 0
+          description: Virtual CPUs kept for the app on other nodes.
+        memory_mb:
+          type: integer
+          minimum: 0
+          description: Memory in mebibytes kept for the app on other nodes.
+        disk_gb:
+          type: integer
+          minimum: 0
+          description: Disk in gibibytes kept for the app on other nodes.
+    HaPolicyCost:
+      type: object
+      title: HaPolicyCost
+      description: |
+        What one HA policy costs this app (ADR 0020). The primary computes it
+        from data it already holds: the app's resources and volume, the
+        snapshot method of the volume's node (ADR 0146) and the manifests of the
+        app's backups (ADR 0147). These are estimates, not reservations.
+      required:
+        - policy
+        - available
+        - reserved
+        - storage_bytes
+        - restore_estimate_s
+        - pause_estimate_ms
+      properties:
+        policy:
+          type: string
+          description: The HA policy this entry prices.
+          enum:
+            - none
+            - cold
+            - warm
+            - hot
+        available:
+          type: boolean
+          description: Whether the app may switch to this policy now.
+        unavailable_reason:
+          description: |
+            Why `available` is false, or null: `stateless` (`cold` needs a
+            volume), `no_repository` (`cold` needs a backup repository) or
+            `not_in_this_release` (`warm` before M5b, `hot` before M6).
+          oneOf:
+            - type: string
+              enum:
+                - stateless
+                - no_repository
+                - not_in_this_release
+            - type: 'null'
+        reserved:
+          $ref: '#/components/schemas/HaCapacity'
+        storage_bytes:
+          type: [integer, 'null']
+          minimum: 0
+          description: |
+            Bytes this policy keeps in object storage. For `cold`, the stored
+            size of the app's kept backups, from their manifests; before the
+            first backup, the volume's allocated bytes as an estimate. 0 for
+            `none`; null when not computed (`warm`, `hot`).
+        restore_estimate_s:
+          type: [integer, 'null']
+          minimum: 0
+          description: |
+            For `cold`, seconds to restore the latest backup: its stored bytes
+            divided by the download rate the primary measured on earlier
+            restores, or the configured default rate before the first one. Null
+            for every other policy.
+        pause_estimate_ms:
+          type: [integer, 'null']
+          minimum: 0
+          description: |
+            For `cold`, how long each backup pauses the app: 0 when the volume's
+            node snapshots with `reflink`; on `pause_copy`, the pause the last
+            backup measured, or the volume's allocated bytes divided by the
+            node's measured copy rate before the first one (ADR 0146). Null for
+            every other policy.
+    AppHaCost:
+      type: object
+      title: AppHaCost
+      description: |
+        The cost of each HA policy for one app, so the panel can show what a
+        policy switch changes (ADR 0020). Present from the storage epic of M5a.
+      required:
+        - snapshot_method
+        - policies
+        - computed_at
+      properties:
+        snapshot_method:
+          description: |
+            How the node that holds the app's volume snapshots it (ADR 0146), or
+            null for a stateless app.
+          oneOf:
+            - type: string
+              enum:
+                - reflink
+                - pause_copy
+            - type: 'null'
+        policies:
+          type: array
+          description: One entry per policy, in the order `none`, `cold`, `warm`, `hot`.
+          items:
+            $ref: '#/components/schemas/HaPolicyCost'
+        computed_at:
+          type: string
+          format: date-time
+          description: When the primary computed these values.
+    VolumeList:
+      type: object
+      title: VolumeList
+      description: The volumes of one app, newest first.
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Volume'
+    CreateVolumeRequest:
+      type: object
+      title: CreateVolumeRequest
+      description: Create a local volume for an app (ADR 0145).
+      required:
+        - size_gb
+        - mount_path
+      properties:
+        size_gb:
+          type: integer
+          minimum: 1
+          maximum: 1024
+          description: Size in gibibytes. The file is sparse; the size counts against the node's disk.
+        mount_path:
+          type: string
+          minLength: 2
+          maxLength: 255
+          pattern: '^/[A-Za-z0-9._/-]+$'
+          description: |
+            Absolute path inside the app's root filesystem where the guest init
+            mounts the volume. It has no `.` or `..` segment, no empty segment and
+            no trailing `/`, and is not `/` nor under `/proc`, `/sys` or `/dev`.
+    Backup:
+      type: object
+      title: Backup
+      description: |
+        One point-in-time copy of a volume, or of the control-plane database, in
+        a backup repository (ADR 0147, ADR 0148). The data never passes through
+        this record: a volume is read and uploaded by the node that holds it,
+        the control-plane database by the primary (`backup-format.md`).
+      required:
+        - id
+        - repository_id
+        - source_kind
+        - status
+        - trigger
+        - created_at
+      properties:
+        id:
+          type: string
+          pattern: '^bkp_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: Backup id.
+        repository_id:
+          type: string
+          pattern: '^brp_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: The backup repository it is stored in.
+        source_kind:
+          type: string
+          description: |
+            What was backed up: one app volume, or the control-plane database
+            (`VACUUM INTO`, ADR 0148).
+          enum:
+            - volume
+            - control_plane
+        app_id:
+          type: [string, 'null']
+          pattern: '^app_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: The app whose volume was backed up; null for `control_plane`.
+        volume_id:
+          type: [string, 'null']
+          pattern: '^vol_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: The backed-up volume; null for `control_plane`.
+        node_id:
+          type: string
+          pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: The node that took it, the volume's node or the primary.
+        status:
+          type: string
+          description: |
+            `queued` waits for its node; `running` snapshots and uploads;
+            `succeeded` once its seal is written; `failed` with `error`.
+          enum:
+            - queued
+            - running
+            - succeeded
+            - failed
+        trigger:
+          type: string
+          description: |
+            `schedule` (the `cold` policy or the control-plane schedule), `api`
+            (`createBackup`) or `upgrade` (the control-plane backup taken before
+            an upgrade, ADR 0148).
+          enum:
+            - schedule
+            - api
+            - upgrade
+        snapshot_method:
+          description: How the volume was snapshotted (ADR 0146); null for `control_plane` and before `running`.
+          oneOf:
+            - type: string
+              enum:
+                - reflink
+                - pause_copy
+            - type: 'null'
+        pause_ms:
+          type: [integer, 'null']
+          minimum: 0
+          description: How long the app was paused for a `pause_copy` snapshot; 0 for `reflink`; null otherwise.
+        logical_bytes:
+          type: [integer, 'null']
+          minimum: 0
+          description: Size of the snapshot that was chunked, on success.
+        uploaded_bytes:
+          type: [integer, 'null']
+          minimum: 0
+          description: Bytes of new chunk objects this backup uploaded, on success; chunks the repository already held cost nothing.
+        chunk_count:
+          type: [integer, 'null']
+          minimum: 0
+          description: Chunks its manifest lists, on success.
+        error:
+          type: [string, 'null']
+          maxLength: 2000
+          description: One-line reason, on `failed`.
+        created_at:
+          type: string
+          format: date-time
+          description: When the backup was requested or scheduled.
+        started_at:
+          type: [string, 'null']
+          format: date-time
+          description: When it left `queued`.
+        finished_at:
+          type: [string, 'null']
+          format: date-time
+          description: When it reached a terminal status.
+        pruned_at:
+          type: [string, 'null']
+          format: date-time
+          description: |
+            When retention removed its seal and manifest from the repository.
+            The record stays; a pruned backup cannot be restored.
+    BackupList:
+      type: object
+      title: BackupList
+      description: One page of backups, newest first.
+      required:
+        - items
+        - next_cursor
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Backup'
+        next_cursor:
+          type: [string, 'null']
+          description: Cursor for the next page, or null on the last page.
+    RestoreBackupRequest:
+      type: object
+      title: RestoreBackupRequest
+      description: Where to restore a volume backup.
+      required:
+        - node_id
+      properties:
+        node_id:
+          type: string
+          pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: |
+            Connected node with the `node` role that gets the new volume and
+            then runs the app. It may be the volume's current node.
+    BackupRepository:
+      type: object
+      title: BackupRepository
+      description: |
+        An encrypted, content-addressed store of backups in the bucket of an
+        `object_store` provider (ADR 0147, `backup-format.md`). Its repository
+        key is stored wrapped under the cluster data-encryption key and, in the
+        bucket, under the owner's recovery key; neither key is ever returned.
+        One repository per cluster in M5a.
+      required:
+        - id
+        - name
+        - provider_id
+        - prefix
+        - recovery_key_fingerprint
+        - control_plane_schedule
+        - created_by
+        - created_at
+      properties:
+        id:
+          type: string
+          pattern: '^brp_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: Backup repository id.
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: Label of the repository.
+        provider_id:
+          type: string
+          pattern: '^prv_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: The `object_store` provider whose bucket holds it.
+        prefix:
+          type: string
+          description: Key prefix of the repository inside the bucket.
+        recovery_key_fingerprint:
+          type: string
+          pattern: '^[0-9a-f]{16}$'
+          description: |
+            Identifies the current recovery key without revealing it
+            (`backup-format.md` section 3), so an owner can check which key
+            they hold.
+        recovery_key_rotated_at:
+          type: [string, 'null']
+          format: date-time
+          description: When the recovery key was last replaced, or null if never.
+        control_plane_schedule:
+          $ref: '#/components/schemas/BackupSchedule'
+        created_by:
+          type: string
+          pattern: '^usr_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: Owner who created the repository.
+        created_at:
+          type: string
+          format: date-time
+          description: When the repository was created.
+    BackupRepositoryList:
+      type: object
+      title: BackupRepositoryList
+      description: The backup repositories of the cluster.
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/BackupRepository'
+    BackupRepositoryWithRecoveryKey:
+      type: object
+      title: BackupRepositoryWithRecoveryKey
+      description: |
+        A backup repository together with its new recovery key, the only time
+        the key is shown (ADR 0147). Quoro keeps no plaintext copy; an owner who
+        loses it and the primary loses every backup.
+      allOf:
+        - $ref: '#/components/schemas/BackupRepository'
+        - type: object
+          required:
+            - recovery_key
+          properties:
+            recovery_key:
+              type: string
+              pattern: '^qrk1(-[0-9A-HJKMNP-TV-Z]{4}){13}$'
+              description: The recovery key (`backup-format.md` section 3). Shown only in this response.
+    CreateBackupRepositoryRequest:
+      type: object
+      title: CreateBackupRepositoryRequest
+      description: Create the cluster's backup repository in a provider's bucket.
+      required:
+        - name
+        - provider_id
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: Label of the repository.
+        provider_id:
+          type: string
+          pattern: '^prv_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: |
+            An `object_store` provider whose `config` names the bucket. It must
+            not be the provider of an audit export: backup and audit credentials
+            are separate entries (ADR 0147).
+        prefix:
+          type: string
+          minLength: 1
+          maxLength: 200
+          pattern: '^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$'
+          default: quoro-backups
+          description: Key prefix inside the bucket. It must not hold a repository already.
+        control_plane_schedule:
+          $ref: '#/components/schemas/BackupSchedule'
+    UpdateBackupRepositoryRequest:
+      type: object
+      title: UpdateBackupRepositoryRequest
+      description: Change a backup repository's settings; absent fields stay unchanged.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: New label.
+        control_plane_schedule:
+          $ref: '#/components/schemas/BackupSchedule'
+    LockStrength:
+      type: string
+      title: LockStrength
+      description: |
+        What the bucket of an audit export does against an overwrite or delete
+        of an exported object, as the probe observed it (ADR 0149,
+        audit-log-format.md section 8.2). `compliance`: S3 Object Lock in
+        compliance mode (AWS S3, Backblaze B2); the locked version survives
+        every overwrite and delete. `bucket_rule`: a Cloudflare R2 bucket lock
+        rule refuses the overwrite and the delete, and anyone who may edit the
+        bucket's settings can remove the rule. `none`: no lock, or the probe
+        failed.
+      enum:
+        - none
+        - bucket_rule
+        - compliance
+    AuditExport:
+      type: object
+      title: AuditExport
+      description: |
+        The off-site copy target of the audit log (ADR 0031, ADR 0149), with the
+        lock strength its probe observed. One per cluster in M5a.
+      required:
+        - id
+        - provider_id
+        - prefix
+        - lock_strength
+        - last_exported_seq
+        - updated_at
+      properties:
+        id:
+          type: string
+          pattern: '^aex_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: Audit export id.
+        provider_id:
+          type: string
+          pattern: '^prv_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: The put-only `object_store` provider of the copy.
+        prefix:
+          type: string
+          description: Key prefix of the copy inside the bucket.
+        lock_strength:
+          $ref: '#/components/schemas/LockStrength'
+        probed_at:
+          type: [string, 'null']
+          format: date-time
+          description: When the probe last ran.
+        probe_detail:
+          type: [string, 'null']
+          maxLength: 2000
+          description: What the probe saw, for example the status of the refused overwrite.
+        last_exported_seq:
+          type: integer
+          minimum: 0
+          description: The last audit `seq` in an acknowledged segment; 0 before the first.
+        last_exported_hash:
+          type: [string, 'null']
+          pattern: '^[0-9a-f]{64}$'
+          description: The `hash` of that record, as written in its head object.
+        last_error:
+          type: [string, 'null']
+          maxLength: 2000
+          description: The last export or verification error, or null.
+        updated_at:
+          type: string
+          format: date-time
+          description: When the record last changed.
+    AuditExportList:
+      type: object
+      title: AuditExportList
+      description: The audit exports of the cluster.
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditExport'
+    CreateAuditExportRequest:
+      type: object
+      title: CreateAuditExportRequest
+      description: Configure the off-site copy of the audit log.
+      required:
+        - provider_id
+      properties:
+        provider_id:
+          type: string
+          pattern: '^prv_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: |
+            An `object_store` provider whose key may put and get, and should not
+            be able to delete (ADR 0031). It must not be the backup repository's
+            provider.
+        prefix:
+          type: string
+          minLength: 1
+          maxLength: 200
+          pattern: '^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$'
+          default: quoro-audit
+          description: Key prefix of the copy inside the bucket.
     Lease:
       type: object
       title: Lease
@@ -2774,6 +3415,10 @@ components:
         - app:delete
         - app:logs
         - app:terminal
+        - backup:read
+        - backup:write
+        - backup:restore
+        - backup:manage
         - agent:read
         - agent:write
         - grant:read
@@ -3250,6 +3895,10 @@ components:
         - build.succeeded
         - build.failed
         - build.cancelled
+        - backup.succeeded
+        - backup.failed
+        - restore.succeeded
+        - restore.failed
         - certificate.issued
         - certificate.expiring
         - certificate.failed
@@ -3719,7 +4368,10 @@ components:
           additionalProperties: true
           description: |
             Non-secret settings such as zone id, account id, bucket, endpoint or
-            region.
+            region. For `object_store`: `endpoint` (an `https://` URL),
+            `bucket`, `access_key_id` and optionally `region` (`auto` when
+            absent); the secret is the secret access key (`backup-format.md`
+            section 10).
         secret:
           type: string
           writeOnly: true
@@ -3921,7 +4573,12 @@ components:
           description: First record whose link does not match.
         reason:
           type: [string, 'null']
-          description: Why the link does not match.
+          description: |
+            Why the link does not match: `hash_mismatch`, `prev_mismatch` or
+            `seq_gap` (audit-log-format.md section 6); from M5a, while an audit
+            export exists, also `tail_truncated` or `copy_mismatch` when the
+            local log disagrees with the head of the off-site copy
+            (audit-log-format.md section 8.3).
     LogStreamName:
       type: string
       title: LogStreamName
@@ -5365,9 +6022,10 @@ paths:
       summary: Create an app
       description: |
         Creates an app record. The image is rolled out by a deployment, which is a
-        separate call. `ha_policy` other than `none` is refused with
-        `validation_failed` before M5a (D-0020). `Quoro-Justification` is required
-        when the caller is an agent (D-0031).
+        separate call. `ha_policy` other than `none`, and `stateful: true`, are
+        refused with `validation_failed`: an app becomes stateful, and may then
+        switch to `cold`, once a volume is created for it (ADR 0145).
+        `Quoro-Justification` is required when the caller is an agent (D-0031).
       x-quoro-scope: app:create
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -5438,9 +6096,10 @@ paths:
       summary: Change app settings
       description: |
         Changes settings, not the image: a new image is rolled out as a deployment.
-        `ha_policy` other than `none` is refused with `validation_failed` before
-        M5a (D-0020). `Quoro-Justification` is required when the caller is an agent
-        (D-0031).
+        `ha_policy: cold` needs a stateful app and a backup repository
+        (`conflict`, 409, otherwise); `warm` and `hot` are refused with
+        `validation_failed` until M5b and M6 (ADR 0020). `Quoro-Justification`
+        is required when the caller is an agent (D-0031).
       x-quoro-scope: app:update
       parameters:
         - $ref: '#/components/parameters/AppId'
@@ -5482,7 +6141,10 @@ paths:
       operationId: deleteApp
       summary: Delete an app and its data
       description: |
-        Deletes the app, its instances, its domains and its volumes. Deletion is
+        Deletes the app, its instances, its domains and its volumes. Its
+        backups stay in the repository and in the backup list; in M5a no
+        operation restores or deletes them once the app is gone
+        (`backup-format.md` section 9). Deletion is
         destructive and off by default for agents: without an approval grant the
         call is refused with `approval_required`, and a human approves the filed
         request (D-0030). Exposed as the MCP tool `delete_app` (D-0033); the tool
@@ -7131,6 +7793,110 @@ paths:
           $ref: '#/components/responses/NotFound'
         '429':
           $ref: '#/components/responses/RateLimited'
+  /api/v1/audit-exports:
+    get:
+      tags: [audit]
+      operationId: listAuditExports
+      summary: List audit exports
+      description: |
+        The off-site copy targets of the audit log, with the lock strength
+        each probe observed (ADR 0149, audit-log-format.md section 8). At most
+        one in M5a.
+      x-quoro-scope: audit:read
+      responses:
+        '200':
+          description: The audit exports.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditExportList'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+    post:
+      tags: [audit]
+      operationId: createAuditExport
+      summary: Configure the off-site audit copy
+      description: |
+        Starts copying the audit log to the bucket of an `object_store`
+        provider (ADR 0031) and runs the lock probe once
+        (audit-log-format.md section 8.2). The probe sets `lock_strength`; a
+        bucket with no lock is accepted and shown as `none`. Human-only: an
+        agent's access token is refused with `forbidden` and
+        `reason: human_only`. `conflict` (409) when the cluster already has an
+        audit export. `validation_failed` (422) when the provider is not
+        `object_store` or is the backup repository's provider.
+      x-quoro-scope: provider:manage
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        description: Provider and prefix.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAuditExportRequest'
+      responses:
+        '201':
+          description: The audit export was created and probed.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditExport'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/NotPrimary'
+  /api/v1/audit-exports/{export_id}/probe:
+    post:
+      tags: [audit]
+      operationId: probeAuditExport
+      summary: Probe the lock strength again
+      description: |
+        Runs the lock probe again (audit-log-format.md section 8.2), for
+        example after the operator added a lock rule to the bucket, and
+        stores the observed `lock_strength`. Human-only: an agent's access
+        token is refused with `forbidden` and `reason: human_only`.
+      x-quoro-scope: provider:manage
+      parameters:
+        - $ref: '#/components/parameters/AuditExportId'
+      responses:
+        '200':
+          description: The audit export with the new probe result.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditExport'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/NotPrimary'
   /api/v1/events:
     get:
       tags: [events]
@@ -7916,6 +8682,544 @@ paths:
           $ref: '#/components/responses/RateLimited'
         '504':
           $ref: '#/components/responses/NodeUnreachable'
+  /api/v1/apps/{app_id}/volumes:
+    get:
+      tags: [volumes]
+      operationId: listAppVolumes
+      summary: List the volumes of an app
+      description: |
+        The app's volumes, newest first, including `detached` volumes a
+        restore replaced (ADR 0145).
+      x-quoro-scope: app:read
+      parameters:
+        - $ref: '#/components/parameters/AppId'
+      responses:
+        '200':
+          description: The app's volumes.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VolumeList'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+    post:
+      tags: [volumes]
+      operationId: createVolume
+      summary: Create a local volume for an app
+      description: |
+        Creates a sparse local disk for the app on one node and makes the app
+        stateful (ADR 0145). The volume is placed on the node that runs the
+        app, or, for an app with no instance, on the node the scheduler picks;
+        the app's placement is then pinned to that node and the node gets a
+        `local` lease on the app, so the app runs only there until a restore
+        moves it. The volume is attached at the next start of the app's
+        instance, which this call does not trigger: restart or redeploy the app
+        to use it. `conflict` (409) when the app already has a volume in
+        `creating`, `ready` or `restoring` (one per app in M5a), runs more than
+        one replica, or its node is not connected.
+        `validation_failed` (422) for a bad `mount_path` or a size larger than
+        the node's free disk. `Quoro-Justification` is required when the
+        caller is an agent (ADR 0031).
+      x-quoro-scope: app:update
+      parameters:
+        - $ref: '#/components/parameters/AppId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/QuoroJustification'
+        - $ref: '#/components/parameters/QuoroIncident'
+      requestBody:
+        required: true
+        description: Size and mount path.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateVolumeRequest'
+      responses:
+        '201':
+          description: The volume was recorded in `creating`; it turns `ready` once its node reports the file.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Volume'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/NotPrimary'
+  /api/v1/volumes/{volume_id}:
+    get:
+      tags: [volumes]
+      operationId: getVolume
+      summary: Read one volume
+      description: One volume with its state and node.
+      x-quoro-scope: app:read
+      parameters:
+        - $ref: '#/components/parameters/VolumeId'
+      responses:
+        '200':
+          description: The volume.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Volume'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+    delete:
+      tags: [volumes]
+      operationId: deleteVolume
+      summary: Delete a volume and its data
+      description: |
+        Deletes the volume's file on its node (ADR 0145). Its backups stay in
+        the repository until retention prunes them. Deletion is destructive and
+        off by default for agents: without an approval grant on
+        `{type: volume, id}` the call is refused with `approval_required`, and
+        a human approves the filed request (ADR 0030). `conflict` (409) while
+        the app's desired status is running, unless the volume is `detached`
+        or `failed`: stop the app first. Deleting the app's attached volume makes the app
+        stateless once the node confirms: its `local` lease is released and
+        its placement is no longer pinned. `Quoro-Justification` is required
+        when the caller is an agent (ADR 0031).
+      x-quoro-scope: app:delete
+      parameters:
+        - $ref: '#/components/parameters/VolumeId'
+        - $ref: '#/components/parameters/QuoroJustification'
+        - $ref: '#/components/parameters/QuoroIncident'
+      responses:
+        '202':
+          description: Deletion accepted; the volume is `deleting` until its node removes the file.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Volume'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/ApprovalRequired'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/NotPrimary'
+  /api/v1/apps/{app_id}/backups:
+    get:
+      tags: [backups]
+      operationId: listAppBackups
+      summary: List the backups of an app
+      description: Backups of the app's volumes, newest first, including failed and pruned ones.
+      x-quoro-scope: backup:read
+      parameters:
+        - $ref: '#/components/parameters/AppId'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of backups.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackupList'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+    post:
+      tags: [backups]
+      operationId: createBackup
+      summary: Back up an app's volume now
+      description: |
+        Queues a backup of the app's volume outside its schedule, with
+        `trigger: api` (ADR 0147). The volume's node snapshots the volume
+        (ADR 0146), chunks and encrypts it and uploads the new chunks; the
+        primary then writes the backup's seal. Emits `backup.succeeded` or
+        `backup.failed`. `conflict` (409) when the app has no volume in
+        `ready`, the cluster has no backup repository, or the volume already
+        has a backup that is not terminal. `Quoro-Justification` is required
+        when the caller is an agent (ADR 0031).
+      x-quoro-scope: backup:write
+      parameters:
+        - $ref: '#/components/parameters/AppId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/QuoroJustification'
+        - $ref: '#/components/parameters/QuoroIncident'
+      responses:
+        '202':
+          description: The backup was accepted and is `queued`.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Backup'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/NotPrimary'
+  /api/v1/backups:
+    get:
+      tags: [backups]
+      operationId: listBackups
+      summary: List backups
+      description: |
+        Backups of every source the caller may read, newest first. Backups of
+        the control-plane database (ADR 0148) are listed only to a caller
+        whose grant selector is `{all: true}`.
+      x-quoro-scope: backup:read
+      parameters:
+        - name: source_kind
+          in: query
+          required: false
+          description: Only backups of this source kind.
+          schema:
+            type: string
+            enum:
+              - volume
+              - control_plane
+        - name: app_id
+          in: query
+          required: false
+          description: Only backups of this app's volumes.
+          schema:
+            type: string
+            pattern: '^app_[0-9A-HJKMNP-TV-Z]{26}$'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of backups.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackupList'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /api/v1/backups/{backup_id}:
+    get:
+      tags: [backups]
+      operationId: getBackup
+      summary: Read one backup
+      description: One backup with its status, sizes, snapshot method and error.
+      x-quoro-scope: backup:read
+      parameters:
+        - $ref: '#/components/parameters/BackupId'
+      responses:
+        '200':
+          description: The backup.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Backup'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /api/v1/backups/{backup_id}/restore:
+    post:
+      tags: [backups]
+      operationId: restoreBackup
+      summary: Restore a volume backup onto a node
+      description: |
+        Restores a succeeded, unpruned volume backup into a new volume on
+        `node_id` and moves the app there (ADR 0147). The primary stops the
+        app's instance and revokes its `local` lease on the old node (reason
+        `moved`); in the same change it turns the app's current volume
+        `detached` and creates the new volume in `restoring` with
+        `restored_from_backup_id`. The target node downloads, verifies and
+        writes the snapshot. When the node reports the volume `ready`, the
+        primary grants the target node a new `local` lease with a higher
+        fencing token, pins the app's placement there and starts the app;
+        then it emits `restore.succeeded`. If the restore fails, the new
+        volume turns `failed`, the app stays stopped with no lease and
+        `restore.failed` is emitted; another restore may follow. A `detached`
+        volume's file stays on its node until an operator deletes it with
+        `deleteVolume`. The restore replaces the app's current
+        data: it is destructive and off by default for agents; without an
+        approval grant on `{type: backup, id}` the call is refused with
+        `approval_required` (ADR 0030). `conflict` (409) when the backup did
+        not succeed or was pruned, belongs to the control-plane database
+        (restored only offline with `quoro restore`, ADR 0148), the volume's
+        current node is not connected (remove it first, which bumps the
+        lease's fencing token), the app has a restore in progress, or the
+        target node has a fence failure. `Quoro-Justification` is required
+        when the caller is an agent (ADR 0031).
+      x-quoro-scope: backup:restore
+      parameters:
+        - $ref: '#/components/parameters/BackupId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/QuoroJustification'
+        - $ref: '#/components/parameters/QuoroIncident'
+      requestBody:
+        required: true
+        description: The node to restore onto.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RestoreBackupRequest'
+      responses:
+        '202':
+          description: The restore was accepted; the answer is the new volume in `restoring`.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Volume'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/ApprovalRequired'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/NotPrimary'
+  /api/v1/backup-repositories:
+    get:
+      tags: [backups]
+      operationId: listBackupRepositories
+      summary: List backup repositories
+      description: The cluster's backup repositories; at most one in M5a. No key is ever returned.
+      x-quoro-scope: backup:read
+      responses:
+        '200':
+          description: The backup repositories.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackupRepositoryList'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+    post:
+      tags: [backups]
+      operationId: createBackupRepository
+      summary: Create the backup repository
+      description: |
+        Creates the cluster's backup repository in the bucket of an
+        `object_store` provider (ADR 0147). The primary generates the
+        repository key and the recovery key, writes the repository's config
+        object (`backup-format.md` section 4) and answers the recovery key
+        once; Quoro keeps no plaintext copy of it. The control-plane backup
+        schedule starts (ADR 0148). Human-only and owner-only: an agent's
+        access token is refused with `forbidden` and `reason: human_only`.
+        `conflict` (409) when the cluster already has a repository, or the
+        prefix already holds a config object. `validation_failed` (422) when
+        the provider is not `object_store`, is the provider of the audit
+        export, or the probe write to the bucket fails.
+      x-quoro-scope: backup:manage
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        description: Name, provider, prefix and the control-plane schedule.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBackupRepositoryRequest'
+      responses:
+        '201':
+          description: The repository was created; the recovery key is in this response only.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackupRepositoryWithRecoveryKey'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/NotPrimary'
+  /api/v1/backup-repositories/{repository_id}:
+    get:
+      tags: [backups]
+      operationId: getBackupRepository
+      summary: Read one backup repository
+      description: One backup repository with its recovery-key fingerprint and schedule.
+      x-quoro-scope: backup:read
+      parameters:
+        - $ref: '#/components/parameters/BackupRepositoryId'
+      responses:
+        '200':
+          description: The backup repository.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackupRepository'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+    patch:
+      tags: [backups]
+      operationId: updateBackupRepository
+      summary: Change a backup repository's settings
+      description: |
+        Renames the repository or changes the control-plane backup schedule
+        (ADR 0148). Human-only and owner-only: an agent's access token is
+        refused with `forbidden` and `reason: human_only`.
+      x-quoro-scope: backup:manage
+      parameters:
+        - $ref: '#/components/parameters/BackupRepositoryId'
+      requestBody:
+        required: true
+        description: Fields to change; absent fields stay unchanged.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateBackupRepositoryRequest'
+      responses:
+        '200':
+          description: The updated backup repository.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackupRepository'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/NotPrimary'
+  /api/v1/backup-repositories/{repository_id}/recovery-key:
+    post:
+      tags: [backups]
+      operationId: rotateBackupRecoveryKey
+      summary: Replace the recovery key
+      description: |
+        Generates a new recovery key, rewraps the repository key under it and
+        replaces the repository's config object, then answers the new key once
+        (`backup-format.md` section 3). The repository key, and so every
+        backup, stays the same; the old recovery key no longer opens the
+        repository. Use it when the owner lost the key while the primary still
+        holds the repository key, or suspects the key leaked. Human-only and
+        owner-only: an agent's access token is refused with `forbidden` and
+        `reason: human_only`.
+      x-quoro-scope: backup:manage
+      parameters:
+        - $ref: '#/components/parameters/BackupRepositoryId'
+      responses:
+        '200':
+          description: The repository with its new recovery key, in this response only.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackupRepositoryWithRecoveryKey'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/NotPrimary'
   /api/v1/nodes/{node_id}/metrics:
     get:
       tags: [metrics]

@@ -10,10 +10,11 @@ These files are the interfaces that Quoro's workstreams build against in paralle
 
 | File | What it fixes | Main consumers |
 | --- | --- | --- |
-| [openapi.yaml](openapi.yaml) | HTTP API for the M1-M4 surface (OpenAPI 3.1): auth, nodes, projects, VMs, apps, Git sources and builds, deployments, domains, logs, metrics, terminal and console sessions, agents, grants, approvals, incidents, audit, events, webhooks | control-plane, panel, mcp, installer |
+| [openapi.yaml](openapi.yaml) | HTTP API (OpenAPI 3.1): auth, nodes, projects, VMs, apps, Git sources and builds, deployments, domains, logs, metrics, terminal and console sessions, volumes, backups and backup repositories, agents, grants, approvals, incidents, audit and its off-site exports, events, webhooks | control-plane, panel, mcp, installer |
 | [events.schema.json](events.schema.json) | JSON Schema (draft 2020-12) of the event envelope and every event type | control-plane, node-agent, panel, mcp, webhook receivers |
 | [node-agent-protocol.md](node-agent-protocol.md) | Enrollment, the dial-out session, messages, desired-state reconciliation, change-log follow, leases and self-fencing (D-0019) | node-agent, control-plane, engine |
-| [audit-log-format.md](audit-log-format.md) | Audit record format, hash chaining, verification, off-site copy with object lock | control-plane, mcp, panel |
+| [audit-log-format.md](audit-log-format.md) | Audit record format, hash chaining, verification, off-site copy with a per-provider lock strength | control-plane, mcp, panel |
+| [backup-format.md](backup-format.md) | Backup repository layout in object storage: chunks, manifests, seals, the repository key and the owner recovery key (ADR 0147, ADR 0148) | control-plane, node-agent, installer |
 | [permission-model.md](permission-model.md) | Identities, scopes, resource selectors, grants (TTL, max uses), incident grants, JIT approval | control-plane, mcp, panel |
 | [db-schema.sql](db-schema.sql) | Control-plane SQLite schema: numbered change log and the state tables derived from it (D-0015) | control-plane |
 | [migrations/](migrations/) | Numbered schema migrations applied in order on top of the frozen `db-schema.sql`; each bumps `schema_version` | control-plane |
@@ -55,7 +56,10 @@ All ids are strings `<prefix>_<ULID>` (ULID in Crockford base32, 26 characters),
 | deployment | `dep_` | One rollout of an image to an app |
 | build | `bld_` | One image build of an app's Git source, run on the app's node (ADR 0117, ADR 0118) |
 | domain | `dom_` | A hostname routed to an app |
-| volume | `vol_` | Persistent disk of a stateful app (shape prepared, used from M5) |
+| volume | `vol_` | Local persistent disk of a stateful app, on one node (ADR 0145) |
+| backup | `bkp_` | One point-in-time copy of a volume or of the control-plane database in a backup repository (ADR 0147, ADR 0148) |
+| backup repository | `brp_` | An encrypted, content-addressed store of backups in an `object_store` provider's bucket (ADR 0147) |
+| audit export | `aex_` | One off-site copy target of the audit log (ADR 0149) |
 | user (human) | `usr_` | A human identity |
 | API token (human) | `tok_` | Personal token of a human |
 | agent | `agt_` | An AI identity: name, model, owner (D-0029) |
@@ -84,14 +88,20 @@ The cluster has three keys (D-0050):
 - **cluster data-encryption key**: 256-bit key for XChaCha20-Poly1305. It encrypts every `*_enc` column; a `*_enc` BLOB stores the key id, then the 24-byte nonce, then the ciphertext with its tag, so that entries encrypted under different keys can coexist and are selected by key id, which is how rotation works.
 - **node-local key**: encrypts a node's local copy of secrets and never leaves the node.
 
+Backups add two keys per backup repository (ADR 0147, [backup-format.md](backup-format.md)):
+
+- **repository key**: 256 random bits, generated when the repository is created. The keys that name and encrypt chunks are derived from it per backup source. It is stored only wrapped: under the cluster data-encryption key in `backup_repositories.repo_key_enc`, for unattended backups, and under the recovery key, in the repository's config object in the bucket.
+- **recovery key**: 256 random bits, shown once to the owner who creates the repository (or rotates it) and never stored by Quoro in plaintext. With it, the repository can be read on a fresh host after the primary and its data-encryption key are lost.
+
 The cluster keys are generated at the primary's first start and stored as `0600` files under `/var/lib/quoro`, outside SQLite. They are backed up separately from the database: losing the data-encryption key loses every secret it protects. Custody of the cluster keys on promotion is open (Q-0024): the candidate is to replicate both keys wrapped to each replica's node key, against re-keying on promotion with an operator-confirmed re-pin.
 
 ### Resource relationships
 
 - A **project** contains **apps**. A **VM** may belong to an app (`app_id` set) or stand alone (M1 lifecycle, `app_id` null). Standalone VMs belong to a project too.
 - An **app** has **deployments**; the current deployment's image runs as one or more **VMs** (instances) placed on **nodes**. In M1-M4 an app has one instance.
-- An app is `stateful` or not. Stateful apps have **volumes** and may run only on their **lease holder** (D-0019).
-- An app has an HA policy: `none`, `cold`, `warm`, `hot` (D-0020). Only `none` is implemented before M5a; the field exists from M0.
+- An app is `stateful` or not. An app is stateful exactly when it has a **volume**: its first volume makes it stateful (ADR 0145). A stateful app runs one instance, on the node that holds its volume and its `local` **lease** (D-0019, D-0047).
+- A **backup** copies one volume, or the control-plane database, into a **backup repository** (ADR 0147, ADR 0148). Restoring a volume backup creates a new volume on the chosen node and moves the app there.
+- An app has an HA policy: `none`, `cold`, `warm`, `hot` (D-0020). `none` and `cold` (scheduled backups of a stateful app) are accepted from M5a; `warm` and `hot` are refused until M5b and M6. The field exists from M0.
 - A **domain** belongs to one app and has a TLS mode: `acme` (public-IP hosts) or `tunnel` (Cloudflare Tunnel) (D-0024).
 - An app either deploys images given by reference or has a **Git source** (`source`): then its images come from **builds** of that source, and each successful build starts a deployment with `trigger: build` (ADR 0117). A build runs on the node that runs the app (ADR 0118).
 - An **interactive session** is a web terminal into an app's VM or a read-only console of a VM (ADR 0114). It lives on the primary while it is open and leaves two audit records, its open and its `session.end` (ADR 0115).
@@ -119,6 +129,10 @@ and the build's manifest digest as its digest, for example `build.quoro.invalid/
 - Incident `status`: `open`, `resolved`.
 - Lease `mode`: `local` (HA policy `none`/`cold`: never expires when the arbiter is unreachable; ends by `lease_revoke` or an operator declaring the node lost) or `expiring` (HA policy `warm`/`hot`, from M5b: `held` -> `uncertain` -> `expired`, self-fence at `expired`; revoked explicitly) (D-0047). Lease state as seen by a node: `held`, `uncertain`, `expired`, `revoked`. See node-agent-protocol.md.
 - Webhook delivery `status`: `pending`, `delivered`, `failed`.
+- Volume `state`: `creating` (the node has not reported the file yet), `ready`, `restoring` (being written from a backup), `failed`, `detached` (replaced by a restore, its file kept on its node until deleted), `deleting` (ADR 0145).
+- Backup `status`: `queued`, `running`, `succeeded`, `failed` (ADR 0147). The last two are terminal.
+- Volume snapshot method of a node: `reflink` or `pause_copy` (ADR 0146).
+- Audit export `lock_strength`: `none`, `bucket_rule` (R2 lock rules), `compliance` (S3 Object Lock in compliance mode) (ADR 0149).
 
 ### Scopes
 
@@ -140,17 +154,21 @@ A scope is `<resource>:<verb>` (D-0030). The complete list:
 | `vm:stop` | Stop a VM | |
 | `vm:delete` | Delete a VM and its disks | destructive |
 | `vm:console` | Read a VM's serial console, live and its recent output (ADR 0116) | |
-| `app:read` | List and read apps, their Git sources, builds, deployments, domains, env var names and app metrics | |
+| `app:read` | List and read apps, their Git sources, builds, deployments, domains, volumes, env var names and app metrics | |
 | `app:create` | Create an app | |
-| `app:update` | Change app settings, the Git source, env vars, domains | |
+| `app:update` | Change app settings, the Git source, env vars, domains, the backup schedule; create volumes | |
 | `app:restart` | Restart an app's instances | |
 | `app:redeploy` | Roll out the current image again | |
 | `app:deploy` | Deploy a new image (new deployment); start and cancel builds, whose success deploys | |
 | `app:start` | Start a stopped app | |
 | `app:stop` | Stop an app | |
-| `app:delete` | Delete an app and its data | destructive |
+| `app:delete` | Delete an app and its data, or one volume of an app | destructive |
 | `app:logs` | Read app logs and build logs, including live streams | |
 | `app:terminal` | Open an interactive terminal in an app's VM (ADR 0113, ADR 0114) | human-only |
+| `backup:read` | List and read backups and backup repositories | |
+| `backup:write` | Take a backup of an app's volume now | |
+| `backup:restore` | Restore a backup onto a node, which moves the app there | destructive |
+| `backup:manage` | Create a backup repository, rotate its recovery key, set the control-plane backup schedule | human-only |
 | `agent:read` | List and read agents | |
 | `agent:write` | Create, update, disable agents; rotate agent keys | human-only |
 | `grant:read` | List and read grants | |
@@ -160,18 +178,19 @@ A scope is `<resource>:<verb>` (D-0030). The complete list:
 | `approval:decide` | Approve or deny an approval request | human-only |
 | `incident:read` | List and read incidents | |
 | `incident:resolve` | Resolve an incident | |
-| `audit:read` | Read the audit log and run verification; humans also fetch session transcripts | |
+| `audit:read` | Read the audit log and run verification, and read the status of its off-site export; humans also fetch session transcripts | |
 | `event:read` | Read events and the event stream | |
 | `webhook:read` | List and read webhooks and deliveries | |
 | `webhook:write` | Create, update, delete, test webhooks | human-only |
-| `provider:manage` | Create, list, read, delete providers and rotate their secrets; map nodes to tunnel providers | human-only |
+| `provider:manage` | Create, list, read, delete providers and rotate their secrets; map nodes to tunnel providers; configure and probe the off-site audit export | human-only |
 | `user:read` | List human users, to resolve user ids to names | human-only |
 | `user:write` | Manage human users and their roles | human-only |
 
 - **destructive** scopes need JIT approval when an agent uses them: the agent files an approval request, a human approves it, and a short-lived extra grant is issued (D-0030).
 - **human-only** scopes can never appear in an agent's grant, so an agent cannot widen its own power or approve its own requests.
 - The wildcard `app:*` style is not allowed in grants; scopes are listed explicitly.
-- Human roles are fixed scope bundles: `owner` (every scope), `operator` (every scope except `user:write`), `viewer` (every `:read` scope plus `app:logs`). `user:read` is a `:read` scope, so every role holds it. `app:terminal` and `vm:console` are not `:read` scopes, so a `viewer` holds neither (ADR 0114).
+- Human roles are fixed scope bundles: `owner` (every scope), `operator` (every scope except `user:write` and `backup:manage`), `viewer` (every `:read` scope plus `app:logs`). `user:read` is a `:read` scope, so every role holds it. `app:terminal` and `vm:console` are not `:read` scopes, so a `viewer` holds neither (ADR 0114). `backup:manage` is owner-only because it shows the recovery key, which reads every backup (ADR 0147).
+- Volumes add no scope of their own (ADR 0145): creating one changes an app's settings (`app:update`), listing them reads the app (`app:read`), and deleting one deletes app data (`app:delete`, destructive, so an agent needs a JIT approval).
 - Builds and metrics add no scope of their own: a build is authorized as a deployment of its app (`app:deploy`), its record as app data (`app:read`), its log as app output (`app:logs`); node metrics need `node:read` and app metrics `app:read`.
 
 ### Resource selectors
@@ -214,6 +233,10 @@ Event `type` is `<subject>.<what>` in lowercase with underscores. The complete l
 | `build.succeeded` | A build produced its image; the deployment it starts follows | |
 | `build.failed` | A build failed (source checkout, a build step, export, import, timeout) | build failed |
 | `build.cancelled` | A build was cancelled before it finished | |
+| `backup.succeeded` | A backup finished and its seal was written | |
+| `backup.failed` | A backup failed (snapshot, upload, seal) | backup failed |
+| `restore.succeeded` | A restored volume is ready on its node and the app was moved there | |
+| `restore.failed` | A restore failed; the new volume is `failed` and the app stays stopped until another restore | |
 | `certificate.issued` | A TLS certificate was obtained or renewed | |
 | `certificate.expiring` | A certificate expires within its warning window | certificate expiring |
 | `certificate.failed` | Obtaining or renewing a certificate failed | |
@@ -280,6 +303,8 @@ Every mutating tool takes a required `justification` string and an optional `inc
 
 M4 adds no MCP tool. Builds, metrics and console sessions are reachable by agents through the HTTP API with a grant; the web terminal is human-only (ADR 0114); a later tool is a contract change of its own.
 
+M5a adds no MCP tool either. Volumes, backups and restores are reachable by agents through the HTTP API with a grant (a volume delete and a restore only through a JIT approval); backup repositories, their recovery key and the off-site audit export are human-only. A later tool is a contract change of its own.
+
 ### Channels
 
 Every action reaches the same service layer through one of these channels, recorded in the audit log as `channel`: `api` (HTTP API), `panel` (the web panel, which uses the API with a session), `mcp` (MCP server, D-0031), `cli` (the `quoro` command), `system` (Quoro itself: reconciliation, schedulers, incident automation). MCP tools map one-to-one onto service operations and require the same scope as the matching endpoint.
@@ -290,7 +315,7 @@ Defined in node-agent-protocol.md. Node to control plane: `hello`, `heartbeat`, 
 
 ### Database tables
 
-Defined in db-schema.sql and changed only by the numbered files in `migrations/`: `meta`, `change_log`, `nodes`, `node_join_tokens`, `node_credentials`, `node_tunnels`, `projects`, `vms`, `apps`, `app_env`, `deployments`, `builds`, `domains`, `volumes`, `leases`, `users`, `api_tokens`, `sessions`, `agents`, `agent_keys`, `access_tokens`, `grants`, `approvals`, `incidents`, `events`, `webhooks`, `webhook_deliveries`, `providers`, `audit_log`, `audit_exports`, `interactive_sessions`. Tables marked local in that file are not replicated through the change log.
+Defined in db-schema.sql and changed only by the numbered files in `migrations/`: `meta`, `change_log`, `nodes`, `node_join_tokens`, `node_credentials`, `node_tunnels`, `projects`, `vms`, `apps`, `app_env`, `deployments`, `builds`, `domains`, `volumes`, `leases`, `users`, `api_tokens`, `sessions`, `agents`, `agent_keys`, `access_tokens`, `grants`, `approvals`, `incidents`, `events`, `webhooks`, `webhook_deliveries`, `providers`, `audit_log`, `audit_exports`, `interactive_sessions`, `backup_repositories`, `backups`. Tables marked local in that file are not replicated through the change log.
 
 ## Open items before the freeze
 
@@ -298,4 +323,4 @@ Defined in db-schema.sql and changed only by the numbered files in `migrations/`
 | --- | --- | --- |
 | Cluster key custody on promotion | Replicate both keys wrapped to each replica's node key | Re-key on promotion with an operator-confirmed re-pin (open; decided with manual promotion in M5b, D-0067) |
 
-Only key custody on promotion is still open. It does not block the freeze: promotion arrives in M5b and the key files and message shapes it needs already exist. The image pipeline and init are decided (D-0061), and so is the M5a snapshot primitive (D-0062), with an lvm-thin vs btrfs spike before M5b. Every other element formerly listed here is decided (D-0047, D-0048, D-0050, D-0051, D-0052, D-0053, D-0054, D-0056, D-0057, D-0061, D-0062, D-0067, D-0071, D-0072, D-0073, D-0074).
+Only key custody on promotion is still open. It does not block the freeze: promotion arrives in M5b and the key files and message shapes it needs already exist. The image pipeline and init are decided (D-0061), and so is the M5a snapshot primitive (ADR 0146, which supersedes D-0062: reflink where the node's data directory supports it, otherwise pause and copy), with an lvm-thin vs btrfs spike before M5b. Every other element formerly listed here is decided (D-0047, D-0048, D-0050, D-0051, D-0052, D-0053, D-0054, D-0056, D-0057, D-0061, D-0062, D-0067, D-0071, D-0072, D-0073, D-0074).

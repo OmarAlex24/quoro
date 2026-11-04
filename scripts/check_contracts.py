@@ -27,7 +27,7 @@ SCOPE_RE = re.compile(r"^      x-quoro-scope:(.*)$")
 MCP_RE = re.compile(r"^      x-quoro-mcp-tool:\s*(\S+)\s*$")
 RESPONSE_CODE_RE = re.compile(r"^(\s+)'?([0-9]{3}|default)'?:\s*$")
 MD_SCOPE_RE = re.compile(
-    r"`((?:cluster|node|project|vm|app|agent|grant|approval|incident|audit|event|webhook|user):[a-z_]+)`"
+    r"`((?:cluster|node|project|vm|app|agent|grant|approval|incident|audit|event|webhook|provider|backup|user):[a-z_]+)`"
 )
 
 
@@ -440,6 +440,7 @@ def check_markdown(fails, directory, scopes):
         "audit-log-format.md",
         "node-agent-protocol.md",
         "engine-trait.md",
+        "backup-format.md",
     ]
     scope_set = set(scopes)
     total = 0
