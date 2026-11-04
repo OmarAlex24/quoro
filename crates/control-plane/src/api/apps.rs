@@ -225,8 +225,14 @@ pub struct App {
     /// `validation_failed` (D-0020).
     #[schema(inline)]
     pub ha_policy: HaPolicy,
-    /// Current OCI reference of the app.
+    /// Current OCI reference of the app. For an app with a Git source, the
+    /// reference of its last successful build, or `""` before the first one.
     pub image: String,
+    /// The Git source the app builds its images from, or absent for an app
+    /// that deploys images given by reference (ADR 0117).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(required = false)]
+    pub source: Option<AppSource>,
     /// Container port the app listens on.
     #[schema(minimum = 1, maximum = 65535)]
     pub port: i64,
@@ -307,11 +313,90 @@ pub struct AppList {
     pub next_cursor: Option<String>,
 }
 
+/// The kind of an app source (`openapi.yaml` `AppSource.kind`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum AppSourceKind {
+    /// A Git repository built with its Dockerfile.
+    #[default]
+    Git,
+}
+
+/// One `--build-arg` of a Git source (`openapi.yaml` `BuildArg`).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
+#[schema(
+    title = "BuildArg",
+    description = "One `--build-arg` of a Git source. Not a secret."
+)]
+pub struct BuildArg {
+    /// Argument name.
+    #[schema(pattern = "^[A-Za-z_][A-Za-z0-9_]*$")]
+    pub name: String,
+    /// Argument value.
+    #[schema(max_length = 4096)]
+    pub value: String,
+}
+
+/// The Git source an app builds its images from (`openapi.yaml`
+/// `AppSource`, ADR 0117). The contract shape only: builds ship with the M4
+/// builds epic, and until then `createApp` refuses a source.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
+#[schema(
+    title = "AppSource",
+    description = "The Git source an app builds its images from (ADR 0117)."
+)]
+pub struct AppSource {
+    /// Kind of source. Only `git` in M4.
+    #[schema(inline)]
+    pub kind: AppSourceKind,
+    /// HTTPS URL of a public Git repository.
+    #[schema(pattern = "^https://[^\\s]+$", max_length = 2000)]
+    pub repo_url: String,
+    /// Branch, tag or full commit SHA to build.
+    #[serde(rename = "ref")]
+    #[schema(min_length = 1, max_length = 255)]
+    pub git_ref: String,
+    /// Path of the Dockerfile, relative to `context_dir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = String, min_length = 1, max_length = 500, default = "Dockerfile", required = false)]
+    pub dockerfile_path: Option<String>,
+    /// Build context, relative to the repository root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = String, min_length = 1, max_length = 500, default = ".", required = false)]
+    pub context_dir: Option<String>,
+    /// Stage of a multi-stage Dockerfile to build, or null for the last stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 128, required = false)]
+    pub target: Option<String>,
+    /// Build arguments, passed as `--build-arg`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(max_items = 100, required = false)]
+    pub build_args: Vec<BuildArg>,
+    /// Names of the app's environment variables exposed as BuildKit secrets.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(schema_with = source_secrets_schema, required = false)]
+    pub secrets: Vec<String>,
+}
+
+/// `AppSource.secrets`: unique environment-variable names, at most 50.
+fn source_secrets_schema() -> utoipa::openapi::schema::Array {
+    use utoipa::openapi::schema::{ArrayBuilder, ObjectBuilder, Type};
+    ArrayBuilder::new()
+        .items(
+            ObjectBuilder::new()
+                .schema_type(Type::String)
+                .pattern(Some("^[A-Za-z_][A-Za-z0-9_]*$")),
+        )
+        .max_items(Some(50))
+        .unique_items(true)
+        .build()
+}
+
 /// Body of `createApp` (`openapi.yaml` `CreateAppRequest`).
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 #[schema(
     title = "CreateAppRequest",
-    description = "Create an app. The first deployment is created separately."
+    description = "Create an app. Exactly one of `image` and `source` is given. The first deployment or build is started separately."
 )]
 pub struct CreateAppRequest {
     /// Project the app belongs to.
@@ -320,8 +405,14 @@ pub struct CreateAppRequest {
     /// Name, unique in the project.
     #[schema(pattern = "^[a-z0-9-]{1,40}$")]
     pub name: String,
-    /// OCI reference of the app image.
-    pub image: String,
+    /// OCI reference of the app image. Required unless `source` is given.
+    #[serde(default)]
+    #[schema(value_type = String, required = false)]
+    pub image: Option<String>,
+    /// The Git source to build the app from (ADR 0117).
+    #[serde(default)]
+    #[schema(value_type = AppSource, required = false)]
+    pub source: Option<AppSource>,
     /// Container port the app listens on.
     #[schema(minimum = 1, maximum = 65535)]
     pub port: i64,
@@ -362,6 +453,10 @@ pub struct UpdateAppRequest {
     #[serde(default)]
     #[schema(value_type = i64, minimum = 1, maximum = 65535, required = false)]
     pub port: Option<i64>,
+    /// Replaces the whole Git source of an app that has one (ADR 0117).
+    #[serde(default)]
+    #[schema(value_type = AppSource, required = false)]
+    pub source: Option<AppSource>,
     /// HA policy. Only `none` before M5a (D-0020).
     #[serde(default)]
     #[schema(value_type = HaPolicy, inline, required = false)]
@@ -489,6 +584,9 @@ pub(crate) fn app_from_row(row: &SqliteRow) -> Result<App, ApiError> {
         stateful: row.try_get("stateful")?,
         ha_policy,
         image: row.try_get("image")?,
+        // No app has a Git source before the M4 builds epic (createApp
+        // refuses one), so `apps.source` is always NULL here.
+        source: None,
         port: row.try_get("port")?,
         health_check,
         resources,
@@ -639,8 +737,26 @@ fn validate_create(body: &CreateAppRequest) -> Result<(), ApiError> {
     if !valid_name(&body.name) {
         return Err(ApiError::validation("name must match ^[a-z0-9-]{1,40}$"));
     }
-    if body.image.trim().is_empty() {
-        return Err(ApiError::validation("image must not be empty"));
+    // Exactly one of `image` and `source` (openapi.yaml `CreateAppRequest`).
+    match (&body.image, &body.source) {
+        (Some(_), Some(_)) => {
+            return Err(ApiError::validation(
+                "give either image or source, not both",
+            ));
+        }
+        (None, None) => return Err(ApiError::validation("image or source is required")),
+        // Git sources need builds, which ship with the M4 builds epic
+        // (ADR 0117); until then an app deploys images only.
+        (None, Some(_)) => {
+            return Err(ApiError::validation(
+                "apps built from a Git source are not supported yet",
+            ));
+        }
+        (Some(image), None) => {
+            if image.trim().is_empty() {
+                return Err(ApiError::validation("image must not be empty"));
+            }
+        }
     }
     if !(1..=65535).contains(&body.port) {
         return Err(ApiError::validation("port is outside 1-65535"));
@@ -911,7 +1027,8 @@ async fn insert_app(
         name: body.name.clone(),
         stateful: false,
         ha_policy: HaPolicy::None,
-        image: body.image.clone(),
+        image: body.image.clone().unwrap_or_default(),
+        source: None,
         port: body.port,
         health_check: body.health_check.clone().unwrap_or_default(),
         resources: body.resources.clone().unwrap_or_default(),
@@ -1154,6 +1271,14 @@ async fn update_app_tx(
         .ok_or_else(|| ApiError::not_found("app"))?;
     let mut app = app_from_row(&row)?;
     let mut changed = Vec::new();
+
+    // A Git source cannot be added to an app created from an image in M4
+    // (openapi.yaml `UpdateAppRequest`), and no app has one yet.
+    if body.source.is_some() && app.source.is_none() {
+        return Err(ApiError::conflict(
+            "a Git source cannot be added to an app created from an image",
+        ));
+    }
 
     if let Some(name) = &body.name
         && *name != app.name
@@ -2326,6 +2451,8 @@ pub fn routes() -> Router<AppState> {
             AppList,
             CreateAppRequest,
             UpdateAppRequest,
+            AppSource,
+            BuildArg,
             HealthCheck,
             AppResources,
             AppPlacement,

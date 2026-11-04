@@ -163,6 +163,8 @@ pub enum Scope {
     VmStop,
     #[serde(rename = "vm:delete")]
     VmDelete,
+    #[serde(rename = "vm:console")]
+    VmConsole,
     #[serde(rename = "app:read")]
     AppRead,
     #[serde(rename = "app:create")]
@@ -183,6 +185,8 @@ pub enum Scope {
     AppDelete,
     #[serde(rename = "app:logs")]
     AppLogs,
+    #[serde(rename = "app:terminal")]
+    AppTerminal,
     #[serde(rename = "agent:read")]
     AgentRead,
     #[serde(rename = "agent:write")]
@@ -219,7 +223,7 @@ pub enum Scope {
 
 impl Scope {
     /// Every scope, in README table order.
-    pub const ALL: [Scope; 39] = [
+    pub const ALL: [Scope; 41] = [
         Self::ClusterRead,
         Self::NodeRead,
         Self::NodeEnroll,
@@ -233,6 +237,7 @@ impl Scope {
         Self::VmStart,
         Self::VmStop,
         Self::VmDelete,
+        Self::VmConsole,
         Self::AppRead,
         Self::AppCreate,
         Self::AppUpdate,
@@ -243,6 +248,7 @@ impl Scope {
         Self::AppStop,
         Self::AppDelete,
         Self::AppLogs,
+        Self::AppTerminal,
         Self::AgentRead,
         Self::AgentWrite,
         Self::GrantRead,
@@ -278,6 +284,7 @@ impl Scope {
             Self::VmStart => "vm:start",
             Self::VmStop => "vm:stop",
             Self::VmDelete => "vm:delete",
+            Self::VmConsole => "vm:console",
             Self::AppRead => "app:read",
             Self::AppCreate => "app:create",
             Self::AppUpdate => "app:update",
@@ -288,6 +295,7 @@ impl Scope {
             Self::AppStop => "app:stop",
             Self::AppDelete => "app:delete",
             Self::AppLogs => "app:logs",
+            Self::AppTerminal => "app:terminal",
             Self::AgentRead => "agent:read",
             Self::AgentWrite => "agent:write",
             Self::GrantRead => "grant:read",
@@ -338,6 +346,7 @@ impl Scope {
                 | Self::ProviderManage
                 | Self::UserRead
                 | Self::UserWrite
+                | Self::AppTerminal
         )
     }
 
@@ -473,7 +482,11 @@ mod tests {
         assert!(Role::Operator.holds(Scope::UserRead));
         assert!(Role::Viewer.holds(Scope::UserRead));
         assert!(!Role::Viewer.holds(Scope::UserWrite));
-        assert_eq!(Scope::ALL.iter().filter(|s| s.is_human_only()).count(), 10);
+        assert!(Role::Operator.holds(Scope::AppTerminal));
+        assert!(Role::Operator.holds(Scope::VmConsole));
+        assert!(!Role::Viewer.holds(Scope::AppTerminal));
+        assert!(!Role::Viewer.holds(Scope::VmConsole));
+        assert_eq!(Scope::ALL.iter().filter(|s| s.is_human_only()).count(), 11);
         assert_eq!(Scope::ALL.iter().filter(|s| s.is_destructive()).count(), 4);
     }
 }

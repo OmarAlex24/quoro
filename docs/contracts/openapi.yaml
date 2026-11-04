@@ -4,7 +4,7 @@ info:
   version: 0.1.0
   summary: HTTP API of the Quoro control plane.
   description: |
-    HTTP API for the M1-M3 surface of Quoro, a self-hosted tool that unifies a
+    HTTP API for the M1-M4 surface of Quoro, a self-hosted tool that unifies a
     hypervisor (Cloud Hypervisor + KVM, one microVM per app) with application
     deployment. One binary serves this API on every node: the primary is the
     single writer and the source of truth, replicas hold a copy of the change log
@@ -79,6 +79,12 @@ tags:
     description: Event subscriptions that deliver to an external receiver.
   - name: providers
     description: Credentials for external providers (DNS, tunnels, load balancers, object storage).
+  - name: builds
+    description: Image builds of an app's Git source, run on its node in a builder microVM.
+  - name: metrics
+    description: Node and app CPU and memory read on demand from the nodes.
+  - name: interactive
+    description: Web terminal and read-only serial console sessions over WebSocket.
 components:
   securitySchemes:
     bearerAuth:
@@ -298,6 +304,22 @@ components:
       schema:
         type: string
         pattern: '^prv_[0-9A-HJKMNP-TV-Z]{26}$'
+    BuildId:
+      name: build_id
+      in: path
+      required: true
+      description: Build id (`bld_...`).
+      schema:
+        type: string
+        pattern: '^bld_[0-9A-HJKMNP-TV-Z]{26}$'
+    InteractiveSessionId:
+      name: session_id
+      in: path
+      required: true
+      description: Terminal or console session id (`trm_...`).
+      schema:
+        type: string
+        pattern: '^trm_[0-9A-HJKMNP-TV-Z]{26}$'
     Seq:
       name: seq
       in: path
@@ -1366,7 +1388,8 @@ components:
       description: |
         A deployable service. It runs as one microVM per instance (D-0008); in
         M1-M4 an app has one instance. `ha_policy` exists from M0 but only `none`
-        is accepted before M5a (D-0020).
+        is accepted before M5a (D-0020). An app either deploys images given by
+        reference (`source` null) or builds them from a Git source (ADR 0117).
       required:
         - id
         - project_id
@@ -1412,7 +1435,18 @@ components:
             - hot
         image:
           type: string
-          description: Current OCI reference of the app.
+          description: |
+            Current OCI reference of the app. For an app with a Git source it is
+            the reference of its last successful build,
+            `build.quoro.invalid/<app_id>:<build_id>`, or the empty string before
+            the first one.
+        source:
+          description: |
+            The Git source the app builds its images from, or null (or absent)
+            for an app that deploys images given by reference (ADR 0117).
+          oneOf:
+            - $ref: '#/components/schemas/AppSource'
+            - type: 'null'
         port:
           type: integer
           minimum: 1
@@ -1490,11 +1524,13 @@ components:
     CreateAppRequest:
       type: object
       title: CreateAppRequest
-      description: Create an app. The first deployment is created separately.
+      description: |
+        Create an app. Exactly one of `image` and `source` is given; both or
+        neither answer `validation_failed`. The first deployment (for `image`) or
+        the first build (for `source`) is started separately.
       required:
         - project_id
         - name
-        - image
         - port
       properties:
         project_id:
@@ -1507,7 +1543,9 @@ components:
           description: Name, unique in the project.
         image:
           type: string
-          description: OCI reference of the app image.
+          description: OCI reference of the app image. Required unless `source` is given.
+        source:
+          $ref: '#/components/schemas/AppSource'
         port:
           type: integer
           minimum: 1
@@ -1537,7 +1575,10 @@ components:
       title: UpdateAppRequest
       description: |
         Change app settings. The image is not changed here: a new image is rolled
-        out as a deployment. Absent fields stay unchanged.
+        out as a deployment, or built from the Git source. Absent fields stay
+        unchanged. `source` replaces the whole Git source of an app that has one,
+        and takes effect with the next build; it cannot be added to an app created
+        from an image, nor removed, in M4 (`conflict`, 409).
       properties:
         name:
           type: string
@@ -1548,6 +1589,8 @@ components:
           minimum: 1
           maximum: 65535
           description: New container port.
+        source:
+          $ref: '#/components/schemas/AppSource'
         ha_policy:
           type: string
           description: HA policy. Only `none` before M5a (D-0020).
@@ -1630,8 +1673,11 @@ components:
       type: object
       title: Deployment
       description: |
-        One rollout of an image to an app. `phase` is the current or failing phase;
-        a build reports `build` (M4).
+        One rollout of an image to an app. `phase` is the current or failing phase.
+        The `build` phase is reserved and never reported: a failed build is a
+        failed `Build` with its own `build.failed` event and starts no deployment
+        (ADR 0119). A successful build starts a deployment of the built image with
+        `trigger: build`.
       required:
         - id
         - app_id
@@ -1765,6 +1811,308 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/DeploymentLogEntry'
+    AppSource:
+      type: object
+      title: AppSource
+      description: |
+        The Git source an app builds its images from (ADR 0117). Only public
+        `https://` repositories and the Dockerfile builder exist in M4; private
+        repositories need a credential reference that a later contract change
+        adds. Build arguments are not secrets: they end up in the image history.
+        Build secrets are names of the app's environment variables; the node
+        receives their values in the signed desired state and passes them to
+        BuildKit as `--secret`, never as arguments, and never logs them.
+      required:
+        - kind
+        - repo_url
+        - ref
+      properties:
+        kind:
+          type: string
+          description: Kind of source. Only `git` in M4.
+          enum:
+            - git
+        repo_url:
+          type: string
+          pattern: '^https://[^\s]+$'
+          maxLength: 2000
+          description: HTTPS URL of a public Git repository.
+        ref:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Branch, tag or full commit SHA to build. The node resolves it to a commit at the start of each build.
+        dockerfile_path:
+          type: string
+          minLength: 1
+          maxLength: 500
+          default: Dockerfile
+          description: Path of the Dockerfile, relative to `context_dir`; never absolute and never outside it.
+        context_dir:
+          type: string
+          minLength: 1
+          maxLength: 500
+          default: .
+          description: Build context, relative to the repository root; `.` is the root.
+        target:
+          type: [string, 'null']
+          maxLength: 128
+          description: Stage of a multi-stage Dockerfile to build, or null for the last stage.
+        build_args:
+          type: array
+          maxItems: 100
+          description: Build arguments, passed as `--build-arg`. Names are unique.
+          items:
+            $ref: '#/components/schemas/BuildArg'
+        secrets:
+          type: array
+          maxItems: 50
+          uniqueItems: true
+          description: |
+            Names of the app's environment variables to expose to the build as
+            BuildKit secrets, with the variable name as the secret id
+            (`RUN --mount=type=secret,id=<name>`). A name that is not an
+            environment variable of the app fails the build in `preparing`.
+          items:
+            type: string
+            pattern: '^[A-Za-z_][A-Za-z0-9_]*$'
+    BuildArg:
+      type: object
+      title: BuildArg
+      description: One `--build-arg` of a Git source. Not a secret.
+      required:
+        - name
+        - value
+      properties:
+        name:
+          type: string
+          pattern: '^[A-Za-z_][A-Za-z0-9_]*$'
+          description: Argument name.
+        value:
+          type: string
+          maxLength: 4096
+          description: Argument value. Stored and returned as sent; the audit log redacts it like every `value` key.
+    BuildFailedStep:
+      type: object
+      title: BuildFailedStep
+      description: |
+        The BuildKit step that failed, read from BuildKit's machine-readable
+        progress, with a few lines of its log and the Dockerfile excerpt. It is
+        replicated with the build, so the panel shows it while the node is down
+        (ADR 0119).
+      required:
+        - vertex
+        - name
+        - error
+        - dockerfile_line
+        - excerpt
+      properties:
+        vertex:
+          type: integer
+          minimum: 0
+          description: BuildKit's step number (`#6` in the plain log).
+        name:
+          type: string
+          description: The step's name, for example `[3/4] RUN npm ci`.
+        error:
+          type: string
+          description: BuildKit's error for the step.
+        dockerfile_line:
+          type: [integer, 'null']
+          minimum: 1
+          description: Line of the Dockerfile the step comes from, when BuildKit names it.
+        excerpt:
+          type: array
+          maxItems: 20
+          description: The step's last log lines and the Dockerfile excerpt, at most 20 lines of at most 500 characters.
+          items:
+            type: string
+    Build:
+      type: object
+      title: Build
+      description: |
+        One image build of an app's Git source, run on the node that runs the
+        app in an ephemeral builder microVM (ADR 0117, ADR 0118). Only the
+        status and the failing step are replicated; the log stays on that node
+        and is read on demand (ADR 0014, ADR 0119). A build that succeeds starts
+        a deployment of its image with `trigger: build`; `deployment_id` names
+        it. The built image's reference is
+        `build.quoro.invalid/<app_id>:<build_id>`, which no node ever pulls.
+      required:
+        - id
+        - app_id
+        - node_id
+        - source
+        - status
+        - commit
+        - image
+        - image_digest
+        - failed_phase
+        - error
+        - failed_step
+        - deployment_id
+        - trigger
+        - created_by_type
+        - created_by_id
+        - created_at
+        - started_at
+        - finished_at
+      properties:
+        id:
+          type: string
+          pattern: '^bld_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: Build id.
+        app_id:
+          type: string
+          pattern: '^app_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: App the build belongs to.
+        node_id:
+          type: string
+          pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: Node that runs the build and keeps its log.
+        source:
+          $ref: '#/components/schemas/AppSource'
+        status:
+          type: string
+          description: |
+            Build status. `queued` waits for the node; `preparing` boots the
+            builder VM and checks out the source; `building` runs the build;
+            `exporting` writes the OCI layout; `importing` turns it into a root
+            disk. `succeeded`, `failed` and `cancelled` are terminal.
+          enum:
+            - queued
+            - preparing
+            - building
+            - exporting
+            - importing
+            - succeeded
+            - failed
+            - cancelled
+        commit:
+          type: [string, 'null']
+          pattern: '^[0-9a-f]{40}$'
+          description: Commit the ref resolved to, once the checkout finished.
+        image:
+          type: [string, 'null']
+          description: The built image's reference, `build.quoro.invalid/<app_id>:<build_id>`, on success.
+        image_digest:
+          type: [string, 'null']
+          description: Manifest digest of the built image, on success.
+        failed_phase:
+          type: [string, 'null']
+          description: Phase the build failed in; null unless `status` is `failed`.
+          enum:
+            - preparing
+            - building
+            - exporting
+            - importing
+            - null
+        error:
+          type: [string, 'null']
+          description: One-line failure reason when `status` is `failed`, for example the step error or `timeout`.
+        failed_step:
+          oneOf:
+            - $ref: '#/components/schemas/BuildFailedStep'
+            - type: 'null'
+          description: The failing step, when the build failed in a build step.
+        deployment_id:
+          type: [string, 'null']
+          pattern: '^dep_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: The deployment the build started, on success.
+        trigger:
+          type: string
+          description: What started the build. Only an explicit start (`api`) in M4.
+          enum:
+            - api
+        created_by_type:
+          type: string
+          description: Kind of identity that started the build.
+          enum:
+            - user
+            - agent
+            - system
+        created_by_id:
+          type: string
+          description: Id of the identity that started the build.
+        created_at:
+          type: string
+          format: date-time
+          description: When the build was queued.
+        started_at:
+          type: [string, 'null']
+          format: date-time
+          description: When the node started it.
+        finished_at:
+          type: [string, 'null']
+          format: date-time
+          description: When it reached a terminal status.
+    BuildList:
+      type: object
+      title: BuildList
+      description: One page of builds, newest first.
+      required:
+        - items
+        - next_cursor
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Build'
+        next_cursor:
+          type: [string, 'null']
+          description: Cursor for the next page, or null on the last page.
+    StartBuildRequest:
+      type: object
+      title: StartBuildRequest
+      description: Start a build of the app's Git source. Every field is optional.
+      properties:
+        ref:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Build this branch, tag or commit instead of the source's `ref`, for this build only.
+    BuildLogLine:
+      type: object
+      title: BuildLogLine
+      description: One line of a build's log, as kept on the node that ran it (ADR 0119).
+      required:
+        - seq
+        - time
+        - stream
+        - line
+      properties:
+        seq:
+          type: integer
+          minimum: 1
+          description: Position in the build's log, gap-free from 1.
+        time:
+          type: string
+          format: date-time
+          description: When the node recorded the line.
+        stream:
+          $ref: '#/components/schemas/LogStreamName'
+        vertex:
+          type: [integer, 'null']
+          minimum: 0
+          description: BuildKit step the line belongs to, when it names one.
+        line:
+          type: string
+          description: The line, without its trailing newline.
+    BuildLogList:
+      type: object
+      title: BuildLogList
+      description: One page of a build's log, oldest first.
+      required:
+        - items
+        - next_cursor
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/BuildLogLine'
+        next_cursor:
+          type: [string, 'null']
+          description: Cursor for the next page, or null when no more lines exist yet.
     Domain:
       type: object
       title: Domain
@@ -2392,6 +2740,7 @@ components:
         - vm:start
         - vm:stop
         - vm:delete
+        - vm:console
         - app:read
         - app:create
         - app:update
@@ -2402,6 +2751,7 @@ components:
         - app:stop
         - app:delete
         - app:logs
+        - app:terminal
         - agent:read
         - agent:write
         - grant:read
@@ -2874,6 +3224,10 @@ components:
         - deployment.started
         - deployment.succeeded
         - deployment.failed
+        - build.started
+        - build.succeeded
+        - build.failed
+        - build.cancelled
         - certificate.issued
         - certificate.expiring
         - certificate.failed
@@ -3589,6 +3943,275 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/LogEntry'
+    NodeMetricSample:
+      type: object
+      title: NodeMetricSample
+      description: One sample of a node's CPU and memory, taken by the node agent every `interval_s`.
+      required:
+        - time
+        - cpu_usage
+        - cpu_count
+        - memory_total_bytes
+        - memory_used_bytes
+      properties:
+        time:
+          type: string
+          format: date-time
+          description: When the node took the sample.
+        cpu_usage:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: Busy fraction of all host CPUs over the sampling interval.
+        cpu_count:
+          type: integer
+          minimum: 1
+          description: Number of host CPUs.
+        memory_total_bytes:
+          type: integer
+          minimum: 0
+          description: Host memory.
+        memory_used_bytes:
+          type: integer
+          minimum: 0
+          description: Host memory in use, `MemTotal - MemAvailable`.
+    NodeMetrics:
+      type: object
+      title: NodeMetrics
+      description: |
+        A node's recent CPU and memory samples, read from the node on demand
+        and never stored by the control plane (ADR 0014). The node keeps the
+        last 10 minutes in memory; an agent restart empties it.
+      required:
+        - node_id
+        - interval_s
+        - samples
+      properties:
+        node_id:
+          type: string
+          pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: The node.
+        interval_s:
+          type: integer
+          minimum: 1
+          description: Seconds between samples (5).
+        samples:
+          type: array
+          description: Samples, oldest first.
+          items:
+            $ref: '#/components/schemas/NodeMetricSample'
+    VmMetricSample:
+      type: object
+      title: VmMetricSample
+      description: |
+        One sample of a VM's CPU and memory as the host sees its VMM process;
+        no guest agent is involved.
+      required:
+        - time
+        - cpu_usage
+        - vcpus
+        - memory_rss_bytes
+        - memory_bytes
+      properties:
+        time:
+          type: string
+          format: date-time
+          description: When the node took the sample.
+        cpu_usage:
+          type: number
+          minimum: 0
+          description: |
+            CPU time of the VM's VMM process over the interval, divided by the
+            interval and by `vcpus`. 1 means every vCPU busy; the VMM's own
+            threads can push it slightly above 1.
+        vcpus:
+          type: integer
+          minimum: 1
+          description: The VM's virtual CPUs.
+        memory_rss_bytes:
+          type: integer
+          minimum: 0
+          description: |
+            Resident memory of the VMM process on the host. It counts the guest
+            pages the guest has touched and does not shrink when the guest frees
+            memory.
+        memory_bytes:
+          type: integer
+          minimum: 0
+          description: The VM's configured memory.
+    AppInstanceMetrics:
+      type: object
+      title: AppInstanceMetrics
+      description: Recent samples of one instance of an app.
+      required:
+        - vm_id
+        - node_id
+        - samples
+      properties:
+        vm_id:
+          type: string
+          pattern: '^vm_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: The instance.
+        node_id:
+          type: string
+          pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: Node that runs it.
+        samples:
+          type: array
+          description: Samples, oldest first; empty when the instance is not running.
+          items:
+            $ref: '#/components/schemas/VmMetricSample'
+    AppMetrics:
+      type: object
+      title: AppMetrics
+      description: |
+        Recent CPU and memory samples of an app's instances, read from their
+        nodes on demand and never stored by the control plane (ADR 0014).
+      required:
+        - app_id
+        - interval_s
+        - instances
+      properties:
+        app_id:
+          type: string
+          pattern: '^app_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: The app.
+        interval_s:
+          type: integer
+          minimum: 1
+          description: Seconds between samples (5).
+        instances:
+          type: array
+          description: One entry per instance.
+          items:
+            $ref: '#/components/schemas/AppInstanceMetrics'
+    CreateTerminalSessionRequest:
+      type: object
+      title: CreateTerminalSessionRequest
+      description: |
+        Open a web terminal in one of the app's VMs (ADR 0113). The program runs
+        inside the app's guest, in the app's root filesystem, with the app's
+        environment and working directory.
+      required:
+        - rows
+        - cols
+      properties:
+        rows:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          description: Initial terminal height in rows.
+        cols:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          description: Initial terminal width in columns.
+        command:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: |
+            The argv to run. Default `["/bin/sh"]`. Only programs the image
+            ships can run; a missing program ends the session with exit code 127.
+          items:
+            type: string
+            minLength: 1
+            maxLength: 4096
+        user:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: User to run as, a name or uid optionally followed by `:` and a group name or gid. Default the app's own user.
+        vm_id:
+          type: string
+          pattern: '^vm_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: The instance to open it in. Default the app's running instance (M4 apps have one).
+    CreateConsoleSessionRequest:
+      type: object
+      title: CreateConsoleSessionRequest
+      description: Open a read-only view of a VM's serial console (ADR 0116). Every field is optional.
+      properties:
+        tail_bytes:
+          type: integer
+          minimum: 0
+          maximum: 1048576
+          description: Replay at most this many bytes of the VM's recent console output before live output. Default all the node keeps (up to 1 MiB, covering the current and the previous boot).
+    InteractiveSessionTicket:
+      type: object
+      title: InteractiveSessionTicket
+      description: |
+        An opened terminal or console session and the single-use ticket that
+        attaches a WebSocket to it (ADR 0114). The ticket is valid for 30
+        seconds and for one upgrade; it is returned once and never stored.
+      required:
+        - id
+        - kind
+        - vm_id
+        - ticket
+        - expires_at
+        - websocket_path
+      properties:
+        id:
+          type: string
+          pattern: '^trm_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: Session id.
+        kind:
+          type: string
+          description: Whether this is a web terminal or a read-only console.
+          enum:
+            - terminal
+            - console
+        vm_id:
+          type: string
+          pattern: '^vm_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: The VM the session is attached to.
+        ticket:
+          type: string
+          minLength: 43
+          maxLength: 64
+          description: Single-use ticket, at least 256 random bits, base64url without padding.
+        expires_at:
+          type: string
+          format: date-time
+          description: When the ticket stops being accepted (30 s after the open).
+        websocket_path:
+          type: string
+          description: Path to upgrade, `/api/v1/interactive-sessions/{session_id}/ws`; the ticket goes in the `ticket` query parameter.
+    InteractiveSessionCloseReason:
+      type: string
+      title: InteractiveSessionCloseReason
+      description: |
+        Why a terminal or console session closed. It is sent to the client in
+        the `closed` control message and recorded in `session.end`
+        (audit-log-format.md section 3.3).
+
+        - `exited`: the terminal's program exited.
+        - `ended_by_client`: the client closed the WebSocket.
+        - `ended_by_request`: `DELETE /api/v1/interactive-sessions/{session_id}`.
+        - `ticket_expired`: no WebSocket attached within 30 s.
+        - `idle_timeout`: no client input for 15 minutes.
+        - `max_duration`: open for 8 hours.
+        - `access_revoked`: the identity was disabled, its role or grant no longer covers the session.
+        - `credential_expired`: the cookie or token that opened it expired or was revoked.
+        - `vm_stopped`: the VM stopped (terminal) or was deleted (console).
+        - `node_disconnected`: the node session dropped; sessions do not resume.
+        - `transcript_limit`: the terminal's transcript reached its 16 MiB cap.
+        - `primary_restarted`: the primary restarted while the session was open.
+        - `error`: anything else; the `error` control message carried the detail.
+      enum:
+        - exited
+        - ended_by_client
+        - ended_by_request
+        - ticket_expired
+        - idle_timeout
+        - max_duration
+        - access_revoked
+        - credential_expired
+        - vm_stopped
+        - node_disconnected
+        - transcript_limit
+        - primary_restarted
+        - error
 paths:
   /api/v1/health:
     get:
@@ -5081,7 +5704,9 @@ paths:
         Starts a deployment of a new image. A deployment that is still in progress
         is superseded. The response is the new deployment; its progress is read from
         `GET /api/v1/deployments/{deployment_id}/logs`. `Quoro-Justification` is
-        required when the caller is an agent (D-0031).
+        required when the caller is an agent (D-0031). An app with a Git source
+        deploys only what it builds: this call answers `conflict` (409) for it, and
+        a new image comes from `POST /api/v1/apps/{app_id}/builds` (ADR 0117).
       x-quoro-scope: app:deploy
       parameters:
         - $ref: '#/components/parameters/AppId'
@@ -6967,6 +7592,647 @@ paths:
           $ref: '#/components/responses/RateLimited'
         '503':
           $ref: '#/components/responses/NotPrimary'
+  /api/v1/apps/{app_id}/builds:
+    get:
+      tags: [builds]
+      operationId: listAppBuilds
+      summary: List builds of an app
+      description: |
+        Builds of one app, newest first (ADR 0117). Each item carries its
+        status and, for a failure, the failing step, so the panel shows a
+        failure while the node is down (ADR 0119).
+      x-quoro-scope: app:read
+      parameters:
+        - $ref: '#/components/parameters/AppId'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of builds.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BuildList'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+    post:
+      tags: [builds]
+      operationId: startBuild
+      summary: Start a build of an app's Git source
+      description: |
+        Queues a build of the app's Git source on the node that runs the app,
+        or on the node the scheduler picks when the app has no instance yet
+        (ADR 0118). The build runs in an ephemeral builder microVM; when it
+        succeeds, the control plane sets the app's `image` to the built image
+        and starts a deployment with `trigger: build`, which is why this needs
+        `app:deploy`. A node runs one build at a time; further builds wait in
+        `queued`. Emits `build.started`; the outcome is `build.succeeded`,
+        `build.failed` or `build.cancelled`. `conflict` (409) when the app has
+        no Git source or already has a build that is not terminal.
+        `Quoro-Justification` is required when the caller is an agent (ADR 0031).
+      x-quoro-scope: app:deploy
+      parameters:
+        - $ref: '#/components/parameters/AppId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/QuoroJustification'
+        - $ref: '#/components/parameters/QuoroIncident'
+      requestBody:
+        required: false
+        description: Optional overrides for this build.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartBuildRequest'
+      responses:
+        '202':
+          description: The build was accepted and is `queued`.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Build'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/NotPrimary'
+  /api/v1/builds/{build_id}:
+    get:
+      tags: [builds]
+      operationId: getBuild
+      summary: Read one build
+      description: One build with its status, resolved commit, failing step and the deployment it started.
+      x-quoro-scope: app:read
+      parameters:
+        - $ref: '#/components/parameters/BuildId'
+      responses:
+        '200':
+          description: The build.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Build'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /api/v1/builds/{build_id}/cancel:
+    post:
+      tags: [builds]
+      operationId: cancelBuild
+      summary: Cancel a build
+      description: |
+        Asks the node to stop the build; the node stops the builder VM and the
+        build ends `cancelled`, which emits `build.cancelled`. The answer is the
+        build as recorded, which may still show its running status until the
+        node confirms. `conflict` (409) when the build is already terminal.
+        `Quoro-Justification` is required when the caller is an agent (ADR 0031).
+      x-quoro-scope: app:deploy
+      parameters:
+        - $ref: '#/components/parameters/BuildId'
+        - $ref: '#/components/parameters/QuoroJustification'
+        - $ref: '#/components/parameters/QuoroIncident'
+      responses:
+        '202':
+          description: The cancel was recorded and sent to the node.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Build'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/NotPrimary'
+  /api/v1/builds/{build_id}/logs:
+    get:
+      tags: [builds]
+      operationId: getBuildLogs
+      summary: Read a build's log
+      description: |
+        One page of a build's log, oldest first. The log stays on the node that
+        ran the build and is read from it on demand (ADR 0014, ADR 0119), so an
+        unreachable node answers `node_unreachable` (504) and a node that no
+        longer keeps the log (it keeps the last 20 builds of each app) answers
+        `not_found`. Pages follow `next_cursor`; on a build that is still running
+        the last page grows, and live lines are better read from
+        `GET /api/v1/builds/{build_id}/logs/stream`.
+      x-quoro-scope: app:logs
+      parameters:
+        - $ref: '#/components/parameters/BuildId'
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of lines to return.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 500
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of log lines.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BuildLogList'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '504':
+          $ref: '#/components/responses/NodeUnreachable'
+  /api/v1/builds/{build_id}/logs/stream:
+    get:
+      tags: [builds]
+      operationId: streamBuildLogs
+      summary: Stream a build's log live
+      description: |
+        Server-sent events of a build's log, read from the node on demand
+        (ADR 0014, ADR 0057, ADR 0119). Framing, once the response started with
+        `200` and `Content-Type: text/event-stream`: `id:` carries the line's
+        `seq`, `event:` carries `log` (a `BuildLogLine`), `status` (the `Build`
+        whenever its status changes), `error` (a `Problem`) or `end` (sent once
+        the build is terminal and every line was sent; the stream then closes).
+        A client resumes with `Last-Event-ID` set to the last `seq` it saw. A
+        finished build replays its log and ends. An unreachable node answers
+        `node_unreachable` (504) before the stream starts, or an `error` event
+        after it started.
+      x-quoro-scope: app:logs
+      parameters:
+        - $ref: '#/components/parameters/BuildId'
+        - name: tail
+          in: query
+          required: false
+          description: Start with the last `tail` lines instead of the whole log. Ignored when `Last-Event-ID` is sent.
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 5000
+        - name: Last-Event-ID
+          in: header
+          required: false
+          description: Last line `seq` the client received; the stream resumes after it.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The stream started; events follow until the build is terminal or the client disconnects.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+            Cache-Control:
+              description: Always `no-cache`; the stream must not be cached.
+              schema:
+                type: string
+                enum: [no-cache]
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  SSE frames. Each frame is `id: <seq>` (log lines only),
+                  `event: <type>`, `data: <json>`, separated by a blank line.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '504':
+          $ref: '#/components/responses/NodeUnreachable'
+  /api/v1/nodes/{node_id}/metrics:
+    get:
+      tags: [metrics]
+      operationId: getNodeMetrics
+      summary: Read a node's recent CPU and memory
+      description: |
+        The node's samples of the last 10 minutes, read from the node over its
+        session on demand and never stored by the control plane (ADR 0014). An
+        unreachable node answers `node_unreachable` (504).
+      x-quoro-scope: node:read
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+      responses:
+        '200':
+          description: The node's recent samples.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeMetrics'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '504':
+          $ref: '#/components/responses/NodeUnreachable'
+  /api/v1/nodes/{node_id}/metrics/stream:
+    get:
+      tags: [metrics]
+      operationId: streamNodeMetrics
+      summary: Stream a node's CPU and memory live
+      description: |
+        Server-sent events with one `sample` event (a `NodeMetricSample`) per
+        sampling interval (5 s), read from the node on demand (ADR 0014,
+        ADR 0057), plus `error` (a `Problem`) on a node problem. Events carry no
+        `id:`; a client that reconnects reads the history again from
+        `GET /api/v1/nodes/{node_id}/metrics`.
+      x-quoro-scope: node:read
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+      responses:
+        '200':
+          description: The stream started; events follow until the client disconnects.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+            Cache-Control:
+              description: Always `no-cache`; the stream must not be cached.
+              schema:
+                type: string
+                enum: [no-cache]
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: "SSE frames `event: <type>`, `data: <json>`, separated by a blank line."
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '504':
+          $ref: '#/components/responses/NodeUnreachable'
+  /api/v1/apps/{app_id}/metrics:
+    get:
+      tags: [metrics]
+      operationId: getAppMetrics
+      summary: Read an app's recent CPU and memory
+      description: |
+        The last 10 minutes of samples of each of the app's instances, read
+        from their nodes on demand and never stored by the control plane
+        (ADR 0014). An unreachable node answers `node_unreachable` (504).
+      x-quoro-scope: app:read
+      parameters:
+        - $ref: '#/components/parameters/AppId'
+      responses:
+        '200':
+          description: The instances' recent samples.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppMetrics'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '504':
+          $ref: '#/components/responses/NodeUnreachable'
+  /api/v1/apps/{app_id}/metrics/stream:
+    get:
+      tags: [metrics]
+      operationId: streamAppMetrics
+      summary: Stream an app's CPU and memory live
+      description: |
+        Server-sent events with one `sample` event per instance and sampling
+        interval (5 s), its `data` a `VmMetricSample` plus `vm_id` and
+        `node_id`, read from the nodes on demand (ADR 0014, ADR 0057), plus
+        `error` (a `Problem`) on a node problem. Events carry no `id:`; a client
+        that reconnects reads the history again from
+        `GET /api/v1/apps/{app_id}/metrics`.
+      x-quoro-scope: app:read
+      parameters:
+        - $ref: '#/components/parameters/AppId'
+      responses:
+        '200':
+          description: The stream started; events follow until the client disconnects.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+            Cache-Control:
+              description: Always `no-cache`; the stream must not be cached.
+              schema:
+                type: string
+                enum: [no-cache]
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: "SSE frames `event: <type>`, `data: <json>`, separated by a blank line."
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '504':
+          $ref: '#/components/responses/NodeUnreachable'
+  /api/v1/apps/{app_id}/terminal-sessions:
+    post:
+      tags: [interactive]
+      operationId: createTerminalSession
+      summary: Open a web terminal in an app
+      description: |
+        Opens a PTY session inside the app's guest, started by Quoro's init
+        over virtio-vsock and relayed by the node agent (ADR 0113). `app:terminal`
+        is human-only in M4 (ADR 0114). This call is the audited open: its
+        record carries the session id, VM, size, command and user
+        (audit-log-format.md section 3.3). The answer is a single-use ticket
+        valid for 30 seconds; the client upgrades
+        `GET /api/v1/interactive-sessions/{session_id}/ws?ticket=...` with it.
+        Every session ends with a `session.end` audit record, and its timed
+        transcript stays on the node (ADR 0115). `conflict` (409) when the
+        app has no running instance; `node_unreachable` (504) when the node is
+        not connected; a VM started before the M4 guest init answers `conflict`
+        until it restarts.
+      x-quoro-scope: app:terminal
+      parameters:
+        - $ref: '#/components/parameters/AppId'
+      requestBody:
+        required: true
+        description: Terminal size and, optionally, the command, user and instance.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTerminalSessionRequest'
+      responses:
+        '201':
+          description: The session is open and waits for its WebSocket.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InteractiveSessionTicket'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/NotPrimary'
+        '504':
+          $ref: '#/components/responses/NodeUnreachable'
+  /api/v1/vms/{vm_id}/console-sessions:
+    post:
+      tags: [interactive]
+      operationId: createConsoleSession
+      summary: Open a read-only view of a VM's serial console
+      description: |
+        Opens a read-only session on the VM's serial console: the node replays
+        its recent console output (the current and the previous boot, up to
+        1 MiB) and then follows live output (ADR 0116). The console carries
+        kernel and init diagnostics, such as the guest's boot output. Input is
+        refused: nothing in the guest reads the serial port. `vm:console` is
+        grantable to agents (ADR 0114). This call is the audited open; the
+        session ends with a `session.end` record and has no transcript
+        (audit-log-format.md section 3.3). The answer is a single-use ticket
+        valid for 30 seconds. `node_unreachable` (504) when the node is not
+        connected. `Quoro-Justification` is required when the caller is an
+        agent (ADR 0031).
+      x-quoro-scope: vm:console
+      parameters:
+        - $ref: '#/components/parameters/VmId'
+        - $ref: '#/components/parameters/QuoroJustification'
+        - $ref: '#/components/parameters/QuoroIncident'
+      requestBody:
+        required: false
+        description: How much recent output to replay.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateConsoleSessionRequest'
+      responses:
+        '201':
+          description: The session is open and waits for its WebSocket.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InteractiveSessionTicket'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/NotPrimary'
+        '504':
+          $ref: '#/components/responses/NodeUnreachable'
+  /api/v1/interactive-sessions/{session_id}:
+    delete:
+      tags: [interactive]
+      operationId: endInteractiveSession
+      summary: End a terminal or console session
+      description: |
+        Closes an open session: the WebSocket gets a `closed` control message
+        with reason `ended_by_request` and a normal close, and the primary
+        writes the `session.end` record naming who ended it. Allowed for the
+        identity that opened the session and for any human with the `owner`
+        role; anyone else gets `forbidden` with reason `scope_missing`. A
+        session that already ended answers `not_found`.
+      x-quoro-scope: authenticated
+      parameters:
+        - $ref: '#/components/parameters/InteractiveSessionId'
+        - $ref: '#/components/parameters/QuoroJustification'
+      responses:
+        '204':
+          description: The session was closed.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/NotPrimary'
+  /api/v1/interactive-sessions/{session_id}/ws:
+    get:
+      tags: [interactive]
+      operationId: connectInteractiveSession
+      summary: Attach a WebSocket to a terminal or console session
+      description: |
+        WebSocket upgrade (RFC 6455) for an opened session (ADR 0057, ADR 0114).
+        The single-use `ticket` from the open authorizes the upgrade; the
+        request needs no other credential, and a cookie or bearer token it
+        carries is ignored. A spent, expired or unknown ticket, or one minted
+        for another session, answers `401` before the upgrade. When the request
+        carries an `Origin` header it must equal the panel's own origin, and a
+        ticket minted for a panel session cookie requires one; otherwise `403`
+        before the upgrade (cross-site WebSocket hijacking). A session accepts
+        one WebSocket; a second upgrade answers `409`.
+
+        Framing after the upgrade:
+
+        - **Binary frames** carry raw terminal bytes in both directions: the
+          program's output (or the console's) from the server, the user's
+          input to the server. A console session refuses client binary frames
+          with an `error` control message and ignores them.
+        - **Text frames** carry one JSON control object each. Client to server:
+          `{"type":"resize","rows":R,"cols":C}` (terminal only). Server to
+          client: `{"type":"exit","code":N}` when the program exited,
+          `{"type":"closed","reason":R}` with an `InteractiveSessionCloseReason`
+          just before the server closes the WebSocket, and
+          `{"type":"error","code":C,"message":M}` with a `Problem` code. Unknown
+          control types are answered with `error` and ignored.
+        - The server closes with status 1000 after `closed`. A client close
+          ends the session with reason `ended_by_client`.
+
+        The panel must render the stream as a terminal (xterm.js), never as
+        HTML, and must not act on escape sequences that reach the browser
+        (clipboard writes through OSC 52, links opened without a click),
+        because the guest is untrusted. The session is re-checked while it is
+        open (permission-model.md section 7.5): idle 15 minutes, at most 8 hours.
+      x-quoro-scope: public
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/InteractiveSessionId'
+        - name: ticket
+          in: query
+          required: true
+          description: The single-use ticket from the open.
+          schema:
+            type: string
+            minLength: 43
+            maxLength: 64
+      responses:
+        '101':
+          description: Switching protocols; the WebSocket carries the session.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /api/v1/interactive-sessions/{session_id}/transcript:
+    get:
+      tags: [interactive]
+      operationId: getSessionTranscript
+      summary: Fetch a terminal session's transcript
+      description: |
+        The timed transcript of a terminal session, as asciicast v2
+        (newline-delimited JSON: a header line, then `[seconds, "i"|"o"|"r", data]`
+        events), relayed from the node that recorded it (ADR 0014, ADR 0115).
+        Its SHA-256 equals `transcript_sha256` in the session's `session.end`
+        audit record unless the file was altered. A transcript holds every
+        secret that appeared in the session, so this needs `audit:read` and a
+        human caller: an agent is refused with `human_only`, and every fetch is
+        audited, also a human's (audit-log-format.md section 3.3). Console
+        sessions have no transcript. `not_found` when the session, its
+        transcript or the node's copy is gone (kept 30 days, at most 1 GiB per
+        node); `node_unreachable` (504) when the node is not connected.
+      x-quoro-scope: audit:read
+      parameters:
+        - $ref: '#/components/parameters/InteractiveSessionId'
+      responses:
+        '200':
+          description: The transcript file, streamed from the node.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/x-asciicast:
+              schema:
+                type: string
+                description: asciicast v2, one JSON value per line.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '504':
+          $ref: '#/components/responses/NodeUnreachable'
 webhooks:
   event:
     post:

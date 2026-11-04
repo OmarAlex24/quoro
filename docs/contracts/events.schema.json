@@ -46,6 +46,10 @@
         "deployment.started",
         "deployment.succeeded",
         "deployment.failed",
+        "build.started",
+        "build.succeeded",
+        "build.failed",
+        "build.cancelled",
         "certificate.issued",
         "certificate.expiring",
         "certificate.failed",
@@ -95,6 +99,10 @@
     { "if": { "required": ["type"], "properties": { "type": { "const": "deployment.started" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_deployment_started" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "deployment.succeeded" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_deployment_succeeded" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "deployment.failed" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_deployment_failed" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "build.started" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_build_started" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "build.succeeded" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_build_succeeded" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "build.failed" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_build_failed" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "build.cancelled" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_build_cancelled" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "certificate.issued" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_certificate_issued" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "certificate.expiring" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_certificate_expiring" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "certificate.failed" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_certificate_failed" } } } },
@@ -118,6 +126,7 @@
     "VmId": { "type": "string", "pattern": "^vm_[0-9A-HJKMNP-TV-Z]{26}$", "description": "VM id (`vm_` + ULID)." },
     "AppId": { "type": "string", "pattern": "^app_[0-9A-HJKMNP-TV-Z]{26}$", "description": "App id (`app_` + ULID)." },
     "DeploymentId": { "type": "string", "pattern": "^dep_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Deployment id (`dep_` + ULID)." },
+    "BuildId": { "type": "string", "pattern": "^bld_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Build id (`bld_` + ULID)." },
     "DomainId": { "type": "string", "pattern": "^dom_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Domain id (`dom_` + ULID)." },
     "VolumeId": { "type": "string", "pattern": "^vol_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Volume id (`vol_` + ULID)." },
     "LeaseId": { "type": "string", "pattern": "^lse_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Lease id (`lse_` + ULID)." },
@@ -163,7 +172,7 @@
 
     "Subject": {
       "type": "object",
-      "description": "The resource the event is about. `type` is the resource kind in the same words the id prefixes use (node, vm, app, deployment, domain, volume, project, lease, grant, approval, incident, agent, user, cluster, webhook); `id` is that resource's id. For certificate events the subject is the domain; for audit.chain_broken it is the cluster.",
+      "description": "The resource the event is about. `type` is the resource kind in the same words the id prefixes use (node, vm, app, deployment, build, domain, volume, project, lease, grant, approval, incident, agent, user, cluster, webhook); `id` is that resource's id. For certificate events the subject is the domain; for audit.chain_broken it is the cluster.",
       "required": ["type", "id"],
       "properties": {
         "type": { "type": "string", "pattern": "^[a-z_]+$" },
@@ -217,7 +226,13 @@
     },
     "DeploymentPhase": {
       "type": "string",
+      "description": "Phase of a deployment. `build` is kept for compatibility and is never produced: a failed build is a `build.failed` event, because a deployment exists only once its build succeeded (ADR 0117).",
       "enum": ["pull", "rootfs", "boot", "health", "build"]
+    },
+    "BuildPhase": {
+      "type": "string",
+      "description": "Phase a build was in when it failed or was cancelled (ADR 0117).",
+      "enum": ["preparing", "building", "exporting", "importing"]
     },
     "CertStatus": {
       "type": "string",
@@ -494,13 +509,80 @@
 
     "data_deployment_failed": {
       "type": "object",
-      "description": "A deployment failed at a named phase; image builds report with `phase: build` (D-0032). Payload fields are additive within schema_version 1.",
+      "description": "A deployment failed at a named phase. A failed build is reported by `build.failed`, not here (ADR 0117). Payload fields are additive within schema_version 1.",
       "required": ["deployment_id", "app_id", "phase", "error"],
       "properties": {
         "deployment_id": { "$ref": "#/$defs/DeploymentId" },
         "app_id": { "$ref": "#/$defs/AppId" },
         "phase": { "$ref": "#/$defs/DeploymentPhase" },
         "error": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "data_build_started": {
+      "type": "object",
+      "description": "A build was created and queued for the app's node (ADR 0117). Emitted by the control plane. Payload fields are additive within schema_version 1.",
+      "required": ["build_id", "app_id", "node_id", "ref"],
+      "properties": {
+        "build_id": { "$ref": "#/$defs/BuildId" },
+        "app_id": { "$ref": "#/$defs/AppId" },
+        "node_id": { "$ref": "#/$defs/NodeId" },
+        "repo_url": { "type": "string" },
+        "ref": { "type": "string", "description": "The branch, tag or commit the build was asked to build." }
+      },
+      "additionalProperties": true
+    },
+
+    "data_build_succeeded": {
+      "type": "object",
+      "description": "A build produced its image on the node; the deployment it starts (`trigger: build`) follows with its own `deployment.started` (ADR 0117). Emitted by the control plane. Payload fields are additive within schema_version 1.",
+      "required": ["build_id", "app_id", "commit", "image", "image_digest", "deployment_id"],
+      "properties": {
+        "build_id": { "$ref": "#/$defs/BuildId" },
+        "app_id": { "$ref": "#/$defs/AppId" },
+        "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$", "description": "Commit the ref resolved to." },
+        "image": { "type": "string", "description": "The built image's reference, `build.quoro.invalid/<app_id>:<build_id>`." },
+        "image_digest": { "type": "string" },
+        "deployment_id": { "$ref": "#/$defs/DeploymentId" }
+      },
+      "additionalProperties": true
+    },
+
+    "data_build_failed": {
+      "type": "object",
+      "description": "A build failed: source checkout, a build step, export, import or its timeout (ADR 0117, ADR 0119). Emitted by the control plane. Payload fields are additive within schema_version 1.",
+      "required": ["build_id", "app_id", "phase", "error"],
+      "properties": {
+        "build_id": { "$ref": "#/$defs/BuildId" },
+        "app_id": { "$ref": "#/$defs/AppId" },
+        "phase": { "$ref": "#/$defs/BuildPhase" },
+        "error": { "type": "string" },
+        "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "failed_step": {
+          "type": "object",
+          "description": "The BuildKit step that failed, when the build failed in a step.",
+          "required": ["vertex", "name", "error"],
+          "properties": {
+            "vertex": { "type": "integer", "minimum": 0 },
+            "name": { "type": "string" },
+            "error": { "type": "string" },
+            "dockerfile_line": { "type": "integer", "minimum": 1 }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+
+    "data_build_cancelled": {
+      "type": "object",
+      "description": "A build was cancelled before it finished. Emitted by the control plane. Payload fields are additive within schema_version 1.",
+      "required": ["build_id", "app_id"],
+      "properties": {
+        "build_id": { "$ref": "#/$defs/BuildId" },
+        "app_id": { "$ref": "#/$defs/AppId" },
+        "phase": { "$ref": "#/$defs/BuildPhase" }
       },
       "additionalProperties": true
     },
@@ -894,6 +976,30 @@
         "hostname": "blog.example.com",
         "expires_at": "2026-11-12T00:00:00Z",
         "days_left": 9
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "evt_01JC9ZB2C3D4E5F6G7H8J9K0M1",
+      "seq": 88,
+      "type": "build.failed",
+      "time": "2026-11-04T10:20:11Z",
+      "source": { "kind": "control_plane" },
+      "subject": { "type": "build", "id": "bld_01JC9ZA2B3C4D5E6F7G8H9J0KM" },
+      "project_id": "prj_01JC9Z5A1B2C3D4E5F6G7H8J9K",
+      "actor": { "type": "system", "id": "system" },
+      "data": {
+        "build_id": "bld_01JC9ZA2B3C4D5E6F7G8H9J0KM",
+        "app_id": "app_01JC9Z7B3N5Q7S9Z1W3Y5A7C9E",
+        "phase": "building",
+        "error": "process \"/bin/sh -c npm ci\" did not complete successfully: exit code: 1",
+        "commit": "3f1c2a4e6b8d0f1a3c5e7b9d1f3a5c7e9b1d3f5a",
+        "failed_step": {
+          "vertex": 6,
+          "name": "[3/4] RUN npm ci",
+          "error": "process \"/bin/sh -c npm ci\" did not complete successfully: exit code: 1",
+          "dockerfile_line": 3
+        }
       }
     }
   ]
