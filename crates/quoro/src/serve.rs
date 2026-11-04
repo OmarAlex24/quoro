@@ -99,6 +99,14 @@ pub async fn run(config: Config) -> Result<i32, String> {
         .map_err(|e| format!("cannot read the bound address: {e}"))?;
     let url = format!("https://{address}");
 
+    // Section 5.10: the other addresses a node may dial when this one fails.
+    // Built after binding, so a `listen` port of 0 advertises the real port.
+    let advertised = crate::advertise::AdvertisedUrls::discover(&config, address).await;
+    let state = {
+        let advertised = advertised.clone();
+        state.with_advertised_urls(move || advertised.urls())
+    };
+
     let (stop_tx, stop_rx) = watch::channel(false);
     let handle = Handle::new();
     tokio::spawn(shutdown_on_signal(handle.clone(), stop_tx));

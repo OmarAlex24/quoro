@@ -87,6 +87,7 @@ async fn fake_primary(mut ws: WebSocketStream<DuplexStream>, key: SigningKey) {
             heartbeat_interval_ms: 20,
             session_timeout_ms: 120,
             primary_node_id: "nod_primary".to_owned(),
+            primary_urls: Vec::new(),
         })
         .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
         .to_text(),
@@ -216,6 +217,7 @@ async fn quiet_primary(server: DuplexStream) {
             heartbeat_interval_ms: 20,
             session_timeout_ms: 120,
             primary_node_id: "nod_primary".to_owned(),
+            primary_urls: Vec::new(),
         })
         .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
         .to_text(),
@@ -280,6 +282,7 @@ async fn listening_primary(server: DuplexStream, events: tokio::sync::mpsc::Send
             heartbeat_interval_ms: 20,
             session_timeout_ms: 120,
             primary_node_id: "nod_primary".to_owned(),
+            primary_urls: Vec::new(),
         })
         .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
         .to_text(),
@@ -355,4 +358,135 @@ async fn an_event_recorded_during_a_session_is_sent_without_a_reconnect() {
     assert!(store.buffered_events().await.unwrap().is_empty());
     serving.abort();
     primary.abort();
+}
+
+/// A primary that sends one `welcome` with `primary_urls` and then stays up,
+/// signalling after the node's first status report (which follows the point
+/// where the session stores the list).
+async fn primary_with_primary_urls(
+    server: DuplexStream,
+    primary_urls: Vec<String>,
+    ready: tokio::sync::oneshot::Sender<()>,
+) {
+    let mut ws = tokio_tungstenite::accept_async(server).await.unwrap();
+    let hello = read_frame(&mut ws).await;
+    send(
+        &mut ws,
+        ControlMessage::Welcome(Welcome {
+            cluster_id: "cls_test".to_owned(),
+            term: 1,
+            server_time: "2026-11-02T10:15:30Z".to_owned(),
+            heartbeat_interval_ms: 20,
+            session_timeout_ms: 120,
+            primary_node_id: "nod_primary".to_owned(),
+            primary_urls,
+        })
+        .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
+        .to_text(),
+    )
+    .await;
+    let _ = read_until(&mut ws, "status_report").await;
+    let _ = ready.send(());
+    tokio::time::sleep(Duration::from_secs(30)).await;
+}
+
+async fn serve_one_welcome(
+    dir: &TempDir,
+    identity: &quoro_node_agent::identity::IdentityHandle,
+    urls: Vec<String>,
+) {
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let (desired, _desired_rx) = watch::channel(None);
+    let (_observed_tx, observed_rx) = watch::channel(Vec::new());
+    let mut session = Session::new(SessionSetup {
+        identity: identity.clone(),
+        store,
+        facts: facts(),
+        desired,
+        observed: observed_rx,
+        current: None,
+        builds: None,
+    });
+
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let primary = tokio::spawn(primary_with_primary_urls(server, urls, ready_tx));
+    let (client_ws, _response) = client_async("ws://primary.test/api/v1/nodes/session", client)
+        .await
+        .unwrap();
+    let serving =
+        tokio::spawn(async move { session.serve(client_ws, std::future::pending::<()>()).await });
+    tokio::time::timeout(Duration::from_secs(5), ready_rx)
+        .await
+        .expect("the welcome and the first status report")
+        .expect("the primary task did not drop the signal");
+    serving.abort();
+    primary.abort();
+}
+
+#[tokio::test]
+async fn a_welcome_with_primary_urls_persists_the_sanitized_list() {
+    let dir = TempDir::new();
+    let key = sign::signing_key_from_seed(&[5; 32]);
+    let identity = identity_files(dir.path(), &key);
+
+    let mut advertised = vec!["http://plain.test:9000".to_owned()];
+    advertised.push("https://reachable.test:9000".to_owned());
+    advertised.push("https://reachable.test:9000".to_owned());
+    for index in 0..10 {
+        advertised.push(format!("https://host{index}.test:9000"));
+    }
+    serve_one_welcome(&dir, &identity, advertised).await;
+
+    let expected: Vec<String> = std::iter::once("https://reachable.test:9000".to_owned())
+        .chain((0..7).map(|index| format!("https://host{index}.test:9000")))
+        .collect();
+    assert_eq!(identity.get().primary_urls, expected);
+    assert_eq!(
+        quoro_node_agent::identity::load_identity(dir.path())
+            .unwrap()
+            .primary_urls,
+        expected,
+        "the list reached identity.json"
+    );
+}
+
+#[tokio::test]
+async fn a_welcome_without_primary_urls_leaves_the_stored_list_alone() {
+    let dir = TempDir::new();
+    let key = sign::signing_key_from_seed(&[6; 32]);
+    let identity = identity_files(dir.path(), &key);
+    let stored = vec!["https://kept.test:9000".to_owned()];
+    assert!(identity.set_primary_urls(&stored).unwrap());
+
+    serve_one_welcome(&dir, &identity, Vec::new()).await;
+
+    assert_eq!(identity.get().primary_urls, stored);
+    assert_eq!(
+        quoro_node_agent::identity::load_identity(dir.path())
+            .unwrap()
+            .primary_urls,
+        stored
+    );
+}
+
+#[tokio::test]
+async fn the_current_primary_url_stays_in_the_stored_list() {
+    let dir = TempDir::new();
+    let key = sign::signing_key_from_seed(&[7; 32]);
+    let identity = identity_files(dir.path(), &key);
+    let current = identity.get().primary_url;
+    // A welcome lists the address the node already dials; it is kept, so the
+    // node can still fall back to it after `primary_url` moves to an address
+    // that does not answer.
+    identity
+        .set_primary_urls(&[current.clone(), "https://other.test:9000".to_owned()])
+        .unwrap();
+    let stored = identity.get().primary_urls;
+    assert_eq!(stored.len(), 2, "{stored:?}");
+    assert_eq!(stored[1], "https://other.test:9000");
+    assert!(
+        stored[0].starts_with(current.trim_end_matches('/')),
+        "{stored:?} keeps {current}"
+    );
 }

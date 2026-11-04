@@ -74,3 +74,41 @@ async fn an_unusable_pin_is_refused_before_connecting() {
     assert!(tls::client_config("not-a-fingerprint").is_err());
     assert!(tls::client_config(&"a".repeat(64)).is_ok());
 }
+
+#[tokio::test]
+async fn a_server_that_never_answers_the_handshake_times_out() {
+    // Accept the TCP connection and then say nothing: the timeout must fire
+    // instead of waiting for the handshake forever.
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
+            held.push(tcp);
+        }
+    });
+
+    let url = format!("https://127.0.0.1:{}", address.port());
+    let start = std::time::Instant::now();
+    let error = tls::connect_with_timeout(
+        &url,
+        &format!("sha256:{}", "ab".repeat(32)),
+        std::time::Duration::from_millis(100),
+    )
+    .await
+    .expect_err("a silent server cannot complete the handshake");
+    let elapsed = start.elapsed();
+    assert!(
+        error.to_string().contains("timed out"),
+        "the error names the timeout: {error}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "the overridable timeout bounds the wait, took {elapsed:?}"
+    );
+
+    server.abort();
+}

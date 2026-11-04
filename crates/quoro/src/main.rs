@@ -7,6 +7,7 @@
 //! parser dependency would be more code and one more licence than the `match`
 //! below.
 
+mod advertise;
 mod audit_cli;
 mod config;
 mod mcp_stdio;

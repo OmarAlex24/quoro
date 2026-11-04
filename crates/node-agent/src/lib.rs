@@ -263,6 +263,7 @@ pub async fn join(
         node_id: enrollment.node_id,
         cluster_id: enrollment.cluster_id,
         primary_url: enrollment.primary_url,
+        primary_urls: Vec::new(),
         fingerprint,
         cluster_public_key: enrollment.cluster_public_key,
         cluster_key_id: key_id,

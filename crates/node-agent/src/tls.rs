@@ -12,6 +12,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
@@ -26,6 +27,13 @@ use crate::AgentError;
 
 /// Default port for `https://` and `wss://`.
 const DEFAULT_PORT: u16 = 443;
+
+/// How long [`connect`] may spend on the TCP connection and the TLS handshake.
+///
+/// A dial to an address that accepts nothing (a blackholed DHCP lease, a host
+/// that is gone) would otherwise hang for the kernel's SYN timeout, and the
+/// session loop and `quoro node set-primary` would look frozen for minutes.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A parsed `https://host[:port]` or `wss://host[:port]` endpoint.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -237,13 +245,39 @@ pub fn client_config(pin: &str) -> Result<Arc<ClientConfig>, AgentError> {
 }
 
 /// Opens a TLS stream to `url`, accepting only the certificate whose digest is
-/// `pin` (section 2.2).
+/// `pin` (section 2.2). The TCP connection and the TLS handshake share
+/// [`CONNECT_TIMEOUT`], so an address that never answers fails in bounded time.
 ///
 /// # Errors
 ///
-/// [`AgentError::Tls`] for a malformed URL or pin, or [`AgentError::Io`] when
-/// the TCP or TLS connection fails.
+/// [`AgentError::Tls`] for a malformed URL or pin, when the timeout expires, or
+/// when the TLS handshake fails; [`AgentError::Io`] when the TCP connection
+/// fails.
 pub async fn connect(url: &str, pin: &str) -> Result<TlsStream<TcpStream>, AgentError> {
+    connect_with_timeout(url, pin, CONNECT_TIMEOUT).await
+}
+
+/// [`connect`] with an explicit timeout, which the timeout test uses so it
+/// does not wait [`CONNECT_TIMEOUT`].
+///
+/// # Errors
+///
+/// As [`connect`].
+pub async fn connect_with_timeout(
+    url: &str,
+    pin: &str,
+    timeout: Duration,
+) -> Result<TlsStream<TcpStream>, AgentError> {
+    match tokio::time::timeout(timeout, dial(url, pin)).await {
+        Ok(result) => result,
+        Err(_) => Err(AgentError::Tls(format!(
+            "connecting to the primary at {url} timed out after {}s",
+            timeout.as_secs_f64()
+        ))),
+    }
+}
+
+async fn dial(url: &str, pin: &str) -> Result<TlsStream<TcpStream>, AgentError> {
     let endpoint = Endpoint::parse(url)?;
     let config = client_config(pin)?;
     let server_name = endpoint.server_name()?;

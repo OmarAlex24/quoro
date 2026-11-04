@@ -35,6 +35,7 @@ fn identity_files_are_private_and_load_back() {
         node_id: "nod_1".to_owned(),
         cluster_id: "cls_1".to_owned(),
         primary_url: "https://primary.test".to_owned(),
+        primary_urls: Vec::new(),
         fingerprint: format!("sha256:{}", "ab".repeat(32)),
         cluster_public_key: public_key.clone(),
         cluster_key_id: quoro_node_agent::Identity::key_id_for(&public_key).unwrap(),

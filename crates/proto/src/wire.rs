@@ -39,6 +39,9 @@ pub const HEARTBEAT_INTERVAL_MS: u64 = 5_000;
 /// Default session timeout without any frame (section 4.3).
 pub const SESSION_TIMEOUT_MS: u64 = 15_000;
 
+/// Most entries a `welcome.primary_urls` list may carry (section 5.10).
+pub const MAX_PRIMARY_URLS: usize = 8;
+
 /// Status report interval (section 4.3).
 pub const STATUS_REPORT_INTERVAL_MS: u64 = 30_000;
 
@@ -616,6 +619,10 @@ pub struct Welcome {
     pub heartbeat_interval_ms: u64,
     pub session_timeout_ms: u64,
     pub primary_node_id: String,
+    /// Other base URLs where this primary's listener can be reached, best
+    /// first (section 5.10). Optional: an absent or empty list is valid.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub primary_urls: Vec<String>,
 }
 
 /// `desired_status` of a VM.
@@ -1146,6 +1153,34 @@ mod tests {
     }
 
     #[test]
+    fn a_welcome_without_primary_urls_parses_and_an_empty_list_is_not_serialized() {
+        let text = r#"{"v":1,"type":"welcome","id":"msg_1","body":{"cluster_id":"cls_1","term":1,"server_time":"2026-11-02T10:15:30Z","heartbeat_interval_ms":5000,"session_timeout_ms":15000,"primary_node_id":"nod_1"}}"#;
+        let raw = RawFrame::parse(text).unwrap();
+        let welcome = match ControlMessage::from_raw(&raw).unwrap() {
+            ControlMessage::Welcome(welcome) => welcome,
+            other => panic!("not a welcome: {other:?}"),
+        };
+        assert!(welcome.primary_urls.is_empty());
+        let frame = ControlMessage::Welcome(welcome)
+            .to_frame("msg_1", None)
+            .to_text();
+        assert!(!frame.contains("primary_urls"), "{frame}");
+
+        let raw = RawFrame::parse(
+            r#"{"v":1,"type":"welcome","id":"msg_2","body":{"cluster_id":"cls_1","term":1,"server_time":"2026-11-02T10:15:30Z","heartbeat_interval_ms":5000,"session_timeout_ms":15000,"primary_node_id":"nod_1","primary_urls":["https://primary.example:8443"]}}"#,
+        )
+        .unwrap();
+        let welcome = match ControlMessage::from_raw(&raw).unwrap() {
+            ControlMessage::Welcome(welcome) => welcome,
+            other => panic!("not a welcome: {other:?}"),
+        };
+        assert_eq!(
+            welcome.primary_urls,
+            vec!["https://primary.example:8443".to_owned()]
+        );
+    }
+
+    #[test]
     fn frames_round_trip_both_ways() {
         let message = NodeMessage::Heartbeat(Heartbeat {
             time: "2026-11-02T10:15:32Z".to_owned(),
@@ -1163,6 +1198,7 @@ mod tests {
             heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
             session_timeout_ms: SESSION_TIMEOUT_MS,
             primary_node_id: "nod_1".to_owned(),
+            primary_urls: Vec::new(),
         });
         let raw = RawFrame::parse(&welcome.to_frame("msg_1", None).to_text()).unwrap();
         assert_eq!(ControlMessage::from_raw(&raw).unwrap(), welcome);
