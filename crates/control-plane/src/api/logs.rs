@@ -590,6 +590,7 @@ pub async fn get_deployment_logs(
                             });
                         }
                     }
+                    Some(StreamEvent::Metrics(_)) => {}
                 }
             }
         }
@@ -679,6 +680,7 @@ impl MergedFeed {
                         self.pending.push_back((index, line));
                     }
                 }
+                StreamEvent::Metrics(_) => {}
                 StreamEvent::End { reason, message } => {
                     if let Some(ended) = self.ended.get_mut(index) {
                         *ended = true;

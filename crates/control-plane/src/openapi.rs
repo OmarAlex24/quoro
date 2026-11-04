@@ -129,6 +129,10 @@ pub struct RateLimited(Problem);
         crate::api::vms::delete_vm,
         crate::api::vms::start_vm,
         crate::api::vms::stop_vm,
+        crate::api::metrics::get_node_metrics,
+        crate::api::metrics::stream_node_metrics,
+        crate::api::metrics::get_app_metrics,
+        crate::api::metrics::stream_app_metrics,
     ),
     components(
         schemas(
@@ -194,6 +198,11 @@ pub struct RateLimited(Problem);
             crate::api::webhooks::WebhookDelivery,
             crate::api::webhooks::WebhookDeliveryList,
             crate::api::webhooks::DeliveryStatus,
+            crate::api::metrics::NodeMetricSample,
+            crate::api::metrics::NodeMetrics,
+            crate::api::metrics::VmMetricSample,
+            crate::api::metrics::AppInstanceMetrics,
+            crate::api::metrics::AppMetrics,
         ),
         responses(
             Unauthenticated,
