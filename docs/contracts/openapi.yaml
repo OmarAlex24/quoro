@@ -577,6 +577,28 @@ components:
           minLength: 1
           writeOnly: true
           description: Password of the user.
+    ChangePasswordRequest:
+      type: object
+      title: ChangePasswordRequest
+      description: The signed-in human's current password and the new one (ADR 0135).
+      required:
+        - current_password
+        - new_password
+      properties:
+        current_password:
+          type: string
+          format: password
+          minLength: 1
+          writeOnly: true
+          description: The password the user signs in with today.
+        new_password:
+          type: string
+          format: password
+          minLength: 12
+          writeOnly: true
+          description: |
+            The new password, different from the current one. Stored as an
+            Argon2id hash.
     MeResponse:
       type: object
       title: MeResponse
@@ -4365,6 +4387,52 @@ paths:
           $ref: '#/components/responses/Unauthenticated'
         '429':
           $ref: '#/components/responses/RateLimited'
+  /api/v1/auth/password:
+    post:
+      tags: [auth]
+      operationId: changePassword
+      summary: Change the signed-in human's own password
+      description: |
+        Self-service password change for the human behind the panel session
+        (ADR 0135). It needs no `user:write`: every human may change their own
+        password, and only their own. Only the `quoro_session` cookie
+        authenticates this operation. A request that carries an
+        `Authorization` header is `unauthenticated` (401) whatever the
+        credential, so neither a personal API token nor an agent access token
+        can change a password. The request must prove the current password: a
+        wrong `current_password` answers `validation_failed` (422) and is
+        audited as `refused` with `result_detail` `wrong_password`
+        (audit-log-format.md section 3.4). `new_password` follows the rule of
+        every other password (at least 12 characters) and must differ from the
+        current one. Attempts are rate limited per user; a limited
+        call answers `rate_limited` (429) and is audited (permission-model.md
+        section 12). On success the password hash changes through the change
+        log, every other panel session of the user ends, the session that made
+        the call stays valid, and personal API tokens are left as they are.
+      x-quoro-scope: human
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        description: The current password and the new one.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangePasswordRequest'
+      responses:
+        '204':
+          description: The password changed and the user's other panel sessions ended.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/NotPrimary'
   /api/v1/auth/agent-token:
     post:
       tags: [auth]

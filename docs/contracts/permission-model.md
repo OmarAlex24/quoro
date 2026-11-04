@@ -78,6 +78,8 @@ Consequences of the bundles:
 
 A human may hold personal API tokens; a token inherits the human's role at call time, so demoting or disabling the human takes effect on the next call (D-0029).
 
+**Own password.** Every human may change their own password, whatever their role, with `POST /api/v1/auth/password` ([openapi.yaml](openapi.yaml), `changePassword`; ADR 0135). It is not a scope: it needs no `user:write`, acts only on the caller and proves the current password. It is accepted only with the panel session cookie; a request with an `Authorization` header is `unauthenticated`, so a personal API token cannot turn into a new password and an agent never reaches it. A successful change ends the user's other panel sessions; the calling session stays valid and personal API tokens are not touched (revoke them with `DELETE /api/v1/tokens/{token_id}`). Interactive sessions opened from an ended panel session close with `close_reason` `credential_expired` at their next re-check (section 7.5). Changing another user's password stays `updateUser` with `user:write`.
+
 ## 4. Scopes
 
 A scope is `<resource>:<verb>` and is the unit of authority in both human roles and agent grants (D-0030). The complete list, with the flags this contract depends on:
@@ -545,6 +547,7 @@ A human's read calls are not recorded; an agent's reads are (D-0031). That asymm
 - Exceeding a limit answers `rate_limited` (429) in `application/problem+json`.
 - **The values are implementation defaults, not contract.** This contract fixes only that the limit is per identity and that the answer is `rate_limited`; an implementation may choose the numbers and change them without a contract change (D-0030).
 - A rate-limited call is audited as `refused` with `result_detail` `rate_limited` when the identity is known, so a burst that an agent produced is visible in the log (D-0031).
+- `POST /api/v1/auth/password` is limited per user, counting attempts with a wrong current password, so a stolen session cannot be used to guess the password (ADR 0135).
 
 ## 13. Worked examples
 
