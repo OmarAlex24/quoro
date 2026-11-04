@@ -584,6 +584,22 @@ impl FakeEngine {
         crash_locked(&mut state, id, reason);
     }
 
+    /// Injection: the app inside a running VM exits on its own with `code`,
+    /// as the Cloud Hypervisor engine reports it: the VM is `Crashed` with
+    /// that exit code, and the event is [`EngineEvent::Crashed`] with the
+    /// reason `app exited with code <code>` (no stop was requested).
+    pub fn exit_app(&self, id: &VmId, code: i32) {
+        let mut state = self.lock();
+        let Some(record) = state.vms.get_mut(id) else {
+            return;
+        };
+        if record.info.state != VmState::Running {
+            return;
+        }
+        record.info.exit_code = Some(code);
+        crash_locked(&mut state, id, &format!("app exited with code {code}"));
+    }
+
     /// Injection: crashes the VM when the fake's manual clock reaches
     /// `after` from now. The clock only moves with [`FakeEngine::advance`];
     /// no wall-clock timer is involved.

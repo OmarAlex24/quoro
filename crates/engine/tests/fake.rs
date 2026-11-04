@@ -106,6 +106,28 @@ async fn events_deliver_started_exited_and_crashed() {
     assert_eq!(info.pid, None);
 }
 
+#[tokio::test]
+async fn an_app_that_exits_on_its_own_is_a_crash_with_its_code() {
+    let (engine, id) = created().await;
+    let mut events = engine.events();
+    engine.start(&id).await.expect("start succeeds");
+    assert_eq!(
+        common::next_event(&mut events).await,
+        Some(EngineEvent::Started { id: id.clone() })
+    );
+    engine.exit_app(&id, 3);
+    assert_eq!(
+        common::next_event(&mut events).await,
+        Some(EngineEvent::Crashed {
+            id: id.clone(),
+            reason: "app exited with code 3".to_string()
+        })
+    );
+    let info = engine.inspect(&id).await.expect("inspect succeeds");
+    assert_eq!(info.state, VmState::Crashed);
+    assert_eq!(info.exit_code, Some(3));
+}
+
 #[tokio::test(start_paused = true)]
 async fn an_ignored_power_button_waits_the_timeout_then_forces() {
     let (engine, id) = created().await;
