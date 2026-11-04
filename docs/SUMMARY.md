@@ -123,6 +123,13 @@
   - [0107: Let operators and viewers resolve user ids to names (a read path for users)](adr/0107-let-operators-and-viewers-resolve-user-ids-to-names-a-read.md)
   - [0109: Docs site: mdBook built from the repo's Markdown, published to GitHub Pages together with the v0.1.0 tag](adr/0109-docs-site-mdbook-built-from-the-repo-s-markdown-published.md)
   - [0111: user:read stays human-only; WebhookDelivery exposes the test flag; creating users is M4 work](adr/0111-user-read-stays-human-only-webhookdelivery-exposes-the-test.md)
+  - [0113: M4 web terminal path: exec through quoro-init over virtio-vsock, relayed by the root node agent](adr/0113-m4-web-terminal-path-exec-through-quoro-init-over-virtio.md)
+  - [0114: M4 terminal and console access: app:terminal human-only (owner, operator); vm:console grantable read-only (owner, operator); agents get a non-interactive app:exec later via approval](adr/0114-m4-terminal-and-console-access-app-terminal-human-only.md)
+  - [0115: M4 session audit: an open record plus a session-end record carrying a SHA-256 of a node-local, size-capped transcript](adr/0115-m4-session-audit-an-open-record-plus-a-session-end-record.md)
+  - [0116: M4 VM console: read-only; serial in socket mode with the node agent as its only client from vm.create and a node-side ring per VM; viewers fan out from the node](adr/0116-m4-vm-console-read-only-serial-in-socket-mode-with-the-node.md)
+  - [0117: Builder interface: a node-agent Builder trait (Dockerfile first, Railpack later) that returns build events and a node-local OCI layout](adr/0117-builder-interface-a-node-agent-builder-trait-dockerfile.md)
+  - [0118: Builds run on the target node in an ephemeral builder microVM (one per build) with a persistent per-app work disk for the BuildKit cache](adr/0118-builds-run-on-the-target-node-in-an-ephemeral-builder.md)
+  - [0119: Build log transport: tagged serial-console lines out of the builder VM, kept on the node, streamed to the panel over SSE via a new stream_open kind build_logs](adr/0119-build-log-transport-tagged-serial-console-lines-out-of-the.md)
 
 # Background research
 
