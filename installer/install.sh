@@ -701,8 +701,16 @@ fetch_engine_runtime() {
         fi
         [ "$_arch" = "$_machine" ] || continue
 
-        validate_pin_fields 'pins.txt' "$_line_no" "$_file" "$_sha" "$_url" \
-            'https://github.com/cloud-hypervisor/'
+        # Cloud Hypervisor comes from its own releases. The guest kernel comes
+        # from Quoro's guest-kernel-* releases (ADR 0152); a tarball from
+        # before them still pins Cloud Hypervisor's kernel build.
+        _prefix='https://github.com/cloud-hypervisor/'
+        case $_name:$_url in
+            "guest-kernel:https://github.com/${QUORO_REPO}/releases/download/guest-kernel-"*)
+                _prefix="https://github.com/${QUORO_REPO}/releases/download/guest-kernel-"
+                ;;
+        esac
+        validate_pin_fields 'pins.txt' "$_line_no" "$_file" "$_sha" "$_url" "$_prefix"
 
         stage_pinned_artifact "$_runtime" "$_file" "$_sha" "$_url" "$_name" "$_version"
         _source=$STAGED_SOURCE

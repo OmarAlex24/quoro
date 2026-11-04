@@ -3,9 +3,10 @@
 //! pinned: `crates/engine/pins.txt`, compiled in with `include_str!` and read
 //! by `crates/engine/scripts/fetch-pinned.sh` too.
 //!
-//! Neither upstream publishes signatures, SUMS files or build attestations
-//! (F-0206), so the pin is GitHub's release-asset sha256 and the engine refuses
-//! to run a file whose sha256 differs.
+//! Cloud Hypervisor publishes no signatures, SUMS files or build attestations,
+//! and Quoro's own guest kernel (`packaging/kernel/`) is attested in its
+//! release but checked here by digest too: the pin is the artifact's sha256 and
+//! the engine refuses to run a file whose sha256 differs.
 //!
 //! INTERFACE FROZEN BY THE SUB-ORCHESTRATOR: keep the public names and
 //! signatures.
@@ -225,7 +226,7 @@ mod tests {
         assert_eq!(pins[1].file, "vmlinux-x86_64");
         assert_eq!(
             pins[1].sha256,
-            "edfeb8a8a6c04ff2979e9f1c700feaa29b8f564f952261834ef0b7d2e673a853"
+            "59e9864b3dd6a0ef45b61949f66968e6cc628f09691ba5c72ac68c580f334271"
         );
 
         assert!(pins.iter().all(|pin| pin.url.starts_with("https://")));

@@ -144,10 +144,15 @@ command remains the reliable path after an unplanned address change.
    its sha256 matches. Files come from `QUORO_INSTALL_FROM` first, then from an
    existing `/usr/local/lib/quoro`, then from the URL in the pin; a local
    candidate that does not match is ignored with a warning and the next source
-   is tried. A download that does not match is fatal. Upstream publishes no
-   signatures for these artifacts, so the integrity anchor is the chain TLS to
-   GitHub → attested tarball → `pins.txt` → sha256, and the engine re-verifies
-   the same pins on every start.
+   is tried. A download that does not match is fatal. A pin URL must point at
+   Cloud Hypervisor's releases (`https://github.com/cloud-hypervisor/`) or, for
+   the guest kernel, at this repository's `guest-kernel-*` releases (ADR 0152).
+   The integrity anchor is the chain TLS to GitHub → attested tarball →
+   `pins.txt` → sha256, and the engine re-verifies the same pins on every
+   start. Cloud Hypervisor publishes no signatures. Quoro's guest kernel
+   release carries its own attestation, which the maintainer checks before
+   bumping the pin (`packaging/kernel/README.md`); the installer and the engine
+   rely on the sha256 alone.
 5. **The tunnel connector against its own pins in the tarball.** Nodes behind
    NAT serve app hostnames through Cloudflare Tunnel, which the node agent runs
    as a `cloudflared` child process (ADR 0024, ADR 0055). The tarball carries
