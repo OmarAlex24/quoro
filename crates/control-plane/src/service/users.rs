@@ -555,6 +555,25 @@ async fn delete_user_tx(
             return Err(ApiError::conflict(LAST_OWNER_DELETE));
         }
     }
+    // The rows that reference users without ON DELETE CASCADE
+    // (db-schema.sql). Checked explicitly so the answer does not depend on how
+    // the driver reports a foreign-key failure; the FK error below stays as a
+    // backstop.
+    let (referenced,): (i64,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM agents WHERE owner_user_id = ?1) \
+             OR EXISTS (SELECT 1 FROM grants WHERE on_behalf_of = ?1 OR revoked_by = ?1) \
+             OR EXISTS (SELECT 1 FROM approvals WHERE decided_by = ?1) \
+             OR EXISTS (SELECT 1 FROM webhooks WHERE created_by = ?1) \
+             OR EXISTS (SELECT 1 FROM providers WHERE created_by = ?1) \
+             OR EXISTS (SELECT 1 FROM node_join_tokens WHERE created_by = ?1) \
+             OR EXISTS (SELECT 1 FROM audit_log WHERE on_behalf_of = ?1)",
+    )
+    .bind(user_id)
+    .fetch_one(&mut *w.tx)
+    .await?;
+    if referenced != 0 {
+        return Err(ApiError::conflict(USER_REFERENCED));
+    }
     match sqlx::query("DELETE FROM users WHERE id = ?")
         .bind(user_id)
         .execute(&mut *w.tx)
