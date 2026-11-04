@@ -23,7 +23,8 @@ pub mod config;
 pub mod exec;
 
 pub use config::{
-    AppStatus, CONFIG_DISK_LEN, CONFIG_MAGIC, CONFIG_MAGIC_V2, CONFIG_REGION_LEN, ConfigError,
-    EXEC_PORT, GuestConfig, LogConsole, NetConfig, SERIAL_CONFIG, SERIAL_DATA, SERIAL_ROOT,
-    STATUS_MAGIC, STATUS_OFFSET, STATUS_REGION_LEN, decode_status, encode_status,
+    AppStatus, CONFIG_DISK_LEN, CONFIG_MAGIC, CONFIG_MAGIC_V2, CONFIG_MAGIC_V3, CONFIG_REGION_LEN,
+    ConfigError, EXEC_PORT, GuestConfig, LogConsole, NetConfig, SERIAL_CONFIG, SERIAL_DATA,
+    SERIAL_ROOT, SERIAL_VOLUME_PREFIX, STATUS_MAGIC, STATUS_OFFSET, STATUS_REGION_LEN, VolumeMount,
+    decode_status, encode_status,
 };

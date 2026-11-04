@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use quoro_engine::{
     Engine, EngineError, EngineEvent, FakeEngine, FakeOp, ImageDigest, NodeNetwork, OciLayout,
-    OutputStream, StopMode, VmCounters, VmId, VmState, VolumeId, WorkDisk,
+    OutputStream, SnapshotMethod, StopMode, VmCounters, VmId, VmState, VolumeAttach, VolumeId,
+    WorkDisk,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -428,14 +429,29 @@ async fn events_are_dropped_and_counted_when_a_subscriber_is_full() {
 async fn volume_snapshots_are_recorded_and_deleted() {
     let engine = FakeEngine::new();
     let volume = VolumeId("vol_01".to_string());
+    assert_eq!(
+        engine.snapshot_volume(&volume).await,
+        Err(EngineError::NotFound),
+        "an unknown volume has no snapshot"
+    );
+    engine.ensure_volume(&volume, 1).await.expect("volume");
     let snapshot = engine
         .snapshot_volume(&volume)
         .await
         .expect("snapshot succeeds");
     assert_eq!(snapshot.volume_id, volume);
     assert_eq!(snapshot.snapshot_id, "snap-1");
-    assert_eq!(snapshot.size_bytes, 0);
+    assert_eq!(snapshot.size_bytes, 1 << 30);
     assert_eq!(snapshot.location.to_string_lossy(), "/fake/snapshots/1");
+    assert_eq!(snapshot.method, SnapshotMethod::Reflink);
+    assert_eq!(snapshot.pause, Duration::ZERO);
+    assert!(
+        matches!(
+            engine.snapshot_volume(&volume).await,
+            Err(EngineError::Conflict(_))
+        ),
+        "one snapshot per volume at a time"
+    );
 
     engine
         .delete_volume_snapshot(&snapshot)
@@ -445,6 +461,140 @@ async fn volume_snapshots_are_recorded_and_deleted() {
         .delete_volume_snapshot(&snapshot)
         .await
         .expect("deleting a missing snapshot succeeds");
+}
+
+#[tokio::test]
+async fn volumes_are_created_attached_and_deleted() {
+    let engine = FakeEngine::new();
+    let volume = VolumeId("vol_01".to_string());
+    let info = engine.ensure_volume(&volume, 2).await.expect("volume");
+    assert_eq!(info.size_gb, 2);
+    assert_eq!(
+        engine.ensure_volume(&volume, 2).await.expect("idempotent"),
+        info
+    );
+    assert!(matches!(
+        engine.ensure_volume(&volume, 3).await,
+        Err(EngineError::Conflict(_))
+    ));
+    assert!(matches!(
+        engine
+            .import_volume(&volume, 2, std::path::Path::new("/fake/restore"))
+            .await,
+        Err(EngineError::Conflict(_))
+    ));
+
+    let prepared = engine
+        .prepare_image(&common::image_ref())
+        .await
+        .expect("image");
+    let mut spec = common::sample_spec(&prepared.digest, "vm_vol");
+    spec.volumes = vec![VolumeAttach {
+        volume_id: volume.clone(),
+        mount_path: "/data".to_string(),
+        serial: "quoro-vol-0".to_string(),
+    }];
+    let mut missing = spec.clone();
+    missing.id = VmId("vm_missing".to_string());
+    missing.volumes[0].volume_id = VolumeId("vol_02".to_string());
+    assert_eq!(engine.create(&missing).await, Err(EngineError::NotFound));
+    engine.create(&spec).await.expect("create with a volume");
+    let mut second = spec.clone();
+    second.id = VmId("vm_vol_2".to_string());
+    assert!(
+        matches!(engine.create(&second).await, Err(EngineError::Conflict(_))),
+        "a volume belongs to one VM at a time"
+    );
+    assert!(matches!(
+        engine.delete_volume(&volume).await,
+        Err(EngineError::Conflict(_))
+    ));
+
+    engine.delete(&spec.id).await.expect("delete the VM");
+    assert_eq!(
+        engine.volumes(),
+        vec![(volume.clone(), 2)],
+        "delete keeps volumes"
+    );
+    engine.delete_volume(&volume).await.expect("delete volume");
+    engine
+        .delete_volume(&volume)
+        .await
+        .expect("a missing volume is Ok");
+    assert!(engine.volumes().is_empty());
+}
+
+#[tokio::test]
+async fn a_pause_copy_snapshot_reports_its_pause_only_for_a_running_vm() {
+    let engine = FakeEngine::new();
+    engine.set_snapshot_method(SnapshotMethod::PauseCopy, Duration::from_millis(250));
+    assert_eq!(
+        engine.capabilities().await.volume_snapshot_method,
+        Some(SnapshotMethod::PauseCopy)
+    );
+    let volume = VolumeId("vol_01".to_string());
+    engine.ensure_volume(&volume, 1).await.expect("volume");
+    let idle = engine.snapshot_volume(&volume).await.expect("snapshot");
+    assert_eq!(idle.pause, Duration::ZERO, "no VM runs, so no pause");
+    engine.delete_volume_snapshot(&idle).await.expect("delete");
+
+    let prepared = engine
+        .prepare_image(&common::image_ref())
+        .await
+        .expect("image");
+    let mut spec = common::sample_spec(&prepared.digest, "vm_vol");
+    spec.volumes = vec![VolumeAttach {
+        volume_id: volume.clone(),
+        mount_path: "/data".to_string(),
+        serial: "quoro-vol-0".to_string(),
+    }];
+    engine.create(&spec).await.expect("create");
+    engine.start(&spec.id).await.expect("start");
+    let running = engine.snapshot_volume(&volume).await.expect("snapshot");
+    assert_eq!(running.method, SnapshotMethod::PauseCopy);
+    assert_eq!(running.pause, Duration::from_millis(250));
+}
+
+#[tokio::test]
+async fn volume_files_are_real_with_a_volume_dir() {
+    let dir = std::env::current_dir()
+        .expect("cwd")
+        .join("target")
+        .join("fake-volume-test");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let engine = FakeEngine::new();
+    engine.set_volume_dir(&dir);
+    let volume = VolumeId("vol_01".to_string());
+    let info = engine.ensure_volume(&volume, 1).await.expect("volume");
+    assert_eq!(info.path, dir.join("vol_01"));
+    std::fs::write(&info.path, b"guest data").expect("write");
+    let snapshot = engine.snapshot_volume(&volume).await.expect("snapshot");
+    assert_eq!(
+        std::fs::read(&snapshot.location).expect("read"),
+        b"guest data"
+    );
+    engine
+        .delete_volume_snapshot(&snapshot)
+        .await
+        .expect("delete");
+    assert!(!snapshot.location.exists());
+
+    let restored = dir.join("restored.raw");
+    std::fs::File::create(&restored)
+        .and_then(|file| file.set_len(1 << 30))
+        .expect("restored file");
+    let other = VolumeId("vol_02".to_string());
+    let imported = engine
+        .import_volume(&other, 1, &restored)
+        .await
+        .expect("import");
+    assert_eq!(imported.path, dir.join("vol_02"));
+    assert!(!restored.exists(), "import renames the file into place");
+    engine.delete_volume(&other).await.expect("delete");
+    engine.delete_volume(&volume).await.expect("delete");
+    assert!(!dir.join("vol_01").exists());
+    std::fs::remove_dir_all(&dir).expect("cleanup");
 }
 
 #[tokio::test]

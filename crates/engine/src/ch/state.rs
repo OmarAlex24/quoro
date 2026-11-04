@@ -200,6 +200,9 @@ pub struct WorkDiskFile {
 pub struct VolumeFile {
     pub volume_id: String,
     pub mount_path: String,
+    /// The disk serial (M5a). Files written before M5a held no volumes.
+    #[serde(default)]
+    pub serial: String,
 }
 
 /// The VM's network attachment in a [`SpecFile`].
@@ -263,6 +266,7 @@ impl From<&VmSpec> for SpecFile {
                 .map(|volume| VolumeFile {
                     volume_id: volume.volume_id.0.clone(),
                     mount_path: volume.mount_path.clone(),
+                    serial: volume.serial.clone(),
                 })
                 .collect(),
             net: NetFile {
@@ -347,6 +351,7 @@ impl SpecFile {
                 .map(|volume| VolumeAttach {
                     volume_id: VolumeId(volume.volume_id.clone()),
                     mount_path: volume.mount_path.clone(),
+                    serial: volume.serial.clone(),
                 })
                 .collect(),
             net: NetAttach {
@@ -760,7 +765,7 @@ fn io_error(path: &Path, err: &io::Error) -> EngineError {
 
 /// fsyncs the directory holding `path`, so a rename or removal survives a
 /// crash.
-fn sync_dir(path: &Path) -> Result<(), EngineError> {
+pub(super) fn sync_dir(path: &Path) -> Result<(), EngineError> {
     let dir = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
@@ -805,6 +810,7 @@ mod tests {
             volumes: vec![VolumeAttach {
                 volume_id: VolumeId("vol_01HX8Z4Q2M9W7T3YV6B1C0D5EF".to_string()),
                 mount_path: "/data".to_string(),
+                serial: "quoro-vol-0".to_string(),
             }],
             net: NetAttach {
                 ip: "10.42.1.7".parse().expect("ip"),

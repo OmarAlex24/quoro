@@ -549,6 +549,7 @@ mod tests {
             dns: vec![Ipv4Addr::new(1, 1, 1, 1)],
             stop_timeout_ms: 5_000,
             exec_port: None,
+            volumes: Vec::new(),
         }
     }
 

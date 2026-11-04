@@ -93,6 +93,33 @@ Encoding validates with the same rules as decoding and errors when the result
 would not fit the 1 MiB region. `GuestConfig::encode` returns the text without
 padding; the caller writes it at offset 0 of a `CONFIG_DISK_LEN` file.
 
+### Configuration version 3 (M5a)
+
+A configuration with an exec port is written with the header
+`quoro-init-config v3`. It carries the same lines as v2, in the same order,
+then one line per attached volume, in the order of `VmSpec::volumes`:
+
+```
+quoro-init-config v3
+...                              every v2 line, including exec_port
+volume=quoro-vol-0:/var/lib/app/data   0 or more, in order
+```
+
+The value is `<serial>:<mount_path>`, split at the first `:`. Rules:
+
+- `serial` matches `quoro-vol-[0-9]+`: the prefix, then one or more ASCII
+  digits (no sign).
+- `mount_path` is absolute, at most 255 bytes, holds no `:`, no empty, `.` or
+  `..` segment and no trailing `/`, and is not `/` nor `/proc`, `/sys` or
+  `/dev` (or anything under them). `/sysx` and `/procfs/a` are ordinary paths.
+- Serials are unique, and mount paths are unique and not nested in one another.
+
+`volume=` is valid only in v3 and only after `exec_port`, and a v3
+configuration requires `exec_port` like v2. A configuration with volumes and no
+exec port does not encode. The init still decodes v1 and v2, where a `volume=`
+line is an unknown key. The encoder writes v3 whenever `exec_port` is set, with
+or without volumes, and never writes v2.
+
 ### Status grammar
 
 Written at `STATUS_OFFSET`, NUL-terminated, at most `STATUS_REGION_LEN`:
@@ -134,6 +161,11 @@ returns `None` for an all-zero region.
    `/dev/stderr` symlinks when missing. A cgroup2 mount that fails — an old
    kernel without cgroup v2, or something already mounted there — is a
    diagnostic line, never a boot failure; BuildKit needs it, an app does not.
+   Then the volumes of a v3 configuration (M5a): each disk was already found by
+   its serial before the switch, and is mounted `ext4`, writable, with
+   `nosuid,nodev`, at its mount path inside the app's root; a missing mount
+   directory is created (0755) with its parents. A volume that cannot be found
+   or mounted is a FATAL.
 7. **Hostname and files.** `sethostname` when configured; `/etc/hosts`
    (`127.0.0.1 localhost`, `::1 localhost`, plus `<address> <hostname>` when
    both are configured); `/etc/resolv.conf` when `dns` is non-empty. Files are
@@ -170,9 +202,9 @@ returns `None` for an all-zero region.
     init is PID 1 and is never signalled.
 15. **Clean the disks.** `sync()`, then read `/proc/self/mounts` and, for every
     mount whose source is a device under `/dev/` (a work disk the app mounted on
-    `/mnt/work`, for example), last mounted first: `umount2(target, 0)`, or a
-    read-only remount (`MS_REMOUNT | MS_RDONLY`, retried with `MS_BIND` for a
-    bind mount) when the unmount finds it busy.
+    `/mnt/work`, or an attached volume, for example), last mounted first:
+    `umount2(target, 0)`, or a read-only remount (`MS_REMOUNT | MS_RDONLY`,
+    retried with `MS_BIND` for a bind mount) when the unmount finds it busy.
 16. **Power off.** `sync()`, `reboot(PowerOff)`. If the reboot returns, the
     process sleeps forever.
 
@@ -222,8 +254,9 @@ console.
 The web terminal reaches the app's context over virtio-vsock
 ([`engine-trait.md`](../../docs/contracts/engine-trait.md) section 6, ADR 0113;
 the spike is [`m4-terminal-and-console.md`](../../docs/research/m4-terminal-and-console.md)).
-A configuration is v2 exactly when it carries `exec_port`; a v1 configuration
-starts no listener.
+A configuration is v2 or v3 exactly when it carries `exec_port`; a v1
+configuration starts no listener. v3 adds the volumes above; the encoder never
+writes v2 any more, and every VM with an exec port is written as v3.
 
 The listener binds `VMADDR_CID_ANY:<exec_port>` inside the app's root, after
 the switch, the network and the user, and before the app starts. It runs for

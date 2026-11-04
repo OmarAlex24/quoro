@@ -18,10 +18,18 @@ pub const SERIAL_CONFIG: &str = "quoro-config";
 
 /// First line of an encoded configuration without an exec listener (M1-M3).
 pub const CONFIG_MAGIC: &str = "quoro-init-config v1";
-/// First line of an encoded configuration that carries `exec_port` (M4). A
-/// configuration is encoded as v2 exactly when [`GuestConfig::exec_port`] is
-/// set, so a v1 init never sees a key it does not know.
+/// First line of a version 2 configuration (M4). It carries `exec_port` after
+/// `stop_timeout_ms`. The init still decodes it, but the encoder no longer
+/// writes it: a configuration with an exec port is written as v3.
 pub const CONFIG_MAGIC_V2: &str = "quoro-init-config v2";
+/// Header line of a version 3 configuration (M5a): v2 plus zero or more
+/// `volume=<serial>:<mount_path>` lines after `exec_port`. The engine writes
+/// v3 exactly when [`GuestConfig::exec_port`] is set, with or without
+/// volumes; a configuration with volumes and no exec port does not encode.
+pub const CONFIG_MAGIC_V3: &str = "quoro-init-config v3";
+/// Prefix of a volume disk's virtio-blk serial: `quoro-vol-<n>`, `n` from 0
+/// in the order of [`GuestConfig::volumes`] (M5a, engine-trait.md section 6).
+pub const SERIAL_VOLUME_PREFIX: &str = "quoro-vol-";
 /// The vsock port the engine asks the init to listen on for exec sessions
 /// (`engine-trait.md` section 6, ADR 0113).
 pub const EXEC_PORT: u32 = 1024;
@@ -42,6 +50,8 @@ pub const CONFIG_DISK_LEN: u64 = CONFIG_REGION_LEN + STATUS_REGION_LEN;
 const MAX_STOP_TIMEOUT_MS: u64 = 86_400_000;
 /// Upper bound on the `hostname` value, in characters.
 const MAX_HOSTNAME_CHARS: usize = 64;
+/// Upper bound on a volume's `mount_path`, in bytes.
+const MAX_MOUNT_PATH_BYTES: usize = 255;
 
 /// Which guest console carries the app's tagged output lines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,6 +101,20 @@ pub struct GuestConfig {
     /// `None` encodes a v1 configuration, and the init starts no listener.
     /// Never 0 and never `u32::MAX` (`VMADDR_PORT_ANY`).
     pub exec_port: Option<u32>,
+    /// Volumes to mount inside the app's root after the root switch, in the
+    /// order of `VmSpec::volumes` (M5a, config v3). Empty for most VMs.
+    pub volumes: Vec<VolumeMount>,
+}
+
+/// One attached volume: the disk's virtio-blk serial and where the init
+/// mounts it inside the app's root (M5a, config v3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VolumeMount {
+    /// `quoro-vol-<n>`; see [`SERIAL_VOLUME_PREFIX`].
+    pub serial: String,
+    /// Absolute, at most 255 bytes, no `:`, no empty, `.` or `..` segment, no
+    /// trailing `/`, not `/` and not under `/proc`, `/sys` or `/dev`.
+    pub mount_path: String,
 }
 
 /// What the init reports when the guest is about to power off.
@@ -130,7 +154,7 @@ impl GuestConfig {
 
         let mut out = String::new();
         out.push_str(if self.exec_port.is_some() {
-            CONFIG_MAGIC_V2
+            CONFIG_MAGIC_V3
         } else {
             CONFIG_MAGIC
         });
@@ -175,6 +199,13 @@ impl GuestConfig {
         if let Some(port) = self.exec_port {
             push_line(&mut out, "exec_port", &port.to_string());
         }
+        for volume in &self.volumes {
+            push_line(
+                &mut out,
+                "volume",
+                &format!("{}:{}", volume.serial, volume.mount_path),
+            );
+        }
 
         if out.len() as u64 > CONFIG_REGION_LEN {
             return Err(ConfigError(format!(
@@ -200,15 +231,20 @@ impl GuestConfig {
         let (magic, body) = lines
             .split_first()
             .ok_or_else(|| ConfigError("configuration is empty".to_string()))?;
-        let v2 = if *magic == CONFIG_MAGIC {
-            false
+        let version = if *magic == CONFIG_MAGIC {
+            1u8
         } else if *magic == CONFIG_MAGIC_V2 {
-            true
+            2
+        } else if *magic == CONFIG_MAGIC_V3 {
+            3
         } else {
             return Err(ConfigError(format!(
-                "line 1: expected magic {CONFIG_MAGIC:?} or {CONFIG_MAGIC_V2:?}, got {magic:?}"
+                "line 1: expected magic {CONFIG_MAGIC:?}, {CONFIG_MAGIC_V2:?} or \
+                 {CONFIG_MAGIC_V3:?}, got {magic:?}"
             )));
         };
+        // v2 and v3 both carry `exec_port`; only v3 carries volumes.
+        let carries_exec_port = version >= 2;
 
         let mut args: Vec<String> = Vec::new();
         let mut env: Vec<(String, String)> = Vec::new();
@@ -222,6 +258,7 @@ impl GuestConfig {
         let mut dns: Vec<Ipv4Addr> = Vec::new();
         let mut stop_timeout_ms: Option<u64> = None;
         let mut exec_port: Option<u32> = None;
+        let mut volumes: Vec<VolumeMount> = Vec::new();
 
         for (offset, line) in body.iter().enumerate() {
             let line_no = offset + 2;
@@ -329,7 +366,7 @@ impl GuestConfig {
                     }
                     stop_timeout_ms = Some(parsed);
                 }
-                "exec_port" if v2 => {
+                "exec_port" if carries_exec_port => {
                     if exec_port.is_some() {
                         return Err(line_error(line_no, "duplicate exec_port".to_string()));
                     }
@@ -338,6 +375,24 @@ impl GuestConfig {
                         line_error(line_no, format!("exec_port is not a port: {value:?}"))
                     })?;
                     exec_port = Some(parsed);
+                }
+                "volume" if version >= 3 => {
+                    if exec_port.is_none() {
+                        return Err(line_error(
+                            line_no,
+                            "volume line before exec_port".to_string(),
+                        ));
+                    }
+                    let value = unescape(raw, line_no)?;
+                    let (serial, mount_path) = value.split_once(':').ok_or_else(|| {
+                        line_error(line_no, format!("volume is missing ':': {raw:?}"))
+                    })?;
+                    validate_volume_serial(serial).map_err(|e| line_error(line_no, e))?;
+                    validate_mount_path(mount_path).map_err(|e| line_error(line_no, e))?;
+                    volumes.push(VolumeMount {
+                        serial: serial.to_string(),
+                        mount_path: mount_path.to_string(),
+                    });
                 }
                 other => {
                     return Err(line_error(line_no, format!("unknown key {other:?}")));
@@ -373,7 +428,7 @@ impl GuestConfig {
         let console = console.ok_or_else(|| ConfigError("missing console".to_string()))?;
         let stop_timeout_ms =
             stop_timeout_ms.ok_or_else(|| ConfigError("missing stop_timeout_ms".to_string()))?;
-        if v2 && exec_port.is_none() {
+        if carries_exec_port && exec_port.is_none() {
             return Err(ConfigError("missing exec_port".to_string()));
         }
 
@@ -388,6 +443,7 @@ impl GuestConfig {
             dns,
             stop_timeout_ms,
             exec_port,
+            volumes,
         };
         validate(&config)?;
         Ok(config)
@@ -726,6 +782,33 @@ fn validate(config: &GuestConfig) -> Result<(), ConfigError> {
             "exec_port {port} is not a listening vsock port"
         )));
     }
+    if !config.volumes.is_empty() && config.exec_port.is_none() {
+        return Err(ConfigError(
+            "volumes need an exec_port: their lines live in a v3 configuration".to_string(),
+        ));
+    }
+    for (index, volume) in config.volumes.iter().enumerate() {
+        no_nul_field(&volume.serial, "volume serial")?;
+        no_nul_field(&volume.mount_path, "volume mount path")?;
+        validate_volume_serial(&volume.serial)
+            .map_err(|e| ConfigError(format!("volume serial {:?}: {e}", volume.serial)))?;
+        validate_mount_path(&volume.mount_path)
+            .map_err(|e| ConfigError(format!("volume mount path {:?}: {e}", volume.mount_path)))?;
+        for other in &config.volumes[..index] {
+            if other.serial == volume.serial {
+                return Err(ConfigError(format!(
+                    "duplicate volume serial {:?}",
+                    volume.serial
+                )));
+            }
+            if mount_paths_overlap(&other.mount_path, &volume.mount_path) {
+                return Err(ConfigError(format!(
+                    "volume mount paths {:?} and {:?} are the same or nested",
+                    other.mount_path, volume.mount_path
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -782,6 +865,71 @@ fn validate_workdir(workdir: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A volume serial is `quoro-vol-` followed by one or more ASCII digits; no
+/// sign, no whitespace, at least one digit.
+fn validate_volume_serial(serial: &str) -> Result<(), String> {
+    let Some(number) = serial.strip_prefix(SERIAL_VOLUME_PREFIX) else {
+        return Err(format!("must start with {SERIAL_VOLUME_PREFIX:?}"));
+    };
+    if number.is_empty() {
+        return Err("has no digits after the prefix".to_string());
+    }
+    if !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("must be the prefix followed by digits".to_string());
+    }
+    Ok(())
+}
+
+/// A volume mount path: absolute, at most 255 bytes, no `:` and no empty, `.`
+/// or `..` segment, no trailing `/`, not `/`, and not `/proc`, `/sys` or
+/// `/dev` or anything under them.
+fn validate_mount_path(path: &str) -> Result<(), String> {
+    if !path.starts_with('/') {
+        return Err("must start with '/'".to_string());
+    }
+    if path.len() > MAX_MOUNT_PATH_BYTES {
+        return Err(format!(
+            "must be at most {MAX_MOUNT_PATH_BYTES} bytes, got {}",
+            path.len()
+        ));
+    }
+    if path.contains(':') {
+        return Err("must not contain ':'".to_string());
+    }
+    if path == "/" {
+        return Err("must not be '/'".to_string());
+    }
+    if path.ends_with('/') {
+        return Err("must not end with '/'".to_string());
+    }
+    for segment in path.split('/').skip(1) {
+        if segment.is_empty() {
+            return Err("must not contain an empty segment".to_string());
+        }
+        if segment == "." || segment == ".." {
+            return Err(format!("must not contain a {segment:?} segment"));
+        }
+    }
+    for reserved in ["/proc", "/sys", "/dev"] {
+        if path == reserved || is_under(path, reserved) {
+            return Err(format!("must not be {reserved} or under it"));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `path` is `parent` or below it.
+fn is_under(path: &str, parent: &str) -> bool {
+    path.strip_prefix(parent)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Two mount paths may not be equal or nested in one another: the volumes
+/// would shadow each other.
+fn mount_paths_overlap(a: &str, b: &str) -> bool {
+    a == b || is_under(a, b) || is_under(b, a)
+}
+
 fn validate_hostname(hostname: &str) -> Result<(), String> {
     let chars = hostname.chars().count();
     if chars == 0 || chars > MAX_HOSTNAME_CHARS {
@@ -832,6 +980,7 @@ mod tests {
             dns: vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)],
             stop_timeout_ms: 10_000,
             exec_port: None,
+            volumes: Vec::new(),
         }
     }
 
@@ -847,11 +996,27 @@ mod tests {
             dns: Vec::new(),
             stop_timeout_ms: 5_000,
             exec_port: None,
+            volumes: Vec::new(),
         }
     }
 
     fn decode_str(text: &str) -> Result<GuestConfig, ConfigError> {
         GuestConfig::decode(text.as_bytes())
+    }
+
+    fn volume(serial: &str, mount_path: &str) -> VolumeMount {
+        VolumeMount {
+            serial: serial.to_string(),
+            mount_path: mount_path.to_string(),
+        }
+    }
+
+    fn with_volumes(volumes: Vec<VolumeMount>) -> GuestConfig {
+        GuestConfig {
+            exec_port: Some(EXEC_PORT),
+            volumes,
+            ..minimal()
+        }
     }
 
     #[test]
@@ -876,31 +1041,33 @@ mod tests {
     }
 
     #[test]
-    fn a_config_with_an_exec_port_is_version_2() {
+    fn a_config_with_an_exec_port_is_version_3() {
         let config = GuestConfig {
             exec_port: Some(EXEC_PORT),
+            volumes: Vec::new(),
             ..minimal()
         };
-        let encoded = config.encode().expect("v2 encodes");
+        let encoded = config.encode().expect("v3 encodes");
         let text = std::str::from_utf8(&encoded).expect("ascii");
         assert_eq!(
             text,
             format!(
-                "{CONFIG_MAGIC_V2}\narg=/bin/true\nconsole=serial\nstop_timeout_ms=5000\nexec_port=1024\n"
+                "{CONFIG_MAGIC_V3}\narg=/bin/true\nconsole=serial\nstop_timeout_ms=5000\nexec_port=1024\n"
             )
         );
         assert_eq!(GuestConfig::decode(&encoded).expect("decodes"), config);
 
-        let sample_v2 = GuestConfig {
+        let sample_v3 = GuestConfig {
             exec_port: Some(7),
+            volumes: Vec::new(),
             ..sample()
         };
-        let encoded = sample_v2.encode().expect("encodes");
-        assert_eq!(GuestConfig::decode(&encoded).expect("decodes"), sample_v2);
+        let encoded = sample_v3.encode().expect("encodes");
+        assert_eq!(GuestConfig::decode(&encoded).expect("decodes"), sample_v3);
     }
 
     #[test]
-    fn exec_port_is_only_valid_in_version_2() {
+    fn exec_port_is_only_valid_in_version_2_or_3() {
         let v1 = format!(
             "{CONFIG_MAGIC}\narg=/bin/true\nconsole=serial\nstop_timeout_ms=1\nexec_port=1024\n"
         );
@@ -929,10 +1096,247 @@ mod tests {
         for port in [0, u32::MAX] {
             let config = GuestConfig {
                 exec_port: Some(port),
+                volumes: Vec::new(),
                 ..minimal()
             };
             assert!(config.encode().is_err(), "port {port} is not encodable");
         }
+    }
+
+    #[test]
+    fn round_trips_version_3_with_zero_one_and_two_volumes() {
+        let sets = [
+            Vec::new(),
+            vec![volume("quoro-vol-0", "/var/lib/app")],
+            vec![
+                volume("quoro-vol-0", "/data"),
+                volume("quoro-vol-1", "/srv/uploads"),
+            ],
+        ];
+        for volumes in sets {
+            let config = with_volumes(volumes.clone());
+            let encoded = config.encode().expect("v3 encodes");
+            let text = std::str::from_utf8(&encoded).expect("ascii");
+            assert!(
+                text.starts_with(&format!("{CONFIG_MAGIC_V3}\n")),
+                "{text:?}"
+            );
+            for volume in &volumes {
+                assert!(
+                    text.contains(&format!("volume={}:{}\n", volume.serial, volume.mount_path)),
+                    "{text:?}"
+                );
+            }
+            assert_eq!(GuestConfig::decode(&encoded).expect("decodes"), config);
+        }
+    }
+
+    #[test]
+    fn volume_lines_follow_exec_port_in_order() {
+        let config = with_volumes(vec![
+            volume("quoro-vol-0", "/data"),
+            volume("quoro-vol-1", "/srv/uploads"),
+        ]);
+        let encoded = config.encode().expect("encodes");
+        let text = String::from_utf8(encoded).expect("ascii");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], CONFIG_MAGIC_V3);
+        assert_eq!(lines[lines.len() - 3], "exec_port=1024");
+        assert_eq!(lines[lines.len() - 2], "volume=quoro-vol-0:/data");
+        assert_eq!(lines[lines.len() - 1], "volume=quoro-vol-1:/srv/uploads");
+    }
+
+    #[test]
+    fn v1_and_v2_configurations_still_decode() {
+        let v1 = format!("{CONFIG_MAGIC}\narg=/bin/true\nconsole=none\nstop_timeout_ms=1\n");
+        let decoded = decode_str(&v1).expect("v1 decodes");
+        assert_eq!(decoded.exec_port, None);
+        assert!(decoded.volumes.is_empty());
+
+        let v2 = format!(
+            "{CONFIG_MAGIC_V2}\narg=/bin/true\nconsole=none\nstop_timeout_ms=1\nexec_port=1024\n"
+        );
+        let decoded = decode_str(&v2).expect("v2 decodes");
+        assert_eq!(decoded.exec_port, Some(1024));
+        assert!(decoded.volumes.is_empty());
+    }
+
+    #[test]
+    fn volume_lines_are_refused_before_version_3() {
+        let v1 = format!(
+            "{CONFIG_MAGIC}\narg=/bin/true\nconsole=none\nstop_timeout_ms=1\n\
+             volume=quoro-vol-0:/data\n"
+        );
+        let error = decode_str(&v1).expect_err("v1 has no volume lines");
+        assert!(error.0.contains("line 5"), "got {error}");
+
+        let v2 = format!(
+            "{CONFIG_MAGIC_V2}\narg=/bin/true\nconsole=none\nstop_timeout_ms=1\n\
+             exec_port=1024\nvolume=quoro-vol-0:/data\n"
+        );
+        let error = decode_str(&v2).expect_err("v2 has no volume lines");
+        assert!(error.0.contains("line 6"), "got {error}");
+    }
+
+    #[test]
+    fn a_volume_line_before_exec_port_is_refused() {
+        let text = format!(
+            "{CONFIG_MAGIC_V3}\narg=/bin/true\nconsole=none\nstop_timeout_ms=1\n\
+             volume=quoro-vol-0:/data\nexec_port=1024\n"
+        );
+        let error = decode_str(&text).expect_err("volume before exec_port must fail");
+        assert!(error.0.contains("line 5"), "got {error}");
+        assert!(error.0.contains("exec_port"), "got {error}");
+
+        let missing =
+            format!("{CONFIG_MAGIC_V3}\narg=/bin/true\nconsole=none\nstop_timeout_ms=1\n");
+        let error = decode_str(&missing).expect_err("v3 requires exec_port");
+        assert!(error.0.contains("missing exec_port"), "got {error}");
+    }
+
+    #[test]
+    fn volumes_without_an_exec_port_do_not_encode() {
+        let config = GuestConfig {
+            volumes: vec![volume("quoro-vol-0", "/data")],
+            ..minimal()
+        };
+        let error = config.encode().expect_err("volumes need a v3 header");
+        assert!(error.0.contains("exec_port"), "got {error}");
+    }
+
+    #[test]
+    fn rejects_bad_volume_serials() {
+        for serial in [
+            "",
+            "quoro-vol",
+            "quoro-vol-",
+            "quoro-vol-+1",
+            "quoro-vol--1",
+            "quoro-vol-1a",
+            "quoro-vol- 1",
+            "quoro-vol-1 ",
+            "quoro-vol_0",
+            "vol-0",
+            "Quoro-vol-0",
+        ] {
+            let config = with_volumes(vec![volume(serial, "/data")]);
+            let error = config
+                .encode()
+                .expect_err(&format!("serial {serial:?} must be refused"));
+            assert!(error.0.contains("volume serial"), "{serial:?} gave {error}");
+
+            let text = format!(
+                "{CONFIG_MAGIC_V3}\narg=/bin/true\nconsole=none\nstop_timeout_ms=1\n\
+                 exec_port=1024\nvolume={serial}:/data\n"
+            );
+            assert!(
+                decode_str(&text).is_err(),
+                "decode must refuse serial {serial:?}"
+            );
+        }
+        for serial in ["quoro-vol-0", "quoro-vol-42", "quoro-vol-007"] {
+            with_volumes(vec![volume(serial, "/data")])
+                .encode()
+                .unwrap_or_else(|error| panic!("serial {serial:?} must be allowed: {error}"));
+        }
+    }
+
+    #[test]
+    fn rejects_bad_volume_mount_paths() {
+        let long = format!("/{}", "a".repeat(255));
+        for path in [
+            "",
+            "data",
+            "/",
+            "/a/",
+            "/a//b",
+            "/a/../b",
+            "/a/./b",
+            "/..",
+            "/.",
+            "/a:b",
+            "/proc",
+            "/proc/x",
+            "/sys",
+            "/sys/fs/cgroup",
+            "/dev",
+            "/dev/vda",
+            long.as_str(),
+        ] {
+            let config = with_volumes(vec![volume("quoro-vol-0", path)]);
+            let error = config
+                .encode()
+                .expect_err(&format!("mount path {path:?} must be refused"));
+            assert!(
+                error.0.contains("volume mount path"),
+                "{path:?} gave {error}"
+            );
+        }
+        let longest = format!("/{}", "a".repeat(254));
+        for path in [
+            "/data",
+            "/var/lib/app/data",
+            "/sysx",
+            "/devx",
+            "/procfs/a",
+            "/a..b",
+            "/.hidden",
+            longest.as_str(),
+        ] {
+            with_volumes(vec![volume("quoro-vol-0", path)])
+                .encode()
+                .unwrap_or_else(|error| panic!("mount path {path:?} must be allowed: {error}"));
+        }
+    }
+
+    #[test]
+    fn a_volume_line_must_hold_a_colon() {
+        let text = format!(
+            "{CONFIG_MAGIC_V3}\narg=/bin/true\nconsole=none\nstop_timeout_ms=1\n\
+             exec_port=1024\nvolume=quoro-vol-0\n"
+        );
+        let error = decode_str(&text).expect_err("a volume without ':' must fail");
+        assert!(error.0.contains("line 6"), "got {error}");
+    }
+
+    #[test]
+    fn rejects_duplicate_volume_serials() {
+        let config = with_volumes(vec![
+            volume("quoro-vol-0", "/data"),
+            volume("quoro-vol-0", "/other"),
+        ]);
+        let error = config.encode().expect_err("duplicate serial must fail");
+        assert!(error.0.contains("duplicate volume serial"), "got {error}");
+
+        let text = format!(
+            "{CONFIG_MAGIC_V3}\narg=/bin/true\nconsole=none\nstop_timeout_ms=1\n\
+             exec_port=1024\nvolume=quoro-vol-0:/data\nvolume=quoro-vol-0:/other\n"
+        );
+        assert!(decode_str(&text).is_err(), "decode must refuse a duplicate");
+    }
+
+    #[test]
+    fn rejects_duplicate_and_nested_volume_mount_paths() {
+        for (first, second) in [
+            ("/data", "/data"),
+            ("/data", "/data/nested"),
+            ("/data/nested", "/data"),
+        ] {
+            let config = with_volumes(vec![
+                volume("quoro-vol-0", first),
+                volume("quoro-vol-1", second),
+            ]);
+            let error = config
+                .encode()
+                .expect_err("overlapping mount paths must fail");
+            assert!(error.0.contains("nested"), "{first} / {second}: {error}");
+        }
+        with_volumes(vec![
+            volume("quoro-vol-0", "/data"),
+            volume("quoro-vol-1", "/database"),
+        ])
+        .encode()
+        .expect("sibling paths that only share a prefix are allowed");
     }
 
     #[test]
@@ -1029,7 +1433,7 @@ mod tests {
     #[test]
     fn rejects_bad_magic() {
         let error =
-            decode_str("quoro-init-config v3\narg=/bin/true\nconsole=none\nstop_timeout_ms=1\n")
+            decode_str("quoro-init-config v9\narg=/bin/true\nconsole=none\nstop_timeout_ms=1\n")
                 .expect_err("wrong magic must fail");
         assert!(error.0.contains("line 1"), "got {error}");
         let error = GuestConfig::decode(b"").expect_err("empty region must fail");

@@ -10,8 +10,7 @@ use std::time::Duration;
 
 use quoro_engine::{
     ConsoleMode, Engine, EngineError, EngineEvent, EventStream, ImageDigest, ImageRef, InitConfig,
-    LineStream, MacAddr, NetAttach, OutputLine, StopMode, VmId, VmSpec, VmState, VolumeAttach,
-    VolumeId,
+    LineStream, MacAddr, NetAttach, OutputLine, StopMode, VmId, VmSpec, VmState,
 };
 
 /// The image every test prepares.
@@ -30,10 +29,7 @@ pub fn sample_spec(rootfs: &ImageDigest, id: &str) -> VmSpec {
         memory_mb: 512,
         rootfs: rootfs.clone(),
         disk_gb: 1,
-        volumes: vec![VolumeAttach {
-            volume_id: VolumeId("vol_01".to_string()),
-            mount_path: "/data".to_string(),
-        }],
+        volumes: Vec::new(),
         net: NetAttach {
             ip: "10.42.1.10".parse().expect("sample address"),
             gateway: "10.42.1.1".parse().expect("sample gateway"),

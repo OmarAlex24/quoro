@@ -8,12 +8,13 @@
 
 mod common;
 
+use std::path::Path;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use quoro_engine::{
-    Engine, FakeEngine, ImageDigest, ImageRef, NodeNetwork, StopMode, VmId, VmSpec, VolumeId,
-    VolumeSnapshot,
+    Engine, FakeEngine, ImageDigest, ImageRef, NodeNetwork, SnapshotMethod, StopMode, VmId, VmSpec,
+    VolumeId, VolumeSnapshot,
 };
 
 fn assert_send<T: Send>(_: &T) {}
@@ -42,7 +43,7 @@ fn calls_are_send<E: Engine>(engine: &E, sample: &Sample<'_>) {
     assert_send(&engine.stop(
         sample.id,
         StopMode::Graceful {
-            timeout: std::time::Duration::from_secs(1),
+            timeout: Duration::from_secs(1),
         },
     ));
     assert_send(&engine.stop(sample.id, StopMode::Force));
@@ -50,6 +51,9 @@ fn calls_are_send<E: Engine>(engine: &E, sample: &Sample<'_>) {
     assert_send(&engine.inspect(sample.id));
     assert_send(&engine.list());
     assert_send(&engine.counters(sample.id));
+    assert_send(&engine.ensure_volume(sample.volume, 1));
+    assert_send(&engine.import_volume(sample.volume, 1, Path::new("/fake/restore")));
+    assert_send(&engine.delete_volume(sample.volume));
     assert_send(&engine.snapshot_volume(sample.volume));
     assert_send(&engine.delete_volume_snapshot(sample.snapshot));
 }
@@ -76,6 +80,8 @@ async fn a_generic_caller_can_spawn_an_engine_call() {
         created_at: SystemTime::now(),
         size_bytes: 0,
         location: "/fake/snapshots/1".into(),
+        method: SnapshotMethod::Reflink,
+        pause: Duration::ZERO,
     };
 
     calls_are_send(

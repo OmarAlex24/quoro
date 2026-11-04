@@ -15,7 +15,7 @@
 use std::fmt;
 use std::future::Future;
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::{Duration, SystemTime};
 
@@ -117,11 +117,36 @@ impl VmSpec {
     }
 }
 
-/// A volume attached to a VM at a mount path inside the guest.
+/// A volume attached to a VM at a mount path inside the guest. The volume
+/// must exist on this node (`ensure_volume` or `import_volume`). Section 3.20.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VolumeAttach {
     pub volume_id: VolumeId,
     pub mount_path: String,
+    /// virtio-blk serial the guest init finds the disk by: `quoro-vol-<n>`,
+    /// `n` from 0 in the order of `VmSpec::volumes`. Added in M5a.
+    pub serial: String,
+}
+
+/// A volume file on this node. Added in M5a. Section 3.20.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VolumeInfo {
+    pub volume_id: VolumeId,
+    pub size_gb: u32,
+    /// Bytes the sparse file uses on the host's disk.
+    pub allocated_bytes: u64,
+    /// Node-local location of the file; not part of any API.
+    pub path: PathBuf,
+}
+
+/// How `snapshot_volume` takes a snapshot on this node (ADR 0146). Added in
+/// M5a. Section 3.16.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotMethod {
+    /// `ioctl(FICLONE)` of the volume file; the VM keeps running.
+    Reflink,
+    /// Pause the VM, copy the sparse file, resume the VM.
+    PauseCopy,
 }
 
 /// The VM's network attachment on the node bridge.
@@ -285,6 +310,9 @@ pub struct Capabilities {
     pub volume_snapshot: bool,
     /// Whether `exec` works on this backend and build (section 3.18). Added in M4.
     pub exec: bool,
+    /// The method `snapshot_volume` uses on this node, probed once at start-up
+    /// (section 3.16); `None` when the engine has no volumes. Added in M5a.
+    pub volume_snapshot_method: Option<SnapshotMethod>,
 }
 
 /// The node network a VM is attached to. Section 3.3.
@@ -308,6 +336,11 @@ pub struct VolumeSnapshot {
     pub size_bytes: u64,
     /// Node-local location of the snapshot; not part of any API.
     pub location: PathBuf,
+    /// How it was taken. Added in M5a.
+    pub method: SnapshotMethod,
+    /// How long the VM using the volume was paused; zero for `Reflink` or
+    /// when no VM was running. Added in M5a.
+    pub pause: Duration,
 }
 
 /// Every method is total: it either succeeds or returns one of these.
@@ -463,6 +496,43 @@ pub trait Engine: Send + Sync {
     }
 
     // Volumes (M5; default implementations return Unsupported)
+    /// Added in M5a; section 3.20.
+    fn ensure_volume(
+        &self,
+        _id: &VolumeId,
+        _size_gb: u32,
+    ) -> impl Future<Output = Result<VolumeInfo, EngineError>> + Send {
+        async {
+            Err(EngineError::Unsupported(
+                "volumes are not implemented by this engine".into(),
+            ))
+        }
+    }
+    /// Added in M5a; section 3.20.
+    fn import_volume(
+        &self,
+        _id: &VolumeId,
+        _size_gb: u32,
+        _from: &Path,
+    ) -> impl Future<Output = Result<VolumeInfo, EngineError>> + Send {
+        async {
+            Err(EngineError::Unsupported(
+                "volumes are not implemented by this engine".into(),
+            ))
+        }
+    }
+    /// Added in M5a; section 3.20.
+    fn delete_volume(
+        &self,
+        _id: &VolumeId,
+    ) -> impl Future<Output = Result<(), EngineError>> + Send {
+        async {
+            Err(EngineError::Unsupported(
+                "volumes are not implemented by this engine".into(),
+            ))
+        }
+    }
+    /// Section 3.16.
     fn snapshot_volume(
         &self,
         _id: &VolumeId,

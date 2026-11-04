@@ -138,6 +138,22 @@ impl ApiClient {
         check_status(status, &body)
     }
 
+    /// `PUT /api/v1/vm.pause` (contract §3.16, ADR 0146).
+    pub async fn pause(&self) -> Result<(), ApiError> {
+        let (status, body) = self
+            .exchange("PUT", "/api/v1/vm.pause", None, false)
+            .await?;
+        check_status(status, &body)
+    }
+
+    /// `PUT /api/v1/vm.resume` (contract §3.16, ADR 0146).
+    pub async fn resume(&self) -> Result<(), ApiError> {
+        let (status, body) = self
+            .exchange("PUT", "/api/v1/vm.resume", None, false)
+            .await?;
+        check_status(status, &body)
+    }
+
     /// `PUT /api/v1/vmm.shutdown`.
     ///
     /// The VMM may exit before or while answering, so a connection that closes
@@ -706,6 +722,63 @@ mod tests {
         peer.await.expect("peer");
         let _ = std::fs::remove_file(&socket);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A listening socket under the workspace `target/` directory, answered by
+    /// `peer` once.
+    fn socket_under_target(tag: &str) -> (std::path::PathBuf, tokio::net::UnixListener) {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join("api-tests");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let socket = dir.join(format!("{tag}-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket);
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        (socket, listener)
+    }
+
+    /// Serves exactly one request with a 204 answer.
+    async fn answer_204(listener: tokio::net::UnixListener) {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        stream
+            .write_all(b"HTTP/1.1 204 \r\nContent-Length: 0\r\n\r\n")
+            .await
+            .expect("write");
+    }
+
+    #[tokio::test]
+    async fn pause_and_resume_are_put_requests() {
+        for (tag, call) in [("pause", "vm.pause"), ("resume", "vm.resume")] {
+            let (socket, listener) = socket_under_target(tag);
+            let peer = tokio::spawn(answer_204(listener));
+            let client = ApiClient::new(&socket).with_timeout(std::time::Duration::from_secs(2));
+            match call {
+                "vm.pause" => client.pause().await.expect("pause"),
+                _ => client.resume().await.expect("resume"),
+            }
+            peer.await.expect("peer");
+            let _ = std::fs::remove_file(&socket);
+        }
+    }
+
+    #[tokio::test]
+    async fn pause_reports_a_refused_pause() {
+        let (socket, listener) = socket_under_target("pause-refused");
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            stream
+                .write_all(b"HTTP/1.1 500 \r\nContent-Length: 12\r\n\r\ninvalid state")
+                .await
+                .expect("write");
+        });
+        let client = ApiClient::new(&socket).with_timeout(std::time::Duration::from_secs(2));
+        let err = client.pause().await.expect_err("500");
+        assert!(
+            matches!(err, ApiError::Status { status: 500, .. }),
+            "{err:?}"
+        );
+        peer.await.expect("peer");
+        let _ = std::fs::remove_file(&socket);
     }
 
     #[tokio::test]

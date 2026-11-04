@@ -18,7 +18,7 @@ use std::time::Duration;
 use crate::{
     Capabilities, ConsoleStream, Engine, EngineError, EventStream, HostProbe, ImageDigest,
     ImageRef, LineStream, NodeNetwork, OciLayout, PreparedImage, StopMode, VmCounters, VmId,
-    VmInfo, VmSpec,
+    VmInfo, VmSpec, VolumeId, VolumeInfo, VolumeSnapshot,
 };
 
 pub mod api;
@@ -35,6 +35,7 @@ mod host;
 mod serial;
 mod stream;
 mod supervise;
+mod volume;
 
 use engine::Inner;
 
@@ -190,6 +191,31 @@ impl Engine for ChEngine {
 
     async fn counters(&self, id: &VmId) -> Result<VmCounters, EngineError> {
         self.inner.counters(id).await
+    }
+
+    async fn ensure_volume(&self, id: &VolumeId, size_gb: u32) -> Result<VolumeInfo, EngineError> {
+        self.inner.ensure_volume(id, size_gb).await
+    }
+
+    async fn import_volume(
+        &self,
+        id: &VolumeId,
+        size_gb: u32,
+        from: &std::path::Path,
+    ) -> Result<VolumeInfo, EngineError> {
+        self.inner.import_volume(id, size_gb, from).await
+    }
+
+    async fn delete_volume(&self, id: &VolumeId) -> Result<(), EngineError> {
+        self.inner.delete_volume(id).await
+    }
+
+    async fn snapshot_volume(&self, id: &VolumeId) -> Result<VolumeSnapshot, EngineError> {
+        self.inner.snapshot_volume(id).await
+    }
+
+    async fn delete_volume_snapshot(&self, snapshot: &VolumeSnapshot) -> Result<(), EngineError> {
+        self.inner.delete_volume_snapshot(snapshot).await
     }
 }
 

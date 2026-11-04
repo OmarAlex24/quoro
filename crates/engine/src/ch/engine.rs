@@ -35,7 +35,8 @@ use crate::pins;
 use crate::{
     ByteStream, Capabilities, ConsoleMode, ConsoleStream, EngineError, EngineEvent, EventStream,
     ExecRequest, ExecSession, HostProbe, ImageDigest, ImageRef, LineStream, MacAddr, NodeNetwork,
-    OciLayout, PreparedImage, SerialMode, StopMode, VmCounters, VmId, VmInfo, VmSpec, VmState,
+    OciLayout, PreparedImage, SerialMode, SnapshotMethod, StopMode, VmCounters, VmId, VmInfo,
+    VmSpec, VmState,
 };
 
 use super::ChConfig;
@@ -93,7 +94,12 @@ pub(super) struct Inner {
     pub(super) inflight_peers: StdMutex<HashMap<String, InflightPeer>>,
     /// Work-disk paths whose `create` is in flight, with the VM that reserved
     /// them. Two VMs may never name the same work-disk path at once (§3.6).
+    /// Volume files are reserved in the same map, so a volume and a work disk,
+    /// or two creates of one volume, can never share a path.
     pub(super) inflight_disks: StdMutex<HashMap<PathBuf, VmId>>,
+    /// How `snapshot_volume` takes a snapshot on this node, probed once at
+    /// start-up (§3.16, ADR 0146).
+    pub(super) volume_method: SnapshotMethod,
     /// Serializes peer-set syncs, so the last one applied saw the latest state.
     pub(super) peers_sync: Mutex<()>,
 }
@@ -173,7 +179,7 @@ impl VmEntry {
     }
 
     /// The spec this VM was created with, if it has been read.
-    fn spec(&self) -> Option<SpecRecord> {
+    pub(super) fn spec(&self) -> Option<SpecRecord> {
         lock(&self.spec).clone()
     }
 
@@ -250,6 +256,13 @@ impl Inner {
                 .map_err(|err| io_error(&dir, &err))?;
         }
 
+        // Volumes are sparse files owned by root, so the directory is 0700 and
+        // the probe starts as soon as it exists (§3.20, §3.16).
+        let volumes_dir = config.state_dir.join("volumes");
+        create_parent_dirs_0700(&volumes_dir)?;
+        super::volume::remove_leftovers(&volumes_dir);
+        let volume_method = super::volume::probe_method(&volumes_dir);
+
         let initramfs = config.state_dir.join("boot").join("initramfs.cpio");
         let init_binary = config.init_binary.clone();
         let out = initramfs.clone();
@@ -279,6 +292,7 @@ impl Inner {
             vms: StdMutex::new(HashMap::new()),
             inflight_peers: StdMutex::new(HashMap::new()),
             inflight_disks: StdMutex::new(HashMap::new()),
+            volume_method,
             peers_sync: Mutex::new(()),
         });
         inner.rediscover(&vms_root).await?;
@@ -402,8 +416,9 @@ impl Inner {
             text_console: true,
             graphical_console: false,
             vm_snapshot: false,
-            volume_snapshot: false,
+            volume_snapshot: true,
             exec: true,
+            volume_snapshot_method: Some(self.volume_method),
         }
     }
 
@@ -537,6 +552,7 @@ impl Inner {
 
         vmconfig::validate_spec(spec)?;
         let _disks = self.reserve_work_disks(spec)?;
+        let _volumes = self.reserve_volumes(spec)?;
         let (network, subnet) = self.reserve(spec).await?;
         let prepared = self.images.cached(&spec.rootfs)?.ok_or_else(|| {
             EngineError::Image(format!("rootfs {} is not a prepared image", spec.rootfs.0))
@@ -644,7 +660,7 @@ impl Inner {
             initramfs: &self.initramfs,
             rootfs: &prepared.rootfs_path,
         };
-        let body = vmconfig::vm_create_body(spec, paths, &boot_files, &tap);
+        let body = vmconfig::vm_create_body(spec, paths, &boot_files, &tap, &self.volumes_dir());
         if let Err(err) = ApiClient::new(&paths.api_socket).create(&body).await {
             let _ = vmm.sigkill();
             let _ = vmm.wait_exit(SETTLE_AFTER_SIGKILL).await;
@@ -1136,7 +1152,10 @@ impl Inner {
     }
 
     /// The entry and the spec of one existing VM, for the observation methods.
-    fn entry_with_spec(&self, id: &VmId) -> Result<(Arc<VmEntry>, SpecRecord), EngineError> {
+    pub(super) fn entry_with_spec(
+        &self,
+        id: &VmId,
+    ) -> Result<(Arc<VmEntry>, SpecRecord), EngineError> {
         let entry = self.entry(id).ok_or(EngineError::NotFound)?;
         if !entry.paths.dir.exists() {
             return Err(EngineError::NotFound);
@@ -1170,7 +1189,7 @@ impl Inner {
     }
 
     /// A snapshot of every known VM, taken so no guard is held across a call.
-    fn entries(&self) -> Vec<(VmId, Arc<VmEntry>)> {
+    pub(super) fn entries(&self) -> Vec<(VmId, Arc<VmEntry>)> {
         lock(&self.vms)
             .iter()
             .map(|(id, entry)| (id.clone(), Arc::clone(entry)))
@@ -1247,11 +1266,6 @@ impl Inner {
     /// Returns the ensured network the address lives in; resources are
     /// reserved here, not at `start`.
     async fn reserve(&self, spec: &VmSpec) -> Result<(NodeNetwork, Subnet), EngineError> {
-        if !spec.volumes.is_empty() {
-            return Err(EngineError::Unsupported(
-                "volumes ship in M5a (D-0052)".to_string(),
-            ));
-        }
         let host_cpus = std::thread::available_parallelism()
             .map(|cpus| cpus.get())
             .unwrap_or(1);
@@ -1467,7 +1481,13 @@ impl Inner {
             initramfs: &self.initramfs,
             rootfs: &prepared.rootfs_path,
         };
-        let body = vmconfig::vm_create_body(spec, &entry.paths, &boot_files, &record.tap);
+        let body = vmconfig::vm_create_body(
+            spec,
+            &entry.paths,
+            &boot_files,
+            &record.tap,
+            &self.volumes_dir(),
+        );
         if let Err(err) = ApiClient::new(&entry.paths.api_socket).create(&body).await {
             let _ = vmm.sigkill();
             let _ = vmm.wait_exit(SETTLE_AFTER_SIGKILL).await;
@@ -1550,7 +1570,7 @@ impl Drop for WorkDiskReservation<'_> {
 ///
 /// Returns `false` when the file already exists, which makes a concurrent
 /// creator a no-op rather than an error.
-fn create_work_disk_file(path: &Path, size_gb: u32) -> Result<bool, EngineError> {
+pub(super) fn create_work_disk_file(path: &Path, size_gb: u32) -> Result<bool, EngineError> {
     let Some(parent) = path.parent() else {
         return Err(EngineError::Conflict(format!(
             "work disk {} has no parent directory",
@@ -1739,7 +1759,7 @@ async fn wait_settled(entry: &VmEntry, timeout: Duration) -> bool {
 
 /// Locks a `std` mutex, taking the value even when an earlier holder panicked:
 /// a poisoned map of VMs is still a map of VMs.
-fn lock<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
+pub(super) fn lock<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -1794,7 +1814,7 @@ fn persist_networks(
 }
 
 /// An `Io` error naming the path it happened on.
-fn io_error(path: &Path, err: &std::io::Error) -> EngineError {
+pub(super) fn io_error(path: &Path, err: &std::io::Error) -> EngineError {
     EngineError::Io(format!("{}: {err}", path.display()))
 }
 
