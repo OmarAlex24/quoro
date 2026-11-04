@@ -82,6 +82,8 @@ impl std::error::Error for HubError {}
 pub enum StreamEvent {
     /// A batch of log lines, oldest first.
     Lines(Vec<wire::LogLine>),
+    /// Metric samples, one `metrics` report per `stream_data` (section 5.17).
+    Metrics(quoro_proto::metrics::MetricsReport),
     /// The stream ended. `reason` is `completed`, `error` or `cancelled`.
     End { reason: String, message: String },
 }
@@ -650,6 +652,9 @@ impl HubInner {
             && !lines.is_empty()
         {
             let _ = slot.tx.send(StreamEvent::Lines(lines));
+        }
+        if let Some(metrics) = data.metrics {
+            let _ = slot.tx.send(StreamEvent::Metrics(metrics));
         }
     }
 

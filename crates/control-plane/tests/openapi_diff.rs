@@ -10,9 +10,9 @@
 //! format, enum, const, pattern, numeric and length bounds, `minItems`,
 //! `uniqueItems`, `default`, `writeOnly`, items, properties, `required` and
 //! `additionalProperties`. Not compared: descriptions, titles, examples,
-//! tags and integer width formats (`int32`/`int64`), which are prose or
-//! representation hints. Every response must still carry a non-empty
-//! description (F-0042).
+//! tags and numeric width formats (`int32`/`int64`/`float`/`double`), which
+//! are prose or representation hints. Every response must still carry a
+//! non-empty description (F-0042).
 
 use quoro_control_plane::openapi::ApiDoc;
 use serde_json::{Map, Value, json};
@@ -142,6 +142,8 @@ fn norm_schema(node: &Value, refs: &mut BTreeSet<String>) -> Value {
                             | "uint8"
                             | "int16"
                             | "uint16"
+                            | "float"
+                            | "double"
                     )
                 )
             {
