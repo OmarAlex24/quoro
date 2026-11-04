@@ -82,6 +82,36 @@ A node install refuses a host that already runs a control plane (it finds
 host into a node would orphan the database, its key files and its panel. It stops
 without deleting anything; uninstall the control plane first.
 
+## Giving the primary a stable address
+
+A node stores the primary's address when it enrolls and dials it on every
+reconnect. Give the primary a fixed address or a DNS name, and set `public_url`
+in `/etc/quoro/quoro.toml` to that address (`https://<host>:8443`), so the join
+commands and the panel hand nodes an address that does not move. A primary on
+DHCP with no reserved lease will strand its nodes after a reboot until an
+operator moves them (see below).
+
+## Moving a node to a new primary address
+
+On each node, as root:
+
+```sh
+sudo quoro node set-primary https://<new address>:8443
+```
+
+The command completes a TLS handshake with the new address using the
+certificate pin stored at enrollment. If the certificate there is not the
+pinned one, it refuses and changes nothing. When the pin matches, it rewrites
+only `primary_url` in `/var/lib/quoro-node/identity.json` (the pin and the node
+credential stay), restarts `quoro-node.service`, and leaves the running apps
+alone: the unit stops the agent without stopping the microVMs. Pass
+`--no-restart` to write the address without touching the service, for example
+when the agent is already stopped.
+
+While connected, nodes also learn the primary's other advertised addresses
+(ADR 0139), so a planned move can be picked up without this command; the manual
+command remains the reliable path after an unplanned address change.
+
 ## What it verifies, and what it trusts
 
 1. **The script itself** arrives over TLS from `raw.githubusercontent.com`;
