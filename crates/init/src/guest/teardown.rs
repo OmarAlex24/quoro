@@ -219,6 +219,23 @@ cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec 0 0
     }
 
     #[test]
+    fn volume_mounts_at_any_path_inside_the_app_root_are_cleaned() {
+        let table = "\
+/dev/vdd /var/lib/app/data ext4 rw,relatime 0 0
+/dev/vde /srv/uploads ext4 rw,relatime 0 0
+/dev/vdf /a/b/c/d ext4 rw,relatime 0 0
+";
+        assert_eq!(
+            unmount_targets(table),
+            vec![
+                "/a/b/c/d".to_string(),
+                "/srv/uploads".to_string(),
+                "/var/lib/app/data".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn pseudo_filesystems_are_ignored() {
         let table = "\
 tmpfs /run tmpfs rw 0 0

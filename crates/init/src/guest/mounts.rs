@@ -14,6 +14,8 @@ use rustix::io::Errno;
 use rustix::mount::{MountFlags, mount, mount_move};
 use rustix::process::{chdir, chroot};
 
+use quoro_init::VolumeMount;
+
 use crate::guest::{Fault, diag};
 
 /// Mount a filesystem. `data` is the comma-separated option string, when the
@@ -169,6 +171,29 @@ pub(crate) fn mount_late() -> Result<(), Fault> {
         }
     }
 
+    Ok(())
+}
+
+/// Step 6: one volume per `volume=` line, mounted at its path inside the app's
+/// root (M5a, engine-trait.md section 6 item 10). The path is created (with
+/// parents, 0755) when the image lacks it. A volume that cannot be mounted
+/// fails the boot.
+pub(crate) fn mount_volumes(volumes: &[(VolumeMount, String)]) -> Result<(), Fault> {
+    for (volume, device) in volumes {
+        let mount_path = &volume.mount_path;
+        make_dir(mount_path, 0o755)?;
+        mount_fs(
+            device,
+            mount_path,
+            "ext4",
+            MountFlags::NOSUID | MountFlags::NODEV,
+            None,
+        )?;
+        diag::log(&format!(
+            "volume: {} mounted on {mount_path}",
+            volume.serial
+        ));
+    }
     Ok(())
 }
 

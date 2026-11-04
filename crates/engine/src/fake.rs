@@ -22,7 +22,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -37,8 +37,12 @@ use crate::{
     ByteStream, Capabilities, ConsoleMode, ConsoleStream, Engine, EngineError, EngineEvent,
     EventStream, ExecRequest, ExecSession, HostProbe, ImageConfig, ImageDigest, ImageRef,
     LineStream, NodeNetwork, OciLayout, OutputLine, OutputStream, PreparedImage, SerialMode,
-    StopMode, VmCounters, VmId, VmInfo, VmSpec, VmState, VolumeId, VolumeSnapshot,
+    SnapshotMethod, StopMode, VmCounters, VmId, VmInfo, VmSpec, VmState, VolumeId, VolumeInfo,
+    VolumeSnapshot,
 };
+
+/// Bytes in one gibibyte, the unit of `size_gb`.
+const GIB: u64 = 1 << 30;
 
 /// Capacity of one event subscriber's channel. A subscriber that falls further
 /// behind than this loses events and the loss is counted, never backpressured
@@ -69,6 +73,23 @@ pub enum FakeOp {
     Start,
     Stop,
     Delete,
+    /// `ensure_volume` (M5a).
+    EnsureVolume,
+    /// `import_volume` (M5a).
+    ImportVolume,
+    /// `delete_volume` (M5a).
+    DeleteVolume,
+    /// `snapshot_volume` (M5a).
+    SnapshotVolume,
+}
+
+/// A volume the fake holds (M5a). With a volume directory set
+/// ([`FakeEngine::set_volume_dir`]) it is a real sparse file there, so a test
+/// can write into it, snapshot it and read the snapshot back; without one it
+/// is a record only.
+struct FakeVolume {
+    size_gb: u32,
+    path: PathBuf,
 }
 
 /// The fake engine's per-VM record.
@@ -237,6 +258,13 @@ struct State {
     networks: HashMap<String, NodeNetwork>,
     vms: HashMap<VmId, VmRecord>,
     snapshots: HashMap<String, VolumeSnapshot>,
+    volumes: HashMap<VolumeId, FakeVolume>,
+    /// Where volume files live; `None` keeps volumes as records only.
+    volume_dir: Option<PathBuf>,
+    snapshot_method: SnapshotMethod,
+    /// The pause a `PauseCopy` snapshot reports while a running VM attaches
+    /// the volume.
+    snapshot_pause: Duration,
     event_subscribers: Vec<mpsc::Sender<EngineEvent>>,
     dropped_events: u64,
     failures: HashMap<FakeOp, VecDeque<EngineError>>,
@@ -254,6 +282,10 @@ impl State {
             networks: HashMap::new(),
             vms: HashMap::new(),
             snapshots: HashMap::new(),
+            volumes: HashMap::new(),
+            volume_dir: None,
+            snapshot_method: SnapshotMethod::Reflink,
+            snapshot_pause: Duration::ZERO,
             event_subscribers: Vec::new(),
             dropped_events: 0,
             failures: HashMap::new(),
@@ -365,6 +397,41 @@ impl FakeEngine {
     /// normally. This reaches the error paths section 3 defines.
     pub fn fail_next(&self, op: FakeOp, err: EngineError) {
         self.lock().failures.entry(op).or_default().push_back(err);
+    }
+
+    /// Keeps volume files in `dir` as real sparse files (M5a). Snapshots are
+    /// copies next to them. Without this, volumes are records only and a
+    /// snapshot's `location` names no file.
+    pub fn set_volume_dir(&self, dir: impl Into<PathBuf>) {
+        self.lock().volume_dir = Some(dir.into());
+    }
+
+    /// The method `capabilities` reports and `snapshot_volume` uses, and the
+    /// pause a `PauseCopy` snapshot of a volume a running VM attaches reports.
+    /// The default is `Reflink` with no pause.
+    pub fn set_snapshot_method(&self, method: SnapshotMethod, pause: Duration) {
+        let mut state = self.lock();
+        state.snapshot_method = method;
+        state.snapshot_pause = pause;
+    }
+
+    /// The volumes this engine holds, with their sizes, sorted by id.
+    #[must_use]
+    pub fn volumes(&self) -> Vec<(VolumeId, u32)> {
+        let mut volumes: Vec<_> = self
+            .lock()
+            .volumes
+            .iter()
+            .map(|(id, volume)| (id.clone(), volume.size_gb))
+            .collect();
+        volumes.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+        volumes
+    }
+
+    /// The snapshots that exist now (taken and not deleted).
+    #[must_use]
+    pub fn volume_snapshots(&self) -> Vec<VolumeSnapshot> {
+        self.lock().snapshots.values().cloned().collect()
     }
 
     fn take_failure(&self, op: FakeOp) -> Option<EngineError> {
@@ -698,6 +765,7 @@ impl Engine for FakeEngine {
             vm_snapshot: false,
             volume_snapshot: true,
             exec: true,
+            volume_snapshot_method: Some(self.lock().snapshot_method),
         }
     }
 
@@ -793,6 +861,32 @@ impl Engine for FakeEngine {
                 "VM {} is egress only and cannot carry an isolation group",
                 spec.id.0
             )));
+        }
+        for (index, volume) in spec.volumes.iter().enumerate() {
+            if !state.volumes.contains_key(&volume.volume_id) {
+                return Err(EngineError::NotFound);
+            }
+            if spec.volumes[..index]
+                .iter()
+                .any(|other| other.serial == volume.serial)
+            {
+                return Err(EngineError::Conflict(format!(
+                    "volume serial {} is used twice",
+                    volume.serial
+                )));
+            }
+            if let Some((other_id, _)) = state.vms.iter().find(|(_, record)| {
+                record
+                    .spec
+                    .volumes
+                    .iter()
+                    .any(|other| other.volume_id == volume.volume_id)
+            }) {
+                return Err(EngineError::Conflict(format!(
+                    "volume {} is already attached to VM {}",
+                    volume.volume_id.0, other_id.0
+                )));
+            }
         }
         for disk in &spec.work_disks {
             for (other_id, record) in &state.vms {
@@ -1097,16 +1191,138 @@ impl Engine for FakeEngine {
         })
     }
 
-    async fn snapshot_volume(&self, id: &VolumeId) -> Result<VolumeSnapshot, EngineError> {
+    async fn ensure_volume(&self, id: &VolumeId, size_gb: u32) -> Result<VolumeInfo, EngineError> {
+        if let Some(err) = self.take_failure(FakeOp::EnsureVolume) {
+            return Err(err);
+        }
         let mut state = self.lock();
+        if let Some(volume) = state.volumes.get(id) {
+            if volume.size_gb != size_gb {
+                return Err(EngineError::Conflict(format!(
+                    "volume {} exists with {} GiB",
+                    id.0, volume.size_gb
+                )));
+            }
+            return Ok(volume_info(id, volume));
+        }
+        let path = match &state.volume_dir {
+            Some(dir) => {
+                let path = dir.join(&id.0);
+                let file = std::fs::File::create(&path).map_err(io_error)?;
+                file.set_len(u64::from(size_gb) * GIB).map_err(io_error)?;
+                path
+            }
+            None => PathBuf::from(format!("/fake/volumes/{}", id.0)),
+        };
+        let volume = FakeVolume { size_gb, path };
+        let info = volume_info(id, &volume);
+        state.volumes.insert(id.clone(), volume);
+        Ok(info)
+    }
+
+    async fn import_volume(
+        &self,
+        id: &VolumeId,
+        size_gb: u32,
+        from: &Path,
+    ) -> Result<VolumeInfo, EngineError> {
+        if let Some(err) = self.take_failure(FakeOp::ImportVolume) {
+            return Err(err);
+        }
+        let mut state = self.lock();
+        if state.volumes.contains_key(id) {
+            return Err(EngineError::Conflict(format!("volume {} exists", id.0)));
+        }
+        let path = match &state.volume_dir {
+            Some(dir) => {
+                let len = std::fs::metadata(from).map_err(io_error)?.len();
+                if len != u64::from(size_gb) * GIB {
+                    return Err(EngineError::Conflict(format!(
+                        "restored file is {len} bytes, not {size_gb} GiB"
+                    )));
+                }
+                let path = dir.join(&id.0);
+                std::fs::rename(from, &path).map_err(io_error)?;
+                path
+            }
+            None => PathBuf::from(format!("/fake/volumes/{}", id.0)),
+        };
+        let volume = FakeVolume { size_gb, path };
+        let info = volume_info(id, &volume);
+        state.volumes.insert(id.clone(), volume);
+        Ok(info)
+    }
+
+    async fn delete_volume(&self, id: &VolumeId) -> Result<(), EngineError> {
+        if let Some(err) = self.take_failure(FakeOp::DeleteVolume) {
+            return Err(err);
+        }
+        let mut state = self.lock();
+        if let Some((vm_id, _)) = state
+            .vms
+            .iter()
+            .find(|(_, record)| record.spec.volumes.iter().any(|v| &v.volume_id == id))
+        {
+            return Err(EngineError::Conflict(format!(
+                "volume {} is attached to VM {}",
+                id.0, vm_id.0
+            )));
+        }
+        if let Some(volume) = state.volumes.remove(id)
+            && state.volume_dir.is_some()
+        {
+            match std::fs::remove_file(&volume.path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(io_error(err)),
+            }
+        }
+        Ok(())
+    }
+
+    async fn snapshot_volume(&self, id: &VolumeId) -> Result<VolumeSnapshot, EngineError> {
+        if let Some(err) = self.take_failure(FakeOp::SnapshotVolume) {
+            return Err(err);
+        }
+        let mut state = self.lock();
+        let Some(volume) = state.volumes.get(id) else {
+            return Err(EngineError::NotFound);
+        };
+        if state.snapshots.values().any(|snap| &snap.volume_id == id) {
+            return Err(EngineError::Conflict(format!(
+                "volume {} already has a snapshot",
+                id.0
+            )));
+        }
+        let size_bytes = u64::from(volume.size_gb) * GIB;
         let n = state.next_snapshot;
+        let location = match &state.volume_dir {
+            Some(dir) => {
+                let location = dir.join(format!("{}.snap-{n}", id.0));
+                std::fs::copy(&volume.path, &location).map_err(io_error)?;
+                location
+            }
+            None => PathBuf::from(format!("/fake/snapshots/{n}")),
+        };
+        let attached_running = state.vms.values().any(|record| {
+            record.info.state == VmState::Running
+                && record.spec.volumes.iter().any(|v| &v.volume_id == id)
+        });
+        let method = state.snapshot_method;
+        let pause = if method == SnapshotMethod::PauseCopy && attached_running {
+            state.snapshot_pause
+        } else {
+            Duration::ZERO
+        };
         state.next_snapshot += 1;
         let snapshot = VolumeSnapshot {
             volume_id: id.clone(),
             snapshot_id: format!("snap-{n}"),
             created_at: SystemTime::now(),
-            size_bytes: 0,
-            location: PathBuf::from(format!("/fake/snapshots/{n}")),
+            size_bytes,
+            location,
+            method,
+            pause,
         };
         state
             .snapshots
@@ -1115,7 +1331,33 @@ impl Engine for FakeEngine {
     }
 
     async fn delete_volume_snapshot(&self, snap: &VolumeSnapshot) -> Result<(), EngineError> {
-        self.lock().snapshots.remove(&snap.snapshot_id);
+        let mut state = self.lock();
+        if state.snapshots.remove(&snap.snapshot_id).is_some() && state.volume_dir.is_some() {
+            match std::fs::remove_file(&snap.location) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(io_error(err)),
+            }
+        }
         Ok(())
     }
+}
+
+/// The `VolumeInfo` of a fake volume; a record-only volume uses no disk.
+fn volume_info(id: &VolumeId, volume: &FakeVolume) -> VolumeInfo {
+    use std::os::unix::fs::MetadataExt as _;
+    let allocated_bytes = std::fs::metadata(&volume.path)
+        .map(|meta| meta.blocks() * 512)
+        .unwrap_or(0);
+    VolumeInfo {
+        volume_id: id.clone(),
+        size_gb: volume.size_gb,
+        allocated_bytes,
+        path: volume.path.clone(),
+    }
+}
+
+/// A file-system error on a fake volume file.
+fn io_error(err: io::Error) -> EngineError {
+    EngineError::Io(err.to_string())
 }

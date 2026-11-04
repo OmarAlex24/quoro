@@ -98,12 +98,17 @@ fn run() -> Result<i32, Fault> {
     let data_device = found
         .data
         .ok_or_else(|| Fault::new(format!("no {SERIAL_DATA} disk found within 5 s")))?;
+    // Resolve the volume disks before the switch: the device nodes under
+    // `/dev` are carried into the app's root, and a missing volume must fail
+    // the boot rather than leave the app without its data.
+    let volume_devices = disks::wait_for_volumes(&config.volumes)?;
 
     mounts::mount_root(&root_device, &data_device)?;
     diag::log("root: overlay ready");
     mounts::switch_root()?;
     diag::log("root: switched to the overlay");
     mounts::mount_late()?;
+    mounts::mount_volumes(&volume_devices)?;
 
     configure_system(&config)?;
 

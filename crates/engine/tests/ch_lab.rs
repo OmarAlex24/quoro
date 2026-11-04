@@ -36,7 +36,7 @@ use quoro_engine::ch::{ChConfig, ChEngine};
 use quoro_engine::{
     ByteStream, ConsoleMode, Engine, EngineError, EngineEvent, ExecRequest, ImageDigest, ImageRef,
     InitConfig, LineStream, MacAddr, NetAttach, NodeNetwork, OutputLine, OutputStream, SerialMode,
-    StopMode, VmId, VmSpec, VmState, VsockAttach,
+    SnapshotMethod, StopMode, VmId, VmSpec, VmState, VolumeAttach, VolumeId, VsockAttach,
 };
 use tokio::io::AsyncReadExt as _;
 
@@ -831,6 +831,134 @@ async fn guest_reset_is_a_crash() {
 
     engine.delete(&id).await.expect("delete");
     assert_no_leftovers(&id);
+
+    let tools = HostTools::discover().expect("host tools");
+    net::remove_network(&tools, BRIDGE)
+        .await
+        .expect("remove the network");
+}
+
+/// M5a: a volume is created, attached to a running VM and snapshotted with the
+/// probed method, and both survive the VM's delete (§3.16, §3.20).
+#[tokio::test]
+#[ignore = "needs /dev/kvm, root and the pinned artifacts on the lab host"]
+async fn local_volume_snapshot_cycle() {
+    if !enter_lab() {
+        return;
+    }
+    let _guard = Guard::new();
+    let engine = new_engine().await;
+    let rootfs = prepare(&engine).await;
+    let method = engine
+        .capabilities()
+        .await
+        .volume_snapshot_method
+        .expect("the engine has volumes");
+
+    let volume = VolumeId("vol_01HX8Z4Q2M9W7T3YV6B1C0D5EF".to_string());
+    let created = engine.ensure_volume(&volume, 1).await.expect("ensure");
+    assert_eq!(created.size_gb, 1);
+    assert_eq!(
+        std::fs::metadata(&created.path).expect("volume file").len(),
+        1 << 30
+    );
+    let again = engine
+        .ensure_volume(&volume, 1)
+        .await
+        .expect("ensure is idempotent");
+    assert_eq!(again.path, created.path);
+    assert!(
+        matches!(
+            engine.ensure_volume(&volume, 2).await,
+            Err(EngineError::Conflict(_))
+        ),
+        "a different size is a Conflict"
+    );
+    assert!(
+        created.allocated_bytes < 1 << 29,
+        "the volume is sparse: {} bytes",
+        created.allocated_bytes
+    );
+
+    let id = VmId("vm_w5a_volume".to_string());
+    let mut spec = console_spec(&id, &rootfs, "10.77.0.16", "sleep 120", 16);
+    spec.volumes = vec![VolumeAttach {
+        volume_id: volume.clone(),
+        mount_path: "/data".to_string(),
+        serial: "quoro-vol-0".to_string(),
+    }];
+    // A volume mount travels in the v3 guest configuration, which carries the
+    // exec port (§6, M5a).
+    spec.vsock = Some(VsockAttach {
+        cid: 3,
+        socket: vm_dir(&id).join("vsock.sock"),
+    });
+    engine.create(&spec).await.expect("create with a volume");
+    start_vm(&engine, &id).await;
+
+    let snapshot = engine
+        .snapshot_volume(&volume)
+        .await
+        .expect("snapshot a running volume");
+    assert_eq!(snapshot.volume_id, volume);
+    assert_eq!(snapshot.snapshot_id, format!("{}.snapshot", volume.0));
+    assert_eq!(snapshot.method, method);
+    assert_eq!(snapshot.size_bytes, 1 << 30);
+    if method == SnapshotMethod::PauseCopy {
+        assert!(
+            snapshot.pause > Duration::ZERO,
+            "a PauseCopy snapshot of a running VM pauses it"
+        );
+    }
+    assert_eq!(
+        engine.inspect(&id).await.expect("inspect").state,
+        VmState::Running,
+        "the VM is running after the snapshot"
+    );
+    assert!(
+        matches!(
+            engine.snapshot_volume(&volume).await,
+            Err(EngineError::Conflict(_))
+        ),
+        "one snapshot at a time"
+    );
+    use std::os::unix::fs::MetadataExt as _;
+    let allocated = std::fs::metadata(&snapshot.location)
+        .expect("snapshot file")
+        .blocks()
+        * 512;
+    assert!(
+        allocated < 1 << 29,
+        "the snapshot is sparse: {allocated} bytes"
+    );
+
+    engine.stop(&id, StopMode::Force).await.expect("stop");
+    engine.delete(&id).await.expect("delete");
+    assert_no_leftovers(&id);
+    assert!(
+        created.path.exists(),
+        "delete keeps the VM's volumes (§3.9)"
+    );
+
+    engine
+        .delete_volume_snapshot(&snapshot)
+        .await
+        .expect("delete the snapshot");
+    assert!(!snapshot.location.exists(), "the snapshot file is gone");
+    engine
+        .delete_volume_snapshot(&snapshot)
+        .await
+        .expect("deleting a missing snapshot is Ok");
+
+    engine
+        .delete_volume(&volume)
+        .await
+        .expect("delete the volume");
+    assert!(!created.path.exists(), "the volume file is gone");
+    engine
+        .delete_volume(&volume)
+        .await
+        .expect("deleting a missing volume is Ok");
 
     let tools = HostTools::discover().expect("host tools");
     net::remove_network(&tools, BRIDGE)

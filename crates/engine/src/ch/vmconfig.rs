@@ -87,6 +87,14 @@ pub fn guest_config(
         dns: dns.to_vec(),
         stop_timeout_ms: stop_timeout_ms(stop_timeout),
         exec_port: spec.vsock.as_ref().map(|_| quoro_init::EXEC_PORT),
+        volumes: spec
+            .volumes
+            .iter()
+            .map(|volume| quoro_init::VolumeMount {
+                serial: volume.serial.clone(),
+                mount_path: volume.mount_path.clone(),
+            })
+            .collect(),
     };
     config
         .encode()
@@ -262,8 +270,18 @@ pub fn validate_work_disks(spec: &VmSpec) -> Result<(), EngineError> {
 /// `console` follows [`VmSpec::console`] and is independent of `serial`, so a
 /// VM can carry the app's tagged output and a serial socket at once (M4).
 /// `vsock` is attached only when the spec names it (section 3.18).
+///
+/// `volumes_dir` is the directory that holds the volume files: each volume is
+/// attached as a writable virtio-blk disk in the spec's order, after the
+/// engine's own disks and before the work disks (section 3.6, section 3.20).
 #[must_use]
-pub fn vm_create_body(spec: &VmSpec, paths: &VmPaths, boot: &BootFiles<'_>, tap: &str) -> Value {
+pub fn vm_create_body(
+    spec: &VmSpec,
+    paths: &VmPaths,
+    boot: &BootFiles<'_>,
+    tap: &str,
+    volumes_dir: &Path,
+) -> Value {
     let serial = match &spec.serial {
         SerialMode::Socket { path } => json!({"mode": "Socket", "socket": path}),
         SerialMode::File { path } => json!({"mode": "File", "file": path}),
@@ -300,6 +318,18 @@ pub fn vm_create_body(spec: &VmSpec, paths: &VmPaths, boot: &BootFiles<'_>, tap:
             "serial": quoro_init::SERIAL_CONFIG,
         }),
     ];
+    // Volumes come after the engine's own and before the work disks, in the
+    // order the spec lists them (§3.6, §3.20). They are writable and belong to
+    // the app, so `delete` keeps them.
+    for (index, volume) in spec.volumes.iter().enumerate() {
+        disks.push(json!({
+            "id": format!("vol-{index}"),
+            "path": volumes_dir.join(&volume.volume_id.0),
+            "readonly": false,
+            "image_type": "Raw",
+            "serial": volume.serial,
+        }));
+    }
     // Work disks come after the engine's own, in the order the spec lists
     // them (§3.6). They are writable and outlive the VM.
     for (index, disk) in spec.work_disks.iter().enumerate() {
@@ -367,6 +397,7 @@ mod tests {
             volumes: vec![VolumeAttach {
                 volume_id: VolumeId("vol_01HX8Z4Q2M9W7T3YV6B1C0D5EF".to_string()),
                 mount_path: "/data".to_string(),
+                serial: "quoro-vol-0".to_string(),
             }],
             net: NetAttach {
                 ip: "10.42.1.7".parse().expect("ip"),
@@ -407,10 +438,20 @@ mod tests {
         )
     }
 
+    fn volumes_dir() -> PathBuf {
+        PathBuf::from("/var/lib/quoro/volumes")
+    }
+
     #[test]
     fn guest_config_maps_every_field() {
-        let spec = make_spec(ConsoleMode::VirtioConsole {
+        let mut spec = make_spec(ConsoleMode::VirtioConsole {
             socket: PathBuf::from("/run/quoro/vm/console.sock"),
+        });
+        // A volume mount travels in the v3 configuration, which carries the
+        // exec port (§6, M5a).
+        spec.vsock = Some(VsockAttach {
+            cid: 3,
+            socket: PathBuf::from("/var/lib/quoro/vms/vm_01HX8Z4Q2M9W7T3YV6B1C0D5EF/vsock.sock"),
         });
         let config = guest_config(
             &spec,
@@ -455,24 +496,30 @@ mod tests {
             ]
         );
         assert_eq!(config.stop_timeout_ms, 10_000);
+        assert_eq!(config.exec_port, Some(quoro_init::EXEC_PORT));
+        assert_eq!(
+            config.volumes,
+            vec![quoro_init::VolumeMount {
+                serial: "quoro-vol-0".to_string(),
+                mount_path: "/data".to_string(),
+            }]
+        );
         assert!(config.encode().is_ok());
     }
 
     #[test]
     fn guest_config_console_mapping() {
-        let off = guest_config(&make_spec(ConsoleMode::Off), &subnet(), &[], Duration::ZERO)
-            .expect("guest config");
+        let mut plain = make_spec(ConsoleMode::Off);
+        plain.volumes.clear();
+        let off = guest_config(&plain, &subnet(), &[], Duration::ZERO).expect("guest config");
         assert_eq!(off.log_console, quoro_init::LogConsole::None);
 
-        let serial = guest_config(
-            &make_spec(ConsoleMode::Serial {
-                socket: PathBuf::from("/run/quoro/vm/serial.sock"),
-            }),
-            &subnet(),
-            &[],
-            Duration::ZERO,
-        )
-        .expect("guest config");
+        let mut serial_spec = make_spec(ConsoleMode::Serial {
+            socket: PathBuf::from("/run/quoro/vm/serial.sock"),
+        });
+        serial_spec.volumes.clear();
+        let serial =
+            guest_config(&serial_spec, &subnet(), &[], Duration::ZERO).expect("guest config");
         assert_eq!(serial.log_console, quoro_init::LogConsole::Serial);
     }
 
@@ -493,6 +540,7 @@ mod tests {
     #[test]
     fn guest_config_with_only_a_cmd() {
         let mut spec = make_spec(ConsoleMode::Off);
+        spec.volumes.clear();
         spec.init.entrypoint.clear();
         let config = guest_config(&spec, &subnet(), &[], Duration::ZERO).expect("guest config");
         assert_eq!(config.args, vec!["--port".to_string(), "8080".to_string()]);
@@ -567,6 +615,7 @@ mod tests {
                 rootfs: &rootfs,
             },
             "tap0",
+            &volumes_dir(),
         );
 
         assert_eq!(
@@ -599,6 +648,13 @@ mod tests {
                         "image_type": "Raw",
                         "serial": "quoro-config",
                     },
+                    {
+                        "id": "vol-0",
+                        "path": "/var/lib/quoro/volumes/vol_01HX8Z4Q2M9W7T3YV6B1C0D5EF",
+                        "readonly": false,
+                        "image_type": "Raw",
+                        "serial": "quoro-vol-0",
+                    },
                 ],
                 "net": [{"id": "net0", "tap": "tap0", "mac": "02:00:00:00:00:01"}],
                 "serial": {
@@ -627,6 +683,7 @@ mod tests {
                 rootfs: &rootfs,
             },
             "tap7",
+            &volumes_dir(),
         );
         assert_eq!(
             body["serial"],
@@ -652,6 +709,7 @@ mod tests {
                 rootfs: &rootfs,
             },
             "tap1",
+            &volumes_dir(),
         );
         assert_eq!(
             body["console"],
@@ -684,7 +742,7 @@ mod tests {
         spec.serial = SerialMode::Socket {
             path: PathBuf::from("/run/quoro/vm/serial.sock"),
         };
-        let body = vm_create_body(&spec, &paths, &boot, "tap0");
+        let body = vm_create_body(&spec, &paths, &boot, "tap0", &volumes_dir());
         assert_eq!(
             body["serial"],
             serde_json::json!({"mode": "Socket", "socket": "/run/quoro/vm/serial.sock"})
@@ -698,7 +756,7 @@ mod tests {
         spec.serial = SerialMode::File {
             path: PathBuf::from("/var/log/quoro/serial.log"),
         };
-        let body = vm_create_body(&spec, &paths, &boot, "tap0");
+        let body = vm_create_body(&spec, &paths, &boot, "tap0", &volumes_dir());
         assert_eq!(
             body["serial"],
             serde_json::json!({"mode": "File", "file": "/var/log/quoro/serial.log"})
@@ -707,7 +765,7 @@ mod tests {
         // An explicit `Off` keeps the pre-M4 `serial.log` (see the note on
         // `vm_create_body`), and so does the superseded serial console.
         spec.serial = SerialMode::Off;
-        let body = vm_create_body(&spec, &paths, &boot, "tap0");
+        let body = vm_create_body(&spec, &paths, &boot, "tap0", &volumes_dir());
         assert_eq!(
             body["serial"],
             serde_json::json!({
@@ -728,7 +786,7 @@ mod tests {
             rootfs: &rootfs,
         };
         assert!(
-            vm_create_body(&spec, &paths, &boot, "tap0")
+            vm_create_body(&spec, &paths, &boot, "tap0", &volumes_dir())
                 .get("vsock")
                 .is_none(),
             "no vsock key without a device"
@@ -738,7 +796,7 @@ mod tests {
             cid: 3,
             socket: PathBuf::from("/var/lib/quoro/vms/vm_01HX8Z4Q2M9W7T3YV6B1C0D5EF/vsock.sock"),
         });
-        let body = vm_create_body(&spec, &paths, &boot, "tap0");
+        let body = vm_create_body(&spec, &paths, &boot, "tap0", &volumes_dir());
         assert_eq!(
             body["vsock"],
             serde_json::json!({
@@ -807,6 +865,7 @@ mod tests {
                 rootfs: &rootfs,
             },
             "tap2",
+            &volumes_dir(),
         );
         let disks = body["disks"].as_array().expect("disks");
         let ids: Vec<&str> = disks
@@ -815,16 +874,73 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec!["root", "data", "config", "work-0", "work-1", "work-2"]
+            vec![
+                "root", "data", "config", "vol-0", "work-0", "work-1", "work-2"
+            ]
         );
         for (index, disk) in spec.work_disks.iter().enumerate() {
-            let entry = &disks[index + 3];
+            let entry = &disks[index + 4];
             assert_eq!(entry["path"], serde_json::json!(disk.path));
             assert_eq!(entry["serial"], serde_json::json!(disk.serial));
             assert_eq!(entry["image_type"], "Raw");
             assert!(entry.get("readonly").is_none(), "a work disk is writable");
         }
         assert_eq!(disks[0]["readonly"], true);
+    }
+
+    #[test]
+    fn create_body_attaches_volumes_before_work_disks() {
+        let mut spec = make_spec(ConsoleMode::Off);
+        spec.volumes = vec![
+            VolumeAttach {
+                volume_id: VolumeId("vol_01HX8Z4Q2M9W7T3YV6B1C0D5EF".to_string()),
+                mount_path: "/data".to_string(),
+                serial: "quoro-vol-0".to_string(),
+            },
+            VolumeAttach {
+                volume_id: VolumeId("vol_01HX8Z4Q2M9W7T3YV6B1C0D5EG".to_string()),
+                mount_path: "/more".to_string(),
+                serial: "quoro-vol-1".to_string(),
+            },
+        ];
+        spec.work_disks = vec![work_disk("/var/lib/quoro/work/work.img", 1, "quoro-work")];
+        let paths = paths();
+        let (kernel, initramfs, rootfs) = boot();
+        let body = vm_create_body(
+            &spec,
+            &paths,
+            &BootFiles {
+                kernel: &kernel,
+                initramfs: &initramfs,
+                rootfs: &rootfs,
+            },
+            "tap0",
+            &volumes_dir(),
+        );
+        let disks = body["disks"].as_array().expect("disks");
+        let ids: Vec<&str> = disks
+            .iter()
+            .map(|disk| disk["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["root", "data", "config", "vol-0", "vol-1", "work-0"]
+        );
+        assert_eq!(
+            disks[3],
+            serde_json::json!({
+                "id": "vol-0",
+                "path": "/var/lib/quoro/volumes/vol_01HX8Z4Q2M9W7T3YV6B1C0D5EF",
+                "readonly": false,
+                "image_type": "Raw",
+                "serial": "quoro-vol-0",
+            })
+        );
+        assert_eq!(
+            disks[4]["path"],
+            "/var/lib/quoro/volumes/vol_01HX8Z4Q2M9W7T3YV6B1C0D5EG"
+        );
+        assert_eq!(disks[4]["serial"], "quoro-vol-1");
     }
 
     #[test]
