@@ -114,7 +114,8 @@ jobs:
           tar xzf "$RUNNER_TEMP/mdbook.tar.gz" -C "$RUNNER_TEMP/mdbook"
           "$RUNNER_TEMP/mdbook/mdbook" --version
       # Builds docs/ as it is (docs/book.toml) into target/book. Nothing is
-      # published from here.
+      # published from here; docs-site.yml publishes the site on a release and
+      # pins the same mdBook, so keep the two pins in sync.
       - name: Build the book
         run: '"$RUNNER_TEMP/mdbook/mdbook" build docs'
       # mdBook has no built-in link checker: every Markdown file must be in

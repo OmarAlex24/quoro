@@ -28,4 +28,6 @@ milestone delivers before you rely on it.
   [architecture decision record](adr/README.md).
 
 This documentation is built from the Markdown in the repository's `docs/`
-directory with [mdBook](https://rust-lang.github.io/mdBook/).
+directory with [mdBook](https://rust-lang.github.io/mdBook/). The site at
+[quoro.dev](https://quoro.dev) is published from GitHub Pages each time a
+release is published, so it matches the latest release, not the `main` branch.

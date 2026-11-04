@@ -1,0 +1,89 @@
+# Publishes the documentation site (ADR 0109, ADR 0130): the mdBook book built
+# from docs/ is deployed to GitHub Pages and served at quoro.dev.
+#
+# It runs when the maintainer publishes a release (release.yml only creates a
+# draft), never on push, so the site always matches a released tag. A
+# "published" event also fires for a prerelease, which is intended: v0.1.0 is
+# a preview.
+#
+# Workflow dispatch redeploys the site by hand. Pick the release tag in "Use
+# workflow from"; a run from a branch fails before it builds anything.
+name: Docs site
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions: {}
+
+# One Pages deployment at a time, and a running one is never cancelled half way.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build and deploy the docs site
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    env:
+      # Keep in sync with the docs job in ci.yml: the site is built with the
+      # same mdBook that CI checks. Pinned by version and by the sha256 of the
+      # release tarball, so a replaced or truncated download fails the check
+      # instead of running. mdBook reads MDBOOK_* variables as configuration,
+      # so the pins use another prefix.
+      PINNED_MDBOOK_VERSION: v0.5.4
+      PINNED_MDBOOK_SHA256: 5222beabd3e37dc5be0d18ff99b79058469354db5c220153a1b92db5ba12be89
+    steps:
+      # A release event runs on the release's tag ref; a manual run must be
+      # started from a release tag too.
+      - name: Require a release tag
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REF" in
+            refs/tags/v[0-9]*) echo "Building the site from $GITHUB_REF" ;;
+            *) echo "::error::run this workflow from a release tag, not $GITHUB_REF"; exit 1 ;;
+          esac
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install mdBook
+        run: |
+          set -euo pipefail
+          curl -fsSL --proto '=https' --tlsv1.2 -o "$RUNNER_TEMP/mdbook.tar.gz" \
+            "https://github.com/rust-lang/mdBook/releases/download/$PINNED_MDBOOK_VERSION/mdbook-$PINNED_MDBOOK_VERSION-x86_64-unknown-linux-musl.tar.gz"
+          echo "$PINNED_MDBOOK_SHA256  $RUNNER_TEMP/mdbook.tar.gz" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/mdbook"
+          tar xzf "$RUNNER_TEMP/mdbook.tar.gz" -C "$RUNNER_TEMP/mdbook"
+          "$RUNNER_TEMP/mdbook/mdbook" --version
+      # Builds docs/ (docs/book.toml) into target/book.
+      - name: Build the book
+        run: '"$RUNNER_TEMP/mdbook/mdbook" build docs'
+      # The same chapter and link checks as CI, so a broken site is not
+      # published.
+      - name: Chapters and links
+        run: python3 -I scripts/check_docs_site.py
+      # The custom domain itself is set in the repository's Pages settings; a
+      # deployment from Actions does not read this file. It is kept in the
+      # output so the site records its domain (ADR 0130).
+      - name: Custom domain
+        run: printf 'quoro.dev\n' > target/book/CNAME
+      - name: Configure Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      # Dotfiles are left out of the artifact; the site has none it needs
+      # (Pages deployed from Actions does not run Jekyll).
+      - name: Upload the site
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: target/book
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
