@@ -198,7 +198,7 @@ impl AppState {
         // `primary_restarted` before the listener opens.
         interactive::close_orphans(&state).await?;
         sweeper::spawn(state.clone());
-        dispatcher::spawn(state.clone());
+        dispatcher::start(state.clone()).await?;
         Ok(state)
     }
 

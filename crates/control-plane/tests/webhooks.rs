@@ -8,14 +8,15 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::any;
-use common::{Server, problem, start};
+use common::{Server, problem, start, start_in};
 use hmac::{Hmac, Mac};
 use quoro_control_plane::changelog::Actor;
 use quoro_control_plane::events::{self, NewEvent, Source, StoredEvent};
-use quoro_control_plane::store::now_rfc3339;
+use quoro_control_plane::store::{Store, now_rfc3339, random_secret, rfc3339_in};
 use serde_json::{Value, json};
 use sha2::Sha256;
 use sqlx::Row;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
@@ -221,6 +222,96 @@ async fn emit_app_event(server: &Server, app_id: &str, kind: &'static str) -> St
     id
 }
 
+/// A fresh data directory that survives one control-plane process, for the
+/// restart tests.
+fn temp_data_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("quoro-test-{}", &random_secret()[..16]));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Commits an event straight into the database of a stopped control plane.
+async fn commit_event(data_dir: &Path, app_id: &str, kind: &'static str) -> String {
+    let store = Store::open(&data_dir.join("quoro.db")).await.unwrap();
+    let mut w = store.begin_write().await.unwrap();
+    let id = events::emit(
+        &mut w.tx,
+        NewEvent {
+            kind,
+            source: Source::ControlPlane,
+            subject_type: "app",
+            subject_id: app_id,
+            project_id: None,
+            request_id: None,
+            actor: None,
+            data: json!({ "app_id": app_id }),
+        },
+    )
+    .await
+    .unwrap();
+    w.commit().await.unwrap();
+    drop(store);
+    id
+}
+
+/// The `Quoro-Event-Id` of a captured delivery.
+fn captured_event_id(request: &Captured) -> String {
+    request
+        .headers
+        .get("quoro-event-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+/// The durable dispatcher cursor, from `meta`.
+async fn webhook_cursor(server: &Server) -> i64 {
+    let (value,): (String,) = sqlx::query_as("SELECT value FROM meta WHERE key = 'webhook_cursor'")
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+    value.parse().unwrap()
+}
+
+/// The seq of one event in a running control plane.
+async fn event_seq(server: &Server, event_id: &str) -> i64 {
+    let (seq,): (i64,) = sqlx::query_as("SELECT seq FROM events WHERE id = ?")
+        .bind(event_id)
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+    seq
+}
+
+/// Runs one stand-alone control-plane process on its own runtime and stops it
+/// completely before returning.
+///
+/// `AppState::open` spawns the dispatcher and sweeper with `tokio::spawn`, so
+/// dropping the state leaves them running. Their own runtime owns them: shutting
+/// it down stops every task of that process. It runs on a separate thread
+/// because a test runtime cannot host a second one.
+fn run_process<T, F, Fut>(f: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T>,
+{
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let out = runtime.block_on(f());
+        runtime.shutdown_timeout(Duration::from_secs(5));
+        // Let the stopped process release its database connections.
+        std::thread::sleep(Duration::from_millis(100));
+        out
+    })
+    .join()
+    .unwrap()
+}
+
 /// Waits until `check` returns `Some`, or panics after thirty seconds; returns
 /// as soon as the condition holds.
 async fn wait_for<T, F, Fut>(mut check: F) -> T
@@ -266,12 +357,11 @@ async fn delivery_count(server: &Server, webhook_id: &str) -> i64 {
 
 /// Waits until the dispatcher has read its start-up cursor.
 ///
-/// `dispatcher::spawn` starts at the newest event in the log, so an event
-/// emitted before that read finishes is never dispatched: a test that emits an
-/// event and then waits for its delivery races the dispatcher's start-up on a
-/// slow runner. A probe webhook makes the read observable: a probe emitted
-/// before it is lost for good, and the next probe is not, so probe until a
-/// delivery arrives. The dispatcher's own tick interval is the only clock here.
+/// The first start seeds the durable cursor at the end of the event log, so an
+/// event emitted before start-up finishes is never dispatched. Probes emitted
+/// before the cursor is persisted are lost for good; the next probe is not, so
+/// probe until a delivery arrives. The dispatcher's own tick interval is the
+/// only clock here.
 async fn dispatcher_ready(owner: &reqwest::Client, server: &Server, app_id: &str) {
     let (recorder, url) = start_receiver(200).await;
     create_webhook(
@@ -1293,4 +1383,233 @@ async fn test_delivery_without_an_event_is_refused() {
     )
     .await;
     assert_eq!((status, code.as_str()), (422, "validation_failed"));
+}
+
+/// D-0140: an event committed while no dispatcher runs is still delivered after
+/// the primary restarts, because the cursor it resumes from is durable.
+#[tokio::test]
+async fn a_restart_between_commit_and_dispatch_still_delivers() {
+    let (recorder, url) = start_receiver(200).await;
+    let data_dir = temp_data_dir();
+
+    // Process 1: owner, project, app and webhook, then stop it completely.
+    let app_id = run_process({
+        let data_dir = data_dir.clone();
+        move || async move {
+            let server = start_in(data_dir).await;
+            let owner = server.owner().await;
+            let project_id = create_project(&owner, &server, "site").await;
+            let app_id = create_app(&owner, &server, &project_id).await;
+            create_webhook(
+                &owner,
+                &server,
+                json!({
+                    "name": "receiver",
+                    "url": url,
+                    "event_types": ["app.up"],
+                    "selector": { "apps": [app_id] },
+                }),
+            )
+            .await;
+            // `AppState::open` awaited the first start, which persists the seed.
+            assert!(webhook_cursor(&server).await >= 0);
+            app_id
+        }
+    });
+
+    // No dispatcher is alive: commit the event straight into the database.
+    let event_id = commit_event(&data_dir, &app_id, "app.up").await;
+
+    // Process 2 resumes after the persisted cursor, not at the end of the log.
+    let server = start_in(data_dir.clone()).await;
+    let captured = wait_for(|| async {
+        let captured = recorder.requests().await;
+        captured
+            .iter()
+            .any(|request| captured_event_id(request) == event_id)
+            .then_some(captured)
+    })
+    .await;
+    assert!(
+        captured
+            .iter()
+            .all(|request| captured_event_id(request) == event_id),
+        "only the committed event is delivered"
+    );
+
+    let seq = event_seq(&server, &event_id).await;
+    wait_for(|| async { (webhook_cursor(&server).await >= seq).then_some(()) }).await;
+}
+
+/// D-0140: a first attempt recorded before a stop but never sent is sent after
+/// the restart, with the attempt already in the log.
+#[tokio::test]
+async fn an_orphaned_first_attempt_is_sent_after_a_restart() {
+    let (recorder, url) = start_receiver(200).await;
+    let data_dir = temp_data_dir();
+
+    let (app_id, webhook_id) = run_process({
+        let data_dir = data_dir.clone();
+        move || async move {
+            let server = start_in(data_dir).await;
+            let owner = server.owner().await;
+            let project_id = create_project(&owner, &server, "site").await;
+            let app_id = create_app(&owner, &server, &project_id).await;
+            let (created, _secret) = create_webhook(
+                &owner,
+                &server,
+                json!({
+                    "name": "receiver",
+                    "url": url,
+                    "event_types": ["app.up"],
+                    "selector": { "apps": [app_id] },
+                }),
+            )
+            .await;
+            let webhook_id = created["id"].as_str().unwrap().to_string();
+            (app_id, webhook_id)
+        }
+    });
+
+    let event_id = commit_event(&data_dir, &app_id, "app.up").await;
+    let store = Store::open(&data_dir.join("quoro.db")).await.unwrap();
+    let seq: i64 = sqlx::query_scalar("SELECT seq FROM events WHERE id = ?")
+        .bind(&event_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    // The crash shape: the attempt row and the advanced cursor committed, the
+    // send did not happen.
+    let delivery_id = quoro_types::new_id(quoro_types::Prefix::WebhookDelivery);
+    let mut w = store.begin_write().await.unwrap();
+    sqlx::query(
+        "INSERT INTO webhook_deliveries (id, webhook_id, event_id, attempt, status, response_code, error, next_attempt_at, created_at, test) \
+         VALUES (?, ?, ?, 1, 'pending', NULL, NULL, NULL, ?, 0)",
+    )
+    .bind(&delivery_id)
+    .bind(&webhook_id)
+    .bind(&event_id)
+    .bind(now_rfc3339())
+    .execute(&mut *w.tx)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO meta (key, value) VALUES ('webhook_cursor', ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(seq.to_string())
+    .execute(&mut *w.tx)
+    .await
+    .unwrap();
+    w.commit().await.unwrap();
+    drop(store);
+
+    let server = start_in(data_dir.clone()).await;
+    wait_for(|| async {
+        let captured = recorder.requests().await;
+        captured
+            .iter()
+            .any(|request| captured_event_id(request) == event_id)
+            .then_some(())
+    })
+    .await;
+    wait_for(|| async {
+        let row = sqlx::query("SELECT status FROM webhook_deliveries WHERE id = ?")
+            .bind(&delivery_id)
+            .fetch_optional(server.state.store.pool())
+            .await
+            .unwrap()?;
+        (row.get::<String, _>("status") == "delivered").then_some(())
+    })
+    .await;
+}
+
+/// D-0140: catch-up is bounded. An event older than the window is skipped with
+/// a `dispatcher.gap` log line and the cursor moves past it; a fresh event is
+/// still delivered.
+#[tokio::test]
+async fn events_older_than_the_catch_up_window_are_skipped() {
+    let (recorder, url) = start_receiver(200).await;
+    let data_dir = temp_data_dir();
+
+    let app_id = run_process({
+        let data_dir = data_dir.clone();
+        move || async move {
+            let server = start_in(data_dir).await;
+            let owner = server.owner().await;
+            let project_id = create_project(&owner, &server, "site").await;
+            let app_id = create_app(&owner, &server, &project_id).await;
+            create_webhook(
+                &owner,
+                &server,
+                json!({
+                    "name": "receiver",
+                    "url": url,
+                    "event_types": ["app.up"],
+                    "selector": { "apps": [app_id] },
+                }),
+            )
+            .await;
+            app_id
+        }
+    });
+
+    let store = Store::open(&data_dir.join("quoro.db")).await.unwrap();
+    let old_id = quoro_types::new_id(quoro_types::Prefix::Event);
+    let old_time = rfc3339_in(-25 * 3600);
+    let mut w = store.begin_write().await.unwrap();
+    events::insert(
+        &mut w.tx,
+        StoredEvent {
+            id: &old_id,
+            time: &old_time,
+            kind: "app.up",
+            source: json!({ "kind": "control_plane" }),
+            subject: json!({ "type": "app", "id": app_id }),
+            project_id: None,
+            incident_id: None,
+            request_id: None,
+            actor: None,
+            data: json!({ "app_id": app_id }),
+            change_actor: Actor::system("tests"),
+        },
+    )
+    .await
+    .unwrap();
+    let fresh_id = events::emit(
+        &mut w.tx,
+        NewEvent {
+            kind: "app.up",
+            source: Source::ControlPlane,
+            subject_type: "app",
+            subject_id: &app_id,
+            project_id: None,
+            request_id: None,
+            actor: None,
+            data: json!({ "app_id": app_id }),
+        },
+    )
+    .await
+    .unwrap();
+    w.commit().await.unwrap();
+    drop(store);
+
+    let server = start_in(data_dir.clone()).await;
+    let captured = wait_for(|| async {
+        let captured = recorder.requests().await;
+        captured
+            .iter()
+            .any(|request| captured_event_id(request) == fresh_id)
+            .then_some(captured)
+    })
+    .await;
+    assert!(
+        captured
+            .iter()
+            .all(|request| captured_event_id(request) != old_id),
+        "an event older than the catch-up window is not delivered"
+    );
+
+    let fresh_seq = event_seq(&server, &fresh_id).await;
+    wait_for(|| async { (webhook_cursor(&server).await >= fresh_seq).then_some(()) }).await;
 }

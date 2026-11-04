@@ -106,6 +106,17 @@ pub async fn start() -> Server {
     start_inner(200, 800, None).await
 }
 
+/// Starts a control plane on an existing data directory, reusing its key
+/// material.
+///
+/// The restart tests stop one process and start another on the same directory.
+/// The data-encryption key must outlive the process, as `keys/data.key` does in
+/// production: a fresh key would leave stored webhook secrets undecryptable.
+pub async fn start_in(data_dir: PathBuf) -> Server {
+    let data_key = Arc::new(DataKey::load_or_create(&data_dir).unwrap());
+    start_at(data_dir, 200, 800, None, data_key).await
+}
+
 /// Starts a control plane whose node sessions outlive the time a test spends
 /// talking to the API between frames: the heartbeat interval stays at 200 ms
 /// (the node-session tests assert it in `welcome`) but a node that sends
@@ -132,10 +143,27 @@ async fn start_inner(
     session_timeout_ms: u64,
     cloudflare: Option<(String, String)>,
 ) -> Server {
+    let data_dir = std::env::temp_dir().join(format!("quoro-test-{}", &random_secret()[..16]));
+    start_at(
+        data_dir,
+        heartbeat_interval_ms,
+        session_timeout_ms,
+        cloudflare,
+        Arc::new(DataKey::ephemeral()),
+    )
+    .await
+}
+
+async fn start_at(
+    data_dir: PathBuf,
+    heartbeat_interval_ms: u64,
+    session_timeout_ms: u64,
+    cloudflare: Option<(String, String)>,
+    data_key: Arc<DataKey>,
+) -> Server {
     // reqwest may carry the binary's no-provider rustls feature in a workspace
     // build; an earlier test having installed it already is fine.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let data_dir = std::env::temp_dir().join(format!("quoro-test-{}", &random_secret()[..16]));
     std::fs::create_dir_all(&data_dir).unwrap();
     let store = Store::open(&data_dir.join("quoro.db")).await.unwrap();
     let mut state = AppState::open(
@@ -153,7 +181,7 @@ async fn start_inner(
             session_timeout_ms,
         },
         Arc::new(ReferenceAsDigest),
-        Arc::new(DataKey::ephemeral()),
+        data_key,
     )
     .await
     .unwrap();
