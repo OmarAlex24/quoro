@@ -8008,9 +8008,10 @@ paths:
         `GET /api/v1/interactive-sessions/{session_id}/ws?ticket=...` with it.
         Every session ends with a `session.end` audit record, and its timed
         transcript stays on the node (ADR 0115). `conflict` (409) when the
-        app has no running instance; `node_unreachable` (504) when the node is
-        not connected; a VM started before the M4 guest init answers `conflict`
-        until it restarts.
+        app has no running instance, and when its VM was created before M4
+        and has no vsock device: a restart keeps a VM's devices, so only a
+        redeploy, which creates a new VM, enables the terminal (ADR 0136);
+        `node_unreachable` (504) when the node is not connected.
       x-quoro-scope: app:terminal
       parameters:
         - $ref: '#/components/parameters/AppId'
@@ -8061,7 +8062,11 @@ paths:
         grantable to agents (ADR 0114). This call is the audited open; the
         session ends with a `session.end` record and has no transcript
         (audit-log-format.md section 3.3). The answer is a single-use ticket
-        valid for 30 seconds. `node_unreachable` (504) when the node is not
+        valid for 30 seconds. `conflict` (409) when the node cannot serve the
+        session: its node does not have the VM, or the VM was created
+        before M4 and its serial port is not a socket; a restart keeps
+        a VM's devices, so only a redeploy, which creates a new VM, enables the
+        console (ADR 0136). `node_unreachable` (504) when the node is not
         connected. `Quoro-Justification` is required when the caller is an
         agent (ADR 0031).
       x-quoro-scope: vm:console
@@ -8092,6 +8097,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '422':
           $ref: '#/components/responses/ValidationFailed'
         '429':
