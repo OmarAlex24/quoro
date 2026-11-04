@@ -8,7 +8,9 @@ binary by `rust-embed`, so the panel's bytes are release bytes too. The release
 is signed with GitHub artifact attestations (Sigstore, SLSA build provenance)
 and the build is byte-for-byte reproducible on any x86_64 Linux host with
 podman or docker (ADR 0027). A tag push creates a **draft** release; the
-maintainer publishes it.
+maintainer publishes it. Publishing the release also builds the documentation
+site from the release tag and deploys it to GitHub Pages at quoro.dev
+(`.github/workflows/docs-site.yml`, ADR 0130).
 
 ## Artifact layout
 
