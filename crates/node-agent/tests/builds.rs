@@ -333,6 +333,64 @@ async fn a_failure_carries_the_failed_step() {
 }
 
 #[tokio::test]
+async fn a_failed_build_the_primary_keeps_stays_failed_with_its_log() {
+    let builder = FakeBuilder::new();
+    builder.script(
+        BUILD,
+        FakeOutcome::Fail {
+            phase: BuildPhase::Building,
+            error: "exit code: 1".to_owned(),
+            step: None,
+        },
+    );
+    let harness = Harness::new(builder).await;
+    harness.publish(1, vec![spec_build(BUILD, APP)]);
+    harness.wait_status(BUILD, BuildState::Failed).await;
+
+    // The primary keeps the failed build of an app with no VM in the
+    // snapshot, marked cancelled, so the node keeps its log and cache.
+    let mut kept = spec_build(BUILD, APP);
+    kept.cancelled = true;
+    harness.publish(2, vec![kept]);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let row = harness.store.build(BUILD).await.unwrap().unwrap();
+    assert_eq!(
+        row.status,
+        BuildState::Failed,
+        "the failure is not rewritten"
+    );
+    assert_eq!(harness.builder.build_count(), 1, "it never runs again");
+    assert!(harness.builder.cache_removals().is_empty());
+    let logs = BuildLogs::new(harness.dir.path().join("builds").join("logs"));
+    assert!(logs.exists(APP, BUILD));
+    assert!(
+        !harness
+            .handle
+            .query(BUILD, 0, 1_000)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let status = harness.wait_status(BUILD, BuildState::Failed).await;
+    assert_eq!(status.failed_phase, Some(BuildPhase::Building));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_kept_build_the_node_has_no_row_for_never_runs() {
+    let harness = Harness::new(FakeBuilder::new()).await;
+    let mut kept = spec_build(BUILD, APP);
+    kept.cancelled = true;
+    harness.publish(1, vec![kept]);
+
+    let status = harness.wait_status(BUILD, BuildState::Cancelled).await;
+    assert!(status.started_at.is_none(), "it never left queued");
+    assert_eq!(harness.builder.build_count(), 0);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_running_build_stops_when_the_primary_cancels_it() {
     let builder = FakeBuilder::new();
     builder.script(BUILD, FakeOutcome::Hang);
