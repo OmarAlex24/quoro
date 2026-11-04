@@ -234,6 +234,16 @@ pub async fn build_spec(
 /// snapshot of its source, with the plaintext values of the app's environment
 /// variables the source names as BuildKit secrets (section 5.11, 6.6).
 ///
+/// It also keeps the newest build of an app when that build ran on this node
+/// and ended `failed` or `cancelled`. The node keeps an app's build log and
+/// cache disk only while the app appears in `spec.vms` or `spec.builds`
+/// (section 6.6), and a Git app whose build failed has no VM yet: without the
+/// entry, the log of the failure would be deleted as soon as the build left
+/// the snapshot. The kept entry is marked `cancelled` and carries no secrets,
+/// so the node never runs it again, even if it lost its row; a report about
+/// it changes nothing, because the build is already terminal. It leaves the
+/// snapshot when a newer build of the app starts, or when the app is deleted.
+///
 /// A secret name that is not an environment variable of the app is left out:
 /// `startBuild` already fails such a build in `preparing`, and this is the
 /// defensive path if the variable is removed later.
@@ -244,9 +254,15 @@ async fn build_specs(
     env_cache: &mut HashMap<String, BTreeMap<String, String>>,
 ) -> Result<Vec<SpecBuild>, String> {
     let rows = sqlx::query(
-        "SELECT b.id, b.app_id, a.project_id, b.source, b.error FROM builds b \
-         JOIN apps a ON a.id = b.app_id \
-         WHERE b.node_id = ? AND b.status NOT IN ('succeeded', 'failed', 'cancelled') \
+        "SELECT b.id, b.app_id, a.project_id, b.source, b.error, \
+                b.status IN ('failed', 'cancelled') AS kept \
+         FROM builds b JOIN apps a ON a.id = b.app_id \
+         WHERE b.node_id = ? AND ( \
+             b.status NOT IN ('succeeded', 'failed', 'cancelled') \
+             OR (b.status IN ('failed', 'cancelled') AND b.id = ( \
+                 SELECT n.id FROM builds n \
+                 WHERE n.app_id = b.app_id AND n.started_at IS NOT NULL \
+                 ORDER BY n.id DESC LIMIT 1))) \
          ORDER BY b.id",
     )
     .bind(node_id)
@@ -261,11 +277,14 @@ async fn build_specs(
         let project_id: String = row.try_get("project_id").map_err(|e| e.to_string())?;
         let source: String = row.try_get("source").map_err(|e| e.to_string())?;
         let error: Option<String> = row.try_get("error").map_err(|e| e.to_string())?;
+        let kept: bool = row.try_get("kept").map_err(|e| e.to_string())?;
         let source: AppSource = serde_json::from_str(&source)
             .map_err(|e| format!("the source snapshot of {build_id} is invalid: {e}"))?;
         let env = app_env_of(conn, data_key, &app_id, env_cache).await?;
         let mut secrets = BTreeMap::new();
-        for name in &source.secrets {
+        // A kept terminal build never runs again: it needs no secrets.
+        let names: &[String] = if kept { &[] } else { &source.secrets };
+        for name in names {
             match env.get(name) {
                 Some(value) => {
                     secrets.insert(name.clone(), value.clone());
@@ -296,7 +315,7 @@ async fn build_specs(
                 .collect(),
             secrets,
             limits: BuildLimits::default(),
-            cancelled: error.as_deref() == Some(crate::build::CANCEL_REQUESTED),
+            cancelled: kept || error.as_deref() == Some(crate::build::CANCEL_REQUESTED),
         });
     }
     Ok(builds)

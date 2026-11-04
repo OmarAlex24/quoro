@@ -179,6 +179,27 @@ async fn recv_build_snapshot(socket: &mut Socket, build_id: &str) -> Value {
 }
 
 /// A `status_report` that only carries build statuses.
+/// The ids of a snapshot's `spec.builds`, in order.
+fn spec_build_ids(snapshot: &Value) -> Vec<String> {
+    snapshot["body"]["spec"]["builds"]
+        .as_array()
+        .map(|builds| {
+            builds
+                .iter()
+                .map(|build| build["build_id"].as_str().unwrap().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `spec.builds` entry of `build_id` in a snapshot.
+fn spec_build<'a>(snapshot: &'a Value, build_id: &str) -> &'a Value {
+    snapshot["body"]["spec"]["builds"]
+        .as_array()
+        .and_then(|builds| builds.iter().find(|build| build["build_id"] == build_id))
+        .unwrap_or_else(|| panic!("{build_id} is not in {snapshot}"))
+}
+
 fn report(builds: Vec<BuildStatus>) -> NodeMessage {
     NodeMessage::StatusReport(StatusReport {
         applied_rev: 0,
@@ -782,6 +803,24 @@ async fn a_failed_build_keeps_its_step_and_a_cancel_is_durable() {
     let data = event_data(&server, "build.failed").await;
     assert_eq!(data["phase"], "building");
     assert_eq!(data["failed_step"]["vertex"], 6);
+    // The failed build stays in the node's list, so the node keeps its log
+    // while the app has no VM: marked cancelled and without secrets, so it
+    // never runs again.
+    let snapshot = loop {
+        let snapshot = recv_build_snapshot(&mut socket, &build_id).await;
+        if spec_build(&snapshot, &build_id)["cancelled"] == true {
+            break snapshot;
+        }
+    };
+    assert_eq!(spec_build_ids(&snapshot), vec![build_id.clone()]);
+    let kept = spec_build(&snapshot, &build_id);
+    assert_eq!(kept["cancelled"], true, "{snapshot}");
+    assert!(
+        kept["secrets"]
+            .as_object()
+            .is_none_or(serde_json::Map::is_empty),
+        "{snapshot}"
+    );
 
     // A report that arrives after the terminal status changes nothing.
     send(
@@ -820,7 +859,7 @@ async fn a_failed_build_keeps_its_step_and_a_cancel_is_durable() {
     )
     .await;
     assert_eq!((status, code.as_str()), (409, "conflict"));
-    // The old build log is not on any node now.
+    // The build log is on the node, which is gone.
     let (status, code, _) = problem(
         owner
             .get(server.url(&format!("/api/v1/builds/{build_id}/logs")))
@@ -837,7 +876,10 @@ async fn a_failed_build_keeps_its_step_and_a_cancel_is_durable() {
     let queued_id = queued["id"].as_str().unwrap().to_string();
     // The snapshot that carries the queued build to the node.
     let snapshot = recv_type(&mut socket, "desired_state").await;
-    assert_eq!(snapshot["body"]["spec"]["builds"][0]["build_id"], queued_id);
+    assert_eq!(
+        spec_build_ids(&snapshot),
+        vec![build_id.clone(), queued_id.clone()]
+    );
     let res = owner
         .post(server.url(&format!("/api/v1/builds/{queued_id}/cancel")))
         .send()
@@ -848,11 +890,12 @@ async fn a_failed_build_keeps_its_step_and_a_cancel_is_durable() {
     assert_eq!(cancelled["status"], "cancelled");
     assert!(cancelled["finished_at"].is_string());
     assert!(event_data(&server, "build.cancelled").await["build_id"] == queued_id);
+    // A build cancelled before the node started it has no log to keep: the
+    // node's list is back to the kept failed build.
     let snapshot = recv_type(&mut socket, "desired_state").await;
-    assert!(
-        snapshot["body"]["spec"]["builds"]
-            .as_array()
-            .is_none_or(Vec::is_empty),
+    assert_eq!(
+        spec_build_ids(&snapshot),
+        vec![build_id.clone()],
         "{snapshot}"
     );
     // A second cancel of a cancelled build is idempotent.
@@ -869,14 +912,23 @@ async fn a_failed_build_keeps_its_step_and_a_cancel_is_durable() {
     let running_id = running["id"].as_str().unwrap().to_string();
     let snapshot = recv_type(&mut socket, "desired_state").await;
     assert_eq!(
-        snapshot["body"]["spec"]["builds"][0]["build_id"],
-        running_id
+        spec_build_ids(&snapshot),
+        vec![build_id.clone(), running_id.clone()]
     );
+    assert_eq!(spec_build(&snapshot, &running_id)["cancelled"], false);
     send(
         &mut socket,
         report(vec![build_status(&running_id, BuildState::Building)]),
     )
     .await;
+    // Once the newer build started, the failed one is no longer kept.
+    let snapshot = loop {
+        let snapshot = recv_type(&mut socket, "desired_state").await;
+        if spec_build_ids(&snapshot) == vec![running_id.clone()] {
+            break snapshot;
+        }
+    };
+    assert_eq!(spec_build(&snapshot, &running_id)["cancelled"], false);
     let res = owner
         .post(server.url(&format!("/api/v1/builds/{running_id}/cancel")))
         .send()
@@ -923,21 +975,24 @@ async fn a_failed_build_keeps_its_step_and_a_cancel_is_durable() {
     .await;
     let build = wait_for_status(&server, &owner, &running_id, "cancelled").await;
     assert!(build["error"].is_null());
-    // The terminal build leaves the node's build list.
+    // The cancelled build ran on the node: it is kept, as the failed one was.
     let snapshot = recv_type(&mut socket, "desired_state").await;
-    assert!(
-        snapshot["body"]["spec"]["builds"]
-            .as_array()
-            .is_none_or(Vec::is_empty),
+    assert_eq!(
+        spec_build_ids(&snapshot),
+        vec![running_id.clone()],
         "{snapshot}"
     );
+    assert_eq!(spec_build(&snapshot, &running_id)["cancelled"], true);
 
     // Deleting an app with a running build drops the build and the node's
     // next snapshot no longer carries it.
     let doomed = start_build(&server, &owner, &app_id).await;
     let doomed_id = doomed["id"].as_str().unwrap().to_string();
     let snapshot = recv_type(&mut socket, "desired_state").await;
-    assert_eq!(snapshot["body"]["spec"]["builds"][0]["build_id"], doomed_id);
+    assert_eq!(
+        spec_build_ids(&snapshot),
+        vec![running_id.clone(), doomed_id.clone()]
+    );
     let res = owner
         .delete(server.url(&format!("/api/v1/apps/{app_id}")))
         .send()

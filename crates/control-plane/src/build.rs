@@ -669,7 +669,9 @@ fn failed_step_json(step: &wire::FailedStep) -> Result<String, ApiError> {
 
 /// Applies one `builds[]` entry of a `status_report` from `node_id` to the
 /// build's row, emitting the terminal event. Returns whether the node's
-/// desired state has to be rebuilt.
+/// desired state has to be rebuilt: when the build ends, and when it first
+/// starts, because a newer build that started replaces the failed build the
+/// desired state kept for its log (`session::desired`).
 ///
 /// Unknown builds, builds of another node and builds that are already terminal
 /// are ignored, so a redelivered report changes nothing.
@@ -857,7 +859,7 @@ pub(crate) async fn apply_build_status(
         _ => {}
     }
     w.commit().await?;
-    Ok(after.status.is_terminal())
+    Ok(after.status.is_terminal() || (before.started_at.is_none() && after.started_at.is_some()))
 }
 
 /// Writes a build row's mutable fields and its change-log entry. A cancel
