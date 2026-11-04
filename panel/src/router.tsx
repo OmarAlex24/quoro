@@ -15,6 +15,7 @@ import { WebhookScreen } from './screens/webhook-screen';
 import { WebhooksScreen } from './screens/webhooks-screen';
 import { AppsScreen } from './screens/apps-screen';
 import { AppScreen } from './screens/app-screen';
+import { BuildScreen } from './screens/build-screen';
 import { ConsoleScreen } from './screens/console-screen';
 import { DeployScreen } from './screens/deploy-screen';
 import { LoginScreen } from './screens/login-screen';
@@ -54,6 +55,12 @@ const appDetailRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/apps/$appId',
   component: AppScreen,
+});
+
+const buildDetailRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/apps/$appId/builds/$buildId',
+  component: BuildScreen,
 });
 
 const vmsRoute = createRoute({
@@ -185,6 +192,7 @@ const routeTree = rootRoute.addChildren([
   appsRoute,
   appDeployRoute,
   appDetailRoute,
+  buildDetailRoute,
   vmsRoute,
   nodesRoute,
   terminalRoute,

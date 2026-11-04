@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Link } from '@tanstack/react-router';
 import type { Vm } from '../api/generated/model';
+import { builtImageLabel } from '../lib/build-status';
 import { lampState } from '../lib/lamp';
 import { cn } from '../lib/utils';
 import { Lamp } from './lamp';
@@ -66,7 +67,8 @@ export function VmBay({
             </p>
           ) : null}
           <p className="type-data mt-2 truncate text-[13px] text-ink">
-            {vm.vcpus} vCPU · {vm.memory_mb} MiB · {vm.disk_gb} GiB · {vm.image}
+            {vm.vcpus} vCPU · {vm.memory_mb} MiB · {vm.disk_gb} GiB ·{' '}
+            {builtImageLabel(vm.image) ?? vm.image}
           </p>
           <p className="type-data mt-0.5 truncate text-[13px] text-ink-muted">
             <span title={vm.id}>{shortId(vm.id)}</span>

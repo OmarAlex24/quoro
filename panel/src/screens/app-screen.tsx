@@ -20,10 +20,29 @@ import {
   useGetDeploymentLogs,
   useListAppDeployments,
 } from '../api/generated/deployments/deployments';
+import {
+  getListAppBuildsQueryKey,
+  startBuild,
+  useListAppBuilds,
+} from '../api/generated/builds/builds';
 import type { App, AppEnvVar, Deployment } from '../api/generated/model';
 import { useListNodes } from '../api/generated/nodes/nodes';
 import { isApiProblem } from '../api/fetcher';
-import { appLampState, DEPLOY_PHASE_LABELS, relativeTime, shortDeploymentId } from '../lib/app-status';
+import {
+  appLampState,
+  DEPLOY_PHASE_LABELS,
+  relativeTime,
+  shortDeploymentId,
+} from '../lib/app-status';
+import {
+  buildDurationLabel,
+  buildLampState,
+  builtImageLabel,
+  isBuildTerminal,
+  lastBuiltCommit,
+  shortBuildId,
+  shortCommit,
+} from '../lib/build-status';
 import { canOpenTerminal } from '../lib/capabilities';
 import { formatLogTime } from '../lib/log-buffer';
 import { problemView, type ProblemView } from '../lib/problem';
@@ -37,6 +56,8 @@ import { AppMetricsBay } from '../components/metrics-bay';
 import { ToneLamp } from '../components/tone-lamp';
 import { Button } from '../components/ui/button';
 import { Dialog, DialogContent } from '../components/ui/dialog';
+import { Field } from '../components/ui/field';
+import { Input } from '../components/ui/input';
 import { NoticeLine, ProblemBanner } from '../components/ui/problem-banner';
 import { LoginScreen } from './login-screen';
 
@@ -72,6 +93,8 @@ export function AppScreen() {
   const [notice, setNotice] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [envDialogOpen, setEnvDialogOpen] = useState(false);
+  const [refOverride, setRefOverride] = useState('');
+  const [buildProblem, setBuildProblem] = useState<ProblemView | null>(null);
 
   const appQuery = useGetApp(appId, {
     query: {
@@ -98,6 +121,24 @@ export function AppScreen() {
     newest?.status === 'pending' ||
     newest?.status === 'preparing' ||
     newest?.status === 'starting';
+
+  const buildsQuery = useListAppBuilds(appId, undefined, {
+    query: {
+      enabled: appId !== '',
+      refetchInterval: (query) => {
+        const newestBuild = query.state.data?.items[0];
+        return newestBuild !== undefined && !isBuildTerminal(newestBuild.status)
+          ? 2_000
+          : 10_000;
+      },
+    },
+  });
+
+  const builds = buildsQuery.data?.items ?? [];
+  const liveBuild =
+    builds[0] !== undefined && !isBuildTerminal(builds[0].status)
+      ? builds[0]
+      : undefined;
 
   const deploymentQuery = useGetDeployment(newest?.id ?? '', {
     query: {
@@ -128,6 +169,7 @@ export function AppScreen() {
     void queryClient.invalidateQueries({
       queryKey: getListAppDeploymentsQueryKey(appId),
     });
+    void queryClient.invalidateQueries({ queryKey: getListAppBuildsQueryKey(appId) });
     void queryClient.invalidateQueries({ queryKey: getGetAppEnvQueryKey(appId) });
     if (deployment) {
       void queryClient.invalidateQueries({
@@ -151,6 +193,28 @@ export function AppScreen() {
     onError: (error, kind) => {
       setNotice(null);
       setProblem(problemView(error, actionPhrase[kind]));
+      invalidate();
+    },
+  });
+
+  const buildNow = useMutation({
+    mutationFn: () =>
+      startBuild(
+        appId,
+        refOverride.trim() === '' ? undefined : { ref: refOverride.trim() },
+        { headers: { 'Idempotency-Key': crypto.randomUUID() } },
+      ),
+    onSuccess: (build) => {
+      setBuildProblem(null);
+      setRefOverride('');
+      invalidate();
+      void navigate({
+        to: '/apps/$appId/builds/$buildId',
+        params: { appId, buildId: build.id },
+      });
+    },
+    onError: (error) => {
+      setBuildProblem(problemView(error, 'start builds'));
       invalidate();
     },
   });
@@ -211,6 +275,18 @@ export function AppScreen() {
   const env: AppEnvVar[] = envQuery.data?.items ?? [];
   const canStart = app.status === 'stopped' || app.status === 'down';
   const canStop = app.status !== 'stopped';
+  const source = app.source ?? null;
+  const imageLabel = builtImageLabel(app.image);
+  const lastCommit = lastBuiltCommit(builds);
+  const canBuildNow = canWrite && source !== null && liveBuild === undefined;
+  const buildDisabledReason =
+    source === null
+      ? null
+      : !canWrite
+        ? 'Your role can read builds but not start them.'
+        : liveBuild !== undefined
+          ? `Build ${shortBuildId(liveBuild.id)} is still running. Wait for it to end.`
+          : null;
 
   const progressError =
     logsQuery.error !== null && logsQuery.error !== undefined
@@ -285,16 +361,18 @@ export function AppScreen() {
               >
                 Restart
               </Button>
-              <Button
-                variant="secondary"
-                disabled={action.isPending}
-                onClick={() => {
-                  setNotice(null);
-                  action.mutate('redeploy');
-                }}
-              >
-                Redeploy
-              </Button>
+              {source === null || app.image !== '' ? (
+                <Button
+                  variant="secondary"
+                  disabled={action.isPending}
+                  onClick={() => {
+                    setNotice(null);
+                    action.mutate('redeploy');
+                  }}
+                >
+                  Redeploy
+                </Button>
+              ) : null}
               <Button
                 variant="danger"
                 disabled={action.isPending || remove.isPending}
@@ -309,7 +387,14 @@ export function AppScreen() {
         <dl className="type-data mt-4 grid grid-cols-1 gap-x-6 gap-y-1 border-t border-rail pt-3 text-[13px] sm:grid-cols-2">
           <div className="flex gap-2">
             <dt className="text-ink-muted">Image</dt>
-            <dd className="min-w-0 truncate text-ink">{app.image}</dd>
+            <dd
+              className="min-w-0 truncate text-ink"
+              title={source === null ? app.image : imageLabel ?? undefined}
+            >
+              {source !== null
+                ? imageLabel ?? 'Not built yet'
+                : app.image}
+            </dd>
           </div>
           <div className="flex gap-2">
             <dt className="text-ink-muted">Port</dt>
@@ -333,6 +418,141 @@ export function AppScreen() {
       {notice ? <div className="mt-2">{<NoticeLine>{notice}</NoticeLine>}</div> : null}
       {problem ? <ProblemBanner view={problem} className="mt-3" /> : null}
 
+      {source !== null ? (
+        <>
+          <section className="mt-5 rounded-[6px] border border-rail bg-panel px-4 py-4 sm:px-5">
+            <h2 className="type-display-light text-[15px] leading-none text-ink">Source</h2>
+            <dl className="type-data mt-3 grid grid-cols-1 gap-x-6 gap-y-1 text-[13px] sm:grid-cols-2">
+              <div className="flex min-w-0 gap-2 sm:col-span-2">
+                <dt className="text-ink-muted">Repository</dt>
+                <dd className="min-w-0 truncate text-ink" title={source.repo_url}>
+                  {source.repo_url}
+                </dd>
+              </div>
+              <div className="flex gap-2">
+                <dt className="text-ink-muted">Ref</dt>
+                <dd className="text-ink">{source.ref}</dd>
+              </div>
+              <div className="flex gap-2">
+                <dt className="text-ink-muted">Dockerfile</dt>
+                <dd className="min-w-0 truncate text-ink">{source.dockerfile_path}</dd>
+              </div>
+              <div className="flex gap-2">
+                <dt className="text-ink-muted">Context</dt>
+                <dd className="min-w-0 truncate text-ink">{source.context_dir}</dd>
+              </div>
+              <div className="flex gap-2">
+                <dt className="text-ink-muted">Target</dt>
+                <dd className="text-ink">{source.target ?? 'last stage'}</dd>
+              </div>
+              <div className="flex gap-2">
+                <dt className="text-ink-muted">Last built commit</dt>
+                <dd className="text-ink" title={lastCommit ?? undefined}>
+                  {lastCommit === null ? 'Not built yet' : shortCommit(lastCommit)}
+                </dd>
+              </div>
+            </dl>
+
+            <div className="mt-4 flex flex-col gap-3 border-t border-rail pt-3 sm:flex-row sm:items-end">
+              <Field
+                label="Build ref"
+                htmlFor="build-ref"
+                hint={`Optional. Leave it empty to build ${source.ref}.`}
+                className="flex-1"
+              >
+                <Input
+                  id="build-ref"
+                  value={refOverride}
+                  onChange={(event) => setRefOverride(event.target.value)}
+                  placeholder={source.ref}
+                  spellCheck={false}
+                />
+              </Field>
+              <div className="flex flex-col gap-1.5">
+                <Button
+                  variant="primary"
+                  disabled={!canBuildNow || buildNow.isPending}
+                  onClick={() => {
+                    setBuildProblem(null);
+                    buildNow.mutate();
+                  }}
+                >
+                  {buildNow.isPending ? 'Starting…' : 'Build now'}
+                </Button>
+                {buildDisabledReason ? (
+                  <p className="max-w-[260px] text-[13px] leading-snug text-ink-muted">
+                    {buildDisabledReason}
+                  </p>
+                ) : null}
+              </div>
+            </div>
+            {buildProblem ? <ProblemBanner view={buildProblem} className="mt-3" /> : null}
+          </section>
+
+          <section className="mt-5 rounded-[6px] border border-rail bg-panel px-4 py-4 sm:px-5">
+            <div className="flex flex-wrap items-baseline justify-between gap-2">
+              <h2 className="type-display-light text-[15px] leading-none text-ink">Builds</h2>
+              <span className="type-data text-[13px] text-ink-muted">
+                {builds.length} {builds.length === 1 ? 'build' : 'builds'}
+              </span>
+            </div>
+
+            {buildsQuery.error !== null && buildsQuery.error !== undefined ? (
+              <ProblemBanner
+                view={problemView(buildsQuery.error, 'see builds')}
+                className="mt-3"
+              />
+            ) : builds.length === 0 ? (
+              <p className="mt-3 text-[13px] text-ink-muted">
+                No builds yet. Build now to make the first image from this source.
+              </p>
+            ) : (
+              <ul className="mt-3 flex flex-col divide-y divide-rail border-y border-rail">
+                {builds.map((build) => {
+                  const buildLamp = buildLampState(build.status);
+                  return (
+                    <li key={build.id}>
+                      <Link
+                        to="/apps/$appId/builds/$buildId"
+                        params={{ appId, buildId: build.id }}
+                        className="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-[4px] px-1.5 py-2.5 hover:bg-recess/40 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+                      >
+                        <ToneLamp
+                          tone={buildLamp.tone}
+                          pulse={buildLamp.pulse}
+                          size={18}
+                          label={buildLamp.statusText}
+                        />
+                        <span className="type-body-medium min-w-[86px] text-[14px] text-ink">
+                          {buildLamp.statusText}
+                        </span>
+                        <span className="type-data text-[13px] text-ink-muted">
+                          commit {shortCommit(build.commit)}
+                        </span>
+                        <span className="type-data text-[13px] text-ink-muted">
+                          {buildDurationLabel(build)}
+                        </span>
+                        <span className="type-data text-[13px] text-ink-muted">
+                          trigger {build.trigger}
+                        </span>
+                        <span className="type-data min-w-0 truncate text-[13px] text-ink-muted">
+                          {build.created_by_type === 'system'
+                            ? 'system'
+                            : `${build.created_by_type} ${build.created_by_id.slice(0, 10)}…`}
+                        </span>
+                        <span className="type-data ml-auto text-[13px] text-ink-muted" title={build.id}>
+                          {shortBuildId(build.id)}
+                        </span>
+                      </Link>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </section>
+        </>
+      ) : null}
+
       <section className="mt-5 rounded-[6px] border border-rail bg-panel px-4 py-4 sm:px-5">
         <h2 className="type-display-light text-[15px] leading-none text-ink">Deployment</h2>
         <div className="mt-3">
@@ -343,7 +563,9 @@ export function AppScreen() {
             />
           ) : (
             <p className="text-[13px] text-ink-muted">
-              No deployment yet. Redeploy to roll out the current image.
+              {source !== null
+                ? 'No deployment yet. A successful build starts one.'
+                : 'No deployment yet. Redeploy to roll out the current image.'}
             </p>
           )}
         </div>
@@ -431,7 +653,9 @@ export function AppScreen() {
         <h2 className="type-display-light text-[15px] leading-none text-ink">Instances</h2>
         {app.instances.length === 0 ? (
           <p className="mt-3 text-[13px] text-ink-muted">
-            No instance is running. Deploy the app to boot one.
+            {source !== null
+              ? 'No instance is running. A successful build deploys the app and boots one.'
+              : 'No instance is running. Deploy the app to boot one.'}
           </p>
         ) : (
           <ul className="mt-3 flex flex-col divide-y divide-rail border-y border-rail">
