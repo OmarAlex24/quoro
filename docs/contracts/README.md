@@ -10,7 +10,7 @@ These files are the interfaces that Quoro's workstreams build against in paralle
 
 | File | What it fixes | Main consumers |
 | --- | --- | --- |
-| [openapi.yaml](openapi.yaml) | HTTP API for the M1-M3 surface (OpenAPI 3.1): auth, nodes, projects, VMs, apps, deployments, domains, logs, agents, grants, approvals, incidents, audit, events, webhooks | control-plane, panel, mcp, installer |
+| [openapi.yaml](openapi.yaml) | HTTP API for the M1-M4 surface (OpenAPI 3.1): auth, nodes, projects, VMs, apps, Git sources and builds, deployments, domains, logs, metrics, terminal and console sessions, agents, grants, approvals, incidents, audit, events, webhooks | control-plane, panel, mcp, installer |
 | [events.schema.json](events.schema.json) | JSON Schema (draft 2020-12) of the event envelope and every event type | control-plane, node-agent, panel, mcp, webhook receivers |
 | [node-agent-protocol.md](node-agent-protocol.md) | Enrollment, the dial-out session, messages, desired-state reconciliation, change-log follow, leases and self-fencing (D-0019) | node-agent, control-plane, engine |
 | [audit-log-format.md](audit-log-format.md) | Audit record format, hash chaining, verification, off-site copy with object lock | control-plane, mcp, panel |
@@ -53,6 +53,7 @@ All ids are strings `<prefix>_<ULID>` (ULID in Crockford base32, 26 characters),
 | VM | `vm_` | One microVM managed by the engine (M1). An app's instances are VMs whose `app_id` is set |
 | app | `app_` | A deployable service; runs as one microVM per instance (D-0008) |
 | deployment | `dep_` | One rollout of an image to an app |
+| build | `bld_` | One image build of an app's Git source, run on the app's node (ADR 0117, ADR 0118) |
 | domain | `dom_` | A hostname routed to an app |
 | volume | `vol_` | Persistent disk of a stateful app (shape prepared, used from M5) |
 | user (human) | `usr_` | A human identity |
@@ -69,6 +70,7 @@ All ids are strings `<prefix>_<ULID>` (ULID in Crockford base32, 26 characters),
 | provider | `prv_` | Credentials of one external provider (D-0051) |
 | lease | `lse_` | Lease on an app or on the primary status (D-0019) |
 | request | `req_` | Correlation id of one API or MCP call |
+| interactive session | `trm_` | One web terminal or VM console session (ADR 0114); not a panel login session |
 
 Change-log entries, audit records and events also carry a numeric, gap-free `seq` per log.
 
@@ -91,6 +93,18 @@ The cluster keys are generated at the primary's first start and stored as `0600`
 - An app is `stateful` or not. Stateful apps have **volumes** and may run only on their **lease holder** (D-0019).
 - An app has an HA policy: `none`, `cold`, `warm`, `hot` (D-0020). Only `none` is implemented before M5a; the field exists from M0.
 - A **domain** belongs to one app and has a TLS mode: `acme` (public-IP hosts) or `tunnel` (Cloudflare Tunnel) (D-0024).
+- An app either deploys images given by reference or has a **Git source** (`source`): then its images come from **builds** of that source, and each successful build starts a deployment with `trigger: build` (ADR 0117). A build runs on the node that runs the app (ADR 0118).
+- An **interactive session** is a web terminal into an app's VM or a read-only console of a VM (ADR 0114). It lives on the primary while it is open and leaves two audit records, its open and its `session.end` (ADR 0115).
+
+### Built images
+
+The image a build produces never leaves the node that built it (ADR 0118), so it has no registry reference. Every contract names it with the reference
+
+```
+build.quoro.invalid/<app_id>:<build_id>
+```
+
+and the build's manifest digest as its digest, for example `build.quoro.invalid/app_01JC9Z7B3N5Q7S9Z1W3Y5A7C9E:bld_01JC9ZA2B3C4D5E6F7G8H9J0KM` with `sha256:...`. The host is under the reserved `.invalid` top-level domain (RFC 6761), so the reference parses as an ordinary OCI reference but can never be pulled: a node prepares it from the build's OCI layout and never contacts a registry for it. `App.image`, `Deployment.image`, `vms.image` and `desired_state` `spec.vms[].image` all carry it verbatim.
 
 ### Status enums
 
@@ -98,6 +112,7 @@ The cluster keys are generated at the primary's first start and stored as `0600`
 - VM `desired_status`: `running`, `stopped`. VM `observed_status`: `creating`, `stopped`, `starting`, `running`, `stopping`, `crashed`, `deleted`, `unknown`.
 - App `status`: `deploying`, `running`, `degraded`, `down`, `stopped`.
 - Deployment `status`: `pending`, `preparing` (pulling image, building rootfs), `starting`, `succeeded`, `failed`, `superseded`.
+- Build `status`: `queued` (waiting for the node), `preparing` (builder VM and source checkout), `building`, `exporting` (writing the OCI layout), `importing` (turning the layout into a root disk), `succeeded`, `failed`, `cancelled` (ADR 0117). The last three are terminal.
 - Domain `cert_status`: `pending`, `issued`, `renewing`, `failed`, `not_applicable` (tunnel mode).
 - Grant `status`: `active`, `expired`, `revoked`, `exhausted`.
 - Approval `status`: `pending`, `approved`, `denied`, `expired`.
@@ -112,7 +127,7 @@ A scope is `<resource>:<verb>` (D-0030). The complete list:
 | Scope | Allows | Flags |
 | --- | --- | --- |
 | `cluster:read` | Read cluster info, version, log position | |
-| `node:read` | List and read nodes | |
+| `node:read` | List and read nodes and node metrics | |
 | `node:enroll` | Create node join tokens | human-only |
 | `node:remove` | Remove a node from the cluster | destructive, human-only |
 | `node:fence_ack` | Acknowledge a node's failed fence after verifying its VMs are stopped, so its leases may be granted again | human-only |
@@ -124,16 +139,18 @@ A scope is `<resource>:<verb>` (D-0030). The complete list:
 | `vm:start` | Start a VM | |
 | `vm:stop` | Stop a VM | |
 | `vm:delete` | Delete a VM and its disks | destructive |
-| `app:read` | List and read apps, deployments, domains, env var names | |
+| `vm:console` | Read a VM's serial console, live and its recent output (ADR 0116) | |
+| `app:read` | List and read apps, their Git sources, builds, deployments, domains, env var names and app metrics | |
 | `app:create` | Create an app | |
-| `app:update` | Change app settings, env vars, domains | |
+| `app:update` | Change app settings, the Git source, env vars, domains | |
 | `app:restart` | Restart an app's instances | |
 | `app:redeploy` | Roll out the current image again | |
-| `app:deploy` | Deploy a new image (new deployment) | |
+| `app:deploy` | Deploy a new image (new deployment); start and cancel builds, whose success deploys | |
 | `app:start` | Start a stopped app | |
 | `app:stop` | Stop an app | |
 | `app:delete` | Delete an app and its data | destructive |
-| `app:logs` | Read app logs, including live streams | |
+| `app:logs` | Read app logs and build logs, including live streams | |
+| `app:terminal` | Open an interactive terminal in an app's VM (ADR 0113, ADR 0114) | human-only |
 | `agent:read` | List and read agents | |
 | `agent:write` | Create, update, disable agents; rotate agent keys | human-only |
 | `grant:read` | List and read grants | |
@@ -143,7 +160,7 @@ A scope is `<resource>:<verb>` (D-0030). The complete list:
 | `approval:decide` | Approve or deny an approval request | human-only |
 | `incident:read` | List and read incidents | |
 | `incident:resolve` | Resolve an incident | |
-| `audit:read` | Read the audit log and run verification | |
+| `audit:read` | Read the audit log and run verification; humans also fetch session transcripts | |
 | `event:read` | Read events and the event stream | |
 | `webhook:read` | List and read webhooks and deliveries | |
 | `webhook:write` | Create, update, delete, test webhooks | human-only |
@@ -154,7 +171,8 @@ A scope is `<resource>:<verb>` (D-0030). The complete list:
 - **destructive** scopes need JIT approval when an agent uses them: the agent files an approval request, a human approves it, and a short-lived extra grant is issued (D-0030).
 - **human-only** scopes can never appear in an agent's grant, so an agent cannot widen its own power or approve its own requests.
 - The wildcard `app:*` style is not allowed in grants; scopes are listed explicitly.
-- Human roles are fixed scope bundles: `owner` (every scope), `operator` (every scope except `user:write`), `viewer` (every `:read` scope plus `app:logs`). `user:read` is a `:read` scope, so every role holds it.
+- Human roles are fixed scope bundles: `owner` (every scope), `operator` (every scope except `user:write`), `viewer` (every `:read` scope plus `app:logs`). `user:read` is a `:read` scope, so every role holds it. `app:terminal` and `vm:console` are not `:read` scopes, so a `viewer` holds neither (ADR 0114).
+- Builds and metrics add no scope of their own: a build is authorized as a deployment of its app (`app:deploy`), its record as app data (`app:read`), its log as app output (`app:logs`); node metrics need `node:read` and app metrics `app:read`.
 
 ### Resource selectors
 
@@ -191,7 +209,11 @@ Event `type` is `<subject>.<what>` in lowercase with underscores. The complete l
 | `app.restarted` | An app's instances were restarted | |
 | `deployment.started` | A deployment began | |
 | `deployment.succeeded` | A deployment's instances are healthy | |
-| `deployment.failed` | A deployment failed (image pull, rootfs, boot, health) | build failed (M4 builds report here with `phase: build`) |
+| `deployment.failed` | A deployment failed (image pull, rootfs, boot, health) | |
+| `build.started` | A build was created and queued | |
+| `build.succeeded` | A build produced its image; the deployment it starts follows | |
+| `build.failed` | A build failed (source checkout, a build step, export, import, timeout) | build failed |
+| `build.cancelled` | A build was cancelled before it finished | |
 | `certificate.issued` | A TLS certificate was obtained or renewed | |
 | `certificate.expiring` | A certificate expires within its warning window | certificate expiring |
 | `certificate.failed` | Obtaining or renewing a certificate failed | |
@@ -219,7 +241,7 @@ For `forbidden`, the field `reason` is one of: `scope_missing`, `selector_mismat
 - `Quoro-Justification`: the agent's stated reason for the call, required on every mutating call by an agent, recorded in the audit log (D-0031).
 - `Quoro-Setup-Token`: the one-time setup token, required by `POST /api/v1/setup` only (D-0054).
 - `Quoro-Incident`: the incident id the call belongs to, when an agent acts on an incident.
-- `Last-Event-ID` on SSE streams (`GET /api/v1/events/stream`, `GET /api/v1/apps/{app_id}/logs/stream`): resume after the given `seq`. One-way streams use SSE; bidirectional sessions use WebSockets (D-0057).
+- `Last-Event-ID` on SSE streams (`GET /api/v1/events/stream`, `GET /api/v1/apps/{app_id}/logs/stream`, `GET /api/v1/builds/{build_id}/logs/stream`): resume after the given `seq`. The metrics streams (`GET /api/v1/nodes/{node_id}/metrics/stream`, `GET /api/v1/apps/{app_id}/metrics/stream`) carry no resumable position and ignore it. One-way streams use SSE; bidirectional sessions use WebSockets (D-0057): the web terminal and the VM console (`GET /api/v1/interactive-sessions/{session_id}/ws`).
 - Every response carries `Quoro-Request-Id` (`req_...`).
 - Webhook deliveries carry `Quoro-Event-Id`, `Quoro-Event-Type`, `Quoro-Delivery-Id` and `Quoro-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256 of "<t>.<raw body>" with the webhook secret>`. Receivers reject a signature older than 5 minutes.
 
@@ -255,17 +277,19 @@ M3 exposes these tools (D-0033: read plus restart and redeploy; delete exists so
 
 Every mutating tool takes a required `justification` string and an optional `incident_id`, the MCP equivalents of the `Quoro-Justification` and `Quoro-Incident` headers.
 
+M4 adds no MCP tool. Builds, metrics and console sessions are reachable by agents through the HTTP API with a grant; the web terminal is human-only (ADR 0114); a later tool is a contract change of its own.
+
 ### Channels
 
 Every action reaches the same service layer through one of these channels, recorded in the audit log as `channel`: `api` (HTTP API), `panel` (the web panel, which uses the API with a session), `mcp` (MCP server, D-0031), `cli` (the `quoro` command), `system` (Quoro itself: reconciliation, schedulers, incident automation). MCP tools map one-to-one onto service operations and require the same scope as the matching endpoint.
 
 ### Node-agent message types
 
-Defined in node-agent-protocol.md. Node to control plane: `hello`, `heartbeat`, `status_report`, `event`, `lease_renew`, `log_ack`, `stream_data`, `stream_end`, `command_result`, `dns_challenge`. Control plane to node: `welcome`, `desired_state`, `lease_grant`, `lease_revoke`, `log_entries`, `stream_open`, `stream_close`, `command`, `signing_key_rotate`, `dns_challenge_result`, `error`. Either side: `ping`, `pong`.
+Defined in node-agent-protocol.md. Node to control plane: `hello`, `heartbeat`, `status_report`, `event`, `lease_renew`, `log_ack`, `stream_data`, `stream_end`, `command_result`, `dns_challenge`. Control plane to node: `welcome`, `desired_state`, `lease_grant`, `lease_revoke`, `log_entries`, `stream_open`, `stream_close`, `stream_input`, `stream_ack`, `command`, `signing_key_rotate`, `dns_challenge_result`, `error`. Either side: `ping`, `pong`.
 
 ### Database tables
 
-Defined in db-schema.sql and changed only by the numbered files in `migrations/`: `meta`, `change_log`, `nodes`, `node_join_tokens`, `node_credentials`, `node_tunnels`, `projects`, `vms`, `apps`, `app_env`, `deployments`, `domains`, `volumes`, `leases`, `users`, `api_tokens`, `sessions`, `agents`, `agent_keys`, `access_tokens`, `grants`, `approvals`, `incidents`, `events`, `webhooks`, `webhook_deliveries`, `providers`, `audit_log`, `audit_exports`. Tables marked local in that file are not replicated through the change log.
+Defined in db-schema.sql and changed only by the numbered files in `migrations/`: `meta`, `change_log`, `nodes`, `node_join_tokens`, `node_credentials`, `node_tunnels`, `projects`, `vms`, `apps`, `app_env`, `deployments`, `builds`, `domains`, `volumes`, `leases`, `users`, `api_tokens`, `sessions`, `agents`, `agent_keys`, `access_tokens`, `grants`, `approvals`, `incidents`, `events`, `webhooks`, `webhook_deliveries`, `providers`, `audit_log`, `audit_exports`, `interactive_sessions`. Tables marked local in that file are not replicated through the change log.
 
 ## Open items before the freeze
 

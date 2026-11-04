@@ -201,6 +201,7 @@ node agent                                          primary
 | Redial backoff | 1 s doubling to 60 s, full jitter | node | this file |
 | Event buffer | 10 000 entries | node | D-0011, this file |
 | Concurrent streams | 32 per session | primary enforces | this file |
+| Stream window | 256 KiB of unacknowledged `data` bytes per stream | node enforces, primary acknowledges | ADR 0116, section 5.25 |
 | Maximum message | 1 MiB | both | this file |
 
 The values above are carried in `welcome` (`heartbeat_interval_ms`, `session_timeout_ms`), so the primary can change them without a protocol change; the node uses the values from the current `welcome` and falls back to the defaults above when a session has not yet received one.
@@ -313,10 +314,27 @@ Each lease entry:
 | `capacity` | object | yes | `cpus`, `memory_mb`, `disk_gb` |
 | `allocated` | object | yes | Same shape, currently allocated |
 | `disk_free_gb` | number | yes | Free space on the volume filesystem |
+| `builds` | array of object | no | One entry per build in the node's current `spec.builds` (section 5.11); absent or empty when there is none (ADR 0117) |
 
 VM entry: `vm_id` (string, `vm_`), `observed_status` (one of `creating`, `stopped`, `starting`, `running`, `stopping`, `crashed`, `deleted`, `unknown`), `health` (`passing`, `failing`, `unknown`), `ip` (string, optional), `restart_count` (integer), `last_exit_code` (integer, optional).
 
 Route entry: `hostname` (string), `cert_status` (one of `pending`, `issued`, `renewing`, `failed`, `not_applicable`), `cert_expires_at` (string, optional).
+
+Build entry:
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `build_id` | string (`bld_`) | yes | The build |
+| `status` | string | yes | `queued`, `preparing`, `building`, `exporting`, `importing`, `succeeded`, `failed` or `cancelled` (README.md) |
+| `commit` | string | no | Full commit SHA the ref resolved to, once the checkout finished |
+| `image_digest` | string | no | Manifest digest of the built image, on `succeeded`; the node has already prepared it as a root disk |
+| `failed_phase` | string | no | On `failed`: `preparing`, `building`, `exporting` or `importing` |
+| `error` | string | no | On `failed`: one-line reason, at most 2 000 characters |
+| `failed_step` | object | no | On `failed` in a build step: `vertex` (integer), `name` (string), `error` (string), `dockerfile_line` (integer, optional), `excerpt` (array of at most 20 strings, each at most 500 characters: the step's last log lines and the Dockerfile excerpt) |
+| `started_at` | string | no | When the node left `queued` |
+| `finished_at` | string | no | When the build reached a terminal status |
+
+The primary owns the `builds` table and the `build.*` events: it applies each reported status change to the build row and emits the event, so the node emits no `build.*` event of its own. A status report may skip intermediate statuses; only the terminal one matters.
 
 The primary treats a VM it knows and the node does not report as `unknown` rather than assuming it is gone; only an explicit `deleted` or a successful `inspect` removes it.
 
@@ -446,10 +464,13 @@ The primary keeps sending from `seq + 1`. An ack that skips a sequence is ignore
 | --- | --- | --- | --- |
 | `stream_id` | string (`msg_`) | yes | Stream the data belongs to, chosen by the primary in `stream_open` |
 | `seq` | integer | yes | Per-stream sequence, gap-free from 1 |
-| `lines` | array of object | no | Log lines; present for `app_logs` and `deployment_logs` |
-| `data` | string | no | Base64 bytes; reserved for byte-oriented kinds |
+| `lines` | array of object | no | Log lines; present for `app_logs`, `deployment_logs` and `build_logs` |
+| `data` | string | no | Base64 bytes, at most 64 KiB decoded per message; present for `terminal`, `console` and `transcript` |
+| `metrics` | object | no | One sample; present for `metrics` (section 5.17, `metrics_query`, for its shape) |
 
-Exactly one of `lines` and `data` is present. A log line is `{ "time": <RFC 3339>, "stream": "stdout"|"stderr", "line": <string without trailing newline>, "vm_id": <vm_> }`; `vm_id` is optional and names the VM that produced the line, so a stream opened for an app with several VMs stays attributable. Lines come from the engine's output stream, which the minimal init tags by stream on the guest side (`engine-trait.md`); the node does not guess.
+Exactly one of `lines`, `data` and `metrics` is present. A log line is `{ "time": <RFC 3339>, "stream": "stdout"|"stderr", "line": <string without trailing newline>, "vm_id": <vm_> }`; `vm_id` is optional and names the VM that produced the line, so a stream opened for an app with several VMs stays attributable. Lines come from the engine's output stream, which the minimal init tags by stream on the guest side (`engine-trait.md`); the node does not guess. A build log line also carries `seq` (integer, gap-free from 1 per build, the position used by the API's cursor and `Last-Event-ID`) and, when BuildKit names one, `vertex` (integer, the step number); it never carries `vm_id`.
+
+Byte streams (`data`) coalesce output over a few milliseconds, so one echoed keystroke is not one message, and obey the stream window: the node stops reading its source while more than 256 KiB it sent on the stream are unacknowledged (section 5.25). On `terminal` and `console` streams the bytes are what the guest wrote, unparsed; the node never interprets them.
 
 ```json
 {
@@ -474,10 +495,13 @@ Exactly one of `lines` and `data` is present. A log line is `{ "time": <RFC 3339
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
 | `stream_id` | string (`msg_`) | yes | Stream that ended |
-| `reason` | string | yes | `completed`, `error` or `cancelled` |
+| `reason` | string | yes | `completed`, `error`, `cancelled`, `vm_stopped` or `limit` |
 | `message` | string | no | Human-readable detail, for example the engine error |
+| `exit_code` | integer | no | `terminal` only: the program's exit code, or `128 + signal`, when it exited |
+| `transcript_sha256` | string | no | `terminal` only: lowercase hex SHA-256 of the session transcript as stored on the node |
+| `transcript_bytes` | integer | no | `terminal` only: size of that transcript |
 
-The primary closes the matching API or panel consumer. `cancelled` is the answer to `stream_close`; `error` carries whatever `EngineError` the node saw.
+The primary closes the matching API or panel consumer. `cancelled` is the answer to `stream_close`; `error` carries whatever `EngineError` the node saw. `completed` ends a `terminal` whose program exited (with `exit_code`), a `build_logs` stream once the build is terminal and every line was sent, and a `transcript` stream once the file was sent. `vm_stopped` ends a `terminal` whose VM stopped and a `console` whose VM was deleted; a console stream outlives VM restarts, so a viewer sees the next boot. `limit` ends a `terminal` whose transcript reached its cap (16 MiB, `audit-log-format.md` section 3.3). A `terminal` stream_end always carries the transcript fields when a transcript file exists, whatever the reason, so the primary can write `session.end`.
 
 ```json
 {
@@ -487,6 +511,23 @@ The primary closes the matching API or panel consumer. `cancelled` is the answer
   "body": {
     "stream_id": "msg_01JC9ZD9K2M4P6R8T0V2X4Z6B8",
     "reason": "completed"
+  }
+}
+```
+
+A terminal whose shell exited:
+
+```json
+{
+  "v": 1,
+  "type": "stream_end",
+  "id": "msg_01JC9ZF6K1W3Y5A7C9E1G3J5M7",
+  "body": {
+    "stream_id": "msg_01JC9ZD0L3N5Q7S9V1X3Z5B7D9",
+    "reason": "completed",
+    "exit_code": 0,
+    "transcript_sha256": "4f2a9c1e7b3d5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8",
+    "transcript_bytes": 18234
   }
 }
 ```
@@ -501,7 +542,8 @@ The primary closes the matching API or panel consumer. `cancelled` is the answer
 | `status` | string | yes | `ok` or `error` |
 | `detail` | string | no | Short human-readable detail |
 | `error` | object | no | `{ "code": ..., "message": ... }` using the `error` codes in section 5.18 |
-| `lines` | array of object | no | Log lines, oldest first, in the line shape of section 5.7; present only in the answer to `command` kind `logs_query` |
+| `lines` | array of object | no | Log lines, oldest first, in the line shape of section 5.7; present only in the answer to `command` kind `logs_query` or `build_logs_query` |
+| `metrics` | object | no | Present only in the answer to `command` kind `metrics_query` (section 5.17) |
 
 `re` identifies the message being answered. For `desired_state` the answer means **stored**: the signature was verified and the snapshot was persisted atomically. It does not mean applied — that is `applied_rev` in `status_report`. For `lease_revoke` the answer means the stateful VMs bound to the lease are stopped and recorded. A `lease_revoke` whose self-fence could not confirm that every bound VM stopped is answered with `status: error` and `error.code` `fence_failed` (sections 5.18 and 8.5); `detail` names the VMs that may still run.
 
@@ -575,7 +617,7 @@ A `lease_revoke` whose fence failed:
 | `rev` | integer | yes | Monotonic revision of the node's desired state |
 | `issued_at` | string | yes | When the primary produced it |
 | `term` | integer | yes | Cluster term at issue time |
-| `spec` | object | yes | `vms`, `routes`, `network`, and `ingress` when the node runs a tunnel |
+| `spec` | object | yes | `vms`, `routes`, `network`, `ingress` when the node runs a tunnel, and `builds` when the node has builds to run (ADR 0117) |
 | `signature` | string | yes | Base64 Ed25519 signature by the cluster signing key |
 
 **Signature.** The signature covers the RFC 8785 (JSON Canonicalization Scheme) serialization of the whole `body` object with the `signature` member removed. The node verifies it against `cluster_public_key` before it parses anything else, persists the verified snapshot atomically, answers `command_result` with `ok`, and only then reconciles. An invalid signature is answered with `error` code `bad_signature` and the snapshot is discarded; the node keeps running on its previously stored snapshot.
@@ -591,8 +633,9 @@ A `lease_revoke` whose fence failed:
 | `app_id` | string (`app_`) | no | Set when this VM is an instance of an app; absent for a standalone VM |
 | `deployment_id` | string (`dep_`) | no | The deployment that produced this VM, when it is an app instance; selects the VM for `stream_open` kind `deployment_logs` |
 | `name` | string | yes | Operator-visible name |
-| `image` | string | yes | OCI reference as requested |
+| `image` | string | yes | OCI reference as requested; a built image's reference is `build.quoro.invalid/<app_id>:<build_id>` (README.md, "Built images") |
 | `image_digest` | string | yes | Resolved digest |
+| `build_id` | string (`bld_`) | no | Set when the image is a build's output on this node; the node prepares it from that build and never pulls it (section 6.6) |
 | `vcpus` | integer | yes | vCPUs |
 | `memory_mb` | integer | yes | Memory in MiB |
 | `disk_gb` | integer | yes | Root disk size |
@@ -619,6 +662,25 @@ A `lease_revoke` whose fence failed:
 
 **Domain ids and certificate events.** The node names the domain of a route in every `certificate.*` event it emits (`certificate.issued`, `certificate.expiring`, `certificate.failed`; section 5.4): `subject` is `{ "type": "domain", "id": <domain_id> }` and `data.domain_id` carries the same id, as `events.schema.json` requires. `domain_id` is an additive optional field: a node that does not know it ignores it, and a node that receives a route without it (from an older primary) reports the certificate state in `status_report.routes` only and emits no `certificate.*` event for that hostname, because it never invents an id.
 
+**`spec.builds[]`** (optional; ADR 0117, ADR 0118):
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `build_id` | string (`bld_`) | yes | Build identity |
+| `app_id` | string (`app_`) | yes | App the build belongs to; also the build cache key, so caches never mix between apps |
+| `project_id` | string (`prj_`) | yes | Owning project |
+| `repo_url` | string | yes | `https://` URL of a public Git repository |
+| `ref` | string | yes | Branch, tag or full commit SHA to build; the node resolves it to a commit |
+| `dockerfile_path` | string | yes | Path of the Dockerfile, relative to `context_dir` |
+| `context_dir` | string | yes | Build context, relative to the repository root; `.` is the root |
+| `target` | string | no | Stage of a multi-stage Dockerfile to build |
+| `build_args` | object | yes | `--build-arg` name to value; `{}` when none |
+| `secrets` | object | yes | BuildKit secret id to plaintext value, taken from the app's environment variables named in the source; `{}` when none |
+| `limits` | object | yes | `vcpus`, `memory_mb`, `timeout_s`, `cache_gb`, `output_gb` |
+| `cancelled` | boolean | yes | True once a cancel was requested; the node stops the build and reports `cancelled` |
+
+A build stays in `spec.builds` until the primary has recorded the terminal status the node reported. A succeeded build leaves `spec.builds` in the same revision that references its image in `spec.vms` (the deployment it started), so the apply loop never sees the built root disk unreferenced and removes it (section 6.2). `secrets` values are handled like `env`: plaintext only inside the signed snapshot, encrypted with the node-local key at rest, never logged and never written to the build's log.
+
 **`spec.network`:** `subnet` (CIDR for the node bridge) and `gateway` (address on that bridge). The addresses in `status_report` must fall inside the subnet.
 
 **`spec.ingress`** (optional; absent when the node runs no tunnel):
@@ -637,7 +699,7 @@ A `lease_revoke` whose fence failed:
 
 **Tunnels (D-0094).** One tunnel per node. The primary creates or looks up the node's tunnel with the account credential of the `tunnel` provider, writes the tunnel's ingress rules (each `tunnel` route's hostname to `http://127.0.0.1:<origin_port>`) and the proxied DNS records itself, and sends the node only `tunnel_id`, `token` and `origin_port`. The node runs the tunnel connector with the token and serves the `tunnel` routes of `spec.routes` from its proxy on `127.0.0.1:<origin_port>`. The account credential never leaves the primary. A changed `token` (rotation) replaces the running connector; an absent `tunnel` stops it.
 
-**Environment values.** `env` carries plaintext values because the node must be able to start the process. It is sent only over the authenticated, pinned session, never over a webhook or an API read, and the node stores it encrypted with the node-local key. The primary stores the same values encrypted with the cluster data-encryption key (AEAD), and the API returns only names (`README.md`, `db-schema.sql`). `spec.ingress.tunnel.token` is handled the same way: plaintext only inside the signed snapshot on the session, encrypted with the node-local key at rest on the node, encrypted with the cluster data-encryption key on the primary (`node_tunnels.token_enc`), never returned by the API.
+**Environment values.** `env` (and `spec.builds[].secrets`) carries plaintext values because the node must be able to start the process. It is sent only over the authenticated, pinned session, never over a webhook or an API read, and the node stores it encrypted with the node-local key. The primary stores the same values encrypted with the cluster data-encryption key (AEAD), and the API returns only names (`README.md`, `db-schema.sql`). `spec.ingress.tunnel.token` is handled the same way: plaintext only inside the signed snapshot on the session, encrypted with the node-local key at rest on the node, encrypted with the cluster data-encryption key on the primary (`node_tunnels.token_enc`), never returned by the API.
 
 ```json
 {
@@ -797,10 +859,20 @@ Each entry has exactly the change-log fields from the shared entity model: `seq`
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
 | `stream_id` | string (`msg_`) | yes | Stream identity chosen by the primary |
-| `kind` | string | yes | `app_logs` or `deployment_logs` in v1 |
+| `kind` | string | yes | `app_logs`, `deployment_logs`, `build_logs`, `metrics`, `terminal`, `console` or `transcript` |
 | `params` | object | yes | Kind-specific selector |
 
-`params` for `app_logs`: `app_id` or `vm_id` (exactly one), optional `tail` (integer, default 0). `params` for `deployment_logs`: `deployment_id`, optional `phase`. The kinds `console` and `terminal` are reserved for M4 and are added by a standalone contract pull request (D-0036); a node that receives them now answers `command_result` with `error` code `bad_message`.
+| Kind | `params` | Data | Ends |
+| --- | --- | --- | --- |
+| `app_logs` | `app_id` or `vm_id` (exactly one), optional `tail` (integer, default 0) | `lines` | on `stream_close` |
+| `deployment_logs` | `deployment_id`, optional `phase` | `lines` | on `stream_close` |
+| `build_logs` | `build_id`; optional `tail` (integer: start with the last `tail` lines; default 0) or `after_seq` (integer: start after that line), not both | `lines` with `seq` | `completed` once the build is terminal and every line was sent (ADR 0119) |
+| `metrics` | `node` (boolean) and `vm_ids` (array of `vm_` ids), at least one of them set | `metrics`, one sample per sampling interval | on `stream_close` |
+| `terminal` | `session_id` (`trm_`), `vm_id`, `rows` and `cols` (integers, 1 to 1 000), `argv` (array of strings, at least one), optional `user` | `data`; input through `stream_input` | `completed` with `exit_code`, `vm_stopped`, `limit`, or `cancelled` on `stream_close` (ADR 0113) |
+| `console` | `vm_id`, optional `tail_bytes` (integer: replay at most that many bytes of the VM's console ring first; default the whole ring) | `data`; `stream_input` is refused | `vm_stopped` when the VM is deleted, or `cancelled` (ADR 0116) |
+| `transcript` | `session_id` (`trm_`) | `data`: the transcript file, from its first byte | `completed` |
+
+A kind this node cannot serve right now is answered with `command_result` status `error`: code `not_found` when the build, VM or transcript is not on this node, `not_available` when the VM exists but cannot serve the kind (a `terminal` on a VM started before the M4 guest init, or on a stopped VM). A `terminal` stream is one PTY session of its own: several terminal streams on one VM are several independent sessions. Any number of `console` streams may follow one VM; the node fans its one console reader out to all of them and none of them ever connects to the VM's serial socket (ADR 0116).
 
 The primary enforces 32 concurrent streams per session. A 33rd open is answered with `command_result` status `error`, code `bad_message`, detail `stream_limit`, without touching the node's streams.
 
@@ -813,6 +885,27 @@ The primary enforces 32 concurrent streams per session. A 33rd open is answered 
     "stream_id": "msg_01JC9ZD9K2M4P6R8T0V2X4Z6B8",
     "kind": "app_logs",
     "params": { "app_id": "app_01JC9Z7B3N5Q7S9Z1W3Y5A7C9E", "tail": 100 }
+  }
+}
+```
+
+A web terminal:
+
+```json
+{
+  "v": 1,
+  "type": "stream_open",
+  "id": "msg_01JC9ZP3S8E1G3J5M7P9R1T3W5",
+  "body": {
+    "stream_id": "msg_01JC9ZD0L3N5Q7S9V1X3Z5B7D9",
+    "kind": "terminal",
+    "params": {
+      "session_id": "trm_01JC9ZA3C4D5E6F7G8H9J0K1M2",
+      "vm_id": "vm_01JC9Z7C4P6R8T0V2X4Z6B8D0F",
+      "rows": 24,
+      "cols": 80,
+      "argv": ["/bin/sh"]
+    }
   }
 }
 ```
@@ -844,7 +937,7 @@ The node stops producing, releases the stream slot, and answers `stream_end` wit
 
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
-| `kind` | string | yes | `logs_query`, `probe` or `fence_ack` in v1 |
+| `kind` | string | yes | `logs_query`, `probe`, `fence_ack`, `build_logs_query` or `metrics_query` |
 | `params` | object | yes | Kind-specific parameters |
 
 `logs_query` params: `app_id` or `vm_id` (exactly one), `since` (RFC 3339, optional), `until` (RFC 3339, optional), `tail` (integer, optional). The answer is one `command_result` with `status: ok` and the matching lines in `lines` (section 5.9), each carrying its `vm_id`. The answer must fit the 1 MiB message limit: the node keeps the newest lines that fit and says in `detail` that older ones were left out.
@@ -852,6 +945,44 @@ The node stops producing, releases the stream slot, and answers `stream_end` wit
 `probe` params: `{}`. The node re-runs the KVM probe (`/dev/kvm`, CPU flags, kernel release) and answers with a `command_result` whose `detail` summarizes it; the primary updates the node's `kvm` record and `engine_version`.
 
 `fence_ack` params: `lease_ids` (array of `lse_` ids, at least one). It carries an operator's acknowledgement of failed fences, recorded through `POST /api/v1/nodes/{node_id}/fence-ack` (section 8.5). The node clears the failed fence it recorded for each listed lease, and clears its failed mark once no failed fence remains. It answers `command_result` with `status: ok`; when failed fences of other leases remain, the node stays failed and `detail` names them. A listed lease with no recorded failed fence is not an error, so a redelivered `fence_ack` is harmless. The listed leases stay `revoked` or `expired` on the node: it starts nothing stateful for them until a `lease_grant` arrives with a higher `fencing_token` (section 8.5 step 4).
+
+`build_logs_query` params: `build_id`, `after_seq` (integer, optional, default 0), `limit` (integer, optional, default 500, at most 1 000). The answer is one `command_result` with `status: ok` and the build's log lines after `after_seq` in `lines`, in the build-log line shape of section 5.7, oldest first, at most `limit` and within the 1 MiB message limit (the node returns fewer lines rather than a larger message). A build the node does not have is answered with `status: error`, code `not_found`.
+
+`metrics_query` params: `node` (boolean) and `vm_ids` (array of `vm_` ids), at least one of them set. The answer is one `command_result` with `status: ok` and `metrics`:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `interval_s` | integer | The node's sampling interval, 5 s |
+| `node` | array of object | Present when `node` was asked: the node's samples, oldest first |
+| `vms` | array of object | One `{ "vm_id", "samples" }` per asked VM the node runs; a VM it does not run is left out |
+
+The node samples every `interval_s` into an in-memory ring of 10 minutes per node and per running VM (ADR 0014): the ring is never written to disk, never sent unless asked and lost on an agent restart. A **node sample** is `{ "time", "cpu_usage", "cpu_count", "memory_total_bytes", "memory_used_bytes" }`: `cpu_usage` is the busy fraction of all host CPUs over the interval (0 to 1, from `/proc/stat`), `memory_used_bytes` is `MemTotal - MemAvailable` (from `/proc/meminfo`). A **VM sample** is `{ "time", "cpu_usage", "vcpus", "memory_rss_bytes", "memory_bytes" }`: `cpu_usage` is the CPU time of the VM's VMM process over the interval divided by the interval and by `vcpus` (0 to 1; it can exceed 1 briefly because the VMM's own threads count), `memory_rss_bytes` is the VMM process's resident memory on the host, which counts the guest pages the guest has touched and does not shrink when the guest frees memory, and `memory_bytes` is the VM's configured memory. Both come from the engine's `counters` and the host's process accounting (`engine-trait.md` section 3.15); no guest agent is involved. The `metrics` stream sends one object per interval in the same shape, with one sample per array.
+
+```json
+{
+  "v": 1,
+  "type": "command_result",
+  "id": "msg_01JC9ZG8N3Y5A7C9E1G3J5M7P9",
+  "re": "msg_01JC9ZR6W1K6N8Q0S2T4V6X8Z0",
+  "body": {
+    "status": "ok",
+    "metrics": {
+      "interval_s": 5,
+      "node": [
+        { "time": "2026-11-04T10:15:30Z", "cpu_usage": 0.12, "cpu_count": 8, "memory_total_bytes": 17179869184, "memory_used_bytes": 6442450944 }
+      ],
+      "vms": [
+        {
+          "vm_id": "vm_01JC9Z7C4P6R8T0V2X4Z6B8D0F",
+          "samples": [
+            { "time": "2026-11-04T10:15:30Z", "cpu_usage": 0.04, "vcpus": 2, "memory_rss_bytes": 201326592, "memory_bytes": 536870912 }
+          ]
+        }
+      ]
+    }
+  }
+}
+```
 
 Restarts and stops are **never** commands. They are changes of desired state — `restart_generation` for a restart, `desired_status` for a stop — so they are idempotent, survive a reconnect, and cannot be lost with a dropped message (D-0011).
 
@@ -905,6 +1036,8 @@ Restarts and stops are **never** commands. They are changes of desired state —
 | `bad_signature` | no | A `desired_state` or `signing_key_rotate` signature did not verify; the message was discarded |
 | `bad_message` | no | Malformed frame, unknown type, unknown command kind, oversized frame |
 | `log_diverged` | no | The node's change-log copy does not match the primary's (section 7) |
+| `not_found` | no | A `stream_open` or `command` named a build, VM or transcript this node does not have. Carried in the `error` of a `command_result` |
+| `not_available` | no | The VM exists but cannot serve the requested stream now: a `terminal` on a stopped VM or on a VM started before the M4 guest init. Carried in the `error` of a `command_result` |
 | `fence_failed` | no | A self-fence could not confirm that every stateful VM bound to the lease stopped, so a VM may still run (section 8.5). Carried in the `error` of the `command_result` that answers a `lease_revoke`; the node has marked itself failed |
 
 A fatal error ends the session immediately; the node applies its redial rule (section 4.4). A non-fatal error leaves the session usable.
@@ -1040,6 +1173,68 @@ A successful `set` means the provider accepted the record, not that resolvers al
 }
 ```
 
+### 5.24 `stream_input`
+
+**Direction:** control plane to node.
+**When:** the client of a `terminal` stream typed, pasted, resized its window or closed its input (ADR 0116).
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `stream_id` | string (`msg_`) | yes | The `terminal` stream |
+| `seq` | integer | yes | Per-stream input sequence, gap-free from 1 |
+| `data` | string | no | Base64 bytes for the program's input, at most 64 KiB decoded |
+| `resize` | object | no | `rows` and `cols` (integers, 1 to 1 000): the new window size |
+| `eof` | boolean | no | True to close the program's input |
+
+At least one of `data`, `resize` and `eof` is present; the node applies them in that order. The node writes input in `seq` order and records it in the transcript before it reaches the guest (`i` and `r` events, `audit-log-format.md` section 3.3). A `stream_input` for a `console`, `build_logs`, `metrics`, `transcript` or log stream is answered with `error` code `bad_message`, non-fatal, and dropped: a console is read-only (ADR 0116). Input for an unknown or ended stream is ignored. Input has no window of its own; the primary forwards at most one client WebSocket message per `stream_input`, and the WebSocket's own back-pressure bounds it.
+
+```json
+{
+  "v": 1,
+  "type": "stream_input",
+  "id": "msg_01JC9ZX4C6E8G0J2M4P6R8T0V2",
+  "body": {
+    "stream_id": "msg_01JC9ZD0L3N5Q7S9V1X3Z5B7D9",
+    "seq": 3,
+    "data": "dW5hbWUgLWEK"
+  }
+}
+```
+
+```json
+{
+  "v": 1,
+  "type": "stream_input",
+  "id": "msg_01JC9ZX5D7F9H1K3N5Q7S9V1X3",
+  "body": {
+    "stream_id": "msg_01JC9ZD0L3N5Q7S9V1X3Z5B7D9",
+    "seq": 4,
+    "resize": { "rows": 50, "cols": 132 }
+  }
+}
+```
+
+### 5.25 `stream_ack`
+
+**Direction:** control plane to node.
+**When:** after the primary has handed bytes of a `data` stream (`terminal`, `console`, `transcript`) to their consumer, at the latest every 64 KiB.
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `stream_id` | string (`msg_`) | yes | The stream |
+| `acked_bytes` | integer | yes | Cumulative decoded bytes of the stream's `data` that the consumer has taken, from the stream's start |
+
+Credit flow control (ADR 0116): the node keeps at most 256 KiB of decoded `data` sent on a stream and not yet covered by `acked_bytes`. At the window it stops reading the stream's source: a terminal's vsock connection, whose own credit flow control then stops the guest program, or a console's ring, which keeps filling, so a slow console viewer loses the oldest bytes it has not seen and never slows the guest. Without the window, one busy terminal could fill the session's send queue and delay heartbeats and lease messages on the same WebSocket. An `acked_bytes` lower than an earlier one is ignored; one beyond the bytes sent is a primary bug, answered with `error` code `bad_message`, non-fatal.
+
+```json
+{
+  "v": 1,
+  "type": "stream_ack",
+  "id": "msg_01JC9ZY6E8G0J2M4P6R8T0V2X4",
+  "body": { "stream_id": "msg_01JC9ZD0L3N5Q7S9V1X3Z5B7D9", "acked_bytes": 196608 }
+}
+```
+
 ## 6. Reconciliation
 
 ### 6.1 Source of truth on the node
@@ -1054,10 +1249,11 @@ The node always acts on the newest verified snapshot in its local store. It neve
 An apply run always follows this order, whatever changed:
 
 1. **Network.** Ensure the bridge, subnet and gateway from `spec.network`, and the per-VM TAP devices. Each VM is attached with its `project_id` as its isolation group, so the VMs of one project reach each other and VMs of different projects do not (`engine-trait.md` section 3.3, D-0084). The DNS servers handed to guests come from the node's own configuration, not from `spec.network`.
-2. **Images.** Prepare every image referenced by a VM whose rootfs is missing or has a different digest, and remove rootfs images no longer referenced.
+2. **Images.** Prepare every image referenced by a VM whose rootfs is missing or has a different digest, and remove rootfs images no longer referenced. An image whose VM carries `build_id` is never pulled: it was prepared by the build's `importing` step (section 6.6); if it is gone, the deployment fails in phase `pull` with the error that the built image is no longer on this node. A root disk is referenced while a VM in `spec.vms` or a build in `spec.builds` names it.
 3. **Stop.** Stop VMs that are no longer desired, or whose spec requires a recreate (image digest, disk size, network identity).
 4. **Start.** Start desired VMs that are not running.
-5. **Routes.** Update the reverse proxy for the hostnames in `spec.routes`, and start, replace or stop the tunnel connector to match `spec.ingress.tunnel`. Certificates for `acme` routes are obtained in the background through `dns_challenge` (section 5.22); a route keeps serving its previous certificate until a new one is issued.
+5. **Builds.** Start the next `queued` build of `spec.builds` when the node has no build running (one at a time per node by default, ADR 0118), stop a build marked `cancelled`, and report every change in `status_report.builds` (section 6.6). Builds run alongside the other steps, never block them, and are not restarted by a later apply run.
+6. **Routes.** Update the reverse proxy for the hostnames in `spec.routes`, and start, replace or stop the tunnel connector to match `spec.ingress.tunnel`. Certificates for `acme` routes are obtained in the background through `dns_challenge` (section 5.22); a route keeps serving its previous certificate until a new one is issued.
 
 The order exists so that a VM never starts on a network that is not ready, and no route points at a VM that is being replaced. It is the reconciliation described in D-0011 and the deployments in D-0033.
 
@@ -1075,6 +1271,35 @@ A stateful VM starts only while the node holds that app's lease in state `held` 
 ### 6.5 While disconnected
 
 Everything continues: running VMs keep running, restarts still happen, health checks still run, and the node keeps reconciling against its stored snapshot. Events are buffered in the local store, bounded at 10 000 entries. On overflow the oldest entries are dropped, a counter is incremented, and the next `hello` reports it as `dropped_events` so that a primary never assumes silence means "nothing happened".
+
+### 6.6 Builds
+
+A build runs on the node in an ephemeral builder microVM, one per build, created through the engine like any VM (ADR 0117, ADR 0118):
+
+- **Builder VM.** Root disk: the BuildKit image pinned by digest in the node agent's build (`pins.txt`, like Cloud Hypervisor and the kernel) and prepared with `prepare_image`; it runs the rootful, daemonless `buildkitd` pattern with `--oci-worker-net=host`. Size: `limits.vcpus` and `limits.memory_mb`. Network: on the node bridge with no isolation group and `egress_only` (`engine-trait.md` section 3.3), so it reaches the outside through the gateway and no VM and no service on the host. The builder VM counts against the node's capacity like any VM; a build whose limits do not fit waits in `queued`.
+- **Work disk.** One persistent ext4 work disk per app on this node, attached to the builder VM as a work disk (`engine-trait.md` section 3.6), at most `limits.cache_gb` gibibytes. It holds the source checkout, the BuildKit cache and the output layout. After each build the builder runs `buildctl prune --keep-storage` down to the cap. The node deletes an app's work disk once the app appears in neither `spec.vms` nor `spec.builds`.
+- **Phases.** `preparing`: the node resolves `ref` to a commit with the host's Git client, clones that commit onto the work disk (shallow, public HTTPS only in M4), and boots the builder VM. `building`: `buildctl build` with the Dockerfile frontend, `--progress=rawjson`, `build_args` as `--build-arg` and `secrets` as `--secret` (written to the work disk for the build's lifetime and removed before the VM is deleted). `exporting`: `--output type=oci` onto the work disk, at most `limits.output_gb`. `importing`: after the builder VM powered off, the node verifies the layout and prepares it as a root disk with `prepare_layout` (`engine-trait.md` section 3.17), cached by manifest digest, then reports `succeeded` with `image_digest`.
+- **Failure.** A step that fails ends the build `failed` in phase `building`, with `failed_step` from BuildKit's rawjson output (the failing vertex, its name and error, the Dockerfile line) and the excerpt from the plain log. The wall-clock limit `limits.timeout_s` stops the builder VM and fails the build in the phase it was in, with the error `timeout`. A failed checkout fails `preparing`. A node agent restart while a build runs fails the build in its current phase with the error `node agent restarted`; builds are not resumed.
+- **Cancel.** `cancelled: true` stops the builder VM with a forced stop and reports `cancelled`.
+- **Log.** The builder VM's tagged output lines (the same path as app logs, `engine-trait.md` section 6) are parsed: rawjson objects become build events and plain lines are appended to the build's log next to its work directory, numbered from 1 (ADR 0119). The log is served by `build_logs` streams and `build_logs_query`, capped at 8 MiB per build (later lines are counted and dropped with one marker line), and kept for the last 20 builds of each app on this node and until the app's work disk is deleted. It is never sent unasked and never replicated; only the status and `failed_step` reach the primary (ADR 0014).
+
+**Defaults.** Until a contract change makes them configurable, the primary sends `limits` `{ "vcpus": 2, "memory_mb": 2048, "timeout_s": 1800, "cache_gb": 10, "output_gb": 10 }`.
+
+```json
+{
+  "build_id": "bld_01JC9ZA2B3C4D5E6F7G8H9J0KM",
+  "app_id": "app_01JC9Z7B3N5Q7S9Z1W3Y5A7C9E",
+  "project_id": "prj_01JC9Z5A1B2C3D4E5F6G7H8J9K",
+  "repo_url": "https://github.com/example/blog.git",
+  "ref": "main",
+  "dockerfile_path": "Dockerfile",
+  "context_dir": ".",
+  "build_args": { "NODE_ENV": "production" },
+  "secrets": {},
+  "limits": { "vcpus": 2, "memory_mb": 2048, "timeout_s": 1800, "cache_gb": 10, "output_gb": 10 },
+  "cancelled": false
+}
+```
 
 ## 7. Change-log follow
 
@@ -1240,7 +1465,7 @@ M0 ships the protocol, not the HA feature: the messages, the four node-side stat
 | M1 | Primary | `local` | Single node; the engine lifecycle runs, no stateful app exists yet |
 | M2 | Primary | `local` | Enrolls, follows the change log, reconciles desired state, emits events |
 | M3 | Primary | `local` | Same; the agent-driven calls arrive as desired-state changes from the API and MCP |
-| M4 | Primary | `local` | Adds console and metrics streams; leases unchanged |
+| M4 | Primary | `local` | Adds builds in desired state, build-log, metrics, terminal, console and transcript streams, `stream_input` and `stream_ack`; leases unchanged |
 | M5a | Primary | `local` | Cold backups; operator declaration of a lost node adds a lease revoke with a new token |
 | M5b | Primary plus witness quorum or external arbiter | `local`, `expiring` (`warm`) | Warm: renewal loop, `uncertain` handling, replication writes carrying tokens, restart persistence of held leases (section 8.4), concurrent fences (section 8.5) |
 | M6 | Quorum | `local`, `expiring` (`warm`, `hot`) | Automatic failover and `hot`; the same messages also carry `resource_type: primary` leases |
@@ -1280,6 +1505,8 @@ Threats and their mitigations are in `../architecture/threat-model.md`; this sec
 - **Provider credentials stay on the primary (D-0094).** A node never receives a provider's account credential. For a tunnel it receives only that tunnel's run token, which cannot create tunnels, write DNS records or reach another node's tunnel. For ACME it asks the primary to write `_acme-challenge.<hostname>` TXT records, and only for the `acme` routes of its own desired state (section 5.22), so a compromised node cannot write arbitrary records in the zone or obtain certificates for hostnames it does not serve.
 - **A compromised primary** can read everything the cluster stores — state, ciphertext it can decrypt with the cluster data-encryption key, and the telemetry that nodes stream on demand — and can issue desired state, lease grants and commands to every node. Until M5b it is also the lease authority, so it can grant the same lease to two nodes and run a stateful app twice; only a storage receiver that tracks the highest fencing token on its own side limits the damage. From M5b a quorum or external arbiter takes that power away from a single primary (D-0017). It cannot read a node's local store or its private key.
 - **A compromised node** can lie about observed state, emit false events and, within its lease, run whatever its stored desired state allows. It cannot forge desired state for other nodes, cannot mint credentials, and cannot write to shared storage with a stale token. Its blast radius is its own workloads, which is why stateful data stays protected by the lease and the token rather than by the honesty of the node.
+- **Terminal and console relay (M4).** The primary never touches a VM socket: it authorizes, audits and relays bytes between a client WebSocket and this session (ADR 0113, ADR 0114). The node agent, already root and already the only reader of VM sockets, is the only process that connects to a VM's vsock socket and its serial socket; both live in the VM's runtime directory, which only root can enter. The node never creates a `<socket>_<port>` listener, so a guest cannot open a vsock connection to the host. The guest is untrusted: the node bounds every frame it reads from it and treats its output as bytes, never as protocol. A `terminal` stream exists only because the primary opened it; a node never starts an exec session on its own.
+- **Builds (M4).** A build runs untrusted code: the Dockerfile and everything it fetches. It runs only inside a builder microVM, with `egress_only` networking and no isolation group (section 6.6), never on the host. Build secrets reach the node only inside the signed desired state, reach the builder VM only on its work disk for the duration of the build as BuildKit secret files, and are removed from the work disk when the build ends; the node never writes them to a build log, a `stream_data` or an event. The built image never leaves the node: it is imported locally and never pushed.
 
 ## 12. Local node store
 
@@ -1295,5 +1522,9 @@ The node keeps a SQLite file, owned by root, that holds everything it needs to r
 | `change_log` | Followed entries in `seq` order with `prev_hash` and `hash`, and the last acked `seq` | Verifies the chain and resumes follow |
 | `quarantine` | Metadata for each quarantined divergent copy: path, time, reason | Nothing divergent is deleted (D-0022) |
 | `cmd_results` | `msg_` id and outcome of the last answered intrusive messages | Makes a redelivered `lease_revoke` idempotent |
+| `builds` (M4) | Per build: `bld_` id, app, status, phase, resolved commit, image digest, failed step, the path of its log file, start and end times | Reports build progress in `status_report` across an agent restart; keeps the logs of the last 20 builds of each app (section 6.6) |
+| `transcripts` (M4) | Per terminal session: `trm_` id, VM, file path, size, SHA-256, start and end times | Serves `stream_open` kind `transcript` and enforces retention: 30 days and 1 GiB per node, oldest removed first (`audit-log-format.md` section 3.3) |
+
+Outside the SQLite file, in the VM's runtime directory, each VM also has its serial ring: two segments of 512 KiB that keep the newest serial output across VMM restarts (`engine-trait.md` section 3.19). The ring is removed with the VM. Metric samples are never stored: they live in memory only (section 5.17).
 
 The store is the reason a node can be restarted, upgraded or disconnected without stopping apps: it holds the signed intent, the applied reality, and the fencing state, and nothing in it depends on the control plane being reachable.

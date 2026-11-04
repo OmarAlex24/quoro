@@ -34,9 +34,9 @@ An audit record has no prefixed id; it is identified by its `seq`, which is gap-
 | `agent_model` | string | no | the agent's `model`, on agent records only |
 | `on_behalf_of` | `usr_` id | no | the human whose authority was lent |
 | `channel` | `api` \| `panel` \| `mcp` \| `cli` \| `system` | yes | how the action arrived |
-| `operation` | string | yes | the endpoint (`DELETE /api/v1/apps/{app_id}`) or the MCP tool name (`delete_app`) |
+| `operation` | string | yes | the endpoint (`DELETE /api/v1/apps/{app_id}`), the MCP tool name (`delete_app`), or `session.end` for the close of an interactive session (section 3.3) |
 | `scope` | scope string | no | the scope the call was authorized under; absent when the call needed none |
-| `target_type` | string | no | `app`, `vm`, `deployment`, `domain`, `project`, `node`, `incident`, `approval`, `grant`, `webhook`, `user`, `cluster` |
+| `target_type` | string | no | `app`, `vm`, `deployment`, `build`, `domain`, `project`, `node`, `incident`, `approval`, `grant`, `webhook`, `user`, `cluster` |
 | `target_id` | string | no | id of that target |
 | `project_id` | `prj_` id | no | project the target belongs to, when it has one |
 | `params` | JSON object | yes | the request parameters, secrets redacted (section 4) |
@@ -169,6 +169,10 @@ Each call or action in the rows marked "yes" below produces exactly one record (
 | approval requests filed, approved, denied, expired | yes | `ok` |
 | system actions: incident opened and resolved, incident grant issued and revoked, fencing-related lease revocations, node enrollment and removal | yes | `ok` / `error` |
 | audit verification runs | yes | `ok` / `error` |
+| the open of a terminal or console session (its `POST`) | yes, for every identity, as a mutating call | `ok` / `refused` / `error` |
+| the close of a terminal or console session, for any reason | yes: one `session.end` record (section 3.3) | `ok` / `error` |
+| a session transcript fetch, by any identity | yes, also for humans, because a transcript holds secrets (section 3.3) | `ok` / `refused` / `error` |
+| bytes, keystrokes and control frames inside a session | no; the transcript holds them on the node, and `session.end` carries its hash | — |
 | authentication failures (no resolvable identity) | no audit record; server log only | — |
 
 Why the split falls where it does:
@@ -197,6 +201,54 @@ The audit chain is separate from the change-log chain, but audit records travel 
 
 The `audit_log` table itself is the primary's copy; it is not a local table (see the "local" markings in [db-schema.sql](db-schema.sql)).
 
+### 3.3 Interactive sessions (M4)
+
+A web terminal or VM console session lasts minutes, and one record per call does not describe it (ADR 0115). A session therefore leaves exactly two records, the open and the end, paired by the session id.
+
+**The open** is the normal record of `POST /api/v1/apps/{app_id}/terminal-sessions` (scope `app:terminal`, `target_type` `app`) or `POST /api/v1/vms/{vm_id}/console-sessions` (scope `vm:console`, `target_type` `vm`). Its `params` are the request body plus the values the primary resolved: `session_id` (the `trm_` id the call minted, so the end record can be paired with it), `vm_id`, and for a terminal `rows`, `cols`, `command` (the argv that runs, after the default is applied) and `user` (absent when the app's own user applies); for a console `tail_bytes`. The single-use ticket is never in `params`. A refused or failed open writes its record and no session exists.
+
+**The end** is a record the primary writes when an opened session closes for any reason, including a ticket that was never used and a primary restart that lost the session (`interactive_sessions` in [db-schema.sql](db-schema.sql) migration 0005 lets it close those at start-up):
+
+| Field | Value |
+| --- | --- |
+| `actor_type`, `actor_id`, `agent_model`, `on_behalf_of`, `channel` | the same as the open's |
+| `operation` | `session.end` |
+| `scope` | the open's scope (`app:terminal` or `vm:console`) |
+| `target_type`, `target_id`, `project_id` | the open's |
+| `grant_id` | the open's, when an agent opened it |
+| `request_id` | the `req_` id of the `DELETE /api/v1/interactive-sessions/{session_id}` that ended it, or a new `req_` id minted by the primary for any other close; never the open's id, which belongs to the open call |
+| `result` | `ok`, or `error` when `close_reason` is `error` or `node_disconnected` |
+| `result_detail` | absent, or the error code when `result` is `error` |
+| `change_seq` | absent; a session changes no replicated state |
+| `params` | the object below |
+
+| `params` field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `session_id` | `trm_` id | yes | the session, as in the open's `params` |
+| `kind` | `terminal` \| `console` | yes | |
+| `node_id` | `nod_` id | yes | the node that ran the session and holds its transcript |
+| `vm_id` | `vm_` id | yes | the VM the session was attached to |
+| `opened_at` | RFC 3339 | yes | when the open was recorded |
+| `connected` | boolean | yes | whether a WebSocket ever attached; false when the ticket expired unused |
+| `duration_ms` | integer | yes | from the open to the close |
+| `bytes_in` | integer | yes | bytes the client sent into the session (always 0 for a console) |
+| `bytes_out` | integer | yes | bytes the session sent to the client |
+| `exit_code` | integer | no | the program's exit code, terminal sessions whose program exited |
+| `close_reason` | string | yes | one of `exited`, `ended_by_client`, `ended_by_request`, `ticket_expired`, `idle_timeout`, `max_duration`, `access_revoked`, `credential_expired`, `vm_stopped`, `node_disconnected`, `transcript_limit`, `primary_restarted`, `error` (meanings in [openapi.yaml](openapi.yaml), `InteractiveSessionCloseReason`) |
+| `ended_by` | `usr_` or `agt_` id | no | who called the `DELETE`, when `close_reason` is `ended_by_request` |
+| `transcript_sha256` | 64 lowercase hex chars | no | SHA-256 of the transcript file exactly as the node stored it; terminal sessions that connected |
+| `transcript_bytes` | integer | no | size of that file |
+
+Because `session.end` is chained like every record, a transcript edited after the session ended no longer matches `transcript_sha256`, and the edit is evident (ADR 0031, ADR 0115).
+
+**Transcripts.** A terminal session's transcript is recorded by the node that runs it, never sent to the primary unless a human fetches it, and never part of the audit log, the change log or the off-site copy (ADR 0014, ADR 0115):
+
+- **Format:** asciicast v2 (newline-delimited JSON): a header line `{"version": 2, "width": <cols>, "height": <rows>, "timestamp": <unix seconds>, "env": {"TERM": ...}}`, then one event line per chunk, `[<seconds since start>, "i" | "o" | "r", <data>]`: `i` input, `o` output, `r` resize as `"<cols>x<rows>"`. Bytes that are not valid UTF-8 are written with U+FFFD replacement in `<data>`; the hash covers the file as written.
+- **Cap:** 16 MiB per session. When the next chunk would pass the cap the node ends the session with `close_reason` `transcript_limit`, so no part of a session is unrecorded.
+- **Console sessions have no transcript.** They are read-only and show the VM's own serial output, which the node already keeps in its console ring (ADR 0116); their `session.end` carries no transcript fields.
+- **Retention:** 30 days on the node, and at most 1 GiB of transcripts per node, the oldest deleted first. Deleting the app or its VM does not delete them; removing the node or purging its data does. A deleted transcript leaves its `session.end` record, whose hash then has nothing to verify.
+- **Access:** `GET /api/v1/interactive-sessions/{session_id}/transcript`, which needs `audit:read` and a human caller (permission-model.md, section 7.6). The primary relays the file from the node over the node session, on demand; it answers `node_unreachable` (504) when the node is not connected and `not_found` (404) when the node no longer has the file. Every fetch is recorded, with `target_type` `vm`, the session's VM as `target_id` and `params` `{session_id}`.
+
 ## 4. Redaction
 
 Requests can carry secrets. The audit record stores the request parameters, so it must not become a second secret store (D-0031).
@@ -206,6 +258,8 @@ The redaction rule:
 - The values of the keys `value`, `values`, `secret`, `password`, `token` and `key` are replaced by the string `"[redacted]"`, at any depth of the `params` object.
 - **Every environment variable value** is replaced by `"[redacted]"`, whatever the key is called. Environment variable *names* are kept, because a name is not a secret and the record of which variable changed is the useful part (D-0031; [openapi.yaml](openapi.yaml), `app_env`).
 - Everything else is stored as sent.
+
+Build arguments (`source.build_args[].value` in [openapi.yaml](openapi.yaml)) are not secrets, since they end up in the image's history, but they sit under the key `value` and are therefore redacted like every other `value`. Build secrets are passed by name only (the names of app environment variables), so their values never reach a request.
 
 Provider credentials are covered by the `secret` key: the requests that carry them (`POST /api/v1/providers` and `POST /api/v1/providers/{provider_id}/rotate` in [openapi.yaml](openapi.yaml)) put the credential under `secret`, so it is redacted like any other secret (D-0051).
 

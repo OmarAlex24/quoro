@@ -60,6 +60,16 @@ pub struct ImageRef {
     pub digest: ImageDigest,
 }
 
+/// An OCI image layout on the node, as a builder wrote it. Added in M4.
+/// Section 3.17.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OciLayout {
+    /// Directory or tarball of the layout (OCI image-layout 1.0).
+    pub path: PathBuf,
+    /// Digest of the image manifest the layout's index names.
+    pub manifest_digest: ImageDigest,
+}
+
 /// A rootfs that is ready to boot. Cached by digest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedImage {
@@ -95,7 +105,19 @@ pub struct VmSpec {
     pub volumes: Vec<VolumeAttach>,
     pub net: NetAttach,
     pub init: InitConfig,
+    /// Where the app's tagged output goes (section 3.13). From M4 the node
+    /// agent sets `VirtioConsole` for apps and builder VMs alike.
     pub console: ConsoleMode,
+    /// The serial port (`ttyS0`): kernel and init diagnostics. From M4 the node
+    /// agent sets `Socket`, and the engine is its only client (section 3.19,
+    /// ADR 0116). Added in M4.
+    pub serial: SerialMode,
+    /// The virtio-vsock device that carries exec sessions (section 3.18,
+    /// ADR 0113). `None` means no device. Added in M4.
+    pub vsock: Option<VsockAttach>,
+    /// Extra writable disks that outlive the VM, identified by serial. Only
+    /// builder VMs use them (ADR 0118); app VMs carry none. Added in M4.
+    pub work_disks: Vec<WorkDisk>,
 }
 
 impl VmSpec {
@@ -140,6 +162,10 @@ pub struct NetAttach {
     /// reach no other VM. The node agent sets it to the VM's project id
     /// (`prj_`). Section 3.3.
     pub isolation_group: Option<String>,
+    /// Egress only: the VM reaches the outside through the gateway and nothing
+    /// on the node, neither another VM nor the host (section 3.3). Builder VMs
+    /// set it, with `isolation_group: None` (ADR 0118). Added in M4.
+    pub egress_only: bool,
 }
 
 /// The app's command line and identity, as the minimal init must apply it.
@@ -160,7 +186,41 @@ pub enum ConsoleMode {
     /// virtio-console to this UNIX socket; carries tagged stdout/stderr lines.
     VirtioConsole { socket: PathBuf },
     /// Serial console to this UNIX socket; interactive text, one client at a time.
+    /// Superseded in M4 by `VmSpec::serial` (section 3.14); a spec that sets it
+    /// together with a `serial` other than `Off` is `Conflict`.
     Serial { socket: PathBuf },
+}
+
+/// How the serial port (`ttyS0`) is attached. Added in M4. Section 3.19.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SerialMode {
+    /// No serial device.
+    Off,
+    /// Serial output appended to this file (the M1-M3 behaviour).
+    File { path: PathBuf },
+    /// Serial port on this UNIX socket; the engine connects to it as the only
+    /// client from `create` on and keeps a node-local ring of its output.
+    Socket { path: PathBuf },
+}
+
+/// A virtio-vsock device in Cloud Hypervisor's hybrid mode: the host end is a
+/// UNIX socket in the VM's runtime directory. Added in M4. Section 3.18.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VsockAttach {
+    /// Guest context id. Each VM has its own vsock namespace, so every VM uses 3.
+    pub cid: u32,
+    pub socket: PathBuf,
+}
+
+/// A writable disk that the engine attaches but does not own: `delete` keeps
+/// it, and the node agent removes it. Added in M4. Section 3.6.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkDisk {
+    pub path: PathBuf,
+    /// Size of the disk when the engine has to create it.
+    pub size_gb: u32,
+    /// virtio-blk serial the guest finds it by, for example `quoro-work`.
+    pub serial: String,
 }
 ```
 
@@ -242,6 +302,8 @@ pub struct Capabilities {
     pub graphical_console: bool, // false
     pub vm_snapshot: bool,
     pub volume_snapshot: bool,
+    /// Whether `exec` works on this backend and build (section 3.18). Added in M4.
+    pub exec: bool,
 }
 
 /// The node network a VM is attached to. Section 3.3.
@@ -307,6 +369,32 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + ?Sized> ConsoleIo for T {}
 /// One end of a text console connection.
 pub type ConsoleStream = Pin<Box<dyn ConsoleIo>>;
 
+/// Raw bytes in arrival order, for example a VM's serial output. Added in M4.
+pub type ByteStream = Pin<Box<dyn Stream<Item = Vec<u8>> + Send>>;
+
+/// A program to run in a running VM, on a PTY. Added in M4. Section 3.18.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecRequest {
+    /// The argv; `argv[0]` without `/` is searched in the app's `PATH`.
+    pub argv: Vec<String>,
+    /// A user name or uid, optionally `:` and a group name or gid; `None` is the app's own user.
+    pub user: Option<String>,
+    pub rows: u16,
+    pub cols: u16,
+}
+
+/// One exec session. Added in M4. Section 3.18.
+pub struct ExecSession {
+    /// The PTY: reads are the program's output, writes are its input. Dropping
+    /// or shutting it down ends the session (`SIGHUP` to its process group).
+    pub io: ConsoleStream,
+    /// Resize requests as `(rows, cols)`.
+    pub resize: tokio::sync::mpsc::Sender<(u16, u16)>,
+    /// Resolves once with the program's exit code, `128 + signal` when a
+    /// signal ended it; an error when the session ended without one.
+    pub exit: tokio::sync::oneshot::Receiver<i32>,
+}
+
 /// The boundary behind which a virtual machine monitor sits.
 ///
 /// The async methods return `impl Future<Output = _> + Send`, so a caller
@@ -333,6 +421,17 @@ pub trait Engine: Send + Sync {
         &self,
         digest: &ImageDigest,
     ) -> impl Future<Output = Result<(), EngineError>> + Send;
+    /// Added in M4; section 3.17.
+    fn prepare_layout(
+        &self,
+        _layout: &OciLayout,
+    ) -> impl Future<Output = Result<PreparedImage, EngineError>> + Send {
+        async {
+            Err(EngineError::Unsupported(
+                "local OCI layouts are not implemented by this engine".into(),
+            ))
+        }
+    }
 
     // Lifecycle
     fn create(&self, spec: &VmSpec) -> impl Future<Output = Result<VmInfo, EngineError>> + Send;
@@ -351,6 +450,26 @@ pub trait Engine: Send + Sync {
     fn output(&self, id: &VmId) -> Result<LineStream, EngineError>;
     fn console(&self, id: &VmId) -> Result<ConsoleStream, EngineError>;
     fn counters(&self, id: &VmId) -> impl Future<Output = Result<VmCounters, EngineError>> + Send;
+
+    // Interactive access (M4; default implementations return Unsupported)
+    /// Section 3.18.
+    fn exec(
+        &self,
+        _id: &VmId,
+        _request: &ExecRequest,
+    ) -> impl Future<Output = Result<ExecSession, EngineError>> + Send {
+        async { Err(EngineError::Unsupported("exec is not implemented by this engine".into())) }
+    }
+    /// Section 3.19.
+    fn serial_output(
+        &self,
+        _id: &VmId,
+        _tail_bytes: Option<u64>,
+    ) -> Result<ByteStream, EngineError> {
+        Err(EngineError::Unsupported(
+            "serial output is not implemented by this engine".into(),
+        ))
+    }
 
     // Volumes (M5; default implementations return Unsupported)
     fn snapshot_volume(
@@ -389,7 +508,9 @@ pub struct HostProbe {
 }
 ```
 
-The derives, `MacAddr`, the blanket `ConsoleIo` implementation, `Display` and `Error` for `EngineError` and `VmSpec::canonical` (section 3.6) are contract items (D-0071), added additively during M0. `events`, `output` and `console` are not `async` because they only build a stream; the first item is produced by the stream itself.
+The derives, `MacAddr`, the blanket `ConsoleIo` implementation, `Display` and `Error` for `EngineError` and `VmSpec::canonical` (section 3.6) are contract items (D-0071), added additively during M0. `events`, `output`, `console` and `serial_output` are not `async` because they only build a stream; the first item is produced by the stream itself.
+
+M4 adds, additively: `VmSpec::serial`, `VmSpec::vsock` and `VmSpec::work_disks` with `SerialMode`, `VsockAttach` and `WorkDisk`; `NetAttach::egress_only`; `Capabilities::exec`; `OciLayout`, `ByteStream`, `ExecRequest` and `ExecSession`; and the methods `prepare_layout`, `exec` and `serial_output`, whose default implementations return `Unsupported`, so a backend that does not offer them still compiles. Code that builds a `VmSpec`, `NetAttach` or `Capabilities` literal sets the new fields to `SerialMode::File` (the M1-M3 serial log), `None`, an empty list, `false` and `false`, which keeps the M1-M3 behaviour. `VmSpec::canonical` keeps `work_disks` in order: their serials are unique, so the order carries no meaning, but the node agent always builds them in the same order.
 
 ## 3. Method semantics
 
@@ -397,7 +518,7 @@ Every method is total in the sense that it either succeeds or returns one `Engin
 
 ### 3.1 `capabilities`
 
-Reports what this backend and build support. It never fails: a missing binary or an unusable host is reported as `kvm: false`, not as an error, because the node agent must be able to report a node's real state without a working engine. `engine` is the backend name, `version` the pinned build, and `graphical_console` is `false` for Cloud Hypervisor: it has no VNC, SPICE, GPU or framebuffer device, and its consoles are text only (F-0034). `text_console` is `true`. `vm_snapshot` reports whether the backend can snapshot VM memory and device state; that capability is not used by Quoro before M5 and never as a volume backup (F-0035).
+Reports what this backend and build support. It never fails: a missing binary or an unusable host is reported as `kvm: false`, not as an error, because the node agent must be able to report a node's real state without a working engine. `engine` is the backend name, `version` the pinned build, and `graphical_console` is `false` for Cloud Hypervisor: it has no VNC, SPICE, GPU or framebuffer device, and its consoles are text only (F-0034). `text_console` is `true`. `exec` reports whether `exec` (section 3.18) works: the backend attaches vsock devices and the guest init it ships listens for exec sessions. `vm_snapshot` reports whether the backend can snapshot VM memory and device state; that capability is not used by Quoro before M5 and never as a volume backup (F-0035).
 
 ### 3.2 `probe_host`
 
@@ -418,6 +539,8 @@ The identity of a network is `bridge`, `subnet` and `gateway`. `dns` is not part
 
 **Isolation groups.** Every VM on the bridge is isolated from every other VM on it, except from the VMs that carry the same `NetAttach::isolation_group` (D-0084). Two VMs with the same group exchange traffic over the bridge in both directions; two VMs with different groups, or a VM whose group is `None`, exchange nothing — neither frames on the bridge nor packets routed through the gateway. Every VM still reaches the gateway and, through it, the outside, and the host still opens connections to every VM, because the ingress runs on the host. The node agent sets the group to the VM's `project_id`, so the VMs of one project reach each other and VMs of different projects do not. The rule is enforced by the engine and holds across VM creates, deletes and an agent restart; the group is part of the VM's spec, so it is compared by `create` (section 3.6) like every other field.
 
+**Egress only.** A VM whose `NetAttach::egress_only` is `true` reaches the outside through the gateway and nothing else on the node: no other VM, whatever its group; no address of the host (the node API, the ingress listeners, the node's own services), except the DNS servers in `NodeNetwork::dns` on port 53; and no link-local address (`169.254.0.0/16`). The host may still open connections to it. Builder VMs run untrusted Dockerfiles with outbound network to fetch bases and dependencies, and this is their boundary (ADR 0118). `egress_only` with an `isolation_group` other than `None` is `Conflict`.
+
 ### 3.4 `prepare_image`
 
 Pulls the OCI image, verifies that the pulled content matches `ImageRef::digest`, converts it into a rootfs image, records the extracted `ImageConfig`, and caches the result by digest.
@@ -425,6 +548,7 @@ Pulls the OCI image, verifies that the pulled content matches `ImageRef::digest`
 - Precondition: `reference` and `digest` are well formed.
 - Postcondition: `PreparedImage::rootfs_path` exists and boots; a second call with the same digest returns the cached value without network access.
 - Idempotent by digest. A digest mismatch between the reference and the pulled content is `Image`.
+- A local OCI layout written by a builder takes `prepare_layout` instead (section 3.17); both fill the same cache.
 - The conversion approach is decided (D-0061): Quoro's own OCI-to-ext4 pipeline, with a Rust registry client and `mkfs.ext4 -d`, validated by the M0 spike in `spikes/oci-microvm`. Three gaps must be closed before the pipeline ships: resolve layer paths inside the rootfs with `openat2` `RESOLVE_IN_ROOT` instead of refusing absolute-symlink parents, support zstd layers, and deliver the configuration through a config disk or the kernel command line instead of baking it into the rootfs.
 
 ### 3.5 `remove_image`
@@ -439,6 +563,8 @@ Creates the VM and its runtime state without starting it. One microVM per app in
 - The same `id` with a different spec is `Conflict`. Equality is compared on the canonical form of `VmSpec`, `VmSpec::canonical()`, which sorts `env` by `(name, value)` and `volumes` by `(volume_id, mount_path)`; everything else keeps its order, so field order and the ordering of those two lists must be normalized before comparison.
 - Resources are reserved at `create`, so `ResourceExhausted` is returned here rather than at `start`.
 - Precondition: `rootfs` is the digest of a prepared image, `net` is inside a network already ensured by `ensure_network`, and `volumes` are attached to this node.
+- `serial: Socket` makes the engine connect to the serial socket as soon as it exists, before boot, so the ring of section 3.19 holds the whole boot. `vsock` attaches the device; its socket lives in the VM's runtime directory, which only root can enter.
+- Each `WorkDisk` is attached as a writable virtio-blk disk with its serial. A missing file is created as an empty ext4 filesystem of `size_gb`; an existing file is attached as it is. Two VMs that name the same work-disk path at once is `Conflict`. The engine never removes a work disk (section 3.9).
 
 ### 3.7 `start`
 
@@ -458,7 +584,7 @@ Stops a VM.
 
 ### 3.9 `delete`
 
-Removes the VM and its own disks. Missing id returns `Ok`, so a retried delete converges. Volumes are never removed by `delete`: they belong to the app, not to the instance, and are deleted through the API with `app:delete` (D-0033, `README.md`). Postcondition: the VMM process is gone, the root and data disks are removed, and `inspect` returns `NotFound`. Precondition: the VM is stopped; a call on a running VM is `Conflict`.
+Removes the VM and its own disks. Missing id returns `Ok`, so a retried delete converges. Volumes are never removed by `delete`: they belong to the app, not to the instance, and are deleted through the API with `app:delete` (D-0033, `README.md`). Postcondition: the VMM process is gone, the root and data disks are removed, and `inspect` returns `NotFound`. Work disks are kept too: the node agent owns them and removes them with the app (ADR 0118). The serial ring of section 3.19 is removed with the runtime directory. Precondition: the VM is stopped; a call on a running VM is `Conflict`.
 
 ### 3.10 `inspect`
 
@@ -480,9 +606,13 @@ A stream of `OutputLine` for one VM: the app's stdout and stderr, tagged by stre
 
 A bidirectional byte stream on the text console: a human types into a terminal in the panel, and the bytes reach the guest's serial console (F-0034; consoles are text-only, xterm.js over serial or virtio-console, D-0056). Used from M4 (D-0033). Text only; there is no graphical console to attach to (F-0034, D-0056). The Cloud Hypervisor console socket accepts one client at a time, so a second concurrent call is `Conflict` (`docs/research/cloud-hypervisor.md`).
 
+**Superseded in M4.** A second connection to a Cloud Hypervisor serial socket silently takes the port away from the current client, and nothing in the guest reads the serial port, so a direct, bidirectional connection per viewer is unsafe and useless (ADR 0116). The M4 console is read-only and comes from `serial_output` (section 3.19); the web terminal comes from `exec` (section 3.18). `console` stays for `ConsoleMode::Serial` specs and for `FakeEngine`; on a VM whose `serial` is `Socket` it is `Conflict`. Nothing in the node agent calls it from M4.
+
 ### 3.15 `counters`
 
 Returns the VM's counters for metrics (M4, D-0033). Unknown id is `NotFound`. Values are cumulative since VM start; the node agent computes rates. Counters are best-effort: a backend that cannot report one of the groups returns zeros for it rather than failing the call.
+
+The M4 metrics use two of them (ADR 0014, `node-agent-protocol.md` sections 5.15 and 5.17): `cpu_time_ms` and `memory_rss_bytes`, which the Cloud Hypervisor backend reads from the VMM process on the host (`/proc/<pid>/stat` and `/proc/<pid>/status`), not from the backend's counter document, so they need no guest agent. The node agent samples them every 5 seconds.
 
 ### 3.16 `snapshot_volume` and `delete_volume_snapshot`
 
@@ -491,6 +621,37 @@ The point-in-time disk primitive the chunk engine needs (D-0023). Both are `Unsu
 - The primitive for M5a is decided (D-0062): reflink snapshots with a full content-defined chunk scan for cold backups. Before M5b, a spike comparing lvm-thin and btrfs chooses the primitive for warm volumes.
 - They must **not** be implemented with Cloud Hypervisor VM snapshots. A CH snapshot is a paused VM's `config.json`, `memory-ranges` and `state.json`; it contains guest RAM and device state but no disk contents, and CH exposes no dirty bitmap (F-0035). A volume snapshot is about the disk.
 - If implemented with a filesystem primitive, the call takes no VMM lock: it snapshots the volume of a stopped or running VM as the chosen primitive allows, and the chunk engine handles crash consistency (D-0023).
+
+### 3.17 `prepare_layout`
+
+Turns a local OCI image layout, as a builder VM wrote it on its work disk, into a prepared rootfs, the way `prepare_image` does for a pulled image (ADR 0117, ADR 0118). Added in M4.
+
+- Precondition: `path` is a readable OCI image layout whose index names `manifest_digest`.
+- The engine verifies every blob against its digest, checks that the manifest's digest is `manifest_digest`, applies the layers with the same pipeline as `prepare_image` (D-0061), extracts `ImageConfig`, and caches the result by `manifest_digest` in the same cache. `create` then boots it with `rootfs` set to that digest, and `remove_image` removes it.
+- Idempotent by digest: a second call with a digest already cached returns the cached value without reading the layout.
+- A missing or malformed layout, a blob that does not match its digest, a media type the pipeline does not support, or a layout larger than the node's image limit is `Image`. Nothing is pulled: a layout that references a blob it does not contain is `Image`, not a registry fetch.
+- The engine never deletes the layout; the node agent does, after the call returns.
+
+### 3.18 `exec`
+
+Starts a program on a PTY inside a running VM, in the app's root filesystem, with the app's environment and working directory, and returns its byte stream (ADR 0113). Added in M4; the web terminal is its only caller.
+
+- The engine connects to the VM's vsock socket with Cloud Hypervisor's hybrid handshake (`CONNECT <port>\n`, answered `OK <port>\n`) on the init's exec port (section 6), and sends the open request. The guest init runs the program and relays bytes; the engine relays them to `ExecSession::io`.
+- `argv` is non-empty, holds no NUL, and is at most 64 items of at most 4096 bytes. `rows` and `cols` are 1 to 1000. Otherwise `Conflict`.
+- An unknown id is `NotFound`. A VM that is not `Running`, has no `vsock`, or whose init does not listen (a VM started before its node got the M4 init) is `Conflict`. A missing program is not an error of the call: the session starts and `exit` resolves with `127`.
+- Many sessions per VM may be open at once. Each is independent: closing one does not touch another, and the app keeps running.
+- Back-pressure: when the reader of `io` stops reading, the engine stops reading from the vsock connection, which stops the program at its next write. A session never buffers without bound.
+- The guest is untrusted. The engine bounds every frame it reads from the guest (section 6) and treats output as bytes, never parsing it.
+- The vsock socket accepts connections from the host only; the node never creates a `<socket>_<port>` listener, so the guest cannot open a connection to the host over vsock.
+
+### 3.19 `serial_output`
+
+A read-only stream of a VM's serial output: first up to `tail_bytes` of the newest bytes the node kept (all of it when `None`), then live output until the VM is deleted or the caller drops the stream (ADR 0116). Added in M4.
+
+- With `serial: Socket`, the engine is the socket's only client, from `create` on. It appends what it reads to a node-local ring in the VM's runtime directory: two segments of 512 KiB, the older one dropped when the newer one fills, so the ring holds at most 1 MiB and survives VMM restarts, which keeps the previous boot's output after a crash loop. While the node agent restarts, the VMM keeps up to 1 MiB of output and replays it when the engine reconnects.
+- Any number of streams may be open on one VM; each one reads the ring and then follows, so viewers never connect to the socket.
+- An unknown id is `NotFound`. A VM whose `serial` is not `Socket` is `Conflict`.
+- Input is never written to the serial port: nothing in the guest reads it.
 
 ## 4. Concurrency
 
@@ -510,7 +671,7 @@ One `cloud-hypervisor` process per VM with its own `--api-socket`, because the V
 | `ensure_network` | Creates the bridge, the gateway address and the forwarding rules; each VM gets a TAP on that bridge | No backend call; the TAP is created per VM with the network device |
 | `prepare_image` | Pulls, verifies the digest, builds the rootfs, extracts `ImageConfig`, caches by digest (D-0061) | No backend call |
 | `remove_image` | Deletes the cached rootfs directory | No backend call |
-| `create` | Creates the runtime directory, starts the VMM with `--api-socket <dir>/api.sock`, then configures the VM: direct kernel boot of the Quoro-provided guest kernel, rootfs as a virtio-blk disk, the writable disk and any volumes as further virtio-blk disks, the network device on the node bridge, the console socket | Process start, then `/vm.create` |
+| `create` | Creates the runtime directory, starts the VMM with `--api-socket <dir>/api.sock`, then configures the VM: direct kernel boot of the Quoro-provided guest kernel, rootfs as a virtio-blk disk, the writable disk and any volumes and work disks as further virtio-blk disks, the network device on the node bridge, the console socket, the serial socket and the vsock device; then connects to the serial socket | Process start, then `/vm.create` |
 | `start` | Boots the configured VM | `/vm.boot` |
 | `stop` graceful | Asks the guest to stop and waits for the process to exit | `/vm.power-button`, then `/vm.info` until stopped |
 | `stop` force | Shuts the VMM down; if the socket does not answer, kills the process and reaps it | `/vmm.shutdown`, else `SIGKILL` on the VMM pid |
@@ -520,6 +681,9 @@ One `cloud-hypervisor` process per VM with its own `--api-socket`, because the V
 | `events` | Watches the VMM process for exit and confirms the resulting state; a requested stop is distinguished from an unexpected exit | Process reaping, `/vm.info` |
 | `output` | Connects to the VM's virtio-console socket and parses the init's tagged lines | Reads the `--console socket=` endpoint |
 | `console` | Connects to the VM's serial socket and relays bytes in both directions, one client at a time | Reads and writes the `--serial socket=` endpoint (F-0034) |
+| `prepare_layout` | Verifies the layout's blobs, builds the rootfs with the `prepare_image` pipeline, caches by manifest digest (section 3.17) | No backend call |
+| `exec` | Connects to `<vm dir>/vsock.sock`, sends `CONNECT` for the exec port, then the open frame; relays frames to the PTY stream (section 3.18) | Hybrid vsock socket; no API call |
+| `serial_output` | Reads the node-local ring, then follows the engine's own serial client (section 3.19) | No backend call; the client reads the `--serial socket=` endpoint |
 | `counters` | Reads the VM's I/O and device counters and maps them to `VmCounters`; the exact field names of the backend's counter document are not fixed by `docs/research/cloud-hypervisor.md`, so the mapping is **Hypothesis** | `/vm.counters` |
 | `snapshot_volume` | Default: `Unsupported`. When implemented: a filesystem-level snapshot of the volume (reflink snapshot for M5a, D-0062) | No `/vm.snapshot` call (F-0035) |
 | `delete_volume_snapshot` | Default: `Unsupported`. When implemented: removes the filesystem-level snapshot | No backend call |
@@ -529,6 +693,7 @@ Details that follow from the research file:
 - **Direct kernel boot**, not firmware: `--kernel` with the Quoro-provided guest kernel and `--cmdline`. The firmware path adds a bootloader stage and is not needed for a Linux-only guest (`docs/research/cloud-hypervisor.md`).
 - **One pinned release per node-agent build.** Cloud Hypervisor has no versioned v2 API to design against, and neither snapshots nor live migration are portable across versions (`docs/research/cloud-hypervisor.md`). The pin is reported in `capabilities` and in `engine_version` in `hello`.
 - **Console is a socket, not a pty.** `--serial socket=<path>` and `--console socket=<path>` are the v54 forms; a socket serves one client at a time and accepts a new one after the current one disconnects (F-0034, `docs/research/cloud-hypervisor.md`). That is why `console` reports `Conflict` on a second reader.
+- **M4 devices.** Every VM gets `--vsock cid=3,socket=<vm dir>/vsock.sock` and `--serial socket=<vm dir>/serial.sock`, with `--console file=` or `socket=` carrying the app's tagged output as before. The kernel command line keeps `loglevel=4`: a boot then writes about 600 bytes to the serial port, which is the guest's boot output the console shows, and a higher level costs boot time on the emulated UART (ADR 0116).
 - **State files under the per-VM runtime directory** — spec, sockets, the VMM pid — so `list` can rediscover a running VM after an agent restart without restarting it (D-0011).
 
 ## 6. Guest contract with the minimal init
@@ -545,6 +710,7 @@ The minimal init is part of the engine workstream and is the only process Quoro 
 | Working directory | The app's working directory |
 | Network | Address, prefix length, gateway, interface name and the DNS servers of the node network (`NodeNetwork::dns`) |
 | Console | Which console carries log lines |
+| Exec port | The vsock port the init listens on for exec sessions (M4) |
 
 **What the init must do.**
 
@@ -555,6 +721,12 @@ The minimal init is part of the engine workstream and is the only process Quoro 
 5. Reap orphaned children so no zombie accumulates, and forward signals to the app where they matter.
 6. On the power-button signal, send `SIGTERM` to the app, wait for it to exit or for the timeout to pass, then power the guest off.
 7. Report the app's exit code so the engine can surface it as `exit_code` and as `EngineEvent::Exited`.
+8. From M4, mount `cgroup2` on `/sys/fs/cgroup`, which BuildKit needs and app images may expect (ADR 0118).
+9. From M4, listen for exec sessions (below), and unmount or remount read-only every writable disk before powering off, so the node reads a work disk without journal recovery (ADR 0118).
+
+**Configuration version 2 (M4).** The init's configuration grammar refuses unknown keys, so M4 adds one: the header becomes `quoro-init-config v2`, and one line `exec_port=<u32>` follows `stop_timeout_ms` (`crates/init/README.md`). The engine writes `exec_port=1024`. The init still accepts a `v1` configuration and then starts no exec listener. The engine and the init ship together: the initramfs is rebuilt from the installed init, so a VM gets the new init at its next start, and a VM that kept running across the upgrade answers `exec` with `Conflict` until it restarts.
+
+**Exec sessions (M4).** After the switch into the app's root and before the app starts, the init listens on vsock port `exec_port` for the VM's lifetime; vsock delivers only connections from the host to a guest listener (ADR 0113). One connection is one session. Every frame is `[u8 type][u32 length, big-endian][payload]`, with a payload of at most 64 KiB; a larger or unknown frame ends the session. Host to guest: `1` open (JSON `{"argv":[...],"user":null|"...","rows":R,"cols":C}`, exactly once, first), `2` input bytes, `3` resize (`u16 rows`, `u16 cols`, big-endian), `4` close. Guest to host: `129` output bytes, `130` exit (`i32` big-endian, `128 + signal` when a signal ended the program), `131` error (UTF-8 message, then the guest closes). Per session the init allocates a PTY and starts the program as a session leader with the PTY as its controlling terminal, the app's environment with `TERM=xterm-256color`, the app's working directory, and the app's user unless the open names another. Because the workspace forbids `unsafe`, the init re-executes itself (`/proc/self/exe` with a helper argument) as a small helper that calls `setsid`, takes the PTY as its controlling terminal on stdin, stdout and stderr, and replaces itself with the program. A close, or the host dropping the connection, sends `SIGHUP` to the session's process group. The exec listener never writes to the app's stdout or to the log console.
 
 While the app is running, the init must not write to the app's stdout, so a log line's stream tag is never ambiguous. On a failed boot — no configuration, a missing entrypoint, an unmountable disk — the init writes a diagnostic to the serial console and powers off with a non-zero code, so the failure surfaces as a `deployment.failed` event in the `boot` phase rather than as a silent hang.
 
@@ -565,7 +737,8 @@ Tests must run on machines without KVM, including CI and the laptops of people w
 - In memory: VMs are records, `create`/`start`/`stop`/`delete` change their state, `list` returns exactly what was created since the instance started.
 - Deterministic: no timers, no threads, no wall-clock dependence beyond explicit calls. Boots complete when `start` returns.
 - Injectable: a test can make a VM crash after N seconds, make `start` return `ResourceExhausted`, make `prepare_image` return `Image`, and make the console echo, so every error path and every event the node agent must map is reachable.
-- Streams: `events`, `output` and `console` are real streams over in-memory channels, so the node agent's stream handling is exercised, not stubbed.
+- Streams: `events`, `output`, `console` and `serial_output` are real streams over in-memory channels, so the node agent's stream handling is exercised, not stubbed.
+- M4 methods: `prepare_layout` caches a fake prepared image by manifest digest; `exec` returns an in-memory session that echoes input and can be told to exit with a code; `serial_output` replays and follows an injectable byte buffer. `Capabilities::exec` is `true`.
 - Volume methods: `snapshot_volume` and `delete_volume_snapshot` succeed and record a snapshot descriptor, so the M5 chunk-engine code is testable before a real primitive exists.
 
 The node agent runs its protocol tests against `FakeEngine`: the M0 lease tests — revoking a `local` lease and expiring a test-only short `expiring` lease — need no VM at all beyond a fake (`node-agent-protocol.md`).
@@ -585,5 +758,5 @@ The node agent runs its protocol tests against `FakeEngine`: the M0 lease tests 
 | M0 | The trait, `FakeEngine`, and the spike that boots a microVM from an OCI image (D-0033) |
 | M1 | `create`, `start`, `stop`, `delete`, `list`, `inspect`, `prepare_image`, `ensure_network` (D-0033) |
 | M2 | `output` feeds live app logs (D-0014, D-0033); isolation groups on `NetAttach` and guest DNS on `NodeNetwork` (D-0084) |
-| M4 | `console` and `counters` (D-0033) |
+| M4 | `counters` for metrics (D-0033, ADR 0014); `serial_output` and `VmSpec::serial` for the read-only console (ADR 0116); `exec` and `VmSpec::vsock` for the web terminal, with init configuration v2 (ADR 0113); `prepare_layout`, `VmSpec::work_disks` and `NetAttach::egress_only` for builds (ADR 0117, ADR 0118). `console` is superseded |
 | M5a/M5b | `snapshot_volume` and `delete_volume_snapshot`: reflink snapshots for M5a, the primitive chosen by the lvm-thin vs btrfs spike for M5b (D-0023, D-0062) |

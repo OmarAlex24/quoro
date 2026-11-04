@@ -523,6 +523,18 @@ async fn app_validation_and_authorization() {
     let mut body = create_body(&project_id);
     body["project_id"] = json!(quoro_types::new_id(quoro_types::Prefix::Project));
     cases.push(("unknown project", body));
+    // Exactly one of `image` and `source`; Git sources wait for the builds epic.
+    let source = json!({ "kind": "git", "repo_url": "https://example.com/app.git", "ref": "main" });
+    let mut body = create_body(&project_id);
+    body.as_object_mut().unwrap().remove("image");
+    cases.push(("neither image nor source", body));
+    let mut body = create_body(&project_id);
+    body["source"] = source.clone();
+    cases.push(("both image and source", body));
+    let mut body = create_body(&project_id);
+    body.as_object_mut().unwrap().remove("image");
+    body["source"] = source.clone();
+    cases.push(("source before builds", body));
     for (label, body) in cases {
         let (status, code, _) = problem(
             owner
@@ -602,6 +614,17 @@ async fn app_validation_and_authorization() {
         owner
             .patch(server.url(&format!("/api/v1/apps/{app_id}")))
             .json(&json!({ "name": "api" }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!((status, code.as_str()), (409, "conflict"));
+    // A Git source cannot be added to an app created from an image.
+    let (status, code, _) = problem(
+        owner
+            .patch(server.url(&format!("/api/v1/apps/{app_id}")))
+            .json(&json!({ "source": source }))
             .send()
             .await
             .unwrap(),

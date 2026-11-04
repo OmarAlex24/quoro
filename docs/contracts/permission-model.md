@@ -72,6 +72,7 @@ Consequences of the bundles:
 - A `viewer` can read apps, deployments, nodes, events, incidents, grants, approvals and the audit log, and can stream app logs, but cannot mutate anything (README.md, "Scopes").
 - An `operator` cannot create or change human users; that is `user:write` and owner-only (README.md, "Scopes").
 - Every role holds `user:read`, so an `operator` or `viewer` can list users and turn a user id (`owner_user_id`, `on_behalf_of`, `decided_by`, `created_by`) into a name. `user:read` is human-only: agents never list users.
+- `app:terminal` and `vm:console` are in the `owner` and `operator` bundles and not in `viewer`, because neither is a `:read` scope (ADR 0114). A `viewer` can read a build's log (`app:logs`) but cannot start a build.
 - Human roles are not grantable to agents. An agent never receives a "role"; it receives grants (D-0029, D-0030).
 - `role` is a column on the user (`users.role`), so changing a role changes every subsequent decision for that human with no re-issue step (D-0029).
 
@@ -84,7 +85,7 @@ A scope is `<resource>:<verb>` and is the unit of authority in both human roles 
 | Scope | Allows | Flags |
 | --- | --- | --- |
 | `cluster:read` | Read cluster info, version, log position | |
-| `node:read` | List and read nodes | |
+| `node:read` | List and read nodes and node metrics | |
 | `node:enroll` | Create node join tokens | human-only |
 | `node:remove` | Remove a node from the cluster | destructive, human-only |
 | `node:fence_ack` | Acknowledge a node's failed fence after verifying its VMs are stopped, so its leases may be granted again | human-only |
@@ -96,16 +97,18 @@ A scope is `<resource>:<verb>` and is the unit of authority in both human roles 
 | `vm:start` | Start a VM | |
 | `vm:stop` | Stop a VM | |
 | `vm:delete` | Delete a VM and its disks | destructive |
-| `app:read` | List and read apps, deployments, domains, env var names | |
+| `vm:console` | Read a VM's serial console, live and its recent output (ADR 0116) | |
+| `app:read` | List and read apps, their Git sources, builds, deployments, domains, env var names and app metrics | |
 | `app:create` | Create an app | |
-| `app:update` | Change app settings, env vars, domains | |
+| `app:update` | Change app settings, the Git source, env vars, domains | |
 | `app:restart` | Restart an app's instances | |
 | `app:redeploy` | Roll out the current image again | |
-| `app:deploy` | Deploy a new image (new deployment) | |
+| `app:deploy` | Deploy a new image (new deployment); start and cancel builds, whose success deploys | |
 | `app:start` | Start a stopped app | |
 | `app:stop` | Stop an app | |
 | `app:delete` | Delete an app and its data | destructive |
-| `app:logs` | Read app logs, including live streams | |
+| `app:logs` | Read app logs and build logs, including live streams | |
+| `app:terminal` | Open an interactive terminal in an app's VM (ADR 0113, ADR 0114) | human-only |
 | `agent:read` | List and read agents | |
 | `agent:write` | Create, update, disable agents; rotate agent keys | human-only |
 | `grant:read` | List and read grants | |
@@ -115,7 +118,7 @@ A scope is `<resource>:<verb>` and is the unit of authority in both human roles 
 | `approval:decide` | Approve or deny an approval request | human-only |
 | `incident:read` | List and read incidents | |
 | `incident:resolve` | Resolve an incident | |
-| `audit:read` | Read the audit log and run verification | |
+| `audit:read` | Read the audit log and run verification; humans also fetch session transcripts (section 7.6) | |
 | `event:read` | Read events and the event stream | |
 | `webhook:read` | List and read webhooks and deliveries | |
 | `webhook:write` | Create, update, delete, test webhooks | human-only |
@@ -140,10 +143,10 @@ Making destructive scopes grantable in standing grants would be a change to this
 
 ### 4.2 Human-only scopes
 
-Ten scopes are human-only: `node:enroll`, `node:remove`, `node:fence_ack`, `agent:write`, `grant:write`, `approval:decide`, `webhook:write`, `provider:manage`, `user:read` and `user:write` (README.md, "Scopes").
+Eleven scopes are human-only: `node:enroll`, `node:remove`, `node:fence_ack`, `app:terminal`, `agent:write`, `grant:write`, `approval:decide`, `webhook:write`, `provider:manage`, `user:read` and `user:write` (README.md, "Scopes").
 
 - A grant whose `scopes` contains a human-only scope is refused at creation with `validation_failed`, and a hypothetical row that contained one is refused at call time with reason `human_only` (README.md, "Errors").
-- The set is chosen so an agent can never widen its own power (`agent:write`, `grant:write`, `webhook:write`), approve its own request (`approval:decide`), take over cluster membership (`node:enroll`, `node:remove`), declare a possibly running VM stopped so its lease moves (`node:fence_ack`, D-0079) or hold external credentials (`provider:manage`) (D-0030, D-0051). `user:read` is human-only so an agent never reads the list of human identities and their emails.
+- The set is chosen so an agent can never widen its own power (`agent:write`, `grant:write`, `webhook:write`), approve its own request (`approval:decide`), take over cluster membership (`node:enroll`, `node:remove`), declare a possibly running VM stopped so its lease moves (`node:fence_ack`, D-0079) or hold external credentials (`provider:manage`) (D-0030, D-0051). `user:read` is human-only so an agent never reads the list of human identities and their emails. `app:terminal` is human-only in M4 because a shell in the app's VM reads every secret the app holds and acts outside single audited calls (ADR 0114); a later, non-interactive exec scope reachable only through an approval grant is a separate decision.
 - Because `approval:decide` is human-only, "an agent approves its own destructive request" is not a policy that could be misconfigured; it is unrepresentable (D-0030).
 
 ### 4.3 Wildcards
@@ -175,6 +178,8 @@ Matching per target type:
 | app | `apps` entry equal to its id, or `projects` entry equal to the slug of its project, or `{"all": true}` |
 | VM | `apps` entry equal to the VM's `app_id`, or `projects` entry equal to the slug of the VM's project, or `nodes` entry equal to the VM's `node_id`, or `{"all": true}` |
 | deployment | the app it belongs to (as above), or `{"all": true}` |
+| build | the app it belongs to (as above), or `{"all": true}` |
+| interactive session | its VM (as above; a terminal session's VM is an instance of its app), or `{"all": true}` |
 | domain | the app it belongs to (as above), or `{"all": true}` |
 | project | `projects` entry equal to its slug, or `{"all": true}` |
 | node | `nodes` entry equal to its id, or `{"all": true}` |
@@ -382,6 +387,27 @@ Implementation note: the candidate query in step (c) filters on status and expir
 
 **Authentication failures are not refusals.** An `unauthenticated` (401) call has no identity to attribute, so it is written to the server log, not the audit chain (D-0031; section 11).
 
+### 7.5 Interactive sessions
+
+A web terminal or a VM console is opened by one authorized call and then stays open for minutes or hours over a WebSocket (ADR 0057, ADR 0114). The open is authorized like any call: `app:terminal` for `POST /api/v1/apps/{app_id}/terminal-sessions` (human-only, so an agent is refused with `human_only` at step 3a), `vm:console` for `POST /api/v1/vms/{vm_id}/console-sessions` (a human's role, or an agent's grant whose selector covers the VM). The answer is a single-use ticket valid for 30 seconds; the WebSocket upgrade presents the ticket instead of a credential ([openapi.yaml](openapi.yaml), `connectInteractiveSession`).
+
+Because one authorization would otherwise cover hours of activity, the primary re-checks an open session and closes it, with the `close_reason` in brackets, when:
+
+| Condition | Checked | `close_reason` |
+| --- | --- | --- |
+| the human is disabled or deleted, or the agent is disabled | on change, and at least every 30 s | `access_revoked` |
+| the human's role no longer holds the scope | on change, and at least every 30 s | `access_revoked` |
+| the agent's grant that authorized the open is revoked, expires or is exhausted, and no other active grant covers the scope and the VM | on change, and at least every 30 s | `access_revoked` |
+| the panel session cookie, the personal API token or the agent access token that opened it expires or is revoked | at its expiry | `credential_expired` |
+| no input from the client for 15 minutes (a console has no input: no WebSocket message from the client) | continuously | `idle_timeout` |
+| the session has been open for 8 hours | continuously | `max_duration` |
+
+An agent access token lives 5 minutes (section 2), so an agent's console session ends at that token's expiry unless the agent opens a new one; console sessions are meant for short reads of boot output, not for permanent tails. The re-check consumes no grant use: only the open is a call. Every close, for any reason, writes the `session.end` audit record ([audit-log-format.md](audit-log-format.md), section 3.3).
+
+### 7.6 Session transcripts
+
+A terminal session's transcript holds every byte typed and printed, so it holds whatever secret appeared on the screen (ADR 0115). `GET /api/v1/interactive-sessions/{session_id}/transcript` therefore needs `audit:read` **and** a human caller: an agent holding `audit:read` is refused with `human_only`, because an agent may not read through a transcript what it may not obtain through a terminal (ADR 0114). Every transcript fetch is audited, also when a human makes it ([audit-log-format.md](audit-log-format.md), section 3).
+
 ## 8. Incident grants and the AI-native loop
 
 D-0032 defines the loop: detect, notify, wake, act. This section fixes the permissions half of the wake and act steps.
@@ -541,6 +567,9 @@ The scenarios cover the M3 Definition of Done in [../product/roadmap.md](../prod
 | 13 | human `usr_H`, role `operator` | role bundle | `delete_app` on `app_1` | ok; no approval needed for a human | `ok` |
 | 14 | agent `agt_A` | incident grant, `event:read`, selector `{"projects":["blog"]}` | `list_events` | ok; only `blog` subjects returned | `ok` |
 | 15 | agent `agt_A` | standard grant, `app:restart`, TTL 1 h, `max_uses` null | `get_app` on `app_1` twenty times, then `restart_app` | all ok; only the restart consumes a use | `ok` on each |
+| 16 | agent `agt_A` | standard grant, `app:terminal` (malformed row), selector `{"all": true}` | `POST /api/v1/apps/{app_id}/terminal-sessions` | 403 `forbidden` | `human_only` |
+| 17 | agent `agt_A` | standard grant, `vm:console`, selector `{"apps":["app_1"]}` | `POST /api/v1/vms/{vm_id}/console-sessions` on `app_1`'s VM | 201 with a ticket; the session ends when the access token expires | `ok`; a later `session.end` with `credential_expired` |
+| 18 | human `usr_H`, role `viewer` | role bundle | `POST /api/v1/vms/{vm_id}/console-sessions` | 403 `forbidden` | `scope_missing` |
 
 Two rows are worth reading together. Row 7 and row 8 are the same call: the second one succeeds only because a human approved exactly that call with exactly those params. Row 9 shows what happens when the approval is not there any more — the agent does not inherit a permanent right to delete from having once been approved (D-0030).
 

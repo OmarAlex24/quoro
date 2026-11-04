@@ -461,7 +461,7 @@ export const handlers = [
       name,
       stateful: body.stateful ?? false,
       ha_policy: 'none',
-      image: body.image.trim(),
+      image: (body.image ?? '').trim(),
       port: body.port,
       health_check: body.health_check ?? {
         path: '/',

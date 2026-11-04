@@ -80,6 +80,14 @@ pub enum EventType {
     DeploymentSucceeded,
     #[serde(rename = "deployment.failed")]
     DeploymentFailed,
+    #[serde(rename = "build.started")]
+    BuildStarted,
+    #[serde(rename = "build.succeeded")]
+    BuildSucceeded,
+    #[serde(rename = "build.failed")]
+    BuildFailed,
+    #[serde(rename = "build.cancelled")]
+    BuildCancelled,
     #[serde(rename = "certificate.issued")]
     CertificateIssued,
     #[serde(rename = "certificate.expiring")]
@@ -133,6 +141,10 @@ impl EventType {
             Self::DeploymentStarted => "deployment.started",
             Self::DeploymentSucceeded => "deployment.succeeded",
             Self::DeploymentFailed => "deployment.failed",
+            Self::BuildStarted => "build.started",
+            Self::BuildSucceeded => "build.succeeded",
+            Self::BuildFailed => "build.failed",
+            Self::BuildCancelled => "build.cancelled",
             Self::CertificateIssued => "certificate.issued",
             Self::CertificateExpiring => "certificate.expiring",
             Self::CertificateFailed => "certificate.failed",
@@ -159,7 +171,7 @@ impl EventType {
     }
 
     /// Every event type of the contract, in contract order.
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 37] = [
         Self::NodeEnrolled,
         Self::NodeConnected,
         Self::NodeDisconnected,
@@ -180,6 +192,10 @@ impl EventType {
         Self::DeploymentStarted,
         Self::DeploymentSucceeded,
         Self::DeploymentFailed,
+        Self::BuildStarted,
+        Self::BuildSucceeded,
+        Self::BuildFailed,
+        Self::BuildCancelled,
         Self::CertificateIssued,
         Self::CertificateExpiring,
         Self::CertificateFailed,
