@@ -11,6 +11,7 @@ import {
   useListVms,
 } from '../api/generated/vms/vms';
 import { countVms, LAMP_COLORS, listIsConverging } from '../lib/lamp';
+import { canViewConsole } from '../lib/capabilities';
 import { problemView, type ProblemView } from '../lib/problem';
 import { useSession } from '../session';
 import { CreateVmDialog } from '../components/create-vm-dialog';
@@ -65,7 +66,7 @@ function CountLamp({
 }
 
 export function VmsScreen() {
-  const { user, loading, unauthenticated, canWrite } = useSession();
+  const { me, user, loading, unauthenticated, canWrite } = useSession();
   const queryClient = useQueryClient();
   const [dialogOpen, setDialogOpen] = useState(false);
   const [problem, setProblem] = useState<ProblemView | null>(null);
@@ -179,6 +180,7 @@ export function VmsScreen() {
               projectName={projectName(vm.project_id)}
               nodeName={nodeName(vm.node_id)}
               canWrite={canWrite}
+              canViewConsole={canViewConsole(me)}
               busy={busyId === vm.id}
               onStart={() => {
                 setNotice(null);

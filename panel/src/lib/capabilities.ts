@@ -46,3 +46,18 @@ export const canManageUsers = (me: MeResponse | undefined): boolean =>
  * never lists users.
  */
 export const canListUsers = (me: MeResponse | undefined): boolean => isHumanSession(me);
+
+/**
+ * Open a web terminal into an app's guest (`app:terminal`). The scope is
+ * human-only in M4 (ADR 0114), so an owner or operator may, an agent never.
+ */
+export const canOpenTerminal = humanWriter;
+
+/**
+ * View a VM's serial console (`vm:console`). The scope is grantable to agents,
+ * and the server checks the grant, so an enabled agent session also sees the
+ * entry point; the console is read-only either way.
+ */
+export const canViewConsole = (me: MeResponse | undefined): boolean =>
+  humanWriter(me) ||
+  (me?.type === 'agent' && me.agent !== undefined && !me.agent.disabled);

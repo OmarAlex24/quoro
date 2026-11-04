@@ -28,6 +28,7 @@ export default defineConfig({
           'audit',
           'events',
           'webhooks',
+          'interactive',
         ],
       },
     },

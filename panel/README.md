@@ -9,7 +9,9 @@ Vite, generated from the frozen contract in `../docs/contracts/openapi.yaml`.
 
 Routes: `/` is the apps list, `/apps/new` the deploy work order, `/apps/$appId`
 one app with its deployment, domains, environment, instances and log tape,
-`/vms` the virtual machines, `/agents` and `/agents/$agentId`, `/grants`
+`/apps/$appId/terminal` a web terminal into the app's guest, `/vms` the virtual
+machines, `/vms/$vmId/console` the read-only serial console of one VM,
+`/agents` and `/agents/$agentId`, `/grants`
 (`?agent_id=&status=&kind=`), `/approvals`, `/audit`
 (`?actor_id=&target_id=&result=&incident_id=&seq=`), `/webhooks` and
 `/webhooks/$webhookId`, plus `/login` and `/setup`.
@@ -53,7 +55,14 @@ client is never hand-edited and is git-ignored.
 
 To see each screen in mock mode: set up, log in, then open `/` (apps rack),
 `/apps/new` (deploy), click `blog` for `/apps/<id>`, and `/vms` for the VM
-rack. The seeded app's tape starts printing lines on the app screen.
+rack. The seeded app's tape starts printing lines on the app screen. The app
+plate's **Terminal** action opens `/apps/<id>/terminal`; each VM bay's
+**Console** action opens `/vms/<id>/console`. Both answer over a mock
+WebSocket: the terminal prints a banner and a `/ # ` prompt, echoes typing, and
+answers `uname -a`, `help` and `exit` (`exit` sends `exit` then `closed` and
+closes 1000); any other command prints `sh: <cmd>: not found`. The console
+replays a kernel boot log and `quoro-init` lines, then prints one line every
+few seconds and refuses input with an `error` control frame.
 
 The agency screens are seeded on first use after setup: two agents
 (`on-call-restarter`, enabled; `weekly-reporter`, disabled), a standard, an
@@ -97,8 +106,13 @@ The production build contains no MSW code: `src/mocks/` is only reached through
   `getDeployment` every 1 s while it is pending, preparing or starting. There
   is no deployment SSE stream in the contract. A 504 from the progress-lines
   call says the node is unreachable.
-- Live logs use one `EventSource` on
-  `/api/v1/apps/<id>/logs/stream?tail=200` with credentials, `log` events
+- A terminal or console session opens with one POST and then a WebSocket
+  carrying the single-use ticket (30 s, never shown or stored). Guest bytes go
+  only into xterm.js; the clipboard (OSC 52) and web-links addons are not
+  loaded, so the untrusted guest cannot write the clipboard or open links. The
+  console is `disableStdin` and only a terminal sends keystrokes and debounced
+  `resize` controls.
+- Live logs use one `EventSource` on  `/api/v1/apps/<id>/logs/stream?tail=200` with credentials, `log` events
   (`LogEntry`), `error` events whose data is a `Problem`, and `end`. The tape
   keeps at most 2000 lines, follows the newest line unless the operator scrolls
   up, pauses on request, and closes the source on unmount. Only the log line
@@ -151,6 +165,8 @@ Runtime:
 | `clsx` | 2.1.1 | Conditional class names. |
 | `tailwind-merge` | 3.7.0 | `cn()` lets a caller override a component's utilities. |
 | `lucide-react` | 1.66.0 | The two icons the panel uses: select chevron, check, dialog close. |
+| `@xterm/xterm` | 6.0.0 | Renders the web terminal and the read-only console; guest bytes never touch the DOM as HTML. |
+| `@xterm/addon-fit` | 0.11.0 | Fits the terminal grid to its bezel and reports the new size for the `resize` control. |
 
 Development:
 
@@ -177,15 +193,16 @@ src/
   components/     ui/ (button, dialog, field, input, textarea, select, banner), lamp,
                   vm-bay, app-bay, deploy-rail, log-tape, tone-lamp, app-domains,
                   app-env-dialog, secret-once, copy-button, scope-picker,
-                  selector-editor, identity-name, agent-*, grant-*, approval-*,
-                  audit-*, webhook-*
+                  selector-editor, identity-name, session-room, xterm-view,
+                  agent-*, grant-*, approval-*, audit-*, webhook-*
   lib/            lamp.ts, app-status.ts, deploy-flow.ts, log-buffer.ts, problem.ts,
-                  slug.ts, capabilities.ts, scopes.ts, agency-format.ts, agents.ts,
-                  grants.ts, approvals.ts, audit.ts, webhooks.ts (each with a test
-                  where pure)
+                  slug.ts, capabilities.ts, scopes.ts, interactive.ts,
+                  agency-format.ts, agents.ts, grants.ts, approvals.ts, audit.ts,
+                  webhooks.ts (each with a test where pure)
   mocks/          db.ts, http.ts, agency.ts, handlers.ts, handlers-<area>.ts,
                   browser.ts (mock mode only)
   screens/        apps-screen.tsx, deploy-screen.tsx, app-screen.tsx, vms-screen.tsx,
+                  terminal-screen.tsx, console-screen.tsx,
                   agents-screen.tsx, agent-screen.tsx, grants-screen.tsx,
                   approvals-screen.tsx, audit-screen.tsx, webhooks-screen.tsx,
                   webhook-screen.tsx, login-screen.tsx, setup-screen.tsx
