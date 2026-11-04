@@ -78,7 +78,16 @@ pub struct VmSpec {
     pub volumes: Vec<VolumeAttach>,
     pub net: NetAttach,
     pub init: InitConfig,
+    /// Where the app's tagged output goes (section 3.13). From M4 the node
+    /// agent sets `VirtioConsole` for apps.
     pub console: ConsoleMode,
+    /// The serial port (`ttyS0`): kernel and init diagnostics. From M4 the node
+    /// agent sets `Socket`, and the engine is its only client (section 3.19,
+    /// ADR 0116). Added in M4.
+    pub serial: SerialMode,
+    /// The virtio-vsock device that carries exec sessions (section 3.18,
+    /// ADR 0113). `None` means no device. Added in M4.
+    pub vsock: Option<VsockAttach>,
 }
 
 impl VmSpec {
@@ -143,7 +152,30 @@ pub enum ConsoleMode {
     /// virtio-console to this UNIX socket; carries tagged stdout/stderr lines.
     VirtioConsole { socket: PathBuf },
     /// Serial console to this UNIX socket; interactive text, one client at a time.
+    /// Superseded in M4 by `VmSpec::serial` (section 3.14); a spec that sets it
+    /// together with a `serial` other than `Off` is `Conflict`.
     Serial { socket: PathBuf },
+}
+
+/// How the serial port (`ttyS0`) is attached. Added in M4. Section 3.19.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SerialMode {
+    /// No serial device.
+    Off,
+    /// Serial output appended to this file (the M1-M3 behaviour).
+    File { path: PathBuf },
+    /// Serial port on this UNIX socket; the engine connects to it as the only
+    /// client from `create` on and keeps a node-local ring of its output.
+    Socket { path: PathBuf },
+}
+
+/// A virtio-vsock device in Cloud Hypervisor's hybrid mode: the host end is a
+/// UNIX socket in the VM's runtime directory. Added in M4. Section 3.18.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VsockAttach {
+    /// Guest context id. Each VM has its own vsock namespace, so every VM uses 3.
+    pub cid: u32,
+    pub socket: PathBuf,
 }
 
 /// How a stop is requested.
@@ -223,6 +255,8 @@ pub struct Capabilities {
     pub graphical_console: bool, // false
     pub vm_snapshot: bool,
     pub volume_snapshot: bool,
+    /// Whether `exec` works on this backend and build (section 3.18). Added in M4.
+    pub exec: bool,
 }
 
 /// The node network a VM is attached to. Section 3.3.
@@ -294,6 +328,32 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + ?Sized> ConsoleIo for T {}
 /// One end of a text console connection.
 pub type ConsoleStream = Pin<Box<dyn ConsoleIo>>;
 
+/// Raw bytes in arrival order, for example a VM's serial output. Added in M4.
+pub type ByteStream = Pin<Box<dyn Stream<Item = Vec<u8>> + Send>>;
+
+/// A program to run in a running VM, on a PTY. Added in M4. Section 3.18.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecRequest {
+    /// The argv; `argv[0]` without `/` is searched in the app's `PATH`.
+    pub argv: Vec<String>,
+    /// A user name or uid, optionally `:` and a group name or gid; `None` is the app's own user.
+    pub user: Option<String>,
+    pub rows: u16,
+    pub cols: u16,
+}
+
+/// One exec session. Added in M4. Section 3.18.
+pub struct ExecSession {
+    /// The PTY: reads are the program's output, writes are its input. Dropping
+    /// or shutting it down ends the session (`SIGHUP` to its process group).
+    pub io: ConsoleStream,
+    /// Resize requests as `(rows, cols)`.
+    pub resize: tokio::sync::mpsc::Sender<(u16, u16)>,
+    /// Resolves once with the program's exit code, `128 + signal` when a
+    /// signal ended it; an error when the session ended without one.
+    pub exit: tokio::sync::oneshot::Receiver<i32>,
+}
+
 /// The boundary behind which a virtual machine monitor sits.
 ///
 /// The async methods return `impl Future<Output = _> + Send`, so a caller
@@ -338,6 +398,30 @@ pub trait Engine: Send + Sync {
     fn output(&self, id: &VmId) -> Result<LineStream, EngineError>;
     fn console(&self, id: &VmId) -> Result<ConsoleStream, EngineError>;
     fn counters(&self, id: &VmId) -> impl Future<Output = Result<VmCounters, EngineError>> + Send;
+
+    // Interactive access (M4; default implementations return Unsupported)
+    /// Section 3.18.
+    fn exec(
+        &self,
+        _id: &VmId,
+        _request: &ExecRequest,
+    ) -> impl Future<Output = Result<ExecSession, EngineError>> + Send {
+        async {
+            Err(EngineError::Unsupported(
+                "exec is not implemented by this engine".into(),
+            ))
+        }
+    }
+    /// Section 3.19.
+    fn serial_output(
+        &self,
+        _id: &VmId,
+        _tail_bytes: Option<u64>,
+    ) -> Result<ByteStream, EngineError> {
+        Err(EngineError::Unsupported(
+            "serial output is not implemented by this engine".into(),
+        ))
+    }
 
     // Volumes (M5; default implementations return Unsupported)
     fn snapshot_volume(

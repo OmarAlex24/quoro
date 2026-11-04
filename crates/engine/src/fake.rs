@@ -26,18 +26,18 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, SystemTime};
 
 use futures_core::Stream;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    Capabilities, ConsoleMode, ConsoleStream, Engine, EngineError, EngineEvent, EventStream,
-    HostProbe, ImageConfig, ImageDigest, ImageRef, LineStream, NodeNetwork, OutputLine,
-    OutputStream, PreparedImage, StopMode, VmCounters, VmId, VmInfo, VmSpec, VmState, VolumeId,
-    VolumeSnapshot,
+    ByteStream, Capabilities, ConsoleMode, ConsoleStream, Engine, EngineError, EngineEvent,
+    EventStream, ExecRequest, ExecSession, HostProbe, ImageConfig, ImageDigest, ImageRef,
+    LineStream, NodeNetwork, OutputLine, OutputStream, PreparedImage, SerialMode, StopMode,
+    VmCounters, VmId, VmInfo, VmSpec, VmState, VolumeId, VolumeSnapshot,
 };
 
 /// Capacity of one event subscriber's channel. A subscriber that falls further
@@ -50,6 +50,16 @@ const LINE_CAPACITY: usize = 256;
 
 /// Size of the in-memory console pipe.
 const CONSOLE_BUFFER: usize = 4096;
+
+/// Bytes an exec session buffers before its writer waits for a reader, so the
+/// fake shows the same back-pressure a real PTY does.
+const EXEC_BUFFER: usize = 64 * 1024;
+
+/// The most serial output the fake keeps per VM, like the real ring (1 MiB).
+const SERIAL_RING: usize = 1 << 20;
+
+/// Capacity, in chunks, of one serial-output subscriber's channel.
+const SERIAL_CAPACITY: usize = 256;
 
 /// An operation a test can make fail once. See [`FakeEngine::fail_next`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -82,6 +92,141 @@ struct VmRecord {
     /// Set while a console client is connected, cleared when it is dropped.
     console_open: Option<Arc<AtomicBool>>,
     console_echo: bool,
+    /// The exec sessions started on this VM, oldest first (section 3.18).
+    execs: Vec<FakeExec>,
+    /// The serial output kept for `serial_output` replays (section 3.19).
+    serial_ring: VecDeque<u8>,
+    /// Live `serial_output` subscribers; dropped when the VM is deleted.
+    serial_subscribers: Vec<mpsc::Sender<Vec<u8>>>,
+}
+
+/// The fake's side of one exec session.
+struct FakeExec {
+    request: ExecRequest,
+    shared: Arc<Mutex<ExecPipe>>,
+    resize: mpsc::Receiver<(u16, u16)>,
+    exit: Option<oneshot::Sender<i32>>,
+}
+
+/// The loopback behind an exec session's `io`: what the client writes is read
+/// back (echo), output a test pushes is read too, and once the session ended
+/// a read returns end of file after the buffer drains.
+#[derive(Default)]
+struct ExecPipe {
+    buf: VecDeque<u8>,
+    ended: bool,
+    /// Set when the client dropped or shut down its end.
+    closed: bool,
+    reader: Option<Waker>,
+    writer: Option<Waker>,
+}
+
+impl ExecPipe {
+    fn wake_all(&mut self) {
+        if let Some(waker) = self.reader.take() {
+            waker.wake();
+        }
+        if let Some(waker) = self.writer.take() {
+            waker.wake();
+        }
+    }
+}
+
+/// The client end of a fake exec session.
+struct ExecIo {
+    shared: Arc<Mutex<ExecPipe>>,
+}
+
+impl ExecIo {
+    fn pipe(&self) -> MutexGuard<'_, ExecPipe> {
+        self.shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Drop for ExecIo {
+    fn drop(&mut self) {
+        let mut pipe = self.pipe();
+        pipe.closed = true;
+        pipe.wake_all();
+    }
+}
+
+impl AsyncRead for ExecIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let mut pipe = self.pipe();
+        if pipe.buf.is_empty() {
+            if pipe.ended {
+                return Poll::Ready(Ok(()));
+            }
+            pipe.reader = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+        let n = buf.remaining().min(pipe.buf.len());
+        let chunk: Vec<u8> = pipe.buf.drain(..n).collect();
+        buf.put_slice(&chunk);
+        if let Some(waker) = pipe.writer.take() {
+            waker.wake();
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for ExecIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut pipe = self.pipe();
+        if pipe.ended || pipe.closed {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the exec session ended",
+            )));
+        }
+        let room = EXEC_BUFFER.saturating_sub(pipe.buf.len());
+        if room == 0 {
+            pipe.writer = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+        let n = room.min(data.len());
+        pipe.buf.extend(&data[..n]);
+        if let Some(waker) = pipe.reader.take() {
+            waker.wake();
+        }
+        Poll::Ready(Ok(n))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut pipe = self.pipe();
+        pipe.closed = true;
+        pipe.wake_all();
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Ends every exec session of a VM: readers see end of file once drained, and
+/// `exit` resolves with an error because no exit code was reported.
+fn end_execs(record: &mut VmRecord) {
+    for exec in &mut record.execs {
+        exec.exit = None;
+        let mut pipe = exec
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pipe.ended = true;
+        pipe.wake_all();
+    }
 }
 
 /// Everything the fake owns, behind one mutex. The lock is never held across
@@ -284,6 +429,108 @@ impl FakeEngine {
         });
     }
 
+    /// The requests of the exec sessions started on a VM, oldest first.
+    #[must_use]
+    pub fn exec_requests(&self, id: &VmId) -> Vec<ExecRequest> {
+        self.lock()
+            .vms
+            .get(id)
+            .map(|record| record.execs.iter().map(|e| e.request.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The resizes the `index`-th exec session of a VM received so far, in
+    /// order. Each call returns only the resizes since the previous call.
+    #[must_use]
+    pub fn exec_resizes(&self, id: &VmId, index: usize) -> Vec<(u16, u16)> {
+        let mut state = self.lock();
+        let Some(exec) = state
+            .vms
+            .get_mut(id)
+            .and_then(|record| record.execs.get_mut(index))
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        while let Ok(size) = exec.resize.try_recv() {
+            out.push(size);
+        }
+        out
+    }
+
+    /// Whether the client of the `index`-th exec session of a VM dropped or
+    /// shut down its end.
+    #[must_use]
+    pub fn exec_closed(&self, id: &VmId, index: usize) -> bool {
+        self.lock()
+            .vms
+            .get(id)
+            .and_then(|record| record.execs.get(index))
+            .is_some_and(|exec| {
+                exec.shared
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .closed
+            })
+    }
+
+    /// Injection: the program of the `index`-th exec session of a VM writes
+    /// `bytes` to its terminal.
+    pub fn push_exec_output(&self, id: &VmId, index: usize, bytes: &[u8]) {
+        let state = self.lock();
+        let Some(exec) = state.vms.get(id).and_then(|record| record.execs.get(index)) else {
+            return;
+        };
+        let mut pipe = exec
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pipe.buf.extend(bytes);
+        if let Some(waker) = pipe.reader.take() {
+            waker.wake();
+        }
+    }
+
+    /// Injection: the program of the `index`-th exec session of a VM exits
+    /// with `code`. Its `exit` resolves and its `io` reaches end of file once
+    /// the buffered output is read.
+    pub fn exit_exec(&self, id: &VmId, index: usize, code: i32) {
+        let mut state = self.lock();
+        let Some(exec) = state
+            .vms
+            .get_mut(id)
+            .and_then(|record| record.execs.get_mut(index))
+        else {
+            return;
+        };
+        if let Some(exit) = exec.exit.take() {
+            let _ = exit.send(code);
+        }
+        let mut pipe = exec
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pipe.ended = true;
+        pipe.wake_all();
+    }
+
+    /// Injection: the guest writes `bytes` to its serial port. They are kept
+    /// for replays (the newest 1 MiB) and sent to every live `serial_output`
+    /// stream; a subscriber whose channel is full misses the chunk.
+    pub fn push_serial(&self, id: &VmId, bytes: &[u8]) {
+        let mut state = self.lock();
+        let Some(record) = state.vms.get_mut(id) else {
+            return;
+        };
+        record.serial_ring.extend(bytes);
+        let excess = record.serial_ring.len().saturating_sub(SERIAL_RING);
+        record.serial_ring.drain(..excess);
+        record.serial_subscribers.retain(|tx| !tx.is_closed());
+        for tx in &record.serial_subscribers {
+            let _ = tx.try_send(bytes.to_vec());
+        }
+    }
+
     /// Injection: echoes console input back to the client. Echo is performed by
     /// [`FakeEngine::pump_console`], not by a task.
     pub fn set_console_echo(&self, id: &VmId, echo: bool) {
@@ -397,6 +644,7 @@ fn crash_locked(state: &mut State, id: &VmId, reason: &str) {
     record.info.state = VmState::Crashed;
     record.info.pid = None;
     record.scheduled_crash = None;
+    end_execs(record);
     emit(
         state,
         EngineEvent::Crashed {
@@ -416,6 +664,7 @@ impl Engine for FakeEngine {
             graphical_console: false,
             vm_snapshot: false,
             volume_snapshot: true,
+            exec: true,
         }
     }
 
@@ -520,6 +769,9 @@ impl Engine for FakeEngine {
                 console_far: None,
                 console_open: None,
                 console_echo: false,
+                execs: Vec::new(),
+                serial_ring: VecDeque::new(),
+                serial_subscribers: Vec::new(),
             },
         );
         Ok(info)
@@ -598,6 +850,7 @@ impl Engine for FakeEngine {
         }
         // A guest that did not react to the power button is stopped by force.
         let code = if graceful && !ignores { 0 } else { 137 };
+        end_execs(record);
         record.info.state = VmState::Stopped;
         record.info.pid = None;
         record.info.exit_code = Some(code);
@@ -676,6 +929,12 @@ impl Engine for FakeEngine {
         let Some(record) = state.vms.get_mut(id) else {
             return Err(EngineError::NotFound);
         };
+        if matches!(record.spec.serial, SerialMode::Socket { .. }) {
+            return Err(EngineError::Conflict(format!(
+                "VM {}'s serial port is read through serial_output",
+                id.0
+            )));
+        }
         if matches!(record.spec.console, ConsoleMode::Off) {
             return Err(EngineError::NotFound);
         }
@@ -697,6 +956,70 @@ impl Engine for FakeEngine {
             inner: client,
             open,
         }))
+    }
+
+    async fn exec(&self, id: &VmId, request: &ExecRequest) -> Result<ExecSession, EngineError> {
+        let open = quoro_init::exec::OpenRequest {
+            argv: request.argv.clone(),
+            user: request.user.clone(),
+            rows: request.rows,
+            cols: request.cols,
+        };
+        open.validate()
+            .map_err(|err| EngineError::Conflict(err.to_string()))?;
+        let mut state = self.lock();
+        let Some(record) = state.vms.get_mut(id) else {
+            return Err(EngineError::NotFound);
+        };
+        if record.info.state != VmState::Running {
+            return Err(EngineError::Conflict(format!("VM {} is not running", id.0)));
+        }
+        if record.spec.vsock.is_none() {
+            return Err(EngineError::Conflict(format!(
+                "VM {} has no vsock device",
+                id.0
+            )));
+        }
+        let shared = Arc::new(Mutex::new(ExecPipe::default()));
+        let (resize_tx, resize_rx) = mpsc::channel(64);
+        let (exit_tx, exit_rx) = oneshot::channel();
+        record.execs.push(FakeExec {
+            request: request.clone(),
+            shared: Arc::clone(&shared),
+            resize: resize_rx,
+            exit: Some(exit_tx),
+        });
+        Ok(ExecSession {
+            io: Box::pin(ExecIo { shared }),
+            resize: resize_tx,
+            exit: exit_rx,
+        })
+    }
+
+    fn serial_output(&self, id: &VmId, tail_bytes: Option<u64>) -> Result<ByteStream, EngineError> {
+        let mut state = self.lock();
+        let Some(record) = state.vms.get_mut(id) else {
+            return Err(EngineError::NotFound);
+        };
+        if !matches!(record.spec.serial, SerialMode::Socket { .. }) {
+            return Err(EngineError::Conflict(format!(
+                "VM {}'s serial port is not a socket",
+                id.0
+            )));
+        }
+        let (tx, rx) = mpsc::channel(SERIAL_CAPACITY);
+        let kept = record.serial_ring.len();
+        let replay = tail_bytes.map_or(kept, |tail| {
+            usize::try_from(tail).unwrap_or(usize::MAX).min(kept)
+        });
+        if replay > 0 {
+            let start = kept - replay;
+            let chunk: Vec<u8> = record.serial_ring.range(start..).copied().collect();
+            // A fresh channel always has room for the replay.
+            let _ = tx.try_send(chunk);
+        }
+        record.serial_subscribers.push(tx);
+        Ok(Box::pin(ReceiverStream::new(rx)))
     }
 
     async fn counters(&self, id: &VmId) -> Result<VmCounters, EngineError> {

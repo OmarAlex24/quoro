@@ -336,6 +336,8 @@ pub async fn running_vm(engine: &FakeEngine, id: &str, index: u8) -> VmId {
             workdir: None,
         },
         console: ConsoleMode::Off,
+        serial: quoro_engine::SerialMode::Off,
+        vsock: None,
     };
     engine.create(&spec).await.expect("create");
     engine.start(&vm).await.expect("start");

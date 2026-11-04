@@ -34,9 +34,11 @@ use quoro_engine::ch::state::{self, VmmRecord};
 use quoro_engine::ch::tools::HostTools;
 use quoro_engine::ch::{ChConfig, ChEngine};
 use quoro_engine::{
-    ConsoleMode, Engine, EngineError, EngineEvent, ImageDigest, ImageRef, InitConfig, LineStream,
-    MacAddr, NetAttach, NodeNetwork, OutputLine, OutputStream, StopMode, VmId, VmSpec, VmState,
+    ByteStream, ConsoleMode, Engine, EngineError, EngineEvent, ExecRequest, ImageDigest, ImageRef,
+    InitConfig, LineStream, MacAddr, NetAttach, NodeNetwork, OutputLine, OutputStream, SerialMode,
+    StopMode, VmId, VmSpec, VmState, VsockAttach,
 };
+use tokio::io::AsyncReadExt as _;
 
 /// The lab switch every test checks.
 const LAB_ENV: &str = "QUORO_ENGINE_LAB";
@@ -165,6 +167,11 @@ fn console_socket(id: &VmId) -> PathBuf {
     state_dir().join(format!("{}.console.sock", id.0))
 }
 
+/// The serial socket of one VM, under the state directory (M4).
+fn serial_socket(id: &VmId) -> PathBuf {
+    state_dir().join(format!("{}.serial.sock", id.0))
+}
+
 /// A VM spec for the lab suite.
 fn lab_spec(
     id: &VmId,
@@ -195,6 +202,8 @@ fn lab_spec(
             workdir: None,
         },
         console,
+        serial: quoro_engine::SerialMode::Off,
+        vsock: None,
     }
 }
 
@@ -272,6 +281,7 @@ fn cleanup(state: &Path, bridge: &str) {
         }
         let _ = runtime.block_on(net::delete_tap(&tools, &tap_name(&id)));
         let _ = std::fs::remove_file(state.join(format!("{}.console.sock", id.0)));
+        let _ = std::fs::remove_file(state.join(format!("{}.serial.sock", id.0)));
         let _ = std::fs::remove_dir_all(&dir);
     }
     let _ = runtime.block_on(net::remove_network(&tools, bridge));
@@ -666,6 +676,155 @@ async fn guest_reset_is_a_crash() {
 
     engine.delete(&id).await.expect("delete");
     assert_no_leftovers(&id);
+
+    let tools = HostTools::discover().expect("host tools");
+    net::remove_network(&tools, BRIDGE)
+        .await
+        .expect("remove the network");
+}
+
+/// Reads serial bytes until `needle` appeared, returning everything read.
+async fn read_serial(stream: &mut ByteStream, needle: &[u8], timeout: Duration) -> Vec<u8> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut seen = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "no serial bytes containing {:?} within {timeout:?}; saw {:?}",
+            String::from_utf8_lossy(needle),
+            String::from_utf8_lossy(&seen)
+        );
+        match tokio::time::timeout(remaining, poll_fn(|cx| stream.as_mut().poll_next(cx))).await {
+            Ok(Some(chunk)) => {
+                seen.extend_from_slice(&chunk);
+                if seen.windows(needle.len()).any(|window| window == needle) {
+                    return seen;
+                }
+            }
+            Ok(None) => panic!(
+                "the serial stream ended before {:?}; saw {:?}",
+                String::from_utf8_lossy(needle),
+                String::from_utf8_lossy(&seen)
+            ),
+            Err(_) => panic!(
+                "no serial bytes containing {:?} within {timeout:?}; saw {:?}",
+                String::from_utf8_lossy(needle),
+                String::from_utf8_lossy(&seen)
+            ),
+        }
+    }
+}
+
+/// M4: a VM with a serial socket and a vsock device streams its boot from the
+/// engine's ring and runs `uname -a` over the hybrid vsock exec channel
+/// (§3.18, §3.19).
+#[tokio::test]
+#[ignore = "needs /dev/kvm, root and the pinned artifacts on the lab host"]
+async fn exec_and_serial_console() {
+    if !enter_lab() {
+        return;
+    }
+    let _guard = Guard::new();
+    let engine = new_engine().await;
+    assert!(engine.capabilities().await.exec, "exec is supported");
+    let rootfs = prepare(&engine).await;
+
+    let id = VmId("vm_w4_term".to_string());
+    let serial = serial_socket(&id);
+    let mut spec = lab_spec(
+        &id,
+        &rootfs,
+        ConsoleMode::Off,
+        "10.77.0.15",
+        "sleep 120",
+        15,
+    );
+    spec.serial = SerialMode::Socket {
+        path: serial.clone(),
+    };
+    spec.vsock = Some(VsockAttach {
+        cid: 3,
+        socket: vm_dir(&id).join("vsock.sock"),
+    });
+    engine.create(&spec).await.expect("create");
+    start_vm(&engine, &id).await;
+
+    // The engine's client is the serial socket's only reader; the ring holds
+    // the whole boot.
+    let mut console = engine.serial_output(&id, None).expect("serial output");
+    let boot = read_serial(&mut console, b"app started", Duration::from_secs(60)).await;
+    assert!(
+        String::from_utf8_lossy(&boot).contains("app started"),
+        "the boot output is in the ring: {:?}",
+        String::from_utf8_lossy(&boot)
+    );
+    // A tail of the ring is a valid second, independent stream: the replay
+    // arrives as one item of at most the requested 64 bytes.
+    let mut tail = engine.serial_output(&id, Some(64)).expect("a tail stream");
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        poll_fn(|cx| tail.as_mut().poll_next(cx)),
+    )
+    .await
+    {
+        Ok(Some(chunk)) => assert!(chunk.len() <= 64, "the tail is bounded: {}", chunk.len()),
+        other => panic!("no tail replay: {other:?}"),
+    }
+
+    // Exec runs in the guest: `uname -a` names the guest kernel.
+    let mut session = engine
+        .exec(
+            &id,
+            &ExecRequest {
+                argv: vec!["uname".to_string(), "-a".to_string()],
+                user: None,
+                rows: 24,
+                cols: 80,
+            },
+        )
+        .await
+        .expect("exec");
+    let mut out = Vec::new();
+    let mut buf = [0_u8; 4096];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!remaining.is_zero(), "exec output timed out");
+        match tokio::time::timeout(remaining, session.io.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => out.extend_from_slice(&buf[..n]),
+            Ok(Err(err)) => panic!("exec read failed: {err}"),
+            Err(_) => panic!("exec output timed out"),
+        }
+    }
+    assert!(
+        String::from_utf8_lossy(&out).contains("Linux"),
+        "uname -a ran in the guest: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    let code = tokio::time::timeout(Duration::from_secs(10), session.exit)
+        .await
+        .expect("the session ends")
+        .expect("an exit code");
+    assert_eq!(code, 0);
+
+    // Read-only: the console accepts no input, and the stream ends on delete.
+    engine.stop(&id, StopMode::Force).await.expect("stop");
+    engine.delete(&id).await.expect("delete");
+    assert_no_leftovers(&id);
+    assert!(!serial.exists(), "the serial socket survived the delete");
+    // Deleting the VM ends every open stream (§3.19).
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        poll_fn(|cx| console.as_mut().poll_next(cx)),
+    )
+    .await
+    {
+        Ok(None) => {}
+        Ok(Some(chunk)) => panic!("bytes after the delete: {chunk:?}"),
+        Err(_) => panic!("the serial stream did not end on delete"),
+    }
 
     let tools = HostTools::discover().expect("host tools");
     net::remove_network(&tools, BRIDGE)

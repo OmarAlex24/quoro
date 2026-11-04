@@ -29,8 +29,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::ch::vmm::{ProcessId, VmmExit};
 use crate::{
-    ConsoleMode, EngineError, EngineEvent, ImageDigest, InitConfig, MacAddr, NetAttach, VmId,
-    VmSpec, VolumeAttach, VolumeId,
+    ConsoleMode, EngineError, EngineEvent, ImageDigest, InitConfig, MacAddr, NetAttach, SerialMode,
+    VmId, VmSpec, VolumeAttach, VolumeId, VsockAttach,
 };
 
 /// The version written into every [`SpecRecord`].
@@ -140,6 +140,47 @@ pub struct SpecFile {
     pub net: NetFile,
     pub init: InitFile,
     pub console: ConsoleFile,
+    /// The serial port (M4). Absent in files written before M4, which read
+    /// as [`SerialFile::Off`].
+    #[serde(default, skip_serializing_if = "SerialFile::is_off")]
+    pub serial: SerialFile,
+    /// The vsock device (M4). Absent means none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vsock: Option<VsockFile>,
+}
+
+/// The serial port in a [`SpecFile`], tagged by `mode` (M4).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum SerialFile {
+    /// No serial device, or a file written before M4.
+    #[default]
+    Off,
+    /// Serial output appended to this file.
+    File {
+        /// The log file.
+        path: PathBuf,
+    },
+    /// The serial port on this UNIX socket, read by the engine.
+    Socket {
+        /// The serial socket.
+        path: PathBuf,
+    },
+}
+
+impl SerialFile {
+    fn is_off(&self) -> bool {
+        matches!(self, Self::Off)
+    }
+}
+
+/// The vsock device in a [`SpecFile`] (M4).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VsockFile {
+    /// Guest context id.
+    pub cid: u32,
+    /// The hybrid vsock socket.
+    pub socket: PathBuf,
 }
 
 /// One attached volume in a [`SpecFile`].
@@ -230,6 +271,15 @@ impl From<&VmSpec> for SpecFile {
                     socket: socket.clone(),
                 },
             },
+            serial: match &spec.serial {
+                SerialMode::Off => SerialFile::Off,
+                SerialMode::File { path } => SerialFile::File { path: path.clone() },
+                SerialMode::Socket { path } => SerialFile::Socket { path: path.clone() },
+            },
+            vsock: spec.vsock.as_ref().map(|vsock| VsockFile {
+                cid: vsock.cid,
+                socket: vsock.socket.clone(),
+            }),
         }
     }
 }
@@ -295,6 +345,15 @@ impl SpecFile {
                     socket: socket.clone(),
                 },
             },
+            serial: match &self.serial {
+                SerialFile::Off => SerialMode::Off,
+                SerialFile::File { path } => SerialMode::File { path: path.clone() },
+                SerialFile::Socket { path } => SerialMode::Socket { path: path.clone() },
+            },
+            vsock: self.vsock.as_ref().map(|vsock| VsockAttach {
+                cid: vsock.cid,
+                socket: vsock.socket.clone(),
+            }),
         })
     }
 
@@ -725,6 +784,8 @@ mod tests {
                 workdir: Some("/app".to_string()),
             },
             console,
+            serial: crate::SerialMode::Off,
+            vsock: None,
         }
     }
 
