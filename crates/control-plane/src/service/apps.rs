@@ -147,9 +147,13 @@ pub async fn delete_app(state: &AppState, ctx: &CallCtx, app_id: &str) -> Result
     ctx.authorize(state, Scope::AppDelete, Some(&target), None, &params)
         .await?;
     match delete_app_tx(state, ctx, app_id, &params).await {
-        Ok((app, vm_ids)) => {
+        Ok((app, vm_ids, build_nodes)) => {
             for vm_id in vm_ids {
                 state.notify_driver(&vm_id);
+            }
+            // A build that was still running leaves the node's `spec.builds`.
+            for node_id in build_nodes {
+                state.hub.node_changed(&node_id);
             }
             Ok(app)
         }

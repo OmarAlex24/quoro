@@ -7,6 +7,7 @@ pub mod approvals;
 pub mod apps;
 pub mod audit;
 pub mod auth;
+pub mod builds;
 pub mod cluster;
 pub mod deployments;
 pub mod domains;
@@ -158,10 +159,13 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/vms/{vm_id}/start", post(vms::start_vm))
         .route("/api/v1/vms/{vm_id}/stop", post(vms::stop_vm))
         // Apps, deployments and domains (`apps::routes`), the on-demand
-        // log reads and the live-log SSE stream (`logs::routes`), and the
-        // metrics reads and live streams (`metrics::routes`).
+        // log reads and the live-log SSE stream (`logs::routes`), the
+        // metrics reads and live streams (`metrics::routes`), the terminal
+        // and console sessions (`interactive::routes`), and the builds
+        // (`builds::routes`).
         .merge(apps::routes())
         .merge(logs::routes())
         .merge(metrics::routes())
         .merge(interactive::routes())
+        .merge(builds::routes())
 }

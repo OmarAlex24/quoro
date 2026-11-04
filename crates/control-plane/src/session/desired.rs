@@ -8,15 +8,26 @@
 //!
 //! An app VM carries what only the app knows: its container `port`, its
 //! decrypted `env` (never logged), the parsed `health_check` and the
-//! `deployment_id` that produced it. Routes are built from the app's `domains`
-//! rows, pointing at the app's running VMs on this node.
+//! `deployment_id` that produced it. A VM of a built image also carries the
+//! `build_id` it was prepared from, and its digest comes from the build's row
+//! rather than from a registry (ADR 0118).
+//!
+//! `spec.builds` carries every build of this node that is not terminal, from
+//! the snapshot of the app's source the build started from, with the plaintext
+//! values of the app's environment variables it names as BuildKit secrets
+//! (section 5.11, ADR 0117).
+//!
+//! Routes are built from the app's `domains` rows, pointing at the app's
+//! running VMs on this node.
 
+use crate::api::apps::AppSource;
 use crate::app_env;
 use crate::crypto::DataKey;
 use crate::deploy;
 use crate::{DigestResolver, NodeNetwork, store::Store};
 use quoro_proto::wire::{
-    DesiredStatus, HealthCheck, Spec, SpecIngress, SpecNetwork, SpecRoute, SpecTunnel, SpecVm,
+    BuildLimits, DesiredStatus, HealthCheck, Spec, SpecBuild, SpecIngress, SpecNetwork, SpecRoute,
+    SpecTunnel, SpecVm,
 };
 use sqlx::sqlite::SqliteConnection;
 use sqlx::{Row, SqlitePool};
@@ -102,28 +113,50 @@ pub async fn build_spec(
         let vm_id: String = row.try_get("id").map_err(|e| e.to_string())?;
         let app_id: Option<String> = row.try_get("app_id").map_err(|e| e.to_string())?;
         let image: String = row.try_get("image").map_err(|e| e.to_string())?;
-        let image_digest = match resolve_digest(resolver, cache, &image).await {
-            Ok(digest) => digest,
-            Err(e) => {
-                let sent = previous
-                    .and_then(|spec| spec.vms.iter().find(|vm| vm.vm_id == vm_id))
-                    .map(|vm| vm.image_digest.clone());
-                let observed: String = row.try_get("observed_status").map_err(|e| e.to_string())?;
-                match sent {
-                    // The node already has it: keep the digest it was given.
-                    Some(digest) => digest,
-                    None if observed == "creating" => {
-                        tracing::warn!(vm_id, image, error = %e, "cannot resolve the image; the VM waits for it");
-                        held_back.push(HeldBack {
-                            vm_id,
-                            app_id,
-                            error: e,
-                        });
-                        continue;
-                    }
-                    None => return Err(format!("cannot resolve {image} for {vm_id}: {e}")),
+        // A built image never leaves the node that built it: its digest comes
+        // from the build's row, never from a registry (ADR 0118).
+        let build_id = crate::build::build_id_of_image(&image).map(str::to_string);
+        let known_digest = match &build_id {
+            Some(build_id) => {
+                let digest: Option<(Option<String>,)> =
+                    sqlx::query_as("SELECT image_digest FROM builds WHERE id = ?")
+                        .bind(build_id)
+                        .fetch_optional(&mut *conn)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                match digest.and_then(|(digest,)| digest) {
+                    Some(digest) => Some(digest),
+                    None => return Err(format!("the build of {image} has no image digest")),
                 }
             }
+            None => None,
+        };
+        let image_digest = match known_digest {
+            Some(digest) => digest,
+            None => match resolve_digest(resolver, cache, &image).await {
+                Ok(digest) => digest,
+                Err(e) => {
+                    let sent = previous
+                        .and_then(|spec| spec.vms.iter().find(|vm| vm.vm_id == vm_id))
+                        .map(|vm| vm.image_digest.clone());
+                    let observed: String =
+                        row.try_get("observed_status").map_err(|e| e.to_string())?;
+                    match sent {
+                        // The node already has it: keep the digest it was given.
+                        Some(digest) => digest,
+                        None if observed == "creating" => {
+                            tracing::warn!(vm_id, image, error = %e, "cannot resolve the image; the VM waits for it");
+                            held_back.push(HeldBack {
+                                vm_id,
+                                app_id,
+                                error: e,
+                            });
+                            continue;
+                        }
+                        None => return Err(format!("cannot resolve {image} for {vm_id}: {e}")),
+                    }
+                }
+            },
         };
         let desired_status: String = row.try_get("desired_status").map_err(|e| e.to_string())?;
         let vcpus: i64 = row.try_get("vcpus").map_err(|e| e.to_string())?;
@@ -173,9 +206,10 @@ pub async fn build_spec(
             lease_id: None,
             fencing_token: None,
             volumes: Vec::new(),
-            build_id: None,
+            build_id,
         });
     }
+    let builds = build_specs(&mut conn, data_key, node_id, &mut env_cache).await?;
     drop(conn);
 
     let routes = build_routes(store.pool(), &apps, &vms).await?;
@@ -190,10 +224,101 @@ pub async fn build_spec(
                 gateway: network.gateway.clone(),
             },
             ingress,
-            builds: Vec::new(),
+            builds,
         },
         held_back,
     })
+}
+
+/// `spec.builds`: every build of this node that is not terminal, from the
+/// snapshot of its source, with the plaintext values of the app's environment
+/// variables the source names as BuildKit secrets (section 5.11, 6.6).
+///
+/// It also keeps the newest build of an app when that build ran on this node
+/// and ended `failed` or `cancelled`. The node keeps an app's build log and
+/// cache disk only while the app appears in `spec.vms` or `spec.builds`
+/// (section 6.6), and a Git app whose build failed has no VM yet: without the
+/// entry, the log of the failure would be deleted as soon as the build left
+/// the snapshot. The kept entry is marked `cancelled` and carries no secrets,
+/// so the node never runs it again, even if it lost its row; a report about
+/// it changes nothing, because the build is already terminal. It leaves the
+/// snapshot when a newer build of the app starts, or when the app is deleted.
+///
+/// A secret name that is not an environment variable of the app is left out:
+/// `startBuild` already fails such a build in `preparing`, and this is the
+/// defensive path if the variable is removed later.
+async fn build_specs(
+    conn: &mut SqliteConnection,
+    data_key: &DataKey,
+    node_id: &str,
+    env_cache: &mut HashMap<String, BTreeMap<String, String>>,
+) -> Result<Vec<SpecBuild>, String> {
+    let rows = sqlx::query(
+        "SELECT b.id, b.app_id, a.project_id, b.source, b.error, \
+                b.status IN ('failed', 'cancelled') AS kept \
+         FROM builds b JOIN apps a ON a.id = b.app_id \
+         WHERE b.node_id = ? AND ( \
+             b.status NOT IN ('succeeded', 'failed', 'cancelled') \
+             OR (b.status IN ('failed', 'cancelled') AND b.id = ( \
+                 SELECT n.id FROM builds n \
+                 WHERE n.app_id = b.app_id AND n.started_at IS NOT NULL \
+                 ORDER BY n.id DESC LIMIT 1))) \
+         ORDER BY b.id",
+    )
+    .bind(node_id)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| format!("cannot read the builds of {node_id}: {e}"))?;
+
+    let mut builds = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let build_id: String = row.try_get("id").map_err(|e| e.to_string())?;
+        let app_id: String = row.try_get("app_id").map_err(|e| e.to_string())?;
+        let project_id: String = row.try_get("project_id").map_err(|e| e.to_string())?;
+        let source: String = row.try_get("source").map_err(|e| e.to_string())?;
+        let error: Option<String> = row.try_get("error").map_err(|e| e.to_string())?;
+        let kept: bool = row.try_get("kept").map_err(|e| e.to_string())?;
+        let source: AppSource = serde_json::from_str(&source)
+            .map_err(|e| format!("the source snapshot of {build_id} is invalid: {e}"))?;
+        let env = app_env_of(conn, data_key, &app_id, env_cache).await?;
+        let mut secrets = BTreeMap::new();
+        // A kept terminal build never runs again: it needs no secrets.
+        let names: &[String] = if kept { &[] } else { &source.secrets };
+        for name in names {
+            match env.get(name) {
+                Some(value) => {
+                    secrets.insert(name.clone(), value.clone());
+                }
+                None => tracing::warn!(
+                    build_id,
+                    app_id,
+                    name,
+                    "a build secret is not an environment variable of the app"
+                ),
+            }
+        }
+        builds.push(SpecBuild {
+            build_id,
+            app_id,
+            project_id,
+            repo_url: source.repo_url,
+            git_ref: source.git_ref,
+            dockerfile_path: source
+                .dockerfile_path
+                .unwrap_or_else(|| "Dockerfile".to_string()),
+            context_dir: source.context_dir.unwrap_or_else(|| ".".to_string()),
+            target: source.target,
+            build_args: source
+                .build_args
+                .into_iter()
+                .map(|arg| (arg.name, arg.value))
+                .collect(),
+            secrets,
+            limits: BuildLimits::default(),
+            cancelled: kept || error.as_deref() == Some(crate::build::CANCEL_REQUESTED),
+        });
+    }
+    Ok(builds)
 }
 
 /// Every app row, keyed by app id.

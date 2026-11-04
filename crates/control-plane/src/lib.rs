@@ -13,6 +13,7 @@ pub mod app_env;
 pub mod audit;
 pub mod auth;
 pub mod authz;
+pub mod build;
 pub mod changelog;
 pub mod crypto;
 pub mod deploy;

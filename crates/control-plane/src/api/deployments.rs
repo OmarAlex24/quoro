@@ -491,6 +491,20 @@ async fn create_deployment_tx(
         return Err(ApiError::not_found("app"));
     }
     let mut w = state.store.begin_write().await?;
+    let source: Option<(Option<String>,)> = sqlx::query_as("SELECT source FROM apps WHERE id = ?")
+        .bind(app_id)
+        .fetch_optional(&mut *w.tx)
+        .await?;
+    let Some((source,)) = source else {
+        return Err(ApiError::not_found("app"));
+    };
+    // An app with a Git source deploys the image its build produced, with
+    // `trigger: build`; an image given here would not be built (ADR 0117).
+    if source.is_some() {
+        return Err(ApiError::conflict(
+            "the app builds its image from a Git source; start a build instead",
+        ));
+    }
     let created = deploy::create_deployment(
         &mut w.tx,
         app_id,

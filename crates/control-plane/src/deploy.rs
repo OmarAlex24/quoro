@@ -106,8 +106,22 @@ pub(crate) struct CreatedDeployment {
     pub change_seq: i64,
     /// The new VM row that carries the deployment.
     pub vm_id: String,
+    /// Node the VM is placed on.
+    pub node_id: String,
     /// Ids of the superseded deployments' VMs, deleted in the same transaction.
     pub retired_vm_ids: Vec<String>,
+}
+
+/// Where a deployment is placed and the digest it already knows.
+///
+/// A deployment started by a build knows both: the image never leaves the
+/// node that built it, so there is no registry resolution (ADR 0118).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DeploymentTarget<'a> {
+    /// Node to place the deployment on; `None` lets the scheduler pick.
+    pub node_id: Option<&'a str>,
+    /// Digest the reference is known to have, when it is already resolved.
+    pub image_digest: Option<&'a str>,
 }
 
 /// The app fields a deployment needs, read inside the write transaction.
@@ -151,7 +165,7 @@ async fn load_app(conn: &mut SqliteConnection, app_id: &str) -> Result<AppSnapsh
 
 /// The node a deployment is placed on: the first of `placement.node_ids` that
 /// is not removed, else the first `connected` node by id.
-async fn pick_node(
+pub(crate) async fn pick_node(
     conn: &mut SqliteConnection,
     placement: &AppPlacement,
 ) -> Result<String, ApiError> {
@@ -174,7 +188,7 @@ async fn pick_node(
 }
 
 /// The creator kind of a deployment, from the change-log actor.
-const fn creator_type(actor: &Actor) -> CreatedByType {
+pub(crate) const fn creator_type(actor: &Actor) -> CreatedByType {
     match actor.kind {
         ActorType::User => CreatedByType::User,
         ActorType::Agent => CreatedByType::Agent,
@@ -246,8 +260,40 @@ pub(crate) async fn create_deployment(
     trigger: DeploymentTrigger,
     actor: &Actor,
 ) -> Result<CreatedDeployment, ApiError> {
+    create_deployment_with(
+        conn,
+        app_id,
+        image,
+        trigger,
+        actor,
+        &DeploymentTarget::default(),
+        true,
+    )
+    .await
+}
+
+/// Starts a deployment with a target and a digest the caller already knows,
+/// and optionally without its two events so the caller emits them in its own
+/// order (a build emits `build.succeeded` before `deployment.started`).
+///
+/// # Errors
+///
+/// The same as [`create_deployment`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn create_deployment_with(
+    conn: &mut SqliteConnection,
+    app_id: &str,
+    image: &str,
+    trigger: DeploymentTrigger,
+    actor: &Actor,
+    target: &DeploymentTarget<'_>,
+    emit_events: bool,
+) -> Result<CreatedDeployment, ApiError> {
     let app = load_app(conn, app_id).await?;
-    let node_id = pick_node(conn, &app.placement).await?;
+    let node_id = match target.node_id {
+        Some(node_id) => node_id.to_string(),
+        None => pick_node(conn, &app.placement).await?,
+    };
     let now = now_rfc3339();
 
     // The link rule needs a strictly increasing `created_at` per app.
@@ -306,7 +352,7 @@ pub(crate) async fn create_deployment(
         id: new_id_with_prefix("dep"),
         app_id: app_id.to_string(),
         image: image.to_string(),
-        image_digest: None,
+        image_digest: target.image_digest.map(str::to_string),
         status: DeploymentStatus::Pending,
         phase: None,
         error: None,
@@ -319,11 +365,12 @@ pub(crate) async fn create_deployment(
     sqlx::query(
         "INSERT INTO deployments (id, app_id, image, image_digest, status, phase, error, \
          \"trigger\", created_by_type, created_by_id, created_at, finished_at) \
-         VALUES (?, ?, ?, NULL, ?, NULL, NULL, ?, ?, ?, ?, NULL)",
+         VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, NULL)",
     )
     .bind(&deployment.id)
     .bind(&deployment.app_id)
     .bind(&deployment.image)
+    .bind(&deployment.image_digest)
     .bind(deployment.status.as_str())
     .bind(deployment.trigger.as_str())
     .bind(deployment.created_by_type.as_str())
@@ -380,21 +427,53 @@ pub(crate) async fn create_deployment(
         }),
     )
     .await?;
+    let created = CreatedDeployment {
+        deployment,
+        project_id: app.project_id,
+        change_seq,
+        vm_id,
+        node_id,
+        retired_vm_ids,
+    };
+    if emit_events {
+        emit_created_events(conn, &created, actor).await?;
+    }
+
+    if app.status != AppStatus::Deploying {
+        set_app_status(conn, app_id, AppStatus::Deploying, &now).await?;
+    }
+
+    Ok(created)
+}
+
+/// Emits the `deployment.started` and `vm.created` events of a new deployment.
+///
+/// A caller that wants `build.succeeded` before `deployment.started` creates
+/// the deployment without its events and emits them here itself (ADR 0117).
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn emit_created_events(
+    conn: &mut SqliteConnection,
+    created: &CreatedDeployment,
+    actor: &Actor,
+) -> Result<(), ApiError> {
     events::emit(
         conn,
         NewEvent {
             kind: "deployment.started",
             source: Source::ControlPlane,
             subject_type: "deployment",
-            subject_id: &deployment.id,
-            project_id: Some(&app.project_id),
+            subject_id: &created.deployment.id,
+            project_id: Some(&created.project_id),
             request_id: None,
             actor: Some(actor),
             data: json!({
-                "deployment_id": deployment.id,
-                "app_id": deployment.app_id,
-                "image": deployment.image,
-                "trigger": deployment.trigger.as_str(),
+                "deployment_id": created.deployment.id,
+                "app_id": created.deployment.app_id,
+                "image": created.deployment.image,
+                "trigger": created.deployment.trigger.as_str(),
             }),
         },
     )
@@ -405,26 +484,19 @@ pub(crate) async fn create_deployment(
             kind: "vm.created",
             source: Source::ControlPlane,
             subject_type: "vm",
-            subject_id: &vm_id,
-            project_id: Some(&app.project_id),
+            subject_id: &created.vm_id,
+            project_id: Some(&created.project_id),
             request_id: None,
             actor: Some(actor),
-            data: json!({ "vm_id": vm_id, "node_id": node_id, "app_id": app_id }),
+            data: json!({
+                "vm_id": created.vm_id,
+                "node_id": created.node_id,
+                "app_id": created.deployment.app_id,
+            }),
         },
     )
     .await?;
-
-    if app.status != AppStatus::Deploying {
-        set_app_status(conn, app_id, AppStatus::Deploying, &now).await?;
-    }
-
-    Ok(CreatedDeployment {
-        deployment,
-        project_id: app.project_id,
-        change_seq,
-        vm_id,
-        retired_vm_ids,
-    })
+    Ok(())
 }
 
 /// Writes `apps.status` and its change-log entry when it changes.
