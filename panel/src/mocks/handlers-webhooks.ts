@@ -261,6 +261,7 @@ export const webhooksHandlers: HttpHandler[] = [
       response_code: null,
       error: null,
       next_attempt_at: null,
+      test: true,
       created_at: now(),
     };
     state.deliveries.push(delivery);

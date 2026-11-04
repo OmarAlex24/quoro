@@ -402,6 +402,9 @@ pub struct WebhookDelivery {
     /// When the next attempt is due.
     #[schema(nullable = true)]
     pub next_attempt_at: Option<String>,
+    /// True for a test delivery sent by `testWebhook`, false for every real
+    /// delivery. A test delivery is always attempt 1 with no next attempt.
+    pub test: bool,
     /// When the attempt was made.
     #[schema(format = "date-time")]
     pub created_at: String,

@@ -122,6 +122,7 @@
   - [0106: Add GET /api/v1/agents/{agent_id}/keys to openapi.yaml so the panel can list an agent's keys](adr/0106-add-get-api-v1-agents-agent-id-keys-to-openapi-yaml-so-the.md)
   - [0107: Let operators and viewers resolve user ids to names (a read path for users)](adr/0107-let-operators-and-viewers-resolve-user-ids-to-names-a-read.md)
   - [0109: Docs site: mdBook built from the repo's Markdown, published to GitHub Pages together with the v0.1.0 tag](adr/0109-docs-site-mdbook-built-from-the-repo-s-markdown-published.md)
+  - [0111: user:read stays human-only; WebhookDelivery exposes the test flag; creating users is M4 work](adr/0111-user-read-stays-human-only-webhookdelivery-exposes-the-test.md)
 
 # Background research
 

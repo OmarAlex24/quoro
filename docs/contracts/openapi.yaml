@@ -3174,13 +3174,15 @@ components:
       description: |
         One delivery attempt of an event to a webhook. Failed deliveries are
         retried with exponential backoff from 10 seconds doubling to 1 hour, at
-        most 10 attempts.
+        most 10 attempts. A test delivery (`test` true) is attempted once and
+        never retried.
       required:
         - id
         - webhook_id
         - event_id
         - attempt
         - status
+        - test
         - created_at
       properties:
         id:
@@ -3217,6 +3219,11 @@ components:
         next_attempt_at:
           type: [string, 'null']
           description: When the next attempt is due.
+        test:
+          type: boolean
+          description: |
+            True for a test delivery sent by `testWebhook`, false for every real
+            delivery. A test delivery is always attempt 1 with no next attempt.
         created_at:
           type: string
           format: date-time
@@ -6729,8 +6736,8 @@ paths:
         attempted once, never retried, never issues an incident grant and never
         carries `data.wake`. It is recorded as its own delivery, separate from
         the real deliveries of the same event, so it never replaces, blocks or
-        collides with them. Human-only (D-0030). `Quoro-Justification` is
-        required when the caller is an agent (D-0031).
+        collides with them; its `test` field is true. Human-only (D-0030).
+        `Quoro-Justification` is required when the caller is an agent (D-0031).
       x-quoro-scope: webhook:write
       parameters:
         - $ref: '#/components/parameters/WebhookId'
@@ -6762,7 +6769,8 @@ paths:
       summary: List a webhook's deliveries
       description: |
         Delivery attempts of one webhook, newest first, with the receiver's response
-        code, any error and the next attempt time.
+        code, any error and the next attempt time. Test deliveries are listed
+        alongside real ones and carry `test: true`.
       x-quoro-scope: webhook:read
       parameters:
         - $ref: '#/components/parameters/WebhookId'

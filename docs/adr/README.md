@@ -96,3 +96,4 @@ Some decisions about internal coordination or business planning are kept private
 | [0106](0106-add-get-api-v1-agents-agent-id-keys-to-openapi-yaml-so-the.md) | Add GET /api/v1/agents/{agent_id}/keys to openapi.yaml so the panel can list an agent's keys | Accepted | contracts, panel, agents, m3 | 2026-11-03 |
 | [0107](0107-let-operators-and-viewers-resolve-user-ids-to-names-a-read.md) | Let operators and viewers resolve user ids to names (a read path for users) | Accepted | contracts, panel, m3 | 2026-11-03 |
 | [0109](0109-docs-site-mdbook-built-from-the-repo-s-markdown-published.md) | Docs site: mdBook built from the repo's Markdown, published to GitHub Pages together with the v0.1.0 tag | Accepted | docs, m3 | 2026-11-03 |
+| [0111](0111-user-read-stays-human-only-webhookdelivery-exposes-the-test.md) | user:read stays human-only; WebhookDelivery exposes the test flag; creating users is M4 work | Accepted | contracts, m3 | 2026-11-03 |
