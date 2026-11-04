@@ -232,6 +232,7 @@ impl<'e, E: Engine, S: LeaseStore> LeaseAgent<'e, E, S> {
                                 detail: Some("unknown lease".to_string()),
                                 error: None,
                                 lines: None,
+                                metrics: None,
                             },
                         );
                     }
@@ -405,6 +406,7 @@ fn revoke_result(lease_id: &LeaseId, report: &FenceReport) -> CommandResult {
             detail: None,
             error: None,
             lines: None,
+            metrics: None,
         };
     }
     let failed: Vec<String> = report
@@ -429,6 +431,7 @@ fn revoke_result(lease_id: &LeaseId, report: &FenceReport) -> CommandResult {
             message: detail,
         }),
         lines: None,
+        metrics: None,
     }
 }
 

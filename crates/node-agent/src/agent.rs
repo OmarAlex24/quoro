@@ -19,6 +19,7 @@ use tracing::{info, warn};
 
 use crate::identity::IdentityHandle;
 use crate::ingress::{CertificateEvents, DnsBridge, IngressSupervisor};
+use crate::metrics::{MetricsRing, MetricsSampler};
 use crate::reconcile::{ReconcileConfig, ReconcileOptions, Reconciler, Snapshot};
 use crate::session::{Session, SessionSetup, wait_stop};
 use crate::store::NodeStore;
@@ -57,8 +58,9 @@ pub async fn run<E: Engine + 'static>(
     ));
 
     let (desired, desired_rx) = watch::channel(current.clone());
+    let engine = Arc::new(engine);
     let (reconciler, observed) = Reconciler::new(
-        Arc::new(engine),
+        Arc::clone(&engine),
         store.clone(),
         ReconcileConfig {
             bridge: config.bridge.clone(),
@@ -70,6 +72,16 @@ pub async fn run<E: Engine + 'static>(
         .with_node_id(identity.get().node_id)
         .with_ingress(Arc::clone(&ingress));
 
+    // Metrics stay in memory on this node (ADR 0014): the sampler fills a ring
+    // the session answers `metrics_query` and `metrics` streams from.
+    let metrics = MetricsRing::new();
+    let sampler = MetricsSampler::new(
+        Arc::clone(&engine),
+        observed.clone(),
+        desired.subscribe(),
+        metrics.clone(),
+    );
+
     let (stop, stop_rx) = watch::channel(false);
     let shutdown_stop = stop.clone();
     let shutdown_task = tokio::spawn(async move {
@@ -77,6 +89,7 @@ pub async fn run<E: Engine + 'static>(
         let _ = shutdown_stop.send(true);
     });
     let reconcile_task = tokio::spawn(reconciler.run(desired_rx, wait_stop(stop_rx.clone())));
+    let metrics_task = tokio::spawn(sampler.run(wait_stop(stop_rx.clone())));
 
     let mut session = Session::new(SessionSetup {
         identity,
@@ -86,11 +99,13 @@ pub async fn run<E: Engine + 'static>(
         observed,
         current,
     })
-    .with_ingress(Arc::clone(&ingress), dns);
+    .with_ingress(Arc::clone(&ingress), dns)
+    .with_metrics(metrics);
     let outcome = session.run(stop_rx).await;
 
     let _ = stop.send(true);
     let _ = reconcile_task.await;
+    let _ = metrics_task.await;
     ingress.shutdown().await;
     shutdown_task.abort();
     outcome

@@ -17,6 +17,7 @@ pub mod ingress;
 pub mod lease;
 pub mod localkey;
 pub mod logs;
+pub mod metrics;
 pub mod reconcile;
 pub mod session;
 pub mod store;

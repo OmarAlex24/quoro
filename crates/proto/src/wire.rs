@@ -361,7 +361,7 @@ pub struct LogAck {
 }
 
 /// Body of `stream_data` (section 5.7).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StreamData {
     pub stream_id: String,
     pub seq: u64,
@@ -369,6 +369,9 @@ pub struct StreamData {
     pub lines: Option<Vec<LogLine>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<String>,
+    /// One sample per array, for a `metrics` stream (section 5.17).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<crate::metrics::MetricsReport>,
 }
 
 /// `reason` of `stream_end` (section 5.8).

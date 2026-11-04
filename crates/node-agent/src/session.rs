@@ -40,6 +40,7 @@ use tracing::{debug, info, warn};
 use crate::identity::{Identity, IdentityHandle};
 use crate::ingress::{DnsBridge, DnsRequest, IngressSupervisor};
 use crate::logs::{LogFilter, StoredLogLine};
+use crate::metrics::{MetricsRing, Tick, parse_metrics_params, tick_report};
 use crate::reconcile::Snapshot;
 use crate::store::NodeStore;
 use crate::tls::{self, Endpoint};
@@ -156,6 +157,8 @@ pub struct Session {
     ingress: Option<Arc<IngressSupervisor>>,
     /// The DNS-01 bridge the ingress supervisor's provider sends through.
     dns: Option<Arc<DnsBridge>>,
+    /// The metric rings, when the agent samples metrics (section 5.17).
+    metrics: Option<MetricsRing>,
 }
 
 impl Session {
@@ -180,6 +183,7 @@ impl Session {
             boot_id: util::hex(&util::random_bytes::<16>()),
             ingress: None,
             dns: None,
+            metrics: None,
         }
     }
 
@@ -190,6 +194,14 @@ impl Session {
     pub fn with_ingress(mut self, ingress: Arc<IngressSupervisor>, dns: Arc<DnsBridge>) -> Self {
         self.ingress = Some(ingress);
         self.dns = Some(dns);
+        self
+    }
+
+    /// Attaches the metric rings the sampler fills, answering `metrics_query`
+    /// and `metrics` streams (section 5.17).
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: MetricsRing) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 
@@ -595,10 +607,14 @@ impl Session {
                         )),
                         error: None,
                         lines: None,
+                        metrics: None,
                     };
                     write_message(sink, NodeMessage::CommandResult(body), Some(&raw.id)).await?;
                 } else if command.kind == "logs_query" {
                     let body = self.logs_query(&command).await;
+                    write_message(sink, NodeMessage::CommandResult(body), Some(&raw.id)).await?;
+                } else if command.kind == "metrics_query" {
+                    let body = self.metrics_query(&command);
                     write_message(sink, NodeMessage::CommandResult(body), Some(&raw.id)).await?;
                 } else {
                     let body = CommandResult {
@@ -612,6 +628,7 @@ impl Session {
                             message: "this command kind is not implemented yet".to_owned(),
                         }),
                         lines: None,
+                        metrics: None,
                     };
                     write_message(sink, NodeMessage::CommandResult(body), Some(&raw.id)).await?;
                 }
@@ -635,6 +652,7 @@ impl Session {
                     detail: Some("unknown lease".to_owned()),
                     error: None,
                     lines: None,
+                    metrics: None,
                 };
                 write_message(sink, NodeMessage::CommandResult(body), Some(&raw.id)).await?;
             }
@@ -726,6 +744,7 @@ impl Session {
                 detail: Some(format!("ignored rev {rev}")),
                 error: None,
                 lines: None,
+                metrics: None,
             };
             write_message(sink, NodeMessage::CommandResult(result), Some(&raw.id)).await?;
             return Ok(());
@@ -737,6 +756,7 @@ impl Session {
                 detail: Some(format!("could not store rev {rev}: {e}")),
                 error: None,
                 lines: None,
+                metrics: None,
             };
             write_message(sink, NodeMessage::CommandResult(result), Some(&raw.id)).await?;
             return Ok(());
@@ -746,6 +766,7 @@ impl Session {
             detail: Some(format!("stored rev {rev}")),
             error: None,
             lines: None,
+            metrics: None,
         };
         write_message(sink, NodeMessage::CommandResult(result), Some(&raw.id)).await?;
 
@@ -810,6 +831,7 @@ impl Session {
             detail: Some(format!("rotated to key {expected}")),
             error: None,
             lines: None,
+            metrics: None,
         };
         write_message(sink, NodeMessage::CommandResult(result), Some(&raw.id)).await?;
         Ok(())
@@ -859,6 +881,25 @@ impl Session {
             detail,
             error: None,
             lines: Some(kept),
+            metrics: None,
+        }
+    }
+
+    /// Answers `command` kind `metrics_query` (section 5.17).
+    fn metrics_query(&self, command: &Command) -> CommandResult {
+        let (node, vm_ids) = match parse_metrics_params(&command.params) {
+            Ok(params) => params,
+            Err(message) => return bad_result(&message),
+        };
+        let Some(ring) = &self.metrics else {
+            return bad_result("metrics are not sampled on this node");
+        };
+        CommandResult {
+            status: CommandStatus::Ok,
+            detail: None,
+            error: None,
+            lines: None,
+            metrics: Some(ring.query(node, &vm_ids)),
         }
     }
 
@@ -897,6 +938,26 @@ impl Session {
                 Ok((deployment_id, phase)) => {
                     spawn_deployment_logs(store, stream_id, deployment_id, phase, stream_tx.clone())
                 }
+                Err(message) => {
+                    let body = bad_result(&message);
+                    write_message(sink, NodeMessage::CommandResult(body), Some(&raw.id)).await?;
+                    return Ok(());
+                }
+            },
+            "metrics" => match parse_metrics_params(&open.params) {
+                Ok((node, vm_ids)) => match &self.metrics {
+                    // Subscribe before spawning so no round is missed between
+                    // this frame and the task's first poll.
+                    Some(ring) => {
+                        spawn_metrics(ring.subscribe(), stream_id, node, vm_ids, stream_tx.clone())
+                    }
+                    None => {
+                        let body = bad_result("metrics are not sampled on this node");
+                        write_message(sink, NodeMessage::CommandResult(body), Some(&raw.id))
+                            .await?;
+                        return Ok(());
+                    }
+                },
                 Err(message) => {
                     let body = bad_result(&message);
                     write_message(sink, NodeMessage::CommandResult(body), Some(&raw.id)).await?;
@@ -1142,6 +1203,7 @@ fn bad_result(message: &str) -> CommandResult {
             message: message.to_owned(),
         }),
         lines: None,
+        metrics: None,
     }
 }
 
@@ -1195,6 +1257,7 @@ async fn send_lines(
             seq: *seq,
             lines: Some(chunk),
             data: None,
+            metrics: None,
         };
         *seq = seq.saturating_add(1);
         if tx.send(NodeMessage::StreamData(frame)).await.is_err() {
@@ -1313,6 +1376,46 @@ async fn run_app_logs(
             }
         }
     }
+}
+
+/// Starts one `metrics` stream: one `stream_data` per sampling round.
+fn spawn_metrics(
+    mut ticks: tokio::sync::broadcast::Receiver<Tick>,
+    stream_id: String,
+    node: bool,
+    vm_ids: Vec<String>,
+    tx: mpsc::Sender<NodeMessage>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut seq = 1u64;
+        loop {
+            match ticks.recv().await {
+                Ok(tick) => {
+                    let Some(report) = tick_report(&tick, node, &vm_ids) else {
+                        continue;
+                    };
+                    let frame = StreamData {
+                        stream_id: stream_id.clone(),
+                        seq,
+                        lines: None,
+                        data: None,
+                        metrics: Some(report),
+                    };
+                    seq = seq.saturating_add(1);
+                    if tx.send(NodeMessage::StreamData(frame)).await.is_err() {
+                        return;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    debug!(skipped, "a metrics stream lagged; some rounds were skipped");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    send_end(&tx, &stream_id, StreamEndReason::Completed, None).await;
+                    return;
+                }
+            }
+        }
+    })
 }
 
 fn spawn_deployment_logs(
@@ -1820,5 +1923,184 @@ mod tests {
                 .len(),
             130
         );
+    }
+
+    /// Like [`drive_session`] but attaches the metric rings to the session.
+    async fn drive_session_with_ring(
+        dir: &TempDir,
+        ring: MetricsRing,
+        primary: impl FnOnce(
+            WebSocketStream<DuplexStream>,
+            NodeStore,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + 'static,
+    ) -> (SessionEnd, NodeStore) {
+        let key = sign::signing_key_from_seed(&[4; 32]);
+        let identity = identity_files(dir.path(), &key);
+        let store = NodeStore::open(dir.path()).await.unwrap();
+        let (desired, _desired_rx) = watch::channel(None);
+        let (_observed_tx, observed_rx) = watch::channel(Vec::new());
+        let mut session = Session::new(SessionSetup {
+            identity,
+            store: store.clone(),
+            facts: facts(),
+            desired,
+            observed: observed_rx,
+            current: None,
+        })
+        .with_metrics(ring);
+
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let primary_store = store.clone();
+        let primary = tokio::spawn(async move {
+            let ws = accept_async(server).await.unwrap();
+            primary(ws, primary_store).await;
+        });
+        let (client_ws, _response) = client_async("ws://primary.test/session", client)
+            .await
+            .unwrap();
+        let end = session
+            .serve(client_ws, std::future::pending::<()>())
+            .await
+            .unwrap();
+        primary.await.unwrap();
+        (end, store)
+    }
+
+    const METRICS_VM: &str = "vm_01JC9Z7C4P6R8T0V2X4Z6B8D0F";
+
+    fn node_sample() -> quoro_proto::metrics::NodeSample {
+        quoro_proto::metrics::NodeSample {
+            time: "2026-11-04T10:15:30Z".to_owned(),
+            cpu_usage: 0.25,
+            cpu_count: 4,
+            memory_total_bytes: 8 * 1024 * 1024 * 1024,
+            memory_used_bytes: 2 * 1024 * 1024 * 1024,
+        }
+    }
+
+    fn vm_sample() -> quoro_proto::metrics::VmSample {
+        quoro_proto::metrics::VmSample {
+            time: "2026-11-04T10:15:30Z".to_owned(),
+            cpu_usage: 0.1,
+            vcpus: 2,
+            memory_rss_bytes: 100 * 1024 * 1024,
+            memory_bytes: 512 * 1024 * 1024,
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_query_answers_with_the_ring() {
+        let dir = TempDir::new();
+        let ring = MetricsRing::new();
+        ring.record(
+            Some(node_sample()),
+            vec![(METRICS_VM.to_owned(), vm_sample())],
+        );
+        let (end, _store) = drive_session_with_ring(&dir, ring, |mut ws, _store| {
+            Box::pin(async move {
+                handshake(&mut ws).await;
+                send(
+                    &mut ws,
+                    ControlMessage::Command(Command {
+                        kind: "metrics_query".to_owned(),
+                        params: json!({"node": true, "vm_ids": [METRICS_VM]}),
+                    })
+                    .to_frame("msg_metrics", None)
+                    .to_text(),
+                )
+                .await;
+                let answer = read_until(&mut ws, "command_result").await;
+                assert_eq!(answer["re"], "msg_metrics");
+                assert_eq!(answer["body"]["status"], "ok");
+                let metrics = &answer["body"]["metrics"];
+                assert_eq!(metrics["interval_s"], 5);
+                let node = metrics["node"].as_array().unwrap();
+                assert_eq!(node.len(), 1);
+                assert_eq!(node[0]["cpu_count"], 4);
+                let vms = metrics["vms"].as_array().unwrap();
+                assert_eq!(vms.len(), 1);
+                assert_eq!(vms[0]["vm_id"], METRICS_VM);
+                assert_eq!(vms[0]["samples"][0]["vcpus"], 2);
+            })
+        })
+        .await;
+        assert_eq!(end, SessionEnd::Reconnect);
+    }
+
+    #[tokio::test]
+    async fn metrics_query_rejects_an_empty_selector() {
+        let dir = TempDir::new();
+        let (end, _store) = drive_session_with_ring(&dir, MetricsRing::new(), |mut ws, _store| {
+            Box::pin(async move {
+                handshake(&mut ws).await;
+                send(
+                    &mut ws,
+                    ControlMessage::Command(Command {
+                        kind: "metrics_query".to_owned(),
+                        params: json!({}),
+                    })
+                    .to_frame("msg_metrics_bad", None)
+                    .to_text(),
+                )
+                .await;
+                let answer = read_until(&mut ws, "command_result").await;
+                assert_eq!(answer["re"], "msg_metrics_bad");
+                assert_eq!(answer["body"]["status"], "error");
+                assert_eq!(answer["body"]["error"]["code"], "bad_message");
+            })
+        })
+        .await;
+        assert_eq!(end, SessionEnd::Reconnect);
+    }
+
+    #[tokio::test]
+    async fn a_metrics_stream_follows_rounds_and_ends_on_close() {
+        let dir = TempDir::new();
+        let ring = MetricsRing::new();
+        let feed = ring.clone();
+        let (end, _store) = drive_session_with_ring(&dir, ring, move |mut ws, _store| {
+            Box::pin(async move {
+                handshake(&mut ws).await;
+                send(
+                    &mut ws,
+                    ControlMessage::StreamOpen(StreamOpen {
+                        stream_id: "msg_metrics_stream".to_owned(),
+                        kind: "metrics".to_owned(),
+                        params: json!({"node": true}),
+                    })
+                    .to_frame("msg_open_metrics", None)
+                    .to_text(),
+                )
+                .await;
+                // Let the session install the stream's subscription.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                feed.record(Some(node_sample()), Vec::new());
+                let data = read_until(&mut ws, "stream_data").await;
+                assert_eq!(data["body"]["stream_id"], "msg_metrics_stream");
+                assert_eq!(data["body"]["seq"], 1);
+                assert!(data["body"].get("lines").is_none());
+                let metrics = &data["body"]["metrics"];
+                assert_eq!(metrics["interval_s"], 5);
+                assert_eq!(metrics["node"].as_array().unwrap().len(), 1);
+                assert!(metrics.get("vms").is_none());
+
+                send(
+                    &mut ws,
+                    ControlMessage::StreamClose(StreamClose {
+                        stream_id: "msg_metrics_stream".to_owned(),
+                    })
+                    .to_frame("msg_close_metrics", None)
+                    .to_text(),
+                )
+                .await;
+                let end = read_until(&mut ws, "stream_end").await;
+                assert_eq!(end["body"]["stream_id"], "msg_metrics_stream");
+                assert_eq!(end["body"]["reason"], "cancelled");
+            })
+        })
+        .await;
+        assert_eq!(end, SessionEnd::Reconnect);
     }
 }

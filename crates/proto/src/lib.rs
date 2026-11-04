@@ -14,6 +14,7 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 pub mod jcs;
+pub mod metrics;
 pub mod sign;
 pub mod wire;
 
@@ -144,7 +145,7 @@ pub struct LeaseRevoke {
 }
 
 /// Body of `command_result` (section 5.9).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CommandResult {
     /// `ok` or `error`.
     pub status: CommandStatus,
@@ -157,6 +158,9 @@ pub struct CommandResult {
     /// Log lines answering `command` kind `logs_query` (section 5.9).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lines: Option<Vec<wire::LogLine>>,
+    /// Samples answering `command` kind `metrics_query` (section 5.17).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<metrics::MetricsReport>,
 }
 
 /// The `error` object of a `command_result` (section 5.9).
@@ -244,7 +248,7 @@ pub enum ToNode {
 /// A node-to-control-plane message.
 ///
 /// Only the messages M0 needs; the rest of the set is added with the session.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum FromNode {
     /// Ask to extend an `expiring` lease (section 5.5).
     LeaseRenew(Envelope<LeaseRenew>),
