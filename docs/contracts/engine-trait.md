@@ -624,9 +624,10 @@ The point-in-time disk primitive the chunk engine needs (D-0023). Both are `Unsu
 
 ### 3.17 `prepare_layout`
 
-Turns a local OCI image layout, as a builder VM wrote it on its work disk, into a prepared rootfs, the way `prepare_image` does for a pulled image (ADR 0117, ADR 0118). Added in M4.
+Turns a local OCI image layout, as a builder VM wrote it to its output disk, into a prepared rootfs, the way `prepare_image` does for a pulled image (ADR 0117, ADR 0118). Added in M4.
 
-- Precondition: `path` is a readable OCI image layout whose index names `manifest_digest`.
+- Precondition: `path` is a readable OCI image layout whose index names `manifest_digest`: a directory, or a tarball of one, which may be followed by zero padding up to the end of the file (a raw output disk, `node-agent-protocol.md` section 6.6).
+- A tarball is read in user space as untrusted input: only regular files named `oci-layout`, `index.json` and `blobs/sha256/<64 hex>` are taken, every other entry (a link, a device, a path with `..`, a duplicate name) makes the layout `Image`, and the bytes read are bounded by the node's image limit.
 - The engine verifies every blob against its digest, checks that the manifest's digest is `manifest_digest`, applies the layers with the same pipeline as `prepare_image` (D-0061), extracts `ImageConfig`, and caches the result by `manifest_digest` in the same cache. `create` then boots it with `rootfs` set to that digest, and `remove_image` removes it.
 - Idempotent by digest: a second call with a digest already cached returns the cached value without reading the layout.
 - A missing or malformed layout, a blob that does not match its digest, a media type the pipeline does not support, or a layout larger than the node's image limit is `Image`. Nothing is pulled: a layout that references a blob it does not contain is `Image`, not a registry fetch.
@@ -722,7 +723,7 @@ The minimal init is part of the engine workstream and is the only process Quoro 
 6. On the power-button signal, send `SIGTERM` to the app, wait for it to exit or for the timeout to pass, then power the guest off.
 7. Report the app's exit code so the engine can surface it as `exit_code` and as `EngineEvent::Exited`.
 8. From M4, mount `cgroup2` on `/sys/fs/cgroup`, which BuildKit needs and app images may expect (ADR 0118).
-9. From M4, listen for exec sessions (below), and unmount or remount read-only every writable disk before powering off, so the node reads a work disk without journal recovery (ADR 0118).
+9. From M4, listen for exec sessions (below), and unmount or remount read-only every writable disk before powering off, so a work disk is clean for the next VM that attaches it, without journal recovery (ADR 0118).
 
 **Configuration version 2 (M4).** The init's configuration grammar refuses unknown keys, so M4 adds one: the header becomes `quoro-init-config v2`, and one line `exec_port=<u32>` follows `stop_timeout_ms` (`crates/init/README.md`). The engine writes `exec_port=1024`. The init still accepts a `v1` configuration and then starts no exec listener. The engine and the init ship together: the initramfs is rebuilt from the installed init, so a VM gets the new init at its next start, and a VM that kept running across the upgrade answers `exec` with `Conflict` until it restarts.
 
