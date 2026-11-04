@@ -4,10 +4,12 @@
 //!
 //! # Model
 //!
-//! - Every deployment creates **one new VM row** for the app (`vms.app_id`
-//!   set), placed on a node, because a VM's image digest is create-time only
-//!   on the node (`crates/node-agent/src/reconcile.rs`). An app has one
-//!   instance in M1-M4.
+//! - A deployment of an app with one replica creates **one new VM row** for
+//!   the app (`vms.app_id` set), placed on a node, because a VM's image digest
+//!   is create-time only on the node
+//!   (`crates/node-agent/src/reconcile.rs`). An app with more replicas starts
+//!   one new instance per node, one node at a time, gated on the previous new
+//!   instance's health (`crate::scheduler`, ADR 0142).
 //! - **VM to deployment link.** `vms` has no `deployment_id` column. The link
 //!   is `vms.app_id = deployments.app_id AND vms.created_at =
 //!   deployments.created_at`: the deployment and its VM are written in the
@@ -15,10 +17,10 @@
 //!   strictly greater than every earlier deployment of the app (bumped by one
 //!   millisecond on a tie), so the link is unique by construction.
 //!   [`deployment_ids_for_node`] is the only reader of the rule.
-//! - When the new VM is observed `running` with health `passing`, the
+//! - When every new instance is observed `running` with health `passing`, the
 //!   deployment `succeeded`, becomes the app's `current_deployment_id`, and
-//!   the app's older VMs are deleted. A failure leaves the previous VM
-//!   running.
+//!   the app's older VMs are deleted. A failure deletes every VM of the
+//!   deployment and leaves the previous deployment's VMs running.
 //!
 //! Every function that changes desired state returns the `vm_` ids whose
 //! desired state changed; the caller (the session or a handler) passes each
@@ -36,7 +38,7 @@ use crate::store::{Store, now_rfc3339};
 use quoro_proto::wire;
 use serde_json::{Value, json};
 use sqlx::{Row, SqliteConnection};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Crockford base32, the alphabet of a ULID (`README` "Identifiers").
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -104,7 +106,8 @@ pub(crate) struct CreatedDeployment {
     pub project_id: String,
     /// Change-log `seq` of the deployment's create entry.
     pub change_seq: i64,
-    /// The new VM row that carries the deployment.
+    /// The first new VM row of the deployment (its only one when the app has
+    /// one replica).
     pub vm_id: String,
     /// Node the VM is placed on.
     pub node_id: String,
@@ -132,13 +135,14 @@ struct AppSnapshot {
     restart_generation: i64,
     resources: AppResources,
     placement: AppPlacement,
+    replicas: i64,
 }
 
 /// Loads the fields of `app_id` a deployment needs.
 async fn load_app(conn: &mut SqliteConnection, app_id: &str) -> Result<AppSnapshot, ApiError> {
     let row = sqlx::query(
-        "SELECT project_id, name, status, restart_generation, resources, placement FROM apps \
-         WHERE id = ?",
+        "SELECT project_id, name, status, restart_generation, resources, placement, replicas \
+         FROM apps WHERE id = ?",
     )
     .bind(app_id)
     .fetch_optional(&mut *conn)
@@ -160,7 +164,134 @@ async fn load_app(conn: &mut SqliteConnection, app_id: &str) -> Result<AppSnapsh
         restart_generation: row.try_get("restart_generation")?,
         resources,
         placement,
+        replicas: row.try_get("replicas")?,
     })
+}
+
+/// The fields every VM row of an app instance carries.
+struct NewVm<'a> {
+    project_id: &'a str,
+    app_id: &'a str,
+    node_id: &'a str,
+    name: &'a str,
+    vcpus: i64,
+    memory_mb: i64,
+    disk_gb: i64,
+    image: &'a str,
+    restart_generation: i64,
+    /// `created_at` of the deployment the VM is linked to.
+    created_at: &'a str,
+}
+
+/// Inserts one app instance row and its change-log entry.
+async fn insert_app_vm(
+    conn: &mut SqliteConnection,
+    vm: &NewVm<'_>,
+    actor: &Actor,
+    now: &str,
+) -> Result<String, ApiError> {
+    let vm_id = new_id_with_prefix("vm");
+    sqlx::query(
+        "INSERT INTO vms (id, project_id, app_id, node_id, name, vcpus, memory_mb, disk_gb, image, \
+         desired_status, observed_status, ip, restart_generation, restart_count, last_exit_code, \
+         created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 0, NULL, ?, ?)",
+    )
+    .bind(&vm_id)
+    .bind(vm.project_id)
+    .bind(vm.app_id)
+    .bind(vm.node_id)
+    .bind(vm.name)
+    .bind(vm.vcpus)
+    .bind(vm.memory_mb)
+    .bind(vm.disk_gb)
+    .bind(vm.image)
+    .bind("running")
+    .bind("creating")
+    .bind(vm.restart_generation)
+    .bind(vm.created_at)
+    .bind(now)
+    .execute(&mut *conn)
+    .await?;
+    changelog::append(
+        conn,
+        actor,
+        "vm",
+        &vm_id,
+        Op::Create,
+        json!({
+            "id": vm_id,
+            "project_id": vm.project_id,
+            "app_id": vm.app_id,
+            "node_id": vm.node_id,
+            "name": vm.name,
+            "vcpus": vm.vcpus,
+            "memory_mb": vm.memory_mb,
+            "disk_gb": vm.disk_gb,
+            "image": vm.image,
+            "desired_status": "running",
+            "observed_status": "creating",
+            "restart_generation": vm.restart_generation,
+            "created_at": vm.created_at,
+            "updated_at": now,
+        }),
+    )
+    .await?;
+    Ok(vm_id)
+}
+
+/// One VM row linked to a deployment by the link rule in the module
+/// documentation.
+struct LinkedVm {
+    id: String,
+    node_id: String,
+    desired_status: String,
+    observed_status: String,
+}
+
+/// The VM rows of `app_id` linked to the deployment written at `created_at`.
+async fn linked_vms(
+    conn: &mut SqliteConnection,
+    app_id: &str,
+    created_at: &str,
+) -> Result<Vec<LinkedVm>, ApiError> {
+    let rows = sqlx::query(
+        "SELECT id, node_id, desired_status, observed_status FROM vms \
+         WHERE app_id = ? AND created_at = ? ORDER BY id",
+    )
+    .bind(app_id)
+    .bind(created_at)
+    .fetch_all(&mut *conn)
+    .await?;
+    rows.iter()
+        .map(|row| {
+            Ok(LinkedVm {
+                id: row.try_get("id")?,
+                node_id: row.try_get("node_id")?,
+                desired_status: row.try_get("desired_status")?,
+                observed_status: row.try_get("observed_status")?,
+            })
+        })
+        .collect()
+}
+
+/// Deletes every VM row linked to the deployment and change-logs each one,
+/// returning the deleted ids. The previous deployment's VMs are untouched.
+async fn delete_linked_vms(
+    conn: &mut SqliteConnection,
+    app_id: &str,
+    created_at: &str,
+) -> Result<Vec<String>, ApiError> {
+    let mut deleted = Vec::new();
+    for vm in linked_vms(conn, app_id, created_at).await? {
+        sqlx::query("DELETE FROM vms WHERE id = ?")
+            .bind(&vm.id)
+            .execute(&mut *conn)
+            .await?;
+        changelog::append(conn, &deploy_actor(), "vm", &vm.id, Op::Delete, json!({})).await?;
+        deleted.push(vm.id);
+    }
+    Ok(deleted)
 }
 
 /// The node a deployment is placed on: the first of `placement.node_ids` that
@@ -290,9 +421,22 @@ pub(crate) async fn create_deployment_with(
     emit_events: bool,
 ) -> Result<CreatedDeployment, ApiError> {
     let app = load_app(conn, app_id).await?;
-    let node_id = match target.node_id {
-        Some(node_id) => node_id.to_string(),
-        None => pick_node(conn, &app.placement).await?,
+    // An app with one instance keeps the historical placement. An app with
+    // more starts one instance on the first node of the scheduler's order and
+    // adds the rest of the nodes as each new instance passes its health check
+    // (ADR 0142).
+    let node_id = if app.replicas > 1 {
+        let nodes =
+            crate::scheduler::place_instances(conn, app_id, &app.placement, app.replicas).await?;
+        nodes
+            .first()
+            .cloned()
+            .ok_or_else(|| ApiError::validation("no node available"))?
+    } else {
+        match target.node_id {
+            Some(node_id) => node_id.to_string(),
+            None => pick_node(conn, &app.placement).await?,
+        }
     };
     let now = now_rfc3339();
 
@@ -380,51 +524,22 @@ pub(crate) async fn create_deployment_with(
     .await?;
     let change_seq = log_deployment(conn, &deployment, Op::Create).await?;
 
-    let vm_id = new_id_with_prefix("vm");
-    sqlx::query(
-        "INSERT INTO vms (id, project_id, app_id, node_id, name, vcpus, memory_mb, disk_gb, image, \
-         desired_status, observed_status, ip, restart_generation, restart_count, last_exit_code, \
-         created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 0, NULL, ?, ?)",
-    )
-    .bind(&vm_id)
-    .bind(&app.project_id)
-    .bind(app_id)
-    .bind(&node_id)
-    .bind(&app.name)
-    .bind(app.resources.vcpus)
-    .bind(app.resources.memory_mb)
-    .bind(app.resources.disk_gb)
-    .bind(image)
-    .bind("running")
-    .bind("creating")
-    .bind(app.restart_generation)
-    .bind(&created_at)
-    .bind(&now)
-    .execute(&mut *conn)
-    .await?;
-    changelog::append(
+    let vm_id = insert_app_vm(
         conn,
+        &NewVm {
+            project_id: &app.project_id,
+            app_id,
+            node_id: &node_id,
+            name: &app.name,
+            vcpus: app.resources.vcpus,
+            memory_mb: app.resources.memory_mb,
+            disk_gb: app.resources.disk_gb,
+            image,
+            restart_generation: app.restart_generation,
+            created_at: &created_at,
+        },
         actor,
-        "vm",
-        &vm_id,
-        Op::Create,
-        json!({
-            "id": vm_id,
-            "project_id": app.project_id,
-            "app_id": app_id,
-            "node_id": node_id,
-            "name": app.name,
-            "vcpus": app.resources.vcpus,
-            "memory_mb": app.resources.memory_mb,
-            "disk_gb": app.resources.disk_gb,
-            "image": image,
-            "desired_status": "running",
-            "observed_status": "creating",
-            "restart_generation": app.restart_generation,
-            "created_at": created_at,
-            "updated_at": now,
-        }),
+        &now,
     )
     .await?;
     let created = CreatedDeployment {
@@ -560,24 +675,17 @@ async fn recompute_app_status(
                 .fetch_optional(&mut *conn)
                 .await?;
         if let Some((created_at,)) = created {
-            let vm = sqlx::query(
-                "SELECT id, desired_status, observed_status FROM vms WHERE app_id = ? AND created_at = ?",
-            )
-            .bind(app_id)
-            .bind(&created_at)
-            .fetch_optional(&mut *conn)
-            .await?;
-            if let Some(vm) = vm {
-                let vm_id: String = vm.try_get("id")?;
-                let desired: String = vm.try_get("desired_status")?;
-                let observed: String = vm.try_get("observed_status")?;
+            let vms = linked_vms(conn, app_id, &created_at).await?;
+            if vms.len() == 1 {
+                // One instance keeps the historical rules exactly.
+                let vm = &vms[0];
                 let (observed, health) = match observation {
-                    Some((seen_id, observed, health)) if seen_id == vm_id => {
+                    Some((seen_id, observed, health)) if seen_id == vm.id => {
                         (format!("{observed:?}").to_lowercase(), Some(health))
                     }
-                    _ => (observed, None),
+                    _ => (vm.observed_status.clone(), None),
                 };
-                if desired == "stopped" {
+                if vm.desired_status == "stopped" {
                     target = AppStatus::Stopped;
                 } else if observed == "running" && health == Some(wire::Health::Passing) {
                     target = AppStatus::Running;
@@ -586,6 +694,42 @@ async fn recompute_app_status(
                     || observed == "deleted"
                 {
                     target = AppStatus::Down;
+                }
+            } else if !vms.is_empty() {
+                // Several instances: stopped only when every one is desired
+                // stopped, running only when every one runs (the observed one
+                // also with health passing), down when none runs, degraded in
+                // between (ADR 0142).
+                if vms.iter().all(|vm| vm.desired_status == "stopped") {
+                    target = AppStatus::Stopped;
+                } else {
+                    let mut running = 0;
+                    let mut all_running = true;
+                    for vm in &vms {
+                        let (observed, health) = match observation {
+                            Some((seen_id, observed, health)) if seen_id == vm.id => {
+                                (format!("{observed:?}").to_lowercase(), Some(health))
+                            }
+                            _ => (vm.observed_status.clone(), None),
+                        };
+                        if observed == "running" {
+                            running += 1;
+                            // Only the observed instance carries health in
+                            // this pass; as with one instance it has to pass.
+                            if health.is_some_and(|health| health != wire::Health::Passing) {
+                                all_running = false;
+                            }
+                        } else {
+                            all_running = false;
+                        }
+                    }
+                    target = if all_running {
+                        AppStatus::Running
+                    } else if running == 0 {
+                        AppStatus::Down
+                    } else {
+                        AppStatus::Degraded
+                    };
                 }
             }
         }
@@ -703,8 +847,9 @@ pub async fn on_spec_sent(
 /// `vms` places on that node. Moves the VM's deployment through `preparing`
 /// (`creating`), `starting` (`starting`) and `succeeded` (`running` with
 /// health `passing`), or `failed` (`crashed` while still in progress), and
-/// keeps `apps.status` in step. Returns the VMs whose desired state changed
-/// (the older VMs a success retires).
+/// keeps `apps.status` in step. Returns the VMs whose desired state changed:
+/// the instances a success retires, the next instance a passing rollout
+/// creates, and the instances a failure deletes.
 ///
 /// # Errors
 ///
@@ -733,11 +878,12 @@ pub async fn on_vm_observed(
         return Ok(Vec::new());
     };
 
-    let mut retired = Vec::new();
+    let mut changed = Vec::new();
     let mut after = before.clone();
     let now = now_rfc3339();
-    let mut emit: Option<(&'static str, Value)> = None;
-    if before.status.in_progress() {
+    let mut emit: Option<(&'static str, Value, Source)> = None;
+    let in_progress = before.status.in_progress();
+    if in_progress {
         match vm.observed_status {
             wire::ObservedStatus::Creating => {
                 if before.status == DeploymentStatus::Pending {
@@ -750,17 +896,80 @@ pub async fn on_vm_observed(
                 after.phase = Some(DeploymentPhase::Boot);
             }
             wire::ObservedStatus::Running if vm.health == wire::Health::Passing => {
-                after.status = DeploymentStatus::Succeeded;
-                after.phase = None;
-                after.finished_at = Some(now.clone());
-                let mut data = json!({
-                    "deployment_id": after.id,
-                    "app_id": after.app_id,
-                });
-                if let Some(digest) = &after.image_digest {
-                    data["image_digest"] = json!(digest);
+                // The new instance of this node passed. With more replicas
+                // wanted than this deployment has instances, the next node
+                // starts now, next to the old instances; otherwise every
+                // instance has to be running before the deployment succeeds
+                // (ADR 0142).
+                let replicas = app_replicas(&mut w.tx, &app_vm.app_id).await?;
+                let linked = linked_vms(&mut w.tx, &app_vm.app_id, &before.created_at).await?;
+                if (linked.len() as i64) < replicas {
+                    match next_instance_node(&mut w.tx, &app_vm.app_id, &linked).await? {
+                        Some(next) => {
+                            let seed =
+                                first_instance(&mut w.tx, &app_vm.app_id, &before.created_at)
+                                    .await?;
+                            let new_id = insert_app_vm(
+                                &mut w.tx,
+                                &NewVm {
+                                    project_id: &seed.project_id,
+                                    app_id: &app_vm.app_id,
+                                    node_id: &next,
+                                    name: &seed.name,
+                                    vcpus: seed.vcpus,
+                                    memory_mb: seed.memory_mb,
+                                    disk_gb: seed.disk_gb,
+                                    image: &seed.image,
+                                    restart_generation: seed.restart_generation,
+                                    created_at: &before.created_at,
+                                },
+                                &deploy_actor(),
+                                &now,
+                            )
+                            .await?;
+                            changed.push(new_id);
+                            after.status = DeploymentStatus::Starting;
+                            after.phase = Some(DeploymentPhase::Boot);
+                        }
+                        None => {
+                            let error = "no eligible node for the next instance".to_string();
+                            after.status = DeploymentStatus::Failed;
+                            after.phase = Some(DeploymentPhase::Boot);
+                            after.error = Some(error.clone());
+                            after.finished_at = Some(now.clone());
+                            emit = Some((
+                                "deployment.failed",
+                                json!({
+                                    "deployment_id": after.id,
+                                    "app_id": after.app_id,
+                                    "phase": "boot",
+                                    "error": error,
+                                }),
+                                Source::ControlPlane,
+                            ));
+                        }
+                    }
+                } else if all_linked_running(&linked, &vm.vm_id) {
+                    after.status = DeploymentStatus::Succeeded;
+                    after.phase = None;
+                    after.finished_at = Some(now.clone());
+                    let mut data = json!({
+                        "deployment_id": after.id,
+                        "app_id": after.app_id,
+                    });
+                    if let Some(digest) = &after.image_digest {
+                        data["image_digest"] = json!(digest);
+                    }
+                    emit = Some((
+                        "deployment.succeeded",
+                        data,
+                        Source::Node(node_id.to_string()),
+                    ));
+                } else {
+                    // Another instance is not running yet: stay in progress.
+                    after.status = DeploymentStatus::Starting;
+                    after.phase = Some(DeploymentPhase::Boot);
                 }
-                emit = Some(("deployment.succeeded", data));
             }
             wire::ObservedStatus::Crashed => {
                 after.status = DeploymentStatus::Failed;
@@ -778,19 +987,21 @@ pub async fn on_vm_observed(
                         "phase": "boot",
                         "error": after.error,
                     }),
+                    Source::Node(node_id.to_string()),
                 ));
             }
             _ => {}
         }
     }
-    let succeeded = after.status == DeploymentStatus::Succeeded && before.status.in_progress();
+    let succeeded = after.status == DeploymentStatus::Succeeded && in_progress;
+    let failed = after.status == DeploymentStatus::Failed && in_progress;
     save_deployment(&mut w.tx, &before, &after).await?;
-    if let Some((kind, data)) = emit {
+    if let Some((kind, data, source)) = emit {
         events::emit(
             &mut w.tx,
             NewEvent {
                 kind,
-                source: Source::Node(node_id.to_string()),
+                source,
                 subject_type: "deployment",
                 subject_id: &after.id,
                 project_id: None,
@@ -802,9 +1013,16 @@ pub async fn on_vm_observed(
         .await?;
     }
 
+    if failed {
+        // Every instance this deployment started goes away; the previous
+        // deployment's instances keep running (ADR 0142).
+        changed.extend(delete_linked_vms(&mut w.tx, &app_vm.app_id, &before.created_at).await?);
+    }
+
     if succeeded {
-        // The new VM is the app's current instance; its image wins and every
-        // other VM of the app is retired in the same transaction.
+        // The new instances are the app's current ones; their image wins and
+        // every VM not linked to this deployment is retired in the same
+        // transaction.
         let row = sqlx::query("SELECT current_deployment_id, image FROM apps WHERE id = ?")
             .bind(&app_vm.app_id)
             .fetch_one(&mut *w.tx)
@@ -838,9 +1056,9 @@ pub async fn on_vm_observed(
         }
 
         let others: Vec<(String,)> =
-            sqlx::query_as("SELECT id FROM vms WHERE app_id = ? AND id != ?")
+            sqlx::query_as("SELECT id FROM vms WHERE app_id = ? AND created_at != ?")
                 .bind(&app_vm.app_id)
-                .bind(&vm.vm_id)
+                .bind(&before.created_at)
                 .fetch_all(&mut *w.tx)
                 .await?;
         for (other_id,) in others {
@@ -857,10 +1075,38 @@ pub async fn on_vm_observed(
                 json!({}),
             )
             .await?;
-            retired.push(other_id);
+            changed.push(other_id);
+        }
+
+        // A scale-down during the rollout leaves more instances than wanted;
+        // the extras on the highest node ids go.
+        let replicas = app_replicas(&mut w.tx, &app_vm.app_id).await?;
+        let mut linked = linked_vms(&mut w.tx, &app_vm.app_id, &before.created_at).await?;
+        if linked.len() as i64 > replicas {
+            linked.sort_by(|a, b| b.node_id.cmp(&a.node_id));
+            let extras = usize::try_from((linked.len() as i64 - replicas).max(0)).unwrap_or(0);
+            for extra in linked.into_iter().take(extras) {
+                sqlx::query("DELETE FROM vms WHERE id = ?")
+                    .bind(&extra.id)
+                    .execute(&mut *w.tx)
+                    .await?;
+                changelog::append(
+                    &mut w.tx,
+                    &deploy_actor(),
+                    "vm",
+                    &extra.id,
+                    Op::Delete,
+                    json!({}),
+                )
+                .await?;
+                changed.push(extra.id);
+            }
         }
     }
 
+    if failed {
+        app_status_after_failure(&mut w.tx, &app_vm.app_id).await?;
+    }
     recompute_app_status(
         &mut w.tx,
         &app_vm.app_id,
@@ -868,7 +1114,93 @@ pub async fn on_vm_observed(
     )
     .await?;
     w.commit().await?;
-    Ok(retired)
+    Ok(changed)
+}
+
+/// The replica count stored for `app_id`.
+async fn app_replicas(conn: &mut SqliteConnection, app_id: &str) -> Result<i64, ApiError> {
+    let row: Option<(i64,)> = sqlx::query_as("SELECT replicas FROM apps WHERE id = ?")
+        .bind(app_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    Ok(row.map(|(replicas,)| replicas).unwrap_or(1))
+}
+
+/// The placement stored for `app_id`.
+async fn app_placement(
+    conn: &mut SqliteConnection,
+    app_id: &str,
+) -> Result<AppPlacement, ApiError> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT placement FROM apps WHERE id = ?")
+        .bind(app_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    let Some((placement,)) = row else {
+        return Ok(AppPlacement::default());
+    };
+    serde_json::from_str(&placement)
+        .map_err(|error| ApiError::internal(&format!("stored placement: {error}")))
+}
+
+/// A template for the next instance of a rollout, copied from the first VM
+/// this deployment created.
+struct InstanceSeed {
+    project_id: String,
+    name: String,
+    vcpus: i64,
+    memory_mb: i64,
+    disk_gb: i64,
+    image: String,
+    restart_generation: i64,
+}
+
+/// Reads the fields the next instance of a deployment copies from its first
+/// instance.
+async fn first_instance(
+    conn: &mut SqliteConnection,
+    app_id: &str,
+    created_at: &str,
+) -> Result<InstanceSeed, ApiError> {
+    let row = sqlx::query(
+        "SELECT project_id, name, vcpus, memory_mb, disk_gb, image, restart_generation FROM vms \
+         WHERE app_id = ? AND created_at = ? ORDER BY id LIMIT 1",
+    )
+    .bind(app_id)
+    .bind(created_at)
+    .fetch_optional(&mut *conn)
+    .await?
+    .ok_or_else(|| ApiError::internal(&"the deployment has no instance"))?;
+    Ok(InstanceSeed {
+        project_id: row.try_get("project_id")?,
+        name: row.try_get("name")?,
+        vcpus: row.try_get("vcpus")?,
+        memory_mb: row.try_get("memory_mb")?,
+        disk_gb: row.try_get("disk_gb")?,
+        image: row.try_get("image")?,
+        restart_generation: row.try_get("restart_generation")?,
+    })
+}
+
+/// The next node of the scheduler's order that has no VM of the deployment,
+/// or `None` when every candidate already has one.
+async fn next_instance_node(
+    conn: &mut SqliteConnection,
+    app_id: &str,
+    linked: &[LinkedVm],
+) -> Result<Option<String>, ApiError> {
+    let placement = app_placement(conn, app_id).await?;
+    let used: HashSet<String> = linked.iter().map(|vm| vm.node_id.clone()).collect();
+    let candidates = crate::scheduler::candidate_nodes(conn, app_id, &placement).await?;
+    Ok(candidates.into_iter().find(|node| !used.contains(node)))
+}
+
+/// Whether every VM of the deployment is `running`, counting the VM being
+/// observed as running.
+fn all_linked_running(linked: &[LinkedVm], observed_id: &str) -> bool {
+    !linked.is_empty()
+        && linked
+            .iter()
+            .all(|vm| vm.id == observed_id || vm.observed_status == "running")
 }
 
 /// Truncates a node-supplied failure message to the stored bound.
@@ -881,7 +1213,7 @@ fn failure_error(value: Option<&Value>) -> String {
         .collect()
 }
 
-/// App status after a failed deployment deleted its only VM.
+/// App status after a failed deployment deleted every VM linked to it.
 async fn app_status_after_failure(
     conn: &mut SqliteConnection,
     app_id: &str,
@@ -918,9 +1250,9 @@ async fn app_status_after_failure(
 
 /// A node-originated `deployment.failed` event from `node_id` (its `data`
 /// object: `deployment_id`, `app_id`, `phase`, `error`). Accepted only when
-/// the deployment's VM is placed on `node_id` and the deployment is still in
-/// progress; anything else is ignored. Returns the VMs whose desired state
-/// changed.
+/// one of the deployment's instances is placed on `node_id` and the
+/// deployment is still in progress; anything else is ignored. Returns the VMs
+/// whose desired state changed.
 ///
 /// # Errors
 ///
@@ -952,17 +1284,10 @@ pub async fn on_node_deployment_failed(
         w.commit().await?;
         return Ok(Vec::new());
     }
-    let vm: Option<(String, String)> =
-        sqlx::query_as("SELECT id, node_id FROM vms WHERE app_id = ? AND created_at = ?")
-            .bind(&before.app_id)
-            .bind(&before.created_at)
-            .fetch_optional(&mut *w.tx)
-            .await?;
-    let Some((vm_id, placed_on)) = vm else {
-        w.commit().await?;
-        return Ok(Vec::new());
-    };
-    if placed_on != node_id {
+    // The event is accepted when any instance of the deployment runs on the
+    // reporting node.
+    let linked = linked_vms(&mut w.tx, &before.app_id, &before.created_at).await?;
+    if !linked.iter().any(|vm| vm.node_id == node_id) {
         w.commit().await?;
         return Ok(Vec::new());
     }
@@ -984,27 +1309,16 @@ pub async fn on_node_deployment_failed(
     // The node's event is already stored by the session; emitting another
     // `deployment.failed` here would duplicate it.
 
-    sqlx::query("DELETE FROM vms WHERE id = ?")
-        .bind(&vm_id)
-        .execute(&mut *w.tx)
-        .await?;
-    changelog::append(
-        &mut w.tx,
-        &deploy_actor(),
-        "vm",
-        &vm_id,
-        Op::Delete,
-        json!({}),
-    )
-    .await?;
+    let deleted = delete_linked_vms(&mut w.tx, &before.app_id, &before.created_at).await?;
     app_status_after_failure(&mut w.tx, &before.app_id).await?;
     w.commit().await?;
-    Ok(vec![vm_id])
+    Ok(deleted)
 }
 
 /// The primary could not resolve the image of app VM `vm_id` within its retry
 /// budget: its in-progress deployment fails in phase `pull` with `error`, and
-/// the VM row is deleted. Returns the VMs whose desired state changed.
+/// every VM row linked to that deployment is deleted. Returns the VMs whose
+/// desired state changed.
 ///
 /// # Errors
 ///
@@ -1066,22 +1380,125 @@ pub async fn on_image_unresolvable(
     )
     .await?;
 
-    sqlx::query("DELETE FROM vms WHERE id = ?")
-        .bind(vm_id)
-        .execute(&mut *w.tx)
-        .await?;
-    changelog::append(
-        &mut w.tx,
-        &deploy_actor(),
-        "vm",
-        vm_id,
-        Op::Delete,
-        json!({}),
-    )
-    .await?;
+    let deleted = delete_linked_vms(&mut w.tx, &app_id, &created_at).await?;
     app_status_after_failure(&mut w.tx, &app_id).await?;
     w.commit().await?;
-    Ok(vec![vm_id.to_string()])
+    Ok(deleted)
+}
+
+/// Applies a new replica count without a deployment (ADR 0142).
+///
+/// With no rollout in progress and a current deployment, more replicas add
+/// VM rows linked to it on scheduler nodes that have none, and fewer delete
+/// the instances on the highest node ids. When the eligible nodes cannot hold
+/// the new count the function writes nothing and returns `validation_failed`,
+/// so the caller's whole transaction fails. A rollout in progress, or an app
+/// without a current deployment, is left alone: the rollout and the next
+/// deploy read `apps.replicas` themselves. Returns the changed VM ids.
+///
+/// # Errors
+///
+/// `validation_failed` when the scheduler is short of nodes, or a database
+/// error.
+pub(crate) async fn scale(
+    conn: &mut SqliteConnection,
+    app_id: &str,
+    replicas: i64,
+) -> Result<Vec<String>, ApiError> {
+    let row = sqlx::query("SELECT current_deployment_id, placement FROM apps WHERE id = ?")
+        .bind(app_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    let Some(row) = row else {
+        return Ok(Vec::new());
+    };
+    let current_deployment_id: Option<String> = row.try_get("current_deployment_id")?;
+    let Some(current_deployment_id) = current_deployment_id else {
+        return Ok(Vec::new());
+    };
+    let in_progress: Option<(String,)> = sqlx::query_as(
+        "SELECT id FROM deployments WHERE app_id = ? AND status IN ('pending', 'preparing', 'starting') LIMIT 1",
+    )
+    .bind(app_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if in_progress.is_some() {
+        return Ok(Vec::new());
+    }
+    let created: Option<(String,)> =
+        sqlx::query_as("SELECT created_at FROM deployments WHERE id = ? AND app_id = ?")
+            .bind(&current_deployment_id)
+            .bind(app_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let Some((created_at,)) = created else {
+        return Ok(Vec::new());
+    };
+
+    let linked = linked_vms(conn, app_id, &created_at).await?;
+    let count = linked.len() as i64;
+    if replicas == count {
+        return Ok(Vec::new());
+    }
+
+    if replicas > count {
+        let placement: String = row.try_get("placement")?;
+        let placement: AppPlacement = serde_json::from_str(&placement)
+            .map_err(|error| ApiError::internal(&format!("stored placement: {error}")))?;
+        let used: HashSet<String> = linked.iter().map(|vm| vm.node_id.clone()).collect();
+        let available: Vec<String> = crate::scheduler::candidate_nodes(conn, app_id, &placement)
+            .await?
+            .into_iter()
+            .filter(|node| !used.contains(node))
+            .collect();
+        let needed = usize::try_from(replicas - count).unwrap_or(usize::MAX);
+        if available.len() < needed {
+            return Err(ApiError::validation(format!(
+                "replicas {replicas} is above the {} eligible nodes",
+                count as usize + available.len()
+            )));
+        }
+        let seed = first_instance(conn, app_id, &created_at).await?;
+        let now = now_rfc3339();
+        let mut added = Vec::new();
+        for node_id in available.into_iter().take(needed) {
+            let vm_id = insert_app_vm(
+                conn,
+                &NewVm {
+                    project_id: &seed.project_id,
+                    app_id,
+                    node_id: &node_id,
+                    name: &seed.name,
+                    vcpus: seed.vcpus,
+                    memory_mb: seed.memory_mb,
+                    disk_gb: seed.disk_gb,
+                    image: &seed.image,
+                    restart_generation: seed.restart_generation,
+                    created_at: &created_at,
+                },
+                &deploy_actor(),
+                &now,
+            )
+            .await?;
+            added.push(vm_id);
+        }
+        return Ok(added);
+    }
+
+    // Fewer replicas: the instances on the highest node ids go.
+    let mut linked = linked;
+    linked.sort_by(|a, b| b.node_id.cmp(&a.node_id));
+    let extras = usize::try_from(count - replicas).unwrap_or(usize::MAX);
+    let mut removed = Vec::new();
+    for vm in linked.into_iter().take(extras) {
+        sqlx::query("DELETE FROM vms WHERE id = ?")
+            .bind(&vm.id)
+            .execute(&mut *conn)
+            .await?;
+        changelog::append(conn, &deploy_actor(), "vm", &vm.id, Op::Delete, json!({})).await?;
+        removed.push(vm.id);
+    }
+    Ok(removed)
 }
 
 #[cfg(test)]

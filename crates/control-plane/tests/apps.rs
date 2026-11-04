@@ -670,7 +670,8 @@ async fn app_validation_and_authorization() {
             json!({ "backup_schedule": { "interval_h": 24, "keep": 101 } }),
             (422, "validation_failed"),
         ),
-        // Replicas above 1 need an enrolled edge (ADR 0142, ADR 0143).
+        // Replicas above 1 need an enrolled edge, and this cluster has none
+        // (ADR 0142, ADR 0143); the whole rules live in `replicas.rs`.
         (json!({ "replicas": 2 }), (409, "conflict")),
         (json!({ "replicas": 0 }), (422, "validation_failed")),
         (json!({ "replicas": 65 }), (422, "validation_failed")),

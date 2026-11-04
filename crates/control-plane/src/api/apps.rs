@@ -861,18 +861,51 @@ fn default_replicas() -> i64 {
     1
 }
 
-/// Checks of a requested replica count (ADR 0142). More than one instance
-/// needs a machine with the `edge` role that serves the app's domains
-/// (ADR 0143). Until the edge epic ships no edge serves anything, so above 1
-/// is always a conflict.
-fn validate_replicas(replicas: i64) -> Result<(), ApiError> {
+/// Checks of a requested replica count (ADR 0142).
+///
+/// The checks run in contract order: a count outside 1-64 is
+/// `validation_failed`; more than one instance is a `conflict` for an app
+/// with a Git source (a built image exists only on the node that built it),
+/// for a stateful app, and while no machine with the `edge` role is enrolled
+/// (ADR 0143); finally a count above the eligible nodes is
+/// `validation_failed`, because the scheduler never under-places.
+async fn validate_replicas(
+    conn: &mut sqlx::SqliteConnection,
+    replicas: i64,
+    has_source: bool,
+    stateful: bool,
+    placement: &AppPlacement,
+) -> Result<(), ApiError> {
     if !(1..=64).contains(&replicas) {
         return Err(ApiError::validation("replicas is outside 1-64"));
     }
     if replicas > 1 {
-        return Err(ApiError::conflict(
-            "replicas above 1 need an enrolled machine with the edge role",
-        ));
+        if has_source {
+            return Err(ApiError::conflict(
+                "replicas above 1 need an image built for every node; this app builds from a Git source",
+            ));
+        }
+        if stateful {
+            return Err(ApiError::conflict("replicas above 1 need a stateless app"));
+        }
+        let edge: Option<(String,)> = sqlx::query_as(
+            "SELECT nodes.id FROM nodes, json_each(nodes.roles) \
+             WHERE nodes.status != 'removed' AND json_each.value = 'edge' LIMIT 1",
+        )
+        .fetch_optional(&mut *conn)
+        .await?;
+        if edge.is_none() {
+            return Err(ApiError::conflict(
+                "replicas above 1 need an enrolled machine with the edge role",
+            ));
+        }
+        let eligible = crate::scheduler::eligible_node_ids(conn, placement).await?;
+        if replicas > eligible.len() as i64 {
+            return Err(ApiError::validation(format!(
+                "replicas {replicas} is above the {} eligible nodes",
+                eligible.len()
+            )));
+        }
     }
     Ok(())
 }
@@ -985,7 +1018,6 @@ fn validate_create(body: &CreateAppRequest) -> Result<(), ApiError> {
     if let Some(schedule) = &body.backup_schedule {
         validate_backup_schedule(schedule)?;
     }
-    validate_replicas(body.replicas)?;
     if let Some(health) = &body.health_check {
         validate_health(health)?;
     }
@@ -1028,9 +1060,8 @@ fn validate_update(body: &UpdateAppRequest) -> Result<(), ApiError> {
     if let Some(schedule) = &body.backup_schedule {
         validate_backup_schedule(schedule)?;
     }
-    if let Some(replicas) = body.replicas {
-        validate_replicas(replicas)?;
-    }
+    // `replicas` needs the app's source, statefulness and the eligible nodes,
+    // so it is checked in the write transaction by `validate_replicas`.
     if let Some(health) = &body.health_check {
         validate_health(health)?;
     }
@@ -1298,6 +1329,14 @@ async fn insert_app(
         )));
     }
     check_placement_nodes(&mut w.tx, &app.placement).await?;
+    validate_replicas(
+        &mut w.tx,
+        app.replicas,
+        app.source.is_some(),
+        app.stateful,
+        &app.placement,
+    )
+    .await?;
 
     let health_check = serde_json::to_string(&app.health_check)
         .map_err(|error| ApiError::internal(&format!("health_check: {error}")))?;
@@ -1517,6 +1556,20 @@ async fn update_app_tx(
     let mut app = app_from_row(&row)?;
     let mut changed = Vec::new();
 
+    // A new replica count is checked against the app as it is now, and against
+    // the placement this request sets when it sets one (ADR 0142).
+    if let Some(replicas) = body.replicas {
+        let placement = body.placement.as_ref().unwrap_or(&app.placement);
+        validate_replicas(
+            &mut w.tx,
+            replicas,
+            app.source.is_some(),
+            app.stateful,
+            placement,
+        )
+        .await?;
+    }
+
     // A Git source replaces the whole source of an app that has one; it can
     // neither be added to an image app nor removed in M4 (openapi.yaml
     // `UpdateAppRequest`).
@@ -1595,7 +1648,7 @@ async fn update_app_tx(
         changed.push("placement");
     }
 
-    let vm_ids = app_vm_ids(&mut w.tx, app_id).await?;
+    let mut vm_ids = app_vm_ids(&mut w.tx, app_id).await?;
     let target = app_target(app_id);
     if !changed.is_empty() {
         app.updated_at = now_rfc3339();
@@ -1629,6 +1682,13 @@ async fn update_app_tx(
         .bind(app_id)
         .execute(&mut *w.tx)
         .await?;
+        // A new replica count is a state change, not a deployment: the
+        // scheduler adds or removes instances of the current deployment
+        // (ADR 0142). A shortfall fails the whole PATCH, because
+        // `scale` writes nothing before it checks.
+        if changed.contains(&"replicas") {
+            vm_ids.extend(deploy::scale(&mut w.tx, app_id, app.replicas).await?);
+        }
         let actor = ctx.identity.actor();
         let payload = serde_json::to_value(&app)
             .map_err(|error| ApiError::internal(&format!("app payload: {error}")))?;

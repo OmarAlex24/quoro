@@ -28,6 +28,7 @@ pub mod keys;
 pub use quoro_proto::jcs;
 pub mod openapi;
 pub mod request;
+pub(crate) mod scheduler;
 pub mod service;
 pub mod session;
 pub mod store;
