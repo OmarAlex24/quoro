@@ -94,6 +94,7 @@ const appDetail = (app: App): AppDetail => ({
   ...app,
   instances: db.vms.filter((vm) => vm.app_id === app.id),
   domains: db.domains.filter((domain) => domain.app_id === app.id),
+  edge_backends: [],
 });
 
 /**
