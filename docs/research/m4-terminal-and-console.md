@@ -178,6 +178,7 @@ Session ids need a new prefix in the identifier table (proposal: `trm_` for both
 - ADR 0057 (WebSockets for interactive sessions) holds; the node session needs `stream_input` and `stream_ack` because today it only carries data from node to primary.
 - ADR 0089 and ADR 0096 hold: no new privilege in the control plane.
 - ADR 0014 holds: console bytes and transcripts stay on the node; only the audit records travel.
+- ADR 0112 plans the interactive epic with the terminal and the console "both through grants". This note keeps the console grantable but recommends a human-only `app:terminal` in M4 (section 1.5), which narrows that plan for the terminal; the maintainer decides it with the contract pull request.
 - The engine-trait statement that `console` uses `--serial socket=` and answers `Conflict` on a second reader is accurate for the socket, but the socket's takeover behaviour (a second connection displaces the first) makes a direct per-viewer connection unsafe; the node must own the socket.
 
 ## Open risks
