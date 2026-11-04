@@ -15,13 +15,24 @@ use agent_common::{
     BRIDGE, GATEWAY, RecordingEngine, SUBNET, TempDir, dns, reconciler, snapshot, spec_vm,
 };
 use quoro_engine::{Engine, StopMode, VmId, VmState};
+use quoro_node_agent::reconcile::Snapshot;
 use quoro_node_agent::store::NodeStore;
-use quoro_proto::wire::{DesiredStatus, ObservedStatus};
+use quoro_proto::wire::{DesiredStatus, ObservedStatus, SpecNetwork, SpecVm};
 
 fn ip_of(text: Option<&String>) -> Ipv4Addr {
     text.expect("the status report carries an IP")
         .parse()
         .expect("a valid IP")
+}
+
+/// A snapshot whose node network is `subnet` with `gateway`.
+fn snapshot_on(rev: u64, subnet: &str, gateway: &str, vms: Vec<SpecVm>) -> Snapshot {
+    let mut snap = snapshot(rev, vms);
+    snap.state.spec.network = Some(SpecNetwork {
+        subnet: subnet.to_owned(),
+        gateway: gateway.to_owned(),
+    });
+    snap
 }
 
 #[tokio::test]
@@ -227,4 +238,124 @@ async fn a_new_reconciler_reuses_the_persisted_vm_and_its_address() {
     assert_eq!(statuses[0].observed_status, ObservedStatus::Running);
     assert_eq!(statuses[0].ip, first_ip, "the address survives a restart");
     assert_eq!(statuses[0].restart_count, 0, "a restart is not a crash");
+}
+
+#[tokio::test]
+async fn a_changed_subnet_lands_on_a_second_bridge_and_keeps_running_vms() {
+    let dir = TempDir::new();
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let engine = Arc::new(RecordingEngine::new());
+    let (mut reconciler, _observed) = reconciler(engine.clone(), store.clone());
+
+    let old = snapshot_on(
+        1,
+        "10.42.0.0/24",
+        "10.42.0.1",
+        vec![spec_vm("vm_a", "prj_1", DesiredStatus::Running)],
+    );
+    let first = reconciler.reconcile_once(Some(&old)).await;
+    assert_eq!(first[0].observed_status, ObservedStatus::Running);
+    let old_ip = ip_of(first[0].ip.as_ref());
+    assert_eq!(old_ip.octets()[..3], [10, 42, 0]);
+    assert_eq!(engine.create_count(), 1);
+
+    // The node's subnet changed: the configured bridge is recorded with the old
+    // network, so the engine refuses it and the agent takes the next name.
+    let new = snapshot_on(
+        2,
+        "10.42.1.0/24",
+        "10.42.1.1",
+        vec![
+            spec_vm("vm_a", "prj_1", DesiredStatus::Running),
+            spec_vm("vm_b", "prj_1", DesiredStatus::Running),
+        ],
+    );
+    let second = reconciler.reconcile_once(Some(&new)).await;
+
+    let status_a = second
+        .iter()
+        .find(|status| status.vm_id == "vm_a")
+        .expect("vm_a is reported");
+    assert_eq!(
+        ip_of(status_a.ip.as_ref()),
+        old_ip,
+        "an existing VM keeps its old address and is not recreated"
+    );
+    assert_eq!(
+        store.vm_record("vm_a").await.unwrap().unwrap().ip,
+        Some(old_ip)
+    );
+    assert_eq!(
+        engine
+            .inspect(&VmId("vm_a".to_owned()))
+            .await
+            .unwrap()
+            .state,
+        VmState::Running
+    );
+
+    let status_b = second
+        .iter()
+        .find(|status| status.vm_id == "vm_b")
+        .expect("vm_b is reported");
+    let new_ip = ip_of(status_b.ip.as_ref());
+    assert_eq!(
+        new_ip.octets()[..3],
+        [10, 42, 1],
+        "a new VM takes an address in the new subnet"
+    );
+
+    assert_eq!(
+        engine.create_count(),
+        2,
+        "only the new VM is created; vm_a keeps its engine-side spec"
+    );
+    let created = engine.created();
+    assert_eq!(created[0].id.0, "vm_a");
+    assert_eq!(created[0].net.ip, old_ip);
+    assert_eq!(created[1].id.0, "vm_b");
+    assert_eq!(created[1].net.ip, new_ip);
+
+    let networks = engine.networks();
+    assert!(
+        networks
+            .iter()
+            .any(|net| net.bridge == BRIDGE && net.subnet == "10.42.1.0/24"),
+        "the configured bridge is tried first: {networks:?}"
+    );
+    let taken = networks
+        .iter()
+        .find(|net| net.subnet == "10.42.1.0/24" && net.bridge != BRIDGE)
+        .expect("a second bridge carries the new subnet");
+    assert_eq!(taken.bridge, "quoro0s1");
+    assert_eq!(taken.gateway, Ipv4Addr::new(10, 42, 1, 1));
+    assert_eq!(taken.dns, dns());
+
+    assert_eq!(store.applied_rev().await.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn a_snapshot_without_a_network_creates_nothing_and_does_not_fail() {
+    let dir = TempDir::new();
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let engine = Arc::new(RecordingEngine::new());
+    let (mut reconciler, _observed) = reconciler(engine.clone(), store.clone());
+
+    // An edge-only machine has no `spec.network` (section 5.11).
+    let mut edge_only = snapshot(1, vec![spec_vm("vm_edge", "prj_1", DesiredStatus::Running)]);
+    edge_only.state.spec.network = None;
+
+    let statuses = reconciler.reconcile_once(Some(&edge_only)).await;
+    assert!(statuses.is_empty(), "{statuses:?}");
+    assert_eq!(engine.create_count(), 0, "no VM is created");
+    assert!(engine.networks().is_empty(), "no bridge is ensured");
+
+    // The same reconciler still applies a node snapshot: the pass did not
+    // leave it in a failed state.
+    let node = snapshot(2, vec![spec_vm("vm_edge", "prj_1", DesiredStatus::Running)]);
+    let statuses = reconciler.reconcile_once(Some(&node)).await;
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].observed_status, ObservedStatus::Running);
+    assert_eq!(engine.create_count(), 1);
+    assert_eq!(engine.networks().last().unwrap().subnet, SUBNET);
 }

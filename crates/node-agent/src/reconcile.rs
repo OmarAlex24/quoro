@@ -90,11 +90,45 @@ impl Default for ReconcileOptions {
 /// The parts of a network's identity, used to decide whether to call
 /// `ensure_network` again. `dns` is not identity for the engine, but a change
 /// must reach the guests created afterwards, so it is compared here too.
+///
+/// `bridge` is the candidate the engine accepted, not part of the desired
+/// network: a changed subnet moves new VMs to a second bridge held here
+/// (`node-agent-protocol.md` section 6.9).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct NetworkState {
+    bridge: String,
     subnet: String,
     gateway: Ipv4Addr,
     dns: Vec<Ipv4Addr>,
+}
+
+impl NetworkState {
+    /// Whether `other` asks for the same network. The bridge is left out: it is
+    /// whatever candidate the engine accepted for this subnet.
+    fn same_network(&self, other: &Self) -> bool {
+        self.subnet == other.subnet && self.gateway == other.gateway && self.dns == other.dns
+    }
+}
+
+/// The longest Linux interface name, in bytes.
+const MAX_BRIDGE_NAME: usize = 15;
+
+/// The bridges to try, in order: the configured one and its numbered
+/// successors (`quoro0`, `quoro0s1`, `quoro0s2`, `quoro0s3`).
+///
+/// A name Linux cannot take is skipped. On an upgraded node the configured
+/// bridge is already recorded with the old subnet, so the first candidate that
+/// the engine accepts is a second bridge (`node-agent-protocol.md` section 6.9).
+fn bridge_candidates(configured: &str) -> Vec<String> {
+    let mut candidates = Vec::with_capacity(4);
+    candidates.push(configured.to_owned());
+    for n in 1..=3 {
+        candidates.push(format!("{configured}s{n}"));
+    }
+    candidates
+        .into_iter()
+        .filter(|name| name.len() <= MAX_BRIDGE_NAME)
+        .collect()
 }
 
 /// Per-VM timing state. It does not survive an agent restart by design: a fresh
@@ -377,32 +411,18 @@ impl<E: Engine + 'static> Reconciler<E> {
         };
 
         let network = NetworkState {
+            bridge: self.config.bridge.clone(),
             subnet: spec_network.subnet.clone(),
             gateway: subnet.gateway,
             dns: self.config.dns.clone(),
         };
-        if self.network_failed || self.network.as_ref() != Some(&network) {
-            let request = NodeNetwork {
-                bridge: self.config.bridge.clone(),
-                subnet: network.subnet.clone(),
-                gateway: network.gateway,
-                dns: network.dns.clone(),
-            };
-            match self.engine.ensure_network(&request).await {
-                Ok(()) => {
-                    info!(
-                        bridge = %request.bridge,
-                        subnet = %request.subnet,
-                        "node network ensured"
-                    );
-                    self.network = Some(network);
-                    self.network_failed = false;
-                }
-                Err(e) => {
-                    warn!(error = ?e, "could not ensure the node network; no VM is created this pass");
-                    self.network_failed = true;
-                }
-            }
+        if self.network_failed
+            || self
+                .network
+                .as_ref()
+                .is_none_or(|current| !current.same_network(&network))
+        {
+            self.ensure_network(&network).await;
         }
         let network_ok = !self.network_failed && self.network.is_some();
 
@@ -441,6 +461,71 @@ impl<E: Engine + 'static> Reconciler<E> {
 
         self.health_pass(Some(snapshot)).await;
         self.publish().await
+    }
+
+    /// Ensures the desired node network, walking the bridge candidates until
+    /// one is accepted.
+    ///
+    /// A bridge already recorded with another subnet is a `Conflict` and is
+    /// never reconfigured (`engine-trait.md` section 3.3), so a node whose
+    /// subnet changed takes the next candidate name instead
+    /// (`node-agent-protocol.md` section 6.9). The old bridge stays without
+    /// VMs, and VMs still on it keep their address until they are redeployed.
+    /// Any other engine error stops the walk: retrying another name would not
+    /// help.
+    async fn ensure_network(&mut self, desired: &NetworkState) -> bool {
+        for (index, bridge) in bridge_candidates(&self.config.bridge)
+            .into_iter()
+            .enumerate()
+        {
+            let request = NodeNetwork {
+                bridge: bridge.clone(),
+                subnet: desired.subnet.clone(),
+                gateway: desired.gateway,
+                dns: desired.dns.clone(),
+            };
+            match self.engine.ensure_network(&request).await {
+                Ok(()) => {
+                    info!(
+                        bridge = %request.bridge,
+                        subnet = %request.subnet,
+                        "node network ensured"
+                    );
+                    if index > 0 {
+                        info!(
+                            bridge = %request.bridge,
+                            previous_bridge = %self.config.bridge,
+                            "running VMs stay on their previous bridge until they are redeployed"
+                        );
+                    }
+                    self.network = Some(NetworkState {
+                        bridge,
+                        subnet: desired.subnet.clone(),
+                        gateway: desired.gateway,
+                        dns: desired.dns.clone(),
+                    });
+                    self.network_failed = false;
+                    return true;
+                }
+                Err(EngineError::Conflict(_)) => {
+                    debug!(
+                        bridge = %request.bridge,
+                        "the bridge is recorded with another network; trying the next candidate"
+                    );
+                }
+                Err(e) => {
+                    warn!(error = ?e, "could not ensure the node network; no VM is created this pass");
+                    self.network_failed = true;
+                    return false;
+                }
+            }
+        }
+        warn!(
+            subnet = %desired.subnet,
+            "every bridge candidate is recorded with another network; no VM is created this pass"
+        );
+        self.network_failed = true;
+        false
     }
 
     /// The observed address of every VM a route lists, for the ingress

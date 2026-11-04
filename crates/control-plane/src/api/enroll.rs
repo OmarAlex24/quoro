@@ -596,6 +596,41 @@ async fn enroll(
         (id, Op::Create)
     };
 
+    // Every machine with the `node` role owns a guest subnet (ADR 0144). An
+    // adopted row that already has one keeps it.
+    if body.roles.contains(&NodeRole::Node) {
+        let current: Option<String> = sqlx::query_scalar("SELECT subnet FROM nodes WHERE id = ?")
+            .bind(&node_id)
+            .fetch_one(&mut *w.tx)
+            .await?;
+        if current.is_none() {
+            let taken: Vec<(String,)> =
+                sqlx::query_as("SELECT subnet FROM nodes WHERE subnet IS NOT NULL")
+                    .fetch_all(&mut *w.tx)
+                    .await?;
+            let taken: Vec<String> = taken.into_iter().map(|(subnet,)| subnet).collect();
+            let subnet = crate::subnet::allocate(&state.config.node_network.subnet, &taken)
+                .map_err(ApiError::conflict)?;
+            sqlx::query("UPDATE nodes SET subnet = ? WHERE id = ?")
+                .bind(&subnet)
+                .bind(&node_id)
+                .execute(&mut *w.tx)
+                .await?;
+            changelog::append(
+                &mut w.tx,
+                &Actor {
+                    kind: ActorType::Node,
+                    id: node_id.clone(),
+                },
+                "node",
+                &node_id,
+                Op::Update,
+                json!({ "id": node_id, "subnet": subnet }),
+            )
+            .await?;
+        }
+    }
+
     if let JoinToken::Row {
         id: token_id,
         created_by,

@@ -31,6 +31,7 @@ pub mod request;
 pub mod service;
 pub mod session;
 pub mod store;
+pub(crate) mod subnet;
 pub mod sweeper;
 pub mod tunnel;
 
@@ -66,7 +67,8 @@ pub struct ServerConfig {
     /// SHA-256 of the listener's certificate DER, exactly as the binary
     /// prints it: `sha256:<64 lowercase hex>`.
     pub tls_fingerprint: String,
-    /// The node bridge handed to every node in its desired state.
+    /// The configured guest network. The oldest node with the `node` role
+    /// keeps it; every other node gets its own `/24` (ADR 0144).
     pub node_network: NodeNetwork,
     /// Heartbeat interval announced in `welcome` (section 4.3).
     pub heartbeat_interval_ms: u64,
@@ -169,6 +171,9 @@ impl AppState {
         let cluster_id = keys::ensure_cluster_meta(&store)
             .await
             .map_err(|e| format!("cannot read the cluster identity: {e:?}"))?;
+        // Nodes enrolled before the per-node subnet existed get theirs before
+        // any session can ask for a desired state (ADR 0144).
+        subnet::backfill(&store, &config.node_network).await?;
         let config = Arc::new(config);
         let hub = NodeHub::new(
             store.clone(),

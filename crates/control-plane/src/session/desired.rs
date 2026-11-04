@@ -24,7 +24,7 @@ use crate::api::apps::AppSource;
 use crate::app_env;
 use crate::crypto::DataKey;
 use crate::deploy;
-use crate::{DigestResolver, NodeNetwork, store::Store};
+use crate::{DigestResolver, store::Store};
 use quoro_proto::wire::{
     BuildLimits, DesiredStatus, HealthCheck, Spec, SpecBuild, SpecIngress, SpecNetwork, SpecRoute,
     SpecTunnel, SpecVm,
@@ -81,12 +81,29 @@ struct AppInfo {
 pub async fn build_spec(
     store: &Store,
     node_id: &str,
-    network: &NodeNetwork,
     resolver: &dyn DigestResolver,
     cache: &DigestCache,
     data_key: &DataKey,
     previous: Option<&Spec>,
 ) -> Result<BuiltSpec, String> {
+    // An edge-only machine runs no VM and has no guest subnet (ADR 0144); a
+    // node still waiting for its subnet cannot be sent a snapshot yet.
+    let (subnet, roles): (Option<String>, String) =
+        sqlx::query_as("SELECT subnet, roles FROM nodes WHERE id = ?")
+            .bind(node_id)
+            .fetch_one(store.pool())
+            .await
+            .map_err(|e| format!("cannot read the subnet of {node_id}: {e}"))?;
+    let roles: Vec<String> = serde_json::from_str(&roles)
+        .map_err(|e| format!("cannot read the roles of {node_id}: {e}"))?;
+    let network = if roles.iter().any(|role| role == "node") {
+        let subnet = subnet.ok_or_else(|| format!("node {node_id} has no guest subnet yet"))?;
+        let gateway = crate::subnet::gateway_of(&subnet)?;
+        Some(SpecNetwork { subnet, gateway })
+    } else {
+        None
+    };
+
     let rows = sqlx::query(
         "SELECT id, project_id, app_id, name, image, vcpus, memory_mb, disk_gb, \
          desired_status, observed_status, restart_generation FROM vms WHERE node_id = ? ORDER BY id",
@@ -219,10 +236,7 @@ pub async fn build_spec(
         spec: Spec {
             vms,
             routes,
-            network: Some(SpecNetwork {
-                subnet: network.subnet.clone(),
-                gateway: network.gateway.clone(),
-            }),
+            network,
             ingress,
             builds,
             mesh: None,
@@ -587,8 +601,8 @@ mod tests {
         sqlx::query(
             "INSERT INTO nodes (id, name, roles, cp_status, status, public_key, address, behind_nat, \
              labels, capacity, allocated, kvm, engine_version, agent_version, desired_rev, applied_rev, \
-             log_seq, last_seen_at, created_at) \
-             VALUES (?, 'n', '[\"node\"]', NULL, 'pending', '', NULL, 1, '{}', '{}', '{}', '{}', NULL, NULL, 0, 0, 0, NULL, ?)",
+             log_seq, last_seen_at, created_at, subnet) \
+             VALUES (?, 'n', '[\"node\"]', NULL, 'pending', '', NULL, 1, '{}', '{}', '{}', '{}', NULL, NULL, 0, 0, 0, NULL, ?, '10.42.1.0/24')",
         )
         .bind(&node_id)
         .bind(&now)
@@ -597,23 +611,11 @@ mod tests {
         .unwrap();
         let a = insert_vm(&store, &node_id, "a").await;
         let b = insert_vm(&store, &node_id, "b").await;
-        let network = NodeNetwork {
-            subnet: "10.42.1.0/24".to_string(),
-            gateway: "10.42.1.1".to_string(),
-        };
         let cache = DigestCache::default();
         let key = DataKey::ephemeral();
-        let built = build_spec(
-            &store,
-            &node_id,
-            &network,
-            &ReferenceAsDigest,
-            &cache,
-            &key,
-            None,
-        )
-        .await
-        .unwrap();
+        let built = build_spec(&store, &node_id, &ReferenceAsDigest, &cache, &key, None)
+            .await
+            .unwrap();
         let spec = built.spec;
         let mut ids: Vec<&str> = spec.vms.iter().map(|vm| vm.vm_id.as_str()).collect();
         ids.sort_unstable();
@@ -652,8 +654,8 @@ mod tests {
         sqlx::query(
             "INSERT INTO nodes (id, name, roles, cp_status, status, public_key, address, behind_nat, \
              labels, capacity, allocated, kvm, engine_version, agent_version, desired_rev, applied_rev, \
-             log_seq, last_seen_at, created_at) \
-             VALUES (?, 'n', '[\"node\"]', NULL, 'pending', '', NULL, 1, '{}', '{}', '{}', '{}', NULL, NULL, 0, 0, 0, NULL, ?)",
+             log_seq, last_seen_at, created_at, subnet) \
+             VALUES (?, 'n', '[\"node\"]', NULL, 'pending', '', NULL, 1, '{}', '{}', '{}', '{}', NULL, NULL, 0, 0, 0, NULL, ?, '10.42.1.0/24')",
         )
         .bind(&node_id)
         .bind(&now)
@@ -662,17 +664,12 @@ mod tests {
         .unwrap();
         let a = insert_vm(&store, &node_id, "a").await;
         let b = insert_vm(&store, &node_id, "b").await;
-        let network = NodeNetwork {
-            subnet: "10.42.1.0/24".to_string(),
-            gateway: "10.42.1.1".to_string(),
-        };
         let key = DataKey::ephemeral();
 
         // A new VM waits; the other one is sent.
         let built = build_spec(
             &store,
             &node_id,
-            &network,
             &FailsOnB,
             &DigestCache::default(),
             &key,
@@ -695,7 +692,6 @@ mod tests {
             build_spec(
                 &store,
                 &node_id,
-                &network,
                 &FailsOnB,
                 &DigestCache::default(),
                 &key,
@@ -714,7 +710,6 @@ mod tests {
         let built = build_spec(
             &store,
             &node_id,
-            &network,
             &FailsOnB,
             &DigestCache::default(),
             &key,
