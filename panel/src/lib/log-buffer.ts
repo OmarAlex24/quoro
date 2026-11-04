@@ -114,7 +114,10 @@ const KNOWN_CODES: ReadonlySet<string> = new Set([
 ]);
 
 /** Turn an SSE `error` event's Problem JSON into the panel's plain words. */
-export const problemViewFromEvent = (data: string): ProblemView => {
+export const problemViewFromEvent = (
+  data: string,
+  action = 'read app logs',
+): ProblemView => {
   try {
     const parsed = JSON.parse(data) as Partial<Problem>;
     if (typeof parsed.code !== 'string' || !KNOWN_CODES.has(parsed.code)) {
@@ -129,7 +132,7 @@ export const problemViewFromEvent = (data: string): ProblemView => {
         scope: typeof parsed.scope === 'string' ? parsed.scope : undefined,
         title: typeof parsed.title === 'string' ? parsed.title : undefined,
       }),
-      'read app logs',
+      action,
     );
   } catch {
     return {

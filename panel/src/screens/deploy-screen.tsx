@@ -7,6 +7,7 @@ import {
   replaceAppEnv,
 } from '../api/generated/apps/apps';
 import { createDeployment } from '../api/generated/deployments/deployments';
+import { startBuild } from '../api/generated/builds/builds';
 import { createAppDomain } from '../api/generated/domains/domains';
 import type { CreateDomainRequestTlsMode } from '../api/generated/model';
 import {
@@ -24,6 +25,16 @@ import {
   type DeployStepState,
 } from '../lib/deploy-flow';
 import { deriveSlug, validateSlug } from '../lib/slug';
+import { cn } from '../lib/utils';
+import {
+  DEFAULT_CONTEXT_DIR,
+  DEFAULT_DOCKERFILE_PATH,
+  DEFAULT_SOURCE_REF,
+  deriveAppNameFromRepo,
+  repoUrlError,
+  validateSourceForm,
+  type SourceErrors,
+} from '../lib/source-form';
 import { useSession } from '../session';
 import { ToneLamp } from '../components/tone-lamp';
 import { Button } from '../components/ui/button';
@@ -40,11 +51,19 @@ const HOSTNAME_PATTERN =
 
 const DEFAULT_IMAGE = 'docker.io/library/nginx:alpine';
 
+type SourceKind = 'image' | 'git';
+
 interface EnvRow {
   key: number;
   name: string;
   value: string;
   show: boolean;
+}
+
+interface BuildArgRow {
+  key: number;
+  name: string;
+  value: string;
 }
 
 const stateTone = (state: DeployStepState) => {
@@ -78,6 +97,14 @@ export function DeployScreen() {
   const [hostname, setHostname] = useState('');
   const [tlsMode, setTlsMode] = useState<CreateDomainRequestTlsMode>('tunnel');
 
+  const [sourceKind, setSourceKind] = useState<SourceKind>('image');
+  const [repoUrl, setRepoUrl] = useState('');
+  const [sourceRef, setSourceRef] = useState(DEFAULT_SOURCE_REF);
+  const [dockerfilePath, setDockerfilePath] = useState(DEFAULT_DOCKERFILE_PATH);
+  const [contextDir, setContextDir] = useState(DEFAULT_CONTEXT_DIR);
+  const [target, setTarget] = useState('');
+  const [secretNames, setSecretNames] = useState<string[]>([]);
+
   const [projectView, setProjectView] = useState<'pick' | 'create'>('pick');
   const [projectName, setProjectName] = useState('');
   const [projectSlug, setProjectSlug] = useState('');
@@ -86,6 +113,11 @@ export function DeployScreen() {
   const nextRowKey = useRef(1);
   const [envRows, setEnvRows] = useState<EnvRow[]>([
     { key: 0, name: '', value: '', show: false },
+  ]);
+
+  const nextArgKey = useRef(1);
+  const [buildArgRows, setBuildArgRows] = useState<BuildArgRow[]>([
+    { key: 0, name: '', value: '' },
   ]);
 
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
@@ -133,9 +165,49 @@ export function DeployScreen() {
   const removeRow = (key: number) =>
     setEnvRows((current) => current.filter((row) => row.key !== key));
 
+  const updateArgRow = (key: number, patch: Partial<BuildArgRow>) =>
+    setBuildArgRows((current) =>
+      current.map((row) => (row.key === key ? { ...row, ...patch } : row)),
+    );
+
+  const addArgRow = () => {
+    const key = nextArgKey.current;
+    nextArgKey.current += 1;
+    setBuildArgRows((current) => [...current, { key, name: '', value: '' }]);
+  };
+
+  const removeArgRow = (key: number) =>
+    setBuildArgRows((current) => current.filter((row) => row.key !== key));
+
   const filledRows = envRows.filter(
     (row) => row.name.trim() !== '' || row.value !== '',
   );
+
+  const filledArgRows = buildArgRows.filter(
+    (row) => row.name.trim() !== '' || row.value !== '',
+  );
+
+  const availableSecretNames = filledRows
+    .map((row) => row.name.trim())
+    .filter((rowName) => ENV_NAME_PATTERN.test(rowName));
+  const secretKey = availableSecretNames.join('\n');
+
+  useEffect(() => {
+    setSecretNames((current) =>
+      current.filter((name) => availableSecretNames.includes(name)),
+    );
+    // `secretKey` is the content of the list; a new array with the same names
+    // must not clear the selection.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [secretKey]);
+
+  const chooseSource = (kind: SourceKind) => {
+    setSourceKind(kind);
+    setFieldErrors({});
+    if (!nameEdited) {
+      setName(kind === 'git' ? deriveAppNameFromRepo(repoUrl) : deriveAppName(image));
+    }
+  };
 
   const createProjectMutation = useMutation({
     mutationFn: () => createProject({ name: projectName.trim(), slug: projectSlug }),
@@ -155,7 +227,27 @@ export function DeployScreen() {
     if (!APP_NAME_PATTERN.test(name.trim())) {
       errors.name = 'Use 1–40 lowercase letters, digits or dashes.';
     }
-    if (image.trim() === '') errors.image = 'Enter the image reference.';
+    if (sourceKind === 'image' && image.trim() === '') {
+      errors.image = 'Enter the image reference.';
+    }
+    if (sourceKind === 'git') {
+      Object.assign(
+        errors,
+        validateSourceForm({
+          repoUrl,
+          ref: sourceRef,
+          dockerfilePath,
+          contextDir,
+          target,
+          buildArgs: filledArgRows.map((row) => ({
+            name: row.name.trim(),
+            value: row.value,
+          })),
+          secrets: secretNames,
+          envNames: availableSecretNames,
+        }),
+      );
+    }
     const parsedPort = Number(port);
     if (
       port.trim() === '' ||
@@ -203,6 +295,7 @@ export function DeployScreen() {
     const steps = deploySteps({
       envCount: filledRows.length,
       hostname: hostname.trim(),
+      build: sourceKind === 'git',
     });
     setActiveSteps(steps);
     setStepStates(Object.fromEntries(steps.map((step) => [step.key, 'waiting' as const])));
@@ -219,9 +312,29 @@ export function DeployScreen() {
         {
           project_id: projectId,
           name: name.trim(),
-          image: image.trim(),
           port: Number(port),
           placement: { node_ids: [nodeId] },
+          ...(sourceKind === 'git'
+            ? {
+                source: {
+                  kind: 'git' as const,
+                  repo_url: repoUrl.trim(),
+                  ref: sourceRef.trim() === '' ? DEFAULT_SOURCE_REF : sourceRef.trim(),
+                  dockerfile_path:
+                    dockerfilePath.trim() === ''
+                      ? DEFAULT_DOCKERFILE_PATH
+                      : dockerfilePath.trim(),
+                  context_dir:
+                    contextDir.trim() === '' ? DEFAULT_CONTEXT_DIR : contextDir.trim(),
+                  target: target.trim() === '' ? null : target.trim(),
+                  build_args: filledArgRows.map((row) => ({
+                    name: row.name.trim(),
+                    value: row.value,
+                  })),
+                  secrets: secretNames,
+                },
+              }
+            : { image: image.trim() }),
         },
         { headers: { 'Idempotency-Key': crypto.randomUUID() } },
       );
@@ -251,6 +364,22 @@ export function DeployScreen() {
         mark('domain', 'done');
       }
 
+      void queryClient.invalidateQueries({ queryKey: getListAppsQueryKey() });
+
+      if (sourceKind === 'git') {
+        current = 'build';
+        mark('build', 'active');
+        const build = await startBuild(app.id, undefined, {
+          headers: { 'Idempotency-Key': crypto.randomUUID() },
+        });
+        mark('build', 'done');
+        void navigate({
+          to: '/apps/$appId/builds/$buildId',
+          params: { appId: app.id, buildId: build.id },
+        });
+        return;
+      }
+
       current = 'deploy';
       mark('deploy', 'active');
       await createDeployment(
@@ -260,7 +389,6 @@ export function DeployScreen() {
       );
       mark('deploy', 'done');
 
-      void queryClient.invalidateQueries({ queryKey: getListAppsQueryKey() });
       void navigate({ to: '/apps/$appId', params: { appId: app.id } });
     } catch (error) {
       mark(current, 'error');
@@ -316,9 +444,19 @@ export function DeployScreen() {
     hostname.trim() !== '' && !HOSTNAME_PATTERN.test(hostname.trim())
       ? 'Use a hostname like blog.example.com.'
       : undefined;
+  const liveRepoError =
+    sourceKind === 'git' && repoUrl.trim() !== ''
+      ? repoUrlError(repoUrl) ?? undefined
+      : undefined;
   const nameError = fieldErrors.name ?? liveNameError;
   const portError = fieldErrors.port ?? livePortError;
   const hostnameError = fieldErrors.hostname ?? liveHostnameError;
+  const repoError = fieldErrors.repo_url ?? liveRepoError;
+
+  const toggleSecret = (name: string, checked: boolean) =>
+    setSecretNames((current) =>
+      checked ? [...current, name] : current.filter((item) => item !== name),
+    );
 
   return (
     <main className="mx-auto w-full max-w-3xl px-4 py-6 sm:px-6 sm:py-8">
@@ -329,7 +467,8 @@ export function DeployScreen() {
         </Button>
       </div>
       <p className="mt-2 text-[15px] text-ink-muted">
-        Name an image, pick where it runs and deploy it. The app gets one microVM.
+        Name an image or a public Git repository, pick where it runs and deploy it. The
+        app gets one microVM.
       </p>
 
       <form
@@ -338,47 +477,273 @@ export function DeployScreen() {
         className="mt-5 rounded-[6px] border border-rail bg-panel bay-shadow"
       >
         <section className="px-4 py-5 sm:px-5">
-          <h2 className="type-display-light text-[15px] leading-none text-ink">Image</h2>
-          <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-[minmax(0,1fr)_140px]">
-            <Field label="OCI reference" htmlFor="app-image">
-              <Input
-                id="app-image"
-                value={image}
-                onChange={(event) => {
-                  setImage(event.target.value);
-                  if (!nameEdited) setName(deriveAppName(event.target.value));
-                  setFieldErrors((current) => {
-                    const next = { ...current };
-                    delete next.image;
-                    return next;
-                  });
-                }}
-                placeholder="docker.io/library/nginx:alpine"
-                spellCheck={false}
-                autoFocus
-                aria-invalid={fieldErrors.image !== undefined}
+          <h2 className="type-display-light text-[15px] leading-none text-ink">Source</h2>
+          <div
+            role="radiogroup"
+            aria-label="How the app image is made"
+            className="mt-4 grid grid-cols-1 gap-2.5 sm:grid-cols-2"
+          >
+            <label
+              className={cn(
+                'flex cursor-pointer items-start gap-3 rounded-[6px] border px-3 py-3 transition-colors',
+                sourceKind === 'image'
+                  ? 'border-cobalt bg-cobalt/[0.04]'
+                  : 'border-rail hover:border-ink-muted',
+              )}
+            >
+              <input
+                type="radio"
+                name="source-kind"
+                value="image"
+                checked={sourceKind === 'image'}
+                onChange={() => chooseSource('image')}
+                className="mt-1 h-4 w-4 shrink-0 accent-cobalt"
               />
-              {fieldErrors.image ? (
-                <p className="text-[13px] text-lamp-fault">{fieldErrors.image}</p>
-              ) : null}
-            </Field>
-            <Field label="Container port" htmlFor="app-port">
-              <Input
-                id="app-port"
-                type="number"
-                min={1}
-                max={65_535}
-                step={1}
-                inputMode="numeric"
-                value={port}
-                onChange={(event) => set('port', event.target.value)}
-                aria-invalid={portError !== undefined}
+              <span className="min-w-0">
+                <span className="type-body-medium block text-[15px] leading-tight text-ink">
+                  Image
+                </span>
+                <span className="mt-1 block text-[13px] leading-snug text-ink-muted">
+                  Deploy a public OCI reference as it is.
+                </span>
+              </span>
+            </label>
+            <label
+              className={cn(
+                'flex cursor-pointer items-start gap-3 rounded-[6px] border px-3 py-3 transition-colors',
+                sourceKind === 'git'
+                  ? 'border-cobalt bg-cobalt/[0.04]'
+                  : 'border-rail hover:border-ink-muted',
+              )}
+            >
+              <input
+                type="radio"
+                name="source-kind"
+                value="git"
+                checked={sourceKind === 'git'}
+                onChange={() => chooseSource('git')}
+                className="mt-1 h-4 w-4 shrink-0 accent-cobalt"
               />
-              {portError ? (
-                <p className="text-[13px] text-lamp-fault">{portError}</p>
-              ) : null}
-            </Field>
+              <span className="min-w-0">
+                <span className="type-body-medium block text-[15px] leading-tight text-ink">
+                  Git repository
+                </span>
+                <span className="mt-1 block text-[13px] leading-snug text-ink-muted">
+                  Build the image from a public repository and a Dockerfile.
+                </span>
+              </span>
+            </label>
           </div>
+
+          {sourceKind === 'image' ? (
+            <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-[minmax(0,1fr)_140px]">
+              <Field label="OCI reference" htmlFor="app-image">
+                <Input
+                  id="app-image"
+                  value={image}
+                  onChange={(event) => {
+                    setImage(event.target.value);
+                    if (!nameEdited) setName(deriveAppName(event.target.value));
+                    setFieldErrors((current) => {
+                      const next = { ...current };
+                      delete next.image;
+                      return next;
+                    });
+                  }}
+                  placeholder="docker.io/library/nginx:alpine"
+                  spellCheck={false}
+                  autoFocus
+                  aria-invalid={fieldErrors.image !== undefined}
+                />
+                {fieldErrors.image ? (
+                  <p className="text-[13px] text-lamp-fault">{fieldErrors.image}</p>
+                ) : null}
+              </Field>
+              <Field label="Container port" htmlFor="app-port">
+                <Input
+                  id="app-port"
+                  type="number"
+                  min={1}
+                  max={65_535}
+                  step={1}
+                  inputMode="numeric"
+                  value={port}
+                  onChange={(event) => set('port', event.target.value)}
+                  aria-invalid={portError !== undefined}
+                />
+                {portError ? (
+                  <p className="text-[13px] text-lamp-fault">{portError}</p>
+                ) : null}
+              </Field>
+            </div>
+          ) : (
+            <>
+              <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-[minmax(0,1fr)_140px]">
+                <Field
+                  label="Repository URL"
+                  htmlFor="app-repo"
+                  hint="Public repositories only, over https://."
+                >
+                  <Input
+                    id="app-repo"
+                    value={repoUrl}
+                    onChange={(event) => {
+                      setRepoUrl(event.target.value);
+                      if (!nameEdited) setName(deriveAppNameFromRepo(event.target.value));
+                      setFieldErrors((current) => {
+                        const next = { ...current };
+                        delete next.repo_url;
+                        return next;
+                      });
+                    }}
+                    placeholder="https://github.com/example/docs-site.git"
+                    spellCheck={false}
+                    autoFocus
+                    aria-invalid={repoError !== undefined}
+                  />
+                  {repoError ? (
+                    <p className="text-[13px] text-lamp-fault">{repoError}</p>
+                  ) : null}
+                </Field>
+                <Field label="Container port" htmlFor="app-port">
+                  <Input
+                    id="app-port"
+                    type="number"
+                    min={1}
+                    max={65_535}
+                    step={1}
+                    inputMode="numeric"
+                    value={port}
+                    onChange={(event) => set('port', event.target.value)}
+                    aria-invalid={portError !== undefined}
+                  />
+                  {portError ? (
+                    <p className="text-[13px] text-lamp-fault">{portError}</p>
+                  ) : null}
+                </Field>
+              </div>
+
+              <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <Field label="Ref" htmlFor="app-ref" hint="Branch, tag or full commit SHA.">
+                  <Input
+                    id="app-ref"
+                    value={sourceRef}
+                    onChange={(event) => setSourceRef(event.target.value)}
+                    placeholder={DEFAULT_SOURCE_REF}
+                    spellCheck={false}
+                    aria-invalid={fieldErrors.ref !== undefined}
+                  />
+                  {fieldErrors.ref ? (
+                    <p className="text-[13px] text-lamp-fault">{fieldErrors.ref}</p>
+                  ) : null}
+                </Field>
+                <Field
+                  label="Target stage"
+                  htmlFor="app-target"
+                  hint="Optional. Leave it empty to build the last stage."
+                >
+                  <Input
+                    id="app-target"
+                    value={target}
+                    onChange={(event) => setTarget(event.target.value)}
+                    placeholder="runtime"
+                    spellCheck={false}
+                    aria-invalid={fieldErrors.target !== undefined}
+                  />
+                  {fieldErrors.target ? (
+                    <p className="text-[13px] text-lamp-fault">{fieldErrors.target}</p>
+                  ) : null}
+                </Field>
+                <Field
+                  label="Dockerfile path"
+                  htmlFor="app-dockerfile"
+                  hint="Relative to the build context."
+                >
+                  <Input
+                    id="app-dockerfile"
+                    value={dockerfilePath}
+                    onChange={(event) => setDockerfilePath(event.target.value)}
+                    placeholder={DEFAULT_DOCKERFILE_PATH}
+                    spellCheck={false}
+                    aria-invalid={fieldErrors.dockerfile !== undefined}
+                  />
+                  {fieldErrors.dockerfile ? (
+                    <p className="text-[13px] text-lamp-fault">{fieldErrors.dockerfile}</p>
+                  ) : null}
+                </Field>
+                <Field
+                  label="Context directory"
+                  htmlFor="app-context"
+                  hint="Relative to the repository root; . is the root."
+                >
+                  <Input
+                    id="app-context"
+                    value={contextDir}
+                    onChange={(event) => setContextDir(event.target.value)}
+                    placeholder={DEFAULT_CONTEXT_DIR}
+                    spellCheck={false}
+                    aria-invalid={fieldErrors.context !== undefined}
+                  />
+                  {fieldErrors.context ? (
+                    <p className="text-[13px] text-lamp-fault">{fieldErrors.context}</p>
+                  ) : null}
+                </Field>
+              </div>
+
+              <div className="mt-4">
+                <div className="flex flex-wrap items-baseline justify-between gap-2">
+                  <span className="type-body-medium text-[13px] text-ink-muted">
+                    Build arguments
+                  </span>
+                  <button
+                    type="button"
+                    className="text-[13px] text-cobalt underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+                    onClick={addArgRow}
+                  >
+                    Add argument
+                  </button>
+                </div>
+                <p className="mt-1 text-[13px] leading-snug text-ink-muted">
+                  Passed as <span className="type-data">--build-arg</span>. They are not
+                  secret: they end up in the image history.
+                </p>
+                <div className="mt-2 flex flex-col gap-2">
+                  {buildArgRows.map((row) => (
+                    <div
+                      key={row.key}
+                      className="grid grid-cols-1 gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
+                    >
+                      <Input
+                        aria-label="Argument name"
+                        value={row.name}
+                        onChange={(event) => updateArgRow(row.key, { name: event.target.value })}
+                        placeholder="NODE_ENV"
+                        spellCheck={false}
+                      />
+                      <Input
+                        aria-label="Argument value"
+                        value={row.value}
+                        onChange={(event) => updateArgRow(row.key, { value: event.target.value })}
+                        placeholder="production"
+                        spellCheck={false}
+                      />
+                      <Button
+                        variant="quiet"
+                        className="justify-self-start px-2.5"
+                        onClick={() => removeArgRow(row.key)}
+                        disabled={buildArgRows.length === 1}
+                      >
+                        Remove
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+                {fieldErrors.build_args ? (
+                  <p className="mt-2 text-[13px] text-lamp-fault">{fieldErrors.build_args}</p>
+                ) : null}
+              </div>
+            </>
+          )}
         </section>
 
         <section className="border-t border-rail px-4 py-5 sm:px-5">
@@ -658,6 +1023,45 @@ export function DeployScreen() {
           {fieldErrors.env ? (
             <p className="mt-2 text-[13px] text-lamp-fault">{fieldErrors.env}</p>
           ) : null}
+
+          {sourceKind === 'git' ? (
+            <fieldset className="mt-5 border-t border-rail pt-4">
+              <legend className="type-body-medium mb-1 text-[13px] text-ink-muted">
+                Build secrets
+              </legend>
+              <p className="text-[13px] leading-snug text-ink-muted">
+                Variables above to mount into the build. Their values still reach the
+                app and are never written to the build log.
+              </p>
+              {availableSecretNames.length === 0 ? (
+                <p className="mt-2 text-[13px] text-ink-muted">
+                  Name a variable above to use it as a build secret.
+                </p>
+              ) : (
+                <div className="mt-2 flex flex-wrap gap-x-5 gap-y-2">
+                  {availableSecretNames.map((secretName) => (
+                    <label
+                      key={secretName}
+                      className="flex items-center gap-2 text-[15px] text-ink"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={secretNames.includes(secretName)}
+                        onChange={(event) =>
+                          toggleSecret(secretName, event.target.checked)
+                        }
+                        className="h-4 w-4 accent-cobalt"
+                      />
+                      <span className="type-data">{secretName}</span>
+                    </label>
+                  ))}
+                </div>
+              )}
+              {fieldErrors.secrets ? (
+                <p className="mt-2 text-[13px] text-lamp-fault">{fieldErrors.secrets}</p>
+              ) : null}
+            </fieldset>
+          ) : null}
         </section>
 
         {showChecklist ? (
@@ -702,7 +1106,13 @@ export function DeployScreen() {
             </Button>
           ) : (
             <Button variant="primary" type="submit" disabled={submitting}>
-              {submitting ? 'Deploying…' : 'Deploy'}
+              {submitting
+                ? sourceKind === 'git'
+                  ? 'Starting the build…'
+                  : 'Deploying…'
+                : sourceKind === 'git'
+                  ? 'Build and deploy'
+                  : 'Deploy'}
             </Button>
           )}
         </div>

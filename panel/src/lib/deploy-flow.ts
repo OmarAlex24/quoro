@@ -1,5 +1,5 @@
 /** The four calls of a deploy, in the order the screen awaits them. */
-export type DeployStepKey = 'create' | 'env' | 'domain' | 'deploy';
+export type DeployStepKey = 'create' | 'env' | 'domain' | 'deploy' | 'build';
 
 export interface DeployStepDefinition {
   readonly key: DeployStepKey;
@@ -11,14 +11,17 @@ export type DeployStepState = 'waiting' | 'active' | 'done' | 'error';
 /**
  * The checklist shown on the deploy plate. `env` only appears when variables
  * were entered and `domain` only when a hostname was given, so the list is the
- * exact sequence of calls about to be made.
+ * exact sequence of calls about to be made. A Git source ends with its first
+ * build instead of a deployment of an image.
  */
 export const deploySteps = ({
   envCount,
   hostname,
+  build = false,
 }: {
   envCount: number;
   hostname: string;
+  build?: boolean;
 }): DeployStepDefinition[] => {
   const steps: DeployStepDefinition[] = [{ key: 'create', label: 'Creating the app' }];
   if (envCount > 0) {
@@ -30,7 +33,11 @@ export const deploySteps = ({
   if (hostname.trim() !== '') {
     steps.push({ key: 'domain', label: `Adding ${hostname.trim()}` });
   }
-  steps.push({ key: 'deploy', label: 'Starting the deployment' });
+  steps.push(
+    build
+      ? { key: 'build', label: 'Starting the first build' }
+      : { key: 'deploy', label: 'Starting the deployment' },
+  );
   return steps;
 };
 

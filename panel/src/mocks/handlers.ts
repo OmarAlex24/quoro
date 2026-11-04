@@ -70,6 +70,7 @@ import {
 import { agentsHandlers } from './handlers-agents';
 import { approvalsHandlers } from './handlers-approvals';
 import { auditHandlers } from './handlers-audit';
+import { buildsHandlers } from './handlers-builds';
 import { grantsHandlers } from './handlers-grants';
 import { incidentsHandlers } from './handlers-incidents';
 import { metricsHandlers } from './handlers-metrics';
@@ -438,10 +439,24 @@ export const handlers = [
         detail: 'App name must be 1-40 lowercase letters, digits or dashes.',
       });
     }
-    if ((body.image ?? '').trim() === '') {
+    const hasSource = body.source !== undefined && body.source !== null;
+    const hasImage = (body.image ?? '').trim() !== '';
+    if (hasSource === hasImage) {
       return problem(422, 'validation_failed', {
-        detail: 'An image reference is required.',
+        detail: 'Give either an image reference or a Git source, not both.',
       });
+    }
+    if (hasSource) {
+      if (!/^https:\/\/[^\s]+$/.test(body.source?.repo_url ?? '')) {
+        return problem(422, 'validation_failed', {
+          detail: 'The repository URL must be a public https:// URL.',
+        });
+      }
+      if ((body.source?.ref ?? '').trim() === '') {
+        return problem(422, 'validation_failed', {
+          detail: 'A branch, tag or commit is required.',
+        });
+      }
     }
     if (!isIntAtLeast(body.port, 1) || body.port > 65_535) {
       return problem(422, 'validation_failed', {
@@ -466,7 +481,8 @@ export const handlers = [
       name,
       stateful: body.stateful ?? false,
       ha_policy: 'none',
-      image: (body.image ?? '').trim(),
+      image: hasSource ? '' : (body.image ?? '').trim(),
+      source: hasSource ? (body.source ?? null) : null,
       port: body.port,
       health_check: body.health_check ?? {
         path: '/',
@@ -514,6 +530,10 @@ export const handlers = [
       delete db.deploymentLogs[deployment.id];
     }
     db.deployments = db.deployments.filter((item) => item.app_id !== appId);
+    for (const build of db.builds.filter((item) => item.app_id === appId)) {
+      delete db.buildLogs[build.id];
+    }
+    db.builds = db.builds.filter((item) => item.app_id !== appId);
     delete db.appEnv[appId];
 
     return json({ ...app, updated_at: now() }, { status: 202 });
@@ -666,6 +686,11 @@ export const handlers = [
     const app = findApp(String(params.appId));
     if (!app) {
       return problem(404, 'not_found', { detail: 'That app no longer exists.' });
+    }
+    if (app.source) {
+      return problem(409, 'conflict', {
+        detail: 'This app builds its image from Git. Start a build instead.',
+      });
     }
     const body = await readJson<CreateDeploymentRequest>(request);
     if (!body || (body.image ?? '').trim() === '') {
@@ -836,8 +861,9 @@ export const handlers = [
     });
   }),
 
-  // The agency screens: users, agents, grants, approvals, audit, webhooks,
-  // incidents.
+  // Builds, then the agency screens: users, agents, grants, approvals, audit,
+  // webhooks, incidents.
+  ...buildsHandlers,
   ...usersHandlers,
   ...agentsHandlers,
   ...grantsHandlers,

@@ -1,14 +1,16 @@
 # Quoro panel
 
-The operator's panel for Quoro: **Setup**, **Login**, **Apps** (list, deploy,
-inspect, operate, live logs), **Virtual machines** (list, create, start,
-stop, delete, with the state visible after each step), and the agency screens:
+The operator's panel for Quoro: **Setup**, **Login**, **Apps** (list, deploy
+from an image or a Git source, inspect, operate, build, live logs),
+**Virtual machines** (list, create, start, stop, delete, with the state visible
+after each step), and the agency screens:
 **Agents** and their keys, **Grants**, **Approvals**, the **Audit log** with
 chain verification, and **Webhooks** with their deliveries. React 19 + TypeScript on
 Vite, generated from the frozen contract in `../docs/contracts/openapi.yaml`.
 
 Routes: `/` is the apps list, `/apps/new` the deploy work order, `/apps/$appId`
-one app with its deployment, domains, environment, instances and log tape,
+one app with its source, builds, deployment, domains, environment, instances and
+log tape, `/apps/$appId/builds/$buildId` one build with its live log,
 `/apps/$appId/terminal` a web terminal into the app's guest, `/vms` the virtual
 machines, `/vms/$vmId/console` the read-only serial console of one VM,
 `/agents` and `/agents/$agentId`, `/grants`
@@ -42,21 +44,39 @@ client is never hand-edited and is git-ignored.
 - **Mock** (`npm run dev:mock`, or `vite --mode mock`): the MSW service worker
   in `mock-public/` is served and `src/mocks/` answers every request from an
   in-memory database. The mock is stateful: setup creates the owner, login
-  starts a session, and it seeds `lab-3`, a **Blog** project and one running
-  `blog` app with a deployment, a domain, two environment variable names and a
-  running instance. Projects are created from the deploy screen or the New VM
-  dialog. A created VM goes `creating` → `starting` → `running` over about
-  1.6 s; a deployment goes `pending` → `preparing` (pull, rootfs) → `starting`
-  (boot) → `succeeded` over about 3 s. Start and stop converge in 1.5 s; delete
-  removes the VM immediately. `/api/v1/apps/<id>/logs/stream` answers
-  `text/event-stream` and emits a fresh nginx-style access line every second.
+  starts a session, and it seeds `lab-3`, a **Blog** project with one running
+  `blog` app and a **Docs** project with one running `docs-site` app that builds
+  from `https://github.com/example/docs-site.git`. The Git app comes with one
+  succeeded and one failed build (the failed one is newest, with the BuildKit
+  excerpt), a built image, a `trigger: build` deployment and an instance.
+  Projects are created from the deploy screen or the New VM dialog. A created VM
+  goes `creating` → `starting` → `running` over about 1.6 s; a deployment goes
+  `pending` → `preparing` (pull, rootfs) → `starting` (boot) → `succeeded` over
+  about 3 s. Start and stop converge in 1.5 s; delete removes the VM immediately.
+  `/api/v1/apps/<id>/logs/stream` answers `text/event-stream` and emits a fresh
+  nginx-style access line every second.
+  A build goes `queued` → `preparing` → `building` → `exporting` → `importing` →
+  `succeeded` over about 4 s while
+  `/api/v1/builds/<id>/logs/stream` replays BuildKit-style lines (`#5 [3/4] RUN
+  npm ci`, `#5 DONE 2.4s`, …) with `seq` ids and a `vertex`, sends `status` on
+  every move and closes with `end`. A successful build sets the app image to
+  `build.quoro.invalid/<app_id>:<build_id>` and starts a `trigger: build`
+  deployment. A repository URL containing `fail` stops in `building` at
+  `[3/4] RUN ls /does-not-exist` with `error`, `dockerfile_line: 3` and a real
+  BuildKit trailer in `excerpt`; the log ends with the same ERROR line.
   The chosen password is the one you set up with. Any non-empty setup token
   works in mock mode.
 
 To see each screen in mock mode: set up, log in, then open `/` (apps rack),
-`/apps/new` (deploy), click `blog` for `/apps/<id>`, and `/vms` for the VM
-rack. The seeded app's tape starts printing lines on the app screen. The app
-plate's **Terminal** action opens `/apps/<id>/terminal`; each VM bay's
+`/apps/new` (deploy), click `blog` for `/apps/<id>`, `docs-site` for its source
+and builds, or `/vms` for the VM rack. The seeded app's tape starts printing
+lines on the app screen. For a live build, open `/apps/new`, choose **Git
+repository**, use `https://github.com/example/docs-site.git` and submit; the
+build screen follows it to a deployment. To see a failure, use a URL containing
+`fail` (for example `https://github.com/example/fail-demo.git`). To see a
+cancellation, start a build and press **Cancel build** while it runs. The seeded
+`docs-site` failed build shows the failing-step panel without starting anything.
+The app plate's **Terminal** action opens `/apps/<id>/terminal`; each VM bay's
 **Console** action opens `/vms/<id>/console`. Both answer over a mock
 WebSocket: the terminal prints a banner and a `/ # ` prompt, echoes typing, and
 answers `uname -a`, `help` and `exit` (`exit` sends `exit` then `closed` and
@@ -101,6 +121,37 @@ The production build contains no MSW code: `src/mocks/` is only reached through
   `Idempotency-Key` (`crypto.randomUUID()`). If a later step fails the app is
   already real, so the plate offers "Open the app" rather than creating it
   twice.
+- The work order chooses a source first: an **Image** (the sequence above) or a
+  **Git repository**. A Git app is created with `source` and no `image`, then
+  gets the same environment and domain, then its first `startBuild` instead of a
+  deployment, and the panel opens its build. The source form takes an `https://`
+  repository URL, ref (`main`), Dockerfile path (`Dockerfile`), context (`.`),
+  an optional target stage, `--build-arg` rows and build secrets picked from the
+  environment variable names entered on the same form. The checks live in
+  `src/lib/source-form.ts`.
+- A Git app's screen shows its source (repository, ref, Dockerfile, context,
+  last built commit) and its builds newest first, and a "Build now" button with
+  an optional one-build ref override. The button is disabled, with the reason in
+  words, while a build is not terminal or the role cannot deploy (`app:deploy`).
+  `createDeployment` answers `conflict` for a Git app, so the panel never calls
+  it for one.
+- The build view is a phase rail (`queued → preparing → building → exporting →
+  importing → succeeded`) plus the log. The log is one `EventSource` on
+  `/api/v1/builds/<id>/logs/stream?tail=2000` with credentials: `log` events
+  carry `BuildLogLine` with its `vertex`, `status` events move the rail, `error`
+  events are a `Problem` said in plain words, and `end` closes the source. The
+  browser resumes with `Last-Event-ID` by itself. A finished build replays its
+  log and ends. When the stream cannot open (the node answers 504) the panel
+  reads the same log through `getBuildLogs` pages and says the full log stays on
+  the node; the replicated failing step is shown either way.
+- A failed build shows the phase, the BuildKit step (`[3/4] RUN …`), its error,
+  the Dockerfile line and the excerpt with the failing line (`>>>` or
+  `dockerfile_line`) at full contrast; "Jump to step" scrolls the log to the
+  first line of that `vertex`. A successful build links to the deployment it
+  started. A non-terminal build offers "Cancel build" (`cancelBuild`).
+- A built image is named `build.quoro.invalid/<app_id>:<build_id>`, so the panel
+  says "built image" and the build id and never shows it as a pullable
+  registry reference.
 - The app screen shows the newest deployment as four rail stations (pull,
   rootfs, boot, health) derived from `status` + `phase`, and polls
   `getDeployment` every 1 s while it is pending, preparing or starting. There
@@ -191,21 +242,24 @@ src/
   api/            fetcher.ts (the mutator), client.ts (query client), auth-store.ts
   api/generated/  orval output (git-ignored, regenerated by `npm run generate`)
   components/     ui/ (button, dialog, field, input, textarea, select, banner), lamp,
-                  vm-bay, app-bay, deploy-rail, log-tape, tone-lamp, app-domains,
+                  vm-bay, app-bay, deploy-rail, build-rail, build-failure,
+                  build-log, build-view, log-tape, tone-lamp, app-domains,
                   app-env-dialog, secret-once, copy-button, scope-picker,
                   selector-editor, identity-name, session-room, xterm-view,
                   agent-*, grant-*, approval-*, audit-*, webhook-*
-  lib/            lamp.ts, app-status.ts, deploy-flow.ts, log-buffer.ts, problem.ts,
+  lib/            lamp.ts, app-status.ts, build-status.ts, build-log.ts,
+                  source-form.ts, deploy-flow.ts, log-buffer.ts, problem.ts,
                   slug.ts, capabilities.ts, scopes.ts, interactive.ts,
                   agency-format.ts, agents.ts, grants.ts, approvals.ts, audit.ts,
                   webhooks.ts (each with a test where pure)
-  mocks/          db.ts, http.ts, agency.ts, handlers.ts, handlers-<area>.ts,
-                  browser.ts (mock mode only)
-  screens/        apps-screen.tsx, deploy-screen.tsx, app-screen.tsx, vms-screen.tsx,
-                  terminal-screen.tsx, console-screen.tsx,
-                  agents-screen.tsx, agent-screen.tsx, grants-screen.tsx,
-                  approvals-screen.tsx, audit-screen.tsx, webhooks-screen.tsx,
-                  webhook-screen.tsx, login-screen.tsx, setup-screen.tsx
+  mocks/          db.ts, builds.ts, http.ts, agency.ts, handlers.ts,
+                  handlers-builds.ts, handlers-<area>.ts, browser.ts (mock only)
+  screens/        apps-screen.tsx, deploy-screen.tsx, app-screen.tsx,
+                  build-screen.tsx, vms-screen.tsx, terminal-screen.tsx,
+                  console-screen.tsx, agents-screen.tsx, agent-screen.tsx,
+                  grants-screen.tsx, approvals-screen.tsx, audit-screen.tsx,
+                  webhooks-screen.tsx, webhook-screen.tsx, login-screen.tsx,
+                  setup-screen.tsx
 mock-public/      mockServiceWorker.js, served only in mock mode
 ```
 
@@ -213,7 +267,13 @@ mock-public/      mockServiceWorker.js, served only in mock mode
 ring and core tones, the pulse, the caption and the list's convergence check.
 `src/lib/app-status.ts` maps `app.status` to the app lamp, derives the four
 deployment stations, names certificate states, picks the default node and
-formats relative change times. `src/lib/deploy-flow.ts` holds the deploy step
-order and the app-name derivation. `src/lib/log-buffer.ts` holds the 2000-line
-cap, SSE frame writer/parser used by the mock, local time formatting and the
-`Problem`-from-SSE conversion. Each has a vitest file next to it.
+formats relative change times. `src/lib/build-status.ts` does the same for a
+build: the phase rail, the lamp, the commit, the duration and the "built image"
+label. `src/lib/build-log.ts` parses the build stream's frames, orders lines by
+`seq` across a resume and finds the failing line in an excerpt.
+`src/lib/source-form.ts` checks the Git source and derives the app name from the
+repository. `src/lib/deploy-flow.ts` holds the deploy step order (an image ends
+in a deployment, a Git source in its first build) and the app-name derivation.
+`src/lib/log-buffer.ts` holds the 2000-line cap, SSE frame writer/parser used by
+the mock, local time formatting and the `Problem`-from-SSE conversion. Each has
+a vitest file next to it.

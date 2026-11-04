@@ -1,6 +1,9 @@
 import type {
   App,
   AppEnvVar,
+  AppSource,
+  Build,
+  BuildLogLine,
   Deployment,
   DeploymentLogEntry,
   Domain,
@@ -53,6 +56,8 @@ export interface MockDb {
   apps: App[];
   deployments: Deployment[];
   deploymentLogs: Record<string, DeploymentLogEntry[]>;
+  builds: Build[];
+  buildLogs: Record<string, BuildLogLine[]>;
   domains: Domain[];
   appEnv: Record<string, AppEnvVar[]>;
 }
@@ -91,6 +96,8 @@ export const db: MockDb = {
   apps: [],
   deployments: [],
   deploymentLogs: {},
+  builds: [],
+  buildLogs: {},
   domains: [],
   appEnv: {},
 };
@@ -371,6 +378,217 @@ const seed = (): void => {
     { app_id: appId, name: 'SITE_NAME', updated_at: createdAt },
     { app_id: appId, name: 'LOG_LEVEL', updated_at: createdAt },
   ];
+
+  seedGitApp(createdAt);
+};
+
+const seedBuildLog = (
+  buildId: string,
+  lines: ReadonlyArray<{ vertex: number | null; line: string; stream?: BuildLogLine['stream'] }>,
+): void => {
+  db.buildLogs[buildId] = lines.map((entry, index) => ({
+    seq: index + 1,
+    time: now(),
+    stream: entry.stream ?? 'stdout',
+    vertex: entry.vertex,
+    line: entry.line,
+  }));
+};
+
+/** A second app that builds from a public repository, with both outcomes. */
+const seedGitApp = (createdAt: string): void => {
+  const project: Project = {
+    id: mockId('prj'),
+    slug: 'docs',
+    name: 'Docs',
+    created_at: createdAt,
+    updated_at: createdAt,
+  };
+  db.projects.push(project);
+
+  const appId = mockId('app');
+  const succeededBuildId = mockId('bld');
+  const failedBuildId = mockId('bld');
+  const deploymentId = mockId('dep');
+  const instanceId = mockId('vm');
+
+  const source: AppSource = {
+    kind: 'git',
+    repo_url: 'https://github.com/example/docs-site.git',
+    ref: 'main',
+    dockerfile_path: 'Dockerfile',
+    context_dir: '.',
+    target: null,
+    build_args: [{ name: 'NODE_ENV', value: 'production' }],
+    secrets: ['NPM_TOKEN'],
+  };
+  const builtImage = `build.quoro.invalid/${appId}:${succeededBuildId}`;
+  const successCommit = '4f2c9a1b2c3d4e5f60718293a4b5c6d7e8f90123';
+  const failedCommit = '9a8b7c6d5e4f3021a9b8c7d6e5f40312a1b2c3d4';
+  const successFinishedAt = new Date(Date.parse(createdAt) + 4_250).toISOString();
+  const failedFinishedAt = new Date(Date.parse(createdAt) + 2_400).toISOString();
+  const failedError =
+    'process "/bin/sh -c ls /does-not-exist" did not complete successfully: exit code: 2';
+
+  db.apps.push({
+    id: appId,
+    project_id: project.id,
+    name: 'docs-site',
+    stateful: false,
+    ha_policy: 'none',
+    image: builtImage,
+    source,
+    port: 3000,
+    health_check: { path: '/', interval_s: 10, timeout_s: 2, failures: 3 },
+    resources: { vcpus: 1, memory_mb: 512, disk_gb: 2 },
+    placement: { node_ids: [db.node.id] },
+    status: 'running',
+    current_deployment_id: deploymentId,
+    restart_generation: 0,
+    created_at: createdAt,
+    updated_at: createdAt,
+  });
+
+  db.deployments.push({
+    id: deploymentId,
+    app_id: appId,
+    image: builtImage,
+    image_digest:
+      'sha256:2a7d1c4e8f0b3d6a9c2e5f8b1d4a7c0e3f6b9d2a5c8e1f4b7d0a3c6e9f2b5d8a',
+    status: 'succeeded',
+    phase: 'health',
+    error: null,
+    trigger: 'build',
+    created_by_type: 'system',
+    created_by_id: 'system',
+    created_at: createdAt,
+    finished_at: createdAt,
+  });
+  db.deploymentLogs[deploymentId] = [
+    { time: createdAt, phase: 'pull', message: `Pulling ${builtImage}` },
+    { time: createdAt, phase: 'rootfs', message: 'Preparing the root filesystem' },
+    { time: createdAt, phase: 'boot', message: 'Booting the microVM' },
+    { time: createdAt, phase: 'health', message: 'Health check passed; the app is running' },
+  ];
+
+  db.vms.push({
+    id: instanceId,
+    project_id: project.id,
+    app_id: appId,
+    node_id: db.node.id,
+    name: 'docs-site-1',
+    vcpus: 1,
+    memory_mb: 512,
+    disk_gb: 2,
+    image: builtImage,
+    desired_status: 'running',
+    observed_status: 'running',
+    ip: '10.0.0.22',
+    restart_generation: 0,
+    restart_count: 0,
+    last_exit_code: null,
+    created_at: createdAt,
+    updated_at: createdAt,
+  });
+
+  db.appEnv[appId] = [
+    { app_id: appId, name: 'NPM_TOKEN', updated_at: createdAt },
+    { app_id: appId, name: 'NODE_ENV', updated_at: createdAt },
+  ];
+
+  db.builds.push({
+    id: succeededBuildId,
+    app_id: appId,
+    node_id: db.node.id,
+    source,
+    status: 'succeeded',
+    commit: successCommit,
+    image: builtImage,
+    image_digest:
+      'sha256:2a7d1c4e8f0b3d6a9c2e5f8b1d4a7c0e3f6b9d2a5c8e1f4b7d0a3c6e9f2b5d8a',
+    failed_phase: null,
+    error: null,
+    failed_step: null,
+    deployment_id: deploymentId,
+    trigger: 'api',
+    created_by_type: 'system',
+    created_by_id: 'system',
+    created_at: createdAt,
+    started_at: createdAt,
+    finished_at: successFinishedAt,
+  });
+  seedBuildLog(succeededBuildId, [
+    { vertex: 1, line: '#1 [internal] load build definition from Dockerfile' },
+    { vertex: 1, line: '#1 transferring dockerfile: 412B done' },
+    { vertex: 2, line: '#2 [internal] load metadata for docker.io/library/node:22-alpine' },
+    { vertex: 3, line: '#3 [1/4] FROM docker.io/library/node:22-alpine' },
+    { vertex: 3, line: '#3 DONE 0.0s' },
+    { vertex: 4, line: '#4 [2/4] COPY package.json package-lock.json ./' },
+    { vertex: 4, line: '#4 DONE 0.1s' },
+    { vertex: 5, line: '#5 [3/4] RUN npm ci' },
+    { vertex: 5, line: '#5 DONE 2.4s' },
+    { vertex: 6, line: '#6 [4/4] RUN npm run build' },
+    { vertex: 6, line: '#6 DONE 1.8s' },
+    { vertex: null, line: '#7 exporting to oci image format' },
+    { vertex: null, line: '#7 exporting layers' },
+    { vertex: null, line: '#7 writing image sha256:2a7d1c4e8f0b3d6a9c2e5f8b1d4a7c0e3f6b9d2a5c8e1f4b7d0a3c6e9f2b5d8a' },
+    { vertex: null, line: '#7 DONE 0.4s' },
+  ]);
+
+  db.builds.push({
+    id: failedBuildId,
+    app_id: appId,
+    node_id: db.node.id,
+    source,
+    status: 'failed',
+    commit: failedCommit,
+    image: null,
+    image_digest: null,
+    failed_phase: 'building',
+    error: failedError,
+    failed_step: {
+      vertex: 5,
+      name: '[3/4] RUN ls /does-not-exist',
+      error: failedError,
+      dockerfile_line: 3,
+      excerpt: [
+        'Dockerfile:3',
+        '--------------------',
+        '   1 | FROM node:22-alpine',
+        '   2 |     RUN echo "step one ok"',
+        '   3 | >>> RUN ls /does-not-exist',
+        '--------------------',
+        `ERROR: failed to solve: ${failedError}`,
+      ],
+    },
+    deployment_id: null,
+    trigger: 'api',
+    created_by_type: 'system',
+    created_by_id: 'system',
+    created_at: createdAt,
+    started_at: createdAt,
+    finished_at: failedFinishedAt,
+  });
+  seedBuildLog(failedBuildId, [
+    { vertex: 1, line: '#1 [internal] load build definition from Dockerfile' },
+    { vertex: 1, line: '#1 transferring dockerfile: 412B done' },
+    { vertex: 2, line: '#2 [internal] load metadata for docker.io/library/node:22-alpine' },
+    { vertex: 3, line: '#3 [1/4] FROM docker.io/library/node:22-alpine' },
+    { vertex: 3, line: '#3 DONE 0.0s' },
+    { vertex: 4, line: '#4 [2/4] COPY package.json package-lock.json ./' },
+    { vertex: 4, line: '#4 DONE 0.1s' },
+    { vertex: 5, line: '#5 [3/4] RUN ls /does-not-exist' },
+    {
+      vertex: 5,
+      stream: 'stderr',
+      line: '#5 0.221 ls: /does-not-exist: No such file or directory',
+    },
+    {
+      vertex: 5,
+      stream: 'stderr',
+      line: `#5 ERROR: ${failedError}`,
+    },
+  ]);
 };
 
 seed();

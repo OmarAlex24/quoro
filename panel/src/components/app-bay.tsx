@@ -2,6 +2,7 @@ import { Link } from '@tanstack/react-router';
 import type { App } from '../api/generated/model';
 import { useListAppDomains } from '../api/generated/domains/domains';
 import { appLampState } from '../lib/app-status';
+import { builtImageLabel } from '../lib/build-status';
 import { ToneLamp } from './tone-lamp';
 
 /** One app as a rack bay: lamp well on the left, equipment plate on the right. */
@@ -11,6 +12,8 @@ export function AppBay({ app }: { app: App }) {
     query: { staleTime: 10_000, retry: false },
   });
   const hostname = domains.data?.items[0]?.hostname;
+  const image =
+    app.source != null ? (builtImageLabel(app.image) ?? 'Not built yet') : app.image;
 
   return (
     <article className="grid grid-cols-[56px_minmax(0,1fr)] overflow-hidden rounded-[6px] border border-rail bg-panel bay-shadow">
@@ -34,7 +37,7 @@ export function AppBay({ app }: { app: App }) {
             <p className="mt-0.5 text-[13px] leading-snug text-ink-muted">{lamp.caption}</p>
           ) : null}
           <p className="type-data mt-2 truncate text-[13px] text-ink">
-            {app.image} · port {app.port}
+            {image} · port {app.port}
           </p>
           <p className="type-data mt-0.5 truncate text-[13px] text-ink-muted">
             {hostname ?? 'No domain yet'}

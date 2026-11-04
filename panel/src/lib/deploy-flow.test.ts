@@ -28,6 +28,12 @@ describe('deploySteps', () => {
       'deploy',
     ]);
   });
+
+  it('ends a Git app with its first build instead of a deployment', () => {
+    const steps = deploySteps({ envCount: 1, hostname: '', build: true });
+    expect(steps.map((step) => step.key)).toEqual(['create', 'env', 'build']);
+    expect(steps[2]?.label).toBe('Starting the first build');
+  });
 });
 
 describe('deriveAppName', () => {

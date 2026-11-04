@@ -5,6 +5,7 @@ import {
   shortDeploymentId,
   stationTone,
 } from '../lib/app-status';
+import { builtImageLabel } from '../lib/build-status';
 import { ToneLamp } from './tone-lamp';
 
 const stationWords = {
@@ -32,7 +33,7 @@ export function DeployRail({
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <p className="type-data text-[13px] text-ink-muted">
           Deployment <span title={deployment.id}>{shortDeploymentId(deployment.id)}</span> ·{' '}
-          {deployment.image}
+          {builtImageLabel(deployment.image) ?? deployment.image}
         </p>
         <p className="type-data text-[13px] text-ink-muted">{deployment.status}</p>
       </div>
