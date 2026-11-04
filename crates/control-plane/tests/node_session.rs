@@ -721,3 +721,27 @@ async fn the_welcome_carries_the_advertised_urls() {
         .collect();
     assert_eq!(urls, &expected, "{welcome}");
 }
+
+#[tokio::test]
+async fn a_hello_mesh_key_is_stored_with_a_mesh_address() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, "node-mesh").await;
+    let key = "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=";
+    let mut socket = connect(&server, &node.credential).await;
+    let NodeMessage::Hello(mut body) = hello(&node.node_id) else {
+        unreachable!("hello() builds a hello");
+    };
+    body.mesh_public_key = Some(key.to_string());
+    send(&mut socket, NodeMessage::Hello(body)).await;
+    let _welcome = recv_type(&mut socket, "welcome").await;
+
+    let (stored, address): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT mesh_public_key, mesh_address FROM nodes WHERE id = ?")
+            .bind(&node.node_id)
+            .fetch_one(server.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(stored.as_deref(), Some(key));
+    assert_eq!(address.as_deref(), Some("10.43.0.1"));
+}

@@ -50,7 +50,7 @@ use sha2::{Digest, Sha256};
 
 use crate::EngineError;
 use crate::ch::tools::{self, HostTools};
-use crate::{MacAddr, NodeNetwork, VmId};
+use crate::{MESH_MARK, MacAddr, NodeNetwork, VmId};
 
 /// Where Linux exposes one directory per network interface.
 const SYS_CLASS_NET: &str = "/sys/class/net";
@@ -247,6 +247,10 @@ pub fn ruleset(bridge: &str, subnet: &Subnet, dns: &[Ipv4Addr]) -> String {
         "        iifname \"{bridge}\" meta mark {EGRESS_MARK:#010x} ip daddr {subnet} drop"
     );
     let _ = writeln!(rules, "        iifname \"{bridge}\" accept");
+    let _ = writeln!(
+        rules,
+        "        oifname \"{bridge}\" meta mark {MESH_MARK:#010x} accept"
+    );
     let _ = writeln!(
         rules,
         "        oifname \"{bridge}\" ct state established,related accept"
@@ -790,6 +794,7 @@ table ip quoro_qw5br0 {
         iifname \"qw5br0\" meta mark 0x51550088 ip daddr 169.254.0.0/16 drop
         iifname \"qw5br0\" meta mark 0x51550088 ip daddr 10.99.5.0/24 drop
         iifname \"qw5br0\" accept
+        oifname \"qw5br0\" meta mark 0x5155008c accept
         oifname \"qw5br0\" ct state established,related accept
         oifname \"qw5br0\" drop
     }

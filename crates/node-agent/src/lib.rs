@@ -19,6 +19,7 @@ pub mod interactive;
 pub mod lease;
 pub mod localkey;
 pub mod logs;
+pub mod mesh;
 pub mod metrics;
 pub mod reconcile;
 pub mod session;

@@ -247,6 +247,8 @@ pub struct Session {
     dns: Option<Arc<DnsBridge>>,
     /// The metric rings, when the agent samples metrics (section 5.17).
     metrics: Option<MetricsRing>,
+    /// The machine's WireGuard public key, reported in `hello` (section 6.9).
+    mesh_public_key: Option<String>,
     /// The engine handles behind `terminal` and `console` streams (M4), when
     /// the agent runs one.
     interactive: Option<Interactive>,
@@ -283,6 +285,7 @@ impl Session {
             ingress: None,
             dns: None,
             metrics: None,
+            mesh_public_key: None,
             interactive: None,
             builds,
             dialed_url: None,
@@ -312,6 +315,15 @@ impl Session {
     #[must_use]
     pub fn with_metrics(mut self, metrics: MetricsRing) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Reports the machine's WireGuard public key in `hello` (section 6.9).
+    /// Only the public key is ever sent; the private key never leaves the
+    /// machine.
+    #[must_use]
+    pub fn with_mesh_key(mut self, public_key: String) -> Self {
+        self.mesh_public_key = Some(public_key);
         self
     }
 
@@ -1373,7 +1385,7 @@ impl Session {
             allocated: self.allocated(),
             kvm: self.facts.kvm.clone(),
             dropped_events,
-            mesh_public_key: None,
+            mesh_public_key: self.mesh_public_key.clone(),
         })
     }
 

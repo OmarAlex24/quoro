@@ -570,6 +570,15 @@ pub struct HostProbe {
 
 pub mod fake;
 
+/// The packet mark the node agent sets on mesh traffic it admits: TCP from
+/// the edge's mesh address to one backend's guest address and port
+/// (`node-agent-protocol.md` section 6.9, ADR 0144). The engine's `forward`
+/// chain lets a marked packet onto the bridge; everything else arriving from
+/// outside the bridge stays dropped unless it answers a guest's own
+/// connection. The node agent owns the mesh interface and the rules that set
+/// the mark; the engine only honours it (`engine-trait.md` section 3.3).
+pub const MESH_MARK: u32 = 0x5155_008c;
+
 /// Pinned Cloud Hypervisor and guest kernel artifacts, verified by sha256.
 #[cfg(target_os = "linux")]
 pub mod pins;
