@@ -23,8 +23,9 @@
 //! starts with [`CAPACITY_ERROR_PREFIX`], so the build manager can queue it
 //! again later; no new public type carries that distinction.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::Ipv4Addr;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -38,6 +39,8 @@ use quoro_engine::{
     WorkDisk,
 };
 use quoro_proto::wire::{BuildPhase, FailedStep, LogStream};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, watch};
 
 use super::progress::ProgressParser;
@@ -80,6 +83,17 @@ const MAX_ARG_BYTES: usize = 64 * 1024;
 const MAX_ARGS: usize = 256;
 /// One byte in a gibibyte.
 const GIB: u64 = 1024 * 1024 * 1024;
+/// The marker a completed source-disk write leaves in the run directory, so a
+/// retry after a capacity refusal can reuse the prepared source.
+const SOURCE_MARKER: &str = "source.json";
+
+/// What [`SOURCE_MARKER`] records: the commit the source resolved to and a
+/// digest of the build's secrets, both validated before a retry reuses them.
+#[derive(Debug, Deserialize, Serialize)]
+struct SourceMarker {
+    commit: String,
+    secrets_sha256: String,
+}
 
 /// Everything the builder needs from the node.
 #[derive(Clone, Debug)]
@@ -339,6 +353,18 @@ impl<E: Engine + 'static> DockerfileBuilder<E> {
         .await;
     }
 
+    /// Records the resolved commit and the secrets digest for a later retry.
+    /// A marker that cannot be written only costs the next attempt a fetch.
+    fn record_source(&self, run_dir: &Path, commit: &str, digest: &str) {
+        let marker = SourceMarker {
+            commit: commit.to_owned(),
+            secrets_sha256: digest.to_owned(),
+        };
+        if let Err(error) = write_source_marker(run_dir, &marker) {
+            tracing::warn!(%error, "could not record the prepared build source");
+        }
+    }
+
     /// Stops the builder VM with a forced stop, best effort.
     async fn stop_vm(&self, id: &VmId) {
         if let Err(error) = self.engine.stop(id, StopMode::Force).await {
@@ -393,7 +419,20 @@ impl<E: Engine + 'static> Builder for DockerfileBuilder<E> {
         cancel: watch::Receiver<bool>,
     ) -> Result<BuildOutput, BuildFailure> {
         let mut cancel = cancel;
-        self.phase(&events, BuildPhase::Preparing).await;
+        let run_dir = self.run_dir(&spec.build_id);
+        // A run directory a capacity refusal left behind carries a marker once
+        // its source disk was written. Reusing it keeps the fetch and the disk
+        // write out of every retry, and keeps the retry quiet: no phase event
+        // until the builder VM actually exists.
+        let marker = if valid_id(&spec.build_id, "bld_") {
+            read_source_marker(&run_dir)
+        } else {
+            None
+        };
+        let quiet = marker.is_some();
+        if !quiet {
+            self.phase(&events, BuildPhase::Preparing).await;
+        }
 
         let plan = match validate_spec(spec) {
             Ok(plan) => plan,
@@ -403,46 +442,80 @@ impl<E: Engine + 'static> Builder for DockerfileBuilder<E> {
             return Err(failure(BuildPhase::Preparing, error, None, false));
         }
 
-        // 1. The source: resolve the ref, then write the source disk.
-        let Some(git) = self.config.git.clone() else {
-            return Err(failure(
-                BuildPhase::Preparing,
-                "git is not installed on this node".to_owned(),
-                None,
-                false,
-            ));
-        };
-        let BuildSource::Git { url, git_ref } = &spec.source;
-        self.line(&events, format!("fetching {url} {git_ref}"))
-            .await;
-        let repo = self.run_dir(&spec.build_id).join("repo.git");
-        // A cancel during the fetch drops it, which kills Git.
-        let commit = tokio::select! {
-            fetched = fetch_commit(&git, url, git_ref, &repo, self.config.fetch_timeout) => {
-                match fetched {
-                    Ok(commit) => commit,
-                    Err(error) => return Err(failure(BuildPhase::Preparing, error, None, false)),
+        // 1. The source: reuse a prepared one, or resolve the ref and write the
+        // source disk. The marker is only written after that write succeeded.
+        let source_disk = run_dir.join("src.disk");
+        let commit = if let Some(marker) = marker {
+            let commit = marker.commit;
+            let digest = secrets_digest(&spec.secrets);
+            if digest != marker.secrets_sha256 {
+                // The secrets changed: the kept repository can write the new
+                // source disk for the recorded commit without another fetch.
+                let Some(git) = self.config.git.clone() else {
+                    return Err(failure(
+                        BuildPhase::Preparing,
+                        "git is not installed on this node".to_owned(),
+                        None,
+                        false,
+                    ));
+                };
+                let repo = run_dir.join("repo.git");
+                tokio::select! {
+                    written = write_source_disk(&git, &repo, &commit, &spec.secrets, &source_disk) => {
+                        if let Err(error) = written {
+                            return Err(failure(BuildPhase::Preparing, error, None, false));
+                        }
+                    }
+                    () = wait_cancel(&mut cancel) => return Err(cancelled(BuildPhase::Preparing)),
                 }
+                self.record_source(&run_dir, &commit, &digest);
             }
-            () = wait_cancel(&mut cancel) => return Err(cancelled(BuildPhase::Preparing)),
-        };
-        self.line(&events, format!("resolved {commit}")).await;
-        self.emit(&events, BuildEvent::Commit(commit.clone())).await;
-        if *cancel.borrow() {
-            return Err(cancelled(BuildPhase::Preparing));
-        }
+            // Silent on purpose: the row keeps the commit, the log does not
+            // grow a line per retry.
+            self.emit(&events, BuildEvent::Commit(commit.clone())).await;
+            commit
+        } else {
+            let Some(git) = self.config.git.clone() else {
+                return Err(failure(
+                    BuildPhase::Preparing,
+                    "git is not installed on this node".to_owned(),
+                    None,
+                    false,
+                ));
+            };
+            let BuildSource::Git { url, git_ref } = &spec.source;
+            self.line(&events, format!("fetching {url} {git_ref}"))
+                .await;
+            let repo = run_dir.join("repo.git");
+            // A cancel during the fetch drops it, which kills Git.
+            let commit = tokio::select! {
+                fetched = fetch_commit(&git, url, git_ref, &repo, self.config.fetch_timeout) => {
+                    match fetched {
+                        Ok(commit) => commit,
+                        Err(error) => return Err(failure(BuildPhase::Preparing, error, None, false)),
+                    }
+                }
+                () = wait_cancel(&mut cancel) => return Err(cancelled(BuildPhase::Preparing)),
+            };
+            self.line(&events, format!("resolved {commit}")).await;
+            self.emit(&events, BuildEvent::Commit(commit.clone())).await;
+            if *cancel.borrow() {
+                return Err(cancelled(BuildPhase::Preparing));
+            }
 
-        self.line(&events, "writing the source disk".to_owned())
-            .await;
-        let source_disk = self.run_dir(&spec.build_id).join("src.disk");
-        tokio::select! {
-            written = write_source_disk(&git, &repo, &commit, &spec.secrets, &source_disk) => {
-                if let Err(error) = written {
-                    return Err(failure(BuildPhase::Preparing, error, None, false));
+            self.line(&events, "writing the source disk".to_owned())
+                .await;
+            tokio::select! {
+                written = write_source_disk(&git, &repo, &commit, &spec.secrets, &source_disk) => {
+                    if let Err(error) = written {
+                        return Err(failure(BuildPhase::Preparing, error, None, false));
+                    }
                 }
+                () = wait_cancel(&mut cancel) => return Err(cancelled(BuildPhase::Preparing)),
             }
-            () = wait_cancel(&mut cancel) => return Err(cancelled(BuildPhase::Preparing)),
-        }
+            self.record_source(&run_dir, &commit, &secrets_digest(&spec.secrets));
+            commit
+        };
 
         // 2. The output disk: an empty sparse file of the output limit.
         let output_disk = self.run_dir(&spec.build_id).join("out.disk");
@@ -450,15 +523,18 @@ impl<E: Engine + 'static> Builder for DockerfileBuilder<E> {
             return Err(failure(BuildPhase::Preparing, error, None, false));
         }
 
-        // 3. The builder image, cached after the first build.
-        self.line(
-            &events,
-            format!(
-                "preparing the builder image {}",
-                self.config.image.reference
-            ),
-        )
-        .await;
+        // 3. The builder image, cached after the first build. A retry of a
+        // waiting build stays quiet about it: the line was already written.
+        if !quiet {
+            self.line(
+                &events,
+                format!(
+                    "preparing the builder image {}",
+                    self.config.image.reference
+                ),
+            )
+            .await;
+        }
         let prepared = match self.engine.prepare_image(&self.config.image).await {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -496,6 +572,11 @@ impl<E: Engine + 'static> Builder for DockerfileBuilder<E> {
                     false,
                 ));
             }
+        }
+
+        // A quiet retry only now leaves `queued`: the VM it waited for exists.
+        if quiet {
+            self.phase(&events, BuildPhase::Preparing).await;
         }
 
         // 5. Subscribe before boot, so the whole output is seen.
@@ -892,6 +973,63 @@ fn create_sparse(path: &Path, gb: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// A SHA-256 of the build's secrets, names and values as the spec gave them,
+/// with length prefixes so no pair of entries can collide by concatenation.
+fn secrets_digest(secrets: &BTreeMap<String, String>) -> String {
+    let mut hasher = Sha256::new();
+    for (name, value) in secrets {
+        hasher.update(u64::try_from(name.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    crate::util::hex(&hasher.finalize())
+}
+
+/// True for a full lowercase commit SHA.
+fn is_commit(text: &str) -> bool {
+    text.len() == 40
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Reads a reusable [`SourceMarker`] from `run_dir`. `None` for anything the
+/// builder cannot trust: a missing or unreadable marker, a malformed commit or
+/// digest, or a source disk that is no longer there.
+fn read_source_marker(run_dir: &Path) -> Option<SourceMarker> {
+    if !run_dir.join("src.disk").is_file() {
+        return None;
+    }
+    let data = fs::read(run_dir.join(SOURCE_MARKER)).ok()?;
+    let marker: SourceMarker = serde_json::from_slice(&data).ok()?;
+    let digest_ok = marker.secrets_sha256.len() == 64
+        && marker
+            .secrets_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if !is_commit(&marker.commit) || !digest_ok {
+        return None;
+    }
+    Some(marker)
+}
+
+/// Writes the marker, mode `0600`, only after the source disk was written.
+fn write_source_marker(run_dir: &Path, marker: &SourceMarker) -> Result<(), String> {
+    let path = run_dir.join(SOURCE_MARKER);
+    let data =
+        serde_json::to_vec(marker).map_err(|e| format!("could not serialize {path:?}: {e}"))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| format!("could not create {path:?}: {e}"))?;
+    file.write_all(&data)
+        .map_err(|e| format!("could not write {path:?}: {e}"))
+}
+
 /// The first installed `git` of the usual locations.
 #[must_use]
 pub fn find_git() -> Option<PathBuf> {
@@ -1189,6 +1327,38 @@ mod tests {
             url: format!("file://{}", work.display()),
             root,
         })
+    }
+
+    /// A `git` wrapper that appends each subcommand it runs to a counter file,
+    /// so a test can count fetches and archives, then runs the real Git.
+    fn git_wrapper(root: &Path) -> PathBuf {
+        let git = find_git().expect("git is installed");
+        let counter = root.join("git-calls.log");
+        let wrapper = root.join("git-wrapper.sh");
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do\n  case \"$a\" in\n    fetch|archive) echo \"$a\" >> '{}' ;;\n  esac\ndone\nexec '{}' \"$@\"\n",
+                counter.display(),
+                git.display()
+            ),
+        )
+        .expect("a git wrapper");
+        let mut permissions = fs::metadata(&wrapper)
+            .expect("wrapper metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&wrapper, permissions).expect("an executable wrapper");
+        wrapper
+    }
+
+    /// How many times a wrapper recorded `subcommand`.
+    fn git_calls(root: &Path, subcommand: &str) -> usize {
+        fs::read_to_string(root.join("git-calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| *line == subcommand)
+            .count()
     }
 
     fn config(root: &Path) -> BuilderConfig {
@@ -1844,6 +2014,212 @@ mod tests {
         assert_eq!(failure.phase, BuildPhase::Preparing);
         assert_eq!(failure.error, "node capacity: no room for another VM");
         assert!(!failure.cancelled);
+        let _ = fs::remove_dir_all(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn capacity_refusals_fetch_once_and_reuse_the_source() {
+        let Some(fixture) = fixture("reuse") else {
+            eprintln!("skipping: git is not installed");
+            return;
+        };
+        let engine = Arc::new(FakeEngine::new());
+        for _ in 0..3 {
+            engine.fail_next(
+                FakeOp::Create,
+                EngineError::ResourceExhausted("no room for another VM".to_owned()),
+            );
+        }
+        let mut config = config(&fixture.root);
+        config.git = Some(git_wrapper(&fixture.root));
+        let builder = DockerfileBuilder::new(Arc::clone(&engine), config);
+        let spec = build_spec(&fixture.url);
+        let mut commits = Vec::new();
+
+        for attempt in 0..3 {
+            let (events, mut receiver) = mpsc::channel(64);
+            let (_cancel, cancel_rx) = watch::channel(false);
+            let failure = builder
+                .build(&spec, events, cancel_rx)
+                .await
+                .expect_err("the node is full");
+            assert!(
+                failure.error.starts_with(CAPACITY_ERROR_PREFIX),
+                "{}",
+                failure.error
+            );
+            let mut lines = Vec::new();
+            let mut commit_events = 0;
+            while let Ok(event) = receiver.try_recv() {
+                match event {
+                    BuildEvent::Commit(commit) => {
+                        commit_events += 1;
+                        commits.push(commit);
+                    }
+                    BuildEvent::Line { text, .. } => lines.push(text),
+                    BuildEvent::Phase(_) => {}
+                }
+            }
+            if attempt == 0 {
+                assert!(lines.iter().any(|line| line.starts_with("fetching ")));
+            } else {
+                assert!(
+                    lines.iter().all(|line| !line.starts_with("fetching ")
+                        && !line.starts_with("resolved ")
+                        && line != "writing the source disk"
+                        && !line.starts_with("preparing the builder image")),
+                    "a retry writes no repeated preparing line: {lines:?}"
+                );
+                // The silent commit event keeps the row's commit up to date.
+                assert_eq!(commit_events, 1);
+            }
+        }
+
+        assert_eq!(
+            git_calls(&fixture.root, "fetch"),
+            1,
+            "the ref is fetched once"
+        );
+        assert_eq!(commits.len(), 3);
+        assert!(commits.iter().all(|commit| commit == &commits[0]));
+        let run_dir = fixture.root.join("builds/run").join(BUILD_ID);
+        assert!(
+            run_dir.join("src.disk").is_file(),
+            "the source disk is kept"
+        );
+        assert!(
+            run_dir.join(SOURCE_MARKER).is_file(),
+            "the marker records the prepared source"
+        );
+        let _ = fs::remove_dir_all(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn changed_secrets_rewrite_only_the_source_disk() {
+        let Some(fixture) = fixture("secrets") else {
+            eprintln!("skipping: git is not installed");
+            return;
+        };
+        let engine = Arc::new(FakeEngine::new());
+        engine.fail_next(
+            FakeOp::Create,
+            EngineError::ResourceExhausted("no room".to_owned()),
+        );
+        let mut config = config(&fixture.root);
+        config.git = Some(git_wrapper(&fixture.root));
+        let builder = DockerfileBuilder::new(Arc::clone(&engine), config);
+        let mut spec = build_spec(&fixture.url);
+        spec.secrets.insert("token".to_owned(), "one".to_owned());
+        let (events, _receiver) = mpsc::channel(64);
+        let (_cancel, cancel_rx) = watch::channel(false);
+        builder
+            .build(&spec, events, cancel_rx)
+            .await
+            .expect_err("the node is full");
+
+        engine.fail_next(
+            FakeOp::Create,
+            EngineError::ResourceExhausted("no room".to_owned()),
+        );
+        spec.secrets.insert("token".to_owned(), "two".to_owned());
+        let (events, mut receiver) = mpsc::channel(64);
+        let (_cancel, cancel_rx) = watch::channel(false);
+        builder
+            .build(&spec, events, cancel_rx)
+            .await
+            .expect_err("the node is still full");
+
+        assert_eq!(
+            git_calls(&fixture.root, "fetch"),
+            1,
+            "the changed secrets need no fetch"
+        );
+        assert_eq!(
+            git_calls(&fixture.root, "archive"),
+            2,
+            "the source disk is rewritten from the kept repository"
+        );
+        let mut lines = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            if let BuildEvent::Line { text, .. } = event {
+                lines.push(text);
+            }
+        }
+        assert!(
+            lines.iter().all(|line| line != "writing the source disk"
+                && !line.starts_with("fetching ")
+                && !line.starts_with("resolved ")),
+            "the rewrite is quiet: {lines:?}"
+        );
+        let _ = fs::remove_dir_all(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn a_waiting_build_uses_the_prepared_source_and_succeeds() {
+        let Some(fixture) = fixture("reuse-success") else {
+            eprintln!("skipping: git is not installed");
+            return;
+        };
+        let engine = Arc::new(FakeEngine::new());
+        engine.fail_next(
+            FakeOp::Create,
+            EngineError::ResourceExhausted("no room".to_owned()),
+        );
+        let mut config = config(&fixture.root);
+        config.git = Some(git_wrapper(&fixture.root));
+        let builder = Arc::new(DockerfileBuilder::new(Arc::clone(&engine), config));
+        let spec = build_spec(&fixture.url);
+
+        let (events, _receiver) = mpsc::channel(64);
+        let (_cancel, cancel_rx) = watch::channel(false);
+        let failure = builder
+            .build(&spec, events, cancel_rx)
+            .await
+            .expect_err("the first attempt waits");
+        assert!(failure.error.starts_with(CAPACITY_ERROR_PREFIX));
+
+        let (events, mut receiver) = mpsc::channel(1024);
+        let (_cancel, cancel_rx) = watch::channel(false);
+        let inner = Arc::clone(&builder);
+        let task = tokio::spawn(async move { inner.build(&spec, events, cancel_rx).await });
+        let id = VmId(BUILD_ID.to_owned());
+        wait_for_vm(&engine, &id).await;
+        wait_for_output_reader(&engine, &id).await;
+        wait_running(&engine, &id).await;
+        let layout = fixture
+            .root
+            .join("builds/run")
+            .join(BUILD_ID)
+            .join("out.disk");
+        fs::write(&layout, {
+            let mut bytes = layout_tar(&index_json(&[MANIFEST]));
+            bytes.resize(1024 * 1024, 0);
+            bytes
+        })
+        .expect("the builder writes its layout");
+        engine.exit_app(&id, 0);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let output = task.await.expect("the task").expect("a build");
+
+        assert_eq!(output.layout.manifest_digest.0, MANIFEST);
+        assert_eq!(git_calls(&fixture.root, "fetch"), 1);
+        let mut lines = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            if let BuildEvent::Line { text, .. } = event {
+                lines.push(text);
+            }
+        }
+        assert!(
+            lines.iter().all(|line| !line.starts_with("fetching ")
+                && !line.starts_with("resolved ")
+                && line != "writing the source disk"
+                && !line.starts_with("preparing the builder image")),
+            "the admitted retry is quiet: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line == "starting the builder VM"),
+            "the retry logs where it actually starts: {lines:?}"
+        );
         let _ = fs::remove_dir_all(&fixture.root);
     }
 
