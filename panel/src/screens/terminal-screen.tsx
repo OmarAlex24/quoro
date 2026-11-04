@@ -73,6 +73,10 @@ export function TerminalScreen() {
       connect={() => createTerminalSession(app.id, { rows: 24, cols: 80 })}
       canConnect={canOpenTerminal(me)}
       deniedMessage="Only an owner or operator can open a web terminal: app:terminal is human-only in this release."
+      // The session lands on one of the app's instances; its id scopes the
+      // per-tab redeploy hint. With no instance the call conflicts anyway.
+      vmId={app.instances[0]?.id ?? app.id}
+      appId={app.id}
     />
   );
 }

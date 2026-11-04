@@ -1,10 +1,15 @@
 import { useMutation } from '@tanstack/react-query';
-import { useState, type ReactNode } from 'react';
+import { Link } from '@tanstack/react-router';
+import { useEffect, useState, type ReactNode } from 'react';
 import { endInteractiveSession } from '../api/generated/interactive/interactive';
 import type { InteractiveSessionTicket } from '../api/generated/model';
 import { isApiProblem } from '../api/fetcher';
 import {
+  clearRedeployHint,
   isSessionLive,
+  needsRedeploy,
+  readRedeployHint,
+  rememberRedeployHint,
   sessionStateText,
   type SessionViewState,
 } from '../lib/interactive';
@@ -40,6 +45,10 @@ export interface SessionRoomProps {
   canConnect: boolean;
   /** Why this identity cannot open it, shown in place of the controls. */
   deniedMessage: string;
+  /** The VM this session runs on; the redeploy hint is remembered per VM. */
+  vmId: string;
+  /** The app to redeploy, when the screen knows it. */
+  appId?: string;
 }
 
 /**
@@ -56,14 +65,25 @@ export function SessionRoom({
   connect,
   canConnect,
   deniedMessage,
+  vmId,
+  appId,
 }: SessionRoomProps) {
   const [ticket, setTicket] = useState<InteractiveSessionTicket | null>(null);
   const [view, setView] = useState<SessionViewState | null>(null);
   const [problem, setProblem] = useState<ProblemView | null>(null);
+  const [redeployHint, setRedeployHint] = useState(() => readRedeployHint(kind, vmId));
+
+  // A route can reuse the component for another VM; follow its hint.
+  useEffect(() => {
+    setRedeployHint(readRedeployHint(kind, vmId));
+  }, [kind, vmId]);
 
   const open = useMutation({
     mutationFn: connect,
     onSuccess: (opened) => {
+      // A redeploy made the VM current, so the old hint no longer applies.
+      clearRedeployHint(kind, vmId);
+      setRedeployHint(false);
       setProblem(null);
       setView({ phase: 'connecting' });
       setTicket(opened);
@@ -71,6 +91,12 @@ export function SessionRoom({
     onError: (error) => {
       setTicket(null);
       setView(null);
+      if (needsRedeploy(error, kind)) {
+        rememberRedeployHint(kind, vmId);
+        setRedeployHint(true);
+        setProblem(null);
+        return;
+      }
       setProblem(problemView(error, kind === 'terminal' ? 'open a terminal' : 'open the console'));
     },
   });
@@ -98,6 +124,12 @@ export function SessionRoom({
   const status = sessionStateText(view);
   const actionWords = view === null || live ? 'Connect' : 'Reconnect';
 
+  const retryAfterRedeploy = () => {
+    clearRedeployHint(kind, vmId);
+    setRedeployHint(false);
+    open.mutate();
+  };
+
   return (
     <main className="mx-auto w-full max-w-5xl px-4 py-6 sm:px-6 sm:py-8">
       <div className="mb-3">{back}</div>
@@ -120,25 +152,36 @@ export function SessionRoom({
           </div>
 
           {canConnect ? (
-            <div className="flex flex-wrap items-center gap-2">
-              {ticket && live ? (
-                <Button
-                  variant="secondary"
-                  disabled={end.isPending}
-                  onClick={() => end.mutate(ticket.id)}
-                >
-                  {end.isPending ? 'Ending…' : 'End session'}
-                </Button>
-              ) : (
-                <Button
-                  variant="primary"
-                  disabled={open.isPending}
-                  onClick={() => open.mutate()}
-                >
-                  {open.isPending ? 'Opening…' : actionWords}
-                </Button>
-              )}
-            </div>
+            redeployHint ? (
+              <Button
+                variant="secondary"
+                size="compact"
+                disabled={open.isPending}
+                onClick={retryAfterRedeploy}
+              >
+                {open.isPending ? 'Opening…' : 'Try again'}
+              </Button>
+            ) : (
+              <div className="flex flex-wrap items-center gap-2">
+                {ticket && live ? (
+                  <Button
+                    variant="secondary"
+                    disabled={end.isPending}
+                    onClick={() => end.mutate(ticket.id)}
+                  >
+                    {end.isPending ? 'Ending…' : 'End session'}
+                  </Button>
+                ) : (
+                  <Button
+                    variant="primary"
+                    disabled={open.isPending}
+                    onClick={() => open.mutate()}
+                  >
+                    {open.isPending ? 'Opening…' : actionWords}
+                  </Button>
+                )}
+              </div>
+            )
           ) : null}
         </div>
       </header>
@@ -147,6 +190,31 @@ export function SessionRoom({
         <p className="mt-3 rounded-[6px] border border-rail bg-panel px-3.5 py-2.5 text-[13px] leading-snug text-ink">
           {deniedMessage}
         </p>
+      ) : null}
+
+      {redeployHint ? (
+        <section className="mt-3 rounded-[6px] border border-rail bg-panel px-4 py-3.5 bay-shadow">
+          <h2 className="type-display-light text-[15px] leading-none text-ink">
+            Redeploy to enable {kind === 'terminal' ? 'the terminal' : 'the console'}
+          </h2>
+          <p className="mt-2 max-w-2xl text-[13px] leading-snug text-ink-muted">
+            This VM was created before the terminal and console existed. A restart keeps its
+            devices; a redeploy creates a new VM that has them.
+          </p>
+          {appId ? (
+            <Link
+              to="/apps/$appId"
+              params={{ appId }}
+              className="mt-3 inline-block text-[13px] text-cobalt underline underline-offset-4 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+            >
+              Open the app to redeploy
+            </Link>
+          ) : (
+            <p className="mt-2 text-[13px] leading-snug text-ink">
+              Recreate the VM to get a console.
+            </p>
+          )}
+        </section>
       ) : null}
 
       {problem ? <ProblemBanner view={problem} className="mt-3" /> : null}
@@ -187,9 +255,11 @@ export function SessionRoom({
                     : 'No console is attached.'}
               </p>
               <p className="max-w-md text-[13px] leading-snug text-[#7d8b9a]">
-                {kind === 'terminal'
-                  ? 'Connect to run a shell inside the app’s guest. The guest renders only through xterm.js.'
-                  : 'Connect to follow the VM’s serial console. It is read-only: kernel and init output, no input.'}
+                {redeployHint
+                  ? `This VM has no ${kind === 'terminal' ? 'terminal' : 'console'} device yet. ${appId ? 'Redeploy the app' : 'Recreate the VM'}, then try again.`
+                  : kind === 'terminal'
+                    ? 'Connect to run a shell inside the app’s guest. The guest renders only through xterm.js.'
+                    : 'Connect to follow the VM’s serial console. It is read-only: kernel and init output, no input.'}
               </p>
             </div>
           )}

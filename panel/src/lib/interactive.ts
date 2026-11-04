@@ -7,6 +7,8 @@
  * the WebSocket immediately after the POST and never shows or stores it.
  */
 
+import { isApiProblem } from '../api/fetcher';
+
 export const CLOSE_REASONS = [
   'exited',
   'ended_by_client',
@@ -148,6 +150,67 @@ export const sessionStateText = (state: SessionViewState | null): string => {
 
 export const isSessionLive = (state: SessionViewState | null): boolean =>
   state !== null && (state.phase === 'connecting' || state.phase === 'live');
+
+export type InteractiveKind = 'terminal' | 'console';
+
+/**
+ * The engine says a VM predates the interactive devices in the `detail` of a
+ * 409 `conflict` (ADR 0136). Other 409s (no running instance, VM not running,
+ * too many streams) keep their own messages and are not this case.
+ */
+const REDEPLOY_DETAIL: Record<InteractiveKind, string> = {
+  terminal: 'has no vsock device',
+  console: 'serial port is not a socket',
+};
+
+/** True when opening this kind of session failed because the VM predates M4. */
+export const needsRedeploy = (error: unknown, kind: InteractiveKind): boolean =>
+  isApiProblem(error) &&
+  error.status === 409 &&
+  error.code === 'conflict' &&
+  typeof error.detail === 'string' &&
+  error.detail.includes(REDEPLOY_DETAIL[kind]);
+
+const REDEPLOY_HINT_PREFIX = 'quoro.redeployHint';
+
+const redeployHintKey = (kind: InteractiveKind, vmId: string): string =>
+  `${REDEPLOY_HINT_PREFIX}.${kind}.${vmId}`;
+
+/**
+ * Session storage for one browser tab. Every access is guarded: private modes
+ * and embedded browsers may refuse it, and the panel then simply forgets.
+ */
+const redeployHintStorage = (): Storage | null => {
+  try {
+    return typeof window === 'undefined' ? null : window.sessionStorage;
+  } catch {
+    return null;
+  }
+};
+
+export const readRedeployHint = (kind: InteractiveKind, vmId: string): boolean => {
+  try {
+    return redeployHintStorage()?.getItem(redeployHintKey(kind, vmId)) === '1';
+  } catch {
+    return false;
+  }
+};
+
+export const rememberRedeployHint = (kind: InteractiveKind, vmId: string): void => {
+  try {
+    redeployHintStorage()?.setItem(redeployHintKey(kind, vmId), '1');
+  } catch {
+    // No storage means no memory; the 409 still shows the note this time.
+  }
+};
+
+export const clearRedeployHint = (kind: InteractiveKind, vmId: string): void => {
+  try {
+    redeployHintStorage()?.removeItem(redeployHintKey(kind, vmId));
+  } catch {
+    // Nothing to clear when storage is unavailable.
+  }
+};
 
 export interface LocationLike {
   protocol: string;

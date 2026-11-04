@@ -30,6 +30,15 @@ interface MockSession {
   close?: () => void;
 }
 
+/**
+ * One seeded VM behaves as if it was created before M4 (ADR 0136): no vsock
+ * device and a serial port that is a file. A stable name, so the hint can be
+ * seen with `npm run dev:mock` without touching the seed.
+ */
+const PRE_M4_VM_NAME = 'blog-1';
+
+const isPreM4Vm = (vm: Vm): boolean => vm.name === PRE_M4_VM_NAME;
+
 const sessions = new Map<string, MockSession>();
 
 const randomTicket = (): string => {
@@ -325,6 +334,11 @@ export const interactiveHandlers = [
         detail: 'The app has no running instance to open a terminal in.',
       });
     }
+    if (isPreM4Vm(vm)) {
+      return problem(409, 'conflict', {
+        detail: `conflict: VM ${vm.id} has no vsock device`,
+      });
+    }
 
     return json(openSession('terminal', vm), { status: 201 });
   }),
@@ -353,6 +367,11 @@ export const interactiveHandlers = [
     ) {
       return problem(422, 'validation_failed', {
         detail: 'tail_bytes must be a whole number between 0 and 1048576.',
+      });
+    }
+    if (isPreM4Vm(vm)) {
+      return problem(409, 'conflict', {
+        detail: `conflict: VM ${vm.id}'s serial port is not a socket`,
       });
     }
 
