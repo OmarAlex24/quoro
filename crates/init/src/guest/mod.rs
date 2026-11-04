@@ -12,6 +12,7 @@ mod app;
 mod console;
 mod diag;
 mod disks;
+mod exec;
 mod mounts;
 mod netlink;
 mod power;
@@ -28,6 +29,8 @@ use rustix::process::{Pid, WaitOptions, WaitStatus};
 
 /// Entry point of the guest init. Never returns: it powers the guest off.
 pub fn main() {
+    // The helper re-exec of an exec session must not touch any PID-1 state.
+    exec::run_helper_if_requested();
     match run() {
         Ok(code) => shutdown::exited(code),
         Err(fault) => shutdown::fatal(fault.code, &fault.message),
@@ -127,6 +130,13 @@ fn run() -> Result<i32, Fault> {
     })?;
     app::prepare_workdir(config.workdir.as_deref())?;
 
+    // The web terminal's listener: after the switch into the app's root, the
+    // network and the user, and before the app. A failure to listen only
+    // costs the terminal, never the boot.
+    if let Some(port) = config.exec_port {
+        exec::start(port, &config, &identity);
+    }
+
     let log = console::open_log(config.log_console);
     let mut child = app::spawn(&config, &identity, &program)?;
     diag::log(&format!("app started pid={}", child.id()));
@@ -202,9 +212,14 @@ fn supervise(app_pid: Pid, pumps: Option<console::Pumps>) -> i32 {
     loop {
         match rustix::process::wait(WaitOptions::empty()) {
             Ok(Some((pid, status))) => {
-                if pid == app_pid && code.is_none() {
-                    code = Some(exit_code(status));
-                    break;
+                if pid == app_pid {
+                    if code.is_none() {
+                        code = Some(exit_code(status));
+                        break;
+                    }
+                } else {
+                    // An exec session's helper; its thread waits on the status.
+                    exec::reaped(pid, status);
                 }
             }
             Ok(None) => break,
@@ -273,7 +288,10 @@ fn reap_remaining(budget: Duration) {
     let deadline = Instant::now() + budget;
     loop {
         match rustix::process::wait(WaitOptions::NOHANG) {
-            Ok(Some(_)) => continue,
+            Ok(Some((pid, status))) => {
+                exec::reaped(pid, status);
+                continue;
+            }
             Ok(None) => {
                 if Instant::now() >= deadline {
                     return;

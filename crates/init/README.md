@@ -150,6 +150,9 @@ returns `None` for an all-zero region.
     `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`) when it has
     no `/`; it must be a regular file with an execute bit, or the boot is a
     FATAL with code 127. The working directory is created (0755) if missing.
+    When the configuration is v2 and carries `exec_port`, the exec listener is
+    bound here, after the switch into the app's root and before the spawn
+    (below).
 11. **Spawn.** `std::process::Command` with `arg0`, the config env plus `HOME`
     and `PATH` defaults, the working directory, the resolved uid/gid, its own
     process group, `/dev/null` on stdin and pipes on stdout/stderr.
@@ -187,13 +190,83 @@ The init never writes anything of its own onto the app's console. The engine
 reads the status record from the config disk after the VMM exits, not from the
 console.
 
+## Exec sessions (M4)
+
+The web terminal reaches the app's context over virtio-vsock
+([`engine-trait.md`](../../docs/contracts/engine-trait.md) section 6, ADR 0113;
+the spike is [`m4-terminal-and-console.md`](../../docs/research/m4-terminal-and-console.md)).
+A configuration is v2 exactly when it carries `exec_port`; a v1 configuration
+starts no listener.
+
+The listener binds `VMADDR_CID_ANY:<exec_port>` inside the app's root, after
+the switch, the network and the user, and before the app starts. It runs for
+the VM's lifetime. A bind failure is one `quoro-init:` line on the serial
+console and nothing else: the app still boots, only the terminal is missing.
+The listener never writes to the app's stdout or to its log console;
+diagnostics go only to `/dev/ttyS0`.
+
+One connection is one session, and the first frame must be `OPEN` (JSON
+`{"argv":[...],"user":null|"...","rows":R,"cols":C}`). Any other first frame, a
+malformed or oversized frame, or an unknown type answers `ERROR` when the
+connection still allows it and closes. At most 16 sessions run at once; the
+next connection is refused with `ERROR` "too many sessions".
+
+Per session:
+
+- A PTY is allocated (`rustix::pty`), its initial window size set on the
+  master, and the slave opened with `NOCTTY` so PID 1 never acquires it.
+- The program is started through a self re-exec: `/proc/self/exe
+  --quoro-exec-helper <program> <arg0> <args...>` with the PTY slave on stdin,
+  stdout and stderr. `pre_exec` is `unsafe` and the workspace forbids it, so
+  the helper (`guest::exec::helper`) calls `setsid`, makes fd 0 the controlling
+  terminal (`TIOCSCTTY`) and `exec`s the program with the requested `argv[0]`.
+  If that `exec` fails it prints `quoro-init: exec <program>: <error>` on the
+  PTY and exits 127, which reaches the host as `OUTPUT` then `EXIT 127`.
+- The environment is the app's (the config's, plus the `HOME` and `PATH`
+  defaults it would get) with `TERM=xterm-256color` replacing any other `TERM`;
+  the working directory is the app's; the user is the app's unless the open
+  names another, which is resolved with `user::resolve` and a failure is an
+  `ERROR` "no such user ...".
+- `argv[0]` without `/` is searched in the app's `PATH` (the config's, or the
+  default above). A program the image lacks is **not** an error of the open:
+  the session starts, prints `quoro-init: <argv0>: not found` on its terminal
+  and sends `EXIT 127`.
+- PTY output becomes `OUTPUT` frames of at most 64 KiB; `INPUT` is written to
+  the master; `RESIZE` calls `tcsetwinsize`, so the kernel sends `SIGWINCH` to
+  the foreground group. Writes to the connection block, so a host that stops
+  reading stalls the PTY and the program rather than growing a buffer in the
+  init.
+- `CLOSE`, or the host dropping the connection, sends `SIGHUP` to the session's
+  process group and stops relaying. When the program exits, the init drains
+  what the PTY still holds (until `EIO`), sends `EXIT` (`128 + signal` when a
+  signal ended it) and closes the connection.
+
+PID 1's `supervise` loop reaps every child, so a session never calls `waitpid`:
+it registers the helper's pid in a small process-wide table and waits on a
+channel that `supervise` and `reap_remaining` feed with `exec::reaped`. A
+status that arrives before the session registers is kept in the same table, so
+a program that exits immediately cannot lose its exit code.
+
+The helper relies on `/proc/self/exe` still being executable after
+`switch_root`. The boot moves the overlay over the initramfs root and `chroot`s
+without unmounting the old root (there is no `pivot_root`), and `/proc` is
+carried into the new root; the magic link resolves to the binary's inode on
+that still-mounted root, not to a path in the new root.
+
 ## Known gaps
 
 - **Supplementary groups.** The app runs with no supplementary groups: when a
   uid is set, `std` calls `setgroups(0)` before `setuid`. The groups listed for
   the user in the image's `/etc/group` are not added, because adding them needs
   `CommandExt::groups` (unstable) or a raw `setgroups`, and the workspace
-  forbids `unsafe`. `uid` and `gid` are set correctly.
+  forbids `unsafe`. `uid` and `gid` are set correctly. Exec sessions inherit
+  the same limitation, and they skip `uid`/`gid` entirely when the resolved
+  identity is already the init's own.
+- **Exec drain timeout.** After the program exits, a session waits at most 5 s
+  for the PTY reader to reach `EIO` (a background process that still holds the
+  slave can delay it). A host that stopped reading blocks the output thread, so
+  after that budget the connection is shut down and the `EXIT` frame is lost;
+  a host that reads sees it normally.
 - **Timestamps.** The guest never sets the clock (no `CLOCK_REALTIME` from the
   host); app output and files carry the kernel's default time.
 - **No `pivot_root`.** The boot moves the overlay over the initramfs root and
