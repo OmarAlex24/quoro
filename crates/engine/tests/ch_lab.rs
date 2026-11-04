@@ -969,16 +969,21 @@ async fn exec_and_serial_console() {
     engine.delete(&id).await.expect("delete");
     assert_no_leftovers(&id);
     assert!(!serial.exists(), "the serial socket survived the delete");
-    // Deleting the VM ends every open stream (§3.19).
-    match tokio::time::timeout(
-        Duration::from_secs(5),
-        poll_fn(|cx| console.as_mut().poll_next(cx)),
-    )
-    .await
-    {
-        Ok(None) => {}
-        Ok(Some(chunk)) => panic!("bytes after the delete: {chunk:?}"),
-        Err(_) => panic!("the serial stream did not end on delete"),
+    // Deleting the VM ends every open stream (§3.19): a subscriber first gets
+    // what was queued before the delete (here the exec session's own serial
+    // lines, after "app started"), then the end of the stream.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut drained = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, poll_fn(|cx| console.as_mut().poll_next(cx))).await {
+            Ok(None) => break,
+            Ok(Some(chunk)) => drained.extend_from_slice(&chunk),
+            Err(_) => panic!(
+                "the serial stream did not end on delete; drained {:?}",
+                String::from_utf8_lossy(&drained)
+            ),
+        }
     }
 
     let tools = HostTools::discover().expect("host tools");
