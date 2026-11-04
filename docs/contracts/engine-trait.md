@@ -155,6 +155,35 @@ pub struct VolumeAttach {
     pub serial: String,
 }
 
+/// The package inventory of a prepared image (ADR 0150, ADR 0151). Added in
+/// M5a. Section 3.21; the wire form is `node-agent-protocol.md` section 5.26.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageInventory {
+    pub digest: ImageDigest,
+    /// `ID` and `VERSION_ID` from the image's os-release, when it has one.
+    pub os: Option<(String, String)>,
+    /// OSV ecosystems covered, for example "Debian:13" or "npm".
+    pub ecosystems: Vec<String>,
+    /// Kinds of content seen and not read, for example "static_binary".
+    pub not_inventoried: Vec<String>,
+    pub packages: Vec<InventoryPackage>,
+    /// RFC 3339 time the inventory was built.
+    pub inventoried_at: String,
+}
+
+/// One package of an [`ImageInventory`]. Added in M5a.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InventoryPackage {
+    pub ecosystem: String,
+    pub name: String,
+    /// The source package, when the package database records one.
+    pub source_name: Option<String>,
+    pub version: String,
+    pub purl: String,
+    /// For a language package, the file it was read from, relative to the root.
+    pub path: Option<String>,
+}
+
 /// A volume file on this node. Added in M5a. Section 3.20.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VolumeInfo {
@@ -529,6 +558,15 @@ pub trait Engine: Send + Sync {
     ) -> impl Future<Output = Result<(), EngineError>> + Send {
         async { Err(EngineError::Unsupported("volumes are not implemented by this engine".into())) }
     }
+
+    // Image inventories (M5a; the default implementation returns Unsupported)
+    /// Added in M5a; section 3.21.
+    fn image_inventory(
+        &self,
+        _digest: &ImageDigest,
+    ) -> impl Future<Output = Result<ImageInventory, EngineError>> + Send {
+        async { Err(EngineError::Unsupported("image inventories are not implemented by this engine".into())) }
+    }
     /// Section 3.16.
     fn snapshot_volume(
         &self,
@@ -729,6 +767,15 @@ The local volumes of ADR 0145: one sparse raw file per volume in the node's data
 - `delete` of a VM never removes its volumes (section 3.9); only `delete_volume` does.
 - The node agent, not the engine, decides when a volume is created, imported or deleted (`node-agent-protocol.md` section 6.7).
 
+### 3.21 `image_inventory`
+
+Returns the package inventory of a prepared image (ADR 0150, ADR 0151). Added in M5a; the default implementation returns `Unsupported`.
+
+- `prepare_image` and `prepare_layout` build the inventory in the same pass that applies the layers, from the unpacked tree, before `mkfs.ext4 -d`, and cache it with the image by digest. What is read, the bounds (20 000 packages, 4 MiB) and the `not_inventoried` kinds are in `node-agent-protocol.md` section 6.11. A failure to inventory never fails the preparation: the image is cached, and the inventory lists what it could not read.
+- The parsers only read files of the unpacked tree, resolved inside it like the layer paths (section 3.4); they never execute anything from the image.
+- `image_inventory` reads the cached inventory and never touches the network. A digest that is not prepared is `NotFound`. An image prepared before M5a has no inventory and is `NotFound` until it is prepared again: its app is reported `pending` until its next deployment.
+- `remove_image` removes the inventory with the image.
+
 ## 4. Concurrency
 
 - Operations on one `VmId` are serialized by the caller. The node agent holds one lock per VM, so it never issues `start` and `delete` for the same id concurrently. The engine does not promise ordering for concurrent calls on one id and may return `Conflict`.
@@ -842,5 +889,5 @@ The node agent runs its protocol tests against `FakeEngine`: the M0 lease tests 
 | M1 | `create`, `start`, `stop`, `delete`, `list`, `inspect`, `prepare_image`, `ensure_network` (D-0033) |
 | M2 | `output` feeds live app logs (D-0014, D-0033); isolation groups on `NetAttach` and guest DNS on `NodeNetwork` (D-0084) |
 | M4 | `counters` for metrics (D-0033, ADR 0014); `serial_output` and `VmSpec::serial` for the read-only console (ADR 0116); `exec` and `VmSpec::vsock` for the web terminal, with init configuration v2 (ADR 0113); `prepare_layout`, `VmSpec::work_disks` and `NetAttach::egress_only` for builds (ADR 0117, ADR 0118). `console` is superseded |
-| M5a | `ensure_volume`, `import_volume`, `delete_volume` and `VolumeAttach::serial` for local volumes, with init configuration v3 (ADR 0145); `snapshot_volume` and `delete_volume_snapshot` with the `Reflink` or `PauseCopy` method probed per node (ADR 0146) |
+| M5a | `image_inventory`, built by `prepare_image` and `prepare_layout` (ADR 0150, ADR 0151); `ensure_volume`, `import_volume`, `delete_volume` and `VolumeAttach::serial` for local volumes, with init configuration v3 (ADR 0145); `snapshot_volume` and `delete_volume_snapshot` with the `Reflink` or `PauseCopy` method probed per node (ADR 0146) |
 | M5b | The primitive for warm volumes chosen by the lvm-thin vs btrfs spike (D-0023) |

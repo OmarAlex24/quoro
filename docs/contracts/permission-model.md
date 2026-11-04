@@ -88,7 +88,7 @@ A scope is `<resource>:<verb>` and is the unit of authority in both human roles 
 | Scope | Allows | Flags |
 | --- | --- | --- |
 | `cluster:read` | Read cluster info, version, log position | |
-| `node:read` | List and read nodes and node metrics | |
+| `node:read` | List and read nodes and node metrics; with `app:read`, the Quoro and host-kernel parts of the vulnerability summary | |
 | `node:enroll` | Create node join tokens | human-only |
 | `node:remove` | Remove a node from the cluster | destructive, human-only |
 | `node:fence_ack` | Acknowledge a node's failed fence after verifying its VMs are stopped, so its leases may be granted again | human-only |
@@ -101,12 +101,12 @@ A scope is `<resource>:<verb>` and is the unit of authority in both human roles 
 | `vm:stop` | Stop a VM | |
 | `vm:delete` | Delete a VM and its disks | destructive |
 | `vm:console` | Read a VM's serial console, live and its recent output (ADR 0116) | |
-| `app:read` | List and read apps, their Git sources, builds, deployments, domains, volumes, env var names and app metrics | |
+| `app:read` | List and read apps, their Git sources, builds, deployments, domains, volumes, env var names, app metrics and vulnerability reports | |
 | `app:create` | Create an app | |
 | `app:update` | Change app settings, the Git source, env vars, domains, the backup schedule; create volumes | |
 | `app:restart` | Restart an app's instances | |
 | `app:redeploy` | Roll out the current image again | |
-| `app:deploy` | Deploy a new image (new deployment); start and cancel builds, whose success deploys | |
+| `app:deploy` | Deploy a new image (new deployment); start and cancel builds, whose success deploys, including a build that refreshes its base images | |
 | `app:start` | Start a stopped app | |
 | `app:stop` | Stop an app | |
 | `app:delete` | Delete an app and its data, or one volume of an app | destructive |
@@ -192,6 +192,8 @@ Matching per target type:
 | backup of a volume | the app it belongs to (as above), or `{"all": true}` |
 | backup of the control-plane database | `{"all": true}` only: it holds the whole cluster state |
 | backup repository, audit export | `{"all": true}` only (section 5.1) |
+| vulnerability finding of an app | the app (as above), or `{"all": true}` |
+| vulnerability finding of a Quoro component or a host kernel | `{"all": true}` only, together with `node:read`: it is node data (openapi.yaml `getVulnerabilitySummary`) |
 | project | `projects` entry equal to its slug, or `{"all": true}` |
 | node | `nodes` entry equal to its id, or `{"all": true}` |
 | incident | its `subject` (resolved as the subject's own type above), or `{"all": true}` |
@@ -441,7 +443,7 @@ A webhook may carry a `wake` object (shared entity model; [events.schema.json](e
 
 ### 8.2 When the grant is issued
 
-1. A detection (node agent report, health check, certificate state) opens an incident with `subject` `{type, id}` (D-0032).
+1. A detection (node agent report, health check, certificate state, a vulnerability finding) opens an incident with `subject` `{type, id}` (D-0032). An app has at most one open incident per detection kind: `app.down` opens one unless an `app.down` incident of that app is open, and `app.up` resolves only that one; from M5a `app.vulnerable` opens its own, alongside an open `app.down` incident, and the system resolves it once the app has no open finding in the KEV catalog or with a CVSS score of 9.0 or more (ADR 0150). The incident's `trigger_event_id` tells them apart.
 2. `incident.opened` is emitted.
 3. For each enabled webhook whose `event_types` matches and whose `selector` covers the incident's subject, the system delivers the event and, if the webhook has `wake`, issues an incident grant:
    - `kind` `incident`;

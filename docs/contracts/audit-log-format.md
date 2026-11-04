@@ -169,6 +169,7 @@ Each call or action in the rows marked "yes" below produces exactly one record (
 | approval requests filed, approved, denied, expired | yes | `ok` |
 | system actions: incident opened and resolved, incident grant issued and revoked, fencing-related lease revocations, node enrollment and removal | yes | `ok` / `error` |
 | storage system actions (M5a): a scheduled backup dispatched, a backup sealed or failed, retention pruning, a garbage-collection sweep, a control-plane backup, a `local` lease granted or moved, an audit-export probe (section 3.5) | yes | `ok` / `error` |
+| vulnerability system actions (M5a): an offline import of vulnerability data (section 3.6) | yes | `ok` / `error` |
 | audit verification runs | yes | `ok` / `error` |
 | the open of a terminal or console session (its `POST`) | yes, for every identity, as a mutating call | `ok` / `refused` / `error` |
 | the close of a terminal or console session, for any reason | yes: one `session.end` record (section 3.3) | `ok` / `error` |
@@ -292,6 +293,20 @@ System records, with `actor_type` `system`, `channel` `system` and no `scope`:
 | `audit_export.probe` | `audit_export` | `audit_export` / the export | The daily probe ran; `ok` with the strength in the change log, or `error` |
 
 A control-plane backup is a `backup.dispatch` and a `backup.seal` with the backup as target. Restoring the control plane with `quoro restore` is offline and writes no record. The restored log ends where the backup ends, so verification against the off-site copy reports `tail_truncated` (section 8.3), which is the truth: the records after the backup are gone locally and kept off-site. How the export continues after such a restore is part of the storage epic; it never overwrites the existing copy.
+
+### 3.6 Vulnerability actions (M5a)
+
+Vulnerability tracking adds two reads and one field (ADR 0150). `getAppVulnerabilities` and `getVulnerabilitySummary` are reads under `app:read`: recorded for agents like every agent call, with `target_type` `app` and the app for the first and `cluster` for the second, and not recorded for humans. `startBuild` keeps its record (scope `app:deploy`, target the app); `params` is the request body, so a build that refreshes its base images shows `refresh_base: true`.
+
+Recording, changing or resolving a finding writes no audit record: findings are derived from the node's inventory and the vulnerability data, and they are in the change log. The incident `app.vulnerable` opens, and its resolution, are recorded like every incident (section 3). The daily refresh of the vulnerability data writes no record either; its result is the data age the API shows.
+
+One system record, with `actor_type` `system`, `channel` `cli` and no `scope`:
+
+| `operation` | `actor_id` | `target_type` / `target_id` | When |
+| --- | --- | --- | --- |
+| `vulnerability_data.import` | `vulnerability_data` | `cluster` / the cluster id | An operator ran `quoro vuln import <dir>` on the primary's host; `params` is `{ecosystems, record_counts}`, `ok` once the data is in place, `error` with the reason otherwise |
+
+The command runs as root on the primary's host, so it has no identity of its own in Quoro; the record says that the host's operator changed the data the findings come from.
 
 ## 4. Redaction
 

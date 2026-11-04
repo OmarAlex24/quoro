@@ -117,6 +117,7 @@ export const startMockBuild = (app: App, refOverride?: string): Build => {
     failed_step: null,
     deployment_id: null,
     trigger: 'api',
+    refresh_base: false,
     created_by_type: 'user',
     created_by_id: db.sessionUserId ?? 'system',
     created_at: createdAt,

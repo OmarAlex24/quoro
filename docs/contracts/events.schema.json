@@ -44,6 +44,7 @@
         "app.degraded",
         "app.up",
         "app.restarted",
+        "app.vulnerable",
         "deployment.started",
         "deployment.succeeded",
         "deployment.failed",
@@ -102,6 +103,7 @@
     { "if": { "required": ["type"], "properties": { "type": { "const": "app.degraded" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_app_degraded" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "app.up" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_app_up" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "app.restarted" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_app_restarted" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "app.vulnerable" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_app_vulnerable" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "deployment.started" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_deployment_started" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "deployment.succeeded" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_deployment_succeeded" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "deployment.failed" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_deployment_failed" } } } },
@@ -520,6 +522,40 @@
       "properties": {
         "app_id": { "$ref": "#/$defs/AppId" },
         "restart_generation": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+
+    "data_app_vulnerable": {
+      "type": "object",
+      "description": "The image an app runs has a new finding that is in CISA's Known Exploited Vulnerabilities catalog or has a CVSS base score of 9.0 or more (ADR 0138, ADR 0150). Emitted by the control plane when it records such a finding: after an image inventory arrives, or after a data refresh matches a new record. One event carries every qualifying finding of that match, at most 20 of them in `findings`, with `finding_count` the full number. It opens an incident for the app, separate from an `app.down` incident: an open `app.down` incident does not absorb it, and `app.up` does not resolve it. The system resolves it when the app has no open finding that qualifies (a deploy of a patched image, or corrected data), or a user or agent resolves it. Findings of Quoro's own components and of host kernels raise no event in M5a. Payload fields are additive within schema_version 1.",
+      "required": ["app_id", "image_digest", "finding_count", "findings"],
+      "properties": {
+        "app_id": { "$ref": "#/$defs/AppId" },
+        "image_digest": { "type": "string", "minLength": 1 },
+        "finding_count": { "type": "integer", "minimum": 1 },
+        "findings": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "items": {
+            "type": "object",
+            "required": ["finding_id", "vuln_id", "package", "installed_version", "severity", "kev", "reason"],
+            "properties": {
+              "finding_id": { "type": "string", "pattern": "^vln_[0-9A-HJKMNP-TV-Z]{26}$" },
+              "vuln_id": { "type": "string", "minLength": 1 },
+              "package": { "type": "string" },
+              "installed_version": { "type": "string" },
+              "fixed_version": { "type": ["string", "null"] },
+              "severity": { "type": "string", "enum": ["critical", "high", "medium", "low", "unknown"] },
+              "cvss_score": { "type": ["number", "null"], "minimum": 0, "maximum": 10 },
+              "kev": { "type": "boolean" },
+              "reason": { "type": "string", "enum": ["kev", "cvss_critical"], "description": "Why it qualifies: `kev` when it is in the KEV catalog, otherwise `cvss_critical`." }
+            },
+            "additionalProperties": true
+          }
+        },
+        "rebuildable": { "type": "boolean", "description": "True when the app has a Git source, so a build with `refresh_base` can pick up a patched base; false for an image app, which needs a new upstream image." }
       },
       "additionalProperties": true
     },
@@ -1130,6 +1166,36 @@
         "volume_id": "vol_01JC9ZC2D3E4F5G6H7J8K9M0NP",
         "node_id": "nod_01JC9Z6Q5W8N3K4T7R2M1XHB0N",
         "error": "upload of chunk failed after 5 attempts: 503 Service Unavailable"
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "evt_01JCA2B2C3D4E5F6G7H8J9K0M3",
+      "seq": 152,
+      "type": "app.vulnerable",
+      "time": "2026-11-05T06:10:03Z",
+      "source": { "kind": "control_plane" },
+      "subject": { "type": "app", "id": "app_01JC9Z7B3N5Q7S9Z1W3Y5A7C9E" },
+      "project_id": "prj_01JC9Z5A1B2C3D4E5F6G7H8J9K",
+      "actor": { "type": "system", "id": "system" },
+      "data": {
+        "app_id": "app_01JC9Z7B3N5Q7S9Z1W3Y5A7C9E",
+        "image_digest": "sha256:5f0c9a2e4b6d8f1a3c5e7b9d1f3a5c7e9b1d3f5a7c9e1b3d5f7a9c1e3b5d7f9a",
+        "finding_count": 1,
+        "findings": [
+          {
+            "finding_id": "vln_01JCA2A2B3C4D5E6F7G8H9J0KM",
+            "vuln_id": "CVE-2026-0001",
+            "package": "libssl3t64",
+            "installed_version": "3.5.1-1",
+            "fixed_version": "3.5.1-1+deb13u1",
+            "severity": "critical",
+            "cvss_score": 9.8,
+            "kev": false,
+            "reason": "cvss_critical"
+          }
+        ],
+        "rebuildable": true
       }
     }
   ]

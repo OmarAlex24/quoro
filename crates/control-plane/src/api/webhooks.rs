@@ -76,6 +76,8 @@ pub enum EventType {
     AppUp,
     #[serde(rename = "app.restarted")]
     AppRestarted,
+    #[serde(rename = "app.vulnerable")]
+    AppVulnerable,
     #[serde(rename = "deployment.started")]
     DeploymentStarted,
     #[serde(rename = "deployment.succeeded")]
@@ -149,6 +151,7 @@ impl EventType {
             Self::AppDegraded => "app.degraded",
             Self::AppUp => "app.up",
             Self::AppRestarted => "app.restarted",
+            Self::AppVulnerable => "app.vulnerable",
             Self::DeploymentStarted => "deployment.started",
             Self::DeploymentSucceeded => "deployment.succeeded",
             Self::DeploymentFailed => "deployment.failed",
@@ -186,7 +189,7 @@ impl EventType {
     }
 
     /// Every event type of the contract, in contract order.
-    pub const ALL: [Self; 42] = [
+    pub const ALL: [Self; 43] = [
         Self::NodeEnrolled,
         Self::NodeConnected,
         Self::NodeDisconnected,
@@ -205,6 +208,7 @@ impl EventType {
         Self::AppDegraded,
         Self::AppUp,
         Self::AppRestarted,
+        Self::AppVulnerable,
         Self::DeploymentStarted,
         Self::DeploymentSucceeded,
         Self::DeploymentFailed,

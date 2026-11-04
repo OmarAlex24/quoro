@@ -274,6 +274,8 @@ pub struct Build {
     /// What started the build.
     #[schema(inline)]
     pub trigger: BuildTrigger,
+    /// Whether the build resolved every base image again (ADR 0150).
+    pub refresh_base: bool,
     /// Kind of identity that started the build.
     #[schema(inline)]
     pub created_by_type: CreatedByType,
@@ -313,6 +315,10 @@ pub struct StartBuildRequest {
     #[serde(rename = "ref", default)]
     #[schema(value_type = String, min_length = 1, max_length = 255, required = false)]
     pub git_ref: Option<String>,
+    /// Resolve every base image again instead of the cached one (ADR 0150).
+    #[serde(default)]
+    #[schema(default = false, required = false)]
+    pub refresh_base: bool,
 }
 
 /// One line of a build's log (`openapi.yaml` `BuildLogLine`).
@@ -427,11 +433,14 @@ async fn project_of_app(state: &AppState, app_id: &str) -> Option<String> {
 }
 
 /// The parameters of a build operation, as the audit log records them.
-fn start_params(app_id: &str, git_ref: Option<&str>) -> Value {
+fn start_params(app_id: &str, git_ref: Option<&str>, refresh_base: bool) -> Value {
     let mut params = Map::new();
     params.insert("app_id".to_string(), json!(app_id));
     if let Some(git_ref) = git_ref {
         params.insert("ref".to_string(), json!(git_ref));
+    }
+    if refresh_base {
+        params.insert("refresh_base".to_string(), json!(true));
     }
     Value::Object(params)
 }
@@ -533,8 +542,10 @@ pub async fn start_build(
     body: Option<ApiJson<StartBuildRequest>>,
 ) -> Result<Response, ApiError> {
     let ctx = CallCtx::new(identity, request_id.0, START_BUILD, &headers);
-    let git_ref = body.and_then(|ApiJson(body)| body.git_ref);
-    let params = start_params(&app_id, git_ref.as_deref());
+    let (git_ref, refresh_base) = body.map_or((None, false), |ApiJson(body)| {
+        (body.git_ref, body.refresh_base)
+    });
+    let params = start_params(&app_id, git_ref.as_deref(), refresh_base);
     let target = app_target(&app_id);
     let project_id = project_of_app(&state, &app_id).await;
     ctx.authorize(
@@ -582,7 +593,16 @@ pub async fn start_build(
         }
     }
 
-    match start_build_tx(&state, &ctx, &app_id, git_ref.as_deref(), &params).await {
+    match start_build_tx(
+        &state,
+        &ctx,
+        &app_id,
+        git_ref.as_deref(),
+        refresh_base,
+        &params,
+    )
+    .await
+    {
         Ok((build, _change_seq)) => {
             if let Some(key) = &key {
                 state.idempotency.finish(
@@ -625,8 +645,16 @@ async fn start_build_tx(
     ctx: &CallCtx,
     app_id: &str,
     git_ref: Option<&str>,
+    refresh_base: bool,
     params: &Value,
 ) -> Result<(Build, i64), ApiError> {
+    // Refreshing the base images needs the builder change of the
+    // vulnerability epic (ADR 0150); until it ships the flag is refused.
+    if refresh_base {
+        return Err(ApiError::validation(
+            "refresh_base is not supported yet: builds reuse the cached base images",
+        ));
+    }
     let mut w = state.store.begin_write().await?;
     let started = build::start_build(&mut w.tx, app_id, git_ref, &ctx.identity.actor()).await?;
     ctx.append_ok(

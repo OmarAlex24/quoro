@@ -324,6 +324,7 @@ Each lease entry:
 | `volumes` | array of object | no | One entry per volume in the node's current `spec.volumes`, plus one per volume file the node holds that `spec.volumes` does not name (ADR 0145); absent or empty when there is none |
 | `backups` | array of object | no | One entry per job in the node's current `spec.backups` (ADR 0147); absent or empty when there is none |
 | `edge_backends` | array of object | no | On a machine with the `edge` role: one entry per backend of `spec.edge.routes` (ADR 0143); absent or empty otherwise |
+| `images` | array of object | no | From M5a: one `{ "image_digest", "inventory_sha256" }` per prepared image the node holds, where `inventory_sha256` is the hex SHA-256 of the image's inventory (section 6.11) or absent while the node is still building it (ADR 0150) |
 
 VM entry: `vm_id` (string, `vm_`), `observed_status` (one of `creating`, `stopped`, `starting`, `running`, `stopping`, `crashed`, `deleted`, `unknown`), `health` (`passing`, `failing`, `unknown`), `ip` (string, optional), `restart_count` (integer), `last_exit_code` (integer, optional).
 
@@ -739,6 +740,7 @@ The node keeps the list next to `primary_url` in its identity (section 12). It d
 | `secrets` | object | yes | BuildKit secret id to plaintext value, taken from the app's environment variables named in the source; `{}` when none |
 | `limits` | object | yes | `vcpus`, `memory_mb`, `timeout_s`, `cache_gb`, `output_gb` |
 | `cancelled` | boolean | yes | True once a cancel was requested; the node stops the build and reports `cancelled` |
+| `refresh_base` | boolean | no | From M5a: when true, the builder resolves every base image again from its registry (`image-resolve-mode=pull`) instead of using the cached one, so a patched base is picked up (ADR 0150). Absent means false |
 
 A build stays in `spec.builds` until the primary has recorded the terminal status the node reported. A succeeded build leaves `spec.builds` in the same revision that references its image in `spec.vms` (the deployment it started), so the apply loop never sees the built root disk unreferenced and removes it (section 6.2). `secrets` values are handled like `env`: plaintext only inside the signed snapshot, encrypted with the node-local key at rest, never logged and never written to the build's log.
 
@@ -1082,7 +1084,7 @@ The node stops producing, releases the stream slot, and answers `stream_end` wit
 
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
-| `kind` | string | yes | `logs_query`, `probe`, `fence_ack`, `build_logs_query` or `metrics_query` |
+| `kind` | string | yes | `logs_query`, `probe`, `fence_ack`, `build_logs_query`, `metrics_query` or `inventory_resend` |
 | `params` | object | yes | Kind-specific parameters |
 
 `logs_query` params: `app_id` or `vm_id` (exactly one), `since` (RFC 3339, optional), `until` (RFC 3339, optional), `tail` (integer, optional). The answer is one `command_result` with `status: ok` and the matching lines in `lines` (section 5.9), each carrying its `vm_id`. The answer must fit the 1 MiB message limit: the node keeps the newest lines that fit and says in `detail` that older ones were left out.
@@ -1092,6 +1094,8 @@ The node stops producing, releases the stream slot, and answers `stream_end` wit
 `fence_ack` params: `lease_ids` (array of `lse_` ids, at least one). It carries an operator's acknowledgement of failed fences, recorded through `POST /api/v1/nodes/{node_id}/fence-ack` (section 8.5). The node clears the failed fence it recorded for each listed lease, and clears its failed mark once no failed fence remains. It answers `command_result` with `status: ok`; when failed fences of other leases remain, the node stays failed and `detail` names them. A listed lease with no recorded failed fence is not an error, so a redelivered `fence_ack` is harmless. The listed leases stay `revoked` or `expired` on the node: it starts nothing stateful for them until a `lease_grant` arrives with a higher `fencing_token` (section 8.5 step 4).
 
 `build_logs_query` params: `build_id`, `after_seq` (integer, optional, default 0), `limit` (integer, optional, default 500, at most 1 000). The answer is one `command_result` with `status: ok` and the build's log lines after `after_seq` in `lines`, in the build-log line shape of section 5.7, oldest first, at most `limit` and within the 1 MiB message limit (the node returns fewer lines rather than a larger message). A build the node does not have is answered with `status: error`, code `not_found`.
+
+`inventory_resend` params: `image_digest`. The node sends that image's inventory again as `image_inventory` messages (section 5.26) and answers one `command_result` with `status: ok` once it has queued them. An image the node does not hold is answered with `status: error`, code `not_found`. The primary sends it when `status_report.images` names an inventory it does not hold, or holds with another `inventory_sha256` (ADR 0150).
 
 `metrics_query` params: `node` (boolean) and `vm_ids` (array of `vm_` ids), at least one of them set. The answer is one `command_result` with `status: ok` and `metrics`:
 
@@ -1380,6 +1384,76 @@ Credit flow control (ADR 0116): the node keeps at most 256 KiB of decoded `data`
 }
 ```
 
+### 5.26 `image_inventory`
+
+**Direction:** node to control plane.
+**When:** once per image the node prepares, pulled or built, after the engine has inventoried it (section 6.11); again when the primary asks with `command` kind `inventory_resend`. From M5a (ADR 0150).
+
+An inventory may hold up to 20 000 packages and 4 MiB of JSON, which is larger than one message (1 MiB, section 3). The node therefore splits it into parts: every part carries the same `image_digest`, `inventory_id` and `parts`, the metadata fields, and a slice of `packages` in order, and each part's serialized message stays below 1 MiB. The primary keeps the parts of one `inventory_id` until all `parts` have arrived, then replaces the image's previous inventory with the joined one and matches it. Parts of an `inventory_id` that are still incomplete after 10 minutes are dropped; the node's next `status_report` then shows the primary that the inventory is missing, and the primary asks again. A part that arrives twice is ignored.
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `image_digest` | string | yes | Manifest digest of the image, as in `spec.vms[].image_digest` |
+| `inventory_id` | string | yes | Identity of this send, the node's `msg_` id of part 1; parts of different sends never mix |
+| `part` | integer | yes | 1-based number of this part |
+| `parts` | integer | yes | Number of parts of this send, 1 to 8 |
+| `inventory_sha256` | string | yes | Hex SHA-256 of the whole inventory (the JSON object of section 6.11), the same value `status_report.images` carries |
+| `inventoried_at` | string | yes | When the engine built the inventory |
+| `os` | object | no | `{ "id", "version_id" }` from the image's `/etc/os-release` or `/usr/lib/os-release`; absent when the image has neither |
+| `ecosystems` | array of string | yes | OSV ecosystems the inventory covers, for example `Debian:13`, `npm`; `[]` when none |
+| `not_inventoried` | array of string | yes | Kinds of content the engine saw and could not read, for example `static_binary`, `rpm_bdb`; `[]` when none |
+| `package_count` | integer | yes | Packages in the whole inventory, at most 20 000 |
+| `packages` | array of object | yes | This part's slice of the packages |
+
+Each package:
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `ecosystem` | string | yes | OSV ecosystem with its release where OSV uses one: `Debian:13`, `Alpine:v3.22`, `Red Hat`, `npm`, `PyPI`, `Go`, `crates.io` |
+| `name` | string | yes | The installed (binary) package's name |
+| `source_name` | string | no | Its source package, when the package database records one (`dpkg`'s `Source:`, `apk`'s `o:`); OSV's distribution records are keyed by it |
+| `version` | string | yes | Installed version, in the ecosystem's own form |
+| `purl` | string | yes | Package URL |
+| `path` | string | no | For a language package, the manifest or binary it was read from, relative to the image root |
+
+The primary acknowledges nothing: completeness is checked through `status_report.images`.
+
+```json
+{
+  "v": 1,
+  "type": "image_inventory",
+  "id": "msg_01JCA2C4E6G8J0M2P4R6T8V0X2",
+  "body": {
+    "image_digest": "sha256:5f0c9a2e4b6d8f1a3c5e7b9d1f3a5c7e9b1d3f5a7c9e1b3d5f7a9c1e3b5d7f9a",
+    "inventory_id": "msg_01JCA2C4E6G8J0M2P4R6T8V0X2",
+    "part": 1,
+    "parts": 1,
+    "inventory_sha256": "9b2f6c1d8e4a7b3c5d9e1f2a4b6c8d0e2f4a6b8c0d2e4f6a8b0c2d4e6f8a0b2c",
+    "inventoried_at": "2026-11-05T06:09:41Z",
+    "os": { "id": "debian", "version_id": "13" },
+    "ecosystems": ["Debian:13", "npm"],
+    "not_inventoried": [],
+    "package_count": 2,
+    "packages": [
+      {
+        "ecosystem": "Debian:13",
+        "name": "libssl3t64",
+        "source_name": "openssl",
+        "version": "3.5.1-1",
+        "purl": "pkg:deb/debian/libssl3t64@3.5.1-1?arch=amd64&distro=debian-13"
+      },
+      {
+        "ecosystem": "npm",
+        "name": "express",
+        "version": "4.21.2",
+        "purl": "pkg:npm/express@4.21.2",
+        "path": "app/package-lock.json"
+      }
+    ]
+  }
+}
+```
+
 ## 6. Reconciliation
 
 ### 6.1 Source of truth on the node
@@ -1485,6 +1559,17 @@ The mesh is kernel WireGuard driven over netlink, with no `wg` or `wg-quick` pro
 ### 6.10 Instance identity
 
 When it creates an app instance, the node adds two variables to its environment, after the app's own `env`: `QUORO_INSTANCE_ID` (the VM's `vm_` id) and `QUORO_NODE_ID` (the node's `nod_` id). The names are reserved: the API refuses them in an app's environment, and if a snapshot from an older primary carries either one, the node's value wins. They are not secrets and may appear in logs.
+
+### 6.11 Image inventories
+
+From M5a every image the engine prepares is inventoried in the same pass that unpacks its layers, before the root disk is built (`engine-trait.md` section 3.4, ADR 0151). No image leaves the node, and no separate scanner runs.
+
+- **What is read.** `os-release`; the `dpkg` database (`/var/lib/dpkg/status` and `status.d/`), the `apk` database (`/lib/apk/db/installed`) and the `rpm` SQLite database; npm `package-lock.json`, Python `*.dist-info/METADATA`, the build information of Go binaries and the `cargo auditable` section of Rust binaries. Anything the engine sees and cannot read (a static binary without build information, an `rpm` Berkeley DB) is listed in `not_inventoried`, so the panel never shows "no vulnerabilities" for something nobody read.
+- **Source names.** Distribution packages carry their source package in `source_name`: OSV's Debian and Alpine records are keyed by it, and a match on the binary name finds nothing.
+- **Bounds.** At most 20 000 packages and 4 MiB of JSON. A larger inventory is cut at the bound and `not_inventoried` gains `truncated`.
+- **Storage on the node.** The inventory is kept next to the prepared image in the engine's cache and removed with it. Its JSON object is the fields of section 5.26 other than `inventory_id`, `part` and `parts`, with all packages, serialized with RFC 8785; `inventory_sha256` is the SHA-256 of those bytes.
+- **Sending.** After it prepares an image, the node sends the inventory once (section 5.26) and lists the image in `status_report.images`. It sends it again only on `inventory_resend`.
+- **On the primary.** The primary keeps the inventories it received, and its copy of the OSV data, in a cache file of its own next to its database, not in the database: the file is large, can always be fetched again, and is left out of control-plane backups (ADR 0148). Only the data age (`osv_mirror`) and the findings (`vulnerability_findings`) are in the database (`migrations/0008-vulnerabilities.sql`). The primary fetches an OSV ecosystem the first time an inventory needs it, never OSV's whole-bucket archive, refreshes it daily from that ecosystem's change list, and can be fed offline with `quoro vuln import <dir>`. It matches on the package's (or source package's) name and the ecosystem's own version order, and records a finding only when it appears, changes or is resolved.
 
 ## 7. Change-log follow
 
@@ -1695,6 +1780,7 @@ Threats and their mitigations are in `../architecture/threat-model.md`; this sec
 - **Terminal and console relay (M4).** The primary never touches a VM socket: it authorizes, audits and relays bytes between a client WebSocket and this session (ADR 0113, ADR 0114). The node agent, already root and already the only reader of VM sockets, is the only process that connects to a VM's vsock socket and its serial socket; both live in the VM's runtime directory, which only root can enter. The node never creates a `<socket>_<port>` listener, so a guest cannot open a vsock connection to the host. The guest is untrusted: the node bounds every frame it reads from it and treats its output as bytes, never as protocol. A `terminal` stream exists only because the primary opened it; a node never starts an exec session on its own.
 - **Builds (M4).** A build runs untrusted code: the Dockerfile and everything it fetches. It runs only inside a builder microVM, with `egress_only` networking and no isolation group (section 6.6), never on the host. Build secrets reach the node only inside the signed desired state, reach the builder VM only on its ephemeral source disk, which the node deletes when the build ends, and live in the guest only in memory as BuildKit secret files; the node never writes them to a build log, a `stream_data` or an event. The node never mounts a disk the builder VM wrote: it reads the output layout as a tar stream in user space and never touches the cache disk's contents. The built image never leaves the node: it is imported locally and never pushed.
 
+- **Image inventories (M5a).** The inventory is built by parsing package databases and manifests inside images the operator did not write, as root on the host. The parsers are Rust, in the engine's process, bounded in size (section 6.11), and read files of the unpacked tree only: they never execute anything from the image. What leaves the node is the package list, over the session, never the image.
 - **Edge and mesh (M5a).** Besides the certificates of the routes it serves, the edge holds its tunnel token and its WireGuard private key, and it reaches a node only through the mesh, where the node's firewall admits only the edge's mesh address and only to the guest addresses and ports of that node's backends (section 6.9). A compromised edge can read and alter the traffic of the apps it serves and probe their backends; it cannot reach other guests, the node's host services or other nodes, and it cannot change desired state. With one edge in M5a, the edge is a single point of failure for the traffic of apps with more than one replica.
 - **Volumes and backups (M5a).** A volume file is guest-written and never mounted on the host; snapshots, backups and restores handle it as bytes (section 6.7). A node receives the chunk keys of the apps it has jobs for and the bucket credential only while it has a job, never the repository key and never the audit-copy credential. A compromised node can read and overwrite nothing in the repository that it could not already read on its own disk: it can upload garbage chunks or manifests, which no seal covers and a restore refuses (`backup-format.md` section 8.1).
 
@@ -1718,6 +1804,6 @@ The node keeps a SQLite file, owned by root, that holds everything it needs to r
 | `edge_backends` (M5a, edge) | Per backend of `spec.edge.routes`: in rotation or not, since when, reason, consecutive probe results | Lets a restarted edge resume with its last view of backend health instead of sending requests to backends it had taken out |
 | `backups` (M5a) | Per backup job: `bkp_` id, status, snapshot method, pause, manifest key and digest, sizes, error, start and end times; optionally the chunk ids the node knows the repository holds, per app | Reports backup progress across an agent restart and skips uploads of known chunks (`backup-format.md` section 5) |
 
-Outside the SQLite file, next to the credential and the node's private key, the node keeps its WireGuard private key (from M5a, mode `0600`) and its identity file: `node_id`, `cluster_id`, `primary_url`, the URLs advertised in `welcome.primary_urls` (at most 8, section 5.10), the pinned certificate fingerprint, and the cluster public key with its `key_id`. It is written `0600` through a temporary file renamed into place, so a half-written identity is never read. Also outside the SQLite file, in the VM's runtime directory, each VM also has its serial ring: two segments of 512 KiB that keep the newest serial output across VMM restarts (`engine-trait.md` section 3.19). The ring is removed with the VM. Metric samples are never stored: they live in memory only (section 5.17).
+Outside the SQLite file, next to the credential and the node's private key, the node keeps its WireGuard private key (from M5a, mode `0600`) and its identity file: `node_id`, `cluster_id`, `primary_url`, the URLs advertised in `welcome.primary_urls` (at most 8, section 5.10), the pinned certificate fingerprint, and the cluster public key with its `key_id`. It is written `0600` through a temporary file renamed into place, so a half-written identity is never read. Also outside the SQLite file, in the VM's runtime directory, each VM also has its serial ring: two segments of 512 KiB that keep the newest serial output across VMM restarts (`engine-trait.md` section 3.19). The ring is removed with the VM. From M5a each prepared image's inventory is a file next to the image in the engine's cache (section 6.11), so the node answers `inventory_resend` without inventorying the image again. Metric samples are never stored: they live in memory only (section 5.17).
 
 The store is the reason a node can be restarted, upgraded or disconnected without stopping apps: it holds the signed intent, the applied reality, and the fencing state, and nothing in it depends on the control plane being reachable.

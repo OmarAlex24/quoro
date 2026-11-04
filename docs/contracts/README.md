@@ -61,6 +61,7 @@ All ids are strings `<prefix>_<ULID>` (ULID in Crockford base32, 26 characters),
 | backup | `bkp_` | One point-in-time copy of a volume or of the control-plane database in a backup repository (ADR 0147, ADR 0148) |
 | backup repository | `brp_` | An encrypted, content-addressed store of backups in an `object_store` provider's bucket (ADR 0147) |
 | audit export | `aex_` | One off-site copy target of the audit log (ADR 0149) |
+| vulnerability finding | `vln_` | One known vulnerability in one package of an app's image, a Quoro component or a host kernel (ADR 0150) |
 | user (human) | `usr_` | A human identity |
 | API token (human) | `tok_` | Personal token of a human |
 | agent | `agt_` | An AI identity: name, model, owner (D-0029) |
@@ -106,6 +107,7 @@ The cluster keys are generated at the primary's first start and stored as `0600`
 - An app has an HA policy: `none`, `cold`, `warm`, `hot` (D-0020). `none` and `cold` (scheduled backups of a stateful app) are accepted from M5a; `warm` and `hot` are refused until M5b and M6. The field exists from M0.
 - A **domain** belongs to one app and has a TLS mode: `acme` (public-IP hosts) or `tunnel` (Cloudflare Tunnel) (D-0024).
 - An app either deploys images given by reference or has a **Git source** (`source`): then its images come from **builds** of that source, and each successful build starts a deployment with `trigger: build` (ADR 0117). A build runs on the node that runs the app (ADR 0118).
+- From M5a the node that prepares an image sends its package **inventory** to the primary, which matches it against a local copy of OSV data and records **vulnerability findings** for the apps that run the image, for the running Quoro release's own components and for host kernels (ADR 0138, ADR 0150). The image never leaves the node. A finding in CISA's KEV catalog or with a CVSS score of 9.0 or more raises `app.vulnerable`, which opens an incident. An app with a Git source is patched by a build with `refresh_base`; Quoro never upgrades a host or an image it did not build.
 - An **interactive session** is a web terminal into an app's VM or a read-only console of a VM (ADR 0114). It lives on the primary while it is open and leaves two audit records, its open and its `session.end` (ADR 0115).
 
 ### Built images
@@ -143,7 +145,7 @@ A scope is `<resource>:<verb>` (D-0030). The complete list:
 | Scope | Allows | Flags |
 | --- | --- | --- |
 | `cluster:read` | Read cluster info, version, log position | |
-| `node:read` | List and read nodes and node metrics | |
+| `node:read` | List and read nodes and node metrics; with `app:read`, the Quoro and host-kernel parts of the vulnerability summary | |
 | `node:enroll` | Create node join tokens | human-only |
 | `node:remove` | Remove a node from the cluster | destructive, human-only |
 | `node:fence_ack` | Acknowledge a node's failed fence after verifying its VMs are stopped, so its leases may be granted again | human-only |
@@ -156,12 +158,12 @@ A scope is `<resource>:<verb>` (D-0030). The complete list:
 | `vm:stop` | Stop a VM | |
 | `vm:delete` | Delete a VM and its disks | destructive |
 | `vm:console` | Read a VM's serial console, live and its recent output (ADR 0116) | |
-| `app:read` | List and read apps, their Git sources, builds, deployments, domains, volumes, env var names and app metrics | |
+| `app:read` | List and read apps, their Git sources, builds, deployments, domains, volumes, env var names, app metrics and vulnerability reports | |
 | `app:create` | Create an app | |
 | `app:update` | Change app settings, the Git source, env vars, domains, the backup schedule; create volumes | |
 | `app:restart` | Restart an app's instances | |
 | `app:redeploy` | Roll out the current image again | |
-| `app:deploy` | Deploy a new image (new deployment); start and cancel builds, whose success deploys | |
+| `app:deploy` | Deploy a new image (new deployment); start and cancel builds, whose success deploys, including a build that refreshes its base images | |
 | `app:start` | Start a stopped app | |
 | `app:stop` | Stop an app | |
 | `app:delete` | Delete an app and its data, or one volume of an app | destructive |
@@ -229,6 +231,7 @@ Event `type` is `<subject>.<what>` in lowercase with underscores. The complete l
 | `app.degraded` | An app with more than one replica has at least one instance out of the edge's rotation and at least one in it (ADR 0143) | |
 | `app.up` | An app recovered, from down or from degraded | |
 | `app.restarted` | An app's instances were restarted | |
+| `app.vulnerable` | The image an app runs has a new finding in the KEV catalog or with a CVSS score of 9.0 or more (ADR 0150); it opens an incident of its own, resolved when no such finding is open | critical CVE |
 | `deployment.started` | A deployment began | |
 | `deployment.succeeded` | A deployment's instances are healthy | |
 | `deployment.failed` | A deployment failed (image pull, rootfs, boot, health) | |
@@ -306,7 +309,7 @@ Every mutating tool takes a required `justification` string and an optional `inc
 
 M4 adds no MCP tool. Builds, metrics and console sessions are reachable by agents through the HTTP API with a grant; the web terminal is human-only (ADR 0114); a later tool is a contract change of its own.
 
-M5a adds no MCP tool either. Volumes, backups and restores are reachable by agents through the HTTP API with a grant (a volume delete and a restore only through a JIT approval); backup repositories, their recovery key and the off-site audit export are human-only. Replicas are a field of `updateApp`, with no tool of their own. A later tool is a contract change of its own.
+M5a adds no MCP tool either. Volumes, backups and restores are reachable by agents through the HTTP API with a grant (a volume delete and a restore only through a JIT approval); backup repositories, their recovery key and the off-site audit export are human-only. Replicas are a field of `updateApp`, with no tool of their own. Vulnerability reports are read through the HTTP API (`app:read`), and an agent woken by `app.vulnerable` rebuilds through `startBuild` with `refresh_base` (`app:deploy`), also with no tool of their own (ADR 0155 defers automatic rebuilds to M5b). A later tool is a contract change of its own.
 
 ### Channels
 
@@ -314,11 +317,11 @@ Every action reaches the same service layer through one of these channels, recor
 
 ### Node-agent message types
 
-Defined in node-agent-protocol.md. Node to control plane: `hello`, `heartbeat`, `status_report`, `event`, `lease_renew`, `log_ack`, `stream_data`, `stream_end`, `command_result`, `dns_challenge`. Control plane to node: `welcome`, `desired_state`, `lease_grant`, `lease_revoke`, `log_entries`, `stream_open`, `stream_close`, `stream_input`, `stream_ack`, `command`, `signing_key_rotate`, `dns_challenge_result`, `error`. Either side: `ping`, `pong`.
+Defined in node-agent-protocol.md. Node to control plane: `hello`, `heartbeat`, `status_report`, `event`, `lease_renew`, `log_ack`, `stream_data`, `stream_end`, `command_result`, `dns_challenge`, `image_inventory`. Control plane to node: `welcome`, `desired_state`, `lease_grant`, `lease_revoke`, `log_entries`, `stream_open`, `stream_close`, `stream_input`, `stream_ack`, `command`, `signing_key_rotate`, `dns_challenge_result`, `error`. Either side: `ping`, `pong`.
 
 ### Database tables
 
-Defined in db-schema.sql and changed only by the numbered files in `migrations/`: `meta`, `change_log`, `nodes`, `node_join_tokens`, `node_credentials`, `node_tunnels`, `projects`, `vms`, `apps`, `app_env`, `deployments`, `builds`, `domains`, `volumes`, `leases`, `users`, `api_tokens`, `sessions`, `agents`, `agent_keys`, `access_tokens`, `grants`, `approvals`, `incidents`, `events`, `webhooks`, `webhook_deliveries`, `providers`, `audit_log`, `audit_exports`, `interactive_sessions`, `backup_repositories`, `backups`. Tables marked local in that file are not replicated through the change log.
+Defined in db-schema.sql and changed only by the numbered files in `migrations/`: `meta`, `change_log`, `nodes`, `node_join_tokens`, `node_credentials`, `node_tunnels`, `projects`, `vms`, `apps`, `app_env`, `deployments`, `builds`, `domains`, `volumes`, `leases`, `users`, `api_tokens`, `sessions`, `agents`, `agent_keys`, `access_tokens`, `grants`, `approvals`, `incidents`, `events`, `webhooks`, `webhook_deliveries`, `providers`, `audit_log`, `audit_exports`, `interactive_sessions`, `backup_repositories`, `backups`, `osv_mirror`, `vulnerability_findings`. Tables marked local in that file are not replicated through the change log.
 
 ## Open items before the freeze
 
