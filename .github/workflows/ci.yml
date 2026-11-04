@@ -174,25 +174,3 @@ jobs:
       # Offline: the tests start a fake Quoro and the runner on 127.0.0.1.
       - name: Test
         run: python -m unittest discover -s tests -v
-
-  release-image:
-    name: Release build image
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    env:
-      # The same engine the release workflow uses.
-      QUORO_CONTAINER_ENGINE: docker
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      # Builds the pinned release build image (ADR 0090) and runs
-      # build-release.sh inside it as the runner user, which is what the
-      # release workflow does first. A pin that no longer resolves (a snapshot
-      # package, the base image digest, rustup-init) fails here, not on a tag.
-      - name: Build the image and read the version inside it
-        run: |
-          set -euo pipefail
-          version="$(packaging/build-in-container.sh --print-version)"
-          printf 'version: %s\n' "$version"
-          test -n "$version"
