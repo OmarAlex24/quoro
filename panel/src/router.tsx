@@ -15,11 +15,13 @@ import { WebhookScreen } from './screens/webhook-screen';
 import { WebhooksScreen } from './screens/webhooks-screen';
 import { AppsScreen } from './screens/apps-screen';
 import { AppScreen } from './screens/app-screen';
+import { ConsoleScreen } from './screens/console-screen';
 import { DeployScreen } from './screens/deploy-screen';
 import { LoginScreen } from './screens/login-screen';
 import { NodesScreen } from './screens/nodes-screen';
 import { SetupScreen } from './screens/setup-screen';
 import { UsersScreen } from './screens/users-screen';
+import { TerminalScreen } from './screens/terminal-screen';
 import { VmsScreen } from './screens/vms-screen';
 import { SessionProvider } from './session';
 
@@ -64,6 +66,18 @@ const nodesRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/nodes',
   component: NodesScreen,
+});
+
+const terminalRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/apps/$appId/terminal',
+  component: TerminalScreen,
+});
+
+const consoleRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/vms/$vmId/console',
+  component: ConsoleScreen,
 });
 
 const agentsRoute = createRoute({
@@ -173,6 +187,8 @@ const routeTree = rootRoute.addChildren([
   appDetailRoute,
   vmsRoute,
   nodesRoute,
+  terminalRoute,
+  consoleRoute,
   agentsRoute,
   agentDetailRoute,
   grantsRoute,

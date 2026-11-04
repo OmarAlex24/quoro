@@ -23,12 +23,8 @@ import {
 import type { App, AppEnvVar, Deployment } from '../api/generated/model';
 import { useListNodes } from '../api/generated/nodes/nodes';
 import { isApiProblem } from '../api/fetcher';
-import {
-  appLampState,
-  DEPLOY_PHASE_LABELS,
-  relativeTime,
-  shortDeploymentId,
-} from '../lib/app-status';
+import { appLampState, DEPLOY_PHASE_LABELS, relativeTime, shortDeploymentId } from '../lib/app-status';
+import { canOpenTerminal } from '../lib/capabilities';
 import { formatLogTime } from '../lib/log-buffer';
 import { problemView, type ProblemView } from '../lib/problem';
 import { useSession } from '../session';
@@ -66,7 +62,7 @@ const deploymentPhaseWords = (phase: string): string =>
     : 'Build';
 
 export function AppScreen() {
-  const { user, loading, unauthenticated, canWrite } = useSession();
+  const { me, user, loading, unauthenticated, canWrite } = useSession();
   const params = useParams({ strict: false });
   const appId = params.appId ?? '';
   const navigate = useNavigate();
@@ -248,6 +244,13 @@ export function AppScreen() {
 
           {canWrite ? (
             <div className="flex flex-wrap items-center gap-2">
+              {canOpenTerminal(me) ? (
+                <Button variant="secondary" asChild>
+                  <Link to="/apps/$appId/terminal" params={{ appId: app.id }}>
+                    Terminal
+                  </Link>
+                </Button>
+              ) : null}
               {canStart ? (
                 <Button
                   variant="primary"

@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { Link } from '@tanstack/react-router';
 import type { Vm } from '../api/generated/model';
 import { lampState } from '../lib/lamp';
 import { cn } from '../lib/utils';
@@ -12,6 +13,7 @@ export interface VmBayProps {
   projectName: string;
   nodeName: string;
   canWrite: boolean;
+  canViewConsole: boolean;
   busy: boolean;
   onStart: () => void;
   onStop: () => void;
@@ -24,6 +26,7 @@ export function VmBay({
   projectName,
   nodeName,
   canWrite,
+  canViewConsole,
   busy,
   onStart,
   onStop,
@@ -71,51 +74,60 @@ export function VmBay({
           </p>
         </div>
 
-        {canWrite ? (
+        {canWrite || canViewConsole ? (
           <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
-            {confirmingDelete ? (
-              <>
-                <p className="mr-1 text-[13px] text-ink">
-                  Delete {vm.name} and its disk?
-                </p>
-                <Button
-                  variant="danger"
-                  disabled={busy}
-                  onClick={() => {
-                    setConfirmingDelete(false);
-                    onDelete();
-                  }}
-                >
-                  Delete
-                </Button>
-                <Button
-                  variant="secondary"
-                  onClick={() => setConfirmingDelete(false)}
-                  disabled={busy}
-                >
-                  Keep
-                </Button>
-              </>
-            ) : (
-              <>
-                {wantsRunning ? (
-                  <Button variant="secondary" onClick={onStop} disabled={busy}>
-                    Stop
+            {canViewConsole ? (
+              <Button variant="secondary" asChild>
+                <Link to="/vms/$vmId/console" params={{ vmId: vm.id }}>
+                  Console
+                </Link>
+              </Button>
+            ) : null}
+            {canWrite ? (
+              confirmingDelete ? (
+                <>
+                  <p className="mr-1 text-[13px] text-ink">
+                    Delete {vm.name} and its disk?
+                  </p>
+                  <Button
+                    variant="danger"
+                    disabled={busy}
+                    onClick={() => {
+                      setConfirmingDelete(false);
+                      onDelete();
+                    }}
+                  >
+                    Delete
                   </Button>
-                ) : (
-                  <Button variant="primary" onClick={onStart} disabled={busy}>
-                    Start
+                  <Button
+                    variant="secondary"
+                    onClick={() => setConfirmingDelete(false)}
+                    disabled={busy}
+                  >
+                    Keep
                   </Button>
-                )}
-                <Button
-                  variant="danger"
-                  onClick={() => setConfirmingDelete(true)}
-                  disabled={busy}
-                >
-                  Delete
-                </Button>
-              </>
-            )}
+                </>
+              ) : (
+                <>
+                  {wantsRunning ? (
+                    <Button variant="secondary" onClick={onStop} disabled={busy}>
+                      Stop
+                    </Button>
+                  ) : (
+                    <Button variant="primary" onClick={onStart} disabled={busy}>
+                      Start
+                    </Button>
+                  )}
+                  <Button
+                    variant="danger"
+                    onClick={() => setConfirmingDelete(true)}
+                    disabled={busy}
+                  >
+                    Delete
+                  </Button>
+                </>
+              )
+            ) : null}
           </div>
         ) : null}
       </div>
