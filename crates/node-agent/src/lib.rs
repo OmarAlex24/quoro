@@ -14,6 +14,7 @@ pub mod enroll;
 pub mod health;
 pub mod identity;
 pub mod ingress;
+pub mod interactive;
 pub mod lease;
 pub mod localkey;
 pub mod logs;
@@ -22,6 +23,7 @@ pub mod reconcile;
 pub mod session;
 pub mod store;
 pub mod tls;
+pub mod transcript;
 mod util;
 
 use std::fmt;

@@ -88,6 +88,16 @@ CREATE TABLE IF NOT EXISTS deployment_lines (
 );
 CREATE INDEX IF NOT EXISTS deployment_lines_by_deployment
     ON deployment_lines (deployment_id, time_ns);
+CREATE TABLE IF NOT EXISTS transcripts (
+    session_id TEXT PRIMARY KEY,
+    vm_id      TEXT NOT NULL,
+    path       TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL DEFAULT 0,
+    sha256     TEXT NOT NULL DEFAULT '',
+    started_at INTEGER NOT NULL,
+    ended_at   INTEGER
+);
+CREATE INDEX IF NOT EXISTS transcripts_by_start ON transcripts (started_at);
 ";
 
 /// Capacity of the live log fan-out channel. A stream that falls further
@@ -159,6 +169,25 @@ pub struct VmRecord {
     pub restart_generation: u64,
     /// Whether the VM was created by this agent.
     pub created: bool,
+}
+
+/// One terminal session's transcript (`audit-log-format.md` section 3.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredTranscript {
+    /// The `trm_` session id the primary minted.
+    pub session_id: String,
+    /// The VM the session was attached to.
+    pub vm_id: String,
+    /// The asciicast file on this node.
+    pub path: std::path::PathBuf,
+    /// File size in bytes.
+    pub size_bytes: u64,
+    /// Lowercase hex SHA-256 of the file.
+    pub sha256: String,
+    /// Unix seconds when the session started.
+    pub started_at: i64,
+    /// Unix seconds when it ended; `None` while it is open.
+    pub ended_at: Option<i64>,
 }
 
 /// One buffered event awaiting delivery.
@@ -244,6 +273,31 @@ impl NodeStore {
             }
         }
         Ok(dir.join(format!("{vm_id}.sock")))
+    }
+
+    /// Where a VM's serial port socket lives (`engine-trait.md` section 3.19):
+    /// next to its console socket, in the same root-only directory. The engine
+    /// is the socket's only client (ADR 0116).
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Io`] when the directory cannot be created.
+    pub fn serial_socket(&self, vm_id: &str) -> Result<std::path::PathBuf, AgentError> {
+        let console = self.console_socket(vm_id)?;
+        Ok(console.with_file_name(format!("{vm_id}.serial.sock")))
+    }
+
+    /// Where a VM's hybrid vsock socket lives (`engine-trait.md` section
+    /// 3.18), in the same root-only directory. Only the node agent connects to
+    /// it, and nothing ever listens on `<socket>_<port>`, so the guest cannot
+    /// reach the host over vsock (ADR 0113).
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Io`] when the directory cannot be created.
+    pub fn vsock_socket(&self, vm_id: &str) -> Result<std::path::PathBuf, AgentError> {
+        let console = self.console_socket(vm_id)?;
+        Ok(console.with_file_name(format!("{vm_id}.vsock.sock")))
     }
 
     /// The next strictly increasing node-wide log instant, in nanoseconds
@@ -694,12 +748,130 @@ impl NodeStore {
             .map(|_| ())
     }
 
+    /// Records a terminal session's transcript row when its file is created.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn insert_transcript(&self, row: &StoredTranscript) -> Result<(), AgentError> {
+        sqlx::query(
+            "INSERT INTO transcripts \
+             (session_id, vm_id, path, size_bytes, sha256, started_at, ended_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(session_id) DO UPDATE SET vm_id = excluded.vm_id, \
+             path = excluded.path, size_bytes = excluded.size_bytes, \
+             sha256 = excluded.sha256, started_at = excluded.started_at, \
+             ended_at = excluded.ended_at",
+        )
+        .bind(&row.session_id)
+        .bind(&row.vm_id)
+        .bind(row.path.to_string_lossy().into_owned())
+        .bind(i64::try_from(row.size_bytes).unwrap_or(i64::MAX))
+        .bind(&row.sha256)
+        .bind(row.started_at)
+        .bind(row.ended_at)
+        .execute(&self.pool)
+        .await
+        .map_err(store_error)
+        .map(|_| ())
+    }
+
+    /// Records a transcript's final size, hash and end time.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn finish_transcript(
+        &self,
+        session_id: &str,
+        size_bytes: u64,
+        sha256: &str,
+        ended_at: i64,
+    ) -> Result<(), AgentError> {
+        sqlx::query(
+            "UPDATE transcripts SET size_bytes = ?, sha256 = ?, ended_at = ? \
+             WHERE session_id = ?",
+        )
+        .bind(i64::try_from(size_bytes).unwrap_or(i64::MAX))
+        .bind(sha256)
+        .bind(ended_at)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await
+        .map_err(store_error)
+        .map(|_| ())
+    }
+
+    /// One transcript row, when this node holds it.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn transcript(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<StoredTranscript>, AgentError> {
+        let row = sqlx::query(
+            "SELECT session_id, vm_id, path, size_bytes, sha256, started_at, ended_at \
+             FROM transcripts WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_error)?;
+        row.map(transcript_row).transpose()
+    }
+
+    /// Every transcript row on this node.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn transcripts(&self) -> Result<Vec<StoredTranscript>, AgentError> {
+        let rows = sqlx::query(
+            "SELECT session_id, vm_id, path, size_bytes, sha256, started_at, ended_at \
+             FROM transcripts ORDER BY started_at ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_error)?;
+        rows.into_iter().map(transcript_row).collect()
+    }
+
+    /// Deletes one transcript row; its file is removed by the caller.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn delete_transcript(&self, session_id: &str) -> Result<(), AgentError> {
+        sqlx::query("DELETE FROM transcripts WHERE session_id = ?")
+            .bind(session_id)
+            .execute(&self.pool)
+            .await
+            .map_err(store_error)
+            .map(|_| ())
+    }
+
     /// The pool, for a test that wants to inspect a table directly.
     #[doc(hidden)]
     #[must_use]
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
+}
+
+fn transcript_row(row: sqlx::sqlite::SqliteRow) -> Result<StoredTranscript, AgentError> {
+    let size: i64 = row.try_get("size_bytes").map_err(store_error)?;
+    let ended: Option<i64> = row.try_get("ended_at").map_err(store_error)?;
+    Ok(StoredTranscript {
+        session_id: row.try_get("session_id").map_err(store_error)?,
+        vm_id: row.try_get("vm_id").map_err(store_error)?,
+        path: std::path::PathBuf::from(row.try_get::<String, _>("path").map_err(store_error)?),
+        size_bytes: u64::try_from(size).unwrap_or(0),
+        sha256: row.try_get("sha256").map_err(store_error)?,
+        started_at: row.try_get("started_at").map_err(store_error)?,
+        ended_at: ended,
+    })
 }
 
 fn store_error(error: sqlx::Error) -> AgentError {

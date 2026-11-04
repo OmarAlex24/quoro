@@ -23,7 +23,8 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt as _;
 use quoro_engine::{
     ConsoleMode, Engine, EngineError, EngineEvent, EventStream, ImageConfig, ImageDigest, ImageRef,
-    InitConfig, MacAddr, NetAttach, NodeNetwork, StopMode, VmId, VmInfo, VmSpec, VmState,
+    InitConfig, MacAddr, NetAttach, NodeNetwork, SerialMode, StopMode, VmId, VmInfo, VmSpec,
+    VmState, VsockAttach,
 };
 use quoro_proto::wire::{
     DesiredState, DesiredStatus, Health, ObservedStatus, SpecRoute, SpecVm, VmStatus,
@@ -35,6 +36,10 @@ use crate::health::{FIRST_PROBE_DELAY, HealthTarget, is_passing, probe};
 use crate::logs::LogCollector;
 use crate::store::NodeStore;
 use crate::util;
+
+/// The guest context id of every VM's vsock device: each VM has its own vsock
+/// namespace, so all of them use 3 (`engine-trait.md` section 3.18).
+const VSOCK_GUEST_CID: u32 = 3;
 
 /// The verified snapshot the reconciler acts on.
 #[derive(Clone, Debug, PartialEq)]
@@ -658,10 +663,27 @@ impl<E: Engine + 'static> Reconciler<E> {
         .await;
 
         let ip = self.address_for(&vm_id, subnet).await?;
-        let console = match self.store.console_socket(&vm_id) {
-            Ok(socket) => ConsoleMode::VirtioConsole { socket },
+        let sockets = self.store.console_socket(&vm_id).and_then(|console| {
+            Ok((
+                console,
+                self.store.serial_socket(&vm_id)?,
+                self.store.vsock_socket(&vm_id)?,
+            ))
+        });
+        let (console, serial, vsock) = match sockets {
+            Ok((console, serial, vsock)) => (
+                ConsoleMode::VirtioConsole { socket: console },
+                // The engine is the serial socket's only client and keeps the
+                // console ring (ADR 0116); the vsock device carries exec
+                // sessions for the web terminal (ADR 0113).
+                SerialMode::Socket { path: serial },
+                Some(VsockAttach {
+                    cid: VSOCK_GUEST_CID,
+                    socket: vsock,
+                }),
+            ),
             Err(e) => {
-                warn!(vm_id, error = %e, "could not prepare the VM's console socket");
+                warn!(vm_id, error = %e, "could not prepare the VM's console sockets");
                 return None;
             }
         };
@@ -682,8 +704,8 @@ impl<E: Engine + 'static> Reconciler<E> {
             },
             init: init_config(&prepared.config, &vm.env),
             console,
-            serial: quoro_engine::SerialMode::Off,
-            vsock: None,
+            serial,
+            vsock,
         };
 
         match self.engine.create(&spec).await {

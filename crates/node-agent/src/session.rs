@@ -39,6 +39,7 @@ use tracing::{debug, info, warn};
 
 use crate::identity::{Identity, IdentityHandle};
 use crate::ingress::{DnsBridge, DnsRequest, IngressSupervisor};
+use crate::interactive::{Door, Interactive, OpenError, StreamKind};
 use crate::logs::{LogFilter, StoredLogLine};
 use crate::metrics::{MetricsRing, Tick, parse_metrics_params, tick_report};
 use crate::reconcile::Snapshot;
@@ -82,29 +83,111 @@ pub enum SessionEnd {
     Fatal(FatalReason),
 }
 
-/// The streams one session has open. Dropping it aborts every stream task, so
-/// a session end also ends its streams.
+/// The streams one session has open. Dropping it aborts every log-stream task
+/// and asks every interactive task to stop, so a session end also ends its
+/// streams.
+///
+/// An interactive stream is not aborted: its task finalises the transcript
+/// (flush, hash, row) and queues its own `stream_end`, and the session's end
+/// must not cut that short. Dropping its [`Door`] is the cancellation signal.
 #[derive(Default)]
 struct SessionStreams {
     handles: HashMap<String, JoinHandle<()>>,
+    doors: HashMap<String, Door>,
 }
 
 impl SessionStreams {
+    /// Stops a stream. Returns whether the session still has to answer with a
+    /// generic `stream_end` `cancelled`: a log stream cannot, an interactive
+    /// task does it itself (with its transcript fields).
     fn stop(&mut self, stream_id: &str) -> bool {
+        let interactive = self.doors.remove(stream_id).is_some();
         match self.handles.remove(stream_id) {
             Some(handle) => {
-                handle.abort();
-                true
+                if interactive {
+                    // The task sees the dropped door and ends itself.
+                    drop(handle);
+                    false
+                } else {
+                    handle.abort();
+                    true
+                }
             }
             None => false,
         }
+    }
+
+    /// Registers a task and, for an interactive stream, its control surface.
+    fn insert(&mut self, stream_id: String, handle: JoinHandle<()>, door: Option<Door>) {
+        if let Some(previous) = self.handles.remove(&stream_id) {
+            if self.doors.remove(&stream_id).is_some() {
+                // The old interactive task stops on the dropped door.
+                drop(previous);
+            } else {
+                previous.abort();
+            }
+        }
+        if let Some(door) = door {
+            self.doors.insert(stream_id.clone(), door);
+        }
+        self.handles.insert(stream_id, handle);
+    }
+
+    /// Drops finished tasks and their doors, freeing the stream slots.
+    fn prune(&mut self) {
+        self.handles.retain(|stream_id, handle| {
+            let live = !handle.is_finished();
+            if !live {
+                self.doors.remove(stream_id);
+            }
+            live
+        });
+    }
+
+    /// Whether this session still holds a live stream under `stream_id`.
+    fn is_live(&self, stream_id: &str) -> bool {
+        self.handles
+            .get(stream_id)
+            .is_some_and(|handle| !handle.is_finished())
+    }
+
+    /// The door of a live interactive stream.
+    fn door(&self, stream_id: &str) -> Option<&Door> {
+        if !self.is_live(stream_id) {
+            return None;
+        }
+        self.doors.get(stream_id)
+    }
+
+    /// Ends every stream and waits briefly for the interactive tasks to write
+    /// their transcripts and final `stream_end`.
+    async fn finish(&mut self) {
+        let doors = std::mem::take(&mut self.doors);
+        let mut finishing = Vec::new();
+        for (stream_id, handle) in self.handles.drain() {
+            if doors.contains_key(&stream_id) {
+                finishing.push(handle);
+            } else {
+                handle.abort();
+            }
+        }
+        // Dropping the doors signals cancellation.
+        drop(doors);
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            futures_util::future::join_all(finishing),
+        )
+        .await;
     }
 }
 
 impl Drop for SessionStreams {
     fn drop(&mut self) {
-        for (_, handle) in self.handles.drain() {
-            handle.abort();
+        let doors = std::mem::take(&mut self.doors);
+        for (stream_id, handle) in self.handles.drain() {
+            if !doors.contains_key(&stream_id) {
+                handle.abort();
+            }
         }
     }
 }
@@ -159,6 +242,9 @@ pub struct Session {
     dns: Option<Arc<DnsBridge>>,
     /// The metric rings, when the agent samples metrics (section 5.17).
     metrics: Option<MetricsRing>,
+    /// The engine handles behind `terminal` and `console` streams (M4), when
+    /// the agent runs one.
+    interactive: Option<Interactive>,
 }
 
 impl Session {
@@ -184,7 +270,16 @@ impl Session {
             ingress: None,
             dns: None,
             metrics: None,
+            interactive: None,
         }
+    }
+
+    /// Attaches the interactive handles: `terminal`, `console` and `transcript`
+    /// streams answer `not_available` without them.
+    #[must_use]
+    pub fn with_interactive(mut self, interactive: Interactive) -> Self {
+        self.interactive = Some(interactive);
+        self
     }
 
     /// Attaches the app-route supervisor: its per-hostname certificate state
@@ -304,9 +399,25 @@ impl Session {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
+        let mut streams = SessionStreams::default();
+        let end = self.serve_streams(ws, stop, &mut streams).await;
+        // A session end must still finalise terminal transcripts and queue the
+        // ends of its interactive streams, however it ended.
+        streams.finish().await;
+        end
+    }
+
+    async fn serve_streams<S>(
+        &mut self,
+        ws: WebSocketStream<S>,
+        stop: impl Future<Output = ()> + Send,
+        streams: &mut SessionStreams,
+    ) -> Result<SessionEnd, AgentError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
         let mut stop = std::pin::pin!(stop);
         let (mut sink, mut source) = ws.split();
-        let mut streams = SessionStreams::default();
         // Stream tasks hand their frames to the session loop, which owns the
         // sink; a task never blocks the loop while it waits for lines.
         let (stream_tx, mut stream_rx) = mpsc::channel::<NodeMessage>(256);
@@ -483,7 +594,7 @@ impl Session {
                     last_rx = Instant::now();
                     match frame {
                         Some(Ok(Message::Text(text))) => {
-                            match self.handle(&text, &mut sink, &mut streams, &stream_tx).await {
+                            match self.handle(&text, &mut sink, streams, &stream_tx).await {
                                 Ok(Some(end)) => return Ok(end),
                                 Ok(None) => {}
                                 Err(AgentError::Fatal(reason)) => {
@@ -580,6 +691,12 @@ impl Session {
             }
             ControlMessage::Pong | ControlMessage::LogEntries(_) => {
                 // Change-log follow is a follow-up.
+            }
+            ControlMessage::StreamInput(input) => {
+                Self::on_stream_input(&raw, &input, streams, sink).await?;
+            }
+            ControlMessage::StreamAck(ack) => {
+                Self::on_stream_ack(&raw, &ack, streams, sink).await?;
             }
             ControlMessage::DnsChallengeResult(result) => {
                 let Some(re) = raw.re.as_deref() else {
@@ -917,7 +1034,7 @@ impl Session {
     {
         // A finished stream (a replayed `deployment_logs`, an ended reader)
         // no longer holds a slot.
-        streams.handles.retain(|_, handle| !handle.is_finished());
+        streams.prune();
         if streams.handles.len() >= MAX_STREAMS {
             let body = bad_result("stream_limit");
             write_message(sink, NodeMessage::CommandResult(body), Some(&raw.id)).await?;
@@ -925,53 +1042,154 @@ impl Session {
         }
         let store = self.store.clone();
         let stream_id = open.stream_id.clone();
-        let handle = match open.kind.as_str() {
+        let opened = match open.kind.as_str() {
             "app_logs" => match parse_app_logs(&open.params) {
-                Ok(params) => spawn_app_logs(store, stream_id, params, stream_tx.clone()),
-                Err(message) => {
-                    let body = bad_result(&message);
-                    write_message(sink, NodeMessage::CommandResult(body), Some(&raw.id)).await?;
-                    return Ok(());
-                }
+                Ok(params) => Ok((
+                    spawn_app_logs(store, stream_id, params, stream_tx.clone()),
+                    None,
+                )),
+                Err(message) => Err(bad_result(&message)),
             },
             "deployment_logs" => match parse_deployment_logs(&open.params) {
-                Ok((deployment_id, phase)) => {
-                    spawn_deployment_logs(store, stream_id, deployment_id, phase, stream_tx.clone())
-                }
-                Err(message) => {
-                    let body = bad_result(&message);
-                    write_message(sink, NodeMessage::CommandResult(body), Some(&raw.id)).await?;
-                    return Ok(());
-                }
+                Ok((deployment_id, phase)) => Ok((
+                    spawn_deployment_logs(
+                        store,
+                        stream_id,
+                        deployment_id,
+                        phase,
+                        stream_tx.clone(),
+                    ),
+                    None,
+                )),
+                Err(message) => Err(bad_result(&message)),
             },
             "metrics" => match parse_metrics_params(&open.params) {
                 Ok((node, vm_ids)) => match &self.metrics {
                     // Subscribe before spawning so no round is missed between
                     // this frame and the task's first poll.
-                    Some(ring) => {
-                        spawn_metrics(ring.subscribe(), stream_id, node, vm_ids, stream_tx.clone())
-                    }
-                    None => {
-                        let body = bad_result("metrics are not sampled on this node");
-                        write_message(sink, NodeMessage::CommandResult(body), Some(&raw.id))
-                            .await?;
-                        return Ok(());
-                    }
+                    Some(ring) => Ok((
+                        spawn_metrics(ring.subscribe(), stream_id, node, vm_ids, stream_tx.clone()),
+                        None,
+                    )),
+                    None => Err(bad_result("metrics are not sampled on this node")),
                 },
-                Err(message) => {
-                    let body = bad_result(&message);
-                    write_message(sink, NodeMessage::CommandResult(body), Some(&raw.id)).await?;
-                    return Ok(());
-                }
+                Err(message) => Err(bad_result(&message)),
             },
-            other => {
-                let body = bad_result(&format!("stream kind {other:?} is not supported"));
+            "terminal" => match &self.interactive {
+                Some(interactive) => interactive
+                    .open_terminal(&open.stream_id, &open.params, stream_tx.clone())
+                    .await
+                    .map(|opened| (opened.handle, Some(opened.door)))
+                    .map_err(open_error_result),
+                None => Err(interactive_unavailable()),
+            },
+            "console" => match &self.interactive {
+                Some(interactive) => interactive
+                    .open_console(&open.stream_id, &open.params, stream_tx.clone())
+                    .map(|opened| (opened.handle, Some(opened.door)))
+                    .map_err(open_error_result),
+                None => Err(interactive_unavailable()),
+            },
+            "transcript" => match &self.interactive {
+                Some(interactive) => interactive
+                    .open_transcript(&open.stream_id, &open.params, stream_tx.clone())
+                    .await
+                    .map(|opened| (opened.handle, Some(opened.door)))
+                    .map_err(open_error_result),
+                None => Err(interactive_unavailable()),
+            },
+            other => Err(bad_result(&format!(
+                "stream kind {other:?} is not supported"
+            ))),
+        };
+        match opened {
+            Ok((handle, door)) => streams.insert(open.stream_id.clone(), handle, door),
+            Err(body) => {
                 write_message(sink, NodeMessage::CommandResult(body), Some(&raw.id)).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies one `stream_input` (section 5.24).
+    ///
+    /// Only a `terminal` takes input; another live stream is answered with
+    /// `bad_message` non-fatal and the input is dropped, while an unknown or
+    /// ended stream id is ignored silently.
+    async fn on_stream_input<S>(
+        raw: &RawFrame,
+        input: &wire::StreamInput,
+        streams: &SessionStreams,
+        sink: &mut SplitSink<WebSocketStream<S>, Message>,
+    ) -> Result<(), AgentError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let Some(door) = streams.door(&input.stream_id) else {
+            if streams.is_live(&input.stream_id) {
+                let error = ProtocolError {
+                    code: ErrorCode::BadMessage,
+                    message: "this stream does not take input".to_owned(),
+                    fatal: false,
+                };
+                write_message(sink, NodeMessage::Error(error), Some(&raw.id)).await?;
+            }
+            return Ok(());
+        };
+        if door.kind != StreamKind::Terminal {
+            let error = ProtocolError {
+                code: ErrorCode::BadMessage,
+                message: "a console stream is read-only".to_owned(),
+                fatal: false,
+            };
+            write_message(sink, NodeMessage::Error(error), Some(&raw.id)).await?;
+            return Ok(());
+        }
+        let parsed = match crate::interactive::parse_input(input) {
+            Ok(parsed) => parsed,
+            Err(message) => {
+                let error = ProtocolError {
+                    code: ErrorCode::BadMessage,
+                    message,
+                    fatal: false,
+                };
+                write_message(sink, NodeMessage::Error(error), Some(&raw.id)).await?;
                 return Ok(());
             }
         };
-        if let Some(previous) = streams.handles.insert(open.stream_id.clone(), handle) {
-            previous.abort();
+        // Never awaits: the session loop serves every stream and the node's
+        // heartbeat, so one stuck terminal must not stall it.
+        door.push_input(parsed);
+        Ok(())
+    }
+
+    /// Applies one `stream_ack` to a data stream's credit window (section
+    /// 5.25).
+    ///
+    /// An earlier ack is ignored; an ack beyond the bytes sent is a primary
+    /// bug, answered with `bad_message` non-fatal and otherwise ignored.
+    async fn on_stream_ack<S>(
+        raw: &RawFrame,
+        ack: &wire::StreamAck,
+        streams: &SessionStreams,
+        sink: &mut SplitSink<WebSocketStream<S>, Message>,
+    ) -> Result<(), AgentError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let Some(door) = streams.door(&ack.stream_id) else {
+            return Ok(());
+        };
+        if door.credit.ack(ack.acked_bytes) == crate::interactive::Ack::Beyond {
+            let error = ProtocolError {
+                code: ErrorCode::BadMessage,
+                message: format!(
+                    "stream_ack for {} bytes is beyond what was sent",
+                    ack.acked_bytes
+                ),
+                fatal: false,
+            };
+            write_message(sink, NodeMessage::Error(error), Some(&raw.id)).await?;
         }
         Ok(())
     }
@@ -1193,6 +1411,34 @@ fn parse_deployment_logs(params: &serde_json::Value) -> Result<(String, Option<S
     Ok((deployment_id, phase))
 }
 
+/// The `command_result` answering a stream open this node cannot serve.
+fn open_error_result(error: OpenError) -> CommandResult {
+    CommandResult {
+        status: CommandStatus::Error,
+        detail: Some(error.message().to_owned()),
+        error: Some(ErrorBody {
+            code: error.code(),
+            message: error.message().to_owned(),
+        }),
+        lines: None,
+        metrics: None,
+    }
+}
+
+/// The answer when the agent runs without interactive handles attached.
+fn interactive_unavailable() -> CommandResult {
+    CommandResult {
+        status: CommandStatus::Error,
+        detail: Some("interactive streams are not available on this node".to_owned()),
+        error: Some(ErrorBody {
+            code: ErrorCode::NotAvailable,
+            message: "interactive streams are not available on this node".to_owned(),
+        }),
+        lines: None,
+        metrics: None,
+    }
+}
+
 /// A `command_result` with `bad_message`.
 fn bad_result(message: &str) -> CommandResult {
     CommandResult {
@@ -1279,6 +1525,9 @@ async fn send_end(
             stream_id: stream_id.to_owned(),
             reason,
             message,
+            exit_code: None,
+            transcript_sha256: None,
+            transcript_bytes: None,
         }))
         .await;
 }
@@ -1857,16 +2106,16 @@ mod tests {
                 send(
                     &mut ws,
                     ControlMessage::StreamOpen(StreamOpen {
-                        stream_id: "msg_console".to_owned(),
-                        kind: "console".to_owned(),
+                        stream_id: "msg_metrics".to_owned(),
+                        kind: "metrics".to_owned(),
                         params: json!({}),
                     })
-                    .to_frame("msg_open_console", None)
+                    .to_frame("msg_open_metrics", None)
                     .to_text(),
                 )
                 .await;
                 let answer = read_until(&mut ws, "command_result").await;
-                assert_eq!(answer["re"], "msg_open_console");
+                assert_eq!(answer["re"], "msg_open_metrics");
                 assert_eq!(answer["body"]["status"], "error");
                 assert_eq!(answer["body"]["error"]["code"], "bad_message");
             })

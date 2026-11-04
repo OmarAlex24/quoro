@@ -72,3 +72,7 @@ tokio = { version = "1", features = [
 # The TLS test generates a self-signed certificate and keys its pin off its
 # digest (section 2.2); rcgen 0.13 is already in `Cargo.lock`.
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# The interactive tests decode `stream_data` and re-hash a transcript file;
+# both crates are already the library's dependencies.
+base64 = { version = "0.22", default-features = false, features = ["std"] }
+sha2 = { version = "0.10", default-features = false }

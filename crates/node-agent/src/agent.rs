@@ -10,6 +10,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use quoro_engine::Engine;
 use quoro_proto::sign;
@@ -19,11 +20,13 @@ use tracing::{info, warn};
 
 use crate::identity::IdentityHandle;
 use crate::ingress::{CertificateEvents, DnsBridge, IngressSupervisor};
+use crate::interactive::Interactive;
 use crate::metrics::{MetricsRing, MetricsSampler};
 use crate::reconcile::{ReconcileConfig, ReconcileOptions, Reconciler, Snapshot};
 use crate::session::{Session, SessionSetup, wait_stop};
 use crate::store::NodeStore;
-use crate::{AgentConfig, AgentError, NodeFacts};
+use crate::transcript::{self, TranscriptLimits};
+use crate::{AgentConfig, AgentError, NodeFacts, util};
 
 /// Runs the node until `shutdown` resolves.
 ///
@@ -57,8 +60,8 @@ pub async fn run<E: Engine + 'static>(
         CertificateEvents::new(store.clone(), Some(identity.get().node_id)),
     ));
 
-    let (desired, desired_rx) = watch::channel(current.clone());
     let engine = Arc::new(engine);
+    let (desired, desired_rx) = watch::channel(current.clone());
     let (reconciler, observed) = Reconciler::new(
         Arc::clone(&engine),
         store.clone(),
@@ -91,6 +94,26 @@ pub async fn run<E: Engine + 'static>(
     let reconcile_task = tokio::spawn(reconciler.run(desired_rx, wait_stop(stop_rx.clone())));
     let metrics_task = tokio::spawn(sampler.run(wait_stop(stop_rx.clone())));
 
+    // Terminal transcripts are pruned at agent start and then hourly; each
+    // terminal session also prunes once it ends (section 3.3).
+    let limits = TranscriptLimits::default();
+    if let Err(e) = transcript::sweep(&store, limits, util::now_secs()).await {
+        warn!(error = %e, "could not prune transcripts");
+    }
+    let retention_store = store.clone();
+    let retention_task = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60 * 60));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            if let Err(e) = transcript::sweep(&retention_store, limits, util::now_secs()).await {
+                warn!(error = %e, "could not prune transcripts");
+            }
+        }
+    });
+
+    let interactive = Interactive::new(Arc::clone(&engine), store.clone());
     let mut session = Session::new(SessionSetup {
         identity,
         store,
@@ -100,10 +123,12 @@ pub async fn run<E: Engine + 'static>(
         current,
     })
     .with_ingress(Arc::clone(&ingress), dns)
-    .with_metrics(metrics);
+    .with_metrics(metrics)
+    .with_interactive(interactive);
     let outcome = session.run(stop_rx).await;
 
     let _ = stop.send(true);
+    retention_task.abort();
     let _ = reconcile_task.await;
     let _ = metrics_task.await;
     ingress.shutdown().await;

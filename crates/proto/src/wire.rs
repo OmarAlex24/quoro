@@ -376,11 +376,15 @@ pub struct StreamData {
 
 /// `reason` of `stream_end` (section 5.8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum StreamEndReason {
     Completed,
     Error,
     Cancelled,
+    /// A `terminal` whose VM stopped, or a `console` whose VM was deleted (M4).
+    VmStopped,
+    /// A `terminal` whose transcript reached its cap (M4).
+    Limit,
 }
 
 /// Body of `stream_end` (section 5.8).
@@ -390,6 +394,15 @@ pub struct StreamEnd {
     pub reason: StreamEndReason,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// `terminal` only: the program's exit code, or `128 + signal`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// `terminal` only: lowercase hex SHA-256 of the transcript as stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_sha256: Option<String>,
+    /// `terminal` only: the transcript's size in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_bytes: Option<u64>,
 }
 
 /// A node-to-control-plane message with a typed body.
@@ -706,6 +719,41 @@ pub struct StreamClose {
     pub stream_id: String,
 }
 
+/// A new window size in `stream_input` (section 5.24).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowSize {
+    /// 1 to 1 000.
+    pub rows: u16,
+    /// 1 to 1 000.
+    pub cols: u16,
+}
+
+/// Body of `stream_input` (section 5.24): input for a `terminal` stream. At
+/// least one of `data`, `resize` and `eof` is present; the node applies them
+/// in that order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamInput {
+    pub stream_id: String,
+    /// Per-stream input sequence, gap-free from 1.
+    pub seq: u64,
+    /// Base64 bytes for the program's input, at most 64 KiB decoded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resize: Option<WindowSize>,
+    /// True to close the program's input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eof: Option<bool>,
+}
+
+/// Body of `stream_ack` (section 5.25): credit for a `data` stream.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamAck {
+    pub stream_id: String,
+    /// Cumulative decoded bytes of the stream's `data` the consumer has taken.
+    pub acked_bytes: u64,
+}
+
 /// Body of `command` (section 5.17).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Command {
@@ -725,6 +773,8 @@ pub enum ControlMessage {
     LogEntries(LogEntries),
     StreamOpen(StreamOpen),
     StreamClose(StreamClose),
+    StreamInput(StreamInput),
+    StreamAck(StreamAck),
     Command(Command),
     /// The raw signed body (section 5.21).
     SigningKeyRotate(Value),
@@ -746,6 +796,8 @@ impl ControlMessage {
             Self::LogEntries(_) => "log_entries",
             Self::StreamOpen(_) => "stream_open",
             Self::StreamClose(_) => "stream_close",
+            Self::StreamInput(_) => "stream_input",
+            Self::StreamAck(_) => "stream_ack",
             Self::Command(_) => "command",
             Self::SigningKeyRotate(_) => "signing_key_rotate",
             Self::DnsChallengeResult(_) => "dns_challenge_result",
@@ -767,6 +819,8 @@ impl ControlMessage {
             Self::LogEntries(b) => frame(kind, id, re, b),
             Self::StreamOpen(b) => frame(kind, id, re, b),
             Self::StreamClose(b) => frame(kind, id, re, b),
+            Self::StreamInput(b) => frame(kind, id, re, b),
+            Self::StreamAck(b) => frame(kind, id, re, b),
             Self::Command(b) => frame(kind, id, re, b),
             Self::DnsChallengeResult(b) => frame(kind, id, re, b),
             Self::Error(b) => frame(kind, id, re, b),
@@ -788,6 +842,8 @@ impl ControlMessage {
             "log_entries" => Self::LogEntries(raw.body_as()?),
             "stream_open" => Self::StreamOpen(raw.body_as()?),
             "stream_close" => Self::StreamClose(raw.body_as()?),
+            "stream_input" => Self::StreamInput(raw.body_as()?),
+            "stream_ack" => Self::StreamAck(raw.body_as()?),
             "command" => Self::Command(raw.body_as()?),
             "signing_key_rotate" => Self::SigningKeyRotate(raw.body.clone()),
             "dns_challenge_result" => Self::DnsChallengeResult(raw.body_as()?),
@@ -1017,5 +1073,74 @@ mod tests {
         assert!(id.starts_with("msg_"));
         assert_eq!(id.len(), 30);
         assert_ne!(id, msg_id([0xac; 16]));
+    }
+
+    #[test]
+    fn the_protocol_interactive_examples_decode() {
+        let input = r#"{"v":1,"type":"stream_input","id":"msg_01JC9ZX4C6E8G0J2M4P6R8T0V2","body":{
+            "stream_id":"msg_01JC9ZD0L3N5Q7S9V1X3Z5B7D9","seq":3,"data":"dW5hbWUgLWEK"}}"#;
+        let raw = RawFrame::parse(input).unwrap();
+        let ControlMessage::StreamInput(body) = ControlMessage::from_raw(&raw).unwrap() else {
+            panic!("expected stream_input");
+        };
+        assert_eq!(body.seq, 3);
+        assert_eq!(body.data.as_deref(), Some("dW5hbWUgLWEK"));
+        assert_eq!((body.resize, body.eof), (None, None));
+
+        let resize = r#"{"v":1,"type":"stream_input","id":"msg_1","body":{
+            "stream_id":"msg_2","seq":4,"resize":{"rows":50,"cols":132}}}"#;
+        let raw = RawFrame::parse(resize).unwrap();
+        let ControlMessage::StreamInput(body) = ControlMessage::from_raw(&raw).unwrap() else {
+            panic!("expected stream_input");
+        };
+        assert_eq!(
+            body.resize,
+            Some(WindowSize {
+                rows: 50,
+                cols: 132
+            })
+        );
+
+        let ack = r#"{"v":1,"type":"stream_ack","id":"msg_3","body":{
+            "stream_id":"msg_2","acked_bytes":196608}}"#;
+        let raw = RawFrame::parse(ack).unwrap();
+        let message = ControlMessage::from_raw(&raw).unwrap();
+        assert_eq!(message.kind(), "stream_ack");
+        let ControlMessage::StreamAck(body) = message.clone() else {
+            panic!("expected stream_ack");
+        };
+        assert_eq!(body.acked_bytes, 196_608);
+        let back = ControlMessage::from_raw(&message.to_frame("msg_3", None)).unwrap();
+        assert_eq!(back, message);
+
+        let end = r#"{"v":1,"type":"stream_end","id":"msg_4","body":{
+            "stream_id":"msg_2","reason":"completed","exit_code":0,
+            "transcript_sha256":"4f2a9c1e7b3d5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8",
+            "transcript_bytes":18234}}"#;
+        let raw = RawFrame::parse(end).unwrap();
+        let NodeMessage::StreamEnd(body) = NodeMessage::from_raw(&raw).unwrap() else {
+            panic!("expected stream_end");
+        };
+        assert_eq!(body.exit_code, Some(0));
+        assert_eq!(body.transcript_bytes, Some(18_234));
+
+        let stopped = StreamEnd {
+            stream_id: "msg_2".to_owned(),
+            reason: StreamEndReason::VmStopped,
+            message: None,
+            exit_code: None,
+            transcript_sha256: None,
+            transcript_bytes: None,
+        };
+        let value = serde_json::to_value(&stopped).unwrap();
+        assert_eq!(value, json!({"stream_id": "msg_2", "reason": "vm_stopped"}));
+        assert_eq!(
+            serde_json::to_value(StreamEndReason::Limit).unwrap(),
+            json!("limit")
+        );
+        assert_eq!(
+            serde_json::to_value(crate::ErrorCode::NotAvailable).unwrap(),
+            json!("not_available")
+        );
     }
 }

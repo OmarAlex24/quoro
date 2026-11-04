@@ -92,6 +92,12 @@ pub enum ErrorCode {
     /// A self-fence could not confirm that every bound VM stopped (section
     /// 5.18, ADR 0079).
     FenceFailed,
+    /// A `stream_open` or `command` named a build, VM or transcript this node
+    /// does not have (M4, carried in a `command_result`).
+    NotFound,
+    /// The VM exists but cannot serve the requested stream now, such as a
+    /// `terminal` on a stopped VM (M4, carried in a `command_result`).
+    NotAvailable,
 }
 
 /// The `data.reason` enum of the `node.fenced` event (section 8.5,
