@@ -249,13 +249,26 @@ Because `session.end` is chained like every record, a transcript edited after th
 - **Retention:** 30 days on the node, and at most 1 GiB of transcripts per node, the oldest deleted first. Deleting the app or its VM does not delete them; removing the node or purging its data does. A deleted transcript leaves its `session.end` record, whose hash then has nothing to verify.
 - **Access:** `GET /api/v1/interactive-sessions/{session_id}/transcript`, which needs `audit:read` and a human caller (permission-model.md, section 7.6). The primary relays the file from the node over the node session, on demand; it answers `node_unreachable` (504) when the node is not connected and `not_found` (404) when the node no longer has the file. Every fetch is recorded, with `target_type` `vm`, the session's VM as `target_id` and `params` `{session_id}`.
 
+### 3.4 Password changes (M4)
+
+`POST /api/v1/auth/password` (ADR 0135, [openapi.yaml](openapi.yaml), `changePassword`) writes one record per call that reached an identity, with the user as actor and as target (`target_type` `user`, `target_id` the user's id), no `scope` and `channel` `panel`:
+
+| Outcome | `result` | `result_detail` | `change_seq` |
+| --- | --- | --- | --- |
+| password changed | `ok` | absent | the change-log seq of the `users` update |
+| `current_password` does not match | `refused` | `wrong_password` | absent |
+| attempt rate limited | `refused` | `rate_limited` | absent |
+| `new_password` breaks the password rule or equals the current one | `error` | `validation_failed` | absent |
+
+`params` carries both keys, redacted (section 4): `{"current_password": "[redacted]", "new_password": "[redacted]"}`. The `wrong_password` records are the trail of someone guessing a password with a stolen session. A request without a session cookie, or with an `Authorization` header, has no identity to attribute and is not recorded (section 7).
+
 ## 4. Redaction
 
 Requests can carry secrets. The audit record stores the request parameters, so it must not become a second secret store (D-0031).
 
 The redaction rule:
 
-- The values of the keys `value`, `values`, `secret`, `password`, `token` and `key` are replaced by the string `"[redacted]"`, at any depth of the `params` object.
+- The values of the keys `value`, `values`, `secret`, `password`, `current_password`, `new_password`, `token` and `key` are replaced by the string `"[redacted]"`, at any depth of the `params` object.
 - **Every environment variable value** is replaced by `"[redacted]"`, whatever the key is called. Environment variable *names* are kept, because a name is not a secret and the record of which variable changed is the useful part (D-0031; [openapi.yaml](openapi.yaml), `app_env`).
 - Everything else is stored as sent.
 
