@@ -384,7 +384,7 @@ Edge backend entry:
 | `reason` | string | no | When out of rotation: `health_check` (its probe failed `failures` times in a row) or `connect_failed` (a request could not connect or was reset) |
 | `last_error` | string | no | One line from the last failed probe or connection, at most 500 characters |
 
-The primary does not store edge backend health. It keeps the newest report, shows it, and turns changes into events: `app.degraded` while some but not all instances of an app are out of rotation, `app.down` with `check: edge_health` when none is left, and `app.up` when every instance is back (`events.schema.json`).
+The primary does not store edge backend health. It keeps the newest report, shows it in `AppDetail.edge_backends` (`openapi.yaml`), and turns changes into events: `app.degraded` while some but not all instances of an app are out of rotation, `app.down` with `check: edge_health` when none is left, and `app.up` when every instance is back (`events.schema.json`).
 
 The primary owns the `volumes` and `backups` tables and the `backup.*` and `restore.*` events, as it does for builds: it applies each reported change to the row, seals a reported `succeeded` backup (`backup-format.md` section 6.2), and emits the events. A node emits no `backup.*` or `restore.*` event of its own. A volume reported `deleted` is removed from the `volumes` table and leaves `spec.volumes` in the next revision. An `orphaned` volume is kept and never deleted by the protocol (section 6.7).
 

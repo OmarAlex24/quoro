@@ -127,6 +127,9 @@ pub async fn get_app(state: &AppState, ctx: &CallCtx, app_id: &str) -> Result<Ap
             app,
             instances,
             domains,
+            // Filled from the edge's in-memory report once the edge serves
+            // routes (ADR 0143).
+            edge_backends: Vec::new(),
         })
     }
     .await;

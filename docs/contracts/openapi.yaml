@@ -1593,6 +1593,61 @@ components:
               description: Hostnames routed to this app.
               items:
                 $ref: '#/components/schemas/Domain'
+            edge_backends:
+              type: array
+              description: |
+                From M5a: the edge's view of this app's instances, one entry per
+                instance the edge balances over (ADR 0143). Taken from the
+                edge's newest `status_report`, which the primary keeps in
+                memory and never stores, so the list is empty while no edge
+                serves the app, after a primary restart until the edge reports
+                again, and for an app with one replica. Absent from a primary
+                older than M5a.
+              items:
+                $ref: '#/components/schemas/EdgeBackend'
+    EdgeBackend:
+      type: object
+      title: EdgeBackend
+      description: |
+        One instance of an app as the edge that serves it sees it
+        (`node-agent-protocol.md` section 5.3, edge backend entry). The
+        edge's health decisions are its own: they change no replicated state.
+      required:
+        - edge_node_id
+        - vm_id
+        - node_id
+        - in_rotation
+        - since
+      properties:
+        edge_node_id:
+          type: string
+          pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: The machine with the `edge` role that reported it.
+        vm_id:
+          type: string
+          pattern: '^vm_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: The instance.
+        node_id:
+          type: string
+          pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: Node that runs the instance.
+        in_rotation:
+          type: boolean
+          description: Whether the edge sends it requests.
+        since:
+          type: string
+          format: date-time
+          description: When `in_rotation` last changed, or when the edge first saw the instance.
+        reason:
+          type: [string, 'null']
+          description: |
+            Why it is out of rotation: `health_check` (its probe failed
+            `failures` times in a row) or `connect_failed` (a request could
+            not connect or was reset); null while in rotation.
+        last_error:
+          type: [string, 'null']
+          maxLength: 500
+          description: One line from the last failed probe or connection; null when none.
     AppList:
       type: object
       title: AppList

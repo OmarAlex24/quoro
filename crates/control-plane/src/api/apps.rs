@@ -386,6 +386,37 @@ pub struct AppDetail {
     pub instances: Vec<Vm>,
     /// Hostnames routed to this app.
     pub domains: Vec<Domain>,
+    /// The edge's view of the app's instances (ADR 0143), from the edge's
+    /// newest `status_report`; empty while no edge serves the app.
+    pub edge_backends: Vec<EdgeBackend>,
+}
+
+/// One instance of an app as the edge that serves it sees it (`openapi.yaml`
+/// `EdgeBackend`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
+#[schema(title = "EdgeBackend")]
+pub struct EdgeBackend {
+    /// The machine with the `edge` role that reported it.
+    #[schema(pattern = "^nod_[0-9A-HJKMNP-TV-Z]{26}$")]
+    pub edge_node_id: String,
+    /// The instance.
+    #[schema(pattern = "^vm_[0-9A-HJKMNP-TV-Z]{26}$")]
+    pub vm_id: String,
+    /// Node that runs the instance.
+    #[schema(pattern = "^nod_[0-9A-HJKMNP-TV-Z]{26}$")]
+    pub node_id: String,
+    /// Whether the edge sends it requests.
+    pub in_rotation: bool,
+    /// When `in_rotation` last changed, or when the edge first saw the
+    /// instance.
+    #[schema(format = "date-time")]
+    pub since: String,
+    /// Why it is out of rotation (`health_check` or `connect_failed`); null
+    /// while in rotation.
+    pub reason: Option<String>,
+    /// One line from the last failed probe or connection; null when none.
+    #[schema(max_length = 500)]
+    pub last_error: Option<String>,
 }
 
 impl utoipa::PartialSchema for AppDetail {
@@ -401,6 +432,10 @@ impl utoipa::PartialSchema for AppDetail {
             .property(
                 "domains",
                 ArrayBuilder::new().items(Ref::from_schema_name("Domain")),
+            )
+            .property(
+                "edge_backends",
+                ArrayBuilder::new().items(Ref::from_schema_name("EdgeBackend")),
             )
             .required("instances")
             .required("domains");
@@ -2736,6 +2771,7 @@ pub fn routes() -> Router<AppState> {
         schemas(
             App,
             AppDetail,
+            EdgeBackend,
             AppList,
             CreateAppRequest,
             UpdateAppRequest,
