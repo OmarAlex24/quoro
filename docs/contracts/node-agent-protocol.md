@@ -236,6 +236,7 @@ All bodies are objects. Field names are snake_case. Timestamps are RFC 3339 UTC 
 | `allocated` | object | yes | Same shape, currently allocated |
 | `kvm` | object | yes | `available`, `kernel`, `nested` (optional) |
 | `dropped_events` | integer | yes | Local events dropped from the buffer since the last successful delivery; 0 when none |
+| `volume_snapshot` | string | no | How this node snapshots a volume (ADR 0146): `reflink` when its data directory supports `FICLONE`, otherwise `pause_copy`. Probed once at agent start (`engine-trait.md` section 3.16). Absent from an agent older than M5a, which the primary treats as a node that cannot hold a volume |
 
 Each lease entry:
 
@@ -277,7 +278,8 @@ Each lease entry:
     "capacity": { "cpus": 8, "memory_mb": 16384, "disk_gb": 200 },
     "allocated": { "cpus": 2, "memory_mb": 2048, "disk_gb": 20 },
     "kvm": { "available": true, "kernel": "6.11.2", "nested": true },
-    "dropped_events": 0
+    "dropped_events": 0,
+    "volume_snapshot": "pause_copy"
   }
 }
 ```
@@ -315,6 +317,8 @@ Each lease entry:
 | `allocated` | object | yes | Same shape, currently allocated |
 | `disk_free_gb` | number | yes | Free space on the volume filesystem |
 | `builds` | array of object | no | One entry per build in the node's current `spec.builds` (section 5.11); absent or empty when there is none (ADR 0117) |
+| `volumes` | array of object | no | One entry per volume in the node's current `spec.volumes`, plus one per volume file the node holds that `spec.volumes` does not name (ADR 0145); absent or empty when there is none |
+| `backups` | array of object | no | One entry per job in the node's current `spec.backups` (ADR 0147); absent or empty when there is none |
 
 VM entry: `vm_id` (string, `vm_`), `observed_status` (one of `creating`, `stopped`, `starting`, `running`, `stopping`, `crashed`, `deleted`, `unknown`), `health` (`passing`, `failing`, `unknown`), `ip` (string, optional), `restart_count` (integer), `last_exit_code` (integer, optional).
 
@@ -335,6 +339,34 @@ Build entry:
 | `finished_at` | string | no | When the build reached a terminal status |
 
 The primary owns the `builds` table and the `build.*` events: it applies each reported status change to the build row and emits the event, so the node emits no `build.*` event of its own. A status report may skip intermediate statuses; only the terminal one matters.
+
+Volume entry:
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `volume_id` | string (`vol_`) | yes | The volume |
+| `state` | string | yes | `creating`, `ready`, `restoring`, `failed`, `deleted` (the file was removed after a `deleted` entry in `spec.volumes`) or `orphaned` (the node holds the file and `spec.volumes` does not name it) |
+| `allocated_bytes` | integer | no | Bytes the sparse file uses on disk; present when the file exists |
+| `error` | string | no | On `failed`: one-line reason, at most 2 000 characters |
+
+Backup entry:
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `backup_id` | string (`bkp_`) | yes | The backup |
+| `status` | string | yes | `queued`, `running`, `succeeded` (the node wrote the manifest; the backup is not sealed yet) or `failed` |
+| `snapshot_method` | string | no | From `running`: `reflink` or `pause_copy` |
+| `pause_ms` | integer | no | From `running`, for `pause_copy`: how long the VM was paused |
+| `manifest_key` | string | no | On `succeeded`: key of the manifest object, relative to the repository root (`backup-format.md` section 2) |
+| `manifest_digest` | string | no | On `succeeded`: BLAKE3 of the encrypted manifest object, 64 lowercase hex |
+| `logical_bytes` | integer | no | On `succeeded`: size of the snapshot |
+| `uploaded_bytes` | integer | no | On `succeeded`: bytes of chunk objects this backup created |
+| `chunk_count` | integer | no | On `succeeded`: chunks the manifest lists |
+| `error` | string | no | On `failed`: one-line reason, at most 2 000 characters; `lease_mismatch` when the job's token is not the node's (section 6.7) |
+| `started_at` | string | no | When the node left `queued` |
+| `finished_at` | string | no | When the node finished its part |
+
+The primary owns the `volumes` and `backups` tables and the `backup.*` and `restore.*` events, as it does for builds: it applies each reported change to the row, seals a reported `succeeded` backup (`backup-format.md` section 6.2), and emits the events. A node emits no `backup.*` or `restore.*` event of its own. A volume reported `deleted` is removed from the `volumes` table and leaves `spec.volumes` in the next revision. An `orphaned` volume is kept and never deleted by the protocol (section 6.7).
 
 The primary treats a VM it knows and the node does not report as `unknown` rather than assuming it is gone; only an explicit `deleted` or a successful `inspect` removes it.
 
@@ -627,7 +659,7 @@ The node keeps the list next to `primary_url` in its identity (section 12). It d
 | `rev` | integer | yes | Monotonic revision of the node's desired state |
 | `issued_at` | string | yes | When the primary produced it |
 | `term` | integer | yes | Cluster term at issue time |
-| `spec` | object | yes | `vms`, `routes`, `network`, `ingress` when the node runs a tunnel, and `builds` when the node has builds to run (ADR 0117) |
+| `spec` | object | yes | `vms`, `routes`, `network`, `ingress` when the node runs a tunnel, `builds` when the node has builds to run (ADR 0117), `volumes` when the node holds volumes (ADR 0145), and `backups` with `backup_repository` when it has backup jobs (ADR 0147) |
 | `signature` | string | yes | Base64 Ed25519 signature by the cluster signing key |
 
 **Signature.** The signature covers the RFC 8785 (JSON Canonicalization Scheme) serialization of the whole `body` object with the `signature` member removed. The node verifies it against `cluster_public_key` before it parses anything else, persists the verified snapshot atomically, answers `command_result` with `ok`, and only then reconciles. An invalid signature is answered with `error` code `bad_signature` and the snapshot is discarded; the node keeps running on its previously stored snapshot.
@@ -657,7 +689,7 @@ The node keeps the list next to `primary_url` in its identity (section 12). It d
 | `stateful` | boolean | yes | Whether the VM may run only while its lease is held |
 | `lease_id` | string (`lse_`) | no | Required when `stateful` is true |
 | `fencing_token` | integer | no | Required when `stateful` is true |
-| `volumes` | array of object | yes | empty until local volumes ship in M5a (D-0052). Each `{ "volume_id": <vol_>, "mount_path": <string> }` |
+| `volumes` | array of object | yes | Volumes to attach, at most one in M5a; `[]` for a stateless VM. Each `{ "volume_id": <vol_>, "serial": <string>, "mount_path": <string> }`: the volume must be `ready` on this node and named in `spec.volumes`; `serial` is the block device serial the guest init finds it by, `quoro-vol-0` for the first (`engine-trait.md` section 3.6) |
 
 **`spec.routes[]`:**
 
@@ -691,6 +723,53 @@ The node keeps the list next to `primary_url` in its identity (section 12). It d
 
 A build stays in `spec.builds` until the primary has recorded the terminal status the node reported. A succeeded build leaves `spec.builds` in the same revision that references its image in `spec.vms` (the deployment it started), so the apply loop never sees the built root disk unreferenced and removes it (section 6.2). `secrets` values are handled like `env`: plaintext only inside the signed snapshot, encrypted with the node-local key at rest, never logged and never written to the build's log.
 
+**`spec.volumes[]`** (optional; ADR 0145):
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `volume_id` | string (`vol_`) | yes | Volume identity; also the name of its file in the node's data directory |
+| `app_id` | string (`app_`) | yes | App that owns it |
+| `size_gb` | integer | yes | Size of the sparse file, in gibibytes |
+| `state` | string | yes | `present`: the file must exist; `deleted`: the node removes the file once no VM uses it, then reports `deleted` |
+| `restore` | object | no | Present only while the volume is `restoring`: write the file from this backup instead of creating it empty |
+
+**`spec.volumes[].restore`:**
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `backup_id` | string (`bkp_`) | yes | Backup to restore |
+| `manifest_key` | string | yes | Key of its manifest object, relative to the repository root |
+| `manifest_digest` | string | yes | BLAKE3 of the encrypted manifest object, from the backup's seal record; the node refuses a manifest that does not match |
+| `logical_bytes` | integer | yes | Size the chunks must cover exactly |
+| `id_key` | string | yes | Base64 of the app's 32-byte chunk-id key (`backup-format.md` section 3) |
+| `data_key` | string | yes | Base64 of the app's 32-byte chunk-data key |
+
+**`spec.backups[]`** (optional; ADR 0147):
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `backup_id` | string (`bkp_`) | yes | Backup identity; also the name of its manifest object |
+| `app_id` | string (`app_`) | yes | App whose volume is backed up; the backup's `source_id` |
+| `volume_id` | string (`vol_`) | yes | Volume to back up; `ready` on this node and named in `spec.volumes` |
+| `vm_id` | string (`vm_`) | no | The app's VM on this node, which a `pause_copy` snapshot pauses; absent when the app has no VM here |
+| `fencing_token` | integer | yes | Token of the app's `local` lease when the backup was dispatched |
+| `id_key` | string | yes | Base64 of the app's 32-byte chunk-id key |
+| `data_key` | string | yes | Base64 of the app's 32-byte chunk-data key |
+
+**`spec.backup_repository`** (optional; present while `spec.backups` or a `spec.volumes[].restore` is not empty):
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `repository_id` | string (`brp_`) | yes | The backup repository |
+| `endpoint` | string | yes | `https://` URL of the S3-compatible endpoint, from the provider's `config` |
+| `region` | string | yes | Signing region, from the provider's `config`; `auto` when it names none |
+| `bucket` | string | yes | Bucket name, from the provider's `config` |
+| `root` | string | yes | `<prefix>/<cluster_id>`, the key prefix every repository key is relative to |
+| `access_key_id` | string | yes | From the provider's `config` |
+| `secret_access_key` | string | yes | The provider's secret, plaintext |
+
+**Backup keys and credentials.** The node gets the chunk keys of one app per job and never the repository key, so it can read and write only that app's backups (`backup-format.md` section 3). `id_key`, `data_key` and `secret_access_key` are handled like `env`: plaintext only inside the signed snapshot on the session, encrypted with the node-local key at rest, never logged, and dropped from the node's store when the field leaves desired state. The primary sends the bucket credential only while the node has a job; the credential of the off-site audit copy never reaches a node.
+
 **`spec.network`:** `subnet` (CIDR for the node bridge) and `gateway` (address on that bridge). The addresses in `status_report` must fall inside the subnet.
 
 **`spec.ingress`** (optional; absent when the node runs no tunnel):
@@ -709,7 +788,7 @@ A build stays in `spec.builds` until the primary has recorded the terminal statu
 
 **Tunnels (D-0094).** One tunnel per node. The primary creates or looks up the node's tunnel with the account credential of the `tunnel` provider, writes the tunnel's ingress rules (each `tunnel` route's hostname to `http://127.0.0.1:<origin_port>`) and the proxied DNS records itself, and sends the node only `tunnel_id`, `token` and `origin_port`. The node runs the tunnel connector with the token and serves the `tunnel` routes of `spec.routes` from its proxy on `127.0.0.1:<origin_port>`. The account credential never leaves the primary. A changed `token` (rotation) replaces the running connector; an absent `tunnel` stops it.
 
-**Environment values.** `env` (and `spec.builds[].secrets`) carries plaintext values because the node must be able to start the process. It is sent only over the authenticated, pinned session, never over a webhook or an API read, and the node stores it encrypted with the node-local key. The primary stores the same values encrypted with the cluster data-encryption key (AEAD), and the API returns only names (`README.md`, `db-schema.sql`). `spec.ingress.tunnel.token` is handled the same way: plaintext only inside the signed snapshot on the session, encrypted with the node-local key at rest on the node, encrypted with the cluster data-encryption key on the primary (`node_tunnels.token_enc`), never returned by the API.
+**Environment values.** `env` (and `spec.builds[].secrets`) carries plaintext values because the node must be able to start the process. It is sent only over the authenticated, pinned session, never over a webhook or an API read, and the node stores it encrypted with the node-local key. The primary stores the same values encrypted with the cluster data-encryption key (AEAD), and the API returns only names (`README.md`, `db-schema.sql`). `spec.ingress.tunnel.token` and the backup fields above are handled the same way: plaintext only inside the signed snapshot on the session, encrypted with the node-local key at rest on the node, encrypted with the cluster data-encryption key on the primary (`node_tunnels.token_enc`), never returned by the API.
 
 ```json
 {
@@ -763,7 +842,7 @@ A replica node that holds a copy of the change log but is not the primary never 
 ### 5.12 `lease_grant`
 
 **Direction:** control plane to node.
-**When:** when the primary (or, from M5b, the authority behind it) grants a lease, and as the answer to every successful `lease_renew`.
+**When:** when the primary (or, from M5b, the authority behind it) grants a lease, and as the answer to every successful `lease_renew`. From M5a the primary grants a `local` lease on an app when it places a stateful app: when the app's first volume is created, and on the target node when a restore completes (section 8.3).
 
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
@@ -1260,9 +1339,9 @@ An apply run always follows this order, whatever changed:
 
 1. **Network.** Ensure the bridge, subnet and gateway from `spec.network`, and the per-VM TAP devices. Each VM is attached with its `project_id` as its isolation group, so the VMs of one project reach each other and VMs of different projects do not (`engine-trait.md` section 3.3, D-0084). The DNS servers handed to guests come from the node's own configuration, not from `spec.network`.
 2. **Images.** Prepare every image referenced by a VM whose rootfs is missing or has a different digest, and remove rootfs images no longer referenced. An image whose VM carries `build_id` is never pulled: it was prepared by the build's `importing` step (section 6.6); if it is gone, the deployment fails in phase `pull` with the error that the built image is no longer on this node. A root disk is referenced while a VM in `spec.vms` or a build in `spec.builds` names it.
-3. **Stop.** Stop VMs that are no longer desired, or whose spec requires a recreate (image digest, disk size, network identity).
-4. **Start.** Start desired VMs that are not running.
-5. **Builds.** Start the next `queued` build of `spec.builds` when the node has no build running (one at a time per node by default, ADR 0118), stop a build marked `cancelled`, and report every change in `status_report.builds` (section 6.6). Builds run alongside the other steps, never block them, and are not restarted by a later apply run.
+3. **Stop.** Stop VMs that are no longer desired, or whose spec requires a recreate (image digest, disk size, network identity, attached volumes).
+4. **Volumes, then start.** Create the file of every `present` volume that has none, or write it from its `restore`, and remove the file of every `deleted` volume that no VM uses any more (section 6.7). Then start desired VMs that are not running. A VM whose volume is not `ready` on this node stays `stopped`; volume work never delays a VM that attaches no volume.
+5. **Builds and backups.** Start the next `queued` build of `spec.builds` when the node has no build running (one at a time per node by default, ADR 0118), stop a build marked `cancelled`, and report every change in `status_report.builds` (section 6.6). Builds run alongside the other steps, never block them, and are not restarted by a later apply run. Start every `spec.backups` job that is not running (section 6.7); backups also run alongside, one per volume.
 6. **Routes.** Update the reverse proxy for the hostnames in `spec.routes`, and start, replace or stop the tunnel connector to match `spec.ingress.tunnel`. Certificates for `acme` routes are obtained in the background through `dns_challenge` (section 5.22); a route keeps serving its previous certificate until a new one is issued.
 
 The order exists so that a VM never starts on a network that is not ready, and no route points at a VM that is being replaced. It is the reconciliation described in D-0011 and the deployments in D-0033.
@@ -1276,7 +1355,7 @@ The order exists so that a VM never starts on a network that is not ready, and n
 
 ### 6.4 Stateful starts
 
-A stateful VM starts only while the node holds that app's lease in state `held` **and** the lease's `fencing_token` equals the `fencing_token` in the VM spec. If either condition fails the VM stays `stopped`, the fact is recorded locally, and the node reports the VM as `stopped` with `health: unknown`; it does not report an error to the primary, because the primary is the one that moved the lease (D-0019). Because renewals keep the token (D-0073), the equality holds for the whole time one holder owns the lease; it changes only when ownership changes, and then the primary issues a new `desired_state` carrying the new token. A node that marked itself failed (section 8.5) starts no stateful VM at all.
+A stateful VM starts only while the node holds that app's lease in state `held` **and** the lease's `fencing_token` equals the `fencing_token` in the VM spec. If either condition fails the VM stays `stopped`, the fact is recorded locally, and the node reports the VM as `stopped` with `health: unknown`; it does not report an error to the primary, because the primary is the one that moved the lease (D-0019). Because renewals keep the token (D-0073), the equality holds for the whole time one holder owns the lease; it changes only when ownership changes, and then the primary issues a new `desired_state` carrying the new token. A node that marked itself failed (section 8.5) starts no stateful VM at all. In M5a a VM is stateful exactly when it attaches a volume (ADR 0145), and its volume must be `ready` on this node.
 
 ### 6.5 While disconnected
 
@@ -1315,6 +1394,17 @@ A build runs on the node in an ephemeral builder microVM, one per build, created
   "cancelled": false
 }
 ```
+
+### 6.7 Volumes and backups
+
+A volume is a sparse raw file in the node's data directory, named by its `volume_id`, holding an ext4 filesystem the engine creates empty (`engine-trait.md` section 3.6, ADR 0145). The host never mounts it: a guest has written it, so it is untrusted input to the host kernel.
+
+- **Create.** A `present` entry with no file and no `restore`: the node creates the file through the engine (`ensure_volume`) and reports `creating`, then `ready`. A size larger than the node's free disk fails the volume with the reason.
+- **Restore.** A `present` entry with `restore`: the node reports `restoring`, then writes the file from the backup as `backup-format.md` section 8.1 describes, and reports `ready`, or `failed` with the reason after deleting the partial file. A restore is not resumed after an agent restart: the node deletes the partial file and starts it again.
+- **Delete.** A `deleted` entry: once no VM of `spec.vms` attaches the volume and no running VM uses it, the node removes the file (`delete_volume`) and reports `deleted`.
+- **Never by absence.** The node never removes a volume file because `spec.volumes` does not name it. Such a file is reported `orphaned` and kept until a `deleted` entry names it or someone with root on the node removes it, as section 10 does for a removed node.
+- **Backup.** For each job of `spec.backups`, the node first checks that it holds the app's lease in state `held` with the job's `fencing_token`; otherwise it reports the backup `failed` with `lease_mismatch`. It then takes the snapshot with its method (`engine-trait.md` section 3.16), pausing `vm_id` for `pause_copy`, reports `running`, chunks and uploads the snapshot, writes the manifest and deletes the snapshot file (`backup-format.md` section 7.1). It reports `succeeded` with the manifest's key and digest, or `failed` with the reason. A job leaves `spec.backups` once the primary has recorded its terminal status; an agent restart while a backup runs fails it with `node agent restarted`, and the snapshot file is deleted at start.
+- **Writes carry the token.** Every object a backup job writes is part of a backup that the primary seals only if the job's token is still the app's current token (`backup-format.md` section 6.2). A node that lost its lease while uploading therefore wastes storage, never a valid backup (section 8.6).
 
 ## 7. Change-log follow
 
@@ -1359,6 +1449,8 @@ Issued for the HA policies where no other copy of the app can start (`none`, `co
   - `lease_revoke` with reason `moved`, `deleted`, `superseded`; or
   - an operator declaring the node lost (part of the `local` lease mode, D-0047), which is a manual action from M5a and needs an endpoint that a later contract pull request adds. Declaring a node lost increments the lease's `fencing_token` (D-0019), so the old holder's token is stale even though the old holder never received a message.
 - A `local` lease on a node whose session is gone is a normal state, not an incident. The primary reports the node `disconnected`, not `fenced`.
+- **Granted at placement (M5a).** The primary grants a `local` lease on an app to the node that holds its volume when the volume is created, and records it in `leases`. A restore revokes the lease on the old node with reason `moved` and, once the new volume is `ready`, grants a new one to the target node with a strictly higher token (ADR 0147). A restore is refused while the old node is disconnected: an operator removes that node first (section 10), which increments the token.
+- **Released at deletion.** Deleting the app's attached volume, or the app, revokes the lease with reason `deleted`.
 
 ### 8.4 `expiring` mode timing
 
@@ -1466,7 +1558,7 @@ The node also emits `node.fenced` when an operator declaration invalidated its t
 ### 8.6 Fencing tokens
 
 - A token is an integer per leased resource that increases strictly on every ownership change — a grant to a new holder, or a grant after expiry or revoke — and stays the same across renewals by the same holder (D-0073). It is never reused. The current token lives on the lease row (`fencing_token` in the shared entity model) and is echoed in every `lease_grant`, `lease_revoke`, `lease_renew`, `hello` and stateful VM spec.
-- Every write to shared storage carries the token: the chunk store and object store from M5, and the replication stream (D-0023). A receiver rejects any write whose token is lower than the highest it has seen for that resource, and records the rejection.
+- Every write to shared storage carries the token: the chunk store and object store from M5, and the replication stream (D-0023). A receiver rejects any write whose token is lower than the highest it has seen for that resource, and records the rejection. For the backups of M5a the receiver is the primary, not the bucket: the bucket accepts any chunk or manifest the credential may write, and the primary seals a backup only when its token is the app's current one (`backup-format.md` section 6.2).
 - Tokens are what makes the lease safe against a paused node: a node that was frozen past its expiry can still act on stale intent, and only the token at the storage layer stops it (`docs/research/r2-conditional-writes.md`).
 - Arbiters do not remove the need for tokens. A Durable Object can bump a token inside its critical section, and R2 has no server-side expiry at all, but in both cases the node and the storage must still enforce the token (`docs/research/durable-objects.md`).
 
@@ -1481,7 +1573,7 @@ M0 ships the protocol, not the HA feature: the messages, the four node-side stat
 | M2 | Primary | `local` | Enrolls, follows the change log, reconciles desired state, emits events |
 | M3 | Primary | `local` | Same; the agent-driven calls arrive as desired-state changes from the API and MCP |
 | M4 | Primary | `local` | Adds builds in desired state, build-log, metrics, terminal, console and transcript streams, `stream_input` and `stream_ack`; leases unchanged |
-| M5a | Primary | `local` | Cold backups; operator declaration of a lost node adds a lease revoke with a new token |
+| M5a | Primary | `local` | Local volumes, with a `local` lease granted at placement; backup jobs carrying the lease token; restores that move the lease to the target node (section 6.7); operator declaration of a lost node adds a lease revoke with a new token |
 | M5b | Primary plus witness quorum or external arbiter | `local`, `expiring` (`warm`) | Warm: renewal loop, `uncertain` handling, replication writes carrying tokens, restart persistence of held leases (section 8.4), concurrent fences (section 8.5) |
 | M6 | Quorum | `local`, `expiring` (`warm`, `hot`) | Automatic failover and `hot`; the same messages also carry `resource_type: primary` leases |
 
@@ -1523,6 +1615,8 @@ Threats and their mitigations are in `../architecture/threat-model.md`; this sec
 - **Terminal and console relay (M4).** The primary never touches a VM socket: it authorizes, audits and relays bytes between a client WebSocket and this session (ADR 0113, ADR 0114). The node agent, already root and already the only reader of VM sockets, is the only process that connects to a VM's vsock socket and its serial socket; both live in the VM's runtime directory, which only root can enter. The node never creates a `<socket>_<port>` listener, so a guest cannot open a vsock connection to the host. The guest is untrusted: the node bounds every frame it reads from it and treats its output as bytes, never as protocol. A `terminal` stream exists only because the primary opened it; a node never starts an exec session on its own.
 - **Builds (M4).** A build runs untrusted code: the Dockerfile and everything it fetches. It runs only inside a builder microVM, with `egress_only` networking and no isolation group (section 6.6), never on the host. Build secrets reach the node only inside the signed desired state, reach the builder VM only on its ephemeral source disk, which the node deletes when the build ends, and live in the guest only in memory as BuildKit secret files; the node never writes them to a build log, a `stream_data` or an event. The node never mounts a disk the builder VM wrote: it reads the output layout as a tar stream in user space and never touches the cache disk's contents. The built image never leaves the node: it is imported locally and never pushed.
 
+- **Volumes and backups (M5a).** A volume file is guest-written and never mounted on the host; snapshots, backups and restores handle it as bytes (section 6.7). A node receives the chunk keys of the apps it has jobs for and the bucket credential only while it has a job, never the repository key and never the audit-copy credential. A compromised node can read and overwrite nothing in the repository that it could not already read on its own disk: it can upload garbage chunks or manifests, which no seal covers and a restore refuses (`backup-format.md` section 8.1).
+
 ## 12. Local node store
 
 The node keeps a SQLite file, owned by root, that holds everything it needs to run without the control plane (D-0011, D-0015 for the choice of SQLite elsewhere). The tables below are described, not specified: they are local to the node, are not part of `db-schema.sql`, are never replicated, and their exact columns may change without a contract change.
@@ -1539,6 +1633,8 @@ The node keeps a SQLite file, owned by root, that holds everything it needs to r
 | `cmd_results` | `msg_` id and outcome of the last answered intrusive messages | Makes a redelivered `lease_revoke` idempotent |
 | `builds` (M4) | Per build: `bld_` id, app, status, phase, resolved commit, image digest, failed step, the path of its log file, start and end times | Reports build progress in `status_report` across an agent restart; keeps the logs of the last 20 builds of each app (section 6.6) |
 | `transcripts` (M4) | Per terminal session: `trm_` id, VM, file path, size, SHA-256, start and end times | Serves `stream_open` kind `transcript` and enforces retention: 30 days and 1 GiB per node, oldest removed first (`audit-log-format.md` section 3.3) |
+| `volumes` (M5a) | Per volume: `vol_` id, app, file path, size, state, last error | Reports volume states across an agent restart, and tells an `orphaned` file from one in `spec.volumes` |
+| `backups` (M5a) | Per backup job: `bkp_` id, status, snapshot method, pause, manifest key and digest, sizes, error, start and end times; optionally the chunk ids the node knows the repository holds, per app | Reports backup progress across an agent restart and skips uploads of known chunks (`backup-format.md` section 5) |
 
 Outside the SQLite file, next to the credential and the node's private key, the node keeps its identity file: `node_id`, `cluster_id`, `primary_url`, the URLs advertised in `welcome.primary_urls` (at most 8, section 5.10), the pinned certificate fingerprint, and the cluster public key with its `key_id`. It is written `0600` through a temporary file renamed into place, so a half-written identity is never read. Also outside the SQLite file, in the VM's runtime directory, each VM also has its serial ring: two segments of 512 KiB that keep the newest serial output across VMM restarts (`engine-trait.md` section 3.19). The ring is removed with the VM. Metric samples are never stored: they live in memory only (section 5.17).
 

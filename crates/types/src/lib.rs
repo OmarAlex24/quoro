@@ -187,6 +187,14 @@ pub enum Scope {
     AppLogs,
     #[serde(rename = "app:terminal")]
     AppTerminal,
+    #[serde(rename = "backup:read")]
+    BackupRead,
+    #[serde(rename = "backup:write")]
+    BackupWrite,
+    #[serde(rename = "backup:restore")]
+    BackupRestore,
+    #[serde(rename = "backup:manage")]
+    BackupManage,
     #[serde(rename = "agent:read")]
     AgentRead,
     #[serde(rename = "agent:write")]
@@ -223,7 +231,7 @@ pub enum Scope {
 
 impl Scope {
     /// Every scope, in README table order.
-    pub const ALL: [Scope; 41] = [
+    pub const ALL: [Scope; 45] = [
         Self::ClusterRead,
         Self::NodeRead,
         Self::NodeEnroll,
@@ -249,6 +257,10 @@ impl Scope {
         Self::AppDelete,
         Self::AppLogs,
         Self::AppTerminal,
+        Self::BackupRead,
+        Self::BackupWrite,
+        Self::BackupRestore,
+        Self::BackupManage,
         Self::AgentRead,
         Self::AgentWrite,
         Self::GrantRead,
@@ -296,6 +308,10 @@ impl Scope {
             Self::AppDelete => "app:delete",
             Self::AppLogs => "app:logs",
             Self::AppTerminal => "app:terminal",
+            Self::BackupRead => "backup:read",
+            Self::BackupWrite => "backup:write",
+            Self::BackupRestore => "backup:restore",
+            Self::BackupManage => "backup:manage",
             Self::AgentRead => "agent:read",
             Self::AgentWrite => "agent:write",
             Self::GrantRead => "grant:read",
@@ -327,7 +343,11 @@ impl Scope {
     pub const fn is_destructive(self) -> bool {
         matches!(
             self,
-            Self::NodeRemove | Self::ProjectDelete | Self::VmDelete | Self::AppDelete
+            Self::NodeRemove
+                | Self::ProjectDelete
+                | Self::VmDelete
+                | Self::AppDelete
+                | Self::BackupRestore
         )
     }
 
@@ -347,6 +367,7 @@ impl Scope {
                 | Self::UserRead
                 | Self::UserWrite
                 | Self::AppTerminal
+                | Self::BackupManage
         )
     }
 
@@ -393,14 +414,15 @@ impl Role {
         }
     }
 
-    /// `owner` holds every scope, `operator` every scope except `user:write`,
+    /// `owner` holds every scope, `operator` every scope except `user:write`
+    /// and `backup:manage` (the recovery key opens every backup, ADR 0147),
     /// `viewer` every `:read` scope plus `app:logs`. `user:read` is a `:read`
     /// scope, so every role holds it.
     #[must_use]
     pub fn holds(self, scope: Scope) -> bool {
         match self {
             Self::Owner => true,
-            Self::Operator => scope != Scope::UserWrite,
+            Self::Operator => scope != Scope::UserWrite && scope != Scope::BackupManage,
             Self::Viewer => scope.is_read() || scope == Scope::AppLogs,
         }
     }
@@ -486,7 +508,12 @@ mod tests {
         assert!(Role::Operator.holds(Scope::VmConsole));
         assert!(!Role::Viewer.holds(Scope::AppTerminal));
         assert!(!Role::Viewer.holds(Scope::VmConsole));
-        assert_eq!(Scope::ALL.iter().filter(|s| s.is_human_only()).count(), 11);
-        assert_eq!(Scope::ALL.iter().filter(|s| s.is_destructive()).count(), 4);
+        assert_eq!(Scope::ALL.iter().filter(|s| s.is_human_only()).count(), 12);
+        assert_eq!(Scope::ALL.iter().filter(|s| s.is_destructive()).count(), 5);
+        assert!(Role::Owner.holds(Scope::BackupManage));
+        assert!(!Role::Operator.holds(Scope::BackupManage));
+        assert!(Role::Operator.holds(Scope::BackupRestore));
+        assert!(Role::Viewer.holds(Scope::BackupRead));
+        assert!(!Role::Viewer.holds(Scope::BackupWrite));
     }
 }

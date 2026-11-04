@@ -46,7 +46,7 @@ There are four identity types: `user`, `agent`, `node` and `system` (README.md, 
 
 Rules on credentials:
 
-- **Secrets are shown once.** A node join token, a personal API token, an agent key and a webhook secret are returned by the call that creates them and never again; only a hash (or, for the webhook secret, an encrypted value) is stored (README.md, "Identifiers"; D-0030).
+- **Secrets are shown once.** A node join token, a personal API token, an agent key and a webhook secret are returned by the call that creates them and never again; only a hash (or, for the webhook secret, an encrypted value) is stored (README.md, "Identifiers"; D-0030). A backup repository's recovery key is returned by the call that creates the repository or replaces the key, and never again; nothing on the server stores it, not even a hash, only a short fingerprint (ADR 0147, [backup-format.md](backup-format.md) section 3).
 - **Personal API tokens (`tok_`) can be listed, created and revoked only by a human; an agent's access token is refused with `human_only`, so an agent can never obtain a credential that escapes its grants (D-0029, D-0030).**
 - **Provider credentials are managed only by humans.** Providers hold the secrets of external services (DNS, tunnel, load balancer, object storage), so every operation needs `provider:manage`, which is human-only: an agent is refused with `human_only` (D-0051). A provider secret is write-only, encrypted with the cluster data-encryption key, never returned by a read and redacted from audit parameters (D-0050, D-0051).
 - **Access tokens are opaque.** An access token is 32 random bytes encoded as an `atk_`-prefixed string. It is not a JWT and carries no claims: scopes, selectors and expiry of authority live in the grant rows, not in the token (D-0030).
@@ -64,13 +64,14 @@ A human's authority is their role. Roles are fixed bundles of scopes, not grant 
 | Role | Holds |
 | --- | --- |
 | `owner` | every scope |
-| `operator` | every scope except `user:write` |
+| `operator` | every scope except `user:write` and `backup:manage` |
 | `viewer` | every `:read` scope plus `app:logs` |
 
 Consequences of the bundles:
 
 - A `viewer` can read apps, deployments, nodes, events, incidents, grants, approvals and the audit log, and can stream app logs, but cannot mutate anything (README.md, "Scopes").
 - An `operator` cannot create or change human users; that is `user:write` and owner-only (README.md, "Scopes").
+- An `operator` cannot create a backup repository or replace its recovery key; that is `backup:manage` and owner-only, because the recovery key opens every backup in the repository, including those of the control-plane database and its secrets (ADR 0147). An `operator` takes backups and restores them (`backup:write`, `backup:restore`).
 - Every role holds `user:read`, so an `operator` or `viewer` can list users and turn a user id (`owner_user_id`, `on_behalf_of`, `decided_by`, `created_by`) into a name. `user:read` is human-only: agents never list users.
 - `app:terminal` and `vm:console` are in the `owner` and `operator` bundles and not in `viewer`, because neither is a `:read` scope (ADR 0114). A `viewer` can read a build's log (`app:logs`) but cannot start a build.
 - Human roles are not grantable to agents. An agent never receives a "role"; it receives grants (D-0029, D-0030).
@@ -100,17 +101,21 @@ A scope is `<resource>:<verb>` and is the unit of authority in both human roles 
 | `vm:stop` | Stop a VM | |
 | `vm:delete` | Delete a VM and its disks | destructive |
 | `vm:console` | Read a VM's serial console, live and its recent output (ADR 0116) | |
-| `app:read` | List and read apps, their Git sources, builds, deployments, domains, env var names and app metrics | |
+| `app:read` | List and read apps, their Git sources, builds, deployments, domains, volumes, env var names and app metrics | |
 | `app:create` | Create an app | |
-| `app:update` | Change app settings, the Git source, env vars, domains | |
+| `app:update` | Change app settings, the Git source, env vars, domains, the backup schedule; create volumes | |
 | `app:restart` | Restart an app's instances | |
 | `app:redeploy` | Roll out the current image again | |
 | `app:deploy` | Deploy a new image (new deployment); start and cancel builds, whose success deploys | |
 | `app:start` | Start a stopped app | |
 | `app:stop` | Stop an app | |
-| `app:delete` | Delete an app and its data | destructive |
+| `app:delete` | Delete an app and its data, or one volume of an app | destructive |
 | `app:logs` | Read app logs and build logs, including live streams | |
 | `app:terminal` | Open an interactive terminal in an app's VM (ADR 0113, ADR 0114) | human-only |
+| `backup:read` | List and read backups and backup repositories (ADR 0147) | |
+| `backup:write` | Take a backup of an app's volume now | |
+| `backup:restore` | Restore a backup onto a node, which replaces the app's data and moves the app there | destructive |
+| `backup:manage` | Create a backup repository, rotate its recovery key, set the control-plane backup schedule (ADR 0147, ADR 0148) | human-only |
 | `agent:read` | List and read agents | |
 | `agent:write` | Create, update, disable agents; rotate agent keys | human-only |
 | `grant:read` | List and read grants | |
@@ -120,17 +125,17 @@ A scope is `<resource>:<verb>` and is the unit of authority in both human roles 
 | `approval:decide` | Approve or deny an approval request | human-only |
 | `incident:read` | List and read incidents | |
 | `incident:resolve` | Resolve an incident | |
-| `audit:read` | Read the audit log and run verification; humans also fetch session transcripts (section 7.6) | |
+| `audit:read` | Read the audit log and run verification, and read the status of its off-site export; humans also fetch session transcripts (section 7.6) | |
 | `event:read` | Read events and the event stream | |
 | `webhook:read` | List and read webhooks and deliveries | |
 | `webhook:write` | Create, update, delete, test webhooks | human-only |
-| `provider:manage` | Create, list, read, delete providers and rotate their secrets | human-only |
+| `provider:manage` | Create, list, read, delete providers and rotate their secrets; configure and probe the off-site audit export (ADR 0149) | human-only |
 | `user:read` | List human users, to resolve user ids to names | human-only |
 | `user:write` | Manage human users and their roles | human-only |
 
 ### 4.1 Destructive scopes
 
-Four scopes are destructive: `node:remove`, `project:delete`, `vm:delete` and `app:delete` (README.md, "Scopes"). They remove data or capacity and cannot be undone by repeating a call.
+Five scopes are destructive: `node:remove`, `project:delete`, `vm:delete`, `app:delete` and `backup:restore` (README.md, "Scopes"). They remove data or capacity and cannot be undone by repeating a call. `app:delete` also covers deleting one volume (`deleteVolume`), and `backup:restore` replaces an app's data with an older copy.
 
 This contract fixes their M3 behaviour:
 
@@ -145,10 +150,10 @@ Making destructive scopes grantable in standing grants would be a change to this
 
 ### 4.2 Human-only scopes
 
-Eleven scopes are human-only: `node:enroll`, `node:remove`, `node:fence_ack`, `app:terminal`, `agent:write`, `grant:write`, `approval:decide`, `webhook:write`, `provider:manage`, `user:read` and `user:write` (README.md, "Scopes").
+Twelve scopes are human-only: `node:enroll`, `node:remove`, `node:fence_ack`, `app:terminal`, `backup:manage`, `agent:write`, `grant:write`, `approval:decide`, `webhook:write`, `provider:manage`, `user:read` and `user:write` (README.md, "Scopes").
 
 - A grant whose `scopes` contains a human-only scope is refused at creation with `validation_failed`, and a hypothetical row that contained one is refused at call time with reason `human_only` (README.md, "Errors").
-- The set is chosen so an agent can never widen its own power (`agent:write`, `grant:write`, `webhook:write`), approve its own request (`approval:decide`), take over cluster membership (`node:enroll`, `node:remove`), declare a possibly running VM stopped so its lease moves (`node:fence_ack`, D-0079) or hold external credentials (`provider:manage`) (D-0030, D-0051). `user:read` is human-only so an agent never reads the list of human identities and their emails. `app:terminal` is human-only in M4 because a shell in the app's VM reads every secret the app holds and acts outside single audited calls (ADR 0114); a later, non-interactive exec scope reachable only through an approval grant is a separate decision.
+- The set is chosen so an agent can never widen its own power (`agent:write`, `grant:write`, `webhook:write`), approve its own request (`approval:decide`), take over cluster membership (`node:enroll`, `node:remove`), declare a possibly running VM stopped so its lease moves (`node:fence_ack`, D-0079) or hold external credentials (`provider:manage`) or the key that opens every backup (`backup:manage`) (D-0030, D-0051, ADR 0147). `user:read` is human-only so an agent never reads the list of human identities and their emails. `app:terminal` is human-only in M4 because a shell in the app's VM reads every secret the app holds and acts outside single audited calls (ADR 0114); a later, non-interactive exec scope reachable only through an approval grant is a separate decision.
 - Because `approval:decide` is human-only, "an agent approves its own destructive request" is not a policy that could be misconfigured; it is unrepresentable (D-0030).
 
 ### 4.3 Wildcards
@@ -183,6 +188,10 @@ Matching per target type:
 | build | the app it belongs to (as above), or `{"all": true}` |
 | interactive session | its VM (as above; a terminal session's VM is an instance of its app), or `{"all": true}` |
 | domain | the app it belongs to (as above), or `{"all": true}` |
+| volume | the app it belongs to (as above), or `{"all": true}` |
+| backup of a volume | the app it belongs to (as above), or `{"all": true}` |
+| backup of the control-plane database | `{"all": true}` only: it holds the whole cluster state |
+| backup repository, audit export | `{"all": true}` only (section 5.1) |
 | project | `projects` entry equal to its slug, or `{"all": true}` |
 | node | `nodes` entry equal to its id, or `{"all": true}` |
 | incident | its `subject` (resolved as the subject's own type above), or `{"all": true}` |
@@ -190,7 +199,7 @@ Matching per target type:
 
 ### 5.1 Cluster-level scopes
 
-`cluster:read`, `event:read` and `audit:read` have no resource of their own:
+`cluster:read`, `event:read` and `audit:read` have no resource of their own, and neither do the backup repositories under `backup:read`:
 
 - **They are matched by any non-empty selector.** A grant carrying `event:read` with selector `{"projects":["blog"]}` may read the event stream, but only records whose subject or project belongs to `blog` (constraint below).
 - **Results are filtered, never refused.** A list call under a selector returns the matching items; it does not answer `forbidden` because some rows in the table are out of scope. Filtered lists are the normal outcome for agents holding narrow grants (D-0030).
@@ -469,7 +478,7 @@ A grant for one hour on one app, and nothing else, is the whole point: the agent
 
 D-0030 requires that destructive actions be off by default and reachable only after a human approves a specific call. The flow, with the exact endpoints and events:
 
-1. **The agent attempts the destructive call.** For example `DELETE /api/v1/apps/{app_id}` (scope `app:delete`) or the `delete_app` MCP tool (D-0031, README.md "MCP tools").
+1. **The agent attempts the destructive call.** For example `DELETE /api/v1/apps/{app_id}` (scope `app:delete`) or the `delete_app` MCP tool (D-0031, README.md "MCP tools"). From M5a the same flow covers `DELETE /api/v1/volumes/{volume_id}` (scope `app:delete`, target `{type: volume}`) and `POST /api/v1/backups/{backup_id}/restore` (scope `backup:restore`, target `{type: backup}`, with the target node in `params`).
 2. **The service refuses with `approval_required`** (403) carrying `scope` and `target`. Nothing is deleted, and the refusal is audited with `result` `refused`, `result_detail` `approval_required` (D-0030).
 3. **The agent files a request:** `POST /api/v1/approvals` with `approval:create`, body `{scope, target, operation, params, justification, incident_id?}`. The service computes `params_hash` as the SHA-256 hex of the RFC 8785 canonical serialization of `params`, stores `status` `pending` and `expires_at` = now + 1 hour, and emits `approval.requested` (D-0030).
 4. **A human decides in the panel** with `approval:decide`, which is human-only: the panel shows the operation, the target, the parameters and the agent's justification, and the human approves or denies (D-0030; README.md "Scopes").
@@ -583,4 +592,4 @@ Two rows are worth reading together. Row 7 and row 8 are the same call: the seco
 - **How long a human session lives beyond the 24 h absolute expiry**, and whether refresh tokens are added. The contract fixes that a session expires absolutely; anything more is a later decision (D-0029).
 - **Grant approval by two humans (four-eyes).** Not in D-0030 and not in this contract.
 - **An external identity provider.** Quoro authenticates its own humans with a password checked against an Argon2id hash and with its own tokens; no SSO path exists in M0-M6 (D-0029; `users.password_hash` in [db-schema.sql](db-schema.sql)).
-- **The off-site copy of the audit log**, which the audit contract fixes in shape. It ships in M5a with the S3-compatible path, after an object-lock probe (D-0053; [audit-log-format.md](audit-log-format.md)).
+- **The off-site copy of the audit log**, which the audit contract fixes, with the lock strength its probe reports per provider (ADR 0149; [audit-log-format.md](audit-log-format.md) section 8). Configuring it needs `provider:manage`; reading its status needs `audit:read`.

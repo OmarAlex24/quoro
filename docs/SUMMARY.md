@@ -21,6 +21,7 @@
 - [Contracts overview](contracts/README.md)
   - [Permission model](contracts/permission-model.md)
   - [Audit log format](contracts/audit-log-format.md)
+  - [Backup repository format](contracts/backup-format.md)
   - [Engine trait](contracts/engine-trait.md)
   - [Node-agent protocol](contracts/node-agent-protocol.md)
 

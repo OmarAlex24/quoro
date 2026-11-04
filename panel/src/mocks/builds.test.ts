@@ -29,6 +29,7 @@ const makeApp = (repoUrl: string): App => {
     name: `build-test-${db.apps.length}`.slice(0, 40),
     stateful: false,
     ha_policy: 'none',
+    backup_schedule: { interval_h: 24, keep: 7 },
     image: '',
     source: sourceFor(repoUrl),
     port: 3000,

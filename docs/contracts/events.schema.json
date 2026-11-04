@@ -50,6 +50,10 @@
         "build.succeeded",
         "build.failed",
         "build.cancelled",
+        "backup.succeeded",
+        "backup.failed",
+        "restore.succeeded",
+        "restore.failed",
         "certificate.issued",
         "certificate.expiring",
         "certificate.failed",
@@ -103,6 +107,10 @@
     { "if": { "required": ["type"], "properties": { "type": { "const": "build.succeeded" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_build_succeeded" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "build.failed" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_build_failed" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "build.cancelled" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_build_cancelled" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "backup.succeeded" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_backup_succeeded" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "backup.failed" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_backup_failed" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "restore.succeeded" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_restore_succeeded" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "restore.failed" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_restore_failed" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "certificate.issued" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_certificate_issued" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "certificate.expiring" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_certificate_expiring" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "certificate.failed" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_certificate_failed" } } } },
@@ -129,6 +137,8 @@
     "BuildId": { "type": "string", "pattern": "^bld_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Build id (`bld_` + ULID)." },
     "DomainId": { "type": "string", "pattern": "^dom_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Domain id (`dom_` + ULID)." },
     "VolumeId": { "type": "string", "pattern": "^vol_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Volume id (`vol_` + ULID)." },
+    "BackupId": { "type": "string", "pattern": "^bkp_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Backup id (`bkp_` + ULID)." },
+    "BackupRepositoryId": { "type": "string", "pattern": "^brp_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Backup repository id (`brp_` + ULID)." },
     "LeaseId": { "type": "string", "pattern": "^lse_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Lease id (`lse_` + ULID)." },
     "UserId": { "type": "string", "pattern": "^usr_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Human user id (`usr_` + ULID)." },
     "ApiTokenId": { "type": "string", "pattern": "^tok_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Human API token id (`tok_` + ULID)." },
@@ -172,7 +182,7 @@
 
     "Subject": {
       "type": "object",
-      "description": "The resource the event is about. `type` is the resource kind in the same words the id prefixes use (node, vm, app, deployment, build, domain, volume, project, lease, grant, approval, incident, agent, user, cluster, webhook); `id` is that resource's id. For certificate events the subject is the domain; for audit.chain_broken it is the cluster.",
+      "description": "The resource the event is about. `type` is the resource kind in the same words the id prefixes use (node, vm, app, deployment, build, domain, volume, backup, project, lease, grant, approval, incident, agent, user, cluster, webhook); `id` is that resource's id. For certificate events the subject is the domain; for audit.chain_broken it is the cluster; for backup.* it is the backup; for restore.* it is the app.",
       "required": ["type", "id"],
       "properties": {
         "type": { "type": "string", "pattern": "^[a-z_]+$" },
@@ -587,6 +597,72 @@
       "additionalProperties": true
     },
 
+    "data_backup_succeeded": {
+      "type": "object",
+      "description": "A backup's seal was written: its snapshot is in the repository and can be restored (ADR 0147, ADR 0148). `app_id` and `volume_id` are absent for a control-plane backup. Emitted by the control plane. Payload fields are additive within schema_version 1.",
+      "required": ["backup_id", "repository_id", "source_kind", "trigger", "logical_bytes", "uploaded_bytes"],
+      "properties": {
+        "backup_id": { "$ref": "#/$defs/BackupId" },
+        "repository_id": { "$ref": "#/$defs/BackupRepositoryId" },
+        "source_kind": { "type": "string", "enum": ["volume", "control_plane"] },
+        "trigger": { "type": "string", "enum": ["schedule", "api", "upgrade"] },
+        "app_id": { "$ref": "#/$defs/AppId" },
+        "volume_id": { "$ref": "#/$defs/VolumeId" },
+        "node_id": { "$ref": "#/$defs/NodeId" },
+        "snapshot_method": { "type": "string", "enum": ["reflink", "pause_copy"] },
+        "pause_ms": { "type": "integer", "minimum": 0, "description": "How long the app was paused for a `pause_copy` snapshot; 0 for `reflink`." },
+        "logical_bytes": { "type": "integer", "minimum": 0 },
+        "uploaded_bytes": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+
+    "data_backup_failed": {
+      "type": "object",
+      "description": "A backup ended without a seal: snapshot, upload, a lost lease or a timeout (ADR 0147). It opens no incident; the next scheduled backup is still taken. Emitted by the control plane. Payload fields are additive within schema_version 1.",
+      "required": ["backup_id", "repository_id", "source_kind", "trigger", "error"],
+      "properties": {
+        "backup_id": { "$ref": "#/$defs/BackupId" },
+        "repository_id": { "$ref": "#/$defs/BackupRepositoryId" },
+        "source_kind": { "type": "string", "enum": ["volume", "control_plane"] },
+        "trigger": { "type": "string", "enum": ["schedule", "api", "upgrade"] },
+        "app_id": { "$ref": "#/$defs/AppId" },
+        "volume_id": { "$ref": "#/$defs/VolumeId" },
+        "node_id": { "$ref": "#/$defs/NodeId" },
+        "error": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "data_restore_succeeded": {
+      "type": "object",
+      "description": "A volume backup was restored into a new volume on `node_id`, the node holds the app's new `local` lease and the app is started there (ADR 0147). Emitted by the control plane. Payload fields are additive within schema_version 1.",
+      "required": ["backup_id", "app_id", "volume_id", "node_id", "fencing_token"],
+      "properties": {
+        "backup_id": { "$ref": "#/$defs/BackupId" },
+        "app_id": { "$ref": "#/$defs/AppId" },
+        "volume_id": { "$ref": "#/$defs/VolumeId", "description": "The new volume." },
+        "previous_volume_id": { "$ref": "#/$defs/VolumeId", "description": "The volume the restore replaced." },
+        "node_id": { "$ref": "#/$defs/NodeId" },
+        "fencing_token": { "type": "integer", "minimum": 1, "description": "Fencing token of the new lease." }
+      },
+      "additionalProperties": true
+    },
+
+    "data_restore_failed": {
+      "type": "object",
+      "description": "A restore did not complete: download, verification of a chunk, the seal or the manifest, or writing the volume (ADR 0147). The app stays stopped with no lease until the operator restores again or deletes the app. Emitted by the control plane. Payload fields are additive within schema_version 1.",
+      "required": ["backup_id", "app_id", "volume_id", "node_id", "error"],
+      "properties": {
+        "backup_id": { "$ref": "#/$defs/BackupId" },
+        "app_id": { "$ref": "#/$defs/AppId" },
+        "volume_id": { "$ref": "#/$defs/VolumeId", "description": "The new volume, left in `failed`." },
+        "node_id": { "$ref": "#/$defs/NodeId" },
+        "error": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
     "data_certificate_issued": {
       "type": "object",
       "description": "A TLS certificate was obtained or renewed. Payload fields are additive within schema_version 1.",
@@ -772,12 +848,13 @@
 
     "data_audit_chain_broken": {
       "type": "object",
-      "description": "Audit verification found a broken hash link (D-0031). `broken_at_seq` is the first record whose chain does not verify; `expected_hash` is the link the previous record implies and `found_hash` is the stored one. Payload fields are additive within schema_version 1.",
+      "description": "Audit verification found a broken hash link (D-0031). `broken_at_seq` is the first record whose chain does not verify; `expected_hash` is the link the previous record implies and `found_hash` is the stored one. `reason` is one of the local verification reasons (`hash_mismatch`, `prev_mismatch`, `seq_gap`, audit-log-format.md section 6) or, from M5a, a disagreement with the off-site copy (audit-log-format.md section 8.3): `tail_truncated` when the local log ends before the last record the copy holds (`broken_at_seq` is the first missing `seq`, `expected_hash` its hash in the copy, `found_hash` 64 zeros), `copy_mismatch` when the local hash at an exported `seq` differs from the copy's (`expected_hash` is the copy's, `found_hash` the local one). An event without `reason` comes from a primary older than M5a. Payload fields are additive within schema_version 1.",
       "required": ["broken_at_seq", "expected_hash", "found_hash"],
       "properties": {
         "broken_at_seq": { "type": "integer", "minimum": 1 },
         "expected_hash": { "$ref": "#/$defs/Hash" },
-        "found_hash": { "$ref": "#/$defs/Hash" }
+        "found_hash": { "$ref": "#/$defs/Hash" },
+        "reason": { "type": "string", "enum": ["hash_mismatch", "prev_mismatch", "seq_gap", "tail_truncated", "copy_mismatch"] }
       },
       "additionalProperties": true
     }
@@ -1000,6 +1077,27 @@
           "error": "process \"/bin/sh -c npm ci\" did not complete successfully: exit code: 1",
           "dockerfile_line": 3
         }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "evt_01JCA1B2C3D4E5F6G7H8J9K0M2",
+      "seq": 131,
+      "type": "backup.failed",
+      "time": "2026-11-05T03:00:42Z",
+      "source": { "kind": "control_plane" },
+      "subject": { "type": "backup", "id": "bkp_01JCA1A2B3C4D5E6F7G8H9J0KM" },
+      "project_id": "prj_01JC9Z5A1B2C3D4E5F6G7H8J9K",
+      "actor": { "type": "system", "id": "system" },
+      "data": {
+        "backup_id": "bkp_01JCA1A2B3C4D5E6F7G8H9J0KM",
+        "repository_id": "brp_01JCA0A2B3C4D5E6F7G8H9J0KM",
+        "source_kind": "volume",
+        "trigger": "schedule",
+        "app_id": "app_01JC9Z7B3N5Q7S9Z1W3Y5A7C9E",
+        "volume_id": "vol_01JC9ZC2D3E4F5G6H7J8K9M0NP",
+        "node_id": "nod_01JC9Z6Q5W8N3K4T7R2M1XHB0N",
+        "error": "upload of chunk failed after 5 attempts: 503 Service Unavailable"
       }
     }
   ]
