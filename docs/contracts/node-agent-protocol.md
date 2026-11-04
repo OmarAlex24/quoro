@@ -239,7 +239,7 @@ All bodies are objects. Field names are snake_case. Timestamps are RFC 3339 UTC 
 | `kvm` | object | yes | `available`, `kernel`, `nested` (optional) |
 | `dropped_events` | integer | yes | Local events dropped from the buffer since the last successful delivery; 0 when none |
 | `mesh_public_key` | string | no | Base64 WireGuard public key of this machine (32 bytes), from M5a (ADR 0144). The machine generates the key pair on its first M5a start and keeps the private key next to its credential; only the public key is ever sent. The primary stores it in `nodes.mesh_public_key` and uses it in other machines' `spec.mesh.peers` |
-| `volume_snapshot` | string | no | How this node snapshots a volume (ADR 0146): `reflink` when its data directory supports `FICLONE`, otherwise `pause_copy`. Probed once at agent start (`engine-trait.md` section 3.16). Absent from an agent older than M5a, which the primary treats as a node that cannot hold a volume |
+| `volume_snapshot` | string | no | How this node snapshots a volume (ADR 0156): `reflink` when its data directory supports `FICLONE` or its volumes live in the node's XFS volume pool, otherwise `pause_copy`. Probed once at agent start (`engine-trait.md` section 3.16). Absent from an agent older than M5a, which the primary treats as a node that cannot hold a volume |
 
 Each lease entry:
 
