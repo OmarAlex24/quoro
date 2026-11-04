@@ -83,6 +83,8 @@ pub fn guest_config(
         }),
         dns: dns.to_vec(),
         stop_timeout_ms: stop_timeout_ms(stop_timeout),
+        // The VM has no vsock device yet, so the init opens no exec listener.
+        exec_port: None,
     };
     config
         .encode()

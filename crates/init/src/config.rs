@@ -16,8 +16,15 @@ pub const SERIAL_DATA: &str = "quoro-data";
 /// virtio-blk serial of the config disk (raw, this module's layout).
 pub const SERIAL_CONFIG: &str = "quoro-config";
 
-/// First line of an encoded configuration.
+/// First line of an encoded configuration without an exec listener (M1-M3).
 pub const CONFIG_MAGIC: &str = "quoro-init-config v1";
+/// First line of an encoded configuration that carries `exec_port` (M4). A
+/// configuration is encoded as v2 exactly when [`GuestConfig::exec_port`] is
+/// set, so a v1 init never sees a key it does not know.
+pub const CONFIG_MAGIC_V2: &str = "quoro-init-config v2";
+/// The vsock port the engine asks the init to listen on for exec sessions
+/// (`engine-trait.md` section 6, ADR 0113).
+pub const EXEC_PORT: u32 = 1024;
 /// First line of an encoded status record.
 pub const STATUS_MAGIC: &str = "quoro-init-status v1";
 
@@ -80,6 +87,10 @@ pub struct GuestConfig {
     /// After the power button: how long the init waits for the app to exit
     /// after `SIGTERM` before it sends `SIGKILL` and powers off.
     pub stop_timeout_ms: u64,
+    /// The vsock port the init listens on for exec sessions (M4, config v2).
+    /// `None` encodes a v1 configuration, and the init starts no listener.
+    /// Never 0 and never `u32::MAX` (`VMADDR_PORT_ANY`).
+    pub exec_port: Option<u32>,
 }
 
 /// What the init reports when the guest is about to power off.
@@ -118,7 +129,11 @@ impl GuestConfig {
         validate(self)?;
 
         let mut out = String::new();
-        out.push_str(CONFIG_MAGIC);
+        out.push_str(if self.exec_port.is_some() {
+            CONFIG_MAGIC_V2
+        } else {
+            CONFIG_MAGIC
+        });
         out.push('\n');
         for arg in &self.args {
             push_line(&mut out, "arg", arg);
@@ -157,6 +172,9 @@ impl GuestConfig {
             "stop_timeout_ms",
             &self.stop_timeout_ms.to_string(),
         );
+        if let Some(port) = self.exec_port {
+            push_line(&mut out, "exec_port", &port.to_string());
+        }
 
         if out.len() as u64 > CONFIG_REGION_LEN {
             return Err(ConfigError(format!(
@@ -182,11 +200,15 @@ impl GuestConfig {
         let (magic, body) = lines
             .split_first()
             .ok_or_else(|| ConfigError("configuration is empty".to_string()))?;
-        if *magic != CONFIG_MAGIC {
+        let v2 = if *magic == CONFIG_MAGIC {
+            false
+        } else if *magic == CONFIG_MAGIC_V2 {
+            true
+        } else {
             return Err(ConfigError(format!(
-                "line 1: expected magic {CONFIG_MAGIC:?}, got {magic:?}"
+                "line 1: expected magic {CONFIG_MAGIC:?} or {CONFIG_MAGIC_V2:?}, got {magic:?}"
             )));
-        }
+        };
 
         let mut args: Vec<String> = Vec::new();
         let mut env: Vec<(String, String)> = Vec::new();
@@ -199,6 +221,7 @@ impl GuestConfig {
         let mut net_gateway: Option<(Ipv4Addr, usize)> = None;
         let mut dns: Vec<Ipv4Addr> = Vec::new();
         let mut stop_timeout_ms: Option<u64> = None;
+        let mut exec_port: Option<u32> = None;
 
         for (offset, line) in body.iter().enumerate() {
             let line_no = offset + 2;
@@ -306,6 +329,16 @@ impl GuestConfig {
                     }
                     stop_timeout_ms = Some(parsed);
                 }
+                "exec_port" if v2 => {
+                    if exec_port.is_some() {
+                        return Err(line_error(line_no, "duplicate exec_port".to_string()));
+                    }
+                    let value = unescape(raw, line_no)?;
+                    let parsed = value.parse::<u32>().map_err(|_| {
+                        line_error(line_no, format!("exec_port is not a port: {value:?}"))
+                    })?;
+                    exec_port = Some(parsed);
+                }
                 other => {
                     return Err(line_error(line_no, format!("unknown key {other:?}")));
                 }
@@ -340,6 +373,9 @@ impl GuestConfig {
         let console = console.ok_or_else(|| ConfigError("missing console".to_string()))?;
         let stop_timeout_ms =
             stop_timeout_ms.ok_or_else(|| ConfigError("missing stop_timeout_ms".to_string()))?;
+        if v2 && exec_port.is_none() {
+            return Err(ConfigError("missing exec_port".to_string()));
+        }
 
         let config = GuestConfig {
             args,
@@ -351,6 +387,7 @@ impl GuestConfig {
             net,
             dns,
             stop_timeout_ms,
+            exec_port,
         };
         validate(&config)?;
         Ok(config)
@@ -682,6 +719,13 @@ fn validate(config: &GuestConfig) -> Result<(), ConfigError> {
             config.stop_timeout_ms
         )));
     }
+    if let Some(port) = config.exec_port
+        && (port == 0 || port == u32::MAX)
+    {
+        return Err(ConfigError(format!(
+            "exec_port {port} is not a listening vsock port"
+        )));
+    }
     Ok(())
 }
 
@@ -787,6 +831,7 @@ mod tests {
             }),
             dns: vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)],
             stop_timeout_ms: 10_000,
+            exec_port: None,
         }
     }
 
@@ -801,6 +846,7 @@ mod tests {
             net: None,
             dns: Vec::new(),
             stop_timeout_ms: 5_000,
+            exec_port: None,
         }
     }
 
@@ -827,6 +873,66 @@ mod tests {
             format!("{CONFIG_MAGIC}\narg=/bin/true\nconsole=serial\nstop_timeout_ms=5000\n")
         );
         assert_eq!(GuestConfig::decode(&encoded).expect("decodes"), config);
+    }
+
+    #[test]
+    fn a_config_with_an_exec_port_is_version_2() {
+        let config = GuestConfig {
+            exec_port: Some(EXEC_PORT),
+            ..minimal()
+        };
+        let encoded = config.encode().expect("v2 encodes");
+        let text = std::str::from_utf8(&encoded).expect("ascii");
+        assert_eq!(
+            text,
+            format!(
+                "{CONFIG_MAGIC_V2}\narg=/bin/true\nconsole=serial\nstop_timeout_ms=5000\nexec_port=1024\n"
+            )
+        );
+        assert_eq!(GuestConfig::decode(&encoded).expect("decodes"), config);
+
+        let sample_v2 = GuestConfig {
+            exec_port: Some(7),
+            ..sample()
+        };
+        let encoded = sample_v2.encode().expect("encodes");
+        assert_eq!(GuestConfig::decode(&encoded).expect("decodes"), sample_v2);
+    }
+
+    #[test]
+    fn exec_port_is_only_valid_in_version_2() {
+        let v1 = format!(
+            "{CONFIG_MAGIC}\narg=/bin/true\nconsole=serial\nstop_timeout_ms=1\nexec_port=1024\n"
+        );
+        assert!(
+            GuestConfig::decode(v1.as_bytes()).is_err(),
+            "v1 has no exec_port"
+        );
+
+        let missing =
+            format!("{CONFIG_MAGIC_V2}\narg=/bin/true\nconsole=serial\nstop_timeout_ms=1\n");
+        assert!(
+            GuestConfig::decode(missing.as_bytes()).is_err(),
+            "v2 requires it"
+        );
+
+        for port in ["0", "4294967295", "-1", "x", "4294967296"] {
+            let text = format!(
+                "{CONFIG_MAGIC_V2}\narg=/bin/true\nconsole=serial\nstop_timeout_ms=1\nexec_port={port}\n"
+            );
+            assert!(GuestConfig::decode(text.as_bytes()).is_err(), "port {port}");
+        }
+        let twice = format!(
+            "{CONFIG_MAGIC_V2}\narg=/bin/true\nconsole=serial\nstop_timeout_ms=1\nexec_port=1\nexec_port=2\n"
+        );
+        assert!(GuestConfig::decode(twice.as_bytes()).is_err());
+        for port in [0, u32::MAX] {
+            let config = GuestConfig {
+                exec_port: Some(port),
+                ..minimal()
+            };
+            assert!(config.encode().is_err(), "port {port} is not encodable");
+        }
     }
 
     #[test]
@@ -923,7 +1029,7 @@ mod tests {
     #[test]
     fn rejects_bad_magic() {
         let error =
-            decode_str("quoro-init-config v2\narg=/bin/true\nconsole=none\nstop_timeout_ms=1\n")
+            decode_str("quoro-init-config v3\narg=/bin/true\nconsole=none\nstop_timeout_ms=1\n")
                 .expect_err("wrong magic must fail");
         assert!(error.0.contains("line 1"), "got {error}");
         let error = GuestConfig::decode(b"").expect_err("empty region must fail");

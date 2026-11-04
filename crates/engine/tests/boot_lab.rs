@@ -104,6 +104,7 @@ async fn alpine_boots_from_the_pipeline_and_reports_its_exit() {
         net: None,
         dns: Vec::new(),
         stop_timeout_ms: 5_000,
+        exec_port: None,
     };
     boot::write_config_disk(&config_disk, &guest).expect("config disk");
     boot::create_data_disk(&mkfs, &data_disk, 1).expect("data disk");

@@ -30,6 +30,11 @@ rustix = { version = "1.1", default-features = false, features = [
     "mount",
     "net",
     "process",
+    "pty",
     "system",
     "termios",
 ] }
+# The exec listener. rustix knows AF_VSOCK but has no safe vsock address type:
+# its `SocketAddrArg` is `unsafe` to implement, and the workspace forbids
+# `unsafe`. This crate wraps the same syscalls safely; see DEPENDENCIES.md.
+vsock = "0.5.5"
