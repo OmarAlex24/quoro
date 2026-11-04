@@ -12,6 +12,7 @@ interface NavItem {
   to:
     | '/'
     | '/vms'
+    | '/nodes'
     | '/agents'
     | '/grants'
     | '/approvals'
@@ -29,6 +30,7 @@ const under = (prefix: string) => (pathname: string) =>
 const MACHINE_SECTIONS: NavItem[] = [
   { to: '/', label: 'Apps', match: (pathname) => pathname === '/' || under('/apps')(pathname) },
   { to: '/vms', label: 'Virtual machines', match: under('/vms') },
+  { to: '/nodes', label: 'Nodes', match: under('/nodes') },
 ];
 
 /** Who may act on it, and the record of what they did. */

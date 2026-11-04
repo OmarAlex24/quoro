@@ -37,6 +37,7 @@ import { getAppsMock } from '../api/generated/apps/apps.msw';
 import { getDeploymentsMock } from '../api/generated/deployments/deployments.msw';
 import { getDomainsMock } from '../api/generated/domains/domains.msw';
 import { getLogsMock } from '../api/generated/logs/logs.msw';
+import { getMetricsMock } from '../api/generated/metrics/metrics.msw';
 import { getUsersMock } from '../api/generated/users/users.msw';
 import { getAgentsMock } from '../api/generated/agents/agents.msw';
 import { getGrantsMock } from '../api/generated/grants/grants.msw';
@@ -71,6 +72,7 @@ import { approvalsHandlers } from './handlers-approvals';
 import { auditHandlers } from './handlers-audit';
 import { grantsHandlers } from './handlers-grants';
 import { incidentsHandlers } from './handlers-incidents';
+import { metricsHandlers } from './handlers-metrics';
 import { usersHandlers } from './handlers-users';
 import { webhooksHandlers } from './handlers-webhooks';
 
@@ -842,6 +844,7 @@ export const handlers = [
   ...auditHandlers,
   ...webhooksHandlers,
   ...incidentsHandlers,
+  ...metricsHandlers,
 
   // Generated fallbacks, kept last so every stateful route above wins.
   ...getHealthMock(),
@@ -853,6 +856,7 @@ export const handlers = [
   ...getDeploymentsMock(),
   ...getDomainsMock(),
   ...getLogsMock(),
+  ...getMetricsMock(),
   ...getUsersMock(),
   ...getAgentsMock(),
   ...getGrantsMock(),

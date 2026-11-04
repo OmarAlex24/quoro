@@ -19,6 +19,7 @@ export default defineConfig({
           'deployments',
           'domains',
           'logs',
+          'metrics',
           'users',
           'agents',
           'grants',

@@ -17,6 +17,7 @@ import { AppsScreen } from './screens/apps-screen';
 import { AppScreen } from './screens/app-screen';
 import { DeployScreen } from './screens/deploy-screen';
 import { LoginScreen } from './screens/login-screen';
+import { NodesScreen } from './screens/nodes-screen';
 import { SetupScreen } from './screens/setup-screen';
 import { UsersScreen } from './screens/users-screen';
 import { VmsScreen } from './screens/vms-screen';
@@ -57,6 +58,12 @@ const vmsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/vms',
   component: VmsScreen,
+});
+
+const nodesRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/nodes',
+  component: NodesScreen,
 });
 
 const agentsRoute = createRoute({
@@ -165,6 +172,7 @@ const routeTree = rootRoute.addChildren([
   appDeployRoute,
   appDetailRoute,
   vmsRoute,
+  nodesRoute,
   agentsRoute,
   agentDetailRoute,
   grantsRoute,
