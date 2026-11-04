@@ -433,3 +433,165 @@ async fn engine_error_displays_a_reason() {
         "conflict: exists"
     );
 }
+
+/// An engine with one running VM that has a vsock device and a socket serial
+/// port, as the node agent creates them from M4.
+async fn interactive() -> (FakeEngine, VmId) {
+    let engine = FakeEngine::new();
+    let prepared = engine
+        .prepare_image(&common::image_ref())
+        .await
+        .expect("prepare_image succeeds");
+    let mut spec = common::sample_spec(&prepared.digest, "vm_interactive");
+    spec.serial = quoro_engine::SerialMode::Socket {
+        path: "/fake/serial.sock".into(),
+    };
+    spec.vsock = Some(quoro_engine::VsockAttach {
+        cid: 3,
+        socket: "/fake/vsock.sock".into(),
+    });
+    let id = spec.id.clone();
+    engine.create(&spec).await.expect("create succeeds");
+    (engine, id)
+}
+
+fn shell() -> quoro_engine::ExecRequest {
+    quoro_engine::ExecRequest {
+        argv: vec!["/bin/sh".to_string()],
+        user: None,
+        rows: 24,
+        cols: 80,
+    }
+}
+
+#[tokio::test]
+async fn exec_echoes_input_reports_resizes_and_exits() {
+    let (engine, id) = interactive().await;
+    assert!(engine.capabilities().await.exec);
+    assert!(
+        matches!(
+            engine.exec(&id, &shell()).await,
+            Err(EngineError::Conflict(_))
+        ),
+        "a stopped VM has no exec"
+    );
+    engine.start(&id).await.expect("start");
+
+    let mut session = engine.exec(&id, &shell()).await.expect("exec");
+    session.io.write_all(b"uname -a\n").await.expect("write");
+    let mut echoed = [0_u8; 9];
+    session.io.read_exact(&mut echoed).await.expect("echo");
+    assert_eq!(&echoed, b"uname -a\n");
+
+    engine.push_exec_output(&id, 0, b"Linux\r\n");
+    let mut output = [0_u8; 7];
+    session.io.read_exact(&mut output).await.expect("output");
+    assert_eq!(&output, b"Linux\r\n");
+
+    session.resize.send((50, 132)).await.expect("resize");
+    assert_eq!(engine.exec_resizes(&id, 0), vec![(50, 132)]);
+    assert_eq!(engine.exec_requests(&id), vec![shell()]);
+
+    engine.exit_exec(&id, 0, 3);
+    assert_eq!(session.exit.await.expect("exit code"), 3);
+    let mut rest = Vec::new();
+    session.io.read_to_end(&mut rest).await.expect("eof");
+    assert!(rest.is_empty());
+}
+
+#[tokio::test]
+async fn exec_validates_requests_and_ends_with_the_vm() {
+    let (engine, id) = interactive().await;
+    engine.start(&id).await.expect("start");
+    for bad in [
+        quoro_engine::ExecRequest {
+            argv: Vec::new(),
+            ..shell()
+        },
+        quoro_engine::ExecRequest {
+            argv: vec!["a\0b".to_string()],
+            ..shell()
+        },
+        quoro_engine::ExecRequest { rows: 0, ..shell() },
+        quoro_engine::ExecRequest {
+            cols: 1001,
+            ..shell()
+        },
+    ] {
+        assert!(matches!(
+            engine.exec(&id, &bad).await,
+            Err(EngineError::Conflict(_))
+        ));
+    }
+    assert!(matches!(
+        engine.exec(&VmId("vm_missing".to_string()), &shell()).await,
+        Err(EngineError::NotFound)
+    ));
+
+    let first = engine.exec(&id, &shell()).await.expect("first");
+    let second = engine
+        .exec(&id, &shell())
+        .await
+        .expect("second, independent");
+    drop(second);
+    assert!(engine.exec_closed(&id, 1));
+    assert!(!engine.exec_closed(&id, 0));
+
+    engine.stop(&id, StopMode::Force).await.expect("stop");
+    assert!(
+        first.exit.await.is_err(),
+        "no exit code when the VM stopped"
+    );
+}
+
+#[tokio::test]
+async fn serial_output_replays_the_ring_and_follows_live_output() {
+    let (engine, id) = interactive().await;
+    engine.start(&id).await.expect("start");
+    engine.push_serial(&id, b"quoro-init: booting\n");
+    engine.push_serial(&id, b"quoro-init: app started\n");
+
+    let mut all = engine.serial_output(&id, None).expect("stream");
+    let mut tail = engine.serial_output(&id, Some(8)).expect("stream");
+    let replay = next_bytes(&mut all).await;
+    assert_eq!(replay, b"quoro-init: booting\nquoro-init: app started\n");
+    assert_eq!(next_bytes(&mut tail).await, b"started\n");
+
+    engine.push_serial(&id, b"live\n");
+    assert_eq!(next_bytes(&mut all).await, b"live\n");
+    assert_eq!(next_bytes(&mut tail).await, b"live\n");
+
+    // A console stream outlives a restart and ends when the VM is deleted.
+    engine.stop(&id, StopMode::Force).await.expect("stop");
+    engine.start(&id).await.expect("start again");
+    engine.push_serial(&id, b"second boot\n");
+    assert_eq!(next_bytes(&mut all).await, b"second boot\n");
+    engine.stop(&id, StopMode::Force).await.expect("stop");
+    engine.delete(&id).await.expect("delete");
+    assert!(
+        std::future::poll_fn(|cx| all.as_mut().poll_next(cx))
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn serial_output_and_console_follow_the_serial_mode() {
+    let (engine, id) = created().await;
+    assert!(matches!(
+        engine.serial_output(&id, None),
+        Err(EngineError::Conflict(_))
+    ));
+    let (engine, id) = interactive().await;
+    assert!(matches!(engine.console(&id), Err(EngineError::Conflict(_))));
+    assert!(matches!(
+        engine.serial_output(&VmId("vm_missing".to_string()), None),
+        Err(EngineError::NotFound)
+    ));
+}
+
+async fn next_bytes(stream: &mut quoro_engine::ByteStream) -> Vec<u8> {
+    std::future::poll_fn(|cx| stream.as_mut().poll_next(cx))
+        .await
+        .expect("a chunk")
+}

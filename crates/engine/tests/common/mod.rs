@@ -53,6 +53,8 @@ pub fn sample_spec(rootfs: &ImageDigest, id: &str) -> VmSpec {
         console: ConsoleMode::VirtioConsole {
             socket: PathBuf::from("/fake/console.sock"),
         },
+        serial: quoro_engine::SerialMode::Off,
+        vsock: None,
     }
 }
 

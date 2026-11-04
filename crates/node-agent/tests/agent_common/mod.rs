@@ -14,9 +14,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use quoro_engine::{
-    Capabilities, ConsoleStream, Engine, EngineError, EngineEvent, EventStream, FakeEngine,
-    HostProbe, ImageConfig, ImageDigest, ImageRef, LineStream, NodeNetwork, PreparedImage,
-    StopMode, VmCounters, VmId, VmInfo, VmSpec, VolumeId, VolumeSnapshot,
+    ByteStream, Capabilities, ConsoleStream, Engine, EngineError, EngineEvent, EventStream,
+    ExecRequest, ExecSession, FakeEngine, HostProbe, ImageConfig, ImageDigest, ImageRef,
+    LineStream, NodeNetwork, PreparedImage, StopMode, VmCounters, VmId, VmInfo, VmSpec, VolumeId,
+    VolumeSnapshot,
 };
 use quoro_node_agent::NodeFacts;
 use quoro_node_agent::identity::{self, Identity, IdentityHandle};
@@ -279,6 +280,8 @@ impl RecordingEngine {
                 workdir: None,
             },
             console: quoro_engine::ConsoleMode::Off,
+            serial: quoro_engine::SerialMode::Off,
+            vsock: None,
         };
         self.create(&spec).await.expect("create the raw VM");
         self.start(&id).await.expect("start the raw VM");
@@ -350,6 +353,14 @@ impl Engine for RecordingEngine {
 
     fn console(&self, id: &VmId) -> Result<ConsoleStream, EngineError> {
         self.inner.console(id)
+    }
+
+    async fn exec(&self, id: &VmId, request: &ExecRequest) -> Result<ExecSession, EngineError> {
+        self.inner.exec(id, request).await
+    }
+
+    fn serial_output(&self, id: &VmId, tail: Option<u64>) -> Result<ByteStream, EngineError> {
+        self.inner.serial_output(id, tail)
     }
 
     async fn counters(&self, id: &VmId) -> Result<VmCounters, EngineError> {

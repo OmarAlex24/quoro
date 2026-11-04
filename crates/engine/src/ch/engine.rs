@@ -29,13 +29,13 @@ use crate::ch::state::{
 use crate::ch::tools::HostTools;
 use crate::ch::vmconfig::{self, BootFiles};
 use crate::ch::vmm::{Vmm, VmmLaunch};
-use crate::ch::{FORCE_STOP_BOUND, host, stream, supervise};
+use crate::ch::{FORCE_STOP_BOUND, exec, host, serial, stream, supervise};
 use crate::image::{ImageStore, ImageStoreConfig};
 use crate::pins;
 use crate::{
-    Capabilities, ConsoleMode, ConsoleStream, EngineError, EngineEvent, EventStream, HostProbe,
-    ImageDigest, ImageRef, LineStream, NodeNetwork, PreparedImage, StopMode, VmCounters, VmId,
-    VmInfo, VmSpec, VmState,
+    ByteStream, Capabilities, ConsoleMode, ConsoleStream, EngineError, EngineEvent, EventStream,
+    ExecRequest, ExecSession, HostProbe, ImageDigest, ImageRef, LineStream, NodeNetwork,
+    PreparedImage, SerialMode, StopMode, VmCounters, VmId, VmInfo, VmSpec, VmState,
 };
 
 use super::ChConfig;
@@ -124,12 +124,16 @@ pub(super) struct VmEntry {
     pub(super) output_open: Arc<AtomicBool>,
     /// A client holds the VM's interactive console (§3.14).
     pub(super) console_open: Arc<AtomicBool>,
+    /// The serial client and the node-local ring behind `serial_output`
+    /// (§3.19). It outlives VMM restarts; `delete` ends it.
+    pub(super) serial: Arc<serial::SerialHub>,
 }
 
 impl VmEntry {
     fn new(id: VmId, paths: VmPaths, spec: Option<SpecRecord>) -> Self {
         let (settled, _) = watch::channel(0_u64);
         Self {
+            serial: Arc::new(serial::SerialHub::new(&paths.dir)),
             id,
             paths,
             op: Mutex::new(()),
@@ -311,12 +315,19 @@ impl Inner {
             let Some(record) = state::read_json::<SpecRecord>(&paths.spec)? else {
                 continue;
             };
+            let spec = record.to_spec().ok();
             let entry = Arc::new(VmEntry::new(id.clone(), paths.clone(), Some(record)));
             match state::read_json::<VmmRecord>(&paths.vmm)? {
                 Some(vmm_record) => match Vmm::adopt(vmm_record.process)? {
                     Some(vmm) => {
                         entry.booted.store(vmm_record.booted, Ordering::SeqCst);
                         *lock(&entry.vmm) = Some(vmm.clone());
+                        // A running VM keeps its serial socket: connect again,
+                        // so the ring covers the gap while the agent was gone
+                        // (§3.19).
+                        if let Some(spec) = &spec {
+                            start_serial_client(&entry, spec);
+                        }
                         lock(&self.vms).insert(id, Arc::clone(&entry));
                         supervise::start(Arc::clone(self), entry, vmm);
                     }
@@ -374,6 +385,7 @@ impl Inner {
             graphical_console: false,
             vm_snapshot: false,
             volume_snapshot: false,
+            exec: true,
         }
     }
 
@@ -566,6 +578,7 @@ impl Inner {
             event_log: &paths.event_log,
             log_file: &paths.vmm_log,
         };
+        remove_stale_sockets(spec);
         let vmm = match Vmm::spawn(&launch).await {
             Ok(vmm) => vmm,
             Err(err) => {
@@ -608,6 +621,9 @@ impl Inner {
         *lock(&entry.vmm) = Some(vmm.clone());
         entry.booted.store(false, Ordering::SeqCst);
         entry.set_phase(Phase::Idle);
+        // Cloud Hypervisor created the serial socket in `vm.create`: connect
+        // now, before the boot, so the ring holds the whole boot (§3.19).
+        start_serial_client(entry, spec);
         supervise::start(Arc::clone(self), Arc::clone(entry), vmm.clone());
         Ok(VmInfo {
             id: spec.id.clone(),
@@ -799,11 +815,14 @@ impl Inner {
             net::delete_tap(&self.tools, &record.tap).await?;
             bridge = Some(record.bridge.clone());
             if let Ok(spec) = record.to_spec() {
-                for socket in console_sockets(&spec) {
+                for socket in guest_sockets(&spec) {
                     let _ = std::fs::remove_file(socket);
                 }
             }
         }
+        // Ends every open `serial_output` stream here, before the ring's
+        // directory goes (§3.19).
+        entry.serial.end();
         tokio::fs::remove_dir_all(&entry.paths.dir)
             .await
             .map_err(|err| io_error(&entry.paths.dir, &err))?;
@@ -942,11 +961,21 @@ impl Inner {
     /// # Errors
     ///
     /// `NotFound` for a VM that does not exist or has no console, `Unsupported`
-    /// for a virtio-console, and `Conflict` when the VM is not running or
-    /// another client already holds the console.
+    /// for a virtio-console, `Conflict` when a VM's serial port is a socket
+    /// (the console is read through [`Self::serial_output`] in M4), and
+    /// `Conflict` when the VM is not running or another client already holds
+    /// the console.
     pub(super) fn console(&self, id: &VmId) -> Result<ConsoleStream, EngineError> {
         let (entry, record) = self.entry_with_spec(id)?;
         let spec = record.to_spec()?;
+        // A serial socket has one client — the engine — and nothing in the
+        // guest reads it, so a viewer must not take it over (§3.14, ADR 0116).
+        if matches!(spec.serial, SerialMode::Socket { .. }) {
+            return Err(EngineError::Conflict(format!(
+                "the serial port of VM {} is read through serial_output",
+                id.0
+            )));
+        }
         match &spec.console {
             ConsoleMode::Off => Err(EngineError::NotFound),
             ConsoleMode::VirtioConsole { .. } => Err(EngineError::Unsupported(
@@ -956,6 +985,54 @@ impl Inner {
                 stream::open_console(&id.0, socket, Arc::clone(&entry.console_open))
             }
         }
+    }
+
+    /// A read-only stream of one VM's serial output (§3.19).
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` for an unknown id, `Conflict` when the VM's serial port is
+    /// not a socket.
+    pub(super) fn serial_output(
+        &self,
+        id: &VmId,
+        tail_bytes: Option<u64>,
+    ) -> Result<ByteStream, EngineError> {
+        let (entry, record) = self.entry_with_spec(id)?;
+        let spec = record.to_spec()?;
+        match spec.serial {
+            SerialMode::Socket { .. } => Ok(entry.serial.subscribe(tail_bytes)),
+            SerialMode::Off | SerialMode::File { .. } => Err(EngineError::Conflict(format!(
+                "VM {}'s serial port is not a socket",
+                id.0
+            ))),
+        }
+    }
+
+    /// Starts a program on a PTY inside a running VM (§3.18).
+    ///
+    /// # Errors
+    ///
+    /// `Conflict` for a request that breaks the format, for a VM that is not
+    /// running or has no vsock device, and for one whose init does not accept
+    /// exec sessions; `NotFound` for an unknown id.
+    pub(super) async fn exec(
+        &self,
+        id: &VmId,
+        request: &ExecRequest,
+    ) -> Result<ExecSession, EngineError> {
+        let (entry, record) = self.entry_with_spec(id)?;
+        let spec = record.to_spec()?;
+        let Some(vsock) = &spec.vsock else {
+            return Err(EngineError::Conflict(format!(
+                "VM {} has no vsock device",
+                id.0
+            )));
+        };
+        if entry.live_vmm().is_none() || !entry.booted.load(Ordering::SeqCst) {
+            return Err(EngineError::Conflict(format!("VM {} is not running", id.0)));
+        }
+        exec::open(&id.0, &vsock.socket, request).await
     }
 
     /// One VM's counters (§3.15).
@@ -1135,23 +1212,25 @@ impl Inner {
             }
         }
 
+        // The superseded serial console and the M4 `serial` field may not both
+        // claim the serial port (§3.14).
+        vmconfig::check_consoles(spec)?;
+
         if let Some(socket) = console_socket(&spec.console) {
-            if !socket.is_absolute() {
-                return Err(EngineError::Io(format!(
-                    "console socket {} is not an absolute path",
-                    socket.display()
-                )));
-            }
-            let parent_exists = socket.parent().is_some_and(Path::exists);
-            if !parent_exists {
-                return Err(EngineError::Io(format!(
-                    "console socket directory {} does not exist",
-                    socket
-                        .parent()
-                        .map(|parent| parent.display().to_string())
-                        .unwrap_or_default()
-                )));
-            }
+            check_socket_parent(socket, "console")?;
+        }
+        if let SerialMode::Socket { path } = &spec.serial {
+            check_socket_parent(path, "serial")?;
+        }
+        // The vsock socket lives in the VM's runtime directory, which `create`
+        // creates after this check, so only its absolute form is checked here.
+        if let Some(vsock) = &spec.vsock
+            && !vsock.socket.is_absolute()
+        {
+            return Err(EngineError::Io(format!(
+                "vsock socket {} is not an absolute path",
+                vsock.socket.display()
+            )));
         }
 
         let mut requested = u64::from(spec.memory_mb);
@@ -1207,6 +1286,7 @@ impl Inner {
             event_log: &entry.paths.event_log,
             log_file: &entry.paths.vmm_log,
         };
+        remove_stale_sockets(spec);
         let vmm = Vmm::spawn(&launch).await?;
         let boot_files = BootFiles {
             kernel: &self.kernel,
@@ -1231,6 +1311,7 @@ impl Inner {
         }
         *lock(&entry.vmm) = Some(vmm.clone());
         entry.booted.store(false, Ordering::SeqCst);
+        start_serial_client(entry, spec);
         supervise::start(Arc::clone(self), Arc::clone(entry), vmm.clone());
         Ok(vmm)
     }
@@ -1297,6 +1378,27 @@ fn rebased(paths: &VmPaths, dir: &Path) -> VmPaths {
     }
 }
 
+/// Checks that a socket path a spec hands to Cloud Hypervisor is absolute and
+/// that its directory exists, so the VMM can bind it.
+fn check_socket_parent(socket: &Path, what: &str) -> Result<(), EngineError> {
+    if !socket.is_absolute() {
+        return Err(EngineError::Io(format!(
+            "{what} socket {} is not an absolute path",
+            socket.display()
+        )));
+    }
+    let parent = socket.parent();
+    if !parent.is_some_and(Path::exists) {
+        return Err(EngineError::Io(format!(
+            "{what} socket directory {} does not exist",
+            parent
+                .map(|parent| parent.display().to_string())
+                .unwrap_or_default()
+        )));
+    }
+    Ok(())
+}
+
 /// The console socket a spec names, if it names one.
 fn console_socket(mode: &ConsoleMode) -> Option<&Path> {
     match mode {
@@ -1305,11 +1407,43 @@ fn console_socket(mode: &ConsoleMode) -> Option<&Path> {
     }
 }
 
-/// Every console socket path a spec names, for `delete`.
-fn console_sockets(spec: &VmSpec) -> Vec<PathBuf> {
-    console_socket(&spec.console)
-        .map(|socket| vec![socket.to_path_buf()])
-        .unwrap_or_default()
+/// Every host-side socket path a spec names, for `delete` and for clearing a
+/// stale socket before a VMM starts: the console socket, the serial socket and
+/// the hybrid vsock socket (§3.6, §3.19).
+fn guest_sockets(spec: &VmSpec) -> Vec<PathBuf> {
+    let mut sockets: Vec<PathBuf> = console_socket(&spec.console)
+        .map(Path::to_path_buf)
+        .into_iter()
+        .collect();
+    if let SerialMode::Socket { path } = &spec.serial {
+        sockets.push(path.clone());
+    }
+    if let Some(vsock) = &spec.vsock {
+        sockets.push(vsock.socket.clone());
+    }
+    sockets
+}
+
+/// Removes the socket files a previous VMM left behind.
+///
+/// A stale UNIX socket makes Cloud Hypervisor's bind fail with `EADDRINUSE`.
+/// This is only called before a VMM of this spec is spawned, when nothing can
+/// be listening on them.
+fn remove_stale_sockets(spec: &VmSpec) {
+    for socket in guest_sockets(spec) {
+        let _ = std::fs::remove_file(socket);
+    }
+}
+
+/// Starts the serial client of a spec whose serial port is a socket.
+///
+/// Called after every VMM start and for every running VM rediscovery adopts,
+/// so the ring covers the whole boot and the gap while the agent restarts
+/// (§3.19). A spec with a file or no serial port has nothing to read.
+fn start_serial_client(entry: &VmEntry, spec: &VmSpec) {
+    if let SerialMode::Socket { path } = &spec.serial {
+        entry.serial.start_client(path.clone());
+    }
 }
 
 /// Formats a MAC address the way `spec.json` stores it.

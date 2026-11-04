@@ -29,11 +29,15 @@ pub mod vmconfig;
 pub mod vmm;
 
 mod engine;
+mod exec;
 mod host;
+mod serial;
 mod stream;
 mod supervise;
 
 use engine::Inner;
+
+use crate::{ByteStream, ExecRequest, ExecSession};
 
 /// Worst case a forced stop takes before it reports failure.
 ///
@@ -169,6 +173,14 @@ impl Engine for ChEngine {
 
     fn console(&self, id: &VmId) -> Result<ConsoleStream, EngineError> {
         self.inner.console(id)
+    }
+
+    fn serial_output(&self, id: &VmId, tail_bytes: Option<u64>) -> Result<ByteStream, EngineError> {
+        self.inner.serial_output(id, tail_bytes)
+    }
+
+    async fn exec(&self, id: &VmId, request: &ExecRequest) -> Result<ExecSession, EngineError> {
+        self.inner.exec(id, request).await
     }
 
     async fn counters(&self, id: &VmId) -> Result<VmCounters, EngineError> {

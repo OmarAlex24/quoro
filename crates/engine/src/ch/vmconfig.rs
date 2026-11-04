@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 
 use crate::ch::net::Subnet;
 use crate::ch::state::VmPaths;
-use crate::{ConsoleMode, EngineError, MacAddr, VmId, VmSpec};
+use crate::{ConsoleMode, EngineError, MacAddr, SerialMode, VmId, VmSpec};
 
 /// The longest `stop_timeout_ms` the init's grammar accepts: one day.
 const MAX_STOP_TIMEOUT_MS: u64 = 86_400_000;
@@ -83,13 +83,33 @@ pub fn guest_config(
         }),
         dns: dns.to_vec(),
         stop_timeout_ms: stop_timeout_ms(stop_timeout),
-        // The VM has no vsock device yet, so the init opens no exec listener.
-        exec_port: None,
+        exec_port: spec.vsock.as_ref().map(|_| quoro_init::EXEC_PORT),
     };
     config
         .encode()
         .map_err(|err| EngineError::Conflict(format!("invalid guest configuration: {err}")))?;
     Ok(config)
+}
+
+/// Rejects a spec that gives the serial port two owners (section 3.14).
+///
+/// [`ConsoleMode::Serial`] is superseded in M4 by [`VmSpec::serial`]; a spec
+/// that still uses it must leave `serial` at [`SerialMode::Off`], so there is
+/// exactly one serial device. Both set is a caller bug, not a preference to
+/// reconcile here.
+///
+/// # Errors
+///
+/// `Conflict` naming the VM when both are set.
+pub(super) fn check_consoles(spec: &VmSpec) -> Result<(), EngineError> {
+    if matches!(spec.console, ConsoleMode::Serial { .. }) && !matches!(spec.serial, SerialMode::Off)
+    {
+        return Err(EngineError::Conflict(format!(
+            "VM {} sets both ConsoleMode::Serial and VmSpec::serial; the serial port has one owner (section 3.14)",
+            spec.id.0
+        )));
+    }
+    Ok(())
 }
 
 /// The stop timeout in milliseconds, saturating and capped at one day, so the
@@ -136,23 +156,38 @@ fn format_mac(mac: MacAddr) -> String {
 /// The body of `PUT /api/v1/vm.create` for Cloud Hypervisor v54 (contract §5).
 ///
 /// All paths are used as given. `tap` is the TAP device the caller created on
-/// the node bridge. A `Serial` console becomes a socket and the serial log is
-/// not used; every other mode logs the serial port to `paths.serial_log` and
-/// attaches a virtio-console socket only for [`ConsoleMode::VirtioConsole`].
+/// the node bridge.
+///
+/// `serial` comes from [`VmSpec::serial`] (section 3.19): `Off` is the pre-M4
+/// default and still means "append to `paths.serial_log`", because a
+/// `spec.json` written before M4 reads back as `Off` and its VM logged its boot
+/// there; turning that into a VM with no serial device would silently lose the
+/// boot diagnostics of every VM created before M4. A spec that still uses the
+/// superseded [`ConsoleMode::Serial`] keeps getting a serial socket at its
+/// console socket, as it did before `serial` existed. `create` rejects a spec
+/// that sets both ([`check_consoles`]).
+///
+/// `console` follows [`VmSpec::console`] and is independent of `serial`, so a
+/// VM can carry the app's tagged output and a serial socket at once (M4).
+/// `vsock` is attached only when the spec names it (section 3.18).
 #[must_use]
 pub fn vm_create_body(spec: &VmSpec, paths: &VmPaths, boot: &BootFiles<'_>, tap: &str) -> Value {
-    let serial = match &spec.console {
-        ConsoleMode::Serial { socket } => json!({"mode": "Socket", "socket": socket}),
-        ConsoleMode::Off | ConsoleMode::VirtioConsole { .. } => {
-            json!({"mode": "File", "file": paths.serial_log})
-        }
+    let serial = match &spec.serial {
+        SerialMode::Socket { path } => json!({"mode": "Socket", "socket": path}),
+        SerialMode::File { path } => json!({"mode": "File", "file": path}),
+        SerialMode::Off => match &spec.console {
+            ConsoleMode::Serial { socket } => json!({"mode": "Socket", "socket": socket}),
+            ConsoleMode::Off | ConsoleMode::VirtioConsole { .. } => {
+                json!({"mode": "File", "file": paths.serial_log})
+            }
+        },
     };
     let console = match &spec.console {
         ConsoleMode::VirtioConsole { socket } => json!({"mode": "Socket", "socket": socket}),
         ConsoleMode::Off | ConsoleMode::Serial { .. } => json!({"mode": "Off"}),
     };
 
-    json!({
+    let mut body = json!({
         "cpus": {"boot_vcpus": spec.vcpus, "max_vcpus": spec.vcpus},
         "memory": {"size": u64::from(spec.memory_mb) * MIB},
         "payload": {
@@ -185,7 +220,13 @@ pub fn vm_create_body(spec: &VmSpec, paths: &VmPaths, boot: &BootFiles<'_>, tap:
         "serial": serial,
         "console": console,
         "rng": {"src": "/dev/urandom"},
-    })
+    });
+    if let Some(vsock) = &spec.vsock {
+        // Hybrid vsock: one UNIX socket on the host, no vhost device
+        // (`docs/research/m4-terminal-and-console.md`).
+        body["vsock"] = json!({"cid": vsock.cid, "socket": vsock.socket});
+    }
+    body
 }
 
 #[cfg(test)]
@@ -194,12 +235,14 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use super::{BootFiles, guest_config, hostname_for, stop_timeout_ms, vm_create_body};
+    use super::{
+        BootFiles, check_consoles, guest_config, hostname_for, stop_timeout_ms, vm_create_body,
+    };
     use crate::ch::net::Subnet;
     use crate::ch::state::VmPaths;
     use crate::{
-        ConsoleMode, EngineError, ImageDigest, InitConfig, MacAddr, NetAttach, VmId, VmSpec,
-        VolumeAttach, VolumeId,
+        ConsoleMode, EngineError, ImageDigest, InitConfig, MacAddr, NetAttach, SerialMode, VmId,
+        VmSpec, VolumeAttach, VolumeId, VsockAttach,
     };
 
     fn subnet() -> Subnet {
@@ -237,6 +280,8 @@ mod tests {
                 workdir: Some("/app".to_string()),
             },
             console,
+            serial: SerialMode::Off,
+            vsock: None,
         }
     }
 
@@ -513,5 +558,118 @@ mod tests {
             })
         );
         assert_eq!(body["memory"]["size"], 536_870_912_u64);
+    }
+
+    #[test]
+    fn create_body_takes_the_serial_port_from_the_spec() {
+        let paths = paths();
+        let (kernel, initramfs, rootfs) = boot();
+        let boot = BootFiles {
+            kernel: &kernel,
+            initramfs: &initramfs,
+            rootfs: &rootfs,
+        };
+
+        // A serial socket is independent of the app's console.
+        let mut spec = make_spec(ConsoleMode::VirtioConsole {
+            socket: PathBuf::from("/run/quoro/vm/console.sock"),
+        });
+        spec.serial = SerialMode::Socket {
+            path: PathBuf::from("/run/quoro/vm/serial.sock"),
+        };
+        let body = vm_create_body(&spec, &paths, &boot, "tap0");
+        assert_eq!(
+            body["serial"],
+            serde_json::json!({"mode": "Socket", "socket": "/run/quoro/vm/serial.sock"})
+        );
+        assert_eq!(
+            body["console"],
+            serde_json::json!({"mode": "Socket", "socket": "/run/quoro/vm/console.sock"})
+        );
+
+        // A file serial port names the file, not `serial.log`.
+        spec.serial = SerialMode::File {
+            path: PathBuf::from("/var/log/quoro/serial.log"),
+        };
+        let body = vm_create_body(&spec, &paths, &boot, "tap0");
+        assert_eq!(
+            body["serial"],
+            serde_json::json!({"mode": "File", "file": "/var/log/quoro/serial.log"})
+        );
+
+        // An explicit `Off` keeps the pre-M4 `serial.log` (see the note on
+        // `vm_create_body`), and so does the superseded serial console.
+        spec.serial = SerialMode::Off;
+        let body = vm_create_body(&spec, &paths, &boot, "tap0");
+        assert_eq!(
+            body["serial"],
+            serde_json::json!({
+                "mode": "File",
+                "file": "/var/lib/quoro/vms/vm_01HX8Z4Q2M9W7T3YV6B1C0D5EF/serial.log",
+            })
+        );
+    }
+
+    #[test]
+    fn create_body_for_a_vsock_device() {
+        let mut spec = make_spec(ConsoleMode::Off);
+        let paths = paths();
+        let (kernel, initramfs, rootfs) = boot();
+        let boot = BootFiles {
+            kernel: &kernel,
+            initramfs: &initramfs,
+            rootfs: &rootfs,
+        };
+        assert!(
+            vm_create_body(&spec, &paths, &boot, "tap0")
+                .get("vsock")
+                .is_none(),
+            "no vsock key without a device"
+        );
+
+        spec.vsock = Some(VsockAttach {
+            cid: 3,
+            socket: PathBuf::from("/var/lib/quoro/vms/vm_01HX8Z4Q2M9W7T3YV6B1C0D5EF/vsock.sock"),
+        });
+        let body = vm_create_body(&spec, &paths, &boot, "tap0");
+        assert_eq!(
+            body["vsock"],
+            serde_json::json!({
+                "cid": 3,
+                "socket": "/var/lib/quoro/vms/vm_01HX8Z4Q2M9W7T3YV6B1C0D5EF/vsock.sock",
+            })
+        );
+    }
+
+    #[test]
+    fn a_serial_port_has_one_owner() {
+        let mut spec = make_spec(ConsoleMode::Serial {
+            socket: PathBuf::from("/run/quoro/vm/serial.sock"),
+        });
+        // The superseded console mode on its own is still accepted.
+        assert!(check_consoles(&spec).is_ok());
+
+        spec.serial = SerialMode::File {
+            path: PathBuf::from("/var/log/quoro/serial.log"),
+        };
+        match check_consoles(&spec) {
+            Err(EngineError::Conflict(reason)) => {
+                assert!(
+                    reason.starts_with("VM vm_01HX8Z4Q2M9W7T3YV6B1C0D5EF "),
+                    "{reason}"
+                );
+                assert!(reason.contains("one owner"), "{reason}");
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+
+        // A virtio-console with a serial socket is the M4 shape.
+        let mut spec = make_spec(ConsoleMode::VirtioConsole {
+            socket: PathBuf::from("/run/quoro/vm/console.sock"),
+        });
+        spec.serial = SerialMode::Socket {
+            path: PathBuf::from("/run/quoro/vm/serial.sock"),
+        };
+        assert!(check_consoles(&spec).is_ok());
     }
 }

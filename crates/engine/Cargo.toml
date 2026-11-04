@@ -20,13 +20,15 @@ tokio = { version = "1", default-features = false, features = [
 # The contract's `EventStream` and `LineStream` are `futures_core::Stream`
 # trait objects; the concrete stream is implemented in this crate.
 futures-core = { version = "0.3", default-features = false }
+# The config, status and exec-frame formats shared with the guest init (one
+# copy). Its library is pure Rust with no dependencies, so it builds on any
+# platform; `FakeEngine::exec` validates requests with it.
+quoro-init = { path = "../init" }
 
 # Everything below backs the Linux-only modules (`image`, `boot`, `pins`, and
 # the Cloud Hypervisor backend). The trait and `FakeEngine` above still build
 # on any platform, so FakeEngine tests run on laptops (engine-trait.md §7).
 [target.'cfg(target_os = "linux")'.dependencies]
-# The config and status formats shared with the guest init (one copy).
-quoro-init = { path = "../init" }
 # Blocking image work runs on `spawn_blocking` (`rt`); the registry client and
 # the VMM supervision need files, UNIX sockets, child processes and timers.
 tokio = { version = "1", default-features = false, features = [

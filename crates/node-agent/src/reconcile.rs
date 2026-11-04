@@ -682,6 +682,8 @@ impl<E: Engine + 'static> Reconciler<E> {
             },
             init: init_config(&prepared.config, &vm.env),
             console,
+            serial: quoro_engine::SerialMode::Off,
+            vsock: None,
         };
 
         match self.engine.create(&spec).await {
