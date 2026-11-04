@@ -107,6 +107,15 @@ Rules:
 | `quoro-control-plane` (workspace crate) | `crates/mcp` | none | The service layer every tool calls, `CallCtx` and bearer authentication; the MCP crate has no database dependency of its own (ADR 0031) |
 | `quoro-types` (workspace crate) | `crates/mcp` | none | `req_` request ids for each tool call |
 | `quoro-mcp` (workspace crate) | `crates/quoro` | none | The `/mcp` route the binary merges into the control plane's router |
+| `fastcdc` | `crates/backup` | no default features | Content-defined chunking of a snapshot file (backup-format.md section 5): the FastCDC 2020 variant with the contract's fixed 256 KiB, 1 MiB and 4 MiB parameters. Pure Rust, streamed over `std::io::Read`, so a 1 GiB volume is never held in memory |
+| `blake3` | `crates/backup` | `std` | Keyed chunk ids, the section 3 key derivations (`derive_key`), the recovery key fingerprint and the unkeyed manifest digest (sections 3 and 6.1). Pure Rust with a portable SIMD path; no C toolchain |
+| `zstd` | `crates/backup` | no default features | zstd level 3 over chunks and manifests (sections 5 and 6.1). Compression is plain Rust bindings over the reference C library, already in the tree through nothing else; decompression is bounded to 4 MiB per chunk and 256 MiB per manifest, so a hostile object cannot make the reader allocate more |
+| `chacha20poly1305` | `crates/backup` | `alloc`, `zeroize` (no default features) | XChaCha20-Poly1305 AEAD for chunk objects, manifests and the wrapped repo key (sections 4, 5 and 6.1); the same RustCrypto version and features the control plane and node agent use. Nonces come from `getrandom`, so its `getrandom` feature stays off |
+| `getrandom` | `crates/backup` | no default features | Every object's 24-byte nonce and the generated repo, source and recovery keys come straight from the OS generator (sections 3 and 4) |
+| `zeroize` | `crates/backup` | `alloc` | Wipes a key's 32 bytes from memory when the key is dropped (section 3) |
+| `serde`, `serde_json` | `crates/backup` | `derive`, `std` / `std` | The config, manifest and seal objects are JSON (sections 4, 6.1 and 6.2); the manifest is the plaintext a node writes and a restore parses |
+| `base64` | `crates/backup` | `std` (no default features) | The wrapped repo key's nonce and ciphertext are standard base64 in the config object (section 4); the same version `quoro-proto` uses |
+| `quoro-proto` (workspace crate) | `crates/backup` | none | The seal's Ed25519 signature over RFC 8785 canonical JSON (section 6.2) reuses `quoro_proto::sign` and `quoro_proto::jcs`, so the workspace has one canonicalizer and one signature implementation |
 
 ## Test-only dependencies
 
@@ -134,6 +143,9 @@ Rules:
 | `quoro-proto` (workspace crate) | `crates/mcp` | none | The incident test signs and frames node messages to open a real node session, so an `app.down` event opens an incident the MCP tools then read and resolve |
 | `tokio-tungstenite`, `futures-util` | `crates/mcp` | `handshake` (no default features) / `sink`, `std` | The same versions and features as `crates/control-plane`: the incident test drives the node session websocket as the node agent does. Enrolling and opening that session is the only way an `app.down` incident exists to test against |
 | `serde_norway` | `crates/mcp` | no default features | The contract test derives each tool's input schema from the frozen `openapi.yaml` (ADR 0048) and compares it with the served one |
+| `proptest` | `crates/backup` | `std` (no default features) | `tests/props.rs` checks the round trip, dedup, tamper refusal and manifest layout over generated snapshots of up to 12 MiB (backup-format.md sections 5, 6 and 8.1). A hand-rolled generator would be more code to review than this crate |
+| `quoro-engine` (workspace crate) | `crates/backup` (test only) | none | `tests/fake_engine.rs` writes, snapshots and imports real sparse volume files through `FakeEngine`, so the chunk engine is exercised against the engine's M5a volume methods, not a mock |
+| `tokio` | `crates/backup` | `macros`, `rt` | `#[tokio::test]` for that end-to-end test; the engine's volume methods are async |
 
 ## Tooling outside Cargo
 

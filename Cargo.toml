@@ -10,6 +10,7 @@ members = [
     "crates/node-agent",
     "crates/types",
     "crates/control-plane",
+    "crates/backup",
     "crates/providers",
     "crates/ingress",
     "crates/mcp",
