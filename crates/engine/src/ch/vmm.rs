@@ -461,6 +461,26 @@ mod tests {
         path
     }
 
+    /// Runs [`Vmm::spawn`], retrying an `exec` that lost to `ETXTBSY`.
+    ///
+    /// `script` writes the script a moment before the spawn. Another test thread
+    /// may fork during that write: the child inherits the write descriptor, and
+    /// the kernel refuses to execute the script ("Text file busy") until every
+    /// such descriptor is closed, however briefly. That is a test-harness race,
+    /// not the start-up failure under test, so try again instead of reporting it.
+    async fn spawn_retrying(launch: &VmmLaunch<'_>) -> Result<Vmm, EngineError> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match Vmm::spawn(launch).await {
+                Err(EngineError::Hypervisor(message)) if message.contains("Text file busy") => {
+                    assert!(std::time::Instant::now() < deadline, "{message}");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
     #[test]
     fn parses_start_time_with_parentheses_and_spaces_in_comm() {
         let stat = "1234 (my proc) S 1 1234 1234 0 -1 4194560 100 0 0 0 1 2 0 0 \
@@ -539,13 +559,13 @@ mod tests {
             event_log: &events,
             log_file: &log,
         };
-        let err = Vmm::spawn(&launch).await.expect_err("must fail");
+        let err = spawn_retrying(&launch).await.expect_err("must fail");
         match err {
             EngineError::Hypervisor(message) => {
                 assert!(message.contains("did not start"), "{message}");
                 // The log may not be flushed yet when the wait status arrives;
                 // poll briefly for the line the script wrote.
-                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
                 loop {
                     let text = std::fs::read_to_string(&log).unwrap_or_default();
                     if text.contains("boom: bad option") {
@@ -554,6 +574,9 @@ mod tests {
                     assert!(std::time::Instant::now() < deadline, "log: {text:?}");
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
+                // The failure carries the log, so an `exec` failure (which
+                // never reaches the script) cannot pass this test.
+                assert!(message.contains("boom: bad option"), "{message}");
             }
             other => panic!("unexpected error: {other:?}"),
         }
@@ -573,7 +596,7 @@ mod tests {
             event_log: &events,
             log_file: &log,
         };
-        let err = Vmm::spawn(&launch).await.expect_err("must fail");
+        let err = spawn_retrying(&launch).await.expect_err("must fail");
         assert!(matches!(err, EngineError::Hypervisor(_)), "{err:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }

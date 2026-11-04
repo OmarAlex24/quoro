@@ -106,6 +106,15 @@ pub async fn start() -> Server {
     start_inner(200, 800, None).await
 }
 
+/// Starts a control plane whose node sessions outlive the time a test spends
+/// talking to the API between frames: the heartbeat interval stays at 200 ms
+/// (the node-session tests assert it in `welcome`) but a node that sends
+/// nothing is only dropped after thirty seconds. Use this for every node test
+/// that is not itself about the session timeout.
+pub async fn start_with_patient_node_session() -> Server {
+    start_inner(200, 30_000, None).await
+}
+
 /// Starts a control plane whose Cloudflare clients reach a local mock, with a
 /// session timeout long enough for a test to poll the API while a node stays
 /// connected.

@@ -3,13 +3,13 @@
 
 mod common;
 
-use common::{Server, TLS_FINGERPRINT, problem, start};
+use common::{Server, TLS_FINGERPRINT, problem, start, start_with_patient_node_session};
 use futures_util::{SinkExt, StreamExt};
 use quoro_control_plane::api::enroll::{ensure_local_join, local_join_token};
 use quoro_control_plane::driver::{self, Capacity, Kvm, LocalNode};
 use quoro_proto::sign;
 use quoro_proto::wire::{
-    self, Capacity as WireCapacity, Health, Kvm as WireKvm, NodeMessage, ObservedStatus,
+    self, Capacity as WireCapacity, Health, Heartbeat, Kvm as WireKvm, NodeMessage, ObservedStatus,
     StatusReport, VmStatus,
 };
 use serde_json::{Value, json};
@@ -140,11 +140,25 @@ async fn send_text(socket: &mut Socket, text: String) {
     socket.send(WsMessage::Text(text.into())).await.unwrap();
 }
 
+/// Sends the `heartbeat` a live node sends every `heartbeat_interval_ms`
+/// (section 5.2), so the primary does not drop an idle session while the test
+/// works over HTTP.
+async fn heartbeat(socket: &mut Socket) {
+    send(
+        socket,
+        NodeMessage::Heartbeat(Heartbeat {
+            time: "2026-11-02T10:15:32Z".to_string(),
+            busy: None,
+        }),
+    )
+    .await;
+}
+
 async fn recv_frame(socket: &mut Socket) -> Value {
     loop {
-        let message = timeout(Duration::from_secs(3), socket.next())
+        let message = timeout(Duration::from_secs(30), socket.next())
             .await
-            .expect("a frame within 3 s")
+            .expect("a frame within 30 s")
             .expect("the socket is open")
             .expect("a valid websocket frame");
         match message {
@@ -259,7 +273,7 @@ async fn join_tokens_enroll_a_node_and_refuse_reuse() {
 
 #[tokio::test]
 async fn a_session_receives_welcome_and_a_verifiable_snapshot() {
-    let server = start().await;
+    let server = start_with_patient_node_session().await;
     let owner = server.owner().await;
     let node = enrolled(&server, &owner, NODE_NAME).await;
 
@@ -304,7 +318,9 @@ async fn a_session_receives_welcome_and_a_verifiable_snapshot() {
 
 #[tokio::test]
 async fn vm_changes_push_snapshots_and_observations_land() {
-    let server = start().await;
+    // Not a timeout test: the fake node must not lose its session while the
+    // test creates a project and a VM and polls the API.
+    let server = start_with_patient_node_session().await;
     let owner = server.owner().await;
     let node = enrolled(&server, &owner, NODE_NAME).await;
     let (mut socket, first) = open(&server, &node).await;
@@ -319,6 +335,8 @@ async fn vm_changes_push_snapshots_and_observations_land() {
         .await
         .unwrap();
     let project_id = project["id"].as_str().unwrap();
+    // The node keeps the session alive while the test works (5.2).
+    heartbeat(&mut socket).await;
 
     let res = owner
         .post(server.url("/api/v1/vms"))
@@ -342,6 +360,7 @@ async fn vm_changes_push_snapshots_and_observations_land() {
     );
     let vm: Value = res.json().await.unwrap();
     let vm_id = vm["id"].as_str().unwrap();
+    heartbeat(&mut socket).await;
 
     let second = recv_type(&mut socket, "desired_state").await;
     let second_rev = second["body"]["rev"].as_u64().unwrap();
@@ -381,7 +400,7 @@ async fn vm_changes_push_snapshots_and_observations_land() {
     )
     .await;
 
-    let bean = wait_for_vm(&server, &owner, vm_id, "running").await;
+    let bean = wait_for_vm(&server, &owner, &mut socket, vm_id, "running").await;
     assert_eq!(bean["ip"], "10.42.1.7");
 
     let res = owner
@@ -390,20 +409,34 @@ async fn vm_changes_push_snapshots_and_observations_land() {
         .await
         .unwrap();
     assert_eq!(res.status(), 202);
+    heartbeat(&mut socket).await;
     let third = recv_type(&mut socket, "desired_state").await;
     assert!(third["body"]["rev"].as_u64().unwrap() > second_rev);
     assert!(third["body"]["spec"]["vms"].as_array().unwrap().is_empty());
 }
 
-async fn wait_for_vm(server: &Server, owner: &reqwest::Client, vm_id: &str, status: &str) -> Value {
-    for _ in 0..100 {
+/// Polls the VM until it reports `status`, sending a heartbeat on every round so
+/// the fake node's session never goes idle. Panics after thirty seconds.
+async fn wait_for_vm(
+    server: &Server,
+    owner: &reqwest::Client,
+    socket: &mut Socket,
+    vm_id: &str,
+    status: &str,
+) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
         let vm = vm_json(server, owner, vm_id).await;
         if vm["observed_status"] == status {
             return vm;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "VM {vm_id} did not become {status}"
+        );
+        heartbeat(socket).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("VM {vm_id} did not become {status}");
 }
 
 #[tokio::test]
@@ -412,14 +445,20 @@ async fn silence_disconnects_and_a_new_session_supersedes() {
     let owner = server.owner().await;
     let node = enrolled(&server, &owner, NODE_NAME).await;
 
-    // Silence: no frame within the 800 ms session timeout.
+    // Silence: no frame within the 800 ms session timeout. This test starts the
+    // server with the real short timeout on purpose.
     let (mut silent, _) = open(&server, &node).await;
-    let _ = silent.next().await;
-    for _ in 0..200 {
+    let _ = timeout(Duration::from_secs(10), silent.next()).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
         let current = node_json(&server, &owner, &node.node_id).await;
         if current["status"] == "disconnected" {
             break;
         }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the idle node is not disconnected"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let current = node_json(&server, &owner, &node.node_id).await;
@@ -438,7 +477,7 @@ async fn silence_disconnects_and_a_new_session_supersedes() {
     // not mark the node disconnected when it closes.
     let (mut first, _) = open(&server, &node).await;
     let (mut second, _) = open(&server, &node).await;
-    let first_closed = timeout(Duration::from_secs(2), async {
+    let first_closed = timeout(Duration::from_secs(10), async {
         loop {
             match first.next().await {
                 None | Some(Err(_)) | Some(Ok(WsMessage::Close(_))) => break,
@@ -541,7 +580,7 @@ async fn the_local_bootstrap_token_enrolls_the_primary() {
 
 #[tokio::test]
 async fn protocol_errors_are_non_fatal_except_an_unsupported_version() {
-    let server = start().await;
+    let server = start_with_patient_node_session().await;
     let owner = server.owner().await;
     let node = enrolled(&server, &owner, NODE_NAME).await;
     let (mut socket, _) = open(&server, &node).await;
@@ -582,7 +621,7 @@ async fn protocol_errors_are_non_fatal_except_an_unsupported_version() {
     let error = recv_type(&mut socket, "error").await;
     assert_eq!(error["body"]["code"], "unsupported_version");
     assert_eq!(error["body"]["fatal"], true);
-    let closed = timeout(Duration::from_secs(2), async {
+    let closed = timeout(Duration::from_secs(10), async {
         loop {
             match socket.next().await {
                 None | Some(Err(_)) | Some(Ok(WsMessage::Close(_))) => break,
