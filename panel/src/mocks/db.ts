@@ -41,6 +41,8 @@ export const now = (): string => new Date().toISOString();
 export interface MockDb {
   setupDone: boolean;
   owner: User | null;
+  /** Every human identity: the owner created at setup plus those invited. */
+  users: User[];
   /** The password chosen at setup; the mock compares against it. */
   password: string | null;
   /** Id of the signed-in user, or null. The panel's cookie, simulated. */
@@ -58,6 +60,7 @@ export interface MockDb {
 export const db: MockDb = {
   setupDone: false,
   owner: null,
+  users: [],
   password: null,
   sessionUserId: null,
   node: {

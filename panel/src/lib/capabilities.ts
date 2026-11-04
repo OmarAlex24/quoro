@@ -33,6 +33,14 @@ export const canManageGrants = humanWriter;
 export const canManageWebhooks = humanWriter;
 
 /**
+ * Create, change, disable, reset and delete human users (`user:write`). Only an
+ * `owner` holds it: an `operator` runs the cluster but cannot touch identities,
+ * and an agent session never can (permission-model.md, section 4.2).
+ */
+export const canManageUsers = (me: MeResponse | undefined): boolean =>
+  isHumanSession(me) && me?.user?.role === 'owner';
+
+/**
  * Read the user list to show names instead of ids (`user:read`). Every human
  * role holds it, so owner, operator and viewer all see names; an agent session
  * never lists users.

@@ -71,6 +71,7 @@ import { approvalsHandlers } from './handlers-approvals';
 import { auditHandlers } from './handlers-audit';
 import { grantsHandlers } from './handlers-grants';
 import { incidentsHandlers } from './handlers-incidents';
+import { usersHandlers } from './handlers-users';
 import { webhooksHandlers } from './handlers-webhooks';
 
 const findVm = (vmId: string): Vm | undefined =>
@@ -148,6 +149,7 @@ export const handlers = [
       created_at: now(),
     };
     db.owner = owner;
+    db.users = [owner];
     db.password = password;
     db.setupDone = true;
     db.sessionUserId = null;
@@ -831,7 +833,9 @@ export const handlers = [
     });
   }),
 
-  // The agency screens: agents, grants, approvals, audit, webhooks, incidents.
+  // The agency screens: users, agents, grants, approvals, audit, webhooks,
+  // incidents.
+  ...usersHandlers,
   ...agentsHandlers,
   ...grantsHandlers,
   ...approvalsHandlers,
