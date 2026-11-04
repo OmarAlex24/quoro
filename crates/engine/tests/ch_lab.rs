@@ -193,6 +193,7 @@ fn lab_spec(
             gateway: GATEWAY.parse().expect("gateway"),
             mac: MacAddr([0x02, 0x00, 0x00, 0x00, 0x77, seed]),
             isolation_group: None,
+            egress_only: false,
         },
         init: InitConfig {
             entrypoint: Vec::new(),
@@ -204,6 +205,7 @@ fn lab_spec(
         console,
         serial: quoro_engine::SerialMode::Off,
         vsock: None,
+        work_disks: Vec::new(),
     }
 }
 
