@@ -523,7 +523,7 @@ async fn app_validation_and_authorization() {
     let mut body = create_body(&project_id);
     body["project_id"] = json!(quoro_types::new_id(quoro_types::Prefix::Project));
     cases.push(("unknown project", body));
-    // Exactly one of `image` and `source`; Git sources wait for the builds epic.
+    // Exactly one of `image` and `source` (openapi.yaml `CreateAppRequest`).
     let source = json!({ "kind": "git", "repo_url": "https://example.com/app.git", "ref": "main" });
     let mut body = create_body(&project_id);
     body.as_object_mut().unwrap().remove("image");
@@ -533,8 +533,8 @@ async fn app_validation_and_authorization() {
     cases.push(("both image and source", body));
     let mut body = create_body(&project_id);
     body.as_object_mut().unwrap().remove("image");
-    body["source"] = source.clone();
-    cases.push(("source before builds", body));
+    body["source"] = json!({ "kind": "git", "repo_url": "git@example.com:app.git", "ref": "main" });
+    cases.push(("source url is not https", body));
     for (label, body) in cases {
         let (status, code, _) = problem(
             owner

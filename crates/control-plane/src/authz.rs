@@ -137,11 +137,11 @@ pub fn resolve<'c>(
                     out.project_id = Some(project_id);
                 }
             }
-            "deployment" | "domain" => {
-                let table = if kind == "deployment" {
-                    "deployments"
-                } else {
-                    "domains"
+            "deployment" | "domain" | "build" => {
+                let table = match kind {
+                    "deployment" => "deployments",
+                    "build" => "builds",
+                    _ => "domains",
                 };
                 let app: Option<(String,)> =
                     sqlx::query_as(&format!("SELECT app_id FROM {table} WHERE id = ?"))

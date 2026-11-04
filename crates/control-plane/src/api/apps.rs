@@ -33,9 +33,9 @@ use sqlx::sqlite::SqliteRow;
 use utoipa::{IntoParams, ToSchema};
 
 /// Columns of [`App`], in the order [`app_from_row`] expects them.
-pub(crate) const APP_COLUMNS: &str = "id, project_id, name, stateful, ha_policy, image, port, health_check, \
-     resources, placement, status, current_deployment_id, restart_generation, created_at, \
-     updated_at";
+pub(crate) const APP_COLUMNS: &str = "id, project_id, name, stateful, ha_policy, image, source, port, \
+     health_check, resources, placement, status, current_deployment_id, restart_generation, \
+     created_at, updated_at";
 
 /// `apps.status` (`App.status`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -206,7 +206,7 @@ impl ToSchema for NodeIdItem {}
 #[derive(Clone, Debug, Serialize, ToSchema)]
 #[schema(
     title = "App",
-    description = "A deployable service. It runs as one microVM per instance (D-0008); in M1-M4 an app has one instance. `ha_policy` exists from M0 but only `none` is accepted before M5a (D-0020)."
+    description = "A deployable service. It runs as one microVM per instance (D-0008); in M1-M4 an app has one instance. `ha_policy` exists from M0 but only `none` is accepted before M5a (D-0020). An app either deploys images given by reference (`source` null) or builds them from a Git source (ADR 0117)."
 )]
 pub struct App {
     /// App id.
@@ -228,9 +228,9 @@ pub struct App {
     /// Current OCI reference of the app. For an app with a Git source, the
     /// reference of its last successful build, or `""` before the first one.
     pub image: String,
-    /// The Git source the app builds its images from, or absent for an app
-    /// that deploys images given by reference (ADR 0117).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// The Git source the app builds its images from, or null for an app that
+    /// deploys images given by reference (ADR 0117).
+    #[serde(default)]
     #[schema(required = false)]
     pub source: Option<AppSource>,
     /// Container port the app listens on.
@@ -337,9 +337,9 @@ pub struct BuildArg {
     pub value: String,
 }
 
-/// The Git source an app builds its images from (`openapi.yaml`
-/// `AppSource`, ADR 0117). The contract shape only: builds ship with the M4
-/// builds epic, and until then `createApp` refuses a source.
+/// The Git source an app builds its images from (`openapi.yaml` `AppSource`,
+/// ADR 0117). It is stored in `apps.source` as JSON; a build then runs from a
+/// snapshot of it.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
 #[schema(
     title = "AppSource",
@@ -577,6 +577,14 @@ pub(crate) fn app_from_row(row: &SqliteRow) -> Result<App, ApiError> {
     let placement: String = row.try_get("placement")?;
     let placement = serde_json::from_str(&placement)
         .map_err(|error| ApiError::internal(&format!("stored placement: {error}")))?;
+    let source: Option<String> = row.try_get("source")?;
+    let source = match source {
+        Some(source) => Some(
+            serde_json::from_str(&source)
+                .map_err(|error| ApiError::internal(&format!("stored source: {error}")))?,
+        ),
+        None => None,
+    };
     Ok(App {
         id: row.try_get("id")?,
         project_id: row.try_get("project_id")?,
@@ -584,9 +592,7 @@ pub(crate) fn app_from_row(row: &SqliteRow) -> Result<App, ApiError> {
         stateful: row.try_get("stateful")?,
         ha_policy,
         image: row.try_get("image")?,
-        // No app has a Git source before the M4 builds epic (createApp
-        // refuses one), so `apps.source` is always NULL here.
-        source: None,
+        source,
         port: row.try_get("port")?,
         health_check,
         resources,
@@ -745,12 +751,8 @@ fn validate_create(body: &CreateAppRequest) -> Result<(), ApiError> {
             ));
         }
         (None, None) => return Err(ApiError::validation("image or source is required")),
-        // Git sources need builds, which ship with the M4 builds epic
-        // (ADR 0117); until then an app deploys images only.
-        (None, Some(_)) => {
-            return Err(ApiError::validation(
-                "apps built from a Git source are not supported yet",
-            ));
+        (None, Some(source)) => {
+            crate::build::validate_source(source)?;
         }
         (Some(image), None) => {
             if image.trim().is_empty() {
@@ -1021,6 +1023,12 @@ async fn insert_app(
 ) -> Result<App, ApiError> {
     validate_create(body)?;
     let now = now_rfc3339();
+    // A Git app holds the built image of its last successful build, or the
+    // empty string before the first one; the column is NOT NULL.
+    let source = match &body.source {
+        Some(source) => Some(crate::build::validate_source(source)?),
+        None => None,
+    };
     let app = App {
         id: deploy::new_id_with_prefix("app"),
         project_id: body.project_id.clone(),
@@ -1028,7 +1036,7 @@ async fn insert_app(
         stateful: false,
         ha_policy: HaPolicy::None,
         image: body.image.clone().unwrap_or_default(),
-        source: None,
+        source,
         port: body.port,
         health_check: body.health_check.clone().unwrap_or_default(),
         resources: body.resources.clone().unwrap_or_default(),
@@ -1069,17 +1077,22 @@ async fn insert_app(
         .map_err(|error| ApiError::internal(&format!("resources: {error}")))?;
     let placement = serde_json::to_string(&app.placement)
         .map_err(|error| ApiError::internal(&format!("placement: {error}")))?;
+    let source = match &app.source {
+        Some(source) => Some(crate::build::source_json(source)?),
+        None => None,
+    };
     sqlx::query(
-        "INSERT INTO apps (id, project_id, name, stateful, ha_policy, image, port, health_check, \
-         resources, placement, status, current_deployment_id, restart_generation, created_at, \
-         updated_at) \
-         VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, ?)",
+        "INSERT INTO apps (id, project_id, name, stateful, ha_policy, image, source, port, \
+         health_check, resources, placement, status, current_deployment_id, restart_generation, \
+         created_at, updated_at) \
+         VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, ?)",
     )
     .bind(&app.id)
     .bind(&app.project_id)
     .bind(&app.name)
     .bind(app.ha_policy.as_str())
     .bind(&app.image)
+    .bind(&source)
     .bind(app.port)
     .bind(&health_check)
     .bind(&resources)
@@ -1272,12 +1285,20 @@ async fn update_app_tx(
     let mut app = app_from_row(&row)?;
     let mut changed = Vec::new();
 
-    // A Git source cannot be added to an app created from an image in M4
-    // (openapi.yaml `UpdateAppRequest`), and no app has one yet.
-    if body.source.is_some() && app.source.is_none() {
-        return Err(ApiError::conflict(
-            "a Git source cannot be added to an app created from an image",
-        ));
+    // A Git source replaces the whole source of an app that has one; it can
+    // neither be added to an image app nor removed in M4 (openapi.yaml
+    // `UpdateAppRequest`).
+    if let Some(source) = &body.source {
+        if app.source.is_none() {
+            return Err(ApiError::conflict(
+                "a Git source cannot be added to an app created from an image",
+            ));
+        }
+        let source = crate::build::validate_source(source)?;
+        if app.source.as_ref() != Some(&source) {
+            app.source = Some(source);
+            changed.push("source");
+        }
     }
 
     if let Some(name) = &body.name
@@ -1340,9 +1361,13 @@ async fn update_app_tx(
             .map_err(|error| ApiError::internal(&format!("resources: {error}")))?;
         let placement = serde_json::to_string(&app.placement)
             .map_err(|error| ApiError::internal(&format!("placement: {error}")))?;
+        let source = match &app.source {
+            Some(source) => Some(crate::build::source_json(source)?),
+            None => None,
+        };
         sqlx::query(
             "UPDATE apps SET name = ?, port = ?, ha_policy = ?, health_check = ?, resources = ?, \
-             placement = ?, updated_at = ? WHERE id = ?",
+             placement = ?, source = ?, updated_at = ? WHERE id = ?",
         )
         .bind(&app.name)
         .bind(app.port)
@@ -1350,6 +1375,7 @@ async fn update_app_tx(
         .bind(&health_check)
         .bind(&resources)
         .bind(&placement)
+        .bind(&source)
         .bind(&app.updated_at)
         .bind(app_id)
         .execute(&mut *w.tx)
@@ -1456,7 +1482,7 @@ pub(crate) async fn delete_app_tx(
     ctx: &CallCtx,
     app_id: &str,
     params: &Value,
-) -> Result<(App, Vec<String>), ApiError> {
+) -> Result<(App, Vec<String>, Vec<String>), ApiError> {
     if !deploy::is_id_with_prefix("app", app_id) {
         return Err(ApiError::not_found("app"));
     }
@@ -1531,6 +1557,36 @@ pub(crate) async fn delete_app_tx(
         .execute(&mut *w.tx)
         .await?;
 
+    // `builds.deployment_id` references the deployment a success started, so
+    // the builds of the app go first; a build that is still running leaves the
+    // node's `spec.builds` once its row is gone.
+    let builds = sqlx::query(&format!(
+        "SELECT {} FROM builds WHERE app_id = ?",
+        crate::build::BUILD_COLUMNS
+    ))
+    .bind(app_id)
+    .fetch_all(&mut *w.tx)
+    .await?;
+    let mut build_nodes = Vec::new();
+    for row in &builds {
+        let build = crate::build::build_from_row(row)?;
+        build_nodes.push(build.node_id.clone());
+        sqlx::query("DELETE FROM builds WHERE id = ?")
+            .bind(&build.id)
+            .execute(&mut *w.tx)
+            .await?;
+        changelog::append(
+            &mut w.tx,
+            &actor,
+            "build",
+            &build.id,
+            Op::Delete,
+            serde_json::to_value(&build)
+                .map_err(|error| ApiError::internal(&format!("build payload: {error}")))?,
+        )
+        .await?;
+    }
+
     // `apps.current_deployment_id` references the deployment, so it goes first.
     sqlx::query("UPDATE apps SET current_deployment_id = NULL WHERE id = ?")
         .bind(app_id)
@@ -1596,7 +1652,7 @@ pub(crate) async fn delete_app_tx(
     )
     .await?;
     w.commit().await?;
-    Ok((app, vm_ids))
+    Ok((app, vm_ids, build_nodes))
 }
 
 /// Bumps `restart_generation`; the node restarts the instances that carry the
@@ -1809,13 +1865,21 @@ pub(crate) async fn redeploy_app_tx(
         return Err(ApiError::not_found("app"));
     }
     let mut w = state.store.begin_write().await?;
-    let image: Option<(String,)> = sqlx::query_as("SELECT image FROM apps WHERE id = ?")
-        .bind(app_id)
-        .fetch_optional(&mut *w.tx)
-        .await?;
-    let Some((image,)) = image else {
+    let app: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT image, source FROM apps WHERE id = ?")
+            .bind(app_id)
+            .fetch_optional(&mut *w.tx)
+            .await?;
+    let Some((image, source)) = app else {
         return Err(ApiError::not_found("app"));
     };
+    // A Git app re-rolls the built image of its last successful build, and
+    // has none before the first one.
+    if source.is_some() && image.is_empty() {
+        return Err(ApiError::conflict(
+            "the app has no built image yet; start a build first",
+        ));
+    }
     let created = deploy::create_deployment(
         &mut w.tx,
         app_id,

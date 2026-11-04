@@ -231,6 +231,7 @@ impl utoipa::Modify for Security {
         openapi.merge(crate::api::apps::AppsDoc::openapi());
         openapi.merge(crate::api::logs::LogsDoc::openapi());
         openapi.merge(crate::api::interactive::InteractiveDoc::openapi());
+        openapi.merge(crate::api::builds::BuildsDoc::openapi());
         openapi.merge(crate::api::events::EventsDoc::openapi());
         openapi.merge(crate::api::incidents::IncidentsDoc::openapi());
 
@@ -261,6 +262,7 @@ impl utoipa::Modify for Security {
             "/api/v1/nodes/join-tokens",
             "/api/v1/audit/verify",
             "/api/v1/vms/{vm_id}/console-sessions",
+            "/api/v1/apps/{app_id}/builds",
         ] {
             if let Some(body) = openapi
                 .paths

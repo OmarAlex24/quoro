@@ -1882,6 +1882,17 @@ async fn apply_status_report(
             }
         }
     }
+    for build in &report.builds {
+        match crate::build::apply_build_status(&hub.0.store, node_id, build).await {
+            Ok(true) => hub.node_changed(node_id),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                build_id = %build.build_id,
+                code = %e.code.as_str(),
+                "cannot apply the reported build status"
+            ),
+        }
+    }
     set_applied_rev(hub, node_id, report.applied_rev).await?;
     apply_route_statuses(hub, node_id, &report.routes).await
 }
