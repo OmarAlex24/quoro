@@ -78,7 +78,7 @@ fn hash_password(password: &str) -> Result<String, ApiError> {
 
 /// The replicated `users` row, exactly as the change log carries it: the
 /// password hash is included so replaying the log rebuilds the table.
-fn user_payload(user: &User, password_hash: &str) -> Value {
+pub(crate) fn user_payload(user: &User, password_hash: &str) -> Value {
     json!({
         "id": user.id,
         "email": user.email,

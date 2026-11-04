@@ -82,7 +82,16 @@ pub struct Record {
 }
 
 /// Keys whose values are replaced at any depth (section 4).
-const REDACTED_KEYS: [&str; 6] = ["value", "values", "secret", "password", "token", "key"];
+const REDACTED_KEYS: [&str; 8] = [
+    "value",
+    "values",
+    "secret",
+    "password",
+    "current_password",
+    "new_password",
+    "token",
+    "key",
+];
 
 /// Replaces the values of the redacted keys by `"[redacted]"`, at any depth.
 #[must_use]
@@ -493,7 +502,13 @@ mod tests {
             target_type: Some("user".into()),
             target_id: Some("usr_01JC9Z6Q5W8N3K4T7R2M1XHB0D".into()),
             project_id: None,
-            params: json!({ "email": "a@example.com", "password": "hunter2hunter2", "nested": [{ "token": "x" }] }),
+            params: json!({
+                "email": "a@example.com",
+                "password": "hunter2hunter2",
+                "current_password": "old-secret-value",
+                "new_password": "new-secret-value",
+                "nested": [{ "token": "x" }],
+            }),
             justification: None,
             trigger_event_id: None,
             incident_id: None,
@@ -525,6 +540,8 @@ mod tests {
         assert_eq!(rows[0].2, GENESIS_HASH);
         assert_eq!(rows[1].2, rows[0].3);
         assert!(!rows[0].1.contains("hunter2"));
+        assert!(!rows[0].1.contains("old-secret-value"));
+        assert!(!rows[0].1.contains("new-secret-value"));
         assert!(rows[0].1.contains("[redacted]"));
         assert!(!rows[0].1.contains("\"x\""));
 

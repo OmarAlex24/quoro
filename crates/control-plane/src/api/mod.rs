@@ -39,6 +39,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/auth/login", post(auth::login))
         .route("/api/v1/auth/logout", post(auth::logout))
         .route("/api/v1/auth/me", get(auth::get_me))
+        .route("/api/v1/auth/password", post(auth::change_password))
         .route("/api/v1/auth/agent-token", post(agents::create_agent_token))
         .route("/api/v1/cluster", get(cluster::get_cluster))
         .route(

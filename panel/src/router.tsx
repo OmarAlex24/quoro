@@ -6,6 +6,7 @@ import {
 } from '@tanstack/react-router';
 import { ChassisHeader } from './components/chassis-header';
 import type { AuditRecordResult, GrantKind, GrantStatus } from './api/generated/model';
+import { AccountScreen } from './screens/account-screen';
 import { AgentScreen } from './screens/agent-screen';
 import { AgentsScreen } from './screens/agents-screen';
 import { ApprovalsScreen } from './screens/approvals-screen';
@@ -182,6 +183,12 @@ const loginRoute = createRoute({
   component: LoginScreen,
 });
 
+const accountRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/account',
+  component: AccountScreen,
+});
+
 const setupRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/setup',
@@ -206,6 +213,7 @@ const routeTree = rootRoute.addChildren([
   webhookDetailRoute,
   usersRoute,
   loginRoute,
+  accountRoute,
   setupRoute,
 ]);
 

@@ -123,6 +123,9 @@ pub struct AppState {
     pub store: store::Store,
     pub config: Arc<ServerConfig>,
     pub idempotency: idempotency::Cache,
+    /// Per-user sliding window of `POST /api/v1/auth/password` attempts
+    /// (permission-model.md section 12).
+    pub password_rate_limit: auth::rate_limit::RateLimiter,
     /// The cluster data-encryption keyring (D-0050); every `*_enc` column is
     /// encrypted and decrypted through it.
     pub data_key: Arc<crypto::DataKey>,
@@ -183,6 +186,7 @@ impl AppState {
             store,
             config,
             idempotency: idempotency::Cache::default(),
+            password_rate_limit: auth::rate_limit::RateLimiter::default(),
             data_key,
             hub,
             tunnel,

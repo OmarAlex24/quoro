@@ -127,9 +127,17 @@ export function ChassisHeader() {
           {clusterLine}
         </p>
         <div className="ml-auto flex items-center gap-2 sm:gap-3">
-          <span className="type-body-medium text-[13px] text-ink-muted">
-            {roleLabel(user.role)}
-          </span>
+          <Link
+            to="/account"
+            className="flex min-w-0 items-baseline gap-2 underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+          >
+            <span className="type-body-medium max-w-[14rem] truncate text-[13px] text-ink">
+              {user.name}
+            </span>
+            <span className="type-body-medium text-[13px] text-ink-muted">
+              {roleLabel(user.role)}
+            </span>
+          </Link>
           <span aria-hidden="true" className="h-4 w-px bg-rail" />
           <Button
             variant="quiet"

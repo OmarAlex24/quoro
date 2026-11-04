@@ -1,5 +1,6 @@
 //! First-run setup and human sessions: `POST /api/v1/setup`,
-//! `POST /api/v1/auth/login`, `POST /api/v1/auth/logout`, `GET /api/v1/auth/me`.
+//! `POST /api/v1/auth/login`, `POST /api/v1/auth/logout`,
+//! `POST /api/v1/auth/password`, `GET /api/v1/auth/me`.
 //!
 //! D-0054: setup needs the one-time `Quoro-Setup-Token` and works only while
 //! no user exists. permission-model.md section 2: sessions have a 24 h
@@ -12,9 +13,10 @@ use crate::auth::{
     Credential, Identity, Principal, SESSION_COOKIE, SESSION_TTL_SECONDS, password, setup_token,
 };
 use crate::changelog::{self, Actor, ActorType, Op};
-use crate::error::{ApiError, Target};
+use crate::error::{ApiError, Code, Target};
 use crate::idempotency::Begin;
 use crate::request::{ApiJson, CallCtx, request_id_of};
+use crate::service::users::user_payload;
 use crate::store::{now_rfc3339, random_secret, rfc3339_in, sha256_hex};
 use axum::Json;
 use axum::extract::State;
@@ -23,6 +25,7 @@ use axum::response::{IntoResponse, Response};
 use quoro_types::{Prefix, Role, Scope, new_id};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sqlx::Row;
 use std::borrow::Cow;
 use utoipa::ToSchema;
 use utoipa::openapi::RefOr;
@@ -57,6 +60,19 @@ pub struct LoginRequest {
     /// Password of the user.
     #[schema(format = "password", min_length = 1, write_only)]
     pub password: String,
+}
+
+/// The signed-in human's current password and the new one (ADR 0135).
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+#[schema(title = "ChangePasswordRequest")]
+pub struct ChangePasswordRequest {
+    /// The password the user signs in with today.
+    #[schema(format = "password", min_length = 1, write_only)]
+    pub current_password: String,
+    /// The new password, different from the current one. Stored as an
+    /// Argon2id hash.
+    #[schema(format = "password", min_length = 12, write_only)]
+    pub new_password: String,
 }
 
 /// Fixed scope bundle of a human.
@@ -692,6 +708,237 @@ pub async fn logout(
         .headers_mut()
         .insert(header::SET_COOKIE, session_cookie(&state, "", 0));
     Ok(response)
+}
+
+const CHANGE_PASSWORD: &str = "POST /api/v1/auth/password";
+
+/// Writes one password-change record in its own transaction, for the outcomes
+/// that have no state change of their own (`audit-log-format.md` section 3.4).
+async fn audit_password(
+    state: &AppState,
+    ctx: &CallCtx,
+    target: &Target,
+    params: &Value,
+    outcome: Outcome,
+    result_detail: &str,
+) -> Result<(), ApiError> {
+    let record = ctx.record(
+        None,
+        Some(target),
+        None,
+        params,
+        outcome,
+        Some(result_detail.to_string()),
+        None,
+    );
+    let mut w = state.store.begin_write().await?;
+    audit::append(&mut w.tx, &record).await?;
+    w.commit().await?;
+    Ok(())
+}
+
+/// Change the signed-in human's own password (`openapi.yaml`
+/// `changePassword`, ADR 0135).
+///
+/// Only the `quoro_session` cookie authenticates this call: any
+/// `Authorization` header answers `unauthenticated` before a credential is
+/// resolved, so neither a personal API token nor an agent token can change a
+/// password. The current password is proven, the new one follows the password
+/// rule, and the whole change (hash, session pruning, change log, audit) is one
+/// write transaction. Personal API tokens are deliberately left alone.
+#[utoipa::path(
+    post,
+    path = "/api/v1/auth/password",
+    tag = "auth",
+    operation_id = "changePassword",
+    extensions(("x-quoro-scope" = json!("human"))),
+    security(("sessionCookie" = [])),
+    request_body(content = ChangePasswordRequest, description = "The current password and the new one."),
+    responses(
+        (status = 204, description = "The password changed and the user's other panel sessions ended.",
+            headers(("Quoro-Request-Id" = String, description = "Correlation id of this call."))),
+        (status = 401, response = crate::openapi::Unauthenticated),
+        (status = 422, response = crate::openapi::ValidationFailed),
+        (status = 429, response = crate::openapi::RateLimited),
+        (status = 503, response = crate::openapi::NotPrimary),
+    )
+)]
+pub async fn change_password(
+    State(state): State<AppState>,
+    extensions: Extensions,
+    headers: HeaderMap,
+    ApiJson(body): ApiJson<ChangePasswordRequest>,
+) -> Result<Response, ApiError> {
+    // Any Authorization header disqualifies the call, whatever it carries,
+    // and leaves no identity to attribute a record to.
+    if headers.contains_key(header::AUTHORIZATION) {
+        return Err(ApiError::unauthenticated());
+    }
+    let identity = crate::auth::authenticate(&state, &headers).await?;
+    // Only a panel session may change a password; the cookie only ever
+    // resolves to a human, but keep the check explicit.
+    if !matches!(identity.credential, Credential::Session { .. }) || identity.user().is_none() {
+        return Err(ApiError::unauthenticated());
+    }
+    let user_id = identity.id().to_string();
+    let ctx = CallCtx::new(
+        identity,
+        request_id_of(&extensions),
+        CHANGE_PASSWORD,
+        &headers,
+    );
+    let target = Target {
+        kind: "user".into(),
+        id: user_id.clone(),
+    };
+    // The unredacted values live only in this request; `audit::append`
+    // redacts both keys before hashing or storing.
+    let params = json!({
+        "current_password": &body.current_password,
+        "new_password": &body.new_password,
+    });
+
+    // Step 2: per-user rate limit. Every attempt that reaches the password
+    // check counts, successful or not.
+    if !state.password_rate_limit.attempt(&user_id) {
+        audit_password(
+            &state,
+            &ctx,
+            &target,
+            &params,
+            Outcome::Refused,
+            "rate_limited",
+        )
+        .await?;
+        return Err(ApiError::new(
+            Code::RateLimited,
+            "too many password change attempts; try again later",
+        ));
+    }
+
+    // Step 3: read the stored hash and verify outside the writer gate (Argon2
+    // is CPU work). A wrong current password is a refusal with its own detail.
+    let stored: Option<(String,)> = sqlx::query_as("SELECT password_hash FROM users WHERE id = ?")
+        .bind(&user_id)
+        .fetch_optional(state.store.pool())
+        .await?;
+    let Some((current_hash,)) = stored else {
+        return Err(ApiError::unauthenticated());
+    };
+    if !password::verify(&body.current_password, &current_hash) {
+        audit_password(
+            &state,
+            &ctx,
+            &target,
+            &params,
+            Outcome::Refused,
+            "wrong_password",
+        )
+        .await?;
+        return Err(ApiError::validation("the current password is wrong"));
+    }
+
+    // Step 4: the new password must follow the password rule and differ from
+    // the current one. Both are `error` / `validation_failed`.
+    if body.new_password.chars().count() < 12 {
+        audit_password(
+            &state,
+            &ctx,
+            &target,
+            &params,
+            Outcome::Error,
+            "validation_failed",
+        )
+        .await?;
+        return Err(ApiError::validation(
+            "the new password must be at least 12 characters",
+        ));
+    }
+    if password::verify(&body.new_password, &current_hash) {
+        audit_password(
+            &state,
+            &ctx,
+            &target,
+            &params,
+            Outcome::Error,
+            "validation_failed",
+        )
+        .await?;
+        return Err(ApiError::validation(
+            "the new password must be different from the current password",
+        ));
+    }
+
+    // Step 5: hash before the writer gate, then commit the change, the session
+    // pruning, the change-log entry and the audit record together.
+    let new_hash = password::hash(&body.new_password).map_err(|e| ApiError::internal(&e))?;
+    let mut w = state.store.begin_write().await?;
+    let row =
+        sqlx::query("SELECT id, email, name, role, disabled, created_at FROM users WHERE id = ?")
+            .bind(&user_id)
+            .fetch_optional(&mut *w.tx)
+            .await?
+            .ok_or_else(ApiError::unauthenticated)?;
+    let current: UserRow = (
+        row.try_get("id")?,
+        row.try_get("email")?,
+        row.try_get("name")?,
+        row.try_get("role")?,
+        row.try_get("disabled")?,
+        row.try_get("created_at")?,
+    );
+    let user = user_from(current)?;
+    // Only the hash that was verified above may be replaced: a concurrent
+    // change that committed in between makes this call's proof stale.
+    let updated =
+        sqlx::query("UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?")
+            .bind(&new_hash)
+            .bind(&user_id)
+            .bind(&current_hash)
+            .execute(&mut *w.tx)
+            .await?;
+    if updated.rows_affected() != 1 {
+        drop(w);
+        audit_password(
+            &state,
+            &ctx,
+            &target,
+            &params,
+            Outcome::Refused,
+            "wrong_password",
+        )
+        .await?;
+        return Err(ApiError::validation("the current password is wrong"));
+    }
+    // sessions is LOCAL: no change-log entry. Every other session of the user
+    // ends; the one that made the call stays valid.
+    if let Credential::Session { session_id } = &ctx.identity.credential {
+        sqlx::query("DELETE FROM sessions WHERE user_id = ? AND id <> ?")
+            .bind(&user_id)
+            .bind(session_id)
+            .execute(&mut *w.tx)
+            .await?;
+    }
+    let change_seq = changelog::append(
+        &mut w.tx,
+        &ctx.identity.actor(),
+        "user",
+        &user_id,
+        Op::Update,
+        user_payload(&user, &new_hash),
+    )
+    .await?;
+    ctx.append_ok(
+        &mut w.tx,
+        None,
+        Some(&target),
+        None,
+        &params,
+        Some(change_seq),
+    )
+    .await?;
+    w.commit().await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// Read the current identity.
