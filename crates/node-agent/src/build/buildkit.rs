@@ -34,7 +34,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use quoro_engine::{
     ConsoleMode, Engine, EngineError, EngineEvent, ImageDigest, ImageRef, InitConfig, MacAddr,
-    NetAttach, OciLayout, OutputStream, PreparedImage, SerialMode, StopMode, VmId, VmSpec,
+    NetAttach, OciLayout, OutputStream, PreparedImage, SerialMode, StopMode, VmId, VmInfo, VmSpec,
     WorkDisk,
 };
 use quoro_proto::wire::{BuildPhase, FailedStep, LogStream};
@@ -544,8 +544,14 @@ impl<E: Engine + 'static> Builder for DockerfileBuilder<E> {
                     Some(EngineEvent::Exited { id: event_id, code }) if event_id == id => {
                         break Ending::Exited(code);
                     }
+                    // The engine reports a guest that exits on its own, with
+                    // no stop asked, as a crash carrying the exit code on the
+                    // VM; for the builder that is the normal way to finish.
                     Some(EngineEvent::Crashed { id: event_id, reason }) if event_id == id => {
-                        break Ending::Crashed(reason);
+                        match self.engine.inspect(&id).await {
+                            Ok(VmInfo { exit_code: Some(code), .. }) => break Ending::Exited(code),
+                            _ => break Ending::Crashed(reason),
+                        }
                     }
                     Some(_) => {}
                     None => {
@@ -1670,15 +1676,9 @@ mod tests {
         })
         .expect("the builder writes its layout");
 
-        engine
-            .stop(
-                &id,
-                StopMode::Graceful {
-                    timeout: Duration::ZERO,
-                },
-            )
-            .await
-            .expect("the VM stops");
+        // The guest script exits on its own: the engine reports that as a
+        // crash carrying the exit code.
+        engine.exit_app(&id, 0);
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         let output = running.handle.await.expect("the task").expect("a build");
@@ -1708,16 +1708,7 @@ mod tests {
             r#"{"vertexes":[{"digest":"sha256:aa","name":"[2/2] RUN false","started":"2026-11-04T00:00:00.000000000Z","completed":"2026-11-04T00:00:00.100000000Z","error":"exit code: 1"}]}"#,
         );
         wait_running(&engine, &id).await;
-        engine.set_ignore_power_button(&id, true);
-        engine
-            .stop(
-                &id,
-                StopMode::Graceful {
-                    timeout: Duration::ZERO,
-                },
-            )
-            .await
-            .expect("the VM stops");
+        engine.exit_app(&id, 1);
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         let failure = running
@@ -1731,6 +1722,37 @@ mod tests {
         let step = failure.step.expect("the failed step");
         assert_eq!(step.vertex, 1);
         assert!(step.name.contains("RUN false"));
+        let _ = fs::remove_dir_all(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn a_crash_without_an_exit_code_fails_as_a_crash() {
+        let Some(fixture) = fixture("crash") else {
+            eprintln!("skipping: git is not installed");
+            return;
+        };
+        let engine = Arc::new(FakeEngine::new());
+        let builder = DockerfileBuilder::new(Arc::clone(&engine), config(&fixture.root));
+        let (running, _events) = spawn(builder, build_spec(&fixture.url));
+        let id = VmId(BUILD_ID.to_owned());
+
+        wait_for_vm(&engine, &id).await;
+        wait_for_output_reader(&engine, &id).await;
+        engine.push_output(&id, OutputStream::Stdout, "quoro-build phase=building");
+        wait_running(&engine, &id).await;
+        engine.crash(&id, "guest reset");
+
+        let failure = running
+            .handle
+            .await
+            .expect("the task")
+            .expect_err("the build fails");
+        assert!(!failure.cancelled);
+        assert!(
+            failure.error.contains("builder VM crashed: guest reset"),
+            "{}",
+            failure.error
+        );
         let _ = fs::remove_dir_all(&fixture.root);
     }
 
