@@ -94,7 +94,7 @@ const appDetail = (app: App): AppDetail => ({
   ...app,
   instances: db.vms.filter((vm) => vm.app_id === app.id),
   domains: db.domains.filter((domain) => domain.app_id === app.id),
-  edge_backends: [],
+  edge_backends: db.edgeBackends[app.id] ?? [],
 });
 
 /**
@@ -222,7 +222,10 @@ export const handlers = [
 
   http.get('*/api/v1/nodes', () => {
     if (!signedIn()) return unauthorized();
-    const list: NodeList = { items: [db.node], next_cursor: null };
+    const list: NodeList = {
+      items: [db.node, ...db.extraNodes],
+      next_cursor: null,
+    };
     return json(list);
   }),
 
@@ -564,6 +567,7 @@ export const handlers = [
     }
     db.builds = db.builds.filter((item) => item.app_id !== appId);
     delete db.appEnv[appId];
+    delete db.edgeBackends[appId];
 
     return json({ ...app, updated_at: now() }, { status: 202 });
   }),

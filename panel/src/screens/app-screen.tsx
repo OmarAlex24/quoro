@@ -48,9 +48,10 @@ import { formatLogTime } from '../lib/log-buffer';
 import { problemView, type ProblemView } from '../lib/problem';
 import { useSession } from '../session';
 import { AppDomains } from '../components/app-domains';
+import { AppEdgeBackends } from '../components/app-edge';
 import { AppEnvDialog } from '../components/app-env-dialog';
+import { AppInstances } from '../components/app-instances';
 import { DeployRail } from '../components/deploy-rail';
-import { Lamp } from '../components/lamp';
 import { LogTape } from '../components/log-tape';
 import { AppMetricsBay } from '../components/metrics-bay';
 import { ToneLamp } from '../components/tone-lamp';
@@ -401,6 +402,10 @@ export function AppScreen() {
             <dd className="text-ink">{app.port}</dd>
           </div>
           <div className="flex gap-2">
+            <dt className="text-ink-muted">Replicas</dt>
+            <dd className="text-ink">{app.replicas}</dd>
+          </div>
+          <div className="flex gap-2">
             <dt className="text-ink-muted">Node</dt>
             <dd className="text-ink">{nodeName}</dd>
           </div>
@@ -649,39 +654,13 @@ export function AppScreen() {
         </p>
       </section>
 
-      <section className="mt-5 rounded-[6px] border border-rail bg-panel px-4 py-4 sm:px-5">
-        <h2 className="type-display-light text-[15px] leading-none text-ink">Instances</h2>
-        {app.instances.length === 0 ? (
-          <p className="mt-3 text-[13px] text-ink-muted">
-            {source !== null
-              ? 'No instance is running. A successful build deploys the app and boots one.'
-              : 'No instance is running. Deploy the app to boot one.'}
-          </p>
-        ) : (
-          <ul className="mt-3 flex flex-col divide-y divide-rail border-y border-rail">
-            {app.instances.map((instance) => (
-              <li
-                key={instance.id}
-                className="flex flex-wrap items-center gap-x-3 gap-y-2 py-2.5"
-              >
-                <Lamp vm={instance} size={18} />
-                <span className="type-data min-w-0 flex-1 truncate text-[14px] text-ink">
-                  {instance.name}
-                </span>
-                <span className="type-data text-[13px] text-ink-muted">
-                  {instance.observed_status}
-                </span>
-                <span className="type-data text-[13px] text-ink-muted">
-                  {instance.ip ?? 'No IP yet'}
-                </span>
-                <span className="type-data text-[13px] text-ink-muted">
-                  {instance.restart_count} restarts
-                </span>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
+      <AppInstances
+        instances={app.instances}
+        nodeNames={nodeNames}
+        hasSource={source !== null}
+      />
+
+      <AppEdgeBackends backends={app.edge_backends ?? []} nodeNames={nodeNames} />
 
       <AppMetricsBay appId={app.id} nodeNames={nodeNames} className="mt-5" />
 

@@ -7,6 +7,7 @@ import type {
   Deployment,
   DeploymentLogEntry,
   Domain,
+  EdgeBackend,
   Node,
   Project,
   User,
@@ -51,6 +52,8 @@ export interface MockDb {
   /** Id of the signed-in user, or null. The panel's cookie, simulated. */
   sessionUserId: string | null;
   node: Node;
+  /** Further nodes of the mock cluster; `node` stays the primary. */
+  extraNodes: Node[];
   projects: Project[];
   vms: Vm[];
   apps: App[];
@@ -60,6 +63,8 @@ export interface MockDb {
   buildLogs: Record<string, BuildLogLine[]>;
   domains: Domain[];
   appEnv: Record<string, AppEnvVar[]>;
+  /** The edge's view of an app's instances, keyed by app id. */
+  edgeBackends: Record<string, EdgeBackend[]>;
 }
 
 export const db: MockDb = {
@@ -91,6 +96,7 @@ export const db: MockDb = {
     last_seen_at: now(),
     created_at: now(),
   },
+  extraNodes: [],
   projects: [],
   vms: [],
   apps: [],
@@ -100,6 +106,7 @@ export const db: MockDb = {
   buildLogs: {},
   domains: [],
   appEnv: {},
+  edgeBackends: {},
 };
 
 const timers = new Set<number>();
@@ -303,6 +310,32 @@ const seed = (): void => {
   const appId = mockId('app');
   const deploymentId = mockId('dep');
   const instanceId = mockId('vm');
+  const replicaInstanceId = mockId('vm');
+
+  const replicaNode: Node = {
+    id: mockId('nod'),
+    name: 'lab-4',
+    roles: ['node', 'edge'],
+    cp_status: 'replica',
+    status: 'connected',
+    public_key: 'c2VlZC1sYWItNC1wdWJsaWMta2V5',
+    address: '10.0.0.4',
+    behind_nat: false,
+    labels: { room: 'lab', rack: 'r2' },
+    capacity: { cpus: 8, memory_mb: 32_768, disk_gb: 1_000 },
+    allocated: { cpus: 1, memory_mb: 512, disk_gb: 2 },
+    kvm: { available: true, kernel: '6.12.0-lab', nested: false },
+    engine_version: '0.1.0',
+    agent_version: '0.1.0',
+    desired_rev: 1,
+    applied_rev: 1,
+    log_seq: 1,
+    fence_failure: null,
+    tunnel: null,
+    last_seen_at: createdAt,
+    created_at: createdAt,
+  };
+  db.extraNodes.push(replicaNode);
 
   const app: App = {
     id: appId,
@@ -311,12 +344,12 @@ const seed = (): void => {
     stateful: false,
     ha_policy: 'none',
     backup_schedule: { interval_h: 24, keep: 7 },
-    replicas: 1,
+    replicas: 2,
     image: 'docker.io/library/nginx:alpine',
     port: 80,
     health_check: { path: '/', interval_s: 10, timeout_s: 2, failures: 3 },
     resources: { vcpus: 1, memory_mb: 512, disk_gb: 2 },
-    placement: { node_ids: [db.node.id] },
+    placement: { node_ids: [db.node.id, replicaNode.id] },
     status: 'running',
     current_deployment_id: deploymentId,
     restart_generation: 0,
@@ -365,6 +398,47 @@ const seed = (): void => {
     created_at: createdAt,
     updated_at: createdAt,
   });
+
+  db.vms.push({
+    id: replicaInstanceId,
+    project_id: project.id,
+    app_id: appId,
+    node_id: replicaNode.id,
+    name: 'blog-2',
+    vcpus: 1,
+    memory_mb: 512,
+    disk_gb: 2,
+    image: app.image,
+    desired_status: 'running',
+    observed_status: 'running',
+    ip: '10.0.0.31',
+    restart_generation: 0,
+    restart_count: 0,
+    last_exit_code: null,
+    created_at: createdAt,
+    updated_at: createdAt,
+  });
+
+  db.edgeBackends[appId] = [
+    {
+      edge_node_id: replicaNode.id,
+      vm_id: instanceId,
+      node_id: db.node.id,
+      in_rotation: true,
+      since: createdAt,
+      reason: null,
+      last_error: null,
+    },
+    {
+      edge_node_id: replicaNode.id,
+      vm_id: replicaInstanceId,
+      node_id: replicaNode.id,
+      in_rotation: false,
+      since: createdAt,
+      reason: 'health_check',
+      last_error: 'GET http://10.0.0.31:80/: request canceled after 2s',
+    },
+  ];
 
   db.domains.push({
     id: mockId('dom'),
