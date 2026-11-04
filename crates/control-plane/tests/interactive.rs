@@ -309,6 +309,7 @@ async fn fixture(server: Server) -> Fixture {
         max_duration: Duration::from_secs(3600),
         ticket_ttl: Duration::from_secs(30),
         tick: Duration::from_millis(25),
+        stream_close_wait: Duration::from_millis(150),
     });
     let owner = server.owner().await;
     let operator = role_client(&server, "operator", "operator").await;
@@ -570,6 +571,20 @@ async fn wait_closed(socket: &mut Socket, reason: &str) -> Value {
     let closed = ws_control(socket, "closed").await;
     assert_eq!(closed["reason"], reason);
     closed
+}
+
+/// Polls for the `session.end` record of `target_id` (an actor writes it once
+/// it has the node's `stream_end`, or its bounded wait elapsed) and returns
+/// the record's params.
+async fn end_params(server: &Server, target_id: &str) -> Value {
+    for _ in 0..100 {
+        let ends = audit_of(server, "session.end", target_id).await;
+        if let Some((_, _, params, _)) = ends.last() {
+            return serde_json::from_str(params).unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("no session.end within 2.5 s");
 }
 
 fn interrupted() -> Value {
@@ -1164,6 +1179,136 @@ async fn delete_is_allowed_for_the_opener_and_an_owner_and_refused_otherwise() {
     assert_eq!(res.status(), 204, "{}", res.text().await.unwrap());
 }
 
+#[tokio::test]
+async fn ending_a_terminal_by_request_records_the_transcript_the_node_reports() {
+    let mut f = fixture(start().await).await;
+    let (res, open) = open_and_answer(
+        &mut f.node,
+        terminal(&f.server, &f.owner, &f.app_id, interrupted()),
+        |open| stream_data(open["body"]["stream_id"].as_str().unwrap(), 1, b"$ \n"),
+    )
+    .await;
+    let ticket = ticket_of(res).await;
+    let session_id = ticket["id"].as_str().unwrap().to_string();
+    let mut socket = ws_upgrade_ok(&f.server, &ticket, Some(ORIGIN)).await;
+    assert_eq!(ws_binary(&mut socket).await, b"$ \n");
+    let stream_id = open["body"]["stream_id"].as_str().unwrap().to_string();
+    let sha = "b".repeat(64);
+
+    // The primary asks the node to stop the stream and waits for the
+    // `stream_end` that carries the transcript it then records.
+    let (res, ()) = tokio::join!(
+        async {
+            f.owner
+                .delete(
+                    f.server
+                        .url(&format!("/api/v1/interactive-sessions/{session_id}")),
+                )
+                .send()
+                .await
+                .unwrap()
+        },
+        async {
+            let close = f.node.next_type("stream_close").await;
+            assert_eq!(close["body"]["stream_id"], stream_id);
+            f.node.send(stream_end(
+                &stream_id,
+                "cancelled",
+                json!({ "transcript_sha256": sha.clone(), "transcript_bytes": 11 }),
+            ));
+        }
+    );
+    assert_eq!(res.status(), 204);
+    wait_closed(&mut socket, "ended_by_request").await;
+
+    let params = end_params(&f.server, &f.app_id).await;
+    assert_eq!(params["session_id"], session_id);
+    assert_eq!(params["close_reason"], "ended_by_request");
+    assert_eq!(params["transcript_sha256"], sha);
+    assert_eq!(params["transcript_bytes"], 11);
+}
+
+#[tokio::test]
+async fn a_client_that_closes_its_socket_still_records_the_transcript() {
+    let mut f = fixture(start().await).await;
+    let (res, open) = open_and_answer(
+        &mut f.node,
+        terminal(&f.server, &f.owner, &f.app_id, interrupted()),
+        |open| stream_data(open["body"]["stream_id"].as_str().unwrap(), 1, b"$ \n"),
+    )
+    .await;
+    let ticket = ticket_of(res).await;
+    let session_id = ticket["id"].as_str().unwrap().to_string();
+    let mut socket = ws_upgrade_ok(&f.server, &ticket, Some(ORIGIN)).await;
+    assert_eq!(ws_binary(&mut socket).await, b"$ \n");
+    let stream_id = open["body"]["stream_id"].as_str().unwrap().to_string();
+    let sha = "c".repeat(64);
+
+    socket.send(WsMessage::Close(None)).await.unwrap();
+    let close = f.node.next_type("stream_close").await;
+    assert_eq!(close["body"]["stream_id"], stream_id);
+    f.node.send(stream_end(
+        &stream_id,
+        "cancelled",
+        json!({ "transcript_sha256": sha.clone(), "transcript_bytes": 23 }),
+    ));
+
+    let params = end_params(&f.server, &f.app_id).await;
+    assert_eq!(params["session_id"], session_id);
+    assert_eq!(params["close_reason"], "ended_by_client");
+    assert_eq!(params["transcript_sha256"], sha);
+    assert_eq!(params["transcript_bytes"], 23);
+}
+
+#[tokio::test]
+async fn a_node_that_never_answers_stream_close_does_not_hang_session_end() {
+    let mut f = fixture(start().await).await;
+    f.server.state.interactive.set_timings(Timings {
+        terminal_open_wait: Duration::from_millis(150),
+        recheck: Duration::from_secs(5),
+        tick: Duration::from_millis(25),
+        stream_close_wait: Duration::from_millis(150),
+        ..Timings::default()
+    });
+    let (res, open) = open_and_answer(
+        &mut f.node,
+        terminal(&f.server, &f.owner, &f.app_id, interrupted()),
+        |open| stream_data(open["body"]["stream_id"].as_str().unwrap(), 1, b"$ \n"),
+    )
+    .await;
+    let ticket = ticket_of(res).await;
+    let session_id = ticket["id"].as_str().unwrap().to_string();
+    let mut socket = ws_upgrade_ok(&f.server, &ticket, Some(ORIGIN)).await;
+    assert_eq!(ws_binary(&mut socket).await, b"$ \n");
+    let stream_id = open["body"]["stream_id"].as_str().unwrap().to_string();
+
+    let started = std::time::Instant::now();
+    let res = f
+        .owner
+        .delete(
+            f.server
+                .url(&format!("/api/v1/interactive-sessions/{session_id}")),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 204);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the close waited for a StreamEnd that never came"
+    );
+    // The node did get the request; it just does not answer it.
+    let close = f.node.next_type("stream_close").await;
+    assert_eq!(close["body"]["stream_id"], stream_id);
+    wait_closed(&mut socket, "ended_by_request").await;
+
+    let params = end_params(&f.server, &f.app_id).await;
+    assert_eq!(params["session_id"], session_id);
+    assert_eq!(params["close_reason"], "ended_by_request");
+    assert!(params.get("transcript_sha256").is_none());
+    assert!(params.get("transcript_bytes").is_none());
+}
+
 async fn rows_actor(server: &Server, operation: &str, target_id: &str) -> String {
     let row: (String,) = sqlx::query_as(
         "SELECT actor_id FROM audit_log WHERE operation = ? AND target_id = ? ORDER BY seq DESC LIMIT 1",
@@ -1184,6 +1329,7 @@ async fn idle_timeout_and_max_duration_close_a_session() {
         max_duration: Duration::from_secs(3600),
         tick: Duration::from_millis(25),
         recheck: Duration::from_secs(5),
+        stream_close_wait: Duration::from_millis(150),
         ..Timings::default()
     });
     let ticket = ticket_of(terminal(&f.server, &f.owner, &f.app_id, interrupted()).await).await;
@@ -1198,6 +1344,7 @@ async fn idle_timeout_and_max_duration_close_a_session() {
         max_duration: Duration::from_millis(300),
         tick: Duration::from_millis(25),
         recheck: Duration::from_secs(5),
+        stream_close_wait: Duration::from_millis(150),
         ..Timings::default()
     });
     let ticket = ticket_of(terminal(&f.server, &f.owner, &f.app_id, interrupted()).await).await;
@@ -1211,6 +1358,7 @@ async fn a_credential_that_expires_closes_the_session() {
     f.server.state.interactive.set_timings(Timings {
         recheck: Duration::from_millis(100),
         tick: Duration::from_millis(25),
+        stream_close_wait: Duration::from_millis(150),
         ..Timings::default()
     });
     let ticket = ticket_of(terminal(&f.server, &f.owner, &f.app_id, interrupted()).await).await;

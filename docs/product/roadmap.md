@@ -244,11 +244,11 @@ rmcp 3.8 is the official Rust MCP SDK, with three semver-major releases between 
 
 #### Definition of Done
 
-- [ ] On lab-2, point an app at a Git repository with a Dockerfile; the build runs, produces an image and the app answers 200 on its domain.
-- [ ] On lab-2, a build that fails shows the failing step and its log output in the panel.
-- [ ] On lab-1, the panel shows at least CPU and memory for lab-2 and for one app on it, refreshed without a page reload [D-0014].
-- [ ] On lab-2, open the web terminal, run a command and see its output; the session is recorded in the audit log [D-0031].
-- [ ] On lab-2, open the VM console of a running microVM and see the guest's boot output on the serial console.
+- [x] On lab-2, point an app at a Git repository with a Dockerfile; the build runs, produces an image and the app answers 200 on its domain.
+- [x] On lab-2, a build that fails shows the failing step and its log output in the panel.
+- [x] On lab-1, the panel shows at least CPU and memory for lab-2 and for one app on it, refreshed without a page reload [D-0014].
+- [x] On lab-2, open the web terminal, run a command and see its output; the session is recorded in the audit log [D-0031].
+- [x] On lab-2, open the VM console of a running microVM and see the guest's boot output on the serial console.
 
 #### Demo script
 

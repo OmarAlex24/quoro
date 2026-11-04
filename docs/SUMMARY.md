@@ -130,6 +130,22 @@
   - [0117: Builder interface: a node-agent Builder trait (Dockerfile first, Railpack later) that returns build events and a node-local OCI layout](adr/0117-builder-interface-a-node-agent-builder-trait-dockerfile.md)
   - [0118: Builds run on the target node in an ephemeral builder microVM (one per build) with a persistent per-app work disk for the BuildKit cache](adr/0118-builds-run-on-the-target-node-in-an-ephemeral-builder.md)
   - [0119: Build log transport: tagged serial-console lines out of the builder VM, kept on the node, streamed to the panel over SSE via a new stream_open kind build_logs](adr/0119-build-log-transport-tagged-serial-console-lines-out-of-the.md)
+  - [0120: M4 builds and metrics reuse existing scopes; M4 adds no MCP tool](adr/0120-m4-builds-and-metrics-reuse-existing-scopes-m4-adds-no-mcp.md)
+  - [0121: Built image reference build.quoro.invalid/<app_id>:<build_id>; Git app image is empty before first build](adr/0121-built-image-reference-build-quoro-invalid-app-id-build-id.md)
+  - [0122: Git apps: createApp takes exactly one of image/source; source cannot be added or removed in M4; createDeployment 409 for Git apps](adr/0122-git-apps-createapp-takes-exactly-one-of-image-source-source.md)
+  - [0123: M4 build scope: public HTTPS repos only, trigger api only, one active build per app, fixed default limits](adr/0123-m4-build-scope-public-https-repos-only-trigger-api-only-one.md)
+  - [0124: Build lifecycle runs through desired state; primary emits build.* events; Deployment.phase build is never reported](adr/0124-build-lifecycle-runs-through-desired-state-primary-emits.md)
+  - [0125: Builder VM networking: egress_only with no isolation group](adr/0125-builder-vm-networking-egress-only-with-no-isolation-group.md)
+  - [0126: Terminal exec channel: vsock port 1024, framed \[u8 type\]\[u32 BE len\]\[payload\], quoro-init config v2 with exec_port](adr/0126-terminal-exec-channel-vsock-port-1024-framed-u8-type-u32-be.md)
+  - [0127: Console: Engine::console superseded by serial_output; node ring of two 512 KiB segments; console streams outlive VM restarts](adr/0127-console-engine-console-superseded-by-serial-output-node.md)
+  - [0128: Transcripts: terminal only, 16 MiB cap closes session (transcript_limit), 30 days and 1 GiB per node, fetch human-only with audit:read and always audited](adr/0128-transcripts-terminal-only-16-mib-cap-closes-session.md)
+  - [0129: Metrics: host-side VMM RSS and CPU, 5 s sampling, 10-minute in-memory ring, SSE samples carry no id](adr/0129-metrics-host-side-vmm-rss-and-cpu-5-s-sampling-10-minute-in.md)
+  - [0130: Public site layout on quoro.dev: the mdBook docs site serves quoro.dev from GitHub Pages at the v0.1.0 release; the installer gets a short URL quoro.dev/install.sh later](adr/0130-public-site-layout-on-quoro-dev-the-mdbook-docs-site-serves.md)
+  - [0132: M4 interactive: ratify contract readings taken while implementing terminal and console sessions](adr/0132-m4-interactive-ratify-contract-readings-taken-while.md)
+  - [0133: Keep an app's last failed or cancelled build in spec.builds so the node keeps its log](adr/0133-keep-an-app-s-last-failed-or-cancelled-build-in-spec-builds.md)
+  - [0134: Curated catalog: one TOML file per template under catalog/ in the public repo, embedded in the signed release binary; images pinned by digest; upstream cosign signatures verified in CI when a template is added or bumped, not on nodes](adr/0134-curated-catalog-one-toml-file-per-template-under-catalog-in.md)
+  - [0135: Q-0099: invited users change their own password through a human-only self-service operation (current and new password), added in a standalone contract PR during M4; no must_change_password flag yet](adr/0135-q-0099-invited-users-change-their-own-password-through-a.md)
+  - [0136: Q-0101: pre-M4 VMs get the terminal and console only after a redeploy; the release notes say so and the panel shows a 'redeploy to enable' hint instead of the action; the node agent never recreates a VM on its own](adr/0136-q-0101-pre-m4-vms-get-the-terminal-and-console-only-after-a.md)
 
 # Background research
 
