@@ -37,6 +37,7 @@ import { AppEnvDialog } from '../components/app-env-dialog';
 import { DeployRail } from '../components/deploy-rail';
 import { Lamp } from '../components/lamp';
 import { LogTape } from '../components/log-tape';
+import { AppMetricsBay } from '../components/metrics-bay';
 import { ToneLamp } from '../components/tone-lamp';
 import { Button } from '../components/ui/button';
 import { Dialog, DialogContent } from '../components/ui/dialog';
@@ -207,6 +208,9 @@ export function AppScreen() {
   const nodeName =
     nodesQuery.data?.items.find((node) => node.id === app.placement.node_ids[0])?.name ??
     'the scheduler';
+  const nodeNames = Object.fromEntries(
+    (nodesQuery.data?.items ?? []).map((node) => [node.id, node.name]),
+  );
 
   const env: AppEnvVar[] = envQuery.data?.items ?? [];
   const canStart = app.status === 'stopped' || app.status === 'down';
@@ -451,6 +455,8 @@ export function AppScreen() {
           </ul>
         )}
       </section>
+
+      <AppMetricsBay appId={app.id} nodeNames={nodeNames} className="mt-5" />
 
       <section className="mt-5">
         <h2 className="type-display-light mb-2 text-[15px] leading-none text-ink">
