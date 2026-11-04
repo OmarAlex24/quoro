@@ -133,3 +133,4 @@
   - [R2 conditional writes as a lease arbiter](research/r2-conditional-writes.md)
   - [rmcp maturity, Litestream replication to R2, and a utoipa -> TypeScript client pipeline](research/rust-api-and-mcp-tooling.md)
   - [Nested virtualization (KVM inside a VM) across common VPS and cloud providers](research/vps-nested-virt.md)
+  - [M4 web terminal and VM console](research/m4-terminal-and-console.md)
