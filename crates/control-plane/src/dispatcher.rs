@@ -1,10 +1,22 @@
-//! The webhook dispatcher (D-0032, permission-model.md section 8).
+//! The webhook dispatcher (D-0032, D-0140, permission-model.md section 8).
 //!
 //! Started by [`crate::AppState::open`] next to the grant sweeper. Every second
-//! it reads events with `seq` greater than its cursor, matches them against the
-//! enabled webhooks, records a delivery attempt and POSTs the raw event
-//! envelope signed with the webhook's secret. Failed attempts are retried with
-//! exponential backoff (10 s doubling, capped at 1 h, at most 10 attempts).
+//! it reads events with `seq` greater than its durable cursor, matches them
+//! against the enabled webhooks, records the first delivery attempt and POSTs
+//! the raw event envelope signed with the webhook's secret. Failed attempts are
+//! retried with exponential backoff (10 s doubling, capped at 1 h, at most 10
+//! attempts).
+//!
+//! Delivery is *at-least-once* across restarts of the primary (D-0140). The
+//! cursor — the seq of the last event the dispatcher has dispatched — lives in
+//! the local `meta` table under `webhook_cursor` and advances in the same
+//! transaction that records the event's first delivery attempts. Start-up
+//! resumes after it, so a committed event is never skipped; an attempt recorded
+//! but not sent before a stop is requeued. A delivery may repeat after a crash
+//! between the send and the commit, so receivers dedupe on the event id (the
+//! `Quoro-Event-Id` header). On the very first start the cursor is seeded at
+//! the end of the event log, and catch-up is bounded: events older than
+//! [`CATCH_UP_WINDOW_SECONDS`] are skipped with one `dispatcher.gap` log line.
 //!
 //! An `incident.opened` delivery to a webhook with a `wake` object issues the
 //! incident grant *before* the delivery, in the same transaction as the
@@ -42,6 +54,14 @@ pub const RETRY_BASE_SECONDS: i64 = 10;
 
 /// Retry delay cap.
 pub const RETRY_MAX_SECONDS: i64 = 3600;
+
+/// How far back the dispatcher catches up after a restart. Events whose `time`
+/// is older than this window are skipped, with one `dispatcher.gap` log line
+/// per run of consecutive skipped seqs.
+pub const CATCH_UP_WINDOW_SECONDS: i64 = 86_400;
+
+/// The `meta` key holding the seq of the last event the dispatcher dispatched.
+const WEBHOOK_CURSOR_KEY: &str = "webhook_cursor";
 
 /// One row of the event log, as the dispatcher reads it.
 #[derive(Clone, Debug)]
@@ -263,9 +283,35 @@ pub(crate) async fn send_once(
     }
 }
 
-/// Starts the dispatcher task. Errors are logged, never propagated: a failed
-/// tick is retried on the next one.
-pub fn spawn(state: AppState) {
+/// Starts the dispatcher before `AppState::open` returns: resumes the durable
+/// cursor, requeues first attempts a previous process recorded but never sent,
+/// and spawns the tick loop.
+///
+/// # Errors
+///
+/// A message for the operator when the cursor cannot be read or seeded, or the
+/// orphaned attempts cannot be requeued.
+pub async fn start(state: AppState) -> Result<(), String> {
+    let (cursor, seeded) = resume_cursor(&state)
+        .await
+        .map_err(|e| format!("cannot resume the webhook dispatcher: {e:?}"))?;
+    requeue_orphaned_attempts(&state)
+        .await
+        .map_err(|e| format!("cannot requeue orphaned webhook deliveries: {e:?}"))?;
+    if seeded {
+        tracing::info!(
+            "webhook dispatcher resumes after seq {cursor} (first start, seeded at the end of the event log)"
+        );
+    } else {
+        tracing::info!("webhook dispatcher resumes after seq {cursor}");
+    }
+    spawn(state, cursor);
+    Ok(())
+}
+
+/// Spawns the tick loop at `cursor`. Errors inside a tick are logged, never
+/// propagated: a failed tick is retried on the next one.
+fn spawn(state: AppState, cursor: i64) {
     tokio::spawn(async move {
         let client = match reqwest::Client::builder()
             .timeout(DELIVERY_TIMEOUT)
@@ -279,13 +325,7 @@ pub fn spawn(state: AppState) {
                 return;
             }
         };
-        let mut cursor = match max_seq(&state).await {
-            Ok(seq) => seq,
-            Err(error) => {
-                tracing::warn!(error = ?error, "webhook dispatcher cannot read the event log");
-                0
-            }
-        };
+        let mut cursor = cursor;
         let mut ticker = tokio::time::interval(TICK_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
@@ -295,6 +335,64 @@ pub fn spawn(state: AppState) {
             }
         }
     });
+}
+
+/// Reads the durable cursor, seeding and persisting it on the very first start.
+///
+/// The seed is the current `MAX(seq)` (no backlog of history) and it is written
+/// immediately, so a second restart before any event does not re-seed at a
+/// newer seq and skip an event committed in between.
+///
+/// Returns the cursor and whether it was seeded.
+async fn resume_cursor(state: &AppState) -> Result<(i64, bool), ApiError> {
+    let stored: Option<(String,)> = sqlx::query_as("SELECT value FROM meta WHERE key = ?")
+        .bind(WEBHOOK_CURSOR_KEY)
+        .fetch_optional(state.store.pool())
+        .await?;
+    if let Some((value,)) = stored {
+        let cursor = value
+            .parse::<i64>()
+            .map_err(|_| ApiError::internal(&format!("webhook cursor {value:?} is not a seq")))?;
+        return Ok((cursor, false));
+    }
+    let cursor = max_seq(state).await?;
+    let mut w = state.store.begin_write().await?;
+    sqlx::query(
+        "INSERT INTO meta (key, value) VALUES (?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(WEBHOOK_CURSOR_KEY)
+    .bind(cursor.to_string())
+    .execute(&mut *w.tx)
+    .await?;
+    w.commit().await?;
+    Ok((cursor, true))
+}
+
+/// Requeues first attempts that were recorded before a stop but never sent.
+///
+/// A real attempt-1 row is `pending` with `next_attempt_at IS NULL`; the retry
+/// loop ignores it in that state, so start-up gives it a due time. Test
+/// deliveries are synchronous and never retried, so `test = 0` leaves them
+/// alone.
+async fn requeue_orphaned_attempts(state: &AppState) -> Result<(), ApiError> {
+    let now = now_rfc3339();
+    let mut w = state.store.begin_write().await?;
+    let result = sqlx::query(
+        "UPDATE webhook_deliveries SET next_attempt_at = ? \
+         WHERE status = 'pending' AND next_attempt_at IS NULL AND test = 0",
+    )
+    .bind(&now)
+    .execute(&mut *w.tx)
+    .await?;
+    w.commit().await?;
+    if result.rows_affected() > 0 {
+        tracing::info!(
+            count = result.rows_affected(),
+            "webhook dispatcher requeued orphaned first attempts"
+        );
+    }
+    Ok(())
 }
 
 async fn max_seq(state: &AppState) -> Result<i64, ApiError> {
@@ -310,6 +408,8 @@ async fn tick(
     cursor: &mut i64,
 ) -> Result<(), ApiError> {
     deliver_due_retries(state, client).await?;
+    // Fixed-width RFC 3339 UTC timestamps compare correctly as strings.
+    let cutoff = rfc3339_in(-CATCH_UP_WINDOW_SECONDS);
     loop {
         let rows = sqlx::query(&format!(
             "SELECT {EVENT_COLUMNS} FROM events WHERE seq > ? ORDER BY seq LIMIT 100"
@@ -325,11 +425,46 @@ async fn tick(
             events.push(event_from_row(row)?);
         }
         let count = events.len();
+        // Whether a processed seq was not yet written durably: events with no
+        // matching webhook and skipped events do not open a transaction each.
+        let mut dirty = false;
+        // A run of consecutive skipped events, coalesced into one log line.
+        let mut gap: Option<(i64, i64, u64)> = None;
         for event in &events {
-            if let Err(error) = dispatch_event(state, client, event).await {
-                tracing::warn!(event_id = %event.id, error = ?error, "webhook event dispatch failed");
+            if event.time.as_str() < cutoff.as_str() {
+                gap = Some(match gap {
+                    Some((first, _, count)) => (first, event.seq, count + 1),
+                    None => (event.seq, event.seq, 1),
+                });
+                *cursor = event.seq;
+                dirty = true;
+                continue;
             }
-            *cursor = event.seq;
+            if let Some((first, last, skipped)) = gap.take() {
+                log_gap(first, last, skipped);
+            }
+            match dispatch_event(state, client, event).await {
+                // A database failure stops the tick before this event: the
+                // cursor stays behind it and the next tick retries it.
+                Err(error) => {
+                    tracing::warn!(
+                        event_id = %event.id,
+                        error = ?error,
+                        "webhook event dispatch failed; retrying from this event"
+                    );
+                    return Ok(());
+                }
+                Ok(persisted) => {
+                    *cursor = event.seq;
+                    dirty |= !persisted;
+                }
+            }
+        }
+        if let Some((first, last, skipped)) = gap.take() {
+            log_gap(first, last, skipped);
+        }
+        if dirty {
+            persist_cursor(state, *cursor).await?;
         }
         if count < 100 {
             return Ok(());
@@ -337,19 +472,90 @@ async fn tick(
     }
 }
 
+fn log_gap(first: i64, last: i64, count: u64) {
+    tracing::warn!(
+        first_seq = first,
+        last_seq = last,
+        count,
+        "dispatcher.gap: skipped {count} event(s) older than the {CATCH_UP_WINDOW_SECONDS}s catch-up window (seq {first}..{last})"
+    );
+}
+
+/// Writes the durable cursor without moving it backwards.
+async fn persist_cursor(state: &AppState, cursor: i64) -> Result<(), ApiError> {
+    let mut w = state.store.begin_write().await?;
+    upsert_cursor(&mut w.tx, cursor).await?;
+    w.commit().await?;
+    Ok(())
+}
+
+/// Upserts the durable cursor. The `WHERE` clause refuses a lower value, so a
+/// coalesced end-of-page write never moves the cursor backwards.
+async fn upsert_cursor(conn: &mut SqliteConnection, seq: i64) -> Result<(), ApiError> {
+    sqlx::query(
+        "INSERT INTO meta (key, value) VALUES (?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value \
+         WHERE CAST(excluded.value AS INTEGER) > CAST(meta.value AS INTEGER)",
+    )
+    .bind(WEBHOOK_CURSOR_KEY)
+    .bind(seq.to_string())
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// One first attempt recorded but not yet sent.
+struct PreparedDelivery {
+    webhook: WebhookRow,
+    delivery_id: String,
+    wake: Option<WakeRef>,
+}
+
 /// Matches one event against the enabled webhooks and delivers it.
+///
+/// Returns `true` when the transaction with the cursor committed, and `false`
+/// when the event was skipped here (no match, or its subject could not be
+/// resolved): the caller then persists the cursor with the rest of the page.
+/// `Err` means the database write failed and the event must be retried.
 async fn dispatch_event(
     state: &AppState,
     client: &reqwest::Client,
     event: &EventRow,
-) -> Result<(), ApiError> {
+) -> Result<bool, ApiError> {
     let mut conn = state.store.pool().acquire().await?;
-    let resolved = authz::resolve(&mut conn, &event.subject_type, &event.subject_id, 0).await?;
-    let rows = sqlx::query("SELECT * FROM webhooks WHERE enabled = 1 ORDER BY id")
+    // Resolving a subject or reading the webhook list failing for one event
+    // must not block the event log forever: log it and advance past the event.
+    let resolved = match authz::resolve(&mut conn, &event.subject_type, &event.subject_id, 0).await
+    {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            drop(conn);
+            tracing::warn!(
+                event_id = %event.id,
+                error = ?error,
+                "webhook subject cannot be resolved; event skipped"
+            );
+            return Ok(false);
+        }
+    };
+    let rows = match sqlx::query("SELECT * FROM webhooks WHERE enabled = 1 ORDER BY id")
         .fetch_all(&mut *conn)
-        .await?;
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            drop(conn);
+            tracing::warn!(
+                event_id = %event.id,
+                error = ?error,
+                "webhook list cannot be read; event skipped"
+            );
+            return Ok(false);
+        }
+    };
     drop(conn);
 
+    let mut matched = Vec::with_capacity(rows.len());
     for row in &rows {
         let webhook = match webhook_row_from_row(row) {
             Ok(webhook) => webhook,
@@ -373,29 +579,69 @@ async fn dispatch_event(
         if !webhook.selector.matches(&resolved) {
             continue;
         }
+        matched.push(webhook);
+    }
+    if matched.is_empty() {
+        return Ok(false);
+    }
+
+    // One transaction records the first attempt of every matching webhook, with
+    // its wake grant, and the cursor. Either the event is fully scheduled and
+    // the cursor moves past it, or nothing changed and the next tick retries.
+    let now = now_rfc3339();
+    let mut w = state.store.begin_write().await?;
+    let mut prepared = Vec::with_capacity(matched.len());
+    for webhook in matched {
+        // Each webhook gets its own savepoint: one that cannot be scheduled
+        // (its wake grant fails, say) is rolled back and logged, and must not
+        // hold the event, and with it the whole log, back for the others.
+        let mut savepoint = sqlx::Connection::begin(&mut *w.tx).await?;
+        match schedule_first_attempt(&mut savepoint, &webhook, event, &now).await {
+            Ok((delivery_id, wake)) => {
+                savepoint.commit().await?;
+                prepared.push(PreparedDelivery {
+                    webhook,
+                    delivery_id,
+                    wake,
+                });
+            }
+            Err(error) => {
+                savepoint.rollback().await?;
+                tracing::warn!(
+                    webhook_id = %webhook.id,
+                    event_id = %event.id,
+                    error = ?error,
+                    "webhook delivery cannot be scheduled; skipped for this event"
+                );
+            }
+        }
+    }
+    upsert_cursor(&mut w.tx, event.seq).await?;
+    w.commit().await?;
+
+    for delivery in prepared {
         // One webhook's failure must not stop the event's remaining deliveries.
-        if let Err(error) = deliver_to_webhook(state, client, event, &webhook).await {
+        if let Err(error) = send_prepared(state, client, event, delivery).await {
             tracing::warn!(
-                webhook_id = %webhook.id,
                 event_id = %event.id,
                 error = ?error,
                 "webhook delivery failed"
             );
         }
     }
-    Ok(())
+    Ok(true)
 }
 
-/// Delivers one event to one matched webhook, recording the attempt.
-async fn deliver_to_webhook(
-    state: &AppState,
-    client: &reqwest::Client,
-    event: &EventRow,
+/// Records the first attempt of one matched webhook and, for a wake webhook and
+/// an `incident.opened` event, issues the incident grant before the delivery,
+/// in the caller's transaction.
+async fn schedule_first_attempt(
+    conn: &mut SqliteConnection,
     webhook: &WebhookRow,
-) -> Result<(), ApiError> {
+    event: &EventRow,
+    now: &str,
+) -> Result<(String, Option<WakeRef>), ApiError> {
     let delivery_id = new_id(Prefix::WebhookDelivery);
-    let now = now_rfc3339();
-    let mut w = state.store.begin_write().await?;
     sqlx::query(
         "INSERT INTO webhook_deliveries (id, webhook_id, event_id, attempt, status, response_code, error, next_attempt_at, created_at, test) \
          VALUES (?, ?, ?, 1, 'pending', NULL, NULL, NULL, ?, 0)",
@@ -403,23 +649,36 @@ async fn deliver_to_webhook(
     .bind(&delivery_id)
     .bind(&webhook.id)
     .bind(&event.id)
-    .bind(&now)
-    .execute(&mut *w.tx)
+    .bind(now)
+    .execute(&mut *conn)
     .await?;
-    // Wake before sending, in the same transaction as the delivery row.
-    let wake =
-        match (event.kind.as_str(), &webhook.wake) {
-            ("incident.opened", Some(configured)) => issue_wake(&mut w.tx, webhook, event)
+    let wake = match (event.kind.as_str(), &webhook.wake) {
+        ("incident.opened", Some(configured)) => {
+            issue_wake(conn, webhook, event)
                 .await?
                 .map(|grant_id| WakeRef {
                     agent_id: configured.agent_id.clone(),
                     grant_id,
-                }),
-            _ => None,
-        };
-    w.commit().await?;
+                })
+        }
+        _ => None,
+    };
+    Ok((delivery_id, wake))
+}
 
-    let secret = match decrypt_secret(state, webhook) {
+/// Decrypts the secret and sends one already-recorded first attempt.
+async fn send_prepared(
+    state: &AppState,
+    client: &reqwest::Client,
+    event: &EventRow,
+    delivery: PreparedDelivery,
+) -> Result<(), ApiError> {
+    let PreparedDelivery {
+        webhook,
+        delivery_id,
+        wake,
+    } = delivery;
+    let secret = match decrypt_secret(state, &webhook) {
         Ok(secret) => secret,
         Err(error) => {
             tracing::warn!(webhook_id = %webhook.id, error = ?error, "webhook secret unavailable");
@@ -431,7 +690,15 @@ async fn deliver_to_webhook(
             return Ok(());
         }
     };
-    let outcome = send_once(client, webhook, event, &delivery_id, &secret, wake.as_ref()).await;
+    let outcome = send_once(
+        client,
+        &webhook,
+        event,
+        &delivery_id,
+        &secret,
+        wake.as_ref(),
+    )
+    .await;
     record_outcome(state, &webhook.id, event, &delivery_id, 1, &outcome).await
 }
 
