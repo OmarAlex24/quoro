@@ -595,6 +595,7 @@ impl Session {
                         )),
                         error: None,
                         lines: None,
+                        metrics: None,
                     };
                     write_message(sink, NodeMessage::CommandResult(body), Some(&raw.id)).await?;
                 } else if command.kind == "logs_query" {
@@ -612,6 +613,7 @@ impl Session {
                             message: "this command kind is not implemented yet".to_owned(),
                         }),
                         lines: None,
+                        metrics: None,
                     };
                     write_message(sink, NodeMessage::CommandResult(body), Some(&raw.id)).await?;
                 }
@@ -635,6 +637,7 @@ impl Session {
                     detail: Some("unknown lease".to_owned()),
                     error: None,
                     lines: None,
+                    metrics: None,
                 };
                 write_message(sink, NodeMessage::CommandResult(body), Some(&raw.id)).await?;
             }
@@ -726,6 +729,7 @@ impl Session {
                 detail: Some(format!("ignored rev {rev}")),
                 error: None,
                 lines: None,
+                metrics: None,
             };
             write_message(sink, NodeMessage::CommandResult(result), Some(&raw.id)).await?;
             return Ok(());
@@ -737,6 +741,7 @@ impl Session {
                 detail: Some(format!("could not store rev {rev}: {e}")),
                 error: None,
                 lines: None,
+                metrics: None,
             };
             write_message(sink, NodeMessage::CommandResult(result), Some(&raw.id)).await?;
             return Ok(());
@@ -746,6 +751,7 @@ impl Session {
             detail: Some(format!("stored rev {rev}")),
             error: None,
             lines: None,
+            metrics: None,
         };
         write_message(sink, NodeMessage::CommandResult(result), Some(&raw.id)).await?;
 
@@ -810,6 +816,7 @@ impl Session {
             detail: Some(format!("rotated to key {expected}")),
             error: None,
             lines: None,
+            metrics: None,
         };
         write_message(sink, NodeMessage::CommandResult(result), Some(&raw.id)).await?;
         Ok(())
@@ -859,6 +866,7 @@ impl Session {
             detail,
             error: None,
             lines: Some(kept),
+            metrics: None,
         }
     }
 
@@ -1142,6 +1150,7 @@ fn bad_result(message: &str) -> CommandResult {
             message: message.to_owned(),
         }),
         lines: None,
+        metrics: None,
     }
 }
 
@@ -1195,6 +1204,7 @@ async fn send_lines(
             seq: *seq,
             lines: Some(chunk),
             data: None,
+            metrics: None,
         };
         *seq = seq.saturating_add(1);
         if tx.send(NodeMessage::StreamData(frame)).await.is_err() {
