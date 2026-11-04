@@ -249,7 +249,15 @@ fn optional_json_column<T: DeserializeOwned>(
     }
 }
 
-/// Builds a [`Node`] from a `nodes` row.
+/// The `SELECT` list of a node row: the `nodes` columns plus the capacity the
+/// VMs placed on the node use, summed from `vms` at read time so every node
+/// (not only the primary) always reports a current allocation.
+pub(crate) const NODE_COLUMNS: &str = "n.*, \
+     (SELECT IFNULL(SUM(vms.vcpus), 0) FROM vms WHERE vms.node_id = n.id) AS allocated_cpus, \
+     (SELECT IFNULL(SUM(vms.memory_mb), 0) FROM vms WHERE vms.node_id = n.id) AS allocated_memory_mb, \
+     (SELECT IFNULL(SUM(vms.disk_gb), 0) FROM vms WHERE vms.node_id = n.id) AS allocated_disk_gb";
+
+/// Builds a [`Node`] from a row selected with [`NODE_COLUMNS`].
 pub(crate) fn node_from_row(row: &SqliteRow) -> Result<Node, ApiError> {
     let cp_status: Option<NodeCpStatus> = row
         .try_get::<Option<String>, _>("cp_status")?
@@ -271,7 +279,14 @@ pub(crate) fn node_from_row(row: &SqliteRow) -> Result<Node, ApiError> {
         behind_nat: row.try_get::<i64, _>("behind_nat")? != 0,
         labels: json_column(row, "labels")?,
         capacity: json_column(row, "capacity")?,
-        allocated: json_column(row, "allocated")?,
+        allocated: NodeCapacity {
+            cpus: u32::try_from(row.try_get::<i64, _>("allocated_cpus")?)
+                .map_err(|e| ApiError::internal(&format!("allocated cpus: {e}")))?,
+            memory_mb: u64::try_from(row.try_get::<i64, _>("allocated_memory_mb")?)
+                .map_err(|e| ApiError::internal(&format!("allocated memory_mb: {e}")))?,
+            disk_gb: u64::try_from(row.try_get::<i64, _>("allocated_disk_gb")?)
+                .map_err(|e| ApiError::internal(&format!("allocated disk_gb: {e}")))?,
+        },
         kvm: json_column(row, "kvm")?,
         engine_version: row.try_get("engine_version")?,
         agent_version: row.try_get("agent_version")?,
@@ -490,11 +505,13 @@ async fn set_tunnel_tx(
     if !is_id(Prefix::Node, node_id) {
         return Err(ApiError::not_found("node"));
     }
-    let node = sqlx::query("SELECT * FROM nodes WHERE id = ?")
-        .bind(node_id)
-        .fetch_optional(&mut *w.tx)
-        .await?
-        .ok_or_else(|| ApiError::not_found("node"))?;
+    let node = sqlx::query(&format!(
+        "SELECT {NODE_COLUMNS} FROM nodes n WHERE n.id = ?"
+    ))
+    .bind(node_id)
+    .fetch_optional(&mut *w.tx)
+    .await?
+    .ok_or_else(|| ApiError::not_found("node"))?;
     tunnel_provider(&mut w.tx, provider_id).await?;
     let existing: Option<(String,)> =
         sqlx::query_as("SELECT provider_id FROM node_tunnels WHERE node_id = ?")
