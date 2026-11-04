@@ -734,8 +734,11 @@ async fn a_viewer_can_read_node_and_app_metrics() {
     let server = start().await;
     let owner = server.owner().await;
     let fixture = fixture(&server, &owner, "viewer").await;
-    let (mut socket, _) = open(&server, &fixture.node).await;
+    // Creating and logging in the viewer hashes twice with Argon2id, which can
+    // outlast the test server's short session timeout; do it before the node
+    // connects.
     let viewer = create_viewer(&owner, &server).await;
+    let (mut socket, _) = open(&server, &fixture.node).await;
 
     let client = viewer.clone();
     let url = server.url(&format!("/api/v1/nodes/{}/metrics", fixture.node.node_id));
