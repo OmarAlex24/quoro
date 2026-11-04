@@ -1,0 +1,56 @@
+# The pinned release build image check (ADR 0090), split out of ci.yml so it
+# runs only when the image can change. It builds packaging/container/Containerfile
+# against snapshot.ubuntu.com, so an outage of that mirror used to fail every
+# pull request, including ones that cannot affect the image.
+#
+# Pull requests run it only when they touch an input of the image or the
+# scripts and workflows that build it. Every push to main and every release
+# tag runs it, so a pin that stops resolving is still caught before a release
+# (release.yml builds the same image on a tag).
+name: Release build image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  pull_request:
+    paths:
+      - packaging/container/**
+      - packaging/build-in-container.sh
+      - packaging/build-release.sh
+      - packaging/reproduce-release.sh
+      - packaging/fetch-node.sh
+      - packaging/node.txt
+      - rust-toolchain.toml
+      - .github/workflows/release.yml
+      - .github/workflows/release-image.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-image:
+    name: Release build image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # The same engine the release workflow uses.
+      QUORO_CONTAINER_ENGINE: docker
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Builds the pinned release build image (ADR 0090) and runs
+      # build-release.sh inside it as the runner user, which is what the
+      # release workflow does first. A pin that no longer resolves (a snapshot
+      # package, the base image digest, rustup-init) fails here, not on a tag.
+      - name: Build the image and read the version inside it
+        run: |
+          set -euo pipefail
+          version="$(packaging/build-in-container.sh --print-version)"
+          printf 'version: %s\n' "$version"
+          test -n "$version"
