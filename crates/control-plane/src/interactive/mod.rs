@@ -56,6 +56,10 @@ pub const MAX_DURATION: Duration = Duration::from_secs(8 * 60 * 60);
 /// How often idle and max-duration deadlines are checked.
 pub const TICK: Duration = Duration::from_millis(100);
 
+/// How long a primary-side close waits for the node's answering `stream_end`
+/// (with the transcript fields) after it asks the node to stop a stream.
+pub const STREAM_CLOSE_WAIT: Duration = Duration::from_secs(5);
+
 /// The largest client WebSocket message that becomes one `stream_input`.
 pub const MAX_CLIENT_BYTES: usize = 64 * 1024;
 
@@ -72,6 +76,8 @@ pub struct Timings {
     pub idle: Duration,
     pub max_duration: Duration,
     pub tick: Duration,
+    /// How long a primary-side close waits for the node's `stream_end`.
+    pub stream_close_wait: Duration,
 }
 
 impl Default for Timings {
@@ -84,6 +90,7 @@ impl Default for Timings {
             idle: IDLE_TIMEOUT,
             max_duration: MAX_DURATION,
             tick: TICK,
+            stream_close_wait: STREAM_CLOSE_WAIT,
         }
     }
 }
