@@ -133,15 +133,22 @@ struct HealthState {
 }
 
 /// A parsed IPv4 subnet.
+///
+/// The build manager allocates its builder VM's address from the same subnet,
+/// from the top down ([`Subnet::allocate_high`]). The reconciler only records
+/// an app VM's address once the VM is created, so a builder starting while an
+/// app VM is being created cannot see that address yet; taking the highest
+/// free address keeps the two apart unless the subnet is almost full, where
+/// the engine refuses the duplicate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Subnet {
+pub(crate) struct Subnet {
     network: u32,
     prefix: u8,
-    gateway: Ipv4Addr,
+    pub(crate) gateway: Ipv4Addr,
 }
 
 impl Subnet {
-    fn parse(cidr: &str, gateway: &str) -> Option<Self> {
+    pub(crate) fn parse(cidr: &str, gateway: &str) -> Option<Self> {
         let (address, prefix) = cidr.split_once('/')?;
         let address: Ipv4Addr = address.parse().ok()?;
         let prefix: u8 = prefix.parse().ok()?;
@@ -175,9 +182,23 @@ impl Subnet {
     /// When the subnet is exhausted the highest address is returned again; the
     /// engine then refuses the duplicate address and the create error is logged
     /// like any other, rather than taking the node down.
-    fn allocate(&self, used: &HashSet<Ipv4Addr>) -> Ipv4Addr {
+    pub(crate) fn allocate(&self, used: &HashSet<Ipv4Addr>) -> Ipv4Addr {
         let broadcast = self.broadcast();
         for raw in self.network.saturating_add(1)..broadcast {
+            let ip = Ipv4Addr::from(raw);
+            if ip != self.gateway && !used.contains(&ip) {
+                return ip;
+            }
+        }
+        Ipv4Addr::from(broadcast.saturating_sub(1))
+    }
+
+    /// The highest usable address that is not in `used`; like
+    /// [`Subnet::allocate`], the highest address again when the subnet is
+    /// exhausted.
+    pub(crate) fn allocate_high(&self, used: &HashSet<Ipv4Addr>) -> Ipv4Addr {
+        let broadcast = self.broadcast();
+        for raw in (self.network.saturating_add(1)..broadcast).rev() {
             let ip = Ipv4Addr::from(raw);
             if ip != self.gateway && !used.contains(&ip) {
                 return ip;
@@ -649,7 +670,14 @@ impl<E: Engine + 'static> Reconciler<E> {
             Ok(prepared) => prepared,
             Err(e) => {
                 warn!(vm_id, image = %vm.image, error = ?e, "could not prepare the VM image");
-                let error = e.to_string();
+                // A built image is prepared by its build's `importing` step and
+                // never pulled (section 6.2 step 2). If it is gone, the engine's
+                // own pull error says nothing useful to the operator.
+                let error = if vm.build_id.is_some() {
+                    "the built image is no longer on this node".to_owned()
+                } else {
+                    e.to_string()
+                };
                 self.deployment_line(vm, "pull", &error).await;
                 self.deployment_failed(vm, "pull", &error).await;
                 return None;
@@ -1305,6 +1333,19 @@ mod tests {
     }
 
     #[test]
+    fn builder_addresses_come_from_the_top_of_the_subnet() {
+        let subnet = Subnet::parse("10.9.8.0/29", "10.9.8.1").unwrap();
+        assert_eq!(
+            subnet.allocate_high(&HashSet::new()),
+            Ipv4Addr::new(10, 9, 8, 6)
+        );
+        let used: HashSet<Ipv4Addr> = [Ipv4Addr::new(10, 9, 8, 6)].into_iter().collect();
+        assert_eq!(subnet.allocate_high(&used), Ipv4Addr::new(10, 9, 8, 5));
+        let full: HashSet<Ipv4Addr> = (2..=6).map(|n| Ipv4Addr::new(10, 9, 8, n)).collect();
+        assert_eq!(subnet.allocate_high(&full), Ipv4Addr::new(10, 9, 8, 6));
+    }
+
+    #[test]
     fn macs_are_local_and_unique() {
         let mac = mac_for(Ipv4Addr::new(10, 42, 1, 7));
         assert_eq!(mac.0[0] & 0b11, 0b10);
@@ -1390,6 +1431,7 @@ mod tests {
                         lease_id: None,
                         fencing_token: None,
                         volumes: Vec::new(),
+                        build_id: None,
                     }],
                     routes: Vec::new(),
                     network: SpecNetwork {
@@ -1397,6 +1439,7 @@ mod tests {
                         gateway: "127.0.0.2".to_owned(),
                     },
                     ingress: None,
+                    builds: Vec::new(),
                 },
                 signature: String::new(),
             },

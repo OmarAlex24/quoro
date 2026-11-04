@@ -878,6 +878,7 @@ async fn a_status_report_for_an_app_vm_is_accepted() {
                 disk_gb: 4,
             },
             disk_free_gb: 90.0,
+            builds: Vec::new(),
         }),
     )
     .await;

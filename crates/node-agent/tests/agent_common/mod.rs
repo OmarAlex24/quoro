@@ -24,7 +24,9 @@ use quoro_node_agent::identity::{self, Identity, IdentityHandle};
 use quoro_node_agent::reconcile::{ReconcileConfig, ReconcileOptions, Reconciler, Snapshot};
 use quoro_node_agent::store::NodeStore;
 use quoro_proto::sign::{self, SigningKey};
-use quoro_proto::wire::{Capacity, DesiredState, DesiredStatus, Kvm, Spec, SpecNetwork, SpecVm};
+use quoro_proto::wire::{
+    BuildLimits, Capacity, DesiredState, DesiredStatus, Kvm, Spec, SpecBuild, SpecNetwork, SpecVm,
+};
 
 /// A temporary directory under the platform temp dir, removed on drop.
 pub struct TempDir(PathBuf);
@@ -114,12 +116,18 @@ pub fn spec_vm(vm_id: &str, project_id: &str, desired_status: DesiredStatus) -> 
         lease_id: None,
         fencing_token: None,
         volumes: Vec::new(),
+        build_id: None,
     }
 }
 
 /// A snapshot with `vms` and no signature check (the reconciler takes an
 /// already verified snapshot).
 pub fn snapshot(rev: u64, vms: Vec<SpecVm>) -> Snapshot {
+    snapshot_with(rev, vms, Vec::new())
+}
+
+/// A snapshot with `vms` and `builds`, and no signature check.
+pub fn snapshot_with(rev: u64, vms: Vec<SpecVm>, builds: Vec<SpecBuild>) -> Snapshot {
     Snapshot {
         rev,
         state: DesiredState {
@@ -134,9 +142,28 @@ pub fn snapshot(rev: u64, vms: Vec<SpecVm>) -> Snapshot {
                     gateway: GATEWAY.to_owned(),
                 },
                 ingress: None,
+                builds,
             },
             signature: String::new(),
         },
+    }
+}
+
+/// One `spec.builds[]` entry with the contract's default limits.
+pub fn spec_build(build_id: &str, app_id: &str) -> SpecBuild {
+    SpecBuild {
+        build_id: build_id.to_owned(),
+        app_id: app_id.to_owned(),
+        project_id: "prj_1".to_owned(),
+        repo_url: "https://github.com/example/blog.git".to_owned(),
+        git_ref: "main".to_owned(),
+        dockerfile_path: "Dockerfile".to_owned(),
+        context_dir: ".".to_owned(),
+        target: None,
+        build_args: BTreeMap::from([("NODE_ENV".to_owned(), "production".to_owned())]),
+        secrets: BTreeMap::from([("token".to_owned(), "s3cret".to_owned())]),
+        limits: BuildLimits::default(),
+        cancelled: false,
     }
 }
 

@@ -18,6 +18,10 @@ use quoro_proto::wire::DesiredState;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
+use crate::build::buildkit::{
+    BuilderConfig, DEFAULT_FETCH_TIMEOUT, DockerfileBuilder, find_git, pinned_image,
+};
+use crate::build::manager::BuildManager;
 use crate::identity::IdentityHandle;
 use crate::ingress::{CertificateEvents, DnsBridge, IngressSupervisor};
 use crate::interactive::Interactive;
@@ -60,6 +64,9 @@ pub async fn run<E: Engine + 'static>(
         CertificateEvents::new(store.clone(), Some(identity.get().node_id)),
     ));
 
+    // One engine handle serves every loop: the reconciler runs the app VMs,
+    // the builder runs one builder VM per build (ADR 0117, ADR 0118), and the
+    // sampler and the interactive sessions read the running VMs.
     let engine = Arc::new(engine);
     let (desired, desired_rx) = watch::channel(current.clone());
     let (reconciler, observed) = Reconciler::new(
@@ -84,6 +91,16 @@ pub async fn run<E: Engine + 'static>(
         desired.subscribe(),
         metrics.clone(),
     );
+    let builder = Arc::new(DockerfileBuilder::new(
+        Arc::clone(&engine),
+        BuilderConfig {
+            builds_dir: config.data_dir.join("builds"),
+            git: find_git(),
+            image: pinned_image(),
+            fetch_timeout: DEFAULT_FETCH_TIMEOUT,
+        },
+    ));
+    let (manager, builds) = BuildManager::new(Arc::clone(&engine), builder, store.clone());
 
     let (stop, stop_rx) = watch::channel(false);
     let shutdown_stop = stop.clone();
@@ -91,8 +108,10 @@ pub async fn run<E: Engine + 'static>(
         shutdown.await;
         let _ = shutdown_stop.send(true);
     });
-    let reconcile_task = tokio::spawn(reconciler.run(desired_rx, wait_stop(stop_rx.clone())));
     let metrics_task = tokio::spawn(sampler.run(wait_stop(stop_rx.clone())));
+    let reconcile_task =
+        tokio::spawn(reconciler.run(desired_rx.clone(), wait_stop(stop_rx.clone())));
+    let build_task = tokio::spawn(manager.run(desired_rx, wait_stop(stop_rx.clone())));
 
     // Terminal transcripts are pruned at agent start and then hourly; each
     // terminal session also prunes once it ends (section 3.3).
@@ -121,6 +140,7 @@ pub async fn run<E: Engine + 'static>(
         desired,
         observed,
         current,
+        builds: Some(builds),
     })
     .with_ingress(Arc::clone(&ingress), dns)
     .with_metrics(metrics)
@@ -131,6 +151,7 @@ pub async fn run<E: Engine + 'static>(
     retention_task.abort();
     let _ = reconcile_task.await;
     let _ = metrics_task.await;
+    let _ = build_task.await;
     ingress.shutdown().await;
     shutdown_task.abort();
     outcome

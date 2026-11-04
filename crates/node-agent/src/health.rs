@@ -174,6 +174,7 @@ mod tests {
             lease_id: None,
             fencing_token: None,
             volumes: Vec::new(),
+            build_id: None,
         }
     }
 

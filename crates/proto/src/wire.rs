@@ -230,6 +230,14 @@ pub struct LogLine {
     /// The VM that produced it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vm_id: Option<String>,
+    /// Position in a build's log, gap-free from 1; set only on build log
+    /// lines (section 5.7, ADR 0119). Added in M4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    /// The BuildKit step a build log line belongs to, when it names one.
+    /// Added in M4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vertex: Option<u32>,
 }
 
 // --- node to control plane --------------------------------------------------
@@ -327,6 +335,109 @@ pub struct StatusReport {
     pub capacity: Capacity,
     pub allocated: Capacity,
     pub disk_free_gb: f64,
+    /// One entry per build in the node's current `spec.builds` (section 5.3,
+    /// ADR 0117). Added in M4; absent when there is none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub builds: Vec<BuildStatus>,
+}
+
+/// Status of a build (README.md "Status enums", ADR 0117).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildState {
+    Queued,
+    Preparing,
+    Building,
+    Exporting,
+    Importing,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+impl BuildState {
+    /// `succeeded`, `failed` and `cancelled` are terminal.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
+    }
+
+    /// The wire name, for example `preparing`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Preparing => "preparing",
+            Self::Building => "building",
+            Self::Exporting => "exporting",
+            Self::Importing => "importing",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// The phase a build failed in (section 5.3, ADR 0117).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildPhase {
+    Preparing,
+    Building,
+    Exporting,
+    Importing,
+}
+
+impl BuildPhase {
+    /// The wire name, for example `building`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Preparing => "preparing",
+            Self::Building => "building",
+            Self::Exporting => "exporting",
+            Self::Importing => "importing",
+        }
+    }
+}
+
+/// The BuildKit step a build failed in (section 5.3, ADR 0119): at most 20
+/// excerpt lines of at most 500 characters each.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailedStep {
+    pub vertex: u32,
+    pub name: String,
+    pub error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dockerfile_line: Option<u32>,
+    #[serde(default)]
+    pub excerpt: Vec<String>,
+}
+
+/// One entry of `status_report.builds` (section 5.3).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildStatus {
+    pub build_id: String,
+    pub status: BuildState,
+    /// Full commit SHA the ref resolved to, once the checkout finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    /// Manifest digest of the built image, on `succeeded`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_phase: Option<BuildPhase>,
+    /// One-line reason on `failed`, at most 2 000 characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_step: Option<FailedStep>,
+    /// RFC 3339; when the node left `queued`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    /// RFC 3339; when the build reached a terminal status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
 }
 
 /// Body of `event`: the event envelope without `seq` (section 5.4).
@@ -563,6 +674,10 @@ pub struct SpecVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fencing_token: Option<u64>,
     pub volumes: Vec<SpecVolume>,
+    /// Set when the image is a build's output on this node: the node never
+    /// pulls it (section 6.6). Added in M4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_id: Option<String>,
 }
 
 /// One route of `spec.routes` (section 5.11).
@@ -599,6 +714,76 @@ pub struct Spec {
     /// Present when the node runs a tunnel (section 5.11, D-0094).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingress: Option<SpecIngress>,
+    /// Builds for this node to run (section 5.11, ADR 0117). Added in M4.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub builds: Vec<SpecBuild>,
+}
+
+/// `spec.builds[].limits` (section 6.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildLimits {
+    pub vcpus: u32,
+    pub memory_mb: u32,
+    pub timeout_s: u64,
+    pub cache_gb: u32,
+    pub output_gb: u32,
+}
+
+impl Default for BuildLimits {
+    /// The contract's defaults (section 6.6).
+    fn default() -> Self {
+        Self {
+            vcpus: 2,
+            memory_mb: 2048,
+            timeout_s: 1800,
+            cache_gb: 10,
+            output_gb: 10,
+        }
+    }
+}
+
+/// One build of `spec.builds` (section 5.11, ADR 0117, ADR 0118).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecBuild {
+    pub build_id: String,
+    pub app_id: String,
+    pub project_id: String,
+    /// `https://` URL of a public Git repository.
+    pub repo_url: String,
+    /// Branch, tag or full commit SHA.
+    #[serde(rename = "ref")]
+    pub git_ref: String,
+    /// Relative to `context_dir`.
+    pub dockerfile_path: String,
+    /// Relative to the repository root; `.` is the root.
+    pub context_dir: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    pub build_args: BTreeMap<String, String>,
+    /// Secret id to plaintext value. `Debug` redacts the values; never log them.
+    pub secrets: BTreeMap<String, String>,
+    pub limits: BuildLimits,
+    pub cancelled: bool,
+}
+
+impl std::fmt::Debug for SpecBuild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let secrets: Vec<&String> = self.secrets.keys().collect();
+        f.debug_struct("SpecBuild")
+            .field("build_id", &self.build_id)
+            .field("app_id", &self.app_id)
+            .field("project_id", &self.project_id)
+            .field("repo_url", &self.repo_url)
+            .field("git_ref", &self.git_ref)
+            .field("dockerfile_path", &self.dockerfile_path)
+            .field("context_dir", &self.context_dir)
+            .field("target", &self.target)
+            .field("build_args", &self.build_args)
+            .field("secrets", &secrets)
+            .field("limits", &self.limits)
+            .field("cancelled", &self.cancelled)
+            .finish()
+    }
 }
 
 /// `spec.ingress` (section 5.11).
@@ -1017,6 +1202,7 @@ mod tests {
                     lease_id: None,
                     fencing_token: None,
                     volumes: Vec::new(),
+                    build_id: None,
                 }],
                 routes: Vec::new(),
                 network: SpecNetwork {
@@ -1024,6 +1210,7 @@ mod tests {
                     gateway: "10.42.0.1".to_owned(),
                 },
                 ingress: None,
+                builds: Vec::new(),
             },
             signature: String::new(),
         };

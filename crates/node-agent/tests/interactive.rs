@@ -159,6 +159,7 @@ where
         desired,
         observed: observed_rx,
         current: None,
+        builds: None,
     });
     if let Some(interactive) = interactive {
         session = session.with_interactive(interactive);

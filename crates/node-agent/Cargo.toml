@@ -31,6 +31,8 @@ tokio = { version = "1", default-features = false, features = [
     "rt",
     "fs",
     "io-util",
+    # The build source runs the host's Git client and streams its archive.
+    "process",
 ] }
 # TLS to the primary, pinned to its certificate fingerprint (section 2.2); the
 # ring provider is the one ADR 0080 allows.
@@ -58,6 +60,9 @@ base64 = { version = "0.22", default-features = false, features = ["std"] }
 # Node keypair seeds, boot ids and message ids come from the OS generator.
 getrandom = { version = "0.3", default-features = false }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+# The build source disk is one tar stream (section 6.6); the same pinned
+# version the engine uses to read image layers.
+tar = { version = "0.4", default-features = false }
 
 [dev-dependencies]
 # Tests need the `#[tokio::test]` macro, a runtime, and `test-util` to pause the

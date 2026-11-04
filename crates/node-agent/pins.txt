@@ -1,0 +1,11 @@
+# Pinned artifacts for image builds on this node. The single source of truth:
+# read by crates/node-agent/src/build/buildkit.rs (include_str!).
+#
+# The builder image is an ordinary OCI image: the engine prepares it with the
+# normal prepare_image path, once per node. It is pinned by digest, not by tag,
+# because a tag can move. The digest is the one the M4 builds spike ran and
+# verified (docs/research/m4-builds.md, ADR 0118). Bumping a pin is its own
+# pull request.
+#
+# name version reference
+buildkit-image v0.34.2 docker.io/moby/buildkit:v0.34.2@sha256:97719ccb2ac86fb44fd36f330a6d302f63dddd5326f3ada24f9c05ccac0d9098
