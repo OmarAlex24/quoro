@@ -479,6 +479,7 @@ fn hello(node_id: &str) -> NodeMessage {
             nested: Some(true),
         },
         dropped_events: 0,
+        mesh_public_key: None,
     })
 }
 
@@ -1186,6 +1187,7 @@ async fn dns_challenges_are_written_by_the_primary_for_the_owning_node() {
             allocated: WireCapacity::default(),
             disk_free_gb: 80.0,
             builds: Vec::new(),
+            edge_backends: Vec::new(),
         }),
     )
     .await;

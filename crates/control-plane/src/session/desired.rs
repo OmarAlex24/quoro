@@ -219,12 +219,14 @@ pub async fn build_spec(
         spec: Spec {
             vms,
             routes,
-            network: SpecNetwork {
+            network: Some(SpecNetwork {
                 subnet: network.subnet.clone(),
                 gateway: network.gateway.clone(),
-            },
+            }),
             ingress,
             builds,
+            mesh: None,
+            edge: None,
         },
         held_back,
     })
@@ -618,7 +620,7 @@ mod tests {
         let mut expected = vec![a.as_str(), b.as_str()];
         expected.sort_unstable();
         assert_eq!(ids, expected);
-        assert_eq!(spec.network.subnet, "10.42.1.0/24");
+        assert_eq!(spec.network.as_ref().unwrap().subnet, "10.42.1.0/24");
         assert!(spec.routes.is_empty());
         assert!(cache.lock().unwrap().len() == 2);
     }

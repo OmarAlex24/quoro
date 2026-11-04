@@ -146,6 +146,7 @@ fn hello(node_id: &str) -> NodeMessage {
             nested: Some(true),
         },
         dropped_events: 0,
+        mesh_public_key: None,
     })
 }
 

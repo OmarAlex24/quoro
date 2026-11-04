@@ -111,6 +111,7 @@ fn hello(node_id: &str) -> NodeMessage {
             nested: Some(true),
         },
         dropped_events: 0,
+        mesh_public_key: None,
     })
 }
 
@@ -396,6 +397,7 @@ async fn vm_changes_push_snapshots_and_observations_land() {
             },
             disk_free_gb: 90.0,
             builds: Vec::new(),
+            edge_backends: Vec::new(),
         }),
     )
     .await;

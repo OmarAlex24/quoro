@@ -362,17 +362,22 @@ impl<E: Engine + 'static> Reconciler<E> {
             })
             .collect();
 
-        let Some(subnet) = Subnet::parse(&spec.network.subnet, &spec.network.gateway) else {
+        // A machine without the `node` role (an edge-only machine) gets no
+        // `spec.network` and runs no VM (section 5.11).
+        let Some(spec_network) = spec.network.as_ref() else {
+            return self.publish().await;
+        };
+        let Some(subnet) = Subnet::parse(&spec_network.subnet, &spec_network.gateway) else {
             warn!(
-                subnet = %spec.network.subnet,
-                gateway = %spec.network.gateway,
+                subnet = %spec_network.subnet,
+                gateway = %spec_network.gateway,
                 "the desired network is not a usable subnet; nothing is applied this pass"
             );
             return self.publish().await;
         };
 
         let network = NetworkState {
-            subnet: spec.network.subnet.clone(),
+            subnet: spec_network.subnet.clone(),
             gateway: subnet.gateway,
             dns: self.config.dns.clone(),
         };
@@ -1434,12 +1439,14 @@ mod tests {
                         build_id: None,
                     }],
                     routes: Vec::new(),
-                    network: SpecNetwork {
+                    network: Some(SpecNetwork {
                         subnet: "127.0.0.0/8".to_owned(),
                         gateway: "127.0.0.2".to_owned(),
-                    },
+                    }),
                     ingress: None,
                     builds: Vec::new(),
+                    mesh: None,
+                    edge: None,
                 },
                 signature: String::new(),
             },

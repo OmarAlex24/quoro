@@ -1373,6 +1373,7 @@ impl Session {
             allocated: self.allocated(),
             kvm: self.facts.kvm.clone(),
             dropped_events,
+            mesh_public_key: None,
         })
     }
 
@@ -1409,6 +1410,7 @@ impl Session {
                 .builds
                 .as_ref()
                 .map_or_else(Vec::new, BuildsHandle::current),
+            edge_backends: Vec::new(),
         };
         write_message(sink, NodeMessage::StatusReport(report), None).await
     }
@@ -2729,12 +2731,14 @@ mod tests {
                 spec: Spec {
                     vms: Vec::new(),
                     routes: Vec::new(),
-                    network: SpecNetwork {
+                    network: Some(SpecNetwork {
                         subnet: "10.42.1.0/24".to_owned(),
                         gateway: "10.42.1.1".to_owned(),
-                    },
+                    }),
                     ingress: None,
                     builds,
+                    mesh: None,
+                    edge: None,
                 },
                 signature: String::new(),
             },

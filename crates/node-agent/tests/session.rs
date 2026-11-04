@@ -29,12 +29,14 @@ fn desired_frame(rev: u64, key: &SigningKey, id: &str) -> String {
         spec: Spec {
             vms: vec![spec_vm("vm_1", "prj_1", DesiredStatus::Running)],
             routes: Vec::new(),
-            network: SpecNetwork {
+            network: Some(SpecNetwork {
                 subnet: SUBNET.to_owned(),
                 gateway: GATEWAY.to_owned(),
-            },
+            }),
             ingress: None,
             builds: Vec::new(),
+            mesh: None,
+            edge: None,
         },
         signature: String::new(),
     };
