@@ -11,6 +11,7 @@
 //! are stored.
 
 pub mod password;
+pub mod rate_limit;
 pub mod setup_token;
 
 use crate::AppState;

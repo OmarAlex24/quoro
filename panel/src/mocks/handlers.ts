@@ -6,6 +6,7 @@ import type {
   AppEnvReplaceRequest,
   AppEnvVar,
   AppList,
+  ChangePasswordRequest,
   CreateAppRequest,
   CreateDeploymentRequest,
   CreateDomainRequest,
@@ -65,6 +66,7 @@ import {
   readJson,
   signedIn,
   unauthorized,
+  validationFailed,
   writeRefusal,
 } from './http';
 import { agentsHandlers } from './handlers-agents';
@@ -191,6 +193,30 @@ export const handlers = [
     if (!user) return unauthorized();
     const me: MeResponse = { type: 'user', user };
     return json(me);
+  }),
+
+  http.post('*/api/v1/auth/password', async ({ request }) => {
+    if (!signedIn()) return unauthorized();
+
+    const body = await readJson<ChangePasswordRequest>(request);
+    if (!body) {
+      return validationFailed('The form could not be read. Try again.');
+    }
+    if (!db.password || body.current_password !== db.password) {
+      return validationFailed('the current password is wrong');
+    }
+    const next = body.new_password ?? '';
+    if (next.length < 12) {
+      return validationFailed('the new password must be at least 12 characters');
+    }
+    if (next === body.current_password) {
+      return validationFailed(
+        'the new password must be different from the current password',
+      );
+    }
+
+    db.password = next;
+    return new HttpResponse(null, { status: 204 });
   }),
 
   http.get('*/api/v1/nodes', () => {
