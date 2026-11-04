@@ -34,7 +34,7 @@ use utoipa::{IntoParams, ToSchema};
 
 /// Columns of [`App`], in the order [`app_from_row`] expects them.
 pub(crate) const APP_COLUMNS: &str = "id, project_id, name, stateful, ha_policy, backup_schedule, \
-     image, source, port, health_check, resources, placement, status, current_deployment_id, \
+     replicas, image, source, port, health_check, resources, placement, status, current_deployment_id, \
      restart_generation, created_at, updated_at";
 
 /// `apps.status` (`App.status`).
@@ -333,6 +333,9 @@ pub struct App {
     pub ha_policy: HaPolicy,
     /// The app's `cold` backup schedule (ADR 0147).
     pub backup_schedule: BackupSchedule,
+    /// Instances of the app, at most one per node (ADR 0142).
+    #[schema(minimum = 1, maximum = 64)]
+    pub replicas: i64,
     /// What each HA policy costs this app; absent until the primary computes it.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(required = false)]
@@ -540,6 +543,10 @@ pub struct CreateAppRequest {
     #[serde(default)]
     #[schema(value_type = BackupSchedule, required = false)]
     pub backup_schedule: Option<BackupSchedule>,
+    /// Instances of the app, one per node (ADR 0142).
+    #[serde(default = "default_replicas")]
+    #[schema(minimum = 1, maximum = 64, default = 1, required = false)]
+    pub replicas: i64,
     /// Health check the node probes.
     #[serde(default)]
     #[schema(value_type = HealthCheck, required = false)]
@@ -582,6 +589,10 @@ pub struct UpdateAppRequest {
     #[serde(default)]
     #[schema(value_type = BackupSchedule, required = false)]
     pub backup_schedule: Option<BackupSchedule>,
+    /// New instance count (ADR 0142).
+    #[serde(default)]
+    #[schema(value_type = i64, minimum = 1, maximum = 64, required = false)]
+    pub replicas: Option<i64>,
     /// New health check.
     #[serde(default)]
     #[schema(value_type = HealthCheck, required = false)]
@@ -716,6 +727,7 @@ pub(crate) fn app_from_row(row: &SqliteRow) -> Result<App, ApiError> {
         stateful: row.try_get("stateful")?,
         ha_policy,
         backup_schedule,
+        replicas: row.try_get("replicas")?,
         ha_cost: None,
         image: row.try_get("image")?,
         source,
@@ -805,6 +817,26 @@ fn validate_health(health: &HealthCheck) -> Result<(), ApiError> {
     if health.failures < 1 {
         return Err(ApiError::validation(
             "health_check.failures must be at least 1",
+        ));
+    }
+    Ok(())
+}
+
+fn default_replicas() -> i64 {
+    1
+}
+
+/// Checks of a requested replica count (ADR 0142). More than one instance
+/// needs a machine with the `edge` role that serves the app's domains
+/// (ADR 0143). Until the edge epic ships no edge serves anything, so above 1
+/// is always a conflict.
+fn validate_replicas(replicas: i64) -> Result<(), ApiError> {
+    if !(1..=64).contains(&replicas) {
+        return Err(ApiError::validation("replicas is outside 1-64"));
+    }
+    if replicas > 1 {
+        return Err(ApiError::conflict(
+            "replicas above 1 need an enrolled machine with the edge role",
         ));
     }
     Ok(())
@@ -918,6 +950,7 @@ fn validate_create(body: &CreateAppRequest) -> Result<(), ApiError> {
     if let Some(schedule) = &body.backup_schedule {
         validate_backup_schedule(schedule)?;
     }
+    validate_replicas(body.replicas)?;
     if let Some(health) = &body.health_check {
         validate_health(health)?;
     }
@@ -959,6 +992,9 @@ fn validate_update(body: &UpdateAppRequest) -> Result<(), ApiError> {
     }
     if let Some(schedule) = &body.backup_schedule {
         validate_backup_schedule(schedule)?;
+    }
+    if let Some(replicas) = body.replicas {
+        validate_replicas(replicas)?;
     }
     if let Some(health) = &body.health_check {
         validate_health(health)?;
@@ -1190,6 +1226,7 @@ async fn insert_app(
         stateful: false,
         ha_policy: HaPolicy::None,
         backup_schedule: body.backup_schedule.unwrap_or_default(),
+        replicas: body.replicas,
         ha_cost: None,
         image: body.image.clone().unwrap_or_default(),
         source,
@@ -1240,16 +1277,17 @@ async fn insert_app(
         None => None,
     };
     sqlx::query(
-        "INSERT INTO apps (id, project_id, name, stateful, ha_policy, backup_schedule, image, \
-         source, port, health_check, resources, placement, status, current_deployment_id, \
+        "INSERT INTO apps (id, project_id, name, stateful, ha_policy, backup_schedule, replicas, \
+         image, source, port, health_check, resources, placement, status, current_deployment_id, \
          restart_generation, created_at, updated_at) \
-         VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, ?)",
+         VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, ?)",
     )
     .bind(&app.id)
     .bind(&app.project_id)
     .bind(&app.name)
     .bind(app.ha_policy.as_str())
     .bind(&backup_schedule)
+    .bind(app.replicas)
     .bind(&app.image)
     .bind(&source)
     .bind(app.port)
@@ -1496,6 +1534,12 @@ async fn update_app_tx(
         app.backup_schedule = schedule;
         changed.push("backup_schedule");
     }
+    if let Some(replicas) = body.replicas
+        && replicas != app.replicas
+    {
+        app.replicas = replicas;
+        changed.push("replicas");
+    }
     if let Some(health) = &body.health_check
         && *health != app.health_check
     {
@@ -1533,7 +1577,7 @@ async fn update_app_tx(
             None => None,
         };
         sqlx::query(
-            "UPDATE apps SET name = ?, port = ?, ha_policy = ?, backup_schedule = ?, \
+            "UPDATE apps SET name = ?, port = ?, ha_policy = ?, backup_schedule = ?, replicas = ?, \
              health_check = ?, resources = ?, placement = ?, source = ?, updated_at = ? \
              WHERE id = ?",
         )
@@ -1541,6 +1585,7 @@ async fn update_app_tx(
         .bind(app.port)
         .bind(app.ha_policy.as_str())
         .bind(&backup_schedule)
+        .bind(app.replicas)
         .bind(&health_check)
         .bind(&resources)
         .bind(&placement)
@@ -2480,6 +2525,10 @@ fn valid_env_name(name: &str) -> bool {
     bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
+/// Variables the node sets on every app instance (node-agent-protocol.md
+/// section 6.10, ADR 0142); an app's environment may not hold them.
+const RESERVED_ENV_NAMES: [&str; 2] = ["QUORO_INSTANCE_ID", "QUORO_NODE_ID"];
+
 fn validate_env(items: &[AppEnvVarInput]) -> Result<(), ApiError> {
     if items.len() > 200 {
         return Err(ApiError::validation(
@@ -2491,6 +2540,12 @@ fn validate_env(items: &[AppEnvVarInput]) -> Result<(), ApiError> {
         if !valid_env_name(&item.name) {
             return Err(ApiError::validation(format!(
                 "environment variable name {:?} is not valid",
+                item.name
+            )));
+        }
+        if RESERVED_ENV_NAMES.contains(&item.name.as_str()) {
+            return Err(ApiError::validation(format!(
+                "environment variable {:?} is reserved: the node sets it",
                 item.name
             )));
         }

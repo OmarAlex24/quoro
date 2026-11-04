@@ -30,6 +30,7 @@ const makeApp = (repoUrl: string): App => {
     stateful: false,
     ha_policy: 'none',
     backup_schedule: { interval_h: 24, keep: 7 },
+    replicas: 1,
     image: '',
     source: sourceFor(repoUrl),
     port: 3000,

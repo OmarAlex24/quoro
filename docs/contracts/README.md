@@ -40,6 +40,7 @@ Every contract uses exactly the names below. If a contract needs a name that is 
 - **Roles** of the single `quoro` binary (D-0012): `node`, `witness`, `edge`. They combine (for example `witness`+`edge`, D-0018).
 - **Control-plane status** of a node: `primary` (single writer and source of truth) or `replica` (holds a copy of the change log, serves reads, forwards writes) (D-0012). Primary and replica are statuses, not roles.
 - The witness role stores no data (D-0017). In M1-M4 the cluster has exactly one primary and no witness (D-0016).
+- The **edge** role (from M5a, ADR 0143) runs the embedded proxy for the domains of apps with more than one replica, balancing over their instances on other nodes and checking each one itself. An edge-only machine runs no engine and needs no KVM. Edges and nodes are joined by the **mesh**, a kernel WireGuard star with the edge as hub (ADR 0144).
 
 ### Identifiers
 
@@ -98,7 +99,8 @@ The cluster keys are generated at the primary's first start and stored as `0600`
 ### Resource relationships
 
 - A **project** contains **apps**. A **VM** may belong to an app (`app_id` set) or stand alone (M1 lifecycle, `app_id` null). Standalone VMs belong to a project too.
-- An **app** has **deployments**; the current deployment's image runs as one or more **VMs** (instances) placed on **nodes**. In M1-M4 an app has one instance.
+- An **app** has **deployments**; the current deployment's image runs as one or more **VMs** (instances) placed on **nodes**. In M1-M4 an app has one instance. From M5a a stateless app runs `replicas` instances, at most one per node (ADR 0142); every instance gets `QUORO_INSTANCE_ID` (its `vm_` id) and `QUORO_NODE_ID` (its `nod_` id) in its environment, and those two names are reserved.
+- Each node with the `node` role has its own guest **subnet**, a `/24` of `10.42.0.0/16` assigned at enrollment and never reused while a VM from it is recorded (the oldest node of a cluster from before M5a keeps the configured guest network, and no other subnet overlaps it); each node and edge has a **mesh address** in `10.43.0.0/16` (ADR 0144).
 - An app is `stateful` or not. An app is stateful exactly when it has a **volume**: its first volume makes it stateful (ADR 0145). A stateful app runs one instance, on the node that holds its volume and its `local` **lease** (D-0019, D-0047).
 - A **backup** copies one volume, or the control-plane database, into a **backup repository** (ADR 0147, ADR 0148). Restoring a volume backup creates a new volume on the chosen node and moves the app there.
 - An app has an HA policy: `none`, `cold`, `warm`, `hot` (D-0020). `none` and `cold` (scheduled backups of a stateful app) are accepted from M5a; `warm` and `hot` are refused until M5b and M6. The field exists from M0.
@@ -224,7 +226,8 @@ Event `type` is `<subject>.<what>` in lowercase with underscores. The complete l
 | `app.updated` | An app's settings changed | |
 | `app.deleted` | An app was deleted | |
 | `app.down` | An app's health check failed past its threshold | VM down |
-| `app.up` | An app recovered | |
+| `app.degraded` | An app with more than one replica has at least one instance out of the edge's rotation and at least one in it (ADR 0143) | |
+| `app.up` | An app recovered, from down or from degraded | |
 | `app.restarted` | An app's instances were restarted | |
 | `deployment.started` | A deployment began | |
 | `deployment.succeeded` | A deployment's instances are healthy | |
@@ -303,7 +306,7 @@ Every mutating tool takes a required `justification` string and an optional `inc
 
 M4 adds no MCP tool. Builds, metrics and console sessions are reachable by agents through the HTTP API with a grant; the web terminal is human-only (ADR 0114); a later tool is a contract change of its own.
 
-M5a adds no MCP tool either. Volumes, backups and restores are reachable by agents through the HTTP API with a grant (a volume delete and a restore only through a JIT approval); backup repositories, their recovery key and the off-site audit export are human-only. A later tool is a contract change of its own.
+M5a adds no MCP tool either. Volumes, backups and restores are reachable by agents through the HTTP API with a grant (a volume delete and a restore only through a JIT approval); backup repositories, their recovery key and the off-site audit export are human-only. Replicas are a field of `updateApp`, with no tool of their own. A later tool is a contract change of its own.
 
 ### Channels
 

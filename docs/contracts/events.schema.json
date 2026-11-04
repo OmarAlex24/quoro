@@ -41,6 +41,7 @@
         "app.updated",
         "app.deleted",
         "app.down",
+        "app.degraded",
         "app.up",
         "app.restarted",
         "deployment.started",
@@ -98,6 +99,7 @@
     { "if": { "required": ["type"], "properties": { "type": { "const": "app.updated" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_app_updated" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "app.deleted" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_app_deleted" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "app.down" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_app_down" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "app.degraded" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_app_degraded" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "app.up" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_app_up" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "app.restarted" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_app_restarted" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "deployment.started" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_deployment_started" } } } },
@@ -457,26 +459,56 @@
 
     "data_app_down": {
       "type": "object",
-      "description": "An app's health check failed past its threshold, or its VM crashed (D-0032). Payload fields are additive within schema_version 1.",
+      "description": "An app's health check failed past its threshold, or its VM crashed (D-0032). From M5a, for an app with more than one replica, the primary also emits it with `check: edge_health` when the edge has every instance out of rotation; `node_id` is then the edge's. Payload fields are additive within schema_version 1.",
       "required": ["app_id", "node_id", "check", "failures"],
       "properties": {
         "app_id": { "$ref": "#/$defs/AppId" },
         "node_id": { "$ref": "#/$defs/NodeId" },
         "vm_id": { "$ref": "#/$defs/VmId" },
-        "check": { "type": "string", "enum": ["health_check", "vm_crashed"] },
+        "check": { "type": "string", "enum": ["health_check", "vm_crashed", "edge_health"] },
         "failures": { "type": "integer", "minimum": 1 },
         "last_error": { "type": "string" }
       },
       "additionalProperties": true
     },
 
+    "data_app_degraded": {
+      "type": "object",
+      "description": "An app with more than one replica has at least one instance out of the edge's rotation and at least one in it (ADR 0142, ADR 0143). Emitted by the control plane from the edge's status reports, when the app enters the degraded state and when the set of instances out of rotation changes. It opens no incident; `app.down` does once no instance is left. Recovery is `app.up` with `from: degraded`. Payload fields are additive within schema_version 1.",
+      "required": ["app_id", "edge_node_id", "replicas", "in_rotation", "out_of_rotation"],
+      "properties": {
+        "app_id": { "$ref": "#/$defs/AppId" },
+        "edge_node_id": { "$ref": "#/$defs/NodeId" },
+        "replicas": { "type": "integer", "minimum": 2 },
+        "in_rotation": { "type": "integer", "minimum": 1 },
+        "out_of_rotation": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["vm_id", "node_id", "since", "reason"],
+            "properties": {
+              "vm_id": { "$ref": "#/$defs/VmId" },
+              "node_id": { "$ref": "#/$defs/NodeId" },
+              "since": { "$ref": "#/$defs/Timestamp" },
+              "reason": { "type": "string", "enum": ["health_check", "connect_failed"] }
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+
     "data_app_up": {
       "type": "object",
-      "description": "An app recovered. Payload fields are additive within schema_version 1.",
+      "description": "An app recovered. `from` says whether it was `down` or, from M5a, `degraded`; an event without `from` comes from an older primary or node and means `down`. Payload fields are additive within schema_version 1.",
       "required": ["app_id"],
       "properties": {
         "app_id": { "$ref": "#/$defs/AppId" },
-        "down_since": { "$ref": "#/$defs/Timestamp" }
+        "down_since": { "$ref": "#/$defs/Timestamp" },
+        "from": { "type": "string", "enum": ["down", "degraded"] },
+        "degraded_since": { "$ref": "#/$defs/Timestamp" }
       },
       "additionalProperties": true
     },

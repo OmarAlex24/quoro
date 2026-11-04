@@ -115,6 +115,7 @@ async fn app_lifecycle_over_http() {
         json!({ "interval_h": 24, "keep": 7 })
     );
     assert!(app.get("ha_cost").is_none());
+    assert_eq!(app["replicas"], 1);
 
     // list and filters.
     let list: Value = owner
@@ -603,6 +604,24 @@ async fn app_validation_and_authorization() {
     .await;
     assert_eq!((status, code.as_str()), (422, "validation_failed"));
 
+    // The names the node sets on every instance are reserved (ADR 0142).
+    for name in ["QUORO_INSTANCE_ID", "QUORO_NODE_ID"] {
+        let (status, code, _) = problem(
+            owner
+                .put(server.url(&format!("/api/v1/apps/{app_id}/env")))
+                .json(&json!({ "items": [{ "name": name, "value": "x" }] }))
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (422, "validation_failed"),
+            "{name}"
+        );
+    }
+
     // updateApp changes given fields only and conflicts on a taken name.
     let _other = create_app_named(&owner, &server, &project_id, "api").await;
     let res = owner
@@ -651,6 +670,10 @@ async fn app_validation_and_authorization() {
             json!({ "backup_schedule": { "interval_h": 24, "keep": 101 } }),
             (422, "validation_failed"),
         ),
+        // Replicas above 1 need an enrolled edge (ADR 0142, ADR 0143).
+        (json!({ "replicas": 2 }), (409, "conflict")),
+        (json!({ "replicas": 0 }), (422, "validation_failed")),
+        (json!({ "replicas": 65 }), (422, "validation_failed")),
     ] {
         let (status, code, _) = problem(
             owner

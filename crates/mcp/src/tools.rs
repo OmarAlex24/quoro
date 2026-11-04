@@ -546,6 +546,7 @@ fn event_type() -> Value {
             "app.updated",
             "app.deleted",
             "app.down",
+            "app.degraded",
             "app.up",
             "app.restarted",
             "deployment.started",

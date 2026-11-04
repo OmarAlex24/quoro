@@ -508,6 +508,7 @@ export const handlers = [
       stateful: body.stateful ?? false,
       ha_policy: 'none',
       backup_schedule: body.backup_schedule ?? { interval_h: 24, keep: 7 },
+      replicas: body.replicas ?? 1,
       image: hasSource ? '' : (body.image ?? '').trim(),
       source: hasSource ? (body.source ?? null) : null,
       port: body.port,

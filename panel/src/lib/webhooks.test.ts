@@ -76,6 +76,7 @@ describe('eventTypesBySubject', () => {
       'app.updated',
       'app.deleted',
       'app.down',
+      'app.degraded',
       'app.up',
       'app.restarted',
     ]);
