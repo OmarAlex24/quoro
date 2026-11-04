@@ -73,6 +73,8 @@ export function ConsoleScreen() {
       connect={() => createConsoleSession(vmId)}
       canConnect={canViewConsole(me)}
       deniedMessage="This session can't view a serial console. A viewer needs a grant that covers vm:console."
+      vmId={vmId}
+      appId={vm.app_id ?? undefined}
     />
   );
 }

@@ -1,14 +1,22 @@
 import { describe, expect, it } from 'vitest';
+import { ApiProblem } from '../api/fetcher';
 import {
   buildWebSocketUrl,
   clampSize,
+  clearRedeployHint,
   closeReasonText,
   CLOSE_REASONS,
   encodeResize,
   isSessionLive,
+  needsRedeploy,
   parseServerControl,
+  readRedeployHint,
+  rememberRedeployHint,
   sessionStateText,
 } from './interactive';
+
+const conflict = (detail: string) =>
+  new ApiProblem({ status: 409, code: 'conflict', detail });
 
 describe('parseServerControl', () => {
   it('reads an exit frame with its code', () => {
@@ -115,6 +123,69 @@ describe('sessionStateText', () => {
     expect(isSessionLive({ phase: 'live' })).toBe(true);
     expect(isSessionLive({ phase: 'exited', code: 0 })).toBe(false);
     expect(isSessionLive(null)).toBe(false);
+  });
+});
+
+describe('needsRedeploy', () => {
+  it('recognises a VM with no vsock device for a terminal', () => {
+    expect(
+      needsRedeploy(conflict('conflict: VM vm_01M6FH5D8PJ21YJKMRNC2PQ6W1 has no vsock device'), 'terminal'),
+    ).toBe(true);
+  });
+
+  it('recognises a serial port that is not a socket for the console', () => {
+    expect(
+      needsRedeploy(
+        conflict("conflict: VM vm_01M6FH5D8PJ21YJKMRNC2PQ6W1's serial port is not a socket"),
+        'console',
+      ),
+    ).toBe(true);
+  });
+
+  it('recognises the two texts only for their own kind', () => {
+    expect(
+      needsRedeploy(conflict('conflict: VM vm_1 has no vsock device'), 'console'),
+    ).toBe(false);
+    expect(
+      needsRedeploy(conflict("conflict: VM vm_1's serial port is not a socket"), 'terminal'),
+    ).toBe(false);
+  });
+
+  it('leaves the other 409 conflicts alone', () => {
+    const others = [
+      'The app has no running instance to open a terminal in.',
+      'conflict: VM vm_1 is not running',
+      'conflict: the node session holds too many open streams',
+    ];
+    for (const detail of others) {
+      expect(needsRedeploy(conflict(detail), 'terminal')).toBe(false);
+      expect(needsRedeploy(conflict(detail), 'console')).toBe(false);
+    }
+  });
+
+  it('is false for a 504 and for things that are not problem documents', () => {
+    expect(needsRedeploy(new ApiProblem({ status: 504, code: 'internal' }), 'terminal')).toBe(
+      false,
+    );
+    expect(needsRedeploy(new Error('network down'), 'terminal')).toBe(false);
+    expect(needsRedeploy(null, 'console')).toBe(false);
+    expect(needsRedeploy({ status: 409, code: 'conflict', detail: 'has no vsock device' }, 'terminal')).toBe(
+      false,
+    );
+  });
+
+  it('is false when the problem carries no detail', () => {
+    expect(needsRedeploy(new ApiProblem({ status: 409, code: 'conflict' }), 'console')).toBe(false);
+  });
+});
+
+describe('redeploy hint storage', () => {
+  // The unit environment has no window, so storage is refused rather than
+  // throwing; the hint then lives only in the component state for one view.
+  it('works without sessionStorage', () => {
+    expect(readRedeployHint('terminal', 'vm_1')).toBe(false);
+    expect(() => rememberRedeployHint('terminal', 'vm_1')).not.toThrow();
+    expect(() => clearRedeployHint('terminal', 'vm_1')).not.toThrow();
   });
 });
 
