@@ -15,6 +15,7 @@ pub mod events;
 pub mod grants;
 pub mod health;
 pub mod incidents;
+pub mod interactive;
 pub mod logs;
 pub mod metrics;
 pub mod nodes;
@@ -162,4 +163,5 @@ pub fn routes() -> Router<AppState> {
         .merge(apps::routes())
         .merge(logs::routes())
         .merge(metrics::routes())
+        .merge(interactive::routes())
 }

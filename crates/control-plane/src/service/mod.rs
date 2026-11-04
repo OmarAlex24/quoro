@@ -23,6 +23,7 @@ pub mod deployments;
 pub mod events;
 pub mod grants;
 pub mod incidents;
+pub mod interactive;
 pub mod logs;
 pub mod nodes;
 pub mod projects;

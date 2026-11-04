@@ -591,6 +591,7 @@ pub async fn get_deployment_logs(
                         }
                     }
                     Some(StreamEvent::Metrics(_)) => {}
+                    Some(StreamEvent::Data(_) | StreamEvent::SessionEnd { .. }) => {}
                 }
             }
         }
@@ -694,6 +695,7 @@ impl MergedFeed {
                         return Some(end_event());
                     }
                 }
+                StreamEvent::Data(_) | StreamEvent::SessionEnd { .. } => {}
             }
         }
     }

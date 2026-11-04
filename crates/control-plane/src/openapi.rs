@@ -230,6 +230,7 @@ impl utoipa::Modify for Security {
         // first so the fixes below see every operation.
         openapi.merge(crate::api::apps::AppsDoc::openapi());
         openapi.merge(crate::api::logs::LogsDoc::openapi());
+        openapi.merge(crate::api::interactive::InteractiveDoc::openapi());
         openapi.merge(crate::api::events::EventsDoc::openapi());
         openapi.merge(crate::api::incidents::IncidentsDoc::openapi());
 
@@ -256,7 +257,11 @@ impl utoipa::Modify for Security {
         // body is written `Option<T>`, which also marks the schema nullable.
         // The contract's `NodeJoinTokenRequest` is a plain object, so the
         // annotation names the type and only the body is marked optional here.
-        for path in ["/api/v1/nodes/join-tokens", "/api/v1/audit/verify"] {
+        for path in [
+            "/api/v1/nodes/join-tokens",
+            "/api/v1/audit/verify",
+            "/api/v1/vms/{vm_id}/console-sessions",
+        ] {
             if let Some(body) = openapi
                 .paths
                 .paths
@@ -266,6 +271,21 @@ impl utoipa::Modify for Security {
             {
                 body.required = Some(utoipa::openapi::Required::False);
             }
+        }
+
+        // utoipa derives no length bounds for array items: the contract's
+        // `CreateTerminalSessionRequest.command` items are 1-4096 characters.
+        if let Some(components) = openapi.components.as_mut()
+            && let Some(utoipa::openapi::RefOr::T(utoipa::openapi::schema::Schema::Object(request))) =
+                components.schemas.get_mut("CreateTerminalSessionRequest")
+            && let Some(utoipa::openapi::RefOr::T(utoipa::openapi::schema::Schema::Array(command))) =
+                request.properties.get_mut("command")
+            && let utoipa::openapi::schema::ArrayItems::RefOrSchema(items) = &mut command.items
+            && let utoipa::openapi::RefOr::T(utoipa::openapi::schema::Schema::Object(items)) =
+                items.as_mut()
+        {
+            items.min_length = Some(1);
+            items.max_length = Some(4096);
         }
 
         // The approve and deny requests take an optional note; like

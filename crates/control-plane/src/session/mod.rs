@@ -27,6 +27,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequestParts, State};
 use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
+use base64::Engine as _;
 use quoro_proto::wire::{self, ControlMessage, NodeMessage};
 use quoro_providers::DnsProvider;
 use serde_json::{Value, json};
@@ -45,6 +46,9 @@ const MAX_DIGEST_FAILURES: u32 = 3;
 
 /// Concurrent log streams one node session may hold (section 5.15).
 const MAX_STREAMS: usize = 32;
+
+/// Decoded bytes one `stream_data` may carry (section 5.7).
+const MAX_STREAM_DATA_BYTES: usize = 64 * 1024;
 
 /// The outbox sender of one session.
 type SessionSender = mpsc::UnboundedSender<String>;
@@ -84,14 +88,71 @@ pub enum StreamEvent {
     Lines(Vec<wire::LogLine>),
     /// Metric samples, one `metrics` report per `stream_data` (section 5.17).
     Metrics(quoro_proto::metrics::MetricsReport),
+    /// A batch of raw bytes of a `terminal`, `console` or `transcript` stream
+    /// (section 5.7, `data`).
+    Data(Vec<u8>),
     /// The stream ended. `reason` is `completed`, `error` or `cancelled`.
     End { reason: String, message: String },
+    /// A `terminal`, `console` or `transcript` stream ended, with the details
+    /// their consumers need (section 5.8).
+    SessionEnd {
+        reason: SessionEndReason,
+        message: String,
+        /// `terminal` only: the program's exit code, or `128 + signal`.
+        exit_code: Option<i32>,
+        /// `terminal` only: SHA-256 and size of the stored transcript.
+        transcript_sha256: Option<String>,
+        transcript_bytes: Option<u64>,
+        /// Set by a failed `stream_open`: the node's `command_result` code,
+        /// for example `not_found` or `not_available`.
+        node_code: Option<quoro_proto::ErrorCode>,
+    },
+}
+
+/// Why a `terminal`, `console` or `transcript` stream ended (section 5.8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionEndReason {
+    /// The program exited (`terminal`) or the file was sent (`transcript`).
+    Completed,
+    /// The node reported an error, or the open failed.
+    Error,
+    /// The stream was closed by `stream_close`.
+    Cancelled,
+    /// The VM stopped (`terminal`) or was deleted (`console`).
+    VmStopped,
+    /// A terminal transcript reached its cap.
+    Limit,
+    /// The node session dropped; sessions do not resume.
+    Lost,
+}
+
+impl SessionEndReason {
+    /// The wire `reason` of section 5.8.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Error => "error",
+            Self::Cancelled => "cancelled",
+            Self::VmStopped => "vm_stopped",
+            Self::Limit => "limit",
+            Self::Lost => "node_disconnected",
+        }
+    }
+}
+
+/// Whether `kind` is one of the byte streams of M4 (`terminal`, `console`,
+/// `transcript`) rather than a log stream.
+fn is_byte_stream(kind: &str) -> bool {
+    matches!(kind, "terminal" | "console" | "transcript")
 }
 
 /// One open stream of a session: where its events go and the last `seq` seen.
 struct StreamSlot {
     tx: mpsc::UnboundedSender<StreamEvent>,
     last_seq: u64,
+    /// The `stream_open` kind, so its events are shaped for its consumer.
+    kind: String,
 }
 
 /// The commands and streams waiting on one live session (sections 5.7-5.9).
@@ -117,10 +178,22 @@ impl Pending {
             let _ = tx.send(Err(HubError::Closed));
         }
         for (_, slot) in self.streams.drain() {
-            let _ = slot.tx.send(StreamEvent::End {
-                reason: "error".to_string(),
-                message: "the node session ended".to_string(),
-            });
+            let message = "the node session ended".to_string();
+            if is_byte_stream(&slot.kind) {
+                let _ = slot.tx.send(StreamEvent::SessionEnd {
+                    reason: SessionEndReason::Lost,
+                    message,
+                    exit_code: None,
+                    transcript_sha256: None,
+                    transcript_bytes: None,
+                    node_code: None,
+                });
+            } else {
+                let _ = slot.tx.send(StreamEvent::End {
+                    reason: "error".to_string(),
+                    message,
+                });
+            }
         }
         self.opens.clear();
     }
@@ -397,6 +470,7 @@ impl NodeHub {
                 StreamSlot {
                     tx: events_tx,
                     last_seq: 0,
+                    kind: kind.to_string(),
                 },
             );
             pending.opens.insert(open_id.clone(), stream_id.clone());
@@ -617,15 +691,28 @@ impl HubInner {
         if result.status == quoro_proto::CommandStatus::Error
             && let Some(slot) = pending.streams.remove(&stream_id)
         {
+            let code = result.error.as_ref().map(|error| error.code);
             let message = result
                 .error
                 .map(|error| error.message)
                 .or(result.detail)
                 .unwrap_or_else(|| "the node could not open the stream".to_string());
-            let _ = slot.tx.send(StreamEvent::End {
-                reason: "error".to_string(),
-                message,
-            });
+            let event = if is_byte_stream(&slot.kind) {
+                StreamEvent::SessionEnd {
+                    reason: SessionEndReason::Error,
+                    message,
+                    exit_code: None,
+                    transcript_sha256: None,
+                    transcript_bytes: None,
+                    node_code: code,
+                }
+            } else {
+                StreamEvent::End {
+                    reason: "error".to_string(),
+                    message,
+                }
+            };
+            let _ = slot.tx.send(event);
         }
     }
 
@@ -656,6 +743,26 @@ impl HubInner {
         if let Some(metrics) = data.metrics {
             let _ = slot.tx.send(StreamEvent::Metrics(metrics));
         }
+        if let Some(encoded) = data.data {
+            match base64::engine::general_purpose::STANDARD.decode(encoded.as_bytes()) {
+                Ok(bytes) if bytes.len() > MAX_STREAM_DATA_BYTES => {
+                    tracing::warn!(
+                        stream_id = %data.stream_id,
+                        bytes = bytes.len(),
+                        "stream_data carries more than 64 KiB"
+                    );
+                }
+                Ok(bytes) if !bytes.is_empty() => {
+                    let _ = slot.tx.send(StreamEvent::Data(bytes));
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    stream_id = %data.stream_id,
+                    error = %e,
+                    "stream_data is not base64"
+                ),
+            }
+        }
     }
 
     /// Routes one `stream_end` to its stream (section 5.8).
@@ -668,10 +775,23 @@ impl HubInner {
             pending
                 .opens
                 .retain(|_, stream_id| stream_id != &end.stream_id);
-            let _ = slot.tx.send(StreamEvent::End {
-                reason: stream_reason(end.reason).to_string(),
-                message: end.message.unwrap_or_default(),
-            });
+            let message = end.message.unwrap_or_default();
+            let event = if is_byte_stream(&slot.kind) {
+                StreamEvent::SessionEnd {
+                    reason: session_end_reason(end.reason),
+                    message,
+                    exit_code: end.exit_code,
+                    transcript_sha256: end.transcript_sha256,
+                    transcript_bytes: end.transcript_bytes,
+                    node_code: None,
+                }
+            } else {
+                StreamEvent::End {
+                    reason: stream_reason(end.reason).to_string(),
+                    message,
+                }
+            };
+            let _ = slot.tx.send(event);
         }
     }
 
@@ -725,6 +845,17 @@ fn stream_reason(reason: wire::StreamEndReason) -> &'static str {
     }
 }
 
+/// The byte-stream form of a [`wire::StreamEndReason`].
+fn session_end_reason(reason: wire::StreamEndReason) -> SessionEndReason {
+    match reason {
+        wire::StreamEndReason::Completed => SessionEndReason::Completed,
+        wire::StreamEndReason::Error => SessionEndReason::Error,
+        wire::StreamEndReason::Cancelled => SessionEndReason::Cancelled,
+        wire::StreamEndReason::VmStopped => SessionEndReason::VmStopped,
+        wire::StreamEndReason::Limit => SessionEndReason::Limit,
+    }
+}
+
 /// A log stream opened through a node session (sections 5.7, 5.8 and 5.16).
 ///
 /// Dropping a stream that has not ended sends `stream_close` for it, so the
@@ -746,7 +877,10 @@ impl NodeStream {
         }
         match self.rx.recv().await {
             Some(event) => {
-                if matches!(event, StreamEvent::End { .. }) {
+                if matches!(
+                    event,
+                    StreamEvent::End { .. } | StreamEvent::SessionEnd { .. }
+                ) {
                     self.ended = true;
                 }
                 Some(event)
@@ -756,6 +890,56 @@ impl NodeStream {
                 None
             }
         }
+    }
+
+    /// The `msg_` id the node knows this stream by.
+    #[must_use]
+    pub fn stream_id(&self) -> &str {
+        &self.stream_id
+    }
+
+    /// Sends one `stream_input` (section 5.24): input bytes, a new window size,
+    /// or the end of input. `seq` is gap-free from 1 per stream. Returns whether
+    /// the frame reached the session's outbox.
+    #[must_use]
+    pub fn send_input(
+        &self,
+        seq: u64,
+        data: Option<&[u8]>,
+        resize: Option<wire::WindowSize>,
+        eof: bool,
+    ) -> bool {
+        let input = wire::StreamInput {
+            stream_id: self.stream_id.clone(),
+            seq,
+            data: data.map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
+            resize,
+            eof: eof.then_some(true),
+        };
+        self.inner.send_text(
+            &self.node_id,
+            self.generation,
+            ControlMessage::StreamInput(input)
+                .to_frame(&new_msg_id(), None)
+                .to_text(),
+        )
+    }
+
+    /// Acknowledges `acked_bytes` cumulative decoded bytes of a `data` stream
+    /// (section 5.25), granting the node more window.
+    #[must_use]
+    pub fn send_ack(&self, acked_bytes: u64) -> bool {
+        let ack = wire::StreamAck {
+            stream_id: self.stream_id.clone(),
+            acked_bytes,
+        };
+        self.inner.send_text(
+            &self.node_id,
+            self.generation,
+            ControlMessage::StreamAck(ack)
+                .to_frame(&new_msg_id(), None)
+                .to_text(),
+        )
     }
 }
 
@@ -1881,9 +2065,14 @@ mod tests {
         let mut pending = Pending::default();
         for index in 0..MAX_STREAMS {
             let (tx, _rx) = mpsc::unbounded_channel();
-            pending
-                .streams
-                .insert(format!("msg_{index}"), StreamSlot { tx, last_seq: 0 });
+            pending.streams.insert(
+                format!("msg_{index}"),
+                StreamSlot {
+                    tx,
+                    last_seq: 0,
+                    kind: "app_logs".to_string(),
+                },
+            );
         }
         assert!(pending.at_stream_limit());
         pending.streams.remove("msg_0");
