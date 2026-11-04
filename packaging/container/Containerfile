@@ -35,6 +35,15 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # ca-certificates to an exact version keeps that from changing what gets
 # installed. Peer verification is back on for every step after it: the second
 # update refetches the indexes from the pinned snapshot over verified TLS.
+#
+# The snapshot service sometimes answers 502 or 503 for a while. Every apt step
+# therefore retries: apt itself retries each download with a growing delay
+# (Acquire::Retries), APT::Update::Error-Mode=any makes an update that could
+# not fetch every index fail instead of warning, and the "attempt" wrapper
+# reruns a whole stage (fresh indexes, then the install) up to five times,
+# 30 s, 60 s, 90 s and 120 s apart. Retrying changes only when the bytes
+# arrive: the snapshot timestamp, the signed indexes and every package version
+# stay the same, so the installed files are identical.
 RUN set -eu; \
     rm -f /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; \
     printf '%s\n' \
@@ -44,26 +53,46 @@ RUN set -eu; \
         'Components: main universe' \
         'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' \
         >/etc/apt/sources.list.d/snapshot.sources; \
-    apt-get -o Acquire::https::Verify-Peer=false update; \
-    apt-get -o Acquire::https::Verify-Peer=false install -y --no-install-recommends \
-        ca-certificates=20260816ubuntu0.24.04.1; \
-    rm -rf /var/lib/apt/lists/*; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends \
-        binutils=2.42-4ubuntu2.10 \
-        ca-certificates=20260816ubuntu0.24.04.1 \
-        curl=8.5.0-2ubuntu10.16 \
-        gcc=4:13.2.0-7ubuntu1 \
-        gcc-13=13.3.0-6ubuntu2~24.04.1 \
-        git=1:2.43.0-1ubuntu7.4 \
-        libc6-dev=2.39-0ubuntu8.9 \
-        musl=1.2.4-2 \
-        musl-dev=1.2.4-2 \
-        musl-tools=1.2.4-2 \
-        python3=3.12.3-0ubuntu2.1 \
-        xz-utils=5.6.1+really5.4.5-1ubuntu0.4; \
+    printf '%s\n' \
+        'Acquire::Retries "5";' \
+        'APT::Update::Error-Mode "any";' \
+        >/etc/apt/apt.conf.d/80-quoro-retries; \
+    attempt() { \
+        n=1; \
+        until "$@"; do \
+            if [ "$n" -ge 5 ]; then return 1; fi; \
+            echo "apt stage failed (attempt $n of 5); retrying in $((n * 30)) s" >&2; \
+            sleep $((n * 30)); \
+            n=$((n + 1)); \
+        done; \
+    }; \
+    bootstrap() { \
+        rm -rf /var/lib/apt/lists/*; \
+        apt-get -o Acquire::https::Verify-Peer=false update && \
+        apt-get -o Acquire::https::Verify-Peer=false install -y --no-install-recommends \
+            ca-certificates=20260816ubuntu0.24.04.1; \
+    }; \
+    toolchain() { \
+        rm -rf /var/lib/apt/lists/*; \
+        apt-get update && \
+        apt-get install -y --no-install-recommends \
+            binutils=2.42-4ubuntu2.10 \
+            ca-certificates=20260816ubuntu0.24.04.1 \
+            curl=8.5.0-2ubuntu10.16 \
+            gcc=4:13.2.0-7ubuntu1 \
+            gcc-13=13.3.0-6ubuntu2~24.04.1 \
+            git=1:2.43.0-1ubuntu7.4 \
+            libc6-dev=2.39-0ubuntu8.9 \
+            musl=1.2.4-2 \
+            musl-dev=1.2.4-2 \
+            musl-tools=1.2.4-2 \
+            python3=3.12.3-0ubuntu2.1 \
+            xz-utils=5.6.1+really5.4.5-1ubuntu0.4; \
+    }; \
+    attempt bootstrap; \
+    attempt toolchain; \
     apt-get clean; \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* /etc/apt/apt.conf.d/80-quoro-retries
 
 # Rust: rustup-init pinned by version and sha256, then exactly the toolchain,
 # profile and components that rust-toolchain.toml names, plus the musl target.
