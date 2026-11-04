@@ -1,7 +1,7 @@
 //! Node reads (`GET /api/v1/nodes`, `GET /api/v1/nodes/{node_id}`; MCP tools `list_nodes`, `get_node`).
 
 use crate::AppState;
-use crate::api::nodes::{Node, NodeList, PageParams, node_from_row, tunnel_of};
+use crate::api::nodes::{NODE_COLUMNS, Node, NodeList, PageParams, node_from_row, tunnel_of};
 use crate::api::page::finish;
 use crate::error::{ApiError, Target};
 use crate::request::{CallCtx, Resource};
@@ -36,11 +36,13 @@ pub async fn list_nodes(
         .await?;
     let result: Result<NodeList, ApiError> = async {
         let limit = page.limit()?;
-        let rows = sqlx::query("SELECT * FROM nodes WHERE id > ? ORDER BY id LIMIT ?")
-            .bind(page.after())
-            .bind(limit + 1)
-            .fetch_all(state.store.pool())
-            .await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {NODE_COLUMNS} FROM nodes n WHERE n.id > ? ORDER BY n.id LIMIT ?"
+        ))
+        .bind(page.after())
+        .bind(limit + 1)
+        .fetch_all(state.store.pool())
+        .await?;
         let mut nodes = rows
             .iter()
             .map(node_from_row)
@@ -83,11 +85,13 @@ pub async fn get_node(state: &AppState, ctx: &CallCtx, node_id: &str) -> Result<
         if !is_id(Prefix::Node, node_id) {
             return Err(ApiError::not_found("node"));
         }
-        let row = sqlx::query("SELECT * FROM nodes WHERE id = ?")
-            .bind(node_id)
-            .fetch_optional(state.store.pool())
-            .await?
-            .ok_or_else(|| ApiError::not_found("node"))?;
+        let row = sqlx::query(&format!(
+            "SELECT {NODE_COLUMNS} FROM nodes n WHERE n.id = ?"
+        ))
+        .bind(node_id)
+        .fetch_optional(state.store.pool())
+        .await?
+        .ok_or_else(|| ApiError::not_found("node"))?;
         let mut node = node_from_row(&row)?;
         node.tunnel = tunnel_of(state.store.pool(), node_id).await?;
         Ok(node)
