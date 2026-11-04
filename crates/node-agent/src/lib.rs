@@ -22,6 +22,7 @@ pub mod logs;
 pub mod metrics;
 pub mod reconcile;
 pub mod session;
+pub mod set_primary;
 pub mod store;
 pub mod tls;
 pub mod transcript;
@@ -40,6 +41,7 @@ pub use lease::{
     LeaseStore, LeaseTable, MIN_DURATION, MemoryLeaseStore, Refusal, RevokeOutcome, StoredLease,
     VmFenceOutcome, budget_for, margin, stop_vms,
 };
+pub use set_primary::{SetPrimary, set_primary, verify_primary, write_primary};
 
 /// The ACME directory `acme` routes use unless the configuration names another
 /// one (a staging directory for tests and labs).

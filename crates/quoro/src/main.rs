@@ -33,6 +33,9 @@ commands:
   join <url> --token TOKEN --fingerprint FINGERPRINT [--config PATH]
                                         enroll this machine as a node
   node [--config PATH]                  run the node agent
+  node set-primary <url> [--config PATH] [--no-restart]
+                                        point this enrolled node at its
+                                        primary's new address
   mcp stdio --url URL --fingerprint FINGERPRINT --key-file PATH
             [--justification TEXT]
                                         serve MCP over stdio for a local MCP
@@ -186,7 +189,15 @@ async fn mcp_command(args: &[String]) -> ExitCode {
 }
 
 /// `quoro node [--config PATH]`: the node agent alone, until SIGTERM.
+/// `quoro node set-primary <url> ...` points an enrolled node at a new
+/// primary address instead of running the agent.
 async fn node_command(args: &[String]) -> ExitCode {
+    if args
+        .first()
+        .is_some_and(|argument| argument == "set-primary")
+    {
+        return set_primary_command(&args[1..]).await;
+    }
     let flags = match parse_flags(args, &["config"]) {
         Ok(flags) => flags,
         Err(e) => return usage_error(&e),
@@ -201,6 +212,50 @@ async fn node_command(args: &[String]) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// `quoro node set-primary <url> [--config PATH] [--no-restart]`: hand an
+/// enrolled node its primary's new address (ADR 0139).
+async fn set_primary_command(args: &[String]) -> ExitCode {
+    let Some((url, rest)) = args.split_first().filter(|(url, _)| !url.starts_with("--")) else {
+        return usage_error("node set-primary needs the primary's new URL");
+    };
+    let flags = match parse_set_primary_flags(rest) {
+        Ok(flags) => flags,
+        Err(e) => return usage_error(&e),
+    };
+    let Some(config) = load_config("node set-primary", &config_path(&flags)) else {
+        return ExitCode::from(1);
+    };
+    exit_code(node::set_primary(&config, url, !flag_boolean(&flags, "no-restart")).await)
+}
+
+/// Reads `node set-primary`'s flags: `--config PATH` and the value-less
+/// `--no-restart`.
+fn parse_set_primary_flags(args: &[String]) -> Result<Vec<(String, String)>, String> {
+    let mut flags = Vec::with_capacity(args.len());
+    let mut args = args.iter();
+    while let Some(argument) = args.next() {
+        let Some(name) = argument.strip_prefix("--") else {
+            return Err(format!("unexpected argument '{argument}'"));
+        };
+        match name {
+            "no-restart" => flags.push((name.to_string(), String::new())),
+            "config" => {
+                let Some(value) = args.next() else {
+                    return Err(format!("'{argument}' needs a value"));
+                };
+                flags.push((name.to_string(), value.clone()));
+            }
+            _ => return Err(format!("unknown option '{argument}'")),
+        }
+    }
+    Ok(flags)
+}
+
+/// Whether a value-less flag was given.
+fn flag_boolean(flags: &[(String, String)], name: &str) -> bool {
+    flags.iter().any(|(key, _)| key == name)
 }
 
 /// Loads `quoro.toml`, printing the failure under `command`.
@@ -365,6 +420,23 @@ mod tests {
         assert!(parse_flags(&args(&["--config"]), &["config"]).is_err());
         assert!(parse_flags(&args(&["serve"]), &["config"]).is_err());
         assert!(parse_flags(&[], &["config"]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_primary_flags_carry_config_and_the_boolean() {
+        let flags =
+            parse_set_primary_flags(&args(&["--no-restart", "--config", "/etc/quoro/x.toml"]))
+                .unwrap();
+        assert_eq!(flag(&flags, "config"), Some("/etc/quoro/x.toml"));
+        assert!(flag_boolean(&flags, "no-restart"));
+        assert!(!flag_boolean(&flags, "restart"));
+
+        assert!(
+            parse_set_primary_flags(&args(&["--no-restart=yes"])).is_err(),
+            "a value after --no-restart is a typo, not a flag"
+        );
+        assert!(parse_set_primary_flags(&args(&["--config"])).is_err());
+        assert!(parse_set_primary_flags(&args(&["https://example.com"])).is_err());
     }
 
     #[test]

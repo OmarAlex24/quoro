@@ -76,6 +76,108 @@ pub async fn join(config: &Config, target: &JoinTarget) -> i32 {
     }
 }
 
+/// `quoro node set-primary <url>`: points an enrolled node at its primary's
+/// new address (ADR 0139, layer 1). Returns the process exit code.
+///
+/// The order matters. The new address is proved first, with the pin stored at
+/// enrollment; only then is a running agent stopped, the identity rewritten,
+/// and the agent started again. The running agent holds the identity in
+/// memory and writes it back on a key rotation or when it learns new
+/// addresses, which would overwrite the new `primary_url`. `KillMode=process`
+/// on the unit keeps the microVMs running across the stop.
+pub async fn set_primary(config: &Config, url: &str, restart: bool) -> i32 {
+    let data_dir = config.node.data_dir.clone();
+    if let Err(e) = std::fs::read_dir(&data_dir) {
+        eprintln!(
+            "quoro node set-primary: cannot read {}: {e}; run this as root",
+            data_dir.display()
+        );
+        return 1;
+    }
+
+    let (identity, primary_url) =
+        match quoro_node_agent::set_primary::verify_primary(&data_dir, url).await {
+            Ok(result) => result,
+            Err(e) => {
+                let text = e.to_string();
+                if text.contains("ermission denied") {
+                    eprintln!("quoro node set-primary: {text}; run this as root");
+                } else {
+                    eprintln!("quoro node set-primary: {text}");
+                }
+                return 1;
+            }
+        };
+    let previous = identity.primary_url;
+    if previous == primary_url {
+        println!("primary address is already {primary_url}; nothing was changed");
+        return 0;
+    }
+
+    let mut stopped = false;
+    if restart && unit_active() {
+        if let Err(e) = systemctl("stop") {
+            eprintln!(
+                "quoro node set-primary: cannot stop quoro-node.service: {e}; nothing was changed"
+            );
+            return 1;
+        }
+        stopped = true;
+    }
+
+    let written = quoro_node_agent::set_primary::write_primary(&data_dir, &primary_url);
+    match &written {
+        Ok(_) => println!("primary address {previous} -> {primary_url}"),
+        Err(e) => eprintln!(
+            "quoro node set-primary: {e}; {} must be writable by root",
+            data_dir.display()
+        ),
+    }
+
+    // Start the agent again whenever it was stopped, including after a failed
+    // write: leaving it down would take the node offline for no gain.
+    if stopped {
+        match systemctl("start") {
+            Ok(()) => println!("restarted quoro-node.service"),
+            Err(e) => {
+                eprintln!("quoro node set-primary: cannot start quoro-node.service: {e}");
+                return 1;
+            }
+        }
+    } else if written.is_ok() {
+        if restart {
+            println!("quoro-node.service was not running; start it to use the new address");
+        } else {
+            println!("restart quoro-node.service to use the new address");
+        }
+    }
+
+    if written.is_ok() { 0 } else { 1 }
+}
+
+/// Whether `quoro-node.service` is running, so a stop would actually do
+/// something.
+fn unit_active() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["is-active", "--quiet", "quoro-node.service"])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Runs `systemctl <action> quoro-node.service`.
+fn systemctl(action: &str) -> Result<(), String> {
+    let status = std::process::Command::new("systemctl")
+        .arg(action)
+        .arg("quoro-node.service")
+        .status()
+        .map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("systemctl {action} quoro-node.service: {status}"))
+    }
+}
+
 /// `quoro node`: runs the node agent until `shutdown` resolves.
 ///
 /// A primary's own agent that is not enrolled yet enrolls first with the
