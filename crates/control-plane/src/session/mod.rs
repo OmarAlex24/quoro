@@ -720,6 +720,8 @@ fn stream_reason(reason: wire::StreamEndReason) -> &'static str {
         wire::StreamEndReason::Completed => "completed",
         wire::StreamEndReason::Error => "error",
         wire::StreamEndReason::Cancelled => "cancelled",
+        wire::StreamEndReason::VmStopped => "vm_stopped",
+        wire::StreamEndReason::Limit => "limit",
     }
 }
 

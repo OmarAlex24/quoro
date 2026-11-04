@@ -86,6 +86,14 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     )
 }
 
+/// The current wall-clock time as whole seconds since the Unix epoch.
+#[must_use]
+pub fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
 /// The current wall-clock time as nanoseconds since the Unix epoch.
 #[must_use]
 pub fn now_ns() -> i64 {
