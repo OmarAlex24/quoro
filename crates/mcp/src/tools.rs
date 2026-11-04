@@ -549,6 +549,7 @@ fn event_type() -> Value {
             "app.degraded",
             "app.up",
             "app.restarted",
+            "app.vulnerable",
             "deployment.started",
             "deployment.succeeded",
             "deployment.failed",

@@ -30,8 +30,8 @@ use std::collections::BTreeSet;
 
 /// Columns of [`Build`], in the order [`build_from_row`] expects them.
 pub(crate) const BUILD_COLUMNS: &str = "id, app_id, node_id, source, status, \"commit\", image, \
-     image_digest, failed_phase, error, failed_step, deployment_id, \"trigger\", created_by_type, \
-     created_by_id, created_at, started_at, finished_at";
+     image_digest, failed_phase, error, failed_step, deployment_id, \"trigger\", refresh_base, \
+     created_by_type, created_by_id, created_at, started_at, finished_at";
 
 /// The durable marker of a cancel that arrived while the build was running.
 pub const CANCEL_REQUESTED: &str = "cancel requested";
@@ -257,6 +257,7 @@ pub(crate) fn build_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Build, Api
         failed_step,
         deployment_id: row.try_get("deployment_id")?,
         trigger,
+        refresh_base: row.try_get("refresh_base")?,
         created_by_type,
         created_by_id: row.try_get("created_by_id")?,
         created_at: row.try_get("created_at")?,
@@ -424,6 +425,7 @@ pub(crate) async fn start_build(
         failed_step: None,
         deployment_id: None,
         trigger: BuildTrigger::Api,
+        refresh_base: false,
         created_by_type: creator_type(actor),
         created_by_id: actor.id.clone(),
         created_at: now.clone(),

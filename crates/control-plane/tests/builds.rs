@@ -494,6 +494,18 @@ async fn a_git_app_builds_its_image_and_deploys_it() {
     )
     .await;
     assert_eq!((status, code.as_str()), (409, "conflict"));
+    // A build that refreshes its base images waits for the vulnerability
+    // epic (ADR 0150): refused, and nothing is queued.
+    let (status, code, _) = problem(
+        owner
+            .post(server.url(&format!("/api/v1/apps/{app_id}/builds")))
+            .json(&json!({ "refresh_base": true }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!((status, code.as_str()), (422, "validation_failed"));
 
     // The build is queued on the node and reaches it with the source, the
     // default limits and the decrypted secret.
@@ -504,6 +516,7 @@ async fn a_git_app_builds_its_image_and_deploys_it() {
     assert_eq!(build["app_id"], app_id);
     assert_eq!(build["node_id"], node.node_id);
     assert_eq!(build["trigger"], "api");
+    assert_eq!(build["refresh_base"], false);
     assert_eq!(build["created_by_type"], "user");
     assert!(build["commit"].is_null());
     assert!(build["error"].is_null());

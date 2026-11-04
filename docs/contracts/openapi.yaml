@@ -89,6 +89,8 @@ tags:
     description: Local persistent disks of stateful apps, one node each.
   - name: backups
     description: Encrypted backups of volumes and of the control-plane database in object storage, and their restore.
+  - name: vulnerabilities
+    description: Known vulnerabilities of app images, of Quoro's own components and of host kernels, matched against a local copy of OSV data.
 components:
   securitySchemes:
     bearerAuth:
@@ -2071,6 +2073,7 @@ components:
         - failed_step
         - deployment_id
         - trigger
+        - refresh_base
         - created_by_type
         - created_by_id
         - created_at
@@ -2143,6 +2146,11 @@ components:
           description: What started the build. Only an explicit start (`api`) in M4.
           enum:
             - api
+        refresh_base:
+          type: boolean
+          description: |
+            Whether the build resolved every base image (`FROM`) again from its
+            registry instead of reusing the builder's cached copy (ADR 0150).
         created_by_type:
           type: string
           description: Kind of identity that started the build.
@@ -2190,6 +2198,14 @@ components:
           minLength: 1
           maxLength: 255
           description: Build this branch, tag or commit instead of the source's `ref`, for this build only.
+        refresh_base:
+          type: boolean
+          default: false
+          description: |
+            Resolve every base image (`FROM`) again from its registry instead
+            of reusing the builder's cached copy, so the build picks up a
+            patched base: the "rebuild with refreshed base" action for a
+            vulnerable app (ADR 0138, ADR 0150).
     BuildLogLine:
       type: object
       title: BuildLogLine
@@ -2548,6 +2564,409 @@ components:
           type: string
           format: date-time
           description: When the primary computed these values.
+    VulnerabilitySeverity:
+      type: string
+      title: VulnerabilitySeverity
+      description: |
+        Severity from the record's CVSS base score: `critical` 9.0 or more,
+        `high` 7.0 or more, `medium` 4.0 or more, `low` above 0, `unknown`
+        when the record carries no score.
+      enum:
+        - critical
+        - high
+        - medium
+        - low
+        - unknown
+    VulnerabilityFinding:
+      type: object
+      title: VulnerabilityFinding
+      description: |
+        One vulnerability in one package of one subject: the image an app runs,
+        a component of the running Quoro release, or a node's host kernel
+        (ADR 0138, ADR 0150). Matched by the primary against its local copy of
+        OSV data; no image and no package list leaves the cluster.
+      required:
+        - id
+        - subject_kind
+        - vuln_id
+        - aliases
+        - ecosystem
+        - package
+        - installed_version
+        - fixed_version
+        - severity
+        - cvss_score
+        - kev
+        - epss
+        - first_seen_at
+        - resolved_at
+        - resolved_reason
+      properties:
+        id:
+          type: string
+          pattern: '^vln_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: Finding id.
+        subject_kind:
+          type: string
+          description: What the finding is about.
+          enum:
+            - app
+            - quoro
+            - host_kernel
+        app_id:
+          type: string
+          pattern: '^app_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: The app, when `subject_kind` is `app`.
+        image_digest:
+          type: string
+          description: Digest of the app's image the package was found in, when `subject_kind` is `app`.
+        node_id:
+          type: string
+          pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: The node, when `subject_kind` is `host_kernel`.
+        component:
+          type: string
+          description: |
+            The Quoro component, when `subject_kind` is `quoro`: a crate name,
+            or one of `guest-kernel`, `cloud-hypervisor`, `cloudflared`,
+            `buildkit`.
+        vuln_id:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: The OSV id, for example a CVE, DSA or GHSA id.
+        aliases:
+          type: array
+          items:
+            type: string
+          description: Other ids of the same vulnerability.
+        summary:
+          type: string
+          description: One-line summary from the record, when it has one.
+        ecosystem:
+          type: string
+          description: OSV ecosystem with its release, for example `Debian:13`, `Alpine:v3.22`, `npm`, `Linux`.
+        package:
+          type: string
+          description: The installed package's name.
+        source_package:
+          type: string
+          description: |
+            The source package the record names, when it differs from
+            `package` (Debian and Alpine records are keyed by source package).
+        installed_version:
+          type: string
+          description: Version installed.
+        fixed_version:
+          type: [string, 'null']
+          description: |
+            The lowest version that fixes it, when the record names one. For
+            an app built from Git, rebuilding with `refresh_base` picks it up
+            once the base image ships it; an image app needs a new upstream
+            image.
+        severity:
+          $ref: '#/components/schemas/VulnerabilitySeverity'
+        cvss_score:
+          type: [number, 'null']
+          minimum: 0
+          maximum: 10
+          description: CVSS base score, when the record carries a vector.
+        cvss_vector:
+          type: string
+          description: The CVSS vector the score comes from.
+        kev:
+          type: boolean
+          description: Whether the vulnerability is in CISA's Known Exploited Vulnerabilities catalog.
+        epss:
+          type: [number, 'null']
+          minimum: 0
+          maximum: 1
+          description: EPSS probability of exploitation, when the primary holds EPSS data.
+        upstream_version_only:
+          type: boolean
+          description: |
+            True for a host kernel matched by its upstream version: a
+            distribution kernel may carry the fix as a backport, so the finding
+            can be a false positive.
+        first_seen_at:
+          type: string
+          format: date-time
+          description: When the finding was first recorded.
+        resolved_at:
+          type: [string, 'null']
+          format: date-time
+          description: When it stopped applying; null while open.
+        resolved_reason:
+          type: [string, 'null']
+          description: Why it stopped applying; null while open.
+          enum:
+            - image_changed
+            - data_changed
+            - app_deleted
+            - node_removed
+            - upgraded
+            - null
+    VulnerabilityCounts:
+      type: object
+      title: VulnerabilityCounts
+      description: Open findings by severity, and how many of them are in the KEV catalog.
+      required:
+        - critical
+        - high
+        - medium
+        - low
+        - unknown
+        - kev
+      properties:
+        critical:
+          type: integer
+          minimum: 0
+        high:
+          type: integer
+          minimum: 0
+        medium:
+          type: integer
+          minimum: 0
+        low:
+          type: integer
+          minimum: 0
+        unknown:
+          type: integer
+          minimum: 0
+        kev:
+          type: integer
+          minimum: 0
+    VulnerabilityDataSource:
+      type: object
+      title: VulnerabilityDataSource
+      description: The age of the primary's copy of one OSV ecosystem.
+      required:
+        - ecosystem
+        - source
+        - data_modified_at
+        - refreshed_at
+        - last_error
+      properties:
+        ecosystem:
+          type: string
+          description: OSV ecosystem name.
+        source:
+          type: string
+          description: '`download` when fetched from OSV, `import` when imported offline with `quoro vuln import`.'
+          enum:
+            - download
+            - import
+        data_modified_at:
+          type: [string, 'null']
+          format: date-time
+          description: Newest record modification in the data held; the data's age.
+        refreshed_at:
+          type: [string, 'null']
+          format: date-time
+          description: When the primary last brought this ecosystem up to date.
+        last_error:
+          type: [string, 'null']
+          description: The last refresh error, cleared by a successful refresh.
+    ImageInventoryStatus:
+      type: object
+      title: ImageInventoryStatus
+      description: |
+        What is known about the packages of an app's current image. A finding
+        list is meaningful only with `status: inventoried` and the data
+        sources it needs present; otherwise the panel says so and never shows
+        "no vulnerabilities".
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          description: |
+            `inventoried`: the node sent the image's package inventory and it
+            was matched. `pending`: the image is running but no inventory
+            arrived yet. `not_inventoried`: the node found no package database
+            or manifest it can read in the image. `no_image`: the app runs no
+            image yet. `pending_data`: the inventory arrived, but an
+            ecosystem it needs is not in the primary's data yet.
+          enum:
+            - inventoried
+            - pending
+            - not_inventoried
+            - no_image
+            - pending_data
+        image_digest:
+          type: string
+          description: The digest the status is about.
+        os:
+          type: string
+          description: Distribution and release from the image's os-release, for example `debian 13`.
+        package_count:
+          type: integer
+          minimum: 0
+          description: Packages in the inventory.
+        ecosystems:
+          type: array
+          items:
+            type: string
+          description: OSV ecosystems the inventory covers.
+        not_inventoried:
+          type: array
+          items:
+            type: string
+          description: |
+            Kinds of content the node saw and could not inventory, for example
+            a static binary without build information.
+        inventoried_at:
+          type: string
+          format: date-time
+          description: When the node built the inventory.
+    AppVulnerabilities:
+      type: object
+      title: AppVulnerabilities
+      description: The vulnerability report of one app (ADR 0150).
+      required:
+        - app_id
+        - inventory
+        - counts
+        - data
+        - items
+        - next_cursor
+      properties:
+        app_id:
+          type: string
+          pattern: '^app_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: The app.
+        inventory:
+          $ref: '#/components/schemas/ImageInventoryStatus'
+        counts:
+          $ref: '#/components/schemas/VulnerabilityCounts'
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/VulnerabilityDataSource'
+          description: The data sources the report used, with their age.
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/VulnerabilityFinding'
+          description: |
+            Findings, open ones first, then by severity (KEV first within a
+            severity) and `vuln_id`.
+        next_cursor:
+          type: [string, 'null']
+          description: Cursor for the next page, or null.
+    AppVulnerabilitySummary:
+      type: object
+      title: AppVulnerabilitySummary
+      description: One app's line in the cluster summary.
+      required:
+        - app_id
+        - project_id
+        - name
+        - inventory_status
+        - counts
+      properties:
+        app_id:
+          type: string
+          pattern: '^app_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: The app.
+        project_id:
+          type: string
+          pattern: '^prj_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: Its project.
+        name:
+          type: string
+          description: The app's name.
+        inventory_status:
+          type: string
+          description: '`ImageInventoryStatus.status` of the app''s current image.'
+          enum:
+            - inventoried
+            - pending
+            - not_inventoried
+            - no_image
+            - pending_data
+        counts:
+          $ref: '#/components/schemas/VulnerabilityCounts'
+    NodeKernelVulnerabilities:
+      type: object
+      title: NodeKernelVulnerabilities
+      description: |
+        Open findings of one node's host kernel, matched by upstream version.
+        Quoro reports host kernels and never upgrades them (ADR 0138).
+      required:
+        - node_id
+        - kernel
+        - counts
+        - items
+      properties:
+        node_id:
+          type: string
+          pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: The node.
+        kernel:
+          type: string
+          description: The kernel release the node reported.
+        counts:
+          $ref: '#/components/schemas/VulnerabilityCounts'
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/VulnerabilityFinding'
+          description: Open findings, most severe first.
+    QuoroVulnerabilities:
+      type: object
+      title: QuoroVulnerabilities
+      description: |
+        Open findings of the running Quoro release's own components, from the
+        SBOM embedded in the release (packaging/README.md).
+      required:
+        - version
+        - counts
+        - items
+      properties:
+        version:
+          type: string
+          description: The running Quoro version.
+        counts:
+          $ref: '#/components/schemas/VulnerabilityCounts'
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/VulnerabilityFinding'
+          description: Open findings, most severe first.
+    VulnerabilitySummary:
+      type: object
+      title: VulnerabilitySummary
+      description: |
+        The cluster's vulnerability summary (ADR 0150). `apps` holds the apps
+        the caller can read. `quoro` and `host_kernels` are node data: they are
+        present only when the caller also holds `node:read`, with no selector
+        narrower than the whole cluster.
+      required:
+        - data
+        - apps
+        - next_cursor
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/VulnerabilityDataSource'
+          description: Every data source the primary holds, with its age.
+        apps:
+          type: array
+          items:
+            $ref: '#/components/schemas/AppVulnerabilitySummary'
+          description: One line per app, apps with critical or KEV findings first.
+        quoro:
+          $ref: '#/components/schemas/QuoroVulnerabilities'
+        host_kernels:
+          type: array
+          items:
+            $ref: '#/components/schemas/NodeKernelVulnerabilities'
+          description: One entry per node with the `node` role.
+        next_cursor:
+          type: [string, 'null']
+          description: Cursor for the next page of `apps`, or null.
     VolumeList:
       type: object
       title: VolumeList
@@ -3921,6 +4340,7 @@ components:
         - app.degraded
         - app.up
         - app.restarted
+        - app.vulnerable
         - deployment.started
         - deployment.succeeded
         - deployment.failed
@@ -8524,7 +8944,9 @@ paths:
         `app:deploy`. A node runs one build at a time; further builds wait in
         `queued`. Emits `build.started`; the outcome is `build.succeeded`,
         `build.failed` or `build.cancelled`. `conflict` (409) when the app has
-        no Git source or already has a build that is not terminal.
+        no Git source or already has a build that is not terminal. With
+        `refresh_base` the build pulls every base image again, which is how a
+        vulnerable app is rebuilt on a patched base (ADR 0150).
         `Quoro-Justification` is required when the caller is an agent (ADR 0031).
       x-quoro-scope: app:deploy
       parameters:
@@ -8888,6 +9310,105 @@ paths:
           $ref: '#/components/responses/RateLimited'
         '503':
           $ref: '#/components/responses/NotPrimary'
+  /api/v1/apps/{app_id}/vulnerabilities:
+    get:
+      tags: [vulnerabilities]
+      operationId: getAppVulnerabilities
+      summary: Read an app's vulnerability report
+      description: |
+        The known vulnerabilities of the image the app currently runs, matched
+        by the primary against its local copy of OSV data (ADR 0138, ADR 0150).
+        The node that prepared the image sent its package inventory; the image
+        never leaves the node. `inventory` says whether the image could be
+        inventoried, and `data` how old the vulnerability data is, so an empty
+        `items` is read together with them. Resolved findings are listed only
+        with `include_resolved`.
+      x-quoro-scope: app:read
+      parameters:
+        - $ref: '#/components/parameters/AppId'
+        - name: severity
+          in: query
+          required: false
+          description: Only findings of this severity or more severe.
+          schema:
+            $ref: '#/components/schemas/VulnerabilitySeverity'
+        - name: kev
+          in: query
+          required: false
+          description: Only findings in the KEV catalog.
+          schema:
+            type: boolean
+        - name: include_resolved
+          in: query
+          required: false
+          description: Also list resolved findings of the app, newest first after the open ones.
+          schema:
+            type: boolean
+            default: false
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: The app's report, with one page of findings.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppVulnerabilities'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /api/v1/vulnerabilities:
+    get:
+      tags: [vulnerabilities]
+      operationId: getVulnerabilitySummary
+      summary: Read the cluster's vulnerability summary
+      description: |
+        Open findings across the cluster (ADR 0150): one line per app the
+        caller can read, filtered by the caller's selector like any list
+        (permission-model.md section 5), plus the running Quoro release's own
+        components and every node's host kernel. Those two parts are node
+        data and are present only when the caller also holds `node:read` with
+        no narrower selector; otherwise they are left out, never refused.
+        `data` lists every data source the primary holds, with its age.
+      x-quoro-scope: app:read
+      parameters:
+        - name: project_id
+          in: query
+          required: false
+          description: Only apps of this project.
+          schema:
+            type: string
+            pattern: '^prj_[0-9A-HJKMNP-TV-Z]{26}$'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: The summary, with one page of apps.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VulnerabilitySummary'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '429':
+          $ref: '#/components/responses/RateLimited'
   /api/v1/apps/{app_id}/backups:
     get:
       tags: [backups]

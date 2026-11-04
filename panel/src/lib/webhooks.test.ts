@@ -79,6 +79,7 @@ describe('eventTypesBySubject', () => {
       'app.degraded',
       'app.up',
       'app.restarted',
+      'app.vulnerable',
     ]);
   });
 });
