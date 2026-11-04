@@ -210,7 +210,7 @@ The values above are carried in `welcome` (`heartbeat_interval_ms`, `session_tim
 
 The primary marks the node `disconnected` after 15 s without any frame from it and emits `node.disconnected` with `data.reason` either `heartbeat_timeout` (no frame within the timeout) or `session_closed` (the socket closed or the server ended the session). A node that reconnects is `connected` again and the primary emits `node.connected`.
 
-The node redials with exponential backoff from 1 s doubling to 60 s with full jitter, and resets the backoff after a session that stayed up for at least 60 s. A `fatal` error stops redialing until an operator acts, except for `unsupported_version`, where the node keeps dialing (an upgraded primary may accept it) but logs the mismatch locally.
+The node redials with exponential backoff from 1 s doubling to 60 s with full jitter, and resets the backoff after a session that stayed up for at least 60 s. One redial attempt dials `primary_url` and, when that fails, each URL the primary advertised in `welcome.primary_urls` in order (section 5.10); the backoff applies between attempts, not between the URLs of one attempt. A `fatal` error stops redialing until an operator acts, except for `unsupported_version`, where the node keeps dialing (an upgraded primary may accept it) but logs the mismatch locally.
 
 ## 5. Message reference
 
@@ -589,6 +589,11 @@ A `lease_revoke` whose fence failed:
 | `heartbeat_interval_ms` | integer | yes | 5 000 in v1 |
 | `session_timeout_ms` | integer | yes | 15 000 in v1 |
 | `primary_node_id` | string (`nod_`) | yes | The node holding the primary status |
+| `primary_urls` | array of string | no | Other base URLs where the primary's listener can be reached, best first; at most 8 (ADR 0139) |
+
+**`primary_urls`.** The primary fills the list with its `public_url` when one is configured, then `https://<address>:<port>` for each non-loopback, non-link-local address of its host (IPv6 in brackets), then `https://<host name>.local:<port>` when that name resolves on the host, where `<port>` is the listener's port. Addresses of the node bridge are left out. Every entry is an `https://` base URL with no path. The field is optional and additive (section 3.4): a primary that does not send it, or sends an empty list, is valid, and a node that does not know it ignores it.
+
+The node keeps the list next to `primary_url` in its identity (section 12). It drops every entry that is not an `https://` URL and every duplicate, keeps the first 8, and replaces the stored list only when the result differs; a `welcome` without the field leaves the stored list as it is. When a dial to `primary_url` fails (the TCP connection, the TLS handshake against the pinned fingerprint, or the WebSocket upgrade), the node tries the stored URLs in order, with the same pinned fingerprint and the same credential, before it waits out the redial backoff (section 4.4). The first one whose session reaches `welcome` becomes the node's `primary_url` and is persisted. The pin and the credential never change: a host that does not hold the primary's private key cannot complete the handshake, so a stale or hostile entry costs one failed dial and nothing else. A `401` or `403` on the upgrade from a host that passed the pin is fatal as on `primary_url`. An operator can also point a node at a new address by hand with `quoro node set-primary <url>`, which completes a pinned handshake before it writes anything.
 
 ```json
 {
@@ -602,7 +607,12 @@ A `lease_revoke` whose fence failed:
     "server_time": "2026-11-02T10:15:30Z",
     "heartbeat_interval_ms": 5000,
     "session_timeout_ms": 15000,
-    "primary_node_id": "nod_01JC9Z0000000000000000000Q"
+    "primary_node_id": "nod_01JC9Z0000000000000000000Q",
+    "primary_urls": [
+      "https://quoro.example.com:8443",
+      "https://192.0.2.10:8443",
+      "https://[2001:db8::10]:8443"
+    ]
   }
 }
 ```
@@ -1530,6 +1540,6 @@ The node keeps a SQLite file, owned by root, that holds everything it needs to r
 | `builds` (M4) | Per build: `bld_` id, app, status, phase, resolved commit, image digest, failed step, the path of its log file, start and end times | Reports build progress in `status_report` across an agent restart; keeps the logs of the last 20 builds of each app (section 6.6) |
 | `transcripts` (M4) | Per terminal session: `trm_` id, VM, file path, size, SHA-256, start and end times | Serves `stream_open` kind `transcript` and enforces retention: 30 days and 1 GiB per node, oldest removed first (`audit-log-format.md` section 3.3) |
 
-Outside the SQLite file, in the VM's runtime directory, each VM also has its serial ring: two segments of 512 KiB that keep the newest serial output across VMM restarts (`engine-trait.md` section 3.19). The ring is removed with the VM. Metric samples are never stored: they live in memory only (section 5.17).
+Outside the SQLite file, next to the credential and the node's private key, the node keeps its identity file: `node_id`, `cluster_id`, `primary_url`, the URLs advertised in `welcome.primary_urls` (at most 8, section 5.10), the pinned certificate fingerprint, and the cluster public key with its `key_id`. It is written `0600` through a temporary file renamed into place, so a half-written identity is never read. Also outside the SQLite file, in the VM's runtime directory, each VM also has its serial ring: two segments of 512 KiB that keep the newest serial output across VMM restarts (`engine-trait.md` section 3.19). The ring is removed with the VM. Metric samples are never stored: they live in memory only (section 5.17).
 
 The store is the reason a node can be restarted, upgraded or disconnected without stopping apps: it holds the signed intent, the applied reality, and the fencing state, and nothing in it depends on the control plane being reachable.
