@@ -12,8 +12,9 @@ Requirements: Linux on x86_64 (`x86_64-unknown-linux-musl` is the only published
 target for now), root, systemd running, and `curl`, `tar`, `gzip`, `sha256sum`,
 `install`, `mktemp`, `cmp`, `systemctl` and `grep` on the host; a primary also
 needs `useradd` for its system account. The engine also needs `mkfs.ext4`
-(e2fsprogs), `ip` (iproute2) and `nft` (nftables): when one is missing the
-installer runs `apt-get update` and then installs the three packages from apt
+(e2fsprogs), `ip` (iproute2) and `nft` (nftables), and Git builds need `git`,
+which the node agent runs to fetch the app's commit: when one is missing the
+installer runs `apt-get update` and then installs the four packages from apt
 without recommends; without `apt-get` it stops and names the missing tool.
 `/dev/kvm` is required at run time: the installer warns when it is absent (the
 node agent then refuses to start the engine), so the files can still be
