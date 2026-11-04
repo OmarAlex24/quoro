@@ -1445,7 +1445,8 @@ components:
       title: App
       description: |
         A deployable service. It runs as one microVM per instance (D-0008); in
-        M1-M4 an app has one instance. `ha_policy` exists from M0; M5a accepts
+        M1-M4 an app has one instance, and from M5a a stateless app runs
+        `replicas` instances, one per node (ADR 0142). `ha_policy` exists from M0; M5a accepts
         `none` and `cold` (ADR 0020, ADR 0147). An app either deploys images
         given by reference (`source` null) or builds them from a Git source
         (ADR 0117). An app is stateful exactly when it has a volume (ADR 0145).
@@ -1456,6 +1457,7 @@ components:
         - stateful
         - ha_policy
         - backup_schedule
+        - replicas
         - image
         - port
         - health_check
@@ -1499,6 +1501,15 @@ components:
             - hot
         backup_schedule:
           $ref: '#/components/schemas/BackupSchedule'
+        replicas:
+          type: integer
+          minimum: 1
+          maximum: 64
+          description: |
+            Instances of the app, at most one per node (ADR 0142). Only a
+            stateless app may have more than one. Changing it is a state
+            change, not a deployment: the scheduler adds or removes instances
+            on eligible nodes.
         ha_cost:
           description: |
             What each HA policy costs this app, computed by the primary. Absent
@@ -1645,6 +1656,17 @@ components:
             - hot
         backup_schedule:
           $ref: '#/components/schemas/BackupSchedule'
+        replicas:
+          type: integer
+          minimum: 1
+          maximum: 64
+          default: 1
+          description: |
+            Instances of the app, one per node (ADR 0142). More than the
+            eligible nodes (connected nodes with the `node` role, narrowed by
+            `placement.node_ids`) answers `validation_failed`; more than 1
+            with a `source`, or while no machine with the `edge` role is
+            enrolled, answers `conflict` (409).
         health_check:
           $ref: '#/components/schemas/HealthCheck'
         resources:
@@ -1686,6 +1708,16 @@ components:
             - hot
         backup_schedule:
           $ref: '#/components/schemas/BackupSchedule'
+        replicas:
+          type: integer
+          minimum: 1
+          maximum: 64
+          description: |
+            New instance count (ADR 0142). More than the eligible nodes answers
+            `validation_failed`; more than 1 for a stateful app, for an app
+            with a Git source (its built image exists only on the node that
+            built it), or while no machine with the `edge` role is enrolled,
+            answers `conflict` (409).
         health_check:
           $ref: '#/components/schemas/HealthCheck'
         resources:
@@ -3886,6 +3918,7 @@ components:
         - app.updated
         - app.deleted
         - app.down
+        - app.degraded
         - app.up
         - app.restarted
         - deployment.started
@@ -6025,6 +6058,10 @@ paths:
         separate call. `ha_policy` other than `none`, and `stateful: true`, are
         refused with `validation_failed`: an app becomes stateful, and may then
         switch to `cold`, once a volume is created for it (ADR 0145).
+        `replicas` larger than the number of eligible nodes is refused with
+        `validation_failed`, never placed on fewer nodes (ADR 0142); more than
+        1 is refused with `conflict` for an app with a `source`, or while no
+        machine with the `edge` role is enrolled.
         `Quoro-Justification` is required when the caller is an agent (D-0031).
       x-quoro-scope: app:create
       parameters:
@@ -6098,8 +6135,13 @@ paths:
         Changes settings, not the image: a new image is rolled out as a deployment.
         `ha_policy: cold` needs a stateful app and a backup repository
         (`conflict`, 409, otherwise); `warm` and `hot` are refused with
-        `validation_failed` until M5b and M6 (ADR 0020). `Quoro-Justification`
-        is required when the caller is an agent (D-0031).
+        `validation_failed` until M5b and M6 (ADR 0020). A new `replicas`
+        adds or removes instances without a deployment; it is refused with
+        `validation_failed` above the eligible nodes, and with `conflict` above
+        1 for a stateful app, for an app with a Git source, or while no
+        machine with the `edge` role is enrolled (ADR 0142, ADR 0143). Going from 1 to more replicas, or back,
+        moves the app's domains between its node and the edge. `Quoro-Justification` is required
+        when the caller is an agent (D-0031).
       x-quoro-scope: app:update
       parameters:
         - $ref: '#/components/parameters/AppId'
@@ -6359,6 +6401,9 @@ paths:
       description: |
         Full replacement: variables not listed are removed, so an empty list clears
         the environment. Values are write-only and never returned by any read.
+        The names `QUORO_INSTANCE_ID` and `QUORO_NODE_ID` are reserved from M5a:
+        the node sets them in every instance to its VM id and its node id
+        (ADR 0142), and a list that names either answers `validation_failed`.
         `Quoro-Justification` is required when the caller is an agent (D-0031).
       x-quoro-scope: app:update
       parameters:
@@ -6437,6 +6482,10 @@ paths:
         required when the caller is an agent (D-0031). An app with a Git source
         deploys only what it builds: this call answers `conflict` (409) for it, and
         a new image comes from `POST /api/v1/apps/{app_id}/builds` (ADR 0117).
+        An app with more than one replica is deployed one node at a time: the
+        next node's instance is replaced only after the previous node's new
+        instance passes its health check, so the edge always has an instance
+        to send requests to (ADR 0142).
       x-quoro-scope: app:deploy
       parameters:
         - $ref: '#/components/parameters/AppId'
@@ -6574,8 +6623,12 @@ paths:
         Adds a domain. TLS is obtained with ACME for a public-IP host or provided by
         a Cloudflare Tunnel for a host behind NAT (D-0024). The domain records the
         provider that manages its DNS records (`provider_id`, D-0095). A hostname
-        already routed elsewhere is refused with `conflict`. `Quoro-Justification` is
-        required when the caller is an agent (D-0031).
+        already routed elsewhere is refused with `conflict`. From M5a a domain of
+        an app with `replicas` above 1 is served by the cluster's edge: its DNS
+        record or tunnel rule points at the edge, which balances over the app's
+        instances (ADR 0143). A domain of an app with one replica is served by
+        the node of its instance, as before.
+        `Quoro-Justification` is required when the caller is an agent (D-0031).
       x-quoro-scope: app:update
       parameters:
         - $ref: '#/components/parameters/AppId'

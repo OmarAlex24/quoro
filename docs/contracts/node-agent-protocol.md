@@ -76,6 +76,8 @@ The call is `x-quoro-scope: public`: the node has no credential yet and the join
 | `capacity` | object | yes | `cpus`, `memory_mb`, `disk_gb` |
 | `kvm` | object | yes | `available` (bool), `kernel` (string), `nested` (bool, optional) |
 
+**Edge-only machines (M5a, ADR 0143).** A machine that enrolls with `roles: ["edge"]` runs no engine and starts no VM, so it needs no KVM: it reports the probe as it finds it (usually `available: false`), and the primary never places a VM on it. A machine with the `node` role still needs KVM to run VMs; `node` and `edge` may combine on one machine.
+
 The `kvm` object is filled from a probe at enrollment: `/dev/kvm` exists and is writable, a `vmx`/`svm` flag is present in the CPU flags, and the kernel release is recorded. The probe procedure follows `docs/research/vps-nested-virt.md`; presence of `/dev/kvm` alone does not prove that a guest can start, so the first real boot is the confirmation and a failed boot is reported as a deployment failure in the `boot` phase.
 
 ### 2.4 Enroll response
@@ -236,6 +238,7 @@ All bodies are objects. Field names are snake_case. Timestamps are RFC 3339 UTC 
 | `allocated` | object | yes | Same shape, currently allocated |
 | `kvm` | object | yes | `available`, `kernel`, `nested` (optional) |
 | `dropped_events` | integer | yes | Local events dropped from the buffer since the last successful delivery; 0 when none |
+| `mesh_public_key` | string | no | Base64 WireGuard public key of this machine (32 bytes), from M5a (ADR 0144). The machine generates the key pair on its first M5a start and keeps the private key next to its credential; only the public key is ever sent. The primary stores it in `nodes.mesh_public_key` and uses it in other machines' `spec.mesh.peers` |
 | `volume_snapshot` | string | no | How this node snapshots a volume (ADR 0146): `reflink` when its data directory supports `FICLONE`, otherwise `pause_copy`. Probed once at agent start (`engine-trait.md` section 3.16). Absent from an agent older than M5a, which the primary treats as a node that cannot hold a volume |
 
 Each lease entry:
@@ -279,6 +282,7 @@ Each lease entry:
     "allocated": { "cpus": 2, "memory_mb": 2048, "disk_gb": 20 },
     "kvm": { "available": true, "kernel": "6.11.2", "nested": true },
     "dropped_events": 0,
+    "mesh_public_key": "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=",
     "volume_snapshot": "pause_copy"
   }
 }
@@ -319,6 +323,7 @@ Each lease entry:
 | `builds` | array of object | no | One entry per build in the node's current `spec.builds` (section 5.11); absent or empty when there is none (ADR 0117) |
 | `volumes` | array of object | no | One entry per volume in the node's current `spec.volumes`, plus one per volume file the node holds that `spec.volumes` does not name (ADR 0145); absent or empty when there is none |
 | `backups` | array of object | no | One entry per job in the node's current `spec.backups` (ADR 0147); absent or empty when there is none |
+| `edge_backends` | array of object | no | On a machine with the `edge` role: one entry per backend of `spec.edge.routes` (ADR 0143); absent or empty otherwise |
 
 VM entry: `vm_id` (string, `vm_`), `observed_status` (one of `creating`, `stopped`, `starting`, `running`, `stopping`, `crashed`, `deleted`, `unknown`), `health` (`passing`, `failing`, `unknown`), `ip` (string, optional), `restart_count` (integer), `last_exit_code` (integer, optional).
 
@@ -365,6 +370,20 @@ Backup entry:
 | `error` | string | no | On `failed`: one-line reason, at most 2 000 characters; `lease_mismatch` when the job's token is not the node's (section 6.7) |
 | `started_at` | string | no | When the node left `queued` |
 | `finished_at` | string | no | When the node finished its part |
+
+Edge backend entry:
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `app_id` | string (`app_`) | yes | App of the backend |
+| `vm_id` | string (`vm_`) | yes | The instance |
+| `node_id` | string (`nod_`) | yes | Node that runs it |
+| `in_rotation` | boolean | yes | Whether the edge sends it requests |
+| `since` | string | yes | When `in_rotation` last changed, or when the edge first saw the backend |
+| `reason` | string | no | When out of rotation: `health_check` (its probe failed `failures` times in a row) or `connect_failed` (a request could not connect or was reset) |
+| `last_error` | string | no | One line from the last failed probe or connection, at most 500 characters |
+
+The primary does not store edge backend health. It keeps the newest report, shows it, and turns changes into events: `app.degraded` while some but not all instances of an app are out of rotation, `app.down` with `check: edge_health` when none is left, and `app.up` when every instance is back (`events.schema.json`).
 
 The primary owns the `volumes` and `backups` tables and the `backup.*` and `restore.*` events, as it does for builds: it applies each reported change to the row, seals a reported `succeeded` backup (`backup-format.md` section 6.2), and emits the events. A node emits no `backup.*` or `restore.*` event of its own. A volume reported `deleted` is removed from the `volumes` table and leaves `spec.volumes` in the next revision. An `orphaned` volume is kept and never deleted by the protocol (section 6.7).
 
@@ -659,7 +678,7 @@ The node keeps the list next to `primary_url` in its identity (section 12). It d
 | `rev` | integer | yes | Monotonic revision of the node's desired state |
 | `issued_at` | string | yes | When the primary produced it |
 | `term` | integer | yes | Cluster term at issue time |
-| `spec` | object | yes | `vms`, `routes`, `network`, `ingress` when the node runs a tunnel, `builds` when the node has builds to run (ADR 0117), `volumes` when the node holds volumes (ADR 0145), and `backups` with `backup_repository` when it has backup jobs (ADR 0147) |
+| `spec` | object | yes | `vms`, `routes`, `network`, `ingress` when the node runs a tunnel, `builds` when the node has builds to run (ADR 0117), `volumes` when the node holds volumes (ADR 0145), `backups` with `backup_repository` when it has backup jobs (ADR 0147), `mesh` once the machine is on the mesh, and `edge` on a machine with the `edge` role (ADR 0143, ADR 0144). An edge-only machine gets `vms` and `routes` as empty lists and no `network` |
 | `signature` | string | yes | Base64 Ed25519 signature by the cluster signing key |
 
 **Signature.** The signature covers the RFC 8785 (JSON Canonicalization Scheme) serialization of the whole `body` object with the `signature` member removed. The node verifies it against `cluster_public_key` before it parses anything else, persists the verified snapshot atomically, answers `command_result` with `ok`, and only then reconciles. An invalid signature is answered with `error` code `bad_signature` and the snapshot is discarded; the node keeps running on its previously stored snapshot.
@@ -682,7 +701,7 @@ The node keeps the list next to `primary_url` in its identity (section 12). It d
 | `memory_mb` | integer | yes | Memory in MiB |
 | `disk_gb` | integer | yes | Root disk size |
 | `port` | integer | no | Container port the app listens on |
-| `env` | object | yes | Environment values, decrypted for this node; `{}` when none |
+| `env` | object | yes | Environment values, decrypted for this node; `{}` when none. It never holds `QUORO_INSTANCE_ID` or `QUORO_NODE_ID`: the node adds those (section 6.10) |
 | `health_check` | object | no | `path`, `interval_s`, `timeout_s`, `failures` |
 | `desired_status` | string | yes | `running` or `stopped` |
 | `restart_generation` | integer | yes | Incremented by the primary on an explicit restart |
@@ -697,7 +716,7 @@ The node keeps the list next to `primary_url` in its identity (section 12). It d
 | --- | --- | --- | --- |
 | `hostname` | string | yes | Host to serve |
 | `app_id` | string (`app_`) | yes | App behind the route |
-| `vm_ids` | array of string | yes | Candidate backends, one per app replica |
+| `vm_ids` | array of string | yes | Candidate backends on this node. From M5a a node gets routes only for apps with one replica, so this holds one VM; the routes of apps with more replicas go to the edge (`spec.edge`) |
 | `port` | integer | yes | Backend port |
 | `tls_mode` | string | yes | `acme` or `tunnel` |
 | `domain_id` | string (`dom_`) | no | The domain this route serves (`domains.id`); filled by the primary for every route it builds from a domain |
@@ -770,7 +789,44 @@ A build stays in `spec.builds` until the primary has recorded the terminal statu
 
 **Backup keys and credentials.** The node gets the chunk keys of one app per job and never the repository key, so it can read and write only that app's backups (`backup-format.md` section 3). `id_key`, `data_key` and `secret_access_key` are handled like `env`: plaintext only inside the signed snapshot on the session, encrypted with the node-local key at rest, never logged, and dropped from the node's store when the field leaves desired state. The primary sends the bucket credential only while the node has a job; the credential of the off-site audit copy never reaches a node.
 
-**`spec.network`:** `subnet` (CIDR for the node bridge) and `gateway` (address on that bridge). The addresses in `status_report` must fall inside the subnet.
+**`spec.network`:** `subnet` (CIDR for the node bridge) and `gateway` (address on that bridge). The addresses in `status_report` must fall inside the subnet. From M5a the subnet is the node's own (`nodes.subnet`, ADR 0144), so two nodes never share one; absent on a machine without the `node` role. A changed subnet is applied as section 6.9 describes.
+
+**`spec.mesh`** (optional; ADR 0144):
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `address` | string | yes | This machine's mesh address, `nodes.mesh_address`, with prefix length `/16` |
+| `listen_port` | integer | yes | UDP port the interface listens on; 51820 unless the operator changed it |
+| `peers` | array of object | yes | The other end of each tunnel; on a node only the edge, on the edge every node with the `node` role (a star in M5a) |
+| `allow` | array of object | yes | On a node: what the edge may reach through the interface, one `{ "source": <edge mesh address>, "address": <guest address>, "port": <integer> }` per backend of this node; `[]` on the edge |
+
+Each peer:
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `node_id` | string (`nod_`) | yes | The peer machine |
+| `public_key` | string | yes | Its `mesh_public_key` |
+| `endpoint` | string | no | `host:port` to dial; absent for a peer behind NAT, which dials this machine instead |
+| `allowed_ips` | array of string | yes | CIDRs routed to the peer: on the edge, a node's mesh address `/32` and its guest subnet; on a node, the edge's mesh address `/32` |
+| `persistent_keepalive_s` | integer | no | Keepalive interval, set by the primary for a machine behind NAT; 25 by default |
+
+**`spec.edge`** (optional; on a machine with the `edge` role; ADR 0143):
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `routes` | array of object | yes | One per hostname the edge serves |
+| `tunnel` | object | no | The edge's own tunnel, same shape and handling as `spec.ingress.tunnel`; present when the edge serves `tunnel` routes |
+
+Each edge route:
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `hostname` | string | yes | Host to serve |
+| `domain_id` | string (`dom_`) | yes | The domain, for `certificate.*` events as in `spec.routes` |
+| `app_id` | string (`app_`) | yes | App behind the route |
+| `tls_mode` | string | yes | `acme` or `tunnel` |
+| `health_check` | object | yes | The app's `path`, `interval_s`, `timeout_s`, `failures` |
+| `backends` | array of object | yes | One per instance: `{ "vm_id", "node_id", "address", "port" }`, where `address` is the instance's guest address in its node's subnet and `port` the app port |
 
 **`spec.ingress`** (optional; absent when the node runs no tunnel):
 
@@ -1337,12 +1393,12 @@ The node always acts on the newest verified snapshot in its local store. It neve
 
 An apply run always follows this order, whatever changed:
 
-1. **Network.** Ensure the bridge, subnet and gateway from `spec.network`, and the per-VM TAP devices. Each VM is attached with its `project_id` as its isolation group, so the VMs of one project reach each other and VMs of different projects do not (`engine-trait.md` section 3.3, D-0084). The DNS servers handed to guests come from the node's own configuration, not from `spec.network`.
+1. **Network.** Ensure the mesh interface, its peers and its `allow` rules from `spec.mesh` (section 6.9), then the bridge, subnet and gateway from `spec.network`, and the per-VM TAP devices. Each VM is attached with its `project_id` as its isolation group, so the VMs of one project reach each other and VMs of different projects do not (`engine-trait.md` section 3.3, D-0084). The DNS servers handed to guests come from the node's own configuration, not from `spec.network`.
 2. **Images.** Prepare every image referenced by a VM whose rootfs is missing or has a different digest, and remove rootfs images no longer referenced. An image whose VM carries `build_id` is never pulled: it was prepared by the build's `importing` step (section 6.6); if it is gone, the deployment fails in phase `pull` with the error that the built image is no longer on this node. A root disk is referenced while a VM in `spec.vms` or a build in `spec.builds` names it.
 3. **Stop.** Stop VMs that are no longer desired, or whose spec requires a recreate (image digest, disk size, network identity, attached volumes).
 4. **Volumes, then start.** Create the file of every `present` volume that has none, or write it from its `restore`, and remove the file of every `deleted` volume that no VM uses any more (section 6.7). Then start desired VMs that are not running. A VM whose volume is not `ready` on this node stays `stopped`; volume work never delays a VM that attaches no volume.
 5. **Builds and backups.** Start the next `queued` build of `spec.builds` when the node has no build running (one at a time per node by default, ADR 0118), stop a build marked `cancelled`, and report every change in `status_report.builds` (section 6.6). Builds run alongside the other steps, never block them, and are not restarted by a later apply run. Start every `spec.backups` job that is not running (section 6.7); backups also run alongside, one per volume.
-6. **Routes.** Update the reverse proxy for the hostnames in `spec.routes`, and start, replace or stop the tunnel connector to match `spec.ingress.tunnel`. Certificates for `acme` routes are obtained in the background through `dns_challenge` (section 5.22); a route keeps serving its previous certificate until a new one is issued.
+6. **Routes.** Update the reverse proxy for the hostnames in `spec.routes` and, on an edge, `spec.edge.routes` (section 6.8), and start, replace or stop the tunnel connectors to match `spec.ingress.tunnel` and `spec.edge.tunnel`. Certificates for `acme` routes are obtained in the background through `dns_challenge` (section 5.22); a route keeps serving its previous certificate until a new one is issued.
 
 The order exists so that a VM never starts on a network that is not ready, and no route points at a VM that is being replaced. It is the reconciliation described in D-0011 and the deployments in D-0033.
 
@@ -1405,6 +1461,30 @@ A volume is a sparse raw file in the node's data directory, named by its `volume
 - **Never by absence.** The node never removes a volume file because `spec.volumes` does not name it. Such a file is reported `orphaned` and kept until a `deleted` entry names it or someone with root on the node removes it, as section 10 does for a removed node.
 - **Backup.** For each job of `spec.backups`, the node first checks that it holds the app's lease in state `held` with the job's `fencing_token`; otherwise it reports the backup `failed` with `lease_mismatch`. It then takes the snapshot with its method (`engine-trait.md` section 3.16), pausing `vm_id` for `pause_copy`, reports `running`, chunks and uploads the snapshot, writes the manifest and deletes the snapshot file (`backup-format.md` section 7.1). It reports `succeeded` with the manifest's key and digest, or `failed` with the reason. A job leaves `spec.backups` once the primary has recorded its terminal status; an agent restart while a backup runs fails it with `node agent restarted`, and the snapshot file is deleted at start.
 - **Writes carry the token.** Every object a backup job writes is part of a backup that the primary seals only if the job's token is still the app's current token (`backup-format.md` section 6.2). A node that lost its lease while uploading therefore wastes storage, never a valid backup (section 8.6).
+
+### 6.8 The edge
+
+A machine with the `edge` role runs the embedded proxy for `spec.edge.routes` (ADR 0143). It needs no engine; on an edge-only machine the apply loop runs only steps 1 and 6.
+
+- **Health.** For each backend the edge probes `health_check.path` over the mesh every `interval_s`, with `timeout_s`. A backend leaves the rotation after `failures` consecutive failed probes and returns after the same number of consecutive passes. A request that cannot connect, or whose connection is reset before a response, takes the backend out at once with reason `connect_failed`; it returns through the probes. A backend the edge has not probed yet starts in rotation.
+- **Balancing.** Round robin over the backends in rotation, with no stickiness. A request that fails to connect is retried once on another backend, and only for `GET` and `HEAD`, so no other request is ever sent twice. With no backend in rotation the edge answers `502`.
+- **Timeouts.** A connect timeout of 5 s and a response-header timeout of 60 s per request, so a backend that accepts and hangs cannot hold a connection forever.
+- **Without the primary.** The edge keeps its last verified desired state on disk like a node (section 6.1, ADR 0011) and keeps probing and balancing. Its health decisions are its own: they change no replicated state, and they reach the primary only as `status_report.edge_backends`.
+- **TLS.** `acme` routes take certificates through `dns_challenge` (section 5.22), exactly as on a node; `tunnel` routes are served from the edge's tunnel.
+
+### 6.9 The mesh
+
+The mesh is kernel WireGuard driven over netlink, with no `wg` or `wg-quick` process (ADR 0063, ADR 0144). In M5a it is a star: the edge has one peer per node, and every node has the edge as its only peer.
+
+- **Keys.** The machine generates its WireGuard key pair on its first M5a start, keeps the private key root-only next to its credential, and sends the public key in `hello`. A machine never receives another machine's private key.
+- **Interface.** The node agent creates the WireGuard interface `quoro-wg0` with `address`, `listen_port` and `peers`, and keeps it equal to them on every apply. A peer that disappears from `peers` is removed. On the edge, the kernel routes each node's guest subnet to that node's peer through `allowed_ips`.
+- **Firewall.** On a node, traffic that arrives on the mesh interface is dropped unless it comes from an `allow` entry's `source` and goes to its `address` and `port` over TCP. The mesh carries no traffic between guests and none to the host's own services; the isolation of guests from each other (ADR 0084) is unchanged.
+- **NAT.** A machine behind NAT has no `endpoint` in the other side's peer entry; it dials the peer that has one and keeps the tunnel open with `persistent_keepalive_s`. WireGuard follows a peer whose address changed (roaming), which also covers a node whose address changed after a reboot.
+- **A changed subnet.** When `spec.network.subnet` differs from the subnet of the node's bridge, the node does not reconfigure that bridge (`engine-trait.md` section 3.3 refuses it with `Conflict`). It ensures a second bridge with the new subnet and gateway, keeps its running VMs on the old bridge with their old addresses, and creates every new or redeployed VM on the new one. The old bridge stays, without VMs, until the host restarts: the engine has no call that removes a network in M5a. VMs that only restart in place keep their address; a redeploy moves them (ADR 0144, like ADR 0136).
+
+### 6.10 Instance identity
+
+When it creates an app instance, the node adds two variables to its environment, after the app's own `env`: `QUORO_INSTANCE_ID` (the VM's `vm_` id) and `QUORO_NODE_ID` (the node's `nod_` id). The names are reserved: the API refuses them in an app's environment, and if a snapshot from an older primary carries either one, the node's value wins. They are not secrets and may appear in logs.
 
 ## 7. Change-log follow
 
@@ -1573,7 +1653,7 @@ M0 ships the protocol, not the HA feature: the messages, the four node-side stat
 | M2 | Primary | `local` | Enrolls, follows the change log, reconciles desired state, emits events |
 | M3 | Primary | `local` | Same; the agent-driven calls arrive as desired-state changes from the API and MCP |
 | M4 | Primary | `local` | Adds builds in desired state, build-log, metrics, terminal, console and transcript streams, `stream_input` and `stream_ack`; leases unchanged |
-| M5a | Primary | `local` | Local volumes, with a `local` lease granted at placement; backup jobs carrying the lease token; restores that move the lease to the target node (section 6.7); operator declaration of a lost node adds a lease revoke with a new token |
+| M5a | Primary | `local` | Local volumes, with a `local` lease granted at placement; backup jobs carrying the lease token; restores that move the lease to the target node (section 6.7); operator declaration of a lost node adds a lease revoke with a new token. Replicas take no lease: they are stateless. The edge and the mesh (sections 6.8 and 6.9) hold no lease either |
 | M5b | Primary plus witness quorum or external arbiter | `local`, `expiring` (`warm`) | Warm: renewal loop, `uncertain` handling, replication writes carrying tokens, restart persistence of held leases (section 8.4), concurrent fences (section 8.5) |
 | M6 | Quorum | `local`, `expiring` (`warm`, `hot`) | Automatic failover and `hot`; the same messages also carry `resource_type: primary` leases |
 
@@ -1615,6 +1695,7 @@ Threats and their mitigations are in `../architecture/threat-model.md`; this sec
 - **Terminal and console relay (M4).** The primary never touches a VM socket: it authorizes, audits and relays bytes between a client WebSocket and this session (ADR 0113, ADR 0114). The node agent, already root and already the only reader of VM sockets, is the only process that connects to a VM's vsock socket and its serial socket; both live in the VM's runtime directory, which only root can enter. The node never creates a `<socket>_<port>` listener, so a guest cannot open a vsock connection to the host. The guest is untrusted: the node bounds every frame it reads from it and treats its output as bytes, never as protocol. A `terminal` stream exists only because the primary opened it; a node never starts an exec session on its own.
 - **Builds (M4).** A build runs untrusted code: the Dockerfile and everything it fetches. It runs only inside a builder microVM, with `egress_only` networking and no isolation group (section 6.6), never on the host. Build secrets reach the node only inside the signed desired state, reach the builder VM only on its ephemeral source disk, which the node deletes when the build ends, and live in the guest only in memory as BuildKit secret files; the node never writes them to a build log, a `stream_data` or an event. The node never mounts a disk the builder VM wrote: it reads the output layout as a tar stream in user space and never touches the cache disk's contents. The built image never leaves the node: it is imported locally and never pushed.
 
+- **Edge and mesh (M5a).** Besides the certificates of the routes it serves, the edge holds its tunnel token and its WireGuard private key, and it reaches a node only through the mesh, where the node's firewall admits only the edge's mesh address and only to the guest addresses and ports of that node's backends (section 6.9). A compromised edge can read and alter the traffic of the apps it serves and probe their backends; it cannot reach other guests, the node's host services or other nodes, and it cannot change desired state. With one edge in M5a, the edge is a single point of failure for the traffic of apps with more than one replica.
 - **Volumes and backups (M5a).** A volume file is guest-written and never mounted on the host; snapshots, backups and restores handle it as bytes (section 6.7). A node receives the chunk keys of the apps it has jobs for and the bucket credential only while it has a job, never the repository key and never the audit-copy credential. A compromised node can read and overwrite nothing in the repository that it could not already read on its own disk: it can upload garbage chunks or manifests, which no seal covers and a restore refuses (`backup-format.md` section 8.1).
 
 ## 12. Local node store
@@ -1634,8 +1715,9 @@ The node keeps a SQLite file, owned by root, that holds everything it needs to r
 | `builds` (M4) | Per build: `bld_` id, app, status, phase, resolved commit, image digest, failed step, the path of its log file, start and end times | Reports build progress in `status_report` across an agent restart; keeps the logs of the last 20 builds of each app (section 6.6) |
 | `transcripts` (M4) | Per terminal session: `trm_` id, VM, file path, size, SHA-256, start and end times | Serves `stream_open` kind `transcript` and enforces retention: 30 days and 1 GiB per node, oldest removed first (`audit-log-format.md` section 3.3) |
 | `volumes` (M5a) | Per volume: `vol_` id, app, file path, size, state, last error | Reports volume states across an agent restart, and tells an `orphaned` file from one in `spec.volumes` |
+| `edge_backends` (M5a, edge) | Per backend of `spec.edge.routes`: in rotation or not, since when, reason, consecutive probe results | Lets a restarted edge resume with its last view of backend health instead of sending requests to backends it had taken out |
 | `backups` (M5a) | Per backup job: `bkp_` id, status, snapshot method, pause, manifest key and digest, sizes, error, start and end times; optionally the chunk ids the node knows the repository holds, per app | Reports backup progress across an agent restart and skips uploads of known chunks (`backup-format.md` section 5) |
 
-Outside the SQLite file, next to the credential and the node's private key, the node keeps its identity file: `node_id`, `cluster_id`, `primary_url`, the URLs advertised in `welcome.primary_urls` (at most 8, section 5.10), the pinned certificate fingerprint, and the cluster public key with its `key_id`. It is written `0600` through a temporary file renamed into place, so a half-written identity is never read. Also outside the SQLite file, in the VM's runtime directory, each VM also has its serial ring: two segments of 512 KiB that keep the newest serial output across VMM restarts (`engine-trait.md` section 3.19). The ring is removed with the VM. Metric samples are never stored: they live in memory only (section 5.17).
+Outside the SQLite file, next to the credential and the node's private key, the node keeps its WireGuard private key (from M5a, mode `0600`) and its identity file: `node_id`, `cluster_id`, `primary_url`, the URLs advertised in `welcome.primary_urls` (at most 8, section 5.10), the pinned certificate fingerprint, and the cluster public key with its `key_id`. It is written `0600` through a temporary file renamed into place, so a half-written identity is never read. Also outside the SQLite file, in the VM's runtime directory, each VM also has its serial ring: two segments of 512 KiB that keep the newest serial output across VMM restarts (`engine-trait.md` section 3.19). The ring is removed with the VM. Metric samples are never stored: they live in memory only (section 5.17).
 
 The store is the reason a node can be restarted, upgraded or disconnected without stopping apps: it holds the signed intent, the applied reality, and the fencing state, and nothing in it depends on the control plane being reachable.
