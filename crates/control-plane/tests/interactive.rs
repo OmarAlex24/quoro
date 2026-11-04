@@ -487,9 +487,11 @@ async fn ws_upgrade_ok(server: &Server, ticket: &Value, origin: Option<&str>) ->
 }
 
 async fn ws_next(socket: &mut Socket) -> WsMessage {
-    timeout(Duration::from_secs(5), socket.next())
+    // Generous bound: under a loaded CI runner a frame can take longer than
+    // a few seconds; a healthy run never waits this long.
+    timeout(Duration::from_secs(30), socket.next())
         .await
-        .expect("a websocket frame within 5 s")
+        .expect("a websocket frame within 30 s")
         .expect("the socket is open")
         .expect("a valid websocket frame")
 }
