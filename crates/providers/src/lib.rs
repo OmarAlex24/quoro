@@ -12,6 +12,8 @@
 //! them and never prints them.
 
 pub mod cloudflare;
+pub mod object_store;
+pub mod s3;
 
 use std::fmt;
 use std::future::Future;

@@ -23,6 +23,19 @@ jobs:
     name: Rust (fmt, clippy, build, test)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    # An S3-compatible server for the object-store integration tests of
+    # crates/providers (tests/s3.rs): RustFS (Apache-2.0) supports
+    # `If-None-Match: *`, versioning and object lock in compliance mode, the
+    # behaviours backups and the off-site audit copy rely on. Pinned by digest;
+    # the credentials are throwaway values that exist only in this container.
+    services:
+      rustfs:
+        image: rustfs/rustfs:1.0.4@sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2
+        ports:
+          - 19000:9000
+        env:
+          RUSTFS_ACCESS_KEY: quorotest
+          RUSTFS_SECRET_KEY: quorotestsecret
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -41,6 +54,10 @@ jobs:
       - name: Build
         run: cargo build --workspace --all-targets --locked
       - name: Test
+        env:
+          QUORO_S3_TEST_ENDPOINT: http://127.0.0.1:19000
+          QUORO_S3_TEST_ACCESS_KEY: quorotest
+          QUORO_S3_TEST_SECRET_KEY: quorotestsecret
         run: cargo test --workspace --locked
 
   deny:
