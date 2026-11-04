@@ -221,19 +221,24 @@ async fn emit_app_event(server: &Server, app_id: &str, kind: &'static str) -> St
     id
 }
 
-/// Waits until `check` returns `Some`, or panics after five seconds.
+/// Waits until `check` returns `Some`, or panics after thirty seconds; returns
+/// as soon as the condition holds.
 async fn wait_for<T, F, Fut>(mut check: F) -> T
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Option<T>>,
 {
-    for _ in 0..100 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
         if let Some(value) = check().await {
             return value;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "condition not met within thirty seconds"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    panic!("condition not met within five seconds");
 }
 
 fn signature(secret: &str, timestamp: &str, body: &[u8]) -> String {
@@ -257,6 +262,51 @@ async fn delivery_count(server: &Server, webhook_id: &str) -> i64 {
             .await
             .unwrap();
     count
+}
+
+/// Waits until the dispatcher has read its start-up cursor.
+///
+/// `dispatcher::spawn` starts at the newest event in the log, so an event
+/// emitted before that read finishes is never dispatched: a test that emits an
+/// event and then waits for its delivery races the dispatcher's start-up on a
+/// slow runner. A probe webhook makes the read observable: a probe emitted
+/// before it is lost for good, and the next probe is not, so probe until a
+/// delivery arrives. The dispatcher's own tick interval is the only clock here.
+async fn dispatcher_ready(owner: &reqwest::Client, server: &Server, app_id: &str) {
+    let (recorder, url) = start_receiver(200).await;
+    create_webhook(
+        owner,
+        server,
+        json!({
+            "name": "dispatcher-probe",
+            "url": url,
+            "event_types": ["app.created"],
+            "selector": { "apps": [app_id] },
+        }),
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        emit_app_event(server, app_id, "app.created").await;
+        // One dispatcher tick plus the POST; a probe that met the cursor read
+        // still on its way is lost, never delayed.
+        let arrived = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !recorder.requests().await.is_empty() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        if arrived.is_ok() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the webhook dispatcher never started"
+        );
+    }
 }
 
 #[tokio::test]
@@ -292,6 +342,8 @@ async fn delivers_signed_event_and_records_the_attempt() {
         None
     );
 
+    // Wait for the dispatcher's start-up cursor before the event is emitted.
+    dispatcher_ready(&owner, &server, &app_id).await;
     let event_id = emit_app_event(&server, &app_id, "app.up").await;
     let captured = wait_for(|| async {
         let captured = recorder.requests().await;
@@ -376,6 +428,7 @@ async fn failed_attempt_schedules_a_retry() {
     )
     .await;
     let webhook_id = created["id"].as_str().unwrap().to_string();
+    dispatcher_ready(&owner, &server, &app_id).await;
     emit_app_event(&server, &app_id, "app.up").await;
 
     let rows = wait_for(|| async {
@@ -444,6 +497,7 @@ async fn incident_opened_wakes_the_agent_once() {
     let webhook_id = created["id"].as_str().unwrap().to_string();
 
     // A detection event, the incident it opened, then `incident.opened`.
+    dispatcher_ready(&owner, &server, &app_id).await;
     let trigger = emit_app_event(&server, &app_id, "app.down").await;
     let incident_id = quoro_types::new_id(quoro_types::Prefix::Incident);
     let mut w = server.state.store.begin_write().await.unwrap();
@@ -644,6 +698,7 @@ async fn two_wake_webhooks_get_their_own_grant() {
         ids
     };
 
+    dispatcher_ready(&owner, &server, &app_id).await;
     let trigger = emit_app_event(&server, &app_id, "app.down").await;
     let incident_id = quoro_types::new_id(quoro_types::Prefix::Incident);
     let mut w = server.state.store.begin_write().await.unwrap();
@@ -1018,6 +1073,7 @@ async fn test_delivery_after_a_real_delivery_does_not_collide() {
     )
     .await;
     let webhook_id = created["id"].as_str().unwrap().to_string();
+    dispatcher_ready(&owner, &server, &app_id).await;
     let event_id = emit_app_event(&server, &app_id, "app.up").await;
 
     let real = wait_for(|| async {
@@ -1087,6 +1143,7 @@ async fn test_delivery_before_the_real_one_does_not_block_it() {
     .await;
     let webhook_id = created["id"].as_str().unwrap().to_string();
 
+    dispatcher_ready(&owner, &server, &app_id).await;
     emit_app_event(&server, &app_id, "app.up").await;
     let res = owner
         .post(server.url(&format!("/api/v1/webhooks/{webhook_id}/test")))
