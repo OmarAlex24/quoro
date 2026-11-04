@@ -620,7 +620,7 @@ impl AppMetricsFeed {
                         }
                     }
                 }
-                StreamEvent::Lines(_) => {}
+                StreamEvent::Lines(_) | StreamEvent::Data(_) | StreamEvent::SessionEnd { .. } => {}
                 StreamEvent::End { message, .. } => {
                     self.done = true;
                     return Some(error_event(&message));
@@ -651,7 +651,9 @@ impl NodeMetricsFeed {
                 Some(StreamEvent::Metrics(report)) => {
                     self.pending.extend(report.node.unwrap_or_default());
                 }
-                Some(StreamEvent::Lines(_)) => {}
+                Some(
+                    StreamEvent::Lines(_) | StreamEvent::Data(_) | StreamEvent::SessionEnd { .. },
+                ) => {}
                 Some(StreamEvent::End { message, .. }) => {
                     self.done = true;
                     return Some(error_event(&message));

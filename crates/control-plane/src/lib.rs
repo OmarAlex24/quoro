@@ -21,6 +21,7 @@ pub mod driver;
 pub mod error;
 pub mod events;
 pub mod idempotency;
+pub mod interactive;
 pub mod keys;
 /// RFC 8785 canonical JSON, shared with the node agent through `quoro-proto`.
 pub use quoro_proto::jcs;
@@ -132,6 +133,9 @@ pub struct AppState {
     pub keys: Arc<ClusterKeys>,
     /// `cls_` id of this cluster, from `meta`.
     pub cluster_id: String,
+    /// The in-memory tickets and attach points of interactive sessions
+    /// (ADR 0114).
+    pub interactive: interactive::Interactive,
 }
 
 impl AppState {
@@ -183,7 +187,11 @@ impl AppState {
             tunnel,
             keys,
             cluster_id,
+            interactive: interactive::Interactive::default(),
         };
+        // Every session the previous process left open ends with
+        // `primary_restarted` before the listener opens.
+        interactive::close_orphans(&state).await?;
         sweeper::spawn(state.clone());
         dispatcher::spawn(state.clone());
         Ok(state)
