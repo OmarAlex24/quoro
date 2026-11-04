@@ -10,10 +10,21 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+# AWS Signature Version 4 for the S3-compatible object store client. Header
+# signing only; the sigv4a (ECDSA) feature and event streams stay off.
+aws-sigv4 = { version = "1", default-features = false, features = ["sign-http", "http1"] }
+# Credentials for the signer and the `Identity` that carries them.
+aws-credential-types = { version = "1", default-features = false }
+aws-smithy-runtime-api = { version = "1", default-features = false, features = ["client"] }
 # HTTPS client for the Cloudflare API. Native roots read the host's CA store
 # (webpki-roots is CDLA-Permissive-2.0, outside ADR 0080); no-provider leaves
 # the crypto provider to rustls with `ring`.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots-no-provider"] }
+# The XML reader behind ListObjectsV2, ListObjectVersions and S3 error bodies.
+quick-xml = { version = "0.41", default-features = false }
+# `x-amz-checksum-sha256` on writes: SHA-256 of the body, standard base64.
+sha2 = { version = "0.11", default-features = false }
+base64 = { version = "0.22", default-features = false, features = ["std"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
