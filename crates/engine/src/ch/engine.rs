@@ -34,8 +34,8 @@ use crate::image::{ImageStore, ImageStoreConfig};
 use crate::pins;
 use crate::{
     ByteStream, Capabilities, ConsoleMode, ConsoleStream, EngineError, EngineEvent, EventStream,
-    ExecRequest, ExecSession, HostProbe, ImageDigest, ImageRef, LineStream, NodeNetwork,
-    PreparedImage, SerialMode, StopMode, VmCounters, VmId, VmInfo, VmSpec, VmState,
+    ExecRequest, ExecSession, HostProbe, ImageDigest, ImageRef, LineStream, MacAddr, NodeNetwork,
+    OciLayout, PreparedImage, SerialMode, StopMode, VmCounters, VmId, VmInfo, VmSpec, VmState,
 };
 
 use super::ChConfig;
@@ -90,9 +90,26 @@ pub(super) struct Inner {
     /// TAPs of VMs whose `create` is in flight, with their bridge and group,
     /// so a concurrent peer sync does not drop them before their record is
     /// visible in `vms`.
-    pub(super) inflight_peers: StdMutex<HashMap<String, (String, Option<String>)>>,
+    pub(super) inflight_peers: StdMutex<HashMap<String, InflightPeer>>,
+    /// Work-disk paths whose `create` is in flight, with the VM that reserved
+    /// them. Two VMs may never name the same work-disk path at once (§3.6).
+    pub(super) inflight_disks: StdMutex<HashMap<PathBuf, VmId>>,
     /// Serializes peer-set syncs, so the last one applied saw the latest state.
     pub(super) peers_sync: Mutex<()>,
+}
+
+/// A TAP whose `create` has not finished yet, and what its bridge sets need.
+pub(super) struct InflightPeer {
+    /// The bridge the TAP will join.
+    pub(super) bridge: String,
+    /// The isolation group its spec carries.
+    pub(super) group: Option<String>,
+    /// Whether the VM is egress only.
+    pub(super) egress_only: bool,
+    /// The address its spec assigned, which the egress address checks allow.
+    pub(super) ip: Ipv4Addr,
+    /// The MAC address its spec assigned, which the egress MAC checks allow.
+    pub(super) mac: MacAddr,
 }
 
 /// Where a lifecycle call on one VM stands, for `inspect` while it is in
@@ -261,6 +278,7 @@ impl Inner {
             subscribers: StdMutex::new(Subscriptions::default()),
             vms: StdMutex::new(HashMap::new()),
             inflight_peers: StdMutex::new(HashMap::new()),
+            inflight_disks: StdMutex::new(HashMap::new()),
             peers_sync: Mutex::new(()),
         });
         inner.rediscover(&vms_root).await?;
@@ -433,24 +451,36 @@ impl Inner {
         self.sync_peers(&net.bridge).await
     }
 
-    /// Rewrites the bridge's `peers` set from every VM recorded on it plus the
-    /// creates in flight (§3.3).
+    /// Rewrites the bridge's `peers`, `egress` and `egress_addrs` sets from
+    /// every VM recorded on it plus the creates in flight (§3.3).
     async fn sync_peers(&self, bridge: &str) -> Result<(), EngineError> {
         let _sync = self.peers_sync.lock().await;
         let mut members: Vec<(String, Option<String>)> = Vec::new();
+        let mut egress: Vec<(String, MacAddr, Ipv4Addr)> = Vec::new();
         for (_, entry) in self.entries() {
             if let Some(record) = entry.spec()
                 && record.bridge == bridge
             {
-                members.push((record.tap, record.spec.net.isolation_group));
+                members.push((record.tap.clone(), record.spec.net.isolation_group.clone()));
+                if record.spec.net.egress_only {
+                    // The egress checks key on the MAC as well as the address,
+                    // so the record must carry both; `to_spec` rejects a
+                    // corrupt one the same way the rest of the state does.
+                    let spec = record.to_spec()?;
+                    egress.push((record.tap, spec.net.mac, spec.net.ip));
+                }
             }
         }
-        for (tap, (tap_bridge, group)) in lock(&self.inflight_peers).iter() {
-            if tap_bridge == bridge && !members.iter().any(|(known, _)| known == tap) {
-                members.push((tap.clone(), group.clone()));
+        for (tap, peer) in lock(&self.inflight_peers).iter() {
+            if peer.bridge == bridge && !members.iter().any(|(known, _)| known == tap) {
+                members.push((tap.clone(), peer.group.clone()));
+                if peer.egress_only {
+                    egress.push((tap.clone(), peer.mac, peer.ip));
+                }
             }
         }
-        net::sync_peers(&self.tools, bridge, &net::peer_pairs(&members)).await
+        net::sync_peers(&self.tools, bridge, &net::peer_pairs(&members)).await?;
+        net::sync_egress(&self.tools, bridge, &egress).await
     }
 
     /// Pulls and converts one image (§3.4).
@@ -459,6 +489,14 @@ impl Inner {
         image: &ImageRef,
     ) -> Result<PreparedImage, EngineError> {
         self.images.prepare(image).await
+    }
+
+    /// Converts a local OCI image layout a builder wrote (§3.17).
+    pub(super) async fn prepare_layout(
+        &self,
+        layout: &OciLayout,
+    ) -> Result<PreparedImage, EngineError> {
+        self.images.prepare_layout(layout).await
     }
 
     /// Removes one cached image, unless a VM uses it (§3.5).
@@ -497,6 +535,8 @@ impl Inner {
             return self.inspect(&spec.id).await;
         }
 
+        vmconfig::validate_spec(spec)?;
+        let _disks = self.reserve_work_disks(spec)?;
         let (network, subnet) = self.reserve(spec).await?;
         let prepared = self.images.cached(&spec.rootfs)?.ok_or_else(|| {
             EngineError::Image(format!("rootfs {} is not a prepared image", spec.rootfs.0))
@@ -511,7 +551,13 @@ impl Inner {
         // ungrouped one is never in any pair (§3.3).
         lock(&self.inflight_peers).insert(
             tap.clone(),
-            (network.bridge.clone(), spec.net.isolation_group.clone()),
+            InflightPeer {
+                bridge: network.bridge.clone(),
+                group: spec.net.isolation_group.clone(),
+                egress_only: spec.net.egress_only,
+                ip: spec.net.ip,
+                mac: spec.net.mac,
+            },
         );
         let created = self
             .create_reserved(
@@ -550,6 +596,11 @@ impl Inner {
         let tmp = rebased(paths, &tmp_dir);
         let built = self.build_files(&tmp, &record, &config, spec.disk_gb).await;
         if let Err(err) = built {
+            let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+            entry.set_phase(Phase::Idle);
+            return Err(err);
+        }
+        if let Err(err) = self.prepare_work_disks(spec).await {
             let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
             entry.set_phase(Phase::Idle);
             return Err(err);
@@ -1126,6 +1177,70 @@ impl Inner {
             .collect()
     }
 
+    /// Reserves every work-disk path of `spec`, refusing a path another VM
+    /// already names or a concurrent create holds (§3.6).
+    ///
+    /// The guard releases the paths when `create` is done with them. The
+    /// caller validated the spec first.
+    fn reserve_work_disks(&self, spec: &VmSpec) -> Result<WorkDiskReservation<'_>, EngineError> {
+        if spec.work_disks.is_empty() {
+            return Ok(WorkDiskReservation {
+                inner: self,
+                id: spec.id.clone(),
+                paths: Vec::new(),
+            });
+        }
+        let others: Vec<(VmId, Vec<std::path::PathBuf>)> = self
+            .entries()
+            .into_iter()
+            .filter(|(id, _)| id != &spec.id)
+            .filter_map(|(id, entry)| {
+                entry.spec().map(|record| {
+                    (
+                        id,
+                        record.spec.work_disks.into_iter().map(|d| d.path).collect(),
+                    )
+                })
+            })
+            .collect();
+
+        {
+            let mut inflight = lock(&self.inflight_disks);
+            for disk in &spec.work_disks {
+                for (other_id, paths) in &others {
+                    if paths.contains(&disk.path) {
+                        return Err(EngineError::Conflict(format!(
+                            "work disk {} is already attached to VM {}",
+                            disk.path.display(),
+                            other_id.0
+                        )));
+                    }
+                }
+                if let Some(owner) = inflight.get(&disk.path)
+                    && owner != &spec.id
+                {
+                    return Err(EngineError::Conflict(format!(
+                        "work disk {} is being attached to VM {}",
+                        disk.path.display(),
+                        owner.0
+                    )));
+                }
+            }
+            for disk in &spec.work_disks {
+                inflight.insert(disk.path.clone(), spec.id.clone());
+            }
+        }
+        Ok(WorkDiskReservation {
+            inner: self,
+            id: spec.id.clone(),
+            paths: spec
+                .work_disks
+                .iter()
+                .map(|disk| disk.path.clone())
+                .collect(),
+        })
+    }
+
     /// The checks and the reservation `create` makes before it writes anything
     /// (§3.6).
     ///
@@ -1248,6 +1363,65 @@ impl Inner {
         Ok(network)
     }
 
+    /// Creates a missing work disk and formats it (§3.6). An existing file is
+    /// attached as it is, which may be a raw file with no filesystem.
+    async fn prepare_work_disks(&self, spec: &VmSpec) -> Result<(), EngineError> {
+        for disk in &spec.work_disks {
+            let path = disk.path.clone();
+            match tokio::fs::symlink_metadata(&path).await {
+                Ok(metadata) => {
+                    if !metadata.file_type().is_file() {
+                        return Err(EngineError::Conflict(format!(
+                            "work disk {} exists and is not a regular file",
+                            path.display()
+                        )));
+                    }
+                    continue;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(io_error(&path, &err)),
+            }
+
+            let create_path = path.clone();
+            let size_gb = disk.size_gb;
+            let created =
+                tokio::task::spawn_blocking(move || create_work_disk_file(&create_path, size_gb))
+                    .await
+                    .map_err(|err| EngineError::Io(format!("work disk task failed: {err}")))??;
+            if !created {
+                // Another process created it between the check and here.
+                continue;
+            }
+
+            let path_text = path.to_str().ok_or_else(|| {
+                EngineError::Conflict(format!(
+                    "work disk path {} is not valid UTF-8",
+                    path.display()
+                ))
+            })?;
+            let formatted = crate::ch::tools::run(
+                &self.tools.mkfs_ext4,
+                &[
+                    "-q",
+                    "-F",
+                    "-t",
+                    "ext4",
+                    "-m",
+                    "0",
+                    "-E",
+                    "lazy_itable_init=1,lazy_journal_init=1,nodiscard",
+                    path_text,
+                ],
+            )
+            .await;
+            if let Err(err) = formatted {
+                let _ = std::fs::remove_file(&path);
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
     /// Writes the spec, the config disk and the data disk into a fresh
     /// directory, all of it off the reactor thread.
     async fn build_files(
@@ -1352,6 +1526,92 @@ impl Inner {
         record.at_ms = now_ms();
         let _ = state::write_json_atomic(&entry.paths.last_exit, &record);
     }
+}
+
+/// Releases the work-disk paths one `create` reserved (§3.6).
+struct WorkDiskReservation<'a> {
+    inner: &'a Inner,
+    id: VmId,
+    paths: Vec<PathBuf>,
+}
+
+impl Drop for WorkDiskReservation<'_> {
+    fn drop(&mut self) {
+        let mut inflight = lock(&self.inner.inflight_disks);
+        for path in &self.paths {
+            if inflight.get(path) == Some(&self.id) {
+                inflight.remove(path);
+            }
+        }
+    }
+}
+
+/// Creates a sparse work-disk file and its parent directories with mode 0700.
+///
+/// Returns `false` when the file already exists, which makes a concurrent
+/// creator a no-op rather than an error.
+fn create_work_disk_file(path: &Path, size_gb: u32) -> Result<bool, EngineError> {
+    let Some(parent) = path.parent() else {
+        return Err(EngineError::Conflict(format!(
+            "work disk {} has no parent directory",
+            path.display()
+        )));
+    };
+    create_parent_dirs_0700(parent)?;
+
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => {
+            let len = u64::from(size_gb) << 30;
+            if let Err(err) = file.set_len(len) {
+                drop(file);
+                let _ = std::fs::remove_file(path);
+                return Err(if err.kind() == std::io::ErrorKind::StorageFull {
+                    EngineError::ResourceExhausted(format!(
+                        "{}: no space left for a {size_gb} GiB work disk",
+                        path.display()
+                    ))
+                } else {
+                    io_error(path, &err)
+                });
+            }
+            Ok(true)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(err) => Err(io_error(path, &err)),
+    }
+}
+
+/// Creates every missing directory of `dir` with mode 0700, leaving existing
+/// ones alone.
+fn create_parent_dirs_0700(dir: &Path) -> Result<(), EngineError> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    if dir.as_os_str().is_empty() || dir.is_dir() {
+        return Ok(());
+    }
+    let mut missing = Vec::new();
+    let mut current = dir.to_path_buf();
+    while !current.as_os_str().is_empty() && !current.exists() {
+        missing.push(current.clone());
+        match current.parent() {
+            Some(parent) => current = parent.to_path_buf(),
+            None => break,
+        }
+    }
+    for path in missing.iter().rev() {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(io_error(path, &err)),
+        }
+    }
+    Ok(())
 }
 
 /// The same paths, rooted at another directory (the `.tmp-` build directory of

@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use crate::ch::vmm::{ProcessId, VmmExit};
 use crate::{
     ConsoleMode, EngineError, EngineEvent, ImageDigest, InitConfig, MacAddr, NetAttach, SerialMode,
-    VmId, VmSpec, VolumeAttach, VolumeId, VsockAttach,
+    VmId, VmSpec, VolumeAttach, VolumeId, VsockAttach, WorkDisk,
 };
 
 /// The version written into every [`SpecRecord`].
@@ -147,6 +147,10 @@ pub struct SpecFile {
     /// The vsock device (M4). Absent means none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vsock: Option<VsockFile>,
+    /// Work disks (engine-trait.md section 3.6). Absent in files written
+    /// before M4, which read as none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub work_disks: Vec<WorkDiskFile>,
 }
 
 /// The serial port in a [`SpecFile`], tagged by `mode` (M4).
@@ -183,6 +187,14 @@ pub struct VsockFile {
     pub socket: PathBuf,
 }
 
+/// One work disk in a [`SpecFile`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkDiskFile {
+    pub path: PathBuf,
+    pub size_gb: u32,
+    pub serial: String,
+}
+
 /// One attached volume in a [`SpecFile`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VolumeFile {
@@ -203,6 +215,10 @@ pub struct NetFile {
     /// written before groups existed, which read as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub isolation_group: Option<String>,
+    /// Egress only (engine-trait.md section 3.3). Absent in files written
+    /// before M4, which read as `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub egress_only: bool,
 }
 
 /// The app's identity in a [`SpecFile`].
@@ -254,6 +270,7 @@ impl From<&VmSpec> for SpecFile {
                 gateway: spec.net.gateway.to_string(),
                 mac: format_mac(spec.net.mac),
                 isolation_group: spec.net.isolation_group.clone(),
+                egress_only: spec.net.egress_only,
             },
             init: InitFile {
                 entrypoint: spec.init.entrypoint.clone(),
@@ -280,6 +297,15 @@ impl From<&VmSpec> for SpecFile {
                 cid: vsock.cid,
                 socket: vsock.socket.clone(),
             }),
+            work_disks: spec
+                .work_disks
+                .iter()
+                .map(|disk| WorkDiskFile {
+                    path: disk.path.clone(),
+                    size_gb: disk.size_gb,
+                    serial: disk.serial.clone(),
+                })
+                .collect(),
         }
     }
 }
@@ -328,6 +354,7 @@ impl SpecFile {
                 gateway,
                 mac,
                 isolation_group: self.net.isolation_group.clone(),
+                egress_only: self.net.egress_only,
             },
             init: InitConfig {
                 entrypoint: self.init.entrypoint.clone(),
@@ -354,6 +381,15 @@ impl SpecFile {
                 cid: vsock.cid,
                 socket: vsock.socket.clone(),
             }),
+            work_disks: self
+                .work_disks
+                .iter()
+                .map(|disk| WorkDisk {
+                    path: disk.path.clone(),
+                    size_gb: disk.size_gb,
+                    serial: disk.serial.clone(),
+                })
+                .collect(),
         })
     }
 
@@ -775,6 +811,7 @@ mod tests {
                 gateway: "10.42.1.1".parse().expect("gateway"),
                 mac: MacAddr([0x02, 0, 0, 0, 0, 1]),
                 isolation_group: None,
+                egress_only: false,
             },
             init: InitConfig {
                 entrypoint: vec!["/bin/sh".to_string()],
@@ -786,6 +823,7 @@ mod tests {
             console,
             serial: crate::SerialMode::Off,
             vsock: None,
+            work_disks: Vec::new(),
         }
     }
 

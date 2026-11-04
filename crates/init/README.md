@@ -128,9 +128,12 @@ returns `None` for an all-zero region.
    `chdir("/newroot")`, `mount_move(".", "/")`, `chroot(".")`, `chdir("/")`.
 6. **Inside the new root.** devpts on `/dev/pts`
    (`newinstance,ptmxmode=0666,mode=0620`), tmpfs on `/dev/shm` (1777), tmpfs on
-   `/run` when the image has that directory, `/tmp` created (1777) when
-   missing, and the `/dev/fd`, `/dev/stdin`, `/dev/stdout`, `/dev/stderr`
-   symlinks when missing.
+   `/run` when the image has that directory, `cgroup2` on `/sys/fs/cgroup`
+   (`nosuid,nodev,noexec`) when the image has that directory, `/tmp` created
+   (1777) when missing, and the `/dev/fd`, `/dev/stdin`, `/dev/stdout`,
+   `/dev/stderr` symlinks when missing. A cgroup2 mount that fails — an old
+   kernel without cgroup v2, or something already mounted there — is a
+   diagnostic line, never a boot failure; BuildKit needs it, an app does not.
 7. **Hostname and files.** `sethostname` when configured; `/etc/hosts`
    (`127.0.0.1 localhost`, `::1 localhost`, plus `<address> <hostname>` when
    both are configured); `/etc/resolv.conf` when `dns` is non-empty. Files are
@@ -159,14 +162,38 @@ returns `None` for an all-zero region.
 12. **Supervise.** One thread per pipe tags lines onto the log console; a
     thread watches the ACPI power button. The main thread waits for any child,
     reaping orphans, until the app's pid exits.
-13. **Tear down.** SIGKILL the app's process group, wait at most 2 s for the
-    output threads, SIGKILL every other process (everything in `/proc` except
-    pid 1), reap for up to 1 s.
-14. **Report and power off.** Write the status record, `sync()`,
-    `reboot(PowerOff)`. If the reboot returns, the process sleeps forever.
+13. **Report.** Write the status record (see above); the engine reads it back
+    after the VMM exits.
+14. **Tear down.** SIGKILL the app's process group, wait at most 2 s for the
+    output threads. Then send `SIGTERM` to every remaining process, reap for up
+    to 1 s, send `SIGKILL` to whatever is left and reap for up to 1 s again. The
+    init is PID 1 and is never signalled.
+15. **Clean the disks.** `sync()`, then read `/proc/self/mounts` and, for every
+    mount whose source is a device under `/dev/` (a work disk the app mounted on
+    `/mnt/work`, for example), last mounted first: `umount2(target, 0)`, or a
+    read-only remount (`MS_REMOUNT | MS_RDONLY`, retried with `MS_BIND` for a
+    bind mount) when the unmount finds it busy.
+16. **Power off.** `sync()`, `reboot(PowerOff)`. If the reboot returns, the
+    process sleeps forever.
 
 A FATAL at any point logs `quoro-init: FATAL <message>`, writes
-`AppStatus::Fatal` when the config disk is known, and powers off the same way.
+`AppStatus::Fatal` when the config disk is known, runs the same teardown as an
+app exit, and powers off the same way.
+
+## Disks at power-off
+
+The engine reads a work disk after the VMM exits, so the init leaves it clean: a
+disk that was unmounted, or remounted read-only after a `sync()`, needs no
+journal recovery on the node. Steps 14 to 16 run on both endings, after the
+status record is written.
+
+Only mounts backed by a device node under `/dev/` are touched, and each is tried
+in reverse mount order so the last mounted goes first. Pseudo filesystems —
+`/dev`, `/proc`, `/sys`, `/run`, `/dev/shm`, `/dev/pts`, `cgroup2` — and the
+overlay are never unmounted. Every attempt is bounded: a busy mount answers
+`EBUSY` immediately, there is no lazy unmount and nothing waits on a writer, so
+a stuck disk is a logged line and the VM powers off anyway. The overlay's upper
+disk usually cannot be released while the root is in use, which is expected.
 
 ## Console protocol
 
@@ -285,4 +312,7 @@ that still-mounted root, not to a path in the new root.
   its own copies loses them on every boot; the engine's configuration is the
   source of truth.
 - **No fsck.** A data disk that needs journal recovery fails to mount; the
-  engine is expected to hand the guest a clean ext4.
+  engine is expected to hand the guest a clean ext4. The init unmounts or
+  remounts read-only every block-device mount before power-off, but the overlay's
+  upper disk and anything else still in use when the app exits stay mounted, so
+  the node must not read a disk while its VM is still running.

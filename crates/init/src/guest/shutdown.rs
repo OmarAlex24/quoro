@@ -2,9 +2,9 @@
 //! Reporting back to the engine and powering the guest off.
 //!
 //! Both endings — the app exited, or the boot failed — write the status record
-//! into the config disk, flush the filesystems and ask the kernel to power the
-//! machine off. Nothing after `main` is allowed to return, so the last stop is
-//! a park loop.
+//! into the config disk, stop whatever is left of the guest, flush and clean
+//! the writable disks and ask the kernel to power the machine off. Nothing
+//! after `main` is allowed to return, so the last stop is a park loop.
 
 use std::fs::File;
 use std::sync::{Mutex, OnceLock};
@@ -14,7 +14,7 @@ use std::time::Duration;
 use quoro_init::AppStatus;
 use rustix::system::RebootCommand;
 
-use crate::guest::{diag, disks};
+use crate::guest::{diag, disks, teardown};
 
 /// The config disk, once it has been found. Every FATAL after that point is
 /// reported through it.
@@ -51,7 +51,7 @@ fn write_status(status: &AppStatus) {
 pub(crate) fn exited(code: i32) -> ! {
     diag::log(&format!("app exited code={code}"));
     write_status(&AppStatus::Exited { code });
-    power_off()
+    finish()
 }
 
 /// The boot failed: report it and power off.
@@ -61,6 +61,15 @@ pub(crate) fn fatal(code: i32, message: &str) -> ! {
         code,
         message: message.to_string(),
     });
+    finish()
+}
+
+/// The part both endings share, after the status record is on disk: nothing may
+/// outlive the VM, and a disk the app mounted must be clean for whoever
+/// attaches it next.
+fn finish() -> ! {
+    teardown::stop_processes();
+    teardown::unmount_disks();
     power_off()
 }
 

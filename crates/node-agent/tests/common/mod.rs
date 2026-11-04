@@ -327,6 +327,7 @@ pub async fn running_vm(engine: &FakeEngine, id: &str, index: u8) -> VmId {
             gateway: Ipv4Addr::new(10, 0, 0, 1),
             mac: MacAddr([0x02, 0, 0, 0, 0, index]),
             isolation_group: None,
+            egress_only: false,
         },
         init: InitConfig {
             entrypoint: Vec::new(),
@@ -338,6 +339,7 @@ pub async fn running_vm(engine: &FakeEngine, id: &str, index: u8) -> VmId {
         console: ConsoleMode::Off,
         serial: quoro_engine::SerialMode::Off,
         vsock: None,
+        work_disks: Vec::new(),
     };
     engine.create(&spec).await.expect("create");
     engine.start(&vm).await.expect("start");

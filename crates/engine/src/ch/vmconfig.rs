@@ -29,6 +29,9 @@ const MAX_HOSTNAME_CHARS: usize = 63;
 /// One megabyte in bytes, the unit of `memory.size` in the VMM API.
 const MIB: u64 = 1_048_576;
 
+/// A work disk's serial is the virtio-blk serial limit: 20 bytes.
+const MAX_WORK_DISK_SERIAL: usize = 20;
+
 /// The host paths a VM boots from.
 #[derive(Clone, Copy, Debug)]
 pub struct BootFiles<'a> {
@@ -153,6 +156,95 @@ fn format_mac(mac: MacAddr) -> String {
     format!("{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}")
 }
 
+/// The checks `create` applies to a spec before it touches the host
+/// (§3.3, §3.6).
+///
+/// # Errors
+///
+/// `Conflict` for an egress-only VM that carries an isolation group, and for
+/// every work-disk rule [`validate_work_disks`] enforces.
+pub fn validate_spec(spec: &VmSpec) -> Result<(), EngineError> {
+    if spec.net.egress_only && spec.net.isolation_group.is_some() {
+        return Err(EngineError::Conflict(format!(
+            "VM {} is egress only and cannot carry an isolation group",
+            spec.id.0
+        )));
+    }
+    validate_work_disks(spec)
+}
+
+/// Checks the work disks of one spec (§3.6).
+///
+/// A work-disk path is absolute; its serial is 1 to 20 bytes of
+/// `[A-Za-z0-9_-]` and not one of the engine's own serials; two work disks of
+/// one spec share neither a path nor a serial; and each size is at least
+/// 1 GiB.
+///
+/// # Errors
+///
+/// `Conflict` naming the work disk and the rule it breaks.
+pub fn validate_work_disks(spec: &VmSpec) -> Result<(), EngineError> {
+    let own_serials = [
+        quoro_init::SERIAL_ROOT,
+        quoro_init::SERIAL_DATA,
+        quoro_init::SERIAL_CONFIG,
+    ];
+    for (index, disk) in spec.work_disks.iter().enumerate() {
+        let label = format!("work disk {index} ({})", disk.serial);
+        if !disk.path.is_absolute() {
+            return Err(EngineError::Conflict(format!(
+                "VM {}: {label} path {} is not absolute",
+                spec.id.0,
+                disk.path.display()
+            )));
+        }
+        let serial = disk.serial.as_str();
+        if serial.is_empty() || serial.len() > MAX_WORK_DISK_SERIAL {
+            return Err(EngineError::Conflict(format!(
+                "VM {}: {label} serial must be 1 to {MAX_WORK_DISK_SERIAL} bytes",
+                spec.id.0
+            )));
+        }
+        if !serial
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        {
+            return Err(EngineError::Conflict(format!(
+                "VM {}: {label} serial may only contain A-Z, a-z, 0-9, '_' and '-'",
+                spec.id.0
+            )));
+        }
+        if own_serials.contains(&serial) {
+            return Err(EngineError::Conflict(format!(
+                "VM {}: {label} serial is one the engine uses itself",
+                spec.id.0
+            )));
+        }
+        if disk.size_gb < 1 {
+            return Err(EngineError::Conflict(format!(
+                "VM {}: {label} size_gb must be at least 1",
+                spec.id.0
+            )));
+        }
+        for other in &spec.work_disks[..index] {
+            if other.path == disk.path {
+                return Err(EngineError::Conflict(format!(
+                    "VM {}: two work disks name the same path {}",
+                    spec.id.0,
+                    disk.path.display()
+                )));
+            }
+            if other.serial == disk.serial {
+                return Err(EngineError::Conflict(format!(
+                    "VM {}: two work disks use the serial {}",
+                    spec.id.0, disk.serial
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The body of `PUT /api/v1/vm.create` for Cloud Hypervisor v54 (contract §5).
 ///
 /// All paths are used as given. `tap` is the TAP device the caller created on
@@ -187,6 +279,38 @@ pub fn vm_create_body(spec: &VmSpec, paths: &VmPaths, boot: &BootFiles<'_>, tap:
         ConsoleMode::Off | ConsoleMode::Serial { .. } => json!({"mode": "Off"}),
     };
 
+    let mut disks = vec![
+        json!({
+            "id": "root",
+            "path": boot.rootfs,
+            "readonly": true,
+            "image_type": "Raw",
+            "serial": quoro_init::SERIAL_ROOT,
+        }),
+        json!({
+            "id": "data",
+            "path": paths.data_disk,
+            "image_type": "Raw",
+            "serial": quoro_init::SERIAL_DATA,
+        }),
+        json!({
+            "id": "config",
+            "path": paths.config_disk,
+            "image_type": "Raw",
+            "serial": quoro_init::SERIAL_CONFIG,
+        }),
+    ];
+    // Work disks come after the engine's own, in the order the spec lists
+    // them (§3.6). They are writable and outlive the VM.
+    for (index, disk) in spec.work_disks.iter().enumerate() {
+        disks.push(json!({
+            "id": format!("work-{index}"),
+            "path": disk.path,
+            "image_type": "Raw",
+            "serial": disk.serial,
+        }));
+    }
+
     let mut body = json!({
         "cpus": {"boot_vcpus": spec.vcpus, "max_vcpus": spec.vcpus},
         "memory": {"size": u64::from(spec.memory_mb) * MIB},
@@ -195,27 +319,7 @@ pub fn vm_create_body(spec: &VmSpec, paths: &VmPaths, boot: &BootFiles<'_>, tap:
             "initramfs": boot.initramfs,
             "cmdline": crate::boot::kernel_cmdline(),
         },
-        "disks": [
-            {
-                "id": "root",
-                "path": boot.rootfs,
-                "readonly": true,
-                "image_type": "Raw",
-                "serial": quoro_init::SERIAL_ROOT,
-            },
-            {
-                "id": "data",
-                "path": paths.data_disk,
-                "image_type": "Raw",
-                "serial": quoro_init::SERIAL_DATA,
-            },
-            {
-                "id": "config",
-                "path": paths.config_disk,
-                "image_type": "Raw",
-                "serial": quoro_init::SERIAL_CONFIG,
-            },
-        ],
+        "disks": disks,
         "net": [{"id": "net0", "tap": tap, "mac": format_mac(spec.net.mac)}],
         "serial": serial,
         "console": console,
@@ -236,13 +340,14 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        BootFiles, check_consoles, guest_config, hostname_for, stop_timeout_ms, vm_create_body,
+        BootFiles, check_consoles, guest_config, hostname_for, stop_timeout_ms, validate_spec,
+        validate_work_disks, vm_create_body,
     };
     use crate::ch::net::Subnet;
     use crate::ch::state::VmPaths;
     use crate::{
         ConsoleMode, EngineError, ImageDigest, InitConfig, MacAddr, NetAttach, SerialMode, VmId,
-        VmSpec, VolumeAttach, VolumeId, VsockAttach,
+        VmSpec, VolumeAttach, VolumeId, VsockAttach, WorkDisk,
     };
 
     fn subnet() -> Subnet {
@@ -268,6 +373,7 @@ mod tests {
                 gateway: "10.42.1.1".parse().expect("gateway"),
                 mac: MacAddr([0x02, 0, 0, 0, 0, 1]),
                 isolation_group: None,
+                egress_only: false,
             },
             init: InitConfig {
                 entrypoint: vec!["/app/server".to_string()],
@@ -282,6 +388,7 @@ mod tests {
             console,
             serial: SerialMode::Off,
             vsock: None,
+            work_disks: Vec::new(),
         }
     }
 
@@ -671,5 +778,137 @@ mod tests {
             path: PathBuf::from("/run/quoro/vm/serial.sock"),
         };
         assert!(check_consoles(&spec).is_ok());
+    }
+
+    fn work_disk(path: &str, size_gb: u32, serial: &str) -> WorkDisk {
+        WorkDisk {
+            path: PathBuf::from(path),
+            size_gb,
+            serial: serial.to_string(),
+        }
+    }
+
+    #[test]
+    fn create_body_appends_work_disks_after_the_engine_disks() {
+        let mut spec = make_spec(ConsoleMode::Off);
+        spec.work_disks = vec![
+            work_disk("/var/lib/quoro/work/quoro-work.img", 12, "quoro-work"),
+            work_disk("/var/lib/quoro/work/src.img", 1, "quoro-src"),
+            work_disk("/var/lib/quoro/work/out.img", 1, "quoro-out"),
+        ];
+        let paths = paths();
+        let (kernel, initramfs, rootfs) = boot();
+        let body = vm_create_body(
+            &spec,
+            &paths,
+            &BootFiles {
+                kernel: &kernel,
+                initramfs: &initramfs,
+                rootfs: &rootfs,
+            },
+            "tap2",
+        );
+        let disks = body["disks"].as_array().expect("disks");
+        let ids: Vec<&str> = disks
+            .iter()
+            .map(|disk| disk["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["root", "data", "config", "work-0", "work-1", "work-2"]
+        );
+        for (index, disk) in spec.work_disks.iter().enumerate() {
+            let entry = &disks[index + 3];
+            assert_eq!(entry["path"], serde_json::json!(disk.path));
+            assert_eq!(entry["serial"], serde_json::json!(disk.serial));
+            assert_eq!(entry["image_type"], "Raw");
+            assert!(entry.get("readonly").is_none(), "a work disk is writable");
+        }
+        assert_eq!(disks[0]["readonly"], true);
+    }
+
+    #[test]
+    fn work_disks_are_validated() {
+        let mut spec = make_spec(ConsoleMode::Off);
+        spec.work_disks = vec![work_disk("/var/lib/quoro/work/work.img", 8, "quoro-work")];
+        validate_work_disks(&spec).expect("a valid work disk");
+        validate_spec(&spec).expect("a valid spec");
+
+        let mut relative = spec.clone();
+        relative.work_disks[0].path = PathBuf::from("work.img");
+        assert!(matches!(
+            validate_work_disks(&relative),
+            Err(EngineError::Conflict(_))
+        ));
+
+        for serial in ["", "abcdefghijklmnopqrstu", "bad serial", "quo:ro"] {
+            let mut bad = spec.clone();
+            bad.work_disks[0].serial = serial.to_string();
+            assert!(
+                matches!(validate_work_disks(&bad), Err(EngineError::Conflict(_))),
+                "{serial:?} should be refused"
+            );
+        }
+
+        for own in [
+            quoro_init::SERIAL_ROOT,
+            quoro_init::SERIAL_DATA,
+            quoro_init::SERIAL_CONFIG,
+        ] {
+            let mut bad = spec.clone();
+            bad.work_disks[0].serial = own.to_string();
+            assert!(
+                matches!(validate_work_disks(&bad), Err(EngineError::Conflict(_))),
+                "{own:?} should be refused"
+            );
+        }
+
+        let mut zero = spec.clone();
+        zero.work_disks[0].size_gb = 0;
+        assert!(matches!(
+            validate_work_disks(&zero),
+            Err(EngineError::Conflict(_))
+        ));
+
+        let mut duplicate_path = spec.clone();
+        duplicate_path
+            .work_disks
+            .push(work_disk("/var/lib/quoro/work/work.img", 1, "quoro-src"));
+        assert!(matches!(
+            validate_work_disks(&duplicate_path),
+            Err(EngineError::Conflict(_))
+        ));
+
+        let mut duplicate_serial = spec.clone();
+        duplicate_serial.work_disks.push(work_disk(
+            "/var/lib/quoro/work/other.img",
+            1,
+            "quoro-work",
+        ));
+        assert!(matches!(
+            validate_work_disks(&duplicate_serial),
+            Err(EngineError::Conflict(_))
+        ));
+
+        // The maximum serial length is accepted.
+        let mut longest = spec.clone();
+        longest.work_disks[0].serial = "abcdefghijklmnopqrst".to_string();
+        validate_work_disks(&longest).expect("20 bytes is the limit");
+    }
+
+    #[test]
+    fn an_egress_only_vm_cannot_carry_an_isolation_group() {
+        let mut spec = make_spec(ConsoleMode::Off);
+        spec.net.egress_only = true;
+        spec.net.isolation_group = Some("prj_01".to_string());
+        match validate_spec(&spec) {
+            Err(EngineError::Conflict(reason)) => {
+                assert!(reason.contains("egress only"), "{reason}");
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+
+        spec.net.isolation_group = None;
+        validate_spec(&spec).expect("egress only alone is valid");
     }
 }

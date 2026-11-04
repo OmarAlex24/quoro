@@ -701,11 +701,13 @@ impl<E: Engine + 'static> Reconciler<E> {
                 // VMs of one project reach each other; VMs of two projects do
                 // not (engine-trait.md section 3.3, D-0084).
                 isolation_group: Some(vm.project_id.clone()),
+                egress_only: false,
             },
             init: init_config(&prepared.config, &vm.env),
             console,
             serial,
             vsock,
+            work_disks: Vec::new(),
         };
 
         match self.engine.create(&spec).await {

@@ -73,6 +73,7 @@ impl Node {
                 gateway: std::net::Ipv4Addr::new(10, 42, 1, 1),
                 mac: MacAddr([0x52, 0x55, 10, 42, 1, 10]),
                 isolation_group: None,
+                egress_only: false,
             },
             init: InitConfig {
                 entrypoint: Vec::new(),
@@ -89,6 +90,7 @@ impl Node {
                 cid: 3,
                 socket: self.dir.path().join(format!("{vm_id}.vsock.sock")),
             }),
+            work_disks: Vec::new(),
         }
     }
 

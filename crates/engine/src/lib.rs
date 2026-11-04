@@ -88,6 +88,9 @@ pub struct VmSpec {
     /// The virtio-vsock device that carries exec sessions (section 3.18,
     /// ADR 0113). `None` means no device. Added in M4.
     pub vsock: Option<VsockAttach>,
+    /// Extra writable disks that outlive the VM, identified by serial. Only
+    /// builder VMs use them (ADR 0118); app VMs carry none. Added in M4.
+    pub work_disks: Vec<WorkDisk>,
 }
 
 impl VmSpec {
@@ -132,6 +135,31 @@ pub struct NetAttach {
     /// reach no other VM. The node agent sets it to the VM's project id
     /// (`prj_`). Section 3.3.
     pub isolation_group: Option<String>,
+    /// Egress only: the VM reaches the outside through the gateway and nothing
+    /// on the node, neither another VM nor the host (section 3.3). Builder VMs
+    /// set it, with `isolation_group: None` (ADR 0118). Added in M4.
+    pub egress_only: bool,
+}
+
+/// A writable disk that the engine attaches but does not own: `delete` keeps
+/// it, and the node agent removes it. Added in M4. Section 3.6.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkDisk {
+    pub path: PathBuf,
+    /// Size of the disk when the engine has to create it.
+    pub size_gb: u32,
+    /// virtio-blk serial the guest finds it by, for example `quoro-work`.
+    pub serial: String,
+}
+
+/// An OCI image layout on the node, as a builder wrote it. Added in M4.
+/// Section 3.17.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OciLayout {
+    /// Directory or tarball of the layout (OCI image-layout 1.0).
+    pub path: PathBuf,
+    /// Digest of the image manifest the layout's index names.
+    pub manifest_digest: ImageDigest,
 }
 
 /// The app's command line and identity, as the minimal init must apply it.
@@ -380,6 +408,17 @@ pub trait Engine: Send + Sync {
         &self,
         digest: &ImageDigest,
     ) -> impl Future<Output = Result<(), EngineError>> + Send;
+    /// Added in M4; section 3.17.
+    fn prepare_layout(
+        &self,
+        _layout: &OciLayout,
+    ) -> impl Future<Output = Result<PreparedImage, EngineError>> + Send {
+        async {
+            Err(EngineError::Unsupported(
+                "local OCI layouts are not implemented by this engine".into(),
+            ))
+        }
+    }
 
     // Lifecycle
     fn create(&self, spec: &VmSpec) -> impl Future<Output = Result<VmInfo, EngineError>> + Send;

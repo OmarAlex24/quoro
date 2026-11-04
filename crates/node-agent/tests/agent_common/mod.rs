@@ -271,6 +271,7 @@ impl RecordingEngine {
                 gateway: Ipv4Addr::new(10, 42, 1, 1),
                 mac: quoro_engine::MacAddr([0x52, 0x55, 10, 42, 1, 200]),
                 isolation_group: None,
+                egress_only: false,
             },
             init: quoro_engine::InitConfig {
                 entrypoint: Vec::new(),
@@ -282,6 +283,7 @@ impl RecordingEngine {
             console: quoro_engine::ConsoleMode::Off,
             serial: quoro_engine::SerialMode::Off,
             vsock: None,
+            work_disks: Vec::new(),
         };
         self.create(&spec).await.expect("create the raw VM");
         self.start(&id).await.expect("start the raw VM");
