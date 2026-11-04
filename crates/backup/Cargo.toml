@@ -1,0 +1,43 @@
+[package]
+name = "quoro-backup"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Content-defined chunking over a snapshot file, streamed, never buffering the
+# whole file (backup-format.md section 5).
+fastcdc = { version = "5", default-features = false }
+# Keyed chunk ids, the section 3 key derivations and the unkeyed manifest
+# digest (sections 3 and 6.1). The `std` feature keeps `Hasher` usable.
+blake3 = { version = "1", default-features = false, features = ["std"] }
+# zstd level 3 for chunks and manifests (sections 5 and 6.1).
+zstd = { version = "0.14", default-features = false }
+# XChaCha20-Poly1305 for chunks, manifests and the wrapped repo key (sections
+# 4, 5 and 6.1). Nonces come from `getrandom`, so its own feature stays off.
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
+# Random nonces and the generated repo, source and recovery keys (sections 3
+# and 4).
+getrandom = { version = "0.3", default-features = false }
+# Wipes key material from memory when it is dropped (section 3).
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
+# The config, manifest and seal objects are JSON (sections 4 and 6).
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+# Nonces and the wrapped repo key are standard base64 (section 4).
+base64 = { version = "0.22", default-features = false, features = ["std"] }
+# The seal is signed over RFC 8785 canonical JSON with the cluster key; the
+# canonicalizer and the signature helpers live there (section 6.2).
+quoro-proto = { path = "../proto" }
+
+[dev-dependencies]
+# Property tests over generated snapshots (tests/props.rs).
+proptest = { version = "1", default-features = false, features = ["std"] }
+# tests/fake_engine.rs writes and snapshots real sparse volume files.
+quoro-engine = { path = "../engine" }
+tokio = { version = "1", features = ["macros", "rt"] }
