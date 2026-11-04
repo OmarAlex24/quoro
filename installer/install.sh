@@ -268,18 +268,19 @@ check_preconditions() {
     [ -z "$_missing" ] || die "missing required tools:$_missing"
 
     # The engine needs e2fsprogs (mkfs.ext4 for image conversion), iproute2 (ip)
-    # and nftables (nft). They are installed later, after every verification
+    # and nftables (nft); Git builds need git, which fetches the app's commit on
+    # the node (ADR 0118). They are installed later, after every verification
     # passed, because installing packages changes the host; here only the
     # presence of a way to install them is checked.
     if ! command -v apt-get >/dev/null 2>&1; then
         _missing=''
-        for _tool in mkfs.ext4 ip nft; do
+        for _tool in mkfs.ext4 ip nft git; do
             if ! has_host_tool "$_tool"; then
                 _missing="$_missing $_tool"
             fi
         done
         [ -z "$_missing" ] ||
-            die "missing host tools:$_missing and no apt-get on this host; install the packages e2fsprogs, iproute2 and nftables"
+            die "missing host tools:$_missing and no apt-get on this host; install the packages e2fsprogs, iproute2, nftables and git"
     fi
 
     case $ROLE in
@@ -781,33 +782,33 @@ fetch_ingress_runtime() {
 # verification passed, because it changes the host.
 install_host_packages() {
     _missing=''
-    for _tool in mkfs.ext4 ip nft; do
+    for _tool in mkfs.ext4 ip nft git; do
         if ! has_host_tool "$_tool"; then
             _missing="$_missing $_tool"
         fi
     done
     if [ -z "$_missing" ]; then
-        log 'host tools present: mkfs.ext4, ip, nft'
+        log 'host tools present: mkfs.ext4, ip, nft, git'
         return 0
     fi
 
     log "host tools missing:$_missing"
     if ! command -v apt-get >/dev/null 2>&1; then
-        die "missing host tools:$_missing; apt-get is not available, install the packages e2fsprogs, iproute2 and nftables"
+        die "missing host tools:$_missing; apt-get is not available, install the packages e2fsprogs, iproute2, nftables and git"
     fi
 
-    log 'installing the host packages e2fsprogs, iproute2 and nftables'
+    log 'installing the host packages e2fsprogs, iproute2, nftables and git'
     DEBIAN_FRONTEND=noninteractive apt-get update -q || die 'apt-get update failed'
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends e2fsprogs iproute2 nftables ||
-        die 'apt-get install failed for e2fsprogs, iproute2 and nftables'
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends e2fsprogs iproute2 nftables git ||
+        die 'apt-get install failed for e2fsprogs, iproute2, nftables and git'
 
     _missing=''
-    for _tool in mkfs.ext4 ip nft; do
+    for _tool in mkfs.ext4 ip nft git; do
         if ! has_host_tool "$_tool"; then
             _missing="$_missing $_tool"
         fi
     done
-    [ -z "$_missing" ] || die "still missing host tools after installing e2fsprogs, iproute2 and nftables:$_missing"
+    [ -z "$_missing" ] || die "still missing host tools after installing e2fsprogs, iproute2, nftables and git:$_missing"
     log 'host packages installed'
 }
 
