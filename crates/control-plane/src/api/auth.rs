@@ -258,7 +258,7 @@ fn me(user: User) -> MeResponse {
 
 /// `true` for a plausible email: one `@`, non-empty sides, no whitespace,
 /// at most 254 characters. Deliverability is not Quoro's concern.
-fn valid_email(email: &str) -> bool {
+pub(crate) fn valid_email(email: &str) -> bool {
     let mut parts = email.split('@');
     let (Some(local), Some(domain), None) = (parts.next(), parts.next(), parts.next()) else {
         return false;
