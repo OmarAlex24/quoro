@@ -1,0 +1,9 @@
+Dockerfile:3
+--------------------
+   1 |     FROM alpine:3.22
+   2 |     RUN echo "step one ok"
+   3 | >>> RUN echo "about to fail" && ls /does-not-exist
+   4 |     RUN echo "never reached"
+   5 |
+--------------------
+error: failed to solve: process "/bin/sh -c echo \"about to fail\" && ls /does-not-exist" did not complete successfully: exit code: 1

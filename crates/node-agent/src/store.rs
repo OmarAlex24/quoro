@@ -16,6 +16,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use quoro_proto::wire::{BuildPhase, BuildState, FailedStep};
 use serde_json::Value;
 use sqlx::Row as _;
 use sqlx::SqlitePool;
@@ -98,6 +99,21 @@ CREATE TABLE IF NOT EXISTS transcripts (
     ended_at   INTEGER
 );
 CREATE INDEX IF NOT EXISTS transcripts_by_start ON transcripts (started_at);
+CREATE TABLE IF NOT EXISTS builds (
+    build_id     TEXT PRIMARY KEY,
+    app_id       TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    failed_phase TEXT,
+    [commit]     TEXT,
+    image_digest TEXT,
+    error        TEXT,
+    failed_step  TEXT,
+    log_path     TEXT,
+    created_at   TEXT NOT NULL,
+    started_at   TEXT,
+    finished_at  TEXT
+);
+CREATE INDEX IF NOT EXISTS builds_by_app ON builds (app_id, created_at);
 ";
 
 /// Capacity of the live log fan-out channel. A stream that falls further
@@ -199,6 +215,53 @@ pub struct BufferedEvent {
     pub evt_id: String,
     /// The event body, without `seq`.
     pub body: Value,
+}
+
+/// One build's local row (`node-agent-protocol.md` section 12, ADR 0117).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuildRecord {
+    /// `bld_<ULID>`.
+    pub build_id: String,
+    /// `app_<ULID>` the build belongs to; also its cache key.
+    pub app_id: String,
+    /// Where the build is: `queued` up to a terminal state.
+    pub status: BuildState,
+    /// The phase it failed in, on `failed`.
+    pub failed_phase: Option<BuildPhase>,
+    /// Full commit SHA the ref resolved to, once the checkout finished.
+    pub commit: Option<String>,
+    /// Manifest digest of the built image, on `succeeded`.
+    pub image_digest: Option<String>,
+    /// One-line reason, on `failed`.
+    pub error: Option<String>,
+    /// The failing BuildKit step, on `failed`.
+    pub failed_step: Option<FailedStep>,
+    /// Path of the build's human log file, when it has one.
+    pub log_path: Option<String>,
+    /// Creation order, an RFC 3339 string with nanoseconds.
+    pub created_at: String,
+    /// When the node left `queued`.
+    pub started_at: Option<String>,
+    /// When the build reached a terminal status.
+    pub finished_at: Option<String>,
+}
+
+impl BuildRecord {
+    /// The `status_report.builds[]` entry for this row (section 5.3).
+    #[must_use]
+    pub fn to_status(&self) -> quoro_proto::wire::BuildStatus {
+        quoro_proto::wire::BuildStatus {
+            build_id: self.build_id.clone(),
+            status: self.status,
+            commit: self.commit.clone(),
+            image_digest: self.image_digest.clone(),
+            failed_phase: self.failed_phase,
+            error: self.error.clone(),
+            failed_step: self.failed_step.clone(),
+            started_at: self.started_at.clone(),
+            finished_at: self.finished_at.clone(),
+        }
+    }
 }
 
 impl NodeStore {
@@ -555,6 +618,119 @@ impl NodeStore {
             .map(|_| ())
     }
 
+    /// Inserts or replaces one build row.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] when the failed step cannot be encoded or SQLite
+    /// fails.
+    pub async fn save_build(&self, record: &BuildRecord) -> Result<(), AgentError> {
+        let failed_step = match &record.failed_step {
+            Some(step) => Some(serde_json::to_string(step).map_err(|e| {
+                AgentError::Store(format!("could not encode a build's failed step: {e}"))
+            })?),
+            None => None,
+        };
+        sqlx::query(
+            "INSERT INTO builds (build_id, app_id, status, failed_phase, \"commit\", image_digest, \
+             error, failed_step, log_path, created_at, started_at, finished_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(build_id) DO UPDATE SET app_id = excluded.app_id, \
+             status = excluded.status, failed_phase = excluded.failed_phase, \
+             \"commit\" = excluded.\"commit\", image_digest = excluded.image_digest, \
+             error = excluded.error, failed_step = excluded.failed_step, \
+             log_path = excluded.log_path, created_at = excluded.created_at, \
+             started_at = excluded.started_at, finished_at = excluded.finished_at",
+        )
+        .bind(&record.build_id)
+        .bind(&record.app_id)
+        .bind(record.status.as_str())
+        .bind(record.failed_phase.map(BuildPhase::as_str))
+        .bind(record.commit.as_deref())
+        .bind(record.image_digest.as_deref())
+        .bind(record.error.as_deref())
+        .bind(failed_step)
+        .bind(record.log_path.as_deref())
+        .bind(&record.created_at)
+        .bind(record.started_at.as_deref())
+        .bind(record.finished_at.as_deref())
+        .execute(&self.pool)
+        .await
+        .map_err(store_error)
+        .map(|_| ())
+    }
+
+    /// One build row.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure or a row it cannot read back.
+    pub async fn build(&self, build_id: &str) -> Result<Option<BuildRecord>, AgentError> {
+        let row = sqlx::query("SELECT * FROM builds WHERE build_id = ?")
+            .bind(build_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(store_error)?;
+        row.map(build_record).transpose()
+    }
+
+    /// Every build row, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure or a row it cannot read back.
+    pub async fn builds(&self) -> Result<Vec<BuildRecord>, AgentError> {
+        let rows = sqlx::query("SELECT * FROM builds ORDER BY created_at ASC, build_id ASC")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(store_error)?;
+        rows.into_iter().map(build_record).collect()
+    }
+
+    /// Every build row of one app, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure or a row it cannot read back.
+    pub async fn builds_for_app(&self, app_id: &str) -> Result<Vec<BuildRecord>, AgentError> {
+        let rows = sqlx::query(
+            "SELECT * FROM builds WHERE app_id = ? ORDER BY created_at ASC, build_id ASC",
+        )
+        .bind(app_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_error)?;
+        rows.into_iter().map(build_record).collect()
+    }
+
+    /// Removes one build row.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn delete_build(&self, build_id: &str) -> Result<(), AgentError> {
+        sqlx::query("DELETE FROM builds WHERE build_id = ?")
+            .bind(build_id)
+            .execute(&self.pool)
+            .await
+            .map_err(store_error)
+            .map(|_| ())
+    }
+
+    /// Removes every build row of one app.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn delete_builds_for_app(&self, app_id: &str) -> Result<(), AgentError> {
+        sqlx::query("DELETE FROM builds WHERE app_id = ?")
+            .bind(app_id)
+            .execute(&self.pool)
+            .await
+            .map_err(store_error)
+            .map(|_| ())
+    }
+
     /// Every address currently recorded, so the allocator never hands one out
     /// twice.
     ///
@@ -876,6 +1052,63 @@ fn transcript_row(row: sqlx::sqlite::SqliteRow) -> Result<StoredTranscript, Agen
 
 fn store_error(error: sqlx::Error) -> AgentError {
     AgentError::Store(error.to_string())
+}
+
+/// Reads one `builds` row back into a [`BuildRecord`].
+fn build_record(row: sqlx::sqlite::SqliteRow) -> Result<BuildRecord, AgentError> {
+    let status: String = row.try_get("status").map_err(store_error)?;
+    let failed_phase: Option<String> = row.try_get("failed_phase").map_err(store_error)?;
+    let failed_step: Option<String> = row.try_get("failed_step").map_err(store_error)?;
+    Ok(BuildRecord {
+        build_id: row.try_get("build_id").map_err(store_error)?,
+        app_id: row.try_get("app_id").map_err(store_error)?,
+        status: parse_build_state(&status)?,
+        failed_phase: failed_phase
+            .map(|phase| parse_build_phase(&phase))
+            .transpose()?,
+        commit: row.try_get("commit").map_err(store_error)?,
+        image_digest: row.try_get("image_digest").map_err(store_error)?,
+        error: row.try_get("error").map_err(store_error)?,
+        failed_step: failed_step
+            .map(|step| {
+                serde_json::from_str(&step).map_err(|e| {
+                    AgentError::Store(format!("a stored build failed step is not JSON: {e}"))
+                })
+            })
+            .transpose()?,
+        log_path: row.try_get("log_path").map_err(store_error)?,
+        created_at: row.try_get("created_at").map_err(store_error)?,
+        started_at: row.try_get("started_at").map_err(store_error)?,
+        finished_at: row.try_get("finished_at").map_err(store_error)?,
+    })
+}
+
+fn parse_build_state(text: &str) -> Result<BuildState, AgentError> {
+    match text {
+        "queued" => Ok(BuildState::Queued),
+        "preparing" => Ok(BuildState::Preparing),
+        "building" => Ok(BuildState::Building),
+        "exporting" => Ok(BuildState::Exporting),
+        "importing" => Ok(BuildState::Importing),
+        "succeeded" => Ok(BuildState::Succeeded),
+        "failed" => Ok(BuildState::Failed),
+        "cancelled" => Ok(BuildState::Cancelled),
+        other => Err(AgentError::Store(format!(
+            "a stored build has an unknown status {other:?}"
+        ))),
+    }
+}
+
+fn parse_build_phase(text: &str) -> Result<BuildPhase, AgentError> {
+    match text {
+        "preparing" => Ok(BuildPhase::Preparing),
+        "building" => Ok(BuildPhase::Building),
+        "exporting" => Ok(BuildPhase::Exporting),
+        "importing" => Ok(BuildPhase::Importing),
+        other => Err(AgentError::Store(format!(
+            "a stored build has an unknown phase {other:?}"
+        ))),
+    }
 }
 
 /// Adds `desired_state.body_enc` to a database created before bodies were

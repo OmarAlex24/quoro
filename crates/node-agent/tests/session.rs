@@ -162,6 +162,7 @@ async fn the_session_speaks_the_protocol_over_a_duplex_stream() {
         desired,
         observed: observed_rx,
         current: None,
+        builds: None,
     });
 
     let (client, server) = tokio::io::duplex(1 << 16);
@@ -248,6 +249,7 @@ async fn an_idle_session_with_a_live_primary_stays_up() {
         desired,
         observed: observed_rx,
         current: None,
+        builds: None,
     });
 
     let (client, server) = tokio::io::duplex(1 << 16);
@@ -313,6 +315,7 @@ async fn an_event_recorded_during_a_session_is_sent_without_a_reconnect() {
         desired,
         observed: observed_rx,
         current: None,
+        builds: None,
     });
 
     let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(4);

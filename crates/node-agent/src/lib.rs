@@ -32,6 +32,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
 pub use agent::run;
+pub use build::manager::{BuildManager, BuildsHandle};
 pub use identity::{Identity, is_enrolled};
 pub use ingress::{DnsBridge, IngressConfig, IngressSupervisor};
 pub use lease::{

@@ -37,6 +37,7 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{WebSocketStream, client_async_with_config};
 use tracing::{debug, info, warn};
 
+use crate::build::manager::{BuildStart, BuildsError, BuildsHandle};
 use crate::identity::{Identity, IdentityHandle};
 use crate::ingress::{DnsBridge, DnsRequest, IngressSupervisor};
 use crate::interactive::{Door, Interactive, OpenError, StreamKind};
@@ -225,6 +226,10 @@ pub struct SessionSetup {
     pub observed: watch::Receiver<Vec<VmStatus>>,
     /// The verified snapshot the agent started with, if any.
     pub current: Option<Snapshot>,
+    /// The build manager's handle, when the agent runs one. Tests that do not
+    /// care about builds pass `None`, and then every build log request is
+    /// answered `not_found`.
+    pub builds: Option<BuildsHandle>,
 }
 
 /// The session loop: dial, run one session, redial.
@@ -245,6 +250,8 @@ pub struct Session {
     /// The engine handles behind `terminal` and `console` streams (M4), when
     /// the agent runs one.
     interactive: Option<Interactive>,
+    /// The build manager's handle, when the agent runs one.
+    builds: Option<BuildsHandle>,
 }
 
 impl Session {
@@ -258,6 +265,7 @@ impl Session {
             desired,
             observed,
             current,
+            builds,
         } = setup;
         Self {
             identity,
@@ -271,6 +279,7 @@ impl Session {
             dns: None,
             metrics: None,
             interactive: None,
+            builds,
         }
     }
 
@@ -513,6 +522,9 @@ impl Session {
         // A clone keeps the select's borrow off `self`, so a branch may still
         // build a status report that reads the store and the snapshot.
         let mut observed = self.observed.clone();
+        // A build status change is reported like an observed-VM change
+        // (section 5.3).
+        let mut builds = self.builds.as_ref().map(BuildsHandle::statuses);
         let mut last_rx = Instant::now();
 
         loop {
@@ -553,6 +565,19 @@ impl Session {
                     }
                 }
                 changed = observed.changed() => {
+                    if changed.is_ok()
+                        && let Err(e) = self.send_status(&mut sink).await
+                    {
+                        warn!(error = %e, "could not send a status report; reconnecting");
+                        return Ok(SessionEnd::Reconnect);
+                    }
+                }
+                changed = async {
+                    match builds.as_mut() {
+                        Some(statuses) => statuses.changed().await.map_err(|_| ()),
+                        None => std::future::pending().await,
+                    }
+                } => {
                     if changed.is_ok()
                         && let Err(e) = self.send_status(&mut sink).await
                     {
@@ -733,6 +758,24 @@ impl Session {
                 } else if command.kind == "metrics_query" {
                     let body = self.metrics_query(&command);
                     write_message(sink, NodeMessage::CommandResult(body), Some(&raw.id)).await?;
+                } else if command.kind == "build_logs_query" {
+                    match self.build_logs_query(&command).await {
+                        Ok(body) => {
+                            write_message(sink, NodeMessage::CommandResult(body), Some(&raw.id))
+                                .await?;
+                        }
+                        Err(BuildsError::NotFound) => {
+                            write_not_found(sink, &raw.id).await?;
+                        }
+                        Err(other) => {
+                            write_message(
+                                sink,
+                                NodeMessage::CommandResult(bad_result(&other.to_string())),
+                                Some(&raw.id),
+                            )
+                            .await?;
+                        }
+                    }
                 } else {
                     let body = CommandResult {
                         status: CommandStatus::Error,
@@ -1020,6 +1063,47 @@ impl Session {
         }
     }
 
+    /// Answers `command` kind `build_logs_query` (section 5.17).
+    ///
+    /// The answer keeps the oldest lines that fit the 1 MiB frame limit and
+    /// returns fewer rather than a larger message.
+    async fn build_logs_query(&self, command: &Command) -> Result<CommandResult, BuildsError> {
+        let query = parse_build_logs_query(&command.params)?;
+        let Some(builds) = &self.builds else {
+            return Err(BuildsError::NotFound);
+        };
+        let lines = builds
+            .query(&query.build_id, query.after_seq, query.limit)
+            .await?;
+        let total = lines.len();
+        let budget = wire::MAX_MESSAGE_BYTES.saturating_sub(FRAME_HEADROOM);
+        let mut kept: Vec<LogLine> = Vec::new();
+        let mut used = 0usize;
+        for line in lines {
+            let size = wire_size(&line);
+            if !kept.is_empty() && used + size > budget {
+                break;
+            }
+            used += size;
+            kept.push(line);
+        }
+        let detail = if kept.len() < total {
+            format!(
+                "{} line(s), the rest left out to fit the 1 MiB frame limit",
+                kept.len()
+            )
+        } else {
+            format!("{} line(s)", kept.len())
+        };
+        Ok(CommandResult {
+            status: CommandStatus::Ok,
+            detail: Some(detail),
+            error: None,
+            lines: Some(kept),
+            metrics: None,
+        })
+    }
+
     /// Starts one stream (section 5.15) or answers why it could not start.
     async fn on_stream_open<S>(
         &mut self,
@@ -1073,6 +1157,22 @@ impl Session {
                     )),
                     None => Err(bad_result("metrics are not sampled on this node")),
                 },
+                Err(message) => Err(bad_result(&message)),
+            },
+            "build_logs" => match parse_build_logs(&open.params) {
+                Ok((build_id, start)) => {
+                    let follow = match &self.builds {
+                        Some(builds) => builds.follow(&build_id, start).await,
+                        None => Err(BuildsError::NotFound),
+                    };
+                    match follow {
+                        Ok(lines) => {
+                            Ok((spawn_build_logs(stream_id, lines, stream_tx.clone()), None))
+                        }
+                        Err(BuildsError::NotFound) => Err(build_not_found()),
+                        Err(other) => Err(bad_result(&other.to_string())),
+                    }
+                }
                 Err(message) => Err(bad_result(&message)),
             },
             "terminal" => match &self.interactive {
@@ -1273,7 +1373,10 @@ impl Session {
             // Free space needs `statvfs`, which the standard library does not
             // expose; the binary fills a real figure in a later milestone.
             disk_free_gb: 0.0,
-            builds: Vec::new(),
+            builds: self
+                .builds
+                .as_ref()
+                .map_or_else(Vec::new, BuildsHandle::current),
         };
         write_message(sink, NodeMessage::StatusReport(report), None).await
     }
@@ -1438,6 +1541,102 @@ fn interactive_unavailable() -> CommandResult {
         lines: None,
         metrics: None,
     }
+}
+
+/// Parses `after_seq`, a non-negative integer cursor.
+fn after_seq_param(params: &serde_json::Value) -> Result<Option<u64>, String> {
+    match params.get("after_seq") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| "after_seq must be a non-negative integer".to_owned()),
+    }
+}
+
+/// The selector and replay of a `build_logs` stream (section 5.15).
+fn parse_build_logs(params: &serde_json::Value) -> Result<(String, BuildStart), String> {
+    let build_id =
+        string_param(params, "build_id")?.ok_or_else(|| "build_id is required".to_owned())?;
+    let tail = tail_param(params)?;
+    let after_seq = after_seq_param(params)?;
+    let start = match (tail, after_seq) {
+        (Some(_), Some(_)) => {
+            return Err("tail and after_seq cannot both be given".to_owned());
+        }
+        (Some(tail), None) => BuildStart::Tail(tail),
+        (None, Some(seq)) => BuildStart::After(seq),
+        // The contract's default is `tail: 0`: no replay, live lines only.
+        (None, None) => BuildStart::Tail(0),
+    };
+    Ok((build_id, start))
+}
+
+/// A parsed `build_logs_query` (section 5.17).
+struct BuildLogsQuery {
+    build_id: String,
+    after_seq: u64,
+    limit: usize,
+}
+
+/// The default page size of `build_logs_query` (section 5.17).
+const BUILD_LOG_QUERY_LIMIT: usize = 500;
+/// The largest page size of `build_logs_query` (section 5.17).
+const BUILD_LOG_QUERY_MAX_LIMIT: usize = 1_000;
+
+fn parse_build_logs_query(params: &serde_json::Value) -> Result<BuildLogsQuery, BuildsError> {
+    let build_id = string_param(params, "build_id")
+        .map_err(BuildsError::BadRequest)?
+        .ok_or_else(|| BuildsError::BadRequest("build_id is required".to_owned()))?;
+    let after_seq = after_seq_param(params)
+        .map_err(BuildsError::BadRequest)?
+        .unwrap_or(0);
+    let limit = match params.get("limit") {
+        None | Some(serde_json::Value::Null) => BUILD_LOG_QUERY_LIMIT,
+        Some(value) => value
+            .as_u64()
+            .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX))
+            .ok_or_else(|| {
+                BuildsError::BadRequest("limit must be a non-negative integer".to_owned())
+            })?,
+    };
+    Ok(BuildLogsQuery {
+        build_id,
+        after_seq,
+        limit: limit.min(BUILD_LOG_QUERY_MAX_LIMIT),
+    })
+}
+
+/// The `command_result` with the section 5.18 code `not_found` for a build
+/// this node does not have.
+fn build_not_found() -> CommandResult {
+    let message = "this node has no such build";
+    CommandResult {
+        status: CommandStatus::Error,
+        detail: Some(message.to_owned()),
+        error: Some(ErrorBody {
+            code: ErrorCode::NotFound,
+            message: message.to_owned(),
+        }),
+        lines: None,
+        metrics: None,
+    }
+}
+
+/// Writes a [`build_not_found`] answer to the frame `re`.
+async fn write_not_found<S>(
+    sink: &mut SplitSink<WebSocketStream<S>, Message>,
+    re: &str,
+) -> Result<(), AgentError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    write_message(
+        sink,
+        NodeMessage::CommandResult(build_not_found()),
+        Some(re),
+    )
+    .await
 }
 
 /// A `command_result` with `bad_message`.
@@ -1715,6 +1914,24 @@ fn spawn_deployment_logs(
     })
 }
 
+fn spawn_build_logs(
+    stream_id: String,
+    mut lines: mpsc::Receiver<Vec<LogLine>>,
+    tx: mpsc::Sender<NodeMessage>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut seq = 1u64;
+        while let Some(batch) = lines.recv().await {
+            if !send_lines(&tx, &stream_id, &mut seq, batch).await {
+                return;
+            }
+        }
+        // The manager ends the follow once the build is terminal and every
+        // line was sent (section 5.8).
+        send_end(&tx, &stream_id, StreamEndReason::Completed, None).await;
+    })
+}
+
 /// Whether a `stop` channel asked the agent to shut down.
 pub(crate) async fn wait_stop(mut stop: watch::Receiver<bool>) {
     loop {
@@ -1784,8 +2001,14 @@ mod tests {
     use tokio::io::DuplexStream;
     use tokio_tungstenite::{accept_async, client_async};
 
+    use crate::build::fake::FakeBuilder;
+    use crate::build::log::BuildLogs;
+    use crate::build::manager::{BuildManager, BuildsHandle};
     use crate::identity::{self, Identity, IdentityHandle};
     use crate::logs::NewLogLine;
+    use crate::store::BuildRecord;
+    use quoro_engine::FakeEngine;
+    use quoro_proto::wire::{BuildLimits, BuildState, LogStream, Spec, SpecBuild, SpecNetwork};
 
     #[test]
     fn session_urls_are_always_wss_with_the_session_path() {
@@ -1927,6 +2150,20 @@ mod tests {
         + Send
         + 'static,
     ) -> (SessionEnd, NodeStore) {
+        drive_session_with(dir, None, primary).await
+    }
+
+    /// The same, with a build manager's handle the session may serve.
+    async fn drive_session_with(
+        dir: &TempDir,
+        builds: Option<BuildsHandle>,
+        primary: impl FnOnce(
+            WebSocketStream<DuplexStream>,
+            NodeStore,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + 'static,
+    ) -> (SessionEnd, NodeStore) {
         let key = sign::signing_key_from_seed(&[4; 32]);
         let identity = identity_files(dir.path(), &key);
         let store = NodeStore::open(dir.path()).await.unwrap();
@@ -1939,6 +2176,7 @@ mod tests {
             desired,
             observed: observed_rx,
             current: None,
+            builds,
         });
 
         let (client, server) = tokio::io::duplex(1 << 20);
@@ -2204,6 +2442,7 @@ mod tests {
             desired,
             observed: observed_rx,
             current: None,
+            builds: None,
         })
         .with_metrics(ring);
 
@@ -2354,6 +2593,359 @@ mod tests {
                 let end = read_until(&mut ws, "stream_end").await;
                 assert_eq!(end["body"]["stream_id"], "msg_metrics_stream");
                 assert_eq!(end["body"]["reason"], "cancelled");
+            })
+        })
+        .await;
+        assert_eq!(end, SessionEnd::Reconnect);
+    }
+
+    // --- build logs (section 5.15, 5.17, ADR 0119) -------------------------
+
+    const BUILD_ID: &str = "bld_1";
+    const BUILD_APP: &str = "app_1";
+
+    /// Seeds one build row and two log lines in `dir`.
+    async fn seed_build(dir: &TempDir, status: BuildState) {
+        let store = NodeStore::open(dir.path()).await.unwrap();
+        let logs = BuildLogs::new(dir.path().join("builds").join("logs"));
+        logs.append(BUILD_APP, BUILD_ID, LogStream::Stdout, Some(1), "first")
+            .await
+            .unwrap();
+        logs.append(BUILD_APP, BUILD_ID, LogStream::Stderr, None, "second")
+            .await
+            .unwrap();
+        let row = BuildRecord {
+            build_id: BUILD_ID.to_owned(),
+            app_id: BUILD_APP.to_owned(),
+            status,
+            failed_phase: None,
+            commit: Some("c".repeat(40)),
+            image_digest: None,
+            error: None,
+            failed_step: None,
+            log_path: None,
+            created_at: "2026-11-03T10:00:00.000000000Z".to_owned(),
+            started_at: None,
+            finished_at: None,
+        };
+        store.save_build(&row).await.unwrap();
+    }
+
+    /// A handle over the store in `dir`, with no manager running.
+    async fn builds_handle(dir: &TempDir) -> BuildsHandle {
+        let store = NodeStore::open(dir.path()).await.unwrap();
+        let (manager, handle) = BuildManager::new(
+            std::sync::Arc::new(FakeEngine::new()),
+            std::sync::Arc::new(FakeBuilder::new()),
+            store,
+        );
+        drop(manager);
+        handle
+    }
+
+    /// A snapshot with `builds` and no VMs.
+    fn build_snapshot(rev: u64, builds: Vec<SpecBuild>) -> Snapshot {
+        Snapshot {
+            rev,
+            state: DesiredState {
+                rev,
+                issued_at: "2026-11-02T10:15:31Z".to_owned(),
+                term: 1,
+                spec: Spec {
+                    vms: Vec::new(),
+                    routes: Vec::new(),
+                    network: SpecNetwork {
+                        subnet: "10.42.1.0/24".to_owned(),
+                        gateway: "10.42.1.1".to_owned(),
+                    },
+                    ingress: None,
+                    builds,
+                },
+                signature: String::new(),
+            },
+        }
+    }
+
+    fn spec_build(build_id: &str, app_id: &str) -> SpecBuild {
+        SpecBuild {
+            build_id: build_id.to_owned(),
+            app_id: app_id.to_owned(),
+            project_id: "prj_1".to_owned(),
+            repo_url: "https://github.com/example/blog.git".to_owned(),
+            git_ref: "main".to_owned(),
+            dockerfile_path: "Dockerfile".to_owned(),
+            context_dir: ".".to_owned(),
+            target: None,
+            build_args: std::collections::BTreeMap::new(),
+            secrets: std::collections::BTreeMap::new(),
+            limits: BuildLimits::default(),
+            cancelled: false,
+        }
+    }
+
+    fn build_query_frame(build_id: &str, id: &str) -> String {
+        ControlMessage::Command(Command {
+            kind: "build_logs_query".to_owned(),
+            params: json!({"build_id": build_id, "after_seq": 0, "limit": 10}),
+        })
+        .to_frame(id, None)
+        .to_text()
+    }
+
+    #[tokio::test]
+    async fn build_logs_query_answers_with_the_build_lines() {
+        let dir = TempDir::new();
+        seed_build(&dir, BuildState::Succeeded).await;
+        let handle = builds_handle(&dir).await;
+        let (end, _store) = drive_session_with(&dir, Some(handle), |mut ws, _store| {
+            Box::pin(async move {
+                handshake(&mut ws).await;
+                send(&mut ws, build_query_frame(BUILD_ID, "msg_build_query")).await;
+                let answer = read_until(&mut ws, "command_result").await;
+                assert_eq!(answer["re"], "msg_build_query");
+                assert_eq!(answer["body"]["status"], "ok");
+                let lines = answer["body"]["lines"].as_array().unwrap();
+                assert_eq!(lines.len(), 2);
+                assert_eq!(lines[0]["seq"], 1);
+                assert_eq!(lines[0]["vertex"], 1);
+                assert_eq!(lines[0]["stream"], "stdout");
+                assert_eq!(lines[1]["stream"], "stderr");
+                assert!(
+                    lines[0].get("vm_id").is_none(),
+                    "a build line never carries a vm_id"
+                );
+            })
+        })
+        .await;
+        assert_eq!(end, SessionEnd::Reconnect);
+    }
+
+    #[tokio::test]
+    async fn a_build_log_stream_replays_and_completes() {
+        let dir = TempDir::new();
+        seed_build(&dir, BuildState::Succeeded).await;
+        let handle = builds_handle(&dir).await;
+        let (end, _store) = drive_session_with(&dir, Some(handle), |mut ws, _store| {
+            Box::pin(async move {
+                handshake(&mut ws).await;
+                send(
+                    &mut ws,
+                    ControlMessage::StreamOpen(StreamOpen {
+                        stream_id: "msg_build_stream".to_owned(),
+                        kind: "build_logs".to_owned(),
+                        params: json!({"build_id": BUILD_ID, "after_seq": 0}),
+                    })
+                    .to_frame("msg_build_open", None)
+                    .to_text(),
+                )
+                .await;
+                let data = read_until(&mut ws, "stream_data").await;
+                assert_eq!(data["body"]["stream_id"], "msg_build_stream");
+                let lines = data["body"]["lines"].as_array().unwrap();
+                assert_eq!(lines.len(), 2);
+                assert_eq!(lines[0]["seq"], 1);
+                assert_eq!(lines[1]["seq"], 2);
+                let end = read_until(&mut ws, "stream_end").await;
+                assert_eq!(end["body"]["reason"], "completed");
+            })
+        })
+        .await;
+        assert_eq!(end, SessionEnd::Reconnect);
+    }
+
+    #[tokio::test]
+    async fn a_build_log_stream_follows_a_build_to_completion() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(dir.path()).await.unwrap();
+        let (manager, handle) = BuildManager::new(
+            std::sync::Arc::new(FakeEngine::new()),
+            std::sync::Arc::new(FakeBuilder::new().with_delay(Duration::from_millis(150))),
+            store.clone(),
+        );
+        let (_snapshots, snapshots_rx) = watch::channel(Some(build_snapshot(
+            1,
+            vec![spec_build(BUILD_ID, BUILD_APP)],
+        )));
+        let (stop, stop_rx) = watch::channel(false);
+        let manager = tokio::spawn(
+            manager
+                .with_tick(Duration::from_millis(10))
+                .run(snapshots_rx, wait_stop(stop_rx)),
+        );
+        let appeared = tokio::time::timeout(Duration::from_secs(5), async {
+            while store.build(BUILD_ID).await.unwrap().is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(appeared.is_ok(), "the manager never created the build row");
+
+        let (end, _store) = drive_session_with(&dir, Some(handle), move |mut ws, _store| {
+            Box::pin(async move {
+                handshake(&mut ws).await;
+                send(
+                    &mut ws,
+                    ControlMessage::StreamOpen(StreamOpen {
+                        stream_id: "msg_build_live".to_owned(),
+                        kind: "build_logs".to_owned(),
+                        params: json!({"build_id": BUILD_ID, "after_seq": 0}),
+                    })
+                    .to_frame("msg_build_live_open", None)
+                    .to_text(),
+                )
+                .await;
+                let mut sent = Vec::new();
+                loop {
+                    let frame = read_frame(&mut ws).await;
+                    match frame["type"].as_str() {
+                        Some("stream_data") => {
+                            sent.extend(frame["body"]["lines"].as_array().unwrap().iter().cloned());
+                        }
+                        Some("stream_end") => {
+                            assert_eq!(frame["body"]["reason"], "completed");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                assert!(!sent.is_empty(), "no live line reached the stream");
+                for (index, line) in sent.iter().enumerate() {
+                    assert_eq!(
+                        line["seq"].as_u64().unwrap(),
+                        index as u64 + 1,
+                        "gap-free and in order"
+                    );
+                }
+                assert!(
+                    sent.last().unwrap()["line"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("build succeeded: ")
+                );
+            })
+        })
+        .await;
+        assert_eq!(end, SessionEnd::Reconnect);
+        let _ = stop.send(true);
+        let _ = manager.await;
+    }
+
+    #[tokio::test]
+    async fn status_report_carries_the_builds() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(dir.path()).await.unwrap();
+        let builder = FakeBuilder::new();
+        builder.script(BUILD_ID, crate::build::fake::FakeOutcome::Hang);
+        let (manager, handle) = BuildManager::new(
+            std::sync::Arc::new(FakeEngine::new()),
+            std::sync::Arc::new(builder),
+            store,
+        );
+        let (_snapshots, snapshots_rx) = watch::channel(Some(build_snapshot(
+            1,
+            vec![spec_build(BUILD_ID, BUILD_APP)],
+        )));
+        let (stop, stop_rx) = watch::channel(false);
+        let manager = tokio::spawn(
+            manager
+                .with_tick(Duration::from_millis(10))
+                .run(snapshots_rx, wait_stop(stop_rx)),
+        );
+        let reported = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let statuses = handle.current();
+                if !statuses.is_empty() {
+                    return statuses;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the manager reported the build");
+        assert_eq!(reported[0].build_id, BUILD_ID);
+
+        let (end, _store) = drive_session_with(&dir, Some(handle), |mut ws, _store| {
+            Box::pin(async move {
+                let hello = read_frame(&mut ws).await;
+                send(
+                    &mut ws,
+                    ControlMessage::Welcome(Welcome {
+                        cluster_id: "cls_test".to_owned(),
+                        term: 1,
+                        server_time: "2026-11-02T10:15:30Z".to_owned(),
+                        heartbeat_interval_ms: 500,
+                        session_timeout_ms: 5_000,
+                        primary_node_id: "nod_primary".to_owned(),
+                    })
+                    .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
+                    .to_text(),
+                )
+                .await;
+                let report = read_until(&mut ws, "status_report").await;
+                let builds = report["body"]["builds"].as_array().unwrap();
+                assert_eq!(builds.len(), 1);
+                assert_eq!(builds[0]["build_id"], BUILD_ID);
+                assert!(
+                    ["queued", "preparing"].contains(&builds[0]["status"].as_str().unwrap()),
+                    "{}",
+                    builds[0]["status"]
+                );
+            })
+        })
+        .await;
+        assert_eq!(end, SessionEnd::Reconnect);
+        let _ = stop.send(true);
+        let _ = manager.await;
+    }
+
+    #[tokio::test]
+    async fn an_unknown_build_is_not_found() {
+        let dir = TempDir::new();
+        let handle = builds_handle(&dir).await;
+        let (end, _store) = drive_session_with(&dir, Some(handle), |mut ws, _store| {
+            Box::pin(async move {
+                handshake(&mut ws).await;
+                send(
+                    &mut ws,
+                    build_query_frame("bld_missing", "msg_missing_query"),
+                )
+                .await;
+                let answer = read_until(&mut ws, "command_result").await;
+                assert_eq!(answer["re"], "msg_missing_query");
+                assert_eq!(answer["body"]["status"], "error");
+                assert_eq!(answer["body"]["error"]["code"], "not_found");
+
+                send(
+                    &mut ws,
+                    ControlMessage::StreamOpen(StreamOpen {
+                        stream_id: "msg_missing_stream".to_owned(),
+                        kind: "build_logs".to_owned(),
+                        params: json!({"build_id": "bld_missing"}),
+                    })
+                    .to_frame("msg_missing_open", None)
+                    .to_text(),
+                )
+                .await;
+                let answer = read_until(&mut ws, "command_result").await;
+                assert_eq!(answer["re"], "msg_missing_open");
+                assert_eq!(answer["body"]["status"], "error");
+                assert_eq!(answer["body"]["error"]["code"], "not_found");
+            })
+        })
+        .await;
+        assert_eq!(end, SessionEnd::Reconnect);
+    }
+
+    #[tokio::test]
+    async fn without_a_build_manager_every_build_request_is_not_found() {
+        let dir = TempDir::new();
+        seed_build(&dir, BuildState::Succeeded).await;
+        let (end, _store) = drive_session(&dir, |mut ws, _store| {
+            Box::pin(async move {
+                handshake(&mut ws).await;
+                send(&mut ws, build_query_frame(BUILD_ID, "msg_no_manager")).await;
+                let answer = read_until(&mut ws, "command_result").await;
+                assert_eq!(answer["body"]["error"]["code"], "not_found");
             })
         })
         .await;

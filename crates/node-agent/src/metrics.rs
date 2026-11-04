@@ -729,6 +729,7 @@ Buffers:          100000 kB
             lease_id: None,
             fencing_token: None,
             volumes: Vec::new(),
+            build_id: None,
         }
     }
 
@@ -747,6 +748,7 @@ Buffers:          100000 kB
                         gateway: "10.0.0.1".to_owned(),
                     },
                     ingress: None,
+                    builds: Vec::new(),
                 },
                 signature: String::new(),
             },
