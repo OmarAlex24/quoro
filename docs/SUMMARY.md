@@ -146,6 +146,8 @@
   - [0134: Curated catalog: one TOML file per template under catalog/ in the public repo, embedded in the signed release binary; images pinned by digest; upstream cosign signatures verified in CI when a template is added or bumped, not on nodes](adr/0134-curated-catalog-one-toml-file-per-template-under-catalog-in.md)
   - [0135: Q-0099: invited users change their own password through a human-only self-service operation (current and new password), added in a standalone contract PR during M4; no must_change_password flag yet](adr/0135-q-0099-invited-users-change-their-own-password-through-a.md)
   - [0136: Q-0101: pre-M4 VMs get the terminal and console only after a redeploy; the release notes say so and the panel shows a 'redeploy to enable' hint instead of the action; the node agent never recreates a VM on its own](adr/0136-q-0101-pre-m4-vms-get-the-terminal-and-console-only-after-a.md)
+  - [0137: v0.1.0 ships without the trademark search, from main after the M4 demo approval, still labeled an experimental preview (it now contains M4); the first general release is a later tag after the M4 close-out](adr/0137-v0-1-0-ships-without-the-trademark-search-from-main-after.md)
+  - [0138: Vulnerability tracking and patching in M5a: Quoro knows the CVEs of what it ships (guest kernel, Cloud Hypervisor, quoro-init, its own crates) and of each app's image, shows them in the panel, raises an app.vulnerable incident that can wake an agent, and rebuilds Git apps on a patched base with one action](adr/0138-vulnerability-tracking-and-patching-in-m5a-quoro-knows-the.md)
 
 # Background research
 

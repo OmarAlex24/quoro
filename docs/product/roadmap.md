@@ -4,7 +4,7 @@ Status: draft for review. Source: D-0033 (milestones), D-0034 (out of scope), D-
 
 This turns D-0033 into a gated plan and adds no features: where another decision explains how an item behaves, the decision is cited next to the item, and every claim that rests on an unverified external fact is either answered in `docs/research/` or marked as a hypothesis.
 
-> **Release callout: first public release (D-0064).** M3 tags v0.1.0 as an experimental preview with signed builds, not for production; M4 complete is the first general release and the broad announcement [D-0064]. The domain and trademark checks (Q-0008) come before the M3 tag [D-0064].
+> **Release callout: first public release (D-0064, D-0137).** v0.1.0 is an experimental preview with signed builds, not for production; it was tagged after the M4 demo and contains M3 and M4 [D-0137]. The first general release and the broad announcement are a later tag after the M4 close-out [D-0064, D-0137]. The domain is registered; the trademark search was waived [D-0137].
 
 ---
 
@@ -192,7 +192,7 @@ The ingress backend is an embedded Rust reverse proxy — hyper, rustls and an A
 
 rmcp 3.8 is the official Rust MCP SDK, with three semver-major releases between March and July 2026, so the MCP surface is pinned to a checked version (docs/research/rust-api-and-mcp-tooling.md).
 
-> **Release callout (D-0064).** This milestone ends with the v0.1.0 tag: an experimental preview with signed builds, not for production [D-0064]. M4 complete is the first general release and the broad announcement [D-0064]. The domain and trademark checks (Q-0008) must be done before this tag [D-0064].
+> **Release callout (D-0064, D-0137).** v0.1.0, the experimental preview planned for the end of this milestone, was tagged after the M4 demo instead and contains M4 too [D-0137].
 
 #### Definition of Done
 
@@ -285,6 +285,7 @@ rmcp 3.8 is the official Rust MCP SDK, with three semver-major releases between 
 - HA policies are named `none`, `cold`, `warm` and `hot`, and the panel shows what each costs [D-0020].
 - Local, non-replicated persistent volumes: create, attach to an app, survive redeploy [D-0052].
 - Off-site copy of the audit log to an S3-compatible bucket with object lock [D-0031, D-0053].
+- Vulnerability tracking (ADR 0138): Quoro lists the components it ships (guest kernel, Cloud Hypervisor, its own crates) and checks them daily against OSV; each app image gets a package inventory on its node, matched on the primary, shown per app in the panel; a critical finding opens an `app.vulnerable` incident that can wake an agent; Git apps can rebuild on a refreshed base, optionally on their own. Host kernels stay the operator's: Quoro reports them and never upgrades them. A short spike comes first.
 
 Cloudflare Load Balancing is a paid add-on from $5/month; an HTTPS monitor on the app hostname tests the app; the load balancer sees all replicas of one tunnel as one endpoint; cloudflared replicas have no documented app health check (Hypothesis); per-node failover needs one tunnel per node behind a load balancer (docs/research/cloudflare-lb-and-tunnel.md).
 
