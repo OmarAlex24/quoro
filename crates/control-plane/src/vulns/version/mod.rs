@@ -220,30 +220,41 @@ pub fn evaluate(
 
 /// The ranges that decide for `installed`.
 ///
-/// A Linux kernel record writes one range per stable series, and the ranges
-/// overlap: `introduced 6.2.0, fixed 6.12.24` next to `introduced 6.12.0,
-/// fixed 6.13.12` says "6.12 is fixed in 6.12.24 and 6.13 in 6.13.12", yet
-/// read as plain OSV ranges the second one flags every 6.12 release after the
-/// fix. So for the Linux ecosystem (whose only package is the kernel), when
-/// any `ECOSYSTEM` range names a fix in the installed version's own
-/// `major.minor` series, only the ranges that name such a fix are read: the
-/// version is affected when it is below that fix and at or above the range's
-/// introduced version. Without a fix in its series, every range is read as
-/// usual. Other ecosystems always read every range.
+/// Other ecosystems always read every range. The Linux ecosystem (whose only
+/// package is the kernel) applies two rules, in this order:
+///
+/// 1. An `ECOSYSTEM` range whose fixes all lie below its introduced version
+///    is dropped. Records carry ranges like `introduced 6.7.0, fixed 6.6.70`;
+///    the OSV walk sorts the events by version and reads that as "affected
+///    from 6.7.0 on, never fixed". The record's other ranges still decide.
+///    See [`inverted`].
+/// 2. A Linux kernel record writes one range per stable series, and the
+///    ranges overlap: `introduced 6.2.0, fixed 6.12.24` next to `introduced
+///    6.12.0, fixed 6.13.12` says "6.12 is fixed in 6.12.24 and 6.13 in
+///    6.13.12", yet read as plain OSV ranges the second one flags every 6.12
+///    release after the fix. So when any remaining `ECOSYSTEM` range names a
+///    fix in the installed version's own `major.minor` series, only the
+///    ranges that name such a fix are read: the version is affected when it
+///    is below that fix and at or above the range's introduced version.
+///    Without a fix in its series, every remaining range is read as usual.
 fn series_ranges<'a>(
     ecosystem_order: Option<Order>,
     installed: &str,
     ranges: &'a [Range],
 ) -> Vec<&'a Range> {
-    let own_series = match ecosystem_order {
-        Some(Order::Kernel) => kernel::series(installed),
-        _ => None,
-    };
-    let Some(own_series) = own_series else {
+    if ecosystem_order != Some(Order::Kernel) {
         return ranges.iter().collect();
+    }
+    let ranges: Vec<&Range> = ranges
+        .iter()
+        .filter(|range| !(range.kind == "ECOSYSTEM" && inverted(&range.events)))
+        .collect();
+    let Some(own_series) = kernel::series(installed) else {
+        return ranges;
     };
     let in_series: Vec<&Range> = ranges
         .iter()
+        .copied()
         .filter(|range| {
             range.kind == "ECOSYSTEM"
                 && range.events.iter().any(|event| {
@@ -255,10 +266,35 @@ fn series_ranges<'a>(
         })
         .collect();
     if in_series.is_empty() {
-        ranges.iter().collect()
+        ranges
     } else {
         in_series
     }
+}
+
+/// Whether a Linux kernel range's fixes all lie below its introduced version.
+///
+/// True only when the range names at least one introduced version other than
+/// `"0"`, at least one fix, and every fix is below every introduced version
+/// in the kernel order. A range with a version that does not parse is not
+/// called inverted here; [`evaluate_range`] already skips it.
+fn inverted(events: &[Event]) -> bool {
+    let introduced: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event.introduced.as_deref())
+        .collect();
+    let fixed: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event.fixed.as_deref())
+        .collect();
+    if introduced.is_empty() || fixed.is_empty() || introduced.contains(&"0") {
+        return false;
+    }
+    fixed.iter().all(|fix| {
+        introduced
+            .iter()
+            .all(|start| kernel::compare(fix, start) == Some(Ordering::Less))
+    })
 }
 
 /// What one usable range said.
@@ -827,6 +863,134 @@ mod tests {
             evaluate("crates.io", "6.12.115", &record, &[]),
             fixed_in("6.13.12")
         );
+    }
+
+    /// CVE-2023-52920's `Linux`/`Kernel` ranges as OSV publishes them.
+    fn cve_2023_52920() -> Vec<Range> {
+        kernel_record(&[("5.3.0", &["6.6.64"]), ("6.7.0", &["6.6.70", "6.6.140"])])
+    }
+
+    /// CVE-2024-36968's `Linux`/`Kernel` ranges as OSV publishes them.
+    fn cve_2024_36968() -> Vec<Range> {
+        kernel_record(&[
+            ("2.6.39", &["6.1.191"]),
+            ("6.2.0", &["6.6.32"]),
+            ("6.7.0", &["6.8.11"]),
+            ("6.9.0", &["6.9.2"]),
+            ("6.10.0", &["6.9.4"]),
+        ])
+    }
+
+    #[test]
+    fn evaluate_kernel_ignores_a_range_fixed_below_its_introduced_version() {
+        let record = cve_2023_52920();
+        // `introduced 6.7.0, fixed 6.6.70` no longer means "from 6.7.0 on".
+        assert_eq!(evaluate("Linux", "7.2.15", &record, &[]), None);
+        assert_eq!(evaluate("Linux", "7.2.15-quoro", &record, &[]), None);
+        assert_eq!(evaluate("Linux", "6.12.115", &record, &[]), None);
+        assert_eq!(evaluate("Linux", "6.7.5", &record, &[]), None);
+        // The valid range of the same record still decides.
+        assert_eq!(
+            evaluate("Linux", "6.6.63", &record, &[]),
+            fixed_in("6.6.64")
+        );
+        assert_eq!(evaluate("Linux", "5.3.0", &record, &[]), fixed_in("6.6.64"));
+        assert_eq!(evaluate("Linux", "6.6.64", &record, &[]), None);
+        assert_eq!(evaluate("Linux", "5.2.9", &record, &[]), None);
+
+        let record = cve_2024_36968();
+        assert_eq!(evaluate("Linux", "7.2.15", &record, &[]), None);
+        assert_eq!(evaluate("Linux", "6.12.115", &record, &[]), None);
+        assert_eq!(evaluate("Linux", "6.10.5", &record, &[]), None);
+        assert_eq!(evaluate("Linux", "6.9.1", &record, &[]), fixed_in("6.9.2"));
+        assert_eq!(evaluate("Linux", "6.9.3", &record, &[]), None);
+        assert_eq!(evaluate("Linux", "6.8.5", &record, &[]), fixed_in("6.8.11"));
+        assert_eq!(
+            evaluate("Linux", "6.6.31", &record, &[]),
+            fixed_in("6.6.32")
+        );
+        assert_eq!(
+            evaluate("Linux", "6.1.190", &record, &[]),
+            fixed_in("6.1.191")
+        );
+    }
+
+    #[test]
+    fn evaluate_kernel_keeps_a_range_with_one_fix_above_its_introduced_version() {
+        // CVE-2026-80724: `introduced 6.19.0, fixed 6.18.50, fixed 7.1.11` has
+        // a fix above 6.19.0 and is read; `introduced 7.3.0, fixed 7.2.4` is not.
+        let record = kernel_record(&[
+            ("6.13.0", &["6.18.47"]),
+            ("6.19.0", &["6.18.50", "7.1.11"]),
+            ("7.2.0", &["7.2.1"]),
+            ("7.3.0", &["7.2.4"]),
+        ]);
+        assert_eq!(evaluate("Linux", "7.3.5", &record, &[]), None);
+        assert_eq!(
+            evaluate("Linux", "6.19.5", &record, &[]),
+            fixed_in("7.1.11")
+        );
+        assert_eq!(evaluate("Linux", "7.2.0", &record, &[]), fixed_in("7.2.1"));
+        assert_eq!(evaluate("Linux", "7.2.15", &record, &[]), None);
+    }
+
+    #[test]
+    fn evaluate_kernel_cve_2026_98432_still_resolves() {
+        // CVE-2026-98432's ranges: no range is inverted, so nothing changes.
+        let record = kernel_record(&[
+            ("4.4.0", &["5.10.272"]),
+            ("5.11.0", &["5.15.223"]),
+            ("5.16.0", &["6.1.190"]),
+            ("6.2.0", &["6.6.159"]),
+            ("6.7.0", &["6.12.113"]),
+            ("6.13.0", &["6.18.56"]),
+            ("6.19.0", &["7.2.10"]),
+        ]);
+        assert_eq!(evaluate("Linux", "7.2.15", &record, &[]), None);
+        assert_eq!(evaluate("Linux", "7.2.10", &record, &[]), None);
+        assert_eq!(evaluate("Linux", "7.2.8", &record, &[]), fixed_in("7.2.10"));
+        assert_eq!(evaluate("Linux", "6.12.113", &record, &[]), None);
+        assert_eq!(
+            evaluate("Linux", "6.12.100", &record, &[]),
+            fixed_in("6.12.113")
+        );
+    }
+
+    #[test]
+    fn evaluate_inverted_ranges_are_only_ignored_for_linux() {
+        // The same shape under a package ecosystem keeps the plain OSV reading.
+        let record = kernel_record(&[("6.7.0", &["6.6.70"])]);
+        assert_eq!(
+            evaluate("crates.io", "7.0.0", &record, &[]),
+            Some(Hit { fixed: None })
+        );
+        assert_eq!(evaluate("Linux", "7.0.0", &record, &[]), None);
+    }
+
+    #[test]
+    fn inverted_needs_every_fix_below_a_real_introduced_version() {
+        let range = |introduced: &[&str], fixes: &[&str]| -> Vec<Event> {
+            introduced
+                .iter()
+                .map(|version| event(Some(version), None, None))
+                .chain(fixes.iter().map(|fixed| event(None, Some(fixed), None)))
+                .collect()
+        };
+        assert!(inverted(&range(&["6.7.0"], &["6.6.70", "6.6.140"])));
+        assert!(inverted(&range(&["6.10.0"], &["6.9.4"])));
+        assert!(!inverted(&range(&["6.7.0"], &["6.6.70", "6.8.1"])));
+        assert!(!inverted(&range(&["6.7.0"], &["6.7.0"])));
+        assert!(!inverted(&range(&["5.3.0"], &["6.6.64"])));
+        // Several introduced versions: every fix must be below all of them.
+        assert!(!inverted(&range(&["6.1.0", "6.7.0"], &["6.6.70"])));
+        assert!(inverted(&range(&["6.7.0", "6.8.0"], &["6.6.70"])));
+        // `introduced: "0"` is below everything.
+        assert!(!inverted(&range(&["0"], &["6.6.70"])));
+        // No fix, no introduced version, or a version that does not parse.
+        assert!(!inverted(&range(&["6.7.0"], &[])));
+        assert!(!inverted(&range(&[], &["6.6.70"])));
+        assert!(!inverted(&range(&["6.7.0"], &["not a version"])));
+        assert!(!inverted(&range(&["no digits"], &["6.6.70"])));
     }
 
     #[test]
