@@ -273,6 +273,10 @@ pub struct Reconciler<E: Engine> {
     ready_volumes: HashSet<String>,
     /// The image-inventory transport, when the agent runs one (section 5.26).
     inventory: Option<crate::inventory::InventoryHub>,
+    /// The edge manager, which applies `spec.edge` (section 6.8). A snapshot
+    /// with `spec.edge` counts as applied only once the manager has applied
+    /// that revision. `None` in tests that only exercise the engine.
+    edge: Option<Arc<crate::edge::EdgeManager>>,
 }
 
 impl<E: Engine + 'static> Reconciler<E> {
@@ -309,6 +313,7 @@ impl<E: Engine + 'static> Reconciler<E> {
                 volumes_out,
                 ready_volumes: HashSet::new(),
                 inventory: None,
+                edge: None,
             },
             receiver,
         )
@@ -334,6 +339,14 @@ impl<E: Engine + 'static> Reconciler<E> {
     #[must_use]
     pub fn with_ingress(mut self, ingress: Arc<crate::ingress::IngressSupervisor>) -> Self {
         self.ingress = Some(ingress);
+        self
+    }
+
+    /// Attaches the edge manager: a snapshot with `spec.edge` is recorded as
+    /// applied only after the manager applied that revision (section 6.8).
+    #[must_use]
+    pub fn with_edge(mut self, edge: Arc<crate::edge::EdgeManager>) -> Self {
+        self.edge = Some(edge);
         self
     }
 
@@ -435,8 +448,14 @@ impl<E: Engine + 'static> Reconciler<E> {
             .collect();
 
         // A machine without the `node` role (an edge-only machine) gets no
-        // `spec.network` and runs no VM (section 5.11).
+        // `spec.network` and runs no VM (section 5.11). Its apply loop runs
+        // only the network and route steps (section 6.8): the edge manager
+        // and the mesh manager apply them, so the revision counts as applied
+        // once the edge manager has it.
         let Some(spec_network) = spec.network.as_ref() else {
+            if self.edge_applied(snapshot) {
+                self.record_applied(snapshot.rev).await;
+            }
             return self.publish().await;
         };
         let Some(subnet) = Subnet::parse(&spec_network.subnet, &spec_network.gateway) else {
@@ -501,15 +520,32 @@ impl<E: Engine + 'static> Reconciler<E> {
         }
         // --- end ingress hook ---
 
-        if reached
-            && snapshot.rev > self.store.applied_rev().await.unwrap_or(0)
-            && let Err(e) = self.store.set_applied_rev(snapshot.rev).await
-        {
-            warn!(error = %e, "could not record the applied revision");
+        if reached && self.edge_applied(snapshot) {
+            self.record_applied(snapshot.rev).await;
         }
 
         self.health_pass(Some(snapshot)).await;
         self.publish().await
+    }
+
+    /// Whether the edge part of `snapshot` is applied: always when the
+    /// snapshot has no `spec.edge` or no edge manager is attached, otherwise
+    /// once the manager has applied this revision or a newer one.
+    fn edge_applied(&self, snapshot: &Snapshot) -> bool {
+        match (&snapshot.state.spec.edge, &self.edge) {
+            (Some(_), Some(edge)) => edge.applied_rev() >= snapshot.rev,
+            _ => true,
+        }
+    }
+
+    /// Records `rev` as the newest fully reconciled revision, never moving
+    /// it backwards.
+    async fn record_applied(&self, rev: u64) {
+        if rev > self.store.applied_rev().await.unwrap_or(0)
+            && let Err(e) = self.store.set_applied_rev(rev).await
+        {
+            warn!(error = %e, "could not record the applied revision");
+        }
     }
 
     /// Ensures the desired node network, walking the bridge candidates until

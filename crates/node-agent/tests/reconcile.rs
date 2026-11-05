@@ -18,12 +18,16 @@ use agent_common::{
     reconciler, snapshot, snapshot_full, spec_vm, spec_volume, stateful_vm, volume_attach,
 };
 use quoro_engine::{Engine, EngineError, FakeOp, StopMode, VmId, VmState, VolumeId};
+use quoro_ingress::cloudflared::CloudflaredConfig;
 use quoro_node_agent::LeaseView;
+use quoro_node_agent::edge::EdgeManager;
+use quoro_node_agent::ingress::{CertificateEvents, DnsBridge, IngressConfig, IngressSupervisor};
 use quoro_node_agent::reconcile::Snapshot;
 use quoro_node_agent::store::{NodeStore, VolumeRecord};
 use quoro_proto::wire::VolumeStatus;
 use quoro_proto::wire::{
-    DesiredStatus, Health, ObservedStatus, SpecNetwork, SpecVm, SpecVolumeState, VolumeState,
+    DesiredStatus, Health, ObservedStatus, SpecEdge, SpecNetwork, SpecVm, SpecVolumeState,
+    VolumeState,
 };
 
 fn ip_of(text: Option<&String>) -> Ipv4Addr {
@@ -356,6 +360,9 @@ async fn a_snapshot_without_a_network_creates_nothing_and_does_not_fail() {
     assert!(statuses.is_empty(), "{statuses:?}");
     assert_eq!(engine.create_count(), 0, "no VM is created");
     assert!(engine.networks().is_empty(), "no bridge is ensured");
+    // With no `spec.edge` there is nothing else to apply: the revision is
+    // recorded.
+    assert_eq!(store.applied_rev().await.unwrap(), 1);
 
     // The same reconciler still applies a node snapshot: the pass did not
     // leave it in a failed state.
@@ -365,6 +372,127 @@ async fn a_snapshot_without_a_network_creates_nothing_and_does_not_fail() {
     assert_eq!(statuses[0].observed_status, ObservedStatus::Running);
     assert_eq!(engine.create_count(), 1);
     assert_eq!(engine.networks().last().unwrap().subnet, SUBNET);
+}
+
+/// An edge manager over a real ingress supervisor whose cloudflared binary
+/// does not exist: an empty `spec.edge` starts no listener and no connector.
+fn edge_manager(dir: &TempDir, store: &NodeStore) -> Arc<EdgeManager> {
+    let config = IngressConfig::new(
+        dir.path(),
+        CloudflaredConfig {
+            binary: dir.path().join("no-cloudflared"),
+            metrics: "127.0.0.1:0".parse().unwrap(),
+            extra_args: Vec::new(),
+        },
+    );
+    let supervisor = Arc::new(IngressSupervisor::new(
+        config,
+        Arc::new(DnsBridge::new()),
+        CertificateEvents::new(store.clone(), None),
+    ));
+    Arc::new(EdgeManager::new(supervisor))
+}
+
+/// An edge-only snapshot: no `spec.network`, no VM, and an empty `spec.edge`.
+fn edge_snapshot(rev: u64) -> Snapshot {
+    let mut snap = snapshot(rev, Vec::new());
+    snap.state.spec.network = None;
+    snap.state.spec.edge = Some(SpecEdge::default());
+    snap
+}
+
+/// Waits until `edge` applied `rev`.
+async fn edge_reaches(edge: &EdgeManager, rev: u64) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while edge.applied_rev() < rev {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the edge manager applied the revision");
+}
+
+#[tokio::test]
+async fn an_edge_only_machine_records_the_revision_its_edge_applied() {
+    let dir = TempDir::new();
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let engine = Arc::new(RecordingEngine::new());
+    let edge = edge_manager(&dir, &store);
+    let (reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let mut reconciler = reconciler.with_edge(Arc::clone(&edge));
+
+    // Before the edge manager applied the revision, it is not recorded.
+    let first = edge_snapshot(3);
+    reconciler.reconcile_once(Some(&first)).await;
+    assert_eq!(store.applied_rev().await.unwrap(), 0);
+
+    // Once the edge manager applied it, the next pass records it
+    // (section 6.8: an edge-only machine runs apply steps 1 and 6 only).
+    let (desired, desired_rx) = tokio::sync::watch::channel(Some(first.clone()));
+    let (stop, mut stop_rx) = tokio::sync::watch::channel(false);
+    let edge_task = tokio::spawn(Arc::clone(&edge).run(desired_rx, async move {
+        let _ = stop_rx.wait_for(|stopped| *stopped).await;
+    }));
+    edge_reaches(&edge, 3).await;
+    reconciler.reconcile_once(Some(&first)).await;
+    assert_eq!(store.applied_rev().await.unwrap(), 3);
+
+    // A newer snapshot is recorded after the edge applied it too, and the
+    // recorded revision never moves backwards.
+    let second = edge_snapshot(5);
+    desired.send_replace(Some(second.clone()));
+    edge_reaches(&edge, 5).await;
+    reconciler.reconcile_once(Some(&second)).await;
+    assert_eq!(store.applied_rev().await.unwrap(), 5);
+    reconciler.reconcile_once(Some(&first)).await;
+    assert_eq!(store.applied_rev().await.unwrap(), 5);
+    assert_eq!(engine.create_count(), 0, "an edge runs no VM");
+    assert!(engine.networks().is_empty(), "an edge has no bridge");
+
+    let _ = stop.send(true);
+    edge_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn an_edge_only_agent_reports_each_new_revision_as_applied() {
+    // The reconciler and the edge manager run as in the agent, on one
+    // snapshot channel: every new revision becomes `applied_rev`.
+    let dir = TempDir::new();
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let engine = Arc::new(RecordingEngine::new());
+    let edge = edge_manager(&dir, &store);
+    let (reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let reconciler = reconciler.with_edge(Arc::clone(&edge));
+
+    let (desired, _) = tokio::sync::watch::channel(Some(edge_snapshot(8)));
+    let (stop, stop_rx) = tokio::sync::watch::channel(false);
+    let wait_stop = |mut rx: tokio::sync::watch::Receiver<bool>| async move {
+        let _ = rx.wait_for(|stopped| *stopped).await;
+    };
+    let edge_task =
+        tokio::spawn(Arc::clone(&edge).run(desired.subscribe(), wait_stop(stop_rx.clone())));
+    let reconcile_task = tokio::spawn(reconciler.run(desired.subscribe(), wait_stop(stop_rx)));
+
+    for rev in [8, 9, 12] {
+        if rev != 8 {
+            desired.send_replace(Some(edge_snapshot(rev)));
+        }
+        let recorded = tokio::time::timeout(Duration::from_secs(5), async {
+            while store.applied_rev().await.unwrap() < rev {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            recorded.is_ok(),
+            "applied_rev stayed {} for rev {rev}",
+            store.applied_rev().await.unwrap()
+        );
+    }
+
+    let _ = stop.send(true);
+    reconcile_task.await.unwrap();
+    edge_task.await.unwrap();
 }
 
 // --- volumes and stateful starts (M5a, sections 6.2, 6.4, 6.7) -------------

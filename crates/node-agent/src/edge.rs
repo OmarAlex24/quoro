@@ -23,6 +23,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -375,6 +376,9 @@ async fn probe_one(target: &HealthTarget) -> Result<(), String> {
 pub struct EdgeManager {
     supervisor: Arc<IngressSupervisor>,
     state: Mutex<EdgeState>,
+    /// The newest snapshot revision whose `spec.edge` was handed to the
+    /// supervisor; 0 before the first snapshot.
+    applied: AtomicU64,
 }
 
 impl EdgeManager {
@@ -384,7 +388,16 @@ impl EdgeManager {
         Self {
             supervisor,
             state: Mutex::new(EdgeState::default()),
+            applied: AtomicU64::new(0),
         }
+    }
+
+    /// The newest snapshot revision this manager applied (section 6.8). The
+    /// reconciler records a revision with `spec.edge` as applied only once
+    /// this reaches it.
+    #[must_use]
+    pub fn applied_rev(&self) -> u64 {
+        self.applied.load(Ordering::Acquire)
     }
 
     /// The current `status_report.edge_backends`. Empty while the snapshot has
@@ -444,6 +457,9 @@ impl EdgeManager {
         let tunnel = state.tunnel.clone();
         drop(state);
         self.supervisor.update_edge(EdgeRoutes { tables, tunnel });
+        if let Some(snapshot) = snapshot {
+            self.applied.fetch_max(snapshot.rev, Ordering::AcqRel);
+        }
     }
 
     /// Probes every backend whose deadline has passed, concurrently, and
