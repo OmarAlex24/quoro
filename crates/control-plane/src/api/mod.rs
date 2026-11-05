@@ -28,6 +28,7 @@ pub mod providers;
 pub mod users;
 pub mod vms;
 pub mod volumes;
+pub mod vulnerabilities;
 pub mod webhooks;
 
 use crate::AppState;
@@ -175,4 +176,5 @@ pub fn routes() -> Router<AppState> {
         .merge(volumes::routes())
         .merge(backups::routes())
         .merge(audit_exports::routes())
+        .merge(vulnerabilities::routes())
 }

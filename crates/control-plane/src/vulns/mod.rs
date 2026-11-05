@@ -15,6 +15,9 @@
 //! - [`mirror`] is the loop that downloads and refreshes, plus [`Vulns`].
 //! - [`import`] feeds the cache from a directory without the network.
 //! - [`kev`] holds everything KEV-specific.
+//! - [`version`] orders versions per ecosystem and evaluates OSV ranges.
+//! - [`status`] says what is known about an app's current image.
+//! - [`severity`] turns a record's CVSS vector into a score and a band.
 
 pub mod cache;
 pub mod changes;
@@ -24,6 +27,9 @@ pub mod import;
 pub mod kev;
 pub mod mirror;
 pub mod osv;
+pub mod severity;
+pub mod status;
+pub mod version;
 
 pub use cache::{AffectedRow, BucketState, Cache};
 pub use fetch::Endpoints;

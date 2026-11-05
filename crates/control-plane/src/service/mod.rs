@@ -30,4 +30,5 @@ pub mod nodes;
 pub mod projects;
 pub mod users;
 pub mod volumes;
+pub mod vulnerabilities;
 pub mod webhooks;

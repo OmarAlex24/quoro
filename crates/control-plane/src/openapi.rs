@@ -134,6 +134,8 @@ pub struct RateLimited(Problem);
         crate::api::metrics::stream_node_metrics,
         crate::api::metrics::get_app_metrics,
         crate::api::metrics::stream_app_metrics,
+        crate::api::vulnerabilities::get_app_vulnerabilities,
+        crate::api::vulnerabilities::get_vulnerability_summary,
     ),
     components(
         schemas(
@@ -205,6 +207,16 @@ pub struct RateLimited(Problem);
             crate::api::metrics::VmMetricSample,
             crate::api::metrics::AppInstanceMetrics,
             crate::api::metrics::AppMetrics,
+            crate::api::vulnerabilities::VulnerabilitySeverity,
+            crate::api::vulnerabilities::VulnerabilityFinding,
+            crate::api::vulnerabilities::VulnerabilityCounts,
+            crate::api::vulnerabilities::VulnerabilityDataSource,
+            crate::api::vulnerabilities::ImageInventoryStatus,
+            crate::api::vulnerabilities::AppVulnerabilities,
+            crate::api::vulnerabilities::AppVulnerabilitySummary,
+            crate::api::vulnerabilities::NodeKernelVulnerabilities,
+            crate::api::vulnerabilities::QuoroVulnerabilities,
+            crate::api::vulnerabilities::VulnerabilitySummary,
         ),
         responses(
             Unauthenticated,
