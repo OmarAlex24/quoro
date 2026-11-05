@@ -55,6 +55,7 @@ The M5a milestone: stateless replicas behind an edge, local volumes, cold backup
 - Writes to the vulnerability cache could queue for many seconds while each one held a pooled connection, which stalled node sessions until they timed out. The cache now takes one writer at a time, and queued writers no longer hold connections ([#328]).
 - When a replica died without closing its connections, a request the edge had already sent to it over a pooled connection waited for the full 60 second response timeout. The edge now cancels the requests still waiting on a replica that leaves the rotation, and drops its pooled connections. A `GET` or `HEAD` that has not answered yet is retried once on another replica, and any other request answers `502` at once ([#334]).
 - A `GET` sent to a replica's pooled connection right after the replica died still got a `502` after about 20 seconds when the replica's host reported it unreachable. It is now retried once on another replica, and the replica leaves the rotation at once. A client that reset its own upload could also take a healthy replica out of rotation; it no longer does ([#338]).
+- A machine with only the edge role always reported `applied_rev` 0 in `GET /api/v1/nodes`. It now reports the newest desired state it has applied ([#341]).
 
 ### Maintenance
 
@@ -320,6 +321,7 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#334]: https://github.com/OmarAlex24/quoro/pull/334
 [#338]: https://github.com/OmarAlex24/quoro/pull/338
 [#340]: https://github.com/OmarAlex24/quoro/pull/340
+[#341]: https://github.com/OmarAlex24/quoro/pull/341
 [ADR 0019]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0019-fencing-is-mandatory-and-lease-based-node-agent-self-fences.md
 [ADR 0020]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0020-per-app-ha-policies-none-cold-warm-hot-with-cost-shown-in.md
 [ADR 0027]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0027-signed-binaries-and-reproducible-builds-are-mandatory.md

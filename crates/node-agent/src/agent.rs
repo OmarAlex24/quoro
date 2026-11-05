@@ -124,6 +124,7 @@ pub async fn run<E: Engine + 'static>(
         .with_node_id(node_id)
         .with_lease_view(leases.view.clone())
         .with_ingress(Arc::clone(&ingress))
+        .with_edge(Arc::clone(&edge))
         .with_inventory(inventory.clone());
     let volume_statuses = reconciler.volume_statuses();
 
