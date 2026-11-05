@@ -1485,7 +1485,6 @@ impl Session {
         let built = desired::build_spec(
             &self.hub.0.store,
             &self.node_id,
-            &self.hub.0.config.node_network,
             self.hub.0.resolver.as_ref(),
             &self.hub.0.digests,
             &self.hub.0.data_key,

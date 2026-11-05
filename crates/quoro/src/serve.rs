@@ -73,8 +73,9 @@ pub async fn run(config: Config) -> Result<i32, String> {
             secure_cookies: true,
             public_url: config.public_url.clone(),
             tls_fingerprint: material.fingerprint.clone(),
-            // Every node gets the subnet of this configuration in M2; a
-            // per-node subnet arrives with the overlay network (ADR 0063).
+            // The configured guest network. The oldest node with the `node`
+            // role keeps it; every other node gets its own /24 of
+            // 10.42.0.0/16 (ADR 0144).
             node_network: NodeNetwork {
                 subnet: subnet.to_string(),
                 gateway: subnet.gateway().to_string(),

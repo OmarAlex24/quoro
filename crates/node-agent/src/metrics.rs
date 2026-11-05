@@ -743,12 +743,14 @@ Buffers:          100000 kB
                 spec: Spec {
                     vms,
                     routes: Vec::new(),
-                    network: SpecNetwork {
+                    network: Some(SpecNetwork {
                         subnet: "10.0.0.0/24".to_owned(),
                         gateway: "10.0.0.1".to_owned(),
-                    },
+                    }),
                     ingress: None,
                     builds: Vec::new(),
+                    mesh: None,
+                    edge: None,
                 },
                 signature: String::new(),
             },

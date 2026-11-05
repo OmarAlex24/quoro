@@ -273,6 +273,10 @@ pub struct Hello {
     pub allocated: Capacity,
     pub kvm: Kvm,
     pub dropped_events: u64,
+    /// Base64 WireGuard public key of this machine (32 bytes), from M5a
+    /// (section 5.1, ADR 0144). The private key never leaves the machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_public_key: Option<String>,
 }
 
 /// Body of `heartbeat` (section 5.2).
@@ -342,6 +346,37 @@ pub struct StatusReport {
     /// ADR 0117). Added in M4; absent when there is none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub builds: Vec<BuildStatus>,
+    /// On a machine with the `edge` role: one entry per backend of
+    /// `spec.edge.routes` (section 5.3, ADR 0143). Added in M5a.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edge_backends: Vec<EdgeBackendStatus>,
+}
+
+/// Why an edge took a backend out of rotation (section 5.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeOutReason {
+    /// Its probe failed `failures` times in a row.
+    HealthCheck,
+    /// A request could not connect or was reset.
+    ConnectFailed,
+}
+
+/// One backend of `spec.edge.routes` as the edge sees it (section 5.3).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeBackendStatus {
+    pub app_id: String,
+    pub vm_id: String,
+    pub node_id: String,
+    pub in_rotation: bool,
+    /// RFC 3339: when `in_rotation` last changed, or when the edge first saw
+    /// the backend.
+    pub since: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<EdgeOutReason>,
+    /// At most 500 characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// Status of a build (README.md "Status enums", ADR 0117).
@@ -712,18 +747,102 @@ pub struct SpecNetwork {
     pub gateway: String,
 }
 
-/// `spec` of `desired_state` (section 5.11).
+/// `spec.mesh` (section 5.11, ADR 0144): this machine's WireGuard interface.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecMesh {
+    /// This machine's mesh address with prefix length `/16`.
+    pub address: String,
+    /// UDP port the interface listens on.
+    pub listen_port: u16,
+    /// The other end of each tunnel: on a node the edge, on the edge every
+    /// node (a star in M5a).
+    pub peers: Vec<MeshPeer>,
+    /// On a node, what the edge may reach through the interface; `[]` on the
+    /// edge.
+    pub allow: Vec<MeshAllow>,
+}
+
+/// One peer of `spec.mesh.peers` (section 5.11).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshPeer {
+    pub node_id: String,
+    /// Base64 WireGuard public key of the peer.
+    pub public_key: String,
+    /// `host:port` to dial; absent for a peer that dials this machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// CIDRs routed to the peer.
+    pub allowed_ips: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent_keepalive_s: Option<u16>,
+}
+
+/// One entry of `spec.mesh.allow` (section 5.11): TCP from `source` to
+/// `address:port` is admitted through the mesh interface.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshAllow {
+    /// The edge's mesh address.
+    pub source: String,
+    /// A guest address on this node.
+    pub address: String,
+    pub port: u16,
+}
+
+/// `spec.edge` (section 5.11, ADR 0143).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecEdge {
+    pub routes: Vec<EdgeRoute>,
+    /// The edge's own tunnel, same shape and handling as
+    /// `spec.ingress.tunnel`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel: Option<SpecTunnel>,
+}
+
+/// One route of `spec.edge.routes` (section 5.11).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeRoute {
+    pub hostname: String,
+    pub domain_id: String,
+    pub app_id: String,
+    /// `acme` or `tunnel`.
+    pub tls_mode: String,
+    pub health_check: HealthCheck,
+    pub backends: Vec<EdgeBackend>,
+}
+
+/// One instance behind an edge route (section 5.11).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeBackend {
+    pub vm_id: String,
+    pub node_id: String,
+    /// The instance's guest address in its node's subnet.
+    pub address: String,
+    pub port: u16,
+}
+
+/// `spec` of `desired_state` (section 5.11).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Spec {
     pub vms: Vec<SpecVm>,
     pub routes: Vec<SpecRoute>,
-    pub network: SpecNetwork,
+    /// The node's own bridge subnet (ADR 0144); absent on a machine without
+    /// the `node` role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<SpecNetwork>,
     /// Present when the node runs a tunnel (section 5.11, D-0094).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingress: Option<SpecIngress>,
     /// Builds for this node to run (section 5.11, ADR 0117). Added in M4.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub builds: Vec<SpecBuild>,
+    /// The machine's WireGuard interface, once it is on the mesh (ADR 0144).
+    /// Added in M5a.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<SpecMesh>,
+    /// Routes with remote backends, on a machine with the `edge` role (ADR
+    /// 0143). Added in M5a.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge: Option<SpecEdge>,
 }
 
 /// `spec.builds[].limits` (section 6.6).
@@ -1241,12 +1360,11 @@ mod tests {
                     build_id: None,
                 }],
                 routes: Vec::new(),
-                network: SpecNetwork {
+                network: Some(SpecNetwork {
                     subnet: "10.42.0.0/24".to_owned(),
                     gateway: "10.42.0.1".to_owned(),
-                },
-                ingress: None,
-                builds: Vec::new(),
+                }),
+                ..Spec::default()
             },
             signature: String::new(),
         };

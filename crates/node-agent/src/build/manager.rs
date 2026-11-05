@@ -341,7 +341,10 @@ impl<E: Engine + 'static, B: Builder + 'static> BuildManager<E, B> {
             return;
         };
         let spec = &snapshot.state.spec;
-        let subnet = Subnet::parse(&spec.network.subnet, &spec.network.gateway);
+        let subnet = spec
+            .network
+            .as_ref()
+            .and_then(|network| Subnet::parse(&network.subnet, &network.gateway));
         let desired: BTreeSet<String> = spec
             .builds
             .iter()
@@ -423,7 +426,7 @@ impl<E: Engine + 'static, B: Builder + 'static> BuildManager<E, B> {
                             .await;
                     }
                     None => debug!(
-                        subnet = %spec.network.subnet,
+                        subnet = ?spec.network.as_ref().map(|network| &network.subnet),
                         "the desired network is not a usable subnet; no build starts"
                     ),
                 }
@@ -1313,12 +1316,14 @@ mod tests {
                 spec: Spec {
                     vms: Vec::new(),
                     routes: Vec::new(),
-                    network: SpecNetwork {
+                    network: Some(SpecNetwork {
                         subnet: "10.42.1.0/24".to_owned(),
                         gateway: "10.42.1.1".to_owned(),
-                    },
+                    }),
                     ingress: None,
                     builds,
+                    mesh: None,
+                    edge: None,
                 },
                 signature: String::new(),
             },

@@ -137,12 +137,14 @@ pub fn snapshot_with(rev: u64, vms: Vec<SpecVm>, builds: Vec<SpecBuild>) -> Snap
             spec: Spec {
                 vms,
                 routes: Vec::new(),
-                network: SpecNetwork {
+                network: Some(SpecNetwork {
                     subnet: SUBNET.to_owned(),
                     gateway: GATEWAY.to_owned(),
-                },
+                }),
                 ingress: None,
                 builds,
+                mesh: None,
+                edge: None,
             },
             signature: String::new(),
         },

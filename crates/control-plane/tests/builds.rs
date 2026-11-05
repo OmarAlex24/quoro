@@ -104,6 +104,7 @@ fn hello(node_id: &str) -> NodeMessage {
             nested: Some(true),
         },
         dropped_events: 0,
+        mesh_public_key: None,
     })
 }
 
@@ -213,6 +214,7 @@ fn report(builds: Vec<BuildStatus>) -> NodeMessage {
         allocated: WireCapacity::default(),
         disk_free_gb: 64.0,
         builds,
+        edge_backends: Vec::new(),
     })
 }
 
