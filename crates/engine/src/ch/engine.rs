@@ -466,6 +466,27 @@ impl Inner {
         self.sync_peers(&net.bridge).await
     }
 
+    /// Puts back a bridge this engine recorded but the host no longer has.
+    ///
+    /// A host reboot removes every bridge, and the node agent ensures only the
+    /// node's current network. After a subnet change (ADR 0144) the VMs still
+    /// recorded on the previous bridge would find nothing to attach to. Their
+    /// addresses belong to that bridge's subnet, so they come back on it,
+    /// recreated from `networks.json`, until a redeploy moves them to the
+    /// current bridge (`node-agent-protocol.md` section 6.9).
+    async fn restore_recorded_bridge(&self, bridge: &str) -> Result<(), EngineError> {
+        let networks = self.networks.lock().await;
+        let Some(net) =
+            recorded_bridge_to_restore(bridge, net::interface_exists(bridge), &networks)
+        else {
+            return Ok(());
+        };
+        net::ensure_network(&self.tools, &net).await?;
+        drop(networks);
+        // The ruleset came back with empty sets; refill them (§3.3).
+        self.sync_peers(bridge).await
+    }
+
     /// Rewrites the bridge's `peers`, `egress` and `egress_addrs` sets from
     /// every VM recorded on it plus the creates in flight (§3.3).
     async fn sync_peers(&self, bridge: &str) -> Result<(), EngineError> {
@@ -738,6 +759,7 @@ impl Inner {
             )));
         }
 
+        self.restore_recorded_bridge(&record.bridge).await?;
         entry.set_phase(Phase::Starting);
         if let Err(err) = net::create_tap(
             &self.tools,
@@ -1766,6 +1788,20 @@ pub(super) fn lock<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
     }
 }
 
+/// The recorded network to recreate before a VM on `bridge` starts: only when
+/// the host lacks the bridge and this engine recorded it. A bridge the engine
+/// never recorded stays missing, and attaching the TAP reports the error.
+fn recorded_bridge_to_restore(
+    bridge: &str,
+    exists: bool,
+    networks: &HashMap<String, (NodeNetwork, Subnet)>,
+) -> Option<NodeNetwork> {
+    if exists {
+        return None;
+    }
+    networks.get(bridge).map(|(net, _)| net.clone())
+}
+
 /// Reads `networks.json`; a missing file is an empty set.
 fn load_networks(path: &Path) -> Result<HashMap<String, (NodeNetwork, Subnet)>, EngineError> {
     let Some(file) = state::read_json::<NetworksFile>(path)? else {
@@ -1827,5 +1863,54 @@ fn zero_counters() -> VmCounters {
         net_tx_bytes: 0,
         block_read_bytes: 0,
         block_write_bytes: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn recorded(bridge: &str, subnet: &str, gateway: [u8; 4]) -> (String, (NodeNetwork, Subnet)) {
+        let net = NodeNetwork {
+            bridge: bridge.to_owned(),
+            subnet: subnet.to_owned(),
+            gateway: Ipv4Addr::from(gateway),
+            dns: vec![Ipv4Addr::new(192, 0, 2, 53)],
+        };
+        let parsed = Subnet::parse(subnet).expect("valid subnet");
+        (bridge.to_owned(), (net, parsed))
+    }
+
+    /// After a reboot the host has no bridge at all; a VM still recorded on the
+    /// node's previous bridge gets that bridge back with its own subnet, not the
+    /// node's current one.
+    #[test]
+    fn a_missing_recorded_bridge_is_restored_with_its_own_network() {
+        let networks: HashMap<_, _> = [
+            recorded("quoro0", "10.42.0.0/24", [10, 42, 0, 1]),
+            recorded("quoro0s1", "10.42.1.0/24", [10, 42, 1, 1]),
+        ]
+        .into_iter()
+        .collect();
+        let restored = recorded_bridge_to_restore("quoro0", false, &networks)
+            .expect("the previous bridge is restored");
+        assert_eq!(restored, networks["quoro0"].0);
+        assert_eq!(restored.subnet, "10.42.0.0/24");
+    }
+
+    #[test]
+    fn a_bridge_the_host_still_has_is_left_alone() {
+        let networks: HashMap<_, _> = [recorded("quoro0", "10.42.0.0/24", [10, 42, 0, 1])]
+            .into_iter()
+            .collect();
+        assert_eq!(recorded_bridge_to_restore("quoro0", true, &networks), None);
+    }
+
+    #[test]
+    fn a_bridge_the_engine_never_recorded_is_not_invented() {
+        let networks: HashMap<_, _> = [recorded("quoro0s1", "10.42.1.0/24", [10, 42, 1, 1])]
+            .into_iter()
+            .collect();
+        assert_eq!(recorded_bridge_to_restore("quoro0", false, &networks), None);
     }
 }
