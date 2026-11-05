@@ -195,7 +195,9 @@ proptest! {
         position in 0f64..1f64,
     ) {
         let keys = keys();
-        let data = seeded(3 * 1024 * 1024, seed);
+        // More than twice the maximum chunk size always gives at least three
+        // chunks; 3 MiB of random data sometimes cut into one.
+        let data = seeded(2 * CHUNK_MAX as usize + 1024 * 1024, seed);
         let (manifest, _) = write_backup(&data, &keys, "bkp_one");
         prop_assert!(manifest.chunks.len() >= 2, "the case must produce several chunks");
 
