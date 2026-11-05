@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 /// How a hostname gets TLS (`desired_state.spec.routes[].tls_mode`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -13,16 +14,41 @@ pub enum TlsMode {
     Tunnel,
 }
 
-/// One hostname this node serves.
+/// When a failed backend request may be sent to another backend.
+///
+/// The distinction is what keeps a non-idempotent request from being executed
+/// twice: a node route may only move on while the body has not started to
+/// stream, and an edge route retries `GET` and `HEAD` once, on another backend,
+/// after a connect failure (`node-agent-protocol.md` section 6.8).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum RetryPolicy {
+    /// Try the next backend on a failure while the request body is unsent.
+    /// This is the node's behaviour and the default.
+    #[default]
+    Unsent,
+    /// Retry once, on another backend, only for `GET` and `HEAD`, and only
+    /// when connecting failed. This is an edge route's policy.
+    IdempotentOnce,
+}
+
+/// One hostname this node or edge serves.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Route {
     /// Lowercase DNS name, no trailing dot, no port, no wildcard.
     pub hostname: String,
-    /// Candidate backends (one per app replica on this node): the VM's
-    /// address on the node bridge and the app port. Requests go round robin;
-    /// a backend that refuses the connection is skipped for that request.
+    /// Candidate backends (one per app replica on this node, or one per
+    /// instance of an edge route): the VM's address and the app port.
+    /// Requests go round robin; a backend that refuses the connection may be
+    /// skipped for that request according to [`Self::retry`].
     pub backends: Vec<SocketAddr>,
+    /// How TLS terminates for this hostname.
     pub tls: TlsMode,
+    /// When a failed request may try another backend.
+    pub retry: RetryPolicy,
+    /// When set, a backend that does not send response headers within this
+    /// time fails the request with `502`. Edge routes use 60 s; node routes
+    /// leave it unset.
+    pub response_timeout: Option<Duration>,
 }
 
 /// The complete set of routes of a node, keyed by hostname.
@@ -34,10 +60,14 @@ pub struct RouteTable {
 impl RouteTable {
     /// Builds a table, normalising hostnames to lowercase.
     ///
+    /// A route without backends is refused when its retry policy is
+    /// [`RetryPolicy::Unsent`]; an edge route is allowed to be empty so it can
+    /// answer `502` while no instance is in rotation.
+    ///
     /// # Errors
     ///
     /// A message naming the first invalid hostname, a duplicate hostname, or a
-    /// route without backends.
+    /// route that must have backends but has none.
     pub fn new(routes: impl IntoIterator<Item = Route>) -> Result<Self, String> {
         let mut map = BTreeMap::new();
         for mut route in routes {
@@ -45,7 +75,7 @@ impl RouteTable {
             if !valid_hostname(&route.hostname) {
                 return Err(format!("invalid hostname {:?}", route.hostname));
             }
-            if route.backends.is_empty() {
+            if route.backends.is_empty() && route.retry == RetryPolicy::Unsent {
                 return Err(format!("route {} has no backends", route.hostname));
             }
             if map.contains_key(&route.hostname) {
@@ -111,6 +141,8 @@ mod tests {
             hostname: host.to_string(),
             backends: vec!["10.42.0.2:8080".parse().unwrap()],
             tls: TlsMode::Acme,
+            retry: RetryPolicy::Unsent,
+            response_timeout: None,
         }
     }
 
@@ -139,5 +171,23 @@ mod tests {
         let mut empty = route("a.example.com");
         empty.backends.clear();
         assert!(RouteTable::new([empty]).is_err());
+    }
+
+    #[test]
+    fn an_edge_route_may_have_no_backends() {
+        let mut edge = route("a.example.com");
+        edge.backends.clear();
+        edge.retry = RetryPolicy::IdempotentOnce;
+        edge.response_timeout = Some(Duration::from_secs(60));
+        let table = RouteTable::new([edge]).unwrap();
+        let route = table.get("a.example.com").unwrap();
+        assert!(route.backends.is_empty());
+        assert_eq!(route.retry, RetryPolicy::IdempotentOnce);
+        assert_eq!(route.response_timeout, Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn the_default_retry_policy_is_unsent() {
+        assert_eq!(RetryPolicy::default(), RetryPolicy::Unsent);
     }
 }

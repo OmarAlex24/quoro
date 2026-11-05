@@ -96,6 +96,13 @@ impl<D: DnsProvider> PublicIngress<D> {
     pub fn local_addrs(&self) -> (SocketAddr, SocketAddr) {
         self.local
     }
+
+    /// The proxy core behind the listeners, so the node can attach a backend
+    /// observer.
+    #[must_use]
+    pub fn core(&self) -> &Arc<ProxyCore> {
+        &self.core
+    }
 }
 
 impl<D: DnsProvider> Ingress for PublicIngress<D> {

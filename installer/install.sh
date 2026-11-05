@@ -43,17 +43,20 @@
 #   QUORO_INSTALL_INSECURE_SKIP_SIGNATURE=1 skip Sigstore verification; only honored
 #                                           together with QUORO_INSTALL_FROM
 #   QUORO_NO_START=1                        install files, do not start the services
-#   QUORO_ROLE=primary|node                 what this host runs (default: primary).
+#   QUORO_ROLE=primary|node|edge            what this host runs (default: primary).
 #                                           A primary runs the unprivileged control
 #                                           plane and its own node agent; a node runs
 #                                           only the node agent and joins a primary
-#                                           (ADR 0089).
-#   QUORO_JOIN_URL=<https url>              the primary's URL, for QUORO_ROLE=node.
+#                                           (ADR 0089); an edge runs the proxy and
+#                                           the mesh, starts no VM and needs no KVM
+#                                           (ADR 0143).
+#   QUORO_JOIN_URL=<https url>              the primary's URL, for QUORO_ROLE=node
+#                                           or edge.
 #   QUORO_JOIN_TOKEN=<token>                a join token from the primary, for
-#                                           QUORO_ROLE=node. Never logged.
+#                                           QUORO_ROLE=node or edge. Never logged.
 #   QUORO_JOIN_FINGERPRINT=sha256:<hex>     the primary's TLS fingerprint, for
-#                                           QUORO_ROLE=node. Not needed when this
-#                                           host is already enrolled.
+#                                           QUORO_ROLE=node or edge. Not needed when
+#                                           this host is already enrolled.
 
 set -eu
 umask 022
@@ -115,19 +118,20 @@ node_is_enrolled() {
         [ -f "$NODE_DATA_DIR/node-ed25519.seed" ]
 }
 
-# Reads QUORO_ROLE. A node runs only the node agent, a primary runs the control
-# plane and its own agent.
+# Reads QUORO_ROLE. A node runs only the node agent, an edge runs the agent
+# without an engine, and a primary runs the control plane and its own agent.
 resolve_role() {
     ROLE=${QUORO_ROLE:-primary}
     case $ROLE in
-        primary | node) : ;;
-        *) die "invalid QUORO_ROLE '${QUORO_ROLE}': expected primary or node" ;;
+        primary | node | edge) : ;;
+        *) die "invalid QUORO_ROLE '${QUORO_ROLE}': expected primary, node or edge" ;;
     esac
 }
 
-# A node enrolls with a join token, so it needs the primary's URL, its token and
-# its TLS fingerprint. Checking them here means a missing one fails before any
-# file is written; the token itself is never printed, logged or traced.
+# A node or an edge enrolls with a join token, so it needs the primary's URL,
+# its token and its TLS fingerprint. Checking them here means a missing one
+# fails before any file is written; the token itself is never printed, logged
+# or traced.
 check_node_join_credentials() {
     if node_is_enrolled; then
         log "this host is already enrolled ($NODE_DATA_DIR); no join token needed"
@@ -139,7 +143,7 @@ check_node_join_credentials() {
     [ -n "${QUORO_JOIN_TOKEN:-}" ] || _missing="$_missing QUORO_JOIN_TOKEN"
     [ -n "${QUORO_JOIN_FINGERPRINT:-}" ] || _missing="$_missing QUORO_JOIN_FINGERPRINT"
     [ -z "$_missing" ] ||
-        die "QUORO_ROLE=node needs$_missing to enroll this host; create a join token on the primary first"
+        die "QUORO_ROLE=$ROLE needs$_missing to enroll this host; create a join token on the primary first"
 
     case ${QUORO_JOIN_URL} in
         https://?*) : ;;
@@ -148,11 +152,11 @@ check_node_join_credentials() {
 }
 
 # A host that already ran a control plane keeps its database and its TLS
-# material there. Turning it into a node would leave that data orphaned with no
-# API to serve it, so refuse instead of installing over it.
+# material there. Turning it into a node or an edge would leave that data
+# orphaned with no API to serve it, so refuse instead of installing over it.
 check_node_host_is_not_a_primary() {
     if [ -e /etc/systemd/system/quoro.service ] || [ -e /var/lib/quoro/quoro.db ]; then
-        die 'this host runs a Quoro control plane (found /etc/systemd/system/quoro.service or /var/lib/quoro/quoro.db); installing it as a node would orphan that data. Uninstall the control plane first, then install it as a node'
+        die 'this host runs a Quoro control plane (found /etc/systemd/system/quoro.service or /var/lib/quoro/quoro.db); installing it as a node or edge would orphan that data. Uninstall the control plane first, then install it with QUORO_ROLE=node or QUORO_ROLE=edge'
     fi
 }
 
@@ -271,7 +275,8 @@ check_preconditions() {
     # and nftables (nft); Git builds need git, which fetches the app's commit on
     # the node (ADR 0118). They are installed later, after every verification
     # passed, because installing packages changes the host; here only the
-    # presence of a way to install them is checked.
+    # presence of a way to install them is checked. An edge runs no engine but
+    # needs ip and nft for the mesh (ADR 0144), so it gets the same packages.
     if ! command -v apt-get >/dev/null 2>&1; then
         _missing=''
         for _tool in mkfs.ext4 ip nft git; do
@@ -288,13 +293,15 @@ check_preconditions() {
             # The control plane runs as this system user; useradd creates it.
             has_host_tool useradd || die 'useradd is missing; the primary needs it to create the quoro-api system user'
             ;;
-        node)
+        node | edge)
             check_node_join_credentials
             check_node_host_is_not_a_primary
             ;;
     esac
 
-    if [ ! -e /dev/kvm ]; then
+    # An edge needs no KVM (ADR 0143), so the warning names only the roles that
+    # run the engine.
+    if [ "$ROLE" != 'edge' ] && [ ! -e /dev/kvm ]; then
         log 'warning: this host has no /dev/kvm; quoro-node.service will refuse to start the cloud-hypervisor engine (ADR 0009)'
     fi
 
@@ -828,7 +835,7 @@ install_dirs() {
         log 'user quoro exists from an older install; it is no longer used'
     fi
 
-    # The node agent's own directory belongs to root on both roles: only
+    # The node agent's own directory belongs to root on every role: only
     # quoro-node.service, which runs as root, reads it.
     if [ -d "$NODE_DATA_DIR" ]; then
         chown root:root "$NODE_DATA_DIR" || die "could not change the owner of $NODE_DATA_DIR to root:root"
@@ -922,10 +929,10 @@ config_has_node_local_false() {
 }
 
 install_config() {
-    if [ "$ROLE" = 'node' ]; then
-        install_node_config
-    else
+    if [ "$ROLE" = 'primary' ]; then
         install_primary_config
+    else
+        install_node_config
     fi
 }
 
@@ -1001,14 +1008,22 @@ install_node_config() {
     fi
 
     _tmp="$WORK_DIR/quoro.toml"
+    if [ "$ROLE" = 'edge' ]; then
+        _purpose='# This host is an edge: it runs the proxy and the mesh for its
+# primary, starts no microVM and runs no control plane (ADR 0143). Edit this
+# file and restart with:'
+    else
+        _purpose='# This host is a node: it runs microVMs for its primary and runs no
+# control plane. Edit this file and restart with:'
+    fi
     printf '%s\n' \
         '# Quoro configuration (ADR 0089 privilege split).' \
-        '# This host is a node: it runs microVMs for its primary and runs no' \
-        '# control plane. Edit this file and restart with:' \
+        "$_purpose" \
         '#   systemctl restart quoro-node' \
         '' \
         '# Engine: "cloud-hypervisor" runs one microVM per app; "fake" runs nothing' \
-        '# and exists for development only.' \
+        '# and exists for development only. An edge starts no VM, so the agent' \
+        '# ignores this line and runs without an engine.' \
         'engine = "cloud-hypervisor"' \
         '' \
         '# Engine settings. The values below are the defaults, and the block is' \
@@ -1169,8 +1184,9 @@ install_unit() {
     esac
 }
 
-# A primary runs the control plane and its own node agent, a node runs the agent
-# alone (ADR 0089). The control plane goes first so its unit is enabled first.
+# A primary runs the control plane and its own node agent, a node and an edge
+# run the agent alone (ADR 0089, ADR 0143). The control plane goes first so its
+# unit is enabled first.
 install_units() {
     if [ "$ROLE" = 'primary' ]; then
         install_unit 'quoro'
@@ -1180,18 +1196,25 @@ install_units() {
 
 # Enrolls this host with its primary, before the unit starts. The token is only
 # passed as an argument: quoro join prints the node id or its own error, never
-# the token.
+# the token. An edge passes --role edge, which the agent persists (ADR 0143).
 enroll_node() {
     if node_is_enrolled; then
         log "this host is already enrolled ($NODE_DATA_DIR); not joining again"
         return 0
     fi
 
-    log "enrolling this host with $QUORO_JOIN_URL"
+    log "enrolling this host with $QUORO_JOIN_URL as a $ROLE"
     _status=0
-    _out=$(/usr/local/bin/quoro join "$QUORO_JOIN_URL" \
-        --token "$QUORO_JOIN_TOKEN" \
-        --fingerprint "$QUORO_JOIN_FINGERPRINT" 2> "$WORK_DIR/join.err") || _status=$?
+    if [ "$ROLE" = 'edge' ]; then
+        _out=$(/usr/local/bin/quoro join "$QUORO_JOIN_URL" \
+            --token "$QUORO_JOIN_TOKEN" \
+            --fingerprint "$QUORO_JOIN_FINGERPRINT" \
+            --role edge 2> "$WORK_DIR/join.err") || _status=$?
+    else
+        _out=$(/usr/local/bin/quoro join "$QUORO_JOIN_URL" \
+            --token "$QUORO_JOIN_TOKEN" \
+            --fingerprint "$QUORO_JOIN_FINGERPRINT" 2> "$WORK_DIR/join.err") || _status=$?
+    fi
     if [ "$_status" -ne 0 ]; then
         cat "$WORK_DIR/join.err" >&2 || true
         die 'enrollment failed; a join token is single use and expires, so create a new one on the primary and pass it in QUORO_JOIN_TOKEN'
@@ -1371,13 +1394,35 @@ Next steps
 EOF
 }
 
+report_edge() {
+    _node_id=$(node_id_from_identity)
+    if [ -n "$_node_id" ]; then
+        log "edge id: $_node_id"
+    else
+        log "warning: could not read the edge id from $NODE_DATA_DIR/identity.json"
+    fi
+
+    cat <<'EOF'
+Next steps
+
+  This host is an edge: it runs the proxy and the mesh for its primary and
+  starts no microVM, so it needs no /dev/kvm. It serves no API or panel of its
+  own; when the agent runs, the edge shows as connected on the primary's Nodes
+  page.
+
+  Read the agent's journal with:
+
+      journalctl -u quoro-node
+EOF
+}
+
 report() {
     print_installed_version
-    if [ "$ROLE" = 'node' ]; then
-        report_node
-    else
-        report_primary
-    fi
+    case $ROLE in
+        primary) report_primary ;;
+        edge) report_edge ;;
+        *) report_node ;;
+    esac
 }
 
 # --- Entry point ------------------------------------------------------------
@@ -1399,6 +1444,8 @@ main() {
     fetch_engine_runtime
     fetch_ingress_runtime
 
+    # Every role that runs the agent gets the host packages: an edge runs no
+    # engine, but the mesh needs ip and nft (ADR 0144).
     install_host_packages
     install_dirs
     if [ "$ROLE" = 'primary' ]; then
@@ -1411,7 +1458,7 @@ main() {
     install_ingress_runtime
     # Enrollment writes identity files only; it starts nothing, so it also runs
     # with QUORO_NO_START=1. It needs the binary and the config in place.
-    if [ "$ROLE" = 'node' ]; then
+    if [ "$ROLE" != 'primary' ]; then
         enroll_node
     fi
     install_units

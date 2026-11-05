@@ -19,6 +19,8 @@ pub mod crypto;
 pub mod deploy;
 pub mod dispatcher;
 pub mod driver;
+/// Reading the edge's backend health (ADR 0143).
+pub(crate) mod edge_health;
 pub mod error;
 pub mod events;
 pub mod idempotency;

@@ -87,6 +87,8 @@ fn routes(path: &str, tls: TlsMode) -> Result<RouteTable> {
         hostname: e.hostname,
         backends: e.backends,
         tls,
+        retry: quoro_ingress::RetryPolicy::Unsent,
+        response_timeout: None,
     }))?)
 }
 

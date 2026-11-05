@@ -16,7 +16,7 @@ use hyper::header::{
     CONNECTION, HOST, HeaderMap, HeaderName, HeaderValue, TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
 };
 use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode, Uri, Version};
+use hyper::{Method, Request, Response, StatusCode, Uri, Version};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
@@ -34,7 +34,7 @@ use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
-use crate::route::valid_hostname;
+use crate::route::{RetryPolicy, valid_hostname};
 use crate::{RouteTable, TlsMode};
 
 /// Concurrent connections a listener will hold before it stops accepting.
@@ -62,13 +62,23 @@ pub struct ListenerMode {
     pub trust_forwarded: bool,
 }
 
-/// The proxy's shared state: the current route table, the backend client and
-/// the round-robin cursor.
+/// Told when a backend could not be reached or its connection was reset
+/// before a response. An edge uses it to take the backend out of rotation at
+/// once (`node-agent-protocol.md` section 6.8).
+pub trait BackendObserver: Send + Sync {
+    /// One backend of `hostname` refused a connection or was reset before it
+    /// sent response headers. `error` is one line for the backend's status.
+    fn connect_failed(&self, hostname: &str, backend: SocketAddr, error: &str);
+}
+
+/// The proxy's shared state: the current route table, the backend client, the
+/// round-robin cursor and the optional backend observer.
 pub struct ProxyCore {
     table: RwLock<Arc<RouteTable>>,
     client: Client<HttpConnector, UpstreamBody>,
     next_backend: AtomicUsize,
     permits: Arc<Semaphore>,
+    observer: RwLock<Option<Arc<dyn BackendObserver>>>,
 }
 
 impl std::fmt::Debug for ProxyCore {
@@ -96,7 +106,38 @@ impl ProxyCore {
             client,
             next_backend: AtomicUsize::new(0),
             permits: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            observer: RwLock::new(None),
         })
+    }
+
+    /// Sets the observer told about backend connect failures and connection
+    /// resets. Without one, a failure only reaches the request's response.
+    pub fn set_observer(&self, observer: Arc<dyn BackendObserver>) {
+        *self
+            .observer
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observer);
+    }
+
+    /// Reports a backend failure to the observer, when there is one and the
+    /// error means the connection could not be opened or was reset.
+    fn observe_failure(
+        &self,
+        hostname: &str,
+        backend: SocketAddr,
+        error: &hyper_util::client::legacy::Error,
+    ) {
+        if !is_connect_failure(error) && !is_reset_failure(error) {
+            return;
+        }
+        let observer = self
+            .observer
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(observer) = observer {
+            observer.connect_failed(hostname, backend, &error.to_string());
+        }
     }
 
     /// Replaces the route table. Requests already in flight keep the table they
@@ -461,13 +502,25 @@ async fn handle_request(
         started: AtomicBool::new(false),
     });
     let attempts = route.backends.len();
-    let Some(&first_backend) = route.backends.first() else {
+    if attempts == 0 {
         return plain(StatusCode::BAD_GATEWAY, "backend unavailable\n");
+    }
+    // An edge retries only `GET` and `HEAD`, once, on another backend, and only
+    // when the connection itself failed. A node route keeps the older policy:
+    // the next backend may be tried while the body has not started to stream.
+    let idempotent = route.retry == RetryPolicy::IdempotentOnce
+        && matches!(parts.method, Method::GET | Method::HEAD);
+    let max_attempts = if idempotent {
+        attempts.min(2)
+    } else if route.retry == RetryPolicy::IdempotentOnce {
+        1
+    } else {
+        attempts
     };
     let start = core.next_backend.fetch_add(1, Ordering::Relaxed);
     let mut response = None;
-    let mut used_backend = first_backend;
-    for offset in 0..attempts {
+    let mut used_backend = route.backends[start % attempts];
+    for offset in 0..max_attempts {
         let backend = route.backends[(start + offset) % attempts];
         let Some(uri) = upstream_uri(backend, &query) else {
             continue;
@@ -479,7 +532,25 @@ async fn handle_request(
         *upstream.uri_mut() = uri;
         *upstream.version_mut() = Version::HTTP_11;
         *upstream.headers_mut() = parts.headers.clone();
-        match core.client.request(upstream).await {
+        let attempt = core.client.request(upstream);
+        let result = match route.response_timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, attempt).await {
+                Ok(result) => result,
+                Err(_) => {
+                    // A backend that accepted and never answered must not hold
+                    // the connection; the request may have reached the app, so
+                    // it is not retried.
+                    tracing::debug!(
+                        host = %host,
+                        backend = %backend,
+                        "backend response headers timed out"
+                    );
+                    break;
+                }
+            },
+            None => attempt.await,
+        };
+        match result {
             Ok(backend_response) => {
                 response = Some(backend_response);
                 used_backend = backend;
@@ -490,8 +561,18 @@ async fn handle_request(
                 // stream; after that the request may already be in the app.
                 let sent = state.started.load(Ordering::SeqCst);
                 tracing::debug!(host = %host, backend = %backend, sent, error = %error, "backend request failed");
-                if sent {
-                    break;
+                core.observe_failure(&host, backend, &error);
+                match route.retry {
+                    RetryPolicy::Unsent => {
+                        if sent {
+                            break;
+                        }
+                    }
+                    RetryPolicy::IdempotentOnce => {
+                        if !idempotent || !is_connect_failure(&error) {
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -726,4 +807,33 @@ fn forwarded_headers(headers: &mut HeaderMap, peer: SocketAddr, mode: ListenerMo
 
 fn upstream_uri(backend: SocketAddr, path_and_query: &str) -> Option<Uri> {
     format!("http://{backend}{path_and_query}").parse().ok()
+}
+
+/// Whether a legacy client error means the backend could not be reached.
+fn is_connect_failure(error: &hyper_util::client::legacy::Error) -> bool {
+    error.is_connect()
+}
+
+/// Whether a legacy client error carries an I/O reset or abort. A reset
+/// arrives after the connection existed, so it is not a connect failure, but
+/// it still means the backend never sent a response.
+fn is_reset_failure(error: &hyper_util::client::legacy::Error) -> bool {
+    use std::io::ErrorKind;
+
+    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(error);
+    while let Some(error) = source {
+        if let Some(io) = error.downcast_ref::<std::io::Error>()
+            && matches!(
+                io.kind(),
+                ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::UnexpectedEof
+            )
+        {
+            return true;
+        }
+        source = error.source();
+    }
+    false
 }

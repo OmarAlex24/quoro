@@ -38,6 +38,7 @@ use tokio_tungstenite::{WebSocketStream, client_async_with_config};
 use tracing::{debug, info, warn};
 
 use crate::build::manager::{BuildStart, BuildsError, BuildsHandle};
+use crate::edge::EdgeManager;
 use crate::identity::{Identity, IdentityHandle};
 use crate::ingress::{DnsBridge, DnsRequest, IngressSupervisor};
 use crate::interactive::{Door, Interactive, OpenError, StreamKind};
@@ -254,6 +255,9 @@ pub struct Session {
     interactive: Option<Interactive>,
     /// The build manager's handle, when the agent runs one.
     builds: Option<BuildsHandle>,
+    /// The edge manager, when the agent runs one, for
+    /// `status_report.edge_backends`.
+    edge: Option<Arc<EdgeManager>>,
     /// The URL `dial` used for the current session, set after a successful
     /// dial and read once `welcome` arrives to promote a fallback address
     /// (section 5.10). `None` when the session was handed a stream directly
@@ -288,6 +292,7 @@ impl Session {
             mesh_public_key: None,
             interactive: None,
             builds,
+            edge: None,
             dialed_url: None,
         }
     }
@@ -315,6 +320,14 @@ impl Session {
     #[must_use]
     pub fn with_metrics(mut self, metrics: MetricsRing) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Attaches the edge manager: its current rotation state fills
+    /// `status_report.edge_backends` (section 5.3, ADR 0143).
+    #[must_use]
+    pub fn with_edge(mut self, edge: Arc<EdgeManager>) -> Self {
+        self.edge = Some(edge);
         self
     }
 
@@ -1422,7 +1435,10 @@ impl Session {
                 .builds
                 .as_ref()
                 .map_or_else(Vec::new, BuildsHandle::current),
-            edge_backends: Vec::new(),
+            edge_backends: self
+                .edge
+                .as_ref()
+                .map_or_else(Vec::new, |edge| edge.statuses()),
         };
         write_message(sink, NodeMessage::StatusReport(report), None).await
     }

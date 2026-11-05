@@ -64,6 +64,8 @@ fn route(hostname: &str, backend: SocketAddr, tls: TlsMode) -> Route {
         hostname: hostname.to_string(),
         backends: vec![backend],
         tls,
+        retry: quoro_ingress::RetryPolicy::Unsent,
+        response_timeout: None,
     }
 }
 

@@ -17,8 +17,9 @@
 //! values of the app's environment variables it names as BuildKit secrets
 //! (section 5.11, ADR 0117).
 //!
-//! Routes are built from the app's `domains` rows, pointing at the app's
-//! running VMs on this node.
+//! Routes are built from the app's `domains` rows: the domains of an app with
+//! one replica point at the app's running VMs on this node, and the domains of
+//! an app with more replicas go to the edge machine as `spec.edge` (ADR 0143).
 
 use crate::api::apps::AppSource;
 use crate::app_env;
@@ -26,8 +27,8 @@ use crate::crypto::DataKey;
 use crate::deploy;
 use crate::{DigestResolver, store::Store};
 use quoro_proto::wire::{
-    BuildLimits, DesiredStatus, HealthCheck, Spec, SpecBuild, SpecIngress, SpecNetwork, SpecRoute,
-    SpecTunnel, SpecVm,
+    BuildLimits, DesiredStatus, EdgeBackend, EdgeRoute, HealthCheck, Spec, SpecBuild, SpecEdge,
+    SpecIngress, SpecNetwork, SpecRoute, SpecTunnel, SpecVm,
 };
 use sqlx::sqlite::SqliteConnection;
 use sqlx::{Row, SqlitePool};
@@ -65,6 +66,9 @@ struct AppInfo {
     port: u16,
     health_check: Option<HealthCheck>,
     current_deployment_id: Option<String>,
+    /// `apps.replicas`: a route of an app with one replica belongs to the
+    /// node that runs it, one above that to the edge (ADR 0142, ADR 0143).
+    replicas: i64,
 }
 
 /// Builds the full snapshot for `node_id`.
@@ -238,6 +242,10 @@ pub async fn build_spec(
     let routes = build_routes(store.pool(), &apps, &vms).await?;
     let ingress = build_ingress(store.pool(), data_key, node_id).await?;
     let mesh = build_mesh(store, mesh_lookup, node_id).await?;
+    // The edge's own tunnel is the one `spec.ingress` would carry for it
+    // (section 5.11): one row in `node_tunnels`, decrypted once here.
+    let tunnel = ingress.as_ref().and_then(|ingress| ingress.tunnel.clone());
+    let edge = build_edge(store.pool(), node_id, tunnel).await?;
 
     Ok(BuiltSpec {
         spec: Spec {
@@ -247,7 +255,7 @@ pub async fn build_spec(
             ingress,
             builds,
             mesh,
-            edge: None,
+            edge,
         },
         held_back,
     })
@@ -346,10 +354,11 @@ async fn build_specs(
 
 /// Every app row, keyed by app id.
 async fn load_apps(pool: &SqlitePool) -> Result<HashMap<String, AppInfo>, String> {
-    let rows = sqlx::query("SELECT id, port, health_check, current_deployment_id FROM apps")
-        .fetch_all(pool)
-        .await
-        .map_err(|e| format!("cannot read the apps: {e}"))?;
+    let rows =
+        sqlx::query("SELECT id, port, health_check, current_deployment_id, replicas FROM apps")
+            .fetch_all(pool)
+            .await
+            .map_err(|e| format!("cannot read the apps: {e}"))?;
     let mut apps = HashMap::with_capacity(rows.len());
     for row in &rows {
         let id: String = row.try_get("id").map_err(|e| e.to_string())?;
@@ -360,12 +369,14 @@ async fn load_apps(pool: &SqlitePool) -> Result<HashMap<String, AppInfo>, String
         let current_deployment_id: Option<String> = row
             .try_get("current_deployment_id")
             .map_err(|e| e.to_string())?;
+        let replicas: i64 = row.try_get("replicas").map_err(|e| e.to_string())?;
         apps.insert(
             id,
             AppInfo {
                 port: u16::try_from(port).map_err(|e| format!("apps.port: {e}"))?,
                 health_check: Some(health_check),
                 current_deployment_id,
+                replicas,
             },
         );
     }
@@ -398,9 +409,11 @@ async fn app_env_of(
     Ok(env)
 }
 
-/// `spec.routes`: every domain of an app with at least one running VM on this
-/// node, sorted by hostname so the snapshot is deterministic. Each route names
-/// its domain (`domain_id`) so the node's `certificate.*` events can carry it.
+/// `spec.routes`: every domain of an app with one replica that has at least
+/// one running VM on this node, sorted by hostname so the snapshot is
+/// deterministic. Each route names its domain (`domain_id`) so the node's
+/// `certificate.*` events can carry it. A domain of an app with more than one
+/// replica goes to the edge instead (`spec.edge`, ADR 0143).
 async fn build_routes(
     pool: &SqlitePool,
     apps: &HashMap<String, AppInfo>,
@@ -423,12 +436,17 @@ async fn build_routes(
         let hostname: String = row.try_get("hostname").map_err(|e| e.to_string())?;
         let app_id: String = row.try_get("app_id").map_err(|e| e.to_string())?;
         let tls_mode: String = row.try_get("tls_mode").map_err(|e| e.to_string())?;
-        let Some(app_vms) = by_app.get(app_id.as_str()) else {
-            continue;
-        };
         let app = apps
             .get(&app_id)
             .ok_or_else(|| format!("app {app_id} of domain {hostname} is missing"))?;
+        // A domain of a replicated app is served by the edge, never by the
+        // node that happens to run one of its instances.
+        if app.replicas != 1 {
+            continue;
+        }
+        let Some(app_vms) = by_app.get(app_id.as_str()) else {
+            continue;
+        };
         // The VM of the app's current deployment first, then the rest in the
         // snapshot's order.
         let current = app.current_deployment_id.as_deref();
@@ -457,8 +475,102 @@ async fn build_routes(
     Ok(routes)
 }
 
-/// The `tunnel` hostnames this node serves: the domains of apps with at least
-/// one running VM on the node (the same rule as [`build_routes`]). The tunnel
+/// `spec.edge` (section 5.11, ADR 0143): the routes the edge machine serves
+/// with remote backends. `None` on every other machine, including one whose
+/// role is `edge` but that the rule in [`edge_node_id`] does not pick.
+///
+/// One route per `domains` row whose app has more than one replica, ordered by
+/// hostname, with the app's health check and one backend per instance that is
+/// meant to run and has a guest address, ordered by VM id. A route with no
+/// backend is still sent: the edge answers 502 for it (ADR 0143). `tunnel` is the
+/// machine's own tunnel and is kept only when at least one route is a `tunnel`
+/// route.
+///
+/// [`edge_node_id`]: super::mesh::edge_node_id
+async fn build_edge(
+    pool: &SqlitePool,
+    node_id: &str,
+    tunnel: Option<SpecTunnel>,
+) -> Result<Option<SpecEdge>, String> {
+    if super::mesh::edge_node_id(pool).await?.as_deref() != Some(node_id) {
+        return Ok(None);
+    }
+    let apps = load_apps(pool).await?;
+    let rows = sqlx::query(
+        "SELECT d.id AS domain_id, d.hostname, d.app_id, d.tls_mode, \
+                v.id AS vm_id, v.node_id AS vm_node_id, v.ip \
+         FROM domains d JOIN apps a ON a.id = d.app_id \
+         LEFT JOIN vms v ON v.app_id = d.app_id AND v.desired_status = 'running' \
+             AND v.ip IS NOT NULL \
+         WHERE a.replicas > 1 \
+         ORDER BY d.hostname, v.id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("cannot read the edge routes of {node_id}: {e}"))?;
+
+    let mut routes: Vec<EdgeRoute> = Vec::new();
+    for row in &rows {
+        let domain_id: String = row.try_get("domain_id").map_err(|e| e.to_string())?;
+        let new_route = match routes.last() {
+            Some(route) => route.domain_id != domain_id,
+            None => true,
+        };
+        if new_route {
+            let hostname: String = row.try_get("hostname").map_err(|e| e.to_string())?;
+            let app_id: String = row.try_get("app_id").map_err(|e| e.to_string())?;
+            let tls_mode: String = row.try_get("tls_mode").map_err(|e| e.to_string())?;
+            let app = apps
+                .get(&app_id)
+                .ok_or_else(|| format!("app {app_id} of domain {hostname} is missing"))?;
+            let Some(health_check) = app.health_check.clone() else {
+                return Err(format!(
+                    "app {app_id} of domain {hostname} has no health check"
+                ));
+            };
+            routes.push(EdgeRoute {
+                hostname,
+                domain_id,
+                app_id,
+                tls_mode,
+                health_check,
+                backends: Vec::new(),
+            });
+        }
+        let vm_id: Option<String> = row.try_get("vm_id").map_err(|e| e.to_string())?;
+        let Some(vm_id) = vm_id else {
+            continue;
+        };
+        let vm_node_id: String = row.try_get("vm_node_id").map_err(|e| e.to_string())?;
+        let address: String = row.try_get("ip").map_err(|e| e.to_string())?;
+        let app_id: String = row
+            .try_get::<String, _>("app_id")
+            .map_err(|e| e.to_string())?;
+        let app = apps
+            .get(&app_id)
+            .ok_or_else(|| format!("app {app_id} of {vm_id} is missing"))?;
+        if let Some(route) = routes.last_mut() {
+            route.backends.push(EdgeBackend {
+                vm_id,
+                node_id: vm_node_id,
+                address,
+                port: app.port,
+            });
+        }
+    }
+
+    let tunnel = if routes.iter().any(|route| route.tls_mode == "tunnel") {
+        tunnel
+    } else {
+        None
+    };
+    Ok(Some(SpecEdge { routes, tunnel }))
+}
+
+/// The `tunnel` hostnames this machine's tunnel serves: on a node, the domains
+/// of apps with one replica and at least one running VM on the node (the same
+/// rule as [`build_routes`]); on the edge, also every `tunnel` domain of an app
+/// with more than one replica, which the edge answers itself. The tunnel
 /// manager uses it to reconcile the provider's ingress rules and CNAMEs.
 ///
 /// # Errors
@@ -468,16 +580,28 @@ pub async fn tunnel_hostnames(
     pool: &SqlitePool,
     node_id: &str,
 ) -> Result<BTreeSet<String>, String> {
-    let rows = sqlx::query(
-        "SELECT DISTINCT d.hostname FROM domains d \
-         JOIN vms v ON v.app_id = d.app_id \
-         WHERE d.tls_mode = 'tunnel' AND v.node_id = ? AND v.desired_status = 'running' \
-         ORDER BY d.hostname",
-    )
-    .bind(node_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| format!("cannot read the tunnel domains of {node_id}: {e}"))?;
+    let is_edge = super::mesh::edge_node_id(pool).await?.as_deref() == Some(node_id);
+    let one_replica = "SELECT 1 FROM vms v WHERE v.app_id = d.app_id AND v.node_id = ?1 \
+                       AND v.desired_status = 'running'";
+    let sql = if is_edge {
+        format!(
+            "SELECT DISTINCT d.hostname FROM domains d JOIN apps a ON a.id = d.app_id \
+             WHERE d.tls_mode = 'tunnel' \
+               AND (a.replicas > 1 OR (a.replicas = 1 AND EXISTS ({one_replica}))) \
+             ORDER BY d.hostname"
+        )
+    } else {
+        format!(
+            "SELECT DISTINCT d.hostname FROM domains d JOIN apps a ON a.id = d.app_id \
+             WHERE d.tls_mode = 'tunnel' AND a.replicas = 1 AND EXISTS ({one_replica}) \
+             ORDER BY d.hostname"
+        )
+    };
+    let rows = sqlx::query(&sql)
+        .bind(node_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("cannot read the tunnel domains of {node_id}: {e}"))?;
     rows.iter()
         .map(|row| {
             row.try_get::<String, _>("hostname")
@@ -754,5 +878,304 @@ mod tests {
             .find(|vm| vm.vm_id == b)
             .expect("b is sent");
         assert_eq!(kept.image_digest, "sha256:earlier");
+    }
+
+    /// A project row for the app tests.
+    async fn insert_project(store: &Store, slug: &str) -> String {
+        let project_id = new_id(Prefix::Project);
+        let now = crate::store::now_rfc3339();
+        sqlx::query(
+            "INSERT INTO projects (id, slug, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&project_id)
+        .bind(slug)
+        .bind(slug)
+        .bind(&now)
+        .bind(&now)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        project_id
+    }
+
+    /// A node row with the given roles, and the given subnet when it has one.
+    async fn insert_node(store: &Store, id: &str, roles: &[&str], subnet: Option<&str>) {
+        let now = crate::store::now_rfc3339();
+        let roles = serde_json::to_string(roles).unwrap();
+        sqlx::query(
+            "INSERT INTO nodes (id, name, roles, cp_status, status, public_key, address, behind_nat, \
+             labels, capacity, allocated, kvm, engine_version, agent_version, desired_rev, applied_rev, \
+             log_seq, last_seen_at, created_at, subnet) \
+             VALUES (?, ?, ?, NULL, 'pending', '', NULL, 1, '{}', '{}', '{}', '{}', NULL, NULL, 0, 0, \
+             0, NULL, ?, ?)",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(roles)
+        .bind(&now)
+        .bind(subnet)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    }
+
+    /// An app row with `replicas` and the contract's default health check.
+    async fn insert_app(store: &Store, project_id: &str, app_id: &str, name: &str, replicas: i64) {
+        let now = crate::store::now_rfc3339();
+        sqlx::query(
+            "INSERT INTO apps (id, project_id, name, stateful, ha_policy, image, port, health_check, \
+             resources, placement, status, current_deployment_id, restart_generation, created_at, \
+             updated_at, replicas) \
+             VALUES (?, ?, ?, 0, 'none', 'img@sha256:1', 8080, \
+             '{\"path\":\"/\",\"interval_s\":10,\"timeout_s\":2,\"failures\":3}', '{}', '{}', \
+             'running', NULL, 0, ?, ?, ?)",
+        )
+        .bind(app_id)
+        .bind(project_id)
+        .bind(name)
+        .bind(&now)
+        .bind(&now)
+        .bind(replicas)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    }
+
+    /// One instance of an app, with a guest address when it has one.
+    async fn insert_app_vm(
+        store: &Store,
+        project_id: &str,
+        app_id: &str,
+        node_id: &str,
+        vm_id: &str,
+        name: &str,
+        ip: Option<&str>,
+    ) {
+        let now = crate::store::now_rfc3339();
+        sqlx::query(
+            "INSERT INTO vms (id, project_id, app_id, node_id, name, vcpus, memory_mb, disk_gb, \
+             image, desired_status, observed_status, ip, restart_generation, restart_count, \
+             last_exit_code, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, 2, 512, 4, 'img@sha256:1', 'running', 'running', ?, 0, 0, \
+             NULL, ?, ?)",
+        )
+        .bind(vm_id)
+        .bind(project_id)
+        .bind(app_id)
+        .bind(node_id)
+        .bind(name)
+        .bind(ip)
+        .bind(&now)
+        .bind(&now)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    }
+
+    /// A domain of an app.
+    async fn insert_domain(
+        store: &Store,
+        domain_id: &str,
+        app_id: &str,
+        hostname: &str,
+        tls_mode: &str,
+    ) {
+        let now = crate::store::now_rfc3339();
+        sqlx::query(
+            "INSERT INTO domains (id, app_id, hostname, tls_mode, cert_status, cert_expires_at, \
+             created_at) VALUES (?, ?, ?, ?, 'pending', NULL, ?)",
+        )
+        .bind(domain_id)
+        .bind(app_id)
+        .bind(hostname)
+        .bind(tls_mode)
+        .bind(&now)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_replicated_app_route_moves_to_the_edge() {
+        let store = Store::open_in_memory().await.unwrap();
+        let edge = "nod_0000000000000000000000000E";
+        let node = "nod_00000000000000000000000001";
+        insert_node(&store, edge, &["edge"], None).await;
+        insert_node(&store, node, &["node"], Some("10.42.1.0/24")).await;
+        let project_id = insert_project(&store, "rep").await;
+        let app_id = deploy::new_id_with_prefix("app");
+        insert_app(&store, &project_id, &app_id, "web", 2).await;
+        let domain_id = deploy::new_id_with_prefix("dom");
+        insert_domain(&store, &domain_id, &app_id, "rep.example.com", "acme").await;
+        let first = new_id(Prefix::Vm);
+        let second = new_id(Prefix::Vm);
+        insert_app_vm(
+            &store,
+            &project_id,
+            &app_id,
+            node,
+            &first,
+            "web-a",
+            Some("10.42.1.11"),
+        )
+        .await;
+        insert_app_vm(&store, &project_id, &app_id, node, &second, "web-b", None).await;
+
+        let cache = DigestCache::default();
+        let key = DataKey::ephemeral();
+        let on_node = build_spec(
+            &store,
+            node,
+            &ReferenceAsDigest,
+            &cache,
+            &key,
+            None,
+            &no_mesh_lookup(),
+        )
+        .await
+        .unwrap()
+        .spec;
+        assert!(
+            on_node.routes.is_empty(),
+            "a replicated app's route never lands on its node"
+        );
+        assert!(on_node.edge.is_none(), "a node is not the edge");
+
+        let on_edge = build_spec(
+            &store,
+            edge,
+            &ReferenceAsDigest,
+            &cache,
+            &key,
+            None,
+            &no_mesh_lookup(),
+        )
+        .await
+        .unwrap()
+        .spec;
+        assert!(on_edge.network.is_none(), "the edge has no guest subnet");
+        let edge_spec = on_edge.edge.expect("the edge gets spec.edge");
+        assert_eq!(edge_spec.routes.len(), 1);
+        let route = &edge_spec.routes[0];
+        assert_eq!(route.hostname, "rep.example.com");
+        assert_eq!(route.domain_id, domain_id);
+        assert_eq!(route.app_id, app_id);
+        assert_eq!(route.tls_mode, "acme");
+        assert_eq!(route.health_check.failures, Some(3));
+        assert_eq!(route.backends.len(), 1, "the VM without an address waits");
+        assert_eq!(route.backends[0].vm_id, first);
+        assert_eq!(route.backends[0].node_id, node);
+        assert_eq!(route.backends[0].address, "10.42.1.11");
+        assert_eq!(route.backends[0].port, 8080);
+        assert!(edge_spec.tunnel.is_none(), "an acme route needs no tunnel");
+    }
+
+    #[tokio::test]
+    async fn a_single_replica_app_keeps_its_node_route_and_the_edge_has_no_route() {
+        let store = Store::open_in_memory().await.unwrap();
+        let edge = "nod_0000000000000000000000000E";
+        let node = "nod_00000000000000000000000001";
+        insert_node(&store, edge, &["edge"], None).await;
+        insert_node(&store, node, &["node"], Some("10.42.1.0/24")).await;
+        let project_id = insert_project(&store, "one").await;
+        let app_id = deploy::new_id_with_prefix("app");
+        insert_app(&store, &project_id, &app_id, "blog", 1).await;
+        let domain_id = deploy::new_id_with_prefix("dom");
+        insert_domain(&store, &domain_id, &app_id, "blog.example.com", "acme").await;
+        let vm_id = new_id(Prefix::Vm);
+        insert_app_vm(
+            &store,
+            &project_id,
+            &app_id,
+            node,
+            &vm_id,
+            "blog-1",
+            Some("10.42.1.12"),
+        )
+        .await;
+
+        let cache = DigestCache::default();
+        let key = DataKey::ephemeral();
+        let on_node = build_spec(
+            &store,
+            node,
+            &ReferenceAsDigest,
+            &cache,
+            &key,
+            None,
+            &no_mesh_lookup(),
+        )
+        .await
+        .unwrap()
+        .spec;
+        assert_eq!(on_node.routes.len(), 1);
+        assert_eq!(on_node.routes[0].hostname, "blog.example.com");
+        assert_eq!(on_node.routes[0].vm_ids, vec![vm_id]);
+
+        let on_edge = build_spec(
+            &store,
+            edge,
+            &ReferenceAsDigest,
+            &cache,
+            &key,
+            None,
+            &no_mesh_lookup(),
+        )
+        .await
+        .unwrap()
+        .spec;
+        let edge_spec = on_edge.edge.expect("the edge still gets spec.edge");
+        assert!(edge_spec.routes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tunnel_hostnames_put_a_replicated_app_on_the_edge_only() {
+        let store = Store::open_in_memory().await.unwrap();
+        let edge = "nod_0000000000000000000000000E";
+        let node = "nod_00000000000000000000000001";
+        insert_node(&store, edge, &["edge"], None).await;
+        insert_node(&store, node, &["node"], Some("10.42.1.0/24")).await;
+        let project_id = insert_project(&store, "tun").await;
+        let replicated = deploy::new_id_with_prefix("app");
+        insert_app(&store, &project_id, &replicated, "rep", 2).await;
+        insert_domain(
+            &store,
+            &deploy::new_id_with_prefix("dom"),
+            &replicated,
+            "rep.example.com",
+            "tunnel",
+        )
+        .await;
+        let single = deploy::new_id_with_prefix("app");
+        insert_app(&store, &project_id, &single, "one", 1).await;
+        insert_domain(
+            &store,
+            &deploy::new_id_with_prefix("dom"),
+            &single,
+            "one.example.com",
+            "tunnel",
+        )
+        .await;
+        insert_app_vm(
+            &store,
+            &project_id,
+            &single,
+            node,
+            &new_id(Prefix::Vm),
+            "one-1",
+            Some("10.42.1.13"),
+        )
+        .await;
+
+        let on_edge = tunnel_hostnames(store.pool(), edge).await.unwrap();
+        assert_eq!(
+            on_edge.iter().cloned().collect::<Vec<_>>(),
+            ["rep.example.com"]
+        );
+        let on_node = tunnel_hostnames(store.pool(), node).await.unwrap();
+        assert_eq!(
+            on_node.iter().cloned().collect::<Vec<_>>(),
+            ["one.example.com"]
+        );
     }
 }

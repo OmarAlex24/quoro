@@ -260,6 +260,13 @@ impl TunnelIngress {
     pub fn origin(&self) -> SocketAddr {
         self.shared.origin
     }
+
+    /// The proxy core behind the loopback listener, so the node can attach a
+    /// backend observer.
+    #[must_use]
+    pub fn core(&self) -> &Arc<ProxyCore> {
+        &self.shared.core
+    }
 }
 
 /// Why the readiness wait ended.
