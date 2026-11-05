@@ -13,7 +13,8 @@ use crate::audit::{self, Outcome};
 use crate::auth::Credential;
 use crate::error::{ApiError, Code, Reason, Target};
 use crate::interactive::{
-    CloseReason, Command, EndInfo, SESSION_COLUMNS, SessionHandle, SessionRow, actor, is_session_id,
+    CloseReason, Command, EndInfo, SESSION_COLUMNS, SessionHandle, SessionRow, SocketSlot, actor,
+    is_session_id,
 };
 use crate::request::CallCtx;
 use crate::session::{HubError, NodeStream, SessionEndReason, StreamEvent};
@@ -24,7 +25,6 @@ use quoro_types::{Prefix, Role, Scope, is_id};
 use serde_json::{Map, Value, json};
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
@@ -170,11 +170,12 @@ fn hand_over(
     let needs_origin = matches!(ctx.identity.credential, Credential::Session { .. });
     let (ticket, expires_at) = interactive.mint_ticket(&row.id, needs_origin);
     let (tx, rx) = mpsc::unbounded_channel();
+    let socket = Arc::new(SocketSlot::default());
     interactive.register(
         &row.id,
         SessionHandle {
             tx,
-            attached: Arc::new(AtomicBool::new(false)),
+            socket: Arc::clone(&socket),
         },
     );
     let identity = ctx.identity.clone();
@@ -187,7 +188,17 @@ fn hand_over(
     };
     let vm_id = row.vm_id.clone();
     tokio::spawn(async move {
-        actor::spawn(state, row, identity, interactive, stream, buffered, rx).await;
+        actor::spawn(
+            state,
+            row,
+            identity,
+            interactive,
+            stream,
+            buffered,
+            rx,
+            socket,
+        )
+        .await;
     });
     InteractiveSessionTicket {
         websocket_path: format!("/api/v1/interactive-sessions/{id}/ws"),
