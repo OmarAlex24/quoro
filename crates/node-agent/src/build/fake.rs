@@ -338,6 +338,7 @@ mod tests {
             build_args: BTreeMap::new(),
             secrets: BTreeMap::new(),
             limits: BuildLimits::default(),
+            refresh_base: false,
             net: BuilderNet {
                 ip: std::net::Ipv4Addr::new(10, 42, 1, 9),
                 gateway: std::net::Ipv4Addr::new(10, 42, 1, 1),

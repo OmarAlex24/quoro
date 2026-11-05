@@ -362,6 +362,7 @@ pub(crate) async fn start_build(
     conn: &mut SqliteConnection,
     app_id: &str,
     git_ref: Option<&str>,
+    refresh_base: bool,
     actor: &Actor,
 ) -> Result<StartedBuild, ApiError> {
     let app = load_app(conn, app_id).await?;
@@ -425,7 +426,7 @@ pub(crate) async fn start_build(
         failed_step: None,
         deployment_id: None,
         trigger: BuildTrigger::Api,
-        refresh_base: false,
+        refresh_base,
         created_by_type: creator_type(actor),
         created_by_id: actor.id.clone(),
         created_at: now.clone(),
@@ -435,9 +436,9 @@ pub(crate) async fn start_build(
 
     sqlx::query(
         "INSERT INTO builds (id, app_id, node_id, source, status, \"commit\", image, image_digest, \
-         failed_phase, error, failed_step, deployment_id, \"trigger\", created_by_type, \
-         created_by_id, created_at, started_at, finished_at) \
-         VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, NULL, NULL, ?, ?, ?, ?, NULL, ?)",
+         failed_phase, error, failed_step, deployment_id, \"trigger\", refresh_base, \
+         created_by_type, created_by_id, created_at, started_at, finished_at) \
+         VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, NULL, ?)",
     )
     .bind(&build.id)
     .bind(&build.app_id)
@@ -447,6 +448,7 @@ pub(crate) async fn start_build(
     .bind(build.failed_phase.map(BuildPhase::as_str))
     .bind(&build.error)
     .bind(build.trigger.as_str())
+    .bind(build.refresh_base)
     .bind(build.created_by_type.as_str())
     .bind(&build.created_by_id)
     .bind(&build.created_at)

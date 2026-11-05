@@ -264,6 +264,7 @@ pub fn spec_build(build_id: &str, app_id: &str) -> SpecBuild {
         secrets: BTreeMap::from([("token".to_owned(), "s3cret".to_owned())]),
         limits: BuildLimits::default(),
         cancelled: false,
+        refresh_base: false,
     }
 }
 

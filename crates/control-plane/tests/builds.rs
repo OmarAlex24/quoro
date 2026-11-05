@@ -499,19 +499,6 @@ async fn a_git_app_builds_its_image_and_deploys_it() {
     )
     .await;
     assert_eq!((status, code.as_str()), (409, "conflict"));
-    // A build that refreshes its base images waits for the vulnerability
-    // epic (ADR 0150): refused, and nothing is queued.
-    let (status, code, _) = problem(
-        owner
-            .post(server.url(&format!("/api/v1/apps/{app_id}/builds")))
-            .json(&json!({ "refresh_base": true }))
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!((status, code.as_str()), (422, "validation_failed"));
-
     // The build is queued on the node and reaches it with the source, the
     // default limits and the decrypted secret.
     let build = start_build(&server, &owner, &app_id).await;
@@ -546,6 +533,8 @@ async fn a_git_app_builds_its_image_and_deploys_it() {
     assert_eq!(spec["context_dir"], ".");
     assert_eq!(spec["build_args"], json!({ "NODE_ENV": "production" }));
     assert_eq!(spec["secrets"], json!({ "TOKEN": SECRET }));
+    // A build that reuses the cached base images says nothing about it.
+    assert!(spec.get("refresh_base").is_none(), "{spec}");
     assert_eq!(
         spec["limits"],
         json!({
@@ -731,6 +720,38 @@ async fn a_git_app_builds_its_image_and_deploys_it() {
     assert_eq!(page["items"][0]["id"], build_id);
     let snapshot = recv_build_snapshot(&mut socket, &overridden_id).await;
     assert_eq!(snapshot["body"]["spec"]["builds"][0]["ref"], "release");
+}
+
+#[tokio::test]
+async fn a_build_with_refresh_base_resolves_its_base_images_again() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let project_id = create_project(&server, &owner).await;
+    let node = enrolled(&server, &owner).await;
+    let (mut socket, _) = open(&server, &node).await;
+    let app = create_git_app(&server, &owner, &project_id).await;
+    let app_id = app["id"].as_str().unwrap().to_string();
+    set_token_env(&server, &owner, &app_id).await;
+
+    // "Rebuild with refreshed base" (ADR 0150): the flag is recorded on the
+    // build and reaches the node, which resolves every base image again.
+    let res = owner
+        .post(server.url(&format!("/api/v1/apps/{app_id}/builds")))
+        .json(&json!({ "refresh_base": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 202, "start: {}", res.text().await.unwrap());
+    let build: Value = res.json().await.unwrap();
+    let build_id = build["id"].as_str().unwrap().to_string();
+    assert_eq!(build["refresh_base"], true);
+    assert_eq!(
+        get_build(&server, &owner, &build_id).await["refresh_base"],
+        true
+    );
+
+    let snapshot = recv_build_snapshot(&mut socket, &build_id).await;
+    assert_eq!(spec_build(&snapshot, &build_id)["refresh_base"], true);
 }
 
 #[tokio::test]
