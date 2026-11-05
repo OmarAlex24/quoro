@@ -1,6 +1,7 @@
 import { HttpResponse, http } from 'msw';
 import type {
   AppMetrics,
+  Node,
   NodeMetricSample,
   NodeMetrics,
   Vm,
@@ -19,22 +20,28 @@ const HISTORY_COUNT = 20;
 const clamp = (value: number, min: number, max: number): number =>
   Math.min(max, Math.max(min, value));
 
-const nodeMemoryTotal = (): number => db.node.capacity.memory_mb * MIB;
+const nodeMemoryTotal = (node: Node): number => node.capacity.memory_mb * MIB;
 
-const nodeSample = (time: string, cpu: number, used: number): NodeMetricSample => ({
+const nodeSample = (
+  node: Node,
+  time: string,
+  cpu: number,
+  used: number,
+): NodeMetricSample => ({
   time,
   cpu_usage: clamp(cpu, 0, 1),
-  cpu_count: db.node.capacity.cpus,
-  memory_total_bytes: nodeMemoryTotal(),
-  memory_used_bytes: Math.round(clamp(used, 0, nodeMemoryTotal())),
+  cpu_count: node.capacity.cpus,
+  memory_total_bytes: nodeMemoryTotal(node),
+  memory_used_bytes: Math.round(clamp(used, 0, nodeMemoryTotal(node))),
 });
 
-const nodeHistory = (): NodeMetricSample[] => {
-  const total = nodeMemoryTotal();
+const nodeHistory = (node: Node): NodeMetricSample[] => {
+  const total = nodeMemoryTotal(node);
   return Array.from({ length: HISTORY_COUNT }, (_, index) => {
     const time = new Date(Date.now() - (HISTORY_COUNT - 1 - index) * INTERVAL_MS).toISOString();
     const wave = Math.sin(index / 2.4);
     return nodeSample(
+      node,
       time,
       0.26 + wave * 0.11 + (Math.random() - 0.5) * 0.02,
       total * (0.61 + wave * 0.025),
@@ -42,17 +49,23 @@ const nodeHistory = (): NodeMetricSample[] => {
   });
 };
 
-let liveCpu = 0.27;
-let liveMemoryFraction = 0.61;
+interface LiveNodeState {
+  cpu: number;
+  memoryFraction: number;
+}
 
-const nextNodeSample = (): NodeMetricSample => {
-  liveCpu = clamp(liveCpu + (Math.random() - 0.5) * 0.05, 0.03, 0.92);
-  liveMemoryFraction = clamp(
-    liveMemoryFraction + (Math.random() - 0.5) * 0.004,
+const liveNodes = new Map<string, LiveNodeState>();
+
+const nextNodeSample = (node: Node): NodeMetricSample => {
+  const state = liveNodes.get(node.id) ?? { cpu: 0.27, memoryFraction: 0.61 };
+  state.cpu = clamp(state.cpu + (Math.random() - 0.5) * 0.05, 0.03, 0.92);
+  state.memoryFraction = clamp(
+    state.memoryFraction + (Math.random() - 0.5) * 0.004,
     0.48,
     0.78,
   );
-  return nodeSample(now(), liveCpu, nodeMemoryTotal() * liveMemoryFraction);
+  liveNodes.set(node.id, state);
+  return nodeSample(node, now(), state.cpu, nodeMemoryTotal(node) * state.memoryFraction);
 };
 
 const vmMemoryBytes = (vm: Vm): number => vm.memory_mb * MIB;
@@ -142,30 +155,35 @@ const nodeUnreachable = () =>
     detail: 'The node is not connected, so its metrics are unavailable.',
   });
 
-const nodeKnown = (nodeId: string): boolean => nodeId === db.node.id;
+const nodeKnown = (nodeId: string): Node | undefined => {
+  if (nodeId === db.node.id) return db.node;
+  return db.extraNodes.find((node) => node.id === nodeId);
+};
 
 export const metricsHandlers = [
   http.get('*/api/v1/nodes/:nodeId/metrics', ({ params }) => {
     if (!signedIn()) return unauthorized();
-    if (!nodeKnown(String(params.nodeId))) {
+    const node = nodeKnown(String(params.nodeId));
+    if (!node) {
       return problem(404, 'not_found', { detail: 'That node no longer exists.' });
     }
-    if (db.node.status !== 'connected') return nodeUnreachable();
+    if (node.status !== 'connected') return nodeUnreachable();
     const body: NodeMetrics = {
-      node_id: db.node.id,
+      node_id: node.id,
       interval_s: 5,
-      samples: nodeHistory(),
+      samples: nodeHistory(node),
     };
     return json(body);
   }),
 
   http.get('*/api/v1/nodes/:nodeId/metrics/stream', ({ params }) => {
     if (!signedIn()) return unauthorized();
-    if (!nodeKnown(String(params.nodeId))) {
+    const node = nodeKnown(String(params.nodeId));
+    if (!node) {
       return problem(404, 'not_found', { detail: 'That node no longer exists.' });
     }
-    if (db.node.status !== 'connected') return nodeUnreachable();
-    return sampleStream(() => [nextNodeSample()]);
+    if (node.status !== 'connected') return nodeUnreachable();
+    return sampleStream(() => [nextNodeSample(node)]);
   }),
 
   http.get('*/api/v1/apps/:appId/metrics', ({ params }) => {
