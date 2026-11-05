@@ -32,6 +32,7 @@ pub mod keys;
 pub use quoro_proto::jcs;
 pub mod leases;
 pub mod openapi;
+pub mod primary_status;
 pub mod request;
 pub(crate) mod scheduler;
 pub mod service;
@@ -155,8 +156,8 @@ pub struct AppState {
 
 impl AppState {
     /// Opens the state: loads or generates the cluster key, takes the
-    /// pre-upgrade backup when a migration is pending, completes `meta` and
-    /// builds the session hub.
+    /// pre-upgrade backup when a migration is pending, completes `meta`, moves
+    /// the primary status as `quoro restore` asked, and builds the session hub.
     ///
     /// # Errors
     ///
@@ -229,6 +230,10 @@ impl AppState {
         let cluster_id = keys::ensure_cluster_meta(&store)
             .await
             .map_err(|e| format!("cannot read the cluster identity: {e:?}"))?;
+        // After `quoro restore` onto another host, the node on this host takes
+        // the primary status before any session or request sees it
+        // (`backup-format.md` section 8.2).
+        primary_status::apply_marker(&store, &config.data_dir).await?;
         // Nodes enrolled before the per-node subnet existed get theirs before
         // any session can ask for a desired state (ADR 0144).
         subnet::backfill(&store, &config.node_network).await?;

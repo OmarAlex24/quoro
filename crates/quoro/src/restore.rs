@@ -9,6 +9,11 @@
 //! directory. It writes no audit record: a restore is offline
 //! (`audit-log-format.md` section 3.5).
 //!
+//! It also names the node on this host that takes the primary status: the one
+//! `--node-id` gives, otherwise the one in this host's node agent identity
+//! file. Its id goes to `<data_dir>/primary-node`, which the primary applies
+//! and deletes at its next start (section 8.2 step 6).
+//!
 //! Every secret is read from a file whose mode refuses group and other access,
 //! never from a flag or the environment, and no error message carries a key, a
 //! credential or the recovery key. [`execute`] is generic over
@@ -26,6 +31,7 @@ use quoro_backup::{
     ChunkId, FORMAT, Manifest, RecoveryKey, RepoConfig, RepoKey, Restorer, Seal, SourceKind,
     open_manifest, unwrap_repo_key, verify_seal,
 };
+use quoro_control_plane::primary_status::MARKER_FILE;
 use quoro_providers::object_store::ObjectStore;
 use quoro_providers::s3::{S3Client, S3Config};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -89,6 +95,12 @@ pub struct Options {
     pub recovery_key: RecoveryKey,
     /// Restore this backup instead of the newest valid one.
     pub backup: Option<String>,
+    /// `--node-id`: the node that takes the primary status. The restored
+    /// database must hold it, not `removed`, or the restore is refused.
+    pub node_id: Option<String>,
+    /// This host's node agent identity file, read when `node_id` is `None`.
+    /// [`run`] sets `/var/lib/quoro-node/identity.json`.
+    pub identity_file: PathBuf,
     /// Do every check and write the database to a scratch file, install
     /// nothing.
     pub dry_run: bool,
@@ -109,6 +121,32 @@ pub struct Report {
     pub skipped_seals: usize,
     /// Whether the files were installed. False for `--dry-run`.
     pub installed: bool,
+    /// Which node takes the primary status, or why none was named.
+    pub primary: PrimaryPick,
+}
+
+/// The node `primary-node` names (section 8.2 step 6), or why no file was
+/// written. A dry run reports what it would pick.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrimaryPick {
+    /// The node `--node-id` named.
+    NodeIdFlag(String),
+    /// The node in this host's node agent identity file.
+    IdentityFile(String),
+    /// No `primary-node` file: the primary status stays where the backup had
+    /// it. The text says why.
+    Unchanged(String),
+}
+
+impl PrimaryPick {
+    /// The picked `nod_` id, if any.
+    #[must_use]
+    pub fn node_id(&self) -> Option<&str> {
+        match self {
+            Self::NodeIdFlag(id) | Self::IdentityFile(id) => Some(id),
+            Self::Unchanged(_) => None,
+        }
+    }
 }
 
 /// The access key and secret of the repository's bucket. Its [`fmt::Debug`]
@@ -129,13 +167,17 @@ impl fmt::Debug for Credentials {
 /// `quoro restore --endpoint URL --region REGION --bucket NAME --prefix PREFIX
 /// --cluster-id CLS --credentials-file PATH --recovery-key-file PATH
 /// --signing-key-file PATH --data-key-file PATH --data-dir DIR
-/// [--backup BKP] [--dry-run]`.
+/// [--backup BKP] [--node-id NOD] [--dry-run]`.
+///
+/// `node_data_dir` is this host's node agent data directory
+/// (`/var/lib/quoro-node`); its identity file names the node that takes the
+/// primary status when `--node-id` is absent.
 ///
 /// # Errors
 ///
 /// [`Error::Usage`] for a bad command line and [`Error::Failed`] for every
 /// refusal or failed check of section 8.2.
-pub async fn run(args: &[String]) -> Result<(), Error> {
+pub async fn run(args: &[String], node_data_dir: &Path) -> Result<(), Error> {
     let command = parse_args(args)?;
     // The two secret files are checked before the network is touched.
     let credentials = read_credentials(&command.credentials_file)?;
@@ -160,6 +202,8 @@ pub async fn run(args: &[String]) -> Result<(), Error> {
             data_key_file: command.data_key_file,
             recovery_key,
             backup: command.backup,
+            node_id: command.node_id,
+            identity_file: node_data_dir.join(quoro_node_agent::identity::IDENTITY_FILE),
             dry_run: command.dry_run,
         },
     )
@@ -176,6 +220,22 @@ pub async fn run(args: &[String]) -> Result<(), Error> {
     );
     if report.skipped_seals > 0 {
         println!("skipped {} invalid seals", report.skipped_seals);
+    }
+    let takes = if report.installed {
+        "takes"
+    } else {
+        "would take"
+    };
+    match &report.primary {
+        PrimaryPick::NodeIdFlag(node_id) => println!(
+            "node {node_id} (--node-id) {takes} the primary status at the primary's next start"
+        ),
+        PrimaryPick::IdentityFile(node_id) => println!(
+            "node {node_id} (this host's node agent) {takes} the primary status at the primary's next start"
+        ),
+        PrimaryPick::Unchanged(reason) => println!(
+            "no {MARKER_FILE} file: {reason}; the primary status stays where the backup had it"
+        ),
     }
     if !report.installed {
         println!("dry run: nothing was installed");
@@ -250,13 +310,16 @@ pub async fn execute<S: ObjectStore>(store: &S, options: &Options) -> Result<Rep
         .map_err(|error| failed(format!("cannot finish the database: {error}")))?;
 
     check_integrity(&temp).await?;
+    // An unusable `--node-id` refuses the restore here, before anything is
+    // installed (section 8.2).
+    let primary = pick_primary(&temp, options).await?;
 
     let installed = !options.dry_run;
     if installed {
         // SQLite may have touched these while checking the file; they must not
         // be installed next to the database.
         remove_sidecars(&temp);
-        if let Err(error) = install(options, &temp, &signing_seed, &data_key) {
+        if let Err(error) = install(options, &temp, &signing_seed, &data_key, primary.node_id()) {
             remove_install(&options.data_dir);
             return Err(error);
         }
@@ -270,6 +333,7 @@ pub async fn execute<S: ObjectStore>(store: &S, options: &Options) -> Result<Rep
         chunks: manifest.chunks.len(),
         skipped_seals,
         installed,
+        primary,
     })
 }
 
@@ -644,18 +708,37 @@ async fn check_integrity(path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-/// Copies the two key files into `<data_dir>/keys` with mode `0600` and renames
-/// the checked database into place (section 8.2 step 6).
+/// Copies the two key files into `<data_dir>/keys` with mode `0600`, writes
+/// `primary-node` `0600` when a node was picked, and renames the checked
+/// database into place (section 8.2 steps 5 and 6).
 fn install(
     options: &Options,
     temp: &Path,
     signing_seed: &[u8; SIGNING_KEY_BYTES],
     data_key: &[u8],
+    primary_node: Option<&str>,
 ) -> Result<(), Error> {
     let keys_dir = options.data_dir.join("keys");
     create_private_dir(&keys_dir)?;
     write_private_file(&keys_dir.join(SIGNING_KEY_FILE), signing_seed)?;
     write_private_file(&keys_dir.join(DATA_KEY_FILE), data_key)?;
+
+    // A file an interrupted earlier run left behind must not outlive this
+    // restore: no database was installed then, so it named nothing real.
+    let marker = options.data_dir.join(MARKER_FILE);
+    match std::fs::remove_file(&marker) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(failed(format!(
+                "cannot remove {}: {error}",
+                marker.display()
+            )));
+        }
+    }
+    if let Some(node_id) = primary_node {
+        write_private_file(&marker, format!("{node_id}\n").as_bytes())?;
+    }
 
     let database = options.data_dir.join(DATABASE_FILE);
     std::fs::rename(temp, &database)
@@ -667,8 +750,109 @@ fn install(
 
 fn remove_install(data_dir: &Path) {
     let _ = std::fs::remove_file(data_dir.join(DATABASE_FILE));
+    let _ = std::fs::remove_file(data_dir.join(MARKER_FILE));
     let _ = std::fs::remove_file(data_dir.join("keys").join(SIGNING_KEY_FILE));
     let _ = std::fs::remove_file(data_dir.join("keys").join(DATA_KEY_FILE));
+}
+
+// ---------------------------------------------------------------------------
+// The node that takes the primary status
+// ---------------------------------------------------------------------------
+
+/// The two members of the node agent's `identity.json` the pick needs
+/// (`quoro_node_agent::identity::Identity`).
+#[derive(serde::Deserialize)]
+struct HostIdentity {
+    node_id: String,
+    cluster_id: String,
+}
+
+/// Picks the node `primary-node` names (section 8.2 step 6) from the checked
+/// database at `database`.
+///
+/// # Errors
+///
+/// [`Error::Failed`] when `--node-id` names a node the database does not hold
+/// or holds as `removed`, or the database cannot be read. Every problem with
+/// the identity file is a [`PrimaryPick::Unchanged`] instead.
+async fn pick_primary(database: &Path, options: &Options) -> Result<PrimaryPick, Error> {
+    if let Some(node_id) = &options.node_id {
+        return match node_status(database, node_id).await? {
+            None => Err(failed(format!(
+                "--node-id {node_id}: the restored database holds no such node"
+            ))),
+            Some(status) if status == "removed" => Err(failed(format!(
+                "--node-id {node_id}: the node is removed in the restored database"
+            ))),
+            Some(_) => Ok(PrimaryPick::NodeIdFlag(node_id.clone())),
+        };
+    }
+
+    let path = &options.identity_file;
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PrimaryPick::Unchanged(format!(
+                "no --node-id and no node agent identity file at {}",
+                path.display()
+            )));
+        }
+        Err(error) => {
+            return Ok(PrimaryPick::Unchanged(format!(
+                "cannot read the node agent identity file {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let identity: HostIdentity = match serde_json::from_str(&text) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return Ok(PrimaryPick::Unchanged(format!(
+                "the node agent identity file {} is malformed: {error}",
+                path.display()
+            )));
+        }
+    };
+    if identity.cluster_id != options.cluster_id {
+        return Ok(PrimaryPick::Unchanged(format!(
+            "this host's node agent belongs to cluster {}, not {}",
+            identity.cluster_id, options.cluster_id
+        )));
+    }
+    if !quoro_types::is_id(quoro_types::Prefix::Node, &identity.node_id) {
+        return Ok(PrimaryPick::Unchanged(format!(
+            "the node agent identity file {} does not hold a nod_ id",
+            path.display()
+        )));
+    }
+    Ok(match node_status(database, &identity.node_id).await? {
+        None => PrimaryPick::Unchanged(format!(
+            "the restored database holds no node {} (this host's node agent)",
+            identity.node_id
+        )),
+        Some(status) if status == "removed" => PrimaryPick::Unchanged(format!(
+            "node {} (this host's node agent) is removed in the restored database",
+            identity.node_id
+        )),
+        Some(_) => PrimaryPick::IdentityFile(identity.node_id),
+    })
+}
+
+/// The `status` of node `node_id` in the database at `path`, read-only.
+async fn node_status(path: &Path, node_id: &str) -> Result<Option<String>, Error> {
+    let options = SqliteConnectOptions::new().filename(path).read_only(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .map_err(|error| failed(format!("cannot open the restored database: {error}")))?;
+    let status: Result<Option<String>, sqlx::Error> =
+        sqlx::query_scalar("SELECT status FROM nodes WHERE id = ?")
+            .bind(node_id)
+            .fetch_optional(&pool)
+            .await;
+    pool.close().await;
+    status.map_err(|error| failed(format!("cannot read the restored nodes: {error}")))
 }
 
 struct TempFile {
@@ -777,6 +961,7 @@ struct Command {
     data_key_file: PathBuf,
     data_dir: PathBuf,
     backup: Option<String>,
+    node_id: Option<String>,
     dry_run: bool,
 }
 
@@ -793,6 +978,7 @@ const VALUE_FLAGS: &[&str] = &[
     "data-key-file",
     "data-dir",
     "backup",
+    "node-id",
 ];
 
 fn parse_args(args: &[String]) -> Result<Command, Error> {
@@ -824,6 +1010,14 @@ fn parse_args(args: &[String]) -> Result<Command, Error> {
     };
     let required =
         |name: &str| value(name).ok_or_else(|| Error::Usage(format!("restore needs --{name}")));
+    let node_id = value("node-id");
+    if let Some(node_id) = &node_id
+        && !quoro_types::is_id(quoro_types::Prefix::Node, node_id)
+    {
+        return Err(Error::Usage(format!(
+            "--node-id '{node_id}' is not nod_ followed by 26 Crockford base32 characters"
+        )));
+    }
     Ok(Command {
         endpoint: required("endpoint")?,
         region: required("region")?,
@@ -836,6 +1030,7 @@ fn parse_args(args: &[String]) -> Result<Command, Error> {
         data_key_file: PathBuf::from(required("data-key-file")?),
         data_dir: PathBuf::from(required("data-dir")?),
         backup: value("backup"),
+        node_id,
         dry_run,
     })
 }

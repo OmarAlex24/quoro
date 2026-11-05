@@ -156,8 +156,27 @@ impl Fixture {
             data_key_file: self.data_key_file.clone(),
             recovery_key: self.recovery.clone(),
             backup: backup.map(str::to_string),
+            node_id: None,
+            // No node agent on this host unless a test writes one.
+            identity_file: self.base.join("no-node-agent").join("identity.json"),
             dry_run: false,
         }
+    }
+
+    /// Writes a node agent identity file of `cluster_id` naming `node_id` and
+    /// returns its path.
+    fn identity_file(&self, name: &str, cluster_id: &str, node_id: &str) -> PathBuf {
+        let path = self.base.join(name);
+        let identity = serde_json::json!({
+            "node_id": node_id,
+            "cluster_id": cluster_id,
+            "primary_url": "https://primary.example:8443",
+            "fingerprint": format!("sha256:{}", "0".repeat(64)),
+            "cluster_public_key": sign::public_key_to_base64(&self.signing.verifying_key()),
+            "cluster_key_id": "0".repeat(64),
+        });
+        write_private(&path, &serde_json::to_vec(&identity).unwrap());
+        path
     }
 
     fn data_dir(&self, name: &str) -> PathBuf {
@@ -197,6 +216,37 @@ async fn make_database(path: &Path, value: &str) -> Vec<u8> {
     std::fs::read(path).unwrap()
 }
 
+/// A database with a `nodes` table holding `(id, status, cp_status)` rows,
+/// the columns `quoro restore` reads.
+async fn make_database_with_nodes(path: &Path, nodes: &[(&str, &str, Option<&str>)]) -> Vec<u8> {
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE nodes (id TEXT PRIMARY KEY, status TEXT NOT NULL, cp_status TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for (id, status, cp_status) in nodes {
+        sqlx::query("INSERT INTO nodes (id, status, cp_status) VALUES (?, ?, ?)")
+            .bind(id)
+            .bind(status)
+            .bind(cp_status)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let _ = sqlx::raw_sql("PRAGMA wal_checkpoint(TRUNCATE);")
+        .execute(&pool)
+        .await;
+    pool.close().await;
+    std::fs::read(path).unwrap()
+}
+
 fn write_private(path: &Path, bytes: &[u8]) {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -229,6 +279,7 @@ fn mode_of(path: &Path) -> u32 {
 
 fn assert_nothing_installed(dir: &Path) {
     assert!(!dir.join("quoro.db").exists(), "no database");
+    assert!(!dir.join("primary-node").exists(), "no primary-node file");
     assert!(!dir.join(".restore-quoro.db.tmp").exists(), "no temp file");
     assert!(!dir.join("keys/signing.key").exists(), "no signing key");
     assert!(!dir.join("keys/data.key").exists(), "no data key");
@@ -583,4 +634,201 @@ fn the_command_refuses_a_readable_credentials_file_before_touching_the_data_dir(
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("readable by group or others"), "{stderr}");
     assert!(!data_dir.exists());
+}
+
+const OLD_NODE: &str = "nod_01JC9Z1A2B3C4D5E6F7G8H9J0A";
+const NEW_NODE: &str = "nod_01JC9Z1A2B3C4D5E6F7G8H9J0B";
+const OTHER_NODE: &str = "nod_01JC9Z1A2B3C4D5E6F7G8H9J0C";
+const REMOVED_NODE: &str = "nod_01JC9Z1A2B3C4D5E6F7G8H9J0D";
+const UNKNOWN_NODE: &str = "nod_01JC9Z1A2B3C4D5E6F7G8H9J0E";
+const OTHER_CLUSTER: &str = "cls_01JC9Z1A2B3C4D5E6F7G8H9J0Z";
+
+/// A fixture whose one backup holds a `nodes` table: the old host's primary,
+/// the new host's node, another node and a removed one.
+async fn node_fixture() -> Fixture {
+    let fixture = Fixture::new().await;
+    let database = make_database_with_nodes(
+        &fixture.base.join("nodes.db"),
+        &[
+            (OLD_NODE, "connected", Some("primary")),
+            (NEW_NODE, "pending", None),
+            (OTHER_NODE, "connected", None),
+            (REMOVED_NODE, "removed", None),
+        ],
+    )
+    .await;
+    fixture
+        .add_backup("bkp_01JC9Z1A2B3C4D5E6F7G8H9J0K", &database, NEW)
+        .await;
+    fixture
+}
+
+#[tokio::test]
+async fn the_identity_file_of_this_cluster_names_the_new_primary_node() {
+    let fixture = node_fixture().await;
+    let dir = fixture.data_dir("identity");
+    let mut options = fixture.options(&dir, None);
+    options.identity_file = fixture.identity_file("identity.json", CLUSTER, NEW_NODE);
+
+    let report = restore::execute(&fixture.store, &options).await.unwrap();
+    assert!(report.installed);
+    assert_eq!(
+        report.primary,
+        restore::PrimaryPick::IdentityFile(NEW_NODE.into())
+    );
+    let marker = dir.join("primary-node");
+    assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), NEW_NODE);
+    #[cfg(unix)]
+    assert_eq!(mode_of(&marker), 0o600);
+}
+
+#[tokio::test]
+async fn an_identity_file_of_another_cluster_writes_no_marker() {
+    let fixture = node_fixture().await;
+    let dir = fixture.data_dir("other-cluster");
+    let mut options = fixture.options(&dir, None);
+    options.identity_file = fixture.identity_file("identity.json", OTHER_CLUSTER, NEW_NODE);
+
+    let report = restore::execute(&fixture.store, &options).await.unwrap();
+    assert!(report.installed);
+    assert!(dir.join("quoro.db").exists());
+    assert!(!dir.join("primary-node").exists());
+    let restore::PrimaryPick::Unchanged(reason) = &report.primary else {
+        panic!("no node is picked: {:?}", report.primary);
+    };
+    assert!(reason.contains(OTHER_CLUSTER), "{reason}");
+}
+
+#[tokio::test]
+async fn an_identity_file_naming_an_unknown_or_removed_node_writes_no_marker() {
+    let fixture = node_fixture().await;
+    for (name, node_id, expected) in [
+        ("unknown", UNKNOWN_NODE, "holds no node"),
+        ("removed", REMOVED_NODE, "is removed"),
+    ] {
+        let dir = fixture.data_dir(&format!("identity-{name}"));
+        let mut options = fixture.options(&dir, None);
+        options.identity_file =
+            fixture.identity_file(&format!("identity-{name}.json"), CLUSTER, node_id);
+
+        let report = restore::execute(&fixture.store, &options).await.unwrap();
+        assert!(report.installed);
+        assert!(!dir.join("primary-node").exists(), "{name}");
+        let restore::PrimaryPick::Unchanged(reason) = &report.primary else {
+            panic!("no node is picked: {:?}", report.primary);
+        };
+        assert!(reason.contains(expected), "{reason}");
+    }
+}
+
+#[tokio::test]
+async fn no_identity_file_writes_no_marker() {
+    let fixture = node_fixture().await;
+    let dir = fixture.data_dir("no-identity");
+
+    let report = restore::execute(&fixture.store, &fixture.options(&dir, None))
+        .await
+        .unwrap();
+    assert!(report.installed);
+    assert!(!dir.join("primary-node").exists());
+    let restore::PrimaryPick::Unchanged(reason) = &report.primary else {
+        panic!("no node is picked: {:?}", report.primary);
+    };
+    assert!(reason.contains("no node agent identity file"), "{reason}");
+}
+
+#[tokio::test]
+async fn a_node_id_the_database_does_not_hold_or_holds_removed_is_refused() {
+    let fixture = node_fixture().await;
+    for (name, node_id, expected) in [
+        ("unknown", UNKNOWN_NODE, "holds no such node"),
+        ("removed", REMOVED_NODE, "is removed"),
+    ] {
+        let dir = fixture.data_dir(&format!("node-id-{name}"));
+        let mut options = fixture.options(&dir, None);
+        options.node_id = Some(node_id.into());
+        // The flag wins even over a usable identity file.
+        options.identity_file =
+            fixture.identity_file(&format!("identity-{name}.json"), CLUSTER, NEW_NODE);
+
+        let error = restore::execute(&fixture.store, &options)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+        assert_nothing_installed(&dir);
+    }
+}
+
+#[tokio::test]
+async fn node_id_overrides_the_identity_file() {
+    let fixture = node_fixture().await;
+    let dir = fixture.data_dir("node-id");
+    let mut options = fixture.options(&dir, None);
+    options.node_id = Some(OTHER_NODE.into());
+    options.identity_file = fixture.identity_file("identity.json", CLUSTER, NEW_NODE);
+
+    let report = restore::execute(&fixture.store, &options).await.unwrap();
+    assert_eq!(
+        report.primary,
+        restore::PrimaryPick::NodeIdFlag(OTHER_NODE.into())
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("primary-node"))
+            .unwrap()
+            .trim(),
+        OTHER_NODE
+    );
+}
+
+#[tokio::test]
+async fn a_dry_run_reports_the_node_and_writes_no_marker() {
+    let fixture = node_fixture().await;
+    let dir = fixture.data_dir("dry-run-node");
+    let mut options = fixture.options(&dir, None);
+    options.identity_file = fixture.identity_file("identity.json", CLUSTER, NEW_NODE);
+    options.dry_run = true;
+
+    let report = restore::execute(&fixture.store, &options).await.unwrap();
+    assert!(!report.installed);
+    assert_eq!(
+        report.primary,
+        restore::PrimaryPick::IdentityFile(NEW_NODE.into())
+    );
+    assert_nothing_installed(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn the_command_refuses_a_malformed_node_id() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_quoro"))
+        .args([
+            "restore",
+            "--endpoint",
+            "https://example.invalid",
+            "--region",
+            "auto",
+            "--bucket",
+            "backups",
+            "--prefix",
+            "quoro",
+            "--cluster-id",
+            CLUSTER,
+            "--credentials-file",
+            "/nonexistent/credentials",
+            "--recovery-key-file",
+            "/nonexistent/recovery.key",
+            "--signing-key-file",
+            "/nonexistent/signing.key",
+            "--data-key-file",
+            "/nonexistent/data.key",
+            "--data-dir",
+            "/nonexistent/data",
+            "--node-id",
+            "nod_lowercase",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--node-id"), "{stderr}");
 }
