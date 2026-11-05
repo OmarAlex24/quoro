@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::{EngineError, ImageDigest, ImageInventory, ImageRef, PreparedImage};
 
+pub(crate) mod backfill;
 pub(crate) mod cache;
 pub(crate) mod ext4;
 pub(crate) mod layer;
@@ -81,6 +82,10 @@ pub struct ImageStore {
     /// One async mutex per digest, so concurrent `prepare` calls for the same
     /// image do one pull. The outer mutex is never held across an `.await`.
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Reads a cached root disk for an image prepared before M5a (§3.21).
+    mounter: Arc<dyn backfill::RootMount>,
+    /// One root disk is mounted at a time, on one mount point.
+    mount_lock: tokio::sync::Mutex<()>,
 }
 
 impl ImageStore {
@@ -97,7 +102,16 @@ impl ImageStore {
         Ok(Self {
             config,
             locks: Mutex::new(HashMap::new()),
+            mounter: Arc::new(backfill::LoopMount),
+            mount_lock: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// The same store, reading root disks through `mounter` (tests).
+    #[cfg(test)]
+    pub(crate) fn with_mounter(mut self, mounter: Arc<dyn backfill::RootMount>) -> Self {
+        self.mounter = mounter;
+        self
     }
 
     /// The cached image for `digest`, without network access.
@@ -145,14 +159,66 @@ impl ImageStore {
             .map_err(|err| EngineError::Io(format!("inventory read task failed: {err}")))?
     }
 
+    /// The cached images that have no inventory yet: images prepared before
+    /// M5a (§3.21). Reads only the cache directory.
+    ///
+    /// # Errors
+    ///
+    /// `Io` when the cache directory cannot be read.
+    pub async fn uninventoried(&self) -> Result<Vec<ImageDigest>, EngineError> {
+        let root = self.config.root.clone();
+        tokio::task::spawn_blocking(move || backfill::uninventoried(&root))
+            .await
+            .map_err(|err| EngineError::Io(format!("cache scan task failed: {err}")))?
+    }
+
+    /// Inventories a cached image from its root disk, read-only, and caches
+    /// the inventory with it (§3.21). An image that already has an inventory
+    /// returns it without reading the root disk. Serialized with `prepare`,
+    /// `prepare_layout` and `remove` of the same digest; one root disk is
+    /// read at a time.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` when the digest is not cached; `Unsupported`, `Io` or
+    /// `Image` when the root disk cannot be mounted, and then nothing is
+    /// written.
+    pub async fn inventory_cached(
+        &self,
+        digest: &ImageDigest,
+    ) -> Result<ImageInventory, EngineError> {
+        let hex = registry::digest_hex(&digest.0)?.to_owned();
+        let lock = self.lock_for(&hex);
+        let _guard = lock.lock().await;
+        if self.cached(digest)?.is_none() {
+            return Err(EngineError::NotFound);
+        }
+        match self.inventory(digest).await {
+            Err(EngineError::NotFound) => {}
+            other => return other,
+        }
+        let _mount = self.mount_lock.lock().await;
+        let root = self.config.root.clone();
+        let mounter = Arc::clone(&self.mounter);
+        let digest = digest.clone();
+        tokio::task::spawn_blocking(move || {
+            backfill::inventory_from_root_disk(&root, &hex, digest, mounter.as_ref())
+        })
+        .await
+        .map_err(|err| EngineError::Io(format!("inventory task failed: {err}")))?
+    }
+
     /// Removes a cached image. A missing digest is `Ok`. The caller checks
-    /// that no VM uses it (§3.5).
+    /// that no VM uses it (§3.5). Serialized with the other calls on the same
+    /// digest, so it never races an inventory being written (§3.21).
     ///
     /// # Errors
     ///
     /// `Image` for a malformed digest, `Io` when the files cannot be removed.
     pub async fn remove(&self, digest: &ImageDigest) -> Result<(), EngineError> {
         let hex = registry::digest_hex(&digest.0)?;
+        let lock = self.lock_for(hex);
+        let _guard = lock.lock().await;
         let dir = self.config.root.join(hex);
         match tokio::fs::remove_dir_all(&dir).await {
             Ok(()) => Ok(()),
@@ -493,6 +559,272 @@ mod tests {
             store.remove(&digest("zz")).await,
             Err(EngineError::Image(_))
         ));
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    // --- images cached before M5a (§3.21) ---------------------------------
+
+    const OTHER_HEX: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+
+    const APK_INSTALLED: &str = "C:Q1abcdef=\nP:musl\nV:1.2.5-r10\nA:x86_64\no:musl\n\n\
+                                 C:Q1other=\nP:libcrypto3\nV:3.5.1-r0\nA:x86_64\no:openssl\n\n";
+
+    /// An unpacked Alpine root, the tree the copy mounter "mounts".
+    fn alpine_fixture(label: &str) -> PathBuf {
+        let dir = crate::image::cache::tests_support::temp_dir(label);
+        std::fs::create_dir_all(dir.join("etc")).expect("etc");
+        std::fs::write(dir.join("etc/os-release"), "ID=alpine\nVERSION_ID=3.22.1\n")
+            .expect("os-release");
+        std::fs::create_dir_all(dir.join("lib/apk/db")).expect("apk db");
+        std::fs::write(dir.join("lib/apk/db/installed"), APK_INSTALLED).expect("installed");
+        dir
+    }
+
+    /// Commits a cache entry for `hex` the way a release before M5a did:
+    /// root disk and metadata, no inventory.
+    fn commit_pre_m5a_entry(root: &Path, hex: &str) {
+        let image = ImageRef {
+            reference: "docker.io/library/alpine:3.22".into(),
+            digest: digest(hex),
+        };
+        let tmp = cache::tmp_dir(root, hex);
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        std::fs::write(tmp.join("rootfs.ext4"), b"rootfs").expect("rootfs");
+        cache::write_entry(
+            &tmp,
+            &image,
+            &crate::ImageConfig {
+                entrypoint: Vec::new(),
+                cmd: Vec::new(),
+                env: Vec::new(),
+                user: None,
+                workdir: None,
+                exposed_ports: Vec::new(),
+            },
+            6,
+        )
+        .expect("image.json");
+        cache::commit(root, &tmp, hex).expect("commit");
+    }
+
+    fn copy_store(
+        root: &Path,
+        fixture: &Path,
+    ) -> (ImageStore, Arc<backfill::tests_support::CopyMount>) {
+        let mounter = Arc::new(backfill::tests_support::CopyMount::new(fixture));
+        let store = store(root).with_mounter(Arc::clone(&mounter) as Arc<dyn backfill::RootMount>);
+        (store, mounter)
+    }
+
+    #[tokio::test]
+    async fn uninventoried_lists_only_committed_entries_without_an_inventory() {
+        let root = crate::image::cache::tests_support::temp_dir("store-uninventoried");
+        let fixture = alpine_fixture("store-uninventoried-fixture");
+        let (store, _) = copy_store(&root, &fixture);
+        commit_pre_m5a_entry(&root, HEX);
+        commit_pre_m5a_entry(&root, OTHER_HEX);
+        // An entry that already has its inventory is not listed.
+        store
+            .inventory_cached(&digest(OTHER_HEX))
+            .await
+            .expect("inventory");
+        // Neither is a scratch directory, the mount point or an entry without
+        // a root disk.
+        std::fs::create_dir_all(root.join(backfill::MOUNT_DIR)).expect("mount dir");
+        let bare = "aa".repeat(32);
+        std::fs::create_dir_all(root.join(&bare)).expect("bare");
+        std::fs::write(root.join(&bare).join("image.json"), b"{}").expect("bare json");
+
+        assert_eq!(
+            store.uninventoried().await.expect("scan"),
+            vec![digest(HEX)]
+        );
+        std::fs::remove_dir_all(&root).expect("cleanup");
+        std::fs::remove_dir_all(&fixture).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn a_cached_image_without_an_inventory_is_inventoried_once_from_its_root_disk() {
+        let root = crate::image::cache::tests_support::temp_dir("store-backfill");
+        let fixture = alpine_fixture("store-backfill-fixture");
+        let (store, mounter) = copy_store(&root, &fixture);
+        commit_pre_m5a_entry(&root, HEX);
+        assert_eq!(
+            store.inventory(&digest(HEX)).await,
+            Err(EngineError::NotFound)
+        );
+
+        let inventory = store
+            .inventory_cached(&digest(HEX))
+            .await
+            .expect("backfill");
+        assert_eq!(inventory.digest, digest(HEX));
+        assert_eq!(inventory.ecosystems, vec!["Alpine:v3.22".to_owned()]);
+        assert!(
+            inventory
+                .packages
+                .iter()
+                .any(|p| p.name == "libcrypto3" && p.source_name.as_deref() == Some("openssl"))
+        );
+        // The root disk was mounted once, from the entry, and unmounted.
+        assert_eq!(
+            *mounter.mounts.lock().unwrap(),
+            vec![root.join(HEX).join("rootfs.ext4")]
+        );
+        assert!(mounter.mounted.lock().unwrap().is_empty());
+        // The inventory is cached with the image, whole.
+        assert_eq!(store.inventory(&digest(HEX)).await, Ok(inventory.clone()));
+        assert!(!root.join(HEX).join("inventory.json.tmp").exists());
+        assert!(store.uninventoried().await.expect("scan").is_empty());
+
+        // A second call returns the cached inventory without mounting again.
+        assert_eq!(store.inventory_cached(&digest(HEX)).await, Ok(inventory));
+        assert_eq!(mounter.mounts.lock().unwrap().len(), 1);
+        std::fs::remove_dir_all(&root).expect("cleanup");
+        std::fs::remove_dir_all(&fixture).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn a_root_disk_that_does_not_mount_writes_nothing_and_stays_listed() {
+        let root = crate::image::cache::tests_support::temp_dir("store-backfill-fail");
+        let fixture = alpine_fixture("store-backfill-fail-fixture");
+        let (store, mounter) = copy_store(&root, &fixture);
+        commit_pre_m5a_entry(&root, HEX);
+        *mounter.fail.lock().unwrap() = Some(EngineError::Io("mount: wrong fs type".into()));
+
+        assert_eq!(
+            store.inventory_cached(&digest(HEX)).await,
+            Err(EngineError::Io("mount: wrong fs type".into()))
+        );
+        assert!(!root.join(HEX).join("inventory.json").exists());
+        assert_eq!(
+            store.uninventoried().await.expect("scan"),
+            vec![digest(HEX)]
+        );
+        // The next start tries again and succeeds.
+        assert!(store.inventory_cached(&digest(HEX)).await.is_ok());
+        std::fs::remove_dir_all(&root).expect("cleanup");
+        std::fs::remove_dir_all(&fixture).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn a_stale_mount_is_cleared_before_the_next_one() {
+        let root = crate::image::cache::tests_support::temp_dir("store-backfill-stale");
+        let fixture = alpine_fixture("store-backfill-stale-fixture");
+        let (store, mounter) = copy_store(&root, &fixture);
+        commit_pre_m5a_entry(&root, HEX);
+        // An interrupted agent left a root disk mounted on the mount point.
+        let at = root.join(backfill::MOUNT_DIR);
+        backfill::RootMount::mount(mounter.as_ref(), Path::new("/stale/rootfs.ext4"), &at)
+            .expect("stale mount");
+
+        store
+            .inventory_cached(&digest(HEX))
+            .await
+            .expect("backfill");
+        assert_eq!(*mounter.unmounts.lock().unwrap(), 2);
+        assert!(mounter.mounted.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(&root).expect("cleanup");
+        std::fs::remove_dir_all(&fixture).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn inventory_cached_of_an_unknown_digest_is_not_found() {
+        let root = crate::image::cache::tests_support::temp_dir("store-backfill-missing");
+        let fixture = alpine_fixture("store-backfill-missing-fixture");
+        let (store, mounter) = copy_store(&root, &fixture);
+        assert_eq!(
+            store.inventory_cached(&digest(HEX)).await,
+            Err(EngineError::NotFound)
+        );
+        assert!(mounter.mounts.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(&root).expect("cleanup");
+        std::fs::remove_dir_all(&fixture).expect("cleanup");
+    }
+}
+
+/// The real read-only loop mount (§3.21). `#[ignore]`d and additionally
+/// gated on `QUORO_ENGINE_MOUNT_TESTS=1`, because it needs root, a loop
+/// device and `mkfs.ext4`:
+///
+/// ```text
+/// sudo -E env "PATH=$PATH" QUORO_ENGINE_MOUNT_TESTS=1 \
+///   cargo test -p quoro-engine image::mount_tests -- --ignored
+/// ```
+#[cfg(test)]
+mod mount_tests {
+    use super::*;
+
+    const HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[tokio::test]
+    #[ignore = "root: set QUORO_ENGINE_MOUNT_TESTS=1"]
+    async fn a_pre_m5a_root_disk_is_inventoried_through_a_read_only_loop_mount() {
+        if std::env::var("QUORO_ENGINE_MOUNT_TESTS").as_deref() != Ok("1") {
+            return;
+        }
+        let root = crate::image::cache::tests_support::temp_dir("mount-backfill");
+        let mkfs = crate::ch::tools::find_optional("mkfs.ext4").expect("mkfs.ext4");
+        let store = ImageStore::new(ImageStoreConfig {
+            root: root.clone(),
+            mkfs_ext4: mkfs.clone(),
+            preserve_ownership: true,
+        })
+        .expect("store");
+
+        // A root disk built the way a release before M5a built it: an Alpine
+        // tree through `mkfs.ext4 -d`, with no inventory next to it.
+        let tree = root.join("tree");
+        std::fs::create_dir_all(tree.join("etc")).expect("etc");
+        std::fs::write(
+            tree.join("etc/os-release"),
+            "ID=alpine\nVERSION_ID=3.22.1\n",
+        )
+        .expect("os");
+        std::fs::create_dir_all(tree.join("lib/apk/db")).expect("db");
+        std::fs::write(
+            tree.join("lib/apk/db/installed"),
+            "C:Q1=\nP:libcrypto3\nV:3.5.1-r0\nA:x86_64\no:openssl\n\n",
+        )
+        .expect("installed");
+        let entry = root.join(HEX);
+        std::fs::create_dir_all(&entry).expect("entry");
+        ext4::build(&mkfs, &tree, &entry.join("rootfs.ext4")).expect("mkfs");
+        cache::write_entry(
+            &entry,
+            &ImageRef {
+                reference: "docker.io/library/alpine:3.22".into(),
+                digest: ImageDigest(format!("sha256:{HEX}")),
+            },
+            &crate::ImageConfig {
+                entrypoint: Vec::new(),
+                cmd: Vec::new(),
+                env: Vec::new(),
+                user: None,
+                workdir: None,
+                exposed_ports: Vec::new(),
+            },
+            0,
+        )
+        .expect("image.json");
+        let before = std::fs::read(entry.join("rootfs.ext4")).expect("rootfs");
+
+        let digest = ImageDigest(format!("sha256:{HEX}"));
+        assert_eq!(
+            store.uninventoried().await.expect("scan"),
+            vec![digest.clone()]
+        );
+        let inventory = store.inventory_cached(&digest).await.expect("backfill");
+        assert_eq!(inventory.ecosystems, vec!["Alpine:v3.22".to_owned()]);
+        assert!(inventory.packages.iter().any(|p| p.name == "libcrypto3"));
+        // Unmounted, never written, and not listed any more.
+        let at = root.join(backfill::MOUNT_DIR);
+        assert!(!backfill::RootMount::is_mounted(&backfill::LoopMount, &at));
+        assert_eq!(
+            std::fs::read(entry.join("rootfs.ext4")).expect("rootfs"),
+            before
+        );
+        assert!(store.uninventoried().await.expect("scan").is_empty());
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
 }

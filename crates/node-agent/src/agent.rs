@@ -86,6 +86,11 @@ pub async fn run<E: Engine + 'static>(
     // One inventory hub serves the reconciler, the build manager and the
     // session (sections 5.26, 6.11).
     let inventory = crate::inventory::InventoryHub::new(Arc::clone(&engine));
+    // Images cached by a release before M5a have no inventory: the engine
+    // reads them from their root disks once, in the background, and the hub
+    // sends them like freshly prepared ones (section 6.11). Nothing waits on
+    // it, and an image that fails is retried at the next start.
+    let backfill_task = crate::inventory::spawn_backfill(Arc::clone(&engine), inventory.clone());
     let node_id = identity.get().node_id;
     let cluster_id = identity.get().cluster_id;
     let (desired, desired_rx) = watch::channel(current.clone());
@@ -223,6 +228,7 @@ pub async fn run<E: Engine + 'static>(
     leases.abort();
     let _ = stop.send(true);
     retention_task.abort();
+    backfill_task.abort();
     let _ = reconcile_task.await;
     let _ = metrics_task.await;
     let _ = build_task.await;

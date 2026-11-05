@@ -81,6 +81,8 @@ pub enum FakeOp {
     DeleteVolume,
     /// `snapshot_volume` (M5a).
     SnapshotVolume,
+    /// `inventory_cached_image` (M5a).
+    InventoryCachedImage,
 }
 
 /// A volume the fake holds (M5a). With a volume directory set
@@ -258,6 +260,11 @@ struct State {
     /// as prepared before M5a (no inventory); a prepared image without an
     /// entry has an empty inventory.
     inventories: HashMap<ImageDigest, Option<ImageInventory>>,
+    /// What `inventory_cached_image` builds for an image prepared before
+    /// M5a; an empty inventory when unset (M5a).
+    backfills: HashMap<ImageDigest, ImageInventory>,
+    /// Digests `inventory_cached_image` read a root disk for, in order.
+    backfilled: Vec<ImageDigest>,
     /// Bridge name to the network the bridge was created with.
     networks: HashMap<String, NodeNetwork>,
     vms: HashMap<VmId, VmRecord>,
@@ -284,6 +291,8 @@ impl State {
         Self {
             images: HashMap::new(),
             inventories: HashMap::new(),
+            backfills: HashMap::new(),
+            backfilled: Vec::new(),
             networks: HashMap::new(),
             vms: HashMap::new(),
             snapshots: HashMap::new(),
@@ -416,6 +425,21 @@ impl FakeEngine {
     /// prepared, `image_inventory` is `NotFound`.
     pub fn clear_inventory(&self, digest: &ImageDigest) {
         self.lock().inventories.insert(digest.clone(), None);
+    }
+
+    /// Sets the inventory `inventory_cached_image` builds for
+    /// `inventory.digest` when that image has none (M5a, §3.21).
+    pub fn set_backfill_inventory(&self, inventory: ImageInventory) {
+        self.lock()
+            .backfills
+            .insert(inventory.digest.clone(), inventory);
+    }
+
+    /// The digests `inventory_cached_image` read a root disk for, in order:
+    /// an image that already had an inventory is not in it.
+    #[must_use]
+    pub fn backfilled(&self) -> Vec<ImageDigest> {
+        self.lock().backfilled.clone()
     }
 
     /// Keeps volume files in `dir` as real sparse files (M5a). Snapshots are
@@ -854,6 +878,50 @@ impl Engine for FakeEngine {
                 inventoried_at: "2026-01-01T00:00:00Z".to_owned(),
             }),
         }
+    }
+
+    async fn uninventoried_images(&self) -> Result<Vec<ImageDigest>, EngineError> {
+        let state = self.lock();
+        let mut digests: Vec<ImageDigest> = state
+            .images
+            .keys()
+            .filter(|digest| matches!(state.inventories.get(*digest), Some(None)))
+            .cloned()
+            .collect();
+        digests.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(digests)
+    }
+
+    async fn inventory_cached_image(
+        &self,
+        digest: &ImageDigest,
+    ) -> Result<ImageInventory, EngineError> {
+        if !self.lock().images.contains_key(digest) {
+            return Err(EngineError::NotFound);
+        }
+        if !matches!(self.lock().inventories.get(digest), Some(None)) {
+            return self.image_inventory(digest).await;
+        }
+        if let Some(err) = self.take_failure(FakeOp::InventoryCachedImage) {
+            return Err(err);
+        }
+        let mut state = self.lock();
+        let inventory = state
+            .backfills
+            .remove(digest)
+            .unwrap_or_else(|| ImageInventory {
+                digest: digest.clone(),
+                os: None,
+                ecosystems: Vec::new(),
+                not_inventoried: Vec::new(),
+                packages: Vec::new(),
+                inventoried_at: "2026-01-01T00:00:00Z".to_owned(),
+            });
+        state.backfilled.push(digest.clone());
+        state
+            .inventories
+            .insert(digest.clone(), Some(inventory.clone()));
+        Ok(inventory)
     }
 
     async fn prepare_layout(&self, layout: &OciLayout) -> Result<PreparedImage, EngineError> {
