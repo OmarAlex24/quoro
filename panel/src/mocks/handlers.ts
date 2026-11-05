@@ -90,6 +90,7 @@ import { incidentsHandlers } from './handlers-incidents';
 import { metricsHandlers } from './handlers-metrics';
 import { usersHandlers } from './handlers-users';
 import { interactiveHandlers } from './handlers-interactive';
+import { vulnerabilitiesHandlers } from './handlers-vulnerabilities';
 import { webhooksHandlers } from './handlers-webhooks';
 
 const findVm = (vmId: string): Vm | undefined =>
@@ -1186,6 +1187,7 @@ export const handlers = [
   ...incidentsHandlers,
   ...metricsHandlers,
   ...interactiveHandlers,
+  ...vulnerabilitiesHandlers,
 
   // Generated fallbacks, kept last so every stateful route above wins.
   ...getHealthMock(),

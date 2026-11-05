@@ -4,6 +4,7 @@ import { LAMP_COLORS, type LampTone } from '../lib/lamp';
 import { formatBytes } from '../lib/metrics';
 import { problemView } from '../lib/problem';
 import { useSession } from '../session';
+import { ClusterVulnerabilities } from '../components/cluster-vulnerabilities';
 import { NodeMetricsBay } from '../components/metrics-bay';
 import { ToneLamp } from '../components/tone-lamp';
 import { ProblemBanner } from '../components/ui/problem-banner';
@@ -50,6 +51,7 @@ export function NodesScreen() {
   if (unauthenticated || !user) return <LoginScreen />;
 
   const nodes = nodesQuery.data?.items ?? [];
+  const nodeNames = Object.fromEntries(nodes.map((node) => [node.id, node.name]));
   const connected = nodes.filter((node) => node.status === 'connected').length;
   const listError =
     nodesQuery.error !== null && nodesQuery.error !== undefined
@@ -157,6 +159,8 @@ export function NodesScreen() {
           })
         )}
       </div>
+
+      <ClusterVulnerabilities nodeNames={nodeNames} className="mt-5" />
     </main>
   );
 }

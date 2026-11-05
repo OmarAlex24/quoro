@@ -52,6 +52,10 @@ import { AppEdgeBackends } from '../components/app-edge';
 import { AppEnvDialog } from '../components/app-env-dialog';
 import { AppInstances } from '../components/app-instances';
 import { AppStorage } from '../components/app-storage';
+import {
+  AppVulnerabilities,
+  RebuildWithRefreshedBase,
+} from '../components/app-vulnerabilities';
 import { DeployRail } from '../components/deploy-rail';
 import { LogTape } from '../components/log-tape';
 import { AppMetricsBay } from '../components/metrics-bay';
@@ -490,6 +494,11 @@ export function AppScreen() {
                     {buildDisabledReason}
                   </p>
                 ) : null}
+                <RebuildWithRefreshedBase
+                  appId={app.id}
+                  disabled={!canBuildNow}
+                  onStarted={invalidate}
+                />
               </div>
             </div>
             {buildProblem ? <ProblemBanner view={buildProblem} className="mt-3" /> : null}
@@ -613,6 +622,12 @@ export function AppScreen() {
           </details>
         ) : null}
       </section>
+
+      <AppVulnerabilities
+        app={app}
+        canWrite={canWrite}
+        onRebuilt={invalidate}
+      />
 
       <section className="mt-5 rounded-[6px] border border-rail bg-panel px-4 py-4 sm:px-5">
         <AppDomains
