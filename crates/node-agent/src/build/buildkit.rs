@@ -1434,8 +1434,17 @@ mod tests {
         (Running { handle, cancel }, receiver)
     }
 
+    /// A wall-clock bound for the waits below. A yield count is not a time
+    /// bound: on a loaded runner the builder can be busy in blocking work for
+    /// longer than any fixed number of yields. `std::time` is used on purpose,
+    /// so tests with a paused tokio clock still get a real deadline.
+    fn wait_deadline() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(30)
+    }
+
     async fn wait_for_vm(engine: &FakeEngine, id: &VmId) {
-        for _ in 0..200_000 {
+        let deadline = wait_deadline();
+        while std::time::Instant::now() < deadline {
             if engine.inspect(id).await.is_ok() {
                 return;
             }
@@ -1448,7 +1457,8 @@ mod tests {
     /// `output` is safe: the fake reports `Conflict` once a reader exists, and
     /// a probe that succeeds is dropped before the test yields.
     async fn wait_for_output_reader(engine: &FakeEngine, id: &VmId) {
-        for _ in 0..200_000 {
+        let deadline = wait_deadline();
+        while std::time::Instant::now() < deadline {
             match engine.output(id) {
                 Err(EngineError::Conflict(_)) => return,
                 other => drop(other),
@@ -1459,7 +1469,8 @@ mod tests {
     }
 
     async fn wait_running(engine: &FakeEngine, id: &VmId) {
-        for _ in 0..200_000 {
+        let deadline = wait_deadline();
+        while std::time::Instant::now() < deadline {
             if let Ok(info) = engine.inspect(id).await
                 && info.state == VmState::Running
             {
