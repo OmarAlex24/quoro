@@ -10,6 +10,7 @@
 
 - [Product requirements](product/prd.md)
 - [Roadmap](product/roadmap.md)
+- [Changelog](site/changelog.md)
 - [Glossary](glossary.md)
 
 # Architecture
