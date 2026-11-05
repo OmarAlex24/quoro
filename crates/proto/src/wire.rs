@@ -371,6 +371,20 @@ pub struct StatusReport {
     /// M5a; absent when there is none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub backups: Vec<BackupStatus>,
+    /// One entry per prepared image the node holds, with its inventory hash
+    /// (section 5.3, ADR 0150). Added in M5a; absent when there is none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageStatus>,
+}
+
+/// One entry of `status_report.images` (section 5.3, ADR 0150).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageStatus {
+    pub image_digest: String,
+    /// Hex SHA-256 of the image's inventory (section 6.11); absent while the
+    /// node has no inventory for the image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_sha256: Option<String>,
 }
 
 /// Why an edge took a backend out of rotation (section 5.3).
@@ -660,6 +674,7 @@ pub enum NodeMessage {
     StreamEnd(StreamEnd),
     CommandResult(CommandResult),
     DnsChallenge(DnsChallenge),
+    ImageInventory(ImageInventoryBody),
     Error(ProtocolError),
     Ping,
     Pong,
@@ -680,6 +695,7 @@ impl NodeMessage {
             Self::StreamEnd(_) => "stream_end",
             Self::CommandResult(_) => "command_result",
             Self::DnsChallenge(_) => "dns_challenge",
+            Self::ImageInventory(_) => "image_inventory",
             Self::Error(_) => "error",
             Self::Ping => "ping",
             Self::Pong => "pong",
@@ -701,6 +717,7 @@ impl NodeMessage {
             Self::StreamEnd(b) => frame(kind, id, re, b),
             Self::CommandResult(b) => frame(kind, id, re, b),
             Self::DnsChallenge(b) => frame(kind, id, re, b),
+            Self::ImageInventory(b) => frame(kind, id, re, b),
             Self::Error(b) => frame(kind, id, re, b),
             Self::Ping | Self::Pong => frame(kind, id, re, &empty_object()),
         }
@@ -723,6 +740,7 @@ impl NodeMessage {
             "stream_end" => Self::StreamEnd(raw.body_as()?),
             "command_result" => Self::CommandResult(raw.body_as()?),
             "dns_challenge" => Self::DnsChallenge(raw.body_as()?),
+            "image_inventory" => Self::ImageInventory(raw.body_as()?),
             "error" => Self::Error(raw.body_as()?),
             "ping" => Self::Ping,
             "pong" => Self::Pong,
@@ -1163,6 +1181,55 @@ impl std::fmt::Debug for SpecTunnel {
             .field("origin_port", &self.origin_port)
             .finish()
     }
+}
+
+/// `ID` and `VERSION_ID` of an image's os-release (section 5.26).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryOs {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+}
+
+/// One package of an `image_inventory` part (section 5.26).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryPackageWire {
+    pub ecosystem: String,
+    pub name: String,
+    /// The source package, when the package database records one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_name: Option<String>,
+    pub version: String,
+    pub purl: String,
+    /// For a language package, the file it was read from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+/// Body of one `image_inventory` part (section 5.26), node to control plane.
+///
+/// Every part of one send carries the same `image_digest`, `inventory_id`,
+/// `parts` and metadata, and its own slice of `packages`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageInventoryBody {
+    pub image_digest: String,
+    /// Identity of the send: the `msg_` id of part 1.
+    pub inventory_id: String,
+    /// 1-based number of this part.
+    pub part: u32,
+    /// Number of parts of this send, 1 to 8.
+    pub parts: u32,
+    /// Hex SHA-256 of the whole inventory (section 6.11).
+    pub inventory_sha256: String,
+    pub inventoried_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<InventoryOs>,
+    pub ecosystems: Vec<String>,
+    pub not_inventoried: Vec<String>,
+    /// Packages in the whole inventory.
+    pub package_count: u64,
+    /// This part's slice of the packages.
+    pub packages: Vec<InventoryPackageWire>,
 }
 
 /// `action` of `dns_challenge` (section 5.22).

@@ -217,6 +217,7 @@ fn report(builds: Vec<BuildStatus>) -> NodeMessage {
         builds,
         edge_backends: Vec::new(),
         backups: Vec::new(),
+        images: Vec::new(),
         volumes: Vec::new(),
     })
 }
