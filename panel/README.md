@@ -157,6 +157,26 @@ The production build contains no MSW code: `src/mocks/` is only reached through
   `getDeployment` every 1 s while it is pending, preparing or starting. There
   is no deployment SSE stream in the contract. A 504 from the progress-lines
   call says the node is unreachable.
+- The app screen's **Storage and HA** section, between Environment and
+  Instances, offers a stateless app "Add a volume" (1–1024 GiB and an absolute
+  mount path, `createVolume`) and, for a stateful app, its volume's size, mount
+  path, node, state and allocated bytes; the four HA policies (warm and hot say
+  "not in this release", cold says "needs a volume" or "needs a backup
+  repository") with the `ha_cost` table (reserved vCPU, memory and disk,
+  storage, restore estimate as `m:ss` or `h:mm:ss`, pause per backup, the
+  current row highlighted, all of it labelled estimates); the backup schedule
+  while the policy is `cold`; and the backups newest first, with "Back up now"
+  and its 409 in the screen's `ProblemBanner`. A policy or schedule change calls
+  `updateApp` and refetches the app so `ha_cost` updates. The audit screen's
+  **Off-site copy** block reads `listAuditExports`, says the strength in the
+  words audit-log-format.md section 8.2 fixes, and shows "Probe again" to an
+  owner only. Mock mode seeds `blog` with a 10 GiB volume on `lab-3` that the
+  node snapshots with `reflink`, a `lab-backups` repository, two succeeded
+  backups and one failed one, and an audit export whose strength is
+  `bucket_rule`; the mock computes `ha_cost` and the cold row moves from the
+  volume's allocated bytes to the kept backups' uploaded bytes when the policy
+  switches, and "Back up now" adds a backup that goes queued → running →
+  succeeded over about 2 s.
 - A terminal or console session opens with one POST and then a WebSocket
   carrying the single-use ticket (30 s, never shown or stored). Guest bytes go
   only into xterm.js; the clipboard (OSC 52) and web-links addons are not

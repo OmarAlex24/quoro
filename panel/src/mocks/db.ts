@@ -1,17 +1,23 @@
 import type {
   App,
   AppEnvVar,
+  AppHaCost,
   AppSource,
+  AuditExport,
+  Backup,
+  BackupRepository,
   Build,
   BuildLogLine,
   Deployment,
   DeploymentLogEntry,
   Domain,
   EdgeBackend,
+  HaPolicyCost,
   Node,
   Project,
   User,
   Vm,
+  Volume,
 } from '../api/generated/model';
 
 /** Crockford base32, the alphabet the contract allows after the id prefix. */
@@ -65,6 +71,10 @@ export interface MockDb {
   appEnv: Record<string, AppEnvVar[]>;
   /** The edge's view of an app's instances, keyed by app id. */
   edgeBackends: Record<string, EdgeBackend[]>;
+  volumes: Volume[];
+  backups: Backup[];
+  backupRepositories: BackupRepository[];
+  auditExports: AuditExport[];
 }
 
 export const db: MockDb = {
@@ -107,6 +117,10 @@ export const db: MockDb = {
   domains: [],
   appEnv: {},
   edgeBackends: {},
+  volumes: [],
+  backups: [],
+  backupRepositories: [],
+  auditExports: [],
 };
 
 const timers = new Set<number>();
@@ -143,6 +157,86 @@ export const findApp = (appId: string): App | undefined =>
 
 export const findDeployment = (deploymentId: string): Deployment | undefined =>
   db.deployments.find((candidate) => candidate.id === deploymentId);
+
+const GIB = 1024 ** 3;
+/** Rates the contract names as defaults before a measurement exists (ADR 0147). */
+const DEFAULT_DOWNLOAD_RATE = 50 * 1024 ** 2;
+
+/** The one volume M5a allows an app to have. */
+const activeVolume = (appId: string): Volume | undefined =>
+  db.volumes.find(
+    (volume) =>
+      volume.app_id === appId &&
+      (volume.state === 'creating' ||
+        volume.state === 'ready' ||
+        volume.state === 'restoring'),
+  );
+
+/**
+ * The mock's `ha_cost` (openapi.yaml `AppHaCost`): one price per policy from
+ * the volume, its node's snapshot method and the kept backups. Switching to
+ * `cold` moves its storage from the sparse file's estimate to the bytes the
+ * kept backups actually uploaded, so the table changes.
+ */
+export const mockHaCost = (app: App): AppHaCost => {
+  const volume = activeVolume(app.id);
+  const repository = db.backupRepositories[0];
+  const kept = db.backups
+    .filter(
+      (backup) =>
+        backup.app_id === app.id && backup.status === 'succeeded' && !backup.pruned_at,
+    )
+    .sort((left, right) => Date.parse(right.created_at) - Date.parse(left.created_at))
+    .slice(0, app.backup_schedule.keep);
+
+  const storedBytes = kept.reduce((total, backup) => total + (backup.uploaded_bytes ?? 0), 0);
+  const coldStorage =
+    app.ha_policy === 'cold' && kept.length > 0
+      ? storedBytes
+      : (volume?.allocated_bytes ?? null);
+  const coldRestore =
+    coldStorage === null ? null : Math.round(coldStorage / DEFAULT_DOWNLOAD_RATE);
+  const coldPause = volume === undefined ? null : 0;
+
+  const none: HaPolicyCost = {
+    policy: 'none',
+    available: true,
+    reserved: { vcpus: 0, memory_mb: 0, disk_gb: 0 },
+    storage_bytes: 0,
+    restore_estimate_s: null,
+    pause_estimate_ms: null,
+  };
+  const cold: HaPolicyCost = {
+    policy: 'cold',
+    available: volume !== undefined && repository !== undefined,
+    unavailable_reason:
+      volume === undefined ? 'stateless' : repository === undefined ? 'no_repository' : null,
+    reserved: { vcpus: 0, memory_mb: 0, disk_gb: 0 },
+    storage_bytes: volume === undefined ? null : coldStorage,
+    restore_estimate_s: volume === undefined ? null : coldRestore,
+    pause_estimate_ms: coldPause,
+  };
+  const warm: HaPolicyCost = {
+    policy: 'warm',
+    available: false,
+    unavailable_reason: 'not_in_this_release',
+    reserved: {
+      vcpus: app.resources.vcpus,
+      memory_mb: app.resources.memory_mb,
+      disk_gb: app.resources.disk_gb + (volume?.size_gb ?? 0),
+    },
+    storage_bytes: null,
+    restore_estimate_s: null,
+    pause_estimate_ms: null,
+  };
+  const hot: HaPolicyCost = { ...warm, policy: 'hot' };
+
+  return {
+    snapshot_method: volume === undefined ? null : 'reflink',
+    policies: [none, cold, warm, hot],
+    computed_at: now(),
+  };
+};
 
 const appInstances = (appId: string): Vm[] =>
   db.vms.filter((vm) => vm.app_id === appId);
@@ -298,6 +392,8 @@ export const runDeployment = (
 /** One project, one running app and its deployment, domain and variables. */
 const seed = (): void => {
   const createdAt = now();
+  const hoursAgo = (hours: number): string =>
+    new Date(Date.parse(createdAt) - hours * 3_600_000).toISOString();
   const project: Project = {
     id: mockId('prj'),
     slug: 'blog',
@@ -341,7 +437,7 @@ const seed = (): void => {
     id: appId,
     project_id: project.id,
     name: 'blog',
-    stateful: false,
+    stateful: true,
     ha_policy: 'none',
     backup_schedule: { interval_h: 24, keep: 7 },
     replicas: 2,
@@ -454,6 +550,114 @@ const seed = (): void => {
     { app_id: appId, name: 'SITE_NAME', updated_at: createdAt },
     { app_id: appId, name: 'LOG_LEVEL', updated_at: createdAt },
   ];
+
+  // Storage: a 10 GiB volume on lab-3, a backup repository and the backups it
+  // already holds. The reflink snapshot method is the one the lab node reports.
+  const volume: Volume = {
+    id: mockId('vol'),
+    app_id: appId,
+    node_id: db.node.id,
+    size_gb: 10,
+    mount_path: '/data',
+    state: 'ready',
+    allocated_bytes: Math.round(3.4 * GIB),
+    restored_from_backup_id: null,
+    error: null,
+    created_at: createdAt,
+    updated_at: createdAt,
+  };
+  db.volumes.push(volume);
+
+  const repository: BackupRepository = {
+    id: mockId('brp'),
+    name: 'lab-backups',
+    provider_id: mockId('prv'),
+    prefix: 'quoro-backups',
+    recovery_key_fingerprint: '9f2c4e6a1b8d3057',
+    recovery_key_rotated_at: null,
+    control_plane_schedule: { interval_h: 6, keep: 7 },
+    created_by: 'usr_01JC9Z6Q5W7X8Y9Z0A1B2C3D4E',
+    created_at: createdAt,
+  };
+  db.backupRepositories.push(repository);
+
+  db.backups.push(
+    {
+      id: mockId('bkp'),
+      repository_id: repository.id,
+      source_kind: 'volume',
+      app_id: appId,
+      volume_id: volume.id,
+      node_id: db.node.id,
+      status: 'failed',
+      trigger: 'schedule',
+      snapshot_method: null,
+      pause_ms: null,
+      logical_bytes: null,
+      uploaded_bytes: null,
+      chunk_count: null,
+      error: 'the node could not read the volume snapshot',
+      created_at: hoursAgo(0.5),
+      started_at: hoursAgo(0.5),
+      finished_at: hoursAgo(0.45),
+      pruned_at: null,
+    },
+    {
+      id: mockId('bkp'),
+      repository_id: repository.id,
+      source_kind: 'volume',
+      app_id: appId,
+      volume_id: volume.id,
+      node_id: db.node.id,
+      status: 'succeeded',
+      trigger: 'api',
+      snapshot_method: 'reflink',
+      pause_ms: 0,
+      logical_bytes: Math.round(3.4 * GIB),
+      uploaded_bytes: Math.round(0.18 * GIB),
+      chunk_count: 41,
+      error: null,
+      created_at: hoursAgo(1),
+      started_at: hoursAgo(1),
+      finished_at: hoursAgo(0.98),
+      pruned_at: null,
+    },
+    {
+      id: mockId('bkp'),
+      repository_id: repository.id,
+      source_kind: 'volume',
+      app_id: appId,
+      volume_id: volume.id,
+      node_id: db.node.id,
+      status: 'succeeded',
+      trigger: 'schedule',
+      snapshot_method: 'reflink',
+      pause_ms: 0,
+      logical_bytes: Math.round(3.4 * GIB),
+      uploaded_bytes: Math.round(2.1 * GIB),
+      chunk_count: 540,
+      error: null,
+      created_at: hoursAgo(6),
+      started_at: hoursAgo(6),
+      finished_at: hoursAgo(5.9),
+      pruned_at: null,
+    },
+  );
+
+  // The off-site copy: an R2 bucket rule, the strength the probe observed.
+  db.auditExports.push({
+    id: mockId('aex'),
+    provider_id: mockId('prv'),
+    prefix: 'quoro-audit',
+    lock_strength: 'bucket_rule',
+    probed_at: hoursAgo(1),
+    probe_detail: 'Overwrite refused with 409; delete refused with 409.',
+    last_exported_seq: 428,
+    last_exported_hash:
+      '6f8d0b7d7e5d4f0c9a1e2d3c4b5a69788796a5b4c3d2e1f0a9b8c7d6e5f4a3b2',
+    last_error: null,
+    updated_at: hoursAgo(1),
+  });
 
   seedGitApp(createdAt);
 };

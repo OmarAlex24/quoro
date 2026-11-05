@@ -12,6 +12,7 @@ import type {
   ListAuditParams,
 } from '../api/generated/model';
 import { AuditEntryRow } from '../components/audit-chain';
+import { AuditCopy } from '../components/audit-copy';
 import { AuditFilters } from '../components/audit-filters';
 import { AuditRecordPanel } from '../components/audit-record';
 import { AuditVerify } from '../components/audit-verify';
@@ -166,6 +167,7 @@ export function AuditScreen() {
           onOpenEntry={(seq) => void openLoadedEntry(seq)}
         />
         <AuditFilters search={search} />
+        <AuditCopy />
       </div>
 
       {listError ? <ProblemBanner view={listError} className="mt-4" /> : null}
