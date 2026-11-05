@@ -58,6 +58,7 @@ The M5a milestone: stateless replicas behind an edge, local volumes, cold backup
 - A machine with only the edge role always reported `applied_rev` 0 in `GET /api/v1/nodes`. It now reports the newest desired state it has applied ([#341]).
 - A new `tunnel` domain, or a hostname that moved between a node and the edge when an app's replica count crossed 1, could wait up to 60 seconds for its tunnel route when the machine had no live session. The primary now publishes those changes at once. After such a move, the old tunnel could also delete the CNAME the new tunnel had just pointed at itself, which left the hostname without DNS. A tunnel now deletes a CNAME only while that CNAME still points at it ([#343]).
 - Scaling an app with `tunnel` domains down to one replica could keep the instance on a node without a tunnel, and the hostnames stopped answering with no sign of why. A scale-down now keeps the instances on nodes with a tunnel first. When no remaining instance can serve the app's `tunnel` domains, each one gets a `certificate.failed` event with `tls_mode` `tunnel` ([#347]).
+- When a `tunnel` hostname moved between a node's tunnel and the edge's, the tunnel that lost it deleted its CNAME and the other tunnel created a new one. Cloudflare took longer to route the new record, and the hostname answered `404` for up to about a minute. The tunnel that gains the hostname now repoints the existing record, and the one that loses it leaves the record alone. The losing node still stops serving the hostname at once, so a short window of `404`s remains ([#348]).
 
 ### Maintenance
 
@@ -326,6 +327,7 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#341]: https://github.com/OmarAlex24/quoro/pull/341
 [#343]: https://github.com/OmarAlex24/quoro/pull/343
 [#347]: https://github.com/OmarAlex24/quoro/pull/347
+[#348]: https://github.com/OmarAlex24/quoro/pull/348
 [ADR 0019]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0019-fencing-is-mandatory-and-lease-based-node-agent-self-fences.md
 [ADR 0020]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0020-per-app-ha-policies-none-cold-warm-hot-with-cost-shown-in.md
 [ADR 0027]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0027-signed-binaries-and-reproducible-builds-are-mandatory.md

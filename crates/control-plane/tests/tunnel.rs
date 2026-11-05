@@ -1643,3 +1643,108 @@ async fn a_scale_down_without_a_node_tunnel_reports_the_tunnel_domains() {
     set_replicas(&server, &owner, &app_id, 2).await;
     settles_on(&mock, "dark.example.com", &edge_tunnel).await;
 }
+
+// ---------------------------------------------------------------------------
+// A moved hostname keeps its DNS record (issue #344)
+// ---------------------------------------------------------------------------
+
+/// The id of the quoro CNAME of `hostname`, if there is one.
+fn cname_id(mock: &Mock, hostname: &str) -> Option<String> {
+    mock.records()
+        .into_iter()
+        .find(|record| record.name == hostname && record.kind == "CNAME")
+        .map(|record| record.id)
+}
+
+/// Every DNS record write (`POST`, `PATCH`, `DELETE`) the mock received.
+fn dns_writes(mock: &Mock) -> Vec<Recorded> {
+    mock.requests()
+        .into_iter()
+        .filter(|request| request.path.contains("/dns_records") && request.method != "GET")
+        .collect()
+}
+
+#[tokio::test]
+async fn a_hostname_that_moves_between_tunnels_keeps_its_cname_record() {
+    let mock = start_mock().await;
+    let server = start_with_cloudflare(&mock.base, &format!("{}/dns-query", mock.base)).await;
+    let owner = server.owner().await;
+    insert_machine(&server, NODE_A, "alpha", &["node"]).await;
+    insert_machine(&server, NODE_B, "beta", &["node"]).await;
+    insert_machine(&server, EDGE, "edge", &["edge"]).await;
+    let provider = create_provider(
+        &server,
+        &owner,
+        "tunnel",
+        "Tunnel",
+        json!({ "account_id": ACCOUNT_ID, "zone_id": ZONE_ID }),
+    )
+    .await;
+    let provider_id = provider["id"].as_str().unwrap().to_string();
+    let node_tunnel = map_tunnel(&server, &owner, &mock, NODE_A, "alpha", &provider_id).await;
+    let edge_tunnel = map_tunnel(&server, &owner, &mock, EDGE, "edge", &provider_id).await;
+    let app_id = setup_project_and_app(&server, &owner).await;
+    place_vm(&server, &app_id, NODE_A, "web-a").await;
+    create_domain(
+        &server,
+        &owner,
+        &app_id,
+        "handoff.example.com",
+        "tunnel",
+        &provider_id,
+    )
+    .await;
+    settles_on(&mock, "handoff.example.com", &node_tunnel).await;
+    let record = cname_id(&mock, "handoff.example.com").expect("the CNAME");
+    let before = dns_writes(&mock).len();
+
+    // The node syncs before the edge (node id order), so the node's tunnel
+    // drops the hostname first. It must leave the record to the edge, which
+    // repoints it: no delete, no second record.
+    set_replicas(&server, &owner, &app_id, 2).await;
+    settles_on(&mock, "handoff.example.com", &edge_tunnel).await;
+    wait_for(|| (!tunnel_routes(&mock, &node_tunnel, "handoff.example.com")).then_some(())).await;
+    assert_eq!(cname_id(&mock, "handoff.example.com"), Some(record.clone()));
+    let writes: Vec<Recorded> = dns_writes(&mock).split_off(before);
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    assert_eq!(writes[0].method, "PATCH", "{writes:?}");
+    assert!(
+        writes[0].path.ends_with(&format!("/dns_records/{record}")),
+        "{writes:?}"
+    );
+    assert_eq!(
+        writes[0].body.as_ref().unwrap()["content"],
+        format!("{edge_tunnel}.cfargotunnel.com")
+    );
+
+    // Back to one replica: the same record moves back to the node.
+    set_replicas(&server, &owner, &app_id, 1).await;
+    settles_on(&mock, "handoff.example.com", &node_tunnel).await;
+    wait_for(|| (!tunnel_routes(&mock, &edge_tunnel, "handoff.example.com")).then_some(())).await;
+    assert_eq!(cname_id(&mock, "handoff.example.com"), Some(record.clone()));
+    let writes: Vec<Recorded> = dns_writes(&mock).split_off(before);
+    assert!(
+        writes.iter().all(|write| write.method == "PATCH"),
+        "{writes:?}"
+    );
+
+    // Deleting the domain still removes the record: the tunnel that serves
+    // the hostname deletes it, and the one it moved away from leaves it be.
+    let domain_id: String = sqlx::query_scalar("SELECT id FROM domains WHERE hostname = ?")
+        .bind("handoff.example.com")
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+    let res = owner
+        .delete(server.url(&format!("/api/v1/domains/{domain_id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 204);
+    wait_for(|| {
+        cname_id(&mock, "handoff.example.com")
+            .is_none()
+            .then_some(())
+    })
+    .await;
+}
