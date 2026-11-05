@@ -603,15 +603,28 @@ async fn an_app_that_leaves_the_snapshot_loses_its_cache_and_logs() {
     assert!(logs.exists(APP, BUILD));
 
     harness.publish(2, Vec::new());
+    // The manager removes the cache disk, then the logs, then the rows, so
+    // the test waits for all three: seeing the cache removal alone says
+    // nothing about the two steps after it.
     let removed = tokio::time::timeout(WAIT, async {
-        while !harness.builder.cache_removals().contains(&APP.to_owned()) {
+        loop {
+            let cache_gone = harness.builder.cache_removals().contains(&APP.to_owned());
+            let logs_gone = !logs.exists(APP, BUILD);
+            let rows_gone = harness.store.builds().await.unwrap().is_empty();
+            if cache_gone && logs_gone && rows_gone {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await;
-    assert!(removed.is_ok(), "the cache was never removed");
-    assert!(!logs.exists(APP, BUILD));
-    assert!(harness.store.builds().await.unwrap().is_empty());
+    assert!(
+        removed.is_ok(),
+        "cache removed: {}, logs gone: {}, rows gone: {}",
+        harness.builder.cache_removals().contains(&APP.to_owned()),
+        !logs.exists(APP, BUILD),
+        harness.store.builds().await.unwrap().is_empty()
+    );
     harness.shutdown().await;
 }
 
