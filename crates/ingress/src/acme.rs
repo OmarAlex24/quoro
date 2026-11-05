@@ -686,7 +686,7 @@ mod tests {
             Err(ProviderError::Transport("no DNS in this test".into()))
         }
 
-        async fn delete_cname(&self, _: &str) -> Result<(), ProviderError> {
+        async fn delete_cname(&self, _: &str, _: &str) -> Result<(), ProviderError> {
             Ok(())
         }
 

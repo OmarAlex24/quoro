@@ -1218,3 +1218,235 @@ async fn wait_for_domain_cert(server: &Server, hostname: &str) {
     }
     panic!("the certificate status did not land within 5 s");
 }
+
+// ---------------------------------------------------------------------------
+// Tunnel hostnames that move between machines (issue #283)
+// ---------------------------------------------------------------------------
+
+/// A node id that sorts before [`NODE_B`] and [`EDGE`].
+const NODE_A: &str = "nod_00000000000000000000000001";
+/// The second placement node, so an app can have two replicas.
+const NODE_B: &str = "nod_00000000000000000000000002";
+/// A machine with the `edge` role and no `node` role.
+const EDGE: &str = "nod_0000000000000000000000000E";
+
+/// Inserts a connected machine row with `roles` and no session: the tunnel
+/// manager must not need one to publish its hostnames.
+async fn insert_machine(server: &Server, id: &str, name: &str, roles: &[&str]) {
+    let now = quoro_control_plane::store::now_rfc3339();
+    let roles = serde_json::to_string(roles).unwrap();
+    sqlx::query(
+        "INSERT INTO nodes (id, name, roles, cp_status, status, public_key, address, behind_nat, \
+         labels, capacity, allocated, kvm, engine_version, agent_version, desired_rev, applied_rev, \
+         log_seq, last_seen_at, created_at) \
+         VALUES (?, ?, ?, NULL, 'connected', '', NULL, 1, '{}', \
+         '{\"cpus\":8,\"memory_mb\":16384,\"disk_gb\":100}', '{}', \
+         '{\"available\":true,\"kernel\":\"6.9.0\"}', NULL, NULL, 0, 0, 0, ?, ?)",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(roles)
+    .bind(&now)
+    .bind(&now)
+    .execute(server.state.store.pool())
+    .await
+    .unwrap();
+}
+
+/// Maps `node_id` to the tunnel provider and returns its tunnel id once the
+/// manager created it at the mock.
+async fn map_tunnel(
+    server: &Server,
+    owner: &reqwest::Client,
+    mock: &Mock,
+    node_id: &str,
+    name: &str,
+    provider_id: &str,
+) -> String {
+    let res = owner
+        .put(server.url(&format!("/api/v1/nodes/{node_id}/tunnel")))
+        .json(&json!({ "provider_id": provider_id, "origin_port": 8081 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+    let tunnel_name = format!("quoro-{name}");
+    wait_for(|| {
+        mock.tunnels()
+            .into_iter()
+            .find(|tunnel| tunnel.name == tunnel_name)
+            .map(|tunnel| tunnel.id)
+    })
+    .await
+}
+
+/// The target of the quoro CNAME of `hostname`, if there is one.
+fn cname_target(mock: &Mock, hostname: &str) -> Option<String> {
+    mock.records()
+        .into_iter()
+        .find(|record| record.name == hostname && record.kind == "CNAME")
+        .map(|record| record.content)
+}
+
+/// Whether the newest ingress configuration of `tunnel_id` routes `hostname`.
+fn tunnel_routes(mock: &Mock, tunnel_id: &str, hostname: &str) -> bool {
+    mock.matching("PUT", &format!("/cfd_tunnel/{tunnel_id}/configurations"))
+        .last()
+        .and_then(|request| request.body.clone())
+        .is_some_and(|body| {
+            body["config"]["ingress"]
+                .as_array()
+                .is_some_and(|rules| rules.iter().any(|rule| rule["hostname"] == hostname))
+        })
+}
+
+/// Waits until `hostname`'s CNAME points at `tunnel_id`, then checks it still
+/// does after every pending reconcile had time to run.
+async fn settles_on(mock: &Mock, hostname: &str, tunnel_id: &str) {
+    let target = format!("{tunnel_id}.cfargotunnel.com");
+    wait_for(|| (cname_target(mock, hostname).as_deref() == Some(target.as_str())).then_some(()))
+        .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        cname_target(mock, hostname).as_deref(),
+        Some(target.as_str()),
+        "the CNAME of {hostname} moved away from {tunnel_id}: {:?}",
+        mock.records()
+    );
+}
+
+async fn set_replicas(server: &Server, owner: &reqwest::Client, app_id: &str, replicas: i64) {
+    let res = owner
+        .patch(server.url(&format!("/api/v1/apps/{app_id}")))
+        .json(&json!({ "replicas": replicas }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+}
+
+#[tokio::test]
+async fn a_new_tunnel_domain_of_a_replicated_app_reaches_the_edge_tunnel_at_once() {
+    let mock = start_mock().await;
+    let server = start_with_cloudflare(&mock.base, &format!("{}/dns-query", mock.base)).await;
+    let owner = server.owner().await;
+    insert_machine(&server, NODE_A, "alpha", &["node"]).await;
+    insert_machine(&server, NODE_B, "beta", &["node"]).await;
+    insert_machine(&server, EDGE, "edge", &["edge"]).await;
+    let provider = create_provider(
+        &server,
+        &owner,
+        "tunnel",
+        "Tunnel",
+        json!({ "account_id": ACCOUNT_ID, "zone_id": ZONE_ID }),
+    )
+    .await;
+    let provider_id = provider["id"].as_str().unwrap().to_string();
+    let edge_tunnel = map_tunnel(&server, &owner, &mock, EDGE, "edge", &provider_id).await;
+    let app_id = setup_project_and_app(&server, &owner).await;
+    set_replicas(&server, &owner, &app_id, 2).await;
+
+    // The edge has no session: its tunnel is still the primary's to publish,
+    // well before the 60 s periodic pass.
+    create_domain(
+        &server,
+        &owner,
+        &app_id,
+        "replicated.example.com",
+        "tunnel",
+        &provider_id,
+    )
+    .await;
+    wait_for(|| tunnel_routes(&mock, &edge_tunnel, "replicated.example.com").then_some(())).await;
+    settles_on(&mock, "replicated.example.com", &edge_tunnel).await;
+
+    // Deleting the domain takes it off the edge's tunnel just as fast.
+    let domain_id: String = sqlx::query_scalar("SELECT id FROM domains WHERE hostname = ?")
+        .bind("replicated.example.com")
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+    let res = owner
+        .delete(server.url(&format!("/api/v1/domains/{domain_id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 204);
+    wait_for(|| {
+        cname_target(&mock, "replicated.example.com")
+            .is_none()
+            .then_some(())
+    })
+    .await;
+    assert!(!tunnel_routes(
+        &mock,
+        &edge_tunnel,
+        "replicated.example.com"
+    ));
+}
+
+#[tokio::test]
+async fn a_replica_count_across_one_moves_the_hostname_between_node_and_edge() {
+    let mock = start_mock().await;
+    let server = start_with_cloudflare(&mock.base, &format!("{}/dns-query", mock.base)).await;
+    let owner = server.owner().await;
+    insert_machine(&server, NODE_A, "alpha", &["node"]).await;
+    insert_machine(&server, NODE_B, "beta", &["node"]).await;
+    insert_machine(&server, EDGE, "edge", &["edge"]).await;
+    let provider = create_provider(
+        &server,
+        &owner,
+        "tunnel",
+        "Tunnel",
+        json!({ "account_id": ACCOUNT_ID, "zone_id": ZONE_ID }),
+    )
+    .await;
+    let provider_id = provider["id"].as_str().unwrap().to_string();
+    let node_tunnel = map_tunnel(&server, &owner, &mock, NODE_A, "alpha", &provider_id).await;
+    let edge_tunnel = map_tunnel(&server, &owner, &mock, EDGE, "edge", &provider_id).await;
+    let app_id = setup_project_and_app(&server, &owner).await;
+    place_vm(&server, &app_id, NODE_A, "web-a").await;
+    create_domain(
+        &server,
+        &owner,
+        &app_id,
+        "moving.example.com",
+        "tunnel",
+        &provider_id,
+    )
+    .await;
+
+    // One replica: the node's tunnel serves the hostname.
+    settles_on(&mock, "moving.example.com", &node_tunnel).await;
+
+    // Two replicas: the edge answers it, and the node's tunnel must not
+    // delete the CNAME the edge now owns.
+    set_replicas(&server, &owner, &app_id, 2).await;
+    settles_on(&mock, "moving.example.com", &edge_tunnel).await;
+    wait_for(|| tunnel_routes(&mock, &edge_tunnel, "moving.example.com").then_some(())).await;
+    wait_for(|| (!tunnel_routes(&mock, &node_tunnel, "moving.example.com")).then_some(())).await;
+
+    // Back to one replica: the hostname returns to the node, and the edge's
+    // tunnel must not delete the node's CNAME.
+    set_replicas(&server, &owner, &app_id, 1).await;
+    settles_on(&mock, "moving.example.com", &node_tunnel).await;
+    wait_for(|| tunnel_routes(&mock, &node_tunnel, "moving.example.com").then_some(())).await;
+    wait_for(|| (!tunnel_routes(&mock, &edge_tunnel, "moving.example.com")).then_some(())).await;
+
+    // The tunnels sync in node id order, so on the way back the node's
+    // tunnel repointed the edge's CNAME at itself before the edge's tunnel
+    // dropped the hostname. The edge's tunnel then left that CNAME alone: the
+    // last DNS write is the repoint, not a delete.
+    let writes: Vec<Recorded> = mock
+        .requests()
+        .into_iter()
+        .filter(|request| request.path.contains("/dns_records") && request.method != "GET")
+        .collect();
+    let last = writes.last().expect("DNS writes");
+    assert_eq!(last.method, "PATCH", "{writes:?}");
+    assert_eq!(
+        last.body.as_ref().unwrap()["content"],
+        format!("{node_tunnel}.cfargotunnel.com"),
+        "{writes:?}"
+    );
+}

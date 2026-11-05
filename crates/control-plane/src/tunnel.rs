@@ -141,6 +141,13 @@ impl TunnelKick {
             TunnelManager { inner }.kick(node_id);
         }
     }
+
+    /// Wakes the manager for every mapped machine.
+    pub(crate) fn kick_all(&self) {
+        if let Some(inner) = self.inner.upgrade() {
+            TunnelManager { inner }.kick_all();
+        }
+    }
 }
 
 impl TunnelManager {
@@ -190,6 +197,15 @@ impl TunnelManager {
             .expect("tunnel pending lock")
             .nodes
             .insert(node_id.to_string());
+        self.inner.wake.notify_one();
+    }
+
+    /// Asks the manager to reconcile every mapped machine soon, as its
+    /// periodic pass does. A change to a domain, an app's replica count or a
+    /// running VM can move a hostname between a node's tunnel and the edge's,
+    /// whether or not those machines have a session.
+    pub fn kick_all(&self) {
+        self.inner.pending.lock().expect("tunnel pending lock").all = true;
         self.inner.wake.notify_one();
     }
 

@@ -488,9 +488,12 @@ impl DnsProvider for CloudflareDns {
         }
     }
 
-    async fn delete_cname(&self, name: &str) -> Result<(), ProviderError> {
+    async fn delete_cname(&self, name: &str, target: &str) -> Result<(), ProviderError> {
         for record in self.records(name).await? {
-            if record.kind == "CNAME" && record.is_ours() {
+            if record.kind == "CNAME"
+                && record.is_ours()
+                && record.content.as_deref() == Some(target)
+            {
                 self.delete_by_id(&record.id).await?;
             }
         }

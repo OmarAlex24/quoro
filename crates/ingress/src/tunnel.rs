@@ -75,7 +75,10 @@ impl TunnelController {
     /// Reconciles one tunnel: PUT its ingress rules (every hostname to
     /// `http://127.0.0.1:<origin_port>`), upsert a proxied CNAME
     /// `<tunnel_id>.cfargotunnel.com` for every hostname, and delete the CNAME
-    /// of every hostname in `published` that is not in `hostnames`.
+    /// of every hostname in `published` that is not in `hostnames`, unless it
+    /// now points at another tunnel: a hostname that moved between a node and
+    /// the edge keeps the CNAME its new tunnel wrote, whichever tunnel syncs
+    /// first.
     ///
     /// `published` is updated in place (insert on a successful upsert, remove
     /// on a successful delete) and is the caller's record of the CNAMEs this
@@ -119,7 +122,7 @@ impl TunnelController {
         }
         let stale: Vec<String> = published.difference(hostnames).cloned().collect();
         for hostname in stale {
-            match self.dns.delete_cname(&hostname).await {
+            match self.dns.delete_cname(&hostname, &target).await {
                 Ok(()) => {
                     published.remove(&hostname);
                 }

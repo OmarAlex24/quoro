@@ -756,7 +756,9 @@ async fn delete_cname_removes_only_tagged_cnames() {
     });
     let dns = mock.client().dns("zone1");
 
-    dns.delete_cname("same.example.com").await.unwrap();
+    dns.delete_cname("same.example.com", "q.example.net")
+        .await
+        .unwrap();
     assert!(mock.record("rec1").is_none());
     assert!(mock.record("rec2").is_some());
     assert!(mock.record("rec3").is_some());
@@ -765,9 +767,37 @@ async fn delete_cname_removes_only_tagged_cnames() {
     assert_eq!(mock.count("DELETE", "/dns_records/rec3"), 0);
 
     // Nothing tagged: the call succeeds and touches nothing.
-    dns.delete_cname("missing.example.com").await.unwrap();
+    dns.delete_cname("missing.example.com", "q.example.net")
+        .await
+        .unwrap();
     assert_eq!(mock.record_count(), 2);
 
+    mock.assert_all_authorized();
+}
+
+#[tokio::test]
+async fn delete_cname_keeps_a_cname_that_points_elsewhere() {
+    // A hostname that moved to another tunnel keeps the CNAME that tunnel
+    // wrote: the old tunnel's delete must not remove it.
+    let mock = start_mock().await;
+    mock.seed(tagged_cname(
+        "rec1",
+        "moved.example.com",
+        "new-tunnel.cfargotunnel.com",
+        true,
+    ));
+    let dns = mock.client().dns("zone1");
+
+    dns.delete_cname("moved.example.com", "old-tunnel.cfargotunnel.com")
+        .await
+        .unwrap();
+    assert!(mock.record("rec1").is_some());
+    assert_eq!(mock.count("DELETE", "/dns_records/rec1"), 0);
+
+    dns.delete_cname("moved.example.com", "new-tunnel.cfargotunnel.com")
+        .await
+        .unwrap();
+    assert!(mock.record("rec1").is_none());
     mock.assert_all_authorized();
 }
 

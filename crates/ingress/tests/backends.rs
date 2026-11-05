@@ -1149,11 +1149,11 @@ impl DnsProvider for MockDns {
         Ok(RecordId("cname-1".to_string()))
     }
 
-    async fn delete_cname(&self, name: &str) -> Result<(), ProviderError> {
+    async fn delete_cname(&self, name: &str, target: &str) -> Result<(), ProviderError> {
         self.calls
             .lock()
             .unwrap()
-            .push(format!("delete_cname {name}"));
+            .push(format!("delete_cname {name} {target}"));
         Ok(())
     }
 

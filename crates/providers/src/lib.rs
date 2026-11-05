@@ -109,8 +109,14 @@ pub trait DnsProvider: Send + Sync + 'static {
         proxied: bool,
     ) -> impl Future<Output = Result<RecordId, ProviderError>> + Send;
 
-    /// Removes the CNAME of `name` if Quoro created it; otherwise does nothing.
-    fn delete_cname(&self, name: &str) -> impl Future<Output = Result<(), ProviderError>> + Send;
+    /// Removes the CNAME of `name` if Quoro created it and it points at
+    /// `target`; otherwise does nothing. A CNAME that another tunnel took over
+    /// in the meantime is left in place.
+    fn delete_cname(
+        &self,
+        name: &str,
+        target: &str,
+    ) -> impl Future<Output = Result<(), ProviderError>> + Send;
 
     /// Whether `name` currently resolves to a TXT record containing `value`
     /// at the provider's authoritative servers or a public resolver, used to

@@ -118,7 +118,7 @@ impl DnsProvider for ChallTestSrv {
         Ok(RecordId(name.to_string()))
     }
 
-    async fn delete_cname(&self, _name: &str) -> Result<(), ProviderError> {
+    async fn delete_cname(&self, _name: &str, _target: &str) -> Result<(), ProviderError> {
         Ok(())
     }
 
