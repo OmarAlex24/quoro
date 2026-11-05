@@ -52,7 +52,7 @@ commands:
   restore --endpoint URL --region REGION --bucket NAME --prefix PREFIX
           --cluster-id CLS --credentials-file PATH --recovery-key-file PATH
           --signing-key-file PATH --data-key-file PATH --data-dir DIR
-          [--backup BKP] [--dry-run]
+          [--backup BKP] [--node-id NOD] [--dry-run]
                                         restore a control-plane database from
                                         its backup repository, offline (ADR 0148)
 
@@ -63,6 +63,11 @@ the built-in defaults.
 (backup-format.md section 7.2). If that backup fails the start stops without
 migrating; `--skip-upgrade-backup` starts once without it, records the skip in
 the audit log and migrates.
+
+`quoro restore` names the node on this host that takes the primary status at
+the primary's next start: the one --node-id gives, otherwise the one in
+/var/lib/quoro-node/identity.json when that file exists (backup-format.md
+section 8.2).
 
 quoro mcp stdio speaks MCP on stdin/stdout as one agent. The agent key
 (akey_...) is read from --key-file, a file only its owner may read (chmod 600);
@@ -94,14 +99,16 @@ async fn main() -> ExitCode {
         "join" => join_command(rest).await,
         "node" => node_command(rest).await,
         "audit" => audit_cli::run(rest).await,
-        "restore" => match restore::run(rest).await {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(restore::Error::Usage(message)) => usage_error(&message),
-            Err(restore::Error::Failed(message)) => {
-                eprintln!("quoro restore: {message}");
-                ExitCode::from(1)
+        "restore" => {
+            match restore::run(rest, std::path::Path::new(config::DEFAULT_NODE_DATA_DIR)).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(restore::Error::Usage(message)) => usage_error(&message),
+                Err(restore::Error::Failed(message)) => {
+                    eprintln!("quoro restore: {message}");
+                    ExitCode::from(1)
+                }
             }
-        },
+        }
         "mcp" => mcp_command(rest).await,
         "--help" | "-h" | "help" => usage(),
         other => {
