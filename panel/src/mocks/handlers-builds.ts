@@ -33,6 +33,7 @@ import {
   unauthorized,
   validationFailed,
 } from './http';
+import { clearAppFindings } from './vulnerabilities';
 
 export const buildsHandlers = [
   http.get('*/api/v1/apps/:appId/builds', ({ request, params }) => {
@@ -61,6 +62,10 @@ export const buildsHandlers = [
     if (ref !== undefined && (ref === '' || ref.length > 255)) {
       return validationFailed('A ref must be 1-255 characters.');
     }
+
+    // A build that resolves every base image again picks up the patched base,
+    // so the app's old findings stop applying.
+    if (body?.refresh_base === true) clearAppFindings(app.id);
 
     const build = startMockBuild(app, ref);
     return json(build, { status: 202 });

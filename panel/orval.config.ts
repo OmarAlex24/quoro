@@ -32,6 +32,7 @@ export default defineConfig({
           'events',
           'webhooks',
           'interactive',
+          'vulnerabilities',
         ],
       },
     },
