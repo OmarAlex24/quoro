@@ -53,6 +53,13 @@ zip = { version = "9.3", default-features = false, features = ["deflate-flate2"]
 # `zip`'s deflate goes through flate2, whose default features are off in that
 # tree, so the pure-Rust backend the engine uses is named here too (no C zlib).
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# Debian's version order (`1:2.36-9+deb12u4`, `2.3.1-2~bpo12+1`) for the
+# Debian and Ubuntu ranges the vulnerability matcher evaluates.
+debversion = { version = "0.5.5", default-features = false }
+# PEP 440's version order (`2!1.0`, `1.0rc1`, `1.0.post1`) for PyPI ranges.
+pep440_rs = { version = "0.7.3", default-features = false }
+# CVSS base scores from a record's v3 and v4 vectors, for its severity band.
+cvss = { version = "3", default-features = false, features = ["std", "v3", "v4"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
