@@ -21,7 +21,8 @@ use crate::jcs;
 pub enum SignError {
     /// The body is not a JSON object.
     NotAnObject,
-    /// The body has no canonical form (a float, an unsafe integer).
+    /// The body has no canonical form (an unsafe integer, a float with an
+    /// exponent form).
     NotCanonical(String),
     /// `signature` is missing, not a string or not base64 of 64 bytes.
     BadSignatureField,
@@ -180,7 +181,7 @@ mod tests {
         );
         assert_eq!(signing_input(&json!([1, 2])), Err(SignError::NotAnObject));
         assert!(matches!(
-            signing_input(&json!({ "x": 1.5 })),
+            signing_input(&json!({ "x": 1e21 })),
             Err(SignError::NotCanonical(_))
         ));
     }

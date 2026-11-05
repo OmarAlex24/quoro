@@ -4,10 +4,13 @@
 //! The change log and the audit log hash `SHA-256(JCS(entry))`
 //! (`audit-log-format.md` section 5). Object members are sorted by the UTF-16
 //! code units of their names, strings use the minimal JSON escaping of RFC
-//! 8785 section 3.2.2.2, and there is no whitespace. Numbers: Quoro's hashed
-//! records only carry integers; an integer serializes as its shortest decimal
-//! form, which is what ECMAScript produces for integers below 2^53. A float is
-//! refused, because no hashed record is allowed to carry one.
+//! 8785 section 3.2.2.2, and there is no whitespace. Numbers follow RFC 8785
+//! section 3.2.2.3 (ECMAScript `Number.prototype.toString`) for the values
+//! Quoro's records carry: an integer below 2^53 serializes as its shortest
+//! decimal form, and a float whose magnitude is 0 or in `[1e-6, 1e21)` as its
+//! shortest round-trip decimal without an exponent (a CVSS score `9.8` stays
+//! `9.8`, `10.0` becomes `10`, `-0.0` becomes `0`). Any other number has an
+//! exponent form in ECMAScript and is refused.
 
 use serde_json::Value;
 use std::fmt::Write as _;
@@ -20,8 +23,8 @@ pub struct NotCanonical(pub String);
 ///
 /// # Errors
 ///
-/// A non-integer number, or an integer outside the IEEE-754 safe range, has
-/// no canonical form that every implementation agrees on, so it is refused.
+/// An integer outside the IEEE-754 safe range, or a float that is not finite
+/// or whose magnitude is outside `[1e-6, 1e21)` (other than 0), is refused.
 pub fn canonicalize(value: &Value) -> Result<String, NotCanonical> {
     let mut out = String::new();
     write_value(&mut out, value)?;
@@ -39,9 +42,21 @@ fn write_value(out: &mut String, value: &Value) -> Result<(), NotCanonical> {
                 let _ = write!(out, "{i}");
             } else if let Some(u) = number.as_u64().filter(|u| *u <= SAFE as u64) {
                 let _ = write!(out, "{u}");
+            } else if let Some(f) = number
+                .as_f64()
+                .filter(|f| number.is_f64() && plain_float(*f))
+            {
+                // Rust's `Display` for f64 is the shortest round-trip decimal
+                // and never uses an exponent, which is what ECMAScript prints
+                // in this range. `-0.0` prints as `0` in ECMAScript.
+                if f == 0.0 {
+                    out.push('0');
+                } else {
+                    let _ = write!(out, "{f}");
+                }
             } else {
                 return Err(NotCanonical(format!(
-                    "number {number} is not a safe integer"
+                    "number {number} has no canonical form in Quoro's records"
                 )));
             }
         }
@@ -72,6 +87,12 @@ fn write_value(out: &mut String, value: &Value) -> Result<(), NotCanonical> {
         }
     }
     Ok(())
+}
+
+/// Whether ECMAScript prints `f` without an exponent: finite, and 0 or with a
+/// magnitude in `[1e-6, 1e21)`. A float outside it is refused.
+fn plain_float(f: f64) -> bool {
+    f.is_finite() && (f == 0.0 || (1e-6..1e21).contains(&f.abs()))
 }
 
 fn write_string(out: &mut String, s: &str) {
@@ -130,8 +151,28 @@ mod tests {
     }
 
     #[test]
-    fn refuses_floats() {
-        assert!(canonicalize(&json!(1.5)).is_err());
+    fn writes_floats_like_ecmascript() {
+        for (value, text) in [
+            (9.8, "9.8"),
+            (10.0, "10"),
+            (0.1, "0.1"),
+            (-0.0, "0"),
+            (0.0, "0"),
+            (-2.5, "-2.5"),
+            (0.000_001, "0.000001"),
+            (123_456.789, "123456.789"),
+        ] {
+            assert_eq!(canonicalize(&json!(value)).unwrap(), text, "{value}");
+        }
+        // A parsed `10.0` is a float and still canonicalizes as `10`.
+        let parsed: Value = serde_json::from_str("[10.0,9.80]").unwrap();
+        assert_eq!(canonicalize(&parsed).unwrap(), "[10,9.8]");
+    }
+
+    #[test]
+    fn refuses_numbers_with_an_exponent_form() {
+        assert!(canonicalize(&json!(1e21)).is_err());
+        assert!(canonicalize(&json!(1e-7)).is_err());
         assert!(canonicalize(&json!(u64::MAX)).is_err());
     }
 }
