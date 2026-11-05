@@ -821,7 +821,7 @@ impl<E: Engine + 'static> Reconciler<E> {
                 isolation_group: Some(vm.project_id.clone()),
                 egress_only: false,
             },
-            init: init_config(&prepared.config, &vm.env),
+            init: init_config(&prepared.config, &vm.env, &vm_id, self.node_id.as_deref()),
             console,
             serial,
             vsock,
@@ -1364,11 +1364,22 @@ fn deployment_failed_key(deployment_id: &str) -> String {
 }
 
 /// The init configuration: the image's own command line, overlaid with the
-/// spec's environment by name, in a deterministic (name) order.
-fn init_config(image: &ImageConfig, spec_env: &BTreeMap<String, String>) -> InitConfig {
+/// spec's environment by name in a deterministic (name) order, then with the
+/// instance identity (`QUORO_INSTANCE_ID` and `QUORO_NODE_ID`) so the node's
+/// values win over a stored one (node-agent-protocol.md section 6.10).
+fn init_config(
+    image: &ImageConfig,
+    spec_env: &BTreeMap<String, String>,
+    vm_id: &str,
+    node_id: Option<&str>,
+) -> InitConfig {
     let mut env: BTreeMap<String, String> = image.env.iter().cloned().collect();
     for (name, value) in spec_env {
         env.insert(name.clone(), value.clone());
+    }
+    env.insert("QUORO_INSTANCE_ID".to_owned(), vm_id.to_owned());
+    if let Some(node_id) = node_id {
+        env.insert("QUORO_NODE_ID".to_owned(), node_id.to_owned());
     }
     InitConfig {
         entrypoint: image.entrypoint.clone(),
@@ -1456,15 +1467,40 @@ mod tests {
             exposed_ports: Vec::new(),
         };
         let overrides = BTreeMap::from([("A".to_owned(), "spec".to_owned())]);
-        let init = init_config(&image, &overrides);
+        let init = init_config(&image, &overrides, "vm_test", None);
         assert_eq!(
             init.env,
             vec![
                 ("A".to_owned(), "spec".to_owned()),
-                ("B".to_owned(), "image".to_owned())
+                ("B".to_owned(), "image".to_owned()),
+                ("QUORO_INSTANCE_ID".to_owned(), "vm_test".to_owned())
             ]
         );
         assert_eq!(init.entrypoint, vec!["/app".to_owned()]);
+    }
+
+    #[test]
+    fn instance_identity_overrides_the_image_and_spec_env() {
+        let image = ImageConfig {
+            entrypoint: vec!["/app".to_owned()],
+            cmd: Vec::new(),
+            env: vec![("QUORO_INSTANCE_ID".to_owned(), "image".to_owned())],
+            user: None,
+            workdir: None,
+            exposed_ports: Vec::new(),
+        };
+        let overrides = BTreeMap::from([
+            ("QUORO_INSTANCE_ID".to_owned(), "spec".to_owned()),
+            ("QUORO_NODE_ID".to_owned(), "spec".to_owned()),
+        ]);
+        let init = init_config(&image, &overrides, "vm_abc", Some("nod_abc"));
+        assert_eq!(
+            init.env,
+            vec![
+                ("QUORO_INSTANCE_ID".to_owned(), "vm_abc".to_owned()),
+                ("QUORO_NODE_ID".to_owned(), "nod_abc".to_owned())
+            ]
+        );
     }
 
     struct TempDir(std::path::PathBuf);
