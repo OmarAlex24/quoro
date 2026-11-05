@@ -11,8 +11,11 @@
 //!
 //! The temporary file is removed on every path, success or error: [`TempBackup`]
 //! drops it. A crash can still leave one behind, so [`remove_leftovers`] sweeps
-//! the data directory when the backup loop starts; the backup row a crash left
-//! non-terminal then times out after 24 hours through [`super::seal::time_out`].
+//! the data directory when the backup loop starts. The backup row a crash left
+//! `queued` or `running`, or that a database restored from that very backup
+//! lists as `running`, is resolved from its seal object before the loop's
+//! first tick ([`resolve_orphaned`]); one whose bucket cannot be read stays
+//! and times out after 24 hours through [`super::seal::time_out`].
 //!
 //! Before an upgrade the same work runs against the old schema, before the
 //! pending migrations, with `trigger: upgrade`
@@ -130,6 +133,140 @@ pub async fn run_control_plane_backup(
             Err(ApiError::internal(&reason))
         }
     }
+}
+
+/// Resolves every control-plane backup left `queued` or `running` when the
+/// primary starts (`backup-format.md` section 7.2, "Rows left behind at
+/// start").
+///
+/// The primary takes a control-plane backup inside its own process, so such a
+/// row was interrupted, or the database was restored from that very backup.
+/// Each row is resolved from `seals/<cluster_id>/<backup_id>.json`:
+///
+/// - a seal that verifies with the cluster signing key and names this backup,
+///   its repository and the cluster records the backup `succeeded` from the
+///   seal, with `uploaded_bytes` null and without writing the seal again;
+/// - no seal object records it `failed` with `interrupted`;
+/// - a seal that does not verify or names another backup, repository, cluster
+///   or source records it `failed` with `the seal does not verify`;
+/// - a repository or bucket that cannot be read leaves the row as it is, and
+///   the 24-hour timeout still applies.
+///
+/// Volume backups are never touched. Resolving runs no retention.
+///
+/// # Errors
+///
+/// A database error.
+pub async fn resolve_orphaned(state: &AppState) -> Result<(), ApiError> {
+    let rows = sqlx::query(&format!(
+        "SELECT {BACKUP_COLUMNS} FROM backups \
+         WHERE source_kind = 'control_plane' AND status IN ('queued', 'running') ORDER BY id"
+    ))
+    .fetch_all(state.store.pool())
+    .await?;
+    for row in &rows {
+        let backup = backup_from_row(row)?;
+        resolve_one(state, &backup).await?;
+    }
+    Ok(())
+}
+
+/// What the seal object of a row left behind says.
+enum Orphan {
+    /// The seal verifies and names this backup.
+    Sealed(Box<quoro_backup::Seal>),
+    /// No seal object exists.
+    Missing,
+    /// The seal object exists but is not this backup's valid seal.
+    Invalid,
+}
+
+/// Resolves one row of [`resolve_orphaned`].
+async fn resolve_one(state: &AppState, backup: &BackupRecord) -> Result<(), ApiError> {
+    let orphan = match read_orphan_seal(state, backup).await {
+        Ok(orphan) => orphan,
+        Err(reason) => {
+            // Section 7.2: a bucket that cannot be read leaves the row; the
+            // 24-hour timeout still applies.
+            tracing::warn!(backup_id = %backup.id, reason = %reason, "cannot resolve a control-plane backup left behind; it stays");
+            return Ok(());
+        }
+    };
+    match orphan {
+        Orphan::Missing => {
+            tracing::info!(backup_id = %backup.id, "a control-plane backup left behind has no seal; failing it");
+            seal::fail(&state.store, &backup.id, &backup.node_id, "interrupted").await?;
+        }
+        Orphan::Invalid => {
+            tracing::warn!(backup_id = %backup.id, "the seal of a control-plane backup left behind does not verify; failing it");
+            seal::fail(
+                &state.store,
+                &backup.id,
+                &backup.node_id,
+                "the seal does not verify",
+            )
+            .await?;
+        }
+        Orphan::Sealed(sealed) => {
+            let sealed = *sealed;
+            tracing::info!(backup_id = %backup.id, "a control-plane backup left behind is sealed; recording it");
+            seal::record_succeeded(
+                &state.store,
+                &backup.id,
+                seal::Sealed {
+                    snapshot_method: None,
+                    pause_ms: backup.pause_ms,
+                    logical_bytes: i64::try_from(sealed.logical_bytes).ok(),
+                    uploaded_bytes: None,
+                    chunk_count: i64::try_from(sealed.chunk_count).ok(),
+                    manifest_key: sealed.manifest_key,
+                    manifest_digest: sealed.manifest_digest,
+                    finished_at: sealed.sealed_at,
+                },
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Reads and checks the seal object of a row left behind. Every error is a
+/// repository or bucket that cannot be read, as a one-line reason.
+async fn read_orphan_seal(state: &AppState, backup: &BackupRecord) -> Result<Orphan, String> {
+    let repository = repo::by_id(&state.store, &backup.repository_id)
+        .await
+        .map_err(|error| reason_of(&error))?
+        .ok_or_else(|| "the backup's repository is missing".to_string())?;
+    let target = repo::target(&state.store, &state.data_key, &repository)
+        .await
+        .map_err(|error| reason_of(&error))?;
+    let bucket = state
+        .backups
+        .open_bucket(&target)
+        .map_err(|error| reason_of(&error))?;
+    let cluster_id = &state.cluster_id;
+    let key = object_key(&target.root, &layout::seal(cluster_id, &backup.id));
+    let bytes = match bucket.get(&key).await {
+        Ok(bytes) => bytes,
+        Err(ObjectStoreError::NotFound) => return Ok(Orphan::Missing),
+        Err(error) => return Err(format!("cannot read the seal: {error}")),
+    };
+    let Ok(sealed) = serde_json::from_slice::<quoro_backup::Seal>(&bytes) else {
+        return Ok(Orphan::Invalid);
+    };
+    let verifies =
+        quoro_backup::verify_seal(&sealed, &state.keys.signing_key().verifying_key()).is_ok();
+    if !verifies
+        || sealed.backup_id != backup.id
+        || &sealed.cluster_id != cluster_id
+        || sealed.repository_id != backup.repository_id
+        || sealed.source_kind != SourceKind::ControlPlane
+        || &sealed.source_id != cluster_id
+        || sealed.manifest_key != layout::manifest(cluster_id, &backup.id)
+    {
+        return Ok(Orphan::Invalid);
+    }
+    Ok(Orphan::Sealed(Box::new(sealed)))
 }
 
 /// Removes the temporary files a crashed backup left in `data_dir`.
