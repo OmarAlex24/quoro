@@ -172,6 +172,15 @@ The primary runs `VACUUM INTO` to a temporary file in its data directory, outsid
 
 A crash after the seal is written and before the row is recorded leaves a sealed backup that the database does not list. `quoro restore` still finds it, because it reads the seals (section 8.2), and garbage collection keeps its chunks, because it is sealed (section 9). Retention counts recorded backups only, so it leaves that one in place.
 
+**Rows left behind at start.** The primary takes a control-plane backup inside its own process, so a control-plane backup that is `queued` or `running` when the primary starts was interrupted: the primary stopped or crashed during it, or the database was restored from that very backup, whose row `VACUUM INTO` copied while it was `running` (section 8.2). Before its backup loop starts, the primary resolves each such row:
+
+- when `seals/<cluster_id>/<backup_id>.json` exists, verifies with the cluster signing key (section 6.2) and names this backup, its repository and the cluster, the primary records the backup `succeeded` from the seal: `manifest_key`, `manifest_digest`, `logical_bytes` and `chunk_count` come from the seal, `finished_at` is its `sealed_at`, and `uploaded_bytes` stays null. The change-log entry, the `backup.seal` audit record and the `backup.succeeded` event are the ones of a sealed backup; the event's required `uploaded_bytes` is 0, because the seal does not carry it;
+- when that object does not exist, the primary records the backup `failed` with the reason `interrupted`;
+- when that object exists but does not verify or names another backup, repository or cluster, the primary records the backup `failed` with the reason `the seal does not verify`;
+- when the bucket cannot be read, the row stays as it is, and the 24-hour timeout of section 7.1 still applies.
+
+A row resolved this way no longer blocks the schedule, which counts from it like from any other finished control-plane backup. Resolving a row runs no retention (section 9): at start the database may be older than the bucket, so the next control-plane backup that succeeds prunes as usual.
+
 **Retention of upgrade backups (ADR 0158).** `control_plane_schedule.keep` counts only control-plane backups with `trigger: schedule`, and their pruning never removes an upgrade backup. Backups with `trigger: upgrade` are counted on their own: after one succeeds, the primary prunes the oldest succeeded, unpruned upgrade backups beyond 3, the same way as in section 9. Garbage collection never removes a chunk that a kept upgrade backup references; since a kept backup is sealed, the sweep of section 9 already treats its chunks as live.
 
 ## 8. Restoring
@@ -215,7 +224,7 @@ The restore:
 
 At its next start, before it serves, the primary reads `primary-node`. When the file names a node of the database that is not `removed` and does not already hold the status, the primary clears `cp_status` on the node that holds it and sets `cp_status = 'primary'` on the named node, in one change-log write, and records `cluster.primary_moved` (`audit-log-format.md` section 3.5). In every case it then deletes the file; a node it cannot use is logged with the reason. The file must have the same owner as the database file, so that the control plane can read and delete it.
 
-The restored database is as old as the backup. How a restored primary reconciles with nodes that applied newer desired state is part of the storage epic; it does not change this format.
+The restored database is as old as the backup. It lists the backup it was restored from as `running`, which the restored primary resolves at its first start (section 7.2, rows left behind at start). How a restored primary reconciles with nodes that applied newer desired state is part of the storage epic; it does not change this format.
 
 ## 9. Retention and garbage collection
 
