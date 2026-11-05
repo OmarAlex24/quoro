@@ -236,6 +236,12 @@ impl ReadAccess {
     pub fn set_project(&mut self, project_id: Option<&str>) {
         self.project_id = project_id.map(str::to_string);
     }
+
+    /// Sets the target recorded on the agent's read audit record, for a
+    /// cluster-level read that authorizes without one.
+    pub fn set_target(&mut self, target: Target) {
+        self.target = Some(target);
+    }
 }
 
 /// Context of one authenticated call: who, through which channel, and which
@@ -472,6 +478,47 @@ impl CallCtx {
     ) -> Result<authz::Allowed, ApiError> {
         let mut conn = state.store.pool().acquire().await?;
         authz::decide(&mut conn, agent, scope, target, params).await
+    }
+
+    /// Whether the caller holds `scope` for the whole cluster, without
+    /// deciding or auditing anything: a human when the role carries it, an
+    /// agent when one of its usable grants with the scope has an
+    /// `{"all": true}` selector. A read that includes node data passes only
+    /// with this answer, and a caller without it is never refused.
+    ///
+    /// # Errors
+    ///
+    /// A database error while reading the agent's grants.
+    pub async fn holds_cluster_wide(
+        &self,
+        state: &AppState,
+        scope: Scope,
+    ) -> Result<bool, ApiError> {
+        match &self.identity.principal {
+            Principal::User(user) => Ok(user.role.holds(scope)),
+            Principal::Agent(agent) => {
+                if agent.disabled {
+                    return Ok(false);
+                }
+                let now = now_rfc3339();
+                let rows = sqlx::query(&format!(
+                    "SELECT {} FROM grants WHERE agent_id = ?",
+                    authz::GRANT_COLUMNS
+                ))
+                .bind(&agent.agent_id)
+                .fetch_all(state.store.pool())
+                .await?;
+                let grants = rows
+                    .iter()
+                    .map(authz::grant_from_row)
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(grants.into_iter().any(|grant| {
+                    grant.scopes.iter().any(|name| name == scope.as_str())
+                        && grant.selector.is_all()
+                        && grant.unusable(&now).is_none()
+                }))
+            }
+        }
     }
 
     /// Records the authority an allowed agent call runs under: the matched

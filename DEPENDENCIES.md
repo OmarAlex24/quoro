@@ -129,6 +129,9 @@ Rules:
 | `quoro-proto` (workspace crate) | `crates/backup` | none | The seal's Ed25519 signature over RFC 8785 canonical JSON (section 6.2) reuses `quoro_proto::sign` and `quoro_proto::jcs`, so the workspace has one canonicalizer and one signature implementation |
 | `zip` | `crates/control-plane` | `deflate-flate2` (no default features) | Reads the OSV ecosystem archives the vulnerability mirror downloads and imports (`node-agent-protocol.md` section 6.11): one record at a time, with a size cap per entry. Only the deflate method those archives use is enabled, through the `flate2` already in the tree; MIT, on the ADR 0080 allowlist |
 | `flate2` | `crates/control-plane` | `rust_backend` only | `zip`'s deflate decompressor, with the same pure-Rust `miniz_oxide` backend the engine uses instead of a C zlib; already in the tree, named here because `zip` leaves its backend unselected |
+| `debversion` | `crates/control-plane` | no default features | Debian's version order (`[epoch:]upstream[-revision]`, `~` before everything) for the Debian and Ubuntu ranges the vulnerability matcher evaluates (`node-agent-protocol.md` section 6.11); writing dpkg's comparison by hand is more surface to review than this crate. Apache-2.0, on the ADR 0080 allowlist |
+| `pep440_rs` | `crates/control-plane` | no default features | PEP 440's version order for the PyPI ranges (`2!1.0`, `1.0rc1`, `1.0.post1`, `1.0.dev3`); the normalisation PEP 440 requires (`1.0 == 1.0.0`) is what this crate implements. Apache-2.0 OR BSD-2-Clause, on the ADR 0080 allowlist |
+| `cvss` | `crates/control-plane` | `std`, `v3`, `v4` (no default features) | Turns a record's `CVSS_V3` or `CVSS_V4` vector into the base score the severity band is derived from (`node-agent-protocol.md` section 6.11); v2 is off because it is ignored. Apache-2.0 OR MIT, on the ADR 0080 allowlist |
 
 ## Test-only dependencies
 

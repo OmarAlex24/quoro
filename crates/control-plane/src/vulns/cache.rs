@@ -573,6 +573,19 @@ impl Cache {
         Ok(row)
     }
 
+    /// The hash of the inventory held for `digest`, without reading its JSON.
+    ///
+    /// # Errors
+    ///
+    /// Any database error.
+    pub async fn inventory_sha(&self, digest: &str) -> Result<Option<String>, sqlx::Error> {
+        let row = sqlx::query_as::<_, (String,)>("SELECT sha256 FROM inventories WHERE digest = ?")
+            .bind(digest)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|(sha256,)| sha256))
+    }
+
     /// Every inventory digest held.
     ///
     /// # Errors
