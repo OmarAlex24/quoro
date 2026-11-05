@@ -526,13 +526,15 @@ mod linux {
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
     use futures_util::StreamExt as _;
+    use genetlink::GenetlinkHandle;
     use genetlink::new_connection;
-    use netlink_packet_core::{NLM_F_ACK, NLM_F_REQUEST, NetlinkMessage, NetlinkPayload};
+    use netlink_packet_core::{
+        NLM_F_ACK, NLM_F_DUMP, NLM_F_REQUEST, NetlinkMessage, NetlinkPayload,
+    };
     use netlink_packet_generic::GenlMessage;
     use netlink_packet_wireguard::{
         WireguardAddressFamily, WireguardAllowedIp, WireguardAllowedIpAttr, WireguardAttribute,
-        WireguardCmd, WireguardDeviceFlags, WireguardMessage, WireguardPeer,
-        WireguardPeerAttribute,
+        WireguardCmd, WireguardMessage, WireguardPeer, WireguardPeerAttribute, WireguardPeerFlags,
     };
     use quoro_proto::wire::{MeshPeer, SpecMesh};
     use tokio::io::AsyncWriteExt as _;
@@ -626,17 +628,24 @@ mod linux {
 
     /// Sets the private key, listen port and peers in one `SetDevice` request.
     ///
-    /// `ReplacePeers` makes a peer that left `spec.mesh.peers` disappear. A peer
-    /// whose public key is not 32 base64 bytes is skipped with a warning rather
-    /// than failing the whole apply.
+    /// Peers are updated in place, never replaced as a set: replacing them
+    /// would drop the endpoint the hub learned from each node and the session
+    /// with it, so the edge could not reach a node until that node's next
+    /// keepalive. Every apply, the periodic one included, would cut the edge
+    /// off its backends. A peer that left `spec.mesh.peers` is removed on its
+    /// own. A peer whose public key is not 32 base64 bytes is skipped with a
+    /// warning rather than failing the whole apply.
     async fn set_wireguard(key: &MeshKey, mesh: &SpecMesh) -> Result<(), String> {
-        let peers: Vec<WireguardPeer> = mesh.peers.iter().filter_map(peer).collect();
+        let (connection, mut handle, _) =
+            new_connection().map_err(|e| format!("could not open generic netlink: {e}"))?;
+        tokio::spawn(connection);
+
+        let current = current_peer_keys(&mut handle).await?;
         let attributes = vec![
             WireguardAttribute::IfName(INTERFACE.to_owned()),
             WireguardAttribute::PrivateKey(key.private),
             WireguardAttribute::ListenPort(mesh.listen_port),
-            WireguardAttribute::Flags(WireguardDeviceFlags::ReplacePeers),
-            WireguardAttribute::Peers(peers),
+            WireguardAttribute::Peers(peer_updates(&mesh.peers, &current)),
         ];
         let genlmsg: GenlMessage<WireguardMessage> = GenlMessage::from_payload(WireguardMessage {
             cmd: WireguardCmd::SetDevice,
@@ -645,9 +654,6 @@ mod linux {
         let mut nlmsg = NetlinkMessage::from(genlmsg);
         nlmsg.header.flags = NLM_F_REQUEST | NLM_F_ACK;
 
-        let (connection, mut handle, _) =
-            new_connection().map_err(|e| format!("could not open generic netlink: {e}"))?;
-        tokio::spawn(connection);
         let mut responses = handle
             .request(nlmsg)
             .await
@@ -667,7 +673,84 @@ mod linux {
         Ok(())
     }
 
+    /// The public keys of the peers the interface has now, read with a
+    /// `GetDevice` dump.
+    async fn current_peer_keys(handle: &mut GenetlinkHandle) -> Result<Vec<[u8; 32]>, String> {
+        let genlmsg: GenlMessage<WireguardMessage> = GenlMessage::from_payload(WireguardMessage {
+            cmd: WireguardCmd::GetDevice,
+            attributes: vec![WireguardAttribute::IfName(INTERFACE.to_owned())],
+        });
+        let mut nlmsg = NetlinkMessage::from(genlmsg);
+        nlmsg.header.flags = NLM_F_REQUEST | NLM_F_DUMP;
+        let mut responses = handle
+            .request(nlmsg)
+            .await
+            .map_err(|e| format!("could not send the WireGuard query: {e}"))?;
+        let mut keys = Vec::new();
+        while let Some(item) = responses.next().await {
+            let packet = item.map_err(|e| format!("could not read the WireGuard device: {e}"))?;
+            match packet.payload {
+                NetlinkPayload::InnerMessage(message) => {
+                    keys.extend(peer_keys(&message.payload.attributes));
+                }
+                NetlinkPayload::Error(error) if error.code.is_some() => {
+                    return Err(format!(
+                        "the kernel refused the WireGuard query: {}",
+                        error.to_io()
+                    ));
+                }
+                NetlinkPayload::Done(_) => break,
+                _ => {}
+            }
+        }
+        Ok(keys)
+    }
+
+    /// The public key of every peer in one `GetDevice` answer.
+    fn peer_keys(attributes: &[WireguardAttribute]) -> Vec<[u8; 32]> {
+        let mut keys = Vec::new();
+        for attribute in attributes {
+            if let WireguardAttribute::Peers(peers) = attribute {
+                for WireguardPeer(peer) in peers {
+                    for nla in peer {
+                        if let WireguardPeerAttribute::PublicKey(key) = nla {
+                            keys.push(*key);
+                        }
+                    }
+                }
+            }
+        }
+        keys
+    }
+
+    /// The peer list of one `SetDevice` request: every desired peer, updated in
+    /// place with its allowed IPs replaced, and a removal for every current peer
+    /// that is no longer desired.
+    pub(super) fn peer_updates(desired: &[MeshPeer], current: &[[u8; 32]]) -> Vec<WireguardPeer> {
+        let mut updates: Vec<WireguardPeer> = desired.iter().filter_map(peer).collect();
+        let kept: Vec<[u8; 32]> = updates
+            .iter()
+            .flat_map(|WireguardPeer(attributes)| attributes.iter())
+            .filter_map(|attribute| match attribute {
+                WireguardPeerAttribute::PublicKey(key) => Some(*key),
+                _ => None,
+            })
+            .collect();
+        for key in current {
+            if !kept.contains(key) {
+                updates.push(WireguardPeer(vec![
+                    WireguardPeerAttribute::PublicKey(*key),
+                    WireguardPeerAttribute::Flags(WireguardPeerFlags::RemoveMe),
+                ]));
+            }
+        }
+        updates
+    }
+
     /// Builds one netlink peer, or `None` when its public key is unusable.
+    ///
+    /// It carries `ReplaceAllowedIps`, so an entry that left the peer's
+    /// allowed IPs disappears while its endpoint and session stay.
     fn peer(peer: &MeshPeer) -> Option<WireguardPeer> {
         let decoded = STANDARD.decode(&peer.public_key).ok();
         let Some(public_key) = decoded
@@ -680,7 +763,10 @@ mod linux {
             );
             return None;
         };
-        let mut attributes = vec![WireguardPeerAttribute::PublicKey(public_key)];
+        let mut attributes = vec![
+            WireguardPeerAttribute::PublicKey(public_key),
+            WireguardPeerAttribute::Flags(WireguardPeerFlags::ReplaceAllowedIps),
+        ];
         if let Some(endpoint) = &peer.endpoint {
             match parse_endpoint(endpoint) {
                 Some(address) => attributes.push(WireguardPeerAttribute::Endpoint(address)),
@@ -875,6 +961,109 @@ mod linux {
             String::from_utf8_lossy(stdout).trim().to_owned()
         } else {
             stderr.to_owned()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn key(byte: u8) -> [u8; 32] {
+            [byte; 32]
+        }
+
+        fn mesh_peer(byte: u8, endpoint: Option<&str>) -> MeshPeer {
+            MeshPeer {
+                node_id: format!("nod_{byte}"),
+                public_key: STANDARD.encode(key(byte)),
+                endpoint: endpoint.map(str::to_owned),
+                allowed_ips: vec![format!("10.42.{byte}.0/24")],
+                persistent_keepalive_s: None,
+            }
+        }
+
+        fn flags_of(peer: &WireguardPeer) -> Vec<WireguardPeerFlags> {
+            peer.0
+                .iter()
+                .filter_map(|attribute| match attribute {
+                    WireguardPeerAttribute::Flags(flags) => Some(*flags),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn key_of(peer: &WireguardPeer) -> [u8; 32] {
+            peer.0
+                .iter()
+                .find_map(|attribute| match attribute {
+                    WireguardPeerAttribute::PublicKey(key) => Some(*key),
+                    _ => None,
+                })
+                .expect("every update names its peer")
+        }
+
+        /// The hub's periodic re-apply: the same peers, no endpoint in the spec.
+        /// Each peer is updated in place, so the endpoint the hub learned and
+        /// the session survive; nothing is removed.
+        #[test]
+        fn an_unchanged_peer_set_is_updated_in_place() {
+            let desired = [mesh_peer(1, None), mesh_peer(2, None)];
+            let updates = peer_updates(&desired, &[key(1), key(2)]);
+            assert_eq!(updates.len(), 2);
+            for update in &updates {
+                assert_eq!(
+                    flags_of(update),
+                    vec![WireguardPeerFlags::ReplaceAllowedIps]
+                );
+                assert!(
+                    !update
+                        .0
+                        .iter()
+                        .any(|attribute| matches!(attribute, WireguardPeerAttribute::Endpoint(_))),
+                    "a hub peer without an endpoint must not get one set"
+                );
+            }
+        }
+
+        #[test]
+        fn a_peer_that_left_the_spec_is_removed_alone() {
+            let desired = [mesh_peer(1, None)];
+            let updates = peer_updates(&desired, &[key(1), key(3)]);
+            assert_eq!(updates.len(), 2);
+            assert_eq!(key_of(&updates[0]), key(1));
+            assert_eq!(
+                flags_of(&updates[0]),
+                vec![WireguardPeerFlags::ReplaceAllowedIps]
+            );
+            assert_eq!(key_of(&updates[1]), key(3));
+            assert_eq!(flags_of(&updates[1]), vec![WireguardPeerFlags::RemoveMe]);
+        }
+
+        #[test]
+        fn a_new_peer_is_added_without_touching_the_others() {
+            let desired = [mesh_peer(1, None), mesh_peer(2, Some("192.0.2.10:51820"))];
+            let updates = peer_updates(&desired, &[key(1)]);
+            assert_eq!(updates.len(), 2);
+            assert!(updates.iter().all(|update| {
+                !flags_of(update)
+                    .iter()
+                    .any(|flags| flags.contains(WireguardPeerFlags::RemoveMe))
+            }));
+        }
+
+        #[test]
+        fn peer_keys_reads_every_peer_of_a_device_answer() {
+            let attributes = vec![
+                WireguardAttribute::IfName(INTERFACE.to_owned()),
+                WireguardAttribute::Peers(vec![
+                    WireguardPeer(vec![WireguardPeerAttribute::PublicKey(key(1))]),
+                    WireguardPeer(vec![
+                        WireguardPeerAttribute::PersistentKeepalive(25),
+                        WireguardPeerAttribute::PublicKey(key(2)),
+                    ]),
+                ]),
+            ];
+            assert_eq!(peer_keys(&attributes), vec![key(1), key(2)]);
         }
     }
 }
