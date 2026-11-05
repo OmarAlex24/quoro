@@ -1,10 +1,25 @@
 # Quoro roadmap
 
-Status: draft for review. Source: D-0033 (milestones), D-0034 (out of scope), D-0036 (done = runs on the lab).
+Status: living document; the [status table](#status) below shows where each milestone stands. Source: D-0033 (milestones), D-0034 (out of scope), D-0036 (done = runs on the lab).
 
 This turns D-0033 into a gated plan and adds no features: where another decision explains how an item behaves, the decision is cited next to the item, and every claim that rests on an unverified external fact is either answered in `docs/research/` or marked as a hypothesis.
 
 > **Release callout: first public release (D-0064, D-0137).** v0.1.0 is an experimental preview with signed builds, not for production; it was tagged after the M4 demo and contains M3 and M4 [D-0137]. The first general release and the broad announcement are a later tag after the M4 close-out [D-0064, D-0137]. The domain is registered; the trademark search was waived [D-0137].
+
+## Status
+
+| Milestone | Status | Release | GitHub milestone |
+|---|---|---|---|
+| M0 — Contracts | Done | [v0.0.1](https://github.com/OmarAlex24/quoro/releases/tag/v0.0.1) | [M0](https://github.com/OmarAlex24/quoro/milestone/1) |
+| M1 — Skeleton | Done | [v0.0.1](https://github.com/OmarAlex24/quoro/releases/tag/v0.0.1) | [M1](https://github.com/OmarAlex24/quoro/milestone/2) |
+| M2 — Deploy | Done | [v0.0.2](https://github.com/OmarAlex24/quoro/releases/tag/v0.0.2) | [M2](https://github.com/OmarAlex24/quoro/milestone/3) |
+| M3 — AI-native | Done | [v0.1.0](https://github.com/OmarAlex24/quoro/releases/tag/v0.1.0) | [M3](https://github.com/OmarAlex24/quoro/milestone/4) |
+| M4 — Full experience | Done | [v0.1.0](https://github.com/OmarAlex24/quoro/releases/tag/v0.1.0) | [M4](https://github.com/OmarAlex24/quoro/milestone/5) |
+| M5a — Stateless HA and backups | In progress (demo pending) | Not released yet; its groundwork is in [v0.1.1](https://github.com/OmarAlex24/quoro/releases/tag/v0.1.1) | [M5a](https://github.com/OmarAlex24/quoro/milestone/6) |
+| M5b — Witness, leases and warm replication | Planned | — | [M5b](https://github.com/OmarAlex24/quoro/milestone/7) |
+| M6 — Automatic failover and hot | Planned | — | [M6](https://github.com/OmarAlex24/quoro/milestone/8) |
+
+Status comes from each milestone's issues on GitHub, its Definition of Done below and the release tags. "Release" is the first tag that shipped the milestone. M4 still has two follow-up issues open in its GitHub milestone. What each release contains is in the [changelog](https://github.com/OmarAlex24/quoro/blob/main/CHANGELOG.md).
 
 ---
 
