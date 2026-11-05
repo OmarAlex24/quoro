@@ -167,6 +167,10 @@
   - [0156: Volume snapshots: reflink where the node's data dir supports it; otherwise volumes live in a node-managed loop-mounted XFS pool (reflink=1) so snapshots stay reflinks; pause_copy only as a last resort](adr/0156-volume-snapshots-reflink-where-the-node-s-data-dir-supports.md)
   - [0157: Pre-upgrade control-plane backup: the new binary takes the VACUUM INTO backup (trigger: upgrade) at its first start, before it applies any migration; no new API operation](adr/0157-pre-upgrade-control-plane-backup-the-new-binary-takes-the.md)
   - [0158: Control-plane backups with trigger: upgrade are kept outside the scheduled retention: the last 3 upgrade backups are always kept, whatever their age](adr/0158-control-plane-backups-with-trigger-upgrade-are-kept-outside.md)
+  - [0160: Canonical JSON (quoro_proto::jcs) accepts floats per RFC 8785 for magnitudes 0 or in \[1e-6, 1e21); vulnerability findings carry cvss_score as a JSON number](adr/0160-canonical-json-quoro-proto-jcs-accepts-floats-per-rfc-8785.md)
+  - [0161: M5a Quoro-component findings match crates (crates.io), guest kernel (Linux/Kernel upstream version), Cloud Hypervisor (crates.io), cloudflared and BuildKit (Go); npm packages in the SBOM are listed but not matched](adr/0161-m5a-quoro-component-findings-match-crates-crates-io-guest.md)
+  - [0162: Evaluate Linux/Kernel OSV ranges per stable series: when a record lists a fix in the version's own major.minor series, that fix alone decides](adr/0162-evaluate-linux-kernel-osv-ranges-per-stable-series-when-a.md)
+  - [0163: Inventory images prepared before M5a from their cached root disk, once, at node start](adr/0163-inventory-images-prepared-before-m5a-from-their-cached-root.md)
 
 # Background research
 
