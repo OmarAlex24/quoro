@@ -15,6 +15,12 @@
 //! A record is keyed by its bucket and id: one GitHub advisory (`GHSA-…`) is
 //! published in every ecosystem it affects, so the same id arrives in several
 //! archives, and each bucket keeps and replaces its own copy.
+//!
+//! Writes go through one gate, as in the control-plane store: a writer waits
+//! on it before it takes a pool connection, so writers queued behind a long
+//! one (a bucket replace parses its archive inside its transaction) never
+//! hold every connection, and reads keep one. A node session reads this
+//! file on its loop.
 
 use crate::store::now_rfc3339;
 use crate::vulns::osv::{self, Affected, Range, Record, Severity};
@@ -22,7 +28,9 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 use sqlx::{Row as _, Sqlite, SqlitePool, Transaction};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 /// The cache schema version. A file that holds another version is recreated.
 const SCHEMA_VERSION: &str = "1";
@@ -123,6 +131,27 @@ struct BucketData {
 #[derive(Clone)]
 pub struct Cache {
     pool: SqlitePool,
+    /// The single-writer gate of this process.
+    writer: Arc<Mutex<()>>,
+}
+
+/// A write transaction holding the writer gate. Dropping it without
+/// [`CacheWrite::commit`] or [`CacheWrite::rollback`] rolls back.
+struct CacheWrite {
+    tx: Transaction<'static, Sqlite>,
+    _gate: OwnedMutexGuard<()>,
+}
+
+impl CacheWrite {
+    /// Commits and releases the gate.
+    async fn commit(self) -> Result<(), sqlx::Error> {
+        self.tx.commit().await
+    }
+
+    /// Rolls back and releases the gate.
+    async fn rollback(self) -> Result<(), sqlx::Error> {
+        self.tx.rollback().await
+    }
 }
 
 impl Cache {
@@ -164,7 +193,7 @@ impl Cache {
         };
         let mut created = false;
         if version.as_deref() != Some(SCHEMA_VERSION) {
-            let mut tx = pool.begin().await?;
+            let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
             for table in TABLES {
                 sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
                     .execute(&mut *tx)
@@ -181,7 +210,25 @@ impl Cache {
             tx.commit().await?;
             created = true;
         }
-        Ok((Self { pool }, created))
+        Ok((
+            Self {
+                pool,
+                writer: Arc::new(Mutex::new(())),
+            },
+            created,
+        ))
+    }
+
+    /// Starts a write transaction: the gate first, then a connection.
+    ///
+    /// It starts with `BEGIN IMMEDIATE`, so it takes SQLite's write lock at
+    /// once and waits on `busy_timeout` for a writer in another process
+    /// (`quoro vuln import`). A deferred `BEGIN` that reads first could not
+    /// upgrade its snapshot once that process committed in between.
+    async fn begin_write(&self) -> Result<CacheWrite, sqlx::Error> {
+        let gate = Arc::clone(&self.writer).lock_owned().await;
+        let tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        Ok(CacheWrite { tx, _gate: gate })
     }
 
     /// The counter bumped by every write that changed something, as the file
@@ -257,50 +304,50 @@ impl Cache {
     where
         I: IntoIterator<Item = Record>,
     {
-        let mut tx = self.pool.begin().await?;
-        reset_temp(&mut tx).await?;
+        let mut w = self.begin_write().await?;
+        reset_temp(&mut w.tx).await?;
         sqlx::query(
             "CREATE TEMP TABLE old_records (id TEXT PRIMARY KEY, modified_nanos INTEGER NOT NULL)",
         )
-        .execute(&mut *tx)
+        .execute(&mut *w.tx)
         .await?;
         sqlx::query(
             "INSERT INTO old_records (id, modified_nanos) \
              SELECT id, modified_nanos FROM records WHERE bucket = ?",
         )
         .bind(bucket)
-        .execute(&mut *tx)
+        .execute(&mut *w.tx)
         .await?;
         sqlx::query("DELETE FROM affected WHERE bucket = ?")
             .bind(bucket)
-            .execute(&mut *tx)
+            .execute(&mut *w.tx)
             .await?;
 
         let mut batch = Vec::with_capacity(BATCH);
         for record in records {
             batch.push(record);
             if batch.len() == BATCH {
-                flush(&mut tx, bucket, &mut batch, true).await?;
+                flush(&mut w.tx, bucket, &mut batch, true).await?;
             }
         }
-        flush(&mut tx, bucket, &mut batch, true).await?;
+        flush(&mut w.tx, bucket, &mut batch, true).await?;
 
         let (old, new) = sqlx::query_as::<_, (i64, i64)>(
             "SELECT (SELECT count(*) FROM old_records), (SELECT count(*) FROM incoming_records)",
         )
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut *w.tx)
         .await?;
         let same = sqlx::query_as::<_, (i64,)>(
             "SELECT count(*) FROM incoming_records i \
              JOIN old_records o ON o.id = i.id AND o.modified_nanos = i.modified_nanos",
         )
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut *w.tx)
         .await?
         .0;
         let changed = old != new || same != new;
 
         if !changed {
-            tx.rollback().await?;
+            w.rollback().await?;
             self.touch_bucket(bucket).await?;
             self.checkpoint().await;
             return Ok(u64::try_from(new).unwrap_or(0));
@@ -309,12 +356,12 @@ impl Cache {
             "DELETE FROM records WHERE bucket = ? AND id NOT IN (SELECT id FROM incoming_records)",
         )
         .bind(bucket)
-        .execute(&mut *tx)
+        .execute(&mut *w.tx)
         .await?;
-        let data = recompute(&mut tx, bucket).await?;
-        write_bucket(&mut tx, bucket, &data).await?;
-        bump(&mut tx).await?;
-        tx.commit().await?;
+        let data = recompute(&mut w.tx, bucket).await?;
+        write_bucket(&mut w.tx, bucket, &data).await?;
+        bump(&mut w.tx).await?;
+        w.commit().await?;
         self.checkpoint().await;
         Ok(data.count)
     }
@@ -324,7 +371,11 @@ impl Cache {
     /// this the log stays as large as the largest archive (npm's is over a
     /// gigabyte unpacked) on a disk the primary shares. Best effort: a reader
     /// holding an old snapshot only delays it to the next replace.
+    ///
+    /// A truncating checkpoint blocks writers while it waits for readers, so
+    /// it holds the gate like a write.
     async fn checkpoint(&self) {
+        let _gate = self.writer.lock().await;
         if let Err(error) = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
             .execute(&self.pool)
             .await
@@ -345,7 +396,7 @@ impl Cache {
     where
         I: IntoIterator<Item = Record>,
     {
-        let mut tx = self.pool.begin().await?;
+        let mut w = self.begin_write().await?;
         let mut changed = 0u64;
         let mut batch = Vec::with_capacity(BATCH);
         for record in records {
@@ -354,7 +405,7 @@ impl Cache {
             )
             .bind(bucket)
             .bind(&record.id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut *w.tx)
             .await?
             .map(|(nanos,)| nanos);
             if existing == Some(nanos_i64(modified_nanos(&record))) {
@@ -363,16 +414,16 @@ impl Cache {
             changed += 1;
             batch.push(record);
             if batch.len() == BATCH {
-                flush(&mut tx, bucket, &mut batch, false).await?;
+                flush(&mut w.tx, bucket, &mut batch, false).await?;
             }
         }
-        flush(&mut tx, bucket, &mut batch, false).await?;
-        let data = recompute(&mut tx, bucket).await?;
-        write_bucket(&mut tx, bucket, &data).await?;
+        flush(&mut w.tx, bucket, &mut batch, false).await?;
+        let data = recompute(&mut w.tx, bucket).await?;
+        write_bucket(&mut w.tx, bucket, &data).await?;
         if changed > 0 {
-            bump(&mut tx).await?;
+            bump(&mut w.tx).await?;
         }
-        tx.commit().await?;
+        w.commit().await?;
         Ok(changed)
     }
 
@@ -383,27 +434,27 @@ impl Cache {
     ///
     /// Any database error.
     pub async fn delete_records(&self, bucket: &str, ids: &[String]) -> Result<u64, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut w = self.begin_write().await?;
         let mut deleted = 0u64;
         for id in ids {
             sqlx::query("DELETE FROM affected WHERE bucket = ? AND record_id = ?")
                 .bind(bucket)
                 .bind(id)
-                .execute(&mut *tx)
+                .execute(&mut *w.tx)
                 .await?;
             let result = sqlx::query("DELETE FROM records WHERE id = ? AND bucket = ?")
                 .bind(id)
                 .bind(bucket)
-                .execute(&mut *tx)
+                .execute(&mut *w.tx)
                 .await?;
             deleted += result.rows_affected();
         }
-        let data = recompute(&mut tx, bucket).await?;
-        write_bucket(&mut tx, bucket, &data).await?;
+        let data = recompute(&mut w.tx, bucket).await?;
+        write_bucket(&mut w.tx, bucket, &data).await?;
         if deleted > 0 {
-            bump(&mut tx).await?;
+            bump(&mut w.tx).await?;
         }
-        tx.commit().await?;
+        w.commit().await?;
         Ok(deleted)
     }
 
@@ -413,10 +464,10 @@ impl Cache {
     ///
     /// Any database error.
     pub async fn touch_bucket(&self, bucket: &str) -> Result<(), sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
-        let data = recompute(&mut tx, bucket).await?;
-        write_bucket(&mut tx, bucket, &data).await?;
-        tx.commit().await
+        let mut w = self.begin_write().await?;
+        let data = recompute(&mut w.tx, bucket).await?;
+        write_bucket(&mut w.tx, bucket, &data).await?;
+        w.commit().await
     }
 
     /// Replaces the KEV catalog. The whole catalog is small, so it is written
@@ -440,18 +491,18 @@ impl Cache {
         if existing == incoming {
             return Ok(());
         }
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM kev").execute(&mut *tx).await?;
+        let mut w = self.begin_write().await?;
+        sqlx::query("DELETE FROM kev").execute(&mut *w.tx).await?;
         let mut batch: Vec<(String, Option<String>)> = Vec::with_capacity(BATCH);
         for entry in incoming {
             batch.push(entry);
             if batch.len() == BATCH {
-                flush_kev(&mut tx, &mut batch).await?;
+                flush_kev(&mut w.tx, &mut batch).await?;
             }
         }
-        flush_kev(&mut tx, &mut batch).await?;
-        bump(&mut tx).await?;
-        tx.commit().await?;
+        flush_kev(&mut w.tx, &mut batch).await?;
+        bump(&mut w.tx).await?;
+        w.commit().await?;
         Ok(())
     }
 
@@ -541,7 +592,7 @@ impl Cache {
         if existing.as_ref() == Some(&(sha256.to_string(), json.to_string())) {
             return Ok(());
         }
-        let mut tx = self.pool.begin().await?;
+        let mut w = self.begin_write().await?;
         sqlx::query(
             "INSERT INTO inventories (digest, sha256, received_at, json) VALUES (?, ?, ?, ?) \
              ON CONFLICT(digest) DO UPDATE SET sha256 = excluded.sha256, \
@@ -551,10 +602,10 @@ impl Cache {
         .bind(sha256)
         .bind(now_rfc3339())
         .bind(json)
-        .execute(&mut *tx)
+        .execute(&mut *w.tx)
         .await?;
-        bump(&mut tx).await?;
-        tx.commit().await?;
+        bump(&mut w.tx).await?;
+        w.commit().await?;
         Ok(())
     }
 
@@ -604,16 +655,16 @@ impl Cache {
     ///
     /// Any database error.
     pub async fn delete_inventory(&self, digest: &str) -> Result<bool, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut w = self.begin_write().await?;
         let result = sqlx::query("DELETE FROM inventories WHERE digest = ?")
             .bind(digest)
-            .execute(&mut *tx)
+            .execute(&mut *w.tx)
             .await?;
         let deleted = result.rows_affected() > 0;
         if deleted {
-            bump(&mut tx).await?;
+            bump(&mut w.tx).await?;
         }
-        tx.commit().await?;
+        w.commit().await?;
         Ok(deleted)
     }
 }
@@ -1091,6 +1142,51 @@ mod tests {
         assert!(cache.delete_inventory("sha256:aaa").await.unwrap());
         assert!(!cache.delete_inventory("sha256:aaa").await.unwrap());
         assert!(cache.inventory("sha256:aaa").await.unwrap().is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A long cache write (a bucket replace parsing an archive) while several
+    /// image inventories arrive: the reads a node session waits on must not
+    /// queue behind the writers for a pool connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_long_write_leaves_reads_a_connection() {
+        let (dir, path) = temp_path();
+        let (cache, _) = Cache::open(&path).await.unwrap();
+        let hold = Duration::from_millis(2_000);
+        let slow = cache.clone();
+        let replace = tokio::spawn(async move {
+            // The archive iterator parses inside the write transaction.
+            let records = (0..20).map(|index| {
+                std::thread::sleep(hold / 20);
+                record(&format!("CVE-{index}"), "2026-01-01T00:00:00Z", "a", "1")
+            });
+            slow.replace_bucket("Debian", records).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut writes = Vec::new();
+        for index in 0..4 {
+            let cache = cache.clone();
+            writes.push(tokio::spawn(async move {
+                cache
+                    .put_inventory(&format!("sha256:{index}"), "abc", "{\"packages\":[]}")
+                    .await
+                    .unwrap();
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let started = std::time::Instant::now();
+        cache.inventory_sha("sha256:none").await.unwrap();
+        let waited = started.elapsed();
+        eprintln!("inventory_sha waited {waited:?} behind a {hold:?} write");
+        replace.await.unwrap();
+        for write in writes {
+            write.await.unwrap();
+        }
+        assert_eq!(cache.inventory_digests().await.unwrap().len(), 4);
+        assert!(
+            waited < Duration::from_millis(500),
+            "a read waited {waited:?} for a connection"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
