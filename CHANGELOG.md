@@ -6,7 +6,9 @@ Each entry links the pull request that made the change and, where one exists, th
 
 ## [Unreleased]
 
-The M5a milestone: stateless replicas behind an edge, local volumes, cold backups and vulnerability tracking. All of it is merged on `main`; the milestone demo is still pending, and none of it is in a release yet.
+## [v0.2.0] - 2026-11-05
+
+Milestone M5a: stateless replicas behind an edge, local volumes, cold backups and vulnerability tracking. The milestone is complete: its demo ran on the lab and was approved on 2026-11-05. Still an experimental preview, not for production ([ADR 0137]).
 
 ### Storage
 
@@ -63,6 +65,22 @@ The M5a milestone: stateless replicas behind an edge, local volumes, cold backup
 ### Maintenance
 
 - The M5a decisions were recorded as ADRs 0139 to 0158 ([#267]). `Cargo.lock` now records `quoro-backup` 0.1.1 ([#258]). Tests that failed intermittently on loaded CI runners were made deterministic ([#265], [#269], [#282], [#286], [#340]). A changelog and a milestone status table were added ([#329]).
+
+### Known issues
+
+- Changing the replica count of an app with `tunnel` domains across 1 moves its hostnames between a node's tunnel and the edge's. For up to about two minutes afterwards, part of the requests answer `404` while Cloudflare moves traffic to the new tunnel. The DNS record is kept; a grace window, in which the machine that lost the hostname keeps serving it, is planned for M5b ([#344]).
+- While a node is disconnected, the app's instances list keeps showing that node's instance as `running`. The edge backends, the metrics and the nodes page show the outage ([#342]).
+- The primary's API can take up to about 30 seconds to show that the edge took a backend out of rotation. The edge itself acts within seconds, so traffic is not affected ([#339]).
+- `applied_rev` in `GET /api/v1/nodes` can lag the revision a machine has applied by up to about 30 seconds when the revision changes no VM and no route ([#346]).
+- Web terminal: a command that ends before the client attaches its WebSocket loses its output, and the upgrade answers `401`. The command still runs. An interactive shell is not affected ([#240]).
+
+### Upgrading from v0.1.1
+
+- Upgrade the node agents together with the primary. An older node agent refuses the per-node guest subnet, and the primary treats a node agent older than M5a as one that cannot hold a volume ([ADR 0144]).
+- Every node except the oldest gets its own guest subnet. Running VMs keep their address and move to the new subnet on their next redeploy.
+- After its node agent starts, a node inventories the images it cached before this release, once and in the background. No redeploy is needed ([ADR 0163]).
+- The installer now installs the optional `xfsprogs` package when `mkfs.xfs` is missing. Without it, a node whose data directory cannot reflink (ext4, for example) pauses the app to snapshot a volume ([ADR 0156]).
+- From this release on, a new binary backs up the control-plane database before it applies a schema migration, when a backup repository is configured ([ADR 0157]). v0.2.0 applies no migration to a v0.1.1 database, so this upgrade takes no such backup.
 
 ## [v0.1.1] - 2026-11-04
 
@@ -153,7 +171,8 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 - **CI.** A cargo workspace with a pinned toolchain, and `cargo-deny` enforcing the dependency license and advisory policy ([#12], [#33], [ADR 0080], [ADR 0086]).
 - ADRs 0081 to 0090 ([#53], [#56]); smaller debug info in dev and test builds ([#46]).
 
-[Unreleased]: https://github.com/OmarAlex24/quoro/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/OmarAlex24/quoro/compare/v0.2.0...HEAD
+[v0.2.0]: https://github.com/OmarAlex24/quoro/releases/tag/v0.2.0
 [v0.1.1]: https://github.com/OmarAlex24/quoro/releases/tag/v0.1.1
 [v0.1.0]: https://github.com/OmarAlex24/quoro/releases/tag/v0.1.0
 [v0.0.2]: https://github.com/OmarAlex24/quoro/releases/tag/v0.0.2
@@ -272,6 +291,7 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#227]: https://github.com/OmarAlex24/quoro/pull/227
 [#229]: https://github.com/OmarAlex24/quoro/pull/229
 [#237]: https://github.com/OmarAlex24/quoro/pull/237
+[#240]: https://github.com/OmarAlex24/quoro/issues/240
 [#242]: https://github.com/OmarAlex24/quoro/pull/242
 [#244]: https://github.com/OmarAlex24/quoro/pull/244
 [#251]: https://github.com/OmarAlex24/quoro/pull/251
@@ -323,9 +343,13 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#329]: https://github.com/OmarAlex24/quoro/pull/329
 [#334]: https://github.com/OmarAlex24/quoro/pull/334
 [#338]: https://github.com/OmarAlex24/quoro/pull/338
+[#339]: https://github.com/OmarAlex24/quoro/issues/339
 [#340]: https://github.com/OmarAlex24/quoro/pull/340
 [#341]: https://github.com/OmarAlex24/quoro/pull/341
+[#342]: https://github.com/OmarAlex24/quoro/issues/342
 [#343]: https://github.com/OmarAlex24/quoro/pull/343
+[#344]: https://github.com/OmarAlex24/quoro/issues/344
+[#346]: https://github.com/OmarAlex24/quoro/issues/346
 [#347]: https://github.com/OmarAlex24/quoro/pull/347
 [#348]: https://github.com/OmarAlex24/quoro/pull/348
 [ADR 0019]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0019-fencing-is-mandatory-and-lease-based-node-agent-self-fences.md
