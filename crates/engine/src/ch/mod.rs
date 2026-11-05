@@ -167,6 +167,17 @@ impl Engine for ChEngine {
         self.inner.images.inventory(digest).await
     }
 
+    async fn uninventoried_images(&self) -> Result<Vec<ImageDigest>, EngineError> {
+        self.inner.images.uninventoried().await
+    }
+
+    async fn inventory_cached_image(
+        &self,
+        digest: &ImageDigest,
+    ) -> Result<ImageInventory, EngineError> {
+        self.inner.images.inventory_cached(digest).await
+    }
+
     async fn create(&self, spec: &VmSpec) -> Result<VmInfo, EngineError> {
         self.inner.create(spec).await
     }

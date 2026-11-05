@@ -26,6 +26,9 @@ use crate::{
 /// Scratch directories all share this prefix.
 const TMP_PREFIX: &str = ".tmp-";
 
+/// The inventory's file name inside a cache entry (§3.21).
+pub(crate) const INVENTORY_FILE: &str = "inventory.json";
+
 /// `image.json`: what `cached()` needs without the registry.
 #[derive(Debug, Deserialize, Serialize)]
 struct CachedEntry {
@@ -167,8 +170,32 @@ struct CachedPackage {
     path: Option<String>,
 }
 
-/// Writes `<dir>/inventory.json`.
+/// Writes `<dir>/inventory.json`. The entry is still a scratch directory, so
+/// the commit's `rename` makes it appear whole.
 pub(crate) fn write_inventory(dir: &Path, inventory: &ImageInventory) -> Result<(), EngineError> {
+    let path = dir.join(INVENTORY_FILE);
+    let bytes = inventory_bytes(inventory)?;
+    std::fs::write(&path, bytes).map_err(|err| io_error(&path, &err))
+}
+
+/// Writes `<dir>/inventory.json` into a committed entry: through a temporary
+/// file and a `rename`, so a crash never leaves a partial inventory that
+/// `read_inventory` would serve (§3.21).
+pub(crate) fn write_inventory_atomic(
+    dir: &Path,
+    inventory: &ImageInventory,
+) -> Result<(), EngineError> {
+    let path = dir.join(INVENTORY_FILE);
+    let tmp = dir.join(format!("{INVENTORY_FILE}.tmp"));
+    let bytes = inventory_bytes(inventory)?;
+    std::fs::write(&tmp, bytes).map_err(|err| io_error(&tmp, &err))?;
+    if let Ok(file) = std::fs::File::open(&tmp) {
+        let _ = file.sync_all();
+    }
+    std::fs::rename(&tmp, &path).map_err(|err| io_error(&tmp, &err))
+}
+
+fn inventory_bytes(inventory: &ImageInventory) -> Result<Vec<u8>, EngineError> {
     let cached = CachedInventory {
         digest: inventory.digest.0.clone(),
         os: inventory.os.clone(),
@@ -188,10 +215,8 @@ pub(crate) fn write_inventory(dir: &Path, inventory: &ImageInventory) -> Result<
             .collect(),
         inventoried_at: inventory.inventoried_at.clone(),
     };
-    let bytes = serde_json::to_vec(&cached)
-        .map_err(|err| EngineError::Io(format!("serializing the image inventory: {err}")))?;
-    let path = dir.join("inventory.json");
-    std::fs::write(&path, bytes).map_err(|err| io_error(&path, &err))
+    serde_json::to_vec(&cached)
+        .map_err(|err| EngineError::Io(format!("serializing the image inventory: {err}")))
 }
 
 /// Reads the committed inventory of `digest`: `NotFound` when the image is
@@ -205,7 +230,7 @@ pub(crate) fn read_inventory(
     if !dir.join("image.json").exists() {
         return Err(EngineError::NotFound);
     }
-    let path = dir.join("inventory.json");
+    let path = dir.join(INVENTORY_FILE);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {

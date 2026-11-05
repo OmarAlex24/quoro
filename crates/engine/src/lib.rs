@@ -573,6 +573,27 @@ pub trait Engine: Send + Sync {
             ))
         }
     }
+    /// Cached images that have no inventory yet: images prepared before M5a.
+    /// Added in M5a; section 3.21. The default lists none, so a backend
+    /// without inventories never starts a backfill.
+    fn uninventoried_images(
+        &self,
+    ) -> impl Future<Output = Result<Vec<ImageDigest>, EngineError>> + Send {
+        async { Ok(Vec::new()) }
+    }
+    /// Inventories a cached image from its root disk, read-only, and caches
+    /// the result with the image. An image that already has an inventory
+    /// returns it as it is. Added in M5a; section 3.21.
+    fn inventory_cached_image(
+        &self,
+        _digest: &ImageDigest,
+    ) -> impl Future<Output = Result<ImageInventory, EngineError>> + Send {
+        async {
+            Err(EngineError::Unsupported(
+                "image inventories are not implemented by this engine".into(),
+            ))
+        }
+    }
     /// Section 3.16.
     fn snapshot_volume(
         &self,

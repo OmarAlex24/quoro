@@ -3405,6 +3405,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_image_cached_before_m5a_reaches_the_primary_after_the_backfill() {
+        let dir = TempDir::new();
+        let engine = engine_with_inventory().await;
+        // The node held this image before M5a: no inventory until the engine
+        // reads its root disk.
+        engine.clear_inventory(&ImageDigest(INVENTORY_DIGEST.to_owned()));
+        engine.set_backfill_inventory(image_inventory());
+        let hub = InventoryHub::new(std::sync::Arc::clone(&engine));
+        let report = crate::inventory::backfill(engine.as_ref(), &hub).await;
+        assert_eq!(report.inventoried, vec![INVENTORY_DIGEST.to_owned()]);
+        let sha = inventory_sha();
+        let snapshot = vm_snapshot(INVENTORY_DIGEST);
+        let (end, _store) = drive_session_full(
+            &dir,
+            None,
+            Some(hub),
+            Some(snapshot),
+            move |mut ws, _store| {
+                Box::pin(async move {
+                    let hello = read_frame(&mut ws).await;
+                    send(
+                        &mut ws,
+                        ControlMessage::Welcome(Welcome {
+                            cluster_id: "cls_test".to_owned(),
+                            term: 1,
+                            server_time: "2026-11-02T10:15:30Z".to_owned(),
+                            heartbeat_interval_ms: 500,
+                            session_timeout_ms: 5_000,
+                            primary_node_id: "nod_primary".to_owned(),
+                            primary_urls: Vec::new(),
+                        })
+                        .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
+                        .to_text(),
+                    )
+                    .await;
+                    // Listed with its hash in status_report.images...
+                    let report = read_until(&mut ws, "status_report").await;
+                    let images = report["body"]["images"].as_array().unwrap();
+                    assert_eq!(images.len(), 1);
+                    assert_eq!(images[0]["image_digest"], INVENTORY_DIGEST);
+                    assert_eq!(images[0]["inventory_sha256"], sha);
+                    // ...and sent exactly as for a freshly prepared image
+                    // (section 5.26).
+                    let part = read_until(&mut ws, "image_inventory").await;
+                    assert_eq!(part["body"]["image_digest"], INVENTORY_DIGEST);
+                    assert_eq!(part["body"]["inventory_id"], part["id"]);
+                    assert_eq!(part["body"]["inventory_sha256"], sha);
+                    assert_eq!(part["body"]["parts"], 1);
+                    assert_eq!(part["body"]["package_count"], 2);
+                })
+            },
+        )
+        .await;
+        assert_eq!(end, SessionEnd::Reconnect);
+    }
+
+    #[tokio::test]
     async fn inventory_resend_queues_the_parts_or_answers_not_found() {
         let dir = TempDir::new();
         let engine = engine_with_inventory().await;
