@@ -132,6 +132,7 @@ impl Actor {
     async fn run(mut self) {
         // Phase 1: the session exists but no WebSocket attached yet. Data that
         // arrives is buffered (never acked) until it is handed to the socket.
+        let mut ticket_grace_used = false;
         let socket = loop {
             tokio::select! {
                 command = self.commands.recv() => match command {
@@ -177,8 +178,14 @@ impl Actor {
                     }
                 },
                 () = tokio::time::sleep_until(self.ticket_deadline) => {
-                    self.end_before_attach(Ending::new(CloseReason::TicketExpired)).await;
-                    return;
+                    // An upgrade that claimed the session presented the ticket
+                    // in time: its socket is on the way, so the session goes on.
+                    if self.socket.seal() || ticket_grace_used {
+                        self.close(Ending::new(CloseReason::TicketExpired), None).await;
+                        return;
+                    }
+                    ticket_grace_used = true;
+                    self.ticket_deadline = Instant::now() + ATTACH_WAIT;
                 }
             }
         };
