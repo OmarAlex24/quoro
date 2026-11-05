@@ -34,6 +34,8 @@ use sqlx::{Row, SqlitePool};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
+use super::mesh::{MeshLookup, build_mesh};
+
 /// The resolved digests, keyed by image reference, shared by every session.
 pub type DigestCache = Arc<Mutex<HashMap<String, String>>>;
 
@@ -78,6 +80,9 @@ struct AppInfo {
 /// session sent last) is left out while its image does not resolve: the node
 /// cannot hold it yet, so leaving it out deletes nothing, and one bad
 /// reference does not freeze the rest of the node.
+///
+/// `mesh_lookup` supplies the session source addresses and the advertised
+/// URLs that `spec.mesh` needs (ADR 0144).
 pub async fn build_spec(
     store: &Store,
     node_id: &str,
@@ -85,6 +90,7 @@ pub async fn build_spec(
     cache: &DigestCache,
     data_key: &DataKey,
     previous: Option<&Spec>,
+    mesh_lookup: &MeshLookup<'_>,
 ) -> Result<BuiltSpec, String> {
     // An edge-only machine runs no VM and has no guest subnet (ADR 0144); a
     // node still waiting for its subnet cannot be sent a snapshot yet.
@@ -231,6 +237,7 @@ pub async fn build_spec(
 
     let routes = build_routes(store.pool(), &apps, &vms).await?;
     let ingress = build_ingress(store.pool(), data_key, node_id).await?;
+    let mesh = build_mesh(store, mesh_lookup, node_id).await?;
 
     Ok(BuiltSpec {
         spec: Spec {
@@ -239,7 +246,7 @@ pub async fn build_spec(
             network,
             ingress,
             builds,
-            mesh: None,
+            mesh,
             edge: None,
         },
         held_back,
@@ -549,6 +556,18 @@ mod tests {
     use crate::ReferenceAsDigest;
     use quoro_types::{Prefix, new_id};
 
+    /// A mesh lookup that knows no session address and no advertised URL, so
+    /// these snapshots have no `spec.mesh`.
+    fn no_mesh_lookup() -> MeshLookup<'static> {
+        fn none(_: &str) -> Option<std::net::IpAddr> {
+            None
+        }
+        MeshLookup {
+            session_ip: &none,
+            advertised_urls: Vec::new(),
+        }
+    }
+
     async fn insert_vm(store: &Store, node_id: &str, name: &str) -> String {
         let project_id = new_id(Prefix::Project);
         let now = crate::store::now_rfc3339();
@@ -613,9 +632,17 @@ mod tests {
         let b = insert_vm(&store, &node_id, "b").await;
         let cache = DigestCache::default();
         let key = DataKey::ephemeral();
-        let built = build_spec(&store, &node_id, &ReferenceAsDigest, &cache, &key, None)
-            .await
-            .unwrap();
+        let built = build_spec(
+            &store,
+            &node_id,
+            &ReferenceAsDigest,
+            &cache,
+            &key,
+            None,
+            &no_mesh_lookup(),
+        )
+        .await
+        .unwrap();
         let spec = built.spec;
         let mut ids: Vec<&str> = spec.vms.iter().map(|vm| vm.vm_id.as_str()).collect();
         ids.sort_unstable();
@@ -674,6 +701,7 @@ mod tests {
             &DigestCache::default(),
             &key,
             None,
+            &no_mesh_lookup(),
         )
         .await
         .unwrap();
@@ -695,7 +723,8 @@ mod tests {
                 &FailsOnB,
                 &DigestCache::default(),
                 &key,
-                None
+                None,
+                &no_mesh_lookup(),
             )
             .await
             .is_err()
@@ -714,6 +743,7 @@ mod tests {
             &DigestCache::default(),
             &key,
             Some(&previous),
+            &no_mesh_lookup(),
         )
         .await
         .unwrap();

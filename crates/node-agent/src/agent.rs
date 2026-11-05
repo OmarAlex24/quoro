@@ -25,6 +25,7 @@ use crate::build::manager::BuildManager;
 use crate::identity::IdentityHandle;
 use crate::ingress::{CertificateEvents, DnsBridge, IngressSupervisor};
 use crate::interactive::Interactive;
+use crate::mesh::{MeshKey, MeshManager, PlatformMeshDriver};
 use crate::metrics::{MetricsRing, MetricsSampler};
 use crate::reconcile::{ReconcileConfig, ReconcileOptions, Reconciler, Snapshot};
 use crate::session::{Session, SessionSetup, wait_stop};
@@ -51,6 +52,9 @@ pub async fn run<E: Engine + 'static>(
 ) -> Result<(), AgentError> {
     let identity = IdentityHandle::load(&config.data_dir)?;
     let store = NodeStore::open(&config.data_dir).await?;
+    // The mesh key pair is generated on the first start and reused after that;
+    // only its public key leaves the machine (section 6.9).
+    let mesh_key = MeshKey::load_or_create(&config.data_dir)?;
 
     let current = load_verified_snapshot(&identity, &store).await;
 
@@ -112,6 +116,11 @@ pub async fn run<E: Engine + 'static>(
     let reconcile_task =
         tokio::spawn(reconciler.run(desired_rx.clone(), wait_stop(stop_rx.clone())));
     let build_task = tokio::spawn(manager.run(desired_rx, wait_stop(stop_rx.clone())));
+    let mesh_public_key = mesh_key.public_key_base64();
+    let mesh_task = tokio::spawn(
+        MeshManager::new(PlatformMeshDriver::new(), mesh_key)
+            .run(desired.subscribe(), wait_stop(stop_rx.clone())),
+    );
 
     // Terminal transcripts are pruned at agent start and then hourly; each
     // terminal session also prunes once it ends (section 3.3).
@@ -144,6 +153,7 @@ pub async fn run<E: Engine + 'static>(
     })
     .with_ingress(Arc::clone(&ingress), dns)
     .with_metrics(metrics)
+    .with_mesh_key(mesh_public_key)
     .with_interactive(interactive);
     let outcome = session.run(stop_rx).await;
 
@@ -152,6 +162,7 @@ pub async fn run<E: Engine + 'static>(
     let _ = reconcile_task.await;
     let _ = metrics_task.await;
     let _ = build_task.await;
+    let _ = mesh_task.await;
     ingress.shutdown().await;
     shutdown_task.abort();
     outcome

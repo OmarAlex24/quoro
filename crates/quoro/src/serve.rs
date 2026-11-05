@@ -158,7 +158,7 @@ pub async fn run(config: Config) -> Result<i32, String> {
         router(state.clone())
             .merge(quoro_mcp::router(state))
             .fallback(crate::panel::serve)
-            .into_make_service(),
+            .into_make_service_with_connect_info::<SocketAddr>(),
     );
 
     let Some(mut local_node) = local_node else {

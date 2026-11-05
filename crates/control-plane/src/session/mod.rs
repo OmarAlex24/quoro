@@ -11,6 +11,7 @@
 //! (change-log follow is a separate follow-up). Both slots are marked below.
 
 pub mod desired;
+mod mesh;
 
 use crate::AppState;
 use crate::changelog::{self, Actor, ActorType, Op};
@@ -24,7 +25,7 @@ use crate::store::{Store, now_rfc3339, sha256_hex};
 use crate::tunnel::{CloudflareEndpoints, TunnelKick};
 use crate::{DigestResolver, ServerConfig};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{FromRequestParts, State};
+use axum::extract::{ConnectInfo, FromRequestParts, State};
 use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
@@ -32,6 +33,7 @@ use quoro_proto::wire::{self, ControlMessage, NodeMessage};
 use quoro_providers::DnsProvider;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
@@ -271,6 +273,9 @@ struct HubInner {
     advertised_urls: Mutex<Option<Arc<AdvertisedUrls>>>,
     /// DNS-01 records this primary created, per node: `record_id` to it.
     dns_records: Mutex<HashMap<String, HashMap<String, DnsRecord>>>,
+    /// The source address each node's session came from, in memory only: the
+    /// edge's WireGuard endpoint (ADR 0144).
+    session_ips: Mutex<HashMap<String, IpAddr>>,
     generation: AtomicU64,
 }
 
@@ -308,6 +313,7 @@ impl NodeHub {
             endpoints: Mutex::new(CloudflareEndpoints::production()),
             advertised_urls: Mutex::new(None),
             dns_records: Mutex::new(HashMap::new()),
+            session_ips: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
         }))
     }
@@ -343,6 +349,49 @@ impl NodeHub {
         if let Some(changed) = changed {
             changed.notify_one();
         }
+    }
+
+    /// Tells every live session to rebuild and resend its desired state
+    /// (section 5.11). Mesh peers depend on other nodes' rows, so a node
+    /// whose key or address changed has to reach all of them. A node without
+    /// a session is left alone: it gets the new snapshot when it dials.
+    pub fn nodes_changed_all(&self) {
+        let changed: Vec<Arc<Notify>> = {
+            let sessions = self.0.sessions.lock().expect("session lock");
+            sessions
+                .values()
+                .map(|handle| Arc::clone(&handle.changed))
+                .collect()
+        };
+        for notify in changed {
+            notify.notify_one();
+        }
+    }
+
+    /// Records the source address `node_id`'s session came from (ADR 0144) and
+    /// returns whether it differs from the one already recorded. Nothing is
+    /// stored when the peer address is unknown.
+    fn remember_session_ip(&self, node_id: &str, ip: Option<IpAddr>) -> bool {
+        let Some(ip) = ip else {
+            return false;
+        };
+        let mut ips = self.0.session_ips.lock().expect("session ip lock");
+        if ips.get(node_id) == Some(&ip) {
+            return false;
+        }
+        ips.insert(node_id.to_string(), ip);
+        true
+    }
+
+    /// The source address `node_id`'s session came from, when the primary
+    /// recorded one.
+    fn session_ip(&self, node_id: &str) -> Option<IpAddr> {
+        self.0
+            .session_ips
+            .lock()
+            .expect("session ip lock")
+            .get(node_id)
+            .copied()
     }
 
     /// Asks the tunnel manager to reconcile `node_id` after a snapshot was
@@ -1053,19 +1102,29 @@ pub async fn open_node_session(
     node: NodeId,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    let node_id = node.0;
+    let node_id = node.id;
+    // The peer address is absent when the router runs without connect info
+    // (tests); the mesh then has no endpoint for this machine (ADR 0144).
+    let peer_ip = node.peer_ip;
     let hub = state.hub.clone();
     Ok(ws
         .max_message_size(wire::MAX_MESSAGE_BYTES)
         .max_frame_size(wire::MAX_MESSAGE_BYTES)
-        .on_upgrade(move |socket| run_session(hub, node_id, socket))
+        .on_upgrade(move |socket| run_session(hub, node_id, socket, peer_ip))
         .into_response())
 }
 
-/// The node id a credential authenticates. It is a request-parts extractor so
-/// authentication runs before the WebSocket extractor: a bad credential is a
-/// problem+json `401`, not an upgrade rejection.
-pub struct NodeId(String);
+/// The node id a credential authenticates, and the address its session came
+/// from. It is a request-parts extractor so authentication runs before the
+/// WebSocket extractor: a bad credential is a problem+json `401`, not an
+/// upgrade rejection. The peer address is absent when the router runs without
+/// connect info (tests).
+pub struct NodeId {
+    /// The authenticated node.
+    id: String,
+    /// The source address of the connection, when the listener reports it.
+    peer_ip: Option<IpAddr>,
+}
 
 impl FromRequestParts<AppState> for NodeId {
     type Rejection = ApiError;
@@ -1074,7 +1133,12 @@ impl FromRequestParts<AppState> for NodeId {
         parts: &mut axum::http::request::Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        Ok(Self(authenticate_node(state, &parts.headers).await?))
+        let id = authenticate_node(state, &parts.headers).await?;
+        let peer_ip = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ConnectInfo(address)| address.ip());
+        Ok(Self { id, peer_ip })
     }
 }
 
@@ -1122,8 +1186,18 @@ struct Session {
     digest_failures: HashMap<String, u32>,
 }
 
-async fn run_session(hub: NodeHub, node_id: String, mut socket: WebSocket) {
+async fn run_session(
+    hub: NodeHub,
+    node_id: String,
+    mut socket: WebSocket,
+    peer_ip: Option<IpAddr>,
+) {
     let (generation, mut rx, mut closed, changed) = hub.attach(&node_id);
+    // ADR 0144: the edge's WireGuard endpoint is the source address of its
+    // session, so a changed address changes every node's peer entry.
+    if hub.remember_session_ip(&node_id, peer_ip) {
+        hub.nodes_changed_all();
+    }
     let timeout = Duration::from_millis(hub.0.config.session_timeout_ms.max(1));
     let mut deadline = Instant::now() + timeout;
     let mut outbox: Vec<String> = Vec::new();
@@ -1279,15 +1353,22 @@ impl Session {
                 ));
                 return true;
             }
-            if let Err(e) = connect_node(&self.hub, &self.node_id, &hello).await {
-                tracing::warn!(%e, node_id = %self.node_id, "cannot record the session start");
-                outbox.push(protocol_error(
-                    quoro_proto::ErrorCode::BadMessage,
-                    "the primary could not record this session",
-                    false,
-                    Some(&raw.id),
-                ));
-                return false;
+            match connect_node(&self.hub, &self.node_id, &hello).await {
+                Ok(changed) => {
+                    if changed {
+                        self.hub.nodes_changed_all();
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(%e, node_id = %self.node_id, "cannot record the session start");
+                    outbox.push(protocol_error(
+                        quoro_proto::ErrorCode::BadMessage,
+                        "the primary could not record this session",
+                        false,
+                        Some(&raw.id),
+                    ));
+                    return false;
+                }
             }
             self.connected = true;
 
@@ -1482,6 +1563,11 @@ impl Session {
     /// `floor` is the node's stored revision on the first send (section 4.2),
     /// `0` afterwards.
     async fn refresh(&mut self, floor: u64, force: bool) -> Result<(), String> {
+        let session_ip = |node_id: &str| self.hub.session_ip(node_id);
+        let mesh_lookup = mesh::MeshLookup {
+            session_ip: &session_ip,
+            advertised_urls: self.hub.advertised_urls(),
+        };
         let built = desired::build_spec(
             &self.hub.0.store,
             &self.node_id,
@@ -1489,6 +1575,7 @@ impl Session {
             &self.hub.0.digests,
             &self.hub.0.data_key,
             self.last_spec.as_ref(),
+            &mesh_lookup,
         )
         .await?;
         self.note_holdbacks(&built.held_back).await;
@@ -1740,7 +1827,11 @@ fn i64_of(value: u64) -> i64 {
 }
 
 /// Records the start of a session and emits `node.connected` (section 5.1).
-async fn connect_node(hub: &NodeHub, node_id: &str, hello: &wire::Hello) -> Result<(), String> {
+///
+/// It also stores the mesh public key the `hello` carried and assigns the
+/// node's mesh address when it has none (ADR 0144). The `bool` says
+/// whether either was newly stored, so the caller can rebuild every snapshot.
+async fn connect_node(hub: &NodeHub, node_id: &str, hello: &wire::Hello) -> Result<bool, String> {
     let actor = Actor {
         kind: ActorType::Node,
         id: node_id.to_string(),
@@ -1763,6 +1854,8 @@ async fn connect_node(hub: &NodeHub, node_id: &str, hello: &wire::Hello) -> Resu
     .execute(&mut *w.tx)
     .await
     .map_err(|e| e.to_string())?;
+    let mesh_changed =
+        mesh::store_hello(&mut w.tx, &actor, node_id, hello.mesh_public_key.as_deref()).await?;
     let payload = driver::node_payload(&mut w.tx, node_id)
         .await
         .map_err(|e| format!("{e:?}"))?;
@@ -1788,7 +1881,8 @@ async fn connect_node(hub: &NodeHub, node_id: &str, hello: &wire::Hello) -> Resu
     )
     .await
     .map_err(|e| e.to_string())?;
-    w.commit().await.map_err(|e| e.to_string())
+    w.commit().await.map_err(|e| e.to_string())?;
+    Ok(mesh_changed)
 }
 
 /// Records the end of a session and emits `node.disconnected`.
