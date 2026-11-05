@@ -37,6 +37,14 @@ fn parse(text: &str) -> Option<Vec<u64>> {
     Some(parts)
 }
 
+/// The stable series of a kernel version: its first two components
+/// (`6.12.115+deb13-amd64` is in `6.12`). None when it has no leading number.
+pub(super) fn series(text: &str) -> Option<(u64, u64)> {
+    let parts = parse(text)?;
+    let major = parts.first().copied()?;
+    Some((major, parts.get(1).copied().unwrap_or(0)))
+}
+
 /// Compares two kernel versions, or None when either has no leading number.
 pub(super) fn compare(a: &str, b: &str) -> Option<Ordering> {
     let left = parse(a)?;
@@ -55,8 +63,18 @@ pub(super) fn compare(a: &str, b: &str) -> Option<Ordering> {
 
 #[cfg(test)]
 mod tests {
-    use super::compare;
+    use super::{compare, series};
     use std::cmp::Ordering;
+
+    #[test]
+    fn series_is_the_first_two_components() {
+        assert_eq!(series("6.12.115+deb13-amd64"), Some((6, 12)));
+        assert_eq!(series("7.2.15-q1"), Some((7, 2)));
+        assert_eq!(series("6.12"), Some((6, 12)));
+        assert_eq!(series("7"), Some((7, 0)));
+        assert_eq!(series("quoro"), None);
+        assert_eq!(series(""), None);
+    }
 
     #[test]
     fn suffixes_are_ignored() {
