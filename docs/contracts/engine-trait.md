@@ -568,6 +568,19 @@ pub trait Engine: Send + Sync {
     ) -> impl Future<Output = Result<ImageInventory, EngineError>> + Send {
         async { Err(EngineError::Unsupported("image inventories are not implemented by this engine".into())) }
     }
+    /// Cached images that have no inventory yet. Added in M5a; section 3.21.
+    fn uninventoried_images(
+        &self,
+    ) -> impl Future<Output = Result<Vec<ImageDigest>, EngineError>> + Send {
+        async { Ok(Vec::new()) }
+    }
+    /// Inventories a cached image from its root disk. Added in M5a; section 3.21.
+    fn inventory_cached_image(
+        &self,
+        _digest: &ImageDigest,
+    ) -> impl Future<Output = Result<ImageInventory, EngineError>> + Send {
+        async { Err(EngineError::Unsupported("image inventories are not implemented by this engine".into())) }
+    }
     /// Section 3.16.
     fn snapshot_volume(
         &self,
@@ -609,7 +622,7 @@ The derives, `MacAddr`, the blanket `ConsoleIo` implementation, `Display` and `E
 
 M4 adds, additively: `VmSpec::serial`, `VmSpec::vsock` and `VmSpec::work_disks` with `SerialMode`, `VsockAttach` and `WorkDisk`; `NetAttach::egress_only`; `Capabilities::exec`; `OciLayout`, `ByteStream`, `ExecRequest` and `ExecSession`; and the methods `prepare_layout`, `exec` and `serial_output`, whose default implementations return `Unsupported`, so a backend that does not offer them still compiles. Code that builds a `VmSpec`, `NetAttach` or `Capabilities` literal sets the new fields to `SerialMode::File` (the M1-M3 serial log), `None`, an empty list, `false` and `false`, which keeps the M1-M3 behaviour. `VmSpec::canonical` keeps `work_disks` in order: their serials are unique, so the order carries no meaning, but the node agent always builds them in the same order.
 
-M5a adds, additively: `VolumeAttach::serial`, `VolumeInfo`, `SnapshotMethod`, `Capabilities::volume_snapshot_method`, `VolumeSnapshot::method` and `VolumeSnapshot::pause`, and the methods `ensure_volume`, `import_volume` and `delete_volume`, whose default implementations return `Unsupported` like `snapshot_volume` and `delete_volume_snapshot`. Code that builds a `Capabilities` literal sets the new field to `None`; `VmSpec::canonical` keeps sorting `volumes` by `(volume_id, mount_path)`, and the serial follows the volume.
+M5a adds, additively: `VolumeAttach::serial`, `VolumeInfo`, `SnapshotMethod`, `Capabilities::volume_snapshot_method`, `VolumeSnapshot::method` and `VolumeSnapshot::pause`, and the methods `ensure_volume`, `import_volume` and `delete_volume`, whose default implementations return `Unsupported` like `snapshot_volume` and `delete_volume_snapshot`. It also adds `ImageInventory`, `InventoryPackage` and the methods `image_inventory` and `inventory_cached_image`, whose default implementations return `Unsupported`, and `uninventoried_images`, whose default implementation returns an empty list, so a backend without inventories never starts a backfill. Code that builds a `Capabilities` literal sets the new field to `None`; `VmSpec::canonical` keeps sorting `volumes` by `(volume_id, mount_path)`, and the serial follows the volume.
 
 ## 3. Method semantics
 
@@ -780,14 +793,21 @@ Returns the package inventory of a prepared image (ADR 0150, ADR 0151). Added in
 
 - `prepare_image` and `prepare_layout` build the inventory in the same pass that applies the layers, from the unpacked tree, before `mkfs.ext4 -d`, and cache it with the image by digest. What is read, the bounds (20 000 packages, 4 MiB) and the `not_inventoried` kinds are in `node-agent-protocol.md` section 6.11. A failure to inventory never fails the preparation: the image is cached, and the inventory lists what it could not read.
 - The parsers only read files of the unpacked tree, resolved inside it like the layer paths (section 3.4); they never execute anything from the image.
-- `image_inventory` reads the cached inventory and never touches the network. A digest that is not prepared is `NotFound`. An image prepared before M5a has no inventory and is `NotFound` until it is prepared again: its app is reported `pending` until its next deployment.
-- `remove_image` removes the inventory with the image.
+- `image_inventory` reads the cached inventory and never touches the network. A digest that is not prepared is `NotFound`, and so is a prepared image that has no inventory yet.
+- **Images prepared before M5a.** An image cached by an earlier release has its root disk and its configuration but no inventory, and a second `prepare_image` or `prepare_layout` of its digest returns the cached value (sections 3.4, 3.17), so a redeploy does not inventory it either. The engine inventories such an image from its root disk instead, once, without the network:
+  - `uninventoried_images` lists the committed cache entries that have a root disk and no inventory. It reads only the cache directory.
+  - `inventory_cached_image` builds the inventory of one of them from its `rootfs.ext4`, read-only, with the same parsers, bounds and `not_inventoried` kinds as a fresh preparation, caches it with the image and returns it. The root disk was built by the engine's own `mkfs.ext4 -d` and is attached read-only to every VM (section 5), so its metadata was never written by a guest; the parsers still reach its files only through paths resolved inside the root, as in section 3.4. The root disk is never written, and nothing on it is executed.
+  - A digest that is not cached is `NotFound`. A digest that already has an inventory returns it as it is, without reading the root disk again.
+  - A root disk that cannot be opened at all (the host lacks a tool, the kernel refuses the filesystem) is an error, and no inventory is written: the image stays without one, and the next start of the node agent tries again. A root disk that opens but whose tree cannot be read gives an inventory whose `not_inventoried` is `inventory_failed`, as for a fresh preparation, and that inventory is kept.
+  - The inventory is written so that a crash never leaves a partial one: a later `image_inventory` returns either nothing or the whole inventory.
+  - The node agent calls `uninventoried_images` once, in the background, after it starts, then `inventory_cached_image` for one image at a time, and sends each inventory it gets as it does for a freshly prepared image (`node-agent-protocol.md` section 6.11). The pass never delays the node's start, a VM start or a preparation; an image that fails is logged and the pass goes on with the next one.
+- `remove_image` removes the inventory with the image. `inventory_cached_image` and `remove_image` of one digest are serialized, so a removal never races the inventory being written.
 
 ## 4. Concurrency
 
 - Operations on one `VmId` are serialized by the caller. The node agent holds one lock per VM, so it never issues `start` and `delete` for the same id concurrently. The engine does not promise ordering for concurrent calls on one id and may return `Conflict`.
 - The engine must be safe to call concurrently for **different** VMs, on many VMs at once. This is what lets one node run several apps and replace them independently.
-- `capabilities`, `probe_host`, `ensure_network`, `prepare_image`, `remove_image` and `list` are safe concurrently with any VM operation. `ensure_network` and `prepare_image` are internally serialized by the implementation where the underlying operation is not reentrant.
+- `capabilities`, `probe_host`, `ensure_network`, `prepare_image`, `remove_image`, `image_inventory`, `uninventoried_images`, `inventory_cached_image` and `list` are safe concurrently with any VM operation. `prepare_image`, `prepare_layout`, `inventory_cached_image` and `remove_image` are serialized per digest (section 3.21). `ensure_network` and `prepare_image` are internally serialized by the implementation where the underlying operation is not reentrant.
 - No call blocks the runtime for longer than an I/O wait: image preparation and boot are awaited, never run on the reactor thread.
 
 ## 5. Cloud Hypervisor implementation
@@ -820,6 +840,9 @@ One `cloud-hypervisor` process per VM with its own `--api-socket`, because the V
 | `ensure_volume` | Creates the sparse file and runs `mkfs.ext4` on it (section 3.20) | No backend call |
 | `import_volume` | Renames the restored file into place (section 3.20) | No backend call |
 | `delete_volume` | Removes the volume file (section 3.20) | No backend call |
+| `image_inventory` | Reads the inventory cached next to the image (section 3.21) | No backend call |
+| `uninventoried_images` | Lists the cache entries with a `rootfs.ext4` and no inventory (section 3.21) | No backend call |
+| `inventory_cached_image` | Mounts the image's `rootfs.ext4` read-only through a loop device (`ro,noload,nodev,nosuid,noexec`, type `ext4`) on a mount point of its own in the node agent's mount namespace, runs the inventory parsers on it, unmounts it and writes the inventory next to the image (section 3.21). A mount left behind by an interrupted agent is unmounted before the next one | No backend call |
 
 Details that follow from the research file:
 
@@ -876,6 +899,7 @@ Tests must run on machines without KVM, including CI and the laptops of people w
 - Injectable: a test can make a VM crash after N seconds, make `start` return `ResourceExhausted`, make `prepare_image` return `Image`, and make the console echo, so every error path and every event the node agent must map is reachable.
 - Streams: `events`, `output`, `console` and `serial_output` are real streams over in-memory channels, so the node agent's stream handling is exercised, not stubbed.
 - M4 methods: `prepare_layout` caches a fake prepared image by manifest digest; `exec` returns an in-memory session that echoes input and can be told to exit with a code; `serial_output` replays and follows an injectable byte buffer. `Capabilities::exec` is `true`.
+- Inventory methods: `image_inventory` returns an injectable inventory for a prepared image; a test can mark an image as prepared before M5a, which `uninventoried_images` then lists and `image_inventory` reports `NotFound` until `inventory_cached_image` builds an injectable inventory for it, or fails with an injectable error.
 - Volume methods: `ensure_volume`, `import_volume` and `delete_volume` keep volume records in memory with their size; `snapshot_volume` and `delete_volume_snapshot` succeed and record a snapshot descriptor, so the M5 chunk-engine code is testable before a real primitive exists. `Capabilities::volume_snapshot_method` is injectable and defaults to `Reflink`; with `PauseCopy` the fake records a pause and resume of the VM that attaches the volume.
 
 The node agent runs its protocol tests against `FakeEngine`: the M0 lease tests — revoking a `local` lease and expiring a test-only short `expiring` lease — need no VM at all beyond a fake (`node-agent-protocol.md`).
@@ -896,5 +920,5 @@ The node agent runs its protocol tests against `FakeEngine`: the M0 lease tests 
 | M1 | `create`, `start`, `stop`, `delete`, `list`, `inspect`, `prepare_image`, `ensure_network` (D-0033) |
 | M2 | `output` feeds live app logs (D-0014, D-0033); isolation groups on `NetAttach` and guest DNS on `NodeNetwork` (D-0084) |
 | M4 | `counters` for metrics (D-0033, ADR 0014); `serial_output` and `VmSpec::serial` for the read-only console (ADR 0116); `exec` and `VmSpec::vsock` for the web terminal, with init configuration v2 (ADR 0113); `prepare_layout`, `VmSpec::work_disks` and `NetAttach::egress_only` for builds (ADR 0117, ADR 0118). `console` is superseded |
-| M5a | `image_inventory`, built by `prepare_image` and `prepare_layout` (ADR 0150, ADR 0151); `ensure_volume`, `import_volume`, `delete_volume` and `VolumeAttach::serial` for local volumes, with init configuration v3 (ADR 0145); `snapshot_volume` and `delete_volume_snapshot` with the `Reflink` or `PauseCopy` method probed per node (ADR 0146) |
+| M5a | `image_inventory`, built by `prepare_image` and `prepare_layout` (ADR 0150, ADR 0151), and `uninventoried_images` and `inventory_cached_image` for images cached before M5a; `ensure_volume`, `import_volume`, `delete_volume` and `VolumeAttach::serial` for local volumes, with init configuration v3 (ADR 0145); `snapshot_volume` and `delete_volume_snapshot` with the `Reflink` or `PauseCopy` method probed per node (ADR 0146) |
 | M5b | The primitive for warm volumes chosen by the lvm-thin vs btrfs spike (D-0023) |
