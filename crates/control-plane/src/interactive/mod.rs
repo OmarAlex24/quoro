@@ -30,7 +30,7 @@ use sha2::{Digest, Sha256};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqliteConnection};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -59,6 +59,11 @@ pub const TICK: Duration = Duration::from_millis(100);
 /// How long a primary-side close waits for the node's answering `stream_end`
 /// (with the transcript fields) after it asks the node to stop a stream.
 pub const STREAM_CLOSE_WAIT: Duration = Duration::from_secs(5);
+
+/// How long a session that ends before its WebSocket reached the actor waits
+/// for a socket an upgrade already claimed, so the client reads why the
+/// session ended instead of a dropped connection.
+pub const ATTACH_WAIT: Duration = Duration::from_secs(5);
 
 /// The largest client WebSocket message that becomes one `stream_input`.
 pub const MAX_CLIENT_BYTES: usize = 64 * 1024;
@@ -153,8 +158,70 @@ pub enum Command {
 /// One session's attach point in the registry.
 pub struct SessionHandle {
     pub tx: mpsc::UnboundedSender<Command>,
-    /// Whether a WebSocket already attached; a second upgrade is a conflict.
-    pub attached: Arc<AtomicBool>,
+    /// Whether an upgrade claimed the session's one WebSocket.
+    pub socket: Arc<SocketSlot>,
+}
+
+/// Where a session's one WebSocket stands. The upgrade claims it before the
+/// `101`, and the socket reaches the actor only afterwards as
+/// [`Command::Attach`]; a session that ends in between must not drop that
+/// socket unanswered, and must not let a later upgrade in once it is ending.
+#[derive(Default)]
+pub struct SocketSlot(AtomicU8);
+
+/// No upgrade claimed the session yet.
+const SOCKET_FREE: u8 = 0;
+/// An upgrade claimed it; its socket is on the way to the actor.
+const SOCKET_CLAIMED: u8 = 1;
+/// The session ended before any upgrade claimed it.
+const SOCKET_SEALED: u8 = 2;
+
+/// The outcome of an upgrade's claim on [`SocketSlot`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Claim {
+    /// The upgrade owns the session's WebSocket.
+    Claimed,
+    /// Another upgrade already did; a second upgrade is a conflict.
+    Taken,
+    /// The session is ending without a WebSocket.
+    Sealed,
+}
+
+impl SocketSlot {
+    /// An upgrade's claim on the session's one WebSocket.
+    pub fn claim(&self) -> Claim {
+        match self.0.compare_exchange(
+            SOCKET_FREE,
+            SOCKET_CLAIMED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => Claim::Claimed,
+            Err(SOCKET_CLAIMED) => Claim::Taken,
+            Err(_) => Claim::Sealed,
+        }
+    }
+
+    /// Whether an upgrade claimed the session.
+    #[must_use]
+    pub fn is_claimed(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == SOCKET_CLAIMED
+    }
+
+    /// The actor ends the session before a socket reached it: refuses every
+    /// later claim. Returns `false` when an upgrade already claimed it, so its
+    /// socket is on the way and the actor must wait for it.
+    pub fn seal(&self) -> bool {
+        match self.0.compare_exchange(
+            SOCKET_FREE,
+            SOCKET_SEALED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => true,
+            Err(state) => state == SOCKET_SEALED,
+        }
+    }
 }
 
 /// One minted, not yet expired ticket. Only its hash is kept.
@@ -290,13 +357,13 @@ impl Interactive {
     pub fn handle(
         &self,
         session_id: &str,
-    ) -> Option<(mpsc::UnboundedSender<Command>, Arc<AtomicBool>)> {
+    ) -> Option<(mpsc::UnboundedSender<Command>, Arc<SocketSlot>)> {
         self.0
             .sessions
             .lock()
             .expect("session lock")
             .get(session_id)
-            .map(|handle| (handle.tx.clone(), Arc::clone(&handle.attached)))
+            .map(|handle| (handle.tx.clone(), Arc::clone(&handle.socket)))
     }
 
     pub fn unregister(&self, session_id: &str) {
@@ -307,12 +374,6 @@ impl Interactive {
             .remove(session_id);
         self.forget_ticket(session_id);
     }
-}
-
-/// Marks that the session has its one WebSocket; `false` if it already did.
-#[must_use]
-pub fn claim_socket(attached: &AtomicBool) -> bool {
-    !attached.swap(true, Ordering::SeqCst)
 }
 
 // ---------------------------------------------------------------------------
@@ -586,5 +647,37 @@ pub fn row_target(row: &SessionRow) -> crate::error::Target {
     crate::error::Target {
         kind: row.target_type.clone(),
         id: row.target_id.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Claim, SocketSlot};
+
+    #[test]
+    fn one_upgrade_claims_the_socket() {
+        let slot = SocketSlot::default();
+        assert_eq!(slot.claim(), Claim::Claimed);
+        assert!(slot.is_claimed());
+        assert_eq!(slot.claim(), Claim::Taken);
+    }
+
+    #[test]
+    fn a_claimed_socket_cannot_be_sealed() {
+        // The session ended after an upgrade claimed it: the actor must wait
+        // for that socket rather than drop it.
+        let slot = SocketSlot::default();
+        assert_eq!(slot.claim(), Claim::Claimed);
+        assert!(!slot.seal());
+        assert!(slot.is_claimed());
+    }
+
+    #[test]
+    fn a_sealed_session_refuses_a_later_upgrade() {
+        let slot = SocketSlot::default();
+        assert!(slot.seal());
+        assert!(slot.seal());
+        assert_eq!(slot.claim(), Claim::Sealed);
+        assert!(!slot.is_claimed());
     }
 }

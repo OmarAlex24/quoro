@@ -5,7 +5,8 @@
 //! 7.5, `node-agent-protocol.md` sections 5.7, 5.8, 5.24 and 5.25).
 
 use super::{
-    CloseReason, Command, EndInfo, Interactive, MAX_CLIENT_BYTES, SessionRow, Timings, finalize,
+    ATTACH_WAIT, CloseReason, Command, EndInfo, Interactive, MAX_CLIENT_BYTES, SessionRow,
+    SocketSlot, Timings, finalize,
 };
 use crate::AppState;
 use crate::auth::{Credential, Identity};
@@ -17,6 +18,7 @@ use quoro_proto::wire::WindowSize;
 use quoro_types::{Role, Scope};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
@@ -58,6 +60,7 @@ impl Ending {
 
 /// Starts the session actor. The caller has already registered its attach
 /// point and minted the ticket.
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn(
     state: AppState,
     row: SessionRow,
@@ -66,6 +69,7 @@ pub async fn spawn(
     stream: NodeStream,
     buffered: Vec<Vec<u8>>,
     commands: mpsc::UnboundedReceiver<Command>,
+    socket: Arc<SocketSlot>,
 ) {
     let timings = interactive.timings();
     let remaining = credential_remaining(&state, &identity).await;
@@ -77,6 +81,7 @@ pub async fn spawn(
         interactive,
         stream,
         commands,
+        socket,
         buffered: buffered.into(),
         timings,
         now: Instant::now(),
@@ -102,6 +107,8 @@ struct Actor {
     interactive: Interactive,
     stream: NodeStream,
     commands: mpsc::UnboundedReceiver<Command>,
+    /// The registry's claim on the session's one WebSocket.
+    socket: Arc<SocketSlot>,
     buffered: VecDeque<Vec<u8>>,
     timings: Timings,
     now: Instant,
@@ -128,20 +135,17 @@ impl Actor {
         let socket = loop {
             tokio::select! {
                 command = self.commands.recv() => match command {
-                    Some(Command::Attach(socket)) => break Some(*socket),
+                    Some(Command::Attach(socket)) => break *socket,
                     Some(Command::End { request_id, ended_by, justification, reply }) => {
-                        self.close(
-                                Ending {
-                                    reason: CloseReason::EndedByRequest,
-                                    ended_by: Some(ended_by),
-                                    justification,
-                                    request_id: Some(request_id),
-                                    reply: Some(reply),
-                                    ..Ending::new(CloseReason::EndedByRequest)
-                                },
-                                None,
-                            )
-                            .await;
+                        let ending = Ending {
+                            reason: CloseReason::EndedByRequest,
+                            ended_by: Some(ended_by),
+                            justification,
+                            request_id: Some(request_id),
+                            reply: Some(reply),
+                            ..Ending::new(CloseReason::EndedByRequest)
+                        };
+                        self.end_before_attach(ending).await;
                         return;
                     }
                     None => return,
@@ -149,7 +153,8 @@ impl Actor {
                 event = self.stream.next() => {
                     match event {
                         None => {
-                            self.close(Ending::new(CloseReason::NodeDisconnected), None).await;
+                            self.end_before_attach(Ending::new(CloseReason::NodeDisconnected))
+                                .await;
                             return;
                         }
                         Some(StreamEvent::Data(bytes)) => self.buffered.push_back(bytes),
@@ -165,24 +170,64 @@ impl Actor {
                             ending.transcript = transcript_sha256.map(|sha| {
                                 (sha, transcript_bytes.unwrap_or(0))
                             });
-                            self.close(ending, None).await;
+                            self.end_before_attach(ending).await;
                             return;
                         }
                         Some(_) => {}
                     }
                 },
                 () = tokio::time::sleep_until(self.ticket_deadline) => {
-                    self.close(Ending::new(CloseReason::TicketExpired), None).await;
+                    self.end_before_attach(Ending::new(CloseReason::TicketExpired)).await;
                     return;
                 }
             }
         };
-        let Some(mut socket) = socket else {
-            return;
-        };
+        let mut socket = socket;
         self.attach().await;
         let ending = self.connected_loop(&mut socket).await;
         self.close(ending, Some(socket)).await;
+    }
+
+    /// Ends a session whose WebSocket has not reached the actor. An upgrade
+    /// claims the session before its `101` and only then hands the socket
+    /// over, so the session can end (the node drops, the shell exits, a
+    /// DELETE lands) between the two. Dropping that socket unanswered would
+    /// reset the client's connection without telling it why: wait, bounded,
+    /// for the claimed socket and close through it instead. A session no
+    /// upgrade claimed is sealed, so a later upgrade is refused.
+    async fn end_before_attach(&mut self, ending: Ending) {
+        if self.socket.seal() {
+            self.close(ending, None).await;
+            return;
+        }
+        let deadline = Instant::now() + ATTACH_WAIT;
+        loop {
+            match tokio::time::timeout_at(deadline, self.commands.recv()).await {
+                Ok(Some(Command::Attach(socket))) => {
+                    let mut socket = *socket;
+                    self.attach().await;
+                    // What the node produced before it ended still reaches
+                    // the client, ahead of the close.
+                    while let Some(bytes) = self.buffered.pop_front() {
+                        let len = bytes.len();
+                        if socket.send(Message::Binary(bytes.into())).await.is_err() {
+                            break;
+                        }
+                        self.delivered(len);
+                    }
+                    self.close(ending, Some(socket)).await;
+                    return;
+                }
+                // This ending already writes the session's one record.
+                Ok(Some(Command::End { reply, .. })) => {
+                    let _ = reply.send(false);
+                }
+                Ok(None) | Err(_) => {
+                    self.close(ending, None).await;
+                    return;
+                }
+            }
+        }
     }
 
     /// Marks the session connected and records it on the row.

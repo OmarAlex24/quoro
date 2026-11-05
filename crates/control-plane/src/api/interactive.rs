@@ -7,7 +7,7 @@
 use crate::AppState;
 use crate::auth::Identity;
 use crate::error::{ApiError, Code};
-use crate::interactive::{Command, TicketCheck, claim_socket};
+use crate::interactive::{Claim, Command, TicketCheck};
 use crate::request::{ApiJson, CallCtx, RequestId};
 use axum::Router;
 use axum::extract::ws::WebSocketUpgrade;
@@ -330,7 +330,7 @@ pub async fn connect_interactive_session(
             if state
                 .interactive
                 .handle(&session_id)
-                .is_some_and(|(_, attached)| attached.load(std::sync::atomic::Ordering::SeqCst))
+                .is_some_and(|(_, socket)| socket.is_claimed())
             {
                 return Err(ApiError::conflict("the session already has its WebSocket"));
             }
@@ -363,11 +363,16 @@ pub async fn connect_interactive_session(
         }
         None => {}
     }
-    let Some((tx, attached)) = state.interactive.handle(&session_id) else {
+    let Some((tx, socket)) = state.interactive.handle(&session_id) else {
         return Err(ApiError::unauthenticated());
     };
-    if !claim_socket(&attached) {
-        return Err(ApiError::conflict("the session already has its WebSocket"));
+    match socket.claim() {
+        Claim::Claimed => {}
+        Claim::Taken => {
+            return Err(ApiError::conflict("the session already has its WebSocket"));
+        }
+        // The session ended before this upgrade: like a session already gone.
+        Claim::Sealed => return Err(ApiError::unauthenticated()),
     }
     Ok(ws
         .on_upgrade(move |socket| async move {
