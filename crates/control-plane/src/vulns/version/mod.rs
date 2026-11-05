@@ -167,6 +167,7 @@ pub fn evaluate(
         return None;
     }
     let ecosystem_order = order_for(ecosystem);
+    let ranges = series_ranges(ecosystem_order, installed, ranges);
     let mut affected = false;
     let mut fix: Option<&str> = None;
     for range in ranges {
@@ -215,6 +216,49 @@ pub fn evaluate(
     Some(Hit {
         fixed: fix.map(str::to_owned),
     })
+}
+
+/// The ranges that decide for `installed`.
+///
+/// A Linux kernel record writes one range per stable series, and the ranges
+/// overlap: `introduced 6.2.0, fixed 6.12.24` next to `introduced 6.12.0,
+/// fixed 6.13.12` says "6.12 is fixed in 6.12.24 and 6.13 in 6.13.12", yet
+/// read as plain OSV ranges the second one flags every 6.12 release after the
+/// fix. So for the Linux ecosystem (whose only package is the kernel), when
+/// any `ECOSYSTEM` range names a fix in the installed version's own
+/// `major.minor` series, only the ranges that name such a fix are read: the
+/// version is affected when it is below that fix and at or above the range's
+/// introduced version. Without a fix in its series, every range is read as
+/// usual. Other ecosystems always read every range.
+fn series_ranges<'a>(
+    ecosystem_order: Option<Order>,
+    installed: &str,
+    ranges: &'a [Range],
+) -> Vec<&'a Range> {
+    let own_series = match ecosystem_order {
+        Some(Order::Kernel) => kernel::series(installed),
+        _ => None,
+    };
+    let Some(own_series) = own_series else {
+        return ranges.iter().collect();
+    };
+    let in_series: Vec<&Range> = ranges
+        .iter()
+        .filter(|range| {
+            range.kind == "ECOSYSTEM"
+                && range.events.iter().any(|event| {
+                    event
+                        .fixed
+                        .as_deref()
+                        .is_some_and(|fixed| kernel::series(fixed) == Some(own_series))
+                })
+        })
+        .collect();
+    if in_series.is_empty() {
+        ranges.iter().collect()
+    } else {
+        in_series
+    }
 }
 
 /// What one usable range said.
@@ -665,6 +709,124 @@ mod tests {
         assert_eq!(evaluate("Linux", "4.3.9", &ranges, &[]), None);
         // The installed string may carry a distribution suffix.
         assert!(evaluate("Linux", "7.2.8-quoro", &ranges, &[]).is_some());
+    }
+
+    /// A Linux record's ranges, each an introduced version and its fixes.
+    fn kernel_record(ranges: &[(&str, &[&str])]) -> Vec<Range> {
+        ranges
+            .iter()
+            .map(|(introduced, fixes)| {
+                let mut events = vec![event(Some(introduced), None, None)];
+                events.extend(fixes.iter().map(|fixed| event(None, Some(fixed), None)));
+                ecosystem_range(events)
+            })
+            .collect()
+    }
+
+    fn fixed_in(version: &str) -> Option<Hit> {
+        Some(Hit {
+            fixed: Some(version.to_owned()),
+        })
+    }
+
+    #[test]
+    fn evaluate_kernel_reads_the_fix_of_its_own_series() {
+        // CVE-2025-37750 as OSV publishes it: one range per stable series.
+        let record = kernel_record(&[
+            ("0", &["6.1.191"]),
+            ("6.2.0", &["6.12.24"]),
+            ("6.12.0", &["6.13.12"]),
+            ("6.13.0", &["6.14.3"]),
+        ]);
+        // 6.12.115 is past the 6.12 fix, although `6.12.0..6.13.12` contains it.
+        assert_eq!(evaluate("Linux", "6.12.115", &record, &[]), None);
+        assert_eq!(
+            evaluate("Linux", "6.12.115+deb13-amd64", &record, &[]),
+            None
+        );
+        // A 6.12 release below the 6.12 fix is still affected, and told that fix.
+        assert_eq!(
+            evaluate("Linux", "6.12.20", &record, &[]),
+            fixed_in("6.12.24")
+        );
+        assert_eq!(evaluate("Linux", "6.12.24", &record, &[]), None);
+        assert_eq!(
+            evaluate("Linux", "6.13.5", &record, &[]),
+            fixed_in("6.13.12")
+        );
+        assert_eq!(
+            evaluate("Linux", "6.1.190", &record, &[]),
+            fixed_in("6.1.191")
+        );
+        assert_eq!(evaluate("Linux", "6.1.191", &record, &[]), None);
+        // No fix in 6.15, and no range contains it: not affected.
+        assert_eq!(evaluate("Linux", "6.15.2", &record, &[]), None);
+    }
+
+    #[test]
+    fn evaluate_kernel_guest_release_past_its_series_fix() {
+        // Three records from the Linux data whose plain reading flags 7.2.15
+        // through the range that opens the next series.
+        let records = [
+            kernel_record(&[
+                ("0", &["5.10.273"]),
+                ("5.11.0", &["5.15.224"]),
+                ("5.16.0", &["6.1.191"]),
+                ("6.2.0", &["6.6.161"]),
+                ("6.7.0", &["6.12.115"]),
+                ("6.13.0", &["6.18.60"]),
+                ("6.19.0", &["7.2.14"]),
+                ("7.2.0", &["7.3.1"]),
+            ]),
+            kernel_record(&[
+                ("0", &["5.15.224"]),
+                ("5.16.0", &["6.1.191", "6.6.161"]),
+                ("6.2.0", &["6.12.115"]),
+                ("6.7.0", &["6.18.60"]),
+                ("6.13.0", &["7.2.14"]),
+                ("6.19.0", &["7.3.1"]),
+            ]),
+            kernel_record(&[
+                ("0", &["6.1.191"]),
+                ("6.2.0", &["6.6.161"]),
+                ("6.7.0", &["6.12.115"]),
+                ("6.10.0", &["6.18.60"]),
+                ("6.13.0", &["7.2.14"]),
+                ("6.19.0", &["7.3.1"]),
+            ]),
+        ];
+        for record in &records {
+            assert_eq!(evaluate("Linux", "7.2.15", record, &[]), None);
+            assert_eq!(evaluate("Linux", "6.12.115", record, &[]), None);
+            assert_eq!(evaluate("Linux", "7.2.13", record, &[]), fixed_in("7.2.14"));
+            assert_eq!(
+                evaluate("Linux", "6.12.100", record, &[]),
+                fixed_in("6.12.115")
+            );
+        }
+    }
+
+    #[test]
+    fn evaluate_kernel_without_a_fix_in_its_series_reads_every_range() {
+        // Introduced in 6.7 and fixed only in 6.18: 6.12 has no fix of its own.
+        let record = kernel_record(&[("6.7.0", &["6.18.60"]), ("6.19.0", &["7.3.1"])]);
+        assert_eq!(
+            evaluate("Linux", "6.12.115", &record, &[]),
+            fixed_in("6.18.60")
+        );
+        assert_eq!(evaluate("Linux", "7.2.15", &record, &[]), fixed_in("7.3.1"));
+        assert_eq!(evaluate("Linux", "6.6.1", &record, &[]), None);
+    }
+
+    #[test]
+    fn evaluate_series_rule_is_only_for_linux() {
+        // The same overlapping shape under a package ecosystem keeps the plain
+        // OSV reading.
+        let record = kernel_record(&[("6.2.0", &["6.12.24"]), ("6.12.0", &["6.13.12"])]);
+        assert_eq!(
+            evaluate("crates.io", "6.12.115", &record, &[]),
+            fixed_in("6.13.12")
+        );
     }
 
     #[test]
