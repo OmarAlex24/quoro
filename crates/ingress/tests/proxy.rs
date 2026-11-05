@@ -835,3 +835,292 @@ async fn a_backend_that_never_sends_headers_hits_the_response_timeout() {
         "the response timeout did not fire"
     );
 }
+
+/// Connections and requests a counting backend has seen.
+#[derive(Default)]
+struct Counts {
+    connections: std::sync::atomic::AtomicUsize,
+    requests: std::sync::atomic::AtomicUsize,
+}
+
+impl Counts {
+    fn connections(&self) -> usize {
+        self.connections.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn requests(&self) -> usize {
+        self.requests.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// A keep-alive backend that answers `backend: {tag}` and counts the
+/// connections it accepted and the requests it answered.
+async fn spawn_counting_backend(tag: &'static str) -> (SocketAddr, Arc<Counts>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let counts = Arc::new(Counts::default());
+    let seen = Arc::clone(&counts);
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            seen.connections
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let seen = Arc::clone(&seen);
+            tokio::spawn(async move {
+                let service = service_fn(move |request: Request<Incoming>| {
+                    let seen = Arc::clone(&seen);
+                    async move {
+                        let _ = request.into_body().collect().await;
+                        seen.requests
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(format!(
+                            "backend: {tag}\n"
+                        )))))
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (addr, counts)
+}
+
+/// A backend that reads a request, writes `reply` (possibly nothing) and then
+/// goes silent with the connection open, like a VM that lost power. Counts
+/// the requests it read.
+async fn spawn_stalling_backend(reply: &'static [u8]) -> (SocketAddr, Arc<Counts>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let counts = Arc::new(Counts::default());
+    let seen = Arc::clone(&counts);
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((mut stream, _)) = listener.accept().await {
+            seen.connections
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut buffer = [0_u8; 4096];
+            if matches!(stream.read(&mut buffer).await, Ok(read) if read > 0) {
+                seen.requests
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = stream.write_all(reply).await;
+            }
+            held.push(stream);
+        }
+    });
+    (addr, counts)
+}
+
+/// Waits until `check` holds, for at most 5 s.
+async fn wait_for(mut check: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !check() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "condition not reached in 5 s"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// An edge route whose response timeout is far longer than any test waits,
+/// so a fast answer proves the request was cancelled, not timed out.
+fn slow_edge_route(host: &str, backends: Vec<SocketAddr>) -> Route {
+    Route {
+        hostname: host.to_string(),
+        backends,
+        tls: TlsMode::Acme,
+        retry: RetryPolicy::IdempotentOnce,
+        response_timeout: Some(Duration::from_secs(60)),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_get_waiting_on_a_backend_that_leaves_the_rotation_is_retried_on_another() {
+    let (stalled, stalled_counts) = spawn_stalling_backend(b"").await;
+    let (live, live_counts) = spawn_counting_backend("L").await;
+    let core = ProxyCore::new();
+    // The first request goes to the first backend: the one that stalls.
+    core.set_table(table(vec![slow_edge_route(
+        "edge.example.com",
+        vec![stalled, live],
+    )]));
+    let (addr, _shutdown, _handle) =
+        spawn_http(Arc::clone(&core), mode(TlsMode::Acme, "https", false)).await;
+
+    let started = std::time::Instant::now();
+    let pending = tokio::spawn(async move { get(&client(), addr, "edge.example.com", "/").await });
+    wait_for(|| stalled_counts.requests() == 1).await;
+    // The edge takes it out; its table still names it, as it does until the
+    // supervisor applies the next one.
+    core.backend_down(stalled);
+
+    let (status, body) = pending.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, "backend: L\n");
+    assert_eq!(live_counts.requests(), 1);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "took {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_post_waiting_on_a_backend_that_leaves_the_rotation_fails_fast_without_a_retry() {
+    let (stalled, stalled_counts) = spawn_stalling_backend(b"").await;
+    let (live, live_counts) = spawn_counting_backend("L").await;
+    let core = ProxyCore::new();
+    core.set_table(table(vec![slow_edge_route(
+        "edge.example.com",
+        vec![stalled, live],
+    )]));
+    let (addr, _shutdown, _handle) =
+        spawn_http(Arc::clone(&core), mode(TlsMode::Acme, "https", false)).await;
+
+    let started = std::time::Instant::now();
+    let pending = tokio::spawn(async move {
+        request(
+            &client(),
+            addr,
+            Some("edge.example.com"),
+            "POST",
+            "/",
+            Bytes::from_static(b"payload"),
+        )
+        .await
+    });
+    wait_for(|| stalled_counts.requests() == 1).await;
+    core.backend_down(stalled);
+
+    let (status, body) = pending.await.unwrap();
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body, "backend unavailable\n");
+    assert_eq!(live_counts.requests(), 0, "the POST was sent twice");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "took {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_response_already_streaming_is_cut_and_not_retried() {
+    let (stalled, stalled_counts) =
+        spawn_stalling_backend(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nfirst bytes").await;
+    let (live, live_counts) = spawn_counting_backend("L").await;
+    let core = ProxyCore::new();
+    core.set_table(table(vec![slow_edge_route(
+        "edge.example.com",
+        vec![stalled, live],
+    )]));
+    let (addr, _shutdown, _handle) =
+        spawn_http(Arc::clone(&core), mode(TlsMode::Acme, "https", false)).await;
+
+    let started = std::time::Instant::now();
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("http://{addr}/"))
+        .header(HOST, "edge.example.com")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let response = client().request(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(stalled_counts.requests(), 1);
+
+    let mut body = response.into_body();
+    let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert_eq!(&first[..], b"first bytes");
+
+    core.backend_down(stalled);
+    let rest = tokio::time::timeout(Duration::from_secs(5), body.collect())
+        .await
+        .expect("the body was not cut");
+    assert!(rest.is_err(), "the cut body ended cleanly");
+    assert_eq!(live_counts.requests(), 0, "a started response was retried");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "took {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pooled_connections_to_a_backend_taken_down_are_not_reused() {
+    let (backend, counts) = spawn_counting_backend("B").await;
+    let core = ProxyCore::new();
+    core.set_table(table(vec![slow_edge_route(
+        "edge.example.com",
+        vec![backend],
+    )]));
+    let (addr, _shutdown, _handle) =
+        spawn_http(Arc::clone(&core), mode(TlsMode::Acme, "https", false)).await;
+    let client = client();
+
+    for _ in 0..2 {
+        let (status, body) = get(&client, addr, "edge.example.com", "/").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    assert_eq!(counts.requests(), 2);
+    assert_eq!(
+        counts.connections(),
+        1,
+        "the edge did not pool its connection"
+    );
+
+    // The backend leaves the rotation and comes back: the next request must
+    // open a new connection instead of reusing the pooled one.
+    core.backend_down(backend);
+    let (status, body) = get(&client, addr, "edge.example.com", "/").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(counts.connections(), 2, "a pooled connection was reused");
+
+    // Dropping it from the table drops its pool too.
+    let (other, _) = spawn_counting_backend("O").await;
+    core.set_table(table(vec![slow_edge_route(
+        "edge.example.com",
+        vec![other],
+    )]));
+    core.set_table(table(vec![slow_edge_route(
+        "edge.example.com",
+        vec![backend],
+    )]));
+    let (status, body) = get(&client, addr, "edge.example.com", "/").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        counts.connections(),
+        3,
+        "a pooled connection survived the table"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_route_is_not_cancelled_by_backend_down() {
+    // Node routes keep their behaviour: only edge requests watch the rotation.
+    let (stalled, stalled_counts) =
+        spawn_stalling_backend(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n").await;
+    let core = ProxyCore::new();
+    core.set_table(table(vec![route(
+        "node.example.com",
+        vec![stalled],
+        TlsMode::Acme,
+    )]));
+    let (addr, _shutdown, _handle) =
+        spawn_http(Arc::clone(&core), mode(TlsMode::Acme, "https", false)).await;
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("http://{addr}/"))
+        .header(HOST, "node.example.com")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let response = client().request(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(stalled_counts.requests(), 1);
+    core.backend_down(stalled);
+    let body =
+        tokio::time::timeout(Duration::from_millis(300), response.into_body().collect()).await;
+    assert!(body.is_err(), "a node response was cut by backend_down");
+}

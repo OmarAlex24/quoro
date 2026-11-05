@@ -12,7 +12,11 @@
 //!
 //! The manager pushes the in-rotation backends to the [`IngressSupervisor`] as
 //! edge routes after every snapshot and every rotation change, so a health
-//! decision takes effect without waiting for the primary. Its decisions never
+//! decision takes effect without waiting for the primary. A backend that
+//! leaves the rotation is also handed to [`IngressSupervisor::backend_down`],
+//! which drops its pooled connections and cancels the requests still waiting
+//! on it, so none of them waits for the response timeout. A backend that
+//! leaves the spec (a deployment) is not: its requests finish normally. Its decisions never
 //! change replicated state; they reach the primary only through
 //! `status_report.edge_backends`.
 
@@ -486,21 +490,29 @@ impl EdgeManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut changed = false;
+        let mut gone: Vec<SocketAddr> = Vec::new();
         for (key, result) in results {
             let Some(rotation) = state.rotations.get_mut(&key) else {
                 continue;
             };
             let failures = rotation.probe.failures;
-            changed |= match result {
+            let flipped = match result {
                 Ok(()) => rotation.record_pass(&now, failures),
                 Err(error) => rotation.record_failure(&now, failures, &error),
             };
+            if flipped && !rotation.in_rotation {
+                gone.push(rotation.addr);
+            }
+            changed |= flipped;
         }
         if changed {
             let tables = state.tables();
             let tunnel = state.tunnel.clone();
             drop(state);
             self.supervisor.update_edge(EdgeRoutes { tables, tunnel });
+            for backend in gone {
+                self.supervisor.backend_down(backend);
+            }
         }
     }
 }
@@ -540,6 +552,7 @@ impl BackendObserver for EdgeManager {
             let tunnel = state.tunnel.clone();
             drop(state);
             self.supervisor.update_edge(EdgeRoutes { tables, tunnel });
+            self.supervisor.backend_down(backend);
         }
     }
 }

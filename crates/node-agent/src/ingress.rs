@@ -749,6 +749,8 @@ pub struct IngressSupervisor {
     status: Arc<RwLock<BTreeMap<String, HostStatus>>>,
     dns: Arc<DnsBridge>,
     observer: Arc<RwLock<Option<Arc<dyn BackendObserver>>>>,
+    /// The proxy cores currently running, for [`Self::backend_down`].
+    cores: Arc<RwLock<Vec<Arc<ProxyCore>>>>,
     shutdown: watch::Sender<bool>,
     task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -764,6 +766,7 @@ impl IngressSupervisor {
         let (event_tx, event_rx) = mpsc::channel(256);
         let status = Arc::new(RwLock::new(BTreeMap::new()));
         let observer = Arc::new(RwLock::new(None));
+        let cores = Arc::new(RwLock::new(Vec::new()));
         let task = tokio::spawn(supervise(
             config,
             Arc::clone(&dns),
@@ -774,6 +777,7 @@ impl IngressSupervisor {
             event_tx,
             Arc::clone(&status),
             Arc::clone(&observer),
+            Arc::clone(&cores),
             event_rx,
         ));
         Self {
@@ -782,6 +786,7 @@ impl IngressSupervisor {
             status,
             dns,
             observer,
+            cores,
             shutdown,
             task: Mutex::new(Some(task)),
         }
@@ -818,6 +823,21 @@ impl IngressSupervisor {
     /// collision. Never blocks the edge manager: the newest set wins.
     pub fn update_edge(&self, routes: EdgeRoutes) {
         let _ = self.edge.send_replace(routes);
+    }
+
+    /// Tells every running proxy core that `backend` left the rotation: its
+    /// pooled connections are dropped and the edge requests in flight to it
+    /// are cancelled ([`ProxyCore::backend_down`]). Called directly rather
+    /// than through the route channel, which keeps only the newest value.
+    pub fn backend_down(&self, backend: SocketAddr) {
+        let cores = self
+            .cores
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for core in cores {
+            core.backend_down(backend);
+        }
     }
 
     /// The certificate state of every route, in `status_report` shape.
@@ -885,6 +905,8 @@ struct Runtime {
     event_tx: mpsc::Sender<IngressEvent>,
     status: Arc<RwLock<BTreeMap<String, HostStatus>>>,
     observer: Arc<RwLock<Option<Arc<dyn BackendObserver>>>>,
+    /// Shared with the supervisor handle; refreshed after every apply.
+    cores: Arc<RwLock<Vec<Arc<ProxyCore>>>>,
     tunnel: Option<TunnelIngress>,
     running: Option<TunnelIdentity>,
     public: Option<PublicIngress<SessionDns>>,
@@ -913,6 +935,7 @@ async fn supervise(
     event_tx: mpsc::Sender<IngressEvent>,
     status: Arc<RwLock<BTreeMap<String, HostStatus>>>,
     observer: Arc<RwLock<Option<Arc<dyn BackendObserver>>>>,
+    cores: Arc<RwLock<Vec<Arc<ProxyCore>>>>,
     mut event_rx: mpsc::Receiver<IngressEvent>,
 ) {
     let mut runtime = Runtime {
@@ -922,6 +945,7 @@ async fn supervise(
         event_tx,
         status,
         observer,
+        cores,
         tunnel: None,
         running: None,
         public: None,
@@ -984,6 +1008,21 @@ impl Runtime {
         self.apply_tunnel(tunnel, &tables.tunnel).await;
         self.apply_public(&tables.acme).await;
         self.record_statuses(&tables);
+        self.publish_cores();
+    }
+
+    /// Hands the supervisor handle the proxy cores now running.
+    fn publish_cores(&self) {
+        let cores: Vec<Arc<ProxyCore>> = self
+            .tunnel
+            .iter()
+            .map(|tunnel| Arc::clone(tunnel.core()))
+            .chain(self.public.iter().map(|public| Arc::clone(public.core())))
+            .collect();
+        *self
+            .cores
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = cores;
     }
 
     /// Attaches the backend observer to any proxy core that is already
