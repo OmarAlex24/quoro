@@ -1124,3 +1124,173 @@ async fn a_node_route_is_not_cancelled_by_backend_down() {
         tokio::time::timeout(Duration::from_millis(300), response.into_body().collect()).await;
     assert!(body.is_err(), "a node response was cut by backend_down");
 }
+
+/// A keep-alive backend that answers `backend: {tag}` until `dead` is set.
+/// After that it reads the next request on each open connection and closes
+/// that connection without answering, as a process does when it dies
+/// gracefully. `rst` makes the close a reset instead of a clean close.
+async fn spawn_dying_backend(
+    tag: &'static str,
+    rst: bool,
+) -> (SocketAddr, Arc<std::sync::atomic::AtomicBool>, Arc<Counts>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let counts = Arc::new(Counts::default());
+    let (flag, seen) = (Arc::clone(&dead), Arc::clone(&counts));
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            seen.connections
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (flag, seen) = (Arc::clone(&flag), Arc::clone(&seen));
+            tokio::spawn(async move {
+                let mut buffer = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                loop {
+                    while !buffer.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+                        }
+                    }
+                    buffer.clear();
+                    seen.requests
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        if rst {
+                            let _ = stream.set_zero_linger();
+                        }
+                        return;
+                    }
+                    let body = format!("backend: {tag}\n");
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    if stream.write_all(reply.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (addr, dead, counts)
+}
+
+/// Sends one request to warm a pooled connection to each of `backends`,
+/// in round-robin order.
+async fn warm(client: &TestClient, addr: SocketAddr, backends: usize) {
+    for _ in 0..backends {
+        let (status, body) = get(client, addr, "edge.example.com", "/").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_get_on_a_pooled_connection_lost_before_the_response_is_retried() {
+    for rst in [false, true] {
+        let (dying, dead, dying_counts) = spawn_dying_backend("D", rst).await;
+        let (live, live_counts) = spawn_counting_backend("L").await;
+        let observer = Arc::new(RecordingObserver::default());
+        let core = ProxyCore::new();
+        core.set_observer(Arc::clone(&observer) as Arc<dyn BackendObserver>);
+        core.set_table(table(vec![slow_edge_route(
+            "edge.example.com",
+            vec![dying, live],
+        )]));
+        let (addr, _shutdown, _handle) =
+            spawn_http(Arc::clone(&core), mode(TlsMode::Acme, "https", false)).await;
+        let client = client();
+        warm(&client, addr, 2).await;
+        assert_eq!(dying_counts.connections(), 1);
+
+        // The next request goes to the dying backend, over its pooled
+        // connection, which is lost before any response.
+        dead.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (status, body) = get(&client, addr, "edge.example.com", "/").await;
+        assert_eq!(status, StatusCode::OK, "rst={rst}: {body}");
+        assert_eq!(body, "backend: L\n", "rst={rst}");
+        assert_eq!(dying_counts.requests(), 2, "rst={rst}");
+        assert_eq!(live_counts.requests(), 2, "rst={rst}");
+
+        // A reset takes the backend out at once; a clean close does not,
+        // since a healthy backend closes idle keep-alive connections too.
+        let failures = observer.failures.lock().unwrap().clone();
+        if rst {
+            assert!(
+                failures.iter().any(|(_, backend, _)| *backend == dying),
+                "{failures:?}"
+            );
+        } else {
+            assert!(failures.is_empty(), "{failures:?}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_that_resets_its_own_upload_does_not_take_the_backend_out() {
+    let (backend, _counts) = spawn_counting_backend("B").await;
+    let observer = Arc::new(RecordingObserver::default());
+    let core = ProxyCore::new();
+    core.set_observer(Arc::clone(&observer) as Arc<dyn BackendObserver>);
+    core.set_table(table(vec![slow_edge_route(
+        "edge.example.com",
+        vec![backend],
+    )]));
+    let (addr, _shutdown, _handle) =
+        spawn_http(Arc::clone(&core), mode(TlsMode::Acme, "https", false)).await;
+
+    // Promise a 1000-byte body, send 10 bytes, then reset the connection.
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            b"POST / HTTP/1.1\r\nHost: edge.example.com\r\nContent-Length: 1000\r\n\r\n0123456789",
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    stream.set_zero_linger().unwrap();
+    drop(stream);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let failures = observer.failures.lock().unwrap().clone();
+    assert!(
+        failures.is_empty(),
+        "a client's reset blamed the backend: {failures:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_post_on_a_pooled_connection_lost_before_the_response_is_not_retried() {
+    for rst in [false, true] {
+        let (dying, dead, dying_counts) = spawn_dying_backend("D", rst).await;
+        let (live, live_counts) = spawn_counting_backend("L").await;
+        let core = ProxyCore::new();
+        core.set_table(table(vec![slow_edge_route(
+            "edge.example.com",
+            vec![dying, live],
+        )]));
+        let (addr, _shutdown, _handle) =
+            spawn_http(Arc::clone(&core), mode(TlsMode::Acme, "https", false)).await;
+        let client = client();
+        warm(&client, addr, 2).await;
+
+        dead.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (status, body) = request(
+            &client,
+            addr,
+            Some("edge.example.com"),
+            "POST",
+            "/",
+            Bytes::from_static(b"payload"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "rst={rst}: {body}");
+        assert_eq!(dying_counts.requests(), 2, "rst={rst}");
+        assert_eq!(
+            live_counts.requests(),
+            1,
+            "rst={rst}: the POST was sent twice"
+        );
+    }
+}

@@ -156,7 +156,8 @@ impl ProxyCore {
     }
 
     /// Reports a backend failure to the observer, when there is one and the
-    /// error means the connection could not be opened or was reset.
+    /// error means the connection could not be opened or died
+    /// ([`is_reset_failure`]): reset, aborted, or given up on by the socket.
     fn observe_failure(
         &self,
         hostname: &str,
@@ -697,7 +698,7 @@ async fn handle_request(
             }
             Attempt::Failed(error) => {
                 let sent = state.started.load(Ordering::SeqCst);
-                tracing::debug!(host = %host, backend = %backend, sent, error = %error, "backend request failed");
+                tracing::debug!(host = %host, backend = %backend, sent, error = ?error, "backend request failed");
                 core.observe_failure(&host, backend, &error);
                 match route.retry {
                     RetryPolicy::Unsent => {
@@ -706,8 +707,11 @@ async fn handle_request(
                         }
                     }
                     RetryPolicy::IdempotentOnce => {
-                        let retry =
-                            is_connect_failure(&error) || (is_reset_failure(&error) && replayable);
+                        // No response headers came: whatever lost the
+                        // connection, a `GET` or `HEAD` whose body can be
+                        // sent again is safe to send to another backend.
+                        let retry = is_connect_failure(&error)
+                            || (is_connection_lost(&error) && replayable);
                         if !idempotent || !retry {
                             break;
                         }
@@ -1079,29 +1083,71 @@ fn is_connect_failure(error: &hyper_util::client::legacy::Error) -> bool {
     error.is_connect()
 }
 
-/// Whether a legacy client error carries an I/O reset, abort or socket
-/// timeout. It arrives after the connection existed, so it is not a connect
-/// failure, but it still means the backend never sent a response. A socket
-/// timeout is `TCP_USER_TIMEOUT` or keepalive giving up on a dead peer, not the
-/// proxy's response timeout.
+/// The causes of a legacy client error that come from the backend connection.
+///
+/// A hyper "user" error wraps a failure of the request body, which is the
+/// downstream client's body: a client that reset its own upload says nothing
+/// about the backend, so the walk stops there.
+fn backend_causes(
+    error: &hyper_util::client::legacy::Error,
+) -> impl Iterator<Item = &(dyn std::error::Error + 'static)> {
+    let mut next = std::error::Error::source(error);
+    std::iter::from_fn(move || {
+        let current = next?;
+        if current
+            .downcast_ref::<hyper::Error>()
+            .is_some_and(hyper::Error::is_user)
+        {
+            next = None;
+            return None;
+        }
+        next = current.source();
+        Some(current)
+    })
+}
+
+/// Whether a legacy client error means the backend's connection died: a
+/// reset or abort, or the socket giving up on a peer that stopped answering.
+/// That is `TCP_USER_TIMEOUT` or keepalive (`TimedOut`), or, when the peer's
+/// host reported it gone with ICMP, `HostUnreachable` or `NetworkUnreachable`:
+/// Linux reports that soft error instead of `ETIMEDOUT` when the user timeout
+/// fires. The proxy's own response timeout is not one of these.
+///
+/// Such a failure takes the backend out of the rotation at once.
 fn is_reset_failure(error: &hyper_util::client::legacy::Error) -> bool {
     use std::io::ErrorKind;
 
-    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(error);
-    while let Some(error) = source {
-        if let Some(io) = error.downcast_ref::<std::io::Error>()
-            && matches!(
+    backend_causes(error).any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
                 io.kind(),
                 ErrorKind::ConnectionReset
                     | ErrorKind::ConnectionAborted
                     | ErrorKind::BrokenPipe
                     | ErrorKind::UnexpectedEof
+                    | ErrorKind::NotConnected
                     | ErrorKind::TimedOut
+                    | ErrorKind::HostUnreachable
+                    | ErrorKind::NetworkUnreachable
+                    | ErrorKind::NetworkDown
             )
-        {
-            return true;
-        }
-        source = error.source();
-    }
-    false
+        })
+    })
+}
+
+/// Whether a legacy client error means the backend connection was lost
+/// before a response: any I/O error on it, or a connection that closed
+/// before the response arrived. A replayable `GET` or `HEAD` is retried on
+/// another backend after one of these.
+///
+/// A clean close is not reported to the observer: a backend that closes an
+/// idle keep-alive connection just as the edge reuses it is healthy.
+fn is_connection_lost(error: &hyper_util::client::legacy::Error) -> bool {
+    is_reset_failure(error)
+        || backend_causes(error).any(|cause| {
+            cause.is::<std::io::Error>()
+                || cause.downcast_ref::<hyper::Error>().is_some_and(|hyper| {
+                    hyper.is_incomplete_message() || hyper.is_closed() || hyper.is_canceled()
+                })
+        })
 }
