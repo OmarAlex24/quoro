@@ -284,9 +284,10 @@ System records, with `actor_type` `system`, `channel` `system` and no `scope`:
 
 | `operation` | `actor_id` | `target_type` / `target_id` | When |
 | --- | --- | --- | --- |
-| `backup.dispatch` | `backups` | `backup` / the backup | A scheduled backup (`trigger: schedule` or `upgrade`) is queued |
+| `backup.dispatch` | `backups` | `backup` / the backup | A scheduled backup (`trigger: schedule`) is queued, or a pre-upgrade backup (`trigger: upgrade`) is recorded |
 | `backup.seal` | `backups` | `backup` / the backup | The primary sealed a backup (`ok`) or recorded it failed (`error`, `result_detail` the reason) |
 | `backup.prune` | `backups` | `backup` / the backup | Retention removed its seal and manifest |
+| `backup.upgrade_skipped` | `backups` | `backup_repository` / the repository | The primary migrated without the pre-upgrade backup because the operator passed `--skip-upgrade-backup` (backup-format.md section 7.2); `params` is `{from_schema_version, to_schema_version}` |
 | `backup.gc` | `backups` | `backup_repository` / the repository | A garbage-collection sweep ran; `params` holds the counts of objects it deleted |
 | `lease.grant` | `leases` | `app` / the app | A `local` lease was granted at placement or after a restore; `params` is `{node_id, fencing_token}` |
 | `lease.revoke` | `leases` | `app` / the app | A lease was revoked with reason `moved` or `deleted`; `params` is `{node_id, fencing_token, reason}` |
