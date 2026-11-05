@@ -578,7 +578,7 @@ async fn build_specs(
     env_cache: &mut HashMap<String, BTreeMap<String, String>>,
 ) -> Result<Vec<SpecBuild>, String> {
     let rows = sqlx::query(
-        "SELECT b.id, b.app_id, a.project_id, b.source, b.error, \
+        "SELECT b.id, b.app_id, a.project_id, b.source, b.error, b.refresh_base, \
                 b.status IN ('failed', 'cancelled') AS kept \
          FROM builds b JOIN apps a ON a.id = b.app_id \
          WHERE b.node_id = ? AND ( \
@@ -602,6 +602,7 @@ async fn build_specs(
         let source: String = row.try_get("source").map_err(|e| e.to_string())?;
         let error: Option<String> = row.try_get("error").map_err(|e| e.to_string())?;
         let kept: bool = row.try_get("kept").map_err(|e| e.to_string())?;
+        let refresh_base: bool = row.try_get("refresh_base").map_err(|e| e.to_string())?;
         let source: AppSource = serde_json::from_str(&source)
             .map_err(|e| format!("the source snapshot of {build_id} is invalid: {e}"))?;
         let env = app_env_of(conn, data_key, &app_id, env_cache).await?;
@@ -640,6 +641,7 @@ async fn build_specs(
             secrets,
             limits: BuildLimits::default(),
             cancelled: kept || error.as_deref() == Some(crate::build::CANCEL_REQUESTED),
+            refresh_base,
         });
     }
     Ok(builds)

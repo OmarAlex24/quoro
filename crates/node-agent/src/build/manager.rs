@@ -697,6 +697,7 @@ impl<E: Engine + 'static, B: Builder + 'static> BuildManager<E, B> {
             build_args: build.build_args.clone(),
             secrets: build.secrets.clone(),
             limits: build.limits,
+            refresh_base: build.refresh_base,
             net: BuilderNet {
                 ip,
                 gateway: subnet.gateway,
@@ -1303,6 +1304,7 @@ mod tests {
             secrets: BTreeMap::new(),
             limits: BuildLimits::default(),
             cancelled: false,
+            refresh_base: false,
         }
     }
 

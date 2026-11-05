@@ -2882,6 +2882,7 @@ mod tests {
             secrets: std::collections::BTreeMap::new(),
             limits: BuildLimits::default(),
             cancelled: false,
+            refresh_base: false,
         }
     }
 

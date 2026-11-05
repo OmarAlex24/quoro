@@ -77,6 +77,9 @@ pub struct BuildSpec {
     /// Secret id to plaintext value. Never logged: `Debug` prints the ids.
     pub secrets: BTreeMap<String, String>,
     pub limits: BuildLimits,
+    /// Resolve every base image again from its registry instead of the
+    /// cached copy (`image-resolve-mode=pull`, ADR 0150). Added in M5a.
+    pub refresh_base: bool,
     /// The builder VM's address on the node bridge, chosen by the manager so
     /// it never collides with an app VM.
     pub net: BuilderNet,
@@ -103,6 +106,7 @@ impl std::fmt::Debug for BuildSpec {
             .field("build_args", &self.build_args)
             .field("secrets", &secrets)
             .field("limits", &self.limits)
+            .field("refresh_base", &self.refresh_base)
             .field("net", &self.net)
             .finish()
     }

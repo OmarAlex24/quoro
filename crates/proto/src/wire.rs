@@ -1107,6 +1107,12 @@ pub struct SpecBuild {
     pub secrets: BTreeMap<String, String>,
     pub limits: BuildLimits,
     pub cancelled: bool,
+    /// Resolve every base image again from its registry
+    /// (`image-resolve-mode=pull`) instead of the builder's cached copy, so a
+    /// patched base is picked up (section 5.2, ADR 0150). Added in M5a;
+    /// absent means false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub refresh_base: bool,
 }
 
 impl std::fmt::Debug for SpecBuild {
@@ -1125,6 +1131,7 @@ impl std::fmt::Debug for SpecBuild {
             .field("secrets", &secrets)
             .field("limits", &self.limits)
             .field("cancelled", &self.cancelled)
+            .field("refresh_base", &self.refresh_base)
             .finish()
     }
 }

@@ -299,6 +299,11 @@ impl<E: Engine + 'static> DockerfileBuilder<E> {
             build.push_str(" --opt ");
             build.push_str(&sh_quote(&format!("target={target}")));
         }
+        // A patched base is picked up only when BuildKit asks the registry
+        // again for every `FROM` (ADR 0150).
+        if spec.refresh_base {
+            build.push_str(" --opt image-resolve-mode=pull");
+        }
         for (name, value) in &plan.build_args {
             build.push_str(" --opt ");
             build.push_str(&sh_quote(&format!("build-arg:{name}={value}")));
@@ -1392,6 +1397,7 @@ mod tests {
                 cache_gb: 1,
                 output_gb: 1,
             },
+            refresh_base: false,
             net: BuilderNet {
                 ip: Ipv4Addr::new(10, 42, 1, 7),
                 gateway: Ipv4Addr::new(10, 42, 1, 1),
@@ -1766,6 +1772,28 @@ mod tests {
         let script = builder.script(&spec, &plan);
         assert!(!script.contains("/dev/shm/q secrets"));
         assert!(!script.contains("--secret"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refresh_base_resolves_every_base_image_again() {
+        let root = scratch("script-refresh-base");
+        let engine = Arc::new(FakeEngine::new());
+        let builder = DockerfileBuilder::new(engine, config(&root));
+        let mut spec = build_spec("https://example.invalid/repo.git");
+        let plan = validate_spec(&spec).expect("a valid spec");
+        assert!(!builder.script(&spec, &plan).contains("image-resolve-mode"));
+        spec.refresh_base = true;
+        let script = builder.script(&spec, &plan);
+        assert_eq!(script.matches(" --opt image-resolve-mode=pull").count(), 1);
+        let build_line = script
+            .lines()
+            .find(|line| line.starts_with("buildctl build "))
+            .expect("the build line");
+        assert!(
+            build_line.contains("--opt image-resolve-mode=pull"),
+            "{build_line}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

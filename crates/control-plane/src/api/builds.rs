@@ -648,15 +648,15 @@ async fn start_build_tx(
     refresh_base: bool,
     params: &Value,
 ) -> Result<(Build, i64), ApiError> {
-    // Refreshing the base images needs the builder change of the
-    // vulnerability epic (ADR 0150); until it ships the flag is refused.
-    if refresh_base {
-        return Err(ApiError::validation(
-            "refresh_base is not supported yet: builds reuse the cached base images",
-        ));
-    }
     let mut w = state.store.begin_write().await?;
-    let started = build::start_build(&mut w.tx, app_id, git_ref, &ctx.identity.actor()).await?;
+    let started = build::start_build(
+        &mut w.tx,
+        app_id,
+        git_ref,
+        refresh_base,
+        &ctx.identity.actor(),
+    )
+    .await?;
     ctx.append_ok(
         &mut w.tx,
         Some(Scope::AppDeploy),
