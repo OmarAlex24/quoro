@@ -13,6 +13,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
+pub mod inventory;
 pub mod jcs;
 pub mod metrics;
 pub mod sign;

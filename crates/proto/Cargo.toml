@@ -18,3 +18,6 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast", "zeroize"] }
 # Keys and signatures travel as standard base64 (section 2.4).
 base64 = { version = "0.22", default-features = false, features = ["std"] }
+# `inventory_sha256` is the SHA-256 of the canonical inventory object
+# (sections 5.26 and 6.11).
+sha2 = { version = "0.10", default-features = false }

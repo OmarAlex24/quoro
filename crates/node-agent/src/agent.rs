@@ -83,6 +83,9 @@ pub async fn run<E: Engine + 'static>(
     // sampler and the interactive sessions read the running VMs.
     let engine = Arc::new(engine);
     let capabilities = engine.capabilities().await;
+    // One inventory hub serves the reconciler, the build manager and the
+    // session (sections 5.26, 6.11).
+    let inventory = crate::inventory::InventoryHub::new(Arc::clone(&engine));
     let node_id = identity.get().node_id;
     let cluster_id = identity.get().cluster_id;
     let (desired, desired_rx) = watch::channel(current.clone());
@@ -115,7 +118,8 @@ pub async fn run<E: Engine + 'static>(
     let reconciler = reconciler
         .with_node_id(node_id)
         .with_lease_view(leases.view.clone())
-        .with_ingress(Arc::clone(&ingress));
+        .with_ingress(Arc::clone(&ingress))
+        .with_inventory(inventory.clone());
     let volume_statuses = reconciler.volume_statuses();
 
     // Metrics stay in memory on this node (ADR 0014): the sampler fills a ring
@@ -137,6 +141,7 @@ pub async fn run<E: Engine + 'static>(
         },
     ));
     let (manager, builds) = BuildManager::new(Arc::clone(&engine), builder, store.clone());
+    let manager = manager.with_inventory(inventory.clone());
 
     // Backups and restores run beside the apply loop, one task per job
     // (section 6.7, ADR 0147). The repository is opened per job, so the
@@ -211,7 +216,8 @@ pub async fn run<E: Engine + 'static>(
     .with_metrics(metrics)
     .with_edge(Arc::clone(&edge))
     .with_mesh_key(mesh_public_key)
-    .with_interactive(interactive);
+    .with_interactive(interactive)
+    .with_inventory(inventory);
     let outcome = session.run(stop_rx).await;
 
     leases.abort();

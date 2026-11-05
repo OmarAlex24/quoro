@@ -4,6 +4,7 @@
 //! ```text
 //! <root>/<64hex>/rootfs.ext4
 //! <root>/<64hex>/image.json
+//! <root>/<64hex>/inventory.json     (from M5a; absent for older entries)
 //! <root>/.tmp-<64hex>-<pid>-<counter>/{blobs,staging,rootfs.ext4,image.json}
 //! ```
 //!
@@ -17,7 +18,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::image::registry::digest_hex;
-use crate::{EngineError, ImageConfig, ImageDigest, ImageRef, PreparedImage};
+use crate::{
+    EngineError, ImageConfig, ImageDigest, ImageInventory, ImageRef, InventoryPackage,
+    PreparedImage,
+};
 
 /// Scratch directories all share this prefix.
 const TMP_PREFIX: &str = ".tmp-";
@@ -138,6 +142,99 @@ pub(crate) fn read(
         size_bytes: metadata.len(),
         config,
     }))
+}
+
+/// `inventory.json`: the image's package inventory (engine-trait.md §3.21).
+#[derive(Debug, Deserialize, Serialize)]
+struct CachedInventory {
+    digest: String,
+    os: Option<(String, String)>,
+    ecosystems: Vec<String>,
+    not_inventoried: Vec<String>,
+    packages: Vec<CachedPackage>,
+    inventoried_at: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct CachedPackage {
+    ecosystem: String,
+    name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_name: Option<String>,
+    version: String,
+    purl: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+}
+
+/// Writes `<dir>/inventory.json`.
+pub(crate) fn write_inventory(dir: &Path, inventory: &ImageInventory) -> Result<(), EngineError> {
+    let cached = CachedInventory {
+        digest: inventory.digest.0.clone(),
+        os: inventory.os.clone(),
+        ecosystems: inventory.ecosystems.clone(),
+        not_inventoried: inventory.not_inventoried.clone(),
+        packages: inventory
+            .packages
+            .iter()
+            .map(|p| CachedPackage {
+                ecosystem: p.ecosystem.clone(),
+                name: p.name.clone(),
+                source_name: p.source_name.clone(),
+                version: p.version.clone(),
+                purl: p.purl.clone(),
+                path: p.path.clone(),
+            })
+            .collect(),
+        inventoried_at: inventory.inventoried_at.clone(),
+    };
+    let bytes = serde_json::to_vec(&cached)
+        .map_err(|err| EngineError::Io(format!("serializing the image inventory: {err}")))?;
+    let path = dir.join("inventory.json");
+    std::fs::write(&path, bytes).map_err(|err| io_error(&path, &err))
+}
+
+/// Reads the committed inventory of `digest`: `NotFound` when the image is
+/// not cached or was cached before inventories existed (§3.21).
+pub(crate) fn read_inventory(
+    root: &Path,
+    digest: &ImageDigest,
+) -> Result<ImageInventory, EngineError> {
+    let hex = digest_hex(&digest.0)?;
+    let dir = root.join(hex);
+    if !dir.join("image.json").exists() {
+        return Err(EngineError::NotFound);
+    }
+    let path = dir.join("inventory.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(EngineError::NotFound);
+        }
+        Err(err) => return Err(io_error(&path, &err)),
+    };
+    let cached: CachedInventory = serde_json::from_slice(&bytes).map_err(|err| {
+        EngineError::Image(format!("inventory {} is malformed: {err}", path.display()))
+    })?;
+    Ok(ImageInventory {
+        digest: ImageDigest(cached.digest),
+        os: cached.os,
+        ecosystems: cached.ecosystems,
+        not_inventoried: cached.not_inventoried,
+        packages: cached
+            .packages
+            .into_iter()
+            .map(|p| InventoryPackage {
+                ecosystem: p.ecosystem,
+                name: p.name,
+                source_name: p.source_name,
+                version: p.version,
+                purl: p.purl,
+                path: p.path,
+            })
+            .collect(),
+        inventoried_at: cached.inventoried_at,
+    })
 }
 
 /// Commits `tmp` as `<root>/<hex>` by renaming it into place.

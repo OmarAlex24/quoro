@@ -145,6 +145,8 @@ pub struct BuildManager<E: Engine, B: Builder> {
     tick: Duration,
     wait_base: Duration,
     wait_max: Duration,
+    /// The image-inventory transport, when the agent runs one (section 5.26).
+    inventory: Option<crate::inventory::InventoryHub>,
 }
 
 impl<E: Engine + 'static, B: Builder + 'static> BuildManager<E, B> {
@@ -167,6 +169,7 @@ impl<E: Engine + 'static, B: Builder + 'static> BuildManager<E, B> {
             tick: DEFAULT_TICK,
             wait_base: WAIT_BASE,
             wait_max: WAIT_MAX,
+            inventory: None,
         };
         let handle = BuildsHandle {
             store,
@@ -188,6 +191,14 @@ impl<E: Engine + 'static, B: Builder + 'static> BuildManager<E, B> {
     pub fn with_wait_backoff(mut self, base: Duration, max: Duration) -> Self {
         self.wait_base = base;
         self.wait_max = max;
+        self
+    }
+
+    /// Attaches the inventory transport: every image this manager imports
+    /// queues its inventory for the session (section 5.26).
+    #[must_use]
+    pub fn with_inventory(mut self, inventory: crate::inventory::InventoryHub) -> Self {
+        self.inventory = Some(inventory);
         self
     }
 
@@ -712,6 +723,7 @@ impl<E: Engine + 'static, B: Builder + 'static> BuildManager<E, B> {
             logs: Arc::clone(&self.logs),
             changes: self.changes.clone(),
             done: done.clone(),
+            inventory: self.inventory.clone(),
         };
         tokio::spawn(task.run(row, spec, cancel_rx, waiting));
         self.running = Some(Running {
@@ -777,6 +789,7 @@ struct BuildTask<E: Engine, B: Builder> {
     logs: Arc<BuildLogs>,
     changes: watch::Sender<u64>,
     done: mpsc::Sender<Done>,
+    inventory: Option<crate::inventory::InventoryHub>,
 }
 
 impl<E: Engine, B: Builder> BuildTask<E, B> {
@@ -893,6 +906,9 @@ impl<E: Engine, B: Builder> BuildTask<E, B> {
         let layout_digest = output.layout.manifest_digest.clone();
         match self.engine.prepare_layout(&output.layout).await {
             Ok(prepared) if prepared.digest == layout_digest => {
+                if let Some(hub) = &self.inventory {
+                    hub.notify_prepared(prepared.digest.clone());
+                }
                 row.status = BuildState::Succeeded;
                 row.image_digest = Some(prepared.digest.0.clone());
                 let line = format!("build succeeded: {}", prepared.digest.0);

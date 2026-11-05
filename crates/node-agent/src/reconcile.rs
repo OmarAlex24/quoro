@@ -271,6 +271,8 @@ pub struct Reconciler<E: Engine> {
     volumes_out: watch::Sender<Vec<VolumeStatus>>,
     /// The volumes that are `ready` on this node in the current pass.
     ready_volumes: HashSet<String>,
+    /// The image-inventory transport, when the agent runs one (section 5.26).
+    inventory: Option<crate::inventory::InventoryHub>,
 }
 
 impl<E: Engine + 'static> Reconciler<E> {
@@ -306,6 +308,7 @@ impl<E: Engine + 'static> Reconciler<E> {
                 lease: LeaseView::default(),
                 volumes_out,
                 ready_volumes: HashSet::new(),
+                inventory: None,
             },
             receiver,
         )
@@ -339,6 +342,14 @@ impl<E: Engine + 'static> Reconciler<E> {
     #[must_use]
     pub fn with_node_id(mut self, node_id: String) -> Self {
         self.node_id = Some(node_id);
+        self
+    }
+
+    /// Attaches the inventory transport: every image this reconciler prepares
+    /// queues its inventory for the session (section 5.26).
+    #[must_use]
+    pub fn with_inventory(mut self, inventory: crate::inventory::InventoryHub) -> Self {
+        self.inventory = Some(inventory);
         self
     }
 
@@ -1137,6 +1148,9 @@ impl<E: Engine + 'static> Reconciler<E> {
                 return None;
             }
         };
+        if let Some(hub) = &self.inventory {
+            hub.notify_prepared(prepared.digest.clone());
+        }
         self.deployment_line(
             vm,
             "rootfs",

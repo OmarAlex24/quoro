@@ -314,6 +314,7 @@ fn status_report(applied_rev: u64, volumes: Vec<VolumeStatus>) -> NodeMessage {
         builds: Vec::new(),
         edge_backends: Vec::new(),
         backups: Vec::new(),
+        images: Vec::new(),
         volumes,
     })
 }

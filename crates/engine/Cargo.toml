@@ -24,6 +24,9 @@ futures-core = { version = "0.3", default-features = false }
 # copy). Its library is pure Rust with no dependencies, so it builds on any
 # platform; `FakeEngine::exec` validates requests with it.
 quoro-init = { path = "../init" }
+# gzip layers on Linux, and the zlib-compressed `cargo auditable` section of
+# Rust binaries in the image inventory (pure-Rust miniz_oxide backend).
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 # Everything below backs the Linux-only modules (`image`, `boot`, `pins`, and
 # the Cloud Hypervisor backend). The trait and `FakeEngine` above still build
@@ -48,8 +51,6 @@ oci-client = { version = "0.18", default-features = false, features = [
 sha2 = { version = "0.11", default-features = false }
 # Layer tarballs; entries are applied by hand, never with `unpack`.
 tar = { version = "0.4", default-features = false }
-# gzip layers (pure-Rust miniz_oxide backend).
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # OCI image config, cached image metadata, Cloud Hypervisor's JSON API, and
 # the per-VM state files.
 serde = { version = "1", default-features = false, features = ["std", "derive"] }

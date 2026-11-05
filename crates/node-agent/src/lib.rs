@@ -18,6 +18,7 @@ pub mod health;
 pub mod identity;
 pub mod ingress;
 pub mod interactive;
+pub mod inventory;
 pub mod lease;
 pub mod localkey;
 pub mod logs;

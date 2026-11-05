@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::{EngineError, ImageDigest, ImageRef, PreparedImage};
+use crate::{EngineError, ImageDigest, ImageInventory, ImageRef, PreparedImage};
 
 pub(crate) mod cache;
 pub(crate) mod ext4;
@@ -33,6 +33,7 @@ pub(crate) mod layer;
 pub(crate) mod layout;
 pub(crate) mod oci;
 pub(crate) mod registry;
+pub(crate) mod tree;
 
 /// Lowercase hexadecimal encoding of `bytes`.
 pub(crate) fn hex(bytes: &[u8]) -> String {
@@ -128,6 +129,20 @@ impl ImageStore {
             return Ok(cached);
         }
         self.convert_and_commit(image, hex).await
+    }
+
+    /// The cached inventory of `digest`, without network access (§3.21).
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` when the image is not cached or was cached before
+    /// inventories existed; `Image` or `Io` when the file cannot be read.
+    pub async fn inventory(&self, digest: &ImageDigest) -> Result<ImageInventory, EngineError> {
+        let root = self.config.root.clone();
+        let digest = digest.clone();
+        tokio::task::spawn_blocking(move || cache::read_inventory(&root, &digest))
+            .await
+            .map_err(|err| EngineError::Io(format!("inventory read task failed: {err}")))?
     }
 
     /// Removes a cached image. A missing digest is `Ok`. The caller checks
@@ -232,6 +247,17 @@ pub(crate) async fn finalize(
     }
     let _ = stats;
 
+    // The package inventory, from the tree that is about to become the root
+    // disk (§3.21, ADR 0151). It never fails the preparation: a tree that
+    // cannot be opened gives an inventory that says so, and an inventory that
+    // cannot be written leaves the image without one (reported `pending`).
+    let tree_root = staging.clone();
+    let digest = image.digest.clone();
+    let inventory = tokio::task::spawn_blocking(move || inventory_of(&tree_root, digest)).await;
+    if let Ok(inventory) = inventory {
+        let _ = cache::write_inventory(tmp, &inventory);
+    }
+
     let rootfs = tmp.join("rootfs.ext4");
     let mkfs = config.mkfs_ext4.clone();
     let source = staging.clone();
@@ -246,6 +272,22 @@ pub(crate) async fn finalize(
     remove_dir(&staging).await;
     remove_dir(&tmp.join("blobs")).await;
     Ok(())
+}
+
+/// Inventories the unpacked tree at `root`.
+fn inventory_of(root: &Path, digest: ImageDigest) -> ImageInventory {
+    let now = tree::rfc3339_now();
+    match tree::RootTree::open(root) {
+        Ok(tree) => crate::inventory::build(&tree, digest, now),
+        Err(_) => ImageInventory {
+            digest,
+            os: None,
+            ecosystems: Vec::new(),
+            not_inventoried: vec!["inventory_failed".to_owned()],
+            packages: Vec::new(),
+            inventoried_at: now,
+        },
+    }
 }
 
 /// Removes a scratch directory, ignoring a missing one.
@@ -541,6 +583,14 @@ mod live_tests {
 
         let first = store.prepare(&image).await.expect("first prepare");
         assert!(first.size_bytes > 0);
+        let inventory = store.inventory(&image.digest).await.expect("inventory");
+        assert_eq!(inventory.ecosystems, vec!["Alpine:v3.22".to_owned()]);
+        assert!(
+            inventory
+                .packages
+                .iter()
+                .any(|p| p.name == "libcrypto3" && p.source_name.as_deref() == Some("openssl"))
+        );
         assert_eq!(first.digest, image.digest);
         let stamp = mtime(&first.rootfs_path);
 
@@ -592,6 +642,25 @@ mod live_tests {
         assert!(prepared.size_bytes > 0);
         // `/var/run -> /run` must have been resolved inside the root; the
         // conversion succeeding already proves no entry escaped it.
+        let inventory = store.inventory(&prepared.digest).await.expect("inventory");
+        assert_eq!(
+            inventory.os.as_ref().map(|os| os.0.as_str()),
+            Some("debian")
+        );
+        assert!(inventory.ecosystems.contains(&"Debian:13".to_owned()));
+        assert!(
+            inventory
+                .packages
+                .iter()
+                .any(|p| p.source_name.as_deref() == Some("openssl")),
+            "{:?}",
+            inventory.packages
+        );
+        assert!(
+            inventory.packages.len() > 50,
+            "{}",
+            inventory.packages.len()
+        );
         cleanup(&root);
     }
 }

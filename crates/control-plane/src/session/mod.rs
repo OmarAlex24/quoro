@@ -1659,6 +1659,15 @@ impl Session {
                     .unwrap_or_default();
                 self.start_dns_challenge(challenge, raw.id.clone(), acme_routes);
             }
+            // Storing inventories happens in a later PR (section 5.26).
+            NodeMessage::ImageInventory(inventory) => tracing::debug!(
+                node_id = %self.node_id,
+                image_digest = %inventory.image_digest,
+                inventory_id = %inventory.inventory_id,
+                part = inventory.part,
+                parts = inventory.parts,
+                "ignoring an image inventory part"
+            ),
         }
         false
     }

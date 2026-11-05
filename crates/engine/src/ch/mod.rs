@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use crate::{
     Capabilities, ConsoleStream, Engine, EngineError, EventStream, HostProbe, ImageDigest,
-    ImageRef, LineStream, NodeNetwork, OciLayout, PreparedImage, StopMode, VmCounters, VmId,
-    VmInfo, VmSpec, VolumeId, VolumeInfo, VolumeSnapshot,
+    ImageInventory, ImageRef, LineStream, NodeNetwork, OciLayout, PreparedImage, StopMode,
+    VmCounters, VmId, VmInfo, VmSpec, VolumeId, VolumeInfo, VolumeSnapshot,
 };
 
 pub mod api;
@@ -161,6 +161,10 @@ impl Engine for ChEngine {
 
     async fn remove_image(&self, digest: &ImageDigest) -> Result<(), EngineError> {
         self.inner.remove_image(digest).await
+    }
+
+    async fn image_inventory(&self, digest: &ImageDigest) -> Result<ImageInventory, EngineError> {
+        self.inner.images.inventory(digest).await
     }
 
     async fn create(&self, spec: &VmSpec) -> Result<VmInfo, EngineError> {

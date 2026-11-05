@@ -42,6 +42,7 @@ use crate::edge::EdgeManager;
 use crate::identity::{Identity, IdentityHandle};
 use crate::ingress::{DnsBridge, DnsRequest, IngressSupervisor};
 use crate::interactive::{Door, Interactive, OpenError, StreamKind};
+use crate::inventory::InventoryHub;
 use crate::lease::LeaseLink;
 use crate::logs::{LogFilter, StoredLogLine};
 use crate::metrics::{MetricsRing, Tick, parse_metrics_params, tick_report};
@@ -271,6 +272,9 @@ pub struct Session {
     disk_free_path: Option<std::path::PathBuf>,
     /// The backup statuses the backup manager publishes (section 5.3).
     backups: Option<watch::Receiver<Vec<BackupStatus>>>,
+    /// The image-inventory transport (sections 5.3, 5.26), when the agent runs
+    /// an engine that inventories images.
+    inventory: Option<InventoryHub>,
     /// The URL `dial` used for the current session, set after a successful
     /// dial and read once `welcome` arrives to promote a fallback address
     /// (section 5.10). `None` when the session was handed a stream directly
@@ -311,6 +315,7 @@ impl Session {
             volumes: None,
             disk_free_path: None,
             backups: None,
+            inventory: None,
             dialed_url: None,
         }
     }
@@ -353,6 +358,15 @@ impl Session {
     #[must_use]
     pub fn with_backups(mut self, backups: watch::Receiver<Vec<BackupStatus>>) -> Self {
         self.backups = Some(backups);
+        self
+    }
+
+    /// Attaches the image-inventory transport: prepared images queue their
+    /// inventory for `image_inventory` parts, and `status_report.images` names
+    /// their hashes (sections 5.3, 5.26).
+    #[must_use]
+    pub fn with_inventory(mut self, inventory: InventoryHub) -> Self {
+        self.inventory = Some(inventory);
         self
     }
 
@@ -622,6 +636,12 @@ impl Session {
             warn!(error = %e, "could not send the first status report; reconnecting");
             return Ok(SessionEnd::Reconnect);
         }
+        // Inventories queued while the node was disconnected go out as soon
+        // as the session is up (section 6.11).
+        if let Err(e) = self.flush_inventory(&mut sink).await {
+            warn!(error = %e, "could not send an image inventory; reconnecting");
+            return Ok(SessionEnd::Reconnect);
+        }
 
         let mut heartbeat_tick = tokio::time::interval(heartbeat);
         heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -641,6 +661,7 @@ impl Session {
         // A build status change is reported like an observed-VM change
         // (section 5.3).
         let mut builds = self.builds.as_ref().map(BuildsHandle::statuses);
+        let inventory_hub = self.inventory.clone();
         let mut last_rx = Instant::now();
 
         loop {
@@ -704,6 +725,17 @@ impl Session {
                 () = tokio::time::sleep_until(deadline) => {
                     warn!("no frame from the primary within the session timeout; reconnecting");
                     return Ok(SessionEnd::Reconnect);
+                }
+                () = async {
+                    match inventory_hub.as_ref() {
+                        Some(hub) => hub.notified().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Err(e) = self.flush_inventory(&mut sink).await {
+                        warn!(error = %e, "could not send an image inventory; reconnecting");
+                        return Ok(SessionEnd::Reconnect);
+                    }
                 }
                 streamed = stream_rx.recv() => {
                     if let Some(message) = streamed
@@ -874,6 +906,38 @@ impl Session {
                 } else if command.kind == "metrics_query" {
                     let body = self.metrics_query(&command);
                     write_message(sink, NodeMessage::CommandResult(body), Some(&raw.id)).await?;
+                } else if command.kind == "inventory_resend" {
+                    match parse_inventory_resend(&command.params) {
+                        Ok(digest) => match &self.inventory {
+                            Some(hub) => match hub.request_resend(&digest).await {
+                                Ok(()) => {
+                                    let body = CommandResult {
+                                        status: CommandStatus::Ok,
+                                        detail: Some("inventory queued".to_owned()),
+                                        error: None,
+                                        lines: None,
+                                        metrics: None,
+                                    };
+                                    write_message(
+                                        sink,
+                                        NodeMessage::CommandResult(body),
+                                        Some(&raw.id),
+                                    )
+                                    .await?;
+                                }
+                                Err(_) => write_not_found(sink, &raw.id).await?,
+                            },
+                            None => write_not_found(sink, &raw.id).await?,
+                        },
+                        Err(message) => {
+                            write_message(
+                                sink,
+                                NodeMessage::CommandResult(bad_result(&message)),
+                                Some(&raw.id),
+                            )
+                            .await?;
+                        }
+                    }
                 } else if command.kind == "build_logs_query" {
                     match self.build_logs_query(&command).await {
                         Ok(body) => {
@@ -1505,6 +1569,10 @@ impl Session {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        let images = match &self.inventory {
+            Some(hub) => hub.images(&self.spec_image_digests()).await,
+            None => Vec::new(),
+        };
         let report = StatusReport {
             applied_rev: self.store.applied_rev().await.unwrap_or(0),
             vms: self.observed.borrow().clone(),
@@ -1531,8 +1599,51 @@ impl Session {
                 .backups
                 .as_ref()
                 .map_or_else(Vec::new, |backups| backups.borrow().clone()),
+            images,
         };
         write_message(sink, NodeMessage::StatusReport(report), None).await
+    }
+
+    /// The `image_digest` of every VM in the current spec, for
+    /// `status_report.images` (section 5.3).
+    fn spec_image_digests(&self) -> Vec<String> {
+        self.current
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .state
+                    .spec
+                    .vms
+                    .iter()
+                    .map(|vm| vm.image_digest.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Sends every inventory queued for this node as `image_inventory` parts
+    /// (section 5.26). Part 1's envelope id is the send's `inventory_id`.
+    async fn flush_inventory<S>(
+        &mut self,
+        sink: &mut SplitSink<WebSocketStream<S>, Message>,
+    ) -> Result<(), AgentError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let Some(hub) = &self.inventory else {
+            return Ok(());
+        };
+        while let Some(parts) = hub.next_parts().await {
+            for (index, part) in parts.into_iter().enumerate() {
+                let id = if index == 0 {
+                    part.inventory_id.clone()
+                } else {
+                    util::message_id()
+                };
+                write_message_with_id(sink, NodeMessage::ImageInventory(part), &id, None).await?;
+            }
+        }
+        Ok(())
     }
 
     fn routes(&self) -> Vec<RouteStatus> {
@@ -1638,6 +1749,11 @@ fn timestamp_param(params: &serde_json::Value, name: &str) -> Result<Option<i64>
             .map(Some)
             .ok_or_else(|| format!("{name} is not an RFC 3339 timestamp")),
     }
+}
+
+/// Parses `inventory_resend` params (section 5.26): the image's digest.
+fn parse_inventory_resend(params: &serde_json::Value) -> Result<String, String> {
+    string_param(params, "image_digest")?.ok_or_else(|| "image_digest is required".to_owned())
 }
 
 fn parse_logs_query(params: &serde_json::Value) -> Result<LogsQuery, String> {
@@ -2108,7 +2224,23 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let id = util::message_id();
-    let text = message.to_frame(&id, re).to_text();
+    write_message_with_id(sink, message, &id, re).await
+}
+
+/// Writes one node message under a given envelope id.
+///
+/// `image_inventory` part 1 must carry its `inventory_id` as the envelope id
+/// (section 5.26), so the id cannot always be generated here.
+async fn write_message_with_id<S>(
+    sink: &mut SplitSink<WebSocketStream<S>, Message>,
+    message: NodeMessage,
+    id: &str,
+    re: Option<&str>,
+) -> Result<(), AgentError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let text = message.to_frame(id, re).to_text();
     sink.send(Message::Text(text.into()))
         .await
         .map_err(|e| AgentError::Protocol(format!("WebSocket write failed: {e}")))
@@ -2200,10 +2332,17 @@ mod tests {
     use crate::build::log::BuildLogs;
     use crate::build::manager::{BuildManager, BuildsHandle};
     use crate::identity::{self, Identity, IdentityHandle};
+    use crate::inventory::InventoryHub;
     use crate::logs::NewLogLine;
     use crate::store::BuildRecord;
-    use quoro_engine::FakeEngine;
-    use quoro_proto::wire::{BuildLimits, BuildState, LogStream, Spec, SpecBuild, SpecNetwork};
+    use quoro_engine::{
+        Engine, FakeEngine, ImageDigest, ImageInventory, ImageRef, InventoryPackage,
+    };
+    use quoro_proto::inventory::{InventoryObject, sha256_hex};
+    use quoro_proto::wire::{
+        BuildLimits, BuildState, DesiredStatus, InventoryOs, InventoryPackageWire, LogStream, Spec,
+        SpecBuild, SpecNetwork, SpecVm,
+    };
 
     #[test]
     fn session_urls_are_always_wss_with_the_session_path() {
@@ -2361,6 +2500,22 @@ mod tests {
         + Send
         + 'static,
     ) -> (SessionEnd, NodeStore) {
+        drive_session_full(dir, builds, None, None, primary).await
+    }
+
+    /// The same, with an inventory hub and a current snapshot to report from.
+    async fn drive_session_full(
+        dir: &TempDir,
+        builds: Option<BuildsHandle>,
+        inventory: Option<InventoryHub>,
+        current: Option<Snapshot>,
+        primary: impl FnOnce(
+            WebSocketStream<DuplexStream>,
+            NodeStore,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + 'static,
+    ) -> (SessionEnd, NodeStore) {
         let key = sign::signing_key_from_seed(&[4; 32]);
         let identity = identity_files(dir.path(), &key);
         let store = NodeStore::open(dir.path()).await.unwrap();
@@ -2372,9 +2527,12 @@ mod tests {
             facts: facts(),
             desired,
             observed: observed_rx,
-            current: None,
+            current,
             builds,
         });
+        if let Some(inventory) = inventory {
+            session = session.with_inventory(inventory);
+        }
 
         let (client, server) = tokio::io::duplex(1 << 20);
         let primary_store = store.clone();
@@ -3100,6 +3258,276 @@ mod tests {
         assert_eq!(end, SessionEnd::Reconnect);
         let _ = stop.send(true);
         let _ = manager.await;
+    }
+
+    // --- image inventories (sections 5.3, 5.26, 6.11) ----------------------
+
+    const INVENTORY_DIGEST: &str =
+        "sha256:5f0c9a2e4b6d8f1a3c5e7b9d1f3a5c7e9b1d3f5a7c9e1b3d5f7a9c1e3b5d7f9a";
+
+    fn image_inventory() -> ImageInventory {
+        ImageInventory {
+            digest: ImageDigest(INVENTORY_DIGEST.to_owned()),
+            os: Some(("debian".to_owned(), "13".to_owned())),
+            ecosystems: vec!["Debian:13".to_owned(), "npm".to_owned()],
+            not_inventoried: Vec::new(),
+            packages: vec![
+                InventoryPackage {
+                    ecosystem: "Debian:13".to_owned(),
+                    name: "libssl3t64".to_owned(),
+                    source_name: Some("openssl".to_owned()),
+                    version: "3.5.1-1".to_owned(),
+                    purl: "pkg:deb/debian/libssl3t64@3.5.1-1?arch=amd64&distro=debian-13"
+                        .to_owned(),
+                    path: None,
+                },
+                InventoryPackage {
+                    ecosystem: "npm".to_owned(),
+                    name: "express".to_owned(),
+                    source_name: None,
+                    version: "4.21.2".to_owned(),
+                    purl: "pkg:npm/express@4.21.2".to_owned(),
+                    path: Some("app/package-lock.json".to_owned()),
+                },
+            ],
+            inventoried_at: "2026-11-05T06:09:41Z".to_owned(),
+        }
+    }
+
+    fn inventory_sha() -> String {
+        let inventory = image_inventory();
+        sha256_hex(&InventoryObject {
+            image_digest: INVENTORY_DIGEST.to_owned(),
+            inventoried_at: inventory.inventoried_at,
+            os: Some(InventoryOs {
+                id: "debian".to_owned(),
+                version_id: Some("13".to_owned()),
+            }),
+            ecosystems: inventory.ecosystems,
+            not_inventoried: inventory.not_inventoried,
+            package_count: 2,
+            packages: inventory
+                .packages
+                .into_iter()
+                .map(|package| InventoryPackageWire {
+                    ecosystem: package.ecosystem,
+                    name: package.name,
+                    source_name: package.source_name,
+                    version: package.version,
+                    purl: package.purl,
+                    path: package.path,
+                })
+                .collect(),
+        })
+    }
+
+    async fn engine_with_inventory() -> std::sync::Arc<FakeEngine> {
+        let engine = std::sync::Arc::new(FakeEngine::new());
+        let image = ImageRef {
+            reference: "docker.io/library/debian:13".to_owned(),
+            digest: ImageDigest(INVENTORY_DIGEST.to_owned()),
+        };
+        Engine::prepare_image(&*engine, &image).await.unwrap();
+        engine.set_inventory(image_inventory());
+        engine
+    }
+
+    fn vm_snapshot(digest: &str) -> Snapshot {
+        Snapshot {
+            rev: 1,
+            state: DesiredState {
+                rev: 1,
+                issued_at: "2026-11-02T10:15:31Z".to_owned(),
+                term: 1,
+                spec: Spec {
+                    vms: vec![SpecVm {
+                        vm_id: "vm_inventory".to_owned(),
+                        project_id: "prj_1".to_owned(),
+                        app_id: None,
+                        deployment_id: None,
+                        name: "inventory".to_owned(),
+                        image: "docker.io/library/debian:13".to_owned(),
+                        image_digest: digest.to_owned(),
+                        vcpus: 2,
+                        memory_mb: 512,
+                        disk_gb: 4,
+                        port: None,
+                        env: std::collections::BTreeMap::new(),
+                        health_check: None,
+                        desired_status: DesiredStatus::Running,
+                        restart_generation: 0,
+                        stateful: false,
+                        lease_id: None,
+                        fencing_token: None,
+                        volumes: Vec::new(),
+                        build_id: None,
+                    }],
+                    routes: Vec::new(),
+                    network: None,
+                    ingress: None,
+                    builds: Vec::new(),
+                    mesh: None,
+                    edge: None,
+                    volumes: Vec::new(),
+                    backups: Vec::new(),
+                    backup_repository: None,
+                },
+                signature: String::new(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn a_prepared_image_sends_its_inventory_parts() {
+        let dir = TempDir::new();
+        let engine = engine_with_inventory().await;
+        let hub = InventoryHub::new(std::sync::Arc::clone(&engine));
+        hub.notify_prepared(ImageDigest(INVENTORY_DIGEST.to_owned()));
+        let sha = inventory_sha();
+        let (end, _store) =
+            drive_session_full(&dir, None, Some(hub), None, move |mut ws, _store| {
+                Box::pin(async move {
+                    handshake(&mut ws).await;
+                    let part = read_until(&mut ws, "image_inventory").await;
+                    assert_eq!(part["body"]["image_digest"], INVENTORY_DIGEST);
+                    assert_eq!(part["body"]["inventory_id"], part["id"]);
+                    assert_eq!(part["body"]["inventory_sha256"], sha);
+                    assert_eq!(part["body"]["part"], 1);
+                    assert_eq!(part["body"]["parts"], 1);
+                    assert_eq!(part["body"]["package_count"], 2);
+                    assert_eq!(part["body"]["os"]["id"], "debian");
+                    assert_eq!(part["body"]["os"]["version_id"], "13");
+                    assert_eq!(part["body"]["packages"].as_array().unwrap().len(), 2);
+                })
+            })
+            .await;
+        assert_eq!(end, SessionEnd::Reconnect);
+    }
+
+    #[tokio::test]
+    async fn inventory_resend_queues_the_parts_or_answers_not_found() {
+        let dir = TempDir::new();
+        let engine = engine_with_inventory().await;
+        let hub = InventoryHub::new(std::sync::Arc::clone(&engine));
+        let sha = inventory_sha();
+        let (end, _store) =
+            drive_session_full(&dir, None, Some(hub), None, move |mut ws, _store| {
+                Box::pin(async move {
+                    handshake(&mut ws).await;
+                    send(
+                        &mut ws,
+                        ControlMessage::Command(Command {
+                            kind: "inventory_resend".to_owned(),
+                            params: json!({"image_digest": INVENTORY_DIGEST}),
+                        })
+                        .to_frame("msg_resend", None)
+                        .to_text(),
+                    )
+                    .await;
+                    let answer = read_until(&mut ws, "command_result").await;
+                    assert_eq!(answer["re"], "msg_resend");
+                    assert_eq!(answer["body"]["status"], "ok");
+                    let part = read_until(&mut ws, "image_inventory").await;
+                    assert_eq!(part["body"]["inventory_id"], part["id"]);
+                    assert_eq!(part["body"]["inventory_sha256"], sha);
+
+                    send(
+                        &mut ws,
+                        ControlMessage::Command(Command {
+                            kind: "inventory_resend".to_owned(),
+                            params: json!({"image_digest": "sha256:unknown"}),
+                        })
+                        .to_frame("msg_resend_missing", None)
+                        .to_text(),
+                    )
+                    .await;
+                    let answer = read_until(&mut ws, "command_result").await;
+                    assert_eq!(answer["re"], "msg_resend_missing");
+                    assert_eq!(answer["body"]["status"], "error");
+                    assert_eq!(answer["body"]["error"]["code"], "not_found");
+                })
+            })
+            .await;
+        assert_eq!(end, SessionEnd::Reconnect);
+    }
+
+    #[tokio::test]
+    async fn status_report_images_lists_the_spec_image_and_its_sha() {
+        let dir = TempDir::new();
+        let engine = engine_with_inventory().await;
+        let hub = InventoryHub::new(std::sync::Arc::clone(&engine));
+        let sha = inventory_sha();
+        let snapshot = vm_snapshot(INVENTORY_DIGEST);
+        let (end, _store) = drive_session_full(
+            &dir,
+            None,
+            Some(hub),
+            Some(snapshot),
+            move |mut ws, _store| {
+                Box::pin(async move {
+                    let hello = read_frame(&mut ws).await;
+                    send(
+                        &mut ws,
+                        ControlMessage::Welcome(Welcome {
+                            cluster_id: "cls_test".to_owned(),
+                            term: 1,
+                            server_time: "2026-11-02T10:15:30Z".to_owned(),
+                            heartbeat_interval_ms: 500,
+                            session_timeout_ms: 5_000,
+                            primary_node_id: "nod_primary".to_owned(),
+                            primary_urls: Vec::new(),
+                        })
+                        .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
+                        .to_text(),
+                    )
+                    .await;
+                    let report = read_until(&mut ws, "status_report").await;
+                    let images = report["body"]["images"].as_array().unwrap();
+                    assert_eq!(images.len(), 1);
+                    assert_eq!(images[0]["image_digest"], INVENTORY_DIGEST);
+                    assert_eq!(images[0]["inventory_sha256"], sha);
+                })
+            },
+        )
+        .await;
+        assert_eq!(end, SessionEnd::Reconnect);
+    }
+
+    #[tokio::test]
+    async fn status_report_images_has_no_sha_for_an_uninventoried_image() {
+        let dir = TempDir::new();
+        let engine = engine_with_inventory().await;
+        engine.clear_inventory(&ImageDigest(INVENTORY_DIGEST.to_owned()));
+        let hub = InventoryHub::new(std::sync::Arc::clone(&engine));
+        let snapshot = vm_snapshot(INVENTORY_DIGEST);
+        let (end, _store) =
+            drive_session_full(&dir, None, Some(hub), Some(snapshot), |mut ws, _store| {
+                Box::pin(async move {
+                    let hello = read_frame(&mut ws).await;
+                    send(
+                        &mut ws,
+                        ControlMessage::Welcome(Welcome {
+                            cluster_id: "cls_test".to_owned(),
+                            term: 1,
+                            server_time: "2026-11-02T10:15:30Z".to_owned(),
+                            heartbeat_interval_ms: 500,
+                            session_timeout_ms: 5_000,
+                            primary_node_id: "nod_primary".to_owned(),
+                            primary_urls: Vec::new(),
+                        })
+                        .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
+                        .to_text(),
+                    )
+                    .await;
+                    let report = read_until(&mut ws, "status_report").await;
+                    let images = report["body"]["images"].as_array().unwrap();
+                    assert_eq!(images.len(), 1);
+                    assert_eq!(images[0]["image_digest"], INVENTORY_DIGEST);
+                    assert!(images[0].get("inventory_sha256").is_none());
+                })
+            })
+            .await;
+        assert_eq!(end, SessionEnd::Reconnect);
     }
 
     #[tokio::test]

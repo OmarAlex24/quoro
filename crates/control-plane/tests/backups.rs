@@ -529,6 +529,7 @@ fn status_report(
         edge_backends: Vec::new(),
         backups,
         volumes,
+        images: Vec::new(),
     })
 }
 
