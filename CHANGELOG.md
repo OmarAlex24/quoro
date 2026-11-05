@@ -58,7 +58,7 @@ The M5a milestone: stateless replicas behind an edge, local volumes, cold backup
 
 ### Maintenance
 
-- The M5a decisions were recorded as ADRs 0139 to 0158 ([#267]). `Cargo.lock` now records `quoro-backup` 0.1.1 ([#258]). Tests that failed intermittently on loaded CI runners were made deterministic ([#265], [#269], [#282], [#286]). A changelog and a milestone status table were added ([#329]).
+- The M5a decisions were recorded as ADRs 0139 to 0158 ([#267]). `Cargo.lock` now records `quoro-backup` 0.1.1 ([#258]). Tests that failed intermittently on loaded CI runners were made deterministic ([#265], [#269], [#282], [#286], [#340]). A changelog and a milestone status table were added ([#329]).
 
 ## [v0.1.1] - 2026-11-04
 
@@ -319,6 +319,7 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#329]: https://github.com/OmarAlex24/quoro/pull/329
 [#334]: https://github.com/OmarAlex24/quoro/pull/334
 [#338]: https://github.com/OmarAlex24/quoro/pull/338
+[#340]: https://github.com/OmarAlex24/quoro/pull/340
 [ADR 0019]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0019-fencing-is-mandatory-and-lease-based-node-agent-self-fences.md
 [ADR 0020]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0020-per-app-ha-policies-none-cold-warm-hot-with-cost-shown-in.md
 [ADR 0027]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0027-signed-binaries-and-reproducible-builds-are-mandatory.md
