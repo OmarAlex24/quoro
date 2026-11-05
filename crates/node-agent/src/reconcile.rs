@@ -621,7 +621,13 @@ impl<E: Engine + 'static> Reconciler<E> {
                     },
                     None => VolumeStatus {
                         volume_id: entry.volume_id.clone(),
-                        state: VolumeState::Creating,
+                        // A fresh restore is `restoring` until the backup
+                        // manager records otherwise (section 6.7).
+                        state: if entry.restore.is_some() {
+                            VolumeState::Restoring
+                        } else {
+                            VolumeState::Creating
+                        },
                         allocated_bytes: None,
                         error: None,
                     },
@@ -662,15 +668,20 @@ impl<E: Engine + 'static> Reconciler<E> {
             match entry.state {
                 SpecVolumeState::Present => {
                     if entry.restore.is_some() {
-                        // Backups and restores arrive in a later task.
-                        self.record_volume(
-                            &mut statuses,
-                            entry,
-                            VolumeState::Failed,
-                            Some(RESTORE_UNSUPPORTED.to_owned()),
-                            None,
-                        )
-                        .await;
+                        // The backup manager writes the file and records its
+                        // state (`backup-format.md` section 8.1); this pass only
+                        // reports that row and gates the VM on it, so it never
+                        // writes over a restore in progress.
+                        match row {
+                            Some(row)
+                                if row.state == VolumeState::Ready
+                                    && row.size_gb == entry.size_gb =>
+                            {
+                                self.ready_volumes.insert(entry.volume_id.clone());
+                            }
+                            Some(row) if row.state == VolumeState::Failed => {}
+                            _ => reached = false,
+                        }
                         continue;
                     }
                     if row.is_some_and(|row| {
@@ -1713,10 +1724,6 @@ impl<E: Engine + 'static> Reconciler<E> {
     }
 }
 
-/// The reason a `present` volume with a `restore` reports: backups and
-/// restores arrive in a later task.
-const RESTORE_UNSUPPORTED: &str = "restore is not supported by this agent yet";
-
 /// The engine attachments for a VM's `spec.vms[].volumes` (section 5.11,
 /// `engine-trait.md` section 3.6). A snapshot that names no serial gets the
 /// contract's `quoro-vol-<n>`, numbered in order.
@@ -1759,11 +1766,7 @@ fn volumes_key(vm_id: &str) -> String {
 
 /// A one-line error of at most 2 000 characters (section 5.3).
 fn truncate_error(error: &str) -> String {
-    let one_line: String = error
-        .chars()
-        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-        .collect();
-    one_line.chars().take(2_000).collect()
+    util::one_line(error, 2_000)
 }
 
 /// The `node_meta` key that remembers one VM's create-time image digest.

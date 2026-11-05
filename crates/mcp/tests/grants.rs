@@ -204,12 +204,15 @@ async fn an_allowed_read_returns_the_http_body_and_is_audited_with_the_grant() {
 
     // The tool's structured content is exactly the HTTP body of the same read
     // with the same token (one service function, two adapters).
-    let (status, body) = agent_get_app(&seeded, &seeded.access_token, &seeded.app_id).await;
+    let (status, mut body) = agent_get_app(&seeded, &seeded.access_token, &seeded.app_id).await;
     assert_eq!(status, 200, "GET app: {body}");
-    assert_eq!(
-        result["structuredContent"], body,
-        "the MCP read must return the HTTP body"
-    );
+    // `ha_cost.computed_at` is the time of each read, so it differs between
+    // the two reads; everything else is the same.
+    let mut structured = result["structuredContent"].clone();
+    for read in [&mut structured, &mut body] {
+        read["ha_cost"]["computed_at"] = Value::Null;
+    }
+    assert_eq!(structured, body, "the MCP read must return the HTTP body");
 
     // The HTTP read that followed is audited too, under `channel: api`.
     let rows = seeded.server.audit_rows().await;

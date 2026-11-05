@@ -33,10 +33,11 @@ use crate::app_env;
 use crate::crypto::DataKey;
 use crate::deploy;
 use crate::{DigestResolver, store::Store};
+use base64::Engine as _;
 use quoro_proto::wire::{
-    BuildLimits, DesiredStatus, EdgeBackend, EdgeRoute, HealthCheck, Spec, SpecBuild, SpecEdge,
-    SpecIngress, SpecNetwork, SpecRoute, SpecTunnel, SpecVm, SpecVolume, SpecVolumeFile,
-    SpecVolumeState,
+    BuildLimits, DesiredStatus, EdgeBackend, EdgeRoute, HealthCheck, Spec, SpecBackup,
+    SpecBackupRepository, SpecBuild, SpecEdge, SpecIngress, SpecNetwork, SpecRestore, SpecRoute,
+    SpecTunnel, SpecVm, SpecVolume, SpecVolumeFile, SpecVolumeState,
 };
 use sqlx::sqlite::SqliteConnection;
 use sqlx::{Row, SqlitePool};
@@ -276,6 +277,13 @@ pub async fn build_spec(
     }
     let builds = build_specs(&mut conn, data_key, node_id, &mut env_cache).await?;
     drop(conn);
+    let (backups, restores, backup_repository) = backup_jobs(store, data_key, node_id).await?;
+    // A `restoring` volume writes its file from the backup instead of creating
+    // it empty (section 5.11).
+    let mut volumes = volumes;
+    for file in &mut volumes {
+        file.restore = restores.get(&file.volume_id).cloned();
+    }
 
     let routes = build_routes(store.pool(), &apps, &vms).await?;
     let ingress = build_ingress(store.pool(), data_key, node_id).await?;
@@ -294,12 +302,181 @@ pub async fn build_spec(
             builds,
             mesh,
             edge,
-            backup_repository: None,
-            backups: Vec::new(),
+            backup_repository,
+            backups,
             volumes,
         },
         held_back,
     })
+}
+
+/// `spec.backups`, `spec.volumes[].restore` and `spec.backup_repository`
+/// (section 5.11, ADR 0147).
+///
+/// Every `queued` or `running` volume backup of `node_id` carries the app's
+/// `id_key` and `data_key`, never the repository key: the repository key is
+/// decrypted from `backup_repositories.repo_key_enc` for this snapshot and
+/// only the two derived source keys leave the process. `vm_id` is the app's VM
+/// on this node, which a `pause_copy` snapshot pauses. A `restoring` volume
+/// carries the same keys in its `restore` object, with the manifest the seal
+/// recorded.
+///
+/// The repository entry is present while the node has a backup job or a
+/// restore (`node-agent-protocol.md` section 5.11).
+async fn backup_jobs(
+    store: &Store,
+    data_key: &DataKey,
+    node_id: &str,
+) -> Result<
+    (
+        Vec<SpecBackup>,
+        HashMap<String, SpecRestore>,
+        Option<SpecBackupRepository>,
+    ),
+    String,
+> {
+    let rows = sqlx::query(
+        "SELECT b.id, b.app_id, b.volume_id, b.fencing_token, b.repository_id, \
+                (SELECT v.id FROM vms v \
+                 WHERE v.app_id = b.app_id AND v.node_id = b.node_id \
+                 ORDER BY v.id DESC LIMIT 1) AS vm_id \
+         FROM backups b \
+         WHERE b.node_id = ? AND b.status IN ('queued', 'running') \
+           AND b.source_kind = 'volume' \
+         ORDER BY b.id",
+    )
+    .bind(node_id)
+    .fetch_all(store.pool())
+    .await
+    .map_err(|e| format!("cannot read the backups of {node_id}: {e}"))?;
+    let restores = sqlx::query(
+        "SELECT v.id AS volume_id, v.app_id, b.id AS backup_id, b.manifest_key, \
+                b.manifest_digest, b.logical_bytes, b.repository_id \
+         FROM volumes v JOIN backups b ON b.id = v.restored_from_backup_id \
+         WHERE v.node_id = ? AND v.state = 'restoring' \
+         ORDER BY v.id",
+    )
+    .bind(node_id)
+    .fetch_all(store.pool())
+    .await
+    .map_err(|e| format!("cannot read the restores of {node_id}: {e}"))?;
+    if rows.is_empty() && restores.is_empty() {
+        return Ok((Vec::new(), HashMap::new(), None));
+    }
+    let first: String = if let Some(row) = rows.first() {
+        row.try_get("repository_id").map_err(|e| e.to_string())?
+    } else {
+        restores[0]
+            .try_get("repository_id")
+            .map_err(|e| e.to_string())?
+    };
+    let repository = sqlx::query(
+        "SELECT id, provider_id, prefix, repo_key_enc FROM backup_repositories WHERE id = ?",
+    )
+    .bind(&first)
+    .fetch_optional(store.pool())
+    .await
+    .map_err(|e| format!("cannot read repository {first}: {e}"))?
+    .ok_or_else(|| format!("the repository {first} of a backup job is missing"))?;
+    let repository_id: String = repository.try_get("id").map_err(|e| e.to_string())?;
+    let provider_id: String = repository
+        .try_get("provider_id")
+        .map_err(|e| e.to_string())?;
+    let prefix: String = repository.try_get("prefix").map_err(|e| e.to_string())?;
+    let repo_key_enc: Vec<u8> = repository
+        .try_get("repo_key_enc")
+        .map_err(|e| e.to_string())?;
+    let target = crate::backups::repo::target_of_provider(
+        store,
+        data_key,
+        &repository_id,
+        &provider_id,
+        &prefix,
+    )
+    .await
+    .map_err(|e| {
+        tracing::warn!(repository_id = %repository_id, error = ?e, "cannot reach the backup repository");
+        format!("cannot reach the backup repository {repository_id}: {:?}", e.code)
+    })?;
+    let repo_key = crate::backups::decrypt_repo_key(data_key, &repository_id, &repo_key_enc)
+        .map_err(|e| {
+            tracing::warn!(repository_id = %repository_id, "cannot decrypt the repository key");
+            format!("cannot decrypt the repository key: {:?}", e.code)
+        })?;
+
+    let mut backups = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let backup_id: String = row.try_get("id").map_err(|e| e.to_string())?;
+        let app_id: String = row.try_get("app_id").map_err(|e| e.to_string())?;
+        let volume_id: String = row.try_get("volume_id").map_err(|e| e.to_string())?;
+        let fencing_token: i64 = row.try_get("fencing_token").map_err(|e| e.to_string())?;
+        let vm_id: Option<String> = row.try_get("vm_id").map_err(|e| e.to_string())?;
+        let keys = repo_key.source_keys(&app_id);
+        backups.push(SpecBackup {
+            backup_id,
+            app_id,
+            volume_id,
+            vm_id,
+            fencing_token: u64::try_from(fencing_token)
+                .map_err(|e| format!("backups.fencing_token: {e}"))?,
+            id_key: base64::engine::general_purpose::STANDARD.encode(keys.id_key.as_bytes()),
+            data_key: base64::engine::general_purpose::STANDARD.encode(keys.data_key.as_bytes()),
+        });
+    }
+    let mut restore_entries = HashMap::with_capacity(restores.len());
+    for row in &restores {
+        let volume_id: String = row.try_get("volume_id").map_err(|e| e.to_string())?;
+        let app_id: String = row.try_get("app_id").map_err(|e| e.to_string())?;
+        let backup_id: String = row.try_get("backup_id").map_err(|e| e.to_string())?;
+        let manifest_key: Option<String> =
+            row.try_get("manifest_key").map_err(|e| e.to_string())?;
+        let manifest_digest: Option<String> =
+            row.try_get("manifest_digest").map_err(|e| e.to_string())?;
+        let logical_bytes: Option<i64> = row.try_get("logical_bytes").map_err(|e| e.to_string())?;
+        let (Some(manifest_key), Some(manifest_digest)) = (manifest_key, manifest_digest) else {
+            return Err(format!(
+                "the backup {backup_id} of volume {volume_id} has no manifest"
+            ));
+        };
+        let keys = repo_key.source_keys(&app_id);
+        restore_entries.insert(
+            volume_id,
+            SpecRestore {
+                backup_id,
+                manifest_key,
+                manifest_digest,
+                logical_bytes: logical_bytes
+                    .and_then(|bytes| u64::try_from(bytes).ok())
+                    .unwrap_or(0),
+                id_key: base64::engine::general_purpose::STANDARD.encode(keys.id_key.as_bytes()),
+                data_key: base64::engine::general_purpose::STANDARD
+                    .encode(keys.data_key.as_bytes()),
+            },
+        );
+    }
+    let repository = if needs_backup_repository(&backups, &restore_entries) {
+        Some(SpecBackupRepository {
+            repository_id,
+            endpoint: target.endpoint,
+            region: target.region,
+            bucket: target.bucket,
+            root: target.root,
+            access_key_id: target.access_key_id,
+            secret_access_key: target.secret_access_key.expose().to_string(),
+        })
+    } else {
+        None
+    };
+    Ok((backups, restore_entries, repository))
+}
+
+/// Whether `spec.backup_repository` must be sent: while the node has a backup
+/// job or a volume it restores from a backup (section 5.11).
+fn needs_backup_repository(
+    backups: &[SpecBackup],
+    restores: &HashMap<String, SpecRestore>,
+) -> bool {
+    !backups.is_empty() || !restores.is_empty()
 }
 
 /// The volume entries for `node_id` and the volumes its VMs may attach:

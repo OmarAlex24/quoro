@@ -617,15 +617,23 @@ pub(crate) async fn clear_stateful(
     }
     app.stateful = false;
     app.placement = AppPlacement::default();
+    // The contract allows `cold` only for a stateful app (`openapi.yaml`
+    // `App.ha_policy`), so the last volume's deletion makes it `none` again.
+    if app.ha_policy == crate::api::apps::HaPolicy::Cold {
+        app.ha_policy = crate::api::apps::HaPolicy::None;
+    }
     app.updated_at = now_rfc3339();
     let placement = serde_json::to_string(&app.placement)
         .map_err(|error| ApiError::internal(&format!("placement: {error}")))?;
-    sqlx::query("UPDATE apps SET stateful = 0, placement = ?, updated_at = ? WHERE id = ?")
-        .bind(&placement)
-        .bind(&app.updated_at)
-        .bind(app_id)
-        .execute(&mut *conn)
-        .await?;
+    sqlx::query(
+        "UPDATE apps SET stateful = 0, placement = ?, ha_policy = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(&placement)
+    .bind(app.ha_policy.as_str())
+    .bind(&app.updated_at)
+    .bind(app_id)
+    .execute(&mut *conn)
+    .await?;
     let payload = serde_json::to_value(&app)
         .map_err(|error| ApiError::internal(&format!("app payload: {error}")))?;
     changelog::append(conn, actor, "app", app_id, Op::Update, payload).await?;

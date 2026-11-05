@@ -19,6 +19,8 @@ use quoro_proto::wire::DesiredState;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
+use crate::backup::S3Repository;
+use crate::backup::manager::BackupManager;
 use crate::build::buildkit::{
     BuilderConfig, DEFAULT_FETCH_TIMEOUT, DockerfileBuilder, find_git, pinned_image,
 };
@@ -82,6 +84,7 @@ pub async fn run<E: Engine + 'static>(
     let engine = Arc::new(engine);
     let capabilities = engine.capabilities().await;
     let node_id = identity.get().node_id;
+    let cluster_id = identity.get().cluster_id;
     let (desired, desired_rx) = watch::channel(current.clone());
 
     // Section 8.3: `local` leases are held on this node alone, so they survive
@@ -135,6 +138,17 @@ pub async fn run<E: Engine + 'static>(
     ));
     let (manager, builds) = BuildManager::new(Arc::clone(&engine), builder, store.clone());
 
+    // Backups and restores run beside the apply loop, one task per job
+    // (section 6.7, ADR 0147). The repository is opened per job, so the
+    // bucket credential lives no longer than the snapshot that carries it.
+    let (backup_manager, backup_statuses) = BackupManager::new(
+        Arc::clone(&engine),
+        store.clone(),
+        Arc::new(S3Repository),
+        leases.view.clone(),
+        cluster_id,
+    );
+
     let (stop, stop_rx) = watch::channel(false);
     let shutdown_stop = stop.clone();
     let shutdown_task = tokio::spawn(async move {
@@ -152,6 +166,8 @@ pub async fn run<E: Engine + 'static>(
     );
     let edge_task =
         tokio::spawn(Arc::clone(&edge).run(desired.subscribe(), wait_stop(stop_rx.clone())));
+    let backup_task =
+        tokio::spawn(backup_manager.run(desired.subscribe(), wait_stop(stop_rx.clone())));
 
     // Terminal transcripts are pruned at agent start and then hourly; each
     // terminal session also prunes once it ends (section 3.3).
@@ -190,6 +206,7 @@ pub async fn run<E: Engine + 'static>(
     )
     .with_volumes(volume_statuses)
     .with_disk_free_path(config.data_dir.clone())
+    .with_backups(backup_statuses)
     .with_ingress(Arc::clone(&ingress), dns)
     .with_metrics(metrics)
     .with_edge(Arc::clone(&edge))
@@ -205,6 +222,7 @@ pub async fn run<E: Engine + 'static>(
     let _ = build_task.await;
     let _ = mesh_task.await;
     let _ = edge_task.await;
+    let _ = backup_task.await;
     ingress.shutdown().await;
     shutdown_task.abort();
     outcome

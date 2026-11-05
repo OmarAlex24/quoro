@@ -263,6 +263,8 @@ struct HubInner {
     cluster_id: String,
     resolver: Arc<dyn DigestResolver>,
     data_key: Arc<DataKey>,
+    /// The bucket factory, sweep flag and last sweep of the backups code.
+    backups: crate::backups::Backups,
     sessions: Mutex<HashMap<String, SessionHandle>>,
     digests: desired::DigestCache,
     /// `vm_` id to node, kept for VMs whose row is already deleted.
@@ -309,6 +311,7 @@ impl NodeHub {
         cluster_id: String,
         resolver: Arc<dyn DigestResolver>,
         data_key: Arc<DataKey>,
+        backups: crate::backups::Backups,
     ) -> Self {
         Self(Arc::new(HubInner {
             store,
@@ -317,6 +320,7 @@ impl NodeHub {
             cluster_id,
             resolver,
             data_key,
+            backups,
             sessions: Mutex::new(HashMap::new()),
             digests: desired::DigestCache::default(),
             vm_nodes: Mutex::new(HashMap::new()),
@@ -2309,6 +2313,26 @@ async fn apply_status_report(
         .lock()
         .expect("disk free lock")
         .insert(node_id.to_string(), report.disk_free_gb);
+    match crate::backups::restore::apply_status(&hub.0.store, node_id, &report.volumes).await {
+        Ok(applied) => {
+            // The grant reaches the node before the snapshot that starts the
+            // app there (section 8.3).
+            for lease in &applied.grants {
+                hub.send_control(
+                    node_id,
+                    &quoro_proto::wire::ControlMessage::LeaseGrant(lease.grant()),
+                );
+            }
+            if applied.desired_changed {
+                hub.node_changed(node_id);
+            }
+        }
+        Err(e) => tracing::warn!(
+            node_id,
+            code = %e.code.as_str(),
+            "cannot apply the reported restore statuses"
+        ),
+    }
     match crate::service::volumes::apply_status(&hub.0.store, node_id, &report.volumes).await {
         Ok(true) => hub.node_changed(node_id),
         Ok(false) => {}
@@ -2316,6 +2340,25 @@ async fn apply_status_report(
             node_id,
             code = %e.code.as_str(),
             "cannot apply the reported volume statuses"
+        ),
+    }
+    match crate::backups::apply_status(
+        &hub.0.store,
+        &hub.0.data_key,
+        &hub.0.keys,
+        &hub.0.cluster_id,
+        &hub.0.backups,
+        node_id,
+        &report.backups,
+    )
+    .await
+    {
+        Ok(true) => hub.node_changed(node_id),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            node_id,
+            code = %e.code.as_str(),
+            "cannot apply the reported backup statuses"
         ),
     }
     set_applied_rev(hub, node_id, report.applied_rev).await?;

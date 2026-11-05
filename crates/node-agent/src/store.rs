@@ -16,7 +16,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use quoro_proto::wire::{BuildPhase, BuildState, FailedStep, VolumeState};
+use quoro_proto::wire::{
+    BackupState, BuildPhase, BuildState, FailedStep, SnapshotMethod, VolumeState,
+};
 use quoro_proto::{FenceReason, LeaseId, LeaseMode, ResourceType};
 use serde_json::Value;
 use sqlx::Row as _;
@@ -123,6 +125,23 @@ CREATE TABLE IF NOT EXISTS volumes (
     state           TEXT NOT NULL,
     error           TEXT,
     allocated_bytes INTEGER
+);
+CREATE TABLE IF NOT EXISTS backups (
+    backup_id       TEXT PRIMARY KEY,
+    app_id          TEXT NOT NULL,
+    volume_id       TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    snapshot_method TEXT,
+    pause_ms        INTEGER,
+    manifest_key    TEXT,
+    manifest_digest TEXT,
+    logical_bytes   INTEGER,
+    uploaded_bytes  INTEGER,
+    chunk_count     INTEGER,
+    error           TEXT,
+    started_at      TEXT,
+    finished_at     TEXT,
+    snapshot_path   TEXT
 );
 CREATE TABLE IF NOT EXISTS leases (
     lease_id      TEXT PRIMARY KEY,
@@ -313,6 +332,67 @@ pub struct VolumeRecord {
     pub error: Option<String>,
     /// Bytes the sparse file uses, when known.
     pub allocated_bytes: Option<u64>,
+}
+
+/// One backup job row (`node-agent-protocol.md` section 12 `backups`).
+///
+/// It holds ids, sizes, times and one-line reasons, never a key or a
+/// credential: the job's `id_key` and `data_key`, and the repository's secret,
+/// live only in the memory of the task carrying them (section 5.11).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackupRecord {
+    /// `bkp_` id.
+    pub backup_id: String,
+    /// `app_` id of the backed-up volume; also the manifest's `source_id`.
+    pub app_id: String,
+    /// `vol_` id of the volume.
+    pub volume_id: String,
+    /// The last status the node reported.
+    pub status: BackupState,
+    /// From `running`: how the snapshot was taken.
+    pub snapshot_method: Option<SnapshotMethod>,
+    /// From `running`, for `pause_copy`: how long the VM was paused.
+    pub pause_ms: Option<u64>,
+    /// On `succeeded`: the manifest's key, relative to the repository root.
+    pub manifest_key: Option<String>,
+    /// On `succeeded`: BLAKE3 of the encrypted manifest object.
+    pub manifest_digest: Option<String>,
+    /// On `succeeded`: size of the snapshot.
+    pub logical_bytes: Option<u64>,
+    /// On `succeeded`: bytes of chunk objects this backup created.
+    pub uploaded_bytes: Option<u64>,
+    /// On `succeeded`: chunks the manifest lists.
+    pub chunk_count: Option<u64>,
+    /// One-line reason, on `failed`.
+    pub error: Option<String>,
+    /// When the node left `queued`.
+    pub started_at: Option<String>,
+    /// When the node finished its part.
+    pub finished_at: Option<String>,
+    /// Node-local path of the snapshot file, so a restart can delete what a
+    /// crash left (`engine-trait.md` section 3.16). Never reported.
+    pub snapshot_path: Option<String>,
+}
+
+impl BackupRecord {
+    /// The `status_report.backups[]` entry for this row (section 5.3).
+    #[must_use]
+    pub fn to_status(&self) -> quoro_proto::wire::BackupStatus {
+        quoro_proto::wire::BackupStatus {
+            backup_id: self.backup_id.clone(),
+            status: self.status,
+            snapshot_method: self.snapshot_method,
+            pause_ms: self.pause_ms,
+            manifest_key: self.manifest_key.clone(),
+            manifest_digest: self.manifest_digest.clone(),
+            logical_bytes: self.logical_bytes,
+            uploaded_bytes: self.uploaded_bytes,
+            chunk_count: self.chunk_count,
+            error: self.error.clone(),
+            started_at: self.started_at.clone(),
+            finished_at: self.finished_at.clone(),
+        }
+    }
 }
 
 /// The `node_meta` key holding the node's failed mark (section 12).
@@ -1152,6 +1232,100 @@ impl NodeStore {
             .map(|_| ())
     }
 
+    /// One backup job row.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure or a row it cannot read back.
+    pub async fn backup(&self, backup_id: &str) -> Result<Option<BackupRecord>, AgentError> {
+        let row = sqlx::query("SELECT * FROM backups WHERE backup_id = ?")
+            .bind(backup_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(store_error)?;
+        row.map(backup_record).transpose()
+    }
+
+    /// Every backup job row, sorted by id.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure or a row it cannot read back.
+    pub async fn backups(&self) -> Result<Vec<BackupRecord>, AgentError> {
+        let rows = sqlx::query("SELECT * FROM backups ORDER BY backup_id ASC")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(store_error)?;
+        rows.into_iter().map(backup_record).collect()
+    }
+
+    /// Inserts or replaces one backup job row.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn save_backup(&self, record: &BackupRecord) -> Result<(), AgentError> {
+        sqlx::query(
+            "INSERT INTO backups (backup_id, app_id, volume_id, status, snapshot_method, \
+             pause_ms, manifest_key, manifest_digest, logical_bytes, uploaded_bytes, \
+             chunk_count, error, started_at, finished_at, snapshot_path) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(backup_id) DO UPDATE SET app_id = excluded.app_id, \
+             volume_id = excluded.volume_id, status = excluded.status, \
+             snapshot_method = excluded.snapshot_method, pause_ms = excluded.pause_ms, \
+             manifest_key = excluded.manifest_key, manifest_digest = excluded.manifest_digest, \
+             logical_bytes = excluded.logical_bytes, uploaded_bytes = excluded.uploaded_bytes, \
+             chunk_count = excluded.chunk_count, error = excluded.error, \
+             started_at = excluded.started_at, finished_at = excluded.finished_at, \
+             snapshot_path = excluded.snapshot_path",
+        )
+        .bind(&record.backup_id)
+        .bind(&record.app_id)
+        .bind(&record.volume_id)
+        .bind(backup_state_str(record.status))
+        .bind(record.snapshot_method.map(snapshot_method_str))
+        .bind(record.pause_ms.and_then(|ms| i64::try_from(ms).ok()))
+        .bind(record.manifest_key.as_deref())
+        .bind(record.manifest_digest.as_deref())
+        .bind(
+            record
+                .logical_bytes
+                .and_then(|bytes| i64::try_from(bytes).ok()),
+        )
+        .bind(
+            record
+                .uploaded_bytes
+                .and_then(|bytes| i64::try_from(bytes).ok()),
+        )
+        .bind(
+            record
+                .chunk_count
+                .and_then(|count| i64::try_from(count).ok()),
+        )
+        .bind(record.error.as_deref())
+        .bind(record.started_at.as_deref())
+        .bind(record.finished_at.as_deref())
+        .bind(record.snapshot_path.as_deref())
+        .execute(&self.pool)
+        .await
+        .map_err(store_error)
+        .map(|_| ())
+    }
+
+    /// Removes one backup job row, once its job left `spec.backups`.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn delete_backup(&self, backup_id: &str) -> Result<(), AgentError> {
+        sqlx::query("DELETE FROM backups WHERE backup_id = ?")
+            .bind(backup_id)
+            .execute(&self.pool)
+            .await
+            .map_err(store_error)
+            .map(|_| ())
+    }
+
     /// Every lease row, as last saved (section 12 `leases`).
     ///
     /// # Errors
@@ -1403,6 +1577,70 @@ fn parse_volume_state(text: &str) -> Result<VolumeState, AgentError> {
             "a stored volume has an unknown state {other:?}"
         ))),
     }
+}
+
+fn backup_state_str(state: BackupState) -> &'static str {
+    match state {
+        BackupState::Queued => "queued",
+        BackupState::Running => "running",
+        BackupState::Succeeded => "succeeded",
+        BackupState::Failed => "failed",
+    }
+}
+
+fn parse_backup_state(text: &str) -> Result<BackupState, AgentError> {
+    match text {
+        "queued" => Ok(BackupState::Queued),
+        "running" => Ok(BackupState::Running),
+        "succeeded" => Ok(BackupState::Succeeded),
+        "failed" => Ok(BackupState::Failed),
+        other => Err(AgentError::Store(format!(
+            "a stored backup has an unknown status {other:?}"
+        ))),
+    }
+}
+
+fn snapshot_method_str(method: SnapshotMethod) -> &'static str {
+    match method {
+        SnapshotMethod::Reflink => "reflink",
+        SnapshotMethod::PauseCopy => "pause_copy",
+    }
+}
+
+fn parse_snapshot_method(text: &str) -> Result<SnapshotMethod, AgentError> {
+    match text {
+        "reflink" => Ok(SnapshotMethod::Reflink),
+        "pause_copy" => Ok(SnapshotMethod::PauseCopy),
+        other => Err(AgentError::Store(format!(
+            "a stored backup has an unknown snapshot method {other:?}"
+        ))),
+    }
+}
+
+fn backup_record(row: sqlx::sqlite::SqliteRow) -> Result<BackupRecord, AgentError> {
+    let status: String = row.try_get("status").map_err(store_error)?;
+    let method: Option<String> = row.try_get("snapshot_method").map_err(store_error)?;
+    let pause_ms: Option<i64> = row.try_get("pause_ms").map_err(store_error)?;
+    let logical_bytes: Option<i64> = row.try_get("logical_bytes").map_err(store_error)?;
+    let uploaded_bytes: Option<i64> = row.try_get("uploaded_bytes").map_err(store_error)?;
+    let chunk_count: Option<i64> = row.try_get("chunk_count").map_err(store_error)?;
+    Ok(BackupRecord {
+        backup_id: row.try_get("backup_id").map_err(store_error)?,
+        app_id: row.try_get("app_id").map_err(store_error)?,
+        volume_id: row.try_get("volume_id").map_err(store_error)?,
+        status: parse_backup_state(&status)?,
+        snapshot_method: method.as_deref().map(parse_snapshot_method).transpose()?,
+        pause_ms: pause_ms.and_then(|ms| u64::try_from(ms).ok()),
+        manifest_key: row.try_get("manifest_key").map_err(store_error)?,
+        manifest_digest: row.try_get("manifest_digest").map_err(store_error)?,
+        logical_bytes: logical_bytes.and_then(|bytes| u64::try_from(bytes).ok()),
+        uploaded_bytes: uploaded_bytes.and_then(|bytes| u64::try_from(bytes).ok()),
+        chunk_count: chunk_count.and_then(|count| u64::try_from(count).ok()),
+        error: row.try_get("error").map_err(store_error)?,
+        started_at: row.try_get("started_at").map_err(store_error)?,
+        finished_at: row.try_get("finished_at").map_err(store_error)?,
+        snapshot_path: row.try_get("snapshot_path").map_err(store_error)?,
+    })
 }
 
 fn volume_record(row: sqlx::sqlite::SqliteRow) -> Result<VolumeRecord, AgentError> {
