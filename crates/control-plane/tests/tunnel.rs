@@ -1450,3 +1450,196 @@ async fn a_replica_count_across_one_moves_the_hostname_between_node_and_edge() {
         "{writes:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A scale-down that would leave tunnel domains without a tunnel (issue #345)
+// ---------------------------------------------------------------------------
+
+/// Writes a succeeded deployment as the app's current one, with one running
+/// instance on each of `nodes` linked to it, and sets the app's replica count
+/// to match.
+async fn deploy_on(server: &Server, app_id: &str, nodes: &[&str]) {
+    let pool = server.state.store.pool();
+    let now = quoro_control_plane::store::now_rfc3339();
+    let project_id: String = sqlx::query_scalar("SELECT project_id FROM apps WHERE id = ?")
+        .bind(app_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let deployment_id = "dep_01HZZZZZZZZZZZZZZZZZZZZZZZ".to_string();
+    sqlx::query(
+        "INSERT INTO deployments (id, app_id, image, status, \"trigger\", created_by_type, \
+         created_by_id, created_at, finished_at) \
+         VALUES (?, ?, 'ghcr.io/example/web@sha256:1111', 'succeeded', 'api', 'user', 'usr_test', ?, ?)",
+    )
+    .bind(&deployment_id)
+    .bind(app_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .unwrap();
+    for node_id in nodes {
+        sqlx::query(
+            "INSERT INTO vms (id, project_id, app_id, node_id, name, vcpus, memory_mb, disk_gb, \
+             image, desired_status, observed_status, ip, restart_generation, restart_count, \
+             last_exit_code, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, 'web', 1, 256, 1, 'ghcr.io/example/web@sha256:1111', 'running', \
+             'running', NULL, 0, 0, NULL, ?, ?)",
+        )
+        .bind(quoro_types::new_id(quoro_types::Prefix::Vm))
+        .bind(&project_id)
+        .bind(app_id)
+        .bind(node_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query("UPDATE apps SET current_deployment_id = ?, replicas = ? WHERE id = ?")
+        .bind(&deployment_id)
+        .bind(i64::try_from(nodes.len()).unwrap())
+        .bind(app_id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// The nodes that run an instance of `app_id`, in id order.
+async fn instance_nodes(server: &Server, app_id: &str) -> Vec<String> {
+    sqlx::query_scalar("SELECT node_id FROM vms WHERE app_id = ? ORDER BY node_id")
+        .bind(app_id)
+        .fetch_all(server.state.store.pool())
+        .await
+        .unwrap()
+}
+
+/// The `data` of every `certificate.failed` event, oldest first.
+async fn certificate_failures(server: &Server) -> Vec<Value> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT data FROM events WHERE type = 'certificate.failed' ORDER BY seq",
+    )
+    .fetch_all(server.state.store.pool())
+    .await
+    .unwrap();
+    rows.iter()
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_scale_down_keeps_the_instance_on_the_node_with_a_tunnel() {
+    let mock = start_mock().await;
+    let server = start_with_cloudflare(&mock.base, &format!("{}/dns-query", mock.base)).await;
+    let owner = server.owner().await;
+    insert_machine(&server, NODE_A, "alpha", &["node"]).await;
+    insert_machine(&server, NODE_B, "beta", &["node"]).await;
+    insert_machine(&server, EDGE, "edge", &["edge"]).await;
+    let provider = create_provider(
+        &server,
+        &owner,
+        "tunnel",
+        "Tunnel",
+        json!({ "account_id": ACCOUNT_ID, "zone_id": ZONE_ID }),
+    )
+    .await;
+    let provider_id = provider["id"].as_str().unwrap().to_string();
+    // Only the node with the higher id has a tunnel, so the old order (the
+    // highest node ids go first) would keep the instance on the other one.
+    let node_tunnel = map_tunnel(&server, &owner, &mock, NODE_B, "beta", &provider_id).await;
+    let edge_tunnel = map_tunnel(&server, &owner, &mock, EDGE, "edge", &provider_id).await;
+    let app_id = setup_project_and_app(&server, &owner).await;
+    deploy_on(&server, &app_id, &[NODE_A, NODE_B]).await;
+    create_domain(
+        &server,
+        &owner,
+        &app_id,
+        "kept.example.com",
+        "tunnel",
+        &provider_id,
+    )
+    .await;
+    settles_on(&mock, "kept.example.com", &edge_tunnel).await;
+
+    set_replicas(&server, &owner, &app_id, 1).await;
+    assert_eq!(instance_nodes(&server, &app_id).await, vec![NODE_B]);
+    settles_on(&mock, "kept.example.com", &node_tunnel).await;
+    wait_for(|| tunnel_routes(&mock, &node_tunnel, "kept.example.com").then_some(())).await;
+    assert!(certificate_failures(&server).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_scale_down_without_a_node_tunnel_reports_the_tunnel_domains() {
+    let mock = start_mock().await;
+    let server = start_with_cloudflare(&mock.base, &format!("{}/dns-query", mock.base)).await;
+    let owner = server.owner().await;
+    insert_machine(&server, NODE_A, "alpha", &["node"]).await;
+    insert_machine(&server, NODE_B, "beta", &["node"]).await;
+    insert_machine(&server, EDGE, "edge", &["edge"]).await;
+    let provider = create_provider(
+        &server,
+        &owner,
+        "tunnel",
+        "Tunnel",
+        json!({ "account_id": ACCOUNT_ID, "zone_id": ZONE_ID }),
+    )
+    .await;
+    let provider_id = provider["id"].as_str().unwrap().to_string();
+    let edge_tunnel = map_tunnel(&server, &owner, &mock, EDGE, "edge", &provider_id).await;
+    let app_id = setup_project_and_app(&server, &owner).await;
+    deploy_on(&server, &app_id, &[NODE_A, NODE_B]).await;
+    let domain = create_domain(
+        &server,
+        &owner,
+        &app_id,
+        "dark.example.com",
+        "tunnel",
+        &provider_id,
+    )
+    .await;
+    settles_on(&mock, "dark.example.com", &edge_tunnel).await;
+    assert!(certificate_failures(&server).await.is_empty());
+
+    // No node has a tunnel: the scale-down keeps the old order, and the
+    // hostname that no tunnel serves any more is reported, not dropped
+    // silently.
+    set_replicas(&server, &owner, &app_id, 1).await;
+    assert_eq!(instance_nodes(&server, &app_id).await, vec![NODE_A]);
+    let failures = certificate_failures(&server).await;
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert_eq!(failures[0]["domain_id"], domain["id"]);
+    assert_eq!(failures[0]["hostname"], "dark.example.com");
+    assert_eq!(failures[0]["tls_mode"], "tunnel");
+    assert!(
+        failures[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("no instance of the app runs on a node with a tunnel"),
+        "{failures:?}"
+    );
+    let res = owner
+        .get(server.url("/api/v1/events?type=certificate.failed"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let page: Value = res.json().await.unwrap();
+    let event = &page["items"][0];
+    assert_eq!(
+        event["subject"],
+        json!({ "type": "domain", "id": domain["id"] })
+    );
+    // A tunnel domain has no certificate: its status does not change.
+    let res = owner
+        .get(server.url(&format!("/api/v1/apps/{app_id}/domains")))
+        .send()
+        .await
+        .unwrap();
+    let domains: Value = res.json().await.unwrap();
+    assert_eq!(domains["items"][0]["cert_status"], "not_applicable");
+
+    // Scaling up again hands the hostname back to the edge.
+    set_replicas(&server, &owner, &app_id, 2).await;
+    settles_on(&mock, "dark.example.com", &edge_tunnel).await;
+}
