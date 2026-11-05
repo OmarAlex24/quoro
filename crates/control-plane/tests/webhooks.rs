@@ -488,11 +488,16 @@ async fn delivers_signed_event_and_records_the_attempt() {
                 .fetch_optional(server.state.store.pool())
                 .await
                 .unwrap()?;
-        Some((
-            row.get::<String, _>("status"),
-            row.get::<Option<i64>, _>("response_code"),
-            row.get::<Option<String>, _>("error"),
-        ))
+        // The receiver can see the request before the dispatcher records the
+        // response, so wait until the delivery leaves `pending`.
+        let status = row.get::<String, _>("status");
+        (status != "pending").then(|| {
+            (
+                status,
+                row.get::<Option<i64>, _>("response_code"),
+                row.get::<Option<String>, _>("error"),
+            )
+        })
     })
     .await;
     assert_eq!(row, ("delivered".to_string(), Some(200), None));
