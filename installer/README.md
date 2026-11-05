@@ -16,6 +16,11 @@ needs `useradd` for its system account. The engine also needs `mkfs.ext4`
 which the node agent runs to fetch the app's commit: when one is missing the
 installer runs `apt-get update` and then installs the four packages from apt
 without recommends; without `apt-get` it stops and names the missing tool.
+It also installs `xfsprogs` when `mkfs.xfs` is missing, as an optional
+package: on a data directory without reflink the engine keeps volumes in a
+loop-mounted XFS pool so that volume snapshots need no pause (ADR 0156), and
+without it the engine falls back to pausing the app for a copy; a failed
+install is only a warning.
 `/dev/kvm` is required at run time: the installer warns when it is absent (the
 node agent then refuses to start the engine), so the files can still be
 inspected on a machine without virtualisation. The installer stops and lists

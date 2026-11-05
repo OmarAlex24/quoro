@@ -98,8 +98,14 @@ pub(super) struct Inner {
     /// or two creates of one volume, can never share a path.
     pub(super) inflight_disks: StdMutex<HashMap<PathBuf, VmId>>,
     /// How `snapshot_volume` takes a snapshot on this node, probed once at
-    /// start-up (§3.16, ADR 0146).
+    /// start-up in the volume directory or inside the pool (§3.16, ADR 0156).
     pub(super) volume_method: SnapshotMethod,
+    /// The loop-mounted XFS pool that holds volume files, when this node has
+    /// one (§3.16, ADR 0156).
+    pub(super) pool: super::pool::VolumePool,
+    /// Serializes growing the pool with the volume create that needs it, so
+    /// two creates never race on the pool's size (§3.16).
+    pub(super) pool_grow: Mutex<()>,
     /// Serializes peer-set syncs, so the last one applied saw the latest state.
     pub(super) peers_sync: Mutex<()>,
 }
@@ -257,11 +263,20 @@ impl Inner {
         }
 
         // Volumes are sparse files owned by root, so the directory is 0700 and
-        // the probe starts as soon as it exists (§3.20, §3.16).
+        // the snapshot method is decided as soon as it exists: the pool is
+        // attached before any other volume call, and a pool image that exists
+        // but does not mount must never fall back to the empty directory
+        // underneath it (§3.20, §3.16, ADR 0156).
         let volumes_dir = config.state_dir.join("volumes");
         create_parent_dirs_0700(&volumes_dir)?;
-        super::volume::remove_leftovers(&volumes_dir);
-        let volume_method = super::volume::probe_method(&volumes_dir);
+        let attachment = super::pool::attach(&config.state_dir, &volumes_dir).await;
+        let volume_method = attachment.method;
+        let pool = attachment.pool;
+        if !matches!(pool, super::pool::VolumePool::Broken { .. }) {
+            // Leftovers live inside the pool, so they are only reachable once
+            // it is mounted; a broken pool's directory is never touched.
+            super::volume::remove_leftovers(&volumes_dir);
+        }
 
         let initramfs = config.state_dir.join("boot").join("initramfs.cpio");
         let init_binary = config.init_binary.clone();
@@ -293,6 +308,8 @@ impl Inner {
             inflight_peers: StdMutex::new(HashMap::new()),
             inflight_disks: StdMutex::new(HashMap::new()),
             volume_method,
+            pool,
+            pool_grow: Mutex::new(()),
             peers_sync: Mutex::new(()),
         });
         inner.rediscover(&vms_root).await?;
@@ -409,6 +426,9 @@ impl Inner {
 
     /// What this backend and build support (§3.1).
     pub(super) fn capabilities(&self) -> Capabilities {
+        // A pool image that does not mount leaves the node without volume
+        // snapshots: the node agent reports its volumes failed (§3.16).
+        let pool_broken = matches!(self.pool, super::pool::VolumePool::Broken { .. });
         Capabilities {
             engine: "cloud-hypervisor".to_string(),
             version: self.ch_version.clone(),
@@ -416,9 +436,13 @@ impl Inner {
             text_console: true,
             graphical_console: false,
             vm_snapshot: false,
-            volume_snapshot: true,
+            volume_snapshot: !pool_broken,
             exec: true,
-            volume_snapshot_method: Some(self.volume_method),
+            volume_snapshot_method: if pool_broken {
+                None
+            } else {
+                Some(self.volume_method)
+            },
         }
     }
 

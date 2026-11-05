@@ -827,6 +827,29 @@ install_host_packages() {
     log 'host packages installed'
 }
 
+# Installs xfsprogs when it is missing. Optional: on a data directory without
+# reflink the engine keeps volumes in a loop-mounted XFS pool so that volume
+# snapshots need no pause (ADR 0156); without mkfs.xfs it falls back to
+# pause_copy, so a failure here is a warning, never fatal.
+install_optional_packages() {
+    if has_host_tool mkfs.xfs && has_host_tool xfs_growfs; then
+        log 'host tools present: mkfs.xfs, xfs_growfs'
+        return 0
+    fi
+    if ! command -v apt-get >/dev/null 2>&1; then
+        log 'warning: mkfs.xfs is missing and apt-get is not available; install xfsprogs, or volume snapshots on a filesystem without reflink pause the app (ADR 0156)'
+        return 0
+    fi
+    log 'installing the optional host package xfsprogs (volume pool, ADR 0156)'
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends xfsprogs ||
+        { DEBIAN_FRONTEND=noninteractive apt-get update -q &&
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends xfsprogs; }; then
+        log 'xfsprogs installed'
+    else
+        log 'warning: apt-get install failed for xfsprogs; volume snapshots on a filesystem without reflink pause the app (ADR 0156)'
+    fi
+}
+
 install_dirs() {
     # Older installs created a quoro system user that ran the service. The
     # engine manages a bridge, TAP devices and nftables rules and converts
@@ -1447,6 +1470,7 @@ main() {
     # Every role that runs the agent gets the host packages: an edge runs no
     # engine, but the mesh needs ip and nft (ADR 0144).
     install_host_packages
+    install_optional_packages
     install_dirs
     if [ "$ROLE" = 'primary' ]; then
         install_api_user

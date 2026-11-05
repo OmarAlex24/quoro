@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Local volumes and their snapshots (engine-trait.md §3.16, §3.20; ADR 0145,
-//! ADR 0146).
+//! ADR 0156).
 //!
 //! A volume is one sparse raw file, named by the volume id, in
 //! `<state_dir>/volumes/`, owned by root and never mounted on the host. The
 //! engine checks and formats it with `mkfs.ext4` on the file itself, attaches
 //! it as a writable virtio-blk disk and snapshots it by `FICLONE` when the
 //! node's filesystem reflinks, or by pausing the using VM, copying the sparse
-//! file and resuming it otherwise. The method is probed once at start-up.
+//! file and resuming it otherwise. The method is probed once at start-up, in
+//! the volume directory itself or inside the loop-mounted XFS volume pool
+//! [`super::pool`] puts there on a filesystem that does not reflink.
 //!
 //! [`Inner`]'s volume methods live here so `engine.rs` stays a lifecycle
 //! module; they share its locks and its record view through the
@@ -25,6 +27,7 @@ use rustix::io::Errno;
 
 use super::api::ApiClient;
 use super::engine::{Inner, create_work_disk_file, io_error, lock};
+use super::pool::VolumePool;
 use crate::ch::state;
 use crate::ch::tools;
 use crate::{
@@ -34,7 +37,7 @@ use crate::{
 /// Free bytes the volume directory keeps for the filesystem's metadata: a
 /// sparse file itself needs almost nothing up front, but `mkfs.ext4` writes
 /// inode and journal metadata into it (contract §3.20).
-const METADATA_MARGIN: u64 = 64 * 1024 * 1024;
+pub(super) const METADATA_MARGIN: u64 = 64 * 1024 * 1024;
 
 /// Bytes copied per `copy_file_range` call. Large enough to keep the syscall
 /// count low, small enough that a resume never waits on one huge call.
@@ -180,7 +183,7 @@ pub(super) fn remove_leftovers(dir: &Path) {
 }
 
 /// Free bytes available to the volume directory.
-fn available_bytes(dir: &Path) -> Result<u64, EngineError> {
+pub(super) fn available_bytes(dir: &Path) -> Result<u64, EngineError> {
     let stat = rustix::fs::statvfs(dir).map_err(|err| io_error(dir, &err.into()))?;
     Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
 }
@@ -311,6 +314,27 @@ fn copy_extent(
     Ok(())
 }
 
+/// Imports a restored file that lives on another filesystem (§3.20).
+///
+/// Copies `from` into `temp`, a file in the volume directory, keeping its
+/// holes; [`copy_sparse`] sets its length and syncs it. The temporary file is
+/// then renamed onto `path`, the directory entry is synced and `from` is
+/// removed. Any failure removes the temporary file and leaves `from` for the
+/// caller, so the node agent can retry the import.
+fn import_by_copy(from: &Path, temp: &Path, path: &Path) -> Result<(), EngineError> {
+    let _ = std::fs::remove_file(temp);
+    let copied = copy_sparse(from, temp).map(|_| ());
+    let imported = copied.and_then(|()| {
+        std::fs::rename(temp, path).map_err(|err| io_error(path, &err))?;
+        state::sync_dir(path)
+    });
+    if let Err(err) = imported {
+        let _ = std::fs::remove_file(temp);
+        return Err(err);
+    }
+    std::fs::remove_file(from).map_err(|err| io_error(from, &err))
+}
+
 /// fsyncs the temporary file before the rename that publishes it.
 fn sync_file(path: &Path) -> Result<(), EngineError> {
     let file = File::open(path).map_err(|err| io_error(path, &err))?;
@@ -343,6 +367,15 @@ impl Inner {
         volume_dir(self)
     }
 
+    /// The filesystem whose free space bounds new volume data (§3.16): the
+    /// host's when the pool holds the data, the volume directory otherwise.
+    fn space_dir(&self) -> PathBuf {
+        match &self.pool {
+            VolumePool::Mounted { .. } => self.config.state_dir.clone(),
+            VolumePool::Absent | VolumePool::Broken { .. } => self.volumes_dir(),
+        }
+    }
+
     /// Reserves every volume file of `spec`, refusing a missing file, a file
     /// another VM attaches, and a concurrent create that holds it (§3.6).
     ///
@@ -358,6 +391,9 @@ impl Inner {
                 paths: Vec::new(),
             });
         }
+        // A VM with volumes cannot be created while the pool is unusable: the
+        // nodes underneath it would be used by mistake (§3.16).
+        self.volume_pool_error()?;
         validate_volume_attaches(spec)?;
         let dir = self.volumes_dir();
         let mut paths = Vec::with_capacity(spec.volumes.len());
@@ -431,6 +467,7 @@ impl Inner {
         size_gb: u32,
     ) -> Result<VolumeInfo, EngineError> {
         validate_volume_id(id)?;
+        self.volume_pool_error()?;
         let dir = self.volumes_dir();
         let path = volume_path(&dir, id);
         let expected = u64::from(size_gb) << 30;
@@ -456,11 +493,21 @@ impl Inner {
             Err(err) => return Err(io_error(&path, &err)),
         }
 
-        let available = available_bytes(&dir)?;
+        // The pool must be able to hold the new volume and one snapshot of it
+        // before the file is created, and the lock keeps a concurrent create
+        // from sizing the pool without this volume (§3.16).
+        let _growing = match &self.pool {
+            VolumePool::Mounted { .. } => Some(self.pool_grow.lock().await),
+            VolumePool::Absent | VolumePool::Broken { .. } => None,
+        };
+        self.grow_pool_for(expected).await?;
+
+        let space = self.space_dir();
+        let available = available_bytes(&space)?;
         if available < METADATA_MARGIN {
             return Err(EngineError::ResourceExhausted(format!(
                 "{} has {available} bytes free, below the {METADATA_MARGIN} byte metadata margin",
-                dir.display()
+                space.display()
             )));
         }
 
@@ -509,6 +556,11 @@ impl Inner {
     }
 
     /// Moves a restored raw file into place as one volume (§3.20).
+    ///
+    /// A plain rename when the file is on the volume directory's filesystem;
+    /// otherwise (the pool is another filesystem) the file is copied with
+    /// [`copy_sparse`], which keeps its holes, and the copy is renamed into
+    /// place before the given file is removed.
     pub(super) async fn import_volume(
         &self,
         id: &VolumeId,
@@ -516,6 +568,7 @@ impl Inner {
         from: &Path,
     ) -> Result<VolumeInfo, EngineError> {
         validate_volume_id(id)?;
+        self.volume_pool_error()?;
         let dir = self.volumes_dir();
         let path = volume_path(&dir, id);
         if path.exists() {
@@ -541,18 +594,29 @@ impl Inner {
                 metadata.len()
             )));
         }
-        std::fs::rename(from, &path).map_err(|err| {
-            if err.raw_os_error() == Some(rustix::io::Errno::XDEV.raw_os_error()) {
-                EngineError::Io(format!(
-                    "{} and {} are on different filesystems: {err}",
-                    from.display(),
-                    path.display()
-                ))
-            } else {
-                io_error(&path, &err)
+        // The pool grows for the restored volume before it is moved in
+        // (§3.16); the lock keeps a concurrent create from racing the size.
+        let _growing = match &self.pool {
+            VolumePool::Mounted { .. } => Some(self.pool_grow.lock().await),
+            VolumePool::Absent | VolumePool::Broken { .. } => None,
+        };
+        self.grow_pool_for(expected).await?;
+        let temp = dir.join(format!("{}.tmp", id.0));
+        match std::fs::rename(from, &path) {
+            Ok(()) => state::sync_dir(&path)?,
+            // The node agent stages its restores outside the pool, so the
+            // rename crosses a filesystem: copy, sync, rename, then remove
+            // the staged file (§3.20).
+            Err(err) if err.raw_os_error() == Some(rustix::io::Errno::XDEV.raw_os_error()) => {
+                let source = from.to_path_buf();
+                let copy = temp.clone();
+                let target = path.clone();
+                tokio::task::spawn_blocking(move || import_by_copy(&source, &copy, &target))
+                    .await
+                    .map_err(|err| EngineError::Io(format!("volume task failed: {err}")))??;
             }
-        })?;
-        state::sync_dir(&path)?;
+            Err(err) => return Err(io_error(&path, &err)),
+        }
         volume_info(id, size_gb, path)
     }
 
@@ -561,6 +625,7 @@ impl Inner {
     /// A leftover snapshot of the volume goes with it; a missing file is `Ok`.
     pub(super) async fn delete_volume(&self, id: &VolumeId) -> Result<(), EngineError> {
         validate_volume_id(id)?;
+        self.volume_pool_error()?;
         let dir = self.volumes_dir();
         let path = volume_path(&dir, id);
         for (vm_id, entry) in self.entries() {
@@ -609,6 +674,7 @@ impl Inner {
         id: &VolumeId,
     ) -> Result<VolumeSnapshot, EngineError> {
         validate_volume_id(id)?;
+        self.volume_pool_error()?;
         let dir = self.volumes_dir();
         let path = volume_path(&dir, id);
         let metadata = match std::fs::symlink_metadata(&path) {
@@ -645,7 +711,8 @@ impl Inner {
                     .map_err(|err| EngineError::Io(format!("snapshot task failed: {err}")))??;
             }
             SnapshotMethod::PauseCopy => {
-                let available = available_bytes(&dir)?;
+                let space = self.space_dir();
+                let available = available_bytes(&space)?;
                 if available < allocated {
                     return Err(EngineError::ResourceExhausted(format!(
                         "volume {} uses {allocated} bytes and only {available} are free",
@@ -710,6 +777,7 @@ impl Inner {
         &self,
         snapshot: &VolumeSnapshot,
     ) -> Result<(), EngineError> {
+        self.volume_pool_error()?;
         let dir = self.volumes_dir();
         let is_snapshot_file = snapshot
             .location
@@ -761,8 +829,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        copy_sparse, is_crockford, is_volume_serial, probe_method, remove_leftovers, snapshot_path,
-        validate_volume_attaches, validate_volume_id, volume_path,
+        copy_sparse, import_by_copy, is_crockford, is_volume_serial, probe_method,
+        remove_leftovers, snapshot_path, validate_volume_attaches, validate_volume_id, volume_path,
     };
     use crate::{
         EngineError, ImageDigest, InitConfig, MacAddr, NetAttach, SerialMode, SnapshotMethod, VmId,
@@ -970,6 +1038,62 @@ mod tests {
                 "the clone is not sparse: {allocated} bytes allocated"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_by_copy_keeps_the_holes_and_takes_the_given_file() {
+        let dir = scratch_dir("import");
+        let from = dir.join("restored.img");
+        let temp = dir.join("vol_01JC9ZC2D3E4F5G6H7J8K9M0NP.tmp");
+        let path = dir.join("vol_01JC9ZC2D3E4F5G6H7J8K9M0NP");
+        const LENGTH: u64 = 8 * 1024 * 1024;
+        let mut file = std::fs::File::create(&from).expect("create");
+        file.set_len(LENGTH).expect("set length");
+        file.seek(SeekFrom::Start(0)).expect("seek");
+        file.write_all(&[7_u8; 4096]).expect("write head");
+        file.seek(SeekFrom::Start(LENGTH - 4096))
+            .expect("seek tail");
+        file.write_all(&[5_u8; 4096]).expect("write tail");
+        file.sync_all().expect("sync");
+        // A crash left a temporary file behind; the import replaces it.
+        std::fs::write(&temp, b"stale").expect("stale temp");
+
+        import_by_copy(&from, &temp, &path).expect("copy import");
+        assert!(!from.exists(), "the given file is removed");
+        assert!(!temp.exists(), "the temporary file is renamed away");
+        let metadata = std::fs::metadata(&path).expect("volume file");
+        assert_eq!(metadata.len(), LENGTH);
+        let mut read = std::fs::File::open(&path).expect("open");
+        let mut bytes = Vec::new();
+        read.read_to_end(&mut bytes).expect("read");
+        assert!(bytes[..4096].iter().all(|byte| *byte == 7));
+        assert!(
+            bytes[4096..LENGTH as usize - 4096]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        assert!(
+            bytes[LENGTH as usize - 4096..]
+                .iter()
+                .all(|byte| *byte == 5)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_by_copy_leaves_the_given_file_when_the_rename_fails() {
+        let dir = scratch_dir("import-fail");
+        let from = dir.join("restored.img");
+        let temp = dir.join("volume.tmp");
+        let path = dir.join("volume");
+        std::fs::write(&from, b"quoro").expect("source");
+        std::fs::create_dir(&path).expect("a directory is in the way");
+
+        let err = import_by_copy(&from, &temp, &path).expect_err("rename onto a directory fails");
+        assert!(matches!(err, EngineError::Io(_)), "{err:?}");
+        assert!(from.exists(), "the given file is left for the caller");
+        assert!(!temp.exists(), "no temporary file is left behind");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

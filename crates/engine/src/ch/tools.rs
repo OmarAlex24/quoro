@@ -58,11 +58,19 @@ impl HostTools {
 
 /// The first executable regular file called `name`, or `Unsupported`.
 fn find(name: &str, package: &str) -> Result<PathBuf, EngineError> {
+    find_optional(name)
+        .ok_or_else(|| EngineError::Unsupported(format!("{name} not found; install {package}")))
+}
+
+/// The first executable regular file called `name`, when the host has one.
+///
+/// Optional host programs come through here: a tool a feature can live
+/// without never fails the engine's start-up (§3.16).
+pub fn find_optional(name: &str) -> Option<PathBuf> {
     SEARCH_DIRS
         .iter()
         .map(|dir| Path::new(dir).join(name))
         .find(|candidate| is_executable(candidate))
-        .ok_or_else(|| EngineError::Unsupported(format!("{name} not found; install {package}")))
 }
 
 /// True when `path` is a file (following symlinks) with an executable bit.
@@ -153,6 +161,35 @@ async fn run_inner(
     )))
 }
 
+/// [`run`], for a caller that is not on the runtime.
+///
+/// `ChEngine::detach_volume_pool` runs outside the runtime (§3.16); a short
+/// `umount` that returns promptly on a busy filesystem is the right tool
+/// there, so this variant has no timeout.
+///
+/// # Errors
+///
+/// The same as [`run`], without the timeout.
+pub(crate) fn run_blocking(program: &Path, args: &[&str]) -> Result<String, EngineError> {
+    let label = label(program, args);
+    let output = std::process::Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|err| EngineError::Io(format!("{label}: {err}")))?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+    let code = output
+        .status
+        .code()
+        .map_or_else(|| "killed by signal".to_owned(), |code| code.to_string());
+    Err(EngineError::Io(format!(
+        "{label}: exit {code}: {}",
+        detail(&output.stdout, &output.stderr)
+    )))
+}
+
 /// The command as it appears in an error message.
 fn label(program: &Path, args: &[&str]) -> String {
     format!("{} {}", program.display(), args.join(" "))
@@ -190,6 +227,17 @@ mod tests {
         assert!(tools.ip.ends_with("ip"));
         assert!(tools.nft.ends_with("nft"));
         assert!(tools.mkfs_ext4.ends_with("mkfs.ext4"));
+    }
+
+    #[test]
+    fn optional_tools_are_absolute_when_found() {
+        // The pool's tools may be absent; one that is found must be usable.
+        for name in ["mkfs.xfs", "xfs_growfs", "mount", "umount", "losetup"] {
+            if let Some(path) = find_optional(name) {
+                assert!(path.is_absolute(), "{} is not absolute", path.display());
+                assert!(is_executable(&path), "{} is not executable", path.display());
+            }
+        }
     }
 
     #[test]
@@ -260,5 +308,17 @@ mod tests {
             .await
             .expect("cat runs");
         assert_eq!(out, "quoro\n");
+    }
+
+    #[test]
+    fn run_blocking_returns_stdout_and_reports_stderr() {
+        let out = run_blocking(&sh(), &["-c", "printf quoro"]).expect("sh runs");
+        assert_eq!(out, "quoro");
+        let err = run_blocking(&sh(), &["-c", "printf 'busy' >&2; exit 32"])
+            .expect_err("non-zero exit is an error");
+        assert_eq!(
+            err,
+            EngineError::Io("/bin/sh -c printf 'busy' >&2; exit 32: exit 32: busy".to_owned())
+        );
     }
 }

@@ -11,7 +11,7 @@
 //! D-0011); [`engine::Inner`] holds that state, [`supervise`] watches each VMM
 //! process, and [`host`] reads the host facts the trait reports.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,6 +32,7 @@ pub mod vmm;
 mod engine;
 mod exec;
 mod host;
+mod pool;
 mod serial;
 mod stream;
 mod supervise;
@@ -117,6 +118,23 @@ impl ChEngine {
     #[must_use]
     pub fn dropped_events(&self) -> u64 {
         self.inner.dropped_events()
+    }
+
+    /// Detaches the volume pool from `<state_dir>/volumes` (§3.16, ADR 0156).
+    ///
+    /// `umount` releases the auto-clear loop device, so the pool can be
+    /// inspected or the state directory wiped. Only a caller that knows no VM
+    /// on this node attaches a volume may call it: tests between cases, and
+    /// node removal. The engine never calls it on its own, and it refuses
+    /// while the pool still holds a volume file.
+    ///
+    /// # Errors
+    ///
+    /// `Conflict` when the pool still holds a volume or the directory is not
+    /// the pool, `Unsupported` without `umount`, and `Io` when `umount` fails
+    /// or the directory stays mounted.
+    pub fn detach_volume_pool(state_dir: &Path) -> Result<(), EngineError> {
+        pool::detach(state_dir)
     }
 }
 
