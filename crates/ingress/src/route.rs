@@ -19,7 +19,9 @@ pub enum TlsMode {
 /// The distinction is what keeps a non-idempotent request from being executed
 /// twice: a node route may only move on while the body has not started to
 /// stream, and an edge route retries `GET` and `HEAD` once, on another backend,
-/// after a connect failure (`node-agent-protocol.md` section 6.8).
+/// after a connect failure, a reset before the response, or its backend
+/// leaving the rotation before it answered (`node-agent-protocol.md` section
+/// 6.8).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum RetryPolicy {
     /// Try the next backend on a failure while the request body is unsent.
@@ -27,7 +29,8 @@ pub enum RetryPolicy {
     #[default]
     Unsent,
     /// Retry once, on another backend, only for `GET` and `HEAD`, and only
-    /// when connecting failed. This is an edge route's policy.
+    /// when no response came: the connection failed or was reset, or the
+    /// backend left the rotation. This is an edge route's policy.
     IdempotentOnce,
 }
 

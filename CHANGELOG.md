@@ -53,6 +53,7 @@ The M5a milestone: stateless replicas behind an edge, local volumes, cold backup
 - A repository's first backup could start the garbage-collection sweep, which then refused new backups while it ran. The sweep now runs only after a pruning ([#317]).
 - A node session that had already been replaced could, while closing, mark its live node as disconnected. Only the node's current session now records a disconnect ([#325]).
 - Writes to the vulnerability cache could queue for many seconds while each one held a pooled connection, which stalled node sessions until they timed out. The cache now takes one writer at a time, and queued writers no longer hold connections ([#328]).
+- When a replica died without closing its connections, a request the edge had already sent to it over a pooled connection waited for the full 60 second response timeout. The edge now cancels the requests still waiting on a replica that leaves the rotation, and drops its pooled connections. A `GET` or `HEAD` that has not answered yet is retried once on another replica, and any other request answers `502` at once ([#334]).
 
 ### Maintenance
 
@@ -315,6 +316,7 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#325]: https://github.com/OmarAlex24/quoro/pull/325
 [#328]: https://github.com/OmarAlex24/quoro/pull/328
 [#329]: https://github.com/OmarAlex24/quoro/pull/329
+[#334]: https://github.com/OmarAlex24/quoro/pull/334
 [ADR 0019]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0019-fencing-is-mandatory-and-lease-based-node-agent-self-fences.md
 [ADR 0020]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0020-per-app-ha-policies-none-cold-warm-hot-with-cost-shown-in.md
 [ADR 0027]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0027-signed-binaries-and-reproducible-builds-are-mandatory.md
