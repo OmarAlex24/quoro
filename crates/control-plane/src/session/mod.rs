@@ -387,9 +387,10 @@ impl NodeHub {
         }
     }
 
-    /// Tells every edge machine's live session to rebuild its snapshot and to
-    /// reconcile its tunnel, because an input of `spec.edge` changed (ADR
-    /// 0143): a VM, a domain, an app or the edge's own tunnel mapping.
+    /// Tells every edge machine's live session to rebuild its snapshot and
+    /// the tunnel manager to reconcile every mapped machine, because an input
+    /// of `spec.edge` and of the tunnel hostnames changed (ADR 0143): a VM, a
+    /// domain, an app or the edge's own tunnel mapping.
     pub fn edge_changed(&self) {
         let inner = Arc::clone(&self.0);
         tokio::spawn(async move { inner.edge_changed().await });
@@ -875,10 +876,21 @@ impl HubInner {
         self.edge_changed().await;
     }
 
-    /// Tells every edge machine with a live session to rebuild its snapshot
-    /// and to reconcile its tunnel, since `spec.edge` reads `vms`, `domains`
-    /// and `apps.replicas` of the whole cluster.
+    /// Tells every edge machine with a live session to rebuild its snapshot,
+    /// since `spec.edge` reads `vms`, `domains` and `apps.replicas` of the
+    /// whole cluster, and asks the tunnel manager to reconcile every mapped
+    /// machine. The same inputs decide which tunnel serves a `tunnel`
+    /// hostname: a node's, or the edge's for a replicated app. The machines
+    /// whose hostnames changed need not have a session, because the primary
+    /// publishes their tunnel routes and CNAMEs itself.
     async fn edge_changed(&self) {
+        let kick = {
+            let tunnels = self.tunnels.lock().expect("tunnel handle lock");
+            tunnels.clone()
+        };
+        if let Some(kick) = kick {
+            kick.kick_all();
+        }
         let rows: Vec<(String, String)> = match sqlx::query_as(
             "SELECT id, roles FROM nodes WHERE status <> 'removed' ORDER BY id",
         )
@@ -908,18 +920,10 @@ impl HubInner {
                     .get(&node_id)
                     .map(|handle| Arc::clone(&handle.changed))
             };
-            let Some(changed) = changed else {
-                // A machine without a session gets the new snapshot when it
-                // dials.
-                continue;
-            };
-            changed.notify_one();
-            let kick = {
-                let tunnels = self.tunnels.lock().expect("tunnel handle lock");
-                tunnels.clone()
-            };
-            if let Some(kick) = kick {
-                kick.kick(&node_id);
+            // A machine without a session gets the new snapshot when it
+            // dials.
+            if let Some(changed) = changed {
+                changed.notify_one();
             }
         }
     }

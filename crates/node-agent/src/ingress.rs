@@ -731,7 +731,7 @@ impl DnsProvider for SessionDns {
         ))
     }
 
-    async fn delete_cname(&self, _name: &str) -> Result<(), ProviderError> {
+    async fn delete_cname(&self, _name: &str, _target: &str) -> Result<(), ProviderError> {
         Err(ProviderError::Transport(
             "the node holds no DNS credential; CNAMEs are written by the primary".to_string(),
         ))
@@ -1667,7 +1667,11 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(dns.delete_cname("app.example.com").await.is_err());
+        assert!(
+            dns.delete_cname("app.example.com", "tun.cfargotunnel.com")
+                .await
+                .is_err()
+        );
     }
 
     #[test]
