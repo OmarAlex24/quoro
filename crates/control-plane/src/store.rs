@@ -216,12 +216,19 @@ impl Store {
     /// that `seq` assignment in the change log and the audit log never races
     /// (D-0015: one writer).
     ///
+    /// The transaction starts with `BEGIN IMMEDIATE`, so it takes SQLite's
+    /// write lock at once and waits on `busy_timeout` for a writer that does
+    /// not go through the gate. A deferred `BEGIN` would take a read snapshot
+    /// at its first `SELECT` and could not upgrade it to a write once another
+    /// connection committed in between: SQLite answers `SQLITE_BUSY_SNAPSHOT`
+    /// at once, without waiting.
+    ///
     /// # Errors
     ///
-    /// The database error from `BEGIN`.
+    /// The database error from `BEGIN IMMEDIATE`.
     pub async fn begin_write(&self) -> Result<WriteTx, sqlx::Error> {
         let gate = Arc::clone(&self.writer).lock_owned().await;
-        let tx = self.pool.begin().await?;
+        let tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         Ok(WriteTx { tx, _gate: gate })
     }
 }
