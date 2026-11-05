@@ -35,10 +35,10 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     ByteStream, Capabilities, ConsoleMode, ConsoleStream, Engine, EngineError, EngineEvent,
-    EventStream, ExecRequest, ExecSession, HostProbe, ImageConfig, ImageDigest, ImageInventory, ImageRef,
-    LineStream, NodeNetwork, OciLayout, OutputLine, OutputStream, PreparedImage, SerialMode,
-    SnapshotMethod, StopMode, VmCounters, VmId, VmInfo, VmSpec, VmState, VolumeId, VolumeInfo,
-    VolumeSnapshot,
+    EventStream, ExecRequest, ExecSession, HostProbe, ImageConfig, ImageDigest, ImageInventory,
+    ImageRef, LineStream, NodeNetwork, OciLayout, OutputLine, OutputStream, PreparedImage,
+    SerialMode, SnapshotMethod, StopMode, VmCounters, VmId, VmInfo, VmSpec, VmState, VolumeId,
+    VolumeInfo, VolumeSnapshot,
 };
 
 /// Bytes in one gibibyte, the unit of `size_gb`.

@@ -30,6 +30,7 @@ pub mod npm;
 pub mod os_release;
 pub mod python;
 pub mod rpm;
+pub mod sqlite;
 
 /// Most packages an inventory holds (section 6.11).
 pub const MAX_PACKAGES: usize = 20_000;
@@ -462,7 +463,14 @@ pub fn build<T: Tree + ?Sized>(
         }
     }
 
-    let os_pair = os.map(|os| (os.id, os.version_id.unwrap_or_default()));
+    // os-release is image content too: an id or version the wire cannot
+    // carry cleanly is left out rather than sent.
+    let os_pair = os
+        .map(|os| (os.id, os.version_id.unwrap_or_default()))
+        .filter(|(id, version)| {
+            valid_text(id, MAX_ECOSYSTEM_LEN)
+                && (version.is_empty() || valid_text(version, MAX_ECOSYSTEM_LEN))
+        });
     out.finish(digest, os_pair, inventoried_at)
 }
 
@@ -480,7 +488,6 @@ pub(crate) mod testing {
         symlinks: BTreeMap<String, String>,
     }
 
-    #[allow(dead_code, reason = "used by the parser tests as they land")]
     impl MemTree {
         pub fn new() -> Self {
             Self::default()
@@ -650,7 +657,10 @@ mod tests {
     fn read_bounded_refuses_an_oversized_file() {
         let tree = MemTree::new().file("a", vec![0u8; 10]);
         assert_eq!(read_bounded(&tree, "a", 9), ReadOutcome::TooLarge);
-        assert_eq!(read_bounded(&tree, "a", 10), ReadOutcome::Data(vec![0u8; 10]));
+        assert_eq!(
+            read_bounded(&tree, "a", 10),
+            ReadOutcome::Data(vec![0u8; 10])
+        );
         assert_eq!(read_bounded(&tree, "b", 10), ReadOutcome::Missing);
     }
 
@@ -662,6 +672,76 @@ mod tests {
         assert_eq!(read_range(&mut file, 8, 3, 16), None);
         assert_eq!(read_range(&mut file, u64::MAX, 3, 16), None);
         assert_eq!(read_range(&mut file, 0, 10, 4), None);
+    }
+
+    #[test]
+    fn build_reads_every_source_and_skips_what_it_must() {
+        let status = "Package: libssl3t64\nStatus: install ok installed\nSource: openssl\n\
+                      Version: 3.5.1-1\nArchitecture: amd64\n\n\
+                      Package: removed\nStatus: deinstall ok config-files\nVersion: 1.0\n";
+        let lock = r#"{"lockfileVersion":3,"packages":{"":{"name":"app"},
+            "node_modules/express":{"version":"4.21.2"}}}"#;
+        let tree = MemTree::new()
+            .file("etc/os-release", "ID=debian\nVERSION_ID=\"13\"\n")
+            .file("var/lib/dpkg/status", status)
+            .file("srv/app/package-lock.json", lock)
+            // A lockfile inside node_modules belongs to a dependency.
+            .file("srv/app/node_modules/x/package-lock.json", lock)
+            .file(
+                "usr/lib/python3/dist-packages/requests-2.32.3.dist-info/METADATA",
+                "Name: requests\nVersion: 2.32.3\n",
+            )
+            // Never walked: the kernel's pseudo-filesystems and symlinks.
+            .file("proc/1/package-lock.json", lock)
+            .symlink("srv/link", "/srv/app")
+            .exe(
+                "usr/bin/script",
+                "#!/bin/sh\necho this is not an ELF file\n",
+            );
+        let inventory = build(
+            &tree,
+            ImageDigest("sha256:00".into()),
+            "2026-11-05T00:00:00Z".into(),
+        );
+        assert_eq!(inventory.os, Some(("debian".into(), "13".into())));
+        assert_eq!(inventory.ecosystems, vec!["Debian:13", "PyPI", "npm"]);
+        assert!(
+            inventory.not_inventoried.is_empty(),
+            "{:?}",
+            inventory.not_inventoried
+        );
+        let names: Vec<(&str, &str, Option<&str>, Option<&str>)> = inventory
+            .packages
+            .iter()
+            .map(|p| {
+                (
+                    p.name.as_str(),
+                    p.version.as_str(),
+                    p.source_name.as_deref(),
+                    p.path.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("libssl3t64", "3.5.1-1", Some("openssl"), None),
+                (
+                    "requests",
+                    "2.32.3",
+                    None,
+                    Some("usr/lib/python3/dist-packages/requests-2.32.3.dist-info")
+                ),
+                ("express", "4.21.2", None, Some("srv/app/package-lock.json")),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_os_release_the_wire_cannot_carry_is_dropped() {
+        let tree = MemTree::new().file("etc/os-release", "ID=\"deb\\nian\"\n");
+        let inventory = build(&tree, ImageDigest("sha256:00".into()), String::new());
+        assert!(inventory.os.is_none());
     }
 
     #[test]
