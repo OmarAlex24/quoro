@@ -51,10 +51,12 @@ The M5a milestone: stateless replicas behind an edge, local volumes, cold backup
 - A build's log stream could end without the build's last line ([#315]).
 - A second process writing the database while the server ran (for example `quoro vuln import`) could make a write fail with "database is locked" ([#316]).
 - A repository's first backup could start the garbage-collection sweep, which then refused new backups while it ran. The sweep now runs only after a pruning ([#317]).
+- A node session that had already been replaced could, while closing, mark its live node as disconnected. Only the node's current session now records a disconnect ([#325]).
+- Writes to the vulnerability cache could queue for many seconds while each one held a pooled connection, which stalled node sessions until they timed out. The cache now takes one writer at a time, and queued writers no longer hold connections ([#328]).
 
 ### Maintenance
 
-- The M5a decisions were recorded as ADRs 0139 to 0158 ([#267]). `Cargo.lock` now records `quoro-backup` 0.1.1 ([#258]). Tests that failed intermittently on loaded CI runners were made deterministic ([#265], [#269], [#282], [#286]).
+- The M5a decisions were recorded as ADRs 0139 to 0158 ([#267]). `Cargo.lock` now records `quoro-backup` 0.1.1 ([#258]). Tests that failed intermittently on loaded CI runners were made deterministic ([#265], [#269], [#282], [#286]). A changelog and a milestone status table were added ([#329]).
 
 ## [v0.1.1] - 2026-11-04
 
@@ -310,6 +312,9 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#319]: https://github.com/OmarAlex24/quoro/pull/319
 [#320]: https://github.com/OmarAlex24/quoro/pull/320
 [#323]: https://github.com/OmarAlex24/quoro/pull/323
+[#325]: https://github.com/OmarAlex24/quoro/pull/325
+[#328]: https://github.com/OmarAlex24/quoro/pull/328
+[#329]: https://github.com/OmarAlex24/quoro/pull/329
 [ADR 0019]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0019-fencing-is-mandatory-and-lease-based-node-agent-self-fences.md
 [ADR 0020]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0020-per-app-ha-policies-none-cold-warm-hot-with-cost-shown-in.md
 [ADR 0027]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0027-signed-binaries-and-reproducible-builds-are-mandatory.md
