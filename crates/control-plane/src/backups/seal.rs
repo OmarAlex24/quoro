@@ -395,6 +395,9 @@ pub(crate) enum SealError {
 /// Signs `seal` and writes `seals/<source_id>/<backup_id>.json` with
 /// `If-None-Match: *` (`backup-format.md` section 6.2).
 ///
+/// The pre-upgrade backup writes its seal through here too, before the row
+/// exists (`backup-format.md` section 7.2, "Before an upgrade").
+///
 /// # Errors
 ///
 /// A [`SealError::Failed`] for a refused put or a stored object that is not

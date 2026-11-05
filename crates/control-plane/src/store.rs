@@ -7,7 +7,7 @@
 
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::{Sqlite, SqlitePool, Transaction};
+use sqlx::{Sqlite, SqliteConnection, SqlitePool, Transaction};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -36,6 +36,7 @@ pub const GENESIS_HASH: &str = "000000000000000000000000000000000000000000000000
 pub struct Store {
     pool: SqlitePool,
     writer: Arc<Mutex<()>>,
+    migrations: Arc<[&'static str]>,
 }
 
 /// A write transaction holding the single-writer gate. Dropping it without
@@ -64,6 +65,20 @@ impl Store {
     ///
     /// Any database error, or a database newer than this binary.
     pub async fn open(path: &Path) -> Result<Self, sqlx::Error> {
+        let store = Self::open_unmigrated(path).await?;
+        store.migrate().await?;
+        Ok(store)
+    }
+
+    /// Opens (creating if needed) the database at `path` without applying any
+    /// migration: the caller reads [`Store::pending_migrations`], takes the
+    /// pre-upgrade backup, and migrates afterwards (`backup-format.md`
+    /// section 7.2, "Before an upgrade").
+    ///
+    /// # Errors
+    ///
+    /// Any database error.
+    pub async fn open_unmigrated(path: &Path) -> Result<Self, sqlx::Error> {
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
@@ -75,7 +90,7 @@ impl Store {
             .max_connections(8)
             .connect_with(options)
             .await?;
-        Self::init(pool).await
+        Ok(Self::connect(pool))
     }
 
     /// An in-memory database for tests: one shared connection, same schema.
@@ -84,6 +99,18 @@ impl Store {
     ///
     /// Any database error.
     pub async fn open_in_memory() -> Result<Self, sqlx::Error> {
+        let store = Self::open_in_memory_unmigrated().await?;
+        store.migrate().await?;
+        Ok(store)
+    }
+
+    /// [`Store::open_in_memory`] without the migration, for a test that needs a
+    /// pending range.
+    ///
+    /// # Errors
+    ///
+    /// Any database error.
+    pub async fn open_in_memory_unmigrated() -> Result<Self, sqlx::Error> {
         let options = SqliteConnectOptions::from_str("sqlite::memory:")?.foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -92,19 +119,74 @@ impl Store {
             .max_lifetime(None)
             .connect_with(options)
             .await?;
-        Self::init(pool).await
+        Ok(Self::connect(pool))
     }
 
-    async fn init(pool: SqlitePool) -> Result<Self, sqlx::Error> {
-        let store = Self {
+    /// The newest schema version this binary ships, for tests that stand in
+    /// the next release's migration.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn shipped_schema_version() -> usize {
+        MIGRATIONS.len() + 1
+    }
+
+    /// Appends migrations after the ones this binary ships. A test-only seam:
+    /// it gives a database a pending range without adding a fake migration to
+    /// `docs/contracts/migrations/`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_extra_migrations(self, extra: &'static [&'static str]) -> Self {
+        let mut migrations: Vec<&'static str> = self.migrations.to_vec();
+        migrations.extend_from_slice(extra);
+        Self {
+            migrations: migrations.into(),
+            ..self
+        }
+    }
+
+    /// The migrations still to apply as `(from, to)`, or `None` when there are
+    /// none or the database is new (`backup-format.md` section 7.2, "Before an
+    /// upgrade").
+    ///
+    /// # Errors
+    ///
+    /// Any database error, or a stored `schema_version` this binary cannot
+    /// read.
+    pub async fn pending_migrations(&self) -> Result<Option<(usize, usize)>, sqlx::Error> {
+        let has_meta: Option<(String,)> =
+            sqlx::query_as("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'meta'")
+                .fetch_optional(&self.pool)
+                .await?;
+        if has_meta.is_none() {
+            return Ok(None);
+        }
+        let mut conn = self.pool.acquire().await?;
+        let version = read_version(&mut conn).await?;
+        let newest = self.migrations.len() + 1;
+        if version == 0 || version > newest {
+            return Err(unsupported_version(version, newest));
+        }
+        if version == newest {
+            return Ok(None);
+        }
+        Ok(Some((version, newest)))
+    }
+
+    fn connect(pool: SqlitePool) -> Self {
+        Self {
             pool,
             writer: Arc::new(Mutex::new(())),
-        };
-        store.migrate().await?;
-        Ok(store)
+            migrations: Arc::from(MIGRATIONS),
+        }
     }
 
-    async fn migrate(&self) -> Result<(), sqlx::Error> {
+    /// Applies the pending migrations in one write transaction. A new database
+    /// gets the base schema first.
+    ///
+    /// # Errors
+    ///
+    /// Any database error, or a database newer than this binary.
+    pub async fn migrate(&self) -> Result<(), sqlx::Error> {
         let mut w = self.begin_write().await?;
         let has_meta: Option<(String,)> =
             sqlx::query_as("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'meta'")
@@ -113,20 +195,12 @@ impl Store {
         if has_meta.is_none() {
             sqlx::raw_sql(BASE_SCHEMA).execute(&mut *w.tx).await?;
         }
-        let (version,): (String,) =
-            sqlx::query_as("SELECT value FROM meta WHERE key = 'schema_version'")
-                .fetch_one(&mut *w.tx)
-                .await?;
-        let version: usize = version
-            .parse()
-            .map_err(|_| sqlx::Error::Protocol(format!("bad schema_version {version:?}")))?;
-        if version == 0 || version > MIGRATIONS.len() + 1 {
-            return Err(sqlx::Error::Protocol(format!(
-                "database schema_version {version} is not supported by this binary (max {})",
-                MIGRATIONS.len() + 1
-            )));
+        let version = read_version(&mut w.tx).await?;
+        let newest = self.migrations.len() + 1;
+        if version == 0 || version > newest {
+            return Err(unsupported_version(version, newest));
         }
-        for migration in &MIGRATIONS[version - 1..] {
+        for migration in &self.migrations[version - 1..] {
             sqlx::raw_sql(migration).execute(&mut *w.tx).await?;
         }
         w.commit().await
@@ -150,6 +224,24 @@ impl Store {
         let tx = self.pool.begin().await?;
         Ok(WriteTx { tx, _gate: gate })
     }
+}
+
+/// Reads `meta.schema_version` through `conn`.
+async fn read_version(conn: &mut SqliteConnection) -> Result<usize, sqlx::Error> {
+    let (version,): (String,) =
+        sqlx::query_as("SELECT value FROM meta WHERE key = 'schema_version'")
+            .fetch_one(conn)
+            .await?;
+    version
+        .parse()
+        .map_err(|_| sqlx::Error::Protocol(format!("bad schema_version {version:?}")))
+}
+
+/// The error for a database written by a newer binary.
+fn unsupported_version(version: usize, newest: usize) -> sqlx::Error {
+    sqlx::Error::Protocol(format!(
+        "database schema_version {version} is not supported by this binary (max {newest})"
+    ))
 }
 
 /// Lowercase hex SHA-256 of `bytes`.
@@ -227,6 +319,48 @@ mod tests {
         drop(store);
         // Reopening applies nothing twice.
         Store::open(&path).await.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_new_database_has_nothing_pending_and_an_extra_migration_shows_up() {
+        let dir = std::env::temp_dir().join(format!("quoro-store-{}", random_secret()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("quoro.db");
+
+        // A new database is not pending anything: the first start creates it
+        // (`backup-format.md` section 7.2 step 1).
+        let store = Store::open_unmigrated(&path).await.unwrap();
+        assert_eq!(store.pending_migrations().await.unwrap(), None);
+        store.migrate().await.unwrap();
+        assert_eq!(store.pending_migrations().await.unwrap(), None);
+        drop(store);
+
+        let migration: &'static str = Box::leak(
+            format!(
+                "CREATE TABLE probe (id INTEGER PRIMARY KEY); \
+                 UPDATE meta SET value = '{}' WHERE key = 'schema_version';",
+                MIGRATIONS.len() + 2
+            )
+            .into_boxed_str(),
+        );
+        let extra: &'static [&'static str] = Box::leak(vec![migration].into_boxed_slice());
+        let store = Store::open_unmigrated(&path)
+            .await
+            .unwrap()
+            .with_extra_migrations(extra);
+        assert_eq!(
+            store.pending_migrations().await.unwrap(),
+            Some((MIGRATIONS.len() + 1, MIGRATIONS.len() + 2))
+        );
+        store.migrate().await.unwrap();
+        assert_eq!(store.pending_migrations().await.unwrap(), None);
+        let (version,): (String,) =
+            sqlx::query_as("SELECT value FROM meta WHERE key = 'schema_version'")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(version, (MIGRATIONS.len() + 2).to_string());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

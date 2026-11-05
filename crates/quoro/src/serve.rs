@@ -16,6 +16,7 @@ use crate::node::{self, EX_CONFIG};
 use crate::tls;
 use axum_server::Handle;
 use quoro_control_plane::api::enroll::ensure_local_join;
+use quoro_control_plane::backups::Backups;
 use quoro_control_plane::crypto::DataKey;
 use quoro_control_plane::store::Store;
 use quoro_control_plane::{
@@ -33,11 +34,15 @@ const NODE_STOP_GRACE: Duration = Duration::from_secs(15);
 
 /// Runs the server until SIGTERM or Ctrl-C. Returns the process exit code.
 ///
+/// `skip_upgrade_backup` is the operator's `--skip-upgrade-backup`: with it, a
+/// pending migration runs without the pre-upgrade backup
+/// (`backup-format.md` section 7.2, "Before an upgrade").
+///
 /// # Errors
 ///
 /// A message for the operator when the data directory, the database, the TLS
 /// material or the listener cannot be brought up.
-pub async fn run(config: Config) -> Result<i32, String> {
+pub async fn run(config: Config, skip_upgrade_backup: bool) -> Result<i32, String> {
     // The control plane's webhook clients use reqwest's no-provider rustls
     // feature, so the process must install one before `AppState::open` starts
     // the dispatcher; `ring` is the provider ADR 0080 allows. The listener
@@ -53,7 +58,9 @@ pub async fn run(config: Config) -> Result<i32, String> {
     };
 
     let database = config.data_dir.join("quoro.db");
-    let store = Store::open(&database)
+    // Unmigrated: the upgrade step inside `AppState::open_with_upgrade` backs
+    // the database up before it applies any migration.
+    let store = Store::open_unmigrated(&database)
         .await
         .map_err(|e| format!("cannot open {}: {e}", database.display()))?;
     let material = tls::load_or_generate(&config.data_dir, &config.node_name, config.listen)
@@ -65,7 +72,7 @@ pub async fn run(config: Config) -> Result<i32, String> {
     info!("data-encryption key ready: {}", data_key.key_id_hex());
 
     let subnet = config.cloud_hypervisor.subnet;
-    let state = AppState::open(
+    let state = AppState::open_with_upgrade(
         store.clone(),
         ServerConfig {
             data_dir: config.data_dir.clone(),
@@ -85,6 +92,8 @@ pub async fn run(config: Config) -> Result<i32, String> {
         },
         resolver,
         Arc::new(data_key),
+        Backups::s3(),
+        skip_upgrade_backup,
     )
     .await?;
     let owner_exists = owner_exists(&store)

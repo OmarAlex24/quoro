@@ -15,6 +15,7 @@ mod node;
 mod null_engine;
 mod panel;
 mod privilege;
+mod restore;
 mod serve;
 mod tls;
 
@@ -28,7 +29,8 @@ const USAGE: &str = "\
 usage: quoro <command> [options]
 
 commands:
-  serve [--config PATH] [--role node]   run the HTTPS listener (D-0054)
+  serve [--config PATH] [--role node] [--skip-upgrade-backup]
+                                        run the HTTPS listener (D-0054)
   setup-token [--config PATH]           print a one-time first-run setup token
   version                               print the version
   join <url> --token TOKEN --fingerprint FINGERPRINT [--config PATH]
@@ -47,9 +49,20 @@ commands:
   audit verify --file PATH [--prev-hash HEX]
                                         verify an exported JSON Lines segment
   audit verify --db PATH                verify a database's audit_log, offline
+  restore --endpoint URL --region REGION --bucket NAME --prefix PREFIX
+          --cluster-id CLS --credentials-file PATH --recovery-key-file PATH
+          --signing-key-file PATH --data-key-file PATH --data-dir DIR
+          [--backup BKP] [--dry-run]
+                                        restore a control-plane database from
+                                        its backup repository, offline (ADR 0148)
 
 The configuration file defaults to /etc/quoro/quoro.toml; a missing file means
 the built-in defaults.
+
+`quoro serve` takes the pre-upgrade backup itself when a migration is pending
+(backup-format.md section 7.2). If that backup fails the start stops without
+migrating; `--skip-upgrade-backup` starts once without it, records the skip in
+the audit log and migrates.
 
 quoro mcp stdio speaks MCP on stdin/stdout as one agent. The agent key
 (akey_...) is read from --key-file, a file only its owner may read (chmod 600);
@@ -81,6 +94,14 @@ async fn main() -> ExitCode {
         "join" => join_command(rest).await,
         "node" => node_command(rest).await,
         "audit" => audit_cli::run(rest).await,
+        "restore" => match restore::run(rest).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(restore::Error::Usage(message)) => usage_error(&message),
+            Err(restore::Error::Failed(message)) => {
+                eprintln!("quoro restore: {message}");
+                ExitCode::from(1)
+            }
+        },
         "mcp" => mcp_command(rest).await,
         "--help" | "-h" | "help" => usage(),
         other => {
@@ -96,14 +117,15 @@ fn usage() -> ExitCode {
     ExitCode::from(2)
 }
 
-/// `quoro serve [--config PATH] [--role node]`.
+/// `quoro serve [--config PATH] [--role node] [--skip-upgrade-backup]`.
 async fn serve_command(args: &[String]) -> ExitCode {
-    let flags = match parse_flags(args, &["config", "role"]) {
+    let flags = match parse_serve_flags(args) {
         Ok(flags) => flags,
         Err(e) => return usage_error(&e),
     };
     let path = config_path(&flags);
     let role = flag(&flags, "role").unwrap_or("node");
+    let skip_upgrade_backup = flag_boolean(&flags, "skip-upgrade-backup");
 
     // D-0054 defines three roles; M1 runs the primary, which is the node role.
     match role {
@@ -133,7 +155,7 @@ async fn serve_command(args: &[String]) -> ExitCode {
         }
     };
 
-    match serve::run(config).await {
+    match serve::run(config, skip_upgrade_backup).await {
         Ok(code) => exit_code(code),
         Err(e) => {
             eprintln!("quoro serve: {e}");
@@ -252,6 +274,29 @@ async fn set_primary_command(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     };
     exit_code(node::set_primary(&config, url, !flag_boolean(&flags, "no-restart")).await)
+}
+
+/// Reads `serve`'s flags: `--config PATH`, `--role NAME` and the value-less
+/// `--skip-upgrade-backup` (`backup-format.md` section 7.2).
+fn parse_serve_flags(args: &[String]) -> Result<Vec<(String, String)>, String> {
+    let mut flags = Vec::with_capacity(args.len() / 2);
+    let mut args = args.iter();
+    while let Some(argument) = args.next() {
+        let Some(name) = argument.strip_prefix("--") else {
+            return Err(format!("unexpected argument '{argument}'"));
+        };
+        match name {
+            "skip-upgrade-backup" => flags.push((name.to_string(), String::new())),
+            "config" | "role" => {
+                let Some(value) = args.next() else {
+                    return Err(format!("'{argument}' needs a value"));
+                };
+                flags.push((name.to_string(), value.clone()));
+            }
+            _ => return Err(format!("unknown option '{argument}'")),
+        }
+    }
+    Ok(flags)
 }
 
 /// Reads `node set-primary`'s flags: `--config PATH` and the value-less
@@ -478,6 +523,25 @@ mod tests {
         let flags = parse_flags(&args(&["--role", "primary"]), &["role"]).unwrap();
         let err = join_role(&flags).expect_err("a primary does not join");
         assert!(err.contains("expected node or edge"), "{err}");
+    }
+
+    #[test]
+    fn serve_flags_carry_the_skip_and_refuse_a_value_after_it() {
+        let flags = parse_serve_flags(&args(&["--skip-upgrade-backup", "--config", "/etc/q.toml"]))
+            .unwrap();
+        assert!(flag_boolean(&flags, "skip-upgrade-backup"));
+        assert_eq!(flag(&flags, "config"), Some("/etc/q.toml"));
+        assert_eq!(flag(&flags, "role"), None);
+
+        assert!(!flag_boolean(
+            &parse_serve_flags(&args(&["--role", "node"])).unwrap(),
+            "skip-upgrade-backup"
+        ));
+        // A value after it is a typo, not a flag, and an unknown option is
+        // refused as everywhere else.
+        assert!(parse_serve_flags(&args(&["--skip-upgrade-backup=yes"])).is_err());
+        assert!(parse_serve_flags(&args(&["--config"])).is_err());
+        assert!(parse_serve_flags(&args(&["--nope", "1"])).is_err());
     }
 
     #[test]

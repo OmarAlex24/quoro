@@ -4,14 +4,17 @@
 //! After a backup is sealed, the oldest succeeded backups of that source
 //! beyond its `keep` count lose their seal first, then their manifest, and
 //! only then get `pruned_at`: a backup without a seal cannot be restored, and
-//! the record stays. The mark-and-sweep then removes what no sealed backup
+//! the record stays. Control-plane backups are pruned per trigger: the
+//! schedule's `keep` counts the scheduled ones, and upgrade backups are kept
+//! three at a time (`backup-format.md` sections 7.2 and 9, ADR 0158). The
+//! mark-and-sweep then removes what no sealed backup
 //! references: manifests without a seal older than 48 hours and chunks no live
 //! manifest lists. It runs at most once a day, never while an object listing
 //! fails and never while a backup of the repository is queued or running.
 
 use crate::api::apps::BackupSchedule;
 use crate::api::backups::{
-    BACKUP_COLUMNS, BackupRecord, BackupSourceKind, backup_from_row, backup_payload,
+    BACKUP_COLUMNS, BackupRecord, BackupSourceKind, BackupTrigger, backup_from_row, backup_payload,
 };
 use crate::changelog::{self, Op};
 use crate::error::ApiError;
@@ -24,6 +27,11 @@ use super::{
     Backups, Bucket, GC_GRACE, GC_PERIOD, RepositoryTarget, decrypt_repo_key, object_key,
     parse_time, repo, time_after,
 };
+
+/// How many upgrade backups retention keeps (`backup-format.md` section 7.2,
+/// ADR 0158). They are counted apart from the scheduled ones, so
+/// `control_plane_schedule.keep` never touches them.
+pub const UPGRADE_KEEP: i64 = 3;
 
 /// What one sweep removed, for the `backup.gc` audit record.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -55,10 +63,13 @@ pub(crate) async fn after_seal(
 ) -> Result<(), ApiError> {
     let keep = keep_for(store, repository, backup).await?;
     let control_plane = backup.source_kind == BackupSourceKind::ControlPlane;
+    // A control-plane backup prunes only its own trigger's backups: the
+    // schedule's `keep` counts the scheduled ones, and upgrade backups are
+    // counted on their own (`backup-format.md` section 7.2, ADR 0158).
     let rows = sqlx::query(&format!(
         "SELECT {BACKUP_COLUMNS} FROM backups \
          WHERE repository_id = ? AND source_kind = ? AND status = 'succeeded' \
-           AND pruned_at IS NULL AND {} \
+           AND pruned_at IS NULL AND {} AND (? = 0 OR \"trigger\" = ?) \
          ORDER BY id DESC",
         source_clause()
     ))
@@ -66,6 +77,8 @@ pub(crate) async fn after_seal(
     .bind(backup.source_kind.as_str())
     .bind(backup.app_id.as_deref().unwrap_or_default())
     .bind(control_plane)
+    .bind(i64::from(control_plane))
+    .bind(backup.trigger.as_str())
     .fetch_all(store.pool())
     .await?;
     let kept: Vec<BackupRecord> = rows
@@ -142,14 +155,19 @@ pub(crate) async fn after_seal(
 }
 
 /// The `keep` of the source's schedule: the app's `backup_schedule` for a
-/// volume, the repository's `control_plane_schedule` for the control plane.
+/// volume, the repository's `control_plane_schedule` for the scheduled
+/// control-plane backups, [`UPGRADE_KEEP`] for an upgrade backup.
 async fn keep_for(
     store: &Store,
     repository: &repo::Repository,
     backup: &BackupRecord,
 ) -> Result<i64, ApiError> {
     if backup.source_kind == BackupSourceKind::ControlPlane {
-        return Ok(repository.control_plane_schedule.keep);
+        return Ok(if backup.trigger == BackupTrigger::Upgrade {
+            UPGRADE_KEEP
+        } else {
+            repository.control_plane_schedule.keep
+        });
     }
     let Some(app_id) = &backup.app_id else {
         return Ok(BackupSchedule::default().keep);
