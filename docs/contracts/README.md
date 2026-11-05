@@ -135,7 +135,7 @@ and the build's manifest digest as its digest, for example `build.quoro.invalid/
 - Webhook delivery `status`: `pending`, `delivered`, `failed`.
 - Volume `state`: `creating` (the node has not reported the file yet), `ready`, `restoring` (being written from a backup), `failed`, `detached` (replaced by a restore, its file kept on its node until deleted), `deleting` (ADR 0145).
 - Backup `status`: `queued`, `running`, `succeeded`, `failed` (ADR 0147). The last two are terminal.
-- Volume snapshot method of a node: `reflink` or `pause_copy` (ADR 0146).
+- Volume snapshot method of a node: `reflink` (native or in the node's XFS volume pool) or `pause_copy` (ADR 0156).
 - Audit export `lock_strength`: `none`, `bucket_rule` (R2 lock rules), `compliance` (S3 Object Lock in compliance mode) (ADR 0149).
 
 ### Scopes

@@ -195,11 +195,12 @@ pub struct VolumeInfo {
     pub path: PathBuf,
 }
 
-/// How `snapshot_volume` takes a snapshot on this node (ADR 0146). Added in
-/// M5a. Section 3.16.
+/// How `snapshot_volume` takes a snapshot on this node (ADR 0146, ADR 0156).
+/// Added in M5a. Section 3.16.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapshotMethod {
-    /// `ioctl(FICLONE)` of the volume file; the VM keeps running.
+    /// `ioctl(FICLONE)` of the volume file, on the data directory's own
+    /// filesystem or inside the node's XFS volume pool; the VM keeps running.
     Reflink,
     /// Pause the VM, copy the sparse file, resume the VM.
     PauseCopy,
@@ -714,9 +715,15 @@ The M4 metrics use two of them (ADR 0014, `node-agent-protocol.md` sections 5.15
 
 ### 3.16 `snapshot_volume` and `delete_volume_snapshot`
 
-The point-in-time disk primitive the chunk engine needs (D-0023). Both are `Unsupported` in the default implementation, and only the M5 code path calls them. ADR 0146 decides the method for M5a and supersedes ADR 0062 on hosts whose filesystem has no reflink.
+The point-in-time disk primitive the chunk engine needs (D-0023). Both are `Unsupported` in the default implementation, and only the M5 code path calls them. ADR 0156 decides the method for M5a; it supersedes ADR 0146, which superseded ADR 0062 on hosts whose filesystem has no reflink.
 
-- **Probe.** At start-up the engine creates a scratch file in the directory that holds volumes and tries `ioctl(FICLONE)` into a second one. If the clone succeeds, the method is `Reflink`; otherwise `PauseCopy`. It removes both files and reports the method in `Capabilities::volume_snapshot_method`, which the node agent sends in `hello` (`node-agent-protocol.md` section 5.1). XFS with reflink and btrfs give `Reflink`; ext4 gives `PauseCopy`.
+- **Probe.** At start-up the engine creates a scratch file in the directory that holds volumes and tries `ioctl(FICLONE)` into a second one, then removes both. If the clone succeeds, the data directory's own filesystem gives `Reflink` (XFS with reflink, btrfs). Otherwise the engine uses the volume pool below and probes again inside it. If the pool cannot be used, the method is `PauseCopy`. The method is reported in `Capabilities::volume_snapshot_method`, which the node agent sends in `hello` (`node-agent-protocol.md` section 5.1); `Reflink` covers both the native and the pool path.
+- **Volume pool (ADR 0156).** On a data directory without reflink (ext4), the volume directory is the mount point of a sparse XFS image, `volume-pool.img` in the engine's state directory, created with `mkfs.xfs -m reflink=1` and mounted through a loop device with `nodev,nosuid,noexec`. Volume files and their snapshots live inside it. The host mounts the pool's XFS and nothing else: it never mounts the filesystem inside a volume file.
+  - **Lifecycle.** The pool has no fstab entry and no systemd unit: the engine attaches it at every start-up, before any other volume call, and reuses a pool that is already mounted on the volume directory (a node agent restart while VMs run). The loop device is attached with auto-clear, so `umount` of the volume directory releases it; the engine never detaches the pool while it holds a volume.
+  - **A pool that exists but does not mount** (missing `xfsprogs`, no loop device, a damaged image) is never replaced by the empty directory underneath: every volume call returns `Unsupported` with the reason, `volume_snapshot_method` is `None`, and the node agent reports the node's volumes `failed`.
+  - **Size.** The image is sparse. Before `ensure_volume` or `import_volume` the engine grows it to at least twice the sum of its volumes' sizes plus 1 GiB, which leaves room for one snapshot of every volume, by extending the image, refreshing the loop device's capacity and running `xfs_growfs`. It never shrinks it. The free-space checks of `ensure_volume` and of a snapshot use the filesystem that holds the image, not the pool's own free space.
+  - **Volumes created before the pool.** If the volume directory already holds volume files when the pool would be created, the engine leaves them in place, keeps `PauseCopy` for that node and logs why; it creates the pool at the first start-up with no such file. It never moves a volume file that a VM may hold open.
+  - **Fallback.** Without `mkfs.xfs` or a loop device the pool cannot be created and the method is `PauseCopy`.
 - **`Reflink`.** The engine clones the volume file into a snapshot file next to it with `FICLONE`, without touching the VM. The snapshot is crash-consistent at the instant of the clone; `pause` is zero.
 - **`PauseCopy`.** If a VM that attaches the volume is `Running`, the engine pauses it (`/vm.pause`), copies the volume file into a snapshot file keeping holes (`SEEK_DATA` and `SEEK_HOLE`), and resumes it (`/vm.resume`), whatever the copy's outcome. `pause` is the time between the pause and the resume. A volume no running VM attaches is copied without a pause. A resume that fails is `Hypervisor`, and the VM is left for the node agent's crash handling.
 - **Crash consistency.** Both methods give the guest the guarantee of a power cut: an ext4 volume replays its journal after a restore. An app that needs more uses its own dump (ADR 0023). A guest-side freeze through the exec channel may shorten the pause later; it is not part of M5a.
@@ -762,7 +769,7 @@ A read-only stream of a VM's serial output: first up to `tail_bytes` of the newe
 The local volumes of ADR 0145: one sparse raw file per volume in the node's data directory, named by the volume id, owned by root and never mounted on the host. Added in M5a; the default implementations return `Unsupported`.
 
 - `ensure_volume` creates the file as an empty ext4 filesystem of `size_gb` gibibytes, sparse, with `mkfs.ext4` run on the file itself, never on a mount. A file that exists with the same size returns its `VolumeInfo`; one with another size is `Conflict`, because M5a has no resize. Too little free disk for the filesystem's metadata is `ResourceExhausted`. Idempotent.
-- `import_volume` moves a raw file that the node agent wrote from a backup (`backup-format.md` section 8.1) into place as the volume's file, in one rename on the same filesystem. The file must be exactly `size_gb` gibibytes. The engine does not parse its content: a filesystem a guest wrote is checked by the guest when it mounts it. A volume that already exists is `Conflict`.
+- `import_volume` moves a raw file that the node agent wrote from a backup (`backup-format.md` section 8.1) into place as the volume's file, in one rename on the same filesystem. When the file is on another filesystem than the volume directory (the volume directory is the XFS volume pool of section 3.16), the engine first copies it into a temporary file in the volume directory keeping holes (`SEEK_DATA` and `SEEK_HOLE`), syncs it, renames that, and then removes the file it was given. The file must be exactly `size_gb` gibibytes. The engine does not parse its content: a filesystem a guest wrote is checked by the guest when it mounts it. A volume that already exists is `Conflict`.
 - `delete_volume` removes the file. A missing file is `Ok`. A volume attached to a VM that exists is `Conflict`; the node agent deletes the VM first.
 - `delete` of a VM never removes its volumes (section 3.9); only `delete_volume` does.
 - The node agent, not the engine, decides when a volume is created, imported or deleted (`node-agent-protocol.md` section 6.7).
@@ -808,7 +815,7 @@ One `cloud-hypervisor` process per VM with its own `--api-socket`, because the V
 | `exec` | Connects to `<vm dir>/vsock.sock`, sends `CONNECT` for the exec port, then the open frame; relays frames to the PTY stream (section 3.18) | Hybrid vsock socket; no API call |
 | `serial_output` | Reads the node-local ring, then follows the engine's own serial client (section 3.19) | No backend call; the client reads the `--serial socket=` endpoint |
 | `counters` | Reads the VM's I/O and device counters and maps them to `VmCounters`; the exact field names of the backend's counter document are not fixed by `docs/research/cloud-hypervisor.md`, so the mapping is **Hypothesis** | `/vm.counters` |
-| `snapshot_volume` | `FICLONE` of the volume file, or pause, sparse copy and resume (section 3.16, ADR 0146) | `/vm.pause` and `/vm.resume` for `PauseCopy` only; never `/vm.snapshot` (F-0035) |
+| `snapshot_volume` | `FICLONE` of the volume file, natively or in the XFS volume pool, or pause, sparse copy and resume (section 3.16, ADR 0156) | `/vm.pause` and `/vm.resume` for `PauseCopy` only; never `/vm.snapshot` (F-0035) |
 | `delete_volume_snapshot` | Removes the snapshot file | No backend call |
 | `ensure_volume` | Creates the sparse file and runs `mkfs.ext4` on it (section 3.20) | No backend call |
 | `import_volume` | Renames the restored file into place (section 3.20) | No backend call |
