@@ -161,7 +161,18 @@ A backup not terminal 24 hours after it was dispatched is recorded `failed` with
 
 ### 7.2 The control-plane database
 
-The primary runs `VACUUM INTO` to a temporary file in its data directory, outside any open transaction (ADR 0148). It then feeds that file through the same steps 4 and 5 itself, with the cluster id as `source_id`, and deletes the temporary file. It runs on the repository's `control_plane_schedule` (default every 6 hours, keep 7) and before an upgrade. The upgrade command asks the primary for a backup with `trigger: upgrade` and does not replace the binary until that backup succeeded. The cluster key files are not part of the database and not part of the backup (section 8.2).
+The primary runs `VACUUM INTO` to a temporary file in its data directory, outside any open transaction (ADR 0148). It then feeds that file through the same steps 4 and 5 itself, with the cluster id as `source_id`, and deletes the temporary file. It runs on the repository's `control_plane_schedule` (default every 6 hours, keep 7) and before an upgrade. If the seal cannot be written, the backup is recorded `failed` at once, as in section 7.1. The cluster key files are not part of the database and not part of the backup (section 8.2).
+
+**Before an upgrade (ADR 0157).** Installing a new version replaces the binary without asking the running primary, so the new binary takes the backup itself, at its first start and before it applies any migration. No API operation starts it.
+
+1. The primary reads the database's `schema_version` and compares it with the newest version the binary ships. When none are pending, or when the database is new, it starts as usual.
+2. When migrations are pending and a repository is configured, it runs `VACUUM INTO`, uploads the chunks, writes the manifest and writes the seal, as above, all before it changes the database. The backup has `trigger: upgrade`. With no repository configured, which includes a database too old to have the `backup_repositories` table, there is nothing to write to, so the primary logs that it migrates without a backup, and migrates. This read runs against the old schema, so a later migration must keep the repository columns it uses readable, or the primary treats the repository as absent.
+3. Only after the seal is written does it apply the migrations. It then records the backup `succeeded` in the migrated database, with its change-log entry and its `backup.dispatch` and `backup.seal` audit records, and runs retention for upgrade backups (below).
+4. If any step of the backup fails, the primary applies no migration, leaves the database as it was, and exits non-zero with a one-line reason. A later start tries the backup again. To migrate without the backup, the operator stops the service and starts the binary once with `quoro serve --skip-upgrade-backup`. The primary then migrates, writes a `backup.upgrade_skipped` audit record (audit-log-format.md section 3.5), and runs as usual. A start with that flag and nothing pending, or with no repository, skips nothing and writes no record.
+
+A crash after the seal is written and before the row is recorded leaves a sealed backup that the database does not list. `quoro restore` still finds it, because it reads the seals (section 8.2), and garbage collection keeps its chunks, because it is sealed (section 9). Retention counts recorded backups only, so it leaves that one in place.
+
+**Retention of upgrade backups (ADR 0158).** `control_plane_schedule.keep` counts only control-plane backups with `trigger: schedule`, and their pruning never removes an upgrade backup. Backups with `trigger: upgrade` are counted on their own: after one succeeds, the primary prunes the oldest succeeded, unpruned upgrade backups beyond 3, the same way as in section 9. Garbage collection never removes a chunk that a kept upgrade backup references; since a kept backup is sealed, the sweep of section 9 already treats its chunks as live.
 
 ## 8. Restoring
 
@@ -200,7 +211,7 @@ The restored database is as old as the backup. How a restored primary reconciles
 
 ## 9. Retention and garbage collection
 
-- **Pruning.** After a backup of a source succeeds, the primary prunes the oldest succeeded, unpruned backups of that source beyond its `keep` count. To prune a backup, it deletes the seal first, then the manifest, and then sets `pruned_at`. The backup record stays. Failed backups count toward nothing and are never pruned.
+- **Pruning.** After a backup of a source succeeds, the primary prunes the oldest succeeded, unpruned backups of that source beyond its `keep` count. For the control-plane database, `keep` counts only scheduled backups; upgrade backups keep 3 (section 7.2, ADR 0158). To prune a backup, it deletes the seal first, then the manifest, and then sets `pruned_at`. The backup record stays. Failed backups count toward nothing and are never pruned.
 - **Deleted apps.** In M5a nothing prunes the backups of an app that was deleted. They stay in the repository and in the backup list, and no operation restores or deletes them. Removing them is later work.
 - **Garbage collection.** A mark-and-sweep on the primary removes chunks that no sealed backup references. It runs at most once a day, after a pruning. While it runs, the primary dispatches no backup of that repository, and it does not start while a backup of that repository is `queued` or `running`. A chunk that an in-flight backup found already present (`412`) therefore cannot disappear under it. The sweep:
   1. lists the seals, and reads and decrypts their manifests, which the primary can do for every source because it holds `repo_key`; the chunk ids those manifests list are live;
