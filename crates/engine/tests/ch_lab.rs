@@ -522,6 +522,57 @@ async fn lifecycle_cycle_three_times() {
 
 #[tokio::test]
 #[ignore = "needs /dev/kvm, root and the pinned artifacts on the lab host"]
+async fn a_vm_restarts_on_its_recorded_bridge_after_a_host_reboot() {
+    if !enter_lab() {
+        return;
+    }
+    let _guard = Guard::new();
+    let engine = new_engine().await;
+    let rootfs = prepare(&engine).await;
+
+    let id = VmId("vm_w7b_reboot".to_string());
+    let spec = console_spec(&id, &rootfs, "10.77.0.14", "echo up; sleep 120", 14);
+    engine.create(&spec).await.expect("create");
+    start_vm(&engine, &id).await;
+
+    // The reboot: the VMM, its TAP, the bridge and its nftables table are gone,
+    // and the next agent does not ensure this bridge again (a node whose subnet
+    // changed ensures only its new one).
+    engine.stop(&id, StopMode::Force).await.expect("stop");
+    drop(engine);
+    let tools = HostTools::discover().expect("host tools");
+    net::delete_tap(&tools, &tap_name(&id))
+        .await
+        .expect("remove the TAP");
+    net::remove_network(&tools, BRIDGE)
+        .await
+        .expect("remove the bridge");
+    assert!(!net::interface_exists(BRIDGE), "the bridge is gone");
+
+    let engine = new_engine().await;
+    start_vm(&engine, &id).await;
+    assert!(net::interface_exists(BRIDGE), "the recorded bridge is back");
+    let addresses = tools::run(&tools.ip, &["-4", "-o", "addr", "show", "dev", BRIDGE])
+        .await
+        .expect("read the bridge address");
+    assert!(
+        addresses.contains(&format!("{GATEWAY}/24")),
+        "the bridge has its recorded gateway: {addresses}"
+    );
+    let mut output = engine.output(&id).expect("open the output");
+    let up = read_output(&mut output, "up", Duration::from_secs(45)).await;
+    assert_eq!(up.line, "up", "the VM did not boot on the restored bridge");
+
+    engine.stop(&id, StopMode::Force).await.expect("stop again");
+    engine.delete(&id).await.expect("delete");
+    assert_no_leftovers(&id);
+    net::remove_network(&tools, BRIDGE)
+        .await
+        .expect("remove the network");
+}
+
+#[tokio::test]
+#[ignore = "needs /dev/kvm, root and the pinned artifacts on the lab host"]
 async fn crash_is_reported() {
     if !enter_lab() {
         return;
