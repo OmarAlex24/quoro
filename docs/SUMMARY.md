@@ -165,6 +165,8 @@
   - [0154: Defer change-log follow on nodes (#74) and cluster signing-key rotation (#76) from M5a to M5b](adr/0154-defer-change-log-follow-on-nodes-74-and-cluster-signing-key.md)
   - [0155: Defer the opt-in automatic 'rebuild on critical finding' policy (D-0138 layer 3) to M5b; M5a ships findings, the app.vulnerable incident and the manual 'rebuild with refreshed base'](adr/0155-defer-the-opt-in-automatic-rebuild-on-critical-finding.md)
   - [0156: Volume snapshots: reflink where the node's data dir supports it; otherwise volumes live in a node-managed loop-mounted XFS pool (reflink=1) so snapshots stay reflinks; pause_copy only as a last resort](adr/0156-volume-snapshots-reflink-where-the-node-s-data-dir-supports.md)
+  - [0157: Pre-upgrade control-plane backup: the new binary takes the VACUUM INTO backup (trigger: upgrade) at its first start, before it applies any migration; no new API operation](adr/0157-pre-upgrade-control-plane-backup-the-new-binary-takes-the.md)
+  - [0158: Control-plane backups with trigger: upgrade are kept outside the scheduled retention: the last 3 upgrade backups are always kept, whatever their age](adr/0158-control-plane-backups-with-trigger-upgrade-are-kept-outside.md)
 
 # Background research
 
