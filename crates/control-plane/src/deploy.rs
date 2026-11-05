@@ -1121,11 +1121,11 @@ pub async fn on_vm_observed(
         }
 
         // A scale-down during the rollout leaves more instances than wanted;
-        // the extras on the highest node ids go.
+        // the extras go in the same order as in `scale`.
         let replicas = app_replicas(&mut w.tx, &app_vm.app_id).await?;
         let mut linked = linked_vms(&mut w.tx, &app_vm.app_id, &before.created_at).await?;
         if linked.len() as i64 > replicas {
-            linked.sort_by(|a, b| b.node_id.cmp(&a.node_id));
+            removal_order(&mut w.tx, &app_vm.app_id, &mut linked).await?;
             let extras = usize::try_from((linked.len() as i64 - replicas).max(0)).unwrap_or(0);
             for extra in linked.into_iter().take(extras) {
                 sqlx::query("DELETE FROM vms WHERE id = ?")
@@ -1143,6 +1143,7 @@ pub async fn on_vm_observed(
                 .await?;
                 changed.push(extra.id);
             }
+            report_unserved_tunnel_domains(&mut w.tx, &app_vm.app_id).await?;
         }
     }
 
@@ -1432,7 +1433,10 @@ pub async fn on_image_unresolvable(
 ///
 /// With no rollout in progress and a current deployment, more replicas add
 /// VM rows linked to it on scheduler nodes that have none, and fewer delete
-/// the instances on the highest node ids. When the eligible nodes cannot hold
+/// instances in [`removal_order`]: those on nodes with a tunnel are kept when
+/// the app has `tunnel` domains, otherwise the highest node ids go. A
+/// scale-down that still leaves those domains without a tunnel reports them
+/// ([`report_unserved_tunnel_domains`]). When the eligible nodes cannot hold
 /// the new count the function writes nothing and returns `validation_failed`,
 /// so the caller's whole transaction fails. A rollout in progress, or an app
 /// without a current deployment, is left alone: the rollout and the next
@@ -1527,9 +1531,9 @@ pub(crate) async fn scale(
         return Ok(added);
     }
 
-    // Fewer replicas: the instances on the highest node ids go.
+    // Fewer replicas: see `removal_order` for which instances go.
     let mut linked = linked;
-    linked.sort_by(|a, b| b.node_id.cmp(&a.node_id));
+    removal_order(conn, app_id, &mut linked).await?;
     let extras = usize::try_from(count - replicas).unwrap_or(usize::MAX);
     let mut removed = Vec::new();
     for vm in linked.into_iter().take(extras) {
@@ -1540,7 +1544,118 @@ pub(crate) async fn scale(
         changelog::append(conn, &deploy_actor(), "vm", &vm.id, Op::Delete, json!({})).await?;
         removed.push(vm.id);
     }
+    report_unserved_tunnel_domains(conn, app_id).await?;
     Ok(removed)
+}
+
+/// Orders an app's instances so the ones a scale-down removes come first.
+///
+/// An app with one replica has its `tunnel` hostnames served by the tunnel of
+/// the node that runs it, so when the app has `tunnel` domains the instances
+/// on nodes mapped to a tunnel (`node_tunnels`) are kept before the others.
+/// Within each group the instances on the highest node ids go first, as they
+/// always did.
+async fn removal_order(
+    conn: &mut SqliteConnection,
+    app_id: &str,
+    linked: &mut [LinkedVm],
+) -> Result<(), ApiError> {
+    let has_tunnel_domain: Option<(i64,)> =
+        sqlx::query_as("SELECT 1 FROM domains WHERE app_id = ? AND tls_mode = 'tunnel' LIMIT 1")
+            .bind(app_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let tunnel_nodes: HashSet<String> = if has_tunnel_domain.is_some() {
+        sqlx::query_as::<_, (String,)>("SELECT node_id FROM node_tunnels")
+            .fetch_all(&mut *conn)
+            .await?
+            .into_iter()
+            .map(|(node_id,)| node_id)
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    sort_for_removal(linked, &tunnel_nodes);
+    Ok(())
+}
+
+/// The pure part of [`removal_order`]: instances on nodes outside
+/// `tunnel_nodes` first, then by node id, highest first.
+fn sort_for_removal(linked: &mut [LinkedVm], tunnel_nodes: &HashSet<String>) {
+    linked.sort_by(|a, b| {
+        let a_keep = tunnel_nodes.contains(&a.node_id);
+        let b_keep = tunnel_nodes.contains(&b.node_id);
+        a_keep.cmp(&b_keep).then_with(|| b.node_id.cmp(&a.node_id))
+    });
+}
+
+/// After a scale-down, reports every `tunnel` domain that no tunnel serves
+/// any more: the app has one replica, at least one instance meant to run,
+/// and none of them on a node mapped to a tunnel. Each such domain gets a
+/// `certificate.failed` event with `tls_mode` `tunnel`, the only per-domain
+/// failure signal the contract has, so the change is never silent.
+async fn report_unserved_tunnel_domains(
+    conn: &mut SqliteConnection,
+    app_id: &str,
+) -> Result<(), ApiError> {
+    let app: Option<(i64, String)> =
+        sqlx::query_as("SELECT replicas, project_id FROM apps WHERE id = ?")
+            .bind(app_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let Some((replicas, project_id)) = app else {
+        return Ok(());
+    };
+    // With more replicas the edge serves the hostnames from its own tunnel.
+    if replicas != 1 {
+        return Ok(());
+    }
+    let (running, on_tunnel): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COUNT(t.node_id) FROM vms v \
+         LEFT JOIN node_tunnels t ON t.node_id = v.node_id \
+         WHERE v.app_id = ? AND v.desired_status = 'running'",
+    )
+    .bind(app_id)
+    .fetch_one(&mut *conn)
+    .await?;
+    if running == 0 || on_tunnel > 0 {
+        return Ok(());
+    }
+    let domains: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, hostname FROM domains WHERE app_id = ? AND tls_mode = 'tunnel' \
+         ORDER BY hostname",
+    )
+    .bind(app_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    for (domain_id, hostname) in domains {
+        tracing::warn!(
+            app_id,
+            hostname,
+            "no instance of the app runs on a node with a tunnel; the hostname is not served"
+        );
+        events::emit(
+            conn,
+            NewEvent {
+                kind: "certificate.failed",
+                source: Source::ControlPlane,
+                subject_type: "domain",
+                subject_id: &domain_id,
+                project_id: Some(&project_id),
+                request_id: None,
+                actor: None,
+                data: json!({
+                    "domain_id": domain_id,
+                    "hostname": hostname,
+                    "tls_mode": "tunnel",
+                    "error": "no instance of the app runs on a node with a tunnel, \
+                              so no tunnel serves this hostname",
+                }),
+            },
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1930,5 +2045,38 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(events, 1);
+    }
+
+    fn linked(id: &str, node_id: &str) -> LinkedVm {
+        LinkedVm {
+            id: id.to_string(),
+            node_id: node_id.to_string(),
+            desired_status: "running".to_string(),
+            observed_status: "running".to_string(),
+        }
+    }
+
+    fn removal_ids(linked: &mut [LinkedVm], tunnel_nodes: &[&str]) -> Vec<String> {
+        let tunnel_nodes: HashSet<String> = tunnel_nodes.iter().map(ToString::to_string).collect();
+        sort_for_removal(linked, &tunnel_nodes);
+        linked.iter().map(|vm| vm.id.clone()).collect()
+    }
+
+    #[test]
+    fn a_scale_down_removes_instances_on_nodes_without_a_tunnel_first() {
+        let mut vms = [
+            linked("vm_a", "nod_a"),
+            linked("vm_b", "nod_b"),
+            linked("vm_c", "nod_c"),
+        ];
+        // No tunnel in play: the highest node ids go first, as before.
+        assert_eq!(removal_ids(&mut vms, &[]), ["vm_c", "vm_b", "vm_a"]);
+        // The node with a tunnel keeps its instance; the others keep the old
+        // order among themselves.
+        assert_eq!(removal_ids(&mut vms, &["nod_c"]), ["vm_b", "vm_a", "vm_c"]);
+        assert_eq!(
+            removal_ids(&mut vms, &["nod_a", "nod_c"]),
+            ["vm_b", "vm_c", "vm_a"]
+        );
     }
 }
