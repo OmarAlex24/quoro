@@ -35,7 +35,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     ByteStream, Capabilities, ConsoleMode, ConsoleStream, Engine, EngineError, EngineEvent,
-    EventStream, ExecRequest, ExecSession, HostProbe, ImageConfig, ImageDigest, ImageRef,
+    EventStream, ExecRequest, ExecSession, HostProbe, ImageConfig, ImageDigest, ImageInventory, ImageRef,
     LineStream, NodeNetwork, OciLayout, OutputLine, OutputStream, PreparedImage, SerialMode,
     SnapshotMethod, StopMode, VmCounters, VmId, VmInfo, VmSpec, VmState, VolumeId, VolumeInfo,
     VolumeSnapshot,
@@ -254,6 +254,10 @@ fn end_execs(record: &mut VmRecord) {
 /// an await point.
 struct State {
     images: HashMap<ImageDigest, PreparedImage>,
+    /// Inventories set by tests (M5a). `Some(None)` makes the image behave
+    /// as prepared before M5a (no inventory); a prepared image without an
+    /// entry has an empty inventory.
+    inventories: HashMap<ImageDigest, Option<ImageInventory>>,
     /// Bridge name to the network the bridge was created with.
     networks: HashMap<String, NodeNetwork>,
     vms: HashMap<VmId, VmRecord>,
@@ -279,6 +283,7 @@ impl State {
     fn new() -> Self {
         Self {
             images: HashMap::new(),
+            inventories: HashMap::new(),
             networks: HashMap::new(),
             vms: HashMap::new(),
             snapshots: HashMap::new(),
@@ -397,6 +402,20 @@ impl FakeEngine {
     /// normally. This reaches the error paths section 3 defines.
     pub fn fail_next(&self, op: FakeOp, err: EngineError) {
         self.lock().failures.entry(op).or_default().push_back(err);
+    }
+
+    /// Sets the inventory `image_inventory` returns for `inventory.digest`
+    /// once that image is prepared (M5a).
+    pub fn set_inventory(&self, inventory: ImageInventory) {
+        self.lock()
+            .inventories
+            .insert(inventory.digest.clone(), Some(inventory));
+    }
+
+    /// Makes `digest` behave like an image prepared before M5a: once
+    /// prepared, `image_inventory` is `NotFound`.
+    pub fn clear_inventory(&self, digest: &ImageDigest) {
+        self.lock().inventories.insert(digest.clone(), None);
     }
 
     /// Keeps volume files in `dir` as real sparse files (M5a). Snapshots are
@@ -816,6 +835,25 @@ impl Engine for FakeEngine {
     async fn remove_image(&self, digest: &ImageDigest) -> Result<(), EngineError> {
         self.lock().images.remove(digest);
         Ok(())
+    }
+
+    async fn image_inventory(&self, digest: &ImageDigest) -> Result<ImageInventory, EngineError> {
+        let state = self.lock();
+        if !state.images.contains_key(digest) {
+            return Err(EngineError::NotFound);
+        }
+        match state.inventories.get(digest) {
+            Some(Some(inventory)) => Ok(inventory.clone()),
+            Some(None) => Err(EngineError::NotFound),
+            None => Ok(ImageInventory {
+                digest: digest.clone(),
+                os: None,
+                ecosystems: Vec::new(),
+                not_inventoried: Vec::new(),
+                packages: Vec::new(),
+                inventoried_at: "2026-01-01T00:00:00Z".to_owned(),
+            }),
+        }
     }
 
     async fn prepare_layout(&self, layout: &OciLayout) -> Result<PreparedImage, EngineError> {

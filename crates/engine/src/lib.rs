@@ -128,6 +128,35 @@ pub struct VolumeAttach {
     pub serial: String,
 }
 
+/// The package inventory of a prepared image (ADR 0150, ADR 0151). Added in
+/// M5a. Section 3.21; the wire form is `node-agent-protocol.md` section 5.26.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageInventory {
+    pub digest: ImageDigest,
+    /// `ID` and `VERSION_ID` from the image's os-release, when it has one.
+    pub os: Option<(String, String)>,
+    /// OSV ecosystems covered, for example "Debian:13" or "npm".
+    pub ecosystems: Vec<String>,
+    /// Kinds of content seen and not read, for example "static_binary".
+    pub not_inventoried: Vec<String>,
+    pub packages: Vec<InventoryPackage>,
+    /// RFC 3339 time the inventory was built.
+    pub inventoried_at: String,
+}
+
+/// One package of an [`ImageInventory`]. Added in M5a.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InventoryPackage {
+    pub ecosystem: String,
+    pub name: String,
+    /// The source package, when the package database records one.
+    pub source_name: Option<String>,
+    pub version: String,
+    pub purl: String,
+    /// For a language package, the file it was read from, relative to the root.
+    pub path: Option<String>,
+}
+
 /// A volume file on this node. Added in M5a. Section 3.20.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VolumeInfo {
@@ -532,6 +561,18 @@ pub trait Engine: Send + Sync {
             ))
         }
     }
+    // Image inventories (M5a; the default implementation returns Unsupported)
+    /// Added in M5a; section 3.21.
+    fn image_inventory(
+        &self,
+        _digest: &ImageDigest,
+    ) -> impl Future<Output = Result<ImageInventory, EngineError>> + Send {
+        async {
+            Err(EngineError::Unsupported(
+                "image inventories are not implemented by this engine".into(),
+            ))
+        }
+    }
     /// Section 3.16.
     fn snapshot_volume(
         &self,
@@ -569,6 +610,11 @@ pub struct HostProbe {
 }
 
 pub mod fake;
+
+/// The package inventory of an unpacked image tree (section 3.21, ADR 0151).
+/// The parsers are platform-independent so their tests run anywhere; the
+/// Linux image path supplies a tree resolved inside the staging root.
+pub mod inventory;
 
 /// The packet mark the node agent sets on mesh traffic it admits: TCP from
 /// the edge's mesh address to one backend's guest address and port
