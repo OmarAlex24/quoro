@@ -46,6 +46,13 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
 # The live-log SSE body is a stream built with `stream::unfold` (ADR 0057).
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# Reads the OSV ecosystem archives, one record at a time
+# (node-agent-protocol.md section 6.11). Deflate only: flate2 is already in the
+# tree, and no other compression method appears in those archives.
+zip = { version = "9.3", default-features = false, features = ["deflate-flate2"] }
+# `zip`'s deflate goes through flate2, whose default features are off in that
+# tree, so the pure-Rust backend the engine uses is named here too (no C zlib).
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }

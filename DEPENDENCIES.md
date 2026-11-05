@@ -127,6 +127,8 @@ Rules:
 | `serde`, `serde_json` | `crates/backup` | `derive`, `std` / `std` | The config, manifest and seal objects are JSON (sections 4, 6.1 and 6.2); the manifest is the plaintext a node writes and a restore parses |
 | `base64` | `crates/backup` | `std` (no default features) | The wrapped repo key's nonce and ciphertext are standard base64 in the config object (section 4); the same version `quoro-proto` uses |
 | `quoro-proto` (workspace crate) | `crates/backup` | none | The seal's Ed25519 signature over RFC 8785 canonical JSON (section 6.2) reuses `quoro_proto::sign` and `quoro_proto::jcs`, so the workspace has one canonicalizer and one signature implementation |
+| `zip` | `crates/control-plane` | `deflate-flate2` (no default features) | Reads the OSV ecosystem archives the vulnerability mirror downloads and imports (`node-agent-protocol.md` section 6.11): one record at a time, with a size cap per entry. Only the deflate method those archives use is enabled, through the `flate2` already in the tree; MIT, on the ADR 0080 allowlist |
+| `flate2` | `crates/control-plane` | `rust_backend` only | `zip`'s deflate decompressor, with the same pure-Rust `miniz_oxide` backend the engine uses instead of a C zlib; already in the tree, named here because `zip` leaves its backend unselected |
 
 ## Test-only dependencies
 

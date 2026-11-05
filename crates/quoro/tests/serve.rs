@@ -255,6 +255,7 @@ async fn the_binary_serves_the_whole_lifecycle_over_https() {
         .arg("serve")
         .arg("--config")
         .arg(&config)
+        .env("QUORO_TEST_NO_VULN_DOWNLOAD", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true)

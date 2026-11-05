@@ -41,6 +41,7 @@ pub mod store;
 pub(crate) mod subnet;
 pub mod sweeper;
 pub mod tunnel;
+pub mod vulns;
 
 use crate::keys::ClusterKeys;
 use crate::session::NodeHub;
@@ -152,6 +153,10 @@ pub struct AppState {
     /// The backup runtime: the bucket factory (production `S3Client`, tests a
     /// `MemoryStore`), the garbage-collection flag and the last sweep time.
     pub backups: backups::Backups,
+    /// The primary's vulnerability data: the cache file next to the database
+    /// and the loop that keeps it fresh (ADR 0150). The loop only runs once
+    /// the binary calls [`vulns::Vulns::spawn`].
+    pub vulns: vulns::Vulns,
 }
 
 impl AppState {
@@ -248,6 +253,7 @@ impl AppState {
             backups.clone(),
         );
         hub.reset_stale_connections().await?;
+        let vulns = vulns::Vulns::open(&config.data_dir, store.clone()).await?;
         let tunnel = tunnel::TunnelManager::new(store.clone(), Arc::clone(&data_key), hub.clone());
         hub.set_tunnel_manager(&tunnel);
         tunnel.start();
@@ -263,6 +269,7 @@ impl AppState {
             cluster_id,
             interactive: interactive::Interactive::default(),
             backups,
+            vulns,
         };
         // Every session the previous process left open ends with
         // `primary_restarted` before the listener opens.

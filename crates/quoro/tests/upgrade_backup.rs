@@ -61,6 +61,7 @@ async fn the_skip_flag_starts_a_primary_with_nothing_pending_and_writes_no_recor
         .arg("--skip-upgrade-backup")
         .arg("--config")
         .arg(&config)
+        .env("QUORO_TEST_NO_VULN_DOWNLOAD", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
