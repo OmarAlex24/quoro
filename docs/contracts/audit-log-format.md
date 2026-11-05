@@ -294,7 +294,7 @@ System records, with `actor_type` `system`, `channel` `system` and no `scope`:
 | `audit_export.probe` | `audit_export` | `audit_export` / the export | The daily probe ran; `ok` with the strength in the change log, or `error` |
 | `cluster.primary_moved` | `cluster` | `node` / the node that now holds the primary status | At its first start after `quoro restore`, the primary moved the primary status to the node on its new host (backup-format.md section 8.2); `params` is `{from_node_id, to_node_id}`, `from_node_id` null when no node held it |
 
-A control-plane backup is a `backup.dispatch` and a `backup.seal` with the backup as target. Restoring the control plane with `quoro restore` is offline and writes no record. The restored log ends where the backup ends, so verification against the off-site copy reports `tail_truncated` (section 8.3), which is the truth: the records after the backup are gone locally and kept off-site. How the export continues after such a restore is part of the storage epic; it never overwrites the existing copy.
+A control-plane backup is a `backup.dispatch` and a `backup.seal` with the backup as target. Restoring the control plane with `quoro restore` is offline and writes no record. The restored log ends where the backup ends. When the copy holds records the backup does not, verification against it reports `tail_truncated` (section 8.3), which is the truth: the records after the backup are gone locally and kept off-site. Section 8.5 says how the export continues after a restore; it never overwrites the existing copy.
 
 ### 3.6 Vulnerability actions (M5a)
 
@@ -531,6 +531,15 @@ From M5a, while an export exists, `POST /api/v1/audit/verify` (section 6) and a 
 ### 8.4 What the copy does and does not solve
 
 It solves tail truncation and full rewrite *on the server*, because the segments and the head hashes live somewhere the operator of the server cannot rewrite (D-0031), to the degree the lock strength says. With `compliance` that holds against everyone until the retention ends. With `bucket_rule` it holds against the server's operator unless they also control the Cloudflare account. With `none` it holds only as long as nobody with the credential, or with the account, deletes or replaces objects. It does not solve a compromised provider account, and it does not make the local log immutable. The honest statement is: the local chain plus an out-of-reach copy make silent rewriting detectable by anyone who compares the two heads (section 7).
+
+### 8.5 After a control-plane restore
+
+A restored database carries the `audit_exports` row as it was when the backup was taken, so the exporter resumes from that row's `last_exported_seq` with the rules of section 8.1. What happens next depends on whether the backup holds every record the copy holds:
+
+- **The backup holds the copy's last record.** The restored log ends at or after the newest head's `last_seq`. The exporter cuts the next segment from `last_exported_seq + 1` under a new key and writes its head; verification (section 8.3) reports `ok`. Records the old primary wrote after the backup and never exported are gone, and the restored primary gives their `seq` values to new records. No exported object names those values, so nothing is overwritten and nothing in the copy contradicts the new records.
+- **The copy holds records the backup does not.** The restored log ends before the newest head's `last_seq`. Verification reports `tail_truncated`. The exporter adopts the exported segments the restored log still covers, as after a crash, and stops at the first one that extends past the log's end: `last_error` names that segment as not matching the local log, and no later segment is written. Once the restored primary has written records past the copy's last `seq`, verification reports `copy_mismatch` at the first `seq` whose hash differs. The copy keeps the original records. M5a has no operation that starts a new copy for such a cluster.
+
+A planned move of the primary to another host therefore takes its backup right after a segment closes, when `last_exported_seq` equals the newest local `seq`, and stops the old primary before the next segment closes, at most five minutes after the next record (section 8.1). Every exported record is then in the backup, and the export continues on the new host as in the first case.
 
 ## 9. Retention
 
