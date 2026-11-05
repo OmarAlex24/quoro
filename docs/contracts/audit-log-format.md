@@ -292,6 +292,7 @@ System records, with `actor_type` `system`, `channel` `system` and no `scope`:
 | `lease.grant` | `leases` | `app` / the app | A `local` lease was granted at placement or after a restore; `params` is `{node_id, fencing_token}` |
 | `lease.revoke` | `leases` | `app` / the app | A lease was revoked with reason `moved` or `deleted`; `params` is `{node_id, fencing_token, reason}` |
 | `audit_export.probe` | `audit_export` | `audit_export` / the export | The daily probe ran; `ok` with the strength in the change log, or `error` |
+| `cluster.primary_moved` | `cluster` | `node` / the node that now holds the primary status | At its first start after `quoro restore`, the primary moved the primary status to the node on its new host (backup-format.md section 8.2); `params` is `{from_node_id, to_node_id}`, `from_node_id` null when no node held it |
 
 A control-plane backup is a `backup.dispatch` and a `backup.seal` with the backup as target. Restoring the control plane with `quoro restore` is offline and writes no record. The restored log ends where the backup ends, so verification against the off-site copy reports `tail_truncated` (section 8.3), which is the truth: the records after the backup are gone locally and kept off-site. How the export continues after such a restore is part of the storage epic; it never overwrites the existing copy.
 
