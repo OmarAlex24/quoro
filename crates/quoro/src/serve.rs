@@ -42,6 +42,10 @@ const NODE_STOP_GRACE: Duration = Duration::from_secs(15);
 ///
 /// A message for the operator when the data directory, the database, the TLS
 /// material or the listener cannot be brought up.
+/// Set by the integration tests, which run without network: the vulnerability
+/// data loop is not started.
+const NO_VULN_DOWNLOAD: &str = "QUORO_TEST_NO_VULN_DOWNLOAD";
+
 pub async fn run(config: Config, skip_upgrade_backup: bool) -> Result<i32, String> {
     // The control plane's webhook clients use reqwest's no-provider rustls
     // feature, so the process must install one before `AppState::open` starts
@@ -96,6 +100,11 @@ pub async fn run(config: Config, skip_upgrade_backup: bool) -> Result<i32, Strin
         skip_upgrade_backup,
     )
     .await?;
+    // The vulnerability data loop downloads from OSV and CISA. The binary's
+    // own integration test runs without network and turns it off.
+    if std::env::var_os(NO_VULN_DOWNLOAD).is_none() {
+        state.vulns.spawn();
+    }
     let owner_exists = owner_exists(&store)
         .await
         .map_err(|e| format!("cannot read the user table: {e}"))?;

@@ -85,6 +85,7 @@ async fn start_primary(dir: &Path) -> Primary {
         .arg("serve")
         .arg("--config")
         .arg(&config)
+        .env("QUORO_TEST_NO_VULN_DOWNLOAD", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true)

@@ -18,6 +18,7 @@ mod privilege;
 mod restore;
 mod serve;
 mod tls;
+mod vuln_cli;
 
 use quoro_control_plane::auth::setup_token;
 use quoro_control_plane::store::Store;
@@ -49,6 +50,8 @@ commands:
   audit verify --file PATH [--prev-hash HEX]
                                         verify an exported JSON Lines segment
   audit verify --db PATH                verify a database's audit_log, offline
+  vuln import <dir> [--config PATH]     import OSV ecosystem archives and the
+                                        KEV catalog from a directory, offline
   restore --endpoint URL --region REGION --bucket NAME --prefix PREFIX
           --cluster-id CLS --credentials-file PATH --recovery-key-file PATH
           --signing-key-file PATH --data-key-file PATH --data-dir DIR
@@ -99,6 +102,7 @@ async fn main() -> ExitCode {
         "join" => join_command(rest).await,
         "node" => node_command(rest).await,
         "audit" => audit_cli::run(rest).await,
+        "vuln" => vuln_cli::run(rest).await,
         "restore" => {
             match restore::run(rest, std::path::Path::new(config::DEFAULT_NODE_DATA_DIR)).await {
                 Ok(()) => ExitCode::SUCCESS,

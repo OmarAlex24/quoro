@@ -124,6 +124,7 @@ async fn a_running_control_plane_holds_no_capabilities() {
         .arg("serve")
         .arg("--config")
         .arg(&config)
+        .env("QUORO_TEST_NO_VULN_DOWNLOAD", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
