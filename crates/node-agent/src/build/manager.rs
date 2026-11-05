@@ -303,11 +303,12 @@ impl<E: Engine + 'static, B: Builder + 'static> BuildManager<E, B> {
             row.failed_phase = Some(phase);
             row.error = Some("node agent restarted".to_owned());
             row.finished_at = Some(now());
+            // The line before the terminal row, as in `complete`.
+            let line = format!("build failed in {}: node agent restarted", phase.as_str());
+            self.finish_log(&row, &line).await;
             if let Err(e) = self.store.save_build(&row).await {
                 warn!(build_id = %row.build_id, error = %e, "could not record a failed build");
             }
-            let line = format!("build failed in {}: node agent restarted", phase.as_str());
-            self.finish_log(&row, &line).await;
         }
 
         match self.engine.list().await {
@@ -964,7 +965,10 @@ impl<E: Engine, B: Builder> BuildTask<E, B> {
         // Clean up before the terminal row is visible, so a caller that sees
         // the build end already knows its ephemeral parts are gone.
         self.release(&row.build_id).await;
-        self.save(row).await;
+        // The terminal line goes into the file before the row turns terminal:
+        // a `build_logs` follow ends once it reads a terminal row and drains
+        // the file, so a line written after the row would never reach it
+        // (section 5.15).
         if let Err(e) = self
             .logs
             .append(&row.app_id, &row.build_id, LogStream::Stdout, None, line)
@@ -975,6 +979,7 @@ impl<E: Engine, B: Builder> BuildTask<E, B> {
         if let Err(e) = self.logs.finish(&row.app_id, &row.build_id).await {
             warn!(build_id = %row.build_id, error = %e, "could not close a build log");
         }
+        self.save(row).await;
         let _ = self
             .done
             .send(Done {
