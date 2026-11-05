@@ -813,7 +813,9 @@ components:
             Control-plane status. `replica` only once read-serving by replica
             nodes is enabled with manual promotion in M5; before that every
             non-primary node is null. In M1-M4 the cluster has exactly one
-            primary and no witness (D-0016).
+            primary and no witness (D-0016). After `quoro restore` onto another
+            host, the restored primary moves `primary` to the node on its new
+            host at its first start (backup-format.md section 8.2).
           oneOf:
             - type: string
               enum:

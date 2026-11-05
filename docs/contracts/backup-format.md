@@ -206,6 +206,14 @@ The restore:
 3. lists `seals/<cluster_id>/`, verifies each seal's signature with the given signing key, and picks the newest valid one, or the one the operator named;
 4. reads and checks the manifest and the chunks as in section 8.1, writing the database file;
 5. runs SQLite's `PRAGMA integrity_check` on the file, and only then installs it with the key files into the new host's data directory.
+6. names the node on the new host that takes the primary status (below), by writing its `nod_` id to `primary-node` in the data directory, mode 0600.
+
+**The primary status moves with the restore.** `nodes.cp_status = 'primary'` names the node on the primary's host (`getCluster.primary_node_id`, `welcome.primary_node_id`, and the `node_id` of control-plane backups). Only the local enrollment of the primary's own agent sets it, so a restore onto another host would leave it on the old host's node. `quoro restore` therefore picks the new host's node: the node named by `--node-id NOD`, otherwise the one in this host's node agent identity file (`/var/lib/quoro-node/identity.json`), when that file exists.
+
+- An explicit `--node-id` that the restored database does not hold, or holds as `removed`, refuses the restore before anything is installed.
+- An identity file that names another cluster, or a node the restored database does not hold or holds as `removed`, writes no `primary-node` file; the restore says why and goes on. Without `--node-id` and without an identity file, no file is written either. In these cases the primary status stays where the backup had it.
+
+At its next start, before it serves, the primary reads `primary-node`. When the file names a node of the database that is not `removed` and does not already hold the status, the primary clears `cp_status` on the node that holds it and sets `cp_status = 'primary'` on the named node, in one change-log write, and records `cluster.primary_moved` (`audit-log-format.md` section 3.5). In every case it then deletes the file; a node it cannot use is logged with the reason. The file must have the same owner as the database file, so that the control plane can read and delete it.
 
 The restored database is as old as the backup. How a restored primary reconciles with nodes that applied newer desired state is part of the storage epic; it does not change this format.
 
