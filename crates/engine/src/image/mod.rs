@@ -85,7 +85,7 @@ pub struct ImageStore {
     /// Reads a cached root disk for an image prepared before M5a (§3.21).
     mounter: Arc<dyn backfill::RootMount>,
     /// One root disk is mounted at a time, on one mount point.
-    mount_lock: tokio::sync::Mutex<()>,
+    mount_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ImageStore {
@@ -103,7 +103,7 @@ impl ImageStore {
             config,
             locks: Mutex::new(HashMap::new()),
             mounter: Arc::new(backfill::LoopMount),
-            mount_lock: tokio::sync::Mutex::new(()),
+            mount_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -188,8 +188,10 @@ impl ImageStore {
         digest: &ImageDigest,
     ) -> Result<ImageInventory, EngineError> {
         let hex = registry::digest_hex(&digest.0)?.to_owned();
-        let lock = self.lock_for(&hex);
-        let _guard = lock.lock().await;
+        // Both guards move into the blocking task, so they are held until the
+        // mount, the parse and the write are over, even when the caller's
+        // future is dropped (an agent shutting down) before that.
+        let guard = self.lock_for(&hex).lock_owned().await;
         if self.cached(digest)?.is_none() {
             return Err(EngineError::NotFound);
         }
@@ -197,11 +199,12 @@ impl ImageStore {
             Err(EngineError::NotFound) => {}
             other => return other,
         }
-        let _mount = self.mount_lock.lock().await;
+        let mount = Arc::clone(&self.mount_lock).lock_owned().await;
         let root = self.config.root.clone();
         let mounter = Arc::clone(&self.mounter);
         let digest = digest.clone();
         tokio::task::spawn_blocking(move || {
+            let _held = (guard, mount);
             backfill::inventory_from_root_disk(&root, &hex, digest, mounter.as_ref())
         })
         .await
