@@ -513,8 +513,27 @@ fn app_subject(event: &wire::EventBody) -> Option<&str> {
         .flatten()
 }
 
-/// Opens one incident for an `app.down` event, unless an open one already
-/// exists for that app (section 8.2 step 1 and 2).
+/// Which detection opens an incident, for its title.
+#[derive(Clone, Copy)]
+enum AppIncident {
+    /// `app.down`.
+    Down,
+    /// `app.vulnerable`.
+    Vulnerable,
+}
+
+impl AppIncident {
+    fn title(self, app_name: &str) -> String {
+        match self {
+            Self::Down => format!("app {app_name} is down"),
+            Self::Vulnerable => format!("app {app_name} has a critical vulnerability"),
+        }
+    }
+}
+
+/// Opens one incident for an `app.down` event, unless an open incident of the
+/// app exists that a detection other than `app.vulnerable` opened (section
+/// 8.2 step 1 and 2).
 async fn open_for_app_down(
     conn: &mut SqliteConnection,
     event: &wire::EventBody,
@@ -524,7 +543,10 @@ async fn open_for_app_down(
     };
     let existing: Option<(String,)> = sqlx::query_as(
         "SELECT id FROM incidents WHERE status = 'open' \
-         AND json_extract(subject, '$.type') = 'app' AND json_extract(subject, '$.id') = ?",
+         AND json_extract(subject, '$.type') = 'app' AND json_extract(subject, '$.id') = ? \
+         AND NOT EXISTS (SELECT 1 FROM events e \
+             WHERE e.id = incidents.trigger_event_id AND e.type = 'app.vulnerable') \
+         LIMIT 1",
     )
     .bind(app_id)
     .fetch_optional(&mut *conn)
@@ -532,7 +554,68 @@ async fn open_for_app_down(
     if existing.is_some() {
         return Ok(());
     }
-    let app: Option<(String, String)> =
+    let request_id = system_request_id(event);
+    open_app_incident(
+        conn,
+        app_id,
+        event.project_id.as_deref(),
+        AppIncident::Down,
+        &event.id,
+        &request_id,
+    )
+    .await
+}
+
+/// Opens one incident for an `app.vulnerable` event, unless one triggered by
+/// such an event is already open for the app.
+///
+/// The caller emits the `app.vulnerable` event in the same transaction.
+///
+/// # Errors
+///
+/// A database error, or an inconsistent stored row.
+pub(crate) async fn open_for_app_vulnerable(
+    conn: &mut SqliteConnection,
+    app_id: &str,
+    project_id: Option<&str>,
+    event_id: &str,
+    request_id: &str,
+) -> Result<(), ApiError> {
+    let existing: Option<(String,)> = sqlx::query_as(
+        "SELECT id FROM incidents WHERE status = 'open' \
+         AND json_extract(subject, '$.type') = 'app' AND json_extract(subject, '$.id') = ? \
+         AND EXISTS (SELECT 1 FROM events e \
+             WHERE e.id = incidents.trigger_event_id AND e.type = 'app.vulnerable') \
+         LIMIT 1",
+    )
+    .bind(app_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if existing.is_some() {
+        return Ok(());
+    }
+    open_app_incident(
+        conn,
+        app_id,
+        project_id,
+        AppIncident::Vulnerable,
+        event_id,
+        request_id,
+    )
+    .await
+}
+
+/// The writes every app incident shares: the row, its change-log entry, its
+/// `incident.opened` event and its `incident.open` audit record.
+async fn open_app_incident(
+    conn: &mut SqliteConnection,
+    app_id: &str,
+    project_id: Option<&str>,
+    kind: AppIncident,
+    trigger_event_id: &str,
+    request_id: &str,
+) -> Result<(), ApiError> {
+    let app: Option<(String, Option<String>)> =
         sqlx::query_as("SELECT name, project_id FROM apps WHERE id = ?")
             .bind(app_id)
             .fetch_optional(&mut *conn)
@@ -540,21 +623,21 @@ async fn open_for_app_down(
     let name = app
         .as_ref()
         .map_or_else(|| app_id.to_string(), |(name, _)| name.clone());
-    let project_id = event
-        .project_id
-        .clone()
-        .or_else(|| app.as_ref().map(|(_, project_id)| project_id.clone()));
+    let project_id = project_id
+        .map(str::to_owned)
+        .or_else(|| app.as_ref().and_then(|(_, project_id)| project_id.clone()));
+    let now = now_rfc3339();
     let incident = Incident {
         id: new_id(Prefix::Incident),
         status: IncidentStatus::Open,
-        title: format!("app {name} is down"),
-        trigger_event_id: event.id.clone(),
+        title: kind.title(&name),
+        trigger_event_id: trigger_event_id.to_owned(),
         subject: Subject {
             kind: "app".to_string(),
             id: app_id.to_string(),
         },
         project_id: project_id.clone(),
-        opened_at: now_rfc3339(),
+        opened_at: now,
         resolved_at: None,
         resolved_by_type: None,
         resolved_by_id: None,
@@ -583,7 +666,6 @@ async fn open_for_app_down(
     )
     .await?;
 
-    let request_id = system_request_id(event);
     let event_id = new_id(Prefix::Event);
     let time = now_rfc3339();
     let actor = Actor::system("incidents");
@@ -597,7 +679,7 @@ async fn open_for_app_down(
             subject: json!({ "type": "incident", "id": incident.id }),
             project_id: incident.project_id.as_deref(),
             incident_id: Some(&incident.id),
-            request_id: Some(&request_id),
+            request_id: Some(request_id),
             actor: Some(json!({ "type": "system", "id": "incidents" })),
             data: json!({
                 "incident_id": incident.id,
@@ -614,12 +696,12 @@ async fn open_for_app_down(
         &system_record(
             "incident.open",
             &incident,
-            Some(&event.id),
+            Some(trigger_event_id),
             json!({
                 "incident_id": incident.id,
                 "subject": { "type": "app", "id": app_id },
             }),
-            request_id,
+            request_id.to_owned(),
             change_seq,
         ),
     )
@@ -628,6 +710,9 @@ async fn open_for_app_down(
 }
 
 /// Resolves the open incident of an `app.up` event as the system (section 8.3).
+///
+/// An incident triggered by `app.vulnerable` is left alone: `app.up` only ends
+/// the `app.down` one.
 async fn resolve_for_app_up(
     conn: &mut SqliteConnection,
     event: &wire::EventBody,
@@ -638,6 +723,8 @@ async fn resolve_for_app_up(
     let row = sqlx::query(&format!(
         "SELECT {INCIDENT_COLUMNS} FROM incidents WHERE status = 'open' \
          AND json_extract(subject, '$.type') = 'app' AND json_extract(subject, '$.id') = ? \
+         AND NOT EXISTS (SELECT 1 FROM events e \
+             WHERE e.id = incidents.trigger_event_id AND e.type = 'app.vulnerable') \
          ORDER BY id LIMIT 1"
     ))
     .bind(app_id)
@@ -646,20 +733,75 @@ async fn resolve_for_app_up(
     let Some(row) = row else {
         return Ok(());
     };
-    let mut incident = incident_from_row(&row)?;
+    let incident = incident_from_row(&row)?;
+    let request_id = system_request_id(event);
+    resolve_app_incident(
+        conn,
+        incident,
+        "the app came back up",
+        "app.up",
+        &request_id,
+    )
+    .await
+}
+
+/// Resolves the open vulnerability incident of an app as the system once no
+/// finding is in KEV or has a CVSS score of 9.0 or more.
+///
+/// # Errors
+///
+/// A database error, or an inconsistent stored row.
+pub(crate) async fn resolve_for_app_vulnerable(
+    conn: &mut SqliteConnection,
+    app_id: &str,
+    request_id: &str,
+) -> Result<(), ApiError> {
+    let row = sqlx::query(&format!(
+        "SELECT {INCIDENT_COLUMNS} FROM incidents WHERE status = 'open' \
+         AND json_extract(subject, '$.type') = 'app' AND json_extract(subject, '$.id') = ? \
+         AND EXISTS (SELECT 1 FROM events e \
+             WHERE e.id = incidents.trigger_event_id AND e.type = 'app.vulnerable') \
+         ORDER BY id LIMIT 1"
+    ))
+    .bind(app_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let incident = incident_from_row(&row)?;
+    resolve_app_incident(
+        conn,
+        incident,
+        "no open finding is in the KEV catalog or has a CVSS score of 9.0 or more",
+        "app.vulnerable resolved",
+        request_id,
+    )
+    .await
+}
+
+/// The writes every system incident resolution shares: the row, its
+/// change-log entry, revoked grants, `incident.resolved` and its audit record.
+async fn resolve_app_incident(
+    conn: &mut SqliteConnection,
+    mut incident: Incident,
+    note: &str,
+    audit_reason: &str,
+    request_id: &str,
+) -> Result<(), ApiError> {
     let actor = Actor::system("incidents");
     let now = now_rfc3339();
     incident.status = IncidentStatus::Resolved;
     incident.resolved_at = Some(now.clone());
     incident.resolved_by_type = Some(IncidentResolver::System);
     incident.resolved_by_id = Some("incidents".to_string());
-    incident.resolution_note = Some("the app came back up".to_string());
+    incident.resolution_note = Some(note.to_string());
     sqlx::query(
         "UPDATE incidents SET status = 'resolved', resolved_at = ?, resolved_by_type = 'system', \
          resolved_by_id = 'incidents', resolution_note = ? WHERE id = ?",
     )
     .bind(&now)
-    .bind(&incident.resolution_note)
+    .bind(note)
     .bind(&incident.id)
     .execute(&mut *conn)
     .await?;
@@ -672,15 +814,14 @@ async fn resolve_for_app_up(
         incident_payload(&incident),
     )
     .await?;
-    let request_id = system_request_id(event);
-    grants::revoke_for_incident(conn, &incident.id, Some(&request_id)).await?;
+    grants::revoke_for_incident(conn, &incident.id, Some(request_id)).await?;
     emit_resolved(
         conn,
         &incident,
         IncidentResolver::System,
         "incidents",
-        incident.resolution_note.as_deref(),
-        Some(&request_id),
+        Some(note),
+        Some(request_id),
         &actor,
     )
     .await?;
@@ -690,8 +831,8 @@ async fn resolve_for_app_up(
             "incident.resolve",
             &incident,
             Some(&incident.trigger_event_id),
-            json!({ "incident_id": incident.id, "reason": "app.up" }),
-            request_id,
+            json!({ "incident_id": incident.id, "reason": audit_reason }),
+            request_id.to_owned(),
             change_seq,
         ),
     )

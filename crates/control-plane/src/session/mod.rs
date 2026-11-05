@@ -25,6 +25,7 @@ use crate::keys::ClusterKeys;
 use crate::leases;
 use crate::store::{Store, now_rfc3339, sha256_hex};
 use crate::tunnel::{CloudflareEndpoints, TunnelKick};
+use crate::vulns::ingest::{self, Assembler};
 use crate::{DigestResolver, ServerConfig};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, FromRequestParts, State};
@@ -54,6 +55,15 @@ const MAX_STREAMS: usize = 32;
 
 /// Decoded bytes one `stream_data` may carry (section 5.7).
 const MAX_STREAM_DATA_BYTES: usize = 64 * 1024;
+
+/// Most inventories one `status_report` may make the primary ask for.
+const MAX_INVENTORY_REQUESTS: usize = 16;
+
+/// How long the same digest is not asked for again (section 5.17).
+const INVENTORY_RESEND_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// How long an `inventory_resend` command may take to be answered.
+const INVENTORY_RESEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The outbox sender of one session.
 type SessionSender = mpsc::UnboundedSender<String>;
@@ -271,6 +281,9 @@ struct HubInner {
     vm_nodes: Mutex<HashMap<String, String>>,
     /// The tunnel manager, so a session can ask for a route reconcile.
     tunnels: Mutex<Option<TunnelKick>>,
+    /// The primary's vulnerability data, so a session can store inventories
+    /// and ask the node to resend them.
+    vulns: Mutex<Option<crate::vulns::Vulns>>,
     /// Where the Cloudflare clients point (section 5.22, ADR 0094).
     endpoints: Mutex<CloudflareEndpoints>,
     /// The base URLs other than `public_url` where this primary's listener
@@ -325,6 +338,7 @@ impl NodeHub {
             digests: desired::DigestCache::default(),
             vm_nodes: Mutex::new(HashMap::new()),
             tunnels: Mutex::new(None),
+            vulns: Mutex::new(None),
             endpoints: Mutex::new(CloudflareEndpoints::production()),
             advertised_urls: Mutex::new(None),
             dns_records: Mutex::new(HashMap::new()),
@@ -480,6 +494,16 @@ impl NodeHub {
     /// Registers the tunnel manager.
     pub(crate) fn set_tunnel_manager(&self, manager: &crate::tunnel::TunnelManager) {
         *self.0.tunnels.lock().expect("tunnel handle lock") = Some(manager.kick_handle());
+    }
+
+    /// Registers the primary's vulnerability data.
+    pub(crate) fn set_vulns(&self, vulns: &crate::vulns::Vulns) {
+        *self.0.vulns.lock().expect("vulns lock") = Some(vulns.clone());
+    }
+
+    /// The primary's vulnerability data, once the start has installed it.
+    fn vulns(&self) -> Option<crate::vulns::Vulns> {
+        self.0.vulns.lock().expect("vulns lock").clone()
     }
 
     /// Points the Cloudflare clients at other endpoints (tests).
@@ -1307,6 +1331,10 @@ struct Session {
     retry_pending: bool,
     /// Consecutive builds in which an app VM's image did not resolve.
     digest_failures: HashMap<String, u32>,
+    /// Parts of the image inventories this session is still assembling.
+    inventory_parts: Assembler,
+    /// When this session last asked the node to resend an inventory, by digest.
+    inventory_requests: HashMap<String, Instant>,
 }
 
 async fn run_session(
@@ -1334,6 +1362,8 @@ async fn run_session(
         notified_deleted: HashSet::new(),
         retry_pending: false,
         digest_failures: HashMap::new(),
+        inventory_parts: Assembler::new(),
+        inventory_requests: HashMap::new(),
     };
     let mut superseded = false;
     let mut reason = "session_closed";
@@ -1565,6 +1595,7 @@ impl Session {
                 {
                     tracing::warn!(%e, node_id = %self.node_id, "cannot apply a status report");
                 }
+                self.request_missing_inventories(&report).await;
             }
             NodeMessage::Event(event) => {
                 if event.source.get("node_id").and_then(Value::as_str)
@@ -1659,17 +1690,89 @@ impl Session {
                     .unwrap_or_default();
                 self.start_dns_challenge(challenge, raw.id.clone(), acme_routes);
             }
-            // Storing inventories happens in a later PR (section 5.26).
-            NodeMessage::ImageInventory(inventory) => tracing::debug!(
-                node_id = %self.node_id,
-                image_digest = %inventory.image_digest,
-                inventory_id = %inventory.inventory_id,
-                part = inventory.part,
-                parts = inventory.parts,
-                "ignoring an image inventory part"
-            ),
+            NodeMessage::ImageInventory(inventory) => {
+                let assembled = self.inventory_parts.push(inventory);
+                if let Some(assembled) = assembled
+                    && let Some(vulns) = self.hub.vulns()
+                {
+                    // A 4 MiB write must not hold the session loop.
+                    tokio::spawn(async move {
+                        if let Err(error) =
+                            ingest::store(&vulns, &assembled.object, &assembled.sha256).await
+                        {
+                            tracing::warn!(%error, "cannot store an image inventory");
+                        }
+                    });
+                }
+            }
         }
         false
+    }
+
+    /// Asks the node to resend the inventories its `status_report` named but
+    /// the cache does not hold, or holds under another hash (section 5.17,
+    /// ADR 0150). A digest is asked for at most every ten minutes, and one
+    /// report asks for at most sixteen.
+    async fn request_missing_inventories(&mut self, report: &wire::StatusReport) {
+        let Some(vulns) = self.hub.vulns() else {
+            return;
+        };
+        let now = Instant::now();
+        self.inventory_requests
+            .retain(|_, asked| now.saturating_duration_since(*asked) < INVENTORY_RESEND_INTERVAL);
+        let mut asked = 0usize;
+        for image in &report.images {
+            if asked == MAX_INVENTORY_REQUESTS {
+                break;
+            }
+            let Some(sha256) = image.inventory_sha256.as_deref() else {
+                // The node is still building the inventory.
+                continue;
+            };
+            if self.inventory_requests.contains_key(&image.image_digest) {
+                continue;
+            }
+            let missing = match vulns.cache().inventory_sha(&image.image_digest).await {
+                Ok(None) => true,
+                Ok(Some(held)) => held != sha256,
+                Err(error) => {
+                    tracing::debug!(
+                        %error,
+                        digest = %image.image_digest,
+                        "cannot read an inventory before asking the node to resend it"
+                    );
+                    false
+                }
+            };
+            if !missing {
+                continue;
+            }
+            asked += 1;
+            self.inventory_requests
+                .insert(image.image_digest.clone(), now);
+            let hub = self.hub.clone();
+            let node_id = self.node_id.clone();
+            let digest = image.image_digest.clone();
+            tokio::spawn(async move {
+                let params = json!({ "image_digest": digest });
+                match hub
+                    .command(
+                        &node_id,
+                        "inventory_resend",
+                        params,
+                        INVENTORY_RESEND_TIMEOUT,
+                    )
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(error) => tracing::debug!(
+                        %error,
+                        node_id = %node_id,
+                        "the node did not answer inventory_resend"
+                    ),
+                }
+            });
+        }
     }
 
     /// Revokes every lease `hello.leases` reports that this primary does not

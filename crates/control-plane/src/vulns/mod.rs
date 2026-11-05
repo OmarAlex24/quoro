@@ -18,13 +18,19 @@
 //! - [`version`] orders versions per ecosystem and evaluates OSV ranges.
 //! - [`status`] says what is known about an app's current image.
 //! - [`severity`] turns a record's CVSS vector into a score and a band.
+//! - [`ingest`] assembles the inventory parts nodes send and stores them.
+//! - [`matcher`] matches one inventory against the cached OSV records.
+//! - [`findings`] writes the findings and runs the matcher loop.
 
 pub mod cache;
 pub mod changes;
 pub mod ecosystem;
 pub mod fetch;
+pub mod findings;
 pub mod import;
+pub mod ingest;
 pub mod kev;
+pub mod matcher;
 pub mod mirror;
 pub mod osv;
 pub mod severity;

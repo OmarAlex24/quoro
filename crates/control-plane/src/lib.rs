@@ -254,6 +254,7 @@ impl AppState {
         );
         hub.reset_stale_connections().await?;
         let vulns = vulns::Vulns::open(&config.data_dir, store.clone()).await?;
+        hub.set_vulns(&vulns);
         let tunnel = tunnel::TunnelManager::new(store.clone(), Arc::clone(&data_key), hub.clone());
         hub.set_tunnel_manager(&tunnel);
         tunnel.start();
@@ -275,6 +276,7 @@ impl AppState {
         // `primary_restarted` before the listener opens.
         interactive::close_orphans(&state).await?;
         sweeper::spawn(state.clone());
+        vulns::findings::spawn(state.clone());
         audit_export::spawn(state.clone());
         backups::dispatch::spawn(state.clone());
         dispatcher::start(state.clone()).await?;
