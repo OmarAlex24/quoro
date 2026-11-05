@@ -93,6 +93,23 @@ impl LeaseView {
         self.failed.load(Ordering::Relaxed)
     }
 
+    /// Whether the node holds the app's lease with exactly `token`, so a backup
+    /// job of that token may run (section 6.7, `backup-format.md` section 7.1
+    /// step 2).
+    ///
+    /// Only `held` counts: an `uncertain`, `expired` or `revoked` lease means
+    /// the node may no longer act for the app, and the job fails with
+    /// `lease_mismatch`.
+    #[must_use]
+    pub fn holds_app_lease(&self, app_id: &str, token: u64) -> bool {
+        self.lock().leases().any(|lease| {
+            lease.resource_type == ResourceType::App
+                && lease.resource_id == app_id
+                && lease.state == LeaseState::Held
+                && lease.token == token
+        })
+    }
+
     /// The node-side state of one lease, for a test.
     #[must_use]
     pub fn state(&self, lease_id: &str) -> Option<LeaseState> {

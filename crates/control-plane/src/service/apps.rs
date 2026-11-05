@@ -83,6 +83,8 @@ pub async fn list_apps(
                 node_id: None,
             })
             .await?;
+        let mut items = items;
+        crate::backups::cost::attach(state, &mut items).await?;
         Ok(AppList { items, next_cursor })
     }
     .await;
@@ -111,7 +113,7 @@ pub async fn get_app(state: &AppState, ctx: &CallCtx, app_id: &str) -> Result<Ap
             .fetch_optional(&mut *conn)
             .await?
             .ok_or_else(|| ApiError::not_found("app"))?;
-        let app = app_from_row(&row)?;
+        let mut app = app_from_row(&row)?;
         access.set_project(Some(&app.project_id));
         let instances = app_vms(&mut conn, app_id).await?;
         let rows = sqlx::query(&format!(
@@ -124,6 +126,7 @@ pub async fn get_app(state: &AppState, ctx: &CallCtx, app_id: &str) -> Result<Ap
             .iter()
             .map(domain_from_row)
             .collect::<Result<Vec<_>, _>>()?;
+        crate::backups::cost::attach(state, std::slice::from_mut(&mut app)).await?;
         Ok(AppDetail {
             app,
             instances,

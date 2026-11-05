@@ -19,7 +19,12 @@ quoro-engine = { path = "../engine" }
 # (ADR 0024, 0094, 0096).
 quoro-ingress = { path = "../ingress" }
 # Tunnel run tokens and DNS records: the node holds no provider credential.
+# Its S3 client writes the backup chunks and manifests (ADR 0147).
 quoro-providers = { path = "../providers" }
+# The backup format: chunking, chunk and manifest encryption, the restore
+# checks of `backup-format.md` sections 5, 6.1 and 8.1. The node wires it; it
+# writes no crypto of its own.
+quoro-backup = { path = "../backup" }
 # Channels for the session and the stop flag (`sync`), the paused monotonic
 # clock the lease timing runs on (`time`), and `tokio::select!` in the agent
 # loop (`macros`); no default features.

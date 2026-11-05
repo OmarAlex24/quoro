@@ -42,6 +42,17 @@ pub fn hex(bytes: &[u8]) -> String {
     out
 }
 
+/// `text` on one line, at most `max_chars` characters: the form a status
+/// report's `error` takes (section 5.3).
+#[must_use]
+pub fn one_line(text: &str, max_chars: usize) -> String {
+    let one_line: String = text
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    one_line.chars().take(max_chars).collect()
+}
+
 /// The current wall-clock time as an RFC 3339 UTC string with second
 /// precision.
 #[must_use]

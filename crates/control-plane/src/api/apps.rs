@@ -1043,14 +1043,7 @@ fn validate_update(body: &UpdateAppRequest) -> Result<(), ApiError> {
         return Err(ApiError::validation("port is outside 1-65535"));
     }
     match body.ha_policy {
-        None | Some(HaPolicy::None) => {}
-        // `cold` needs a stateful app and a backup repository (ADR 0147); no
-        // app can hold a volume until the storage epic ships.
-        Some(HaPolicy::Cold) => {
-            return Err(ApiError::conflict(
-                "ha_policy cold needs a stateful app and a backup repository",
-            ));
-        }
+        None | Some(HaPolicy::None | HaPolicy::Cold) => {}
         Some(HaPolicy::Warm | HaPolicy::Hot) => {
             return Err(ApiError::validation(
                 "ha_policy warm and hot are not supported before M5b and M6",
@@ -1072,6 +1065,26 @@ fn validate_update(body: &UpdateAppRequest) -> Result<(), ApiError> {
         validate_placement(placement)?;
     }
     Ok(())
+}
+
+/// Whether the app may switch to `cold`: it is stateful (an attached volume in
+/// `creating` or `ready`) and a backup repository exists (`openapi.yaml`
+/// `App.ha_policy`).
+async fn cold_allowed(conn: &mut sqlx::SqliteConnection, app_id: &str) -> Result<bool, ApiError> {
+    let attached: Option<(String,)> = sqlx::query_as(
+        "SELECT id FROM volumes WHERE app_id = ? AND state IN ('creating', 'ready')",
+    )
+    .bind(app_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if attached.is_none() {
+        return Ok(false);
+    }
+    let repository: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM backup_repositories LIMIT 1")
+            .fetch_optional(&mut *conn)
+            .await?;
+    Ok(repository.is_some())
 }
 
 /// The app's VM rows, oldest first.
@@ -1515,12 +1528,14 @@ pub async fn update_app(
         .await?;
 
     match update_app_tx(&state, &ctx, &app_id, &body, &params).await {
-        Ok((app, vm_ids)) => {
+        Ok((mut app, vm_ids)) => {
             for vm_id in vm_ids {
                 state.notify_driver(&vm_id);
             }
             // `replicas`, `port` and the health check shape `spec.edge`.
             state.hub.edge_changed();
+            // `openapi.yaml` `App.ha_cost`: every read answer carries it.
+            crate::backups::cost::attach(&state, std::slice::from_mut(&mut app)).await?;
             Ok(Json(app))
         }
         Err(error) => {
@@ -1615,6 +1630,13 @@ async fn update_app_tx(
     if let Some(policy) = body.ha_policy
         && policy != app.ha_policy
     {
+        // `cold` needs a stateful app and a backup repository (ADR 0147,
+        // `openapi.yaml` `App.ha_policy`).
+        if policy == HaPolicy::Cold && !cold_allowed(&mut w.tx, app_id).await? {
+            return Err(ApiError::conflict(
+                "ha_policy cold needs a stateful app and a backup repository",
+            ));
+        }
         app.ha_policy = policy;
         changed.push("ha_policy");
     }

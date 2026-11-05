@@ -20,9 +20,9 @@ use std::time::Duration;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt as _, StreamExt as _};
 use quoro_proto::wire::{
-    self, Capacity, Command, ControlMessage, DesiredState, EventBody, Heartbeat, Hello, LogLine,
-    NodeMessage, RawFrame, RouteStatus, StatusReport, StreamClose, StreamData, StreamEnd,
-    StreamEndReason, StreamOpen, VmStatus, VolumeStatus,
+    self, BackupStatus, Capacity, Command, ControlMessage, DesiredState, EventBody, Heartbeat,
+    Hello, LogLine, NodeMessage, RawFrame, RouteStatus, StatusReport, StreamClose, StreamData,
+    StreamEnd, StreamEndReason, StreamOpen, VmStatus, VolumeStatus,
 };
 use quoro_proto::{CommandResult, CommandStatus, ErrorBody, ErrorCode, MsgId, ProtocolError};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -269,6 +269,8 @@ pub struct Session {
     /// The directory whose filesystem holds the volumes, for
     /// `status_report.disk_free_gb` (section 5.3); `None` reports 0.
     disk_free_path: Option<std::path::PathBuf>,
+    /// The backup statuses the backup manager publishes (section 5.3).
+    backups: Option<watch::Receiver<Vec<BackupStatus>>>,
     /// The URL `dial` used for the current session, set after a successful
     /// dial and read once `welcome` arrives to promote a fallback address
     /// (section 5.10). `None` when the session was handed a stream directly
@@ -308,6 +310,7 @@ impl Session {
             volume_snapshot: None,
             volumes: None,
             disk_free_path: None,
+            backups: None,
             dialed_url: None,
         }
     }
@@ -342,6 +345,14 @@ impl Session {
     #[must_use]
     pub fn with_volumes(mut self, volumes: watch::Receiver<Vec<VolumeStatus>>) -> Self {
         self.volumes = Some(volumes);
+        self
+    }
+
+    /// Attaches the backup manager's statuses, reported in every
+    /// `status_report.backups` (section 5.3).
+    #[must_use]
+    pub fn with_backups(mut self, backups: watch::Receiver<Vec<BackupStatus>>) -> Self {
+        self.backups = Some(backups);
         self
     }
 
@@ -1516,7 +1527,10 @@ impl Session {
                 .volumes
                 .as_ref()
                 .map_or_else(Vec::new, |volumes| volumes.borrow().clone()),
-            backups: Vec::new(),
+            backups: self
+                .backups
+                .as_ref()
+                .map_or_else(Vec::new, |backups| backups.borrow().clone()),
         };
         write_message(sink, NodeMessage::StatusReport(report), None).await
     }

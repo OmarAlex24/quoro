@@ -13,6 +13,7 @@ pub mod app_env;
 pub mod audit;
 pub mod auth;
 pub mod authz;
+pub mod backups;
 pub mod build;
 pub mod changelog;
 pub mod crypto;
@@ -146,6 +147,9 @@ pub struct AppState {
     /// The in-memory tickets and attach points of interactive sessions
     /// (ADR 0114).
     pub interactive: interactive::Interactive,
+    /// The backup runtime: the bucket factory (production `S3Client`, tests a
+    /// `MemoryStore`), the garbage-collection flag and the last sweep time.
+    pub backups: backups::Backups,
 }
 
 impl AppState {
@@ -179,6 +183,7 @@ impl AppState {
         // any session can ask for a desired state (ADR 0144).
         subnet::backfill(&store, &config.node_network).await?;
         let config = Arc::new(config);
+        let backups = backups::Backups::s3();
         let hub = NodeHub::new(
             store.clone(),
             Arc::clone(&config),
@@ -186,6 +191,7 @@ impl AppState {
             cluster_id.clone(),
             resolver,
             Arc::clone(&data_key),
+            backups.clone(),
         );
         hub.reset_stale_connections().await?;
         let tunnel = tunnel::TunnelManager::new(store.clone(), Arc::clone(&data_key), hub.clone());
@@ -202,11 +208,13 @@ impl AppState {
             keys,
             cluster_id,
             interactive: interactive::Interactive::default(),
+            backups,
         };
         // Every session the previous process left open ends with
         // `primary_restarted` before the listener opens.
         interactive::close_orphans(&state).await?;
         sweeper::spawn(state.clone());
+        backups::dispatch::spawn(state.clone());
         dispatcher::start(state.clone()).await?;
         Ok(state)
     }

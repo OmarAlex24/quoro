@@ -7,6 +7,7 @@ pub mod approvals;
 pub mod apps;
 pub mod audit;
 pub mod auth;
+pub mod backups;
 pub mod builds;
 pub mod cluster;
 pub mod deployments;
@@ -171,4 +172,5 @@ pub fn routes() -> Router<AppState> {
         .merge(interactive::routes())
         .merge(builds::routes())
         .merge(volumes::routes())
+        .merge(backups::routes())
 }

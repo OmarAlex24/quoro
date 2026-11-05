@@ -10,6 +10,7 @@
 //! section 2) and [`run`] (reconciler plus dial-out session, sections 3-6).
 
 mod agent;
+pub mod backup;
 pub mod build;
 pub mod edge;
 pub mod enroll;
@@ -35,6 +36,8 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
 pub use agent::run;
+pub use backup::S3Repository;
+pub use backup::manager::BackupManager;
 pub use build::manager::{BuildManager, BuildsHandle};
 pub use identity::{Identity, is_enrolled};
 pub use ingress::{DnsBridge, IngressConfig, IngressSupervisor};

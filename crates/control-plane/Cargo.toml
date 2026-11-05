@@ -15,8 +15,12 @@ quoro-types = { path = "../types" }
 quoro-proto = { path = "../proto" }
 # Ingress backends: the primary-side tunnel controller (ADR 0094).
 quoro-ingress = { path = "../ingress" }
-# Provider clients: Cloudflare DNS and tunnels (ADR 0025, 0055).
+# Provider clients: Cloudflare DNS and tunnels (ADR 0025, 0055) and the S3
+# client backups use (backup-format.md section 10).
 quoro-providers = { path = "../providers" }
+# The backup repository format: keys, chunks, manifests, seals, config objects
+# and the layout (backup-format.md sections 2 to 6).
+quoro-backup = { path = "../backup" }
 # `ws` serves the node-agent session (GET /api/v1/nodes/session).
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
 # Node public keys and credentials are base64 (node-agent-protocol.md section 2).

@@ -11,6 +11,8 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
+
 use agent_common::{
     BRIDGE, GATEWAY, RecordingEngine, SUBNET, TargetDir, TempDir, dns, local_lease_table,
     reconciler, snapshot, snapshot_full, spec_vm, spec_volume, stateful_vm, volume_attach,
@@ -729,5 +731,84 @@ async fn a_redeploy_swaps_the_vm_and_keeps_the_volume() {
         std::fs::read(&file).unwrap(),
         b"the app's data",
         "the file content is unchanged"
+    );
+}
+
+#[tokio::test]
+async fn a_volume_being_restored_is_not_ready_and_no_vm_attaches_it() {
+    let dir = TargetDir::new("volume-restoring");
+    let engine = Arc::new(RecordingEngine::new());
+    engine.inner().set_volume_dir(dir.path());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let (reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let mut reconciler = reconciler.with_lease_view(LeaseView::new(
+        local_lease_table("lse_1", "app_1", 1),
+        false,
+    ));
+
+    let mut volume = spec_volume("vol_data", "app_1", 1, SpecVolumeState::Present);
+    volume.restore = Some(quoro_proto::wire::SpecRestore {
+        backup_id: "bkp_1".to_owned(),
+        manifest_key: "manifests/app_1/bkp_1".to_owned(),
+        manifest_digest: "0".repeat(64),
+        logical_bytes: 1 << 30,
+        id_key: base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+        data_key: base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+    });
+    let snap = snapshot_full(
+        1,
+        vec![stateful_vm(
+            "vm_a",
+            "lse_1",
+            1,
+            vec![volume_attach("vol_data", "/data")],
+        )],
+        Vec::new(),
+        vec![volume],
+    );
+
+    // The backup manager owns the file; the reconciler only reports the row.
+    reconciler.reconcile_once(Some(&snap)).await;
+    let volumes = reconciler.volume_statuses().borrow().clone();
+    assert_eq!(
+        volume_in(&volumes, "vol_data").map(|status| status.state),
+        Some(VolumeState::Restoring),
+        "a restore in progress is reported `restoring`"
+    );
+    assert!(
+        engine.list().await.unwrap().is_empty(),
+        "no VM attaches a volume that is not ready"
+    );
+    assert!(
+        !dir.path().join("vol_data").exists(),
+        "the reconciler did not create the file"
+    );
+
+    // Once the manager records the file ready, the VM starts.
+    engine
+        .inner()
+        .ensure_volume(&VolumeId("vol_data".to_owned()), 1)
+        .await
+        .unwrap();
+    store
+        .save_volume(&VolumeRecord {
+            volume_id: "vol_data".to_owned(),
+            app_id: "app_1".to_owned(),
+            size_gb: 1,
+            state: VolumeState::Ready,
+            error: None,
+            allocated_bytes: Some(0),
+        })
+        .await
+        .unwrap();
+    reconciler.reconcile_once(Some(&snap)).await;
+    assert_eq!(
+        engine
+            .inspect(&VmId("vm_a".to_owned()))
+            .await
+            .unwrap()
+            .state,
+        VmState::Running,
+        "the VM starts once the restore is ready"
     );
 }

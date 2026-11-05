@@ -153,6 +153,19 @@ pub fn resolve<'c>(
                     return resolve(conn, "app", &app_id, depth).await;
                 }
             }
+            // A backup of a volume matches through its app; a control-plane
+            // backup, or one whose app is gone, matches only `{"all": true}`
+            // (permission-model.md section 5, "Matching per target type").
+            "backup" => {
+                let row: Option<(Option<String>,)> =
+                    sqlx::query_as("SELECT app_id FROM backups WHERE id = ?")
+                        .bind(id)
+                        .fetch_optional(&mut *conn)
+                        .await?;
+                if let Some((Some(app_id),)) = row {
+                    return resolve(conn, "app", &app_id, depth).await;
+                }
+            }
             "project" => {
                 let row: Option<(String,)> =
                     sqlx::query_as("SELECT slug FROM projects WHERE id = ?")
