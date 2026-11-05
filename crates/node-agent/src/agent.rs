@@ -189,6 +189,7 @@ pub async fn run<E: Engine + 'static>(
             .map(wire_snapshot_method),
     )
     .with_volumes(volume_statuses)
+    .with_disk_free_path(config.data_dir.clone())
     .with_ingress(Arc::clone(&ingress), dns)
     .with_metrics(metrics)
     .with_edge(Arc::clone(&edge))

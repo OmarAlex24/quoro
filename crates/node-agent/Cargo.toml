@@ -71,6 +71,10 @@ tar = { version = "0.4", default-features = false }
 # Kernel WireGuard is configured over generic netlink, never through a `wg` or
 # `wg-quick` process (ADR 0063, section 6.9). The crates are MIT and only the
 # Linux build uses them.
+# `statvfs` for `status_report.disk_free_gb` without `unsafe`; already in the
+# lock file through the engine.
+rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 genetlink = "0.3.1"
 netlink-packet-generic = "0.5.0"

@@ -90,10 +90,80 @@ fn state_dir() -> PathBuf {
 /// Wipes and recreates the state directory.
 fn reset_state() {
     let dir = state_dir();
+    // The volume pool is a mount point: wiping the directory underneath a
+    // mounted pool would delete the image's contents (§3.16).
+    unmount_volume_pool(&dir.join("volumes"));
     if dir.exists() {
         std::fs::remove_dir_all(&dir).expect("wipe the state directory");
     }
     std::fs::create_dir_all(&dir).expect("create the state directory");
+}
+
+/// Unmounts `<state>/volumes` when it is a mount point.
+///
+/// The test-only force path: it does not refuse a pool that still holds a
+/// volume, which a panicked test may leave behind, and it detaches lazily when
+/// a file of the pool is still open.
+fn unmount_volume_pool(volumes: &Path) {
+    if !is_mount_point(volumes) {
+        return;
+    }
+    for args in [&["-l"][..], &[][..]] {
+        let unmounted = std::process::Command::new("umount")
+            .args(args)
+            .arg(volumes)
+            .status()
+            .is_ok_and(|status| status.success());
+        if unmounted {
+            return;
+        }
+    }
+    panic!("cannot unmount {}", volumes.display());
+}
+
+/// True when `dir` is a mount point in this namespace.
+fn is_mount_point(dir: &Path) -> bool {
+    !mounts_on(dir).is_empty()
+}
+
+/// The `(fstype, source)` of every mount table line mounted on `dir`.
+///
+/// The lab suite owns no copy of the engine's mount table parser, so it reads
+/// the same file the pool does, with the kernel's `\040` escapes decoded.
+fn mounts_on(dir: &Path) -> Vec<(String, String)> {
+    let Ok(text) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return Vec::new();
+    };
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    text.lines()
+        .filter_map(|line| {
+            let (left, right) = line.split_once(" - ")?;
+            let fields: Vec<&str> = left.split_whitespace().collect();
+            let rest: Vec<&str> = right.split_whitespace().collect();
+            if fields.len() < 5 || rest.len() < 2 {
+                return None;
+            }
+            let point = fields[4].replace("\\040", " ");
+            (Path::new(&point) == dir.as_path()).then(|| (rest[0].to_owned(), rest[1].to_owned()))
+        })
+        .collect()
+}
+
+/// True when `dir`'s filesystem clones files with `FICLONE`.
+fn fs_reflinks(dir: &Path) -> bool {
+    let source = dir.join(format!(".reflink-probe-{}", std::process::id()));
+    let clone = dir.join(format!(".reflink-probe-{}-clone", std::process::id()));
+    let _ = std::fs::remove_file(&source);
+    let _ = std::fs::remove_file(&clone);
+    let cloned = (|| {
+        std::fs::write(&source, b"quoro").ok()?;
+        let src = std::fs::File::open(&source).ok()?;
+        let dst = std::fs::File::create(&clone).ok()?;
+        rustix::fs::ioctl_ficlone(&dst, &src).ok()
+    })();
+    let _ = std::fs::remove_file(&source);
+    let _ = std::fs::remove_file(&clone);
+    cloned.is_some()
 }
 
 /// The engine configuration from the environment.
@@ -280,6 +350,7 @@ fn cleanup(state: &Path, bridge: &str) {
         return;
     };
     let Ok(entries) = std::fs::read_dir(state.join("vms")) else {
+        unmount_volume_pool(&state.join("volumes"));
         return;
     };
     for entry in entries.flatten() {
@@ -300,6 +371,8 @@ fn cleanup(state: &Path, bridge: &str) {
         let _ = std::fs::remove_file(state.join(format!("{}.serial.sock", id.0)));
         let _ = std::fs::remove_dir_all(&dir);
     }
+    // The pool is a mount of the state directory: never leave it behind.
+    unmount_volume_pool(&state.join("volumes"));
     let _ = runtime.block_on(net::remove_network(&tools, bridge));
 }
 
@@ -1015,6 +1088,182 @@ async fn local_volume_snapshot_cycle() {
     net::remove_network(&tools, BRIDGE)
         .await
         .expect("remove the network");
+}
+
+/// M5a: on a data directory without reflink the volume pool gives `Reflink`
+/// snapshots with no pause, survives an engine restart and detaches cleanly
+/// (§3.16, ADR 0156).
+#[tokio::test]
+#[ignore = "needs /dev/kvm, root and the pinned artifacts on the lab host"]
+async fn volume_pool_on_ext4_snapshots_with_reflink() {
+    if !enter_lab() {
+        return;
+    }
+    let state = state_dir();
+    if fs_reflinks(&state) {
+        eprintln!("skipping: the state directory reflinks natively, so there is no pool");
+        return;
+    }
+    let tools = HostTools::discover().expect("host tools");
+    if tools::find_optional("mkfs.xfs").is_none() {
+        eprintln!("skipping: mkfs.xfs is missing; install xfsprogs");
+        return;
+    }
+    let _guard = Guard::new();
+    let engine = new_engine().await;
+    let volumes = state.join("volumes");
+    assert_eq!(
+        engine.capabilities().await.volume_snapshot_method,
+        Some(SnapshotMethod::Reflink),
+        "the pool makes the engine reflink"
+    );
+    assert_eq!(
+        mounts_on(&volumes)
+            .first()
+            .map(|(fstype, _)| fstype.as_str()),
+        Some("xfs"),
+        "the volume directory is the pool's xfs mount"
+    );
+    let rootfs = prepare(&engine).await;
+
+    let volume = VolumeId("vol_01JC9ZC2D3E4F5G6H7J8K9M0NP".to_string());
+    let created = engine.ensure_volume(&volume, 1).await.expect("ensure");
+    assert_eq!(created.size_gb, 1);
+    assert!(
+        created.allocated_bytes < 1 << 29,
+        "the volume is sparse: {} bytes",
+        created.allocated_bytes
+    );
+
+    let id = VmId("vm_w5a_pool".to_string());
+    let mut spec = console_spec(&id, &rootfs, "10.77.0.17", "sleep 120", 17);
+    spec.volumes = vec![VolumeAttach {
+        volume_id: volume.clone(),
+        mount_path: "/data".to_string(),
+        serial: "quoro-vol-0".to_string(),
+    }];
+    // A volume mount travels in the v3 guest configuration, which carries the
+    // exec port (§6, M5a).
+    spec.vsock = Some(VsockAttach {
+        cid: 3,
+        socket: vm_dir(&id).join("vsock.sock"),
+    });
+    engine.create(&spec).await.expect("create with a volume");
+    start_vm(&engine, &id).await;
+
+    // Write through the mounted volume, so the snapshot has data to clone.
+    let written = exec_in_guest(
+        &engine,
+        &id,
+        &["sh", "-c", "printf quoro-pool > /data/marker && sync"],
+    )
+    .await;
+    assert!(written.is_empty(), "writing the marker printed {written:?}");
+
+    let snapshot = engine
+        .snapshot_volume(&volume)
+        .await
+        .expect("snapshot a running volume");
+    assert_eq!(snapshot.method, SnapshotMethod::Reflink);
+    assert_eq!(
+        snapshot.pause,
+        Duration::ZERO,
+        "a reflink snapshot never pauses the VM"
+    );
+    assert_eq!(
+        engine.inspect(&id).await.expect("inspect").state,
+        VmState::Running,
+        "the VM is running after the snapshot"
+    );
+
+    // A new engine on the same state directory reuses the mounted pool.
+    drop(engine);
+    let engine = new_engine().await;
+    assert_eq!(
+        engine.capabilities().await.volume_snapshot_method,
+        Some(SnapshotMethod::Reflink)
+    );
+    assert_eq!(
+        mounts_on(&volumes).len(),
+        1,
+        "the pool is mounted once, not twice"
+    );
+    assert!(created.path.exists(), "the volume is still in the pool");
+    assert!(
+        snapshot.location.exists(),
+        "the snapshot is still in the pool"
+    );
+
+    engine.stop(&id, StopMode::Force).await.expect("stop");
+    engine.delete(&id).await.expect("delete");
+    engine
+        .delete_volume_snapshot(&snapshot)
+        .await
+        .expect("delete the snapshot");
+    engine
+        .delete_volume(&volume)
+        .await
+        .expect("delete the volume");
+    drop(engine);
+
+    ChEngine::detach_volume_pool(&state).expect("detach the pool");
+    assert!(
+        mounts_on(&volumes).is_empty(),
+        "the volume directory is no longer a mount point"
+    );
+    let image = state.join("volume-pool.img");
+    let losetup = tools::find_optional("losetup").expect("losetup is installed with mount");
+    let mut remaining = String::new();
+    for _ in 0..20 {
+        remaining = tools::run(
+            &losetup,
+            &["-j", image.to_str().expect("the image path is UTF-8")],
+        )
+        .await
+        .expect("losetup -j");
+        if remaining.trim().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        remaining.trim().is_empty(),
+        "the loop device is released: {remaining:?}"
+    );
+
+    net::remove_network(&tools, BRIDGE)
+        .await
+        .expect("remove the network");
+}
+
+/// Runs `argv` in the guest over the exec channel and returns its output.
+async fn exec_in_guest(engine: &ChEngine, id: &VmId, argv: &[&str]) -> String {
+    let mut session = engine
+        .exec(
+            id,
+            &ExecRequest {
+                argv: argv.iter().map(|arg| (*arg).to_string()).collect(),
+                user: None,
+                rows: 24,
+                cols: 80,
+            },
+        )
+        .await
+        .expect("exec in the guest");
+    let mut out = Vec::new();
+    let mut buf = [0_u8; 1024];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!remaining.is_zero(), "exec output timed out");
+        match tokio::time::timeout(remaining, session.io.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => out.extend_from_slice(&buf[..n]),
+            Ok(Err(err)) => panic!("exec read: {err}"),
+            Err(_) => panic!("exec output timed out"),
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Reads serial bytes until `needle` appeared, returning everything read.

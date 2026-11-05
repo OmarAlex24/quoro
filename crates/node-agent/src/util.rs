@@ -227,9 +227,40 @@ pub fn random_fraction() -> f64 {
     (value % 1_000_000) as f64 / 1_000_000.0
 }
 
+/// The space an unprivileged write can still use on the filesystem that holds
+/// `path`, in GiB (`node-agent-protocol.md` section 5.3, `disk_free_gb`). An
+/// error is logged and reported as 0, so the primary refuses a volume rather
+/// than over-commit the disk.
+#[must_use]
+pub fn disk_free_gb(path: &std::path::Path) -> f64 {
+    match rustix::fs::statvfs(path) {
+        Ok(stat) => {
+            let bytes = u128::from(stat.f_bavail) * u128::from(stat.f_frsize);
+            // Precision loss is irrelevant at GiB scale.
+            #[allow(clippy::cast_precision_loss)]
+            let gib = bytes as f64 / f64::from(1u32 << 30);
+            gib
+        }
+        Err(error) => {
+            tracing::warn!(path = %path.display(), error = %error, "cannot read the free disk space");
+            0.0
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disk_free_reads_the_filesystem_and_reports_zero_on_error() {
+        let free = disk_free_gb(&std::env::temp_dir());
+        assert!(free > 0.0, "the temp directory has free space: {free}");
+        assert!(
+            disk_free_gb(std::path::Path::new("/nonexistent/quoro/disk-free")).abs() < f64::EPSILON,
+            "an unreadable path reports 0"
+        );
+    }
 
     #[test]
     fn timestamps_are_rfc3339_utc() {
