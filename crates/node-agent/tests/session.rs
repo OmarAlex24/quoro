@@ -37,6 +37,9 @@ fn desired_frame(rev: u64, key: &SigningKey, id: &str) -> String {
             builds: Vec::new(),
             mesh: None,
             edge: None,
+            volumes: Vec::new(),
+            backups: Vec::new(),
+            backup_repository: None,
         },
         signature: String::new(),
     };

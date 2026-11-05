@@ -16,7 +16,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use quoro_proto::wire::{BuildPhase, BuildState, FailedStep};
+use quoro_proto::wire::{BuildPhase, BuildState, FailedStep, VolumeState};
+use quoro_proto::{FenceReason, LeaseId, LeaseMode, ResourceType};
 use serde_json::Value;
 use sqlx::Row as _;
 use sqlx::SqlitePool;
@@ -24,6 +25,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use tokio::sync::broadcast;
 
 use crate::AgentError;
+use crate::lease::{FenceRecord, LeaseState, StoredLease};
 use crate::localkey::LocalKey;
 use crate::logs::CapturedLine;
 use crate::util;
@@ -114,6 +116,38 @@ CREATE TABLE IF NOT EXISTS builds (
     finished_at  TEXT
 );
 CREATE INDEX IF NOT EXISTS builds_by_app ON builds (app_id, created_at);
+CREATE TABLE IF NOT EXISTS volumes (
+    volume_id       TEXT PRIMARY KEY,
+    app_id          TEXT NOT NULL,
+    size_gb         INTEGER NOT NULL,
+    state           TEXT NOT NULL,
+    error           TEXT,
+    allocated_bytes INTEGER
+);
+CREATE TABLE IF NOT EXISTS leases (
+    lease_id      TEXT PRIMARY KEY,
+    resource_type TEXT NOT NULL,
+    resource_id   TEXT NOT NULL,
+    mode          TEXT NOT NULL,
+    token         INTEGER NOT NULL,
+    state         TEXT NOT NULL,
+    duration_ms   INTEGER
+);
+CREATE TABLE IF NOT EXISTS lease_tokens (
+    resource_type TEXT NOT NULL,
+    resource_id   TEXT NOT NULL,
+    token         INTEGER NOT NULL,
+    PRIMARY KEY (resource_type, resource_id)
+);
+CREATE TABLE IF NOT EXISTS fences (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    lease_id  TEXT NOT NULL,
+    token     INTEGER NOT NULL,
+    vm_ids    TEXT NOT NULL,
+    at_ns     INTEGER NOT NULL,
+    reason    TEXT NOT NULL,
+    complete  INTEGER NOT NULL
+);
 ";
 
 /// Capacity of the live log fan-out channel. A stream that falls further
@@ -263,6 +297,26 @@ impl BuildRecord {
         }
     }
 }
+
+/// One volume row (`node-agent-protocol.md` section 12 `volumes`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VolumeRecord {
+    /// `vol_` id; also the name of the file.
+    pub volume_id: String,
+    /// `app_` id of the owner.
+    pub app_id: String,
+    /// Size of the file in gibibytes.
+    pub size_gb: u32,
+    /// The last state the node reported.
+    pub state: VolumeState,
+    /// One-line reason, on `failed`.
+    pub error: Option<String>,
+    /// Bytes the sparse file uses, when known.
+    pub allocated_bytes: Option<u64>,
+}
+
+/// The `node_meta` key holding the node's failed mark (section 12).
+const NODE_FAILED: &str = "node_failed";
 
 impl NodeStore {
     /// Opens (creating when missing) `<data_dir>/node.db` in WAL mode with
@@ -1028,6 +1082,221 @@ impl NodeStore {
             .map(|_| ())
     }
 
+    /// One volume row.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure or a row it cannot read back.
+    pub async fn volume(&self, volume_id: &str) -> Result<Option<VolumeRecord>, AgentError> {
+        let row = sqlx::query("SELECT * FROM volumes WHERE volume_id = ?")
+            .bind(volume_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(store_error)?;
+        row.map(volume_record).transpose()
+    }
+
+    /// Every volume row, sorted by id.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure or a row it cannot read back.
+    pub async fn volumes(&self) -> Result<Vec<VolumeRecord>, AgentError> {
+        let rows = sqlx::query("SELECT * FROM volumes ORDER BY volume_id ASC")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(store_error)?;
+        rows.into_iter().map(volume_record).collect()
+    }
+
+    /// Inserts or replaces one volume row.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn save_volume(&self, record: &VolumeRecord) -> Result<(), AgentError> {
+        sqlx::query(
+            "INSERT INTO volumes (volume_id, app_id, size_gb, state, error, allocated_bytes) \
+             VALUES (?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(volume_id) DO UPDATE SET app_id = excluded.app_id, \
+             size_gb = excluded.size_gb, state = excluded.state, error = excluded.error, \
+             allocated_bytes = excluded.allocated_bytes",
+        )
+        .bind(&record.volume_id)
+        .bind(&record.app_id)
+        .bind(i64::from(record.size_gb))
+        .bind(volume_state_str(record.state))
+        .bind(record.error.as_deref())
+        .bind(
+            record
+                .allocated_bytes
+                .map(|bytes| i64::try_from(bytes).unwrap_or(i64::MAX)),
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(store_error)
+        .map(|_| ())
+    }
+
+    /// Removes one volume row; the file is removed by the caller.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn delete_volume(&self, volume_id: &str) -> Result<(), AgentError> {
+        sqlx::query("DELETE FROM volumes WHERE volume_id = ?")
+            .bind(volume_id)
+            .execute(&self.pool)
+            .await
+            .map_err(store_error)
+            .map(|_| ())
+    }
+
+    /// Every lease row, as last saved (section 12 `leases`).
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure or a row it cannot read back.
+    pub async fn load_leases(&self) -> Result<Vec<StoredLease>, AgentError> {
+        let rows = sqlx::query("SELECT * FROM leases ORDER BY lease_id ASC")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(store_error)?;
+        rows.into_iter().map(lease_record).collect()
+    }
+
+    /// The highest fencing token seen per resource (section 8.6).
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure or a row it cannot read back.
+    pub async fn load_highest_tokens(
+        &self,
+    ) -> Result<Vec<((ResourceType, String), u64)>, AgentError> {
+        let rows = sqlx::query("SELECT * FROM lease_tokens")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(store_error)?;
+        let mut tokens = Vec::with_capacity(rows.len());
+        for row in rows {
+            let resource_type: String = row.try_get("resource_type").map_err(store_error)?;
+            let resource_id: String = row.try_get("resource_id").map_err(store_error)?;
+            let token: i64 = row.try_get("token").map_err(store_error)?;
+            tokens.push((
+                (parse_resource_type(&resource_type)?, resource_id),
+                u64::try_from(token).unwrap_or(0),
+            ));
+        }
+        Ok(tokens)
+    }
+
+    /// Persists one lease row and the highest token for its resource.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure or a lease field with no
+    /// stored form.
+    pub async fn save_lease(&self, lease: &StoredLease, highest: u64) -> Result<(), AgentError> {
+        let duration_ms = lease
+            .duration
+            .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX));
+        let mut tx = self.pool.begin().await.map_err(store_error)?;
+        sqlx::query(
+            "INSERT INTO leases (lease_id, resource_type, resource_id, mode, token, state, \
+             duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(lease_id) DO UPDATE SET resource_type = excluded.resource_type, \
+             resource_id = excluded.resource_id, mode = excluded.mode, token = excluded.token, \
+             state = excluded.state, duration_ms = excluded.duration_ms",
+        )
+        .bind(&lease.lease_id.0)
+        .bind(resource_type_str(lease.resource_type))
+        .bind(&lease.resource_id)
+        .bind(lease_mode_str(lease.mode))
+        .bind(i64::try_from(lease.token).unwrap_or(i64::MAX))
+        .bind(lease_state_str(lease.state))
+        .bind(duration_ms)
+        .execute(&mut *tx)
+        .await
+        .map_err(store_error)?;
+        sqlx::query(
+            "INSERT INTO lease_tokens (resource_type, resource_id, token) VALUES (?, ?, ?) \
+             ON CONFLICT(resource_type, resource_id) DO UPDATE SET token = MAX(token, excluded.token)",
+        )
+        .bind(resource_type_str(lease.resource_type))
+        .bind(&lease.resource_id)
+        .bind(i64::try_from(highest).unwrap_or(i64::MAX))
+        .execute(&mut *tx)
+        .await
+        .map_err(store_error)?;
+        tx.commit().await.map_err(store_error)
+    }
+
+    /// Records one self-fence (section 8.5 step 2).
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure or an unencodable VM list.
+    pub async fn record_fence(&self, record: &FenceRecord) -> Result<(), AgentError> {
+        let vm_ids: Vec<String> = record.vm_ids.iter().map(|id| id.0.clone()).collect();
+        let vm_ids = serde_json::to_string(&vm_ids)
+            .map_err(|e| AgentError::Store(format!("could not encode a fence's VMs: {e}")))?;
+        let at_ns = record
+            .at
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX)
+            });
+        sqlx::query(
+            "INSERT INTO fences (lease_id, token, vm_ids, at_ns, reason, complete) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&record.lease_id.0)
+        .bind(i64::try_from(record.token).unwrap_or(i64::MAX))
+        .bind(vm_ids)
+        .bind(at_ns)
+        .bind(fence_reason_str(record.reason))
+        .bind(i64::from(record.complete))
+        .execute(&self.pool)
+        .await
+        .map_err(store_error)
+        .map(|_| ())
+    }
+
+    /// Every recorded self-fence, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure or a row it cannot read back.
+    pub async fn fences(&self) -> Result<Vec<FenceRecord>, AgentError> {
+        let rows = sqlx::query("SELECT * FROM fences ORDER BY id ASC")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(store_error)?;
+        rows.into_iter().map(fence_record).collect()
+    }
+
+    /// Sets the node's failed mark (section 12 `node_meta`).
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn set_node_failed(&self, failed: bool) -> Result<(), AgentError> {
+        self.set_meta(NODE_FAILED, if failed { "1" } else { "0" })
+            .await
+    }
+
+    /// Whether the node is marked failed (section 12 `node_meta`).
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn node_failed(&self) -> Result<bool, AgentError> {
+        Ok(self
+            .meta(NODE_FAILED)
+            .await?
+            .is_some_and(|value| value == "1"))
+    }
+
     /// The pool, for a test that wants to inspect a table directly.
     #[doc(hidden)]
     #[must_use]
@@ -1109,6 +1378,155 @@ fn parse_build_phase(text: &str) -> Result<BuildPhase, AgentError> {
             "a stored build has an unknown phase {other:?}"
         ))),
     }
+}
+
+fn volume_state_str(state: VolumeState) -> &'static str {
+    match state {
+        VolumeState::Creating => "creating",
+        VolumeState::Ready => "ready",
+        VolumeState::Restoring => "restoring",
+        VolumeState::Failed => "failed",
+        VolumeState::Deleted => "deleted",
+        VolumeState::Orphaned => "orphaned",
+    }
+}
+
+fn parse_volume_state(text: &str) -> Result<VolumeState, AgentError> {
+    match text {
+        "creating" => Ok(VolumeState::Creating),
+        "ready" => Ok(VolumeState::Ready),
+        "restoring" => Ok(VolumeState::Restoring),
+        "failed" => Ok(VolumeState::Failed),
+        "deleted" => Ok(VolumeState::Deleted),
+        "orphaned" => Ok(VolumeState::Orphaned),
+        other => Err(AgentError::Store(format!(
+            "a stored volume has an unknown state {other:?}"
+        ))),
+    }
+}
+
+fn volume_record(row: sqlx::sqlite::SqliteRow) -> Result<VolumeRecord, AgentError> {
+    let state: String = row.try_get("state").map_err(store_error)?;
+    let size_gb: i64 = row.try_get("size_gb").map_err(store_error)?;
+    let allocated: Option<i64> = row.try_get("allocated_bytes").map_err(store_error)?;
+    Ok(VolumeRecord {
+        volume_id: row.try_get("volume_id").map_err(store_error)?,
+        app_id: row.try_get("app_id").map_err(store_error)?,
+        size_gb: u32::try_from(size_gb).unwrap_or(0),
+        state: parse_volume_state(&state)?,
+        error: row.try_get("error").map_err(store_error)?,
+        allocated_bytes: allocated.and_then(|bytes| u64::try_from(bytes).ok()),
+    })
+}
+
+fn resource_type_str(resource_type: ResourceType) -> &'static str {
+    match resource_type {
+        ResourceType::App => "app",
+        ResourceType::Primary => "primary",
+    }
+}
+
+fn parse_resource_type(text: &str) -> Result<ResourceType, AgentError> {
+    match text {
+        "app" => Ok(ResourceType::App),
+        "primary" => Ok(ResourceType::Primary),
+        other => Err(AgentError::Store(format!(
+            "a stored lease has an unknown resource type {other:?}"
+        ))),
+    }
+}
+
+fn lease_mode_str(mode: LeaseMode) -> &'static str {
+    match mode {
+        LeaseMode::Local => "local",
+        LeaseMode::Expiring => "expiring",
+    }
+}
+
+fn parse_lease_mode(text: &str) -> Result<LeaseMode, AgentError> {
+    match text {
+        "local" => Ok(LeaseMode::Local),
+        "expiring" => Ok(LeaseMode::Expiring),
+        other => Err(AgentError::Store(format!(
+            "a stored lease has an unknown mode {other:?}"
+        ))),
+    }
+}
+
+fn lease_state_str(state: LeaseState) -> &'static str {
+    match state {
+        LeaseState::Held => "held",
+        LeaseState::Uncertain => "uncertain",
+        LeaseState::Expired => "expired",
+        LeaseState::Revoked => "revoked",
+    }
+}
+
+fn parse_lease_state(text: &str) -> Result<LeaseState, AgentError> {
+    match text {
+        "held" => Ok(LeaseState::Held),
+        "uncertain" => Ok(LeaseState::Uncertain),
+        "expired" => Ok(LeaseState::Expired),
+        "revoked" => Ok(LeaseState::Revoked),
+        other => Err(AgentError::Store(format!(
+            "a stored lease has an unknown state {other:?}"
+        ))),
+    }
+}
+
+fn lease_record(row: sqlx::sqlite::SqliteRow) -> Result<StoredLease, AgentError> {
+    let resource_type: String = row.try_get("resource_type").map_err(store_error)?;
+    let mode: String = row.try_get("mode").map_err(store_error)?;
+    let state: String = row.try_get("state").map_err(store_error)?;
+    let token: i64 = row.try_get("token").map_err(store_error)?;
+    let duration_ms: Option<i64> = row.try_get("duration_ms").map_err(store_error)?;
+    Ok(StoredLease {
+        lease_id: LeaseId(row.try_get("lease_id").map_err(store_error)?),
+        resource_type: parse_resource_type(&resource_type)?,
+        resource_id: row.try_get("resource_id").map_err(store_error)?,
+        mode: parse_lease_mode(&mode)?,
+        token: u64::try_from(token).unwrap_or(0),
+        state: parse_lease_state(&state)?,
+        duration: duration_ms
+            .and_then(|ms| u64::try_from(ms).ok())
+            .map(Duration::from_millis),
+    })
+}
+
+fn fence_reason_str(reason: FenceReason) -> &'static str {
+    match reason {
+        FenceReason::LeaseExpired => "lease_expired",
+        FenceReason::LeaseRevoked => "lease_revoked",
+    }
+}
+
+fn parse_fence_reason(text: &str) -> Result<FenceReason, AgentError> {
+    match text {
+        "lease_expired" => Ok(FenceReason::LeaseExpired),
+        "lease_revoked" => Ok(FenceReason::LeaseRevoked),
+        other => Err(AgentError::Store(format!(
+            "a stored fence has an unknown reason {other:?}"
+        ))),
+    }
+}
+
+fn fence_record(row: sqlx::sqlite::SqliteRow) -> Result<FenceRecord, AgentError> {
+    let vm_ids: String = row.try_get("vm_ids").map_err(store_error)?;
+    let vm_ids: Vec<String> = serde_json::from_str(&vm_ids)
+        .map_err(|e| AgentError::Store(format!("a stored fence's VM list is not JSON: {e}")))?;
+    let token: i64 = row.try_get("token").map_err(store_error)?;
+    let at_ns: i64 = row.try_get("at_ns").map_err(store_error)?;
+    let reason: String = row.try_get("reason").map_err(store_error)?;
+    let complete: i64 = row.try_get("complete").map_err(store_error)?;
+    let at = std::time::UNIX_EPOCH + Duration::from_nanos(u64::try_from(at_ns).unwrap_or(0));
+    Ok(FenceRecord {
+        lease_id: LeaseId(row.try_get("lease_id").map_err(store_error)?),
+        token: u64::try_from(token).unwrap_or(0),
+        vm_ids: vm_ids.into_iter().map(quoro_engine::VmId).collect(),
+        at,
+        reason: parse_fence_reason(&reason)?,
+        complete: complete != 0,
+    })
 }
 
 /// Adds `desired_state.body_enc` to a database created before bodies were

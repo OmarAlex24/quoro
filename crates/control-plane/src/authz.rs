@@ -137,10 +137,11 @@ pub fn resolve<'c>(
                     out.project_id = Some(project_id);
                 }
             }
-            "deployment" | "domain" | "build" => {
+            "deployment" | "domain" | "build" | "volume" => {
                 let table = match kind {
                     "deployment" => "deployments",
                     "build" => "builds",
+                    "volume" => "volumes",
                     _ => "domains",
                 };
                 let app: Option<(String,)> =

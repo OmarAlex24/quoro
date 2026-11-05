@@ -27,6 +27,7 @@ use crate::edge::EdgeManager;
 use crate::identity::IdentityHandle;
 use crate::ingress::{CertificateEvents, DnsBridge, IngressSupervisor};
 use crate::interactive::Interactive;
+use crate::lease::{FenceTimers, LeaseConfig};
 use crate::mesh::{MeshKey, MeshManager, PlatformMeshDriver};
 use crate::metrics::{MetricsRing, MetricsSampler};
 use crate::reconcile::{ReconcileConfig, ReconcileOptions, Reconciler, Snapshot};
@@ -79,7 +80,26 @@ pub async fn run<E: Engine + 'static>(
     // the builder runs one builder VM per build (ADR 0117, ADR 0118), and the
     // sampler and the interactive sessions read the running VMs.
     let engine = Arc::new(engine);
+    let capabilities = engine.capabilities().await;
+    let node_id = identity.get().node_id;
     let (desired, desired_rx) = watch::channel(current.clone());
+
+    // Section 8.3: `local` leases are held on this node alone, so they survive
+    // a lost session; the service also fences the VMs of a revoked lease.
+    let leases = crate::lease::start_local_leases(
+        Arc::clone(&engine),
+        store.clone(),
+        LeaseConfig {
+            node_id: node_id.clone(),
+            timers: FenceTimers {
+                grace: Duration::from_secs(10),
+                force: Duration::from_secs(5),
+            },
+        },
+        desired.subscribe(),
+    )
+    .await?;
+
     let (reconciler, observed) = Reconciler::new(
         Arc::clone(&engine),
         store.clone(),
@@ -90,8 +110,10 @@ pub async fn run<E: Engine + 'static>(
         ReconcileOptions::default(),
     );
     let reconciler = reconciler
-        .with_node_id(identity.get().node_id)
+        .with_node_id(node_id)
+        .with_lease_view(leases.view.clone())
         .with_ingress(Arc::clone(&ingress));
+    let volume_statuses = reconciler.volume_statuses();
 
     // Metrics stay in memory on this node (ADR 0014): the sampler fills a ring
     // the session answers `metrics_query` and `metrics` streams from.
@@ -160,6 +182,13 @@ pub async fn run<E: Engine + 'static>(
         current,
         builds: Some(builds),
     })
+    .with_leases(leases.link.clone())
+    .with_volume_snapshot(
+        capabilities
+            .volume_snapshot_method
+            .map(wire_snapshot_method),
+    )
+    .with_volumes(volume_statuses)
     .with_ingress(Arc::clone(&ingress), dns)
     .with_metrics(metrics)
     .with_edge(Arc::clone(&edge))
@@ -167,6 +196,7 @@ pub async fn run<E: Engine + 'static>(
     .with_interactive(interactive);
     let outcome = session.run(stop_rx).await;
 
+    leases.abort();
     let _ = stop.send(true);
     retention_task.abort();
     let _ = reconcile_task.await;
@@ -177,6 +207,14 @@ pub async fn run<E: Engine + 'static>(
     ingress.shutdown().await;
     shutdown_task.abort();
     outcome
+}
+
+/// The wire form of the engine's volume snapshot method (section 5.1).
+fn wire_snapshot_method(method: quoro_engine::SnapshotMethod) -> quoro_proto::wire::SnapshotMethod {
+    match method {
+        quoro_engine::SnapshotMethod::Reflink => quoro_proto::wire::SnapshotMethod::Reflink,
+        quoro_engine::SnapshotMethod::PauseCopy => quoro_proto::wire::SnapshotMethod::PauseCopy,
+    }
 }
 
 /// The newest stored snapshot, re-verified against the current pin.

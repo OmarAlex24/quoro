@@ -7,8 +7,9 @@
 //! session per node: a new session for the same node closes the older one, and
 //! only the live session may report state back.
 //!
-//! M2 sends no `lease_revoke` (there are no leases yet) and no `log_entries`
-//! (change-log follow is a separate follow-up). Both slots are marked below.
+//! M5a revokes stale or superseded leases from `hello` and grants the
+//! node's `local` app leases after the snapshot (sections 4.2 and 5.12).
+//! Change-log follow is a separate follow-up; its slot is marked below.
 
 pub mod desired;
 mod mesh;
@@ -21,6 +22,7 @@ use crate::driver::{self, ObservedStatus as DriverObservedStatus};
 use crate::error::{ApiError, Code};
 use crate::events::{self, StoredEvent};
 use crate::keys::ClusterKeys;
+use crate::leases;
 use crate::store::{Store, now_rfc3339, sha256_hex};
 use crate::tunnel::{CloudflareEndpoints, TunnelKick};
 use crate::{DigestResolver, ServerConfig};
@@ -282,6 +284,9 @@ struct HubInner {
     edge_reports: Mutex<HashMap<String, Vec<wire::EdgeBackendStatus>>>,
     /// The edge's health view of each app between reports (ADR 0143).
     edge_health: Mutex<BTreeMap<String, crate::edge_health::AppHealth>>,
+    /// Free space on the volume filesystem each node last reported
+    /// (`status_report.disk_free_gb`, section 5.3).
+    disk_free_gb: Mutex<HashMap<String, f64>>,
     generation: AtomicU64,
 }
 
@@ -322,6 +327,7 @@ impl NodeHub {
             session_ips: Mutex::new(HashMap::new()),
             edge_reports: Mutex::new(HashMap::new()),
             edge_health: Mutex::new(BTreeMap::new()),
+            disk_free_gb: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
         }))
     }
@@ -406,6 +412,37 @@ impl NodeHub {
             .session_ips
             .lock()
             .expect("session ip lock")
+            .get(node_id)
+            .copied()
+    }
+
+    /// Queues one control frame to `node_id`'s live session, whatever its
+    /// generation. Returns whether a session took the frame; a node without
+    /// one receives the change with its next snapshot.
+    pub(crate) fn send_control(
+        &self,
+        node_id: &str,
+        message: &quoro_proto::wire::ControlMessage,
+    ) -> bool {
+        let text = message.to_frame(&new_msg_id(), None).to_text();
+        let tx = {
+            let sessions = self.0.sessions.lock().expect("session lock");
+            sessions.get(node_id).map(|handle| handle.tx.clone())
+        };
+        match tx {
+            Some(tx) => tx.send(text).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Free space on `node_id`'s volume filesystem as its last `status_report`
+    /// said (section 5.3), or `None` before the first report.
+    #[must_use]
+    pub fn disk_free_gb(&self, node_id: &str) -> Option<f64> {
+        self.0
+            .disk_free_gb
+            .lock()
+            .expect("disk free lock")
             .get(node_id)
             .copied()
     }
@@ -1478,9 +1515,10 @@ impl Session {
                 .to_text(),
             );
 
-            // Section 4.2: M2 has no leases to revoke and no fence_ack to send
-            // (M5), and log follow is a separate follow-up, so the desired
-            // state is next.
+            // Section 4.2 rule 3: stale or superseded leases are revoked
+            // before anything else; then the desired state (rule 5), then the
+            // app leases this node holds (section 5.12).
+            self.revoke_stale_leases(&hello.leases, outbox).await;
             match self.refresh(hello.stored_rev, true).await {
                 Ok(()) => self.retry_pending = false,
                 Err(e) => {
@@ -1488,6 +1526,7 @@ impl Session {
                     self.retry_pending = true;
                 }
             }
+            self.send_grants(outbox).await;
             return false;
         }
 
@@ -1600,7 +1639,7 @@ impl Session {
                 false,
                 Some(&raw.id),
             )),
-            // No leases or change-log follow exist in M2.
+            // No change-log follow exists yet.
             NodeMessage::LeaseRenew(_) | NodeMessage::LogAck(_) => {}
             NodeMessage::DnsChallenge(challenge) => {
                 let acme_routes: HashSet<String> = self
@@ -1618,6 +1657,88 @@ impl Session {
             }
         }
         false
+    }
+
+    /// Revokes every lease `hello.leases` reports that this primary does not
+    /// know, already revoked, holds on another node, or holds with a lower
+    /// token than the node's (sections 5.1 and 4.2 rule 3).
+    async fn revoke_stale_leases(&self, reported: &[wire::HelloLease], outbox: &mut Vec<String>) {
+        if reported.is_empty() {
+            return;
+        }
+        let mut conn = match self.hub.0.store.pool().acquire().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::warn!(%e, node_id = %self.node_id, "cannot read the leases of hello");
+                return;
+            }
+        };
+        for claimed in reported {
+            let row = match leases::by_id(&mut conn, &claimed.lease_id).await {
+                Ok(row) => row,
+                Err(e) => {
+                    tracing::warn!(error = %e.code.as_str(), lease_id = %claimed.lease_id, "cannot read a lease");
+                    continue;
+                }
+            };
+            let reason = match &row {
+                None => quoro_proto::RevokeReason::Moved,
+                Some(lease) if lease.is_revoked() => quoro_proto::RevokeReason::Deleted,
+                Some(lease) if lease.holder_node_id != self.node_id => {
+                    quoro_proto::RevokeReason::Moved
+                }
+                Some(lease) if lease.fencing_token.max(1) as u64 > claimed.fencing_token.max(1) => {
+                    quoro_proto::RevokeReason::Superseded
+                }
+                Some(_) => continue,
+            };
+            let token = match &row {
+                Some(lease) => {
+                    (lease.fencing_token.max(1) as u64).max(claimed.fencing_token.max(1))
+                }
+                None => claimed.fencing_token.max(1),
+            };
+            let revoke = quoro_proto::LeaseRevoke {
+                lease_id: quoro_proto::LeaseId(claimed.lease_id.clone()),
+                fencing_token: token,
+                reason,
+            };
+            outbox.push(
+                ControlMessage::LeaseRevoke(revoke)
+                    .to_frame(&new_msg_id(), None)
+                    .to_text(),
+            );
+        }
+    }
+
+    /// Sends a `lease_grant` for every unrevoked lease this node holds
+    /// (section 5.12). A `local` lease carries no `duration_ms`.
+    async fn send_grants(&self, outbox: &mut Vec<String>) {
+        let mut conn = match self.hub.0.store.pool().acquire().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::warn!(%e, node_id = %self.node_id, "cannot read the leases of the node");
+                return;
+            }
+        };
+        match leases::held_by_node(&mut conn, &self.node_id).await {
+            Ok(leases) => {
+                for lease in leases {
+                    outbox.push(
+                        ControlMessage::LeaseGrant(lease.grant())
+                            .to_frame(&new_msg_id(), None)
+                            .to_text(),
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e.code.as_str(),
+                    node_id = %self.node_id,
+                    "cannot read the leases of the node"
+                );
+            }
+        }
     }
 
     /// Answers one `dns_challenge` off the session loop (section 5.22). The
@@ -1920,16 +2041,21 @@ async fn connect_node(hub: &NodeHub, node_id: &str, hello: &wire::Hello) -> Resu
     };
     let capacity = serde_json::to_string(&hello.capacity).map_err(|e| e.to_string())?;
     let kvm = serde_json::to_string(&hello.kvm).map_err(|e| e.to_string())?;
+    let volume_snapshot = hello.volume_snapshot.map(|method| match method {
+        wire::SnapshotMethod::Reflink => "reflink",
+        wire::SnapshotMethod::PauseCopy => "pause_copy",
+    });
     let now = now_rfc3339();
     let mut w = hub.0.store.begin_write().await.map_err(|e| e.to_string())?;
     sqlx::query(
         "UPDATE nodes SET status = 'connected', agent_version = ?, engine_version = ?, \
-         capacity = ?, kvm = ?, applied_rev = ?, last_seen_at = ? WHERE id = ?",
+         capacity = ?, kvm = ?, volume_snapshot = ?, applied_rev = ?, last_seen_at = ? WHERE id = ?",
     )
     .bind(&hello.agent_version)
     .bind(&hello.engine_version)
     .bind(&capacity)
     .bind(&kvm)
+    .bind(volume_snapshot)
     .bind(i64_of(hello.applied_rev))
     .bind(&now)
     .bind(node_id)
@@ -2081,7 +2207,8 @@ struct ObservedVm {
 
 /// Applies a `status_report` (section 5.3): observed VM state goes through the
 /// same [`driver`] functions the in-process driver used, so the `vm.*` events
-/// stay in one place. VMs of other nodes are ignored.
+/// stay in one place; reported builds, volumes and route certificates are
+/// applied here. VMs of other nodes are ignored.
 async fn apply_status_report(
     hub: &NodeHub,
     node_id: &str,
@@ -2174,6 +2301,22 @@ async fn apply_status_report(
                 "cannot apply the reported build status"
             ),
         }
+    }
+    // `disk_free_gb` is what `createVolume` checks a size against; it is the
+    // node's last report, so it lives on the hub rather than in a table.
+    hub.0
+        .disk_free_gb
+        .lock()
+        .expect("disk free lock")
+        .insert(node_id.to_string(), report.disk_free_gb);
+    match crate::service::volumes::apply_status(&hub.0.store, node_id, &report.volumes).await {
+        Ok(true) => hub.node_changed(node_id),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            node_id,
+            code = %e.code.as_str(),
+            "cannot apply the reported volume statuses"
+        ),
     }
     set_applied_rev(hub, node_id, report.applied_rev).await?;
     apply_route_statuses(hub, node_id, &report.routes).await

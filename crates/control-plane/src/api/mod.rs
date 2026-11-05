@@ -25,6 +25,7 @@ pub mod projects;
 pub mod providers;
 pub mod users;
 pub mod vms;
+pub mod volumes;
 pub mod webhooks;
 
 use crate::AppState;
@@ -162,11 +163,12 @@ pub fn routes() -> Router<AppState> {
         // Apps, deployments and domains (`apps::routes`), the on-demand
         // log reads and the live-log SSE stream (`logs::routes`), the
         // metrics reads and live streams (`metrics::routes`), the terminal
-        // and console sessions (`interactive::routes`), and the builds
-        // (`builds::routes`).
+        // and console sessions (`interactive::routes`), the builds
+        // (`builds::routes`) and the volumes (`volumes::routes`).
         .merge(apps::routes())
         .merge(logs::routes())
         .merge(metrics::routes())
         .merge(interactive::routes())
         .merge(builds::routes())
+        .merge(volumes::routes())
 }

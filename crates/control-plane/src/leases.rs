@@ -1,0 +1,276 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! Lease rows (`leases`; `node-agent-protocol.md` section 8).
+//!
+//! M5a writes one `local` lease per stateful app: the node that holds the
+//! app's volume holds it, so the app runs there and nowhere else (section 8.3,
+//! ADR 0145). The row is the authority: [`Lease::grant`] and
+//! [`Lease::revoke`] build the wire messages the node receives on its session,
+//! and the same `fencing_token` is echoed in the VM spec (section 5.11).
+//!
+//! Every write goes through the change log in the caller's transaction, like
+//! the other replicated tables.
+
+use crate::changelog::{self, Actor, Op};
+use crate::deploy;
+use crate::error::ApiError;
+use crate::store::now_rfc3339;
+use quoro_proto::{LeaseGrant, LeaseId, LeaseMode, LeaseRevoke, ResourceType, RevokeReason};
+use serde_json::{Value, json};
+use sqlx::sqlite::SqliteRow;
+use sqlx::{Row, SqliteConnection};
+
+/// Columns of [`Lease`], in the order [`lease_from_row`] expects them.
+pub(crate) const LEASE_COLUMNS: &str = "id, resource_type, resource_id, holder_node_id, mode, \
+     fencing_token, duration_ms, granted_at, renewed_at, expires_at, revoked_at";
+
+/// One `leases` row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Lease {
+    pub id: String,
+    /// `app` or `primary`.
+    pub resource_type: String,
+    /// The `app_` or `nod_` id the lease protects.
+    pub resource_id: String,
+    pub holder_node_id: String,
+    /// `local` or `expiring`; M5a writes `local` only.
+    pub mode: String,
+    pub fencing_token: i64,
+    pub duration_ms: Option<i64>,
+    pub granted_at: String,
+    pub renewed_at: Option<String>,
+    pub expires_at: Option<String>,
+    pub revoked_at: Option<String>,
+}
+
+impl Lease {
+    /// Whether the lease already ended.
+    #[must_use]
+    pub(crate) fn is_revoked(&self) -> bool {
+        self.revoked_at.is_some()
+    }
+
+    /// The change-log payload of the row, so a replica rebuilds it exactly.
+    #[must_use]
+    pub(crate) fn payload(&self) -> Value {
+        json!({
+            "id": self.id,
+            "resource_type": self.resource_type,
+            "resource_id": self.resource_id,
+            "holder_node_id": self.holder_node_id,
+            "mode": self.mode,
+            "fencing_token": self.fencing_token,
+            "duration_ms": self.duration_ms,
+            "granted_at": self.granted_at,
+            "renewed_at": self.renewed_at,
+            "expires_at": self.expires_at,
+            "revoked_at": self.revoked_at,
+        })
+    }
+
+    /// The `lease_grant` body the holder receives (section 5.12). A `local`
+    /// lease carries no `duration_ms`.
+    #[must_use]
+    pub(crate) fn grant(&self) -> LeaseGrant {
+        LeaseGrant {
+            lease_id: LeaseId(self.id.clone()),
+            resource_type: if self.resource_type == "primary" {
+                ResourceType::Primary
+            } else {
+                ResourceType::App
+            },
+            resource_id: self.resource_id.clone(),
+            mode: if self.mode == "expiring" {
+                LeaseMode::Expiring
+            } else {
+                LeaseMode::Local
+            },
+            fencing_token: u64::try_from(self.fencing_token.max(1)).unwrap_or(1),
+            duration_ms: self
+                .duration_ms
+                .and_then(|ms| u64::try_from(ms.max(1)).ok()),
+            granted_at: self.granted_at.clone(),
+        }
+    }
+
+    /// The `lease_revoke` body that ends the lease with `reason` (section
+    /// 5.13). The token is the lease's own, which is at least the node's.
+    #[must_use]
+    pub(crate) fn revoke(&self, reason: RevokeReason) -> LeaseRevoke {
+        LeaseRevoke {
+            lease_id: LeaseId(self.id.clone()),
+            fencing_token: u64::try_from(self.fencing_token.max(1)).unwrap_or(1),
+            reason,
+        }
+    }
+}
+
+/// Builds a [`Lease`] from a row selected with [`LEASE_COLUMNS`].
+///
+/// # Errors
+///
+/// A database error for a missing column.
+pub(crate) fn lease_from_row(row: &SqliteRow) -> Result<Lease, ApiError> {
+    Ok(Lease {
+        id: row.try_get("id")?,
+        resource_type: row.try_get("resource_type")?,
+        resource_id: row.try_get("resource_id")?,
+        holder_node_id: row.try_get("holder_node_id")?,
+        mode: row.try_get("mode")?,
+        fencing_token: row.try_get("fencing_token")?,
+        duration_ms: row.try_get("duration_ms")?,
+        granted_at: row.try_get("granted_at")?,
+        renewed_at: row.try_get("renewed_at")?,
+        expires_at: row.try_get("expires_at")?,
+        revoked_at: row.try_get("revoked_at")?,
+    })
+}
+
+async fn read_one(
+    conn: &mut SqliteConnection,
+    sql: &str,
+    id: &str,
+) -> Result<Option<Lease>, ApiError> {
+    let row = sqlx::query(&format!("SELECT {LEASE_COLUMNS} FROM leases WHERE {sql}"))
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    row.as_ref().map(lease_from_row).transpose()
+}
+
+/// The lease of an app, revoked or not.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn app_lease(
+    conn: &mut SqliteConnection,
+    app_id: &str,
+) -> Result<Option<Lease>, ApiError> {
+    read_one(
+        conn,
+        "resource_type = 'app' AND resource_id = ? ORDER BY id LIMIT 1",
+        app_id,
+    )
+    .await
+}
+
+/// One lease by id, revoked or not.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn by_id(
+    conn: &mut SqliteConnection,
+    lease_id: &str,
+) -> Result<Option<Lease>, ApiError> {
+    read_one(conn, "id = ?", lease_id).await
+}
+
+/// Every unrevoked lease `node_id` holds, oldest first.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn held_by_node(
+    conn: &mut SqliteConnection,
+    node_id: &str,
+) -> Result<Vec<Lease>, ApiError> {
+    let rows = sqlx::query(&format!(
+        "SELECT {LEASE_COLUMNS} FROM leases \
+         WHERE holder_node_id = ? AND revoked_at IS NULL ORDER BY id"
+    ))
+    .bind(node_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    rows.iter().map(lease_from_row).collect()
+}
+
+/// Grants the app's `local` lease to `node_id` and writes its change-log
+/// entry, returning the row. The token is one more than whatever the app's
+/// lease last carried, so ownership changes never reuse a token (section 8.6).
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn grant_app_lease(
+    conn: &mut SqliteConnection,
+    app_id: &str,
+    node_id: &str,
+    actor: &Actor,
+) -> Result<Lease, ApiError> {
+    let now = now_rfc3339();
+    let previous = app_lease(conn, app_id).await?;
+    let token = previous
+        .as_ref()
+        .map_or(1, |lease| lease.fencing_token.max(0) + 1);
+    let op = if previous.is_some() {
+        Op::Update
+    } else {
+        Op::Create
+    };
+    let id = previous.as_ref().map_or_else(
+        || deploy::new_id_with_prefix("lse"),
+        |lease| lease.id.clone(),
+    );
+    sqlx::query(
+        "INSERT INTO leases (id, resource_type, resource_id, holder_node_id, mode, fencing_token, \
+         duration_ms, granted_at, renewed_at, expires_at, revoked_at) \
+         VALUES (?, 'app', ?, ?, 'local', ?, NULL, ?, NULL, NULL, NULL) \
+         ON CONFLICT (resource_type, resource_id) DO UPDATE SET \
+           holder_node_id = excluded.holder_node_id, mode = 'local', \
+           fencing_token = excluded.fencing_token, duration_ms = NULL, \
+           granted_at = excluded.granted_at, renewed_at = NULL, expires_at = NULL, \
+           revoked_at = NULL",
+    )
+    .bind(&id)
+    .bind(app_id)
+    .bind(node_id)
+    .bind(token)
+    .bind(&now)
+    .execute(&mut *conn)
+    .await?;
+    let lease = Lease {
+        id,
+        resource_type: "app".to_string(),
+        resource_id: app_id.to_string(),
+        holder_node_id: node_id.to_string(),
+        mode: "local".to_string(),
+        fencing_token: token,
+        duration_ms: None,
+        granted_at: now,
+        renewed_at: None,
+        expires_at: None,
+        revoked_at: None,
+    };
+    changelog::append(conn, actor, "lease", &lease.id, op, lease.payload()).await?;
+    Ok(lease)
+}
+
+/// Revokes the app's lease and writes its change-log entry; the caller builds
+/// the `lease_revoke` with a [`RevokeReason`]. Returns `None` when the app has
+/// no lease or it was already revoked.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn revoke_app_lease(
+    conn: &mut SqliteConnection,
+    app_id: &str,
+    actor: &Actor,
+) -> Result<Option<Lease>, ApiError> {
+    let Some(mut lease) = app_lease(conn, app_id).await? else {
+        return Ok(None);
+    };
+    if lease.is_revoked() {
+        return Ok(None);
+    }
+    let now = now_rfc3339();
+    sqlx::query("UPDATE leases SET revoked_at = ? WHERE id = ?")
+        .bind(&now)
+        .bind(&lease.id)
+        .execute(&mut *conn)
+        .await?;
+    lease.revoked_at = Some(now);
+    changelog::append(conn, actor, "lease", &lease.id, Op::Update, lease.payload()).await?;
+    Ok(Some(lease))
+}

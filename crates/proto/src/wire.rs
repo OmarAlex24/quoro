@@ -277,6 +277,18 @@ pub struct Hello {
     /// (section 5.1, ADR 0144). The private key never leaves the machine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh_public_key: Option<String>,
+    /// How this node snapshots a volume (ADR 0146): `reflink` or
+    /// `pause_copy`. Added in M5a; absent from older agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_snapshot: Option<SnapshotMethod>,
+}
+
+/// How a node snapshots a volume (section 5.1, ADR 0146).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotMethod {
+    Reflink,
+    PauseCopy,
 }
 
 /// Body of `heartbeat` (section 5.2).
@@ -350,6 +362,15 @@ pub struct StatusReport {
     /// `spec.edge.routes` (section 5.3, ADR 0143). Added in M5a.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub edge_backends: Vec<EdgeBackendStatus>,
+    /// One entry per volume of `spec.volumes`, plus one per volume file the
+    /// node holds that `spec.volumes` does not name (section 5.3, ADR 0145).
+    /// Added in M5a; absent when there is none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<VolumeStatus>,
+    /// One entry per job of `spec.backups` (section 5.3, ADR 0147). Added in
+    /// M5a; absent when there is none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backups: Vec<BackupStatus>,
 }
 
 /// Why an edge took a backend out of rotation (section 5.3).
@@ -377,6 +398,78 @@ pub struct EdgeBackendStatus {
     /// At most 500 characters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+}
+
+/// `state` of a volume entry in `status_report` (section 5.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeState {
+    Creating,
+    Ready,
+    Restoring,
+    Failed,
+    /// The file was removed after a `deleted` entry in `spec.volumes`.
+    Deleted,
+    /// The node holds the file and `spec.volumes` does not name it.
+    Orphaned,
+}
+
+/// One entry of `status_report.volumes` (section 5.3).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeStatus {
+    pub volume_id: String,
+    pub state: VolumeState,
+    /// Bytes the sparse file uses on disk; present when the file exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocated_bytes: Option<u64>,
+    /// One-line reason on `failed`, at most 2 000 characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// `status` of a backup entry in `status_report` (section 5.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupState {
+    Queued,
+    Running,
+    /// The node wrote the manifest; the backup is not sealed yet.
+    Succeeded,
+    Failed,
+}
+
+/// One entry of `status_report.backups` (section 5.3).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupStatus {
+    pub backup_id: String,
+    pub status: BackupState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_method: Option<SnapshotMethod>,
+    /// For `pause_copy`: how long the VM was paused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_ms: Option<u64>,
+    /// On `succeeded`: the manifest's key, relative to the repository root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_key: Option<String>,
+    /// On `succeeded`: BLAKE3 of the encrypted manifest, 64 lowercase hex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uploaded_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_count: Option<u64>,
+    /// One-line reason on `failed`, at most 2 000 characters;
+    /// `lease_mismatch` when the job's token is not the node's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// RFC 3339; when the node left `queued`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    /// RFC 3339; when the node finished its part.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
 }
 
 /// Status of a build (README.md "Status enums", ADR 0117).
@@ -681,10 +774,16 @@ pub struct HealthCheck {
     pub failures: Option<u32>,
 }
 
-/// A volume attached to a VM (section 5.11; empty until M5a).
+/// A volume attached to a VM, one entry of `spec.vms[].volumes` (section
+/// 5.11; empty until M5a).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpecVolume {
     pub volume_id: String,
+    /// The block device serial the guest init finds the disk by,
+    /// `quoro-vol-0` for the first. Added in M5a; older snapshots held no
+    /// volumes.
+    #[serde(default)]
+    pub serial: String,
     pub mount_path: String,
 }
 
@@ -843,6 +942,124 @@ pub struct Spec {
     /// 0143). Added in M5a.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge: Option<SpecEdge>,
+    /// Volume files this node holds (section 5.11, ADR 0145). Added in M5a.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<SpecVolumeFile>,
+    /// Backup jobs for this node (section 5.11, ADR 0147). Added in M5a.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backups: Vec<SpecBackup>,
+    /// The repository the jobs and restores use; present while `backups` or
+    /// a `volumes[].restore` is not empty. Added in M5a.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_repository: Option<SpecBackupRepository>,
+}
+
+/// `state` of a `spec.volumes[]` entry (section 5.11).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpecVolumeState {
+    /// The file must exist.
+    Present,
+    /// The node removes the file once no VM uses it, then reports `deleted`.
+    Deleted,
+}
+
+/// One entry of `spec.volumes` (section 5.11, ADR 0145).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecVolumeFile {
+    pub volume_id: String,
+    pub app_id: String,
+    pub size_gb: u32,
+    pub state: SpecVolumeState,
+    /// Present only while the volume is `restoring`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore: Option<SpecRestore>,
+}
+
+/// `spec.volumes[].restore` (section 5.11, backup-format.md section 8.1).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecRestore {
+    pub backup_id: String,
+    pub manifest_key: String,
+    pub manifest_digest: String,
+    pub logical_bytes: u64,
+    /// Base64 of the app's 32-byte chunk-id key. `Debug` redacts it.
+    pub id_key: String,
+    /// Base64 of the app's 32-byte chunk-data key. `Debug` redacts it.
+    pub data_key: String,
+}
+
+impl std::fmt::Debug for SpecRestore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpecRestore")
+            .field("backup_id", &self.backup_id)
+            .field("manifest_key", &self.manifest_key)
+            .field("manifest_digest", &self.manifest_digest)
+            .field("logical_bytes", &self.logical_bytes)
+            .field("id_key", &"<redacted>")
+            .field("data_key", &"<redacted>")
+            .finish()
+    }
+}
+
+/// One job of `spec.backups` (section 5.11, ADR 0147).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecBackup {
+    pub backup_id: String,
+    pub app_id: String,
+    pub volume_id: String,
+    /// The app's VM on this node, which a `pause_copy` snapshot pauses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm_id: Option<String>,
+    pub fencing_token: u64,
+    /// Base64 of the app's 32-byte chunk-id key. `Debug` redacts it.
+    pub id_key: String,
+    /// Base64 of the app's 32-byte chunk-data key. `Debug` redacts it.
+    pub data_key: String,
+}
+
+impl std::fmt::Debug for SpecBackup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpecBackup")
+            .field("backup_id", &self.backup_id)
+            .field("app_id", &self.app_id)
+            .field("volume_id", &self.volume_id)
+            .field("vm_id", &self.vm_id)
+            .field("fencing_token", &self.fencing_token)
+            .field("id_key", &"<redacted>")
+            .field("data_key", &"<redacted>")
+            .finish()
+    }
+}
+
+/// `spec.backup_repository` (section 5.11): where the node reads and writes
+/// chunk and manifest objects. The credential is plaintext only inside the
+/// signed snapshot.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecBackupRepository {
+    pub repository_id: String,
+    pub endpoint: String,
+    pub region: String,
+    pub bucket: String,
+    /// `<prefix>/<cluster_id>`, the prefix every repository key is relative to.
+    pub root: String,
+    pub access_key_id: String,
+    /// The provider's secret, plaintext. `Debug` redacts it; never log it.
+    pub secret_access_key: String,
+}
+
+impl std::fmt::Debug for SpecBackupRepository {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpecBackupRepository")
+            .field("repository_id", &self.repository_id)
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("bucket", &self.bucket)
+            .field("root", &self.root)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .finish()
+    }
 }
 
 /// `spec.builds[].limits` (section 6.6).

@@ -112,6 +112,7 @@ fn hello(node_id: &str) -> NodeMessage {
         },
         dropped_events: 0,
         mesh_public_key: None,
+        volume_snapshot: None,
     })
 }
 
@@ -398,6 +399,8 @@ async fn vm_changes_push_snapshots_and_observations_land() {
             disk_free_gb: 90.0,
             builds: Vec::new(),
             edge_backends: Vec::new(),
+            backups: Vec::new(),
+            volumes: Vec::new(),
         }),
     )
     .await;
@@ -843,6 +846,8 @@ async fn an_edge_reports_backend_health_and_a_replicated_app_gets_degraded() {
             allocated: WireCapacity::default(),
             disk_free_gb: 18.0,
             builds: Vec::new(),
+            backups: Vec::new(),
+            volumes: Vec::new(),
             edge_backends: vec![
                 wire::EdgeBackendStatus {
                     app_id: app_id.clone(),
@@ -946,6 +951,8 @@ async fn an_edge_reports_backend_health_and_a_replicated_app_gets_degraded() {
             allocated: WireCapacity::default(),
             disk_free_gb: 18.0,
             builds: Vec::new(),
+            backups: Vec::new(),
+            volumes: Vec::new(),
             edge_backends: vec![
                 wire::EdgeBackendStatus {
                     app_id: app_id.clone(),

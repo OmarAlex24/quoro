@@ -131,27 +131,34 @@ async fn target_project_id(
     conn: &mut SqliteConnection,
     target: &Target,
 ) -> Result<Option<String>, ApiError> {
-    let row: Option<(String,)> = match target.kind.as_str() {
-        "app" => {
-            sqlx::query_as("SELECT project_id FROM apps WHERE id = ?")
-                .bind(&target.id)
-                .fetch_optional(&mut *conn)
-                .await?
-        }
-        "vm" => {
-            sqlx::query_as("SELECT project_id FROM vms WHERE id = ?")
-                .bind(&target.id)
-                .fetch_optional(&mut *conn)
-                .await?
-        }
-        "project" => {
-            sqlx::query_as("SELECT id FROM projects WHERE id = ?")
-                .bind(&target.id)
-                .fetch_optional(&mut *conn)
-                .await?
-        }
-        _ => None,
-    };
+    let row: Option<(String,)> =
+        match target.kind.as_str() {
+            "app" => {
+                sqlx::query_as("SELECT project_id FROM apps WHERE id = ?")
+                    .bind(&target.id)
+                    .fetch_optional(&mut *conn)
+                    .await?
+            }
+            "vm" => {
+                sqlx::query_as("SELECT project_id FROM vms WHERE id = ?")
+                    .bind(&target.id)
+                    .fetch_optional(&mut *conn)
+                    .await?
+            }
+            "volume" => sqlx::query_as(
+                "SELECT a.project_id FROM volumes v JOIN apps a ON a.id = v.app_id WHERE v.id = ?",
+            )
+            .bind(&target.id)
+            .fetch_optional(&mut *conn)
+            .await?,
+            "project" => {
+                sqlx::query_as("SELECT id FROM projects WHERE id = ?")
+                    .bind(&target.id)
+                    .fetch_optional(&mut *conn)
+                    .await?
+            }
+            _ => None,
+        };
     Ok(row.map(|r| r.0))
 }
 
@@ -160,6 +167,7 @@ async fn target_exists(state: &AppState, target: &Target) -> Result<bool, ApiErr
     let sql = match target.kind.as_str() {
         "app" => "SELECT id FROM apps WHERE id = ?",
         "vm" => "SELECT id FROM vms WHERE id = ?",
+        "volume" => "SELECT id FROM volumes WHERE id = ?",
         "project" => "SELECT id FROM projects WHERE id = ?",
         _ => return Ok(false),
     };
@@ -189,9 +197,9 @@ async fn validate(state: &AppState, body: &CreateApprovalRequest) -> Result<Scop
         )));
     }
     let target = target_of(&body.target);
-    if !matches!(target.kind.as_str(), "app" | "vm" | "project") {
+    if !matches!(target.kind.as_str(), "app" | "vm" | "project" | "volume") {
         return Err(ApiError::validation(format!(
-            "target.type {:?} is not app, vm or project",
+            "target.type {:?} is not app, vm, project or volume",
             target.kind
         )));
     }
@@ -535,6 +543,22 @@ async fn describe(state: &AppState, approval: &Approval) -> Result<TargetInfo, A
                 info.node_id = Some(node_id);
             }
         }
+        // A volume matches through the app that owns it (permission-model.md
+        // section 5, "Matching per target type").
+        "volume" => {
+            let row: Option<(String, String, String)> = sqlx::query_as(
+                "SELECT v.app_id, a.project_id, v.node_id FROM volumes v \
+                 JOIN apps a ON a.id = v.app_id WHERE v.id = ?",
+            )
+            .bind(&target.id)
+            .fetch_optional(state.store.pool())
+            .await?;
+            if let Some((app_id, project_id, node_id)) = row {
+                info.app_id = Some(app_id);
+                info.project_id = Some(project_id);
+                info.node_id = Some(node_id);
+            }
+        }
         "project" => info.project_id = Some(target.id.clone()),
         _ => {}
     }
@@ -725,6 +749,15 @@ async fn selector_for_target(
                 (Some(app_id), _) => selector.apps = Some(vec![app_id]),
                 (None, node_id) => selector.nodes = Some(vec![node_id]),
             }
+        }
+        // A volume is scoped to its app, like an `app` target.
+        "volume" => {
+            let row: (String,) = sqlx::query_as("SELECT app_id FROM volumes WHERE id = ?")
+                .bind(&target.id)
+                .fetch_optional(&mut *conn)
+                .await?
+                .ok_or_else(|| ApiError::not_found("volume"))?;
+            selector.apps = Some(vec![row.0]);
         }
         _ => {
             return Err(ApiError::validation(

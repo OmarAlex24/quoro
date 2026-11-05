@@ -77,7 +77,7 @@ pub fn budget_for(lease: &Lease, timers: FenceTimers) -> FenceTimers {
     }
 }
 
-type StopFuture<'a> = Pin<Box<dyn Future<Output = (VmId, VmFenceOutcome)> + 'a>>;
+type StopFuture<'a> = Pin<Box<dyn Future<Output = (VmId, VmFenceOutcome)> + Send + 'a>>;
 
 /// Stops every VM in `vms`, all at the same time and inside one shared budget:
 /// the bound applies to the whole lease, not to each VM (section 8.5).

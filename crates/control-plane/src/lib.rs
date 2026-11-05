@@ -28,6 +28,7 @@ pub mod interactive;
 pub mod keys;
 /// RFC 8785 canonical JSON, shared with the node agent through `quoro-proto`.
 pub use quoro_proto::jcs;
+pub mod leases;
 pub mod openapi;
 pub mod request;
 pub(crate) mod scheduler;
