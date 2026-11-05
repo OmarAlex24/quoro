@@ -285,33 +285,98 @@ pub(crate) async fn seal(
         Err(SealError::Retry(error)) => return Err(error),
     }
 
+    let sealed = Sealed {
+        snapshot_method: entry.snapshot_method.map(snapshot_method),
+        pause_ms: entry.pause_ms.and_then(|ms| i64::try_from(ms).ok()),
+        logical_bytes: entry.logical_bytes.and_then(|n| i64::try_from(n).ok()),
+        uploaded_bytes: entry.uploaded_bytes.and_then(|n| i64::try_from(n).ok()),
+        chunk_count: entry.chunk_count.and_then(|n| i64::try_from(n).ok()),
+        manifest_key,
+        manifest_digest,
+        finished_at: now,
+    };
+    let Some(after) = record_succeeded(store, &before.id, sealed).await? else {
+        return Ok(false);
+    };
+
+    // Retention runs only after the seal exists (`backup-format.md` section 9).
+    if let Err(error) = super::prune::after_seal(
+        store,
+        data_key,
+        keys,
+        runtime,
+        &repository,
+        &target,
+        &bucket,
+        &after,
+        time::OffsetDateTime::now_utc(),
+    )
+    .await
+    {
+        tracing::warn!(backup_id = %after.id, error = ?error, "backup pruning failed");
+    }
+    Ok(true)
+}
+
+/// What a written seal records on its row.
+pub(crate) struct Sealed {
+    /// The snapshot method; `None` keeps the row's.
+    pub snapshot_method: Option<SnapshotMethod>,
+    /// The pause, replacing the row's.
+    pub pause_ms: Option<i64>,
+    /// Size of the file the manifest's chunks cover.
+    pub logical_bytes: Option<i64>,
+    /// Bytes of new chunk objects; `None` when they are not known.
+    pub uploaded_bytes: Option<i64>,
+    /// Chunks the manifest lists.
+    pub chunk_count: Option<i64>,
+    /// Repository-relative key of the manifest object.
+    pub manifest_key: String,
+    /// BLAKE3 digest of the manifest object's bytes.
+    pub manifest_digest: String,
+    /// When the seal was written.
+    pub finished_at: String,
+}
+
+/// Records a backup whose seal object exists `succeeded`, with its change-log
+/// entry, the `backup.succeeded` event and the `backup.seal` system record
+/// with `ok`. It writes no object and runs no retention.
+///
+/// Returns the recorded row, or `None` when the row is gone or already
+/// terminal.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn record_succeeded(
+    store: &Store,
+    backup_id: &str,
+    sealed: Sealed,
+) -> Result<Option<BackupRecord>, ApiError> {
     let mut w = store.begin_write().await?;
     let row = sqlx::query(&format!(
         "SELECT {BACKUP_COLUMNS} FROM backups WHERE id = ?"
     ))
-    .bind(&before.id)
+    .bind(backup_id)
     .fetch_optional(&mut *w.tx)
     .await?;
     let Some(row) = row else {
-        return Ok(false);
+        return Ok(None);
     };
     let fresh = backup_from_row(&row)?;
     if fresh.status.is_terminal() {
-        return Ok(false);
+        return Ok(None);
     }
     let mut after = fresh;
     after.status = BackupStatus::Succeeded;
-    after.snapshot_method = entry
-        .snapshot_method
-        .map(snapshot_method)
-        .or(after.snapshot_method);
-    after.pause_ms = entry.pause_ms.and_then(|ms| i64::try_from(ms).ok());
-    after.logical_bytes = entry.logical_bytes.and_then(|n| i64::try_from(n).ok());
-    after.uploaded_bytes = entry.uploaded_bytes.and_then(|n| i64::try_from(n).ok());
-    after.chunk_count = entry.chunk_count.and_then(|n| i64::try_from(n).ok());
-    after.manifest_key = Some(manifest_key);
-    after.manifest_digest = Some(manifest_digest);
-    after.finished_at = Some(now);
+    after.snapshot_method = sealed.snapshot_method.or(after.snapshot_method);
+    after.pause_ms = sealed.pause_ms;
+    after.logical_bytes = sealed.logical_bytes;
+    after.uploaded_bytes = sealed.uploaded_bytes;
+    after.chunk_count = sealed.chunk_count;
+    after.manifest_key = Some(sealed.manifest_key);
+    after.manifest_digest = Some(sealed.manifest_digest);
+    after.finished_at = Some(sealed.finished_at);
     sqlx::query(
         "UPDATE backups SET status = 'succeeded', snapshot_method = ?, pause_ms = ?, \
          logical_bytes = ?, uploaded_bytes = ?, chunk_count = ?, manifest_key = ?, \
@@ -362,24 +427,7 @@ pub(crate) async fn seal(
     );
     crate::audit::append(&mut w.tx, &record).await?;
     w.commit().await?;
-
-    // Retention runs only after the seal exists (`backup-format.md` section 9).
-    if let Err(error) = super::prune::after_seal(
-        store,
-        data_key,
-        keys,
-        runtime,
-        &repository,
-        &target,
-        &bucket,
-        &after,
-        time::OffsetDateTime::now_utc(),
-    )
-    .await
-    {
-        tracing::warn!(backup_id = %after.id, error = ?error, "backup pruning failed");
-    }
-    Ok(true)
+    Ok(Some(after))
 }
 
 /// Why the seal object could not be written.

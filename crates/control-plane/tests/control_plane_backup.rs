@@ -7,10 +7,10 @@ mod common;
 
 use common::{Server, start, start_in};
 use quoro_backup::{
-    ChunkId, RepoKey, Restorer, Seal, SourceKind, layout, open_manifest, verify_seal,
+    ChunkId, RepoKey, Restorer, Seal, SourceKind, layout, open_manifest, sign_seal, verify_seal,
 };
 use quoro_control_plane::backups::control_plane::{
-    backup_before_upgrade, queue_if_due, record_upgrade, remove_leftovers,
+    backup_before_upgrade, queue_if_due, record_upgrade, remove_leftovers, resolve_orphaned,
     run_control_plane_backup, upgrade_before_start,
 };
 use quoro_control_plane::backups::prune;
@@ -1500,4 +1500,371 @@ async fn a_refused_seal_put_fails_the_scheduled_backup_at_once() {
     .unwrap();
     assert_eq!(result, "error");
     assert_eq!(reason.as_deref(), Some(error.as_str()));
+}
+
+// ---------------------------------------------------------------------------
+// Rows left behind at start (`backup-format.md` section 7.2)
+// ---------------------------------------------------------------------------
+
+/// A factory whose bucket fails every read of a seal with a transport error,
+/// not a not-found.
+struct SealGetFailBuckets(Arc<MemoryStore>);
+
+impl BucketStore for SealGetFailBuckets {
+    fn put_new<'a>(
+        &'a self,
+        key: &'a str,
+        body: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ObjectStoreError>> + Send + 'a>> {
+        Box::pin(async move { self.0.put_new(key, body, None).await.map(|_| ()) })
+    }
+
+    fn get<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ObjectStoreError>> + Send + 'a>> {
+        Box::pin(async move {
+            if key.contains("/seals/") {
+                return Err(ObjectStoreError::Transport(
+                    "the seal get is down".to_string(),
+                ));
+            }
+            self.0.get(key).await
+        })
+    }
+
+    fn list<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ObjectInfo>, ObjectStoreError>> + Send + 'a>> {
+        Box::pin(self.0.list(prefix))
+    }
+
+    fn delete<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ObjectStoreError>> + Send + 'a>> {
+        Box::pin(self.0.delete(key))
+    }
+}
+
+impl BucketFactory for SealGetFailBuckets {
+    fn open(
+        &self,
+        _target: &RepositoryTarget,
+    ) -> Result<Bucket, quoro_control_plane::error::ApiError> {
+        Ok(Arc::new(SealGetFailBuckets(Arc::clone(&self.0))))
+    }
+}
+
+/// Puts the row back as `VACUUM INTO` copied it: `running`, with none of the
+/// fields the seal step writes.
+async fn set_running(server: &Server, backup_id: &str) {
+    sqlx::query(
+        "UPDATE backups SET status = 'running', manifest_key = NULL, manifest_digest = NULL, \
+         logical_bytes = NULL, uploaded_bytes = NULL, chunk_count = NULL, finished_at = NULL \
+         WHERE id = ?",
+    )
+    .bind(backup_id)
+    .execute(server.state.store.pool())
+    .await
+    .unwrap();
+}
+
+/// The repository key of the seal of `backup_id`.
+fn seal_key(server: &Server, backup_id: &str) -> String {
+    format!(
+        "{}{}",
+        root(server),
+        layout::seal(&server.state.cluster_id, backup_id)
+    )
+}
+
+/// The `result` and `result_detail` of every `backup.seal` record of a backup,
+/// oldest first.
+async fn seal_records(server: &Server, backup_id: &str) -> Vec<(String, Option<String>)> {
+    sqlx::query_as(
+        "SELECT result, result_detail FROM audit_log WHERE operation = 'backup.seal' \
+         AND target_id = ? ORDER BY seq",
+    )
+    .bind(backup_id)
+    .fetch_all(server.state.store.pool())
+    .await
+    .unwrap()
+}
+
+/// How many events of `kind` name `backup_id`.
+async fn event_count(server: &Server, kind: &str, backup_id: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM events WHERE type = ? AND json_extract(subject, '$.id') = ?",
+    )
+    .bind(kind)
+    .bind(backup_id)
+    .fetch_one(server.state.store.pool())
+    .await
+    .unwrap()
+}
+
+/// A sealed control-plane backup whose row a restored database lists as
+/// `running`, and its seal.
+async fn restored_from_backup(
+    server: &Server,
+    bucket: &MemoryStore,
+    now: OffsetDateTime,
+) -> (String, Seal) {
+    let backup_id = scheduled_backup(server, now).await;
+    set_running(server, &backup_id).await;
+    let seal: Seal =
+        serde_json::from_slice(&object(bucket, &seal_key(server, &backup_id)).await).unwrap();
+    (backup_id, seal)
+}
+
+#[tokio::test]
+async fn a_running_row_whose_seal_exists_is_recorded_succeeded_from_the_seal() {
+    let bucket = Arc::new(MemoryStore::new());
+    let (server, owner, _node_id, project_id) = setup(&bucket).await;
+    create_app(&owner, &server, &project_id, "web").await;
+    create_repository(&owner, &server, 1, 7).await;
+
+    let now = at("2026-11-05T02:00:00Z");
+    let (backup_id, seal) = restored_from_backup(&server, &bucket, now).await;
+    let started_at = row(&server, &backup_id).await.started_at;
+    assert!(started_at.is_some());
+    let changes_before: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM change_log WHERE entity_type = 'backup' AND entity_id = ?",
+    )
+    .bind(&backup_id)
+    .fetch_one(server.state.store.pool())
+    .await
+    .unwrap();
+    // The bug: the row blocks the schedule.
+    assert!(
+        queue_if_due(&server.state, now + time::Duration::hours(2))
+            .await
+            .unwrap()
+            .is_none(),
+        "a running row blocks the schedule"
+    );
+
+    resolve_orphaned(&server.state).await.unwrap();
+
+    let after = row(&server, &backup_id).await;
+    assert_eq!(after.status, "succeeded", "{:?}", after.error);
+    assert_eq!(
+        after.manifest_key.as_deref(),
+        Some(seal.manifest_key.as_str())
+    );
+    assert_eq!(
+        after.manifest_key.as_deref(),
+        Some(layout::manifest(&server.state.cluster_id, &backup_id).as_str())
+    );
+    assert_eq!(
+        after.manifest_digest.as_deref(),
+        Some(seal.manifest_digest.as_str())
+    );
+    assert_eq!(after.logical_bytes, Some(seal.logical_bytes as i64));
+    assert_eq!(after.chunk_count, Some(seal.chunk_count as i64));
+    assert_eq!(after.uploaded_bytes, None, "uploaded_bytes stays null");
+    assert_eq!(after.finished_at.as_deref(), Some(seal.sealed_at.as_str()));
+    assert_eq!(after.started_at, started_at, "started_at is unchanged");
+    assert!(after.error.is_none());
+
+    // The records of a sealed backup: one more change-log entry, a second
+    // `backup.seal` with `ok`, and the event.
+    let changes_after: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM change_log WHERE entity_type = 'backup' AND entity_id = ?",
+    )
+    .bind(&backup_id)
+    .fetch_one(server.state.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(changes_after, changes_before + 1);
+    let records = seal_records(&server, &backup_id).await;
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[1], ("ok".to_string(), None));
+    assert_eq!(
+        event_count(&server, "backup.succeeded", &backup_id).await,
+        2
+    );
+
+    // The seal object was not written again.
+    let stored: Seal =
+        serde_json::from_slice(&object(&bucket, &seal_key(&server, &backup_id)).await).unwrap();
+    assert_eq!(stored, seal);
+
+    // The schedule counts from the resolved row.
+    assert!(
+        queue_if_due(&server.state, now + time::Duration::minutes(30))
+            .await
+            .unwrap()
+            .is_none(),
+        "inside the interval nothing is due"
+    );
+    let next = queue_if_due(&server.state, now + time::Duration::hours(2))
+        .await
+        .unwrap()
+        .expect("due once the interval passed");
+    assert_ne!(next.id, backup_id);
+}
+
+#[tokio::test]
+async fn a_running_row_without_a_seal_fails_as_interrupted() {
+    let bucket = Arc::new(MemoryStore::new());
+    let (server, owner, _node_id, project_id) = setup(&bucket).await;
+    create_app(&owner, &server, &project_id, "web").await;
+    create_repository(&owner, &server, 1, 7).await;
+
+    let now = at("2026-11-05T02:00:00Z");
+    let queued = queue_if_due(&server.state, now).await.unwrap().unwrap();
+    // The primary crashed after it marked the row running.
+    sqlx::query("UPDATE backups SET status = 'running', started_at = ? WHERE id = ?")
+        .bind("2026-11-05T02:00:00.000Z")
+        .bind(&queued.id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+
+    resolve_orphaned(&server.state).await.unwrap();
+
+    let failed = row(&server, &queued.id).await;
+    assert_eq!(failed.status, "failed");
+    assert_eq!(failed.error.as_deref(), Some("interrupted"));
+    assert!(failed.finished_at.is_some() && failed.manifest_key.is_none());
+    assert_eq!(
+        seal_records(&server, &queued.id).await,
+        vec![("error".to_string(), Some("interrupted".to_string()))]
+    );
+    assert_eq!(event_count(&server, "backup.failed", &queued.id).await, 1);
+    assert!(
+        queue_if_due(&server.state, now + time::Duration::hours(1))
+            .await
+            .unwrap()
+            .is_some(),
+        "the failed row no longer blocks the schedule"
+    );
+}
+
+#[tokio::test]
+async fn a_seal_signed_by_another_key_fails_the_row() {
+    let bucket = Arc::new(MemoryStore::new());
+    let (server, owner, _node_id, project_id) = setup(&bucket).await;
+    create_app(&owner, &server, &project_id, "web").await;
+    create_repository(&owner, &server, 1, 7).await;
+
+    let now = at("2026-11-05T02:00:00Z");
+    let (backup_id, mut seal) = restored_from_backup(&server, &bucket, now).await;
+    let other_dir = server.data_dir.join("other-cluster");
+    let other = ClusterKeys::load_or_generate(&other_dir).unwrap();
+    sign_seal(&mut seal, other.signing_key()).unwrap();
+    let key = seal_key(&server, &backup_id);
+    bucket.delete(&key).await.unwrap();
+    bucket
+        .put_new(&key, serde_json::to_vec(&seal).unwrap(), None)
+        .await
+        .unwrap();
+
+    resolve_orphaned(&server.state).await.unwrap();
+
+    let failed = row(&server, &backup_id).await;
+    assert_eq!(failed.status, "failed");
+    assert_eq!(failed.error.as_deref(), Some("the seal does not verify"));
+    assert!(failed.manifest_key.is_none());
+    let records = seal_records(&server, &backup_id).await;
+    assert_eq!(
+        records.last(),
+        Some(&(
+            "error".to_string(),
+            Some("the seal does not verify".to_string())
+        ))
+    );
+}
+
+#[tokio::test]
+async fn a_valid_seal_of_another_backup_fails_the_row() {
+    let bucket = Arc::new(MemoryStore::new());
+    let (server, owner, _node_id, project_id) = setup(&bucket).await;
+    create_app(&owner, &server, &project_id, "web").await;
+    create_repository(&owner, &server, 1, 7).await;
+
+    let now = at("2026-11-05T02:00:00Z");
+    let first = scheduled_backup(&server, now).await;
+    let (second, _) = restored_from_backup(&server, &bucket, now + time::Duration::hours(2)).await;
+    // The second backup's seal key holds the first backup's seal, which
+    // verifies with the cluster key but names another backup.
+    let key = seal_key(&server, &second);
+    let foreign = object(&bucket, &seal_key(&server, &first)).await;
+    bucket.delete(&key).await.unwrap();
+    bucket.put_new(&key, foreign, None).await.unwrap();
+
+    resolve_orphaned(&server.state).await.unwrap();
+
+    let failed = row(&server, &second).await;
+    assert_eq!(failed.status, "failed");
+    assert_eq!(failed.error.as_deref(), Some("the seal does not verify"));
+    assert_eq!(row(&server, &first).await.status, "succeeded");
+}
+
+#[tokio::test]
+async fn a_bucket_that_cannot_be_read_leaves_the_row_running() {
+    let bucket = Arc::new(MemoryStore::new());
+    let (server, owner, _node_id, project_id) = setup(&bucket).await;
+    create_app(&owner, &server, &project_id, "web").await;
+    create_repository(&owner, &server, 1, 7).await;
+
+    let now = at("2026-11-05T02:00:00Z");
+    let (backup_id, _seal) = restored_from_backup(&server, &bucket, now).await;
+    let records_before = seal_records(&server, &backup_id).await;
+    server
+        .state
+        .backups
+        .set_factory(Arc::new(SealGetFailBuckets(Arc::clone(&bucket))));
+
+    resolve_orphaned(&server.state).await.unwrap();
+
+    let after = row(&server, &backup_id).await;
+    assert_eq!(after.status, "running");
+    assert!(after.error.is_none() && after.finished_at.is_none());
+    assert_eq!(seal_records(&server, &backup_id).await, records_before);
+
+    // A factory that cannot open the bucket leaves it too.
+    server.state.backups.set_factory(Arc::new(BrokenBuckets));
+    resolve_orphaned(&server.state).await.unwrap();
+    assert_eq!(row(&server, &backup_id).await.status, "running");
+}
+
+#[tokio::test]
+async fn a_running_volume_backup_is_left_alone() {
+    let bucket = Arc::new(MemoryStore::new());
+    let (server, owner, node_id, project_id) = setup(&bucket).await;
+    create_app(&owner, &server, &project_id, "web").await;
+    let repository_id = create_repository(&owner, &server, 1, 7).await;
+
+    let volume_backup = "bkp_01JC9Z1A2B3C4D5E6F7G8H9J0V";
+    sqlx::query(
+        "INSERT INTO backups (id, repository_id, source_kind, app_id, volume_id, node_id, status, \
+         \"trigger\", fencing_token, created_by_type, created_by_id, created_at, started_at) \
+         VALUES (?, ?, 'volume', 'app_01JC9Z1A2B3C4D5E6F7G8H9J0A', 'vol_01JC9Z1A2B3C4D5E6F7G8H9J0B', \
+         ?, 'running', 'schedule', 1, 'system', 'backups', ?, ?)",
+    )
+    .bind(volume_backup)
+    .bind(&repository_id)
+    .bind(&node_id)
+    .bind("2026-11-05T01:00:00.000Z")
+    .bind("2026-11-05T01:00:01.000Z")
+    .execute(server.state.store.pool())
+    .await
+    .unwrap();
+    // A queued control-plane row in the same start shows the resolver ran.
+    let now = at("2026-11-05T02:00:00Z");
+    let queued = queue_if_due(&server.state, now).await.unwrap().unwrap();
+
+    resolve_orphaned(&server.state).await.unwrap();
+
+    let failed = row(&server, &queued.id).await;
+    assert_eq!(failed.status, "failed");
+    assert_eq!(failed.error.as_deref(), Some("interrupted"));
+    let volume = row(&server, volume_backup).await;
+    assert_eq!(volume.status, "running");
+    assert!(volume.error.is_none() && volume.finished_at.is_none());
+    assert!(seal_records(&server, volume_backup).await.is_empty());
 }

@@ -30,11 +30,19 @@ pub const DISPATCH_INTERVAL: Duration = Duration::from_secs(60);
 /// tick is retried on the next one.
 pub fn spawn(state: AppState) {
     // A crash mid-backup leaves its temporary database behind
-    // (`backup-format.md` section 7.2): the row times out, the file goes now.
+    // (`backup-format.md` section 7.2): the file goes now, and the row is
+    // resolved below, before the first tick.
     if let Err(error) = super::control_plane::remove_leftovers(&state.config.data_dir) {
         tracing::warn!(error = ?error, "could not remove a leftover control-plane backup file");
     }
     tokio::spawn(async move {
+        // A control-plane backup left `queued` or `running` would block its
+        // schedule; it is resolved from its seal object before the first
+        // `queue_if_due` (`backup-format.md` section 7.2, "Rows left behind at
+        // start"). The bucket I/O runs here, so it does not delay the start.
+        if let Err(error) = super::control_plane::resolve_orphaned(&state).await {
+            tracing::warn!(error = ?error, "could not resolve the control-plane backups left behind");
+        }
         let mut ticker = tokio::time::interval(DISPATCH_INTERVAL);
         loop {
             ticker.tick().await;
