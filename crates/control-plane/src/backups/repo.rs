@@ -109,6 +109,39 @@ pub(crate) async fn any(store: &crate::store::Store) -> Result<Option<Repository
     row.as_ref().map(repository_from_row).transpose()
 }
 
+/// The cluster's repository as the pre-upgrade backup may read it, before the
+/// pending migrations ran (`backup-format.md` section 7.2, "Before an upgrade").
+///
+/// A database too old to have the table, or to have every column this reads,
+/// has no repository the pre-upgrade backup could write to.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn any_before_upgrade(
+    store: &crate::store::Store,
+) -> Result<Option<Repository>, ApiError> {
+    let table: Option<(String,)> = sqlx::query_as(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'backup_repositories'",
+    )
+    .fetch_optional(store.pool())
+    .await?;
+    if table.is_none() {
+        return Ok(None);
+    }
+    let columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('backup_repositories') WHERE name IN \
+         ('id', 'name', 'provider_id', 'prefix', 'repo_key_enc', 'recovery_key_fingerprint', \
+          'recovery_key_rotated_at', 'control_plane_schedule', 'created_by', 'created_at')",
+    )
+    .fetch_one(store.pool())
+    .await?;
+    if columns < 10 {
+        return Ok(None);
+    }
+    any(store).await
+}
+
 /// One repository by id.
 ///
 /// # Errors

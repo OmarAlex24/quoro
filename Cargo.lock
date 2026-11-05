@@ -2287,11 +2287,13 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "quoro-backup",
  "quoro-control-plane",
  "quoro-engine",
  "quoro-mcp",
  "quoro-node-agent",
  "quoro-proto",
+ "quoro-providers",
  "quoro-types",
  "rcgen 0.13.2",
  "reqwest 0.12.28",
@@ -2305,6 +2307,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

@@ -20,6 +20,10 @@ quoro-mcp = { path = "../mcp" }
 quoro-engine = { path = "../engine" }
 # The node agent: `quoro join`, `quoro node` and the primary's local node.
 quoro-node-agent = { path = "../node-agent" }
+# `quoro restore` reads a backup repository and checks its objects (ADR 0148).
+quoro-backup = { path = "../backup" }
+# The S3 client `quoro restore` lists and gets the repository's objects with.
+quoro-providers = { path = "../providers" }
 # Wire shapes (capacity, KVM) the node agent reports.
 quoro-proto = { path = "../proto" }
 # The control plane's local join file is JSON.
@@ -94,6 +98,9 @@ sqlx = { version = "0.8", default-features = false, features = [
     "sqlite",
     "runtime-tokio",
 ] }
+# `quoro restore` wipes the credentials file's text and its secret access key
+# from memory when they are dropped.
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 # The end-to-end test drives the binary over real HTTPS with a cookie jar.

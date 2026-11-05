@@ -16,6 +16,7 @@
 //! bytes, because [`crate::crypto::DataKey::decrypt`] returns text; the hex is
 //! decoded back to the 32 bytes at the one place that derives source keys.
 
+pub mod control_plane;
 pub mod cost;
 pub mod dispatch;
 pub mod prune;

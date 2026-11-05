@@ -153,18 +153,50 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Opens the state: loads or generates the cluster key, completes `meta`
-    /// and builds the session hub.
+    /// Opens the state: loads or generates the cluster key, takes the
+    /// pre-upgrade backup when a migration is pending, completes `meta` and
+    /// builds the session hub.
     ///
     /// # Errors
     ///
-    /// A message for the operator when the signing key cannot be loaded or
-    /// `meta` cannot be completed.
+    /// A message for the operator when the signing key cannot be loaded, the
+    /// pre-upgrade backup fails, the migrations cannot be applied or `meta`
+    /// cannot be completed.
     pub async fn open(
+        store: store::Store,
+        config: ServerConfig,
+        resolver: Arc<dyn DigestResolver>,
+        data_key: Arc<crypto::DataKey>,
+    ) -> Result<Self, String> {
+        Self::open_with_upgrade(
+            store,
+            config,
+            resolver,
+            data_key,
+            backups::Backups::s3(),
+            false,
+        )
+        .await
+    }
+
+    /// [`AppState::open`], with the backup runtime the caller already built and
+    /// the operator's `--skip-upgrade-backup`.
+    ///
+    /// `store` may be unmigrated: the pending range is read, the pre-upgrade
+    /// backup runs (or the skip is honoured), the migrations are applied and
+    /// the backup is recorded, all before the rest of the start
+    /// (`backup-format.md` section 7.2, "Before an upgrade").
+    ///
+    /// # Errors
+    ///
+    /// As [`AppState::open`].
+    pub async fn open_with_upgrade(
         store: store::Store,
         mut config: ServerConfig,
         resolver: Arc<dyn DigestResolver>,
         data_key: Arc<crypto::DataKey>,
+        backups: backups::Backups,
+        skip_upgrade_backup: bool,
     ) -> Result<Self, String> {
         if config.heartbeat_interval_ms == 0 {
             config.heartbeat_interval_ms = quoro_proto::wire::HEARTBEAT_INTERVAL_MS;
@@ -176,6 +208,23 @@ impl AppState {
             ClusterKeys::load_or_generate(&config.data_dir)
                 .map_err(|e| format!("cannot load the cluster signing key: {e}"))?,
         );
+        // The backup needs the keys and the data key, and must run before any
+        // migration touches the database.
+        backups::control_plane::upgrade_before_start(
+            &store,
+            &config.data_dir,
+            &keys,
+            &data_key,
+            &backups,
+            skip_upgrade_backup,
+        )
+        .await
+        .map_err(|reason| {
+            format!(
+                "the pre-upgrade backup failed: {reason}; start once with \
+                 --skip-upgrade-backup to migrate without it"
+            )
+        })?;
         let cluster_id = keys::ensure_cluster_meta(&store)
             .await
             .map_err(|e| format!("cannot read the cluster identity: {e:?}"))?;
@@ -183,7 +232,6 @@ impl AppState {
         // any session can ask for a desired state (ADR 0144).
         subnet::backfill(&store, &config.node_network).await?;
         let config = Arc::new(config);
-        let backups = backups::Backups::s3();
         let hub = NodeHub::new(
             store.clone(),
             Arc::clone(&config),

@@ -7,7 +7,8 @@
 //! last succeeded backup is older than `backup_schedule.interval_h`, or when
 //! it has none. A failed scheduled backup waits for the next interval; it is
 //! not retried sooner, because the interval counts from the last *succeeded*
-//! one.
+//! one. The control-plane database has its own schedule and work
+//! ([`super::control_plane`]); the loop only queues it.
 
 use crate::AppState;
 use crate::api::apps::BackupSchedule;
@@ -28,6 +29,11 @@ pub const DISPATCH_INTERVAL: Duration = Duration::from_secs(60);
 /// Starts the dispatch loop. Errors are logged, never propagated: a failed
 /// tick is retried on the next one.
 pub fn spawn(state: AppState) {
+    // A crash mid-backup leaves its temporary database behind
+    // (`backup-format.md` section 7.2): the row times out, the file goes now.
+    if let Err(error) = super::control_plane::remove_leftovers(&state.config.data_dir) {
+        tracing::warn!(error = ?error, "could not remove a leftover control-plane backup file");
+    }
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(DISPATCH_INTERVAL);
         loop {
@@ -65,6 +71,12 @@ pub async fn run(state: &AppState, now: time::OffsetDateTime) -> Result<Tick, Ap
         state.hub.node_changed(&node_id);
     }
     for node_id in scheduled_due(&state.store, now).await? {
+        tick.queued += 1;
+        state.hub.node_changed(&node_id);
+    }
+    // The control-plane source queues its own backup; no node is notified
+    // (`backup-format.md` section 7.2).
+    for node_id in dispatch_control_plane(state, now).await? {
         tick.queued += 1;
         state.hub.node_changed(&node_id);
     }
@@ -308,4 +320,27 @@ pub(crate) async fn current_lease(store: &Store, app_id: &str) -> Result<Option<
     .fetch_optional(store.pool())
     .await?;
     Ok(row.map(|row| row.0))
+}
+
+/// The control-plane source's schedule (`backup-format.md` section 7.2,
+/// ADR 0148). The primary does the work itself, so no node is notified and the
+/// returned list is always empty.
+async fn dispatch_control_plane(
+    state: &AppState,
+    now: time::OffsetDateTime,
+) -> Result<Vec<String>, ApiError> {
+    let Some(backup) = super::control_plane::queue_if_due(state, now).await? else {
+        return Ok(Vec::new());
+    };
+    let backup_id = backup.id;
+    let state = state.clone();
+    // Its own task, so the 60 s loop never waits on a vacuum and an upload.
+    tokio::spawn(async move {
+        if let Err(error) =
+            super::control_plane::run_control_plane_backup(&state, &backup_id, now).await
+        {
+            tracing::warn!(backup_id = %backup_id, error = ?error, "control-plane backup failed");
+        }
+    });
+    Ok(Vec::new())
 }
