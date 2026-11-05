@@ -260,6 +260,10 @@ struct SessionHandle {
     changed: Arc<Notify>,
     /// Commands and streams waiting on this session.
     pending: Arc<Mutex<Pending>>,
+    /// Whether this session's `hello` is recorded (`nodes.status` set to
+    /// `connected` by [`connect_node`]). Written only while the store's writer
+    /// gate is held, so [`disconnect_node`] reads it in order with that write.
+    hello_recorded: bool,
 }
 
 /// A source of `welcome.primary_urls` (section 5.10). The binary installs one
@@ -756,6 +760,7 @@ impl NodeHub {
                 closed,
                 changed: Arc::clone(&changed),
                 pending: Arc::new(Mutex::new(Pending::default())),
+                hello_recorded: false,
             },
         );
         (generation, rx, closed_rx, changed)
@@ -773,6 +778,31 @@ impl NodeHub {
         } else {
             None
         }
+    }
+
+    /// Marks whether `generation`'s `hello` is recorded; a superseded
+    /// generation is left alone.
+    fn set_hello_recorded(&self, node_id: &str, generation: u64, recorded: bool) {
+        if let Some(handle) = self
+            .0
+            .sessions
+            .lock()
+            .expect("session lock")
+            .get_mut(node_id)
+            .filter(|handle| handle.generation == generation)
+        {
+            handle.hello_recorded = recorded;
+        }
+    }
+
+    /// Whether `node_id` has a session whose `hello` is recorded.
+    fn has_recorded_session(&self, node_id: &str) -> bool {
+        self.0
+            .sessions
+            .lock()
+            .expect("session lock")
+            .get(node_id)
+            .is_some_and(|handle| handle.hello_recorded)
     }
 
     /// Whether `generation` is still the live session of `node_id`.
@@ -1456,18 +1486,39 @@ async fn run_session(
         }
     }
 
-    if let Some(pending) = session.hub.detach(&session.node_id, generation) {
-        pending.lock().expect("pending lock").fail_all();
-    }
-    if session.connected
-        && !superseded
-        && let Err(e) = disconnect_node(&session.hub, &session.node_id, reason).await
-    {
-        tracing::warn!(%e, node_id = %session.node_id, "cannot record the disconnect");
-    }
+    end_session(
+        &session.hub,
+        &session.node_id,
+        generation,
+        session.connected && !superseded,
+        reason,
+    )
+    .await;
     // A close frame tells the node the session ended; the client may already
     // be gone, which is fine.
     let _ = socket.send(Message::Close(None)).await;
+}
+
+/// Ends `generation`'s session: fails its pending commands and streams and,
+/// when `record_disconnect`, records the disconnect.
+///
+/// A session that a newer one replaced may leave its loop through any branch
+/// (a heartbeat timeout, a socket error) before it sees the `closed` signal.
+/// [`disconnect_node`] then finds the newer session and records nothing, so a
+/// stale teardown never marks the live node disconnected (issue #324).
+async fn end_session(
+    hub: &NodeHub,
+    node_id: &str,
+    generation: u64,
+    record_disconnect: bool,
+    reason: &str,
+) {
+    if let Some(pending) = hub.detach(node_id, generation) {
+        pending.lock().expect("pending lock").fail_all();
+    }
+    if record_disconnect && let Err(e) = disconnect_node(hub, node_id, reason).await {
+        tracing::warn!(%e, node_id = %node_id, "cannot record the disconnect");
+    }
 }
 
 impl Session {
@@ -1506,7 +1557,7 @@ impl Session {
                 ));
                 return true;
             }
-            match connect_node(&self.hub, &self.node_id, &hello).await {
+            match connect_node(&self.hub, &self.node_id, self.generation, &hello).await {
                 Ok(changed) => {
                     if changed {
                         self.hub.nodes_changed_all();
@@ -2150,7 +2201,12 @@ fn i64_of(value: u64) -> i64 {
 /// It also stores the mesh public key the `hello` carried and assigns the
 /// node's mesh address when it has none (ADR 0144). The `bool` says
 /// whether either was newly stored, so the caller can rebuild every snapshot.
-async fn connect_node(hub: &NodeHub, node_id: &str, hello: &wire::Hello) -> Result<bool, String> {
+async fn connect_node(
+    hub: &NodeHub,
+    node_id: &str,
+    generation: u64,
+    hello: &wire::Hello,
+) -> Result<bool, String> {
     let actor = Actor {
         kind: ActorType::Node,
         id: node_id.to_string(),
@@ -2205,11 +2261,22 @@ async fn connect_node(hub: &NodeHub, node_id: &str, hello: &wire::Hello) -> Resu
     )
     .await
     .map_err(|e| e.to_string())?;
-    w.commit().await.map_err(|e| e.to_string())?;
+    // Marked before the commit, while the writer gate is held: a disconnect
+    // queued behind this write must see it (issue #324).
+    hub.set_hello_recorded(node_id, generation, true);
+    if let Err(e) = w.commit().await {
+        hub.set_hello_recorded(node_id, generation, false);
+        return Err(e.to_string());
+    }
     Ok(mesh_changed)
 }
 
 /// Records the end of a session and emits `node.disconnected`.
+///
+/// Records nothing when a newer session of the node already recorded its
+/// `hello`: the ending session is stale and the node is connected. The check
+/// runs inside the write transaction, so it is ordered against that
+/// session's [`connect_node`] by the writer gate (issue #324).
 async fn disconnect_node(hub: &NodeHub, node_id: &str, reason: &str) -> Result<(), String> {
     let actor = Actor {
         kind: ActorType::Node,
@@ -2217,6 +2284,9 @@ async fn disconnect_node(hub: &NodeHub, node_id: &str, reason: &str) -> Result<(
     };
     let now = now_rfc3339();
     let mut w = hub.0.store.begin_write().await.map_err(|e| e.to_string())?;
+    if hub.has_recorded_session(node_id) {
+        return Ok(());
+    }
     let updated = sqlx::query(
         "UPDATE nodes SET status = 'disconnected', last_seen_at = ? WHERE id = ? AND status = 'connected'",
     )
@@ -2778,5 +2848,187 @@ mod tests {
         assert!(pending.at_stream_limit());
         pending.streams.remove("msg_0");
         assert!(!pending.at_stream_limit());
+    }
+
+    /// A primary with one node whose row says `connected`.
+    async fn hub_with_node() -> (AppState, String, std::path::PathBuf) {
+        // The tunnel manager builds a reqwest client on the no-provider
+        // rustls feature.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let data_dir = std::env::temp_dir().join(format!(
+            "quoro-session-{}",
+            &crate::store::random_secret()[..16]
+        ));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let store = Store::open(&data_dir.join("quoro.db")).await.unwrap();
+        let state = AppState::open(
+            store,
+            ServerConfig {
+                data_dir: data_dir.clone(),
+                secure_cookies: false,
+                public_url: None,
+                tls_fingerprint: String::new(),
+                node_network: crate::NodeNetwork {
+                    subnet: "10.42.1.0/24".to_string(),
+                    gateway: "10.42.1.1".to_string(),
+                },
+                heartbeat_interval_ms: 200,
+                session_timeout_ms: 800,
+            },
+            Arc::new(crate::ReferenceAsDigest),
+            Arc::new(DataKey::ephemeral()),
+        )
+        .await
+        .unwrap();
+        let node_id = driver::register_local_node(
+            &state.store,
+            &driver::LocalNode {
+                name: "node-a".to_string(),
+                capacity: driver::Capacity {
+                    cpus: 2,
+                    memory_mb: 2_048,
+                    disk_gb: 10,
+                },
+                kvm: driver::Kvm {
+                    available: true,
+                    kernel: "6.12.0".to_string(),
+                    nested: None,
+                },
+                engine_version: "engine".to_string(),
+                agent_version: "agent".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        (state, node_id, data_dir)
+    }
+
+    fn hello(node_id: &str) -> wire::Hello {
+        wire::Hello {
+            node_id: node_id.to_string(),
+            agent_version: "agent".to_string(),
+            engine_version: "engine".to_string(),
+            boot_id: "boot-1".to_string(),
+            stored_rev: 0,
+            applied_rev: 0,
+            log_seq: 0,
+            log_hash: "0".repeat(64),
+            leases: Vec::new(),
+            capacity: wire::Capacity {
+                cpus: 2,
+                memory_mb: 2_048,
+                disk_gb: 10,
+            },
+            allocated: wire::Capacity::default(),
+            kvm: wire::Kvm {
+                available: true,
+                kernel: "6.12.0".to_string(),
+                nested: None,
+            },
+            dropped_events: 0,
+            mesh_public_key: None,
+            volume_snapshot: None,
+        }
+    }
+
+    /// The node's `status` and how many `node.disconnected` it has.
+    async fn status_and_disconnects(state: &AppState, node_id: &str) -> (String, i64) {
+        let status: String = sqlx::query_scalar("SELECT status FROM nodes WHERE id = ?")
+            .bind(node_id)
+            .fetch_one(state.store.pool())
+            .await
+            .unwrap();
+        let disconnects: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE type = 'node.disconnected' \
+             AND json_extract(subject, '$.id') = ?",
+        )
+        .bind(node_id)
+        .fetch_one(state.store.pool())
+        .await
+        .unwrap();
+        (status, disconnects)
+    }
+
+    #[tokio::test]
+    async fn a_replaced_session_that_times_out_leaves_the_new_session_connected() {
+        let (state, node_id, data_dir) = hub_with_node().await;
+        let hub = &state.hub;
+        let (a, _rx_a, _closed_a, _) = hub.attach(&node_id);
+        connect_node(hub, &node_id, a, &hello(&node_id))
+            .await
+            .unwrap();
+        // Session B replaces A and records its hello while A's loop is still
+        // blocked; A then leaves through the heartbeat timeout without having
+        // seen its `closed` signal (issue #324).
+        let (b, _rx_b, _closed_b, _) = hub.attach(&node_id);
+        connect_node(hub, &node_id, b, &hello(&node_id))
+            .await
+            .unwrap();
+        end_session(hub, &node_id, a, true, "heartbeat_timeout").await;
+        assert_eq!(
+            status_and_disconnects(&state, &node_id).await,
+            ("connected".to_string(), 0)
+        );
+        assert!(hub.is_current(&node_id, b), "B is still the live session");
+
+        // B's own timeout still records the disconnect.
+        end_session(hub, &node_id, b, true, "heartbeat_timeout").await;
+        assert_eq!(
+            status_and_disconnects(&state, &node_id).await,
+            ("disconnected".to_string(), 1)
+        );
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_ordered_after_the_new_hello_records_nothing() {
+        let (state, node_id, data_dir) = hub_with_node().await;
+        let hub = &state.hub;
+        let (a, _rx_a, _closed_a, _) = hub.attach(&node_id);
+        connect_node(hub, &node_id, a, &hello(&node_id))
+            .await
+            .unwrap();
+        // A was still current when it left its loop, so its detach succeeds,
+        // but B attaches and records its hello before A's write gets the
+        // writer gate.
+        assert!(hub.detach(&node_id, a).is_some());
+        let (b, _rx_b, _closed_b, _) = hub.attach(&node_id);
+        connect_node(hub, &node_id, b, &hello(&node_id))
+            .await
+            .unwrap();
+        disconnect_node(hub, &node_id, "heartbeat_timeout")
+            .await
+            .unwrap();
+        assert_eq!(
+            status_and_disconnects(&state, &node_id).await,
+            ("connected".to_string(), 0)
+        );
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_before_the_new_hello_is_recorded() {
+        let (state, node_id, data_dir) = hub_with_node().await;
+        let hub = &state.hub;
+        let (a, _rx_a, _closed_a, _) = hub.attach(&node_id);
+        connect_node(hub, &node_id, a, &hello(&node_id))
+            .await
+            .unwrap();
+        // B has attached but not sent its hello: A's disconnect is real, and
+        // B's hello marks the node connected again afterwards.
+        let (b, _rx_b, _closed_b, _) = hub.attach(&node_id);
+        end_session(hub, &node_id, a, true, "heartbeat_timeout").await;
+        assert_eq!(
+            status_and_disconnects(&state, &node_id).await,
+            ("disconnected".to_string(), 1)
+        );
+        connect_node(hub, &node_id, b, &hello(&node_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            status_and_disconnects(&state, &node_id).await,
+            ("connected".to_string(), 1)
+        );
+        std::fs::remove_dir_all(&data_dir).unwrap();
     }
 }
