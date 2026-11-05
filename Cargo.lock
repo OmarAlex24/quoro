@@ -2445,6 +2445,7 @@ dependencies = [
  "quoro-proto",
  "quoro-providers",
  "rcgen 0.13.2",
+ "rustix",
  "rustls",
  "serde",
  "serde_json",

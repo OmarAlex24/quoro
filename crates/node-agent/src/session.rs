@@ -266,6 +266,9 @@ pub struct Session {
     volume_snapshot: Option<wire::SnapshotMethod>,
     /// The volume statuses the reconciler publishes (section 5.3).
     volumes: Option<watch::Receiver<Vec<VolumeStatus>>>,
+    /// The directory whose filesystem holds the volumes, for
+    /// `status_report.disk_free_gb` (section 5.3); `None` reports 0.
+    disk_free_path: Option<std::path::PathBuf>,
     /// The URL `dial` used for the current session, set after a successful
     /// dial and read once `welcome` arrives to promote a fallback address
     /// (section 5.10). `None` when the session was handed a stream directly
@@ -304,6 +307,7 @@ impl Session {
             leases: None,
             volume_snapshot: None,
             volumes: None,
+            disk_free_path: None,
             dialed_url: None,
         }
     }
@@ -320,6 +324,16 @@ impl Session {
     #[must_use]
     pub fn with_volume_snapshot(mut self, method: Option<wire::SnapshotMethod>) -> Self {
         self.volume_snapshot = method;
+        self
+    }
+
+    /// Reports the free space of the filesystem that holds `path` as
+    /// `status_report.disk_free_gb` (section 5.3). The node's data directory
+    /// holds the volumes, or the image of the volume pool that grows into
+    /// it, so its filesystem bounds what a new volume can use.
+    #[must_use]
+    pub fn with_disk_free_path(mut self, path: std::path::PathBuf) -> Self {
+        self.disk_free_path = Some(path);
         self
     }
 
@@ -1486,9 +1500,10 @@ impl Session {
             routes: self.routes(),
             capacity: self.facts.capacity,
             allocated: self.allocated(),
-            // Free space needs `statvfs`, which the standard library does not
-            // expose; the binary fills a real figure in a later milestone.
-            disk_free_gb: 0.0,
+            disk_free_gb: self
+                .disk_free_path
+                .as_deref()
+                .map_or(0.0, util::disk_free_gb),
             builds: self
                 .builds
                 .as_ref()
