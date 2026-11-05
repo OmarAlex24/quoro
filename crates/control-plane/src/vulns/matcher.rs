@@ -61,53 +61,16 @@ pub async fn match_inventory(
         let Some(ecosystem_name) = package_ecosystem(package) else {
             continue;
         };
-        if order_for(ecosystem_name).is_none() {
-            continue;
-        }
-        let names = lookup_names(package);
-        // Only a distribution's source package is a different package; a
-        // PyPI normalized name is the same one spelled differently.
-        let by_source = is_distro(ecosystem_name);
-        let mut seen = HashSet::new();
-        let mut found = Vec::new();
-        for name in names {
-            for row in cache.affected_for(ecosystem_name, &name).await? {
-                if seen.insert(row.id.clone()) {
-                    found.push((name.clone(), row));
-                }
-            }
-        }
-        let mut package_candidates = Vec::new();
-        for (name, row) in found {
-            if row.withdrawn.is_some() {
-                continue;
-            }
-            let Some(hit) = evaluate(ecosystem_name, &package.version, &row.ranges, &row.versions)
-            else {
-                continue;
-            };
-            let aliases = aliases(&row);
-            let (cvss_score, cvss_vector) = match cvss(&row.severity) {
-                Some((score, vector)) => (Some(score), Some(vector)),
-                None => (None, None),
-            };
-            let kev = cache.is_kev(&kev_ids(&row.id, &aliases)).await?;
-            package_candidates.push(Candidate {
-                vuln_id: row.id,
-                aliases,
-                summary: row.summary,
-                ecosystem: ecosystem_name.to_string(),
-                package: package.name.clone(),
-                source_package: (by_source && name != package.name).then_some(name),
-                installed_version: package.version.clone(),
-                fixed_version: hit.fixed,
-                severity: band(cvss_score),
-                cvss_score,
-                cvss_vector,
-                kev,
-            });
-        }
-        candidates.extend(collapse(package_candidates));
+        candidates.extend(
+            match_package_parts(
+                cache,
+                ecosystem_name,
+                &package.name,
+                &package.version,
+                package.source_name.as_deref(),
+            )
+            .await?,
+        );
     }
     if candidates.len() > MAX_CANDIDATES {
         candidates.sort_by(most_severe);
@@ -119,6 +82,79 @@ pub async fn match_inventory(
         candidates.truncate(MAX_CANDIDATES);
     }
     Ok(candidates)
+}
+
+/// The candidates of one package whose ecosystem is known, matched exactly the
+/// way [`match_inventory`] matches an inventory's packages: the same range
+/// evaluation, withdrawn records, alias collapsing, KEV and CVSS.
+///
+/// # Errors
+///
+/// Any database error reading the cache.
+pub async fn match_package(
+    cache: &Cache,
+    ecosystem: &str,
+    package: &str,
+    version: &str,
+) -> Result<Vec<Candidate>, sqlx::Error> {
+    match_package_parts(cache, ecosystem, package, version, None).await
+}
+
+/// One package's candidates. `source_name` is the source package an inventory
+/// names, which only a distribution's records are keyed by.
+async fn match_package_parts(
+    cache: &Cache,
+    ecosystem: &str,
+    package: &str,
+    version: &str,
+    source_name: Option<&str>,
+) -> Result<Vec<Candidate>, sqlx::Error> {
+    if order_for(ecosystem).is_none() {
+        return Ok(Vec::new());
+    }
+    let names = lookup_names(ecosystem, package, source_name);
+    // Only a distribution's source package is a different package; a
+    // PyPI normalized name is the same one spelled differently.
+    let by_source = is_distro(ecosystem);
+    let mut seen = HashSet::new();
+    let mut found = Vec::new();
+    for lookup in names {
+        for row in cache.affected_for(ecosystem, &lookup).await? {
+            if seen.insert(row.id.clone()) {
+                found.push((lookup.clone(), row));
+            }
+        }
+    }
+    let mut package_candidates = Vec::new();
+    for (lookup, row) in found {
+        if row.withdrawn.is_some() {
+            continue;
+        }
+        let Some(hit) = evaluate(ecosystem, version, &row.ranges, &row.versions) else {
+            continue;
+        };
+        let aliases = aliases(&row);
+        let (cvss_score, cvss_vector) = match cvss(&row.severity) {
+            Some((score, vector)) => (Some(score), Some(vector)),
+            None => (None, None),
+        };
+        let kev = cache.is_kev(&kev_ids(&row.id, &aliases)).await?;
+        package_candidates.push(Candidate {
+            vuln_id: row.id,
+            aliases,
+            summary: row.summary,
+            ecosystem: ecosystem.to_string(),
+            package: package.to_string(),
+            source_package: (by_source && lookup != package).then_some(lookup),
+            installed_version: version.to_string(),
+            fixed_version: hit.fixed,
+            severity: band(cvss_score),
+            cvss_score,
+            cvss_vector,
+            kev,
+        });
+    }
+    Ok(collapse(package_candidates))
 }
 
 /// The order `trusted` decides for a package, or `None` when its ecosystem
@@ -137,27 +173,23 @@ fn is_distro(ecosystem: &str) -> bool {
 }
 
 /// The package names to look up, most specific first.
-fn lookup_names(package: &InventoryPackageWire) -> Vec<String> {
-    if is_distro(&package.ecosystem) {
+fn lookup_names(ecosystem: &str, package: &str, source_name: Option<&str>) -> Vec<String> {
+    if is_distro(ecosystem) {
         // OSV keys a distribution's records by source package, so the binary
         // name is never looked up when a source package is named.
-        return match package
-            .source_name
-            .as_deref()
-            .filter(|source| !source.is_empty())
-        {
+        return match source_name.filter(|source| !source.is_empty()) {
             Some(source) => vec![source.to_owned()],
-            None => vec![package.name.clone()],
+            None => vec![package.to_owned()],
         };
     }
     let mut names = Vec::new();
-    if package.ecosystem == "PyPI" {
-        let normalized = normalize_pypi(&package.name);
-        if normalized != package.name && !normalized.is_empty() {
+    if ecosystem == "PyPI" {
+        let normalized = normalize_pypi(package);
+        if normalized != package && !normalized.is_empty() {
             names.push(normalized);
         }
     }
-    names.push(package.name.clone());
+    names.push(package.to_owned());
     names
 }
 

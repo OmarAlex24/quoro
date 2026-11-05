@@ -1,7 +1,9 @@
 #!/bin/sh
 # Verify a downloaded release tarball: its checksum line in the adjacent
 # SHA256SUMS file and its GitHub artifact attestation (Sigstore, SLSA build
-# provenance). Prints VERIFIED only when both checks pass.
+# provenance). When the release also carries its CycloneDX SBOM next to the
+# tarball, that file is verified the same way. Prints VERIFIED only when every
+# check passes.
 #
 # A workflow_dispatch dry run (ADR 0082) builds the same artifact from a branch
 # and attests it against that branch ref. It is not a release, so it is verified
@@ -17,8 +19,11 @@ usage: packaging/verify-release.sh <tarball> <tag> [--bundle <file>]
        packaging/verify-release.sh <tarball> --dry-run-ref <ref> [--bundle <file>]
 
 Verifies <tarball> against the SHA256SUMS file next to it (when present) and
-against its GitHub artifact attestation. <tag> is the release tag the artifact
-must have been built from, for example v0.1.0.
+against its GitHub artifact attestation. When the release's SBOM (the tarball
+name with .tar.gz replaced by .cdx.json) sits next to it, that SBOM is verified
+against the same SHA256SUMS and its own attestation.
+<tag> is the release tag the artifact must have been built from, for example
+v0.1.0.
 
 With --dry-run-ref <ref> the artifact is treated as a workflow_dispatch dry run
 (not a release) and must have been attested from <ref>, which must be
@@ -143,43 +148,79 @@ dir=$(dirname "$tarball")
 base=$(basename "$tarball")
 
 # (a) Checksum. --ignore-missing would silently pass when the file has no line
-# for this tarball, so the line is required explicitly first.
-if [ -f "$dir/SHA256SUMS" ]; then
-	awk -v file="$base" '
-		{
-			name = $2
-			sub(/^\*/, "", name)
-			if (name == file) {
-				found = 1
-				exit
+# for the artifact, so the line is required explicitly first.
+check_checksum() {
+	cfile=$1
+	cdir=$(dirname "$cfile")
+	cbase=$(basename "$cfile")
+	if [ -f "$cdir/SHA256SUMS" ]; then
+		awk -v file="$cbase" '
+			{
+				name = $2
+				sub(/^\*/, "", name)
+				if (name == file) {
+					found = 1
+					exit
+				}
 			}
-		}
-		END {
-			if (!found) {
-				exit 1
+			END {
+				if (!found) {
+					exit 1
+				}
 			}
-		}
-	' "$dir/SHA256SUMS" || die "SHA256SUMS has no entry for $base"
+		' "$cdir/SHA256SUMS" || die "SHA256SUMS has no entry for $cbase"
 
-	(
-		cd "$dir"
-		sha256sum -c --ignore-missing SHA256SUMS
-	) || die "checksum mismatch for $base"
-	printf 'checksum: ok\n'
-else
-	printf 'checksum: skipped (no SHA256SUMS next to %s)\n' "$base" >&2
-fi
+		(
+			cd "$cdir"
+			sha256sum -c --ignore-missing SHA256SUMS
+		) || die "checksum mismatch for $cbase"
+		printf 'checksum: ok\n'
+	else
+		printf 'checksum: skipped (no SHA256SUMS next to %s)\n' "$cbase" >&2
+	fi
+}
 
 # (b) Attestation: binds these bytes to a workflow run in this repository, on
-# this tag (or branch, for a dry run), on a GitHub-hosted runner.
-gh attestation verify "$tarball" \
-	--bundle "$bundle" \
-	--repo "$repo" \
-	--signer-workflow "$signer" \
-	--source-ref "$source_ref" \
-	--deny-self-hosted-runners || die "attestation verification failed"
+# this tag (or branch, for a dry run), on a GitHub-hosted runner. Without a
+# local bundle, gh fetches the attestation from the API.
+check_attestation() {
+	afile=$1
+	abundle=$2
+	if [ -n "$abundle" ]; then
+		gh attestation verify "$afile" \
+			--bundle "$abundle" \
+			--repo "$repo" \
+			--signer-workflow "$signer" \
+			--source-ref "$source_ref" \
+			--deny-self-hosted-runners || die "attestation verification failed for $(basename "$afile")"
+	else
+		gh attestation verify "$afile" \
+			--repo "$repo" \
+			--signer-workflow "$signer" \
+			--source-ref "$source_ref" \
+			--deny-self-hosted-runners || die "attestation verification failed for $(basename "$afile")"
+	fi
+	printf 'attestation: ok (%s from %s at %s)\n' "$repo" "$signer" "$source_ref"
+}
 
-printf 'attestation: ok (%s from %s at %s)\n' "$repo" "$signer" "$source_ref"
+check_checksum "$tarball"
+check_attestation "$tarball" "$bundle"
+
+# Releases from M5a on also publish the CycloneDX SBOM next to the tarball, with
+# the same checksum line and its own attestation. A release without it is
+# verified exactly as before.
+sbom=${base%.tar.gz}.cdx.json
+if [ -f "$dir/$sbom" ]; then
+	printf 'sbom: %s\n' "$sbom"
+	check_checksum "$dir/$sbom"
+	sbom_bundle="$dir/$sbom.sigstore.jsonl"
+	if [ -f "$sbom_bundle" ]; then
+		check_attestation "$dir/$sbom" "$sbom_bundle"
+	else
+		check_attestation "$dir/$sbom" ""
+	fi
+fi
+
 if [ -n "$dry_run_ref" ]; then
 	printf 'VERIFIED (dry run from %s, not a release)\n' "$dry_run_ref"
 else
