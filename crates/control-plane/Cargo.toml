@@ -61,6 +61,11 @@ pep440_rs = { version = "0.7.3", default-features = false }
 # CVSS base scores from a record's v3 and v4 vectors, for its severity band.
 cvss = { version = "3", default-features = false, features = ["std", "v3", "v4"] }
 
+[build-dependencies]
+# `build.rs` writes the embedded component list, so it reads and rewrites the
+# SBOM's JSON with the version this crate already uses.
+serde_json = { version = "1", default-features = false, features = ["std"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
 quoro-types = { path = "../types" }

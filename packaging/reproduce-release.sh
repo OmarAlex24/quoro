@@ -1,8 +1,8 @@
 #!/bin/sh
 # Rebuild a published release (or a dry-run artifact) from its source and
-# compare the tarball hash with the published SHA256SUMS. A build is
-# reproducible when this prints REPRODUCIBLE; anything else is a MISMATCH or a
-# broken environment.
+# compare the tarball and, when the release published one, the CycloneDX SBOM
+# with the published SHA256SUMS. A build is reproducible when this prints
+# REPRODUCIBLE; anything else is a MISMATCH or a broken environment.
 #
 # The rebuild runs in the release build image (ADR 0090) through the clone's
 # own packaging/build-in-container.sh, so an old tag is rebuilt with the image
@@ -16,7 +16,10 @@ usage: packaging/reproduce-release.sh <tag> [--sums <path-or-https-url>]
 
 Fetches the source into a fresh temporary directory, rebuilds the release
 artifact there in the release build image and compares its sha256 with the
-published SHA256SUMS.
+published SHA256SUMS. When the published SHA256SUMS also has a line for the
+CycloneDX SBOM, the rebuilt SBOM is compared the same way; a release published
+before the SBOM existed reports "sbom: not published" and is judged on the
+tarball alone.
 
 <tag> is a release tag, with or without the leading v (v0.1.0 or 0.1.0). Its
 SHA256SUMS defaults to the one attached to the GitHub release.
@@ -43,6 +46,27 @@ EOF
 die() {
 	printf 'error: %s\n' "$*" >&2
 	exit 1
+}
+
+# Print the sha256 that SHA256SUMS records for one file name, or fail when it
+# has no line for it. Reads the global $sums_file.
+sums_entry() {
+	awk -v file="$1" '
+		{
+			name = $2
+			sub(/^\*/, "", name)
+			if (name == file) {
+				print tolower($1)
+				found = 1
+				exit
+			}
+		}
+		END {
+			if (!found) {
+				exit 1
+			}
+		}
+	' "$sums_file"
 }
 
 [ "$#" -ge 1 ] || {
@@ -200,24 +224,7 @@ set -- "$src"/dist/quoro-*-x86_64-unknown-linux-musl.tar.gz
 built=$1
 tarball=${built##*/}
 
-expected=$(
-	awk -v file="$tarball" '
-		{
-			name = $2
-			sub(/^\*/, "", name)
-			if (name == file) {
-				print tolower($1)
-				found = 1
-				exit
-			}
-		}
-		END {
-			if (!found) {
-				exit 1
-			}
-		}
-	' "$sums_file"
-) || die "SHA256SUMS has no entry for $tarball"
+expected=$(sums_entry "$tarball") || die "SHA256SUMS has no entry for $tarball"
 
 actual=$(sha256sum "$built") || die "cannot hash $built"
 actual=${actual%% *}
@@ -227,7 +234,38 @@ printf 'source commit:        %s\n' "$commit"
 printf 'expected (published): %s\n' "$expected"
 printf 'actual   (rebuilt):   %s\n' "$actual"
 
+tarball_ok=0
 if [ "$actual" = "$expected" ]; then
+	tarball_ok=1
+fi
+
+# A release from M5a on also publishes the SBOM, and then every published
+# artifact must match. An older release has no SBOM line: it is judged on the
+# tarball alone, as before.
+sbom=${tarball%.tar.gz}.cdx.json
+built_sbom="$src/dist/$sbom"
+sbom_ok=1
+if sbom_expected=$(sums_entry "$sbom"); then
+	printf 'sbom:                 %s\n' "$sbom"
+	printf 'expected (published): %s\n' "$sbom_expected"
+	if [ ! -f "$built_sbom" ]; then
+		printf 'actual   (rebuilt):   missing\n'
+		sbom_ok=0
+	else
+		sbom_actual=$(sha256sum "$built_sbom") || die "cannot hash $built_sbom"
+		sbom_actual=${sbom_actual%% *}
+		printf 'actual   (rebuilt):   %s\n' "$sbom_actual"
+		if [ "$sbom_actual" = "$sbom_expected" ]; then
+			sbom_ok=1
+		else
+			sbom_ok=0
+		fi
+	fi
+else
+	printf 'sbom: not published\n'
+fi
+
+if [ "$tarball_ok" = "1" ] && [ "$sbom_ok" = "1" ]; then
 	printf 'REPRODUCIBLE\n'
 	exit 0
 fi

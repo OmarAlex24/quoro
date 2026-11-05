@@ -1,11 +1,11 @@
 #!/bin/sh
-# Build the release artifact for one version: a static musl binary tarball and
-# its SHA256SUMS. The build is reproducible: every input that can leak into
-# the bytes (clock, paths, locale, archive metadata, toolchain flags) is
-# pinned here, and the build environment itself (C compiler, binutils, musl)
-# is pinned by the release build image. Release builds run this script through
-# packaging/build-in-container.sh. See packaging/README.md, ADR 0027 and
-# ADR 0090.
+# Build the release artifact for one version: a static musl binary tarball, its
+# CycloneDX SBOM and its SHA256SUMS. The build is reproducible: every input that
+# can leak into the bytes (clock, paths, locale, archive metadata, toolchain
+# flags) is pinned here, and the build environment itself (C compiler, binutils,
+# musl) is pinned by the release build image. Release builds run this script
+# through packaging/build-in-container.sh. See packaging/README.md, ADR 0027,
+# ADR 0090 and ADR 0138.
 set -eu
 
 usage() {
@@ -13,10 +13,11 @@ usage() {
 usage: packaging/build-release.sh [VERSION]
        packaging/build-release.sh --print-version
 
-Builds dist/quoro-VERSION-x86_64-unknown-linux-musl.tar.gz and dist/SHA256SUMS
-from the current checkout. VERSION defaults to the version of the Cargo
-package named by QUORO_PACKAGE (default: quoro). --print-version prints that
-default on stdout and exits without building.
+Builds dist/quoro-VERSION-x86_64-unknown-linux-musl.tar.gz,
+dist/quoro-VERSION-x86_64-unknown-linux-musl.cdx.json (the CycloneDX 1.6 SBOM)
+and dist/SHA256SUMS from the current checkout. VERSION defaults to the version
+of the Cargo package named by QUORO_PACKAGE (default: quoro). --print-version
+prints that default on stdout and exits without building.
 
 A release build runs inside the release build image: use
 packaging/build-in-container.sh, which takes the same arguments. Run directly
@@ -33,6 +34,10 @@ Environment:
 The panel is built before cargo because rust-embed compiles panel/dist into the
 binary. The panel toolchain is pinned in packaging/node.txt: put that Node.js
 first on PATH (packaging/fetch-node.sh <dir> prints its bin directory).
+
+The SBOM component list is built from cargo metadata, panel/package-lock.json and
+the pinned artifacts, then exported as QUORO_SBOM_COMPONENTS so that the control
+plane embeds it. It needs python3.
 EOF
 }
 
@@ -123,6 +128,11 @@ if [ "$print_version" = "1" ]; then
 	printf '%s\n' "$version"
 	exit 0
 fi
+
+# The SBOM is built and written with python3 (standard library only); the
+# release build image ships 3.12.
+command -v python3 >/dev/null 2>&1 ||
+	die "python3 is required to build the SBOM but is not on PATH"
 
 # The release build image (packaging/container/Containerfile) pins the C
 # compiler, binutils and musl, which reach the binary through C dependencies.
@@ -255,6 +265,27 @@ else
 	note "note: musl-gcc not found; C dependencies would fall back to the default compiler"
 fi
 
+# The SBOM lists every crate compiled into the two binaries, so it is derived
+# from the same locked dependency graph the build uses (ADR 0138). It runs after
+# the panel build and before cargo: the npm packages come from the panel's
+# lockfile, not from node_modules. The absolute path is exported so the control
+# plane's build script can compile the same list into the binary.
+mkdir -p "$CARGO_TARGET_DIR"
+metadata_file="$CARGO_TARGET_DIR/cargo-metadata.json"
+cargo +"$channel" metadata --format-version 1 --locked \
+	--filter-platform x86_64-unknown-linux-musl >"$metadata_file" ||
+	die "cargo metadata failed; the SBOM needs it"
+QUORO_SBOM_COMPONENTS="$CARGO_TARGET_DIR/sbom-components.json"
+python3 -I packaging/sbom.py components \
+	--metadata "$metadata_file" \
+	--lockfile panel/package-lock.json \
+	--pins crates/engine/pins.txt \
+	--pins crates/ingress/pins.txt \
+	--buildkit crates/node-agent/pins.txt \
+	--out "$QUORO_SBOM_COMPONENTS" ||
+	die "the SBOM component list could not be built"
+export QUORO_SBOM_COMPONENTS
+
 # Both binaries ship: quoro is the service, quoro-init is PID 1 inside every
 # microVM. One invocation so they share the exact same environment.
 cargo +"$channel" build --release --locked --target x86_64-unknown-linux-musl \
@@ -336,12 +367,26 @@ tar --sort=name \
 gzip -9 -n -c "$archive" >"dist/$tarball"
 rm -f "$archive"
 
+# The SBOM lists what the tarball ships and hashes it into SHA256SUMS next to
+# the tarball. Its timestamp is normalised like the rest of the release, so a
+# rebuild produces the same bytes (ADR 0138).
+sbom="$name.cdx.json"
+python3 -I packaging/sbom.py document \
+	--components "$QUORO_SBOM_COMPONENTS" \
+	--version "$version" \
+	--tarball "dist/$tarball" \
+	--source-date-epoch "$SOURCE_DATE_EPOCH" \
+	--out "dist/$sbom" ||
+	die "the SBOM document could not be built"
+touch -h -d "@$SOURCE_DATE_EPOCH" "dist/$sbom"
+
 (
 	cd dist
-	sha256sum "$tarball" >SHA256SUMS
+	sha256sum "$tarball" "$sbom" >SHA256SUMS
 )
 
 printf 'built: dist/%s\n' "$tarball"
 printf 'sha256(binary): %s\n' "$(sha256sum "$binary")"
 printf 'sha256(quoro-init): %s\n' "$(sha256sum "$init_binary")"
 printf 'sha256(tarball): %s\n' "$(sha256sum "dist/$tarball")"
+printf 'sha256(sbom): %s\n' "$(sha256sum "dist/$sbom")"

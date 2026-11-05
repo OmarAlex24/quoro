@@ -21,9 +21,12 @@
 //! - [`ingest`] assembles the inventory parts nodes send and stores them.
 //! - [`matcher`] matches one inventory against the cached OSV records.
 //! - [`findings`] writes the findings and runs the matcher loop.
+//! - [`components`] is the component list the running release embeds.
+//! - [`subjects`] matches the release's components and the nodes' kernels.
 
 pub mod cache;
 pub mod changes;
+pub mod components;
 pub mod ecosystem;
 pub mod fetch;
 pub mod findings;
@@ -35,6 +38,7 @@ pub mod mirror;
 pub mod osv;
 pub mod severity;
 pub mod status;
+pub mod subjects;
 pub mod version;
 
 pub use cache::{AffectedRow, BucketState, Cache};

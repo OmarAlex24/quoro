@@ -19,14 +19,16 @@ use crate::error::ApiError;
 use crate::events::{self, StoredEvent};
 use crate::service::incidents;
 use crate::store::now_rfc3339;
+use crate::vulns::components;
 use crate::vulns::ecosystem;
 use crate::vulns::matcher::{self, Candidate};
+use crate::vulns::subjects;
 use quoro_proto::inventory::InventoryObject;
 use quoro_types::{Prefix, new_id};
 use serde_json::{Value, json};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqliteConnection};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -48,6 +50,48 @@ pub struct Reconciled {
     pub resolved: usize,
 }
 
+/// One finding a non-app subject should have, as [`apply_subject`] writes it.
+pub(crate) struct DesiredFinding {
+    /// The row's `component`: the component's name, for a `quoro` finding.
+    pub component: Option<String>,
+    /// The row's `node_id`, for a `host_kernel` finding.
+    pub node_id: Option<String>,
+    /// The match, with `installed_version` already the value the row records.
+    pub candidate: Candidate,
+}
+
+/// What makes two open findings of one subject the same row, as the unique
+/// index on open findings does.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SubjectKey {
+    component: String,
+    node_id: String,
+    vuln_id: String,
+    package: String,
+}
+
+impl SubjectKey {
+    /// The key of a desired finding.
+    fn desired(finding: &DesiredFinding) -> Self {
+        Self {
+            component: finding.component.clone().unwrap_or_default(),
+            node_id: finding.node_id.clone().unwrap_or_default(),
+            vuln_id: finding.candidate.vuln_id.clone(),
+            package: finding.candidate.package.clone(),
+        }
+    }
+
+    /// The key of a stored row.
+    fn row(row: &FindingRow) -> Self {
+        Self {
+            component: row.component.clone().unwrap_or_default(),
+            node_id: row.node_id.clone().unwrap_or_default(),
+            vuln_id: row.vuln_id.clone(),
+            package: row.package.clone(),
+        }
+    }
+}
+
 /// The columns of one finding row, in the order [`FindingRow`] reads them.
 const FINDING_COLUMNS: &str = "id, subject_kind, app_id, project_id, image_digest, node_id, \
      component, vuln_id, aliases, summary, ecosystem, package, source_package, \
@@ -56,7 +100,7 @@ const FINDING_COLUMNS: &str = "id, subject_kind, app_id, project_id, image_diges
 
 /// One row of `vulnerability_findings`, as the matcher reads and writes it.
 #[derive(Clone, Debug)]
-struct FindingRow {
+pub(crate) struct FindingRow {
     id: String,
     subject_kind: String,
     app_id: Option<String>,
@@ -116,14 +160,30 @@ impl FindingRow {
 
     /// A new open finding for one app and candidate.
     fn new(app_id: &str, project_id: &str, digest: &str, candidate: &Candidate, now: &str) -> Self {
+        let mut row = Self::new_subject("app", None, None, candidate, now);
+        row.app_id = Some(app_id.to_owned());
+        row.project_id = Some(project_id.to_owned());
+        row.image_digest = Some(digest.to_owned());
+        row
+    }
+
+    /// A new open finding for one non-app subject: a component of the release,
+    /// or a node's host kernel.
+    pub(crate) fn new_subject(
+        subject_kind: &str,
+        component: Option<&str>,
+        node_id: Option<&str>,
+        candidate: &Candidate,
+        now: &str,
+    ) -> Self {
         Self {
             id: crate::deploy::new_id_with_prefix("vln"),
-            subject_kind: "app".to_owned(),
-            app_id: Some(app_id.to_owned()),
-            project_id: Some(project_id.to_owned()),
-            image_digest: Some(digest.to_owned()),
-            node_id: None,
-            component: None,
+            subject_kind: subject_kind.to_owned(),
+            app_id: None,
+            project_id: None,
+            image_digest: None,
+            node_id: node_id.map(str::to_owned),
+            component: component.map(str::to_owned),
             vuln_id: candidate.vuln_id.clone(),
             aliases: candidate.aliases.clone(),
             summary: candidate.summary.clone(),
@@ -144,6 +204,21 @@ impl FindingRow {
         }
     }
 
+    /// The row's `component`.
+    pub(crate) fn component(&self) -> Option<&str> {
+        self.component.as_deref()
+    }
+
+    /// The row's `node_id`.
+    pub(crate) fn node_id(&self) -> Option<&str> {
+        self.node_id.as_deref()
+    }
+
+    /// The row's `installed_version`.
+    pub(crate) fn installed_version(&self) -> &str {
+        &self.installed_version
+    }
+
     /// Whether the row holds a vulnerability that opens the incident.
     fn qualifying(&self) -> bool {
         self.kev || self.cvss_score.is_some_and(|score| score >= CRITICAL_SCORE)
@@ -151,8 +226,13 @@ impl FindingRow {
 
     /// Whether the stored values differ from `candidate` for the current image.
     fn differs(&self, candidate: &Candidate, digest: &str) -> bool {
-        self.image_digest.as_deref() != Some(digest)
-            || self.installed_version != candidate.installed_version
+        self.image_digest.as_deref() != Some(digest) || self.differs_subject(candidate)
+    }
+
+    /// Whether the stored values differ from `candidate` for a subject whose
+    /// row carries no image digest.
+    fn differs_subject(&self, candidate: &Candidate) -> bool {
+        self.installed_version != candidate.installed_version
             || self.fixed_version != candidate.fixed_version
             || self.severity != candidate.severity
             || self.cvss_score != candidate.cvss_score
@@ -167,6 +247,12 @@ impl FindingRow {
     /// Copies the candidate's values into this row.
     fn apply(&mut self, candidate: &Candidate, digest: &str, now: &str) {
         self.image_digest = Some(digest.to_owned());
+        self.apply_candidate(candidate, now);
+    }
+
+    /// Copies the candidate's values into this row, leaving the subject's own
+    /// columns (`image_digest`, `component`, `node_id`) alone.
+    fn apply_candidate(&mut self, candidate: &Candidate, now: &str) {
         self.aliases = candidate.aliases.clone();
         self.summary = candidate.summary.clone();
         self.ecosystem = candidate.ecosystem.clone();
@@ -435,6 +521,106 @@ async fn open_findings(
     rows.iter().map(FindingRow::from_row).collect()
 }
 
+/// Writes one non-app subject's findings in one transaction: a new row, a
+/// changed row, or a resolved one.
+///
+/// `reason` says why a finding of this subject that the match no longer names
+/// is resolved. Nothing else happens: these subjects raise no event and open no
+/// incident (events.schema.json `data_app_vulnerable`).
+///
+/// # Errors
+///
+/// A database error, or an error writing the change log.
+pub(crate) async fn apply_subject(
+    state: &AppState,
+    subject_kind: &str,
+    desired: Vec<DesiredFinding>,
+    reason: impl Fn(&FindingRow) -> &'static str,
+) -> Result<Reconciled, ApiError> {
+    let mut w = state.store.begin_write().await?;
+    let rows = open_subject_findings(&mut w.tx, subject_kind).await?;
+    let mut existing: HashMap<SubjectKey, FindingRow> = rows
+        .into_iter()
+        .map(|row| (SubjectKey::row(&row), row))
+        .collect();
+    let now = now_rfc3339();
+    let actor = Actor::system("vulnerabilities");
+    let mut reconciled = Reconciled::default();
+    // One record can be published twice for the same package (two ranges); the
+    // first match is the finding.
+    let mut written: HashSet<SubjectKey> = HashSet::new();
+
+    for desired in desired {
+        let key = SubjectKey::desired(&desired);
+        if !written.insert(key.clone()) {
+            continue;
+        }
+        if let Some(mut row) = existing.remove(&key) {
+            if !row.differs_subject(&desired.candidate) {
+                continue;
+            }
+            row.apply_candidate(&desired.candidate, &now);
+            update_row(&mut w.tx, &row).await?;
+            changelog::append(
+                &mut w.tx,
+                &actor,
+                "vulnerability_finding",
+                &row.id,
+                Op::Update,
+                row.payload(),
+            )
+            .await?;
+            reconciled.updated += 1;
+        } else {
+            let row = FindingRow::new_subject(
+                subject_kind,
+                desired.component.as_deref(),
+                desired.node_id.as_deref(),
+                &desired.candidate,
+                &now,
+            );
+            insert_row(&mut w.tx, &row).await?;
+            changelog::append(
+                &mut w.tx,
+                &actor,
+                "vulnerability_finding",
+                &row.id,
+                Op::Create,
+                row.payload(),
+            )
+            .await?;
+            reconciled.inserted += 1;
+        }
+    }
+
+    // Whatever the matcher no longer found is resolved.
+    let mut remaining: Vec<FindingRow> = existing.into_values().collect();
+    remaining.sort_by(|left, right| left.id.cmp(&right.id));
+    for mut row in remaining {
+        let resolved_reason = reason(&row);
+        resolve_row(&mut w.tx, &mut row, resolved_reason, &now, &actor).await?;
+        reconciled.resolved += 1;
+    }
+
+    w.commit().await?;
+    Ok(reconciled)
+}
+
+/// The open findings of one non-app subject.
+async fn open_subject_findings(
+    conn: &mut SqliteConnection,
+    subject_kind: &str,
+) -> Result<Vec<FindingRow>, ApiError> {
+    let rows = sqlx::query(&format!(
+        "SELECT {FINDING_COLUMNS} FROM vulnerability_findings \
+         WHERE subject_kind = ? AND resolved_at IS NULL ORDER BY id"
+    ))
+    .bind(subject_kind)
+    .fetch_all(&mut *conn)
+    .await?;
+    rows.iter().map(FindingRow::from_row).collect()
+}
+
 async fn insert_row(conn: &mut SqliteConnection, row: &FindingRow) -> Result<(), ApiError> {
     sqlx::query(INSERT_FINDING)
         .bind(&row.id)
@@ -608,7 +794,8 @@ pub fn wake_matcher() {
     wake().notify_one();
 }
 
-/// One pass over every app whose fingerprint changed.
+/// One pass over every app whose fingerprint changed, then over the two
+/// non-app subjects.
 pub async fn run_once(state: &AppState) {
     let generation = match state.vulns.cache().generation().await {
         Ok(generation) => generation,
@@ -617,6 +804,9 @@ pub async fn run_once(state: &AppState) {
             return;
         }
     };
+    // The release's own components need their ecosystems' data; `Linux` is
+    // always fetched, so only the package ecosystems are asked for.
+    subjects::want_ecosystems(state);
     let mut apps: BTreeSet<String> = BTreeSet::new();
     match sqlx::query_as::<_, (String,)>("SELECT id FROM apps ORDER BY id")
         .fetch_all(state.store.pool())
@@ -666,6 +856,98 @@ pub async fn run_once(state: &AppState) {
             }
         }
     }
+
+    reconcile_quoro_subject(state, generation).await;
+    reconcile_host_kernel_subject(state, generation).await;
+}
+
+/// The fingerprint of one non-app subject: the cache generation plus what it
+/// reconciles.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SubjectFingerprint {
+    /// The release's component list, named by [`components::embedded_hash`].
+    Quoro(i64, String),
+    /// Every node with the `node` role: id, kernel release and status.
+    HostKernels(i64, Vec<(String, String, String)>),
+}
+
+fn subject_fingerprints() -> &'static Mutex<HashMap<String, SubjectFingerprint>> {
+    static FINGERPRINTS: OnceLock<Mutex<HashMap<String, SubjectFingerprint>>> = OnceLock::new();
+    FINGERPRINTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The key one subject's fingerprint is held under. The cluster id keeps two
+/// primaries in one process (as the tests run them) apart.
+fn subject_key(state: &AppState, subject_kind: &str) -> String {
+    format!("{}:{subject_kind}", state.cluster_id)
+}
+
+/// Reconciles the release's own components when the cache or the component
+/// list changed since the last pass.
+async fn reconcile_quoro_subject(state: &AppState, generation: i64) {
+    let key = subject_key(state, "quoro");
+    let fingerprint = SubjectFingerprint::Quoro(generation, components::embedded_hash().to_owned());
+    {
+        let fingerprints = subject_fingerprints()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if fingerprints.get(&key) == Some(&fingerprint) {
+            return;
+        }
+    }
+    match subjects::reconcile_quoro(state).await {
+        Ok(_) => remember_subject_fingerprint(&key, fingerprint),
+        Err(error) => {
+            tracing::warn!(error = ?error, "cannot reconcile Quoro's own findings");
+        }
+    }
+}
+
+/// Reconciles every node's host kernel when the cache or the nodelist changed
+/// since the last pass.
+async fn reconcile_host_kernel_subject(state: &AppState, generation: i64) {
+    let nodes = match subjects::node_kernels(state).await {
+        Ok(nodes) => nodes,
+        Err(error) => {
+            tracing::warn!(error = ?error, "cannot read the nodes' host kernels");
+            return;
+        }
+    };
+    let key = subject_key(state, "host_kernel");
+    let fingerprint = SubjectFingerprint::HostKernels(
+        generation,
+        nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.node_id.clone(),
+                    node.kernel.clone(),
+                    node.status.clone(),
+                )
+            })
+            .collect(),
+    );
+    {
+        let fingerprints = subject_fingerprints()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if fingerprints.get(&key) == Some(&fingerprint) {
+            return;
+        }
+    }
+    match subjects::reconcile_host_kernels(state, &nodes).await {
+        Ok(_) => remember_subject_fingerprint(&key, fingerprint),
+        Err(error) => {
+            tracing::warn!(error = ?error, "cannot reconcile the host kernels' findings");
+        }
+    }
+}
+
+fn remember_subject_fingerprint(key: &str, fingerprint: SubjectFingerprint) {
+    subject_fingerprints()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key.to_owned(), fingerprint);
 }
 
 /// Starts the matcher loop: one pass at start, then on a wake-up or every
