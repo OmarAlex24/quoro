@@ -6,11 +6,16 @@ import type {
   AppEnvReplaceRequest,
   AppEnvVar,
   AppList,
+  AuditExportList,
+  Backup,
+  BackupList,
+  BackupRepositoryList,
   ChangePasswordRequest,
   CreateAppRequest,
   CreateDeploymentRequest,
   CreateDomainRequest,
   CreateProjectRequest,
+  CreateVolumeRequest,
   CreateVmRequest,
   Deployment,
   DeploymentList,
@@ -25,9 +30,12 @@ import type {
   Project,
   ProjectList,
   SetupRequest,
+  UpdateAppRequest,
   User,
   Vm,
   VmList,
+  Volume,
+  VolumeList,
 } from '../api/generated/model';
 import { getHealthMock } from '../api/generated/health/health.msw';
 import { getAuthMock } from '../api/generated/auth/auth.msw';
@@ -54,14 +62,18 @@ import {
   db,
   findApp,
   findDeployment,
+  mockHaCost,
   mockId,
   now,
   runDeployment,
   schedule,
 } from './db';
 import {
+  conflict,
   isIntAtLeast,
   json,
+  notFound,
+  page,
   problem,
   readJson,
   signedIn,
@@ -92,6 +104,7 @@ const TLS_MODES = new Set(['acme', 'tunnel']);
 
 const appDetail = (app: App): AppDetail => ({
   ...app,
+  ha_cost: mockHaCost(app),
   instances: db.vms.filter((vm) => vm.app_id === app.id),
   domains: db.domains.filter((domain) => domain.app_id === app.id),
   edge_backends: db.edgeBackends[app.id] ?? [],
@@ -544,6 +557,80 @@ export const handlers = [
     return json(appDetail(app));
   }),
 
+  http.patch('*/api/v1/apps/:appId', async ({ request, params }) => {
+    const user = signedIn();
+    if (!user) return unauthorized();
+    if (user.role === 'viewer') return writeRefusal('app:update');
+
+    const app = findApp(String(params.appId));
+    if (!app) {
+      return problem(404, 'not_found', { detail: 'That app no longer exists.' });
+    }
+    const body = await readJson<UpdateAppRequest>(request);
+    if (!body) return validationFailed('The form could not be read. Try again.');
+
+    if (body.name !== undefined) {
+      const name = body.name.trim();
+      if (!APP_NAME_PATTERN.test(name)) {
+        return validationFailed('App name must be 1-40 lowercase letters, digits or dashes.');
+      }
+      if (
+        db.apps.some(
+          (candidate) =>
+            candidate.id !== app.id &&
+            candidate.project_id === app.project_id &&
+            candidate.name === name,
+        )
+      ) {
+        return conflict(`An app named "${name}" already exists in that project.`);
+      }
+      app.name = name;
+    }
+
+    if (body.port !== undefined) {
+      if (!isIntAtLeast(body.port, 1) || body.port > 65_535) {
+        return validationFailed('Port must be a whole number between 1 and 65535.');
+      }
+      app.port = body.port;
+    }
+
+    if (body.ha_policy !== undefined) {
+      if (body.ha_policy === 'warm' || body.ha_policy === 'hot') {
+        return validationFailed('Warm and hot HA are not in this release.');
+      }
+      if (body.ha_policy === 'cold') {
+        const volume = db.volumes.find(
+          (candidate) =>
+            candidate.app_id === app.id &&
+            (candidate.state === 'creating' ||
+              candidate.state === 'ready' ||
+              candidate.state === 'restoring'),
+        );
+        if (!volume) return conflict('Cold HA needs a volume. Add one to the app first.');
+        if (db.backupRepositories.length === 0) {
+          return conflict('Cold HA needs a backup repository.');
+        }
+      }
+      app.ha_policy = body.ha_policy;
+    }
+
+    if (body.backup_schedule !== undefined) {
+      if (
+        !isIntAtLeast(body.backup_schedule.interval_h, 1) ||
+        body.backup_schedule.interval_h > 168
+      ) {
+        return validationFailed('The backup interval must be 1 to 168 hours.');
+      }
+      if (!isIntAtLeast(body.backup_schedule.keep, 1) || body.backup_schedule.keep > 100) {
+        return validationFailed('Keep must be a whole number from 1 to 100.');
+      }
+      app.backup_schedule = { ...body.backup_schedule };
+    }
+
+    app.updated_at = now();
+    return json({ ...app, ha_cost: mockHaCost(app) });
+  }),
+
   http.delete('*/api/v1/apps/:appId', ({ params }) => {
     const user = signedIn();
     if (!user) return unauthorized();
@@ -695,6 +782,199 @@ export const handlers = [
 
     db.appEnv[app.id] = items;
     return json({ items } satisfies AppEnvList);
+  }),
+
+  http.get('*/api/v1/apps/:appId/volumes', ({ params }) => {
+    if (!signedIn()) return unauthorized();
+    const app = findApp(String(params.appId));
+    if (!app) {
+      return problem(404, 'not_found', { detail: 'That app no longer exists.' });
+    }
+    const items = db.volumes
+      .filter((volume) => volume.app_id === app.id)
+      .sort((left, right) => Date.parse(right.created_at) - Date.parse(left.created_at));
+    const list: VolumeList = { items };
+    return json(list);
+  }),
+
+  http.post('*/api/v1/apps/:appId/volumes', async ({ request, params }) => {
+    const user = signedIn();
+    if (!user) return unauthorized();
+    if (user.role === 'viewer') return writeRefusal('app:update');
+
+    const app = findApp(String(params.appId));
+    if (!app) {
+      return problem(404, 'not_found', { detail: 'That app no longer exists.' });
+    }
+    const body = await readJson<CreateVolumeRequest>(request);
+    if (!body) return validationFailed('The form could not be read. Try again.');
+    if (!isIntAtLeast(body.size_gb, 1) || body.size_gb > 1024) {
+      return validationFailed('Volume size must be a whole number from 1 to 1024 GiB.');
+    }
+    const mountPath = (body.mount_path ?? '').trim();
+    const segments = mountPath.split('/').slice(1);
+    if (
+      !/^\/[A-Za-z0-9._/-]+$/.test(mountPath) ||
+      mountPath.endsWith('/') ||
+      segments.some(
+        (segment) => segment === '' || segment === '.' || segment === '..',
+      ) ||
+      /^\/(proc|sys|dev)(\/|$)/.test(mountPath)
+    ) {
+      return validationFailed('Mount path must be absolute and free of . and .. segments.');
+    }
+    if (
+      db.volumes.some(
+        (volume) =>
+          volume.app_id === app.id &&
+          (volume.state === 'creating' ||
+            volume.state === 'ready' ||
+            volume.state === 'restoring'),
+      )
+    ) {
+      return conflict('This app already has a volume.');
+    }
+
+    const createdAt = now();
+    const volume: Volume = {
+      id: mockId('vol'),
+      app_id: app.id,
+      node_id: app.placement.node_ids[0] ?? db.node.id,
+      size_gb: body.size_gb,
+      mount_path: mountPath,
+      state: 'creating',
+      allocated_bytes: null,
+      restored_from_backup_id: null,
+      error: null,
+      created_at: createdAt,
+      updated_at: createdAt,
+    };
+    db.volumes.push(volume);
+    app.stateful = true;
+    app.updated_at = createdAt;
+
+    // The node reports the sparse file a moment later, as it does in the contract.
+    schedule(() => {
+      const current = db.volumes.find((candidate) => candidate.id === volume.id);
+      if (!current) return;
+      current.state = 'ready';
+      current.allocated_bytes = Math.round(current.size_gb * 1024 ** 3 * 0.05);
+      current.updated_at = now();
+    }, 1_200);
+
+    return json(volume, { status: 201 });
+  }),
+
+  http.get('*/api/v1/apps/:appId/backups', ({ request, params }) => {
+    if (!signedIn()) return unauthorized();
+    const app = findApp(String(params.appId));
+    if (!app) {
+      return problem(404, 'not_found', { detail: 'That app no longer exists.' });
+    }
+    const items = db.backups
+      .filter((backup) => backup.app_id === app.id)
+      .sort((left, right) => Date.parse(right.created_at) - Date.parse(left.created_at));
+    const list: BackupList = page(items, request);
+    return json(list);
+  }),
+
+  http.post('*/api/v1/apps/:appId/backups', ({ params }) => {
+    const user = signedIn();
+    if (!user) return unauthorized();
+    if (user.role === 'viewer') return writeRefusal('backup:write');
+
+    const app = findApp(String(params.appId));
+    if (!app) {
+      return problem(404, 'not_found', { detail: 'That app no longer exists.' });
+    }
+    const volume = db.volumes.find(
+      (candidate) => candidate.app_id === app.id && candidate.state === 'ready',
+    );
+    if (!volume) return conflict('This app has no ready volume to back up.');
+    const repository = db.backupRepositories[0];
+    if (!repository) return conflict('The cluster has no backup repository.');
+
+    const inFlight = db.backups.find(
+      (backup) =>
+        backup.volume_id === volume.id &&
+        (backup.status === 'queued' || backup.status === 'running'),
+    );
+    if (inFlight) return conflict('A backup of this volume is already running.');
+
+    const backup: Backup = {
+      id: mockId('bkp'),
+      repository_id: repository.id,
+      source_kind: 'volume',
+      app_id: app.id,
+      volume_id: volume.id,
+      node_id: volume.node_id,
+      status: 'queued',
+      trigger: 'api',
+      snapshot_method: null,
+      pause_ms: null,
+      logical_bytes: null,
+      uploaded_bytes: null,
+      chunk_count: null,
+      error: null,
+      created_at: now(),
+      started_at: null,
+      finished_at: null,
+      pruned_at: null,
+    };
+    db.backups.push(backup);
+
+    schedule(() => {
+      const current = db.backups.find((candidate) => candidate.id === backup.id);
+      if (!current) return;
+      current.status = 'running';
+      current.snapshot_method = 'reflink';
+      current.pause_ms = 0;
+      current.started_at = now();
+    }, 500);
+    schedule(() => {
+      const current = db.backups.find((candidate) => candidate.id === backup.id);
+      if (!current) return;
+      const logical = volume.allocated_bytes ?? Math.round(volume.size_gb * 1024 ** 3 * 0.05);
+      current.status = 'succeeded';
+      current.logical_bytes = logical;
+      current.uploaded_bytes = Math.round(logical * 0.2);
+      current.chunk_count = Math.max(1, Math.round(logical / (8 * 1024 ** 2)));
+      current.finished_at = now();
+    }, 2_200);
+
+    return json(backup, { status: 202 });
+  }),
+
+  http.get('*/api/v1/backup-repositories', () => {
+    if (!signedIn()) return unauthorized();
+    const list: BackupRepositoryList = { items: db.backupRepositories };
+    return json(list);
+  }),
+
+  http.get('*/api/v1/audit-exports', () => {
+    if (!signedIn()) return unauthorized();
+    const list: AuditExportList = { items: db.auditExports };
+    return json(list);
+  }),
+
+  http.post('*/api/v1/audit-exports/:exportId/probe', ({ params }) => {
+    const user = signedIn();
+    if (!user) return unauthorized();
+    if (user.role !== 'owner') {
+      return problem(403, 'forbidden', {
+        reason: 'human_only',
+        scope: 'provider:manage',
+        detail: 'Only an owner can probe the off-site copy.',
+      });
+    }
+    const auditExport = db.auditExports.find(
+      (candidate) => candidate.id === String(params.exportId),
+    );
+    if (!auditExport) return notFound('That audit export');
+    auditExport.probed_at = now();
+    auditExport.probe_detail = 'Overwrite refused with 409; delete refused with 409.';
+    auditExport.updated_at = now();
+    return json(auditExport);
   }),
 
   http.get('*/api/v1/apps/:appId/deployments', ({ params }) => {

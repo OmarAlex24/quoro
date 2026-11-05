@@ -51,6 +51,7 @@ import { AppDomains } from '../components/app-domains';
 import { AppEdgeBackends } from '../components/app-edge';
 import { AppEnvDialog } from '../components/app-env-dialog';
 import { AppInstances } from '../components/app-instances';
+import { AppStorage } from '../components/app-storage';
 import { DeployRail } from '../components/deploy-rail';
 import { LogTape } from '../components/log-tape';
 import { AppMetricsBay } from '../components/metrics-bay';
@@ -653,6 +654,13 @@ export function AppScreen() {
           Values are write-only: Quoro stores them encrypted and never shows them again.
         </p>
       </section>
+
+      <AppStorage
+        app={app}
+        canWrite={canWrite}
+        nodeNames={nodeNames}
+        onChanged={invalidate}
+      />
 
       <AppInstances
         instances={app.instances}

@@ -16,6 +16,8 @@ export default defineConfig({
           'projects',
           'vms',
           'apps',
+          'volumes',
+          'backups',
           'deployments',
           'builds',
           'domains',
