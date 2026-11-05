@@ -265,7 +265,20 @@ pub async fn verify_audit(
         .map(|row| Ok(audit::record_value_from_row(row)?))
         .collect::<Result<_, ApiError>>()?;
 
-    let verification = audit::verify_records(records, from_seq, &seed);
+    let mut verification = audit::verify_records(records, from_seq, &seed);
+    // Section 8.3: while an export exists, the same run also compares the
+    // local log with the copy. A provider that cannot be read is recorded in
+    // `audit_exports.last_error`; only a disagreement with the copy is a
+    // verification failure here.
+    if verification.ok
+        && let Some(copy_break) = crate::audit_export::verify::compare_via_provider(state).await?
+    {
+        verification.ok = false;
+        verification.broken_at_seq = Some(copy_break.broken_at_seq);
+        verification.reason = Some(copy_break.reason);
+        verification.expected_hash = Some(copy_break.expected_hash);
+        verification.found_hash = Some(copy_break.found_hash);
+    }
     let detail = failure_detail(&verification);
     let outcome = if verification.ok {
         crate::audit::Outcome::Ok
@@ -299,6 +312,7 @@ pub async fn verify_audit(
                     "broken_at_seq": verification.broken_at_seq,
                     "expected_hash": verification.expected_hash,
                     "found_hash": verification.found_hash,
+                    "reason": verification.reason,
                 }),
             },
         )

@@ -11,6 +11,7 @@
 pub mod api;
 pub mod app_env;
 pub mod audit;
+pub mod audit_export;
 pub mod auth;
 pub mod authz;
 pub mod backups;
@@ -262,6 +263,7 @@ impl AppState {
         // `primary_restarted` before the listener opens.
         interactive::close_orphans(&state).await?;
         sweeper::spawn(state.clone());
+        audit_export::spawn(state.clone());
         backups::dispatch::spawn(state.clone());
         dispatcher::start(state.clone()).await?;
         Ok(state)

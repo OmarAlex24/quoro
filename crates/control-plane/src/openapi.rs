@@ -236,6 +236,7 @@ impl utoipa::Modify for Security {
         openapi.merge(crate::api::builds::BuildsDoc::openapi());
         openapi.merge(crate::api::volumes::VolumesDoc::openapi());
         openapi.merge(crate::api::backups::BackupsDoc::openapi());
+        openapi.merge(crate::api::audit_exports::AuditExportsDoc::openapi());
         openapi.merge(crate::api::events::EventsDoc::openapi());
         openapi.merge(crate::api::incidents::IncidentsDoc::openapi());
 
