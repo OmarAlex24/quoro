@@ -172,6 +172,11 @@
   - [0161: M5a Quoro-component findings match crates (crates.io), guest kernel (Linux/Kernel upstream version), Cloud Hypervisor (crates.io), cloudflared and BuildKit (Go); npm packages in the SBOM are listed but not matched](adr/0161-m5a-quoro-component-findings-match-crates-crates-io-guest.md)
   - [0162: Evaluate Linux/Kernel OSV ranges per stable series: when a record lists a fix in the version's own major.minor series, that fix alone decides](adr/0162-evaluate-linux-kernel-osv-ranges-per-stable-series-when-a.md)
   - [0163: Inventory images prepared before M5a from their cached root disk, once, at node start](adr/0163-inventory-images-prepared-before-m5a-from-their-cached-root.md)
+  - [0164: In the Linux ecosystem, an OSV range whose fixed version is below its introduced version is ignored when matching](adr/0164-in-the-linux-ecosystem-an-osv-range-whose-fixed-version-is.md)
+  - [0165: deleteApp turns the app's volumes into deleting so the node removes their files (a contract change for M5b)](adr/0165-deleteapp-turns-the-app-s-volumes-into-deleting-so-the-node.md)
+  - [0166: node-agent-protocol 6.8 describes how the edge cancels requests to a backend that leaves rotation (GET/HEAD retried once, others 502, streaming bodies cut); OPTIONS stays out of the retry set](adr/0166-node-agent-protocol-6-8-describes-how-the-edge-cancels.md)
+  - [0167: Per-domain serving status and last error, so a tunnel domain that no tunnel serves shows in GET /apps/{app_id}/domains (a contract change for M5b)](adr/0167-per-domain-serving-status-and-last-error-so-a-tunnel-domain.md)
+  - [0168: Grace period for a tunnel hostname that leaves a machine: the machine keeps serving it for about 120 s (a contract change for M5b)](adr/0168-grace-period-for-a-tunnel-hostname-that-leaves-a-machine.md)
 
 # Background research
 
