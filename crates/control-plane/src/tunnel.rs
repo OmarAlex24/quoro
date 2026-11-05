@@ -24,7 +24,7 @@ use quoro_ingress::tunnel::TunnelController;
 use quoro_providers::Token;
 use quoro_providers::cloudflare::{API_BASE, Cloudflare, DOH_BASE};
 use sqlx::Row;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::Notify;
 use tokio::time::Duration;
@@ -423,6 +423,15 @@ impl TunnelManager {
             .get(node_id)
             .map(|state| state.published.clone())
             .unwrap_or_default();
+        // A hostname this tunnel drops but another tunnel now serves keeps
+        // its CNAME: the new tunnel repoints that record instead of this one
+        // deleting it and the new one creating another (issue #344).
+        let handoff = self
+            .handoff(node_id, &provider_id, &published, &hostnames)
+            .await?;
+        for hostname in handoff.keys() {
+            published.remove(hostname);
+        }
         match controller
             .sync_routes(&tunnel_id, origin_port, &hostnames, &mut published)
             .await
@@ -436,7 +445,18 @@ impl TunnelManager {
                         "cannot publish a tunnel hostname"
                     );
                 }
-                let synced = failures.is_empty();
+                // Until the new tunnel has written the CNAME, this one still
+                // answers for the record: it stays in `published`, so it is
+                // deleted here if the hostname ends up served by no tunnel,
+                // and the next pass looks again.
+                let mut waiting = false;
+                for (hostname, repointed) in handoff {
+                    if !repointed {
+                        published.insert(hostname);
+                        waiting = true;
+                    }
+                }
+                let synced = failures.is_empty() && !waiting;
                 self.inner.nodes.lock().expect("tunnel state lock").insert(
                     node_id.to_string(),
                     NodeSync {
@@ -452,6 +472,55 @@ impl TunnelManager {
             }
             Err(e) => Err(format!("cannot sync the tunnel routes: {e}")),
         }
+    }
+
+    /// The hostnames `node_id`'s tunnel published and no longer serves that
+    /// another machine's tunnel of the same provider serves now, each with
+    /// whether that tunnel already wrote its CNAME (it is in its `published`).
+    ///
+    /// Such a hostname moved between tunnels, typically between a node and
+    /// the edge when an app's replica count crossed 1. Its CNAME is the new
+    /// tunnel's to repoint, never this tunnel's to delete.
+    async fn handoff(
+        &self,
+        node_id: &str,
+        provider_id: &str,
+        published: &BTreeSet<String>,
+        hostnames: &BTreeSet<String>,
+    ) -> Result<BTreeMap<String, bool>, String> {
+        let stale: BTreeSet<&String> = published.difference(hostnames).collect();
+        if stale.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let others: Vec<String> = sqlx::query_scalar(
+            "SELECT node_id FROM node_tunnels \
+             WHERE node_id <> ? AND provider_id = ? AND tunnel_id IS NOT NULL \
+             ORDER BY node_id",
+        )
+        .bind(node_id)
+        .bind(provider_id)
+        .fetch_all(self.inner.store.pool())
+        .await
+        .map_err(|e| format!("cannot read node_tunnels: {e}"))?;
+        let mut handoff = BTreeMap::new();
+        for other in others {
+            let served = crate::session::desired::tunnel_hostnames(self.inner.store.pool(), &other)
+                .await
+                .map_err(|e| format!("cannot read the tunnel routes of {other}: {e}"))?;
+            let repointed: BTreeSet<String> = self
+                .inner
+                .nodes
+                .lock()
+                .expect("tunnel state lock")
+                .get(&other)
+                .map(|state| state.published.clone())
+                .unwrap_or_default();
+            for hostname in stale.iter().filter(|hostname| served.contains(**hostname)) {
+                let entry = handoff.entry((*hostname).clone()).or_insert(false);
+                *entry |= repointed.contains(*hostname);
+            }
+        }
+        Ok(handoff)
     }
 
     /// Retires a tunnel whose node no longer has a mapping.
