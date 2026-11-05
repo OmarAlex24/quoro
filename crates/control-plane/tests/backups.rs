@@ -1510,13 +1510,25 @@ async fn pruning_keeps_two_and_removes_the_oldest_seal_and_manifest() {
         ids.push(run_backup(&mut setup, &data).await);
     }
     let oldest = &ids[0];
-    let pruned_at: Option<String> =
-        sqlx::query_scalar("SELECT pruned_at FROM backups WHERE id = ?")
-            .bind(oldest)
-            .fetch_one(setup.server.state.store.pool())
-            .await
-            .unwrap();
-    assert!(pruned_at.is_some(), "the oldest backup is pruned");
+    // Pruning runs after the third backup's row is `succeeded`, so the
+    // test waits for its commit, which sets `pruned_at` last.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let pruned_at: Option<String> =
+            sqlx::query_scalar("SELECT pruned_at FROM backups WHERE id = ?")
+                .bind(oldest)
+                .fetch_one(setup.server.state.store.pool())
+                .await
+                .unwrap();
+        if pruned_at.is_some() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the oldest backup is pruned"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let old_seal = format!(
         "{}{}",
         root(&setup.server),

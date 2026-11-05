@@ -86,6 +86,7 @@ pub(crate) async fn after_seal(
         .map(backup_from_row)
         .collect::<Result<Vec<_>, _>>()?;
 
+    let mut pruned = 0usize;
     for stale in kept.iter().skip(usize::try_from(keep).unwrap_or(0)) {
         let source_id = match stale.source_kind {
             BackupSourceKind::Volume => stale.app_id.clone().unwrap_or_default(),
@@ -136,13 +137,16 @@ pub(crate) async fn after_seal(
         );
         crate::audit::append(&mut w.tx, &record).await?;
         w.commit().await?;
+        pruned += 1;
     }
 
     // A sweep at most once a day, and only after a pruning (`backup-format.md`
-    // section 9).
-    if runtime
-        .last_sweep()
-        .is_none_or(|last| now >= time_after(last, GC_PERIOD))
+    // section 9). A seal that pruned nothing does not start one: while it
+    // runs, no backup of the repository can be queued.
+    if pruned > 0
+        && runtime
+            .last_sweep()
+            .is_none_or(|last| now >= time_after(last, GC_PERIOD))
     {
         match sweep(store, data_key, keys, runtime, &repository.id, now).await {
             Ok(_) => {}
