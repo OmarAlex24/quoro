@@ -195,7 +195,9 @@ proptest! {
         position in 0f64..1f64,
     ) {
         let keys = keys();
-        let data = seeded(3 * 1024 * 1024, seed);
+        // More than the 4 MiB maximum chunk size, so every seed gives at least
+        // two chunks; 3 MiB could land in one chunk when no cut point appears.
+        let data = seeded(5 * 1024 * 1024, seed);
         let (manifest, _) = write_backup(&data, &keys, "bkp_one");
         prop_assert!(manifest.chunks.len() >= 2, "the case must produce several chunks");
 
