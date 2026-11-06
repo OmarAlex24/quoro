@@ -242,6 +242,8 @@
   - [0235: hello carries control_plane_urls, and welcome.primary_urls lists the promotable machines' URLs after the primary's own, up to 16](adr/0235-hello-carries-control-plane-urls-and-welcome-primary-urls.md)
   - [0236: --ack-fence needs a written statement, skips only the voters' wait, declares the old primary's node lost, and keeps every lease's own gate](adr/0236-ack-fence-needs-a-written-statement-skips-only-the-voters.md)
   - [0237: Let support_request through while a revoke's fence runs, like renewal answers (extends ADR 0222)](adr/0237-let-support-request-through-while-a-revoke-s-fence-runs.md)
+  - [0238: A new failed fence of a lease whose acknowledgement is pending takes it out of fence_ack_pending and lists it again](adr/0238-a-new-failed-fence-of-a-lease-whose-acknowledgement-is.md)
+  - [0239: A fence_ack for a connected node waits until the lease_revokes sent on that session are answered](adr/0239-a-fence-ack-for-a-connected-node-waits-until-the-lease.md)
 
 # Background research
 
