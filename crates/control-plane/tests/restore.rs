@@ -1049,6 +1049,63 @@ async fn a_restore_moves_the_app_and_the_ready_report_finishes_it() {
     assert_eq!(grants, 1);
 }
 
+/// Issue #384: a snapshot of the old node built before the restore was
+/// accepted is still on its way when the accept revokes the lease. It must
+/// not reach the old node after the revoke, still naming the moved VM.
+#[tokio::test]
+async fn a_snapshot_built_before_a_restore_never_follows_its_revoke() {
+    let mut setup = setup().await;
+    let backup_id = run_backup(&mut setup, &vec![3u8; 64 * 1024]).await;
+
+    // The old node's next snapshot is held between its build and its send.
+    // Stopping the app makes it differ from the last one sent, so it is sent.
+    let hold = setup
+        .state
+        .server
+        .state
+        .hub
+        .hold_next_snapshot(&setup.state.node.node_id);
+    let res = setup
+        .state
+        .owner
+        .post(
+            setup
+                .state
+                .server
+                .url(&format!("/api/v1/apps/{}/stop", setup.state.app_id)),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        res.status().is_success(),
+        "stop: {}",
+        res.text().await.unwrap()
+    );
+    timeout(Duration::from_secs(10), hold.built())
+        .await
+        .expect("the old node's snapshot is built");
+
+    // The restore is accepted while that snapshot, which names the VM, waits.
+    let res = restore(
+        &setup.state.owner,
+        &setup.state.server,
+        &backup_id,
+        &setup.node_b.node_id,
+    )
+    .await;
+    assert_eq!(res.status(), 202, "restore: {}", res.text().await.unwrap());
+    hold.release();
+
+    recv_type(&mut setup.state.socket, "lease_revoke").await;
+    let snapshot = recv_type(&mut setup.state.socket, "desired_state").await;
+    assert!(
+        names_vm(&snapshot, &setup.state.vm_id).is_none(),
+        "the old node got a snapshot naming the moved VM after the revoke: {}",
+        snapshot["body"]["spec"]["vms"]
+    );
+}
+
 fn base64_of(bytes: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(bytes)

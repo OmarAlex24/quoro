@@ -264,6 +264,10 @@ struct SessionHandle {
     /// `connected` by [`connect_node`]). Written only while the store's writer
     /// gate is held, so [`disconnect_node`] reads it in order with that write.
     hello_recorded: bool,
+    /// How many `lease_revoke` frames [`NodeHub::send_control`] queued to
+    /// this session. A snapshot built before one of them is not sent after it
+    /// (section 8.3, issue #384).
+    revokes: u64,
 }
 
 /// A source of `welcome.primary_urls` (section 5.10). The binary installs one
@@ -307,6 +311,38 @@ struct HubInner {
     /// (`status_report.disk_free_gb`, section 5.3).
     disk_free_gb: Mutex<HashMap<String, f64>>,
     generation: AtomicU64,
+    /// Test seam: snapshots to hold between their build and their send.
+    snapshot_holds: Mutex<HashMap<String, Arc<SnapshotHold>>>,
+}
+
+/// A test seam that holds one node's next snapshot after it is built and
+/// before it is sent, so a test can change the state in that window.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct SnapshotHold {
+    built: Notify,
+    release: Notify,
+}
+
+impl SnapshotHold {
+    /// Waits until the held snapshot is built.
+    pub async fn built(&self) {
+        self.built.notified().await;
+    }
+
+    /// Lets the held snapshot go on to its send.
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+/// What [`NodeHub::send_snapshot`] did with a snapshot.
+enum SnapshotSent {
+    Sent,
+    /// A `lease_revoke` was queued after the snapshot was built.
+    Stale,
+    /// A newer session took over, or the session ended.
+    Gone,
 }
 
 /// A DNS-01 TXT record the primary created for one node (section 5.22).
@@ -351,7 +387,22 @@ impl NodeHub {
             edge_health: Mutex::new(BTreeMap::new()),
             disk_free_gb: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
+            snapshot_holds: Mutex::new(HashMap::new()),
         }))
+    }
+
+    /// Test seam: holds `node_id`'s next snapshot that differs from the last
+    /// one sent, between its build and its send.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn hold_next_snapshot(&self, node_id: &str) -> Arc<SnapshotHold> {
+        let hold = Arc::new(SnapshotHold::default());
+        self.0
+            .snapshot_holds
+            .lock()
+            .expect("snapshot hold lock")
+            .insert(node_id.to_string(), Arc::clone(&hold));
+        hold
     }
 
     /// Whether `node_id` has a live session.
@@ -448,14 +499,16 @@ impl NodeHub {
         message: &quoro_proto::wire::ControlMessage,
     ) -> bool {
         let text = message.to_frame(&new_msg_id(), None).to_text();
-        let tx = {
-            let sessions = self.0.sessions.lock().expect("session lock");
-            sessions.get(node_id).map(|handle| handle.tx.clone())
+        // Counted and queued under one lock, in order with a snapshot's check
+        // in `send_snapshot`.
+        let mut sessions = self.0.sessions.lock().expect("session lock");
+        let Some(handle) = sessions.get_mut(node_id) else {
+            return false;
         };
-        match tx {
-            Some(tx) => tx.send(text).is_ok(),
-            None => false,
+        if matches!(message, quoro_proto::wire::ControlMessage::LeaseRevoke(_)) {
+            handle.revokes += 1;
         }
+        handle.tx.send(text).is_ok()
     }
 
     /// Free space on `node_id`'s volume filesystem as its last `status_report`
@@ -762,6 +815,7 @@ impl NodeHub {
                 changed: Arc::clone(&changed),
                 pending: Arc::new(Mutex::new(Pending::default())),
                 hello_recorded: false,
+                revokes: 0,
             },
         );
         (generation, rx, closed_rx, changed)
@@ -817,17 +871,40 @@ impl NodeHub {
     }
 
     /// Queues one text frame to `generation` of the node's session.
-    fn send(&self, node_id: &str, generation: u64, text: String) -> bool {
-        let tx = {
-            let sessions = self.0.sessions.lock().expect("session lock");
-            sessions
-                .get(node_id)
-                .filter(|handle| handle.generation == generation)
-                .map(|handle| handle.tx.clone())
+    /// How many `lease_revoke` frames were queued to `node_id`'s session of
+    /// `generation`, or `None` when that session is gone.
+    fn revokes(&self, node_id: &str, generation: u64) -> Option<u64> {
+        let sessions = self.0.sessions.lock().expect("session lock");
+        sessions
+            .get(node_id)
+            .filter(|handle| handle.generation == generation)
+            .map(|handle| handle.revokes)
+    }
+
+    /// Queues a snapshot built while `revokes` frames had been queued, unless
+    /// a `lease_revoke` was queued since: that snapshot can still name what
+    /// the revoke took away, and must not reach the node after it.
+    fn send_snapshot(
+        &self,
+        node_id: &str,
+        generation: u64,
+        revokes: Option<u64>,
+        text: String,
+    ) -> SnapshotSent {
+        let sessions = self.0.sessions.lock().expect("session lock");
+        let Some(handle) = sessions
+            .get(node_id)
+            .filter(|handle| handle.generation == generation)
+        else {
+            return SnapshotSent::Gone;
         };
-        match tx {
-            Some(tx) => tx.send(text).is_ok(),
-            None => false,
+        if Some(handle.revokes) != revokes {
+            return SnapshotSent::Stale;
+        }
+        if handle.tx.send(text).is_ok() {
+            SnapshotSent::Sent
+        } else {
+            SnapshotSent::Gone
         }
     }
 
@@ -1937,6 +2014,9 @@ impl Session {
     /// `floor` is the node's stored revision on the first send (section 4.2),
     /// `0` afterwards.
     async fn refresh(&mut self, floor: u64, force: bool) -> Result<(), String> {
+        // Read before the build: a revoke queued from here on was decided on
+        // rows this build may not see (issue #384).
+        let revokes = self.hub.revokes(&self.node_id, self.generation);
         let session_ip = |node_id: &str| self.hub.session_ip(node_id);
         let mesh_lookup = mesh::MeshLookup {
             session_ip: &session_ip,
@@ -1959,6 +2039,25 @@ impl Session {
         }
         self.hub.remember_vms(&self.node_id, &spec);
         if !force && self.last_spec.as_ref() == Some(&spec) {
+            return Ok(());
+        }
+        let hold = self
+            .hub
+            .0
+            .snapshot_holds
+            .lock()
+            .expect("snapshot hold lock")
+            .remove(&self.node_id);
+        if let Some(hold) = hold {
+            hold.built.notify_one();
+            hold.release.notified().await;
+        }
+        // Section 8.3: the revoke reaches the node before the snapshot that
+        // drops what it revoked. Every revoke is queued after its write
+        // committed, so a rebuild sees that write; a snapshot built before it
+        // would follow the revoke still naming the resource.
+        if self.hub.revokes(&self.node_id, self.generation) != revokes {
+            self.hub.node_changed(&self.node_id);
             return Ok(());
         }
 
@@ -1987,10 +2086,20 @@ impl Session {
         let text = ControlMessage::DesiredState(body)
             .to_frame(&new_msg_id(), None)
             .to_text();
-        if !self.hub.send(&self.node_id, self.generation, text) {
+        match self
+            .hub
+            .send_snapshot(&self.node_id, self.generation, revokes, text)
+        {
+            SnapshotSent::Sent => {}
+            // A revoke was queued while this snapshot was on its way: built
+            // again, it leaves out what the revoke took away.
+            SnapshotSent::Stale => {
+                self.hub.node_changed(&self.node_id);
+                return Ok(());
+            }
             // A newer session took over while this one was building; it will
             // send its own snapshot and must not receive this one.
-            return Ok(());
+            SnapshotSent::Gone => return Ok(()),
         }
         let app_vms: Vec<(String, String)> = spec
             .vms
