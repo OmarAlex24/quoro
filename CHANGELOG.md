@@ -8,7 +8,7 @@ Each entry links the pull request that made the change and, where one exists, th
 
 ### Added
 
-- **Fence events name the lease's token and the stopped VMs.** A node's `node.fenced` and `node.fence_failed` events now carry `fencing_tokens`: the token the node held for each fenced lease, the same one as in the fence's local record. When a revoke with a higher token joined a running fence, the event carries that revoke's token. `node.fenced` also carries `vm_ids`, the VMs the fence stopped. The failed fences an upgraded agent reports again carry their recorded token too ([#PR442], [#442], [#436]).
+- **Fence events name the lease's token and the stopped VMs.** A node's `node.fenced` and `node.fence_failed` events now carry `fencing_tokens`: the token the node held for each fenced lease, the same one as in the fence's local record. When a revoke with a higher token joined a running fence, the event carries that revoke's token. `node.fenced` also carries `vm_ids`, the VMs the fence stopped. The failed fences an upgraded agent reports again carry their recorded token too ([#445], [#442], [#436]).
 
 - **Warm volume calls in the engine.** The engine trait gains the calls warm replication is built on: `volume_changed_ranges` compares the extent maps of two reflink snapshots of a volume and returns only the byte ranges that differ (a full copy when there is no base or the maps cannot be compared), `stage_volume`, `commit_staged_volume` and `discard_staged_volume` build a volume's next copy beside the last good one and swap it in with one rename, and `pause` and `resume` freeze a running VM. A volume can now keep several snapshots, each in its own file. Nothing calls these yet; replication between nodes comes next ([#389], [#390], [ADR 0172], [ADR 0173]).
 
@@ -414,7 +414,7 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#439]: https://github.com/OmarAlex24/quoro/pull/439
 [#440]: https://github.com/OmarAlex24/quoro/pull/440
 [#442]: https://github.com/OmarAlex24/quoro/issues/442
-[#PR442]: https://github.com/OmarAlex24/quoro/pull/PR442
+[#445]: https://github.com/OmarAlex24/quoro/pull/445
 [ADR 0019]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0019-fencing-is-mandatory-and-lease-based-node-agent-self-fences.md
 [ADR 0020]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0020-per-app-ha-policies-none-cold-warm-hot-with-cost-shown-in.md
 [ADR 0027]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0027-signed-binaries-and-reproducible-builds-are-mandatory.md
