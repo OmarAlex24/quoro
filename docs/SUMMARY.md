@@ -244,6 +244,9 @@
   - [0237: Let support_request through while a revoke's fence runs, like renewal answers (extends ADR 0222)](adr/0237-let-support-request-through-while-a-revoke-s-fence-runs.md)
   - [0238: A new failed fence of a lease whose acknowledgement is pending takes it out of fence_ack_pending and lists it again](adr/0238-a-new-failed-fence-of-a-lease-whose-acknowledgement-is.md)
   - [0239: A fence_ack for a connected node waits until the lease_revokes sent on that session are answered](adr/0239-a-fence-ack-for-a-connected-node-waits-until-the-lease.md)
+  - [0240: Node measures expiring-lease validity on CLOCK_BOOTTIME, so a host suspend shortens it](adr/0240-node-measures-expiring-lease-validity-on-clock-boottime-so.md)
+  - [0241: A lease converted from local to expiring opens no failover gate until a renewal is answered, and the node fences from its first renewal](adr/0241-a-lease-converted-from-local-to-expiring-opens-no-failover.md)
+  - [0242: A stateful start under an expiring lease needs valid_until - now >= start bound + M, and the engine's start takes a caller-supplied bound (3 s for expiring leases)](adr/0242-a-stateful-start-under-an-expiring-lease-needs-valid-until.md)
 
 # Background research
 
