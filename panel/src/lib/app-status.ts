@@ -4,6 +4,7 @@ import type {
   Deployment,
   DeploymentPhase,
   DomainCertStatus,
+  DomainServingStatus,
   DomainTlsMode,
   Node,
 } from '../api/generated/model';
@@ -192,6 +193,24 @@ export const certWords: Record<DomainCertStatus, string> = {
   renewing: 'Renewing',
   failed: 'Failed',
   not_applicable: 'Not applicable',
+};
+
+/** Whether a machine serves the hostname (ADR 0167). */
+export const servingTone = (status: DomainServingStatus): LampTone => {
+  switch (status) {
+    case 'serving':
+      return 'run';
+    case 'unserved':
+      return 'fault';
+    case 'pending':
+      return 'idle';
+  }
+};
+
+export const servingWords: Record<DomainServingStatus, string> = {
+  serving: 'Serving',
+  unserved: 'Not served',
+  pending: 'Waiting for an instance',
 };
 
 export const tlsWords: Record<DomainTlsMode, string> = {

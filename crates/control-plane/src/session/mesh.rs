@@ -20,7 +20,6 @@ use base64::Engine as _;
 use quoro_proto::wire::{MeshAllow, MeshPeer, SpecMesh};
 use serde_json::json;
 use sqlx::Row;
-use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnection;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -196,9 +195,11 @@ impl MeshNode {
 ///
 /// A message when a row cannot be read or a stored `roles` value is not a JSON
 /// array.
-pub(crate) async fn edge_node_id(pool: &SqlitePool) -> Result<Option<String>, String> {
+pub(crate) async fn edge_node_id<'e>(
+    executor: impl sqlx::SqliteExecutor<'e>,
+) -> Result<Option<String>, String> {
     let rows = sqlx::query("SELECT id, roles FROM nodes WHERE status <> 'removed' ORDER BY id")
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await
         .map_err(|e| format!("cannot read the nodes for the edge: {e}"))?;
     for row in &rows {

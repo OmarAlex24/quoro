@@ -279,6 +279,7 @@ impl AppState {
         vulns::findings::spawn(state.clone());
         audit_export::spawn(state.clone());
         backups::dispatch::spawn(state.clone());
+        session::serving::spawn(state.clone());
         dispatcher::start(state.clone()).await?;
         Ok(state)
     }

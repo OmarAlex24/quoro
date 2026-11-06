@@ -8,6 +8,8 @@ import {
   deploymentRail,
   pickDefaultNode,
   relativeTime,
+  servingTone,
+  servingWords,
   stationTone,
   tlsWords,
 } from './app-status';
@@ -121,6 +123,17 @@ describe('stationTone', () => {
     expect(stationTone('current')).toBe('shift');
     expect(stationTone('failed')).toBe('fault');
     expect(stationTone('not-reached')).toBe('idle');
+  });
+});
+
+describe('serving words', () => {
+  it('names every serving status of the contract and maps it to a lamp', () => {
+    expect(servingWords.serving).toBe('Serving');
+    expect(servingWords.unserved).toBe('Not served');
+    expect(servingWords.pending).toBe('Waiting for an instance');
+    expect(servingTone('serving')).toBe('run');
+    expect(servingTone('unserved')).toBe('fault');
+    expect(servingTone('pending')).toBe('idle');
   });
 });
 
