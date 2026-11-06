@@ -11,30 +11,27 @@ import {
 import { formatDuration } from './agency-format';
 import type { LampTone } from './lamp';
 
-/** The subjects an event type is grouped under, in contract order. */
-const EVENT_SUBJECTS = [
-  'node',
-  'vm',
-  'app',
-  'deployment',
-  'certificate',
-  'grant',
-  'approval',
-  'incident',
-  'audit',
-] as const;
-
 export const allEventTypes = (): EventType[] => Object.values(EventType);
 
+/** `domain.unserved` -> `domain`. */
+const eventSubject = (type: EventType): string => type.split('.')[0] ?? type;
+
 /**
- * Every `EventType` grouped by its subject prefix, preserving the order the
- * contract lists them in. The add dialog paints one group per subject.
+ * Every `EventType` grouped by its subject prefix, in the order the contract
+ * lists them (`events.schema.json`). The groups come from the generated enum,
+ * so a new event family shows up without a panel change. The add dialog
+ * paints one group per subject.
  */
-export const eventTypesBySubject = (): Array<{ subject: string; types: EventType[] }> =>
-  EVENT_SUBJECTS.map((subject) => ({
-    subject,
-    types: allEventTypes().filter((type) => type.startsWith(`${subject}.`)),
-  })).filter((group) => group.types.length > 0);
+export const eventTypesBySubject = (): Array<{ subject: string; types: EventType[] }> => {
+  const groups: Array<{ subject: string; types: EventType[] }> = [];
+  for (const type of allEventTypes()) {
+    const subject = eventSubject(type);
+    const group = groups.find((candidate) => candidate.subject === subject);
+    if (group) group.types.push(type);
+    else groups.push({ subject, types: [type] });
+  }
+  return groups;
+};
 
 /** "Every event", the list when it is short, or a count when it is long. */
 export const describeEventTypes = (types: readonly EventType[]): string => {
