@@ -20,7 +20,7 @@ use quoro_engine::{Engine, FakeEngine, VmState};
 use quoro_node_agent::store::NodeStore;
 use quoro_node_agent::{
     Attached, FenceTimers, LeaseConfig, LeaseState, LocalLeases, ManualHostClock, StoredLease,
-    StoredValidity, start_local_leases,
+    StoredValidity, VmFenceOutcome, start_local_leases, stop_vms,
 };
 use quoro_proto::{Envelope, LeaseGrant, LeaseId, LeaseMode, LeaseRenew, MsgId, ResourceType};
 use tokio::sync::watch;
@@ -627,4 +627,38 @@ async fn an_expiry_whose_stops_hang_fails_within_the_margin() {
     );
     assert!(leases.view.is_failed());
     leases.abort();
+}
+
+/// #434, section 8.5: a forced stop that outlives `T_force` is a failed fence,
+/// since nothing confirmed the VM stopped in time, but the engine still
+/// finishes it: the VMM does not keep running because the fence gave up.
+#[tokio::test(start_paused = true)]
+async fn a_forced_stop_that_outlives_t_force_still_stops_the_vm() {
+    let engine = FakeEngine::new();
+    let vm = running_vm(&engine, "vm_slow_kill", 2).await;
+    engine.set_ignore_power_button(&vm, true);
+    engine.set_stop_delay(&vm, millis(500));
+
+    let report = stop_vms(
+        &engine,
+        std::slice::from_ref(&vm),
+        FenceTimers {
+            grace: millis(100),
+            force: millis(300),
+        },
+    )
+    .await;
+    assert!(!report.complete());
+    assert!(
+        matches!(&report.vms[..], [(id, VmFenceOutcome::Failed(_))] if id == &vm),
+        "{report:?}"
+    );
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Stopping);
+    assert_eq!(stop_counts(&engine.stop_calls()), (1, 1));
+
+    tokio::time::sleep(millis(500)).await;
+    let info = engine.inspect(&vm).await.unwrap();
+    assert_eq!(info.state, VmState::Stopped);
+    assert_eq!(info.pid, None);
+    assert_eq!(info.exit_code, Some(137));
 }

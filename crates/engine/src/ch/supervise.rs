@@ -60,7 +60,9 @@ pub(super) fn finish(
     let booted = entry.booted.swap(false, Ordering::SeqCst);
     let facts = ExitFacts {
         booted,
-        stop_requested: marker_exists(&entry.paths.stop_requested),
+        // In memory first: a stop whose marker could not be written is still a stop.
+        stop_requested: entry.stop_requested.load(Ordering::SeqCst)
+            || marker_exists(&entry.paths.stop_requested),
         reset_seen,
         status: crate::boot::read_status(&entry.paths.config_disk)
             .ok()

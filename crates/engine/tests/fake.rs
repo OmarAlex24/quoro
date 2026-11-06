@@ -194,6 +194,100 @@ async fn a_stop_delay_is_awaited_before_acting() {
     assert_eq!(info.exit_code, Some(137));
 }
 
+/// #434, contract §3.8: a forced stop that has begun finishes even when its
+/// caller stops waiting. Meanwhile the VM reads `Stopping` with its pid, and
+/// `start` and `delete` are refused.
+#[tokio::test(start_paused = true)]
+async fn a_forced_stop_finishes_after_its_caller_stops_waiting() {
+    let (engine, id) = created().await;
+    let started = engine.start(&id).await.expect("start succeeds");
+    let mut events = engine.events();
+    engine.set_stop_delay(&id, Duration::from_millis(500));
+
+    let gave_up = tokio::time::timeout(
+        Duration::from_millis(100),
+        engine.stop(&id, StopMode::Force),
+    )
+    .await;
+    assert!(gave_up.is_err(), "the caller stopped waiting");
+    let stopping = engine.inspect(&id).await.expect("inspect succeeds");
+    assert_eq!(stopping.state, VmState::Stopping);
+    assert_eq!(stopping.pid, started.pid);
+    assert!(matches!(
+        engine.start(&id).await,
+        Err(EngineError::Conflict(_))
+    ));
+    assert!(matches!(
+        engine.delete(&id).await,
+        Err(EngineError::Conflict(_))
+    ));
+
+    // Past the 500 ms the slow VMM takes, counted from the stop call.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let stopped = engine.inspect(&id).await.expect("inspect succeeds");
+    assert_eq!(stopped.state, VmState::Stopped);
+    assert_eq!(stopped.pid, None);
+    assert_eq!(stopped.exit_code, Some(137));
+    assert_eq!(
+        common::next_event(&mut events).await,
+        Some(EngineEvent::Exited {
+            id: id.clone(),
+            code: 137
+        })
+    );
+    // Stopped once: a later start boots the VM again and nothing stops it.
+    engine.set_stop_delay(&id, Duration::ZERO);
+    engine.start(&id).await.expect("start succeeds");
+    assert_eq!(
+        common::next_event(&mut events).await,
+        Some(EngineEvent::Started { id: id.clone() })
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        engine.inspect(&id).await.expect("inspect succeeds").state,
+        VmState::Running
+    );
+}
+
+/// Contract §3.8 as D-0243 extends it: a stop called while a forced stop of
+/// the same VM still runs joins it instead of starting another, and the VM
+/// is stopped once.
+#[tokio::test(start_paused = true)]
+async fn a_later_stop_joins_a_forced_stop_in_progress() {
+    let (engine, id) = created().await;
+    engine.start(&id).await.expect("start succeeds");
+    let mut events = engine.events();
+    engine.set_stop_delay(&id, Duration::from_millis(500));
+    let began = tokio::time::Instant::now();
+    let gave_up = tokio::time::timeout(
+        Duration::from_millis(100),
+        engine.stop(&id, StopMode::Force),
+    )
+    .await;
+    assert!(gave_up.is_err(), "the caller stopped waiting");
+
+    let joined = engine
+        .stop(
+            &id,
+            StopMode::Graceful {
+                timeout: Duration::from_secs(30),
+            },
+        )
+        .await
+        .expect("the later stop succeeds");
+    assert_eq!(began.elapsed(), Duration::from_millis(500));
+    assert_eq!(joined.state, VmState::Stopped);
+    assert_eq!(joined.exit_code, Some(137), "the forced stop ended the VM");
+    assert_eq!(
+        common::next_event(&mut events).await,
+        Some(EngineEvent::Exited {
+            id: id.clone(),
+            code: 137
+        })
+    );
+    assert_eq!(engine.stop_calls().len(), 2);
+}
+
 #[tokio::test(start_paused = true)]
 async fn an_unkillable_vm_keeps_its_state_and_every_stop_fails() {
     let (engine, id) = created().await;

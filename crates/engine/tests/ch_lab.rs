@@ -1779,3 +1779,113 @@ async fn exec_and_serial_console() {
         .await
         .expect("remove the network");
 }
+
+/// Freezes the VM's VMM with `SIGSTOP` and returns its pid. A frozen VMM
+/// accepts API connections and answers none: a hung VMM.
+async fn freeze(engine: &ChEngine, id: &VmId) -> u32 {
+    let pid = engine
+        .inspect(id)
+        .await
+        .expect("inspect")
+        .pid
+        .expect("a running VM has a pid");
+    let status = std::process::Command::new("kill")
+        .args(["-STOP", &pid.to_string()])
+        .status()
+        .expect("kill -STOP");
+    assert!(status.success(), "kill -STOP {pid}");
+    pid
+}
+
+/// #434 (contract §3.8): a forced stop kills a hung VMM within a few hundred
+/// milliseconds, finishes the kill even when its caller stops waiting, and
+/// does not wait out a graceful stop that holds the VM.
+#[tokio::test]
+#[ignore = "needs /dev/kvm, root and the pinned artifacts on the lab host"]
+async fn a_forced_stop_kills_a_hung_vmm_quickly_even_when_abandoned() {
+    if !enter_lab() {
+        return;
+    }
+    let _guard = Guard::new();
+    let engine = new_engine().await;
+    let rootfs = prepare(&engine).await;
+    let id = VmId("vm_w434_hung".to_string());
+    let spec = console_spec(&id, &rootfs, "10.77.0.19", "sleep 120", 19);
+    engine.create(&spec).await.expect("create");
+
+    // A frozen VMM is killed well inside a fence's `T_force`.
+    start_vm(&engine, &id).await;
+    let pid = freeze(&engine, &id).await;
+    let began = std::time::Instant::now();
+    let stopped = engine.stop(&id, StopMode::Force).await.expect("force stop");
+    let took = began.elapsed();
+    assert_eq!(stopped.state, VmState::Stopped);
+    assert_eq!(stopped.pid, None);
+    assert!(
+        took < Duration::from_secs(1),
+        "the forced stop took {took:?}"
+    );
+    assert!(
+        !Path::new(&format!("/proc/{pid}")).exists(),
+        "the VMM {pid} survived"
+    );
+
+    // The caller stops waiting after 50 ms; the kill still happens.
+    start_vm(&engine, &id).await;
+    let pid = freeze(&engine, &id).await;
+    let abandoned =
+        tokio::time::timeout(Duration::from_millis(50), engine.stop(&id, StopMode::Force)).await;
+    assert!(abandoned.is_err(), "the caller stopped waiting");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let info = engine.inspect(&id).await.expect("inspect");
+        if info.state == VmState::Stopped {
+            assert_eq!(info.pid, None);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "still {info:?} 2 s after the caller gave up"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !Path::new(&format!("/proc/{pid}")).exists(),
+        "the VMM {pid} survived"
+    );
+
+    // A forced stop does not wait out a graceful stop that holds the VM: the
+    // graceful stop hands it over at once.
+    start_vm(&engine, &id).await;
+    let pid = freeze(&engine, &id).await;
+    let graceful = engine.stop(
+        &id,
+        StopMode::Graceful {
+            timeout: Duration::from_secs(30),
+        },
+    );
+    let forced = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let began = std::time::Instant::now();
+        let stopped = engine.stop(&id, StopMode::Force).await;
+        (stopped, began.elapsed())
+    };
+    let (graceful, (forced, took)) = tokio::join!(graceful, forced);
+    assert_eq!(forced.expect("force stop").state, VmState::Stopped);
+    assert_eq!(graceful.expect("graceful stop").state, VmState::Stopped);
+    assert!(
+        took < Duration::from_secs(1),
+        "the forced stop behind a graceful one took {took:?}"
+    );
+    assert!(
+        !Path::new(&format!("/proc/{pid}")).exists(),
+        "the VMM {pid} survived"
+    );
+
+    engine.delete(&id).await.expect("delete");
+    assert_no_leftovers(&id);
+    let tools = HostTools::discover().expect("host tools");
+    net::remove_network(&tools, BRIDGE)
+        .await
+        .expect("remove the network");
+}
