@@ -72,6 +72,20 @@ const REDIAL_BASE: Duration = Duration::from_secs(1);
 const REDIAL_MAX: Duration = Duration::from_secs(60);
 /// A session this long resets the redial backoff (section 4.4).
 const REDIAL_RESET_AFTER: Duration = Duration::from_secs(60);
+/// How long one redial attempt keeps redialing `primary_url` while it refuses
+/// the connection, before it tries the advertised addresses (issue #359). A
+/// refused connection from the address that last worked is how a restarting
+/// primary looks: the host is there and its listener comes back within a
+/// fraction of a second.
+const REFUSED_RETRY_WINDOW: Duration = Duration::from_secs(2);
+/// The pause between two dials of a `primary_url` that refused.
+const REFUSED_RETRY_STEP: Duration = Duration::from_millis(250);
+/// The connect timeout of an advertised address in the first redial attempt
+/// after a session. It doubles with each failed attempt, up to
+/// [`tls::CONNECT_TIMEOUT`], so a slow link still connects. An advertised
+/// address is a guess: some of a multi-homed primary's addresses never answer
+/// from a given node, and each one used to cost the full timeout (issue #359).
+const ADVERTISED_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// `log_hash` while `log_seq` is 0 (section 5.1).
 const ZERO_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -427,13 +441,20 @@ impl Session {
     /// [`AgentError::Identity`] when the credential or key cannot be read.
     pub async fn run(&mut self, stop: watch::Receiver<bool>) -> Result<(), AgentError> {
         let mut backoff = REDIAL_BASE;
+        let mut failed_attempts: u32 = 0;
         loop {
             if *stop.borrow() {
                 return Ok(());
             }
             let started = Instant::now();
-            match self.dial().await {
+            // A dial in progress never holds up a stop.
+            let dialed = tokio::select! {
+                dialed = self.dial(advertised_timeout(failed_attempts)) => dialed,
+                () = wait_stop(stop.clone()) => return Ok(()),
+            };
+            match dialed {
                 Ok((ws, url)) => {
+                    failed_attempts = 0;
                     self.dialed_url = Some(url);
                     let end = self.serve(ws, wait_stop(stop.clone())).await?;
                     match end {
@@ -447,6 +468,7 @@ impl Session {
                 }
                 Err(e @ AgentError::Fatal(_)) => return Err(e),
                 Err(e) => {
+                    failed_attempts = failed_attempts.saturating_add(1);
                     warn!(error = %e, "could not open the session; will redial");
                 }
             }
@@ -464,8 +486,15 @@ impl Session {
     /// fails, each URL the primary advertised in `welcome.primary_urls` in
     /// order, with the same pin and credential and no backoff between them.
     /// Returns the stream and the URL that accepted it.
+    ///
+    /// `primary_url`, the address that last worked, gets the full
+    /// [`tls::CONNECT_TIMEOUT`], and while it refuses the connection it is
+    /// dialed again every [`REFUSED_RETRY_STEP`] for [`REFUSED_RETRY_WINDOW`]
+    /// before the advertised addresses are tried. Each advertised address
+    /// gets `advertised_timeout` (issue #359).
     async fn dial(
         &self,
+        advertised_timeout: Duration,
     ) -> Result<(WebSocketStream<TlsStream<tokio::net::TcpStream>>, String), AgentError> {
         let identity = self.identity.get();
         let credential = self.identity.credential()?;
@@ -478,8 +507,13 @@ impl Session {
         }
 
         let mut last_error = None;
-        for url in candidates {
-            match dial_one(&url, &credential, &identity.fingerprint).await {
+        for (index, url) in candidates.into_iter().enumerate() {
+            let dialed = if index == 0 {
+                dial_known(&url, &credential, &identity.fingerprint).await
+            } else {
+                dial_one(&url, &credential, &identity.fingerprint, advertised_timeout).await
+            };
+            match dialed {
                 Ok(ws) => return Ok((ws, url)),
                 // A `401`/`403` from a host that passed the pin is fatal
                 // wherever it came from; no other address can help.
@@ -2261,15 +2295,56 @@ fn parse_control(text: &str) -> Result<ControlMessage, AgentError> {
     ControlMessage::from_raw(&raw).map_err(|e| AgentError::Protocol(format!("bad message: {e}")))
 }
 
-/// Opens one pinned TLS connection to `base_url` and upgrades it to the node
-/// protocol (section 3.1).
-async fn dial_one(
+/// The connect timeout of the advertised addresses after `failed_attempts`
+/// redial attempts in a row: [`ADVERTISED_CONNECT_TIMEOUT`] in the first
+/// attempt, doubling with each failed one up to [`tls::CONNECT_TIMEOUT`].
+fn advertised_timeout(failed_attempts: u32) -> Duration {
+    ADVERTISED_CONNECT_TIMEOUT
+        .saturating_mul(1 << failed_attempts.min(8))
+        .min(tls::CONNECT_TIMEOUT)
+}
+
+/// Dials `primary_url`, the address that last worked, with the full
+/// [`tls::CONNECT_TIMEOUT`]. While it refuses the TCP connection, the dial is
+/// repeated every [`REFUSED_RETRY_STEP`] for [`REFUSED_RETRY_WINDOW`]: a
+/// restarting primary refuses for a fraction of a second, and walking its
+/// other addresses meanwhile only delays the reconnect (issue #359).
+async fn dial_known(
     base_url: &str,
     credential: &str,
     fingerprint: &str,
 ) -> Result<WebSocketStream<TlsStream<tokio::net::TcpStream>>, AgentError> {
+    let deadline = Instant::now() + REFUSED_RETRY_WINDOW;
+    loop {
+        match dial_one(base_url, credential, fingerprint, tls::CONNECT_TIMEOUT).await {
+            Err(e) if is_refused(&e) && Instant::now() + REFUSED_RETRY_STEP <= deadline => {
+                debug!(url = %base_url, "the primary refused the connection; dialing it again");
+                tokio::time::sleep(REFUSED_RETRY_STEP).await;
+            }
+            dialed => return dialed,
+        }
+    }
+}
+
+/// Whether the TCP connection was refused: a host answered and nothing
+/// listens on the port.
+fn is_refused(error: &AgentError) -> bool {
+    matches!(
+        error,
+        AgentError::Io { source, .. } if source.kind() == std::io::ErrorKind::ConnectionRefused
+    )
+}
+
+/// Opens one pinned TLS connection to `base_url` within `timeout` and upgrades
+/// it to the node protocol (section 3.1).
+async fn dial_one(
+    base_url: &str,
+    credential: &str,
+    fingerprint: &str,
+    timeout: Duration,
+) -> Result<WebSocketStream<TlsStream<tokio::net::TcpStream>>, AgentError> {
     let url = session_url(base_url)?;
-    let stream = tls::connect(&url, fingerprint).await?;
+    let stream = tls::connect_with_timeout(&url, fingerprint, timeout).await?;
 
     let mut request = url
         .as_str()
@@ -2359,6 +2434,31 @@ mod tests {
             "wss://[::1]:9443/api/v1/nodes/session"
         );
         assert!(session_url("http://quoro.example.com").is_err());
+    }
+
+    #[test]
+    fn advertised_addresses_get_a_short_timeout_that_grows_with_failures() {
+        let secs = |failed| advertised_timeout(failed).as_secs();
+        assert_eq!(secs(0), 2);
+        assert_eq!(secs(1), 4);
+        assert_eq!(secs(2), 8);
+        assert_eq!(secs(3), 10, "never above the full connect timeout");
+        assert_eq!(secs(u32::MAX), 10);
+    }
+
+    #[test]
+    fn only_a_refused_tcp_connection_is_refused() {
+        let refused = AgentError::io(
+            "connect to the primary",
+            std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+        );
+        assert!(is_refused(&refused));
+        let reset = AgentError::io(
+            "connect to the primary",
+            std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+        );
+        assert!(!is_refused(&reset));
+        assert!(!is_refused(&AgentError::Tls("timed out".to_owned())));
     }
 
     #[test]
