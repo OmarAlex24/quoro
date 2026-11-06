@@ -6,6 +6,10 @@ Each entry links the pull request that made the change and, where one exists, th
 
 ## [Unreleased]
 
+### Fixed
+
+- After a restore moved an app to another node, the old node recreated the app's VM, stopped and without its volume, and kept it with its Cloud Hypervisor process until the node agent restarted. The old node now deletes the VM as soon as the restore is accepted, and keeps only the detached volume's file ([#361]).
+
 ## [v0.2.0] - 2026-11-05
 
 Milestone M5a: stateless replicas behind an edge, local volumes, cold backups and vulnerability tracking. The milestone is complete: its demo ran on the lab and was approved on 2026-11-05. Still an experimental preview, not for production ([ADR 0137]).
@@ -353,6 +357,7 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#347]: https://github.com/OmarAlex24/quoro/pull/347
 [#348]: https://github.com/OmarAlex24/quoro/pull/348
 [#353]: https://github.com/OmarAlex24/quoro/pull/353
+[#361]: https://github.com/OmarAlex24/quoro/pull/361
 [ADR 0019]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0019-fencing-is-mandatory-and-lease-based-node-agent-self-fences.md
 [ADR 0020]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0020-per-app-ha-policies-none-cold-warm-hot-with-cost-shown-in.md
 [ADR 0027]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0027-signed-binaries-and-reproducible-builds-are-mandatory.md
