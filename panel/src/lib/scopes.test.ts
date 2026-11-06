@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import permissionModel from '../../../docs/contracts/permission-model.md?raw';
 import {
   ALL_SCOPES,
   DESTRUCTIVE_SCOPES,
@@ -7,10 +8,43 @@ import {
   grantableScopesByResource,
 } from './scopes';
 
+/**
+ * The scopes the contract's sentence "N scopes are <class>: ..." names, in
+ * order (permission-model.md, sections 4.1 and 4.2).
+ */
+const contractScopes = (scopeClass: 'human-only' | 'destructive'): string[] => {
+  const sentence = new RegExp(`scopes are ${scopeClass}: ([^]*?)\\(README\\.md`).exec(
+    permissionModel,
+  );
+  expect(sentence, `permission-model.md lists the ${scopeClass} scopes`).not.toBeNull();
+  return [...(sentence?.[1] ?? '').matchAll(/`([a-z_]+:[a-z_]+)`/g)].map((match) => match[1] ?? '');
+};
+
 describe('scopes', () => {
-  it('names thirteen human-only and six destructive scopes', () => {
-    expect(HUMAN_ONLY_SCOPES.size).toBe(13);
-    expect(DESTRUCTIVE_SCOPES.size).toBe(6);
+  it('matches the human-only scopes of permission-model.md, section 4.2', () => {
+    const contract = contractScopes('human-only');
+    expect(contract).toHaveLength(15);
+    expect([...HUMAN_ONLY_SCOPES]).toEqual(contract);
+  });
+
+  it('matches the destructive scopes of permission-model.md, section 4.1', () => {
+    const contract = contractScopes('destructive');
+    expect(contract).toHaveLength(7);
+    expect([...DESTRUCTIVE_SCOPES]).toEqual(contract);
+  });
+
+  it('names only scopes the API knows', () => {
+    for (const scope of [...HUMAN_ONLY_SCOPES, ...DESTRUCTIVE_SCOPES]) {
+      expect(ALL_SCOPES).toContain(scope);
+    }
+  });
+
+  it('never offers the terminal, the backup key or a restore for a grant', () => {
+    const offered = grantableScopes();
+    expect(offered).not.toContain('app:terminal');
+    expect(offered).not.toContain('backup:manage');
+    expect(offered).not.toContain('backup:restore');
+    expect(offered).toContain('backup:read');
   });
 
   it('never offers a human-only or destructive scope for a grant', () => {
