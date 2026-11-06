@@ -10,6 +10,7 @@ Each entry links the pull request that made the change and, where one exists, th
 
 - After a restore moved an app to another node, the old node recreated the app's VM, stopped and without its volume, and kept it with its Cloud Hypervisor process until the node agent restarted. The old node now deletes the VM as soon as the restore is accepted, and keeps only the detached volume's file ([#361]).
 - After a primary restart, a node could take up to about 25 s to reconnect: when its first redial found the primary's listener still down, it tried every address the primary advertised, each with a 10 s connect timeout, before it dialed the primary's address again. A node now dials a primary that refuses the connection again for up to 2 s before it tries the other addresses, and gives each advertised address a 2 s connect timeout that grows with every failed attempt, so it reconnects within about a second of the restart. Stopping the node agent no longer waits for a dial in progress ([#368], [ADR 0139]).
+- An edge reported a backend leaving or rejoining the rotation to the primary only with its next periodic status report, so the API and the panel could lag the edge by up to 30 s. The edge now sends a status report as soon as its backend list changes. A backend's `last_error` now names the backend and the root cause, in the same words whether the proxy or a health probe saw the failure, instead of `client error (Connect)` or `client error (SendRequest)` ([#369], [ADR 0143]).
 
 ## [v0.2.0] - 2026-11-05
 
@@ -360,6 +361,7 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#353]: https://github.com/OmarAlex24/quoro/pull/353
 [#361]: https://github.com/OmarAlex24/quoro/pull/361
 [#368]: https://github.com/OmarAlex24/quoro/pull/368
+[#369]: https://github.com/OmarAlex24/quoro/pull/369
 [ADR 0019]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0019-fencing-is-mandatory-and-lease-based-node-agent-self-fences.md
 [ADR 0020]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0020-per-app-ha-policies-none-cold-warm-hot-with-cost-shown-in.md
 [ADR 0027]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0027-signed-binaries-and-reproducible-builds-are-mandatory.md

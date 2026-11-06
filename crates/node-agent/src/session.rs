@@ -666,6 +666,11 @@ impl Session {
             warn!(error = %e, "could not deliver buffered events; reconnecting");
             return Ok(SessionEnd::Reconnect);
         }
+        // An edge's rotation changes are reported like an observed-VM change
+        // (section 5.3): an edge runs no VM, so nothing else would carry them
+        // before the periodic report. The receiver is taken before the first
+        // report, so a change between the two is not missed.
+        let mut edge_changes = self.edge.as_ref().map(|edge| edge.changes());
         if let Err(e) = self.send_status(&mut sink).await {
             warn!(error = %e, "could not send the first status report; reconnecting");
             return Ok(SessionEnd::Reconnect);
@@ -752,6 +757,22 @@ impl Session {
                     if changed.is_ok()
                         && let Err(e) = self.send_status(&mut sink).await
                     {
+                        warn!(error = %e, "could not send a status report; reconnecting");
+                        return Ok(SessionEnd::Reconnect);
+                    }
+                }
+                () = async {
+                    let changed = match edge_changes.as_mut() {
+                        Some(changes) => changes.changed().await.is_ok(),
+                        None => false,
+                    };
+                    // The session holds the manager, so its sender outlives
+                    // this receiver; a closed one never wakes the loop.
+                    if !changed {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    if let Err(e) = self.send_status(&mut sink).await {
                         warn!(error = %e, "could not send a status report; reconnecting");
                         return Ok(SessionEnd::Reconnect);
                     }

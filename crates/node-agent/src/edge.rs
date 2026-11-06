@@ -18,7 +18,9 @@
 //! on it, so none of them waits for the response timeout. A backend that
 //! leaves the spec (a deployment) is not: its requests finish normally. Its decisions never
 //! change replicated state; they reach the primary only through
-//! `status_report.edge_backends`.
+//! `status_report.edge_backends`. Every change of that list is published on
+//! [`EdgeManager::changes`], so the session reports it at once instead of at
+//! the next periodic report (section 5.3).
 
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
@@ -379,6 +381,10 @@ pub struct EdgeManager {
     /// The newest snapshot revision whose `spec.edge` was handed to the
     /// supervisor; 0 before the first snapshot.
     applied: AtomicU64,
+    /// The current `status_report.edge_backends`, replaced under the state
+    /// lock after every change, so its receivers wake only when the report
+    /// would differ.
+    reported: watch::Sender<Vec<EdgeBackendStatus>>,
 }
 
 impl EdgeManager {
@@ -389,6 +395,7 @@ impl EdgeManager {
             supervisor,
             state: Mutex::new(EdgeState::default()),
             applied: AtomicU64::new(0),
+            reported: watch::channel(Vec::new()).0,
         }
     }
 
@@ -408,6 +415,29 @@ impl EdgeManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .statuses()
+    }
+
+    /// A receiver that changes whenever [`statuses`](Self::statuses) does: a
+    /// backend left or joined the rotation, its `last_error` changed, or a
+    /// snapshot added or removed backends. A report sent on that change is
+    /// what section 5.3 calls a report "on any observed change".
+    #[must_use]
+    pub fn changes(&self) -> watch::Receiver<Vec<EdgeBackendStatus>> {
+        self.reported.subscribe()
+    }
+
+    /// Publishes `state`'s statuses when they differ from the last ones.
+    /// Called with the state lock held, so the published lists follow the
+    /// same order as the changes.
+    fn publish(&self, state: &EdgeState) {
+        let statuses = state.statuses();
+        self.reported.send_if_modified(|current| {
+            if *current == statuses {
+                return false;
+            }
+            *current = statuses;
+            true
+        });
     }
 
     /// Watches the snapshot, probes the backends and pushes the tables until
@@ -453,6 +483,7 @@ impl EdgeManager {
             snapshot.and_then(|snapshot| snapshot.state.spec.edge.as_ref()),
             &now,
         );
+        self.publish(&state);
         let tables = state.tables();
         let tunnel = state.tunnel.clone();
         drop(state);
@@ -521,6 +552,9 @@ impl EdgeManager {
             }
             changed |= flipped;
         }
+        // A failed probe changes `last_error` even when the backend stays in
+        // rotation; the report carries that too.
+        self.publish(&state);
         if changed {
             let tables = state.tables();
             let tunnel = state.tunnel.clone();
@@ -563,6 +597,7 @@ impl BackendObserver for EdgeManager {
                 changed |= rotation.connect_failed(&now, error);
             }
         }
+        self.publish(&state);
         if changed {
             let tables = state.tables();
             let tunnel = state.tunnel.clone();

@@ -787,7 +787,18 @@ async fn the_observer_sees_a_backend_that_cannot_connect() {
     assert_eq!(failures.len(), 1, "{failures:?}");
     assert_eq!(failures[0].0, "edge.example.com");
     assert_eq!(failures[0].1, dead);
-    assert!(!failures[0].2.is_empty());
+    // The root cause, worded as the edge's health probes word theirs, not
+    // the client's `client error (Connect)`.
+    assert!(
+        failures[0].2.starts_with(&format!("connect to {dead}: ")),
+        "{}",
+        failures[0].2
+    );
+    assert!(
+        failures[0].2.to_ascii_lowercase().contains("refused"),
+        "{}",
+        failures[0].2
+    );
 }
 
 #[tokio::test]
@@ -1217,8 +1228,11 @@ async fn a_get_on_a_pooled_connection_lost_before_the_response_is_retried() {
         // since a healthy backend closes idle keep-alive connections too.
         let failures = observer.failures.lock().unwrap().clone();
         if rst {
+            let lost = format!("connection to {dying} lost: ");
             assert!(
-                failures.iter().any(|(_, backend, _)| *backend == dying),
+                failures
+                    .iter()
+                    .any(|(_, backend, error)| *backend == dying && error.starts_with(&lost)),
                 "{failures:?}"
             );
         } else {
