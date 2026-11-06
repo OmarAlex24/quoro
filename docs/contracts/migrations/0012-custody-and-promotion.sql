@@ -1,5 +1,6 @@
 -- Migration 0012: change-log follow, key custody, promotion and signing-key
--- rotation (ADR 0154, ADR 0179 to ADR 0182; node-agent-protocol.md section 7).
+-- rotation (ADR 0154, ADR 0179 to ADR 0182, ADR 0226 to ADR 0236;
+-- node-agent-protocol.md section 7).
 --
 -- nodes.custody_public_key is the base64 X25519 public key (32 bytes) of the
 -- custody key a machine with the `node` role generates (section 7.2), or

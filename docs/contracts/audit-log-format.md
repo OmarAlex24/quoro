@@ -353,7 +353,7 @@ Replication cycles, streams and their refusals write no record: they change no s
 
 ### 3.9 Promotion and custody (M5b)
 
-Promotion, custody and the rotation of the signing key add one call and three kinds of system record (ADR 0154, ADR 0180 to ADR 0182). The call is recorded like any mutating call:
+Promotion, custody and the rotation of the signing key add one call and three kinds of system record (ADR 0154, ADR 0180 to ADR 0182, ADR 0231 to ADR 0233). The call is recorded like any mutating call:
 
 | Operation | `scope` | `target_type` / `target_id` | Notes |
 | --- | --- | --- | --- |
