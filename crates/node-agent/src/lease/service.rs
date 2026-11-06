@@ -1481,8 +1481,12 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
 
     /// The `node.fenced` or `node.fence_failed` event of one fence (section
     /// 8.5 step 3, D-0074). Both carry `token`, the one the fence's record
-    /// carries. `node.fenced` names every VM the fence stopped, as its record
-    /// does; `node.fence_failed` names only the VMs that may still run.
+    /// carries. `node.fenced` names every VM the fence chose, each confirmed
+    /// stopped or gone, as its record does. `node.fence_failed` names the VMs
+    /// whose stop could not be confirmed, which is not every VM that may still
+    /// run: a fence that could not list the engine's VMs names none of the ones
+    /// it missed, and one whose task died names only the VMs known when it
+    /// began. Its `error` says which case it is.
     fn fence_event(
         &self,
         lease_id: &LeaseId,

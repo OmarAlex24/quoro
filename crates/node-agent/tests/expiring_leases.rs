@@ -436,6 +436,18 @@ async fn a_held_lease_is_fenced_after_a_reboot_or_a_long_suspend() {
         assert_eq!(rows[0].validity, None, "{name}");
         wait_for_fence_record(&store).await;
         assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Stopped);
+        let fenced = events_of(&store, "node.fenced").await;
+        assert_eq!(fenced.len(), 1, "{name}");
+        assert_eq!(
+            fenced[0]["data"]["fencing_tokens"],
+            serde_json::json!({ LEASE: 1 }),
+            "{name}"
+        );
+        assert_eq!(
+            fenced[0]["data"]["vm_ids"],
+            serde_json::json!(["vm_warm"]),
+            "{name}"
+        );
         leases.abort();
     }
 }
@@ -609,6 +621,10 @@ async fn an_expiry_whose_stops_hang_fails_within_the_margin() {
     let failed = events_of(&store, "node.fence_failed").await;
     assert_eq!(failed.len(), 1);
     assert_eq!(failed[0]["data"]["reason"], "lease_expired");
+    assert_eq!(
+        failed[0]["data"]["fencing_tokens"],
+        serde_json::json!({ LEASE: 1 })
+    );
     assert!(leases.view.is_failed());
     leases.abort();
 }

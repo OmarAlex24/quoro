@@ -501,8 +501,8 @@ async fn a_crash_mid_fence_fences_again_on_restart() {
     let snapshot = snapshot_full(
         1,
         vec![
-            stateful_vm("vm_one", "lse_one", 1, Vec::new()),
-            stateful_vm("vm_two", "lse_two", 1, Vec::new()),
+            stateful_vm("vm_one", "lse_one", 7, Vec::new()),
+            stateful_vm("vm_two", "lse_two", 7, Vec::new()),
         ],
         Vec::new(),
         Vec::new(),
@@ -522,7 +522,7 @@ async fn a_crash_mid_fence_fences_again_on_restart() {
             .grant(
                 msg(&format!("msg_grant_{lease}")),
                 None,
-                local_grant(lease, app, 1),
+                local_grant(lease, app, 7),
             )
             .await
             .unwrap();
@@ -535,7 +535,7 @@ async fn a_crash_mid_fence_fences_again_on_restart() {
     for lease in ["lse_one", "lse_two"] {
         let link = leases.link.clone();
         pending.push(tokio::spawn(async move {
-            link.revoke(msg(&format!("msg_revoke_{lease}")), None, revoke(lease, 1))
+            link.revoke(msg(&format!("msg_revoke_{lease}")), None, revoke(lease, 7))
                 .await
         }));
     }
@@ -573,7 +573,7 @@ async fn a_crash_mid_fence_fences_again_on_restart() {
     let (leases, store) = start(&dir, engine.clone(), &desired).await;
     for lease in ["lse_one", "lse_two"] {
         assert_eq!(leases.view.state(lease), Some(LeaseState::Revoked));
-        assert!(!leases.view.may_start_stateful(lease, 1));
+        assert!(!leases.view.may_start_stateful(lease, 7));
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     while store.fences().await.unwrap().len() < 2 {
@@ -591,7 +591,7 @@ async fn a_crash_mid_fence_fences_again_on_restart() {
     assert!(
         fences
             .iter()
-            .all(|fence| fence.complete && fence.token == 1)
+            .all(|fence| fence.complete && fence.token == 7)
     );
     let events = fenced_events(&store).await;
     assert_eq!(events.len(), 2, "one event per fence");
@@ -603,7 +603,7 @@ async fn a_crash_mid_fence_fences_again_on_restart() {
         assert_eq!(event["type"], "node.fenced");
         assert_eq!(
             event["data"]["fencing_tokens"],
-            serde_json::json!({ lease: 1 })
+            serde_json::json!({ lease: 7 })
         );
         assert_eq!(event["data"]["vm_ids"], serde_json::json!([vm]));
     }
@@ -845,6 +845,25 @@ async fn a_restart_without_a_snapshot_fences_every_app_vm() {
     assert!(fences[0].complete);
     assert!(fences[0].vm_ids.contains(&bound));
     assert!(!fences[0].vm_ids.contains(&builder));
+    // The event names the VMs the record names: the bound VM, which the
+    // first fence left running, and never the builder. The other app's VM
+    // was stopped by that first fence, so this one does not choose it.
+    let events = fenced_events(&store).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["type"], "node.fenced");
+    let named: Vec<&str> = events[0]["data"]["vm_ids"]
+        .as_array()
+        .expect("vm_ids")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    let recorded: Vec<&str> = fences[0].vm_ids.iter().map(|vm| vm.0.as_str()).collect();
+    assert_eq!(named, recorded);
+    assert!(named.contains(&"vm_bound") && !named.contains(&"bld_builder"));
+    assert_eq!(
+        events[0]["data"]["fencing_tokens"],
+        serde_json::json!({"lse_lost": 1})
+    );
     leases.abort();
 }
 
@@ -979,6 +998,13 @@ async fn a_revoke_of_a_lease_already_fenced_stops_nothing() {
     assert_eq!(higher.status, CommandStatus::Ok);
     assert_eq!(store.fences().await.unwrap().len(), 2);
     assert_eq!(store.load_highest_tokens().await.unwrap()[0].1, 2);
+    let events = fenced_events(&store).await;
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        events[1]["data"]["fencing_tokens"],
+        serde_json::json!({"lse_done": 2}),
+        "the second fence carries the higher revoke's token"
+    );
     leases.abort();
 }
 
@@ -1093,6 +1119,10 @@ async fn a_fence_that_cannot_list_the_vms_fails() {
     assert_eq!(events[0]["type"], "node.fence_failed");
     // No stop failed, so no VM is named; the error says the set is unknown.
     assert_eq!(events[0]["data"]["vm_ids"], serde_json::json!([]));
+    assert_eq!(
+        events[0]["data"]["fencing_tokens"],
+        serde_json::json!({"lse_listed": 1})
+    );
     assert!(
         events[0]["data"]["error"]
             .as_str()
