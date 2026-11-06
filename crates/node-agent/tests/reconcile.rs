@@ -1027,3 +1027,126 @@ async fn an_uncertain_lease_keeps_a_running_vm_and_starts_nothing() {
     }
     assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Crashed);
 }
+
+/// D-0224: a restart that finds a fence to run again and no verified
+/// snapshot stops every app VM. Once the first desired state verifies, the
+/// VMs of other held leases and of stateless apps start again; the fenced
+/// lease's VM stays stopped.
+#[tokio::test]
+async fn vms_swept_by_a_fence_without_a_snapshot_start_again_with_the_first_snapshot() {
+    let dir = TargetDir::new("sweep-restart");
+    let engine = Arc::new(RecordingEngine::new());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let snap = snapshot(
+        1,
+        vec![
+            spec_vm("vm_web", "prj_1", DesiredStatus::Running),
+            stateful_vm("vm_held", "lse_held", 1, Vec::new()),
+            stateful_vm("vm_lost", "lse_lost", 1, Vec::new()),
+        ],
+    );
+
+    // Everything runs while both leases are held.
+    let mut table = local_lease_table("lse_held", "app_held", 1);
+    table
+        .on_grant(
+            &quoro_proto::LeaseGrant {
+                lease_id: quoro_proto::LeaseId("lse_lost".to_owned()),
+                resource_type: quoro_proto::ResourceType::App,
+                resource_id: "app_lost".to_owned(),
+                mode: quoro_proto::LeaseMode::Local,
+                fencing_token: 1,
+                duration_ms: None,
+                granted_at: "2026-11-02T10:15:33Z".to_owned(),
+            },
+            None,
+            tokio::time::Instant::now(),
+        )
+        .expect("a local grant");
+    let (first, _observed) = reconciler(engine.clone(), store.clone());
+    let mut first = first.with_lease_view(LeaseView::new(table, false));
+    first.reconcile_once(Some(&snap)).await;
+    let ids = ["vm_web", "vm_held", "vm_lost"].map(|id| VmId(id.to_owned()));
+    for id in &ids {
+        assert_eq!(engine.inspect(id).await.unwrap().state, VmState::Running);
+    }
+    drop(first);
+
+    // The agent died mid-fence of `lse_lost`: it is stored `revoked` without
+    // a fence record, and `lse_held` is stored `held`.
+    for (lease, app, state) in [
+        ("lse_held", "app_held", quoro_node_agent::LeaseState::Held),
+        (
+            "lse_lost",
+            "app_lost",
+            quoro_node_agent::LeaseState::Revoked,
+        ),
+    ] {
+        store
+            .save_lease(
+                &quoro_node_agent::StoredLease {
+                    lease_id: quoro_proto::LeaseId(lease.to_owned()),
+                    resource_type: quoro_proto::ResourceType::App,
+                    resource_id: app.to_owned(),
+                    mode: quoro_proto::LeaseMode::Local,
+                    token: 1,
+                    state,
+                    duration: None,
+                    validity: None,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+    }
+
+    // The restart verifies no snapshot: the fence stops every app VM.
+    let (desired, desired_rx) = tokio::sync::watch::channel(None);
+    let leases = quoro_node_agent::start_local_leases(
+        engine.clone(),
+        store.clone(),
+        quoro_node_agent::LeaseConfig {
+            node_id: "nod_test".to_owned(),
+            timers: quoro_node_agent::FenceTimers {
+                grace: Duration::from_millis(20),
+                force: Duration::from_millis(20),
+            },
+        },
+        desired_rx,
+    )
+    .await
+    .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while store.fences().await.unwrap().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the fence is recorded"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    for id in &ids {
+        assert_eq!(engine.inspect(id).await.unwrap().state, VmState::Stopped);
+    }
+
+    // The first desired state verifies.
+    desired.send_replace(Some(snap.clone()));
+    let (second, _observed) = reconciler(engine.clone(), store.clone());
+    let mut second = second.with_lease_view(leases.view.clone());
+    second.reconcile_once(Some(&snap)).await;
+    assert_eq!(
+        engine.inspect(&ids[0]).await.unwrap().state,
+        VmState::Running,
+        "the stateless VM starts again"
+    );
+    assert_eq!(
+        engine.inspect(&ids[1]).await.unwrap().state,
+        VmState::Running,
+        "the VM of the held lease starts again"
+    );
+    assert_eq!(
+        engine.inspect(&ids[2]).await.unwrap().state,
+        VmState::Stopped,
+        "the fenced lease's VM stays stopped"
+    );
+    leases.abort();
+}

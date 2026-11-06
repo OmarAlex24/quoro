@@ -1046,3 +1046,119 @@ async fn the_lease_table_of_an_older_agent_gains_the_validity_columns() {
         Some(validity)
     );
 }
+
+/// Sections 5.13 and 8.5: a fence that cannot list the engine's VMs cannot
+/// confirm that every bound VM stopped, so it fails like an unconfirmed forced
+/// stop: the revoke is answered `fence_failed`, the node is marked failed in
+/// memory and in the store, and `node.fence_failed` names the listing error.
+#[tokio::test]
+async fn a_fence_that_cannot_list_the_vms_fails() {
+    let dir = TargetDir::new("lease-unlisted");
+    let engine = Arc::new(FakeEngine::new());
+    let snapshot = snapshot_full(
+        1,
+        vec![stateful_vm("vm_listed", "lse_listed", 1, Vec::new())],
+        Vec::new(),
+        Vec::new(),
+    );
+    let (desired, _) = watch::channel(Some(snapshot));
+    let (leases, store) = start(&dir, engine.clone(), &desired).await;
+    leases
+        .link
+        .grant(
+            msg("msg_grant"),
+            None,
+            local_grant("lse_listed", "app_listed", 1),
+        )
+        .await
+        .unwrap();
+    let vm = common::running_vm(&engine, "vm_listed", 2).await;
+    // An app VM the snapshot does not name: only the listing would find it.
+    let unnamed = common::running_vm(&engine, "vm_unnamed", 3).await;
+
+    engine.fail_next(
+        quoro_engine::FakeOp::List,
+        quoro_engine::EngineError::Io("the VM state file is unreadable".to_owned()),
+    );
+    let result = leases
+        .link
+        .revoke(msg("msg_revoke"), None, revoke("lse_listed", 1))
+        .await
+        .unwrap();
+    assert_eq!(result.status, CommandStatus::Error);
+    assert_eq!(
+        result.error.as_ref().map(|error| error.code),
+        Some(ErrorCode::FenceFailed)
+    );
+    assert!(
+        result
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("could not list the engine's VMs")),
+        "{:?}",
+        result.detail
+    );
+    // The VM the fence knew of is stopped all the same; the one only the
+    // listing would have found still runs, which is why the fence failed.
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Stopped);
+    assert_eq!(
+        engine.inspect(&unnamed).await.unwrap().state,
+        VmState::Running
+    );
+    assert!(leases.view.is_failed());
+    assert!(store.node_failed().await.unwrap());
+    let fences = store.fences().await.unwrap();
+    assert_eq!(fences.len(), 1);
+    assert!(!fences[0].complete);
+    assert_eq!(fences[0].vm_ids, vec![vm.clone()]);
+    let events = fenced_events(&store).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["type"], "node.fence_failed");
+    // No stop failed, so no VM is named; the error says the set is unknown.
+    assert_eq!(events[0]["data"]["vm_ids"], serde_json::json!([]));
+    assert!(
+        events[0]["data"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("could not list the engine's VMs")
+                && error.contains("any app VM on this node may still run"))
+    );
+
+    // The answer is final: a redelivery gets it again and fences nothing.
+    let stops = stops_of(&engine, &vm);
+    let again = leases
+        .link
+        .revoke(msg("msg_revoke"), None, revoke("lse_listed", 1))
+        .await
+        .unwrap();
+    assert_eq!(again, result);
+    assert_eq!(stops_of(&engine, &vm), stops);
+    leases.abort();
+    drop(store);
+
+    // A restart keeps the node failed and runs no fence: the failed fence is
+    // recorded, and nothing stateful starts until an operator acknowledges it.
+    let stops_before = engine.stop_calls().len();
+    let (desired, _) = watch::channel(None);
+    let (leases, store) = start(&dir, engine.clone(), &desired).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(engine.stop_calls().len(), stops_before);
+    assert!(leases.view.is_failed());
+    assert!(!leases.view.may_start_stateful("lse_listed", 1));
+    assert_eq!(leases.view.state("lse_listed"), Some(LeaseState::Revoked));
+
+    // A new revoke fences again; the listing works now, so the unnamed VM is
+    // stopped and the fence is complete. The node stays failed.
+    let result = leases
+        .link
+        .revoke(msg("msg_revoke_again"), None, revoke("lse_listed", 1))
+        .await
+        .unwrap();
+    assert_eq!(result.status, CommandStatus::Ok, "{result:?}");
+    assert_eq!(
+        engine.inspect(&unnamed).await.unwrap().state,
+        VmState::Stopped
+    );
+    assert!(leases.view.is_failed());
+    assert!(store.node_failed().await.unwrap());
+    leases.abort();
+}
