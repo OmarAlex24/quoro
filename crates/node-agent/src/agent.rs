@@ -37,6 +37,7 @@ use crate::session::{Session, SessionSetup, wait_stop};
 use crate::store::NodeStore;
 use crate::transcript::{self, TranscriptLimits};
 use crate::warm::receiver::{ReceiverOptions, WarmReceiver};
+use crate::warm::sender::{SenderOptions, WarmSender};
 use crate::warm::{StatusBoard, VolumeLocks};
 use crate::{AgentConfig, AgentError, NodeFacts, util};
 
@@ -175,16 +176,25 @@ pub async fn run<E: Engine + 'static>(
     );
 
     // Warm replication (section 6.13): the receiver holds the copies this
-    // node is the target of. Its status entries go out in
-    // `status_report.warm`.
+    // node is the target of, and the sender ships the volumes it is the
+    // source of. Their status entries go out in `status_report.warm`.
     let (warm_board, warm_statuses) = StatusBoard::new();
     let warm_receiver = WarmReceiver::new(
         Arc::clone(&engine),
         store.clone(),
         desired.subscribe(),
+        warm_locks.clone(),
+        warm_board.clone(),
+        ReceiverOptions::default(),
+    );
+    let warm_sender = WarmSender::new(
+        Arc::clone(&engine),
+        store.clone(),
+        desired.subscribe(),
+        leases.view.clone(),
         warm_locks,
         warm_board,
-        ReceiverOptions::default(),
+        SenderOptions::default(),
     );
 
     let (stop, stop_rx) = watch::channel(false);
@@ -207,6 +217,7 @@ pub async fn run<E: Engine + 'static>(
     let backup_task =
         tokio::spawn(backup_manager.run(desired.subscribe(), wait_stop(stop_rx.clone())));
     let warm_task = tokio::spawn(warm_receiver.run(wait_stop(stop_rx.clone())));
+    let warm_sender_task = tokio::spawn(warm_sender.run(wait_stop(stop_rx.clone())));
 
     // Terminal transcripts are pruned at agent start and then hourly; each
     // terminal session also prunes once it ends (section 3.3).
@@ -266,6 +277,7 @@ pub async fn run<E: Engine + 'static>(
     let _ = edge_task.await;
     let _ = backup_task.await;
     let _ = warm_task.await;
+    let _ = warm_sender_task.await;
     ingress.shutdown().await;
     shutdown_task.abort();
     outcome
