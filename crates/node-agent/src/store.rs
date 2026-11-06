@@ -24,7 +24,7 @@ use serde_json::Value;
 use sqlx::Row as _;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 use crate::AgentError;
 use crate::lease::{FenceRecord, LeaseState, StoredLease};
@@ -189,6 +189,10 @@ pub struct NodeStore {
     /// the order they were handed out and a live stream never sees one go
     /// backwards.
     pub(crate) log_gate: Arc<tokio::sync::Mutex<()>>,
+    /// The newest revision [`Self::set_applied_rev`] recorded in this
+    /// process, so the session reports it without waiting for the periodic
+    /// report (section 5.3).
+    pub(crate) applied: Arc<watch::Sender<u64>>,
 }
 
 /// A node-wide monotonic clock in nanoseconds since the Unix epoch.
@@ -439,6 +443,7 @@ impl NodeStore {
             clock: Arc::new(LogClock::new(last_log)),
             logs_tx,
             log_gate: Arc::new(tokio::sync::Mutex::new(())),
+            applied: Arc::new(watch::channel(0).0),
         })
     }
 
@@ -646,7 +651,16 @@ impl NodeStore {
     ///
     /// [`AgentError::Store`] on a SQLite failure.
     pub async fn set_applied_rev(&self, rev: u64) -> Result<(), AgentError> {
-        self.set_meta(APPLIED_REV, &rev.to_string()).await
+        self.set_meta(APPLIED_REV, &rev.to_string()).await?;
+        self.applied.send_replace(rev);
+        Ok(())
+    }
+
+    /// A receiver that changes every time [`Self::set_applied_rev`] records a
+    /// revision.
+    #[must_use]
+    pub fn applied_changes(&self) -> watch::Receiver<u64> {
+        self.applied.subscribe()
     }
 
     /// How many events the buffer has dropped since the last delivery.

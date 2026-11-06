@@ -87,6 +87,12 @@ const REFUSED_RETRY_STEP: Duration = Duration::from_millis(250);
 /// from a given node, and each one used to cost the full timeout (issue #359).
 const ADVERTISED_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long a status report for a newly applied revision waits, so a
+/// reconcile pass that also changes the observed VMs sends one report, not
+/// two. A report sent for another reason in the meantime carries the
+/// revision, and then none is sent for it.
+const APPLIED_REPORT_DELAY: Duration = Duration::from_millis(250);
+
 /// `log_hash` while `log_seq` is 0 (section 5.1).
 const ZERO_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -294,6 +300,8 @@ pub struct Session {
     /// (section 5.10). `None` when the session was handed a stream directly
     /// (tests driving [`Session::serve`]).
     dialed_url: Option<String>,
+    /// The `applied_rev` of the last status report sent.
+    reported_applied_rev: u64,
 }
 
 impl Session {
@@ -331,6 +339,7 @@ impl Session {
             backups: None,
             inventory: None,
             dialed_url: None,
+            reported_applied_rev: 0,
         }
     }
 
@@ -671,6 +680,11 @@ impl Session {
         // before the periodic report. The receiver is taken before the first
         // report, so a change between the two is not missed.
         let mut edge_changes = self.edge.as_ref().map(|edge| edge.changes());
+        // A newly applied revision is an observed change too (section 5.3):
+        // a revision that changes no VM and no route, which is most of an
+        // edge's, would otherwise wait for the periodic report (issue #346).
+        let mut applied_changes = self.store.applied_changes();
+        let mut applied_report_at: Option<Instant> = None;
         if let Err(e) = self.send_status(&mut sink).await {
             warn!(error = %e, "could not send the first status report; reconnecting");
             return Ok(SessionEnd::Reconnect);
@@ -773,6 +787,30 @@ impl Session {
                     }
                 } => {
                     if let Err(e) = self.send_status(&mut sink).await {
+                        warn!(error = %e, "could not send a status report; reconnecting");
+                        return Ok(SessionEnd::Reconnect);
+                    }
+                }
+                () = async {
+                    // The store's sender lives as long as the session's store;
+                    // a closed receiver never wakes the loop.
+                    if applied_changes.changed().await.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    applied_report_at.get_or_insert(Instant::now() + APPLIED_REPORT_DELAY);
+                }
+                () = async {
+                    match applied_report_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    applied_report_at = None;
+                    let applied = self.store.applied_rev().await.unwrap_or(0);
+                    if applied > self.reported_applied_rev
+                        && let Err(e) = self.send_status(&mut sink).await
+                    {
                         warn!(error = %e, "could not send a status report; reconnecting");
                         return Ok(SessionEnd::Reconnect);
                     }
@@ -1628,8 +1666,9 @@ impl Session {
             Some(hub) => hub.images(&self.spec_image_digests()).await,
             None => Vec::new(),
         };
+        let applied_rev = self.store.applied_rev().await.unwrap_or(0);
         let report = StatusReport {
-            applied_rev: self.store.applied_rev().await.unwrap_or(0),
+            applied_rev,
             vms: self.observed.borrow().clone(),
             routes: self.routes(),
             capacity: self.facts.capacity,
@@ -1656,7 +1695,9 @@ impl Session {
                 .map_or_else(Vec::new, |backups| backups.borrow().clone()),
             images,
         };
-        write_message(sink, NodeMessage::StatusReport(report), None).await
+        write_message(sink, NodeMessage::StatusReport(report), None).await?;
+        self.reported_applied_rev = applied_rev;
+        Ok(())
     }
 
     /// The `image_digest` of every VM in the current spec, for

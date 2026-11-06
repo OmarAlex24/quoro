@@ -594,6 +594,7 @@ async fn status_within(ws: &mut WebSocketStream<DuplexStream>, limit: Duration) 
 /// An edge running `first`, and a session over it whose handshake is done.
 struct EdgeSession {
     edge: Arc<EdgeManager>,
+    store: NodeStore,
     snapshots: watch::Sender<Option<Snapshot>>,
     ws: WebSocketStream<DuplexStream>,
     /// The status report the session sent after `welcome`.
@@ -629,7 +630,7 @@ impl EdgeSession {
         let (_observed_tx, observed_rx) = watch::channel(Vec::new());
         let mut session = Session::new(SessionSetup {
             identity,
-            store,
+            store: store.clone(),
             facts: facts(),
             desired,
             observed: observed_rx,
@@ -667,6 +668,7 @@ impl EdgeSession {
         let first = read_until(&mut ws, "status_report").await;
         Self {
             edge,
+            store,
             snapshots,
             ws,
             first,
@@ -772,6 +774,34 @@ async fn an_edge_reports_a_failed_probe_and_the_backend_it_takes_out() {
     assert_eq!(
         edge_entries(&out),
         vec![("vm_a".to_owned(), false, Some("health_check".to_owned()))]
+    );
+    run.finish().await;
+}
+
+#[tokio::test]
+async fn a_newly_applied_revision_is_reported_without_waiting_for_the_periodic_report() {
+    // An edge: no VM changes, so only the applied revision moves.
+    let mut run = EdgeSession::start(edge_snapshot(1, vec![edge_backend("vm_a", 18080)], 60)).await;
+    assert_eq!(run.first["body"]["applied_rev"], 0);
+
+    run.store.set_applied_rev(2).await.unwrap();
+    let report = status_within(&mut run.ws, Duration::from_secs(2))
+        .await
+        .expect("a status report within 2 s of the applied revision");
+    assert_eq!(report["body"]["applied_rev"], 2);
+
+    // Revisions applied back to back go out in one report.
+    run.store.set_applied_rev(3).await.unwrap();
+    run.store.set_applied_rev(4).await.unwrap();
+    let report = status_within(&mut run.ws, Duration::from_secs(2))
+        .await
+        .expect("a status report within 2 s of the applied revisions");
+    assert_eq!(report["body"]["applied_rev"], 4);
+    assert!(
+        status_within(&mut run.ws, Duration::from_secs(1))
+            .await
+            .is_none(),
+        "a second report for revisions already reported"
     );
     run.finish().await;
 }
