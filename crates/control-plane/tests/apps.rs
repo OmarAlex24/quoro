@@ -458,9 +458,12 @@ async fn deployment_ids(
     server: &common::Server,
     node_id: &str,
 ) -> std::collections::HashMap<String, String> {
-    deploy::deployment_ids_for_node(&server.state.store, node_id)
+    deploy::deployments_for_node(&server.state.store, node_id)
         .await
         .unwrap()
+        .into_iter()
+        .map(|(vm_id, deployment)| (vm_id, deployment.id))
+        .collect()
 }
 
 #[tokio::test]

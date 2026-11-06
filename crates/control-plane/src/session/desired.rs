@@ -144,7 +144,7 @@ pub async fn build_spec(
     let moving_away = apps_restoring_elsewhere(store.pool(), node_id).await?;
     let (volumes, attachments) = load_node_volumes(store.pool(), node_id).await?;
     let leases = load_app_leases(store.pool(), node_id).await?;
-    let deployments = deploy::deployment_ids_for_node(store, node_id)
+    let deployments = deploy::deployments_for_node(store, node_id)
         .await
         .map_err(|e| format!("cannot link the VMs to their deployments: {e}"))?;
     let mut conn = store
@@ -186,6 +186,16 @@ pub async fn build_spec(
             }
             None => None,
         };
+        // A VM's digest is fixed when it is created (section 6.2): the one its
+        // deployment recorded with the first snapshot that named it. Only a
+        // new deployment, with a new VM id, resolves the reference again, so
+        // a restart with an empty cache never moves a running VM to the
+        // tag's new digest (issue #354).
+        let known_digest = known_digest.or_else(|| {
+            deployments
+                .get(&vm_id)
+                .and_then(|deployment| deployment.image_digest.clone())
+        });
         let image_digest = match known_digest {
             Some(digest) => digest,
             None => match resolve_digest(resolver, cache, &image).await {
@@ -231,7 +241,9 @@ pub async fn build_spec(
                     Some(app.port),
                     app.health_check.clone(),
                     env,
-                    deployments.get(&vm_id).cloned(),
+                    deployments
+                        .get(&vm_id)
+                        .map(|deployment| deployment.id.clone()),
                 )
             }
             None => (None, None, BTreeMap::new(), None),

@@ -262,6 +262,10 @@ pub struct Reconciler<E: Engine> {
     node_id: Option<String>,
     spec_meta: HashMap<String, SpecMeta>,
     health: HashMap<String, HealthState>,
+    /// Per VM, the requested digest last refused because the VM's digest is
+    /// create-time only: the refusal is logged once per VM and digest, not on
+    /// every pass (issue #354).
+    refused_digests: HashMap<String, String>,
     /// The app-route supervisor, when the agent runs one (worker hook for
     /// `M2` apps). `None` in tests that only exercise the engine.
     ingress: Option<Arc<crate::ingress::IngressSupervisor>>,
@@ -302,6 +306,7 @@ impl<E: Engine + 'static> Reconciler<E> {
                 network_failed: false,
                 timings: HashMap::new(),
                 last_states: HashMap::new(),
+                refused_digests: HashMap::new(),
                 once_only: Vec::new(),
                 published: None,
                 collector,
@@ -922,6 +927,7 @@ impl<E: Engine + 'static> Reconciler<E> {
                     self.last_states.remove(&vm_id);
                     self.timings.remove(&vm_id);
                     self.health.remove(&vm_id);
+                    self.refused_digests.remove(&vm_id);
                     info = None;
                 }
                 Err(e) => {
@@ -1004,11 +1010,15 @@ impl<E: Engine + 'static> Reconciler<E> {
             && !known.is_empty()
             && known != vm.image_digest
         {
-            warn!(
-                vm_id,
-                known, requested = %vm.image_digest,
-                "a VM's image digest is create-time only; deploy a new VM id to change it"
-            );
+            if first_refusal(&mut self.refused_digests, &vm_id, &vm.image_digest) {
+                warn!(
+                    vm_id,
+                    known, requested = %vm.image_digest,
+                    "a VM's image digest is create-time only; deploy a new VM id to change it"
+                );
+            }
+        } else {
+            self.refused_digests.remove(&vm_id);
         }
 
         let applied_generation = self
@@ -1747,6 +1757,7 @@ impl<E: Engine + 'static> Reconciler<E> {
                     }
                     self.timings.remove(&vm_id);
                     self.health.remove(&vm_id);
+                    self.refused_digests.remove(&vm_id);
                     self.collector.detach(&vm_id);
                     self.once_only.push(VmStatus {
                         vm_id: vm_id.clone(),
@@ -1872,6 +1883,17 @@ fn truncate_error(error: &str) -> String {
     util::one_line(error, 2_000)
 }
 
+/// Records that `vm_id` was refused `requested`, and returns whether that is
+/// new: the first refusal of a digest, or one after the VM was asked for
+/// another.
+fn first_refusal(refused: &mut HashMap<String, String>, vm_id: &str, requested: &str) -> bool {
+    if refused.get(vm_id).is_some_and(|last| last == requested) {
+        return false;
+    }
+    refused.insert(vm_id.to_string(), requested.to_string());
+    true
+}
+
 /// The `node_meta` key that remembers one VM's create-time image digest.
 fn digest_key(vm_id: &str) -> String {
     format!("image_digest:{vm_id}")
@@ -1938,6 +1960,19 @@ async fn next_event(stream: &mut EventStream) -> Option<EngineEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #354: a refused digest is logged once per VM and digest, not on
+    /// every pass; a VM asked for yet another digest is logged again.
+    #[test]
+    fn a_refused_digest_is_reported_once_per_vm_and_digest() {
+        let mut refused = HashMap::new();
+        assert!(first_refusal(&mut refused, "vm_a", "sha256:new"));
+        assert!(!first_refusal(&mut refused, "vm_a", "sha256:new"));
+        assert!(!first_refusal(&mut refused, "vm_a", "sha256:new"));
+        assert!(first_refusal(&mut refused, "vm_b", "sha256:new"));
+        assert!(first_refusal(&mut refused, "vm_a", "sha256:newer"));
+        assert!(!first_refusal(&mut refused, "vm_a", "sha256:newer"));
+    }
 
     #[test]
     fn subnets_skip_the_reserved_addresses() {
