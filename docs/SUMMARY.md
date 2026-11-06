@@ -250,6 +250,7 @@
   - [0243: Both stop modes carry a caller-supplied bound, and a forced stop the engine began finishes after a dropped call](adr/0243-both-stop-modes-carry-a-caller-supplied-bound-and-a-forced.md)
   - [0244: A converted lease's row keeps mode local until the primary answers its first renewal, and is written expiring then](adr/0244-a-converted-lease-s-row-keeps-mode-local-until-the-primary.md)
   - [0245: fence_ack carries each lease's acknowledged token, and the node clears only failed fences below it](adr/0245-fence-ack-carries-each-lease-s-acknowledged-token-and-the.md)
+  - [0246: A fence started by a lease_revoke records its failure with the revoke's token; a fence acknowledgement bumps only the listed leases the node still holds](adr/0246-a-fence-started-by-a-lease-revoke-records-its-failure-with.md)
 
 # Background research
 

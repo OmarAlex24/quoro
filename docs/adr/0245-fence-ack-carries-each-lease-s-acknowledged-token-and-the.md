@@ -1,12 +1,12 @@
 # ADR 0245: fence_ack carries each lease's acknowledged token, and the node clears only failed fences below it
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0246](0246-a-fence-started-by-a-lease-revoke-records-its-failure-with.md)
 - **Date:** 2026-11-06
 - **Ledger id:** D-0245
 - **Tags:** m5b, leases, contracts
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** none
+- **Related:** [ADR 0246](0246-a-fence-started-by-a-lease-revoke-records-its-failure-with.md)
 
 ## Context
 
@@ -27,6 +27,7 @@ _Some wording was changed for the public repository._
 
 ## Consequences
 
+- [ADR 0246](0246-a-fence-started-by-a-lease-revoke-records-its-failure-with.md) refines which token a fence started by a lease_revoke records, and which listed leases a fence acknowledgement bumps. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---
