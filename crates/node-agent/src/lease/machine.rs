@@ -11,10 +11,14 @@ use std::time::Duration;
 use quoro_proto::{FenceReason, LeaseGrant, LeaseId, LeaseMode, LeaseRevoke, MsgId, ResourceType};
 use tokio::time::Instant;
 
+use crate::lease::clock::HostNow;
 use crate::lease::store::StoredLease;
 
 /// The floor the authority must respect for an `expiring` grant (section 8.4).
 pub const MIN_DURATION: Duration = Duration::from_millis(3000);
+
+/// The longest `duration_ms` a grant may carry (section 5.12).
+const MAX_DURATION: Duration = Duration::from_millis(600_000);
 
 /// `M = max(1000 ms, D / 10)`, the margin of section 8.4.
 #[must_use]
@@ -126,32 +130,27 @@ impl LeaseTable {
     ///
     /// - `local` leases come back with their state and token.
     /// - `expiring` leases that were `held` or `uncertain` come back
-    ///   `expired` and are fenced: the timing that proved them valid did not
-    ///   survive the restart, so the safe choice is to stop and wait for a new
-    ///   grant with a higher token.
+    ///   `uncertain` with their remaining validity when it was stored on this
+    ///   host boot and has not run out on `CLOCK_BOOTTIME` (section 8.4 "Agent
+    ///   restart", ADR 0072): they renew at once and start nothing until the
+    ///   authority answers. Otherwise they come back `expired` and are fenced:
+    ///   after a reboot, or with no stored validity (a first grant never
+    ///   answered), nothing proves the lease is still valid.
     /// - `expired` and `revoked` stay as they are. One whose fence has no
     ///   record for its token was interrupted by the restart (section 8.5
-    ///   "Concurrency", D-0075): it is fenced again, because the VMMs outlive
+    ///   "Concurrency", ADR 0075): it is fenced again, because the VMMs outlive
     ///   the agent and a half-done stop may have left a VM running.
     /// - The highest token per resource comes back exactly.
     ///
-    /// The contract (section 8.4, D-0072) requires a `held` `expiring` lease
-    /// to survive an agent restart inside the same host boot: the remaining
-    /// validity must be persisted against the kernel boot id and measured with
-    /// `CLOCK_BOOTTIME`, so a restarted agent can prove the lease is still
-    /// valid. M0 keeps the conservative fence instead of proving it.
-    //
-    // TODO(M5b, D-0072): persist the remaining validity against the boot id and
-    // `CLOCK_BOOTTIME`, and restore a `held` `expiring` lease as held with its
-    // remaining validity instead of fencing it.
-    #[must_use]
-    ///
     /// `fenced` holds the lease id and token of every recorded fence, complete
     /// or not: a failed fence is covered by the node's failed mark instead.
+    /// `now` is one reading of the host clock and the monotonic clock.
+    #[must_use]
     pub fn restore(
         leases: Vec<StoredLease>,
         highest: Vec<((ResourceType, String), u64)>,
         fenced: &HashSet<(LeaseId, u64)>,
+        now: &HostNow,
     ) -> (Self, Vec<Action>) {
         let mut table = Self::new();
         for entry in highest {
@@ -159,18 +158,30 @@ impl LeaseTable {
         }
         let mut actions = Vec::new();
         for stored in leases {
-            let state = match stored.mode {
-                LeaseMode::Local => stored.state,
-                LeaseMode::Expiring => match stored.state {
-                    LeaseState::Held | LeaseState::Uncertain => {
+            let mut valid_until = None;
+            let state = match (stored.mode, stored.state) {
+                (LeaseMode::Expiring, LeaseState::Held | LeaseState::Uncertain) => match stored
+                    .validity
+                    .as_ref()
+                    .and_then(|validity| now.restore(validity))
+                {
+                    Some(until)
+                        if stored
+                            .duration
+                            .is_some_and(|d| plausible_validity(d, until, now.instant)) =>
+                    {
+                        valid_until = Some(until);
+                        LeaseState::Uncertain
+                    }
+                    _ => {
                         actions.push(Action::Fence {
                             lease_id: stored.lease_id.clone(),
                             reason: FenceReason::LeaseExpired,
                         });
                         LeaseState::Expired
                     }
-                    other => other,
                 },
+                (_, other) => other,
             };
             // A lease that reached a fenced state always starts a fence, and
             // the fence's record is written once its stop finished. A fenced
@@ -205,8 +216,10 @@ impl LeaseTable {
                     token: stored.token,
                     state,
                     duration: stored.duration,
-                    valid_until: None,
-                    next_renew_at: None,
+                    valid_until,
+                    // A lease that came back with its validity renews at once
+                    // (section 8.4 "Agent restart").
+                    next_renew_at: valid_until.map(|_| now.instant),
                     outstanding: Vec::new(),
                 },
             );
@@ -568,6 +581,23 @@ impl LeaseTable {
         })
     }
 
+    /// Section 8.4: whether a stateful VM with this spec token that is
+    /// already running may keep running. True while the node holds the lease
+    /// `held` or `uncertain` with exactly that token, the highest seen for
+    /// the resource: an `uncertain` lease keeps its VMs and starts nothing new.
+    /// Only an `uncertain` lease with a deadline keeps its VMs, so the timer
+    /// fences them at that deadline; one with none (a first grant that was
+    /// never confirmed) never had VMs of its own.
+    #[must_use]
+    pub fn may_keep_running(&self, lease_id: &LeaseId, spec_token: u64) -> bool {
+        self.leases.get(lease_id).is_some_and(|lease| {
+            (lease.state == LeaseState::Held
+                || (lease.state == LeaseState::Uncertain && lease.valid_until.is_some()))
+                && lease.token == spec_token
+                && lease.token == self.highest_for(lease.resource_type, &lease.resource_id)
+        })
+    }
+
     /// The lease with this id, if the node knows it.
     #[must_use]
     pub fn get(&self, lease_id: &LeaseId) -> Option<&Lease> {
@@ -600,6 +630,14 @@ impl Default for LeaseTable {
     }
 }
 
+/// Whether a restored `valid_until` can come from a grant of duration `d`:
+/// `d` within the bounds of section 5.12, and no more than `D - M` left
+/// (section 8.4). Anything else is a damaged row, and the lease is fenced.
+fn plausible_validity(d: Duration, until: Instant, now: Instant) -> bool {
+    (MIN_DURATION..=MAX_DURATION).contains(&d)
+        && until.saturating_duration_since(now) <= d.saturating_sub(margin(d))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -611,6 +649,7 @@ mod tests {
     use tokio::time::Instant;
 
     use super::{Action, LeaseState, LeaseTable, MIN_DURATION, Refusal, RevokeOutcome, margin};
+    use crate::lease::clock::{HostNow, ManualHostClock, StoredValidity};
     use crate::lease::store::StoredLease;
 
     fn millis(ms: u64) -> Duration {
@@ -1290,9 +1329,15 @@ mod tests {
             token: 7,
             state: LeaseState::Uncertain,
             duration: Some(millis(15000)),
+            validity: None,
         };
         let highest = vec![((ResourceType::App, "app_test".to_string()), 7_u64)];
-        let (table, actions) = LeaseTable::restore(vec![stored], highest, &HashSet::new());
+        let (table, actions) = LeaseTable::restore(
+            vec![stored],
+            highest,
+            &HashSet::new(),
+            &HostNow::unknown(Instant::now()),
+        );
         assert_eq!(
             actions,
             vec![Action::Fence {
@@ -1322,6 +1367,7 @@ mod tests {
                 token: 2,
                 state: LeaseState::Held,
                 duration: None,
+                validity: None,
             },
             StoredLease {
                 lease_id: LeaseId("lse_revoked".to_string()),
@@ -1331,12 +1377,18 @@ mod tests {
                 token: 3,
                 state: LeaseState::Revoked,
                 duration: None,
+                validity: None,
             },
         ];
         let fenced: HashSet<(LeaseId, u64)> = [(LeaseId("lse_revoked".to_string()), 3)]
             .into_iter()
             .collect();
-        let (table, actions) = LeaseTable::restore(leases, Vec::new(), &fenced);
+        let (table, actions) = LeaseTable::restore(
+            leases,
+            Vec::new(),
+            &fenced,
+            &HostNow::unknown(Instant::now()),
+        );
         assert!(actions.is_empty());
         assert_eq!(
             table
@@ -1368,6 +1420,7 @@ mod tests {
                 LeaseMode::Local => None,
                 LeaseMode::Expiring => Some(millis(15000)),
             },
+            validity: None,
         }
     }
 
@@ -1390,7 +1443,12 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let (table, actions) = LeaseTable::restore(leases, Vec::new(), &fenced);
+        let (table, actions) = LeaseTable::restore(
+            leases,
+            Vec::new(),
+            &fenced,
+            &HostNow::unknown(Instant::now()),
+        );
         assert_eq!(
             actions,
             vec![
@@ -1422,13 +1480,229 @@ mod tests {
     #[test]
     fn restore_fences_a_held_expiring_lease_once() {
         let leases = vec![stored("lse_e", LeaseMode::Expiring, 7, LeaseState::Held)];
-        let (_table, actions) = LeaseTable::restore(leases, Vec::new(), &HashSet::new());
+        let (_table, actions) = LeaseTable::restore(
+            leases,
+            Vec::new(),
+            &HashSet::new(),
+            &HostNow::unknown(Instant::now()),
+        );
         assert_eq!(
             actions,
             vec![Action::Fence {
                 lease_id: LeaseId("lse_e".to_string()),
                 reason: FenceReason::LeaseExpired,
             }]
+        );
+    }
+
+    /// Holds an expiring lease, stores it through `clock`, and returns the
+    /// stored row with its `valid_until` (D = 15 s, so 13.5 s after `t0`).
+    fn held_and_stored(clock: &ManualHostClock, t0: Instant) -> (StoredLease, Instant) {
+        let mut table = LeaseTable::new();
+        let grant = expiring("lse_e", 7, 15000);
+        table.on_grant(&grant, None, t0).expect("grant");
+        confirm(&mut table, &grant, t0);
+        let lease = table.get(&LeaseId("lse_e".to_string())).expect("lease");
+        let until = lease.valid_until.expect("held with a deadline");
+        (StoredLease::from_lease(lease, &HostNow::read(clock)), until)
+    }
+
+    /// Section 8.4 "Agent restart" (ADR 0072): within the same boot a held
+    /// expiring lease comes back `uncertain` with what is left of its
+    /// validity, renews at once, keeps its VMs and starts nothing.
+    #[tokio::test(start_paused = true)]
+    async fn restore_keeps_a_held_expiring_lease_within_the_same_boot() {
+        let clock = ManualHostClock::new(Some("boot-a"), millis(500_000));
+        let t0 = Instant::now();
+        let (stored, _until) = held_and_stored(&clock, t0);
+        assert_eq!(
+            stored.validity,
+            Some(StoredValidity {
+                boot_id: "boot-a".to_string(),
+                until_boottime: millis(513_500),
+            })
+        );
+
+        // The agent restarts 4 s later.
+        tokio::time::advance(millis(4000)).await;
+        let now = HostNow::read(&clock);
+        let highest = vec![((ResourceType::App, "app_test".to_string()), 7_u64)];
+        let (mut table, actions) =
+            LeaseTable::restore(vec![stored], highest, &HashSet::new(), &now);
+        assert!(actions.is_empty(), "nothing is fenced");
+        let id = LeaseId("lse_e".to_string());
+        let lease = table.get(&id).expect("lease");
+        assert_eq!(lease.state, LeaseState::Uncertain);
+        assert_eq!(lease.valid_until, Some(now.instant + millis(9500)));
+        assert!(!table.may_start_stateful(&id, 7), "starts nothing new");
+        assert!(table.may_keep_running(&id, 7), "keeps what runs");
+        assert!(!table.may_keep_running(&id, 6));
+        assert_eq!(
+            table.poll(now.instant),
+            vec![Action::SendRenew {
+                lease_id: id.clone(),
+                fencing_token: 7,
+            }],
+            "renews at once"
+        );
+
+        // Unanswered, it expires at the restored deadline, not later.
+        let expiry = now.instant + millis(9500);
+        assert!(
+            !table
+                .poll(expiry - millis(1))
+                .iter()
+                .any(|action| matches!(action, Action::Fence { .. }))
+        );
+        assert_eq!(
+            table.poll(expiry),
+            vec![Action::Fence {
+                lease_id: id,
+                reason: FenceReason::LeaseExpired,
+            }]
+        );
+    }
+
+    /// The renewal a restored lease sends makes it `held` again when it is
+    /// answered with the same token.
+    #[tokio::test(start_paused = true)]
+    async fn a_restored_lease_is_held_again_once_its_renewal_is_answered() {
+        let clock = ManualHostClock::new(Some("boot-a"), millis(500_000));
+        let (stored, _) = held_and_stored(&clock, Instant::now());
+        tokio::time::advance(millis(2000)).await;
+        let now = HostNow::read(&clock);
+        let (mut table, _) = LeaseTable::restore(vec![stored], Vec::new(), &HashSet::new(), &now);
+        let id = LeaseId("lse_e".to_string());
+        let _ = table.poll(now.instant);
+        let renew = MsgId("msg_after_restart".to_string());
+        table.renew_sent(&id, renew.clone(), now.instant);
+        table
+            .on_grant(&expiring("lse_e", 7, 15000), Some(&renew), now.instant)
+            .expect("the answer");
+        let lease = table.get(&id).expect("lease");
+        assert_eq!(lease.state, LeaseState::Held);
+        assert_eq!(lease.valid_until, Some(now.instant + millis(13500)));
+        assert!(table.may_start_stateful(&id, 7));
+    }
+
+    /// After a reboot, after the validity ran out, with no stored validity,
+    /// or with a row no grant could have produced, a held expiring lease comes
+    /// back `expired` and is fenced.
+    #[tokio::test(start_paused = true)]
+    async fn restore_fences_a_held_expiring_lease_it_cannot_prove() {
+        for case in [
+            "reboot",
+            "ran out",
+            "suspended past it",
+            "no validity",
+            "no duration",
+            "more left than D - M",
+            "duration below the floor",
+            "duration above the ceiling",
+            "stored uncertain, ran out",
+        ] {
+            let clock = ManualHostClock::new(Some("boot-a"), millis(500_000));
+            let (mut stored, _) = held_and_stored(&clock, Instant::now());
+            match case {
+                "reboot" => clock.reboot("boot-b", millis(1000)),
+                "ran out" => tokio::time::advance(millis(13_500)).await,
+                "suspended past it" => clock.suspend(millis(20_000)),
+                "no validity" => stored.validity = None,
+                "no duration" => stored.duration = None,
+                "more left than D - M" => {
+                    if let Some(validity) = stored.validity.as_mut() {
+                        validity.until_boottime += millis(1);
+                    }
+                }
+                "duration below the floor" => stored.duration = Some(millis(2999)),
+                "duration above the ceiling" => stored.duration = Some(millis(600_001)),
+                _ => {
+                    stored.state = LeaseState::Uncertain;
+                    tokio::time::advance(millis(13_500)).await;
+                }
+            }
+            let now = HostNow::read(&clock);
+            let (table, actions) =
+                LeaseTable::restore(vec![stored], Vec::new(), &HashSet::new(), &now);
+            let id = LeaseId("lse_e".to_string());
+            assert_eq!(
+                actions,
+                vec![Action::Fence {
+                    lease_id: id.clone(),
+                    reason: FenceReason::LeaseExpired,
+                }],
+                "{case}"
+            );
+            let lease = table.get(&id).expect("lease");
+            assert_eq!(lease.state, LeaseState::Expired, "{case}");
+            assert!(!table.may_keep_running(&id, 7), "{case}");
+        }
+    }
+
+    /// A stored `uncertain` lease within its validity comes back `uncertain`
+    /// with what is left, like a held one.
+    #[tokio::test(start_paused = true)]
+    async fn restore_keeps_a_stored_uncertain_lease_within_its_validity() {
+        let clock = ManualHostClock::new(Some("boot-a"), millis(500_000));
+        let (mut stored, _) = held_and_stored(&clock, Instant::now());
+        stored.state = LeaseState::Uncertain;
+        tokio::time::advance(millis(3000)).await;
+        let now = HostNow::read(&clock);
+        let (table, actions) = LeaseTable::restore(vec![stored], Vec::new(), &HashSet::new(), &now);
+        assert!(actions.is_empty());
+        let lease = table.get(&LeaseId("lse_e".to_string())).expect("lease");
+        assert_eq!(lease.state, LeaseState::Uncertain);
+        assert_eq!(lease.valid_until, Some(now.instant + millis(10_500)));
+    }
+
+    /// Section 8.4: an `uncertain` lease with no deadline, a first grant that
+    /// was never confirmed, keeps no running VM, since nothing would ever
+    /// fence it.
+    #[tokio::test(start_paused = true)]
+    async fn an_unconfirmed_first_grant_keeps_no_running_vm() {
+        let mut table = LeaseTable::new();
+        table
+            .on_grant(&expiring("lse_e", 1, 15000), None, Instant::now())
+            .expect("grant");
+        let id = LeaseId("lse_e".to_string());
+        assert_eq!(table.get(&id).expect("lease").state, LeaseState::Uncertain);
+        assert!(!table.may_start_stateful(&id, 1));
+        assert!(!table.may_keep_running(&id, 1));
+    }
+
+    /// An uncertain lease whose first grant was never answered has no
+    /// validity to store, and a fenced one stores none.
+    #[tokio::test(start_paused = true)]
+    async fn only_a_known_validity_is_stored() {
+        let clock = ManualHostClock::new(Some("boot-a"), millis(500_000));
+        let mut table = LeaseTable::new();
+        let grant = expiring("lse_e", 1, 15000);
+        let t0 = Instant::now();
+        table.on_grant(&grant, None, t0).expect("grant");
+        let id = LeaseId("lse_e".to_string());
+        let lease = table.get(&id).expect("lease");
+        assert_eq!(lease.state, LeaseState::Uncertain);
+        assert_eq!(
+            StoredLease::from_lease(lease, &HostNow::read(&clock)).validity,
+            None
+        );
+
+        confirm(&mut table, &grant, t0);
+        let _ = table.poll(t0 + millis(13_500));
+        let lease = table.get(&id).expect("lease");
+        assert_eq!(lease.state, LeaseState::Expired);
+        assert_eq!(
+            StoredLease::from_lease(lease, &HostNow::read(&clock)).validity,
+            None
+        );
+
+        table
+            .on_grant(&local_on("lse_l", "app_l", 1), None, t0)
+            .expect("grant");
+        let local = table.get(&LeaseId("lse_l".to_string())).expect("lease");
+        assert_eq!(
+            StoredLease::from_lease(local, &HostNow::read(&clock)).validity,
+            None
         );
     }
 

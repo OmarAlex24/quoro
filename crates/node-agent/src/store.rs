@@ -27,7 +27,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use tokio::sync::{broadcast, watch};
 
 use crate::AgentError;
-use crate::lease::{FenceRecord, LeaseState, StoredLease};
+use crate::lease::{FenceRecord, LeaseState, StoredLease, StoredValidity};
 use crate::localkey::LocalKey;
 use crate::logs::CapturedLine;
 use crate::util;
@@ -150,7 +150,9 @@ CREATE TABLE IF NOT EXISTS leases (
     mode          TEXT NOT NULL,
     token         INTEGER NOT NULL,
     state         TEXT NOT NULL,
-    duration_ms   INTEGER
+    duration_ms   INTEGER,
+    validity_boot_id        TEXT,
+    valid_until_boottime_ns INTEGER
 );
 CREATE TABLE IF NOT EXISTS lease_tokens (
     resource_type TEXT NOT NULL,
@@ -401,6 +403,10 @@ impl BackupRecord {
 
 /// The `node_meta` key holding the node's failed mark (section 12).
 const NODE_FAILED: &str = "node_failed";
+
+/// The `node_meta` key holding the kernel boot id the agent last started on
+/// (section 12 `host_boot_id`, section 8.4 "Agent restart").
+pub const HOST_BOOT_ID: &str = "host_boot_id";
 
 impl NodeStore {
     /// Opens (creating when missing) `<data_dir>/node.db` in WAL mode with
@@ -1680,6 +1686,10 @@ fn lease_record(row: sqlx::sqlite::SqliteRow) -> Result<StoredLease, AgentError>
     let state: String = row.try_get("state").map_err(store_error)?;
     let token: i64 = row.try_get("token").map_err(store_error)?;
     let duration_ms: Option<i64> = row.try_get("duration_ms").map_err(store_error)?;
+    let validity_boot_id: Option<String> = row.try_get("validity_boot_id").map_err(store_error)?;
+    let valid_until_ns: Option<i64> = row
+        .try_get("valid_until_boottime_ns")
+        .map_err(store_error)?;
     Ok(StoredLease {
         lease_id: LeaseId(row.try_get("lease_id").map_err(store_error)?),
         resource_type: parse_resource_type(&resource_type)?,
@@ -1690,6 +1700,13 @@ fn lease_record(row: sqlx::sqlite::SqliteRow) -> Result<StoredLease, AgentError>
         duration: duration_ms
             .and_then(|ms| u64::try_from(ms).ok())
             .map(Duration::from_millis),
+        validity: match (validity_boot_id, valid_until_ns) {
+            (Some(boot_id), Some(ns)) => u64::try_from(ns).ok().map(|ns| StoredValidity {
+                boot_id,
+                until_boottime: Duration::from_nanos(ns),
+            }),
+            _ => None,
+        },
     })
 }
 
@@ -1739,12 +1756,22 @@ async fn upsert_lease(
     let duration_ms = lease
         .duration
         .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX));
+    // A validity that does not fit is not stored: the restart then fences
+    // the lease, the safe side.
+    let validity = lease.validity.as_ref().and_then(|validity| {
+        i64::try_from(validity.until_boottime.as_nanos())
+            .ok()
+            .map(|ns| (validity.boot_id.as_str(), ns))
+    });
     sqlx::query(
         "INSERT INTO leases (lease_id, resource_type, resource_id, mode, token, state, \
-         duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?) \
+         duration_ms, validity_boot_id, valid_until_boottime_ns) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(lease_id) DO UPDATE SET resource_type = excluded.resource_type, \
          resource_id = excluded.resource_id, mode = excluded.mode, token = excluded.token, \
-         state = excluded.state, duration_ms = excluded.duration_ms",
+         state = excluded.state, duration_ms = excluded.duration_ms, \
+         validity_boot_id = excluded.validity_boot_id, \
+         valid_until_boottime_ns = excluded.valid_until_boottime_ns",
     )
     .bind(&lease.lease_id.0)
     .bind(resource_type_str(lease.resource_type))
@@ -1753,6 +1780,8 @@ async fn upsert_lease(
     .bind(i64::try_from(lease.token).unwrap_or(i64::MAX))
     .bind(lease_state_str(lease.state))
     .bind(duration_ms)
+    .bind(validity.map(|(boot_id, _)| boot_id))
+    .bind(validity.map(|(_, ns)| ns))
     .execute(&mut **tx)
     .await
     .map_err(store_error)?;
@@ -1852,9 +1881,10 @@ async fn buffer_event(
     Ok(())
 }
 
-/// Adds `desired_state.body_enc` to a database created before bodies were
-/// encrypted. New databases get the column from [`SCHEMA`]; existing ones are
-/// altered once, and the old plaintext `body` rows keep loading.
+/// Adds the columns newer agents need to a database an older agent created:
+/// `desired_state.body_enc` (bodies encrypted) and the two validity columns
+/// of `leases`. New databases get them from [`SCHEMA`]; existing ones are
+/// altered once, and the old rows keep loading.
 async fn migrate(pool: &SqlitePool) -> Result<(), AgentError> {
     let columns = sqlx::query("PRAGMA table_info(desired_state)")
         .fetch_all(pool)
@@ -1869,6 +1899,28 @@ async fn migrate(pool: &SqlitePool) -> Result<(), AgentError> {
             .execute(pool)
             .await
             .map_err(store_error)?;
+    }
+
+    // A held `expiring` lease's validity on `CLOCK_BOOTTIME` (section 8.4
+    // "Agent restart", ADR 0072); rows written before it read as none.
+    let columns = sqlx::query("PRAGMA table_info(leases)")
+        .fetch_all(pool)
+        .await
+        .map_err(store_error)?;
+    let names: Vec<String> = columns
+        .iter()
+        .filter_map(|row| row.try_get::<String, _>("name").ok())
+        .collect();
+    for (column, kind) in [
+        ("validity_boot_id", "TEXT"),
+        ("valid_until_boottime_ns", "INTEGER"),
+    ] {
+        if !names.iter().any(|name| name == column) {
+            sqlx::query(&format!("ALTER TABLE leases ADD COLUMN {column} {kind}"))
+                .execute(pool)
+                .await
+                .map_err(store_error)?;
+        }
     }
     Ok(())
 }

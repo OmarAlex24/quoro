@@ -14,6 +14,7 @@ use quoro_proto::{
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
+use crate::lease::clock::HostNow;
 use crate::lease::fence::{FenceReport, FenceTimers, VmFenceOutcome, budget_for, stop_vms};
 use crate::lease::machine::{Action, Lease, LeaseTable, Refusal, RevokeOutcome};
 use crate::lease::store::{FenceRecord, LeaseStore, StoredLease};
@@ -66,8 +67,14 @@ impl<'e, E: Engine, S: LeaseStore> LeaseAgent<'e, E, S> {
             .into_iter()
             .map(|record| (record.lease_id, record.token))
             .collect();
-        let (table, pending_fences) =
-            LeaseTable::restore(store.load_leases(), store.load_highest_tokens(), &fenced);
+        let (table, pending_fences) = LeaseTable::restore(
+            store.load_leases(),
+            store.load_highest_tokens(),
+            &fenced,
+            // M0's in-memory store keeps no host clock: every held
+            // `expiring` lease is fenced on restart, the conservative side.
+            &HostNow::unknown(Instant::now()),
+        );
         let failed = store.node_failed();
         Self {
             engine,
@@ -353,8 +360,10 @@ impl<'e, E: Engine, S: LeaseStore> LeaseAgent<'e, E, S> {
             .table
             .highest_for(lease.resource_type, &lease.resource_id)
             .max(lease.token);
-        self.store
-            .save_lease(&StoredLease::from_lease(lease), highest);
+        self.store.save_lease(
+            &StoredLease::from_lease(lease, &HostNow::unknown(Instant::now())),
+            highest,
+        );
     }
 
     fn remember(&mut self, id: MsgId, result: CommandResult) {

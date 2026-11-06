@@ -940,3 +940,90 @@ async fn a_volume_being_restored_is_not_ready_and_no_vm_attaches_it() {
         "the VM starts once the restore is ready"
     );
 }
+
+/// Section 8.4: while a lease is `uncertain` with the spec's token, a stateful
+/// VM that already runs keeps running and one that stopped is not started
+/// again (ADR 0072: a held lease restored after an agent restart comes back
+/// `uncertain`).
+#[tokio::test]
+async fn an_uncertain_lease_keeps_a_running_vm_and_starts_nothing() {
+    let dir = TargetDir::new("volume-uncertain");
+    let engine = Arc::new(RecordingEngine::new());
+    engine.inner().set_volume_dir(dir.path());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let snap = snapshot_full(
+        1,
+        vec![stateful_vm(
+            "vm_warm",
+            "lse_1",
+            2,
+            vec![volume_attach("vol_warm", "/data")],
+        )],
+        Vec::new(),
+        vec![spec_volume(
+            "vol_warm",
+            "app_1",
+            1,
+            SpecVolumeState::Present,
+        )],
+    );
+
+    // The lease is held: the VM starts.
+    let (held, _observed) = reconciler(engine.clone(), store.clone());
+    let mut held = held.with_lease_view(LeaseView::new(
+        local_lease_table("lse_1", "app_1", 2),
+        false,
+    ));
+    let statuses = held.reconcile_once(Some(&snap)).await;
+    assert_eq!(statuses[0].observed_status, ObservedStatus::Running);
+    drop(held);
+
+    // The same lease, now `expiring`, restored `uncertain` with the same
+    // token after an agent restart on the same boot.
+    let clock = quoro_node_agent::ManualHostClock::new(
+        Some("boot-a"),
+        std::time::Duration::from_secs(1000),
+    );
+    let now = quoro_node_agent::HostNow::read(&clock);
+    let stored = quoro_node_agent::StoredLease {
+        lease_id: quoro_proto::LeaseId("lse_1".to_owned()),
+        resource_type: quoro_proto::ResourceType::App,
+        resource_id: "app_1".to_owned(),
+        mode: quoro_proto::LeaseMode::Expiring,
+        token: 2,
+        state: quoro_node_agent::LeaseState::Held,
+        duration: Some(std::time::Duration::from_millis(15_000)),
+        validity: Some(quoro_node_agent::StoredValidity {
+            boot_id: "boot-a".to_owned(),
+            until_boottime: std::time::Duration::from_secs(1010),
+        }),
+    };
+    let (table, fences) = quoro_node_agent::LeaseTable::restore(
+        vec![stored],
+        vec![((quoro_proto::ResourceType::App, "app_1".to_owned()), 2)],
+        &std::collections::HashSet::new(),
+        &now,
+    );
+    assert!(fences.is_empty(), "restored, not fenced");
+    let view = LeaseView::new(table, false);
+    assert!(!view.may_start_stateful("lse_1", 2));
+    assert!(view.may_keep_running("lse_1", 2));
+    let (uncertain, _observed) = reconciler(engine.clone(), store.clone());
+    let mut uncertain = uncertain.with_lease_view(view);
+    let vm = VmId("vm_warm".to_owned());
+    let stops = engine.stops().len();
+    for _ in 0..3 {
+        let statuses = uncertain.reconcile_once(Some(&snap)).await;
+        assert_eq!(statuses[0].observed_status, ObservedStatus::Running);
+    }
+    assert_eq!(engine.stops().len(), stops, "the running VM is not stopped");
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Running);
+
+    // It exits on its own: nothing starts it again while the lease is
+    // uncertain.
+    engine.inner().crash(&vm, "boom");
+    for _ in 0..3 {
+        let _ = uncertain.reconcile_once(Some(&snap)).await;
+    }
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Crashed);
+}

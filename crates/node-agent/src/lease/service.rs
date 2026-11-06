@@ -63,11 +63,12 @@ use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use crate::AgentError;
+use crate::lease::clock::{HostNow, SystemHostClock};
 use crate::lease::fence::{FenceReport, FenceTimers, VmFenceOutcome, budget_for, stop_vms};
 use crate::lease::machine::{LeaseState, LeaseTable, Refusal, RevokeOutcome};
 use crate::lease::store::{FenceRecord, StoredLease};
 use crate::reconcile::Snapshot;
-use crate::store::NodeStore;
+use crate::store::{HOST_BOOT_ID, NodeStore};
 use crate::util;
 
 /// What the service needs that is not the engine or the store.
@@ -155,6 +156,18 @@ impl LeaseView {
         !self.failed.load(Ordering::SeqCst)
             && !self.gates.fencing().contains(&lease_id)
             && self.lock().may_start_stateful(&lease_id, spec_token)
+    }
+
+    /// Section 8.4: may a stateful VM with this spec token that already runs
+    /// keep running? True while the lease is `held` or `uncertain` with that
+    /// token: an `uncertain` lease keeps its VMs and starts nothing new. Not
+    /// while the node is marked failed or a fence of the lease is running.
+    #[must_use]
+    pub fn may_keep_running(&self, lease_id: &str, spec_token: u64) -> bool {
+        let lease_id = LeaseId(lease_id.to_owned());
+        !self.failed.load(Ordering::SeqCst)
+            && !self.gates.fencing().contains(&lease_id)
+            && self.lock().may_keep_running(&lease_id, spec_token)
     }
 
     /// Section 6.4 at the moment of the start: waits until no fence of the
@@ -306,7 +319,8 @@ impl LocalLeases {
 ///
 /// # Errors
 ///
-/// [`AgentError`] when the stored lease rows cannot be read.
+/// [`AgentError`] when the stored lease rows cannot be read or the restored
+/// state cannot be written back.
 pub async fn start_local_leases<E: Engine + 'static>(
     engine: Arc<E>,
     store: NodeStore,
@@ -323,11 +337,40 @@ pub async fn start_local_leases<E: Engine + 'static>(
         .into_iter()
         .map(|record| (record.lease_id, record.token))
         .collect();
+    let host = HostNow::read(&SystemHostClock);
+    // This service has no renewal loop yet, so nothing could renew a restored
+    // `expiring` lease or fence it at its deadline: the restore keeps fencing
+    // every such lease, the conservative M0 rule, until the loop arrives
+    // (section 8.4 "Agent restart", #75).
+    let now = HostNow::unknown(host.instant);
     let (table, pending) = LeaseTable::restore(
         store.load_leases().await?,
         store.load_highest_tokens().await?,
         &fenced,
+        &now,
     );
+    // An `expiring` lease the restore could not prove is written back
+    // `expired` before its fence begins, so the store never keeps a
+    // validity the table no longer stands behind.
+    // Both writes are best effort: a store that takes no writes must not
+    // keep the agent from starting the fences the restore found, and a
+    // validity that failed to restore once fails again on this boot.
+    for lease in table.leases() {
+        if lease.mode == LeaseMode::Expiring {
+            let highest = table.highest_for(lease.resource_type, &lease.resource_id);
+            if let Err(e) = store
+                .save_lease(&StoredLease::from_lease(lease, &now), highest)
+                .await
+            {
+                warn!(error = %e, lease_id = %lease.id.0, "could not write back a restored lease");
+            }
+        }
+    }
+    if let Some(boot_id) = &host.boot_id
+        && let Err(e) = store.set_meta(HOST_BOOT_ID, boot_id).await
+    {
+        warn!(error = %e, "could not store the host boot id");
+    }
     let failed = store.node_failed().await?;
     let view = LeaseView::new(table, failed);
     let (commands, command_rx) = mpsc::unbounded_channel();
@@ -514,7 +557,10 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
         if let Some(lease) = lease
             && let Err(e) = self
                 .store
-                .save_lease(&StoredLease::from_lease(&lease), highest)
+                .save_lease(
+                    &StoredLease::from_lease(&lease, &HostNow::read(&SystemHostClock)),
+                    highest,
+                )
                 .await
         {
             warn!(error = %e, "could not persist a lease grant");
@@ -623,7 +669,10 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
         };
         if let Err(e) = self
             .store
-            .save_lease(&StoredLease::from_lease(&lease), highest)
+            .save_lease(
+                &StoredLease::from_lease(&lease, &HostNow::read(&SystemHostClock)),
+                highest,
+            )
             .await
         {
             warn!(error = %e, "could not persist a lease");
@@ -737,6 +786,7 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
 
         // A revoke that joined the fence may have raised the lease's token;
         // the fence covers it too, so the record carries the newest one.
+        let host = HostNow::read(&SystemHostClock);
         let (lease, token, row) = {
             let table = self.lock();
             let lease = table.get(&lease_id).cloned();
@@ -749,7 +799,7 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
             // or not at all, and a fenced lease is never restored `held`.
             let row = lease.as_ref().map(|lease| {
                 (
-                    StoredLease::from_lease(lease),
+                    StoredLease::from_lease(lease, &host),
                     table.highest_for(lease.resource_type, &lease.resource_id),
                 )
             });

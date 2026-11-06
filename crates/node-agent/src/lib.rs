@@ -43,10 +43,11 @@ pub use build::manager::{BuildManager, BuildsHandle};
 pub use identity::{Identity, is_enrolled};
 pub use ingress::{DnsBridge, IngressConfig, IngressSupervisor};
 pub use lease::{
-    Action, FenceRecord, FenceReport, FenceTimers, Lease, LeaseAgent, LeaseAgentConfig,
-    LeaseConfig, LeaseLink, LeaseState, LeaseStore, LeaseTable, LeaseView, LocalLeases,
-    MIN_DURATION, MemoryLeaseStore, Refusal, RevokeOutcome, StartPermit, StoredLease,
-    VmFenceOutcome, budget_for, margin, start_local_leases, stop_vms,
+    Action, FenceRecord, FenceReport, FenceTimers, HostClock, HostNow, Lease, LeaseAgent,
+    LeaseAgentConfig, LeaseConfig, LeaseLink, LeaseState, LeaseStore, LeaseTable, LeaseView,
+    LocalLeases, MIN_DURATION, ManualHostClock, MemoryLeaseStore, Refusal, RevokeOutcome,
+    StartPermit, StoredLease, StoredValidity, SystemHostClock, VmFenceOutcome, budget_for, margin,
+    start_local_leases, stop_vms,
 };
 pub use set_primary::{SetPrimary, set_primary, verify_primary, write_primary};
 
