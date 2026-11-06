@@ -789,8 +789,8 @@
 
     "data_domain_served": {
       "type": "object",
-      "description": "A machine serves an `unserved` domain's hostname again: the domain's `serving_status` went from `unserved` to `serving` (ADR 0167). `unserved_since` is when it became `unserved`. Payload fields are additive within schema_version 1.",
-      "required": ["domain_id", "app_id", "hostname", "tls_mode", "unserved_since"],
+      "description": "A machine serves an `unserved` domain's hostname again: the domain's `serving_status` went from `unserved` to `serving` (ADR 0167). `unserved_since`, when the primary knows it, is when the domain became `unserved`, like `degraded_since` on `app.up`. Payload fields are additive within schema_version 1.",
+      "required": ["domain_id", "app_id", "hostname", "tls_mode"],
       "properties": {
         "domain_id": { "$ref": "#/$defs/DomainId" },
         "app_id": { "$ref": "#/$defs/AppId" },
