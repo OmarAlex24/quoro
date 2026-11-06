@@ -155,9 +155,9 @@ pub struct LeaseView {
 /// What keeps a stateful start and a fence of the same lease apart.
 ///
 /// Lock order: the lease table first, then these sets. A lease enters
-/// `fencing` and `stopping` while the service still holds the table lock that
-/// moved it out of `held` or `uncertain`, so whoever reads the new state reads
-/// the sets after it and finds the lease there.
+/// `stopping`, then `fencing`, while the service still holds the table lock
+/// that moved it out of `held` or `uncertain`. Whoever reads the new state, or
+/// finds the lease in `fencing`, therefore finds it in `stopping` too.
 #[derive(Debug, Default)]
 struct FenceGates {
     /// Leases whose fence is running or not yet recorded: nothing stateful
@@ -166,6 +166,9 @@ struct FenceGates {
     /// Leases whose fence has not finished stopping their VMs yet: the
     /// fence alone stops those VMs (section 8.5 step 1).
     stopping: Mutex<HashSet<LeaseId>>,
+    /// Woken whenever a lease enters `stopping`, so a stop the reconciler has
+    /// under way gives way to the fence.
+    triggers: tokio::sync::Notify,
     /// One gate per lease: a start holds it shared, a fence exclusively.
     gates: Mutex<HashMap<LeaseId, Arc<RwLock<()>>>>,
 }
@@ -186,8 +189,9 @@ impl FenceGates {
     /// A fence of `lease_id` is triggered: nothing starts for the lease, and
     /// its VMs are the fence's to stop.
     fn triggered(&self, lease_id: &LeaseId) {
-        self.fencing().insert(lease_id.clone());
         self.stopping().insert(lease_id.clone());
+        self.fencing().insert(lease_id.clone());
+        self.triggers.notify_waiters();
     }
 
     fn gate(&self, lease_id: &LeaseId) -> Arc<RwLock<()>> {
@@ -285,6 +289,23 @@ impl LeaseView {
         self.gates
             .stopping()
             .contains(&LeaseId(lease_id.to_owned()))
+    }
+
+    /// Resolves once a fence of the lease is stopping its VMs (see
+    /// [`Self::fence_owns_stop`]); at once if one already is. A stop of one of
+    /// those VMs that races this gives up when it resolves, which releases
+    /// the engine's lock on the VM for the fence.
+    pub async fn fence_triggered(&self, lease_id: &str) {
+        let lease_id = LeaseId(lease_id.to_owned());
+        loop {
+            let notified = self.gates.triggers.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.gates.stopping().contains(&lease_id) {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// Whether the node is marked failed (section 12 `node_meta`).
@@ -1088,20 +1109,37 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                 let _ = reply.send(Ok(result));
             }
             Ok(RevokeOutcome::Fence { lease_id }) => {
-                // Persist the revoked state before stopping anything, so an
-                // agent that dies mid-fence restores the lease as revoked,
-                // never as held (section 8.5 step 2).
-                self.persist(&lease_id).await;
+                let triggered_at = Instant::now();
+                let waiter = Some(Waiter {
+                    msg: envelope.id,
+                    reply,
+                });
+                let expiring = self
+                    .lock()
+                    .get(&lease_id)
+                    .is_some_and(|lease| lease.mode == LeaseMode::Expiring);
+                if expiring {
+                    // An `expiring` lease's VMs must stop before the primary's
+                    // gate, so the stop begins before anything waits on the
+                    // store. An agent that dies before the write restores the
+                    // lease with its stored deadline, which is no later than
+                    // the one it had, and the clock fences it (section 8.4).
+                    self.begin_fence(
+                        lease_id.clone(),
+                        FenceReason::LeaseRevoked,
+                        waiter,
+                        triggered_at,
+                    );
+                    self.persist(&lease_id).await;
+                } else {
+                    // A `local` lease has no deadline: its revoked state is
+                    // persisted before stopping anything, so an agent that
+                    // dies mid-fence restores it as revoked, never as held
+                    // (section 8.5 step 2).
+                    self.persist(&lease_id).await;
+                    self.begin_fence(lease_id, FenceReason::LeaseRevoked, waiter, triggered_at);
+                }
                 self.publish_hello();
-                self.begin_fence(
-                    lease_id,
-                    FenceReason::LeaseRevoked,
-                    Some(Waiter {
-                        msg: envelope.id,
-                        reply,
-                    }),
-                    Instant::now(),
-                );
             }
         }
     }
@@ -1212,7 +1250,13 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
         let desired = self.desired.clone();
         let known = vms.clone();
         let fenced = lease_id.clone();
+        // Leaves `stopping` when the stop is over, however the task ends.
+        let stopping = StoppingGuard {
+            gates: Arc::clone(&self.view.gates),
+            lease_id: lease_id.clone(),
+        };
         let handle = self.tasks.spawn(async move {
+            let _stopping = stopping;
             // A start that holds the gate finishes first; its VM is then
             // among those stopped here.
             let _exclusive = gate.write_owned().await;
@@ -1463,6 +1507,20 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
 
     fn publish_hello(&self) {
         let _ = self.hello.send_replace(hello_leases(&self.view.table));
+    }
+}
+
+/// Takes a lease out of `stopping` when its fence task ends, returns or not:
+/// a task aborted with the service, or one that panicked, must not leave the
+/// reconciler waiting for a stop that will never come.
+struct StoppingGuard {
+    gates: Arc<FenceGates>,
+    lease_id: LeaseId,
+}
+
+impl Drop for StoppingGuard {
+    fn drop(&mut self) {
+        self.gates.stopping().remove(&self.lease_id);
     }
 }
 

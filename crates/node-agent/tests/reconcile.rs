@@ -1256,3 +1256,114 @@ async fn the_reconciler_leaves_a_fenced_vm_to_its_fence() {
     assert_eq!(engine.inner().stop_calls().len(), 1);
     leases.abort();
 }
+
+/// Section 8.5 step 1: a reconciler stop that is already under way when a
+/// fence of the VM's lease is triggered gives up at once, which releases the
+/// engine's lock on the VM, and the fence stops the VM itself.
+#[tokio::test]
+async fn a_reconciler_stop_under_way_gives_up_when_the_fence_is_triggered() {
+    let dir = TempDir::new();
+    let engine = Arc::new(RecordingEngine::new());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let running = stateful_vm("vm_raced", "lse_raced", 1, Vec::new());
+    let stopped = SpecVm {
+        desired_status: DesiredStatus::Stopped,
+        ..running.clone()
+    };
+    let snap = snapshot_full(1, vec![running], Vec::new(), Vec::new());
+    let snap_stopped = snapshot_full(2, vec![stopped], Vec::new(), Vec::new());
+    let (_desired, desired_rx) = tokio::sync::watch::channel(Some(snap.clone()));
+    let leases = quoro_node_agent::start_local_leases(
+        engine.clone(),
+        store.clone(),
+        quoro_node_agent::LeaseConfig::new(
+            "nod_test",
+            quoro_node_agent::FenceTimers {
+                grace: Duration::from_secs(60),
+                force: Duration::from_secs(60),
+            },
+        ),
+        desired_rx,
+    )
+    .await
+    .unwrap();
+    leases
+        .link
+        .grant(
+            quoro_proto::MsgId("msg_grant".to_owned()),
+            None,
+            quoro_proto::LeaseGrant {
+                lease_id: quoro_proto::LeaseId("lse_raced".to_owned()),
+                resource_type: quoro_proto::ResourceType::App,
+                resource_id: "app_raced".to_owned(),
+                mode: quoro_proto::LeaseMode::Local,
+                fencing_token: 1,
+                duration_ms: None,
+                granted_at: "2026-11-02T10:15:33Z".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    let (reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let mut reconciler = reconciler.with_lease_view(leases.view.clone());
+    reconciler.reconcile_once(Some(&snap)).await;
+    let id = VmId("vm_raced".to_owned());
+    assert_eq!(engine.inspect(&id).await.unwrap().state, VmState::Running);
+
+    // An operator stop of the held lease's VM takes 3 s.
+    engine.inner().set_stop_delay(&id, Duration::from_secs(3));
+    let stopping = tokio::spawn(async move {
+        reconciler.reconcile_once(Some(&snap_stopped)).await;
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while engine.inner().stop_calls().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the reconciler stops the VM"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // The lease is revoked while that stop runs.
+    let revoked_at = std::time::Instant::now();
+    let link = leases.link.clone();
+    let revoke = tokio::spawn(async move {
+        link.revoke(
+            quoro_proto::MsgId("msg_revoke".to_owned()),
+            None,
+            quoro_proto::LeaseRevoke {
+                lease_id: quoro_proto::LeaseId("lse_raced".to_owned()),
+                fencing_token: 1,
+                reason: quoro_proto::RevokeReason::Deleted,
+            },
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), stopping)
+        .await
+        .expect("the reconciler's stop gives up for the fence")
+        .unwrap();
+    assert!(revoked_at.elapsed() < Duration::from_secs(1));
+    // The fence's own stop follows, once its lease is saved revoked.
+    let fence_stop = StopMode::Graceful {
+        timeout: Duration::from_secs(60),
+    };
+    while !engine
+        .inner()
+        .stop_calls()
+        .iter()
+        .any(|(_, mode)| *mode == fence_stop)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the fence stops the VM"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let answer = revoke.await.unwrap().expect("the revoke is answered");
+    assert_eq!(answer.status, quoro_proto::CommandStatus::Ok);
+    assert_eq!(engine.inspect(&id).await.unwrap().state, VmState::Stopped);
+    assert!(!leases.view.fence_owns_stop("lse_raced"));
+    leases.abort();
+}
