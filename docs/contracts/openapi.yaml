@@ -7714,7 +7714,8 @@ paths:
           lease: the lease's gate (`App.lease.gate_at`, section 8.4) has not
           passed and no fence of it was confirmed. A lease that is still
           `local` (section 8.4, "Changing the mode") is held until the node is
-          declared lost (`declareNodeLost`).
+          declared lost (`declareNodeLost`), and so is a lease converted to
+          `expiring` whose holder has had no renewal answered yet.
 
         When the source is connected, the primary first revokes its lease
         over the session and goes on once the revoke is answered; that loses

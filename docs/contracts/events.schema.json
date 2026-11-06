@@ -340,6 +340,13 @@
         "node_id": { "$ref": "#/$defs/NodeId" },
         "app_ids": { "type": "array", "items": { "$ref": "#/$defs/AppId" } },
         "lease_ids": { "type": "array", "items": { "$ref": "#/$defs/LeaseId" } },
+        "fencing_tokens": {
+          "type": "object",
+          "description": "The fencing token the node held for each lease in lease_ids when it fenced, keyed by lease id (node-agent-protocol.md section 8.5 steps 2 and 3). From M5b the node always sends it.",
+          "propertyNames": { "$ref": "#/$defs/LeaseId" },
+          "additionalProperties": { "type": "integer", "minimum": 1 }
+        },
+        "vm_ids": { "type": "array", "items": { "$ref": "#/$defs/VmId" }, "description": "The VMs the fence stopped (node-agent-protocol.md section 8.5 step 3). From M5b the node always sends it." },
         "reason": { "type": "string", "enum": ["lease_expired", "lease_revoked"] }
       },
       "additionalProperties": true
@@ -353,6 +360,12 @@
         "node_id": { "$ref": "#/$defs/NodeId" },
         "app_ids": { "type": "array", "items": { "$ref": "#/$defs/AppId" } },
         "lease_ids": { "type": "array", "items": { "$ref": "#/$defs/LeaseId" } },
+        "fencing_tokens": {
+          "type": "object",
+          "description": "The fencing token the node held for each lease in lease_ids when it fenced, keyed by lease id (node-agent-protocol.md section 8.5 steps 2 and 3). From M5b the node always sends it.",
+          "propertyNames": { "$ref": "#/$defs/LeaseId" },
+          "additionalProperties": { "type": "integer", "minimum": 1 }
+        },
         "vm_ids": { "type": "array", "items": { "$ref": "#/$defs/VmId" } },
         "reason": { "type": "string", "enum": ["lease_expired", "lease_revoked"] },
         "error": { "type": "string", "description": "The engine error of the forced stop." }
@@ -1138,6 +1151,8 @@
         "node_id": "nod_01JC9Z6Q5W8N3K4T7R2M1XHB0N",
         "app_ids": ["app_01JC9Z6Q5W8N3K4T7R2M1XHB0X"],
         "lease_ids": ["lse_01JC9Z6Q5W8N3K4T7R2M1XHB0H"],
+        "fencing_tokens": { "lse_01JC9Z6Q5W8N3K4T7R2M1XHB0H": 7 },
+        "vm_ids": ["vm_01JC9Z6Q5W8N3K4T7R2M1XHB0B"],
         "reason": "lease_expired"
       }
     },
@@ -1154,6 +1169,7 @@
         "node_id": "nod_01JC9Z6Q5W8N3K4T7R2M1XHB0N",
         "app_ids": ["app_01JC9Z6Q5W8N3K4T7R2M1XHB0X"],
         "lease_ids": ["lse_01JC9Z6Q5W8N3K4T7R2M1XHB0H"],
+        "fencing_tokens": { "lse_01JC9Z6Q5W8N3K4T7R2M1XHB0H": 7 },
         "vm_ids": ["vm_01JC9Z6Q5W8N3K4T7R2M1XHB0B"],
         "reason": "lease_revoked",
         "error": "VMM process did not exit after SIGKILL"
