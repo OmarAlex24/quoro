@@ -860,7 +860,10 @@ async fn a_revoke_s_fence_keeps_the_session_alive_and_holds_back_the_rest() {
     let engine = Arc::new(FakeEngine::new());
     let (lease_desired, _) = watch::channel(Some(snapshot_full(
         1,
-        vec![stateful_vm("vm_slow", "lse_slow", 1, Vec::new())],
+        vec![
+            stateful_vm("vm_slow", "lse_slow", 1, Vec::new()),
+            stateful_vm("vm_next", "lse_next", 1, Vec::new()),
+        ],
         Vec::new(),
         Vec::new(),
     )));
@@ -933,20 +936,46 @@ async fn a_revoke_s_fence_keeps_the_session_alive_and_holds_back_the_rest() {
             .to_text(),
     )
     .await;
-    wait_for("the slow lease to be held", || {
+    send(
+        &mut ws,
+        ControlMessage::LeaseGrant(local_grant("lse_next", "app_next", 1))
+            .to_frame("msg_grant_next", None)
+            .to_text(),
+    )
+    .await;
+    wait_for("both slow leases to be held", || {
         view.state("lse_slow") == Some(LeaseState::Held)
+            && view.state("lse_next") == Some(LeaseState::Held)
     })
     .await;
     let slow = common::running_vm(&engine, "vm_slow", 2).await;
     engine.set_stop_delay(&slow, Duration::from_millis(1500));
+    let next = common::running_vm(&engine, "vm_next", 3).await;
+    engine.set_stop_delay(&next, Duration::from_millis(800));
 
     send(&mut ws, revoke_frame("lse_slow", 1, "msg_revoke")).await;
     wait_for("the slow stop to begin", || {
         engine.stop_calls().iter().any(|(id, _)| *id == slow)
     })
     .await;
+    // A revoke of another lease waits too, and the frames behind it wait
+    // for its own fence.
+    send(&mut ws, revoke_frame("lse_next", 1, "msg_revoke_next")).await;
     send(&mut ws, desired_frame(REV, &key, "msg_desired")).await;
+    send(
+        &mut ws,
+        r#"{"v":1,"type":"teleport","id":"msg_teleport","body":{}}"#.to_owned(),
+    )
+    .await;
     send(&mut ws, revoke_frame("lse_slow", 1, "msg_revoke_again")).await;
+    // A grant for the revoked lease waits behind its fence.
+    send(
+        &mut ws,
+        ControlMessage::LeaseGrant(local_grant("lse_slow", "app_slow", 2))
+            .to_frame("msg_grant_slow_again", None)
+            .to_text(),
+    )
+    .await;
     send(
         &mut ws,
         ControlMessage::LeaseGrant(local_grant("lse_other", "app_other", 1))
@@ -964,10 +993,14 @@ async fn a_revoke_s_fence_keeps_the_session_alive_and_holds_back_the_rest() {
     let mut heartbeats = 0;
     let mut pong_before_answer = false;
     let mut answered: Vec<String> = Vec::new();
-    while answered.len() < 3 {
+    let mut first_answered_at = None;
+    let mut desired_answered_at = None;
+    while answered.len() < 5 {
         let frame = read_frame(&mut ws).await;
         match frame["type"].as_str().unwrap() {
-            "heartbeat" if answered.is_empty() => heartbeats += 1,
+            // Only the heartbeats between the pong, sent during the fence,
+            // and the revoke's answer count.
+            "heartbeat" if pong_before_answer && answered.is_empty() => heartbeats += 1,
             "pong" => {
                 assert_eq!(frame["re"], "msg_ping");
                 pong_before_answer = answered.is_empty();
@@ -975,7 +1008,13 @@ async fn a_revoke_s_fence_keeps_the_session_alive_and_holds_back_the_rest() {
                 assert_eq!(view.state("lse_slow"), Some(LeaseState::Revoked));
             }
             "command_result" | "error" => {
-                answered.push(frame["re"].as_str().unwrap().to_owned());
+                let re = frame["re"].as_str().unwrap().to_owned();
+                match re.as_str() {
+                    "msg_revoke" => first_answered_at = Some(std::time::Instant::now()),
+                    "msg_desired" => desired_answered_at = Some(std::time::Instant::now()),
+                    _ => {}
+                }
+                answered.push(re);
             }
             _ => {}
         }
@@ -986,11 +1025,134 @@ async fn a_revoke_s_fence_keeps_the_session_alive_and_holds_back_the_rest() {
         "heartbeats kept flowing during the 1.5 s fence, before its answer: {heartbeats}"
     );
     // The revoke first, then the held frames in the order they arrived.
-    assert_eq!(answered, ["msg_revoke", "msg_desired", "msg_revoke_again"]);
+    assert_eq!(
+        answered,
+        [
+            "msg_revoke",
+            "msg_revoke_next",
+            "msg_desired",
+            "msg_teleport",
+            "msg_revoke_again"
+        ]
+    );
+    // The held revoke's fence ran its 0.8 s stop after the first answer, and
+    // the desired state behind it waited for that fence.
+    let waited = desired_answered_at.unwrap() - first_answered_at.unwrap();
+    assert!(
+        waited >= Duration::from_millis(700),
+        "the desired state waited for the second fence: {waited:?}"
+    );
+    assert!(
+        engine.stop_calls().iter().any(|(id, _)| *id == next),
+        "the held revoke fenced its lease"
+    );
+    assert_eq!(view.state("lse_next"), Some(LeaseState::Revoked));
+    assert_eq!(engine.inspect(&next).await.unwrap().state, VmState::Stopped);
+    wait_for("the held grant of the revoked lease", || {
+        view.may_start_stateful("lse_slow", 2)
+    })
+    .await;
     assert_eq!(engine.inspect(&slow).await.unwrap().state, VmState::Stopped);
     assert_eq!(store.latest_desired().await.unwrap().unwrap().0, REV);
 
     let _ = stop_tx.send(());
     assert_eq!(serving.await.unwrap().unwrap(), SessionEnd::Shutdown);
+    leases.abort();
+}
+
+/// Section 5.13: on receipt of a revoke the node starts nothing more for the
+/// lease. The revoke reaches the lease service when the session reads it, so
+/// a session that ends right after still leaves the lease `revoked` and its
+/// VM stopped.
+#[tokio::test]
+async fn a_revoke_takes_effect_even_when_the_session_ends_at_once() {
+    let dir = TempDir::new();
+    let key = sign::signing_key_from_seed(&[4; 32]);
+    let identity = identity_files(dir.path(), &key);
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let engine = Arc::new(FakeEngine::new());
+    let (lease_desired, _) = watch::channel(Some(snapshot_full(
+        1,
+        vec![stateful_vm("vm_gone", "lse_gone", 1, Vec::new())],
+        Vec::new(),
+        Vec::new(),
+    )));
+    let leases = start_local_leases(
+        Arc::clone(&engine),
+        store.clone(),
+        LeaseConfig {
+            node_id: "nod_test".to_owned(),
+            timers: FenceTimers {
+                grace: Duration::from_millis(200),
+                force: Duration::from_millis(200),
+            },
+        },
+        lease_desired.subscribe(),
+    )
+    .await
+    .expect("the lease service starts");
+    leases
+        .link
+        .grant(
+            quoro_proto::MsgId("msg_grant".to_owned()),
+            None,
+            local_grant("lse_gone", "app_gone", 1),
+        )
+        .await
+        .unwrap();
+    let vm = common::running_vm(&engine, "vm_gone", 2).await;
+    let view = leases.view.clone();
+    let (desired, _desired_rx) = watch::channel(None);
+    let (_observed_tx, observed_rx) = watch::channel(Vec::new());
+    let mut session = Session::new(SessionSetup {
+        identity,
+        store: store.clone(),
+        facts: facts(),
+        desired,
+        observed: observed_rx,
+        current: None,
+        builds: None,
+    })
+    .with_leases(leases.link.clone());
+
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let accept = tokio::spawn(tokio_tungstenite::accept_async(server));
+    let (client_ws, _response) = client_async("ws://primary.test/api/v1/nodes/session", client)
+        .await
+        .unwrap();
+    let mut ws = accept.await.unwrap().unwrap();
+    let serving =
+        tokio::spawn(async move { session.serve(client_ws, std::future::pending::<()>()).await });
+
+    let hello = read_frame(&mut ws).await;
+    send(
+        &mut ws,
+        ControlMessage::Welcome(Welcome {
+            cluster_id: "cls_test".to_owned(),
+            term: 1,
+            server_time: "2026-11-02T10:15:30Z".to_owned(),
+            heartbeat_interval_ms: 100,
+            session_timeout_ms: 15_000,
+            primary_node_id: "nod_primary".to_owned(),
+            primary_urls: Vec::new(),
+        })
+        .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
+        .to_text(),
+    )
+    .await;
+    read_until(&mut ws, "status_report").await;
+    send(&mut ws, revoke_frame("lse_gone", 1, "msg_revoke")).await;
+    ws.close(None).await.unwrap();
+    drop(ws);
+
+    assert_eq!(serving.await.unwrap().unwrap(), SessionEnd::Reconnect);
+    wait_for("the lease to be revoked", || {
+        view.state("lse_gone") == Some(LeaseState::Revoked)
+    })
+    .await;
+    wait_for("the fence to stop the VM", || {
+        engine.stop_calls().iter().any(|(id, _)| *id == vm)
+    })
+    .await;
     leases.abort();
 }

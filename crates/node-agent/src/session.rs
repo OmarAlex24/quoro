@@ -326,21 +326,32 @@ struct PendingRevoke {
 }
 
 impl PendingRevoke {
+    /// Hands the revoke to the lease service now, so the lease is `revoked`
+    /// and fenced even when the session ends before the answer is awaited
+    /// (section 5.13: on receipt the node starts nothing more for the lease).
     fn start(leases: &LeaseLink, started: StartedRevoke) -> Self {
-        let leases = leases.clone();
         let id = MsgId(started.raw_id.clone());
         let lease_id = started.body.lease_id.0.clone();
-        let (re, body) = (started.re, started.body);
+        let answer = leases.begin_revoke(id, started.re, started.body);
         Self {
             raw_id: started.raw_id,
             lease_id,
             answer: Box::pin(async move {
-                match leases.revoke(id, re, body).await {
+                match answer.await {
                     Ok(result) => NodeMessage::CommandResult(result),
                     Err(error) => NodeMessage::Error(error),
                 }
             }),
         }
+    }
+}
+
+/// The lease a frame revokes, when it is a readable `lease_revoke`.
+fn revoked_lease(text: &str) -> Option<String> {
+    let raw = RawFrame::parse(text).ok()?;
+    match ControlMessage::from_raw(&raw) {
+        Ok(ControlMessage::LeaseRevoke(revoke)) => Some(revoke.lease_id.0),
+        _ => None,
     }
 }
 
@@ -362,16 +373,24 @@ fn session_end(handled: Result<Option<SessionEnd>, AgentError>) -> Option<Sessio
 /// `lease_grant` for another lease, including the answer to a renewal, and
 /// `ping` and `pong` are; every other frame waits for the revoke's answer,
 /// among them `desired_state`, `command`, `stream_open` and any
-/// `lease_revoke`. A frame that cannot be read waits too, so its error answer
-/// keeps its place. From M5b a voter also answers `support_request` at once
-/// (ADR 0237); that message arrives with the voters.
-fn passes_a_running_fence(text: &str, revoking: &str) -> bool {
+/// `lease_revoke`. A grant for a lease whose revoke waits in `held` waits
+/// too, so it never overtakes that revoke. A frame that cannot be read waits
+/// as well, so its error answer keeps its place. From M5b a voter also
+/// answers `support_request` at once (ADR 0237); that message arrives with
+/// the voters.
+fn passes_a_running_fence(
+    text: &str,
+    revoking: &str,
+    held_revokes: &HashMap<String, usize>,
+) -> bool {
     let Ok(raw) = RawFrame::parse(text) else {
         return false;
     };
     match ControlMessage::from_raw(&raw) {
         Ok(ControlMessage::Ping | ControlMessage::Pong) => true,
-        Ok(ControlMessage::LeaseGrant(grant)) => grant.lease_id.0 != revoking,
+        Ok(ControlMessage::LeaseGrant(grant)) => {
+            grant.lease_id.0 != revoking && !held_revokes.contains_key(&grant.lease_id.0)
+        }
         _ => false,
     }
 }
@@ -793,12 +812,23 @@ impl Session {
         // answer (section 5.13, ADR 0222).
         let mut revoking: Option<PendingRevoke> = None;
         let mut held: VecDeque<String> = VecDeque::new();
+        // The leases of the revokes in `held`, with how many each has.
+        let mut held_revokes: HashMap<String, usize> = HashMap::new();
         self.started_revoke = None;
 
         loop {
             let deadline = last_rx + timeout;
             tokio::select! {
-                () = &mut stop => return Ok(SessionEnd::Shutdown),
+                () = &mut stop => {
+                    // A running fence is let finish and answered first, so a
+                    // routine shutdown does not cut it off midway; its stop
+                    // is bounded by the fence timers.
+                    if let Some(pending) = revoking.take() {
+                        let answer = pending.answer.await;
+                        let _ = write_message(&mut sink, answer, Some(&pending.raw_id)).await;
+                    }
+                    return Ok(SessionEnd::Shutdown);
+                }
                 _ = heartbeat_tick.tick() => {
                     let beat = NodeMessage::Heartbeat(Heartbeat {
                         time: util::now_rfc3339(),
@@ -953,14 +983,20 @@ impl Session {
                         let Some(text) = held.pop_front() else {
                             break;
                         };
+                        if let Some(lease) = revoked_lease(&text)
+                            && let Some(count) = held_revokes.get_mut(&lease)
+                        {
+                            *count -= 1;
+                            if *count == 0 {
+                                held_revokes.remove(&lease);
+                            }
+                        }
                         let handled = self.handle(&text, &mut sink, streams, &stream_tx).await;
                         if let Some(end) = session_end(handled) {
                             return Ok(end);
                         }
-                        if let (Some(started), Some(leases)) =
-                            (self.started_revoke.take(), self.leases.as_ref())
-                        {
-                            revoking = Some(PendingRevoke::start(leases, started));
+                        if let Some(next) = self.start_revoke() {
+                            revoking = Some(next);
                         }
                     }
                 }
@@ -969,8 +1005,11 @@ impl Session {
                     match frame {
                         Some(Ok(Message::Text(text))) => {
                             if let Some(pending) = &revoking
-                                && !passes_a_running_fence(&text, &pending.lease_id)
+                                && !passes_a_running_fence(&text, &pending.lease_id, &held_revokes)
                             {
+                                if let Some(lease) = revoked_lease(&text) {
+                                    *held_revokes.entry(lease).or_default() += 1;
+                                }
                                 held.push_back(text.to_string());
                                 continue;
                             }
@@ -978,10 +1017,8 @@ impl Session {
                             if let Some(end) = session_end(handled) {
                                 return Ok(end);
                             }
-                            if let (Some(started), Some(leases)) =
-                                (self.started_revoke.take(), self.leases.as_ref())
-                            {
-                                revoking = Some(PendingRevoke::start(leases, started));
+                            if let Some(next) = self.start_revoke() {
+                                revoking = Some(next);
                             }
                         }
                         Some(Ok(Message::Ping(payload))) => {
@@ -1012,6 +1049,19 @@ impl Session {
                         None => return Ok(SessionEnd::Reconnect),
                     }
                 }
+            }
+        }
+    }
+
+    /// Starts the fence of the revoke [`Self::handle`] just took, if any.
+    fn start_revoke(&mut self) -> Option<PendingRevoke> {
+        let started = self.started_revoke.take()?;
+        match self.leases.as_ref() {
+            Some(leases) => Some(PendingRevoke::start(leases, started)),
+            None => {
+                // `handle` answers a revoke itself when no lease service runs.
+                warn!(lease_id = %started.body.lease_id.0, "a revoke without a lease service");
+                None
             }
         }
     }
