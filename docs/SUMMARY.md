@@ -192,3 +192,4 @@
   - [M5a spike: stateless replicas, the edge role and the node mesh](research/m5a-replicas-and-edge.md)
   - [M5a spike: local volumes, the chunk engine, cold backups and the audit copy](research/m5a-backups-and-chunks.md)
   - [M5a spike: vulnerability tracking and the guest kernel](research/m5a-vulnerabilities.md)
+  - [M5b spikes: warm diff, lease timing, change-log size and the lab cut](research/m5b-warm-and-leases.md)
