@@ -1,14 +1,31 @@
-import type { Vm } from '../api/generated/model';
+import type { Node, Vm } from '../api/generated/model';
 import { Lamp } from './lamp';
+
+/**
+ * The status column of one instance. The API reports an instance `unknown`
+ * while its node is not connected; the row says why when the node list does.
+ */
+export const instanceStatusText = (
+  instance: Pick<Vm, 'observed_status' | 'node_id'>,
+  nodeStatuses: Record<string, Node['status']>,
+): string => {
+  const nodeStatus = nodeStatuses[instance.node_id];
+  if (instance.observed_status === 'unknown' && nodeStatus && nodeStatus !== 'connected') {
+    return `unknown (node ${nodeStatus})`;
+  }
+  return instance.observed_status;
+};
 
 /** The app's instances, one row each, with the node that runs it. */
 export function AppInstances({
   instances,
   nodeNames,
+  nodeStatuses = {},
   hasSource,
 }: {
   instances: readonly Vm[];
   nodeNames: Record<string, string>;
+  nodeStatuses?: Record<string, Node['status']>;
   hasSource: boolean;
 }) {
   return (
@@ -32,7 +49,7 @@ export function AppInstances({
                 {instance.name}
               </span>
               <span className="type-data text-[13px] text-ink-muted">
-                {instance.observed_status}
+                {instanceStatusText(instance, nodeStatuses)}
               </span>
               <span className="type-data text-[13px] text-ink-muted">
                 {instance.ip ?? 'No IP yet'}

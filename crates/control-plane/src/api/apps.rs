@@ -12,7 +12,7 @@ use crate::api::deployments::{
 };
 use crate::api::domains::{DOMAIN_COLUMNS, Domain, domain_from_row};
 use crate::api::page::PageQuery;
-use crate::api::vms::{VM_COLUMNS, Vm, vm_from_row};
+use crate::api::vms::{NODE_STATUS_COLUMN, VM_COLUMNS, Vm, vm_as_seen, vm_from_row};
 
 use crate::changelog::{self, Op};
 use crate::deploy;
@@ -1126,6 +1126,22 @@ pub(crate) async fn app_vms(
     .fetch_all(&mut *conn)
     .await?;
     rows.iter().map(vm_from_row).collect()
+}
+
+/// The app's instances as the API presents them ([`vm_as_seen`]): `unknown`
+/// while their node is not connected. For reads only; a write goes by
+/// [`app_vms`], which keeps the status the node last reported.
+pub(crate) async fn app_vms_as_seen(
+    conn: &mut sqlx::SqliteConnection,
+    app_id: &str,
+) -> Result<Vec<Vm>, ApiError> {
+    let rows = sqlx::query(&format!(
+        "SELECT {VM_COLUMNS}, {NODE_STATUS_COLUMN} FROM vms WHERE app_id = ? ORDER BY id"
+    ))
+    .bind(app_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    rows.iter().map(vm_as_seen).collect()
 }
 
 pub(crate) async fn app_vm_ids(

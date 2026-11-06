@@ -4,7 +4,7 @@
 use crate::AppState;
 use crate::api::apps::{
     APP_COLUMNS, App, AppDetail, AppList, EdgeBackend, ListAppsQuery, app_from_row, app_target,
-    app_vms, delete_app_tx, redeploy_app_tx, restart_app_tx,
+    app_vms_as_seen, delete_app_tx, redeploy_app_tx, restart_app_tx,
 };
 use crate::api::deployments::Deployment;
 use crate::api::domains::{DOMAIN_COLUMNS, domain_from_row};
@@ -115,7 +115,7 @@ pub async fn get_app(state: &AppState, ctx: &CallCtx, app_id: &str) -> Result<Ap
             .ok_or_else(|| ApiError::not_found("app"))?;
         let mut app = app_from_row(&row)?;
         access.set_project(Some(&app.project_id));
-        let instances = app_vms(&mut conn, app_id).await?;
+        let instances = app_vms_as_seen(&mut conn, app_id).await?;
         let rows = sqlx::query(&format!(
             "SELECT {DOMAIN_COLUMNS} FROM domains WHERE app_id = ? ORDER BY id"
         ))

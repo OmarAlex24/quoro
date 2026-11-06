@@ -277,6 +277,9 @@ export function AppScreen() {
   const nodeNames = Object.fromEntries(
     (nodesQuery.data?.items ?? []).map((node) => [node.id, node.name]),
   );
+  const nodeStatuses = Object.fromEntries(
+    (nodesQuery.data?.items ?? []).map((node) => [node.id, node.status]),
+  );
 
   const env: AppEnvVar[] = envQuery.data?.items ?? [];
   const canStart = app.status === 'stopped' || app.status === 'down';
@@ -680,6 +683,7 @@ export function AppScreen() {
       <AppInstances
         instances={app.instances}
         nodeNames={nodeNames}
+        nodeStatuses={nodeStatuses}
         hasSource={source !== null}
       />
 

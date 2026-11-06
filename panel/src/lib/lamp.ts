@@ -36,13 +36,15 @@ export const desiredTone = (status: VmDesiredStatus): LampTone =>
 
 /**
  * Is the VM still on its way from observed to desired? This is the exact rule
- * the list uses to pick a 1 s refresh instead of 10 s.
+ * the list uses to pick a 1 s refresh instead of 10 s. A crash and an unknown
+ * state are settled: nothing moves until someone acts or the VM's node, which
+ * is disconnected, reports again.
  */
 export const isConverging = (
   desired: VmDesiredStatus,
   observed: VmObservedStatus,
 ): boolean => {
-  if (observed === 'crashed') return false;
+  if (observed === 'crashed' || observed === 'unknown') return false;
   if (desired === 'running') return observed !== 'running';
   return observed !== 'stopped';
 };
@@ -65,16 +67,7 @@ const lampText = (
   const target = desired === 'running' ? 'running' : 'stopped';
 
   if (observed === 'crashed') return 'Crashed. Start it to recover.';
-  if (!isConverging(desired, observed)) {
-    return observed === 'running'
-      ? 'Running'
-      : observed === 'stopped'
-        ? 'Stopped'
-        : observed === 'unknown'
-          ? 'Unknown'
-          : observedLabel[observed];
-  }
-  if (observed === 'unknown') return `Unknown, will be ${target}`;
+  if (!isConverging(desired, observed)) return observedLabel[observed];
   return `${observedLabel[observed]}, will be ${target}`;
 };
 
