@@ -348,11 +348,15 @@ async fn cloud_hypervisor_engine(config: &Config) -> Result<quoro_engine::ch::Ch
     use quoro_engine::ch::{ChConfig, ChEngine};
 
     let ch = &config.cloud_hypervisor;
-    let ch_config = ChConfig::new(
+    let mut ch_config = ChConfig::new(
         ch.state_dir(&config.node.data_dir),
         ch.artifacts_dir.clone(),
         ch.init_binary.clone(),
     );
+    // The engine removes the snapshots left in its volume directory when it
+    // starts, except those the node agent's store records: a warm base or a
+    // quarantined copy outlives the agent (engine-trait.md section 3.16).
+    ch_config.snapshot_sweep = quoro_node_agent::kept::sweep_rule(&config.node.data_dir).await;
     // A pin mismatch, a missing `nft` or a broken artifact lands here; the
     // engine's message already names the cause, so it is passed through.
     let engine = match ChEngine::new(ch_config).await {

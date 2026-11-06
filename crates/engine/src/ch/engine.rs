@@ -282,7 +282,7 @@ impl Inner {
         if !matches!(pool, super::pool::VolumePool::Broken { .. }) {
             // Leftovers live inside the pool, so they are only reachable once
             // it is mounted; a broken pool's directory is never touched.
-            super::volume::remove_leftovers(&volumes_dir);
+            super::volume::remove_leftovers(&volumes_dir, &config.snapshot_sweep);
         }
 
         let initramfs = config.state_dir.join("boot").join("initramfs.cpio");

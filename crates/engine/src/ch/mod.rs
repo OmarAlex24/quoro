@@ -68,6 +68,10 @@ pub struct ChConfig {
     /// Host memory never handed to VMs when reserving at create (default
     /// 512 MiB).
     pub reserved_memory_mb: u64,
+    /// Which snapshots the start-up sweep of the volume directory keeps
+    /// (section 3.16). The default removes every snapshot, as in M5a; the
+    /// node agent passes the ids its store records.
+    pub snapshot_sweep: crate::SnapshotSweep,
 }
 
 impl ChConfig {
@@ -82,6 +86,7 @@ impl ChConfig {
             init_binary,
             guest_stop_timeout: Duration::from_secs(30),
             reserved_memory_mb: 512,
+            snapshot_sweep: crate::SnapshotSweep::RemoveAll,
         }
     }
 }

@@ -19,6 +19,7 @@ pub mod identity;
 pub mod ingress;
 pub mod interactive;
 pub mod inventory;
+pub mod kept;
 pub mod lease;
 pub mod localkey;
 pub mod logs;

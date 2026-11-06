@@ -12,6 +12,7 @@
 //! [`FakeEngine`] is an in-memory implementation for tests; it lives in
 //! [`fake`].
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::future::Future;
 use std::net::Ipv4Addr;
@@ -354,6 +355,39 @@ pub struct NodeNetwork {
     /// Taken from the node's configuration; empty means guests get no
     /// resolver. Not part of the network's identity. Section 3.3.
     pub dns: Vec<Ipv4Addr>,
+}
+
+/// Which snapshot files an engine's start-up sweep keeps (section 3.16).
+///
+/// Snapshots left by a crash are removed at start. From M5b the node agent
+/// keeps the snapshots its store records (a warm base, the snapshot being
+/// shipped, a returning source's candidates, a quarantined copy) and hands
+/// their ids to the engine before the engine starts, so the sweep removes
+/// only the rest. It is safe because the node agent records a snapshot before
+/// anything relies on it: a snapshot with no record never holds data the live
+/// volume does not hold too.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SnapshotSweep {
+    /// Remove every snapshot left in the volume directory (M5a).
+    #[default]
+    RemoveAll,
+    /// Keep the snapshots with these ids and remove the others.
+    Keep(BTreeSet<String>),
+    /// Keep every snapshot: the node agent could not read which ones it
+    /// records, and removing a recorded one could lose data.
+    KeepAll,
+}
+
+impl SnapshotSweep {
+    /// Whether the sweep keeps the snapshot with this id.
+    #[must_use]
+    pub fn keeps(&self, snapshot_id: &str) -> bool {
+        match self {
+            Self::RemoveAll => false,
+            Self::Keep(ids) => ids.contains(snapshot_id),
+            Self::KeepAll => true,
+        }
+    }
 }
 
 /// A point-in-time volume snapshot descriptor. Section 3.16.

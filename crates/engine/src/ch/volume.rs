@@ -191,13 +191,10 @@ fn probe_clone(source: &Path, clone: &Path) -> std::io::Result<()> {
 /// volume directory (§3.16: snapshots left by a crash are removed at start;
 /// §3.22: so are staging files). Volume files themselves are never touched.
 ///
-/// Every snapshot is removed because, so far, no snapshot outlives the node
-/// agent run that took it: a backup deletes its own. §3.16 lets the node
-/// agent keep the snapshots its store records from M5b (a warm base, the
-/// snapshot being shipped, a quarantined copy); the change that first keeps
-/// one across a restart must hand this sweep that keep set, or move it into
-/// the node agent.
-pub(super) fn remove_leftovers(dir: &Path) {
+/// A snapshot whose id (its file name) `sweep` keeps stays: from M5b the
+/// node agent keeps the snapshots its store records, a warm base or a
+/// quarantined copy, across a restart (§3.16).
+pub(super) fn remove_leftovers(dir: &Path, sweep: &crate::SnapshotSweep) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -206,10 +203,12 @@ pub(super) fn remove_leftovers(dir: &Path) {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if name.ends_with(SNAPSHOT_SUFFIX)
-            || name.ends_with(super::warm::STAGING_SUFFIX)
-            || name.ends_with(".tmp")
-        {
+        let leftover = if name.ends_with(SNAPSHOT_SUFFIX) {
+            !sweep.keeps(name)
+        } else {
+            name.ends_with(super::warm::STAGING_SUFFIX) || name.ends_with(".tmp")
+        };
+        if leftover {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -1163,9 +1162,46 @@ mod tests {
         for name in std::iter::once(id.to_string()).chain(leftovers.iter().cloned()) {
             std::fs::write(dir.join(&name), b"x").expect("file");
         }
-        remove_leftovers(&dir);
+        remove_leftovers(&dir, &crate::SnapshotSweep::RemoveAll);
         assert!(dir.join(id).exists(), "the volume file stays");
         for name in &leftovers {
+            assert!(!dir.join(name).exists(), "{name} is removed");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_sweep_keeps_the_snapshots_the_node_agent_records() {
+        let dir = scratch_dir("kept");
+        let id = "vol_01JC9ZC2D3E4F5G6H7J8K9M0NP";
+        let kept = format!("{id}.19a2b3c4d5e-3.snapshot");
+        let unrecorded = format!("{id}.19a2b3c4d5f-4.snapshot");
+        let others = [format!("{id}.staging"), format!("{id}.tmp")];
+        let write_all = || {
+            for name in [id.to_string(), kept.clone(), unrecorded.clone()]
+                .iter()
+                .chain(&others)
+            {
+                std::fs::write(dir.join(name), b"x").expect("file");
+            }
+        };
+
+        write_all();
+        let rule = crate::SnapshotSweep::Keep([kept.clone()].into_iter().collect());
+        remove_leftovers(&dir, &rule);
+        assert!(dir.join(id).exists(), "the volume file stays");
+        assert!(dir.join(&kept).exists(), "a recorded snapshot stays");
+        assert!(!dir.join(&unrecorded).exists(), "an unrecorded one goes");
+        for name in &others {
+            assert!(!dir.join(name).exists(), "{name} is removed");
+        }
+
+        // A node agent that cannot read its records keeps every snapshot,
+        // but never a staging or temporary file.
+        write_all();
+        remove_leftovers(&dir, &crate::SnapshotSweep::KeepAll);
+        assert!(dir.join(&kept).exists() && dir.join(&unrecorded).exists());
+        for name in &others {
             assert!(!dir.join(name).exists(), "{name} is removed");
         }
         let _ = std::fs::remove_dir_all(&dir);

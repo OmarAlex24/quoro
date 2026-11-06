@@ -38,8 +38,8 @@ use crate::{
     ByteStream, Capabilities, ConsoleMode, ConsoleStream, Engine, EngineError, EngineEvent,
     EventStream, ExecRequest, ExecSession, HostProbe, ImageConfig, ImageDigest, ImageInventory,
     ImageRef, LineStream, NodeNetwork, OciLayout, OutputLine, OutputStream, PreparedImage,
-    RangesOf, SerialMode, SnapshotMethod, StageFrom, StagedVolume, StopMode, VmCounters, VmId,
-    VmInfo, VmSpec, VmState, VolumeId, VolumeInfo, VolumeSnapshot,
+    RangesOf, SerialMode, SnapshotMethod, SnapshotSweep, StageFrom, StagedVolume, StopMode,
+    VmCounters, VmId, VmInfo, VmSpec, VmState, VolumeId, VolumeInfo, VolumeSnapshot,
 };
 
 /// Bytes in one gibibyte, the unit of `size_gb`.
@@ -549,6 +549,39 @@ impl FakeEngine {
             .collect();
         staged.sort_by(|a, b| a.0.0.cmp(&b.0.0));
         staged
+    }
+
+    /// What the real engine does to the volume directory when it starts
+    /// (section 3.16): removes every staging file and every snapshot that
+    /// `sweep` does not keep, by `snapshot_id`. A test calls it to model an
+    /// agent restart, as the fake itself outlives one.
+    ///
+    /// # Errors
+    ///
+    /// `Io` when a file of a removed snapshot or staging copy cannot be
+    /// removed.
+    pub fn start_up_sweep(&self, sweep: &SnapshotSweep) -> Result<(), EngineError> {
+        let mut state = self.lock();
+        let has_files = state.volume_dir.is_some();
+        let mut removed: Vec<PathBuf> = Vec::new();
+        state.snapshots.retain(|id, snapshot| {
+            let keep = sweep.keeps(id);
+            if !keep {
+                removed.push(snapshot.location.clone());
+            }
+            keep
+        });
+        removed.extend(state.staged.drain().map(|(_, staged)| staged.location));
+        if has_files {
+            for path in removed {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(io_error(err)),
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Whether `pause` froze the VM and nothing resumed or stopped it since
