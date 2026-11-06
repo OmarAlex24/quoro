@@ -91,10 +91,16 @@ pub(super) async fn open(
 }
 
 /// The conflict every "there is no exec listener on the other side" path
-/// reports (a VM started before its node got the M4 init).
+/// reports (§3.18). Two VMs get it: one whose init has not reached its exec
+/// listener yet, because it binds it after the volumes and the network, just
+/// before it starts the app; and one started before its node got the M4
+/// init, which only a restart fixes. The engine cannot tell them apart, so
+/// the message names both.
 fn refused(vm: &str) -> EngineError {
     EngineError::Conflict(format!(
-        "the VM's init does not accept exec sessions; restart the VM ({vm})"
+        "the VM's init does not accept exec sessions yet: the VM may still be \
+         starting; if it has been running for a while, it predates exec support \
+         and needs a restart ({vm})"
     ))
 }
 
