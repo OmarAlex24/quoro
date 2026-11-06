@@ -1,12 +1,12 @@
 # ADR 0218: Changing ha_policy changes the lease mode with a lease_grant at the same token; expiring only with majority support
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0241](0241-a-lease-converted-from-local-to-expiring-opens-no-failover.md)
 - **Date:** 2026-11-06
 - **Ledger id:** D-0218
 - **Tags:** m5b, contracts, warm
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** none
+- **Related:** [ADR 0241](0241-a-lease-converted-from-local-to-expiring-opens-no-failover.md)
 
 ## Context
 
@@ -20,6 +20,7 @@ When the policy becomes warm the primary sends the holder a lease_grant with mod
 
 ## Consequences
 
+- [ADR 0241](0241-a-lease-converted-from-local-to-expiring-opens-no-failover.md) refines what the grant that converts a lease to expiring sets on the node and counts toward the failover gate. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---
