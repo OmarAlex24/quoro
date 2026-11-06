@@ -192,7 +192,7 @@ node agent                                          primary
 
 1. `hello` is the first message the node sends on every session.
 2. `welcome` is the first message the primary sends. From M5b the node compares its `term` with the highest term it has seen and ends the session with `error` code `stale_term` when the `welcome` is lower (section 8.8).
-3. The primary sends any `lease_revoke` before anything else. The node stops the stateful VMs bound to those leases and answers `command_result` for each revoke. While a revoke's self-fence runs, the node keeps processing `lease_grant` for other leases, including the answers to its renewals, and liveness traffic; it holds back every other message, such as `desired_state`, a `lease_revoke` of the same lease, `command` and `stream_open`, until it has answered the revoke (section 5.13, ADR 0222).
+3. The primary sends any `lease_revoke` before anything else. The node stops the stateful VMs bound to those leases and answers `command_result` for each revoke. While a revoke's self-fence runs, the node keeps processing `lease_grant` for other leases, including the answers to its renewals, liveness traffic, and on a voter `support_request`, which it answers with `support_grant`; it holds back every other message, such as `desired_state`, a `lease_revoke` of the same lease, `command` and `stream_open`, until it has answered the revoke (section 5.13, ADR 0222, ADR 0237).
 4. If an operator acknowledged a failed fence of this node and the node has not yet confirmed it, the primary then sends `command` kind `fence_ack` (sections 5.17 and 8.5) and waits for its `command_result`. From M5b, while a signing-key rotation runs and the node still pins the current key, the primary then sends `signing_key_rotate` (sections 5.21 and 7.5) and waits for its `command_result`, so the `desired_state` that follows is signed with the key the node pins.
 5. Only then does the primary send `desired_state`. The node verifies, persists, answers `command_result` with `ok`, and reconciles.
 6. `log_entries` follow the desired state; the node acknowledges with `log_ack` as it verifies the chain.
@@ -1018,14 +1018,15 @@ A revoke whose token is lower than the node's current token predates the node's 
 
 On receipt the node starts nothing more for the lease: from then on no VM bound to it starts, whatever arrives later (section 6.4), until a grant with a higher token (section 8.5 step 4). It stops the stateful VMs bound to the lease, records the stop locally, moves the lease to `revoked`, and answers `command_result`. If the self-fence cannot confirm that every bound VM stopped, the answer is `command_result` with status `error` and the node follows section 8.5's failed-fence path. An agent that restarted without a verified desired-state snapshot cannot tell which VMs the lease binds; when it holds no recorded fence for the lease, it stops every app VM instead (section 6.3).
 
-**Order while the fence runs** (ADR 0222). Until it has answered the revoke, the node processes only:
+**Order while the fence runs** (ADR 0222, ADR 0237). Until it has answered the revoke, the node processes only:
 
 - `lease_grant` for any other lease, including the answers to its `lease_renew`;
-- liveness traffic: it keeps sending `heartbeat`, answers `ping` with `pong`, and accepts the `pong` that answers its own `ping`.
+- liveness traffic: it keeps sending `heartbeat`, answers `ping` with `pong`, and accepts the `pong` that answers its own `ping`;
+- on a voter, `support_request`, which it answers with `support_grant` as at any other time (section 8.8). A request with a lower term ends the session with `stale_term`, as at any other time, and the fence goes on.
 
 It also keeps sending `lease_renew` for its other `expiring` leases. Every other message of the session is held back and processed in the order received once the revoke is answered: for example `desired_state`, a `lease_revoke` of the same lease, `command` and `stream_open`.
 
-This is safe. Section 4.2 rule 3 exists so that nothing received after a revoke can start the revoked lease's VMs before they are stopped. None of the messages let through can: a grant names another lease, liveness traffic starts nothing, and the start gate above keeps every VM of the revoked lease stopped while its fence runs and afterwards. Holding back every message would hold back renewal answers too. A `local` lease's fence has no deadline and can take longer than a third of `D`, so an `expiring` lease of another app could reach `valid_until` and fence although the primary renewed it.
+This is safe. Section 4.2 rule 3 exists so that nothing received after a revoke can start the revoked lease's VMs before they are stopped. None of the messages let through can: a grant names another lease, liveness traffic starts nothing, a support request changes only the voter's own vote state (section 8.8), and the start gate above keeps every VM of the revoked lease stopped while its fence runs and afterwards. Holding back every message would hold back renewal answers too. A `local` lease's fence has no deadline and can take longer than a third of `D`, so an `expiring` lease of another app could reach `valid_until` and fence although the primary renewed it. Holding back support requests would cost the primary this voter's support for as long as the fence lasts, and with it, when the other voters cannot make up for it, the majority it needs to grant and renew `expiring` leases.
 
 ```json
 {
