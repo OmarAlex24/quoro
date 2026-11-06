@@ -570,6 +570,55 @@ async fn desired_state_until(socket: &mut Socket, check: impl Fn(&Value) -> bool
     }
 }
 
+/// The entry of `vm_id` in a `desired_state` frame's `spec.vms`, if any.
+fn names_vm<'a>(frame: &'a Value, vm_id: &str) -> Option<&'a Value> {
+    frame["body"]["spec"]["vms"]
+        .as_array()?
+        .iter()
+        .find(|vm| vm["vm_id"] == vm_id)
+}
+
+/// A `status_report` that carries one VM's observed status.
+fn vm_report(applied_rev: u64, vm_id: &str, observed_status: ObservedStatus) -> NodeMessage {
+    let NodeMessage::StatusReport(mut report) = status_report(applied_rev, Vec::new()) else {
+        unreachable!("status_report builds a status report")
+    };
+    report.vms.push(VmStatus {
+        vm_id: vm_id.to_string(),
+        observed_status,
+        health: Health::Unknown,
+        ip: None,
+        restart_count: 0,
+        last_exit_code: None,
+    });
+    NodeMessage::StatusReport(report)
+}
+
+/// Waits until the VM row's `(node_id, observed_status)` satisfies `check`.
+async fn wait_for_vm_row(
+    server: &Server,
+    vm_id: &str,
+    check: impl Fn(&(String, String)) -> bool,
+) -> (String, String) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let row: (String, String) =
+            sqlx::query_as("SELECT node_id, observed_status FROM vms WHERE id = ?")
+                .bind(vm_id)
+                .fetch_one(server.state.store.pool())
+                .await
+                .unwrap();
+        if check(&row) {
+            return row;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the VM row stayed at {row:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Waits for the first `desired_state` that carries `volume_id` in
 /// `spec.volumes`.
 async fn desired_state_with_volume(socket: &mut Socket, volume_id: &str) -> Value {
@@ -815,22 +864,36 @@ async fn a_restore_moves_the_app_and_the_ready_report_finishes_it() {
     let revoke = recv_type(&mut setup.state.socket, "lease_revoke").await;
     assert_eq!(revoke["body"]["reason"], "moved");
 
-    // The old node no longer runs the app.
-    let vm_id = setup.state.vm_id.clone();
-    let snapshot = desired_state_until(&mut setup.state.socket, |frame| {
-        frame["body"]["spec"]["vms"].as_array().is_some_and(|vms| {
-            vms.iter()
-                .any(|vm| vm["vm_id"] == vm_id && vm["desired_status"] == "stopped")
-        })
+    // The first snapshot after the revoke no longer names the app's VM, so
+    // the old node deletes it. Kept in without the detached volume, it would
+    // be recreated stopped (section 6.2 step 3, issue #287).
+    let snapshot = recv_type(&mut setup.state.socket, "desired_state").await;
+    let old_rev = snapshot["body"]["rev"].as_u64().unwrap();
+    assert!(
+        names_vm(&snapshot, &setup.state.vm_id).is_none(),
+        "the old node's snapshot still names the moved VM: {}",
+        snapshot["body"]["spec"]["vms"]
+    );
+    assert!(
+        snapshot["body"]["spec"]["routes"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "no route points at the moved VM"
+    );
+
+    // The old node deletes it. The row stays on the old node until the
+    // restore is ready and records what the node reported.
+    send(
+        &mut setup.state.socket,
+        vm_report(old_rev, &setup.state.vm_id, ObservedStatus::Deleted),
+    )
+    .await;
+    let (vm_node, observed) = wait_for_vm_row(&setup.state.server, &setup.state.vm_id, |row| {
+        row.1 == "deleted"
     })
     .await;
-    let old_vm = snapshot["body"]["spec"]["vms"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|vm| vm["vm_id"] == setup.state.vm_id)
-        .expect("the app's VM is still named");
-    assert_eq!(old_vm["desired_status"], "stopped");
+    assert_eq!(vm_node, setup.state.node.node_id);
+    assert_eq!(observed, "deleted");
 
     // The target node's snapshot carries the restore object.
     let snapshot = desired_state_with_volume(&mut setup.socket_b, &new_volume_id).await;
@@ -897,6 +960,38 @@ async fn a_restore_moves_the_app_and_the_ready_report_finishes_it() {
         .expect("the target node receives the grant");
     assert_eq!(granted["body"]["fencing_token"], json!(token));
 
+    // The target node's snapshot names the VM, running, with the new volume
+    // and the new token.
+    let vm_id = setup.state.vm_id.clone();
+    let runs_there = |frame: &Value| {
+        frame["type"] == "desired_state"
+            && names_vm(frame, &vm_id).is_some_and(|vm| vm["desired_status"] == "running")
+    };
+    let target_snapshot = match frames.iter().find(|frame| runs_there(frame)) {
+        Some(frame) => frame.clone(),
+        None => desired_state_until(&mut setup.socket_b, &runs_there).await,
+    };
+    let moved = names_vm(&target_snapshot, &vm_id).unwrap();
+    assert_eq!(moved["stateful"], true);
+    assert_eq!(moved["fencing_token"], json!(token));
+    assert_eq!(moved["volumes"][0]["volume_id"], new_volume_id);
+
+    // Nothing gives the VM back to the old node.
+    heartbeat(&mut setup.state.socket).await;
+    while let Ok(Some(Ok(message))) =
+        timeout(Duration::from_millis(500), setup.state.socket.next()).await
+    {
+        if let WsMessage::Text(text) = message {
+            let frame: Value = serde_json::from_str(text.as_str()).unwrap();
+            if frame["type"] == "desired_state" {
+                assert!(
+                    names_vm(&frame, &setup.state.vm_id).is_none(),
+                    "the old node got the moved VM back"
+                );
+            }
+        }
+    }
+
     // Placement is pinned to the target node and the app runs there.
     let app = get_app(&setup.state.owner, &setup.state.server, &setup.state.app_id).await;
     assert_eq!(app["placement"]["node_ids"], json!([setup.node_b.node_id]));
@@ -907,12 +1002,14 @@ async fn a_restore_moves_the_app_and_the_ready_report_finishes_it() {
         .await
         .unwrap();
     assert_eq!(desired, "running");
-    let vm_node: String = sqlx::query_scalar("SELECT node_id FROM vms WHERE id = ?")
-        .bind(&setup.state.vm_id)
-        .fetch_one(setup.state.server.state.store.pool())
-        .await
-        .unwrap();
+    let (vm_node, observed): (String, String) =
+        sqlx::query_as("SELECT node_id, observed_status FROM vms WHERE id = ?")
+            .bind(&setup.state.vm_id)
+            .fetch_one(setup.state.server.state.store.pool())
+            .await
+            .unwrap();
     assert_eq!(vm_node, setup.node_b.node_id);
+    assert_eq!(observed, "creating");
     let ready = setup
         .state
         .owner

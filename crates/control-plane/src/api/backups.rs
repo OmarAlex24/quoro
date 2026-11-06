@@ -1474,6 +1474,11 @@ pub async fn restore_backup(
                 }
                 state.hub.node_changed(old_node_id);
             }
+            // Every node that holds an instance hears that it stopped or, on
+            // a move, that it left (issue #287).
+            for node_id in &accepted.vm_node_ids {
+                state.hub.node_changed(node_id);
+            }
             state.hub.node_changed(&accepted.volume.node_id);
             if let Some(key) = &key {
                 state.idempotency.finish(
