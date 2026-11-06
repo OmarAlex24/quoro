@@ -8,6 +8,7 @@ import { Scope } from '../api/generated/model';
  * contract, so a scope added there and not here fails the panel's tests.
  */
 export const HUMAN_ONLY_SCOPES: ReadonlySet<Scope> = new Set<Scope>([
+  'cluster:manage',
   'node:enroll',
   'node:remove',
   'node:fence_ack',

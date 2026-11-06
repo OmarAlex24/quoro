@@ -37,9 +37,38 @@ pub struct Cluster {
     pub term: i64,
     /// The voters of the cluster and whether HA is ready (ADR 0170).
     pub votes: ClusterVotes,
+    /// Id of the current cluster signing key; absent until the promotion and
+    /// custody work ships (`node-agent-protocol.md` section 7.5).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(pattern = "^[0-9a-f]{64}$", required = false, nullable = false)]
+    pub signing_key_id: Option<String>,
+    /// The running signing-key rotation, or null; absent until the promotion
+    /// and custody work ships (`node-agent-protocol.md` section 7.5).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(required = false)]
+    pub signing_key_rotation: Option<Option<SigningKeyRotation>>,
     /// When the cluster was created.
     #[schema(format = "date-time")]
     pub created_at: String,
+}
+
+/// A running rotation of the cluster signing key (`openapi.yaml`
+/// `SigningKeyRotation`, ADR 0154).
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[schema(
+    title = "SigningKeyRotation",
+    description = "A running rotation of the cluster signing key (ADR 0154, node-agent-protocol.md section 7.5)."
+)]
+pub struct SigningKeyRotation {
+    /// Id of the next signing key.
+    #[schema(pattern = "^[0-9a-f]{64}$")]
+    pub next_key_id: String,
+    /// When the rotation started.
+    #[schema(format = "date-time")]
+    pub started_at: String,
+    /// Machines that still pin the current key, oldest enrolled first.
+    #[schema(pattern = "^nod_[0-9A-HJKMNP-TV-Z]{26}$")]
+    pub pending_node_ids: Vec<String>,
 }
 
 /// The voters of the cluster (`openapi.yaml` `ClusterVotes`, ADR 0170).

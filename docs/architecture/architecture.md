@@ -164,7 +164,7 @@ What exists per milestone:
 
 - M1 to M4 have exactly one primary, which is also a node, plus nodes that run the node agent and dial out to it (D-0016, D-0033).
 - Witness, edge and leases with expiry arrive with M5 (D-0033): `witness` in M5b, `edge` in M5a.
-- Replica nodes serve reads and forward writes to the primary (D-0012). Turning that serving on requires promoting a replica to primary; manual promotion ships in M5b, alongside leases and fencing, and refuses while the old primary may still hold expiring leases unless an operator acknowledges the fence (D-0067).
+- Replica nodes serve reads and forward writes to the primary (D-0012); that serving is M6 (ADR 0179). Manual promotion ships in M5b, alongside leases and fencing, and refuses while the old primary may still hold expiring leases unless an operator acknowledges the fence (D-0067). In M5b every machine with the `node` role follows the change log and holds the cluster keys sealed to a custody key of its own, and `quoro cluster promote` rebuilds the primary's database from that log on the machine it promotes; until then that machine serves nothing (node-agent-protocol.md section 7).
 
 Design choice, stated as such: from M2 every enrolled node already follows the change log over its session and keeps a verified copy, so a later manual promotion needs no protocol change (D-0013). The M2 node agent therefore implements the follow path even though nothing else in M2 uses a replica. This costs storage on each node and buys the ability to promote without a redesign.
 
@@ -194,7 +194,7 @@ The data plane never infers intent. A node with no session to the primary applie
 
 | If this fails | What happens | What does not happen |
 | --- | --- | --- |
-| The primary | Apps keep running; replicas serve reads and refuse writes they cannot forward (`not_primary`) | No automatic election before M6 (D-0016) |
+| The primary | Apps keep running; changes wait until an operator promotes a following machine (M5b, `quoro cluster promote`). From M6 replicas serve reads and refuse writes they cannot forward (`not_primary`) | No automatic election before M6 (D-0016) |
 | A replica | Nothing user-visible; the primary keeps serving | No state is lost, because the primary is the only writer (D-0012) |
 | A node | Its apps stop; its session drops and `node.disconnected` fires; the app is reported `down` or `degraded` | Nothing is started elsewhere automatically before M6 (D-0016, D-0033) |
 | The engine on one node | That node cannot create or restart microVMs; running microVMs continue unless the VMM died with it | The cluster does not rebalance; placement is explicit |
@@ -299,7 +299,7 @@ Decided (D-0050), three keys:
 - **Cluster data-encryption key** (DEK, 256-bit XChaCha20-Poly1305). Encrypts every `*_enc` column; a `*_enc` column stores the key id, the nonce and the ciphertext, so a row records which key wrote it.
 - **Node-local key.** Encrypts a node's local copy of the secrets for the apps placed on it.
 
-Storage and rotation: the keys are generated at first start and stored as 0600 files in `/var/lib/quoro`, outside the SQLite file, and backed up separately, because losing the data-encryption key loses every secret. The signing key rotates through the node-agent message `signing_key_rotate`, signed by the old key. The data-encryption key rotates by re-encrypting rows under a new key id. Custody of both keys when a replica is promoted is decided (ADR 0078, read by ADR 0180): each machine with the `node` role generates a custody key pair, and the primary seals the signing key, the data-encryption key and its own TLS key to each such machine's public custody key, so a promoted node opens them and keeps the certificate nodes pin (ADR 0181). The node-local key is not used for this, because the primary never sees it. The fields and the table that carry the seals are specified with manual promotion in M5b (D-0067); until then the keys do not leave the primary.
+Storage and rotation: the keys are generated at first start and stored as 0600 files in `/var/lib/quoro`, outside the SQLite file, and backed up separately, because losing the data-encryption key loses every secret. The signing key rotates through the node-agent message `signing_key_rotate`, signed by the old key. The data-encryption key rotates by re-encrypting rows under a new key id. Custody of both keys when a replica is promoted is decided (ADR 0078, read by ADR 0180): each machine with the `node` role generates a custody key pair, and the primary seals the signing key, the data-encryption key and its own TLS key to each such machine's public custody key, so a promoted node opens them and keeps the certificate nodes pin (ADR 0181). The node-local key is not used for this, because the primary never sees it. The seals are HPKE seals in the replicated table `node_key_custody`, and the signing key rotates through `POST /api/v1/cluster/signing-key/rotate` once every machine pins the next key (node-agent-protocol.md sections 7.2 and 7.5).
 
 ## 7. Telemetry locality
 
@@ -773,7 +773,7 @@ Decided since the first draft, and therefore no longer listed here:
 - Host layout, CLI and setup token: D-0054.
 - Lab TLS for the M2 demonstration: D-0055.
 
-Custody of the cluster keys on promotion was the last open row. Q-0024 fixed when promotion ships (M5b, D-0067); D-0078 chose to replicate the keys to replica nodes, and ADR 0180 reads that as seals to a custody key of each node, because the node-local key is never seen by the primary. Until promotion exists the keys do not leave the primary.
+Custody of the cluster keys on promotion was the last open row. Q-0024 fixed when promotion ships (M5b, D-0067); D-0078 chose to replicate the keys to replica nodes, and ADR 0180 reads that as seals to a custody key of each node, because the node-local key is never seen by the primary. The seals and the promotion are specified in node-agent-protocol.md section 7.
 
 Q-0001 to Q-0006, Q-0009, Q-0024, Q-0025, Q-0026 and Q-0060 are decided (D-0059 to D-0065, D-0067 to D-0070) and are therefore absent from the table.
 

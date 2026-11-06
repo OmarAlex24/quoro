@@ -251,7 +251,9 @@ and needs the same scope as the matching endpoint (D-0031, `../contracts/README.
 | T-NODE-11 | D | A node is flooded with frames or oversized messages | One JSON message per text frame, 1 MiB maximum, heartbeat every 5 s and disconnect after 15 s without a frame | `../contracts/node-agent-protocol.md` | A slow-loris style session can hold the single session slot until it times out |
 | T-NODE-12 | E | A node sends a message type or version the primary does not expect | Unknown fields are ignored, an unknown `type` is answered with a non-fatal `error`, and a major version mismatch is a fatal `unsupported_version` | `../contracts/node-agent-protocol.md` | A downgrade attack has nothing to gain: the protocol has one major version |
 | T-NODE-13 | T | A removed node keeps receiving desired state | `DELETE /api/v1/nodes/{node_id}` ends the session with a fatal `node_removed` and the node stops dialing | `../contracts/node-agent-protocol.md` | Its VMs are left as they are; removal never destroys data remotely, by design |
-| T-NODE-14 | E | A compromised primary takes over the cluster | Nothing in the protocol stops it: it holds the cluster signing key, the state and the audit log | D-0012, D-0031 | Full control. Signed desired state does not help, because the primary is the signer. This is why the audit copy must be out of reach of whoever operates the server (D-0031) and why a promoted replica must obtain the key through the custody path decided with manual promotion in M5b (D-0067) |
+| T-NODE-14 | E | A compromised primary takes over the cluster | Nothing in the protocol stops it: it holds the cluster signing key, the state and the audit log | D-0012, D-0031 | Full control. Signed desired state does not help, because the primary is the signer. This is why the audit copy must be out of reach of whoever operates the server (D-0031) and why a promoted machine obtains the keys only from seals made to its own custody key (ADR 0180, `../contracts/node-agent-protocol.md` section 7.2) |
+| T-NODE-15 | S | An attacker who controls a node, or its network path, swaps the node's custody key for one it holds, so the next seals open for it | The primary binds each machine to the first custody key it reports and refuses a different one with `custody_key_changed`; it makes no seal to the new key and writes `node.custody_key_changed` to the audit log | ADR 0180, `../contracts/node-agent-protocol.md` section 7.2 | The session is authenticated by the node credential, so an attacker who already holds the credential and the data directory also holds the original custody key and its seals (T-NODE-16) |
+| T-NODE-16 | E | A compromised node with the `node` role opens its seals and acts as the primary | Accepted by D-0078: every promotable machine holds the keys a primary holds. A promotion through Quoro needs root on the machine and a majority of voters; a returning old primary demotes itself on the first higher term it sees | D-0078, ADR 0180, ADR 0182, `../contracts/node-agent-protocol.md` sections 7.3 and 7.4 | With the signing key and the primary's TLS key it can answer as the primary to any node that dials it, including through `welcome.primary_urls`, and claim a higher term: nodes check the certificate and the signature, not the votes. Its blast radius is that of a compromised primary (T-NODE-14) for the nodes that reach it |
 
 ### (f) Leases and fencing
 
@@ -307,9 +309,10 @@ and needs the same scope as the matching endpoint (D-0031, `../contracts/README.
 | T-PRV-03 | T | An S3-compatible provider silently ignores conditional writes, giving two nodes the same lease | The provider adapter probes the capability at setup and refuses to enable the arbiter if the probe fails | F-0038, `docs/research/r2-conditional-writes.md`, D-0017 | Community MinIO and Backblaze B2 status is **Hypothesis**; the probe is the only defence |
 | T-PRV-04 | I | Stored backups are readable by the provider | Chunk-engine chunks are encrypted client-side; SQLite and template backups go through that same chunk engine from consistent snapshots, so nothing is stored unencrypted (D-0069) | D-0023, D-0069, F-0040 | Litestream with SSE-C may be added later as an optional backend (D-0069); such a backend would rely on the provider for encryption, with a Quoro-held key sent per request |
 | T-PRV-05 | D | A provider rate limit (R2 allows 1 write per second per key) stalls the off-site copy | Segment keys are unique, so the per-key limit does not bind the audit copy; retries back off | F-0037, `../contracts/audit-log-format.md` | A provider-wide outage pauses the copy; the local chain continues |
-| T-PRV-06 | I | Secrets in the change log are readable to a replica node | Replicated secret columns are encrypted with the cluster key, and a replica holds ciphertext | D-0013, `../contracts/node-agent-protocol.md` | How a promoted replica obtains the cluster key is decided with manual promotion in M5b (D-0067); custody determines who can read history |
+| T-PRV-06 | I | Secrets in the change log are readable to a replica node | Replicated secret columns are encrypted with the cluster key, and a follower holds ciphertext. It holds the key only as a seal to its own custody key, which it opens when it is promoted | D-0013, ADR 0180, `../contracts/node-agent-protocol.md` sections 7.1 and 7.2 | Every machine with the `node` role can open its seal, so a compromised one reads every secret in the log (section 8.3, T-NODE-16) |
 | T-PRV-07 | T | A provider changes a DNS record outside Quoro | Desired state is the source of truth and reconciliation rewrites drift | D-0011, D-0025 | Drift between reconciliations is unobserved unless a route check reports it |
 | T-PRV-08 | I | Provider secrets read back through the API or the audit log | Provider secrets are write-only, encrypted with the data-encryption key in `secret_enc`, never returned by a read call, redacted from audit parameters, and reachable only under the human-only `provider:manage` scope | D-0051, D-0050 | A compromised primary holding the DEK can decrypt them |
+| T-PRV-09 | I | The node credential hashes on every follower are used to open sessions | From M5b `node_credentials` travels in the change log so a promoted primary accepts every node's session; it holds only SHA-256 hashes of 32 random bytes, which cannot be reversed into a credential | ADR 0182, `../contracts/db-schema.sql` migration 0012 | A follower learns which nodes have live credentials, which the `nodes` rows already show |
 
 ### (j) Webhooks
 
@@ -351,8 +354,8 @@ and needs the same scope as the matching endpoint (D-0031, `../contracts/README.
 | Id | S | Threat | Mitigation | Reference | Residual risk |
 | --- | --- | --- | --- | --- | --- |
 | T-AVL-01 | D | The control plane dies and apps stop | Nodes store desired state locally and reconcile without the control plane, and they keep self-restarting apps | D-0011, D-0010 | Changes are blocked until a primary exists again |
-| T-AVL-02 | D | The primary is lost and nobody can change anything | Replica nodes hold a copy and can be promoted manually | D-0012, D-0016 | Manual promotion is an operator action; until it happens the cluster is read-only |
-| T-AVL-03 | D | Two nodes both believe they are primary after a network cut | Automatic election is not allowed below three votes, and Quoro says so instead of pretending | D-0016, D-0017 | The operator may still force a promotion by hand and create a split; that is a human error the product warns about |
+| T-AVL-02 | D | The primary is lost and nobody can change anything | From M5b an operator promotes a machine with the `node` role with `quoro cluster promote`: it rebuilds the database from its followed log, opens its seals and serves with the old certificate, so nodes follow it without a re-pin | D-0012, D-0016, ADR 0182, `../contracts/node-agent-protocol.md` section 7.3 | Promotion is an operator action; until it happens changes are blocked. Entries the old primary wrote and the candidate never followed are lost, and the new primary rebuilds browser sessions, webhook delivery state and the vulnerability mirror from nothing |
+| T-AVL-03 | D | Two nodes both believe they are primary after a network cut | Automatic election is not allowed below three votes, and Quoro says so instead of pretending. A promotion takes term `t + 1` from a majority of voters and waits for the old primary's grants; every machine refuses a lower term, and an old primary that meets the higher term stops writing (ADR 0182) | D-0016, D-0017, ADR 0169, `../contracts/node-agent-protocol.md` sections 7.3, 7.4 and 8.9 | `--ack-fence` skips the wait on the operator's word: if the old primary still runs, an `expiring` lease it granted in its last seconds may run twice. An old primary cut off with some nodes keeps changing their desired state and `local` leases until they see the new term |
 | T-AVL-04 | D | The witness sits in the same failure domain as a node and votes with it | The requirement is stated in the product and the panel; the witness must be outside the nodes' failure domain | D-0017 | Nothing enforces placement; a home PC next to a node is accepted if the operator says so |
 | T-AVL-05 | D | A single edge loses all app traffic | Two edges with DNS failover, or Cloudflare as the traffic edge with the host as witness only | D-0018 | Both alternatives add a provider dependency |
 | T-AVL-06 | D | A provider outage removes the arbiter and stops stateful apps | The outage fences expiring leases by design; local-mode leases keep `none`/`cold` apps running | D-0047, D-0019, `docs/research/r2-conditional-writes.md` | `warm` and `hot` apps lose availability during a long outage |
@@ -387,6 +390,7 @@ decisions with a single narrow threat.
 | D-0047 (lease modes, fencing tokens on every shared write) | T-LEASE-02, T-LEASE-03, T-LEASE-05, T-LEASE-09, T-AVL-06, T-VM-06 |
 | D-0048 (frozen spec, CI diff, pinned rmcp) | T-SUP-05, T-SUP-07 |
 | D-0050 (cluster keys, DEK storage and rotation) | T-PRV-06, T-PRV-08 |
+| ADR 0180 to ADR 0182 (key custody, the kept certificate, manual promotion) | T-AVL-02, T-AVL-03, T-PRV-06, T-NODE-15 |
 | D-0051 (human-only `providers` resource, write-only secrets) | T-PRV-01, T-PRV-02, T-PRV-08 |
 | D-0053 (off-site copy in M5a, object-lock probe) | T-AUD-06, T-PRV-05 |
 | D-0054 (setup token, listener and pin model) | T-API-11 |
@@ -407,11 +411,12 @@ off-site copy exists".
 
 ### 8.2 Single primary until promotion exists
 
-Until M5b (manual promotion, D-0067, with the key custody of section 8.3) and M6 (automatic
-election), one primary is
-a single point of write failure and a single point of trust. Losing it means no changes until an
-operator acts; compromising it means full control (T-NODE-14). Replica nodes reduce the data-loss
-risk, not the authority risk.
+From M5b an operator can promote a machine with the `node` role when the primary is gone
+(D-0067, ADR 0182, `../contracts/node-agent-protocol.md` section 7.3); until M6 there is no
+automatic election. One primary therefore stays a single point of write failure until an operator
+acts, and a single point of trust: compromising it means full control (T-NODE-14). Following
+machines reduce the data-loss risk, not the authority risk, and each of them holds the keys a
+primary holds (section 8.3).
 
 ### 8.3 Cluster key custody and how a promoted replica obtains it
 
@@ -422,9 +427,11 @@ keys"), and so is custody on promotion (D-0078, read by ADR 0180 and ADR 0181): 
 the `node` role generates a custody key pair, and the primary seals the signing key, the
 data-encryption key and its own TLS key to each such machine. Edge-only and witness-only machines get
 no seal. This widens the blast radius of a compromised node: a node that can open its seals holds
-the keys a primary holds, which D-0078 accepted. The fields and the table that carry the seals, and
-the threats they add, are specified with manual promotion in M5b (D-0067). That is why promotion is
-not offered before M5b: a replica promoted earlier would own state it cannot decrypt.
+the keys a primary holds, which D-0078 accepted (T-NODE-16). The seals are HPKE seals to an X25519
+custody key that never leaves the machine, bound to one cluster, machine, kind and key, and the
+primary refuses a machine's attempt to change its custody key (T-NODE-15;
+`../contracts/node-agent-protocol.md` section 7.2). That is why promotion is not offered before
+M5b: a replica promoted earlier would own state it cannot decrypt.
 
 ### 8.4 Object lock portability
 
@@ -548,6 +555,10 @@ Besides the lab run, each of these checks also runs as an automated test in the 
 | Let several `expiring` leases on one node expire at the same time and confirm every fence runs concurrently and finishes within its own bound, `t_send + D` (D-0075) | T-LEASE-01, T-LEASE-02 |
 | Crash a node in the middle of a fence and confirm that, after restart, its stateful apps stay stopped and no lease is granted elsewhere until an operator acknowledges the fence (D-0075) | T-LEASE-02, T-LEASE-09 |
 | Ask for manual promotion while the old primary may still hold expiring leases: refused until an operator acknowledges the fence (D-0067) | T-AVL-02, T-AVL-03 |
+| Promote while the old primary runs and its voters support it: every vote is refused (`support_held`) and no voter moves to the new term | T-AVL-03 |
+| Stop the old primary and promote another machine: the nodes and the edge reach it with their pins unchanged, and it reads an environment value of an app, so its seal opened | T-AVL-02, T-PRV-06 |
+| Start the old primary again after the promotion: on the first `stale_term` it ends its sessions with `not_primary` and answers `503`; `quoro node rejoin` keeps its data as a quarantined copy | T-AVL-03 |
+| Report a different custody key from an enrolled node: refused with `custody_key_changed`, no seal is made to it, and the audit log records it | T-NODE-15 |
 
 ### M6 — election and hot
 

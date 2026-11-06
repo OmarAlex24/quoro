@@ -139,6 +139,8 @@ pub fn is_id(prefix: Prefix, id: &str) -> bool {
 pub enum Scope {
     #[serde(rename = "cluster:read")]
     ClusterRead,
+    #[serde(rename = "cluster:manage")]
+    ClusterManage,
     #[serde(rename = "node:read")]
     NodeRead,
     #[serde(rename = "node:enroll")]
@@ -239,8 +241,9 @@ pub enum Scope {
 
 impl Scope {
     /// Every scope, in README table order.
-    pub const ALL: [Scope; 49] = [
+    pub const ALL: [Scope; 50] = [
         Self::ClusterRead,
+        Self::ClusterManage,
         Self::NodeRead,
         Self::NodeEnroll,
         Self::NodeRemove,
@@ -296,6 +299,7 @@ impl Scope {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ClusterRead => "cluster:read",
+            Self::ClusterManage => "cluster:manage",
             Self::NodeRead => "node:read",
             Self::NodeEnroll => "node:enroll",
             Self::NodeRemove => "node:remove",
@@ -389,6 +393,7 @@ impl Scope {
                 | Self::AppTerminal
                 | Self::AppDeleteQuarantine
                 | Self::BackupManage
+                | Self::ClusterManage
         )
     }
 
@@ -443,7 +448,11 @@ impl Role {
     pub fn holds(self, scope: Scope) -> bool {
         match self {
             Self::Owner => true,
-            Self::Operator => scope != Scope::UserWrite && scope != Scope::BackupManage,
+            Self::Operator => {
+                scope != Scope::UserWrite
+                    && scope != Scope::BackupManage
+                    && scope != Scope::ClusterManage
+            }
             Self::Viewer => scope.is_read() || scope == Scope::AppLogs,
         }
     }
@@ -532,10 +541,13 @@ mod tests {
         assert!(Role::Operator.holds(Scope::VmConsole));
         assert!(!Role::Viewer.holds(Scope::AppTerminal));
         assert!(!Role::Viewer.holds(Scope::VmConsole));
-        assert_eq!(Scope::ALL.iter().filter(|s| s.is_human_only()).count(), 15);
+        assert_eq!(Scope::ALL.iter().filter(|s| s.is_human_only()).count(), 16);
         assert_eq!(Scope::ALL.iter().filter(|s| s.is_destructive()).count(), 7);
         assert!(Role::Owner.holds(Scope::BackupManage));
         assert!(!Role::Operator.holds(Scope::BackupManage));
+        assert!(Role::Owner.holds(Scope::ClusterManage));
+        assert!(!Role::Operator.holds(Scope::ClusterManage));
+        assert!(!Role::Viewer.holds(Scope::ClusterManage));
         assert!(Role::Operator.holds(Scope::BackupRestore));
         assert!(Role::Operator.holds(Scope::AppFailover));
         assert!(Role::Operator.holds(Scope::AppDeleteQuarantine));
