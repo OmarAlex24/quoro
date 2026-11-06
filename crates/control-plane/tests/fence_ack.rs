@@ -780,13 +780,14 @@ async fn a_revoke_that_fails_again_after_the_ack_keeps_the_lease_listed() {
     );
 }
 
-/// A node that does not answer within the start wait still gets its desired
-/// state, and its late answers still count: a revoke answered late lets the
-/// `fence_ack` go out, and a late `ok` clears it.
+/// The desired state waits for the answer to the `fence_ack` (section 4.2
+/// rules 4 and 5), and a refusal is an answer: a node that answers it with an
+/// `error` frame, or with the `command_result` error an agent without
+/// `fence_ack` sends, still gets its desired state. The acknowledgement stays
+/// pending, is not sent again on that session, and goes out again at the next.
 #[tokio::test]
-async fn late_answers_after_the_start_wait_still_deliver_the_ack() {
+async fn a_refused_fence_ack_lets_the_desired_state_out_and_is_sent_again() {
     let server = start_with_patient_node_session().await;
-    server.state.hub.set_start_wait(Duration::from_millis(300));
     let owner = server.owner().await;
     let (node, app_id, lease_id) = acked_while_away(&server, &owner).await;
     let node_id = node.node_id.clone();
@@ -800,31 +801,38 @@ async fn late_answers_after_the_start_wait_still_deliver_the_ack() {
         ),
     )
     .await;
-    let frames = recv_until(&mut socket, &["welcome", "lease_revoke", "desired_state"]).await;
-    assert!(of_type(&frames, "command").is_empty(), "{frames:?}");
+    let frames = recv_until(&mut socket, &["welcome", "lease_revoke"]).await;
     let revoke = of_type(&frames, "lease_revoke")[0].clone();
-    heartbeat(&mut socket).await;
-
     reply(
         &mut socket,
         ok_result(),
         Some(revoke["id"].as_str().unwrap()),
     )
     .await;
-    let command = of_type(&recv_until(&mut socket, &["command"]).await, "command")[0].clone();
+    let frames = recv_until(&mut socket, &["command"]).await;
+    assert!(of_type(&frames, "desired_state").is_empty(), "{frames:?}");
+    let command = of_type(&frames, "command")[0].clone();
     assert_eq!(command["body"]["kind"], "fence_ack");
-    tokio::time::sleep(Duration::from_millis(600)).await;
     heartbeat(&mut socket).await;
-    assert!(fence_ack_pending(&server, &node_id).await.is_some());
+    none_of(&mut socket, &["desired_state"], Duration::from_millis(300)).await;
     reply(
         &mut socket,
-        ok_result(),
+        NodeMessage::Error(quoro_proto::ProtocolError {
+            code: ErrorCode::BadMessage,
+            message: "the fence_ack could not be read".to_string(),
+            fatal: false,
+        }),
         Some(command["id"].as_str().unwrap()),
     )
     .await;
-    wait_for_no_pending_ack(&server, &mut socket, &node_id).await;
+    let frames = recv_until(&mut socket, &["desired_state"]).await;
+    assert!(of_type(&frames, "command").is_empty(), "{frames:?}");
+    heartbeat(&mut socket).await;
+    none_of(&mut socket, &["command"], Duration::from_millis(500)).await;
+    assert!(fence_ack_pending(&server, &node_id).await.is_some());
 
-    // A second session with nothing pending neither waits nor sends one.
+    // The next session sends it again; an agent that does not know the
+    // command kind refuses it with a `command_result` error.
     drop(socket);
     wait_for_node(&owner, &server, None, &node_id, "disconnected", |node| {
         node["status"] != "connected"
@@ -832,8 +840,28 @@ async fn late_answers_after_the_start_wait_still_deliver_the_ack() {
     .await;
     let mut socket = connect(&server, &node.credential).await;
     send(&mut socket, hello(&node_id, Vec::new())).await;
-    let frames = recv_until(&mut socket, &["welcome", "desired_state"]).await;
-    assert!(of_type(&frames, "command").is_empty(), "{frames:?}");
+    let frames = recv_until(&mut socket, &["welcome", "command"]).await;
+    assert!(of_type(&frames, "desired_state").is_empty(), "{frames:?}");
+    let command = of_type(&frames, "command")[0].clone();
+    assert_eq!(command["body"]["kind"], "fence_ack");
+    reply(
+        &mut socket,
+        NodeMessage::CommandResult(CommandResult {
+            status: CommandStatus::Error,
+            detail: Some("command kind \"fence_ack\" arrives in a later milestone".to_string()),
+            error: Some(ErrorBody {
+                code: ErrorCode::BadMessage,
+                message: "this command kind is not implemented yet".to_string(),
+            }),
+            lines: None,
+            metrics: None,
+        }),
+        Some(command["id"].as_str().unwrap()),
+    )
+    .await;
+    recv_until(&mut socket, &["desired_state"]).await;
+    heartbeat(&mut socket).await;
+    assert!(fence_ack_pending(&server, &node_id).await.is_some());
 }
 
 /// An acknowledgement leaves alone a listed lease that another node holds by

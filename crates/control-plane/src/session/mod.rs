@@ -321,9 +321,6 @@ struct HubInner {
     /// Woken by every change notification, so the domains' serving status
     /// is recomputed after the desired states it follows (ADR 0167).
     serving_inputs: Notify,
-    /// How long a session start waits for its revokes and `fence_ack`, in
-    /// milliseconds; see [`NodeHub::set_start_wait`].
-    start_wait_ms: AtomicU64,
 }
 
 /// A test seam that holds one node's next snapshot after it is built and
@@ -400,21 +397,7 @@ impl NodeHub {
             generation: AtomicU64::new(0),
             snapshot_holds: Mutex::new(HashMap::new()),
             serving_inputs: Notify::new(),
-            start_wait_ms: AtomicU64::new(
-                u64::try_from(crate::fences::FENCE_ACK_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
-            ),
         }))
-    }
-
-    /// Test seam: how long a session start holds back the first desired
-    /// state for the revokes and the pending `fence_ack` (default
-    /// [`crate::fences::FENCE_ACK_TIMEOUT`]).
-    #[doc(hidden)]
-    pub fn set_start_wait(&self, wait: Duration) {
-        self.0.start_wait_ms.store(
-            u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
     }
 
     /// Test seam: holds `node_id`'s next snapshot that differs from the last
@@ -1518,8 +1501,9 @@ struct Session {
     start_wait: Option<u64>,
     /// The `fence_ack` sent on this session and not answered yet.
     fence_ack: Option<FenceAckSent>,
-    /// Set when the node answered a `fence_ack` with an error: it is not sent
-    /// again on this session, and the next session sends it again.
+    /// Set when the node refused a `fence_ack`, or when a failed fence it
+    /// reported could not be recorded: no `fence_ack` goes out again on this
+    /// session, and the next session sends the pending one.
     fence_ack_stopped: bool,
 }
 
@@ -1566,8 +1550,6 @@ async fn run_session(
     let mut close_after_error = false;
     let retry = tokio::time::sleep(SNAPSHOT_RETRY);
     tokio::pin!(retry);
-    let start_wait = tokio::time::sleep(crate::fences::FENCE_ACK_TIMEOUT);
-    tokio::pin!(start_wait);
 
     'session: loop {
         while let Ok(text) = rx.try_recv() {
@@ -1589,18 +1571,11 @@ async fn run_session(
                     Some(Ok(Message::Text(text))) => {
                         deadline = Instant::now() + timeout;
                         let was_pending = session.retry_pending;
-                        let was_waiting = session.start_wait.is_some();
                         if session.handle_text(text.as_str(), &mut outbox).await {
                             close_after_error = true;
                         }
                         if session.retry_pending && !was_pending {
                             retry.as_mut().reset(Instant::now() + SNAPSHOT_RETRY);
-                        }
-                        if session.start_wait.is_some() && !was_waiting {
-                            let wait = Duration::from_millis(
-                                session.hub.0.start_wait_ms.load(Ordering::Relaxed),
-                            );
-                            start_wait.as_mut().reset(Instant::now() + wait);
                         }
                     }
                     Some(Ok(Message::Binary(_))) => {
@@ -1653,23 +1628,6 @@ async fn run_session(
                         tracing::warn!(%e, node_id = %session.node_id, "cannot build the desired state");
                         retry.as_mut().reset(Instant::now() + SNAPSHOT_RETRY);
                     }
-                }
-            }
-            () = &mut start_wait, if session.start_wait.is_some() => {
-                // A node that does not answer within the wait still gets its
-                // desired state. A `fence_ack` already sent keeps its message
-                // id, so a late `ok` still clears it; one not sent yet waits
-                // for the revokes, or for the next session.
-                let was_pending = session.retry_pending;
-                if let Some(stored_rev) = session.start_wait.take() {
-                    tracing::warn!(
-                        node_id = %session.node_id,
-                        "the revokes or the fence_ack of the session start were not answered in time"
-                    );
-                    session.finish_start(stored_rev, &mut outbox).await;
-                }
-                if session.retry_pending && !was_pending {
-                    retry.as_mut().reset(Instant::now() + SNAPSHOT_RETRY);
                 }
             }
             () = sleep => {
@@ -1879,6 +1837,12 @@ impl Session {
                         }
                         Err(e) => {
                             tracing::warn!(%e, event_id = %event.id, "cannot store a node event");
+                            if event.kind == "node.fence_failed" {
+                                // As for a revoke answer that cannot be
+                                // recorded: no `fence_ack` may clear this
+                                // failure unseen on this session.
+                                self.fence_ack_stopped = true;
+                            }
                         }
                     }
                 }
@@ -1890,7 +1854,12 @@ impl Session {
                         .as_ref()
                         .is_some_and(|sent| sent.msg_id == re)
                     {
-                        self.fence_ack_answered(&result, outbox).await;
+                        self.fence_ack_answered(
+                            result.status == quoro_proto::CommandStatus::Ok,
+                            result.detail.as_deref(),
+                            outbox,
+                        )
+                        .await;
                         return false;
                     }
                     if let Some(lease_id) =
@@ -1929,15 +1898,24 @@ impl Session {
                     "node reported an error"
                 );
                 // A refused revoke is answered with `error` (section 5.13);
-                // it is answered all the same.
-                if let Some(re) = raw.re.as_deref()
-                    && self
+                // it is answered all the same. So is a refused `fence_ack`,
+                // which the session start no longer waits for.
+                if let Some(re) = raw.re.as_deref() {
+                    if self
+                        .fence_ack
+                        .as_ref()
+                        .is_some_and(|sent| sent.msg_id == re)
+                    {
+                        self.fence_ack_answered(false, Some(&error.message), outbox)
+                            .await;
+                    } else if self
                         .hub
                         .0
                         .take_revoke(&self.node_id, self.generation, re)
                         .is_some()
-                {
-                    self.revoke_answered(outbox).await;
+                    {
+                        self.revoke_answered(outbox).await;
+                    }
                 }
             }
             NodeMessage::Hello(_) => outbox.push(protocol_error(
@@ -2197,19 +2175,21 @@ impl Session {
         }
     }
 
-    /// The answer to a `fence_ack`: `ok` clears what it carried from
-    /// `fence_ack_pending` (section 8.5 step 4) and lets a newer
-    /// acknowledgement go out; an error stops it for this session. The
-    /// session start then goes on (section 4.2 rule 5).
+    /// The answer to a `fence_ack`, a `command_result` or an `error`: `ok`
+    /// clears what it carried from `fence_ack_pending` (section 8.5 step 4)
+    /// and lets a newer acknowledgement go out; a refusal stops it for this
+    /// session. Either answer lets the session start go on (section 4.2 rule
+    /// 5), so a node that refuses the command still gets its desired state.
     async fn fence_ack_answered(
         &mut self,
-        result: &quoro_proto::CommandResult,
+        ok: bool,
+        detail: Option<&str>,
         outbox: &mut Vec<String>,
     ) {
         let Some(sent) = self.fence_ack.take() else {
             return;
         };
-        if result.status == quoro_proto::CommandStatus::Ok {
+        if ok {
             if let Err(e) =
                 crate::fences::confirm(&self.hub.0.store, &self.node_id, &sent.lease_ids).await
             {
@@ -2219,7 +2199,7 @@ impl Session {
         } else {
             tracing::warn!(
                 node_id = %self.node_id,
-                detail = ?result.detail,
+                detail = ?detail,
                 "the node did not take the fence ack; it is sent again at its next session"
             );
             self.fence_ack_stopped = true;
@@ -2246,7 +2226,7 @@ impl Session {
     /// A `lease_revoke` answered with `fence_failed`: the failure is recorded
     /// on the node, so the lease is granted to no node until an operator
     /// acknowledges it (section 8.5 step 1).
-    async fn note_revoke_answer(&self, lease_id: &str, result: &quoro_proto::CommandResult) {
+    async fn note_revoke_answer(&mut self, lease_id: &str, result: &quoro_proto::CommandResult) {
         if result.error.as_ref().map(|error| error.code)
             != Some(quoro_proto::ErrorCode::FenceFailed)
         {
@@ -2286,12 +2266,19 @@ impl Session {
                 "a revoke was answered fence_failed; the lease waits for an operator's acknowledgement"
             ),
             Ok(false) => {}
-            Err(e) => tracing::warn!(
-                code = %e.code.as_str(),
-                node_id = %self.node_id,
-                lease_id,
-                "cannot record a failed fence"
-            ),
+            Err(e) => {
+                // The lease may still sit in `fence_ack_pending`; a
+                // `fence_ack` carrying it would clear the failure the node
+                // just recorded. None goes out on this session; the next
+                // session's revoke reports the failure again.
+                tracing::warn!(
+                    code = %e.code.as_str(),
+                    node_id = %self.node_id,
+                    lease_id,
+                    "cannot record a failed fence; the fence_ack waits for the next session"
+                );
+                self.fence_ack_stopped = true;
+            }
         }
     }
 

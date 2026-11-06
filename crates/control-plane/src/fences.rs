@@ -15,7 +15,6 @@
 //! in the caller's transaction.
 
 use std::collections::HashSet;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -25,12 +24,6 @@ use crate::changelog::{self, Actor, ActorType, Op};
 use crate::driver;
 use crate::error::ApiError;
 use crate::store::{Store, now_rfc3339};
-
-/// How long a session start holds back the first desired state for the
-/// stale-lease revokes and the pending `fence_ack` to be answered (section
-/// 4.2 rules 3 to 5). The node still gets its desired state after it; a
-/// `fence_ack` already sent is still cleared by a late `ok`.
-pub(crate) const FENCE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `nodes.fence_failure` (migration 0001, `NodeFenceFailure`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

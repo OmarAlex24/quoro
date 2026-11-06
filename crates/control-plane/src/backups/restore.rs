@@ -23,7 +23,7 @@ use crate::api::backups::{
 use crate::api::vms::{VM_COLUMNS, vm_from_row};
 use crate::api::volumes::{VOLUME_COLUMNS, Volume, VolumeState};
 use crate::changelog::{self, Actor, Op};
-use crate::error::ApiError;
+use crate::error::{ApiError, Code};
 use crate::events::{self, NewEvent, Source};
 use crate::leases::{self, Lease};
 use crate::request::CallCtx;
@@ -260,8 +260,21 @@ pub(crate) async fn apply_status(
         }
         match reported.state {
             wire::VolumeState::Ready => {
-                let outcome = restore_ready(store, node_id, &volume, reported).await?;
-                applied.merge(outcome);
+                match restore_ready(store, node_id, &volume, reported).await {
+                    Ok(outcome) => applied.merge(outcome),
+                    // The app's lease waits for an operator's acknowledgement
+                    // of a failed fence (section 8.5), so it is granted to no
+                    // node yet. The transaction rolled back; the volume stays
+                    // `restoring`, and the next status report applies it once
+                    // the lease is acknowledged. The other volumes go on.
+                    Err(e) if e.code == Code::Conflict => tracing::warn!(
+                        volume_id = %volume.id,
+                        node_id,
+                        detail = ?e.detail,
+                        "a restored volume waits for its lease"
+                    ),
+                    Err(e) => return Err(e),
+                }
             }
             wire::VolumeState::Failed => {
                 let vm_node_ids = restore_failed(store, node_id, &volume, reported).await?;

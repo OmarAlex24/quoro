@@ -46,7 +46,7 @@
 //! again ([`LeaseTable::restore`]). A revoke is answered with success only once
 //! that transaction committed.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::SystemTime;
@@ -407,8 +407,9 @@ pub async fn start_local_leases<E: Engine + 'static>(
             .is_ok_and(|listed| listed.is_empty())
     {
         warn!(
-            "the node is marked failed but names no failed fence, so no fence_ack can clear it; \
-             clear the failed mark by hand once its VMs are checked"
+            "the node is marked failed but names no failed fence, so the primary lists nothing \
+             to acknowledge; the next fence_ack this node takes clears the mark, or clear it by \
+             hand once its VMs are checked"
         );
     }
     let view = LeaseView::new(table, failed);
@@ -430,6 +431,7 @@ pub async fn start_local_leases<E: Engine + 'static>(
         tasks: JoinSet::new(),
         task_leases: HashMap::new(),
         recorded,
+        unstored_failures: BTreeSet::new(),
     };
     service.note_bindings();
     let task = tokio::spawn(service.run());
@@ -458,7 +460,14 @@ async fn unreported_failures(
             return None;
         }
     }
-    let listed = store.failed_fences().await.unwrap_or_default();
+    let listed = match store.failed_fences().await {
+        Ok(listed) => listed,
+        Err(e) => {
+            // The flag stays set, so the next start reports them.
+            warn!(error = %e, "could not read the failed fences to report");
+            return None;
+        }
+    };
     let mut latest: HashMap<String, FenceRecord> = HashMap::new();
     for record in records.iter().filter(|record| !record.complete) {
         if listed.contains(&record.lease_id.0) {
@@ -578,6 +587,10 @@ struct LocalLeaseService<E: Engine> {
     task_leases: HashMap<tokio::task::Id, LeaseId>,
     /// The complete fences recorded in the store, by lease and token.
     recorded: HashSet<(LeaseId, u64)>,
+    /// Leases whose failed fence the store did not take: the failed mark
+    /// holds for them in memory, and only a `fence_ack` naming them clears
+    /// them (section 5.17).
+    unstored_failures: BTreeSet<String>,
 }
 
 impl<E: Engine + 'static> LocalLeaseService<E> {
@@ -648,7 +661,7 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
     /// first, and the failed mark in memory follows only once the store says
     /// none remains, so a crash never leaves the node startable with a failed
     /// fence still recorded.
-    async fn fence_ack(&self, lease_ids: &[String]) -> CommandResult {
+    async fn fence_ack(&mut self, lease_ids: &[String]) -> CommandResult {
         // A fence of a listed lease that is still running may fail after the
         // operator checked; its outcome must not be cleared unseen.
         if let Some(busy) = lease_ids
@@ -660,7 +673,15 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
             ));
         }
         match self.store.ack_fences(lease_ids).await {
-            Ok(remaining) => {
+            Ok(mut remaining) => {
+                for lease_id in lease_ids {
+                    self.unstored_failures.remove(lease_id);
+                }
+                for lease_id in &self.unstored_failures {
+                    if !remaining.contains(lease_id) {
+                        remaining.push(lease_id.clone());
+                    }
+                }
                 if remaining.is_empty() {
                     self.view.failed.store(false, Ordering::SeqCst);
                     CommandResult {
@@ -1053,6 +1074,9 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                         .await
                 {
                     warn!(error = %e, "could not store the node's failed mark");
+                    // An acknowledgement of other leases must not clear the
+                    // mark this failure holds in memory.
+                    self.unstored_failures.insert(lease_id.0.clone());
                 }
                 if complete {
                     not_fenced(&format!(
