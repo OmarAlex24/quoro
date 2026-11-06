@@ -1,7 +1,8 @@
 //! Cluster read (`GET /api/v1/cluster`; MCP tool `get_cluster`).
 
 use crate::AppState;
-use crate::api::cluster::Cluster;
+use crate::api::cluster::{Cluster, ClusterVoter, ClusterVotes};
+use crate::api::nodes::NodeRole;
 use crate::error::ApiError;
 use crate::request::CallCtx;
 use crate::store::{GENESIS_HASH, now_rfc3339};
@@ -77,11 +78,57 @@ pub async fn get_cluster(state: &AppState, ctx: &CallCtx) -> Result<Cluster, Api
             primary_node_id,
             log_seq,
             log_head_hash,
-            // No elections exist until M6; the only term so far is 1.
+            // No promotion exists before the M5b promotion work; the only
+            // term so far is 1.
             term: 1,
+            votes: votes(state).await?,
             created_at,
         })
     }
     .await;
     ctx.finish_read(state, access, result).await
+}
+
+/// Voters HA needs (ADR 0017, ADR 0170).
+const REQUIRED_VOTES: i64 = 3;
+
+/// The voters of the cluster (`Cluster.votes`): every machine with the `node`
+/// or `witness` role that is not removed, connected or not (ADR 0170).
+///
+/// `ha_ready` stays false: the primary does not track voter support before
+/// the M5b lease work, so it cannot yet grant `expiring` leases
+/// (`node-agent-protocol.md` section 8.8).
+///
+/// # Errors
+///
+/// A database error, or a `roles` column that is not a list of roles.
+async fn votes(state: &AppState) -> Result<ClusterVotes, ApiError> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id, roles, status FROM nodes WHERE status <> 'removed' ORDER BY created_at, id",
+    )
+    .fetch_all(state.store.pool())
+    .await?;
+    let mut voters = Vec::new();
+    for (node_id, roles, status) in rows {
+        let roles: Vec<NodeRole> = serde_json::from_str(&roles)
+            .map_err(|e| ApiError::internal(&format!("nodes.roles is invalid: {e}")))?;
+        if roles
+            .iter()
+            .any(|role| matches!(role, NodeRole::Node | NodeRole::Witness))
+        {
+            voters.push(ClusterVoter {
+                node_id,
+                roles,
+                connected: status == "connected",
+            });
+        }
+    }
+    let count = i64::try_from(voters.len())
+        .map_err(|e| ApiError::internal(&format!("voter count: {e}")))?;
+    Ok(ClusterVotes {
+        voters,
+        count,
+        required: REQUIRED_VOTES,
+        ha_ready: false,
+    })
 }

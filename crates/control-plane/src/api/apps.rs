@@ -362,6 +362,10 @@ pub struct App {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(required = false)]
     pub ha_cost: Option<AppHaCost>,
+    /// The app's lease as the primary sees it; absent when the app has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(required = false)]
+    pub lease: Option<super::leases::Lease>,
     /// Current OCI reference of the app. For an app with a Git source, the
     /// reference of its last successful build, or `""` before the first one.
     pub image: String,
@@ -786,6 +790,7 @@ pub(crate) fn app_from_row(row: &SqliteRow) -> Result<App, ApiError> {
         backup_schedule,
         replicas: row.try_get("replicas")?,
         ha_cost: None,
+        lease: None,
         image: row.try_get("image")?,
         source,
         port: row.try_get("port")?,
@@ -1334,6 +1339,7 @@ async fn insert_app(
         backup_schedule: body.backup_schedule.unwrap_or_default(),
         replicas: body.replicas,
         ha_cost: None,
+        lease: None,
         image: body.image.clone().unwrap_or_default(),
         source,
         port: body.port,
@@ -1563,6 +1569,7 @@ pub async fn update_app(
             state.hub.edge_changed();
             // `openapi.yaml` `App.ha_cost`: every read answer carries it.
             crate::backups::cost::attach(&state, std::slice::from_mut(&mut app)).await?;
+            super::leases::attach(&state, std::slice::from_mut(&mut app)).await?;
             Ok(Json(app))
         }
         Err(error) => {
@@ -2919,6 +2926,7 @@ pub fn routes() -> Router<AppState> {
             App,
             AppDetail,
             EdgeBackend,
+            super::leases::Lease,
             AppList,
             CreateAppRequest,
             UpdateAppRequest,

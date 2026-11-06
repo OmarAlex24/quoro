@@ -160,6 +160,8 @@ pub struct RateLimited(Problem);
             crate::api::audit::AuditVerificationRequest,
             crate::api::audit::AuditVerificationResult,
             crate::api::cluster::Cluster,
+            crate::api::cluster::ClusterVotes,
+            crate::api::cluster::ClusterVoter,
             crate::api::auth::Grant,
             crate::api::grants::GrantList,
             crate::api::grants::CreateGrantRequest,

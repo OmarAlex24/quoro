@@ -9,6 +9,8 @@ export const HUMAN_ONLY_SCOPES: ReadonlySet<Scope> = new Set<Scope>([
   'node:enroll',
   'node:remove',
   'node:fence_ack',
+  'node:roles',
+  'node:declare_lost',
   'agent:write',
   'grant:write',
   'approval:decide',

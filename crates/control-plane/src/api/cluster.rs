@@ -32,12 +32,45 @@ pub struct Cluster {
     /// Hash of the last change-log entry.
     #[schema(pattern = "^[0-9a-f]{64}$")]
     pub log_head_hash: String,
-    /// Term of the current primary; 1 until elections exist (M6).
+    /// Term of the current primary: 1 until the first promotion (ADR 0169).
     #[schema(minimum = 1)]
     pub term: i64,
+    /// The voters of the cluster and whether HA is ready (ADR 0170).
+    pub votes: ClusterVotes,
     /// When the cluster was created.
     #[schema(format = "date-time")]
     pub created_at: String,
+}
+
+/// The voters of the cluster (`openapi.yaml` `ClusterVotes`, ADR 0170).
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[schema(title = "ClusterVotes")]
+pub struct ClusterVotes {
+    /// Every voter, oldest enrolled first.
+    pub voters: Vec<ClusterVoter>,
+    /// Number of voters.
+    #[schema(minimum = 0)]
+    pub count: i64,
+    /// Voters that HA needs; 3 in M5b (ADR 0017).
+    #[schema(minimum = 1)]
+    pub required: i64,
+    /// Whether `count` reaches `required` and the primary holds the support of
+    /// a majority of voters (ADR 0169).
+    pub ha_ready: bool,
+}
+
+/// One voter of the cluster (`openapi.yaml` `ClusterVoter`).
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[schema(title = "ClusterVoter")]
+pub struct ClusterVoter {
+    /// The voting machine.
+    #[schema(pattern = "^nod_[0-9A-HJKMNP-TV-Z]{26}$")]
+    pub node_id: String,
+    /// The machine's roles; at least one of them is `node` or `witness`.
+    #[schema(inline)]
+    pub roles: Vec<crate::api::nodes::NodeRole>,
+    /// Whether the machine's node-agent session is up now.
+    pub connected: bool,
 }
 
 /// Read cluster identity and change-log position.

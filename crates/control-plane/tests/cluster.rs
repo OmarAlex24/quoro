@@ -54,4 +54,80 @@ async fn get_cluster_returns_identity_and_log_position() {
     assert_eq!(hash.len(), 64);
     assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()));
     assert!(!cluster["created_at"].as_str().unwrap().is_empty());
+
+    // ADR 0170: the one `node` machine is the only voter, and HA is not ready.
+    let votes = &cluster["votes"];
+    assert_eq!(votes["count"], 1, "{cluster}");
+    assert_eq!(votes["required"], 3);
+    assert_eq!(votes["ha_ready"], false);
+    assert_eq!(votes["voters"][0]["node_id"], node_id);
+    assert_eq!(votes["voters"][0]["roles"], serde_json::json!(["node"]));
+    assert!(votes["voters"][0]["connected"].is_boolean());
+
+    let node: Value = owner
+        .get(server.url(&format!("/api/v1/nodes/{node_id}")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(node["lost_at"].is_null(), "{node}");
+}
+
+#[tokio::test]
+async fn votes_count_node_and_witness_machines_but_not_an_edge_alone() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let node_id = driver::register_local_node(&server.state.store, &local_node())
+        .await
+        .unwrap();
+    for (id, roles, status) in [
+        (
+            "nod_01JCA0A1B2C3D4E5F6G7H8J9KM",
+            r#"["edge","witness"]"#,
+            "connected",
+        ),
+        ("nod_01JCA0A1B2C3D4E5F6G7H8J9KN", r#"["edge"]"#, "connected"),
+        (
+            "nod_01JCA0A1B2C3D4E5F6G7H8J9KP",
+            r#"["witness"]"#,
+            "removed",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO nodes (id, name, roles, status, public_key, behind_nat, labels, \
+             capacity, allocated, kvm, created_at) \
+             VALUES (?, ?, ?, ?, 'key', 0, '{}', '{}', '{}', '{}', '2099-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(roles)
+        .bind(status)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+    }
+
+    let cluster: Value = owner
+        .get(server.url("/api/v1/cluster"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let votes = &cluster["votes"];
+    assert_eq!(votes["count"], 2, "{cluster}");
+    assert_eq!(votes["voters"][0]["node_id"], node_id);
+    assert_eq!(
+        votes["voters"][1]["node_id"],
+        "nod_01JCA0A1B2C3D4E5F6G7H8J9KM"
+    );
+    assert_eq!(
+        votes["voters"][1]["roles"],
+        serde_json::json!(["edge", "witness"])
+    );
+    assert_eq!(votes["voters"][1]["connected"], true);
+    assert_eq!(votes["ha_ready"], false);
 }

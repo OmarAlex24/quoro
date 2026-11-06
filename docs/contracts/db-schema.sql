@@ -67,7 +67,7 @@ PRAGMA foreign_keys = ON;
 -- ---------------------------------------------------------------------------
 
 -- Keys: schema_version ('1', written below), cluster_id (cls_), cluster_name,
--- term (current election term, 1 until elections exist, D-0016), created_at and
+-- term (current term, 1 until the first promotion, ADR 0169), created_at and
 -- webhook_cursor (the seq of the last event the local webhook dispatcher has
 -- dispatched; written by the dispatcher, local like webhook_deliveries, ADR 0140).
 CREATE TABLE meta (
@@ -275,7 +275,9 @@ CREATE TABLE volumes (
     created_at TEXT NOT NULL
 ) STRICT;
 
--- leases: replicated. The primary is the lease authority in M0-M5a (D-0019).
+-- leases: replicated. The primary is the lease authority in M0-M5a (D-0019);
+-- from M5b it grants and renews expiring leases only while a majority of
+-- voters supports it (ADR 0169). Renewals write nothing (migration 0010).
 -- Two modes (D-0047): `local` for HA policy `none`/`cold` and `expiring` for
 -- `warm`/`hot`. The node-side states `held`, `uncertain`, `expired` and
 -- `revoked` are fixed in node-agent-protocol.md.

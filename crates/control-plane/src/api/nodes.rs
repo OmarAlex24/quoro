@@ -76,6 +76,9 @@ pub struct Node {
     pub tunnel: Option<NodeTunnel>,
     /// Last heartbeat or message from the node.
     pub last_seen_at: Option<String>,
+    /// When an operator declared this node lost (ADR 0183), or null.
+    #[schema(format = "date-time", required = true)]
+    pub lost_at: Option<String>,
     /// When the node first enrolled.
     #[schema(format = "date-time")]
     pub created_at: String,
@@ -297,6 +300,7 @@ pub(crate) fn node_from_row(row: &SqliteRow) -> Result<Node, ApiError> {
         // Filled by `attach_tunnel` from `node_tunnels` (ADR 0095).
         tunnel: None,
         last_seen_at: row.try_get("last_seen_at")?,
+        lost_at: row.try_get("lost_at")?,
         created_at: row.try_get("created_at")?,
     })
 }

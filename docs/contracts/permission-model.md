@@ -92,6 +92,8 @@ A scope is `<resource>:<verb>` and is the unit of authority in both human roles 
 | `node:enroll` | Create node join tokens | human-only |
 | `node:remove` | Remove a node from the cluster | destructive, human-only |
 | `node:fence_ack` | Acknowledge a node's failed fence after verifying its VMs are stopped, so its leases may be granted again | human-only |
+| `node:roles` | Add or remove the `witness` role of an enrolled machine, which changes the voters (ADR 0170) | human-only |
+| `node:declare_lost` | Declare a disconnected node lost, so its leases may be granted elsewhere (ADR 0183) | human-only |
 | `project:read` | List and read projects | |
 | `project:write` | Create and update projects | |
 | `project:delete` | Delete an empty project | destructive |
@@ -150,10 +152,10 @@ Making destructive scopes grantable in standing grants would be a change to this
 
 ### 4.2 Human-only scopes
 
-Twelve scopes are human-only: `node:enroll`, `node:remove`, `node:fence_ack`, `app:terminal`, `backup:manage`, `agent:write`, `grant:write`, `approval:decide`, `webhook:write`, `provider:manage`, `user:read` and `user:write` (README.md, "Scopes").
+Fourteen scopes are human-only: `node:enroll`, `node:remove`, `node:fence_ack`, `node:roles`, `node:declare_lost`, `app:terminal`, `backup:manage`, `agent:write`, `grant:write`, `approval:decide`, `webhook:write`, `provider:manage`, `user:read` and `user:write` (README.md, "Scopes").
 
 - A grant whose `scopes` contains a human-only scope is refused at creation with `validation_failed`, and a hypothetical row that contained one is refused at call time with reason `human_only` (README.md, "Errors").
-- The set is chosen so an agent can never widen its own power (`agent:write`, `grant:write`, `webhook:write`), approve its own request (`approval:decide`), take over cluster membership (`node:enroll`, `node:remove`), declare a possibly running VM stopped so its lease moves (`node:fence_ack`, D-0079) or hold external credentials (`provider:manage`) or the key that opens every backup (`backup:manage`) (D-0030, D-0051, ADR 0147). `user:read` is human-only so an agent never reads the list of human identities and their emails. `app:terminal` is human-only in M4 because a shell in the app's VM reads every secret the app holds and acts outside single audited calls (ADR 0114); a later, non-interactive exec scope reachable only through an approval grant is a separate decision.
+- The set is chosen so an agent can never widen its own power (`agent:write`, `grant:write`, `webhook:write`), approve its own request (`approval:decide`), take over cluster membership or the voters (`node:enroll`, `node:remove`, `node:roles`), declare a possibly running VM stopped so its lease moves (`node:fence_ack`, D-0079, and `node:declare_lost`, ADR 0183) or hold external credentials (`provider:manage`) or the key that opens every backup (`backup:manage`) (D-0030, D-0051, ADR 0147). `user:read` is human-only so an agent never reads the list of human identities and their emails. `app:terminal` is human-only in M4 because a shell in the app's VM reads every secret the app holds and acts outside single audited calls (ADR 0114); a later, non-interactive exec scope reachable only through an approval grant is a separate decision.
 - Because `approval:decide` is human-only, "an agent approves its own destructive request" is not a policy that could be misconfigured; it is unrepresentable (D-0030).
 
 ### 4.3 Wildcards

@@ -19,6 +19,7 @@ pub mod grants;
 pub mod health;
 pub mod incidents;
 pub mod interactive;
+pub mod leases;
 pub mod logs;
 pub mod metrics;
 pub mod nodes;
