@@ -249,6 +249,7 @@
   - [0242: A stateful start under an expiring lease needs valid_until - now >= start bound + M, and the engine's start takes a caller-supplied bound (3 s for expiring leases)](adr/0242-a-stateful-start-under-an-expiring-lease-needs-valid-until.md)
   - [0243: Both stop modes carry a caller-supplied bound, and a forced stop the engine began finishes after a dropped call](adr/0243-both-stop-modes-carry-a-caller-supplied-bound-and-a-forced.md)
   - [0244: A converted lease's row keeps mode local until the primary answers its first renewal, and is written expiring then](adr/0244-a-converted-lease-s-row-keeps-mode-local-until-the-primary.md)
+  - [0245: fence_ack carries each lease's acknowledged token, and the node clears only failed fences below it](adr/0245-fence-ack-carries-each-lease-s-acknowledged-token-and-the.md)
 
 # Background research
 
