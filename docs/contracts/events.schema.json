@@ -342,7 +342,7 @@
         "lease_ids": { "type": "array", "items": { "$ref": "#/$defs/LeaseId" } },
         "fencing_tokens": {
           "type": "object",
-          "description": "The fencing token the node held for each lease in lease_ids when it fenced, keyed by lease id (node-agent-protocol.md section 8.5 steps 2 and 3). From M5b the node always sends it.",
+          "description": "The token of the fence for each lease in lease_ids, keyed by lease id: the highest token the node had seen for the lease when the fence started, which for a fence that a lease_revoke started is the revoke's token (node-agent-protocol.md section 8.5 step 2, ADR 0246). From M5b the node always sends it.",
           "propertyNames": { "$ref": "#/$defs/LeaseId" },
           "additionalProperties": { "type": "integer", "minimum": 1 }
         },
@@ -362,7 +362,7 @@
         "lease_ids": { "type": "array", "items": { "$ref": "#/$defs/LeaseId" } },
         "fencing_tokens": {
           "type": "object",
-          "description": "The fencing token the node held for each lease in lease_ids when it fenced, keyed by lease id (node-agent-protocol.md section 8.5 steps 2 and 3). From M5b the node always sends it.",
+          "description": "The token of the fence for each lease in lease_ids, keyed by lease id: the highest token the node had seen for the lease when the fence started, which for a fence that a lease_revoke started is the revoke's token (node-agent-protocol.md section 8.5 step 2, ADR 0246). From M5b the node always sends it.",
           "propertyNames": { "$ref": "#/$defs/LeaseId" },
           "additionalProperties": { "type": "integer", "minimum": 1 }
         },
