@@ -98,7 +98,7 @@ External facts behind this milestone are verified in the research files. Cloud H
 
 - Nothing precedes M0. The rootfs pipeline (`mkfs.ext4 -d` plus an OCI registry client) is verified by the M0 spike.
 - Q-0003 (rootfs conversion and minimal init) is answered by the M0 spike: our own conversion pipeline and init, validated there [D-0061].
-- Realtime transport, lease modes, text-only consoles, the OpenAPI source of truth, provider credentials, cluster keys and the host layout with the one-time setup token are decided [D-0057, D-0047, D-0056, D-0048, D-0051, D-0050, D-0054]. Custody of the cluster keys on promotion stays open and is decided with promotion in M5b [D-0067]; it does not block the freeze.
+- Realtime transport, lease modes, text-only consoles, the OpenAPI source of truth, provider credentials, cluster keys and the host layout with the one-time setup token are decided [D-0057, D-0047, D-0056, D-0048, D-0051, D-0050, D-0054]. Custody of the cluster keys on promotion is decided too [D-0078, D-0180, D-0181]: every machine with the `node` role generates a custody key pair, and the primary seals the cluster keys and its own TLS key to each one; the fields that carry the seals come with promotion in M5b [D-0067].
 - Contracts freeze at the end of M0; any later change is a standalone PR [D-0036].
 
 #### Explicitly out of scope
@@ -358,7 +358,7 @@ D-0016 places manual promotion of a replica node to primary in M5, and it ships 
 - Replicated volumes at the `warm` policy: data continuously replicated, image pulled, instance stopped [D-0020], shipped by the content-addressed chunk engine [D-0023].
 - The N+1 capacity indicator: "if node A dies, do its apps fit on the others?" [D-0021].
 - Failback behaviour: a returning node rejoins fenced, starts nothing stateful, quarantines its divergent writes as a snapshot recorded in the audit log, resyncs incrementally, and by default no failback happens [D-0022].
-- A planned switchover is available when the user prefers the original node: wait for lag near zero, wait for a low-traffic window, freeze writes, final sync, move the lease, shift traffic, drain connections; it loses no data [D-0022].
+- A planned switchover is available when the user prefers the original node: wait for lag near zero, freeze writes, final sync, move the lease, shift traffic, drain connections; it loses no data [D-0022]. In M5b it runs as soon as it is asked for; scheduling it for a low-traffic window comes later [D-0177].
 - The edge can also be the third voter, as the witness+edge combination of the same binary [D-0018].
 
 External arbiters are optional and their behaviour is verified. R2 conditional writes as a lease arbiter: an atomic conditional PUT, 1 write/s per key, no TTL, and fencing tokens are still required (docs/research/r2-conditional-writes.md). Cloudflare Durable Objects as the arbiter: fits on the Workers Free plan, needs a Cloudflare account and a Worker, and fencing tokens are still required (docs/research/durable-objects.md). The snapshot primitive under the chunk engine is reflink snapshots, natively or in a node-managed XFS volume pool, plus a full content-defined chunk scan for the M5a `cold` backups [D-0156]; `warm` keeps the same snapshots and finds the ranges that changed between two of them by comparing their extent maps (FIEMAP), with no lvm-thin and no btrfs [D-0172].
@@ -367,15 +367,15 @@ Failure domains: all three lab VMs run on one physical host. The lab therefore s
 
 #### Definition of Done
 
-- [ ] Roles: lab-2 is the control-plane primary and a node; lab-1 is a node hosting the stateful app; lab-3 is added as witness during the test [D-0012, D-0017].
-- [ ] With only lab-1 and lab-2 as nodes, Quoro reports that HA needs a third vote and offers to add a witness [D-0017].
-- [ ] Add lab-3 as witness; Quoro then reports three votes, and lab-3 stores no application data.
+- [ ] Roles: lab-2 is the control-plane primary and a node; lab-1 is a node hosting the stateful app; lab-3, already enrolled as the edge, gains the witness role during the test (witness+edge) [D-0012, D-0017, D-0018].
+- [ ] With lab-1 and lab-2 as the only voters (lab-3, still an edge only, does not vote), Quoro reports that HA needs a third vote and offers to add a witness [D-0017, D-0170].
+- [ ] Give lab-3 the witness role, without enrolling it again; Quoro then reports three votes, and lab-3 stores no application data [D-0170].
 - [ ] A stateful app runs at `warm` on lab-1 with its data shipped to lab-2; the panel shows the last shipped snapshot on lab-2.
-- [ ] Cut lab-1 off from lab-2 and lab-3; lab-1 self-fences its stateful apps and they stop on lab-1 [D-0019].
+- [ ] Cut lab-1 off from lab-2 and lab-3 with a firewall rule on lab-1, removed by a timer; lab-1's agent keeps running, lab-1 self-fences its stateful apps and they stop on lab-1 [D-0019].
 - [ ] While lab-1 still holds the app's lease, Quoro refuses to start the warm copy on lab-2 [D-0019].
 - [ ] After lab-1's lease is lost, an operator (or an agent with human approval) starts the warm copy on lab-2, and it contains the data of the last shipped snapshot [D-0016, D-0020, D-0023]. Automatic per-app failover is M6.
-- [ ] Bring lab-1 back; it starts nothing stateful, its copy of the app becomes the `warm` copy following lab-2 (lab-2 is now the lease holder and source of truth), and its divergent writes appear as a quarantined snapshot recorded in the audit log [D-0022].
-- [ ] Write a known record to the app, then run a planned switchover back to lab-1; it completes, the app serves from lab-1, and the record is present [D-0022].
+- [ ] Bring lab-1 back by removing the firewall rule; it starts nothing stateful, its copy of the app becomes the `warm` copy following lab-2 (lab-2 is now the lease holder and source of truth), and its divergent writes appear as a quarantined snapshot recorded in the audit log [D-0022].
+- [ ] Write a known record to the app, then run a planned switchover back to lab-1; it runs immediately (scheduling it for a low-traffic window comes later), completes, the app serves from lab-1, and the record is present [D-0022, D-0177].
 - [ ] The N+1 indicator answers "if lab-1 dies, do its apps fit?" with yes, or with no plus the missing resources [D-0021].
 - [ ] An operator promotes a replica node to primary; the promotion is refused while the old primary may still hold expiring leases unless the operator acknowledges the fence [D-0067].
 - [ ] Before expiring leases ship, the concurrent-fence and mid-fence crash tests pass [D-0075].
@@ -383,18 +383,19 @@ Failure domains: all three lab VMs run on one physical host. The lab therefore s
 
 #### Demo script
 
-1. Start with lab-1 and lab-2 as nodes only and open the HA view. Expected: Quoro says a third vote is missing and offers a witness [D-0017]. Add lab-3 as witness. Expected: Quoro reports three votes and lab-3 shows no volumes.
+1. Start with lab-1 and lab-2 as nodes and lab-3 as the edge only, and open the HA view. Expected: Quoro counts two votes, says a third vote is missing and offers a witness [D-0017]. Give lab-3 the witness role. Expected: Quoro reports three votes and lab-3 shows no volumes [D-0170].
 2. Deploy a stateful app at `warm` on lab-1. Expected: the panel shows the data being shipped and lab-2 holding the last shipped snapshot.
-3. Cut the network between lab-1 and the other two. Expected: lab-1's app stops itself (self-fence). Try to start the warm copy on lab-2 before the lease is lost: refused. After the lease is lost, start it: it serves the last shipped data.
-4. Reconnect lab-1. Expected: it starts nothing stateful, its copy becomes the warm copy following lab-2, and a quarantined snapshot of its divergent writes is in the audit log [D-0022].
-5. Start a planned switchover to lab-1 in the panel, then open the N+1 indicator and ask "if lab-1 dies?". Expected: the switchover completes with no data loss and the app serves from lab-1; the indicator answers yes, or no plus the missing resources [D-0021].
+3. Cut lab-1 off from the other two with a firewall rule on lab-1, removed by a timer; lab-1's agent keeps running. Expected: lab-1's app stops itself (self-fence). Try to start the warm copy on lab-2 before the lease is lost: refused. After the lease is lost, start it: it serves the last shipped data.
+4. Remove the firewall rule to reconnect lab-1. Expected: it starts nothing stateful, its copy becomes the warm copy following lab-2, and a quarantined snapshot of its divergent writes is in the audit log [D-0022].
+5. Start a planned switchover to lab-1 in the panel; it runs immediately. Then open the N+1 indicator and ask "if lab-1 dies?". Expected: the switchover completes with no data loss and the app serves from lab-1; the indicator answers yes, or no plus the missing resources [D-0021, D-0177].
+6. Ask to promote lab-1 to primary while lab-2's control plane runs. Expected: refused [D-0067]. Stop the control plane on lab-2; its node agent keeps running. Promote lab-1 again. Expected: the promotion waits until the old primary's support and expiring leases have run out, or goes ahead when the operator acknowledges the fence; the nodes and the edge then follow lab-1 [D-0182]. Finish by promoting lab-2 back to primary the same way: lab-2 rejoins as a node, its promotion is refused while lab-1's control plane runs and goes ahead once it is stopped, and lab-1 rejoins as a node. Expected: lab-2 is the primary again, as at the start.
 
 #### Dependencies
 
 - M5a (edge, app replicas, chunk engine, bucket).
 - D-0017, D-0018, D-0019, D-0020, D-0021, D-0022, D-0023.
 - A standalone contract PR adds the HA policy cost and N+1 capacity fields.
-- Needed before or during M5b: a lab measurement of how precise and correct the FIEMAP comparison of two reflink snapshots is on the XFS volume pool, which also sets the default replication interval of `warm` [D-0172].
+- Measured before the M5b contracts: the FIEMAP comparison of two reflink snapshots on the XFS volume pool found exactly the written blocks over 50 cycles in about 20 ms, which keeps the default replication interval of `warm` at 30 s (docs/research/m5b-warm-and-leases.md) [D-0172, D-0173].
 - This milestone does not deliver automatic promotion of the control plane; that is M6 [D-0016].
 
 #### Explicitly out of scope
