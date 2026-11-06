@@ -15,8 +15,11 @@
 //! its send time when it hands the renewal to the session, a little before the
 //! frame leaves, so `valid_until` errs early. Each lease's validity is stored
 //! on `CLOCK_BOOTTIME` once, when `valid_until` is set, so a held lease
-//! survives an agent restart within the same host boot and a suspend can never
-//! move its stored deadline later (section 8.4 "Agent restart", ADR 0072).
+//! survives an agent restart within the same host boot, and a suspend after
+//! that conversion can only shorten what the restart finds left (section 8.4
+//! "Agent restart", ADR 0072). A suspend between a renewal and its answer, or
+//! while the agent runs, is not detected yet: the monotonic clock does not
+//! count it.
 //!
 //! A revoke reaches the service as soon as the session reads it, and is
 //! answered once its fence is recorded; the session holds back what may not
@@ -216,7 +219,9 @@ impl LeaseView {
         let lease_id = LeaseId(lease_id.to_owned());
         !self.failed.load(Ordering::SeqCst)
             && !self.gates.fencing().contains(&lease_id)
-            && self.lock().may_start_stateful(&lease_id, spec_token)
+            && self
+                .lock()
+                .may_start_stateful(&lease_id, spec_token, Instant::now())
     }
 
     /// Section 8.4: may a stateful VM with this spec token that already runs
@@ -746,14 +751,15 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
         // run side by side (section 8.5).
         for action in std::mem::take(&mut self.pending) {
             if let crate::lease::Action::Fence { lease_id, reason } = action {
-                self.begin_fence(lease_id, reason, None);
+                self.begin_fence(lease_id, reason, None, Instant::now());
             }
         }
         loop {
-            // Everything the clock has reached runs before the wait, so the
-            // timer below always sleeps until a strictly later instant.
-            self.advance().await;
-            let deadline = self.lock().next_deadline(Instant::now());
+            // Everything the clock had reached when `advance` polled runs
+            // before the wait. The wait is computed from that same instant,
+            // so a deadline reached while `advance` ran ends it at once.
+            let polled_at = self.advance().await;
+            let deadline = self.lock().next_deadline(polled_at);
             tokio::select! {
                 () = wait_until(deadline) => {}
                 changed = self.desired.changed() => {
@@ -825,11 +831,20 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
 
     /// Section 8.4 for everything the clock has reached: sends the renewals
     /// that are due through the attached session, and fences each lease that
-    /// reached `valid_until`.
-    async fn advance(&mut self) {
+    /// reached `valid_until`. Returns the instant it polled at.
+    async fn advance(&mut self) -> Instant {
         let now = Instant::now();
-        let actions = self.lock().poll(now);
-        let mut changed = false;
+        // Each lease's `valid_until` before the poll clears it: an expiry's
+        // stop time counts from there, not from the poll, which may run late.
+        let (deadlines, actions): (HashMap<LeaseId, Instant>, _) = {
+            let mut table = self.lock();
+            let deadlines = table
+                .leases()
+                .filter_map(|lease| lease.valid_until.map(|until| (lease.id.clone(), until)))
+                .collect();
+            (deadlines, table.poll(now))
+        };
+        let mut expired = Vec::new();
         for action in actions {
             match action {
                 Action::SendRenew {
@@ -859,18 +874,26 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                     }
                 }
                 Action::Fence { lease_id, reason } => {
-                    // Persisted `expired` before the stop begins, so an agent
-                    // that dies mid-fence restores the lease fenced (section
-                    // 8.5 step 2).
-                    self.persist(&lease_id).await;
-                    self.begin_fence(lease_id, reason, None);
-                    changed = true;
+                    // The stop must end by `t_send + D` (section 8.4), so it
+                    // begins before anything waits on the store.
+                    let since = deadlines.get(&lease_id).copied().unwrap_or(now).min(now);
+                    self.begin_fence(lease_id.clone(), reason, None, since);
+                    expired.push(lease_id);
                 }
             }
         }
-        if changed {
-            self.publish_hello();
+        if expired.is_empty() {
+            return now;
         }
+        // Then `expired` is stored, so an agent that dies mid-fence restores
+        // the lease fenced (section 8.5 step 2). One that dies before the
+        // write still restores it `expired`: its stored deadline, on
+        // `CLOCK_BOOTTIME`, is no later than the `valid_until` just reached.
+        for lease_id in &expired {
+            self.persist(lease_id).await;
+        }
+        self.publish_hello();
+        now
     }
 
     /// Section 5.17 `fence_ack`: the store clears the listed failed fences
@@ -942,7 +965,7 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
         };
         if let Some(lease) = lease {
             // A grant that answered a renewal set `valid_until`: its stored
-            // form is converted now, before any suspend can come between.
+            // form is converted now, so a later suspend cannot move it.
             let row = StoredLease::with_validity(&lease, self.validity_of(&lease));
             if let Err(e) = self.store.save_lease(&row, highest).await {
                 warn!(error = %e, "could not persist a lease grant");
@@ -1020,6 +1043,7 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                         msg: envelope.id,
                         reply,
                     }),
+                    Instant::now(),
                 );
             }
         }
@@ -1088,7 +1112,16 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
     /// Section 8.5 step 1: starts stopping every VM bound to the lease, in a
     /// task of its own. A lease whose fence is already running gets no second
     /// stop: the trigger joins that fence and is answered with its result.
-    fn begin_fence(&mut self, lease_id: LeaseId, reason: FenceReason, waiter: Option<Waiter>) {
+    ///
+    /// `since` is when the fence was triggered: an `expiring` lease's stop
+    /// time counts from there (section 8.4).
+    fn begin_fence(
+        &mut self,
+        lease_id: LeaseId,
+        reason: FenceReason,
+        waiter: Option<Waiter>,
+        since: Instant,
+    ) {
         if let Some(flight) = self.in_flight.get_mut(&lease_id) {
             flight.waiters.extend(waiter);
             return;
@@ -1119,18 +1152,17 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
         let desired = self.desired.clone();
         let known = vms.clone();
         let fenced = lease_id.clone();
-        let begun = Instant::now();
         let handle = self.tasks.spawn(async move {
             // A start that holds the gate finishes first; its VM is then
             // among those stopped here.
             let _exclusive = gate.write_owned().await;
             let (stopping, unlisted) = fence_targets(&*engine, &desired, &fenced, known).await;
             // An `expiring` lease must be stopped within `M` of the trigger
-            // (section 8.4), so time spent waiting for a start comes out of
-            // the graceful stop.
+            // (section 8.4), so the time since the trigger, waiting for a
+            // start or listing the VMs, comes out of the graceful stop.
             let budget = if bounded {
                 FenceTimers {
-                    grace: budget.grace.saturating_sub(begun.elapsed()),
+                    grace: budget.grace.saturating_sub(since.elapsed()),
                     force: budget.force,
                 }
             } else {

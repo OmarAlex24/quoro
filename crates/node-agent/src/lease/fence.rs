@@ -35,8 +35,8 @@ pub enum VmFenceOutcome {
     ///
     /// The engine's `Force` already escalates to `SIGKILL` (engine-trait.md
     /// 3.8), so `Failed` means that even the kill could not be confirmed: the
-    /// forced stop returned an error or timed out and a bounded `inspect` did
-    /// not find the VM stopped without a pid.
+    /// forced stop returned an error or timed out and an `inspect` inside the
+    /// same `T_force` did not find the VM stopped without a pid.
     Failed(String),
 }
 
@@ -134,9 +134,12 @@ async fn stop_one<E: Engine>(engine: &E, id: VmId, timers: FenceTimers) -> (VmId
         }
     }
 
-    // Section 8.5 step 1: then forced, bounded by `T_force`.
+    // Section 8.5 step 1: then forced, bounded by `T_force`. The check below
+    // shares that bound, so the whole stop of one VM never takes longer than
+    // `T_grace + T_force` (section 8.4).
+    let force_deadline = tokio::time::Instant::now() + timers.force;
     let forced = engine.stop(&id, StopMode::Force);
-    let failure = match tokio::time::timeout(timers.force, forced).await {
+    let failure = match tokio::time::timeout_at(force_deadline, forced).await {
         Ok(Ok(_)) => return (id, VmFenceOutcome::Forced),
         Ok(Err(EngineError::NotFound)) => return (id, VmFenceOutcome::Gone),
         Ok(Err(error)) => error.to_string(),
@@ -144,9 +147,10 @@ async fn stop_one<E: Engine>(engine: &E, id: VmId, timers: FenceTimers) -> (VmId
     };
 
     // D-0074: the forced stop could not confirm anything, so look at the VM
-    // once, inside the same bound. Only a stopped VM without a pid is proof;
-    // everything else means the VM may still run.
-    match tokio::time::timeout(timers.force, engine.inspect(&id)).await {
+    // once, with what is left of the same bound. Only a stopped VM without a
+    // pid is proof; everything else, an inspect the bound cut short included,
+    // means the VM may still run.
+    match tokio::time::timeout_at(force_deadline, engine.inspect(&id)).await {
         Ok(Err(EngineError::NotFound)) => (id, VmFenceOutcome::Gone),
         Ok(Ok(info))
             if matches!(

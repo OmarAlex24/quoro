@@ -435,9 +435,11 @@ async fn a_held_lease_is_fenced_after_a_reboot_or_a_long_suspend() {
 /// `valid_until` is set. A later save of the same `valid_until`, here the
 /// higher-token grant of a new ownership, which keeps the old validity, stores
 /// the same deadline even after a suspend, which `CLOCK_BOOTTIME` counts and
-/// the monotonic clock does not.
+/// the monotonic clock does not. (A suspend before the conversion, between a
+/// renewal and its answer, is not covered: see the module doc of the lease
+/// service.)
 #[tokio::test]
-async fn a_suspend_never_moves_the_stored_deadline_later() {
+async fn a_suspend_after_the_conversion_never_moves_the_stored_deadline_later() {
     let dir = TargetDir::new("expiring-suspend-save");
     let engine = Arc::new(FakeEngine::new());
     let desired = bound(&["vm_warm"]);
@@ -462,5 +464,137 @@ async fn a_suspend_never_moves_the_stored_deadline_later() {
         Some(first_validity),
         "the same valid_until is stored as it was first converted"
     );
+    leases.abort();
+}
+
+/// Section 8.4: a renewal left unanswered for `D / 3` makes the lease
+/// `uncertain` while the session stays up, and the answer to the next
+/// renewal makes it `held` again, with nothing stopped.
+#[tokio::test]
+async fn a_late_renewal_makes_the_lease_uncertain_until_the_next_answer() {
+    let dir = TargetDir::new("expiring-late");
+    let engine = Arc::new(FakeEngine::new());
+    let desired = bound(&["vm_warm"]);
+    let clock = clock();
+    let (leases, _store) = start(&dir, &engine, &desired, config(&clock)).await;
+    let vm = running_vm(&engine, "vm_warm", 2).await;
+    let mut attached = leases.link.attach();
+
+    // `D` = 6 000: a renewal every 2 000 ms.
+    let _before = grant_and_confirm(&leases, &mut attached, 6000).await;
+    let _unanswered = next_renewal(&mut attached).await;
+    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Held));
+    // The next renewal goes out once the first one is late.
+    let renew = next_renewal(&mut attached).await;
+    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Uncertain));
+    assert!(leases.view.may_keep_running(LEASE, 1));
+    assert!(!leases.view.may_start_stateful(LEASE, 1));
+    answer(&leases, &renew, 6000).await;
+    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Held));
+    assert!(leases.view.may_start_stateful(LEASE, 1));
+    assert!(engine.stop_calls().is_empty(), "nothing is fenced");
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Running);
+    leases.abort();
+}
+
+/// Section 8.3: losing the session never touches a `local` lease.
+#[tokio::test]
+async fn a_lost_session_leaves_a_local_lease_held() {
+    let dir = TargetDir::new("local-detached");
+    let engine = Arc::new(FakeEngine::new());
+    let desired = bound(&["vm_warm"]);
+    let clock = clock();
+    let (leases, _store) = start(&dir, &engine, &desired, config(&clock)).await;
+    let attached = leases.link.attach();
+    leases
+        .link
+        .grant(
+            MsgId("msg_grant".to_owned()),
+            None,
+            LeaseGrant {
+                mode: LeaseMode::Local,
+                duration_ms: None,
+                ..expiring(1, 3000)
+            },
+        )
+        .await
+        .expect("the grant is taken");
+    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Held));
+
+    drop(attached);
+    tokio::time::sleep(millis(200)).await;
+    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Held));
+    assert!(leases.view.may_start_stateful(LEASE, 1));
+    assert_eq!(leases.link.hello()[0].state, "held");
+    leases.abort();
+}
+
+/// A session that ends after a newer one attached changes nothing: the newer
+/// session keeps carrying the renewals and the lease stays `held`.
+#[tokio::test]
+async fn an_old_session_ending_after_a_new_one_attached_changes_nothing() {
+    let dir = TargetDir::new("expiring-reattached");
+    let engine = Arc::new(FakeEngine::new());
+    let desired = bound(&["vm_warm"]);
+    let clock = clock();
+    let (leases, _store) = start(&dir, &engine, &desired, config(&clock)).await;
+    let mut old = leases.link.attach();
+    // `D` = 3 000: a renewal every 1 000 ms.
+    let _before = grant_and_confirm(&leases, &mut old, 3000).await;
+
+    let mut new = leases.link.attach();
+    let renew = next_renewal(&mut new).await;
+    answer(&leases, &renew, 3000).await;
+    drop(old);
+    tokio::time::sleep(millis(100)).await;
+    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Held));
+
+    let renew = next_renewal(&mut new).await;
+    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Held));
+    answer(&leases, &renew, 3000).await;
+    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Held));
+    assert!(engine.stop_calls().is_empty(), "nothing is fenced");
+    leases.abort();
+}
+
+/// Section 8.4: `T_grace + T_force <= M` holds for the whole stop, the check
+/// after a forced stop included. A VM whose stops both hang fails its fence,
+/// and the fence still ends by `t_send + D`.
+#[tokio::test]
+async fn an_expiry_whose_stops_hang_fails_within_the_margin() {
+    let dir = TargetDir::new("expiring-hang");
+    let engine = Arc::new(FakeEngine::new());
+    let desired = bound(&["vm_hung"]);
+    let clock = clock();
+    let (leases, store) = start(&dir, &engine, &desired, config(&clock)).await;
+    let vm = running_vm(&engine, "vm_hung", 2).await;
+    engine.set_ignore_power_button(&vm, true);
+    engine.set_stop_delay(&vm, millis(5000));
+    let mut attached = leases.link.attach();
+
+    // `D` = 3 000, `M` = 1 000: the fence starts at `t_send` + 2 000, the
+    // forced stop by `t_send` + 2 700, and the stop gives up at `t_send` +
+    // 3 000. Recording a failed fence takes a few writes after that.
+    let before = grant_and_confirm(&leases, &mut attached, 3000).await;
+    wait_for("the forced stop", || {
+        stop_counts(&engine.stop_calls()).1 == 1
+    })
+    .await;
+    let forced = before.elapsed();
+    assert!(forced >= millis(2000), "no early fence: {forced:?}");
+    assert!(
+        forced <= millis(2750),
+        "the graceful stop is clamped: {forced:?}"
+    );
+    wait_for_fence_record(&store).await;
+    let done = before.elapsed();
+    assert!(
+        done <= millis(3250),
+        "the stop gave up by t_send + D, then was recorded: {done:?}"
+    );
+    let failed = events_of(&store, "node.fence_failed").await;
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0]["data"]["reason"], "lease_expired");
+    assert!(leases.view.is_failed());
     leases.abort();
 }

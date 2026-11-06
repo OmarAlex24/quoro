@@ -362,6 +362,14 @@ impl LeaseTable {
                     let Some(t_send) = t_send else {
                         return Ok(());
                     };
+                    // An answer that arrives once its own `valid_until` has
+                    // passed proves nothing still valid: it changes nothing,
+                    // and the renewals go on. A held lease's current
+                    // `valid_until` is no later, so the clock expires it.
+                    let valid_until = t_send + (d - margin(d));
+                    if valid_until <= now {
+                        return Ok(());
+                    }
                     // Section 8.4: `valid_until = t_send + D - M`, renew every
                     // `D / 3`. Renewals sent at or before `t_send` are
                     // answered by this grant.
@@ -379,7 +387,7 @@ impl LeaseTable {
                     if let Some(lease) = self.leases.get_mut(&grant.lease_id) {
                         lease.state = LeaseState::Held;
                         lease.duration = Some(d);
-                        lease.valid_until = Some(t_send + (d - margin(d)));
+                        lease.valid_until = Some(valid_until);
                         lease.next_renew_at = Some(t_send + d / 3);
                         lease.outstanding = outstanding;
                     }
@@ -465,6 +473,7 @@ impl LeaseTable {
         let Some(d) = lease.duration else {
             return;
         };
+        prune_outstanding(&mut lease.outstanding, d, now);
         lease.outstanding.push((msg, now));
         lease.next_renew_at = Some(now + d / 3);
     }
@@ -539,6 +548,7 @@ impl LeaseTable {
             {
                 lease.state = LeaseState::Uncertain;
             }
+            prune_outstanding(&mut lease.outstanding, d, now);
 
             // 3. It is time to renew. `next_renew_at` moves here too, so a
             // caller that forgets `renew_sent` cannot make us send twice.
@@ -556,8 +566,11 @@ impl LeaseTable {
     /// The earliest instant strictly after `now` at which [`Self::poll`] has
     /// something to do, so the driver can sleep exactly that long.
     ///
-    /// Instants already reached are not reported: the caller polls for those
-    /// before it waits, and sleeping on a past instant never wakes.
+    /// Instants at or before `now` are not reported: the caller polls at `now`
+    /// before it waits, which handles them, and a renewal already late stays
+    /// late, so reporting it would wake the driver again and again. The caller
+    /// passes the `now` it polled at, so an instant reached since is reported
+    /// and its wait ends at once.
     #[must_use]
     pub fn next_deadline(&self, now: Instant) -> Option<Instant> {
         let mut earliest: Option<Instant> = None;
@@ -588,10 +601,16 @@ impl LeaseTable {
     /// lease and the lease's token equals the token in the VM spec. The token
     /// must also be the highest seen for the resource, so a lease id that a
     /// newer ownership superseded can never start anything (D-0073).
+    ///
+    /// An `expiring` lease must also be before its `valid_until` at `now`:
+    /// it stays `held` past that instant until the next [`Self::poll`], and
+    /// nothing may start in that gap (section 8.4).
     #[must_use]
-    pub fn may_start_stateful(&self, lease_id: &LeaseId, spec_token: u64) -> bool {
+    pub fn may_start_stateful(&self, lease_id: &LeaseId, spec_token: u64, now: Instant) -> bool {
         self.leases.get(lease_id).is_some_and(|lease| {
             lease.state == LeaseState::Held
+                && (lease.mode == LeaseMode::Local
+                    || lease.valid_until.is_some_and(|until| now < until))
                 && lease.token == spec_token
                 && lease.token == self.highest_for(lease.resource_type, &lease.resource_id)
         })
@@ -644,6 +663,14 @@ impl Default for LeaseTable {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Drops the renewals whose answer could no longer set a `valid_until` in the
+/// future (`t_send + D - M <= now`), so a renewal the authority never answers
+/// is not kept forever.
+fn prune_outstanding(outstanding: &mut Vec<(MsgId, Instant)>, d: Duration, now: Instant) {
+    let keep = d - margin(d);
+    outstanding.retain(|(_, sent)| *sent + keep > now);
 }
 
 /// Whether a restored `valid_until` can come from a grant of duration `d`:
@@ -742,12 +769,12 @@ mod tests {
         table
             .on_grant(&local("lse_old", 1), None, now)
             .expect("grant");
-        assert!(table.may_start_stateful(&LeaseId("lse_old".to_string()), 1));
+        assert!(table.may_start_stateful(&LeaseId("lse_old".to_string()), 1, Instant::now()));
         table
             .on_grant(&local("lse_new", 2), None, now)
             .expect("grant");
-        assert!(!table.may_start_stateful(&LeaseId("lse_old".to_string()), 1));
-        assert!(table.may_start_stateful(&LeaseId("lse_new".to_string()), 2));
+        assert!(!table.may_start_stateful(&LeaseId("lse_old".to_string()), 1, Instant::now()));
+        assert!(table.may_start_stateful(&LeaseId("lse_new".to_string()), 2, Instant::now()));
     }
 
     #[test]
@@ -816,8 +843,8 @@ mod tests {
         assert_eq!(lease.duration, None);
         assert_eq!(lease.valid_until, None);
         assert_eq!(table.next_deadline(now), None);
-        assert!(table.may_start_stateful(&LeaseId("lse_a".to_string()), 1));
-        assert!(!table.may_start_stateful(&LeaseId("lse_a".to_string()), 2));
+        assert!(table.may_start_stateful(&LeaseId("lse_a".to_string()), 1, Instant::now()));
+        assert!(!table.may_start_stateful(&LeaseId("lse_a".to_string()), 2, Instant::now()));
     }
 
     #[test]
@@ -982,6 +1009,98 @@ mod tests {
         assert_eq!(lease.valid_until, Some(renew_at + millis(13500)));
     }
 
+    /// Section 8.4: an answer that arrives once `t_send + D - M` has passed
+    /// would set a `valid_until` in the past. It changes nothing: a first
+    /// grant stays `uncertain` and keeps renewing, and a held lease is left
+    /// to the clock.
+    #[test]
+    fn an_answer_after_its_own_valid_until_sets_nothing() {
+        let t0 = Instant::now();
+        let id = LeaseId("lse_e".to_string());
+        let mut table = LeaseTable::new();
+        let grant = expiring("lse_e", 1, 3000);
+        table.on_grant(&grant, None, t0).expect("grant");
+        let _ = table.poll(t0);
+        table.renew_sent(&id, MsgId("msg_first".to_string()), t0);
+        // `valid_until` would be `t0 + 2 000`; the answer comes at `t0 + 2 000`.
+        table
+            .on_grant(
+                &grant,
+                Some(&MsgId("msg_first".to_string())),
+                t0 + millis(2000),
+            )
+            .expect("the answer is taken");
+        let lease = table.get(&id).expect("lease");
+        assert_eq!(lease.state, LeaseState::Uncertain);
+        assert_eq!(lease.valid_until, None);
+        assert!(!table.may_start_stateful(&id, 1, t0 + millis(2000)));
+        assert!(!table.may_keep_running(&id, 1));
+
+        // A timely answer to a later renewal makes it `held`.
+        let later = t0 + millis(2500);
+        table.renew_sent(&id, MsgId("msg_second".to_string()), later);
+        table
+            .on_grant(
+                &grant,
+                Some(&MsgId("msg_second".to_string())),
+                later + millis(10),
+            )
+            .expect("the answer is taken");
+        let lease = table.get(&id).expect("lease");
+        assert_eq!(lease.state, LeaseState::Held);
+        assert_eq!(lease.valid_until, Some(later + millis(2000)));
+    }
+
+    /// Section 8.4: a held `expiring` lease past its `valid_until` starts
+    /// nothing, even before the next poll marks it `expired`.
+    #[test]
+    fn a_held_lease_past_valid_until_starts_nothing_before_the_poll() {
+        let t0 = Instant::now();
+        let id = LeaseId("lse_e".to_string());
+        let mut table = LeaseTable::new();
+        let grant = expiring("lse_e", 1, 3000);
+        table.on_grant(&grant, None, t0).expect("grant");
+        confirm(&mut table, &grant, t0);
+        let until = t0 + millis(2000);
+        assert_eq!(table.get(&id).expect("lease").valid_until, Some(until));
+        assert!(table.may_start_stateful(&id, 1, until - millis(1)));
+        assert!(!table.may_start_stateful(&id, 1, until));
+        assert_eq!(table.get(&id).expect("lease").state, LeaseState::Held);
+        // A `local` lease has no deadline.
+        table
+            .on_grant(&local_on("lse_l", "app_other", 1), None, t0)
+            .expect("grant");
+        assert!(table.may_start_stateful(&LeaseId("lse_l".to_string()), 1, t0 + millis(3_600_000)));
+    }
+
+    /// A renewal the authority never answers is dropped once its answer could
+    /// no longer set a `valid_until` in the future, so the list stays bounded.
+    #[test]
+    fn unanswered_renewals_are_dropped_after_d_minus_m() {
+        let t0 = Instant::now();
+        let id = LeaseId("lse_e".to_string());
+        let mut table = LeaseTable::new();
+        let grant = expiring("lse_e", 1, 3000);
+        table.on_grant(&grant, None, t0).expect("grant");
+        // No answer ever comes: a renewal every `D / 3` for a minute.
+        let mut now = t0;
+        for step in 0..60 {
+            for action in table.poll(now) {
+                if let Action::SendRenew { lease_id, .. } = action {
+                    table.renew_sent(&lease_id, MsgId(format!("msg_{step}")), now);
+                }
+            }
+            now += millis(1000);
+        }
+        let lease = table.get(&id).expect("lease");
+        assert_eq!(lease.state, LeaseState::Uncertain);
+        assert!(
+            lease.outstanding.len() <= 3,
+            "only the renewals of the last D - M are kept: {}",
+            lease.outstanding.len()
+        );
+    }
+
     #[test]
     fn a_late_renewal_makes_the_lease_uncertain() {
         let t0 = Instant::now();
@@ -999,7 +1118,7 @@ mod tests {
         let _ = table.poll(late);
         let lease = table.get(&LeaseId("lse_e".to_string())).expect("lease");
         assert_eq!(lease.state, LeaseState::Uncertain);
-        assert!(!table.may_start_stateful(&LeaseId("lse_e".to_string()), 1));
+        assert!(!table.may_start_stateful(&LeaseId("lse_e".to_string()), 1, Instant::now()));
     }
 
     #[test]
@@ -1106,7 +1225,7 @@ mod tests {
         let lease = table.get(&LeaseId("lse_e".to_string())).expect("lease");
         assert_eq!(lease.state, LeaseState::Held);
         assert_eq!(lease.valid_until, Some(renew_at + millis(13500)));
-        assert!(table.may_start_stateful(&LeaseId("lse_e".to_string()), 1));
+        assert!(table.may_start_stateful(&LeaseId("lse_e".to_string()), 1, Instant::now()));
     }
 
     #[test]
@@ -1221,12 +1340,16 @@ mod tests {
                 assert_eq!(lease.state, LeaseState::Uncertain);
                 assert_eq!(lease.token, 2);
                 assert_eq!(lease.valid_until, None, "an expired lease had none");
-                assert!(!table.may_start_stateful(&LeaseId("lse_e".to_string()), 2));
+                assert!(!table.may_start_stateful(
+                    &LeaseId("lse_e".to_string()),
+                    2,
+                    Instant::now()
+                ));
                 confirm(&mut table, &regrant, t0);
                 let lease = table.get(&LeaseId("lse_e".to_string())).expect("lease");
                 assert_eq!(lease.state, LeaseState::Held);
                 assert_eq!(lease.valid_until, Some(t0 + millis(13500)));
-                assert!(table.may_start_stateful(&LeaseId("lse_e".to_string()), 2));
+                assert!(table.may_start_stateful(&LeaseId("lse_e".to_string()), 2, Instant::now()));
                 assert_eq!(table.highest_for(ResourceType::App, "app_test"), 2);
             } else {
                 table.on_grant(&local("lse_a", 1), None, t0).expect("grant");
@@ -1238,7 +1361,7 @@ mod tests {
                 let lease = table.get(&LeaseId("lse_a".to_string())).expect("lease");
                 assert_eq!(lease.state, LeaseState::Held);
                 assert_eq!(lease.token, 2);
-                assert!(table.may_start_stateful(&LeaseId("lse_a".to_string()), 2));
+                assert!(table.may_start_stateful(&LeaseId("lse_a".to_string()), 2, Instant::now()));
             }
         }
     }
@@ -1257,7 +1380,7 @@ mod tests {
             "D-0072: nothing proved the timing yet"
         );
         assert_eq!(lease.valid_until, None);
-        assert!(!table.may_start_stateful(&LeaseId("lse_e".to_string()), 1));
+        assert!(!table.may_start_stateful(&LeaseId("lse_e".to_string()), 1, Instant::now()));
         assert_eq!(
             table.poll(now),
             vec![Action::SendRenew {
@@ -1276,7 +1399,7 @@ mod tests {
         let lease = table.get(&LeaseId("lse_e".to_string())).expect("lease");
         assert_eq!(lease.state, LeaseState::Held);
         assert_eq!(lease.valid_until, Some(sent_at + millis(13500)));
-        assert!(table.may_start_stateful(&LeaseId("lse_e".to_string()), 1));
+        assert!(table.may_start_stateful(&LeaseId("lse_e".to_string()), 1, Instant::now()));
     }
 
     #[test]
@@ -1329,7 +1452,7 @@ mod tests {
             Some(t0 + millis(13500)),
             "a new ownership never extends the old validity"
         );
-        assert!(!table.may_start_stateful(&LeaseId("lse_e".to_string()), 2));
+        assert!(!table.may_start_stateful(&LeaseId("lse_e".to_string()), 2, Instant::now()));
         assert_eq!(
             table.poll(at),
             vec![Action::SendRenew {
@@ -1362,7 +1485,7 @@ mod tests {
             ));
             let lease = table.get(&LeaseId("lse_e".to_string())).expect("lease");
             assert_eq!(lease.state, fenced);
-            assert!(!table.may_start_stateful(&LeaseId("lse_e".to_string()), 1));
+            assert!(!table.may_start_stateful(&LeaseId("lse_e".to_string()), 1, Instant::now()));
         }
     }
 
@@ -1446,7 +1569,7 @@ mod tests {
             LeaseState::Expired
         );
         assert_eq!(table.highest_for(ResourceType::App, "app_test"), 7);
-        assert!(!table.may_start_stateful(&LeaseId("lse_e".to_string()), 7));
+        assert!(!table.may_start_stateful(&LeaseId("lse_e".to_string()), 7, Instant::now()));
     }
 
     #[test]
@@ -1566,7 +1689,7 @@ mod tests {
                 state
             );
         }
-        assert!(!table.may_start_stateful(&LeaseId("lse_cut".to_string()), 4));
+        assert!(!table.may_start_stateful(&LeaseId("lse_cut".to_string()), 4, Instant::now()));
     }
 
     /// A held expiring lease is fenced once by the restore, not twice.
@@ -1627,7 +1750,10 @@ mod tests {
         let lease = table.get(&id).expect("lease");
         assert_eq!(lease.state, LeaseState::Uncertain);
         assert_eq!(lease.valid_until, Some(now.instant + millis(9500)));
-        assert!(!table.may_start_stateful(&id, 7), "starts nothing new");
+        assert!(
+            !table.may_start_stateful(&id, 7, Instant::now()),
+            "starts nothing new"
+        );
         assert!(table.may_keep_running(&id, 7), "keeps what runs");
         assert!(!table.may_keep_running(&id, 6));
         assert_eq!(
@@ -1675,7 +1801,7 @@ mod tests {
         let lease = table.get(&id).expect("lease");
         assert_eq!(lease.state, LeaseState::Held);
         assert_eq!(lease.valid_until, Some(now.instant + millis(13500)));
-        assert!(table.may_start_stateful(&id, 7));
+        assert!(table.may_start_stateful(&id, 7, Instant::now()));
     }
 
     /// After a reboot, after the validity ran out, with no stored validity,
@@ -1759,7 +1885,7 @@ mod tests {
             .expect("grant");
         let id = LeaseId("lse_e".to_string());
         assert_eq!(table.get(&id).expect("lease").state, LeaseState::Uncertain);
-        assert!(!table.may_start_stateful(&id, 1));
+        assert!(!table.may_start_stateful(&id, 1, Instant::now()));
         assert!(!table.may_keep_running(&id, 1));
     }
 
