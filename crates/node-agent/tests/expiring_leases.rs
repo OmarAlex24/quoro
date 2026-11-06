@@ -238,6 +238,11 @@ async fn an_unanswered_lease_goes_uncertain_then_expires_and_fences_in_time() {
     assert_eq!(fenced[0]["data"]["reason"], "lease_expired");
     assert_eq!(fenced[0]["data"]["lease_ids"][0], LEASE);
     assert_eq!(fenced[0]["data"]["app_ids"][0], APP);
+    assert_eq!(
+        fenced[0]["data"]["fencing_tokens"],
+        serde_json::json!({ LEASE: 1 })
+    );
+    assert_eq!(fenced[0]["data"]["vm_ids"], serde_json::json!(["vm_warm"]));
     let rows = store.load_leases().await.unwrap();
     assert_eq!(rows[0].state, LeaseState::Expired);
     assert_eq!(rows[0].validity, None);
@@ -300,6 +305,10 @@ async fn an_expiring_lease_that_cannot_be_stopped_reports_fence_failed() {
     assert_eq!(failed[0]["data"]["reason"], "lease_expired");
     assert_eq!(failed[0]["data"]["lease_ids"][0], LEASE);
     assert_eq!(failed[0]["data"]["vm_ids"][0], "vm_stuck");
+    assert_eq!(
+        failed[0]["data"]["fencing_tokens"],
+        serde_json::json!({ LEASE: 1 })
+    );
     assert!(events_of(&store, "node.fenced").await.is_empty());
     assert!(leases.view.is_failed());
     assert!(store.node_failed().await.unwrap());

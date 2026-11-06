@@ -718,6 +718,7 @@ async fn report_unreported(
                 "node_id": config.node_id,
                 "app_ids": app_ids,
                 "lease_ids": [record.lease_id.0],
+                "fencing_tokens": {record.lease_id.0.as_str(): record.token},
                 "vm_ids": vm_ids,
                 "reason": match record.reason {
                     FenceReason::LeaseExpired => "lease_expired",
@@ -1421,7 +1422,7 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
         let resource = lease.map_or((ResourceType::App, String::new()), |lease| {
             (lease.resource_type, lease.resource_id.clone())
         });
-        let (evt_id, event) = self.fence_event(lease_id, resource, flight.reason, outcome);
+        let (evt_id, event) = self.fence_event(lease_id, token, resource, flight.reason, outcome);
         let recorded = self
             .store
             .finish_fence(
@@ -1479,10 +1480,13 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
     }
 
     /// The `node.fenced` or `node.fence_failed` event of one fence (section
-    /// 8.5 step 3, D-0074).
+    /// 8.5 step 3, D-0074). Both carry `token`, the one the fence's record
+    /// carries. `node.fenced` names every VM the fence stopped, as its record
+    /// does; `node.fence_failed` names only the VMs that may still run.
     fn fence_event(
         &self,
         lease_id: &LeaseId,
+        token: u64,
         (resource_type, resource_id): (ResourceType, String),
         reason: FenceReason,
         outcome: &FenceOutcome,
@@ -1495,12 +1499,20 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
             "node_id": self.config.node_id,
             "app_ids": app_ids,
             "lease_ids": [lease_id.0],
+            "fencing_tokens": {lease_id.0.as_str(): token},
             "reason": match reason {
                 FenceReason::LeaseExpired => "lease_expired",
                 FenceReason::LeaseRevoked => "lease_revoked",
             },
         });
         let kind = if outcome.complete() {
+            let vm_ids: Vec<&str> = outcome
+                .report
+                .vms
+                .iter()
+                .map(|(vm, _)| vm.0.as_str())
+                .collect();
+            data["vm_ids"] = serde_json::json!(vm_ids);
             "node.fenced"
         } else {
             let (vm_ids, error) = fence_failures(outcome);

@@ -8,6 +8,8 @@ Each entry links the pull request that made the change and, where one exists, th
 
 ### Added
 
+- **Fence events name the lease's token and the stopped VMs.** A node's `node.fenced` and `node.fence_failed` events now carry `fencing_tokens`: the token the node held for each fenced lease, the same one as in the fence's local record. When a revoke with a higher token joined a running fence, the event carries that revoke's token. `node.fenced` also carries `vm_ids`, the VMs the fence stopped. The failed fences an upgraded agent reports again carry their recorded token too ([#PR442], [#442], [#436]).
+
 - **Warm volume calls in the engine.** The engine trait gains the calls warm replication is built on: `volume_changed_ranges` compares the extent maps of two reflink snapshots of a volume and returns only the byte ranges that differ (a full copy when there is no base or the maps cannot be compared), `stage_volume`, `commit_staged_volume` and `discard_staged_volume` build a volume's next copy beside the last good one and swap it in with one rename, and `pause` and `resume` freeze a running VM. A volume can now keep several snapshots, each in its own file. Nothing calls these yet; replication between nodes comes next ([#389], [#390], [ADR 0172], [ADR 0173]).
 
 - **Expiring leases on the node.** The node agent now runs the `expiring` lease mode of section 8.4. It renews each such lease every third of its duration through its session, and counts a lease as valid only from the send time of a renewal the primary answered. A lease whose renewal is late, or whose session is lost, goes `uncertain`: its VMs keep running and nothing new starts for it. At the lease's deadline the node stops every VM bound to it within the margin `M` (a 1 s graceful stop, then a 0.3 s forced one), before the primary may grant the lease to another node. A held lease survives an agent restart on the same host boot: its deadline is converted to `CLOCK_BOOTTIME` once, when a renewal is answered, so a suspend after that can only shorten it, and after a reboot the lease comes back expired and is fenced. The primary grants no `expiring` lease yet; warm apps bring that. The M0 lease agent, which only tests used, is removed and its tests are ported to the lease service ([#431], [#75], [ADR 0072], [ADR 0225]).
@@ -408,8 +410,11 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#429]: https://github.com/OmarAlex24/quoro/issues/429
 [#430]: https://github.com/OmarAlex24/quoro/issues/430
 [#431]: https://github.com/OmarAlex24/quoro/pull/431
+[#436]: https://github.com/OmarAlex24/quoro/pull/436
 [#439]: https://github.com/OmarAlex24/quoro/pull/439
 [#440]: https://github.com/OmarAlex24/quoro/pull/440
+[#442]: https://github.com/OmarAlex24/quoro/issues/442
+[#PR442]: https://github.com/OmarAlex24/quoro/pull/PR442
 [ADR 0019]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0019-fencing-is-mandatory-and-lease-based-node-agent-self-fences.md
 [ADR 0020]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0020-per-app-ha-policies-none-cold-warm-hot-with-cost-shown-in.md
 [ADR 0027]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0027-signed-binaries-and-reproducible-builds-are-mandatory.md

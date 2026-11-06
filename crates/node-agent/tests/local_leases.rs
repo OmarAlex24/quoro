@@ -418,7 +418,21 @@ async fn fences_of_different_leases_run_concurrently() {
         assert_eq!(engine.inspect(vm).await.unwrap().state, VmState::Stopped);
     }
     assert_eq!(store.fences().await.unwrap().len(), 2);
-    assert_eq!(fenced_events(&store).await.len(), 2);
+    let events = fenced_events(&store).await;
+    assert_eq!(events.len(), 2);
+    // Each event names its own lease, token and VM, and nothing of the other.
+    for (lease, vm) in [("lse_a", "vm_a"), ("lse_b", "vm_b")] {
+        let event = events
+            .iter()
+            .find(|event| event["data"]["lease_ids"] == serde_json::json!([lease]))
+            .unwrap_or_else(|| panic!("no event for {lease}: {events:?}"));
+        assert_eq!(event["type"], "node.fenced");
+        assert_eq!(
+            event["data"]["fencing_tokens"],
+            serde_json::json!({ lease: 1 })
+        );
+        assert_eq!(event["data"]["vm_ids"], serde_json::json!([vm]));
+    }
     leases.abort();
 }
 
@@ -579,7 +593,20 @@ async fn a_crash_mid_fence_fences_again_on_restart() {
             .iter()
             .all(|fence| fence.complete && fence.token == 1)
     );
-    assert_eq!(fenced_events(&store).await.len(), 2, "one event per fence");
+    let events = fenced_events(&store).await;
+    assert_eq!(events.len(), 2, "one event per fence");
+    for (lease, vm) in [("lse_one", "vm_one"), ("lse_two", "vm_two")] {
+        let event = events
+            .iter()
+            .find(|event| event["data"]["lease_ids"] == serde_json::json!([lease]))
+            .unwrap_or_else(|| panic!("no event for {lease}: {events:?}"));
+        assert_eq!(event["type"], "node.fenced");
+        assert_eq!(
+            event["data"]["fencing_tokens"],
+            serde_json::json!({ lease: 1 })
+        );
+        assert_eq!(event["data"]["vm_ids"], serde_json::json!([vm]));
+    }
     assert!(!leases.view.is_failed());
     leases.abort();
     drop(store);
@@ -637,6 +664,10 @@ async fn an_unstoppable_vm_fails_the_fence_and_marks_the_node_failed() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["type"], "node.fence_failed");
     assert_eq!(events[0]["data"]["vm_ids"][0], "vm_stuck");
+    assert_eq!(
+        events[0]["data"]["fencing_tokens"],
+        serde_json::json!({"lse_stuck": 1})
+    );
     leases.abort();
 }
 
@@ -690,6 +721,15 @@ async fn revokes_that_arrive_during_a_fence_join_it() {
     let rows = store.load_leases().await.unwrap();
     assert_eq!(rows[0].state, LeaseState::Revoked);
     assert_eq!(rows[0].token, 2);
+    // The event carries the record's token, the highest revoke's.
+    let events = fenced_events(&store).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["type"], "node.fenced");
+    assert_eq!(
+        events[0]["data"]["fencing_tokens"],
+        serde_json::json!({"lse_join": 2})
+    );
+    assert_eq!(events[0]["data"]["vm_ids"], serde_json::json!(["vm_join"]));
 
     // Both answers are final: a redelivery fences nothing again.
     let again = leases
@@ -1247,6 +1287,10 @@ async fn an_older_failed_mark_lists_its_incomplete_fences() {
         serde_json::json!(["lse_old"])
     );
     assert_eq!(events[0]["data"]["vm_ids"], serde_json::json!(["vm_old"]));
+    assert_eq!(
+        events[0]["data"]["fencing_tokens"],
+        serde_json::json!({"lse_old": 3})
+    );
     assert_eq!(events[0]["data"]["reason"], "lease_revoked");
     leases.abort();
     store.pool().close().await;
