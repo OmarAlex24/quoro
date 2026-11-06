@@ -1,12 +1,12 @@
 # ADR 0208: The target applies a stream into a staging clone, checks a root hash over 1 MiB cells, and renames it in one step
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0248](0248-warm-replication-a-root-mismatch-answer-makes-the-source-s.md)
 - **Date:** 2026-11-06
 - **Ledger id:** D-0208
 - **Tags:** m5b, contracts, warm
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** none
+- **Related:** [ADR 0248](0248-warm-replication-a-root-mismatch-answer-makes-the-source-s.md)
 
 ## Context
 
@@ -20,6 +20,7 @@ A volume is cut into 1 MiB cells; a cell hash is BLAKE3 of its bytes and the roo
 
 ## Consequences
 
+- [ADR 0248](0248-warm-replication-a-root-mismatch-answer-makes-the-source-s.md) refines what the source does with its base when the target refuses with root_mismatch. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---
