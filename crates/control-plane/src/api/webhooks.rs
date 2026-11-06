@@ -78,6 +78,12 @@ pub enum EventType {
     AppRestarted,
     #[serde(rename = "app.vulnerable")]
     AppVulnerable,
+    #[serde(rename = "app.failed_over")]
+    AppFailedOver,
+    #[serde(rename = "app.switched_over")]
+    AppSwitchedOver,
+    #[serde(rename = "app.switchover_failed")]
+    AppSwitchoverFailed,
     #[serde(rename = "deployment.started")]
     DeploymentStarted,
     #[serde(rename = "deployment.succeeded")]
@@ -100,6 +106,8 @@ pub enum EventType {
     RestoreSucceeded,
     #[serde(rename = "restore.failed")]
     RestoreFailed,
+    #[serde(rename = "volume.quarantined")]
+    VolumeQuarantined,
     #[serde(rename = "certificate.issued")]
     CertificateIssued,
     #[serde(rename = "certificate.expiring")]
@@ -156,6 +164,9 @@ impl EventType {
             Self::AppUp => "app.up",
             Self::AppRestarted => "app.restarted",
             Self::AppVulnerable => "app.vulnerable",
+            Self::AppFailedOver => "app.failed_over",
+            Self::AppSwitchedOver => "app.switched_over",
+            Self::AppSwitchoverFailed => "app.switchover_failed",
             Self::DeploymentStarted => "deployment.started",
             Self::DeploymentSucceeded => "deployment.succeeded",
             Self::DeploymentFailed => "deployment.failed",
@@ -167,6 +178,7 @@ impl EventType {
             Self::BackupFailed => "backup.failed",
             Self::RestoreSucceeded => "restore.succeeded",
             Self::RestoreFailed => "restore.failed",
+            Self::VolumeQuarantined => "volume.quarantined",
             Self::CertificateIssued => "certificate.issued",
             Self::CertificateExpiring => "certificate.expiring",
             Self::CertificateFailed => "certificate.failed",
@@ -195,7 +207,7 @@ impl EventType {
     }
 
     /// Every event type of the contract, in contract order.
-    pub const ALL: [Self; 45] = [
+    pub const ALL: [Self; 49] = [
         Self::NodeEnrolled,
         Self::NodeConnected,
         Self::NodeDisconnected,
@@ -215,6 +227,9 @@ impl EventType {
         Self::AppUp,
         Self::AppRestarted,
         Self::AppVulnerable,
+        Self::AppFailedOver,
+        Self::AppSwitchedOver,
+        Self::AppSwitchoverFailed,
         Self::DeploymentStarted,
         Self::DeploymentSucceeded,
         Self::DeploymentFailed,
@@ -226,6 +241,7 @@ impl EventType {
         Self::BackupFailed,
         Self::RestoreSucceeded,
         Self::RestoreFailed,
+        Self::VolumeQuarantined,
         Self::CertificateIssued,
         Self::CertificateExpiring,
         Self::CertificateFailed,

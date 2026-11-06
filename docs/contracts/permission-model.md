@@ -114,6 +114,8 @@ A scope is `<resource>:<verb>` and is the unit of authority in both human roles 
 | `app:delete` | Delete an app and its data, or one volume of an app | destructive |
 | `app:logs` | Read app logs and build logs, including live streams | |
 | `app:terminal` | Open an interactive terminal in an app's VM (ADR 0113, ADR 0114) | human-only |
+| `app:failover` | Fail a `warm` app over to its warm node, or run a planned switchover to it (ADR 0175, ADR 0177) | destructive |
+| `app:delete_quarantine` | Delete a quarantined copy of a volume, the divergent writes a node kept after a failover (ADR 0176) | destructive, human-only |
 | `backup:read` | List and read backups and backup repositories (ADR 0147) | |
 | `backup:write` | Take a backup of an app's volume now | |
 | `backup:restore` | Restore a backup onto a node, which replaces the app's data and moves the app there | destructive |
@@ -137,7 +139,7 @@ A scope is `<resource>:<verb>` and is the unit of authority in both human roles 
 
 ### 4.1 Destructive scopes
 
-Five scopes are destructive: `node:remove`, `project:delete`, `vm:delete`, `app:delete` and `backup:restore` (README.md, "Scopes"). They remove data or capacity and cannot be undone by repeating a call. `app:delete` also covers deleting one volume (`deleteVolume`), and `backup:restore` replaces an app's data with an older copy.
+Seven scopes are destructive: `node:remove`, `project:delete`, `vm:delete`, `app:delete`, `backup:restore`, and from M5b `app:failover` and `app:delete_quarantine` (README.md, "Scopes"). They remove data or capacity and cannot be undone by repeating a call. `app:delete` also covers deleting one volume (`deleteVolume`), and `backup:restore` replaces an app's data with an older copy. `app:failover` starts a `warm` app from its last shipped snapshot, which drops the writes made since then on the old node from the app's data (they survive only as a quarantined copy), and it also covers the planned switchover, which moves the app (ADR 0175, ADR 0177). `app:delete_quarantine` deletes those kept writes for good (ADR 0176).
 
 This contract fixes their M3 behaviour:
 
@@ -148,14 +150,14 @@ This contract fixes their M3 behaviour:
 
 Making destructive scopes grantable in standing grants would be a change to this contract and therefore to an accepted decision (D-0030 says destructive actions are off by default), not an implementation detail (D-0036).
 
-`node:remove` is destructive **and** human-only, so no agent can delete a node at all: an approval grant can carry a destructive scope, never a human-only one (README.md, "Scopes").
+`node:remove` is destructive **and** human-only, so no agent can delete a node at all: an approval grant can carry a destructive scope, never a human-only one (README.md, "Scopes"). `app:delete_quarantine` is both for the same reason: no agent deletes divergent writes, even with an approval.
 
 ### 4.2 Human-only scopes
 
-Fourteen scopes are human-only: `node:enroll`, `node:remove`, `node:fence_ack`, `node:roles`, `node:declare_lost`, `app:terminal`, `backup:manage`, `agent:write`, `grant:write`, `approval:decide`, `webhook:write`, `provider:manage`, `user:read` and `user:write` (README.md, "Scopes").
+Fifteen scopes are human-only: `node:enroll`, `node:remove`, `node:fence_ack`, `node:roles`, `node:declare_lost`, `app:terminal`, `app:delete_quarantine`, `backup:manage`, `agent:write`, `grant:write`, `approval:decide`, `webhook:write`, `provider:manage`, `user:read` and `user:write` (README.md, "Scopes").
 
 - A grant whose `scopes` contains a human-only scope is refused at creation with `validation_failed`, and a hypothetical row that contained one is refused at call time with reason `human_only` (README.md, "Errors").
-- The set is chosen so an agent can never widen its own power (`agent:write`, `grant:write`, `webhook:write`), approve its own request (`approval:decide`), take over cluster membership or the voters (`node:enroll`, `node:remove`, `node:roles`), declare a possibly running VM stopped so its lease moves (`node:fence_ack`, D-0079, and `node:declare_lost`, ADR 0183) or hold external credentials (`provider:manage`) or the key that opens every backup (`backup:manage`) (D-0030, D-0051, ADR 0147). `user:read` is human-only so an agent never reads the list of human identities and their emails. `app:terminal` is human-only in M4 because a shell in the app's VM reads every secret the app holds and acts outside single audited calls (ADR 0114); a later, non-interactive exec scope reachable only through an approval grant is a separate decision.
+- The set is chosen so an agent can never widen its own power (`agent:write`, `grant:write`, `webhook:write`), approve its own request (`approval:decide`), take over cluster membership or the voters (`node:enroll`, `node:remove`, `node:roles`), declare a possibly running VM stopped so its lease moves (`node:fence_ack`, D-0079, and `node:declare_lost`, ADR 0183), delete the divergent writes a failover left behind (`app:delete_quarantine`, ADR 0176) or hold external credentials (`provider:manage`) or the key that opens every backup (`backup:manage`) (D-0030, D-0051, ADR 0147). `user:read` is human-only so an agent never reads the list of human identities and their emails. `app:terminal` is human-only in M4 because a shell in the app's VM reads every secret the app holds and acts outside single audited calls (ADR 0114); a later, non-interactive exec scope reachable only through an approval grant is a separate decision.
 - Because `approval:decide` is human-only, "an agent approves its own destructive request" is not a policy that could be misconfigured; it is unrepresentable (D-0030).
 
 ### 4.3 Wildcards
@@ -482,7 +484,7 @@ A grant for one hour on one app, and nothing else, is the whole point: the agent
 
 D-0030 requires that destructive actions be off by default and reachable only after a human approves a specific call. The flow, with the exact endpoints and events:
 
-1. **The agent attempts the destructive call.** For example `DELETE /api/v1/apps/{app_id}` (scope `app:delete`) or the `delete_app` MCP tool (D-0031, README.md "MCP tools"). From M5a the same flow covers `DELETE /api/v1/volumes/{volume_id}` (scope `app:delete`, target `{type: volume}`) and `POST /api/v1/backups/{backup_id}/restore` (scope `backup:restore`, target `{type: backup}`, with the target node in `params`).
+1. **The agent attempts the destructive call.** For example `DELETE /api/v1/apps/{app_id}` (scope `app:delete`) or the `delete_app` MCP tool (D-0031, README.md "MCP tools"). From M5a the same flow covers `DELETE /api/v1/volumes/{volume_id}` (scope `app:delete`, target `{type: volume}`) and `POST /api/v1/backups/{backup_id}/restore` (scope `backup:restore`, target `{type: backup}`, with the target node in `params`). From M5b it covers `POST /api/v1/apps/{app_id}/failover` and `POST /api/v1/apps/{app_id}/switchover` (scope `app:failover`, target `{type: app}`, with the warm node in `params`): an agent that fails over a warm app is the "agent with human approval" of ADR 0175.
 2. **The service refuses with `approval_required`** (403) carrying `scope` and `target`. Nothing is deleted, and the refusal is audited with `result` `refused`, `result_detail` `approval_required` (D-0030).
 3. **The agent files a request:** `POST /api/v1/approvals` with `approval:create`, body `{scope, target, operation, params, justification, incident_id?}`. The service computes `params_hash` as the SHA-256 hex of the RFC 8785 canonical serialization of `params`, stores `status` `pending` and `expires_at` = now + 1 hour, and emits `approval.requested` (D-0030).
 4. **A human decides in the panel** with `approval:decide`, which is human-only: the panel shows the operation, the target, the parameters and the agent's justification, and the human approves or denies (D-0030; README.md "Scopes").

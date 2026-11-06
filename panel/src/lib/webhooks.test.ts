@@ -80,6 +80,9 @@ describe('eventTypesBySubject', () => {
       'app.up',
       'app.restarted',
       'app.vulnerable',
+      'app.failed_over',
+      'app.switched_over',
+      'app.switchover_failed',
     ]);
   });
 });

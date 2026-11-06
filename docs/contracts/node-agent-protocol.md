@@ -330,6 +330,8 @@ Each lease entry:
 | `backups` | array of object | no | One entry per job in the node's current `spec.backups` (ADR 0147); absent or empty when there is none |
 | `edge_backends` | array of object | no | On a machine with the `edge` role: one entry per backend of `spec.edge.routes` (ADR 0143); absent or empty otherwise |
 | `images` | array of object | no | From M5a: one `{ "image_digest", "inventory_sha256" }` per prepared image the node holds, where `inventory_sha256` is the hex SHA-256 of the image's inventory (section 6.11) or absent while the node is still building it (ADR 0150) |
+| `warm` | array of object | no | From M5b: one entry per volume of `spec.volumes` that carries `warm`, on the source and on the target (section 6.13, ADR 0173); absent or empty when there is none |
+| `quarantines` | array of object | no | From M5b: one entry per quarantined copy of a volume the node keeps (section 9, ADR 0176); absent or empty when there is none |
 
 VM entry: `vm_id` (string, `vm_`), `observed_status` (one of `creating`, `stopped`, `starting`, `running`, `stopping`, `crashed`, `deleted`, `unknown`), `health` (`passing`, `failing`, `unknown`), `ip` (string, optional), `restart_count` (integer), `last_exit_code` (integer, optional).
 
@@ -389,9 +391,39 @@ Edge backend entry:
 | `reason` | string | no | When out of rotation: `health_check` (its probe failed `failures` times in a row) or `connect_failed` (a request could not connect or was reset) |
 | `last_error` | string | no | One line from the last failed probe or connection, at most 500 characters |
 
+Warm entry (M5b, section 6.13):
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `volume_id` | string (`vol_`) | yes | The volume |
+| `app_id` | string (`app_`) | yes | Its app |
+| `role` | string | yes | `source` or `target`, as in `spec.volumes[].warm.role` |
+| `snapshot_seq` | integer | no | On the target: the newest complete copy it holds. On the source: the newest snapshot the target confirmed. Absent before the first one |
+| `snapshot_taken_at` | string | no | When the source took that snapshot, from the stream's header |
+| `completed_at` | string | no | On the target: when it swapped that copy in. On the source: when the target's confirmation arrived |
+| `allocated_bytes` | integer | no | On the target: bytes its complete copy uses on disk |
+| `extent_count` | integer | no | On the source: the extents of the newest snapshot it took. A diff costs time in proportion to it (`docs/research/m5b-warm-and-leases.md`) |
+| `frozen` | boolean | no | On the source: true while the app's VM is paused by `switchover_freeze` (section 5.17); absent otherwise |
+| `rejected_token` | integer | no | On the target: the token of the last stream it refused as stale (section 6.13) |
+| `rejected_at` | string | no | On the target: when it refused that stream |
+| `error` | string | no | One line on the last failed cycle or stream, at most 500 characters; absent once a cycle succeeds |
+
+Quarantine entry (M5b, section 9):
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `quarantine_id` | string (`qrn_`) | yes | The quarantined copy; the node generates the id |
+| `volume_id` | string (`vol_`) | yes | The volume it is a copy of |
+| `app_id` | string (`app_`) | yes | The volume's app |
+| `created_at` | string | yes | When the node took the copy |
+| `size_bytes` | integer | yes | Bytes the copy uses on the node's disk |
+| `sha256` | string | no | Hex SHA-256 of the copy's content, 64 lowercase characters; absent while the node is still computing it |
+
 The primary does not store edge backend health. It keeps the newest report, shows it in `AppDetail.edge_backends` (`openapi.yaml`), and turns changes into events: `app.degraded` while some but not all instances of an app are out of rotation, `app.down` with `check: edge_health` when none is left, and `app.up` when every instance is back (`events.schema.json`).
 
 The primary owns the `volumes` and `backups` tables and the `backup.*` and `restore.*` events, as it does for builds: it applies each reported change to the row, seals a reported `succeeded` backup (`backup-format.md` section 6.2), and emits the events. A node emits no `backup.*` or `restore.*` event of its own. A volume reported `deleted` is removed from the `volumes` table and leaves `spec.volumes` in the next revision. An `orphaned` volume is kept and never deleted by the protocol (section 6.7).
+
+The primary does not store `warm` entries either: it keeps the newest of each node in memory, and the progress fields of `App.warm` (`openapi.yaml`) come from them, so they are null after a primary restart until the nodes report again. Writing them would append a change-log entry per warm app every interval (ADR 0203 keeps renewals out of the log for the same reason). It does store quarantines, which are rare and must survive: the first time a report lists a quarantine with its `sha256`, the primary records it (`volume_quarantines`), writes the system audit record `volume.quarantine` (`audit-log-format.md` section 3.8) and emits `volume.quarantined`. A quarantine stays recorded until the node no longer reports it after `spec.quarantine_deletes` named it.
 
 The primary treats a VM it knows and the node does not report as `unknown` rather than assuming it is gone; only an explicit `deleted` or a successful `inspect` removes it.
 
@@ -601,6 +633,7 @@ A terminal whose shell exited:
 | `error` | object | no | `{ "code": ..., "message": ... }` using the `error` codes in section 5.18 |
 | `lines` | array of object | no | Log lines, oldest first, in the line shape of section 5.7; present only in the answer to `command` kind `logs_query` or `build_logs_query` |
 | `metrics` | object | no | Present only in the answer to `command` kind `metrics_query` (section 5.17) |
+| `snapshot_seq` | integer | no | From M5b: present only in an `ok` answer to `command` kind `switchover_freeze`: the final snapshot the target confirmed (section 5.17) |
 
 `re` identifies the message being answered. For `desired_state` the answer means **stored**: the signature was verified and the snapshot was persisted atomically. It does not mean applied — that is `applied_rev` in `status_report`. For `lease_revoke` the answer means the stateful VMs bound to the lease are stopped and recorded. A `lease_revoke` whose self-fence could not confirm that every bound VM stopped is answered with `status: error` and `error.code` `fence_failed` (sections 5.18 and 8.5); `detail` names the VMs that may still run.
 
@@ -684,7 +717,7 @@ The node keeps the list next to `primary_url` in its identity (section 12). It d
 | `rev` | integer | yes | Monotonic revision of the node's desired state |
 | `issued_at` | string | yes | When the primary produced it |
 | `term` | integer | yes | Cluster term at issue time. A node refuses a snapshot whose term is lower than the highest term it has seen with `error` code `stale_term` (section 8.8) |
-| `spec` | object | yes | `vms`, `routes`, `network`, `ingress` when the node runs a tunnel, `builds` when the node has builds to run (ADR 0117), `volumes` when the node holds volumes (ADR 0145), `backups` with `backup_repository` when it has backup jobs (ADR 0147), `mesh` once the machine is on the mesh, `edge` on a machine with the `edge` role (ADR 0143, ADR 0144), and from M5b `votes` on every voter and `witness` on a machine with the `witness` role (section 6.12, ADR 0170). An edge-only or witness-only machine gets `vms` and `routes` as empty lists and no `network` |
+| `spec` | object | yes | `vms`, `routes`, `network`, `ingress` when the node runs a tunnel, `builds` when the node has builds to run (ADR 0117), `volumes` when the node holds volumes (ADR 0145), `backups` with `backup_repository` when it has backup jobs (ADR 0147), `mesh` once the machine is on the mesh, `edge` on a machine with the `edge` role (ADR 0143, ADR 0144), and from M5b `votes` on every voter and `witness` on a machine with the `witness` role (section 6.12, ADR 0170), and `quarantine_deletes` when the operator deleted quarantined copies the node keeps (section 9). An edge-only or witness-only machine gets `vms` and `routes` as empty lists and no `network` |
 | `signature` | string | yes | Base64 Ed25519 signature by the cluster signing key |
 
 **Signature.** The signature covers the RFC 8785 (JSON Canonicalization Scheme) serialization of the whole `body` object with the `signature` member removed. The node verifies it against `cluster_public_key` before it parses anything else, persists the verified snapshot atomically, answers `command_result` with `ok`, and only then reconciles. An invalid signature is answered with `error` code `bad_signature` and the snapshot is discarded; the node keeps running on its previously stored snapshot.
@@ -710,6 +743,7 @@ The node keeps the list next to `primary_url` in its identity (section 12). It d
 | `env` | object | yes | Environment values, decrypted for this node; `{}` when none. It never holds `QUORO_INSTANCE_ID` or `QUORO_NODE_ID`: the node adds those (section 6.10) |
 | `health_check` | object | no | `path`, `interval_s`, `timeout_s`, `failures`, and from M5b `start_period_s` and `restart` (section 6.3) |
 | `desired_status` | string | yes | `running` or `stopped` |
+| `standby` | boolean | no | From M5b, on the warm node of a `warm` app (ADR 0174): the node prepares the VM's image and creates nothing else, so the VM is reported `stopped`. A VM of a `standby` entry that already exists on the node (the old source after a failover or a switchover) is deleted, keeping its volumes (section 9). `desired_status` is `stopped`. The VM is created and started only when a later snapshot drops `standby`, sets `desired_status` to `running` and carries a token of a lease the node holds (sections 6.4 and 6.13). Absent means false |
 | `restart_generation` | integer | yes | Incremented by the primary on an explicit restart |
 | `stateful` | boolean | yes | Whether the VM may run only while its lease is held |
 | `lease_id` | string (`lse_`) | no | Required when `stateful` is true |
@@ -722,7 +756,7 @@ The node keeps the list next to `primary_url` in its identity (section 12). It d
 | --- | --- | --- | --- |
 | `hostname` | string | yes | Host to serve |
 | `app_id` | string (`app_`) | yes | App behind the route |
-| `vm_ids` | array of string | yes | Candidate backends on this node. From M5a a node gets routes only for apps with one replica, so this holds one VM; the routes of apps with more replicas go to the edge (`spec.edge`). The one exception is a route with `draining_until`, which a node keeps for a short time after its app moved to the edge |
+| `vm_ids` | array of string | yes | Candidate backends on this node. From M5a a node gets routes only for apps with one replica, so this holds one VM; the routes of apps with more replicas go to the edge (`spec.edge`), and from M5b so do those of `warm` apps while the cluster has an edge (ADR 0174). The one exception is a route with `draining_until`, which a node keeps for a short time after its app moved to the edge |
 | `port` | integer | yes | Backend port |
 | `tls_mode` | string | yes | `acme` or `tunnel` |
 | `domain_id` | string (`dom_`) | no | The domain this route serves (`domains.id`); filled by the primary for every route it builds from a domain |
@@ -761,6 +795,21 @@ A build stays in `spec.builds` until the primary has recorded the terminal statu
 | `size_gb` | integer | yes | Size of the sparse file, in gibibytes |
 | `state` | string | yes | `present`: the file must exist; `deleted`: the node removes the file once no VM uses it, then reports `deleted` |
 | `restore` | object | no | Present only while the volume is `restoring`: write the file from this backup instead of creating it empty |
+| `warm` | object | no | From M5b, on both nodes of a `warm` app: this node's part in replicating the volume (section 6.13, ADR 0173) |
+
+**`spec.volumes[].warm`** (M5b):
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `role` | string | yes | `source`: this node holds the app's lease, runs it and ships snapshots. `target`: this node holds the warm copy and receives them |
+| `peer_node_id` | string (`nod_`) | yes | The other node of the pair |
+| `peer_address` | string | yes | The other node's mesh address; the source dials the target's |
+| `port` | integer | yes | TCP port of the target's replication listener on its own mesh address; 51822 unless the operator changed it |
+| `interval_s` | integer | yes | Seconds between two snapshots on the source: 30 by default, 5 to 3 600 (ADR 0173, `docs/research/m5b-warm-and-leases.md`) |
+| `lease_id` | string (`lse_`) | yes | The app's lease |
+| `fencing_token` | integer | yes | The lease's current token. The source stamps it on every stream; the target refuses a stream with a lower one (section 6.13) |
+
+An entry with `warm.role` `target` is the warm copy, not a second volume: the node creates its file only from a complete stream, reports it in `status_report.warm` and never in `status_report.volumes`, and removes it on a `deleted` entry like any volume. `size_gb` is the same on both nodes.
 
 **`spec.volumes[].restore`:**
 
@@ -808,7 +857,7 @@ A build stays in `spec.builds` until the primary has recorded the terminal statu
 | `address` | string | yes | This machine's mesh address, `nodes.mesh_address`, with prefix length `/16` |
 | `listen_port` | integer | yes | UDP port the interface listens on; 51820 unless the operator changed it |
 | `peers` | array of object | yes | The other end of each tunnel; on a node the edge, on the edge every node with the `node` role (a star in M5a). From M5b a voter also has every other voter, except that two witness-only machines are not peers (section 6.9) |
-| `allow` | array of object | yes | On a node: what the edge may reach through the interface, one `{ "source": <edge mesh address>, "address": <guest address>, "port": <integer> }` per backend of this node; `[]` on the edge |
+| `allow` | array of object | yes | On a node: what the edge may reach through the interface, one `{ "source": <edge mesh address>, "address": <guest address>, "port": <integer> }` per backend of this node; from M5b also, on the target of a warm volume, `{ "source": <the source's mesh address>, "address": <this node's own mesh address>, "port": <the warm entry's port> }` (section 6.13); `[]` on the edge |
 
 Each peer:
 
@@ -836,8 +885,10 @@ Each edge route:
 | `app_id` | string (`app_`) | yes | App behind the route |
 | `tls_mode` | string | yes | `acme` or `tunnel` |
 | `health_check` | object | yes | The app's `path`, `interval_s`, `timeout_s`, `failures`. The edge ignores `start_period_s` and `restart`, which only the node acts on (section 6.3) |
-| `backends` | array of object | yes | One per instance: `{ "vm_id", "node_id", "address", "port" }`, where `address` is the instance's guest address in its node's subnet and `port` the app port |
+| `backends` | array of object | yes | One per instance: `{ "vm_id", "node_id", "address", "port" }`, where `address` is the instance's guest address in its node's subnet and `port` the app port. A `warm` app has one backend, the instance on the node that holds its lease; its standby VM is never a backend (section 6.8) |
 | `draining_until` | string (RFC 3339) | no | From M5b, on `tunnel` routes only: the app is back to one replica and its hostname moved to that node's tunnel; the edge keeps serving it from its own tunnel until this time ("Draining tunnel routes" above, ADR 0168) |
+
+**`spec.quarantine_deletes`** (optional; M5b): an array of `qrn_` ids, the quarantined copies on this node that an operator deleted with `DELETE /api/v1/volumes/{volume_id}/quarantines/{quarantine_id}` (ADR 0176). The node removes each copy and stops reporting it in `status_report.quarantines`; an id it does not hold is ignored. The primary leaves an id out of the next revision once the node no longer reports it. Nothing else removes a quarantined copy: the node never removes one because a snapshot does not name it.
 
 **`spec.ingress`** (optional; absent when the node runs no tunnel):
 
@@ -1093,7 +1144,7 @@ The node stops producing, releases the stream slot, and answers `stream_end` wit
 
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
-| `kind` | string | yes | `logs_query`, `probe`, `fence_ack`, `build_logs_query`, `metrics_query` or `inventory_resend` |
+| `kind` | string | yes | `logs_query`, `probe`, `fence_ack`, `build_logs_query`, `metrics_query`, `inventory_resend`, and from M5b `switchover_freeze` or `switchover_thaw` |
 | `params` | object | yes | Kind-specific parameters |
 
 `logs_query` params: `app_id` or `vm_id` (exactly one), `since` (RFC 3339, optional), `until` (RFC 3339, optional), `tail` (integer, optional). The answer is one `command_result` with `status: ok` and the matching lines in `lines` (section 5.9), each carrying its `vm_id`. The answer must fit the 1 MiB message limit: the node keeps the newest lines that fit and says in `detail` that older ones were left out.
@@ -1141,6 +1192,10 @@ The node samples every `interval_s` into an in-memory ring of 10 minutes per nod
   }
 }
 ```
+
+`switchover_freeze` params (M5b): `app_id`, `vm_id`, `volume_id`, `lease_id`, `fencing_token`. The first step of a planned switchover (ADR 0177, section 6.13). The node checks that it is the source of `volume_id` and holds `lease_id` in state `held` with `fencing_token`; otherwise it answers `status: error` with code `not_available`. It pauses the VM through the engine (`engine-trait.md` section 3.22), takes a snapshot, ships it to the target as one cycle of section 6.13, and waits for the target's answer. When the target answers `complete`, the node answers `status: ok` with `snapshot_seq`, and the VM **stays paused**: the app's writes are frozen. It stays paused until a `lease_revoke` stops it (section 5.13), a `switchover_thaw` resumes it, or the lease ends (section 8.4) and the node fences it. If any step fails, the node resumes the VM at once and answers `status: error` with code `replication_failed` and the reason. While the VM is paused this way, the source's `status_report.warm` entry carries `frozen: true`, and a node agent that restarts keeps it paused.
+
+`switchover_thaw` params (M5b): `app_id`, `vm_id`. Resumes a VM that `switchover_freeze` paused and answers `status: ok`; a VM that is not paused that way is left as it is, and the answer is still `ok`, so a repeated thaw is harmless. The primary sends it when it gives up a switchover before the revoke, and whenever a report shows `frozen: true` for an app with no switchover it is running, for example after the primary restarted.
 
 Restarts and stops are **never** commands. They are changes of desired state — `restart_generation` for a restart, `desired_status` for a stop — so they are idempotent, survive a reconnect, and cannot be lost with a dropped message (D-0011).
 
@@ -1197,6 +1252,7 @@ Restarts and stops are **never** commands. They are changes of desired state —
 | `not_found` | no | A `stream_open` or `command` named a build, VM or transcript this node does not have. Carried in the `error` of a `command_result` |
 | `not_available` | no | The VM exists but cannot serve the requested stream now: a `terminal` on a stopped VM or on a VM started before the M4 guest init. Carried in the `error` of a `command_result` |
 | `fence_failed` | no | A self-fence could not confirm that every stateful VM bound to the lease stopped, so a VM may still run (section 8.5). Carried in the `error` of the `command_result` that answers a `lease_revoke`; the node has marked itself failed |
+| `replication_failed` | no | From M5b: a `switchover_freeze` could not ship its final snapshot, or the target refused it (section 6.13). Carried in the `error` of its `command_result`; the node resumed the VM |
 | `stale_term` | yes | From M5b: the other side's term is lower than the highest term the sender has seen (section 8.8). A node sends it on a `welcome`, `desired_state` or `support_request` from an older primary and ends the session; it keeps redialing (section 4.4). A primary that receives it stops granting and renewing `expiring` leases at once |
 
 A fatal error ends the session immediately; the node applies its redial rule (section 4.4). A non-fatal error leaves the session usable.
@@ -1537,10 +1593,10 @@ The node always acts on the newest verified snapshot in its local store. It neve
 An apply run always follows this order, whatever changed:
 
 1. **Network.** Ensure the mesh interface, its peers and its `allow` rules from `spec.mesh` (section 6.9), then the bridge, subnet and gateway from `spec.network`, and the per-VM TAP devices. Each VM is attached with its `project_id` as its isolation group, so the VMs of one project reach each other and VMs of different projects do not (`engine-trait.md` section 3.3, D-0084). The DNS servers handed to guests come from the node's own configuration, not from `spec.network`.
-2. **Images.** Prepare every image referenced by a VM whose rootfs is missing or has a different digest, and remove rootfs images no longer referenced. An image whose VM carries `build_id` is never pulled: it was prepared by the build's `importing` step (section 6.6); if it is gone, the deployment fails in phase `pull` with the error that the built image is no longer on this node. A root disk is referenced while a VM in `spec.vms` or a build in `spec.builds` names it.
+2. **Images.** Prepare every image referenced by a VM whose rootfs is missing or has a different digest, and remove rootfs images no longer referenced. An image whose VM carries `build_id` is never pulled: it was prepared by the build's `importing` step (section 6.6); if it is gone, the deployment fails in phase `pull` with the error that the built image is no longer on this node. A root disk is referenced while a VM in `spec.vms` or a build in `spec.builds` names it. A `standby` VM's image is prepared like any other, so a failover does not wait for a pull (ADR 0174).
 3. **Stop.** Stop VMs that are no longer desired, or whose spec requires a recreate (image digest, disk size, network identity, attached volumes).
-4. **Volumes, then start.** Create the file of every `present` volume that has none, or write it from its `restore`, and remove the file of every `deleted` volume that no VM uses any more (section 6.7). Then start desired VMs that are not running. A VM whose volume is not `ready` on this node stays `stopped`; volume work never delays a VM that attaches no volume.
-5. **Builds and backups.** Start the next `queued` build of `spec.builds` when the node has no build running (one at a time per node by default, ADR 0118), stop a build marked `cancelled`, and report every change in `status_report.builds` (section 6.6). Builds run alongside the other steps, never block them, and are not restarted by a later apply run. Start every `spec.backups` job that is not running (section 6.7); backups also run alongside, one per volume.
+4. **Volumes, then start.** Create the file of every `present` volume that has none, or write it from its `restore`, and remove the file of every `deleted` volume that no VM uses any more (section 6.7). The file of a warm target comes only from a complete stream (section 6.13). Then start desired VMs that are not running. A VM whose volume is not `ready` on this node stays `stopped`; volume work never delays a VM that attaches no volume.
+5. **Builds and backups.** Start the next `queued` build of `spec.builds` when the node has no build running (one at a time per node by default, ADR 0118), stop a build marked `cancelled`, and report every change in `status_report.builds` (section 6.6). Builds run alongside the other steps, never block them, and are not restarted by a later apply run. Start every `spec.backups` job that is not running (section 6.7); backups also run alongside, one per volume. From M5b the warm cycle of every volume the node is the source of runs alongside too (section 6.13).
 6. **Routes.** Update the reverse proxy for the hostnames in `spec.routes` and, on an edge, `spec.edge.routes` (section 6.8), and start, replace or stop the tunnel connectors to match `spec.ingress.tunnel` and `spec.edge.tunnel`. A route with `draining_until` is applied like any other: the node serves exactly the routes of the snapshot and drops one only when a snapshot no longer carries it (section 5.11). Certificates for `acme` routes are obtained in the background through `dns_challenge` (section 5.22); a route keeps serving its previous certificate until a new one is issued.
 
 The order exists so that a VM never starts on a network that is not ready, and no route points at a VM that is being replaced. It is the reconciliation described in D-0011 and the deployments in D-0033.
@@ -1555,7 +1611,7 @@ The order exists so that a VM never starts on a network that is not ready, and n
 
 ### 6.4 Stateful starts
 
-A stateful VM starts only while the node holds that app's lease in state `held` **and** the lease's `fencing_token` equals the `fencing_token` in the VM spec. If either condition fails the VM stays `stopped`, the fact is recorded locally, and the node reports the VM as `stopped` with `health: unknown`; it does not report an error to the primary, because the primary is the one that moved the lease (D-0019). Because renewals keep the token (D-0073), the equality holds for the whole time one holder owns the lease; it changes only when ownership changes, and then the primary issues a new `desired_state` carrying the new token. A node that marked itself failed (section 8.5) starts no stateful VM at all. In M5a a VM is stateful exactly when it attaches a volume (ADR 0145), and its volume must be `ready` on this node.
+A stateful VM starts only while the node holds that app's lease in state `held` **and** the lease's `fencing_token` equals the `fencing_token` in the VM spec. If either condition fails the VM stays `stopped`, the fact is recorded locally, and the node reports the VM as `stopped` with `health: unknown`; it does not report an error to the primary, because the primary is the one that moved the lease (D-0019). Because renewals keep the token (D-0073), the equality holds for the whole time one holder owns the lease; it changes only when ownership changes, and then the primary issues a new `desired_state` carrying the new token. A node that marked itself failed (section 8.5) starts no stateful VM at all. In M5a a VM is stateful exactly when it attaches a volume (ADR 0145), and its volume must be `ready` on this node. From M5b a `standby` VM is never created or started, whatever lease the node holds (section 5.11); on a warm node the VM starts only from a snapshot that drops `standby`, after the lease was granted to this node (section 6.13).
 
 ### 6.5 While disconnected
 
@@ -1605,6 +1661,7 @@ A volume is a sparse raw file in the node's data directory, named by its `volume
 - **Never by absence.** The node never removes a volume file because `spec.volumes` does not name it. Such a file is reported `orphaned` and kept until a `deleted` entry names it or someone with root on the node removes it, as section 10 does for a removed node.
 - **Backup.** For each job of `spec.backups`, the node first checks that it holds the app's lease in state `held` with the job's `fencing_token`; otherwise it reports the backup `failed` with `lease_mismatch`. It then takes the snapshot with its method (`engine-trait.md` section 3.16), pausing `vm_id` for `pause_copy`, reports `running`, chunks and uploads the snapshot, writes the manifest and deletes the snapshot file (`backup-format.md` section 7.1). It reports `succeeded` with the manifest's key and digest, or `failed` with the reason. A job leaves `spec.backups` once the primary has recorded its terminal status; an agent restart while a backup runs fails it with `node agent restarted`, and the snapshot file is deleted at start.
 - **Writes carry the token.** Every object a backup job writes is part of a backup that the primary seals only if the job's token is still the app's current token (`backup-format.md` section 6.2). A node that lost its lease while uploading therefore wastes storage, never a valid backup (section 8.6).
+- **Warm volumes (M5b).** A volume entry with `warm` is replicated as section 6.13 describes. A backup of a `warm` app's volume runs on the source, which holds the lease. A `deleted` entry removes the copy on each node. A quarantined copy is removed only through `spec.quarantine_deletes` (section 9).
 
 ### 6.8 The edge
 
@@ -1616,16 +1673,17 @@ A machine with the `edge` role runs the embedded proxy for `spec.edge.routes` (A
 - **Timeouts.** A connect timeout of 5 s and a response-header timeout of 60 s per request, so a backend that accepts and hangs cannot hold a connection forever. Backend connections use TCP keepalive and, on Linux, `TCP_USER_TIMEOUT`, so a connection to a backend that disappeared fails within seconds instead of waiting for the response-header timeout.
 - **Without the primary.** The edge keeps its last verified desired state on disk like a node (section 6.1, ADR 0011) and keeps probing and balancing. Its health decisions are its own: they change no replicated state, and they reach the primary only as `status_report.edge_backends`.
 - **TLS.** `acme` routes take certificates through `dns_challenge` (section 5.22), exactly as on a node; `tunnel` routes are served from the edge's tunnel.
+- **Warm apps (M5b).** A `warm` app's route has one backend: the instance on the node that holds the app's lease (ADR 0174). A failover or a switchover replaces it in the next `desired_state` of the edge, which the edge applies like any change of backends; the old backend's requests finish as in "Leaving the rotation" above. So moving a warm app needs no DNS or tunnel change.
 - **Draining routes.** A route with `draining_until` (section 5.11, ADR 0168) is balanced, probed and served like any other. It names the hostname of an app that went back to one replica and is now also served by that node's tunnel; the edge keeps it until a snapshot no longer carries it. A backend that leaves a draining route because the route itself left `spec.edge.routes` finishes its requests normally, as in "Leaving the rotation" above.
 
 ### 6.9 The mesh
 
-The mesh is kernel WireGuard driven over netlink, with no `wg` or `wg-quick` process (ADR 0063, ADR 0144). In M5a it is a star: the edge has one peer per node, and every node has the edge as its only peer. From M5b voters also peer with each other, so a candidate for promotion reaches every voter directly (section 8.9): every two voters are peers unless both are witness-only, and a peer the star already has is not repeated.
+The mesh is kernel WireGuard driven over netlink, with no `wg` or `wg-quick` process (ADR 0063, ADR 0144). In M5a it is a star: the edge has one peer per node, and every node has the edge as its only peer. From M5b voters also peer with each other, so a candidate for promotion reaches every voter directly (section 8.9): every two voters are peers unless both are witness-only, and a peer the star already has is not repeated. The two nodes of a warm volume both have the `node` role, so they are voters and already peers; warm replication adds only the `allow` entry of section 6.13.
 
 - **Keys.** The machine generates its WireGuard key pair on its first M5a start, keeps the private key root-only next to its credential, and sends the public key in `hello`. A machine never receives another machine's private key.
 - **Interface.** The node agent creates the WireGuard interface `quoro-wg0` with `address`, `listen_port` and `peers`, and keeps it equal to them on every apply. A peer that disappears from `peers` is removed. On the edge, the kernel routes each node's guest subnet to that node's peer through `allowed_ips`.
-- **Firewall.** On a node, traffic that arrives on the mesh interface is dropped unless it comes from an `allow` entry's `source` and goes to its `address` and `port` over TCP. The mesh carries no traffic between guests, and none to the host's own services except, on a voter, the vote listener: TCP to its own mesh address on `spec.votes.port`, from the mesh address of each voter with the `node` role in `spec.votes.voters` (section 8.9). That rule follows from `spec.votes` and is not repeated in `allow`. The isolation of guests from each other (ADR 0084) is unchanged.
-- **NAT.** A machine behind NAT has no `endpoint` in the other side's peer entry; it dials the peer that has one and keeps the tunnel open with `persistent_keepalive_s`. WireGuard follows a peer whose address changed (roaming), which also covers a node whose address changed after a reboot. Two voters that are both behind NAT, neither with an endpoint, cannot reach each other: the primary gives them no peer entry for each other, and a candidate on one of them cannot count the other's vote (section 8.9).
+- **Firewall.** On a node, traffic that arrives on the mesh interface is dropped unless it comes from an `allow` entry's `source` and goes to its `address` and `port` over TCP. The mesh carries no traffic between guests, and none to the host's own services except, on a voter, the vote listener: TCP to its own mesh address on `spec.votes.port`, from the mesh address of each voter with the `node` role in `spec.votes.voters` (section 8.9). That rule follows from `spec.votes` and is not repeated in `allow`. From M5b the target of a warm volume also admits the replication listener: TCP to its own mesh address on the warm entry's `port`, from the source's mesh address, through the `allow` entry the primary sends it (section 6.13). The isolation of guests from each other (ADR 0084) is unchanged.
+- **NAT.** A machine behind NAT has no `endpoint` in the other side's peer entry; it dials the peer that has one and keeps the tunnel open with `persistent_keepalive_s`. WireGuard follows a peer whose address changed (roaming), which also covers a node whose address changed after a reboot. Two voters that are both behind NAT, neither with an endpoint, cannot reach each other: the primary gives them no peer entry for each other, and a candidate on one of them cannot count the other's vote (section 8.9). For the same reason two nodes both behind NAT cannot replicate a warm volume to each other, and the primary never pairs them (`openapi.yaml`, `App.warm`).
 - **A changed subnet.** When `spec.network.subnet` differs from the subnet of the node's bridge, the node does not reconfigure that bridge (`engine-trait.md` section 3.3 refuses it with `Conflict`). It ensures a second bridge with the new subnet and gateway, keeps its running VMs on the old bridge with their old addresses, and creates every new or redeployed VM on the new one. The old bridge stays, without VMs, until the host restarts: the engine has no call that removes a network in M5a. VMs that only restart in place keep their address; a redeploy moves them (ADR 0144, like ADR 0136).
 
 ### 6.10 Instance identity
@@ -1678,6 +1736,63 @@ From M5b every machine with the `node` or `witness` role is a voter (ADR 0170). 
 ```
 
 The example shows the two fields as they appear in `spec` on a machine that is both edge and witness.
+
+### 6.13 Warm replication
+
+From M5b an app with `ha_policy: warm` keeps a second copy of its volume on another node, its warm node, at most a few intervals behind (ADR 0020, ADR 0172 to ADR 0177). The node that holds the app's lease is the **source**: it runs the app, snapshots the volume every `interval_s` and ships what changed. The warm node is the **target**: it holds the last complete copy and the app's prepared image (`standby`, section 5.11), and starts nothing until a failover or a switchover grants it the lease. The primary sends both sides `spec.volumes[].warm` (section 5.11). A node that snapshots with `pause_copy` is never either side (ADR 0172).
+
+**Snapshots and sequence numbers.**
+
+- Each complete copy of a warm volume has a `snapshot_seq`. The source numbers each snapshot one above the newest copy the target completed, so a number names one complete copy, and a node that becomes the source numbers its snapshots after the copy it started from. The first snapshot of a volume is 1. A snapshot that never completed on the target is discarded, and its number may be used again.
+- The source keeps its **base**, the newest snapshot the target confirmed, until the target confirms a newer one; then the base moves and the old one is deleted. It also keeps the snapshot it is shipping. Both survive a node-agent restart: the node records them in its store (section 12), and the start-up sweep keeps them (`engine-trait.md` section 3.16).
+- **A cycle.** The source takes a snapshot `next` and asks the engine for the ranges that changed since the base (`volume_changed_ranges`, `engine-trait.md` section 3.22): the ranges whose extents no longer share physical blocks with the base's (ADR 0172). When there is no base (the first copy, a new target, a base lost to a crash) or the engine cannot compare extents, the source ships every allocated range of `next`, a full copy. Then it streams `next` to the target. A failed cycle keeps the base, deletes `next` and runs again at the next interval, and `status_report.warm` carries the error.
+- **Interval.** `interval_s` is 30 by default, at least 5 and at most 3 600 (ADR 0173). The lab measurements behind the default: the extent comparison found exactly the written blocks over 50 cycles in about 20 ms, and a cycle's cost follows the changed bytes and the volume's extent count, not the interval (`docs/research/m5b-warm-and-leases.md`). The source reports the extent count in `status_report.warm`.
+
+**The stream.**
+
+- **Transport.** One TCP connection from the source's mesh address to the target's mesh address on `port`, through the mesh (section 6.9); the target's firewall admits it only from the source's mesh address (the `allow` entry, section 5.11). HTTP/1.1, `POST /v1/replicate`, one stream per request: the request body is a sequence of frames and the answer is JSON. WireGuard authenticates and encrypts the link; the stream adds no TLS and no credential of its own.
+- **Frames.** `[u8 type][u32 BE length][payload]`, as on the terminal exec channel (ADR 0126): one header, then blocks and zero ranges in increasing offset order with no overlap, then one manifest.
+
+| Type | Frame | Payload |
+| --- | --- | --- |
+| 1 | header | JSON: `app_id`, `volume_id`, `lease_id`, `fencing_token`, `snapshot_seq`, `base_seq` (the target's copy the ranges apply to, or null for a full copy), `taken_at` (RFC 3339, when the source took the snapshot) and `size_bytes` (the volume's size, `size_gb` GiB) |
+| 2 | block | `offset` (u64 BE), `length` (u32 BE, 1 to 1 048 576), `blake3` (32 bytes, the BLAKE3 hash of the data), then `length` bytes of data. The range lies inside one cell |
+| 3 | zero range | `offset` (u64 BE), `length` (u64 BE): the range reads as zeros in the snapshot; the target writes zeros or punches a hole |
+| 4 | manifest | JSON: `block_count` (blocks and zero ranges sent) and `root_hash` (64 lowercase hex) |
+
+- **Cells and the root hash.** A volume is divided into cells of 1 MiB at offsets `k × 1 048 576`; a volume's size is a whole number of GiB, so every cell is full. A cell's hash is the BLAKE3 hash of its 1 MiB. The **root hash** of a copy is the BLAKE3 hash of the concatenation of every cell's hash in offset order. Each side keeps the cell hashes of its copy (the source those of its base and of `next`, the target those of its complete copy) and updates only the cells a cycle touched, so neither side reads the whole volume per cycle. A side that lost its cell hashes computes them again by reading the copy once. The hashing and IO code is the chunk engine's (ADR 0023); the blocks are not FastCDC chunks, because they apply in place (ADR 0173).
+- **The target's checks**, before it writes anything:
+  - it is the target of `volume_id` with the same `lease_id` in its desired state, and the connection comes from `peer_address`;
+  - `fencing_token` is at least the higher of the warm entry's `fencing_token` and the highest token it has seen in a stream of this volume;
+  - `base_seq` is null, or names its complete copy, or, on a returning source, one of the snapshots it kept (section 9);
+  - `snapshot_seq` is above `base_seq`, and for a full copy above its complete copy;
+  - no other stream of this volume is open.
+
+  A stream that fails a check is refused at once with its reason.
+- **Applying.** The target writes into a staging file: a reflink clone of the copy `base_seq` names, or for a full copy an empty sparse file of `size_bytes` (`engine-trait.md` section 3.22). It checks each block's `blake3`, writes it, and updates the cell hashes. At the manifest it checks `block_count`, computes the root hash of the staging file from its cell hashes and compares it with `root_hash`. If they are equal, it syncs the staging file, renames it over its copy in one step, and answers `complete`. Otherwise it deletes the staging file and refuses with `root_mismatch`, and its complete copy is unchanged. So the target never holds a half-applied copy: its copy is always one complete snapshot of the source.
+- **Answer.** `{ "status": "complete" | "refused", "snapshot_seq": <the target's newest complete copy, or null>, "reason": <string> }`. `reason` is present on `refused` and is one of `stale_token`, `wrong_lease`, `not_target`, `not_newer`, `base_mismatch`, `root_mismatch`, `bad_frame` or `busy`. On `base_mismatch` the source ships again from the copy the answer names if it still holds that snapshot, and as a full copy otherwise.
+- **Tokens.** A stream is a write to shared storage, so it carries the lease's token, and the target refuses a lower one (section 8.6, ADR 0173). The target records the refusal and reports it (`rejected_token`, `rejected_at`). So a source that lost its lease while it was paused or cut off cannot overwrite the copy that a failover started from.
+
+**What the primary derives.** From the two sides' `status_report.warm` entries the primary shows `App.warm` (`openapi.yaml`):
+
+- `last_snapshot_seq` and `last_shipped_at` are the target's `snapshot_seq` and `completed_at`;
+- `lag_s` is the time since the source took that copy's snapshot (`snapshot_taken_at`), on the primary's clock;
+- `state` is `syncing` until the target holds a first complete copy, `in_sync` while `lag_s` is at most twice `interval_s`, `lagging` above that, and `failed` while either side reports an error or is not connected.
+
+The switchover's condition, "in sync with a lag below two intervals" (ADR 0177), is that `in_sync`.
+
+**Failover (ADR 0175).** When the primary grants the target the lease (`openapi.yaml`, `failoverApp`), it sends the target a `desired_state` in which this node is the source of the volume and the standby VM is running with the new token, and the other node is the target. Before it creates the VM, the node keeps its complete copy as its base: a snapshot numbered with that copy's `snapshot_seq`, the common base of the resync (section 9). Then it creates and starts the VM on its copy (section 6.4). Writes the old source made after its last complete copy are not on the target; they are kept, never dropped, when the old source returns (section 9).
+
+**Planned switchover (ADR 0177).** The primary (`openapi.yaml`, `switchoverApp`):
+
+1. refuses the call unless `App.warm.state` is `in_sync` and both nodes are connected;
+2. sends the source `command` kind `switchover_freeze` (section 5.17): the source pauses the VM, ships a final snapshot and keeps the VM paused;
+3. sends the source `lease_revoke` with reason `moved` and waits for its `command_result`: the VM is stopped and the lease revoked;
+4. grants the target the lease with a higher token and sends both nodes their new roles, as for a failover;
+5. switches the edge's backend to the new instance in the edge's next `desired_state`; the old backend leaves the route, and the edge lets its requests finish (section 6.8);
+6. emits `app.switched_over`.
+
+If step 2 fails, or the primary gives up before step 3, it sends `switchover_thaw`: the source resumes, nothing moved, and the primary emits `app.switchover_failed`. Once the revoke of step 3 was answered, the switchover goes forward only: the final snapshot is on the target, and the old source's volume holds the same data, so it becomes the target with no quarantine (section 9). A primary that restarts during a switchover thaws a source that reports `frozen: true` (section 5.17); a frozen source cut off from the primary fences when its lease ends.
 
 ## 7. Change-log follow
 
@@ -1739,6 +1854,8 @@ The call is refused with `409 conflict` while the node is connected, because the
 ### 8.4 `expiring` mode timing
 
 Used for `warm` and `hot`, where a second copy is ready and will start as soon as the lease moves (D-0047).
+
+**Changing the mode (M5b).** An app's lease changes mode without changing holder when its HA policy changes. When the policy becomes `warm`, the primary sends the holder a `lease_grant` with `mode` `expiring`, the current token and a duration; when it leaves `warm`, a `lease_grant` with `mode` `local` and the current token. Neither is an ownership change, so the token stays (section 8.6). The node takes the grant like the answer to a renewal, adopts the mode, and for `expiring` starts renewing (section 5.5). The primary sends the `expiring` grant only while it holds majority support (section 8.8). Until then the lease stays `local`: the app runs on, and a failover needs the source connected or declared lost (section 8.3).
 
 Definitions, all on the node's monotonic clock:
 
@@ -1850,7 +1967,7 @@ The node also emits `node.fenced` when an operator declaration invalidated its t
 ### 8.6 Fencing tokens
 
 - A token is an integer per leased resource that increases strictly on every ownership change — a grant to a new holder, or a grant after expiry or revoke — and stays the same across renewals by the same holder (D-0073). It is never reused. The current token lives on the lease row (`fencing_token` in the shared entity model) and is echoed in every `lease_grant`, `lease_revoke`, `lease_renew`, `hello` and stateful VM spec.
-- Every write to shared storage carries the token: the chunk store and object store from M5, and the replication stream (D-0023). A receiver rejects any write whose token is lower than the highest it has seen for that resource, and records the rejection. For the backups of M5a the receiver is the primary, not the bucket: the bucket accepts any chunk or manifest the credential may write, and the primary seals a backup only when its token is the app's current one (`backup-format.md` section 6.2).
+- Every write to shared storage carries the token: the chunk store and object store from M5, and the replication stream of warm volumes (D-0023, section 6.13). A receiver rejects any write whose token is lower than the highest it has seen for that resource, and records the rejection. For the backups of M5a the receiver is the primary, not the bucket: the bucket accepts any chunk or manifest the credential may write, and the primary seals a backup only when its token is the app's current one (`backup-format.md` section 6.2).
 - Tokens are what makes the lease safe against a paused node: a node that was frozen past its expiry can still act on stale intent, and only the token at the storage layer stops it (`docs/research/r2-conditional-writes.md`).
 - Arbiters do not remove the need for tokens. A Durable Object can bump a token inside its critical section, and R2 has no server-side expiry at all, but in both cases the node and the storage must still enforce the token (`docs/research/durable-objects.md`).
 
@@ -1866,7 +1983,7 @@ M0 ships the protocol, not the HA feature: the messages, the four node-side stat
 | M3 | Primary | `local` | Same; the agent-driven calls arrive as desired-state changes from the API and MCP |
 | M4 | Primary | `local` | Adds builds in desired state, build-log, metrics, terminal, console and transcript streams, `stream_input` and `stream_ack`; leases unchanged |
 | M5a | Primary | `local` | Local volumes, with a `local` lease granted at placement; backup jobs carrying the lease token; restores that move the lease to the target node (section 6.7); operator declaration of a lost node adds a lease revoke with a new token. Replicas take no lease: they are stateless. The edge and the mesh (sections 6.8 and 6.9) hold no lease either |
-| M5b | Primary, while a majority of voters supports it (section 8.8) | `local`, `expiring` (`warm`) | Warm: renewal loop, `uncertain` handling, restart persistence of held leases (section 8.4), concurrent fences (section 8.5); replication writes carrying tokens come with warm replication. Voters answer `support_request`, keep their vote state and serve promotion votes (sections 8.8 and 8.9); every machine refuses a lower term |
+| M5b | Primary, while a majority of voters supports it (section 8.8) | `local`, `expiring` (`warm`) | Warm: renewal loop, `uncertain` handling, restart persistence of held leases (section 8.4), concurrent fences (section 8.5); replication streams carry the token and the target refuses a lower one (section 6.13). Voters answer `support_request`, keep their vote state and serve promotion votes (sections 8.8 and 8.9); every machine refuses a lower term |
 | M6 | Quorum | `local`, `expiring` (`warm`, `hot`) | Automatic failover and `hot`; the same messages also carry `resource_type: primary` leases |
 
 ### 8.8 Voter support and terms (M5b)
@@ -2013,6 +2130,16 @@ Order on reconnect:
 
 Divergent local writes are kept as a quarantined snapshot and recorded in the audit log from M5b (D-0022 step 3, D-0031). There is no automatic failback: the default is that roles simply swap, and a return to the previous node is a planned switchover with a write freeze, a final sync and a lease move (D-0022).
 
+**A returning source (M5b, ADR 0176).** A node that was the source of a warm volume and lost the lease (a failover while it was cut off, or a switchover) finds, in its first `desired_state` after the stale-lease revokes, that it is now the target of that volume. Before it accepts a stream for it, the node:
+
+1. compares its live volume file with each snapshot of the volume it kept, its base and the snapshot it was shipping, through `volume_changed_ranges` (section 6.13). If the file has no changed range against one of them, it holds no divergent write, and it deletes the file;
+2. otherwise keeps the live file as a **quarantined copy**: a reflink clone, which costs only the diverged blocks, recorded in its store (section 12) with a new `qrn_` id and reported in `status_report.quarantines` with its size and, once computed, its SHA-256. The primary records it, writes the audit record and emits `volume.quarantined` (section 5.3);
+3. keeps its snapshots as candidate copies. The new source ships from its base, the copy it started from, and names it in `base_seq`: when the target holds that snapshot, only the ranges changed since are shipped, an incremental resync from the last common point. The other candidate is deleted once that stream completes. When the target holds neither, it answers `base_mismatch` and the new source ships a full copy.
+
+A returning source therefore starts nothing stateful, keeps its divergent writes and becomes the `warm` copy (D-0022 steps 1 to 4). Nothing deletes a quarantined copy automatically: only an operator does, with `DELETE /api/v1/volumes/{volume_id}/quarantines/{quarantine_id}`, a human-only call that reaches the node as `spec.quarantine_deletes` (section 5.11). A switchover's old source holds no divergent write, because its VM was paused before the final snapshot and stopped after it, so step 2 does not happen. A quarantined copy on a node that never reconnects is removed from the primary's records only when an operator removes the node (section 10); until then `deleteVolumeQuarantine` leaves it `deleting`.
+
+The old source still has the app's VM, fenced or stopped by the revoke. Its desired state now lists that VM as `standby` (section 5.11), so the node deletes it before step 1, keeping its volume (`engine-trait.md` section 3.9): the engine compares and replaces a volume file only while no VM that attaches it exists (`engine-trait.md` section 3.22).
+
 ## 10. Node removal
 
 ```
@@ -2023,6 +2150,7 @@ DELETE /api/v1/nodes/{node_id}
 - If the node is connected, the primary first sends `lease_revoke` for every lease the node holds and waits for each `command_result`, so the node fences its stateful VMs; then it ends the session with a fatal `error` code `node_removed` and marks the node `removed`. If the node is not connected, removal increments the fencing token of each of its leases, exactly like declaring the node lost (section 8.3), so the old copy can no longer write to shared storage. Only then may the app start elsewhere; the node itself is not asked to destroy anything.
 - The node stops dialing permanently. It leaves its stateless VMs running and its fenced stateful VMs stopped, because deleting them is a data decision, not a protocol step.
 - From M5b, removing a voter changes the voter set: it follows section 8.10, so it answers `409 conflict` while the previous change has not reached a majority of voters. Removal is not refused for leaving fewer than three voters; the HA view then reports that HA needs a third vote.
+- From M5b, removing a node drops the records of the quarantined copies it keeps (section 9, `volume_quarantines`) in the same transaction, so a node that is gone for good no longer blocks `deleteVolume` or `deleteApp` (`has_quarantines`). The copies themselves stay on its disk with the rest of its data.
 - Removing a node never destroys data remotely. Purging local state — disks, rootfs images, the node's store — is a local CLI command run on that machine by whoever has root there. A node that is gone for good therefore keeps its data until someone with access deletes it, which is the safe default.
 
 ## 11. Security notes
@@ -2041,6 +2169,7 @@ Threats and their mitigations are in `../architecture/threat-model.md`; this sec
 
 - **Image inventories (M5a).** The inventory is built by parsing package databases and manifests inside images the operator did not write, as root on the host. The parsers are Rust, in the engine's process, bounded in size (section 6.11), and read files of the unpacked tree only: they never execute anything from the image. What leaves the node is the package list, over the session, never the image.
 - **Edge and mesh (M5a).** Besides the certificates of the routes it serves, the edge holds its tunnel token and its WireGuard private key, and it reaches a node only through the mesh, where the node's firewall admits only the edge's mesh address and only to the guest addresses and ports of that node's backends (section 6.9). A compromised edge can read and alter the traffic of the apps it serves and probe their backends; it cannot reach other guests, the node's host services or other nodes, and it cannot change desired state. With one edge in M5a, the edge is a single point of failure for the traffic of apps with more than one replica.
+- **Warm replication (M5b).** The target holds a full copy of the volume, so it can read the app's data like the source; the warm node is chosen among the nodes the app may run on (`openapi.yaml`, `App.warm`). The replication listener is reachable only through the mesh and only from the source's mesh address, and its streams carry no secret. A compromised source can ship any content, which it could also write through the app; it cannot ship with a token lower than the target has seen, so a source that lost its lease cannot overwrite the copy a failover started from. A compromised target can refuse streams, which shows as lag in `App.warm`, or hold a different copy than it reports; a failover to it starts from whatever it holds. A quarantined copy holds the app's data and stays on its node's disk until an operator deletes it.
 - **Volumes and backups (M5a).** A volume file is guest-written and never mounted on the host; snapshots, backups and restores handle it as bytes (section 6.7). A node receives the chunk keys of the apps it has jobs for and the bucket credential only while it has a job, never the repository key and never the audit-copy credential. A compromised node can read and overwrite nothing in the repository that it could not already read on its own disk: it can upload garbage chunks or manifests, which no seal covers and a restore refuses (`backup-format.md` section 8.1).
 
 ## 12. Local node store
@@ -2055,7 +2184,8 @@ The node keeps a SQLite file, owned by root, that holds everything it needs to r
 | `leases` | Lease id, resource, mode, token, state, `valid_until`, duration, remaining validity on `CLOCK_BOOTTIME` for `held` and `uncertain` expiring leases | Survives an agent restart: a fenced lease stays fenced, a held one keeps its remaining validity within the same host boot |
 | `event_buffer` | Buffered events with their `evt_` id and time, plus the dropped counter | Bounded at 10 000; delivered after reconnect |
 | `change_log` | Followed entries in `seq` order with `prev_hash` and `hash`, and the last acked `seq` | Verifies the chain and resumes follow |
-| `quarantine` | Metadata for each quarantined divergent copy: path, time, reason | Nothing divergent is deleted (D-0022) |
+| `quarantine` | Metadata for each quarantined divergent copy, of the change log (section 7) and, from M5b, of a volume (section 9): path, time, reason, and for a volume its `qrn_` id, volume, size and SHA-256 | Nothing divergent is deleted (D-0022) |
+| `warm` (M5b) | Per warm volume: role, peer, the base and the snapshot being shipped with their `snapshot_seq`, the cell hashes of the base and of the complete copy, the highest token seen in a stream, whether the VM is frozen by a switchover, and on a returning source its candidate snapshots | Resumes replication after an agent restart without a full copy, and keeps a frozen VM frozen (section 6.13) |
 | `cmd_results` | `msg_` id and outcome of the last answered intrusive messages | Makes a redelivered `lease_revoke` idempotent |
 | `builds` (M4) | Per build: `bld_` id, app, status, phase, resolved commit, image digest, failed step, the path of its log file, start and end times | Reports build progress in `status_report` across an agent restart; keeps the logs of the last 20 builds of each app (section 6.6) |
 | `transcripts` (M4) | Per terminal session: `trm_` id, VM, file path, size, SHA-256, start and end times | Serves `stream_open` kind `transcript` and enforces retention: 30 days and 1 GiB per node, oldest removed first (`audit-log-format.md` section 3.3) |

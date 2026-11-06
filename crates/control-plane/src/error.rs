@@ -70,7 +70,8 @@ impl Code {
     }
 }
 
-/// Why a `forbidden` response was returned.
+/// Why a `forbidden` response was returned, and from M5b why a failover, a
+/// switchover or a delete was refused with `conflict` (ADR 0175 to ADR 0177).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Reason {
@@ -81,6 +82,15 @@ pub enum Reason {
     GrantExhausted,
     HumanOnly,
     AgentDisabled,
+    NotWarm,
+    NoCopy,
+    NotInSync,
+    NodeDisconnected,
+    FenceFailed,
+    NoSupport,
+    LeaseHeld,
+    InProgress,
+    HasQuarantines,
 }
 
 impl Reason {
@@ -94,6 +104,15 @@ impl Reason {
             Self::GrantExhausted => "grant_exhausted",
             Self::HumanOnly => "human_only",
             Self::AgentDisabled => "agent_disabled",
+            Self::NotWarm => "not_warm",
+            Self::NoCopy => "no_copy",
+            Self::NotInSync => "not_in_sync",
+            Self::NodeDisconnected => "node_disconnected",
+            Self::FenceFailed => "fence_failed",
+            Self::NoSupport => "no_support",
+            Self::LeaseHeld => "lease_held",
+            Self::InProgress => "in_progress",
+            Self::HasQuarantines => "has_quarantines",
         }
     }
 }
@@ -133,7 +152,8 @@ pub struct Problem {
     /// Machine-readable error code.
     #[schema(inline)]
     pub code: Code,
-    /// Why a `forbidden` response was returned. Absent for other codes.
+    /// Why a `forbidden` response was returned, or a failover, switchover or
+    /// delete refused with `conflict`. Absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(inline, nullable = false)]
     pub reason: Option<Reason>,

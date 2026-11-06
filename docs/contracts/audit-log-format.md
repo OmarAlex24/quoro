@@ -171,6 +171,7 @@ Each call or action in the rows marked "yes" below produces exactly one record (
 | storage system actions (M5a): a scheduled backup dispatched, a backup sealed or failed, retention pruning, a garbage-collection sweep, a control-plane backup, a `local` lease granted or moved, an audit-export probe (section 3.5) | yes | `ok` / `error` |
 | vulnerability system actions (M5a): an offline import of vulnerability data (section 3.6) | yes | `ok` / `error` |
 | lease and voter system actions (M5b): an `expiring` lease granted with a new token, the revokes of a node declared lost, a maintenance window opened or ended (section 3.7) | yes | `ok` / `error` |
+| warm system actions (M5b): a quarantined copy of a volume recorded (section 3.8) | yes | `ok` |
 | audit verification runs | yes | `ok` / `error` |
 | the open of a terminal or console session (its `POST`) | yes, for every identity, as a mutating call | `ok` / `refused` / `error` |
 | the close of a terminal or console session, for any reason | yes: one `session.end` record (section 3.3) | `ok` / `error` |
@@ -329,6 +330,26 @@ System records, with `actor_type` `system` and no `scope`:
 | `cluster.maintenance` | `cluster` | `cli` | `cluster` / the cluster id | The operator or the installer ran `quoro cluster maintenance` on the primary's host and the primary opened the window (node-agent-protocol.md section 8.11); `params` is `{duration_s}`, `ok` once a majority supported it, `error` with the reason otherwise. `--end` writes another record with `params` `{end: true}` |
 
 Support requests and grants, promotion votes and the loss of a majority write no record: they change no state on the primary. What follows from them is recorded: the fences of the nodes (`node.fenced` events) and, with promotion, the promotion itself.
+
+### 3.8 Warm replication (M5b)
+
+Warm replication adds three calls and one kind of system record (ADR 0174 to ADR 0177). The calls are recorded like any mutating call:
+
+| Operation | `scope` | `target_type` / `target_id` | Notes |
+| --- | --- | --- | --- |
+| `failoverApp` | `app:failover` | `app` / the app | Destructive: an agent's call carries the `approval_id` and `grant_id` of its approval; `params` is the request body, `{node_id}`. The change log holds the new lease and its token, and `lease.grant` records it (section 3.7) |
+| `switchoverApp` | `app:failover` | `app` / the app | As `failoverApp`. The record is written when the switchover starts; its outcome is the event `app.switched_over` or `app.switchover_failed`, and the lease moves through `lease.revoke` and `lease.grant` records |
+| `deleteVolumeQuarantine` | `app:delete_quarantine` | `volume` / the volume | Human only; `params` is `{quarantine_id}` |
+
+Changing an app's `ha_policy` to or from `warm`, or its warm settings, is an `updateApp` like any other.
+
+System record, with `actor_type` `system` and no `scope`:
+
+| `operation` | `actor_id` | `channel` | `target_type` / `target_id` | When |
+| --- | --- | --- | --- | --- |
+| `volume.quarantine` | `volumes` | `system` | `volume` / the volume | The primary recorded a quarantined copy that a node reported (node-agent-protocol.md section 9): `params` is `{app_id, volume_id, node_id, quarantine_id, size_bytes, sha256}`. Written once per copy, in the same transaction as its `volume_quarantines` row, so the divergent writes a failover left behind are on the audit chain (D-0022, D-0031) |
+
+Replication cycles, streams and their refusals write no record: they change no state on the primary, which keeps their progress in memory (node-agent-protocol.md section 5.3).
 
 ## 4. Redaction
 

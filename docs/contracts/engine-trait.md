@@ -392,6 +392,55 @@ pub struct VolumeSnapshot {
     pub pause: Duration,
 }
 
+/// A byte range of a volume file. Added in M5b. Section 3.22.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ByteRange {
+    pub offset: u64,
+    pub length: u64,
+}
+
+/// The newer side of a `volume_changed_ranges` comparison. Added in M5b.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RangesOf {
+    /// A snapshot of the volume.
+    Snapshot(VolumeSnapshot),
+    /// The volume file itself, which no VM that exists may attach.
+    Volume(VolumeId),
+}
+
+/// The ranges that may differ from a base. Added in M5b. Section 3.22.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangedRanges {
+    /// Sorted by offset, not overlapping, aligned to 4 KiB. A range may be a
+    /// hole in the newer file; it then reads as zeros.
+    pub ranges: Vec<ByteRange>,
+    /// True when `ranges` is every allocated range of the newer file: there
+    /// was no base, or the extent maps could not be compared.
+    pub full: bool,
+    /// Extents in the newer file's extent map.
+    pub extent_count: u64,
+}
+
+/// What a staging file starts from. Added in M5b. Section 3.22.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StageFrom {
+    /// An empty sparse file of the volume's size.
+    Empty,
+    /// A reflink clone of the volume file.
+    Volume,
+    /// A reflink clone of a snapshot of the volume.
+    Snapshot(VolumeSnapshot),
+}
+
+/// A staging file a warm copy is written into. Added in M5b. Section 3.22.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedVolume {
+    pub volume_id: VolumeId,
+    pub size_bytes: u64,
+    /// Node-local location the node agent writes; not part of any API.
+    pub location: PathBuf,
+}
+
 /// Every method is total: it either succeeds or returns one of these.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EngineError {
@@ -602,6 +651,47 @@ pub trait Engine: Send + Sync {
             ))
         }
     }
+
+    // Warm volumes (M5b; the default implementation returns Unsupported)
+    /// Added in M5b; section 3.22.
+    fn volume_changed_ranges(
+        &self,
+        _newer: &RangesOf,
+        _base: Option<&VolumeSnapshot>,
+    ) -> impl Future<Output = Result<ChangedRanges, EngineError>> + Send {
+        async { Err(EngineError::Unsupported("warm volumes are not implemented by this engine".into())) }
+    }
+    /// Added in M5b; section 3.22.
+    fn stage_volume(
+        &self,
+        _id: &VolumeId,
+        _size_gb: u32,
+        _from: &StageFrom,
+    ) -> impl Future<Output = Result<StagedVolume, EngineError>> + Send {
+        async { Err(EngineError::Unsupported("warm volumes are not implemented by this engine".into())) }
+    }
+    /// Added in M5b; section 3.22.
+    fn commit_staged_volume(
+        &self,
+        _staged: &StagedVolume,
+    ) -> impl Future<Output = Result<VolumeInfo, EngineError>> + Send {
+        async { Err(EngineError::Unsupported("warm volumes are not implemented by this engine".into())) }
+    }
+    /// Added in M5b; section 3.22.
+    fn discard_staged_volume(
+        &self,
+        _staged: &StagedVolume,
+    ) -> impl Future<Output = Result<(), EngineError>> + Send {
+        async { Err(EngineError::Unsupported("warm volumes are not implemented by this engine".into())) }
+    }
+    /// Freezes a running VM's vCPUs. Added in M5b; section 3.22.
+    fn pause(&self, _id: &VmId) -> impl Future<Output = Result<(), EngineError>> + Send {
+        async { Err(EngineError::Unsupported("pausing a VM is not implemented by this engine".into())) }
+    }
+    /// Added in M5b; section 3.22.
+    fn resume(&self, _id: &VmId) -> impl Future<Output = Result<(), EngineError>> + Send {
+        async { Err(EngineError::Unsupported("pausing a VM is not implemented by this engine".into())) }
+    }
 }
 
 /// The result of the host check in section 3.2.
@@ -623,6 +713,8 @@ The derives, `MacAddr`, the blanket `ConsoleIo` implementation, `Display` and `E
 M4 adds, additively: `VmSpec::serial`, `VmSpec::vsock` and `VmSpec::work_disks` with `SerialMode`, `VsockAttach` and `WorkDisk`; `NetAttach::egress_only`; `Capabilities::exec`; `OciLayout`, `ByteStream`, `ExecRequest` and `ExecSession`; and the methods `prepare_layout`, `exec` and `serial_output`, whose default implementations return `Unsupported`, so a backend that does not offer them still compiles. Code that builds a `VmSpec`, `NetAttach` or `Capabilities` literal sets the new fields to `SerialMode::File` (the M1-M3 serial log), `None`, an empty list, `false` and `false`, which keeps the M1-M3 behaviour. `VmSpec::canonical` keeps `work_disks` in order: their serials are unique, so the order carries no meaning, but the node agent always builds them in the same order.
 
 M5a adds, additively: `VolumeAttach::serial`, `VolumeInfo`, `SnapshotMethod`, `Capabilities::volume_snapshot_method`, `VolumeSnapshot::method` and `VolumeSnapshot::pause`, and the methods `ensure_volume`, `import_volume` and `delete_volume`, whose default implementations return `Unsupported` like `snapshot_volume` and `delete_volume_snapshot`. It also adds `ImageInventory`, `InventoryPackage` and the methods `image_inventory` and `inventory_cached_image`, whose default implementations return `Unsupported`, and `uninventoried_images`, whose default implementation returns an empty list, so a backend without inventories never starts a backfill. Code that builds a `Capabilities` literal sets the new field to `None`; `VmSpec::canonical` keeps sorting `volumes` by `(volume_id, mount_path)`, and the serial follows the volume.
+
+M5b adds, additively: `ByteRange`, `RangesOf`, `ChangedRanges`, `StageFrom` and `StagedVolume`, and the methods `volume_changed_ranges`, `stage_volume`, `commit_staged_volume`, `discard_staged_volume`, `pause` and `resume`, whose default implementations return `Unsupported`, so a backend without warm volumes still compiles and its node is never a warm node (ADR 0172). No existing type gains a field. `VmState` gains no variant: a paused VM is reported `Running` (section 3.22). One rule changes: a volume may have several snapshots at once (section 3.16).
 
 ## 3. Method semantics
 
@@ -740,10 +832,10 @@ The point-in-time disk primitive the chunk engine needs (D-0023). Both are `Unsu
 - **`Reflink`.** The engine clones the volume file into a snapshot file next to it with `FICLONE`, without touching the VM. The snapshot is crash-consistent at the instant of the clone; `pause` is zero.
 - **`PauseCopy`.** If a VM that attaches the volume is `Running`, the engine pauses it (`/vm.pause`), copies the volume file into a snapshot file keeping holes (`SEEK_DATA` and `SEEK_HOLE`), and resumes it (`/vm.resume`), whatever the copy's outcome. `pause` is the time between the pause and the resume. A volume no running VM attaches is copied without a pause. A resume that fails is `Hypervisor`, and the VM is left for the node agent's crash handling.
 - **Crash consistency.** Both methods give the guest the guarantee of a power cut: an ext4 volume replays its journal after a restore. An app that needs more uses its own dump (ADR 0023). A guest-side freeze through the exec channel may shorten the pause later; it is not part of M5a.
-- The snapshot is a node-local file that only the chunk engine reads. It is never attached to a VM and never mounted. `delete_volume_snapshot` removes it; a missing snapshot is `Ok`. Snapshots left by a crash are removed by the node agent at start.
-- At most one snapshot per volume exists at a time; a second `snapshot_volume` while one exists is `Conflict`. An unknown volume is `NotFound`. Too little free space for a `PauseCopy` is `ResourceExhausted`, checked before the pause.
+- The snapshot is a node-local file that only the chunk engine reads. It is never attached to a VM and never mounted. `delete_volume_snapshot` removes it; a missing snapshot is `Ok`. Snapshots left by a crash are removed by the node agent at start. From M5b the node agent keeps those its store records: a warm volume's base and the snapshot being shipped, the candidate copies of a returning source and the quarantined copies (section 3.22, `node-agent-protocol.md` sections 6.13 and 9); it removes the rest.
+- In M5a at most one snapshot per volume exists at a time, and a second `snapshot_volume` while one exists is `Conflict`. From M5b a volume may have several at once, each with its own `snapshot_id`: a warm source keeps its base and the snapshot it ships, a backup may take another, and a returning source keeps its candidates and a quarantined copy. The node agent still runs at most one backup snapshot of a volume at a time. An unknown volume is `NotFound`. Too little free space for a `PauseCopy` is `ResourceExhausted`, checked before the pause.
 - They must **not** be implemented with Cloud Hypervisor VM snapshots. A CH snapshot is a paused VM's `config.json`, `memory-ranges` and `state.json`; it contains guest RAM and device state but no disk contents, and CH exposes no dirty bitmap (F-0035). `/vm.pause` and `/vm.resume` are the only VMM calls this method makes.
-- Warm volumes (M5b) keep these reflink snapshots, native or in the pool: the changed ranges between two consecutive snapshots of a volume are found by comparing their extent maps (FIEMAP), with a full hashed scan of the snapshot as the fallback, and neither lvm-thin nor btrfs is used (ADR 0172). A `PauseCopy` node cannot hold a warm volume. The call that returns the changed ranges is specified with the warm-replication contract.
+- Warm volumes (M5b) keep these reflink snapshots, native or in the pool: the changed ranges between two consecutive snapshots of a volume are found by comparing their extent maps (FIEMAP), with a full hashed scan of the snapshot as the fallback, and neither lvm-thin nor btrfs is used (ADR 0172). A `PauseCopy` node cannot hold a warm volume. The call that returns the changed ranges is `volume_changed_ranges` (section 3.22).
 
 ### 3.17 `prepare_layout`
 
@@ -803,11 +895,25 @@ Returns the package inventory of a prepared image (ADR 0150, ADR 0151). Added in
   - The node agent calls `uninventoried_images` once, in the background, after it starts, then `inventory_cached_image` for one image at a time, and sends each inventory it gets as it does for a freshly prepared image (`node-agent-protocol.md` section 6.11). The pass never delays the node's start, a VM start or a preparation; an image that fails is logged and the pass goes on with the next one.
 - `remove_image` removes the inventory with the image. `inventory_cached_image` and `remove_image` of one digest are serialized, so a removal never races the inventory being written.
 
+### 3.22 Warm volumes: `volume_changed_ranges`, staging, `pause` and `resume`
+
+What a warm source and a warm target need from the engine (ADR 0172 to ADR 0177, `node-agent-protocol.md` section 6.13). Added in M5b; the default implementations return `Unsupported`, and a node whose `volume_snapshot_method` is not `Reflink` is never offered a warm volume. The engine finds what changed and moves files into place; the node agent reads and writes the bytes, hashes them and talks to the other node, as for backups (section 3.16).
+
+- **`volume_changed_ranges`** returns the ranges of `newer` whose data may differ from `base`. Both are files of the same volume: `newer` is a snapshot or the volume file itself, `base` a snapshot taken earlier, so they share every block that was not written in between. The engine reads both extent maps with `FS_IOC_FIEMAP` and `FIEMAP_FLAG_SYNC` and reports every logical range of `newer` whose physical block is not the same in `base`, rounded out to 4 KiB, including the ranges that are holes in one file and not in the other. An extent flagged `UNKNOWN`, `DELALLOC`, `ENCODED`, `NOT_ALIGNED`, `DATA_INLINE` or `DATA_TAIL` in either map counts as changed. The result may contain ranges whose bytes are in fact equal, never fewer than were written: on the lab the comparison found exactly the written 4 KiB blocks over 50 cycles, in about 20 ms, at about 4 µs per extent (`docs/research/m5b-warm-and-leases.md`).
+  - With no `base`, or when the extent maps cannot be compared (the files are not on the same filesystem, the filesystem does not report physical blocks), it returns every allocated range of `newer`, from `SEEK_DATA` and `SEEK_HOLE`, with `full: true`. The node agent then ships a full copy.
+  - `extent_count` is the number of extents in `newer`'s map. The source reports it (`status_report.warm`), because the cost of a cycle grows with it.
+  - `newer` as `Volume` compares the live volume file, which a returning source does before it keeps a quarantined copy (`node-agent-protocol.md` section 9). A VM that exists and attaches the volume makes that `Conflict`, because the file could change during the comparison. An unknown volume or snapshot is `NotFound`. A `base` of another volume is `Conflict`.
+- **`stage_volume`** creates a staging file next to the volume file, `size_gb` gibibytes, which the node agent writes a received copy into: an empty sparse file (`Empty`), or a reflink clone of the volume file (`Volume`) or of a snapshot of the volume (`Snapshot`), so an incremental copy writes only the changed blocks. A clone of a file of another size is `Conflict`; a missing source is `NotFound`; too little free space for the staging file's metadata is `ResourceExhausted`. Each call creates a new staging file; a volume has at most one at a time, so a second call while one exists is `Conflict`.
+- **`commit_staged_volume`** syncs the staging file, renames it over the volume file in one step on the same filesystem, syncs the directory and returns the volume's `VolumeInfo`. A volume that has no file yet (the first copy on a target) gets it. A VM that exists and attaches the volume is `Conflict`: the target's standby VM is not created until it is the source (`node-agent-protocol.md` section 5.11). After a crash the volume file is either the old copy or the new one, never a mix.
+- **`discard_staged_volume`** removes the staging file; a missing one is `Ok`. Staging files left by a crash are removed by the node agent at start, so a copy that did not complete leaves nothing.
+- **`pause`** freezes a running VM's vCPUs; its memory, devices and volumes stay as they are, and the guest sees no event. **`resume`** lets it run again. They are what a planned switchover freezes the app's writes with (ADR 0177, `node-agent-protocol.md` section 5.17). Pausing a paused VM and resuming a running one are `Ok`. A VM that is not running or paused is `Conflict`; an unknown one is `NotFound`. A paused VM keeps `VmState::Running` in `inspect` and `list`: the node agent records the freeze itself, so it knows after a restart which VM it paused. `stop` and `delete` work on a paused VM.
+- The node agent, not the engine, decides when to snapshot, compare, stage, commit or pause, and checks the lease and the token first (`node-agent-protocol.md` sections 6.13 and 8.6).
+
 ## 4. Concurrency
 
 - Operations on one `VmId` are serialized by the caller. The node agent holds one lock per VM, so it never issues `start` and `delete` for the same id concurrently. The engine does not promise ordering for concurrent calls on one id and may return `Conflict`.
 - The engine must be safe to call concurrently for **different** VMs, on many VMs at once. This is what lets one node run several apps and replace them independently.
-- `capabilities`, `probe_host`, `ensure_network`, `prepare_image`, `remove_image`, `image_inventory`, `uninventoried_images`, `inventory_cached_image` and `list` are safe concurrently with any VM operation. `prepare_image`, `prepare_layout`, `inventory_cached_image` and `remove_image` are serialized per digest (section 3.21). `ensure_network` and `prepare_image` are internally serialized by the implementation where the underlying operation is not reentrant.
+- `capabilities`, `probe_host`, `ensure_network`, `prepare_image`, `remove_image`, `image_inventory`, `uninventoried_images`, `inventory_cached_image` and `list` are safe concurrently with any VM operation. So are `volume_changed_ranges` on snapshots and the staging calls, which the node agent serializes per volume; `pause` and `resume` are VM operations, serialized per `VmId` like `start` and `stop`. `prepare_image`, `prepare_layout`, `inventory_cached_image` and `remove_image` are serialized per digest (section 3.21). `ensure_network` and `prepare_image` are internally serialized by the implementation where the underlying operation is not reentrant.
 - No call blocks the runtime for longer than an I/O wait: image preparation and boot are awaited, never run on the reactor thread.
 
 ## 5. Cloud Hypervisor implementation
@@ -837,6 +943,12 @@ One `cloud-hypervisor` process per VM with its own `--api-socket`, because the V
 | `counters` | Reads the VM's I/O and device counters and maps them to `VmCounters`; the exact field names of the backend's counter document are not fixed by `docs/research/cloud-hypervisor.md`, so the mapping is **Hypothesis** | `/vm.counters` |
 | `snapshot_volume` | `FICLONE` of the volume file, natively or in the XFS volume pool, or pause, sparse copy and resume (section 3.16, ADR 0156) | `/vm.pause` and `/vm.resume` for `PauseCopy` only; never `/vm.snapshot` (F-0035) |
 | `delete_volume_snapshot` | Removes the snapshot file | No backend call |
+| `volume_changed_ranges` | Reads both extent maps with `FS_IOC_FIEMAP` and compares their physical blocks (section 3.22, ADR 0172) | No backend call |
+| `stage_volume` | `FICLONE` of the volume file or of a snapshot into a staging file, or a sparse empty file (section 3.22) | No backend call |
+| `commit_staged_volume` | `fsync` of the staging file, `rename` over the volume file, `fsync` of the directory (section 3.22) | No backend call |
+| `discard_staged_volume` | Removes the staging file | No backend call |
+| `pause` | Freezes the VM's vCPUs (section 3.22) | `/vm.pause` |
+| `resume` | Lets a paused VM run (section 3.22) | `/vm.resume` |
 | `ensure_volume` | Creates the sparse file and runs `mkfs.ext4` on it (section 3.20) | No backend call |
 | `import_volume` | Renames the restored file into place (section 3.20) | No backend call |
 | `delete_volume` | Removes the volume file (section 3.20) | No backend call |
@@ -901,6 +1013,7 @@ Tests must run on machines without KVM, including CI and the laptops of people w
 - M4 methods: `prepare_layout` caches a fake prepared image by manifest digest; `exec` returns an in-memory session that echoes input and can be told to exit with a code; `serial_output` replays and follows an injectable byte buffer. `Capabilities::exec` is `true`.
 - Inventory methods: `image_inventory` returns an injectable inventory for a prepared image; a test can mark an image as prepared before M5a, which `uninventoried_images` then lists and `image_inventory` reports `NotFound` until `inventory_cached_image` builds an injectable inventory for it, or fails with an injectable error.
 - Volume methods: `ensure_volume`, `import_volume` and `delete_volume` keep volume records in memory with their size; `snapshot_volume` and `delete_volume_snapshot` succeed and record a snapshot descriptor, so the M5 chunk-engine code is testable before a real primitive exists. `Capabilities::volume_snapshot_method` is injectable and defaults to `Reflink`; with `PauseCopy` the fake records a pause and resume of the VM that attaches the volume.
+- Warm methods (M5b): `volume_changed_ranges` returns injectable ranges, by default every range of the volume with `full: true`; `stage_volume`, `commit_staged_volume` and `discard_staged_volume` keep staging records and apply the volume rules of section 3.22, including the `Conflict` of a VM that attaches the volume; `pause` and `resume` flip a paused flag a test can read, and a test can make either fail.
 
 The node agent runs its protocol tests against `FakeEngine`: the M0 lease tests — revoking a `local` lease and expiring a test-only short `expiring` lease — need no VM at all beyond a fake (`node-agent-protocol.md`).
 
@@ -921,4 +1034,4 @@ The node agent runs its protocol tests against `FakeEngine`: the M0 lease tests 
 | M2 | `output` feeds live app logs (D-0014, D-0033); isolation groups on `NetAttach` and guest DNS on `NodeNetwork` (D-0084) |
 | M4 | `counters` for metrics (D-0033, ADR 0014); `serial_output` and `VmSpec::serial` for the read-only console (ADR 0116); `exec` and `VmSpec::vsock` for the web terminal, with init configuration v2 (ADR 0113); `prepare_layout`, `VmSpec::work_disks` and `NetAttach::egress_only` for builds (ADR 0117, ADR 0118). `console` is superseded |
 | M5a | `image_inventory`, built by `prepare_image` and `prepare_layout` (ADR 0150, ADR 0151), and `uninventoried_images` and `inventory_cached_image` for images cached before M5a; `ensure_volume`, `import_volume`, `delete_volume` and `VolumeAttach::serial` for local volumes, with init configuration v3 (ADR 0145); `snapshot_volume` and `delete_volume_snapshot` with the `Reflink` or `PauseCopy` method probed per node (ADR 0146) |
-| M5b | Changed ranges between two reflink snapshots of a warm volume, found by comparing their extent maps (ADR 0172, D-0023) |
+| M5b | `volume_changed_ranges` between two reflink snapshots of a warm volume, found by comparing their extent maps (ADR 0172, D-0023); `stage_volume`, `commit_staged_volume` and `discard_staged_volume` for the target's copy (ADR 0173); `pause` and `resume` for a planned switchover (ADR 0177); several snapshots per volume (section 3.16) |

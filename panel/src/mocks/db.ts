@@ -567,6 +567,7 @@ const seed = (): void => {
     allocated_bytes: Math.round(3.4 * GIB),
     restored_from_backup_id: null,
     error: null,
+    quarantines: [],
     created_at: createdAt,
     updated_at: createdAt,
   };

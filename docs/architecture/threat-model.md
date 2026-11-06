@@ -267,6 +267,7 @@ and needs the same scope as the matching endpoint (D-0031, `../contracts/README.
 | T-LEASE-08 | T | A node with a valid credential claims a lease it never had | Lease authority is the primary in M0-M5a, and from M5b the primary while a majority of voters supports it (ADR 0169); a node cannot grant itself a lease | D-0017, D-0019, `../contracts/node-agent-protocol.md` | A compromised primary can grant a lease to any node (T-NODE-14) |
 | T-LEASE-09 | T | A `local` lease never expires, so a lost node comes back and starts its stateful app beside the new holder | A local lease ends only by `lease_revoke` or when an operator declares the node lost, which increments the fencing token so the old holder's token is stale; a cold restore elsewhere needs the manual fence acknowledgement first (D-0047) | D-0047, `../contracts/node-agent-protocol.md` | The manual "declared lost" step is the weak link: forget it and two copies can start |
 | T-LEASE-10 | D | Fencing takes longer than the margin and the node is still stopping when another starts | The node must finish fencing before `valid_until + margin`, and the authority waits `duration_ms + 2 * margin` before regranting | `../contracts/node-agent-protocol.md` | A guest that ignores SIGTERM delays a force stop; the formula assumes the force stop works |
+| T-LEASE-11 | T | A node that is not a warm volume's source, or a source that lost the lease, overwrites the warm copy a failover would start from | The target accepts a replication stream only from the source's mesh address named in its signed desired state, over the WireGuard peer that authenticates it; it refuses a fencing token below the highest it has seen and records the refusal; it writes into a staging file and keeps it only when every block hash and the root hash match, so its complete copy is never half-applied (ADR 0173) | D-0019, D-0173, `../contracts/node-agent-protocol.md` section 6.13 | The copy is only as good as its source: a compromised source that holds the lease can ship bad data with correct hashes |
 
 ### (g) Engine and guest isolation
 
@@ -368,7 +369,7 @@ decisions with a single narrow threat.
 | D-0011 (autonomous nodes, dial-out) | T-AVL-01, T-NODE-05, T-API-03 (no inbound path to a node to attack), T-AVL-09 |
 | D-0013 (numbered hash-chained log) | T-NODE-06, T-PRV-06, T-AUD-06, T-AVL-02 (a replica can verify what it holds), T-AUD-01 (the same chain discipline) |
 | D-0017 (three votes, witness) | T-AVL-03, T-AVL-04, T-LEASE-08, T-PRV-03 (the arbiter must be probed before it votes) |
-| D-0019 (mandatory lease-based fencing) | T-LEASE-01, T-LEASE-02, T-LEASE-07, T-LEASE-10, T-LEASE-05 (tokens do the work, not reads), T-VM-06 (shared storage writes carry tokens) |
+| D-0019 (mandatory lease-based fencing) | T-LEASE-01, T-LEASE-02, T-LEASE-07, T-LEASE-10, T-LEASE-11, T-LEASE-05 (tokens do the work, not reads), T-VM-06 (shared storage writes carry tokens) |
 | D-0026 (curated catalog, pinned signed images) | T-VM-05, T-SUP-04 |
 | D-0027 (signed binaries, reproducible builds) | T-SUP-01, T-SUP-02, T-SUP-03 |
 | D-0029 (agents as separate identities) | T-MCP-03, T-AUD-04, T-MCP-07, T-API-06 |

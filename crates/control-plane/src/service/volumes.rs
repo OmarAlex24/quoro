@@ -290,6 +290,7 @@ pub(crate) async fn create_volume(
         allocated_bytes: None,
         restored_from_backup_id: None,
         error: None,
+        quarantines: Vec::new(),
         created_at: now.clone(),
         updated_at: now.clone(),
     };
