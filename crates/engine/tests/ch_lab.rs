@@ -35,8 +35,9 @@ use quoro_engine::ch::tools::{self, HostTools};
 use quoro_engine::ch::{ChConfig, ChEngine};
 use quoro_engine::{
     ByteStream, ConsoleMode, Engine, EngineError, EngineEvent, ExecRequest, ImageDigest, ImageRef,
-    InitConfig, LineStream, MacAddr, NetAttach, NodeNetwork, OutputLine, OutputStream, SerialMode,
-    SnapshotMethod, StopMode, VmId, VmSpec, VmState, VolumeAttach, VolumeId, VsockAttach,
+    InitConfig, LineStream, MacAddr, NetAttach, NodeNetwork, OutputLine, OutputStream, RangesOf,
+    SerialMode, SnapshotMethod, StageFrom, StopMode, VmId, VmSpec, VmState, VolumeAttach, VolumeId,
+    VsockAttach,
 };
 use tokio::io::AsyncReadExt as _;
 
@@ -1025,7 +1026,17 @@ async fn local_volume_snapshot_cycle() {
         .await
         .expect("snapshot a running volume");
     assert_eq!(snapshot.volume_id, volume);
-    assert_eq!(snapshot.snapshot_id, format!("{}.snapshot", volume.0));
+    assert_eq!(
+        snapshot.location.file_name().and_then(|name| name.to_str()),
+        Some(snapshot.snapshot_id.as_str()),
+        "the snapshot id is its file name"
+    );
+    assert!(
+        snapshot.snapshot_id.starts_with(&format!("{}.", volume.0))
+            && snapshot.snapshot_id.ends_with(".snapshot"),
+        "{}",
+        snapshot.snapshot_id
+    );
     assert_eq!(snapshot.method, method);
     assert_eq!(snapshot.size_bytes, 1 << 30);
     if method == SnapshotMethod::PauseCopy {
@@ -1039,13 +1050,18 @@ async fn local_volume_snapshot_cycle() {
         VmState::Running,
         "the VM is running after the snapshot"
     );
-    assert!(
-        matches!(
-            engine.snapshot_volume(&volume).await,
-            Err(EngineError::Conflict(_))
-        ),
-        "one snapshot at a time"
-    );
+    // From M5b a volume keeps several snapshots, each in its own file (§3.16).
+    let second = engine
+        .snapshot_volume(&volume)
+        .await
+        .expect("a second snapshot");
+    assert_ne!(second.snapshot_id, snapshot.snapshot_id);
+    assert!(snapshot.location.exists() && second.location.exists());
+    engine
+        .delete_volume_snapshot(&second)
+        .await
+        .expect("delete the second snapshot");
+    assert!(snapshot.location.exists(), "the first snapshot is kept");
     use std::os::unix::fs::MetadataExt as _;
     let allocated = std::fs::metadata(&snapshot.location)
         .expect("snapshot file")
@@ -1234,6 +1250,326 @@ async fn volume_pool_on_ext4_snapshots_with_reflink() {
     net::remove_network(&tools, BRIDGE)
         .await
         .expect("remove the network");
+}
+
+/// M5b: the warm volume calls a replication round uses (§3.22). Two snapshots
+/// of a running VM's volume are shipped into a second volume the way a target
+/// does it: a full copy into an empty staging file, then the changed ranges
+/// into a clone of the last good copy. The second volume ends up byte for byte
+/// equal to the second snapshot. A running VM also pauses and resumes, and a
+/// paused VM stops.
+#[tokio::test]
+#[ignore = "needs /dev/kvm, root and the pinned artifacts on the lab host"]
+async fn warm_volume_calls() {
+    if !enter_lab() {
+        return;
+    }
+    let _guard = Guard::new();
+    let engine = new_engine().await;
+    let rootfs = prepare(&engine).await;
+    let method = engine
+        .capabilities()
+        .await
+        .volume_snapshot_method
+        .expect("the engine has volumes");
+
+    let source = VolumeId("vol_01JD0WARM5SRC0000000000000".to_string());
+    let target = VolumeId("vol_01JD0WARM5TGT0000000000000".to_string());
+    engine.ensure_volume(&source, 1).await.expect("ensure");
+
+    let id = VmId("vm_w5b_warm".to_string());
+    let mut spec = console_spec(&id, &rootfs, "10.77.0.18", "sleep 300", 18);
+    spec.volumes = vec![VolumeAttach {
+        volume_id: source.clone(),
+        mount_path: "/data".to_string(),
+        serial: "quoro-vol-0".to_string(),
+    }];
+    spec.vsock = Some(VsockAttach {
+        cid: 3,
+        socket: vm_dir(&id).join("vsock.sock"),
+    });
+    engine.create(&spec).await.expect("create with a volume");
+    start_vm(&engine, &id).await;
+
+    // A paused VM still reads Running; pausing twice and resuming twice are
+    // no-ops, and the guest answers again after the resume.
+    engine.pause(&id).await.expect("pause");
+    engine.pause(&id).await.expect("pausing a paused VM is Ok");
+    assert_eq!(
+        engine.inspect(&id).await.expect("inspect").state,
+        VmState::Running,
+        "a paused VM reads Running"
+    );
+    engine.resume(&id).await.expect("resume");
+    engine
+        .resume(&id)
+        .await
+        .expect("resuming a running VM is Ok");
+
+    let written = exec_in_guest(
+        &engine,
+        &id,
+        &[
+            "sh",
+            "-c",
+            "dd if=/dev/urandom of=/data/one bs=1M count=8 2>/dev/null && sync",
+        ],
+    )
+    .await;
+    assert!(written.is_empty(), "the first write printed {written:?}");
+    let first = engine.snapshot_volume(&source).await.expect("snapshot 1");
+
+    let written = exec_in_guest(
+        &engine,
+        &id,
+        &[
+            "sh",
+            "-c",
+            "dd if=/dev/urandom of=/data/one bs=4k count=3 seek=100 conv=notrunc 2>/dev/null \
+             && dd if=/dev/urandom of=/data/two bs=1M count=2 2>/dev/null && sync",
+        ],
+    )
+    .await;
+    assert!(written.is_empty(), "the second write printed {written:?}");
+    let second = engine.snapshot_volume(&source).await.expect("snapshot 2");
+
+    // A volume a VM writes to has no stable map.
+    assert!(
+        matches!(
+            engine
+                .volume_changed_ranges(&RangesOf::Volume(source.clone()), None)
+                .await,
+            Err(EngineError::Conflict(_))
+        ),
+        "the ranges of an attached volume are a Conflict"
+    );
+
+    let full = engine
+        .volume_changed_ranges(&RangesOf::Snapshot(first.clone()), None)
+        .await
+        .expect("ranges without a base");
+    assert!(full.full, "no base means a full copy");
+    let delta = engine
+        .volume_changed_ranges(&RangesOf::Snapshot(second.clone()), Some(&first))
+        .await
+        .expect("ranges against the first snapshot");
+    assert!(!delta.full, "two snapshots of one volume compare");
+    assert!(!delta.ranges.is_empty(), "the second write changed blocks");
+    let shipped: u64 = delta.ranges.iter().map(|range| range.length).sum();
+    eprintln!(
+        "method {method:?}: full copy {} bytes in {} ranges, delta {shipped} bytes in {} ranges",
+        full.ranges.iter().map(|range| range.length).sum::<u64>(),
+        full.ranges.len(),
+        delta.ranges.len()
+    );
+    if method == SnapshotMethod::Reflink {
+        assert!(
+            shipped < 64 << 20,
+            "a reflink delta holds the written blocks, not the volume: {shipped} bytes"
+        );
+    }
+
+    // Round 1: a full copy into an empty staging file.
+    let staged = engine
+        .stage_volume(&target, 1, &StageFrom::Empty)
+        .await
+        .expect("stage from empty");
+    assert!(
+        matches!(
+            engine.stage_volume(&target, 1, &StageFrom::Empty).await,
+            Err(EngineError::Conflict(_))
+        ),
+        "one staging file per volume"
+    );
+    copy_ranges(&first.location, &staged.location, &full.ranges);
+    let committed = engine
+        .commit_staged_volume(&staged)
+        .await
+        .expect("commit round 1");
+    assert!(
+        !staged.location.exists(),
+        "the commit renames the staging file"
+    );
+    assert_same_bytes(&committed.path, &first.location);
+
+    // Round 2: the delta into a clone of the last good copy.
+    let staged = engine
+        .stage_volume(&target, 1, &StageFrom::Volume)
+        .await
+        .expect("stage from the volume");
+    copy_ranges(&second.location, &staged.location, &delta.ranges);
+    // A discarded staging file leaves the last good copy alone.
+    engine
+        .discard_staged_volume(&staged)
+        .await
+        .expect("discard");
+    assert_same_bytes(&committed.path, &first.location);
+    let staged = engine
+        .stage_volume(&target, 1, &StageFrom::Volume)
+        .await
+        .expect("stage again");
+    copy_ranges(&second.location, &staged.location, &delta.ranges);
+    let committed = engine
+        .commit_staged_volume(&staged)
+        .await
+        .expect("commit round 2");
+    assert_same_bytes(&committed.path, &second.location);
+
+    // A volume a VM uses is never replaced under it.
+    let staged = engine
+        .stage_volume(&source, 1, &StageFrom::Snapshot(first.clone()))
+        .await
+        .expect("stage the attached volume from a snapshot");
+    assert!(
+        matches!(
+            engine.commit_staged_volume(&staged).await,
+            Err(EngineError::Conflict(_))
+        ),
+        "committing over an attached volume is a Conflict"
+    );
+    engine
+        .discard_staged_volume(&staged)
+        .await
+        .expect("discard");
+
+    // A paused VM writes nothing more: writes in flight when it paused have
+    // landed, so two snapshots taken while it stays paused under a write
+    // load are equal. A switchover's final snapshot relies on it.
+    if method == SnapshotMethod::Reflink {
+        let started = exec_in_guest(
+            &engine,
+            &id,
+            &[
+                "sh",
+                "-c",
+                "setsid sh -c 'while true; do dd if=/dev/urandom of=/data/load bs=64k count=64 \
+                 conv=notrunc 2>/dev/null; sync; done' >/dev/null 2>&1 & echo started",
+            ],
+        )
+        .await;
+        assert!(
+            started.contains("started"),
+            "the writer printed {started:?}"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        engine.pause(&id).await.expect("pause under a write load");
+        let frozen = engine.snapshot_volume(&source).await.expect("snapshot");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let later = engine.snapshot_volume(&source).await.expect("snapshot");
+        let drift = engine
+            .volume_changed_ranges(&RangesOf::Snapshot(later.clone()), Some(&frozen))
+            .await
+            .expect("ranges between the two");
+        assert!(
+            drift.ranges.is_empty(),
+            "the paused VM wrote after the pause: {:?}",
+            drift.ranges
+        );
+        for snapshot in [&frozen, &later] {
+            engine
+                .delete_volume_snapshot(snapshot)
+                .await
+                .expect("delete a snapshot");
+        }
+    }
+
+    // A paused VM cannot answer the power button: its graceful stop goes
+    // straight to the shutdown instead of waiting out the timeout.
+    engine.pause(&id).await.expect("pause before the stop");
+    let started = std::time::Instant::now();
+    engine
+        .stop(
+            &id,
+            StopMode::Graceful {
+                timeout: Duration::from_secs(10),
+            },
+        )
+        .await
+        .expect("stop a paused VM");
+    let took = started.elapsed();
+    eprintln!("a paused VM stopped in {took:?}");
+    assert!(
+        took < Duration::from_secs(10),
+        "the stop of a paused VM waited out its graceful timeout: {took:?}"
+    );
+    assert_eq!(
+        engine.inspect(&id).await.expect("inspect").state,
+        VmState::Stopped
+    );
+    engine.delete(&id).await.expect("delete");
+    assert_no_leftovers(&id);
+
+    for snapshot in [&first, &second] {
+        engine
+            .delete_volume_snapshot(snapshot)
+            .await
+            .expect("delete a snapshot");
+    }
+    for volume in [&source, &target] {
+        engine.delete_volume(volume).await.expect("delete a volume");
+    }
+    let tools = HostTools::discover().expect("host tools");
+    net::remove_network(&tools, BRIDGE)
+        .await
+        .expect("remove the network");
+}
+
+/// Copies `ranges` of `from` into the same offsets of `to`, as a target applies
+/// block frames, then syncs `to`.
+fn copy_ranges(from: &Path, to: &Path, ranges: &[quoro_engine::ByteRange]) {
+    use std::os::unix::fs::FileExt as _;
+    let source = std::fs::File::open(from).expect("open the snapshot");
+    let target = std::fs::OpenOptions::new()
+        .write(true)
+        .open(to)
+        .expect("open the staging file");
+    let mut buf = vec![0_u8; 1 << 20];
+    for range in ranges {
+        let mut offset = range.offset;
+        let end = range.offset + range.length;
+        while offset < end {
+            let len = usize::try_from((end - offset).min(1 << 20)).expect("a chunk fits");
+            source
+                .read_exact_at(&mut buf[..len], offset)
+                .expect("read the snapshot");
+            target
+                .write_all_at(&buf[..len], offset)
+                .expect("write the staging file");
+            offset += len as u64;
+        }
+    }
+    target.sync_all().expect("sync the staging file");
+}
+
+/// Asserts that two files hold the same bytes.
+fn assert_same_bytes(a: &Path, b: &Path) {
+    use std::io::Read as _;
+    let mut left = std::fs::File::open(a).expect("open");
+    let mut right = std::fs::File::open(b).expect("open");
+    assert_eq!(
+        left.metadata().expect("metadata").len(),
+        right.metadata().expect("metadata").len(),
+        "{} and {} differ in length",
+        a.display(),
+        b.display()
+    );
+    let mut l = vec![0_u8; 1 << 20];
+    let mut r = vec![0_u8; 1 << 20];
+    let mut offset = 0_u64;
+    loop {
+        let n = left.read(&mut l).expect("read");
+        if n == 0 {
+            break;
+        }
+        right.read_exact(&mut r[..n]).expect("read");
+        assert!(
+            l[..n] == r[..n],
+            "{} and {} differ near offset {offset}",
+            a.display(),
+            b.display()
+        );
+        offset += n as u64;
+    }
 }
 
 /// Runs `argv` in the guest over the exec channel and returns its output.

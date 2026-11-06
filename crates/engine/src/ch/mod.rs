@@ -16,9 +16,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{
-    Capabilities, ConsoleStream, Engine, EngineError, EventStream, HostProbe, ImageDigest,
-    ImageInventory, ImageRef, LineStream, NodeNetwork, OciLayout, PreparedImage, StopMode,
-    VmCounters, VmId, VmInfo, VmSpec, VolumeId, VolumeInfo, VolumeSnapshot,
+    Capabilities, ChangedRanges, ConsoleStream, Engine, EngineError, EventStream, HostProbe,
+    ImageDigest, ImageInventory, ImageRef, LineStream, NodeNetwork, OciLayout, PreparedImage,
+    RangesOf, StageFrom, StagedVolume, StopMode, VmCounters, VmId, VmInfo, VmSpec, VolumeId,
+    VolumeInfo, VolumeSnapshot,
 };
 
 pub mod api;
@@ -37,6 +38,7 @@ mod serial;
 mod stream;
 mod supervise;
 mod volume;
+mod warm;
 
 use engine::Inner;
 
@@ -249,6 +251,39 @@ impl Engine for ChEngine {
 
     async fn delete_volume_snapshot(&self, snapshot: &VolumeSnapshot) -> Result<(), EngineError> {
         self.inner.delete_volume_snapshot(snapshot).await
+    }
+
+    async fn volume_changed_ranges(
+        &self,
+        newer: &RangesOf,
+        base: Option<&VolumeSnapshot>,
+    ) -> Result<ChangedRanges, EngineError> {
+        self.inner.volume_changed_ranges(newer, base).await
+    }
+
+    async fn stage_volume(
+        &self,
+        id: &VolumeId,
+        size_gb: u32,
+        from: &StageFrom,
+    ) -> Result<StagedVolume, EngineError> {
+        self.inner.stage_volume(id, size_gb, from).await
+    }
+
+    async fn commit_staged_volume(&self, staged: &StagedVolume) -> Result<VolumeInfo, EngineError> {
+        self.inner.commit_staged_volume(staged).await
+    }
+
+    async fn discard_staged_volume(&self, staged: &StagedVolume) -> Result<(), EngineError> {
+        self.inner.discard_staged_volume(staged).await
+    }
+
+    async fn pause(&self, id: &VmId) -> Result<(), EngineError> {
+        self.inner.pause(id).await
+    }
+
+    async fn resume(&self, id: &VmId) -> Result<(), EngineError> {
+        self.inner.resume(id).await
     }
 }
 

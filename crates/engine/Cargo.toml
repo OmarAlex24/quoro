@@ -63,6 +63,11 @@ rustix = { version = "1.1", default-features = false, features = [
     "fs",
     "process",
 ] }
+# `FS_IOC_FIEMAP` for `volume_changed_ranges` (engine-trait.md §3.22, ADR
+# 0172): the extent maps of two reflink snapshots. rustix has no FIEMAP
+# wrapper and its raw `ioctl` is `unsafe` to implement, which the workspace
+# forbids; this crate is the ioctl and its structs, nothing else.
+fiemap = "0.2.1"
 
 [dev-dependencies]
 # Tests need the `#[tokio::test]` macro, a runtime, and the paused clock

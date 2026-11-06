@@ -1012,6 +1012,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
+name = "fiemap"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5df22ec34db45457baae5bc0f70f622adbf7aa2408e102fc94409ac47586e7bd"
+dependencies = [
+ "bitflags",
+]
+
+[[package]]
 name = "filetime"
 version = "0.2.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2421,6 +2430,7 @@ dependencies = [
 name = "quoro-engine"
 version = "0.2.0"
 dependencies = [
+ "fiemap",
  "flate2",
  "futures-core",
  "oci-client",
