@@ -10,7 +10,7 @@ Each entry links the pull request that made the change and, where one exists, th
 
 - **Warm volume calls in the engine.** The engine trait gains the calls warm replication is built on: `volume_changed_ranges` compares the extent maps of two reflink snapshots of a volume and returns only the byte ranges that differ (a full copy when there is no base or the maps cannot be compared), `stage_volume`, `commit_staged_volume` and `discard_staged_volume` build a volume's next copy beside the last good one and swap it in with one rename, and `pause` and `resume` freeze a running VM. A volume can now keep several snapshots, each in its own file. Nothing calls these yet; replication between nodes comes next ([#389], [#390], [ADR 0172], [ADR 0173]).
 
-- **Acknowledging a failed self-fence.** When a node cannot confirm that a VM stopped during a self-fence, including when it cannot list the engine's VMs, it marks itself failed and starts nothing stateful. Until now nothing could clear that mark, and the primary did not record the failure, so it could grant the lease again. The primary now lists the lease, app and VM ids in the node's `fence_failure` (`GET /api/v1/nodes/{node_id}`) and grants none of those leases until a human calls `POST /api/v1/nodes/{node_id}/fence-ack` with exactly the listed lease ids, after checking out of band that the VMs are stopped. Agents are refused with `human_only`, and the call is audited. The acknowledgement increments each lease's fencing token and reaches the node at once, or at its next session before its desired state; the node then clears those failed fences, and its failed mark once none remains ([#PRB], [#391], [#399], [ADR 0074], [ADR 0079]).
+- **Acknowledging a failed self-fence.** When a node cannot confirm that a VM stopped during a self-fence, including when it cannot list the engine's VMs, it marks itself failed and starts nothing stateful. Until now nothing could clear that mark, and the primary did not record the failure, so it could grant the lease again. The primary now lists the lease, app and VM ids in the node's `fence_failure` (`GET /api/v1/nodes/{node_id}`) and grants none of those leases until a human calls `POST /api/v1/nodes/{node_id}/fence-ack` with exactly the listed lease ids, after checking out of band that the VMs are stopped. Agents are refused with `human_only`, and the call is audited. The acknowledgement increments each lease's fencing token and reaches the node at once, or at its next session before its desired state; the node then clears those failed fences, and its failed mark once none remains ([#423], [#391], [#399], [ADR 0074], [ADR 0079]).
 
 ### Fixed
 
@@ -396,7 +396,7 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#418]: https://github.com/OmarAlex24/quoro/issues/418
 [#420]: https://github.com/OmarAlex24/quoro/pull/420
 [#422]: https://github.com/OmarAlex24/quoro/pull/422
-[#PRB]: https://github.com/OmarAlex24/quoro/pull/PRB
+[#423]: https://github.com/OmarAlex24/quoro/pull/423
 [ADR 0019]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0019-fencing-is-mandatory-and-lease-based-node-agent-self-fences.md
 [ADR 0020]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0020-per-app-ha-policies-none-cold-warm-hot-with-cost-shown-in.md
 [ADR 0027]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0027-signed-binaries-and-reproducible-builds-are-mandatory.md
