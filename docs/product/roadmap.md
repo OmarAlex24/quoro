@@ -15,7 +15,7 @@ This turns D-0033 into a gated plan and adds no features: where another decision
 | M2 — Deploy | Done | [v0.0.2](https://github.com/OmarAlex24/quoro/releases/tag/v0.0.2) | [M2](https://github.com/OmarAlex24/quoro/milestone/3) |
 | M3 — AI-native | Done | [v0.1.0](https://github.com/OmarAlex24/quoro/releases/tag/v0.1.0) | [M3](https://github.com/OmarAlex24/quoro/milestone/4) |
 | M4 — Full experience | Done | [v0.1.0](https://github.com/OmarAlex24/quoro/releases/tag/v0.1.0) | [M4](https://github.com/OmarAlex24/quoro/milestone/5) |
-| M5a — Stateless HA and backups | In progress (demo pending) | Not released yet; its groundwork is in [v0.1.1](https://github.com/OmarAlex24/quoro/releases/tag/v0.1.1) | [M5a](https://github.com/OmarAlex24/quoro/milestone/6) |
+| M5a — Stateless HA and backups | Done (demo approved on 2026-11-05) | [v0.2.0](https://github.com/OmarAlex24/quoro/releases/tag/v0.2.0) | [M5a](https://github.com/OmarAlex24/quoro/milestone/6) |
 | M5b — Witness, leases and warm replication | Planned | — | [M5b](https://github.com/OmarAlex24/quoro/milestone/7) |
 | M6 — Automatic failover and hot | Planned | — | [M6](https://github.com/OmarAlex24/quoro/milestone/8) |
 
@@ -308,20 +308,20 @@ D-0016 places manual promotion of a replica node to primary in M5, and it ships 
 
 #### Definition of Done
 
-- [ ] With lab-1 and lab-2 as nodes and lab-3 as the edge, a stateless app runs two app replicas, one on each node, and the edge sends traffic to both.
-- [ ] Power off lab-1; the app still answers 200 on its domain through the edge on lab-3, served by the app replica on lab-2 [D-0020].
-- [ ] On lab-1, a volume is created and attached to an app; data written to it survives a redeploy [D-0052].
-- [ ] With lab-1 back, take a `cold` backup of a stateful app running on lab-1 to an S3-compatible bucket, then restore it onto lab-2 and confirm the restored app serves the data that was present at backup time [D-0020, D-0023].
-- [ ] On lab-1, the panel shows the `cold` policy's cost for the app, and switching the policy changes the shown cost [D-0020].
-- [ ] On lab-3, an edge health check removes lab-1 from rotation after lab-1 is powered off, and adds it back after lab-1 returns.
-- [ ] On lab-1, one audit segment is exported with object lock to a bucket; an overwrite or delete of it is refused; truncating the tail of the local audit log is detected against the exported copy [D-0031, D-0053].
+- [x] With lab-1 and lab-2 as nodes and lab-3 as the edge, a stateless app runs two app replicas, one on each node, and the edge sends traffic to both.
+- [x] Power off lab-1; the app still answers 200 on its domain through the edge on lab-3, served by the app replica on lab-2 [D-0020]. (In the demo, the outage was simulated by stopping lab-1's node agent and killing the replica's VM process.)
+- [x] On lab-1, a volume is created and attached to an app; data written to it survives a redeploy [D-0052].
+- [x] With lab-1 back, take a `cold` backup of a stateful app running on lab-1 to an S3-compatible bucket, then restore it onto lab-2 and confirm the restored app serves the data that was present at backup time [D-0020, D-0023].
+- [x] On lab-1, the panel shows the `cold` policy's cost for the app, and switching the policy changes the shown cost [D-0020].
+- [x] On lab-3, an edge health check removes lab-1 from rotation after lab-1 is powered off, and adds it back after lab-1 returns. (Simulated the same way.)
+- [x] On lab-1, one audit segment is exported with object lock to a bucket; an overwrite or delete of it is refused; truncating the tail of the local audit log is detected against the exported copy [D-0031, D-0053].
 
 #### Demo script
 
 1. Set up lab-1 and lab-2 as nodes and lab-3 as edge.
 2. Deploy a stateless app with two app replicas and request its domain several times. Expected: the panel lists both replicas on different nodes, and responses come from both (each instance identifies itself).
-3. Power off lab-1. Expected: the domain keeps answering 200, requests land on lab-2 only.
-4. Power lab-1 back on and wait for the node to reconnect. Expected: the edge sends traffic to it again.
+3. Power off lab-1. Expected: the domain keeps answering 200, requests land on lab-2 only. (In the demo, the outage was simulated by stopping lab-1's node agent and killing the replica's VM process.)
+4. Power lab-1 back on and wait for the node to reconnect. Expected: the edge sends traffic to it again. (In the demo, the node agent was started again.)
 5. Take a `cold` backup of a stateful app to the bucket, then restore it on lab-2. Expected: the restored app serves the backed-up data.
 6. Create a volume, attach it to an app and write a file to it; redeploy the app. Expected: the file is still there after the redeploy [D-0052].
 7. Export one audit segment with object lock to the bucket, then try to overwrite or delete it. Expected: both are refused; truncating the tail of the local audit log is detected against the exported copy [D-0031, D-0053].
