@@ -1,9 +1,11 @@
 import { Scope } from '../api/generated/model';
 
 /**
- * Scope classes from permission-model.md, sections 4.1 and 4.2. A standard
- * grant and a webhook's incident grant may carry neither class: the server
- * refuses them with `validation_failed`, and the panel never offers them.
+ * Scope classes from permission-model.md, sections 4.1 and 4.2, in the order
+ * the contract lists them. A standard grant and a webhook's incident grant may
+ * carry neither class: the server refuses them with `validation_failed`, and
+ * the panel never offers them. `scopes.test.ts` reads both lists from the
+ * contract, so a scope added there and not here fails the panel's tests.
  */
 export const HUMAN_ONLY_SCOPES: ReadonlySet<Scope> = new Set<Scope>([
   'node:enroll',
@@ -11,6 +13,9 @@ export const HUMAN_ONLY_SCOPES: ReadonlySet<Scope> = new Set<Scope>([
   'node:fence_ack',
   'node:roles',
   'node:declare_lost',
+  'app:terminal',
+  'app:delete_quarantine',
+  'backup:manage',
   'agent:write',
   'grant:write',
   'approval:decide',
@@ -18,7 +23,6 @@ export const HUMAN_ONLY_SCOPES: ReadonlySet<Scope> = new Set<Scope>([
   'provider:manage',
   'user:read',
   'user:write',
-  'app:delete_quarantine',
 ]);
 
 export const DESTRUCTIVE_SCOPES: ReadonlySet<Scope> = new Set<Scope>([
@@ -26,6 +30,7 @@ export const DESTRUCTIVE_SCOPES: ReadonlySet<Scope> = new Set<Scope>([
   'project:delete',
   'vm:delete',
   'app:delete',
+  'backup:restore',
   'app:failover',
   'app:delete_quarantine',
 ]);
