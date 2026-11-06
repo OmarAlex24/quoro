@@ -13,6 +13,7 @@ Each entry links the pull request that made the change and, where one exists, th
 - An edge reported a backend leaving or rejoining the rotation to the primary only with its next periodic status report, so the API and the panel could lag the edge by up to 30 s. The edge now sends a status report as soon as its backend list changes. A backend's `last_error` now names the backend and the root cause, in the same words whether the proxy or a health probe saw the failure, instead of `client error (Connect)` or `client error (SendRequest)` ([#369], [ADR 0143]).
 - While a node was disconnected, the app's Instances list and the VM API kept showing its instances as `running`, the status the node last reported. The API now shows them as `unknown` until the node is connected again, and the panel says why: `unknown (node disconnected)`. Nothing is written for it: the primary keeps the last report, so a disconnect or a primary restart emits no event and changes no deployment ([#377]).
 - A node reported a newly applied revision to the primary only with its next periodic status report, unless the revision also changed a VM or a route, so `applied_rev` in the API could lag by up to 30 s, on an edge above all. The node now sends a status report about 250 ms after it applies a revision ([#379]).
+- A terminal command that finished before the client's WebSocket attached could not be read: the upgrade answered `401`, as if the ticket were bad, and the command's output and exit code were lost. A command with no output that exited within about a second was refused with `409`. The session now keeps the output and the exit until its ticket expires, so the client receives them, then `exit` and `closed`, and the audit record shows the session as connected ([#381], [ADR 0186]).
 
 ## [v0.2.0] - 2026-11-05
 
@@ -366,6 +367,7 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#369]: https://github.com/OmarAlex24/quoro/pull/369
 [#377]: https://github.com/OmarAlex24/quoro/pull/377
 [#379]: https://github.com/OmarAlex24/quoro/pull/379
+[#381]: https://github.com/OmarAlex24/quoro/pull/381
 [ADR 0019]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0019-fencing-is-mandatory-and-lease-based-node-agent-self-fences.md
 [ADR 0020]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0020-per-app-ha-policies-none-cold-warm-hot-with-cost-shown-in.md
 [ADR 0027]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0027-signed-binaries-and-reproducible-builds-are-mandatory.md
@@ -432,3 +434,4 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [ADR 0161]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0161-m5a-quoro-component-findings-match-crates-crates-io-guest.md
 [ADR 0162]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0162-evaluate-linux-kernel-osv-ranges-per-stable-series-when-a.md
 [ADR 0163]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0163-inventory-images-prepared-before-m5a-from-their-cached-root.md
+[ADR 0186]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0186-add-287-old-node-recreates-a-moved-app-s-vm-and-240.md
