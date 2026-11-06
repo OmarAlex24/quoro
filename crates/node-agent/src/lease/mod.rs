@@ -4,16 +4,19 @@
 //!
 //! - [`machine`] is pure: no I/O, no async, no clock reads.
 //! - [`fence`] stops the VMs bound to a lost lease within the margin.
-//! - [`store`] is what survives an agent restart.
+//! - [`store`] is what survives an agent restart, and [`clock`] how a held
+//!   `expiring` lease's validity survives it within the same host boot.
 //! - [`agent`] is the async driver that ties them together.
 
 mod agent;
+mod clock;
 mod fence;
 mod machine;
 mod service;
 mod store;
 
 pub use agent::{LeaseAgent, LeaseAgentConfig};
+pub use clock::{HostClock, HostNow, ManualHostClock, StoredValidity, SystemHostClock};
 pub use fence::{FenceReport, FenceTimers, VmFenceOutcome, budget_for, stop_vms};
 pub use machine::{
     Action, Lease, LeaseState, LeaseTable, MIN_DURATION, Refusal, RevokeOutcome, margin,

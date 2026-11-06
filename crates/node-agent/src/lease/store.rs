@@ -15,6 +15,7 @@ use std::time::{Duration, SystemTime};
 use quoro_engine::VmId;
 use quoro_proto::{FenceReason, LeaseId, LeaseMode, ResourceType};
 
+use crate::lease::clock::{HostNow, StoredValidity};
 use crate::lease::machine::{Lease, LeaseState};
 
 /// One lease row as it survives a restart (section 12 `leases`).
@@ -34,12 +35,23 @@ pub struct StoredLease {
     pub state: LeaseState,
     /// `duration_ms` of the grant; `None` for `local`.
     pub duration: Option<Duration>,
+    /// For a `held` or `uncertain` `expiring` lease with a known
+    /// `valid_until`: that deadline on `CLOCK_BOOTTIME` with the boot it
+    /// belongs to (section 8.4 "Agent restart", ADR 0072). `None` otherwise,
+    /// and on a host that cannot tell its boot.
+    pub validity: Option<StoredValidity>,
 }
 
 impl StoredLease {
-    /// The row for one tracked lease.
+    /// The row for one tracked lease, its validity converted with `now`.
     #[must_use]
-    pub fn from_lease(lease: &Lease) -> Self {
+    pub fn from_lease(lease: &Lease, now: &HostNow) -> Self {
+        let validity = match (lease.mode, lease.state, lease.valid_until) {
+            (LeaseMode::Expiring, LeaseState::Held | LeaseState::Uncertain, Some(until)) => {
+                now.store(until)
+            }
+            _ => None,
+        };
         Self {
             lease_id: lease.id.clone(),
             resource_type: lease.resource_type,
@@ -48,6 +60,7 @@ impl StoredLease {
             token: lease.token,
             state: lease.state,
             duration: lease.duration,
+            validity,
         }
     }
 }

@@ -78,7 +78,7 @@ tar = { version = "0.4", default-features = false }
 # Linux build uses them.
 # `statvfs` for `status_report.disk_free_gb` without `unsafe`; already in the
 # lock file through the engine.
-rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }
+rustix = { version = "1.1", default-features = false, features = ["std", "fs", "time"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 genetlink = "0.3.1"

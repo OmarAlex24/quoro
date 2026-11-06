@@ -941,6 +941,15 @@ impl<E: Engine + 'static> Reconciler<E> {
                 (Some(lease_id), Some(token)) if self.lease.may_start_stateful(lease_id, token)
             );
         let may_start = volumes_ready && lease_allowed;
+        // Section 8.4: an `uncertain` lease keeps the VMs that already run and
+        // starts nothing new, so a running stateful VM is stopped only when its
+        // lease no longer stands behind it.
+        let may_keep_running = volumes_ready
+            && (!vm.stateful
+                || matches!(
+                    (&vm.lease_id, vm.fencing_token),
+                    (Some(lease_id), Some(token)) if self.lease.may_keep_running(lease_id, token)
+                ));
 
         if info.is_none() {
             if !volumes_ready {
@@ -969,7 +978,8 @@ impl<E: Engine + 'static> Reconciler<E> {
             if matches!(
                 info.state,
                 VmState::Running | VmState::Starting | VmState::Stopping
-            ) {
+            ) && !may_keep_running
+            {
                 match self.stop_vm(&id).await {
                     Ok(stopped) => info = stopped,
                     Err(e) => {
@@ -983,7 +993,8 @@ impl<E: Engine + 'static> Reconciler<E> {
                 stateful = vm.stateful,
                 volumes_ready,
                 lease_allowed,
-                "the VM waits to start"
+                may_keep_running,
+                "the VM waits to start, or keeps running without restarts"
             );
             self.remember(&vm_id, info.state);
             return true;

@@ -941,3 +941,108 @@ async fn a_revoke_of_a_lease_already_fenced_stops_nothing() {
     assert_eq!(store.load_highest_tokens().await.unwrap()[0].1, 2);
     leases.abort();
 }
+
+/// Section 8.4 "Agent restart" with no renewal loop yet in this service: a
+/// stored `held` expiring lease is fenced at start and written back
+/// `expired`, whatever validity it stored.
+#[tokio::test]
+async fn a_stored_expiring_lease_is_fenced_until_the_renewal_loop_exists() {
+    let dir = TargetDir::new("lease-expiring-restore");
+    let engine = Arc::new(FakeEngine::new());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    // On Linux the validity is a real one: this boot, 10 s left, which a
+    // restore on the host clock would keep. Elsewhere the host has no boot
+    // id, and a made-up one stands in.
+    let host = quoro_node_agent::HostNow::read(&quoro_node_agent::SystemHostClock);
+    let validity = host
+        .store(host.instant + Duration::from_secs(10))
+        .unwrap_or(quoro_node_agent::StoredValidity {
+            boot_id: "boot-a".to_owned(),
+            until_boottime: Duration::from_secs(10),
+        });
+    store
+        .save_lease(
+            &quoro_node_agent::StoredLease {
+                lease_id: LeaseId("lse_warm".to_owned()),
+                resource_type: ResourceType::App,
+                resource_id: "app_warm".to_owned(),
+                mode: LeaseMode::Expiring,
+                token: 4,
+                state: LeaseState::Held,
+                duration: Some(Duration::from_millis(15_000)),
+                validity: Some(validity),
+            },
+            4,
+        )
+        .await
+        .unwrap();
+    let snapshot = snapshot_full(
+        1,
+        vec![stateful_vm("vm_warm", "lse_warm", 4, Vec::new())],
+        Vec::new(),
+        Vec::new(),
+    );
+    let vm = common::running_vm(&engine, "vm_warm", 2).await;
+    let (desired, _) = watch::channel(Some(snapshot));
+    let (leases, store) = start(&dir, engine.clone(), &desired).await;
+    assert_eq!(leases.view.state("lse_warm"), Some(LeaseState::Expired));
+    let rows = store.load_leases().await.unwrap();
+    assert_eq!(rows[0].state, LeaseState::Expired);
+    assert_eq!(
+        rows[0].validity, None,
+        "no validity is kept for a fenced lease"
+    );
+    wait_for("the restore fence", || stops_of(&engine, &vm) > 0).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while store.fences().await.unwrap().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the fence is recorded"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Stopped);
+    leases.abort();
+}
+
+/// Section 12 `leases`: a database an older agent created gains the validity
+/// columns, its rows load with none, and a stored validity reads back exactly.
+#[tokio::test]
+async fn the_lease_table_of_an_older_agent_gains_the_validity_columns() {
+    let dir = TargetDir::new("lease-migrate");
+    {
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(dir.path().join("node.db"))
+            .create_if_missing(true);
+        let pool = sqlx::SqlitePool::connect_with(options).await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE leases (lease_id TEXT PRIMARY KEY, resource_type TEXT NOT NULL, \
+             resource_id TEXT NOT NULL, mode TEXT NOT NULL, token INTEGER NOT NULL, \
+             state TEXT NOT NULL, duration_ms INTEGER); \
+             INSERT INTO leases VALUES ('lse_old', 'app', 'app_old', 'local', 3, 'held', NULL);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+    }
+    let store = NodeStore::open(dir.path()).await.expect("the store opens");
+    let rows = store.load_leases().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].lease_id, LeaseId("lse_old".to_owned()));
+    assert_eq!(rows[0].validity, None);
+
+    let validity = quoro_node_agent::StoredValidity {
+        boot_id: "boot-a".to_owned(),
+        until_boottime: Duration::from_nanos(1_234_567_890_123),
+    };
+    let mut row = rows[0].clone();
+    row.mode = LeaseMode::Expiring;
+    row.duration = Some(Duration::from_millis(15_000));
+    row.validity = Some(validity.clone());
+    store.save_lease(&row, 3).await.unwrap();
+    assert_eq!(
+        store.load_leases().await.unwrap()[0].validity,
+        Some(validity)
+    );
+}
