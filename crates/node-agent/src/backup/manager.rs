@@ -1073,6 +1073,7 @@ mod tests {
             size_gb: 1,
             state: SpecVolumeState::Present,
             restore,
+            warm: None,
         }
     }
 

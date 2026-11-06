@@ -251,6 +251,7 @@ fn status_report(applied_rev: u64, volumes: Vec<VolumeStatus>) -> NodeMessage {
         backups: Vec::new(),
         images: Vec::new(),
         volumes,
+        warm: Vec::new(),
     })
 }
 

@@ -48,7 +48,7 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = ["h
 # `StreamExt`/`SinkExt` on the WebSocket.
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 # The enrollment POST over the same pinned TLS stream (section 2.3).
-hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper = { version = "1", default-features = false, features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 http-body-util = { version = "0.1", default-features = false }
 # The local node store (section 12) is SQLite, like the control plane's.

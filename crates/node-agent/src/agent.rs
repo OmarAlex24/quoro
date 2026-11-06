@@ -36,6 +36,8 @@ use crate::reconcile::{ReconcileConfig, ReconcileOptions, Reconciler, Snapshot};
 use crate::session::{Session, SessionSetup, wait_stop};
 use crate::store::NodeStore;
 use crate::transcript::{self, TranscriptLimits};
+use crate::warm::receiver::{ReceiverOptions, WarmReceiver};
+use crate::warm::{StatusBoard, VolumeLocks};
 use crate::{AgentConfig, AgentError, NodeFacts, util};
 
 /// Runs the node until `shutdown` resolves.
@@ -128,7 +130,11 @@ pub async fn run<E: Engine + 'static>(
         },
         ReconcileOptions::default(),
     );
+    // One lock per warm volume, shared by the warm receiver and the
+    // reconciler (section 6.13).
+    let warm_locks = VolumeLocks::new();
     let reconciler = reconciler
+        .with_warm_locks(warm_locks.clone())
         .with_node_id(node_id)
         .with_lease_view(leases.view.clone())
         .with_ingress(Arc::clone(&ingress))
@@ -168,6 +174,19 @@ pub async fn run<E: Engine + 'static>(
         cluster_id,
     );
 
+    // Warm replication (section 6.13): the receiver holds the copies this
+    // node is the target of. Its status entries go out in
+    // `status_report.warm`.
+    let (warm_board, warm_statuses) = StatusBoard::new();
+    let warm_receiver = WarmReceiver::new(
+        Arc::clone(&engine),
+        store.clone(),
+        desired.subscribe(),
+        warm_locks,
+        warm_board,
+        ReceiverOptions::default(),
+    );
+
     let (stop, stop_rx) = watch::channel(false);
     let shutdown_stop = stop.clone();
     let shutdown_task = tokio::spawn(async move {
@@ -187,6 +206,7 @@ pub async fn run<E: Engine + 'static>(
         tokio::spawn(Arc::clone(&edge).run(desired.subscribe(), wait_stop(stop_rx.clone())));
     let backup_task =
         tokio::spawn(backup_manager.run(desired.subscribe(), wait_stop(stop_rx.clone())));
+    let warm_task = tokio::spawn(warm_receiver.run(wait_stop(stop_rx.clone())));
 
     // Terminal transcripts are pruned at agent start and then hourly; each
     // terminal session also prunes once it ends (section 3.3).
@@ -226,6 +246,7 @@ pub async fn run<E: Engine + 'static>(
     .with_volumes(volume_statuses)
     .with_disk_free_path(config.data_dir.clone())
     .with_backups(backup_statuses)
+    .with_warm(warm_statuses)
     .with_ingress(Arc::clone(&ingress), dns)
     .with_metrics(metrics)
     .with_edge(Arc::clone(&edge))
@@ -244,6 +265,7 @@ pub async fn run<E: Engine + 'static>(
     let _ = mesh_task.await;
     let _ = edge_task.await;
     let _ = backup_task.await;
+    let _ = warm_task.await;
     ingress.shutdown().await;
     shutdown_task.abort();
     outcome

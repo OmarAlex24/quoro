@@ -571,6 +571,7 @@ async fn load_node_volumes(
             size_gb: u32::try_from(size_gb).map_err(|e| format!("volumes.size_gb: {e}"))?,
             state: spec_state,
             restore: None,
+            warm: None,
         });
     }
     Ok((files, attachments))

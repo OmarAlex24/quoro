@@ -412,6 +412,7 @@ fn status_report(applied_rev: u64, volumes: Vec<VolumeStatus>) -> NodeMessage {
         edge_backends: Vec::new(),
         backups: Vec::new(),
         images: Vec::new(),
+        warm: Vec::new(),
         volumes,
     })
 }
@@ -742,6 +743,7 @@ async fn run_backup(setup: &mut Setup, data: &[u8]) -> String {
             }],
             volumes: Vec::new(),
             images: Vec::new(),
+            warm: Vec::new(),
         }),
     )
     .await;

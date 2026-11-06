@@ -1191,6 +1191,7 @@ async fn dns_challenges_are_written_by_the_primary_for_the_owning_node() {
             edge_backends: Vec::new(),
             backups: Vec::new(),
             images: Vec::new(),
+            warm: Vec::new(),
             volumes: Vec::new(),
         }),
     )

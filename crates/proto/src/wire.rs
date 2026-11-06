@@ -375,6 +375,50 @@ pub struct StatusReport {
     /// (section 5.3, ADR 0150). Added in M5a; absent when there is none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ImageStatus>,
+    /// One entry per volume of `spec.volumes` that carries `warm`, on the
+    /// source and on the target (sections 5.3 and 6.13, ADR 0173). Added in
+    /// M5b; absent when there is none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warm: Vec<WarmStatus>,
+}
+
+/// One entry of `status_report.warm` (section 5.3, section 6.13).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WarmStatus {
+    pub volume_id: String,
+    pub app_id: String,
+    pub role: WarmRole,
+    /// On the target: the newest complete copy it holds. On the source: the
+    /// newest snapshot the target confirmed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_seq: Option<u64>,
+    /// RFC 3339: when the source took that snapshot, from the stream header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_taken_at: Option<String>,
+    /// RFC 3339. On the target: when it swapped that copy in. On the source:
+    /// when the target's confirmation arrived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    /// On the target: bytes its complete copy uses on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocated_bytes: Option<u64>,
+    /// On the source: the extents of the newest snapshot it took.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extent_count: Option<u64>,
+    /// On the source: true while the app's VM is paused by
+    /// `switchover_freeze` (section 5.17).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen: Option<bool>,
+    /// On the target: the token of the last stream it refused as stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected_token: Option<u64>,
+    /// RFC 3339: when the target refused that stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected_at: Option<String>,
+    /// One line on the last failed cycle or stream, at most 500 characters;
+    /// absent once a cycle succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// One entry of `status_report.images` (section 5.3, ADR 0150).
@@ -1009,6 +1053,40 @@ pub struct SpecVolumeFile {
     /// Present only while the volume is `restoring`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore: Option<SpecRestore>,
+    /// On both nodes of a `warm` app: this node's part in replicating the
+    /// volume (sections 5.11 and 6.13, ADR 0173). Added in M5b.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm: Option<SpecWarm>,
+}
+
+/// `role` of `spec.volumes[].warm` (section 5.11).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WarmRole {
+    /// This node holds the app's lease, runs it and ships snapshots.
+    Source,
+    /// This node holds the warm copy and receives them.
+    Target,
+}
+
+/// `spec.volumes[].warm` (section 5.11, section 6.13, ADR 0173).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecWarm {
+    pub role: WarmRole,
+    /// The other node of the pair.
+    pub peer_node_id: String,
+    /// The other node's mesh address; the source dials the target's.
+    pub peer_address: String,
+    /// TCP port of the target's replication listener on its own mesh
+    /// address; 51822 unless the operator changed it.
+    pub port: u16,
+    /// Seconds between two snapshots on the source, 5 to 3 600.
+    pub interval_s: u32,
+    /// The app's lease.
+    pub lease_id: String,
+    /// The lease's current token; the target refuses a stream with a lower
+    /// one.
+    pub fencing_token: u64,
 }
 
 /// `spec.volumes[].restore` (section 5.11, backup-format.md section 8.1).
