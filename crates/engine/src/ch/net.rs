@@ -588,8 +588,9 @@ fn sys_class_net(name: &str) -> std::path::PathBuf {
     Path::new(SYS_CLASS_NET).join(name)
 }
 
-/// Test and teardown helper: removes the bridge's nftables table and then the
-/// bridge itself. Anything already gone is `Ok`.
+/// Test and teardown helper: removes the bridge's two nftables tables, the
+/// `ip` one (forwarding and NAT) and the `bridge` one (isolation between
+/// guests), and then the bridge itself. Anything already gone is `Ok`.
 ///
 /// The engine never calls this; only tests and an explicit node teardown do.
 ///
@@ -599,14 +600,22 @@ fn sys_class_net(name: &str) -> std::path::PathBuf {
 pub async fn remove_network(tools: &HostTools, bridge: &str) -> Result<(), EngineError> {
     let table = table_name(bridge);
     let table = table.as_str();
-    let existing = tools::run(&tools.nft, &["list", "table", "ip", table]).await;
-    if existing.is_ok() {
-        tools::run(&tools.nft, &["delete", "table", "ip", table]).await?;
+    for family in ["ip", "bridge"] {
+        if table_exists(tools, family, table).await {
+            tools::run(&tools.nft, &["delete", "table", family, table]).await?;
+        }
     }
     if interface_exists(bridge) {
         tools::run(&tools.ip, &["link", "del", "dev", bridge]).await?;
     }
     Ok(())
+}
+
+/// Whether nftables has `table <family> <table>`.
+async fn table_exists(tools: &HostTools, family: &str, table: &str) -> bool {
+    tools::run(&tools.nft, &["list", "table", family, table])
+        .await
+        .is_ok()
 }
 
 /// Validates a bridge name: one to fifteen characters of `[A-Za-z0-9_-]`, the
@@ -1103,6 +1112,13 @@ table bridge quoro_qw5br0 {
 
         remove_network(&tools, LAB_BRIDGE).await.expect("teardown");
         assert!(!interface_exists(LAB_BRIDGE));
+        let table = table_name(LAB_BRIDGE);
+        for family in ["ip", "bridge"] {
+            assert!(
+                !table_exists(&tools, family, &table).await,
+                "table {family} {table} is left behind"
+            );
+        }
     }
 
     #[tokio::test]

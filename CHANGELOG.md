@@ -24,6 +24,7 @@ Each entry links the pull request that made the change and, where one exists, th
 - The panel's webhook dialog did not offer the `build`, `backup`, `restore`, `volume` and `domain` events, so they could only be subscribed to through the API. The dialog now offers every event type of the contract, grouped by subject ([#398]).
 - Re-running the installer to upgrade a set-up primary printed `warning: could not read a setup token` and the first-run steps again, and a node or an edge printed its first-run text. The installer now reads the version it replaces and says `upgraded from 0.1.1 to 0.2.0`. On a primary whose cluster is set up, it skips the setup token and the first-run steps and names the next step, upgrading the nodes and edges. A re-run without `QUORO_ROLE` on a node or an edge installed a second control plane next to the agent; the installer now refuses it and names the role to pass. The installer README documents the `edge` role, the `QUORO_JOIN_*` variables for an edge, and how to upgrade ([#401]).
 - After a primary restart, the desired state could name a new digest for an app instance that was already running: the primary resolved the image tag again with an empty cache, and if the tag had moved, it asked the node for a digest no instance runs. The node refused the change, as a VM's digest is fixed when it is created, and logged the same warning on every pass. An instance now keeps the digest its deployment recorded when it was created; only a new deployment resolves the tag again. The node logs the refusal once per VM and digest ([#403]).
+- A terminal opened on a VM that was still booting was refused with "the VM's init does not accept exec sessions; restart the VM", although the VM only needed a few more seconds: its init accepts terminals once it has mounted the volumes and set up the network. The message now says the VM may still be starting, and that only a VM which has been running for a while needs a restart. The engine's KVM test suite now waits for the guest before its first command, and its teardown removes both of the bridge's firewall tables instead of only one ([#418]).
 
 ## [v0.2.0] - 2026-11-05
 
@@ -386,6 +387,7 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#398]: https://github.com/OmarAlex24/quoro/pull/398
 [#401]: https://github.com/OmarAlex24/quoro/pull/401
 [#403]: https://github.com/OmarAlex24/quoro/pull/403
+[#418]: https://github.com/OmarAlex24/quoro/issues/418
 [ADR 0019]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0019-fencing-is-mandatory-and-lease-based-node-agent-self-fences.md
 [ADR 0020]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0020-per-app-ha-policies-none-cold-warm-hot-with-cost-shown-in.md
 [ADR 0027]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0027-signed-binaries-and-reproducible-builds-are-mandatory.md

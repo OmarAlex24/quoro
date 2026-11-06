@@ -1572,20 +1572,44 @@ fn assert_same_bytes(a: &Path, b: &Path) {
     }
 }
 
-/// Runs `argv` in the guest over the exec channel and returns its output.
+/// How long [`exec_in_guest`] waits for the guest's exec listener.
+const EXEC_READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Opens an exec session, waiting for the guest to accept one.
+///
+/// `start` returns once the VMM booted the guest, but the init binds its exec
+/// listener only after it mounted the volumes and set up the network, just
+/// before it starts the app, so an exec right after `start` is refused with
+/// `Conflict` (§3.18). This retries that refusal with a short backoff until
+/// [`EXEC_READY_TIMEOUT`]; any other error fails at once.
+async fn open_exec(engine: &ChEngine, id: &VmId, argv: &[&str]) -> quoro_engine::ExecSession {
+    let request = ExecRequest {
+        argv: argv.iter().map(|arg| (*arg).to_string()).collect(),
+        user: None,
+        rows: 24,
+        cols: 80,
+    };
+    let deadline = tokio::time::Instant::now() + EXEC_READY_TIMEOUT;
+    let mut backoff = Duration::from_millis(100);
+    loop {
+        match engine.exec(id, &request).await {
+            Ok(session) => return session,
+            Err(EngineError::Conflict(reason))
+                if reason.contains("does not accept exec sessions")
+                    && tokio::time::Instant::now() + backoff < deadline =>
+            {
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(2));
+            }
+            Err(err) => panic!("exec in the guest: {err:?}"),
+        }
+    }
+}
+
+/// Runs `argv` in the guest over the exec channel and returns its output,
+/// waiting first for the guest to accept exec sessions.
 async fn exec_in_guest(engine: &ChEngine, id: &VmId, argv: &[&str]) -> String {
-    let mut session = engine
-        .exec(
-            id,
-            &ExecRequest {
-                argv: argv.iter().map(|arg| (*arg).to_string()).collect(),
-                user: None,
-                rows: 24,
-                cols: 80,
-            },
-        )
-        .await
-        .expect("exec in the guest");
+    let mut session = open_exec(engine, id, argv).await;
     let mut out = Vec::new();
     let mut buf = [0_u8; 1024];
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
