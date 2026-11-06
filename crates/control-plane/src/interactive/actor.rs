@@ -68,6 +68,7 @@ pub async fn spawn(
     interactive: Interactive,
     stream: NodeStream,
     buffered: Vec<Vec<u8>>,
+    early_end: Option<StreamEvent>,
     commands: mpsc::UnboundedReceiver<Command>,
     socket: Arc<SocketSlot>,
 ) {
@@ -83,6 +84,7 @@ pub async fn spawn(
         commands,
         socket,
         buffered: buffered.into(),
+        held: early_end.and_then(ending_of),
         timings,
         now: Instant::now(),
         ticket_deadline: Instant::now() + timings.ticket_ttl,
@@ -110,6 +112,10 @@ struct Actor {
     /// The registry's claim on the session's one WebSocket.
     socket: Arc<SocketSlot>,
     buffered: VecDeque<Vec<u8>>,
+    /// How the node ended the session before a WebSocket attached: kept,
+    /// with the output in `buffered`, until the client attaches or its ticket
+    /// expires, so a program that exits first still reaches its client.
+    held: Option<Ending>,
     timings: Timings,
     now: Instant,
     ticket_deadline: Instant,
@@ -132,6 +138,9 @@ impl Actor {
     async fn run(mut self) {
         // Phase 1: the session exists but no WebSocket attached yet. Data that
         // arrives is buffered (never acked) until it is handed to the socket.
+        // The program starts with the open, so it can end here, before its
+        // client attaches: the ending is held with the output and replayed on
+        // attach. Only the ticket bounds this phase.
         let mut ticket_grace_used = false;
         let socket = loop {
             tokio::select! {
@@ -139,7 +148,8 @@ impl Actor {
                     Some(Command::Attach(socket)) => break *socket,
                     Some(Command::End { request_id, ended_by, justification, reply }) => {
                         let ending = Ending {
-                            reason: CloseReason::EndedByRequest,
+                            // A program that already exited keeps its code.
+                            exit_code: self.held.as_ref().and_then(|held| held.exit_code),
                             ended_by: Some(ended_by),
                             justification,
                             request_id: Some(request_id),
@@ -151,37 +161,21 @@ impl Actor {
                     }
                     None => return,
                 },
-                event = self.stream.next() => {
-                    match event {
-                        None => {
-                            self.end_before_attach(Ending::new(CloseReason::NodeDisconnected))
-                                .await;
-                            return;
-                        }
-                        Some(StreamEvent::Data(bytes)) => self.buffered.push_back(bytes),
-                        Some(StreamEvent::SessionEnd {
-                            reason,
-                            message,
-                            exit_code,
-                            transcript_sha256,
-                            transcript_bytes,
-                            ..
-                        }) => {
-                            let mut ending = node_ending(reason, message, exit_code);
-                            ending.transcript = transcript_sha256.map(|sha| {
-                                (sha, transcript_bytes.unwrap_or(0))
-                            });
-                            self.end_before_attach(ending).await;
-                            return;
-                        }
-                        Some(_) => {}
-                    }
+                // An ended stream yields nothing more.
+                event = self.stream.next(), if self.held.is_none() => match event {
+                    None => self.held = Some(Ending::new(CloseReason::NodeDisconnected)),
+                    Some(StreamEvent::Data(bytes)) => self.buffered.push_back(bytes),
+                    Some(event) => self.held = ending_of(event),
                 },
                 () = tokio::time::sleep_until(self.ticket_deadline) => {
                     // An upgrade that claimed the session presented the ticket
                     // in time: its socket is on the way, so the session goes on.
                     if self.socket.seal() || ticket_grace_used {
-                        self.close(Ending::new(CloseReason::TicketExpired), None).await;
+                        let ending = self
+                            .held
+                            .take()
+                            .unwrap_or_else(|| Ending::new(CloseReason::TicketExpired));
+                        self.close(ending, None).await;
                         return;
                     }
                     ticket_grace_used = true;
@@ -191,17 +185,23 @@ impl Actor {
         };
         let mut socket = socket;
         self.attach().await;
-        let ending = self.connected_loop(&mut socket).await;
+        let ending = match self.held.take() {
+            Some(ending) => {
+                self.replay(&mut socket).await;
+                ending
+            }
+            None => self.connected_loop(&mut socket).await,
+        };
         self.close(ending, Some(socket)).await;
     }
 
-    /// Ends a session whose WebSocket has not reached the actor. An upgrade
-    /// claims the session before its `101` and only then hands the socket
-    /// over, so the session can end (the node drops, the shell exits, a
-    /// DELETE lands) between the two. Dropping that socket unanswered would
-    /// reset the client's connection without telling it why: wait, bounded,
-    /// for the claimed socket and close through it instead. A session no
-    /// upgrade claimed is sealed, so a later upgrade is refused.
+    /// Ends, by request, a session whose WebSocket has not reached the
+    /// actor. An upgrade claims the session before its `101` and only then
+    /// hands the socket over, so a DELETE can land between the two. Dropping
+    /// that socket unanswered would reset the client's connection without
+    /// telling it why: wait, bounded, for the claimed socket and close through
+    /// it instead. A session no upgrade claimed is sealed, so a later upgrade
+    /// is refused.
     async fn end_before_attach(&mut self, ending: Ending) {
         if self.socket.seal() {
             self.close(ending, None).await;
@@ -213,15 +213,7 @@ impl Actor {
                 Ok(Some(Command::Attach(socket))) => {
                     let mut socket = *socket;
                     self.attach().await;
-                    // What the node produced before it ended still reaches
-                    // the client, ahead of the close.
-                    while let Some(bytes) = self.buffered.pop_front() {
-                        let len = bytes.len();
-                        if socket.send(Message::Binary(bytes.into())).await.is_err() {
-                            break;
-                        }
-                        self.delivered(len);
-                    }
+                    self.replay(&mut socket).await;
                     self.close(ending, Some(socket)).await;
                     return;
                 }
@@ -234,6 +226,18 @@ impl Actor {
                     return;
                 }
             }
+        }
+    }
+
+    /// Hands what the node produced before the session ended to the client,
+    /// ahead of the close.
+    async fn replay(&mut self, socket: &mut WebSocket) {
+        while let Some(bytes) = self.buffered.pop_front() {
+            let len = bytes.len();
+            if socket.send(Message::Binary(bytes.into())).await.is_err() {
+                break;
+            }
+            self.delivered(len);
         }
     }
 
@@ -309,20 +313,11 @@ impl Actor {
                         }
                         self.delivered(bytes.len());
                     }
-                    Some(StreamEvent::SessionEnd {
-                        reason,
-                        message,
-                        exit_code,
-                        transcript_sha256,
-                        transcript_bytes,
-                        ..
-                    }) => {
-                        let mut ending = node_ending(reason, message, exit_code);
-                        ending.transcript =
-                            transcript_sha256.map(|sha| (sha, transcript_bytes.unwrap_or(0)));
-                        return ending;
+                    Some(event) => {
+                        if let Some(ending) = ending_of(event) {
+                            return ending;
+                        }
                     }
-                    Some(_) => {}
                 },
                 command = self.commands.recv() => match command {
                     Some(Command::End { request_id, ended_by, justification, reply }) => {
@@ -617,6 +612,24 @@ impl Actor {
         self.interactive.unregister(&self.row.id);
         wrote
     }
+}
+
+/// The ending a node's `stream_end` carries; `None` for any other event.
+fn ending_of(event: StreamEvent) -> Option<Ending> {
+    let StreamEvent::SessionEnd {
+        reason,
+        message,
+        exit_code,
+        transcript_sha256,
+        transcript_bytes,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    let mut ending = node_ending(reason, message, exit_code);
+    ending.transcript = transcript_sha256.map(|sha| (sha, transcript_bytes.unwrap_or(0)));
+    Some(ending)
 }
 
 fn node_ending(reason: SessionEndReason, message: String, exit_code: Option<i32>) -> Ending {

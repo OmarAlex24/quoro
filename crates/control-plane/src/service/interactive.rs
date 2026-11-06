@@ -102,10 +102,19 @@ enum FirstEvent {
     Data(Vec<Vec<u8>>),
     /// No data yet; the session still exists.
     Quiet,
+    /// The terminal's program already exited, without output: the session
+    /// opens all the same, so its client gets the exit code (issue #240).
+    Exited(StreamEvent),
 }
 
-/// Waits for the first data event, a failed open, or the deadline.
-async fn wait_open(stream: &mut NodeStream, wait: Duration) -> Result<FirstEvent, ApiError> {
+/// Waits for the first data event, a failed open, or the deadline. With
+/// `exits` (a terminal), a program that exits within the wait is a session
+/// that ran, not a failed open.
+async fn wait_open(
+    stream: &mut NodeStream,
+    wait: Duration,
+    exits: bool,
+) -> Result<FirstEvent, ApiError> {
     let deadline = Instant::now() + wait;
     loop {
         match tokio::time::timeout_at(deadline, stream.next()).await {
@@ -143,6 +152,12 @@ async fn wait_open(stream: &mut NodeStream, wait: Duration) -> Result<FirstEvent
                     ),
                 });
             }
+            Ok(Some(
+                event @ StreamEvent::SessionEnd {
+                    reason: SessionEndReason::Completed,
+                    ..
+                },
+            )) if exits => return Ok(FirstEvent::Exited(event)),
             Ok(Some(StreamEvent::SessionEnd {
                 reason, message, ..
             })) => {
@@ -164,8 +179,13 @@ fn hand_over(
     ctx: &CallCtx,
     row: SessionRow,
     stream: NodeStream,
-    buffered: Vec<Vec<u8>>,
+    first: FirstEvent,
 ) -> InteractiveSessionTicket {
+    let (buffered, early_end) = match first {
+        FirstEvent::Data(bytes) => (bytes, None),
+        FirstEvent::Quiet => (Vec::new(), None),
+        FirstEvent::Exited(end) => (Vec::new(), Some(end)),
+    };
     let interactive = state.interactive.clone();
     let needs_origin = matches!(ctx.identity.credential, Credential::Session { .. });
     let (ticket, expires_at) = interactive.mint_ticket(&row.id, needs_origin);
@@ -195,6 +215,7 @@ fn hand_over(
             interactive,
             stream,
             buffered,
+            early_end,
             rx,
             socket,
         )
@@ -303,11 +324,12 @@ pub async fn open_terminal(
             .hub
             .open_stream(&node_id, "terminal", stream_params)
             .map_err(open_error)?;
-        let buffered =
-            match wait_open(&mut stream, state.interactive.timings().terminal_open_wait).await? {
-                FirstEvent::Data(bytes) => bytes,
-                FirstEvent::Quiet => Vec::new(),
-            };
+        let first = wait_open(
+            &mut stream,
+            state.interactive.timings().terminal_open_wait,
+            true,
+        )
+        .await?;
 
         let mut record_params = Map::new();
         record_params.insert("session_id".to_string(), json!(session_id));
@@ -357,12 +379,12 @@ pub async fn open_terminal(
             .await?;
         insert_session(&mut w.tx, &row, seq).await?;
         w.commit().await?;
-        Ok::<_, ApiError>((row, stream, buffered))
+        Ok::<_, ApiError>((row, stream, first))
     }
     .await;
 
     match result {
-        Ok((row, stream, buffered)) => Ok(hand_over(state, ctx, row, stream, buffered)),
+        Ok((row, stream, first)) => Ok(hand_over(state, ctx, row, stream, first)),
         Err(error) => {
             ctx.audit_error(
                 state,
@@ -433,11 +455,12 @@ pub async fn open_console(
             .hub
             .open_stream(&node_id, "console", stream_params)
             .map_err(open_error)?;
-        let buffered =
-            match wait_open(&mut stream, state.interactive.timings().console_open_wait).await? {
-                FirstEvent::Data(bytes) => bytes,
-                FirstEvent::Quiet => Vec::new(),
-            };
+        let first = wait_open(
+            &mut stream,
+            state.interactive.timings().console_open_wait,
+            false,
+        )
+        .await?;
 
         let mut record_params = Map::new();
         record_params.insert("session_id".to_string(), json!(session_id));
@@ -484,12 +507,12 @@ pub async fn open_console(
             .await?;
         insert_session(&mut w.tx, &row, seq).await?;
         w.commit().await?;
-        Ok::<_, ApiError>((row, stream, buffered))
+        Ok::<_, ApiError>((row, stream, first))
     }
     .await;
 
     match result {
-        Ok((row, stream, buffered)) => Ok(hand_over(state, ctx, row, stream, buffered)),
+        Ok((row, stream, first)) => Ok(hand_over(state, ctx, row, stream, first)),
         Err(error) => {
             ctx.audit_error(
                 state,

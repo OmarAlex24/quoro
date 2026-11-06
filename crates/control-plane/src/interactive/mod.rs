@@ -11,6 +11,11 @@
 //! relays bytes, pushes input, acknowledges credit, re-checks the opener's
 //! access and writes the one `session.end` record.
 //!
+//! A terminal's program starts with the open, so it can exit before the
+//! client attaches. The actor then keeps the output and the node's ending
+//! until the ticket expires and replays both on attach (ADR 0186), so the
+//! client gets the output, `exit` and `closed`, never a refused upgrade.
+//!
 //! `interactive_sessions` (migration 0005) is local, not replicated. It makes
 //! every opened session end with exactly one `session.end`, even one the
 //! primary lost in a restart: [`close_orphans`] closes every row still open at

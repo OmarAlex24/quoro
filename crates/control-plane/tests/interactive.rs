@@ -697,6 +697,226 @@ async fn owner_opens_a_terminal_relays_bytes_and_writes_session_end() {
     assert!(params.get("ended_by").is_none());
 }
 
+/// Issue #240: the program starts with the open, so a short command can print
+/// and exit before the client's upgrade arrives. The session keeps its output
+/// and its ending until the WebSocket attaches, and replays both.
+#[tokio::test]
+async fn a_command_that_exits_before_the_websocket_attaches_still_reaches_the_client() {
+    let mut f = fixture(start().await).await;
+    let (res, open) = open_and_answer(
+        &mut f.node,
+        terminal(
+            &f.server,
+            &f.owner,
+            &f.app_id,
+            json!({ "rows": 24, "cols": 80, "command": ["/bin/sh", "-c", "uname -r"] }),
+        ),
+        |open| stream_data(open["body"]["stream_id"].as_str().unwrap(), 1, b"6.18.0\n"),
+    )
+    .await;
+    let ticket = ticket_of(res).await;
+    let session_id = ticket["id"].as_str().unwrap().to_string();
+    let stream_id = open["body"]["stream_id"].as_str().unwrap();
+    f.node.send(stream_end(
+        stream_id,
+        "completed",
+        json!({
+            "exit_code": 0,
+            "transcript_sha256": "b".repeat(64),
+            "transcript_bytes": 64
+        }),
+    ));
+    // Long enough for the primary to take the node's stream_end before the
+    // upgrade; the session must still be open for its client.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (ended_at, _, _) = session_row(&f.server, &session_id).await.unwrap();
+    assert!(
+        ended_at.is_none(),
+        "the session ended before its client attached"
+    );
+
+    let mut socket = ws_upgrade(
+        &f.server,
+        &session_id,
+        ticket["ticket"].as_str().unwrap(),
+        Some(ORIGIN),
+    )
+    .await
+    .expect("the upgrade of a session whose program already exited succeeds");
+    assert_eq!(ws_binary(&mut socket).await, b"6.18.0\n");
+    let exit = ws_control(&mut socket, "exit").await;
+    assert_eq!(exit["code"], 0);
+    wait_closed(&mut socket, "exited").await;
+
+    let params = end_params(&f.server, &f.app_id).await;
+    assert_eq!(params["session_id"], session_id);
+    assert_eq!(params["close_reason"], "exited");
+    assert_eq!(params["exit_code"], 0);
+    assert_eq!(params["connected"], true);
+    assert_eq!(params["bytes_out"], 7);
+    assert_eq!(params["transcript_sha256"], "b".repeat(64));
+    assert_eq!(params["transcript_bytes"], 64);
+    assert_eq!(audit_of(&f.server, "session.end", &f.app_id).await.len(), 1);
+}
+
+/// Issue #240: a command with no output that exits within the open's wait is
+/// a session that ran, not a failed open.
+#[tokio::test]
+async fn a_silent_command_that_exits_during_the_open_still_reaches_the_client() {
+    let mut f = fixture(start().await).await;
+    let (res, _) = open_and_answer(
+        &mut f.node,
+        terminal(
+            &f.server,
+            &f.owner,
+            &f.app_id,
+            json!({ "rows": 24, "cols": 80, "command": ["/bin/sh", "-c", "exit 4"] }),
+        ),
+        |open| {
+            stream_end(
+                open["body"]["stream_id"].as_str().unwrap(),
+                "completed",
+                json!({ "exit_code": 4, "transcript_sha256": "c".repeat(64), "transcript_bytes": 32 }),
+            )
+        },
+    )
+    .await;
+    let ticket = ticket_of(res).await;
+    let mut socket = ws_upgrade_ok(&f.server, &ticket, Some(ORIGIN)).await;
+    match ws_next(&mut socket).await {
+        WsMessage::Text(text) => {
+            let exit: Value = serde_json::from_str(text.as_str()).unwrap();
+            assert_eq!(exit, json!({ "type": "exit", "code": 4 }));
+        }
+        other => panic!("expected the exit control first, got {other:?}"),
+    }
+    wait_closed(&mut socket, "exited").await;
+    let params = end_params(&f.server, &f.app_id).await;
+    assert_eq!(params["close_reason"], "exited");
+    assert_eq!(params["exit_code"], 4);
+    assert_eq!(params["connected"], true);
+    assert_eq!(params["bytes_out"], 0);
+    assert_eq!(params["transcript_sha256"], "c".repeat(64));
+}
+
+/// A session whose program exited is kept only for its ticket's lifetime:
+/// unclaimed, it is recorded with the program's own ending, and a late upgrade
+/// is refused like any expired ticket.
+#[tokio::test]
+async fn an_exited_session_nobody_attaches_to_is_recorded_when_its_ticket_expires() {
+    let mut f = fixture(start().await).await;
+    f.server.state.interactive.set_timings(Timings {
+        ticket_ttl: Duration::from_millis(400),
+        ..f.server.state.interactive.timings()
+    });
+    let (res, open) = open_and_answer(
+        &mut f.node,
+        terminal(&f.server, &f.owner, &f.app_id, interrupted()),
+        |open| stream_data(open["body"]["stream_id"].as_str().unwrap(), 1, b"bye\n"),
+    )
+    .await;
+    let ticket = ticket_of(res).await;
+    let session_id = ticket["id"].as_str().unwrap().to_string();
+    f.node.send(stream_end(
+        open["body"]["stream_id"].as_str().unwrap(),
+        "completed",
+        json!({ "exit_code": 0, "transcript_sha256": "d".repeat(64), "transcript_bytes": 16 }),
+    ));
+    let params = end_params(&f.server, &f.app_id).await;
+    assert_eq!(params["close_reason"], "exited");
+    assert_eq!(params["exit_code"], 0);
+    assert_eq!(params["connected"], false);
+    assert_eq!(params["bytes_out"], 0);
+    // Transcript fields belong to sessions that connected.
+    assert!(params.get("transcript_sha256").is_none());
+    assert!(params["duration_ms"].as_u64().unwrap() >= 300, "{params}");
+    let status = ws_upgrade(
+        &f.server,
+        &session_id,
+        ticket["ticket"].as_str().unwrap(),
+        Some(ORIGIN),
+    )
+    .await
+    .expect_err("an expired ticket");
+    assert_eq!(status, 401);
+}
+
+/// Ending a session whose program already exited, before anyone attached,
+/// closes it by request and keeps the program's exit code on the record.
+#[tokio::test]
+async fn deleting_an_exited_session_before_it_attaches_records_who_ended_it() {
+    let mut f = fixture(start().await).await;
+    let (res, open) = open_and_answer(
+        &mut f.node,
+        terminal(&f.server, &f.owner, &f.app_id, interrupted()),
+        |open| stream_data(open["body"]["stream_id"].as_str().unwrap(), 1, b"done\n"),
+    )
+    .await;
+    let ticket = ticket_of(res).await;
+    let session_id = ticket["id"].as_str().unwrap().to_string();
+    f.node.send(stream_end(
+        open["body"]["stream_id"].as_str().unwrap(),
+        "completed",
+        json!({ "exit_code": 2 }),
+    ));
+    // Long enough for the primary to take the node's stream_end first.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let res = f
+        .owner
+        .delete(
+            f.server
+                .url(&format!("/api/v1/interactive-sessions/{session_id}")),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 204, "{}", res.text().await.unwrap());
+    let params = end_params(&f.server, &f.app_id).await;
+    assert_eq!(params["close_reason"], "ended_by_request");
+    assert_eq!(
+        params["ended_by"],
+        json!(owner_id(&f.owner, &f.server).await)
+    );
+    assert_eq!(params["exit_code"], 2);
+    assert_eq!(params["connected"], false);
+    assert_eq!(audit_of(&f.server, "session.end", &f.app_id).await.len(), 1);
+    let status = ws_upgrade(
+        &f.server,
+        &session_id,
+        ticket["ticket"].as_str().unwrap(),
+        Some(ORIGIN),
+    )
+    .await
+    .expect_err("an ended session");
+    assert_eq!(status, 401);
+}
+
+/// A node that drops before the client attaches: the client is told why
+/// instead of being refused as if its ticket were bad.
+#[tokio::test]
+async fn a_node_that_drops_before_the_websocket_attaches_tells_the_client_why() {
+    let mut f = fixture(start().await).await;
+    let (res, _) = open_and_answer(
+        &mut f.node,
+        terminal(&f.server, &f.owner, &f.app_id, interrupted()),
+        |open| stream_data(open["body"]["stream_id"].as_str().unwrap(), 1, b"$ "),
+    )
+    .await;
+    let ticket = ticket_of(res).await;
+    f.node.disconnect();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut socket = ws_upgrade_ok(&f.server, &ticket, Some(ORIGIN)).await;
+    assert_eq!(ws_binary(&mut socket).await, b"$ ");
+    wait_closed(&mut socket, "node_disconnected").await;
+    let ends = audit_of(&f.server, "session.end", &f.app_id).await;
+    assert_eq!(ends.len(), 1);
+    assert_eq!(ends[0].0, "error");
+    let params: Value = serde_json::from_str(&ends[0].2).unwrap();
+    assert_eq!(params["close_reason"], "node_disconnected");
+    assert_eq!(params["connected"], true);
+    assert!(params.get("exit_code").is_none());
+}
+
 #[tokio::test]
 async fn viewer_is_refused_and_no_row_exists() {
     let f = fixture(start().await).await;
