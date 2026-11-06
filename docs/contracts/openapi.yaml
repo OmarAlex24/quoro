@@ -4076,7 +4076,11 @@ components:
           description: Node holding the lease.
         mode:
           type: string
-          description: Local leases need no renewal; expiring leases do.
+          description: |
+            Local leases need no renewal; expiring leases do. When an app's
+            HA policy becomes `warm`, its lease reads `local` until the primary
+            answers the holder's first renewal after the mode change
+            (node-agent-protocol.md section 8.4, ADR 0244).
           enum:
             - local
             - expiring
@@ -7714,7 +7718,10 @@ paths:
           lease: the lease's gate (`App.lease.gate_at`, section 8.4) has not
           passed and no fence of it was confirmed. A lease that is still
           `local` (section 8.4, "Changing the mode") is held until the node is
-          declared lost (`declareNodeLost`).
+          declared lost (`declareNodeLost`). That includes a warm app's
+          lease until the primary answers its holder's first renewal after
+          the mode change, because the lease stays `local` until then
+          (ADR 0244).
 
         When the source is connected, the primary first revokes its lease
         over the session and goes on once the revoke is answered; that loses

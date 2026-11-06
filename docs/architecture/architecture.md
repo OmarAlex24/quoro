@@ -540,7 +540,7 @@ HA and backups are out of the MVP but prepared for (D-0033). "Prepared for" is a
 Two modes (D-0047), because D-0019 (self-fencing from M0) and D-0011 (apps keep running when the control plane is gone) would otherwise conflict during M1-M4, when there is only one control plane:
 
 - **`local`**: issued for HA policy `none` or `cold`, where no other copy can start. It never expires when the arbiter is unreachable; it ends only by an explicit `lease_revoke` (move, delete, planned switchover) or when an operator declares the node lost, which requires a manual fence acknowledgement before a cold backup is restored elsewhere. That keeps D-0011 and the M2 demo true: stopping the control plane does not stop apps.
-- **`expiring`**: issued for `warm` and `hot` from M5b. Duration-based, measured on the node's monotonic clock from when the renewal was sent, minus a safety margin. The state path is `held` -> `uncertain` -> `expired` -> self-fence, and a lease is also revoked explicitly.
+- **`expiring`**: issued for `warm` and `hot` from M5b. Duration-based, measured from when the renewal was sent, minus a safety margin, on a node clock that keeps counting while the host is suspended (`CLOCK_BOOTTIME` on Linux, ADR 0240). The state path is `held` -> `uncertain` -> `expired` -> self-fence, and a lease is also revoked explicitly.
 
 Fencing tokens are carried on every write to shared storage (D-0047), not only in the lease messages.
 
@@ -551,16 +551,16 @@ The distinction between two lease states is the core safety rule:
 
 Conflating the two produces one of two failures: fencing on every network blip, or continuing to run a stateful app that another node has already been allowed to start. Treating them as separate states is what lets a partition be survivable on one side and safe on the other.
 
-For an `expiring` lease the deadline is `valid_until = t_send + D - M`, where `t_send` is the node's monotonic time when it sent the renewal the current grant answers, `D` is the grant's `duration_ms` and `M = max(1000 ms, D / 10)` ([../contracts/node-agent-protocol.md](../contracts/node-agent-protocol.md) section 8.4).
+For an `expiring` lease the deadline is `valid_until = t_send + D - M`, where `t_send` is the node's time on that clock when it sent the renewal the current grant answers, `D` is the grant's `duration_ms` and `M = max(1000 ms, D / 10)` ([../contracts/node-agent-protocol.md](../contracts/node-agent-protocol.md) section 8.4).
 
 | From | Event | To | What the node does |
 | --- | --- | --- | --- |
 | (none) | `lease_grant` | `held` | Starts the stateful app |
 | `held` | renewal failing, authority unreachable | `uncertain` | Keeps running, starts nothing new |
 | `held` | `lease_revoke` | `revoked` | Stops the stateful app |
-| `held` | monotonic clock reaches `valid_until` | `expired` | Self-fences: stops the stateful app |
+| `held` | the node's clock reaches `valid_until` | `expired` | Self-fences: stops the stateful app |
 | `uncertain` | renewal succeeds | `held` | Resumes normal operation |
-| `uncertain` | monotonic clock reaches `valid_until` | `expired` | Self-fences: stops the stateful app |
+| `uncertain` | the node's clock reaches `valid_until` | `expired` | Self-fences: stops the stateful app |
 | `expired` | new `lease_grant` | `held` | Restarts only under the new grant's token |
 
 Two properties matter in the table. Recovery from `uncertain` back to `held` is silent, because nothing was given up; recovery from `expired` is not, because the app was stopped and the fencing token moved on. And no transition ever goes directly from `uncertain` to starting something, which is the whole point of the state.
