@@ -595,12 +595,11 @@ pub async fn ack_node_fence(
     ctx.authorize_human(&state, Scope::NodeFenceAck, Some(&target), None, &params)
         .await?;
     match fence_ack_tx(&state, &ctx, &node_id, &body.lease_ids, &params).await {
-        Ok((node, holders)) => {
-            for holder in holders {
-                state.hub.node_changed(&holder);
-            }
+        Ok(node) => {
+            // The node's session rebuilds its snapshot and sends the
+            // `fence_ack` at once; a node without one gets it at its next
+            // session start (section 8.5 step 4).
             state.hub.node_changed(&node_id);
-            crate::fences::deliver(state.hub.clone(), node_id);
             Ok(Json(node))
         }
         Err(error) => {
@@ -622,15 +621,21 @@ pub async fn ack_node_fence(
 /// outstanding failed fences, increments each listed lease's token and
 /// records it revoked as when declaring a node lost (section 8.3), clears
 /// `fence_failure`, queues the acknowledgement in `fence_ack_pending`, and
-/// writes the change-log entries and the audit record. Returns the node and
-/// the holders of the listed leases, whose snapshots change.
+/// writes the change-log entries and the audit record.
+///
+/// Only the leases this node still holds change: declaring a node lost
+/// touches the leases the node holds (section 8.3), and a lease another node
+/// holds already carries a higher token than this node's, so revoking it
+/// here would only end the other node's grant without telling it. Every
+/// listed lease is still acknowledged to the node, so it clears its record of
+/// each failed fence.
 async fn fence_ack_tx(
     state: &AppState,
     ctx: &CallCtx,
     node_id: &str,
     lease_ids: &[String],
     params: &Value,
-) -> Result<(Node, Vec<String>), ApiError> {
+) -> Result<Node, ApiError> {
     if lease_ids.is_empty() {
         return Err(ApiError::validation(
             "lease_ids must name at least one lease",
@@ -678,12 +683,7 @@ async fn fence_ack_tx(
     }
 
     let actor = ctx.identity.actor();
-    let mut holders: Vec<String> = Vec::new();
-    for lease in crate::leases::bump_tokens(&mut w.tx, lease_ids, &actor).await? {
-        if lease.holder_node_id != node_id && !holders.contains(&lease.holder_node_id) {
-            holders.push(lease.holder_node_id);
-        }
-    }
+    crate::leases::bump_tokens(&mut w.tx, lease_ids, node_id, &actor).await?;
     let mut pending = crate::fences::pending_of(&mut w.tx, node_id)
         .await?
         .unwrap_or_default();
@@ -693,10 +693,8 @@ async fn fence_ack_tx(
             pending.lease_ids.push(lease_id.clone());
         }
     }
-    let pending_text = serde_json::to_string(&pending)
-        .map_err(|e| ApiError::internal(&format!("cannot encode a fence ack: {e}")))?;
     sqlx::query("UPDATE nodes SET fence_failure = NULL, fence_ack_pending = ? WHERE id = ?")
-        .bind(pending_text)
+        .bind(crate::fences::pending_text(Some(&pending))?)
         .bind(node_id)
         .execute(&mut *w.tx)
         .await?;
@@ -725,7 +723,7 @@ async fn fence_ack_tx(
     w.commit().await?;
     let mut node = node_from_row(&row)?;
     node.tunnel = tunnel;
-    Ok((node, holders))
+    Ok(node)
 }
 
 /// Validates the provider, writes the row, its change-log entry and the audit

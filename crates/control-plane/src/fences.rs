@@ -7,8 +7,9 @@
 //! `fence_failed`. The primary then lists the lease, app and VM ids in the
 //! node's `fence_failure`, and grants none of those leases to any node until a
 //! human acknowledges them (`POST /api/v1/nodes/{node_id}/fence-ack`). The
-//! acknowledgement is delivered to the node as `command` kind `fence_ack`;
-//! `fence_ack_pending` holds it until the node answers `ok`.
+//! acknowledgement is delivered to the node as `command` kind `fence_ack` by
+//! its session (`session/mod.rs`); `fence_ack_pending` holds it until the
+//! node answers `ok`.
 //!
 //! Both columns are replicated state: every write goes through the change log
 //! in the caller's transaction.
@@ -23,12 +24,12 @@ use sqlx::SqliteConnection;
 use crate::changelog::{self, Actor, ActorType, Op};
 use crate::driver;
 use crate::error::ApiError;
-use crate::session::NodeHub;
 use crate::store::{Store, now_rfc3339};
 
-/// How long the primary waits for a connected node to answer a `fence_ack`
-/// sent after the acknowledgement; a node that does not answer gets it again
-/// at its next session start.
+/// How long a session start holds back the first desired state for the
+/// stale-lease revokes and the pending `fence_ack` to be answered (section
+/// 4.2 rules 3 to 5). The node still gets its desired state after it; a
+/// `fence_ack` already sent is still cleared by a late `ok`.
 pub(crate) const FENCE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `nodes.fence_failure` (migration 0001, `NodeFenceFailure`).
@@ -110,14 +111,13 @@ pub(crate) async fn pending_of(
 
 /// Adds a failed fence of `node_id` to its `fence_failure`; ids accumulate
 /// until acknowledged (section 8.5 "Acknowledging a failed fence" step 1).
-/// Returns whether anything was added.
+/// Returns whether anything changed.
 ///
-/// A lease whose acknowledgement waits in `fence_ack_pending` is not listed
-/// again: the report predates the node's `fence_ack`, which clears every
-/// failed fence the node recorded for that lease (section 5.17). Otherwise a
-/// late `node.fence_failed`, or a revoke answered before the session-start
-/// `fence_ack` (section 4.2 rules 3 and 4), would ask for the same
-/// acknowledgement again.
+/// A reported lease also leaves `fence_ack_pending`: the node failed to fence
+/// it again after the operator checked, so the acknowledgement no longer
+/// covers it and must not clear the new failure on the node. A late copy of
+/// a report the operator already acknowledged lists the lease again, which
+/// costs one more acknowledgement and is the safe side.
 ///
 /// # Errors
 ///
@@ -128,24 +128,14 @@ pub(crate) async fn record_failure(
     failed: &Failed<'_>,
     actor: &Actor,
 ) -> Result<bool, ApiError> {
+    if failed.lease_ids.is_empty() {
+        return Ok(false);
+    }
     let exists: Option<String> = sqlx::query_scalar("SELECT id FROM nodes WHERE id = ?")
         .bind(node_id)
         .fetch_optional(&mut *conn)
         .await?;
     if exists.is_none() {
-        return Ok(false);
-    }
-    let acked = pending_of(conn, node_id)
-        .await?
-        .map(|pending| pending.lease_ids)
-        .unwrap_or_default();
-    let lease_ids: Vec<String> = failed
-        .lease_ids
-        .iter()
-        .filter(|lease_id| !acked.contains(lease_id))
-        .cloned()
-        .collect();
-    if lease_ids.is_empty() {
         return Ok(false);
     }
     let current = failure_of(conn, node_id).await?;
@@ -155,22 +145,45 @@ pub(crate) async fn record_failure(
         ..FenceFailure::default()
     });
     let mut changed = is_new;
-    changed |= extend_unique(&mut failure.lease_ids, &lease_ids);
+    changed |= extend_unique(&mut failure.lease_ids, failed.lease_ids);
     changed |= extend_unique(&mut failure.app_ids, failed.app_ids);
     changed |= extend_unique(&mut failure.vm_ids, failed.vm_ids);
+    let mut pending = pending_of(conn, node_id).await?;
+    if let Some(pending) = pending.as_mut() {
+        let before = pending.lease_ids.len();
+        pending
+            .lease_ids
+            .retain(|lease_id| !failed.lease_ids.contains(lease_id));
+        changed |= pending.lease_ids.len() != before;
+    }
     if !changed {
         return Ok(false);
     }
     let text = serde_json::to_string(&failure)
         .map_err(|e| ApiError::internal(&format!("cannot encode a fence failure: {e}")))?;
-    sqlx::query("UPDATE nodes SET fence_failure = ? WHERE id = ?")
+    sqlx::query("UPDATE nodes SET fence_failure = ?, fence_ack_pending = ? WHERE id = ?")
         .bind(text)
+        .bind(pending_text(pending.as_ref())?)
         .bind(node_id)
         .execute(&mut *conn)
         .await?;
     let payload = driver::node_payload(conn, node_id).await?;
     changelog::append(conn, actor, "node", node_id, Op::Update, payload).await?;
     Ok(true)
+}
+
+/// The stored form of `fence_ack_pending`: `NULL` once no lease is left.
+///
+/// # Errors
+///
+/// An internal error when the value cannot be encoded.
+pub(crate) fn pending_text(pending: Option<&FenceAckPending>) -> Result<Option<String>, ApiError> {
+    match pending {
+        Some(pending) if !pending.lease_ids.is_empty() => serde_json::to_string(pending)
+            .map(Some)
+            .map_err(|e| ApiError::internal(&format!("cannot encode a fence ack: {e}"))),
+        _ => Ok(None),
+    }
 }
 
 /// Every lease listed in any node's `fence_failure`: the primary grants none
@@ -211,19 +224,15 @@ pub(crate) async fn confirm(
     let Some(mut pending) = pending_of(&mut w.tx, node_id).await? else {
         return Ok(());
     };
+    let before = pending.lease_ids.len();
     pending
         .lease_ids
         .retain(|lease_id| !lease_ids.contains(lease_id));
-    let text = if pending.lease_ids.is_empty() {
-        None
-    } else {
-        Some(
-            serde_json::to_string(&pending)
-                .map_err(|e| ApiError::internal(&format!("cannot encode a fence ack: {e}")))?,
-        )
-    };
+    if pending.lease_ids.len() == before {
+        return Ok(());
+    }
     sqlx::query("UPDATE nodes SET fence_ack_pending = ? WHERE id = ?")
-        .bind(text)
+        .bind(pending_text(Some(&pending))?)
         .bind(node_id)
         .execute(&mut *w.tx)
         .await?;
@@ -241,56 +250,6 @@ pub(crate) async fn confirm(
 #[must_use]
 pub(crate) fn command_params(lease_ids: &[String]) -> serde_json::Value {
     json!({ "lease_ids": lease_ids })
-}
-
-/// Sends the node's pending acknowledgement now, when it is connected, and
-/// clears it once the node answers `ok` (section 8.5 step 4). A node that is
-/// not connected, or does not answer, gets it at its next session start.
-pub(crate) fn deliver(hub: NodeHub, node_id: String) {
-    tokio::spawn(async move {
-        let pending = {
-            let mut conn = match hub.store().pool().acquire().await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    tracing::warn!(%e, node_id, "cannot read a pending fence ack");
-                    return;
-                }
-            };
-            match pending_of(&mut conn, &node_id).await {
-                Ok(Some(pending)) => pending,
-                Ok(None) => return,
-                Err(e) => {
-                    tracing::warn!(code = %e.code.as_str(), node_id, "cannot read a pending fence ack");
-                    return;
-                }
-            }
-        };
-        match hub
-            .command(
-                &node_id,
-                "fence_ack",
-                command_params(&pending.lease_ids),
-                FENCE_ACK_TIMEOUT,
-            )
-            .await
-        {
-            Ok(result) if result.status == quoro_proto::CommandStatus::Ok => {
-                if let Err(e) = confirm(hub.store(), &node_id, &pending.lease_ids).await {
-                    tracing::warn!(code = %e.code.as_str(), node_id, "cannot clear a delivered fence ack");
-                }
-            }
-            Ok(result) => tracing::warn!(
-                node_id,
-                detail = ?result.detail,
-                "the node did not take the fence ack; it is sent again at its next session"
-            ),
-            Err(error) => tracing::debug!(
-                %error,
-                node_id,
-                "the fence ack waits for the node's next session"
-            ),
-        }
-    });
 }
 
 #[cfg(test)]
@@ -371,7 +330,14 @@ mod tests {
 
         // The acknowledgement's token step, then the failure cleared: the
         // next grant carries a strictly higher token again.
-        let bumped = crate::leases::bump_tokens(&mut w.tx, &lease_ids, &actor)
+        // A lease held by another node is left alone.
+        assert!(
+            crate::leases::bump_tokens(&mut w.tx, &lease_ids, "nod_other", &actor)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let bumped = crate::leases::bump_tokens(&mut w.tx, &lease_ids, &node_id, &actor)
             .await
             .unwrap();
         assert_eq!(bumped.len(), 1);
@@ -392,13 +358,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_report_for_an_acknowledged_lease_is_not_listed_again() {
+    async fn a_new_failure_of_an_acknowledged_lease_lists_it_and_leaves_the_ack() {
         let (store, node_id, data_dir) = store_with_node().await;
         let actor = node_actor(&node_id);
         let mut w = store.begin_write().await.unwrap();
         let pending = FenceAckPending {
             acked_at: now_rfc3339(),
-            lease_ids: vec!["lse_acked".to_string()],
+            lease_ids: vec!["lse_acked".to_string(), "lse_kept".to_string()],
         };
         sqlx::query("UPDATE nodes SET fence_ack_pending = ? WHERE id = ?")
             .bind(serde_json::to_string(&pending).unwrap())
@@ -406,31 +372,16 @@ mod tests {
             .execute(&mut *w.tx)
             .await
             .unwrap();
+        // The node failed to fence `lse_acked` again after the operator
+        // checked: it is listed again, and the acknowledgement no longer
+        // covers it, so it cannot clear the new failure on the node.
         let acked = ["lse_acked".to_string()];
-        assert!(
-            !record_failure(
-                &mut w.tx,
-                &node_id,
-                &Failed {
-                    lease_ids: &acked,
-                    app_ids: &[],
-                    vm_ids: &[],
-                },
-                &actor,
-            )
-            .await
-            .unwrap()
-        );
-        assert!(failure_of(&mut w.tx, &node_id).await.unwrap().is_none());
-
-        // A report naming another lease too lists only that one.
-        let both = ["lse_acked".to_string(), "lse_other".to_string()];
         assert!(
             record_failure(
                 &mut w.tx,
                 &node_id,
                 &Failed {
-                    lease_ids: &both,
+                    lease_ids: &acked,
                     app_ids: &[],
                     vm_ids: &["vm_1".to_string()],
                 },
@@ -440,12 +391,33 @@ mod tests {
             .unwrap()
         );
         let failure = failure_of(&mut w.tx, &node_id).await.unwrap().unwrap();
-        assert_eq!(failure.lease_ids, vec!["lse_other".to_string()]);
+        assert_eq!(failure.lease_ids, acked.to_vec());
         assert_eq!(failure.vm_ids, vec!["vm_1".to_string()]);
+        let left = pending_of(&mut w.tx, &node_id).await.unwrap().unwrap();
+        assert_eq!(left.lease_ids, vec!["lse_kept".to_string()]);
 
-        // Confirming the delivery clears only what it carried.
+        // The same report again changes nothing.
+        assert!(
+            !record_failure(
+                &mut w.tx,
+                &node_id,
+                &Failed {
+                    lease_ids: &acked,
+                    app_ids: &[],
+                    vm_ids: &["vm_1".to_string()],
+                },
+                &actor,
+            )
+            .await
+            .unwrap()
+        );
+
+        // Confirming the delivery clears only what it carried; the last
+        // lease leaves the column `NULL`.
         w.commit().await.unwrap();
-        confirm(&store, &node_id, &acked).await.unwrap();
+        confirm(&store, &node_id, &["lse_kept".to_string()])
+            .await
+            .unwrap();
         let mut conn = store.pool().acquire().await.unwrap();
         assert!(pending_of(&mut conn, &node_id).await.unwrap().is_none());
         drop(conn);

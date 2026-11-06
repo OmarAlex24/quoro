@@ -185,11 +185,11 @@ pub(crate) async fn held_by_node(
     rows.iter().map(lease_from_row).collect()
 }
 
-/// Increments the `fencing_token` of each listed lease and records it
-/// revoked in the primary's view, with its holder still named, as when an
-/// operator declares a node lost (`node-agent-protocol.md` sections 8.3 and
-/// 8.5 step 3). Writes one change-log entry per lease and returns the rows;
-/// an id with no row is skipped.
+/// Increments the `fencing_token` of each listed lease `holder` holds and
+/// records it revoked in the primary's view, with its holder still named, as
+/// when an operator declares a node lost (`node-agent-protocol.md` sections
+/// 8.3 and 8.5 step 3). Writes one change-log entry per lease and returns the
+/// rows; an id with no row, or held by another node, is skipped.
 ///
 /// # Errors
 ///
@@ -197,6 +197,7 @@ pub(crate) async fn held_by_node(
 pub(crate) async fn bump_tokens(
     conn: &mut SqliteConnection,
     lease_ids: &[String],
+    holder: &str,
     actor: &Actor,
 ) -> Result<Vec<Lease>, ApiError> {
     let now = now_rfc3339();
@@ -205,6 +206,9 @@ pub(crate) async fn bump_tokens(
         let Some(mut lease) = by_id(conn, lease_id).await? else {
             continue;
         };
+        if lease.holder_node_id != holder {
+            continue;
+        }
         lease.fencing_token = lease.fencing_token.max(0) + 1;
         if lease.revoked_at.is_none() {
             lease.revoked_at = Some(now.clone());

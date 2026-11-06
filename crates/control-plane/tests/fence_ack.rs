@@ -626,11 +626,10 @@ async fn a_failed_fence_is_listed_and_a_human_acknowledgement_reaches_the_node()
     assert_eq!(params["lease_ids"], json!([lease_id]));
 }
 
-#[tokio::test]
-async fn a_pending_fence_ack_goes_out_after_the_revokes_and_before_the_desired_state() {
-    let server = start_with_patient_node_session().await;
-    let owner = server.owner().await;
-    let (node, mut socket, app_id, vm_id, lease_id) = node_with_lease(&server, &owner).await;
+/// A listed failure on a node that is gone, then acknowledged: returns the
+/// node, its app, VM and lease, with `fence_ack_pending` set.
+async fn acked_while_away(server: &Server, owner: &reqwest::Client) -> (Enrolled, String, String) {
+    let (node, mut socket, app_id, vm_id, lease_id) = node_with_lease(server, owner).await;
     let node_id = node.node_id.clone();
     send(
         &mut socket,
@@ -638,34 +637,56 @@ async fn a_pending_fence_ack_goes_out_after_the_revokes_and_before_the_desired_s
     )
     .await;
     wait_for_node(
-        &owner,
-        &server,
+        owner,
+        server,
         Some(&mut socket),
         &node_id,
         "a fence_failure",
         |node| !node["fence_failure"].is_null(),
     )
     .await;
-
-    // The node is gone when the operator acknowledges, so the command waits.
     drop(socket);
-    wait_for_node(&owner, &server, None, &node_id, "disconnected", |node| {
+    wait_for_node(owner, server, None, &node_id, "disconnected", |node| {
         node["status"] != "connected"
     })
     .await;
-    let res = ack(
-        &owner,
-        &server,
-        &node_id,
-        json!({ "lease_ids": [lease_id] }),
-    )
-    .await;
+    let res = ack(owner, server, &node_id, json!({ "lease_ids": [lease_id] })).await;
     assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(fence_ack_pending(&server, &node_id).await.is_some());
+    assert!(fence_ack_pending(server, &node_id).await.is_some());
+    (node, app_id, lease_id)
+}
 
-    // Section 4.2: the stale lease is revoked first, then `fence_ack`, and the
-    // desired state waits for its answer.
+/// Reads frames for `wait` and fails on any of the `forbidden` types.
+async fn none_of(socket: &mut Socket, forbidden: &[&str], wait: Duration) {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        match timeout(left, socket.next()).await {
+            Err(_) => return,
+            Ok(Some(Ok(WsMessage::Text(text)))) => {
+                let frame: Value = serde_json::from_str(text.as_str()).unwrap();
+                let kind = frame["type"].as_str().unwrap_or_default();
+                assert!(!forbidden.contains(&kind), "unexpected {kind}: {frame}");
+            }
+            Ok(Some(Ok(_))) => {}
+            Ok(other) => panic!("the socket ended: {other:?}"),
+        }
+    }
+}
+
+/// Section 4.2 rules 3 to 5: the stale-lease revoke goes first, the pending
+/// `fence_ack` only once it is answered, and the desired state only once the
+/// `fence_ack` is answered.
+#[tokio::test]
+async fn a_pending_fence_ack_goes_out_once_the_revokes_are_answered() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let (node, app_id, lease_id) = acked_while_away(&server, &owner).await;
+    let node_id = node.node_id.clone();
+
     let mut socket = connect(&server, &node.credential).await;
     send(
         &mut socket,
@@ -675,35 +696,35 @@ async fn a_pending_fence_ack_goes_out_after_the_revokes_and_before_the_desired_s
         ),
     )
     .await;
-    let frames = recv_until(&mut socket, &["welcome", "lease_revoke", "command"]).await;
-    let kinds: Vec<&str> = frames
-        .iter()
-        .map(|frame| frame["type"].as_str().unwrap())
-        .collect();
-    assert_eq!(kinds, ["welcome", "lease_revoke", "command"], "{frames:?}");
-    let revoke = &frames[1];
+    let frames = recv_until(&mut socket, &["welcome", "lease_revoke"]).await;
+    let revoke = of_type(&frames, "lease_revoke")[0].clone();
     assert_eq!(revoke["body"]["lease_id"], lease_id);
     assert_eq!(revoke["body"]["fencing_token"], 2);
-    let command = &frames[2];
-    assert_eq!(command["body"]["kind"], "fence_ack");
-    assert_eq!(command["body"]["params"]["lease_ids"], json!([lease_id]));
+    assert!(of_type(&frames, "command").is_empty(), "{frames:?}");
+    // Nothing else while the revoke is unanswered.
+    heartbeat(&mut socket).await;
+    none_of(
+        &mut socket,
+        &["command", "desired_state"],
+        Duration::from_millis(500),
+    )
+    .await;
 
-    // The node answers the revoke `fence_failed` (its failed fence is still
-    // recorded): that predates the acknowledgement, so the lease is not
-    // listed again.
+    // The node's fence at the new token stops everything: then the
+    // acknowledgement goes out, and the desired state waits for its answer.
     reply(
         &mut socket,
-        fence_failed_result(),
+        ok_result(),
         Some(revoke["id"].as_str().unwrap()),
     )
     .await;
-    // No desired state before the `fence_ack` is answered.
+    let frames = recv_until(&mut socket, &["command"]).await;
+    assert!(of_type(&frames, "desired_state").is_empty(), "{frames:?}");
+    let command = of_type(&frames, "command")[0].clone();
+    assert_eq!(command["body"]["kind"], "fence_ack");
+    assert_eq!(command["body"]["params"]["lease_ids"], json!([lease_id]));
     heartbeat(&mut socket).await;
-    let quiet = timeout(Duration::from_millis(500), socket.next()).await;
-    if let Ok(Some(Ok(WsMessage::Text(text)))) = quiet {
-        let frame: Value = serde_json::from_str(text.as_str()).unwrap();
-        assert_ne!(frame["type"], "desired_state", "{frame}");
-    }
+    none_of(&mut socket, &["desired_state"], Duration::from_millis(500)).await;
     reply(
         &mut socket,
         ok_result(),
@@ -714,6 +735,160 @@ async fn a_pending_fence_ack_goes_out_after_the_revokes_and_before_the_desired_s
     wait_for_no_pending_ack(&server, &mut socket, &node_id).await;
     let node = get_node(&owner, &server, &node_id).await;
     assert!(node["fence_failure"].is_null(), "{node}");
+}
+
+/// The blocker case of the review: after the operator checked, the node's
+/// fence at the new token fails again. That failure is listed, the
+/// acknowledgement no longer covers the lease, and no `fence_ack` reaches the
+/// node, so it stays failed.
+#[tokio::test]
+async fn a_revoke_that_fails_again_after_the_ack_keeps_the_lease_listed() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let (node, app_id, lease_id) = acked_while_away(&server, &owner).await;
+    let node_id = node.node_id.clone();
+
+    let mut socket = connect(&server, &node.credential).await;
+    send(
+        &mut socket,
+        hello(
+            &node_id,
+            vec![hello_lease(&lease_id, &app_id, 1, "revoked")],
+        ),
+    )
+    .await;
+    let frames = recv_until(&mut socket, &["welcome", "lease_revoke"]).await;
+    let revoke = of_type(&frames, "lease_revoke")[0].clone();
+    reply(
+        &mut socket,
+        fence_failed_result(),
+        Some(revoke["id"].as_str().unwrap()),
+    )
+    .await;
+    // With nothing left to acknowledge, the desired state follows at once,
+    // and no `fence_ack` is sent.
+    let frames = recv_until(&mut socket, &["desired_state"]).await;
+    assert!(of_type(&frames, "command").is_empty(), "{frames:?}");
+    heartbeat(&mut socket).await;
+    none_of(&mut socket, &["command"], Duration::from_millis(500)).await;
+    assert!(fence_ack_pending(&server, &node_id).await.is_none());
+    let listed = get_node(&owner, &server, &node_id).await;
+    assert_eq!(
+        listed["fence_failure"]["lease_ids"],
+        json!([lease_id]),
+        "{listed}"
+    );
+}
+
+/// A node that does not answer within the start wait still gets its desired
+/// state, and its late answers still count: a revoke answered late lets the
+/// `fence_ack` go out, and a late `ok` clears it.
+#[tokio::test]
+async fn late_answers_after_the_start_wait_still_deliver_the_ack() {
+    let server = start_with_patient_node_session().await;
+    server.state.hub.set_start_wait(Duration::from_millis(300));
+    let owner = server.owner().await;
+    let (node, app_id, lease_id) = acked_while_away(&server, &owner).await;
+    let node_id = node.node_id.clone();
+
+    let mut socket = connect(&server, &node.credential).await;
+    send(
+        &mut socket,
+        hello(
+            &node_id,
+            vec![hello_lease(&lease_id, &app_id, 1, "revoked")],
+        ),
+    )
+    .await;
+    let frames = recv_until(&mut socket, &["welcome", "lease_revoke", "desired_state"]).await;
+    assert!(of_type(&frames, "command").is_empty(), "{frames:?}");
+    let revoke = of_type(&frames, "lease_revoke")[0].clone();
+    heartbeat(&mut socket).await;
+
+    reply(
+        &mut socket,
+        ok_result(),
+        Some(revoke["id"].as_str().unwrap()),
+    )
+    .await;
+    let command = of_type(&recv_until(&mut socket, &["command"]).await, "command")[0].clone();
+    assert_eq!(command["body"]["kind"], "fence_ack");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    heartbeat(&mut socket).await;
+    assert!(fence_ack_pending(&server, &node_id).await.is_some());
+    reply(
+        &mut socket,
+        ok_result(),
+        Some(command["id"].as_str().unwrap()),
+    )
+    .await;
+    wait_for_no_pending_ack(&server, &mut socket, &node_id).await;
+
+    // A second session with nothing pending neither waits nor sends one.
+    drop(socket);
+    wait_for_node(&owner, &server, None, &node_id, "disconnected", |node| {
+        node["status"] != "connected"
+    })
+    .await;
+    let mut socket = connect(&server, &node.credential).await;
+    send(&mut socket, hello(&node_id, Vec::new())).await;
+    let frames = recv_until(&mut socket, &["welcome", "desired_state"]).await;
+    assert!(of_type(&frames, "command").is_empty(), "{frames:?}");
+}
+
+/// An acknowledgement leaves alone a listed lease that another node holds by
+/// now: that node's grant already carries a higher token. The failed node is
+/// still told, so it clears its own record.
+#[tokio::test]
+async fn an_ack_leaves_a_lease_another_node_holds_alone() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let (node, mut socket, app_id, vm_id, lease_id) = node_with_lease(&server, &owner).await;
+    let other = enrolled_node(&server, &owner, "node-beta").await;
+    send(
+        &mut socket,
+        fence_failed_event(&node.node_id, &lease_id, &app_id, &vm_id),
+    )
+    .await;
+    wait_for_node(
+        &owner,
+        &server,
+        Some(&mut socket),
+        &node.node_id,
+        "a fence_failure",
+        |node| !node["fence_failure"].is_null(),
+    )
+    .await;
+    // The lease moved on meanwhile (the restore race of #392).
+    sqlx::query("UPDATE leases SET holder_node_id = ?, fencing_token = 5 WHERE id = ?")
+        .bind(&other.node_id)
+        .bind(&lease_id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+
+    let res = ack(
+        &owner,
+        &server,
+        &node.node_id,
+        json!({ "lease_ids": [lease_id] }),
+    )
+    .await;
+    assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+    let (token, revoked_at, holder) = lease_row(&server, &lease_id).await;
+    assert_eq!(
+        (token, revoked_at, holder),
+        (5, None, other.node_id.clone())
+    );
+    let command = of_type(&recv_until(&mut socket, &["command"]).await, "command")[0].clone();
+    assert_eq!(command["body"]["params"]["lease_ids"], json!([lease_id]));
+    reply(
+        &mut socket,
+        ok_result(),
+        Some(command["id"].as_str().unwrap()),
+    )
+    .await;
+    wait_for_no_pending_ack(&server, &mut socket, &node.node_id).await;
 }
 
 #[tokio::test]

@@ -516,9 +516,11 @@ async fn refuse_unrestorable(state: &AppState, backup: &BackupRecord) -> Result<
     Ok(())
 }
 
-/// Checks that `node_id` is a node with the `node` role and no failed fence.
+/// Checks that `node_id` is a node with the `node` role, no failed fence and
+/// no acknowledgement it has not taken yet: until it answers the `fence_ack`
+/// it stays failed and starts nothing stateful (section 8.5).
 async fn target_node(state: &AppState, node_id: &str) -> Result<(), ApiError> {
-    let row = sqlx::query("SELECT roles, fence_failure FROM nodes WHERE id = ?")
+    let row = sqlx::query("SELECT roles, fence_failure, fence_ack_pending FROM nodes WHERE id = ?")
         .bind(node_id)
         .fetch_optional(state.store.pool())
         .await?
@@ -533,6 +535,12 @@ async fn target_node(state: &AppState, node_id: &str) -> Result<(), ApiError> {
     let fence_failure: Option<String> = row.try_get("fence_failure")?;
     if fence_failure.is_some() {
         return Err(ApiError::conflict("the target node has a fence failure"));
+    }
+    let fence_ack_pending: Option<String> = row.try_get("fence_ack_pending")?;
+    if fence_ack_pending.is_some() {
+        return Err(ApiError::conflict(
+            "the target node has not taken the acknowledgement of its failed fence yet",
+        ));
     }
     Ok(())
 }

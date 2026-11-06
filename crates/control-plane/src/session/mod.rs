@@ -321,6 +321,9 @@ struct HubInner {
     /// Woken by every change notification, so the domains' serving status
     /// is recomputed after the desired states it follows (ADR 0167).
     serving_inputs: Notify,
+    /// How long a session start waits for its revokes and `fence_ack`, in
+    /// milliseconds; see [`NodeHub::set_start_wait`].
+    start_wait_ms: AtomicU64,
 }
 
 /// A test seam that holds one node's next snapshot after it is built and
@@ -397,7 +400,21 @@ impl NodeHub {
             generation: AtomicU64::new(0),
             snapshot_holds: Mutex::new(HashMap::new()),
             serving_inputs: Notify::new(),
+            start_wait_ms: AtomicU64::new(
+                u64::try_from(crate::fences::FENCE_ACK_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+            ),
         }))
+    }
+
+    /// Test seam: how long a session start holds back the first desired
+    /// state for the revokes and the pending `fence_ack` (default
+    /// [`crate::fences::FENCE_ACK_TIMEOUT`]).
+    #[doc(hidden)]
+    pub fn set_start_wait(&self, wait: Duration) {
+        self.0.start_wait_ms.store(
+            u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     /// Test seam: holds `node_id`'s next snapshot that differs from the last
@@ -412,12 +429,6 @@ impl NodeHub {
             .expect("snapshot hold lock")
             .insert(node_id.to_string(), Arc::clone(&hold));
         hold
-    }
-
-    /// The store the sessions write to.
-    #[must_use]
-    pub(crate) fn store(&self) -> &Store {
-        &self.0.store
     }
 
     /// Whether `node_id` has a live session.
@@ -1050,6 +1061,18 @@ impl HubInner {
             .map(|handle| Arc::clone(&handle.pending))
     }
 
+    /// Whether a `lease_revoke` sent on `generation` of the node's session is
+    /// still unanswered.
+    fn revokes_unanswered(&self, node_id: &str, generation: u64) -> bool {
+        self.pending_of(node_id, generation).is_some_and(|pending| {
+            !pending
+                .lock()
+                .expect("pending lock")
+                .revoke_leases
+                .is_empty()
+        })
+    }
+
     /// The lease of the `lease_revoke` that `re` answers, once.
     fn take_revoke(&self, node_id: &str, generation: u64, re: &str) -> Option<String> {
         let pending = self.pending_of(node_id, generation)?;
@@ -1489,17 +1512,22 @@ struct Session {
     inventory_parts: Assembler,
     /// When this session last asked the node to resend an inventory, by digest.
     inventory_requests: HashMap<String, Instant>,
-    /// The `fence_ack` sent at session start whose answer the desired state
-    /// waits for (section 4.2 rule 4).
-    fence_ack: Option<FenceAckWait>,
+    /// The `stored_rev` of the `hello` whose first desired state waits for
+    /// the revokes and the pending `fence_ack` to be answered (section 4.2
+    /// rules 3 to 5).
+    start_wait: Option<u64>,
+    /// The `fence_ack` sent on this session and not answered yet.
+    fence_ack: Option<FenceAckSent>,
+    /// Set when the node answered a `fence_ack` with an error: it is not sent
+    /// again on this session, and the next session sends it again.
+    fence_ack_stopped: bool,
 }
 
-/// A `fence_ack` sent at session start, and the `stored_rev` of the `hello`
-/// whose desired state waits for its answer.
-struct FenceAckWait {
+/// A `fence_ack` the node has not answered: its message id and the lease ids
+/// it carried.
+struct FenceAckSent {
     msg_id: String,
     lease_ids: Vec<String>,
-    stored_rev: u64,
 }
 
 async fn run_session(
@@ -1529,15 +1557,17 @@ async fn run_session(
         digest_failures: HashMap::new(),
         inventory_parts: Assembler::new(),
         inventory_requests: HashMap::new(),
+        start_wait: None,
         fence_ack: None,
+        fence_ack_stopped: false,
     };
     let mut superseded = false;
     let mut reason = "session_closed";
     let mut close_after_error = false;
     let retry = tokio::time::sleep(SNAPSHOT_RETRY);
     tokio::pin!(retry);
-    let fence_ack_wait = tokio::time::sleep(crate::fences::FENCE_ACK_TIMEOUT);
-    tokio::pin!(fence_ack_wait);
+    let start_wait = tokio::time::sleep(crate::fences::FENCE_ACK_TIMEOUT);
+    tokio::pin!(start_wait);
 
     'session: loop {
         while let Ok(text) = rx.try_recv() {
@@ -1559,17 +1589,18 @@ async fn run_session(
                     Some(Ok(Message::Text(text))) => {
                         deadline = Instant::now() + timeout;
                         let was_pending = session.retry_pending;
-                        let was_waiting = session.fence_ack.is_some();
+                        let was_waiting = session.start_wait.is_some();
                         if session.handle_text(text.as_str(), &mut outbox).await {
                             close_after_error = true;
                         }
                         if session.retry_pending && !was_pending {
                             retry.as_mut().reset(Instant::now() + SNAPSHOT_RETRY);
                         }
-                        if session.fence_ack.is_some() && !was_waiting {
-                            fence_ack_wait
-                                .as_mut()
-                                .reset(Instant::now() + crate::fences::FENCE_ACK_TIMEOUT);
+                        if session.start_wait.is_some() && !was_waiting {
+                            let wait = Duration::from_millis(
+                                session.hub.0.start_wait_ms.load(Ordering::Relaxed),
+                            );
+                            start_wait.as_mut().reset(Instant::now() + wait);
                         }
                     }
                     Some(Ok(Message::Binary(_))) => {
@@ -1599,7 +1630,7 @@ async fn run_session(
                     break;
                 }
             }
-            () = changed.notified(), if session.connected && session.fence_ack.is_none() => {
+            () = changed.notified(), if session.connected && session.start_wait.is_none() => {
                 let was_pending = session.retry_pending;
                 match session.refresh(0, false).await {
                     Ok(()) => session.retry_pending = false,
@@ -1611,8 +1642,11 @@ async fn run_session(
                 if session.retry_pending && !was_pending {
                     retry.as_mut().reset(Instant::now() + SNAPSHOT_RETRY);
                 }
+                // An acknowledgement recorded while the node is connected
+                // reaches it at once (section 8.5 step 4).
+                session.send_fence_ack(&mut outbox).await;
             }
-            () = &mut retry, if session.retry_pending && session.fence_ack.is_none() => {
+            () = &mut retry, if session.retry_pending && session.start_wait.is_none() => {
                 match session.refresh(0, false).await {
                     Ok(()) => session.retry_pending = false,
                     Err(e) => {
@@ -1621,17 +1655,18 @@ async fn run_session(
                     }
                 }
             }
-            () = &mut fence_ack_wait, if session.fence_ack.is_some() => {
-                // Section 4.2 rule 4 waits for the answer; a node that never
-                // gives one still gets its desired state, and the
-                // acknowledgement stays pending for its next session.
+            () = &mut start_wait, if session.start_wait.is_some() => {
+                // A node that does not answer within the wait still gets its
+                // desired state. A `fence_ack` already sent keeps its message
+                // id, so a late `ok` still clears it; one not sent yet waits
+                // for the revokes, or for the next session.
                 let was_pending = session.retry_pending;
-                if let Some(wait) = session.fence_ack.take() {
+                if let Some(stored_rev) = session.start_wait.take() {
                     tracing::warn!(
                         node_id = %session.node_id,
-                        "no answer to the fence_ack; it is sent again at the next session"
+                        "the revokes or the fence_ack of the session start were not answered in time"
                     );
-                    session.finish_start(wait.stored_rev, &mut outbox).await;
+                    session.finish_start(stored_rev, &mut outbox).await;
                 }
                 if session.retry_pending && !was_pending {
                     retry.as_mut().reset(Instant::now() + SNAPSHOT_RETRY);
@@ -1766,10 +1801,12 @@ impl Session {
             // desired state (rule 5) and the app leases this node holds
             // (section 5.12).
             self.revoke_stale_leases(&hello.leases, outbox).await;
-            if self.send_pending_fence_ack(hello.stored_rev, outbox).await {
-                return false;
+            if self.has_pending_fence_ack().await {
+                self.start_wait = Some(hello.stored_rev);
+                self.advance_start(outbox).await;
+            } else {
+                self.finish_start(hello.stored_rev, outbox).await;
             }
-            self.finish_start(hello.stored_rev, outbox).await;
             return false;
         }
 
@@ -1851,7 +1888,7 @@ impl Session {
                     if self
                         .fence_ack
                         .as_ref()
-                        .is_some_and(|wait| wait.msg_id == re)
+                        .is_some_and(|sent| sent.msg_id == re)
                     {
                         self.fence_ack_answered(&result, outbox).await;
                         return false;
@@ -1860,6 +1897,8 @@ impl Session {
                         self.hub.0.take_revoke(&self.node_id, self.generation, re)
                     {
                         self.note_revoke_answer(&lease_id, &result).await;
+                        self.revoke_answered(outbox).await;
+                        return false;
                     }
                     self.hub
                         .0
@@ -1889,6 +1928,17 @@ impl Session {
                     message = %error.message,
                     "node reported an error"
                 );
+                // A refused revoke is answered with `error` (section 5.13);
+                // it is answered all the same.
+                if let Some(re) = raw.re.as_deref()
+                    && self
+                        .hub
+                        .0
+                        .take_revoke(&self.node_id, self.generation, re)
+                        .is_some()
+                {
+                    self.revoke_answered(outbox).await;
+                }
             }
             NodeMessage::Hello(_) => outbox.push(protocol_error(
                 quoro_proto::ErrorCode::BadMessage,
@@ -2057,16 +2107,46 @@ impl Session {
         }
     }
 
-    /// Sends the node's pending fence acknowledgement as `command` kind
-    /// `fence_ack` (section 4.2 rule 4, section 8.5 step 4). Returns whether
-    /// one was sent; the desired state then waits for its answer.
-    async fn send_pending_fence_ack(&mut self, stored_rev: u64, outbox: &mut Vec<String>) -> bool {
-        let pending = match self.hub.0.store.pool().acquire().await {
-            Ok(mut conn) => crate::fences::pending_of(&mut conn, &self.node_id).await,
-            Err(e) => Err(ApiError::from(e)),
-        };
-        let pending = match pending {
-            Ok(Some(pending)) if !pending.lease_ids.is_empty() => pending,
+    /// Whether an operator's acknowledgement waits for delivery to this node
+    /// (`fence_ack_pending`, section 8.5 step 4).
+    async fn has_pending_fence_ack(&self) -> bool {
+        match self.pending_fence_ack().await {
+            Ok(pending) => !pending.is_empty(),
+            Err(e) => {
+                tracing::warn!(code = %e.code.as_str(), node_id = %self.node_id, "cannot read a pending fence ack");
+                false
+            }
+        }
+    }
+
+    async fn pending_fence_ack(&self) -> Result<Vec<String>, ApiError> {
+        let mut conn = self.hub.0.store.pool().acquire().await?;
+        Ok(crate::fences::pending_of(&mut conn, &self.node_id)
+            .await?
+            .map(|pending| pending.lease_ids)
+            .unwrap_or_default())
+    }
+
+    /// Sends `command` kind `fence_ack` with the pending acknowledgement
+    /// (section 5.17, section 8.5 step 4), unless one is unanswered, the node
+    /// refused one on this session, or a `lease_revoke` this session sent is
+    /// unanswered. The node answers revokes before it processes a `command`
+    /// (section 4.2 rule 3), so an acknowledgement sent with a revoke
+    /// unanswered would clear a failed fence that the revoke's own fence
+    /// records. Waiting for the answer lets a `fence_failed` answer take its
+    /// lease out of the acknowledgement first. Returns whether one was sent.
+    async fn send_fence_ack(&mut self, outbox: &mut Vec<String>) -> bool {
+        if self.fence_ack.is_some()
+            || self.fence_ack_stopped
+            || self
+                .hub
+                .0
+                .revokes_unanswered(&self.node_id, self.generation)
+        {
+            return false;
+        }
+        let lease_ids = match self.pending_fence_ack().await {
+            Ok(lease_ids) if !lease_ids.is_empty() => lease_ids,
             Ok(_) => return false,
             Err(e) => {
                 tracing::warn!(code = %e.code.as_str(), node_id = %self.node_id, "cannot read a pending fence ack");
@@ -2077,35 +2157,64 @@ impl Session {
         outbox.push(
             ControlMessage::Command(wire::Command {
                 kind: "fence_ack".to_string(),
-                params: crate::fences::command_params(&pending.lease_ids),
+                params: crate::fences::command_params(&lease_ids),
             })
             .to_frame(&msg_id, None)
             .to_text(),
         );
-        self.fence_ack = Some(FenceAckWait {
-            msg_id,
-            lease_ids: pending.lease_ids,
-            stored_rev,
-        });
+        self.fence_ack = Some(FenceAckSent { msg_id, lease_ids });
         true
     }
 
-    /// The answer to the session-start `fence_ack`: `ok` clears what it
-    /// carried from `fence_ack_pending` (section 8.5 step 4); then the
-    /// desired state follows (section 4.2 rule 5).
+    /// Section 4.2 rules 4 and 5 at session start: once every revoke is
+    /// answered, the pending acknowledgement goes out and the desired state
+    /// waits for its answer; with nothing left to acknowledge, the desired
+    /// state goes out.
+    async fn advance_start(&mut self, outbox: &mut Vec<String>) {
+        let Some(stored_rev) = self.start_wait else {
+            return;
+        };
+        if self.fence_ack.is_some()
+            || self
+                .hub
+                .0
+                .revokes_unanswered(&self.node_id, self.generation)
+            || self.send_fence_ack(outbox).await
+        {
+            return;
+        }
+        self.start_wait = None;
+        self.finish_start(stored_rev, outbox).await;
+    }
+
+    /// A `lease_revoke` this session sent was answered: the session start
+    /// may go on, and a pending acknowledgement may go out.
+    async fn revoke_answered(&mut self, outbox: &mut Vec<String>) {
+        if self.start_wait.is_some() {
+            self.advance_start(outbox).await;
+        } else {
+            self.send_fence_ack(outbox).await;
+        }
+    }
+
+    /// The answer to a `fence_ack`: `ok` clears what it carried from
+    /// `fence_ack_pending` (section 8.5 step 4) and lets a newer
+    /// acknowledgement go out; an error stops it for this session. The
+    /// session start then goes on (section 4.2 rule 5).
     async fn fence_ack_answered(
         &mut self,
         result: &quoro_proto::CommandResult,
         outbox: &mut Vec<String>,
     ) {
-        let Some(wait) = self.fence_ack.take() else {
+        let Some(sent) = self.fence_ack.take() else {
             return;
         };
         if result.status == quoro_proto::CommandStatus::Ok {
             if let Err(e) =
-                crate::fences::confirm(&self.hub.0.store, &self.node_id, &wait.lease_ids).await
+                crate::fences::confirm(&self.hub.0.store, &self.node_id, &sent.lease_ids).await
             {
                 tracing::warn!(code = %e.code.as_str(), node_id = %self.node_id, "cannot clear a delivered fence ack");
+                self.fence_ack_stopped = true;
             }
         } else {
             tracing::warn!(
@@ -2113,8 +2222,12 @@ impl Session {
                 detail = ?result.detail,
                 "the node did not take the fence ack; it is sent again at its next session"
             );
+            self.fence_ack_stopped = true;
         }
-        self.finish_start(wait.stored_rev, outbox).await;
+        if let Some(stored_rev) = self.start_wait.take() {
+            self.finish_start(stored_rev, outbox).await;
+        }
+        self.send_fence_ack(outbox).await;
     }
 
     /// Section 4.2 rule 5 and section 5.12: the first desired state of the
