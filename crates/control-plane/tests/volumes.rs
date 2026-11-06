@@ -919,6 +919,131 @@ async fn delete_releases_the_lease_and_the_deleted_report_ends_the_stateful_app(
     assert_eq!(lease_rows, 1, "the lease row is revoked");
 }
 
+/// Issue #333 (ADR 0165): deleting an app keeps each of its volumes as
+/// `deleting`, so the node gets the file as `deleted` and removes it; the row
+/// goes only when the node reports it deleted. The holder of the app's
+/// `local` lease is told with reason `deleted` before that snapshot.
+#[tokio::test]
+async fn deleting_an_app_keeps_its_volume_deleting_until_the_node_removes_the_file() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled_node(&server, &owner, "node-alpha").await;
+    let (mut socket, _) = open(&server, &node).await;
+    heartbeat(&mut socket).await;
+
+    let project_id = create_project(&owner, &server, "demo").await;
+    let app_id = create_app(&owner, &server, &project_id, "web").await;
+    deploy_app(&owner, &server, &app_id, IMAGE).await;
+    recv_type(&mut socket, "desired_state").await;
+    heartbeat(&mut socket).await;
+
+    let res = create_volume(&owner, &server, &app_id, 5, "/data").await;
+    assert_eq!(res.status(), 201);
+    let volume_id = res.json::<Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let frames = recv_until(&mut socket, &["lease_grant", "desired_state"]).await;
+    let ready_rev = frames
+        .iter()
+        .find(|frame| frame["type"] == "desired_state")
+        .unwrap()["body"]["rev"]
+        .as_u64()
+        .unwrap();
+    send(
+        &mut socket,
+        status_report(
+            ready_rev,
+            vec![VolumeStatus {
+                volume_id: volume_id.clone(),
+                state: WireVolumeState::Ready,
+                allocated_bytes: Some(4096),
+                error: None,
+            }],
+        ),
+    )
+    .await;
+    wait_for_volume_state(&owner, &server, &mut socket, &volume_id, "ready").await;
+    heartbeat(&mut socket).await;
+
+    let res = owner
+        .delete(server.url(&format!("/api/v1/apps/{app_id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 202, "delete: {}", res.text().await.unwrap());
+
+    // The app is gone, but its volume stays readable as `deleting`.
+    let res = owner
+        .get(server.url(&format!("/api/v1/volumes/{volume_id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "the volume outlives its app");
+    assert_eq!(res.json::<Value>().await.unwrap()["state"], "deleting");
+
+    // The holder is revoked with reason `deleted`, and a snapshot without the
+    // app's instance carries the file as `deleted`.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut revoked = false;
+    let snapshot = loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no snapshot carried the volume as deleted"
+        );
+        let frame = recv_frame(&mut socket).await;
+        if frame["type"] == "lease_revoke" {
+            assert_eq!(frame["body"]["reason"], "deleted", "{frame}");
+            revoked = true;
+            continue;
+        }
+        if frame["type"] == "desired_state"
+            && frame["body"]["spec"]["volumes"][0]["state"] == "deleted"
+        {
+            break frame;
+        }
+    };
+    assert!(revoked, "the lease_revoke comes before the snapshot");
+    assert_eq!(
+        snapshot["body"]["spec"]["volumes"][0]["volume_id"],
+        volume_id
+    );
+    assert_eq!(snapshot["body"]["spec"]["vms"], json!([]), "{snapshot}");
+
+    // The node removed the file: the row goes.
+    let rev = snapshot["body"]["rev"].as_u64().unwrap();
+    send(
+        &mut socket,
+        status_report(
+            rev,
+            vec![VolumeStatus {
+                volume_id: volume_id.clone(),
+                state: WireVolumeState::Deleted,
+                allocated_bytes: None,
+                error: None,
+            }],
+        ),
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let res = owner
+            .get(server.url(&format!("/api/v1/volumes/{volume_id}")))
+            .send()
+            .await
+            .unwrap();
+        if res.status() == 404 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the volume row was not removed"
+        );
+        heartbeat(&mut socket).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test]
 async fn a_stateful_deployment_drops_the_old_vm_in_the_same_revision() {
     let server = start_with_patient_node_session().await;
