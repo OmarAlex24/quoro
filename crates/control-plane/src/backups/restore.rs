@@ -70,16 +70,18 @@ pub(crate) struct AppliedRestores {
     pub desired_changed: bool,
     /// New `local` leases, one per restore that became `ready`.
     pub grants: Vec<Lease>,
-    /// The nodes the app's instances moved away from. Each must hear a
-    /// snapshot without them, so it deletes them.
-    pub left_node_ids: Vec<String>,
+    /// Other nodes whose desired state changed: the nodes the app's instances
+    /// moved away from (a `ready` restore), so they delete them, and the
+    /// nodes the instances stayed on (a `failed` restore), so they get them
+    /// back.
+    pub other_node_ids: Vec<String>,
 }
 
 impl AppliedRestores {
     fn merge(&mut self, other: Self) {
         self.desired_changed |= other.desired_changed;
         self.grants.extend(other.grants);
-        self.left_node_ids.extend(other.left_node_ids);
+        self.other_node_ids.extend(other.other_node_ids);
     }
 }
 
@@ -261,8 +263,9 @@ pub(crate) async fn apply_status(
                 applied.merge(outcome);
             }
             wire::VolumeState::Failed => {
-                restore_failed(store, node_id, &volume, reported).await?;
+                let vm_node_ids = restore_failed(store, node_id, &volume, reported).await?;
                 applied.desired_changed = true;
+                applied.other_node_ids.extend(vm_node_ids);
             }
             _ => {}
         }
@@ -360,7 +363,7 @@ async fn restore_ready(
             .map_err(|error| ApiError::internal(&format!("app payload: {error}")))?,
     )
     .await?;
-    let left_node_ids = move_vms(&mut w.tx, &app.id, node_id, &actor).await?;
+    let other_node_ids = move_vms(&mut w.tx, &app.id, node_id, &actor).await?;
 
     events::emit(
         &mut w.tx,
@@ -397,18 +400,20 @@ async fn restore_ready(
     Ok(AppliedRestores {
         desired_changed: true,
         grants: vec![lease],
-        left_node_ids,
+        other_node_ids,
     })
 }
 
 /// The `failed` transition: the row keeps the node's reason and the event says
 /// why (`backup-format.md` section 8.1). The app stays stopped, without a lease.
+/// Returns the nodes that hold the app's instances: with no volume `restoring`
+/// any more, the instances are back in those nodes' desired state, stopped.
 async fn restore_failed(
     store: &Store,
     node_id: &str,
     before: &Volume,
     reported: &wire::VolumeStatus,
-) -> Result<(), ApiError> {
+) -> Result<Vec<String>, ApiError> {
     let actor = Actor::system("volumes");
     let mut w = store.begin_write().await?;
     let row = sqlx::query(&format!(
@@ -420,7 +425,7 @@ async fn restore_failed(
     .ok_or_else(|| ApiError::internal(&"the restoring volume disappeared"))?;
     let mut current = crate::api::volumes::volume_from_row(&row)?;
     if current.state != VolumeState::Restoring {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let reason = reported
         .error
@@ -467,8 +472,13 @@ async fn restore_failed(
         },
     )
     .await?;
+    let vm_node_ids: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT node_id FROM vms WHERE app_id = ? ORDER BY node_id")
+            .bind(&current.app_id)
+            .fetch_all(&mut *w.tx)
+            .await?;
     w.commit().await?;
-    Ok(())
+    Ok(vm_node_ids)
 }
 
 /// The refusals of `openapi.yaml` `restoreBackup` that read the backup, the

@@ -2513,9 +2513,10 @@ async fn apply_status_report(
                 hub.node_changed(node_id);
             }
             // A node the app's instances moved away from must hear a
-            // snapshot without them, or it keeps them (issue #287).
-            for left in &applied.left_node_ids {
-                hub.node_changed(left);
+            // snapshot without them, or it keeps them (issue #287); after a
+            // failed restore, the node they stayed on gets them back.
+            for other in &applied.other_node_ids {
+                hub.node_changed(other);
             }
         }
         Err(e) => tracing::warn!(

@@ -1068,6 +1068,10 @@ async fn a_failed_restore_leaves_the_app_stopped_without_a_lease() {
     assert_eq!(res.status(), 202);
     let new_volume: Value = res.json().await.unwrap();
     let new_volume_id = new_volume["id"].as_str().unwrap().to_string();
+    // While the restore runs, the app's VM has left its old node.
+    recv_type(&mut setup.state.socket, "lease_revoke").await;
+    let during = recv_type(&mut setup.state.socket, "desired_state").await;
+    assert!(names_vm(&during, &setup.state.vm_id).is_none());
     let snapshot = desired_state_with_volume(&mut setup.socket_b, &new_volume_id).await;
     let rev = snapshot["body"]["rev"].as_u64().unwrap();
     send(
@@ -1104,6 +1108,17 @@ async fn a_failed_restore_leaves_the_app_stopped_without_a_lease() {
     .await
     .unwrap();
     assert_eq!(unrevoked, 0, "the app has no lease");
+
+    // The app stays on its old node: that node gets its VM back at once,
+    // stopped and without a volume.
+    let vm_id = setup.state.vm_id.clone();
+    let after = desired_state_until(&mut setup.state.socket, |frame| {
+        names_vm(frame, &vm_id).is_some()
+    })
+    .await;
+    let back = names_vm(&after, &vm_id).unwrap();
+    assert_eq!(back["desired_status"], "stopped");
+    assert_eq!(back["volumes"], json!([]));
 
     let data: String = sqlx::query_scalar("SELECT data FROM events WHERE type = 'restore.failed'")
         .fetch_one(setup.state.server.state.store.pool())
