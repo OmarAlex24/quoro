@@ -63,12 +63,14 @@ describe('lampState', () => {
     expect(state.statusText).toBe('Crashed');
   });
 
-  it('keeps the target on the ring when the node has not reported yet', () => {
+  it('keeps the target on the ring and does not pulse while the state is unknown', () => {
     const state = lampState(vm('running', 'unknown'));
     expect(state.ringColor).toBe(LAMP_COLORS.run);
     expect(state.coreColor).toBe(LAMP_COLORS.unknown);
-    expect(state.pulse).toBe(true);
-    expect(state.text).toBe('Unknown, will be running');
+    expect(state.pulse).toBe(false);
+    expect(state.converging).toBe(false);
+    expect(state.text).toBe('Unknown');
+    expect(state.statusText).toBe('Unknown');
   });
 });
 
@@ -77,7 +79,6 @@ describe('isConverging', () => {
     expect(isConverging('running', 'running')).toBe(false);
     expect(isConverging('running', 'creating')).toBe(true);
     expect(isConverging('running', 'starting')).toBe(true);
-    expect(isConverging('running', 'unknown')).toBe(true);
   });
 
   it('follows the refresh rule: desired stopped is settled at stopped', () => {
@@ -89,6 +90,14 @@ describe('isConverging', () => {
   it('treats a crash as settled, so it does not keep the list on a 1 s clock', () => {
     expect(isConverging('running', 'crashed')).toBe(false);
     expect(isConverging('stopped', 'crashed')).toBe(false);
+  });
+
+  it('treats unknown as settled: a disconnected node can stay away for hours', () => {
+    expect(isConverging('running', 'unknown')).toBe(false);
+    expect(isConverging('stopped', 'unknown')).toBe(false);
+    expect(listIsConverging([vm('running', 'running'), vm('running', 'unknown')])).toBe(
+      false,
+    );
   });
 
   it('detects one converging VM among many', () => {

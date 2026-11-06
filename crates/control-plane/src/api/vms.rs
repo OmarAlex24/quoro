@@ -33,6 +33,11 @@ pub(crate) const VM_COLUMNS: &str = "id, project_id, app_id, node_id, name, vcpu
      desired_status, observed_status, ip, restart_generation, restart_count, last_exit_code, \
      created_at, updated_at";
 
+/// The status of the VM's node, selected next to [`VM_COLUMNS`] by the read
+/// paths that present a VM through [`vm_as_seen`].
+pub(crate) const NODE_STATUS_COLUMN: &str =
+    "(SELECT status FROM nodes WHERE nodes.id = vms.node_id) AS node_status";
+
 /// `vms.desired_status` (`Vm.desired_status`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -250,6 +255,26 @@ pub(crate) fn vm_from_row(row: &SqliteRow) -> Result<Vm, ApiError> {
     })
 }
 
+/// A `vms` row read with [`NODE_STATUS_COLUMN`], as the API presents it: the
+/// status its node last reported while that node is `connected`, and
+/// `unknown` while it is not. A node without a session reports nothing, and
+/// the primary treats a VM its node does not report as `unknown`
+/// (`node-agent-protocol.md` section 5.3). A `deleted` VM stays `deleted`:
+/// its node did report that.
+///
+/// Only what the API shows changes. The row keeps the last reported status,
+/// which the deployments, the app status and the change log go by, so a
+/// disconnect writes nothing and a reconnect emits no `vm.*` event.
+pub(crate) fn vm_as_seen(row: &SqliteRow) -> Result<Vm, ApiError> {
+    let mut vm = vm_from_row(row)?;
+    let node_status: Option<String> = row.get("node_status");
+    if node_status.as_deref() != Some("connected") && vm.observed_status != ObservedStatus::Deleted
+    {
+        vm.observed_status = ObservedStatus::Unknown;
+    }
+    Ok(vm)
+}
+
 fn vm_target(vm_id: &str) -> Target {
     Target {
         kind: "vm".to_string(),
@@ -398,7 +423,7 @@ pub async fn list_vms(
         let limit = page_query.limit()?;
         let after = page_query.after();
 
-        let mut sql = format!("SELECT {VM_COLUMNS} FROM vms WHERE id > ?");
+        let mut sql = format!("SELECT {VM_COLUMNS}, {NODE_STATUS_COLUMN} FROM vms WHERE id > ?");
         if query.project_id.is_some() {
             sql.push_str(" AND project_id = ?");
         }
@@ -418,10 +443,7 @@ pub async fn list_vms(
             .bind(limit + 1)
             .fetch_all(state.store.pool())
             .await?;
-        let vms = rows
-            .iter()
-            .map(vm_from_row)
-            .collect::<Result<Vec<_>, _>>()?;
+        let vms = rows.iter().map(vm_as_seen).collect::<Result<Vec<_>, _>>()?;
         let (items, next_cursor) = page::finish(vms, limit, |vm| vm.id.clone());
         let items = access
             .filter(&state, items, |vm| crate::request::Resource {
@@ -484,13 +506,15 @@ pub async fn get_vm(
         if !is_id(Prefix::Vm, &vm_id) {
             return Err(ApiError::not_found("vm"));
         }
-        let row = sqlx::query(&format!("SELECT {VM_COLUMNS} FROM vms WHERE id = ?"))
-            .bind(&vm_id)
-            .fetch_optional(state.store.pool())
-            .await?;
+        let row = sqlx::query(&format!(
+            "SELECT {VM_COLUMNS}, {NODE_STATUS_COLUMN} FROM vms WHERE id = ?"
+        ))
+        .bind(&vm_id)
+        .fetch_optional(state.store.pool())
+        .await?;
         match row {
             Some(row) => {
-                let vm = vm_from_row(&row)?;
+                let vm = vm_as_seen(&row)?;
                 access.set_project(Some(&vm.project_id));
                 Ok(Json(vm))
             }

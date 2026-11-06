@@ -1010,3 +1010,227 @@ async fn an_edge_reports_backend_health_and_a_replicated_app_gets_degraded() {
     };
     assert_eq!(incidents, 1);
 }
+
+/// A `status_report` with one VM, as a node sends it after `desired_state`.
+fn report_one(applied_rev: u64, vm_id: &str, status: ObservedStatus) -> NodeMessage {
+    NodeMessage::StatusReport(StatusReport {
+        applied_rev,
+        vms: vec![VmStatus {
+            vm_id: vm_id.to_string(),
+            observed_status: status,
+            health: Health::Passing,
+            ip: Some("10.42.1.7".to_string()),
+            restart_count: 0,
+            last_exit_code: None,
+        }],
+        routes: Vec::new(),
+        capacity: WireCapacity {
+            cpus: 8,
+            memory_mb: 16_384,
+            disk_gb: 100,
+        },
+        allocated: WireCapacity {
+            cpus: 1,
+            memory_mb: 256,
+            disk_gb: 1,
+        },
+        disk_free_gb: 90.0,
+        builds: Vec::new(),
+        edge_backends: Vec::new(),
+        backups: Vec::new(),
+        images: Vec::new(),
+        volumes: Vec::new(),
+    })
+}
+
+/// How the API shows `vm_id` through each read path: `GET /vms/{id}`, the
+/// node's `GET /vms` page and the app's `instances`.
+async fn observed_everywhere(
+    server: &Server,
+    owner: &reqwest::Client,
+    app_id: &str,
+    node_id: &str,
+    vm_id: &str,
+) -> [String; 3] {
+    let one = vm_json(server, owner, vm_id).await;
+    let page: Value = owner
+        .get(server.url(&format!("/api/v1/vms?node_id={node_id}")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let app: Value = owner
+        .get(server.url(&format!("/api/v1/apps/{app_id}")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let listed = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|vm| vm["id"] == vm_id)
+        .expect("the VM is listed");
+    let instance = app["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|vm| vm["id"] == vm_id)
+        .expect("the VM is an instance");
+    [
+        one["observed_status"].as_str().unwrap().to_string(),
+        listed["observed_status"].as_str().unwrap().to_string(),
+        instance["observed_status"].as_str().unwrap().to_string(),
+    ]
+}
+
+/// The number of `vm.*` events, and the status the database row holds.
+async fn vm_facts(server: &Server, vm_id: &str) -> (i64, String) {
+    let (events,): (i64,) = sqlx::query_as("SELECT count(*) FROM events WHERE type LIKE 'vm.%'")
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+    let (stored,): (String,) = sqlx::query_as("SELECT observed_status FROM vms WHERE id = ?")
+        .bind(vm_id)
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+    (events, stored)
+}
+
+#[tokio::test]
+async fn an_instance_on_a_disconnected_node_reads_unknown_until_its_node_reports() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+    let (mut socket, _) = open(&server, &node).await;
+
+    let project: Value = owner
+        .post(server.url("/api/v1/projects"))
+        .json(&json!({ "slug": "demo", "name": "Demo" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let project_id = project["id"].as_str().unwrap();
+    heartbeat(&mut socket).await;
+    let image = "ghcr.io/example/web@sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    let res = owner
+        .post(server.url("/api/v1/apps"))
+        .json(&json!({
+            "project_id": project_id,
+            "name": "web",
+            "image": image,
+            "port": 8080,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        201,
+        "create app: {}",
+        res.text().await.unwrap()
+    );
+    let app: Value = res.json().await.unwrap();
+    let app_id = app["id"].as_str().unwrap().to_string();
+    heartbeat(&mut socket).await;
+    let res = owner
+        .post(server.url(&format!("/api/v1/apps/{app_id}/deployments")))
+        .json(&json!({ "image": image }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        202,
+        "create deployment: {}",
+        res.text().await.unwrap()
+    );
+    heartbeat(&mut socket).await;
+
+    // The node gets the instance and reports it running.
+    let snapshot = loop {
+        let snapshot = recv_type(&mut socket, "desired_state").await;
+        if !snapshot["body"]["spec"]["vms"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+        {
+            break snapshot;
+        }
+    };
+    let rev = snapshot["body"]["rev"].as_u64().unwrap();
+    let vm_id = snapshot["body"]["spec"]["vms"][0]["vm_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    send(
+        &mut socket,
+        report_one(rev, &vm_id, ObservedStatus::Running),
+    )
+    .await;
+    wait_for_vm(&server, &owner, &mut socket, &vm_id, "running").await;
+    assert_eq!(
+        observed_everywhere(&server, &owner, &app_id, &node.node_id, &vm_id).await,
+        ["running", "running", "running"]
+    );
+    let (events, stored) = vm_facts(&server, &vm_id).await;
+    assert_eq!(stored, "running");
+
+    // The node's session ends. Its instance is no longer known to be running.
+    socket.close(None).await.unwrap();
+    drop(socket);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while node_json(&server, &owner, &node.node_id).await["status"] != "disconnected" {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the node is not disconnected"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        observed_everywhere(&server, &owner, &app_id, &node.node_id, &vm_id).await,
+        ["unknown", "unknown", "unknown"],
+        "an instance on a disconnected node reads unknown in every read path"
+    );
+    // Only what the API shows changed: the row keeps the node's last report,
+    // and no `vm.*` event was emitted.
+    assert_eq!(
+        vm_facts(&server, &vm_id).await,
+        (events, "running".to_string())
+    );
+
+    // The node comes back and reports again: the instance reads running, and
+    // still no `vm.*` event, since nothing about the VM changed.
+    let (mut socket, snapshot) = open(&server, &node).await;
+    let rev = snapshot["body"]["rev"].as_u64().unwrap();
+    send(
+        &mut socket,
+        report_one(rev, &vm_id, ObservedStatus::Running),
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let seen = observed_everywhere(&server, &owner, &app_id, &node.node_id, &vm_id).await;
+        if seen == ["running", "running", "running"] {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the reconnected node's instance reads {seen:?}"
+        );
+        heartbeat(&mut socket).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        vm_facts(&server, &vm_id).await,
+        (events, "running".to_string())
+    );
+}

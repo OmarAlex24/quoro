@@ -1,8 +1,8 @@
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
-import type { Vm } from '../api/generated/model';
-import { AppInstances } from './app-instances';
+import type { Node, Vm } from '../api/generated/model';
+import { AppInstances, instanceStatusText } from './app-instances';
 
 const instance = (overrides: Partial<Vm> = {}): Vm => ({
   id: 'vm_01HZZZZZZZZZZZZZZZZZZZZZZZ',
@@ -29,9 +29,10 @@ const render = (
   instances: readonly Vm[],
   nodeNames: Record<string, string> = {},
   hasSource = false,
+  nodeStatuses: Record<string, Node['status']> = {},
 ): string =>
   renderToStaticMarkup(
-    createElement(AppInstances, { instances, nodeNames, hasSource }),
+    createElement(AppInstances, { instances, nodeNames, nodeStatuses, hasSource }),
   );
 
 describe('AppInstances', () => {
@@ -59,6 +60,41 @@ describe('AppInstances', () => {
     expect(html).toContain('blog-2');
     expect(html).toContain('creating');
     expect(html).toContain('node lab-4');
+  });
+
+  it('says why an instance is unknown when its node is not connected', () => {
+    const html = render(
+      [
+        instance({ observed_status: 'unknown' }),
+        instance({
+          id: 'vm_01HYYYYYYYYYYYYYYYYYYYYYYY',
+          name: 'blog-2',
+          node_id: 'nod_01HYYYYYYYYYYYYYYYYYYYYYYY',
+        }),
+      ],
+      {
+        nod_01HZZZZZZZZZZZZZZZZZZZZZZZ: 'lab-1',
+        nod_01HYYYYYYYYYYYYYYYYYYYYYYY: 'lab-2',
+      },
+      false,
+      {
+        nod_01HZZZZZZZZZZZZZZZZZZZZZZZ: 'disconnected',
+        nod_01HYYYYYYYYYYYYYYYYYYYYYYY: 'connected',
+      },
+    );
+
+    expect(html).toContain('unknown (node disconnected)');
+    expect(html).toContain('node lab-1');
+    expect(html).toContain('running');
+    expect(html).toContain('node lab-2');
+  });
+
+  it('shows the plain status when the node list does not explain it', () => {
+    const vm = instance({ observed_status: 'unknown' });
+    expect(instanceStatusText(vm, {})).toBe('unknown');
+    expect(instanceStatusText(vm, { [vm.node_id]: 'connected' })).toBe('unknown');
+    expect(instanceStatusText(vm, { [vm.node_id]: 'fenced' })).toBe('unknown (node fenced)');
+    expect(instanceStatusText(instance(), { [vm.node_id]: 'disconnected' })).toBe('running');
   });
 
   it('keeps the empty message the screen already used', () => {
