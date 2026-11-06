@@ -13,6 +13,7 @@
 
 pub mod desired;
 mod mesh;
+pub mod serving;
 
 use crate::AppState;
 use crate::changelog::{self, Actor, ActorType, Op};
@@ -313,6 +314,9 @@ struct HubInner {
     generation: AtomicU64,
     /// Test seam: snapshots to hold between their build and their send.
     snapshot_holds: Mutex<HashMap<String, Arc<SnapshotHold>>>,
+    /// Woken by every change notification, so the domains' serving status
+    /// is recomputed after the desired states it follows (ADR 0167).
+    serving_inputs: Notify,
 }
 
 /// A test seam that holds one node's next snapshot after it is built and
@@ -388,6 +392,7 @@ impl NodeHub {
             disk_free_gb: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
             snapshot_holds: Mutex::new(HashMap::new()),
+            serving_inputs: Notify::new(),
         }))
     }
 
@@ -418,6 +423,7 @@ impl NodeHub {
     /// Tells the session of `vm_id`'s node to rebuild its snapshot. Runs in
     /// the background, so a request never waits for the node.
     pub fn vm_changed(&self, vm_id: &str) {
+        self.0.serving_inputs.notify_one();
         let inner = Arc::clone(&self.0);
         let vm_id = vm_id.to_string();
         tokio::spawn(async move { inner.vm_changed(&vm_id).await });
@@ -427,6 +433,7 @@ impl NodeHub {
     /// state (section 5.11). A node without a session is left alone: it gets
     /// the new snapshot when it dials.
     pub fn node_changed(&self, node_id: &str) {
+        self.0.serving_inputs.notify_one();
         let changed = {
             let sessions = self.0.sessions.lock().expect("session lock");
             sessions
@@ -443,8 +450,17 @@ impl NodeHub {
     /// of `spec.edge` and of the tunnel hostnames changed (ADR 0143): a VM, a
     /// domain, an app or the edge's own tunnel mapping.
     pub fn edge_changed(&self) {
+        self.0.serving_inputs.notify_one();
         let inner = Arc::clone(&self.0);
         tokio::spawn(async move { inner.edge_changed().await });
+    }
+
+    /// Resolves once an input of the domains' serving status may have
+    /// changed: any desired-state change this hub was told about, whether or
+    /// not the node has a live session (ADR 0167). A change that arrives
+    /// while nobody waits is kept for the next wait.
+    pub(crate) async fn serving_inputs_changed(&self) {
+        self.0.serving_inputs.notified().await;
     }
 
     /// Tells every live session to rebuild and resend its desired state
@@ -452,6 +468,7 @@ impl NodeHub {
     /// whose key or address changed has to reach all of them. A node without
     /// a session is left alone: it gets the new snapshot when it dials.
     pub fn nodes_changed_all(&self) {
+        self.0.serving_inputs.notify_one();
         let changed: Vec<Arc<Notify>> = {
             let sessions = self.0.sessions.lock().expect("session lock");
             sessions

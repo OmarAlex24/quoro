@@ -1157,7 +1157,6 @@ pub async fn on_vm_observed(
                 .await?;
                 changed.push(extra.id);
             }
-            report_unserved_tunnel_domains(&mut w.tx, &app_vm.app_id).await?;
         }
     }
 
@@ -1449,8 +1448,8 @@ pub async fn on_image_unresolvable(
 /// VM rows linked to it on scheduler nodes that have none, and fewer delete
 /// instances in [`removal_order`]: those on nodes with a tunnel are kept when
 /// the app has `tunnel` domains, otherwise the highest node ids go. A
-/// scale-down that still leaves those domains without a tunnel reports them
-/// ([`report_unserved_tunnel_domains`]). When the eligible nodes cannot hold
+/// scale-down that still leaves those domains without a tunnel makes them
+/// `unserved` ([`crate::session::serving`]). When the eligible nodes cannot hold
 /// the new count the function writes nothing and returns `validation_failed`,
 /// so the caller's whole transaction fails. A rollout in progress, or an app
 /// without a current deployment, is left alone: the rollout and the next
@@ -1558,7 +1557,6 @@ pub(crate) async fn scale(
         changelog::append(conn, &deploy_actor(), "vm", &vm.id, Op::Delete, json!({})).await?;
         removed.push(vm.id);
     }
-    report_unserved_tunnel_domains(conn, app_id).await?;
     Ok(removed)
 }
 
@@ -1601,75 +1599,6 @@ fn sort_for_removal(linked: &mut [LinkedVm], tunnel_nodes: &HashSet<String>) {
         let b_keep = tunnel_nodes.contains(&b.node_id);
         a_keep.cmp(&b_keep).then_with(|| b.node_id.cmp(&a.node_id))
     });
-}
-
-/// After a scale-down, reports every `tunnel` domain that no tunnel serves
-/// any more: the app has one replica, at least one instance meant to run,
-/// and none of them on a node mapped to a tunnel. Each such domain gets a
-/// `certificate.failed` event with `tls_mode` `tunnel`, the only per-domain
-/// failure signal the contract has, so the change is never silent.
-async fn report_unserved_tunnel_domains(
-    conn: &mut SqliteConnection,
-    app_id: &str,
-) -> Result<(), ApiError> {
-    let app: Option<(i64, String)> =
-        sqlx::query_as("SELECT replicas, project_id FROM apps WHERE id = ?")
-            .bind(app_id)
-            .fetch_optional(&mut *conn)
-            .await?;
-    let Some((replicas, project_id)) = app else {
-        return Ok(());
-    };
-    // With more replicas the edge serves the hostnames from its own tunnel.
-    if replicas != 1 {
-        return Ok(());
-    }
-    let (running, on_tunnel): (i64, i64) = sqlx::query_as(
-        "SELECT COUNT(*), COUNT(t.node_id) FROM vms v \
-         LEFT JOIN node_tunnels t ON t.node_id = v.node_id \
-         WHERE v.app_id = ? AND v.desired_status = 'running'",
-    )
-    .bind(app_id)
-    .fetch_one(&mut *conn)
-    .await?;
-    if running == 0 || on_tunnel > 0 {
-        return Ok(());
-    }
-    let domains: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, hostname FROM domains WHERE app_id = ? AND tls_mode = 'tunnel' \
-         ORDER BY hostname",
-    )
-    .bind(app_id)
-    .fetch_all(&mut *conn)
-    .await?;
-    for (domain_id, hostname) in domains {
-        tracing::warn!(
-            app_id,
-            hostname,
-            "no instance of the app runs on a node with a tunnel; the hostname is not served"
-        );
-        events::emit(
-            conn,
-            NewEvent {
-                kind: "certificate.failed",
-                source: Source::ControlPlane,
-                subject_type: "domain",
-                subject_id: &domain_id,
-                project_id: Some(&project_id),
-                request_id: None,
-                actor: None,
-                data: json!({
-                    "domain_id": domain_id,
-                    "hostname": hostname,
-                    "tls_mode": "tunnel",
-                    "error": "no instance of the app runs on a node with a tunnel, \
-                              so no tunnel serves this hostname",
-                }),
-            },
-        )
-        .await?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

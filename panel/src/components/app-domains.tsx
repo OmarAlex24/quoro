@@ -5,7 +5,13 @@ import type {
   CreateDomainRequestTlsMode,
   Domain,
 } from '../api/generated/model';
-import { certTone, certWords, tlsWords } from '../lib/app-status';
+import {
+  certTone,
+  certWords,
+  servingTone,
+  servingWords,
+  tlsWords,
+} from '../lib/app-status';
 import { problemView, type ProblemView } from '../lib/problem';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
@@ -80,6 +86,14 @@ export function AppDomains({
                 />
                 {certWords[domain.cert_status]}
               </span>
+              <span className="inline-flex items-center gap-1.5 text-[13px] text-ink-muted">
+                <ToneLamp
+                  tone={servingTone(domain.serving_status)}
+                  size={13}
+                  label={servingWords[domain.serving_status]}
+                />
+                {servingWords[domain.serving_status]}
+              </span>
               {canWrite ? (
                 <Button
                   variant="quiet"
@@ -92,6 +106,11 @@ export function AppDomains({
                 >
                   Remove
                 </Button>
+              ) : null}
+              {domain.serving_status === 'unserved' && domain.last_error ? (
+                <p className="basis-full text-[13px] leading-snug text-lamp-fault">
+                  {domain.last_error}
+                </p>
               ) : null}
             </li>
           ))

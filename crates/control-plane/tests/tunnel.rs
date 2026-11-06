@@ -1515,17 +1515,63 @@ async fn instance_nodes(server: &Server, app_id: &str) -> Vec<String> {
         .unwrap()
 }
 
-/// The `data` of every `certificate.failed` event, oldest first.
-async fn certificate_failures(server: &Server) -> Vec<Value> {
-    let rows: Vec<String> = sqlx::query_scalar(
-        "SELECT data FROM events WHERE type = 'certificate.failed' ORDER BY seq",
-    )
-    .fetch_all(server.state.store.pool())
-    .await
-    .unwrap();
-    rows.iter()
-        .map(|data| serde_json::from_str(data).unwrap())
+/// The `(time, data)` of every event of type `kind`, oldest first.
+async fn events_of(server: &Server, kind: &str) -> Vec<(String, Value)> {
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT time, data FROM events WHERE type = ? ORDER BY seq")
+            .bind(kind)
+            .fetch_all(server.state.store.pool())
+            .await
+            .unwrap();
+    rows.into_iter()
+        .map(|(time, data)| (time, serde_json::from_str(&data).unwrap()))
         .collect()
+}
+
+/// Stops or starts `app_id` (`action` is `stop` or `start`).
+async fn app_action(server: &Server, owner: &reqwest::Client, app_id: &str, action: &str) {
+    let res = owner
+        .post(server.url(&format!("/api/v1/apps/{app_id}/{action}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 202, "{action}: {}", res.text().await.unwrap());
+}
+
+/// Waits until the domain `hostname` of `app_id` has `serving_status`
+/// `status` (ADR 0167), and returns it as the API shows it.
+async fn wait_for_serving(
+    server: &Server,
+    owner: &reqwest::Client,
+    app_id: &str,
+    hostname: &str,
+    status: &str,
+) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let res = owner
+            .get(server.url(&format!("/api/v1/apps/{app_id}/domains")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let page: Value = res.json().await.unwrap();
+        let domain = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|domain| domain["hostname"] == hostname)
+            .cloned()
+            .unwrap_or_else(|| panic!("no domain {hostname}: {page}"));
+        if domain["serving_status"] == status {
+            return domain;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{hostname} did not become {status}: {domain}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test]
@@ -1561,16 +1607,24 @@ async fn a_scale_down_keeps_the_instance_on_the_node_with_a_tunnel() {
     )
     .await;
     settles_on(&mock, "kept.example.com", &edge_tunnel).await;
+    wait_for_serving(&server, &owner, &app_id, "kept.example.com", "serving").await;
 
     set_replicas(&server, &owner, &app_id, 1).await;
     assert_eq!(instance_nodes(&server, &app_id).await, vec![NODE_B]);
     settles_on(&mock, "kept.example.com", &node_tunnel).await;
     wait_for(|| tunnel_routes(&mock, &node_tunnel, "kept.example.com").then_some(())).await;
-    assert!(certificate_failures(&server).await.is_empty());
+    let domain = wait_for_serving(&server, &owner, &app_id, "kept.example.com", "serving").await;
+    assert!(domain["last_error"].is_null(), "{domain}");
+    assert!(events_of(&server, "domain.unserved").await.is_empty());
+    assert!(events_of(&server, "certificate.failed").await.is_empty());
 }
 
+/// Issue #349 (ADR 0167): the domain's `serving_status` follows where its
+/// hostname can be served, and a change between `serving` and `unserved`
+/// emits `domain.unserved` and `domain.served` instead of the old
+/// `certificate.failed` stopgap.
 #[tokio::test]
-async fn a_scale_down_without_a_node_tunnel_reports_the_tunnel_domains() {
+async fn a_scale_down_without_a_node_tunnel_makes_the_tunnel_domain_unserved() {
     let mock = start_mock().await;
     let server = start_with_cloudflare(&mock.base, &format!("{}/dns-query", mock.base)).await;
     let owner = server.owner().await;
@@ -1599,49 +1653,174 @@ async fn a_scale_down_without_a_node_tunnel_reports_the_tunnel_domains() {
     )
     .await;
     settles_on(&mock, "dark.example.com", &edge_tunnel).await;
-    assert!(certificate_failures(&server).await.is_empty());
+    // Two replicas: the edge serves the hostname from its tunnel.
+    wait_for_serving(&server, &owner, &app_id, "dark.example.com", "serving").await;
+    assert!(events_of(&server, "domain.unserved").await.is_empty());
 
     // No node has a tunnel: the scale-down keeps the old order, and the
     // hostname that no tunnel serves any more is reported, not dropped
     // silently.
     set_replicas(&server, &owner, &app_id, 1).await;
     assert_eq!(instance_nodes(&server, &app_id).await, vec![NODE_A]);
-    let failures = certificate_failures(&server).await;
-    assert_eq!(failures.len(), 1, "{failures:?}");
-    assert_eq!(failures[0]["domain_id"], domain["id"]);
-    assert_eq!(failures[0]["hostname"], "dark.example.com");
-    assert_eq!(failures[0]["tls_mode"], "tunnel");
-    assert!(
-        failures[0]["error"]
-            .as_str()
-            .unwrap()
-            .contains("no instance of the app runs on a node with a tunnel"),
-        "{failures:?}"
+    let unserved = wait_for_serving(&server, &owner, &app_id, "dark.example.com", "unserved").await;
+    assert_eq!(
+        unserved["last_error"],
+        "no instance of the app runs on a node with a tunnel"
+    );
+    // A tunnel domain has no certificate: its status does not change.
+    assert_eq!(unserved["cert_status"], "not_applicable");
+    let reports = events_of(&server, "domain.unserved").await;
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    let (unserved_at, data) = &reports[0];
+    assert_eq!(
+        data,
+        &json!({
+            "domain_id": domain["id"],
+            "app_id": app_id,
+            "hostname": "dark.example.com",
+            "tls_mode": "tunnel",
+            "error": "no instance of the app runs on a node with a tunnel",
+        })
     );
     let res = owner
-        .get(server.url("/api/v1/events?type=certificate.failed"))
+        .get(server.url("/api/v1/events?type=domain.unserved"))
         .send()
         .await
         .unwrap();
     assert_eq!(res.status(), 200);
     let page: Value = res.json().await.unwrap();
-    let event = &page["items"][0];
     assert_eq!(
-        event["subject"],
+        page["items"][0]["subject"],
         json!({ "type": "domain", "id": domain["id"] })
     );
-    // A tunnel domain has no certificate: its status does not change.
-    let res = owner
-        .get(server.url(&format!("/api/v1/apps/{app_id}/domains")))
-        .send()
-        .await
-        .unwrap();
-    let domains: Value = res.json().await.unwrap();
-    assert_eq!(domains["items"][0]["cert_status"], "not_applicable");
+    // The stopgap is gone: the hostname is not reported as a certificate.
+    assert!(events_of(&server, "certificate.failed").await.is_empty());
 
     // Scaling up again hands the hostname back to the edge.
     set_replicas(&server, &owner, &app_id, 2).await;
     settles_on(&mock, "dark.example.com", &edge_tunnel).await;
+    let served = wait_for_serving(&server, &owner, &app_id, "dark.example.com", "serving").await;
+    assert!(served["last_error"].is_null(), "{served}");
+    let recoveries = events_of(&server, "domain.served").await;
+    assert_eq!(recoveries.len(), 1, "{recoveries:?}");
+    assert_eq!(recoveries[0].1["domain_id"], domain["id"]);
+    assert_eq!(recoveries[0].1["tls_mode"], "tunnel");
+    assert_eq!(recoveries[0].1["unserved_since"], unserved_at.as_str());
+}
+
+/// Issue #349: every `domain.unserved` gets its `domain.served`, even when the
+/// app was stopped in between (`unserved`, `pending`, `serving`), and a
+/// domain that turns `unserved` again before it was served opens no second
+/// period.
+#[tokio::test]
+async fn an_unserved_domain_is_announced_as_served_after_a_stop_and_a_start() {
+    let mock = start_mock().await;
+    let server = start_with_cloudflare(&mock.base, &format!("{}/dns-query", mock.base)).await;
+    let owner = server.owner().await;
+    insert_machine(&server, NODE_A, "alpha", &["node"]).await;
+    let provider = create_provider(
+        &server,
+        &owner,
+        "tunnel",
+        "Tunnel",
+        json!({ "account_id": ACCOUNT_ID, "zone_id": ZONE_ID }),
+    )
+    .await;
+    let provider_id = provider["id"].as_str().unwrap().to_string();
+    let app_id = setup_project_and_app(&server, &owner).await;
+    deploy_on(&server, &app_id, &[NODE_A]).await;
+    let domain = create_domain(
+        &server,
+        &owner,
+        &app_id,
+        "gap.example.com",
+        "tunnel",
+        &provider_id,
+    )
+    .await;
+
+    // The app's only node has no tunnel: `pending` becomes `unserved`.
+    wait_for_serving(&server, &owner, &app_id, "gap.example.com", "unserved").await;
+    let reports = events_of(&server, "domain.unserved").await;
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    let unserved_at = reports[0].0.clone();
+
+    // Stopped, then started on the same node: `unserved` again, within the
+    // period already open.
+    app_action(&server, &owner, &app_id, "stop").await;
+    wait_for_serving(&server, &owner, &app_id, "gap.example.com", "pending").await;
+    app_action(&server, &owner, &app_id, "start").await;
+    wait_for_serving(&server, &owner, &app_id, "gap.example.com", "unserved").await;
+    assert_eq!(events_of(&server, "domain.unserved").await.len(), 1);
+
+    // Stopped, given a tunnel, started: `pending` becomes `serving`, and the
+    // period closes with `domain.served`.
+    app_action(&server, &owner, &app_id, "stop").await;
+    wait_for_serving(&server, &owner, &app_id, "gap.example.com", "pending").await;
+    map_tunnel(&server, &owner, &mock, NODE_A, "alpha", &provider_id).await;
+    app_action(&server, &owner, &app_id, "start").await;
+    wait_for_serving(&server, &owner, &app_id, "gap.example.com", "serving").await;
+    let recoveries = events_of(&server, "domain.served").await;
+    assert_eq!(recoveries.len(), 1, "{recoveries:?}");
+    assert_eq!(
+        recoveries[0].1,
+        json!({
+            "domain_id": domain["id"],
+            "app_id": app_id,
+            "hostname": "gap.example.com",
+            "tls_mode": "tunnel",
+            "unserved_since": unserved_at,
+        })
+    );
+
+    // The period is closed: a later stop and start announces nothing.
+    app_action(&server, &owner, &app_id, "stop").await;
+    wait_for_serving(&server, &owner, &app_id, "gap.example.com", "pending").await;
+    app_action(&server, &owner, &app_id, "start").await;
+    wait_for_serving(&server, &owner, &app_id, "gap.example.com", "serving").await;
+    assert_eq!(events_of(&server, "domain.served").await.len(), 1);
+    assert_eq!(events_of(&server, "domain.unserved").await.len(), 1);
+}
+
+/// Issue #349: an `acme` domain of an app with one replica is `serving` while
+/// an instance is meant to run, and `pending` again once the app stops. On
+/// `main` it stayed `pending` for good.
+#[tokio::test]
+async fn an_acme_domain_is_serving_while_its_app_runs_and_pending_once_it_stops() {
+    let mock = start_mock().await;
+    let server = start_with_cloudflare(&mock.base, &format!("{}/dns-query", mock.base)).await;
+    let owner = server.owner().await;
+    insert_machine(&server, NODE_A, "alpha", &["node"]).await;
+    let provider = create_provider(
+        &server,
+        &owner,
+        "dns",
+        "Dns",
+        json!({ "account_id": ACCOUNT_ID, "zone_id": ZONE_ID }),
+    )
+    .await;
+    let provider_id = provider["id"].as_str().unwrap().to_string();
+    let app_id = setup_project_and_app(&server, &owner).await;
+    deploy_on(&server, &app_id, &[NODE_A]).await;
+    let domain = create_domain(
+        &server,
+        &owner,
+        &app_id,
+        "lit.example.com",
+        "acme",
+        &provider_id,
+    )
+    .await;
+    assert_eq!(domain["serving_status"], "pending");
+
+    let serving = wait_for_serving(&server, &owner, &app_id, "lit.example.com", "serving").await;
+    assert!(serving["last_error"].is_null(), "{serving}");
+
+    app_action(&server, &owner, &app_id, "stop").await;
+    wait_for_serving(&server, &owner, &app_id, "lit.example.com", "pending").await;
+    // Neither change is between `serving` and `unserved`.
+    assert!(events_of(&server, "domain.unserved").await.is_empty());
+    assert!(events_of(&server, "domain.served").await.is_empty());
 }
 
 // ---------------------------------------------------------------------------
