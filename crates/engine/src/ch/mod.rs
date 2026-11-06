@@ -44,13 +44,21 @@ use engine::Inner;
 
 use crate::{ByteStream, ExecRequest, ExecSession};
 
-/// Worst case a forced stop takes before it reports failure.
+/// Latest time a forced stop sends `SIGKILL` to a VMM that is still running,
+/// counted from when it holds the VM's lock (contract §3.8, D-0074, #434).
 ///
-/// `Force` sends `vmm.shutdown` with a 2 s timeout, waits 3 s for the exit,
-/// SIGKILLs the VMM and waits 5 s for it to be reaped (contract §3.8, D-0074).
-/// Ten seconds is therefore the bound: a `stop(Force)` that has not returned by
-/// then is not still working, it has already failed.
-pub const FORCE_STOP_BOUND: Duration = Duration::from_secs(10);
+/// `Force` sends `vmm.shutdown` with a 100 ms timeout. A VMM that does not
+/// answer is killed at once; one that answers gets 150 ms to exit before it is
+/// killed.
+pub const FORCE_KILL_BOUND: Duration = Duration::from_millis(250);
+
+/// Worst case a forced stop takes once it holds the VM's lock: the
+/// [`FORCE_KILL_BOUND`], then 5 s for the killed VMM to be reaped. By then
+/// the stop has returned, with the stopped VM or with an error. The stop runs
+/// on its own task, so it finishes even when the caller stops waiting; only a
+/// runtime that shuts down cancels it, and the restarted agent fences the VM
+/// again (node-agent-protocol §8.5).
+pub const FORCE_STOP_BOUND: Duration = Duration::from_millis(5250);
 
 /// Everything [`ChEngine::new`] needs to run VMs on this node.
 #[derive(Clone, Debug)]

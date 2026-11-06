@@ -21,6 +21,7 @@ Each entry links the pull request that made the change and, where one exists, th
 
 ### Fixed
 
+- A forced stop of a VM whose Cloud Hypervisor process hung sent `SIGKILL` only after about 5 s, so a self-fence, whose forced stop gets 0.3 s under an `expiring` lease, could not kill a hung VMM in time. A fence that gave up on the stop also left the VM `stopping` and never killed it. A forced stop now kills a VMM that does not answer at once, and one that answers but does not exit within 150 ms, so `SIGKILL` goes out within 250 ms. It finishes the kill on its own task even when its caller stops waiting. A graceful stop of the same VM hands over to it at once instead of holding the VM until its own timeout, and a later stop waits for the one in progress ([#447], [#434], [ADR 0074]).
 - A node refused a fence acknowledgement that arrived while a fence of one of the listed leases was still running, so it stayed failed until its next session. Section 5.17 says it answers `ok`. The node now clears the failures recorded before the acknowledgement and answers `ok`, naming any fence still running in `detail`. A failure that running fence records afterwards is not covered: the node is failed again, the primary lists the lease again, and only a new acknowledgement clears it ([#440], [#430], [ADR 0238]).
 - While a node fenced a lease, its reconciler could stop the same VM itself, with its own 10 s graceful stop. The engine runs one operation per VM at a time, so the fence's stop waited behind it, timed out, and reported the fence failed: the node marked itself failed, and an operator had to acknowledge a fence that had in fact stopped the VM. For an `expiring` lease, the VM could also outlive its deadline. The reconciler now leaves a VM to its lease's fence until the fence has stopped it: it begins no stop of its own, and it gives up a stop already under way as soon as the fence is triggered. The lease service backs this up: when a lease stops being held, the same step that changes its state marks the fence as under way. A revoke of an `expiring` lease now begins its fence before its state is written, as an expiry already does ([#439], [#429], [ADR 0075]).
 - While a node fenced a lease for a revoke, its session sent and read nothing else until the fence finished, heartbeats included. A `local` lease's fence can take up to 15 s (a 10 s graceful stop, then a 5 s forced one), which reaches the primary's 15 s session timeout, so the primary could mark the node `disconnected` in the middle of a fence it had asked for. The session now keeps sending heartbeats, answers `ping`, and applies lease grants for other leases while the fence runs; every other message waits and is processed in the order it arrived once the revoke is answered ([#428], [#427], [ADR 0222]).
@@ -417,10 +418,12 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#430]: https://github.com/OmarAlex24/quoro/issues/430
 [#431]: https://github.com/OmarAlex24/quoro/pull/431
 [#436]: https://github.com/OmarAlex24/quoro/pull/436
+[#434]: https://github.com/OmarAlex24/quoro/issues/434
 [#439]: https://github.com/OmarAlex24/quoro/pull/439
 [#440]: https://github.com/OmarAlex24/quoro/pull/440
 [#442]: https://github.com/OmarAlex24/quoro/issues/442
 [#445]: https://github.com/OmarAlex24/quoro/pull/445
+[#447]: https://github.com/OmarAlex24/quoro/pull/447
 [ADR 0019]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0019-fencing-is-mandatory-and-lease-based-node-agent-self-fences.md
 [ADR 0020]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0020-per-app-ha-policies-none-cold-warm-hot-with-cost-shown-in.md
 [ADR 0027]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0027-signed-binaries-and-reproducible-builds-are-mandatory.md

@@ -10,10 +10,12 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-# The engine trait is async and the fake engine uses channels, duplex streams
-# and the paused test clock; only those modules are enabled.
+# The engine trait is async and the fake engine uses channels, duplex streams,
+# the paused test clock and tasks (`rt`: a slow forced stop runs on its own
+# task); only those modules are enabled.
 tokio = { version = "1", default-features = false, features = [
     "io-util",
+    "rt",
     "sync",
     "time",
 ] }

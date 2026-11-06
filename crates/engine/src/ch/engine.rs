@@ -19,7 +19,7 @@ use std::time::Duration;
 use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{Mutex, OwnedMutexGuard, mpsc, watch};
 
 use crate::ch::api::ApiClient;
 use crate::ch::net::{self, Subnet};
@@ -29,7 +29,7 @@ use crate::ch::state::{
 use crate::ch::tools::HostTools;
 use crate::ch::vmconfig::{self, BootFiles};
 use crate::ch::vmm::{Vmm, VmmLaunch};
-use crate::ch::{FORCE_STOP_BOUND, exec, host, serial, stream, supervise};
+use crate::ch::{FORCE_KILL_BOUND, FORCE_STOP_BOUND, exec, host, serial, stream, supervise};
 use crate::image::{ImageStore, ImageStoreConfig};
 use crate::pins;
 use crate::{
@@ -47,10 +47,15 @@ const EVENT_CAPACITY: usize = 1024;
 const INFO_TIMEOUT: Duration = Duration::from_secs(1);
 /// Timeout of the `vm.counters` call `counters` makes.
 const COUNTERS_TIMEOUT: Duration = Duration::from_secs(1);
-/// Timeout of the `vmm.shutdown` call a forced stop makes.
+/// Timeout of the `vmm.shutdown` call `delete` makes.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
-/// How long a forced stop waits for the exit after `vmm.shutdown`.
-const SETTLE_AFTER_SHUTDOWN: Duration = Duration::from_secs(3);
+/// Timeout of the `vmm.shutdown` call a forced stop makes. A VMM that does not
+/// answer within it is killed at once (§3.8): a fence's `T_force` can be a few
+/// hundred milliseconds (node-agent-protocol §8.5).
+const FORCE_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
+/// How long a forced stop waits for the exit after `vmm.shutdown` answered,
+/// before it sends `SIGKILL`.
+const FORCE_EXIT_AFTER_SHUTDOWN: Duration = Duration::from_millis(150);
 /// How long any stop waits for the exit after SIGKILL.
 const SETTLE_AFTER_SIGKILL: Duration = Duration::from_secs(5);
 /// How long `delete` waits for the exit before it gives up.
@@ -62,10 +67,13 @@ const PAUSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// paused before it asks the guest to stop anyway. A fence's graceful step
 /// is bounded by `T_grace`, so the probe stays a small part of it.
 const PAUSED_PROBE_TIMEOUT: Duration = Duration::from_millis(200);
-// The pieces of a forced stop add up to its documented bound.
+// The pieces of a forced stop add up to its documented bounds.
 const _: () = assert!(
-    SHUTDOWN_TIMEOUT.as_secs() + SETTLE_AFTER_SHUTDOWN.as_secs() + SETTLE_AFTER_SIGKILL.as_secs()
-        == FORCE_STOP_BOUND.as_secs()
+    FORCE_SHUTDOWN_TIMEOUT.as_millis() + FORCE_EXIT_AFTER_SHUTDOWN.as_millis()
+        == FORCE_KILL_BOUND.as_millis()
+);
+const _: () = assert!(
+    FORCE_KILL_BOUND.as_millis() + SETTLE_AFTER_SIGKILL.as_millis() == FORCE_STOP_BOUND.as_millis()
 );
 /// The smallest memory a VM may be created with.
 const MINIMUM_MEMORY_MB: u32 = 128;
@@ -147,12 +155,21 @@ enum Phase {
 pub(super) struct VmEntry {
     pub(super) id: VmId,
     pub(super) paths: VmPaths,
-    /// Serializes create, start, stop and delete on this id.
-    pub(super) op: Mutex<()>,
+    /// Serializes create, start, stop and delete on this id. It is shared so
+    /// a forced stop's own task can hold it (§3.8).
+    pub(super) op: Arc<Mutex<()>>,
     /// The live VMM handle, while the process exists.
     pub(super) vmm: StdMutex<Option<Vmm>>,
     /// `/vm.boot` succeeded for the current VMM process.
     pub(super) booted: AtomicBool,
+    /// A stop was requested for the current VMM. The supervisor reads it with
+    /// the `stop_requested` marker file, so an exit after a stop is a stop
+    /// even when the marker could not be written (§3.8, #434).
+    pub(super) stop_requested: AtomicBool,
+    /// Forced stops of this VM that wait for its lock. While one waits, a
+    /// graceful stop that holds the lock hands it to its own forced stop at
+    /// once instead of holding it until its timeout (#434).
+    force_waiting: watch::Sender<usize>,
     phase: StdMutex<Phase>,
     /// Bumped by the supervisor after it finished the exit path; a waiter
     /// subscribes before it looks at `vmm` so no completion is missed.
@@ -175,9 +192,11 @@ impl VmEntry {
             serial: Arc::new(serial::SerialHub::new(&paths.dir)),
             id,
             paths,
-            op: Mutex::new(()),
+            op: Arc::new(Mutex::new(())),
             vmm: StdMutex::new(None),
             booted: AtomicBool::new(false),
+            stop_requested: AtomicBool::new(false),
+            force_waiting: watch::channel(0).0,
             phase: StdMutex::new(Phase::Idle),
             settled,
             spec: StdMutex::new(spec),
@@ -824,6 +843,7 @@ impl Inner {
             entry.set_phase(Phase::Idle);
             return Err(err);
         }
+        entry.stop_requested.store(false, Ordering::SeqCst);
         state::remove_marker(&entry.paths.stop_requested)?;
         let _ = std::fs::remove_file(&entry.paths.last_exit);
         if let Err(err) = crate::boot::reset_status(&entry.paths.config_disk) {
@@ -873,48 +893,131 @@ impl Inner {
     }
 
     /// Stops a VM, gracefully or by force (§3.8, D-0074).
-    pub(super) async fn stop(&self, id: &VmId, mode: StopMode) -> Result<VmInfo, EngineError> {
+    ///
+    /// The forced part runs on a task of its own that holds the VM's operation
+    /// lock, so once it has begun it sends `SIGKILL` and waits for the exit
+    /// even when the caller stops waiting: a fence that gives up after its
+    /// `T_force` never leaves the VMM running and the VM `Stopping` (#434).
+    /// The forced stop takes its place in the lock's queue before the call can
+    /// be dropped, and a graceful stop that holds the lock hands it over at
+    /// once, so no later call on the VM runs first and the kill does not wait
+    /// out another caller's graceful timeout. A later stop of the same VM
+    /// waits for that lock, so it joins the forced stop and then finds the VM
+    /// stopped. The caller-supplied bounds of D-0243 go on these waits and
+    /// into [`ForceTimings`]. A runtime that shuts down cancels the task like
+    /// any other; the VMM then outlives the agent, as after an agent crash,
+    /// and the restarted agent fences it again (node-agent-protocol §8.5).
+    pub(super) async fn stop(
+        self: &Arc<Self>,
+        id: &VmId,
+        mode: StopMode,
+    ) -> Result<VmInfo, EngineError> {
         let Some(entry) = self.entry(id) else {
             return Err(EngineError::NotFound);
         };
-        let _op = entry.op.lock().await;
+        let StopMode::Graceful { timeout } = mode else {
+            // Nothing below yields before the task is spawned, so a dropped
+            // call cannot lose its place in the queue.
+            let waiting = ForceWaiting::begin(&entry);
+            let op = match queue_for_lock(&entry).await {
+                Ok(op) => {
+                    drop(waiting);
+                    OpLock::Held(op)
+                }
+                Err(lock) => OpLock::Queued(lock, waiting),
+            };
+            return self
+                .spawn_forced_stop(entry, op, ForceTimings::DEFAULT)
+                .await;
+        };
+        let op = Arc::clone(&entry.op).lock_owned().await;
         if !entry.paths.dir.exists() {
             self.remove_entry(id);
             return Err(EngineError::NotFound);
         }
-        let Some(vmm) = entry.live_vmm() else {
+        if entry.live_vmm().is_none() {
             self.settle_crashed_exit(&entry);
             return self.inspect(id).await;
-        };
+        }
 
-        entry.set_phase(Phase::Stopping);
-        state::touch_marker(&entry.paths.stop_requested)?;
-        let api = ApiClient::new(&entry.paths.api_socket);
+        let stopping = Stopping::begin(&entry);
+        request_stop(&entry);
         // A paused guest cannot answer the power button, so a graceful stop
         // of a paused VM goes straight to the shutdown instead of waiting out
         // its timeout (§3.22).
-        if entry.booted.load(Ordering::SeqCst)
-            && let StopMode::Graceful { timeout } = mode
-            && !is_paused(&entry.paths.api_socket).await
-        {
-            let asked = api.power_button().await.is_ok();
-            if asked && wait_settled(&entry, timeout).await {
-                entry.set_phase(Phase::Idle);
-                return self.inspect(id).await;
+        let guest_stopped = async {
+            if !entry.booted.load(Ordering::SeqCst) || is_paused(&entry.paths.api_socket).await {
+                return false;
             }
+            let asked = ApiClient::new(&entry.paths.api_socket)
+                .power_button()
+                .await
+                .is_ok();
+            asked && wait_settled(&entry, timeout).await
+        };
+        // A forced stop that waits behind this one ends the graceful wait.
+        // Forced stops ahead of it already hold or held the lock, so they
+        // no longer count.
+        let mut forced = entry.force_waiting.subscribe();
+        let stopped = tokio::select! {
+            stopped = guest_stopped => stopped,
+            _ = forced.wait_for(|waiting| *waiting > 0) => false,
+        };
+        if stopped {
+            drop(stopping);
+            return self.inspect(id).await;
         }
+        // The forced stop takes over the lock and the phase, so nothing runs
+        // between the two (§4).
+        stopping.hand_over();
+        self.spawn_forced_stop(entry, OpLock::Held(op), ForceTimings::DEFAULT)
+            .await
+    }
 
-        let _ = api.with_timeout(SHUTDOWN_TIMEOUT).shutdown_vmm().await;
-        if !wait_settled(&entry, SETTLE_AFTER_SHUTDOWN).await {
-            let _ = vmm.sigkill();
-            if !wait_settled(&entry, SETTLE_AFTER_SIGKILL).await {
-                entry.set_phase(Phase::Idle);
-                return Err(EngineError::Hypervisor(
-                    "VMM process did not exit after SIGKILL".to_string(),
-                ));
-            }
+    /// Runs [`Self::forced_stop`] on its own task and waits for it. Dropping
+    /// the returned future does not cancel the task.
+    async fn spawn_forced_stop(
+        self: &Arc<Self>,
+        entry: Arc<VmEntry>,
+        op: OpLock,
+        timings: ForceTimings,
+    ) -> Result<VmInfo, EngineError> {
+        let inner = Arc::clone(self);
+        tokio::spawn(async move { inner.forced_stop(&entry, op, timings).await })
+            .await
+            .map_err(|err| {
+                EngineError::Hypervisor(format!("the forced stop did not finish: {err}"))
+            })?
+    }
+
+    /// The forced stop of `entry` (§3.8). `op` is the VM's lock, or the
+    /// caller's place in its queue. The VMM is read only once the lock is
+    /// held, so the stop never acts on a VMM a later `start` replaced.
+    async fn forced_stop(
+        &self,
+        entry: &VmEntry,
+        op: OpLock,
+        timings: ForceTimings,
+    ) -> Result<VmInfo, EngineError> {
+        let _op = op.acquire().await;
+        let id = &entry.id;
+        if !entry.paths.dir.exists() {
+            self.remove_entry(id);
+            return Err(EngineError::NotFound);
         }
-        entry.set_phase(Phase::Idle);
+        let stopping = Stopping::begin(entry);
+        let Some(vmm) = entry.live_vmm() else {
+            drop(stopping);
+            self.settle_crashed_exit(entry);
+            return self.inspect(id).await;
+        };
+        request_stop(entry);
+        if !shut_down_or_kill(entry, &vmm, timings).await {
+            return Err(EngineError::Hypervisor(
+                "VMM process did not exit after SIGKILL".to_string(),
+            ));
+        }
+        drop(stopping);
         self.inspect(id).await
     }
 
@@ -993,7 +1096,7 @@ impl Inner {
         }
 
         if let Some(vmm) = entry.live_vmm() {
-            state::touch_marker(&entry.paths.stop_requested)?;
+            request_stop(&entry);
             let _ = ApiClient::new(&entry.paths.api_socket)
                 .with_timeout(SHUTDOWN_TIMEOUT)
                 .shutdown_vmm()
@@ -1872,6 +1975,143 @@ fn overlaps(a: &Subnet, b: &Subnet) -> bool {
         == u32::from(b.network).checked_shr(shift).unwrap_or(0)
 }
 
+/// A forced stop's place in the queue of a VM's operation lock.
+type QueuedLock = Pin<Box<dyn Future<Output = OwnedMutexGuard<()>> + Send>>;
+
+/// The VM's operation lock as a forced stop's task receives it.
+enum OpLock {
+    /// Held: taken at once, or handed over by a graceful stop.
+    Held(OwnedMutexGuard<()>),
+    /// Queued for by the caller, so the task keeps the caller's place, and
+    /// counted as waiting until it holds the lock.
+    Queued(QueuedLock, ForceWaiting),
+}
+
+/// Takes a place in the queue of `entry`'s operation lock without yielding:
+/// the lock itself when it is free, otherwise the acquisition, polled once.
+///
+/// The first poll of tokio's `Mutex::lock_owned` links the waiter into the
+/// mutex's FIFO queue, or takes the lock, before anything else can yield; the
+/// pinned future keeps that place when it moves into a task. This is how
+/// tokio's semaphore behaves, not documented API, so
+/// `a_queued_lock_keeps_its_place` pins it.
+async fn queue_for_lock(entry: &VmEntry) -> Result<OwnedMutexGuard<()>, QueuedLock> {
+    let mut lock: QueuedLock = Box::pin(Arc::clone(&entry.op).lock_owned());
+    match std::future::poll_fn(|cx| Poll::Ready(lock.as_mut().poll(cx))).await {
+        Poll::Ready(op) => Ok(op),
+        Poll::Pending => Err(lock),
+    }
+}
+
+impl OpLock {
+    /// The lock, once held. A queued forced stop stops counting as waiting
+    /// as soon as it holds it.
+    async fn acquire(self) -> OwnedMutexGuard<()> {
+        match self {
+            Self::Held(op) => op,
+            Self::Queued(lock, waiting) => {
+                let op = lock.await;
+                drop(waiting);
+                op
+            }
+        }
+    }
+}
+
+/// Counts a forced stop in [`VmEntry::force_waiting`] until it is dropped.
+struct ForceWaiting(Arc<VmEntry>);
+
+impl ForceWaiting {
+    fn begin(entry: &Arc<VmEntry>) -> Self {
+        entry.force_waiting.send_modify(|waiting| *waiting += 1);
+        Self(Arc::clone(entry))
+    }
+}
+
+impl Drop for ForceWaiting {
+    fn drop(&mut self) {
+        self.0.force_waiting.send_modify(|waiting| *waiting -= 1);
+    }
+}
+
+/// Records that a stop of `entry`'s VMM was requested: in memory first, so the
+/// exit is a stop even when the marker cannot be written, then in the marker
+/// file, which outlives the agent (§3.11). A marker that cannot be written
+/// never holds back the stop.
+fn request_stop(entry: &VmEntry) {
+    entry.stop_requested.store(true, Ordering::SeqCst);
+    let _ = state::touch_marker(&entry.paths.stop_requested);
+}
+
+/// Holds a VM in [`Phase::Stopping`] and puts it back to [`Phase::Idle`]
+/// when dropped, so a stop whose caller stops waiting, or that fails, never
+/// leaves the VM reported as `Stopping` (#434).
+struct Stopping<'a> {
+    entry: &'a VmEntry,
+    armed: bool,
+}
+
+impl<'a> Stopping<'a> {
+    fn begin(entry: &'a VmEntry) -> Self {
+        entry.set_phase(Phase::Stopping);
+        Self { entry, armed: true }
+    }
+
+    /// Leaves the VM `Stopping` for the forced stop that takes over.
+    fn hand_over(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Stopping<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.entry.set_phase(Phase::Idle);
+        }
+    }
+}
+
+/// The timings of one forced stop's escalation (§3.8). They are fixed today;
+/// D-0243 derives them from the caller's `within`.
+#[derive(Clone, Copy, Debug)]
+struct ForceTimings {
+    /// Timeout of the `vmm.shutdown` call. A VMM that does not answer is
+    /// killed at once.
+    shutdown: Duration,
+    /// How long a VMM that answered gets to exit before it is killed.
+    exit_after_shutdown: Duration,
+    /// How long the stop waits for the killed VMM's exit.
+    reap: Duration,
+}
+
+impl ForceTimings {
+    /// `SIGKILL` at most [`FORCE_KILL_BOUND`] after the forced stop holds the
+    /// lock, and failure after [`FORCE_STOP_BOUND`].
+    const DEFAULT: Self = Self {
+        shutdown: FORCE_SHUTDOWN_TIMEOUT,
+        exit_after_shutdown: FORCE_EXIT_AFTER_SHUTDOWN,
+        reap: SETTLE_AFTER_SIGKILL,
+    };
+}
+
+/// The escalation of a forced stop (§3.8): `vmm.shutdown`, then `SIGKILL`
+/// unless the VMM answered and exited within `exit_after_shutdown`, then a
+/// bounded wait for the exit. `SIGKILL` therefore goes out at most
+/// `shutdown + exit_after_shutdown` after the call, and at once when the API
+/// does not answer. True once the exit is recorded.
+async fn shut_down_or_kill(entry: &VmEntry, vmm: &Vmm, timings: ForceTimings) -> bool {
+    let answered = ApiClient::new(&entry.paths.api_socket)
+        .with_timeout(timings.shutdown)
+        .shutdown_vmm()
+        .await
+        .is_ok();
+    if answered && wait_settled(entry, timings.exit_after_shutdown).await {
+        return true;
+    }
+    let _ = vmm.sigkill();
+    wait_settled(entry, timings.reap).await
+}
+
 /// Waits until the supervisor of `entry` finished the exit path.
 ///
 /// The subscription happens before the `vmm` check, so an exit that lands
@@ -2023,6 +2263,226 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(recorded_bridge_to_restore("quoro0", true, &networks), None);
+    }
+
+    /// A stand-in for one VM: a `sleep` process adopted as its VMM, a
+    /// supervisor that records the exit the way `supervise::finish` does, and
+    /// the API socket path a test serves (or leaves dead).
+    struct StandIn {
+        root: PathBuf,
+        entry: Arc<VmEntry>,
+        vmm: Vmm,
+        child: Option<std::process::Child>,
+    }
+
+    impl StandIn {
+        fn new(name: &str) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("quoro-force-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let id = VmId(format!("vm_{name}"));
+            let paths = VmPaths::new(&root, &id);
+            std::fs::create_dir_all(&paths.dir).expect("runtime dir");
+            let entry = Arc::new(VmEntry::new(id, paths, None));
+            let child = std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("sleep");
+            let process = crate::ch::vmm::ProcessId::of(child.id())
+                .expect("stat")
+                .expect("alive");
+            let vmm = Vmm::adopt(process).expect("adopt").expect("adopted");
+            *lock(&entry.vmm) = Some(vmm.clone());
+            let supervised = Arc::clone(&entry);
+            let watched = vmm.clone();
+            tokio::spawn(async move {
+                while watched.wait_exit(Duration::from_secs(60)).await.is_none() {}
+                *lock(&supervised.vmm) = None;
+                supervised
+                    .settled
+                    .send_modify(|value| *value = value.wrapping_add(1));
+            });
+            Self {
+                root,
+                entry,
+                vmm,
+                child: Some(child),
+            }
+        }
+
+        fn pid(&self) -> u32 {
+            self.child.as_ref().map_or(0, std::process::Child::id)
+        }
+
+        /// Reaps the stand-in VMM and returns the signal that ended it.
+        fn signal(mut self) -> Option<i32> {
+            use std::os::unix::process::ExitStatusExt as _;
+            let status = self.child.take().expect("child").wait().expect("wait");
+            status.signal()
+        }
+    }
+
+    impl Drop for StandIn {
+        /// A failed assertion leaves no `sleep` and no directory behind.
+        fn drop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// Accepts API connections on `socket` and answers none of them: a hung
+    /// VMM.
+    fn silent_api(socket: &Path) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(socket).expect("bind");
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        })
+    }
+
+    /// Answers every API request with `204`, then runs `after` once: a VMM
+    /// that takes the shutdown request.
+    fn answering_api(
+        socket: &Path,
+        after: impl FnOnce() + Send + 'static,
+    ) -> tokio::task::JoinHandle<()> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::UnixListener::bind(socket).expect("bind");
+        tokio::spawn(async move {
+            let mut after = Some(after);
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = vec![0_u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let _ = stream.write_all(b"HTTP/1.1 204 \r\n\r\n").await;
+                if let Some(after) = after.take() {
+                    after();
+                }
+            }
+        })
+    }
+
+    const SIGKILL: i32 = 9;
+    const SIGTERM: i32 = 15;
+    /// Slack over [`FORCE_KILL_BOUND`] for the kill and the reap on a busy
+    /// machine; the old escalation took 2 s and 3 s here.
+    const SLACK: Duration = Duration::from_millis(250);
+
+    /// #434: a VMM whose API does not answer is killed after the short
+    /// shutdown timeout, not after 2 s + 3 s.
+    /// A forced stop queued for a held lock keeps its place when its
+    /// acquisition moves into a task, so a call queued after it never runs
+    /// first; and it counts as waiting only until it holds the lock.
+    #[tokio::test]
+    async fn a_queued_lock_keeps_its_place() {
+        let vm = StandIn::new("queue");
+        let held = Arc::clone(&vm.entry.op).lock_owned().await;
+        let waiting = ForceWaiting::begin(&vm.entry);
+        let queued = queue_for_lock(&vm.entry)
+            .await
+            .expect_err("the lock is held");
+        assert_eq!(*vm.entry.force_waiting.borrow(), 1);
+
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let later = {
+            let op = Arc::clone(&vm.entry.op);
+            let order = Arc::clone(&order);
+            tokio::spawn(async move {
+                let _op = op.lock_owned().await;
+                order.lock().expect("order").push("later");
+            })
+        };
+        // The later call is queued behind the forced stop.
+        tokio::task::yield_now().await;
+        let first = {
+            let order = Arc::clone(&order);
+            let entry = Arc::clone(&vm.entry);
+            tokio::spawn(async move {
+                let _op = OpLock::Queued(queued, waiting).acquire().await;
+                assert_eq!(*entry.force_waiting.borrow(), 0);
+                order.lock().expect("order").push("queued");
+            })
+        };
+        drop(held);
+        first.await.expect("queued");
+        later.await.expect("later");
+        assert_eq!(*order.lock().expect("order"), ["queued", "later"]);
+        assert_eq!(*vm.entry.force_waiting.borrow(), 0);
+        assert!(queue_for_lock(&vm.entry).await.is_ok(), "the lock is free");
+    }
+
+    #[tokio::test]
+    async fn a_forced_stop_kills_a_vmm_whose_api_does_not_answer() {
+        let vm = StandIn::new("silent");
+        let api = silent_api(&vm.entry.paths.api_socket);
+        let began = std::time::Instant::now();
+        assert!(
+            shut_down_or_kill(&vm.entry, &vm.vmm, ForceTimings::DEFAULT).await,
+            "the VMM exited"
+        );
+        let took = began.elapsed();
+        assert!(took < FORCE_KILL_BOUND + SLACK, "SIGKILL after {took:?}");
+        api.abort();
+        assert_eq!(vm.signal(), Some(SIGKILL));
+    }
+
+    /// #434: a VMM with no API socket at all is killed at once.
+    #[tokio::test]
+    async fn a_forced_stop_kills_a_vmm_without_an_api_at_once() {
+        let vm = StandIn::new("noapi");
+        let began = std::time::Instant::now();
+        assert!(
+            shut_down_or_kill(&vm.entry, &vm.vmm, ForceTimings::DEFAULT).await,
+            "the VMM exited"
+        );
+        let took = began.elapsed();
+        assert!(
+            took < FORCE_SHUTDOWN_TIMEOUT + SLACK,
+            "SIGKILL after {took:?}"
+        );
+        assert_eq!(vm.signal(), Some(SIGKILL));
+    }
+
+    /// #434: a VMM that takes the shutdown request but does not exit is
+    /// killed after the short exit wait, not after 3 s.
+    #[tokio::test]
+    async fn a_forced_stop_kills_a_vmm_that_answers_but_does_not_exit() {
+        let vm = StandIn::new("stuck");
+        let api = answering_api(&vm.entry.paths.api_socket, || {});
+        let began = std::time::Instant::now();
+        assert!(
+            shut_down_or_kill(&vm.entry, &vm.vmm, ForceTimings::DEFAULT).await,
+            "the VMM exited"
+        );
+        let took = began.elapsed();
+        assert!(
+            took >= FORCE_EXIT_AFTER_SHUTDOWN,
+            "killed before the exit wait: {took:?}"
+        );
+        assert!(took < FORCE_KILL_BOUND + SLACK, "SIGKILL after {took:?}");
+        api.abort();
+        assert_eq!(vm.signal(), Some(SIGKILL));
+    }
+
+    /// A VMM that exits after `vmm.shutdown` is never killed.
+    #[tokio::test]
+    async fn a_forced_stop_does_not_kill_a_vmm_that_shuts_down() {
+        let vm = StandIn::new("clean");
+        let pid =
+            rustix::process::Pid::from_raw(i32::try_from(vm.pid()).expect("pid")).expect("pid");
+        let api = answering_api(&vm.entry.paths.api_socket, move || {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
+        });
+        assert!(
+            shut_down_or_kill(&vm.entry, &vm.vmm, ForceTimings::DEFAULT).await,
+            "the VMM exited"
+        );
+        api.abort();
+        assert_eq!(vm.signal(), Some(SIGTERM));
     }
 
     #[test]
