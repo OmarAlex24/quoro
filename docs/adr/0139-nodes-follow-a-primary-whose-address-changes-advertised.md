@@ -1,12 +1,12 @@
 # ADR 0139: Nodes follow a primary whose address changes: advertised address list, pinned rediscovery on the node's subnet, and quoro node set-primary
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0235](0235-hello-carries-control-plane-urls-and-welcome-primary-urls.md)
 - **Date:** 2026-11-04
 - **Ledger id:** D-0139
 - **Tags:** networking, node-agent, reliability
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** none
+- **Related:** [ADR 0235](0235-hello-carries-control-plane-urls-and-welcome-primary-urls.md)
 
 ## Context
 
@@ -26,6 +26,7 @@ _Some wording was changed for the public repository._ _Some operational details 
 
 ## Consequences
 
+- [ADR 0235](0235-hello-carries-control-plane-urls-and-welcome-primary-urls.md) refines the cap of welcome.primary_urls (16 entries instead of 8). The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---

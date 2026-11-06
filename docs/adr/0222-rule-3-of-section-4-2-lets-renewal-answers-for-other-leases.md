@@ -1,12 +1,12 @@
 # ADR 0222: Rule 3 of section 4.2 lets renewal answers for other leases through while a revoke's fence runs
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0237](0237-let-support-request-through-while-a-revoke-s-fence-runs.md)
 - **Date:** 2026-11-06
 - **Ledger id:** D-0222
 - **Tags:** m5b, leases, contracts
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** none
+- **Related:** [ADR 0237](0237-let-support-request-through-while-a-revoke-s-fence-runs.md)
 
 ## Context
 
@@ -22,6 +22,7 @@ _Some wording was changed for the public repository._
 
 ## Consequences
 
+- [ADR 0237](0237-let-support-request-through-while-a-revoke-s-fence-runs.md) refines the messages a node processes while a revoke's fence runs (on a voter, support_request as well). The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---
