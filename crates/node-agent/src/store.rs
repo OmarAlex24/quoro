@@ -1343,37 +1343,8 @@ impl NodeStore {
     /// [`AgentError::Store`] on a SQLite failure or a lease field with no
     /// stored form.
     pub async fn save_lease(&self, lease: &StoredLease, highest: u64) -> Result<(), AgentError> {
-        let duration_ms = lease
-            .duration
-            .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX));
         let mut tx = self.pool.begin().await.map_err(store_error)?;
-        sqlx::query(
-            "INSERT INTO leases (lease_id, resource_type, resource_id, mode, token, state, \
-             duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(lease_id) DO UPDATE SET resource_type = excluded.resource_type, \
-             resource_id = excluded.resource_id, mode = excluded.mode, token = excluded.token, \
-             state = excluded.state, duration_ms = excluded.duration_ms",
-        )
-        .bind(&lease.lease_id.0)
-        .bind(resource_type_str(lease.resource_type))
-        .bind(&lease.resource_id)
-        .bind(lease_mode_str(lease.mode))
-        .bind(i64::try_from(lease.token).unwrap_or(i64::MAX))
-        .bind(lease_state_str(lease.state))
-        .bind(duration_ms)
-        .execute(&mut *tx)
-        .await
-        .map_err(store_error)?;
-        sqlx::query(
-            "INSERT INTO lease_tokens (resource_type, resource_id, token) VALUES (?, ?, ?) \
-             ON CONFLICT(resource_type, resource_id) DO UPDATE SET token = MAX(token, excluded.token)",
-        )
-        .bind(resource_type_str(lease.resource_type))
-        .bind(&lease.resource_id)
-        .bind(i64::try_from(highest).unwrap_or(i64::MAX))
-        .execute(&mut *tx)
-        .await
-        .map_err(store_error)?;
+        upsert_lease(&mut tx, lease, highest).await?;
         tx.commit().await.map_err(store_error)
     }
 
@@ -1388,13 +1359,15 @@ impl NodeStore {
         tx.commit().await.map_err(store_error)
     }
 
-    /// Records one finished self-fence together with its event, and with the
-    /// node's failed mark when the fence could not confirm every stop, in one
-    /// transaction (section 8.5 steps 2 and 3).
+    /// Records one finished self-fence together with the lease's row and its
+    /// resource's highest token, its event, and the node's failed mark when
+    /// the fence could not confirm every stop, in one transaction (section 8.5
+    /// steps 2 and 3).
     ///
     /// A restart therefore finds all of them or none of them. With none, the
-    /// lease is in a fenced state without a fence record, which the restore
-    /// reads as an interrupted fence and runs again.
+    /// lease is either still `revoked` or `expired` without a fence record,
+    /// which the restore reads as an interrupted fence and runs again, or the
+    /// revoke was never answered with success.
     ///
     /// # Errors
     ///
@@ -1402,10 +1375,14 @@ impl NodeStore {
     pub async fn finish_fence(
         &self,
         record: &FenceRecord,
+        lease: Option<(&StoredLease, u64)>,
         evt_id: &str,
         event: &Value,
     ) -> Result<(), AgentError> {
         let mut tx = self.pool.begin().await.map_err(store_error)?;
+        if let Some((lease, highest)) = lease {
+            upsert_lease(&mut tx, lease, highest).await?;
+        }
         insert_fence(&mut tx, record).await?;
         if !record.complete {
             sqlx::query(
@@ -1750,6 +1727,46 @@ fn fence_record(row: sqlx::sqlite::SqliteRow) -> Result<FenceRecord, AgentError>
         reason: parse_fence_reason(&reason)?,
         complete: complete != 0,
     })
+}
+
+/// Inserts or replaces one lease row and raises its resource's highest token
+/// inside `tx` (section 12 `leases`, section 8.6).
+async fn upsert_lease(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    lease: &StoredLease,
+    highest: u64,
+) -> Result<(), AgentError> {
+    let duration_ms = lease
+        .duration
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX));
+    sqlx::query(
+        "INSERT INTO leases (lease_id, resource_type, resource_id, mode, token, state, \
+         duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(lease_id) DO UPDATE SET resource_type = excluded.resource_type, \
+         resource_id = excluded.resource_id, mode = excluded.mode, token = excluded.token, \
+         state = excluded.state, duration_ms = excluded.duration_ms",
+    )
+    .bind(&lease.lease_id.0)
+    .bind(resource_type_str(lease.resource_type))
+    .bind(&lease.resource_id)
+    .bind(lease_mode_str(lease.mode))
+    .bind(i64::try_from(lease.token).unwrap_or(i64::MAX))
+    .bind(lease_state_str(lease.state))
+    .bind(duration_ms)
+    .execute(&mut **tx)
+    .await
+    .map_err(store_error)?;
+    sqlx::query(
+        "INSERT INTO lease_tokens (resource_type, resource_id, token) VALUES (?, ?, ?) \
+         ON CONFLICT(resource_type, resource_id) DO UPDATE SET token = MAX(token, excluded.token)",
+    )
+    .bind(resource_type_str(lease.resource_type))
+    .bind(&lease.resource_id)
+    .bind(i64::try_from(highest).unwrap_or(i64::MAX))
+    .execute(&mut **tx)
+    .await
+    .map_err(store_error)?;
+    Ok(())
 }
 
 /// Inserts one fence record inside `tx` (section 8.5 step 2).

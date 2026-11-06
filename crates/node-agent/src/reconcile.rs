@@ -1026,12 +1026,15 @@ impl<E: Engine + 'static> Reconciler<E> {
                 warn!(vm_id, error = %e, "could not record the restart generation");
             }
             if vm.desired_status == DesiredStatus::Running {
-                let Some(_permit) = self.start_permit(vm).await else {
+                let Some(permit) = self.start_permit(vm).await else {
                     debug!(vm_id, "the lease was lost before the restart; the VM waits");
                     self.remember(&vm_id, info.state);
                     return true;
                 };
-                match self.engine.start(&id).await {
+                let started = self.engine.start(&id).await;
+                // A fence of the lease may stop the VM from here on.
+                drop(permit);
+                match started {
                     Ok(started) => {
                         info!(vm_id, "VM restarted for a new restart_generation");
                         self.deployment_line(vm, "boot", "VM started").await;
@@ -1066,7 +1069,7 @@ impl<E: Engine + 'static> Reconciler<E> {
                     // Section 6.4 at the moment of the start: the lease may
                     // have been lost since `may_start` was read, and a fence
                     // must not overlap the start (section 8.5).
-                    let Some(_permit) = self.start_permit(vm).await else {
+                    let Some(permit) = self.start_permit(vm).await else {
                         debug!(vm_id, "the lease was lost before the start; the VM waits");
                         self.remember(&vm_id, info.state);
                         return true;
@@ -1080,7 +1083,10 @@ impl<E: Engine + 'static> Reconciler<E> {
                         {
                             warn!(vm_id, error = %e, "could not record the exit code");
                         }
-                        match self.crash_restart(&vm_id, &id, info.exit_code).await {
+                        match self
+                            .crash_restart(&vm_id, &id, info.exit_code, permit)
+                            .await
+                        {
                             Ok(Some(started)) => info = started,
                             Ok(None) => reached = false,
                             Err(e) => {
@@ -1089,7 +1095,10 @@ impl<E: Engine + 'static> Reconciler<E> {
                             }
                         }
                     } else {
-                        match self.engine.start(&id).await {
+                        let started = self.engine.start(&id).await;
+                        // A fence of the lease may stop the VM from here on.
+                        drop(permit);
+                        match started {
                             Ok(started) => {
                                 debug!(vm_id, "VM started");
                                 self.deployment_line(vm, "boot", "VM started").await;
@@ -1636,12 +1645,15 @@ impl<E: Engine + 'static> Reconciler<E> {
 
     /// Restarts a VM that exited on its own, with exponential backoff.
     ///
-    /// Returns `Ok(None)` while the backoff is still running.
+    /// Returns `Ok(None)` while the backoff is still running. `permit` is the
+    /// stateful VM's start permit, released as soon as the engine's start
+    /// returned.
     async fn crash_restart(
         &mut self,
         vm_id: &str,
         id: &VmId,
         exit_code: Option<i32>,
+        permit: Option<StartPermit>,
     ) -> Result<Option<VmInfo>, EngineError> {
         let base = self.options.backoff_base;
         let max = self.options.backoff_max;
@@ -1660,7 +1672,10 @@ impl<E: Engine + 'static> Reconciler<E> {
             return Ok(None);
         }
 
-        match self.engine.start(id).await {
+        let started = self.engine.start(id).await;
+        // A fence of the lease may stop the VM from here on.
+        drop(permit);
+        match started {
             Ok(started) => {
                 if let Err(e) = self
                     .store
