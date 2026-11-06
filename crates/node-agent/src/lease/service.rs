@@ -29,10 +29,10 @@
 //! it may have been bound to the lease in a snapshot this process never saw
 //! (a snapshot that dropped it, or one from before an agent restart). With no
 //! snapshot at all, that is every app VM on the node. A fence that cannot list
-//! the engine's VMs stops what it knows but is not recorded: the revoke is
-//! answered with an error, the lease stays unstartable, and the next revoke or
-//! restart fences again. Only a VM whose stop could not be confirmed fails the
-//! fence (D-0074).
+//! the engine's VMs cannot confirm that every bound VM stopped, so it fails
+//! like a fence whose forced stop could not be confirmed (sections 5.13 and
+//! 8.5, D-0074): it stops what it knows, records the failure, emits
+//! `node.fence_failed`, marks the node failed and answers `fence_failed`.
 //!
 //! A revoke of a lease that is already `revoked` or `expired` at the same
 //! token, with a complete fence recorded for it, is answered `ok` at once:
@@ -428,21 +428,17 @@ struct InFlight {
 struct FenceOutcome {
     report: FenceReport,
     /// Set when the engine's VMs could not be listed, so a VM bound to the
-    /// lease may have been missed.
+    /// lease may have been missed and still run.
     unlisted: Option<String>,
     /// Set when the fence task itself died, so no stop is confirmed.
     died: Option<String>,
 }
 
 impl FenceOutcome {
-    /// A VM may still run: the fence failed (D-0074).
-    fn failed(&self) -> bool {
-        self.died.is_some() || !self.report.complete()
-    }
-
-    /// Every VM the lease may hold is confirmed stopped.
+    /// Every VM the lease may hold is confirmed stopped; otherwise a VM may
+    /// still run and the fence failed (sections 5.13 and 8.5, D-0074).
     fn complete(&self) -> bool {
-        !self.failed() && self.unlisted.is_none()
+        self.died.is_none() && self.unlisted.is_none() && self.report.complete()
     }
 }
 
@@ -805,12 +801,9 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
             });
             (lease, token, row)
         };
-        let result = if !outcome.failed() && outcome.unlisted.is_some() {
-            self.leave_unrecorded(&lease_id, row, &outcome).await
-        } else {
-            self.record_fence(&lease_id, &flight, lease.as_ref(), token, row, &outcome)
-                .await
-        };
+        let result = self
+            .record_fence(&lease_id, &flight, lease.as_ref(), token, row, &outcome)
+            .await;
         for waiter in flight.waiters {
             // Only a final answer is kept for a redelivered revoke; one whose
             // fence was not recorded fences again when it comes back.
@@ -821,29 +814,6 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
             }
             let _ = waiter.reply.send(Ok(result.clone()));
         }
-    }
-
-    /// A fence that stopped every VM it found but could not look for all of
-    /// them: nothing is recorded, so the restore and the next revoke fence
-    /// again, and the lease stays unstartable in this process. The lease's
-    /// `revoked` or `expired` row is saved, so a restart knows to fence it.
-    async fn leave_unrecorded(
-        &self,
-        lease_id: &LeaseId,
-        row: Option<(StoredLease, u64)>,
-        outcome: &FenceOutcome,
-    ) -> CommandResult {
-        if let Some((lease, highest)) = row
-            && let Err(e) = self.store.save_lease(&lease, highest).await
-        {
-            warn!(error = %e, lease_id = %lease_id.0, "could not persist a lease");
-        }
-        let (_, error) = fence_failures(outcome);
-        warn!(lease_id = %lease_id.0, error, "a fence could not find every VM; it is not recorded");
-        not_fenced(&format!(
-            "the fence of lease {} could not find every VM: {error}",
-            lease_id.0
-        ))
     }
 
     /// Section 8.5 steps 2 and 3: records a complete or failed fence with the
@@ -907,6 +877,17 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                 // (section 5.9). A failed fence keeps its `fence_failed`
                 // answer: the failed mark holds in memory either way.
                 warn!(error = %e, lease_id = %lease_id.0, "could not record a self-fence");
+                // Best effort, one write at a time: a restart should still
+                // find the lease fenced and, after a failed fence, the node
+                // failed.
+                if let Some((lease, highest)) = &row
+                    && let Err(e) = self.store.save_lease(lease, *highest).await
+                {
+                    warn!(error = %e, lease_id = %lease_id.0, "could not persist a lease");
+                }
+                if !complete && let Err(e) = self.store.set_node_failed(true).await {
+                    warn!(error = %e, "could not store the node's failed mark");
+                }
                 if complete {
                     not_fenced(&format!(
                         "the fence of lease {} stopped its VMs but could not be recorded: {e}",
@@ -1115,7 +1096,9 @@ async fn fence_targets<E: Engine>(
         }
         Err(e) => (
             targets,
-            Some(format!("could not list the engine's VMs: {e}")),
+            Some(format!(
+                "could not list the engine's VMs, so any app VM on this node may still run: {e}"
+            )),
         ),
     }
 }
