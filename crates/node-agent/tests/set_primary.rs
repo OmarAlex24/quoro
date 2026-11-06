@@ -222,9 +222,14 @@ async fn a_closed_port_is_refused_quickly() {
         &format!("sha256:{}", "ab".repeat(32)),
     );
 
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
+    // A closed port, held for the whole test (issue #414): the local end of
+    // a loopback connection kept open. Nothing listens on it, so a connect is
+    // refused, and no test running in parallel can bind it, as it could a
+    // port released right away.
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (_accepted, _) = listener.accept().unwrap();
+    let address = client.local_addr().unwrap();
     let url = format!("https://127.0.0.1:{}", address.port());
 
     let start = std::time::Instant::now();

@@ -258,11 +258,32 @@ fn status_line(response: &str) -> u16 {
         .unwrap_or_else(|| panic!("no status in response: {response:?}"))
 }
 
-fn unused_port() -> SocketAddr {
+/// Keeps a dead backend's port reserved while it lives (issue #414).
+struct HeldPort {
+    _client: std::net::TcpStream,
+    _accepted: std::net::TcpStream,
+}
+
+/// A backend address that refuses every connection for as long as the
+/// returned guard lives. The port is the local end of a loopback connection
+/// held open: nothing listens on it, so a connect is refused at once, and
+/// while the connection is open no other bind gets the port. A port released
+/// right away could be bound by the next backend of a test running in
+/// parallel, and the "dead" backend would then answer. A socket bound
+/// without `listen` would reserve the port too, but on macOS a connect to it
+/// times out instead of being refused.
+fn dead_port() -> (SocketAddr, HeldPort) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr
+    let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (accepted, _) = listener.accept().unwrap();
+    let addr = client.local_addr().unwrap();
+    (
+        addr,
+        HeldPort {
+            _client: client,
+            _accepted: accepted,
+        },
+    )
 }
 
 #[tokio::test]
@@ -420,7 +441,7 @@ async fn round_robin_skips_dead_backends_and_reports_502_when_all_are_dead() {
     assert_eq!(tags, vec!["A", "B", "A", "B"]);
 
     // A dead backend is skipped without failing the request.
-    let dead = unused_port();
+    let (dead, _dead_port) = dead_port();
     let live = spawn_backend("L").await;
     let core = ProxyCore::new();
     core.set_table(table(vec![route(
@@ -436,10 +457,12 @@ async fn round_robin_skips_dead_backends_and_reports_502_when_all_are_dead() {
     }
 
     // Every backend dead -> 502.
+    let (first_dead, _first_dead_port) = dead_port();
+    let (second_dead, _second_dead_port) = dead_port();
     let core = ProxyCore::new();
     core.set_table(table(vec![route(
         "app.example.com",
-        vec![unused_port(), unused_port()],
+        vec![first_dead, second_dead],
         TlsMode::Acme,
     )]));
     let (addr, _shutdown, _handle) = spawn_http(core, mode(TlsMode::Acme, "https", false)).await;
@@ -721,7 +744,7 @@ impl BackendObserver for RecordingObserver {
 
 #[tokio::test]
 async fn an_edge_route_retries_a_connect_failure_once_for_get_and_head_only() {
-    let dead = unused_port();
+    let (dead, _dead_port) = dead_port();
     let live = spawn_backend("L").await;
     let core = ProxyCore::new();
     core.set_table(table(vec![edge_route(
@@ -769,7 +792,7 @@ async fn an_edge_route_retries_a_connect_failure_once_for_get_and_head_only() {
 
 #[tokio::test]
 async fn the_observer_sees_a_backend_that_cannot_connect() {
-    let dead = unused_port();
+    let (dead, _dead_port) = dead_port();
     let observer = Arc::new(RecordingObserver::default());
     let core = ProxyCore::new();
     core.set_observer(Arc::clone(&observer) as Arc<dyn BackendObserver>);

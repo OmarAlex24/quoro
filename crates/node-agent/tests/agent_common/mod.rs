@@ -35,11 +35,13 @@ use quoro_proto::{LeaseGrant, LeaseId, LeaseMode, ResourceType};
 pub struct TempDir(PathBuf);
 
 impl TempDir {
-    /// Creates a unique temporary directory.
+    /// Creates a unique temporary directory. It must not exist yet: a
+    /// directory shared with another test would mix their files, and its
+    /// `Drop` would remove the other test's files.
     pub fn new() -> Self {
         let path =
             std::env::temp_dir().join(format!("quoro-agent-test-{}", quoro_node_agent_test_id()));
-        std::fs::create_dir_all(&path).expect("create the test directory");
+        std::fs::create_dir(&path).expect("create a new test directory");
         Self(path)
     }
 
@@ -55,7 +57,11 @@ impl Drop for TempDir {
     }
 }
 
-/// A unique tag for a test directory, so parallel tests never collide.
+/// A unique tag for a test directory, so parallel tests never collide. The
+/// counter separates the tests of one process and the process id separates
+/// test binaries that run at the same time: the clock alone does not, because
+/// on some platforms it only advances in whole microseconds and every process
+/// starts its counter at zero.
 fn quoro_node_agent_test_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -63,7 +69,11 @@ fn quoro_node_agent_test_id() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("{nanos:x}-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
+    format!(
+        "{}-{nanos:x}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// The bridge every test node uses.
