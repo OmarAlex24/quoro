@@ -65,7 +65,7 @@ The node generates an Ed25519 keypair, keeps the private key locally and sends t
 POST /api/v1/nodes/enroll
 ```
 
-The call is `x-quoro-scope: public`: the node has no credential yet and the join token is the proof. A token can be consumed once; a used or expired token is `409` or `422` in the API's error format (`openapi.yaml`).
+The call is `x-quoro-scope: public`: the node has no credential yet and the join token is the proof. A token can be consumed once; a used or expired token is `409` or `422` in the API's error format (`openapi.yaml`). From M5b, enrolling a machine with the `node` or `witness` role changes the voter set, and is also refused with `409`, without consuming the token, while the previous voter-set change has not reached a majority of voters (section 8.10); `quoro join` says so and the operator runs it again.
 
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
@@ -77,6 +77,8 @@ The call is `x-quoro-scope: public`: the node has no credential yet and the join
 | `kvm` | object | yes | `available` (bool), `kernel` (string), `nested` (bool, optional) |
 
 **Edge-only machines (M5a, ADR 0143).** A machine that enrolls with `roles: ["edge"]` runs no engine and starts no VM, so it needs no KVM: it reports the probe as it finds it (usually `available: false`), and the primary never places a VM on it. A machine with the `node` role still needs KVM to run VMs; `node` and `edge` may combine on one machine.
+
+**Witness-only machines (M5b, ADR 0170).** A machine that enrolls with `roles: ["witness"]` runs no engine either and needs no KVM; it only votes (section 6.12). `witness` may combine with `edge` (ADR 0018) and with `node`, where it adds nothing, since one machine has one vote.
 
 The `kvm` object is filled from a probe at enrollment: `/dev/kvm` exists and is writable, a `vmx`/`svm` flag is present in the CPU flags, and the kernel release is recorded. The probe procedure follows `docs/research/vps-nested-virt.md`; presence of `/dev/kvm` alone does not prove that a guest can start, so the first real boot is the confirmation and a failed boot is reported as a deployment failure in the `boot` phase.
 
@@ -160,7 +162,7 @@ node agent                                          primary
     |                                                  |
     |-- TLS + GET /api/v1/nodes/session (credential) -->|
     |-- hello ---------------------------------------->|
-    |<---------------------------------------- welcome  |
+    |<---------------------------------------- welcome  |  a lower term than the node has seen: stale_term
     |<----------------------------------- lease_revoke  |  0..n stale or superseded leases
     |-- command_result ------------------------------>|
     |<----------------------------- command fence_ack  |  0..1 when an acknowledgement is pending
@@ -180,18 +182,20 @@ node agent                                          primary
     |-- stream_data ... stream_end ------------------>|
     |<------------------------------------ lease_grant |
     |-- lease_renew every duration/3 (expiring only) ->|
+    |<------------------------------- support_request  |  voters only, every support_ms/3 (M5b)
+    |-- support_grant -------------------------------->|
     |                                                  |
 ```
 
 ### 4.2 Rules of the order
 
 1. `hello` is the first message the node sends on every session.
-2. `welcome` is the first message the primary sends.
+2. `welcome` is the first message the primary sends. From M5b the node compares its `term` with the highest term it has seen and ends the session with `error` code `stale_term` when the `welcome` is lower (section 8.8).
 3. The primary sends any `lease_revoke` before anything else. The node stops the stateful VMs bound to those leases and answers `command_result` for each revoke before it processes the next message.
 4. If an operator acknowledged a failed fence of this node and the node has not yet confirmed it, the primary then sends `command` kind `fence_ack` (sections 5.17 and 8.5) and waits for its `command_result`.
 5. Only then does the primary send `desired_state`. The node verifies, persists, answers `command_result` with `ok`, and reconciles.
 6. `log_entries` follow the desired state; the node acknowledges with `log_ack` as it verifies the chain.
-7. Steady state begins: `heartbeat` every 5 s, `status_report` on any observed change and at least every 30 s, `event` whenever something happens, streams on demand.
+7. Steady state begins: `heartbeat` every 5 s, `status_report` on any observed change and at least every 30 s, `event` whenever something happens, streams on demand. On a voter the primary sends its first `support_request` after the voter acknowledged the `desired_state`, so the voter knows its voter-set version (section 8.10).
 
 ### 4.3 Timers
 
@@ -205,6 +209,7 @@ node agent                                          primary
 | Concurrent streams | 32 per session | primary enforces | this file |
 | Stream window | 256 KiB of unacknowledged `data` bytes per stream | node enforces, primary acknowledges | ADR 0116, section 5.25 |
 | Maximum message | 1 MiB | both | this file |
+| Support window `S` | 15 000 ms, asked again every `S / 3` | primary asks, voter promises | ADR 0169, section 8.8 |
 
 The values above are carried in `welcome` (`heartbeat_interval_ms`, `session_timeout_ms`), so the primary can change them without a protocol change; the node uses the values from the current `welcome` and falls back to the defaults above when a session has not yet received one.
 
@@ -212,7 +217,7 @@ The values above are carried in `welcome` (`heartbeat_interval_ms`, `session_tim
 
 The primary marks the node `disconnected` after 15 s without any frame from it and emits `node.disconnected` with `data.reason` either `heartbeat_timeout` (no frame within the timeout) or `session_closed` (the socket closed or the server ended the session). A node that reconnects is `connected` again and the primary emits `node.connected`.
 
-The node redials with exponential backoff from 1 s doubling to 60 s with full jitter, and resets the backoff after a session that stayed up for at least 60 s. One redial attempt dials `primary_url` and, when that fails, each URL the primary advertised in `welcome.primary_urls` in order (section 5.10); the backoff applies between attempts, not between the URLs of one attempt. A `fatal` error stops redialing until an operator acts, except for `unsupported_version`, where the node keeps dialing (an upgraded primary may accept it) but logs the mismatch locally.
+The node redials with exponential backoff from 1 s doubling to 60 s with full jitter, and resets the backoff after a session that stayed up for at least 60 s. One redial attempt dials `primary_url` and, when that fails, each URL the primary advertised in `welcome.primary_urls` in order (section 5.10); the backoff applies between attempts, not between the URLs of one attempt. A `fatal` error stops redialing until an operator acts, with two exceptions. After `unsupported_version` the node keeps dialing (an upgraded primary may accept it) but logs the mismatch locally. After `stale_term` (section 8.8), sent by the node or received by it, the node keeps dialing too, through `primary_url` and every stored `primary_urls` entry, because the primary of the higher term may be reached at another address or start later; while it has no session it keeps running its stored desired state (section 6.5).
 
 ## 5. Message reference
 
@@ -472,7 +477,7 @@ The primary assigns `seq` on receipt and deduplicates by `id`, so a node that re
 | `lease_id` | string (`lse_`) | yes | Lease being renewed |
 | `fencing_token` | integer | yes | Token the node believes it holds |
 
-The primary answers with a `lease_grant` that carries the same `fencing_token` when the node still holds the lease — renewals keep the token, they never change it (D-0073) — with `re` set to this message's `id`. A renewal whose token is lower than the primary's current token, or for a lease that no longer exists, is answered with `lease_revoke`. The node also sends one `lease_renew` immediately after a first grant (section 8.4). `local` leases are never renewed.
+The primary answers with a `lease_grant` that carries the same `fencing_token` when the node still holds the lease — renewals keep the token, they never change it (D-0073) — with `re` set to this message's `id`. From M5b it answers only while a majority of voters supports it for the duration it grants (section 8.8); without that majority it leaves the renewal unanswered, so the renewal is late and the node follows section 8.4. A renewal whose token is lower than the primary's current token, or for a lease that no longer exists, is answered with `lease_revoke`. The node also sends one `lease_renew` immediately after a first grant (section 8.4). `local` leases are never renewed.
 
 ```json
 {
@@ -636,7 +641,7 @@ A `lease_revoke` whose fence failed:
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
 | `cluster_id` | string (`cls_`) | yes | Cluster the session belongs to |
-| `term` | integer | yes | Cluster term; `1` until elections exist |
+| `term` | integer | yes | Cluster term: `1` until the first promotion, then one more with each promotion (section 8.9). A node that has seen a higher term refuses this session with `stale_term` (section 8.8) |
 | `server_time` | string | yes | Primary's wall-clock time |
 | `heartbeat_interval_ms` | integer | yes | 5 000 in v1 |
 | `session_timeout_ms` | integer | yes | 15 000 in v1 |
@@ -678,8 +683,8 @@ The node keeps the list next to `primary_url` in its identity (section 12). It d
 | --- | --- | --- | --- |
 | `rev` | integer | yes | Monotonic revision of the node's desired state |
 | `issued_at` | string | yes | When the primary produced it |
-| `term` | integer | yes | Cluster term at issue time |
-| `spec` | object | yes | `vms`, `routes`, `network`, `ingress` when the node runs a tunnel, `builds` when the node has builds to run (ADR 0117), `volumes` when the node holds volumes (ADR 0145), `backups` with `backup_repository` when it has backup jobs (ADR 0147), `mesh` once the machine is on the mesh, and `edge` on a machine with the `edge` role (ADR 0143, ADR 0144). An edge-only machine gets `vms` and `routes` as empty lists and no `network` |
+| `term` | integer | yes | Cluster term at issue time. A node refuses a snapshot whose term is lower than the highest term it has seen with `error` code `stale_term` (section 8.8) |
+| `spec` | object | yes | `vms`, `routes`, `network`, `ingress` when the node runs a tunnel, `builds` when the node has builds to run (ADR 0117), `volumes` when the node holds volumes (ADR 0145), `backups` with `backup_repository` when it has backup jobs (ADR 0147), `mesh` once the machine is on the mesh, `edge` on a machine with the `edge` role (ADR 0143, ADR 0144), and from M5b `votes` on every voter and `witness` on a machine with the `witness` role (section 6.12, ADR 0170). An edge-only or witness-only machine gets `vms` and `routes` as empty lists and no `network` |
 | `signature` | string | yes | Base64 Ed25519 signature by the cluster signing key |
 
 **Signature.** The signature covers the RFC 8785 (JSON Canonicalization Scheme) serialization of the whole `body` object with the `signature` member removed. The node verifies it against `cluster_public_key` before it parses anything else, persists the verified snapshot atomically, answers `command_result` with `ok`, and only then reconciles. An invalid signature is answered with `error` code `bad_signature` and the snapshot is discarded; the node keeps running on its previously stored snapshot.
@@ -802,7 +807,7 @@ A build stays in `spec.builds` until the primary has recorded the terminal statu
 | --- | --- | --- | --- |
 | `address` | string | yes | This machine's mesh address, `nodes.mesh_address`, with prefix length `/16` |
 | `listen_port` | integer | yes | UDP port the interface listens on; 51820 unless the operator changed it |
-| `peers` | array of object | yes | The other end of each tunnel; on a node only the edge, on the edge every node with the `node` role (a star in M5a) |
+| `peers` | array of object | yes | The other end of each tunnel; on a node the edge, on the edge every node with the `node` role (a star in M5a). From M5b a voter also has every other voter, except that two witness-only machines are not peers (section 6.9) |
 | `allow` | array of object | yes | On a node: what the edge may reach through the interface, one `{ "source": <edge mesh address>, "address": <guest address>, "port": <integer> }` per backend of this node; `[]` on the edge |
 
 Each peer:
@@ -812,7 +817,7 @@ Each peer:
 | `node_id` | string (`nod_`) | yes | The peer machine |
 | `public_key` | string | yes | Its `mesh_public_key` |
 | `endpoint` | string | no | `host:port` to dial; absent for a peer behind NAT, which dials this machine instead |
-| `allowed_ips` | array of string | yes | CIDRs routed to the peer: on the edge, a node's mesh address `/32` and its guest subnet; on a node, the edge's mesh address `/32` |
+| `allowed_ips` | array of string | yes | CIDRs routed to the peer: on the edge, a node's mesh address `/32` and its guest subnet; on a node, the edge's mesh address `/32`; between two voters, the other voter's mesh address `/32` |
 | `persistent_keepalive_s` | integer | no | Keepalive interval, set by the primary for a machine behind NAT; 25 by default |
 
 **`spec.edge`** (optional; on a machine with the `edge` role; ADR 0143):
@@ -913,7 +918,7 @@ A replica node that holds a copy of the change log but is not the primary never 
 | `resource_id` | string | yes | `app_` or `nod_` id |
 | `mode` | string | yes | `local` or `expiring` |
 | `fencing_token` | integer | yes | Changes only when ownership changes: the same value as the node's current token when the grant answers a renewal by the current holder; a strictly higher value than any earlier token for the resource when the lease goes to a new holder or is granted again after expiry or revoke. Never reused (D-0073). |
-| `duration_ms` | integer | no | Present for `expiring`, absent for `local` |
+| `duration_ms` | integer | no | Present for `expiring`, absent for `local`. At least 3 000; `D` (15 000 by default, ADR 0171), or `W` while a maintenance window is open (section 8.11), at most 600 000 |
 | `granted_at` | string | yes | Authority's wall-clock time of the grant |
 
 A grant whose token is lower than the highest token the node has seen for that resource, or equal to it while the node does not hold that lease (state `held` or `uncertain`) under that token, is a bug in the authority and is refused with `error` code `bad_message`, non-fatal: the node keeps its current state and starts or stops nothing.
@@ -1192,6 +1197,7 @@ Restarts and stops are **never** commands. They are changes of desired state —
 | `not_found` | no | A `stream_open` or `command` named a build, VM or transcript this node does not have. Carried in the `error` of a `command_result` |
 | `not_available` | no | The VM exists but cannot serve the requested stream now: a `terminal` on a stopped VM or on a VM started before the M4 guest init. Carried in the `error` of a `command_result` |
 | `fence_failed` | no | A self-fence could not confirm that every stateful VM bound to the lease stopped, so a VM may still run (section 8.5). Carried in the `error` of the `command_result` that answers a `lease_revoke`; the node has marked itself failed |
+| `stale_term` | yes | From M5b: the other side's term is lower than the highest term the sender has seen (section 8.8). A node sends it on a `welcome`, `desired_state` or `support_request` from an older primary and ends the session; it keeps redialing (section 4.4). A primary that receives it stops granting and renewing `expiring` leases at once |
 
 A fatal error ends the session immediately; the node applies its redial rule (section 4.4). A non-fatal error leaves the session usable.
 
@@ -1458,6 +1464,65 @@ The primary acknowledges nothing: completeness is checked through `status_report
 }
 ```
 
+### 5.27 `support_request`
+
+**Direction:** control plane to node.
+**When:** from M5b, to every connected voter (a machine with `spec.votes`, section 6.12): once after `desired_state` at the start of each session, then every `support_ms / 3` (ADR 0169, section 8.8).
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `term` | integer | yes | The primary's term |
+| `primary_node_id` | string (`nod_`) | yes | The node holding the primary status, as in `welcome` |
+| `support_ms` | integer | yes | `S`, the support window asked for; 15 000 by default, at least 3 000 |
+| `max_lease_ms` | integer | yes | `L`, the longest `duration_ms` the primary may grant while this support lasts: `D` normally, `W` while a maintenance window is open (section 8.11) |
+| `voters_version` | integer | yes | The voter-set version the primary counts against (section 8.10) |
+
+The voter answers with `support_grant` (section 5.28) once its promise is stored, or with `error`: `stale_term`, fatal, when `term` is lower than the highest term it has seen (section 8.8); `bad_message`, non-fatal, when it voted in this term for another candidate than `primary_node_id`, or when `support_ms` is below the floor. A machine that is not a voter ignores the message.
+
+```json
+{
+  "v": 1,
+  "type": "support_request",
+  "id": "msg_01JCA0B2C3D4E5F6G7H8J9K0MN",
+  "body": {
+    "term": 1,
+    "primary_node_id": "nod_01JC9Z0000000000000000000Q",
+    "support_ms": 15000,
+    "max_lease_ms": 15000,
+    "voters_version": 3120
+  }
+}
+```
+
+### 5.28 `support_grant`
+
+**Direction:** node to control plane.
+**When:** in answer to a `support_request`, with `re` set to the request's `id`.
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `term` | integer | yes | The term supported, equal to the request's |
+| `support_ms` | integer | yes | The window granted, equal to the request's |
+| `max_lease_ms` | integer | yes | The `L` recorded with the promise, equal to the request's |
+| `voters_version` | integer | yes | The voter-set version of the voter's stored desired state; the primary counts the support only when it equals its own (section 8.10) |
+
+The voter sends it only after it has stored its promise and its lease horizon (sections 8.8 and 12). The primary measures the support from the time it sent the request, never from the time the answer arrived. An answer that does not pair with an outstanding request is ignored.
+
+```json
+{
+  "v": 1,
+  "type": "support_grant",
+  "id": "msg_01JCA0B3D4E5F6G7H8J9K0MNPQ",
+  "re": "msg_01JCA0B2C3D4E5F6G7H8J9K0MN",
+  "body": {
+    "term": 1,
+    "support_ms": 15000,
+    "max_lease_ms": 15000,
+    "voters_version": 3120
+  }
+}
+```
+
 ## 6. Reconciliation
 
 ### 6.1 Source of truth on the node
@@ -1555,12 +1620,12 @@ A machine with the `edge` role runs the embedded proxy for `spec.edge.routes` (A
 
 ### 6.9 The mesh
 
-The mesh is kernel WireGuard driven over netlink, with no `wg` or `wg-quick` process (ADR 0063, ADR 0144). In M5a it is a star: the edge has one peer per node, and every node has the edge as its only peer.
+The mesh is kernel WireGuard driven over netlink, with no `wg` or `wg-quick` process (ADR 0063, ADR 0144). In M5a it is a star: the edge has one peer per node, and every node has the edge as its only peer. From M5b voters also peer with each other, so a candidate for promotion reaches every voter directly (section 8.9): every two voters are peers unless both are witness-only, and a peer the star already has is not repeated.
 
 - **Keys.** The machine generates its WireGuard key pair on its first M5a start, keeps the private key root-only next to its credential, and sends the public key in `hello`. A machine never receives another machine's private key.
 - **Interface.** The node agent creates the WireGuard interface `quoro-wg0` with `address`, `listen_port` and `peers`, and keeps it equal to them on every apply. A peer that disappears from `peers` is removed. On the edge, the kernel routes each node's guest subnet to that node's peer through `allowed_ips`.
-- **Firewall.** On a node, traffic that arrives on the mesh interface is dropped unless it comes from an `allow` entry's `source` and goes to its `address` and `port` over TCP. The mesh carries no traffic between guests and none to the host's own services; the isolation of guests from each other (ADR 0084) is unchanged.
-- **NAT.** A machine behind NAT has no `endpoint` in the other side's peer entry; it dials the peer that has one and keeps the tunnel open with `persistent_keepalive_s`. WireGuard follows a peer whose address changed (roaming), which also covers a node whose address changed after a reboot.
+- **Firewall.** On a node, traffic that arrives on the mesh interface is dropped unless it comes from an `allow` entry's `source` and goes to its `address` and `port` over TCP. The mesh carries no traffic between guests, and none to the host's own services except, on a voter, the vote listener: TCP to its own mesh address on `spec.votes.port`, from the mesh address of each voter with the `node` role in `spec.votes.voters` (section 8.9). That rule follows from `spec.votes` and is not repeated in `allow`. The isolation of guests from each other (ADR 0084) is unchanged.
+- **NAT.** A machine behind NAT has no `endpoint` in the other side's peer entry; it dials the peer that has one and keeps the tunnel open with `persistent_keepalive_s`. WireGuard follows a peer whose address changed (roaming), which also covers a node whose address changed after a reboot. Two voters that are both behind NAT, neither with an endpoint, cannot reach each other: the primary gives them no peer entry for each other, and a candidate on one of them cannot count the other's vote (section 8.9).
 - **A changed subnet.** When `spec.network.subnet` differs from the subnet of the node's bridge, the node does not reconfigure that bridge (`engine-trait.md` section 3.3 refuses it with `Conflict`). It ensures a second bridge with the new subnet and gateway, keeps its running VMs on the old bridge with their old addresses, and creates every new or redeployed VM on the new one. The old bridge stays, without VMs, until the host restarts: the engine has no call that removes a network in M5a. VMs that only restart in place keep their address; a redeploy moves them (ADR 0144, like ADR 0136).
 
 ### 6.10 Instance identity
@@ -1578,6 +1643,41 @@ From M5a every image the engine prepares is inventoried in the same pass that un
 - **Sending.** After it prepares an image, the node sends the inventory once (section 5.26) and lists the image in `status_report.images`. It sends it again only on `inventory_resend`.
 - **Images held before M5a.** Once after it starts, in the background, the node agent asks the engine for every cached image without an inventory and has the engine inventory them one at a time from their root disks (`engine-trait.md` section 3.21). Each inventory it gets is sent exactly as for a freshly prepared image: once (section 5.26), and listed in `status_report.images` with its `inventory_sha256`. Until then the image is listed without `inventory_sha256`, as one whose inventory is still being built. The pass needs no network and no deployment, covers pulled and built images alike, and never delays the node's start or its VMs. An image the engine cannot inventory is logged and stays without an inventory until the next start of the node agent tries again; the other images go on.
 - **On the primary.** The primary keeps the inventories it received, and its copy of the OSV data, in a cache file of its own next to its database, not in the database: the file is large, can always be fetched again, and is left out of control-plane backups (ADR 0148). Only the data age (`osv_mirror`) and the findings (`vulnerability_findings`) are in the database (`migrations/0008-vulnerabilities.sql`). The primary fetches an OSV ecosystem the first time an inventory needs it, never OSV's whole-bucket archive, refreshes it daily from that ecosystem's change list, and can be fed offline with `quoro vuln import <dir>`. It matches on the package's (or source package's) name and the ecosystem's own version order, and records a finding only when it appears, changes or is resolved.
+
+### 6.12 Voters and the witness
+
+From M5b every machine with the `node` or `witness` role is a voter (ADR 0170). An edge-only machine is not, and one machine has one vote whatever its roles. What a voter does is section 8.8; this section says what the primary sends it and what a witness runs.
+
+- **Roles in desired state.** A machine learns its roles from its desired state: `spec.witness` is present on a machine with the `witness` role, and `spec.votes` on every voter. A machine gains or loses the `witness` role through `POST /api/v1/nodes/{node_id}/roles` without enrolling again, and acts on the next `desired_state`. A machine whose desired state loses `spec.votes` stops answering `support_request` and votes, and keeps its vote state (section 12) until it gets `spec.votes` again or is removed.
+- **A witness-only machine** (enrolled with `roles: ["witness"]`, or an edge that gained the role) runs the node agent with no engine and starts no VM, so it needs no KVM, like an edge-only machine (section 2.3). It gets `vms` and `routes` as empty lists, no `network`, and `spec.mesh` with its peers. It answers `support_request`, serves votes on the mesh (section 8.9) and stores only its vote state: no volumes, no images and no application data. The primary assigns it a mesh address when it enrolls or gains the role.
+- **The voter set** is every enrolled machine with the `node` or `witness` role that is not `removed`, connected or not. A node declared lost (section 8.3) stays a voter until it is removed.
+
+**`spec.witness`** (optional; on a machine with the `witness` role): an empty object in M5b. Its presence is the role.
+
+**`spec.votes`** (optional; on every voter):
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `version` | integer | yes | The voter-set version: the change-log `seq` of the entry that last changed the voter set (section 8.10) |
+| `port` | integer | yes | TCP port of the vote listener on the voter's mesh address; 51821 unless the operator changed it |
+| `voters` | array of object | yes | Every voter, this machine included: `{ "node_id": <nod_>, "roles": [...], "mesh_address": <address or null> }` |
+
+```json
+{
+  "witness": {},
+  "votes": {
+    "version": 3120,
+    "port": 51821,
+    "voters": [
+      { "node_id": "nod_01JC9Z0000000000000000000Q", "roles": ["node"], "mesh_address": "10.43.0.2" },
+      { "node_id": "nod_01JC9Y2M4Q7V8B1N6T3R5K9XZP", "roles": ["node"], "mesh_address": "10.43.0.3" },
+      { "node_id": "nod_01JCA0A1B2C3D4E5F6G7H8J9KM", "roles": ["edge", "witness"], "mesh_address": "10.43.0.1" }
+    ]
+  }
+}
+```
+
+The example shows the two fields as they appear in `spec` on a machine that is both edge and witness.
 
 ## 7. Change-log follow
 
@@ -1599,9 +1699,10 @@ The lease modes are decided (D-0047): `local` for HA policy `none` and `cold`, `
 | Period | Lease authority | Consequence |
 | --- | --- | --- |
 | M0 to M5a | The primary, in process | One control plane; a `local` lease survives its absence (D-0011) |
-| M5b and later | The primary backed by a quorum with the witness, or an external arbiter | Same messages; the authority behind them is stronger (D-0017) |
+| M5b | The primary, while a majority of voters supports it (section 8.8, ADR 0169) | Same lease messages; `expiring` grants and renewals stop when the primary loses that majority, and a promotion cannot overlap the old primary's grants (D-0017) |
+| M6 and later | An elected primary | Automatic failover; the same messages also carry `resource_type: primary` leases |
 
-The external arbiter options are an S3/R2 conditional write or a Cloudflare Durable Object. Both are researched and both require the fencing token to stay (F-0037, F-0038, `docs/research/r2-conditional-writes.md`, `docs/research/durable-objects.md`): object storage has no server-side expiry, and a Durable Object restart can kill an in-flight write, so "the lease expired" is always inferred and always enforced by the node and by the token.
+The voters do not see leases: they give the primary a short support window, and the primary grants only inside it. An external arbiter is not used in M5b (ADR 0169 keeps it as a later option). The external arbiter options are an S3/R2 conditional write or a Cloudflare Durable Object. Both are researched and both require the fencing token to stay (F-0037, F-0038, `docs/research/r2-conditional-writes.md`, `docs/research/durable-objects.md`): object storage has no server-side expiry, and a Durable Object restart can kill an in-flight write, so "the lease expired" is always inferred and always enforced by the node and by the token.
 
 The same mechanism also serves primary election (D-0019). Leases with `resource_type: primary` appear when automatic failover exists (M6); in M0-M5 the only leases are `resource_type: app`.
 
@@ -1612,6 +1713,8 @@ The same mechanism also serves primary election (D-0019). Leases with `resource_
 | `lease_grant` | control plane to node | Grant a lease, with mode, token and duration; also the answer to `lease_renew` |
 | `lease_renew` | node to control plane | Ask to extend an `expiring` lease every `duration_ms / 3` |
 | `lease_revoke` | control plane to node | End a lease: `moved`, `deleted`, `declared_lost`, `superseded` |
+| `support_request` | control plane to voter | From M5b: ask for a support window, every `support_ms / 3` (section 8.8) |
+| `support_grant` | voter to control plane | The promise not to support another candidate for a higher term until the window has passed |
 
 ### 8.3 `local` mode
 
@@ -1620,10 +1723,18 @@ Issued for the HA policies where no other copy of the app can start (`none`, `co
 - It never expires because the session is gone or the control plane is unreachable. This is what keeps D-0011 true: an app keeps running when the panel is down.
 - It ends only by:
   - `lease_revoke` with reason `moved`, `deleted`, `superseded`; or
-  - an operator declaring the node lost (part of the `local` lease mode, D-0047), which is a manual action from M5a and needs an endpoint that a later contract pull request adds. Declaring a node lost increments the lease's `fencing_token` (D-0019), so the old holder's token is stale even though the old holder never received a message.
+  - an operator declaring the node lost (part of the `local` lease mode, D-0047): `POST /api/v1/nodes/{node_id}/declare-lost`, scope `node:declare_lost`, human-only and audited (ADR 0183). Declaring a node lost increments the lease's `fencing_token` (D-0019), so the old holder's token is stale even though the old holder never received a message.
 - A `local` lease on a node whose session is gone is a normal state, not an incident. The primary reports the node `disconnected`, not `fenced`.
 - **Granted at placement (M5a).** The primary grants a `local` lease on an app to the node that holds its volume when the volume is created, and records it in `leases`. A restore revokes the lease on the old node with reason `moved` and, once the new volume is `ready`, grants a new one to the target node with a strictly higher token (ADR 0147). A restore is refused while the old node is disconnected: an operator removes that node first (section 10), which increments the token.
 - **Released at deletion.** Deleting the app's attached volume, or the app, revokes the lease with reason `deleted`.
+
+**Declaring a node lost (M5b, ADR 0183).** The operator states that a disconnected node is gone, so the apps it held may start elsewhere. In one transaction the primary:
+
+1. increments the `fencing_token` of every lease the node holds, `local` and `expiring`, and records each one revoked in its own view (`leases.revoked_at`), with the node still named as the last holder;
+2. sets `nodes.lost_at`; the node stays enrolled, and stays a voter until it is removed (section 6.12);
+3. writes one audit record, `declareNodeLost`.
+
+The call is refused with `409 conflict` while the node is connected, because the primary can then revoke over the session (section 5.13), and for a `removed` node. It changes nothing in `fence_failure`: a lease listed there stays ungrantable until an operator acknowledges that fence (section 8.5), so declaring a node lost never covers a failed fence the operator has not seen. An `expiring` lease of a lost node also keeps its gate (section 8.4): a new holder gets it only after the old holder's last grant has passed `T_grant + D + 2M`. When the node returns, its `hello` names leases with tokens lower than the primary's, and the primary revokes them with reason `declared_lost` before anything else (section 9); the primary clears `lost_at` once those revokes are answered. Cold restores of a disconnected node and a promotion that acknowledges the fence for the old primary's own node use this call (ADR 0182).
 
 ### 8.4 `expiring` mode timing
 
@@ -1647,7 +1758,7 @@ valid_until = t_send + D - M
 M           = max(1000, D / 10)
 ```
 
-The authority never grants a `duration_ms` below 3 000 ms: with the floor margin of 1 000 ms that keeps `valid_until` at least 2 000 ms after the renewal, so the node has a real window to renew before it must fence. A grant below that floor is refused with `error` code `bad_message`, non-fatal.
+The authority never grants a `duration_ms` below 3 000 ms: with the floor margin of 1 000 ms that keeps `valid_until` at least 2 000 ms after the renewal, so the node has a real window to renew before it must fence. A grant below that floor is refused with `error` code `bad_message`, non-fatal. A grant that answers a renewal may carry any duration at or above the floor, up to 600 000 ms; the node computes `M` and `valid_until` from the duration of the grant it holds. In M5b the duration is `D` = 15 000 ms, or `W` while a maintenance window is open (section 8.11, ADR 0171).
 
 **First grant.** An `expiring` grant that does not answer an outstanding renewal of the node — the first grant of a lease to this node, a grant after `expired` or `revoked`, or a higher-token grant while the node already holds the lease — records the token, leaves the lease (or puts it) in `uncertain`, and makes the node send a `lease_renew` at once. The lease becomes `held` only when the authority answers that renewal with the same token; `valid_until` is then computed from that renewal's send time. Until then the node starts nothing stateful for it, and an existing `valid_until` (a higher-token grant while held) is kept, never extended. This removes any assumption about how long the grant took to arrive (D-0072). A `local` grant needs no renewal and is `held` on receipt.
 
@@ -1687,7 +1798,7 @@ T_grace + T_force <= M
 F - T_gate <= (t_send + D) - (t_send + D + 2M) = -2M
 ```
 
-The fence therefore completes at least `2M` before the gate opens. The two clocks are not shared, so let `δ` be the bound on their drift and offset over the lease lifetime: the fence completion, expressed on the authority's clock, is at most `t_send + D + δ`, and the gate is at least `t_send + D + 2M - δ`. The remaining gap is `2M - 2δ`, which is strictly positive whenever `δ < M`. The margin `M` must therefore be larger than the bounded drift and the messaging delay between the machines; that the drift is bounded by such a value is a **Hypothesis** to be measured on the lab, and a node whose clock steps backwards or forwards by more than `M` must be treated as a failed node.
+The fence therefore completes at least `2M` before the gate opens. The two clocks are not shared, so let `δ` be the bound on their drift and offset over the lease lifetime: the fence completion, expressed on the authority's clock, is at most `t_send + D + δ`, and the gate is at least `t_send + D + 2M - δ`. The remaining gap is `2M - 2δ`, which is strictly positive whenever `δ < M`. The margin `M` must therefore be larger than the bounded drift and the messaging delay between the machines. That bound was measured on the lab before M5b (`docs/research/m5b-warm-and-leases.md`): the monotonic clocks of the three machines differed in rate by at most 4.2 ppm, 0.063 ms over a 15 s lease, and the session path's round trip had a p99 of 0.75 ms, against `M` = 1 500 ms. The lab's machines share one physical host; machines on separate hosts can drift more, but still by parts per million, microseconds per lease. A node whose clock steps backwards or forwards by more than `M` must still be treated as a failed node.
 
 Worked example with `D = 15000`:
 
@@ -1699,11 +1810,19 @@ Worked example with `D = 15000`:
 | Gate `T_gate` | not before `t_send + 18 000 ms` |
 | Chosen `T_grace` / `T_force` | 1 000 ms / 300 ms, sum 1 300 ms ≤ `M` |
 | Actual fence completion, worst case | `t_send + 14 800 ms` |
-| Slack before the gate | at least 3 200 ms, minus 2δ |
+| Slack before the gate | at least 3 200 ms, minus 2δ (2δ measured at about 0.13 ms on the lab) |
 
-**What the authority must enforce.** The gate is the authority's obligation, not the node's: the primary (or the arbiter) records the send time of the last grant to a holder and refuses to grant the same lease to anyone else before `D + 2M` have passed on its own clock. An authority that grants earlier can hand the same app to two nodes. That obligation is why an arbiter with a real single-writer critical section (a Durable Object, or a conditional write on strongly consistent storage) matters at M5b (`docs/research/durable-objects.md`, `docs/research/r2-conditional-writes.md`).
+**What the authority must enforce.** The gate is the authority's obligation, not the node's. An authority that grants earlier can hand the same app to two nodes. In M5b the authority is the primary, and it:
 
-**Agent restart.** `expiring` leases that were `held` or `uncertain` survive an agent restart within the same host boot. The node persists, for each such lease, the remaining validity measured on `CLOCK_BOOTTIME` together with the host's kernel boot id (`/proc/sys/kernel/random/boot_id`, stored as `host_boot_id` in `node_meta`, section 12; not the per-process `boot_id` of `hello`). On restart, if the kernel boot id is unchanged and the remaining validity has not run out on `CLOCK_BOOTTIME`, the lease comes back `uncertain` with that remaining `valid_until` and renews at once; otherwise it comes back `expired` and is fenced. `CLOCK_BOOTTIME` keeps counting while the machine is suspended, so a suspend can only shorten the remaining validity. The VMMs outlive the agent (section 6.3), so an agent upgrade does not stop warm apps. Required before `expiring` leases ship in M5b (D-0072); M0 restores such leases as `expired` and fences them, which is the conservative behaviour.
+- sends an `expiring` grant, a first grant or the answer to a renewal, only while a majority of voters supports it for that duration (section 8.8);
+- keeps, for each `expiring` lease, the gate of its current holder: the latest `T_grant + duration_ms + 2M` over every grant it sent that holder, so a shorter grant after a longer one (the end of a maintenance window) never brings the gate forward;
+- grants the lease with a new token, to another node or to the same one after expiry or revoke, only after that gate has passed on its own monotonic clock; renewals by the current holder are not gated;
+- keeps no monotonic time across its own restart: at start it treats every `expiring` lease as granted at that moment for `leases.duration_ms`, the longest duration it may have granted the holder, which it raises before it sends a longer grant and lowers only once the longer grant's gate has passed. The first gate after a restart is therefore `start + duration_ms + 2M`;
+- writes nothing for a renewal: a renewal changes no state and appends no change-log entry, and `Lease.renewed_at`, `expires_at` and `gate_at` in the API are the primary's in-memory view.
+
+The primary's single-writer critical section is its own database transaction. What a single primary cannot guarantee alone is that no second primary grants at the same time after a promotion; the voters' support and the terms provide that (sections 8.8 and 8.9). A Durable Object or a conditional write on strongly consistent storage remains a later option for the same role (`docs/research/durable-objects.md`, `docs/research/r2-conditional-writes.md`).
+
+**Agent restart.** `expiring` leases that were `held` or `uncertain` survive an agent restart within the same host boot. The node persists, for each such lease, the remaining validity measured on `CLOCK_BOOTTIME` together with the host's kernel boot id (`/proc/sys/kernel/random/boot_id`, stored as `host_boot_id` in `node_meta`, section 12; not the per-process `boot_id` of `hello`). On restart, if the kernel boot id is unchanged and the remaining validity has not run out on `CLOCK_BOOTTIME`, the lease comes back `uncertain` with that remaining `valid_until` and renews at once; otherwise it comes back `expired` and is fenced. `CLOCK_BOOTTIME` keeps counting while the machine is suspended, so a suspend can only shorten the remaining validity. The VMMs outlive the agent (section 6.3), so an agent upgrade does not stop warm apps. Required before `expiring` leases ship in M5b (D-0072); M0 restores such leases as `expired` and fences them, which is the conservative behaviour. The vote state of a voter survives restarts the same way (section 8.8).
 
 ### 8.5 Self-fence procedure
 
@@ -1747,8 +1866,138 @@ M0 ships the protocol, not the HA feature: the messages, the four node-side stat
 | M3 | Primary | `local` | Same; the agent-driven calls arrive as desired-state changes from the API and MCP |
 | M4 | Primary | `local` | Adds builds in desired state, build-log, metrics, terminal, console and transcript streams, `stream_input` and `stream_ack`; leases unchanged |
 | M5a | Primary | `local` | Local volumes, with a `local` lease granted at placement; backup jobs carrying the lease token; restores that move the lease to the target node (section 6.7); operator declaration of a lost node adds a lease revoke with a new token. Replicas take no lease: they are stateless. The edge and the mesh (sections 6.8 and 6.9) hold no lease either |
-| M5b | Primary plus witness quorum or external arbiter | `local`, `expiring` (`warm`) | Warm: renewal loop, `uncertain` handling, replication writes carrying tokens, restart persistence of held leases (section 8.4), concurrent fences (section 8.5) |
+| M5b | Primary, while a majority of voters supports it (section 8.8) | `local`, `expiring` (`warm`) | Warm: renewal loop, `uncertain` handling, restart persistence of held leases (section 8.4), concurrent fences (section 8.5); replication writes carrying tokens come with warm replication. Voters answer `support_request`, keep their vote state and serve promotion votes (sections 8.8 and 8.9); every machine refuses a lower term |
 | M6 | Quorum | `local`, `expiring` (`warm`, `hot`) | Automatic failover and `hot`; the same messages also carry `resource_type: primary` leases |
+
+### 8.8 Voter support and terms (M5b)
+
+From M5b the primary is the lease authority only while a majority of voters supports it (ADR 0169). A voter is a machine with the `node` or `witness` role (section 6.12). Support works like an `expiring` lease with the roles swapped: the primary asks over the session it already has with each voter, the voter promises, and each side measures from the moment that keeps it safe.
+
+Definitions, each on the clock of the machine that uses it:
+
+| Symbol | Value |
+| --- | --- |
+| `S` | `support_ms` of the request; 15 000 ms by default, at least 3 000 ms |
+| `M_S` | `max(1000 ms, S / 10)`: 1 500 ms with the default |
+| `L` | `max_lease_ms` of the request: the longest `duration_ms` the primary may grant while this support lasts |
+| `M_L` | `max(1000 ms, L / 10)`, the margin of a grant of duration `L` (section 8.4) |
+| `p_send` | The primary's monotonic time when it sent the `support_request` that a `support_grant` answers |
+| Support, in the primary's view | Until `p_send + S - M_S` |
+| `v_recv` | The voter's monotonic time when it received that request |
+| Promise | The voter supports no other candidate for a higher term before `v_recv + S` |
+| Lease horizon | `v_recv + S + L + 2 M_L`: until then a grant made under this support may not yet have passed its gate |
+
+**Exchange.** The primary sends `support_request` to every connected voter (section 5.27) and keeps, per voter, the newest answered support. The voter stores the promise and raises its lease horizon to the new value when it is later than the stored one, then answers `support_grant` (section 5.28). The voter never lowers the horizon within a term.
+
+**Majority.** More than half of the voter set of the primary's `voters_version` (section 8.10), counting every voter, connected or not. The primary's own host is a voter like any other when it has the `node` or `witness` role, and it counts only through the support its own node agent grants over its own session: the vote state lives with the agent (section 12), so a candidate can ask it like any voter, and a host whose agent does not run gives no support. A voter counts only when its `support_grant` carries the primary's `voters_version`. With fewer than three voters the primary still needs a majority of the voters that exist (both of two, the one of one), and `Cluster.votes.ha_ready` is false: a two-voter cluster loses its `expiring` leases when either machine is cut off.
+
+**What support allows.** At the moment it sends an `expiring` `lease_grant`, a first grant or the answer to a renewal, of duration `d`, the primary must hold support from a majority whose `L` is at least `d`. Without it the primary leaves renewals unanswered: the node's renewals go late, the lease goes `uncertain` and at `valid_until` `expired`, and the node fences, on the primary's own host too. That is the price of ADR 0169: a primary cut off from the majority stops its warm apps instead of keeping them while a promotion may start them elsewhere. `local` leases need no support; they are granted, revoked and moved as before.
+
+**Terms.** `term` starts at 1 and goes up only through a promotion, which takes `t + 1` from a majority of voters (section 8.9). Every machine, voter or not, keeps the highest term it has seen, from a `welcome`, a `desired_state`, a `support_request` or a vote it granted, in its local store (section 12):
+
+- A `welcome`, `desired_state` or `support_request` with a lower term is answered with `error` code `stale_term`, fatal, and the machine ends the session and redials (section 4.4). It keeps running its stored desired state meanwhile.
+- A higher term in a `welcome` or `desired_state` is stored and adopted. The session is authenticated by the pinned certificate, which a promoted primary keeps (ADR 0181).
+- A voter supports, at its current term, only the primary it voted for when it voted in that term; for a term it did not vote in, the primary of its session.
+- A primary that receives `stale_term` stops granting and renewing `expiring` leases at once. What else it does, such as refusing writes, is part of the promotion contract (ADR 0182).
+
+**Restarts.** The voter stores its term, the candidate it voted for, the promise and the lease horizon before it answers, with the promise and the horizon measured on `CLOCK_BOOTTIME` next to the host's kernel boot id, as for held leases (section 8.4). After an agent restart within the same boot both keep counting. After a reboot the voter cannot tell how long it was down, so it starts both again from its first start: the promise until `now + S` and the horizon until `now + S + L + 2 M_L`, with the stored `S` and `L`. Both can only end later than before, which is the safe side. The primary keeps support in memory only: after it restarts it has none, and it asks again before it grants or renews any `expiring` lease.
+
+### 8.9 Promotion votes (M5b)
+
+Manual promotion (ADR 0182) takes term `t + 1` from a majority of voters. This section fixes how a candidate asks and what a voter answers; the promotion's own steps, the CLI and the custody seals come with the promotion contract.
+
+**Where votes travel: directly over the mesh.** The M5a mesh is a star: nodes peer only with the edge (section 6.9). A candidate could reach the other voters either through the edge as a relay or through peers of its own, and M5b uses peers:
+
+- A relay makes the edge a single point of failure for promotion, which is the operation used when a machine is gone, and a cluster whose witness is a separate machine may have no edge at all.
+- WireGuard authenticates each peer by its key and binds its mesh address to it, so a request that arrives from a voter's mesh address comes from that voter.
+- Warm replication needs node-to-node peers anyway (ADR 0144, ADR 0173).
+
+Every two voters are therefore peers unless both are witness-only (section 6.9). Two voters both behind NAT, neither with an endpoint, cannot be peers; a candidate on one of them cannot count the other, and needs its majority among the voters it reaches.
+
+**Listener.** The node agent of every voter listens on its own mesh address, TCP port `spec.votes.port` (51821 by default), and on no other address. Requests are HTTP/1.1 with JSON bodies inside the WireGuard tunnel, which encrypts and authenticates them. The voter answers only requests that come from the mesh address of a voter with the `node` role in its `spec.votes.voters`, because only such a machine holds custody seals and can be promoted (ADR 0180); any other source is answered `not_allowed`. The candidate asks every voter in the same way, its own agent included.
+
+**Request.** `POST /v1/vote`:
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `cluster_id` | string (`cls_`) | yes | The cluster |
+| `term` | integer | yes | The term asked for, `t + 1` |
+| `candidate_node_id` | string (`nod_`) | yes | The candidate; must be the node whose mesh address sent the request |
+| `voters_version` | integer | yes | The voter-set version the candidate counts against (section 8.10) |
+| `check` | boolean | no | `true`: answer as for a real vote and change nothing. A candidate checks first and votes only when a majority would grant, so a promotion that cannot win moves no voter to a higher term |
+
+**Answer.** `200` with:
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `node_id` | string (`nod_`) | yes | The voter |
+| `term` | integer | yes | The voter's current term after this request |
+| `vote` | string | yes | `granted` or `refused` (with `check`, what a real vote would answer) |
+| `reason` | string | no | With `refused`: `stale_term` (the term asked for is not above the voter's term, unless the voter already granted that term to this candidate), `support_held` (the voter's promise to the primary it supports has not run out), `voters_changed` (the request's `voters_version` differs from the voter's), `not_allowed` (another cluster, or the source is not a voter with the `node` role) |
+| `retry_after_ms` | integer | no | With `support_held`: time until the promise runs out |
+| `lease_wait_ms` | integer | no | With `granted`: `max(0, lease horizon - now)` on the voter's clock |
+| `voters_version` | integer | yes | The voter's voter-set version |
+| `voters` | array of string | no | With `voters_changed`: the node ids of the voter's voter set |
+
+```json
+{
+  "node_id": "nod_01JCA0A1B2C3D4E5F6G7H8J9KM",
+  "term": 2,
+  "vote": "granted",
+  "lease_wait_ms": 16480,
+  "voters_version": 3120
+}
+```
+
+**Voter rules.** A voter grants term `T` to candidate `C` only when all of these hold:
+
+1. `T` is above its current term, or equals it and it already granted `T` to `C`, which makes a repeated request harmless;
+2. its promise to the primary it supports has run out (`now >= v_recv + S` of its last `support_grant`), or `C` is that same primary;
+3. the request's `voters_version` equals its own.
+
+It then stores `T` and `C` (section 12) before it answers `granted`, and from then on refuses every lower term: its session with an older primary ends with `stale_term`.
+
+**Candidate rules.** The candidate may act as primary at term `T` only when voters forming a majority of the voter set of its `voters_version` answered `granted`, and it has then waited until the latest `(receipt time of the answer) + lease_wait_ms` over those answers, on its own monotonic clock. The promotion contract lets an operator skip that wait by acknowledging the fence (ADR 0182), which declares the old primary's node lost (section 8.3).
+
+**Why a promoted primary never overlaps the old one's grants.** Let `P` be the primary of term `t` and `Q` the candidate's majority for `T = t + 1`.
+
+1. Every `expiring` grant `P` sends needs, at that moment, the support of a majority `R` in `P`'s view. `R` and `Q` share a voter `v`: they are majorities of one voter set, or of two sets one change apart (section 8.10).
+2. `v` granted `T` only at or after `v_recv + S` on its clock, where `v_recv` is the receipt of the last `support_request` from `P` it answered. That request was sent at `p_send <= v_recv`, so `P`'s view of `v`'s support ended at `p_send + S - M_S`, earlier by at least `M_S - δ > 0` (section 8.4: `δ < M`). After granting `T`, `v` answers `P` only with `stale_term`. So `P` held no support from `v` once `v` had voted, and every grant `P` made was sent while an earlier support of `v` was valid.
+3. Such a grant, sent at `T_grant < p_send + S - M_S` with `d <= L`, passes its gate at `T_grant + d + 2M_d < p_send + S + L + 2M_L`, which is before `v`'s lease horizon.
+4. `v` reported `lease_wait_ms` as the rest of that horizon when it answered; the candidate counts it from the answer's receipt, which is later. So when the candidate acts, every grant `P` made has passed its gate: every holder has fenced (section 8.4), and the new primary may grant again with a higher token.
+
+With the defaults (`S` = `D` = 15 s), a voter's wait after the old primary's last support request is at most `S + D + 2M` = 33 s, the bound of ADR 0169; during a maintenance window with `W` = 180 s it is 15 + 180 + 36 = 231 s.
+
+### 8.10 Voter set changes (M5b)
+
+The voter set changes when a machine with the `node` or `witness` role enrolls, when `POST /api/v1/nodes/{node_id}/roles` adds or removes a vote, and when a voter is removed (section 10). Its version, `spec.votes.version`, is the change-log `seq` of the entry that made the last such change, so it only grows and a promoted primary inherits it with the log. Two majorities must share a voter for section 8.9's argument, and that holds between one set and the next only when they differ by one voter. So:
+
+1. Every change adds or removes exactly one voter.
+2. The primary makes the next change only after a majority of the current voters has acknowledged, with `command_result` `ok`, a `desired_state` that carries the current version. Until then the roles operation and the removal of a voter answer `409 conflict`, and the enrollment of a voter answers `409` without consuming its token (section 2.3).
+3. The primary counts a voter's support only when its `support_grant` carries the primary's current version.
+4. A voter grants a vote only for its own version (`voters_changed` otherwise), so a candidate's majority holds one version.
+
+A machine's version only grows, because it comes with its newest stored `desired_state`, so a voter that supported the primary at `v + 1` can never vote at `v` afterwards. A candidate whose majority holds version `v` therefore faces a primary that counts version `v` or `v + 1`: rule 2 keeps the primary from moving to `v + 2` while a majority of the `v + 1` set still holds `v`, and a majority of `v` voters would need some of them. The `voters` list of a `voters_changed` answer lets the candidate count against the newer set instead.
+
+D-0170's guard applies to the roles operation: removing a vote is refused with `409 conflict` when it would leave fewer than three voters while any `expiring` lease exists, unless the request sets `force`.
+
+### 8.11 Maintenance window (M5b)
+
+A planned restart of the primary, for an upgrade, would otherwise fence every `warm` app whose node cannot renew within about `D` (ADR 0171). Before it, the operator or the installer's upgrade path runs, as root on the primary's host:
+
+```
+quoro cluster maintenance [--duration <seconds>]
+```
+
+The command reaches the running primary over a local control socket, `/run/quoro/control.sock`, which only root and the service user may open; nothing about it is exposed on the network. The primary then:
+
+1. asks its voters for support with `max_lease_ms` = `W`, where `W` is the duration given (default 180 s, at least `D`, at most 600 s);
+2. once a majority supports `W`, raises `leases.duration_ms` to `W` for every `expiring` lease, and answers every renewal with `duration_ms` = `W` while the window is open;
+3. writes one audit record, `cluster.maintenance` (audit-log-format.md section 3.7).
+
+The command returns success once every `expiring` lease has had a renewal answered with `W`, and prints until when the last of them is covered. It fails when no majority supports `W`, or when a holder has not renewed within `D / 3` plus one margin; the leases already answered keep their longer validity. The window closes at the primary's next start, with `quoro cluster maintenance --end`, or `W` after it opened, whichever comes first; renewals are then answered with `D` again, and the gates follow section 8.4, so the longer grants keep their longer gates.
+
+The installer runs the command before it restarts `quoro.service`. When it fails, the installer says that `warm` apps fence if the restart takes longer than about `D`, and goes on with the upgrade, because fencing is the safe outcome. An unplanned outage of the primary longer than `D` still fences `warm` apps by design; the HA view says so, and M6's election removes it.
 
 ## 9. Node return
 
@@ -1757,7 +2006,7 @@ A node that comes back after a failure may hold writes nobody else has and may b
 Order on reconnect:
 
 1. `hello`, carrying `stored_rev`, `applied_rev`, `log_seq`, `log_hash` and every lease the node believes it holds.
-2. The primary revokes every stale lease: held by a node the primary no longer considers the holder, or carrying a lower token than the primary's. The node fences those first, before anything else (section 4.2).
+2. The primary revokes every stale lease: held by a node the primary no longer considers the holder, or carrying a lower token than the primary's. A node declared lost gets every lease it names revoked here with reason `declared_lost`, and its `lost_at` is cleared once the revokes are answered (section 8.3). The node fences those first, before anything else (section 4.2).
 3. Only after fencing, the primary sends a full `desired_state`. A node that returned fenced starts nothing stateful, exactly as D-0022 step 1 requires.
 4. The node reconciles. Because the snapshot is complete and `rev` is monotonic, reconciliation cannot start a duplicate app: a stateful VM appears in the snapshot only if the node holds the matching lease token, which it does not until the primary grants it again.
 5. Log follow resumes. If the hash chain no longer matches, the divergent copy is quarantined and the node refollows from `seq` 1 (section 7).
@@ -1773,6 +2022,7 @@ DELETE /api/v1/nodes/{node_id}
 - The scope is `node:remove`, destructive and human-only (`README.md`), so an agent cannot remove a node.
 - If the node is connected, the primary first sends `lease_revoke` for every lease the node holds and waits for each `command_result`, so the node fences its stateful VMs; then it ends the session with a fatal `error` code `node_removed` and marks the node `removed`. If the node is not connected, removal increments the fencing token of each of its leases, exactly like declaring the node lost (section 8.3), so the old copy can no longer write to shared storage. Only then may the app start elsewhere; the node itself is not asked to destroy anything.
 - The node stops dialing permanently. It leaves its stateless VMs running and its fenced stateful VMs stopped, because deleting them is a data decision, not a protocol step.
+- From M5b, removing a voter changes the voter set: it follows section 8.10, so it answers `409 conflict` while the previous change has not reached a majority of voters. Removal is not refused for leaving fewer than three voters; the HA view then reports that HA needs a third vote.
 - Removing a node never destroys data remotely. Purging local state — disks, rootfs images, the node's store — is a local CLI command run on that machine by whoever has root there. A node that is gone for good therefore keeps its data until someone with access deletes it, which is the safe default.
 
 ## 11. Security notes
@@ -1783,7 +2033,8 @@ Threats and their mitigations are in `../architecture/threat-model.md`; this sec
 - **Desired-state signature.** A node accepts a snapshot only if the Ed25519 signature verifies against the cluster public key it received at enrollment. A compromised intermediate or a different cluster cannot make a node start an arbitrary microVM. The signature does not protect against the primary itself: whatever the primary signs, the node runs. The signing key rotates with a `signing_key_rotate` signed by the old key (D-0050), so a new key is accepted only from the holder of the old one.
 - **Certificate pinning.** The node refuses a TLS certificate whose SHA-256 differs from the fingerprint in the join command, so a self-signed primary is as safe as a CA-issued one, and a stolen DNS name does not redirect a node.
 - **Provider credentials stay on the primary (D-0094).** A node never receives a provider's account credential. For a tunnel it receives only that tunnel's run token, which cannot create tunnels, write DNS records or reach another node's tunnel. For ACME it asks the primary to write `_acme-challenge.<hostname>` TXT records, and only for the `acme` routes of its own desired state (section 5.22), so a compromised node cannot write arbitrary records in the zone or obtain certificates for hostnames it does not serve.
-- **A compromised primary** can read everything the cluster stores — state, ciphertext it can decrypt with the cluster data-encryption key, and the telemetry that nodes stream on demand — and can issue desired state, lease grants and commands to every node. Until M5b it is also the lease authority, so it can grant the same lease to two nodes and run a stateful app twice; only a storage receiver that tracks the highest fencing token on its own side limits the damage. From M5b a quorum or external arbiter takes that power away from a single primary (D-0017). It cannot read a node's local store or its private key.
+- **A compromised primary** can read everything the cluster stores — state, ciphertext it can decrypt with the cluster data-encryption key, and the telemetry that nodes stream on demand — and can issue desired state, lease grants and commands to every node. It is also the lease authority, so it can grant the same lease to two nodes and run a stateful app twice; only a storage receiver that tracks the highest fencing token on its own side limits the damage. The voters of M5b do not change that: they see no leases, and they only stop a primary that has lost their majority, or an old primary after a promotion, from granting (section 8.8). It cannot read a node's local store or its private key.
+- **Voters (M5b).** A voter's power is its support and its vote. A compromised voter can withhold support, which with the other voters' help can stop `expiring` renewals (availability, never a double run), and can vote for any candidate, but one vote is never a majority. The vote listener is reachable only through the mesh, only from voters with the `node` role, and its requests carry no secret. A witness holds no data, no seals and no credential of other machines.
 - **A compromised node** can lie about observed state, emit false events and, within its lease, run whatever its stored desired state allows. It cannot forge desired state for other nodes, cannot mint credentials, and cannot write to shared storage with a stale token. Its blast radius is its own workloads, which is why stateful data stays protected by the lease and the token rather than by the honesty of the node.
 - **Terminal and console relay (M4).** The primary never touches a VM socket: it authorizes, audits and relays bytes between a client WebSocket and this session (ADR 0113, ADR 0114). The node agent, already root and already the only reader of VM sockets, is the only process that connects to a VM's vsock socket and its serial socket; both live in the VM's runtime directory, which only root can enter. The node never creates a `<socket>_<port>` listener, so a guest cannot open a vsock connection to the host. The guest is untrusted: the node bounds every frame it reads from it and treats its output as bytes, never as protocol. A `terminal` stream exists only because the primary opened it; a node never starts an exec session on its own.
 - **Builds (M4).** A build runs untrusted code: the Dockerfile and everything it fetches. It runs only inside a builder microVM, with `egress_only` networking and no isolation group (section 6.6), never on the host. Build secrets reach the node only inside the signed desired state, reach the builder VM only on its ephemeral source disk, which the node deletes when the build ends, and live in the guest only in memory as BuildKit secret files; the node never writes them to a build log, a `stream_data` or an event. The node never mounts a disk the builder VM wrote: it reads the output layout as a tar stream in user space and never touches the cache disk's contents. The built image never leaves the node: it is imported locally and never pushed.
@@ -1798,7 +2049,7 @@ The node keeps a SQLite file, owned by root, that holds everything it needs to r
 
 | Table | Holds | Why |
 | --- | --- | --- |
-| `node_meta` | `node_id`, `cluster_id`, `boot_id`, `host_boot_id` (the kernel boot id), the failed mark and the failed fences it covers (cleared by `command` kind `fence_ack`, section 5.17), agent and engine versions, the cluster public key and its `key_id`, a reference to the credential | Identity across restarts |
+| `node_meta` | `node_id`, `cluster_id`, `boot_id`, `host_boot_id` (the kernel boot id), the failed mark and the failed fences it covers (cleared by `command` kind `fence_ack`, section 5.17), agent and engine versions, the cluster public key and its `key_id`, a reference to the credential; from M5b the highest term seen, and on a voter its vote state: the candidate it voted for in that term, the primary it supports with the last `S` and `L`, and the promise and lease horizon on `CLOCK_BOOTTIME` (section 8.8) | Identity across restarts; a voter's promise survives an agent restart and errs late after a reboot |
 | `desired_state` | One row per accepted `rev`: the full signed body, its hash, `issued_at`, `term` | The snapshot to reconcile from, and the signature to re-verify |
 | `applied_state` | Per VM the last applied spec digest, observed status, restart count, last exit code | Detects drift without the primary |
 | `leases` | Lease id, resource, mode, token, state, `valid_until`, duration, remaining validity on `CLOCK_BOOTTIME` for `held` and `uncertain` expiring leases | Survives an agent restart: a fenced lease stays fenced, a held one keeps its remaining validity within the same host boot |

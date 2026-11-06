@@ -147,6 +147,10 @@ pub enum Scope {
     NodeRemove,
     #[serde(rename = "node:fence_ack")]
     NodeFenceAck,
+    #[serde(rename = "node:roles")]
+    NodeRoles,
+    #[serde(rename = "node:declare_lost")]
+    NodeDeclareLost,
     #[serde(rename = "project:read")]
     ProjectRead,
     #[serde(rename = "project:write")]
@@ -231,12 +235,14 @@ pub enum Scope {
 
 impl Scope {
     /// Every scope, in README table order.
-    pub const ALL: [Scope; 45] = [
+    pub const ALL: [Scope; 47] = [
         Self::ClusterRead,
         Self::NodeRead,
         Self::NodeEnroll,
         Self::NodeRemove,
         Self::NodeFenceAck,
+        Self::NodeRoles,
+        Self::NodeDeclareLost,
         Self::ProjectRead,
         Self::ProjectWrite,
         Self::ProjectDelete,
@@ -288,6 +294,8 @@ impl Scope {
             Self::NodeEnroll => "node:enroll",
             Self::NodeRemove => "node:remove",
             Self::NodeFenceAck => "node:fence_ack",
+            Self::NodeRoles => "node:roles",
+            Self::NodeDeclareLost => "node:declare_lost",
             Self::ProjectRead => "project:read",
             Self::ProjectWrite => "project:write",
             Self::ProjectDelete => "project:delete",
@@ -359,6 +367,8 @@ impl Scope {
             Self::NodeEnroll
                 | Self::NodeRemove
                 | Self::NodeFenceAck
+                | Self::NodeRoles
+                | Self::NodeDeclareLost
                 | Self::AgentWrite
                 | Self::GrantWrite
                 | Self::ApprovalDecide
@@ -497,6 +507,9 @@ mod tests {
         assert!(Role::Owner.holds(Scope::UserWrite));
         assert!(!Role::Operator.holds(Scope::UserWrite));
         assert!(Role::Operator.holds(Scope::NodeFenceAck));
+        assert!(Role::Operator.holds(Scope::NodeRoles));
+        assert!(Role::Operator.holds(Scope::NodeDeclareLost));
+        assert!(!Role::Viewer.holds(Scope::NodeDeclareLost));
         assert!(Role::Viewer.holds(Scope::VmRead));
         assert!(Role::Viewer.holds(Scope::AppLogs));
         assert!(!Role::Viewer.holds(Scope::VmCreate));
@@ -508,7 +521,7 @@ mod tests {
         assert!(Role::Operator.holds(Scope::VmConsole));
         assert!(!Role::Viewer.holds(Scope::AppTerminal));
         assert!(!Role::Viewer.holds(Scope::VmConsole));
-        assert_eq!(Scope::ALL.iter().filter(|s| s.is_human_only()).count(), 12);
+        assert_eq!(Scope::ALL.iter().filter(|s| s.is_human_only()).count(), 14);
         assert_eq!(Scope::ALL.iter().filter(|s| s.is_destructive()).count(), 5);
         assert!(Role::Owner.holds(Scope::BackupManage));
         assert!(!Role::Operator.holds(Scope::BackupManage));

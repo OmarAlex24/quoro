@@ -404,7 +404,7 @@ Anything Quoro asks of an external service goes through a provider interface (D-
 | `DnsProvider` | Creating and updating the records that point a domain at the cluster | M2 |
 | `LoadBalancerProvider` | Registering and deregistering endpoints, health monitors | M5a |
 | `ObjectStore` (S3-compatible) | Cold backups (M5a), telemetry archive, off-site audit copy from M5a (D-0053) | M5a |
-| `LeaseArbiter` | Leases from M5b when an external arbiter is used | M5b |
+| `LeaseArbiter` | Leases when an external arbiter is used; M5b uses its own voters instead (ADR 0169) | Later |
 
 `ObjectStore` probes capabilities at setup instead of assuming them:
 
@@ -546,7 +546,7 @@ Fencing tokens are carried on every write to shared storage (D-0047), not only i
 
 The distinction between two lease states is the core safety rule:
 
-- **`uncertain`** means "arbiter unreachable": the node keeps running what it runs and starts nothing new. It has not lost the lease; it cannot prove it still holds it.
+- **`uncertain`** means "the authority cannot be reached": the arbiter, or in M5b a primary that is unreachable or has lost the support of a majority of voters. The node keeps running what it runs and starts nothing new. It has not lost the lease; it cannot prove it still holds it.
 - **`expired`** means "lease lost": the node self-fences, stopping its stateful VMs (D-0019).
 
 Conflating the two produces one of two failures: fencing on every network blip, or continuing to run a stateful app that another node has already been allowed to start. Treating them as separate states is what lets a partition be survivable on one side and safe on the other.
@@ -556,7 +556,7 @@ For an `expiring` lease the deadline is `valid_until = t_send + D - M`, where `t
 | From | Event | To | What the node does |
 | --- | --- | --- | --- |
 | (none) | `lease_grant` | `held` | Starts the stateful app |
-| `held` | renewal failing, arbiter unreachable | `uncertain` | Keeps running, starts nothing new |
+| `held` | renewal failing, authority unreachable | `uncertain` | Keeps running, starts nothing new |
 | `held` | `lease_revoke` | `revoked` | Stops the stateful app |
 | `held` | monotonic clock reaches `valid_until` | `expired` | Self-fences: stops the stateful app |
 | `uncertain` | renewal succeeds | `held` | Resumes normal operation |
@@ -567,13 +567,15 @@ Two properties matter in the table. Recovery from `uncertain` back to `held` is 
 
 The authority never grants the lease to another holder before `D + 2M` after its last grant, so the old holder's fencing completes first ([../contracts/node-agent-protocol.md](../contracts/node-agent-protocol.md) section 8.4).
 
+In M5b the authority is the primary, backed by its voters (ADR 0169, ADR 0170): every machine with the `node` or `witness` role gives the primary a support window over its session, and the primary grants and renews `expiring` leases only while a majority supports it. Voters never see leases. What they prevent is a second primary granting at the same time: a promotion takes term `t + 1` from a majority, a voter agrees only after its support for the old primary ran out, and the candidate waits until the old primary's last possible grant has passed its gate. Votes travel directly between voters over the mesh, which gains voter-to-voter peers in M5b (node-agent-protocol.md sections 8.8 to 8.10).
+
 Fencing tokens increase on every ownership change and stay the same across renewals (D-0073); they travel on every write to shared storage — chunk store, object store, replication stream — and receivers reject stale tokens (D-0019). A token is what makes "the old holder is definitely not writing" enforceable by the storage layer rather than by good behaviour.
 
 ### Lease arbiter options
 
 | Option | Evidence | Consequence |
 | --- | --- | --- |
-| Quoro's own witness quorum | A witness is a free daemon in a different failure domain that breaks ties and stores no data (D-0017) | No external dependency; needs a third machine or a managed plan |
+| Quoro's own voters, with a witness as the third vote | A witness is a free daemon in a different failure domain that breaks ties and stores no data (D-0017); the voters support the primary for short windows and vote at promotion (ADR 0169) | No external dependency; needs a third machine or a managed plan. The M5b choice |
 | R2 conditional PUT | Atomic `If-Match` / `If-None-Match` PUT with a single winner, but no TTL, one write per second per key, no conditional delete, and a 404 does not prove an in-flight PUT failed (`docs/research/r2-conditional-writes.md`, F-0037, F-0038) | Single winner is real; TTL must be emulated by timestamps, so fencing tokens are still required |
 | Cloudflare Durable Objects | A strongly consistent single-threaded object with alarms for a server-side TTL; fits the free plan at a 5 s renewal per F-0039; acquire can be ambiguous when an object restarts; needs a Worker in the user's account (`docs/research/durable-objects.md`) | Closest to a real lease; adds a Worker and a provider account to the critical path |
 
@@ -643,7 +645,7 @@ Four rules hold in every flow:
 4. Nothing is started elsewhere automatically before M6 (D-0016, D-0033). The panel shows the app as degraded and the N+1 indicator answers whether its apps would fit on the remaining nodes (D-0021).
 5. To restore a stateful app elsewhere from a `cold` backup (M5a), an operator must first declare the node lost, as part of the `local` lease mode (D-0047), and acknowledge the manual fence. That revokes its leases and increments the fencing token, so a node that comes back cannot keep writing (D-0019).
 6. From M5b, with `expiring` leases: the node's renewals start failing, it goes `uncertain` (keep running, start nothing new), then `expired`, self-fences its stateful apps, and buffers `node.fenced` for replay on reconnect; if a forced stop cannot confirm a VM stopped, it emits `node.fence_failed` instead, marks itself failed, and the lease is not granted elsewhere until an operator acknowledges the fence (D-0074).
-7. A `warm` copy may start only after the old lease has expired on the arbiter's side plus the safety margin (D-0019). That ordering, not the detection time, is what prevents two writers.
+7. A `warm` copy may start only after the old lease has passed its gate on the primary, `T_grant + D + 2M` after its last grant (D-0019). That ordering, not the detection time, is what prevents two writers.
 
 ### (d) Node return
 

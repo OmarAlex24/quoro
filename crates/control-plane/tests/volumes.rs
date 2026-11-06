@@ -717,6 +717,19 @@ async fn the_node_gets_the_volume_the_lease_and_the_ready_report() {
     assert!(body["duration_ms"].is_null(), "{grant}");
     assert!(!body["granted_at"].as_str().unwrap().is_empty());
 
+    // From M5b every read of the app carries its lease (`App.lease`).
+    let app = get_app(&owner, &server, &app_id).await;
+    let lease = &app["lease"];
+    assert_eq!(lease["id"], lease_id, "{app}");
+    assert_eq!(lease["resource_type"], "app");
+    assert_eq!(lease["resource_id"], app_id);
+    assert_eq!(lease["holder_node_id"], node.node_id);
+    assert_eq!(lease["mode"], "local");
+    assert_eq!(lease["fencing_token"], 1);
+    assert!(lease["duration_ms"].is_null());
+    assert!(lease["gate_at"].is_null());
+    assert!(lease["revoked_at"].is_null());
+
     let snapshot = frames
         .iter()
         .find(|frame| frame["type"] == "desired_state")

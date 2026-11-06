@@ -694,6 +694,7 @@ components:
         - log_seq
         - log_head_hash
         - term
+        - votes
         - created_at
       properties:
         id:
@@ -721,11 +722,77 @@ components:
         term:
           type: integer
           minimum: 1
-          description: Term of the current primary; 1 until elections exist (M6).
+          description: |
+            Term of the current primary: 1 until the first promotion, then one
+            more with each promotion, which takes it from a majority of voters
+            (node-agent-protocol.md section 8.8). Automatic elections are M6.
+        votes:
+          $ref: '#/components/schemas/ClusterVotes'
         created_at:
           type: string
           format: date-time
           description: When the cluster was created.
+    ClusterVotes:
+      type: object
+      title: ClusterVotes
+      description: |
+        The voters of the cluster (ADR 0170): every enrolled machine with the
+        `node` or `witness` role that is not removed, connected or not. An
+        edge-only machine does not vote, and one machine has one vote whatever
+        its roles. Below `required` the HA view says that HA needs a third vote
+        and offers a witness: a join token with role `witness` for a new
+        machine, or `POST /api/v1/nodes/{node_id}/roles` for an enrolled one.
+      required:
+        - voters
+        - count
+        - required
+        - ha_ready
+      properties:
+        voters:
+          type: array
+          description: Every voter, oldest enrolled first.
+          items:
+            $ref: '#/components/schemas/ClusterVoter'
+        count:
+          type: integer
+          minimum: 0
+          description: Number of voters.
+        required:
+          type: integer
+          minimum: 1
+          description: Voters that HA needs; 3 in M5b (ADR 0017).
+        ha_ready:
+          type: boolean
+          description: |
+            Whether `count` is at least `required` and the primary holds the
+            support of a majority of voters right now, so it can grant and renew
+            `expiring` leases (ADR 0169, node-agent-protocol.md section 8.8). A
+            primary that does not track support yet reports false.
+    ClusterVoter:
+      type: object
+      title: ClusterVoter
+      description: One voter of the cluster.
+      required:
+        - node_id
+        - roles
+        - connected
+      properties:
+        node_id:
+          type: string
+          pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: The voting machine.
+        roles:
+          type: array
+          description: The machine's roles; at least one of them is `node` or `witness`.
+          items:
+            type: string
+            enum:
+              - node
+              - witness
+              - edge
+        connected:
+          type: boolean
+          description: Whether the machine's node-agent session is up now.
     NodeCapacity:
       type: object
       title: NodeCapacity
@@ -790,6 +857,7 @@ components:
         - log_seq
         - fence_failure
         - tunnel
+        - lost_at
         - created_at
       properties:
         id:
@@ -888,6 +956,15 @@ components:
         last_seen_at:
           type: [string, 'null']
           description: Last heartbeat or message from the node.
+        lost_at:
+          type: [string, 'null']
+          format: date-time
+          description: |
+            When an operator declared this node lost (ADR 0183,
+            `POST /api/v1/nodes/{node_id}/declare-lost`), or null. Its leases
+            were revoked with new tokens at that time. Cleared once the node
+            returns and has answered the revokes of those leases
+            (node-agent-protocol.md sections 8.3 and 9).
         created_at:
           type: string
           format: date-time
@@ -972,6 +1049,38 @@ components:
           maximum: 65535
           default: 8081
           description: Loopback port on the node where its proxy accepts the tunnel's traffic.
+    NodeRolesRequest:
+      type: object
+      title: NodeRolesRequest
+      description: |
+        Add or remove the `witness` role of an enrolled machine (ADR 0170).
+        Exactly one of `add` and `remove` is given. Only `witness` can change in
+        M5b; `node` and `edge` are chosen at enrollment.
+      properties:
+        add:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          description: Roles to add.
+          items:
+            type: string
+            enum:
+              - witness
+        remove:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          description: Roles to remove.
+          items:
+            type: string
+            enum:
+              - witness
+        force:
+          type: boolean
+          default: false
+          description: |
+            Remove a vote even though fewer than three voters would remain while
+            `expiring` leases exist.
     FenceAckRequest:
       type: object
       title: FenceAckRequest
@@ -1540,6 +1649,15 @@ components:
             computed (no node holds the app's volume yet).
           oneOf:
             - $ref: '#/components/schemas/AppHaCost'
+            - type: 'null'
+        lease:
+          description: |
+            From M5b: the app's lease as the primary sees it (ADR 0019,
+            node-agent-protocol.md section 8), on every read of the app. Absent
+            when the app has no lease row, which a stateless app never has, and
+            on a primary older than M5b.
+          oneOf:
+            - $ref: '#/components/schemas/Lease'
             - type: 'null'
         image:
           type: string
@@ -3471,8 +3589,12 @@ components:
         A lease on an app or on the primary status. `fencing_token` changes only
         on ownership change: it stays the same across renewals by the same holder
         and increases strictly when the lease goes to a new holder or is granted
-        again after expiry or revoke; never reused (D-0019, D-0073). Shape only in
-        the API until M5b.
+        again after expiry or revoke; never reused (D-0019, D-0073). From M5b
+        every read of an app carries its lease (`App.lease`). The times of an
+        `expiring` lease are the primary's view: renewals write nothing, so
+        `renewed_at`, `expires_at` and `gate_at` come from its memory and are
+        null after a primary restart until the next renewal
+        (node-agent-protocol.md section 8.4).
       required:
         - id
         - resource_type
@@ -3518,10 +3640,20 @@ components:
           description: When the lease was granted.
         renewed_at:
           type: [string, 'null']
-          description: When the lease was last renewed.
+          description: When the primary last answered a renewal; expiring leases only.
         expires_at:
           type: [string, 'null']
-          description: Arbiter-side expiry estimate; expiring leases only.
+          description: |
+            When the holder has fenced at the latest if it renews no more: the
+            last grant's time plus its `duration_ms`, on the primary's clock;
+            expiring leases only.
+        gate_at:
+          type: [string, 'null']
+          description: |
+            The earliest time the primary may grant this lease with a new token,
+            to another node or again after expiry: the latest
+            `T_grant + duration_ms + 2M` over its grants to the holder
+            (node-agent-protocol.md section 8.4); expiring leases only.
         revoked_at:
           type: [string, 'null']
           description: When the lease was revoked.
@@ -3948,6 +4080,8 @@ components:
         - node:enroll
         - node:remove
         - node:fence_ack
+        - node:roles
+        - node:declare_lost
         - project:read
         - project:write
         - project:delete
@@ -5780,8 +5914,9 @@ paths:
         Cluster id and name, binary version, the node that holds the primary
         status, and the position of the change log. The primary is the single
         writer and source of truth (D-0012); `log_seq` and `log_head_hash` say how
-        far the state has been written. Exposed as the MCP tool `get_cluster`
-        (D-0033).
+        far the state has been written. From M5b `votes` lists the voters and
+        says whether HA is ready (ADR 0170). Exposed as the MCP tool
+        `get_cluster` (D-0033).
       x-quoro-scope: cluster:read
       x-quoro-mcp-tool: get_cluster
       responses:
@@ -5873,7 +6008,10 @@ paths:
         `approval_required` when it asks for approval first. A node that still
         hosts running instances is refused with `conflict`. The node moves to
         `removed` and reconciliation stops targeting it. `Quoro-Justification` is
-        required when the caller is an agent (D-0031).
+        required when the caller is an agent (D-0031). From M5b removing a voter
+        changes the voter set, so it is also refused with `conflict` while the
+        previous voter-set change has not reached a majority of voters
+        (node-agent-protocol.md section 8.10).
       x-quoro-scope: node:remove
       parameters:
         - $ref: '#/components/parameters/NodeId'
@@ -5946,6 +6084,104 @@ paths:
           $ref: '#/components/responses/Conflict'
         '422':
           $ref: '#/components/responses/ValidationFailed'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/NotPrimary'
+  /api/v1/nodes/{node_id}/roles:
+    post:
+      tags: [nodes]
+      operationId: updateNodeRoles
+      summary: Add or remove the witness role of a machine
+      description: |
+        Adds or removes the `witness` role of an enrolled machine without
+        enrolling it again (ADR 0170); the machine acts on its next desired
+        state (node-agent-protocol.md section 6.12). Typical use is an edge that
+        also becomes the third voter (ADR 0018). The scope is human-only: an
+        agent is refused with `forbidden` and `reason: human_only`. Adding a role
+        the machine has, or removing one it lacks, changes nothing and answers
+        `200`. A change that adds or removes a vote is refused with `conflict`
+        while the previous voter-set change has not reached a majority of voters
+        (section 8.10), and removing a vote is refused with `conflict` when fewer
+        than three voters would remain while any `expiring` lease exists, unless
+        `force` is set. A request with both or neither of `add` and `remove`, or
+        that would leave the machine with no role, is refused with
+        `validation_failed`; a removed node with `conflict`. The call is audited
+        (D-0031).
+      x-quoro-scope: node:roles
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+      requestBody:
+        required: true
+        description: The role to add or to remove.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NodeRolesRequest'
+      responses:
+        '200':
+          description: The node with its roles after the change.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Node'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/NotPrimary'
+  /api/v1/nodes/{node_id}/declare-lost:
+    post:
+      tags: [nodes]
+      operationId: declareNodeLost
+      summary: Declare a disconnected node lost
+      description: |
+        Records a human's statement that a disconnected node is gone, so the
+        apps it held may start elsewhere (ADR 0183, node-agent-protocol.md
+        section 8.3). In one transaction the primary increments the fencing
+        token of every lease the node holds and revokes each one in its own
+        view, sets the node's `lost_at`, and writes the audit record. The node
+        stays enrolled and stays a voter. Leases listed in its `fence_failure`
+        stay ungrantable until that fence is acknowledged, and an `expiring`
+        lease still waits for its gate. When the node returns, the primary
+        revokes those leases on its session before anything else. The scope is
+        human-only: an agent is refused with `forbidden` and
+        `reason: human_only`. A connected or removed node is refused with
+        `conflict`. Declaring a node already declared lost changes nothing and
+        answers `200`. The call is audited (D-0031).
+      x-quoro-scope: node:declare_lost
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+      responses:
+        '200':
+          description: The node was declared lost; it is returned with `lost_at` set.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Node'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '429':
           $ref: '#/components/responses/RateLimited'
         '503':
@@ -6084,7 +6320,10 @@ paths:
         authenticates the node-agent session. The token is consumed and cannot be
         reused. The message protocol is in `docs/contracts/node-agent-protocol.md`.
         This call is public because a node has no credential yet; the join token is
-        the proof.
+        the proof. From M5b enrolling a machine with the `node` or `witness` role
+        changes the voter set, and is refused with `conflict`, without consuming
+        the token, while the previous voter-set change has not reached a majority
+        of voters (node-agent-protocol.md section 8.10).
       x-quoro-scope: public
       security: []
       parameters:

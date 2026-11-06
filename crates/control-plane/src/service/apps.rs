@@ -85,6 +85,7 @@ pub async fn list_apps(
             .await?;
         let mut items = items;
         crate::backups::cost::attach(state, &mut items).await?;
+        crate::api::leases::attach(state, &mut items).await?;
         Ok(AppList { items, next_cursor })
     }
     .await;
@@ -127,6 +128,7 @@ pub async fn get_app(state: &AppState, ctx: &CallCtx, app_id: &str) -> Result<Ap
             .map(domain_from_row)
             .collect::<Result<Vec<_>, _>>()?;
         crate::backups::cost::attach(state, std::slice::from_mut(&mut app)).await?;
+        crate::api::leases::attach(state, std::slice::from_mut(&mut app)).await?;
         Ok(AppDetail {
             app,
             instances,

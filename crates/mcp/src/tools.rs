@@ -358,6 +358,8 @@ fn scope() -> Value {
             "node:enroll",
             "node:remove",
             "node:fence_ack",
+            "node:roles",
+            "node:declare_lost",
             "project:read",
             "project:write",
             "project:delete",

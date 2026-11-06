@@ -170,6 +170,7 @@ Each call or action in the rows marked "yes" below produces exactly one record (
 | system actions: incident opened and resolved, incident grant issued and revoked, fencing-related lease revocations, node enrollment and removal | yes | `ok` / `error` |
 | storage system actions (M5a): a scheduled backup dispatched, a backup sealed or failed, retention pruning, a garbage-collection sweep, a control-plane backup, a `local` lease granted or moved, an audit-export probe (section 3.5) | yes | `ok` / `error` |
 | vulnerability system actions (M5a): an offline import of vulnerability data (section 3.6) | yes | `ok` / `error` |
+| lease and voter system actions (M5b): an `expiring` lease granted with a new token, the revokes of a node declared lost, a maintenance window opened or ended (section 3.7) | yes | `ok` / `error` |
 | audit verification runs | yes | `ok` / `error` |
 | the open of a terminal or console session (its `POST`) | yes, for every identity, as a mutating call | `ok` / `refused` / `error` |
 | the close of a terminal or console session, for any reason | yes: one `session.end` record (section 3.3) | `ok` / `error` |
@@ -309,6 +310,25 @@ One system record, with `actor_type` `system`, `channel` `cli` and no `scope`:
 | `vulnerability_data.import` | `vulnerability_data` | `cluster` / the cluster id | An operator ran `quoro vuln import <dir>` on the primary's host; `params` is `{ecosystems, record_counts}`, `ok` once the data is in place, `error` with the reason otherwise |
 
 The command runs as root on the primary's host, so it has no identity of its own in Quoro; the record says that the host's operator changed the data the findings come from.
+
+### 3.7 Leases and voters (M5b)
+
+Voters, `expiring` leases and the maintenance window add two calls and three kinds of system record (ADR 0169 to ADR 0171, ADR 0183). The calls are recorded like any mutating call:
+
+| Operation | `scope` | `target_type` / `target_id` | Notes |
+| --- | --- | --- | --- |
+| `updateNodeRoles` | `node:roles` | `node` / the machine | Human only; `params` is the request body. A request that changes nothing is still recorded, with no `change_seq` |
+| `declareNodeLost` | `node:declare_lost` | `node` / the node | Human only; `params` is `{}`. The change log holds the new token of each revoked lease |
+
+System records, with `actor_type` `system` and no `scope`:
+
+| `operation` | `actor_id` | `channel` | `target_type` / `target_id` | When |
+| --- | --- | --- | --- | --- |
+| `lease.grant` | `leases` | `system` | `app` / the app | Also an `expiring` lease granted with a new token, to a new holder or again after expiry or revoke; `params` is `{node_id, fencing_token, mode, duration_ms}`. Renewals write no record |
+| `lease.revoke` | `leases` | `system` | `app` / the app | Also the revokes of a returning node declared lost, with reason `declared_lost` |
+| `cluster.maintenance` | `cluster` | `cli` | `cluster` / the cluster id | The operator or the installer ran `quoro cluster maintenance` on the primary's host and the primary opened the window (node-agent-protocol.md section 8.11); `params` is `{duration_s}`, `ok` once a majority supported it, `error` with the reason otherwise. `--end` writes another record with `params` `{end: true}` |
+
+Support requests and grants, promotion votes and the loss of a majority write no record: they change no state on the primary. What follows from them is recorded: the fences of the nodes (`node.fenced` events) and, with promotion, the promotion itself.
 
 ## 4. Redaction
 

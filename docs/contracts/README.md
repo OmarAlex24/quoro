@@ -40,6 +40,7 @@ Every contract uses exactly the names below. If a contract needs a name that is 
 - **Roles** of the single `quoro` binary (D-0012): `node`, `witness`, `edge`. They combine (for example `witness`+`edge`, D-0018).
 - **Control-plane status** of a node: `primary` (single writer and source of truth) or `replica` (holds a copy of the change log, serves reads, forwards writes) (D-0012). Primary and replica are statuses, not roles.
 - The witness role stores no data (D-0017). In M1-M4 the cluster has exactly one primary and no witness (D-0016).
+- From M5b every machine with the `node` or `witness` role is a **voter**; an edge-only machine is not, and one machine has one vote whatever its roles (ADR 0170). Each voter gives the primary its **support** for a short window over its session, and the primary grants and renews `expiring` leases only while a majority of voters supports it (ADR 0169). The cluster **term** goes up by one with each promotion, which takes it from a majority of voters; every machine refuses a primary with a lower term than it has seen (`stale_term`, node-agent-protocol.md section 8.8). An enrolled machine gains or loses the `witness` role through `POST /api/v1/nodes/{node_id}/roles`, without enrolling again; a witness stores only its vote state.
 - The **edge** role (from M5a, ADR 0143) runs the embedded proxy for the domains of apps with more than one replica, balancing over their instances on other nodes and checking each one itself. An edge-only machine runs no engine and needs no KVM. Edges and nodes are joined by the **mesh**, a kernel WireGuard star with the edge as hub (ADR 0144).
 
 ### Identifiers
@@ -131,7 +132,7 @@ and the build's manifest digest as its digest, for example `build.quoro.invalid/
 - Grant `status`: `active`, `expired`, `revoked`, `exhausted`.
 - Approval `status`: `pending`, `approved`, `denied`, `expired`.
 - Incident `status`: `open`, `resolved`.
-- Lease `mode`: `local` (HA policy `none`/`cold`: never expires when the arbiter is unreachable; ends by `lease_revoke` or an operator declaring the node lost) or `expiring` (HA policy `warm`/`hot`, from M5b: `held` -> `uncertain` -> `expired`, self-fence at `expired`; revoked explicitly) (D-0047). Lease state as seen by a node: `held`, `uncertain`, `expired`, `revoked`. See node-agent-protocol.md.
+- Lease `mode`: `local` (HA policy `none`/`cold`: never expires when the arbiter is unreachable; ends by `lease_revoke` or an operator declaring the node lost) or `expiring` (HA policy `warm`/`hot`, from M5b: `held` -> `uncertain` -> `expired`, self-fence at `expired`; revoked explicitly) (D-0047). Lease state as seen by a node: `held`, `uncertain`, `expired`, `revoked`. See node-agent-protocol.md. From M5b the API shows each app's lease (`App.lease`), as the primary sees it.
 - Webhook delivery `status`: `pending`, `delivered`, `failed`.
 - Volume `state`: `creating` (the node has not reported the file yet), `ready`, `restoring` (being written from a backup), `failed`, `detached` (replaced by a restore, its file kept on its node until deleted), `deleting` (ADR 0145).
 - Backup `status`: `queued`, `running`, `succeeded`, `failed` (ADR 0147). The last two are terminal.
@@ -149,6 +150,8 @@ A scope is `<resource>:<verb>` (D-0030). The complete list:
 | `node:enroll` | Create node join tokens | human-only |
 | `node:remove` | Remove a node from the cluster | destructive, human-only |
 | `node:fence_ack` | Acknowledge a node's failed fence after verifying its VMs are stopped, so its leases may be granted again | human-only |
+| `node:roles` | Add or remove the `witness` role of an enrolled machine, which changes the voters (ADR 0170) | human-only |
+| `node:declare_lost` | Declare a disconnected node lost, so its leases may be granted elsewhere (ADR 0183) | human-only |
 | `project:read` | List and read projects | |
 | `project:write` | Create and update projects | |
 | `project:delete` | Delete an empty project | destructive |
@@ -313,13 +316,15 @@ M4 adds no MCP tool. Builds, metrics and console sessions are reachable by agent
 
 M5a adds no MCP tool either. Volumes, backups and restores are reachable by agents through the HTTP API with a grant (a volume delete and a restore only through a JIT approval); backup repositories, their recovery key and the off-site audit export are human-only. Replicas are a field of `updateApp`, with no tool of their own. Vulnerability reports are read through the HTTP API (`app:read`), and an agent woken by `app.vulnerable` rebuilds through `startBuild` with `refresh_base` (`app:deploy`), also with no tool of their own (ADR 0155 defers automatic rebuilds to M5b). A later tool is a contract change of its own.
 
+M5b's lease and witness contract adds no MCP tool: the roles operation and declaring a node lost are human-only, and an agent reads the voters through `get_cluster` and an app's lease through `get_app`.
+
 ### Channels
 
 Every action reaches the same service layer through one of these channels, recorded in the audit log as `channel`: `api` (HTTP API), `panel` (the web panel, which uses the API with a session), `mcp` (MCP server, D-0031), `cli` (the `quoro` command), `system` (Quoro itself: reconciliation, schedulers, incident automation). MCP tools map one-to-one onto service operations and require the same scope as the matching endpoint.
 
 ### Node-agent message types
 
-Defined in node-agent-protocol.md. Node to control plane: `hello`, `heartbeat`, `status_report`, `event`, `lease_renew`, `log_ack`, `stream_data`, `stream_end`, `command_result`, `dns_challenge`, `image_inventory`. Control plane to node: `welcome`, `desired_state`, `lease_grant`, `lease_revoke`, `log_entries`, `stream_open`, `stream_close`, `stream_input`, `stream_ack`, `command`, `signing_key_rotate`, `dns_challenge_result`, `error`. Either side: `ping`, `pong`.
+Defined in node-agent-protocol.md. Node to control plane: `hello`, `heartbeat`, `status_report`, `event`, `lease_renew`, `log_ack`, `stream_data`, `stream_end`, `command_result`, `dns_challenge`, `image_inventory`, `support_grant`. Control plane to node: `welcome`, `desired_state`, `lease_grant`, `lease_revoke`, `log_entries`, `stream_open`, `stream_close`, `stream_input`, `stream_ack`, `command`, `signing_key_rotate`, `dns_challenge_result`, `support_request`, `error`. Either side: `ping`, `pong`.
 
 ### Database tables
 

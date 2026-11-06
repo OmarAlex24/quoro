@@ -104,6 +104,7 @@ export const db: MockDb = {
     fence_failure: null,
     tunnel: null,
     last_seen_at: now(),
+    lost_at: null,
     created_at: now(),
   },
   extraNodes: [],
@@ -429,6 +430,7 @@ const seed = (): void => {
     fence_failure: null,
     tunnel: null,
     last_seen_at: createdAt,
+    lost_at: null,
     created_at: createdAt,
   };
   db.extraNodes.push(replicaNode);
