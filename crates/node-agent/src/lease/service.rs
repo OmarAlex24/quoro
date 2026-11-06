@@ -1,13 +1,25 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The `local` lease service the session and the reconciler share
-//! (`node-agent-protocol.md` sections 5.12, 5.13, 8.3, 8.5).
+//! The lease service the session and the reconciler share
+//! (`node-agent-protocol.md` sections 5.5, 5.12, 5.13, 8.3 to 8.5).
 //!
-//! It adapts the M0 state machine ([`LeaseTable`]) to the running agent: the
+//! It drives the state machine ([`LeaseTable`]) for the running agent: the
 //! session forwards every `lease_grant` and `lease_revoke` here, the reconciler
 //! asks [`LeaseView`] whether a stateful VM may start, and both see the same
-//! table. Only `local` leases exist in M5a (section 8.7): they never expire and
-//! send no `lease_renew`, so the timer half of [`crate::lease::LeaseAgent`] is
-//! not needed here.
+//! table.
+//!
+//! `local` leases never expire (section 8.3). `expiring` leases renew every
+//! `D / 3` through the session the service is attached to
+//! ([`LeaseLink::attach`]), go `uncertain` when a renewal is late or the
+//! session is lost, and self-fence when the monotonic clock reaches
+//! `valid_until` (section 8.4). The service mints each `lease_renew` and takes
+//! its send time when it hands the renewal to the session, a little before the
+//! frame leaves, so `valid_until` errs early. Each lease's validity is stored
+//! on `CLOCK_BOOTTIME` once, when `valid_until` is set, so a held lease
+//! survives an agent restart within the same host boot, and a suspend after
+//! that conversion can only shorten what the restart finds left (section 8.4
+//! "Agent restart", ADR 0072). A suspend between a renewal and its answer, or
+//! while the agent runs, is not detected yet: the monotonic clock does not
+//! count it.
 //!
 //! A revoke reaches the service as soon as the session reads it, and is
 //! answered once its fence is recorded; the session holds back what may not
@@ -48,7 +60,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::SystemTime;
 
@@ -56,7 +68,7 @@ use quoro_engine::{Engine, VmId, VmState};
 use quoro_proto::wire::HelloLease;
 use quoro_proto::{
     CommandResult, CommandStatus, Envelope, ErrorBody, ErrorCode, FenceReason, LeaseGrant, LeaseId,
-    LeaseMode, LeaseRevoke, MsgId, ProtocolError, ResourceType,
+    LeaseMode, LeaseRenew, LeaseRevoke, MsgId, ProtocolError, ResourceType,
 };
 use tokio::sync::{OwnedRwLockReadGuard, RwLock, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -64,21 +76,72 @@ use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use crate::AgentError;
-use crate::lease::clock::{HostNow, SystemHostClock};
+use crate::lease::clock::{HostClock, HostNow, StoredValidity, SystemHostClock};
 use crate::lease::fence::{FenceReport, FenceTimers, VmFenceOutcome, budget_for, stop_vms};
-use crate::lease::machine::{LeaseState, LeaseTable, Refusal, RevokeOutcome};
+use crate::lease::machine::{Action, Lease, LeaseState, LeaseTable, Refusal, RevokeOutcome};
 use crate::lease::store::{FenceRecord, StoredLease};
 use crate::reconcile::Snapshot;
 use crate::store::{HOST_BOOT_ID, NodeStore};
 use crate::util;
 
 /// What the service needs that is not the engine or the store.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct LeaseConfig {
     /// The `nod_` id `node.fenced` carries (section 8.5 step 3).
     pub node_id: String,
-    /// The stop timeouts a fence uses.
+    /// The stop timeouts a fence of a `local` lease uses.
     pub timers: FenceTimers,
+    /// The stop timeouts a fence of an `expiring` lease uses, clamped to its
+    /// margin `M` (section 8.4: `T_grace + T_force <= M`).
+    pub expiring_timers: FenceTimers,
+    /// The host clock a held `expiring` lease's validity is stored on.
+    pub host_clock: Arc<dyn HostClock>,
+}
+
+impl LeaseConfig {
+    /// `T_grace` and `T_force` of an `expiring` lease's fence by default, the
+    /// worked example of section 8.4: 1 300 ms, inside `M` = 1 500 ms of the
+    /// default `D` = 15 000 ms.
+    pub const EXPIRING_TIMERS: FenceTimers = FenceTimers {
+        grace: std::time::Duration::from_millis(1000),
+        force: std::time::Duration::from_millis(300),
+    };
+
+    /// A configuration with the default `expiring` fence timers and the
+    /// running host's clock.
+    #[must_use]
+    pub fn new(node_id: impl Into<String>, timers: FenceTimers) -> Self {
+        Self {
+            node_id: node_id.into(),
+            timers,
+            expiring_timers: Self::EXPIRING_TIMERS,
+            host_clock: Arc::new(SystemHostClock),
+        }
+    }
+
+    /// The same, with another host clock (a test's [`ManualHostClock`]).
+    ///
+    /// [`ManualHostClock`]: crate::lease::ManualHostClock
+    #[must_use]
+    pub fn with_host_clock(mut self, clock: Arc<dyn HostClock>) -> Self {
+        self.host_clock = clock;
+        self
+    }
+
+    /// The same, with other `expiring` fence timers.
+    #[must_use]
+    pub fn with_expiring_timers(mut self, timers: FenceTimers) -> Self {
+        self.expiring_timers = timers;
+        self
+    }
+
+    /// The timers a fence of `lease` uses, before [`budget_for`] clamps them.
+    fn timers_for(&self, lease: &Lease) -> FenceTimers {
+        match lease.mode {
+            LeaseMode::Expiring => self.expiring_timers,
+            LeaseMode::Local => self.timers,
+        }
+    }
 }
 
 /// The read side of the lease table, shared with the reconciler.
@@ -156,7 +219,9 @@ impl LeaseView {
         let lease_id = LeaseId(lease_id.to_owned());
         !self.failed.load(Ordering::SeqCst)
             && !self.gates.fencing().contains(&lease_id)
-            && self.lock().may_start_stateful(&lease_id, spec_token)
+            && self
+                .lock()
+                .may_start_stateful(&lease_id, spec_token, Instant::now())
     }
 
     /// Section 8.4: may a stateful VM with this spec token that already runs
@@ -231,6 +296,14 @@ enum LeaseCommand {
         lease_ids: Vec<String>,
         reply: oneshot::Sender<CommandResult>,
     },
+    /// A session is up: renewals go out through `renewals`, and every live
+    /// `expiring` lease renews at once (section 8.4).
+    Attach {
+        session: u64,
+        renewals: mpsc::UnboundedSender<Envelope<LeaseRenew>>,
+    },
+    /// That session is gone: the authority is unreachable (section 8.4).
+    Detach { session: u64 },
 }
 
 /// The session's handle to the lease service.
@@ -238,9 +311,45 @@ enum LeaseCommand {
 pub struct LeaseLink {
     commands: mpsc::UnboundedSender<LeaseCommand>,
     hello: watch::Receiver<Vec<HelloLease>>,
+    sessions: Arc<AtomicU64>,
+}
+
+/// A session attached to the lease service ([`LeaseLink::attach`]). Dropping
+/// it detaches the session: every `held` `expiring` lease goes `uncertain`.
+pub struct Attached {
+    /// The `lease_renew` messages to send, each with its envelope id.
+    pub renewals: mpsc::UnboundedReceiver<Envelope<LeaseRenew>>,
+    commands: mpsc::UnboundedSender<LeaseCommand>,
+    session: u64,
+}
+
+impl Drop for Attached {
+    fn drop(&mut self) {
+        let _ = self.commands.send(LeaseCommand::Detach {
+            session: self.session,
+        });
+    }
 }
 
 impl LeaseLink {
+    /// Attaches a session that has received its `welcome`: the service sends
+    /// its `lease_renew` messages through the returned [`Attached`] until it
+    /// is dropped, and every live `expiring` lease renews at once (section
+    /// 8.4). A later attach replaces an earlier one.
+    #[must_use]
+    pub fn attach(&self) -> Attached {
+        let session = self.sessions.fetch_add(1, Ordering::SeqCst) + 1;
+        let (renewals, rx) = mpsc::unbounded_channel();
+        let _ = self
+            .commands
+            .send(LeaseCommand::Attach { session, renewals });
+        Attached {
+            renewals: rx,
+            commands: self.commands.clone(),
+            session,
+        }
+    }
+
     /// Every lease the node knows, as `hello` reports them (section 5.1).
     #[must_use]
     pub fn hello(&self) -> Vec<HelloLease> {
@@ -378,18 +487,27 @@ pub async fn start_local_leases<E: Engine + 'static>(
         .into_iter()
         .map(|record| (record.lease_id, record.token))
         .collect();
-    let host = HostNow::read(&SystemHostClock);
-    // This service has no renewal loop yet, so nothing could renew a restored
-    // `expiring` lease or fence it at its deadline: the restore keeps fencing
-    // every such lease, the conservative M0 rule, until the loop arrives
-    // (section 8.4 "Agent restart", #75).
-    let now = HostNow::unknown(host.instant);
-    let (table, pending) = LeaseTable::restore(
-        store.load_leases().await?,
-        store.load_highest_tokens().await?,
-        &fenced,
-        &now,
-    );
+    let host = HostNow::read(&*config.host_clock);
+    // A held `expiring` lease stored on this host boot comes back `uncertain`
+    // with what is left of its validity and renews once a session attaches;
+    // any other comes back `expired` and is fenced (section 8.4 "Agent
+    // restart", ADR 0072).
+    let rows = store.load_leases().await?;
+    let stored: HashMap<LeaseId, StoredValidity> = rows
+        .iter()
+        .filter_map(|row| Some((row.lease_id.clone(), row.validity.clone()?)))
+        .collect();
+    let (table, pending) =
+        LeaseTable::restore(rows, store.load_highest_tokens().await?, &fenced, &host);
+    // A lease that came back with its validity keeps the stored deadline
+    // itself: converting it back and forth would move it.
+    let validities: HashMap<LeaseId, (Instant, StoredValidity)> = table
+        .leases()
+        .filter_map(|lease| {
+            let until = lease.valid_until?;
+            Some((lease.id.clone(), (until, stored.get(&lease.id)?.clone())))
+        })
+        .collect();
     // An `expiring` lease the restore could not prove is written back
     // `expired` before its fence begins, so the store never keeps a
     // validity the table no longer stands behind.
@@ -399,8 +517,11 @@ pub async fn start_local_leases<E: Engine + 'static>(
     for lease in table.leases() {
         if lease.mode == LeaseMode::Expiring {
             let highest = table.highest_for(lease.resource_type, &lease.resource_id);
+            let validity = validities
+                .get(&lease.id)
+                .map(|(_, validity)| validity.clone());
             if let Err(e) = store
-                .save_lease(&StoredLease::from_lease(lease, &now), highest)
+                .save_lease(&StoredLease::with_validity(lease, validity), highest)
                 .await
             {
                 warn!(error = %e, lease_id = %lease.id.0, "could not write back a restored lease");
@@ -448,6 +569,8 @@ pub async fn start_local_leases<E: Engine + 'static>(
         task_leases: HashMap::new(),
         recorded,
         unstored_failures: BTreeSet::new(),
+        validities,
+        renewals: None,
     };
     service.note_bindings();
     let task = tokio::spawn(service.run());
@@ -455,6 +578,7 @@ pub async fn start_local_leases<E: Engine + 'static>(
         link: LeaseLink {
             commands,
             hello: hello_rx,
+            sessions: Arc::new(AtomicU64::new(0)),
         },
         view,
         task,
@@ -607,6 +731,14 @@ struct LocalLeaseService<E: Engine> {
     /// holds for them in memory, and only a `fence_ack` naming them clears
     /// them (section 5.17).
     unstored_failures: BTreeSet<String>,
+    /// Each held `expiring` lease's `valid_until` with its stored form,
+    /// converted once when `valid_until` was set (section 8.4 "Agent
+    /// restart"). A later save reuses it: converting again after a suspend,
+    /// which `CLOCK_BOOTTIME` counts and the monotonic clock does not, would
+    /// store a later deadline.
+    validities: HashMap<LeaseId, (Instant, StoredValidity)>,
+    /// The attached session, which sends the renewals (section 5.5).
+    renewals: Option<(u64, mpsc::UnboundedSender<Envelope<LeaseRenew>>)>,
 }
 
 impl<E: Engine + 'static> LocalLeaseService<E> {
@@ -619,11 +751,17 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
         // run side by side (section 8.5).
         for action in std::mem::take(&mut self.pending) {
             if let crate::lease::Action::Fence { lease_id, reason } = action {
-                self.begin_fence(lease_id, reason, None);
+                self.begin_fence(lease_id, reason, None, Instant::now());
             }
         }
         loop {
+            // Everything the clock had reached when `advance` polled runs
+            // before the wait. The wait is computed from that same instant,
+            // so a deadline reached while `advance` ran ends it at once.
+            let polled_at = self.advance().await;
+            let deadline = self.lock().next_deadline(polled_at);
             tokio::select! {
+                () = wait_until(deadline) => {}
                 changed = self.desired.changed() => {
                     if changed.is_err() {
                         break;
@@ -670,7 +808,92 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
             LeaseCommand::FenceAck { lease_ids, reply } => {
                 let _ = reply.send(self.fence_ack(&lease_ids).await);
             }
+            LeaseCommand::Attach { session, renewals } => {
+                self.renewals = Some((session, renewals));
+                self.lock().renew_now(Instant::now());
+            }
+            LeaseCommand::Detach { session } => {
+                if self.renewals.as_ref().is_some_and(|(at, _)| *at == session) {
+                    self.detach();
+                }
+            }
         }
+    }
+
+    /// The authority is unreachable: renewals stop, and every `held`
+    /// `expiring` lease goes `uncertain`; it keeps its VMs and starts nothing
+    /// new until a renewal is answered (section 8.4).
+    fn detach(&mut self) {
+        self.renewals = None;
+        self.lock().authority_unreachable(Instant::now());
+        self.publish_hello();
+    }
+
+    /// Section 8.4 for everything the clock has reached: sends the renewals
+    /// that are due through the attached session, and fences each lease that
+    /// reached `valid_until`. Returns the instant it polled at.
+    async fn advance(&mut self) -> Instant {
+        let now = Instant::now();
+        // Each lease's `valid_until` before the poll clears it: an expiry's
+        // stop time counts from there, not from the poll, which may run late.
+        let (deadlines, actions): (HashMap<LeaseId, Instant>, _) = {
+            let mut table = self.lock();
+            let deadlines = table
+                .leases()
+                .filter_map(|lease| lease.valid_until.map(|until| (lease.id.clone(), until)))
+                .collect();
+            (deadlines, table.poll(now))
+        };
+        let mut expired = Vec::new();
+        for action in actions {
+            match action {
+                Action::SendRenew {
+                    lease_id,
+                    fencing_token,
+                } => {
+                    let id = MsgId(util::message_id());
+                    let sent = self.renewals.as_ref().is_some_and(|(_, renewals)| {
+                        renewals
+                            .send(Envelope {
+                                id: id.clone(),
+                                re: None,
+                                body: LeaseRenew {
+                                    lease_id: lease_id.clone(),
+                                    fencing_token,
+                                },
+                            })
+                            .is_ok()
+                    });
+                    if sent {
+                        // The send time is taken here, before the session
+                        // writes the frame, so `valid_until` errs early.
+                        self.lock().renew_sent(&lease_id, id, now);
+                    } else if self.renewals.is_some() {
+                        // The session is gone without detaching yet.
+                        self.detach();
+                    }
+                }
+                Action::Fence { lease_id, reason } => {
+                    // The stop must end by `t_send + D` (section 8.4), so it
+                    // begins before anything waits on the store.
+                    let since = deadlines.get(&lease_id).copied().unwrap_or(now).min(now);
+                    self.begin_fence(lease_id.clone(), reason, None, since);
+                    expired.push(lease_id);
+                }
+            }
+        }
+        if expired.is_empty() {
+            return now;
+        }
+        // Then `expired` is stored, so an agent that dies mid-fence restores
+        // the lease fenced (section 8.5 step 2). One that dies before the
+        // write still restores it `expired`: its stored deadline, on
+        // `CLOCK_BOOTTIME`, is no later than the `valid_until` just reached.
+        for lease_id in &expired {
+            self.persist(lease_id).await;
+        }
+        self.publish_hello();
+        now
     }
 
     /// Section 5.17 `fence_ack`: the store clears the listed failed fences
@@ -728,14 +951,6 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
     }
 
     async fn grant(&mut self, envelope: Envelope<LeaseGrant>) -> Result<(), ProtocolError> {
-        // M5a places `local` leases only (section 8.7); an expiring lease needs
-        // the renewal loop M5b adds, and accepting one here would let it run
-        // without ever being renewed.
-        if envelope.body.mode != LeaseMode::Local {
-            return Err(refused(
-                "expiring leases are not supported by this agent yet",
-            ));
-        }
         let now = Instant::now();
         let (lease, highest) = {
             let mut table = self.lock();
@@ -748,16 +963,13 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                 Err(Refusal::BadMessage(message)) => return Err(refused(&message)),
             }
         };
-        if let Some(lease) = lease
-            && let Err(e) = self
-                .store
-                .save_lease(
-                    &StoredLease::from_lease(&lease, &HostNow::read(&SystemHostClock)),
-                    highest,
-                )
-                .await
-        {
-            warn!(error = %e, "could not persist a lease grant");
+        if let Some(lease) = lease {
+            // A grant that answered a renewal set `valid_until`: its stored
+            // form is converted now, so a later suspend cannot move it.
+            let row = StoredLease::with_validity(&lease, self.validity_of(&lease));
+            if let Err(e) = self.store.save_lease(&row, highest).await {
+                warn!(error = %e, "could not persist a lease grant");
+            }
         }
         self.publish_hello();
         Ok(())
@@ -831,6 +1043,7 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                         msg: envelope.id,
                         reply,
                     }),
+                    Instant::now(),
                 );
             }
         }
@@ -852,7 +1065,7 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
             && !self.view.gates.fencing().contains(&revoke.lease_id)
     }
 
-    async fn persist(&self, lease_id: &LeaseId) {
+    async fn persist(&mut self, lease_id: &LeaseId) {
         let (lease, highest) = {
             let table = self.lock();
             let Some(lease) = table.get(lease_id).cloned() else {
@@ -861,22 +1074,54 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
             let highest = table.highest_for(lease.resource_type, &lease.resource_id);
             (lease, highest)
         };
-        if let Err(e) = self
-            .store
-            .save_lease(
-                &StoredLease::from_lease(&lease, &HostNow::read(&SystemHostClock)),
-                highest,
-            )
-            .await
-        {
+        let row = StoredLease::with_validity(&lease, self.validity_of(&lease));
+        if let Err(e) = self.store.save_lease(&row, highest).await {
             warn!(error = %e, "could not persist a lease");
+        }
+    }
+
+    /// The stored form of `lease`'s validity (section 8.4 "Agent restart"):
+    /// the one converted when its `valid_until` was set, or, for a
+    /// `valid_until` not seen yet, one converted now and kept.
+    fn validity_of(&mut self, lease: &Lease) -> Option<StoredValidity> {
+        let until = match (lease.mode, lease.state, lease.valid_until) {
+            (LeaseMode::Expiring, LeaseState::Held | LeaseState::Uncertain, Some(until)) => until,
+            _ => {
+                self.validities.remove(&lease.id);
+                return None;
+            }
+        };
+        if let Some((at, validity)) = self.validities.get(&lease.id)
+            && *at == until
+        {
+            return Some(validity.clone());
+        }
+        match HostNow::read(&*self.config.host_clock).store(until) {
+            Some(validity) => {
+                self.validities
+                    .insert(lease.id.clone(), (until, validity.clone()));
+                Some(validity)
+            }
+            None => {
+                self.validities.remove(&lease.id);
+                None
+            }
         }
     }
 
     /// Section 8.5 step 1: starts stopping every VM bound to the lease, in a
     /// task of its own. A lease whose fence is already running gets no second
     /// stop: the trigger joins that fence and is answered with its result.
-    fn begin_fence(&mut self, lease_id: LeaseId, reason: FenceReason, waiter: Option<Waiter>) {
+    ///
+    /// `since` is when the fence was triggered: an `expiring` lease's stop
+    /// time counts from there (section 8.4).
+    fn begin_fence(
+        &mut self,
+        lease_id: LeaseId,
+        reason: FenceReason,
+        waiter: Option<Waiter>,
+        since: Instant,
+    ) {
         if let Some(flight) = self.in_flight.get_mut(&lease_id) {
             flight.waiters.extend(waiter);
             return;
@@ -898,7 +1143,7 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
         // taken before the change that came first.
         self.note_bindings();
         let vms = self.bound.get(&lease_id).cloned().unwrap_or_default();
-        let budget = budget_for(&lease, self.config.timers);
+        let budget = budget_for(&lease, self.config.timers_for(&lease));
         let bounded = lease.mode == LeaseMode::Expiring;
         // Nothing stateful starts for this lease until the fence is recorded.
         self.view.gates.fencing().insert(lease_id.clone());
@@ -907,18 +1152,17 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
         let desired = self.desired.clone();
         let known = vms.clone();
         let fenced = lease_id.clone();
-        let begun = Instant::now();
         let handle = self.tasks.spawn(async move {
             // A start that holds the gate finishes first; its VM is then
             // among those stopped here.
             let _exclusive = gate.write_owned().await;
             let (stopping, unlisted) = fence_targets(&*engine, &desired, &fenced, known).await;
             // An `expiring` lease must be stopped within `M` of the trigger
-            // (section 8.4), so time spent waiting for a start comes out of
-            // the graceful stop.
+            // (section 8.4), so the time since the trigger, waiting for a
+            // start or listing the VMs, comes out of the graceful stop.
             let budget = if bounded {
                 FenceTimers {
-                    grace: budget.grace.saturating_sub(begun.elapsed()),
+                    grace: budget.grace.saturating_sub(since.elapsed()),
                     force: budget.force,
                 }
             } else {
@@ -980,24 +1224,28 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
 
         // A revoke that joined the fence may have raised the lease's token;
         // the fence covers it too, so the record carries the newest one.
-        let host = HostNow::read(&SystemHostClock);
-        let (lease, token, row) = {
+        let (lease, token, highest) = {
             let table = self.lock();
             let lease = table.get(&lease_id).cloned();
             let token = lease
                 .as_ref()
                 .filter(|lease| matches!(lease.state, LeaseState::Revoked | LeaseState::Expired))
                 .map_or(flight.token, |lease| lease.token.max(flight.token));
-            // The lease's row is written with the record, so a lease whose
-            // `revoked` state could not be saved before the stop is saved now
-            // or not at all, and a fenced lease is never restored `held`.
-            let row = lease.as_ref().map(|lease| {
-                (
-                    StoredLease::from_lease(lease, &host),
-                    table.highest_for(lease.resource_type, &lease.resource_id),
-                )
-            });
-            (lease, token, row)
+            let highest = lease
+                .as_ref()
+                .map(|lease| table.highest_for(lease.resource_type, &lease.resource_id));
+            (lease, token, highest)
+        };
+        // The lease's row is written with the record, so a lease whose
+        // `revoked` or `expired` state could not be saved before the stop is
+        // saved now or not at all, and a fenced lease is never restored
+        // `held`.
+        let row = match (&lease, highest) {
+            (Some(lease), Some(highest)) => Some((
+                StoredLease::with_validity(lease, self.validity_of(lease)),
+                highest,
+            )),
+            _ => None,
         };
         let result = self
             .record_fence(&lease_id, &flight, lease.as_ref(), token, row, &outcome)
@@ -1152,6 +1400,14 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
 
     fn publish_hello(&self) {
         let _ = self.hello.send_replace(hello_leases(&self.view.table));
+    }
+}
+
+/// Waits until `deadline`; with none, never.
+async fn wait_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
     }
 }
 
