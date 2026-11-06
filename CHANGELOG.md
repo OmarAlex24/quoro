@@ -17,6 +17,7 @@ Each entry links the pull request that made the change and, where one exists, th
 - A node agent that died in the middle of a self-fence came back with the lease revoked but did not stop its VMs again, and the VMs outlive the agent, so a VM could keep running without its lease. The agent now records a fence, together with the lease's state, only once its stop has finished, answers the revoke `ok` only once that record is written, and fences again at start any revoked or expired lease without a record. A fence also stops the VMs the latest desired state no longer names, so a VM dropped from it just before the revoke is not missed. Fences of different leases now run at the same time instead of one after another, the agent keeps taking messages while one runs, and a stateful VM no longer starts while a fence of its lease is under way ([#385], [ADR 0075], [ADR 0019]).
 - After a restore was accepted, the old node could still receive a desired state that named the moved VM after its lease had been revoked, when that snapshot had been built just before the restore. A snapshot built before a lease revoke is now dropped and built again, so nothing the revoke took away reaches the node after it. Deleting a volume had the same race ([#388]).
 - The panel offered `app:terminal`, `backup:manage` and `backup:restore` in the agent grant and webhook forms, and the API then refused the grant. Its human-only and destructive scope lists now match the permission model, and a test reads both lists from the contract ([#397]).
+- The panel's webhook dialog did not offer the `build`, `backup`, `restore`, `volume` and `domain` events, so they could only be subscribed to through the API. The dialog now offers every event type of the contract, grouped by subject ([#398]).
 
 ## [v0.2.0] - 2026-11-05
 
@@ -374,6 +375,7 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#385]: https://github.com/OmarAlex24/quoro/pull/385
 [#388]: https://github.com/OmarAlex24/quoro/pull/388
 [#397]: https://github.com/OmarAlex24/quoro/pull/397
+[#398]: https://github.com/OmarAlex24/quoro/pull/398
 [ADR 0019]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0019-fencing-is-mandatory-and-lease-based-node-agent-self-fences.md
 [ADR 0020]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0020-per-app-ha-policies-none-cold-warm-hot-with-cost-shown-in.md
 [ADR 0027]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0027-signed-binaries-and-reproducible-builds-are-mandatory.md
