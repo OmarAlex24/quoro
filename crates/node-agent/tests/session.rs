@@ -5,14 +5,24 @@
 
 mod agent_common;
 
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
-use agent_common::{GATEWAY, SUBNET, TempDir, facts, identity_files, spec_vm};
+use agent_common::{GATEWAY, SUBNET, TempDir, facts, identity_files, snapshot, spec_vm};
 use futures_util::{SinkExt as _, StreamExt as _};
+use quoro_ingress::cloudflared::CloudflaredConfig;
+use quoro_ingress::proxy::BackendObserver as _;
+use quoro_node_agent::edge::EdgeManager;
+use quoro_node_agent::ingress::{CertificateEvents, DnsBridge, IngressConfig, IngressSupervisor};
+use quoro_node_agent::reconcile::Snapshot;
 use quoro_node_agent::session::{Session, SessionEnd, SessionSetup};
 use quoro_node_agent::store::NodeStore;
 use quoro_proto::sign::{self, SigningKey};
-use quoro_proto::wire::{ControlMessage, DesiredState, DesiredStatus, Spec, SpecNetwork, Welcome};
+use quoro_proto::wire::{
+    ControlMessage, DesiredState, DesiredStatus, EdgeBackend, EdgeRoute, HealthCheck, Spec,
+    SpecEdge, SpecNetwork, Welcome,
+};
 use serde_json::Value;
 use tokio::io::DuplexStream;
 use tokio::sync::watch;
@@ -494,4 +504,274 @@ async fn the_current_primary_url_stays_in_the_stored_list() {
         stored[0].starts_with(current.trim_end_matches('/')),
         "{stored:?} keeps {current}"
     );
+}
+
+const EDGE_HOST: &str = "edge-demo.example.com";
+
+/// An edge manager over a real ingress supervisor that starts nothing: the
+/// routes below are `tunnel` routes and the snapshot carries no tunnel, so no
+/// listener and no connector run.
+fn edge_manager(dir: &TempDir, store: &NodeStore) -> Arc<EdgeManager> {
+    let config = IngressConfig::new(
+        dir.path(),
+        CloudflaredConfig {
+            binary: dir.path().join("no-cloudflared"),
+            metrics: "127.0.0.1:0".parse().unwrap(),
+            extra_args: Vec::new(),
+        },
+    );
+    let supervisor = Arc::new(IngressSupervisor::new(
+        config,
+        Arc::new(DnsBridge::new()),
+        CertificateEvents::new(store.clone(), None),
+    ));
+    Arc::new(EdgeManager::new(supervisor))
+}
+
+fn edge_backend(vm_id: &str, port: u16) -> EdgeBackend {
+    EdgeBackend {
+        vm_id: vm_id.to_owned(),
+        node_id: "nod_backend".to_owned(),
+        address: "127.0.0.1".to_owned(),
+        port,
+    }
+}
+
+/// An edge-only snapshot with one route over `backends`, probed every
+/// `interval_s` and taken out after two failed probes.
+fn edge_snapshot(rev: u64, backends: Vec<EdgeBackend>, interval_s: u32) -> Snapshot {
+    let mut snap = snapshot(rev, Vec::new());
+    snap.state.spec.network = None;
+    snap.state.spec.edge = Some(SpecEdge {
+        routes: vec![EdgeRoute {
+            hostname: EDGE_HOST.to_owned(),
+            domain_id: "dom_edge".to_owned(),
+            app_id: "app_edge".to_owned(),
+            tls_mode: "tunnel".to_owned(),
+            health_check: HealthCheck {
+                path: Some("/health".to_owned()),
+                interval_s: Some(interval_s),
+                timeout_s: Some(1),
+                failures: Some(2),
+                start_period_s: None,
+                restart: None,
+            },
+            backends,
+            draining_until: None,
+        }],
+        tunnel: None,
+    });
+    snap
+}
+
+/// The `edge_backends` of a status report, as (vm_id, in_rotation, reason).
+fn edge_entries(report: &Value) -> Vec<(String, bool, Option<String>)> {
+    report["body"]["edge_backends"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry["vm_id"].as_str().unwrap().to_owned(),
+                        entry["in_rotation"].as_bool().unwrap(),
+                        entry["reason"].as_str().map(str::to_owned),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The next status report, or `None` when none comes within `limit`. The
+/// periodic report is 30 s away, so a report this soon was sent for a change.
+async fn status_within(ws: &mut WebSocketStream<DuplexStream>, limit: Duration) -> Option<Value> {
+    tokio::time::timeout(limit, read_until(ws, "status_report"))
+        .await
+        .ok()
+}
+
+/// An edge running `first`, and a session over it whose handshake is done.
+struct EdgeSession {
+    edge: Arc<EdgeManager>,
+    snapshots: watch::Sender<Option<Snapshot>>,
+    ws: WebSocketStream<DuplexStream>,
+    /// The status report the session sent after `welcome`.
+    first: Value,
+    serving: tokio::task::JoinHandle<Result<SessionEnd, quoro_node_agent::AgentError>>,
+    stop: watch::Sender<bool>,
+    manager: tokio::task::JoinHandle<()>,
+    _dir: TempDir,
+}
+
+impl EdgeSession {
+    async fn start(first: Snapshot) -> Self {
+        let dir = TempDir::new();
+        let key = sign::signing_key_from_seed(&[8; 32]);
+        let identity = identity_files(dir.path(), &key);
+        let store = NodeStore::open(dir.path()).await.unwrap();
+        let edge = edge_manager(&dir, &store);
+        let rev = first.rev;
+        let (snapshots, snapshots_rx) = watch::channel(Some(first));
+        let (stop, mut stop_rx) = watch::channel(false);
+        let manager = tokio::spawn(Arc::clone(&edge).run(snapshots_rx, async move {
+            let _ = stop_rx.wait_for(|stop| *stop).await;
+        }));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while edge.applied_rev() < rev {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the edge manager applied the snapshot");
+
+        let (desired, _desired_rx) = watch::channel(None);
+        let (_observed_tx, observed_rx) = watch::channel(Vec::new());
+        let mut session = Session::new(SessionSetup {
+            identity,
+            store,
+            facts: facts(),
+            desired,
+            observed: observed_rx,
+            current: None,
+            builds: None,
+        })
+        .with_edge(Arc::clone(&edge));
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let accepting = tokio::spawn(tokio_tungstenite::accept_async(server));
+        let (client_ws, _response) = client_async("ws://primary.test/api/v1/nodes/session", client)
+            .await
+            .unwrap();
+        let serving =
+            tokio::spawn(
+                async move { session.serve(client_ws, std::future::pending::<()>()).await },
+            );
+        let mut ws = accepting.await.unwrap().unwrap();
+
+        let hello = read_frame(&mut ws).await;
+        send(
+            &mut ws,
+            ControlMessage::Welcome(Welcome {
+                cluster_id: "cls_test".to_owned(),
+                term: 1,
+                server_time: "2026-11-02T10:15:30Z".to_owned(),
+                heartbeat_interval_ms: 500,
+                session_timeout_ms: 5_000,
+                primary_node_id: "nod_primary".to_owned(),
+                primary_urls: Vec::new(),
+            })
+            .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
+            .to_text(),
+        )
+        .await;
+        let first = read_until(&mut ws, "status_report").await;
+        Self {
+            edge,
+            snapshots,
+            ws,
+            first,
+            serving,
+            stop,
+            manager,
+            _dir: dir,
+        }
+    }
+
+    async fn finish(self) {
+        assert!(!self.serving.is_finished(), "the session stayed up");
+        self.serving.abort();
+        let _ = self.stop.send(true);
+        self.manager.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn an_edge_reports_a_rotation_change_at_once() {
+    // The first probe is a minute away, so only the test changes the rotation.
+    let a: SocketAddr = "127.0.0.1:18080".parse().unwrap();
+    let mut run =
+        EdgeSession::start(edge_snapshot(1, vec![edge_backend("vm_a", a.port())], 60)).await;
+    assert_eq!(
+        edge_entries(&run.first),
+        vec![("vm_a".to_owned(), true, None)]
+    );
+
+    // The proxy could not connect to the backend: the edge takes it out at
+    // once, and the primary hears of it at once, not at the next periodic
+    // report.
+    let error = "connect to 127.0.0.1:18080: Connection refused (os error 111)";
+    run.edge.connect_failed(EDGE_HOST, a, error);
+    let out = status_within(&mut run.ws, Duration::from_secs(2))
+        .await
+        .expect("a status report within 2 s of the rotation change");
+    assert_eq!(
+        edge_entries(&out),
+        vec![("vm_a".to_owned(), false, Some("connect_failed".to_owned()))]
+    );
+    assert_eq!(out["body"]["edge_backends"][0]["last_error"], error);
+
+    // A snapshot that adds an instance changes the report too.
+    run.snapshots.send_replace(Some(edge_snapshot(
+        2,
+        vec![edge_backend("vm_a", a.port()), edge_backend("vm_b", 18081)],
+        60,
+    )));
+    let added = status_within(&mut run.ws, Duration::from_secs(2))
+        .await
+        .expect("a status report within 2 s of the new backend");
+    assert_eq!(
+        edge_entries(&added),
+        vec![
+            ("vm_a".to_owned(), false, Some("connect_failed".to_owned())),
+            ("vm_b".to_owned(), true, None),
+        ]
+    );
+
+    // The same failure again changes nothing, so it sends nothing.
+    run.edge.connect_failed(EDGE_HOST, a, error);
+    assert!(
+        status_within(&mut run.ws, Duration::from_secs(1))
+            .await
+            .is_none(),
+        "a report without a change"
+    );
+    run.finish().await;
+}
+
+#[tokio::test]
+async fn an_edge_reports_a_failed_probe_and_the_backend_it_takes_out() {
+    // A port nothing listens on: every probe is refused.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut run = EdgeSession::start(edge_snapshot(1, vec![edge_backend("vm_a", closed)], 1)).await;
+    assert_eq!(
+        edge_entries(&run.first),
+        vec![("vm_a".to_owned(), true, None)]
+    );
+
+    // The first failed probe leaves the backend in rotation with an error;
+    // the second takes it out. Each is reported within a probe interval.
+    let failed = status_within(&mut run.ws, Duration::from_millis(2_500))
+        .await
+        .expect("a status report after the first failed probe");
+    assert_eq!(edge_entries(&failed), vec![("vm_a".to_owned(), true, None)]);
+    let error = failed["body"]["edge_backends"][0]["last_error"]
+        .as_str()
+        .expect("the failed probe's error")
+        .to_owned();
+    assert!(
+        error.starts_with(&format!("connect to 127.0.0.1:{closed}: ")),
+        "{error}"
+    );
+    let out = status_within(&mut run.ws, Duration::from_millis(2_500))
+        .await
+        .expect("a status report when the backend left the rotation");
+    assert_eq!(
+        edge_entries(&out),
+        vec![("vm_a".to_owned(), false, Some("health_check".to_owned()))]
+    );
+    run.finish().await;
 }

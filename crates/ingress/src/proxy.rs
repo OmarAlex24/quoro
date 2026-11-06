@@ -93,7 +93,10 @@ pub struct ListenerMode {
 /// once (`node-agent-protocol.md` section 6.8).
 pub trait BackendObserver: Send + Sync {
     /// One backend of `hostname` refused a connection or was reset before it
-    /// sent response headers. `error` is one line for the backend's status.
+    /// sent response headers. `error` is one line for the backend's status:
+    /// `connect to {backend}: {cause}`, `connect to {backend} timed out` or
+    /// `connection to {backend} lost: {cause}`, with the root cause of the
+    /// failure, as the edge's health probes word theirs.
     fn connect_failed(&self, hostname: &str, backend: SocketAddr, error: &str);
 }
 
@@ -173,7 +176,7 @@ impl ProxyCore {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         if let Some(observer) = observer {
-            observer.connect_failed(hostname, backend, &error.to_string());
+            observer.connect_failed(hostname, backend, &failure_line(backend, error));
         }
     }
 
@@ -1104,6 +1107,32 @@ fn backend_causes(
         next = current.source();
         Some(current)
     })
+}
+
+/// The one line [`BackendObserver::connect_failed`] gets for a failure: the
+/// backend and the root cause, not the client's own wrapper (`client error
+/// (Connect)`, `client error (SendRequest)`), so the same failure reads the
+/// same whichever request or probe saw it.
+fn failure_line(backend: SocketAddr, error: &hyper_util::client::legacy::Error) -> String {
+    let io = backend_causes(error).find_map(|cause| cause.downcast_ref::<std::io::Error>());
+    let cause = io.map_or_else(
+        || {
+            backend_causes(error)
+                .last()
+                .map_or_else(|| error.to_string(), ToString::to_string)
+        },
+        ToString::to_string,
+    );
+    if is_connect_failure(error) {
+        // The connector's own timeout is an I/O error around tokio's
+        // `Elapsed`, whose text says nothing of a connect.
+        if io.is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut) {
+            return format!("connect to {backend} timed out");
+        }
+        format!("connect to {backend}: {cause}")
+    } else {
+        format!("connection to {backend} lost: {cause}")
+    }
 }
 
 /// Whether a legacy client error means the backend's connection died: a
