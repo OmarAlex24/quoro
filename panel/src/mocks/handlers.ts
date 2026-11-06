@@ -1093,6 +1093,8 @@ export const handlers = [
       tls_mode: body.tls_mode,
       cert_status: body.tls_mode === 'tunnel' ? 'not_applicable' : 'pending',
       cert_expires_at: null,
+      serving_status: 'serving',
+      last_error: null,
       created_at: now(),
     };
     db.domains.push(domain);

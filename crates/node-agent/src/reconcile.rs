@@ -2016,6 +2016,8 @@ mod tests {
                             interval_s: Some(1),
                             timeout_s: Some(1),
                             failures: Some(1),
+                            start_period_s: None,
+                            restart: None,
                         }),
                         desired_status: DesiredStatus::Running,
                         restart_generation: 0,

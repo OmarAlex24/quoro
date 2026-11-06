@@ -743,7 +743,7 @@ The point-in-time disk primitive the chunk engine needs (D-0023). Both are `Unsu
 - The snapshot is a node-local file that only the chunk engine reads. It is never attached to a VM and never mounted. `delete_volume_snapshot` removes it; a missing snapshot is `Ok`. Snapshots left by a crash are removed by the node agent at start.
 - At most one snapshot per volume exists at a time; a second `snapshot_volume` while one exists is `Conflict`. An unknown volume is `NotFound`. Too little free space for a `PauseCopy` is `ResourceExhausted`, checked before the pause.
 - They must **not** be implemented with Cloud Hypervisor VM snapshots. A CH snapshot is a paused VM's `config.json`, `memory-ranges` and `state.json`; it contains guest RAM and device state but no disk contents, and CH exposes no dirty bitmap (F-0035). `/vm.pause` and `/vm.resume` are the only VMM calls this method makes.
-- Before M5b, a spike comparing lvm-thin and btrfs chooses the primitive for warm volumes.
+- Warm volumes (M5b) keep these reflink snapshots, native or in the pool: the changed ranges between two consecutive snapshots of a volume are found by comparing their extent maps (FIEMAP), with a full hashed scan of the snapshot as the fallback, and neither lvm-thin nor btrfs is used (ADR 0172). A `PauseCopy` node cannot hold a warm volume. The call that returns the changed ranges is specified with the warm-replication contract.
 
 ### 3.17 `prepare_layout`
 
@@ -921,4 +921,4 @@ The node agent runs its protocol tests against `FakeEngine`: the M0 lease tests 
 | M2 | `output` feeds live app logs (D-0014, D-0033); isolation groups on `NetAttach` and guest DNS on `NodeNetwork` (D-0084) |
 | M4 | `counters` for metrics (D-0033, ADR 0014); `serial_output` and `VmSpec::serial` for the read-only console (ADR 0116); `exec` and `VmSpec::vsock` for the web terminal, with init configuration v2 (ADR 0113); `prepare_layout`, `VmSpec::work_disks` and `NetAttach::egress_only` for builds (ADR 0117, ADR 0118). `console` is superseded |
 | M5a | `image_inventory`, built by `prepare_image` and `prepare_layout` (ADR 0150, ADR 0151), and `uninventoried_images` and `inventory_cached_image` for images cached before M5a; `ensure_volume`, `import_volume`, `delete_volume` and `VolumeAttach::serial` for local volumes, with init configuration v3 (ADR 0145); `snapshot_volume` and `delete_volume_snapshot` with the `Reflink` or `PauseCopy` method probed per node (ADR 0146) |
-| M5b | The primitive for warm volumes chosen by the lvm-thin vs btrfs spike (D-0023) |
+| M5b | Changed ranges between two reflink snapshots of a warm volume, found by comparing their extent maps (ADR 0172, D-0023) |

@@ -95,7 +95,7 @@ Backups add two keys per backup repository (ADR 0147, [backup-format.md](backup-
 - **repository key**: 256 random bits, generated when the repository is created. The keys that name and encrypt chunks are derived from it per backup source. It is stored only wrapped: under the cluster data-encryption key in `backup_repositories.repo_key_enc`, for unattended backups, and under the recovery key, in the repository's config object in the bucket.
 - **recovery key**: 256 random bits, shown once to the owner who creates the repository (or rotates it) and never stored by Quoro in plaintext. With it, the repository can be read on a fresh host after the primary and its data-encryption key are lost.
 
-The cluster keys are generated at the primary's first start and stored as `0600` files under `/var/lib/quoro`, outside SQLite. They are backed up separately from the database: losing the data-encryption key loses every secret it protects. Custody of the cluster keys on promotion is open (Q-0024): the candidate is to replicate both keys wrapped to each replica's node key, against re-keying on promotion with an operator-confirmed re-pin.
+The cluster keys are generated at the primary's first start and stored as `0600` files under `/var/lib/quoro`, outside SQLite. They are backed up separately from the database: losing the data-encryption key loses every secret it protects. Custody of the cluster keys on promotion is decided (ADR 0078, read by ADR 0180): every machine with the `node` role generates a custody key pair of its own, and the primary seals the signing key, the data-encryption key and its own TLS key to each such machine, so a promoted node can open them and keeps the certificate nodes pin (ADR 0181). The node-local key above is not used for this, because the primary never sees it. The fields and the table that carry the seals are specified with manual promotion in M5b; until then the keys do not leave the primary.
 
 ### Resource relationships
 
@@ -105,7 +105,7 @@ The cluster keys are generated at the primary's first start and stored as `0600`
 - An app is `stateful` or not. An app is stateful exactly when it has a **volume**: its first volume makes it stateful (ADR 0145). A stateful app runs one instance, on the node that holds its volume and its `local` **lease** (D-0019, D-0047).
 - A **backup** copies one volume, or the control-plane database, into a **backup repository** (ADR 0147, ADR 0148). Restoring a volume backup creates a new volume on the chosen node and moves the app there.
 - An app has an HA policy: `none`, `cold`, `warm`, `hot` (D-0020). `none` and `cold` (scheduled backups of a stateful app) are accepted from M5a; `warm` and `hot` are refused until M5b and M6. The field exists from M0.
-- A **domain** belongs to one app and has a TLS mode: `acme` (public-IP hosts) or `tunnel` (Cloudflare Tunnel) (D-0024).
+- A **domain** belongs to one app and has a TLS mode: `acme` (public-IP hosts) or `tunnel` (Cloudflare Tunnel) (D-0024). Its serving status says whether a machine can serve the hostname at all, apart from its certificate (ADR 0167).
 - An app either deploys images given by reference or has a **Git source** (`source`): then its images come from **builds** of that source, and each successful build starts a deployment with `trigger: build` (ADR 0117). A build runs on the node that runs the app (ADR 0118).
 - From M5a the node that prepares an image sends its package **inventory** to the primary, which matches it against a local copy of OSV data and records **vulnerability findings** for the apps that run the image, for the running Quoro release's own components and for host kernels (ADR 0138, ADR 0150). The image never leaves the node. A finding in CISA's KEV catalog or with a CVSS score of 9.0 or more raises `app.vulnerable`, which opens an incident. An app with a Git source is patched by a build with `refresh_base`; Quoro never upgrades a host or an image it did not build.
 - An **interactive session** is a web terminal into an app's VM or a read-only console of a VM (ADR 0114). It lives on the primary while it is open and leaves two audit records, its open and its `session.end` (ADR 0115).
@@ -245,7 +245,9 @@ Event `type` is `<subject>.<what>` in lowercase with underscores. The complete l
 | `restore.failed` | A restore failed; the new volume is `failed` and the app stays stopped until another restore | |
 | `certificate.issued` | A TLS certificate was obtained or renewed | |
 | `certificate.expiring` | A certificate expires within its warning window | certificate expiring |
-| `certificate.failed` | Obtaining or renewing a certificate failed | |
+| `certificate.failed` | Obtaining or renewing a certificate failed. A primary that does not yet emit `domain.unserved` also emits it with `tls_mode` `tunnel` for a `tunnel` domain no tunnel serves | |
+| `domain.unserved` | No machine can serve a domain's hostname although its app has an instance meant to run; the domain's `serving_status` became `unserved` (ADR 0167). It opens no incident | |
+| `domain.served` | A machine serves an `unserved` domain's hostname again | |
 | `grant.created` | A grant was issued | |
 | `grant.revoked` | A grant was revoked | |
 | `grant.expired` | A grant's TTL passed or its uses ran out | |
@@ -325,8 +327,4 @@ Defined in db-schema.sql and changed only by the numbered files in `migrations/`
 
 ## Open items before the freeze
 
-| Element | Recommended | Open alternative |
-| --- | --- | --- |
-| Cluster key custody on promotion | Replicate both keys wrapped to each replica's node key | Re-key on promotion with an operator-confirmed re-pin (open; decided with manual promotion in M5b, D-0067) |
-
-Only key custody on promotion is still open. It does not block the freeze: promotion arrives in M5b and the key files and message shapes it needs already exist. The image pipeline and init are decided (D-0061), and so is the M5a snapshot primitive (ADR 0146, which supersedes D-0062: reflink where the node's data directory supports it, otherwise pause and copy), with an lvm-thin vs btrfs spike before M5b. Every other element formerly listed here is decided (D-0047, D-0048, D-0050, D-0051, D-0052, D-0053, D-0054, D-0056, D-0057, D-0061, D-0062, D-0067, D-0071, D-0072, D-0073, D-0074).
+None. The last open element, custody of the cluster keys on promotion, is decided: the keys are replicated to every machine with the `node` role, sealed to a custody key of each machine (ADR 0078, read by ADR 0180), together with the primary's TLS key (ADR 0181). The fields and the table that carry the seals are specified with manual promotion in M5b. The image pipeline and init are decided (D-0061), and so is the snapshot primitive: reflink snapshots, natively or in a node-managed XFS volume pool, for the M5a `cold` backups (ADR 0156, which supersedes D-0062 and ADR 0146), and the same snapshots compared by their extent maps (FIEMAP) to find the changed ranges for `warm` replication in M5b, with no lvm-thin and no btrfs (ADR 0172). Every other element formerly listed here is decided (D-0047, D-0048, D-0050, D-0051, D-0052, D-0053, D-0054, D-0056, D-0057, D-0061, D-0062, D-0067, D-0071, D-0072, D-0073, D-0074).

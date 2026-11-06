@@ -12,8 +12,8 @@ use sqlx::sqlite::SqliteRow;
 use utoipa::{IntoParams, ToSchema};
 
 /// Columns of [`Domain`], in the order [`domain_from_row`] expects them.
-pub(crate) const DOMAIN_COLUMNS: &str =
-    "id, app_id, hostname, tls_mode, cert_status, cert_expires_at, provider_id, created_at";
+pub(crate) const DOMAIN_COLUMNS: &str = "id, app_id, hostname, tls_mode, cert_status, \
+     cert_expires_at, serving_status, last_error, provider_id, created_at";
 
 /// `domains.tls_mode` (`Domain.tls_mode`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -72,6 +72,38 @@ impl CertStatus {
     }
 }
 
+/// `domains.serving_status` (`Domain.serving_status`, ADR 0167).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ServingStatus {
+    Serving,
+    Unserved,
+    Pending,
+}
+
+impl ServingStatus {
+    /// The wire form stored in `domains.serving_status`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Serving => "serving",
+            Self::Unserved => "unserved",
+            Self::Pending => "pending",
+        }
+    }
+
+    /// Parses `domains.serving_status`; `None` is an internal inconsistency.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "serving" => Some(Self::Serving),
+            "unserved" => Some(Self::Unserved),
+            "pending" => Some(Self::Pending),
+            _ => None,
+        }
+    }
+}
+
 /// A hostname routed to one app (`openapi.yaml` `Domain`).
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 #[schema(
@@ -97,6 +129,13 @@ pub struct Domain {
     /// Expiry of the current certificate, when one exists.
     #[schema(required = false)]
     pub cert_expires_at: Option<String>,
+    /// Whether a machine can serve the hostname, independently of the
+    /// certificate (ADR 0167).
+    #[schema(inline)]
+    pub serving_status: ServingStatus,
+    /// Why the hostname is `unserved`; null in any other status.
+    #[schema(required = false)]
+    pub last_error: Option<String>,
     /// The provider whose credential manages the hostname's DNS records: a
     /// `dns` provider for `acme` or a `tunnel` provider for `tunnel` (D-0095).
     /// Null only for domains created before the field existed.
@@ -175,6 +214,9 @@ pub(crate) fn domain_from_row(row: &SqliteRow) -> Result<Domain, ApiError> {
     let cert_status: String = row.try_get("cert_status")?;
     let cert_status = CertStatus::parse(&cert_status)
         .ok_or_else(|| ApiError::internal(&format!("unknown cert_status {cert_status:?}")))?;
+    let serving_status: String = row.try_get("serving_status")?;
+    let serving_status = ServingStatus::parse(&serving_status)
+        .ok_or_else(|| ApiError::internal(&format!("unknown serving_status {serving_status:?}")))?;
     Ok(Domain {
         id: row.try_get("id")?,
         app_id: row.try_get("app_id")?,
@@ -182,6 +224,8 @@ pub(crate) fn domain_from_row(row: &SqliteRow) -> Result<Domain, ApiError> {
         tls_mode,
         cert_status,
         cert_expires_at: row.try_get("cert_expires_at")?,
+        serving_status,
+        last_error: row.try_get("last_error")?,
         provider_id: row.try_get("provider_id")?,
         created_at: row.try_get("created_at")?,
     })
@@ -519,6 +563,10 @@ async fn create_app_domain_tx(
         tls_mode: body.tls_mode,
         cert_status,
         cert_expires_at: None,
+        // The column default: the primary sets the status when it next
+        // recomputes the app's routes (ADR 0167).
+        serving_status: ServingStatus::Pending,
+        last_error: None,
         provider_id: Some(provider_id),
         created_at: now_rfc3339(),
     };

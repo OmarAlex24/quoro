@@ -543,6 +543,8 @@ const seed = (): void => {
     tls_mode: 'tunnel',
     cert_status: 'not_applicable',
     cert_expires_at: null,
+    serving_status: 'serving',
+    last_error: null,
     created_at: createdAt,
   });
 

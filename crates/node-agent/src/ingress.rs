@@ -1378,6 +1378,7 @@ mod tests {
             port,
             tls_mode: tls_mode.to_string(),
             domain_id: None,
+            draining_until: None,
         }
     }
 

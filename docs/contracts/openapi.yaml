@@ -1384,7 +1384,10 @@ components:
     HealthCheck:
       type: object
       title: HealthCheck
-      description: Health check an app declares; the node probes it and reports events.
+      description: |
+        Health check an app declares; the node probes it, reports events and,
+        unless `restart` is false, restarts an instance that stays unhealthy
+        (`node-agent-protocol.md` section 6.3, ADR 0184).
       required:
         - path
         - interval_s
@@ -1410,6 +1413,22 @@ components:
           minimum: 1
           default: 3
           description: Consecutive failures before the app is declared down.
+        start_period_s:
+          type: integer
+          minimum: 0
+          default: 30
+          description: |
+            Seconds after an instance starts during which failed probes do not
+            count toward `failures` (ADR 0184).
+        restart:
+          type: boolean
+          default: true
+          description: |
+            Whether the node restarts an instance after `failures` consecutive
+            failed probes outside the start period, with the crash backoff. A
+            stateful instance restarts only while its node holds the app's
+            lease. False keeps the report-only behaviour: `app.down` and no
+            restart (ADR 0184).
     AppResources:
       type: object
       title: AppResources
@@ -2317,6 +2336,7 @@ components:
         - hostname
         - tls_mode
         - cert_status
+        - serving_status
         - created_at
       properties:
         id:
@@ -2349,6 +2369,27 @@ components:
         cert_expires_at:
           type: [string, 'null']
           description: Expiry of the current certificate, when one exists.
+        serving_status:
+          type: string
+          description: |
+            Whether a machine can serve the hostname, independently of the
+            certificate (ADR 0167). `serving`: the hostname's route is in the
+            desired state of a machine that can serve it (for `tunnel`, a
+            machine whose tunnel carries the hostname). `unserved`: the app has
+            an instance meant to run, but no machine can serve the hostname;
+            `last_error` says why. For `tunnel` that is a one-replica app with
+            no instance meant to run on a node with a tunnel, or an app with
+            more replicas while the edge has no tunnel. `pending`: neither yet,
+            because the domain was just added or the app has no instance meant
+            to run. A change between `serving` and `unserved` emits
+            `domain.served` or `domain.unserved`.
+          enum:
+            - serving
+            - unserved
+            - pending
+        last_error:
+          type: [string, 'null']
+          description: Why the hostname is `unserved`; null in any other status.
         provider_id:
           type: [string, 'null']
           pattern: '^prv_[0-9A-HJKMNP-TV-Z]{26}$'
@@ -2429,7 +2470,9 @@ components:
         app_id:
           type: string
           pattern: '^app_[0-9A-HJKMNP-TV-Z]{26}$'
-          description: App that owns the volume.
+          description: |
+            App that owns the volume. After deleteApp it names the deleted app
+            until the node removes the file and the record is dropped (ADR 0165).
         node_id:
           type: string
           pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
@@ -2450,7 +2493,9 @@ components:
             `failed` with `error` when creation or a restore failed;
             `detached` once a restore was accepted to replace it: its file stays
             untouched on its node and it is never attached again; `deleting`
-            until the node removes the file.
+            after deleteVolume, or after deleteApp for every volume of the app,
+            until the node removes the file; the record is then dropped
+            (ADR 0165).
           enum:
             - creating
             - ready
@@ -4412,6 +4457,8 @@ components:
         - certificate.issued
         - certificate.expiring
         - certificate.failed
+        - domain.unserved
+        - domain.served
         - grant.created
         - grant.revoked
         - grant.expired
@@ -6660,10 +6707,14 @@ paths:
       operationId: deleteApp
       summary: Delete an app and its data
       description: |
-        Deletes the app, its instances, its domains and its volumes. Its
-        backups stay in the repository and in the backup list; in M5a no
-        operation restores or deletes them once the app is gone
-        (`backup-format.md` section 9). Deletion is
+        Deletes the app, its instances, its domains and its volumes. In the
+        same transaction every volume of the app, whatever its state, turns
+        `deleting`: its node removes the file, and the primary drops the
+        volume's record once the node reports it deleted (ADR 0165). Until
+        then the volume stays readable with `getVolume`; it is no longer listed
+        under the app, which is gone. Its backups stay in the repository and in
+        the backup list; in M5a no operation restores or deletes them once the
+        app is gone (`backup-format.md` section 9). Deletion is
         destructive and off by default for agents: without an approval grant the
         call is refused with `approval_required`, and a human approves the filed
         request (D-0030). Exposed as the MCP tool `delete_app` (D-0033); the tool
@@ -6677,7 +6728,7 @@ paths:
         - $ref: '#/components/parameters/QuoroIncident'
       responses:
         '202':
-          description: Deletion accepted; the instances stop and are removed.
+          description: Deletion accepted; the instances stop and are removed, and the app's volumes are `deleting` until their nodes remove the files.
           headers:
             Quoro-Request-Id:
               $ref: '#/components/headers/QuoroRequestId'

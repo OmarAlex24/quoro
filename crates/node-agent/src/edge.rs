@@ -618,8 +618,11 @@ mod tests {
                 interval_s: Some(1),
                 timeout_s: Some(1),
                 failures: Some(3),
+                start_period_s: None,
+                restart: None,
             },
             backends,
+            draining_until: None,
         }
     }
 
@@ -841,6 +844,8 @@ mod tests {
             interval_s: None,
             timeout_s: None,
             failures: None,
+            start_period_s: None,
+            restart: None,
         });
         assert_eq!(spec.path, "/");
         assert_eq!(
@@ -858,6 +863,8 @@ mod tests {
             interval_s: Some(0),
             timeout_s: Some(7),
             failures: Some(0),
+            start_period_s: None,
+            restart: None,
         });
         assert_eq!(spec.path, "/live");
         assert_eq!(spec.interval, Duration::from_secs(1));
