@@ -361,7 +361,7 @@ D-0016 places manual promotion of a replica node to primary in M5, and it ships 
 - A planned switchover is available when the user prefers the original node: wait for lag near zero, wait for a low-traffic window, freeze writes, final sync, move the lease, shift traffic, drain connections; it loses no data [D-0022].
 - The edge can also be the third voter, as the witness+edge combination of the same binary [D-0018].
 
-External arbiters are optional and their behaviour is verified. R2 conditional writes as a lease arbiter: an atomic conditional PUT, 1 write/s per key, no TTL, and fencing tokens are still required (docs/research/r2-conditional-writes.md). Cloudflare Durable Objects as the arbiter: fits on the Workers Free plan, needs a Cloudflare account and a Worker, and fencing tokens are still required (docs/research/durable-objects.md). The snapshot primitive under the chunk engine is reflink snapshots plus a full content-defined chunk scan for the M5a `cold` backups; a spike comparing lvm-thin and btrfs chooses the primitive for `warm` before M5b, and the `Engine` trait's `snapshot_volume` hooks keep it swappable [D-0062].
+External arbiters are optional and their behaviour is verified. R2 conditional writes as a lease arbiter: an atomic conditional PUT, 1 write/s per key, no TTL, and fencing tokens are still required (docs/research/r2-conditional-writes.md). Cloudflare Durable Objects as the arbiter: fits on the Workers Free plan, needs a Cloudflare account and a Worker, and fencing tokens are still required (docs/research/durable-objects.md). The snapshot primitive under the chunk engine is reflink snapshots, natively or in a node-managed XFS volume pool, plus a full content-defined chunk scan for the M5a `cold` backups [D-0156]; `warm` keeps the same snapshots and finds the ranges that changed between two of them by comparing their extent maps (FIEMAP), with no lvm-thin and no btrfs [D-0172].
 
 Failure domains: all three lab VMs run on one physical host. The lab therefore simulates separate failure domains by stopping VMs or cutting the network between them. The real requirement that the witness sits in a different failure domain [D-0017] is documented here, not proven by the lab.
 
@@ -394,7 +394,7 @@ Failure domains: all three lab VMs run on one physical host. The lab therefore s
 - M5a (edge, app replicas, chunk engine, bucket).
 - D-0017, D-0018, D-0019, D-0020, D-0021, D-0022, D-0023.
 - A standalone contract PR adds the HA policy cost and N+1 capacity fields.
-- Needed before or during M5b: the lvm-thin versus btrfs spike that chooses the `warm` snapshot primitive [D-0062].
+- Needed before or during M5b: a lab measurement of how precise and correct the FIEMAP comparison of two reflink snapshots is on the XFS volume pool, which also sets the default replication interval of `warm` [D-0172].
 - This milestone does not deliver automatic promotion of the control plane; that is M6 [D-0016].
 
 #### Explicitly out of scope

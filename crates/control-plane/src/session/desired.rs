@@ -764,6 +764,7 @@ async fn build_routes(
             port: app.port,
             tls_mode,
             domain_id: Some(domain_id),
+            draining_until: None,
         });
     }
     routes.sort_by(|a, b| a.hostname.cmp(&b.hostname));
@@ -830,6 +831,7 @@ async fn build_edge(
                 tls_mode,
                 health_check,
                 backends: Vec::new(),
+                draining_until: None,
             });
         }
         let vm_id: Option<String> = row.try_get("vm_id").map_err(|e| e.to_string())?;

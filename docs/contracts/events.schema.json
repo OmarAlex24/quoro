@@ -59,6 +59,8 @@
         "certificate.issued",
         "certificate.expiring",
         "certificate.failed",
+        "domain.unserved",
+        "domain.served",
         "grant.created",
         "grant.revoked",
         "grant.expired",
@@ -118,6 +120,8 @@
     { "if": { "required": ["type"], "properties": { "type": { "const": "certificate.issued" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_certificate_issued" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "certificate.expiring" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_certificate_expiring" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "certificate.failed" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_certificate_failed" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "domain.unserved" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_domain_unserved" } } } },
+    { "if": { "required": ["type"], "properties": { "type": { "const": "domain.served" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_domain_served" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "grant.created" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_grant_created" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "grant.revoked" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_grant_revoked" } } } },
     { "if": { "required": ["type"], "properties": { "type": { "const": "grant.expired" } } }, "then": { "properties": { "data": { "$ref": "#/$defs/data_grant_expired" } } } },
@@ -186,7 +190,7 @@
 
     "Subject": {
       "type": "object",
-      "description": "The resource the event is about. `type` is the resource kind in the same words the id prefixes use (node, vm, app, deployment, build, domain, volume, backup, project, lease, grant, approval, incident, agent, user, cluster, webhook); `id` is that resource's id. For certificate events the subject is the domain; for audit.chain_broken it is the cluster; for backup.* it is the backup; for restore.* it is the app.",
+      "description": "The resource the event is about. `type` is the resource kind in the same words the id prefixes use (node, vm, app, deployment, build, domain, volume, backup, project, lease, grant, approval, incident, agent, user, cluster, webhook); `id` is that resource's id. For certificate and domain events the subject is the domain; for audit.chain_broken it is the cluster; for backup.* it is the backup; for restore.* it is the app.",
       "required": ["type", "id"],
       "properties": {
         "type": { "type": "string", "pattern": "^[a-z_]+$" },
@@ -758,13 +762,41 @@
 
     "data_certificate_failed": {
       "type": "object",
-      "description": "Obtaining or renewing a certificate failed. Payload fields are additive within schema_version 1.",
+      "description": "Obtaining or renewing a certificate failed. A primary that does not yet emit `domain.unserved` (ADR 0167) also emits this event with `tls_mode` `tunnel` for a `tunnel` domain that no tunnel serves; `domain.unserved` replaces that use. Payload fields are additive within schema_version 1.",
       "required": ["domain_id", "hostname", "tls_mode", "error"],
       "properties": {
         "domain_id": { "$ref": "#/$defs/DomainId" },
         "hostname": { "type": "string" },
         "tls_mode": { "type": "string", "enum": ["acme", "tunnel"] },
         "error": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "data_domain_unserved": {
+      "type": "object",
+      "description": "No machine can serve a domain's hostname although its app has an instance meant to run: the domain's `serving_status` became `unserved` (ADR 0167). `error` is the domain's `last_error`. Opens no incident. Payload fields are additive within schema_version 1.",
+      "required": ["domain_id", "app_id", "hostname", "tls_mode", "error"],
+      "properties": {
+        "domain_id": { "$ref": "#/$defs/DomainId" },
+        "app_id": { "$ref": "#/$defs/AppId" },
+        "hostname": { "type": "string" },
+        "tls_mode": { "type": "string", "enum": ["acme", "tunnel"] },
+        "error": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "data_domain_served": {
+      "type": "object",
+      "description": "A machine serves an `unserved` domain's hostname again: the domain's `serving_status` went from `unserved` to `serving` (ADR 0167). `unserved_since`, when the primary knows it, is when the domain became `unserved`, like `degraded_since` on `app.up`. Payload fields are additive within schema_version 1.",
+      "required": ["domain_id", "app_id", "hostname", "tls_mode"],
+      "properties": {
+        "domain_id": { "$ref": "#/$defs/DomainId" },
+        "app_id": { "$ref": "#/$defs/AppId" },
+        "hostname": { "type": "string" },
+        "tls_mode": { "type": "string", "enum": ["acme", "tunnel"] },
+        "unserved_since": { "$ref": "#/$defs/Timestamp" }
       },
       "additionalProperties": true
     },
@@ -1121,6 +1153,24 @@
         "hostname": "blog.example.com",
         "expires_at": "2026-11-12T00:00:00Z",
         "days_left": 9
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "evt_01JC9Z6Q5W8N3K4T7R2M1XHB10",
+      "seq": 52,
+      "type": "domain.unserved",
+      "time": "2026-11-06T09:30:00Z",
+      "source": { "kind": "control_plane" },
+      "subject": { "type": "domain", "id": "dom_01JC9Z6Q5W8N3K4T7R2M1XHB0F" },
+      "project_id": "prj_01JC9Z6Q5W8N3K4T7R2M1XHB0P",
+      "actor": { "type": "system", "id": "system" },
+      "data": {
+        "domain_id": "dom_01JC9Z6Q5W8N3K4T7R2M1XHB0F",
+        "app_id": "app_01JC9Z6Q5W8N3K4T7R2M1XHB0X",
+        "hostname": "blog.example.com",
+        "tls_mode": "tunnel",
+        "error": "no instance of the app runs on a node with a tunnel"
       }
     },
     {

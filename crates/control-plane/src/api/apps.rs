@@ -209,11 +209,12 @@ pub struct AppHaCost {
 }
 
 /// Health check an app declares (`openapi.yaml` `HealthCheck`); the node probes
-/// it and reports events.
+/// it, reports events and, unless `restart` is false, restarts an instance that
+/// stays unhealthy (ADR 0184).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[schema(
     title = "HealthCheck",
-    description = "Health check an app declares; the node probes it and reports events."
+    description = "Health check an app declares; the node probes it, reports events and, unless `restart` is false, restarts an instance that stays unhealthy (`node-agent-protocol.md` section 6.3, ADR 0184)."
 )]
 pub struct HealthCheck {
     /// HTTP path probed on the app port.
@@ -228,6 +229,17 @@ pub struct HealthCheck {
     /// Consecutive failures before the app is declared down.
     #[schema(minimum = 1, default = 3)]
     pub failures: i64,
+    /// Seconds after an instance starts during which failed probes do not
+    /// count toward `failures` (ADR 0184). Absent in a request means 30.
+    #[serde(default = "default_health_start_period")]
+    #[schema(minimum = 0, default = 30, required = false)]
+    pub start_period_s: i64,
+    /// Whether the node restarts an instance after `failures` consecutive
+    /// failed probes outside the start period (ADR 0184). Absent in a request
+    /// means true.
+    #[serde(default = "default_health_restart")]
+    #[schema(default = true, required = false)]
+    pub restart: bool,
 }
 
 fn default_health_path() -> String {
@@ -246,6 +258,14 @@ const fn default_health_failures() -> i64 {
     3
 }
 
+const fn default_health_start_period() -> i64 {
+    30
+}
+
+const fn default_health_restart() -> bool {
+    true
+}
+
 impl Default for HealthCheck {
     fn default() -> Self {
         Self {
@@ -253,6 +273,8 @@ impl Default for HealthCheck {
             interval_s: default_health_interval(),
             timeout_s: default_health_timeout(),
             failures: default_health_failures(),
+            start_period_s: default_health_start_period(),
+            restart: default_health_restart(),
         }
     }
 }
@@ -852,6 +874,11 @@ fn validate_health(health: &HealthCheck) -> Result<(), ApiError> {
     if health.failures < 1 {
         return Err(ApiError::validation(
             "health_check.failures must be at least 1",
+        ));
+    }
+    if health.start_period_s < 0 {
+        return Err(ApiError::validation(
+            "health_check.start_period_s must be at least 0",
         ));
     }
     Ok(())
@@ -1955,9 +1982,11 @@ pub(crate) async fn delete_app_tx(
         .await?;
     }
 
-    // `volumes.app_id` is ON DELETE CASCADE, but a cascade would leave the
-    // change log without the removal and a replica with the rows, so every
-    // volume goes explicitly and the app's `local` lease ends with it.
+    // `volumes.app_id` has no foreign key (migration 0009): from M5b the
+    // volumes of a deleted app stay `deleting` until their node removes the
+    // files (ADR 0165). Until that ships every volume record goes here,
+    // explicitly and through the change log, and the app's `local` lease ends
+    // with it.
     let volumes = sqlx::query(&format!(
         "SELECT {} FROM volumes WHERE app_id = ?",
         crate::api::volumes::VOLUME_COLUMNS

@@ -106,6 +106,10 @@ pub enum EventType {
     CertificateExpiring,
     #[serde(rename = "certificate.failed")]
     CertificateFailed,
+    #[serde(rename = "domain.unserved")]
+    DomainUnserved,
+    #[serde(rename = "domain.served")]
+    DomainServed,
     #[serde(rename = "grant.created")]
     GrantCreated,
     #[serde(rename = "grant.revoked")]
@@ -166,6 +170,8 @@ impl EventType {
             Self::CertificateIssued => "certificate.issued",
             Self::CertificateExpiring => "certificate.expiring",
             Self::CertificateFailed => "certificate.failed",
+            Self::DomainUnserved => "domain.unserved",
+            Self::DomainServed => "domain.served",
             Self::GrantCreated => "grant.created",
             Self::GrantRevoked => "grant.revoked",
             Self::GrantExpired => "grant.expired",
@@ -189,7 +195,7 @@ impl EventType {
     }
 
     /// Every event type of the contract, in contract order.
-    pub const ALL: [Self; 43] = [
+    pub const ALL: [Self; 45] = [
         Self::NodeEnrolled,
         Self::NodeConnected,
         Self::NodeDisconnected,
@@ -223,6 +229,8 @@ impl EventType {
         Self::CertificateIssued,
         Self::CertificateExpiring,
         Self::CertificateFailed,
+        Self::DomainUnserved,
+        Self::DomainServed,
         Self::GrantCreated,
         Self::GrantRevoked,
         Self::GrantExpired,

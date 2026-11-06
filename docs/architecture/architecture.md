@@ -299,7 +299,7 @@ Decided (D-0050), three keys:
 - **Cluster data-encryption key** (DEK, 256-bit XChaCha20-Poly1305). Encrypts every `*_enc` column; a `*_enc` column stores the key id, the nonce and the ciphertext, so a row records which key wrote it.
 - **Node-local key.** Encrypts a node's local copy of the secrets for the apps placed on it.
 
-Storage and rotation: the keys are generated at first start and stored as 0600 files in `/var/lib/quoro`, outside the SQLite file, and backed up separately, because losing the data-encryption key loses every secret. The signing key rotates through the node-agent message `signing_key_rotate`, signed by the old key. The data-encryption key rotates by re-encrypting rows under a new key id. Custody of both keys when a replica is promoted is decided together with manual promotion in M5b (D-0067); the open part is whether the keys are replicated wrapped to each replica's node key or re-keyed with an operator-confirmed re-pin.
+Storage and rotation: the keys are generated at first start and stored as 0600 files in `/var/lib/quoro`, outside the SQLite file, and backed up separately, because losing the data-encryption key loses every secret. The signing key rotates through the node-agent message `signing_key_rotate`, signed by the old key. The data-encryption key rotates by re-encrypting rows under a new key id. Custody of both keys when a replica is promoted is decided (ADR 0078, read by ADR 0180): each machine with the `node` role generates a custody key pair, and the primary seals the signing key, the data-encryption key and its own TLS key to each such machine's public custody key, so a promoted node opens them and keeps the certificate nodes pin (ADR 0181). The node-local key is not used for this, because the primary never sees it. The fields and the table that carry the seals are specified with manual promotion in M5b (D-0067); until then the keys do not leave the primary.
 
 ## 7. Telemetry locality
 
@@ -333,7 +333,7 @@ Cloud Hypervisor specifics:
 - **Nested virtualization**: rare on cheap VPS. Hetzner Cloud, Hostinger, Contabo VPS and netcup VPS state that they do not support it (F-0044, `docs/research/vps-nested-virt.md`). The installer therefore probes `/dev/kvm`, the vmx/svm CPU flag and a real microVM boot instead of trusting provider marketing. A host that fails the probe is refused during install rather than at first deploy.
 - **Image path**: OCI image -> root disk -> boot with a minimal init (D-0008). Quoro ships its own minimal Rust init and its own OCI-to-ext4 pipeline (D-0061), validated by the M0 spike (`spikes/oci-microvm`); the pipeline resolves layer paths inside the rootfs with `openat2` and `RESOLVE_IN_ROOT`, and also covers zstd layers and config delivery through a config disk or the kernel command line. The guest kernel is built by Quoro and pinned reproducibly (D-0027).
 - **Consoles are text-only.** Cloud Hypervisor has no VNC, virtual GPU or framebuffer device (F-0034). The microVM console is the serial or virtio-console UNIX socket, relayed by the node agent, so consoles are xterm.js over serial or virtio-console only.
-- **Disks and snapshots.** Cloud Hypervisor snapshots hold guest RAM and device state, not disk contents, and there is no incremental or dirty-bitmap API (F-0035). The chunk engine (D-0023) therefore needs its own disk snapshot primitive. The interim primitive is reflink snapshots plus a full content-defined chunk scan for M5a cold backups, and a spike comparing lvm-thin with btrfs before M5b picks the primitive for warm backups at few-second intervals (D-0062); the `Engine` trait's `snapshot_volume` hooks keep it swappable.
+- **Disks and snapshots.** Cloud Hypervisor snapshots hold guest RAM and device state, not disk contents, and there is no incremental or dirty-bitmap API (F-0035). The chunk engine (D-0023) therefore needs its own disk snapshot primitive. The primitive is reflink snapshots, natively or in a node-managed XFS volume pool, plus a full content-defined chunk scan for M5a cold backups (ADR 0156, which supersedes D-0062). Warm replication in M5b keeps the same snapshots and finds the ranges that changed between two of them by comparing their extent maps (FIEMAP), with a full hashed scan as the fallback; neither lvm-thin nor btrfs is used (ADR 0172).
 - **virtio-fs** needs an external virtiofsd (`docs/research/cloud-hypervisor.md`). The engine therefore does not depend on it: apps boot from a disk image, and virtio-fs is at most an optimisation for a later milestone.
 - **No live migration** (D-0034). Moving a running microVM between nodes is not a goal; moving an app is a stop/start with a lease, not a migration.
 
@@ -742,16 +742,15 @@ The scheme is not chosen — for example minisign, or Sigstore plus SLSA provena
 
 Every open item this document depends on. None of them is decided here.
 
-| Id | Question | Options | Recommendation | Needed by |
-| --- | --- | --- | --- | --- |
-| — | Custody of the cluster keys when a replica is promoted to primary | (a) wrap both keys to each replica's node key; (b) re-key on promotion with an operator-confirmed re-pin | (a), as recorded with D-0050 | M5b, with manual promotion (D-0067) |
+No question is open any more.
 
-Decided since the first draft, and therefore no longer listed above:
+Decided since the first draft, and therefore no longer listed here:
 
 - Ingress proxy: D-0059.
 - Git builds: D-0060.
 - Image path, rootfs conversion and minimal init: D-0061.
-- Disk snapshot primitive: D-0062.
+- Disk snapshot primitive: D-0062, superseded by ADR 0146 and ADR 0156; changed ranges for warm volumes: ADR 0172.
+- Custody of the cluster keys on promotion: D-0078, read by ADR 0180 and ADR 0181.
 - Node mesh: D-0063.
 - Release milestones: D-0064.
 - Manual promotion: D-0067.
@@ -772,7 +771,7 @@ Decided since the first draft, and therefore no longer listed above:
 - Host layout, CLI and setup token: D-0054.
 - Lab TLS for the M2 demonstration: D-0055.
 
-Custody of the cluster keys on promotion is the only open row. Q-0024 fixed when promotion ships (M5b, D-0067) but not how a promoted replica obtains the keys; until promotion exists the keys do not leave the primary.
+Custody of the cluster keys on promotion was the last open row. Q-0024 fixed when promotion ships (M5b, D-0067); D-0078 chose to replicate the keys to replica nodes, and ADR 0180 reads that as seals to a custody key of each node, because the node-local key is never seen by the primary. Until promotion exists the keys do not leave the primary.
 
 Q-0001 to Q-0006, Q-0009, Q-0024, Q-0025, Q-0026 and Q-0060 are decided (D-0059 to D-0065, D-0067 to D-0070) and are therefore absent from the table.
 

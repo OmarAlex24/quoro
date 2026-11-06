@@ -405,7 +405,8 @@ off-site copy exists".
 
 ### 8.2 Single primary until promotion exists
 
-Until M5b (manual promotion, D-0067) and M6 (automatic election), one primary is
+Until M5b (manual promotion, D-0067, with the key custody of section 8.3) and M6 (automatic
+election), one primary is
 a single point of write failure and a single point of trust. Losing it means no changes until an
 operator acts; compromising it means full control (T-NODE-14). Replica nodes reduce the data-loss
 risk, not the authority risk.
@@ -415,8 +416,13 @@ risk, not the authority risk.
 Replicated secret columns are encrypted with the cluster key (D-0013, `../contracts/node-agent-protocol.md`).
 A promoted replica must obtain that key or it cannot read the state it now owns. The algorithms, the
 storage and the rotation of the cluster keys are decided (D-0050; architecture section 6, "Cluster
-keys"); custody on promotion is decided together with manual promotion in M5b (D-0067). That is why
-promotion is not offered before M5b: a replica promoted earlier would own state it cannot decrypt.
+keys"), and so is custody on promotion (D-0078, read by ADR 0180 and ADR 0181): every machine with
+the `node` role generates a custody key pair, and the primary seals the signing key, the
+data-encryption key and its own TLS key to each such machine. Edge-only and witness-only machines get
+no seal. This widens the blast radius of a compromised node: a node that can open its seals holds
+the keys a primary holds, which D-0078 accepted. The fields and the table that carry the seals, and
+the threats they add, are specified with manual promotion in M5b (D-0067). That is why promotion is
+not offered before M5b: a replica promoted earlier would own state it cannot decrypt.
 
 ### 8.4 Object lock portability
 

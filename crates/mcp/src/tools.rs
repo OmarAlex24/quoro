@@ -564,6 +564,8 @@ fn event_type() -> Value {
             "certificate.issued",
             "certificate.expiring",
             "certificate.failed",
+            "domain.unserved",
+            "domain.served",
             "grant.created",
             "grant.revoked",
             "grant.expired",

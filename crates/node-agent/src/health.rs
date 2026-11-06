@@ -195,6 +195,8 @@ mod tests {
                     interval_s: Some(5),
                     timeout_s: Some(1),
                     failures: Some(4),
+                    start_period_s: None,
+                    restart: None,
                 }),
             ),
             Ipv4Addr::LOCALHOST,

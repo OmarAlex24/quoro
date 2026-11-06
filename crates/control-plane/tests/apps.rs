@@ -105,6 +105,9 @@ async fn app_lifecycle_over_http() {
     assert_eq!(app["port"], 8080);
     assert_eq!(app["health_check"]["path"], "/");
     assert_eq!(app["health_check"]["interval_s"], 10);
+    // ADR 0184: absent from the request, the restart fields take their defaults.
+    assert_eq!(app["health_check"]["start_period_s"], 30);
+    assert_eq!(app["health_check"]["restart"], true);
     assert_eq!(app["resources"]["vcpus"], 1);
     assert_eq!(app["resources"]["memory_mb"], 256);
     assert_eq!(app["resources"]["disk_gb"], 1);
@@ -191,6 +194,9 @@ async fn app_lifecycle_over_http() {
     assert_eq!(res.status(), 201, "domain: {}", res.text().await.unwrap());
     let domain: Value = res.json().await.unwrap();
     assert_eq!(domain["cert_status"], "pending");
+    // ADR 0167: a new domain is `pending` until the primary computes its status.
+    assert_eq!(domain["serving_status"], "pending");
+    assert!(domain["last_error"].is_null(), "{domain}");
     assert!(
         domain["provider_id"]
             .as_str()
@@ -523,6 +529,11 @@ async fn app_validation_and_authorization() {
     body["health_check"] =
         json!({ "path": "health", "interval_s": 10, "timeout_s": 2, "failures": 3 });
     cases.push(("health path", body));
+    let mut body = create_body(&project_id);
+    body["health_check"] = json!({
+        "path": "/", "interval_s": 10, "timeout_s": 2, "failures": 3, "start_period_s": -1
+    });
+    cases.push(("health start period", body));
     let mut body = create_body(&project_id);
     body["placement"] = json!({ "node_ids": ["nod_not-a-real-node"] });
     cases.push(("placement", body));

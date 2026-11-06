@@ -790,6 +790,14 @@ pub struct HealthCheck {
     pub timeout_s: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failures: Option<u32>,
+    /// Seconds after a start during which failed probes do not count; absent
+    /// means 30 (section 6.3, ADR 0184). Added in M5b.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_period_s: Option<u32>,
+    /// Whether the node restarts a VM that stays unhealthy; absent means true
+    /// (section 6.3, ADR 0184). Added in M5b.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<bool>,
 }
 
 /// A volume attached to a VM, one entry of `spec.vms[].volumes` (section
@@ -853,6 +861,11 @@ pub struct SpecRoute {
     /// it sends none, and an older node ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain_id: Option<String>,
+    /// RFC 3339 end of the grace window of a `tunnel` route that left this
+    /// machine (section 5.11, ADR 0168). Added in M5b; the node serves the
+    /// route like any other and never acts on the time itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draining_until: Option<String>,
 }
 
 /// `spec.network` (section 5.11).
@@ -925,6 +938,10 @@ pub struct EdgeRoute {
     pub tls_mode: String,
     pub health_check: HealthCheck,
     pub backends: Vec<EdgeBackend>,
+    /// RFC 3339 end of the grace window of a `tunnel` route whose app went
+    /// back to one replica (section 5.11, ADR 0168). Added in M5b.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draining_until: Option<String>,
 }
 
 /// One instance behind an edge route (section 5.11).
