@@ -38,11 +38,11 @@ nothing.
 | `QUORO_INSTALL_FROM=<dir>` | Install from local artifacts in `<dir>` instead of downloading. For testing before a release exists. The version comes from `QUORO_VERSION`, or from the single `quoro-*-x86_64-unknown-linux-musl.tar.gz` in that directory. |
 | `QUORO_INSTALL_DRY_RUN_REF=refs/heads/<branch>` | Verify a `workflow_dispatch` dry-run build from that branch instead of a release tag. Only honored together with `QUORO_INSTALL_FROM`, refused together with the insecure flag, and it prints a loud warning. Never use it for a real installation. |
 | `QUORO_INSTALL_INSECURE_SKIP_SIGNATURE=1` | Skip Sigstore verification. Only honored together with `QUORO_INSTALL_FROM`, prints a loud warning, and the sha256 check still runs. Never use it for a real installation. |
-| `QUORO_NO_START=1` | Install everything but do not start the units, and do not issue a setup token. On a node the enrollment still runs: it writes identity files and starts nothing. |
-| `QUORO_ROLE=primary\|node` | What this host runs. `primary` (the default) installs the control plane and its own node agent; `node` installs only the node agent and enrolls it with a primary. See [Roles](#roles). |
-| `QUORO_JOIN_URL` | Node only: the primary's HTTPS URL, for example `https://quoro.example.com:8443`. |
-| `QUORO_JOIN_TOKEN` | Node only: a join token from the primary. It is single use, expires, and the installer never prints it. |
-| `QUORO_JOIN_FINGERPRINT` | Node only: the primary's TLS fingerprint, `sha256:<hex>`. The installer prints it at the end of a primary install and it is in `journalctl -u quoro`. |
+| `QUORO_NO_START=1` | Install everything but do not start the units, and do not issue a setup token. On a node or an edge the enrollment still runs: it writes identity files and starts nothing. |
+| `QUORO_ROLE=primary\|node\|edge` | What this host runs. `primary` (the default) installs the control plane and its own node agent; `node` installs only the node agent and enrolls it with a primary; `edge` installs the node agent as an edge, which runs the proxy and the mesh and no microVM. The role is not remembered: pass it again on every re-run. See [Roles](#roles). |
+| `QUORO_JOIN_URL` | Node or edge: the primary's HTTPS URL, for example `https://quoro.example.com:8443`. Not needed on a host that is already enrolled. |
+| `QUORO_JOIN_TOKEN` | Node or edge: a join token from the primary. It is single use, expires, and the installer never prints it. Not needed on a host that is already enrolled. |
+| `QUORO_JOIN_FINGERPRINT` | Node or edge: the primary's TLS fingerprint, `sha256:<hex>`. The installer prints it at the end of a primary install and it is in `journalctl -u quoro`. Not needed on a host that is already enrolled. |
 
 Example, pinning a version:
 
@@ -63,10 +63,18 @@ curl -fsSL https://raw.githubusercontent.com/OmarAlex24/quoro/main/installer/ins
 - **`node`** runs only the node agent, `quoro-node.service`, as root. It runs
   the microVMs for one primary and serves no API and no panel. It belongs to
   exactly one primary and is enrolled during the install.
+- **`edge`** runs the same node agent with the edge role (ADR 0143): the
+  embedded reverse proxy that serves the cluster's app hostnames and checks the
+  health of their backends, and the hub of the cluster's WireGuard mesh
+  (ADR 0144). It starts no microVM, so it
+  needs no `/dev/kvm`, and it serves no API and no panel. Like a node, it
+  belongs to exactly one primary and is enrolled during the install with a join
+  token; the installer enrolls it with `--role edge`, which the agent keeps.
 
-A node install needs a join token. Create one on the primary, in the panel or
-with `POST /api/v1/nodes/join-tokens`, and pass it with the primary's URL and
-TLS fingerprint:
+A node or an edge install needs a join token. Create one on the primary, in the
+panel or with `POST /api/v1/nodes/join-tokens`, and pass it with the primary's
+URL and TLS fingerprint. The token is the same for both roles; `QUORO_ROLE`
+decides what the host becomes:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/OmarAlex24/quoro/main/installer/install.sh \
@@ -76,16 +84,33 @@ curl -fsSL https://raw.githubusercontent.com/OmarAlex24/quoro/main/installer/ins
          QUORO_JOIN_FINGERPRINT=sha256:<hex> sh
 ```
 
+For an edge, pass `QUORO_ROLE=edge` with the same three values:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/OmarAlex24/quoro/main/installer/install.sh \
+  | sudo QUORO_ROLE=edge \
+         QUORO_JOIN_URL=https://<primary>:8443 \
+         QUORO_JOIN_TOKEN=<token> \
+         QUORO_JOIN_FINGERPRINT=sha256:<hex> sh
+```
+
 The three values are checked before anything is written, so a missing one fails
 before the host is touched. A join token is single use and expires, so create a
 fresh one for every attempt. A host that is already enrolled needs no token:
-re-running the installer with `QUORO_ROLE=node` finds its identity and skips the
+re-running the installer with its role finds its identity and skips the
 enrollment.
 
-A node install refuses a host that already runs a control plane (it finds
-`/etc/systemd/system/quoro.service` or `/var/lib/quoro/quoro.db`): turning that
-host into a node would orphan the database, its key files and its panel. It stops
-without deleting anything; uninstall the control plane first.
+A node or an edge install refuses a host that already runs a control plane (it
+finds `/etc/systemd/system/quoro.service` or `/var/lib/quoro/quoro.db`): turning
+that host into a node or an edge would orphan the database, its key files and
+its panel. It stops without deleting anything; uninstall the control plane
+first.
+
+The mirror case is refused too. A primary install (the default role) on a host
+that is enrolled as a node or an edge and runs no control plane stops before
+writing anything and names the role to pass, `QUORO_ROLE=node` or
+`QUORO_ROLE=edge`: the installer does not remember a host's role, and a re-run
+without it would otherwise install a second control plane next to the agent.
 
 ## Giving the primary a stable address
 
@@ -293,8 +318,10 @@ terminal only; it is never written to a file. Get a fresh one any time with:
 sudo quoro setup-token
 ```
 
-On a node it prints the node id from `/var/lib/quoro-node/identity.json`; the
-node then shows as connected on the primary's Nodes page.
+On a node or an edge it prints the node id from
+`/var/lib/quoro-node/identity.json`; the host then shows as connected on the
+primary's Nodes page. On an upgrade it prints neither the setup token nor the
+first-run steps (see [Upgrading](#upgrading)).
 
 Back up the cluster key files under `/var/lib/quoro` separately from the
 database (ADR 0050): a database copy does not contain them, and losing the
@@ -348,6 +375,39 @@ Re-running the installer is safe:
   `journalctl -u <unit> -n 50` hint otherwise. On a primary `quoro.service`
   starts before `quoro-node.service`, because the control plane writes the join
   file its own agent enrolls with.
+
+## Upgrading
+
+Upgrade by re-running the installer with the version to install. Upgrade the
+primary first, then every node and edge of the cluster to the same version.
+
+On the primary (the default role):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/OmarAlex24/quoro/main/installer/install.sh \
+  | sudo QUORO_VERSION=<version> sh
+```
+
+On each node, pass `QUORO_ROLE=node` again, and on each edge `QUORO_ROLE=edge`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/OmarAlex24/quoro/main/installer/install.sh \
+  | sudo QUORO_ROLE=node QUORO_VERSION=<version> sh
+```
+
+The installer does not remember a host's role, so pass it on every run. A
+primary install on an enrolled node or edge is refused (see [Roles](#roles)).
+An enrolled host keeps its identity and its credential, so the upgrade needs no
+join token, URL or fingerprint. Without `QUORO_VERSION` the installer installs
+the latest release.
+
+The installer reads the version of the binary it replaces before it replaces
+it, and says what changed: `upgraded from 0.1.1 to 0.2.0`, or `reinstalled
+0.2.0 over the same version` for a re-run. On a primary whose cluster is already
+set up it then skips the setup token and the first-run steps and only names the
+next step, upgrading the nodes and edges. A primary that was never set up still
+gets a setup token. The rules in [Idempotency](#idempotency) apply: only the
+files that changed are replaced, and only the units they affect are restarted.
 
 ## Virtualisation and the engine
 

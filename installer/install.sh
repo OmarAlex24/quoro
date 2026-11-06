@@ -85,6 +85,8 @@ UNIT_CHANGED=0
 NODE_UNIT_CHANGED=0
 ENGINE_CHANGED=0
 INGRESS_CHANGED=0
+# The version of the quoro binary this run replaces; empty on a first install.
+PREVIOUS_VERSION=''
 
 # Where the node agent keeps its identity, local store and engine state. It is a
 # sibling of the control plane's data directory, never inside it, so the two can
@@ -157,6 +159,16 @@ check_node_join_credentials() {
 check_node_host_is_not_a_primary() {
     if [ -e /etc/systemd/system/quoro.service ] || [ -e /var/lib/quoro/quoro.db ]; then
         die 'this host runs a Quoro control plane (found /etc/systemd/system/quoro.service or /var/lib/quoro/quoro.db); installing it as a node or edge would orphan that data. Uninstall the control plane first, then install it with QUORO_ROLE=node or QUORO_ROLE=edge'
+    fi
+}
+
+# The mirror case: a node or an edge runs no control plane, and the role is not
+# remembered between runs. Re-running the installer there without QUORO_ROLE
+# would install and start a second control plane next to the agent, so refuse
+# and name the role to pass instead.
+check_primary_host_is_not_a_node() {
+    if node_is_enrolled && [ ! -e /etc/systemd/system/quoro.service ] && [ ! -e /var/lib/quoro/quoro.db ]; then
+        die "this host is enrolled as a node or an edge (found $NODE_DATA_DIR/identity.json) and runs no control plane; re-run the installer with the role it was installed with, QUORO_ROLE=node or QUORO_ROLE=edge"
     fi
 }
 
@@ -290,6 +302,7 @@ check_preconditions() {
 
     case $ROLE in
         primary)
+            check_primary_host_is_not_a_node
             # The control plane runs as this system user; useradd creates it.
             has_host_tool useradd || die 'useradd is missing; the primary needs it to create the quoro-api system user'
             ;;
@@ -1313,6 +1326,31 @@ start_services() {
 
 # --- Report -----------------------------------------------------------------
 
+# An install over an existing quoro binary is an upgrade (or a re-run of the
+# same version). Its version is read before the binary is replaced, so the
+# report can say what changed and skip the first-run steps.
+read_previous_version() {
+    _bin='/usr/local/bin/quoro'
+    [ -x "$_bin" ] || return 0
+    _out=''
+    if _out=$("$_bin" version 2>/dev/null) || _out=$("$_bin" --version 2>/dev/null); then
+        PREVIOUS_VERSION=${_out#quoro }
+        PREVIOUS_VERSION=${PREVIOUS_VERSION#v}
+    fi
+    if [ -z "$PREVIOUS_VERSION" ]; then
+        PREVIOUS_VERSION='an earlier version'
+    fi
+}
+
+# "upgraded from 0.1.1 to 0.2.0", or the same for a re-run of one version.
+describe_upgrade() {
+    if [ "$PREVIOUS_VERSION" = "$VERSION" ]; then
+        printf 'reinstalled %s over the same version' "$VERSION"
+    else
+        printf 'upgraded from %s to %s' "$PREVIOUS_VERSION" "$VERSION"
+    fi
+}
+
 print_installed_version() {
     _version_out=''
     if _version_out=$(/usr/local/bin/quoro version 2>/dev/null); then
@@ -1352,14 +1390,27 @@ print_fingerprint() {
 
 report_primary() {
     _token=''
+    _err="$WORK_DIR/setup-token.err"
     if [ "${QUORO_NO_START:-}" = '1' ]; then
+        if [ -n "$PREVIOUS_VERSION" ]; then
+            report_primary_upgrade "$(describe_upgrade); services not started"
+            return 0
+        fi
         log 'services not started, so no setup token was issued'
-    elif _token=$(/usr/local/bin/quoro setup-token 2>/dev/null); then
+    elif _token=$(/usr/local/bin/quoro setup-token 2>"$_err"); then
         if [ -n "$_token" ]; then
             printf '\nSetup token for the first-run /setup form:\n\n    %s\n\n' "$_token"
         else
             log 'warning: quoro setup-token printed nothing'
         fi
+    elif grep -q 'an owner already exists' "$_err" 2>/dev/null; then
+        # The cluster is set up: there is no token to issue and no first-run
+        # step to repeat.
+        if [ -n "$PREVIOUS_VERSION" ]; then
+            report_primary_upgrade "$(describe_upgrade); the cluster is already set up"
+            return 0
+        fi
+        log 'the cluster is already set up; no setup token is needed'
     else
         log 'warning: could not read a setup token; run "sudo quoro setup-token" yourself'
     fi
@@ -1394,12 +1445,35 @@ the data-encryption key loses every stored secret.
 EOF
 }
 
+# A primary upgraded over an earlier version: no setup token, no first-run
+# steps, only what an upgrade asks for next. $1 is the line to log.
+report_primary_upgrade() {
+    log "$1"
+    print_fingerprint
+    cat <<EOF
+Next steps
+
+  Upgrade every node and edge of this cluster to the same version: re-run the
+  installer on each host with its role and this version, for example
+
+      curl -fsSL https://raw.githubusercontent.com/OmarAlex24/quoro/main/installer/install.sh \\
+        | sudo QUORO_ROLE=node QUORO_VERSION=$VERSION sh
+
+  and QUORO_ROLE=edge on an edge. An enrolled host needs no join token. See
+  "Upgrading" in installer/README.md.
+EOF
+}
+
 report_node() {
     _node_id=$(node_id_from_identity)
     if [ -n "$_node_id" ]; then
         log "node id: $_node_id"
     else
         log "warning: could not read the node id from $NODE_DATA_DIR/identity.json"
+    fi
+    if [ -n "$PREVIOUS_VERSION" ]; then
+        report_agent_upgrade
+        return 0
     fi
 
     cat <<'EOF'
@@ -1424,6 +1498,10 @@ report_edge() {
     else
         log "warning: could not read the edge id from $NODE_DATA_DIR/identity.json"
     fi
+    if [ -n "$PREVIOUS_VERSION" ]; then
+        report_agent_upgrade
+        return 0
+    fi
 
     cat <<'EOF'
 Next steps
@@ -1434,6 +1512,22 @@ Next steps
   page.
 
   Read the agent's journal with:
+
+      journalctl -u quoro-node
+EOF
+}
+
+# A node or an edge that ran an earlier version: the agent kept its identity
+# and was restarted on the new binary.
+report_agent_upgrade() {
+    log "$(describe_upgrade)"
+    cat <<'EOF'
+Next steps
+
+  Nothing else to do on this host: it kept its enrollment, and the agent runs
+  the new version. Upgrade the primary first, then every node and edge to the
+  same version (see "Upgrading" in installer/README.md). Read the agent's
+  journal with:
 
       journalctl -u quoro-node
 EOF
@@ -1459,7 +1553,12 @@ main() {
     trap 'exit 130' INT
     trap 'exit 143' TERM
 
-    log "installing quoro $VERSION for $TARGET (role $ROLE)"
+    read_previous_version
+    if [ -n "$PREVIOUS_VERSION" ]; then
+        log "found quoro $PREVIOUS_VERSION; installing $VERSION for $TARGET (role $ROLE) over it"
+    else
+        log "installing quoro $VERSION for $TARGET (role $ROLE)"
+    fi
     fetch_artifacts
     verify_checksum
     verify_signature
