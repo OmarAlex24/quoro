@@ -83,6 +83,9 @@ pub enum FakeOp {
     SnapshotVolume,
     /// `inventory_cached_image` (M5a).
     InventoryCachedImage,
+    /// `list` (M5b): the whole listing fails, as when the real engine cannot
+    /// read one VM's state.
+    List,
 }
 
 /// A volume the fake holds (M5a). With a volume directory set
@@ -1150,6 +1153,9 @@ impl Engine for FakeEngine {
     }
 
     async fn list(&self) -> Result<Vec<VmInfo>, EngineError> {
+        if let Some(err) = self.take_failure(FakeOp::List) {
+            return Err(err);
+        }
         let mut infos: Vec<VmInfo> = self
             .lock()
             .vms
