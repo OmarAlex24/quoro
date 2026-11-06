@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Following the primary to an advertised address (section 5.10): when
 //! `primary_url` refuses a dial, the node tries `primary_urls` with the same
-//! pin and, once a session reaches `welcome`, persists that address.
+//! pin and, once a session reaches `welcome`, persists that address. A
+//! restarting primary that refuses for a moment is dialed again before the
+//! advertised addresses, and an advertised address that never answers costs a
+//! short timeout (section 4.4, issue #359).
 
 mod agent_common;
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use agent_common::{TempDir, facts};
 use futures_util::{SinkExt as _, StreamExt as _};
@@ -47,13 +51,15 @@ fn server_config(cert: CertificateDer<'static>, key: Vec<u8>) -> Arc<rustls::Ser
     Arc::new(config)
 }
 
-/// Serves the node session far enough to answer `hello` with `welcome`.
-async fn serve_welcome(listener: TcpListener, acceptor: TlsAcceptor) {
+/// Serves the node session far enough to answer `hello` with `welcome`, and
+/// counts the welcomes it sent in `welcomed`.
+async fn serve_welcome(listener: TcpListener, acceptor: TlsAcceptor, welcomed: Arc<AtomicUsize>) {
     loop {
         let Ok((tcp, _)) = listener.accept().await else {
             return;
         };
         let acceptor = acceptor.clone();
+        let welcomed = Arc::clone(&welcomed);
         tokio::spawn(async move {
             let Ok(stream) = acceptor.accept(tcp).await else {
                 return;
@@ -80,7 +86,9 @@ async fn serve_welcome(listener: TcpListener, acceptor: TlsAcceptor) {
                     })
                     .to_frame("msg_welcome", frame["id"].as_str())
                     .to_text();
-                    let _ = ws.send(Message::Text(welcome.into())).await;
+                    if ws.send(Message::Text(welcome.into())).await.is_ok() {
+                        welcomed.fetch_add(1, Ordering::SeqCst);
+                    }
                 }
             }
         });
@@ -93,6 +101,40 @@ fn closed_url() -> String {
     let port = probe.local_addr().expect("probe address").port();
     drop(probe);
     format!("https://127.0.0.1:{port}")
+}
+
+/// An address that accepts the TCP connection and never answers the TLS
+/// handshake, like an address of the primary that this node cannot really
+/// reach. Returns its URL and the count of connections it accepted.
+async fn silent_url() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let url = format!(
+        "https://127.0.0.1:{}",
+        listener.local_addr().unwrap().port()
+    );
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&accepted);
+    let task = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((tcp, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            held.push(tcp);
+        }
+    });
+    (url, accepted, task)
+}
+
+/// Waits until `done` holds, for at most `limit`, and returns how long it took.
+async fn within(limit: Duration, done: impl Fn() -> bool) -> Duration {
+    let started = Instant::now();
+    tokio::time::timeout(limit, async {
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("not done within {limit:?}"));
+    started.elapsed()
 }
 
 fn write_identity(
@@ -158,7 +200,11 @@ async fn a_reachable_advertised_address_becomes_the_primary() {
         "https://127.0.0.1:{}",
         listener.local_addr().unwrap().port()
     );
-    let primary = tokio::spawn(serve_welcome(listener, acceptor));
+    let primary = tokio::spawn(serve_welcome(
+        listener,
+        acceptor,
+        Arc::new(AtomicUsize::new(0)),
+    ));
 
     let closed = closed_url();
     let identity = write_identity(
@@ -208,7 +254,11 @@ async fn an_advertised_address_with_another_certificate_is_never_promoted() {
         "https://127.0.0.1:{}",
         listener.local_addr().unwrap().port()
     );
-    let primary = tokio::spawn(serve_welcome(listener, acceptor));
+    let primary = tokio::spawn(serve_welcome(
+        listener,
+        acceptor,
+        Arc::new(AtomicUsize::new(0)),
+    ));
 
     let closed = closed_url();
     let identity = write_identity(
@@ -220,9 +270,9 @@ async fn an_advertised_address_with_another_certificate_is_never_promoted() {
     );
     let (stop, running) = session(&dir, identity.clone()).await;
 
-    // Long enough for the first attempt (the closed port, then the wrong pin)
-    // and well inside the one-second redial backoff.
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    // Long enough for the first attempt: the closed port, dialed again while
+    // it refuses for two seconds, then the wrong pin.
+    tokio::time::sleep(Duration::from_millis(2_700)).await;
     let current = identity.get();
     assert_eq!(current.primary_url, closed, "the pin refused the host");
     assert_eq!(current.primary_urls, vec![other]);
@@ -230,4 +280,103 @@ async fn an_advertised_address_with_another_certificate_is_never_promoted() {
     let _ = stop.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(2), running).await;
     primary.abort();
+}
+
+#[tokio::test]
+async fn a_restarting_primary_is_dialed_again_before_the_other_addresses() {
+    let dir = TempDir::new();
+    let cluster = sign::signing_key_from_seed(&[6; 32]);
+    let (cert, key) = self_signed();
+    let pin = format!("sha256:{}", tls::cert_fingerprint(cert.as_ref()));
+    let acceptor = TlsAcceptor::from(server_config(cert, key));
+    // Nothing listens on the primary's port yet, so it refuses the
+    // connection, as a primary does while it restarts.
+    let primary_url = closed_url();
+    let port: u16 = primary_url.rsplit(':').next().unwrap().parse().unwrap();
+    let (silent, silent_accepted, silent_task) = silent_url().await;
+    let identity = write_identity(
+        dir.path(),
+        &cluster,
+        &primary_url,
+        &pin,
+        std::slice::from_ref(&silent),
+    );
+    let started = Instant::now();
+    let (stop, running) = session(&dir, identity.clone()).await;
+
+    // The listener comes back 300 ms later.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+    let welcomed = Arc::new(AtomicUsize::new(0));
+    let primary = tokio::spawn(serve_welcome(listener, acceptor, Arc::clone(&welcomed)));
+
+    within(Duration::from_secs(20), || {
+        welcomed.load(Ordering::SeqCst) > 0
+    })
+    .await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the node reconnected {elapsed:?} after the restart began"
+    );
+    assert_eq!(
+        silent_accepted.load(Ordering::SeqCst),
+        0,
+        "the address that does not answer was never dialed"
+    );
+    assert_eq!(identity.get().primary_url, primary_url);
+
+    let _ = stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), running).await;
+    primary.abort();
+    silent_task.abort();
+}
+
+#[tokio::test]
+async fn an_advertised_address_that_never_answers_costs_a_short_timeout() {
+    let dir = TempDir::new();
+    let cluster = sign::signing_key_from_seed(&[7; 32]);
+    let (cert, key) = self_signed();
+    let pin = format!("sha256:{}", tls::cert_fingerprint(cert.as_ref()));
+    let acceptor = TlsAcceptor::from(server_config(cert, key));
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let reachable = format!(
+        "https://127.0.0.1:{}",
+        listener.local_addr().unwrap().port()
+    );
+    let primary = tokio::spawn(serve_welcome(
+        listener,
+        acceptor,
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    let (silent, silent_accepted, silent_task) = silent_url().await;
+
+    // `primary_url` refuses for good; the first advertised address never
+    // answers, the second is the primary.
+    let closed = closed_url();
+    let identity = write_identity(
+        dir.path(),
+        &cluster,
+        &closed,
+        &pin,
+        &[silent.clone(), reachable.clone()],
+    );
+    let (stop, running) = session(&dir, identity.clone()).await;
+
+    // Two seconds of redialing the refusing address, then two seconds on
+    // the silent one, instead of the full ten-second connect timeout.
+    let elapsed = within(Duration::from_secs(20), || {
+        identity.get().primary_url == reachable
+    })
+    .await;
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "the reachable address was promoted after {elapsed:?}"
+    );
+    assert_eq!(silent_accepted.load(Ordering::SeqCst), 1);
+
+    let _ = stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), running).await;
+    primary.abort();
+    silent_task.abort();
 }
