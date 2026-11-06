@@ -334,6 +334,22 @@ components:
       schema:
         type: string
         pattern: '^vol_[0-9A-HJKMNP-TV-Z]{26}$'
+    QuarantineId:
+      name: quarantine_id
+      in: path
+      required: true
+      description: Quarantined copy id (`qrn_...`).
+      schema:
+        type: string
+        pattern: '^qrn_[0-9A-HJKMNP-TV-Z]{26}$'
+    LostNodeId:
+      name: lost_node_id
+      in: query
+      required: true
+      description: The node whose loss the N+1 indicator simulates (`nod_...`).
+      schema:
+        type: string
+        pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
     BackupId:
       name: backup_id
       in: path
@@ -499,8 +515,10 @@ components:
       description: |
         RFC 9457 problem detail with Quoro's extra fields. The media type is
         `application/problem+json`. `code` is the machine-readable error; `reason`
-        refines `forbidden`, and `scope` plus `target` refine `approval_required`
-        so an agent can file the matching approval request (D-0030).
+        refines `forbidden` and, from M5b, the `conflict` of a failover, a
+        switchover or a delete that would remove quarantined data; `scope` plus
+        `target` refine `approval_required` so an agent can file the matching
+        approval request (D-0030).
       required:
         - type
         - title
@@ -543,7 +561,15 @@ components:
             - internal
         reason:
           type: string
-          description: Why a `forbidden` response was returned. Absent for other codes.
+          description: |
+            Why a `forbidden` response was returned: `scope_missing`,
+            `selector_mismatch`, `grant_expired`, `grant_revoked`,
+            `grant_exhausted`, `human_only` or `agent_disabled`. From M5b also
+            why a `conflict` was returned by `failoverApp` or `switchoverApp`
+            (`not_warm`, `no_copy`, `not_in_sync`, `node_disconnected`,
+            `fence_failed`, `no_support`, `lease_held`, `in_progress`; each
+            operation says when) or by `deleteApp` and `deleteVolume`
+            (`has_quarantines`). Absent for other codes and other conflicts.
           enum:
             - scope_missing
             - selector_mismatch
@@ -552,6 +578,15 @@ components:
             - grant_exhausted
             - human_only
             - agent_disabled
+            - not_warm
+            - no_copy
+            - not_in_sync
+            - node_disconnected
+            - fence_failed
+            - no_support
+            - lease_held
+            - in_progress
+            - has_quarantines
         scope:
           type: string
           description: |
@@ -1398,7 +1433,9 @@ components:
             - stopped
         observed_status:
           type: string
-          description: Status the node last reported.
+          description: |
+            Status the node last reported; `unknown` while its node is not
+            connected (node-agent-protocol.md section 5.3).
           enum:
             - creating
             - stopped
@@ -1579,7 +1616,7 @@ components:
         A deployable service. It runs as one microVM per instance (D-0008); in
         M1-M4 an app has one instance, and from M5a a stateless app runs
         `replicas` instances, one per node (ADR 0142). `ha_policy` exists from M0; M5a accepts
-        `none` and `cold` (ADR 0020, ADR 0147). An app either deploys images
+        `none` and `cold` (ADR 0020, ADR 0147), and M5b `warm` (ADR 0174). An app either deploys images
         given by reference (`source` null) or builds them from a Git source
         (ADR 0117). An app is stateful exactly when it has a volume (ADR 0145).
       required:
@@ -1624,8 +1661,9 @@ components:
           description: |
             HA policy. M5a accepts `none` and `cold`; `cold` only for a stateful
             app while the cluster has a backup repository, and it runs the app's
-            `backup_schedule` (ADR 0147). `warm` and `hot` return
-            `validation_failed` until M5b and M6 (ADR 0020).
+            `backup_schedule` (ADR 0147). M5b accepts `warm` for a stateful app
+            that a second node can hold a copy of (`warm`, ADR 0174). `hot`
+            returns `validation_failed` until M6 (ADR 0020).
           enum:
             - none
             - cold
@@ -1658,6 +1696,14 @@ components:
             on a primary older than M5b.
           oneOf:
             - $ref: '#/components/schemas/Lease'
+            - type: 'null'
+        warm:
+          description: |
+            From M5b: the app's warm copy (ADR 0173, ADR 0174), on every read
+            of the app. Null when `ha_policy` is not `warm`; absent on a primary
+            older than M5b.
+          oneOf:
+            - $ref: '#/components/schemas/WarmCopy'
             - type: 'null'
         image:
           type: string
@@ -1709,6 +1755,116 @@ components:
           type: string
           format: date-time
           description: When the app record last changed.
+    WarmCopy:
+      type: object
+      title: WarmCopy
+      description: |
+        The warm copy of a `warm` app: a second copy of its volume on another
+        node, its warm node, which the node holding the app's lease (the
+        source) updates every `interval_s` (ADR 0172, ADR 0173). The warm node
+        also holds the app's prepared image and starts nothing until a
+        failover or a switchover grants it the lease (ADR 0174). The progress
+        fields are the primary's in-memory view of the two nodes' newest
+        reports (node-agent-protocol.md sections 5.3 and 6.13), never stored,
+        so they are null after a primary restart until the nodes report again.
+      required:
+        - node_id
+        - node_pinned
+        - interval_s
+        - state
+        - last_snapshot_seq
+        - last_shipped_at
+        - lag_s
+        - extent_count
+        - error
+      properties:
+        node_id:
+          type: [string, 'null']
+          pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: |
+            The warm node. The scheduler picks it among the nodes the app may
+            run on unless an operator pinned it (`UpdateAppRequest.warm`).
+            Eligible: a connected node with the `node` role, in
+            `placement.node_ids` when that is not empty, other than the node of
+            the app's volume, that snapshots with `reflink` (ADR 0172) and that
+            the source can reach over the mesh (two nodes both behind NAT
+            cannot pair). After a failover it is the old source, which becomes
+            the warm copy when it returns (ADR 0176). Null while no node is
+            eligible; `state` is then `failed`.
+        node_pinned:
+          type: boolean
+          description: Whether an operator chose `node_id` rather than the scheduler.
+        interval_s:
+          type: integer
+          minimum: 5
+          maximum: 3600
+          description: |
+            Seconds between two snapshots on the source; 30 unless changed
+            (ADR 0173, measured in `docs/research/m5b-warm-and-leases.md`).
+        state:
+          type: string
+          description: |
+            `syncing` until the warm node holds a first complete copy (also
+            during the full copy to a new warm node and the resync of a
+            returning source); `in_sync` while `lag_s` is at most twice
+            `interval_s`; `lagging` above that; `failed` while either node
+            reports an error, is not connected, or no node is eligible
+            (`error` says why). A switchover needs `in_sync` (ADR 0177).
+          enum:
+            - syncing
+            - in_sync
+            - lagging
+            - failed
+        last_snapshot_seq:
+          type: [integer, 'null']
+          minimum: 1
+          description: |
+            The newest complete copy on the warm node, the last shipped
+            snapshot; null before the first one, and after a primary restart
+            until the warm node reported again.
+        last_shipped_at:
+          type: [string, 'null']
+          format: date-time
+          description: When the warm node completed that copy.
+        lag_s:
+          type: [integer, 'null']
+          minimum: 0
+          description: |
+            Seconds since the source took the snapshot of that copy, on the
+            primary's clock: how much recent data a failover now would not
+            have. Null when `last_snapshot_seq` is.
+        extent_count:
+          type: [integer, 'null']
+          minimum: 0
+          description: |
+            Extents of the source's newest snapshot, as reported. A diff costs
+            time in proportion to it, so a heavily fragmented volume ships
+            more slowly.
+        error:
+          type: [string, 'null']
+          maxLength: 500
+          description: Why `state` is `failed`, or null.
+    WarmSettings:
+      type: object
+      title: WarmSettings
+      description: |
+        Settings of an app's warm copy (ADR 0174). Accepted only when the
+        app's `ha_policy` is `warm` or becomes `warm` in the same request
+        (`validation_failed` otherwise). Absent fields stay unchanged.
+      properties:
+        node_id:
+          type: [string, 'null']
+          pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: |
+            Pins the warm node; null lets the scheduler pick. A node that is
+            not eligible (`WarmCopy.node_id`) answers `validation_failed`. A
+            new warm node receives a full copy, and the copy on the previous
+            one is deleted.
+        interval_s:
+          type: integer
+          minimum: 5
+          maximum: 3600
+          description: Seconds between two snapshots on the source.
     AppDetail:
       type: object
       title: AppDetail
@@ -1843,8 +1999,9 @@ components:
           type: string
           default: none
           description: |
-            HA policy. Only `none` at creation: `cold` needs a volume, which is
-            created after the app (ADR 0145). Others answer `validation_failed`.
+            HA policy. Only `none` at creation: `cold` and `warm` need a
+            volume, which is created after the app (ADR 0145). Others answer
+            `validation_failed`.
           enum:
             - none
             - cold
@@ -1893,15 +2050,19 @@ components:
         ha_policy:
           type: string
           description: |
-            HA policy. `none` or `cold`; `cold` only for a stateful app while
-            the cluster has a backup repository, otherwise `conflict` (409).
-            `warm` and `hot` answer `validation_failed` until M5b and M6
-            (ADR 0020).
+            HA policy. `none`, `cold` or `warm`; `cold` only for a stateful app
+            while the cluster has a backup repository, otherwise `conflict`
+            (409). `warm` only for an app with a volume whose node snapshots
+            with `reflink` and while another node is eligible as its warm node
+            (`WarmCopy.node_id`), otherwise `validation_failed` (ADR 0172,
+            ADR 0174). `hot` answers `validation_failed` until M6 (ADR 0020).
           enum:
             - none
             - cold
             - warm
             - hot
+        warm:
+          $ref: '#/components/schemas/WarmSettings'
         backup_schedule:
           $ref: '#/components/schemas/BackupSchedule'
         replicas:
@@ -2568,9 +2729,12 @@ components:
       description: |
         Local persistent disk of a stateful app: a sparse file on one node's
         data disk, attached to the app's microVM as a virtio-blk device and
-        mounted by the guest init at `mount_path` (ADR 0145). It is not
-        replicated: its data lives on that node and in its backups. In M5a an
-        app has at most one volume in `creating`, `ready` or `restoring`.
+        mounted by the guest init at `mount_path` (ADR 0145). Its data lives
+        on that node and in its backups; from M5b the volume of a `warm` app
+        also has a copy on the warm node (`App.warm`, ADR 0173), and a node
+        that lost the app's lease may keep its divergent writes as
+        quarantined copies (ADR 0176). In M5a an app has at most one volume
+        in `creating`, `ready` or `restoring`.
       required:
         - id
         - app_id
@@ -2578,6 +2742,7 @@ components:
         - size_gb
         - mount_path
         - state
+        - quarantines
         - created_at
         - updated_at
       properties:
@@ -2594,7 +2759,9 @@ components:
         node_id:
           type: string
           pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
-          description: Node holding the data.
+          description: |
+            Node holding the data. For a `warm` app, the node that holds the
+            app's lease (the source); a failover or a switchover changes it.
         size_gb:
           type: integer
           minimum: 1
@@ -2633,6 +2800,14 @@ components:
           type: [string, 'null']
           maxLength: 2000
           description: One-line reason, in `failed`.
+        quarantines:
+          type: array
+          description: |
+            From M5b: the quarantined copies of this volume, oldest first;
+            empty when there is none. Nothing deletes one automatically
+            (ADR 0176).
+          items:
+            $ref: '#/components/schemas/VolumeQuarantine'
         created_at:
           type: string
           format: date-time
@@ -2641,6 +2816,52 @@ components:
           type: string
           format: date-time
           description: When the volume record last changed.
+    VolumeQuarantine:
+      type: object
+      title: VolumeQuarantine
+      description: |
+        A quarantined copy of a volume: the live file of a node that ran the
+        app and lost its lease to a failover, kept as a reflink clone on that
+        node's disk because it may hold writes the new source does not have
+        (ADR 0176, node-agent-protocol.md section 9). Quoro offers no
+        operation to read or restore it in M5b; someone with root on the node
+        can copy it out. Only `deleteVolumeQuarantine` removes it.
+      required:
+        - id
+        - node_id
+        - size_bytes
+        - sha256
+        - state
+        - created_at
+      properties:
+        id:
+          type: string
+          pattern: '^qrn_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: Quarantined copy id.
+        node_id:
+          type: string
+          pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: The node whose disk holds the copy.
+        size_bytes:
+          type: integer
+          minimum: 0
+          description: Bytes the copy uses on that node's disk.
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: SHA-256 of the copy's content, as the node computed it.
+        state:
+          type: string
+          description: |
+            `kept`, or `deleting` after `deleteVolumeQuarantine` until the
+            node no longer reports the copy; the record is then dropped.
+          enum:
+            - kept
+            - deleting
+        created_at:
+          type: string
+          format: date-time
+          description: When the node took the copy.
     BackupSchedule:
       type: object
       title: BackupSchedule
@@ -2694,8 +2915,12 @@ components:
       description: |
         What one HA policy costs this app (ADR 0020). The primary computes it
         from data it already holds: the app's resources and volume, the
-        snapshot method of the volume's node (ADR 0146) and the manifests of the
-        app's backups (ADR 0147). These are estimates, not reservations.
+        snapshot method of the volume's node (ADR 0146), the manifests of the
+        app's backups (ADR 0147) and, from M5b, the warm node's reports. These
+        are estimates, not reservations. For `warm`, `reserved` is disk only:
+        the volume's size plus the app's root disk on the warm node; memory
+        and vCPUs are needed there only after a failover (ADR 0174), which the
+        N+1 indicator checks (`getClusterCapacity`).
       required:
         - policy
         - available
@@ -2717,14 +2942,18 @@ components:
           description: Whether the app may switch to this policy now.
         unavailable_reason:
           description: |
-            Why `available` is false, or null: `stateless` (`cold` needs a
-            volume), `no_repository` (`cold` needs a backup repository) or
-            `not_in_this_release` (`warm` before M5b, `hot` before M6).
+            Why `available` is false, or null: `stateless` (`cold` and `warm`
+            need a volume), `no_repository` (`cold` needs a backup repository),
+            `no_warm_node` (`warm` needs a volume node that snapshots with
+            `reflink` and another eligible node, `WarmCopy.node_id`) or
+            `not_in_this_release` (`hot` before M6; `warm` on a primary older
+            than M5b).
           oneOf:
             - type: string
               enum:
                 - stateless
                 - no_repository
+                - no_warm_node
                 - not_in_this_release
             - type: 'null'
         reserved:
@@ -2733,17 +2962,23 @@ components:
           type: [integer, 'null']
           minimum: 0
           description: |
-            Bytes this policy keeps in object storage. For `cold`, the stored
-            size of the app's kept backups, from their manifests; before the
-            first backup, the volume's allocated bytes as an estimate. 0 for
-            `none`; null when not computed (`warm`, `hot`).
+            Bytes this policy keeps outside the app's node. For `cold`, in
+            object storage: the stored size of the app's kept backups, from
+            their manifests; before the first backup, the volume's allocated
+            bytes as an estimate. For `warm`, on the warm node's disk: the
+            allocated bytes of its copy as last reported, or the volume's
+            allocated bytes as an estimate before that. 0 for `none`; null
+            when not computed (`hot`).
         restore_estimate_s:
           type: [integer, 'null']
           minimum: 0
           description: |
             For `cold`, seconds to restore the latest backup: its stored bytes
             divided by the download rate the primary measured on earlier
-            restores, or the configured default rate before the first one. Null
+            restores, or the configured default rate before the first one. For
+            `warm`, seconds to start the warm copy: the time the app's last
+            start took, from the primary's request to the node reporting the
+            VM running, or 10 before the primary observed one (ADR 0174). Null
             for every other policy.
         pause_estimate_ms:
           type: [integer, 'null']
@@ -2752,8 +2987,9 @@ components:
             For `cold`, how long each backup pauses the app: 0 when the volume's
             node snapshots with `reflink`; on `pause_copy`, the pause the last
             backup measured, or the volume's allocated bytes divided by the
-            node's measured copy rate before the first one (ADR 0146). Null for
-            every other policy.
+            node's measured copy rate before the first one (ADR 0146). For
+            `warm`, 0: a warm volume is only snapshotted with `reflink`
+            (ADR 0172). Null for every other policy.
     AppHaCost:
       type: object
       title: AppHaCost
@@ -3345,6 +3581,147 @@ components:
         next_cursor:
           type: [string, 'null']
           description: Cursor for the next page, or null on the last page.
+    FailoverAppRequest:
+      type: object
+      title: FailoverAppRequest
+      description: The node to start the warm copy on.
+      required:
+        - node_id
+      properties:
+        node_id:
+          type: string
+          pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: The app's warm node, `App.warm.node_id`.
+    SwitchoverAppRequest:
+      type: object
+      title: SwitchoverAppRequest
+      description: The node to move the app to.
+      required:
+        - node_id
+      properties:
+        node_id:
+          type: string
+          pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: The app's warm node, `App.warm.node_id`.
+    ClusterCapacity:
+      type: object
+      title: ClusterCapacity
+      description: |
+        The N+1 indicator: whether the apps of one node would fit on the
+        others if that node were lost, or which resources are missing
+        (ADR 0021, ADR 0178). The primary simulates the loss with the
+        allocation it holds now; nothing is reserved.
+      required:
+        - lost_node_id
+        - fits
+        - missing
+        - apps
+        - computed_at
+      properties:
+        lost_node_id:
+          type: string
+          pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: The node whose loss was simulated.
+        fits:
+          type: boolean
+          description: |
+            Whether every listed app that needs a node got one, that is no app
+            has `reason` `no_capacity`. An app that cannot move for another
+            reason (`no_backup`, `no_warm_copy`) is listed with that reason and
+            does not make `fits` false: more capacity would not help it.
+        missing:
+          $ref: '#/components/schemas/CapacityShortfall'
+        apps:
+          type: array
+          description: |
+            One entry per app with an instance meant to run on the lost node,
+            or whose volume is there; in placement order.
+          items:
+            $ref: '#/components/schemas/ClusterCapacityApp'
+        computed_at:
+          type: string
+          format: date-time
+          description: When the primary computed the answer.
+    CapacityShortfall:
+      type: object
+      title: CapacityShortfall
+      description: |
+        The resources of the apps left without a node for lack of capacity,
+        summed; all zero when `fits` is true.
+      required:
+        - cpus
+        - memory_mb
+        - disk_gb
+      properties:
+        cpus:
+          type: integer
+          minimum: 0
+          description: vCPUs.
+        memory_mb:
+          type: integer
+          minimum: 0
+          description: Memory in mebibytes.
+        disk_gb:
+          type: integer
+          minimum: 0
+          description: Disk in gibibytes.
+    ClusterCapacityApp:
+      type: object
+      title: ClusterCapacityApp
+      description: What one app of the lost node would need.
+      required:
+        - app_id
+        - policy
+        - action
+        - node_id
+        - reason
+      properties:
+        app_id:
+          type: string
+          pattern: '^app_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: The app.
+        policy:
+          type: string
+          description: The app's `ha_policy`.
+          enum:
+            - none
+            - cold
+            - warm
+            - hot
+        action:
+          type: string
+          description: |
+            `keep`: a stateless app that still has an instance on another
+            node; it only loses one replica. `start`: a stateless app whose
+            only instance was on the lost node; it needs a new one on
+            `node_id`. `failover`: a `warm` app whose source is the lost node;
+            its warm copy starts on its warm node, which already holds the
+            disk, so it needs memory and vCPUs there. `restore`: a stateful
+            `none` or `cold` app; its latest backup is restored on `node_id`.
+          enum:
+            - keep
+            - start
+            - failover
+            - restore
+        node_id:
+          type: [string, 'null']
+          pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: |
+            Where the app would go; the node it keeps running on for `keep`.
+            Null when it gets no node.
+        reason:
+          description: |
+            Why `node_id` is null: `no_capacity` (no remaining node has room),
+            `no_backup` (a stateful app with no succeeded backup: its data is
+            only on the lost node) or `no_warm_copy` (the warm node holds no
+            complete copy). Null otherwise.
+          oneOf:
+            - type: string
+              enum:
+                - no_capacity
+                - no_backup
+                - no_warm_copy
+            - type: 'null'
     RestoreBackupRequest:
       type: object
       title: RestoreBackupRequest
@@ -4102,6 +4479,8 @@ components:
         - app:delete
         - app:logs
         - app:terminal
+        - app:failover
+        - app:delete_quarantine
         - backup:read
         - backup:write
         - backup:restore
@@ -4577,6 +4956,9 @@ components:
         - app.up
         - app.restarted
         - app.vulnerable
+        - app.failed_over
+        - app.switched_over
+        - app.switchover_failed
         - deployment.started
         - deployment.succeeded
         - deployment.failed
@@ -4588,6 +4970,7 @@ components:
         - backup.failed
         - restore.succeeded
         - restore.failed
+        - volume.quarantined
         - certificate.issued
         - certificate.expiring
         - certificate.failed
@@ -5937,6 +6320,50 @@ paths:
           $ref: '#/components/responses/NotPrimary'
         '429':
           $ref: '#/components/responses/RateLimited'
+  /api/v1/cluster/capacity:
+    get:
+      tags: [cluster]
+      operationId: getClusterCapacity
+      summary: Simulate the loss of a node (the N+1 indicator)
+      description: |
+        Answers "if this node is lost, do its apps fit on the others?" with
+        yes, or with no plus the missing resources (ADR 0021, ADR 0178). The
+        primary takes the apps with an instance meant to run on
+        `lost_node_id` or a volume there: a stateless app that keeps another
+        instance loses one replica and needs nothing; a stateless app whose
+        only instance was there needs a new one; a `warm` app whose source is
+        there starts on its warm node; a stateful `none` or `cold` app needs a
+        restore of its latest backup. It places them greedily, by memory, then
+        vCPUs, then disk, largest first, against each remaining connected
+        node with the `node` role: its capacity minus what is allocated,
+        within the app's `placement.node_ids`. A warm app can go only to its
+        warm node. Nothing is reserved and no event is emitted. The panel's
+        HA view shows the answer. The MCP tool `get_capacity` under the same
+        scope (ADR 0178) is added with the implementation. `404` when the
+        node does not exist or was removed.
+      x-quoro-scope: cluster:read
+      parameters:
+        - $ref: '#/components/parameters/LostNodeId'
+      responses:
+        '200':
+          description: The simulated loss.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClusterCapacity'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '429':
+          $ref: '#/components/responses/RateLimited'
   /api/v1/nodes:
     get:
       tags: [nodes]
@@ -6011,7 +6438,10 @@ paths:
         required when the caller is an agent (D-0031). From M5b removing a voter
         changes the voter set, so it is also refused with `conflict` while the
         previous voter-set change has not reached a majority of voters
-        (node-agent-protocol.md section 8.10).
+        (node-agent-protocol.md section 8.10). From M5b removing a node also
+        drops the records of the quarantined copies it keeps
+        (`Volume.quarantines`, ADR 0176); the files stay on the machine's
+        disk, like the rest of its data, and Quoro no longer tracks them.
       x-quoro-scope: node:remove
       parameters:
         - $ref: '#/components/parameters/NodeId'
@@ -6897,8 +7327,15 @@ paths:
       description: |
         Changes settings, not the image: a new image is rolled out as a deployment.
         `ha_policy: cold` needs a stateful app and a backup repository
-        (`conflict`, 409, otherwise); `warm` and `hot` are refused with
-        `validation_failed` until M5b and M6 (ADR 0020). A new `replicas`
+        (`conflict`, 409, otherwise). `ha_policy: warm` needs a volume on a
+        node that snapshots with `reflink` and an eligible warm node
+        (`validation_failed` otherwise); it starts the copy to the warm node,
+        prepares the app's image there, moves the app's domains to the edge
+        when the cluster has one, and turns the app's lease `expiring` as soon
+        as the primary holds the support of a majority of voters
+        (node-agent-protocol.md sections 6.13 and 8.4). Leaving `warm` deletes
+        the warm copy and turns the lease `local` again. `hot` is refused with
+        `validation_failed` until M6 (ADR 0020). A new `replicas`
         adds or removes instances without a deployment; it is refused with
         `validation_failed` above the eligible nodes, and with `conflict` above
         1 for a stateful app, for an app with a Git source, or while no
@@ -6953,7 +7390,11 @@ paths:
         then the volume stays readable with `getVolume`; it is no longer listed
         under the app, which is gone. Its backups stay in the repository and in
         the backup list; in M5a no operation restores or deletes them once the
-        app is gone (`backup-format.md` section 9). Deletion is
+        app is gone (`backup-format.md` section 9). From M5b the call is
+        refused with `conflict` and `reason: has_quarantines` while a volume
+        of the app keeps a quarantined copy (ADR 0176): a human deletes those
+        first (`deleteVolumeQuarantine`), so an approved agent never deletes
+        divergent writes nobody looked at. Deletion is
         destructive and off by default for agents: without an approval grant the
         call is refused with `approval_required`, and a human approves the filed
         request (D-0030). Exposed as the MCP tool `delete_app` (D-0033); the tool
@@ -6981,6 +7422,8 @@ paths:
           $ref: '#/components/responses/ApprovalRequired'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '429':
           $ref: '#/components/responses/RateLimited'
         '503':
@@ -7128,6 +7571,153 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/NotPrimary'
+  /api/v1/apps/{app_id}/failover:
+    post:
+      tags: [apps]
+      operationId: failoverApp
+      summary: Start a warm app's copy on its warm node
+      description: |
+        Starts the warm copy of a `warm` app on its warm node, for when the
+        node that holds the app's lease is lost (ADR 0175). `node_id` must be
+        `App.warm.node_id` (`validation_failed` otherwise). The primary moves
+        the lease only when the old holder can no longer run the app, so two
+        copies never write at once (ADR 0019). Refused with `conflict` and
+        `reason`:
+        - `not_warm`: the app's `ha_policy` is not `warm`;
+        - `in_progress`: a failover or switchover of the app is running;
+        - `no_copy`: as far as the primary knows, the warm node holds no
+          complete copy;
+        - `node_disconnected`: the warm node is not connected;
+        - `fence_failed`: the lease or the warm node has a failed fence that
+          no operator acknowledged (node-agent-protocol.md section 8.5);
+        - `no_support`: the primary does not hold the support of a majority
+          of voters, so it cannot grant an `expiring` lease (section 8.8);
+        - `lease_held`: the source is not connected and may still hold the
+          lease: the lease's gate (`App.lease.gate_at`, section 8.4) has not
+          passed and no fence of it was confirmed. A lease that is still
+          `local` (section 8.4, "Changing the mode") is held until the node is
+          declared lost (`declareNodeLost`).
+
+        When the source is connected, the primary first revokes its lease
+        over the session and goes on once the revoke is answered; that loses
+        the writes made since the last shipped snapshot, which a planned
+        switchover (`switchoverApp`) does not. Then, in one change, it grants
+        the warm node an `expiring` lease with a higher fencing token, turns
+        the standby VM there `running` on the last shipped snapshot, moves the
+        app's volume and domains to that node (the edge's backend, or without
+        an edge the tunnel route with the grace window of ADR 0168), makes the
+        old source the app's warm node, and emits `app.failed_over`. The call
+        answers `202` with the app once the lease moved; the instance starts
+        asynchronously. The old source's lease is revoked when it reconnects;
+        it keeps its divergent writes as a quarantined copy and becomes the
+        warm copy (node-agent-protocol.md section 9). Destructive and off by
+        default for agents: without an approval grant on `{type: app, id}`
+        with `node_id` in `params` the call is refused with
+        `approval_required` (ADR 0030). Automatic failover is M6.
+        `Quoro-Justification` is required when the caller is an agent
+        (ADR 0031).
+      x-quoro-scope: app:failover
+      parameters:
+        - $ref: '#/components/parameters/AppId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/QuoroJustification'
+        - $ref: '#/components/parameters/QuoroIncident'
+      requestBody:
+        required: true
+        description: The warm node to start the app on.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FailoverAppRequest'
+      responses:
+        '202':
+          description: The lease moved to the warm node; the app starts there.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/App'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/ApprovalRequired'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/NotPrimary'
+  /api/v1/apps/{app_id}/switchover:
+    post:
+      tags: [apps]
+      operationId: switchoverApp
+      summary: Move a warm app to its warm node with no data loss
+      description: |
+        A planned switchover (ADR 0022, ADR 0177): moves a `warm` app to its
+        warm node, `node_id`, which must be `App.warm.node_id`
+        (`validation_failed` otherwise). It runs as soon as it is asked;
+        choosing a low-traffic window is the caller's in M5b. The primary
+        pauses the app on its node (the write freeze), ships a final snapshot,
+        stops the app and revokes its lease, grants the warm node the lease
+        with a higher token, starts the app there and switches the edge's
+        backend while the old backend's requests finish
+        (node-agent-protocol.md section 6.13). The app does not serve from
+        the freeze until the new instance runs, typically a few seconds.
+        Refused with `conflict` and `reason`: `not_warm`; `in_progress`;
+        `not_in_sync` unless `App.warm.state` is `in_sync`, a lag of at most
+        two intervals; `node_disconnected` unless both nodes are connected;
+        `fence_failed`; `no_support`. The call answers `202` with the app
+        when the switchover started. It ends with `app.switched_over`, the old
+        node becoming the warm copy with no quarantine, or, when a step before
+        the revoke failed, with `app.switchover_failed`: the app resumed on
+        its node and nothing moved. Destructive and off by default for agents,
+        under the same scope as `failoverApp`: without an approval grant on
+        `{type: app, id}` with `node_id` in `params` the call is refused with
+        `approval_required` (ADR 0030). `Quoro-Justification` is required when
+        the caller is an agent (ADR 0031).
+      x-quoro-scope: app:failover
+      parameters:
+        - $ref: '#/components/parameters/AppId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/QuoroJustification'
+        - $ref: '#/components/parameters/QuoroIncident'
+      requestBody:
+        required: true
+        description: The warm node to move the app to.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SwitchoverAppRequest'
+      responses:
+        '202':
+          description: The switchover started.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/App'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/ApprovalRequired'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
         '429':
           $ref: '#/components/responses/RateLimited'
         '503':
@@ -9626,7 +10216,10 @@ paths:
         `{type: volume, id}` the call is refused with `approval_required`, and
         a human approves the filed request (ADR 0030). `conflict` (409) while
         the app's desired status is running, unless the volume is `detached`
-        or `failed`: stop the app first. Deleting the app's attached volume makes the app
+        or `failed`: stop the app first. From M5b also `conflict` with
+        `reason: has_quarantines` while the volume keeps a quarantined copy
+        (ADR 0176): a human deletes those first (`deleteVolumeQuarantine`).
+        Deleting the volume of a `warm` app deletes the warm copy too. Deleting the app's attached volume makes the app
         stateless once the node confirms: its `local` lease is released and
         its placement is no longer pinned. `Quoro-Justification` is required
         when the caller is an agent (ADR 0031).
@@ -9653,6 +10246,48 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/NotPrimary'
+  /api/v1/volumes/{volume_id}/quarantines/{quarantine_id}:
+    delete:
+      tags: [volumes]
+      operationId: deleteVolumeQuarantine
+      summary: Delete a quarantined copy of a volume
+      description: |
+        Deletes a quarantined copy: the divergent writes a node kept after it
+        lost the app's lease to a failover (ADR 0176, node-agent-protocol.md
+        section 9). Those writes are not in the app's current data; once the
+        copy is deleted they are gone. The copy turns `deleting`, its node
+        removes the file (`spec.quarantine_deletes`), and the record is
+        dropped once the node no longer reports it. A copy on a node that
+        never reconnects stays `deleting` until the node is removed
+        (`removeNode`), which drops the records of every copy the node keeps.
+        Nothing else deletes a quarantined copy. Destructive and human-only, so no agent can delete
+        one, even with an approval: an agent is refused with `forbidden` and
+        `reason: human_only`. A copy already `deleting` answers `202` again.
+        The call is audited (ADR 0031).
+      x-quoro-scope: app:delete_quarantine
+      parameters:
+        - $ref: '#/components/parameters/VolumeId'
+        - $ref: '#/components/parameters/QuarantineId'
+      responses:
+        '202':
+          description: The copy is `deleting`; the answer is its volume.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Volume'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
         '429':
           $ref: '#/components/responses/RateLimited'
         '503':

@@ -191,6 +191,10 @@ pub enum Scope {
     AppLogs,
     #[serde(rename = "app:terminal")]
     AppTerminal,
+    #[serde(rename = "app:failover")]
+    AppFailover,
+    #[serde(rename = "app:delete_quarantine")]
+    AppDeleteQuarantine,
     #[serde(rename = "backup:read")]
     BackupRead,
     #[serde(rename = "backup:write")]
@@ -235,7 +239,7 @@ pub enum Scope {
 
 impl Scope {
     /// Every scope, in README table order.
-    pub const ALL: [Scope; 47] = [
+    pub const ALL: [Scope; 49] = [
         Self::ClusterRead,
         Self::NodeRead,
         Self::NodeEnroll,
@@ -263,6 +267,8 @@ impl Scope {
         Self::AppDelete,
         Self::AppLogs,
         Self::AppTerminal,
+        Self::AppFailover,
+        Self::AppDeleteQuarantine,
         Self::BackupRead,
         Self::BackupWrite,
         Self::BackupRestore,
@@ -316,6 +322,8 @@ impl Scope {
             Self::AppDelete => "app:delete",
             Self::AppLogs => "app:logs",
             Self::AppTerminal => "app:terminal",
+            Self::AppFailover => "app:failover",
+            Self::AppDeleteQuarantine => "app:delete_quarantine",
             Self::BackupRead => "backup:read",
             Self::BackupWrite => "backup:write",
             Self::BackupRestore => "backup:restore",
@@ -356,6 +364,8 @@ impl Scope {
                 | Self::VmDelete
                 | Self::AppDelete
                 | Self::BackupRestore
+                | Self::AppFailover
+                | Self::AppDeleteQuarantine
         )
     }
 
@@ -377,6 +387,7 @@ impl Scope {
                 | Self::UserRead
                 | Self::UserWrite
                 | Self::AppTerminal
+                | Self::AppDeleteQuarantine
                 | Self::BackupManage
         )
     }
@@ -521,11 +532,14 @@ mod tests {
         assert!(Role::Operator.holds(Scope::VmConsole));
         assert!(!Role::Viewer.holds(Scope::AppTerminal));
         assert!(!Role::Viewer.holds(Scope::VmConsole));
-        assert_eq!(Scope::ALL.iter().filter(|s| s.is_human_only()).count(), 14);
-        assert_eq!(Scope::ALL.iter().filter(|s| s.is_destructive()).count(), 5);
+        assert_eq!(Scope::ALL.iter().filter(|s| s.is_human_only()).count(), 15);
+        assert_eq!(Scope::ALL.iter().filter(|s| s.is_destructive()).count(), 7);
         assert!(Role::Owner.holds(Scope::BackupManage));
         assert!(!Role::Operator.holds(Scope::BackupManage));
         assert!(Role::Operator.holds(Scope::BackupRestore));
+        assert!(Role::Operator.holds(Scope::AppFailover));
+        assert!(Role::Operator.holds(Scope::AppDeleteQuarantine));
+        assert!(!Role::Viewer.holds(Scope::AppFailover));
         assert!(Role::Viewer.holds(Scope::BackupRead));
         assert!(!Role::Viewer.holds(Scope::BackupWrite));
     }

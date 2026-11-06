@@ -847,6 +847,7 @@ export const handlers = [
       allocated_bytes: null,
       restored_from_backup_id: null,
       error: null,
+      quarantines: [],
       created_at: createdAt,
       updated_at: createdAt,
     };

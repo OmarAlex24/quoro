@@ -8,9 +8,9 @@ import {
 } from './scopes';
 
 describe('scopes', () => {
-  it('names twelve human-only and four destructive scopes', () => {
-    expect(HUMAN_ONLY_SCOPES.size).toBe(12);
-    expect(DESTRUCTIVE_SCOPES.size).toBe(4);
+  it('names thirteen human-only and six destructive scopes', () => {
+    expect(HUMAN_ONLY_SCOPES.size).toBe(13);
+    expect(DESTRUCTIVE_SCOPES.size).toBe(6);
   });
 
   it('never offers a human-only or destructive scope for a grant', () => {

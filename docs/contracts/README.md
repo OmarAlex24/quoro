@@ -59,6 +59,7 @@ All ids are strings `<prefix>_<ULID>` (ULID in Crockford base32, 26 characters),
 | build | `bld_` | One image build of an app's Git source, run on the app's node (ADR 0117, ADR 0118) |
 | domain | `dom_` | A hostname routed to an app |
 | volume | `vol_` | Local persistent disk of a stateful app, on one node (ADR 0145) |
+| quarantined copy | `qrn_` | A volume's divergent writes kept by a node that lost the app's lease to a failover (ADR 0176); the node generates the id |
 | backup | `bkp_` | One point-in-time copy of a volume or of the control-plane database in a backup repository (ADR 0147, ADR 0148) |
 | backup repository | `brp_` | An encrypted, content-addressed store of backups in an `object_store` provider's bucket (ADR 0147) |
 | audit export | `aex_` | One off-site copy target of the audit log (ADR 0149) |
@@ -105,7 +106,8 @@ The cluster keys are generated at the primary's first start and stored as `0600`
 - Each node with the `node` role has its own guest **subnet**, a `/24` of `10.42.0.0/16` assigned at enrollment and never reused while a VM from it is recorded (the oldest node of a cluster from before M5a keeps the configured guest network, and no other subnet overlaps it); each node and edge has a **mesh address** in `10.43.0.0/16` (ADR 0144).
 - An app is `stateful` or not. An app is stateful exactly when it has a **volume**: its first volume makes it stateful (ADR 0145). A stateful app runs one instance, on the node that holds its volume and its `local` **lease** (D-0019, D-0047).
 - A **backup** copies one volume, or the control-plane database, into a **backup repository** (ADR 0147, ADR 0148). Restoring a volume backup creates a new volume on the chosen node and moves the app there.
-- An app has an HA policy: `none`, `cold`, `warm`, `hot` (D-0020). `none` and `cold` (scheduled backups of a stateful app) are accepted from M5a; `warm` and `hot` are refused until M5b and M6. The field exists from M0.
+- An app has an HA policy: `none`, `cold`, `warm`, `hot` (D-0020). `none` and `cold` (scheduled backups of a stateful app) are accepted from M5a, `warm` from M5b; `hot` is refused until M6. The field exists from M0.
+- A `warm` app keeps a second copy of its volume on its **warm node**, shipped from the node that holds its lease every `interval_s` (30 s by default) and kept with its prepared image and a standby VM that starts nothing (ADR 0172 to ADR 0174). An operator, or an agent with a human's approval, **fails over** to the warm node once the old node's lease is lost, or runs a planned **switchover** that loses no data (ADR 0175, ADR 0177). A node that lost the lease keeps its divergent writes as a **quarantined copy** of the volume and becomes the warm copy (ADR 0176).
 - A **domain** belongs to one app and has a TLS mode: `acme` (public-IP hosts) or `tunnel` (Cloudflare Tunnel) (D-0024). Its serving status says whether a machine can serve the hostname at all, apart from its certificate (ADR 0167).
 - An app either deploys images given by reference or has a **Git source** (`source`): then its images come from **builds** of that source, and each successful build starts a deployment with `trigger: build` (ADR 0117). A build runs on the node that runs the app (ADR 0118).
 - From M5a the node that prepares an image sends its package **inventory** to the primary, which matches it against a local copy of OSV data and records **vulnerability findings** for the apps that run the image, for the running Quoro release's own components and for host kernels (ADR 0138, ADR 0150). The image never leaves the node. A finding in CISA's KEV catalog or with a CVSS score of 9.0 or more raises `app.vulnerable`, which opens an incident. An app with a Git source is patched by a build with `refresh_base`; Quoro never upgrades a host or an image it did not build.
@@ -135,6 +137,7 @@ and the build's manifest digest as its digest, for example `build.quoro.invalid/
 - Lease `mode`: `local` (HA policy `none`/`cold`: never expires when the arbiter is unreachable; ends by `lease_revoke` or an operator declaring the node lost) or `expiring` (HA policy `warm`/`hot`, from M5b: `held` -> `uncertain` -> `expired`, self-fence at `expired`; revoked explicitly) (D-0047). Lease state as seen by a node: `held`, `uncertain`, `expired`, `revoked`. See node-agent-protocol.md. From M5b the API shows each app's lease (`App.lease`), as the primary sees it.
 - Webhook delivery `status`: `pending`, `delivered`, `failed`.
 - Volume `state`: `creating` (the node has not reported the file yet), `ready`, `restoring` (being written from a backup), `failed`, `detached` (replaced by a restore, its file kept on its node until deleted), `deleting` (ADR 0145).
+- Warm copy `state` (`App.warm`, M5b): `syncing`, `in_sync` (a lag of at most two intervals), `lagging`, `failed` (ADR 0173). Quarantined copy `state`: `kept`, `deleting` (ADR 0176).
 - Backup `status`: `queued`, `running`, `succeeded`, `failed` (ADR 0147). The last two are terminal.
 - Volume snapshot method of a node: `reflink` (native or in the node's XFS volume pool) or `pause_copy` (ADR 0156).
 - Audit export `lock_strength`: `none`, `bucket_rule` (R2 lock rules), `compliance` (S3 Object Lock in compliance mode) (ADR 0149).
@@ -172,6 +175,8 @@ A scope is `<resource>:<verb>` (D-0030). The complete list:
 | `app:delete` | Delete an app and its data, or one volume of an app | destructive |
 | `app:logs` | Read app logs and build logs, including live streams | |
 | `app:terminal` | Open an interactive terminal in an app's VM (ADR 0113, ADR 0114) | human-only |
+| `app:failover` | Fail a `warm` app over to its warm node, or run a planned switchover to it (ADR 0175, ADR 0177) | destructive |
+| `app:delete_quarantine` | Delete a quarantined copy of a volume, the divergent writes a node kept after a failover (ADR 0176) | destructive, human-only |
 | `backup:read` | List and read backups and backup repositories | |
 | `backup:write` | Take a backup of an app's volume now | |
 | `backup:restore` | Restore a backup onto a node, which moves the app there | destructive |
@@ -197,7 +202,7 @@ A scope is `<resource>:<verb>` (D-0030). The complete list:
 - **human-only** scopes can never appear in an agent's grant, so an agent cannot widen its own power or approve its own requests.
 - The wildcard `app:*` style is not allowed in grants; scopes are listed explicitly.
 - Human roles are fixed scope bundles: `owner` (every scope), `operator` (every scope except `user:write` and `backup:manage`), `viewer` (every `:read` scope plus `app:logs`). `user:read` is a `:read` scope, so every role holds it. `app:terminal` and `vm:console` are not `:read` scopes, so a `viewer` holds neither (ADR 0114). `backup:manage` is owner-only because it shows the recovery key, which reads every backup (ADR 0147).
-- Volumes add no scope of their own (ADR 0145): creating one changes an app's settings (`app:update`), listing them reads the app (`app:read`), and deleting one deletes app data (`app:delete`, destructive, so an agent needs a JIT approval).
+- Volumes add no scope of their own (ADR 0145): creating one changes an app's settings (`app:update`), listing them reads the app (`app:read`), and deleting one deletes app data (`app:delete`, destructive, so an agent needs a JIT approval). From M5b, deleting a quarantined copy needs `app:delete_quarantine`, which only a human holds, and the N+1 indicator reads the cluster (`cluster:read`).
 - Builds and metrics add no scope of their own: a build is authorized as a deployment of its app (`app:deploy`), its record as app data (`app:read`), its log as app output (`app:logs`); node metrics need `node:read` and app metrics `app:read`.
 
 ### Resource selectors
@@ -235,6 +240,9 @@ Event `type` is `<subject>.<what>` in lowercase with underscores. The complete l
 | `app.up` | An app recovered, from down or from degraded | |
 | `app.restarted` | An app's instances were restarted | |
 | `app.vulnerable` | The image an app runs has a new finding in the KEV catalog or with a CVSS score of 9.0 or more (ADR 0150); it opens an incident of its own, resolved when no such finding is open | critical CVE |
+| `app.failed_over` | The lease of a `warm` app moved to its warm node, which starts the app from its last complete copy (ADR 0175). It opens no incident | |
+| `app.switched_over` | A planned switchover of a `warm` app completed with no data lost; the former node is now its warm copy (ADR 0177). It opens no incident | |
+| `app.switchover_failed` | A planned switchover stopped before the lease moved; the app resumed on its node and nothing moved. It opens no incident | |
 | `deployment.started` | A deployment began | |
 | `deployment.succeeded` | A deployment's instances are healthy | |
 | `deployment.failed` | A deployment failed (image pull, rootfs, boot, health) | |
@@ -246,6 +254,7 @@ Event `type` is `<subject>.<what>` in lowercase with underscores. The complete l
 | `backup.failed` | A backup failed (snapshot, upload, seal) | backup failed |
 | `restore.succeeded` | A restored volume is ready on its node and the app was moved there | |
 | `restore.failed` | A restore failed; the new volume is `failed` and the app stays stopped until another restore | |
+| `volume.quarantined` | A node that lost a `warm` app's lease kept its divergent volume as a quarantined copy, recorded in the audit log (ADR 0176). It opens no incident | |
 | `certificate.issued` | A TLS certificate was obtained or renewed | |
 | `certificate.expiring` | A certificate expires within its warning window | certificate expiring |
 | `certificate.failed` | Obtaining or renewing a certificate failed. A primary that does not yet emit `domain.unserved` also emits it with `tls_mode` `tunnel` for a `tunnel` domain no tunnel serves | |
@@ -266,7 +275,7 @@ Event `type` is `<subject>.<what>` in lowercase with underscores. The complete l
 
 HTTP errors use `application/problem+json` (RFC 9457) with an extra `code` field. `code` values: `unauthenticated` (401), `forbidden` (403), `approval_required` (403), `not_found` (404), `conflict` (409), `validation_failed` (422), `rate_limited` (429), `not_primary` (503, write reached a replica that cannot forward), `node_unreachable` (504, on-demand telemetry could not reach the node), `internal` (500).
 
-For `forbidden`, the field `reason` is one of: `scope_missing`, `selector_mismatch`, `grant_expired`, `grant_revoked`, `grant_exhausted`, `human_only`, `agent_disabled`. For `approval_required`, the body carries `scope` and the target so the agent can file an approval request.
+For `forbidden`, the field `reason` is one of: `scope_missing`, `selector_mismatch`, `grant_expired`, `grant_revoked`, `grant_exhausted`, `human_only`, `agent_disabled`. From M5b `reason` also says why a failover or a switchover was refused with `conflict` (`not_warm`, `in_progress`, `no_copy`, `not_in_sync`, `node_disconnected`, `fence_failed`, `no_support`, `lease_held`), and why a delete was (`has_quarantines`). For `approval_required`, the body carries `scope` and the target so the agent can file an approval request.
 
 ### Request headers
 
@@ -318,6 +327,8 @@ M5a adds no MCP tool either. Volumes, backups and restores are reachable by agen
 
 M5b's lease and witness contract adds no MCP tool: the roles operation and declaring a node lost are human-only, and an agent reads the voters through `get_cluster` and an app's lease through `get_app`.
 
+M5b's warm contract adds no MCP tool yet. An agent reads an app's warm copy through `get_app` and fails over or switches over through the HTTP API with a JIT approval (`app:failover`); deleting a quarantined copy is human-only. ADR 0178 names an MCP tool `get_capacity` for the N+1 indicator (`getClusterCapacity`, `cluster:read`); it joins this table, and its annotation joins `openapi.yaml`, with the change that implements the operation, because the MCP server's tool list must match this table.
+
 ### Channels
 
 Every action reaches the same service layer through one of these channels, recorded in the audit log as `channel`: `api` (HTTP API), `panel` (the web panel, which uses the API with a session), `mcp` (MCP server, D-0031), `cli` (the `quoro` command), `system` (Quoro itself: reconciliation, schedulers, incident automation). MCP tools map one-to-one onto service operations and require the same scope as the matching endpoint.
@@ -328,7 +339,7 @@ Defined in node-agent-protocol.md. Node to control plane: `hello`, `heartbeat`, 
 
 ### Database tables
 
-Defined in db-schema.sql and changed only by the numbered files in `migrations/`: `meta`, `change_log`, `nodes`, `node_join_tokens`, `node_credentials`, `node_tunnels`, `projects`, `vms`, `apps`, `app_env`, `deployments`, `builds`, `domains`, `volumes`, `leases`, `users`, `api_tokens`, `sessions`, `agents`, `agent_keys`, `access_tokens`, `grants`, `approvals`, `incidents`, `events`, `webhooks`, `webhook_deliveries`, `providers`, `audit_log`, `audit_exports`, `interactive_sessions`, `backup_repositories`, `backups`, `osv_mirror`, `vulnerability_findings`. Tables marked local in that file are not replicated through the change log.
+Defined in db-schema.sql and changed only by the numbered files in `migrations/`: `meta`, `change_log`, `nodes`, `node_join_tokens`, `node_credentials`, `node_tunnels`, `projects`, `vms`, `apps`, `app_env`, `deployments`, `builds`, `domains`, `volumes`, `volume_quarantines`, `leases`, `users`, `api_tokens`, `sessions`, `agents`, `agent_keys`, `access_tokens`, `grants`, `approvals`, `incidents`, `events`, `webhooks`, `webhook_deliveries`, `providers`, `audit_log`, `audit_exports`, `interactive_sessions`, `backup_repositories`, `backups`, `osv_mirror`, `vulnerability_findings`. Tables marked local in that file are not replicated through the change log.
 
 ## Open items before the freeze
 

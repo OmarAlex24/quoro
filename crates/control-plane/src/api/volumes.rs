@@ -118,6 +118,11 @@ pub struct Volume {
     /// One-line reason, in `failed`.
     #[schema(max_length = 2000)]
     pub error: Option<String>,
+    /// From M5b: the quarantined copies of this volume, oldest first (ADR
+    /// 0176). Always empty until warm volumes ship.
+    #[serde(default)]
+    #[schema(required = true)]
+    pub quarantines: Vec<VolumeQuarantine>,
     /// When the volume was created.
     #[schema(format = "date-time")]
     pub created_at: String,
@@ -127,15 +132,56 @@ pub struct Volume {
 }
 
 impl Volume {
-    /// The change-log payload of the row.
+    /// The change-log payload of the row. The quarantined copies are rows of
+    /// their own (`volume_quarantines`), so they are not part of it.
     ///
     /// # Errors
     ///
     /// An internal error when the row does not serialize.
     pub(crate) fn payload(&self) -> Result<Value, ApiError> {
-        serde_json::to_value(self)
-            .map_err(|error| ApiError::internal(&format!("volume payload: {error}")))
+        let mut payload = serde_json::to_value(self)
+            .map_err(|error| ApiError::internal(&format!("volume payload: {error}")))?;
+        if let Some(object) = payload.as_object_mut() {
+            object.remove("quarantines");
+        }
+        Ok(payload)
     }
+}
+
+/// State of a quarantined copy (`openapi.yaml` `VolumeQuarantine.state`).
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeQuarantineState {
+    Kept,
+    Deleting,
+}
+
+/// A quarantined copy of a volume (`openapi.yaml` `VolumeQuarantine`, ADR
+/// 0176): the divergent writes a node kept after a failover.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize, ToSchema)]
+#[schema(
+    title = "VolumeQuarantine",
+    description = "A quarantined copy of a volume: the live file of a node that lost the app's lease to a failover, kept on that node's disk (ADR 0176)."
+)]
+pub struct VolumeQuarantine {
+    /// Quarantined copy id.
+    #[schema(pattern = "^qrn_[0-9A-HJKMNP-TV-Z]{26}$")]
+    pub id: String,
+    /// The node whose disk holds the copy.
+    #[schema(pattern = "^nod_[0-9A-HJKMNP-TV-Z]{26}$")]
+    pub node_id: String,
+    /// Bytes the copy uses on that node's disk.
+    #[schema(minimum = 0)]
+    pub size_bytes: i64,
+    /// SHA-256 of the copy's content, as the node computed it.
+    #[schema(pattern = "^[0-9a-f]{64}$")]
+    pub sha256: String,
+    /// `kept` or `deleting`.
+    #[schema(inline)]
+    pub state: VolumeQuarantineState,
+    /// When the node took the copy.
+    #[schema(format = "date-time")]
+    pub created_at: String,
 }
 
 /// The volumes of one app, newest first (`openapi.yaml` `VolumeList`).
@@ -183,6 +229,7 @@ pub(crate) fn volume_from_row(row: &SqliteRow) -> Result<Volume, ApiError> {
         allocated_bytes: row.try_get("allocated_bytes")?,
         restored_from_backup_id: row.try_get("restored_from_backup_id")?,
         error: row.try_get("error")?,
+        quarantines: Vec::new(),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -559,7 +606,7 @@ pub fn routes() -> Router<AppState> {
 #[openapi(
     paths(list_app_volumes, create_volume, get_volume, delete_volume),
     components(
-        schemas(Volume, VolumeList, CreateVolumeRequest),
+        schemas(Volume, VolumeQuarantine, VolumeList, CreateVolumeRequest),
         responses(
             crate::openapi::Unauthenticated,
             crate::openapi::Forbidden,

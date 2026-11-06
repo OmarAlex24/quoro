@@ -18,6 +18,7 @@ export const HUMAN_ONLY_SCOPES: ReadonlySet<Scope> = new Set<Scope>([
   'provider:manage',
   'user:read',
   'user:write',
+  'app:delete_quarantine',
 ]);
 
 export const DESTRUCTIVE_SCOPES: ReadonlySet<Scope> = new Set<Scope>([
@@ -25,6 +26,8 @@ export const DESTRUCTIVE_SCOPES: ReadonlySet<Scope> = new Set<Scope>([
   'project:delete',
   'vm:delete',
   'app:delete',
+  'app:failover',
+  'app:delete_quarantine',
 ]);
 
 export const ALL_SCOPES: readonly Scope[] = Object.values(Scope);

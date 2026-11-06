@@ -170,6 +170,7 @@ pub(crate) async fn accept(
         allocated_bytes: None,
         restored_from_backup_id: Some(backup.id.clone()),
         error: None,
+        quarantines: Vec::new(),
         created_at: now.clone(),
         updated_at: now.clone(),
     };

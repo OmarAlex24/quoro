@@ -36,7 +36,7 @@ const POLL: Duration = Duration::from_secs(1);
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
 
 /// The closed set of event types (`events.schema.json`, `EventType`).
-pub const EVENT_TYPES: [&str; 45] = [
+pub const EVENT_TYPES: [&str; 49] = [
     "node.enrolled",
     "node.connected",
     "node.disconnected",
@@ -56,6 +56,9 @@ pub const EVENT_TYPES: [&str; 45] = [
     "app.up",
     "app.restarted",
     "app.vulnerable",
+    "app.failed_over",
+    "app.switched_over",
+    "app.switchover_failed",
     "deployment.started",
     "deployment.succeeded",
     "deployment.failed",
@@ -67,6 +70,7 @@ pub const EVENT_TYPES: [&str; 45] = [
     "backup.failed",
     "restore.succeeded",
     "restore.failed",
+    "volume.quarantined",
     "certificate.issued",
     "certificate.expiring",
     "certificate.failed",

@@ -30,6 +30,7 @@ const MIGRATIONS: &[&str] = &[
         "../../../docs/contracts/migrations/0009-domain-serving-status-and-volume-sweep.sql"
     ),
     include_str!("../../../docs/contracts/migrations/0010-node-lost-at.sql"),
+    include_str!("../../../docs/contracts/migrations/0011-warm-copies-and-quarantines.sql"),
 ];
 
 /// 64 zeros: `prev_hash` of the first entry of a chain.

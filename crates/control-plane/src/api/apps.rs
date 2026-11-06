@@ -141,7 +141,72 @@ pub enum SnapshotMethod {
 pub enum HaUnavailableReason {
     Stateless,
     NoRepository,
+    NoWarmNode,
     NotInThisRelease,
+}
+
+/// How far a warm copy is (`openapi.yaml` `WarmCopy.state`, ADR 0173).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WarmState {
+    Syncing,
+    InSync,
+    Lagging,
+    Failed,
+}
+
+/// The warm copy of a `warm` app (`openapi.yaml` `WarmCopy`, ADR 0172 to
+/// ADR 0174). The progress fields come from the nodes' newest reports and are
+/// never stored.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(
+    title = "WarmCopy",
+    description = "The warm copy of a `warm` app: a second copy of its volume on its warm node, updated every `interval_s` (ADR 0172 to ADR 0174)."
+)]
+pub struct WarmCopy {
+    /// The warm node, or null while no node is eligible.
+    #[schema(pattern = "^nod_[0-9A-HJKMNP-TV-Z]{26}$", required = true)]
+    pub node_id: Option<String>,
+    /// Whether an operator chose `node_id` rather than the scheduler.
+    pub node_pinned: bool,
+    /// Seconds between two snapshots on the source.
+    #[schema(minimum = 5, maximum = 3600)]
+    pub interval_s: i64,
+    /// `syncing`, `in_sync`, `lagging` or `failed`.
+    #[schema(inline)]
+    pub state: WarmState,
+    /// The newest complete copy on the warm node, or null.
+    #[schema(minimum = 1, required = true)]
+    pub last_snapshot_seq: Option<i64>,
+    /// When the warm node completed that copy, or null.
+    #[schema(format = "date-time", required = true)]
+    pub last_shipped_at: Option<String>,
+    /// Seconds since the source took the snapshot of that copy, or null.
+    #[schema(minimum = 0, required = true)]
+    pub lag_s: Option<i64>,
+    /// Extents of the source's newest snapshot, or null.
+    #[schema(minimum = 0, required = true)]
+    pub extent_count: Option<i64>,
+    /// Why `state` is `failed`, or null.
+    #[schema(max_length = 500, required = true)]
+    pub error: Option<String>,
+}
+
+/// Settings of an app's warm copy (`openapi.yaml` `WarmSettings`, ADR 0174).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(
+    title = "WarmSettings",
+    description = "Settings of an app's warm copy (ADR 0174). Absent fields stay unchanged."
+)]
+pub struct WarmSettings {
+    /// Pins the warm node; null lets the scheduler pick.
+    #[serde(default)]
+    #[schema(pattern = "^nod_[0-9A-HJKMNP-TV-Z]{26}$", required = false)]
+    pub node_id: Option<String>,
+    /// Seconds between two snapshots on the source.
+    #[serde(default)]
+    #[schema(value_type = i64, minimum = 5, maximum = 3600, required = false)]
+    pub interval_s: Option<i64>,
 }
 
 /// Capacity an HA policy reserves on other nodes (`openapi.yaml` `HaCapacity`).
@@ -366,6 +431,11 @@ pub struct App {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(required = false)]
     pub lease: Option<super::leases::Lease>,
+    /// The app's warm copy; absent until warm volumes ship, then null when
+    /// `ha_policy` is not `warm`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(required = false)]
+    pub warm: Option<WarmCopy>,
     /// Current OCI reference of the app. For an app with a Git source, the
     /// reference of its last successful build, or `""` before the first one.
     pub image: String,
@@ -666,6 +736,10 @@ pub struct UpdateAppRequest {
     #[serde(default)]
     #[schema(value_type = AppPlacement, required = false)]
     pub placement: Option<AppPlacement>,
+    /// Settings of the warm copy; only with `ha_policy` `warm` (ADR 0174).
+    #[serde(default)]
+    #[schema(value_type = WarmSettings, required = false)]
+    pub warm: Option<WarmSettings>,
 }
 
 /// The readable part of an environment variable (`openapi.yaml` `AppEnvVar`).
@@ -791,6 +865,7 @@ pub(crate) fn app_from_row(row: &SqliteRow) -> Result<App, ApiError> {
         replicas: row.try_get("replicas")?,
         ha_cost: None,
         lease: None,
+        warm: None,
         image: row.try_get("image")?,
         source,
         port: row.try_get("port")?,
@@ -1082,6 +1157,13 @@ fn validate_update(body: &UpdateAppRequest) -> Result<(), ApiError> {
             ));
         }
     }
+    // `UpdateAppRequest.warm` needs `ha_policy` `warm`, which this release
+    // still refuses.
+    if body.warm.is_some() {
+        return Err(ApiError::validation(
+            "warm settings need ha_policy warm, which is not supported before M5b",
+        ));
+    }
     if let Some(schedule) = &body.backup_schedule {
         validate_backup_schedule(schedule)?;
     }
@@ -1356,6 +1438,7 @@ async fn insert_app(
         replicas: body.replicas,
         ha_cost: None,
         lease: None,
+        warm: None,
         image: body.image.clone().unwrap_or_default(),
         source,
         port: body.port,
@@ -1845,6 +1928,7 @@ async fn update_app_tx(
         (status = 401, response = crate::openapi::Unauthenticated),
         (status = 403, response = crate::openapi::ApprovalRequired),
         (status = 404, response = crate::openapi::NotFound),
+        (status = 409, response = crate::openapi::Conflict),
         (status = 429, response = crate::openapi::RateLimited),
         (status = 503, response = crate::openapi::NotPrimary),
     )
@@ -2943,6 +3027,8 @@ pub fn routes() -> Router<AppState> {
             AppDetail,
             EdgeBackend,
             super::leases::Lease,
+            WarmCopy,
+            WarmSettings,
             AppList,
             CreateAppRequest,
             UpdateAppRequest,
