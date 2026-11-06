@@ -25,6 +25,7 @@ use utoipa::{IntoParams, ToSchema};
 /// The operation string recorded in the audit log.
 const SET_TUNNEL_OPERATION: &str = "PUT /api/v1/nodes/{node_id}/tunnel";
 const DELETE_TUNNEL_OPERATION: &str = "DELETE /api/v1/nodes/{node_id}/tunnel";
+const FENCE_ACK_OPERATION: &str = "POST /api/v1/nodes/{node_id}/fence-ack";
 
 /// A machine running the Quoro binary (D-0012).
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -212,6 +213,32 @@ pub struct SetNodeTunnelRequest {
     #[serde(default)]
     #[schema(value_type = u16, minimum = 1, maximum = 65535, default = 8081, required = false)]
     pub origin_port: Option<u16>,
+}
+
+/// Body of `ackNodeFence` (`openapi.yaml` `FenceAckRequest`).
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+#[schema(
+    title = "FenceAckRequest",
+    description = "The failed fences an operator verified out of band."
+)]
+pub struct FenceAckRequest {
+    /// Lease ids of the failed fences being acknowledged.
+    #[schema(schema_with = fence_ack_lease_ids_schema)]
+    pub lease_ids: Vec<String>,
+}
+
+/// `FenceAckRequest.lease_ids`: at least one unique `lse_` id.
+fn fence_ack_lease_ids_schema() -> utoipa::openapi::schema::Array {
+    use utoipa::openapi::schema::{ArrayBuilder, ObjectBuilder, Type};
+    ArrayBuilder::new()
+        .items(
+            ObjectBuilder::new()
+                .schema_type(Type::String)
+                .pattern(Some("^lse_[0-9A-HJKMNP-TV-Z]{26}$")),
+        )
+        .min_items(Some(1))
+        .unique_items(true)
+        .build()
 }
 
 /// One page of nodes.
@@ -517,6 +544,188 @@ pub async fn set_node_tunnel(
             Err(error)
         }
     }
+}
+
+/// Records a human's acknowledgement of a node's failed fences
+/// (`node-agent-protocol.md` section 8.5, D-0074, D-0079).
+#[utoipa::path(
+    post,
+    path = "/api/v1/nodes/{node_id}/fence-ack",
+    tag = "nodes",
+    operation_id = "ackNodeFence",
+    extensions(("x-quoro-scope" = json!("node:fence_ack"))),
+    params(
+        ("node_id" = String, Path, description = "Node id (`nod_...`).", pattern = "^nod_[0-9A-HJKMNP-TV-Z]{26}$"),
+    ),
+    request_body(content = FenceAckRequest, description = "The lease ids of the failed fences being acknowledged."),
+    responses(
+        (status = 200, description = "The acknowledgement was recorded; the node is returned with `fence_failure` null.", body = Node,
+            headers(("Quoro-Request-Id" = String, description = "Correlation id of this call."))),
+        (status = 401, response = crate::openapi::Unauthenticated),
+        (status = 403, response = crate::openapi::Forbidden),
+        (status = 404, response = crate::openapi::NotFound),
+        (status = 409, response = crate::openapi::Conflict),
+        (status = 422, response = crate::openapi::ValidationFailed),
+        (status = 429, response = crate::openapi::RateLimited),
+        (status = 503, response = crate::openapi::NotPrimary),
+    )
+)]
+///
+/// # Errors
+///
+/// `forbidden` for an agent or without `node:fence_ack`, `validation_failed`
+/// for an empty list, a repeated id or one that is not an `lse_` id,
+/// `not_found` for an unknown node, `conflict` when the node has no failed
+/// fence or `lease_ids` differs from its outstanding ones, or a database
+/// error.
+pub async fn ack_node_fence(
+    State(state): State<AppState>,
+    identity: Identity,
+    headers: HeaderMap,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Path(node_id): Path<String>,
+    ApiJson(body): ApiJson<FenceAckRequest>,
+) -> Result<Json<Node>, ApiError> {
+    let params = json!({ "lease_ids": &body.lease_ids });
+    let target = Target {
+        kind: "node".to_string(),
+        id: node_id.clone(),
+    };
+    let ctx = CallCtx::new(identity, request_id, FENCE_ACK_OPERATION, &headers);
+    ctx.authorize_human(&state, Scope::NodeFenceAck, Some(&target), None, &params)
+        .await?;
+    match fence_ack_tx(&state, &ctx, &node_id, &body.lease_ids, &params).await {
+        Ok((node, holders)) => {
+            for holder in holders {
+                state.hub.node_changed(&holder);
+            }
+            state.hub.node_changed(&node_id);
+            crate::fences::deliver(state.hub.clone(), node_id);
+            Ok(Json(node))
+        }
+        Err(error) => {
+            ctx.audit_error(
+                &state,
+                Some(Scope::NodeFenceAck),
+                Some(&target),
+                None,
+                &params,
+                &error,
+            )
+            .await?;
+            Err(error)
+        }
+    }
+}
+
+/// Section 8.5 step 3 in one transaction: checks the list against the node's
+/// outstanding failed fences, increments each listed lease's token and
+/// records it revoked as when declaring a node lost (section 8.3), clears
+/// `fence_failure`, queues the acknowledgement in `fence_ack_pending`, and
+/// writes the change-log entries and the audit record. Returns the node and
+/// the holders of the listed leases, whose snapshots change.
+async fn fence_ack_tx(
+    state: &AppState,
+    ctx: &CallCtx,
+    node_id: &str,
+    lease_ids: &[String],
+    params: &Value,
+) -> Result<(Node, Vec<String>), ApiError> {
+    if lease_ids.is_empty() {
+        return Err(ApiError::validation(
+            "lease_ids must name at least one lease",
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for lease_id in lease_ids {
+        if !is_id(Prefix::Lease, lease_id) {
+            return Err(ApiError::validation(format!(
+                "lease_ids: {lease_id} is not a lease id"
+            )));
+        }
+        if !seen.insert(lease_id.as_str()) {
+            return Err(ApiError::validation(format!(
+                "lease_ids: {lease_id} is listed twice"
+            )));
+        }
+    }
+    let mut w = state.store.begin_write().await?;
+    if !is_id(Prefix::Node, node_id) {
+        return Err(ApiError::not_found("node"));
+    }
+    let exists: Option<String> = sqlx::query_scalar("SELECT id FROM nodes WHERE id = ?")
+        .bind(node_id)
+        .fetch_optional(&mut *w.tx)
+        .await?;
+    if exists.is_none() {
+        return Err(ApiError::not_found("node"));
+    }
+    let Some(failure) = crate::fences::failure_of(&mut w.tx, node_id).await? else {
+        return Err(ApiError::conflict(
+            "the node has no failed fence to acknowledge",
+        ));
+    };
+    let mut asked: Vec<&str> = lease_ids.iter().map(String::as_str).collect();
+    let mut outstanding: Vec<&str> = failure.lease_ids.iter().map(String::as_str).collect();
+    asked.sort_unstable();
+    outstanding.sort_unstable();
+    outstanding.dedup();
+    if asked != outstanding {
+        return Err(ApiError::conflict(format!(
+            "lease_ids must equal the node's outstanding failed fences: {}",
+            outstanding.join(", ")
+        )));
+    }
+
+    let actor = ctx.identity.actor();
+    let mut holders: Vec<String> = Vec::new();
+    for lease in crate::leases::bump_tokens(&mut w.tx, lease_ids, &actor).await? {
+        if lease.holder_node_id != node_id && !holders.contains(&lease.holder_node_id) {
+            holders.push(lease.holder_node_id);
+        }
+    }
+    let mut pending = crate::fences::pending_of(&mut w.tx, node_id)
+        .await?
+        .unwrap_or_default();
+    pending.acked_at = now_rfc3339();
+    for lease_id in lease_ids {
+        if !pending.lease_ids.contains(lease_id) {
+            pending.lease_ids.push(lease_id.clone());
+        }
+    }
+    let pending_text = serde_json::to_string(&pending)
+        .map_err(|e| ApiError::internal(&format!("cannot encode a fence ack: {e}")))?;
+    sqlx::query("UPDATE nodes SET fence_failure = NULL, fence_ack_pending = ? WHERE id = ?")
+        .bind(pending_text)
+        .bind(node_id)
+        .execute(&mut *w.tx)
+        .await?;
+    let payload = crate::driver::node_payload(&mut w.tx, node_id).await?;
+    let seq = changelog::append(&mut w.tx, &actor, "node", node_id, Op::Update, payload).await?;
+    let target = Target {
+        kind: "node".to_string(),
+        id: node_id.to_string(),
+    };
+    ctx.append_ok(
+        &mut w.tx,
+        Some(Scope::NodeFenceAck),
+        Some(&target),
+        None,
+        params,
+        Some(seq),
+    )
+    .await?;
+    let row = sqlx::query(&format!(
+        "SELECT {NODE_COLUMNS} FROM nodes n WHERE n.id = ?"
+    ))
+    .bind(node_id)
+    .fetch_one(&mut *w.tx)
+    .await?;
+    let tunnel = tunnel_of(&mut *w.tx, node_id).await?;
+    w.commit().await?;
+    let mut node = node_from_row(&row)?;
+    node.tunnel = tunnel;
+    Ok((node, holders))
 }
 
 /// Validates the provider, writes the row, its change-log entry and the audit

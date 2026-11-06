@@ -180,6 +180,9 @@ struct Pending {
     streams: HashMap<String, StreamSlot>,
     /// `stream_open` msg id to the stream it opened, so a failed open ends it.
     opens: HashMap<String, String>,
+    /// `lease_revoke` msg id to its lease, so an answer with `fence_failed`
+    /// is recorded on the node (section 8.5 step 1).
+    revoke_leases: HashMap<String, String>,
 }
 
 impl Pending {
@@ -190,6 +193,7 @@ impl Pending {
 
     /// Fails every waiter because the session ended.
     fn fail_all(&mut self) {
+        self.revoke_leases.clear();
         for (_, tx) in self.commands.drain() {
             let _ = tx.send(Err(HubError::Closed));
         }
@@ -410,6 +414,12 @@ impl NodeHub {
         hold
     }
 
+    /// The store the sessions write to.
+    #[must_use]
+    pub(crate) fn store(&self) -> &Store {
+        &self.0.store
+    }
+
     /// Whether `node_id` has a live session.
     #[must_use]
     pub fn is_connected(&self, node_id: &str) -> bool {
@@ -515,15 +525,24 @@ impl NodeHub {
         node_id: &str,
         message: &quoro_proto::wire::ControlMessage,
     ) -> bool {
-        let text = message.to_frame(&new_msg_id(), None).to_text();
+        let id = new_msg_id();
+        let text = message.to_frame(&id, None).to_text();
         // Counted and queued under one lock, in order with a snapshot's check
         // in `send_snapshot`.
         let mut sessions = self.0.sessions.lock().expect("session lock");
         let Some(handle) = sessions.get_mut(node_id) else {
             return false;
         };
-        if matches!(message, quoro_proto::wire::ControlMessage::LeaseRevoke(_)) {
+        if let quoro_proto::wire::ControlMessage::LeaseRevoke(revoke) = message {
             handle.revokes += 1;
+            // Registered before the frame is queued, so its answer always
+            // finds its lease (section 8.5 step 1).
+            handle
+                .pending
+                .lock()
+                .expect("pending lock")
+                .revoke_leases
+                .insert(id, revoke.lease_id.0.clone());
         }
         handle.tx.send(text).is_ok()
     }
@@ -1031,6 +1050,13 @@ impl HubInner {
             .map(|handle| Arc::clone(&handle.pending))
     }
 
+    /// The lease of the `lease_revoke` that `re` answers, once.
+    fn take_revoke(&self, node_id: &str, generation: u64, re: &str) -> Option<String> {
+        let pending = self.pending_of(node_id, generation)?;
+        let mut pending = pending.lock().expect("pending lock");
+        pending.revoke_leases.remove(re)
+    }
+
     /// Routes one `command_result` to its waiter, or ends a stream whose
     /// `stream_open` failed (sections 5.9 and 5.15).
     fn resolve_command_result(
@@ -1463,6 +1489,17 @@ struct Session {
     inventory_parts: Assembler,
     /// When this session last asked the node to resend an inventory, by digest.
     inventory_requests: HashMap<String, Instant>,
+    /// The `fence_ack` sent at session start whose answer the desired state
+    /// waits for (section 4.2 rule 4).
+    fence_ack: Option<FenceAckWait>,
+}
+
+/// A `fence_ack` sent at session start, and the `stored_rev` of the `hello`
+/// whose desired state waits for its answer.
+struct FenceAckWait {
+    msg_id: String,
+    lease_ids: Vec<String>,
+    stored_rev: u64,
 }
 
 async fn run_session(
@@ -1492,12 +1529,15 @@ async fn run_session(
         digest_failures: HashMap::new(),
         inventory_parts: Assembler::new(),
         inventory_requests: HashMap::new(),
+        fence_ack: None,
     };
     let mut superseded = false;
     let mut reason = "session_closed";
     let mut close_after_error = false;
     let retry = tokio::time::sleep(SNAPSHOT_RETRY);
     tokio::pin!(retry);
+    let fence_ack_wait = tokio::time::sleep(crate::fences::FENCE_ACK_TIMEOUT);
+    tokio::pin!(fence_ack_wait);
 
     'session: loop {
         while let Ok(text) = rx.try_recv() {
@@ -1519,11 +1559,17 @@ async fn run_session(
                     Some(Ok(Message::Text(text))) => {
                         deadline = Instant::now() + timeout;
                         let was_pending = session.retry_pending;
+                        let was_waiting = session.fence_ack.is_some();
                         if session.handle_text(text.as_str(), &mut outbox).await {
                             close_after_error = true;
                         }
                         if session.retry_pending && !was_pending {
                             retry.as_mut().reset(Instant::now() + SNAPSHOT_RETRY);
+                        }
+                        if session.fence_ack.is_some() && !was_waiting {
+                            fence_ack_wait
+                                .as_mut()
+                                .reset(Instant::now() + crate::fences::FENCE_ACK_TIMEOUT);
                         }
                     }
                     Some(Ok(Message::Binary(_))) => {
@@ -1553,7 +1599,7 @@ async fn run_session(
                     break;
                 }
             }
-            () = changed.notified(), if session.connected => {
+            () = changed.notified(), if session.connected && session.fence_ack.is_none() => {
                 let was_pending = session.retry_pending;
                 match session.refresh(0, false).await {
                     Ok(()) => session.retry_pending = false,
@@ -1566,13 +1612,29 @@ async fn run_session(
                     retry.as_mut().reset(Instant::now() + SNAPSHOT_RETRY);
                 }
             }
-            () = &mut retry, if session.retry_pending => {
+            () = &mut retry, if session.retry_pending && session.fence_ack.is_none() => {
                 match session.refresh(0, false).await {
                     Ok(()) => session.retry_pending = false,
                     Err(e) => {
                         tracing::warn!(%e, node_id = %session.node_id, "cannot build the desired state");
                         retry.as_mut().reset(Instant::now() + SNAPSHOT_RETRY);
                     }
+                }
+            }
+            () = &mut fence_ack_wait, if session.fence_ack.is_some() => {
+                // Section 4.2 rule 4 waits for the answer; a node that never
+                // gives one still gets its desired state, and the
+                // acknowledgement stays pending for its next session.
+                let was_pending = session.retry_pending;
+                if let Some(wait) = session.fence_ack.take() {
+                    tracing::warn!(
+                        node_id = %session.node_id,
+                        "no answer to the fence_ack; it is sent again at the next session"
+                    );
+                    session.finish_start(wait.stored_rev, &mut outbox).await;
+                }
+                if session.retry_pending && !was_pending {
+                    retry.as_mut().reset(Instant::now() + SNAPSHOT_RETRY);
                 }
             }
             () = sleep => {
@@ -1699,17 +1761,15 @@ impl Session {
             );
 
             // Section 4.2 rule 3: stale or superseded leases are revoked
-            // before anything else; then the desired state (rule 5), then the
-            // app leases this node holds (section 5.12).
+            // before anything else; then a pending fence acknowledgement
+            // (rule 4), whose answer the desired state waits for; then the
+            // desired state (rule 5) and the app leases this node holds
+            // (section 5.12).
             self.revoke_stale_leases(&hello.leases, outbox).await;
-            match self.refresh(hello.stored_rev, true).await {
-                Ok(()) => self.retry_pending = false,
-                Err(e) => {
-                    tracing::warn!(%e, node_id = %self.node_id, "cannot build the desired state");
-                    self.retry_pending = true;
-                }
+            if self.send_pending_fence_ack(hello.stored_rev, outbox).await {
+                return false;
             }
-            self.send_grants(outbox).await;
+            self.finish_start(hello.stored_rev, outbox).await;
             return false;
         }
 
@@ -1788,6 +1848,19 @@ impl Session {
             }
             NodeMessage::CommandResult(result) => {
                 if let Some(re) = raw.re.as_deref() {
+                    if self
+                        .fence_ack
+                        .as_ref()
+                        .is_some_and(|wait| wait.msg_id == re)
+                    {
+                        self.fence_ack_answered(&result, outbox).await;
+                        return false;
+                    }
+                    if let Some(lease_id) =
+                        self.hub.0.take_revoke(&self.node_id, self.generation, re)
+                    {
+                        self.note_revoke_answer(&lease_id, &result).await;
+                    }
                     self.hub
                         .0
                         .resolve_command_result(&self.node_id, self.generation, re, result);
@@ -1968,16 +2041,150 @@ impl Session {
                 fencing_token: token,
                 reason,
             };
+            let id = new_msg_id();
+            if let Some(pending) = self.hub.0.pending_of(&self.node_id, self.generation) {
+                pending
+                    .lock()
+                    .expect("pending lock")
+                    .revoke_leases
+                    .insert(id.clone(), claimed.lease_id.clone());
+            }
             outbox.push(
                 ControlMessage::LeaseRevoke(revoke)
-                    .to_frame(&new_msg_id(), None)
+                    .to_frame(&id, None)
                     .to_text(),
             );
         }
     }
 
+    /// Sends the node's pending fence acknowledgement as `command` kind
+    /// `fence_ack` (section 4.2 rule 4, section 8.5 step 4). Returns whether
+    /// one was sent; the desired state then waits for its answer.
+    async fn send_pending_fence_ack(&mut self, stored_rev: u64, outbox: &mut Vec<String>) -> bool {
+        let pending = match self.hub.0.store.pool().acquire().await {
+            Ok(mut conn) => crate::fences::pending_of(&mut conn, &self.node_id).await,
+            Err(e) => Err(ApiError::from(e)),
+        };
+        let pending = match pending {
+            Ok(Some(pending)) if !pending.lease_ids.is_empty() => pending,
+            Ok(_) => return false,
+            Err(e) => {
+                tracing::warn!(code = %e.code.as_str(), node_id = %self.node_id, "cannot read a pending fence ack");
+                return false;
+            }
+        };
+        let msg_id = new_msg_id();
+        outbox.push(
+            ControlMessage::Command(wire::Command {
+                kind: "fence_ack".to_string(),
+                params: crate::fences::command_params(&pending.lease_ids),
+            })
+            .to_frame(&msg_id, None)
+            .to_text(),
+        );
+        self.fence_ack = Some(FenceAckWait {
+            msg_id,
+            lease_ids: pending.lease_ids,
+            stored_rev,
+        });
+        true
+    }
+
+    /// The answer to the session-start `fence_ack`: `ok` clears what it
+    /// carried from `fence_ack_pending` (section 8.5 step 4); then the
+    /// desired state follows (section 4.2 rule 5).
+    async fn fence_ack_answered(
+        &mut self,
+        result: &quoro_proto::CommandResult,
+        outbox: &mut Vec<String>,
+    ) {
+        let Some(wait) = self.fence_ack.take() else {
+            return;
+        };
+        if result.status == quoro_proto::CommandStatus::Ok {
+            if let Err(e) =
+                crate::fences::confirm(&self.hub.0.store, &self.node_id, &wait.lease_ids).await
+            {
+                tracing::warn!(code = %e.code.as_str(), node_id = %self.node_id, "cannot clear a delivered fence ack");
+            }
+        } else {
+            tracing::warn!(
+                node_id = %self.node_id,
+                detail = ?result.detail,
+                "the node did not take the fence ack; it is sent again at its next session"
+            );
+        }
+        self.finish_start(wait.stored_rev, outbox).await;
+    }
+
+    /// Section 4.2 rule 5 and section 5.12: the first desired state of the
+    /// session, then the app leases this node holds.
+    async fn finish_start(&mut self, stored_rev: u64, outbox: &mut Vec<String>) {
+        match self.refresh(stored_rev, true).await {
+            Ok(()) => self.retry_pending = false,
+            Err(e) => {
+                tracing::warn!(%e, node_id = %self.node_id, "cannot build the desired state");
+                self.retry_pending = true;
+            }
+        }
+        self.send_grants(outbox).await;
+    }
+
+    /// A `lease_revoke` answered with `fence_failed`: the failure is recorded
+    /// on the node, so the lease is granted to no node until an operator
+    /// acknowledges it (section 8.5 step 1).
+    async fn note_revoke_answer(&self, lease_id: &str, result: &quoro_proto::CommandResult) {
+        if result.error.as_ref().map(|error| error.code)
+            != Some(quoro_proto::ErrorCode::FenceFailed)
+        {
+            return;
+        }
+        let recorded: Result<bool, ApiError> = async {
+            let mut w = self.hub.0.store.begin_write().await?;
+            let app_ids: Vec<String> = leases::by_id(&mut w.tx, lease_id)
+                .await?
+                .filter(|lease| lease.resource_type == "app")
+                .map(|lease| vec![lease.resource_id])
+                .unwrap_or_default();
+            let lease_ids = [lease_id.to_string()];
+            let actor = Actor {
+                kind: ActorType::Node,
+                id: self.node_id.clone(),
+            };
+            let changed = crate::fences::record_failure(
+                &mut w.tx,
+                &self.node_id,
+                &crate::fences::Failed {
+                    lease_ids: &lease_ids,
+                    app_ids: &app_ids,
+                    vm_ids: &[],
+                },
+                &actor,
+            )
+            .await?;
+            w.commit().await?;
+            Ok(changed)
+        }
+        .await;
+        match recorded {
+            Ok(true) => tracing::warn!(
+                node_id = %self.node_id,
+                lease_id,
+                "a revoke was answered fence_failed; the lease waits for an operator's acknowledgement"
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                code = %e.code.as_str(),
+                node_id = %self.node_id,
+                lease_id,
+                "cannot record a failed fence"
+            ),
+        }
+    }
+
     /// Sends a `lease_grant` for every unrevoked lease this node holds
-    /// (section 5.12). A `local` lease carries no `duration_ms`.
+    /// (section 5.12), except a lease listed in a node's `fence_failure`
+    /// (section 8.5). A `local` lease carries no `duration_ms`.
     async fn send_grants(&self, outbox: &mut Vec<String>) {
         let mut conn = match self.hub.0.store.pool().acquire().await {
             Ok(conn) => conn,
@@ -1986,9 +2193,23 @@ impl Session {
                 return;
             }
         };
+        let listed = match crate::fences::listed_leases(&mut conn).await {
+            Ok(listed) => listed,
+            Err(e) => {
+                tracing::warn!(
+                    code = %e.code.as_str(),
+                    node_id = %self.node_id,
+                    "cannot read the failed fences; no lease is granted"
+                );
+                return;
+            }
+        };
         match leases::held_by_node(&mut conn, &self.node_id).await {
             Ok(leases) => {
-                for lease in leases {
+                for lease in leases
+                    .into_iter()
+                    .filter(|lease| !listed.contains(&lease.id))
+                {
                     outbox.push(
                         ControlMessage::LeaseGrant(lease.grant())
                             .to_frame(&new_msg_id(), None)
@@ -2916,6 +3137,39 @@ async fn insert_node_event(
     crate::service::incidents::apply_node_event(&mut w.tx, event)
         .await
         .map_err(|e| format!("{e:?}"))?;
+    // Section 8.5 step 1: a failed fence lists its leases on the node, in the
+    // event's transaction.
+    if event.kind == "node.fence_failed" {
+        let ids = |key: &str| -> Vec<String> {
+            event
+                .data
+                .get(key)
+                .and_then(Value::as_array)
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let (lease_ids, app_ids, vm_ids) = (ids("lease_ids"), ids("app_ids"), ids("vm_ids"));
+        crate::fences::record_failure(
+            &mut w.tx,
+            node_id,
+            &crate::fences::Failed {
+                lease_ids: &lease_ids,
+                app_ids: &app_ids,
+                vm_ids: &vm_ids,
+            },
+            &Actor {
+                kind: ActorType::Node,
+                id: node_id.to_string(),
+            },
+        )
+        .await
+        .map_err(|e| format!("cannot record a failed fence: {}", e.code.as_str()))?;
+    }
     w.commit().await.map_err(|e| e.to_string())
 }
 

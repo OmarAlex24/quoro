@@ -185,13 +185,50 @@ pub(crate) async fn held_by_node(
     rows.iter().map(lease_from_row).collect()
 }
 
+/// Increments the `fencing_token` of each listed lease and records it
+/// revoked in the primary's view, with its holder still named, as when an
+/// operator declares a node lost (`node-agent-protocol.md` sections 8.3 and
+/// 8.5 step 3). Writes one change-log entry per lease and returns the rows;
+/// an id with no row is skipped.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn bump_tokens(
+    conn: &mut SqliteConnection,
+    lease_ids: &[String],
+    actor: &Actor,
+) -> Result<Vec<Lease>, ApiError> {
+    let now = now_rfc3339();
+    let mut bumped = Vec::new();
+    for lease_id in lease_ids {
+        let Some(mut lease) = by_id(conn, lease_id).await? else {
+            continue;
+        };
+        lease.fencing_token = lease.fencing_token.max(0) + 1;
+        if lease.revoked_at.is_none() {
+            lease.revoked_at = Some(now.clone());
+        }
+        sqlx::query("UPDATE leases SET fencing_token = ?, revoked_at = ? WHERE id = ?")
+            .bind(lease.fencing_token)
+            .bind(&lease.revoked_at)
+            .bind(&lease.id)
+            .execute(&mut *conn)
+            .await?;
+        changelog::append(conn, actor, "lease", &lease.id, Op::Update, lease.payload()).await?;
+        bumped.push(lease);
+    }
+    Ok(bumped)
+}
+
 /// Grants the app's `local` lease to `node_id` and writes its change-log
 /// entry, returning the row. The token is one more than whatever the app's
 /// lease last carried, so ownership changes never reuse a token (section 8.6).
 ///
 /// # Errors
 ///
-/// A database error.
+/// `conflict` while the lease is listed in a node's `fence_failure`, or a
+/// database error.
 pub(crate) async fn grant_app_lease(
     conn: &mut SqliteConnection,
     app_id: &str,
@@ -200,6 +237,18 @@ pub(crate) async fn grant_app_lease(
 ) -> Result<Lease, ApiError> {
     let now = now_rfc3339();
     let previous = app_lease(conn, app_id).await?;
+    // Section 8.5: a lease listed in a node's `fence_failure` is granted to
+    // no node until an operator acknowledges the failed fence.
+    if let Some(previous) = &previous
+        && crate::fences::listed_leases(conn)
+            .await?
+            .contains(&previous.id)
+    {
+        return Err(ApiError::conflict(format!(
+            "lease {} has a failed fence that no operator has acknowledged",
+            previous.id
+        )));
+    }
     let token = previous
         .as_ref()
         .map_or(1, |lease| lease.fencing_token.max(0) + 1);
