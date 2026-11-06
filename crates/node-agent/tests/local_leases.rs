@@ -1326,3 +1326,43 @@ async fn a_fence_ack_waits_for_a_running_fence_of_its_lease() {
     assert!(!store.node_failed().await.unwrap());
     leases.abort();
 }
+
+/// Section 8.5 step 1: a fence the restore finds is the stop's owner before
+/// the service runs, so a reconciler that starts first leaves the VM to it.
+#[tokio::test]
+async fn a_fence_the_restore_finds_owns_the_stop_from_the_start() {
+    let dir = TargetDir::new("lease-restore-owns-stop");
+    let engine = Arc::new(FakeEngine::new());
+    let snapshot = snapshot_full(
+        1,
+        vec![stateful_vm("vm_cut", "lse_cut", 1, Vec::new())],
+        Vec::new(),
+        Vec::new(),
+    );
+    let (desired, _) = watch::channel(Some(snapshot));
+    let (leases, _store) = start_with(&dir, engine.clone(), &desired, slow_config()).await;
+    leases
+        .link
+        .grant(msg("msg_grant"), None, local_grant("lse_cut", "app_cut", 1))
+        .await
+        .unwrap();
+    let vm = common::running_vm(&engine, "vm_cut", 2).await;
+    engine.set_stop_delay(&vm, Duration::from_secs(600));
+    let link = leases.link.clone();
+    let pending = tokio::spawn(async move {
+        link.revoke(msg("msg_revoke"), None, revoke("lse_cut", 1))
+            .await
+    });
+    wait_for("the stop to begin", || stops_of(&engine, &vm) == 1).await;
+    // The agent dies mid-fence; its fence task goes with it.
+    leases.abort();
+    let _ = pending.await;
+
+    let (leases, _store) = start_with(&dir, engine.clone(), &desired, slow_config()).await;
+    assert!(
+        leases.view.fence_owns_stop("lse_cut"),
+        "the restored fence owns the stop as soon as the service exists"
+    );
+    assert!(!leases.view.may_start_stateful("lse_cut", 1));
+    leases.abort();
+}

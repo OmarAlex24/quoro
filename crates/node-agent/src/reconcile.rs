@@ -909,15 +909,33 @@ impl<E: Engine + 'static> Reconciler<E> {
             && recorded.as_deref() != Some(signature.as_str())
         {
             info!(vm_id, "the VM's attached volumes changed; recreating it");
+            if self.fence_owns_stop(vm) {
+                debug!(
+                    vm_id,
+                    "a fence of the VM's lease is stopping it; recreating it later"
+                );
+                return false;
+            }
             if let Some(current) = &info
                 && matches!(
                     current.state,
                     VmState::Running | VmState::Starting | VmState::Stopping
                 )
-                && let Err(e) = self.engine.stop(&id, StopMode::Force).await
             {
-                warn!(vm_id, error = ?e, "could not stop the VM for a recreate");
-                return false;
+                match self
+                    .unless_fenced(vm, self.engine.stop(&id, StopMode::Force))
+                    .await
+                {
+                    None => {
+                        debug!(vm_id, "a fence of the VM's lease took over its stop");
+                        return false;
+                    }
+                    Some(Err(e)) => {
+                        warn!(vm_id, error = ?e, "could not stop the VM for a recreate");
+                        return false;
+                    }
+                    Some(Ok(_)) => {}
+                }
             }
             match self.engine.delete(&id).await {
                 Ok(()) => {
@@ -981,14 +999,18 @@ impl<E: Engine + 'static> Reconciler<E> {
         // stays stopped. Neither is an error: the primary moved the lease or
         // the volume work is still running.
         if vm.desired_status == DesiredStatus::Running && !may_start {
+            // A fence of the lease stops the VM itself (section 8.5 step 1):
+            // checked after `may_keep_running`, so a lease that just left
+            // `held` is seen fencing.
             if matches!(
                 info.state,
                 VmState::Running | VmState::Starting | VmState::Stopping
             ) && !may_keep_running
             {
-                match self.stop_vm(&id).await {
-                    Ok(stopped) => info = stopped,
-                    Err(e) => {
+                match self.unless_fenced(vm, self.stop_vm(&id)).await {
+                    None => debug!(vm_id, "a fence of the VM's lease is stopping it"),
+                    Some(Ok(stopped)) => info = stopped,
+                    Some(Err(e)) => {
                         warn!(vm_id, error = ?e, "could not stop a VM that may not start");
                         return false;
                     }
@@ -1031,9 +1053,13 @@ impl<E: Engine + 'static> Reconciler<E> {
 
         if vm.restart_generation > applied_generation && may_start {
             if matches!(info.state, VmState::Running | VmState::Starting) {
-                match self.stop_vm(&id).await {
-                    Ok(stopped) => info = stopped,
-                    Err(e) => {
+                match self.unless_fenced(vm, self.stop_vm(&id)).await {
+                    None => {
+                        debug!(vm_id, "a fence of the VM's lease took over its stop");
+                        return false;
+                    }
+                    Some(Ok(stopped)) => info = stopped,
+                    Some(Err(e)) => {
                         warn!(vm_id, error = ?e, "could not stop the VM for a restart");
                         return false;
                     }
@@ -1146,8 +1172,12 @@ impl<E: Engine + 'static> Reconciler<E> {
                     info.state,
                     VmState::Running | VmState::Starting | VmState::Stopping
                 ) {
-                    match self.stop_vm(&id).await {
-                        Ok(stopped) => {
+                    match self.unless_fenced(vm, self.stop_vm(&id)).await {
+                        None => {
+                            debug!(vm_id, "a fence of the VM's lease is stopping it");
+                            reached = false;
+                        }
+                        Some(Ok(stopped)) => {
                             if let Some(code) = stopped.exit_code
                                 && let Err(e) = self
                                     .store
@@ -1158,7 +1188,7 @@ impl<E: Engine + 'static> Reconciler<E> {
                             }
                             info = stopped;
                         }
-                        Err(e) => {
+                        Some(Err(e)) => {
                             warn!(vm_id, error = ?e, "could not stop the VM");
                             reached = false;
                         }
@@ -1651,6 +1681,34 @@ impl<E: Engine + 'static> Reconciler<E> {
             return None;
         };
         self.lease.start_permit(lease_id, token).await.map(Some)
+    }
+
+    /// Whether a fence of the stateful VM's lease is stopping it: then the
+    /// fence alone stops the VM (section 8.5 step 1), since a second stop
+    /// would hold the engine's lock on the VM and make the fence's own stop
+    /// time out.
+    fn fence_owns_stop(&self, vm: &SpecVm) -> bool {
+        Self::fenced_lease(vm).is_some_and(|lease_id| self.lease.fence_owns_stop(lease_id))
+    }
+
+    fn fenced_lease(vm: &SpecVm) -> Option<&str> {
+        vm.lease_id.as_deref().filter(|_| vm.stateful)
+    }
+
+    /// Runs `stop`, an engine stop of `vm`, unless a fence of its lease is
+    /// stopping the VM: then, or as soon as such a fence is triggered while
+    /// `stop` runs, `stop` is given up and `None` returned. Dropping it
+    /// releases the engine's lock on the VM, so the fence's own stop runs
+    /// within its timers (section 8.5 step 1).
+    async fn unless_fenced<T>(&self, vm: &SpecVm, stop: impl Future<Output = T>) -> Option<T> {
+        let Some(lease_id) = Self::fenced_lease(vm) else {
+            return Some(stop.await);
+        };
+        tokio::select! {
+            biased;
+            () = self.lease.fence_triggered(lease_id) => None,
+            stopped = stop => Some(stopped),
+        }
     }
 
     async fn stop_vm(&self, id: &VmId) -> Result<VmInfo, EngineError> {
