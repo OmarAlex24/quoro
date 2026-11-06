@@ -146,6 +146,7 @@ fn agent_config(config: &Config, role: Role) -> AgentConfig {
         cloudflared_metrics: config.ingress.cloudflared_metrics,
         acme_directory_url: config.ingress.acme_directory_url.clone(),
         acme_contact: config.ingress.acme_contact.clone(),
+        snapshots_at_start: None,
     }
 }
 
@@ -307,10 +308,10 @@ pub async fn run(
     let role = read_role(&config.node.data_dir);
     if !role.runs_vms() {
         info!("running as {role} without an engine: this machine starts no VMs");
-        return run_with(config, role, NullEngine::new(), shutdown).await;
+        return run_with(config, role, NullEngine::new(), None, shutdown).await;
     }
     match config.engine {
-        EngineKind::Fake => run_with(config, role, FakeEngine::new(), shutdown).await,
+        EngineKind::Fake => run_with(config, role, FakeEngine::new(), None, shutdown).await,
         EngineKind::CloudHypervisor => run_cloud_hypervisor(config, role, shutdown).await,
     }
 }
@@ -322,7 +323,12 @@ async fn run_cloud_hypervisor(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<i32, String> {
     match cloud_hypervisor_engine(config).await {
-        Ok(engine) => run_with(config, role, engine, shutdown).await,
+        Ok(engine) => {
+            // What the engine's start-up sweep left, so the agent can tell
+            // whether its store records every snapshot (section 12).
+            let snapshots_at_start = engine.snapshots_at_start().cloned();
+            run_with(config, role, engine, snapshots_at_start, shutdown).await
+        }
         Err(code) => Ok(code),
     }
 }
@@ -348,11 +354,16 @@ async fn cloud_hypervisor_engine(config: &Config) -> Result<quoro_engine::ch::Ch
     use quoro_engine::ch::{ChConfig, ChEngine};
 
     let ch = &config.cloud_hypervisor;
-    let ch_config = ChConfig::new(
+    let mut ch_config = ChConfig::new(
         ch.state_dir(&config.node.data_dir),
         ch.artifacts_dir.clone(),
         ch.init_binary.clone(),
     );
+    // The engine removes the snapshots left in its volume directory when it
+    // starts, except those the node agent's store records: a warm base or a
+    // quarantined copy outlives the agent (engine-trait.md section 3.16). A
+    // store that does not track every snapshot keeps them all.
+    ch_config.snapshot_sweep = quoro_node_agent::kept::sweep_rule(&config.node.data_dir).await;
     // A pin mismatch, a missing `nft` or a broken artifact lands here; the
     // engine's message already names the cause, so it is passed through.
     let engine = match ChEngine::new(ch_config).await {
@@ -393,13 +404,18 @@ async fn cloud_hypervisor_engine(config: &Config) -> Result<quoro_engine::ch::Ch
 }
 
 /// Enrolls through the local join file when needed, then runs the agent.
+///
+/// `snapshots_at_start` is what the engine's start-up sweep left in its
+/// volume directory, for an engine that has one.
 async fn run_with<E: Engine + 'static>(
     config: &Config,
     role: Role,
     engine: E,
+    snapshots_at_start: Option<std::collections::BTreeSet<String>>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<i32, String> {
-    let agent = agent_config(config, role);
+    let mut agent = agent_config(config, role);
+    agent.snapshots_at_start = snapshots_at_start;
     let facts = facts_of(&engine).await;
     let dns = &agent.dns;
     if dns.is_empty() {

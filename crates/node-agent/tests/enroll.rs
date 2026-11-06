@@ -101,6 +101,7 @@ fn config(dir: &TempDir) -> AgentConfig {
         cloudflared_metrics: "127.0.0.1:20241".parse().unwrap(),
         acme_directory_url: quoro_node_agent::DEFAULT_ACME_DIRECTORY.to_owned(),
         acme_contact: Vec::new(),
+        snapshots_at_start: None,
     }
 }
 

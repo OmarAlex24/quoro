@@ -68,6 +68,10 @@ pub struct ChConfig {
     /// Host memory never handed to VMs when reserving at create (default
     /// 512 MiB).
     pub reserved_memory_mb: u64,
+    /// Which snapshots the start-up sweep of the volume directory keeps
+    /// (section 3.16). The default keeps every snapshot; the node agent
+    /// passes the file names its store records once it knows them.
+    pub snapshot_sweep: crate::SnapshotSweep,
 }
 
 impl ChConfig {
@@ -82,6 +86,7 @@ impl ChConfig {
             init_binary,
             guest_stop_timeout: Duration::from_secs(30),
             reserved_memory_mb: 512,
+            snapshot_sweep: crate::SnapshotSweep::KeepAll,
         }
     }
 }
@@ -113,6 +118,21 @@ impl ChEngine {
     pub async fn new(config: ChConfig) -> Result<ChEngine, EngineError> {
         let inner = Inner::new(config).await?;
         Ok(Self { inner })
+    }
+
+    /// The file names of the snapshots the start-up sweep left in the volume
+    /// directory: those [`ChConfig::snapshot_sweep`] kept (§3.16). `None`
+    /// when the engine cannot vouch for the listing: the volume pool is
+    /// broken, the directory or an entry could not be read, another
+    /// filesystem is mounted on the directory, or the node has no reflink.
+    ///
+    /// The node agent compares them with its records: a snapshot it does not
+    /// record is one it cannot tell from a quarantined copy, so it keeps
+    /// every snapshot until none is left (`node-agent-protocol.md` section
+    /// 12).
+    #[must_use]
+    pub fn snapshots_at_start(&self) -> Option<&std::collections::BTreeSet<String>> {
+        self.inner.snapshots_at_start.as_ref()
     }
 
     /// How many lifecycle events were dropped because a subscriber's buffer was

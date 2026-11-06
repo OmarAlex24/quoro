@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use quoro_engine::{
     ByteRange, ChangedRanges, Engine, EngineError, EngineEvent, FakeEngine, FakeOp, FakeRanges,
-    ImageDigest, NodeNetwork, OciLayout, OutputStream, RangesOf, SnapshotMethod, StageFrom,
-    StopMode, VmCounters, VmId, VmState, VolumeAttach, VolumeId, WorkDisk,
+    ImageDigest, NodeNetwork, OciLayout, OutputStream, RangesOf, SnapshotMethod, SnapshotSweep,
+    StageFrom, StopMode, VmCounters, VmId, VmState, VolumeAttach, VolumeId, VolumeSnapshot,
+    WorkDisk,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -888,10 +889,10 @@ async fn create_refuses_egress_only_with_an_isolation_group() {
 
 /// A scratch directory under the crate's `target`, emptied first.
 fn scratch(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::current_dir()
-        .expect("cwd")
-        .join("target")
-        .join(format!("fake-warm-{tag}"));
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target")
+        .join("fake-tests")
+        .join(format!("warm-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("dir");
     dir
@@ -1249,6 +1250,88 @@ async fn staging_checks_its_source_and_the_commit_refuses_an_attached_volume() {
     assert_eq!(engine.staged_volumes().len(), 1, "the staging file is kept");
     engine.delete(&vm).await.expect("delete");
     engine.commit_staged_volume(&staged).await.expect("commit");
+}
+
+#[tokio::test]
+async fn the_start_up_sweep_keeps_only_the_recorded_snapshots() {
+    let dir = scratch("sweep");
+    let engine = FakeEngine::new();
+    engine.set_volume_dir(&dir);
+    let volume = VolumeId("vol_01".to_string());
+    engine.ensure_volume(&volume, 1).await.expect("volume");
+    let kept = engine.snapshot_volume(&volume).await.expect("snapshot");
+    let swept = engine.snapshot_volume(&volume).await.expect("snapshot");
+    let staged = engine
+        .stage_volume(&volume, 1, &StageFrom::Empty)
+        .await
+        .expect("stage");
+
+    let name = |snapshot: &VolumeSnapshot| {
+        snapshot
+            .location
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("a file name")
+            .to_owned()
+    };
+    let rule = SnapshotSweep::Keep([name(&kept)].into_iter().collect());
+    let left = engine.start_up_sweep(&rule).expect("sweep");
+    assert_eq!(left, [name(&kept)].into_iter().collect());
+    assert_eq!(
+        engine
+            .volume_snapshots()
+            .into_iter()
+            .map(|snapshot| snapshot.snapshot_id)
+            .collect::<Vec<_>>(),
+        vec![kept.snapshot_id.clone()]
+    );
+    assert!(kept.location.exists(), "the recorded snapshot stays");
+    assert!(!swept.location.exists(), "the unrecorded one is removed");
+    assert!(!staged.location.exists(), "a staging file never survives");
+    assert!(engine.staged_volumes().is_empty());
+
+    let left = engine
+        .start_up_sweep(&SnapshotSweep::KeepAll)
+        .expect("sweep");
+    assert_eq!(left, [name(&kept)].into_iter().collect());
+    assert!(kept.location.exists());
+    let left = engine
+        .start_up_sweep(&SnapshotSweep::Keep(Default::default()))
+        .expect("sweep");
+    assert!(left.is_empty());
+    assert!(!kept.location.exists());
+    assert!(engine.volume_snapshots().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_failed_snapshot_delete_keeps_the_file() {
+    let dir = scratch("delete-fails");
+    let engine = FakeEngine::new();
+    engine.set_volume_dir(&dir);
+    let volume = VolumeId("vol_01".to_string());
+    engine.ensure_volume(&volume, 1).await.expect("volume");
+    let snapshot = engine.snapshot_volume(&volume).await.expect("snapshot");
+    engine.fail_next(
+        FakeOp::DeleteVolumeSnapshot,
+        EngineError::Unsupported("the volume pool is broken".into()),
+    );
+    assert!(matches!(
+        engine.delete_volume_snapshot(&snapshot).await,
+        Err(EngineError::Unsupported(_))
+    ));
+    assert!(snapshot.location.exists());
+    engine
+        .delete_volume_snapshot(&snapshot)
+        .await
+        .expect("delete");
+    assert!(!snapshot.location.exists());
+    // A missing snapshot is Ok, as in the real engine (section 3.16).
+    engine
+        .delete_volume_snapshot(&snapshot)
+        .await
+        .expect("delete again");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]

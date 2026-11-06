@@ -160,6 +160,19 @@ CREATE TABLE IF NOT EXISTS lease_tokens (
     token         INTEGER NOT NULL,
     PRIMARY KEY (resource_type, resource_id)
 );
+CREATE TABLE IF NOT EXISTS kept_snapshots (
+    snapshot_id   TEXT PRIMARY KEY,
+    volume_id     TEXT NOT NULL,
+    app_id        TEXT NOT NULL,
+    purpose       TEXT NOT NULL,
+    seq           INTEGER,
+    location      TEXT NOT NULL,
+    size_bytes    INTEGER NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    method        TEXT NOT NULL,
+    pause_ms      INTEGER NOT NULL,
+    cells         BLOB
+);
 CREATE TABLE IF NOT EXISTS fences (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     lease_id  TEXT NOT NULL,
@@ -338,6 +351,23 @@ pub struct VolumeRecord {
     pub error: Option<String>,
     /// Bytes the sparse file uses, when known.
     pub allocated_bytes: Option<u64>,
+}
+
+/// One snapshot the node keeps across an agent restart (`warm`,
+/// `quarantine`, `node-agent-protocol.md` section 12): the engine's
+/// descriptor plus why the node keeps it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeptSnapshotRecord {
+    /// The app the volume belongs to.
+    pub app_id: String,
+    /// The engine's descriptor; `snapshot_id` is the key.
+    pub snapshot: quoro_engine::VolumeSnapshot,
+    /// Why the node keeps it, for example `warm_base`.
+    pub purpose: String,
+    /// The `snapshot_seq` of the copy it holds, when it has one.
+    pub seq: Option<u64>,
+    /// The copy's cell hashes, when the node keeps them (section 6.13).
+    pub cells: Option<Vec<u8>>,
 }
 
 /// One backup job row (`node-agent-protocol.md` section 12 `backups`).
@@ -1218,6 +1248,89 @@ impl NodeStore {
             .map(|_| ())
     }
 
+    /// Records a snapshot the node keeps, or updates its purpose, `seq` and
+    /// cell hashes. A record never moves to another file: saving the same
+    /// `snapshot_id` with another location or volume is an error.
+    ///
+    /// The record is durable when this returns: the write is committed in its
+    /// own transaction, so the engine's start-up sweep keeps the file from
+    /// the next start on (engine-trait.md section 3.16).
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure, or when the id is recorded
+    /// with another location or volume.
+    pub async fn save_kept_snapshot(&self, record: &KeptSnapshotRecord) -> Result<(), AgentError> {
+        let snapshot = &record.snapshot;
+        let created_at_ms = snapshot
+            .created_at
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| {
+                i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
+            });
+        let done = sqlx::query(
+            "INSERT INTO kept_snapshots (snapshot_id, volume_id, app_id, purpose, seq, location, \
+             size_bytes, created_at_ms, method, pause_ms, cells) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(snapshot_id) DO UPDATE SET app_id = excluded.app_id, \
+             purpose = excluded.purpose, seq = excluded.seq, cells = excluded.cells \
+             WHERE kept_snapshots.location = excluded.location \
+             AND kept_snapshots.volume_id = excluded.volume_id",
+        )
+        .bind(&snapshot.snapshot_id)
+        .bind(&snapshot.volume_id.0)
+        .bind(&record.app_id)
+        .bind(&record.purpose)
+        .bind(record.seq.map(|seq| i64::try_from(seq).unwrap_or(i64::MAX)))
+        .bind(snapshot.location.display().to_string())
+        .bind(i64::try_from(snapshot.size_bytes).unwrap_or(i64::MAX))
+        .bind(created_at_ms)
+        .bind(engine_method_str(snapshot.method))
+        .bind(i64::try_from(snapshot.pause.as_millis()).unwrap_or(i64::MAX))
+        .bind(record.cells.as_deref())
+        .execute(&self.pool)
+        .await
+        .map_err(store_error)?;
+        if done.rows_affected() == 0 {
+            // The sweep keeps a snapshot by its file name, so a record must
+            // never move to another file.
+            return Err(AgentError::Store(format!(
+                "kept snapshot {} is recorded with another file or volume",
+                snapshot.snapshot_id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Every snapshot the node keeps, ordered by volume and id.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure or a row it cannot read back.
+    pub async fn kept_snapshots(&self) -> Result<Vec<KeptSnapshotRecord>, AgentError> {
+        let rows =
+            sqlx::query("SELECT * FROM kept_snapshots ORDER BY volume_id ASC, snapshot_id ASC")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(store_error)?;
+        rows.into_iter().map(kept_snapshot_record).collect()
+    }
+
+    /// Forgets one kept snapshot. The caller deletes the file first, so a
+    /// record never outlives its reason to keep the file.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn forget_kept_snapshot(&self, snapshot_id: &str) -> Result<(), AgentError> {
+        sqlx::query("DELETE FROM kept_snapshots WHERE snapshot_id = ?")
+            .bind(snapshot_id)
+            .execute(&self.pool)
+            .await
+            .map_err(store_error)
+            .map(|_| ())
+    }
+
     /// One backup job row.
     ///
     /// # Errors
@@ -1713,6 +1826,49 @@ fn volume_record(row: sqlx::sqlite::SqliteRow) -> Result<VolumeRecord, AgentErro
         error: row.try_get("error").map_err(store_error)?,
         allocated_bytes: allocated.and_then(|bytes| u64::try_from(bytes).ok()),
     })
+}
+
+/// Reads one `kept_snapshots` row back into a [`KeptSnapshotRecord`].
+fn kept_snapshot_record(row: sqlx::sqlite::SqliteRow) -> Result<KeptSnapshotRecord, AgentError> {
+    let seq: Option<i64> = row.try_get("seq").map_err(store_error)?;
+    let size_bytes: i64 = row.try_get("size_bytes").map_err(store_error)?;
+    let created_at_ms: i64 = row.try_get("created_at_ms").map_err(store_error)?;
+    let pause_ms: i64 = row.try_get("pause_ms").map_err(store_error)?;
+    let method: String = row.try_get("method").map_err(store_error)?;
+    let location: String = row.try_get("location").map_err(store_error)?;
+    let volume_id: String = row.try_get("volume_id").map_err(store_error)?;
+    let method = match method.as_str() {
+        "reflink" => quoro_engine::SnapshotMethod::Reflink,
+        "pause_copy" => quoro_engine::SnapshotMethod::PauseCopy,
+        other => {
+            return Err(AgentError::Store(format!(
+                "unknown snapshot method {other:?}"
+            )));
+        }
+    };
+    Ok(KeptSnapshotRecord {
+        app_id: row.try_get("app_id").map_err(store_error)?,
+        snapshot: quoro_engine::VolumeSnapshot {
+            volume_id: quoro_engine::VolumeId(volume_id),
+            snapshot_id: row.try_get("snapshot_id").map_err(store_error)?,
+            created_at: std::time::UNIX_EPOCH
+                + Duration::from_millis(u64::try_from(created_at_ms).unwrap_or(0)),
+            size_bytes: u64::try_from(size_bytes).unwrap_or(0),
+            location: std::path::PathBuf::from(location),
+            method,
+            pause: Duration::from_millis(u64::try_from(pause_ms).unwrap_or(0)),
+        },
+        purpose: row.try_get("purpose").map_err(store_error)?,
+        seq: seq.and_then(|seq| u64::try_from(seq).ok()),
+        cells: row.try_get("cells").map_err(store_error)?,
+    })
+}
+
+fn engine_method_str(method: quoro_engine::SnapshotMethod) -> &'static str {
+    match method {
+        quoro_engine::SnapshotMethod::Reflink => "reflink",
+        quoro_engine::SnapshotMethod::PauseCopy => "pause_copy",
+    }
 }
 
 fn resource_type_str(resource_type: ResourceType) -> &'static str {

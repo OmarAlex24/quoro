@@ -189,30 +189,54 @@ fn probe_clone(source: &Path, clone: &Path) -> std::io::Result<()> {
 
 /// Removes the snapshot, staging and temporary files a crash left in the
 /// volume directory (§3.16: snapshots left by a crash are removed at start;
-/// §3.22: so are staging files). Volume files themselves are never touched.
+/// §3.22: so are staging files), and returns the file names of the snapshots
+/// it left. Volume files themselves are never touched.
 ///
-/// Every snapshot is removed because, so far, no snapshot outlives the node
-/// agent run that took it: a backup deletes its own. §3.16 lets the node
-/// agent keep the snapshots its store records from M5b (a warm base, the
-/// snapshot being shipped, a quarantined copy); the change that first keeps
-/// one across a restart must hand this sweep that keep set, or move it into
-/// the node agent.
-pub(super) fn remove_leftovers(dir: &Path) {
+/// A snapshot whose file name `sweep` keeps stays: from M5b the node agent
+/// keeps the snapshots its store records, a warm base or a quarantined copy,
+/// across a restart (§3.16). The one M5a snapshot name,
+/// `<volume id>.snapshot`, goes under every rule: from M5b nothing creates or
+/// records it, so such a file is always a backup cut short before M5b.
+///
+/// The names are `None` when the directory or one of its entries could not
+/// be read: the node agent must never take a listing it did not get whole
+/// for "nothing is left".
+pub(super) fn remove_leftovers(
+    dir: &Path,
+    sweep: &crate::SnapshotSweep,
+) -> Option<std::collections::BTreeSet<String>> {
+    let mut kept = std::collections::BTreeSet::new();
+    let mut whole = true;
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+        return None;
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let Ok(entry) = entry else {
+            whole = false;
+            continue;
+        };
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
         };
-        if name.ends_with(SNAPSHOT_SUFFIX)
-            || name.ends_with(super::warm::STAGING_SUFFIX)
-            || name.ends_with(".tmp")
-        {
-            let _ = std::fs::remove_file(entry.path());
+        let leftover = if let Some(stem) = name.strip_suffix(SNAPSHOT_SUFFIX) {
+            // A volume id holds no dot, so a stem without one is the M5a
+            // name; a newer one carries `.<time>-<counter>`.
+            let legacy = !stem.contains('.');
+            legacy || !sweep.keeps(name)
+        } else {
+            name.ends_with(super::warm::STAGING_SUFFIX) || name.ends_with(".tmp")
+        };
+        if leftover {
+            if std::fs::remove_file(entry.path()).is_err() && name.ends_with(SNAPSHOT_SUFFIX) {
+                // A snapshot that could not be removed is still there.
+                kept.insert(name.to_owned());
+            }
+        } else if name.ends_with(SNAPSHOT_SUFFIX) {
+            kept.insert(name.to_owned());
         }
     }
+    whole.then_some(kept)
 }
 
 /// Free bytes available to the volume directory.
@@ -795,6 +819,13 @@ impl Inner {
             }
         }
 
+        // The new name must survive a power cut as well as the data, or a
+        // snapshot the node agent recorded could vanish with its directory
+        // entry (§3.16).
+        if let Err(err) = state::sync_dir(&location) {
+            let _ = std::fs::remove_file(&location);
+            return Err(err);
+        }
         let snapshot_id = location
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -854,6 +885,7 @@ const SNAPSHOT_API_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
     use std::path::{Path, PathBuf};
 
@@ -1163,11 +1195,103 @@ mod tests {
         for name in std::iter::once(id.to_string()).chain(leftovers.iter().cloned()) {
             std::fs::write(dir.join(&name), b"x").expect("file");
         }
-        remove_leftovers(&dir);
+        let kept = remove_leftovers(&dir, &crate::SnapshotSweep::Keep(BTreeSet::new()));
+        assert_eq!(kept, Some(BTreeSet::new()));
         assert!(dir.join(id).exists(), "the volume file stays");
         for name in &leftovers {
             assert!(!dir.join(name).exists(), "{name} is removed");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_sweep_keeps_the_snapshots_the_node_agent_records() {
+        let dir = scratch_dir("kept");
+        let id = "vol_01JC9ZC2D3E4F5G6H7J8K9M0NP";
+        let kept = format!("{id}.19a2b3c4d5e-3.snapshot");
+        let unrecorded = format!("{id}.19a2b3c4d5f-4.snapshot");
+        let others = [format!("{id}.staging"), format!("{id}.tmp")];
+        let write_all = || {
+            for name in [id.to_string(), kept.clone(), unrecorded.clone()]
+                .iter()
+                .chain(&others)
+            {
+                std::fs::write(dir.join(name), b"x").expect("file");
+            }
+        };
+
+        write_all();
+        let rule = crate::SnapshotSweep::Keep([kept.clone()].into_iter().collect());
+        let left = remove_leftovers(&dir, &rule);
+        assert_eq!(
+            left,
+            Some([kept.clone()].into_iter().collect::<BTreeSet<_>>())
+        );
+        assert!(dir.join(id).exists(), "the volume file stays");
+        assert!(dir.join(&kept).exists(), "a recorded snapshot stays");
+        assert!(!dir.join(&unrecorded).exists(), "an unrecorded one goes");
+        for name in &others {
+            assert!(!dir.join(name).exists(), "{name} is removed");
+        }
+
+        // A node agent that cannot read its records keeps every snapshot,
+        // but never a staging or temporary file.
+        write_all();
+        let legacy = format!("{id}.snapshot");
+        std::fs::write(dir.join(&legacy), b"x").expect("file");
+        let left = remove_leftovers(&dir, &crate::SnapshotSweep::KeepAll);
+        assert_eq!(
+            left,
+            Some(
+                [kept.clone(), unrecorded.clone()]
+                    .into_iter()
+                    .collect::<BTreeSet<_>>()
+            ),
+            "the sweep reports what it left"
+        );
+        assert!(dir.join(&kept).exists() && dir.join(&unrecorded).exists());
+        for name in &others {
+            assert!(!dir.join(name).exists(), "{name} is removed");
+        }
+        // The M5a name goes under every rule: nothing from M5b records it.
+        assert!(!dir.join(&legacy).exists(), "the M5a snapshot name goes");
+
+        // A directory it cannot read reports nothing, never an empty set.
+        assert_eq!(
+            remove_leftovers(&dir.join("missing"), &crate::SnapshotSweep::KeepAll),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The sweep matches the names the engine gives its snapshots, so a
+    /// snapshot named by [`new_snapshot_path`] and kept by its file name
+    /// survives, and one that is not kept goes.
+    #[test]
+    fn the_sweep_matches_the_names_the_engine_gives_snapshots() {
+        let dir = scratch_dir("names");
+        let id = VolumeId("vol_01JC9ZC2D3E4F5G6H7J8K9M0NP".to_string());
+        std::fs::write(volume_path(&dir, &id), b"live").expect("volume");
+        let recorded = new_snapshot_path(&dir, &id);
+        let unrecorded = new_snapshot_path(&dir, &id);
+        for path in [&recorded, &unrecorded] {
+            copy_sparse(&volume_path(&dir, &id), path).expect("snapshot");
+        }
+        let name = |path: &Path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .expect("a file name")
+                .to_owned()
+        };
+        let rule = crate::SnapshotSweep::Keep([name(&recorded)].into_iter().collect());
+        let left = remove_leftovers(&dir, &rule);
+        assert_eq!(
+            left,
+            Some([name(&recorded)].into_iter().collect::<BTreeSet<_>>())
+        );
+        assert!(recorded.exists(), "the recorded snapshot stays");
+        assert!(!unrecorded.exists(), "the other one goes");
+        assert!(volume_path(&dir, &id).exists(), "the volume file stays");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
