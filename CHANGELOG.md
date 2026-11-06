@@ -15,6 +15,7 @@ Each entry links the pull request that made the change and, where one exists, th
 - A node reported a newly applied revision to the primary only with its next periodic status report, unless the revision also changed a VM or a route, so `applied_rev` in the API could lag by up to 30 s, on an edge above all. The node now sends a status report about 250 ms after it applies a revision ([#379]).
 - A terminal command that finished before the client's WebSocket attached could not be read: the upgrade answered `401`, as if the ticket were bad, and the command's output and exit code were lost. A command with no output that exited within about a second was refused with `409`. The session now keeps the output and the exit until its ticket expires, so the client receives them, then `exit` and `closed`, and the audit record shows the session as connected ([#381], [ADR 0186]).
 - A node agent that died in the middle of a self-fence came back with the lease revoked but did not stop its VMs again, and the VMs outlive the agent, so a VM could keep running without its lease. The agent now records a fence, together with the lease's state, only once its stop has finished, answers the revoke `ok` only once that record is written, and fences again at start any revoked or expired lease without a record. A fence also stops the VMs the latest desired state no longer names, so a VM dropped from it just before the revoke is not missed. Fences of different leases now run at the same time instead of one after another, the agent keeps taking messages while one runs, and a stateful VM no longer starts while a fence of its lease is under way ([#385], [ADR 0075], [ADR 0019]).
+- After a restore was accepted, the old node could still receive a desired state that named the moved VM after its lease had been revoked, when that snapshot had been built just before the restore. A snapshot built before a lease revoke is now dropped and built again, so nothing the revoke took away reaches the node after it. Deleting a volume had the same race ([#388]).
 
 ## [v0.2.0] - 2026-11-05
 
@@ -370,6 +371,7 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#379]: https://github.com/OmarAlex24/quoro/pull/379
 [#381]: https://github.com/OmarAlex24/quoro/pull/381
 [#385]: https://github.com/OmarAlex24/quoro/pull/385
+[#388]: https://github.com/OmarAlex24/quoro/pull/388
 [ADR 0019]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0019-fencing-is-mandatory-and-lease-based-node-agent-self-fences.md
 [ADR 0020]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0020-per-app-ha-policies-none-cold-warm-hot-with-cost-shown-in.md
 [ADR 0027]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0027-signed-binaries-and-reproducible-builds-are-mandatory.md
