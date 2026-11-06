@@ -280,7 +280,8 @@ pub struct WorkDisk {
 ```
 
 ```rust
-/// How a stop is requested. Every stop is bounded by its caller (section 3.8).
+/// How a stop is requested. Every stop is bounded by its caller (section 3.8,
+/// ADR 0243).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StopMode {
     /// Ask the guest to stop and wait at most `timeout`, then stop it as
@@ -789,7 +790,7 @@ Stops a VM.
 
 - `Graceful { timeout, force_within }` asks the guest to exit — the power-button path, which the minimal init turns into `SIGTERM` to the app (section 7) — and waits at most `timeout`. On expiry it stops the VM as `Force { within: force_within }`. The call returns `Ok` only when the VM is stopped, and returns within `timeout + force_within`.
 - `Force { within }` stops without cooperation from the guest. If the VMM does not confirm the stop (its API does not answer, or the process does not exit), the backend escalates to `SIGKILL` on the VMM process and reaps it, all inside `within`. `Force` returns `Ok` only when the VMM process is gone; when it is not gone once `within` has passed, the call returns `Timeout`. Any error from a forced stop, `Timeout` included, means the VM may still be running, and the node agent must treat it that way (`node-agent-protocol.md` section 8.5, D-0074).
-- A forced stop, once begun, goes on to the kill and the reap after the call has returned `Timeout` or its future was dropped (section 4).
+- A forced stop, once begun, goes on to the kill and the reap after the call has returned `Timeout` or its future was dropped (section 4). Both modes carry the caller's bound (ADR 0243).
 - Stopping a stopped VM returns `Ok`. Stopping an unknown id is `NotFound`.
 - Postcondition: `state` is `Stopped`, `exit_code` reports the app's code when the guest reported one, and `EngineEvent::Exited` has been or will be emitted.
 
@@ -921,7 +922,7 @@ What a warm source and a warm target need from the engine (ADR 0172 to ADR 0177,
 - Operations on one `VmId` are serialized by the caller. The node agent holds one lock per VM, so it never issues `start` and `delete` for the same id concurrently. The engine does not promise ordering for concurrent calls on one id and may return `Conflict`.
 - The engine must be safe to call concurrently for **different** VMs, on many VMs at once. This is what lets one node run several apps and replace them independently.
 - `capabilities`, `probe_host`, `ensure_network`, `prepare_image`, `remove_image`, `image_inventory`, `uninventoried_images`, `inventory_cached_image` and `list` are safe concurrently with any VM operation. So are `volume_changed_ranges` on snapshots and the staging calls, which the node agent serializes per volume; `pause` and `resume` are VM operations, serialized per `VmId` like `start` and `stop`. `prepare_image`, `prepare_layout`, `inventory_cached_image` and `remove_image` are serialized per digest (section 3.21). `ensure_network` and `prepare_image` are internally serialized by the implementation where the underlying operation is not reentrant.
-- `start` and `stop` enforce their bounds themselves, so a caller never has to drop the future to bound them. Dropping the future of a `start` or a `stop` does not abandon a forced stop the engine has begun: the engine carries it to the kill and the reap in a task of its own. A `stop` called while such a stop of the same VM still runs joins it, within its own bound.
+- `start` and `stop` enforce their bounds themselves, so a caller never has to drop the future to bound them. Dropping the future of a `start` or a `stop` does not abandon a forced stop the engine has begun: the engine carries it to the kill and the reap in a task of its own. A `stop` called while such a stop of the same VM still runs joins it, within its own bound (ADR 0243).
 - No call blocks the runtime for longer than an I/O wait: image preparation and boot are awaited, never run on the reactor thread.
 
 ## 5. Cloud Hypervisor implementation
@@ -1043,4 +1044,4 @@ The node agent runs its protocol tests against `FakeEngine`: the M0 lease tests 
 | M2 | `output` feeds live app logs (D-0014, D-0033); isolation groups on `NetAttach` and guest DNS on `NodeNetwork` (D-0084) |
 | M4 | `counters` for metrics (D-0033, ADR 0014); `serial_output` and `VmSpec::serial` for the read-only console (ADR 0116); `exec` and `VmSpec::vsock` for the web terminal, with init configuration v2 (ADR 0113); `prepare_layout`, `VmSpec::work_disks` and `NetAttach::egress_only` for builds (ADR 0117, ADR 0118). `console` is superseded |
 | M5a | `image_inventory`, built by `prepare_image` and `prepare_layout` (ADR 0150, ADR 0151), and `uninventoried_images` and `inventory_cached_image` for images cached before M5a; `ensure_volume`, `import_volume`, `delete_volume` and `VolumeAttach::serial` for local volumes, with init configuration v3 (ADR 0145); `snapshot_volume` and `delete_volume_snapshot` with the `Reflink` or `PauseCopy` method probed per node (ADR 0146) |
-| M5b | `volume_changed_ranges` between two reflink snapshots of a warm volume, found by comparing their extent maps (ADR 0172, D-0023); `stage_volume`, `commit_staged_volume` and `discard_staged_volume` for the target's copy (ADR 0173); `pause` and `resume` for a planned switchover (ADR 0177); several snapshots per volume (section 3.16); a caller-supplied bound on `start` (ADR 0242) and on both stop modes, with forced stops that finish after a dropped call (#434) |
+| M5b | `volume_changed_ranges` between two reflink snapshots of a warm volume, found by comparing their extent maps (ADR 0172, D-0023); `stage_volume`, `commit_staged_volume` and `discard_staged_volume` for the target's copy (ADR 0173); `pause` and `resume` for a planned switchover (ADR 0177); several snapshots per volume (section 3.16); a caller-supplied bound on `start` (ADR 0242) and on both stop modes, with forced stops that finish after a dropped call (ADR 0243, #434) |

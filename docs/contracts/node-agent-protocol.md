@@ -1975,6 +1975,7 @@ The `expiring` grant that converts a lease answers no renewal, so it sets no `va
 - The node keeps the lease `held` and its VMs running, and sends a `lease_renew` at once. From the moment that first renewal is sent, the lease has a provisional deadline, that renewal's `t_send + D - M`, and the node self-fences at it unless an answer sets a real `valid_until` first. An answer computes `valid_until` from the `t_send` of the renewal it answers, never earlier than the first, so the deadline moves later only on proof from the authority.
 - Until its first renewal is sent, the converted lease behaves as `local` on the node: a lost session neither makes it `uncertain` nor stops its VMs. The authority has set no gate for it then, so the app runs on as before the conversion.
 - On the primary, the converted lease has no gate until a grant answers one of its renewals (`T_grant >= t_send` of that renewal). Until then it is `local` for failover: the source must be connected or declared lost, and `failoverApp` answers `lease_held` (section 8.3).
+- The lease row keeps `mode` `local` until then (ADR 0244). The primary writes `expiring` in a transaction that it commits before it sends its answer to the holder's first renewal after the conversion. A restarted primary therefore sees the lease as `local`, so a failover answers `lease_held`. When the holder's `hello` reports the lease as `local`, the primary sends the conversion grant again. When it reports it as `expiring`, the primary answers the holder's next renewal as the first one.
 
 A `local` grant with the same token ends the renewals: the node drops `valid_until` and keeps the lease `held` as `local`.
 
@@ -1989,7 +1990,7 @@ Definitions, all on the node's lease clock: a monotonic clock that keeps countin
 | `valid_until` | `t_send + D - M` |
 | Fence deadline | `valid_until + M = t_send + D` |
 | `T_grace` | Graceful-stop timeout used when fencing |
-| `T_force` | Bound of the forced stop that follows, passed to the engine as `force_within` (`engine-trait.md` section 3.8) |
+| `T_force` | Bound of the forced stop that follows, passed to the engine as `force_within` (`engine-trait.md` section 3.8, ADR 0243) |
 | Start bound | 3 000 ms: the bound the node passes to the engine for a stateful start under an `expiring` lease (section 6.4, ADR 0242) |
 
 ```
@@ -2059,10 +2060,10 @@ Worked example with `D = 15000`:
 **What the authority must enforce.** The gate is the authority's obligation, not the node's. An authority that grants earlier can hand the same app to two nodes. In M5b the authority is the primary, and it:
 
 - sends an `expiring` grant, a first grant or the answer to a renewal, only while a majority of voters supports it for that duration (section 8.8);
-- keeps, for each `expiring` lease, the gate of its current holder: the latest `T_grant + duration_ms + 2M` over every grant it sent that holder except a conversion grant, so a shorter grant after a longer one (the end of a maintenance window) never brings the gate forward. A lease converted from `local` has no gate until a grant answers one of its renewals, and until then it is moved only as a `local` lease is ("Changing the mode", ADR 0241);
+- keeps, for each `expiring` lease, the gate of its current holder: the latest `T_grant + duration_ms + 2M` over every grant it sent that holder except a conversion grant, so a shorter grant after a longer one (the end of a maintenance window) never brings the gate forward. A lease converted from `local` has no gate until a grant answers one of its renewals, and until then it is moved only as a `local` lease is, with its row still `local` ("Changing the mode", ADR 0241, ADR 0244);
 - grants the lease with a new token, to another node or to the same one after expiry or revoke, only after that gate has passed on its own monotonic clock; renewals by the current holder are not gated;
-- keeps no monotonic time across its own restart: at start it treats every `expiring` lease as granted at that moment for `leases.duration_ms`, the longest duration it may have granted the holder, which it raises before it sends a longer grant and lowers only once the longer grant's gate has passed. The first gate after a restart is therefore `start + duration_ms + 2M`. This includes a converted lease whose first renewal was never answered, which a restarted primary cannot tell apart, because it writes nothing for a renewal (threat model T-LEASE-14);
-- writes nothing for a renewal: a renewal changes no state and appends no change-log entry, and `Lease.renewed_at`, `expires_at` and `gate_at` in the API are the primary's in-memory view.
+- keeps no monotonic time across its own restart: at start it treats every `expiring` lease as granted at that moment for `leases.duration_ms`, the longest duration it may have granted the holder, which it raises before it sends a longer grant and lowers only once the longer grant's gate has passed. The first gate after a restart is therefore `start + duration_ms + 2M`. A converted lease whose first renewal was never answered gets no such gate, because its row is still `local` (ADR 0244);
+- writes nothing for a renewal: a renewal changes no state and appends no change-log entry, except the answer to a converted lease's first renewal, which writes the row's `mode` `expiring` before it is sent (ADR 0244), and `Lease.renewed_at`, `expires_at` and `gate_at` in the API are the primary's in-memory view.
 
 The primary's single-writer critical section is its own database transaction. What a single primary cannot guarantee alone is that no second primary grants at the same time after a promotion; the voters' support and the terms provide that (sections 8.8 and 8.9). A Durable Object or a conditional write on strongly consistent storage remains a later option for the same role (`docs/research/durable-objects.md`, `docs/research/r2-conditional-writes.md`).
 
@@ -2072,7 +2073,7 @@ The primary's single-writer critical section is its own database transaction. Wh
 
 When a lease reaches `expired` or `revoked`, the node:
 
-1. Stops every stateful VM bound to that lease (after an agent restart with no verified desired-state snapshot, every app VM, section 6.3) with `StopMode::Graceful { timeout: T_grace, force_within: T_force }`, which forces the stop when the graceful timeout passes, so the whole stop finishes within `T_grace + T_force <= M` (`engine-trait.md` section 3.8). The forced stop escalates to `SIGKILL` on the VMM process inside the engine (`engine-trait.md` section 3.8).
+1. Stops every stateful VM bound to that lease (after an agent restart with no verified desired-state snapshot, every app VM, section 6.3) with `StopMode::Graceful { timeout: T_grace, force_within: T_force }`, which forces the stop when the graceful timeout passes, so the whole stop finishes within `T_grace + T_force <= M` (`engine-trait.md` section 3.8, ADR 0243). The forced stop escalates to `SIGKILL` on the VMM process inside the engine (`engine-trait.md` section 3.8).
 2. Records the stop locally: lease id, token, VM ids, time and the reason (`expired` or `revoked`), so the fact survives an agent restart.
 3. Emits `node.fenced` with the lease, the token and the VM ids (`data.lease_ids`, `data.fencing_tokens` and `data.vm_ids` in `events.schema.json`) — only when every bound VM is confirmed stopped or gone. If the session is down the event is buffered (section 6.5) and delivered later.
 4. Starts nothing stateful for that resource until a new `lease_grant` arrives with a higher `fencing_token`.

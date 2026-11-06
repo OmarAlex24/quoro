@@ -277,10 +277,14 @@ CREATE TABLE volumes (
 
 -- leases: replicated. The primary is the lease authority in M0-M5a (D-0019);
 -- from M5b it grants and renews expiring leases only while a majority of
--- voters supports it (ADR 0169). Renewals write nothing (migration 0010).
+-- voters supports it (ADR 0169). Renewals write nothing (migration 0010),
+-- except the answer to a converted lease's first renewal (below).
 -- Two modes (D-0047): `local` for HA policy `none`/`cold` and `expiring` for
--- `warm`/`hot`. The node-side states `held`, `uncertain`, `expired` and
--- `revoked` are fixed in node-agent-protocol.md.
+-- `warm`/`hot`. When the policy becomes `warm`, mode stays `local` until the
+-- primary answers the holder's first renewal after the conversion grant; that
+-- answer writes `expiring` before it is sent (ADR 0218, ADR 0244). The
+-- node-side states `held`, `uncertain`, `expired` and `revoked` are fixed in
+-- node-agent-protocol.md.
 CREATE TABLE leases (
     id             TEXT PRIMARY KEY,
     resource_type  TEXT NOT NULL CHECK (resource_type IN ('app', 'primary')),
