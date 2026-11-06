@@ -1381,6 +1381,38 @@ impl NodeStore {
         rows.into_iter().map(kept_snapshot_record).collect()
     }
 
+    /// The snapshots the node keeps of one volume, ordered by id.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure or a row it cannot read back.
+    pub async fn kept_snapshots_of(
+        &self,
+        volume_id: &str,
+    ) -> Result<Vec<KeptSnapshotRecord>, AgentError> {
+        let rows = sqlx::query(
+            "SELECT * FROM kept_snapshots WHERE volume_id = ? ORDER BY snapshot_id ASC",
+        )
+        .bind(volume_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_error)?;
+        rows.into_iter().map(kept_snapshot_record).collect()
+    }
+
+    /// The `(volume_id, purpose)` pairs of the kept snapshots, without their
+    /// cell hashes.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn kept_snapshot_purposes(&self) -> Result<Vec<(String, String)>, AgentError> {
+        sqlx::query_as("SELECT DISTINCT volume_id, purpose FROM kept_snapshots ORDER BY volume_id")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(store_error)
+    }
+
     /// Forgets one kept snapshot. The caller deletes the file first, so a
     /// record never outlives its reason to keep the file.
     ///

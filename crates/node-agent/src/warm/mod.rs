@@ -4,8 +4,9 @@
 //!
 //! The node that holds a warm app's lease is the **source**: it snapshots the
 //! volume every interval and ships what changed. The warm node is the
-//! **target**: it holds the last complete copy. [`receiver`] is the target
-//! side; [`frame`] is the stream both sides speak.
+//! **target**: it holds the last complete copy. [`sender`] is the source
+//! side, [`receiver`] the target side; [`frame`] is the stream both sides
+//! speak.
 //!
 //! Each volume has one lock ([`VolumeLocks`]): a stream holds it from its
 //! checks to its answer, and anything else that replaces or removes the warm
@@ -14,6 +15,7 @@
 
 pub mod frame;
 pub mod receiver;
+pub mod sender;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
@@ -110,11 +112,40 @@ impl StatusBoard {
     }
 }
 
+/// The data segments of `file` inside `start..end`, from `SEEK_DATA` and
+/// `SEEK_HOLE`, sorted; what lies between them reads as zeros. A filesystem
+/// that cannot tell reports everything as data. Blocking IO.
+///
+/// # Errors
+///
+/// An I/O error from the file.
+pub fn data_segments(file: &File, start: u64, end: u64) -> std::io::Result<Vec<(u64, u64)>> {
+    let mut segments = Vec::new();
+    let mut offset = start;
+    while offset < end {
+        let data = match rustix::fs::seek(file, SeekFrom::Data(offset)) {
+            Ok(data) => data,
+            Err(Errno::NXIO) => break,
+            Err(e) => return Err(e.into()),
+        };
+        if data >= end {
+            break;
+        }
+        let stop = match rustix::fs::seek(file, SeekFrom::Hole(data)) {
+            Ok(hole) if hole > data => hole.min(end),
+            // A hole at the data offset is not the truth; read the rest.
+            Ok(_) | Err(Errno::NXIO) => end,
+            Err(e) => return Err(e.into()),
+        };
+        segments.push((data, stop));
+        offset = stop;
+    }
+    Ok(segments)
+}
+
 /// The cell hashes of a copy of `size` bytes, reading only the cells its
-/// data reaches: `SEEK_DATA` and `SEEK_HOLE` find the data, and a hole reads
-/// as zeros, so a cell no data reaches has the zero cell's hash. A
-/// filesystem that cannot tell reports everything as data, and every cell is
-/// read. Blocking IO.
+/// data reaches ([`data_segments`]): a hole reads as zeros, so a cell no
+/// data reaches has the zero cell's hash. Blocking IO.
 ///
 /// # Errors
 ///
@@ -123,28 +154,6 @@ impl StatusBoard {
 pub fn hash_copy(file: &File, size: u64) -> std::io::Result<CellHashes> {
     let mut cells = CellHashes::zeroed(size)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let mut with_data: BTreeSet<u64> = BTreeSet::new();
-    let mut offset = 0_u64;
-    while offset < size {
-        let data = match rustix::fs::seek(file, SeekFrom::Data(offset)) {
-            Ok(data) => data,
-            Err(Errno::NXIO) => break,
-            Err(e) => return Err(e.into()),
-        };
-        if data >= size {
-            break;
-        }
-        let end = match rustix::fs::seek(file, SeekFrom::Hole(data)) {
-            Ok(hole) if hole > data => hole.min(size),
-            // A hole at the data offset is not the truth; read the rest.
-            Ok(_) | Err(Errno::NXIO) => size,
-            Err(e) => return Err(e.into()),
-        };
-        with_data.extend(data / CELL..end.div_ceil(CELL));
-        offset = end;
-    }
-    let mut reader = file;
-    cells.rehash(&mut reader, with_data)?;
     // A file shorter than the copy is not the copy, holes or not.
     if file.metadata()?.len() < size {
         return Err(std::io::Error::new(
@@ -152,6 +161,12 @@ pub fn hash_copy(file: &File, size: u64) -> std::io::Result<CellHashes> {
             format!("the copy is shorter than {size} bytes"),
         ));
     }
+    let mut with_data: BTreeSet<u64> = BTreeSet::new();
+    for (start, stop) in data_segments(file, 0, size)? {
+        with_data.extend(start / CELL..stop.div_ceil(CELL));
+    }
+    let mut reader = file;
+    cells.rehash(&mut reader, with_data)?;
     Ok(cells)
 }
 
