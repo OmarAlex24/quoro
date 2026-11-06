@@ -1248,7 +1248,9 @@ impl NodeStore {
             .map(|_| ())
     }
 
-    /// Records a snapshot the node keeps, or replaces its record.
+    /// Records a snapshot the node keeps, or updates its purpose, `seq` and
+    /// cell hashes. A record never moves to another file: saving the same
+    /// `snapshot_id` with another location or volume is an error.
     ///
     /// The record is durable when this returns: the write is committed in its
     /// own transaction, so the engine's start-up sweep keeps the file from
@@ -1256,7 +1258,8 @@ impl NodeStore {
     ///
     /// # Errors
     ///
-    /// [`AgentError::Store`] on a SQLite failure.
+    /// [`AgentError::Store`] on a SQLite failure, or when the id is recorded
+    /// with another location or volume.
     pub async fn save_kept_snapshot(&self, record: &KeptSnapshotRecord) -> Result<(), AgentError> {
         let snapshot = &record.snapshot;
         let created_at_ms = snapshot
@@ -1265,15 +1268,14 @@ impl NodeStore {
             .map_or(0, |since| {
                 i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
             });
-        sqlx::query(
+        let done = sqlx::query(
             "INSERT INTO kept_snapshots (snapshot_id, volume_id, app_id, purpose, seq, location, \
              size_bytes, created_at_ms, method, pause_ms, cells) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(snapshot_id) DO UPDATE SET volume_id = excluded.volume_id, \
-             app_id = excluded.app_id, purpose = excluded.purpose, seq = excluded.seq, \
-             location = excluded.location, size_bytes = excluded.size_bytes, \
-             created_at_ms = excluded.created_at_ms, method = excluded.method, \
-             pause_ms = excluded.pause_ms, cells = excluded.cells",
+             ON CONFLICT(snapshot_id) DO UPDATE SET app_id = excluded.app_id, \
+             purpose = excluded.purpose, seq = excluded.seq, cells = excluded.cells \
+             WHERE kept_snapshots.location = excluded.location \
+             AND kept_snapshots.volume_id = excluded.volume_id",
         )
         .bind(&snapshot.snapshot_id)
         .bind(&snapshot.volume_id.0)
@@ -1288,8 +1290,16 @@ impl NodeStore {
         .bind(record.cells.as_deref())
         .execute(&self.pool)
         .await
-        .map_err(store_error)
-        .map(|_| ())
+        .map_err(store_error)?;
+        if done.rows_affected() == 0 {
+            // The sweep keeps a snapshot by its file name, so a record must
+            // never move to another file.
+            return Err(AgentError::Store(format!(
+                "kept snapshot {} is recorded with another file or volume",
+                snapshot.snapshot_id
+            )));
+        }
+        Ok(())
     }
 
     /// Every snapshot the node keeps, ordered by volume and id.

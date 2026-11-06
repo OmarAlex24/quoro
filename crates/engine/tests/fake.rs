@@ -8,7 +8,8 @@ use std::time::Duration;
 use quoro_engine::{
     ByteRange, ChangedRanges, Engine, EngineError, EngineEvent, FakeEngine, FakeOp, FakeRanges,
     ImageDigest, NodeNetwork, OciLayout, OutputStream, RangesOf, SnapshotMethod, SnapshotSweep,
-    StageFrom, StopMode, VmCounters, VmId, VmState, VolumeAttach, VolumeId, WorkDisk,
+    StageFrom, StopMode, VmCounters, VmId, VmState, VolumeAttach, VolumeId, VolumeSnapshot,
+    WorkDisk,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1265,8 +1266,17 @@ async fn the_start_up_sweep_keeps_only_the_recorded_snapshots() {
         .await
         .expect("stage");
 
-    let rule = SnapshotSweep::Keep([kept.snapshot_id.clone()].into_iter().collect());
-    engine.start_up_sweep(&rule).expect("sweep");
+    let name = |snapshot: &VolumeSnapshot| {
+        snapshot
+            .location
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("a file name")
+            .to_owned()
+    };
+    let rule = SnapshotSweep::Keep([name(&kept)].into_iter().collect());
+    let left = engine.start_up_sweep(&rule).expect("sweep");
+    assert_eq!(left, [name(&kept)].into_iter().collect());
     assert_eq!(
         engine
             .volume_snapshots()
@@ -1280,15 +1290,47 @@ async fn the_start_up_sweep_keeps_only_the_recorded_snapshots() {
     assert!(!staged.location.exists(), "a staging file never survives");
     assert!(engine.staged_volumes().is_empty());
 
-    engine
+    let left = engine
         .start_up_sweep(&SnapshotSweep::KeepAll)
         .expect("sweep");
+    assert_eq!(left, [name(&kept)].into_iter().collect());
     assert!(kept.location.exists());
-    engine
-        .start_up_sweep(&SnapshotSweep::RemoveAll)
+    let left = engine
+        .start_up_sweep(&SnapshotSweep::Keep(Default::default()))
         .expect("sweep");
+    assert!(left.is_empty());
     assert!(!kept.location.exists());
     assert!(engine.volume_snapshots().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_failed_snapshot_delete_keeps_the_file() {
+    let dir = scratch("delete-fails");
+    let engine = FakeEngine::new();
+    engine.set_volume_dir(&dir);
+    let volume = VolumeId("vol_01".to_string());
+    engine.ensure_volume(&volume, 1).await.expect("volume");
+    let snapshot = engine.snapshot_volume(&volume).await.expect("snapshot");
+    engine.fail_next(
+        FakeOp::DeleteVolumeSnapshot,
+        EngineError::Unsupported("the volume pool is broken".into()),
+    );
+    assert!(matches!(
+        engine.delete_volume_snapshot(&snapshot).await,
+        Err(EngineError::Unsupported(_))
+    ));
+    assert!(snapshot.location.exists());
+    engine
+        .delete_volume_snapshot(&snapshot)
+        .await
+        .expect("delete");
+    assert!(!snapshot.location.exists());
+    // A missing snapshot is Ok, as in the real engine (section 3.16).
+    engine
+        .delete_volume_snapshot(&snapshot)
+        .await
+        .expect("delete again");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

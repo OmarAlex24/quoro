@@ -82,6 +82,12 @@ pub struct AgentConfig {
     pub acme_directory_url: String,
     /// ACME account contacts (`mailto:`); may be empty.
     pub acme_contact: Vec<String>,
+    /// The file names of the snapshots the engine's start-up sweep left in
+    /// its volume directory (engine-trait.md section 3.16), or `None` for an
+    /// engine without a sweep or one that skipped it. The agent marks its
+    /// store as tracking every snapshot once each of them is recorded
+    /// ([`kept::start_tracking`]).
+    pub snapshots_at_start: Option<std::collections::BTreeSet<String>>,
 }
 
 impl AgentConfig {

@@ -20,7 +20,7 @@
 //! `Crashed` event, `set_console_echo` makes a console round-trip, and
 //! `set_unkillable` makes every stop fail as a VMM that survives `SIGKILL`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -82,6 +82,8 @@ pub enum FakeOp {
     DeleteVolume,
     /// `snapshot_volume` (M5a).
     SnapshotVolume,
+    /// `delete_volume_snapshot` (M5b): the file and the fake's record stay.
+    DeleteVolumeSnapshot,
     /// `inventory_cached_image` (M5a).
     InventoryCachedImage,
     /// `list` (M5b): the whole listing fails, as when the real engine cannot
@@ -552,24 +554,33 @@ impl FakeEngine {
     }
 
     /// What the real engine does to the volume directory when it starts
-    /// (section 3.16): removes every staging file and every snapshot that
-    /// `sweep` does not keep, by `snapshot_id`. A test calls it to model an
-    /// agent restart, as the fake itself outlives one.
+    /// (section 3.16): removes every staging file and every snapshot whose
+    /// file name `sweep` does not keep, and returns the file names of the
+    /// snapshots it left, as `ChEngine::snapshots_at_start` does. A test
+    /// calls it to model an agent restart, as the fake itself outlives one.
     ///
     /// # Errors
     ///
     /// `Io` when a file of a removed snapshot or staging copy cannot be
     /// removed.
-    pub fn start_up_sweep(&self, sweep: &SnapshotSweep) -> Result<(), EngineError> {
+    pub fn start_up_sweep(&self, sweep: &SnapshotSweep) -> Result<BTreeSet<String>, EngineError> {
         let mut state = self.lock();
         let has_files = state.volume_dir.is_some();
         let mut removed: Vec<PathBuf> = Vec::new();
-        state.snapshots.retain(|id, snapshot| {
-            let keep = sweep.keeps(id);
-            if !keep {
+        let mut kept = BTreeSet::new();
+        state.snapshots.retain(|_, snapshot| {
+            let name = snapshot
+                .location
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if sweep.keeps(&name) {
+                kept.insert(name);
+                true
+            } else {
                 removed.push(snapshot.location.clone());
+                false
             }
-            keep
         });
         removed.extend(state.staged.drain().map(|(_, staged)| staged.location));
         if has_files {
@@ -581,7 +592,7 @@ impl FakeEngine {
                 }
             }
         }
-        Ok(())
+        Ok(kept)
     }
 
     /// Whether `pause` froze the VM and nothing resumed or stopped it since
@@ -1556,6 +1567,9 @@ impl Engine for FakeEngine {
     }
 
     async fn delete_volume_snapshot(&self, snap: &VolumeSnapshot) -> Result<(), EngineError> {
+        if let Some(err) = self.take_failure(FakeOp::DeleteVolumeSnapshot) {
+            return Err(err);
+        }
         let mut state = self.lock();
         if state.snapshots.remove(&snap.snapshot_id).is_some() && state.volume_dir.is_some() {
             match std::fs::remove_file(&snap.location) {

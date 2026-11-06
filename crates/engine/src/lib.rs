@@ -362,29 +362,32 @@ pub struct NodeNetwork {
 /// Snapshots left by a crash are removed at start. From M5b the node agent
 /// keeps the snapshots its store records (a warm base, the snapshot being
 /// shipped, a returning source's candidates, a quarantined copy) and hands
-/// their ids to the engine before the engine starts, so the sweep removes
-/// only the rest. It is safe because the node agent records a snapshot before
-/// anything relies on it: a snapshot with no record never holds data the live
-/// volume does not hold too.
+/// their file names to the engine before the engine starts, so the sweep
+/// removes only the rest. It is safe because the node agent records a
+/// snapshot before anything relies on it: a snapshot with no record never
+/// holds data the live volume does not hold too.
+///
+/// Every doubt keeps more, so the default keeps every snapshot: an engine
+/// built without the node agent's rule never removes one it cannot tell from
+/// a recorded copy.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum SnapshotSweep {
-    /// Remove every snapshot left in the volume directory (M5a).
-    #[default]
-    RemoveAll,
-    /// Keep the snapshots with these ids and remove the others.
+    /// Keep the snapshots whose file names are in the set and remove the
+    /// others. A file name, not a `snapshot_id`: it is what the sweep sees
+    /// in the volume directory.
     Keep(BTreeSet<String>),
-    /// Keep every snapshot: the node agent could not read which ones it
+    /// Keep every snapshot: the node agent does not know which ones it
     /// records, and removing a recorded one could lose data.
+    #[default]
     KeepAll,
 }
 
 impl SnapshotSweep {
-    /// Whether the sweep keeps the snapshot with this id.
+    /// Whether the sweep keeps the snapshot file with this name.
     #[must_use]
-    pub fn keeps(&self, snapshot_id: &str) -> bool {
+    pub fn keeps(&self, file_name: &str) -> bool {
         match self {
-            Self::RemoveAll => false,
-            Self::Keep(ids) => ids.contains(snapshot_id),
+            Self::Keep(names) => names.contains(file_name),
             Self::KeepAll => true,
         }
     }

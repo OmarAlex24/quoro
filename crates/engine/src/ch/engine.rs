@@ -115,6 +115,9 @@ pub(super) struct Inner {
     pub(super) pool_grow: Mutex<()>,
     /// Serializes peer-set syncs, so the last one applied saw the latest state.
     pub(super) peers_sync: Mutex<()>,
+    /// The snapshot files the start-up sweep left, or `None` when it did not
+    /// run (§3.16).
+    pub(super) snapshots_at_start: Option<std::collections::BTreeSet<String>>,
 }
 
 /// A TAP whose `create` has not finished yet, and what its bridge sets need.
@@ -279,11 +282,28 @@ impl Inner {
         let attachment = super::pool::attach(&config.state_dir, &volumes_dir).await;
         let volume_method = attachment.method;
         let pool = attachment.pool;
-        if !matches!(pool, super::pool::VolumePool::Broken { .. }) {
-            // Leftovers live inside the pool, so they are only reachable once
-            // it is mounted; a broken pool's directory is never touched.
-            super::volume::remove_leftovers(&volumes_dir, &config.snapshot_sweep);
-        }
+        // Leftovers live inside the pool, so they are only reachable once it
+        // is mounted; a broken pool's directory is never touched.
+        let swept = if matches!(pool, super::pool::VolumePool::Broken { .. }) {
+            None
+        } else {
+            super::volume::remove_leftovers(&volumes_dir, &config.snapshot_sweep)
+        };
+        // The node agent marks its store as tracking every snapshot from what
+        // the sweep left, so it is told only when the sweep saw the directory
+        // the snapshots live in: the mounted pool, or a directory that
+        // reflinks itself with no pool image beside it. Another filesystem
+        // mounted on the directory, or a node without reflink, reports
+        // nothing, and the node agent keeps every snapshot there (§3.16).
+        let sees_snapshots = match &pool {
+            super::pool::VolumePool::Mounted { .. } => true,
+            super::pool::VolumePool::Absent => {
+                volume_method == SnapshotMethod::Reflink
+                    && !config.state_dir.join(super::pool::POOL_IMAGE).exists()
+            }
+            super::pool::VolumePool::Broken { .. } => false,
+        };
+        let snapshots_at_start = swept.filter(|_| sees_snapshots);
 
         let initramfs = config.state_dir.join("boot").join("initramfs.cpio");
         let init_binary = config.init_binary.clone();
@@ -318,6 +338,7 @@ impl Inner {
             pool,
             pool_grow: Mutex::new(()),
             peers_sync: Mutex::new(()),
+            snapshots_at_start,
         });
         inner.rediscover(&vms_root).await?;
         Ok(inner)

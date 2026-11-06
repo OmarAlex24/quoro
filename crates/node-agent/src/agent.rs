@@ -57,9 +57,10 @@ pub async fn run<E: Engine + 'static>(
 ) -> Result<(), AgentError> {
     let identity = IdentityHandle::load(&config.data_dir)?;
     let store = NodeStore::open(&config.data_dir).await?;
-    // The engine's start-up sweep already ran with the recorded snapshot ids;
-    // a record whose file is gone is a release cut short (section 12).
-    if let Err(e) = crate::kept::forget_missing(&store).await {
+    // The engine's start-up sweep already ran. Once every snapshot it left
+    // is recorded, the store tracks them and later sweeps remove the others
+    // (section 12); until then the sweep keeps every snapshot.
+    if let Err(e) = crate::kept::start_tracking(&store, config.snapshots_at_start.as_ref()).await {
         warn!(error = %e, "could not check the kept snapshots");
     }
     // The mesh key pair is generated on the first start and reused after that;

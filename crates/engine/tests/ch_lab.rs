@@ -36,8 +36,8 @@ use quoro_engine::ch::{ChConfig, ChEngine};
 use quoro_engine::{
     ByteStream, ConsoleMode, Engine, EngineError, EngineEvent, ExecRequest, ImageDigest, ImageRef,
     InitConfig, LineStream, MacAddr, NetAttach, NodeNetwork, OutputLine, OutputStream, RangesOf,
-    SerialMode, SnapshotMethod, StageFrom, StopMode, VmId, VmSpec, VmState, VolumeAttach, VolumeId,
-    VsockAttach,
+    SerialMode, SnapshotMethod, SnapshotSweep, StageFrom, StopMode, VmId, VmSpec, VmState,
+    VolumeAttach, VolumeId, VolumeSnapshot, VsockAttach,
 };
 use tokio::io::AsyncReadExt as _;
 
@@ -179,6 +179,24 @@ fn config() -> ChConfig {
 /// A fresh engine on the current state directory.
 async fn new_engine() -> ChEngine {
     ChEngine::new(config()).await.expect("build the engine")
+}
+
+/// A fresh engine whose start-up sweep keeps only the snapshots named in
+/// `sweep`, as the node agent's records do (§3.16).
+async fn new_engine_with(sweep: SnapshotSweep) -> ChEngine {
+    let mut config = config();
+    config.snapshot_sweep = sweep;
+    ChEngine::new(config).await.expect("build the engine")
+}
+
+/// The file name of a snapshot: what the start-up sweep keeps it by.
+fn snapshot_file_name(snapshot: &VolumeSnapshot) -> String {
+    snapshot
+        .location
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("a snapshot file name")
+        .to_owned()
 }
 
 /// The node network every test expects.
@@ -1192,9 +1210,19 @@ async fn volume_pool_on_ext4_snapshots_with_reflink() {
         "the VM is running after the snapshot"
     );
 
-    // A new engine on the same state directory reuses the mounted pool.
+    // A second snapshot that no record names: the next start-up sweep must
+    // remove it and keep the recorded one (§3.16).
+    let unrecorded = engine
+        .snapshot_volume(&volume)
+        .await
+        .expect("a second snapshot");
+    assert!(unrecorded.location.exists());
+
+    // A new engine on the same state directory reuses the mounted pool, and
+    // its sweep keeps what the node agent's records name.
     drop(engine);
-    let engine = new_engine().await;
+    let kept = snapshot_file_name(&snapshot);
+    let engine = new_engine_with(SnapshotSweep::Keep([kept.clone()].into_iter().collect())).await;
     assert_eq!(
         engine.capabilities().await.volume_snapshot_method,
         Some(SnapshotMethod::Reflink)
@@ -1207,7 +1235,16 @@ async fn volume_pool_on_ext4_snapshots_with_reflink() {
     assert!(created.path.exists(), "the volume is still in the pool");
     assert!(
         snapshot.location.exists(),
-        "the snapshot is still in the pool"
+        "the recorded snapshot is still in the pool"
+    );
+    assert!(
+        !unrecorded.location.exists(),
+        "the start-up sweep removed the snapshot no record names"
+    );
+    assert_eq!(
+        engine.snapshots_at_start(),
+        Some(&[kept].into_iter().collect()),
+        "the engine reports the snapshots its sweep left"
     );
 
     engine.stop(&id, StopMode::Force).await.expect("stop");
