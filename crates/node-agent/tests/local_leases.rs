@@ -1281,8 +1281,8 @@ async fn a_fence_ack_during_a_fence_leaves_that_fence_s_failure_standing() {
     let timers = LeaseConfig::new(
         "nod_test",
         FenceTimers {
-            grace: Duration::from_millis(400),
-            force: Duration::from_millis(400),
+            grace: Duration::from_millis(1500),
+            force: Duration::from_millis(1500),
         },
     );
     let (leases, store) = start_with(&dir, engine.clone(), &desired, timers).await;
@@ -1337,8 +1337,14 @@ async fn a_fence_ack_during_a_fence_leaves_that_fence_s_failure_standing() {
         !revoking.is_finished(),
         "the acknowledgement came during the fence"
     );
+    // The failure recorded before is cleared, and with it the failed mark.
     assert!(store.failed_fences().await.unwrap().is_empty());
-    assert!(!leases.view.may_start_stateful("lse_slow", 2));
+    assert!(!leases.view.is_failed());
+    assert!(!store.node_failed().await.unwrap());
+    assert!(
+        leases.view.fence_owns_stop("lse_slow"),
+        "the fence still runs"
+    );
 
     // The running fence fails after the acknowledgement: its failure stands.
     let second = revoking.await.unwrap().unwrap();

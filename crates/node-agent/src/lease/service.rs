@@ -975,13 +975,19 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
     /// none remains, so a crash never leaves the node startable with a failed
     /// fence still recorded.
     ///
-    /// A fence of a listed lease that is still running is not covered: the
-    /// acknowledgement clears only the failures recorded before it. If that
-    /// fence fails afterwards, it records a new failed fence, marks the node
-    /// failed again and emits `node.fence_failed`, so the primary lists the
-    /// lease again and only a new acknowledgement clears it (ADR 0238). The
-    /// service takes one command at a time, so that record always comes after
-    /// this one. Until the fence is recorded, nothing starts for its lease.
+    /// A fence of a listed lease that is still running when the service takes
+    /// this command is not covered: the acknowledgement clears only the
+    /// failures recorded by then. If that fence fails afterwards, it records a
+    /// new failed fence, marks the node failed again and emits
+    /// `node.fence_failed`, so the primary lists the lease again and only a
+    /// new acknowledgement clears it (ADR 0238). Until the fence is recorded,
+    /// nothing starts for its lease.
+    ///
+    /// The list names leases, not tokens, so a failure recorded after the
+    /// operator checked but before this command is taken (a fence that ended
+    /// while the command waited, or one whose event has not reached the
+    /// primary yet) is cleared with its lease. `fence_ack` carries no token
+    /// to tell them apart; that needs a contract change.
     async fn fence_ack(&mut self, lease_ids: &[String]) -> CommandResult {
         let running: Vec<&str> = lease_ids
             .iter()
