@@ -34,7 +34,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::health::{FIRST_PROBE_DELAY, HealthTarget, is_passing, probe};
-use crate::lease::LeaseView;
+use crate::lease::{LeaseView, StartPermit};
 use crate::logs::LogCollector;
 use crate::store::{NodeStore, VolumeRecord};
 use crate::util;
@@ -1026,6 +1026,11 @@ impl<E: Engine + 'static> Reconciler<E> {
                 warn!(vm_id, error = %e, "could not record the restart generation");
             }
             if vm.desired_status == DesiredStatus::Running {
+                let Some(_permit) = self.start_permit(vm).await else {
+                    debug!(vm_id, "the lease was lost before the restart; the VM waits");
+                    self.remember(&vm_id, info.state);
+                    return true;
+                };
                 match self.engine.start(&id).await {
                     Ok(started) => {
                         info!(vm_id, "VM restarted for a new restart_generation");
@@ -1058,6 +1063,14 @@ impl<E: Engine + 'static> Reconciler<E> {
                     // stop.
                     let unexpected_exit = matches!(info.state, VmState::Crashed)
                         || (was_running && info.state == VmState::Stopped);
+                    // Section 6.4 at the moment of the start: the lease may
+                    // have been lost since `may_start` was read, and a fence
+                    // must not overlap the start (section 8.5).
+                    let Some(_permit) = self.start_permit(vm).await else {
+                        debug!(vm_id, "the lease was lost before the start; the VM waits");
+                        self.remember(&vm_id, info.state);
+                        return true;
+                    };
                     if unexpected_exit {
                         if let Some(code) = info.exit_code
                             && let Err(e) = self
@@ -1596,6 +1609,20 @@ impl<E: Engine + 'static> Reconciler<E> {
     }
 
     /// Stops a VM gracefully with the configured timeout.
+    /// Section 6.4 at the moment of a start: `None` when a stateful VM may not
+    /// start now; otherwise a guard the caller holds until the engine's start
+    /// returned, so a fence of the VM's lease waits for the start and then
+    /// stops the VM (section 8.5). A stateless VM needs no lease.
+    async fn start_permit(&self, vm: &SpecVm) -> Option<Option<StartPermit>> {
+        if !vm.stateful {
+            return Some(None);
+        }
+        let (Some(lease_id), Some(token)) = (&vm.lease_id, vm.fencing_token) else {
+            return None;
+        };
+        self.lease.start_permit(lease_id, token).await.map(Some)
+    }
+
     async fn stop_vm(&self, id: &VmId) -> Result<VmInfo, EngineError> {
         self.engine
             .stop(

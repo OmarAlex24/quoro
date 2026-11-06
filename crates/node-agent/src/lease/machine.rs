@@ -5,7 +5,7 @@
 //! Every method takes `now: Instant` from the caller, so the same code runs
 //! against the paused test clock and against the node's real monotonic clock.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use quoro_proto::{FenceReason, LeaseGrant, LeaseId, LeaseMode, LeaseRevoke, MsgId, ResourceType};
@@ -129,7 +129,10 @@ impl LeaseTable {
     ///   `expired` and are fenced: the timing that proved them valid did not
     ///   survive the restart, so the safe choice is to stop and wait for a new
     ///   grant with a higher token.
-    /// - `expired` and `revoked` stay as they are.
+    /// - `expired` and `revoked` stay as they are. One whose fence has no
+    ///   record for its token was interrupted by the restart (section 8.5
+    ///   "Concurrency", D-0075): it is fenced again, because the VMMs outlive
+    ///   the agent and a half-done stop may have left a VM running.
     /// - The highest token per resource comes back exactly.
     ///
     /// The contract (section 8.4, D-0072) requires a `held` `expiring` lease
@@ -142,9 +145,13 @@ impl LeaseTable {
     // `CLOCK_BOOTTIME`, and restore a `held` `expiring` lease as held with its
     // remaining validity instead of fencing it.
     #[must_use]
+    ///
+    /// `fenced` holds the lease id and token of every recorded fence, complete
+    /// or not: a failed fence is covered by the node's failed mark instead.
     pub fn restore(
         leases: Vec<StoredLease>,
         highest: Vec<((ResourceType, String), u64)>,
+        fenced: &HashSet<(LeaseId, u64)>,
     ) -> (Self, Vec<Action>) {
         let mut table = Self::new();
         for entry in highest {
@@ -165,6 +172,23 @@ impl LeaseTable {
                     other => other,
                 },
             };
+            // A lease that reached a fenced state always starts a fence, and
+            // the fence's record is written once its stop finished. A fenced
+            // state without that record means the agent died mid-fence.
+            let interrupted = match state {
+                LeaseState::Revoked => Some(FenceReason::LeaseRevoked),
+                LeaseState::Expired => Some(FenceReason::LeaseExpired),
+                LeaseState::Held | LeaseState::Uncertain => None,
+            };
+            if let Some(reason) = interrupted
+                && state == stored.state
+                && !fenced.contains(&(stored.lease_id.clone(), stored.token))
+            {
+                actions.push(Action::Fence {
+                    lease_id: stored.lease_id.clone(),
+                    reason,
+                });
+            }
             let key = (stored.resource_type, stored.resource_id.clone());
             table
                 .highest_token
@@ -578,6 +602,7 @@ impl Default for LeaseTable {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::time::Duration;
 
     use quoro_proto::{
@@ -1267,7 +1292,7 @@ mod tests {
             duration: Some(millis(15000)),
         };
         let highest = vec![((ResourceType::App, "app_test".to_string()), 7_u64)];
-        let (table, actions) = LeaseTable::restore(vec![stored], highest);
+        let (table, actions) = LeaseTable::restore(vec![stored], highest, &HashSet::new());
         assert_eq!(
             actions,
             vec![Action::Fence {
@@ -1308,7 +1333,10 @@ mod tests {
                 duration: None,
             },
         ];
-        let (table, actions) = LeaseTable::restore(leases, Vec::new());
+        let fenced: HashSet<(LeaseId, u64)> = [(LeaseId("lse_revoked".to_string()), 3)]
+            .into_iter()
+            .collect();
+        let (table, actions) = LeaseTable::restore(leases, Vec::new(), &fenced);
         assert!(actions.is_empty());
         assert_eq!(
             table
@@ -1326,6 +1354,82 @@ mod tests {
         );
         assert_eq!(table.highest_for(ResourceType::App, "app_local"), 2);
         assert_eq!(table.highest_for(ResourceType::App, "app_revoked"), 3);
+    }
+
+    fn stored(lease: &str, mode: LeaseMode, token: u64, state: LeaseState) -> StoredLease {
+        StoredLease {
+            lease_id: LeaseId(lease.to_string()),
+            resource_type: ResourceType::App,
+            resource_id: format!("app_{lease}"),
+            mode,
+            token,
+            state,
+            duration: match mode {
+                LeaseMode::Local => None,
+                LeaseMode::Expiring => Some(millis(15000)),
+            },
+        }
+    }
+
+    /// Section 8.5 "Concurrency" (D-0075): a lease that reached a fenced state
+    /// but has no fence record for its token was interrupted mid-fence, so the
+    /// restore fences it again; a recorded fence is not repeated.
+    #[test]
+    fn restore_fences_again_a_fence_the_restart_interrupted() {
+        let leases = vec![
+            stored("lse_cut", LeaseMode::Local, 4, LeaseState::Revoked),
+            stored("lse_done", LeaseMode::Local, 2, LeaseState::Revoked),
+            stored("lse_exp", LeaseMode::Expiring, 5, LeaseState::Expired),
+            stored("lse_held", LeaseMode::Local, 1, LeaseState::Held),
+        ];
+        // `lse_cut` was recorded at an older token only: its newest revoke
+        // never finished its fence.
+        let fenced: HashSet<(LeaseId, u64)> = [
+            (LeaseId("lse_cut".to_string()), 3),
+            (LeaseId("lse_done".to_string()), 2),
+        ]
+        .into_iter()
+        .collect();
+        let (table, actions) = LeaseTable::restore(leases, Vec::new(), &fenced);
+        assert_eq!(
+            actions,
+            vec![
+                Action::Fence {
+                    lease_id: LeaseId("lse_cut".to_string()),
+                    reason: FenceReason::LeaseRevoked,
+                },
+                Action::Fence {
+                    lease_id: LeaseId("lse_exp".to_string()),
+                    reason: FenceReason::LeaseExpired,
+                },
+            ]
+        );
+        for (id, state) in [
+            ("lse_cut", LeaseState::Revoked),
+            ("lse_done", LeaseState::Revoked),
+            ("lse_exp", LeaseState::Expired),
+            ("lse_held", LeaseState::Held),
+        ] {
+            assert_eq!(
+                table.get(&LeaseId(id.to_string())).expect("lease").state,
+                state
+            );
+        }
+        assert!(!table.may_start_stateful(&LeaseId("lse_cut".to_string()), 4));
+    }
+
+    /// A held expiring lease is fenced once by the restore, not twice.
+    #[test]
+    fn restore_fences_a_held_expiring_lease_once() {
+        let leases = vec![stored("lse_e", LeaseMode::Expiring, 7, LeaseState::Held)];
+        let (_table, actions) = LeaseTable::restore(leases, Vec::new(), &HashSet::new());
+        assert_eq!(
+            actions,
+            vec![Action::Fence {
+                lease_id: LeaseId("lse_e".to_string()),
+                reason: FenceReason::LeaseExpired,
+            }]
+        );
     }
 
     #[test]

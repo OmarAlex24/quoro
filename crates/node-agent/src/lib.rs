@@ -45,8 +45,8 @@ pub use ingress::{DnsBridge, IngressConfig, IngressSupervisor};
 pub use lease::{
     Action, FenceRecord, FenceReport, FenceTimers, Lease, LeaseAgent, LeaseAgentConfig,
     LeaseConfig, LeaseLink, LeaseState, LeaseStore, LeaseTable, LeaseView, LocalLeases,
-    MIN_DURATION, MemoryLeaseStore, Refusal, RevokeOutcome, StoredLease, VmFenceOutcome,
-    budget_for, margin, start_local_leases, stop_vms,
+    MIN_DURATION, MemoryLeaseStore, Refusal, RevokeOutcome, StartPermit, StoredLease,
+    VmFenceOutcome, budget_for, margin, start_local_leases, stop_vms,
 };
 pub use set_primary::{SetPrimary, set_primary, verify_primary, write_primary};
 
