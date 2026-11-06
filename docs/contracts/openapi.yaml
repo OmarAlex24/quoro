@@ -6598,10 +6598,12 @@ paths:
         refused with `forbidden` and `reason: human_only`. `lease_ids` must equal
         the node's outstanding `fence_failure.lease_ids`; a node without one, or a
         list that differs, is refused with `conflict`. In one transaction the
-        primary increments the fencing token of each listed lease, as when a node
-        is declared lost, clears `fence_failure`, and queues the `fence_ack`
-        command for the node (node-agent-protocol.md sections 5.17 and 8.5); from
-        then on those leases may be granted again. The call is audited (D-0031).
+        primary increments the fencing token of each listed lease that the node
+        still holds, as when a node is declared lost, leaves the token of a
+        listed lease that another node already holds as it is (ADR 0246),
+        clears `fence_failure`, and queues the `fence_ack` command for the node
+        (node-agent-protocol.md sections 5.17 and 8.5); from then on those
+        leases may be granted again. The call is audited (D-0031).
       x-quoro-scope: node:fence_ack
       parameters:
         - $ref: '#/components/parameters/NodeId'
