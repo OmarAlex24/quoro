@@ -1292,12 +1292,100 @@ async fn an_older_failed_mark_lists_its_incomplete_fences() {
         store.failed_fences().await.unwrap(),
         vec!["lse_old".to_owned()]
     );
-    assert!(
-        store
-            .ack_fences(&["lse_old".to_owned()])
-            .await
-            .unwrap()
-            .is_empty()
+    store.pool().close().await;
+    drop(store);
+
+    // The older primary never listed that failure, so the upgraded agent
+    // reports it once, naming the VM its record names.
+    let engine = Arc::new(FakeEngine::new());
+    let (desired, _) = watch::channel(None);
+    let (leases, store) = start(&dir, engine.clone(), &desired).await;
+    assert!(leases.view.is_failed());
+    let events = fenced_events(&store).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["type"], "node.fence_failed");
+    assert_eq!(events[0]["subject"]["id"], "lse_old");
+    assert_eq!(
+        events[0]["data"]["lease_ids"],
+        serde_json::json!(["lse_old"])
     );
+    assert_eq!(events[0]["data"]["vm_ids"], serde_json::json!(["vm_old"]));
+    assert_eq!(events[0]["data"]["reason"], "lease_revoked");
+    leases.abort();
+    store.pool().close().await;
+    drop(store);
+
+    // Only once: a second start reports nothing more.
+    let (leases, store) = start(&dir, engine, &desired).await;
+    assert_eq!(fenced_events(&store).await.len(), 1);
+    let result = leases.link.fence_ack(vec!["lse_old".to_owned()]).await;
+    assert_eq!(result.status, CommandStatus::Ok, "{result:?}");
+    assert!(!leases.view.is_failed());
     assert!(!store.node_failed().await.unwrap());
+    leases.abort();
+}
+
+/// A `fence_ack` naming a lease whose fence still runs is refused: that
+/// fence may fail after the operator checked, and its outcome must not be
+/// cleared unseen. Once the fence is answered, a `fence_ack` applies.
+#[tokio::test]
+async fn a_fence_ack_waits_for_a_running_fence_of_its_lease() {
+    let dir = TargetDir::new("lease-fence-ack-running");
+    let engine = Arc::new(FakeEngine::new());
+    let snapshot = snapshot_full(
+        1,
+        vec![stateful_vm("vm_slow", "lse_slow", 1, Vec::new())],
+        Vec::new(),
+        Vec::new(),
+    );
+    let (desired, _) = watch::channel(Some(snapshot));
+    let (leases, store) = start(&dir, engine.clone(), &desired).await;
+    leases
+        .link
+        .grant(
+            msg("msg_grant"),
+            None,
+            local_grant("lse_slow", "app_slow", 1),
+        )
+        .await
+        .unwrap();
+    let slow = common::running_vm(&engine, "vm_slow", 2).await;
+    engine.set_stop_delay(&slow, Duration::from_secs(2));
+
+    let link = leases.link.clone();
+    let revoking = tokio::spawn(async move {
+        link.revoke(msg("msg_revoke"), None, revoke("lse_slow", 1))
+            .await
+    });
+    wait_for("the slow stop to begin", || stops_of(&engine, &slow) == 1).await;
+    let refused = leases.link.fence_ack(vec!["lse_slow".to_owned()]).await;
+    assert_eq!(refused.status, CommandStatus::Error, "{refused:?}");
+    assert!(
+        refused
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("is running")),
+        "{refused:?}"
+    );
+
+    // The stop outlasts the fence's budget, so this fence fails after the
+    // refused acknowledgement: the failure stands.
+    let answer = revoking.await.unwrap().unwrap();
+    assert_eq!(
+        answer.error.as_ref().map(|error| error.code),
+        Some(ErrorCode::FenceFailed),
+        "{answer:?}"
+    );
+    assert!(leases.view.is_failed());
+    assert_eq!(
+        store.failed_fences().await.unwrap(),
+        vec!["lse_slow".to_owned()]
+    );
+
+    // An acknowledgement sent once the fence is answered applies.
+    let applied = leases.link.fence_ack(vec!["lse_slow".to_owned()]).await;
+    assert_eq!(applied.status, CommandStatus::Ok, "{applied:?}");
+    assert!(!leases.view.is_failed());
+    assert!(!store.node_failed().await.unwrap());
+    leases.abort();
 }

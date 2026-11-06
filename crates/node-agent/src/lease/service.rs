@@ -352,6 +352,7 @@ pub async fn start_local_leases<E: Engine + 'static>(
     desired: watch::Receiver<Option<Snapshot>>,
 ) -> Result<LocalLeases, AgentError> {
     let records = store.fences().await?;
+    let unreported = unreported_failures(&store, &records).await;
     let recorded: HashSet<(LeaseId, u64)> = records
         .iter()
         .filter(|record| record.complete)
@@ -396,6 +397,20 @@ pub async fn start_local_leases<E: Engine + 'static>(
         warn!(error = %e, "could not store the host boot id");
     }
     let failed = store.node_failed().await?;
+    if let Some(failures) = unreported {
+        report_unreported(&store, &config, &table, failures).await;
+    }
+    if failed
+        && store
+            .failed_fences()
+            .await
+            .is_ok_and(|listed| listed.is_empty())
+    {
+        warn!(
+            "the node is marked failed but names no failed fence, so no fence_ack can clear it; \
+             clear the failed mark by hand once its VMs are checked"
+        );
+    }
     let view = LeaseView::new(table, failed);
     let (commands, command_rx) = mpsc::unbounded_channel();
     let (hello_tx, hello_rx) = watch::channel(hello_leases(&view.table));
@@ -426,6 +441,79 @@ pub async fn start_local_leases<E: Engine + 'static>(
         view,
         task,
     })
+}
+
+/// The latest failed fence record of each lease an upgrade left to report,
+/// or `None` when there is nothing to report (`node_meta`
+/// `failed_fences_unreported`).
+async fn unreported_failures(
+    store: &NodeStore,
+    records: &[FenceRecord],
+) -> Option<Vec<FenceRecord>> {
+    match store.failed_fences_unreported().await {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(e) => {
+            warn!(error = %e, "could not read whether failed fences wait to be reported");
+            return None;
+        }
+    }
+    let listed = store.failed_fences().await.unwrap_or_default();
+    let mut latest: HashMap<String, FenceRecord> = HashMap::new();
+    for record in records.iter().filter(|record| !record.complete) {
+        if listed.contains(&record.lease_id.0) {
+            latest.insert(record.lease_id.0.clone(), record.clone());
+        }
+    }
+    let mut failures: Vec<FenceRecord> = latest.into_values().collect();
+    failures.sort_by(|a, b| a.lease_id.0.cmp(&b.lease_id.0));
+    Some(failures)
+}
+
+/// Reports, once, the failed fences an older agent recorded: one
+/// `node.fence_failed` per lease, naming the VMs its record names, so the
+/// primary lists them for an acknowledgement (section 8.5). Best effort: a
+/// store that takes no writes reports them at the next start.
+async fn report_unreported(
+    store: &NodeStore,
+    config: &LeaseConfig,
+    table: &LeaseTable,
+    failures: Vec<FenceRecord>,
+) {
+    let mut events = Vec::with_capacity(failures.len());
+    for record in failures {
+        let app_ids: Vec<String> = table
+            .get(&record.lease_id)
+            .filter(|lease| lease.resource_type == ResourceType::App)
+            .map(|lease| vec![lease.resource_id.clone()])
+            .unwrap_or_default();
+        let vm_ids: Vec<String> = record.vm_ids.iter().map(|vm| vm.0.clone()).collect();
+        let evt_id = util::event_id();
+        let event = serde_json::json!({
+            "schema_version": 1,
+            "id": evt_id,
+            "type": "node.fence_failed",
+            "time": util::rfc3339_nanos(store.next_log_time()),
+            "source": {"kind": "node", "node_id": config.node_id},
+            "subject": {"type": "lease", "id": record.lease_id.0},
+            "actor": {"type": "node", "id": config.node_id},
+            "data": {
+                "node_id": config.node_id,
+                "app_ids": app_ids,
+                "lease_ids": [record.lease_id.0],
+                "vm_ids": vm_ids,
+                "reason": match record.reason {
+                    FenceReason::LeaseExpired => "lease_expired",
+                    FenceReason::LeaseRevoked => "lease_revoked",
+                },
+                "error": "reported again after an agent upgrade: this fence failed before the agent kept a list of failed fences",
+            },
+        });
+        events.push((evt_id, event));
+    }
+    if let Err(e) = store.report_failed_fences(&events).await {
+        warn!(error = %e, "could not report the failed fences an older agent recorded");
+    }
 }
 
 /// Who waits for a fence to finish: the revoke it answers.
@@ -561,6 +649,16 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
     /// none remains, so a crash never leaves the node startable with a failed
     /// fence still recorded.
     async fn fence_ack(&self, lease_ids: &[String]) -> CommandResult {
+        // A fence of a listed lease that is still running may fail after the
+        // operator checked; its outcome must not be cleared unseen.
+        if let Some(busy) = lease_ids
+            .iter()
+            .find(|lease_id| self.in_flight.contains_key(&LeaseId((*lease_id).clone())))
+        {
+            return not_fenced(&format!(
+                "a fence of lease {busy} is running; the acknowledgement is not applied"
+            ));
+        }
         match self.store.ack_fences(lease_ids).await {
             Ok(remaining) => {
                 if remaining.is_empty() {
@@ -948,7 +1046,12 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                 {
                     warn!(error = %e, lease_id = %lease_id.0, "could not persist a lease");
                 }
-                if !complete && let Err(e) = self.store.set_node_failed(true).await {
+                if !complete
+                    && let Err(e) = self
+                        .store
+                        .mark_fence_failed(&lease_id.0, &evt_id, &event)
+                        .await
+                {
                     warn!(error = %e, "could not store the node's failed mark");
                 }
                 if complete {
