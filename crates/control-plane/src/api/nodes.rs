@@ -68,6 +68,18 @@ pub struct Node {
     /// Last change-log seq the node has verified.
     #[schema(minimum = 0)]
     pub log_seq: i64,
+    /// Change-log entries the node is behind, or null for a machine that does
+    /// not follow; absent until the promotion and custody work ships
+    /// (`node-agent-protocol.md` section 7.1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<i64>, minimum = 0, required = false)]
+    pub log_lag: Option<Option<i64>>,
+    /// Whether the cluster keys are sealed to this machine, or null without
+    /// the `node` role; absent until the promotion and custody work ships
+    /// (`node-agent-protocol.md` section 7.2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<NodeCustody>, inline, required = false)]
+    pub custody: Option<Option<NodeCustody>>,
     /// Unacknowledged failed fences of this node, or null.
     #[schema(required)]
     pub fence_failure: Option<NodeFenceFailure>,
@@ -91,6 +103,16 @@ pub enum NodeRole {
     Node,
     Witness,
     Edge,
+}
+
+/// Whether the cluster keys are sealed to a machine (`Node.custody`, ADR 0180).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeCustody {
+    Sealed,
+    Pending,
+    None,
+    KeyChanged,
 }
 
 /// Control-plane status of a node.
@@ -296,6 +318,8 @@ pub(crate) fn node_from_row(row: &SqliteRow) -> Result<Node, ApiError> {
         desired_rev: row.try_get("desired_rev")?,
         applied_rev: row.try_get("applied_rev")?,
         log_seq: row.try_get("log_seq")?,
+        log_lag: None,
+        custody: None,
         fence_failure: optional_json_column(row, "fence_failure")?,
         // Filled by `attach_tunnel` from `node_tunnels` (ADR 0095).
         tunnel: None,

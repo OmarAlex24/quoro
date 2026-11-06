@@ -64,7 +64,7 @@ A human's authority is their role. Roles are fixed bundles of scopes, not grant 
 | Role | Holds |
 | --- | --- |
 | `owner` | every scope |
-| `operator` | every scope except `user:write` and `backup:manage` |
+| `operator` | every scope except `user:write`, `backup:manage` and `cluster:manage` |
 | `viewer` | every `:read` scope plus `app:logs` |
 
 Consequences of the bundles:
@@ -72,6 +72,7 @@ Consequences of the bundles:
 - A `viewer` can read apps, deployments, nodes, events, incidents, grants, approvals and the audit log, and can stream app logs, but cannot mutate anything (README.md, "Scopes").
 - An `operator` cannot create or change human users; that is `user:write` and owner-only (README.md, "Scopes").
 - An `operator` cannot create a backup repository or replace its recovery key; that is `backup:manage` and owner-only, because the recovery key opens every backup in the repository, including those of the control-plane database and its secrets (ADR 0147). An `operator` takes backups and restores them (`backup:write`, `backup:restore`).
+- An `operator` cannot rotate the cluster signing key; that is `cluster:manage` and owner-only, because the signing key decides what every node runs (node-agent-protocol.md section 7.5).
 - Every role holds `user:read`, so an `operator` or `viewer` can list users and turn a user id (`owner_user_id`, `on_behalf_of`, `decided_by`, `created_by`) into a name. `user:read` is human-only: agents never list users.
 - `app:terminal` and `vm:console` are in the `owner` and `operator` bundles and not in `viewer`, because neither is a `:read` scope (ADR 0114). A `viewer` can read a build's log (`app:logs`) but cannot start a build.
 - Human roles are not grantable to agents. An agent never receives a "role"; it receives grants (D-0029, D-0030).
@@ -88,6 +89,7 @@ A scope is `<resource>:<verb>` and is the unit of authority in both human roles 
 | Scope | Allows | Flags |
 | --- | --- | --- |
 | `cluster:read` | Read cluster info, version, log position | |
+| `cluster:manage` | Rotate the cluster signing key (ADR 0154, ADR 0187) | human-only |
 | `node:read` | List and read nodes and node metrics; with `app:read`, the Quoro and host-kernel parts of the vulnerability summary | |
 | `node:enroll` | Create node join tokens | human-only |
 | `node:remove` | Remove a node from the cluster | destructive, human-only |
@@ -154,10 +156,10 @@ Making destructive scopes grantable in standing grants would be a change to this
 
 ### 4.2 Human-only scopes
 
-Fifteen scopes are human-only: `node:enroll`, `node:remove`, `node:fence_ack`, `node:roles`, `node:declare_lost`, `app:terminal`, `app:delete_quarantine`, `backup:manage`, `agent:write`, `grant:write`, `approval:decide`, `webhook:write`, `provider:manage`, `user:read` and `user:write` (README.md, "Scopes").
+Sixteen scopes are human-only: `cluster:manage`, `node:enroll`, `node:remove`, `node:fence_ack`, `node:roles`, `node:declare_lost`, `app:terminal`, `app:delete_quarantine`, `backup:manage`, `agent:write`, `grant:write`, `approval:decide`, `webhook:write`, `provider:manage`, `user:read` and `user:write` (README.md, "Scopes").
 
 - A grant whose `scopes` contains a human-only scope is refused at creation with `validation_failed`, and a hypothetical row that contained one is refused at call time with reason `human_only` (README.md, "Errors").
-- The set is chosen so an agent can never widen its own power (`agent:write`, `grant:write`, `webhook:write`), approve its own request (`approval:decide`), take over cluster membership or the voters (`node:enroll`, `node:remove`, `node:roles`), declare a possibly running VM stopped so its lease moves (`node:fence_ack`, D-0079, and `node:declare_lost`, ADR 0183), delete the divergent writes a failover left behind (`app:delete_quarantine`, ADR 0176) or hold external credentials (`provider:manage`) or the key that opens every backup (`backup:manage`) (D-0030, D-0051, ADR 0147). `user:read` is human-only so an agent never reads the list of human identities and their emails. `app:terminal` is human-only in M4 because a shell in the app's VM reads every secret the app holds and acts outside single audited calls (ADR 0114); a later, non-interactive exec scope reachable only through an approval grant is a separate decision.
+- The set is chosen so an agent can never widen its own power (`agent:write`, `grant:write`, `webhook:write`), approve its own request (`approval:decide`), take over cluster membership or the voters (`node:enroll`, `node:remove`, `node:roles`), declare a possibly running VM stopped so its lease moves (`node:fence_ack`, D-0079, and `node:declare_lost`, ADR 0183), delete the divergent writes a failover left behind (`app:delete_quarantine`, ADR 0176) or hold external credentials (`provider:manage`) or the key that opens every backup (`backup:manage`) or replace the key every node trusts (`cluster:manage`) (D-0030, D-0051, ADR 0147). `user:read` is human-only so an agent never reads the list of human identities and their emails. `app:terminal` is human-only in M4 because a shell in the app's VM reads every secret the app holds and acts outside single audited calls (ADR 0114); a later, non-interactive exec scope reachable only through an approval grant is a separate decision.
 - Because `approval:decide` is human-only, "an agent approves its own destructive request" is not a policy that could be misconfigured; it is unrepresentable (D-0030).
 
 ### 4.3 Wildcards

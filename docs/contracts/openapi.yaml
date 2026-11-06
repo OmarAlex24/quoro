@@ -477,7 +477,9 @@ components:
     NotPrimary:
       description: |
         The write reached a replica that cannot forward it to the primary
-        (`code: not_primary`, 503) (D-0012). The client may retry against the
+        (`code: not_primary`, 503) (D-0012). From M5b a demoted primary, one
+        that learned of a higher term, answers every request this way
+        (node-agent-protocol.md section 7.4). The client may retry against the
         primary.
       headers:
         Quoro-Request-Id:
@@ -568,8 +570,9 @@ components:
             why a `conflict` was returned by `failoverApp` or `switchoverApp`
             (`not_warm`, `no_copy`, `not_in_sync`, `node_disconnected`,
             `fence_failed`, `no_support`, `lease_held`, `in_progress`; each
-            operation says when) or by `deleteApp` and `deleteVolume`
-            (`has_quarantines`). Absent for other codes and other conflicts.
+            operation says when), by `deleteApp` and `deleteVolume`
+            (`has_quarantines`), or by `rotateSigningKey` (`in_progress`).
+            Absent for other codes and other conflicts.
           enum:
             - scope_missing
             - selector_mismatch
@@ -760,13 +763,56 @@ components:
           description: |
             Term of the current primary: 1 until the first promotion, then one
             more with each promotion, which takes it from a majority of voters
-            (node-agent-protocol.md section 8.8). Automatic elections are M6.
+            (node-agent-protocol.md sections 7.3 and 8.8). Automatic elections
+            are M6.
         votes:
           $ref: '#/components/schemas/ClusterVotes'
+        signing_key_id:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: |
+            Id of the current cluster signing key: the lowercase hex SHA-256 of
+            its public key (node-agent-protocol.md section 5.21). Absent until
+            the promotion and custody work ships.
+        signing_key_rotation:
+          description: |
+            The signing-key rotation that is running, or null when none is
+            (node-agent-protocol.md section 7.5). Absent until the promotion
+            and custody work ships.
+          oneOf:
+            - $ref: '#/components/schemas/SigningKeyRotation'
+            - type: 'null'
         created_at:
           type: string
           format: date-time
           description: When the cluster was created.
+    SigningKeyRotation:
+      type: object
+      title: SigningKeyRotation
+      description: |
+        A running rotation of the cluster signing key (ADR 0154,
+        node-agent-protocol.md section 7.5). It completes once every machine
+        that is not removed pins the next key; a machine that never returns
+        holds it open until it is removed.
+      required:
+        - next_key_id
+        - started_at
+        - pending_node_ids
+      properties:
+        next_key_id:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: Id of the next signing key.
+        started_at:
+          type: string
+          format: date-time
+          description: When the rotation started.
+        pending_node_ids:
+          type: array
+          description: Machines of any role that still pin the current key, oldest enrolled first.
+          items:
+            type: string
+            pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
     ClusterVotes:
       type: object
       title: ClusterVotes
@@ -874,7 +920,8 @@ components:
       description: |
         A machine running the Quoro binary (D-0012). `cp_status` is the
         control-plane status; whether a node follows the change log is visible in
-        its `log_seq`, not in `cp_status`.
+        its `log_seq` and `log_lag`, and whether it can be promoted in its
+        `custody`, not in `cp_status` (node-agent-protocol.md section 7).
       required:
         - id
         - name
@@ -913,12 +960,13 @@ components:
               - edge
         cp_status:
           description: |
-            Control-plane status. `replica` only once read-serving by replica
-            nodes is enabled with manual promotion in M5; before that every
-            non-primary node is null. In M1-M4 the cluster has exactly one
-            primary and no witness (D-0016). After `quoro restore` onto another
-            host, the restored primary moves `primary` to the node on its new
-            host at its first start (backup-format.md section 8.2).
+            Control-plane status. `replica` is reserved for read serving by
+            replica nodes, which is M6 (ADR 0179); until then every non-primary
+            node is null, including the machines that follow the change log
+            and could be promoted. After `quoro restore` onto another host, the
+            restored primary moves `primary` to the node on its new host at its
+            first start (backup-format.md section 8.2); `quoro cluster promote`
+            moves it to the promoted node (node-agent-protocol.md section 7.3).
           oneOf:
             - type: string
               enum:
@@ -971,7 +1019,35 @@ components:
         log_seq:
           type: integer
           minimum: 0
-          description: Last change-log seq the node has verified.
+          description: |
+            Last change-log seq the node has verified. From M5b the newest
+            acknowledgement the primary holds in memory (node-agent-protocol.md
+            section 7.1).
+        log_lag:
+          type: [integer, 'null']
+          minimum: 0
+          description: |
+            How many change-log entries the node is behind the primary: the
+            primary's newest seq minus `log_seq`. Null for a machine that does
+            not follow, one without the `node` role (node-agent-protocol.md
+            section 7.1). Absent until the promotion and custody work ships.
+        custody:
+          description: |
+            Whether the cluster keys are sealed to this machine, so it can be
+            promoted (node-agent-protocol.md section 7.2): `sealed` when every
+            key in use is, `pending` while a seal is missing, `none` before the
+            machine reports a custody key, `key_changed` after the machine
+            reported a different key, which the primary refused. Null for a
+            machine without the `node` role. Absent until the promotion and
+            custody work ships.
+          oneOf:
+            - type: string
+              enum:
+                - sealed
+                - pending
+                - none
+                - key_changed
+            - type: 'null'
         fence_failure:
           description: |
             Failed fences of this node that no operator has acknowledged yet, or
@@ -4453,6 +4529,7 @@ components:
         grants; scopes are listed explicitly.
       enum:
         - cluster:read
+        - cluster:manage
         - node:read
         - node:enroll
         - node:remove
@@ -6364,6 +6441,43 @@ paths:
           $ref: '#/components/responses/ValidationFailed'
         '429':
           $ref: '#/components/responses/RateLimited'
+  /api/v1/cluster/signing-key/rotate:
+    post:
+      tags: [cluster]
+      operationId: rotateSigningKey
+      summary: Rotate the cluster signing key
+      description: |
+        Starts a rotation of the key that signs desired state (ADR 0154,
+        node-agent-protocol.md section 7.5). The primary generates the next
+        key, seals it to every machine with a custody key, and sends every
+        machine a `signing_key_rotate` signed by the current key; each machine
+        pins the next key when it answers. The rotation completes once every
+        machine that is not removed pins it, and `Cluster.signing_key_rotation`
+        shows the machines still pending until then. One rotation runs at a
+        time: another request answers `conflict` with `reason: in_progress`.
+        The scope is human-only: an agent is refused with `forbidden` and
+        `reason: human_only`. The call is audited (D-0031).
+      x-quoro-scope: cluster:manage
+      responses:
+        '202':
+          description: The rotation started.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigningKeyRotation'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/NotPrimary'
   /api/v1/nodes:
     get:
       tags: [nodes]

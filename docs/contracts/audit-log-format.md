@@ -351,6 +351,24 @@ System record, with `actor_type` `system` and no `scope`:
 
 Replication cycles, streams and their refusals write no record: they change no state on the primary, which keeps their progress in memory (node-agent-protocol.md section 5.3).
 
+### 3.9 Promotion and custody (M5b)
+
+Promotion, custody and the rotation of the signing key add one call and three kinds of system record (ADR 0154, ADR 0180 to ADR 0182, ADR 0231 to ADR 0233). The call is recorded like any mutating call:
+
+| Operation | `scope` | `target_type` / `target_id` | Notes |
+| --- | --- | --- | --- |
+| `rotateSigningKey` | `cluster:manage` | `cluster` / the cluster id | Human only; `params` is `{}`. The change log holds the next key's row and its seals (node-agent-protocol.md section 7.5) |
+
+System records, with `actor_type` `system` and no `scope`:
+
+| `operation` | `actor_id` | `channel` | `target_type` / `target_id` | When |
+| --- | --- | --- | --- | --- |
+| `cluster.promoted` | `cluster` | `cli` | `node` / the promoted node | `quoro cluster promote` built the new primary (node-agent-protocol.md section 7.3). `params` is `{from_node_id, to_node_id, term, log_seq, ack_fence}`, where `log_seq` is the last followed entry the database was rebuilt from. With `ack_fence` true, `justification` holds the operator's `--statement`. Written in the change-log write that moves the primary status, as the first record of the new term. The command runs as root on the host and authenticates no user, like `cluster.maintenance` (section 3.7) |
+| `node.custody_key_changed` | `nodes` | `system` | `node` / the machine | A machine reported a custody key other than the one the primary bound to it, and the primary refused it (node-agent-protocol.md section 7.2). `params` is `{node_id}`. Written once, when `nodes.custody_key_changed_at` is set |
+| `cluster.signing_key_rotated` | `cluster` | `system` | `cluster` / the cluster id | Every machine that is not removed pins the next signing key, and the primary made it the current one and deleted the old key and its seals (node-agent-protocol.md section 7.5). `params` is `{old_key_id, new_key_id}` |
+
+Seals, follow acknowledgements and votes write no record. A demoted primary writes no record either, because it no longer writes; `quoro node rejoin` keeps its database, and so its whole audit chain, as a quarantined copy (node-agent-protocol.md section 7.4). The new primary's chain continues from the last record it followed. Records the old primary wrote after that are not in it; when the off-site copy holds them, its verification reports the difference as after a restore (section 8.5).
+
 ## 4. Redaction
 
 Requests can carry secrets. The audit record stores the request parameters, so it must not become a second secret store (D-0031).

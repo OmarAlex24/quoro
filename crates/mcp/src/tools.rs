@@ -354,6 +354,7 @@ fn scope() -> Value {
         "description": "One scope, `<resource>:<verb>` (D-0030). Wildcards are not allowed in\ngrants; scopes are listed explicitly.\n",
         "enum": [
             "cluster:read",
+            "cluster:manage",
             "node:read",
             "node:enroll",
             "node:remove",

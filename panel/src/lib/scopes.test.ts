@@ -23,7 +23,7 @@ const contractScopes = (scopeClass: 'human-only' | 'destructive'): string[] => {
 describe('scopes', () => {
   it('matches the human-only scopes of permission-model.md, section 4.2', () => {
     const contract = contractScopes('human-only');
-    expect(contract).toHaveLength(15);
+    expect(contract).toHaveLength(16);
     expect([...HUMAN_ONLY_SCOPES]).toEqual(contract);
   });
 
@@ -39,10 +39,11 @@ describe('scopes', () => {
     }
   });
 
-  it('never offers the terminal, the backup key or a restore for a grant', () => {
+  it('never offers the terminal, the backup key, the signing key or a restore for a grant', () => {
     const offered = grantableScopes();
     expect(offered).not.toContain('app:terminal');
     expect(offered).not.toContain('backup:manage');
+    expect(offered).not.toContain('cluster:manage');
     expect(offered).not.toContain('backup:restore');
     expect(offered).toContain('backup:read');
   });

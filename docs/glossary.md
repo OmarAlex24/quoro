@@ -34,6 +34,8 @@ Terms used across Quoro's documents. Bracketed ids point to the decision ledger;
 
 **control plane**: The stateful layer (API and state) that holds Quoro's state and accepts writes through the primary; if it dies, apps keep running and only changes are blocked. [D-0010, D-0011]
 
+**custody key**: The X25519 key pair a machine with the `node` role generates for itself; the primary seals the cluster signing key, the data-encryption key and its own TLS key to the public half, so that machine can be promoted (node-agent-protocol.md section 7.2). [D-0078, ADR 0180]
+
 **data plane**: The apps and node agents that keep running and reconciling their local desired state when the panel or the control plane is unreachable. [D-0010, D-0011]
 
 **desired state**: The locally stored description of what a node should run, written by the control plane and applied by the node agent without needing the control plane to be reachable. [D-0011]
@@ -72,7 +74,7 @@ Terms used across Quoro's documents. Bracketed ids point to the decision ledger;
 
 **majority**: See quorum. [D-0016, D-0017]
 
-**manual promotion**: The M5b action (D-0067) that promotes a replica node to primary, either as a command or button or by an agent with human approval. [D-0016, D-0067]
+**manual promotion**: The M5b action (D-0067) that makes a machine with the `node` role the primary when the old one is gone: `quoro cluster promote`, run as root on that machine, takes the next term from a majority of voters, rebuilds the database from the change log the machine followed and opens the cluster keys sealed to its custody key (node-agent-protocol.md section 7.3). [D-0016, D-0067, ADR 0182]
 
 **MCP**: Model Context Protocol server exposing Quoro to agents; it is first-class from day one and uses the same service layer and audit log as the HTTP API. [D-0002, D-0031]
 
@@ -112,7 +114,7 @@ Terms used across Quoro's documents. Bracketed ids point to the decision ledger;
 
 **relevo**: See planned switchover. [D-0022]
 
-**replica**: (1) replica node: a node that holds a copy of control-plane state, serves reads and forwards writes to the primary; (2) app replica: an extra running instance of a stateless app behind the edge load balancer. A replica node is not an app replica. [D-0012, D-0020]
+**replica**: (1) replica node: a node that holds a copy of control-plane state, serves reads and forwards writes to the primary (read serving is M6; in M5b a following machine serves nothing, ADR 0179); (2) app replica: an extra running instance of a stateless app behind the edge load balancer. A replica node is not an app replica. [D-0012, D-0020]
 
 **reproducible build**: A build that can be rebuilt bit for bit from its sources; reproducible builds and signed binaries are mandatory because the installer is `curl | sh`. Also: signed binary. [D-0027]
 

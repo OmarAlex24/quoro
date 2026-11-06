@@ -13,7 +13,7 @@ Names used here — roles, node status, VM observed status, lease modes and node
 - The enrollment flow and the credential a node receives.
 - The transport, the envelope and the message set in both directions.
 - How desired state is delivered, verified, persisted and applied.
-- How a node follows the change log (D-0013) and what it does when its copy diverges.
+- How a node follows the change log (D-0013) and what it does when its copy diverges; from M5b, how a machine with the `node` role holds the cluster keys and is promoted to primary (ADR 0179 to ADR 0182).
 - The lease lifecycle and the self-fence procedure that D-0019 requires from M0.
 - The order of operations when a node returns after a failure (D-0022).
 - What the node stores locally, so the data plane can run without the control plane (D-0011).
@@ -75,6 +75,7 @@ The call is `x-quoro-scope: public`: the node has no credential yet and the join
 | `roles` | array of string | yes | Any of `node`, `witness`, `edge` (`README.md`) |
 | `capacity` | object | yes | `cpus`, `memory_mb`, `disk_gb` |
 | `kvm` | object | yes | `available` (bool), `kernel` (string), `nested` (bool, optional) |
+| `custody_public_key` | string | no | From M5b, with the `node` role: base64 X25519 public key of the machine's custody key (section 7.2). The primary binds the machine to the first custody key it reports, here or in `hello` |
 
 **Edge-only machines (M5a, ADR 0143).** A machine that enrolls with `roles: ["edge"]` runs no engine and starts no VM, so it needs no KVM: it reports the probe as it finds it (usually `available: false`), and the primary never places a VM on it. A machine with the `node` role still needs KVM to run VMs; `node` and `edge` may combine on one machine.
 
@@ -92,9 +93,9 @@ The `kvm` object is filled from a probe at enrollment: `/dev/kvm` exists and is 
 | `credential` | string | Node session credential, returned once |
 | `cluster_public_key` | string | Base64 Ed25519 public key that signs desired state |
 
-The credential is 32 random bytes, base64-encoded, and stored root-only on the node. The primary stores only its SHA-256 hash, in the local table `node_credentials` (`db-schema.sql` migration 0002), so a database read does not yield a usable credential and the hash never travels in the change log.
+The credential is 32 random bytes, base64-encoded, and stored root-only on the node. The primary stores only its SHA-256 hash, in the table `node_credentials` (`db-schema.sql` migration 0002), so a database read does not yield a usable credential. Until M5b the table was local. From M5b its rows travel in the change log like the other hash-only tables (migration 0012, ADR 0226), so that a promoted primary accepts every node's session (section 7.3).
 
-Desired state and lease messages are signed with the cluster signing key (Ed25519), whose public key the node pins at enrollment; that key is separate from the cluster data-encryption key that protects data at rest (D-0050). The signing key is Ed25519; data at rest uses a 256-bit cluster data-encryption key with XChaCha20-Poly1305, plus a node-local key that encrypts this node's copy of desired-state secrets. All keys are files mode 0600 in `/var/lib/quoro` on the primary, outside the SQLite file, generated at first start and backed up separately from the database. Custody of the keys when a replica is promoted is decided (ADR 0078, read by ADR 0180): every machine with the `node` role will hold the signing key, the data-encryption key and the primary's TLS key sealed to a custody key of its own, never to its node-local key, which the primary never sees. The fields that carry the seals are specified with manual promotion in M5b; until then the keys do not leave the primary.
+Desired state and lease messages are signed with the cluster signing key (Ed25519), whose public key the node pins at enrollment; that key is separate from the cluster data-encryption key that protects data at rest (D-0050). The signing key is Ed25519; data at rest uses a 256-bit cluster data-encryption key with XChaCha20-Poly1305, plus a node-local key that encrypts this node's copy of desired-state secrets. All keys are files mode 0600 in `/var/lib/quoro` on the primary, outside the SQLite file, generated at first start and backed up separately from the database. From M5b every machine with the `node` role holds the signing key, the data-encryption key and the primary's TLS key sealed to a custody key of its own, never to its node-local key, which the primary never sees (ADR 0078, read by ADR 0180 and ADR 0181; section 7.2).
 
 ### 2.5 After enrollment
 
@@ -192,7 +193,7 @@ node agent                                          primary
 1. `hello` is the first message the node sends on every session.
 2. `welcome` is the first message the primary sends. From M5b the node compares its `term` with the highest term it has seen and ends the session with `error` code `stale_term` when the `welcome` is lower (section 8.8).
 3. The primary sends any `lease_revoke` before anything else. The node stops the stateful VMs bound to those leases and answers `command_result` for each revoke. While a revoke's self-fence runs, the node keeps processing `lease_grant` for other leases, including the answers to its renewals, and liveness traffic; it holds back every other message, such as `desired_state`, a `lease_revoke` of the same lease, `command` and `stream_open`, until it has answered the revoke (section 5.13, ADR 0222).
-4. If an operator acknowledged a failed fence of this node and the node has not yet confirmed it, the primary then sends `command` kind `fence_ack` (sections 5.17 and 8.5) and waits for its `command_result`.
+4. If an operator acknowledged a failed fence of this node and the node has not yet confirmed it, the primary then sends `command` kind `fence_ack` (sections 5.17 and 8.5) and waits for its `command_result`. From M5b, while a signing-key rotation runs and the node still pins the current key, the primary then sends `signing_key_rotate` (sections 5.21 and 7.5) and waits for its `command_result`, so the `desired_state` that follows is signed with the key the node pins.
 5. Only then does the primary send `desired_state`. The node verifies, persists, answers `command_result` with `ok`, and reconciles.
 6. `log_entries` follow the desired state; the node acknowledges with `log_ack` as it verifies the chain.
 7. Steady state begins: `heartbeat` every 5 s, `status_report` on any observed change and at least every 30 s, `event` whenever something happens, streams on demand. On a voter the primary sends its first `support_request` after the voter acknowledged the `desired_state`, so the voter knows its voter-set version (section 8.10).
@@ -210,6 +211,7 @@ node agent                                          primary
 | Stream window | 256 KiB of unacknowledged `data` bytes per stream | node enforces, primary acknowledges | ADR 0116, section 5.25 |
 | Maximum message | 1 MiB | both | this file |
 | Support window `S` | 15 000 ms, asked again every `S / 3` | primary asks, voter promises | ADR 0169, section 8.8 |
+| Connect timeout of a stored `primary_urls` entry | 2 000 ms in the first redial attempt, doubling with each failed attempt up to 10 000 ms | node | ADR 0139, section 5.10 |
 
 The values above are carried in `welcome` (`heartbeat_interval_ms`, `session_timeout_ms`), so the primary can change them without a protocol change; the node uses the values from the current `welcome` and falls back to the defaults above when a session has not yet received one.
 
@@ -217,7 +219,7 @@ The values above are carried in `welcome` (`heartbeat_interval_ms`, `session_tim
 
 The primary marks the node `disconnected` after 15 s without any frame from it and emits `node.disconnected` with `data.reason` either `heartbeat_timeout` (no frame within the timeout) or `session_closed` (the socket closed or the server ended the session). A node that reconnects is `connected` again and the primary emits `node.connected`.
 
-The node redials with exponential backoff from 1 s doubling to 60 s with full jitter, and resets the backoff after a session that stayed up for at least 60 s. One redial attempt dials `primary_url` and, when that fails, each URL the primary advertised in `welcome.primary_urls` in order (section 5.10); the backoff applies between attempts, not between the URLs of one attempt. A `fatal` error stops redialing until an operator acts, with two exceptions. After `unsupported_version` the node keeps dialing (an upgraded primary may accept it) but logs the mismatch locally. After `stale_term` (section 8.8), sent by the node or received by it, the node keeps dialing too, through `primary_url` and every stored `primary_urls` entry, because the primary of the higher term may be reached at another address or start later; while it has no session it keeps running its stored desired state (section 6.5).
+The node redials with exponential backoff from 1 s doubling to 60 s with full jitter, and resets the backoff after a session that stayed up for at least 60 s. One redial attempt dials `primary_url` and, when that fails, each URL the primary advertised in `welcome.primary_urls` in order (section 5.10); the backoff applies between attempts, not between the URLs of one attempt. A `fatal` error stops redialing until an operator acts, with three exceptions. After `unsupported_version` the node keeps dialing (an upgraded primary may accept it) but logs the mismatch locally. After `stale_term` (section 8.8), sent by the node or received by it, the node keeps dialing too, through `primary_url` and every stored `primary_urls` entry, because the primary of the higher term may be reached at another address or start later; while it has no session it keeps running its stored desired state (section 6.5). After `not_primary` (section 7.4), from a primary that learned of a higher term, it keeps dialing in the same way: `primary_url` is now a demoted primary, and the new one is reached through the stored `primary_urls`.
 
 ## 5. Message reference
 
@@ -245,6 +247,9 @@ All bodies are objects. Field names are snake_case. Timestamps are RFC 3339 UTC 
 | `dropped_events` | integer | yes | Local events dropped from the buffer since the last successful delivery; 0 when none |
 | `mesh_public_key` | string | no | Base64 WireGuard public key of this machine (32 bytes), from M5a (ADR 0144). The machine generates the key pair on its first M5a start and keeps the private key next to its credential; only the public key is ever sent. The primary stores it in `nodes.mesh_public_key` and uses it in other machines' `spec.mesh.peers` |
 | `volume_snapshot` | string | no | How this node snapshots a volume (ADR 0156): `reflink` when its data directory supports `FICLONE` or its volumes live in the node's XFS volume pool, otherwise `pause_copy`. Probed once at agent start (`engine-trait.md` section 3.16). Absent from an agent older than M5a, which the primary treats as a node that cannot hold a volume |
+| `custody_public_key` | string | no | From M5b, on a machine with the `node` role: base64 X25519 public key (32 bytes) of its custody key (section 7.2). Generated at the machine's first M5b start; the private half never leaves it |
+| `signing_key_id` | string | no | From M5b: `key_id` of the cluster signing key this machine pins (section 5.21). The primary signs this machine's messages with that key while a rotation runs (section 7.5) |
+| `control_plane_urls` | array of string | no | From M5b, on a machine with the `node` role: base URLs where this machine's control-plane listener would answer if it were promoted, best first, at most 4. Built like `welcome.primary_urls` from this machine's own addresses and the listener port of the installed configuration (8443 by default). The primary lists them in `welcome.primary_urls` (section 5.10) |
 
 Each lease entry:
 
@@ -288,7 +293,10 @@ Each lease entry:
     "kvm": { "available": true, "kernel": "6.11.2", "nested": true },
     "dropped_events": 0,
     "mesh_public_key": "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=",
-    "volume_snapshot": "pause_copy"
+    "volume_snapshot": "pause_copy",
+    "custody_public_key": "hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo=",
+    "signing_key_id": "3f9a1c0e7b52d4a86e1f09c3b7d25e4a90c18f6b2d73e5a41c0b98f7e26d1a35",
+    "control_plane_urls": ["https://192.0.2.21:8443"]
   }
 }
 ```
@@ -530,7 +538,7 @@ The primary answers with a `lease_grant` that carries the same `fencing_token` w
 | `seq` | integer | yes | Highest contiguous `seq` verified |
 | `hash` | string | yes | The `hash` of that entry, hex SHA-256 |
 
-The primary keeps sending from `seq + 1`. An ack that skips a sequence is ignored: the node must verify every entry in order, because the point of the log is that a gap or a broken link is detectable (D-0013).
+The primary keeps sending from `seq + 1`. An ack that skips a sequence is ignored: the node must verify every entry in order, because the point of the log is that a gap or a broken link is detectable (D-0013). From M5b the node acknowledges each `log_entries` message once, with its highest entry, and the primary keeps the newest ack of each node in memory (section 7.1).
 
 ```json
 {
@@ -679,11 +687,12 @@ A `lease_revoke` whose fence failed:
 | `heartbeat_interval_ms` | integer | yes | 5 000 in v1 |
 | `session_timeout_ms` | integer | yes | 15 000 in v1 |
 | `primary_node_id` | string (`nod_`) | yes | The node holding the primary status |
-| `primary_urls` | array of string | no | Other base URLs where the primary's listener can be reached, best first; at most 8 (ADR 0139) |
+| `primary_urls` | array of string | no | Other base URLs where the primary's listener can be reached, best first, and from M5b the URLs of the machines that could be promoted; at most 16 (ADR 0139, ADR 0235, section 7.3) |
+| `schema_version` | integer | no | From M5b: the schema version of the primary's database (`db-schema.sql` `meta`). The node keeps the newest it saw; `quoro cluster promote` refuses to rebuild a database from a log newer than its binary (section 7.3, ADR 0229) |
 
-**`primary_urls`.** The primary fills the list with its `public_url` when one is configured, then `https://<address>:<port>` for each non-loopback, non-link-local address of its host (IPv6 in brackets), then `https://<host name>.local:<port>` when that name resolves on the host, where `<port>` is the listener's port. Addresses of the node bridge are left out. Every entry is an `https://` base URL with no path. The field is optional and additive (section 3.4): a primary that does not send it, or sends an empty list, is valid, and a node that does not know it ignores it.
+**`primary_urls`.** The primary fills the list with its `public_url` when one is configured, then `https://<address>:<port>` for each non-loopback, non-link-local address of its host (IPv6 in brackets), then `https://<host name>.local:<port>` when that name resolves on the host, where `<port>` is the listener's port. Addresses of the node bridge are left out. From M5b the list goes on with the `control_plane_urls` of every other connected machine whose `Node.custody` is `sealed` (section 7.2), the machines a promotion could choose: the first URL of each such machine, oldest enrolled first, then the second of each, and so on. Every entry is an `https://` base URL with no path. The field is optional and additive (section 3.4): a primary that does not send it, or sends an empty list, is valid, and a node that does not know it ignores it.
 
-The node keeps the list next to `primary_url` in its identity (section 12). It drops every entry that is not an `https://` URL and every duplicate, keeps the first 8, and replaces the stored list only when the result differs; a `welcome` without the field leaves the stored list as it is. When a dial to `primary_url` fails (the TCP connection, the TLS handshake against the pinned fingerprint, or the WebSocket upgrade), the node tries the stored URLs in order, with the same pinned fingerprint and the same credential, before it waits out the redial backoff (section 4.4). The first one whose session reaches `welcome` becomes the node's `primary_url` and is persisted. The pin and the credential never change: a host that does not hold the primary's private key cannot complete the handshake, so a stale or hostile entry costs one failed dial and nothing else. A `401` or `403` on the upgrade from a host that passed the pin is fatal as on `primary_url`. An operator can also point a node at a new address by hand with `quoro node set-primary <url>`, which completes a pinned handshake before it writes anything.
+The node keeps the list next to `primary_url` in its identity (section 12). It drops every entry that is not an `https://` URL and every duplicate, keeps the first 16, and replaces the stored list only when the result differs; a `welcome` without the field leaves the stored list as it is. When a dial to `primary_url` fails (the TCP connection, the TLS handshake against the pinned fingerprint, or the WebSocket upgrade), the node tries the stored URLs in order, with the same pinned fingerprint and the same credential, before it waits out the redial backoff (section 4.4). Each connection to a stored entry gives up after the connect timeout of section 4.3, so a list of unreachable entries costs seconds per attempt. A `503` on the upgrade, which a demoted primary answers (section 7.4), is a failed dial like any other. The first one whose session reaches `welcome` becomes the node's `primary_url` and is persisted. The pin and the credential never change: a host that does not hold the primary's private key cannot complete the handshake, so a stale or hostile entry costs one failed dial and nothing else. A `401` or `403` on the upgrade from a host that passed the pin is fatal as on `primary_url`. An operator can also point a node at a new address by hand with `quoro node set-primary <url>`, which completes a pinned handshake before it writes anything.
 
 ```json
 {
@@ -701,8 +710,10 @@ The node keeps the list next to `primary_url` in its identity (section 12). It d
     "primary_urls": [
       "https://quoro.example.com:8443",
       "https://192.0.2.10:8443",
-      "https://[2001:db8::10]:8443"
-    ]
+      "https://[2001:db8::10]:8443",
+      "https://192.0.2.21:8443"
+    ],
+    "schema_version": 13
   }
 }
 ```
@@ -1038,6 +1049,7 @@ This is safe. Section 4.2 rule 3 exists so that nothing received after a revoke 
 | --- | --- | --- | --- |
 | `from_seq` | integer | yes | `seq` of the first entry in `entries` |
 | `entries` | array of object | yes | Change-log entries, at most 500 |
+| `head_seq` | integer | no | From M5b: the `seq` of the primary's newest entry when it sent this message, so the node knows how far behind it is (section 7.1, ADR 0227) |
 
 Each entry has exactly the change-log fields from the shared entity model: `seq` (gap-free from 1), `term`, `time`, `actor_type`, `actor_id`, `entity_type`, `entity_id`, `op` (`create`, `update`, `delete`), `payload` (full new row for create and update, `{}` for delete), `prev_hash` (64 hex, 64 zeros for `seq` 1) and `hash` (hex SHA-256 over the RFC 8785 serialization of the entry without `hash`).
 
@@ -1062,7 +1074,8 @@ Each entry has exactly the change-log fields from the shared entity model: `seq`
         "prev_hash": "3b1f0c9a5e7d2b8f4a6c1d9e0f3a5b7c9d1e3f5a7b9c1d3e5f7a9b1c3d5e7f90",
         "hash": "9c7e1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f90a1b2c3d4e5f6a7b8c9d0e1"
       }
-    ]
+    ],
+    "head_seq": 903
   }
 }
 ```
@@ -1257,12 +1270,14 @@ Restarts and stops are **never** commands. They are changes of desired state —
 | `node_removed` | yes | The node was removed from the cluster (section 10) |
 | `bad_signature` | no | A `desired_state` or `signing_key_rotate` signature did not verify; the message was discarded |
 | `bad_message` | no | Malformed frame, unknown type, unknown command kind, oversized frame |
-| `log_diverged` | no | The node's change-log copy does not match the primary's (section 7) |
+| `log_diverged` | no | The node's change-log copy does not match the primary's (section 7.1) |
 | `not_found` | no | A `stream_open` or `command` named a build, VM or transcript this node does not have. Carried in the `error` of a `command_result` |
 | `not_available` | no | The VM exists but cannot serve the requested stream now: a `terminal` on a stopped VM or on a VM started before the M4 guest init. Carried in the `error` of a `command_result` |
 | `fence_failed` | no | A self-fence could not confirm that every stateful VM bound to the lease stopped, so a VM may still run (section 8.5). Carried in the `error` of the `command_result` that answers a `lease_revoke`; the node has marked itself failed |
 | `replication_failed` | no | From M5b: a `switchover_freeze` could not ship its final snapshot, or the target refused it (section 6.13). Carried in the `error` of its `command_result`; the node resumed the VM |
-| `stale_term` | yes | From M5b: the other side's term is lower than the highest term the sender has seen (section 8.8). A node sends it on a `welcome`, `desired_state` or `support_request` from an older primary and ends the session; it keeps redialing (section 4.4). A primary that receives it stops granting and renewing `expiring` leases at once |
+| `stale_term` | yes | From M5b: the other side's term is lower than the highest term the sender has seen (section 8.8). A node sends it on a `welcome`, `desired_state` or `support_request` from an older primary and ends the session; it keeps redialing (section 4.4). A primary that receives it stops granting and renewing `expiring` leases at once, and demotes itself (section 7.4) |
+| `not_primary` | yes | From M5b: the sender was the primary and has learned of a higher term (section 7.4). It ends every session with this code; the node keeps redialing through its other URLs (section 4.4) |
+| `custody_key_changed` | no | From M5b: the `custody_public_key` of a `hello` differs from the key the primary bound to the machine (section 7.2). The session goes on; the primary makes no seal to the new key |
 
 A fatal error ends the session immediately; the node applies its redial rule (section 4.4). A non-fatal error leaves the session usable.
 
@@ -1331,6 +1346,8 @@ The receiver answers `pong` with `re` set to the `ping` id. A `ping` is not a he
 | `signature` | string | yes | Base64 Ed25519 signature by the current pinned signing key |
 
 **Signature.** As for `desired_state` (section 5.11), the signature covers the RFC 8785 serialization of the whole `body` object with the `signature` member removed. The node verifies it against the cluster public key it currently has pinned.
+
+**When, from M5b.** During a rotation (section 7.5) the primary sends it to every machine of any role, edge-only and witness-only machines included, because they verify `desired_state` too: at once to the connected machines, and to every other one on its next session, after any `lease_revoke` and `fence_ack` and before its `desired_state`.
 
 **Node behaviour.** On a valid signature the node persists the new public key and the `key_id` in its local store (`node_meta`, section 12), and from then on accepts only signatures by the new key. It answers with a `command_result` (`re` set to this message's `id`) meaning persisted, the same acknowledgement `desired_state` and `lease_revoke` use. A signature that does not verify is answered with `error` code `bad_signature`, and the node keeps the old pin and the old key.
 
@@ -1804,14 +1821,97 @@ The switchover's condition, "in sync with a lag below two intervals" (ADR 0177),
 
 If step 2 fails, or the primary gives up before step 3, it sends `switchover_thaw`: the source resumes, nothing moved, and the primary emits `app.switchover_failed`. Once the revoke of step 3 was answered, the switchover goes forward only: the final snapshot is on the target, and the old source's volume holds the same data, so it becomes the target with no quarantine (section 9). A primary that restarts during a switchover thaws a source that reports `frozen: true` (section 5.17); a frozen source cut off from the primary fences when its lease ends.
 
-## 7. Change-log follow
+## 7. Change-log follow, key custody and promotion
 
-Every change to cluster state is a numbered entry in an append-only, hash-chained log (D-0013, D-0015). Replica nodes follow it so that a manual promotion (D-0016) needs no protocol change: a node that already holds a current copy can serve reads and forward writes.
+Every change to cluster state is a numbered entry in an append-only, hash-chained log (D-0013, D-0015). Every machine with the `node` role follows it and holds the cluster keys sealed to a key of its own, so that an operator can promote it when the primary is gone (D-0067, ADR 0179 to ADR 0182). In M5b a follower serves no reads and forwards no writes: `cp_status` `replica` and read serving stay for M6 (ADR 0179).
 
-- **Which nodes follow:** every node with the role `node`, from M2 on. Nothing in this protocol distinguishes a future primary from any other follower, which is what keeps promotion cheap. When promotion happens (manual promotion in M5b, D-0067) the promoted node stops being a follower and starts issuing `desired_state` for its own nodes.
-- **Delivery:** `log_entries` with `from_seq` and up to 500 entries. The node verifies each entry's `hash` over the RFC 8785 serialization of the entry without `hash`, and that `prev_hash` equals the previous entry's `hash`, then stores it and sends `log_ack`.
-- **On `hello`:** the primary compares the node's `log_seq` and `log_hash` with its own hash at that sequence. If they differ, the primary sends `error` with code `log_diverged`, non-fatal. The node moves its local copy aside as a quarantined copy — never deleting it, because divergent local writes must never be silently dropped (D-0022) — and refollows from `seq` 1.
-- **Secrets in the log:** `app_env` values, webhook secrets and provider secrets are stored encrypted with the cluster data-encryption key (AEAD, `db-schema.sql`), so a follower holds ciphertext it cannot read. A promoted replica obtains the cluster data-encryption key, and the signing key, from seals made for it: every machine with the `node` role generates a custody key pair and the primary seals both cluster keys, and its own TLS key, to that machine's public custody key (ADR 0078, read by ADR 0180 and ADR 0181). Edge-only and witness-only machines get no seal. The fields and the table that carry the seals are specified with manual promotion in M5b (D-0067); until then the keys do not leave the primary.
+### 7.1 Follow
+
+- **Which machines follow:** every machine with the `node` role, the primary's own host included. Nothing in this protocol distinguishes a future primary from any other follower, which is what keeps promotion cheap. Edge-only and witness-only machines do not follow and get no `log_entries`.
+- **Delivery (ADR 0227):** after the `desired_state` of a session (section 4.2), the primary sends `log_entries` from the node's `log_seq + 1`, up to 500 entries per message, and then each new entry as it is written. It keeps at most one `log_entries` message per session unacknowledged, and sends the next once the `log_ack` of the previous one arrives. Each message carries `head_seq`, the primary's newest `seq`, so the node knows how far behind it is (section 5.14).
+- **Verification:** the node verifies each entry's `hash` over the RFC 8785 serialization of the entry without `hash`, and that `prev_hash` equals the previous entry's `hash`, then stores the entries and sends one `log_ack` for the highest one. A message whose entries do not verify is a primary bug: the node stores nothing from it and answers `error` code `bad_message`, and the primary sends again from the node's last ack.
+- **On `hello` (ADR 0227):** the primary compares the node's `log_seq` and `log_hash` with its own entry at that `seq`. If they differ, or the node's `log_seq` is above the primary's newest `seq` (a node that followed an older primary further than the promoted one, section 7.3), the primary sends `error` with code `log_diverged`, non-fatal, before any `log_entries`. The node moves its local copy aside as a quarantined copy, never deleting it, because divergent local writes must never be silently dropped (D-0022), and refollows from `seq` 1.
+- **Lag (ADR 0227):** the primary keeps each node's newest acknowledged `seq` in memory and reports it as `Node.log_seq`, with `Node.log_lag`, its own newest `seq` minus that value (`openapi.yaml`). It writes `nodes.log_seq` only together with the writes it already makes to the node's row when a session starts (from `hello.log_seq`) and when it ends. Every write to `nodes` is itself a change-log entry that every follower must then receive and acknowledge, so writing each acknowledgement would never settle.
+- **Secrets in the log:** `app_env` values, webhook secrets and provider secrets are stored encrypted with the cluster data-encryption key (AEAD, `db-schema.sql`), so a follower holds ciphertext it cannot read until a promotion opens its seal of that key (section 7.2). From M5b the hashes in `node_credentials` travel in the log too (`db-schema.sql` migration 0012, ADR 0226), so a promoted primary accepts every node's session.
+
+### 7.2 Key custody
+
+Every machine with the `node` role holds the cluster keys sealed to a key of its own (ADR 0078, read by ADR 0180, and ADR 0181). Edge-only and witness-only machines get no seal.
+
+- **Custody key.** At its first M5b start a machine with the `node` role generates an X25519 key pair, its custody key, and keeps the private half next to its credential as `custody.key`, mode `0600` (section 12). It is neither the WireGuard key nor the node's Ed25519 key, so no key serves two protocols. The machine sends the public half in every `hello` (`custody_public_key`, section 5.1), and in its enroll request when it enrolls with the `node` role (section 2.3).
+- **Binding (ADR 0231).** The primary stores the first custody key a machine reports in `nodes.custody_public_key` and never replaces it from a later report. A `hello` with a different key is answered with `error` code `custody_key_changed`, non-fatal. The session goes on, the primary sets `nodes.custody_key_changed_at`, writes the audit record `node.custody_key_changed` once (`audit-log-format.md` section 3.9), and makes no seal to the new key; `Node.custody` shows `key_changed`. A machine loses its custody key only with its data directory, which also holds its credential, so the way back is to remove the node and enroll the machine again.
+- **Seals.** The primary seals each key it holds to each such machine and keeps the seals in `node_key_custody` (`db-schema.sql` migration 0012). The table is replicated, so every follower holds every seal and can open only its own:
+
+| `key_kind` | Plaintext | `key_id` |
+| --- | --- | --- |
+| `signing` | The 32-byte Ed25519 seed of a cluster signing key | Lowercase hex SHA-256 of its 32-byte public key, as in `signing_key_rotate` (section 5.21) |
+| `dek` | The 32-byte cluster data-encryption key | The 32 lowercase hex characters of the 16-byte key id that starts every blob the key encrypted. One seal per key id the primary holds |
+| `tls` | The RFC 8785 serialization of `{"cert_pem": ..., "key_pem": ...}`: the primary's certificate chain and private key, as PEM text | Lowercase hex SHA-256 of the leaf certificate's DER, the fingerprint every node pins (section 2.2) |
+
+- **Construction (ADR 0231).** HPKE (RFC 9180) in base mode, with DHKEM(X25519, HKDF-SHA256), HKDF-SHA256 and ChaCha20-Poly1305 (KEM `0x0020`, KDF `0x0001`, AEAD `0x0003`). `info` is the ASCII text `quoro custody v1`, `cluster_id`, `node_id`, `key_kind` and `key_id`, each followed by one zero byte, and the AAD is empty. `info` binds a seal to its cluster, machine, kind and key, so a seal cannot be presented as another one. `sealed` holds the 32-byte encapsulated key followed by the ciphertext and its tag.
+- **When.** The primary seals every key in use to a machine when it first stores the machine's custody key, and seals a new key to every such machine before it uses the key (a signing key before its rotation starts, section 7.5). It deletes a machine's seals when the machine is removed (section 10), and a key's seals when the key is retired. These writes go through the change log like any other. At its first M5b start the primary seals its keys to every machine that has reported a custody key.
+- **Status.** `Node.custody` (`openapi.yaml`) is `sealed` when every key in use is sealed to the machine, `pending` while a seal is missing, `none` before the machine reports a custody key, and `key_changed` after a refused change. It is null for a machine without the `node` role. Only a `sealed` machine can be promoted.
+
+### 7.3 Promotion
+
+An operator promotes a machine with the `node` role when the primary is gone (ADR 0182, ADR 0232). As root on that machine:
+
+```
+quoro cluster promote [--dry-run] [--ack-fence --statement <text>]
+```
+
+Before it changes anything, the command refuses when:
+
+- the machine does not have the `node` role, or its agent has no identity;
+- this host already has a control-plane database or a control-plane unit. A demoted primary's data must be moved aside first (section 7.4);
+- the agent's followed log is empty or quarantined;
+- the newest `welcome.schema_version` the agent stored is above the newest schema version this binary knows;
+- it cannot open a seal of every key in use: the current signing key and, during a rotation, the next one (section 7.5), every data-encryption key id, and the TLS key.
+
+Then it:
+
+1. **Shows the log position:** the agent's last verified `seq`, the `head_seq` the primary last reported with its time, and the difference. Entries the old primary wrote and this machine never received are lost to the cluster. With `--dry-run` the command stops after the vote pre-check of step 2, having changed nothing, so an operator can compare candidates.
+2. **Takes the term.** It asks every voter for term `t + 1` over the mesh (section 8.9), where `t` is the highest term this machine has seen: first with `check`, then for real. It goes on only when a majority answers `granted`; otherwise it prints each voter's answer and stops, and no voter moved, because only the pre-check ran.
+3. **Waits for the old primary's grants:** until the latest receipt time plus `lease_wait_ms` over the granting answers (section 8.9), printing the time left. `--ack-fence` skips this wait (below).
+4. **Builds the database (ADR 0228, ADR 0229).** In a new database file it creates the schema of this binary (`db-schema.sql` and every migration), then applies the followed entries in `seq` order: `create` and `update` write the payload's row, `delete` removes the row, and each entry is copied into `change_log`. It verifies the change-log chain and the audit chain (`audit-log-format.md` section 6) and stops on a break.
+   - A payload written before a column existed lacks that column, and the row takes the column's default. Every migration therefore gives a new column a default or allows NULL. A payload field that this schema no longer has, such as a column a later migration dropped, is ignored.
+   - Each `entity_type` names one table (`db-schema.sql` and its migrations). A `delete` carries `{}`, so the row is found by `entity_id`, which for a table with a composite key joins the key's columns with `/`.
+   - Tables marked LOCAL in `db-schema.sql` start empty: browser sessions and access tokens, so users log in again; webhook delivery attempts; interactive sessions; and the vulnerability mirror, which the new primary fetches again (section 6.11).
+   - `meta` is not in the log. `cluster_id` comes from the agent's identity, `term` is `t + 1` and `schema_version` is this binary's. `webhook_cursor` is the `seq` of the newest event in the rebuilt event log, so the new primary delivers only events it writes itself. An event the old primary never delivered is lost rather than delivered twice: a second delivery of `incident.opened` to a webhook with `wake` would issue a second grant.
+   - `audit_exports` is in the log, so the off-site export resumes from its row as after a restore (`audit-log-format.md` section 8.5).
+5. **Moves the primary status.** In one change-log write at term `t + 1` it clears `cp_status` on the old primary's node, sets `cp_status = 'primary'` on its own node and records `cluster.promoted` (`audit-log-format.md` section 3.9). With `--ack-fence` the same write declares the old primary's node lost, as `declareNodeLost` does (section 8.3).
+6. **Installs the keys and starts.** It opens its seals and writes the keys where a primary keeps them, and prepares the host as the installer does for a primary: the control plane's system user, its data and configuration directories, and its unit. It then starts the control plane and points this machine's agent at it, as `quoro node set-primary` does (section 5.10). The certificate is the old primary's (ADR 0181), so the pin holds.
+
+**`--ack-fence` (ADR 0236).** The flag requires `--statement`, the operator's statement that the old primary's host is down and stays down, which the record keeps as its `justification`. It skips step 3 only, and declares the old primary's node lost in step 5, so the `local` leases that node held may be granted elsewhere. It does not skip any lease's own gate: before it grants an `expiring` lease to another node, the new primary waits until that lease's gate has passed (section 8.4, ADR 0203), counted from its own first start with the lease's stored `duration_ms`. What the flag gives up is the case the voters' wait covers: an `expiring` grant the old primary made and this machine never received. A token issued in that grant is unknown to the new primary, which may issue the same token for the same lease again.
+
+**The new primary.** It starts at term `t + 1` with no voter support (section 8.8), so it asks its voters before it grants or renews any `expiring` lease. Nodes and the edge find it through `welcome.primary_urls` (section 5.10) or an operator's `quoro node set-primary`, with the pin unchanged, and every machine that sees its `welcome` adopts the higher term (section 8.8). It sends each node a `desired_state` whose `rev` is above both its own `nodes.desired_rev` and the `stored_rev` of the node's `hello`, so no node ignores it as old (section 6.1, ADR 0234). A `warm` app whose lease expired is granted again only to its last holder, which has the newest copy; a promotion never moves it (ADR 0182).
+
+### 7.4 The old primary
+
+A primary learns that a newer term exists when a machine answers it with `stale_term` (section 8.8): a node that reached it after seeing the new primary, or a voter answering its `support_request`. It then (ADR 0230):
+
+1. stops granting and renewing `expiring` leases at once (section 8.8);
+2. records the higher term in `meta` (`demoted_by_term`), so a restart keeps it demoted;
+3. ends every node session with `error` code `not_primary`, fatal, and answers every later session upgrade and every API, panel and MCP request with `503` and code `not_primary`.
+
+A node keeps redialing after `not_primary` and tries its other URLs (section 4.4), so it reaches the new primary. Nothing on the old primary is deleted, and it writes nothing more, grants nothing, and no node accepts its term. To make the host a node again, the operator runs, as root on it:
+
+```
+quoro node rejoin
+```
+
+The command stops and disables the control-plane unit, and moves the control-plane data directory, with its database and its key files, aside as a quarantined copy named with the term and the time. It never deletes it, because it may hold writes the new primary lacks (D-0022). The host's agent kept running and reaches the new primary through its stored URLs. Its followed log is ahead of the new primary's or differs from it, so the new primary answers its `hello` with `log_diverged`, and the agent quarantines its copy and follows from `seq` 1 (section 7.1). Terminal and console sessions that were open on the old primary get no `session.end` record.
+
+### 7.5 Signing-key rotation
+
+An owner rotates the cluster signing key with `POST /api/v1/cluster/signing-key/rotate`, under the human-only scope `cluster:manage` (ADR 0154, ADR 0187, ADR 0233). One rotation runs at a time; another request answers `409` `conflict` with reason `in_progress` until it completes.
+
+1. The primary generates the next key, writes it next to the current one in its key directory, seals it to every machine with a custody key (section 7.2) and records it in `signing_keys` as `next`, in one change-log write.
+2. It sends `signing_key_rotate`, signed by the current key, to every machine that is not removed, of any role (section 5.21).
+3. A machine persists the new pin and answers `command_result` `ok`. The primary records the key the machine pins in `nodes.signing_key_id`, from that answer and from `hello.signing_key_id` on every session, and signs each machine's messages with the key that machine pins.
+4. Once every machine that is not removed pins the next key, the primary makes it the current one: in one change-log write it deletes the old key's row and its seals, records the next key as `current`, and writes the audit record `cluster.signing_key_rotated`. Then it deletes the old key file.
+
+A machine that never returns holds the rotation open until an operator removes it (section 10); `Cluster.signing_key_rotation` lists the machines still on the old key. A machine that enrolls during a rotation receives the current key at enrollment and the next one on its first session. A promotion during a rotation opens the seals of both keys and the new primary goes on with the rotation where it was.
 
 ## 8. Leases and self-fencing
 
@@ -2025,13 +2125,13 @@ Definitions, each on the clock of the machine that uses it:
 - A `welcome`, `desired_state` or `support_request` with a lower term is answered with `error` code `stale_term`, fatal, and the machine ends the session and redials (section 4.4). It keeps running its stored desired state meanwhile.
 - A higher term in a `welcome` or `desired_state` is stored and adopted. The session is authenticated by the pinned certificate, which a promoted primary keeps (ADR 0181).
 - A voter supports, at its current term, only the primary it voted for when it voted in that term; for a term it did not vote in, the primary of its session.
-- A primary that receives `stale_term` stops granting and renewing `expiring` leases at once. What else it does, such as refusing writes, is part of the promotion contract (ADR 0182).
+- A primary that receives `stale_term` stops granting and renewing `expiring` leases at once, and demotes itself: it ends its sessions with `not_primary` and answers every later request with `503` `not_primary` (section 7.4, ADR 0182).
 
 **Restarts.** The voter stores its term, the candidate it voted for, the promise and the lease horizon before it answers, with the promise and the horizon measured on `CLOCK_BOOTTIME` next to the host's kernel boot id, as for held leases (section 8.4). After an agent restart within the same boot both keep counting. After a reboot the voter cannot tell how long it was down, so it starts both again from its first start: the promise until `now + S` and the horizon until `now + S + L + 2 M_L`, with the stored `S` and `L`. Both can only end later than before, which is the safe side. The primary keeps support in memory only: after it restarts it has none, and it asks again before it grants or renews any `expiring` lease.
 
 ### 8.9 Promotion votes (M5b)
 
-Manual promotion (ADR 0182) takes term `t + 1` from a majority of voters. This section fixes how a candidate asks and what a voter answers; the promotion's own steps, the CLI and the custody seals come with the promotion contract.
+Manual promotion (ADR 0182) takes term `t + 1` from a majority of voters. This section fixes how a candidate asks and what a voter answers; the promotion's own steps, the CLI and the custody seals are in section 7.
 
 **Where votes travel: directly over the mesh.** The M5a mesh is a star: nodes peer only with the edge (section 6.9). A candidate could reach the other voters either through the edge as a relay or through peers of its own, and M5b uses peers:
 
@@ -2084,7 +2184,7 @@ Every two voters are therefore peers unless both are witness-only (section 6.9).
 
 It then stores `T` and `C` (section 12) before it answers `granted`, and from then on refuses every lower term: its session with an older primary ends with `stale_term`.
 
-**Candidate rules.** The candidate may act as primary at term `T` only when voters forming a majority of the voter set of its `voters_version` answered `granted`, and it has then waited until the latest `(receipt time of the answer) + lease_wait_ms` over those answers, on its own monotonic clock. The promotion contract lets an operator skip that wait by acknowledging the fence (ADR 0182), which declares the old primary's node lost (section 8.3).
+**Candidate rules.** The candidate may act as primary at term `T` only when voters forming a majority of the voter set of its `voters_version` answered `granted`, and it has then waited until the latest `(receipt time of the answer) + lease_wait_ms` over those answers, on its own monotonic clock. An operator can skip that wait by acknowledging the fence (`--ack-fence`, section 7.3, ADR 0182), which declares the old primary's node lost (section 8.3) and leaves every lease's own gate in place.
 
 **Why a promoted primary never overlaps the old one's grants.** Let `P` be the primary of term `t` and `Q` the candidate's majority for `T = t + 1`.
 
@@ -2136,7 +2236,7 @@ Order on reconnect:
 2. The primary revokes every stale lease: held by a node the primary no longer considers the holder, or carrying a lower token than the primary's. A node declared lost gets every lease it names revoked here with reason `declared_lost`, and its `lost_at` is cleared once the revokes are answered (section 8.3). The node fences those first, before anything else (section 4.2).
 3. Only after fencing, the primary sends a full `desired_state`. A node that returned fenced starts nothing stateful, exactly as D-0022 step 1 requires.
 4. The node reconciles. Because the snapshot is complete and `rev` is monotonic, reconciliation cannot start a duplicate app: a stateful VM appears in the snapshot only if the node holds the matching lease token, which it does not until the primary grants it again.
-5. Log follow resumes. If the hash chain no longer matches, the divergent copy is quarantined and the node refollows from `seq` 1 (section 7).
+5. Log follow resumes. If the hash chain no longer matches, the divergent copy is quarantined and the node refollows from `seq` 1 (section 7.1).
 
 Divergent local writes are kept as a quarantined snapshot and recorded in the audit log from M5b (D-0022 step 3, D-0031). There is no automatic failback: the default is that roles simply swap, and a return to the previous node is a planned switchover with a write freeze, a final sync and a lease move (D-0022).
 
@@ -2160,6 +2260,7 @@ DELETE /api/v1/nodes/{node_id}
 - If the node is connected, the primary first sends `lease_revoke` for every lease the node holds and waits for each `command_result`, so the node fences its stateful VMs; then it ends the session with a fatal `error` code `node_removed` and marks the node `removed`. If the node is not connected, removal increments the fencing token of each of its leases, exactly like declaring the node lost (section 8.3), so the old copy can no longer write to shared storage. Only then may the app start elsewhere; the node itself is not asked to destroy anything.
 - The node stops dialing permanently. It leaves its stateless VMs running and its fenced stateful VMs stopped, because deleting them is a data decision, not a protocol step.
 - From M5b, removing a voter changes the voter set: it follows section 8.10, so it answers `409 conflict` while the previous change has not reached a majority of voters. Removal is not refused for leaving fewer than three voters; the HA view then reports that HA needs a third vote.
+- From M5b, removing a node deletes the custody seals made for it (section 7.2) in the same transaction, and no longer counts it for a signing-key rotation, which may then complete (section 7.5).
 - From M5b, removing a node drops the records of the quarantined copies it keeps (section 9, `volume_quarantines`) in the same transaction, so a node that is gone for good no longer blocks `deleteVolume` or `deleteApp` (`has_quarantines`). The copies themselves stay on its disk with the rest of its data.
 - Removing a node never destroys data remotely. Purging local state — disks, rootfs images, the node's store — is a local CLI command run on that machine by whoever has root there. A node that is gone for good therefore keeps its data until someone with access deletes it, which is the safe default.
 
@@ -2168,6 +2269,7 @@ DELETE /api/v1/nodes/{node_id}
 Threats and their mitigations are in `../architecture/threat-model.md`; this section states only what the protocol does.
 
 - **Credential storage.** The node credential and the node's private key are stored root-only on the node. The primary stores only a hash of the credential.
+- **Key custody and promotion (M5b).** Every machine with the `node` role can open its seals and so holds, once it opens them, the keys a primary holds: the signing key, the data-encryption key and the primary's TLS key (ADR 0078, ADR 0180). A seal opens only with that machine's custody key, which never leaves it, and its `info` binds it to one cluster, machine, kind and key (section 7.2). A machine cannot swap its custody key for one an attacker holds: the primary keeps the first key it saw and refuses a change. Promotion needs root on the candidate and a majority of voters, and a promoted primary keeps the certificate every node pins, so nodes follow it without a re-pin; a returning old primary learns the higher term and demotes itself (sections 7.3 and 7.4). The node credential hashes are on every follower; they are hashes of 32 random bytes, so they do not yield a credential.
 - **Desired-state signature.** A node accepts a snapshot only if the Ed25519 signature verifies against the cluster public key it received at enrollment. A compromised intermediate or a different cluster cannot make a node start an arbitrary microVM. The signature does not protect against the primary itself: whatever the primary signs, the node runs. The signing key rotates with a `signing_key_rotate` signed by the old key (D-0050), so a new key is accepted only from the holder of the old one.
 - **Certificate pinning.** The node refuses a TLS certificate whose SHA-256 differs from the fingerprint in the join command, so a self-signed primary is as safe as a CA-issued one, and a stolen DNS name does not redirect a node.
 - **Provider credentials stay on the primary (D-0094).** A node never receives a provider's account credential. For a tunnel it receives only that tunnel's run token, which cannot create tunnels, write DNS records or reach another node's tunnel. For ACME it asks the primary to write `_acme-challenge.<hostname>` TXT records, and only for the `acme` routes of its own desired state (section 5.22), so a compromised node cannot write arbitrary records in the zone or obtain certificates for hostnames it does not serve.
@@ -2188,12 +2290,12 @@ The node keeps a SQLite file, owned by root, that holds everything it needs to r
 
 | Table | Holds | Why |
 | --- | --- | --- |
-| `node_meta` | `node_id`, `cluster_id`, `boot_id`, `host_boot_id` (the kernel boot id), the failed mark and the failed fences it covers (cleared by `command` kind `fence_ack`, section 5.17), agent and engine versions, the cluster public key and its `key_id`, a reference to the credential; from M5b the highest term seen, and on a voter its vote state: the candidate it voted for in that term, the primary it supports with the last `S` and `L`, and the promise and lease horizon on `CLOCK_BOOTTIME` (section 8.8) | Identity across restarts; a voter's promise survives an agent restart and errs late after a reboot |
+| `node_meta` | `node_id`, `cluster_id`, `boot_id`, `host_boot_id` (the kernel boot id), the failed mark and the failed fences it covers (cleared by `command` kind `fence_ack`, section 5.17), agent and engine versions, the cluster public key and its `key_id`, a reference to the credential; from M5b the highest term seen, the newest `welcome.schema_version`, and on a voter its vote state: the candidate it voted for in that term, the primary it supports with the last `S` and `L`, and the promise and lease horizon on `CLOCK_BOOTTIME` (section 8.8) | Identity across restarts; a voter's promise survives an agent restart and errs late after a reboot |
 | `desired_state` | One row per accepted `rev`: the full signed body, its hash, `issued_at`, `term` | The snapshot to reconcile from, and the signature to re-verify |
 | `applied_state` | Per VM the last applied spec digest, observed status, restart count, last exit code | Detects drift without the primary |
 | `leases` | Lease id, resource, mode, token, state, `valid_until`, duration, remaining validity on `CLOCK_BOOTTIME` for `held` and `uncertain` expiring leases | Survives an agent restart: a fenced lease stays fenced, a held one keeps its remaining validity within the same host boot |
 | `event_buffer` | Buffered events with their `evt_` id and time, plus the dropped counter | Bounded at 10 000; delivered after reconnect |
-| `change_log` | Followed entries in `seq` order with `prev_hash` and `hash`, and the last acked `seq` | Verifies the chain and resumes follow |
+| `change_log` | Followed entries in `seq` order with `prev_hash` and `hash`, the last acked `seq`, and from M5b the primary's `head_seq` as last reported with its time | Verifies the chain, resumes follow, and is what `quoro cluster promote` rebuilds the database from (section 7.3) |
 | `quarantine` | Metadata for each quarantined divergent copy, of the change log (section 7) and, from M5b, of a volume (section 9): path, time, reason, and for a volume its `qrn_` id, volume, size and SHA-256 | Nothing divergent is deleted (D-0022) |
 | `warm` (M5b) | Per warm volume: role, peer, the base and the snapshot being shipped with their `snapshot_seq`, the cell hashes of the base and of the complete copy, the highest token seen in a stream, whether the VM is frozen by a switchover, and on a returning source its candidate snapshots | Resumes replication after an agent restart without a full copy, and keeps a frozen VM frozen (section 6.13) |
 | `cmd_results` | `msg_` id and outcome of the last answered intrusive messages | Makes a redelivered `lease_revoke` idempotent |
@@ -2203,6 +2305,6 @@ The node keeps a SQLite file, owned by root, that holds everything it needs to r
 | `edge_backends` (M5a, edge) | Per backend of `spec.edge.routes`: in rotation or not, since when, reason, consecutive probe results | Lets a restarted edge resume with its last view of backend health instead of sending requests to backends it had taken out |
 | `backups` (M5a) | Per backup job: `bkp_` id, status, snapshot method, pause, manifest key and digest, sizes, error, start and end times; optionally the chunk ids the node knows the repository holds, per app | Reports backup progress across an agent restart and skips uploads of known chunks (`backup-format.md` section 5) |
 
-Outside the SQLite file, next to the credential and the node's private key, the node keeps its WireGuard private key (from M5a, mode `0600`) and its identity file: `node_id`, `cluster_id`, `primary_url`, the URLs advertised in `welcome.primary_urls` (at most 8, section 5.10), the pinned certificate fingerprint, and the cluster public key with its `key_id`. It is written `0600` through a temporary file renamed into place, so a half-written identity is never read. Also outside the SQLite file, in the VM's runtime directory, each VM also has its serial ring: two segments of 512 KiB that keep the newest serial output across VMM restarts (`engine-trait.md` section 3.19). The ring is removed with the VM. From M5a each prepared image's inventory is a file next to the image in the engine's cache (section 6.11), so the node answers `inventory_resend` without inventorying the image again. Metric samples are never stored: they live in memory only (section 5.17).
+Outside the SQLite file, next to the credential and the node's private key, the node keeps its WireGuard private key (from M5a, mode `0600`), on a machine with the `node` role its custody private key `custody.key` (from M5b, mode `0600`, section 7.2), and its identity file: `node_id`, `cluster_id`, `primary_url`, the URLs advertised in `welcome.primary_urls` (at most 16, section 5.10), the pinned certificate fingerprint, and the cluster public key with its `key_id`. It is written `0600` through a temporary file renamed into place, so a half-written identity is never read. Also outside the SQLite file, in the VM's runtime directory, each VM also has its serial ring: two segments of 512 KiB that keep the newest serial output across VMM restarts (`engine-trait.md` section 3.19). The ring is removed with the VM. From M5a each prepared image's inventory is a file next to the image in the engine's cache (section 6.11), so the node answers `inventory_resend` without inventorying the image again. Metric samples are never stored: they live in memory only (section 5.17).
 
 The store is the reason a node can be restarted, upgraded or disconnected without stopping apps: it holds the signed intent, the applied reality, and the fencing state, and nothing in it depends on the control plane being reachable.
