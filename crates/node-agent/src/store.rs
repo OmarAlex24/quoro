@@ -403,6 +403,10 @@ impl BackupRecord {
 
 /// The `node_meta` key holding the node's failed mark (section 12).
 const NODE_FAILED: &str = "node_failed";
+/// `node_meta` key of the failed fences the failed mark covers: a JSON array
+/// of the lease ids whose fence failed and no `fence_ack` cleared yet
+/// (section 12 `node_meta`, section 5.17).
+const FAILED_FENCES: &str = "failed_fences";
 
 /// The `node_meta` key holding the kernel boot id the agent last started on
 /// (section 12 `host_boot_id`, section 8.4 "Agent restart").
@@ -1399,6 +1403,11 @@ impl NodeStore {
             .execute(&mut *tx)
             .await
             .map_err(store_error)?;
+            let mut failed = read_failed_fences(&mut tx).await?;
+            if !failed.contains(&record.lease_id.0) {
+                failed.push(record.lease_id.0.clone());
+            }
+            write_failed_fences(&mut tx, &failed).await?;
         }
         buffer_event(&mut tx, evt_id, event).await?;
         tx.commit().await.map_err(store_error)
@@ -1425,6 +1434,46 @@ impl NodeStore {
     pub async fn set_node_failed(&self, failed: bool) -> Result<(), AgentError> {
         self.set_meta(NODE_FAILED, if failed { "1" } else { "0" })
             .await
+    }
+
+    /// The lease ids whose fence failed and no `fence_ack` cleared yet
+    /// (section 12 `node_meta`).
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure or an unreadable list.
+    pub async fn failed_fences(&self) -> Result<Vec<String>, AgentError> {
+        let mut tx = self.pool.begin().await.map_err(store_error)?;
+        let failed = read_failed_fences(&mut tx).await?;
+        tx.commit().await.map_err(store_error)?;
+        Ok(failed)
+    }
+
+    /// Applies a `fence_ack` (section 5.17): clears the failed fence of each
+    /// listed lease, and the node's failed mark once none remains, in one
+    /// transaction. Returns the failed fences that remain. A listed lease with
+    /// no failed fence is not an error.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure or an unreadable list.
+    pub async fn ack_fences(&self, lease_ids: &[String]) -> Result<Vec<String>, AgentError> {
+        let mut tx = self.pool.begin().await.map_err(store_error)?;
+        let mut failed = read_failed_fences(&mut tx).await?;
+        failed.retain(|lease_id| !lease_ids.contains(lease_id));
+        write_failed_fences(&mut tx, &failed).await?;
+        if failed.is_empty() {
+            sqlx::query(
+                "INSERT INTO node_meta (key, value) VALUES (?, '0') \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )
+            .bind(NODE_FAILED)
+            .execute(&mut *tx)
+            .await
+            .map_err(store_error)?;
+        }
+        tx.commit().await.map_err(store_error)?;
+        Ok(failed)
     }
 
     /// Whether the node is marked failed (section 12 `node_meta`).
@@ -1798,6 +1847,41 @@ async fn upsert_lease(
     Ok(())
 }
 
+/// The failed fences in `node_meta`, inside `tx`.
+async fn read_failed_fences(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<Vec<String>, AgentError> {
+    let text: Option<String> = sqlx::query_scalar("SELECT value FROM node_meta WHERE key = ?")
+        .bind(FAILED_FENCES)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(store_error)?;
+    match text {
+        None => Ok(Vec::new()),
+        Some(text) => serde_json::from_str(&text)
+            .map_err(|e| AgentError::Store(format!("could not read the failed fences: {e}"))),
+    }
+}
+
+/// Replaces the failed fences in `node_meta`, inside `tx`.
+async fn write_failed_fences(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    failed: &[String],
+) -> Result<(), AgentError> {
+    let text = serde_json::to_string(failed)
+        .map_err(|e| AgentError::Store(format!("could not encode the failed fences: {e}")))?;
+    sqlx::query(
+        "INSERT INTO node_meta (key, value) VALUES (?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(FAILED_FENCES)
+    .bind(text)
+    .execute(&mut **tx)
+    .await
+    .map_err(store_error)
+    .map(|_| ())
+}
+
 /// Inserts one fence record inside `tx` (section 8.5 step 2).
 async fn insert_fence(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -1921,6 +2005,32 @@ async fn migrate(pool: &SqlitePool) -> Result<(), AgentError> {
                 .await
                 .map_err(store_error)?;
         }
+    }
+
+    // A node an older agent marked failed has no list of the failed fences
+    // the mark covers: they are the incomplete fence records (section 12
+    // `node_meta`), so a `fence_ack` can clear them.
+    let failed: Option<String> = sqlx::query_scalar("SELECT value FROM node_meta WHERE key = ?")
+        .bind(NODE_FAILED)
+        .fetch_optional(pool)
+        .await
+        .map_err(store_error)?;
+    let listed: Option<String> = sqlx::query_scalar("SELECT value FROM node_meta WHERE key = ?")
+        .bind(FAILED_FENCES)
+        .fetch_optional(pool)
+        .await
+        .map_err(store_error)?;
+    if failed.as_deref() == Some("1") && listed.is_none() {
+        let mut lease_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT lease_id FROM fences WHERE complete = 0 ORDER BY lease_id",
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(store_error)?;
+        lease_ids.dedup();
+        let mut tx = pool.begin().await.map_err(store_error)?;
+        write_failed_fences(&mut tx, &lease_ids).await?;
+        tx.commit().await.map_err(store_error)?;
     }
     Ok(())
 }

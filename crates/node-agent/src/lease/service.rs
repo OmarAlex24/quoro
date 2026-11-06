@@ -226,6 +226,10 @@ enum LeaseCommand {
         envelope: Envelope<LeaseRevoke>,
         reply: oneshot::Sender<Result<CommandResult, ProtocolError>>,
     },
+    FenceAck {
+        lease_ids: Vec<String>,
+        reply: oneshot::Sender<CommandResult>,
+    },
 }
 
 /// The session's handle to the lease service.
@@ -296,6 +300,26 @@ impl LeaseLink {
         answer
             .await
             .unwrap_or_else(|_| Ok(not_fenced("the lease service stopped")))
+    }
+}
+
+impl LeaseLink {
+    /// Applies a `fence_ack` (section 5.17, section 8.5): clears the failed
+    /// fence of each listed lease, and the node's failed mark once none
+    /// remains. The listed leases stay `revoked` or `expired`: nothing starts
+    /// for them before a grant with a higher token.
+    pub async fn fence_ack(&self, lease_ids: Vec<String>) -> CommandResult {
+        let (reply, answer) = oneshot::channel();
+        if self
+            .commands
+            .send(LeaseCommand::FenceAck { lease_ids, reply })
+            .is_err()
+        {
+            return not_fenced("the lease service is not running");
+        }
+        answer
+            .await
+            .unwrap_or_else(|_| not_fenced("the lease service stopped"))
     }
 }
 
@@ -525,6 +549,45 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
             }
             LeaseCommand::Revoke { envelope, reply } => {
                 self.revoke(envelope, reply).await;
+            }
+            LeaseCommand::FenceAck { lease_ids, reply } => {
+                let _ = reply.send(self.fence_ack(&lease_ids).await);
+            }
+        }
+    }
+
+    /// Section 5.17 `fence_ack`: the store clears the listed failed fences
+    /// first, and the failed mark in memory follows only once the store says
+    /// none remains, so a crash never leaves the node startable with a failed
+    /// fence still recorded.
+    async fn fence_ack(&self, lease_ids: &[String]) -> CommandResult {
+        match self.store.ack_fences(lease_ids).await {
+            Ok(remaining) => {
+                if remaining.is_empty() {
+                    self.view.failed.store(false, Ordering::SeqCst);
+                    CommandResult {
+                        status: CommandStatus::Ok,
+                        detail: Some("no failed fence remains".to_owned()),
+                        error: None,
+                        lines: None,
+                        metrics: None,
+                    }
+                } else {
+                    CommandResult {
+                        status: CommandStatus::Ok,
+                        detail: Some(format!(
+                            "the node stays failed: failed fences remain for {}",
+                            remaining.join(", ")
+                        )),
+                        error: None,
+                        lines: None,
+                        metrics: None,
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "could not clear acknowledged fences");
+                not_fenced(&format!("the acknowledgement could not be stored: {e}"))
             }
         }
     }
@@ -1012,10 +1075,11 @@ fn service_gone() -> ProtocolError {
     }
 }
 
-/// The answer to a revoke whose fence is neither recorded nor failed: the
-/// VMs are not known to be stopped and recorded (section 5.9), so the answer
-/// is not `ok`. It carries no error code: `bad_message` would mean the revoke
-/// was stale, `fence_failed` that a VM may still run.
+/// An error answer with no error code. For a revoke whose fence is neither
+/// recorded nor failed, the VMs are not known to be stopped and recorded
+/// (section 5.9), so the answer is not `ok`; `bad_message` would mean the
+/// revoke was stale, `fence_failed` that a VM may still run. For a
+/// `fence_ack`, nothing was cleared and the primary sends it again.
 fn not_fenced(detail: &str) -> CommandResult {
     CommandResult {
         status: CommandStatus::Error,
