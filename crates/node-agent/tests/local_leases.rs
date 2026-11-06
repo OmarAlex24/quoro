@@ -1262,11 +1262,13 @@ async fn an_older_failed_mark_lists_its_incomplete_fences() {
     leases.abort();
 }
 
-/// A `fence_ack` naming a lease whose fence still runs is refused: that
-/// fence may fail after the operator checked, and its outcome must not be
-/// cleared unseen. Once the fence is answered, a `fence_ack` applies.
+/// Section 5.17 (ADR 0238): a `fence_ack` that arrives while a fence of a
+/// listed lease runs is answered `ok` and clears the failures recorded before
+/// it. That running fence is not covered: when it fails afterwards, its new
+/// failure stands, the node is failed again and `node.fence_failed` goes out,
+/// and only a new acknowledgement clears it.
 #[tokio::test]
-async fn a_fence_ack_waits_for_a_running_fence_of_its_lease() {
+async fn a_fence_ack_during_a_fence_leaves_that_fence_s_failure_standing() {
     let dir = TargetDir::new("lease-fence-ack-running");
     let engine = Arc::new(FakeEngine::new());
     let snapshot = snapshot_full(
@@ -1276,7 +1278,14 @@ async fn a_fence_ack_waits_for_a_running_fence_of_its_lease() {
         Vec::new(),
     );
     let (desired, _) = watch::channel(Some(snapshot));
-    let (leases, store) = start(&dir, engine.clone(), &desired).await;
+    let timers = LeaseConfig::new(
+        "nod_test",
+        FenceTimers {
+            grace: Duration::from_millis(400),
+            force: Duration::from_millis(400),
+        },
+    );
+    let (leases, store) = start_with(&dir, engine.clone(), &desired, timers).await;
     leases
         .link
         .grant(
@@ -1287,39 +1296,71 @@ async fn a_fence_ack_waits_for_a_running_fence_of_its_lease() {
         .await
         .unwrap();
     let slow = common::running_vm(&engine, "vm_slow", 2).await;
-    engine.set_stop_delay(&slow, Duration::from_secs(2));
+    // Every stop outlasts the fence's budget, so each fence fails.
+    engine.set_ignore_power_button(&slow, true);
+    engine.set_stop_delay(&slow, Duration::from_secs(5));
 
-    let link = leases.link.clone();
-    let revoking = tokio::spawn(async move {
-        link.revoke(msg("msg_revoke"), None, revoke("lse_slow", 1))
-            .await
-    });
-    wait_for("the slow stop to begin", || stops_of(&engine, &slow) == 1).await;
-    let refused = leases.link.fence_ack(vec!["lse_slow".to_owned()]).await;
-    assert_eq!(refused.status, CommandStatus::Error, "{refused:?}");
-    assert!(
-        refused
-            .detail
-            .as_deref()
-            .is_some_and(|detail| detail.contains("is running")),
-        "{refused:?}"
-    );
-
-    // The stop outlasts the fence's budget, so this fence fails after the
-    // refused acknowledgement: the failure stands.
-    let answer = revoking.await.unwrap().unwrap();
+    // A first fence fails: the node is failed for `lse_slow`.
+    let first = leases
+        .link
+        .revoke(msg("msg_revoke"), None, revoke("lse_slow", 1))
+        .await
+        .unwrap();
     assert_eq!(
-        answer.error.as_ref().map(|error| error.code),
+        first.error.as_ref().map(|error| error.code),
         Some(ErrorCode::FenceFailed),
-        "{answer:?}"
+        "{first:?}"
     );
     assert!(leases.view.is_failed());
+
+    // The primary acknowledged it with a new token, and revokes again at
+    // that token; that fence runs when the acknowledgement arrives.
+    let link = leases.link.clone();
+    let revoking = tokio::spawn(async move {
+        link.revoke(msg("msg_revoke_again"), None, revoke("lse_slow", 2))
+            .await
+    });
+    wait_for("the second fence to begin", || {
+        stops_of(&engine, &slow) >= 3
+    })
+    .await;
+    let acked = leases.link.fence_ack(vec!["lse_slow".to_owned()]).await;
+    assert_eq!(acked.status, CommandStatus::Ok, "{acked:?}");
+    assert!(
+        acked
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("still running")),
+        "{acked:?}"
+    );
+    assert!(
+        !revoking.is_finished(),
+        "the acknowledgement came during the fence"
+    );
+    assert!(store.failed_fences().await.unwrap().is_empty());
+    assert!(!leases.view.may_start_stateful("lse_slow", 2));
+
+    // The running fence fails after the acknowledgement: its failure stands.
+    let second = revoking.await.unwrap().unwrap();
+    assert_eq!(
+        second.error.as_ref().map(|error| error.code),
+        Some(ErrorCode::FenceFailed),
+        "{second:?}"
+    );
+    assert!(leases.view.is_failed());
+    assert!(store.node_failed().await.unwrap());
     assert_eq!(
         store.failed_fences().await.unwrap(),
         vec!["lse_slow".to_owned()]
     );
+    let failed: Vec<_> = fenced_events(&store)
+        .await
+        .into_iter()
+        .filter(|event| event["type"] == "node.fence_failed")
+        .collect();
+    assert_eq!(failed.len(), 2, "one node.fence_failed per failed fence");
 
-    // An acknowledgement sent once the fence is answered applies.
+    // Only a new acknowledgement clears it.
     let applied = leases.link.fence_ack(vec!["lse_slow".to_owned()]).await;
     assert_eq!(applied.status, CommandStatus::Ok, "{applied:?}");
     assert!(!leases.view.is_failed());
