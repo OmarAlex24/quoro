@@ -586,8 +586,13 @@ async fn an_expiry_whose_stops_hang_fails_within_the_margin() {
         forced <= millis(2750),
         "the graceful stop is clamped: {forced:?}"
     );
+    assert!(
+        leases.view.fence_owns_stop(LEASE),
+        "the reconciler leaves the VM to the fence"
+    );
     wait_for_fence_record(&store).await;
     let done = before.elapsed();
+    assert!(!leases.view.fence_owns_stop(LEASE));
     assert!(
         done <= millis(3250),
         "the stop gave up by t_send + D, then was recorded: {done:?}"

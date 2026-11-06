@@ -1150,3 +1150,109 @@ async fn vms_swept_by_a_fence_without_a_snapshot_start_again_with_the_first_snap
     );
     leases.abort();
 }
+
+/// Section 8.5 step 1: while a fence of a lease stops its VMs, the reconciler
+/// leaves them to the fence, both a VM that may no longer run and one whose
+/// desired state is `stopped`. A second stop would hold the engine's lock on
+/// the VM, and the fence's own stop would time out and report a failed fence
+/// while the VM still runs.
+#[tokio::test]
+async fn the_reconciler_leaves_a_fenced_vm_to_its_fence() {
+    let dir = TempDir::new();
+    let engine = Arc::new(RecordingEngine::new());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let running = stateful_vm("vm_fenced", "lse_fenced", 1, Vec::new());
+    let stopped = SpecVm {
+        desired_status: DesiredStatus::Stopped,
+        ..running.clone()
+    };
+    let snap = snapshot_full(1, vec![running], Vec::new(), Vec::new());
+    let snap_stopped = snapshot_full(2, vec![stopped], Vec::new(), Vec::new());
+    let (_desired, desired_rx) = tokio::sync::watch::channel(Some(snap.clone()));
+    let leases = quoro_node_agent::start_local_leases(
+        engine.clone(),
+        store.clone(),
+        quoro_node_agent::LeaseConfig::new(
+            "nod_test",
+            quoro_node_agent::FenceTimers {
+                grace: Duration::from_secs(60),
+                force: Duration::from_secs(60),
+            },
+        ),
+        desired_rx,
+    )
+    .await
+    .unwrap();
+    leases
+        .link
+        .grant(
+            quoro_proto::MsgId("msg_grant".to_owned()),
+            None,
+            quoro_proto::LeaseGrant {
+                lease_id: quoro_proto::LeaseId("lse_fenced".to_owned()),
+                resource_type: quoro_proto::ResourceType::App,
+                resource_id: "app_fenced".to_owned(),
+                mode: quoro_proto::LeaseMode::Local,
+                fencing_token: 1,
+                duration_ms: None,
+                granted_at: "2026-11-02T10:15:33Z".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    let (reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let mut reconciler = reconciler.with_lease_view(leases.view.clone());
+    reconciler.reconcile_once(Some(&snap)).await;
+    let id = VmId("vm_fenced".to_owned());
+    assert_eq!(engine.inspect(&id).await.unwrap().state, VmState::Running);
+
+    // The fence's graceful stop takes 1.5 s.
+    engine
+        .inner()
+        .set_stop_delay(&id, Duration::from_millis(1500));
+    let link = leases.link.clone();
+    let revoke = tokio::spawn(async move {
+        link.revoke(
+            quoro_proto::MsgId("msg_revoke".to_owned()),
+            None,
+            quoro_proto::LeaseRevoke {
+                lease_id: quoro_proto::LeaseId("lse_fenced".to_owned()),
+                fencing_token: 1,
+                reason: quoro_proto::RevokeReason::Deleted,
+            },
+        )
+        .await
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while engine.inner().stop_calls().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the fence stops the VM"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(leases.view.fence_owns_stop("lse_fenced"));
+
+    // Passes during the fence stop nothing themselves.
+    reconciler.reconcile_once(Some(&snap)).await;
+    reconciler.reconcile_once(Some(&snap_stopped)).await;
+    let calls = engine.inner().stop_calls();
+    assert_eq!(calls.len(), 1, "only the fence stops the VM: {calls:?}");
+    assert_eq!(
+        calls[0].1,
+        StopMode::Graceful {
+            timeout: Duration::from_secs(60)
+        },
+        "the one stop is the fence's"
+    );
+
+    let answer = revoke.await.unwrap().expect("the revoke is answered");
+    assert_eq!(answer.status, quoro_proto::CommandStatus::Ok);
+    assert!(!leases.view.fence_owns_stop("lse_fenced"));
+    assert_eq!(engine.inspect(&id).await.unwrap().state, VmState::Stopped);
+    // Once the fence is over, a pass finds the VM stopped and leaves it so.
+    reconciler.reconcile_once(Some(&snap)).await;
+    assert_eq!(engine.inspect(&id).await.unwrap().state, VmState::Stopped);
+    assert_eq!(engine.inner().stop_calls().len(), 1);
+    leases.abort();
+}

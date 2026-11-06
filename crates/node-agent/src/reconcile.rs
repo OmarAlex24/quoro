@@ -909,6 +909,13 @@ impl<E: Engine + 'static> Reconciler<E> {
             && recorded.as_deref() != Some(signature.as_str())
         {
             info!(vm_id, "the VM's attached volumes changed; recreating it");
+            if self.fence_owns_stop(vm) {
+                debug!(
+                    vm_id,
+                    "a fence of the VM's lease is stopping it; recreating it later"
+                );
+                return false;
+            }
             if let Some(current) = &info
                 && matches!(
                     current.state,
@@ -981,10 +988,14 @@ impl<E: Engine + 'static> Reconciler<E> {
         // stays stopped. Neither is an error: the primary moved the lease or
         // the volume work is still running.
         if vm.desired_status == DesiredStatus::Running && !may_start {
+            // A fence of the lease stops the VM itself (section 8.5 step 1),
+            // read after `may_keep_running` so a lease that just left `held`
+            // is seen fencing.
             if matches!(
                 info.state,
                 VmState::Running | VmState::Starting | VmState::Stopping
             ) && !may_keep_running
+                && !self.fence_owns_stop(vm)
             {
                 match self.stop_vm(&id).await {
                     Ok(stopped) => info = stopped,
@@ -1143,6 +1154,13 @@ impl<E: Engine + 'static> Reconciler<E> {
             }
             DesiredStatus::Stopped => {
                 if matches!(
+                    info.state,
+                    VmState::Running | VmState::Starting | VmState::Stopping
+                ) && self.fence_owns_stop(vm)
+                {
+                    debug!(vm_id, "a fence of the VM's lease is stopping it");
+                    reached = false;
+                } else if matches!(
                     info.state,
                     VmState::Running | VmState::Starting | VmState::Stopping
                 ) {
@@ -1651,6 +1669,18 @@ impl<E: Engine + 'static> Reconciler<E> {
             return None;
         };
         self.lease.start_permit(lease_id, token).await.map(Some)
+    }
+
+    /// Whether a fence of the stateful VM's lease is stopping it: then the
+    /// fence alone stops the VM (section 8.5 step 1), since a second stop
+    /// would hold the engine's lock on the VM and make the fence's own stop
+    /// time out.
+    fn fence_owns_stop(&self, vm: &SpecVm) -> bool {
+        vm.stateful
+            && vm
+                .lease_id
+                .as_deref()
+                .is_some_and(|lease_id| self.lease.fence_owns_stop(lease_id))
     }
 
     async fn stop_vm(&self, id: &VmId) -> Result<VmInfo, EngineError> {
