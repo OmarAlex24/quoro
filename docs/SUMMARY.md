@@ -230,6 +230,18 @@
   - [0223: Expiring leases in dev builds before the warm policy ships: a dev-only cargo feature lets ha_policy warm be accepted so the lease switches to expiring, with no replication](adr/0223-expiring-leases-in-dev-builds-before-the-warm-policy-ships.md)
   - [0224: A lease_revoke on an agent that restarted with no verified desired-state snapshot stops every app VM on the node; the contract gets a section 6.3 exception](adr/0224-a-lease-revoke-on-an-agent-that-restarted-with-no-verified.md)
   - [0225: Remove the M0 LeaseAgent once the new lease timer lands, after porting the tests that still apply to it](adr/0225-remove-the-m0-leaseagent-once-the-new-lease-timer-lands.md)
+  - [0226: Node credential hashes travel in the change log from schema 13, so a promoted primary accepts every node's session](adr/0226-node-credential-hashes-travel-in-the-change-log-from-schema.md)
+  - [0227: Change-log follow sends one log_entries batch at a time and keeps each node's acknowledged seq in memory; Node.log_lag shows the gap](adr/0227-change-log-follow-sends-one-log-entries-batch-at-a-time-and.md)
+  - [0228: A promoted primary's database: local tables start empty, the webhook cursor starts at the newest event, and the off-site export resumes as after a restore](adr/0228-a-promoted-primary-s-database-local-tables-start-empty-the.md)
+  - [0229: welcome carries the primary's schema_version; promotion refuses a newer log, and a column missing from an older payload takes its default](adr/0229-welcome-carries-the-primary-s-schema-version-promotion.md)
+  - [0230: A primary that learns of a higher term demotes itself with a new fatal session error not_primary and 503 on every request; quoro node rejoin moves its data aside](adr/0230-a-primary-that-learns-of-a-higher-term-demotes-itself-with.md)
+  - [0231: Custody keys are bound on first use: the primary refuses a changed key with custody_key_changed; seals use HPKE with info binding cluster, node, kind and key](adr/0231-custody-keys-are-bound-on-first-use-the-primary-refuses-a.md)
+  - [0232: quoro cluster promote refuses on a host that already has a control plane, prepares the host as the installer does for a primary, and has a --dry-run](adr/0232-quoro-cluster-promote-refuses-on-a-host-that-already-has-a.md)
+  - [0233: Signing-key rotation: human-only scope cluster:manage, one rotation at a time, the next key sealed before it is sent, the old one kept until every machine pins the next](adr/0233-signing-key-rotation-human-only-scope-cluster-manage-one.md)
+  - [0234: After a promotion the new primary sends each node a desired_state rev above the node's stored rev](adr/0234-after-a-promotion-the-new-primary-sends-each-node-a-desired.md)
+  - [0235: hello carries control_plane_urls, and welcome.primary_urls lists the promotable machines' URLs after the primary's own, up to 16](adr/0235-hello-carries-control-plane-urls-and-welcome-primary-urls.md)
+  - [0236: --ack-fence needs a written statement, skips only the voters' wait, declares the old primary's node lost, and keeps every lease's own gate](adr/0236-ack-fence-needs-a-written-statement-skips-only-the-voters.md)
+  - [0237: Let support_request through while a revoke's fence runs, like renewal answers (extends ADR 0222)](adr/0237-let-support-request-through-while-a-revoke-s-fence-runs.md)
 
 # Background research
 
