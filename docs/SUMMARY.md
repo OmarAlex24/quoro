@@ -247,6 +247,8 @@
   - [0240: Node measures expiring-lease validity on CLOCK_BOOTTIME, so a host suspend shortens it](adr/0240-node-measures-expiring-lease-validity-on-clock-boottime-so.md)
   - [0241: A lease converted from local to expiring opens no failover gate until a renewal is answered, and the node fences from its first renewal](adr/0241-a-lease-converted-from-local-to-expiring-opens-no-failover.md)
   - [0242: A stateful start under an expiring lease needs valid_until - now >= start bound + M, and the engine's start takes a caller-supplied bound (3 s for expiring leases)](adr/0242-a-stateful-start-under-an-expiring-lease-needs-valid-until.md)
+  - [0243: Both stop modes carry a caller-supplied bound, and a forced stop the engine began finishes after a dropped call](adr/0243-both-stop-modes-carry-a-caller-supplied-bound-and-a-forced.md)
+  - [0244: A converted lease's row keeps mode local until the primary answers its first renewal, and is written expiring then](adr/0244-a-converted-lease-s-row-keeps-mode-local-until-the-primary.md)
 
 # Background research
 
