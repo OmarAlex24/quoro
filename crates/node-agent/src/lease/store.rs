@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime};
 use quoro_engine::VmId;
 use quoro_proto::{FenceReason, LeaseId, LeaseMode, ResourceType};
 
-use crate::lease::clock::{HostNow, StoredValidity};
+use crate::lease::clock::StoredValidity;
 use crate::lease::machine::{Lease, LeaseState};
 
 /// One lease row as it survives a restart (section 12 `leases`).
@@ -39,20 +39,16 @@ pub struct StoredLease {
 }
 
 impl StoredLease {
-    /// The row for one tracked lease, its validity converted with `now`.
-    #[must_use]
-    pub fn from_lease(lease: &Lease, now: &HostNow) -> Self {
-        let validity = lease.valid_until.and_then(|until| now.store(until));
-        Self::with_validity(lease, validity)
-    }
-
-    /// The row for one tracked lease with a validity converted earlier, when
-    /// its `valid_until` was set. The validity is kept only for a `held` or
+    /// The row for one tracked lease. Its validity is the stored deadline the
+    /// lease keeps, read when the renewal that set `valid_until` was sent
+    /// (section 8.4 "Agent restart", ADR 0240), and only for a `held` or
     /// `uncertain` `expiring` lease with a `valid_until`.
     #[must_use]
-    pub fn with_validity(lease: &Lease, validity: Option<StoredValidity>) -> Self {
+    pub fn from_lease(lease: &Lease) -> Self {
         let validity = match (lease.mode, lease.state, lease.valid_until) {
-            (LeaseMode::Expiring, LeaseState::Held | LeaseState::Uncertain, Some(_)) => validity,
+            (LeaseMode::Expiring, LeaseState::Held | LeaseState::Uncertain, Some(_)) => {
+                lease.validity().cloned()
+            }
             _ => None,
         };
         Self {
