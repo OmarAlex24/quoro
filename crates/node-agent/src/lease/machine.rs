@@ -480,6 +480,22 @@ impl LeaseTable {
         }
     }
 
+    /// The authority is reachable again: every `expiring` lease that is `held`
+    /// or `uncertain` renews at `now` instead of at its next renewal interval,
+    /// so a lease that went `uncertain` while the session was down returns to
+    /// `held` as soon as the authority answers (section 8.4). Nothing else
+    /// changes: only an answered renewal moves `valid_until`.
+    pub fn renew_now(&mut self, now: Instant) {
+        for lease in self.leases.values_mut() {
+            if lease.mode == LeaseMode::Expiring
+                && matches!(lease.state, LeaseState::Held | LeaseState::Uncertain)
+                && lease.duration.is_some()
+            {
+                lease.next_renew_at = Some(now);
+            }
+        }
+    }
+
     /// Advances the state machine to `now` and returns what the caller must do
     /// (section 8.4 rows for the monotonic clock and the renewals).
     #[must_use]
@@ -741,6 +757,51 @@ mod tests {
         assert_eq!(margin(millis(30000)), millis(3000));
     }
 
+    /// Section 8.4: an `expiring` lease's fence fits in `M` with the agent's
+    /// default timers (`T_grace + T_force <= M`, the worked example's
+    /// 1 000 + 300 ms), from the shortest `D` a grant may carry to the
+    /// longest; a `local` lease keeps its own timers.
+    #[test]
+    fn the_expiring_fence_budget_fits_in_the_margin() {
+        use crate::lease::fence::budget_for;
+        use crate::lease::service::LeaseConfig;
+
+        let timers = LeaseConfig::EXPIRING_TIMERS;
+        for d in [3000, 6000, 15_000, 30_000, 600_000] {
+            let now = Instant::now();
+            let mut table = LeaseTable::new();
+            table
+                .on_grant(&expiring("lse_a", 1, d), None, now)
+                .expect("grant");
+            let lease = table.get(&LeaseId("lse_a".to_string())).expect("lease");
+            let budget = budget_for(lease, timers);
+            assert!(budget.grace + budget.force <= margin(millis(d)), "D = {d}");
+            if margin(millis(d)) >= timers.grace + timers.force {
+                assert_eq!(budget, timers, "D = {d}: nothing to clamp");
+            }
+        }
+        // `D` = 3 000 leaves `M` = 1 000: the forced stop keeps its 300 ms and
+        // the graceful one gets the rest.
+        let mut table = LeaseTable::new();
+        table
+            .on_grant(&expiring("lse_a", 1, 3000), None, Instant::now())
+            .expect("grant");
+        let lease = table.get(&LeaseId("lse_a".to_string())).expect("lease");
+        let budget = budget_for(lease, timers);
+        assert_eq!((budget.grace, budget.force), (millis(700), millis(300)));
+
+        let mut table = LeaseTable::new();
+        table
+            .on_grant(&local("lse_b", 1), None, Instant::now())
+            .expect("grant");
+        let local_timers = crate::lease::fence::FenceTimers {
+            grace: Duration::from_secs(10),
+            force: Duration::from_secs(5),
+        };
+        let lease = table.get(&LeaseId("lse_b".to_string())).expect("lease");
+        assert_eq!(budget_for(lease, local_timers), local_timers);
+    }
+
     #[test]
     fn a_grant_holds_a_local_lease_without_timing() {
         let now = Instant::now();
@@ -985,6 +1046,38 @@ mod tests {
                 .expect("lease")
                 .state,
             LeaseState::Held
+        );
+    }
+
+    #[test]
+    fn renewing_now_moves_only_the_next_renewal() {
+        let t0 = Instant::now();
+        let mut table = LeaseTable::new();
+        let grant = expiring("lse_e", 1, 15_000);
+        table.on_grant(&grant, None, t0).expect("grant");
+        let _ = confirm(&mut table, &grant, t0);
+        table
+            .on_grant(&local_on("lse_l", "app_other", 1), None, t0)
+            .expect("the local grant is held");
+        let held = table.get(&LeaseId("lse_e".to_owned())).unwrap().clone();
+        table.authority_unreachable(t0 + millis(100));
+
+        let at = t0 + millis(200);
+        table.renew_now(at);
+        let lease = table.get(&LeaseId("lse_e".to_owned())).unwrap();
+        assert_eq!(lease.state, LeaseState::Uncertain);
+        assert_eq!(lease.valid_until, held.valid_until, "no validity is added");
+        assert_eq!(
+            table.poll(at),
+            vec![Action::SendRenew {
+                lease_id: LeaseId("lse_e".to_owned()),
+                fencing_token: 1,
+            }]
+        );
+        assert_eq!(
+            table.get(&LeaseId("lse_l".to_owned())).unwrap().state,
+            LeaseState::Held,
+            "a local lease never renews"
         );
     }
 

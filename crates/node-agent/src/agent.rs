@@ -96,17 +96,19 @@ pub async fn run<E: Engine + 'static>(
     let (desired, desired_rx) = watch::channel(current.clone());
 
     // Section 8.3: `local` leases are held on this node alone, so they survive
-    // a lost session; the service also fences the VMs of a revoked lease.
+    // a lost session. `expiring` leases renew through the session and fence
+    // at their deadline (section 8.4); the service also fences the VMs of a
+    // revoked lease.
     let leases = crate::lease::start_local_leases(
         Arc::clone(&engine),
         store.clone(),
-        LeaseConfig {
-            node_id: node_id.clone(),
-            timers: FenceTimers {
+        LeaseConfig::new(
+            node_id.clone(),
+            FenceTimers {
                 grace: Duration::from_secs(10),
                 force: Duration::from_secs(5),
             },
-        },
+        ),
         desired.subscribe(),
     )
     .await?;

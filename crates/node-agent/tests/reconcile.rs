@@ -1105,13 +1105,13 @@ async fn vms_swept_by_a_fence_without_a_snapshot_start_again_with_the_first_snap
     let leases = quoro_node_agent::start_local_leases(
         engine.clone(),
         store.clone(),
-        quoro_node_agent::LeaseConfig {
-            node_id: "nod_test".to_owned(),
-            timers: quoro_node_agent::FenceTimers {
+        quoro_node_agent::LeaseConfig::new(
+            "nod_test",
+            quoro_node_agent::FenceTimers {
                 grace: Duration::from_millis(20),
                 force: Duration::from_millis(20),
             },
-        },
+        ),
         desired_rx,
     )
     .await

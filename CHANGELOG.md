@@ -10,6 +10,8 @@ Each entry links the pull request that made the change and, where one exists, th
 
 - **Warm volume calls in the engine.** The engine trait gains the calls warm replication is built on: `volume_changed_ranges` compares the extent maps of two reflink snapshots of a volume and returns only the byte ranges that differ (a full copy when there is no base or the maps cannot be compared), `stage_volume`, `commit_staged_volume` and `discard_staged_volume` build a volume's next copy beside the last good one and swap it in with one rename, and `pause` and `resume` freeze a running VM. A volume can now keep several snapshots, each in its own file. Nothing calls these yet; replication between nodes comes next ([#389], [#390], [ADR 0172], [ADR 0173]).
 
+- **Expiring leases on the node.** The node agent now runs the `expiring` lease mode of section 8.4. It renews each such lease every third of its duration through its session, and counts a lease as valid only from the send time of a renewal the primary answered. A lease whose renewal is late, or whose session is lost, goes `uncertain`: its VMs keep running and nothing new starts for it. At the lease's deadline the node stops every VM bound to it within the margin `M` (a 1 s graceful stop, then a 0.3 s forced one), before the primary may grant the lease to another node. A held lease survives an agent restart on the same host boot: its deadline is stored on `CLOCK_BOOTTIME`, so a suspend can only shorten it, and after a reboot the lease comes back expired and is fenced. The primary grants no `expiring` lease yet; warm apps bring that. The M0 lease agent, which only tests used, is removed and its tests are ported to the lease service ([#PR3B], [#75], [ADR 0072], [ADR 0225]).
+
 - **Acknowledging a failed self-fence.** When a node cannot confirm that a VM stopped during a self-fence, including when it cannot list the engine's VMs, it marks itself failed and starts nothing stateful. Until now nothing could clear that mark, and the primary did not record the failure, so it could grant the lease again. The primary now lists the lease, app and VM ids in the node's `fence_failure` (`GET /api/v1/nodes/{node_id}`) and grants none of those leases until a human calls `POST /api/v1/nodes/{node_id}/fence-ack` with exactly the listed lease ids, after checking out of band that the VMs are stopped. Agents are refused with `human_only`, and the call is audited. The acknowledgement increments each lease's fencing token and reaches the node at once, or at its next session before its desired state; the node then clears those failed fences, and its failed mark once none remains ([#423], [#391], [#399], [ADR 0074], [ADR 0079]).
 
 ### Fixed
@@ -233,6 +235,7 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#70]: https://github.com/OmarAlex24/quoro/pull/70
 [#71]: https://github.com/OmarAlex24/quoro/pull/71
 [#73]: https://github.com/OmarAlex24/quoro/pull/73
+[#75]: https://github.com/OmarAlex24/quoro/issues/75
 [#80]: https://github.com/OmarAlex24/quoro/pull/80
 [#81]: https://github.com/OmarAlex24/quoro/pull/81
 [#82]: https://github.com/OmarAlex24/quoro/pull/82
@@ -400,6 +403,7 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#423]: https://github.com/OmarAlex24/quoro/pull/423
 [#427]: https://github.com/OmarAlex24/quoro/issues/427
 [#428]: https://github.com/OmarAlex24/quoro/pull/428
+[#PR3B]: https://github.com/OmarAlex24/quoro/pull/PR3B
 [ADR 0019]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0019-fencing-is-mandatory-and-lease-based-node-agent-self-fences.md
 [ADR 0020]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0020-per-app-ha-policies-none-cold-warm-hot-with-cost-shown-in.md
 [ADR 0027]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0027-signed-binaries-and-reproducible-builds-are-mandatory.md
@@ -409,6 +413,7 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [ADR 0061]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0061-q-0003-write-our-own-minimal-init-and-oci-to-ext4-pipeline.md
 [ADR 0064]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0064-first-public-release-is-an-m3-preview-v0-1-experimental-not.md
 [ADR 0071]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0071-engine-trait-async-methods-return-send-futures-fn-impl.md
+[ADR 0072]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0072-lease-timing-a-node-renews-immediately-after-a-first-grant.md
 [ADR 0074]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0074-a-failed-forced-stop-escalates-sigkill-the-vmm-process-if.md
 [ADR 0075]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0075-concurrent-fences-and-a-mid-fence-crash-test-are-mandatory.md
 [ADR 0079]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0079-add-protocol-error-code-fence-failed-and-a-human-only.md
@@ -475,3 +480,4 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [ADR 0173]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0173-warm-replication-path-the-source-node-ships-changed-ranges.md
 [ADR 0186]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0186-add-287-old-node-recreates-a-moved-app-s-vm-and-240.md
 [ADR 0222]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0222-rule-3-of-section-4-2-lets-renewal-answers-for-other-leases.md
+[ADR 0225]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0225-remove-the-m0-leaseagent-once-the-new-lease-timer-lands.md

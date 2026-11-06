@@ -22,7 +22,7 @@ use quoro_node_agent::ingress::{CertificateEvents, DnsBridge, IngressConfig, Ing
 use quoro_node_agent::reconcile::Snapshot;
 use quoro_node_agent::session::{Session, SessionEnd, SessionSetup};
 use quoro_node_agent::store::NodeStore;
-use quoro_node_agent::{FenceTimers, LeaseConfig, LeaseState, start_local_leases};
+use quoro_node_agent::{FenceTimers, LeaseConfig, LeaseState, ManualHostClock, start_local_leases};
 use quoro_proto::sign::{self, SigningKey};
 use quoro_proto::wire::{
     ControlMessage, DesiredState, DesiredStatus, EdgeBackend, EdgeRoute, HealthCheck, Spec,
@@ -870,13 +870,13 @@ async fn a_revoke_s_fence_keeps_the_session_alive_and_holds_back_the_rest() {
     let leases = start_local_leases(
         Arc::clone(&engine),
         store.clone(),
-        LeaseConfig {
-            node_id: "nod_test".to_owned(),
-            timers: FenceTimers {
+        LeaseConfig::new(
+            "nod_test",
+            FenceTimers {
                 grace: Duration::from_secs(60),
                 force: Duration::from_secs(60),
             },
-        },
+        ),
         lease_desired.subscribe(),
     )
     .await
@@ -1080,13 +1080,13 @@ async fn a_revoke_takes_effect_even_when_the_session_ends_at_once() {
     let leases = start_local_leases(
         Arc::clone(&engine),
         store.clone(),
-        LeaseConfig {
-            node_id: "nod_test".to_owned(),
-            timers: FenceTimers {
+        LeaseConfig::new(
+            "nod_test",
+            FenceTimers {
                 grace: Duration::from_millis(200),
                 force: Duration::from_millis(200),
             },
-        },
+        ),
         lease_desired.subscribe(),
     )
     .await
@@ -1154,5 +1154,122 @@ async fn a_revoke_takes_effect_even_when_the_session_ends_at_once() {
         engine.stop_calls().iter().any(|(id, _)| *id == vm)
     })
     .await;
+    leases.abort();
+}
+
+/// Section 8.4: the session carries the lease service's renewals. A first
+/// `expiring` grant is `uncertain` and renews at once; the renewal goes out
+/// as a `lease_renew` frame, the primary's answer (a grant whose `re` names
+/// it) makes the lease `held`, and the end of the session makes it
+/// `uncertain` again.
+#[tokio::test]
+async fn the_session_carries_renewals_and_its_end_makes_the_lease_uncertain() {
+    let dir = TempDir::new();
+    let key = sign::signing_key_from_seed(&[4; 32]);
+    let identity = identity_files(dir.path(), &key);
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let engine = Arc::new(FakeEngine::new());
+    let (lease_desired, _) = watch::channel(Some(snapshot_full(
+        1,
+        vec![stateful_vm("vm_warm", "lse_warm", 1, Vec::new())],
+        Vec::new(),
+        Vec::new(),
+    )));
+    let leases = start_local_leases(
+        Arc::clone(&engine),
+        store.clone(),
+        LeaseConfig::new(
+            "nod_test",
+            FenceTimers {
+                grace: Duration::from_secs(10),
+                force: Duration::from_secs(5),
+            },
+        )
+        .with_host_clock(Arc::new(ManualHostClock::new(
+            Some("boot-a"),
+            Duration::from_secs(1000),
+        ))),
+        lease_desired.subscribe(),
+    )
+    .await
+    .expect("the lease service starts");
+    let view = leases.view.clone();
+    let (desired, _desired_rx) = watch::channel(None);
+    let (_observed_tx, observed_rx) = watch::channel(Vec::new());
+    let mut session = Session::new(SessionSetup {
+        identity,
+        store: store.clone(),
+        facts: facts(),
+        desired,
+        observed: observed_rx,
+        current: None,
+        builds: None,
+    })
+    .with_leases(leases.link.clone());
+
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let accept = tokio::spawn(tokio_tungstenite::accept_async(server));
+    let (client_ws, _response) = client_async("ws://primary.test/api/v1/nodes/session", client)
+        .await
+        .unwrap();
+    let mut ws = accept.await.unwrap().unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let serving = tokio::spawn(async move {
+        session
+            .serve(client_ws, async {
+                let _ = stop_rx.await;
+            })
+            .await
+    });
+
+    let hello = read_frame(&mut ws).await;
+    send(
+        &mut ws,
+        ControlMessage::Welcome(Welcome {
+            cluster_id: "cls_test".to_owned(),
+            term: 1,
+            server_time: "2026-11-02T10:15:30Z".to_owned(),
+            heartbeat_interval_ms: 5_000,
+            session_timeout_ms: 15_000,
+            primary_node_id: "nod_primary".to_owned(),
+            primary_urls: Vec::new(),
+        })
+        .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
+        .to_text(),
+    )
+    .await;
+    read_until(&mut ws, "status_report").await;
+
+    let grant = |re: Option<&str>| {
+        ControlMessage::LeaseGrant(LeaseGrant {
+            mode: LeaseMode::Expiring,
+            duration_ms: Some(15_000),
+            ..local_grant("lse_warm", "app_warm", 1)
+        })
+        .to_frame(&format!("msg_grant_{}", re.unwrap_or("first")), re)
+        .to_text()
+    };
+    send(&mut ws, grant(None)).await;
+    let renew = read_until(&mut ws, "lease_renew").await;
+    assert_eq!(renew["body"]["lease_id"], "lse_warm");
+    assert_eq!(renew["body"]["fencing_token"], 1);
+    assert_eq!(view.state("lse_warm"), Some(LeaseState::Uncertain));
+    assert!(!view.may_start_stateful("lse_warm", 1));
+
+    send(&mut ws, grant(Some(renew["id"].as_str().unwrap()))).await;
+    wait_for("the answered renewal to make the lease held", || {
+        view.state("lse_warm") == Some(LeaseState::Held)
+    })
+    .await;
+    assert!(view.may_start_stateful("lse_warm", 1));
+
+    let _ = stop_tx.send(());
+    assert_eq!(serving.await.unwrap().unwrap(), SessionEnd::Shutdown);
+    wait_for("the lost session to make the lease uncertain", || {
+        view.state("lse_warm") == Some(LeaseState::Uncertain)
+    })
+    .await;
+    assert!(view.may_keep_running("lse_warm", 1));
+    assert!(engine.stop_calls().is_empty(), "nothing is fenced");
     leases.abort();
 }

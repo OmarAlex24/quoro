@@ -777,6 +777,11 @@ impl Session {
         // edge's, would otherwise wait for the periodic report (issue #346).
         let mut applied_changes = self.store.applied_changes();
         let mut applied_report_at: Option<Instant> = None;
+        // The lease service sends its `lease_renew` messages through this
+        // session from now on; every live `expiring` lease renews at once.
+        // Dropping the attachment, however the session ends, makes the held
+        // ones `uncertain` (section 8.4).
+        let mut attached = self.leases.as_ref().map(LeaseLink::attach);
         if let Err(e) = self.send_status(&mut sink).await {
             warn!(error = %e, "could not send the first status report; reconnecting");
             return Ok(SessionEnd::Reconnect);
@@ -962,6 +967,32 @@ impl Session {
                     {
                         warn!(error = %e, "could not send a dns_challenge; reconnecting");
                         return Ok(SessionEnd::Reconnect);
+                    }
+                }
+                renewal = async {
+                    match attached.as_mut() {
+                        Some(attached) => attached.renewals.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    // Renewals keep going while a revoke's fence runs
+                    // (section 5.13).
+                    match renewal {
+                        Some(renew) => {
+                            if let Err(e) = write_message_with_id(
+                                &mut sink,
+                                NodeMessage::LeaseRenew(renew.body),
+                                &renew.id.0,
+                                None,
+                            )
+                            .await
+                            {
+                                warn!(error = %e, "could not send a lease renewal; reconnecting");
+                                return Ok(SessionEnd::Reconnect);
+                            }
+                        }
+                        // The lease service is gone; nothing renews.
+                        None => attached = None,
                     }
                 }
                 answer = async {

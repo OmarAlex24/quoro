@@ -21,13 +21,13 @@ use quoro_proto::{
 use tokio::sync::watch;
 
 fn config() -> LeaseConfig {
-    LeaseConfig {
-        node_id: "nod_test".to_owned(),
-        timers: FenceTimers {
+    LeaseConfig::new(
+        "nod_test",
+        FenceTimers {
             grace: Duration::from_millis(20),
             force: Duration::from_millis(20),
         },
-    }
+    )
 }
 
 fn local_grant(lease_id: &str, app_id: &str, token: u64) -> LeaseGrant {
@@ -224,13 +224,13 @@ async fn a_revoke_of_an_unknown_lease_is_answered_ok() {
 }
 
 fn slow_config() -> LeaseConfig {
-    LeaseConfig {
-        node_id: "nod_test".to_owned(),
-        timers: FenceTimers {
+    LeaseConfig::new(
+        "nod_test",
+        FenceTimers {
             grace: Duration::from_secs(60),
             force: Duration::from_secs(60),
         },
-    }
+    )
 }
 
 async fn start_with(
@@ -939,69 +939,6 @@ async fn a_revoke_of_a_lease_already_fenced_stops_nothing() {
     assert_eq!(higher.status, CommandStatus::Ok);
     assert_eq!(store.fences().await.unwrap().len(), 2);
     assert_eq!(store.load_highest_tokens().await.unwrap()[0].1, 2);
-    leases.abort();
-}
-
-/// Section 8.4 "Agent restart" with no renewal loop yet in this service: a
-/// stored `held` expiring lease is fenced at start and written back
-/// `expired`, whatever validity it stored.
-#[tokio::test]
-async fn a_stored_expiring_lease_is_fenced_until_the_renewal_loop_exists() {
-    let dir = TargetDir::new("lease-expiring-restore");
-    let engine = Arc::new(FakeEngine::new());
-    let store = NodeStore::open(dir.path()).await.unwrap();
-    // On Linux the validity is a real one: this boot, 10 s left, which a
-    // restore on the host clock would keep. Elsewhere the host has no boot
-    // id, and a made-up one stands in.
-    let host = quoro_node_agent::HostNow::read(&quoro_node_agent::SystemHostClock);
-    let validity = host
-        .store(host.instant + Duration::from_secs(10))
-        .unwrap_or(quoro_node_agent::StoredValidity {
-            boot_id: "boot-a".to_owned(),
-            until_boottime: Duration::from_secs(10),
-        });
-    store
-        .save_lease(
-            &quoro_node_agent::StoredLease {
-                lease_id: LeaseId("lse_warm".to_owned()),
-                resource_type: ResourceType::App,
-                resource_id: "app_warm".to_owned(),
-                mode: LeaseMode::Expiring,
-                token: 4,
-                state: LeaseState::Held,
-                duration: Some(Duration::from_millis(15_000)),
-                validity: Some(validity),
-            },
-            4,
-        )
-        .await
-        .unwrap();
-    let snapshot = snapshot_full(
-        1,
-        vec![stateful_vm("vm_warm", "lse_warm", 4, Vec::new())],
-        Vec::new(),
-        Vec::new(),
-    );
-    let vm = common::running_vm(&engine, "vm_warm", 2).await;
-    let (desired, _) = watch::channel(Some(snapshot));
-    let (leases, store) = start(&dir, engine.clone(), &desired).await;
-    assert_eq!(leases.view.state("lse_warm"), Some(LeaseState::Expired));
-    let rows = store.load_leases().await.unwrap();
-    assert_eq!(rows[0].state, LeaseState::Expired);
-    assert_eq!(
-        rows[0].validity, None,
-        "no validity is kept for a fenced lease"
-    );
-    wait_for("the restore fence", || stops_of(&engine, &vm) > 0).await;
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    while store.fences().await.unwrap().is_empty() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the fence is recorded"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Stopped);
     leases.abort();
 }
 
