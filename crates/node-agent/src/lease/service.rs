@@ -29,7 +29,15 @@
 //! it may have been bound to the lease in a snapshot this process never saw
 //! (a snapshot that dropped it, or one from before an agent restart). With no
 //! snapshot at all, that is every app VM on the node. A fence that cannot list
-//! the engine's VMs cannot confirm the stop and fails (D-0074).
+//! the engine's VMs stops what it knows but is not recorded: the revoke is
+//! answered with an error, the lease stays unstartable, and the next revoke or
+//! restart fences again. Only a VM whose stop could not be confirmed fails the
+//! fence (D-0074).
+//!
+//! A revoke of a lease that is already `revoked` or `expired` at the same
+//! token, with a complete fence recorded for it, is answered `ok` at once:
+//! nothing could have started for the lease since, and the primary sends such
+//! a revoke at every session start for a lease the node still reports.
 //!
 //! A fence is recorded only once its stop finished, in one transaction with
 //! the lease's row, its event and, for a failed fence, the node's failed mark.
@@ -305,9 +313,13 @@ pub async fn start_local_leases<E: Engine + 'static>(
     config: LeaseConfig,
     desired: watch::Receiver<Option<Snapshot>>,
 ) -> Result<LocalLeases, AgentError> {
-    let fenced: HashSet<(LeaseId, u64)> = store
-        .fences()
-        .await?
+    let records = store.fences().await?;
+    let recorded: HashSet<(LeaseId, u64)> = records
+        .iter()
+        .filter(|record| record.complete)
+        .map(|record| (record.lease_id.clone(), record.token))
+        .collect();
+    let fenced: HashSet<(LeaseId, u64)> = records
         .into_iter()
         .map(|record| (record.lease_id, record.token))
         .collect();
@@ -335,6 +347,7 @@ pub async fn start_local_leases<E: Engine + 'static>(
         in_flight: HashMap::new(),
         tasks: JoinSet::new(),
         task_leases: HashMap::new(),
+        recorded,
     };
     service.note_bindings();
     let task = tokio::spawn(service.run());
@@ -372,13 +385,21 @@ struct InFlight {
 struct FenceOutcome {
     report: FenceReport,
     /// Set when the engine's VMs could not be listed, so a VM bound to the
-    /// lease may have been missed and still run.
+    /// lease may have been missed.
     unlisted: Option<String>,
+    /// Set when the fence task itself died, so no stop is confirmed.
+    died: Option<String>,
 }
 
 impl FenceOutcome {
+    /// A VM may still run: the fence failed (D-0074).
+    fn failed(&self) -> bool {
+        self.died.is_some() || !self.report.complete()
+    }
+
+    /// Every VM the lease may hold is confirmed stopped.
     fn complete(&self) -> bool {
-        self.unlisted.is_none() && self.report.complete()
+        !self.failed() && self.unlisted.is_none()
     }
 }
 
@@ -404,6 +425,8 @@ struct LocalLeaseService<E: Engine> {
     tasks: JoinSet<FenceOutcome>,
     /// Which lease each stop task fences.
     task_leases: HashMap<tokio::task::Id, LeaseId>,
+    /// The complete fences recorded in the store, by lease and token.
+    recorded: HashSet<(LeaseId, u64)>,
 }
 
 impl<E: Engine + 'static> LocalLeaseService<E> {
@@ -438,12 +461,9 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                 }
             }
         }
-        // The agent is shutting down: let the running fences finish and be
-        // recorded rather than cut them off (an abort still leaves the lease
-        // fenced, the restore runs the fence again).
-        while let Some(joined) = self.tasks.join_next_with_id().await {
-            self.finish_fence(joined).await;
-        }
+        // The agent is shutting down. A fence still running is cut off with
+        // the service, as by a crash: its lease is `revoked` or `expired`
+        // without a record, so the restore fences it again.
     }
 
     /// Adds the bindings of the current desired snapshot to [`Self::bound`].
@@ -527,6 +547,18 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
             });
             return;
         }
+        if self.already_fenced(&envelope.body) {
+            let result = CommandResult {
+                status: CommandStatus::Ok,
+                detail: Some("already fenced".to_owned()),
+                error: None,
+                lines: None,
+                metrics: None,
+            };
+            self.answered.insert(envelope.id, result.clone());
+            let _ = reply.send(Ok(result));
+            return;
+        }
         let outcome = {
             let mut table = self.lock();
             table.on_revoke(&envelope.body)
@@ -562,6 +594,22 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                 );
             }
         }
+    }
+
+    /// Whether `revoke` names a lease that is already `revoked` or `expired`
+    /// at its token, with a complete fence recorded and none running: then no
+    /// VM of the lease can have started since (section 6.4), and the revoke
+    /// changes nothing.
+    fn already_fenced(&self, revoke: &LeaseRevoke) -> bool {
+        let key = (revoke.lease_id.clone(), revoke.fencing_token);
+        let fenced_at_token = self.lock().get(&revoke.lease_id).is_some_and(|lease| {
+            matches!(lease.state, LeaseState::Revoked | LeaseState::Expired)
+                && lease.token == revoke.fencing_token
+        });
+        fenced_at_token
+            && self.recorded.contains(&key)
+            && !self.in_flight.contains_key(&revoke.lease_id)
+            && !self.view.gates.fencing().contains(&revoke.lease_id)
     }
 
     async fn persist(&self, lease_id: &LeaseId) {
@@ -636,6 +684,7 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
             FenceOutcome {
                 report: stop_vms(&*engine, &stopping, budget).await,
                 unlisted,
+                died: None,
             }
         });
         self.task_leases.insert(handle.id(), lease_id.clone());
@@ -682,7 +731,8 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                     })
                     .collect(),
             },
-            unlisted: Some(format!("the fence stopped early: {error}")),
+            unlisted: None,
+            died: Some(format!("the fence stopped early: {error}")),
         });
 
         // A revoke that joined the fence may have raised the lease's token;
@@ -705,6 +755,59 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
             });
             (lease, token, row)
         };
+        let result = if !outcome.failed() && outcome.unlisted.is_some() {
+            self.leave_unrecorded(&lease_id, row, &outcome).await
+        } else {
+            self.record_fence(&lease_id, &flight, lease.as_ref(), token, row, &outcome)
+                .await
+        };
+        for waiter in flight.waiters {
+            // Only a final answer is kept for a redelivered revoke; one whose
+            // fence was not recorded fences again when it comes back.
+            if result.status == CommandStatus::Ok
+                || result.error.as_ref().map(|error| error.code) == Some(ErrorCode::FenceFailed)
+            {
+                self.answered.insert(waiter.msg.clone(), result.clone());
+            }
+            let _ = waiter.reply.send(Ok(result.clone()));
+        }
+    }
+
+    /// A fence that stopped every VM it found but could not look for all of
+    /// them: nothing is recorded, so the restore and the next revoke fence
+    /// again, and the lease stays unstartable in this process. The lease's
+    /// `revoked` or `expired` row is saved, so a restart knows to fence it.
+    async fn leave_unrecorded(
+        &self,
+        lease_id: &LeaseId,
+        row: Option<(StoredLease, u64)>,
+        outcome: &FenceOutcome,
+    ) -> CommandResult {
+        if let Some((lease, highest)) = row
+            && let Err(e) = self.store.save_lease(&lease, highest).await
+        {
+            warn!(error = %e, lease_id = %lease_id.0, "could not persist a lease");
+        }
+        let (_, error) = fence_failures(outcome);
+        warn!(lease_id = %lease_id.0, error, "a fence could not find every VM; it is not recorded");
+        not_fenced(&format!(
+            "the fence of lease {} could not find every VM: {error}",
+            lease_id.0
+        ))
+    }
+
+    /// Section 8.5 steps 2 and 3: records a complete or failed fence with the
+    /// lease's row, its event and, for a failed one, the node's failed mark,
+    /// and returns the revoke's answer.
+    async fn record_fence(
+        &mut self,
+        lease_id: &LeaseId,
+        flight: &InFlight,
+        lease: Option<&crate::lease::Lease>,
+        token: u64,
+        row: Option<(StoredLease, u64)>,
+        outcome: &FenceOutcome,
+    ) -> CommandResult {
         let complete = outcome.complete();
         if !complete {
             // ADR 0074: the forced stop could not be confirmed, so a VM may
@@ -725,12 +828,10 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
             reason: flight.reason,
             complete,
         };
-        let resource = lease
-            .as_ref()
-            .map_or((ResourceType::App, String::new()), |lease| {
-                (lease.resource_type, lease.resource_id.clone())
-            });
-        let (evt_id, event) = self.fence_event(&lease_id, resource, flight.reason, &outcome);
+        let resource = lease.map_or((ResourceType::App, String::new()), |lease| {
+            (lease.resource_type, lease.resource_id.clone())
+        });
+        let (evt_id, event) = self.fence_event(lease_id, resource, flight.reason, outcome);
         let recorded = self
             .store
             .finish_fence(
@@ -740,11 +841,13 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                 &event,
             )
             .await;
-
-        let result = match recorded {
+        match recorded {
             Ok(()) => {
-                self.view.gates.fencing().remove(&lease_id);
-                revoke_result(&lease_id, &outcome)
+                self.view.gates.fencing().remove(lease_id);
+                if complete {
+                    self.recorded.insert((lease_id.clone(), token));
+                }
+                revoke_result(lease_id, outcome)
             }
             Err(e) => {
                 // The stop is not recorded, so a restart may not know the
@@ -760,19 +863,9 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                         lease_id.0
                     ))
                 } else {
-                    revoke_result(&lease_id, &outcome)
+                    revoke_result(lease_id, outcome)
                 }
             }
-        };
-        for waiter in flight.waiters {
-            // Only a final answer is kept for a redelivered revoke; one that
-            // could not be recorded fences again when it comes back.
-            if result.status == CommandStatus::Ok
-                || result.error.as_ref().map(|error| error.code) == Some(ErrorCode::FenceFailed)
-            {
-                self.answered.insert(waiter.msg.clone(), result.clone());
-            }
-            let _ = waiter.reply.send(Ok(result.clone()));
         }
     }
 
@@ -912,7 +1005,7 @@ fn fence_failures(outcome: &FenceOutcome) -> (Vec<String>, String) {
             errors.push(format!("{}: {error}", vm.0));
         }
     }
-    if let Some(error) = &outcome.unlisted {
+    for error in [&outcome.died, &outcome.unlisted].into_iter().flatten() {
         errors.push(error.clone());
     }
     (vm_ids, errors.join(", "))

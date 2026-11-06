@@ -873,3 +873,71 @@ async fn a_fence_that_cannot_be_recorded_is_not_answered_ok() {
     assert!(stops_of(&engine, &vm) > stops);
     leases.abort();
 }
+
+/// Section 4.2 rule 3 at every session start: the primary revokes again a
+/// lease the node still reports as `revoked`. With its fence recorded, the
+/// revoke is answered `ok` at once and stops nothing, even after a restart
+/// that found no snapshot, so other apps' VMs keep running.
+#[tokio::test]
+async fn a_revoke_of_a_lease_already_fenced_stops_nothing() {
+    let dir = TargetDir::new("lease-refence");
+    let engine = Arc::new(FakeEngine::new());
+    let snapshot = snapshot_full(
+        1,
+        vec![stateful_vm("vm_done", "lse_done", 1, Vec::new())],
+        Vec::new(),
+        Vec::new(),
+    );
+    let (desired, _) = watch::channel(Some(snapshot));
+    let (leases, store) = start(&dir, engine.clone(), &desired).await;
+    leases
+        .link
+        .grant(
+            msg("msg_grant"),
+            None,
+            local_grant("lse_done", "app_done", 1),
+        )
+        .await
+        .unwrap();
+    let vm = common::running_vm(&engine, "vm_done", 2).await;
+    let first = leases
+        .link
+        .revoke(msg("msg_revoke"), None, revoke("lse_done", 1))
+        .await
+        .unwrap();
+    assert_eq!(first.status, CommandStatus::Ok);
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Stopped);
+    leases.abort();
+    drop(store);
+
+    // A restart that cannot verify a snapshot, with another app running.
+    let other = common::running_vm(&engine, "vm_other", 3).await;
+    let stops = engine.stop_calls().len();
+    let (desired, _) = watch::channel(None);
+    let (leases, store) = start(&dir, engine.clone(), &desired).await;
+    assert_eq!(leases.view.state("lse_done"), Some(LeaseState::Revoked));
+    let again = leases
+        .link
+        .revoke(msg("msg_revoke_again"), None, revoke("lse_done", 1))
+        .await
+        .unwrap();
+    assert_eq!(again.status, CommandStatus::Ok);
+    assert_eq!(engine.stop_calls().len(), stops, "nothing was stopped");
+    assert_eq!(
+        engine.inspect(&other).await.unwrap().state,
+        VmState::Running
+    );
+    assert_eq!(store.fences().await.unwrap().len(), 1);
+    assert_eq!(fenced_events(&store).await.len(), 1);
+
+    // A revoke with a higher token is a new ownership change: it fences.
+    let higher = leases
+        .link
+        .revoke(msg("msg_revoke_higher"), None, revoke("lse_done", 2))
+        .await
+        .unwrap();
+    assert_eq!(higher.status, CommandStatus::Ok);
+    assert_eq!(store.fences().await.unwrap().len(), 2);
+    assert_eq!(store.load_highest_tokens().await.unwrap()[0].1, 2);
+    leases.abort();
+}
