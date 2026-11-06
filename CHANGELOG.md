@@ -16,6 +16,7 @@ Each entry links the pull request that made the change and, where one exists, th
 
 ### Fixed
 
+- A node refused a fence acknowledgement that arrived while a fence of one of the listed leases was still running, so it stayed failed until its next session. Section 5.17 says it answers `ok`. The node now clears the failures recorded before the acknowledgement and answers `ok`, naming any fence still running in `detail`. A failure that running fence records afterwards is not covered: the node is failed again, the primary lists the lease again, and only a new acknowledgement clears it ([#440], [#430], [ADR 0238]).
 - While a node fenced a lease, its reconciler could stop the same VM itself, with its own 10 s graceful stop. The engine runs one operation per VM at a time, so the fence's stop waited behind it, timed out, and reported the fence failed: the node marked itself failed, and an operator had to acknowledge a fence that had in fact stopped the VM. For an `expiring` lease, the VM could also outlive its deadline. The reconciler now leaves a VM to its lease's fence until the fence has stopped it: it begins no stop of its own, and it gives up a stop already under way as soon as the fence is triggered. The lease service backs this up: when a lease stops being held, the same step that changes its state marks the fence as under way. A revoke of an `expiring` lease now begins its fence before its state is written, as an expiry already does ([#439], [#429], [ADR 0075]).
 - While a node fenced a lease for a revoke, its session sent and read nothing else until the fence finished, heartbeats included. A `local` lease's fence can take up to 15 s (a 10 s graceful stop, then a 5 s forced one), which reaches the primary's 15 s session timeout, so the primary could mark the node `disconnected` in the middle of a fence it had asked for. The session now keeps sending heartbeats, answers `ping`, and applies lease grants for other leases while the fence runs; every other message waits and is processed in the order it arrived once the revoke is answered ([#428], [#427], [ADR 0222]).
 - After a restore moved an app to another node, the old node recreated the app's VM, stopped and without its volume, and kept it with its Cloud Hypervisor process until the node agent restarted. The old node now deletes the VM as soon as the restore is accepted, and keeps only the detached volume's file ([#361]).
@@ -405,8 +406,10 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#427]: https://github.com/OmarAlex24/quoro/issues/427
 [#428]: https://github.com/OmarAlex24/quoro/pull/428
 [#429]: https://github.com/OmarAlex24/quoro/issues/429
+[#430]: https://github.com/OmarAlex24/quoro/issues/430
 [#431]: https://github.com/OmarAlex24/quoro/pull/431
 [#439]: https://github.com/OmarAlex24/quoro/pull/439
+[#440]: https://github.com/OmarAlex24/quoro/pull/440
 [ADR 0019]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0019-fencing-is-mandatory-and-lease-based-node-agent-self-fences.md
 [ADR 0020]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0020-per-app-ha-policies-none-cold-warm-hot-with-cost-shown-in.md
 [ADR 0027]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0027-signed-binaries-and-reproducible-builds-are-mandatory.md
@@ -484,3 +487,4 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [ADR 0186]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0186-add-287-old-node-recreates-a-moved-app-s-vm-and-240.md
 [ADR 0222]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0222-rule-3-of-section-4-2-lets-renewal-answers-for-other-leases.md
 [ADR 0225]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0225-remove-the-m0-leaseagent-once-the-new-lease-timer-lands.md
+[ADR 0238]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0238-a-new-failed-fence-of-a-lease-whose-acknowledgement-is.md

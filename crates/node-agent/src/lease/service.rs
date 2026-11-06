@@ -974,17 +974,34 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
     /// first, and the failed mark in memory follows only once the store says
     /// none remains, so a crash never leaves the node startable with a failed
     /// fence still recorded.
+    ///
+    /// A fence of a listed lease that is still running when the service takes
+    /// this command is not covered: the acknowledgement clears only the
+    /// failures recorded by then. If that fence fails afterwards, it records a
+    /// new failed fence, marks the node failed again and emits
+    /// `node.fence_failed`, so the primary lists the lease again and only a
+    /// new acknowledgement clears it (ADR 0238). Until the fence is recorded,
+    /// nothing starts for its lease.
+    ///
+    /// The list names leases, not tokens, so a failure recorded after the
+    /// operator checked but before this command is taken (a fence that ended
+    /// while the command waited, or one whose event has not reached the
+    /// primary yet) is cleared with its lease. `fence_ack` carries no token
+    /// to tell them apart; that needs a contract change.
     async fn fence_ack(&mut self, lease_ids: &[String]) -> CommandResult {
-        // A fence of a listed lease that is still running may fail after the
-        // operator checked; its outcome must not be cleared unseen.
-        if let Some(busy) = lease_ids
+        let running: Vec<&str> = lease_ids
             .iter()
-            .find(|lease_id| self.in_flight.contains_key(&LeaseId((*lease_id).clone())))
-        {
-            return not_fenced(&format!(
-                "a fence of lease {busy} is running; the acknowledgement is not applied"
-            ));
-        }
+            .filter(|lease_id| self.in_flight.contains_key(&LeaseId((*lease_id).clone())))
+            .map(String::as_str)
+            .collect();
+        let running_note = if running.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; a fence of {} is still running, and a failure it records stands",
+                running.join(", ")
+            )
+        };
         match self.store.ack_fences(lease_ids).await {
             Ok(mut remaining) => {
                 for lease_id in lease_ids {
@@ -999,7 +1016,7 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                     self.view.failed.store(false, Ordering::SeqCst);
                     CommandResult {
                         status: CommandStatus::Ok,
-                        detail: Some("no failed fence remains".to_owned()),
+                        detail: Some(format!("no failed fence remains{running_note}")),
                         error: None,
                         lines: None,
                         metrics: None,
@@ -1008,7 +1025,7 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                     CommandResult {
                         status: CommandStatus::Ok,
                         detail: Some(format!(
-                            "the node stays failed: failed fences remain for {}",
+                            "the node stays failed: failed fences remain for {}{running_note}",
                             remaining.join(", ")
                         )),
                         error: None,
