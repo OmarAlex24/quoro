@@ -24,6 +24,14 @@
 //! its fencing token and the one volume to attach, because the volume may be
 //! attached to one VM at a time.
 //!
+//! A restore onto another node moves the app away from its node from the
+//! moment it is accepted (`openapi.yaml` `restoreBackup`): while the app has a
+//! `restoring` volume on another node, its VMs are left out of this node's
+//! snapshot, so the node deletes them like any VM that leaves its spec. Kept
+//! in, without the detached volume, they would be recreated stopped (section
+//! 6.2 step 3, issue #287). The rows move to the target node when the restore
+//! is `ready`.
+//!
 //! Routes are built from the app's `domains` rows: the domains of an app with
 //! one replica point at the app's running VMs on this node, and the domains of
 //! an app with more replicas go to the edge machine as `spec.edge` (ADR 0143).
@@ -41,7 +49,7 @@ use quoro_proto::wire::{
 };
 use sqlx::sqlite::SqliteConnection;
 use sqlx::{Row, SqlitePool};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use super::mesh::{MeshLookup, build_mesh};
@@ -133,6 +141,7 @@ pub async fn build_spec(
     .map_err(|e| format!("cannot read the desired state of {node_id}: {e}"))?;
 
     let apps = load_apps(store.pool()).await?;
+    let moving_away = apps_restoring_elsewhere(store.pool(), node_id).await?;
     let (volumes, attachments) = load_node_volumes(store.pool(), node_id).await?;
     let leases = load_app_leases(store.pool(), node_id).await?;
     let deployments = deploy::deployment_ids_for_node(store, node_id)
@@ -150,6 +159,14 @@ pub async fn build_spec(
     for row in &rows {
         let vm_id: String = row.try_get("id").map_err(|e| e.to_string())?;
         let app_id: Option<String> = row.try_get("app_id").map_err(|e| e.to_string())?;
+        // A restore is moving the app to another node: the VM leaves this
+        // node now, before its image is even looked at.
+        if app_id
+            .as_ref()
+            .is_some_and(|app_id| moving_away.contains(app_id))
+        {
+            continue;
+        }
         let image: String = row.try_get("image").map_err(|e| e.to_string())?;
         // A built image never leaves the node that built it: its digest comes
         // from the build's row, never from a registry (ADR 0118).
@@ -477,6 +494,24 @@ fn needs_backup_repository(
     restores: &HashMap<String, SpecRestore>,
 ) -> bool {
     !backups.is_empty() || !restores.is_empty()
+}
+
+/// The apps with a volume `restoring` on a node other than `node_id`: a
+/// restore is moving them there, so their VMs have left `node_id`
+/// (`openapi.yaml` `restoreBackup`). A restore onto the same node is not a
+/// move and leaves the app's VMs where they are.
+async fn apps_restoring_elsewhere(
+    pool: &SqlitePool,
+    node_id: &str,
+) -> Result<HashSet<String>, String> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT app_id FROM volumes WHERE state = 'restoring' AND node_id <> ?",
+    )
+    .bind(node_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("cannot read the restores away from {node_id}: {e}"))?;
+    Ok(rows.into_iter().map(|(app_id,)| app_id).collect())
 }
 
 /// The volume entries for `node_id` and the volumes its VMs may attach:
@@ -1474,5 +1509,113 @@ mod tests {
             on_node.iter().cloned().collect::<Vec<_>>(),
             ["one.example.com"]
         );
+    }
+
+    /// The snapshot of `node_id`, after `previous` when the session sent one.
+    async fn spec_on(store: &Store, node_id: &str, previous: Option<&Spec>) -> Spec {
+        build_spec(
+            store,
+            node_id,
+            &ReferenceAsDigest,
+            &DigestCache::default(),
+            &DataKey::ephemeral(),
+            previous,
+            &no_mesh_lookup(),
+        )
+        .await
+        .unwrap()
+        .spec
+    }
+
+    /// A volume of `app_id` on `node_id` in `state`.
+    async fn insert_volume(store: &Store, app_id: &str, node_id: &str, state: &str) -> String {
+        let volume_id = deploy::new_id_with_prefix("vol");
+        let now = crate::store::now_rfc3339();
+        sqlx::query(
+            "INSERT INTO volumes (id, app_id, node_id, size_gb, mount_path, state, \
+             allocated_bytes, restored_from_backup_id, error, created_at, updated_at) \
+             VALUES (?, ?, ?, 1, '/data', ?, NULL, NULL, NULL, ?, ?)",
+        )
+        .bind(&volume_id)
+        .bind(app_id)
+        .bind(node_id)
+        .bind(state)
+        .bind(&now)
+        .bind(&now)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        volume_id
+    }
+
+    #[tokio::test]
+    async fn a_restore_onto_another_node_takes_the_app_vm_off_its_node() {
+        let store = Store::open_in_memory().await.unwrap();
+        let old = "nod_00000000000000000000000001";
+        let target = "nod_00000000000000000000000002";
+        insert_node(&store, old, &["node"], Some("10.42.1.0/24")).await;
+        insert_node(&store, target, &["node"], Some("10.42.2.0/24")).await;
+        let project_id = insert_project(&store, "moved").await;
+        let app_id = deploy::new_id_with_prefix("app");
+        insert_app(&store, &project_id, &app_id, "db", 1).await;
+        let domain_id = deploy::new_id_with_prefix("dom");
+        insert_domain(&store, &domain_id, &app_id, "db.example.com", "acme").await;
+        let other_app = deploy::new_id_with_prefix("app");
+        insert_app(&store, &project_id, &other_app, "web", 1).await;
+        let vm_id = new_id(Prefix::Vm);
+        insert_app_vm(
+            &store,
+            &project_id,
+            &app_id,
+            old,
+            &vm_id,
+            "db-1",
+            Some("10.42.1.10"),
+        )
+        .await;
+        let other_vm = new_id(Prefix::Vm);
+        insert_app_vm(
+            &store,
+            &project_id,
+            &other_app,
+            old,
+            &other_vm,
+            "web-1",
+            Some("10.42.1.11"),
+        )
+        .await;
+        let before = spec_on(&store, old, None).await;
+        assert_eq!(before.vms.len(), 2, "the old node was sent both VMs");
+
+        // While the volume restores on the target, the app's VM is gone from
+        // its old node, although that node was sent it before, and so is its
+        // route. The other app's VM stays.
+        let volume_id = insert_volume(&store, &app_id, target, "restoring").await;
+        let on_old = spec_on(&store, old, Some(&before)).await;
+        let ids: Vec<&str> = on_old.vms.iter().map(|vm| vm.vm_id.as_str()).collect();
+        assert_eq!(ids, [other_vm.as_str()]);
+        assert!(on_old.routes.is_empty(), "no route to the moved VM");
+        // The target gets the volume to restore, and the VM only once the
+        // restore is ready and the row moves there.
+        let on_target = spec_on(&store, target, None).await;
+        assert!(on_target.vms.is_empty());
+        assert_eq!(on_target.volumes.len(), 1);
+        assert_eq!(on_target.volumes[0].volume_id, volume_id);
+
+        // A restore onto the VM's own node is not a move: the VM stays.
+        sqlx::query("UPDATE volumes SET node_id = ? WHERE id = ?")
+            .bind(old)
+            .bind(&volume_id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let on_old = spec_on(&store, old, Some(&before)).await;
+        let mut ids: Vec<&str> = on_old.vms.iter().map(|vm| vm.vm_id.as_str()).collect();
+        ids.sort_unstable();
+        let mut expected = vec![vm_id.as_str(), other_vm.as_str()];
+        expected.sort_unstable();
+        assert_eq!(ids, expected);
+        assert_eq!(on_old.routes.len(), 1);
+        assert_eq!(on_old.routes[0].vm_ids, vec![vm_id]);
     }
 }

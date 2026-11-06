@@ -6,11 +6,14 @@
 //! The primary accepts the restore in one transaction: it detaches the volume
 //! being replaced (the unique index allows one attached volume per app),
 //! inserts the new volume in `restoring` on the target node, stops the app and
-//! revokes its `local` lease with reason `moved`. The target node downloads,
-//! verifies and writes the snapshot; when it reports the volume `ready`,
-//! [`apply_status`] grants the node a new `local` lease with a higher fencing
-//! token, pins the app's placement there and starts the app. A reported
-//! `failed` leaves the app stopped with no lease.
+//! revokes its `local` lease with reason `moved`. From then on, a node other
+//! than the target no longer finds the app's instances in its desired state
+//! and deletes them (`session::desired`, issue #287). The target node
+//! downloads, verifies and writes the snapshot; when it reports the volume
+//! `ready`, [`apply_status`] grants the node a new `local` lease with a higher
+//! fencing token, pins the app's placement there, moves the instances there
+//! and starts the app. A reported `failed` leaves the app stopped with no
+//! lease, and its instances back in the desired state of the node they are on.
 
 use crate::AppState;
 use crate::api::apps::{APP_COLUMNS, AppPlacement, AppStatus, app_from_row};
@@ -54,6 +57,10 @@ pub(crate) struct AcceptedRestore {
     pub old_node_id: Option<String>,
     /// The revoke the old holder must receive (reason `moved`).
     pub revoke: Option<LeaseRevoke>,
+    /// The nodes that held the app's instances. Each must hear a snapshot
+    /// with the instance stopped, or without it when the restore moves the
+    /// app to another node.
+    pub vm_node_ids: Vec<String>,
 }
 
 /// The restores a status report moved, with the leases the nodes must hear.
@@ -63,12 +70,18 @@ pub(crate) struct AppliedRestores {
     pub desired_changed: bool,
     /// New `local` leases, one per restore that became `ready`.
     pub grants: Vec<Lease>,
+    /// Other nodes whose desired state changed: the nodes the app's instances
+    /// moved away from (a `ready` restore), so they delete them, and the
+    /// nodes the instances stayed on (a `failed` restore), so they get them
+    /// back.
+    pub other_node_ids: Vec<String>,
 }
 
 impl AppliedRestores {
     fn merge(&mut self, other: Self) {
         self.desired_changed |= other.desired_changed;
         self.grants.extend(other.grants);
+        self.other_node_ids.extend(other.other_node_ids);
     }
 }
 
@@ -185,8 +198,10 @@ pub(crate) async fn accept(
     )
     .await?;
 
-    // 3. The app stops, the way `stopApp` does.
-    stop_app(&mut w.tx, &app_id, &ctx.identity.actor()).await?;
+    // 3. The app stops, the way `stopApp` does. On a restore onto another
+    //    node its instances also leave their node's desired state now, while
+    //    the new volume is `restoring` there (`session::desired`).
+    let vm_node_ids = stop_app(&mut w.tx, &app_id, &ctx.identity.actor()).await?;
 
     // 4. The old holder's `local` lease ends with the move (section 8.3).
     let revoke = leases::revoke_app_lease(&mut w.tx, &app_id, &ctx.identity.actor())
@@ -208,6 +223,7 @@ pub(crate) async fn accept(
         volume,
         old_node_id,
         revoke,
+        vm_node_ids,
     })
 }
 
@@ -247,8 +263,9 @@ pub(crate) async fn apply_status(
                 applied.merge(outcome);
             }
             wire::VolumeState::Failed => {
-                restore_failed(store, node_id, &volume, reported).await?;
+                let vm_node_ids = restore_failed(store, node_id, &volume, reported).await?;
                 applied.desired_changed = true;
+                applied.other_node_ids.extend(vm_node_ids);
             }
             _ => {}
         }
@@ -346,7 +363,7 @@ async fn restore_ready(
             .map_err(|error| ApiError::internal(&format!("app payload: {error}")))?,
     )
     .await?;
-    move_vms(&mut w.tx, &app.id, node_id, &actor).await?;
+    let other_node_ids = move_vms(&mut w.tx, &app.id, node_id, &actor).await?;
 
     events::emit(
         &mut w.tx,
@@ -383,17 +400,20 @@ async fn restore_ready(
     Ok(AppliedRestores {
         desired_changed: true,
         grants: vec![lease],
+        other_node_ids,
     })
 }
 
 /// The `failed` transition: the row keeps the node's reason and the event says
 /// why (`backup-format.md` section 8.1). The app stays stopped, without a lease.
+/// Returns the nodes that hold the app's instances: with no volume `restoring`
+/// any more, the instances are back in those nodes' desired state, stopped.
 async fn restore_failed(
     store: &Store,
     node_id: &str,
     before: &Volume,
     reported: &wire::VolumeStatus,
-) -> Result<(), ApiError> {
+) -> Result<Vec<String>, ApiError> {
     let actor = Actor::system("volumes");
     let mut w = store.begin_write().await?;
     let row = sqlx::query(&format!(
@@ -405,7 +425,7 @@ async fn restore_failed(
     .ok_or_else(|| ApiError::internal(&"the restoring volume disappeared"))?;
     let mut current = crate::api::volumes::volume_from_row(&row)?;
     if current.state != VolumeState::Restoring {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let reason = reported
         .error
@@ -452,8 +472,13 @@ async fn restore_failed(
         },
     )
     .await?;
+    let vm_node_ids: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT node_id FROM vms WHERE app_id = ? ORDER BY node_id")
+            .bind(&current.app_id)
+            .fetch_all(&mut *w.tx)
+            .await?;
     w.commit().await?;
-    Ok(())
+    Ok(vm_node_ids)
 }
 
 /// The refusals of `openapi.yaml` `restoreBackup` that read the backup, the
@@ -553,18 +578,23 @@ async fn replaced_volume_shape(
     Ok((size_gb, mount_path))
 }
 
-/// Stops every instance of `app_id` and its status, as `stopApp` does.
+/// Stops every instance of `app_id` and its status, as `stopApp` does, and
+/// returns the nodes that hold the instances, each once.
 async fn stop_app(
     conn: &mut SqliteConnection,
     app_id: &str,
     actor: &Actor,
-) -> Result<(), ApiError> {
+) -> Result<Vec<String>, ApiError> {
     let rows = sqlx::query(&format!("SELECT {VM_COLUMNS} FROM vms WHERE app_id = ?"))
         .bind(app_id)
         .fetch_all(&mut *conn)
         .await?;
+    let mut node_ids = Vec::new();
     for row in &rows {
         let mut vm = vm_from_row(row)?;
+        if !node_ids.contains(&vm.node_id) {
+            node_ids.push(vm.node_id.clone());
+        }
         if vm.desired_status == crate::api::vms::DesiredStatus::Stopped {
             continue;
         }
@@ -610,22 +640,28 @@ async fn stop_app(
             .await?;
         }
     }
-    Ok(())
+    Ok(node_ids)
 }
 
-/// Moves the app's instances to `node_id` and asks them to run there.
+/// Moves the app's instances to `node_id` and asks them to run there. Returns
+/// the other nodes the instances left, each once: their desired state no
+/// longer names the instances, and they must hear it.
 async fn move_vms(
     conn: &mut SqliteConnection,
     app_id: &str,
     node_id: &str,
     actor: &Actor,
-) -> Result<(), ApiError> {
+) -> Result<Vec<String>, ApiError> {
     let rows = sqlx::query(&format!("SELECT {VM_COLUMNS} FROM vms WHERE app_id = ?"))
         .bind(app_id)
         .fetch_all(&mut *conn)
         .await?;
+    let mut left_node_ids = Vec::new();
     for row in &rows {
         let mut vm = vm_from_row(row)?;
+        if vm.node_id != node_id && !left_node_ids.contains(&vm.node_id) {
+            left_node_ids.push(vm.node_id.clone());
+        }
         vm.node_id = node_id.to_string();
         vm.desired_status = crate::api::vms::DesiredStatus::Running;
         vm.observed_status = crate::api::vms::ObservedStatus::Creating;
@@ -650,7 +686,7 @@ async fn move_vms(
         )
         .await?;
     }
-    Ok(())
+    Ok(left_node_ids)
 }
 
 /// An `audit-log-format.md` section 3.5 system record of the `leases` actor.
