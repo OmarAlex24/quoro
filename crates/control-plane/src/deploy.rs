@@ -16,7 +16,7 @@
 //!   same write transaction with the same `created_at`, and that value is made
 //!   strictly greater than every earlier deployment of the app (bumped by one
 //!   millisecond on a tie), so the link is unique by construction.
-//!   [`deployment_ids_for_node`] is the only reader of the rule.
+//!   [`deployments_for_node`] is the only reader of the rule.
 //! - When every new instance is observed `running` with health `passing`, the
 //!   deployment `succeeded`, becomes the app's `current_deployment_id`, and
 //!   the app's older VMs are deleted. A failure deletes every VM of the
@@ -827,25 +827,39 @@ async fn linked_deployment(
     row.as_ref().map(deployment_from_row).transpose()
 }
 
-/// `vm_` id to `dep_` id for every app VM placed on `node_id`, following the
-/// link rule in the module documentation. Standalone VMs are absent.
+/// The deployment that created an app VM.
+#[derive(Clone, Debug)]
+pub struct VmDeployment {
+    /// Its `dep_` id.
+    pub id: String,
+    /// The digest it recorded: the image's, once a snapshot first named its
+    /// instance ([`on_spec_sent`]), or the build's. A VM keeps it for life.
+    pub image_digest: Option<String>,
+}
+
+/// `vm_` id to the deployment that created it, for every app VM placed on
+/// `node_id`, following the link rule in the module documentation.
+/// Standalone VMs are absent.
 ///
 /// # Errors
 ///
 /// A database error.
-pub async fn deployment_ids_for_node(
+pub async fn deployments_for_node(
     store: &Store,
     node_id: &str,
-) -> Result<HashMap<String, String>, sqlx::Error> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT v.id, d.id FROM vms v \
+) -> Result<HashMap<String, VmDeployment>, sqlx::Error> {
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT v.id, d.id, d.image_digest FROM vms v \
          JOIN deployments d ON d.app_id = v.app_id AND d.created_at = v.created_at \
          WHERE v.node_id = ? AND v.app_id IS NOT NULL",
     )
     .bind(node_id)
     .fetch_all(store.pool())
     .await?;
-    Ok(rows.into_iter().collect())
+    Ok(rows
+        .into_iter()
+        .map(|(vm_id, id, image_digest)| (vm_id, VmDeployment { id, image_digest }))
+        .collect())
 }
 
 /// The session sent a snapshot to `node_id` that holds these app VMs, each

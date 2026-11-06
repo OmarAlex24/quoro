@@ -7,7 +7,9 @@
 use quoro_control_plane::auth::setup_token;
 use quoro_control_plane::crypto::DataKey;
 use quoro_control_plane::store::{Store, random_secret};
-use quoro_control_plane::{AppState, NodeNetwork, ReferenceAsDigest, ServerConfig, router};
+use quoro_control_plane::{
+    AppState, DigestResolver, NodeNetwork, ReferenceAsDigest, ServerConfig, router,
+};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -197,6 +199,31 @@ async fn start_at(
     Server {
         base,
         data_dir,
+        state,
+    }
+}
+
+/// Starts a second control-plane process on `server`'s database, as after a
+/// restart: a new `AppState` with empty in-memory caches that resolves image
+/// references with `resolver`. Stop the first process's node sessions first.
+pub async fn restart_with_resolver(server: &Server, resolver: Arc<dyn DigestResolver>) -> Server {
+    let state = AppState::open(
+        server.state.store.clone(),
+        (*server.state.config).clone(),
+        resolver,
+        Arc::clone(&server.state.data_key),
+    )
+    .await
+    .unwrap();
+    let app = router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    Server {
+        base,
+        data_dir: server.data_dir.clone(),
         state,
     }
 }

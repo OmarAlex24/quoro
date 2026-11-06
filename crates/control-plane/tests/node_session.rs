@@ -3,7 +3,9 @@
 
 mod common;
 
-use common::{Server, TLS_FINGERPRINT, problem, start, start_with_patient_node_session};
+use common::{
+    Server, TLS_FINGERPRINT, problem, restart_with_resolver, start, start_with_patient_node_session,
+};
 use futures_util::{SinkExt, StreamExt};
 use quoro_control_plane::api::enroll::{ensure_local_join, local_join_token};
 use quoro_control_plane::driver::{self, Capacity, Kvm, LocalNode};
@@ -1233,4 +1235,185 @@ async fn an_instance_on_a_disconnected_node_reads_unknown_until_its_node_reports
         vm_facts(&server, &vm_id).await,
         (events, "running".to_string())
     );
+}
+
+/// The digest a registry tag resolves to once it has moved upstream.
+const MOVED_DIGEST: &str =
+    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+/// A registry whose tags all moved to [`MOVED_DIGEST`].
+struct MovedTag;
+
+impl quoro_control_plane::DigestResolver for MovedTag {
+    fn resolve<'a>(
+        &'a self,
+        _reference: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'a>>
+    {
+        Box::pin(async { Ok(MOVED_DIGEST.to_string()) })
+    }
+}
+
+/// The `spec.vms` entry of `vm_id` in a `desired_state` frame.
+fn spec_vm<'a>(snapshot: &'a Value, vm_id: &str) -> Option<&'a Value> {
+    snapshot["body"]["spec"]["vms"]
+        .as_array()?
+        .iter()
+        .find(|vm| vm["vm_id"] == vm_id)
+}
+
+/// Issue #354: a VM keeps the digest it was created with. A restarted primary
+/// starts with an empty digest cache; when the app's tag moved meanwhile, the
+/// running instance must not be sent the tag's new digest. Only a new
+/// deployment, with a new VM id, resolves the tag again.
+#[tokio::test]
+async fn a_restarted_primary_keeps_an_instance_on_its_create_time_digest() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+    let (mut socket, _) = open(&server, &node).await;
+
+    let project: Value = owner
+        .post(server.url("/api/v1/projects"))
+        .json(&json!({ "slug": "demo", "name": "Demo" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let project_id = project["id"].as_str().unwrap();
+    heartbeat(&mut socket).await;
+    let image = "ghcr.io/example/web:latest";
+    let res = owner
+        .post(server.url("/api/v1/apps"))
+        .json(&json!({
+            "project_id": project_id,
+            "name": "web",
+            "image": image,
+            "port": 8080,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        201,
+        "create app: {}",
+        res.text().await.unwrap()
+    );
+    let app: Value = res.json().await.unwrap();
+    let app_id = app["id"].as_str().unwrap().to_string();
+    heartbeat(&mut socket).await;
+    let res = owner
+        .post(server.url(&format!("/api/v1/apps/{app_id}/deployments")))
+        .json(&json!({ "image": image }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 202, "deploy: {}", res.text().await.unwrap());
+
+    // The instance is created with the digest the tag had then.
+    let snapshot = loop {
+        heartbeat(&mut socket).await;
+        let snapshot = recv_type(&mut socket, "desired_state").await;
+        if !snapshot["body"]["spec"]["vms"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+        {
+            break snapshot;
+        }
+    };
+    let vm_id = snapshot["body"]["spec"]["vms"][0]["vm_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let created = snapshot["body"]["spec"]["vms"][0]["image_digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(created, MOVED_DIGEST);
+    // The deployment records it with that first snapshot.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let recorded: Option<String> =
+            sqlx::query_scalar("SELECT image_digest FROM deployments WHERE app_id = ?")
+                .bind(&app_id)
+                .fetch_one(server.state.store.pool())
+                .await
+                .unwrap();
+        if recorded.as_deref() == Some(created.as_str()) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the deployment did not record {created}: {recorded:?}"
+        );
+        heartbeat(&mut socket).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The instance runs, so the deployment succeeds.
+    let rev = snapshot["body"]["rev"].as_u64().unwrap();
+    send(
+        &mut socket,
+        report_one(rev, &vm_id, ObservedStatus::Running),
+    )
+    .await;
+    wait_for_vm(&server, &owner, &mut socket, &vm_id, "running").await;
+
+    // The primary restarts while upstream has moved the tag.
+    socket.close(None).await.unwrap();
+    drop(socket);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while node_json(&server, &owner, &node.node_id).await["status"] != "disconnected" {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the node is not disconnected"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let restarted = restart_with_resolver(&server, std::sync::Arc::new(MovedTag)).await;
+    let (mut socket, snapshot) = open(&restarted, &node).await;
+    let vm = spec_vm(&snapshot, &vm_id).expect("the instance is still desired");
+    assert_eq!(
+        vm["image_digest"], created,
+        "the restarted primary moved a running instance to the tag's new digest"
+    );
+    let rev = snapshot["body"]["rev"].as_u64().unwrap();
+    send(
+        &mut socket,
+        report_one(rev, &vm_id, ObservedStatus::Running),
+    )
+    .await;
+
+    // A new deployment creates a new VM id, and only that resolves the tag
+    // again; the running instance keeps its digest meanwhile.
+    let owner = restarted.client();
+    restarted
+        .login(&owner, common::OWNER_EMAIL, common::OWNER_PASSWORD)
+        .await;
+    let res = owner
+        .post(restarted.url(&format!("/api/v1/apps/{app_id}/deployments")))
+        .json(&json!({ "image": image }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 202, "redeploy: {}", res.text().await.unwrap());
+    let snapshot = loop {
+        heartbeat(&mut socket).await;
+        let snapshot = recv_type(&mut socket, "desired_state").await;
+        if snapshot["body"]["spec"]["vms"].as_array().unwrap().len() == 2 {
+            break snapshot;
+        }
+    };
+    assert_eq!(spec_vm(&snapshot, &vm_id).unwrap()["image_digest"], created);
+    let new_vm = snapshot["body"]["spec"]["vms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|vm| vm["vm_id"] != vm_id.as_str())
+        .unwrap();
+    assert_eq!(new_vm["image_digest"], MOVED_DIGEST);
 }
