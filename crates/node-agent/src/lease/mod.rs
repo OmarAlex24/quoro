@@ -18,5 +18,7 @@ pub use fence::{FenceReport, FenceTimers, VmFenceOutcome, budget_for, stop_vms};
 pub use machine::{
     Action, Lease, LeaseState, LeaseTable, MIN_DURATION, Refusal, RevokeOutcome, margin,
 };
-pub use service::{LeaseConfig, LeaseLink, LeaseView, LocalLeases, start_local_leases};
+pub use service::{
+    LeaseConfig, LeaseLink, LeaseView, LocalLeases, StartPermit, start_local_leases,
+};
 pub use store::{FenceRecord, LeaseStore, MemoryLeaseStore, StoredLease};

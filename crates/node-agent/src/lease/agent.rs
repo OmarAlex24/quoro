@@ -61,8 +61,13 @@ impl<'e, E: Engine, S: LeaseStore> LeaseAgent<'e, E, S> {
         config: LeaseAgentConfig,
         outbound: mpsc::UnboundedSender<FromNode>,
     ) -> Self {
+        let fenced = store
+            .fences()
+            .into_iter()
+            .map(|record| (record.lease_id, record.token))
+            .collect();
         let (table, pending_fences) =
-            LeaseTable::restore(store.load_leases(), store.load_highest_tokens());
+            LeaseTable::restore(store.load_leases(), store.load_highest_tokens(), &fenced);
         let failed = store.node_failed();
         Self {
             engine,

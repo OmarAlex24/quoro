@@ -987,50 +987,8 @@ impl NodeStore {
     ///
     /// [`AgentError::Store`] when the body cannot be encoded or SQLite fails.
     pub async fn push_event(&self, evt_id: &str, body: &Value) -> Result<(), AgentError> {
-        let text = serde_json::to_string(body)
-            .map_err(|e| AgentError::Store(format!("could not encode an event: {e}")))?;
         let mut tx = self.pool.begin().await.map_err(store_error)?;
-        sqlx::query("INSERT OR IGNORE INTO event_buffer (evt_id, body) VALUES (?, ?)")
-            .bind(evt_id)
-            .bind(text)
-            .execute(&mut *tx)
-            .await
-            .map_err(store_error)?;
-        let count: i64 = sqlx::query("SELECT COUNT(*) AS n FROM event_buffer")
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(store_error)?
-            .try_get("n")
-            .map_err(store_error)?;
-        let excess = count - EVENT_BUFFER_LIMIT;
-        if excess > 0 {
-            sqlx::query(
-                "DELETE FROM event_buffer WHERE seq IN \
-                 (SELECT seq FROM event_buffer ORDER BY seq ASC LIMIT ?)",
-            )
-            .bind(excess)
-            .execute(&mut *tx)
-            .await
-            .map_err(store_error)?;
-            let dropped = sqlx::query("SELECT value FROM node_meta WHERE key = ?")
-                .bind(DROPPED_EVENTS)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(store_error)?
-                .and_then(|row| row.try_get::<String, _>("value").ok())
-                .and_then(|text| text.parse::<u64>().ok())
-                .unwrap_or(0)
-                .saturating_add(u64::try_from(excess).unwrap_or(0));
-            sqlx::query(
-                "INSERT INTO node_meta (key, value) VALUES (?, ?) \
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            )
-            .bind(DROPPED_EVENTS)
-            .bind(dropped.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(store_error)?;
-        }
+        buffer_event(&mut tx, evt_id, body).await?;
         tx.commit().await.map_err(store_error)
     }
 
@@ -1385,37 +1343,8 @@ impl NodeStore {
     /// [`AgentError::Store`] on a SQLite failure or a lease field with no
     /// stored form.
     pub async fn save_lease(&self, lease: &StoredLease, highest: u64) -> Result<(), AgentError> {
-        let duration_ms = lease
-            .duration
-            .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX));
         let mut tx = self.pool.begin().await.map_err(store_error)?;
-        sqlx::query(
-            "INSERT INTO leases (lease_id, resource_type, resource_id, mode, token, state, \
-             duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(lease_id) DO UPDATE SET resource_type = excluded.resource_type, \
-             resource_id = excluded.resource_id, mode = excluded.mode, token = excluded.token, \
-             state = excluded.state, duration_ms = excluded.duration_ms",
-        )
-        .bind(&lease.lease_id.0)
-        .bind(resource_type_str(lease.resource_type))
-        .bind(&lease.resource_id)
-        .bind(lease_mode_str(lease.mode))
-        .bind(i64::try_from(lease.token).unwrap_or(i64::MAX))
-        .bind(lease_state_str(lease.state))
-        .bind(duration_ms)
-        .execute(&mut *tx)
-        .await
-        .map_err(store_error)?;
-        sqlx::query(
-            "INSERT INTO lease_tokens (resource_type, resource_id, token) VALUES (?, ?, ?) \
-             ON CONFLICT(resource_type, resource_id) DO UPDATE SET token = MAX(token, excluded.token)",
-        )
-        .bind(resource_type_str(lease.resource_type))
-        .bind(&lease.resource_id)
-        .bind(i64::try_from(highest).unwrap_or(i64::MAX))
-        .execute(&mut *tx)
-        .await
-        .map_err(store_error)?;
+        upsert_lease(&mut tx, lease, highest).await?;
         tx.commit().await.map_err(store_error)
     }
 
@@ -1425,29 +1354,48 @@ impl NodeStore {
     ///
     /// [`AgentError::Store`] on a SQLite failure or an unencodable VM list.
     pub async fn record_fence(&self, record: &FenceRecord) -> Result<(), AgentError> {
-        let vm_ids: Vec<String> = record.vm_ids.iter().map(|id| id.0.clone()).collect();
-        let vm_ids = serde_json::to_string(&vm_ids)
-            .map_err(|e| AgentError::Store(format!("could not encode a fence's VMs: {e}")))?;
-        let at_ns = record
-            .at
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| {
-                i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX)
-            });
-        sqlx::query(
-            "INSERT INTO fences (lease_id, token, vm_ids, at_ns, reason, complete) \
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&record.lease_id.0)
-        .bind(i64::try_from(record.token).unwrap_or(i64::MAX))
-        .bind(vm_ids)
-        .bind(at_ns)
-        .bind(fence_reason_str(record.reason))
-        .bind(i64::from(record.complete))
-        .execute(&self.pool)
-        .await
-        .map_err(store_error)
-        .map(|_| ())
+        let mut tx = self.pool.begin().await.map_err(store_error)?;
+        insert_fence(&mut tx, record).await?;
+        tx.commit().await.map_err(store_error)
+    }
+
+    /// Records one finished self-fence together with the lease's row and its
+    /// resource's highest token, its event, and the node's failed mark when
+    /// the fence could not confirm every stop, in one transaction (section 8.5
+    /// steps 2 and 3).
+    ///
+    /// A restart therefore finds all of them or none of them. With none, the
+    /// lease is either still `revoked` or `expired` without a fence record,
+    /// which the restore reads as an interrupted fence and runs again, or the
+    /// revoke was never answered with success.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure or an unencodable field.
+    pub async fn finish_fence(
+        &self,
+        record: &FenceRecord,
+        lease: Option<(&StoredLease, u64)>,
+        evt_id: &str,
+        event: &Value,
+    ) -> Result<(), AgentError> {
+        let mut tx = self.pool.begin().await.map_err(store_error)?;
+        if let Some((lease, highest)) = lease {
+            upsert_lease(&mut tx, lease, highest).await?;
+        }
+        insert_fence(&mut tx, record).await?;
+        if !record.complete {
+            sqlx::query(
+                "INSERT INTO node_meta (key, value) VALUES (?, '1') \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )
+            .bind(NODE_FAILED)
+            .execute(&mut *tx)
+            .await
+            .map_err(store_error)?;
+        }
+        buffer_event(&mut tx, evt_id, event).await?;
+        tx.commit().await.map_err(store_error)
     }
 
     /// Every recorded self-fence, oldest first.
@@ -1779,6 +1727,129 @@ fn fence_record(row: sqlx::sqlite::SqliteRow) -> Result<FenceRecord, AgentError>
         reason: parse_fence_reason(&reason)?,
         complete: complete != 0,
     })
+}
+
+/// Inserts or replaces one lease row and raises its resource's highest token
+/// inside `tx` (section 12 `leases`, section 8.6).
+async fn upsert_lease(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    lease: &StoredLease,
+    highest: u64,
+) -> Result<(), AgentError> {
+    let duration_ms = lease
+        .duration
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX));
+    sqlx::query(
+        "INSERT INTO leases (lease_id, resource_type, resource_id, mode, token, state, \
+         duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(lease_id) DO UPDATE SET resource_type = excluded.resource_type, \
+         resource_id = excluded.resource_id, mode = excluded.mode, token = excluded.token, \
+         state = excluded.state, duration_ms = excluded.duration_ms",
+    )
+    .bind(&lease.lease_id.0)
+    .bind(resource_type_str(lease.resource_type))
+    .bind(&lease.resource_id)
+    .bind(lease_mode_str(lease.mode))
+    .bind(i64::try_from(lease.token).unwrap_or(i64::MAX))
+    .bind(lease_state_str(lease.state))
+    .bind(duration_ms)
+    .execute(&mut **tx)
+    .await
+    .map_err(store_error)?;
+    sqlx::query(
+        "INSERT INTO lease_tokens (resource_type, resource_id, token) VALUES (?, ?, ?) \
+         ON CONFLICT(resource_type, resource_id) DO UPDATE SET token = MAX(token, excluded.token)",
+    )
+    .bind(resource_type_str(lease.resource_type))
+    .bind(&lease.resource_id)
+    .bind(i64::try_from(highest).unwrap_or(i64::MAX))
+    .execute(&mut **tx)
+    .await
+    .map_err(store_error)?;
+    Ok(())
+}
+
+/// Inserts one fence record inside `tx` (section 8.5 step 2).
+async fn insert_fence(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    record: &FenceRecord,
+) -> Result<(), AgentError> {
+    let vm_ids: Vec<String> = record.vm_ids.iter().map(|id| id.0.clone()).collect();
+    let vm_ids = serde_json::to_string(&vm_ids)
+        .map_err(|e| AgentError::Store(format!("could not encode a fence's VMs: {e}")))?;
+    let at_ns = record
+        .at
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX)
+        });
+    sqlx::query(
+        "INSERT INTO fences (lease_id, token, vm_ids, at_ns, reason, complete) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&record.lease_id.0)
+    .bind(i64::try_from(record.token).unwrap_or(i64::MAX))
+    .bind(vm_ids)
+    .bind(at_ns)
+    .bind(fence_reason_str(record.reason))
+    .bind(i64::from(record.complete))
+    .execute(&mut **tx)
+    .await
+    .map_err(store_error)
+    .map(|_| ())
+}
+
+/// Buffers one event inside `tx`, dropping the oldest entries when the buffer
+/// is full and counting each drop (section 6.5).
+async fn buffer_event(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    evt_id: &str,
+    body: &Value,
+) -> Result<(), AgentError> {
+    let text = serde_json::to_string(body)
+        .map_err(|e| AgentError::Store(format!("could not encode an event: {e}")))?;
+    sqlx::query("INSERT OR IGNORE INTO event_buffer (evt_id, body) VALUES (?, ?)")
+        .bind(evt_id)
+        .bind(text)
+        .execute(&mut **tx)
+        .await
+        .map_err(store_error)?;
+    let count: i64 = sqlx::query("SELECT COUNT(*) AS n FROM event_buffer")
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(store_error)?
+        .try_get("n")
+        .map_err(store_error)?;
+    let excess = count - EVENT_BUFFER_LIMIT;
+    if excess > 0 {
+        sqlx::query(
+            "DELETE FROM event_buffer WHERE seq IN \
+             (SELECT seq FROM event_buffer ORDER BY seq ASC LIMIT ?)",
+        )
+        .bind(excess)
+        .execute(&mut **tx)
+        .await
+        .map_err(store_error)?;
+        let dropped = sqlx::query("SELECT value FROM node_meta WHERE key = ?")
+            .bind(DROPPED_EVENTS)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(store_error)?
+            .and_then(|row| row.try_get::<String, _>("value").ok())
+            .and_then(|text| text.parse::<u64>().ok())
+            .unwrap_or(0)
+            .saturating_add(u64::try_from(excess).unwrap_or(0));
+        sqlx::query(
+            "INSERT INTO node_meta (key, value) VALUES (?, ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(DROPPED_EVENTS)
+        .bind(dropped.to_string())
+        .execute(&mut **tx)
+        .await
+        .map_err(store_error)?;
+    }
+    Ok(())
 }
 
 /// Adds `desired_state.body_enc` to a database created before bodies were

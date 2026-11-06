@@ -222,3 +222,722 @@ async fn a_revoke_of_an_unknown_lease_is_answered_ok() {
     assert!(engine.stop_calls().is_empty());
     leases.abort();
 }
+
+fn slow_config() -> LeaseConfig {
+    LeaseConfig {
+        node_id: "nod_test".to_owned(),
+        timers: FenceTimers {
+            grace: Duration::from_secs(60),
+            force: Duration::from_secs(60),
+        },
+    }
+}
+
+async fn start_with(
+    dir: &TargetDir,
+    engine: Arc<FakeEngine>,
+    desired: &watch::Sender<Option<quoro_node_agent::reconcile::Snapshot>>,
+    config: LeaseConfig,
+) -> (LocalLeases, NodeStore) {
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let leases = start_local_leases(engine, store.clone(), config, desired.subscribe())
+        .await
+        .expect("the lease service starts");
+    (leases, store)
+}
+
+/// Waits (real time, bounded) until `ready` holds.
+async fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !ready() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+fn stops_of(engine: &FakeEngine, vm: &quoro_engine::VmId) -> usize {
+    engine
+        .stop_calls()
+        .iter()
+        .filter(|(id, _)| id == vm)
+        .count()
+}
+
+async fn fenced_events(store: &NodeStore) -> Vec<serde_json::Value> {
+    store
+        .buffered_events()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|event| event.body)
+        .filter(|body| body["type"] == "node.fenced" || body["type"] == "node.fence_failed")
+        .collect()
+}
+
+/// Section 8.5 "Concurrency" (D-0075): the service keeps taking messages while
+/// one lease is being fenced, and the fence of another lease does not wait for
+/// it.
+#[tokio::test]
+async fn a_fence_in_progress_does_not_block_other_leases() {
+    let dir = TargetDir::new("lease-nonblocking");
+    let engine = Arc::new(FakeEngine::new());
+    let snapshot = snapshot_full(
+        1,
+        vec![
+            stateful_vm("vm_slow", "lse_slow", 1, Vec::new()),
+            stateful_vm("vm_fast", "lse_fast", 1, Vec::new()),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+    let (desired, _) = watch::channel(Some(snapshot));
+    let (leases, _store) = start_with(&dir, engine.clone(), &desired, slow_config()).await;
+    for (lease, app) in [("lse_slow", "app_slow"), ("lse_fast", "app_fast")] {
+        leases
+            .link
+            .grant(
+                msg(&format!("msg_grant_{lease}")),
+                None,
+                local_grant(lease, app, 1),
+            )
+            .await
+            .unwrap();
+    }
+    let slow = common::running_vm(&engine, "vm_slow", 2).await;
+    let fast = common::running_vm(&engine, "vm_fast", 3).await;
+    engine.set_stop_delay(&slow, Duration::from_secs(3));
+
+    let link = leases.link.clone();
+    let slow_revoke = tokio::spawn(async move {
+        link.revoke(msg("msg_revoke_slow"), None, revoke("lse_slow", 1))
+            .await
+    });
+    wait_for("the slow stop to begin", || stops_of(&engine, &slow) == 1).await;
+
+    // The other lease is revoked, fenced and answered while the slow fence
+    // still runs, and a grant is applied meanwhile.
+    let fast_result = leases
+        .link
+        .revoke(msg("msg_revoke_fast"), None, revoke("lse_fast", 1))
+        .await
+        .expect("the fast revoke is answered");
+    assert_eq!(fast_result.status, CommandStatus::Ok);
+    assert_eq!(engine.inspect(&fast).await.unwrap().state, VmState::Stopped);
+    leases
+        .link
+        .grant(
+            msg("msg_grant_new"),
+            None,
+            local_grant("lse_new", "app_new", 1),
+        )
+        .await
+        .expect("a grant is applied during another lease's fence");
+    assert!(
+        !slow_revoke.is_finished(),
+        "the slow fence is still running"
+    );
+    assert_eq!(engine.inspect(&slow).await.unwrap().state, VmState::Running);
+
+    // A newer grant of the lease being fenced does not let its VM start
+    // before the fence is recorded.
+    leases
+        .link
+        .grant(
+            msg("msg_regrant"),
+            None,
+            local_grant("lse_slow", "app_slow", 2),
+        )
+        .await
+        .expect("a higher token is accepted");
+    assert_eq!(leases.view.state("lse_slow"), Some(LeaseState::Held));
+    assert!(!leases.view.may_start_stateful("lse_slow", 2));
+
+    let slow_result = slow_revoke.await.unwrap().expect("the slow revoke");
+    assert_eq!(slow_result.status, CommandStatus::Ok);
+    assert_eq!(engine.inspect(&slow).await.unwrap().state, VmState::Stopped);
+    assert!(leases.view.may_start_stateful("lse_slow", 2));
+    leases.abort();
+}
+
+/// Section 8.5 "Concurrency" (D-0075): the fences of two leases stop their VMs
+/// side by side, inside one stop time rather than two.
+#[tokio::test]
+async fn fences_of_different_leases_run_concurrently() {
+    let dir = TargetDir::new("lease-concurrent");
+    let engine = Arc::new(FakeEngine::new());
+    let snapshot = snapshot_full(
+        1,
+        vec![
+            stateful_vm("vm_a", "lse_a", 1, Vec::new()),
+            stateful_vm("vm_b", "lse_b", 1, Vec::new()),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+    let (desired, _) = watch::channel(Some(snapshot));
+    let (leases, store) = start_with(&dir, engine.clone(), &desired, slow_config()).await;
+    let mut vms = Vec::new();
+    for (index, (lease, app, vm)) in [("lse_a", "app_a", "vm_a"), ("lse_b", "app_b", "vm_b")]
+        .into_iter()
+        .enumerate()
+    {
+        leases
+            .link
+            .grant(
+                msg(&format!("msg_grant_{lease}")),
+                None,
+                local_grant(lease, app, 1),
+            )
+            .await
+            .unwrap();
+        let id = common::running_vm(&engine, vm, 2 + u8::try_from(index).unwrap()).await;
+        engine.set_stop_delay(&id, Duration::from_millis(1500));
+        vms.push(id);
+    }
+
+    let began = std::time::Instant::now();
+    let (a, b) = tokio::join!(
+        leases
+            .link
+            .revoke(msg("msg_revoke_a"), None, revoke("lse_a", 1)),
+        leases
+            .link
+            .revoke(msg("msg_revoke_b"), None, revoke("lse_b", 1)),
+    );
+    let elapsed = began.elapsed();
+    assert_eq!(a.unwrap().status, CommandStatus::Ok);
+    assert_eq!(b.unwrap().status, CommandStatus::Ok);
+    assert!(
+        elapsed < Duration::from_millis(2900),
+        "two 1.5 s stops took {elapsed:?}: the fences ran one after the other"
+    );
+    for vm in &vms {
+        assert_eq!(engine.inspect(vm).await.unwrap().state, VmState::Stopped);
+    }
+    assert_eq!(store.fences().await.unwrap().len(), 2);
+    assert_eq!(fenced_events(&store).await.len(), 2);
+    leases.abort();
+}
+
+/// Section 6.4 against section 8.5: a start that holds the lease's start
+/// permit finishes before the fence stops the VM, and once the lease is lost
+/// no permit is given.
+#[tokio::test]
+async fn a_fence_waits_for_a_start_in_progress_and_then_stops_the_vm() {
+    let dir = TargetDir::new("lease-gate");
+    let engine = Arc::new(FakeEngine::new());
+    let snapshot = snapshot_full(
+        1,
+        vec![stateful_vm("vm_gate", "lse_gate", 1, Vec::new())],
+        Vec::new(),
+        Vec::new(),
+    );
+    let (desired, _) = watch::channel(Some(snapshot));
+    let (leases, _store) = start(&dir, engine.clone(), &desired).await;
+    leases
+        .link
+        .grant(
+            msg("msg_grant"),
+            None,
+            local_grant("lse_gate", "app_gate", 1),
+        )
+        .await
+        .unwrap();
+
+    // The reconciler is starting the VM: it holds the permit.
+    let permit = leases
+        .view
+        .start_permit("lse_gate", 1)
+        .await
+        .expect("a held lease gives a permit");
+    assert!(leases.view.start_permit("lse_gate", 2).await.is_none());
+    let vm = common::running_vm(&engine, "vm_gate", 2).await;
+
+    let link = leases.link.clone();
+    let revoke_task = tokio::spawn(async move {
+        link.revoke(msg("msg_revoke"), None, revoke("lse_gate", 1))
+            .await
+    });
+    wait_for("the lease to be revoked", || {
+        leases.view.state("lse_gate") == Some(LeaseState::Revoked)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(stops_of(&engine, &vm), 0, "the fence waits for the start");
+    assert!(!revoke_task.is_finished());
+
+    drop(permit);
+    let result = revoke_task.await.unwrap().expect("the revoke");
+    assert_eq!(result.status, CommandStatus::Ok);
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Stopped);
+    assert!(leases.view.start_permit("lse_gate", 1).await.is_none());
+    leases.abort();
+}
+
+/// Section 8.5 "Concurrency" (D-0075): an agent that dies in the middle of
+/// two fences restores both leases fenced, fences them again at once, and
+/// records each fence and its event exactly once.
+#[tokio::test]
+async fn a_crash_mid_fence_fences_again_on_restart() {
+    let dir = TargetDir::new("lease-crash");
+    let engine = Arc::new(FakeEngine::new());
+    let snapshot = snapshot_full(
+        1,
+        vec![
+            stateful_vm("vm_one", "lse_one", 1, Vec::new()),
+            stateful_vm("vm_two", "lse_two", 1, Vec::new()),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+    let (desired, _) = watch::channel(Some(snapshot.clone()));
+    let (leases, store) = start_with(&dir, engine.clone(), &desired, slow_config()).await;
+    let mut vms = Vec::new();
+    for (index, (lease, app, vm)) in [
+        ("lse_one", "app_one", "vm_one"),
+        ("lse_two", "app_two", "vm_two"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        leases
+            .link
+            .grant(
+                msg(&format!("msg_grant_{lease}")),
+                None,
+                local_grant(lease, app, 1),
+            )
+            .await
+            .unwrap();
+        let id = common::running_vm(&engine, vm, 2 + u8::try_from(index).unwrap()).await;
+        // A VMM that takes far longer to stop than the agent lives.
+        engine.set_stop_delay(&id, Duration::from_secs(600));
+        vms.push(id);
+    }
+    let mut pending = Vec::new();
+    for lease in ["lse_one", "lse_two"] {
+        let link = leases.link.clone();
+        pending.push(tokio::spawn(async move {
+            link.revoke(msg(&format!("msg_revoke_{lease}")), None, revoke(lease, 1))
+                .await
+        }));
+    }
+    wait_for("both stops to begin", || {
+        vms.iter().all(|vm| stops_of(&engine, vm) == 1)
+    })
+    .await;
+
+    // The agent dies mid-fence.
+    leases.abort();
+    for task in pending {
+        let answer = task
+            .await
+            .unwrap()
+            .expect("a dead service is not a refusal");
+        assert_eq!(
+            answer.status,
+            CommandStatus::Error,
+            "a dead service never answers ok"
+        );
+        assert!(answer.error.is_none(), "nor fence_failed");
+    }
+    drop(store);
+    for vm in &vms {
+        assert_eq!(
+            engine.inspect(vm).await.unwrap().state,
+            VmState::Running,
+            "the VMM outlives the agent"
+        );
+        engine.set_stop_delay(vm, Duration::ZERO);
+    }
+
+    // A new agent process over the same store.
+    let (desired, _) = watch::channel(Some(snapshot));
+    let (leases, store) = start(&dir, engine.clone(), &desired).await;
+    for lease in ["lse_one", "lse_two"] {
+        assert_eq!(leases.view.state(lease), Some(LeaseState::Revoked));
+        assert!(!leases.view.may_start_stateful(lease, 1));
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while store.fences().await.unwrap().len() < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the restart fences again"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    for vm in &vms {
+        assert_eq!(engine.inspect(vm).await.unwrap().state, VmState::Stopped);
+    }
+    let fences = store.fences().await.unwrap();
+    assert_eq!(fences.len(), 2);
+    assert!(
+        fences
+            .iter()
+            .all(|fence| fence.complete && fence.token == 1)
+    );
+    assert_eq!(fenced_events(&store).await.len(), 2, "one event per fence");
+    assert!(!leases.view.is_failed());
+    leases.abort();
+    drop(store);
+
+    // A second restart finds both fences recorded and fences nothing.
+    let stops_before = engine.stop_calls().len();
+    let (desired, _) = watch::channel(None);
+    let (leases, store) = start(&dir, engine.clone(), &desired).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(engine.stop_calls().len(), stops_before);
+    assert_eq!(store.fences().await.unwrap().len(), 2);
+    leases.abort();
+}
+
+/// D-0074 with concurrent fences: a VM that cannot be stopped fails its fence,
+/// marks the node failed in memory and in the store, and the revoke is
+/// answered `fence_failed`.
+#[tokio::test]
+async fn an_unstoppable_vm_fails_the_fence_and_marks_the_node_failed() {
+    let dir = TargetDir::new("lease-failed");
+    let engine = Arc::new(FakeEngine::new());
+    let snapshot = snapshot_full(
+        1,
+        vec![stateful_vm("vm_stuck", "lse_stuck", 1, Vec::new())],
+        Vec::new(),
+        Vec::new(),
+    );
+    let (desired, _) = watch::channel(Some(snapshot));
+    let (leases, store) = start(&dir, engine.clone(), &desired).await;
+    leases
+        .link
+        .grant(
+            msg("msg_grant"),
+            None,
+            local_grant("lse_stuck", "app_stuck", 1),
+        )
+        .await
+        .unwrap();
+    let vm = common::running_vm(&engine, "vm_stuck", 2).await;
+    engine.set_unkillable(&vm, true);
+
+    let result = leases
+        .link
+        .revoke(msg("msg_revoke"), None, revoke("lse_stuck", 1))
+        .await
+        .expect("the revoke is answered");
+    assert_eq!(result.status, CommandStatus::Error);
+    assert_eq!(result.error.expect("an error").code, ErrorCode::FenceFailed);
+    assert!(leases.view.is_failed());
+    assert!(store.node_failed().await.unwrap());
+    let fences = store.fences().await.unwrap();
+    assert_eq!(fences.len(), 1);
+    assert!(!fences[0].complete);
+    let events = fenced_events(&store).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["type"], "node.fence_failed");
+    assert_eq!(events[0]["data"]["vm_ids"][0], "vm_stuck");
+    leases.abort();
+}
+
+/// Section 5.13 during a running fence: a redelivered revoke and a second
+/// revoke with a higher token join the fence instead of stopping the VM again,
+/// all of them are answered once it is recorded, and the record carries the
+/// higher token.
+#[tokio::test]
+async fn revokes_that_arrive_during_a_fence_join_it() {
+    let dir = TargetDir::new("lease-join");
+    let engine = Arc::new(FakeEngine::new());
+    let snapshot = snapshot_full(
+        1,
+        vec![stateful_vm("vm_join", "lse_join", 1, Vec::new())],
+        Vec::new(),
+        Vec::new(),
+    );
+    let (desired, _) = watch::channel(Some(snapshot));
+    let (leases, store) = start_with(&dir, engine.clone(), &desired, slow_config()).await;
+    leases
+        .link
+        .grant(
+            msg("msg_grant"),
+            None,
+            local_grant("lse_join", "app_join", 1),
+        )
+        .await
+        .unwrap();
+    let vm = common::running_vm(&engine, "vm_join", 2).await;
+    engine.set_stop_delay(&vm, Duration::from_millis(800));
+
+    let mut answers = Vec::new();
+    for (id, token) in [("msg_first", 1), ("msg_first", 1), ("msg_higher", 2)] {
+        let link = leases.link.clone();
+        answers.push(tokio::spawn(async move {
+            link.revoke(msg(id), None, revoke("lse_join", token)).await
+        }));
+        if answers.len() == 1 {
+            wait_for("the stop to begin", || stops_of(&engine, &vm) == 1).await;
+        }
+    }
+    for answer in answers {
+        let result = answer.await.unwrap().expect("every revoke is answered");
+        assert_eq!(result.status, CommandStatus::Ok);
+    }
+    assert_eq!(stops_of(&engine, &vm), 1, "the VM was stopped once");
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Stopped);
+    let fences = store.fences().await.unwrap();
+    assert_eq!(fences.len(), 1);
+    assert_eq!(fences[0].token, 2);
+    let rows = store.load_leases().await.unwrap();
+    assert_eq!(rows[0].state, LeaseState::Revoked);
+    assert_eq!(rows[0].token, 2);
+
+    // Both answers are final: a redelivery fences nothing again.
+    let again = leases
+        .link
+        .revoke(msg("msg_higher"), None, revoke("lse_join", 2))
+        .await
+        .unwrap();
+    assert_eq!(again.status, CommandStatus::Ok);
+    assert_eq!(stops_of(&engine, &vm), 1);
+    assert_eq!(store.fences().await.unwrap().len(), 1);
+    leases.abort();
+}
+
+/// Section 8.5 step 1: a snapshot that dropped a VM before the revoke arrived
+/// does not let the VM escape the fence; it is stopped and recorded.
+#[tokio::test]
+async fn a_vm_dropped_from_the_snapshot_before_the_revoke_is_still_fenced() {
+    let dir = TargetDir::new("lease-dropped");
+    let engine = Arc::new(FakeEngine::new());
+    let bound = snapshot_full(
+        1,
+        vec![stateful_vm("vm_dropped", "lse_dropped", 1, Vec::new())],
+        Vec::new(),
+        Vec::new(),
+    );
+    let (desired, _) = watch::channel(Some(bound));
+    let (leases, store) = start(&dir, engine.clone(), &desired).await;
+    leases
+        .link
+        .grant(
+            msg("msg_grant"),
+            None,
+            local_grant("lse_dropped", "app_dropped", 1),
+        )
+        .await
+        .unwrap();
+    let vm = common::running_vm(&engine, "vm_dropped", 2).await;
+
+    // The primary moves the app: the new snapshot no longer names the VM,
+    // and the reconciler has not removed it yet.
+    desired.send_replace(Some(snapshot_full(2, Vec::new(), Vec::new(), Vec::new())));
+    let result = leases
+        .link
+        .revoke(msg("msg_revoke"), None, revoke("lse_dropped", 1))
+        .await
+        .unwrap();
+    assert_eq!(result.status, CommandStatus::Ok);
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Stopped);
+    let fences = store.fences().await.unwrap();
+    assert_eq!(fences[0].vm_ids, vec![vm]);
+    leases.abort();
+}
+
+/// Section 8.5 with an agent restart that finds no verified snapshot: the
+/// restore cannot tell which VMs the interrupted fence was stopping, so it
+/// stops every app VM on the node rather than record a fence that stopped
+/// nothing. A builder VM holds no lease and keeps running.
+#[tokio::test]
+async fn a_restart_without_a_snapshot_fences_every_app_vm() {
+    let dir = TargetDir::new("lease-nosnapshot");
+    let engine = Arc::new(FakeEngine::new());
+    let snapshot = snapshot_full(
+        1,
+        vec![stateful_vm("vm_bound", "lse_lost", 1, Vec::new())],
+        Vec::new(),
+        Vec::new(),
+    );
+    let (desired, _) = watch::channel(Some(snapshot));
+    let (leases, store) = start_with(&dir, engine.clone(), &desired, slow_config()).await;
+    leases
+        .link
+        .grant(
+            msg("msg_grant"),
+            None,
+            local_grant("lse_lost", "app_lost", 1),
+        )
+        .await
+        .unwrap();
+    let bound = common::running_vm(&engine, "vm_bound", 2).await;
+    let other = common::running_vm(&engine, "vm_other", 3).await;
+    let builder = common::running_vm(&engine, "bld_builder", 4).await;
+    engine.set_stop_delay(&bound, Duration::from_secs(600));
+    let link = leases.link.clone();
+    let pending = tokio::spawn(async move {
+        link.revoke(msg("msg_revoke"), None, revoke("lse_lost", 1))
+            .await
+    });
+    wait_for("the stop to begin", || stops_of(&engine, &bound) == 1).await;
+    leases.abort();
+    let _ = pending.await;
+    drop(store);
+    engine.set_stop_delay(&bound, Duration::ZERO);
+
+    // The new process cannot verify any stored snapshot.
+    let (desired, _) = watch::channel(None);
+    let (leases, store) = start(&dir, engine.clone(), &desired).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while store.fences().await.unwrap().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the restart fences again"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    for vm in [&bound, &other] {
+        assert_eq!(engine.inspect(vm).await.unwrap().state, VmState::Stopped);
+    }
+    assert_eq!(
+        engine.inspect(&builder).await.unwrap().state,
+        VmState::Running
+    );
+    let fences = store.fences().await.unwrap();
+    assert!(fences[0].complete);
+    assert!(fences[0].vm_ids.contains(&bound));
+    assert!(!fences[0].vm_ids.contains(&builder));
+    leases.abort();
+}
+
+/// Section 5.9: a revoke is answered `ok` only once its fence is recorded. A
+/// fence whose record cannot be written is answered with an error that is not
+/// `fence_failed`, and the lease stays unstartable in this process.
+#[tokio::test]
+async fn a_fence_that_cannot_be_recorded_is_not_answered_ok() {
+    let dir = TargetDir::new("lease-unrecorded");
+    let engine = Arc::new(FakeEngine::new());
+    let snapshot = snapshot_full(
+        1,
+        vec![stateful_vm(
+            "vm_unrecorded",
+            "lse_unrecorded",
+            1,
+            Vec::new(),
+        )],
+        Vec::new(),
+        Vec::new(),
+    );
+    let (desired, _) = watch::channel(Some(snapshot));
+    let (leases, store) = start(&dir, engine.clone(), &desired).await;
+    leases
+        .link
+        .grant(
+            msg("msg_grant"),
+            None,
+            local_grant("lse_unrecorded", "app_unrecorded", 1),
+        )
+        .await
+        .unwrap();
+    let vm = common::running_vm(&engine, "vm_unrecorded", 2).await;
+
+    // The local store stops taking writes.
+    store.pool().close().await;
+    let result = leases
+        .link
+        .revoke(msg("msg_revoke"), None, revoke("lse_unrecorded", 1))
+        .await
+        .unwrap();
+    assert_eq!(result.status, CommandStatus::Error);
+    assert!(result.error.is_none(), "not a failed fence: {result:?}");
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Stopped);
+    assert!(!leases.view.is_failed());
+    // A newer grant does not let the VM start before a fence is recorded.
+    leases
+        .link
+        .grant(
+            msg("msg_regrant"),
+            None,
+            local_grant("lse_unrecorded", "app_unrecorded", 2),
+        )
+        .await
+        .unwrap();
+    assert!(!leases.view.may_start_stateful("lse_unrecorded", 2));
+
+    // The answer is not final: a redelivery fences again.
+    let stops = stops_of(&engine, &vm);
+    let again = leases
+        .link
+        .revoke(msg("msg_revoke"), None, revoke("lse_unrecorded", 2))
+        .await
+        .unwrap();
+    assert_eq!(again.status, CommandStatus::Error);
+    assert!(stops_of(&engine, &vm) > stops);
+    leases.abort();
+}
+
+/// Section 4.2 rule 3 at every session start: the primary revokes again a
+/// lease the node still reports as `revoked`. With its fence recorded, the
+/// revoke is answered `ok` at once and stops nothing, even after a restart
+/// that found no snapshot, so other apps' VMs keep running.
+#[tokio::test]
+async fn a_revoke_of_a_lease_already_fenced_stops_nothing() {
+    let dir = TargetDir::new("lease-refence");
+    let engine = Arc::new(FakeEngine::new());
+    let snapshot = snapshot_full(
+        1,
+        vec![stateful_vm("vm_done", "lse_done", 1, Vec::new())],
+        Vec::new(),
+        Vec::new(),
+    );
+    let (desired, _) = watch::channel(Some(snapshot));
+    let (leases, store) = start(&dir, engine.clone(), &desired).await;
+    leases
+        .link
+        .grant(
+            msg("msg_grant"),
+            None,
+            local_grant("lse_done", "app_done", 1),
+        )
+        .await
+        .unwrap();
+    let vm = common::running_vm(&engine, "vm_done", 2).await;
+    let first = leases
+        .link
+        .revoke(msg("msg_revoke"), None, revoke("lse_done", 1))
+        .await
+        .unwrap();
+    assert_eq!(first.status, CommandStatus::Ok);
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Stopped);
+    leases.abort();
+    drop(store);
+
+    // A restart that cannot verify a snapshot, with another app running.
+    let other = common::running_vm(&engine, "vm_other", 3).await;
+    let stops = engine.stop_calls().len();
+    let (desired, _) = watch::channel(None);
+    let (leases, store) = start(&dir, engine.clone(), &desired).await;
+    assert_eq!(leases.view.state("lse_done"), Some(LeaseState::Revoked));
+    let again = leases
+        .link
+        .revoke(msg("msg_revoke_again"), None, revoke("lse_done", 1))
+        .await
+        .unwrap();
+    assert_eq!(again.status, CommandStatus::Ok);
+    assert_eq!(engine.stop_calls().len(), stops, "nothing was stopped");
+    assert_eq!(
+        engine.inspect(&other).await.unwrap().state,
+        VmState::Running
+    );
+    assert_eq!(store.fences().await.unwrap().len(), 1);
+    assert_eq!(fenced_events(&store).await.len(), 1);
+
+    // A revoke with a higher token is a new ownership change: it fences.
+    let higher = leases
+        .link
+        .revoke(msg("msg_revoke_higher"), None, revoke("lse_done", 2))
+        .await
+        .unwrap();
+    assert_eq!(higher.status, CommandStatus::Ok);
+    assert_eq!(store.fences().await.unwrap().len(), 2);
+    assert_eq!(store.load_highest_tokens().await.unwrap()[0].1, 2);
+    leases.abort();
+}
