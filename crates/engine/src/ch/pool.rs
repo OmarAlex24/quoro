@@ -678,7 +678,10 @@ fn octal(digits: &[u8]) -> Option<u8> {
 
 /// True for a volume file name: `vol_` and not one of its side files.
 fn is_volume_file(name: &str) -> bool {
-    name.starts_with("vol_") && !name.ends_with(".snapshot") && !name.ends_with(".tmp")
+    name.starts_with("vol_")
+        && !name.ends_with(".snapshot")
+        && !name.ends_with(super::warm::STAGING_SUFFIX)
+        && !name.ends_with(".tmp")
 }
 
 /// True when `dir` holds a volume file, which keeps the pool from being
@@ -1050,6 +1053,10 @@ not a mount line
         assert!(is_volume_file("vol_01HX8Z4Q2M9W7T3YV6B1C0D5EF"));
         assert!(!is_volume_file("vol_01HX8Z4Q2M9W7T3YV6B1C0D5EF.snapshot"));
         assert!(!is_volume_file("vol_01HX8Z4Q2M9W7T3YV6B1C0D5EF.tmp"));
+        assert!(!is_volume_file("vol_01HX8Z4Q2M9W7T3YV6B1C0D5EF.staging"));
+        assert!(!is_volume_file(
+            "vol_01HX8Z4Q2M9W7T3YV6B1C0D5EF.19a2b3c4d5e-0.snapshot"
+        ));
         assert!(!is_volume_file("volume-pool.img"));
         assert!(!is_volume_file(".probe-1-source"));
     }

@@ -55,6 +55,13 @@ const SETTLE_AFTER_SHUTDOWN: Duration = Duration::from_secs(3);
 const SETTLE_AFTER_SIGKILL: Duration = Duration::from_secs(5);
 /// How long `delete` waits for the exit before it gives up.
 const SETTLE_AFTER_DELETE_SHUTDOWN: Duration = Duration::from_secs(5);
+/// How long one `vm.info`, `vm.pause` or `vm.resume` of a switchover freeze
+/// may take (§3.22); a VMM that does not answer is a failed freeze.
+const PAUSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a graceful stop waits for the VMM to say whether the VM is
+/// paused before it asks the guest to stop anyway. A fence's graceful step
+/// is bounded by `T_grace`, so the probe stays a small part of it.
+const PAUSED_PROBE_TIMEOUT: Duration = Duration::from_millis(200);
 // The pieces of a forced stop add up to its documented bound.
 const _: () = assert!(
     SHUTDOWN_TIMEOUT.as_secs() + SETTLE_AFTER_SHUTDOWN.as_secs() + SETTLE_AFTER_SIGKILL.as_secs()
@@ -96,7 +103,7 @@ pub(super) struct Inner {
     /// them. Two VMs may never name the same work-disk path at once (§3.6).
     /// Volume files are reserved in the same map, so a volume and a work disk,
     /// or two creates of one volume, can never share a path.
-    pub(super) inflight_disks: StdMutex<HashMap<PathBuf, VmId>>,
+    pub(super) inflight_disks: Arc<StdMutex<HashMap<PathBuf, VmId>>>,
     /// How `snapshot_volume` takes a snapshot on this node, probed once at
     /// start-up in the volume directory or inside the pool (§3.16, ADR 0156).
     pub(super) volume_method: SnapshotMethod,
@@ -306,7 +313,7 @@ impl Inner {
             subscribers: StdMutex::new(Subscriptions::default()),
             vms: StdMutex::new(HashMap::new()),
             inflight_peers: StdMutex::new(HashMap::new()),
-            inflight_disks: StdMutex::new(HashMap::new()),
+            inflight_disks: Arc::new(StdMutex::new(HashMap::new())),
             volume_method,
             pool,
             pool_grow: Mutex::new(()),
@@ -862,8 +869,12 @@ impl Inner {
         entry.set_phase(Phase::Stopping);
         state::touch_marker(&entry.paths.stop_requested)?;
         let api = ApiClient::new(&entry.paths.api_socket);
+        // A paused guest cannot answer the power button, so a graceful stop
+        // of a paused VM goes straight to the shutdown instead of waiting out
+        // its timeout (§3.22).
         if entry.booted.load(Ordering::SeqCst)
             && let StopMode::Graceful { timeout } = mode
+            && !is_paused(&entry.paths.api_socket).await
         {
             let asked = api.power_button().await.is_ok();
             if asked && wait_settled(&entry, timeout).await {
@@ -884,6 +895,59 @@ impl Inner {
         }
         entry.set_phase(Phase::Idle);
         self.inspect(id).await
+    }
+
+    /// Freezes a running VM's vCPUs (§3.22). Pausing a paused VM is `Ok`.
+    pub(super) async fn pause(&self, id: &VmId) -> Result<(), EngineError> {
+        self.set_paused(id, true).await
+    }
+
+    /// Lets a paused VM run again (§3.22). Resuming a running VM is `Ok`.
+    pub(super) async fn resume(&self, id: &VmId) -> Result<(), EngineError> {
+        self.set_paused(id, false).await
+    }
+
+    /// `vm.pause` or `vm.resume` as the VMM's state needs (§3.22).
+    ///
+    /// The VM's operation lock is held, so a pause never races a start, a
+    /// stop or a delete of the same VM (§4). A VM that is not running or
+    /// paused is `Conflict`; the VMM reports `Paused` and the engine keeps
+    /// reporting `Running` for it (§3.10).
+    async fn set_paused(&self, id: &VmId, pause: bool) -> Result<(), EngineError> {
+        let Some(entry) = self.entry(id) else {
+            return Err(EngineError::NotFound);
+        };
+        let _op = entry.op.lock().await;
+        if !entry.paths.dir.exists() {
+            return Err(EngineError::NotFound);
+        }
+        let not_running = || EngineError::Conflict(format!("VM {} is not running", id.0));
+        if entry.live_vmm().is_none() || !entry.booted.load(Ordering::SeqCst) {
+            return Err(not_running());
+        }
+        let api = ApiClient::new(&entry.paths.api_socket).with_timeout(PAUSE_TIMEOUT);
+        let document = api.info().await.map_err(|err| {
+            EngineError::Hypervisor(format!(
+                "cloud-hypervisor did not report VM {}: {err}",
+                id.0
+            ))
+        })?;
+        match (document.get("state").and_then(Value::as_str), pause) {
+            (Some("Running"), true) => api.pause().await.map_err(|err| {
+                EngineError::Hypervisor(format!(
+                    "cloud-hypervisor did not pause VM {}: {err}",
+                    id.0
+                ))
+            }),
+            (Some("Paused"), false) => api.resume().await.map_err(|err| {
+                EngineError::Hypervisor(format!(
+                    "cloud-hypervisor did not resume VM {}: {err}",
+                    id.0
+                ))
+            }),
+            (Some("Paused"), true) | (Some("Running"), false) => Ok(()),
+            _ => Err(not_running()),
+        }
     }
 
     /// Removes a stopped VM, its disks and its runtime directory (§3.9).
@@ -1801,6 +1865,16 @@ async fn wait_settled(entry: &VmEntry, timeout: Duration) -> bool {
         tokio::time::timeout(timeout, settled.wait_for(|value| *value > current)).await,
         Ok(Ok(_))
     )
+}
+
+/// True when the VMM reports the VM `Paused` (§3.22). An unanswered probe
+/// reads as not paused, so the stop asks the guest as before.
+async fn is_paused(socket: &Path) -> bool {
+    ApiClient::new(socket)
+        .with_timeout(PAUSED_PROBE_TIMEOUT)
+        .info()
+        .await
+        .is_ok_and(|document| document.get("state").and_then(Value::as_str) == Some("Paused"))
 }
 
 /// Locks a `std` mutex, taking the value even when an earlier holder panicked:

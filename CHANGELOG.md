@@ -6,6 +6,10 @@ Each entry links the pull request that made the change and, where one exists, th
 
 ## [Unreleased]
 
+### Added
+
+- **Warm volume calls in the engine.** The engine trait gains the calls warm replication is built on: `volume_changed_ranges` compares the extent maps of two reflink snapshots of a volume and returns only the byte ranges that differ (a full copy when there is no base or the maps cannot be compared), `stage_volume`, `commit_staged_volume` and `discard_staged_volume` build a volume's next copy beside the last good one and swap it in with one rename, and `pause` and `resume` freeze a running VM. A volume can now keep several snapshots, each in its own file. Nothing calls these yet; replication between nodes comes next ([#389], [#390], [ADR 0172], [ADR 0173]).
+
 ### Fixed
 
 - After a restore moved an app to another node, the old node recreated the app's VM, stopped and without its volume, and kept it with its Cloud Hypervisor process until the node agent restarted. The old node now deletes the VM as soon as the restore is accepted, and keeps only the detached volume's file ([#361]).
@@ -375,6 +379,8 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#381]: https://github.com/OmarAlex24/quoro/pull/381
 [#385]: https://github.com/OmarAlex24/quoro/pull/385
 [#388]: https://github.com/OmarAlex24/quoro/pull/388
+[#389]: https://github.com/OmarAlex24/quoro/issues/389
+[#390]: https://github.com/OmarAlex24/quoro/issues/390
 [#397]: https://github.com/OmarAlex24/quoro/pull/397
 [#398]: https://github.com/OmarAlex24/quoro/pull/398
 [#401]: https://github.com/OmarAlex24/quoro/pull/401
@@ -445,4 +451,6 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [ADR 0161]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0161-m5a-quoro-component-findings-match-crates-crates-io-guest.md
 [ADR 0162]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0162-evaluate-linux-kernel-osv-ranges-per-stable-series-when-a.md
 [ADR 0163]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0163-inventory-images-prepared-before-m5a-from-their-cached-root.md
+[ADR 0172]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0172-warm-snapshot-primitive-keep-the-reflink-snapshots-of-d.md
+[ADR 0173]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0173-warm-replication-path-the-source-node-ships-changed-ranges.md
 [ADR 0186]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0186-add-287-old-node-recreates-a-moved-app-s-vm-and-240.md

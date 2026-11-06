@@ -20,6 +20,7 @@ use std::io::Write as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use rustix::fs::SeekFrom;
@@ -43,8 +44,14 @@ pub(super) const METADATA_MARGIN: u64 = 64 * 1024 * 1024;
 /// count low, small enough that a resume never waits on one huge call.
 const COPY_CHUNK: u64 = 4 * 1024 * 1024;
 
-/// The suffix of the one snapshot file a volume may have (contract §3.16).
-const SNAPSHOT_SUFFIX: &str = ".snapshot";
+/// The suffix of every snapshot file (contract §3.16). From M5b a volume may
+/// have several, `<volume id>.<unique part>.snapshot`; M5a named its one
+/// snapshot `<volume id>.snapshot`.
+pub(super) const SNAPSHOT_SUFFIX: &str = ".snapshot";
+
+/// Snapshots taken by this process, so two in one millisecond get different
+/// names (§3.16).
+static SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The directory that holds every volume file.
 pub(super) fn volume_dir(inner: &Inner) -> PathBuf {
@@ -56,9 +63,25 @@ pub(super) fn volume_path(dir: &Path, id: &VolumeId) -> PathBuf {
     dir.join(&id.0)
 }
 
-/// The snapshot file of one volume, `<volume_dir>/<volume id>.snapshot`.
-pub(super) fn snapshot_path(dir: &Path, id: &VolumeId) -> PathBuf {
+/// The one snapshot file M5a gave a volume, `<volume_dir>/<volume id>.snapshot`.
+pub(super) fn legacy_snapshot_path(dir: &Path, id: &VolumeId) -> PathBuf {
     dir.join(format!("{}{SNAPSHOT_SUFFIX}", id.0))
+}
+
+/// A new snapshot file name for one volume that no file in `dir` has:
+/// `<volume id>.<milliseconds since the epoch, hex>-<counter, hex>.snapshot`.
+/// The time keeps names apart across restarts; the counter within one.
+pub(super) fn new_snapshot_path(dir: &Path, id: &VolumeId) -> PathBuf {
+    let millis = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis());
+    loop {
+        let count = SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("{}.{millis:x}-{count:x}{SNAPSHOT_SUFFIX}", id.0));
+        if !path.exists() {
+            return path;
+        }
+    }
 }
 
 /// `vol_` followed by 26 Crockford base32 characters (the ULID alphabet).
@@ -164,9 +187,16 @@ fn probe_clone(source: &Path, clone: &Path) -> std::io::Result<()> {
     rustix::fs::ioctl_ficlone(&dst, &src).map_err(std::io::Error::from)
 }
 
-/// Removes the snapshot and temporary files a crash left in the volume
-/// directory (§3.16: snapshots left by a crash are removed at start). Volume
-/// files themselves are never touched.
+/// Removes the snapshot, staging and temporary files a crash left in the
+/// volume directory (§3.16: snapshots left by a crash are removed at start;
+/// §3.22: so are staging files). Volume files themselves are never touched.
+///
+/// Every snapshot is removed because, so far, no snapshot outlives the node
+/// agent run that took it: a backup deletes its own. §3.16 lets the node
+/// agent keep the snapshots its store records from M5b (a warm base, the
+/// snapshot being shipped, a quarantined copy); the change that first keeps
+/// one across a restart must hand this sweep that keep set, or move it into
+/// the node agent.
 pub(super) fn remove_leftovers(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -176,7 +206,10 @@ pub(super) fn remove_leftovers(dir: &Path) {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if name.ends_with(SNAPSHOT_SUFFIX) || name.ends_with(".tmp") {
+        if name.ends_with(SNAPSHOT_SUFFIX)
+            || name.ends_with(super::warm::STAGING_SUFFIX)
+            || name.ends_with(".tmp")
+        {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -189,7 +222,11 @@ pub(super) fn available_bytes(dir: &Path) -> Result<u64, EngineError> {
 }
 
 /// The [`VolumeInfo`] of the file at `path`.
-fn volume_info(id: &VolumeId, size_gb: u32, path: PathBuf) -> Result<VolumeInfo, EngineError> {
+pub(super) fn volume_info(
+    id: &VolumeId,
+    size_gb: u32,
+    path: PathBuf,
+) -> Result<VolumeInfo, EngineError> {
     let metadata = std::fs::metadata(&path).map_err(|err| io_error(&path, &err))?;
     Ok(VolumeInfo {
         volume_id: id.clone(),
@@ -200,7 +237,7 @@ fn volume_info(id: &VolumeId, size_gb: u32, path: PathBuf) -> Result<VolumeInfo,
 }
 
 /// Clones `source` into a new `clone` with `FICLONE` (contract §3.16).
-fn reflink(source: &Path, clone: &Path) -> Result<(), EngineError> {
+pub(super) fn reflink(source: &Path, clone: &Path) -> Result<(), EngineError> {
     let src = File::open(source).map_err(|err| io_error(source, &err))?;
     let dst = OpenOptions::new()
         .write(true)
@@ -212,7 +249,11 @@ fn reflink(source: &Path, clone: &Path) -> Result<(), EngineError> {
         let _ = std::fs::remove_file(clone);
         return Err(io_error(source, &err.into()));
     }
-    rustix::fs::fsync(&dst).map_err(|err| io_error(clone, &err.into()))?;
+    if let Err(err) = rustix::fs::fsync(&dst) {
+        drop(dst);
+        let _ = std::fs::remove_file(clone);
+        return Err(io_error(clone, &err.into()));
+    }
     Ok(())
 }
 
@@ -336,7 +377,7 @@ fn import_by_copy(from: &Path, temp: &Path, path: &Path) -> Result<(), EngineErr
 }
 
 /// fsyncs the temporary file before the rename that publishes it.
-fn sync_file(path: &Path) -> Result<(), EngineError> {
+pub(super) fn sync_file(path: &Path) -> Result<(), EngineError> {
     let file = File::open(path).map_err(|err| io_error(path, &err))?;
     file.sync_all().map_err(|err| io_error(path, &err))
 }
@@ -369,7 +410,7 @@ impl Inner {
 
     /// The filesystem whose free space bounds new volume data (§3.16): the
     /// host's when the pool holds the data, the volume directory otherwise.
-    fn space_dir(&self) -> PathBuf {
+    pub(super) fn space_dir(&self) -> PathBuf {
         match &self.pool {
             VolumePool::Mounted { .. } => self.config.state_dir.clone(),
             VolumePool::Absent | VolumePool::Broken { .. } => self.volumes_dir(),
@@ -628,21 +669,11 @@ impl Inner {
         self.volume_pool_error()?;
         let dir = self.volumes_dir();
         let path = volume_path(&dir, id);
-        for (vm_id, entry) in self.entries() {
-            let Some(record) = entry.spec() else {
-                continue;
-            };
-            if record
-                .spec
-                .volumes
-                .iter()
-                .any(|volume| volume.volume_id == id.0)
-            {
-                return Err(EngineError::Conflict(format!(
-                    "volume {} is attached to VM {}",
-                    id.0, vm_id.0
-                )));
-            }
+        if let Some(vm_id) = self.vm_attaching(id) {
+            return Err(EngineError::Conflict(format!(
+                "volume {} is attached to VM {}",
+                id.0, vm_id.0
+            )));
         }
         if let Some(owner) = lock(&self.inflight_disks).get(&path) {
             return Err(EngineError::Conflict(format!(
@@ -655,16 +686,25 @@ impl Inner {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(io_error(&path, &err)),
         }
-        let snapshot = snapshot_path(&dir, id);
-        if let Err(err) = std::fs::remove_file(&snapshot)
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(io_error(&snapshot, &err));
+        // M5a's single snapshot name and a staging file only: from M5b the
+        // node agent deletes the snapshots it took, and keeps some on purpose
+        // (a warm base, a quarantined copy), so no pattern of snapshot names
+        // is removed here (§3.16). A staging file belongs to the volume alone.
+        for leftover in [
+            legacy_snapshot_path(&dir, id),
+            super::warm::staging_path(&dir, id),
+        ] {
+            if let Err(err) = std::fs::remove_file(&leftover)
+                && err.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(io_error(&leftover, &err));
+            }
         }
         Ok(())
     }
 
-    /// Takes the one snapshot a volume may have (§3.16, ADR 0146).
+    /// Takes a snapshot of one volume (§3.16, ADR 0146). From M5b a volume may
+    /// have several at once, each with its own file name.
     ///
     /// `Reflink` clones the file. `PauseCopy` pauses the VM that attaches the
     /// volume when it is running, copies the sparse file and always resumes the
@@ -690,13 +730,7 @@ impl Inner {
             }
             Err(err) => return Err(io_error(&path, &err)),
         };
-        let location = snapshot_path(&dir, id);
-        if location.exists() {
-            return Err(EngineError::Conflict(format!(
-                "volume {} already has a snapshot",
-                id.0
-            )));
-        }
+        let location = new_snapshot_path(&dir, id);
 
         let length = metadata.len();
         let allocated = metadata.blocks().saturating_mul(512);
@@ -761,9 +795,13 @@ impl Inner {
             }
         }
 
+        let snapshot_id = location
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
         Ok(VolumeSnapshot {
             volume_id: id.clone(),
-            snapshot_id: format!("{}{SNAPSHOT_SUFFIX}", id.0),
+            snapshot_id,
             created_at: SystemTime::now(),
             size_bytes: length,
             location,
@@ -778,18 +816,9 @@ impl Inner {
         snapshot: &VolumeSnapshot,
     ) -> Result<(), EngineError> {
         self.volume_pool_error()?;
-        let dir = self.volumes_dir();
-        let is_snapshot_file = snapshot
-            .location
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with(SNAPSHOT_SUFFIX));
-        if snapshot.location.parent() != Some(dir.as_path()) || !is_snapshot_file {
-            return Err(EngineError::Conflict(format!(
-                "snapshot {} is not inside the volume directory",
-                snapshot.location.display()
-            )));
-        }
+        // With several snapshots per volume, a record that names another
+        // volume's file must not delete it (§3.16).
+        super::warm::check_snapshot_file(&self.volumes_dir(), snapshot)?;
         match std::fs::remove_file(&snapshot.location) {
             Ok(()) => state::sync_dir(&snapshot.location),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -829,8 +858,9 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        copy_sparse, import_by_copy, is_crockford, is_volume_serial, probe_method,
-        remove_leftovers, snapshot_path, validate_volume_attaches, validate_volume_id, volume_path,
+        copy_sparse, import_by_copy, is_crockford, is_volume_serial, legacy_snapshot_path,
+        new_snapshot_path, probe_method, remove_leftovers, validate_volume_attaches,
+        validate_volume_id, volume_path,
     };
     use crate::{
         EngineError, ImageDigest, InitConfig, MacAddr, NetAttach, SerialMode, SnapshotMethod, VmId,
@@ -962,9 +992,32 @@ mod tests {
             PathBuf::from("/var/lib/quoro/volumes/vol_01HX8Z4Q2M9W7T3YV6B1C0D5EF")
         );
         assert_eq!(
-            snapshot_path(dir, &id),
+            legacy_snapshot_path(dir, &id),
             PathBuf::from("/var/lib/quoro/volumes/vol_01HX8Z4Q2M9W7T3YV6B1C0D5EF.snapshot")
         );
+    }
+
+    #[test]
+    fn every_new_snapshot_of_a_volume_gets_its_own_name() {
+        let dir = scratch_dir("names");
+        let id = volume_id("vol_01HX8Z4Q2M9W7T3YV6B1C0D5EF");
+        let first = new_snapshot_path(&dir, &id);
+        std::fs::write(&first, b"x").expect("file");
+        let second = new_snapshot_path(&dir, &id);
+        assert_ne!(first, second);
+        for path in [&first, &second] {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("name");
+            assert!(
+                name.starts_with("vol_01HX8Z4Q2M9W7T3YV6B1C0D5EF."),
+                "{name}"
+            );
+            assert!(name.ends_with(".snapshot"), "{name}");
+            assert_eq!(path.parent(), Some(dir.as_path()));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1101,17 +1154,20 @@ mod tests {
     fn leftovers_are_removed_and_volumes_are_kept() {
         let dir = scratch_dir("leftovers");
         let id = "vol_01JC9ZC2D3E4F5G6H7J8K9M0NP";
-        for name in [
-            id.to_string(),
+        let leftovers = [
             format!("{id}.snapshot"),
+            format!("{id}.19a2b3c4d5e-3.snapshot"),
+            format!("{id}.staging"),
             format!("{id}.tmp"),
-        ] {
+        ];
+        for name in std::iter::once(id.to_string()).chain(leftovers.iter().cloned()) {
             std::fs::write(dir.join(&name), b"x").expect("file");
         }
         remove_leftovers(&dir);
         assert!(dir.join(id).exists(), "the volume file stays");
-        assert!(!dir.join(format!("{id}.snapshot")).exists());
-        assert!(!dir.join(format!("{id}.tmp")).exists());
+        for name in &leftovers {
+            assert!(!dir.join(name).exists(), "{name} is removed");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
