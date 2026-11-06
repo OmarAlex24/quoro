@@ -9,9 +9,9 @@
 //! send no `lease_renew`, so the timer half of [`crate::lease::LeaseAgent`] is
 //! not needed here.
 //!
-//! A revoke is handled completely, including its fence, before its answer is
-//! returned, so the session answers it before it processes the next message
-//! (section 4.2 rule 3).
+//! A revoke reaches the service as soon as the session reads it, and is
+//! answered once its fence is recorded; the session holds back what may not
+//! pass a running fence meanwhile (section 5.13, ADR 0222).
 //!
 //! Fences run concurrently (section 8.5 "Concurrency", D-0075): each one is a
 //! task of its own, so the service keeps taking grants and revokes for other
@@ -47,6 +47,7 @@
 //! that transaction committed.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::SystemTime;
@@ -286,20 +287,35 @@ impl LeaseLink {
         re: Option<MsgId>,
         body: LeaseRevoke,
     ) -> Result<CommandResult, ProtocolError> {
+        self.begin_revoke(id, re, body).await
+    }
+
+    /// [`Self::revoke`], with the revoke handed to the service before this
+    /// returns: the lease is `revoked` and its fence under way whether or
+    /// not the returned answer is ever awaited (section 5.13: on receipt the
+    /// node starts nothing more for the lease).
+    pub fn begin_revoke(
+        &self,
+        id: MsgId,
+        re: Option<MsgId>,
+        body: LeaseRevoke,
+    ) -> impl Future<Output = Result<CommandResult, ProtocolError>> + Send + 'static {
         let (reply, answer) = oneshot::channel();
-        if self
+        let sent = self
             .commands
             .send(LeaseCommand::Revoke {
                 envelope: Envelope { id, re, body },
                 reply,
             })
-            .is_err()
-        {
-            return Ok(not_fenced("the lease service is not running"));
+            .is_ok();
+        async move {
+            if !sent {
+                return Ok(not_fenced("the lease service is not running"));
+            }
+            answer
+                .await
+                .unwrap_or_else(|_| Ok(not_fenced("the lease service stopped")))
         }
-        answer
-            .await
-            .unwrap_or_else(|_| Ok(not_fenced("the lease service stopped")))
     }
 }
 
