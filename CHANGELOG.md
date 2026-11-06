@@ -26,6 +26,7 @@ Each entry links the pull request that made the change and, where one exists, th
 - After a primary restart, the desired state could name a new digest for an app instance that was already running: the primary resolved the image tag again with an empty cache, and if the tag had moved, it asked the node for a digest no instance runs. The node refused the change, as a VM's digest is fixed when it is created, and logged the same warning on every pass. An instance now keeps the digest its deployment recorded when it was created; only a new deployment resolves the tag again. The node logs the refusal once per VM and digest ([#403]).
 - A terminal opened on a VM that was still booting was refused with "the VM's init does not accept exec sessions; restart the VM", although the VM only needed a few more seconds: its init accepts terminals once it has mounted the volumes and set up the network. The message now says the VM may still be starting, and that only a VM which has been running for a while needs a restart. The engine's KVM test suite now waits for the guest before its first command, and its teardown removes both of the bridge's firewall tables instead of only one ([#418]).
 - Deleting an app deleted its volume records at once, so the node was never told and the volume files stayed on its disk until an operator removed them. Every volume of the deleted app now stays `deleting`, readable with `getVolume`, until its node removes the file and reports it, and its node is told even when it keeps only a detached volume. The holder of the app's lease now also receives the `lease_revoke` with reason `deleted` that deleting the app was meant to send ([#420], [ADR 0165]).
+- Every domain stayed `pending` in the API and the panel, even while its hostname was served: nothing computed a domain's serving status. The primary now recomputes it whenever an app's instances, its replicas, a domain, a tunnel mapping or the edge change, and at least every 30 s. A domain is `serving` when a machine serves its hostname, `unserved` with the reason in `last_error` when its app has an instance meant to run but no machine can serve it (for example a `tunnel` hostname of a one-replica app whose node has no tunnel), and `pending` while its app runs no instance. Becoming `unserved` emits `domain.unserved`, and being served again emits `domain.served`; a `tunnel` domain no tunnel serves is no longer reported as `certificate.failed`. The app's Domains card shows the serving status and the reason ([#422], [ADR 0167]).
 
 ## [v0.2.0] - 2026-11-05
 
@@ -390,6 +391,7 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#403]: https://github.com/OmarAlex24/quoro/pull/403
 [#418]: https://github.com/OmarAlex24/quoro/issues/418
 [#420]: https://github.com/OmarAlex24/quoro/pull/420
+[#422]: https://github.com/OmarAlex24/quoro/pull/422
 [ADR 0019]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0019-fencing-is-mandatory-and-lease-based-node-agent-self-fences.md
 [ADR 0020]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0020-per-app-ha-policies-none-cold-warm-hot-with-cost-shown-in.md
 [ADR 0027]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0027-signed-binaries-and-reproducible-builds-are-mandatory.md
@@ -458,6 +460,7 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [ADR 0162]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0162-evaluate-linux-kernel-osv-ranges-per-stable-series-when-a.md
 [ADR 0163]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0163-inventory-images-prepared-before-m5a-from-their-cached-root.md
 [ADR 0165]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0165-deleteapp-turns-the-app-s-volumes-into-deleting-so-the-node.md
+[ADR 0167]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0167-per-domain-serving-status-and-last-error-so-a-tunnel-domain.md
 [ADR 0172]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0172-warm-snapshot-primitive-keep-the-reflink-snapshots-of-d.md
 [ADR 0173]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0173-warm-replication-path-the-source-node-ships-changed-ranges.md
 [ADR 0186]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0186-add-287-old-node-recreates-a-moved-app-s-vm-and-240.md
