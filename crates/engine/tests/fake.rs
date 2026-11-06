@@ -6,9 +6,9 @@ mod common;
 use std::time::Duration;
 
 use quoro_engine::{
-    Engine, EngineError, EngineEvent, FakeEngine, FakeOp, ImageDigest, NodeNetwork, OciLayout,
-    OutputStream, SnapshotMethod, StopMode, VmCounters, VmId, VmState, VolumeAttach, VolumeId,
-    WorkDisk,
+    ByteRange, ChangedRanges, Engine, EngineError, EngineEvent, FakeEngine, FakeOp, FakeRanges,
+    ImageDigest, NodeNetwork, OciLayout, OutputStream, RangesOf, SnapshotMethod, StageFrom,
+    StopMode, VmCounters, VmId, VmState, VolumeAttach, VolumeId, WorkDisk,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -445,16 +445,20 @@ async fn volume_snapshots_are_recorded_and_deleted() {
     assert_eq!(snapshot.location.to_string_lossy(), "/fake/snapshots/1");
     assert_eq!(snapshot.method, SnapshotMethod::Reflink);
     assert_eq!(snapshot.pause, Duration::ZERO);
-    assert!(
-        matches!(
-            engine.snapshot_volume(&volume).await,
-            Err(EngineError::Conflict(_))
-        ),
-        "one snapshot per volume at a time"
-    );
+    // From M5b a volume may have several snapshots at once (section 3.16).
+    let second = engine
+        .snapshot_volume(&volume)
+        .await
+        .expect("a second snapshot succeeds");
+    assert_ne!(second.snapshot_id, snapshot.snapshot_id);
+    assert_eq!(engine.volume_snapshots().len(), 2);
 
     engine
         .delete_volume_snapshot(&snapshot)
+        .await
+        .expect("delete succeeds");
+    engine
+        .delete_volume_snapshot(&second)
         .await
         .expect("delete succeeds");
     engine
@@ -880,4 +884,437 @@ async fn create_refuses_egress_only_with_an_isolation_group() {
         .create(&spec)
         .await
         .expect("egress only without a group is valid");
+}
+
+/// A scratch directory under the crate's `target`, emptied first.
+fn scratch(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::current_dir()
+        .expect("cwd")
+        .join("target")
+        .join(format!("fake-warm-{tag}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    dir
+}
+
+/// A VM spec that attaches `volume` on `quoro-vol-0`.
+async fn vm_with_volume(engine: &FakeEngine, volume: &VolumeId, name: &str) -> VmId {
+    let prepared = engine
+        .prepare_image(&common::image_ref())
+        .await
+        .expect("image");
+    let mut spec = common::sample_spec(&prepared.digest, name);
+    spec.volumes = vec![VolumeAttach {
+        volume_id: volume.clone(),
+        mount_path: "/data".to_string(),
+        serial: "quoro-vol-0".to_string(),
+    }];
+    engine.create(&spec).await.expect("create");
+    spec.id
+}
+
+#[tokio::test]
+async fn changed_ranges_default_to_the_whole_volume() {
+    let engine = FakeEngine::new();
+    let volume = VolumeId("vol_01".to_string());
+    assert_eq!(
+        engine
+            .volume_changed_ranges(&RangesOf::Volume(volume.clone()), None)
+            .await,
+        Err(EngineError::NotFound),
+        "an unknown volume"
+    );
+    engine.ensure_volume(&volume, 2).await.expect("volume");
+    let base = engine.snapshot_volume(&volume).await.expect("base");
+    let next = engine.snapshot_volume(&volume).await.expect("next");
+    let ranges = engine
+        .volume_changed_ranges(&RangesOf::Snapshot(next.clone()), Some(&base))
+        .await
+        .expect("ranges");
+    assert_eq!(
+        ranges,
+        ChangedRanges {
+            ranges: vec![ByteRange {
+                offset: 0,
+                length: 2 << 30,
+            }],
+            full: true,
+            extent_count: 1,
+        }
+    );
+
+    let pushed = ChangedRanges {
+        ranges: vec![ByteRange {
+            offset: 4096,
+            length: 8192,
+        }],
+        full: false,
+        extent_count: 7,
+    };
+    engine.push_changed_ranges(pushed.clone());
+    assert_eq!(
+        engine
+            .volume_changed_ranges(&RangesOf::Snapshot(next.clone()), Some(&base))
+            .await,
+        Ok(pushed),
+        "a pushed result is returned once"
+    );
+    assert!(
+        engine
+            .volume_changed_ranges(&RangesOf::Snapshot(next.clone()), Some(&base))
+            .await
+            .expect("ranges")
+            .full
+    );
+
+    engine.fail_next(FakeOp::VolumeChangedRanges, EngineError::Timeout);
+    assert_eq!(
+        engine
+            .volume_changed_ranges(&RangesOf::Snapshot(next.clone()), None)
+            .await,
+        Err(EngineError::Timeout)
+    );
+
+    engine.delete_volume_snapshot(&base).await.expect("delete");
+    assert_eq!(
+        engine
+            .volume_changed_ranges(&RangesOf::Snapshot(next.clone()), Some(&base))
+            .await,
+        Err(EngineError::NotFound),
+        "a deleted base"
+    );
+}
+
+#[tokio::test]
+async fn changed_ranges_refuse_a_foreign_base_and_an_attached_volume() {
+    let engine = FakeEngine::new();
+    let volume = VolumeId("vol_01".to_string());
+    let other = VolumeId("vol_02".to_string());
+    engine.ensure_volume(&volume, 1).await.expect("volume");
+    engine.ensure_volume(&other, 1).await.expect("volume");
+    let foreign = engine.snapshot_volume(&other).await.expect("snapshot");
+    assert!(matches!(
+        engine
+            .volume_changed_ranges(&RangesOf::Volume(volume.clone()), Some(&foreign))
+            .await,
+        Err(EngineError::Conflict(_))
+    ));
+
+    vm_with_volume(&engine, &volume, "vm_warm").await;
+    assert!(
+        matches!(
+            engine
+                .volume_changed_ranges(&RangesOf::Volume(volume.clone()), None)
+                .await,
+            Err(EngineError::Conflict(_))
+        ),
+        "a VM that exists attaches the live file"
+    );
+}
+
+#[tokio::test]
+async fn content_mode_reports_the_blocks_that_differ() {
+    let dir = scratch("content");
+    let engine = FakeEngine::new();
+    engine.set_volume_dir(&dir);
+    engine.set_changed_ranges_mode(FakeRanges::Content);
+    let volume = VolumeId("vol_01".to_string());
+    let info = engine.ensure_volume(&volume, 1).await.expect("volume");
+    let base = engine.snapshot_volume(&volume).await.expect("base");
+
+    write_at(&info.path, 10, b"x");
+    write_at(&info.path, 3 * 4096 + 5, b"yy");
+    write_at(&info.path, 4 * 4096, b"z");
+    write_at(&info.path, (1 << 30) - 1, b"!");
+    let next = engine.snapshot_volume(&volume).await.expect("next");
+    let ranges = engine
+        .volume_changed_ranges(&RangesOf::Snapshot(next.clone()), Some(&base))
+        .await
+        .expect("ranges");
+    assert!(!ranges.full);
+    assert_eq!(
+        ranges.ranges,
+        vec![
+            ByteRange {
+                offset: 0,
+                length: 4096,
+            },
+            ByteRange {
+                offset: 3 * 4096,
+                length: 2 * 4096,
+            },
+            ByteRange {
+                offset: (1 << 30) - 4096,
+                length: 4096,
+            },
+        ]
+    );
+    assert!(
+        engine
+            .volume_changed_ranges(&RangesOf::Snapshot(next), None)
+            .await
+            .expect("ranges")
+            .full,
+        "no base: the whole volume"
+    );
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+/// Writes `bytes` at `offset` into `path` without truncating it.
+fn write_at(path: &std::path::Path, offset: u64, bytes: &[u8]) {
+    use std::io::{Seek as _, SeekFrom, Write as _};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open");
+    file.seek(SeekFrom::Start(offset)).expect("seek");
+    file.write_all(bytes).expect("write");
+}
+
+#[tokio::test]
+async fn a_staged_copy_replaces_the_volume_only_when_committed() {
+    let dir = scratch("stage");
+    let engine = FakeEngine::new();
+    engine.set_volume_dir(&dir);
+    let volume = VolumeId("vol_01".to_string());
+
+    // A first copy on a target: no volume file yet, an empty staging file.
+    let staged = engine
+        .stage_volume(&volume, 1, &StageFrom::Empty)
+        .await
+        .expect("stage");
+    assert_eq!(staged.size_bytes, 1 << 30);
+    assert_eq!(
+        std::fs::metadata(&staged.location)
+            .expect("staging file")
+            .len(),
+        1 << 30
+    );
+    assert!(
+        matches!(
+            engine.stage_volume(&volume, 1, &StageFrom::Empty).await,
+            Err(EngineError::Conflict(_))
+        ),
+        "one staging file per volume"
+    );
+    write_at(&staged.location, 0, b"first copy");
+    assert!(
+        engine.volumes().is_empty(),
+        "nothing is a volume before the commit"
+    );
+    let info = engine.commit_staged_volume(&staged).await.expect("commit");
+    assert_eq!(info.path, dir.join("vol_01"));
+    assert!(!staged.location.exists());
+    assert_eq!(engine.volumes(), vec![(volume.clone(), 1)]);
+    assert!(engine.staged_volumes().is_empty());
+    assert_eq!(
+        &std::fs::read(&info.path).expect("read")[..10],
+        b"first copy"
+    );
+
+    // The next copy clones the volume; a discarded one leaves it unchanged.
+    let staged = engine
+        .stage_volume(&volume, 1, &StageFrom::Volume)
+        .await
+        .expect("stage");
+    assert_eq!(
+        &std::fs::read(&staged.location).expect("read")[..10],
+        b"first copy"
+    );
+    write_at(&staged.location, 0, b"half");
+    engine
+        .discard_staged_volume(&staged)
+        .await
+        .expect("discard");
+    assert!(!staged.location.exists());
+    engine
+        .discard_staged_volume(&staged)
+        .await
+        .expect("discarding twice is Ok");
+    assert_eq!(
+        &std::fs::read(&info.path).expect("read")[..10],
+        b"first copy"
+    );
+    assert_eq!(
+        engine.commit_staged_volume(&staged).await,
+        Err(EngineError::NotFound),
+        "a discarded staging file cannot be committed"
+    );
+
+    // A clone of a snapshot of the volume.
+    let snapshot = engine.snapshot_volume(&volume).await.expect("snapshot");
+    write_at(&info.path, 0, b"live write");
+    let staged = engine
+        .stage_volume(&volume, 1, &StageFrom::Snapshot(snapshot.clone()))
+        .await
+        .expect("stage");
+    assert_eq!(
+        &std::fs::read(&staged.location).expect("read")[..10],
+        b"first copy"
+    );
+    engine
+        .discard_staged_volume(&staged)
+        .await
+        .expect("discard");
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+#[tokio::test]
+async fn staging_checks_its_source_and_the_commit_refuses_an_attached_volume() {
+    let engine = FakeEngine::new();
+    let volume = VolumeId("vol_01".to_string());
+    let other = VolumeId("vol_02".to_string());
+    assert_eq!(
+        engine.stage_volume(&volume, 1, &StageFrom::Volume).await,
+        Err(EngineError::NotFound),
+        "no volume file to clone"
+    );
+    engine.ensure_volume(&volume, 1).await.expect("volume");
+    engine.ensure_volume(&other, 1).await.expect("volume");
+    assert!(
+        matches!(
+            engine.stage_volume(&volume, 2, &StageFrom::Volume).await,
+            Err(EngineError::Conflict(_))
+        ),
+        "a clone of a file of another size"
+    );
+    let foreign = engine.snapshot_volume(&other).await.expect("snapshot");
+    assert!(matches!(
+        engine
+            .stage_volume(&volume, 1, &StageFrom::Snapshot(foreign.clone()))
+            .await,
+        Err(EngineError::Conflict(_))
+    ));
+    engine
+        .delete_volume_snapshot(&foreign)
+        .await
+        .expect("delete");
+    let mut missing = foreign.clone();
+    missing.volume_id = volume.clone();
+    assert_eq!(
+        engine
+            .stage_volume(&volume, 1, &StageFrom::Snapshot(missing))
+            .await,
+        Err(EngineError::NotFound)
+    );
+
+    engine.fail_next(
+        FakeOp::StageVolume,
+        EngineError::ResourceExhausted("full".into()),
+    );
+    assert!(matches!(
+        engine.stage_volume(&volume, 1, &StageFrom::Empty).await,
+        Err(EngineError::ResourceExhausted(_))
+    ));
+
+    let staged = engine
+        .stage_volume(&volume, 1, &StageFrom::Volume)
+        .await
+        .expect("stage");
+    // A handle that names another file or size is refused, not committed.
+    let mut foreign_location = staged.clone();
+    foreign_location.location = std::path::PathBuf::from("/elsewhere/vol_01.staging");
+    for refused in [
+        engine.commit_staged_volume(&foreign_location).await.err(),
+        engine.discard_staged_volume(&foreign_location).await.err(),
+    ] {
+        assert!(
+            matches!(refused, Some(EngineError::Conflict(_))),
+            "{refused:?}"
+        );
+    }
+    let mut wrong_size = staged.clone();
+    wrong_size.size_bytes *= 2;
+    assert!(matches!(
+        engine.commit_staged_volume(&wrong_size).await,
+        Err(EngineError::Conflict(_))
+    ));
+    engine.fail_next(
+        FakeOp::CommitStagedVolume,
+        EngineError::Io("injected".into()),
+    );
+    assert_eq!(
+        engine.commit_staged_volume(&staged).await,
+        Err(EngineError::Io("injected".into()))
+    );
+    assert_eq!(engine.staged_volumes().len(), 1, "a failed commit keeps it");
+    let vm = vm_with_volume(&engine, &volume, "vm_warm").await;
+    assert!(
+        matches!(
+            engine.commit_staged_volume(&staged).await,
+            Err(EngineError::Conflict(_))
+        ),
+        "a VM that exists attaches the volume"
+    );
+    assert_eq!(engine.staged_volumes().len(), 1, "the staging file is kept");
+    engine.delete(&vm).await.expect("delete");
+    engine.commit_staged_volume(&staged).await.expect("commit");
+}
+
+#[tokio::test]
+async fn a_node_without_reflink_stages_only_empty_copies() {
+    let engine = FakeEngine::new();
+    engine.set_snapshot_method(SnapshotMethod::PauseCopy, Duration::ZERO);
+    let volume = VolumeId("vol_01".to_string());
+    engine.ensure_volume(&volume, 1).await.expect("volume");
+    assert!(matches!(
+        engine.stage_volume(&volume, 1, &StageFrom::Volume).await,
+        Err(EngineError::Unsupported(_))
+    ));
+    let staged = engine
+        .stage_volume(&volume, 1, &StageFrom::Empty)
+        .await
+        .expect("an empty staging file needs no clone");
+    engine
+        .discard_staged_volume(&staged)
+        .await
+        .expect("discard");
+}
+
+#[tokio::test]
+async fn pause_and_resume_flip_a_flag_and_the_vm_still_reads_running() {
+    let (engine, id) = created().await;
+    assert_eq!(
+        engine.pause(&VmId("vm_missing".to_string())).await,
+        Err(EngineError::NotFound)
+    );
+    assert!(
+        matches!(engine.pause(&id).await, Err(EngineError::Conflict(_))),
+        "a stopped VM cannot be paused"
+    );
+    engine.start(&id).await.expect("start");
+    engine.pause(&id).await.expect("pause");
+    engine.pause(&id).await.expect("pausing a paused VM is Ok");
+    assert!(engine.is_paused(&id));
+    assert_eq!(
+        engine.inspect(&id).await.expect("inspect").state,
+        VmState::Running
+    );
+    engine.resume(&id).await.expect("resume");
+    engine
+        .resume(&id)
+        .await
+        .expect("resuming a running VM is Ok");
+    assert!(!engine.is_paused(&id));
+
+    engine.pause(&id).await.expect("pause");
+    engine
+        .stop(&id, StopMode::Force)
+        .await
+        .expect("a paused VM stops");
+    assert!(!engine.is_paused(&id));
+    assert!(matches!(
+        engine.resume(&id).await,
+        Err(EngineError::Conflict(_))
+    ));
+    engine.start(&id).await.expect("start");
+    assert!(!engine.is_paused(&id), "a new start is not paused");
+
+    engine.fail_next(FakeOp::Pause, EngineError::Timeout);
+    assert_eq!(engine.pause(&id).await, Err(EngineError::Timeout));
+    assert!(!engine.is_paused(&id));
+    engine.pause(&id).await.expect("pause");
+    engine.fail_next(FakeOp::Resume, EngineError::Timeout);
+    assert_eq!(engine.resume(&id).await, Err(EngineError::Timeout));
+    assert!(engine.is_paused(&id), "a failed resume leaves it paused");
 }

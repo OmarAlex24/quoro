@@ -372,6 +372,55 @@ pub struct VolumeSnapshot {
     pub pause: Duration,
 }
 
+/// A byte range of a volume file. Added in M5b. Section 3.22.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ByteRange {
+    pub offset: u64,
+    pub length: u64,
+}
+
+/// The newer side of a `volume_changed_ranges` comparison. Added in M5b.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RangesOf {
+    /// A snapshot of the volume.
+    Snapshot(VolumeSnapshot),
+    /// The volume file itself, which no VM that exists may attach.
+    Volume(VolumeId),
+}
+
+/// The ranges that may differ from a base. Added in M5b. Section 3.22.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangedRanges {
+    /// Sorted by offset, not overlapping, aligned to 4 KiB. A range may be a
+    /// hole in the newer file; it then reads as zeros.
+    pub ranges: Vec<ByteRange>,
+    /// True when `ranges` is every allocated range of the newer file: there
+    /// was no base, or the extent maps could not be compared.
+    pub full: bool,
+    /// Extents in the newer file's extent map.
+    pub extent_count: u64,
+}
+
+/// What a staging file starts from. Added in M5b. Section 3.22.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StageFrom {
+    /// An empty sparse file of the volume's size.
+    Empty,
+    /// A reflink clone of the volume file.
+    Volume,
+    /// A reflink clone of a snapshot of the volume.
+    Snapshot(VolumeSnapshot),
+}
+
+/// A staging file a warm copy is written into. Added in M5b. Section 3.22.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedVolume {
+    pub volume_id: VolumeId,
+    pub size_bytes: u64,
+    /// Node-local location the node agent writes; not part of any API.
+    pub location: PathBuf,
+}
+
 /// Every method is total: it either succeeds or returns one of these.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EngineError {
@@ -615,6 +664,71 @@ pub trait Engine: Send + Sync {
             ))
         }
     }
+
+    // Warm volumes (M5b; the default implementation returns Unsupported)
+    /// Added in M5b; section 3.22.
+    fn volume_changed_ranges(
+        &self,
+        _newer: &RangesOf,
+        _base: Option<&VolumeSnapshot>,
+    ) -> impl Future<Output = Result<ChangedRanges, EngineError>> + Send {
+        async {
+            Err(EngineError::Unsupported(
+                "warm volumes are not implemented by this engine".into(),
+            ))
+        }
+    }
+    /// Added in M5b; section 3.22.
+    fn stage_volume(
+        &self,
+        _id: &VolumeId,
+        _size_gb: u32,
+        _from: &StageFrom,
+    ) -> impl Future<Output = Result<StagedVolume, EngineError>> + Send {
+        async {
+            Err(EngineError::Unsupported(
+                "warm volumes are not implemented by this engine".into(),
+            ))
+        }
+    }
+    /// Added in M5b; section 3.22.
+    fn commit_staged_volume(
+        &self,
+        _staged: &StagedVolume,
+    ) -> impl Future<Output = Result<VolumeInfo, EngineError>> + Send {
+        async {
+            Err(EngineError::Unsupported(
+                "warm volumes are not implemented by this engine".into(),
+            ))
+        }
+    }
+    /// Added in M5b; section 3.22.
+    fn discard_staged_volume(
+        &self,
+        _staged: &StagedVolume,
+    ) -> impl Future<Output = Result<(), EngineError>> + Send {
+        async {
+            Err(EngineError::Unsupported(
+                "warm volumes are not implemented by this engine".into(),
+            ))
+        }
+    }
+    /// Freezes a running VM's vCPUs. Added in M5b; section 3.22.
+    fn pause(&self, _id: &VmId) -> impl Future<Output = Result<(), EngineError>> + Send {
+        async {
+            Err(EngineError::Unsupported(
+                "pausing a VM is not implemented by this engine".into(),
+            ))
+        }
+    }
+    /// Added in M5b; section 3.22.
+    fn resume(&self, _id: &VmId) -> impl Future<Output = Result<(), EngineError>> + Send {
+        async {
+            Err(EngineError::Unsupported(
+                "pausing a VM is not implemented by this engine".into(),
+            ))
+        }
+    }
 }
 
 /// The result of the host check in section 3.2.
@@ -631,6 +745,11 @@ pub struct HostProbe {
 }
 
 pub mod fake;
+
+/// The extent-map comparison behind `volume_changed_ranges` (section 3.22,
+/// ADR 0172). Platform-independent, so its property tests run anywhere; the
+/// Cloud Hypervisor backend feeds it the maps it reads with FIEMAP.
+pub mod extents;
 
 /// The package inventory of an unpacked image tree (section 3.21, ADR 0151).
 /// The parsers are platform-independent so their tests run anywhere; the
@@ -663,4 +782,4 @@ pub mod image;
 #[cfg(target_os = "linux")]
 pub mod ch;
 
-pub use fake::{FakeEngine, FakeOp};
+pub use fake::{FakeEngine, FakeOp, FakeRanges};
