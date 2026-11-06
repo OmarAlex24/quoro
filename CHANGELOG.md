@@ -18,6 +18,7 @@ Each entry links the pull request that made the change and, where one exists, th
 - After a restore was accepted, the old node could still receive a desired state that named the moved VM after its lease had been revoked, when that snapshot had been built just before the restore. A snapshot built before a lease revoke is now dropped and built again, so nothing the revoke took away reaches the node after it. Deleting a volume had the same race ([#388]).
 - The panel offered `app:terminal`, `backup:manage` and `backup:restore` in the agent grant and webhook forms, and the API then refused the grant. Its human-only and destructive scope lists now match the permission model, and a test reads both lists from the contract ([#397]).
 - The panel's webhook dialog did not offer the `build`, `backup`, `restore`, `volume` and `domain` events, so they could only be subscribed to through the API. The dialog now offers every event type of the contract, grouped by subject ([#398]).
+- Re-running the installer to upgrade a set-up primary printed `warning: could not read a setup token` and the first-run steps again, and a node or an edge printed its first-run text. The installer now reads the version it replaces and says `upgraded from 0.1.1 to 0.2.0`. On a primary whose cluster is set up, it skips the setup token and the first-run steps and names the next step, upgrading the nodes and edges. A re-run without `QUORO_ROLE` on a node or an edge installed a second control plane next to the agent; the installer now refuses it and names the role to pass. The installer README documents the `edge` role, the `QUORO_JOIN_*` variables for an edge, and how to upgrade ([#401]).
 
 ## [v0.2.0] - 2026-11-05
 
@@ -376,6 +377,7 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#388]: https://github.com/OmarAlex24/quoro/pull/388
 [#397]: https://github.com/OmarAlex24/quoro/pull/397
 [#398]: https://github.com/OmarAlex24/quoro/pull/398
+[#401]: https://github.com/OmarAlex24/quoro/pull/401
 [ADR 0019]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0019-fencing-is-mandatory-and-lease-based-node-agent-self-fences.md
 [ADR 0020]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0020-per-app-ha-policies-none-cold-warm-hot-with-cost-shown-in.md
 [ADR 0027]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0027-signed-binaries-and-reproducible-builds-are-mandatory.md
