@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import eventsSchema from '../../../docs/contracts/events.schema.json';
 import type { Webhook } from '../api/generated/model';
 import {
   buildCreateWebhookBody,
@@ -65,11 +66,20 @@ describe('eventTypesBySubject', () => {
       'vm',
       'app',
       'deployment',
+      'build',
+      'backup',
+      'restore',
+      'volume',
       'certificate',
+      'domain',
       'grant',
       'approval',
       'incident',
       'audit',
+    ]);
+    expect(groups.find((group) => group.subject === 'domain')?.types).toEqual([
+      'domain.unserved',
+      'domain.served',
     ]);
     expect(groups.find((group) => group.subject === 'app')?.types).toEqual([
       'app.created',
@@ -84,6 +94,11 @@ describe('eventTypesBySubject', () => {
       'app.switched_over',
       'app.switchover_failed',
     ]);
+  });
+
+  it('offers every event type of events.schema.json, each once', () => {
+    const offered = eventTypesBySubject().flatMap((group) => group.types);
+    expect(offered).toEqual(eventsSchema.properties.type.enum);
   });
 });
 
