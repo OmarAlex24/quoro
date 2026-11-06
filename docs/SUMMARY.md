@@ -251,6 +251,7 @@
   - [0244: A converted lease's row keeps mode local until the primary answers its first renewal, and is written expiring then](adr/0244-a-converted-lease-s-row-keeps-mode-local-until-the-primary.md)
   - [0245: fence_ack carries each lease's acknowledged token, and the node clears only failed fences below it](adr/0245-fence-ack-carries-each-lease-s-acknowledged-token-and-the.md)
   - [0246: A fence started by a lease_revoke records its failure with the revoke's token; a fence acknowledgement bumps only the listed leases the node still holds](adr/0246-a-fence-started-by-a-lease-revoke-records-its-failure-with.md)
+  - [0247: fence_ack stores current token + 1 for a listed lease another node holds, so the node can clear a failure recorded at that token](adr/0247-fence-ack-stores-current-token-1-for-a-listed-lease-another.md)
 
 # Background research
 
