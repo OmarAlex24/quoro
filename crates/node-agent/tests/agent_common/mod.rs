@@ -14,10 +14,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use quoro_engine::{
-    ByteStream, Capabilities, ConsoleStream, Engine, EngineError, EngineEvent, EventStream,
-    ExecRequest, ExecSession, FakeEngine, HostProbe, ImageConfig, ImageDigest, ImageRef,
-    LineStream, NodeNetwork, PreparedImage, StopMode, VmCounters, VmId, VmInfo, VmSpec, VolumeId,
-    VolumeInfo, VolumeSnapshot,
+    ByteStream, Capabilities, ChangedRanges, ConsoleStream, Engine, EngineError, EngineEvent,
+    EventStream, ExecRequest, ExecSession, FakeEngine, HostProbe, ImageConfig, ImageDigest,
+    ImageRef, LineStream, NodeNetwork, PreparedImage, RangesOf, StageFrom, StagedVolume, StopMode,
+    VmCounters, VmId, VmInfo, VmSpec, VolumeId, VolumeInfo, VolumeSnapshot,
 };
 use quoro_node_agent::LeaseTable;
 use quoro_node_agent::NodeFacts;
@@ -521,6 +521,39 @@ impl Engine for RecordingEngine {
 
     async fn delete_volume_snapshot(&self, snap: &VolumeSnapshot) -> Result<(), EngineError> {
         self.inner.delete_volume_snapshot(snap).await
+    }
+
+    async fn volume_changed_ranges(
+        &self,
+        newer: &RangesOf,
+        base: Option<&VolumeSnapshot>,
+    ) -> Result<ChangedRanges, EngineError> {
+        self.inner.volume_changed_ranges(newer, base).await
+    }
+
+    async fn stage_volume(
+        &self,
+        id: &VolumeId,
+        size_gb: u32,
+        from: &StageFrom,
+    ) -> Result<StagedVolume, EngineError> {
+        self.inner.stage_volume(id, size_gb, from).await
+    }
+
+    async fn commit_staged_volume(&self, staged: &StagedVolume) -> Result<VolumeInfo, EngineError> {
+        self.inner.commit_staged_volume(staged).await
+    }
+
+    async fn discard_staged_volume(&self, staged: &StagedVolume) -> Result<(), EngineError> {
+        self.inner.discard_staged_volume(staged).await
+    }
+
+    async fn pause(&self, id: &VmId) -> Result<(), EngineError> {
+        self.inner.pause(id).await
+    }
+
+    async fn resume(&self, id: &VmId) -> Result<(), EngineError> {
+        self.inner.resume(id).await
     }
 }
 

@@ -33,12 +33,13 @@ use futures_core::Stream;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::{ByteRange, ChangedRanges};
 use crate::{
     ByteStream, Capabilities, ConsoleMode, ConsoleStream, Engine, EngineError, EngineEvent,
     EventStream, ExecRequest, ExecSession, HostProbe, ImageConfig, ImageDigest, ImageInventory,
     ImageRef, LineStream, NodeNetwork, OciLayout, OutputLine, OutputStream, PreparedImage,
-    SerialMode, SnapshotMethod, StopMode, VmCounters, VmId, VmInfo, VmSpec, VmState, VolumeId,
-    VolumeInfo, VolumeSnapshot,
+    RangesOf, SerialMode, SnapshotMethod, StageFrom, StagedVolume, StopMode, VmCounters, VmId,
+    VmInfo, VmSpec, VmState, VolumeId, VolumeInfo, VolumeSnapshot,
 };
 
 /// Bytes in one gibibyte, the unit of `size_gb`.
@@ -86,6 +87,16 @@ pub enum FakeOp {
     /// `list` (M5b): the whole listing fails, as when the real engine cannot
     /// read one VM's state.
     List,
+    /// `volume_changed_ranges` (M5b).
+    VolumeChangedRanges,
+    /// `stage_volume` (M5b).
+    StageVolume,
+    /// `commit_staged_volume` (M5b).
+    CommitStagedVolume,
+    /// `pause` (M5b).
+    Pause,
+    /// `resume` (M5b).
+    Resume,
 }
 
 /// A volume the fake holds (M5a). With a volume directory set
@@ -95,6 +106,27 @@ pub enum FakeOp {
 struct FakeVolume {
     size_gb: u32,
     path: PathBuf,
+}
+
+/// A staging file the fake holds for a volume (M5b, section 3.22): a real
+/// file next to the volume files when a volume directory is set, a record
+/// otherwise.
+struct FakeStaged {
+    size_gb: u32,
+    location: PathBuf,
+}
+
+/// How `volume_changed_ranges` answers when no result was pushed with
+/// [`FakeEngine::push_changed_ranges`] (M5b).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FakeRanges {
+    /// The whole volume as one range, with `full: true` (section 7).
+    #[default]
+    Full,
+    /// With a base and a volume directory: the 4 KiB blocks whose bytes
+    /// differ between the two files, with `full: false`. Without a base, or
+    /// without a volume directory, the whole volume as in `Full`.
+    Content,
 }
 
 /// The fake engine's per-VM record.
@@ -124,6 +156,9 @@ struct VmRecord {
     serial_ring: VecDeque<u8>,
     /// Live `serial_output` subscribers; dropped when the VM is deleted.
     serial_subscribers: Vec<mpsc::Sender<Vec<u8>>>,
+    /// Set by `pause`, cleared by `resume` and whenever the VM stops running
+    /// (M5b, section 3.22). A paused VM still reads `Running`.
+    paused: bool,
 }
 
 /// The fake's side of one exec session.
@@ -273,6 +308,12 @@ struct State {
     vms: HashMap<VmId, VmRecord>,
     snapshots: HashMap<String, VolumeSnapshot>,
     volumes: HashMap<VolumeId, FakeVolume>,
+    /// The staging file of each volume that has one (M5b, section 3.22).
+    staged: HashMap<VolumeId, FakeStaged>,
+    /// Results `volume_changed_ranges` returns next, oldest first (M5b).
+    changed_ranges: VecDeque<ChangedRanges>,
+    /// How `volume_changed_ranges` answers otherwise (M5b).
+    ranges_mode: FakeRanges,
     /// Where volume files live; `None` keeps volumes as records only.
     volume_dir: Option<PathBuf>,
     snapshot_method: SnapshotMethod,
@@ -300,6 +341,9 @@ impl State {
             vms: HashMap::new(),
             snapshots: HashMap::new(),
             volumes: HashMap::new(),
+            staged: HashMap::new(),
+            changed_ranges: VecDeque::new(),
+            ranges_mode: FakeRanges::Full,
             volume_dir: None,
             snapshot_method: SnapshotMethod::Reflink,
             snapshot_pause: Duration::ZERO,
@@ -478,6 +522,43 @@ impl FakeEngine {
     #[must_use]
     pub fn volume_snapshots(&self) -> Vec<VolumeSnapshot> {
         self.lock().snapshots.values().cloned().collect()
+    }
+
+    /// Makes the next `volume_changed_ranges` return `ranges` once, after
+    /// its checks of the files passed (M5b). Pushed results are returned
+    /// oldest first.
+    pub fn push_changed_ranges(&self, ranges: ChangedRanges) {
+        self.lock().changed_ranges.push_back(ranges);
+    }
+
+    /// How `volume_changed_ranges` answers when no result was pushed (M5b).
+    /// The default is [`FakeRanges::Full`].
+    pub fn set_changed_ranges_mode(&self, mode: FakeRanges) {
+        self.lock().ranges_mode = mode;
+    }
+
+    /// The staging files that exist now, by volume, sorted by volume id
+    /// (M5b).
+    #[must_use]
+    pub fn staged_volumes(&self) -> Vec<(VolumeId, PathBuf)> {
+        let mut staged: Vec<_> = self
+            .lock()
+            .staged
+            .iter()
+            .map(|(id, staged)| (id.clone(), staged.location.clone()))
+            .collect();
+        staged.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+        staged
+    }
+
+    /// Whether `pause` froze the VM and nothing resumed or stopped it since
+    /// (M5b). An unknown VM is not paused.
+    #[must_use]
+    pub fn is_paused(&self, id: &VmId) -> bool {
+        self.lock()
+            .vms
+            .get(id)
+            .is_some_and(|record| record.paused && record.info.state == VmState::Running)
     }
 
     fn take_failure(&self, op: FakeOp) -> Option<EngineError> {
@@ -790,6 +871,7 @@ fn crash_locked(state: &mut State, id: &VmId, reason: &str) {
     record.info.state = VmState::Crashed;
     record.info.pid = None;
     record.scheduled_crash = None;
+    record.paused = false;
     end_execs(record);
     emit(
         state,
@@ -1036,6 +1118,7 @@ impl Engine for FakeEngine {
                 execs: Vec::new(),
                 serial_ring: VecDeque::new(),
                 serial_subscribers: Vec::new(),
+                paused: false,
             },
         );
         Ok(info)
@@ -1062,6 +1145,7 @@ impl Engine for FakeEngine {
         record.info.started_at = Some(SystemTime::now());
         record.info.exit_code = None;
         record.scheduled_crash = None;
+        record.paused = false;
         let info = record.info.clone();
         emit(&mut state, EngineEvent::Started { id: id.clone() });
         Ok(info)
@@ -1118,6 +1202,7 @@ impl Engine for FakeEngine {
         record.info.state = VmState::Stopped;
         record.info.pid = None;
         record.info.exit_code = Some(code);
+        record.paused = false;
         let info = record.info.clone();
         emit(
             &mut state,
@@ -1397,15 +1482,10 @@ impl Engine for FakeEngine {
             return Err(err);
         }
         let mut state = self.lock();
+        // From M5b a volume may have several snapshots at once (section 3.16).
         let Some(volume) = state.volumes.get(id) else {
             return Err(EngineError::NotFound);
         };
-        if state.snapshots.values().any(|snap| &snap.volume_id == id) {
-            return Err(EngineError::Conflict(format!(
-                "volume {} already has a snapshot",
-                id.0
-            )));
-        }
         let size_bytes = u64::from(volume.size_gb) * GIB;
         let n = state.next_snapshot;
         let location = match &state.volume_dir {
@@ -1453,6 +1533,345 @@ impl Engine for FakeEngine {
         }
         Ok(())
     }
+
+    async fn volume_changed_ranges(
+        &self,
+        newer: &RangesOf,
+        base: Option<&VolumeSnapshot>,
+    ) -> Result<ChangedRanges, EngineError> {
+        if let Some(err) = self.take_failure(FakeOp::VolumeChangedRanges) {
+            return Err(err);
+        }
+        let mut state = self.lock();
+        // The newer side: a snapshot the fake took, or a volume no VM that
+        // exists attaches (section 3.22).
+        let (volume_id, newer_path, size_bytes) = match newer {
+            RangesOf::Snapshot(snapshot) => {
+                let Some(known) = state.snapshots.get(&snapshot.snapshot_id) else {
+                    return Err(EngineError::NotFound);
+                };
+                (
+                    known.volume_id.clone(),
+                    known.location.clone(),
+                    known.size_bytes,
+                )
+            }
+            RangesOf::Volume(id) => {
+                let Some(volume) = state.volumes.get(id) else {
+                    return Err(EngineError::NotFound);
+                };
+                if let Some(vm_id) = attaching_vm(&state, id) {
+                    return Err(EngineError::Conflict(format!(
+                        "volume {} is attached to VM {}",
+                        id.0, vm_id.0
+                    )));
+                }
+                (
+                    id.clone(),
+                    volume.path.clone(),
+                    u64::from(volume.size_gb) * GIB,
+                )
+            }
+        };
+        let base_path = match base {
+            Some(base) if base.volume_id != volume_id => {
+                return Err(EngineError::Conflict(format!(
+                    "base snapshot {} is of volume {}, not {}",
+                    base.snapshot_id, base.volume_id.0, volume_id.0
+                )));
+            }
+            Some(base) => match state.snapshots.get(&base.snapshot_id) {
+                Some(known) => Some(known.location.clone()),
+                None => return Err(EngineError::NotFound),
+            },
+            None => None,
+        };
+        if let Some(pushed) = state.changed_ranges.pop_front() {
+            return Ok(pushed);
+        }
+        let whole = ChangedRanges {
+            ranges: vec![ByteRange {
+                offset: 0,
+                length: size_bytes,
+            }],
+            full: true,
+            extent_count: 1,
+        };
+        match (state.ranges_mode, base_path, state.volume_dir.is_some()) {
+            (FakeRanges::Content, Some(base_path), true) => {
+                drop(state);
+                let ranges = differing_blocks(&newer_path, &base_path, size_bytes)?;
+                let extent_count = ranges.len() as u64;
+                Ok(ChangedRanges {
+                    ranges,
+                    full: false,
+                    extent_count,
+                })
+            }
+            _ => Ok(whole),
+        }
+    }
+
+    async fn stage_volume(
+        &self,
+        id: &VolumeId,
+        size_gb: u32,
+        from: &StageFrom,
+    ) -> Result<StagedVolume, EngineError> {
+        if let Some(err) = self.take_failure(FakeOp::StageVolume) {
+            return Err(err);
+        }
+        let mut state = self.lock();
+        if state.staged.contains_key(id) {
+            return Err(EngineError::Conflict(format!(
+                "volume {} already has a staging file",
+                id.0
+            )));
+        }
+        let size_bytes = u64::from(size_gb) * GIB;
+        // The file the staging copy is cloned from, if any.
+        let source = match from {
+            StageFrom::Empty => None,
+            StageFrom::Volume => {
+                let Some(volume) = state.volumes.get(id) else {
+                    return Err(EngineError::NotFound);
+                };
+                if volume.size_gb != size_gb {
+                    return Err(EngineError::Conflict(format!(
+                        "volume {} is {} GiB, not {size_gb} GiB",
+                        id.0, volume.size_gb
+                    )));
+                }
+                Some(volume.path.clone())
+            }
+            StageFrom::Snapshot(snapshot) => {
+                if &snapshot.volume_id != id {
+                    return Err(EngineError::Conflict(format!(
+                        "snapshot {} is of volume {}, not {}",
+                        snapshot.snapshot_id, snapshot.volume_id.0, id.0
+                    )));
+                }
+                let Some(known) = state.snapshots.get(&snapshot.snapshot_id) else {
+                    return Err(EngineError::NotFound);
+                };
+                if known.size_bytes != size_bytes {
+                    return Err(EngineError::Conflict(format!(
+                        "snapshot {} is {} bytes, not {size_gb} GiB",
+                        known.snapshot_id, known.size_bytes
+                    )));
+                }
+                Some(known.location.clone())
+            }
+        };
+        // As in the real engine, only a reflink node clones (section 3.22).
+        if source.is_some() && state.snapshot_method != SnapshotMethod::Reflink {
+            return Err(EngineError::Unsupported(
+                "a staging clone needs reflink; this node has no warm volumes".into(),
+            ));
+        }
+        let location = staging_location(&state, id);
+        let location = match &state.volume_dir {
+            Some(_) => {
+                match source {
+                    Some(source) => {
+                        std::fs::copy(&source, &location).map_err(io_error)?;
+                    }
+                    None => {
+                        let file = std::fs::File::create(&location).map_err(io_error)?;
+                        file.set_len(size_bytes).map_err(io_error)?;
+                    }
+                }
+                location
+            }
+            None => location,
+        };
+        state.staged.insert(
+            id.clone(),
+            FakeStaged {
+                size_gb,
+                location: location.clone(),
+            },
+        );
+        Ok(StagedVolume {
+            volume_id: id.clone(),
+            size_bytes,
+            location,
+        })
+    }
+
+    async fn commit_staged_volume(&self, staged: &StagedVolume) -> Result<VolumeInfo, EngineError> {
+        if let Some(err) = self.take_failure(FakeOp::CommitStagedVolume) {
+            return Err(err);
+        }
+        let mut state = self.lock();
+        let id = &staged.volume_id;
+        // The same answers as the real engine: a foreign location or size is
+        // `Conflict`, a staging file that is not there is `NotFound`.
+        check_staged_location(&state, staged)?;
+        match state.staged.get(id) {
+            None => return Err(EngineError::NotFound),
+            Some(known) if u64::from(known.size_gb) * GIB != staged.size_bytes => {
+                return Err(EngineError::Conflict(format!(
+                    "the staging file of volume {} is {} GiB, not {} bytes",
+                    id.0, known.size_gb, staged.size_bytes
+                )));
+            }
+            Some(_) => {}
+        }
+        if let Some(vm_id) = attaching_vm(&state, id) {
+            return Err(EngineError::Conflict(format!(
+                "volume {} is attached to VM {}",
+                id.0, vm_id.0
+            )));
+        }
+        let Some(known) = state.staged.remove(id) else {
+            return Err(EngineError::NotFound);
+        };
+        let path = match &state.volume_dir {
+            Some(dir) => {
+                let path = dir.join(&id.0);
+                if let Err(err) = std::fs::rename(&known.location, &path) {
+                    state.staged.insert(id.clone(), known);
+                    return Err(io_error(err));
+                }
+                path
+            }
+            None => PathBuf::from(format!("/fake/volumes/{}", id.0)),
+        };
+        let volume = FakeVolume {
+            size_gb: known.size_gb,
+            path,
+        };
+        let info = volume_info(id, &volume);
+        state.volumes.insert(id.clone(), volume);
+        Ok(info)
+    }
+
+    async fn discard_staged_volume(&self, staged: &StagedVolume) -> Result<(), EngineError> {
+        let mut state = self.lock();
+        check_staged_location(&state, staged)?;
+        if state.staged.remove(&staged.volume_id).is_none() {
+            return Ok(());
+        }
+        if state.volume_dir.is_some() {
+            match std::fs::remove_file(&staged.location) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(io_error(err)),
+            }
+        }
+        Ok(())
+    }
+
+    async fn pause(&self, id: &VmId) -> Result<(), EngineError> {
+        if let Some(err) = self.take_failure(FakeOp::Pause) {
+            return Err(err);
+        }
+        let mut state = self.lock();
+        let Some(record) = state.vms.get_mut(id) else {
+            return Err(EngineError::NotFound);
+        };
+        if record.info.state != VmState::Running {
+            return Err(EngineError::Conflict(format!("VM {} is not running", id.0)));
+        }
+        record.paused = true;
+        Ok(())
+    }
+
+    async fn resume(&self, id: &VmId) -> Result<(), EngineError> {
+        if let Some(err) = self.take_failure(FakeOp::Resume) {
+            return Err(err);
+        }
+        let mut state = self.lock();
+        let Some(record) = state.vms.get_mut(id) else {
+            return Err(EngineError::NotFound);
+        };
+        if record.info.state != VmState::Running {
+            return Err(EngineError::Conflict(format!("VM {} is not running", id.0)));
+        }
+        record.paused = false;
+        Ok(())
+    }
+}
+
+/// Where the staging file of `id` lives: next to the volume files when a
+/// volume directory is set, a placeholder path otherwise.
+fn staging_location(state: &State, id: &VolumeId) -> PathBuf {
+    match &state.volume_dir {
+        Some(dir) => dir.join(format!("{}.staging", id.0)),
+        None => PathBuf::from(format!("/fake/staging/{}", id.0)),
+    }
+}
+
+/// `Conflict` unless `staged` names the staging file of its own volume, as
+/// in the real engine (section 3.22).
+fn check_staged_location(state: &State, staged: &StagedVolume) -> Result<(), EngineError> {
+    if staged.location == staging_location(state, &staged.volume_id) {
+        Ok(())
+    } else {
+        Err(EngineError::Conflict(format!(
+            "{} is not the staging file of volume {}",
+            staged.location.display(),
+            staged.volume_id.0
+        )))
+    }
+}
+
+/// The VM that attaches `id`, if one exists (section 3.22).
+fn attaching_vm(state: &State, id: &VolumeId) -> Option<VmId> {
+    state
+        .vms
+        .iter()
+        .find(|(_, record)| record.spec.volumes.iter().any(|v| &v.volume_id == id))
+        .map(|(vm_id, _)| vm_id.clone())
+}
+
+/// The 4 KiB blocks whose bytes differ between two files of `size` bytes,
+/// merged into ranges ([`FakeRanges::Content`]).
+fn differing_blocks(newer: &Path, base: &Path, size: u64) -> Result<Vec<ByteRange>, EngineError> {
+    use std::io::Read as _;
+
+    const READ: usize = 1 << 20;
+    let mut newer = std::fs::File::open(newer).map_err(io_error)?;
+    let mut base = std::fs::File::open(base).map_err(io_error)?;
+    let mut left = vec![0_u8; READ];
+    let mut right = vec![0_u8; READ];
+    let mut ranges = Vec::new();
+    let mut offset = 0_u64;
+    while offset < size {
+        let want = usize::try_from((size - offset).min(READ as u64)).unwrap_or(READ);
+        read_full(&mut newer, &mut left[..want])?;
+        read_full(&mut base, &mut right[..want])?;
+        for (index, (a, b)) in left[..want]
+            .chunks(crate::extents::BLOCK as usize)
+            .zip(right[..want].chunks(crate::extents::BLOCK as usize))
+            .enumerate()
+        {
+            if a != b {
+                ranges.push(ByteRange {
+                    offset: offset + index as u64 * crate::extents::BLOCK,
+                    length: a.len() as u64,
+                });
+            }
+        }
+        offset += want as u64;
+    }
+
+    /// Reads `buffer.len()` bytes, or zeros past the end of the file.
+    fn read_full(file: &mut std::fs::File, buffer: &mut [u8]) -> Result<(), EngineError> {
+        let mut filled = 0;
+        while filled < buffer.len() {
+            let read = file.read(&mut buffer[filled..]).map_err(io_error)?;
+            if read == 0 {
+                buffer[filled..].fill(0);
+                break;
+            }
+            filled += read;
+        }
+        Ok(())
+    }
+
+    Ok(crate::extents::round_and_merge(ranges, size))
 }
 
 /// The `VolumeInfo` of a fake volume; a record-only volume uses no disk.

@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use quoro_engine::{
-    Engine, FakeEngine, ImageDigest, ImageRef, NodeNetwork, SnapshotMethod, StopMode, VmId, VmSpec,
-    VolumeId, VolumeSnapshot,
+    Engine, FakeEngine, ImageDigest, ImageRef, NodeNetwork, RangesOf, SnapshotMethod, StageFrom,
+    StagedVolume, StopMode, VmId, VmSpec, VolumeId, VolumeSnapshot,
 };
 
 fn assert_send<T: Send>(_: &T) {}
@@ -56,6 +56,18 @@ fn calls_are_send<E: Engine>(engine: &E, sample: &Sample<'_>) {
     assert_send(&engine.delete_volume(sample.volume));
     assert_send(&engine.snapshot_volume(sample.volume));
     assert_send(&engine.delete_volume_snapshot(sample.snapshot));
+    let newer = RangesOf::Snapshot(sample.snapshot.clone());
+    assert_send(&engine.volume_changed_ranges(&newer, Some(sample.snapshot)));
+    assert_send(&engine.stage_volume(sample.volume, 1, &StageFrom::Empty));
+    let staged = StagedVolume {
+        volume_id: sample.volume.clone(),
+        size_bytes: 1 << 30,
+        location: "/fake/staging/vol_01".into(),
+    };
+    assert_send(&engine.commit_staged_volume(&staged));
+    assert_send(&engine.discard_staged_volume(&staged));
+    assert_send(&engine.pause(sample.id));
+    assert_send(&engine.resume(sample.id));
 }
 
 #[tokio::test]
