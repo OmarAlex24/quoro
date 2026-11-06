@@ -1633,9 +1633,13 @@ mod tests {
         let run_dir = builds_dir.join("run").join(BUILD);
         let waited = tokio::time::timeout(WAIT, async {
             loop {
+                // The manager creates the run directory before it writes
+                // the source disk, so a slow runner can see the directory
+                // alone; wait for both (issue #376).
                 if let Ok(Some(row)) = store.build(BUILD).await
                     && row.status == BuildState::Queued
                     && run_dir.is_dir()
+                    && run_dir.join("src.disk").is_file()
                     && row.started_at.is_none()
                 {
                     return;
@@ -1646,9 +1650,8 @@ mod tests {
         .await;
         assert!(
             waited.is_ok(),
-            "the build never waited with a run directory"
+            "the build never waited with a run directory and its source disk"
         );
-        assert!(run_dir.join("src.disk").is_file());
 
         let mut cancelled = build;
         cancelled.cancelled = true;
