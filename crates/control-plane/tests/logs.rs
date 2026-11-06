@@ -884,6 +884,7 @@ async fn a_status_report_for_an_app_vm_is_accepted() {
             edge_backends: Vec::new(),
             backups: Vec::new(),
             images: Vec::new(),
+            warm: Vec::new(),
             volumes: Vec::new(),
         }),
     )

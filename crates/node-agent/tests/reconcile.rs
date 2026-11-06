@@ -24,10 +24,11 @@ use quoro_node_agent::edge::EdgeManager;
 use quoro_node_agent::ingress::{CertificateEvents, DnsBridge, IngressConfig, IngressSupervisor};
 use quoro_node_agent::reconcile::Snapshot;
 use quoro_node_agent::store::{NodeStore, VolumeRecord};
+use quoro_node_agent::warm::VolumeLocks;
 use quoro_proto::wire::VolumeStatus;
 use quoro_proto::wire::{
     DesiredStatus, Health, ObservedStatus, SpecEdge, SpecNetwork, SpecVm, SpecVolumeState,
-    VolumeState,
+    SpecWarm, VolumeState, WarmRole,
 };
 
 fn ip_of(text: Option<&String>) -> Ipv4Addr {
@@ -741,6 +742,161 @@ async fn an_unknown_local_volume_is_orphaned_and_kept() {
     );
     assert!(dir.path().join("vol_orphan").exists());
     assert!(store.volume("vol_orphan").await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_warm_copy_is_left_to_the_warm_receiver() {
+    // Section 5.11: the file of a warm target comes only from a complete
+    // stream, is reported in `status_report.warm` and never in `volumes`,
+    // and the receiver removes it on a `deleted` entry under the volume's
+    // lock.
+    let dir = TargetDir::new("volume-warm-target");
+    let engine = Arc::new(RecordingEngine::new());
+    engine.inner().set_volume_dir(dir.path());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let (mut reconciler, _observed) = reconciler(engine.clone(), store.clone());
+
+    let mut target = spec_volume("vol_warm", "app_1", 1, SpecVolumeState::Present);
+    target.warm = Some(SpecWarm {
+        role: WarmRole::Target,
+        peer_node_id: "nod_1".to_owned(),
+        peer_address: "10.99.0.2".to_owned(),
+        port: 51822,
+        interval_s: 30,
+        lease_id: "lse_1".to_owned(),
+        fencing_token: 3,
+    });
+    let snap = snapshot_full(1, Vec::new(), Vec::new(), vec![target]);
+    reconciler.reconcile_once(Some(&snap)).await;
+    assert!(
+        engine.inner().volumes().is_empty(),
+        "no file before a stream"
+    );
+    let volumes = reconciler.volume_statuses().borrow().clone();
+    assert_eq!(volume_in(&volumes, "vol_warm"), None, "not in `volumes`");
+    assert!(store.volume("vol_warm").await.unwrap().is_none());
+    assert_eq!(store.applied_rev().await.unwrap(), 1);
+
+    // The receiver holds a copy; a `deleted` entry is its to remove.
+    engine
+        .inner()
+        .ensure_volume(&VolumeId("vol_warm".to_owned()), 1)
+        .await
+        .expect("the copy");
+    store.add_warm_target("vol_warm", "app_1", 1).await.unwrap();
+    let snap = snapshot_full(
+        2,
+        Vec::new(),
+        Vec::new(),
+        vec![spec_volume(
+            "vol_warm",
+            "app_1",
+            1,
+            SpecVolumeState::Deleted,
+        )],
+    );
+    reconciler.reconcile_once(Some(&snap)).await;
+    assert_eq!(
+        engine.inner().volumes().len(),
+        1,
+        "the reconciler left the copy"
+    );
+    // Once the receiver removed it, the entry stays the receiver's: the
+    // copy is never reported in `volumes`, deleted or not.
+    store.mark_warm_removed("vol_warm").await.unwrap();
+    reconciler.reconcile_once(Some(&snap)).await;
+    assert!(store.volume("vol_warm").await.unwrap().is_none());
+    let volumes = reconciler.volume_statuses().borrow().clone();
+    assert_eq!(volume_in(&volumes, "vol_warm"), None);
+    assert!(store.volume("vol_warm").await.unwrap().is_none());
+    assert_eq!(store.applied_rev().await.unwrap(), 2);
+
+    // A volume the node holds as its own (it was the source) is this pass's
+    // to remove and report, warm record or not.
+    store
+        .save_volume(&VolumeRecord {
+            volume_id: "vol_warm".to_owned(),
+            app_id: "app_1".to_owned(),
+            size_gb: 1,
+            state: VolumeState::Ready,
+            error: None,
+            allocated_bytes: Some(0),
+        })
+        .await
+        .unwrap();
+    let snap = snapshot_full(
+        3,
+        Vec::new(),
+        Vec::new(),
+        vec![spec_volume(
+            "vol_warm",
+            "app_1",
+            1,
+            SpecVolumeState::Deleted,
+        )],
+    );
+    reconciler.reconcile_once(Some(&snap)).await;
+    assert!(
+        engine.inner().volumes().is_empty(),
+        "the own file is removed"
+    );
+    let volumes = reconciler.volume_statuses().borrow().clone();
+    assert_eq!(
+        volume_in(&volumes, "vol_warm").map(|status| status.state),
+        Some(VolumeState::Deleted)
+    );
+    // The receiver then marks its own row removed; every later pass still
+    // reports the node's `deleted` until the entry leaves the spec.
+    store.mark_warm_removed("vol_warm").await.unwrap();
+    reconciler.reconcile_once(Some(&snap)).await;
+    let volumes = reconciler.volume_statuses().borrow().clone();
+    assert_eq!(
+        volume_in(&volumes, "vol_warm").map(|status| status.state),
+        Some(VolumeState::Deleted),
+        "still reported on the next pass"
+    );
+}
+
+#[tokio::test]
+async fn a_warm_copy_turning_into_the_source_waits_for_its_stream() {
+    // A node that holds a warm copy and becomes the source adopts the file
+    // only between two streams: the reconciler and the warm receiver share
+    // the volume's lock.
+    let dir = TargetDir::new("volume-warm-lock");
+    let engine = Arc::new(RecordingEngine::new());
+    engine.inner().set_volume_dir(dir.path());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let locks = VolumeLocks::new();
+    let (reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let mut reconciler = reconciler.with_warm_locks(locks.clone());
+    store.add_warm_target("vol_warm", "app_1", 1).await.unwrap();
+
+    let mut source = spec_volume("vol_warm", "app_1", 1, SpecVolumeState::Present);
+    source.warm = Some(SpecWarm {
+        role: WarmRole::Source,
+        peer_node_id: "nod_1".to_owned(),
+        peer_address: "10.99.0.2".to_owned(),
+        port: 51822,
+        interval_s: 30,
+        lease_id: "lse_1".to_owned(),
+        fencing_token: 4,
+    });
+    let snap = snapshot_full(1, Vec::new(), Vec::new(), vec![source]);
+    let stream = locks.try_lock("vol_warm").expect("free");
+    reconciler.reconcile_once(Some(&snap)).await;
+    assert!(
+        engine.inner().volumes().is_empty(),
+        "not while a stream runs"
+    );
+    assert_eq!(store.applied_rev().await.unwrap(), 0, "not applied yet");
+    drop(stream);
+    reconciler.reconcile_once(Some(&snap)).await;
+    assert_eq!(
+        engine.inner().volumes().len(),
+        1,
+        "adopted after the stream"
+    );
+    assert_eq!(store.applied_rev().await.unwrap(), 1);
 }
 
 #[tokio::test]

@@ -190,6 +190,7 @@ pub fn spec_volume(
         size_gb,
         state,
         restore: None,
+        warm: None,
     }
 }
 

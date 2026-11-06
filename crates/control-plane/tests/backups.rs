@@ -530,6 +530,7 @@ fn status_report(
         backups,
         volumes,
         images: Vec::new(),
+        warm: Vec::new(),
     })
 }
 

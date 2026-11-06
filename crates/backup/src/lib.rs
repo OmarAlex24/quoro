@@ -15,6 +15,7 @@
 
 use std::fmt;
 
+pub mod cells;
 pub mod layout;
 
 mod aead;

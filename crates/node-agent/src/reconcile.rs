@@ -28,7 +28,7 @@ use quoro_engine::{
 };
 use quoro_proto::wire::{
     DesiredState, DesiredStatus, Health, ObservedStatus, Spec, SpecRoute, SpecVm, SpecVolumeFile,
-    SpecVolumeState, VmStatus, VolumeState, VolumeStatus,
+    SpecVolumeState, VmStatus, VolumeState, VolumeStatus, WarmRole,
 };
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
@@ -281,6 +281,10 @@ pub struct Reconciler<E: Engine> {
     /// with `spec.edge` counts as applied only once the manager has applied
     /// that revision. `None` in tests that only exercise the engine.
     edge: Option<Arc<crate::edge::EdgeManager>>,
+    /// The warm volumes' locks, shared with the warm receiver: the file of a
+    /// volume this node holds a warm copy of is created, adopted or removed
+    /// here only between two streams (section 6.13).
+    warm_locks: Option<crate::warm::VolumeLocks>,
 }
 
 impl<E: Engine + 'static> Reconciler<E> {
@@ -319,6 +323,7 @@ impl<E: Engine + 'static> Reconciler<E> {
                 ready_volumes: HashSet::new(),
                 inventory: None,
                 edge: None,
+                warm_locks: None,
             },
             receiver,
         )
@@ -360,6 +365,14 @@ impl<E: Engine + 'static> Reconciler<E> {
     #[must_use]
     pub fn with_node_id(mut self, node_id: String) -> Self {
         self.node_id = Some(node_id);
+        self
+    }
+
+    /// Shares the warm volumes' locks with the warm receiver (section
+    /// 6.13).
+    #[must_use]
+    pub fn with_warm_locks(mut self, locks: crate::warm::VolumeLocks) -> Self {
+        self.warm_locks = Some(locks);
         self
     }
 
@@ -657,11 +670,39 @@ impl<E: Engine + 'static> Reconciler<E> {
             .into_iter()
             .map(|row| (row.volume_id.clone(), row))
             .collect();
+        let warm_copies: HashSet<String> = match self.store.warm_target_summaries().await {
+            Ok(targets) => targets.into_iter().map(|row| row.volume_id).collect(),
+            Err(e) => {
+                warn!(error = %e, "could not read the warm targets");
+                return false;
+            }
+        };
+        // The warm copies this node holds as a target are the warm
+        // receiver's (section 6.13): it creates the file only from a complete
+        // stream, reports it in `status_report.warm` and removes it on a
+        // `deleted` entry under the volume's lock, so no stream is cut.
+        // A `deleted` entry is the receiver's when it names the target or
+        // this node holds a warm copy of it, unless the node has a volume row
+        // of its own for it, in any state: that file is this pass's to remove,
+        // and its `deleted` is reported until the entry leaves the spec.
+        let is_warm_copy = |entry: &SpecVolumeFile| {
+            let target = entry
+                .warm
+                .as_ref()
+                .is_some_and(|warm| warm.role == WarmRole::Target);
+            match entry.state {
+                SpecVolumeState::Present => target,
+                SpecVolumeState::Deleted => {
+                    let own = rows.contains_key(&entry.volume_id);
+                    !own && (target || warm_copies.contains(&entry.volume_id))
+                }
+            }
+        };
 
         // Start from what each named volume last reported, plus one entry per
         // orphan, which is what this pass begins with.
         let mut statuses: BTreeMap<String, VolumeStatus> = BTreeMap::new();
-        for entry in &spec.volumes {
+        for entry in spec.volumes.iter().filter(|entry| !is_warm_copy(entry)) {
             statuses.insert(
                 entry.volume_id.clone(),
                 match rows.get(&entry.volume_id) {
@@ -715,8 +756,27 @@ impl<E: Engine + 'static> Reconciler<E> {
             .collect();
         let mut reached = true;
 
-        for entry in &spec.volumes {
+        for entry in spec.volumes.iter().filter(|entry| !is_warm_copy(entry)) {
             let row = rows.get(&entry.volume_id);
+            // A volume this node holds a warm copy of (it turns from target
+            // into source): its file is adopted or removed only while no
+            // stream holds it; a busy one is retried on the next pass.
+            let _warm_lock = match &self.warm_locks {
+                Some(locks) if warm_copies.contains(&entry.volume_id) => {
+                    match locks.try_lock(&entry.volume_id) {
+                        Some(guard) => Some(guard),
+                        None => {
+                            debug!(
+                                volume_id = %entry.volume_id,
+                                "a warm stream holds the volume; retrying on the next pass"
+                            );
+                            reached = false;
+                            continue;
+                        }
+                    }
+                }
+                _ => None,
+            };
             match entry.state {
                 SpecVolumeState::Present => {
                     if entry.restore.is_some() {

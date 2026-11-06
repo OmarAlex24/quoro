@@ -1535,7 +1535,7 @@ impl Engine for FakeEngine {
         let location = match &state.volume_dir {
             Some(dir) => {
                 let location = dir.join(format!("{}.snap-{n}", id.0));
-                std::fs::copy(&volume.path, &location).map_err(io_error)?;
+                copy_sparse(&volume.path, &location).map_err(io_error)?;
                 location
             }
             None => PathBuf::from(format!("/fake/snapshots/{n}")),
@@ -1721,7 +1721,7 @@ impl Engine for FakeEngine {
             Some(_) => {
                 match source {
                     Some(source) => {
-                        std::fs::copy(&source, &location).map_err(io_error)?;
+                        copy_sparse(&source, &location).map_err(io_error)?;
                     }
                     None => {
                         let file = std::fs::File::create(&location).map_err(io_error)?;
@@ -1862,6 +1862,61 @@ fn check_staged_location(state: &State, staged: &StagedVolume) -> Result<(), Eng
             staged.volume_id.0
         )))
     }
+}
+
+/// Copies a volume file the way a reflink clone looks: the same length, with
+/// only the ranges that hold data written, so its holes stay holes, as the
+/// real engine's snapshots and staging clones do. On Linux `std::fs::copy`
+/// writes every byte where the filesystem cannot clone (ext4), which made
+/// each copy of a 1 GiB test volume a 1 GiB write; so the data ranges are
+/// found with `SEEK_DATA` and `SEEK_HOLE` and copied alone.
+#[cfg(target_os = "linux")]
+fn copy_sparse(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::unix::fs::FileExt as _;
+
+    use rustix::fs::SeekFrom;
+    use rustix::io::Errno;
+
+    const CHUNK: u64 = 1 << 20;
+    let source = std::fs::File::open(from)?;
+    let length = source.metadata()?.len();
+    let target = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(to)?;
+    target.set_len(length)?;
+    let mut buffer = vec![0_u8; CHUNK as usize];
+    let mut offset = 0_u64;
+    while offset < length {
+        let data = match rustix::fs::seek(&source, SeekFrom::Data(offset)) {
+            Ok(data) if data < length => data,
+            Ok(_) | Err(Errno::NXIO) => break,
+            Err(err) => return Err(err.into()),
+        };
+        let end = match rustix::fs::seek(&source, SeekFrom::Hole(data)) {
+            Ok(hole) if hole > data => hole.min(length),
+            // A hole at the data offset is not the truth; copy the rest.
+            Ok(_) | Err(Errno::NXIO) => length,
+            Err(err) => return Err(err.into()),
+        };
+        let mut at = data;
+        while at < end {
+            let n = usize::try_from((end - at).min(CHUNK)).unwrap_or(buffer.len());
+            source.read_exact_at(&mut buffer[..n], at)?;
+            target.write_all_at(&buffer[..n], at)?;
+            at += n as u64;
+        }
+        offset = end;
+    }
+    Ok(())
+}
+
+/// Elsewhere `std::fs::copy` clones the file where the filesystem can (APFS
+/// on macOS), which keeps its holes.
+#[cfg(not(target_os = "linux"))]
+fn copy_sparse(from: &Path, to: &Path) -> io::Result<()> {
+    std::fs::copy(from, to).map(|_| ())
 }
 
 /// The VM that attaches `id`, if one exists (section 3.22).

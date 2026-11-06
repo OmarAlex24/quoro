@@ -1160,6 +1160,78 @@ async fn a_staged_copy_replaces_the_volume_only_when_committed() {
     std::fs::remove_dir_all(&dir).expect("cleanup");
 }
 
+/// Whether the filesystem reports the first hole of `path` before its end.
+#[cfg(target_os = "linux")]
+fn reports_holes(path: &std::path::Path) -> bool {
+    let file = std::fs::File::open(path).expect("open");
+    let length = file.metadata().expect("metadata").len();
+    matches!(
+        rustix::fs::seek(&file, rustix::fs::SeekFrom::Hole(0)),
+        Ok(hole) if hole < length
+    )
+}
+
+/// macOS keeps holes on APFS, the filesystem these tests run on there.
+#[cfg(not(target_os = "linux"))]
+fn reports_holes(_path: &std::path::Path) -> bool {
+    true
+}
+
+#[tokio::test]
+async fn snapshots_and_staging_clones_keep_the_holes_of_the_volume() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let dir = scratch("holes");
+    let engine = FakeEngine::new();
+    engine.set_volume_dir(&dir);
+    let volume = VolumeId("vol_01".to_string());
+    let info = engine.ensure_volume(&volume, 1).await.expect("volume");
+    write_at(&info.path, 4096, b"near the start");
+    write_at(&info.path, 512 << 20, b"in the middle");
+    let allocated =
+        |path: &std::path::Path| std::fs::metadata(path).expect("metadata").blocks() * 512;
+    // Only a filesystem that reports holes can keep them.
+    let reports_holes = reports_holes(&info.path);
+
+    let snapshot = engine.snapshot_volume(&volume).await.expect("snapshot");
+    let staged = engine
+        .stage_volume(&volume, 1, &StageFrom::Volume)
+        .await
+        .expect("stage");
+    for copy in [&snapshot.location, &staged.location] {
+        let bytes = std::fs::read(copy).expect("read");
+        assert_eq!(bytes.len(), 1 << 30, "the volume's length");
+        assert_eq!(&bytes[4096..4096 + 14], b"near the start");
+        assert_eq!(&bytes[(512 << 20)..(512 << 20) + 13], b"in the middle");
+        assert!(bytes[..4096].iter().all(|byte| *byte == 0));
+        if reports_holes {
+            assert!(
+                allocated(copy) <= allocated(&info.path) + (1 << 20),
+                "{} uses {} bytes, the volume {}",
+                copy.display(),
+                allocated(copy),
+                allocated(&info.path)
+            );
+        }
+    }
+    engine
+        .discard_staged_volume(&staged)
+        .await
+        .expect("discard");
+    let staged = engine
+        .stage_volume(&volume, 1, &StageFrom::Snapshot(snapshot.clone()))
+        .await
+        .expect("stage");
+    if reports_holes {
+        assert!(allocated(&staged.location) <= allocated(&info.path) + (1 << 20));
+    }
+    engine
+        .discard_staged_volume(&staged)
+        .await
+        .expect("discard");
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
 #[tokio::test]
 async fn staging_checks_its_source_and_the_commit_refuses_an_attached_volume() {
     let engine = FakeEngine::new();

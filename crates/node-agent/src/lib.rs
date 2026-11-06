@@ -32,6 +32,7 @@ pub mod store;
 pub mod tls;
 pub mod transcript;
 mod util;
+pub mod warm;
 
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr};

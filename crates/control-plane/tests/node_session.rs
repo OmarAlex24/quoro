@@ -403,6 +403,7 @@ async fn vm_changes_push_snapshots_and_observations_land() {
             edge_backends: Vec::new(),
             backups: Vec::new(),
             images: Vec::new(),
+            warm: Vec::new(),
             volumes: Vec::new(),
         }),
     )
@@ -851,6 +852,7 @@ async fn an_edge_reports_backend_health_and_a_replicated_app_gets_degraded() {
             builds: Vec::new(),
             backups: Vec::new(),
             images: Vec::new(),
+            warm: Vec::new(),
             volumes: Vec::new(),
             edge_backends: vec![
                 wire::EdgeBackendStatus {
@@ -957,6 +959,7 @@ async fn an_edge_reports_backend_health_and_a_replicated_app_gets_degraded() {
             builds: Vec::new(),
             backups: Vec::new(),
             images: Vec::new(),
+            warm: Vec::new(),
             volumes: Vec::new(),
             edge_backends: vec![
                 wire::EdgeBackendStatus {
@@ -1041,6 +1044,7 @@ fn report_one(applied_rev: u64, vm_id: &str, status: ObservedStatus) -> NodeMess
         edge_backends: Vec::new(),
         backups: Vec::new(),
         images: Vec::new(),
+        warm: Vec::new(),
         volumes: Vec::new(),
     })
 }

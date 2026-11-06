@@ -173,6 +173,25 @@ CREATE TABLE IF NOT EXISTS kept_snapshots (
     pause_ms      INTEGER NOT NULL,
     cells         BLOB
 );
+CREATE TABLE IF NOT EXISTS warm_targets (
+    volume_id        TEXT PRIMARY KEY,
+    app_id           TEXT NOT NULL,
+    size_gb          INTEGER NOT NULL,
+    complete_seq     INTEGER,
+    taken_at         TEXT,
+    completed_at     TEXT,
+    allocated_bytes  INTEGER,
+    cells            BLOB,
+    highest_token    INTEGER NOT NULL DEFAULT 0,
+    rejected_token   INTEGER,
+    rejected_at      TEXT,
+    pending_seq      INTEGER,
+    pending_taken_at TEXT,
+    pending_root     TEXT,
+    pending_cells    BLOB,
+    error            TEXT,
+    removed          INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS fences (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     lease_id  TEXT NOT NULL,
@@ -368,6 +387,52 @@ pub struct KeptSnapshotRecord {
     pub seq: Option<u64>,
     /// The copy's cell hashes, when the node keeps them (section 6.13).
     pub cells: Option<Vec<u8>>,
+}
+
+/// The warm copy this node holds as the target of a warm volume
+/// (`node-agent-protocol.md` sections 6.13 and 12).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WarmTargetRecord {
+    pub volume_id: String,
+    pub app_id: String,
+    pub size_gb: u32,
+    /// The `snapshot_seq` of the complete copy, `None` before the first one
+    /// or when the copy on disk is not known to be one.
+    pub complete_seq: Option<u64>,
+    /// When the source took that copy's snapshot, from its stream header.
+    pub taken_at: Option<String>,
+    /// When this node swapped that copy in.
+    pub completed_at: Option<String>,
+    /// Bytes the complete copy uses on disk.
+    pub allocated_bytes: Option<u64>,
+    /// The complete copy's cell hashes in their stored form, when known.
+    pub cells: Option<Vec<u8>>,
+    /// The highest fencing token of a stream this node accepted (section
+    /// 8.6).
+    pub highest_token: u64,
+    /// The token of the last stream refused as stale, and when.
+    pub rejected_token: Option<u64>,
+    pub rejected_at: Option<String>,
+    /// A copy about to be swapped in, written before the swap so that a
+    /// crash between the swap and its record is resolved at the next start.
+    pub pending: Option<PendingCommit>,
+    /// One line on the last failed stream.
+    pub error: Option<String>,
+    /// The copy was removed on a `deleted` entry; the row stays until the
+    /// entry leaves `spec.volumes`, so the reconciler keeps leaving the
+    /// entry to the warm receiver.
+    pub removed: bool,
+}
+
+/// A copy the node is about to swap in (see [`WarmTargetRecord::pending`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingCommit {
+    pub seq: u64,
+    pub taken_at: String,
+    /// The copy's root hash, 64 lowercase hex characters.
+    pub root: String,
+    /// Its cell hashes in their stored form.
+    pub cells: Vec<u8>,
 }
 
 /// One backup job row (`node-agent-protocol.md` section 12 `backups`).
@@ -1331,6 +1396,247 @@ impl NodeStore {
             .map(|_| ())
     }
 
+    /// The warm copy of one volume this node holds as a target.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure or a row it cannot read back.
+    pub async fn warm_target(
+        &self,
+        volume_id: &str,
+    ) -> Result<Option<WarmTargetRecord>, AgentError> {
+        let row = sqlx::query("SELECT * FROM warm_targets WHERE volume_id = ?")
+            .bind(volume_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(store_error)?;
+        row.map(warm_target_record).transpose()
+    }
+
+    /// Every warm copy this node holds as a target, sorted by volume id.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure or a row it cannot read back.
+    pub async fn warm_targets(&self) -> Result<Vec<WarmTargetRecord>, AgentError> {
+        let rows = sqlx::query("SELECT * FROM warm_targets ORDER BY volume_id ASC")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(store_error)?;
+        rows.into_iter().map(warm_target_record).collect()
+    }
+
+    /// Every warm target row without its cell hashes, sorted by volume id:
+    /// `cells` and `pending` are always `None`. For the status entries and
+    /// the reconciler, which run every few seconds and need neither (the
+    /// hashes of a 1 TiB copy are 32 MiB).
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure or a row it cannot read back.
+    pub async fn warm_target_summaries(&self) -> Result<Vec<WarmTargetRecord>, AgentError> {
+        let rows = sqlx::query(
+            "SELECT volume_id, app_id, size_gb, complete_seq, taken_at, completed_at, \
+             allocated_bytes, NULL AS cells, highest_token, rejected_token, rejected_at, \
+             NULL AS pending_seq, NULL AS pending_taken_at, NULL AS pending_root, \
+             NULL AS pending_cells, error, removed \
+             FROM warm_targets ORDER BY volume_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_error)?;
+        rows.into_iter().map(warm_target_record).collect()
+    }
+
+    /// Records that this node is the target of a warm volume, unless it is
+    /// recorded already; an existing row is left as it is, except that a
+    /// removed copy's row is a target again.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn add_warm_target(
+        &self,
+        volume_id: &str,
+        app_id: &str,
+        size_gb: u32,
+    ) -> Result<(), AgentError> {
+        sqlx::query(
+            "INSERT INTO warm_targets (volume_id, app_id, size_gb) VALUES (?, ?, ?) \
+             ON CONFLICT(volume_id) DO UPDATE SET removed = 0 WHERE warm_targets.removed = 1",
+        )
+        .bind(volume_id)
+        .bind(app_id)
+        .bind(i64::from(size_gb))
+        .execute(&self.pool)
+        .await
+        .map_err(store_error)
+        .map(|_| ())
+    }
+
+    /// Writes the copy's state of one warm target row: everything but the
+    /// last stale stream, the error and the removed mark, which only their
+    /// own calls write, so a stream that holds the lock never erases a
+    /// rejection recorded while it ran. Only the holder of the volume's lock
+    /// calls it.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn save_warm_target(&self, record: &WarmTargetRecord) -> Result<(), AgentError> {
+        let as_i64 = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+        let pending = record.pending.as_ref();
+        sqlx::query(
+            "INSERT INTO warm_targets (volume_id, app_id, size_gb, complete_seq, taken_at, \
+             completed_at, allocated_bytes, cells, highest_token, rejected_token, rejected_at, \
+             pending_seq, pending_taken_at, pending_root, pending_cells, error) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(volume_id) DO UPDATE SET app_id = excluded.app_id, \
+             size_gb = excluded.size_gb, complete_seq = excluded.complete_seq, \
+             taken_at = excluded.taken_at, completed_at = excluded.completed_at, \
+             allocated_bytes = excluded.allocated_bytes, cells = excluded.cells, \
+             highest_token = MAX(warm_targets.highest_token, excluded.highest_token), \
+             pending_seq = excluded.pending_seq, pending_taken_at = excluded.pending_taken_at, \
+             pending_root = excluded.pending_root, pending_cells = excluded.pending_cells",
+        )
+        .bind(&record.volume_id)
+        .bind(&record.app_id)
+        .bind(i64::from(record.size_gb))
+        .bind(record.complete_seq.map(as_i64))
+        .bind(record.taken_at.as_deref())
+        .bind(record.completed_at.as_deref())
+        .bind(record.allocated_bytes.map(as_i64))
+        .bind(record.cells.as_deref())
+        .bind(as_i64(record.highest_token))
+        .bind(record.rejected_token.map(as_i64))
+        .bind(record.rejected_at.as_deref())
+        .bind(pending.map(|p| as_i64(p.seq)))
+        .bind(pending.map(|p| p.taken_at.as_str()))
+        .bind(pending.map(|p| p.root.as_str()))
+        .bind(pending.map(|p| p.cells.as_slice()))
+        .bind(record.error.as_deref())
+        .execute(&self.pool)
+        .await
+        .map_err(store_error)
+        .map(|_| ())
+    }
+
+    /// Raises the highest token seen in a stream of a warm volume; a lower
+    /// one leaves it as it is (section 8.6).
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn raise_warm_token(&self, volume_id: &str, token: u64) -> Result<(), AgentError> {
+        sqlx::query(
+            "UPDATE warm_targets SET highest_token = MAX(highest_token, ?) WHERE volume_id = ?",
+        )
+        .bind(i64::try_from(token).unwrap_or(i64::MAX))
+        .bind(volume_id)
+        .execute(&self.pool)
+        .await
+        .map_err(store_error)
+        .map(|_| ())
+    }
+
+    /// Records a stream refused as stale (section 6.13).
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn record_warm_rejection(
+        &self,
+        volume_id: &str,
+        token: u64,
+        at: &str,
+    ) -> Result<(), AgentError> {
+        sqlx::query(
+            "UPDATE warm_targets SET rejected_token = ?, rejected_at = ? WHERE volume_id = ?",
+        )
+        .bind(i64::try_from(token).unwrap_or(i64::MAX))
+        .bind(at)
+        .bind(volume_id)
+        .execute(&self.pool)
+        .await
+        .map_err(store_error)
+        .map(|_| ())
+    }
+
+    /// Sets or clears the one-line error of a warm target.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn set_warm_error(
+        &self,
+        volume_id: &str,
+        error: Option<&str>,
+    ) -> Result<(), AgentError> {
+        sqlx::query("UPDATE warm_targets SET error = ? WHERE volume_id = ?")
+            .bind(error)
+            .bind(volume_id)
+            .execute(&self.pool)
+            .await
+            .map_err(store_error)
+            .map(|_| ())
+    }
+
+    /// Records the cell hashes of the complete copy `complete_seq`, unless
+    /// the row names another copy by now.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn set_warm_cells(
+        &self,
+        volume_id: &str,
+        complete_seq: u64,
+        cells: &[u8],
+    ) -> Result<(), AgentError> {
+        sqlx::query("UPDATE warm_targets SET cells = ? WHERE volume_id = ? AND complete_seq = ?")
+            .bind(cells)
+            .bind(volume_id)
+            .bind(i64::try_from(complete_seq).unwrap_or(i64::MAX))
+            .execute(&self.pool)
+            .await
+            .map_err(store_error)
+            .map(|_| ())
+    }
+
+    /// Marks a warm copy removed on a `deleted` entry: no copy, nothing
+    /// pending, no error. The caller removed the file first.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn mark_warm_removed(&self, volume_id: &str) -> Result<(), AgentError> {
+        sqlx::query(
+            "UPDATE warm_targets SET removed = 1, complete_seq = NULL, taken_at = NULL, \
+             completed_at = NULL, allocated_bytes = NULL, cells = NULL, pending_seq = NULL, \
+             pending_taken_at = NULL, pending_root = NULL, pending_cells = NULL, error = NULL \
+             WHERE volume_id = ?",
+        )
+        .bind(volume_id)
+        .execute(&self.pool)
+        .await
+        .map_err(store_error)
+        .map(|_| ())
+    }
+
+    /// Forgets a warm target; the caller removed its copy first.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn forget_warm_target(&self, volume_id: &str) -> Result<(), AgentError> {
+        sqlx::query("DELETE FROM warm_targets WHERE volume_id = ?")
+            .bind(volume_id)
+            .execute(&self.pool)
+            .await
+            .map_err(store_error)
+            .map(|_| ())
+    }
+
     /// One backup job row.
     ///
     /// # Errors
@@ -1861,6 +2167,48 @@ fn kept_snapshot_record(row: sqlx::sqlite::SqliteRow) -> Result<KeptSnapshotReco
         purpose: row.try_get("purpose").map_err(store_error)?,
         seq: seq.and_then(|seq| u64::try_from(seq).ok()),
         cells: row.try_get("cells").map_err(store_error)?,
+    })
+}
+
+fn warm_target_record(row: sqlx::sqlite::SqliteRow) -> Result<WarmTargetRecord, AgentError> {
+    let u64_of = |name: &str| -> Result<Option<u64>, AgentError> {
+        let value: Option<i64> = row.try_get(name).map_err(store_error)?;
+        Ok(value.and_then(|value| u64::try_from(value).ok()))
+    };
+    let size_gb: i64 = row.try_get("size_gb").map_err(store_error)?;
+    let pending_seq = u64_of("pending_seq")?;
+    let pending_taken_at: Option<String> = row.try_get("pending_taken_at").map_err(store_error)?;
+    let pending_root: Option<String> = row.try_get("pending_root").map_err(store_error)?;
+    let pending_cells: Option<Vec<u8>> = row.try_get("pending_cells").map_err(store_error)?;
+    let pending = match (pending_seq, pending_taken_at, pending_root, pending_cells) {
+        (Some(seq), Some(taken_at), Some(root), Some(cells)) => Some(PendingCommit {
+            seq,
+            taken_at,
+            root,
+            cells,
+        }),
+        (None, None, None, None) => None,
+        _ => {
+            return Err(AgentError::Store(
+                "a warm target row holds part of a pending copy".to_owned(),
+            ));
+        }
+    };
+    Ok(WarmTargetRecord {
+        volume_id: row.try_get("volume_id").map_err(store_error)?,
+        app_id: row.try_get("app_id").map_err(store_error)?,
+        size_gb: u32::try_from(size_gb).unwrap_or(0),
+        complete_seq: u64_of("complete_seq")?,
+        taken_at: row.try_get("taken_at").map_err(store_error)?,
+        completed_at: row.try_get("completed_at").map_err(store_error)?,
+        allocated_bytes: u64_of("allocated_bytes")?,
+        cells: row.try_get("cells").map_err(store_error)?,
+        highest_token: u64_of("highest_token")?.unwrap_or(0),
+        rejected_token: u64_of("rejected_token")?,
+        rejected_at: row.try_get("rejected_at").map_err(store_error)?,
+        pending,
+        error: row.try_get("error").map_err(store_error)?,
+        removed: u64_of("removed")?.unwrap_or(0) != 0,
     })
 }
 

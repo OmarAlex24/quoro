@@ -294,6 +294,8 @@ pub struct Session {
     disk_free_path: Option<std::path::PathBuf>,
     /// The backup statuses the backup manager publishes (section 5.3).
     backups: Option<watch::Receiver<Vec<BackupStatus>>>,
+    /// The warm replication statuses both sides publish (section 5.3).
+    warm: Option<watch::Receiver<Vec<wire::WarmStatus>>>,
     /// The image-inventory transport (sections 5.3, 5.26), when the agent runs
     /// an engine that inventories images.
     inventory: Option<InventoryHub>,
@@ -428,6 +430,7 @@ impl Session {
             volumes: None,
             disk_free_path: None,
             backups: None,
+            warm: None,
             inventory: None,
             dialed_url: None,
             reported_applied_rev: 0,
@@ -473,6 +476,14 @@ impl Session {
     #[must_use]
     pub fn with_backups(mut self, backups: watch::Receiver<Vec<BackupStatus>>) -> Self {
         self.backups = Some(backups);
+        self
+    }
+
+    /// Attaches the warm replication statuses, reported in every
+    /// `status_report.warm` (section 5.3).
+    #[must_use]
+    pub fn with_warm(mut self, warm: watch::Receiver<Vec<wire::WarmStatus>>) -> Self {
+        self.warm = Some(warm);
         self
     }
 
@@ -811,6 +822,7 @@ impl Session {
         // A build status change is reported like an observed-VM change
         // (section 5.3).
         let mut builds = self.builds.as_ref().map(BuildsHandle::statuses);
+        let mut warm = self.warm.clone();
         let inventory_hub = self.inventory.clone();
         let mut last_rx = Instant::now();
         // The revoke whose fence runs, and the frames that wait for its
@@ -884,6 +896,22 @@ impl Session {
                     if changed.is_ok()
                         && let Err(e) = self.send_status(&mut sink).await
                     {
+                        warn!(error = %e, "could not send a status report; reconnecting");
+                        return Ok(SessionEnd::Reconnect);
+                    }
+                }
+                () = async {
+                    let changed = match warm.as_mut() {
+                        Some(statuses) => statuses.changed().await.is_ok(),
+                        None => false,
+                    };
+                    // A closed board (the receiver stopped) never wakes the
+                    // loop again.
+                    if !changed {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    if let Err(e) = self.send_status(&mut sink).await {
                         warn!(error = %e, "could not send a status report; reconnecting");
                         return Ok(SessionEnd::Reconnect);
                     }
@@ -1908,6 +1936,10 @@ impl Session {
                 .as_ref()
                 .map_or_else(Vec::new, |backups| backups.borrow().clone()),
             images,
+            warm: self
+                .warm
+                .as_ref()
+                .map_or_else(Vec::new, |warm| warm.borrow().clone()),
         };
         write_message(sink, NodeMessage::StatusReport(report), None).await?;
         self.reported_applied_rev = applied_rev;
