@@ -12,7 +12,7 @@ use crate::api::page;
 use crate::deploy;
 use crate::error::ApiError;
 use crate::request::{CallCtx, Resource};
-use quoro_proto::wire::EdgeOutReason;
+use quoro_proto::wire::{ControlMessage, EdgeOutReason};
 use quoro_types::{Prefix, Scope, is_id};
 use serde_json::{Map, Value, json};
 
@@ -181,17 +181,28 @@ pub async fn delete_app(state: &AppState, ctx: &CallCtx, app_id: &str) -> Result
     ctx.authorize(state, Scope::AppDelete, Some(&target), None, &params)
         .await?;
     match delete_app_tx(state, ctx, app_id, &params).await {
-        Ok((app, vm_ids, build_nodes)) => {
-            for vm_id in vm_ids {
-                state.notify_driver(&vm_id);
+        Ok(deleted) => {
+            // Section 4.1: the revoke reaches the holder before the snapshot
+            // that drops the app's instances and volumes.
+            if let Some((holder, revoke)) = &deleted.revoke {
+                state
+                    .hub
+                    .send_control(holder, &ControlMessage::LeaseRevoke(revoke.clone()));
+            }
+            for vm_id in &deleted.vm_ids {
+                state.notify_driver(vm_id);
             }
             // A build that was still running leaves the node's `spec.builds`.
-            for node_id in build_nodes {
-                state.hub.node_changed(&node_id);
+            for node_id in &deleted.build_nodes {
+                state.hub.node_changed(node_id);
+            }
+            // Each volume, now `deleting`, reaches its node as `deleted`.
+            for node_id in &deleted.volume_nodes {
+                state.hub.node_changed(node_id);
             }
             // The app's routes leave `spec.edge` of the edge.
             state.hub.edge_changed();
-            Ok(app)
+            Ok(deleted.app)
         }
         Err(error) => {
             ctx.audit_error(

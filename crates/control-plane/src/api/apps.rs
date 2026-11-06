@@ -1950,12 +1950,26 @@ pub async fn delete_app(
     Ok((StatusCode::ACCEPTED, Json(app)).into_response())
 }
 
+/// What [`delete_app_tx`] committed, for the notifications that follow it.
+pub(crate) struct DeletedApp {
+    /// The app as it was.
+    pub app: App,
+    /// The app's instances, now deleted.
+    pub vm_ids: Vec<String>,
+    /// The nodes of the app's builds, now deleted.
+    pub build_nodes: Vec<String>,
+    /// The nodes of the app's volumes, now `deleting`.
+    pub volume_nodes: std::collections::BTreeSet<String>,
+    /// The holder of the app's revoked `local` lease and its `lease_revoke`.
+    pub revoke: Option<(String, quoro_proto::LeaseRevoke)>,
+}
+
 pub(crate) async fn delete_app_tx(
     state: &AppState,
     ctx: &CallCtx,
     app_id: &str,
     params: &Value,
-) -> Result<(App, Vec<String>, Vec<String>), ApiError> {
+) -> Result<DeletedApp, ApiError> {
     if !deploy::is_id_with_prefix("app", app_id) {
         return Err(ApiError::not_found("app"));
     }
@@ -2089,11 +2103,13 @@ pub(crate) async fn delete_app_tx(
         .await?;
     }
 
-    // `volumes.app_id` has no foreign key (migration 0009): from M5b the
-    // volumes of a deleted app stay `deleting` until their node removes the
-    // files (ADR 0165). Until that ships every volume record goes here,
-    // explicitly and through the change log, and the app's `local` lease ends
-    // with it.
+    // `volumes.app_id` has no foreign key (migration 0009): every volume of
+    // the app, whatever its state, turns `deleting` and outlives the app, so
+    // `spec.volumes` carries it as `deleted` and its node removes the file.
+    // The row goes when the node reports it `deleted`, as for deleteVolume
+    // (ADR 0165, node-agent-protocol.md section 6.7). A detached volume can
+    // sit on another node than the app's instances, so each volume's node is
+    // told.
     let volumes = sqlx::query(&format!(
         "SELECT {} FROM volumes WHERE app_id = ?",
         crate::api::volumes::VOLUME_COLUMNS
@@ -2101,9 +2117,17 @@ pub(crate) async fn delete_app_tx(
     .bind(app_id)
     .fetch_all(&mut *w.tx)
     .await?;
+    let mut volume_nodes = std::collections::BTreeSet::new();
     for row in &volumes {
-        let volume = crate::api::volumes::volume_from_row(row)?;
-        sqlx::query("DELETE FROM volumes WHERE id = ?")
+        let mut volume = crate::api::volumes::volume_from_row(row)?;
+        volume_nodes.insert(row.try_get::<String, _>("node_id")?);
+        if volume.state == crate::api::volumes::VolumeState::Deleting {
+            continue;
+        }
+        volume.state = crate::api::volumes::VolumeState::Deleting;
+        volume.updated_at = now_rfc3339();
+        sqlx::query("UPDATE volumes SET state = 'deleting', updated_at = ? WHERE id = ?")
+            .bind(&volume.updated_at)
             .bind(&volume.id)
             .execute(&mut *w.tx)
             .await?;
@@ -2112,12 +2136,21 @@ pub(crate) async fn delete_app_tx(
             &actor,
             "volume",
             &volume.id,
-            Op::Delete,
+            Op::Update,
             volume.payload()?,
         )
         .await?;
     }
-    crate::leases::revoke_app_lease(&mut w.tx, app_id, &actor).await?;
+    // Section 8.3, "Released at deletion": the app's `local` lease ends with
+    // the app, and its holder is told with reason `deleted`.
+    let revoke = crate::leases::revoke_app_lease(&mut w.tx, app_id, &actor)
+        .await?
+        .map(|lease| {
+            (
+                lease.holder_node_id.clone(),
+                lease.revoke(quoro_proto::RevokeReason::Deleted),
+            )
+        });
 
     sqlx::query("DELETE FROM apps WHERE id = ?")
         .bind(app_id)
@@ -2155,7 +2188,13 @@ pub(crate) async fn delete_app_tx(
     )
     .await?;
     w.commit().await?;
-    Ok((app, vm_ids, build_nodes))
+    Ok(DeletedApp {
+        app,
+        vm_ids,
+        build_nodes,
+        volume_nodes,
+        revoke,
+    })
 }
 
 /// Bumps `restart_generation`; the node restarts the instances that carry the
