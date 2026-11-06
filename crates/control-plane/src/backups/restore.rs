@@ -23,7 +23,7 @@ use crate::api::backups::{
 use crate::api::vms::{VM_COLUMNS, vm_from_row};
 use crate::api::volumes::{VOLUME_COLUMNS, Volume, VolumeState};
 use crate::changelog::{self, Actor, Op};
-use crate::error::ApiError;
+use crate::error::{ApiError, Code};
 use crate::events::{self, NewEvent, Source};
 use crate::leases::{self, Lease};
 use crate::request::CallCtx;
@@ -260,8 +260,21 @@ pub(crate) async fn apply_status(
         }
         match reported.state {
             wire::VolumeState::Ready => {
-                let outcome = restore_ready(store, node_id, &volume, reported).await?;
-                applied.merge(outcome);
+                match restore_ready(store, node_id, &volume, reported).await {
+                    Ok(outcome) => applied.merge(outcome),
+                    // The app's lease waits for an operator's acknowledgement
+                    // of a failed fence (section 8.5), so it is granted to no
+                    // node yet. The transaction rolled back; the volume stays
+                    // `restoring`, and the next status report applies it once
+                    // the lease is acknowledged. The other volumes go on.
+                    Err(e) if e.code == Code::Conflict => tracing::warn!(
+                        volume_id = %volume.id,
+                        node_id,
+                        detail = ?e.detail,
+                        "a restored volume waits for its lease"
+                    ),
+                    Err(e) => return Err(e),
+                }
             }
             wire::VolumeState::Failed => {
                 let vm_node_ids = restore_failed(store, node_id, &volume, reported).await?;
@@ -516,9 +529,11 @@ async fn refuse_unrestorable(state: &AppState, backup: &BackupRecord) -> Result<
     Ok(())
 }
 
-/// Checks that `node_id` is a node with the `node` role and no failed fence.
+/// Checks that `node_id` is a node with the `node` role, no failed fence and
+/// no acknowledgement it has not taken yet: until it answers the `fence_ack`
+/// it stays failed and starts nothing stateful (section 8.5).
 async fn target_node(state: &AppState, node_id: &str) -> Result<(), ApiError> {
-    let row = sqlx::query("SELECT roles, fence_failure FROM nodes WHERE id = ?")
+    let row = sqlx::query("SELECT roles, fence_failure, fence_ack_pending FROM nodes WHERE id = ?")
         .bind(node_id)
         .fetch_optional(state.store.pool())
         .await?
@@ -533,6 +548,12 @@ async fn target_node(state: &AppState, node_id: &str) -> Result<(), ApiError> {
     let fence_failure: Option<String> = row.try_get("fence_failure")?;
     if fence_failure.is_some() {
         return Err(ApiError::conflict("the target node has a fence failure"));
+    }
+    let fence_ack_pending: Option<String> = row.try_get("fence_ack_pending")?;
+    if fence_ack_pending.is_some() {
+        return Err(ApiError::conflict(
+            "the target node has not taken the acknowledgement of its failed fence yet",
+        ));
     }
     Ok(())
 }

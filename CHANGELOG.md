@@ -10,6 +10,8 @@ Each entry links the pull request that made the change and, where one exists, th
 
 - **Warm volume calls in the engine.** The engine trait gains the calls warm replication is built on: `volume_changed_ranges` compares the extent maps of two reflink snapshots of a volume and returns only the byte ranges that differ (a full copy when there is no base or the maps cannot be compared), `stage_volume`, `commit_staged_volume` and `discard_staged_volume` build a volume's next copy beside the last good one and swap it in with one rename, and `pause` and `resume` freeze a running VM. A volume can now keep several snapshots, each in its own file. Nothing calls these yet; replication between nodes comes next ([#389], [#390], [ADR 0172], [ADR 0173]).
 
+- **Acknowledging a failed self-fence.** When a node cannot confirm that a VM stopped during a self-fence, including when it cannot list the engine's VMs, it marks itself failed and starts nothing stateful. Until now nothing could clear that mark, and the primary did not record the failure, so it could grant the lease again. The primary now lists the lease, app and VM ids in the node's `fence_failure` (`GET /api/v1/nodes/{node_id}`) and grants none of those leases until a human calls `POST /api/v1/nodes/{node_id}/fence-ack` with exactly the listed lease ids, after checking out of band that the VMs are stopped. Agents are refused with `human_only`, and the call is audited. The acknowledgement increments each lease's fencing token and reaches the node at once, or at its next session before its desired state; the node then clears those failed fences, and its failed mark once none remains ([#423], [#391], [#399], [ADR 0074], [ADR 0079]).
+
 ### Fixed
 
 - After a restore moved an app to another node, the old node recreated the app's VM, stopped and without its volume, and kept it with its Cloud Hypervisor process until the node agent restarted. The old node now deletes the VM as soon as the restore is accepted, and keeps only the detached volume's file ([#361]).
@@ -385,13 +387,16 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#388]: https://github.com/OmarAlex24/quoro/pull/388
 [#389]: https://github.com/OmarAlex24/quoro/issues/389
 [#390]: https://github.com/OmarAlex24/quoro/issues/390
+[#391]: https://github.com/OmarAlex24/quoro/issues/391
 [#397]: https://github.com/OmarAlex24/quoro/pull/397
 [#398]: https://github.com/OmarAlex24/quoro/pull/398
+[#399]: https://github.com/OmarAlex24/quoro/pull/399
 [#401]: https://github.com/OmarAlex24/quoro/pull/401
 [#403]: https://github.com/OmarAlex24/quoro/pull/403
 [#418]: https://github.com/OmarAlex24/quoro/issues/418
 [#420]: https://github.com/OmarAlex24/quoro/pull/420
 [#422]: https://github.com/OmarAlex24/quoro/pull/422
+[#423]: https://github.com/OmarAlex24/quoro/pull/423
 [ADR 0019]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0019-fencing-is-mandatory-and-lease-based-node-agent-self-fences.md
 [ADR 0020]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0020-per-app-ha-policies-none-cold-warm-hot-with-cost-shown-in.md
 [ADR 0027]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0027-signed-binaries-and-reproducible-builds-are-mandatory.md
@@ -401,7 +406,9 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [ADR 0061]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0061-q-0003-write-our-own-minimal-init-and-oci-to-ext4-pipeline.md
 [ADR 0064]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0064-first-public-release-is-an-m3-preview-v0-1-experimental-not.md
 [ADR 0071]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0071-engine-trait-async-methods-return-send-futures-fn-impl.md
+[ADR 0074]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0074-a-failed-forced-stop-escalates-sigkill-the-vmm-process-if.md
 [ADR 0075]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0075-concurrent-fences-and-a-mid-fence-crash-test-are-mandatory.md
+[ADR 0079]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0079-add-protocol-error-code-fence-failed-and-a-human-only.md
 [ADR 0080]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0080-dependency-license-policy-for-the-agpl-3-0-only-core-an.md
 [ADR 0081]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0081-release-signing-keyless-github-artifact-attestations.md
 [ADR 0083]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0083-vm-disk-gb-minimum-is-1-in-openapi-yaml-createvmrequest-and.md

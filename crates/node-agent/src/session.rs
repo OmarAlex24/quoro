@@ -1031,6 +1031,22 @@ impl Session {
                             .await?;
                         }
                     }
+                } else if command.kind == "fence_ack" {
+                    let body = match parse_fence_ack(&command.params) {
+                        Ok(lease_ids) => match &self.leases {
+                            Some(leases) => leases.fence_ack(lease_ids).await,
+                            // Without a lease service no fence was recorded.
+                            None => CommandResult {
+                                status: CommandStatus::Ok,
+                                detail: Some("no failed fence remains".to_owned()),
+                                error: None,
+                                lines: None,
+                                metrics: None,
+                            },
+                        },
+                        Err(message) => bad_result(&message),
+                    };
+                    write_message(sink, NodeMessage::CommandResult(body), Some(&raw.id)).await?;
                 } else if command.kind == "build_logs_query" {
                     match self.build_logs_query(&command).await {
                         Ok(body) => {
@@ -1845,6 +1861,26 @@ fn timestamp_param(params: &serde_json::Value, name: &str) -> Result<Option<i64>
             .map(Some)
             .ok_or_else(|| format!("{name} is not an RFC 3339 timestamp")),
     }
+}
+
+/// The `lease_ids` of a `fence_ack` command (section 5.17): at least one
+/// `lse_` id.
+fn parse_fence_ack(params: &serde_json::Value) -> Result<Vec<String>, String> {
+    let ids = params
+        .get("lease_ids")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "fence_ack needs lease_ids".to_owned())?;
+    let mut lease_ids = Vec::with_capacity(ids.len());
+    for id in ids {
+        match id.as_str() {
+            Some(id) if id.starts_with("lse_") => lease_ids.push(id.to_owned()),
+            _ => return Err(format!("fence_ack lease id {id} is not an lse_ id")),
+        }
+    }
+    if lease_ids.is_empty() {
+        return Err("fence_ack needs at least one lease id".to_owned());
+    }
+    Ok(lease_ids)
 }
 
 /// Parses `inventory_resend` params (section 5.26): the image's digest.

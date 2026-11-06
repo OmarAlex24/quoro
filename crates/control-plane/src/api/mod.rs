@@ -123,6 +123,10 @@ pub fn routes() -> Router<AppState> {
             put(nodes::set_node_tunnel).delete(nodes::delete_node_tunnel),
         )
         .route(
+            "/api/v1/nodes/{node_id}/fence-ack",
+            post(nodes::ack_node_fence),
+        )
+        .route(
             "/api/v1/projects",
             get(projects::list_projects).post(projects::create_project),
         )

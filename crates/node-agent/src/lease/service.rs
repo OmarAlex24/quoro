@@ -46,7 +46,7 @@
 //! again ([`LeaseTable::restore`]). A revoke is answered with success only once
 //! that transaction committed.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::SystemTime;
@@ -226,6 +226,10 @@ enum LeaseCommand {
         envelope: Envelope<LeaseRevoke>,
         reply: oneshot::Sender<Result<CommandResult, ProtocolError>>,
     },
+    FenceAck {
+        lease_ids: Vec<String>,
+        reply: oneshot::Sender<CommandResult>,
+    },
 }
 
 /// The session's handle to the lease service.
@@ -299,6 +303,26 @@ impl LeaseLink {
     }
 }
 
+impl LeaseLink {
+    /// Applies a `fence_ack` (section 5.17, section 8.5): clears the failed
+    /// fence of each listed lease, and the node's failed mark once none
+    /// remains. The listed leases stay `revoked` or `expired`: nothing starts
+    /// for them before a grant with a higher token.
+    pub async fn fence_ack(&self, lease_ids: Vec<String>) -> CommandResult {
+        let (reply, answer) = oneshot::channel();
+        if self
+            .commands
+            .send(LeaseCommand::FenceAck { lease_ids, reply })
+            .is_err()
+        {
+            return not_fenced("the lease service is not running");
+        }
+        answer
+            .await
+            .unwrap_or_else(|_| not_fenced("the lease service stopped"))
+    }
+}
+
 /// A running lease service plus the handles the rest of the agent uses.
 pub struct LocalLeases {
     /// The session's handle.
@@ -328,6 +352,7 @@ pub async fn start_local_leases<E: Engine + 'static>(
     desired: watch::Receiver<Option<Snapshot>>,
 ) -> Result<LocalLeases, AgentError> {
     let records = store.fences().await?;
+    let unreported = unreported_failures(&store, &records).await;
     let recorded: HashSet<(LeaseId, u64)> = records
         .iter()
         .filter(|record| record.complete)
@@ -372,6 +397,21 @@ pub async fn start_local_leases<E: Engine + 'static>(
         warn!(error = %e, "could not store the host boot id");
     }
     let failed = store.node_failed().await?;
+    if let Some(failures) = unreported {
+        report_unreported(&store, &config, &table, failures).await;
+    }
+    if failed
+        && store
+            .failed_fences()
+            .await
+            .is_ok_and(|listed| listed.is_empty())
+    {
+        warn!(
+            "the node is marked failed but names no failed fence, so the primary lists nothing \
+             to acknowledge; the next fence_ack this node takes clears the mark, or clear it by \
+             hand once its VMs are checked"
+        );
+    }
     let view = LeaseView::new(table, failed);
     let (commands, command_rx) = mpsc::unbounded_channel();
     let (hello_tx, hello_rx) = watch::channel(hello_leases(&view.table));
@@ -391,6 +431,7 @@ pub async fn start_local_leases<E: Engine + 'static>(
         tasks: JoinSet::new(),
         task_leases: HashMap::new(),
         recorded,
+        unstored_failures: BTreeSet::new(),
     };
     service.note_bindings();
     let task = tokio::spawn(service.run());
@@ -402,6 +443,86 @@ pub async fn start_local_leases<E: Engine + 'static>(
         view,
         task,
     })
+}
+
+/// The latest failed fence record of each lease an upgrade left to report,
+/// or `None` when there is nothing to report (`node_meta`
+/// `failed_fences_unreported`).
+async fn unreported_failures(
+    store: &NodeStore,
+    records: &[FenceRecord],
+) -> Option<Vec<FenceRecord>> {
+    match store.failed_fences_unreported().await {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(e) => {
+            warn!(error = %e, "could not read whether failed fences wait to be reported");
+            return None;
+        }
+    }
+    let listed = match store.failed_fences().await {
+        Ok(listed) => listed,
+        Err(e) => {
+            // The flag stays set, so the next start reports them.
+            warn!(error = %e, "could not read the failed fences to report");
+            return None;
+        }
+    };
+    let mut latest: HashMap<String, FenceRecord> = HashMap::new();
+    for record in records.iter().filter(|record| !record.complete) {
+        if listed.contains(&record.lease_id.0) {
+            latest.insert(record.lease_id.0.clone(), record.clone());
+        }
+    }
+    let mut failures: Vec<FenceRecord> = latest.into_values().collect();
+    failures.sort_by(|a, b| a.lease_id.0.cmp(&b.lease_id.0));
+    Some(failures)
+}
+
+/// Reports, once, the failed fences an older agent recorded: one
+/// `node.fence_failed` per lease, naming the VMs its record names, so the
+/// primary lists them for an acknowledgement (section 8.5). Best effort: a
+/// store that takes no writes reports them at the next start.
+async fn report_unreported(
+    store: &NodeStore,
+    config: &LeaseConfig,
+    table: &LeaseTable,
+    failures: Vec<FenceRecord>,
+) {
+    let mut events = Vec::with_capacity(failures.len());
+    for record in failures {
+        let app_ids: Vec<String> = table
+            .get(&record.lease_id)
+            .filter(|lease| lease.resource_type == ResourceType::App)
+            .map(|lease| vec![lease.resource_id.clone()])
+            .unwrap_or_default();
+        let vm_ids: Vec<String> = record.vm_ids.iter().map(|vm| vm.0.clone()).collect();
+        let evt_id = util::event_id();
+        let event = serde_json::json!({
+            "schema_version": 1,
+            "id": evt_id,
+            "type": "node.fence_failed",
+            "time": util::rfc3339_nanos(store.next_log_time()),
+            "source": {"kind": "node", "node_id": config.node_id},
+            "subject": {"type": "lease", "id": record.lease_id.0},
+            "actor": {"type": "node", "id": config.node_id},
+            "data": {
+                "node_id": config.node_id,
+                "app_ids": app_ids,
+                "lease_ids": [record.lease_id.0],
+                "vm_ids": vm_ids,
+                "reason": match record.reason {
+                    FenceReason::LeaseExpired => "lease_expired",
+                    FenceReason::LeaseRevoked => "lease_revoked",
+                },
+                "error": "reported again after an agent upgrade: this fence failed before the agent kept a list of failed fences",
+            },
+        });
+        events.push((evt_id, event));
+    }
+    if let Err(e) = store.report_failed_fences(&events).await {
+        warn!(error = %e, "could not report the failed fences an older agent recorded");
+    }
 }
 
 /// Who waits for a fence to finish: the revoke it answers.
@@ -466,6 +587,10 @@ struct LocalLeaseService<E: Engine> {
     task_leases: HashMap<tokio::task::Id, LeaseId>,
     /// The complete fences recorded in the store, by lease and token.
     recorded: HashSet<(LeaseId, u64)>,
+    /// Leases whose failed fence the store did not take: the failed mark
+    /// holds for them in memory, and only a `fence_ack` naming them clears
+    /// them (section 5.17).
+    unstored_failures: BTreeSet<String>,
 }
 
 impl<E: Engine + 'static> LocalLeaseService<E> {
@@ -525,6 +650,63 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
             }
             LeaseCommand::Revoke { envelope, reply } => {
                 self.revoke(envelope, reply).await;
+            }
+            LeaseCommand::FenceAck { lease_ids, reply } => {
+                let _ = reply.send(self.fence_ack(&lease_ids).await);
+            }
+        }
+    }
+
+    /// Section 5.17 `fence_ack`: the store clears the listed failed fences
+    /// first, and the failed mark in memory follows only once the store says
+    /// none remains, so a crash never leaves the node startable with a failed
+    /// fence still recorded.
+    async fn fence_ack(&mut self, lease_ids: &[String]) -> CommandResult {
+        // A fence of a listed lease that is still running may fail after the
+        // operator checked; its outcome must not be cleared unseen.
+        if let Some(busy) = lease_ids
+            .iter()
+            .find(|lease_id| self.in_flight.contains_key(&LeaseId((*lease_id).clone())))
+        {
+            return not_fenced(&format!(
+                "a fence of lease {busy} is running; the acknowledgement is not applied"
+            ));
+        }
+        match self.store.ack_fences(lease_ids).await {
+            Ok(mut remaining) => {
+                for lease_id in lease_ids {
+                    self.unstored_failures.remove(lease_id);
+                }
+                for lease_id in &self.unstored_failures {
+                    if !remaining.contains(lease_id) {
+                        remaining.push(lease_id.clone());
+                    }
+                }
+                if remaining.is_empty() {
+                    self.view.failed.store(false, Ordering::SeqCst);
+                    CommandResult {
+                        status: CommandStatus::Ok,
+                        detail: Some("no failed fence remains".to_owned()),
+                        error: None,
+                        lines: None,
+                        metrics: None,
+                    }
+                } else {
+                    CommandResult {
+                        status: CommandStatus::Ok,
+                        detail: Some(format!(
+                            "the node stays failed: failed fences remain for {}",
+                            remaining.join(", ")
+                        )),
+                        error: None,
+                        lines: None,
+                        metrics: None,
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "could not clear acknowledged fences");
+                not_fenced(&format!("the acknowledgement could not be stored: {e}"))
             }
         }
     }
@@ -885,8 +1067,16 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                 {
                     warn!(error = %e, lease_id = %lease_id.0, "could not persist a lease");
                 }
-                if !complete && let Err(e) = self.store.set_node_failed(true).await {
+                if !complete
+                    && let Err(e) = self
+                        .store
+                        .mark_fence_failed(&lease_id.0, &evt_id, &event)
+                        .await
+                {
                     warn!(error = %e, "could not store the node's failed mark");
+                    // An acknowledgement of other leases must not clear the
+                    // mark this failure holds in memory.
+                    self.unstored_failures.insert(lease_id.0.clone());
                 }
                 if complete {
                     not_fenced(&format!(
@@ -1012,10 +1202,11 @@ fn service_gone() -> ProtocolError {
     }
 }
 
-/// The answer to a revoke whose fence is neither recorded nor failed: the
-/// VMs are not known to be stopped and recorded (section 5.9), so the answer
-/// is not `ok`. It carries no error code: `bad_message` would mean the revoke
-/// was stale, `fence_failed` that a VM may still run.
+/// An error answer with no error code. For a revoke whose fence is neither
+/// recorded nor failed, the VMs are not known to be stopped and recorded
+/// (section 5.9), so the answer is not `ok`; `bad_message` would mean the
+/// revoke was stale, `fence_failed` that a VM may still run. For a
+/// `fence_ack`, nothing was cleared and the primary sends it again.
 fn not_fenced(detail: &str) -> CommandResult {
     CommandResult {
         status: CommandStatus::Error,

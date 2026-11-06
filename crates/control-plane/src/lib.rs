@@ -25,6 +25,7 @@ pub mod driver;
 pub(crate) mod edge_health;
 pub mod error;
 pub mod events;
+pub(crate) mod fences;
 pub mod idempotency;
 pub mod interactive;
 pub mod keys;
