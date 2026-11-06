@@ -191,7 +191,7 @@ node agent                                          primary
 
 1. `hello` is the first message the node sends on every session.
 2. `welcome` is the first message the primary sends. From M5b the node compares its `term` with the highest term it has seen and ends the session with `error` code `stale_term` when the `welcome` is lower (section 8.8).
-3. The primary sends any `lease_revoke` before anything else. The node stops the stateful VMs bound to those leases and answers `command_result` for each revoke before it processes the next message.
+3. The primary sends any `lease_revoke` before anything else. The node stops the stateful VMs bound to those leases and answers `command_result` for each revoke. While a revoke's self-fence runs, the node keeps processing `lease_grant` for other leases, including the answers to its renewals, and liveness traffic; it holds back every other message, such as `desired_state`, a `lease_revoke` of the same lease, `command` and `stream_open`, until it has answered the revoke (section 5.13, ADR 0222).
 4. If an operator acknowledged a failed fence of this node and the node has not yet confirmed it, the primary then sends `command` kind `fence_ack` (sections 5.17 and 8.5) and waits for its `command_result`.
 5. Only then does the primary send `desired_state`. The node verifies, persists, answers `command_result` with `ok`, and reconciles.
 6. `log_entries` follow the desired state; the node acknowledges with `log_ack` as it verifies the chain.
@@ -1005,7 +1005,16 @@ A grant whose token is lower than the highest token the node has seen for that r
 
 A revoke whose token is lower than the node's current token predates the node's latest grant; it is refused with `error` code `bad_message`, non-fatal, and the node keeps the lease and its VMs as they are (D-0073).
 
-On receipt the node stops the stateful VMs bound to the lease, records the stop locally, moves the lease to `revoked`, and answers `command_result` **before** it processes any later message of the session. If the self-fence cannot confirm that every bound VM stopped, the answer is `command_result` with status `error` and the node follows section 8.5's failed-fence path.
+On receipt the node starts nothing more for the lease: from then on no VM bound to it starts, whatever arrives later (section 6.4), until a grant with a higher token (section 8.5 step 4). It stops the stateful VMs bound to the lease, records the stop locally, moves the lease to `revoked`, and answers `command_result`. If the self-fence cannot confirm that every bound VM stopped, the answer is `command_result` with status `error` and the node follows section 8.5's failed-fence path. An agent that restarted without a verified desired-state snapshot cannot tell which VMs the lease binds; when it holds no recorded fence for the lease, it stops every app VM instead (section 6.3).
+
+**Order while the fence runs** (ADR 0222). Until it has answered the revoke, the node processes only:
+
+- `lease_grant` for any other lease, including the answers to its `lease_renew`;
+- liveness traffic: it keeps sending `heartbeat`, answers `ping` with `pong`, and accepts the `pong` that answers its own `ping`.
+
+It also keeps sending `lease_renew` for its other `expiring` leases. Every other message of the session is held back and processed in the order received once the revoke is answered: for example `desired_state`, a `lease_revoke` of the same lease, `command` and `stream_open`.
+
+This is safe. Section 4.2 rule 3 exists so that nothing received after a revoke can start the revoked lease's VMs before they are stopped. None of the messages let through can: a grant names another lease, liveness traffic starts nothing, and the start gate above keeps every VM of the revoked lease stopped while its fence runs and afterwards. Holding back every message would hold back renewal answers too. A `local` lease's fence has no deadline and can take longer than a third of `D`, so an `expiring` lease of another app could reach `valid_until` and fence although the primary renewed it.
 
 ```json
 {
@@ -1608,6 +1617,7 @@ The order exists so that a VM never starts on a network that is not ready, and n
 - From M5b a VM that stays unhealthy is restarted (ADR 0184). With `restart` true, after `failures` consecutive failures outside the start period the node, besides reporting `failing` and emitting `app.down`, stops the VM and starts it again in place, with the crash backoff above (1 s doubling to 5 min, reset after 10 minutes healthy). The start period begins again at each start. A stateful VM is started again only under the rule of section 6.4: its node holds the app's lease in state `held` with the matching token; otherwise it stays stopped, as for any stateful start. A health restart is not a human restart: it does not change `restart_generation`. With `restart` false the node only reports, as before M5b. A snapshot without `restart` means true.
 - Image preparation is cached by digest. Two VMs with the same digest share one prepared rootfs; the digest, not the tag, is the key.
 - An agent restart does not restart VMs. VMMs are separate processes that outlive the agent, and the agent rediscovers them on start (`engine-trait.md`, D-0011). This is what makes an agent upgrade invisible to running apps.
+- One exception (ADR 0224). An agent can restart with no verified desired-state snapshot in its store: none was persisted, or none verifies. If it then receives a `lease_revoke` for a lease with no recorded fence, it cannot tell which VMs that lease binds. It fences by stopping every app VM on the node, as section 8.5 describes, records the stop for that lease, and answers the revoke. It stops no builder VM. It starts nothing until the first `desired_state` verifies. Then it starts again the VMs of other leases and of stateless apps that the snapshot lists as running, a stateful VM only under the rule of section 6.4; the revoked lease's VMs stay stopped. The case needs both a missing snapshot and a revoke with no recorded fence, so it is rare, and stopping every app VM is the safe side against two copies of one app.
 
 ### 6.4 Stateful starts
 
@@ -1945,7 +1955,7 @@ The primary's single-writer critical section is its own database transaction. Wh
 
 When a lease reaches `expired` or `revoked`, the node:
 
-1. Stops every stateful VM bound to that lease with `StopMode::Graceful { timeout: T_grace }`, then with `StopMode::Force` if the timeout passes, so the whole stop finishes within `T_grace + T_force <= M` (`engine-trait.md`). The forced stop escalates to `SIGKILL` on the VMM process inside the engine (`engine-trait.md` section 3.8).
+1. Stops every stateful VM bound to that lease (after an agent restart with no verified desired-state snapshot, every app VM, section 6.3) with `StopMode::Graceful { timeout: T_grace }`, then with `StopMode::Force` if the timeout passes, so the whole stop finishes within `T_grace + T_force <= M` (`engine-trait.md`). The forced stop escalates to `SIGKILL` on the VMM process inside the engine (`engine-trait.md` section 3.8).
 2. Records the stop locally: lease id, token, VM ids, time and the reason (`expired` or `revoked`), so the fact survives an agent restart.
 3. Emits `node.fenced` with the lease, the token and the VM ids — only when every bound VM is confirmed stopped or gone. If the session is down the event is buffered (section 6.5) and delivered later.
 4. Starts nothing stateful for that resource until a new `lease_grant` arrives with a higher `fencing_token`.
