@@ -17,9 +17,16 @@
 //!   The hostname is served when there is an edge, and a `tunnel` hostname
 //!   only when the edge has a tunnel.
 //!
-//! An app with no instance meant to run leaves its domains `pending`. A
-//! domain that becomes `unserved` emits `domain.unserved`, and one that goes
-//! from `unserved` back to `serving` emits `domain.served`.
+//! An app with no instance meant to run leaves its domains `pending`.
+//!
+//! Every `domain.unserved` gets its `domain.served`. A domain that becomes
+//! `unserved` opens an unserved period and emits `domain.unserved`; the next
+//! time it becomes `serving` the period closes and `domain.served` is emitted
+//! with `unserved_since`, whatever came in between: a stopped app's domain
+//! goes `unserved`, `pending`, `serving` and is still announced as served
+//! again. A domain that becomes `unserved` while its period is still open
+//! emits nothing more. The period is read from the domain's latest serving
+//! event, so it survives a primary restart.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -150,7 +157,6 @@ pub async fn recompute(store: &Store) -> Result<usize, ApiError> {
         if domain.serving_status == status && domain.last_error == error {
             continue;
         }
-        let before = domain.serving_status;
         domain.serving_status = status;
         domain.last_error = error;
         sqlx::query("UPDATE domains SET serving_status = ?, last_error = ? WHERE id = ?")
@@ -162,56 +168,51 @@ pub async fn recompute(store: &Store) -> Result<usize, ApiError> {
         let payload = serde_json::to_value(&domain)
             .map_err(|error| ApiError::internal(&format!("domain payload: {error}")))?;
         changelog::append(&mut w.tx, &actor, "domain", &domain.id, Op::Update, payload).await?;
-        announce(&mut w.tx, &domain, before, &app.project_id).await?;
+        announce(&mut w.tx, &domain, &app.project_id).await?;
         changed += 1;
     }
     w.commit().await?;
     Ok(changed)
 }
 
-/// Emits `domain.unserved` when `domain` became `unserved`, and
-/// `domain.served` when it went from `unserved` to `serving`.
+/// The event a domain announces when its status changes to `now`, given
+/// whether its unserved period is open.
+fn event_kind(now: ServingStatus, open: bool) -> Option<&'static str> {
+    match (now, open) {
+        (ServingStatus::Unserved, false) => Some("domain.unserved"),
+        (ServingStatus::Serving, true) => Some("domain.served"),
+        _ => None,
+    }
+}
+
+/// Emits `domain.unserved` when `domain` became `unserved` with no unserved
+/// period open, and `domain.served` when it became `serving` with one open.
 async fn announce(
     conn: &mut SqliteConnection,
     domain: &Domain,
-    before: ServingStatus,
     project_id: &str,
 ) -> Result<(), ApiError> {
-    let tls_mode = domain.tls_mode.as_str();
-    let (kind, data) = match (before, domain.serving_status) {
-        (ServingStatus::Unserved, ServingStatus::Unserved) => return Ok(()),
-        (_, ServingStatus::Unserved) => {
-            tracing::warn!(
-                domain_id = %domain.id,
-                hostname = %domain.hostname,
-                error = domain.last_error.as_deref().unwrap_or_default(),
-                "no machine serves the hostname"
-            );
-            (
-                "domain.unserved",
-                json!({
-                    "domain_id": domain.id,
-                    "app_id": domain.app_id,
-                    "hostname": domain.hostname,
-                    "tls_mode": tls_mode,
-                    "error": domain.last_error.as_deref().unwrap_or_default(),
-                }),
-            )
-        }
-        (ServingStatus::Unserved, ServingStatus::Serving) => {
-            let mut data = json!({
-                "domain_id": domain.id,
-                "app_id": domain.app_id,
-                "hostname": domain.hostname,
-                "tls_mode": tls_mode,
-            });
-            if let Some(since) = unserved_since(conn, &domain.id).await? {
-                data["unserved_since"] = json!(since);
-            }
-            ("domain.served", data)
-        }
-        _ => return Ok(()),
+    let since = open_unserved_since(conn, &domain.id).await?;
+    let Some(kind) = event_kind(domain.serving_status, since.is_some()) else {
+        return Ok(());
     };
+    let mut data = json!({
+        "domain_id": domain.id,
+        "app_id": domain.app_id,
+        "hostname": domain.hostname,
+        "tls_mode": domain.tls_mode.as_str(),
+    });
+    if let Some(since) = since {
+        data["unserved_since"] = json!(since);
+    } else {
+        tracing::warn!(
+            domain_id = %domain.id,
+            hostname = %domain.hostname,
+            error = domain.last_error.as_deref().unwrap_or_default(),
+            "no machine serves the hostname"
+        );
+        data["error"] = json!(domain.last_error.as_deref().unwrap_or_default());
+    }
     events::emit(
         conn,
         NewEvent {
@@ -229,20 +230,22 @@ async fn announce(
     Ok(())
 }
 
-/// When `domain_id` last became `unserved`: the time of its latest
-/// `domain.unserved` event, when one is kept.
-async fn unserved_since(
+/// When `domain_id`'s open unserved period began: the time of its latest
+/// serving event when that event is a `domain.unserved`. `None` when the
+/// domain has no such event or a `domain.served` closed the period.
+async fn open_unserved_since(
     conn: &mut SqliteConnection,
     domain_id: &str,
 ) -> Result<Option<String>, ApiError> {
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT time FROM events WHERE type = 'domain.unserved' \
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT type, time FROM events \
+         WHERE type IN ('domain.unserved', 'domain.served') \
          AND json_extract(subject, '$.id') = ? ORDER BY seq DESC LIMIT 1",
     )
     .bind(domain_id)
     .fetch_optional(&mut *conn)
     .await?;
-    Ok(row.map(|row| row.0))
+    Ok(row.and_then(|(kind, time)| (kind == "domain.unserved").then_some(time)))
 }
 
 /// Per app: its replicas, its project and its instances meant to run, in
@@ -308,6 +311,25 @@ mod tests {
             edge: false,
             edge_tunnel: false,
         }
+    }
+
+    #[test]
+    fn every_unserved_event_is_closed_by_one_served_event() {
+        // Becoming unserved opens a period, once.
+        assert_eq!(
+            event_kind(ServingStatus::Unserved, false),
+            Some("domain.unserved")
+        );
+        assert_eq!(event_kind(ServingStatus::Unserved, true), None);
+        // Becoming serving closes an open period, from any status.
+        assert_eq!(
+            event_kind(ServingStatus::Serving, true),
+            Some("domain.served")
+        );
+        assert_eq!(event_kind(ServingStatus::Serving, false), None);
+        // Pending neither opens nor closes one.
+        assert_eq!(event_kind(ServingStatus::Pending, true), None);
+        assert_eq!(event_kind(ServingStatus::Pending, false), None);
     }
 
     #[test]

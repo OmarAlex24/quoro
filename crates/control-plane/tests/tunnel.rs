@@ -1528,6 +1528,16 @@ async fn events_of(server: &Server, kind: &str) -> Vec<(String, Value)> {
         .collect()
 }
 
+/// Stops or starts `app_id` (`action` is `stop` or `start`).
+async fn app_action(server: &Server, owner: &reqwest::Client, app_id: &str, action: &str) {
+    let res = owner
+        .post(server.url(&format!("/api/v1/apps/{app_id}/{action}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 202, "{action}: {}", res.text().await.unwrap());
+}
+
 /// Waits until the domain `hostname` of `app_id` has `serving_status`
 /// `status` (ADR 0167), and returns it as the API shows it.
 async fn wait_for_serving(
@@ -1698,6 +1708,80 @@ async fn a_scale_down_without_a_node_tunnel_makes_the_tunnel_domain_unserved() {
     assert_eq!(recoveries[0].1["unserved_since"], unserved_at.as_str());
 }
 
+/// Issue #349: every `domain.unserved` gets its `domain.served`, even when the
+/// app was stopped in between (`unserved`, `pending`, `serving`), and a
+/// domain that turns `unserved` again before it was served opens no second
+/// period.
+#[tokio::test]
+async fn an_unserved_domain_is_announced_as_served_after_a_stop_and_a_start() {
+    let mock = start_mock().await;
+    let server = start_with_cloudflare(&mock.base, &format!("{}/dns-query", mock.base)).await;
+    let owner = server.owner().await;
+    insert_machine(&server, NODE_A, "alpha", &["node"]).await;
+    let provider = create_provider(
+        &server,
+        &owner,
+        "tunnel",
+        "Tunnel",
+        json!({ "account_id": ACCOUNT_ID, "zone_id": ZONE_ID }),
+    )
+    .await;
+    let provider_id = provider["id"].as_str().unwrap().to_string();
+    let app_id = setup_project_and_app(&server, &owner).await;
+    deploy_on(&server, &app_id, &[NODE_A]).await;
+    let domain = create_domain(
+        &server,
+        &owner,
+        &app_id,
+        "gap.example.com",
+        "tunnel",
+        &provider_id,
+    )
+    .await;
+
+    // The app's only node has no tunnel: `pending` becomes `unserved`.
+    wait_for_serving(&server, &owner, &app_id, "gap.example.com", "unserved").await;
+    let reports = events_of(&server, "domain.unserved").await;
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    let unserved_at = reports[0].0.clone();
+
+    // Stopped, then started on the same node: `unserved` again, within the
+    // period already open.
+    app_action(&server, &owner, &app_id, "stop").await;
+    wait_for_serving(&server, &owner, &app_id, "gap.example.com", "pending").await;
+    app_action(&server, &owner, &app_id, "start").await;
+    wait_for_serving(&server, &owner, &app_id, "gap.example.com", "unserved").await;
+    assert_eq!(events_of(&server, "domain.unserved").await.len(), 1);
+
+    // Stopped, given a tunnel, started: `pending` becomes `serving`, and the
+    // period closes with `domain.served`.
+    app_action(&server, &owner, &app_id, "stop").await;
+    wait_for_serving(&server, &owner, &app_id, "gap.example.com", "pending").await;
+    map_tunnel(&server, &owner, &mock, NODE_A, "alpha", &provider_id).await;
+    app_action(&server, &owner, &app_id, "start").await;
+    wait_for_serving(&server, &owner, &app_id, "gap.example.com", "serving").await;
+    let recoveries = events_of(&server, "domain.served").await;
+    assert_eq!(recoveries.len(), 1, "{recoveries:?}");
+    assert_eq!(
+        recoveries[0].1,
+        json!({
+            "domain_id": domain["id"],
+            "app_id": app_id,
+            "hostname": "gap.example.com",
+            "tls_mode": "tunnel",
+            "unserved_since": unserved_at,
+        })
+    );
+
+    // The period is closed: a later stop and start announces nothing.
+    app_action(&server, &owner, &app_id, "stop").await;
+    wait_for_serving(&server, &owner, &app_id, "gap.example.com", "pending").await;
+    app_action(&server, &owner, &app_id, "start").await;
+    wait_for_serving(&server, &owner, &app_id, "gap.example.com", "serving").await;
+    assert_eq!(events_of(&server, "domain.served").await.len(), 1);
+    assert_eq!(events_of(&server, "domain.unserved").await.len(), 1);
+}
+
 /// Issue #349: an `acme` domain of an app with one replica is `serving` while
 /// an instance is meant to run, and `pending` again once the app stops. On
 /// `main` it stayed `pending` for good.
@@ -1732,12 +1816,7 @@ async fn an_acme_domain_is_serving_while_its_app_runs_and_pending_once_it_stops(
     let serving = wait_for_serving(&server, &owner, &app_id, "lit.example.com", "serving").await;
     assert!(serving["last_error"].is_null(), "{serving}");
 
-    let res = owner
-        .post(server.url(&format!("/api/v1/apps/{app_id}/stop")))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 202, "stop: {}", res.text().await.unwrap());
+    app_action(&server, &owner, &app_id, "stop").await;
     wait_for_serving(&server, &owner, &app_id, "lit.example.com", "pending").await;
     // Neither change is between `serving` and `unserved`.
     assert!(events_of(&server, "domain.unserved").await.is_empty());
