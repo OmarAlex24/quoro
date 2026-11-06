@@ -534,6 +534,8 @@ each names the threat it exercises.
 
 ### M5b — witness, leases, fencing
 
+Besides the lab run, each of these checks also runs as an automated test in the M5b work. The cut on the lab is a firewall rule on lab-1, removed by a timer; lab-1's agent keeps running. The arbiter row applies only when an external arbiter is used; with the witness instead, the same check makes the primary lose the support of a majority of voters, and the node reports `uncertain` and does not fence before `valid_until` (D-0169).
+
 | Check | Threat |
 | --- | --- |
 | Cut lab-1 off from lab-2 and lab-3: lab-1 self-fences its stateful apps and they stop | T-LEASE-02 |
