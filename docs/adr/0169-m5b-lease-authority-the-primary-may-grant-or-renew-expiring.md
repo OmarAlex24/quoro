@@ -1,12 +1,12 @@
 # ADR 0169: M5b lease authority: the primary may grant or renew expiring leases only while a majority of voters supports it; promotion takes the next term from a majority
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0198](0198-the-candidate-waits-for-each-voter-s-lease-horizon-which.md)
 - **Date:** 2026-11-06
 - **Ledger id:** D-0169
 - **Tags:** m5b, reliability, witness
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** none
+- **Related:** [ADR 0198](0198-the-candidate-waits-for-each-voter-s-lease-horizon-which.md)
 
 ## Context
 
@@ -22,6 +22,7 @@ _Some wording was changed for the public repository._
 
 ## Consequences
 
+- [ADR 0198](0198-the-candidate-waits-for-each-voter-s-lease-horizon-which.md) refines the candidate's wait before it starts at the new term (each voter's lease horizon instead of S + D + 2M). The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---

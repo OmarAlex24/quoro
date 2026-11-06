@@ -195,6 +195,22 @@
   - [0184: Health checks restart hung apps (#78): after the configured number of consecutive failed probes outside a start grace period, the node restarts the VM with the crash backoff; opt-out per app](adr/0184-health-checks-restart-hung-apps-78-after-the-configured.md)
   - [0186: Add #287 (old node recreates a moved app's VM) and #240 (terminal output lost, upgrade answers 401) to the M5b milestone and fix them before the failover work](adr/0186-add-287-old-node-recreates-a-moved-app-s-vm-and-240.md)
   - [0187: Signing-key rotation (#76, D-0154) and the automatic rebuild on a critical finding (D-0155) come last in M5b and move to M6 by a new decision if the milestone slips](adr/0187-signing-key-rotation-76-d-0154-and-the-automatic-rebuild-on.md)
+  - [0190: Domain.serving_status has three states for every TLS mode; pending is the default and the state of pre-migration rows](adr/0190-domain-serving-status-has-three-states-for-every-tls-mode.md)
+  - [0191: domain.unserved and domain.served carry domain_id, app_id, hostname, tls_mode plus error or unserved_since, open no incident, and the certificate.failed tunnel stopgap stays allowed until the primary emits them](adr/0191-domain-unserved-and-domain-served-carry-domain-id-app-id.md)
+  - [0192: deleteApp turns every volume of the app into deleting whatever its state; the record stays readable with getVolume until the node reports deleted](adr/0192-deleteapp-turns-every-volume-of-the-app-into-deleting.md)
+  - [0193: health_check.start_period_s (minimum 0, default 30) and restart (default true) are optional in requests and always present in responses; a health restart keeps restart_generation; the edge ignores both](adr/0193-health-check-start-period-s-minimum-0-default-30-and.md)
+  - [0194: draining_until is an RFC 3339 field on tunnel routes only (spec.routes and spec.edge.routes), window 120 s after the CNAME repoint; the machine never acts on the time and a machine with no running backend gets no draining route](adr/0194-draining-until-is-an-rfc-3339-field-on-tunnel-routes-only.md)
+  - [0196: Promotion votes travel directly between voters over the mesh, not through the edge](adr/0196-promotion-votes-travel-directly-between-voters-over-the.md)
+  - [0197: Voter support is a primary-initiated support_request / support_grant pair on the session, S = 15 s renewed every S/3](adr/0197-voter-support-is-a-primary-initiated-support-request.md)
+  - [0198: The candidate waits for each voter's lease horizon, which covers the longest lease the old primary declared (max_lease_ms), plus a vote pre-check (refines ADR 0169)](adr/0198-the-candidate-waits-for-each-voter-s-lease-horizon-which.md)
+  - [0199: stale_term is a fatal session error that every machine sends to a primary with a lower term, and it does not stop redialing](adr/0199-stale-term-is-a-fatal-session-error-that-every-machine.md)
+  - [0200: Voter-set changes go one voter at a time, versioned by change-log seq, and the next waits for a majority to store the current one](adr/0200-voter-set-changes-go-one-voter-at-a-time-versioned-by.md)
+  - [0201: The roles operation changes only witness, under a new human-only scope node:roles; witness-only machines run no engine](adr/0201-the-roles-operation-changes-only-witness-under-a-new-human.md)
+  - [0202: Declare-lost sets nodes.lost_at (not a new status), is refused for a connected node, and leaves fence_failure and the gate in place](adr/0202-declare-lost-sets-nodes-lost-at-not-a-new-status-is-refused.md)
+  - [0203: The primary keeps the gate as the latest T_grant + d + 2M per holder, survives its own restart through leases.duration_ms, and writes nothing for renewals](adr/0203-the-primary-keeps-the-gate-as-the-latest-t-grant-d-2m-per.md)
+  - [0204: quoro cluster maintenance talks to the running primary over a local control socket and first takes majority support for W](adr/0204-quoro-cluster-maintenance-talks-to-the-running-primary-over.md)
+  - [0205: Cluster.votes keeps exactly the fields of ADR 0170; a lost node stays a voter; ha_ready also needs majority support](adr/0205-cluster-votes-keeps-exactly-the-fields-of-adr-0170-a-lost.md)
+  - [0206: domain.served carries unserved_since as an optional field (corrects ADR 0191)](adr/0206-domain-served-carries-unserved-since-as-an-optional-field.md)
 
 # Background research
 
