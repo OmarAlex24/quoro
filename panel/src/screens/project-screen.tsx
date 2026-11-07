@@ -1,5 +1,5 @@
-import { getRouteApi, Link } from '@tanstack/react-router';
-import type { ReactNode } from 'react';
+import { getRouteApi, Link, useNavigate } from '@tanstack/react-router';
+import { useEffect, useState, type ReactNode } from 'react';
 import { useGetApp, useListApps } from '../api/generated/apps/apps';
 import type { App, Project } from '../api/generated/model';
 import { useListNodes } from '../api/generated/nodes/nodes';
@@ -7,14 +7,18 @@ import { useListProjects } from '../api/generated/projects/projects';
 import { useGetVm } from '../api/generated/vms/vms';
 import { problemView } from '../lib/problem';
 import { PROJECT_LIST_PARAMS } from '../lib/projects';
+import type { AddKind } from '../lib/routes';
+import { useSession } from '../session';
+import { CommandMenu } from '../components/command-menu';
+import { CreateSheet } from '../components/create-sheet';
 import { AppMetricsBay } from '../components/metrics-bay';
 import { LogTape } from '../components/log-tape';
+import { ProjectCanvas } from '../components/project-canvas';
 import { ProjectShell } from '../components/shell/project-shell';
 import { SessionGate } from '../components/shell/side-shell';
 import { Button } from '../components/ui/button';
 import { ProblemBanner } from '../components/ui/problem-banner';
 import { AppScreen } from './app-screen';
-import { AppsScreen } from './apps-screen';
 import { BuildScreen } from './build-screen';
 import { VmsScreen } from './vms-screen';
 
@@ -22,9 +26,10 @@ const projectRoute = getRouteApi('/projects/$projectId');
 
 /**
  * `/projects/$projectId`: the project's top bar and rail around what is open.
- * Until the canvas and the service sheet arrive, each place shows the screen
- * that held it before: the project's apps on the canvas, the app screen for
- * `?app=`, the build screen for `?app=&build=`, the VM bay for `?vm=`.
+ * The canvas shows the project's services; `?add=` opens a create sheet over
+ * it. Until the service sheet arrives, an open service shows the screen that
+ * held it before: the app screen for `?app=`, the build screen for
+ * `?app=&build=`, the VM bay for `?vm=`.
  */
 export function ProjectScreen() {
   return (
@@ -37,7 +42,10 @@ export function ProjectScreen() {
 function ProjectPage() {
   const { projectId } = projectRoute.useParams();
   const search = projectRoute.useSearch();
+  const navigate = useNavigate();
+  const { canWrite } = useSession();
   const view = search.view ?? 'canvas';
+  const [menuOpen, setMenuOpen] = useState(false);
 
   const projectsQuery = useListProjects(PROJECT_LIST_PARAMS);
   const projects = projectsQuery.data?.items ?? [];
@@ -51,6 +59,30 @@ function ProjectPage() {
     query: { enabled: search.app === undefined && search.vm !== undefined, retry: false },
   });
   const leaf = search.app ? appQuery.data?.name : search.vm ? vmQuery.data?.name : undefined;
+  const onCanvas = !missing && !search.app && !search.vm && view === 'canvas';
+  const sheet = canWrite && onCanvas ? search.add : undefined;
+  const canAdd = canWrite && onCanvas;
+  const shortcut = canAdd && sheet === undefined;
+
+  // Cmd+K (Ctrl+K elsewhere) opens the Add menu while the canvas is in view
+  // and no create sheet covers it.
+  useEffect(() => {
+    if (!shortcut) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key.toLowerCase() !== 'k' || !(event.metaKey || event.ctrlKey)) return;
+      if (event.altKey || event.shiftKey) return;
+      event.preventDefault();
+      setMenuOpen((open) => !open);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [shortcut]);
+
+  const openSheet = (kind: AddKind) =>
+    void navigate({ to: '/projects/$projectId', params: { projectId }, search: { add: kind } });
+  // A sheet opens only over the canvas, which has no other search state.
+  const closeSheet = () =>
+    void navigate({ to: '/projects/$projectId', params: { projectId }, search: {} });
 
   let content: ReactNode;
   if (missing) {
@@ -68,7 +100,14 @@ function ProjectPage() {
   } else if (view === 'settings') {
     content = project ? <ProjectSettings project={project} /> : null;
   } else {
-    content = <AppsScreen projectId={projectId} />;
+    content = (
+      <ProjectCanvas
+        key={projectId}
+        projectId={projectId}
+        project={project}
+        onAdd={canAdd ? () => setMenuOpen(true) : undefined}
+      />
+    );
   }
 
   return (
@@ -78,9 +117,15 @@ function ProjectPage() {
       projects={projects}
       leaf={leaf}
       view={view}
-      canvas={!missing && !search.app && !search.vm && view === 'canvas'}
+      canvas={onCanvas}
     >
       {content}
+      {canAdd ? (
+        <CommandMenu open={menuOpen} onOpenChange={setMenuOpen} onChoose={openSheet} />
+      ) : null}
+      {sheet ? (
+        <CreateSheet key={sheet} kind={sheet} projectId={projectId} onClose={closeSheet} />
+      ) : null}
     </ProjectShell>
   );
 }

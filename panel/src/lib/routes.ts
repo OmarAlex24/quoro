@@ -43,14 +43,19 @@ export type ProjectTab = (typeof PROJECT_TABS)[number];
 export const PROJECT_VIEWS = ['canvas', 'metrics', 'logs', 'settings'] as const;
 export type ProjectView = (typeof PROJECT_VIEWS)[number];
 
+/** What "+ Add" can open over the canvas: a create sheet for each. */
+export const ADD_KINDS = ['git', 'image', 'vm'] as const;
+export type AddKind = (typeof ADD_KINDS)[number];
+
 /** `/projects?add=app`: the projects page with the add flow open. */
 export interface ProjectsSearch {
   add?: 'app';
 }
 
 /**
- * `/projects/$projectId?view=&app=&vm=&tab=&build=`: a project, the rail view,
- * and the service open in it. `build` opens one build of `app`.
+ * `/projects/$projectId?view=&app=&vm=&tab=&build=&add=`: a project, the rail
+ * view, and the service open in it. `build` opens one build of `app`; `add`
+ * opens the create sheet for a Git app, an image app or a VM.
  */
 export interface ProjectSearch {
   view?: ProjectView;
@@ -58,6 +63,7 @@ export interface ProjectSearch {
   vm?: string;
   tab?: ProjectTab;
   build?: string;
+  add?: AddKind;
 }
 
 /** `/nodes?tab=vms`: the nodes, or the virtual machines of the whole cluster. */
@@ -99,6 +105,7 @@ export const validateProjectSearch = (search: Raw): ProjectSearch =>
     vm: text(search.vm),
     tab: pick(search.tab, PROJECT_TABS),
     build: text(search.build),
+    add: pick(search.add, ADD_KINDS),
   });
 
 export const validateNodesSearch = (search: Raw): NodesSearch =>

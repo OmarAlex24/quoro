@@ -81,7 +81,18 @@ const stateWords: Record<DeployStepState, string> = {
   error: 'Failed',
 };
 
-export function DeployScreen() {
+/**
+ * Deploy an app: from an image or a public Git repository, into a project,
+ * on a node, with a domain and variables. Full page at `/projects?add=app`;
+ * inside a project's create sheet (`sheet`), the source is the one the sheet
+ * was opened for and the project starts chosen. The steps and requests are
+ * the same either way.
+ */
+export function DeployScreen({
+  sheet,
+}: {
+  sheet?: { source: SourceKind; projectId: string };
+} = {}) {
   const { user, loading, unauthenticated, canWrite } = useSession();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -90,15 +101,17 @@ export function DeployScreen() {
   const nodesQuery = useListNodes(undefined, { query: { staleTime: 10_000 } });
 
   const [image, setImage] = useState(DEFAULT_IMAGE);
-  const [name, setName] = useState(() => deriveAppName(DEFAULT_IMAGE));
+  const [name, setName] = useState(() =>
+    sheet?.source === 'git' ? deriveAppNameFromRepo('') : deriveAppName(DEFAULT_IMAGE),
+  );
   const [nameEdited, setNameEdited] = useState(false);
   const [port, setPort] = useState('80');
-  const [projectId, setProjectId] = useState('');
+  const [projectId, setProjectId] = useState(sheet?.projectId ?? '');
   const [nodeId, setNodeId] = useState('');
   const [hostname, setHostname] = useState('');
   const [tlsMode, setTlsMode] = useState<CreateDomainRequestTlsMode>('tunnel');
 
-  const [sourceKind, setSourceKind] = useState<SourceKind>('image');
+  const [sourceKind, setSourceKind] = useState<SourceKind>(sheet?.source ?? 'image');
   const [repoUrl, setRepoUrl] = useState('');
   const [sourceRef, setSourceRef] = useState(DEFAULT_SOURCE_REF);
   const [dockerfilePath, setDockerfilePath] = useState(DEFAULT_DOCKERFILE_PATH);
@@ -459,25 +472,36 @@ export function DeployScreen() {
       checked ? [...current, name] : current.filter((item) => item !== name),
     );
 
+  // In a sheet the sheet carries the title and the source; the form sits on it flat.
+  const Frame = sheet ? 'div' : 'main';
+
   return (
-    <main className="mx-auto w-full max-w-3xl px-4 py-6 sm:px-6 sm:py-8">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <h1 className="type-display text-[24px] leading-none">Deploy an app</h1>
-        <Button variant="ghost" asChild>
-          <Link to="/projects">Back to projects</Link>
-        </Button>
-      </div>
-      <p className="mt-2 text-[15px] text-ink-2">
-        Name an image or a public Git repository, pick where it runs and deploy it. The
-        app gets one microVM.
-      </p>
+    <Frame className={sheet ? undefined : 'mx-auto w-full max-w-3xl px-4 py-6 sm:px-6 sm:py-8'}>
+      {sheet ? null : (
+        <>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <h1 className="type-display text-[24px] leading-none">Deploy an app</h1>
+            <Button variant="ghost" asChild>
+              <Link to="/projects">Back to projects</Link>
+            </Button>
+          </div>
+          <p className="mt-2 text-[15px] text-ink-2">
+            Name an image or a public Git repository, pick where it runs and deploy it. The
+            app gets one microVM.
+          </p>
+        </>
+      )}
 
       <form
         onSubmit={submit}
         noValidate
-        className="mt-5 rounded-[10px] border border-line bg-surface card-sheen"
+        className={
+          sheet ? undefined : 'mt-5 rounded-[10px] border border-line bg-surface card-sheen'
+        }
       >
-        <section className="px-4 py-5 sm:px-5">
+        <section className={sheet ? 'px-4 pb-5 sm:px-5' : 'px-4 py-5 sm:px-5'}>
+          {sheet ? null : (
+          <>
           <h2 className="type-display-light text-[15px] leading-none text-ink">Source</h2>
           <div
             role="radiogroup"
@@ -537,6 +561,8 @@ export function DeployScreen() {
               </span>
             </label>
           </div>
+          </>
+          )}
 
           {sourceKind === 'image' ? (
             <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-[minmax(0,1fr)_140px]">
@@ -1120,6 +1146,6 @@ export function DeployScreen() {
           )}
         </div>
       </form>
-    </main>
+    </Frame>
   );
 }

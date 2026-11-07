@@ -27,13 +27,13 @@ interface FormState {
   nodeId: string;
 }
 
-const initialForm = (nodes: Node[]): FormState => ({
+const initialForm = (nodes: Node[], projectId = ''): FormState => ({
   name: '',
   vcpus: '1',
   memoryMb: '512',
   diskGb: '2',
   image: DEFAULT_IMAGE,
-  projectId: '',
+  projectId,
   nodeId: nodes[0]?.id ?? '',
 });
 
@@ -50,21 +50,29 @@ const fieldMessage = (value: string, kind: 'int' | 'name'): string | undefined =
   return undefined;
 };
 
+/**
+ * Create a VM: a name, its size, an image, a project and a node. A dialog
+ * over the VM list; with `sheet`, the same form without the dialog, for a
+ * project's create sheet, with that project chosen. Closing (Cancel, or
+ * success) calls `onOpenChange(false)` either way.
+ */
 export function CreateVmDialog({
   open,
   onOpenChange,
   projects,
   nodes,
   onCreated,
+  sheet,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   projects: Project[];
   nodes: Node[];
   onCreated: (name: string) => void;
+  sheet?: { projectId: string };
 }) {
   const queryClient = useQueryClient();
-  const [form, setForm] = useState<FormState>(() => initialForm(nodes));
+  const [form, setForm] = useState<FormState>(() => initialForm(nodes, sheet?.projectId));
   const [projectView, setProjectView] = useState<'pick' | 'create'>('pick');
   const [projectName, setProjectName] = useState('');
   const [projectSlug, setProjectSlug] = useState('');
@@ -91,7 +99,7 @@ export function CreateVmDialog({
       ),
     onSuccess: (vm) => {
       void queryClient.invalidateQueries({ queryKey: getListVmsQueryKey() });
-      setForm(initialForm(nodes));
+      setForm(initialForm(nodes, sheet?.projectId));
       setProjectView('pick');
       onOpenChange(false);
       onCreated(vm.name);
@@ -136,21 +144,7 @@ export function CreateVmDialog({
   const projectSlugError =
     projectView === 'create' && projectSlug !== '' ? validateSlug(projectSlug) : undefined;
 
-  return (
-    <Dialog
-      open={open}
-      onOpenChange={(next) => {
-        if (!next) {
-          setProblem(null);
-          setFieldErrors({});
-        }
-        onOpenChange(next);
-      }}
-    >
-      <DialogContent
-        title="New VM"
-        description="Choose a project and a node. The microVM boots from the image you name."
-      >
+  const body = (
         <form onSubmit={submit} className="flex flex-col gap-4" noValidate>
           {problem ? <ProblemBanner view={problem} /> : null}
 
@@ -370,6 +364,26 @@ export function CreateVmDialog({
             </Button>
           </div>
         </form>
+  );
+
+  if (sheet) return body;
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        if (!next) {
+          setProblem(null);
+          setFieldErrors({});
+        }
+        onOpenChange(next);
+      }}
+    >
+      <DialogContent
+        title="New VM"
+        description="Choose a project and a node. The microVM boots from the image you name."
+      >
+        {body}
       </DialogContent>
     </Dialog>
   );

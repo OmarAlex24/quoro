@@ -35,14 +35,18 @@ const encode = (value: number, length: number): string => {
 
 let sequence = 0;
 
-/** A contract-shaped id: `<prefix>_` plus 26 Crockford characters. */
+/** A fixed start for the time part of mock ids. */
+const MOCK_EPOCH = Date.UTC(2026, 0, 1);
+
+/**
+ * A contract-shaped id: `<prefix>_` plus 26 Crockford characters. Ids come
+ * from a counter, not the clock, so the seeded data has the same ids after
+ * every reload: what the browser keeps by id (a canvas layout) still applies.
+ */
 export const mockId = (prefix: string): string => {
   sequence += 1;
-  const time = encode(Date.now(), 10);
-  const randomness = encode(
-    Math.floor(Math.random() * 1_000_000) + sequence * 7919,
-    16,
-  );
+  const time = encode(MOCK_EPOCH + sequence, 10);
+  const randomness = encode(sequence * 7919 + 104_729, 16);
   return `${prefix}_${time}${randomness}`;
 };
 
@@ -665,6 +669,7 @@ const seed = (): void => {
   });
 
   seedGitApp(createdAt);
+  seedAtlas(createdAt, repository.id);
 };
 
 const seedBuildLog = (
@@ -878,6 +883,244 @@ const seedGitApp = (createdAt: string): void => {
       line: `#5 ERROR: ${failedError}`,
     },
   ]);
+};
+
+/**
+ * Atlas: a project with several services, as the canvas reference draws it.
+ * Two Git apps (web with a domain, api on a private port), an image worker,
+ * a stateful postgres under the cold policy with a volume and a recent
+ * backup, and a standalone VM. It is listed first.
+ */
+const seedAtlas = (createdAt: string, repositoryId: string): void => {
+  const minutesAgo = (minutes: number): string =>
+    new Date(Date.parse(createdAt) - minutes * 60_000).toISOString();
+  const project: Project = {
+    id: mockId('prj'),
+    slug: 'atlas',
+    name: 'Atlas',
+    created_at: createdAt,
+    updated_at: createdAt,
+  };
+  db.projects.unshift(project);
+  const lab4 = db.extraNodes[0]?.id ?? db.node.id;
+
+  const addApp = (input: {
+    name: string;
+    image: string;
+    port: number;
+    replicas?: number;
+    source?: AppSource;
+    stateful?: boolean;
+    cold?: boolean;
+    vcpus?: number;
+    memoryMb?: number;
+  }): App => {
+    const appId = mockId('app');
+    const deploymentId = mockId('dep');
+    const replicas = input.replicas ?? 1;
+    const nodes = replicas > 1 ? [db.node.id, lab4] : [lab4];
+    const resources = {
+      vcpus: input.vcpus ?? 1,
+      memory_mb: input.memoryMb ?? 512,
+      disk_gb: 2,
+    };
+    const app: App = {
+      id: appId,
+      project_id: project.id,
+      name: input.name,
+      stateful: input.stateful ?? false,
+      ha_policy: input.cold ? 'cold' : 'none',
+      backup_schedule: { interval_h: 6, keep: 7 },
+      replicas,
+      image: input.image,
+      ...(input.source ? { source: input.source } : {}),
+      port: input.port,
+      health_check: { path: '/', interval_s: 10, timeout_s: 2, failures: 3 },
+      resources,
+      placement: { node_ids: nodes },
+      status: 'running',
+      current_deployment_id: deploymentId,
+      restart_generation: 0,
+      created_at: createdAt,
+      updated_at: createdAt,
+    };
+    db.apps.push(app);
+    db.deployments.push({
+      id: deploymentId,
+      app_id: appId,
+      image: input.image,
+      image_digest:
+        'sha256:0c3e5a7b9d1f2a4c6e8b0d2f4a6c8e0b2d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2c',
+      status: 'succeeded',
+      phase: 'health',
+      error: null,
+      trigger: input.source ? 'build' : 'api',
+      created_by_type: 'system',
+      created_by_id: 'system',
+      created_at: createdAt,
+      finished_at: createdAt,
+    });
+    db.deploymentLogs[deploymentId] = [
+      { time: createdAt, phase: 'pull', message: `Pulling ${input.image}` },
+      { time: createdAt, phase: 'health', message: 'Health check passed; the app is running' },
+    ];
+    nodes.forEach((nodeId, index) => {
+      db.vms.push({
+        id: mockId('vm'),
+        project_id: project.id,
+        app_id: appId,
+        node_id: nodeId,
+        name: `${input.name}-${index + 1}`,
+        ...resources,
+        image: input.image,
+        desired_status: 'running',
+        observed_status: 'running',
+        ip: `10.0.1.${db.vms.length + 10}`,
+        restart_generation: 0,
+        restart_count: 0,
+        last_exit_code: null,
+        created_at: createdAt,
+        updated_at: createdAt,
+      });
+    });
+    db.appEnv[appId] = [];
+    return app;
+  };
+
+  const gitSource = (repo: string): AppSource => ({
+    kind: 'git',
+    repo_url: `https://github.com/example/${repo}.git`,
+    ref: 'main',
+    dockerfile_path: 'Dockerfile',
+    context_dir: '.',
+    target: null,
+    build_args: [],
+    secrets: [],
+  });
+
+  const addBuild = (app: App, commit: string): void => {
+    if (!app.source) return;
+    const buildId = mockId('bld');
+    db.builds.push({
+      id: buildId,
+      app_id: app.id,
+      node_id: db.node.id,
+      source: app.source,
+      status: 'succeeded',
+      commit,
+      image: app.image,
+      image_digest:
+        'sha256:0c3e5a7b9d1f2a4c6e8b0d2f4a6c8e0b2d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2c',
+      failed_phase: null,
+      error: null,
+      failed_step: null,
+      deployment_id: app.current_deployment_id ?? null,
+      trigger: 'api',
+      refresh_base: false,
+      created_by_type: 'system',
+      created_by_id: 'system',
+      created_at: minutesAgo(40),
+      started_at: minutesAgo(40),
+      finished_at: minutesAgo(38),
+    });
+    seedBuildLog(buildId, [{ vertex: null, line: '#1 DONE 0.4s' }]);
+  };
+
+  const webSource = gitSource('atlas-web');
+  const web = addApp({
+    name: 'web',
+    image: 'build.quoro.invalid/atlas-web',
+    port: 3000,
+    replicas: 2,
+    source: webSource,
+  });
+  addBuild(web, '7d41e0ab9c2f3e4d5a6b7c8d9e0f1a2b3c4d5e6f');
+  db.domains.push({
+    id: mockId('dom'),
+    app_id: web.id,
+    hostname: 'atlas.example.com',
+    tls_mode: 'tunnel',
+    cert_status: 'not_applicable',
+    cert_expires_at: null,
+    serving_status: 'serving',
+    last_error: null,
+    created_at: createdAt,
+  });
+
+  const api = addApp({
+    name: 'api',
+    image: 'build.quoro.invalid/atlas-api',
+    port: 3000,
+    replicas: 2,
+    source: gitSource('atlas-api'),
+  });
+  addBuild(api, '4f2a9c1e8b7d6c5a4f3e2d1c0b9a8f7e6d5c4b3a');
+
+  addApp({ name: 'worker', image: 'ghcr.io/example/atlas-worker:1.8', port: 8080 });
+
+  const postgres = addApp({
+    name: 'postgres',
+    image: 'docker.io/library/postgres:17',
+    port: 5432,
+    stateful: true,
+    cold: true,
+    memoryMb: 1024,
+  });
+  const volumeId = mockId('vol');
+  db.volumes.push({
+    id: volumeId,
+    app_id: postgres.id,
+    node_id: lab4,
+    size_gb: 20,
+    mount_path: '/var/lib/postgresql',
+    state: 'ready',
+    allocated_bytes: Math.round(4.2 * GIB),
+    restored_from_backup_id: null,
+    error: null,
+    quarantines: [],
+    created_at: createdAt,
+    updated_at: createdAt,
+  });
+  db.backups.push({
+    id: mockId('bkp'),
+    repository_id: repositoryId,
+    source_kind: 'volume',
+    app_id: postgres.id,
+    volume_id: volumeId,
+    node_id: lab4,
+    status: 'succeeded',
+    trigger: 'schedule',
+    snapshot_method: 'reflink',
+    pause_ms: 0,
+    logical_bytes: Math.round(4.2 * GIB),
+    uploaded_bytes: Math.round(0.6 * GIB),
+    chunk_count: 160,
+    error: null,
+    created_at: minutesAgo(227),
+    started_at: minutesAgo(227),
+    finished_at: minutesAgo(226),
+    pruned_at: null,
+  });
+
+  db.vms.push({
+    id: mockId('vm'),
+    project_id: project.id,
+    app_id: null,
+    node_id: db.node.id,
+    name: 'ci-runner',
+    vcpus: 4,
+    memory_mb: 8192,
+    disk_gb: 40,
+    image: 'docker.io/library/ubuntu:24.04',
+    desired_status: 'running',
+    observed_status: 'running',
+    ip: '10.0.1.40',
+    restart_generation: 0,
+    restart_count: 0,
+    last_exit_code: null,
+    created_at: createdAt,
+    updated_at: createdAt,
+  });
 };
 
 seed();
