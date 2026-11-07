@@ -420,15 +420,22 @@ mod tests {
     }
 
     /// A pause after a VM loses a volume still changes its latest pause, so
-    /// a set of volumes that shrinks never hides a later pause.
+    /// a set of volumes that shrinks never hides a later pause: neither a
+    /// sum of counts per volume nor the highest of them would give that.
     #[test]
     fn a_later_pause_is_seen_after_the_vm_loses_a_volume() {
-        let paused = PausedVms::default();
-        drop(paused.mark("vol_a"));
-        drop(paused.mark("vol_b"));
-        let seen = paused.mark_of(["vol_a", "vol_b"]).latest;
-        drop(paused.mark("vol_a"));
-        assert_ne!(paused.mark_of(["vol_a"]).latest, seen);
+        // `vol_b` paused once (a sum of counts would hide the next pause),
+        // then twice (the highest count would).
+        for pauses_of_b in [1, 2] {
+            let paused = PausedVms::default();
+            drop(paused.mark("vol_a"));
+            for _ in 0..pauses_of_b {
+                drop(paused.mark("vol_b"));
+            }
+            let seen = paused.mark_of(["vol_a", "vol_b"]).latest;
+            drop(paused.mark("vol_a"));
+            assert_ne!(paused.mark_of(["vol_a"]).latest, seen, "{pauses_of_b}");
+        }
     }
 
     #[test]

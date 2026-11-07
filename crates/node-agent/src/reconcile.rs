@@ -2005,6 +2005,23 @@ impl<E: Engine + 'static> Reconciler<E> {
                 continue;
             };
             if let Some(target) = HealthTarget::for_vm(vm, ip) {
+                // The VM that runs attaches the volumes it was created with,
+                // which differ from the spec's until a recreate is done, and
+                // a backup of either pauses it (D-0259).
+                let mut volumes: Vec<String> = volume_ids(vm).map(str::to_owned).collect();
+                if let Some(recorded) = self
+                    .store
+                    .meta(&volumes_key(&vm.vm_id))
+                    .await
+                    .ok()
+                    .flatten()
+                {
+                    for volume_id in signature_volume_ids(&recorded) {
+                        if !volumes.iter().any(|known| known == volume_id) {
+                            volumes.push(volume_id.to_owned());
+                        }
+                    }
+                }
                 targets.insert(
                     vm.vm_id.clone(),
                     HealthTargetInfo {
@@ -2012,7 +2029,7 @@ impl<E: Engine + 'static> Reconciler<E> {
                         deployment_id: vm.deployment_id.clone(),
                         app_id: vm.app_id.clone(),
                         project_id: vm.project_id.clone(),
-                        volumes: volume_ids(vm).map(str::to_owned).collect(),
+                        volumes,
                     },
                 );
             }
@@ -2534,6 +2551,14 @@ fn volumes_signature(volumes: &[quoro_proto::wire::SpecVolume]) -> String {
         .collect();
     parts.sort();
     parts.join("\n")
+}
+
+/// The volume ids of a signature [`volumes_signature`] made.
+fn signature_volume_ids(signature: &str) -> impl Iterator<Item = &str> {
+    signature
+        .lines()
+        .filter_map(|part| part.split('|').next())
+        .filter(|volume_id| !volume_id.is_empty())
 }
 
 /// The `node_meta` key that remembers one VM's attached-volume signature.
@@ -3442,22 +3467,88 @@ mod tests {
     /// [`health_snapshot_with`], with the VM attaching the volume
     /// `vol_health`, which a backup's pause marks (D-0259).
     fn health_snapshot_with_volume(port: u16, check: quoro_proto::wire::HealthCheck) -> Snapshot {
+        health_snapshot_attaching(port, check, "vol_health", &["vol_health"])
+    }
+
+    /// [`health_snapshot_with`], with the VM attaching `attached` and
+    /// `present` in `spec.volumes`.
+    fn health_snapshot_attaching(
+        port: u16,
+        check: quoro_proto::wire::HealthCheck,
+        attached: &str,
+        present: &[&str],
+    ) -> Snapshot {
         let mut snapshot = health_snapshot_with(port, check);
         let spec = &mut snapshot.state.spec;
         spec.vms[0].volumes.push(quoro_proto::wire::SpecVolume {
-            volume_id: "vol_health".to_owned(),
+            volume_id: attached.to_owned(),
             serial: "quoro-vol-0".to_owned(),
             mount_path: "/data".to_owned(),
         });
-        spec.volumes.push(SpecVolumeFile {
-            volume_id: "vol_health".to_owned(),
-            app_id: "app_1".to_owned(),
-            size_gb: 1,
-            state: quoro_proto::wire::SpecVolumeState::Present,
-            restore: None,
-            warm: None,
-        });
+        for volume_id in present {
+            spec.volumes.push(SpecVolumeFile {
+                volume_id: (*volume_id).to_owned(),
+                app_id: "app_1".to_owned(),
+                size_gb: 1,
+                state: quoro_proto::wire::SpecVolumeState::Present,
+                restore: None,
+                warm: None,
+            });
+        }
         snapshot
+    }
+
+    /// #524: until a recreate for a new set of volumes is done, the VM that
+    /// runs still attaches its old ones, and a backup of one of them pauses
+    /// it: it is not probed, so its check does not turn `failing`.
+    #[tokio::test]
+    async fn a_vm_paused_through_a_volume_it_attaches_until_its_recreate_is_not_probed() {
+        use quoro_engine::FakeEngine;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let healthy = Arc::new(AtomicBool::new(true));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let paused = crate::health::PausedVms::default();
+        let (port, server) = pausing_server(
+            Arc::clone(&healthy),
+            paused.clone(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&requests),
+        )
+        .await;
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let engine = Arc::new(FakeEngine::new());
+        let mut reconciler =
+            health_reconciler(Arc::clone(&engine), store.clone(), Duration::from_millis(1))
+                .with_paused_vms(paused.clone());
+        let before = health_snapshot_attaching(port, check(0, None), "vol_old", &["vol_old"]);
+        reconciler.reconcile_once(Some(&before)).await;
+        tokio::time::sleep(NEXT_PROBE).await;
+        let statuses = reconciler.reconcile_once(Some(&before)).await;
+        assert_eq!(statuses[0].health, Health::Passing);
+
+        // The spec moves the VM to another volume, and the stop of its
+        // recreate keeps failing, so the VM keeps running on `vol_old`.
+        engine.set_unkillable(&VmId("vm_health".to_owned()), true);
+        let after = health_snapshot_attaching(
+            port,
+            check(0, None),
+            "vol_health",
+            &["vol_old", "vol_health"],
+        );
+        let mark = paused.mark("vol_old");
+        healthy.store(false, Ordering::SeqCst);
+        let probed = requests.load(Ordering::SeqCst);
+        for _ in 0..2 {
+            tokio::time::sleep(NEXT_PROBE).await;
+            let statuses = reconciler.reconcile_once(Some(&after)).await;
+            assert_eq!(statuses[0].health, Health::Passing);
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), probed, "not probed");
+        assert!(app_events(&store).await.is_empty(), "no app.down");
+        drop(mark);
+        server.abort();
     }
 
     /// #524: a VM is held back only by a backup of a volume it attaches. A
