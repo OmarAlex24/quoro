@@ -937,6 +937,7 @@ mod tests {
     use tokio::time::{Duration, sleep, timeout};
 
     use super::*;
+    use crate::health::PauseMark;
     use crate::lease::LeaseTable;
 
     /// One gibibyte, the size a `vol_` file has in these tests.
@@ -1317,6 +1318,62 @@ mod tests {
         let status = wait_backup(&mut statuses, "bkp_1").await;
         handle.abort();
         (dir, keys, memory, repo, status)
+    }
+
+    /// Runs one backup of `vol_1` for the VM `vm_1` with `method`, and
+    /// returns `vm_1`'s pause marks afterwards.
+    async fn marks_after_a_backup(name: &str, method: SnapshotMethod) -> PauseMark {
+        let dir = TestDir::new(name);
+        let store = NodeStore::open(dir.path()).await.unwrap();
+        let volumes = dir.path().join("volumes");
+        std::fs::create_dir_all(&volumes).unwrap();
+        let engine = Arc::new(FakeEngine::new());
+        engine.set_volume_dir(&volumes);
+        engine.set_snapshot_method(method, Duration::from_millis(50));
+        engine
+            .ensure_volume(&VolumeId("vol_1".to_owned()), 1)
+            .await
+            .unwrap();
+        seed_volume(&volumes.join("vol_1"), &[(0, 1 << 20)]);
+        ready_volume(&store, "vol_1").await;
+
+        let keys = keys_for("app_1");
+        let paused = PausedVms::default();
+        let (manager, mut statuses) = BackupManager::new(
+            Arc::clone(&engine),
+            store,
+            Arc::new(SharedStore(Arc::new(MemoryStore::new()))),
+            lease_view(7),
+            "cls_1".to_owned(),
+        );
+        let manager = manager
+            .with_options(BackupOptions::quick())
+            .with_paused_vms(paused.clone());
+        let backup = SpecBackup {
+            vm_id: Some("vm_1".to_owned()),
+            ..job("bkp_1", "vol_1", &keys, 7)
+        };
+        let (_tx, rx) = watch::channel(Some(snapshot(
+            vec![present("vol_1", None)],
+            vec![backup],
+            Some(repository(&format!("tests/{name}"))),
+        )));
+        let handle = tokio::spawn(manager.run(rx, std::future::pending::<()>()));
+        let status = wait_backup(&mut statuses, "bkp_1").await;
+        handle.abort();
+        assert_eq!(status.status, BackupState::Succeeded, "{status:?}");
+        paused.mark_of("vm_1")
+    }
+
+    /// D-0259: a `pause_copy` snapshot marks the job's VM, which it pauses,
+    /// for the snapshot and no longer; a reflink snapshot pauses nothing and
+    /// marks nothing.
+    #[tokio::test]
+    async fn a_pause_copy_snapshot_marks_the_vm_it_pauses_for_the_snapshot_only() {
+        let marks = marks_after_a_backup("backup-pause-mark", SnapshotMethod::PauseCopy).await;
+        assert_eq!(marks, PauseMark { held: 0, pauses: 1 });
+        let marks = marks_after_a_backup("backup-reflink-mark", SnapshotMethod::Reflink).await;
+        assert_eq!(marks, PauseMark::default());
     }
 
     #[tokio::test]

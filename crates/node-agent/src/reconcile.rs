@@ -3235,4 +3235,97 @@ mod tests {
         assert_eq!(engine.stop_calls().len(), 1, "asked for again");
         server.abort();
     }
+
+    /// D-0259: a VM a backup paused is not restarted for its health. A
+    /// restart asked before the pause is dropped, failed probes during the
+    /// pause do not count, and after the pause the count starts again.
+    #[tokio::test]
+    async fn a_vm_paused_for_a_backup_is_not_restarted_for_its_health() {
+        use quoro_engine::FakeEngine;
+
+        let healthy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (port, server) = switchable_server(Arc::clone(&healthy)).await;
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let engine = Arc::new(FakeEngine::new());
+        let paused = crate::health::PausedVms::default();
+        let mut reconciler =
+            health_reconciler(Arc::clone(&engine), store.clone(), Duration::from_millis(1))
+                .with_paused_vms(paused.clone());
+        let snapshot = health_snapshot_with(port, check(0, None));
+
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        tokio::time::sleep(NEXT_PROBE).await;
+        // This pass's probe fails and asks for a restart; then a backup
+        // pauses the VM before the next pass.
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        let mark = paused.mark("vm_health");
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        assert!(
+            engine.stop_calls().is_empty(),
+            "the paused VM is not stopped"
+        );
+
+        for _ in 0..2 {
+            tokio::time::sleep(NEXT_PROBE).await;
+            reconciler.reconcile_once(Some(&snapshot)).await;
+            reconciler.reconcile_once(Some(&snapshot)).await;
+        }
+        assert!(engine.stop_calls().is_empty(), "nor while it stays paused");
+
+        // Resumed: the next counted failure, one with this check, restarts it.
+        drop(mark);
+        tokio::time::sleep(NEXT_PROBE).await;
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        assert_eq!(engine.stop_calls().len(), 1);
+        server.abort();
+    }
+
+    /// D-0259: when a paused VM is resumed its failures count from zero, so
+    /// the failures before the pause do not add up with those after it.
+    #[tokio::test]
+    async fn the_failure_count_starts_from_zero_when_a_paused_vm_resumes() {
+        use quoro_engine::FakeEngine;
+
+        let healthy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (port, server) = switchable_server(Arc::clone(&healthy)).await;
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let engine = Arc::new(FakeEngine::new());
+        let paused = crate::health::PausedVms::default();
+        let mut reconciler =
+            health_reconciler(Arc::clone(&engine), store.clone(), Duration::from_millis(1))
+                .with_paused_vms(paused.clone());
+        let two_failures = quoro_proto::wire::HealthCheck {
+            failures: Some(2),
+            ..check(0, None)
+        };
+        let snapshot = health_snapshot_with(port, two_failures);
+
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        // One failure before the pause.
+        tokio::time::sleep(NEXT_PROBE).await;
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        // The pause, over before the next probe.
+        let mark = paused.mark("vm_health");
+        tokio::time::sleep(NEXT_PROBE).await;
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        drop(mark);
+
+        // One failure after it: one in a row, not two.
+        tokio::time::sleep(NEXT_PROBE).await;
+        let statuses = reconciler.reconcile_once(Some(&snapshot)).await;
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        assert_ne!(statuses[0].health, Health::Failing);
+        assert!(engine.stop_calls().is_empty());
+
+        // A second one after it: failing, and restarted.
+        tokio::time::sleep(NEXT_PROBE).await;
+        let statuses = reconciler.reconcile_once(Some(&snapshot)).await;
+        assert_eq!(statuses[0].health, Health::Failing);
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        assert_eq!(engine.stop_calls().len(), 1);
+        server.abort();
+    }
 }
