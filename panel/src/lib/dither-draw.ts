@@ -149,3 +149,103 @@ export function drawMark({ ctx, w, h }: DitherSurface, read: TokenReader = readT
 export function drawRamp({ ctx, w, h }: DitherSurface, read: TokenReader = readToken): void {
   dither2(ctx, w, h, 2, read('--accent'), read('--ion'), (x) => x / w, (x) => clamp((x / w - 0.3) * 1.1));
 }
+
+/**
+ * A project's preview: a two-tone radial glow behind its service tiles,
+ * wider the more services it has.
+ */
+export function drawPreview({ ctx, w, h }: DitherSurface, services: number, read: TokenReader = readToken): void {
+  const rx = Math.min(0.46, 0.16 + services * 0.065) * w;
+  const ry = 0.5 * h;
+  const distance = (x: number, y: number) => Math.hypot((x - w / 2) / rx, (y - h / 2) / ry);
+  dither2(
+    ctx,
+    w,
+    h,
+    2,
+    read('--accent'),
+    read('--ion'),
+    (x, y) => {
+      const d = distance(x, y);
+      return d < 1 ? 0.26 * Math.pow(1 - d, 1.7) : 0;
+    },
+    (x, y) => clamp(0.2 + 0.55 * (1 - distance(x, y))),
+  );
+}
+
+/** The corner radius of the card an aura surrounds; `.svc` uses the same. */
+export const AURA_RADIUS = 11;
+
+/**
+ * An aura: a one-tone dithered glow outside a rounded rectangle that sits
+ * `margin` px inside the canvas on every side, fading out over the margin.
+ */
+export function drawAura(
+  { ctx, w, h }: DitherSurface,
+  margin: number,
+  tone: string,
+  read: TokenReader = readToken,
+): void {
+  const r = AURA_RADIUS;
+  const hx = (w - 2 * margin) / 2 - r;
+  const hy = (h - 2 * margin) / 2 - r;
+  const outside = (x: number, y: number) => {
+    const qx = Math.abs(x - w / 2) - hx;
+    const qy = Math.abs(y - h / 2) - hy;
+    return Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) + Math.min(Math.max(qx, qy), 0) - r;
+  };
+  dither(ctx, w, h, 2, read(tone), (x, y) => {
+    const d = outside(x, y);
+    return d <= 0 || d >= margin ? 0 : 0.5 * Math.pow(1 - d / margin, 2.4);
+  });
+}
+
+/** The empty-state drawing: a cube in three dithered faces. */
+export function drawCube({ ctx, w, h }: DitherSurface, read: TokenReader = readToken): void {
+  const s = Math.min(h * 0.46, w * 0.3);
+  const cx = w / 2;
+  const cy = h / 2 + s * 0.02;
+  const k = 0.866;
+  type Polygon = ReadonlyArray<readonly [number, number]>;
+  const inside = (x: number, y: number, points: Polygon) => {
+    let hit = false;
+    for (let i = 0, j = points.length - 1; i < points.length; j = i, i += 1) {
+      const [xi, yi] = points[i]!;
+      const [xj, yj] = points[j]!;
+      if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) hit = !hit;
+    }
+    return hit;
+  };
+  const top: Polygon = [
+    [cx, cy - s],
+    [cx + k * s, cy - s / 2],
+    [cx, cy],
+    [cx - k * s, cy - s / 2],
+  ];
+  const left: Polygon = [
+    [cx - k * s, cy - s / 2],
+    [cx, cy],
+    [cx, cy + s],
+    [cx - k * s, cy + s / 2],
+  ];
+  const right: Polygon = [
+    [cx, cy],
+    [cx + k * s, cy - s / 2],
+    [cx + k * s, cy + s / 2],
+    [cx, cy + s],
+  ];
+  const face = (x: number, y: number) =>
+    inside(x, y, top) ? 1 : inside(x, y, left) ? 2 : inside(x, y, right) ? 3 : 0;
+  const density = [0, 0.22, 0.55, 0.92] as const;
+  const mix = [0, 0.85, 0.1, 0.3] as const;
+  dither2(
+    ctx,
+    w,
+    h,
+    2,
+    read('--accent'),
+    read('--ion'),
+    (x, y) => density[face(x, y)]!,
+    (x, y) => mix[face(x, y)]!,
+  );
+}

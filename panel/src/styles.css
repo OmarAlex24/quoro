@@ -1061,6 +1061,602 @@
     }
   }
 
+  /*
+   * The projects grid: one tile per project with a dithered preview of its
+   * services and its state in one line.
+   */
+  .pgrid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+    gap: 14px;
+  }
+
+  .ptile {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    background-color: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    overflow: hidden;
+    color: var(--ink);
+    text-decoration: none;
+    transition: border-color 120ms ease;
+  }
+
+  .ptile:hover {
+    border-color: var(--line-2);
+  }
+
+  .ptile-ghost {
+    height: 222px;
+    opacity: 0.6;
+  }
+
+  .ptile-h {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    padding: 14px 16px 12px;
+  }
+
+  .ptile-h b {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-stretch: 106%;
+    font-weight: 620;
+    font-size: 15px;
+    letter-spacing: -0.003em;
+  }
+
+  .ptile-count {
+    margin-left: auto;
+    flex: none;
+    font-size: 12px;
+    color: var(--ink-3);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .pprev {
+    position: relative;
+    display: grid;
+    place-content: center;
+    height: 150px;
+    margin: 0 10px;
+    border-radius: 8px;
+    background-color: var(--canvas);
+    border: 1px solid var(--line);
+    overflow: hidden;
+  }
+
+  .pprev canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+  }
+
+  .ptiles {
+    position: relative;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 8px;
+    max-width: 180px;
+  }
+
+  .glyph.glyph-preview {
+    width: 36px;
+    height: 36px;
+    border-radius: 8px;
+  }
+
+  .ptiles-more {
+    width: 36px;
+    height: 36px;
+    display: grid;
+    place-items: center;
+    border-radius: 8px;
+    background-color: var(--raised);
+    box-shadow: inset 0 0 0 1px var(--line-2);
+    font-size: 12px;
+    color: var(--ink-2);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .pfoot {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    min-width: 0;
+    padding: 12px 16px;
+    font-size: 12.5px;
+    color: var(--ink-2);
+  }
+
+  /* A request that waits on a person, at the top of the page it concerns. */
+  .callout {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 14px;
+    border: 1px solid color-mix(in oklab, var(--shift) 40%, var(--line));
+    border-radius: 10px;
+    background-color: color-mix(in oklab, var(--shift) 7%, var(--surface));
+    font-size: 13.5px;
+    color: var(--ink);
+  }
+
+  /*
+   * A project's canvas. The stage fills the space under the top bar; the
+   * scroller pans; the world is scaled by the zoom and holds one slot per
+   * card. An aura sits in its card's slot, behind every card.
+   */
+  .canvas-stage {
+    position: relative;
+    height: calc(100dvh - 52px);
+    overflow: hidden;
+  }
+
+  /* Below 768 px the rail lies flat under the top bar: 48 px and its border. */
+  @media (max-width: 767.98px) {
+    .canvas-stage {
+      height: calc(100dvh - 101px);
+    }
+  }
+
+  .canvas-scroll {
+    position: absolute;
+    inset: 0;
+    overflow: auto;
+    overscroll-behavior: contain;
+    background-color: var(--canvas);
+    background-image: radial-gradient(var(--dot) 1.1px, transparent 1.3px);
+    background-attachment: local;
+    cursor: grab;
+  }
+
+  .canvas-scroll:active {
+    cursor: grabbing;
+  }
+
+  .canvas-sizer {
+    position: relative;
+  }
+
+  .canvas-world {
+    position: absolute;
+    left: 0;
+    top: 0;
+    transform-origin: 0 0;
+  }
+
+  .canvas-slot {
+    position: absolute;
+    cursor: default;
+    touch-action: auto;
+  }
+
+  .canvas-slot[data-dragging] {
+    cursor: grabbing;
+  }
+
+  .canvas-slot[data-dragging] .svc {
+    border-color: var(--line-2);
+    box-shadow: var(--shadow);
+  }
+
+  .canvas-empty {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    padding: 72px 16px 16px;
+    pointer-events: none;
+  }
+
+  .canvas-empty > * {
+    pointer-events: auto;
+  }
+
+  .canvas-tools {
+    position: absolute;
+    top: 16px;
+    right: 18px;
+    left: 18px;
+    z-index: 2;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 10px;
+    pointer-events: none;
+  }
+
+  /* One row on any width: the access chip gives way and truncates, Add keeps its size. */
+  .canvas-tools > * {
+    pointer-events: auto;
+  }
+
+  .canvas-problem {
+    position: absolute;
+    left: 16px;
+    right: 16px;
+    top: 64px;
+    z-index: 2;
+  }
+
+  /* A service on the canvas: the whole card is the link that opens it. */
+  .svc {
+    position: relative;
+    display: block;
+    width: 264px;
+    background-color: var(--surface);
+    background-image: linear-gradient(180deg, var(--surface-hi), var(--surface) 70%);
+    border: 1px solid var(--line);
+    border-radius: 11px;
+    overflow: hidden;
+    color: var(--ink);
+    text-decoration: none;
+    user-select: none;
+    -webkit-user-drag: none;
+    transition: border-color 120ms ease;
+  }
+
+  .svc:hover {
+    border-color: var(--line-2);
+  }
+
+  .svc:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .svc-body {
+    display: grid;
+    gap: 4px;
+    padding: 14px 16px 15px;
+  }
+
+  .svc-name {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+    margin-bottom: 2px;
+  }
+
+  .svc-name b {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-stretch: 106%;
+    font-weight: 620;
+    font-size: 15px;
+    letter-spacing: -0.003em;
+  }
+
+  .svc-x {
+    margin-left: auto;
+    flex: none;
+    font-size: 12px;
+    color: var(--ink-3);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .svc-sub {
+    display: block;
+    margin-top: -6px;
+    padding-left: 38px;
+    font-size: 12.5px;
+    color: var(--ink-2);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .svc-state {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    margin-top: 12px;
+    font-size: 13px;
+    white-space: nowrap;
+  }
+
+  .svc-foot {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    padding: 9px 16px;
+    border-top: 1px solid var(--line);
+    font-size: 12.5px;
+    color: var(--ink-2);
+    background-color: color-mix(in oklab, var(--surface) 60%, var(--sunk));
+  }
+
+  .svc-foot svg {
+    width: 14px;
+    height: 14px;
+    flex: none;
+    color: var(--ink-3);
+  }
+
+  .svc-foot-fault,
+  .svc-foot-fault svg {
+    color: var(--fault);
+  }
+
+  /* What needs a person radiates; red stays still, and only one breathes. */
+  .aura {
+    position: absolute;
+    z-index: -1;
+    pointer-events: none;
+  }
+
+  .aura canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+
+  @keyframes aura-breathe {
+    50% {
+      opacity: 0.4;
+    }
+  }
+
+  .aura-breathe {
+    animation: aura-breathe 2.8s ease-in-out infinite;
+  }
+
+  /* Who else can act here, top-right on the canvas. */
+  .access {
+    display: flex;
+    flex: 0 1 auto;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    max-width: 100%;
+    height: 34px;
+    padding: 0 10px 0 6px;
+    border-radius: 8px;
+    background-color: var(--surface);
+    border: 1px solid var(--line);
+    font-size: 12px;
+    color: var(--ink-2);
+  }
+
+  .access b {
+    color: var(--ink);
+    font-weight: 600;
+  }
+
+  .access-more {
+    flex: none;
+    padding-left: 8px;
+    border-left: 1px solid var(--line);
+    color: var(--ink-2);
+    font-variant-numeric: tabular-nums;
+    text-decoration: none;
+  }
+
+  .access-more:hover {
+    color: var(--ink);
+  }
+
+  /* Zoom in, zoom out and fit, bottom-left. */
+  .zoom {
+    position: absolute;
+    left: 16px;
+    bottom: 16px;
+    z-index: 2;
+    display: grid;
+    gap: 2px;
+    padding: 3px;
+    background-color: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+  }
+
+  .zoom button {
+    width: 28px;
+    height: 28px;
+    display: grid;
+    place-items: center;
+    border-radius: 6px;
+    color: var(--ink-3);
+    cursor: pointer;
+  }
+
+  .zoom button:hover {
+    background-color: var(--raised);
+    color: var(--ink);
+  }
+
+  .zoom svg {
+    width: 15px;
+    height: 15px;
+  }
+
+  /* Nothing here yet. */
+  .empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    max-width: 360px;
+    margin-inline: auto;
+    text-align: center;
+  }
+
+  .empty-cube {
+    display: block;
+    width: 120px;
+    height: 78px;
+  }
+
+  .empty-title {
+    margin-top: 14px;
+    font-size: 14.5px;
+    font-weight: 620;
+    color: var(--ink);
+  }
+
+  .empty-text {
+    margin-top: 6px;
+    font-size: 13px;
+    color: var(--ink-2);
+  }
+
+  /* The Add menu: a typed filter over what can be added. */
+  .cmd {
+    position: fixed;
+    left: 50%;
+    top: 14vh;
+    z-index: 50;
+    width: min(440px, calc(100vw - 32px));
+    transform: translateX(-50%);
+    padding-bottom: 6px;
+    background-color: var(--raised);
+    border: 1px solid var(--line-2);
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+
+  .cmd[data-state='open'] {
+    animation: menu-in 120ms ease-out;
+  }
+
+  .cmd-input {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    height: 46px;
+    padding: 0 16px;
+    border-bottom: 1px solid var(--line);
+    color: var(--ink-3);
+  }
+
+  .cmd-input svg {
+    width: 15px;
+    height: 15px;
+    flex: none;
+  }
+
+  .cmd-input input {
+    flex: 1;
+    min-width: 0;
+    height: 100%;
+    background: transparent;
+    border: 0;
+    outline: none;
+    font-size: 14px;
+    color: var(--ink);
+  }
+
+  .cmd-input input::placeholder {
+    color: var(--ink-2);
+  }
+
+  .cmd-list {
+    display: grid;
+    gap: 2px;
+    padding-top: 6px;
+  }
+
+  .mi {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 0 6px;
+    padding: 10px 14px;
+    border-radius: 8px;
+    cursor: pointer;
+  }
+
+  .mi.on {
+    background-color: var(--surface);
+    box-shadow: inset 0 0 0 1px var(--line-2);
+  }
+
+  .mi-t {
+    display: grid;
+    gap: 1px;
+    min-width: 0;
+  }
+
+  .mi-t b {
+    font-weight: 560;
+    font-size: 13.5px;
+    color: var(--ink);
+  }
+
+  .mi-t small {
+    font-size: 12px;
+    color: var(--ink-2);
+  }
+
+  .cmd-none {
+    padding: 14px 20px;
+    font-size: 13px;
+    color: var(--ink-2);
+  }
+
+  /* A create flow in a sheet at the right, over the canvas. */
+  .sheet {
+    position: fixed;
+    top: 10px;
+    right: 10px;
+    bottom: 0;
+    z-index: 50;
+    width: min(640px, calc(100vw - 20px));
+    display: flex;
+    flex-direction: column;
+    background-color: var(--surface);
+    border: 1px solid var(--line-2);
+    border-bottom: 0;
+    border-radius: 12px 12px 0 0;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+
+  .sheet[data-state='open'] {
+    animation: sheet-in 160ms ease-out;
+  }
+
+  @keyframes sheet-in {
+    from {
+      opacity: 0;
+      transform: translateX(16px);
+    }
+  }
+
+  .sheet-head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 20px 20px 16px;
+  }
+
+  .sheet-title {
+    font-stretch: 112%;
+    font-weight: 640;
+    font-size: 21px;
+    letter-spacing: -0.006em;
+    line-height: 1.2;
+  }
+
+  .sheet-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+  }
+
   @keyframes dialog-fade {
     from {
       opacity: 0;
@@ -1091,7 +1687,8 @@
 
   @media (prefers-reduced-motion: reduce) {
     .lamp-pulse,
-    .sweep {
+    .sweep,
+    .aura-breathe {
       animation: none;
     }
 

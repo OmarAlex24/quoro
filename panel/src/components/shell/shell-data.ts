@@ -1,4 +1,5 @@
 import { useListApprovals } from '../../api/generated/approvals/approvals';
+import type { Approval } from '../../api/generated/model';
 import { useGetCluster } from '../../api/generated/cluster/cluster';
 import { useListNodes } from '../../api/generated/nodes/nodes';
 import { clusterSummary, type ClusterSummary } from '../../lib/nodes';
@@ -10,14 +11,19 @@ import { useSession } from '../../session';
  * sign-in caches no refusal.
  */
 
-/** Approvals waiting for a person; refreshed every 10 s. */
-export function usePendingApprovalCount(): number {
+/** Approvals waiting for a person; refreshed every 10 s. One query for every view that shows them. */
+export function usePendingApprovals(): Approval[] {
   const { user } = useSession();
   const pending = useListApprovals(
     { status: 'pending' },
     { query: { enabled: user !== undefined, refetchInterval: 10_000, retry: false } },
   );
-  return pending.data?.items.length ?? 0;
+  return pending.data?.items ?? [];
+}
+
+/** How many approvals wait for a person. */
+export function usePendingApprovalCount(): number {
+  return usePendingApprovals().length;
 }
 
 /** The cluster's name, or the product's when it cannot be read. */

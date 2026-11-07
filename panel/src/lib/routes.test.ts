@@ -149,6 +149,14 @@ describe('search validators', () => {
     }
   });
 
+  it('opens a create sheet for a Git app, an image app or a VM, and nothing else', () => {
+    for (const add of ['git', 'image', 'vm']) {
+      expect(validateProjectSearch({ add })).toEqual({ add });
+    }
+    expect(validateProjectSearch({ add: 'template' })).toEqual({});
+    expect(validateProjectSearch({ add: 'app' })).toEqual({});
+  });
+
   it('reads the projects, nodes and agents switches', () => {
     expect(validateProjectsSearch({ add: 'app' })).toEqual({ add: 'app' });
     expect(validateProjectsSearch({ add: 'vm' })).toEqual({});
