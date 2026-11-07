@@ -9,12 +9,14 @@ import { appLampState } from '../lib/app-status';
 import { lampState } from '../lib/lamp';
 import {
   appAddress,
+  appKey,
   appKind,
   commitLine,
   lastBuildFailed,
   nextBackupLine,
   nodesLine,
   replicasMark,
+  vmKey,
   vmSize,
   volumeLine,
   type ServiceKind,
@@ -45,6 +47,7 @@ function CardFace({
   foot,
   deploying,
   link,
+  selected = false,
 }: {
   kind: ServiceKind;
   name: string;
@@ -55,6 +58,8 @@ function CardFace({
   foot: readonly FootRow[];
   deploying: boolean;
   link: { search: { app: string; tab: 'deployments' } | { vm: string }; projectId: string };
+  /** Open in the service sheet. */
+  selected?: boolean;
 }) {
   const mark = replicas !== undefined ? replicasMark({ replicas }) : null;
   return (
@@ -64,6 +69,8 @@ function CardFace({
       search={link.search}
       className="svc"
       draggable={false}
+      data-service={'app' in link.search ? appKey(link.search.app) : vmKey(link.search.vm)}
+      data-selected={selected ? '' : undefined}
     >
       {deploying ? <span className="sweep" aria-hidden="true" /> : null}
       <span className="svc-body">
@@ -102,6 +109,7 @@ export function AppCard({
   builds,
   nodeIds,
   nodeNames,
+  selected = false,
 }: {
   app: App;
   /** Recent builds, newest first; only for an app with a Git source. */
@@ -109,6 +117,8 @@ export function AppCard({
   /** Nodes the app's instances run on. */
   nodeIds: readonly string[];
   nodeNames: Readonly<Record<string, string>>;
+  /** Open in the service sheet. */
+  selected?: boolean;
 }) {
   const lamp = appLampState(app.status);
   const domains = useListAppDomains(app.id, undefined, {
@@ -150,6 +160,7 @@ export function AppCard({
       foot={foot}
       deploying={app.status === 'deploying'}
       link={{ projectId: app.project_id, search: { app: app.id, tab: 'deployments' } }}
+      selected={selected}
     />
   );
 }

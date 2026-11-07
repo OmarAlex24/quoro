@@ -4,6 +4,7 @@ import {
   LEGACY_PATHS,
   newHome,
   sectionOf,
+  sheetTab,
   validateAgentsSearch,
   validateAuditSearch,
   validateGrantsSearch,
@@ -147,6 +148,12 @@ describe('search validators', () => {
     ]) {
       expect(validateProjectSearch({ tab }).tab).toBe(tab);
     }
+  });
+
+  it('opens a service on Deployments unless the URL names another tab', () => {
+    expect(sheetTab(validateProjectSearch({ app: APP }))).toBe('deployments');
+    expect(sheetTab(validateProjectSearch({ app: APP, tab: 'variables' }))).toBe('variables');
+    expect(sheetTab(validateProjectSearch({ app: APP, tab: 'Variables' }))).toBe('deployments');
   });
 
   it('opens a create sheet for a Git app, an image app or a VM, and nothing else', () => {

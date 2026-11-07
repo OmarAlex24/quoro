@@ -249,3 +249,61 @@ export function drawCube({ ctx, w, h }: DitherSurface, read: TokenReader = readT
     (x, y) => mix[face(x, y)]!,
   );
 }
+
+/** How a tape segment or a step bar is drawn: by what happened in it. */
+export type TapeTone = 'done' | 'live' | 'failed' | 'stopped';
+
+/**
+ * One phase of the deploy tape. Done phases share one accent-to-ion run
+ * across the whole tape: `from` and `to` are where this segment starts and
+ * ends on it (0..1), so neighbours meet in the same mix. The running phase
+ * fills in amber towards now; a broken one is solid fault red.
+ */
+export function drawTapeSegment(
+  { ctx, w, h }: DitherSurface,
+  tone: TapeTone,
+  from: number,
+  to: number,
+  read: TokenReader = readToken,
+): void {
+  if (tone === 'live') {
+    dither(ctx, w, h, 2, read('--shift'), (x) => 0.3 + (0.7 * x) / w);
+    return;
+  }
+  if (tone === 'failed') {
+    dither(ctx, w, h, 2, read('--fault'), () => 0.92);
+    return;
+  }
+  if (tone === 'stopped') {
+    dither(ctx, w, h, 2, read('--idle'), () => 0.6);
+    return;
+  }
+  dither2(ctx, w, h, 2, read('--accent'), read('--ion'), () => 0.92, (x) =>
+    clamp(0.1 + 0.7 * (from + ((to - from) * x) / w)),
+  );
+}
+
+/**
+ * A BuildKit step's bar: a faint dotted track, filled to the step's share of
+ * the build. The share is drawn at least 4 px wide so a short step still shows.
+ */
+export function drawStepBar(
+  { ctx, w, h }: DitherSurface,
+  share: number,
+  tone: TapeTone,
+  read: TokenReader = readToken,
+): void {
+  dither(ctx, w, h, 2, read('--line-2'), () => 0.2);
+  if (share <= 0) return;
+  const filled = Math.min(w, Math.max(4, share * w));
+  ctx.clearRect(0, 0, filled, h);
+  if (tone === 'failed') {
+    dither(ctx, filled, h, 2, read('--fault'), () => 0.96);
+  } else if (tone === 'live') {
+    dither(ctx, filled, h, 2, read('--shift'), (x) => 0.3 + (0.7 * x) / filled);
+  } else {
+    dither2(ctx, filled, h, 2, read('--accent'), read('--ion'), () => 0.96, (x) =>
+      clamp(0.15 + (0.6 * x) / filled),
+    );
+  }
+}
