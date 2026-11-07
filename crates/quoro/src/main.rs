@@ -92,7 +92,7 @@ async fn main() -> ExitCode {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some((command, rest)) = args.split_first() else {
-        return usage();
+        return quoro_cli::run(Vec::new()).await;
     };
 
     match command.as_str() {

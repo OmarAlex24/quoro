@@ -14,10 +14,11 @@ use axum::middleware::{self, Next};
 use quoro_cli::Environment;
 use quoro_control_plane::auth::setup_token;
 use quoro_control_plane::crypto::DataKey;
+use quoro_control_plane::driver::{self, Capacity, Kvm, LocalNode};
 use quoro_control_plane::store::{Store, random_secret, sha256_hex};
 use quoro_control_plane::{AppState, NodeNetwork, ReferenceAsDigest, ServerConfig, router};
 use rustls::pki_types::PrivatePkcs8KeyDer;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -195,6 +196,142 @@ impl Primary {
         Environment::new(vars, false)
     }
 
+    /// A request with a bearer token on the plain fixture listener; the
+    /// status and the JSON body (`Value::Null` when there is none).
+    pub async fn fixture(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        token: &str,
+        body: Option<Value>,
+    ) -> (u16, Value) {
+        let mut request = reqwest::Client::new()
+            .request(method, format!("{}{path}", self.plain))
+            .header("Authorization", format!("Bearer {token}"));
+        if let Some(body) = body {
+            request = request
+                .header("Content-Type", "application/json")
+                .body(body.to_string());
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap();
+        (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
+    async fn fixture_ok(&self, path: &str, token: &str, body: Value) -> Value {
+        let (status, body) = self
+            .fixture(reqwest::Method::POST, path, token, Some(body))
+            .await;
+        assert!((200..300).contains(&status), "POST {path}: {status} {body}");
+        body
+    }
+
+    /// Registers the local node and creates the project `demo` with the app
+    /// `web`, as the owner; returns the app's id.
+    pub async fn app(&self, owner_token: &str) -> String {
+        driver::register_local_node(
+            &self.state.store,
+            &LocalNode {
+                name: "test-node".to_string(),
+                capacity: Capacity {
+                    cpus: 8,
+                    memory_mb: 16_384,
+                    disk_gb: 100,
+                },
+                kvm: Kvm {
+                    available: true,
+                    kernel: "6.8.0".to_string(),
+                    nested: Some(true),
+                },
+                engine_version: "test-engine".to_string(),
+                agent_version: "test-agent".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let project = self
+            .fixture_ok(
+                "/api/v1/projects",
+                owner_token,
+                json!({ "slug": "demo", "name": "Demo" }),
+            )
+            .await;
+        let app = self
+            .fixture_ok(
+                "/api/v1/apps",
+                owner_token,
+                json!({
+                    "project_id": project["id"],
+                    "name": "web",
+                    "image": "ghcr.io/example/web@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                    "port": 8080,
+                }),
+            )
+            .await;
+        app["id"].as_str().unwrap().to_string()
+    }
+
+    /// Creates the agent `name` owned by `owner_id` and a key for it; returns
+    /// the agent's id and the key.
+    pub async fn agent(&self, owner_token: &str, owner_id: &str, name: &str) -> (String, String) {
+        let agent = self
+            .fixture_ok(
+                "/api/v1/agents",
+                owner_token,
+                json!({ "name": name, "model": "test-model", "owner_user_id": owner_id }),
+            )
+            .await;
+        let agent_id = agent["id"].as_str().unwrap().to_string();
+        let key = self
+            .fixture_ok(
+                &format!("/api/v1/agents/{agent_id}/keys"),
+                owner_token,
+                json!({}),
+            )
+            .await;
+        (agent_id, key["key"].as_str().unwrap().to_string())
+    }
+
+    /// Grants `scopes` on `selector` to the agent for an hour.
+    pub async fn grant(&self, owner_token: &str, agent_id: &str, scopes: &[&str], selector: Value) {
+        self.fixture_ok(
+            "/api/v1/grants",
+            owner_token,
+            json!({
+                "agent_id": agent_id,
+                "scopes": scopes,
+                "selector": selector,
+                "ttl_s": 3600,
+                "reason": "tests",
+            }),
+        )
+        .await;
+    }
+
+    /// One integer from a SQL query, such as a count.
+    pub async fn count(&self, sql: &str) -> i64 {
+        sqlx::query_scalar(sql)
+            .fetch_one(self.state.store.pool())
+            .await
+            .unwrap()
+    }
+
+    /// How many access tokens the primary minted.
+    pub async fn mints(&self) -> i64 {
+        self.count("SELECT COUNT(*) FROM access_tokens").await
+    }
+
+    /// The newest audit record's justification, actor type and operation.
+    pub async fn last_actor(&self) -> (Option<String>, String, String) {
+        sqlx::query_as(
+            "SELECT justification, actor_type, operation FROM audit_log ORDER BY seq DESC LIMIT 1",
+        )
+        .fetch_one(self.state.store.pool())
+        .await
+        .unwrap()
+    }
+
     /// The newest audit record's justification, channel and operation.
     pub async fn last_audit(&self) -> (Option<String>, String, String) {
         sqlx::query_as(
@@ -212,6 +349,26 @@ pub fn write_credentials(home: &Path, token: &str, mode: u32) {
     let path = home.join("quoro/credentials.toml");
     std::fs::write(&path, format!("[contexts.lab]\ntoken = \"{token}\"\n")).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// Writes `key` to `dir/name` at `mode`; returns the path.
+pub fn key_file(dir: &Path, name: &str, key: &str, mode: u32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::create_dir_all(dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, format!("{key}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    path
+}
+
+/// A file's permission bits.
+pub fn mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        .permissions()
+        .mode()
+        & 0o777
 }
 
 /// Runs the client with `args` in `environment`.

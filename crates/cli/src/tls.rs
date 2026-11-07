@@ -8,7 +8,12 @@
 //! (`quoro_node_agent::tls`), which the client does not link. A primary behind
 //! a publicly trusted certificate can use `tls = "system"` instead.
 //!
-//! Both configurations are built on the `ring` provider explicitly, never on
+//! A first `quoro login` without a pin uses a third configuration,
+//! [`capturing`], that records the presented leaf's digest and then fails the
+//! handshake, so nothing is sent on that connection; the user confirms the
+//! digest and it becomes the context's pin.
+//!
+//! Every configuration is built on the `ring` provider explicitly, never on
 //! a process default, so the algorithms do not depend on what another crate
 //! installed (ADR 0080).
 
@@ -17,7 +22,7 @@ use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signat
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use sha2::{Digest as _, Sha256};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Reads a certificate fingerprint: `sha256:<64 hex>`, bare hex or
 /// colon-separated hex, in any case, as `quoro join` accepts it.
@@ -45,7 +50,7 @@ pub fn parse_fingerprint(text: &str) -> Result<[u8; 32], String> {
 }
 
 /// `sha256:<lowercase hex>`, the form the primary prints.
-fn show(digest: &[u8]) -> String {
+pub fn show(digest: &[u8]) -> String {
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     format!("sha256:{hex}")
 }
@@ -79,6 +84,72 @@ pub fn system() -> Result<ClientConfig, String> {
         .map_err(|e| format!("no usable TLS protocol versions: {e}"))?
         .with_root_certificates(roots)
         .with_no_client_auth())
+}
+
+/// The digest the [`capturing`] configuration saw.
+pub type Captured = Arc<Mutex<Option<[u8; 32]>>>;
+
+/// A configuration that records the SHA-256 of the presented leaf in
+/// `captured` and refuses every certificate, so the handshake never completes
+/// and no request is sent.
+pub fn capturing(captured: Captured) -> Result<ClientConfig, String> {
+    let provider = provider();
+    Ok(ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("no usable TLS protocol versions: {e}"))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(CapturingVerifier { captured, provider }))
+        .with_no_client_auth())
+}
+
+/// Records the leaf's digest, accepts nothing.
+#[derive(Debug)]
+struct CapturingVerifier {
+    captured: Captured,
+    provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for CapturingVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let digest: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
+        if let Ok(mut captured) = self.captured.lock() {
+            *captured = Some(digest);
+        }
+        Err(rustls::Error::General(
+            "first contact: the certificate is recorded, not trusted".to_string(),
+        ))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::General("first contact".to_string()))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::General("first contact".to_string()))
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 /// Accepts one certificate, by digest.
