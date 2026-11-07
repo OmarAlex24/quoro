@@ -8,7 +8,7 @@ Each entry links the pull request that made the change and, where one exists, th
 
 ### Added
 
-- **A host suspend counts against `expiring` leases.** The node measures lease time on a clock that keeps counting while the host is suspended (`CLOCK_BOOTTIME` on Linux). Its timers run on the monotonic clock, which stops during a suspend, while the primary's gate keeps running. So the node checks at least every 250 ms, and at once when the host wakes, how far `CLOCK_BOOTTIME` has moved beyond that clock. It then moves every `expiring` lease's deadline, renewals and pending renewals earlier by the difference. A lease whose deadline passed during the suspend expires and is fenced as soon as the host wakes, with no graceful stop, and so does one a revoke reaches first. No stateful start passes in between, and the node is not marked failed. The deadline a held lease stores for an agent restart now comes from the `CLOCK_BOOTTIME` reading taken when its renewal was sent, not when the answer arrived, so a suspend between the two cannot make it later ([#PR446], [#446], [ADR 0240]).
+- **A host suspend counts against `expiring` leases.** The node measures lease time on a clock that keeps counting while the host is suspended (`CLOCK_BOOTTIME` on Linux). Its timers run on the monotonic clock, which stops during a suspend, while the primary's gate keeps running. So the node checks at least every 250 ms, and at once when the host wakes, how far `CLOCK_BOOTTIME` has moved beyond that clock. It then moves every `expiring` lease's deadline, renewals and pending renewals earlier by the difference. A lease whose deadline passed during the suspend expires and is fenced as soon as the host wakes, with no graceful stop, and so does one a revoke reaches first. No stateful start passes in between, and the node is not marked failed. The deadline a held lease stores for an agent restart now comes from the `CLOCK_BOOTTIME` reading taken when its renewal was sent, not when the answer arrived, so a suspend between the two cannot make it later ([#452], [#446], [ADR 0240]).
 
 - **Fence events name the lease's token and the stopped VMs.** A node's `node.fenced` and `node.fence_failed` events now carry `fencing_tokens`: the token the node held for each fenced lease, the same one as in the fence's local record. When a revoke with a higher token joined a running fence, the event carries that revoke's token. `node.fenced` also carries `vm_ids`, the VMs the fence stopped. The failed fences an upgraded agent reports again carry their recorded token too ([#445], [#442], [#436]).
 
@@ -426,8 +426,8 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#442]: https://github.com/OmarAlex24/quoro/issues/442
 [#445]: https://github.com/OmarAlex24/quoro/pull/445
 [#446]: https://github.com/OmarAlex24/quoro/issues/446
-[#PR446]: https://github.com/OmarAlex24/quoro/pull/PR446
 [#447]: https://github.com/OmarAlex24/quoro/pull/447
+[#452]: https://github.com/OmarAlex24/quoro/pull/452
 [ADR 0019]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0019-fencing-is-mandatory-and-lease-based-node-agent-self-fences.md
 [ADR 0020]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0020-per-app-ha-policies-none-cold-warm-hot-with-cost-shown-in.md
 [ADR 0027]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0027-signed-binaries-and-reproducible-builds-are-mandatory.md
