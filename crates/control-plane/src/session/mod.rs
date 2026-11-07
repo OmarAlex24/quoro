@@ -1524,11 +1524,11 @@ struct Session {
     fence_ack_stopped: bool,
 }
 
-/// A `fence_ack` the node has not answered: its message id and the lease ids
-/// it carried.
+/// A `fence_ack` the node has not answered: its message id and what it
+/// carried, the lease ids and their tokens.
 struct FenceAckSent {
     msg_id: String,
-    lease_ids: Vec<String>,
+    delivery: crate::fences::Delivery,
 }
 
 async fn run_session(
@@ -2106,7 +2106,7 @@ impl Session {
     /// (`fence_ack_pending`, section 8.5 step 4).
     async fn has_pending_fence_ack(&self) -> bool {
         match self.pending_fence_ack().await {
-            Ok(pending) => !pending.is_empty(),
+            Ok(pending) => !pending.lease_ids.is_empty(),
             Err(e) => {
                 tracing::warn!(code = %e.code.as_str(), node_id = %self.node_id, "cannot read a pending fence ack");
                 false
@@ -2114,12 +2114,14 @@ impl Session {
         }
     }
 
-    async fn pending_fence_ack(&self) -> Result<Vec<String>, ApiError> {
+    /// The `fence_ack` that would deliver the node's pending
+    /// acknowledgement; its `lease_ids` are empty when none is pending.
+    async fn pending_fence_ack(&self) -> Result<crate::fences::Delivery, ApiError> {
         let mut conn = self.hub.0.store.pool().acquire().await?;
         Ok(crate::fences::pending_of(&mut conn, &self.node_id)
             .await?
-            .map(|pending| pending.lease_ids)
-            .unwrap_or_default())
+            .unwrap_or_default()
+            .delivery())
     }
 
     /// Sends `command` kind `fence_ack` with the pending acknowledgement
@@ -2140,8 +2142,8 @@ impl Session {
         {
             return false;
         }
-        let lease_ids = match self.pending_fence_ack().await {
-            Ok(lease_ids) if !lease_ids.is_empty() => lease_ids,
+        let delivery = match self.pending_fence_ack().await {
+            Ok(delivery) if !delivery.lease_ids.is_empty() => delivery,
             Ok(_) => return false,
             Err(e) => {
                 tracing::warn!(code = %e.code.as_str(), node_id = %self.node_id, "cannot read a pending fence ack");
@@ -2152,12 +2154,12 @@ impl Session {
         outbox.push(
             ControlMessage::Command(wire::Command {
                 kind: "fence_ack".to_string(),
-                params: crate::fences::command_params(&lease_ids),
+                params: crate::fences::command_params(&delivery),
             })
             .to_frame(&msg_id, None)
             .to_text(),
         );
-        self.fence_ack = Some(FenceAckSent { msg_id, lease_ids });
+        self.fence_ack = Some(FenceAckSent { msg_id, delivery });
         true
     }
 
@@ -2208,7 +2210,7 @@ impl Session {
         };
         if ok {
             if let Err(e) =
-                crate::fences::confirm(&self.hub.0.store, &self.node_id, &sent.lease_ids).await
+                crate::fences::confirm(&self.hub.0.store, &self.node_id, &sent.delivery).await
             {
                 tracing::warn!(code = %e.code.as_str(), node_id = %self.node_id, "cannot clear a delivered fence ack");
                 self.fence_ack_stopped = true;

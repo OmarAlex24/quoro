@@ -617,6 +617,11 @@ pub async fn ack_node_fence(
     }
 }
 
+/// A lease row's `fencing_token` as the token a `fence_ack` carries.
+fn stored_token(token: i64) -> u64 {
+    u64::try_from(token).unwrap_or(0)
+}
+
 /// Section 8.5 step 3 in one transaction: checks the list against the node's
 /// outstanding failed fences, increments each listed lease's token and
 /// records it revoked as when declaring a node lost (section 8.3), clears
@@ -626,9 +631,14 @@ pub async fn ack_node_fence(
 /// Only the leases this node still holds change: declaring a node lost
 /// touches the leases the node holds (section 8.3), and a lease another node
 /// holds already carries a higher token than this node's, so revoking it
-/// here would only end the other node's grant without telling it. Every
-/// listed lease is still acknowledged to the node, so it clears its record of
-/// each failed fence.
+/// here would only end the other node's grant without telling it (ADR 0246).
+/// Every listed lease is still acknowledged to the node, each with a token
+/// (ADR 0245): a lease the node holds, its token after the increment; one
+/// another node holds, that lease's token plus one, so the node clears a
+/// failed fence it recorded at that token (ADR 0247). The node clears only
+/// the failed fences below its lease's token. A lease with no row gets no
+/// token, and the acknowledgement then goes out without `fencing_tokens`, as
+/// a primary before ADR 0245 sends it.
 async fn fence_ack_tx(
     state: &AppState,
     ctx: &CallCtx,
@@ -683,15 +693,26 @@ async fn fence_ack_tx(
     }
 
     let actor = ctx.identity.actor();
-    crate::leases::bump_tokens(&mut w.tx, lease_ids, node_id, &actor).await?;
+    let bumped = crate::leases::bump_tokens(&mut w.tx, lease_ids, node_id, &actor).await?;
     let mut pending = crate::fences::pending_of(&mut w.tx, node_id)
         .await?
         .unwrap_or_default();
     pending.acked_at = now_rfc3339();
     for lease_id in lease_ids {
+        let token = match bumped.iter().find(|lease| &lease.id == lease_id) {
+            Some(lease) => Some(stored_token(lease.fencing_token)),
+            // Another node holds it (ADR 0247), or it has no row.
+            None => crate::leases::by_id(&mut w.tx, lease_id)
+                .await?
+                .map(|lease| stored_token(lease.fencing_token).saturating_add(1)),
+        };
         if !pending.lease_ids.contains(lease_id) {
             pending.lease_ids.push(lease_id.clone());
         }
+        match token {
+            Some(token) => pending.fencing_tokens.insert(lease_id.clone(), token),
+            None => pending.fencing_tokens.remove(lease_id),
+        };
     }
     sqlx::query("UPDATE nodes SET fence_failure = NULL, fence_ack_pending = ? WHERE id = ?")
         .bind(crate::fences::pending_text(Some(&pending))?)

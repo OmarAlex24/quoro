@@ -14,7 +14,7 @@
 //! Both columns are replicated state: every write goes through the change log
 //! in the caller's transaction.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -34,11 +34,86 @@ pub(crate) struct FenceFailure {
     pub vm_ids: Vec<String>,
 }
 
-/// `nodes.fence_ack_pending` (migration 0001).
+/// `nodes.fence_ack_pending` (migration 0001), with the token stored for
+/// each lease (section 8.5 step 3, ADR 0245).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct FenceAckPending {
     pub acked_at: String,
     pub lease_ids: Vec<String>,
+    /// The acknowledged token of each lease in `lease_ids`: for a lease the
+    /// node still holds, its `fencing_token` after the acknowledgement's
+    /// increment; for one another node holds, that lease's token plus one
+    /// (ADR 0247). A lease with no row has none, and neither has an
+    /// acknowledgement a primary before ADR 0245 recorded.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fencing_tokens: BTreeMap<String, u64>,
+}
+
+/// One delivery of the pending acknowledgement (section 8.5 step 4): the
+/// lease ids and the tokens stored for them when it went out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Delivery {
+    pub lease_ids: Vec<String>,
+    /// The stored token of each listed lease that has one.
+    pub tokens: BTreeMap<String, u64>,
+}
+
+impl Delivery {
+    /// The `fencing_tokens` this delivery carries (section 5.17): its tokens
+    /// when every listed lease has one, else none, and the `fence_ack` goes
+    /// out as a primary before ADR 0245 sends it. A node answers a
+    /// `fence_ack` whose tokens miss a listed lease with `error`.
+    #[must_use]
+    pub(crate) fn fencing_tokens(&self) -> Option<&BTreeMap<String, u64>> {
+        self.lease_ids
+            .iter()
+            .all(|lease_id| self.tokens.contains_key(lease_id))
+            .then_some(&self.tokens)
+    }
+}
+
+impl FenceAckPending {
+    /// The next `fence_ack` of this acknowledgement (section 8.5 step 4), the
+    /// same on every delivery while nothing changes. A lease without a stored
+    /// token, which an acknowledgement recorded before ADR 0245 or one of a
+    /// lease with no row leaves, goes out in a `fence_ack` of its own without
+    /// `fencing_tokens`, and the node clears it by lease id. The leases with
+    /// a token follow, with their tokens, once the node answered it: one
+    /// without tokens would clear them by lease id too, a failed fence the
+    /// operator never saw included.
+    #[must_use]
+    pub(crate) fn delivery(&self) -> Delivery {
+        let untokened: Vec<String> = self
+            .lease_ids
+            .iter()
+            .filter(|lease_id| !self.fencing_tokens.contains_key(*lease_id))
+            .cloned()
+            .collect();
+        if !untokened.is_empty() {
+            return Delivery {
+                lease_ids: untokened,
+                tokens: BTreeMap::new(),
+            };
+        }
+        Delivery {
+            lease_ids: self.lease_ids.clone(),
+            tokens: self
+                .lease_ids
+                .iter()
+                .filter_map(|lease_id| {
+                    self.fencing_tokens
+                        .get(lease_id)
+                        .map(|token| (lease_id.clone(), *token))
+                })
+                .collect(),
+        }
+    }
+
+    /// Takes `lease_id` out, with its token.
+    fn remove(&mut self, lease_id: &str) {
+        self.lease_ids.retain(|listed| listed != lease_id);
+        self.fencing_tokens.remove(lease_id);
+    }
 }
 
 /// The ids one failure report names.
@@ -144,9 +219,9 @@ pub(crate) async fn record_failure(
     let mut pending = pending_of(conn, node_id).await?;
     if let Some(pending) = pending.as_mut() {
         let before = pending.lease_ids.len();
-        pending
-            .lease_ids
-            .retain(|lease_id| !failed.lease_ids.contains(lease_id));
+        for lease_id in failed.lease_ids {
+            pending.remove(lease_id);
+        }
         changed |= pending.lease_ids.len() != before;
     }
     if !changed {
@@ -201,9 +276,12 @@ pub(crate) async fn listed_leases(
     Ok(listed)
 }
 
-/// Clears the acknowledged `lease_ids` from the node's `fence_ack_pending`
-/// once the node answered the `fence_ack` with `ok` (section 8.5 step 4). An
-/// acknowledgement recorded meanwhile for other leases stays pending.
+/// Clears what `delivered` carried from the node's `fence_ack_pending` once
+/// the node answered the `fence_ack` with `ok` (section 8.5 step 4): each
+/// delivered lease still pending with the token stored when it went out, or
+/// still without one when it went out without. One acknowledged again since,
+/// after a new failure listed it, with another token stays pending (ADR
+/// 0238, ADR 0245), and so do the leases the delivery did not carry.
 ///
 /// # Errors
 ///
@@ -211,17 +289,21 @@ pub(crate) async fn listed_leases(
 pub(crate) async fn confirm(
     store: &Store,
     node_id: &str,
-    lease_ids: &[String],
+    delivered: &Delivery,
 ) -> Result<(), ApiError> {
     let mut w = store.begin_write().await?;
     let Some(mut pending) = pending_of(&mut w.tx, node_id).await? else {
         return Ok(());
     };
-    let before = pending.lease_ids.len();
-    pending
-        .lease_ids
-        .retain(|lease_id| !lease_ids.contains(lease_id));
-    if pending.lease_ids.len() == before {
+    let before = pending.clone();
+    for lease_id in &delivered.lease_ids {
+        if pending.lease_ids.contains(lease_id)
+            && pending.fencing_tokens.get(lease_id) == delivered.tokens.get(lease_id)
+        {
+            pending.remove(lease_id);
+        }
+    }
+    if pending == before {
         return Ok(());
     }
     sqlx::query("UPDATE nodes SET fence_ack_pending = ? WHERE id = ?")
@@ -239,10 +321,14 @@ pub(crate) async fn confirm(
     Ok(())
 }
 
-/// The `params` of a `fence_ack` command (section 5.17).
+/// The `params` of a `fence_ack` command (section 5.17): `fencing_tokens`
+/// only when the delivery has a token for every lease (ADR 0245).
 #[must_use]
-pub(crate) fn command_params(lease_ids: &[String]) -> serde_json::Value {
-    json!({ "lease_ids": lease_ids })
+pub(crate) fn command_params(delivery: &Delivery) -> serde_json::Value {
+    match delivery.fencing_tokens() {
+        Some(tokens) => json!({ "lease_ids": delivery.lease_ids, "fencing_tokens": tokens }),
+        None => json!({ "lease_ids": delivery.lease_ids }),
+    }
 }
 
 #[cfg(test)]
@@ -358,6 +444,10 @@ mod tests {
         let pending = FenceAckPending {
             acked_at: now_rfc3339(),
             lease_ids: vec!["lse_acked".to_string(), "lse_kept".to_string()],
+            fencing_tokens: BTreeMap::from([
+                ("lse_acked".to_string(), 4),
+                ("lse_kept".to_string(), 7),
+            ]),
         };
         sqlx::query("UPDATE nodes SET fence_ack_pending = ? WHERE id = ?")
             .bind(serde_json::to_string(&pending).unwrap())
@@ -388,6 +478,11 @@ mod tests {
         assert_eq!(failure.vm_ids, vec!["vm_1".to_string()]);
         let left = pending_of(&mut w.tx, &node_id).await.unwrap().unwrap();
         assert_eq!(left.lease_ids, vec!["lse_kept".to_string()]);
+        assert_eq!(
+            left.fencing_tokens,
+            BTreeMap::from([("lse_kept".to_string(), 7)]),
+            "the token leaves with its lease"
+        );
 
         // The same report again changes nothing.
         assert!(
@@ -408,12 +503,148 @@ mod tests {
         // Confirming the delivery clears only what it carried; the last
         // lease leaves the column `NULL`.
         w.commit().await.unwrap();
-        confirm(&store, &node_id, &["lse_kept".to_string()])
-            .await
-            .unwrap();
+        confirm(&store, &node_id, &left.delivery()).await.unwrap();
         let mut conn = store.pool().acquire().await.unwrap();
         assert!(pending_of(&mut conn, &node_id).await.unwrap().is_none());
         drop(conn);
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    async fn set_pending(store: &Store, node_id: &str, pending: &FenceAckPending) {
+        sqlx::query("UPDATE nodes SET fence_ack_pending = ? WHERE id = ?")
+            .bind(serde_json::to_string(pending).unwrap())
+            .bind(node_id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+    }
+
+    async fn pending(store: &Store, node_id: &str) -> Option<FenceAckPending> {
+        let mut conn = store.pool().acquire().await.unwrap();
+        pending_of(&mut conn, node_id).await.unwrap()
+    }
+
+    /// Section 5.17 (ADR 0245): a delivery carries `fencing_tokens` only
+    /// when every pending lease has one. An acknowledgement a primary before
+    /// ADR 0245 recorded has none, and goes out as that primary sent it.
+    #[test]
+    fn a_delivery_carries_the_tokens_only_when_every_lease_has_one() {
+        let mut pending = FenceAckPending {
+            acked_at: now_rfc3339(),
+            lease_ids: vec!["lse_a".to_string(), "lse_b".to_string()],
+            fencing_tokens: BTreeMap::from([("lse_a".to_string(), 3), ("lse_b".to_string(), 9)]),
+        };
+        let delivery = pending.delivery();
+        assert_eq!(
+            command_params(&delivery),
+            json!({
+                "lease_ids": ["lse_a", "lse_b"],
+                "fencing_tokens": {"lse_a": 3, "lse_b": 9},
+            })
+        );
+        // A lease without a token goes out alone, without tokens.
+        pending.fencing_tokens.remove("lse_b");
+        assert_eq!(pending.delivery().fencing_tokens(), None);
+        assert_eq!(
+            command_params(&pending.delivery()),
+            json!({ "lease_ids": ["lse_b"] })
+        );
+
+        // A row written before ADR 0245 reads with no tokens, and is written
+        // back as it was.
+        let legacy = r#"{"acked_at":"2026-11-01T00:00:00Z","lease_ids":["lse_a"]}"#;
+        let read: FenceAckPending = serde_json::from_str(legacy).unwrap();
+        assert!(read.fencing_tokens.is_empty());
+        assert_eq!(read.delivery().fencing_tokens(), None);
+        assert_eq!(serde_json::to_string(&read).unwrap(), legacy);
+    }
+
+    /// Section 8.5 step 4 (ADR 0238, ADR 0245): an `ok` clears a delivered
+    /// lease only while the pending acknowledgement still carries the token
+    /// that went out. A lease a new failure listed again and an operator
+    /// acknowledged again meanwhile carries a newer token, and stays pending.
+    #[tokio::test]
+    async fn an_ok_clears_only_what_went_out_with_the_same_token() {
+        let (store, node_id, data_dir) = store_with_node().await;
+        let sent = FenceAckPending {
+            acked_at: now_rfc3339(),
+            lease_ids: vec!["lse_a".to_string(), "lse_b".to_string()],
+            fencing_tokens: BTreeMap::from([("lse_a".to_string(), 3), ("lse_b".to_string(), 9)]),
+        };
+        let delivery = sent.delivery();
+        // `lse_a` was acknowledged again at token 5 before the answer came,
+        // and `lse_c` was acknowledged meanwhile.
+        set_pending(
+            &store,
+            &node_id,
+            &FenceAckPending {
+                acked_at: now_rfc3339(),
+                lease_ids: vec![
+                    "lse_a".to_string(),
+                    "lse_b".to_string(),
+                    "lse_c".to_string(),
+                ],
+                fencing_tokens: BTreeMap::from([
+                    ("lse_a".to_string(), 5),
+                    ("lse_b".to_string(), 9),
+                    ("lse_c".to_string(), 2),
+                ]),
+            },
+        )
+        .await;
+        confirm(&store, &node_id, &delivery).await.unwrap();
+        let left = pending(&store, &node_id).await.unwrap();
+        assert_eq!(
+            left.lease_ids,
+            vec!["lse_a".to_string(), "lse_c".to_string()]
+        );
+        assert_eq!(
+            left.fencing_tokens,
+            BTreeMap::from([("lse_a".to_string(), 5), ("lse_c".to_string(), 2)])
+        );
+
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    /// Section 8.5 step 4 and section 5.17: an acknowledgement with leases
+    /// both with and without a token goes out in two `fence_ack`s. The leases
+    /// without one go first, without tokens, and their `ok` clears them; the
+    /// leases with one follow with their tokens, so no `fence_ack` clears
+    /// them by lease id.
+    #[tokio::test]
+    async fn a_mixed_acknowledgement_goes_out_in_two_deliveries() {
+        let (store, node_id, data_dir) = store_with_node().await;
+        let mixed = FenceAckPending {
+            acked_at: now_rfc3339(),
+            lease_ids: vec![
+                "lse_new".to_string(),
+                "lse_old".to_string(),
+                "lse_more".to_string(),
+            ],
+            fencing_tokens: BTreeMap::from([
+                ("lse_new".to_string(), 4),
+                ("lse_more".to_string(), 7),
+            ]),
+        };
+        set_pending(&store, &node_id, &mixed).await;
+        let first = mixed.delivery();
+        assert_eq!(command_params(&first), json!({ "lease_ids": ["lse_old"] }));
+        confirm(&store, &node_id, &first).await.unwrap();
+        let left = pending(&store, &node_id).await.unwrap();
+        assert_eq!(
+            left.lease_ids,
+            vec!["lse_new".to_string(), "lse_more".to_string()]
+        );
+        let second = left.delivery();
+        assert_eq!(
+            command_params(&second),
+            json!({
+                "lease_ids": ["lse_new", "lse_more"],
+                "fencing_tokens": {"lse_new": 4, "lse_more": 7},
+            })
+        );
+        confirm(&store, &node_id, &second).await.unwrap();
+        assert!(pending(&store, &node_id).await.is_none());
         std::fs::remove_dir_all(&data_dir).unwrap();
     }
 }
