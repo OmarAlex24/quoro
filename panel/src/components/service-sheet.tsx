@@ -145,7 +145,8 @@ export function ServiceSheet({
   );
 }
 
-function CloseButton() {
+/** The sheet's close button; the app and the VM sheet share it. */
+export function CloseButton() {
   return (
     <DialogPrimitive.Close className="iconbtn" aria-label="Close">
       <X strokeWidth={1.7} aria-hidden="true" />
@@ -315,7 +316,7 @@ function SheetBody({
  * edge with more tabs behind it fades, and the active tab is scrolled into
  * view whenever it changes.
  */
-function SheetTabs({ label, tab, children }: { label: string; tab: ProjectTab; children: ReactNode }) {
+export function SheetTabs({ label, tab, children }: { label: string; tab: string; children: ReactNode }) {
   const ref = useRef<HTMLElement>(null);
   const [edges, setEdges] = useState<'none' | 'start' | 'end' | 'both'>('none');
 

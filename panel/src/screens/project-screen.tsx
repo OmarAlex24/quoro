@@ -7,8 +7,8 @@ import { useListProjects } from '../api/generated/projects/projects';
 import { useGetVm } from '../api/generated/vms/vms';
 import { problemView } from '../lib/problem';
 import { PROJECT_LIST_PARAMS } from '../lib/projects';
-import { sheetTab, type AddKind } from '../lib/routes';
-import { appKey } from '../lib/services';
+import { sheetTab, vmSheetTab, type AddKind } from '../lib/routes';
+import { appKey, vmKey } from '../lib/services';
 import { useSession } from '../session';
 import { CommandMenu } from '../components/command-menu';
 import { CreateSheet } from '../components/create-sheet';
@@ -16,11 +16,11 @@ import { AppMetricsBay } from '../components/metrics-bay';
 import { LogTape } from '../components/log-tape';
 import { ProjectCanvas } from '../components/project-canvas';
 import { ServiceSheet } from '../components/service-sheet';
+import { VmSheet } from '../components/vm-sheet';
 import { ProjectShell } from '../components/shell/project-shell';
 import { SessionGate } from '../components/shell/side-shell';
 import { Button } from '../components/ui/button';
 import { ProblemBanner } from '../components/ui/problem-banner';
-import { VmsScreen } from './vms-screen';
 
 const projectRoute = getRouteApi('/projects/$projectId');
 
@@ -28,8 +28,8 @@ const projectRoute = getRouteApi('/projects/$projectId');
  * `/projects/$projectId`: the project's top bar and rail around what is open.
  * The canvas shows the project's services; `?add=` opens a create sheet over
  * it and `?app=` the service sheet, on the tab in `?tab=` and the build in
- * `?build=`. The canvas stays behind the service sheet. `?vm=` still shows
- * the VM bay that held a VM before.
+ * `?build=`; `?vm=` opens a VM in the same kind of sheet, on Overview or
+ * Settings. The canvas stays behind either sheet.
  */
 export function ProjectScreen() {
   return (
@@ -60,9 +60,21 @@ function ProjectPage() {
   });
   const leaf = search.app ? appQuery.data?.name : search.vm ? vmQuery.data?.name : undefined;
   const serviceApp = missing ? undefined : search.app;
-  const onCanvas = !missing && !search.vm && view === 'canvas';
-  const sheet = canWrite && onCanvas && !serviceApp ? search.add : undefined;
-  const canAdd = canWrite && onCanvas && !serviceApp;
+  // An app wins when the URL names both.
+  const serviceVm = missing || serviceApp ? undefined : search.vm;
+  const onCanvas = !missing && view === 'canvas';
+  const open = serviceApp !== undefined || serviceVm !== undefined;
+  const sheet = canWrite && onCanvas && !open ? search.add : undefined;
+  const canAdd = canWrite && onCanvas && !open;
+  // The card the open sheet belongs to: the VM's own, or its app's for an instance.
+  const vmAppId = serviceVm && vmQuery.data?.id === serviceVm ? vmQuery.data.app_id : null;
+  const selectedKey = serviceApp
+    ? appKey(serviceApp)
+    : serviceVm
+      ? vmAppId
+        ? appKey(vmAppId)
+        : vmKey(serviceVm)
+      : undefined;
   const shortcut = canAdd && sheet === undefined;
 
   // Cmd+K (Ctrl+K elsewhere) opens the Add menu while the canvas is in view
@@ -87,7 +99,7 @@ function ProjectPage() {
   // Closing the service sheet goes back to what was behind it and puts focus
   // on the card that opened it.
   const closeService = () => {
-    const key = serviceApp ? appKey(serviceApp) : null;
+    const key = selectedKey ?? null;
     void navigate({
       to: '/projects/$projectId',
       params: { projectId },
@@ -103,8 +115,6 @@ function ProjectPage() {
   let content: ReactNode;
   if (missing) {
     content = <ProjectMissing />;
-  } else if (search.vm) {
-    content = <VmsScreen key={search.vm} projectId={projectId} vmId={search.vm} />;
   } else if (view === 'metrics') {
     content = <ProjectMetrics projectId={projectId} />;
   } else if (view === 'logs') {
@@ -117,7 +127,7 @@ function ProjectPage() {
         key={projectId}
         projectId={projectId}
         project={project}
-        selected={serviceApp ? appKey(serviceApp) : undefined}
+        selected={selectedKey}
         onAdd={canAdd ? () => setMenuOpen(true) : undefined}
       />
     );
@@ -147,6 +157,9 @@ function ProjectPage() {
           buildId={search.build}
           onClose={closeService}
         />
+      ) : null}
+      {serviceVm ? (
+        <VmSheet projectId={projectId} vmId={serviceVm} tab={vmSheetTab(search)} onClose={closeService} />
       ) : null}
     </ProjectShell>
   );

@@ -13,6 +13,7 @@ import {
   groupFindings,
   guestKernelVersion,
   inventorySentence,
+  nodeSecurityCount,
   openFindingCount,
   parsePins,
   resolvedReasonWords,
@@ -304,5 +305,27 @@ describe('securityParams', () => {
       limit: 50,
     });
     expect(securityParams('critical')).toEqual({ severity: 'critical', limit: 50 });
+  });
+});
+
+describe('nodeSecurityCount', () => {
+  const counts = (high: number, low = 0) => ({ critical: 0, high, medium: 0, low, unknown: 0, kev: 0 });
+
+  it('adds the release and every host kernel, and nothing of the apps', () => {
+    expect(
+      nodeSecurityCount({
+        quoro: { version: '0.1.0', counts: counts(1), items: [] },
+        host_kernels: [
+          { node_id: 'nod_a', kernel: '6.12', counts: counts(1, 2), items: [] },
+          { node_id: 'nod_b', kernel: '6.12', counts: counts(0), items: [] },
+        ],
+      }),
+    ).toBe(4);
+  });
+
+  it('is null when the summary has no node data or is not there', () => {
+    expect(nodeSecurityCount({})).toBeNull();
+    expect(nodeSecurityCount(undefined)).toBeNull();
+    expect(nodeSecurityCount({ host_kernels: [] })).toBe(0);
   });
 });

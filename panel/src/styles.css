@@ -2586,6 +2586,415 @@
     height: 8px;
   }
 
+  /* A dot between the parts of a footer line. */
+  .dot-sep {
+    width: 3px;
+    height: 3px;
+    flex: none;
+    border-radius: 50%;
+    background-color: var(--ink-3);
+  }
+
+  /*
+   * The N+1 strip: one sentence on whether the cluster can lose a node, with
+   * the node it asks about on the right.
+   */
+  .n1 {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 16px;
+    padding: 12px 14px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background-color: var(--surface);
+    font-size: 13px;
+    color: var(--ink);
+    transition: opacity 120ms ease;
+  }
+
+  .n1[aria-busy='true'] {
+    opacity: 0.6;
+  }
+
+  .n1-gl {
+    width: 28px;
+    height: 28px;
+    flex: none;
+    display: grid;
+    place-items: center;
+    border-radius: 7px;
+    background-color: var(--raised);
+    box-shadow: inset 0 0 0 1px var(--line-2);
+    color: var(--run);
+  }
+
+  .n1-gl svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  .n1-shift .n1-gl {
+    color: var(--shift);
+  }
+
+  .n1-fault {
+    border-color: color-mix(in oklab, var(--fault) 35%, var(--line));
+  }
+
+  .n1-fault .n1-gl {
+    color: var(--fault);
+  }
+
+  .n1-t {
+    min-width: 0;
+    flex: 1;
+    line-height: 1.45;
+  }
+
+  .n1-t b {
+    font-weight: 620;
+  }
+
+  .field.n1-pick {
+    width: auto;
+    flex: none;
+    height: 28px;
+    gap: 6px;
+    padding: 0 8px 0 10px;
+    font-size: 12.5px;
+  }
+
+  /* The nodes: a card per machine, three across on a wide screen. */
+  .nodes {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr));
+    gap: 14px;
+  }
+
+  .node {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    border: 1px solid var(--line);
+    border-radius: 11px;
+    background-color: var(--surface);
+    background-image: linear-gradient(180deg, var(--surface-hi), var(--surface) 70%);
+    overflow: hidden;
+  }
+
+  .node-h {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 10px;
+    padding: 14px 16px 0;
+  }
+
+  .node-h b {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-stretch: 106%;
+    font-weight: 620;
+    font-size: 15px;
+    letter-spacing: -0.003em;
+  }
+
+  .node-word {
+    margin-left: auto;
+    font-size: 12.5px;
+    color: var(--ink-2);
+  }
+
+  .node-b {
+    flex: 1;
+    display: grid;
+    align-content: start;
+    gap: 12px;
+    padding: 12px 16px 14px;
+  }
+
+  .node-note {
+    font-size: 12.5px;
+    line-height: 1.45;
+    color: var(--ink-2);
+  }
+
+  /* The node's own reading of its host, under the meters. */
+  .node-live {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 8px;
+    padding-top: 10px;
+    border-top: 1px dashed var(--line);
+    font-size: 12px;
+    color: var(--ink-2);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .node-live-t {
+    min-width: 0;
+  }
+
+  .node-live-go {
+    margin-left: auto;
+    color: var(--accent);
+    font-size: 12px;
+    text-underline-offset: 3px;
+  }
+
+  .node-live-go:hover {
+    text-decoration: underline;
+  }
+
+  .node-live-go:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 3px;
+  }
+
+  .svc-foot.node-foot {
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
+
+  .node-foot-link {
+    color: var(--ink-2);
+    text-decoration: none;
+  }
+
+  .node-foot-link:hover {
+    color: var(--ink);
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+
+  .node-foot-link:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 3px;
+  }
+
+  .stats.stats-2 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  /* The VM table: one row per VM; on a phone each row is a small card. */
+  .vmt-box {
+    overflow: visible;
+  }
+
+  .vmt {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+
+  .vmt th {
+    padding: 9px 14px;
+    border-bottom: 1px solid var(--line);
+    background-color: var(--sunk);
+    color: var(--ink-2);
+    font-size: 12px;
+    font-weight: 560;
+    text-align: left;
+    white-space: nowrap;
+  }
+
+  .vmt th:first-child {
+    border-top-left-radius: 10px;
+  }
+
+  .vmt th:last-child {
+    border-top-right-radius: 10px;
+  }
+
+  .vmt td {
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--line);
+    vertical-align: middle;
+  }
+
+  .vmt tbody tr:last-child td {
+    border-bottom: 0;
+  }
+
+  .vmt tr[aria-busy='true'] td {
+    opacity: 0.6;
+  }
+
+  /* The flex sits inside the cell, so the cell keeps the row's height and rule. */
+  .vmt-name-in {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+  }
+
+  .vmt-name small,
+  .vmt-state small {
+    display: block;
+    font-size: 12px;
+    color: var(--ink-2);
+  }
+
+  .vmt-open {
+    font-weight: 600;
+    color: var(--ink);
+    text-decoration: none;
+  }
+
+  .vmt-open:hover,
+  .vmt-link:hover {
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+
+  .vmt-open:focus-visible,
+  .vmt-link:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 3px;
+  }
+
+  .vmt-link {
+    color: var(--ink);
+    text-decoration: none;
+  }
+
+  .vmt-size {
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    color: var(--ink);
+  }
+
+  .vmt-lamp {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    white-space: nowrap;
+  }
+
+  .vmt-act-in {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 6px;
+  }
+
+  @media (max-width: 767.98px) {
+    .vmt thead {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+      white-space: nowrap;
+    }
+
+    .vmt tbody tr {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      grid-template-areas:
+        'name act'
+        'state state'
+        'project project'
+        'node size';
+      gap: 6px 10px;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .vmt tbody tr:last-child {
+      border-bottom: 0;
+    }
+
+    .vmt td {
+      padding: 0;
+      border: 0;
+      min-width: 0;
+    }
+
+    .vmt td.vmt-name {
+      grid-area: name;
+    }
+
+    .vmt td.vmt-act {
+      grid-area: act;
+    }
+
+    /* The lines under the name line up with it, past the kind tile. */
+    .vmt td.vmt-state {
+      grid-area: state;
+      padding-left: 38px;
+    }
+
+    .vmt td.vmt-project {
+      grid-area: project;
+      padding-left: 38px;
+      font-size: 12.5px;
+    }
+
+    .vmt td.vmt-node {
+      grid-area: node;
+      padding-left: 38px;
+      font-size: 12.5px;
+      color: var(--ink-2);
+    }
+
+    .vmt td.vmt-size {
+      grid-area: size;
+      font-size: 12.5px;
+      color: var(--ink-2);
+    }
+  }
+
+  .iconbtn.iconbtn-sm {
+    width: 28px;
+    height: 28px;
+  }
+
+  .iconbtn:disabled {
+    opacity: 0.45;
+    pointer-events: none;
+  }
+
+  .menu-item.menu-item-danger,
+  .menu-item.menu-item-danger svg {
+    color: var(--fault);
+  }
+
+  /* A VM on its way, or crashed: the lamp's words, under the sheet's tabs. */
+  .vm-caption {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--ink);
+  }
+
+  .vm-caption-fault {
+    color: var(--fault);
+  }
+
+  @media (max-width: 559.98px) {
+    .n1 {
+      flex-wrap: wrap;
+      align-items: flex-start;
+    }
+
+    .n1-t {
+      flex-basis: calc(100% - 40px);
+    }
+
+    .field.n1-pick {
+      margin-left: 40px;
+    }
+  }
+
   /* What each HA policy costs: policies across, costs down, so it fits a phone. */
   .cmp {
     width: 100%;

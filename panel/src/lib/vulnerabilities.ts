@@ -8,6 +8,7 @@ import type {
   VulnerabilityFinding,
   VulnerabilityFindingResolvedReason,
   VulnerabilitySeverity,
+  VulnerabilitySummary,
 } from '../api/generated/model';
 import { relativeTime } from './app-status';
 import type { LampTone } from './lamp';
@@ -164,6 +165,21 @@ export const isOpenFinding = (finding: VulnerabilityFinding): boolean =>
 /** The total number of open findings a counts object names. */
 export const openFindingCount = (counts: VulnerabilityCounts): number =>
   counts.critical + counts.high + counts.medium + counts.low + counts.unknown;
+
+/**
+ * The open findings of the cluster's own machines, for the count on the Nodes
+ * section's Security tab: the running Quoro release and every node's host
+ * kernel. Null when the summary carries neither, which is how it answers a
+ * caller without `node:read`.
+ */
+export const nodeSecurityCount = (
+  summary: Pick<VulnerabilitySummary, 'quoro' | 'host_kernels'> | undefined,
+): number | null => {
+  if (!summary || (summary.quoro === undefined && summary.host_kernels === undefined)) return null;
+  const quoro = summary.quoro ? openFindingCount(summary.quoro.counts) : 0;
+  const hosts = (summary.host_kernels ?? []).reduce((sum, host) => sum + openFindingCount(host.counts), 0);
+  return quoro + hosts;
+};
 
 /** The Quoro findings that belong to the guest kernel. */
 export const guestKernelFindings = (

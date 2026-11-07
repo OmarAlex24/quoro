@@ -1,8 +1,14 @@
 import { getRouteApi, Link, Outlet } from '@tanstack/react-router';
+import { useListNodes } from '../api/generated/nodes/nodes';
 import { useListVms } from '../api/generated/vms/vms';
+import { useGetVulnerabilitySummary } from '../api/generated/vulnerabilities/vulnerabilities';
+import { SERVICE_LIST_PARAMS } from '../lib/projects';
+import type { NodesTab } from '../lib/routes';
 import { cn } from '../lib/utils';
+import { nodeSecurityCount } from '../lib/vulnerabilities';
 import { useSession } from '../session';
 import { ApiTokens } from '../components/api-tokens';
+import { ClusterVulnerabilities } from '../components/cluster-vulnerabilities';
 import { TabbedPage } from '../components/shell/tab-strip';
 import { AgentScreen } from './agent-screen';
 import { AgentsScreen } from './agents-screen';
@@ -19,39 +25,65 @@ import { VmsScreen } from './vms-screen';
 const nodesRoute = getRouteApi('/shell/nodes');
 const agentsRoute = getRouteApi('/shell/agents');
 
-/** `/nodes` and `/nodes?tab=vms`: the machines, and every VM of the cluster. */
+/**
+ * `/nodes`, `/nodes?tab=vms` and `/nodes?tab=security`: the machines with the
+ * N+1 strip, every VM of the cluster (or of one node), and the vulnerability
+ * summary of the cluster's own software.
+ */
 export function NodesPage() {
-  const { tab } = nodesRoute.useSearch();
+  const { tab, node } = nodesRoute.useSearch();
   const { user } = useSession();
-  const vms = useListVms(undefined, { query: { enabled: user !== undefined } });
+  const vms = useListVms(SERVICE_LIST_PARAMS, { query: { enabled: user !== undefined } });
   const vmCount = vms.data?.items.length;
+  const nodes = useListNodes(undefined, { query: { enabled: user !== undefined, staleTime: 10_000 } });
+  const nodeNames = Object.fromEntries((nodes.data?.items ?? []).map((item) => [item.id, item.name]));
+  // The same request the Security tab makes, so opening it reads the cache.
+  const summary = useGetVulnerabilitySummary(
+    { limit: 50 },
+    { query: { enabled: user !== undefined, refetchInterval: 30_000 } },
+  );
+  const securityCount = nodeSecurityCount(summary.data);
+
+  const tabLink = (value: NodesTab | undefined, words: string, count?: number) => (
+    <Link
+      to="/nodes"
+      search={value ? { tab: value } : {}}
+      className={cn(tab === value && 'on')}
+      aria-current={tab === value ? 'page' : undefined}
+    >
+      {words}
+      {count !== undefined ? (
+        <>
+          <span className="count count-soft" aria-hidden="true">
+            {count}
+          </span>
+          <span className="sr-only">, {count}</span>
+        </>
+      ) : null}
+    </Link>
+  );
 
   return (
     <TabbedPage
       label="Nodes"
+      title="Nodes"
       tabs={
         <>
-          <Link
-            to="/nodes"
-            search={{}}
-            className={cn(tab === undefined && 'on')}
-            aria-current={tab === undefined ? 'page' : undefined}
-          >
-            Nodes
-          </Link>
-          <Link
-            to="/nodes"
-            search={{ tab: 'vms' }}
-            className={cn(tab === 'vms' && 'on')}
-            aria-current={tab === 'vms' ? 'page' : undefined}
-          >
-            Virtual machines
-            {vmCount !== undefined ? <span className="count count-soft">{vmCount}</span> : null}
-          </Link>
+          {tabLink(undefined, 'Nodes')}
+          {tabLink('vms', 'Virtual machines', vmCount)}
+          {tabLink('security', 'Security', securityCount ?? undefined)}
         </>
       }
     >
-      {tab === 'vms' ? <VmsScreen /> : <NodesScreen />}
+      {tab === 'vms' ? (
+        <VmsScreen key={node ?? 'all'} nodeId={node} />
+      ) : tab === 'security' ? (
+        <main className="mx-auto w-full max-w-6xl px-4 pb-8 sm:px-6">
+          <ClusterVulnerabilities nodeNames={nodeNames} />
+        </main>
+      ) : (
+        <NodesScreen />
+      )}
     </TabbedPage>
   );
 }

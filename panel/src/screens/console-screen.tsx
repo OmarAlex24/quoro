@@ -1,5 +1,6 @@
 import { Link, useParams } from '@tanstack/react-router';
 import { createConsoleSession } from '../api/generated/interactive/interactive';
+import type { Vm } from '../api/generated/model';
 import { useGetVm } from '../api/generated/vms/vms';
 import { canViewConsole } from '../lib/capabilities';
 import { problemView } from '../lib/problem';
@@ -9,12 +10,13 @@ import { Button } from '../components/ui/button';
 import { ProblemBanner } from '../components/ui/problem-banner';
 import { LoginScreen } from './login-screen';
 
-const backToVms = (
-  <Link
-    to="/vms"
-    className="text-[13px] text-ink-2 underline-offset-4 hover:text-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
-  >
-    Virtual machines
+const BACK_CLASS =
+  'text-[13px] text-ink-2 underline-offset-4 hover:text-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent';
+
+/** Back to the VM's sheet on its project's canvas, where the console was opened from. */
+const backToVm = (vm: Pick<Vm, 'id' | 'name' | 'project_id'>) => (
+  <Link to="/projects/$projectId" params={{ projectId: vm.project_id }} search={{ vm: vm.id }} className={BACK_CLASS}>
+    Back to {vm.name}
   </Link>
 );
 
@@ -52,7 +54,9 @@ export function ConsoleScreen() {
       <main className="mx-auto w-full max-w-5xl px-4 py-6 sm:px-6 sm:py-8">
         <ProblemBanner view={problemView(vmQuery.error, 'see this VM')} />
         <Button variant="default" className="mt-4" asChild>
-          <Link to="/vms">Back to virtual machines</Link>
+          <Link to="/nodes" search={{ tab: 'vms' }}>
+            Back to virtual machines
+          </Link>
         </Button>
       </main>
     );
@@ -67,7 +71,7 @@ export function ConsoleScreen() {
       eyebrow="Serial console"
       title={vm.name}
       description="The VM's serial console, read-only: recent boot output and then live kernel and init lines. Nothing in the guest reads the serial port, so input is refused."
-      back={backToVms}
+      back={backToVm(vm)}
       // The id from the route, the one the operator chose; never a field
       // of the fetched record.
       connect={() => createConsoleSession(vmId)}

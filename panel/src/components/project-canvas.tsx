@@ -334,7 +334,7 @@ export function ProjectCanvas({
 
   const card = (service: ServiceItem) =>
     service.kind === 'vm' ? (
-      <VmCard vm={service.vm} nodeNames={nodeNames} />
+      <VmCard selected={selected === service.key} vm={service.vm} nodeNames={nodeNames} />
     ) : (
       <AppCard
         selected={selected === service.key}

@@ -11,9 +11,12 @@ import {
   validateNodesSearch,
   validateProjectSearch,
   validateProjectsSearch,
+  vmSheetTab,
   type LegacyUrl,
 } from './routes';
 
+const VM = 'vm_01JD5Z8Q4XK3M9V2T7B6N1R0SG';
+const NODE = 'nod_01JD5Z8Q4XK3M9V2T7B6N1R0SH';
 const APP = 'app_01JD5Z8Q4XK3M9V2T7B6N1R0SA';
 const PROJECT = 'prj_01JD5Z8Q4XK3M9V2T7B6N1R0SB';
 const BUILD = 'bld_01JD5Z8Q4XK3M9V2T7B6N1R0SC';
@@ -164,12 +167,32 @@ describe('search validators', () => {
     expect(validateProjectSearch({ add: 'app' })).toEqual({});
   });
 
+  it('opens a VM on Overview, or on Settings when the URL names it', () => {
+    expect(vmSheetTab(validateProjectSearch({ vm: VM }))).toBe('overview');
+    expect(vmSheetTab(validateProjectSearch({ vm: VM, tab: 'settings' }))).toBe('settings');
+    expect(vmSheetTab(validateProjectSearch({ vm: VM, tab: 'overview' }))).toBe('overview');
+    // An app's tab on a VM falls back to Overview, and the other way round.
+    expect(vmSheetTab(validateProjectSearch({ vm: VM, tab: 'deployments' }))).toBe('overview');
+    expect(validateProjectSearch({ vm: VM, tab: 'overview' })).toEqual({ vm: VM, tab: 'overview' });
+    expect(sheetTab(validateProjectSearch({ app: APP, tab: 'overview' }))).toBe('deployments');
+    expect(sheetTab(validateProjectSearch({ app: APP, tab: 'settings' }))).toBe('settings');
+  });
+
   it('reads the projects, nodes and agents switches', () => {
     expect(validateProjectsSearch({ add: 'app' })).toEqual({ add: 'app' });
     expect(validateProjectsSearch({ add: 'vm' })).toEqual({});
     expect(validateNodesSearch({ tab: 'vms' })).toEqual({ tab: 'vms' });
+    expect(validateNodesSearch({ tab: 'security' })).toEqual({ tab: 'security' });
     expect(validateNodesSearch({ tab: 'nodes' })).toEqual({});
     expect(validateAgentsSearch({ agent: AGENT, tab: 'keys' })).toEqual({ agent: AGENT });
+  });
+
+  it('filters the VMs tab by node, and drops the node anywhere else', () => {
+    expect(validateNodesSearch({ tab: 'vms', node: ` ${NODE} ` })).toEqual({ tab: 'vms', node: NODE });
+    expect(validateNodesSearch({ tab: 'vms', node: '' })).toEqual({ tab: 'vms' });
+    expect(validateNodesSearch({ node: NODE })).toEqual({});
+    expect(validateNodesSearch({ tab: 'security', node: NODE })).toEqual({ tab: 'security' });
+    expect(hrefOf({ to: '/nodes', search: { tab: 'vms', node: NODE } })).toBe(`/nodes?tab=vms&node=${NODE}`);
   });
 
   it('keeps the grants and audit filters the old routes accepted', () => {

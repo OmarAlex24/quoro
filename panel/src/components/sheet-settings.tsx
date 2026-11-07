@@ -17,7 +17,8 @@ import { Button } from './ui/button';
 import { Dialog, DialogContent } from './ui/dialog';
 import { ProblemBanner } from './ui/problem-banner';
 
-function Group({ title, lede, children }: { title: string; lede?: string; children: ReactNode }) {
+/** A titled group of the Settings tab; the VM sheet uses it too. */
+export function Group({ title, lede, children }: { title: string; lede?: string; children: ReactNode }) {
   return (
     <section className="set-group" aria-label={title}>
       <h3 className="set-h">{title}</h3>
@@ -27,7 +28,8 @@ function Group({ title, lede, children }: { title: string; lede?: string; childr
   );
 }
 
-function Rows({ rows }: { rows: ReadonlyArray<readonly [string, ReactNode] | null> }) {
+/** Label and value rows in a box. */
+export function Rows({ rows }: { rows: ReadonlyArray<readonly [string, ReactNode] | null> }) {
   return (
     <dl className="box set-rows">
       {rows.filter((row) => row !== null).map(([label, value]) => (

@@ -47,6 +47,29 @@ export const takesSecondTone = (m: number, i: number, j: number): boolean =>
 
 export const clamp = (v: number, lo = 0, hi = 1): number => Math.max(lo, Math.min(hi, v));
 
+/*
+ * A meter's fill, as pure numbers so it can be tested without a canvas: the
+ * bar is lit solid up to the reading point, thins out over the last 10 px so
+ * the point shows, and leaves a faint dotted track past it. The second tone
+ * gathers towards the reading point.
+ */
+
+/** Where the reading point of a meter `width` px wide filled to `share` sits, in px. */
+export const meterEdge = (share: number, width: number): number =>
+  Number.isFinite(share) ? clamp(share) * width : 0;
+
+/** The density at `x` of a meter whose reading point is at `edge`. */
+export const meterDensity = (x: number, edge: number): number => {
+  const fade = Math.min(10, edge);
+  if (x >= edge) return 0.14;
+  if (x > edge - fade) return 0.45 + (0.55 * (edge - x)) / fade;
+  return 1;
+};
+
+/** The share of lit cells in the second tone at `x`: none on the track. */
+export const meterMix = (x: number, edge: number): number =>
+  x >= edge ? 0 : 0.78 * Math.pow(x / Math.max(1, edge), 1.8);
+
 /**
  * A seeded generator (mulberry32 over a string hash), so a seed draws the same
  * picture on every render, in every browser.

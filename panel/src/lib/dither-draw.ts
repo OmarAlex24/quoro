@@ -5,6 +5,9 @@ import {
   avatarPair,
   clamp,
   isLit,
+  meterDensity,
+  meterEdge,
+  meterMix,
   takesSecondTone,
 } from './dither';
 import type { AreaPlot } from './metric-area';
@@ -309,19 +312,29 @@ export function drawStepBar(
   }
 }
 
+/** How a meter is drawn: in the two dither tones, or in one state colour. */
+export type MeterTone = 'accent' | 'fault';
+
 /**
  * A meter: a dithered bar filled to `share` (0..1) over a faint dotted track,
  * its leading edge thinning out so the reading point shows. The fill runs from
- * the accent towards ion as it grows.
+ * the accent towards ion as it grows; a `fault` meter, one that is nearly
+ * full, is drawn fill and track in the fault colour, so it reads without
+ * reading the number.
  */
-export function drawMeter({ ctx, w, h }: DitherSurface, share: number, read: TokenReader = readToken): void {
-  const edge = clamp(share) * w;
-  const fade = Math.min(10, edge);
-  const density = (x: number) =>
-    x >= edge ? 0.14 : x > edge - fade ? 0.45 + (0.55 * (edge - x)) / fade : 1;
-  dither2(ctx, w, h, 2, read('--accent'), read('--ion'), density, (x) =>
-    x >= edge ? 0 : 0.78 * Math.pow(x / Math.max(1, edge), 1.8),
-  );
+export function drawMeter(
+  { ctx, w, h }: DitherSurface,
+  share: number,
+  read: TokenReader = readToken,
+  tone: MeterTone = 'accent',
+): void {
+  const edge = meterEdge(share, w);
+  const density = (x: number) => meterDensity(x, edge);
+  if (tone === 'fault') {
+    dither(ctx, w, h, 2, read('--fault'), density);
+    return;
+  }
+  dither2(ctx, w, h, 2, read('--accent'), read('--ion'), density, (x) => meterMix(x, edge));
 }
 
 const CHART_FONT = '500 11px "Archivo Variable", Archivo, ui-sans-serif, system-ui, sans-serif';
