@@ -254,6 +254,10 @@
   - [0247: fence_ack stores current token + 1 for a listed lease another node holds, so the node can clear a failure recorded at that token](adr/0247-fence-ack-stores-current-token-1-for-a-listed-lease-another.md)
   - [0248: Warm replication: a root_mismatch answer makes the source's base a lost base; the source deletes it and the next cycle ships a full copy](adr/0248-warm-replication-a-root-mismatch-answer-makes-the-source-s.md)
   - [0250: A failed engine start, an error or a Timeout, waits the reconciler's crash backoff before the next start; an explicit restart clears it](adr/0250-a-failed-engine-start-an-error-or-a-timeout-waits-the.md)
+  - [0254: A converted lease's first gate counts the conversion grant's duration](adr/0254-a-converted-lease-s-first-gate-counts-the-conversion-grant.md)
+  - [0256: An expiring grant that carries re never converts a lease (part 1 of 2)](adr/0256-an-expiring-grant-that-carries-re-never-converts-a-lease.md)
+  - [0257: A primary answers, as a converted lease's first renewal, only a lease_renew the node sent after it took the conversion](adr/0257-a-primary-answers-as-a-converted-lease-s-first-renewal-only.md)
+  - [0258: A primary changes a lease's mode only with the same token](adr/0258-a-primary-changes-a-lease-s-mode-only-with-the-same-token.md)
 
 # Background research
 
