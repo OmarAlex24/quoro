@@ -1188,6 +1188,40 @@ async fn a_stream_resolves_a_copy_left_pending_before_its_checks() {
     h.assert_copy(&third, Some(3), &third.touched).await;
 }
 
+/// The status board once `ready` accepts it. The running receiver publishes
+/// at the end of each pass, after it binds its listeners, so a test that
+/// reached a listener waits for the board rather than reading it (issue
+/// #550). The bound only keeps a receiver that never publishes from hanging
+/// the test.
+async fn board_where(
+    statuses: &mut watch::Receiver<Vec<WarmStatus>>,
+    ready: impl FnMut(&Vec<WarmStatus>) -> bool,
+) -> Vec<WarmStatus> {
+    tokio::time::timeout(Duration::from_secs(30), statuses.wait_for(ready))
+        .await
+        .expect("the receiver publishes")
+        .expect("the board is open")
+        .clone()
+}
+
+/// Waits until `check` holds, for what the running receiver changes without
+/// publishing: its listeners and its store rows. The same helper as the
+/// sender tests'.
+async fn wait_for<F, Fut>(what: &str, mut check: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !check().await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test]
 async fn the_running_receiver_listens_reports_and_removes_a_deleted_copy() {
     let scratch = Scratch::new("run");
@@ -1202,7 +1236,7 @@ async fn the_running_receiver_listens_reports_and_removes_a_deleted_copy() {
     let mut target = entry(5);
     target.warm.as_mut().expect("warm").port = port;
     let (desired, desired_rx) = watch::channel(Some(snapshot(1, vec![target.clone()])));
-    let (board, statuses) = StatusBoard::new();
+    let (board, mut statuses) = StatusBoard::new();
     let receiver = WarmReceiver::new(
         Arc::clone(&engine),
         store.clone(),
@@ -1218,16 +1252,12 @@ async fn the_running_receiver_listens_reports_and_removes_a_deleted_copy() {
 
     // Before any stream: an entry with no copy, and a target row.
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
-    let mut listening = false;
-    for _ in 0..100 {
-        if TcpStream::connect(addr).await.is_ok() {
-            listening = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(listening, "the receiver listens on the mesh address");
-    let status = statuses.borrow().clone();
+    wait_for("the listener on the mesh address", || async {
+        TcpStream::connect(addr).await.is_ok()
+    })
+    .await;
+    // The pass that bound the listener publishes after it (issue #550).
+    let status = board_where(&mut statuses, |status| !status.is_empty()).await;
     assert_eq!(status.len(), 1, "{status:?}");
     assert_eq!(status[0].snapshot_seq, None);
     assert!(status[0].error.is_none(), "{status:?}");
@@ -1250,51 +1280,29 @@ async fn the_running_receiver_listens_reports_and_removes_a_deleted_copy() {
     // keeps the reconciler off the entry, and no status remains.
     target.state = SpecVolumeState::Deleted;
     desired.send_replace(Some(snapshot(2, vec![target])));
-    let mut removed = false;
-    for _ in 0..100 {
-        if store
+    wait_for("the row marked removed", || async {
+        store
             .warm_target(VOL)
             .await
             .expect("store")
             .is_some_and(|row| row.removed && row.complete_seq.is_none())
-        {
-            removed = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(removed, "the row is marked removed");
+    })
+    .await;
     assert!(engine.volumes().is_empty(), "the copy is removed");
     assert!(!scratch.0.join("volumes").join(VOL).exists());
-    for _ in 0..100 {
-        if statuses.borrow().is_empty() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(statuses.borrow().is_empty());
+    board_where(&mut statuses, Vec::is_empty).await;
     // The listener closed with the entry.
-    let mut closed = false;
-    for _ in 0..100 {
-        if TcpStream::connect(addr).await.is_err() {
-            closed = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(closed, "the listener closes");
+    wait_for("the listener to close", || async {
+        TcpStream::connect(addr).await.is_err()
+    })
+    .await;
 
     // Once the entry leaves the spec, the row is forgotten.
     desired.send_replace(Some(snapshot(3, Vec::new())));
-    let mut forgotten = false;
-    for _ in 0..100 {
-        if store.warm_target(VOL).await.expect("store").is_none() {
-            forgotten = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(forgotten, "the row is forgotten");
+    wait_for("the row to be forgotten", || async {
+        store.warm_target(VOL).await.expect("store").is_none()
+    })
+    .await;
 
     let _ = stop.send(());
     task.await.expect("the receiver stops");
@@ -1311,7 +1319,7 @@ async fn a_listener_that_cannot_bind_is_reported() {
     let mut target = entry(5);
     target.warm.as_mut().expect("warm").port = taken.local_addr().expect("addr").port();
     let (_desired, desired_rx) = watch::channel(Some(snapshot(1, vec![target])));
-    let (board, statuses) = StatusBoard::new();
+    let (board, mut statuses) = StatusBoard::new();
     let receiver = WarmReceiver::new(
         engine,
         store,
@@ -1324,15 +1332,14 @@ async fn a_listener_that_cannot_bind_is_reported() {
     let task = tokio::spawn(receiver.run(async {
         let _ = stopped.await;
     }));
-    let mut reported = None;
-    for _ in 0..100 {
-        if let Some(error) = statuses.borrow().first().and_then(|s| s.error.clone()) {
-            reported = Some(error);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let error = reported.expect("the bind error is reported");
+    let status = board_where(&mut statuses, |status| {
+        status.first().is_some_and(|entry| entry.error.is_some())
+    })
+    .await;
+    let error = status[0]
+        .error
+        .as_deref()
+        .expect("the bind error is reported");
     assert!(error.contains("cannot listen"), "{error}");
     let _ = stop.send(());
     task.await.expect("stops");
