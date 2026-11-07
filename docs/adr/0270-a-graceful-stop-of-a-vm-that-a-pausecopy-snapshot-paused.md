@@ -1,12 +1,12 @@
 # ADR 0270: A graceful stop of a VM that a PauseCopy snapshot paused resumes it and asks the guest to power off, instead of a hard shutdown
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0279](0279-a-fence-s-graceful-phase-also-resumes-a-vm-that-a-pausecopy.md)
 - **Date:** 2026-11-07
 - **Ledger id:** D-0270
 - **Tags:** m5b, engine, backup, volumes, contracts
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** none
+- **Related:** [ADR 0279](0279-a-fence-s-graceful-phase-also-resumes-a-vm-that-a-pausecopy.md)
 
 ## Context
 
@@ -51,6 +51,7 @@ _Some wording was changed for the public repository._
 
 ## Consequences
 
+- [ADR 0279](0279-a-fence-s-graceful-phase-also-resumes-a-vm-that-a-pausecopy.md) refines which stops resume a VM a PauseCopy snapshot paused: a fence's graceful phase too; only forced stops never resume. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---
