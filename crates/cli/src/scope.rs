@@ -310,6 +310,44 @@ impl Scope {
         ))
     }
 
+    /// The node `reference` names: its id (`nod_...`, used as it is) or its
+    /// name, looked up with `listNodes` (`node:read`).
+    pub async fn node_id(&mut self, reference: &str) -> Result<String, Failure> {
+        if is_id("nod_", reference) {
+            return Ok(reference.to_string());
+        }
+        let nodes = self
+            .list_all(crate::operations::LIST_NODES.path)
+            .await
+            .map_err(|mut failure| {
+                if failure.code == exit::FORBIDDEN {
+                    failure.message = format!(
+                        "{}; reading nodes by name needs node:read: name the node by its id (nod_...)",
+                        failure.message
+                    );
+                }
+                failure
+            })?;
+        match nodes.iter().find(|node| node["name"] == reference) {
+            Some(node) => Ok(text(node, "id")),
+            // A grant on projects reads no node, so an agent's empty list
+            // says nothing about the name.
+            None if self.is_agent => Err(Failure::new(
+                exit::NOT_FOUND,
+                format!(
+                    "no node you may read has the name '{reference}'; reading nodes by name \
+                     needs node:read on all resources: name the node by its id (nod_...)"
+                ),
+            )),
+            None => Err(Failure::new(
+                exit::NOT_FOUND,
+                format!(
+                    "no node has the id or name '{reference}'; quoro status --cluster shows them"
+                ),
+            )),
+        }
+    }
+
     /// A linked id the primary no longer knows says which link to fix.
     fn stale(&self, mut failure: Failure, what: &str) -> Failure {
         if failure.code == exit::NOT_FOUND
@@ -398,11 +436,22 @@ pub fn can_confirm(
     is_agent: bool,
     what: &str,
 ) -> Result<(), Failure> {
+    can_confirm_change(global, environment, is_agent, &format!("deleting {what}"))
+}
+
+/// [`can_confirm`] for any change that cannot be undone; `change` names it
+/// (`deleting an app`, `replacing an app's environment`).
+pub fn can_confirm_change(
+    global: &Global,
+    environment: &Environment,
+    is_agent: bool,
+    change: &str,
+) -> Result<(), Failure> {
     if global.yes || is_agent || environment.stdin_is_terminal {
         return Ok(());
     }
     Err(Failure::usage(format!(
-        "deleting {what} cannot be undone: pass --yes to confirm without a terminal; \
+        "{change} cannot be undone: pass --yes to confirm without a terminal; \
          nothing was sent"
     )))
 }
@@ -417,24 +466,64 @@ pub fn confirm_name(
     name: &str,
     stderr: &mut dyn Write,
 ) -> Result<(), Failure> {
-    can_confirm(global, environment, is_agent, what)?;
+    confirm(
+        global,
+        environment,
+        is_agent,
+        &Confirm {
+            change: &format!("deleting {what}"),
+            warning: &format!("This deletes {what} for good"),
+            label: "its name",
+            expected: name,
+            nothing: "nothing was deleted",
+        },
+        stderr,
+    )
+}
+
+/// What a human confirms by typing `expected`.
+pub struct Confirm<'a> {
+    /// The change, for the refusal without a terminal (`deleting an app`).
+    pub change: &'a str,
+    /// The sentence before the prompt (`This deletes the app web for good`).
+    pub warning: &'a str,
+    /// What to type (`its name`, `the app's name`).
+    pub label: &'a str,
+    pub expected: &'a str,
+    /// The end of the refusal when the answer differs (`nothing was deleted`).
+    pub nothing: &'a str,
+}
+
+/// Asks a human to type `confirm.expected` before a change that cannot be
+/// undone; `--yes` and an agent are not asked.
+pub fn confirm(
+    global: &Global,
+    environment: &Environment,
+    is_agent: bool,
+    confirm: &Confirm<'_>,
+    stderr: &mut dyn Write,
+) -> Result<(), Failure> {
+    can_confirm_change(global, environment, is_agent, confirm.change)?;
     if global.yes || is_agent {
         return Ok(());
     }
     let _ = write!(
         stderr,
-        "This deletes {what} for good. Type its name ({name}) to confirm: "
+        "{}. Type {} ({}) to confirm: ",
+        confirm.warning, confirm.label, confirm.expected
     );
     let _ = stderr.flush();
     let typed = environment
         .read_line()
         .map_err(|e| Failure::usage(format!("cannot read the answer: {e}")))?;
-    if typed.trim() == name {
+    if typed.trim() == confirm.expected {
         Ok(())
     } else {
         Err(Failure::usage(format!(
-            "'{}' is not '{name}'; nothing was deleted",
-            typed.trim()
+            "'{}' is not '{}'; {}",
+            typed.trim(),
+            confirm.expected,
+            confirm.nothing
         )))
     }
 }

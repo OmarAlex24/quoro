@@ -81,6 +81,18 @@ pub enum Command {
     Build(BuildCommand),
     /// Read or follow the app's, a build's or a deployment's logs
     Logs(LogsArgs),
+    /// List or replace the app's environment variables
+    #[command(subcommand)]
+    Env(EnvCommand),
+    /// List, add and remove the app's domains
+    #[command(subcommand)]
+    Domain(DomainCommand),
+    /// List, create and delete the app's volume
+    #[command(subcommand)]
+    Volume(VolumeCommand),
+    /// List, take and restore backups of the app's volume
+    #[command(subcommand)]
+    Backup(BackupCommand),
     /// Call any API operation and print the response body
     Api(ApiArgs),
     /// Print a shell completion script
@@ -264,6 +276,83 @@ pub struct LogsArgs {
     /// A deployment's progress lines
     #[arg(long, value_name = "DEPLOYMENT", conflicts_with = "follow")]
     pub deployment: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EnvCommand {
+    /// List the names of the app's variables and when they changed; never a value
+    List,
+    /// Replace all of the app's variables with those of a dotenv file
+    Replace {
+        /// The file, NAME=VALUE per line (# comments, quotes), or - for stdin
+        #[arg(long, value_name = "FILE")]
+        file: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DomainCommand {
+    /// List the app's domains with their TLS and serving state
+    List,
+    /// Route a hostname to the app
+    Add {
+        /// The hostname, such as app.example.com
+        host: String,
+        /// How TLS is provided
+        #[arg(long, value_name = "MODE", default_value = "acme",
+            value_parser = ["acme", "tunnel"])]
+        tls: String,
+        /// The DNS or tunnel provider, by name or id (default: the only one of its kind)
+        #[arg(long, value_name = "PROVIDER")]
+        provider: Option<String>,
+    },
+    /// Stop routing a hostname to the app
+    Remove {
+        /// The hostname
+        host: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum VolumeCommand {
+    /// List the app's volumes
+    List,
+    /// Create a local volume for the app; it attaches at the next start
+    Create {
+        /// The size in GiB (1 to 1024)
+        #[arg(long, value_name = "GB", value_parser = clap::value_parser!(u32).range(1..=1024))]
+        size: u32,
+        /// The absolute path the app sees it at, such as /data
+        #[arg(long, value_name = "PATH")]
+        mount: String,
+    },
+    /// Delete a volume and its data
+    Delete {
+        /// The volume, by id (vol_...) or by the app's mount path
+        #[arg(value_name = "VOLUME")]
+        volume: String,
+        #[command(flatten)]
+        approval: ApprovalArgs,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BackupCommand {
+    /// List the newest backups of the app's volume
+    List,
+    /// Back the app's volume up now
+    Create,
+    /// Restore a backup onto a node; it replaces the app's data and moves the app
+    Restore {
+        /// The backup, by id (bkp_...)
+        #[arg(value_name = "BACKUP")]
+        backup: String,
+        /// The node to restore onto, by name or id
+        #[arg(long, value_name = "NODE")]
+        node: String,
+        #[command(flatten)]
+        approval: ApprovalArgs,
+    },
 }
 
 #[derive(Debug, Args)]

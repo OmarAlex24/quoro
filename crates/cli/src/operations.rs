@@ -9,8 +9,9 @@
 //!
 //! The destructive operations at the end are the ones whose approval params
 //! the client can reproduce (`approval.rs`); registering them checks their
-//! templates against the contract. Of them only `deleteApp` is also called by
-//! name (`quoro app delete`); the others are reached with `quoro api`.
+//! templates against the contract. `deleteApp`, `deleteVolume` and
+//! `restoreBackup` are also called by name (`quoro app delete`, `quoro volume
+//! delete`, `quoro backup restore`); `deleteVm` is reached with `quoro api`.
 
 /// One operation of `openapi.yaml`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -262,6 +263,90 @@ pub const LIST_NODES: Operation = Operation {
     path: "/api/v1/nodes",
 };
 
+/// `getAppEnv` (`app:read`): names and change times, never a value.
+pub const GET_APP_ENV: Operation = Operation {
+    id: "getAppEnv",
+    method: "GET",
+    path: "/api/v1/apps/{app_id}/env",
+};
+
+/// `replaceAppEnv` (`app:update`): the whole environment at once.
+pub const REPLACE_APP_ENV: Operation = Operation {
+    id: "replaceAppEnv",
+    method: "PUT",
+    path: "/api/v1/apps/{app_id}/env",
+};
+
+/// `listAppDomains` (`app:read`).
+pub const LIST_APP_DOMAINS: Operation = Operation {
+    id: "listAppDomains",
+    method: "GET",
+    path: "/api/v1/apps/{app_id}/domains",
+};
+
+/// `createAppDomain` (`app:update`).
+pub const CREATE_APP_DOMAIN: Operation = Operation {
+    id: "createAppDomain",
+    method: "POST",
+    path: "/api/v1/apps/{app_id}/domains",
+};
+
+/// `deleteDomain` (`app:update`), by the domain's id.
+pub const DELETE_DOMAIN: Operation = Operation {
+    id: "deleteDomain",
+    method: "DELETE",
+    path: "/api/v1/domains/{domain_id}",
+};
+
+/// `listProviders` (`provider:manage`, human-only): a provider named by name.
+pub const LIST_PROVIDERS: Operation = Operation {
+    id: "listProviders",
+    method: "GET",
+    path: "/api/v1/providers",
+};
+
+/// `listAppVolumes` (`app:read`): every volume of the app, not paged.
+pub const LIST_APP_VOLUMES: Operation = Operation {
+    id: "listAppVolumes",
+    method: "GET",
+    path: "/api/v1/apps/{app_id}/volumes",
+};
+
+/// `createVolume` (`app:update`).
+pub const CREATE_VOLUME: Operation = Operation {
+    id: "createVolume",
+    method: "POST",
+    path: "/api/v1/apps/{app_id}/volumes",
+};
+
+/// `getVolume` (`app:read`).
+pub const GET_VOLUME: Operation = Operation {
+    id: "getVolume",
+    method: "GET",
+    path: "/api/v1/volumes/{volume_id}",
+};
+
+/// `listAppBackups` (`backup:read`), newest first.
+pub const LIST_APP_BACKUPS: Operation = Operation {
+    id: "listAppBackups",
+    method: "GET",
+    path: "/api/v1/apps/{app_id}/backups",
+};
+
+/// `createBackup` (`backup:write`): a backup of the app's volume now.
+pub const CREATE_BACKUP: Operation = Operation {
+    id: "createBackup",
+    method: "POST",
+    path: "/api/v1/apps/{app_id}/backups",
+};
+
+/// `getBackup` (`backup:read`).
+pub const GET_BACKUP: Operation = Operation {
+    id: "getBackup",
+    method: "GET",
+    path: "/api/v1/backups/{backup_id}",
+};
+
 /// `deleteApp` (`app:delete`).
 pub const DELETE_APP: Operation = Operation {
     id: "deleteApp",
@@ -326,6 +411,18 @@ pub const OPERATIONS: &[Operation] = &[
     GET_APP_VULNERABILITIES,
     GET_CLUSTER,
     LIST_NODES,
+    GET_APP_ENV,
+    REPLACE_APP_ENV,
+    LIST_APP_DOMAINS,
+    CREATE_APP_DOMAIN,
+    DELETE_DOMAIN,
+    LIST_PROVIDERS,
+    LIST_APP_VOLUMES,
+    CREATE_VOLUME,
+    GET_VOLUME,
+    LIST_APP_BACKUPS,
+    CREATE_BACKUP,
+    GET_BACKUP,
     DELETE_APP,
     DELETE_VM,
     DELETE_VOLUME,

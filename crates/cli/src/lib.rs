@@ -31,15 +31,24 @@
 //! `restart` roll an app out, `build` lists and cancels builds (`deploy.rs`),
 //! and `logs` reads and follows the app's, a build's or a deployment's logs
 //! over the API's reads and event streams (`logs.rs`).
+//!
+//! `env` lists the app's variable names and replaces its environment from a
+//! dotenv file, never printing a value (`env.rs`); `domain` lists, adds and
+//! removes its hostnames (`domain.rs`); `volume` lists, creates and deletes
+//! its volume (`volume.rs`); `backup` lists, takes and restores backups of
+//! that volume (`backup.rs`).
 
 mod agent;
 mod api;
 mod app;
 mod approval;
+mod backup;
 mod cli;
 mod client;
 mod context;
 mod deploy;
+mod domain;
+mod env;
 mod error;
 mod link;
 mod links;
@@ -52,6 +61,7 @@ mod scope;
 mod status;
 mod terminal;
 mod tls;
+mod volume;
 mod whoami;
 
 use clap::Parser as _;
@@ -286,6 +296,18 @@ pub async fn run_with(
             deploy::build(&cli.global, command, environment, stdout).await
         }
         cli::Command::Logs(args) => logs::run(&cli.global, args, environment, stdout, stderr).await,
+        cli::Command::Env(command) => {
+            env::run(&cli.global, command, environment, stdout, stderr).await
+        }
+        cli::Command::Domain(command) => {
+            domain::run(&cli.global, command, environment, stdout, stderr).await
+        }
+        cli::Command::Volume(command) => {
+            volume::run(&cli.global, command, environment, stdout, stderr).await
+        }
+        cli::Command::Backup(command) => {
+            backup::run(&cli.global, command, environment, stdout, stderr).await
+        }
         cli::Command::Api(args) => api::run(&cli.global, args, environment, stdout, stderr).await,
         cli::Command::Completion { shell } => {
             clap_complete::generate(shell, &mut command(), "quoro", stdout);
