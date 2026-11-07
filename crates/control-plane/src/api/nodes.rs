@@ -739,6 +739,14 @@ async fn fence_ack_tx(
     .await?;
     let tunnel = tunnel_of(&mut *w.tx, node_id).await?;
     w.commit().await?;
+    // The operator checked that the failed fence's VMs are stopped, and the
+    // token moved as when declaring the node lost (section 8.5 step 3), so a
+    // restore may grant the lease elsewhere (issue #392).
+    for lease in &bumped {
+        state
+            .hub
+            .record_release(&lease.id, node_id, lease.fencing_token);
+    }
     let mut node = node_from_row(&row)?;
     node.tunnel = tunnel;
     Ok(node)

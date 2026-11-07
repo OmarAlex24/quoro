@@ -532,6 +532,15 @@ pub(crate) async fn apply_status(
                     // A report that raced the delete must not resurrect it.
                     continue;
                 }
+                if reported_state == wire::VolumeState::Ready
+                    && before.state == VolumeState::Restoring
+                    && before.restored_from_backup_id.is_some()
+                {
+                    // A restore's volume becomes `ready` only through
+                    // `backups::restore`, together with its lease; one still
+                    // `restoring` waits for that lease (issue #392).
+                    continue;
+                }
                 let after_state = match reported_state {
                     wire::VolumeState::Creating => VolumeState::Creating,
                     wire::VolumeState::Ready => VolumeState::Ready,

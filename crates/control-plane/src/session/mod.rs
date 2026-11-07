@@ -181,9 +181,11 @@ struct Pending {
     streams: HashMap<String, StreamSlot>,
     /// `stream_open` msg id to the stream it opened, so a failed open ends it.
     opens: HashMap<String, String>,
-    /// `lease_revoke` msg id to its lease, so an answer with `fence_failed`
-    /// is recorded on the node (section 8.5 step 1).
-    revoke_leases: HashMap<String, String>,
+    /// `lease_revoke` msg id to its lease and the token an `ok` releases the
+    /// lease at ([`leases::Releases`]): the revoke's own, or the primary's
+    /// when a `hello` revoke goes above it. An answer with `fence_failed` is
+    /// recorded on the node (section 8.5 step 1).
+    revoke_leases: HashMap<String, (String, u64)>,
 }
 
 impl Pending {
@@ -325,6 +327,17 @@ struct HubInner {
     /// Free space on the volume filesystem each node last reported
     /// (`status_report.disk_free_gb`, section 5.3).
     disk_free_gb: Mutex<HashMap<String, f64>>,
+    /// The revoked leases each last holder released, in memory only: a
+    /// restore grants the lease to its target only once its holder did
+    /// (section 5.13, issue #392).
+    releases: leases::Releases,
+    /// Each `(node, lease)` whose failed fence the node reported, by a revoke
+    /// answered `fence_failed`, while the primary could not record it: its
+    /// VMs may still run, so no restore takes the lease until a later report
+    /// of that failure is recorded (section 8.5 step 1, issue #392). In
+    /// memory only; the node reports the failure again in its buffered
+    /// `node.fence_failed` and when the next session's revoke fences again.
+    unrecorded_failures: Mutex<HashSet<(String, String)>>,
     generation: AtomicU64,
     /// Test seam: snapshots to hold between their build and their send.
     snapshot_holds: Mutex<HashMap<String, Arc<SnapshotHold>>>,
@@ -407,6 +420,8 @@ impl NodeHub {
             warm_reports: Mutex::new(HashMap::new()),
             warm_facts: Mutex::new(HashMap::new()),
             disk_free_gb: Mutex::new(HashMap::new()),
+            releases: leases::Releases::default(),
+            unrecorded_failures: Mutex::new(HashSet::new()),
             generation: AtomicU64::new(0),
             snapshot_holds: Mutex::new(HashMap::new()),
             serving_inputs: Notify::new(),
@@ -456,6 +471,58 @@ impl NodeHub {
         let inner = Arc::clone(&self.0);
         let vm_id = vm_id.to_string();
         tokio::spawn(async move { inner.vm_changed(&vm_id).await });
+    }
+
+    /// `holder` released `lease_id` at `token` ([`leases::Releases`]). The
+    /// caller records it only once the write that makes it true committed.
+    pub(crate) fn record_release(&self, lease_id: &str, holder: &str, token: i64) {
+        self.0.releases.record(lease_id, holder, token);
+    }
+
+    /// What the holders' answers released ([`leases::is_released`]).
+    pub(crate) fn releases(&self) -> &leases::Releases {
+        &self.0.releases
+    }
+
+    /// Whether a `lease_revoke` of `lease_id` waits for its answer on the
+    /// live session of `node_id`, or `node_id` answered one `fence_failed`
+    /// that the primary could not record.
+    pub(crate) fn revoke_unanswered(&self, node_id: &str, lease_id: &str) -> bool {
+        if self
+            .0
+            .unrecorded_failures
+            .lock()
+            .expect("unrecorded failures lock")
+            .contains(&(node_id.to_string(), lease_id.to_string()))
+        {
+            return true;
+        }
+        let sessions = self.0.sessions.lock().expect("session lock");
+        sessions.get(node_id).is_some_and(|handle| {
+            handle
+                .pending
+                .lock()
+                .expect("pending lock")
+                .revoke_leases
+                .values()
+                .any(|(revoked, _)| revoked == lease_id)
+        })
+    }
+
+    /// Notes whether the failed fence of `lease_id` that `node_id` reported
+    /// is recorded ([`HubInner::unrecorded_failures`]).
+    fn note_failure_recorded(&self, node_id: &str, lease_id: &str, recorded: bool) {
+        let mut unrecorded = self
+            .0
+            .unrecorded_failures
+            .lock()
+            .expect("unrecorded failures lock");
+        let key = (node_id.to_string(), lease_id.to_string());
+        if recorded {
+            unrecorded.remove(&key);
+        } else {
+            unrecorded.insert(key);
+        }
     }
 
     /// Tells the live session of `node_id` to rebuild and resend its desired
@@ -561,7 +628,7 @@ impl NodeHub {
                 .lock()
                 .expect("pending lock")
                 .revoke_leases
-                .insert(id, revoke.lease_id.0.clone());
+                .insert(id, (revoke.lease_id.0.clone(), revoke.fencing_token));
         }
         handle.tx.send(text).is_ok()
     }
@@ -1154,11 +1221,19 @@ impl HubInner {
         })
     }
 
-    /// The lease of the `lease_revoke` that `re` answers, once.
-    fn take_revoke(&self, node_id: &str, generation: u64, re: &str) -> Option<String> {
+    /// The lease and token of the `lease_revoke` that `re` answers, once.
+    fn take_revoke(&self, node_id: &str, generation: u64, re: &str) -> Option<(String, u64)> {
         let pending = self.pending_of(node_id, generation)?;
         let mut pending = pending.lock().expect("pending lock");
         pending.revoke_leases.remove(re)
+    }
+
+    /// The lease and token of the `lease_revoke` that `re` answers, left
+    /// unanswered until [`Self::take_revoke`].
+    fn peek_revoke(&self, node_id: &str, generation: u64, re: &str) -> Option<(String, u64)> {
+        let pending = self.pending_of(node_id, generation)?;
+        let pending = pending.lock().expect("pending lock");
+        pending.revoke_leases.get(re).cloned()
     }
 
     /// Routes one `command_result` to its waiter, or ends a stream whose
@@ -1960,11 +2035,31 @@ impl Session {
                         .await;
                         return false;
                     }
-                    if let Some(lease_id) =
-                        self.hub.0.take_revoke(&self.node_id, self.generation, re)
+                    if let Some((lease_id, token)) =
+                        self.hub.0.peek_revoke(&self.node_id, self.generation, re)
                     {
+                        // `ok`: the bound VMs are stopped and recorded
+                        // (section 5.13), so the lease may move at that token.
+                        if result.status == quoro_proto::CommandStatus::Ok {
+                            self.hub.0.releases.record(
+                                &lease_id,
+                                &self.node_id,
+                                i64::try_from(token).unwrap_or(i64::MAX),
+                            );
+                        }
+                        // The revoke stays unanswered for a restore until a
+                        // failed fence is recorded, or noted unrecorded on
+                        // the hub (issue #392), so none grants the lease in
+                        // between.
                         self.note_revoke_answer(&lease_id, &result).await;
-                        self.revoke_answered(outbox).await;
+                        if self
+                            .hub
+                            .0
+                            .take_revoke(&self.node_id, self.generation, re)
+                            .is_some()
+                        {
+                            self.revoke_answered(outbox).await;
+                        }
                         return false;
                     }
                     self.hub
@@ -2127,9 +2222,6 @@ impl Session {
     /// know, already revoked, holds on another node, or holds with a lower
     /// token than the node's (sections 5.1 and 4.2 rule 3).
     async fn revoke_stale_leases(&self, reported: &[wire::HelloLease], outbox: &mut Vec<String>) {
-        if reported.is_empty() {
-            return;
-        }
         let mut conn = match self.hub.0.store.pool().acquire().await {
             Ok(conn) => conn,
             Err(e) => {
@@ -2137,6 +2229,49 @@ impl Session {
                 return;
             }
         };
+        // A restore grants its lease again only once the old holder answered
+        // the revoke `ok` (section 5.13, issue #392). That answer is lost with
+        // the session that carried the revoke, and what this primary learned
+        // is lost when it restarts, so each lease a restore still waits for is
+        // revoked again here, at its own token; one the `hello` names is
+        // revoked below. The node fences again at that token (section 8.5),
+        // which stops nothing more once the lease's VMs are stopped.
+        match leases::awaited_by_restores(&mut conn, &self.node_id).await {
+            Ok(awaited) => {
+                for lease in awaited {
+                    if reported.iter().any(|claimed| claimed.lease_id == lease.id) {
+                        continue;
+                    }
+                    match leases::is_released(&mut conn, &self.hub.0.releases, false, &lease).await
+                    {
+                        Ok(false) => {}
+                        Ok(true) => continue,
+                        Err(e) => {
+                            tracing::warn!(code = %e.code.as_str(), lease_id = %lease.id, "cannot read a lease's release");
+                            continue;
+                        }
+                    }
+                    let token = lease.fencing_token.max(1) as u64;
+                    self.queue_hello_revoke(
+                        quoro_proto::LeaseRevoke {
+                            lease_id: quoro_proto::LeaseId(lease.id.clone()),
+                            fencing_token: token,
+                            reason: quoro_proto::RevokeReason::Moved,
+                        },
+                        token,
+                        outbox,
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                code = %e.code.as_str(),
+                node_id = %self.node_id,
+                "cannot read the leases restores wait for"
+            ),
+        }
+        if reported.is_empty() {
+            return;
+        }
         for claimed in reported {
             let row = match leases::by_id(&mut conn, &claimed.lease_id).await {
                 Ok(row) => row,
@@ -2162,25 +2297,46 @@ impl Session {
                 }
                 None => claimed.fencing_token.max(1),
             };
-            let revoke = quoro_proto::LeaseRevoke {
-                lease_id: quoro_proto::LeaseId(claimed.lease_id.clone()),
-                fencing_token: token,
-                reason,
-            };
-            let id = new_msg_id();
-            if let Some(pending) = self.hub.0.pending_of(&self.node_id, self.generation) {
-                pending
-                    .lock()
-                    .expect("pending lock")
-                    .revoke_leases
-                    .insert(id.clone(), claimed.lease_id.clone());
-            }
-            outbox.push(
-                ControlMessage::LeaseRevoke(revoke)
-                    .to_frame(&id, None)
-                    .to_text(),
+            // The answer releases the lease at the primary's token, never
+            // above it: a higher one could cover a later grant to this node
+            // that the answer says nothing about.
+            let released = row
+                .as_ref()
+                .map_or(0, |lease| lease.fencing_token.max(1) as u64);
+            self.queue_hello_revoke(
+                quoro_proto::LeaseRevoke {
+                    lease_id: quoro_proto::LeaseId(claimed.lease_id.clone()),
+                    fencing_token: token,
+                    reason,
+                },
+                released,
+                outbox,
             );
         }
+    }
+
+    /// Queues a `lease_revoke` of the session's start, after `welcome`, and
+    /// notes it unanswered, so that its `ok` releases the lease at `released`
+    /// ([`leases::Releases`]).
+    fn queue_hello_revoke(
+        &self,
+        revoke: quoro_proto::LeaseRevoke,
+        released: u64,
+        outbox: &mut Vec<String>,
+    ) {
+        let id = new_msg_id();
+        if let Some(pending) = self.hub.0.pending_of(&self.node_id, self.generation) {
+            pending
+                .lock()
+                .expect("pending lock")
+                .revoke_leases
+                .insert(id.clone(), (revoke.lease_id.0.clone(), released));
+        }
+        outbox.push(
+            ControlMessage::LeaseRevoke(revoke)
+                .to_frame(&id, None)
+                .to_text(),
+        );
     }
 
     /// Whether an operator's acknowledgement waits for delivery to this node
@@ -2332,6 +2488,8 @@ impl Session {
         {
             return;
         }
+        // The VMs may run again, whatever this holder released before.
+        self.hub.0.releases.forget(lease_id, &self.node_id);
         let recorded: Result<bool, ApiError> = async {
             let mut w = self.hub.0.store.begin_write().await?;
             let app_ids: Vec<String> = leases::by_id(&mut w.tx, lease_id)
@@ -2359,6 +2517,10 @@ impl Session {
             Ok(changed)
         }
         .await;
+        if recorded.is_ok() {
+            self.hub
+                .note_failure_recorded(&self.node_id, lease_id, true);
+        }
         match recorded {
             Ok(true) => tracing::warn!(
                 node_id = %self.node_id,
@@ -2378,6 +2540,8 @@ impl Session {
                     "cannot record a failed fence; the fence_ack waits for the next session"
                 );
                 self.fence_ack_stopped = true;
+                self.hub
+                    .note_failure_recorded(&self.node_id, lease_id, false);
             }
         }
     }
@@ -3059,7 +3223,7 @@ async fn apply_status_report(
         .lock()
         .expect("disk free lock")
         .insert(node_id.to_string(), report.disk_free_gb);
-    match crate::backups::restore::apply_status(&hub.0.store, node_id, &report.volumes).await {
+    match crate::backups::restore::apply_status(&hub.0.store, hub, node_id, &report.volumes).await {
         Ok(applied) => {
             // The grant reaches the node before the snapshot that starts the
             // app there (section 8.3).
@@ -3352,6 +3516,7 @@ async fn insert_node_event(
         .map_err(|e| format!("{e:?}"))?;
     // Section 8.5 step 1: a failed fence lists its leases on the node, in the
     // event's transaction.
+    let mut failed_leases = Vec::new();
     if event.kind == "node.fence_failed" {
         let ids = |key: &str| -> Vec<String> {
             event
@@ -3366,12 +3531,14 @@ async fn insert_node_event(
                 })
                 .unwrap_or_default()
         };
-        let (lease_ids, app_ids, vm_ids) = (ids("lease_ids"), ids("app_ids"), ids("vm_ids"));
+        let (app_ids, vm_ids) = (ids("app_ids"), ids("vm_ids"));
+        failed_leases = ids("lease_ids");
+        let lease_ids = &failed_leases;
         crate::fences::record_failure(
             &mut w.tx,
             node_id,
             &crate::fences::Failed {
-                lease_ids: &lease_ids,
+                lease_ids,
                 app_ids: &app_ids,
                 vm_ids: &vm_ids,
             },
@@ -3383,7 +3550,11 @@ async fn insert_node_event(
         .await
         .map_err(|e| format!("cannot record a failed fence: {}", e.code.as_str()))?;
     }
-    w.commit().await.map_err(|e| e.to_string())
+    w.commit().await.map_err(|e| e.to_string())?;
+    for lease_id in &failed_leases {
+        hub.note_failure_recorded(node_id, lease_id, true);
+    }
+    Ok(())
 }
 
 /// The current cluster term from `meta` (1 until elections exist).
