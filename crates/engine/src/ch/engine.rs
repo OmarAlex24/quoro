@@ -3180,6 +3180,37 @@ mod tests {
         assert!(!clone.exists());
     }
 
+    /// A VM stopped and started again during the copy runs on a new VMM
+    /// process, which the snapshot did not pause: it is not resumed, and the
+    /// copy, which the new guest may have written to, is not kept.
+    #[tokio::test]
+    async fn a_vm_started_again_during_the_copy_is_not_resumed() {
+        let vm = StandIn::new("snaprestart");
+        let next = StandIn::new("snapnext");
+        vm.entry.booted.store(true, Ordering::SeqCst);
+        let api = StatefulApi::serve(&vm.entry.paths.api_socket, "Running", false);
+        let (source, clone) = volume_files(&vm);
+
+        let (entry, restarted) = (Arc::clone(&vm.entry), next.vmm.clone());
+        let failed = crate::ch::volume::pause_and_copy(
+            &[Arc::clone(&vm.entry)],
+            &vol_1(),
+            &source,
+            &clone,
+            move |s, c| {
+                *lock(&entry.vmm) = Some(restarted);
+                plain_copy(s, c)
+            },
+        )
+        .await;
+        assert!(
+            matches!(failed, Err(EngineError::Hypervisor(_))),
+            "{failed:?}"
+        );
+        assert_eq!(api.calls(), ["vm.info", "vm.pause"]);
+        assert!(!clone.exists());
+    }
+
     /// A VM another caller paused is copied as it stands: its guest makes no
     /// writes, and its freeze is not the snapshot's to end. A VM that never
     /// booted is copied without an API call.
