@@ -913,11 +913,43 @@ where
     }
 }
 
-/// The VM a `PauseCopy` snapshot paused: which VMM process, and since when.
+/// The VM a `PauseCopy` snapshot paused: which VMM process, under which
+/// claim, and since when.
 struct PausedVm {
     entry: Arc<VmEntry>,
     process: ProcessId,
+    claim: PauseClaim,
     since: Instant,
+}
+
+/// A `PauseCopy` snapshot's claim on its pause of one VMM process (#584). The
+/// record `snapshot-paused.json` names the process only, which a later pause
+/// of the same process would name again; the number tells the two apart
+/// within this engine process, so a snapshot never resumes a pause it no
+/// longer holds. A snapshot sets it when it writes its record; the snapshot's
+/// resume, or a graceful stop that ends the pause, clears it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PauseClaim {
+    pub(super) process: ProcessId,
+    number: u64,
+}
+
+/// The number of the last claim, so no two claims share one.
+static LAST_CLAIM: AtomicU64 = AtomicU64::new(0);
+
+/// Claims the pause of `process` for a snapshot, as its record is written.
+pub(super) fn claim_pause(entry: &VmEntry, process: ProcessId) -> PauseClaim {
+    let claim = PauseClaim {
+        process,
+        number: LAST_CLAIM.fetch_add(1, Ordering::SeqCst) + 1,
+    };
+    *lock(&entry.snapshot_claim) = Some(claim);
+    claim
+}
+
+/// The claim a snapshot holds on the VM's pause, if any.
+pub(super) fn current_claim(entry: &VmEntry) -> Option<PauseClaim> {
+    *lock(&entry.snapshot_claim)
 }
 
 /// How many starts a VM that attaches the volume had when the snapshot looked
@@ -1141,8 +1173,8 @@ async fn pause_if_booted(
         return Ok(None);
     };
     let process = vmm.id();
-    let since = tokio::select! {
-        since = pause_if_running(entry, process, volume) => since?,
+    let paused = tokio::select! {
+        paused = pause_if_running(entry, process, volume) => paused?,
         () = entry.forced_stop_waiting() => {
             return Err(EngineError::Conflict(format!(
                 "a forced stop of the VM using volume {} came before the snapshot's pause",
@@ -1150,9 +1182,10 @@ async fn pause_if_booted(
             )));
         }
     };
-    Ok(since.map(|since| PausedVm {
+    Ok(paused.map(|(since, claim)| PausedVm {
         entry: Arc::clone(entry),
         process,
+        claim,
         since,
     }))
 }
@@ -1171,14 +1204,15 @@ async fn started_during_copy(counts: &[StartCount]) -> Option<VmId> {
 }
 
 /// Pauses the VM if its VMM reports it running, and returns when the pause
-/// began; `None` when it is not running. The paused process is recorded
-/// before the pause, and the record removed when the pause did not take
-/// effect. A VM that is already paused is `Conflict`.
+/// began and the snapshot's claim on it; `None` when it is not running. The
+/// paused process is recorded and claimed before the pause, and the record
+/// and the claim removed when the pause did not take effect. A VM that is
+/// already paused is `Conflict`.
 async fn pause_if_running(
     entry: &VmEntry,
     process: ProcessId,
     volume: &VolumeId,
-) -> Result<Option<Instant>, EngineError> {
+) -> Result<Option<(Instant, PauseClaim)>, EngineError> {
     let api = ApiClient::new(&entry.paths.api_socket).with_timeout(SNAPSHOT_API_TIMEOUT);
     let state = vm_state(&api).await.map_err(|err| {
         EngineError::Hypervisor(format!(
@@ -1207,6 +1241,7 @@ async fn pause_if_running(
     // Recorded first: a pause the engine cannot record is not made, since a
     // restart during the copy would leave it in place.
     state::write_json_atomic(&entry.paths.snapshot_paused, &process)?;
+    let claim = claim_pause(entry, process);
     let since = Instant::now();
     if let Err(err) = api.pause().await {
         // The request may have reached the VMM and only its answer been lost;
@@ -1227,15 +1262,19 @@ async fn pause_if_running(
             volume.0
         )));
     }
-    Ok(Some(since))
+    Ok(Some((since, claim)))
 }
 
 /// Resumes the VM `paused` stopped, under its operation lock, if its VMM is
-/// still the process that was paused, and returns when it was resumed. A
-/// resume that fails, or a VMM that is gone, is `Hypervisor`, and the VM is
-/// left for the node agent's crash handling (§3.16). A forced stop of the VM
-/// that waits for the lock meanwhile gets it at once and ends the VM, which
-/// is then not resumed (ADR 0243).
+/// still the process that was paused and the snapshot still holds its claim
+/// on the pause, and returns when it was resumed. A resume that fails, or a
+/// VMM that is gone, is `Hypervisor`, and the VM is left for the node agent's
+/// crash handling (§3.16). A forced stop of the VM that waits for the lock
+/// meanwhile gets it at once and ends the VM, which is then not resumed (ADR
+/// 0243). A graceful stop during the copy ends the claim and resumes the VM
+/// itself ([`end_snapshot_pause`]): the guest then ran during the copy, so
+/// the snapshot does not resume it, also when another snapshot has paused
+/// the same process again since, and is `Hypervisor` (#584).
 async fn resume_paused(paused: &PausedVm, volume: &VolumeId) -> Result<Instant, EngineError> {
     let entry = &paused.entry;
     let stopped = || {
@@ -1251,6 +1290,12 @@ async fn resume_paused(paused: &PausedVm, volume: &VolumeId) -> Result<Instant, 
     {
         remove_record_of(entry, paused.process);
         return Err(stopped());
+    }
+    if current_claim(entry) != Some(paused.claim) {
+        return Err(EngineError::Hypervisor(format!(
+            "a stop of the VM using volume {} resumed it during the copy, so the copy is not kept",
+            volume.0
+        )));
     }
     let api = ApiClient::new(&entry.paths.api_socket).with_timeout(SNAPSHOT_API_TIMEOUT);
     tokio::select! {
@@ -1329,18 +1374,90 @@ pub(super) async fn resume_left_paused(entry: &VmEntry) {
     }
 }
 
+/// Ends the pause of `entry`'s VMM `process` that the VM's directory records
+/// for a `PauseCopy` snapshot, for a graceful stop that holds the VM's lock
+/// (§3.16, §3.22, #584). It removes the record and takes the snapshot's claim
+/// first, before it yields, so while the stop still holds the lock: the
+/// snapshot then does not resume the VM and drops its copy. It then resumes
+/// the VM, each call bounded by `by`. A record left from before the engine
+/// restarted has no claim, and is ended the same way. The resume runs on a
+/// task of its own, so a stop whose caller gives up does not cut it short.
+/// True once the VM runs. False when it may still be paused, and the stop
+/// then goes on as a forced one.
+///
+/// When the resume fails and the VMM, still the same process, says the VM
+/// is still paused, the guest never ran, so the record and the claim are
+/// given back, unless another snapshot has claimed a pause since. That
+/// matters only when the forced stop does not end the VMM or the stop's
+/// caller gave up: a snapshot that still waits to resume then resumes the VM
+/// and keeps its copy; otherwise the next graceful stop or the engine's
+/// start-up resumes it, as after a snapshot's failed resume (§3.16).
+/// Normally the forced stop ends the VMM first and the snapshot drops its
+/// copy.
+pub(super) async fn end_snapshot_pause(
+    entry: &Arc<VmEntry>,
+    process: ProcessId,
+    by: tokio::time::Instant,
+) -> bool {
+    let taken = {
+        let mut current = lock(&entry.snapshot_claim);
+        if recorded_pause(entry) != Some(process)
+            || state::remove_marker(&entry.paths.snapshot_paused).is_err()
+        {
+            return false;
+        }
+        let taken = current.filter(|claim| claim.process == process);
+        if taken.is_some() {
+            *current = None;
+        }
+        taken
+    };
+    let entry = Arc::clone(entry);
+    let task = tokio::spawn(async move {
+        let api = || {
+            ApiClient::new(&entry.paths.api_socket)
+                .with_timeout(SNAPSHOT_API_TIMEOUT)
+                .by(by)
+        };
+        if api().resume().await.is_ok() {
+            return true;
+        }
+        // A resume whose answer was lost may have taken effect.
+        match vm_state(&api()).await.as_ref().map(Option::as_deref) {
+            Ok(Some("Paused")) => {
+                let mut current = lock(&entry.snapshot_claim);
+                if current.is_none()
+                    && entry.live_vmm().is_some_and(|vmm| vmm.id() == process)
+                    && state::write_json_atomic(&entry.paths.snapshot_paused, &process).is_ok()
+                {
+                    *current = taken;
+                }
+                false
+            }
+            Ok(Some(_)) => true,
+            _ => false,
+        }
+    });
+    task.await.unwrap_or(false)
+}
+
 /// The paused process the VM's directory records, if any can be read.
-fn recorded_pause(entry: &VmEntry) -> Option<ProcessId> {
+pub(super) fn recorded_pause(entry: &VmEntry) -> Option<ProcessId> {
     state::read_json(&entry.paths.snapshot_paused)
         .ok()
         .flatten()
 }
 
 /// Removes the record of a snapshot's pause if it names `process`, so one
-/// snapshot never removes the record of another's pause of a later process.
+/// snapshot never removes the record of another's pause of a later process,
+/// and the claim on that process's pause with it.
 fn remove_record_of(entry: &VmEntry, process: ProcessId) {
     if recorded_pause(entry) == Some(process) {
         let _ = state::remove_marker(&entry.paths.snapshot_paused);
+    }
+    let mut claim = lock(&entry.snapshot_claim);
+    if claim.is_some_and(|claim| claim.process == process) {
+        *claim = None;
     }
 }
 

@@ -197,6 +197,9 @@ pub(super) struct VmEntry {
     /// The serial client and the node-local ring behind `serial_output`
     /// (§3.19). It outlives VMM restarts; `delete` ends it.
     pub(super) serial: Arc<serial::SerialHub>,
+    /// The pause this engine's `PauseCopy` snapshot holds on the VM, set and
+    /// cleared with the record `snapshot-paused.json` (§3.16, #584).
+    pub(super) snapshot_claim: StdMutex<Option<super::volume::PauseClaim>>,
 }
 
 impl VmEntry {
@@ -217,6 +220,7 @@ impl VmEntry {
             spec: StdMutex::new(spec),
             output_open: Arc::new(AtomicBool::new(false)),
             console_open: Arc::new(AtomicBool::new(false)),
+            snapshot_claim: StdMutex::new(None),
         }
     }
 
@@ -1125,32 +1129,17 @@ impl Inner {
 
         let stopping = PhaseGuard::begin(&entry, Phase::Stopping);
         request_stop(&entry);
-        // A paused guest cannot answer the power button, so a graceful stop
-        // of a paused VM goes straight to the shutdown instead of waiting out
-        // its timeout (§3.22).
-        let guest_stopped = async {
-            if !entry.booted.load(Ordering::SeqCst) || is_paused(&entry.paths.api_socket).await {
-                return false;
-            }
-            let asked = ApiClient::new(&entry.paths.api_socket)
-                .by(graceful_by)
-                .power_button()
-                .await
-                .is_ok();
-            asked
-                && wait_settled(
-                    &entry,
-                    graceful_by.saturating_duration_since(Instant::now()),
-                )
-                .await
-        };
+        let guest_stopped = ask_guest_to_stop(&entry, graceful_by);
         // A forced stop that waits behind this one ends the graceful wait.
         // Forced stops ahead of it already hold or held the lock, so they
         // no longer count.
         let mut forced = entry.force_waiting.subscribe();
+        // Checked first, so a forced stop already waiting never lets the
+        // graceful part resume a paused VM it is about to kill.
         let stopped = tokio::select! {
-            stopped = tokio::time::timeout_at(graceful_by, guest_stopped) => stopped.unwrap_or(false),
+            biased;
             _ = forced.wait_for(|waiting| *waiting > 0) => false,
+            stopped = tokio::time::timeout_at(graceful_by, guest_stopped) => stopped.unwrap_or(false),
         };
         if stopped {
             drop(stopping);
@@ -2442,6 +2431,41 @@ async fn counted_boot(
         .await
 }
 
+/// The graceful part of a stop, with the VM's lock held: asks the guest to
+/// power off and waits until `graceful_by` for its VMM to exit. True when it
+/// did (§3.8).
+///
+/// A paused guest cannot answer the power button. A VM that a `PauseCopy`
+/// snapshot paused, which its directory records for its live VMM, is resumed
+/// first and then asked, so the app gets its shutdown during a backup; the
+/// snapshot then drops its copy (§3.16, #584). That holds for a record left
+/// from before the engine restarted too, and for a fence's graceful phase
+/// (D-0279). Any other paused VM, such as a planned switchover's freeze
+/// (§3.22, ADR 0177), is never resumed by a stop: it goes straight to the
+/// forced stop instead of waiting out the timeout.
+async fn ask_guest_to_stop(entry: &Arc<VmEntry>, graceful_by: Instant) -> bool {
+    if !entry.booted.load(Ordering::SeqCst) {
+        return false;
+    }
+    let snapshot_paused = entry
+        .live_vmm()
+        .map(|vmm| vmm.id())
+        .filter(|process| super::volume::recorded_pause(entry) == Some(*process));
+    if let Some(process) = snapshot_paused {
+        if !super::volume::end_snapshot_pause(entry, process, graceful_by).await {
+            return false;
+        }
+    } else if is_paused(&entry.paths.api_socket).await {
+        return false;
+    }
+    let asked = ApiClient::new(&entry.paths.api_socket)
+        .by(graceful_by)
+        .power_button()
+        .await
+        .is_ok();
+    asked && wait_settled(entry, graceful_by.saturating_duration_since(Instant::now())).await
+}
+
 /// True when the VMM reports the VM `Paused` (§3.22). An unanswered probe
 /// reads as not paused, so the stop asks the guest as before.
 async fn is_paused(socket: &Path) -> bool {
@@ -3041,6 +3065,9 @@ mod tests {
                             state = "Running";
                             Some(done)
                         }
+                        // The guest is asked to power off; the stand-in VMM
+                        // does not exit by itself.
+                        "vm.power-button" => Some(done),
                         _ => Some("HTTP/1.1 404 \r\nContent-Length: 0\r\n\r\n".to_owned()),
                     };
                     lock(&recorded).push(endpoint);
@@ -3695,6 +3722,351 @@ mod tests {
         assert_eq!(api.calls(), ["vm.info", "vm.pause", "vm.resume"]);
         assert!(!clone.exists());
         assert_eq!(recorded_pause(&vm.entry), None);
+    }
+
+    /// #584: a graceful stop of a VM whose live VMM this engine's
+    /// `PauseCopy` snapshot paused removes the record and the claim, resumes
+    /// the VM and asks the guest to power off, so the app gets its shutdown.
+    #[tokio::test]
+    async fn a_graceful_stop_resumes_a_vm_a_snapshot_paused_and_asks_the_guest() {
+        let (vm, api) = booted("gsnap", "Paused", Faults::default());
+        state::write_json_atomic(&vm.entry.paths.snapshot_paused, &vm.vmm.id()).expect("record");
+        crate::ch::volume::claim_pause(&vm.entry, vm.vmm.id());
+
+        let stop = {
+            let entry = Arc::clone(&vm.entry);
+            tokio::spawn(async move {
+                let _op = entry.op.lock().await;
+                ask_guest_to_stop(&entry, Instant::now() + Duration::from_secs(5)).await
+            })
+        };
+        assert!(
+            eventually(Duration::from_secs(2), || api.calls().len() == 2).await,
+            "{:?}",
+            api.calls()
+        );
+        assert_eq!(api.calls(), ["vm.resume", "vm.power-button"]);
+        assert_eq!(recorded_pause(&vm.entry), None);
+        assert_eq!(crate::ch::volume::current_claim(&vm.entry), None);
+        // The guest powers off: its VMM exits.
+        vm.vmm.sigkill().expect("kill");
+        assert!(stop.await.expect("task"), "the guest stopped in time");
+    }
+
+    /// A VM paused without a snapshot's record of its live VMM, such as a
+    /// planned switchover's freeze (§3.22, ADR 0177), is never resumed by a
+    /// graceful stop: it goes straight to the forced stop. A record and a
+    /// claim of another process change nothing.
+    #[tokio::test]
+    async fn a_graceful_stop_never_resumes_a_vm_another_caller_paused() {
+        let (vm, api) = booted("gfreeze", "Paused", Faults::default());
+        let by = Instant::now() + Duration::from_secs(5);
+        assert!(!ask_guest_to_stop(&vm.entry, by).await);
+        assert_eq!(api.calls(), ["vm.info"]);
+
+        let other = StandIn::new("gfreezeother");
+        state::write_json_atomic(&vm.entry.paths.snapshot_paused, &other.vmm.id()).expect("record");
+        let claim = crate::ch::volume::claim_pause(&vm.entry, other.vmm.id());
+        assert!(!ask_guest_to_stop(&vm.entry, by).await);
+        assert_eq!(api.calls(), ["vm.info", "vm.info"]);
+        assert_eq!(recorded_pause(&vm.entry), Some(other.vmm.id()));
+        assert_eq!(crate::ch::volume::current_claim(&vm.entry), Some(claim));
+    }
+
+    /// #584: a record of the live VMM that a snapshot left before the engine
+    /// restarted, with no claim in memory, as start-up leaves it when the VM's
+    /// stop was requested, is ended by a graceful stop the same way.
+    #[tokio::test]
+    async fn a_graceful_stop_after_a_restart_resumes_a_vm_a_snapshot_left_paused() {
+        let (vm, api) = booted("gsnaprestart", "Paused", Faults::default());
+        state::write_json_atomic(&vm.entry.paths.snapshot_paused, &vm.vmm.id()).expect("record");
+
+        let stop = {
+            let entry = Arc::clone(&vm.entry);
+            tokio::spawn(async move {
+                let _op = entry.op.lock().await;
+                ask_guest_to_stop(&entry, Instant::now() + Duration::from_secs(5)).await
+            })
+        };
+        assert!(
+            eventually(Duration::from_secs(2), || api.calls().len() == 2).await,
+            "{:?}",
+            api.calls()
+        );
+        assert_eq!(api.calls(), ["vm.resume", "vm.power-button"]);
+        assert_eq!(recorded_pause(&vm.entry), None);
+        vm.vmm.sigkill().expect("kill");
+        assert!(stop.await.expect("task"), "the guest stopped in time");
+    }
+
+    /// #584: a stop takes the snapshot's record and claim as soon as it is
+    /// polled, while it holds the VM's lock, so a caller that drops it at once
+    /// never leaves them to be taken after the lock is free. The resume still
+    /// runs on its own task.
+    #[tokio::test]
+    async fn a_stop_dropped_at_once_has_already_ended_the_snapshots_pause() {
+        let (vm, api) = booted("gsnapdrop", "Paused", Faults::default());
+        state::write_json_atomic(&vm.entry.paths.snapshot_paused, &vm.vmm.id()).expect("record");
+        crate::ch::volume::claim_pause(&vm.entry, vm.vmm.id());
+        {
+            let _op = vm.entry.op.lock().await;
+            let by = Instant::now() + Duration::from_secs(5);
+            let mut stop = std::pin::pin!(ask_guest_to_stop(&vm.entry, by));
+            // Polled exactly once, then dropped at the end of this block.
+            let polled =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(stop.as_mut().poll(cx))).await;
+            assert!(polled.is_pending(), "the stop waits for its resume");
+            assert_eq!(recorded_pause(&vm.entry), None);
+            assert_eq!(crate::ch::volume::current_claim(&vm.entry), None);
+        }
+        assert!(
+            eventually(Duration::from_secs(2), || api.calls() == ["vm.resume"]).await,
+            "{:?}",
+            api.calls()
+        );
+    }
+
+    /// #584: when the stop's resume fails and the VMM says the VM is still
+    /// paused, the guest never ran, so the stop gives the record and the
+    /// claim back and goes on as a forced one.
+    #[tokio::test]
+    async fn a_stop_whose_resume_fails_gives_the_pause_back() {
+        let faults = Faults {
+            resume_fails: true,
+            ..Faults::default()
+        };
+        let (vm, api) = booted("gsnapfail", "Paused", faults);
+        state::write_json_atomic(&vm.entry.paths.snapshot_paused, &vm.vmm.id()).expect("record");
+        let claim = crate::ch::volume::claim_pause(&vm.entry, vm.vmm.id());
+
+        let stopped = {
+            let _op = vm.entry.op.lock().await;
+            ask_guest_to_stop(&vm.entry, Instant::now() + Duration::from_secs(5)).await
+        };
+        assert!(!stopped);
+        assert_eq!(api.calls(), ["vm.resume", "vm.info"]);
+        assert_eq!(recorded_pause(&vm.entry), Some(vm.vmm.id()));
+        assert_eq!(crate::ch::volume::current_claim(&vm.entry), Some(claim));
+    }
+
+    /// #584: the pause is given back only to the VMM process it was taken
+    /// from; a VM whose live VMM is another process gets no record back.
+    #[tokio::test]
+    async fn a_pause_is_given_back_only_to_the_same_vmm() {
+        let faults = Faults {
+            resume_fails: true,
+            ..Faults::default()
+        };
+        let (vm, api) = booted("gsnapother", "Paused", faults);
+        let other = StandIn::new("gsnapotherold");
+        state::write_json_atomic(&vm.entry.paths.snapshot_paused, &other.vmm.id()).expect("record");
+        let by = Instant::now() + Duration::from_secs(5);
+        assert!(!crate::ch::volume::end_snapshot_pause(&vm.entry, other.vmm.id(), by).await);
+        assert_eq!(api.calls(), ["vm.resume", "vm.info"]);
+        assert_eq!(recorded_pause(&vm.entry), None);
+        assert_eq!(crate::ch::volume::current_claim(&vm.entry), None);
+    }
+
+    /// #584: a snapshot whose pause a graceful stop ended during the copy
+    /// does not resume the VM again, and drops its copy: the guest ran while
+    /// the volume was copied.
+    #[tokio::test]
+    async fn a_snapshot_whose_pause_a_stop_ended_drops_its_copy() {
+        let (vm, api) = booted("gsnapcopy", "Running", Faults::default());
+        let (source, clone) = volume_files(&vm);
+
+        let (copying, copy_started) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let snapshot = {
+            let vms = vec![Arc::clone(&vm.entry)];
+            let (source, clone) = (source.clone(), clone.clone());
+            tokio::spawn(async move {
+                crate::ch::volume::pause_and_copy(
+                    &|| vms.clone(),
+                    &crate::ch::volume::VolumeStarts::default(),
+                    &vol_1(),
+                    &source,
+                    &clone,
+                    move |s, c| {
+                        let copied = plain_copy(s, c);
+                        let _ = copying.send(());
+                        let _ = released.recv();
+                        copied
+                    },
+                )
+                .await
+            })
+        };
+        tokio::task::spawn_blocking(move || copy_started.recv())
+            .await
+            .expect("task")
+            .expect("the copy started");
+
+        // A graceful stop with a short timeout, during the copy.
+        let stopped = {
+            let _op = vm.entry.op.lock().await;
+            ask_guest_to_stop(&vm.entry, Instant::now() + Duration::from_secs(1)).await
+        };
+        assert!(!stopped, "the stand-in guest does not power off");
+        release.send(()).expect("release");
+        let failed = snapshot.await.expect("task");
+        assert!(
+            matches!(failed, Err(EngineError::Hypervisor(_))),
+            "{failed:?}"
+        );
+        assert_eq!(
+            api.calls(),
+            ["vm.info", "vm.pause", "vm.resume", "vm.power-button"],
+            "the snapshot does not resume the VM a second time"
+        );
+        assert!(!clone.exists(), "the copy is not kept");
+        assert_eq!(recorded_pause(&vm.entry), None);
+    }
+
+    /// #584: once a graceful stop ended a snapshot's pause, another snapshot
+    /// may pause the same VMM process again during the first one's copy. The
+    /// first snapshot then neither resumes the VM nor removes the second
+    /// one's record or claim, so the second copy stays whole.
+    #[tokio::test]
+    async fn a_snapshot_never_ends_a_later_pause_of_the_same_process() {
+        let (vm, api) = booted("gsnaplater", "Running", Faults::default());
+        let (source, clone) = volume_files(&vm);
+
+        let (copying, copy_started) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let snapshot = {
+            let vms = vec![Arc::clone(&vm.entry)];
+            let (source, clone) = (source.clone(), clone.clone());
+            tokio::spawn(async move {
+                crate::ch::volume::pause_and_copy(
+                    &|| vms.clone(),
+                    &crate::ch::volume::VolumeStarts::default(),
+                    &vol_1(),
+                    &source,
+                    &clone,
+                    move |s, c| {
+                        let copied = plain_copy(s, c);
+                        let _ = copying.send(());
+                        let _ = released.recv();
+                        copied
+                    },
+                )
+                .await
+            })
+        };
+        tokio::task::spawn_blocking(move || copy_started.recv())
+            .await
+            .expect("task")
+            .expect("the copy started");
+
+        let stopped = {
+            let _op = vm.entry.op.lock().await;
+            ask_guest_to_stop(&vm.entry, Instant::now() + Duration::from_secs(1)).await
+        };
+        assert!(!stopped, "the stand-in guest does not power off");
+        // A second snapshot pauses the same process, as `pause_if_running`
+        // records and claims it.
+        state::write_json_atomic(&vm.entry.paths.snapshot_paused, &vm.vmm.id()).expect("record");
+        let later = crate::ch::volume::claim_pause(&vm.entry, vm.vmm.id());
+
+        release.send(()).expect("release");
+        let failed = snapshot.await.expect("task");
+        assert!(
+            matches!(failed, Err(EngineError::Hypervisor(_))),
+            "{failed:?}"
+        );
+        assert_eq!(
+            api.calls(),
+            ["vm.info", "vm.pause", "vm.resume", "vm.power-button"],
+            "the first snapshot does not resume the VM the second one paused"
+        );
+        assert!(!clone.exists(), "the copy is not kept");
+        assert_eq!(recorded_pause(&vm.entry), Some(vm.vmm.id()));
+        assert_eq!(crate::ch::volume::current_claim(&vm.entry), Some(later));
+    }
+
+    /// D-0279: a fence's graceful phase (node-agent-protocol §8.5 step 1,
+    /// as `stop_one` runs it) on a VM a `PauseCopy` snapshot paused resumes
+    /// the VM once and asks the guest to power off, and the fence drops it
+    /// when `T_grace` is over. Its forced phase then ends the VMM, and the
+    /// snapshot, whose pause the graceful phase ended, drops its copy without
+    /// resuming the VM again.
+    #[tokio::test]
+    async fn a_fences_graceful_phase_resumes_a_snapshot_paused_vm_and_its_forced_phase_ends_it() {
+        let (vm, api) = booted("fencesnap", "Running", Faults::default());
+        let (source, clone) = volume_files(&vm);
+
+        let (copying, copy_started) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let snapshot = {
+            let vms = vec![Arc::clone(&vm.entry)];
+            let (source, clone) = (source.clone(), clone.clone());
+            tokio::spawn(async move {
+                crate::ch::volume::pause_and_copy(
+                    &|| vms.clone(),
+                    &crate::ch::volume::VolumeStarts::default(),
+                    &vol_1(),
+                    &source,
+                    &clone,
+                    move |s, c| {
+                        let copied = plain_copy(s, c);
+                        let _ = copying.send(());
+                        let _ = released.recv();
+                        copied
+                    },
+                )
+                .await
+            })
+        };
+        tokio::task::spawn_blocking(move || copy_started.recv())
+            .await
+            .expect("task")
+            .expect("the copy started");
+
+        // The graceful phase, bounded by `T_grace`: the stand-in guest does
+        // not power off, so the fence gives up on it.
+        let grace = Duration::from_millis(500);
+        let graceful = tokio::time::timeout(grace, async {
+            let _op = vm.entry.op.lock().await;
+            ask_guest_to_stop(&vm.entry, Instant::now() + grace).await
+        })
+        .await;
+        assert!(!matches!(graceful, Ok(true)), "{graceful:?}");
+        assert_eq!(
+            api.calls(),
+            ["vm.info", "vm.pause", "vm.resume", "vm.power-button"]
+        );
+        assert_eq!(recorded_pause(&vm.entry), None);
+        assert_eq!(crate::ch::volume::current_claim(&vm.entry), None);
+
+        // The forced phase, bounded by `T_force`.
+        {
+            let waiting = ForceWaiting::begin(&vm.entry);
+            let _op = vm.entry.op.lock().await;
+            drop(waiting);
+            shut_down_or_kill(
+                &vm.entry,
+                &vm.vmm,
+                ForceTimings::within(Duration::from_millis(300)),
+            )
+            .await
+            .expect("the VMM was reaped");
+        }
+
+        release.send(()).expect("release");
+        let failed = snapshot.await.expect("task");
+        assert!(
+            matches!(failed, Err(EngineError::Hypervisor(_))),
+            "{failed:?}"
+        );
+        assert!(!clone.exists(), "the copy is not kept");
+        let calls = api.calls();
+        assert_eq!(
+            calls.iter().filter(|call| *call == "vm.resume").count(),
+            1,
+            "only the graceful phase resumed the VM: {calls:?}"
+        );
+        assert_eq!(vm.signal(), Some(SIGKILL));
     }
 
     /// ADR 0243: a forced stop that waits for the VM's lock while a snapshot
