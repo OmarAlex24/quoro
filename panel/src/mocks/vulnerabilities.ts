@@ -168,12 +168,80 @@ const blogFindings = (app: App): VulnerabilityFinding[] => [
   }),
 ];
 
+/** Atlas's api: four open findings in its Debian base and npm tree, and one resolved. */
+const atlasApiFindings = (app: App): VulnerabilityFinding[] => [
+  baseFinding({
+    vuln_id: 'CVE-2025-27587',
+    app_id: app.id,
+    package: 'libssl3t64',
+    source_package: 'openssl',
+    installed_version: '3.5.1-1',
+    fixed_version: '3.5.1-1+deb13u1',
+    severity: 'high',
+    cvss_score: 7.5,
+    kev: true,
+    summary: 'A timing side channel in the elliptic-curve code leaks key bits.',
+    first_seen_at: ago(20),
+  }),
+  baseFinding({
+    vuln_id: 'GHSA-3xgq-45jj-v275',
+    app_id: app.id,
+    ecosystem: 'npm',
+    package: 'cross-spawn',
+    installed_version: '7.0.3',
+    fixed_version: '7.0.5',
+    severity: 'high',
+    cvss_score: 7.5,
+    summary: 'A regular expression in argument escaping can take exponential time.',
+    first_seen_at: ago(44),
+  }),
+  baseFinding({
+    vuln_id: 'GHSA-952p-6rrq-rcjv',
+    app_id: app.id,
+    ecosystem: 'npm',
+    package: 'micromatch',
+    installed_version: '4.0.5',
+    fixed_version: '4.0.8',
+    severity: 'medium',
+    cvss_score: 5.3,
+    summary: 'A crafted pattern can make matching take a long time.',
+    first_seen_at: ago(44),
+  }),
+  baseFinding({
+    vuln_id: 'CVE-2023-4641',
+    app_id: app.id,
+    package: 'login',
+    source_package: 'shadow',
+    installed_version: '1:4.17.4-2',
+    fixed_version: null,
+    severity: 'medium',
+    cvss_score: 5.5,
+    summary: 'A password entered at a failed prompt can stay in memory.',
+    first_seen_at: ago(96),
+  }),
+  baseFinding({
+    vuln_id: 'CVE-2024-56171',
+    app_id: app.id,
+    package: 'libxml2',
+    installed_version: '2.12.7+dfsg-1',
+    fixed_version: '2.12.7+dfsg+really2.9.14-1',
+    severity: 'high',
+    cvss_score: 7.8,
+    resolved_at: ago(30),
+    resolved_reason: 'upgraded',
+    first_seen_at: ago(96),
+  }),
+];
+
 const findingsCache = new Map<string, VulnerabilityFinding[]>();
 const clearedApps = new Set<string>();
 
 const seedFor = (app: App): VulnerabilityFinding[] => {
   if (app.name === 'docs-site') return docsSiteFindings(app);
   if (app.name === 'blog') return blogFindings(app);
+  if (app.name === 'api' && db.projects.some((project) => project.id === app.project_id && project.slug === 'atlas')) {
+    return atlasApiFindings(app);
+  }
   return [];
 };
 

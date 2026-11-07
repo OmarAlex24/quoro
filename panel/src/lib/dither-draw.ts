@@ -7,6 +7,7 @@ import {
   isLit,
   takesSecondTone,
 } from './dither';
+import type { AreaPlot } from './metric-area';
 import { readToken } from './use-theme';
 
 /**
@@ -305,5 +306,138 @@ export function drawStepBar(
     dither2(ctx, filled, h, 2, read('--accent'), read('--ion'), () => 0.96, (x) =>
       clamp(0.15 + (0.6 * x) / filled),
     );
+  }
+}
+
+/**
+ * A meter: a dithered bar filled to `share` (0..1) over a faint dotted track,
+ * its leading edge thinning out so the reading point shows. The fill runs from
+ * the accent towards ion as it grows.
+ */
+export function drawMeter({ ctx, w, h }: DitherSurface, share: number, read: TokenReader = readToken): void {
+  const edge = clamp(share) * w;
+  const fade = Math.min(10, edge);
+  const density = (x: number) =>
+    x >= edge ? 0.14 : x > edge - fade ? 0.45 + (0.55 * (edge - x)) / fade : 1;
+  dither2(ctx, w, h, 2, read('--accent'), read('--ion'), density, (x) =>
+    x >= edge ? 0 : 0.78 * Math.pow(x / Math.max(1, edge), 1.8),
+  );
+}
+
+const CHART_FONT = '500 11px "Archivo Variable", Archivo, ui-sans-serif, system-ui, sans-serif';
+
+/**
+ * DitherArea: a metric over the last ten minutes. A faint grid with its
+ * labels, the area under the line in two-tone ordered dither (ion close to
+ * the line, accent deeper down, more ion in the recent minutes), the line
+ * itself running from accent to ion, the configured limit as a thin line and
+ * a dot on the newest sample. Each run of samples is drawn on its own, so a
+ * gap stays empty.
+ */
+export function drawMetricArea({ ctx, w, h }: DitherSurface, plot: AreaPlot, read: TokenReader = readToken): void {
+  const { box } = plot;
+  const accent = read('--accent');
+  const ion = read('--ion');
+  const faint = read('--ink-3');
+
+  ctx.font = CHART_FONT;
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'right';
+  for (const tick of plot.ticks) {
+    ctx.fillStyle = read('--line');
+    ctx.fillRect(box.left, Math.round(tick.y), box.right - box.left, 1);
+    ctx.fillStyle = faint;
+    ctx.fillText(tick.label, box.left - 8, tick.y);
+  }
+  ctx.fillStyle = faint;
+  ctx.textAlign = 'left';
+  ctx.fillText('−10 min', box.left, h - 7);
+  ctx.textAlign = 'center';
+  ctx.fillText('−5 min', (box.left + box.right) / 2, h - 7);
+  ctx.textAlign = 'right';
+  ctx.fillText('now', box.right, h - 7);
+
+  // The line's height at every whole pixel; NaN where no run covers it.
+  const lineAt = new Float32Array(Math.ceil(w) + 2).fill(Number.NaN);
+  for (const run of plot.runs) {
+    if (run.length === 1) {
+      const { x, y } = run[0]!;
+      for (let px = Math.floor(x) - 1; px <= Math.ceil(x) + 1; px += 1) if (px >= 0) lineAt[px] = y;
+      continue;
+    }
+    for (let k = 1; k < run.length; k += 1) {
+      const a = run[k - 1]!;
+      const b = run[k]!;
+      const span = Math.max(1e-6, b.x - a.x);
+      for (let px = Math.max(0, Math.floor(a.x)); px <= Math.ceil(b.x) && px < lineAt.length; px += 1) {
+        lineAt[px] = a.y + ((b.y - a.y) * clamp((px - a.x) / span));
+      }
+    }
+  }
+  const depth = (x: number, y: number): number | null => {
+    const line = lineAt[Math.floor(x)];
+    if (line === undefined || Number.isNaN(line) || y < line) return null;
+    return (y - line) / Math.max(1, box.bottom - line);
+  };
+  const width = Math.max(1, box.right - box.left);
+  dither2(
+    ctx,
+    box.right,
+    box.bottom,
+    2,
+    accent,
+    ion,
+    (x, y) => {
+      if (x < box.left) return 0;
+      const t = depth(x, y);
+      return t === null ? 0 : 0.62 * Math.pow(1 - t, 1.5) + 0.05;
+    },
+    (x, y) => {
+      const t = depth(x, y) ?? 1;
+      return clamp((1 - t * 2.2) * (0.45 + (0.55 * (x - box.left)) / width));
+    },
+    box.left,
+    0,
+  );
+
+  if (plot.limit) {
+    ctx.fillStyle = faint;
+    ctx.fillRect(box.left, Math.round(plot.limit.y), width, 1);
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText(plot.limit.label, box.right, plot.limit.y - 3);
+    ctx.textBaseline = 'middle';
+  }
+
+  const gradient = ctx.createLinearGradient(box.left, 0, box.right, 0);
+  gradient.addColorStop(0, accent);
+  gradient.addColorStop(0.55, accent);
+  gradient.addColorStop(1, ion);
+  ctx.strokeStyle = gradient;
+  ctx.fillStyle = gradient;
+  ctx.lineWidth = 2;
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  for (const run of plot.runs) {
+    if (run.length === 1) {
+      ctx.beginPath();
+      ctx.arc(run[0]!.x, run[0]!.y, 1.6, 0, Math.PI * 2);
+      ctx.fill();
+      continue;
+    }
+    ctx.beginPath();
+    run.forEach((point, index) => (index === 0 ? ctx.moveTo(point.x, point.y) : ctx.lineTo(point.x, point.y)));
+    ctx.stroke();
+  }
+
+  if (plot.newest) {
+    ctx.fillStyle = read('--surface');
+    ctx.beginPath();
+    ctx.arc(plot.newest.x, plot.newest.y, 6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = ion;
+    ctx.beginPath();
+    ctx.arc(plot.newest.x, plot.newest.y, 4, 0, Math.PI * 2);
+    ctx.fill();
   }
 }

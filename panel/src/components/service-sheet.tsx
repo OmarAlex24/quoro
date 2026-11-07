@@ -3,7 +3,7 @@ import * as DialogPrimitive from '@radix-ui/react-dialog';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Link } from '@tanstack/react-router';
 import { Lock, MoreHorizontal, Play, RefreshCw, RotateCcw, Square, SquareTerminal, X } from 'lucide-react';
-import { useRef, useState } from 'react';
+import { useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import {
   getGetAppEnvQueryKey,
   getGetAppQueryKey,
@@ -19,22 +19,24 @@ import { getListAppBuildsQueryKey, useListAppBuilds } from '../api/generated/bui
 import { getListAppDeploymentsQueryKey } from '../api/generated/deployments/deployments';
 import type { App, AppDetail, Deployment } from '../api/generated/model';
 import { useListNodes } from '../api/generated/nodes/nodes';
+import { useGetAppVulnerabilities } from '../api/generated/vulnerabilities/vulnerabilities';
 import { appLampState, relativeTime } from '../lib/app-status';
 import { canOpenTerminal } from '../lib/capabilities';
 import { problemView, type ProblemView } from '../lib/problem';
 import { PROJECT_TABS, type ProjectTab } from '../lib/routes';
 import { appAddress, appKind } from '../lib/services';
+import { securityParams, securityTabCount } from '../lib/vulnerabilities';
 import { useSession } from '../session';
 import { AppEnvDialog } from './app-env-dialog';
-import { AppStorage } from './app-storage';
-import { AppVulnerabilities } from './app-vulnerabilities';
 import { GlyphTile } from './glyph-tile';
 import { LampDot } from './lamp';
 import { LogTape } from './log-tape';
-import { AppMetricsBay } from './metrics-bay';
 import { MenuPanel, useMenu } from './shell/menu';
 import { DeploymentsTab, RUN_PAGE } from './sheet-deployments';
+import { MetricsTab } from './sheet-metrics';
+import { SecurityTab } from './sheet-security';
 import { SettingsTab } from './sheet-settings';
+import { StorageTab } from './sheet-storage';
 import { Button } from './ui/button';
 import { NoticeLine, ProblemBanner } from './ui/problem-banner';
 import { Tag } from './ui/tag';
@@ -111,8 +113,9 @@ export function ServiceSheet({
         // The caller returns focus to the card that opened the sheet.
         onCloseAutoFocus={(event) => event.preventDefault()}
         onEscapeKeyDown={(event) => {
-          // Escape inside a menu closes the menu, not the sheet.
-          if ((event.target as Element | null)?.closest?.('[role="menu"]')) event.preventDefault();
+          // Escape inside a menu closes the menu, and on a chart its
+          // crosshair, not the sheet.
+          if ((event.target as Element | null)?.closest?.('[role="menu"], [data-crosshair]')) event.preventDefault();
         }}
       >
         {app ? (
@@ -205,6 +208,12 @@ function SheetBody({
 
   const lamp = appLampState(app.status);
   const terminal = canWrite && canOpenTerminal(me);
+  // The open findings on the Security tab: the same request the tab makes
+  // with no filter, so opening the tab reads it from the cache.
+  const vulnerabilities = useGetAppVulnerabilities(app.id, securityParams(), {
+    query: { refetchInterval: 30_000 },
+  });
+  const openFindings = securityTabCount(vulnerabilities.data);
 
   return (
     <>
@@ -235,7 +244,7 @@ function SheetBody({
         </div>
       </div>
 
-      <nav className="tabs sh-tabs" aria-label={`${app.name} sections`}>
+      <SheetTabs label={`${app.name} sections`} tab={tab}>
         {PROJECT_TABS.map((key) => (
           <Link
             key={key}
@@ -246,9 +255,19 @@ function SheetBody({
             aria-current={key === tab ? 'page' : undefined}
           >
             {TAB_WORDS[key]}
+            {key === 'security' && openFindings !== null ? (
+              <>
+                <span className="count count-soft" aria-hidden="true">
+                  {openFindings}
+                </span>
+                <span className="sr-only">
+                  , {openFindings} open {openFindings === 1 ? 'finding' : 'findings'}
+                </span>
+              </>
+            ) : null}
           </Link>
         ))}
-      </nav>
+      </SheetTabs>
 
       <div className="sh-body">
         {notice ? <NoticeLine>{notice}</NoticeLine> : null}
@@ -269,22 +288,12 @@ function SheetBody({
         {tab === 'variables' ? (
           <VariablesTab app={app} canWrite={canWrite} onSaved={invalidate} />
         ) : null}
-        {tab === 'metrics' ? (
-          <div className="[&>:first-child]:mt-0">
-            <AppMetricsBay appId={app.id} nodeNames={nodeNames} />
-          </div>
-        ) : null}
+        {tab === 'metrics' ? <MetricsTab app={app} nodeNames={nodeNames} /> : null}
         {tab === 'logs' ? <LogTape appId={app.id} tall /> : null}
         {tab === 'storage' ? (
-          <div className="[&>:first-child]:mt-0">
-            <AppStorage app={app} canWrite={canWrite} nodeNames={nodeNames} onChanged={invalidate} />
-          </div>
+          <StorageTab app={app} canWrite={canWrite} nodeNames={nodeNames} onChanged={invalidate} />
         ) : null}
-        {tab === 'security' ? (
-          <div className="[&>:first-child]:mt-0">
-            <AppVulnerabilities app={app} canWrite={canWrite} onRebuilt={invalidate} />
-          </div>
-        ) : null}
+        {tab === 'security' ? <SecurityTab app={app} canWrite={canWrite} onRebuilt={invalidate} /> : null}
         {tab === 'settings' ? (
           <SettingsWithBuilds
             app={app}
@@ -298,6 +307,54 @@ function SheetBody({
         ) : null}
       </div>
     </>
+  );
+}
+
+/**
+ * The tab row. On a narrow sheet it scrolls sideways inside its own box: the
+ * edge with more tabs behind it fades, and the active tab is scrolled into
+ * view whenever it changes.
+ */
+function SheetTabs({ label, tab, children }: { label: string; tab: ProjectTab; children: ReactNode }) {
+  const ref = useRef<HTMLElement>(null);
+  const [edges, setEdges] = useState<'none' | 'start' | 'end' | 'both'>('none');
+
+  useLayoutEffect(() => {
+    const nav = ref.current;
+    if (!nav) return;
+    const measure = () => {
+      const before = nav.scrollLeft > 1;
+      const after = nav.scrollLeft + nav.clientWidth < nav.scrollWidth - 1;
+      setEdges(before && after ? 'both' : before ? 'start' : after ? 'end' : 'none');
+    };
+    measure();
+    nav.addEventListener('scroll', measure, { passive: true });
+    const observer = new ResizeObserver(measure);
+    observer.observe(nav);
+    return () => {
+      nav.removeEventListener('scroll', measure);
+      observer.disconnect();
+    };
+  }, []);
+
+  // Scroll the row itself, not the page: scrollIntoView could also move the
+  // sheet's body.
+  useLayoutEffect(() => {
+    const nav = ref.current;
+    const active = nav?.querySelector<HTMLElement>('a.on');
+    if (!nav || !active) return;
+    // The row is positioned, so a tab's offset is measured from the row itself.
+    const pad = 32;
+    const left = active.offsetLeft;
+    const right = left + active.offsetWidth;
+    if (left - pad < nav.scrollLeft) nav.scrollLeft = Math.max(0, left - pad);
+    else if (right + pad > nav.scrollLeft + nav.clientWidth) nav.scrollLeft = right + pad - nav.clientWidth;
+  }, [tab]);
+
+  return (
+    <nav ref={ref} className="tabs sh-tabs" aria-label={label} data-fade={edges}>
+      {children}
+    </nav>
   );
 }
 

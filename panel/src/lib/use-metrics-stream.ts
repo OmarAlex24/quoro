@@ -207,10 +207,15 @@ export function useAppMetricsStream(
   enabled = true,
 ): {
   instances: AppInstanceSeries[];
+  /** Seconds between two samples, as the history read said (`AppMetrics.interval_s`); null before it. */
+  intervalS: number | null;
   status: MetricsStreamStatus;
   problem: ProblemView | null;
 } {
-  const core = useMetricsCore<AppStreamSample, AppInstanceMetrics[]>({
+  const core = useMetricsCore<
+    AppStreamSample,
+    { instances: AppInstanceMetrics[]; interval_s: number }
+  >({
     url: `/api/v1/apps/${appId}/metrics/stream`,
     enabled: enabled && appId !== '',
     loadHistory: async () => {
@@ -223,7 +228,7 @@ export function useAppMetricsStream(
             node_id: instance.node_id,
           })),
         ),
-        meta: data.instances,
+        meta: { instances: data.instances, interval_s: data.interval_s },
       };
     },
     keyOf: (sample) => `${sample.vm_id}:${sample.time}`,
@@ -241,7 +246,7 @@ export function useAppMetricsStream(
 
   const order: Array<Pick<AppInstanceMetrics, 'vm_id' | 'node_id'>> = [];
   const seen = new Set<string>();
-  for (const instance of core.meta ?? []) {
+  for (const instance of core.meta?.instances ?? []) {
     if (seen.has(instance.vm_id)) continue;
     seen.add(instance.vm_id);
     order.push({ vm_id: instance.vm_id, node_id: instance.node_id });
@@ -257,6 +262,7 @@ export function useAppMetricsStream(
       ...instance,
       samples: samplesByVm.get(instance.vm_id) ?? [],
     })),
+    intervalS: core.meta?.interval_s ?? null,
     status: core.status,
     problem: core.problem,
   };
