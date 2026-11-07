@@ -1858,15 +1858,20 @@ components:
           type: [string, 'null']
           pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
           description: |
-            The warm node. The scheduler picks it among the nodes the app may
-            run on unless an operator pinned it (`UpdateAppRequest.warm`).
-            Eligible: a connected node with the `node` role, in
-            `placement.node_ids` when that is not empty, other than the node of
-            the app's volume, that snapshots with `reflink` (ADR 0172) and that
-            the source can reach over the mesh (two nodes both behind NAT
-            cannot pair). After a failover it is the old source, which becomes
-            the warm copy when it returns (ADR 0176). Null while no node is
-            eligible; `state` is then `failed`.
+            The warm node. The scheduler picks it unless an operator pinned it
+            (`UpdateAppRequest.warm`). Eligible: a connected node with the
+            `node` role, other than the node of the app's volume, that
+            snapshots with `reflink` (ADR 0172) and that the source can reach
+            over the mesh (two nodes both behind NAT cannot pair). A stateful
+            app's placement names only its volume's node (ADR 0145), so it
+            does not narrow the choice; pin a node to choose it (ADR 0275).
+            After a failover it is the old source, which becomes the warm copy
+            when it returns (ADR 0176). Null while no node is eligible;
+            `state` is then `failed`. The scheduler keeps the warm node while
+            it is disconnected and picks another only when it is removed,
+            loses the node role, stops snapshotting with reflink or becomes
+            the volume's node; an operator's pin lasts until the node is
+            removed (ADR 0276).
         node_pinned:
           type: boolean
           description: Whether an operator chose `node_id` rather than the scheduler.
