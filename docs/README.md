@@ -14,6 +14,9 @@ milestone delivers before you rely on it.
 - **Install**: [Installing Quoro](site/install.md) covers the one-command
   installer, its roles (primary and node), what it verifies and the host layout
   it creates.
+- **Guides**: the [command-line client](guides/cli.md): contexts and the
+  certificate pin, human and agent login, linked folders, every command,
+  scripting, approvals, and connecting an AI agent through MCP.
 - **Concepts**: the [product requirements](product/prd.md) explain what Quoro
   is for and who it is for; the [glossary](glossary.md) defines the terms used
   everywhere else.

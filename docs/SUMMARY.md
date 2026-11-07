@@ -6,6 +6,10 @@
 
 - [Installing Quoro](site/install.md)
 
+# Guides
+
+- [Command-line client](guides/cli.md)
+
 # Concepts
 
 - [Product requirements](product/prd.md)

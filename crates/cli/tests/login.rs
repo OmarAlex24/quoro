@@ -202,7 +202,7 @@ async fn an_agent_credential_or_no_token_is_refused_before_anything_is_sent() {
     assert!(
         output.stderr.contains("--token-stdin")
             && output.stderr.contains("on a terminal")
-            && output.stderr.contains("Your account → API tokens"),
+            && output.stderr.contains("Settings → API tokens"),
         "{}",
         output.stderr
     );
@@ -228,13 +228,13 @@ async fn on_a_terminal_the_certificate_is_confirmed_then_the_token_asked_for() {
     let trust = output.stderr.find("Trust it? [y/N]").expect("trust asked");
     let token = output
         .stderr
-        .find("Create one in the panel: Your account → API tokens")
+        .find("Create one in the panel: Settings → API tokens")
         .expect("token asked");
     assert!(trust < token, "{}", output.stderr);
     assert!(
         output
             .stderr
-            .contains(&format!("({}/account)", lab.primary.url)),
+            .contains(&format!("({}/settings/tokens)", lab.primary.url)),
         "{}",
         output.stderr
     );
@@ -289,7 +289,7 @@ async fn logout_forgets_the_token_and_points_to_the_panel_to_revoke_it() {
         Some(
             format!(
                 "The token still works until it is revoked: revoke it in the panel, \
-                 Your account → API tokens ({}/account).",
+                 Settings → API tokens ({}/settings/tokens).",
                 lab.primary.url
             )
             .as_str()
