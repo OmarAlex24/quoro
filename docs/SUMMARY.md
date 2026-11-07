@@ -263,6 +263,7 @@
   - [0259: Health checks: probes of a VM paused for a backup neither count nor restart it, and a health restart stops a VM only when it can start again](adr/0259-health-checks-probes-of-a-vm-paused-for-a-backup-neither.md)
   - [0262: fence_ack acknowledges a listed lease with no row at 2^53-1, the canonical-JSON bound, and migration 0001's comment names fencing_tokens](adr/0262-fence-ack-acknowledges-a-listed-lease-with-no-row-at-2-53-1.md)
   - [0263: The primary measures its support window (p_send) on CLOCK_BOOTTIME](adr/0263-the-primary-measures-its-support-window-p-send-on-clock.md)
+  - [0264: After a node fences a converted lease that restarted before its first renewal, the primary regrants it from hello at a higher token](adr/0264-after-a-node-fences-a-converted-lease-that-restarted-before.md)
   - [0265: M5b refuses warm for an app built from a Git source, with the reason not_in_this_release](adr/0265-m5b-refuses-warm-for-an-app-built-from-a-git-source-with.md)
   - [0266: Where the primary takes a voter's mesh endpoint from (node-to-node peers, section 6.9)](adr/0266-where-the-primary-takes-a-voter-s-mesh-endpoint-from-node.md)
   - [0267: A warm copy the node is no longer the target of is never reported, so the primary cannot always delete it](adr/0267-a-warm-copy-the-node-is-no-longer-the-target-of-is-never.md)
