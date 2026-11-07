@@ -33,7 +33,9 @@ use quoro_proto::wire::{
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use crate::health::{DEFAULT_RESTART, FIRST_PROBE_DELAY, HealthTarget, is_passing, probe};
+use crate::health::{
+    DEFAULT_RESTART, FIRST_PROBE_DELAY, HealthTarget, PausedVms, is_passing, probe,
+};
 use crate::lease::{LeaseView, StartPermit};
 use crate::logs::LogCollector;
 use crate::store::{NodeStore, VolumeRecord};
@@ -183,6 +185,10 @@ struct HealthState {
     run_ended: bool,
     /// A health restart was already asked for this run.
     restart_asked: bool,
+    /// The VM's [`crate::health::PauseMark::pauses`] when its last probe was
+    /// counted. Another value means it was paused since, so its failures
+    /// count from zero (D-0259).
+    pauses_seen: u64,
 }
 
 impl HealthState {
@@ -196,6 +202,7 @@ impl HealthState {
             seen_at: now,
             run_ended: false,
             restart_asked: false,
+            pauses_seen: 0,
         }
     }
 
@@ -339,6 +346,10 @@ pub struct Reconciler<E: Engine> {
     /// passes that wait out the backoff, also when the engine reads the VM
     /// `stopped` rather than `crashed`.
     restarts_due: HashSet<String>,
+    /// The VMs a backup paused, shared with the backup manager: their failed
+    /// probes do not count and they are not restarted for their health
+    /// (D-0259).
+    paused: PausedVms,
     /// Per VM, the requested digest last refused because the VM's digest is
     /// create-time only: the refusal is logged once per VM and digest, not on
     /// every pass (issue #354).
@@ -396,6 +407,7 @@ impl<E: Engine + 'static> Reconciler<E> {
                 health: HashMap::new(),
                 health_restarts: HashSet::new(),
                 restarts_due: HashSet::new(),
+                paused: PausedVms::default(),
                 ingress: None,
                 lease: LeaseView::default(),
                 volumes_out,
@@ -436,6 +448,14 @@ impl<E: Engine + 'static> Reconciler<E> {
     #[must_use]
     pub fn with_edge(mut self, edge: Arc<crate::edge::EdgeManager>) -> Self {
         self.edge = Some(edge);
+        self
+    }
+
+    /// Shares the pause marks the backup manager sets on the VMs a
+    /// `pause_copy` snapshot pauses (D-0259).
+    #[must_use]
+    pub fn with_paused_vms(mut self, paused: PausedVms) -> Self {
+        self.paused = paused;
         self
     }
 
@@ -1194,7 +1214,8 @@ impl<E: Engine + 'static> Reconciler<E> {
         // not be followed by a start. A lease that leaves `held` between the
         // stop and the start leaves it stopped (section 6.4). A fence of the
         // lease stops the VM itself (section 8.5), so a VM it is stopping is
-        // left to it.
+        // left to it. A VM a backup paused is not restarted for its health
+        // (D-0259).
         if self.health_restarts.contains(&vm_id) {
             let still_failing = self.health.get(&vm_id).is_some_and(|state| {
                 state.status == Health::Failing
@@ -1205,6 +1226,7 @@ impl<E: Engine + 'static> Reconciler<E> {
                 || info.state != VmState::Running
                 || !restarts_when_unhealthy(vm)
                 || !still_failing
+                || self.paused.mark_of(&vm_id).held > 0
             {
                 self.drop_health_restart(&vm_id);
             } else if self.fence_owns_stop(vm) {
@@ -1880,21 +1902,40 @@ impl<E: Engine + 'static> Reconciler<E> {
                 self.health.insert(vm_id, state);
                 continue;
             }
+            // D-0259: a VM paused for a backup is not probed; the probe could
+            // only time out.
+            let before = self.paused.mark_of(&vm_id);
+            if before.held > 0 {
+                state.next_at = now + state.target.interval;
+                self.health.insert(vm_id, state);
+                continue;
+            }
 
             let previous = state.status;
-            let counts = !state.in_start_period(now);
+            let in_start_period = state.in_start_period(now);
             let reason = match probe(&state.target).await {
                 Ok(code) if is_passing(code) => None,
                 Ok(code) => Some(format!("status {code}")),
                 Err(reason) => Some(reason),
             };
+            // D-0259: once a paused VM is resumed its failures count from
+            // zero, and a probe a pause overlapped does not count.
+            let after = self.paused.mark_of(&vm_id);
+            if after.pauses != state.pauses_seen {
+                state.failures = 0;
+                state.pauses_seen = after.pauses;
+            }
+            let paused = after.held > 0 || after.pauses != before.pauses;
             let status = if reason.is_none() {
                 state.failures = 0;
                 Health::Passing
-            } else if !counts {
+            } else if in_start_period || paused {
                 // Section 6.3: a failed probe in the start period does not
-                // count.
-                debug!(vm_id, "a failed probe in the start period does not count");
+                // count, nor one of a VM a backup paused (D-0259).
+                debug!(
+                    vm_id,
+                    in_start_period, paused, "a failed probe that does not count"
+                );
                 previous
             } else {
                 state.failures = state.failures.saturating_add(1);

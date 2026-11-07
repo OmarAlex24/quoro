@@ -37,6 +37,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
+use crate::health::PausedVms;
 use crate::lease::LeaseView;
 use crate::reconcile::Snapshot;
 use crate::store::{BackupRecord, NodeStore, VolumeRecord};
@@ -109,6 +110,9 @@ pub struct BackupManager<E: Engine, R: Repository> {
     /// Task completions; taken by [`BackupManager::run`].
     events: Option<mpsc::UnboundedReceiver<BackupRecord>>,
     done: mpsc::UnboundedSender<BackupRecord>,
+    /// The pause marks shared with the reconciler: a `pause_copy` snapshot
+    /// marks the VM it pauses (D-0259).
+    paused: PausedVms,
 }
 
 impl<E: Engine + 'static, R: Repository> BackupManager<E, R> {
@@ -139,6 +143,7 @@ impl<E: Engine + 'static, R: Repository> BackupManager<E, R> {
                 options: BackupOptions::default(),
                 events: Some(events),
                 done,
+                paused: PausedVms::default(),
             },
             statuses_rx,
         )
@@ -148,6 +153,15 @@ impl<E: Engine + 'static, R: Repository> BackupManager<E, R> {
     #[must_use]
     pub fn with_options(mut self, options: BackupOptions) -> Self {
         self.options = options;
+        self
+    }
+
+    /// Shares the pause marks with the reconciler, so the VM a `pause_copy`
+    /// snapshot pauses is neither counted failing nor restarted for its
+    /// health during the pause (D-0259).
+    #[must_use]
+    pub fn with_paused_vms(mut self, paused: PausedVms) -> Self {
+        self.paused = paused;
         self
     }
 
@@ -362,6 +376,7 @@ impl<E: Engine + 'static, R: Repository> BackupManager<E, R> {
                 cluster_id: self.cluster_id.clone(),
                 options: self.options.clone(),
                 done: self.done.clone(),
+                paused: self.paused.clone(),
             },
             self.lease.clone(),
             job.clone(),
@@ -468,6 +483,8 @@ struct JobContext<E: Engine, R: Repository> {
     cluster_id: String,
     options: BackupOptions,
     done: mpsc::UnboundedSender<BackupRecord>,
+    /// The pause marks shared with the reconciler (D-0259).
+    paused: PausedVms,
 }
 
 /// One backup job: check the lease, snapshot, chunk, upload, write the
@@ -485,6 +502,7 @@ async fn run_job<E: Engine, R: Repository>(
         cluster_id,
         options,
         done,
+        paused,
     } = context;
     let mut record = BackupRecord {
         backup_id: job.backup_id.clone(),
@@ -552,11 +570,24 @@ async fn run_job<E: Engine, R: Repository>(
     };
 
     // Section 7.1 step 3: take the snapshot, then report `running` with its
-    // method and, for `pause_copy`, the pause.
-    let snapshot = match engine
+    // method and, for `pause_copy`, the pause. A `pause_copy` snapshot pauses
+    // the app's VM on this node (`vm_id`) for the whole copy while the engine
+    // still reports it running, so the VM is marked for that time: its health
+    // check neither counts the pause nor restarts it (D-0259).
+    let mark = match &job.vm_id {
+        Some(vm_id)
+            if engine.capabilities().await.volume_snapshot_method
+                == Some(SnapshotMethod::PauseCopy) =>
+        {
+            Some(paused.mark(vm_id))
+        }
+        _ => None,
+    };
+    let snapshot = engine
         .snapshot_volume(&VolumeId(job.volume_id.clone()))
-        .await
-    {
+        .await;
+    drop(mark);
+    let snapshot = match snapshot {
         Ok(snapshot) => snapshot,
         Err(e) => {
             finish_failed(
