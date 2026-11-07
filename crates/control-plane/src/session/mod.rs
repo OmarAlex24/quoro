@@ -316,6 +316,12 @@ struct HubInner {
     edge_reports: Mutex<HashMap<String, Vec<wire::EdgeBackendStatus>>>,
     /// The edge's health view of each app between reports (ADR 0143).
     edge_health: Mutex<BTreeMap<String, crate::edge_health::AppHealth>>,
+    /// The newest `status_report.warm` of each node, in memory only (section
+    /// 5.3, migration 0011): `App.warm` is derived from it on every read.
+    warm_reports: Mutex<HashMap<String, Vec<wire::WarmStatus>>>,
+    /// The warm facts of the newest snapshot sent to each node, in memory
+    /// only ([`NodeHub::swap_warm_facts`]).
+    warm_facts: Mutex<HashMap<String, crate::warm::WarmFacts>>,
     /// Free space on the volume filesystem each node last reported
     /// (`status_report.disk_free_gb`, section 5.3).
     disk_free_gb: Mutex<HashMap<String, f64>>,
@@ -398,6 +404,8 @@ impl NodeHub {
             session_ips: Mutex::new(HashMap::new()),
             edge_reports: Mutex::new(HashMap::new()),
             edge_health: Mutex::new(BTreeMap::new()),
+            warm_reports: Mutex::new(HashMap::new()),
+            warm_facts: Mutex::new(HashMap::new()),
             disk_free_gb: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
             snapshot_holds: Mutex::new(HashMap::new()),
@@ -594,6 +602,75 @@ impl NodeHub {
             .collect();
         reports.sort_by(|a, b| a.0.cmp(&b.0));
         reports
+    }
+
+    /// The newest `status_report.warm` of each node that reported one since
+    /// the primary started, keyed by node id (section 5.3). Kept in memory
+    /// only (migration 0011), so it is empty after a restart until the nodes
+    /// report again.
+    #[must_use]
+    pub(crate) fn warm_reports(&self) -> HashMap<String, Vec<wire::WarmStatus>> {
+        self.0
+            .warm_reports
+            .lock()
+            .expect("warm report lock")
+            .clone()
+    }
+
+    /// The copies `node_id` last reported holding as a warm node, as
+    /// `(volume_id, app_id)` ([`crate::warm::reported_targets`]).
+    fn reported_warm_targets(&self, node_id: &str) -> Vec<(String, String)> {
+        self.0
+            .warm_reports
+            .lock()
+            .expect("warm report lock")
+            .get(node_id)
+            .map(|entries| crate::warm::reported_targets(entries))
+            .unwrap_or_default()
+    }
+
+    /// Keeps the newest `status_report.warm` of `node_id`. Only a change in
+    /// the copies it holds as a warm node rebuilds its snapshot, because such
+    /// a copy may get a `deleted` entry (section 5.11); a new snapshot number
+    /// or lag changes only `App.warm`, which is read from here.
+    fn apply_warm_report(&self, node_id: &str, report: &[wire::WarmStatus]) {
+        let changed = {
+            let mut reports = self.0.warm_reports.lock().expect("warm report lock");
+            let before = reports
+                .get(node_id)
+                .map(|entries| crate::warm::reported_targets(entries))
+                .unwrap_or_default();
+            if report.is_empty() {
+                reports.remove(node_id);
+            } else {
+                reports.insert(node_id.to_string(), report.to_vec());
+            }
+            before != crate::warm::reported_targets(report)
+        };
+        if changed {
+            self.node_changed(node_id);
+        }
+    }
+
+    /// Records the warm facts of the snapshot just sent to `node_id` and
+    /// returns the peers of the pairs that differ from the snapshot sent
+    /// before it, on any of the node's sessions since the primary started
+    /// ([`crate::warm::peers_to_wake`]). A node that connects again is
+    /// compared with what it was last sent, so a pair that went away while it
+    /// was disconnected still reaches the other node. A node's first session
+    /// since the primary started rebuilds every node already.
+    fn swap_warm_facts(
+        &self,
+        node_id: &str,
+        facts: &crate::warm::WarmFacts,
+    ) -> std::collections::BTreeSet<String> {
+        let mut sent = self.0.warm_facts.lock().expect("warm facts lock");
+        let before = if facts.is_empty() {
+            sent.remove(node_id)
+        } else {
+            sent.insert(node_id.to_string(), facts.clone())
+        };
+        crate::warm::peers_to_wake(before.as_ref(), facts)
     }
 
     /// Registers the tunnel manager.
@@ -957,9 +1034,13 @@ impl NodeHub {
 
     /// Records `vm -> node` for every VM of a built snapshot, so a later
     /// deletion can still find the node after the row is gone.
+    ///
+    /// A `standby` entry is left out: it carries the id of the app's VM on
+    /// the source, which is where that VM's row and its deletion belong
+    /// (ADR 0174).
     fn remember_vms(&self, node_id: &str, spec: &wire::Spec) {
         let mut map = self.0.vm_nodes.lock().expect("vm map lock");
-        for vm in &spec.vms {
+        for vm in spec.vms.iter().filter(|vm| !vm.standby) {
             map.insert(vm.vm_id.clone(), node_id.to_string());
         }
     }
@@ -2388,6 +2469,7 @@ impl Session {
             self.last_spec.as_ref(),
             &mesh_lookup,
             &self.hub.0.drains,
+            &self.hub.reported_warm_targets(&self.node_id),
         )
         .await?;
         self.note_holdbacks(&built.held_back).await;
@@ -2462,7 +2544,7 @@ impl Session {
         let app_vms: Vec<(String, String)> = spec
             .vms
             .iter()
-            .filter(|vm| vm.app_id.is_some())
+            .filter(|vm| vm.app_id.is_some() && !vm.standby)
             .map(|vm| (vm.vm_id.clone(), vm.image_digest.clone()))
             .collect();
         if !app_vms.is_empty()
@@ -2475,6 +2557,15 @@ impl Session {
             );
         }
         self.desired_rev = rev;
+        // The other node of a warm pair whose entries changed builds its
+        // snapshot again, so both sides follow the same token, interval and
+        // source VMs (section 6.13, ADR 0174).
+        let facts = crate::warm::facts_of(&spec);
+        for peer in self.hub.swap_warm_facts(&self.node_id, &facts) {
+            if peer != self.node_id {
+                self.hub.node_changed(&peer);
+            }
+        }
         self.last_spec = Some(spec);
         self.hub.tunnel_changed(&self.node_id);
         Ok(())
@@ -2872,6 +2963,8 @@ async fn apply_status_report(
     report: &wire::StatusReport,
     notified_deleted: &mut HashSet<String>,
 ) -> Result<(), String> {
+    // First, so a database error on a VM below never loses it.
+    hub.apply_warm_report(node_id, &report.warm);
     for vm in &report.vms {
         let row = sqlx::query(
             "SELECT node_id, app_id, ip, observed_status, \

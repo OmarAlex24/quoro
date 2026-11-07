@@ -50,7 +50,7 @@ use base64::Engine as _;
 use quoro_proto::wire::{
     BuildLimits, DesiredStatus, EdgeBackend, EdgeRoute, HealthCheck, Spec, SpecBackup,
     SpecBackupRepository, SpecBuild, SpecEdge, SpecIngress, SpecNetwork, SpecRestore, SpecRoute,
-    SpecTunnel, SpecVm, SpecVolume, SpecVolumeFile, SpecVolumeState,
+    SpecTunnel, SpecVm, SpecVolume, SpecVolumeFile, SpecVolumeState, WarmRole,
 };
 use sqlx::sqlite::SqliteConnection;
 use sqlx::{Row, SqlitePool};
@@ -111,7 +111,10 @@ struct AppInfo {
 /// `mesh_lookup` supplies the session source addresses and the advertised
 /// URLs that `spec.mesh` needs (ADR 0144). `drains` holds the departed
 /// `tunnel` routes the machine keeps for a while (ADR 0194); a `tunnel` route
-/// of `previous` that this snapshot drops can start one.
+/// of `previous` that this snapshot drops can start one. `warm_copies` holds
+/// the `(volume_id, app_id)` of each copy the node last reported holding as
+/// a warm node, from the primary's memory (section 5.3): one that no failover
+/// can need any more gets a `deleted` entry.
 #[allow(clippy::too_many_arguments)]
 pub async fn build_spec(
     store: &Store,
@@ -122,6 +125,7 @@ pub async fn build_spec(
     previous: Option<&Spec>,
     mesh_lookup: &MeshLookup<'_>,
     drains: &Drains,
+    warm_copies: &[(String, String)],
 ) -> Result<BuiltSpec, String> {
     // An edge-only machine runs no VM and has no guest subnet (ADR 0144); a
     // node still waiting for its subnet cannot be sent a snapshot yet.
@@ -324,6 +328,8 @@ pub async fn build_spec(
     for file in &mut volumes {
         file.restore = restores.get(&file.volume_id).cloned();
     }
+    let pairs = crate::warm::load_pairs(store.pool()).await?;
+    warm_volumes(store.pool(), node_id, &pairs, warm_copies, &mut volumes).await?;
 
     let mut routes = build_routes(store.pool(), &apps, &vms).await?;
     let ingress = build_ingress(store.pool(), data_key, node_id).await?;
@@ -350,6 +356,10 @@ pub async fn build_spec(
     {
         edge.tunnel = None;
     }
+    // The warm node never serves the app (ADR 0174). A standby entry is
+    // `stopped`, which the routes and the drains skip already; it is added
+    // after them all the same, so neither ever reads it.
+    vms.extend(standby_vms(store, data_key, node_id, &pairs, &apps, resolver, cache).await?);
 
     Ok(BuiltSpec {
         spec: Spec {
@@ -366,6 +376,200 @@ pub async fn build_spec(
         },
         held_back,
     })
+}
+
+/// The warm parts of `spec.volumes` on `node_id` (sections 5.11 and 6.13,
+/// ADR 0173):
+/// - the source's `present` volume gets `warm` with `role: source`;
+/// - the warm node gets a `present` entry for the copy, with `role: target`
+///   and the volume's `size_gb`;
+/// - a copy the node reported holding (`reported`) that no failover can need
+///   any more gets a `deleted` entry ([`crate::warm::stale_copies`]). It
+///   carries no `warm`: the node removes it as its warm copy because it holds
+///   that copy and no volume row of its own. A copy whose pair is only
+///   incomplete gets no entry at all, and the node keeps it.
+///
+/// Entries stay ordered by volume id.
+async fn warm_volumes(
+    pool: &SqlitePool,
+    node_id: &str,
+    pairs: &[crate::warm::Pair],
+    reported: &[(String, String)],
+    volumes: &mut Vec<SpecVolumeFile>,
+) -> Result<(), String> {
+    for file in volumes.iter_mut() {
+        if file.state != SpecVolumeState::Present {
+            continue;
+        }
+        if let Some(pair) = pairs
+            .iter()
+            .find(|pair| pair.source == node_id && pair.volume_id == file.volume_id)
+        {
+            file.warm = Some(pair.entry(WarmRole::Source));
+        }
+    }
+    let stale = crate::warm::stale_copies(pool, node_id, reported, pairs).await?;
+    for pair in pairs.iter().filter(|pair| pair.target == node_id) {
+        if volumes.iter().any(|file| file.volume_id == pair.volume_id) {
+            continue;
+        }
+        volumes.push(SpecVolumeFile {
+            volume_id: pair.volume_id.clone(),
+            app_id: pair.app_id.clone(),
+            size_gb: pair.size_gb,
+            state: SpecVolumeState::Present,
+            restore: None,
+            warm: Some(pair.entry(WarmRole::Target)),
+        });
+    }
+    for copy in stale {
+        // A volume of the node's own is named already and never stale; this
+        // only keeps one entry per volume.
+        if volumes.iter().any(|file| file.volume_id == copy.volume_id) {
+            continue;
+        }
+        volumes.push(SpecVolumeFile {
+            volume_id: copy.volume_id,
+            app_id: copy.app_id,
+            size_gb: copy.size_gb,
+            state: SpecVolumeState::Deleted,
+            restore: None,
+            warm: None,
+        });
+    }
+    volumes.sort_by(|a, b| a.volume_id.cmp(&b.volume_id));
+    Ok(())
+}
+
+/// The warm node's `standby` entries (section 5.11, ADR 0174): for each pair
+/// whose warm node is `node_id`, the app's VM as its source runs it, with
+/// `standby` set, `desired_status` `stopped`, the app's lease and the copy
+/// attached. The node prepares its image and creates nothing.
+///
+/// - The VM is the one of the app's current deployment on the source, or the
+///   source's newest VM of the app while none matches.
+/// - Its digest is the one the source VM was given: the build's, or the one
+///   its deployment recorded, and resolved only while neither exists.
+/// - `env` is the app's, decrypted for this node, as for any VM entry.
+/// - An entry whose digest cannot be found yet is left out with a warning,
+///   never held back: a held-back VM fails its deployment, and the source VM
+///   runs on.
+async fn standby_vms(
+    store: &Store,
+    data_key: &DataKey,
+    node_id: &str,
+    pairs: &[crate::warm::Pair],
+    apps: &HashMap<String, AppInfo>,
+    resolver: &dyn DigestResolver,
+    cache: &DigestCache,
+) -> Result<Vec<SpecVm>, String> {
+    let mut vms = Vec::new();
+    let mut env_cache: HashMap<String, BTreeMap<String, String>> = HashMap::new();
+    for pair in pairs.iter().filter(|pair| pair.target == node_id) {
+        let rows = sqlx::query(
+            "SELECT id, project_id, name, image, vcpus, memory_mb, disk_gb, restart_generation \
+             FROM vms WHERE app_id = ? AND node_id = ? ORDER BY id",
+        )
+        .bind(&pair.app_id)
+        .bind(&pair.source)
+        .fetch_all(store.pool())
+        .await
+        .map_err(|e| format!("cannot read the source VM of {}: {e}", pair.app_id))?;
+        let Some(app) = apps.get(&pair.app_id) else {
+            continue;
+        };
+        let deployments = deploy::deployments_for_node(store, &pair.source)
+            .await
+            .map_err(|e| format!("cannot link the source VMs to their deployments: {e}"))?;
+        let mut current = None;
+        for row in &rows {
+            let vm_id: String = row.try_get("id").map_err(|e| e.to_string())?;
+            if deployments.get(&vm_id).is_some_and(|deployment| {
+                app.current_deployment_id.as_deref() == Some(deployment.id.as_str())
+            }) {
+                current = Some(row);
+                break;
+            }
+        }
+        let Some(row) = current.or_else(|| rows.last()) else {
+            continue;
+        };
+        let vm_id: String = row.try_get("id").map_err(|e| e.to_string())?;
+        let image: String = row.try_get("image").map_err(|e| e.to_string())?;
+        let build_id = crate::build::build_id_of_image(&image).map(str::to_string);
+        let deployment = deployments.get(&vm_id);
+        let known = match &build_id {
+            Some(build_id) => {
+                let digest: Option<Option<String>> =
+                    sqlx::query_scalar("SELECT image_digest FROM builds WHERE id = ?")
+                        .bind(build_id)
+                        .fetch_optional(store.pool())
+                        .await
+                        .map_err(|e| e.to_string())?;
+                digest.flatten()
+            }
+            None => None,
+        }
+        .or_else(|| deployment.and_then(|deployment| deployment.image_digest.clone()));
+        let image_digest = match known {
+            Some(digest) => digest,
+            None if build_id.is_some() => {
+                tracing::warn!(vm_id, image, "the build of a standby VM has no digest yet");
+                continue;
+            }
+            None => match resolve_digest(resolver, cache, &image).await {
+                Ok(digest) => digest,
+                Err(e) => {
+                    tracing::warn!(vm_id, image, error = %e, "cannot resolve the image of a standby VM yet");
+                    continue;
+                }
+            },
+        };
+        let vcpus: i64 = row.try_get("vcpus").map_err(|e| e.to_string())?;
+        let memory_mb: i64 = row.try_get("memory_mb").map_err(|e| e.to_string())?;
+        let disk_gb: i64 = row.try_get("disk_gb").map_err(|e| e.to_string())?;
+        let restart_generation: i64 = row
+            .try_get("restart_generation")
+            .map_err(|e| e.to_string())?;
+        // A connection only for the values, as the other queries here use
+        // the pool.
+        let env = {
+            let mut conn = store
+                .pool()
+                .acquire()
+                .await
+                .map_err(|e| format!("cannot open a connection: {e}"))?;
+            app_env_of(&mut conn, data_key, &pair.app_id, &mut env_cache).await?
+        };
+        vms.push(SpecVm {
+            vm_id,
+            project_id: row.try_get("project_id").map_err(|e| e.to_string())?,
+            app_id: Some(pair.app_id.clone()),
+            deployment_id: deployment.map(|deployment| deployment.id.clone()),
+            name: row.try_get("name").map_err(|e| e.to_string())?,
+            image,
+            image_digest,
+            vcpus: u32::try_from(vcpus).map_err(|e| format!("vms.vcpus: {e}"))?,
+            memory_mb: u32::try_from(memory_mb).map_err(|e| format!("vms.memory_mb: {e}"))?,
+            disk_gb: u32::try_from(disk_gb).map_err(|e| format!("vms.disk_gb: {e}"))?,
+            port: Some(app.port),
+            env,
+            health_check: app.health_check.clone(),
+            desired_status: DesiredStatus::Stopped,
+            standby: true,
+            restart_generation: u64::try_from(restart_generation.max(0)).unwrap_or(0),
+            stateful: true,
+            lease_id: Some(pair.lease_id.clone()),
+            fencing_token: Some(pair.fencing_token),
+            volumes: vec![SpecVolume {
+                volume_id: pair.volume_id.clone(),
+                serial: "quoro-vol-0".to_string(),
+                mount_path: pair.mount_path.clone(),
+            }],
+            build_id,
+        });
+    }
+    Ok(vms)
 }
 
 /// `spec.backups`, `spec.volumes[].restore` and `spec.backup_repository`
@@ -1184,6 +1388,7 @@ async fn resolve_digest(
 mod tests {
     use super::*;
     use crate::ReferenceAsDigest;
+    use quoro_proto::wire::SpecWarm;
     use quoro_types::{Prefix, new_id};
 
     /// A mesh lookup that knows no session address and no advertised URL, so
@@ -1271,6 +1476,7 @@ mod tests {
             None,
             &no_mesh_lookup(),
             &Drains::default(),
+            &[],
         )
         .await
         .unwrap();
@@ -1334,6 +1540,7 @@ mod tests {
             None,
             &no_mesh_lookup(),
             &Drains::default(),
+            &[],
         )
         .await
         .unwrap();
@@ -1358,6 +1565,7 @@ mod tests {
                 None,
                 &no_mesh_lookup(),
                 &Drains::default(),
+                &[],
             )
             .await
             .is_err()
@@ -1378,6 +1586,7 @@ mod tests {
             Some(&previous),
             &no_mesh_lookup(),
             &Drains::default(),
+            &[],
         )
         .await
         .unwrap();
@@ -1542,6 +1751,7 @@ mod tests {
             None,
             &no_mesh_lookup(),
             &Drains::default(),
+            &[],
         )
         .await
         .unwrap()
@@ -1561,6 +1771,7 @@ mod tests {
             None,
             &no_mesh_lookup(),
             &Drains::default(),
+            &[],
         )
         .await
         .unwrap()
@@ -1617,6 +1828,7 @@ mod tests {
             None,
             &no_mesh_lookup(),
             &Drains::default(),
+            &[],
         )
         .await
         .unwrap()
@@ -1634,6 +1846,7 @@ mod tests {
             None,
             &no_mesh_lookup(),
             &Drains::default(),
+            &[],
         )
         .await
         .unwrap()
@@ -1704,6 +1917,7 @@ mod tests {
             previous,
             &no_mesh_lookup(),
             &Drains::default(),
+            &[],
         )
         .await
         .unwrap()
@@ -1861,6 +2075,7 @@ mod tests {
             previous,
             &no_mesh_lookup(),
             drains,
+            &[],
         )
         .await
         .unwrap()
@@ -2148,5 +2363,346 @@ mod tests {
         let second = drained_spec(&store, &key, &drains, node, Some(&first)).await;
         assert!(second.routes.is_empty(), "{:?}", second.routes);
         assert!(drains.next_end().is_none());
+    }
+
+    const SOURCE: &str = "nod_0000000000000000000000000S";
+    const TARGET: &str = "nod_0000000000000000000000000T";
+
+    /// Two `reflink` nodes on the mesh and a `warm` app on the first: its VM,
+    /// a `ready` volume, a lease the first node holds with token 4, and the
+    /// second node as its warm node. Returns `(app_id, vm_id, volume_id)`.
+    async fn warm_app(store: &Store) -> (String, String, String) {
+        insert_node(store, SOURCE, &["node"], Some("10.42.1.0/24")).await;
+        insert_node(store, TARGET, &["node"], Some("10.42.2.0/24")).await;
+        for (node, address) in [(SOURCE, "10.43.0.2"), (TARGET, "10.43.0.3")] {
+            sqlx::query(
+                "UPDATE nodes SET mesh_address = ?, volume_snapshot = 'reflink' WHERE id = ?",
+            )
+            .bind(address)
+            .bind(node)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+        let project_id = insert_project(store, "warm").await;
+        let app_id = deploy::new_id_with_prefix("app");
+        insert_app(store, &project_id, &app_id, "db", 1).await;
+        sqlx::query(
+            "UPDATE apps SET stateful = 1, ha_policy = 'warm', warm_node_id = ? WHERE id = ?",
+        )
+        .bind(TARGET)
+        .bind(&app_id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let vm_id = "vm_0000000000000000000000000A".to_owned();
+        insert_app_vm(
+            store,
+            &project_id,
+            &app_id,
+            SOURCE,
+            &vm_id,
+            "db-1",
+            Some("10.42.1.5"),
+        )
+        .await;
+        let volume_id = insert_volume(store, &app_id, SOURCE, "ready").await;
+        sqlx::query(
+            "INSERT INTO leases (id, resource_type, resource_id, holder_node_id, mode, \
+             fencing_token, granted_at) VALUES ('lse_w', 'app', ?, ?, 'local', 4, ?)",
+        )
+        .bind(&app_id)
+        .bind(SOURCE)
+        .bind(crate::store::now_rfc3339())
+        .execute(store.pool())
+        .await
+        .unwrap();
+        (app_id, vm_id, volume_id)
+    }
+
+    /// The snapshot of a node that reported holding `copies` as a warm node.
+    async fn spec_with_copies(store: &Store, node_id: &str, copies: &[(String, String)]) -> Spec {
+        spec_keyed(store, &DataKey::ephemeral(), node_id, copies).await
+    }
+
+    async fn spec_keyed(
+        store: &Store,
+        key: &DataKey,
+        node_id: &str,
+        copies: &[(String, String)],
+    ) -> Spec {
+        build_spec(
+            store,
+            node_id,
+            &ReferenceAsDigest,
+            &DigestCache::default(),
+            key,
+            None,
+            &no_mesh_lookup(),
+            &Drains::default(),
+            copies,
+        )
+        .await
+        .unwrap()
+        .spec
+    }
+
+    #[tokio::test]
+    async fn both_nodes_of_a_warm_app_get_their_part_and_the_warm_node_a_standby_vm() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (app_id, vm_id, volume_id) = warm_app(&store).await;
+        insert_domain(&store, "dom_w", &app_id, "db.example.com", "acme").await;
+        let key = DataKey::ephemeral();
+        sqlx::query(
+            "INSERT INTO app_env (app_id, name, value_enc, updated_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(&app_id)
+        .bind("DATABASE_PASSWORD")
+        .bind(crate::app_env::encrypt_value(
+            &key,
+            &app_id,
+            "DATABASE_PASSWORD",
+            "s3cret",
+        ))
+        .bind(crate::store::now_rfc3339())
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let source = spec_keyed(&store, &key, SOURCE, &[]).await;
+        assert_eq!(source.volumes.len(), 1);
+        assert_eq!(
+            source.volumes[0].warm,
+            Some(SpecWarm {
+                role: WarmRole::Source,
+                peer_node_id: TARGET.to_owned(),
+                peer_address: "10.43.0.3".to_owned(),
+                port: 51822,
+                interval_s: 30,
+                lease_id: "lse_w".to_owned(),
+                fencing_token: 4,
+            })
+        );
+        let running = &source.vms[0];
+        assert!(!running.standby);
+        assert_eq!(running.desired_status, DesiredStatus::Running);
+        assert_eq!(source.routes.len(), 1, "the source serves the app");
+
+        let target = spec_keyed(&store, &key, TARGET, &[]).await;
+        assert_eq!(
+            target.volumes,
+            vec![SpecVolumeFile {
+                volume_id: volume_id.clone(),
+                app_id: app_id.clone(),
+                size_gb: 1,
+                state: SpecVolumeState::Present,
+                restore: None,
+                warm: Some(SpecWarm {
+                    role: WarmRole::Target,
+                    peer_node_id: SOURCE.to_owned(),
+                    peer_address: "10.43.0.2".to_owned(),
+                    port: 51822,
+                    interval_s: 30,
+                    lease_id: "lse_w".to_owned(),
+                    fencing_token: 4,
+                }),
+            }]
+        );
+        assert_eq!(target.vms.len(), 1);
+        let standby = &target.vms[0];
+        assert_eq!(standby.vm_id, vm_id, "the app's VM, under its own id");
+        assert!(standby.standby);
+        assert_eq!(standby.desired_status, DesiredStatus::Stopped);
+        assert_eq!(standby.image_digest, running.image_digest);
+        assert_eq!(
+            (standby.vcpus, standby.memory_mb, standby.disk_gb),
+            (running.vcpus, running.memory_mb, running.disk_gb)
+        );
+        assert!(standby.stateful);
+        assert_eq!(standby.lease_id.as_deref(), Some("lse_w"));
+        assert_eq!(standby.fencing_token, Some(4));
+        assert_eq!(
+            standby.volumes,
+            vec![SpecVolume {
+                volume_id,
+                serial: "quoro-vol-0".to_owned(),
+                mount_path: "/data".to_owned(),
+            }]
+        );
+        assert_eq!(standby.env, running.env, "section 5.11: the app's values");
+        assert_eq!(
+            standby.env.get("DATABASE_PASSWORD").map(String::as_str),
+            Some("s3cret")
+        );
+        assert!(
+            target.routes.is_empty(),
+            "the warm node never serves the app"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_warm_app_gets_no_warm_entries_until_its_pair_is_complete() {
+        // Each case undoes one part of a complete pair.
+        let cases: [(&str, &str); 7] = [
+            ("no lease", "DELETE FROM leases"),
+            (
+                "a revoked lease",
+                "UPDATE leases SET revoked_at = '2026-11-07T10:00:00Z'",
+            ),
+            (
+                "a lease another node holds",
+                "UPDATE leases SET holder_node_id = 'nod_0000000000000000000000000T'",
+            ),
+            (
+                "a warm node that snapshots with pause_copy",
+                "UPDATE nodes SET volume_snapshot = 'pause_copy' \
+                 WHERE id = 'nod_0000000000000000000000000T'",
+            ),
+            (
+                "a source whose snapshot method is not known yet",
+                "UPDATE nodes SET volume_snapshot = NULL \
+                 WHERE id = 'nod_0000000000000000000000000S'",
+            ),
+            (
+                "a warm node without a mesh address",
+                "UPDATE nodes SET mesh_address = NULL WHERE id = 'nod_0000000000000000000000000T'",
+            ),
+            (
+                "a volume that is not ready",
+                "UPDATE volumes SET state = 'creating'",
+            ),
+        ];
+        for (case, undo) in cases {
+            let store = Store::open_in_memory().await.unwrap();
+            warm_app(&store).await;
+            sqlx::query(undo).execute(store.pool()).await.unwrap();
+            let source = spec_on(&store, SOURCE, None).await;
+            assert!(
+                source.volumes.iter().all(|file| file.warm.is_none()),
+                "{case}: {:?}",
+                source.volumes
+            );
+            let target = spec_on(&store, TARGET, None).await;
+            assert!(target.volumes.is_empty(), "{case}: {:?}", target.volumes);
+            assert!(target.vms.is_empty(), "{case}: {:?}", target.vms);
+        }
+    }
+
+    /// `(volume_id, state, carries warm)` of each entry of `spec.volumes`.
+    fn volume_states(spec: &Spec) -> Vec<(&str, SpecVolumeState, bool)> {
+        spec.volumes
+            .iter()
+            .map(|file| (file.volume_id.as_str(), file.state, file.warm.is_some()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_copy_the_node_reported_but_no_longer_targets_is_deleted() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (app_id, _, volume_id) = warm_app(&store).await;
+        let reported = vec![
+            (volume_id.clone(), app_id.clone()),
+            ("vol_gone".to_owned(), "app_gone".to_owned()),
+        ];
+        let target = spec_with_copies(&store, TARGET, &reported).await;
+        let mut expected = vec![
+            (volume_id.as_str(), SpecVolumeState::Present, true),
+            ("vol_gone", SpecVolumeState::Deleted, false),
+        ];
+        expected.sort_by(|a, b| a.0.cmp(b.0));
+        assert_eq!(volume_states(&target), expected);
+
+        // The app leaves `warm`: its copy on the old warm node is deleted,
+        // with the volume's size, and the standby VM goes.
+        sqlx::query("UPDATE volumes SET size_gb = 3")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE apps SET ha_policy = 'none', warm_node_id = NULL")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let target = spec_with_copies(&store, TARGET, &reported[..1]).await;
+        assert_eq!(target.volumes.len(), 1);
+        assert_eq!(target.volumes[0].state, SpecVolumeState::Deleted);
+        assert_eq!(target.volumes[0].size_gb, 3);
+        assert!(target.vms.is_empty());
+        let source = spec_on(&store, SOURCE, None).await;
+        assert_eq!(source.volumes[0].warm, None);
+        assert_eq!(source.volumes[0].state, SpecVolumeState::Present);
+
+        // The source's own volume is never deleted for a report of it.
+        let source = spec_with_copies(&store, SOURCE, &reported[..1]).await;
+        assert_eq!(source.volumes[0].state, SpecVolumeState::Present);
+    }
+
+    #[tokio::test]
+    async fn the_warm_node_keeps_its_copy_until_no_failover_can_need_it() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (app_id, _, volume_id) = warm_app(&store).await;
+        let held = vec![(volume_id.clone(), app_id.clone())];
+        let run = |sql: &'static str| {
+            let pool = store.pool().clone();
+            async move { sqlx::query(sql).execute(&pool).await.unwrap() }
+        };
+        let kept = |spec: &Spec, why: &str| {
+            assert!(spec.volumes.is_empty(), "{why}: {:?}", spec.volumes);
+            assert!(spec.vms.is_empty(), "{why}: {:?}", spec.vms);
+        };
+
+        // A fence or a restore revokes the lease, and the source's volume
+        // fails: the copy may be the only good data, so it gets no entry at
+        // all, and the warm node keeps it.
+        run("UPDATE leases SET revoked_at = '2026-11-07T10:00:00Z'").await;
+        kept(
+            &spec_with_copies(&store, TARGET, &held).await,
+            "a revoked lease",
+        );
+        run("UPDATE volumes SET state = 'failed'").await;
+        kept(
+            &spec_with_copies(&store, TARGET, &held).await,
+            "a failed volume",
+        );
+        run("UPDATE apps SET warm_node_id = NULL").await;
+        kept(
+            &spec_with_copies(&store, TARGET, &held).await,
+            "no warm node",
+        );
+        // Leaving `warm` while the source is fenced keeps it too.
+        run("UPDATE apps SET ha_policy = 'none'").await;
+        kept(
+            &spec_with_copies(&store, TARGET, &held).await,
+            "left warm, fenced",
+        );
+
+        // A healthy source and another warm node: the copy is deleted. The
+        // new warm node starts its own first copy from the source.
+        run("UPDATE leases SET revoked_at = NULL").await;
+        run("UPDATE volumes SET state = 'ready'").await;
+        insert_node(&store, "nod_0000000000000000000000000X", &["node"], None).await;
+        run("UPDATE apps SET ha_policy = 'warm', warm_node_id = 'nod_0000000000000000000000000X'")
+            .await;
+        let target = spec_with_copies(&store, TARGET, &held).await;
+        assert_eq!(
+            volume_states(&target),
+            vec![(volume_id.as_str(), SpecVolumeState::Deleted, false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_standby_vm_is_the_sources_newest_vm_until_one_belongs_to_the_current_deployment() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (app_id, first, _) = warm_app(&store).await;
+        let project_id: String = sqlx::query_scalar("SELECT project_id FROM apps WHERE id = ?")
+            .bind(&app_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        let newer = "vm_0000000000000000000000000B".to_owned();
+        assert!(newer > first);
+        insert_app_vm(&store, &project_id, &app_id, SOURCE, &newer, "db-2", None).await;
+        let target = spec_on(&store, TARGET, None).await;
+        assert_eq!(target.vms.len(), 1);
+        assert_eq!(target.vms[0].vm_id, newer);
     }
 }
