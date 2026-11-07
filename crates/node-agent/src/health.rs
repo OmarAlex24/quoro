@@ -131,6 +131,10 @@ impl HealthTarget {
 /// reconciler reads the marks; both hold a clone.
 #[derive(Clone, Debug, Default)]
 pub struct PausedVms {
+    /// A VM's entry stays after its last mark is released: removing it would
+    /// start `pauses` from zero again, and a later count equal to the one the
+    /// reconciler last saw would hide a pause. One small entry per VM ever
+    /// backed up since the agent started.
     marks: Arc<Mutex<HashMap<String, PauseMark>>>,
 }
 

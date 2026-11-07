@@ -185,9 +185,9 @@ struct HealthState {
     run_ended: bool,
     /// A health restart was already asked for this run.
     restart_asked: bool,
-    /// The VM's [`crate::health::PauseMark::pauses`] when its last probe was
-    /// counted. Another value means it was paused since, so its failures
-    /// count from zero (D-0259).
+    /// The VM's [`crate::health::PauseMark::pauses`] after its last probe.
+    /// Another value means it was paused since, so its failures count from
+    /// zero and a restart asked before the pause is dropped (D-0259).
     pauses_seen: u64,
 }
 
@@ -1215,18 +1215,24 @@ impl<E: Engine + 'static> Reconciler<E> {
         // stop and the start leaves it stopped (section 6.4). A fence of the
         // lease stops the VM itself (section 8.5), so a VM it is stopping is
         // left to it. A VM a backup paused is not restarted for its health
-        // (D-0259).
+        // (D-0259): not while it is paused, nor for failures from before a
+        // pause that began after the probe that asked for the restart.
         if self.health_restarts.contains(&vm_id) {
-            let still_failing = self.health.get(&vm_id).is_some_and(|state| {
-                state.status == Health::Failing
-                    && HealthTarget::for_vm(vm, state.target.ip)
-                        .is_some_and(|target| target.probes_like(&state.target))
-            });
+            let mark = self.paused.mark_of(&vm_id);
+            let (still_failing, paused_since) =
+                self.health.get(&vm_id).map_or((false, false), |state| {
+                    (
+                        state.status == Health::Failing
+                            && HealthTarget::for_vm(vm, state.target.ip)
+                                .is_some_and(|target| target.probes_like(&state.target)),
+                        mark.held > 0 || mark.pauses != state.pauses_seen,
+                    )
+                });
             if vm.desired_status != DesiredStatus::Running
                 || info.state != VmState::Running
                 || !restarts_when_unhealthy(vm)
                 || !still_failing
-                || self.paused.mark_of(&vm_id).held > 0
+                || paused_since
             {
                 self.drop_health_restart(&vm_id);
             } else if self.fence_owns_stop(vm) {
@@ -3237,8 +3243,8 @@ mod tests {
     }
 
     /// D-0259: a VM a backup paused is not restarted for its health. A
-    /// restart asked before the pause is dropped, failed probes during the
-    /// pause do not count, and after the pause the count starts again.
+    /// restart asked before the pause is dropped, none is carried out while
+    /// the VM stays paused, and after the pause a counted failure restarts it.
     #[tokio::test]
     async fn a_vm_paused_for_a_backup_is_not_restarted_for_its_health() {
         use quoro_engine::FakeEngine;
@@ -3321,6 +3327,184 @@ mod tests {
         assert!(engine.stop_calls().is_empty());
 
         // A second one after it: failing, and restarted.
+        tokio::time::sleep(NEXT_PROBE).await;
+        let statuses = reconciler.reconcile_once(Some(&snapshot)).await;
+        assert_eq!(statuses[0].health, Health::Failing);
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        assert_eq!(engine.stop_calls().len(), 1);
+        server.abort();
+    }
+
+    /// A health server for `vm_health` that counts the requests it gets.
+    /// While `pause_in_probe` is set, a pause of the VM begins and ends
+    /// before each answer, as a backup's would while the probe waits.
+    async fn pausing_server(
+        healthy: Arc<std::sync::atomic::AtomicBool>,
+        paused: crate::health::PausedVms,
+        pause_in_probe: Arc<std::sync::atomic::AtomicBool>,
+        requests: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = [0u8; 512];
+                let _ = socket.read(&mut buffer).await;
+                requests.fetch_add(1, Ordering::SeqCst);
+                if pause_in_probe.load(Ordering::SeqCst) {
+                    drop(paused.mark("vm_health"));
+                }
+                let status = if healthy.load(Ordering::SeqCst) {
+                    "200 OK"
+                } else {
+                    "503 Service Unavailable"
+                };
+                let _ = socket
+                    .write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes())
+                    .await;
+            }
+        });
+        (port, server)
+    }
+
+    /// D-0259: a restart asked just before a pause that is over by the next
+    /// pass is dropped too. Its failures are from before the pause, and once
+    /// a paused VM resumes they count from zero, whatever the pause's length.
+    #[tokio::test]
+    async fn a_restart_asked_before_a_short_pause_is_dropped_when_the_vm_resumes() {
+        use quoro_engine::FakeEngine;
+
+        let healthy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (port, server) = switchable_server(Arc::clone(&healthy)).await;
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let engine = Arc::new(FakeEngine::new());
+        let paused = crate::health::PausedVms::default();
+        let mut reconciler =
+            health_reconciler(Arc::clone(&engine), store.clone(), Duration::from_millis(1))
+                .with_paused_vms(paused.clone());
+        let snapshot = health_snapshot_with(port, check(0, None));
+
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        tokio::time::sleep(NEXT_PROBE).await;
+        // This pass's probe fails and asks for a restart; a backup pauses
+        // the VM and resumes it before the next pass.
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        drop(paused.mark("vm_health"));
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        assert!(
+            engine.stop_calls().is_empty(),
+            "not stopped for failures from before the pause"
+        );
+
+        // A failure after the pause counts, and asks again.
+        tokio::time::sleep(NEXT_PROBE).await;
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        assert_eq!(engine.stop_calls().len(), 1);
+        server.abort();
+    }
+
+    /// D-0259: a paused VM is not probed, so its check does not turn
+    /// `failing` and emits no `app.down` while the pause lasts. The first
+    /// failure after the pause counts.
+    #[tokio::test]
+    async fn a_paused_vm_is_not_probed_and_does_not_turn_failing() {
+        use quoro_engine::FakeEngine;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let healthy = Arc::new(AtomicBool::new(true));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let paused = crate::health::PausedVms::default();
+        let (port, server) = pausing_server(
+            Arc::clone(&healthy),
+            paused.clone(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&requests),
+        )
+        .await;
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let engine = Arc::new(FakeEngine::new());
+        let mut reconciler =
+            health_reconciler(Arc::clone(&engine), store.clone(), Duration::from_millis(1))
+                .with_paused_vms(paused.clone());
+        let snapshot = health_snapshot_with(port, check(0, None));
+
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        tokio::time::sleep(NEXT_PROBE).await;
+        let statuses = reconciler.reconcile_once(Some(&snapshot)).await;
+        assert_eq!(statuses[0].health, Health::Passing);
+
+        // A backup pauses the VM, which would fail every probe now.
+        let mark = paused.mark("vm_health");
+        healthy.store(false, Ordering::SeqCst);
+        let probed = requests.load(Ordering::SeqCst);
+        for _ in 0..2 {
+            tokio::time::sleep(NEXT_PROBE).await;
+            let statuses = reconciler.reconcile_once(Some(&snapshot)).await;
+            assert_eq!(statuses[0].health, Health::Passing);
+        }
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            probed,
+            "a paused VM is not probed"
+        );
+        assert!(app_events(&store).await.is_empty(), "no app.down");
+        assert!(engine.stop_calls().is_empty());
+
+        drop(mark);
+        tokio::time::sleep(NEXT_PROBE).await;
+        let statuses = reconciler.reconcile_once(Some(&snapshot)).await;
+        assert_eq!(statuses[0].health, Health::Failing);
+        assert_eq!(app_events(&store).await, ["app.down"]);
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        assert_eq!(engine.stop_calls().len(), 1);
+        server.abort();
+    }
+
+    /// D-0259: a failed probe that a pause overlapped does not count, even
+    /// when the pause began and ended while the probe waited for its answer.
+    #[tokio::test]
+    async fn a_failed_probe_a_pause_overlapped_does_not_count() {
+        use quoro_engine::FakeEngine;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let pause_in_probe = Arc::new(AtomicBool::new(true));
+        let paused = crate::health::PausedVms::default();
+        let (port, server) = pausing_server(
+            Arc::new(AtomicBool::new(false)),
+            paused.clone(),
+            Arc::clone(&pause_in_probe),
+            Arc::clone(&requests),
+        )
+        .await;
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let engine = Arc::new(FakeEngine::new());
+        let mut reconciler =
+            health_reconciler(Arc::clone(&engine), store.clone(), Duration::from_millis(1))
+                .with_paused_vms(paused.clone());
+        let snapshot = health_snapshot_with(port, check(0, None));
+
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        for _ in 0..2 {
+            tokio::time::sleep(NEXT_PROBE).await;
+            let statuses = reconciler.reconcile_once(Some(&snapshot)).await;
+            assert_ne!(statuses[0].health, Health::Failing);
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 2, "both were probed");
+        assert!(engine.stop_calls().is_empty());
+
+        // The same failure with no pause during the probe counts.
+        pause_in_probe.store(false, Ordering::SeqCst);
         tokio::time::sleep(NEXT_PROBE).await;
         let statuses = reconciler.reconcile_once(Some(&snapshot)).await;
         assert_eq!(statuses[0].health, Health::Failing);
