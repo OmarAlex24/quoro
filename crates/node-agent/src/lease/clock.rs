@@ -179,6 +179,23 @@ pub struct ManualHostClock {
     /// Counts the suspends, so a [`HostClock::sleep`] ends at one, as a timer
     /// on `CLOCK_BOOTTIME` does when the host wakes.
     suspends: Arc<watch::Sender<u64>>,
+    /// A suspend [`Self::suspend_when`] armed.
+    armed: Arc<Mutex<Option<ArmedSuspend>>>,
+}
+
+/// A suspend that begins at the first read of `CLOCK_BOOTTIME` at which
+/// `when` holds.
+struct ArmedSuspend {
+    slept: Duration,
+    when: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl std::fmt::Debug for ArmedSuspend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArmedSuspend")
+            .field("slept", &self.slept)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -200,6 +217,7 @@ impl ManualHostClock {
                 origin: Instant::now(),
             })),
             suspends: Arc::new(watch::Sender::new(0)),
+            armed: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -228,6 +246,53 @@ impl ManualHostClock {
         self.lock().at_origin += slept;
     }
 
+    /// Models a suspend of `slept`, as [`Self::suspend`] does, that begins at
+    /// the first read of `CLOCK_BOOTTIME` at which `when` holds, just before
+    /// that read. A test uses it to put a suspend between two steps of the
+    /// lease service that no test can reach between. `when` runs on every
+    /// read until it holds, with no lock of this clock held but under
+    /// whatever lock the reader holds. So it must not read this clock, nor
+    /// take a lock a reader may hold while it reads this clock, such as the
+    /// lease table's. A lock it does take must come after those in every
+    /// lock order: the lease service takes its fence sets after the table, so
+    /// `LeaseView::fence_owns_stop` is fine.
+    pub fn suspend_when(&self, slept: Duration, when: impl Fn() -> bool + Send + Sync + 'static) {
+        *self.armed_lock() = Some(ArmedSuspend {
+            slept,
+            when: Arc::new(when),
+        });
+    }
+
+    /// The suspend [`Self::suspend_when`] armed, once its condition holds.
+    /// `CLOCK_BOOTTIME` jumps in the same critical section that disarms it,
+    /// so no reader sees the suspend disarmed and the clock not yet moved.
+    fn fire_armed(&self) {
+        let Some(when) = self
+            .armed_lock()
+            .as_ref()
+            .map(|armed| Arc::clone(&armed.when))
+        else {
+            return;
+        };
+        if !when() {
+            return;
+        }
+        {
+            let mut armed = self.armed_lock();
+            let Some(fired) = armed.take_if(|armed| Arc::ptr_eq(&armed.when, &when)) else {
+                return;
+            };
+            self.lock().at_origin += fired.slept;
+        }
+        self.suspends.send_modify(|count| *count += 1);
+    }
+
+    fn armed_lock(&self) -> std::sync::MutexGuard<'_, Option<ArmedSuspend>> {
+        self.armed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, ManualInner> {
         self.inner
             .lock()
@@ -241,6 +306,7 @@ impl HostClock for ManualHostClock {
     }
 
     fn boottime(&self) -> Option<Duration> {
+        self.fire_armed();
         let inner = self.lock();
         Some(inner.at_origin + Instant::now().saturating_duration_since(inner.origin))
     }
