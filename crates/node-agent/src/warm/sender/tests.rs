@@ -42,6 +42,29 @@ const SIZE: u64 = GIB;
 const LAST_CELL: u64 = SIZE / CELL - 1;
 const TOKEN: u64 = 5;
 
+/// The target's timings here: `quick()`, but with the production frame
+/// timeout. No test here stalls a stream, so the timeout checks nothing in
+/// these tests; at 500 ms, a loaded machine's file IO on the source reaches
+/// it between two frames and the target drops a sound stream as
+/// `bad_frame`. The receiver's own tests stall streams and keep 500 ms.
+fn target_options() -> ReceiverOptions {
+    ReceiverOptions {
+        frame_timeout: ReceiverOptions::default().frame_timeout,
+        ..ReceiverOptions::quick()
+    }
+}
+
+/// The source's timings here: `quick()` cycles, with the production stall
+/// timeout, for the same reason. No test here makes the target stop
+/// reading, and the target's store writes can pause its reads for seconds
+/// on a loaded disk.
+fn source_options() -> SenderOptions {
+    SenderOptions {
+        stall_timeout: SenderOptions::default().stall_timeout,
+        ..SenderOptions::quick()
+    }
+}
+
 /// A scratch directory, removed on drop: under `QUORO_TEST_REFLINK_DIR`
 /// when it is set, so holes and clones run on the filesystem warm copies
 /// live on; under the workspace `target/` otherwise.
@@ -183,7 +206,7 @@ impl Target {
             desired_rx,
             locks.clone(),
             board,
-            ReceiverOptions::quick(),
+            target_options(),
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -373,7 +396,7 @@ impl Source {
             leases.clone(),
             locks.clone(),
             board.clone(),
-            SenderOptions::quick(),
+            source_options(),
         );
         let volume = scratch.0.join("volumes").join(VOL);
         Self {
@@ -399,7 +422,7 @@ impl Source {
             self.leases.clone(),
             self.locks.clone(),
             self.board.clone(),
-            SenderOptions::quick(),
+            source_options(),
         );
     }
 
@@ -829,7 +852,22 @@ async fn a_failure_on_the_target_deletes_the_snapshot_and_the_next_cycle_ships_f
         panic!("a failed cycle");
     };
     assert!(error.contains("500"), "{error}");
-    assert_eq!(target.complete_seq().await, Some(1));
+    // The target answers before it resolves its copy, which hashes the whole
+    // volume, and holds the volume's lock until then; a cycle that came
+    // before would be refused `busy`.
+    drop(
+        tokio::time::timeout(Duration::from_secs(300), target.locks.lock(VOL))
+            .await
+            .expect("the target releases the volume's lock"),
+    );
+    let row = target
+        .store
+        .warm_target(VOL)
+        .await
+        .expect("store")
+        .expect("the row");
+    assert!(row.pending.is_none(), "the target resolved its copy");
+    assert_eq!(row.complete_seq, Some(1));
     assert_eq!(
         source.kept().await,
         vec![base_entry(KeepPurpose::WarmBase, 1)]

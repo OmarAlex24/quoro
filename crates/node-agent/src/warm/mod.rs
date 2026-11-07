@@ -19,9 +19,10 @@ pub mod sender;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
+use std::os::unix::fs::FileExt as _;
 use std::sync::{Arc, Mutex as StdMutex};
 
-use quoro_backup::cells::{CELL, CellHashes};
+use quoro_backup::cells::{CELL, CellHashes, hash_cell, zero_cell_hash};
 use quoro_proto::wire::WarmStatus;
 use rustix::fs::SeekFrom;
 use rustix::io::Errno;
@@ -143,9 +144,23 @@ pub fn data_segments(file: &File, start: u64, end: u64) -> std::io::Result<Vec<(
     Ok(segments)
 }
 
+/// One cell of zeros to compare with.
+static ZERO_CELL: [u8; CELL as usize] = [0; CELL as usize];
+
+/// Whether `bytes` are all zeros. One slice comparison per cell, which is a
+/// `memcmp`: many times faster than a byte-by-byte scan, above all in a debug
+/// build.
+pub fn is_zero(bytes: &[u8]) -> bool {
+    bytes
+        .chunks(ZERO_CELL.len())
+        .all(|chunk| chunk == &ZERO_CELL[..chunk.len()])
+}
+
 /// The cell hashes of a copy of `size` bytes, reading only the cells its
 /// data reaches ([`data_segments`]): a hole reads as zeros, so a cell no
-/// data reaches has the zero cell's hash. Blocking IO.
+/// data reaches has the zero cell's hash, and so does a cell of zeros, which
+/// is not hashed again. A filesystem that reports holes as data then costs a
+/// read of the copy, not a hash of every byte of it. Blocking IO.
 ///
 /// # Errors
 ///
@@ -165,8 +180,18 @@ pub fn hash_copy(file: &File, size: u64) -> std::io::Result<CellHashes> {
     for (start, stop) in data_segments(file, 0, size)? {
         with_data.extend(start / CELL..stop.div_ceil(CELL));
     }
-    let mut reader = file;
-    cells.rehash(&mut reader, with_data)?;
+    let mut buf = vec![0_u8; ZERO_CELL.len()];
+    for cell in with_data {
+        file.read_exact_at(&mut buf, cell * CELL)?;
+        let hash = if is_zero(&buf) {
+            zero_cell_hash()
+        } else {
+            hash_cell(&buf)
+        };
+        cells
+            .set(cell, hash)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    }
     Ok(cells)
 }
 

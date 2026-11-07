@@ -2145,18 +2145,51 @@ fn check_staged_location(state: &State, staged: &StagedVolume) -> Result<(), Eng
     }
 }
 
+/// The ranges of `file`, of `length` bytes, that hold data, from
+/// `SEEK_DATA` and `SEEK_HOLE`; what lies between them reads as zeros.
+#[cfg(target_os = "linux")]
+fn data_ranges(file: &std::fs::File, length: u64) -> io::Result<Vec<(u64, u64)>> {
+    use rustix::fs::SeekFrom;
+    use rustix::io::Errno;
+
+    let mut ranges = Vec::new();
+    let mut offset = 0_u64;
+    while offset < length {
+        let data = match rustix::fs::seek(file, SeekFrom::Data(offset)) {
+            Ok(data) if data < length => data,
+            Ok(_) | Err(Errno::NXIO) => break,
+            Err(err) => return Err(err.into()),
+        };
+        let end = match rustix::fs::seek(file, SeekFrom::Hole(data)) {
+            Ok(hole) if hole > data => hole.min(length),
+            // A hole at the data offset is not the truth; take the rest.
+            Ok(_) | Err(Errno::NXIO) => length,
+            Err(err) => return Err(err.into()),
+        };
+        ranges.push((data, end));
+        offset = end;
+    }
+    Ok(ranges)
+}
+
+/// Elsewhere the whole file counts as data.
+#[cfg(not(target_os = "linux"))]
+fn data_ranges(_file: &std::fs::File, length: u64) -> io::Result<Vec<(u64, u64)>> {
+    Ok(vec![(0, length)])
+}
+
 /// Copies a volume file the way a reflink clone looks: the same length, with
 /// only the ranges that hold data written, so its holes stay holes, as the
 /// real engine's snapshots and staging clones do. On Linux `std::fs::copy`
 /// writes every byte where the filesystem cannot clone (ext4), which made
 /// each copy of a 1 GiB test volume a 1 GiB write; so the data ranges are
-/// found with `SEEK_DATA` and `SEEK_HOLE` and copied alone.
+/// found with `SEEK_DATA` and `SEEK_HOLE` and copied alone, and a chunk of
+/// zeros inside them is not written. A filesystem that reports holes as
+/// data (a macOS directory mounted into a Linux container does, for a file
+/// renamed and opened again) then costs a read, and the copy stays sparse.
 #[cfg(target_os = "linux")]
 fn copy_sparse(from: &Path, to: &Path) -> io::Result<()> {
     use std::os::unix::fs::FileExt as _;
-
-    use rustix::fs::SeekFrom;
-    use rustix::io::Errno;
 
     const CHUNK: u64 = 1 << 20;
     let source = std::fs::File::open(from)?;
@@ -2168,27 +2201,19 @@ fn copy_sparse(from: &Path, to: &Path) -> io::Result<()> {
         .open(to)?;
     target.set_len(length)?;
     let mut buffer = vec![0_u8; CHUNK as usize];
-    let mut offset = 0_u64;
-    while offset < length {
-        let data = match rustix::fs::seek(&source, SeekFrom::Data(offset)) {
-            Ok(data) if data < length => data,
-            Ok(_) | Err(Errno::NXIO) => break,
-            Err(err) => return Err(err.into()),
-        };
-        let end = match rustix::fs::seek(&source, SeekFrom::Hole(data)) {
-            Ok(hole) if hole > data => hole.min(length),
-            // A hole at the data offset is not the truth; copy the rest.
-            Ok(_) | Err(Errno::NXIO) => length,
-            Err(err) => return Err(err.into()),
-        };
+    let zeros = vec![0_u8; CHUNK as usize];
+    for (data, end) in data_ranges(&source, length)? {
         let mut at = data;
         while at < end {
             let n = usize::try_from((end - at).min(CHUNK)).unwrap_or(buffer.len());
             source.read_exact_at(&mut buffer[..n], at)?;
-            target.write_all_at(&buffer[..n], at)?;
+            // The target is new and of the full length: a hole there reads
+            // as zeros already.
+            if buffer[..n] != zeros[..n] {
+                target.write_all_at(&buffer[..n], at)?;
+            }
             at += n as u64;
         }
-        offset = end;
     }
     Ok(())
 }
@@ -2210,34 +2235,59 @@ fn attaching_vm(state: &State, id: &VolumeId) -> Option<VmId> {
 }
 
 /// The 4 KiB blocks whose bytes differ between two files of `size` bytes,
-/// merged into ranges ([`FakeRanges::Content`]).
+/// merged into ranges ([`FakeRanges::Content`]). Only the blocks where
+/// either file holds data ([`data_ranges`]) are read: elsewhere both read as
+/// zeros, so a test volume costs the data it holds, not its size.
 fn differing_blocks(newer: &Path, base: &Path, size: u64) -> Result<Vec<ByteRange>, EngineError> {
-    use std::io::Read as _;
+    use std::io::{Read as _, Seek as _, SeekFrom};
 
     const READ: usize = 1 << 20;
+    const BLOCK: u64 = crate::extents::BLOCK;
     let mut newer = std::fs::File::open(newer).map_err(io_error)?;
     let mut base = std::fs::File::open(base).map_err(io_error)?;
+    let mut spans: Vec<(u64, u64)> = Vec::new();
+    for file in [&newer, &base] {
+        let length = file.metadata().map_err(io_error)?.len().min(size);
+        for (start, end) in data_ranges(file, length).map_err(io_error)? {
+            spans.push((
+                start / BLOCK * BLOCK,
+                end.div_ceil(BLOCK).saturating_mul(BLOCK).min(size),
+            ));
+        }
+    }
+    spans.sort_unstable();
+    let mut read_spans: Vec<(u64, u64)> = Vec::new();
+    for (start, end) in spans {
+        match read_spans.last_mut() {
+            Some((_, last_end)) if start <= *last_end => *last_end = (*last_end).max(end),
+            _ => read_spans.push((start, end)),
+        }
+    }
     let mut left = vec![0_u8; READ];
     let mut right = vec![0_u8; READ];
     let mut ranges = Vec::new();
-    let mut offset = 0_u64;
-    while offset < size {
-        let want = usize::try_from((size - offset).min(READ as u64)).unwrap_or(READ);
-        read_full(&mut newer, &mut left[..want])?;
-        read_full(&mut base, &mut right[..want])?;
-        for (index, (a, b)) in left[..want]
-            .chunks(crate::extents::BLOCK as usize)
-            .zip(right[..want].chunks(crate::extents::BLOCK as usize))
-            .enumerate()
-        {
-            if a != b {
-                ranges.push(ByteRange {
-                    offset: offset + index as u64 * crate::extents::BLOCK,
-                    length: a.len() as u64,
-                });
+    for (start, end) in read_spans {
+        newer.seek(SeekFrom::Start(start)).map_err(io_error)?;
+        base.seek(SeekFrom::Start(start)).map_err(io_error)?;
+        let mut offset = start;
+        while offset < end {
+            let want = usize::try_from((end - offset).min(READ as u64)).unwrap_or(READ);
+            read_full(&mut newer, &mut left[..want])?;
+            read_full(&mut base, &mut right[..want])?;
+            for (index, (a, b)) in left[..want]
+                .chunks(BLOCK as usize)
+                .zip(right[..want].chunks(BLOCK as usize))
+                .enumerate()
+            {
+                if a != b {
+                    ranges.push(ByteRange {
+                        offset: offset + index as u64 * BLOCK,
+                        length: a.len() as u64,
+                    });
+                }
             }
+            offset += want as u64;
         }
-        offset += want as u64;
     }
 
     /// Reads `buffer.len()` bytes, or zeros past the end of the file.
