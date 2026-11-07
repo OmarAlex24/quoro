@@ -278,6 +278,7 @@
   - [0277: Warm turns on at the end of its chain: until then updateApp refuses warm outside dev builds, and the dev-warm-policy feature stays until the last warm PR](adr/0277-warm-turns-on-at-the-end-of-its-chain-until-then-updateapp.md)
   - [0278: A warm node without a mesh address is not a lasting reason to pick another warm node; the contract sentence of D-0276 governs](adr/0278-a-warm-node-without-a-mesh-address-is-not-a-lasting-reason.md)
   - [0279: A fence's graceful phase also resumes a VM that a PauseCopy snapshot paused before it asks the guest to power off](adr/0279-a-fence-s-graceful-phase-also-resumes-a-vm-that-a-pausecopy.md)
+  - [0281: The primary regrants a lease from hello only when the node lists it expired or refused a same-token local grant, never when it lists it revoked](adr/0281-the-primary-regrants-a-lease-from-hello-only-when-the-node.md)
 
 # Background research
 
