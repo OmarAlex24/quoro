@@ -30,7 +30,7 @@ use crate::ch::state::{
 };
 use crate::ch::tools::HostTools;
 use crate::ch::vmconfig::{self, BootFiles};
-use crate::ch::vmm::{Liveness, Vmm, VmmLaunch};
+use crate::ch::vmm::{Liveness, ProcessId, Vmm, VmmLaunch};
 use crate::ch::{FORCE_KILL_BOUND, FORCE_STOP_BOUND, exec, host, serial, stream, supervise};
 use crate::image::{ImageStore, ImageStoreConfig};
 use crate::pins;
@@ -41,7 +41,7 @@ use crate::{
     VmSpec, VmState,
 };
 
-use super::ChConfig;
+use super::{ChConfig, OpenError};
 
 /// Capacity of each event subscriber's buffer (§3.12).
 const EVENT_CAPACITY: usize = 1024;
@@ -275,7 +275,7 @@ struct NetworkRecord {
 impl Inner {
     /// Checks the pinned artifacts, prepares the state directory and
     /// rediscovers the VMs left by an earlier process (contract §5, §3.11).
-    pub(super) async fn new(config: ChConfig) -> Result<Arc<Inner>, EngineError> {
+    pub(super) async fn new(config: ChConfig) -> Result<Arc<Inner>, OpenError> {
         let tools = HostTools::discover()?;
         let ch_pin = pins::get(pins::CLOUD_HYPERVISOR)?;
         let kernel_pin = pins::get(pins::GUEST_KERNEL)?;
@@ -369,6 +369,21 @@ impl Inner {
     }
 }
 
+/// Adopts the VMM that `id`'s record names, at start-up.
+///
+/// A failure is [`OpenError::Retry`] and names the VM: the VMM may still run
+/// a guest, so the engine must not start without it, and a later start may
+/// get past the failure (#459).
+fn adopt_recorded(id: &VmId, process: ProcessId) -> Result<Option<Vmm>, OpenError> {
+    Vmm::adopt(process).map_err(|err| {
+        let reason = match err {
+            EngineError::Hypervisor(reason) => reason,
+            other => other.to_string(),
+        };
+        OpenError::Retry(EngineError::Hypervisor(format!("VM {}: {reason}", id.0)))
+    })
+}
+
 /// The version line `binary --version` prints.
 async fn observed_build(binary: &Path) -> Result<String, EngineError> {
     let output = tokio::process::Command::new(binary)
@@ -394,7 +409,7 @@ impl Inner {
     /// A VMM that is still alive is adopted and supervised; one that is gone
     /// has its exit recorded now, so a restart of the agent never loses an exit
     /// that happened while it was not running.
-    async fn rediscover(self: &Arc<Self>, vms_root: &Path) -> Result<(), EngineError> {
+    async fn rediscover(self: &Arc<Self>, vms_root: &Path) -> Result<(), OpenError> {
         let mut directory = tokio::fs::read_dir(vms_root)
             .await
             .map_err(|err| io_error(vms_root, &err))?;
@@ -419,7 +434,7 @@ impl Inner {
             let spec = record.to_spec().ok();
             let entry = Arc::new(VmEntry::new(id.clone(), paths.clone(), Some(record)));
             match state::read_json::<VmmRecord>(&paths.vmm)? {
-                Some(vmm_record) => match Vmm::adopt(vmm_record.process)? {
+                Some(vmm_record) => match adopt_recorded(&id, vmm_record.process)? {
                     Some(vmm) => {
                         entry.booted.store(vmm_record.booted, Ordering::SeqCst);
                         *lock(&entry.vmm) = Some(vmm.clone());
@@ -2560,6 +2575,15 @@ mod tests {
             self.child.as_ref().map_or(0, std::process::Child::id)
         }
 
+        /// Kills and reaps the stand-in VMM, and returns the signal that
+        /// ended it.
+        fn signal_now(mut self) -> Option<i32> {
+            use std::os::unix::process::ExitStatusExt as _;
+            let mut child = self.child.take().expect("child");
+            child.kill().expect("kill");
+            child.wait().expect("wait").signal()
+        }
+
         /// Reaps the stand-in VMM and returns the signal that ended it.
         fn signal(mut self) -> Option<i32> {
             use std::os::unix::process::ExitStatusExt as _;
@@ -2735,6 +2759,36 @@ mod tests {
             .expect("the VMM exited");
         api.abort();
         assert_eq!(vm.signal(), Some(SIGKILL));
+    }
+
+    /// #459: at start-up, a VMM `/proc` cannot tell about is not forgotten.
+    /// The engine refuses to open with a retryable error that names the VM,
+    /// and a VMM that is gone is recorded as exited, as before.
+    #[tokio::test]
+    async fn a_vmm_left_behind_that_proc_cannot_tell_about_blocks_the_start_up() {
+        use crate::ch::vmm::proc_faults::{Fault, inject};
+
+        let vm = StandIn::new("adopt");
+        let process = vm.vmm.id();
+        let id = VmId("vm_adopt".to_string());
+        {
+            let _fault = inject(
+                process.pid,
+                Fault::Errno(rustix::io::Errno::MFILE.raw_os_error()),
+            );
+            match adopt_recorded(&id, process) {
+                Err(OpenError::Retry(EngineError::Hypervisor(message))) => assert!(
+                    message.starts_with("VM vm_adopt: cannot adopt cloud-hypervisor pid")
+                        && message.contains("cannot tell whether it still runs"),
+                    "{message}"
+                ),
+                Err(other) => panic!("{other:?}"),
+                Ok(adopted) => panic!("adopted {:?}", adopted.map(|vmm| vmm.id())),
+            }
+        }
+        assert!(adopt_recorded(&id, process).expect("adopt").is_some());
+        assert_eq!(vm.signal_now(), Some(SIGKILL));
+        assert!(adopt_recorded(&id, process).expect("adopt").is_none());
     }
 
     /// A forced stop queued for a held lock keeps its place when its
