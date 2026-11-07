@@ -12,8 +12,12 @@
 //! downloads, verifies and writes the snapshot; when it reports the volume
 //! `ready`, [`apply_status`] grants the node a new `local` lease with a higher
 //! fencing token, pins the app's placement there, moves the instances there
-//! and starts the app. A reported `failed` leaves the app stopped with no
-//! lease, and its instances back in the desired state of the node they are on.
+//! and starts the app. It does so only once the old holder released the
+//! lease: it answered the revoke `ok`, so its VMs are stopped and recorded,
+//! or it was declared lost (ADR 0017, sections 5.13 and 8.3, issue #392).
+//! Until then the volume stays `restoring`, and the next `ready` report tries
+//! again. A reported `failed` leaves the app stopped with no lease, and its
+//! instances back in the desired state of the node they are on.
 
 use crate::AppState;
 use crate::api::apps::{APP_COLUMNS, AppPlacement, AppStatus, app_from_row};
@@ -25,7 +29,7 @@ use crate::api::volumes::{VOLUME_COLUMNS, Volume, VolumeState};
 use crate::changelog::{self, Actor, Op};
 use crate::error::{ApiError, Code};
 use crate::events::{self, NewEvent, Source};
-use crate::leases::{self, Lease};
+use crate::leases::{self, Lease, Releases};
 use crate::request::CallCtx;
 use crate::store::{Store, now_rfc3339};
 use quoro_proto::wire;
@@ -237,6 +241,7 @@ pub(crate) async fn accept(
 /// A database error.
 pub(crate) async fn apply_status(
     store: &Store,
+    releases: &Releases,
     node_id: &str,
     volumes: &[wire::VolumeStatus],
 ) -> Result<AppliedRestores, ApiError> {
@@ -260,13 +265,14 @@ pub(crate) async fn apply_status(
         }
         match reported.state {
             wire::VolumeState::Ready => {
-                match restore_ready(store, node_id, &volume, reported).await {
+                match restore_ready(store, releases, node_id, &volume, reported).await {
                     Ok(outcome) => applied.merge(outcome),
-                    // The app's lease waits for an operator's acknowledgement
-                    // of a failed fence (section 8.5), so it is granted to no
-                    // node yet. The transaction rolled back; the volume stays
-                    // `restoring`, and the next status report applies it once
-                    // the lease is acknowledged. The other volumes go on.
+                    // The app's lease waits for its old holder to release it,
+                    // or for an operator's acknowledgement of a failed fence
+                    // (section 8.5), so it is granted to no node yet. The
+                    // transaction rolled back; the volume stays `restoring`,
+                    // and the next status report applies it once the lease
+                    // may move. The other volumes go on.
                     Err(e) if e.code == Code::Conflict => tracing::warn!(
                         volume_id = %volume.id,
                         node_id,
@@ -294,6 +300,7 @@ pub(crate) async fn apply_status(
 /// transition is applied once.
 async fn restore_ready(
     store: &Store,
+    releases: &Releases,
     node_id: &str,
     before: &Volume,
     reported: &wire::VolumeStatus,
@@ -336,6 +343,18 @@ async fn restore_ready(
         current.payload()?,
     )
     .await?;
+
+    // ADR 0017, section 5.13: the old holder's VMs may still run until it
+    // answers the revoke `ok`, so the lease moves only once it released it
+    // (issue #392). That holds for a restore onto the same node too.
+    if let Some(previous) = leases::app_lease(&mut w.tx, &current.app_id).await?
+        && !leases::is_released(&mut w.tx, releases, &previous).await?
+    {
+        return Err(ApiError::conflict(format!(
+            "lease {} waits for node {} to answer its revoke",
+            previous.id, previous.holder_node_id
+        )));
+    }
 
     // `grant_app_lease` takes the app's last token, revoked or not, and adds
     // one, so the target node's token is strictly higher than the old one

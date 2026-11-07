@@ -181,9 +181,10 @@ struct Pending {
     streams: HashMap<String, StreamSlot>,
     /// `stream_open` msg id to the stream it opened, so a failed open ends it.
     opens: HashMap<String, String>,
-    /// `lease_revoke` msg id to its lease, so an answer with `fence_failed`
-    /// is recorded on the node (section 8.5 step 1).
-    revoke_leases: HashMap<String, String>,
+    /// `lease_revoke` msg id to its lease and token, so an answer with
+    /// `fence_failed` is recorded on the node (section 8.5 step 1) and an
+    /// `ok` releases the lease at that token ([`leases::Releases`]).
+    revoke_leases: HashMap<String, (String, u64)>,
 }
 
 impl Pending {
@@ -325,6 +326,10 @@ struct HubInner {
     /// Free space on the volume filesystem each node last reported
     /// (`status_report.disk_free_gb`, section 5.3).
     disk_free_gb: Mutex<HashMap<String, f64>>,
+    /// The revoked leases each last holder released, in memory only: a
+    /// restore grants the lease to its target only once its holder did
+    /// (ADR 0017, issue #392).
+    releases: leases::Releases,
     generation: AtomicU64,
     /// Test seam: snapshots to hold between their build and their send.
     snapshot_holds: Mutex<HashMap<String, Arc<SnapshotHold>>>,
@@ -407,6 +412,7 @@ impl NodeHub {
             warm_reports: Mutex::new(HashMap::new()),
             warm_facts: Mutex::new(HashMap::new()),
             disk_free_gb: Mutex::new(HashMap::new()),
+            releases: leases::Releases::default(),
             generation: AtomicU64::new(0),
             snapshot_holds: Mutex::new(HashMap::new()),
             serving_inputs: Notify::new(),
@@ -456,6 +462,12 @@ impl NodeHub {
         let inner = Arc::clone(&self.0);
         let vm_id = vm_id.to_string();
         tokio::spawn(async move { inner.vm_changed(&vm_id).await });
+    }
+
+    /// `holder` released `lease_id` at `token` ([`leases::Releases`]). The
+    /// caller records it only once the write that makes it true committed.
+    pub(crate) fn record_release(&self, lease_id: &str, holder: &str, token: i64) {
+        self.0.releases.record(lease_id, holder, token);
     }
 
     /// Tells the live session of `node_id` to rebuild and resend its desired
@@ -561,7 +573,7 @@ impl NodeHub {
                 .lock()
                 .expect("pending lock")
                 .revoke_leases
-                .insert(id, revoke.lease_id.0.clone());
+                .insert(id, (revoke.lease_id.0.clone(), revoke.fencing_token));
         }
         handle.tx.send(text).is_ok()
     }
@@ -1154,8 +1166,8 @@ impl HubInner {
         })
     }
 
-    /// The lease of the `lease_revoke` that `re` answers, once.
-    fn take_revoke(&self, node_id: &str, generation: u64, re: &str) -> Option<String> {
+    /// The lease and token of the `lease_revoke` that `re` answers, once.
+    fn take_revoke(&self, node_id: &str, generation: u64, re: &str) -> Option<(String, u64)> {
         let pending = self.pending_of(node_id, generation)?;
         let mut pending = pending.lock().expect("pending lock");
         pending.revoke_leases.remove(re)
@@ -1960,9 +1972,18 @@ impl Session {
                         .await;
                         return false;
                     }
-                    if let Some(lease_id) =
+                    if let Some((lease_id, token)) =
                         self.hub.0.take_revoke(&self.node_id, self.generation, re)
                     {
+                        // `ok`: the bound VMs are stopped and recorded
+                        // (section 5.13), so the lease may move at that token.
+                        if result.status == quoro_proto::CommandStatus::Ok {
+                            self.hub.0.releases.record(
+                                &lease_id,
+                                &self.node_id,
+                                i64::try_from(token).unwrap_or(i64::MAX),
+                            );
+                        }
                         self.note_revoke_answer(&lease_id, &result).await;
                         self.revoke_answered(outbox).await;
                         return false;
@@ -2127,9 +2148,6 @@ impl Session {
     /// know, already revoked, holds on another node, or holds with a lower
     /// token than the node's (sections 5.1 and 4.2 rule 3).
     async fn revoke_stale_leases(&self, reported: &[wire::HelloLease], outbox: &mut Vec<String>) {
-        if reported.is_empty() {
-            return;
-        }
         let mut conn = match self.hub.0.store.pool().acquire().await {
             Ok(conn) => conn,
             Err(e) => {
@@ -2137,6 +2155,30 @@ impl Session {
                 return;
             }
         };
+        // A node names every lease it knows, whatever its state (section
+        // 5.1). A lease revoked from it that its `hello` does not name is one
+        // it never took, so nothing runs there under it (issue #392). One
+        // revoked after this read reaches the node on this session.
+        match leases::revoked_from_node(&mut conn, &self.node_id).await {
+            Ok(revoked) => {
+                for lease in revoked {
+                    if !reported.iter().any(|claimed| claimed.lease_id == lease.id) {
+                        self.hub
+                            .0
+                            .releases
+                            .record(&lease.id, &self.node_id, lease.fencing_token);
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(
+                code = %e.code.as_str(),
+                node_id = %self.node_id,
+                "cannot read the leases revoked from the node"
+            ),
+        }
+        if reported.is_empty() {
+            return;
+        }
         for claimed in reported {
             let row = match leases::by_id(&mut conn, &claimed.lease_id).await {
                 Ok(row) => row,
@@ -2173,7 +2215,7 @@ impl Session {
                     .lock()
                     .expect("pending lock")
                     .revoke_leases
-                    .insert(id.clone(), claimed.lease_id.clone());
+                    .insert(id.clone(), (claimed.lease_id.clone(), token));
             }
             outbox.push(
                 ControlMessage::LeaseRevoke(revoke)
@@ -3059,7 +3101,14 @@ async fn apply_status_report(
         .lock()
         .expect("disk free lock")
         .insert(node_id.to_string(), report.disk_free_gb);
-    match crate::backups::restore::apply_status(&hub.0.store, node_id, &report.volumes).await {
+    match crate::backups::restore::apply_status(
+        &hub.0.store,
+        &hub.0.releases,
+        node_id,
+        &report.volumes,
+    )
+    .await
+    {
         Ok(applied) => {
             // The grant reaches the node before the snapshot that starts the
             // app there (section 8.3).
