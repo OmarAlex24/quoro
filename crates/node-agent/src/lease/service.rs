@@ -287,20 +287,38 @@ impl LeaseView {
         table
     }
 
-    /// Records a renewal about to be sent (section 8.4, ADR 0240). Its send
-    /// time is read under the lock that caught up with every suspend measured
-    /// so far. A suspend another caller applies later then moves it like any
+    /// Records a renewal and hands it to the session with `send` (section
+    /// 8.4, ADR 0240). Its send time is read under the lock that caught up
+    /// with every suspend measured so far. A suspend another caller applies later then moves it like any
     /// other instant, and a suspend already applied is not taken off a send
     /// time read after it. A send time read outside the lock could miss a
     /// suspend applied in between, and its answer would set a `valid_until`
     /// later than the primary's gate by that suspend.
     ///
-    /// Returns whether the renewal gave a converted lease its provisional
-    /// deadline (ADR 0241).
-    fn record_renewal(&self, lease_id: &LeaseId, msg: MsgId, clock: &dyn HostClock) -> bool {
+    /// The renewal is recorded before `send` hands it to the session, so
+    /// `t_send` errs early, and both happen under the lock: a renewal `send`
+    /// could not hand over is taken back before anyone sees it, so a
+    /// converted lease whose first renewal never left keeps behaving as
+    /// `local` (ADR 0241).
+    ///
+    /// Returns whether the renewal was sent and gave a converted lease its
+    /// provisional deadline, and whether it was sent at all.
+    fn record_renewal(
+        &self,
+        lease_id: &LeaseId,
+        msg: MsgId,
+        clock: &dyn HostClock,
+        send: impl FnOnce() -> bool,
+    ) -> (bool, bool) {
         let mut table = self.lock_at(Instant::now());
         let reading = HostNow::read(clock);
-        table.renew_sent(lease_id, msg, &reading)
+        let provisional = table.renew_sent(lease_id, msg.clone(), &reading);
+        if send() {
+            (provisional, true)
+        } else {
+            table.renewal_not_sent(lease_id, &msg, provisional);
+            (false, false)
+        }
     }
 
     /// Section 6.4: may a stateful VM with this spec token start now?
@@ -701,6 +719,7 @@ pub async fn start_local_leases<E: Engine + 'static>(
         task_leases: HashMap::new(),
         recorded,
         unstored_failures: BTreeSet::new(),
+        unstored_conversions: HashSet::new(),
         renewals: None,
     };
     service.note_bindings();
@@ -863,6 +882,12 @@ struct LocalLeaseService<E: Engine> {
     /// holds for them in memory, and only a `fence_ack` naming them clears
     /// them (section 5.17).
     unstored_failures: BTreeSet<String>,
+    /// Leases converted to `expiring` whose row could not be written yet
+    /// (ADR 0241). Their first renewal waits until the row is stored: a
+    /// restart must never find a row still `local` once the authority could
+    /// have answered a renewal, which would bring the lease back with no
+    /// deadline.
+    unstored_conversions: HashSet<LeaseId>,
     /// The attached session, which sends the renewals (section 5.5).
     renewals: Option<(u64, mpsc::UnboundedSender<Envelope<LeaseRenew>>)>,
 }
@@ -1002,30 +1027,40 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                     lease_id,
                     fencing_token,
                 } => {
+                    if self.renewals.is_none() {
+                        continue;
+                    }
+                    // A converted lease renews only once its row says
+                    // `expiring`; until then it behaves as `local`, and the
+                    // next renewal interval tries again (ADR 0241).
+                    if self.unstored_conversions.contains(&lease_id)
+                        && !self.persist(&lease_id).await
+                    {
+                        continue;
+                    }
                     let Some((_, renewals)) = &self.renewals else {
                         continue;
                     };
                     let id = MsgId(util::message_id());
-                    // The renewal is recorded before it is handed to the
-                    // session, so `t_send` and its `CLOCK_BOOTTIME` err early
-                    // (section 8.4, ADR 0240). A renewal the session never
-                    // takes is never answered.
-                    if self
-                        .view
-                        .record_renewal(&lease_id, id.clone(), &*self.config.host_clock)
-                    {
-                        provisional.push(lease_id.clone());
+                    let renewal = Envelope {
+                        id: id.clone(),
+                        re: None,
+                        body: LeaseRenew {
+                            lease_id: lease_id.clone(),
+                            fencing_token,
+                        },
+                    };
+                    // `t_send` and its `CLOCK_BOOTTIME` are read before the
+                    // renewal is handed to the session, so both err early
+                    // (section 8.4, ADR 0240).
+                    let (first, sent) =
+                        self.view
+                            .record_renewal(&lease_id, id, &*self.config.host_clock, || {
+                                renewals.send(renewal).is_ok()
+                            });
+                    if first {
+                        provisional.push(lease_id);
                     }
-                    let sent = renewals
-                        .send(Envelope {
-                            id,
-                            re: None,
-                            body: LeaseRenew {
-                                lease_id,
-                                fencing_token,
-                            },
-                        })
-                        .is_ok();
                     if !sent {
                         // The session is gone without detaching yet.
                         self.detach();
@@ -1151,8 +1186,16 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
             // A grant that answered a renewal set `valid_until` and its
             // stored form, read when that renewal was sent.
             let row = StoredLease::from_lease(&lease);
-            if let Err(e) = self.store.save_lease(&row, highest).await {
-                warn!(error = %e, "could not persist a lease grant");
+            match self.store.save_lease(&row, highest).await {
+                Ok(()) => {
+                    self.unstored_conversions.remove(&lease.id);
+                }
+                Err(e) => {
+                    warn!(error = %e, "could not persist a lease grant");
+                    if lease.awaits_first_renewal() {
+                        self.unstored_conversions.insert(lease.id.clone());
+                    }
+                }
             }
         }
         self.publish_hello();
@@ -1284,11 +1327,13 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
             && !self.view.gates.fencing().contains(&revoke.lease_id)
     }
 
-    async fn persist(&mut self, lease_id: &LeaseId) {
+    /// Stores the lease's row. Returns whether it is stored: a lease the
+    /// table does not know has nothing to store.
+    async fn persist(&mut self, lease_id: &LeaseId) -> bool {
         let (lease, highest) = {
             let table = self.lock();
             let Some(lease) = table.get(lease_id).cloned() else {
-                return;
+                return true;
             };
             let highest = table.highest_for(lease.resource_type, &lease.resource_id);
             (lease, highest)
@@ -1296,7 +1341,10 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
         let row = StoredLease::from_lease(&lease);
         if let Err(e) = self.store.save_lease(&row, highest).await {
             warn!(error = %e, "could not persist a lease");
+            return false;
         }
+        self.unstored_conversions.remove(lease_id);
+        true
     }
 
     /// Section 8.5 step 1: starts stopping every VM bound to the lease, in a
@@ -1837,7 +1885,7 @@ mod tests {
 
     use super::LeaseView;
     use crate::lease::clock::{HostNow, ManualHostClock, SuspendWatch};
-    use crate::lease::machine::{Action, LeaseTable};
+    use crate::lease::machine::{Action, LeaseState, LeaseTable};
 
     /// ADR 0240: the start check counts a suspend the service has not caught
     /// up with yet, so no start passes between the wake-up and the service's
@@ -1916,7 +1964,7 @@ mod tests {
         // the full `D - M` from now.
         clock.suspend(Duration::from_secs(2));
         let first = MsgId("msg_renew_1".to_owned());
-        view.record_renewal(&grant.lease_id, first.clone(), &*clock);
+        view.record_renewal(&grant.lease_id, first.clone(), &*clock, || true);
         view.lock()
             .on_grant(&grant, Some(&first), now)
             .expect("the answer");
@@ -1926,7 +1974,7 @@ mod tests {
         // applies: its send time moves with every other instant, so its
         // answer cannot revive the lease past the primary's gate.
         let second = MsgId("msg_renew_2".to_owned());
-        view.record_renewal(&grant.lease_id, second.clone(), &*clock);
+        view.record_renewal(&grant.lease_id, second.clone(), &*clock, || true);
         clock.suspend(Duration::from_secs(10));
         assert!(view.may_start_stateful("lse_e", 1), "3.5 s are left");
         view.lock()
@@ -1940,5 +1988,61 @@ mod tests {
         assert!(view.may_start_stateful("lse_e", 1));
         clock.suspend(Duration::from_secs(4));
         assert!(!view.may_start_stateful("lse_e", 1));
+    }
+
+    /// ADR 0241, safety review m1: a converted lease's first renewal that the
+    /// session does not take is taken back under the same lock, so the lease
+    /// keeps behaving as `local`: a lost session leaves it `held` with its
+    /// VMs. The next renewal the session takes gives it its deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_first_renewal_the_session_does_not_take_leaves_the_lease_local() {
+        let clock = Arc::new(ManualHostClock::new(
+            Some("boot-a"),
+            Duration::from_secs(1000),
+        ));
+        let reading = HostNow::read(&*clock);
+        let now = reading.instant;
+        let mut grant = LeaseGrant {
+            lease_id: LeaseId("lse_a".to_owned()),
+            resource_type: ResourceType::App,
+            resource_id: "app_a".to_owned(),
+            mode: LeaseMode::Local,
+            fencing_token: 1,
+            duration_ms: None,
+            granted_at: "2026-11-06T10:00:00Z".to_owned(),
+        };
+        let mut table = LeaseTable::new();
+        table.on_grant(&grant, None, now).expect("the local grant");
+        grant.mode = LeaseMode::Expiring;
+        grant.duration_ms = Some(15_000);
+        table.on_grant(&grant, None, now).expect("the conversion");
+        let view =
+            LeaseView::with_suspends(table, false, SuspendWatch::new(clock.clone(), &reading));
+        let lease = |view: &LeaseView| view.lock().get(&grant.lease_id).cloned().expect("lease");
+
+        let lost = view.record_renewal(
+            &grant.lease_id,
+            MsgId("msg_lost".to_owned()),
+            &*clock,
+            || false,
+        );
+        assert_eq!(lost, (false, false));
+        assert!(lease(&view).awaits_first_renewal());
+        assert_eq!(lease(&view).validity(), None);
+        view.lock().authority_unreachable(now);
+        assert_eq!(lease(&view).state, LeaseState::Held);
+        assert!(view.may_keep_running("lse_a", 1));
+
+        let sent = view.record_renewal(
+            &grant.lease_id,
+            MsgId("msg_sent".to_owned()),
+            &*clock,
+            || true,
+        );
+        assert_eq!(sent, (true, true));
+        assert_eq!(
+            lease(&view).valid_until,
+            Some(now + Duration::from_millis(13_500))
+        );
     }
 }

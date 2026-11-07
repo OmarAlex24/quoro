@@ -980,6 +980,7 @@ async fn a_converted_lease_keeps_its_vms_and_fences_at_its_first_renewal_s_deadl
     let mut attached = leases.link.attach();
     let before = grant_local_then_convert(&leases, 6000).await;
     assert_eq!(leases.link.hello()[0].mode, LeaseMode::Expiring);
+    assert_eq!(leases.link.hello()[0].state, "held");
 
     let renew = next_renewal(&mut attached).await;
     assert_eq!(renew.body.fencing_token, 1, "the same token");
@@ -1102,39 +1103,59 @@ async fn a_converted_lease_runs_on_without_a_session_until_its_first_renewal() {
 
 /// Section 8.4 "Agent restart" (ADR 0241): the provisional deadline is stored
 /// once the first renewal is out, so a restart on the same boot brings the
-/// converted lease back `uncertain` with it, keeping its VMs. An answer to
-/// the renewal the restored lease sends holds it again.
+/// converted lease back `uncertain` with it, keeping its VMs until that
+/// deadline: with `D` = 6 000, 5 000 ms after the first renewal. A restored
+/// lease whose renewal is answered is held again.
 #[tokio::test]
 async fn a_restart_keeps_a_converted_lease_s_provisional_deadline() {
-    let dir = TargetDir::new("expiring-convert-restart");
-    let engine = Arc::new(FakeEngine::new());
-    let desired = bound(&["vm_warm"]);
-    let clock = clock();
-    let (leases, store) = start(&dir, &engine, &desired, config(&clock)).await;
-    let vm = running_vm(&engine, "vm_warm", 2).await;
-    let mut attached = leases.link.attach();
-    let _before = grant_local_then_convert(&leases, 15_000).await;
-    let _unanswered = next_renewal(&mut attached).await;
-    let stored = wait_for_stored_validity(&store).await;
-    drop(attached);
-    leases.abort();
-    drop(store);
+    for answered in [false, true] {
+        let dir = TargetDir::new(if answered {
+            "expiring-convert-restart-answered"
+        } else {
+            "expiring-convert-restart"
+        });
+        let engine = Arc::new(FakeEngine::new());
+        let desired = bound(&["vm_warm"]);
+        let clock = clock();
+        let (leases, store) = start(&dir, &engine, &desired, config(&clock)).await;
+        let vm = running_vm(&engine, "vm_warm", 2).await;
+        let mut attached = leases.link.attach();
+        let before = grant_local_then_convert(&leases, 6000).await;
+        let _unanswered = next_renewal(&mut attached).await;
+        let stored = wait_for_stored_validity(&store).await;
+        drop(attached);
+        leases.abort();
+        drop(store);
 
-    let (leases, store) = start(&dir, &engine, &desired, config(&clock)).await;
-    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Uncertain));
-    assert!(leases.view.may_keep_running(LEASE, 1));
-    assert_eq!(
-        store.load_leases().await.unwrap()[0].validity,
-        Some(stored),
-        "the restore keeps the provisional deadline"
-    );
-    let mut attached = leases.link.attach();
-    let renew = next_renewal(&mut attached).await;
-    answer(&leases, &renew, 15_000).await;
-    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Held));
-    assert!(engine.stop_calls().is_empty(), "nothing is fenced");
-    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Running);
-    leases.abort();
+        let (leases, store) = start(&dir, &engine, &desired, config(&clock)).await;
+        assert_eq!(leases.view.state(LEASE), Some(LeaseState::Uncertain));
+        assert_eq!(leases.link.hello()[0].state, "uncertain");
+        assert_eq!(leases.link.hello()[0].mode, LeaseMode::Expiring);
+        assert!(leases.view.may_keep_running(LEASE, 1));
+        assert_eq!(
+            store.load_leases().await.unwrap()[0].validity,
+            Some(stored),
+            "the restore keeps the provisional deadline"
+        );
+        let mut attached = leases.link.attach();
+        let renew = next_renewal(&mut attached).await;
+        if answered {
+            answer(&leases, &renew, 6000).await;
+            assert_eq!(leases.view.state(LEASE), Some(LeaseState::Held));
+            assert!(engine.stop_calls().is_empty(), "nothing is fenced");
+            assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Running);
+        } else {
+            wait_for_fence_record(&store).await;
+            let done = before.elapsed();
+            assert!(
+                done >= millis(5000),
+                "no earlier than t_send + 5 000: {done:?}"
+            );
+            assert!(done < millis(6500), "at the stored deadline: {done:?}");
+            assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Stopped);
+        }
+        leases.abort();
+    }
 }
 
 /// Section 8.4 "Agent restart": a converted lease stored before its first
