@@ -9,19 +9,20 @@ mod agent_common;
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 
 use agent_common::{
-    BRIDGE, GATEWAY, RecordingEngine, SUBNET, TargetDir, TempDir, dns, local_lease_table,
-    reconciler, snapshot, snapshot_full, spec_vm, spec_volume, stateful_vm, volume_attach,
+    BRIDGE, GATEWAY, RecordingEngine, SUBNET, TargetDir, TempDir, dns, local_lease_table, options,
+    reconcile_config, reconciler, snapshot, snapshot_full, spec_vm, spec_volume, stateful_vm,
+    volume_attach,
 };
 use quoro_engine::{Engine, EngineError, FakeOp, StopMode, VmId, VmState, VolumeId};
 use quoro_ingress::cloudflared::CloudflaredConfig;
 use quoro_node_agent::edge::EdgeManager;
 use quoro_node_agent::ingress::{CertificateEvents, DnsBridge, IngressConfig, IngressSupervisor};
-use quoro_node_agent::reconcile::Snapshot;
+use quoro_node_agent::reconcile::{ReconcileOptions, Reconciler, Snapshot};
 use quoro_node_agent::store::{NodeStore, VolumeRecord};
 use quoro_node_agent::warm::VolumeLocks;
 use quoro_node_agent::{EXPIRING_START_WITHIN, LeaseTable, LeaseView, START_WITHIN};
@@ -144,6 +145,98 @@ async fn a_crashed_vm_is_restarted_with_a_backoff_and_counted() {
     assert_eq!(record.restart_count, 1);
     assert_eq!(engine.inspect(&id).await.unwrap().state, VmState::Running);
     assert_eq!(store.applied_rev().await.unwrap(), 1);
+}
+
+/// #462: a start that failed, a `Timeout` included, is tried again only
+/// once the crash-restart backoff has passed, and the backoff doubles, so a
+/// boot slower than its bound does not loop. It is not counted as a restart.
+#[tokio::test]
+async fn a_failed_start_waits_out_the_backoff_before_the_next_try() {
+    let dir = TempDir::new();
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let engine = Arc::new(RecordingEngine::new());
+    let (mut reconciler, _observed) = Reconciler::new(
+        engine.clone(),
+        store.clone(),
+        reconcile_config(),
+        ReconcileOptions {
+            backoff_base: Duration::from_millis(400),
+            backoff_max: Duration::from_millis(1600),
+            ..options()
+        },
+    );
+    engine
+        .inner()
+        .fail_next(FakeOp::Start, EngineError::Timeout);
+    engine
+        .inner()
+        .fail_next(FakeOp::Start, EngineError::Hypervisor("boom".to_owned()));
+    let snap = snapshot(1, vec![spec_vm("vm_slow", "prj_1", DesiredStatus::Running)]);
+    let starts = || engine.starts().len();
+
+    reconciler.reconcile_once(Some(&snap)).await;
+    let failed = Instant::now();
+    assert_eq!(starts(), 1, "the first start is not delayed");
+    reconciler.reconcile_once(Some(&snap)).await;
+    assert_eq!(starts(), 1, "the next pass waits");
+
+    tokio::time::sleep_until((failed + Duration::from_millis(450)).into()).await;
+    reconciler.reconcile_once(Some(&snap)).await;
+    let failed_again = Instant::now();
+    assert_eq!(starts(), 2, "tried again once 400 ms passed");
+
+    tokio::time::sleep_until((failed_again + Duration::from_millis(450)).into()).await;
+    reconciler.reconcile_once(Some(&snap)).await;
+    assert!(
+        failed_again.elapsed() < Duration::from_millis(800),
+        "checked inside the doubled backoff: {:?}",
+        failed_again.elapsed()
+    );
+    assert_eq!(starts(), 2, "the backoff doubled to 800 ms");
+
+    tokio::time::sleep_until((failed_again + Duration::from_millis(850)).into()).await;
+    let statuses = reconciler.reconcile_once(Some(&snap)).await;
+    assert_eq!(starts(), 3);
+    assert_eq!(statuses[0].observed_status, ObservedStatus::Running);
+    let record = store.vm_record("vm_slow").await.unwrap().unwrap();
+    assert_eq!(record.restart_count, 0, "a start that failed is no restart");
+}
+
+/// #462: an operator's restart (a new `restart_generation`) is tried at
+/// once, whatever backoff a failed start left to wait out.
+#[tokio::test]
+async fn a_new_restart_generation_clears_the_start_backoff() {
+    let dir = TempDir::new();
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let engine = Arc::new(RecordingEngine::new());
+    let (mut reconciler, _observed) = Reconciler::new(
+        engine.clone(),
+        store.clone(),
+        reconcile_config(),
+        ReconcileOptions {
+            backoff_base: Duration::from_secs(60),
+            backoff_max: Duration::from_secs(300),
+            ..options()
+        },
+    );
+    engine
+        .inner()
+        .fail_next(FakeOp::Start, EngineError::Timeout);
+    let mut vm = spec_vm("vm_again", "prj_1", DesiredStatus::Running);
+    reconciler
+        .reconcile_once(Some(&snapshot(1, vec![vm.clone()])))
+        .await;
+    reconciler
+        .reconcile_once(Some(&snapshot(1, vec![vm.clone()])))
+        .await;
+    assert_eq!(engine.starts().len(), 1, "the backoff holds the next try");
+
+    vm.restart_generation = 1;
+    let statuses = reconciler
+        .reconcile_once(Some(&snapshot(2, vec![vm])))
+        .await;
+    assert_eq!(engine.starts().len(), 2, "the restart runs at once");
+    assert_eq!(statuses[0].observed_status, ObservedStatus::Running);
 }
 
 #[tokio::test]
