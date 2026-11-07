@@ -8,11 +8,14 @@ import { cn } from '../../lib/utils';
 export function TabbedPage({
   label,
   tabs,
+  title,
   narrow = false,
   children,
 }: {
   label: string;
   tabs: ReactNode;
+  /** The section's heading over the tabs, when the page under them has none. */
+  title?: string;
   /** The page under it is a single record in the narrower column. */
   narrow?: boolean;
   children: ReactNode;
@@ -25,6 +28,7 @@ export function TabbedPage({
           narrow ? 'max-w-4xl' : 'max-w-6xl',
         )}
       >
+        {title ? <h1 className="type-display mb-5 text-[24px] leading-none">{title}</h1> : null}
         <nav className="tabs" aria-label={label}>
           {tabs}
         </nav>

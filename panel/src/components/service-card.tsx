@@ -166,7 +166,16 @@ export function AppCard({
 }
 
 /** A standalone VM on the canvas: its size, its lamp and the node it runs on. */
-export function VmCard({ vm, nodeNames }: { vm: Vm; nodeNames: Readonly<Record<string, string>> }) {
+export function VmCard({
+  vm,
+  nodeNames,
+  selected = false,
+}: {
+  vm: Vm;
+  nodeNames: Readonly<Record<string, string>>;
+  /** Open in the VM sheet. */
+  selected?: boolean;
+}) {
   const lamp = lampState(vm);
   const nodes = nodesLine([vm.node_id], nodeNames);
   return (
@@ -179,6 +188,7 @@ export function VmCard({ vm, nodeNames }: { vm: Vm; nodeNames: Readonly<Record<s
       foot={nodes ? [{ key: 'nodes', Icon: Server, text: nodes }] : []}
       deploying={false}
       link={{ projectId: vm.project_id, search: { vm: vm.id } }}
+      selected={selected}
     />
   );
 }

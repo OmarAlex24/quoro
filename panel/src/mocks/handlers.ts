@@ -25,6 +25,7 @@ import type {
   DomainList,
   LoginRequest,
   MeResponse,
+  Node,
   NodeList,
   Problem,
   ProblemCode,
@@ -83,6 +84,7 @@ import {
   validationFailed,
   writeRefusal,
 } from './http';
+import { allocatedFrom, simulateLoss } from './capacity';
 import { agentsHandlers } from './handlers-agents';
 import { approvalsHandlers } from './handlers-approvals';
 import { auditHandlers } from './handlers-audit';
@@ -98,6 +100,10 @@ import { webhooksHandlers } from './handlers-webhooks';
 
 /** The mock cluster's id; one installation per page load. */
 const CLUSTER_ID = mockId('cls');
+
+/** The mock cluster's nodes, each with what its VMs add up to as `allocated`. */
+const mockNodes = (): Node[] =>
+  [db.node, ...db.extraNodes].map((node) => ({ ...node, allocated: allocatedFrom(node.id, db.vms) }));
 
 const findVm = (vmId: string): Vm | undefined =>
   db.vms.find((candidate) => candidate.id === vmId);
@@ -267,10 +273,29 @@ export const handlers = [
   http.get('*/api/v1/nodes', () => {
     if (!signedIn()) return unauthorized();
     const list: NodeList = {
-      items: [db.node, ...db.extraNodes],
+      items: mockNodes(),
       next_cursor: null,
     };
     return json(list);
+  }),
+
+  http.get('*/api/v1/cluster/capacity', ({ request }) => {
+    if (!signedIn()) return unauthorized();
+    const lostId = new URL(request.url).searchParams.get('lost_node_id') ?? '';
+    const nodes = mockNodes();
+    const lost = nodes.find((node) => node.id === lostId);
+    if (!lost || lost.status === 'removed') return notFound('That node');
+    return json(
+      simulateLoss({
+        lostId,
+        nodes,
+        apps: db.apps,
+        vms: db.vms,
+        volumes: db.volumes,
+        backups: db.backups,
+        now: now(),
+      }),
+    );
   }),
 
   http.get('*/api/v1/projects', () => {
@@ -403,11 +428,6 @@ export const handlers = [
       updated_at: createdAt,
     };
     db.vms.push(vm);
-    db.node.allocated = {
-      cpus: db.node.allocated.cpus + vm.vcpus,
-      memory_mb: db.node.allocated.memory_mb + vm.memory_mb,
-      disk_gb: db.node.allocated.disk_gb + vm.disk_gb,
-    };
     converge(vm.id, [
       [700, 'starting'],
       [1600, 'running'],
@@ -473,11 +493,6 @@ export const handlers = [
         detail: 'That VM no longer exists.',
       });
     }
-    db.node.allocated = {
-      cpus: Math.max(0, db.node.allocated.cpus - vm.vcpus),
-      memory_mb: Math.max(0, db.node.allocated.memory_mb - vm.memory_mb),
-      disk_gb: Math.max(0, db.node.allocated.disk_gb - vm.disk_gb),
-    };
     return json(
       { ...vm, observed_status: 'deleted', updated_at: now() },
       { status: 202 },

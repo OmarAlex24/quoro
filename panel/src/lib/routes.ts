@@ -39,9 +39,24 @@ export const PROJECT_TABS = [
 ] as const;
 export type ProjectTab = (typeof PROJECT_TABS)[number];
 
-/** The tab an open service shows: the one in the URL, Deployments when none is. */
+/** The VM sheet's tabs: what the VM is, and its console and delete. */
+export const VM_TABS = ['overview', 'settings'] as const;
+export type VmTab = (typeof VM_TABS)[number];
+
+/** Every tab `?tab=` may name: an app's or a VM's. `settings` is in both. */
+export const SHEET_TABS = [...PROJECT_TABS, 'overview'] as const;
+export type SheetTab = (typeof SHEET_TABS)[number];
+
+const isProjectTab = (tab: SheetTab): tab is ProjectTab =>
+  (PROJECT_TABS as readonly string[]).includes(tab);
+
+/** The tab an open app shows: the one in the URL, Deployments when none is or it is a VM's. */
 export const sheetTab = (search: Pick<ProjectSearch, 'tab'>): ProjectTab =>
-  search.tab ?? 'deployments';
+  search.tab !== undefined && isProjectTab(search.tab) ? search.tab : 'deployments';
+
+/** The tab an open VM shows: Settings when the URL names it, Overview otherwise. */
+export const vmSheetTab = (search: Pick<ProjectSearch, 'tab'>): VmTab =>
+  search.tab === 'settings' ? 'settings' : 'overview';
 
 /** The project rail: canvas, metrics, logs and settings. No value means the canvas. */
 export const PROJECT_VIEWS = ['canvas', 'metrics', 'logs', 'settings'] as const;
@@ -58,21 +73,32 @@ export interface ProjectsSearch {
 
 /**
  * `/projects/$projectId?view=&app=&vm=&tab=&build=&add=`: a project, the rail
- * view, and the service open in it. `build` opens one build of `app`; `add`
+ * view, and the service open in it: an app (`app`) or a VM (`vm`), each in
+ * its sheet on the tab in `tab`. `build` opens one build of `app`; `add`
  * opens the create sheet for a Git app, an image app or a VM.
  */
 export interface ProjectSearch {
   view?: ProjectView;
   app?: string;
   vm?: string;
-  tab?: ProjectTab;
+  tab?: SheetTab;
   build?: string;
   add?: AddKind;
 }
 
-/** `/nodes?tab=vms`: the nodes, or the virtual machines of the whole cluster. */
+/** The Nodes section's tabs: no value is the nodes themselves. */
+export const NODES_TABS = ['vms', 'security'] as const;
+export type NodesTab = (typeof NODES_TABS)[number];
+
+/**
+ * `/nodes?tab=vms&node=` and `/nodes?tab=security`: the nodes, the virtual
+ * machines of the whole cluster (or of one node), or the cluster's
+ * vulnerability summary.
+ */
 export interface NodesSearch {
-  tab?: 'vms';
+  tab?: NodesTab;
+  /** Only the VMs placed on this node; read on the VMs tab only. */
+  node?: string;
 }
 
 /** The grants filters, shareable as a link. */
@@ -107,13 +133,15 @@ export const validateProjectSearch = (search: Raw): ProjectSearch =>
     view: pick(search.view, PROJECT_VIEWS),
     app: text(search.app),
     vm: text(search.vm),
-    tab: pick(search.tab, PROJECT_TABS),
+    tab: pick(search.tab, SHEET_TABS),
     build: text(search.build),
     add: pick(search.add, ADD_KINDS),
   });
 
-export const validateNodesSearch = (search: Raw): NodesSearch =>
-  compact({ tab: pick(search.tab, ['vms'] as const) });
+export const validateNodesSearch = (search: Raw): NodesSearch => {
+  const tab = pick(search.tab, NODES_TABS);
+  return compact({ tab, node: tab === 'vms' ? text(search.node) : undefined });
+};
 
 export const validateGrantsSearch = (search: Raw): GrantsSearch =>
   compact({
