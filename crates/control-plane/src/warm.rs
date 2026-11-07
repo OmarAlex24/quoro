@@ -9,8 +9,11 @@
 //!
 //! The primary sends each of them its `spec.volumes[].warm` entry, and sends
 //! the warm node the app's VM as a `standby` entry ([`crate::session::desired`]).
-//! A node that reported a copy the database no longer gives it gets a
-//! `deleted` entry for it ([`stale_copies`]).
+//! A warm node keeps reporting every copy it holds until it is removed, also
+//! one the database no longer gives it. Such a copy gets a `deleted` entry
+//! once no failover can need it, and keeps it while the node reports the
+//! copy ([`stale_copies`], ADR 0267). The reports live in memory, so after a
+//! primary restart the node's first report brings the copy back into view.
 //!
 //! Nothing about a copy's progress is stored (migration 0011). The primary
 //! keeps each node's newest `status_report.warm` in memory, as it does for the
@@ -273,14 +276,17 @@ struct AppRow {
 }
 
 /// Whether `node_id`, which reported holding a copy of a volume for `app_id`,
-/// gets a `deleted` entry for it. Only the database decides, and a copy that
-/// a failover may still need is always kept: a copy left on disk costs
-/// space, a copy deleted wrongly can lose the only good data.
+/// gets a `deleted` entry for it (section 5.11, ADR 0267). Only the database
+/// decides, and a copy that a failover may still need is always kept: a copy
+/// left on disk costs space, a copy deleted wrongly can lose the only good
+/// data.
 /// - **Never** while the node has a volume row of its own for it, in any
 ///   state: that file is the node's own volume, which the reconciler keeps
 ///   or removes (section 6.7).
-/// - **Yes** once the volume is being deleted (`deleting`), the volume and
-///   the app are both gone, or the volume belongs to another app.
+/// - **Yes** once the volume is being deleted (`deleting`), the volume or the
+///   app is gone, or the volume belongs to another app. A volume's row goes
+///   once its own node removed the file, whatever the warm node holds, and
+///   no failover can start from a copy without it.
 /// - **Yes** once the app left `warm`, but only while its source is
 ///   healthy: the volume is `ready` on the node that holds the app's
 ///   unrevoked lease, so the data lives there.
@@ -290,8 +296,7 @@ struct AppRow {
 /// - **No** otherwise:
 ///   - a fence, a restore or a switchover revokes the lease;
 ///   - the source's volume may be `failed`, `detached` or `restoring`;
-///   - the app may have no warm node;
-///   - an app or a volume row may be missing while the other is there.
+///   - the app may have no warm node.
 ///
 ///   The copy may then be the data a failover starts from.
 fn copy_is_stale(
@@ -302,10 +307,10 @@ fn copy_is_stale(
 ) -> bool {
     let (volume, app) = match (volume, app) {
         (Some(volume), _) if volume.node_id == node_id => return false,
-        (Some(volume), _) if volume.state == "deleting" || volume.app_id != app_id => return true,
-        (None, None) => return true,
-        (Some(volume), Some(app)) => (volume, app),
-        _ => return false,
+        (Some(volume), Some(app)) if volume.state != "deleting" && volume.app_id == app_id => {
+            (volume, app)
+        }
+        _ => return true,
     };
     let source_healthy =
         volume.state == "ready" && app.lease_holder.as_deref() == Some(volume.node_id.as_str());
@@ -932,18 +937,6 @@ mod tests {
                 false,
             ),
             (
-                "the app is gone but its volume is not",
-                Some(ready.clone()),
-                None,
-                false,
-            ),
-            (
-                "the volume is gone but its app is not",
-                None,
-                Some(app("warm", Some("nod_x"), held)),
-                false,
-            ),
-            (
                 "the node's own volume",
                 Some(volume("nod_t", "app_1", "deleting")),
                 None,
@@ -963,6 +956,18 @@ mod tests {
                 true,
             ),
             ("the volume and the app are gone", None, None, true),
+            (
+                "the volume is gone but its app is not",
+                None,
+                Some(app("warm", Some("nod_t"), held)),
+                true,
+            ),
+            (
+                "the app is gone but its volume is not",
+                Some(ready.clone()),
+                None,
+                true,
+            ),
             (
                 "the volume is another app's",
                 Some(volume("nod_s", "app_2", "ready")),
