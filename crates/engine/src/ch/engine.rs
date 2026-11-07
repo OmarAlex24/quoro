@@ -30,7 +30,7 @@ use crate::ch::state::{
 };
 use crate::ch::tools::HostTools;
 use crate::ch::vmconfig::{self, BootFiles};
-use crate::ch::vmm::{Vmm, VmmLaunch};
+use crate::ch::vmm::{Liveness, Vmm, VmmLaunch};
 use crate::ch::{FORCE_KILL_BOUND, FORCE_STOP_BOUND, exec, host, serial, stream, supervise};
 use crate::image::{ImageStore, ImageStoreConfig};
 use crate::pins;
@@ -220,14 +220,17 @@ impl VmEntry {
         lock(&self.spec).clone()
     }
 
-    /// The live VMM, when the process still is the one it was started as.
+    /// The live VMM, unless its process is gone.
+    ///
+    /// A `/proc` that cannot be read proves nothing, so the VMM stays live: a
+    /// stop goes on to stop it, and `inspect` keeps reporting it with its pid
+    /// instead of stopped, which a fence would take for proof (D-0074).
     fn live_vmm(&self) -> Option<Vmm> {
         let slot = lock(&self.vmm);
         let vmm = slot.as_ref()?;
-        if vmm.id().is_alive() {
-            Some(vmm.clone())
-        } else {
-            None
+        match vmm.id().liveness() {
+            Liveness::Gone => None,
+            Liveness::Alive | Liveness::Unknown(_) => Some(vmm.clone()),
         }
     }
 }
@@ -1145,11 +1148,7 @@ impl Inner {
             return self.inspect(id).await;
         };
         request_stop(entry);
-        if !shut_down_or_kill(entry, &vmm, timings).await {
-            return Err(EngineError::Hypervisor(
-                "VMM process did not exit after SIGKILL".to_string(),
-            ));
-        }
+        shut_down_or_kill(entry, &vmm, timings).await?;
         drop(stopping);
         self.inspect(id).await
     }
@@ -1235,11 +1234,9 @@ impl Inner {
                 .shutdown_vmm()
                 .await;
             if !wait_settled(&entry, SETTLE_AFTER_DELETE_SHUTDOWN).await {
-                let _ = vmm.sigkill();
+                let killed = vmm.sigkill();
                 if !wait_settled(&entry, SETTLE_AFTER_SIGKILL).await {
-                    return Err(EngineError::Hypervisor(
-                        "VMM process did not exit after SIGKILL".to_string(),
-                    ));
+                    return Err(killed.err().unwrap_or_else(not_exited_after_sigkill));
                 }
             }
         }
@@ -2324,18 +2321,41 @@ impl Drop for GiveUpOnDrop {
 /// unless the VMM answered and exited within `exit_after_shutdown`, then a
 /// bounded wait for the exit. `SIGKILL` therefore goes out at most
 /// `shutdown + exit_after_shutdown` after the call, and at once when the API
-/// does not answer. True once the exit is recorded.
-async fn shut_down_or_kill(entry: &VmEntry, vmm: &Vmm, timings: ForceTimings) -> bool {
+/// does not answer. `Ok` once the exit is recorded.
+///
+/// A `SIGKILL` that could not be sent, for one because `/proc` cannot tell
+/// whether the pid is still the VMM, ends the stop with that error at once:
+/// nothing would make the VMM exit in the reap wait.
+async fn shut_down_or_kill(
+    entry: &VmEntry,
+    vmm: &Vmm,
+    timings: ForceTimings,
+) -> Result<(), EngineError> {
     let answered = ApiClient::new(&entry.paths.api_socket)
         .with_timeout(timings.shutdown)
         .shutdown_vmm()
         .await
         .is_ok();
     if answered && wait_settled(entry, timings.exit_after_shutdown).await {
-        return true;
+        return Ok(());
     }
-    let _ = vmm.sigkill();
-    wait_settled(entry, timings.reap).await
+    if let Err(err) = vmm.sigkill() {
+        return if wait_settled(entry, Duration::ZERO).await {
+            Ok(())
+        } else {
+            Err(err)
+        };
+    }
+    if wait_settled(entry, timings.reap).await {
+        Ok(())
+    } else {
+        Err(not_exited_after_sigkill())
+    }
+}
+
+/// A VMM that did not exit within the reap wait after `SIGKILL`.
+fn not_exited_after_sigkill() -> EngineError {
+    EngineError::Hypervisor("VMM process did not exit after SIGKILL".to_string())
 }
 
 /// Waits until the supervisor of `entry` finished the exit path.
@@ -2649,20 +2669,71 @@ mod tests {
         let vm = StandIn::new("fence");
         silent_api(&vm.entry.paths.api_socket);
         let began = std::time::Instant::now();
-        assert!(
-            shut_down_or_kill(
-                &vm.entry,
-                &vm.vmm,
-                ForceTimings::within(Duration::from_millis(300))
-            )
-            .await,
-            "the VMM was reaped"
-        );
+        shut_down_or_kill(
+            &vm.entry,
+            &vm.vmm,
+            ForceTimings::within(Duration::from_millis(300)),
+        )
+        .await
+        .expect("the VMM was reaped");
         let took = began.elapsed();
         assert!(
             took < Duration::from_millis(150) + SLACK,
             "the kill took {took:?}"
         );
+        assert_eq!(vm.signal(), Some(SIGKILL));
+    }
+
+    /// #459: a VMM whose `/proc` entry cannot be read stays live, so
+    /// `inspect` keeps its pid, and a forced stop neither signals it nor
+    /// reports it gone: it fails at once with the reason, and the fence
+    /// reports `fence_failed`. Proof that the process is gone still counts.
+    #[tokio::test]
+    async fn a_vmm_proc_cannot_tell_about_is_not_taken_for_stopped() {
+        use crate::ch::vmm::proc_faults::{Fault, inject};
+
+        let mut vm = StandIn::new("unreadable");
+        let api = silent_api(&vm.entry.paths.api_socket);
+        {
+            let _fault = inject(
+                vm.pid(),
+                Fault::Errno(rustix::io::Errno::MFILE.raw_os_error()),
+            );
+            assert!(vm.entry.live_vmm().is_some(), "the VMM stays live");
+            let began = std::time::Instant::now();
+            let result = shut_down_or_kill(
+                &vm.entry,
+                &vm.vmm,
+                ForceTimings::within(Duration::from_millis(300)),
+            )
+            .await;
+            match result {
+                Err(EngineError::Hypervisor(message)) => assert!(
+                    message.contains("cannot kill") && message.contains("cannot tell"),
+                    "{message}"
+                ),
+                other => panic!("{other:?}"),
+            }
+            let took = began.elapsed();
+            assert!(
+                took < Duration::from_millis(150) + SLACK,
+                "no reap wait: {took:?}"
+            );
+            let child = vm.child.as_mut().expect("child");
+            assert!(child.try_wait().expect("try_wait").is_none(), "still runs");
+            assert!(lock(&vm.entry.vmm).is_some(), "the VMM is not forgotten");
+        }
+        {
+            let _fault = inject(
+                vm.pid(),
+                Fault::Errno(rustix::io::Errno::SRCH.raw_os_error()),
+            );
+            assert!(vm.entry.live_vmm().is_none(), "ESRCH is proof");
+        }
+        shut_down_or_kill(&vm.entry, &vm.vmm, ForceTimings::DEFAULT)
+            .await
+            .expect("the VMM exited");
+        api.abort();
         assert_eq!(vm.signal(), Some(SIGKILL));
     }
 
@@ -2714,10 +2785,9 @@ mod tests {
         let vm = StandIn::new("silent");
         let api = silent_api(&vm.entry.paths.api_socket);
         let began = std::time::Instant::now();
-        assert!(
-            shut_down_or_kill(&vm.entry, &vm.vmm, ForceTimings::DEFAULT).await,
-            "the VMM exited"
-        );
+        shut_down_or_kill(&vm.entry, &vm.vmm, ForceTimings::DEFAULT)
+            .await
+            .expect("the VMM exited");
         let took = began.elapsed();
         assert!(took < FORCE_KILL_BOUND + SLACK, "SIGKILL after {took:?}");
         api.abort();
@@ -2729,10 +2799,9 @@ mod tests {
     async fn a_forced_stop_kills_a_vmm_without_an_api_at_once() {
         let vm = StandIn::new("noapi");
         let began = std::time::Instant::now();
-        assert!(
-            shut_down_or_kill(&vm.entry, &vm.vmm, ForceTimings::DEFAULT).await,
-            "the VMM exited"
-        );
+        shut_down_or_kill(&vm.entry, &vm.vmm, ForceTimings::DEFAULT)
+            .await
+            .expect("the VMM exited");
         let took = began.elapsed();
         assert!(
             took < FORCE_SHUTDOWN_TIMEOUT + SLACK,
@@ -2748,10 +2817,9 @@ mod tests {
         let vm = StandIn::new("stuck");
         let api = answering_api(&vm.entry.paths.api_socket, || {});
         let began = std::time::Instant::now();
-        assert!(
-            shut_down_or_kill(&vm.entry, &vm.vmm, ForceTimings::DEFAULT).await,
-            "the VMM exited"
-        );
+        shut_down_or_kill(&vm.entry, &vm.vmm, ForceTimings::DEFAULT)
+            .await
+            .expect("the VMM exited");
         let took = began.elapsed();
         assert!(
             took >= FORCE_EXIT_AFTER_SHUTDOWN,
@@ -2771,10 +2839,9 @@ mod tests {
         let api = answering_api(&vm.entry.paths.api_socket, move || {
             let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
         });
-        assert!(
-            shut_down_or_kill(&vm.entry, &vm.vmm, ForceTimings::DEFAULT).await,
-            "the VMM exited"
-        );
+        shut_down_or_kill(&vm.entry, &vm.vmm, ForceTimings::DEFAULT)
+            .await
+            .expect("the VMM exited");
         api.abort();
         assert_eq!(vm.signal(), Some(SIGTERM));
     }

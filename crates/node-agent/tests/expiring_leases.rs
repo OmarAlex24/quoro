@@ -893,8 +893,14 @@ async fn a_forced_stop_that_outlives_t_force_still_stops_the_vm() {
     )
     .await;
     assert!(!report.complete());
+    // The engine's own bound ends with the fence's: its `Timeout` reads as
+    // the fence's own (#459).
     assert!(
-        matches!(&report.vms[..], [(id, VmFenceOutcome::Failed(_))] if id == &vm),
+        matches!(
+            &report.vms[..],
+            [(id, VmFenceOutcome::Failed(reason))]
+                if id == &vm && reason == "forced stop timed out"
+        ),
         "{report:?}"
     );
     assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Stopping);
