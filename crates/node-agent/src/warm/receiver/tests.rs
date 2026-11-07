@@ -413,6 +413,16 @@ impl Harness {
         });
     }
 
+    /// Replaces `spec.volumes` in a new desired-state revision.
+    fn set_volumes(&self, volumes: Vec<SpecVolumeFile>) {
+        self.desired.send_modify(|current| {
+            let snapshot = current.as_mut().expect("a snapshot");
+            snapshot.rev += 1;
+            snapshot.state.rev = snapshot.rev;
+            snapshot.state.spec.volumes = volumes;
+        });
+    }
+
     fn set_warm(&self, change: impl FnOnce(&mut SpecWarm)) {
         self.set_entry(|entry| change(entry.warm.as_mut().expect("warm")));
     }
@@ -1311,17 +1321,17 @@ async fn a_copy_left_pending_that_is_deleted_is_not_hashed_and_waits_for_nothing
         .expect("the pass does not wait for the volume's lock");
     assert!(!h.row().await.removed, "kept while the volume is held");
     assert!(h.volume_path.exists());
-    // The copy left the status with that pass, so the primary stops sending
-    // the entry: the copy still goes once the volume is free, with no pass.
-    h.desired.send_modify(|current| {
-        let snapshot = current.as_mut().expect("a snapshot");
-        snapshot.rev += 1;
-        snapshot.state.rev = snapshot.rev;
-        snapshot.state.spec.volumes.clear();
-    });
+    // Still reported while it waits, so the primary keeps the entry (ADR
+    // 0267).
+    assert_eq!(h.status().snapshot_seq, Some(1));
+    // The copy still goes once the volume is free, with no pass, even if the
+    // entry left the spec meanwhile, and it leaves the report then.
+    h.set_volumes(Vec::new());
     drop(held);
     wait_for("the copy to be removed", || async { h.row().await.removed }).await;
     assert!(!h.volume_path.exists());
+    let mut statuses = h.statuses.clone();
+    board_where(&mut statuses, Vec::is_empty).await;
 }
 
 #[tokio::test]
@@ -1345,6 +1355,119 @@ async fn a_held_copy_whose_entry_is_present_again_once_it_is_free_is_kept() {
     .await;
     assert!(!h.row().await.removed, "the copy is kept");
     h.assert_copy(&first, Some(1), &first.touched).await;
+}
+
+/// The volume's entry once the primary sends `deleted` for a copy the node
+/// is no longer the target of: no `warm` (section 5.11, ADR 0267).
+fn deleted_entry() -> SpecVolumeFile {
+    SpecVolumeFile {
+        state: SpecVolumeState::Deleted,
+        warm: None,
+        ..entry(5)
+    }
+}
+
+#[tokio::test]
+async fn a_copy_the_node_is_no_longer_the_target_of_stays_reported_until_it_is_removed() {
+    // The app left `warm`, got another warm node or is moving: the spec no
+    // longer names the copy. The node keeps reporting it, so the primary can
+    // send its `deleted` entry, also after a restart of its own (ADR 0267).
+    let h = Harness::new("held").await;
+    let first = ship_first(&h).await;
+    let mut listeners = BTreeMap::new();
+    h.set_volumes(Vec::new());
+    h.receiver.pass(&mut listeners).await;
+    let held = h.status();
+    assert_eq!(held.volume_id, VOL);
+    assert_eq!(held.app_id, APP);
+    assert_eq!(held.role, WarmRole::Target);
+    assert_eq!(held.snapshot_seq, Some(1));
+    assert!(held.completed_at.is_some(), "{held:?}");
+    assert!(held.error.is_none(), "no listener error: {held:?}");
+    assert!(
+        listeners.is_empty(),
+        "no listener for a copy it is not the target of"
+    );
+    h.assert_copy(&first, Some(1), &first.touched).await;
+
+    // The `deleted` entry removes it, and it leaves the report.
+    h.set_volumes(vec![deleted_entry()]);
+    h.receiver.pass(&mut listeners).await;
+    assert!(h.row().await.removed);
+    assert!(!h.volume_path.exists());
+    assert!(h.statuses.borrow().is_empty(), "{:?}", *h.statuses.borrow());
+
+    // Once the primary drops the entry, the row is forgotten.
+    h.set_volumes(Vec::new());
+    h.receiver.pass(&mut listeners).await;
+    assert!(h.store.warm_target(VOL).await.expect("store").is_none());
+    assert!(h.statuses.borrow().is_empty());
+}
+
+#[tokio::test]
+async fn a_copy_whose_removal_fails_stays_reported_and_goes_at_a_later_pass() {
+    let h = Harness::new("remove-fails").await;
+    ship_first(&h).await;
+    h.set_volumes(vec![deleted_entry()]);
+    h.engine.fail_next(
+        FakeOp::DeleteVolume,
+        EngineError::Io("the disk is busy".to_owned()),
+    );
+    let mut listeners = BTreeMap::new();
+    h.receiver.pass(&mut listeners).await;
+    assert!(!h.row().await.removed, "the removal failed");
+    assert!(h.volume_path.exists());
+    // Still reported, so the primary keeps the entry and the next pass tries
+    // again.
+    assert_eq!(h.status().snapshot_seq, Some(1));
+    h.receiver.pass(&mut listeners).await;
+    assert!(h.row().await.removed);
+    assert!(!h.volume_path.exists());
+    assert!(h.statuses.borrow().is_empty(), "{:?}", *h.statuses.borrow());
+}
+
+#[tokio::test]
+async fn the_nodes_own_volume_is_never_reported_as_a_copy_it_holds() {
+    // A node that turned from target into source holds the file as its own
+    // volume. Reported as a copy it holds, it could get a `deleted` entry,
+    // which the reconciler would act on (section 9).
+    let h = Harness::new("held-own").await;
+    ship_first(&h).await;
+    let own = |state| VolumeRecord {
+        volume_id: VOL.to_owned(),
+        app_id: APP.to_owned(),
+        size_gb: 1,
+        state,
+        error: None,
+        allocated_bytes: None,
+    };
+    h.store
+        .save_volume(&own(VolumeState::Ready))
+        .await
+        .expect("row");
+    // The volume's entry as the source's, without `warm`.
+    h.set_volumes(vec![SpecVolumeFile {
+        warm: None,
+        ..entry(5)
+    }]);
+    let mut listeners = BTreeMap::new();
+    h.receiver.pass(&mut listeners).await;
+    assert!(h.statuses.borrow().is_empty(), "{:?}", *h.statuses.borrow());
+    assert!(!h.row().await.removed);
+
+    // Once the node no longer holds the file as its own, the warm row is
+    // reported again. What it says of the file after a hand-over is the
+    // return path's (section 9).
+    h.store
+        .save_volume(&own(VolumeState::Deleted))
+        .await
+        .expect("row");
+    h.receiver.pass(&mut listeners).await;
+    let held = h.status();
+    assert_eq!(
+        (held.volume_id.as_str(), held.role),
+        (VOL, WarmRole::Target)
+    );
 }
 
 #[tokio::test]

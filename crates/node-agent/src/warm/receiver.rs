@@ -41,7 +41,9 @@
 //!   are served.
 //!
 //! The copy is never created except from a complete stream, and it is
-//! reported in `status_report.warm`, never in `status_report.volumes`.
+//! reported in `status_report.warm`, never in `status_report.volumes`. A
+//! copy the node is no longer the target of stays reported until it is
+//! removed, so the primary can always send its `deleted` entry (ADR 0267).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::Infallible;
@@ -1106,9 +1108,9 @@ impl<E: Engine + 'static> Inner<E> {
     /// Removes the copy of a `deleted` entry this node holds as a target,
     /// then forgets it. While a stream or a resolution holds the volume, a
     /// task waits for its lock and removes the copy then, so the pass never
-    /// waits for a hash of the volume. The removal must not depend on a later
-    /// pass: the copy leaves `status_report.warm` with this one, and the
-    /// primary stops sending the entry once the node no longer reports it.
+    /// waits for a hash of the volume. A removal that fails is tried again
+    /// at a later pass: the node keeps reporting the copy until it is
+    /// removed, so the primary keeps sending the entry (ADR 0267).
     async fn delete_copy(self: &Arc<Self>, volume_id: &str) {
         if !self.holds_copy(volume_id).await {
             return;
@@ -1139,6 +1141,8 @@ impl<E: Engine + 'static> Inner<E> {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&volume_id);
+            // The copy leaves the report now, not at the next pass.
+            inner.publish().await;
         });
     }
 
@@ -1283,8 +1287,19 @@ impl<E: Engine + 'static> Inner<E> {
         }
     }
 
-    /// Publishes one `status_report.warm` entry per volume this node is the
-    /// target of.
+    /// Publishes this node's `status_report.warm` entries as a target
+    /// (section 5.3):
+    /// - one per volume `spec.volumes` names as a `present` target entry;
+    /// - one per copy the node still holds that the spec does not name so: a
+    ///   copy whose app left `warm`, got another warm node, was deleted or is
+    ///   moving, and one whose removal failed. It is reported until it is
+    ///   removed, so the primary keeps sending its `deleted` entry, also
+    ///   after its own restart (ADR 0267). A row with no complete copy is
+    ///   reported too: a failed swap may have left a file of unknown content.
+    ///
+    /// A volume the node holds as its own is never reported the second way:
+    /// its file is that volume, not a warm copy, and a `deleted` entry for it
+    /// would reach the reconciler, which would remove it (section 9).
     async fn publish(&self) {
         let _publishing = self.publishing.lock().await;
         let spec = self
@@ -1307,41 +1322,76 @@ impl<E: Engine + 'static> Inner<E> {
                     return;
                 }
             };
+        let own: BTreeSet<String> = match self.store.volumes().await {
+            Ok(volumes) => volumes
+                .into_iter()
+                .filter(|volume| volume.state != VolumeState::Deleted)
+                .map(|volume| volume.volume_id)
+                .collect(),
+            Err(e) => {
+                warn!(error = %e, "could not read the volume rows");
+                return;
+            }
+        };
         let ip = mesh_ip(&spec);
         let bind_errors = self
             .bind_errors
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let entries = targets(&spec)
-            .into_iter()
+        let named = targets(&spec);
+        let mut entries: Vec<WarmStatus> = named
+            .iter()
             .map(|(file, warm)| {
-                let row = rows.get(&file.volume_id);
                 let listen_error = match ip {
                     None => Some("this node has no mesh address yet".to_owned()),
                     Some(ip) => bind_errors.get(&SocketAddr::new(ip, warm.port)).cloned(),
                 };
-                let complete = row.and_then(|row| row.complete_seq);
-                WarmStatus {
-                    volume_id: file.volume_id.clone(),
-                    app_id: file.app_id.clone(),
-                    role: WarmRole::Target,
-                    snapshot_seq: complete,
-                    snapshot_taken_at: complete.and(row.and_then(|row| row.taken_at.clone())),
-                    completed_at: complete.and(row.and_then(|row| row.completed_at.clone())),
-                    allocated_bytes: complete.and(row.and_then(|row| row.allocated_bytes)),
-                    extent_count: None,
-                    frozen: None,
-                    rejected_token: row.and_then(|row| row.rejected_token),
-                    rejected_at: row.and_then(|row| row.rejected_at.clone()),
-                    error: row
-                        .and_then(|row| row.error.clone())
-                        .or(listen_error)
-                        .map(|error| util::one_line(&error, ERROR_CHARS)),
-                }
+                target_status(
+                    &file.volume_id,
+                    &file.app_id,
+                    rows.get(&file.volume_id),
+                    listen_error,
+                )
             })
             .collect();
+        let held = rows.values().filter(|row| {
+            !row.removed
+                && !own.contains(&row.volume_id)
+                && !named
+                    .iter()
+                    .any(|(file, _)| file.volume_id == row.volume_id)
+        });
+        entries.extend(held.map(|row| target_status(&row.volume_id, &row.app_id, Some(row), None)));
         self.board.set(PART, entries);
+    }
+}
+
+/// The `status_report.warm` entry of a copy this node holds as a target, from
+/// its row when it has one.
+fn target_status(
+    volume_id: &str,
+    app_id: &str,
+    row: Option<&WarmTargetRecord>,
+    listen_error: Option<String>,
+) -> WarmStatus {
+    let complete = row.and_then(|row| row.complete_seq);
+    WarmStatus {
+        volume_id: volume_id.to_owned(),
+        app_id: app_id.to_owned(),
+        role: WarmRole::Target,
+        snapshot_seq: complete,
+        snapshot_taken_at: complete.and(row.and_then(|row| row.taken_at.clone())),
+        completed_at: complete.and(row.and_then(|row| row.completed_at.clone())),
+        allocated_bytes: complete.and(row.and_then(|row| row.allocated_bytes)),
+        extent_count: None,
+        frozen: None,
+        rejected_token: row.and_then(|row| row.rejected_token),
+        rejected_at: row.and_then(|row| row.rejected_at.clone()),
+        error: row
+            .and_then(|row| row.error.clone())
+            .or(listen_error)
+            .map(|error| util::one_line(&error, ERROR_CHARS)),
     }
 }
 

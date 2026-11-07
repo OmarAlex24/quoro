@@ -569,3 +569,201 @@ async fn a_pair_gone_before_the_source_first_connects_reaches_the_warm_node() {
     })
     .await;
 }
+
+/// `(volume_id, state, has warm)` of each `spec.volumes` entry.
+fn volume_states(spec: &Value) -> Vec<(String, String, bool)> {
+    spec["volumes"]
+        .as_array()
+        .map(|volumes| {
+            volumes
+                .iter()
+                .map(|volume| {
+                    (
+                        volume["volume_id"].as_str().unwrap().to_string(),
+                        volume["state"].as_str().unwrap().to_string(),
+                        volume.get("warm").is_some_and(|warm| !warm.is_null()),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A copy of a volume and an app the database does not have, which no
+/// failover can need: reported next to another copy, it shows which entries
+/// that report got.
+const GONE_VOLUME: &str = "vol_0000000000000000000000000X";
+const GONE_APP: &str = "app_0000000000000000000000000X";
+
+#[tokio::test]
+async fn a_copy_the_old_warm_node_still_holds_is_deleted_while_it_reports_it() {
+    // ADR 0267: a node keeps reporting a copy it is no longer the target of
+    // until it is removed. The primary keeps no report across a restart, so
+    // the node's first report is all it knows, as here.
+    let server = start().await;
+    let owner = server.owner().await;
+    let source = enroll(&server, &owner, "source", 3).await;
+    let target = enroll(&server, &owner, "target", 4).await;
+    let _on_source = open(&server, &source, 1).await;
+    let (app_id, _, volume_id) = warm_app(&server, &owner, &source.node_id, &target.node_id).await;
+    sqlx::query("UPDATE apps SET ha_policy = 'none', warm_node_id = NULL WHERE id = ?")
+        .bind(&app_id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+
+    // Before it reports anything, the old warm node is sent nothing for it.
+    let mut on_target = connect(&server, &target.credential).await;
+    send(&mut on_target, hello(&target.node_id, 2)).await;
+    let spec = spec_where(&mut on_target, |_| true).await;
+    assert_eq!(volume_states(&spec), Vec::new());
+
+    // Its first report names the copy: the source is healthy, so it gets a
+    // `deleted` entry without `warm`, with the volume's size.
+    let held = WarmStatus {
+        snapshot_seq: Some(3),
+        ..warm_entry(&volume_id, &app_id, WarmRole::Target)
+    };
+    send(&mut on_target, report(vec![held.clone()])).await;
+    let spec = spec_where(&mut on_target, |spec| !volume_states(spec).is_empty()).await;
+    assert_eq!(
+        volume_states(&spec),
+        vec![(volume_id.clone(), "deleted".to_string(), false)]
+    );
+    assert_eq!(spec["volumes"][0]["app_id"], app_id.as_str());
+    assert_eq!(spec["volumes"][0]["size_gb"], 2);
+    assert!(spec["vms"].as_array().is_none_or(Vec::is_empty));
+
+    // The entry stays while the node reports the copy, so a removal that
+    // failed is asked again.
+    send(
+        &mut on_target,
+        report(vec![
+            held,
+            warm_entry(GONE_VOLUME, GONE_APP, WarmRole::Target),
+        ]),
+    )
+    .await;
+    let spec = spec_where(&mut on_target, |spec| volume_states(spec).len() == 2).await;
+    let mut expected = vec![
+        (volume_id.clone(), "deleted".to_string(), false),
+        (GONE_VOLUME.to_string(), "deleted".to_string(), false),
+    ];
+    expected.sort();
+    assert_eq!(volume_states(&spec), expected);
+
+    // A copy the node no longer reports loses its entry.
+    send(
+        &mut on_target,
+        report(vec![warm_entry(GONE_VOLUME, GONE_APP, WarmRole::Target)]),
+    )
+    .await;
+    let spec = spec_where(&mut on_target, |spec| volume_states(spec).len() == 1).await;
+    assert_eq!(
+        volume_states(&spec),
+        vec![(GONE_VOLUME.to_string(), "deleted".to_string(), false)]
+    );
+    send(&mut on_target, report(Vec::new())).await;
+    spec_where(&mut on_target, |spec| volume_states(spec).is_empty()).await;
+}
+
+/// A warm app on two connected nodes that left `warm` while its source was
+/// fenced: the old warm node reports its copy `held`, with the copy no
+/// failover can need, and only that one gets an entry. Returns the two
+/// nodes' sessions, the source's first, the app id and the volume id.
+async fn left_warm_while_fenced(server: &Server) -> (Socket, Socket, String, String) {
+    let owner = server.owner().await;
+    let source = enroll(server, &owner, "source", 3).await;
+    let target = enroll(server, &owner, "target", 4).await;
+    let on_source = open(server, &source, 1).await;
+    let mut on_target = open(server, &target, 2).await;
+    let (app_id, _, volume_id) = warm_app(server, &owner, &source.node_id, &target.node_id).await;
+    let pool = server.state.store.pool();
+    sqlx::query("UPDATE leases SET revoked_at = '2026-11-07T10:00:00Z'")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE apps SET ha_policy = 'none', warm_node_id = NULL WHERE id = ?")
+        .bind(&app_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    send(&mut on_target, held_with_gone(&volume_id, &app_id)).await;
+    let spec = spec_where(&mut on_target, |spec| {
+        volume_states(spec).iter().any(|(id, ..)| id == GONE_VOLUME)
+    })
+    .await;
+    assert_eq!(
+        volume_states(&spec),
+        vec![(GONE_VOLUME.to_string(), "deleted".to_string(), false)],
+        "the copy a failover may still need gets no entry"
+    );
+    (on_source, on_target, app_id, volume_id)
+}
+
+/// The old warm node's report: the app's copy, and one no failover can need.
+fn held_with_gone(volume_id: &str, app_id: &str) -> NodeMessage {
+    report(vec![
+        warm_entry(volume_id, app_id, WarmRole::Target),
+        warm_entry(GONE_VOLUME, GONE_APP, WarmRole::Target),
+    ])
+}
+
+#[tokio::test]
+async fn a_kept_copy_gets_its_entry_at_the_next_report_once_the_source_is_healthy() {
+    let server = start().await;
+    let (_on_source, mut on_target, app_id, volume_id) = left_warm_while_fenced(&server).await;
+
+    // The lease is granted again. Nothing wakes the warm node for that, but
+    // its next report, unchanged, has the copy it keeps checked again, and
+    // the copy gets its entry.
+    sqlx::query("UPDATE leases SET revoked_at = NULL")
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+    send(&mut on_target, held_with_gone(&volume_id, &app_id)).await;
+    let spec = spec_where(&mut on_target, |spec| volume_states(spec).len() == 2).await;
+    let mut expected = vec![
+        (volume_id.clone(), "deleted".to_string(), false),
+        (GONE_VOLUME.to_string(), "deleted".to_string(), false),
+    ];
+    expected.sort();
+    assert_eq!(volume_states(&spec), expected);
+}
+
+#[tokio::test]
+async fn a_kept_copy_whose_volume_is_deleted_gets_its_entry_at_the_next_report() {
+    let server = start().await;
+    let (_on_source, mut on_target, app_id, volume_id) = left_warm_while_fenced(&server).await;
+
+    // The volume is deleted: its own node removed the file, and the row went
+    // with it, while the warm node still holds the copy. No failover can
+    // start from it, so the node's next report, unchanged, gets it its entry,
+    // although the lease is still revoked.
+    let pool = server.state.store.pool();
+    sqlx::query("DELETE FROM volumes WHERE id = ?")
+        .bind(&volume_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE apps SET stateful = 0 WHERE id = ?")
+        .bind(&app_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    send(&mut on_target, held_with_gone(&volume_id, &app_id)).await;
+    let spec = spec_where(&mut on_target, |spec| volume_states(spec).len() == 2).await;
+    let mut expected = vec![
+        (volume_id.clone(), "deleted".to_string(), false),
+        (GONE_VOLUME.to_string(), "deleted".to_string(), false),
+    ];
+    expected.sort();
+    assert_eq!(volume_states(&spec), expected);
+    let entry = spec["volumes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["volume_id"] == volume_id.as_str())
+        .unwrap();
+    assert_eq!(entry["size_gb"], 1, "the row is gone");
+}
