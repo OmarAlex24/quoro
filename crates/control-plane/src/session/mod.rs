@@ -229,6 +229,51 @@ fn new_msg_id() -> String {
     wire::msg_id(random)
 }
 
+/// A lease's token as the wire carries it: at least 1.
+fn lease_token(lease: &leases::Lease) -> u64 {
+    u64::try_from(lease.fencing_token.max(1)).unwrap_or(1)
+}
+
+/// The `lease_revoke` for a lease the node claims at token `claimed` while
+/// the primary's row says the node no longer holds it (sections 5.5 and 9),
+/// with the token its `ok` releases the lease at. `None` while the row names
+/// the node, not revoked, at a token no higher than the claimed one.
+///
+/// | Row | Reason | Token |
+/// | --- | --- | --- |
+/// | none | `moved` | the claimed one |
+/// | revoked | `deleted` | the higher of the two |
+/// | another holder | `moved` | the higher of the two |
+/// | a higher token | `superseded` | the row's |
+///
+/// The answer releases the lease at the row's token, never above it (0
+/// without a row): a higher one could cover a later grant to this node that
+/// the answer says nothing about.
+fn stale_lease_revoke(
+    row: Option<&leases::Lease>,
+    node_id: &str,
+    lease_id: &str,
+    claimed: u64,
+) -> Option<(quoro_proto::LeaseRevoke, u64)> {
+    let claimed = claimed.max(1);
+    let reason = match row {
+        None => quoro_proto::RevokeReason::Moved,
+        Some(lease) if lease.is_revoked() => quoro_proto::RevokeReason::Deleted,
+        Some(lease) if lease.holder_node_id != node_id => quoro_proto::RevokeReason::Moved,
+        Some(lease) if lease_token(lease) > claimed => quoro_proto::RevokeReason::Superseded,
+        Some(_) => return None,
+    };
+    let released = row.map_or(0, lease_token);
+    Some((
+        quoro_proto::LeaseRevoke {
+            lease_id: quoro_proto::LeaseId(lease_id.to_string()),
+            fencing_token: released.max(claimed),
+            reason,
+        },
+        released,
+    ))
+}
+
 /// The frame that answers a failed decode (section 5.18).
 fn protocol_error(
     code: quoro_proto::ErrorCode,
@@ -2214,8 +2259,9 @@ impl Session {
                 false,
                 Some(&raw.id),
             )),
+            NodeMessage::LeaseRenew(renew) => self.answer_renewal(&raw.id, &renew, outbox).await,
             // No change-log follow exists yet.
-            NodeMessage::LeaseRenew(_) | NodeMessage::LogAck(_) => {}
+            NodeMessage::LogAck(_) => {}
             NodeMessage::DnsChallenge(challenge) => {
                 let acme_routes: HashSet<String> = self
                     .last_spec
@@ -2349,7 +2395,7 @@ impl Session {
                         }
                     }
                     let token = lease.fencing_token.max(1) as u64;
-                    self.queue_hello_revoke(
+                    self.queue_revoke(
                         quoro_proto::LeaseRevoke {
                             lease_id: quoro_proto::LeaseId(lease.id.clone()),
                             fencing_token: token,
@@ -2377,45 +2423,146 @@ impl Session {
                     continue;
                 }
             };
-            let reason = match &row {
-                None => quoro_proto::RevokeReason::Moved,
-                Some(lease) if lease.is_revoked() => quoro_proto::RevokeReason::Deleted,
-                Some(lease) if lease.holder_node_id != self.node_id => {
-                    quoro_proto::RevokeReason::Moved
-                }
-                Some(lease) if lease.fencing_token.max(1) as u64 > claimed.fencing_token.max(1) => {
-                    quoro_proto::RevokeReason::Superseded
-                }
-                Some(_) => continue,
-            };
-            let token = match &row {
-                Some(lease) => {
-                    (lease.fencing_token.max(1) as u64).max(claimed.fencing_token.max(1))
-                }
-                None => claimed.fencing_token.max(1),
-            };
-            // The answer releases the lease at the primary's token, never
-            // above it: a higher one could cover a later grant to this node
-            // that the answer says nothing about.
-            let released = row
-                .as_ref()
-                .map_or(0, |lease| lease.fencing_token.max(1) as u64);
-            self.queue_hello_revoke(
-                quoro_proto::LeaseRevoke {
-                    lease_id: quoro_proto::LeaseId(claimed.lease_id.clone()),
-                    fencing_token: token,
-                    reason,
-                },
-                released,
-                outbox,
-            );
+            if let Some((revoke, released)) = stale_lease_revoke(
+                row.as_ref(),
+                &self.node_id,
+                &claimed.lease_id,
+                claimed.fencing_token,
+            ) {
+                self.queue_revoke(revoke, released, outbox);
+            }
         }
     }
 
-    /// Queues a `lease_revoke` of the session's start, after `welcome`, and
-    /// notes it unanswered, so that its `ok` releases the lease at `released`
-    /// ([`leases::Releases`]).
-    fn queue_hello_revoke(
+    /// Answers a `lease_renew` (section 5.5):
+    ///
+    /// - A lease the node no longer holds in the primary's row is revoked,
+    ///   as at the session's start ([`stale_lease_revoke`]): no row, another
+    ///   holder, revoked, or a higher token.
+    /// - A `local` row gets no answer (D-0256 part 2). The node renews only
+    ///   `expiring` leases, so the primary made this one `local` after its
+    ///   grant, and the node's validity runs out.
+    /// - An `expiring` row at the renewal's token is answered with a
+    ///   `lease_grant` at that token, `mode` `expiring`, for `D`, with `re`
+    ///   set. Only while a majority of voters supports it (section 8.8): no
+    ///   build counts support yet, so in every build none is answered.
+    /// - Anything else gets no answer, and the lease runs out on the node: a
+    ///   node token above the row's, a lease listed in a failed fence (section
+    ///   8.5), or a grant the authority refuses.
+    ///
+    /// The row is read, the stored duration raised and the grant recorded in
+    /// one single-writer transaction, committed before the grant is queued
+    /// (section 8.4, "What the authority must enforce"). A revoke that
+    /// commits after it reaches the node after the grant. The answer writes
+    /// nothing else: renewals change no state.
+    async fn answer_renewal(
+        &self,
+        re: &str,
+        renew: &quoro_proto::LeaseRenew,
+        outbox: &mut Vec<String>,
+    ) {
+        use crate::authority::{DEFAULT_DURATION_MS, Grant, GrantKind};
+        let lease_id = renew.lease_id.0.as_str();
+        let duration_ms = DEFAULT_DURATION_MS;
+        let mut w = match self.hub.0.store.begin_write().await {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!(%e, lease_id, "cannot answer a renewal");
+                return;
+            }
+        };
+        let row = match leases::by_id(&mut w.tx, lease_id).await {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::warn!(code = %e.code.as_str(), lease_id, "cannot read a renewed lease");
+                return;
+            }
+        };
+        if let Some((revoke, released)) =
+            stale_lease_revoke(row.as_ref(), &self.node_id, lease_id, renew.fencing_token)
+        {
+            drop(w);
+            self.queue_revoke(revoke, released, outbox);
+            return;
+        }
+        let Some(lease) = row else {
+            return;
+        };
+        if lease.mode != "expiring" {
+            tracing::debug!(lease_id, "a renewal of a local lease gets no answer");
+            return;
+        }
+        if lease_token(&lease) != renew.fencing_token.max(1) {
+            tracing::warn!(
+                lease_id,
+                node_token = renew.fencing_token,
+                "a renewal above the lease's token gets no answer"
+            );
+            return;
+        }
+        match crate::fences::listed_leases(&mut w.tx).await {
+            Ok(listed) if listed.contains(lease_id) => {
+                tracing::warn!(
+                    lease_id,
+                    "a renewal of a lease with a failed fence gets no answer"
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(code = %e.code.as_str(), lease_id, "cannot read the failed fences");
+                return;
+            }
+        }
+        let actor = Actor {
+            kind: ActorType::Node,
+            id: self.node_id.clone(),
+        };
+        let stored = i64::try_from(duration_ms).unwrap_or(i64::MAX);
+        if let Err(e) = leases::raise_duration(&mut w, lease_id, stored, &actor).await {
+            tracing::warn!(code = %e.code.as_str(), lease_id, "cannot raise a lease's duration");
+            return;
+        }
+        // Refused, the transaction rolls back, raise and all.
+        let sent_wall = time::OffsetDateTime::now_utc();
+        if let Err(refused) = self.hub.0.authority.record_grant(&Grant {
+            lease_id,
+            holder: &self.node_id,
+            duration_ms,
+            kind: GrantKind::Renewal,
+            sent_wall,
+        }) {
+            if refused == crate::authority::Refused::NoSupport {
+                tracing::debug!(lease_id, "no voter support; the renewal gets no answer");
+            } else {
+                tracing::warn!(
+                    lease_id,
+                    ?refused,
+                    "the authority refused a renewal's answer"
+                );
+            }
+            return;
+        }
+        if let Err(e) = w.commit().await {
+            // Recorded but not sent: the gate only ends later than it must.
+            tracing::warn!(%e, lease_id, "cannot answer a renewal");
+            return;
+        }
+        // The row is `expiring`, so the grant is too.
+        let mut grant = lease.grant();
+        grant.duration_ms = Some(duration_ms);
+        grant.granted_at = crate::store::format_rfc3339(sent_wall);
+        outbox.push(
+            ControlMessage::LeaseGrant(grant)
+                .to_frame(&new_msg_id(), Some(re))
+                .to_text(),
+        );
+    }
+
+    /// Queues a `lease_revoke` on this session, after `welcome` at its start,
+    /// and notes it unanswered, so that its `ok` releases the lease at
+    /// `released` ([`leases::Releases`]).
+    fn queue_revoke(
         &self,
         revoke: quoro_proto::LeaseRevoke,
         released: u64,

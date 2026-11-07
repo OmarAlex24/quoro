@@ -386,10 +386,6 @@ pub(crate) async fn bump_tokens(
 /// # Errors
 ///
 /// A duration outside 3 000 to 600 000 ms, or a database error.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the first expiring grant (#604) raises it")
-)]
 pub(crate) async fn raise_duration(
     w: &mut crate::store::WriteTx,
     lease_id: &str,
@@ -426,7 +422,10 @@ pub(crate) async fn raise_duration(
 /// A duration outside 3 000 to 600 000 ms, or a database error.
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "the first expiring grant (#604) lowers it")
+    expect(
+        dead_code,
+        reason = "lowered after a longer grant, which nothing sends yet"
+    )
 )]
 pub(crate) async fn lower_duration(
     w: &mut crate::store::WriteTx,
@@ -452,10 +451,6 @@ pub(crate) async fn lower_duration(
 
 /// A stored duration the authority may grant: 3 000 to 600 000 ms (sections
 /// 5.12 and 8.4). Anything else is a caller's bug.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the first expiring grant (#604) checks it")
-)]
 fn check_duration(duration_ms: i64) -> Result<u64, ApiError> {
     use crate::authority::{MAX_DURATION_MS, MIN_DURATION_MS};
     u64::try_from(duration_ms)
@@ -469,10 +464,6 @@ fn check_duration(duration_ms: i64) -> Result<u64, ApiError> {
         })
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the first expiring grant (#604) writes it")
-)]
 async fn write_duration(
     conn: &mut SqliteConnection,
     mut lease: Lease,
