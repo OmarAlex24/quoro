@@ -67,14 +67,21 @@ pub struct Lease {
     /// `D` from the grant; `None` for `local`.
     pub duration: Option<Duration>,
     /// `t_send + D - M`; `None` for `local`, until a first renewal is
-    /// answered, and once fenced (section 8.4). An `uncertain` lease with
-    /// `None` never expires by the clock.
+    /// answered, and once fenced (section 8.4). A lease converted from
+    /// `local` gets it when its first renewal is sent instead: its
+    /// provisional deadline (section 8.4 "Changing the mode", ADR 0241). An
+    /// `uncertain` lease with `None` never expires by the clock.
     pub valid_until: Option<Instant>,
     /// `valid_until` as it is stored: `CLOCK_BOOTTIME(t_send) + D - M`, read
     /// when the renewal was sent (section 8.4 "Agent restart", ADR 0240), or
     /// the stored deadline a restore found. `None` whenever `valid_until` is,
     /// and on a host that cannot tell its boot.
     validity: Option<StoredValidity>,
+    /// Whether `valid_until` is still a converted lease's provisional
+    /// deadline: its first renewal is out, and no answer has been taken since
+    /// the conversion (ADR 0241). The conversion grant counts toward no gate,
+    /// so until an answer is taken no gate backs this deadline.
+    provisional: bool,
     /// When to send the next renewal; `None` for `local` (section 8.4).
     next_renew_at: Option<Instant>,
     /// Renewals sent and not yet answered.
@@ -87,9 +94,10 @@ struct Renewal {
     msg: MsgId,
     /// `t_send`, on the lease clock.
     sent: Instant,
-    /// The stored deadline an answer to it gives: `CLOCK_BOOTTIME` read before
-    /// `sent`, plus `D - M`.
-    validity: Option<StoredValidity>,
+    /// `CLOCK_BOOTTIME` read before `sent`, in its stored form. An answer
+    /// stores this plus its own `D - M`: the answer may carry another
+    /// duration than the lease had when the renewal went out.
+    sent_boottime: Option<StoredValidity>,
 }
 
 impl Lease {
@@ -97,6 +105,22 @@ impl Lease {
     #[must_use]
     pub fn validity(&self) -> Option<&StoredValidity> {
         self.validity.as_ref()
+    }
+
+    /// Whether this is a lease converted from `local` to `expiring` whose
+    /// first renewal has not been sent yet (section 8.4 "Changing the mode",
+    /// ADR 0241). The authority has set no gate for it, so it behaves as
+    /// `local`: a lost session neither makes it `uncertain` nor stops its
+    /// VMs.
+    ///
+    /// Only such a lease is `held` and `expiring` without a deadline: any
+    /// other becomes `held` through an answer, which sets `valid_until`, and
+    /// keeps it until it is fenced.
+    #[must_use]
+    pub fn awaits_first_renewal(&self) -> bool {
+        self.mode == LeaseMode::Expiring
+            && self.state == LeaseState::Held
+            && self.valid_until.is_none()
     }
 
     /// Brings every instant the lease keeps on the lease clock earlier by
@@ -328,6 +352,7 @@ impl LeaseTable {
                     duration: stored.duration,
                     valid_until,
                     validity,
+                    provisional: false,
                     // A lease that came back with its validity renews at once
                     // (section 8.4 "Agent restart").
                     next_renew_at: valid_until.map(|_| now.instant),
@@ -363,7 +388,8 @@ impl LeaseTable {
         now: Instant,
     ) -> Result<(), Refusal> {
         // Section 8.4 floor: `expiring` carries a duration of at least
-        // 3 000 ms; `local` carries none (section 5.12).
+        // 3 000 ms and at most 600 000 ms; `local` carries none (section
+        // 5.12).
         let duration = match grant.mode {
             LeaseMode::Expiring => {
                 let Some(ms) = grant.duration_ms else {
@@ -375,6 +401,11 @@ impl LeaseTable {
                 if duration < MIN_DURATION {
                     return Err(Refusal::BadMessage(format!(
                         "duration_ms {ms} is below the {MIN_DURATION:?} floor"
+                    )));
+                }
+                if duration > MAX_DURATION {
+                    return Err(Refusal::BadMessage(format!(
+                        "duration_ms {ms} is above the {MAX_DURATION:?} ceiling"
                     )));
                 }
                 Some(duration)
@@ -389,14 +420,14 @@ impl LeaseTable {
             }
         };
 
-        // A lease id may only ever name one resource and one mode.
+        // A lease id may only ever name one resource. Its mode may change
+        // (section 8.4 "Changing the mode", ADR 0241).
         if let Some(existing) = self.leases.get(&grant.lease_id)
             && (existing.resource_type != grant.resource_type
-                || existing.resource_id != grant.resource_id
-                || existing.mode != grant.mode)
+                || existing.resource_id != grant.resource_id)
         {
             return Err(Refusal::BadMessage(format!(
-                "lease {} already names a different resource or mode",
+                "lease {} already names a different resource",
                 grant.lease_id.0
             )));
         }
@@ -432,6 +463,44 @@ impl LeaseTable {
             }
         }
 
+        // Section 5.12 and section 8.4 "Changing the mode" (ADR 0241): the
+        // same token with the other mode changes the mode of the lease the
+        // node holds. It is no ownership change and answers no renewal, so an
+        // `expiring` grant that answers one is not a conversion: a late answer
+        // to a renewal sent before a `local` grant ended the renewals finds
+        // no outstanding renewal below and changes nothing.
+        if same_token
+            && !(grant.mode == LeaseMode::Expiring && answers.is_some())
+            && existing
+                .as_ref()
+                .is_some_and(|existing| existing.mode != grant.mode)
+            && let Some(lease) = self.leases.get_mut(&grant.lease_id)
+        {
+            // Past its `valid_until` the lease is due to expire at the next
+            // poll (section 8.4), and no change of mode revives it.
+            if lease.valid_until.is_some_and(|until| until <= now) {
+                return Ok(());
+            }
+            lease.state = LeaseState::Held;
+            lease.duration = duration;
+            lease.valid_until = None;
+            lease.validity = None;
+            lease.provisional = false;
+            lease.outstanding.clear();
+            if duration.is_some() {
+                // To `expiring`: the lease stays `held`, its VMs run on, and
+                // it renews at once. Its first renewal gives it a provisional
+                // deadline ([`Self::renew_sent`]).
+                lease.mode = LeaseMode::Expiring;
+                lease.next_renew_at = Some(now);
+            } else {
+                // To `local`: the renewals end, and so does the deadline.
+                lease.mode = LeaseMode::Local;
+                lease.next_renew_at = None;
+            }
+            return Ok(());
+        }
+
         match duration {
             // Section 8.3: a local lease has no timing at all.
             None => {
@@ -453,6 +522,7 @@ impl LeaseTable {
                         duration: None,
                         valid_until: None,
                         validity: None,
+                        provisional: false,
                         next_renew_at: None,
                         outstanding: Vec::new(),
                     },
@@ -473,7 +543,7 @@ impl LeaseTable {
                     });
                     let Some(Renewal {
                         sent: t_send,
-                        validity,
+                        sent_boottime,
                         ..
                     }) = answered
                     else {
@@ -481,10 +551,21 @@ impl LeaseTable {
                     };
                     // An answer that arrives once its own `valid_until` has
                     // passed proves nothing still valid: it changes nothing,
-                    // and the renewals go on. A held lease's current
-                    // `valid_until` is no later, so the clock expires it.
+                    // and the renewals go on. A `valid_until` an earlier
+                    // answer set stands, as that answer's gate does. A
+                    // provisional deadline has no gate behind it (ADR 0241),
+                    // and this answer may carry a shorter duration than the
+                    // conversion did: the lease takes the answer's deadline,
+                    // already past, and expires at the next poll.
                     let valid_until = t_send + (d - margin(d));
                     if valid_until <= now {
+                        if let Some(lease) = self.leases.get_mut(&grant.lease_id)
+                            && lease.provisional
+                            && lease.valid_until.is_some_and(|until| until > valid_until)
+                        {
+                            lease.valid_until = Some(valid_until);
+                            lease.validity = sent_boottime.map(|at| at.later_by(d - margin(d)));
+                        }
                         return Ok(());
                     }
                     // Section 8.4: `valid_until = t_send + D - M`, renew every
@@ -507,8 +588,11 @@ impl LeaseTable {
                         lease.valid_until = Some(valid_until);
                         // ADR 0240: the stored deadline comes from the
                         // reading made when the renewal was sent, so a
-                        // suspend before the answer cannot make it later.
-                        lease.validity = validity;
+                        // suspend before the answer cannot make it later,
+                        // and from this answer's duration, like
+                        // `valid_until`.
+                        lease.validity = sent_boottime.map(|at| at.later_by(d - margin(d)));
+                        lease.provisional = false;
                         lease.next_renew_at = Some(t_send + d / 3);
                         lease.outstanding = outstanding;
                     }
@@ -519,13 +603,17 @@ impl LeaseTable {
                 // cannot prove the new grant until a renewal is answered, so
                 // the lease is `uncertain` and renews immediately. It never
                 // extends the validity the previous ownership had.
-                let (valid_until, validity) = existing
+                let (valid_until, validity, provisional) = existing
                     .as_ref()
                     .filter(|existing| {
                         matches!(existing.state, LeaseState::Held | LeaseState::Uncertain)
                     })
-                    .map_or((None, None), |existing| {
-                        (existing.valid_until, existing.validity.clone())
+                    .map_or((None, None, false), |existing| {
+                        (
+                            existing.valid_until,
+                            existing.validity.clone(),
+                            existing.provisional,
+                        )
                     });
                 self.highest_token.insert(key, grant.fencing_token);
                 self.leases.insert(
@@ -540,6 +628,7 @@ impl LeaseTable {
                         duration: Some(d),
                         valid_until,
                         validity,
+                        provisional,
                         next_renew_at: Some(now),
                         outstanding: Vec::new(),
                     },
@@ -588,34 +677,75 @@ impl LeaseTable {
     /// reading taken just before it was handed to the session. Its instant is
     /// `t_send`, and its `CLOCK_BOOTTIME` gives the deadline an answer stores
     /// (section 8.4 "Agent restart", ADR 0240).
-    pub fn renew_sent(&mut self, lease_id: &LeaseId, msg: MsgId, sent: &HostNow) {
+    ///
+    /// Returns whether the renewal gave a converted lease its provisional
+    /// deadline (ADR 0241): the caller stores the lease then, so an agent
+    /// restart keeps that deadline.
+    pub fn renew_sent(&mut self, lease_id: &LeaseId, msg: MsgId, sent: &HostNow) -> bool {
         let now = sent.instant;
         let Some(lease) = self.leases.get_mut(lease_id) else {
-            return;
+            return false;
         };
         if lease.mode != LeaseMode::Expiring
             || !matches!(lease.state, LeaseState::Held | LeaseState::Uncertain)
         {
-            return;
+            return false;
         }
         let Some(d) = lease.duration else {
-            return;
+            return false;
         };
+        let deadline = now + (d - margin(d));
+        let sent_boottime = sent.store(now);
+        // ADR 0241: the first renewal of a converted lease gives it a
+        // provisional deadline, the `valid_until` an answer to it would set.
+        // Any later answer sets one no earlier, so the deadline moves later
+        // only on proof from the authority.
+        let provisional = lease.awaits_first_renewal();
+        if provisional {
+            lease.valid_until = Some(deadline);
+            lease.validity = sent_boottime.as_ref().map(|at| at.later_by(d - margin(d)));
+            lease.provisional = true;
+        }
         prune_outstanding(&mut lease.outstanding, d, now);
         lease.outstanding.push(Renewal {
             msg,
             sent: now,
-            validity: sent.store(now + (d - margin(d))),
+            sent_boottime,
         });
         lease.next_renew_at = Some(now + d / 3);
+        provisional
+    }
+
+    /// Takes back a renewal [`Self::renew_sent`] recorded that never reached
+    /// the session. Its answer can never come, and a converted lease whose
+    /// first renewal it was gets its provisional deadline taken back with it
+    /// (`provisional`, as `renew_sent` returned it): until a first renewal is
+    /// sent, the lease behaves as `local` (ADR 0241).
+    pub fn renewal_not_sent(&mut self, lease_id: &LeaseId, msg: &MsgId, provisional: bool) {
+        let Some(lease) = self.leases.get_mut(lease_id) else {
+            return;
+        };
+        lease.outstanding.retain(|renewal| renewal.msg != *msg);
+        if provisional && lease.outstanding.is_empty() {
+            lease.valid_until = None;
+            lease.validity = None;
+            lease.provisional = false;
+        }
     }
 
     /// The authority is unreachable (section 8.4): every expiring lease that
-    /// was held becomes uncertain. Local leases never change for this reason
+    /// was held becomes uncertain, except a converted lease whose first
+    /// renewal was not sent yet. Local leases never change for this reason
     /// (section 8.3).
     pub fn authority_unreachable(&mut self, _now: Instant) {
         for lease in self.leases.values_mut() {
-            if lease.mode == LeaseMode::Expiring && lease.state == LeaseState::Held {
+            // A converted lease whose first renewal was not sent stays
+            // `held`: no gate exists for it yet, so the app runs on (ADR
+            // 0241).
+            if lease.mode == LeaseMode::Expiring
+                && lease.state == LeaseState::Held
+                && !lease.awaits_first_renewal()
+            {
                 lease.state = LeaseState::Uncertain;
             }
         }
@@ -737,7 +867,9 @@ impl LeaseTable {
     ///
     /// An `expiring` lease must also be before its `valid_until` at `now`:
     /// it stays `held` past that instant until the next [`Self::poll`], and
-    /// nothing may start in that gap (section 8.4).
+    /// nothing may start in that gap (section 8.4). A converted lease starts
+    /// nothing until its first renewal gives it a provisional deadline (ADR
+    /// 0241); its VMs that already run keep running.
     #[must_use]
     pub fn may_start_stateful(&self, lease_id: &LeaseId, spec_token: u64, now: Instant) -> bool {
         self.leases.get(lease_id).is_some_and(|lease| {
@@ -820,7 +952,7 @@ mod tests {
     use std::time::Duration;
 
     use quoro_proto::{
-        FenceReason, LeaseGrant, LeaseId, LeaseMode, LeaseRevoke, MsgId, ResourceType,
+        FenceReason, LeaseGrant, LeaseId, LeaseMode, LeaseRevoke, MsgId, ResourceType, RevokeReason,
     };
     use tokio::time::Instant;
 
@@ -1077,22 +1209,631 @@ mod tests {
     }
 
     #[test]
-    fn a_lease_id_cannot_change_resource_or_mode() {
+    fn a_lease_id_cannot_change_resource() {
         let now = Instant::now();
         let mut table = LeaseTable::new();
         table
             .on_grant(&local("lse_a", 1), None, now)
             .expect("grant");
-        let mut other_resource = local("lse_a", 2);
-        other_resource.resource_id = "app_other".to_string();
+        for token in [1, 2] {
+            let mut other_resource = local("lse_a", token);
+            other_resource.resource_id = "app_other".to_string();
+            assert!(matches!(
+                table.on_grant(&other_resource, None, now),
+                Err(Refusal::BadMessage(_))
+            ));
+        }
+        let lease = table.get(&LeaseId("lse_a".to_string())).expect("lease");
+        assert_eq!(lease.resource_id, "app_test");
+        assert_eq!(lease.token, 1);
+    }
+
+    /// Section 8.4 "Changing the mode" (ADR 0241): a same-token `expiring`
+    /// grant converts a held `local` lease. It stays `held` and keeps its
+    /// VMs, but starts nothing until its first renewal is sent, which it is
+    /// at once. That renewal gives it a provisional deadline,
+    /// `t_send + D - M`, and the clock fences it there when no answer comes.
+    #[test]
+    fn a_same_token_expiring_grant_converts_a_local_lease() {
+        let t0 = Instant::now();
+        let mut table = LeaseTable::new();
+        table.on_grant(&local("lse_a", 1), None, t0).expect("grant");
+        let id = LeaseId("lse_a".to_string());
+        table
+            .on_grant(&expiring("lse_a", 1, 15000), None, t0)
+            .expect("the conversion is taken");
+        let lease = table.get(&id).expect("lease");
+        assert_eq!(lease.mode, LeaseMode::Expiring);
+        assert_eq!(lease.state, LeaseState::Held);
+        assert_eq!(lease.token, 1, "no ownership change");
+        assert_eq!(lease.valid_until, None, "the conversion answers no renewal");
+        assert!(lease.awaits_first_renewal());
+        assert!(table.may_keep_running(&id, 1), "its VMs run on");
+        assert!(!table.may_start_stateful(&id, 1, t0));
+        assert!(table.has_timed_leases());
+
+        let t_send = t0 + millis(10);
+        assert_eq!(
+            table.poll(t_send),
+            vec![Action::SendRenew {
+                lease_id: id.clone(),
+                fencing_token: 1,
+            }],
+            "renews at once"
+        );
+        assert!(
+            table.renew_sent(
+                &id,
+                MsgId("msg_first".to_string()),
+                &HostNow::unknown(t_send)
+            ),
+            "the first renewal sets the provisional deadline"
+        );
+        let deadline = t_send + millis(13_500);
+        assert_eq!(table.get(&id).expect("lease").valid_until, Some(deadline));
+        assert!(!table.get(&id).expect("lease").awaits_first_renewal());
+        assert!(table.may_start_stateful(&id, 1, t_send));
+
+        // A later renewal leaves the provisional deadline where it is.
+        let later = t_send + millis(5000);
         assert!(matches!(
-            table.on_grant(&other_resource, None, now),
+            table.poll(later).as_slice(),
+            [Action::SendRenew { .. }]
+        ));
+        assert!(!table.renew_sent(
+            &id,
+            MsgId("msg_second".to_string()),
+            &HostNow::unknown(later)
+        ));
+        assert_eq!(table.get(&id).expect("lease").valid_until, Some(deadline));
+
+        assert!(
+            !table
+                .poll(deadline - millis(1))
+                .iter()
+                .any(|action| matches!(action, Action::Fence { .. }))
+        );
+        assert!(table.poll(deadline).contains(&Action::Fence {
+            lease_id: id.clone(),
+            reason: FenceReason::LeaseExpired,
+        }));
+        assert_eq!(table.get(&id).expect("lease").state, LeaseState::Expired);
+    }
+
+    /// ADR 0241: an answer computes `valid_until` from the send time of the
+    /// renewal it answers, so after a conversion the deadline moves later
+    /// only when the authority answers a later renewal.
+    #[test]
+    fn an_answer_moves_a_converted_lease_s_deadline_from_its_renewal() {
+        let t0 = Instant::now();
+        let mut table = LeaseTable::new();
+        table.on_grant(&local("lse_a", 1), None, t0).expect("grant");
+        let grant = expiring("lse_a", 1, 15000);
+        table.on_grant(&grant, None, t0).expect("conversion");
+        let id = LeaseId("lse_a".to_string());
+        let first = MsgId("msg_first".to_string());
+        assert!(matches!(
+            table.poll(t0).as_slice(),
+            [Action::SendRenew { .. }]
+        ));
+        assert!(table.renew_sent(&id, first.clone(), &HostNow::unknown(t0)));
+
+        table
+            .on_grant(&grant, Some(&first), t0 + millis(40))
+            .expect("the answer");
+        let lease = table.get(&id).expect("lease");
+        assert_eq!(lease.state, LeaseState::Held);
+        assert_eq!(
+            lease.valid_until,
+            Some(t0 + millis(13_500)),
+            "the same deadline"
+        );
+
+        let later = t0 + millis(5000);
+        let second = MsgId("msg_second".to_string());
+        assert!(matches!(
+            table.poll(later).as_slice(),
+            [Action::SendRenew { .. }]
+        ));
+        assert!(!table.renew_sent(&id, second.clone(), &HostNow::unknown(later)));
+        table
+            .on_grant(&grant, Some(&second), later + millis(40))
+            .expect("the second answer");
+        assert_eq!(
+            table.get(&id).expect("lease").valid_until,
+            Some(later + millis(13_500))
+        );
+    }
+
+    /// ADR 0241: a late answer to a converted lease's renewal, one that
+    /// arrives once its own deadline has passed, may carry a shorter duration
+    /// than the conversion did. No gate backs the provisional deadline, so
+    /// the lease takes the answer's deadline and expires at the next poll. A
+    /// deadline an answer set stands through a later late answer.
+    #[test]
+    fn a_late_answer_ends_a_provisional_deadline_but_not_an_answered_one() {
+        let t0 = Instant::now();
+        let id = LeaseId("lse_a".to_string());
+        let first = MsgId("msg_first".to_string());
+        let converted = |at: Instant| {
+            let mut table = LeaseTable::new();
+            table.on_grant(&local("lse_a", 1), None, at).expect("grant");
+            table
+                .on_grant(&expiring("lse_a", 1, 15000), None, at)
+                .expect("conversion");
+            assert!(matches!(
+                table.poll(at).as_slice(),
+                [Action::SendRenew { .. }]
+            ));
+            assert!(table.renew_sent(&id, first.clone(), &HostNow::unknown(at)));
+            table
+        };
+
+        let mut table = converted(t0);
+        let late = t0 + millis(2500);
+        table
+            .on_grant(&expiring("lse_a", 1, 3000), Some(&first), late)
+            .expect("the late answer");
+        assert_eq!(
+            table.get(&id).expect("lease").valid_until,
+            Some(t0 + millis(2000)),
+            "the answer's deadline, already past"
+        );
+        assert!(table.poll(late).contains(&Action::Fence {
+            lease_id: id.clone(),
+            reason: FenceReason::LeaseExpired,
+        }));
+
+        let mut table = converted(t0);
+        table
+            .on_grant(&expiring("lse_a", 1, 15000), Some(&first), t0 + millis(40))
+            .expect("the answer");
+        let later = t0 + millis(5000);
+        let second = MsgId("msg_second".to_string());
+        assert!(matches!(
+            table.poll(later).as_slice(),
+            [Action::SendRenew { .. }]
+        ));
+        assert!(!table.renew_sent(&id, second.clone(), &HostNow::unknown(later)));
+        table
+            .on_grant(
+                &expiring("lse_a", 1, 3000),
+                Some(&second),
+                later + millis(2500),
+            )
+            .expect("the late answer");
+        let lease = table.get(&id).expect("lease");
+        assert_eq!(lease.valid_until, Some(t0 + millis(13_500)), "it stands");
+        assert_eq!(lease.state, LeaseState::Held);
+    }
+
+    /// ADR 0241: until its first renewal is sent, a lost session leaves a
+    /// converted lease `held`, because no gate exists for it yet. Once that
+    /// renewal is out, a lost session makes it `uncertain` like any other
+    /// `expiring` lease, and it keeps its VMs until its deadline.
+    #[test]
+    fn a_converted_lease_stays_held_through_a_lost_session_until_its_first_renewal() {
+        let t0 = Instant::now();
+        let mut table = LeaseTable::new();
+        table.on_grant(&local("lse_a", 1), None, t0).expect("grant");
+        table
+            .on_grant(&expiring("lse_a", 1, 15000), None, t0)
+            .expect("conversion");
+        let id = LeaseId("lse_a".to_string());
+
+        table.authority_unreachable(t0);
+        assert_eq!(table.get(&id).expect("lease").state, LeaseState::Held);
+        assert!(table.may_keep_running(&id, 1));
+        // With no session, nothing is sent: the lease stays as it was, and no
+        // clock fences it.
+        let _ = table.poll(t0 + millis(60_000));
+        assert_eq!(table.get(&id).expect("lease").state, LeaseState::Held);
+        assert_eq!(table.get(&id).expect("lease").valid_until, None);
+
+        let t_send = t0 + millis(60_000);
+        table.renew_now(t_send);
+        assert!(matches!(
+            table.poll(t_send).as_slice(),
+            [Action::SendRenew { .. }]
+        ));
+        assert!(table.renew_sent(
+            &id,
+            MsgId("msg_first".to_string()),
+            &HostNow::unknown(t_send)
+        ));
+        table.authority_unreachable(t_send);
+        let lease = table.get(&id).expect("lease");
+        assert_eq!(lease.state, LeaseState::Uncertain);
+        assert!(table.may_keep_running(&id, 1), "until its deadline");
+        assert!(!table.may_start_stateful(&id, 1, t_send));
+        assert!(
+            table
+                .poll(t_send + millis(13_500))
+                .contains(&Action::Fence {
+                    lease_id: id.clone(),
+                    reason: FenceReason::LeaseExpired,
+                })
+        );
+    }
+
+    /// Section 8.4 "Changing the mode": a same-token `local` grant ends the
+    /// renewals of an `expiring` lease. The node drops `valid_until` and
+    /// keeps the lease `held` as `local`, from `held` or `uncertain`.
+    #[test]
+    fn a_same_token_local_grant_converts_an_expiring_lease() {
+        for unreachable in [false, true] {
+            let t0 = Instant::now();
+            let mut table = LeaseTable::new();
+            let grant = expiring("lse_e", 1, 15000);
+            table.on_grant(&grant, None, t0).expect("grant");
+            confirm(&mut table, &grant, t0);
+            let id = LeaseId("lse_e".to_string());
+            let later = t0 + millis(5000);
+            assert!(matches!(
+                table.poll(later).as_slice(),
+                [Action::SendRenew { .. }]
+            ));
+            table.renew_sent(&id, MsgId("msg_out".to_string()), &HostNow::unknown(later));
+            if unreachable {
+                table.authority_unreachable(later);
+                assert_eq!(table.get(&id).expect("lease").state, LeaseState::Uncertain);
+            }
+
+            table
+                .on_grant(&local("lse_e", 1), None, later)
+                .expect("the conversion is taken");
+            let lease = table.get(&id).expect("lease");
+            assert_eq!(lease.mode, LeaseMode::Local);
+            assert_eq!(lease.state, LeaseState::Held);
+            assert_eq!(lease.token, 1);
+            assert_eq!(lease.duration, None);
+            assert_eq!(lease.valid_until, None);
+            assert_eq!(lease.validity(), None);
+            assert!(!table.has_timed_leases());
+            assert_eq!(
+                table.next_deadline(later),
+                None,
+                "no renewal and no deadline"
+            );
+            assert!(table.poll(t0 + millis(60_000)).is_empty());
+            assert!(table.may_start_stateful(&id, 1, t0 + millis(60_000)));
+
+            // A late answer to the renewal sent before is an answer, not a
+            // conversion: it answers no renewal the lease still has, so it
+            // changes nothing.
+            table
+                .on_grant(&grant, Some(&MsgId("msg_out".to_string())), later)
+                .expect("taken");
+            let lease = table.get(&id).expect("lease");
+            assert_eq!(lease.mode, LeaseMode::Local);
+            assert_eq!(lease.valid_until, None);
+            assert!(table.poll(later).is_empty(), "no renewal");
+        }
+    }
+
+    /// Section 8.4: a lease past its `valid_until` expires at the next poll,
+    /// and a change of mode that arrives first does not revive it.
+    #[test]
+    fn a_mode_change_past_valid_until_changes_nothing() {
+        let t0 = Instant::now();
+        let mut table = LeaseTable::new();
+        let grant = expiring("lse_e", 1, 15000);
+        table.on_grant(&grant, None, t0).expect("grant");
+        confirm(&mut table, &grant, t0);
+        let id = LeaseId("lse_e".to_string());
+        let until = t0 + millis(13_500);
+        table
+            .on_grant(&local("lse_e", 1), None, until)
+            .expect("taken");
+        let lease = table.get(&id).expect("lease");
+        assert_eq!(lease.mode, LeaseMode::Expiring);
+        assert_eq!(lease.valid_until, Some(until));
+        assert!(table.poll(until).contains(&Action::Fence {
+            lease_id: id.clone(),
+            reason: FenceReason::LeaseExpired,
+        }));
+    }
+
+    /// ADR 0241: a revoke fences a converted lease like any other, before
+    /// its first renewal and after.
+    #[test]
+    fn a_revoke_fences_a_converted_lease() {
+        for after_first_renewal in [false, true] {
+            let t0 = Instant::now();
+            let mut table = LeaseTable::new();
+            table.on_grant(&local("lse_a", 1), None, t0).expect("grant");
+            table
+                .on_grant(&expiring("lse_a", 1, 15000), None, t0)
+                .expect("conversion");
+            let id = LeaseId("lse_a".to_string());
+            if after_first_renewal {
+                assert!(matches!(
+                    table.poll(t0).as_slice(),
+                    [Action::SendRenew { .. }]
+                ));
+                assert!(table.renew_sent(
+                    &id,
+                    MsgId("msg_first".to_string()),
+                    &HostNow::unknown(t0)
+                ));
+            }
+            let outcome = table
+                .on_revoke(&LeaseRevoke {
+                    lease_id: id.clone(),
+                    fencing_token: 1,
+                    reason: RevokeReason::Moved,
+                })
+                .expect("revoke");
+            assert_eq!(
+                outcome,
+                RevokeOutcome::Fence {
+                    lease_id: id.clone()
+                }
+            );
+            let lease = table.get(&id).expect("lease");
+            assert_eq!(lease.state, LeaseState::Revoked);
+            assert!(!table.may_keep_running(&id, 1));
+            assert!(table.poll(t0 + millis(60_000)).is_empty());
+        }
+    }
+
+    /// A higher token over a converted lease is a new ownership (section
+    /// 8.4): the lease keeps the deadline it has, if any. Before its first
+    /// renewal it has none, so it keeps no VMs.
+    #[test]
+    fn a_higher_token_over_a_converted_lease_keeps_only_its_deadline() {
+        for after_first_renewal in [false, true] {
+            let t0 = Instant::now();
+            let mut table = LeaseTable::new();
+            table.on_grant(&local("lse_a", 1), None, t0).expect("grant");
+            table
+                .on_grant(&expiring("lse_a", 1, 15000), None, t0)
+                .expect("conversion");
+            let id = LeaseId("lse_a".to_string());
+            if after_first_renewal {
+                assert!(matches!(
+                    table.poll(t0).as_slice(),
+                    [Action::SendRenew { .. }]
+                ));
+                assert!(table.renew_sent(
+                    &id,
+                    MsgId("msg_first".to_string()),
+                    &HostNow::unknown(t0)
+                ));
+            }
+            table
+                .on_grant(&expiring("lse_a", 2, 15000), None, t0)
+                .expect("a new ownership");
+            let lease = table.get(&id).expect("lease");
+            assert_eq!(lease.state, LeaseState::Uncertain);
+            assert_eq!(
+                lease.valid_until,
+                after_first_renewal.then(|| t0 + millis(13_500))
+            );
+            assert_eq!(table.may_keep_running(&id, 2), after_first_renewal);
+        }
+    }
+
+    /// ADR 0244: the primary may send the conversion again. A lease already
+    /// `expiring` takes it as a grant that answers no renewal, which changes
+    /// nothing, so the provisional deadline stays where it is.
+    #[test]
+    fn a_resent_conversion_changes_nothing() {
+        let t0 = Instant::now();
+        let mut table = LeaseTable::new();
+        table.on_grant(&local("lse_a", 1), None, t0).expect("grant");
+        let conversion = expiring("lse_a", 1, 15000);
+        table.on_grant(&conversion, None, t0).expect("conversion");
+        let id = LeaseId("lse_a".to_string());
+        assert!(matches!(
+            table.poll(t0).as_slice(),
+            [Action::SendRenew { .. }]
+        ));
+        assert!(table.renew_sent(&id, MsgId("msg_first".to_string()), &HostNow::unknown(t0)));
+        let before = table.get(&id).expect("lease").clone();
+        table
+            .on_grant(&conversion, None, t0 + millis(1000))
+            .expect("taken");
+        assert_eq!(table.get(&id).expect("lease"), &before);
+    }
+
+    /// A renewal that never reached the session is taken back. For a
+    /// converted lease's first renewal its provisional deadline goes too, so
+    /// the lease behaves as `local` again until a renewal is sent (ADR 0241).
+    #[test]
+    fn a_renewal_not_sent_takes_back_the_provisional_deadline() {
+        let t0 = Instant::now();
+        let mut table = LeaseTable::new();
+        table.on_grant(&local("lse_a", 1), None, t0).expect("grant");
+        table
+            .on_grant(&expiring("lse_a", 1, 15000), None, t0)
+            .expect("conversion");
+        let id = LeaseId("lse_a".to_string());
+        let msg = MsgId("msg_first".to_string());
+        assert!(matches!(
+            table.poll(t0).as_slice(),
+            [Action::SendRenew { .. }]
+        ));
+        assert!(table.renew_sent(&id, msg.clone(), &HostNow::unknown(t0)));
+        table.renewal_not_sent(&id, &msg, true);
+        let lease = table.get(&id).expect("lease");
+        assert!(lease.awaits_first_renewal());
+        assert_eq!(lease.validity(), None);
+        table.authority_unreachable(t0);
+        assert_eq!(table.get(&id).expect("lease").state, LeaseState::Held);
+        // Its answer, should one come, answers nothing.
+        table
+            .on_grant(&expiring("lse_a", 1, 15000), Some(&msg), t0)
+            .expect("taken");
+        assert_eq!(table.get(&id).expect("lease").valid_until, None);
+    }
+
+    /// ADR 0240: the stored deadline is `CLOCK_BOOTTIME(t_send)` plus the
+    /// answer's own `D - M`, like `valid_until`, also when the answer carries
+    /// another duration than the lease had when the renewal went out (the end
+    /// of a maintenance window).
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_stores_the_deadline_of_its_own_duration() {
+        let clock = ManualHostClock::new(Some("boot-a"), millis(500_000));
+        let t0 = Instant::now();
+        let mut table = LeaseTable::new();
+        let window = expiring("lse_e", 1, 60_000);
+        table.on_grant(&window, None, t0).expect("grant");
+        confirm_with(&mut table, &window, &HostNow::read(&clock));
+        let id = LeaseId("lse_e".to_string());
+        tokio::time::advance(millis(20_000)).await;
+        let reading = HostNow::read(&clock);
+        assert!(matches!(
+            table.poll(reading.instant).as_slice(),
+            [Action::SendRenew { .. }]
+        ));
+        let msg = MsgId("msg_after_window".to_string());
+        table.renew_sent(&id, msg.clone(), &reading);
+        table
+            .on_grant(&expiring("lse_e", 1, 15000), Some(&msg), reading.instant)
+            .expect("the answer");
+        let lease = table.get(&id).expect("lease");
+        assert_eq!(lease.valid_until, Some(reading.instant + millis(13_500)));
+        assert_eq!(
+            lease.validity(),
+            Some(&StoredValidity {
+                boot_id: "boot-a".to_string(),
+                until_boottime: millis(520_000 + 13_500),
+            })
+        );
+    }
+
+    /// Section 5.12: `duration_ms` is at most 600 000.
+    #[test]
+    fn a_grant_above_the_duration_ceiling_is_refused() {
+        let now = Instant::now();
+        let mut table = LeaseTable::new();
+        assert!(matches!(
+            table.on_grant(&expiring("lse_e", 1, 600_001), None, now),
             Err(Refusal::BadMessage(_))
         ));
+        assert!(table.get(&LeaseId("lse_e".to_string())).is_none());
+        table
+            .on_grant(&expiring("lse_e", 1, 600_000), None, now)
+            .expect("the ceiling itself is taken");
+    }
+
+    /// A higher token is a new ownership whatever the mode, so a lease id
+    /// that held one mode can be granted again with the other (section 5.12).
+    /// A held `local` lease that a higher `expiring` grant replaces has no
+    /// deadline to keep: it is `uncertain` without one, so its VMs stop.
+    #[test]
+    fn a_higher_token_may_carry_the_other_mode() {
+        let t0 = Instant::now();
+        let mut table = LeaseTable::new();
+        table.on_grant(&local("lse_a", 1), None, t0).expect("grant");
+        table
+            .on_grant(&expiring("lse_a", 2, 15000), None, t0)
+            .expect("a new ownership");
+        let id = LeaseId("lse_a".to_string());
+        let lease = table.get(&id).expect("lease");
+        assert_eq!(lease.state, LeaseState::Uncertain);
+        assert_eq!(lease.valid_until, None);
+        assert!(!table.may_keep_running(&id, 2));
+        assert!(!table.may_keep_running(&id, 1));
+
+        let mut table = LeaseTable::new();
+        let grant = expiring("lse_e", 1, 15000);
+        table.on_grant(&grant, None, t0).expect("grant");
+        confirm(&mut table, &grant, t0);
+        let id = LeaseId("lse_e".to_string());
+        table
+            .on_revoke(&LeaseRevoke {
+                lease_id: id.clone(),
+                fencing_token: 2,
+                reason: RevokeReason::Moved,
+            })
+            .expect("revoke");
+        table
+            .on_grant(&local("lse_e", 3), None, t0)
+            .expect("granted again as local");
+        let lease = table.get(&id).expect("lease");
+        assert_eq!(
+            (lease.mode, lease.state, lease.token),
+            (LeaseMode::Local, LeaseState::Held, 3)
+        );
+    }
+
+    /// ADR 0240 and 0241: the provisional deadline is on the lease clock like
+    /// any `valid_until`, so a suspend moves it earlier. Before the first
+    /// renewal there is none to move, and the renewal still goes out at once.
+    #[test]
+    fn a_suspend_moves_a_converted_lease_s_provisional_deadline() {
+        let t0 = Instant::now();
+        let mut table = LeaseTable::new();
+        table.on_grant(&local("lse_a", 1), None, t0).expect("grant");
+        table
+            .on_grant(&expiring("lse_a", 1, 15000), None, t0)
+            .expect("conversion");
+        let id = LeaseId("lse_a".to_string());
+        assert_eq!(table.catch_up(millis(2000), t0), millis(2000));
+        assert_eq!(table.get(&id).expect("lease").valid_until, None);
         assert!(matches!(
-            table.on_grant(&expiring("lse_a", 2, 15000), None, now),
-            Err(Refusal::BadMessage(_))
+            table.poll(t0).as_slice(),
+            [Action::SendRenew { .. }]
         ));
+        assert!(table.renew_sent(&id, MsgId("msg_first".to_string()), &HostNow::unknown(t0)));
+        assert_eq!(table.catch_up(millis(5000), t0), millis(3000));
+        assert_eq!(
+            table.get(&id).expect("lease").valid_until,
+            Some(t0 + millis(10_500))
+        );
+    }
+
+    /// Section 8.4 "Agent restart" (ADR 0241): a converted lease stored after
+    /// its first renewal keeps its provisional deadline across a restart. One
+    /// stored before has no deadline: nothing proves the authority set no
+    /// gate since, so it comes back `expired` and is fenced.
+    #[tokio::test(start_paused = true)]
+    async fn a_restore_keeps_a_converted_lease_s_provisional_deadline() {
+        let clock = ManualHostClock::new(Some("boot-a"), millis(500_000));
+        let t0 = Instant::now();
+        let mut table = LeaseTable::new();
+        table.on_grant(&local("lse_a", 1), None, t0).expect("grant");
+        table
+            .on_grant(&expiring("lse_a", 1, 15000), None, t0)
+            .expect("conversion");
+        let id = LeaseId("lse_a".to_string());
+        let before = StoredLease::from_lease(table.get(&id).expect("lease"));
+        assert_eq!(before.validity, None);
+        assert!(matches!(
+            table.poll(t0).as_slice(),
+            [Action::SendRenew { .. }]
+        ));
+        assert!(table.renew_sent(&id, MsgId("msg_first".to_string()), &HostNow::read(&clock)));
+        let after = StoredLease::from_lease(table.get(&id).expect("lease"));
+        assert_eq!(
+            after.validity,
+            Some(StoredValidity {
+                boot_id: "boot-a".to_string(),
+                until_boottime: millis(513_500),
+            })
+        );
+
+        tokio::time::advance(millis(4000)).await;
+        let now = HostNow::read(&clock);
+        let highest = vec![((ResourceType::App, "app_test".to_string()), 1_u64)];
+        let (restored, actions) =
+            LeaseTable::restore(vec![after], highest.clone(), &HashSet::new(), &now);
+        assert!(actions.is_empty());
+        let lease = restored.get(&id).expect("lease");
+        assert_eq!(lease.state, LeaseState::Uncertain);
+        assert_eq!(lease.valid_until, Some(now.instant + millis(9500)));
+
+        let (restored, actions) = LeaseTable::restore(vec![before], highest, &HashSet::new(), &now);
+        assert_eq!(
+            actions,
+            vec![Action::Fence {
+                lease_id: id.clone(),
+                reason: FenceReason::LeaseExpired,
+            }]
+        );
+        assert_eq!(restored.get(&id).expect("lease").state, LeaseState::Expired);
     }
 
     #[test]

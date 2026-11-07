@@ -352,6 +352,17 @@ pub struct StoredValidity {
     pub until_boottime: Duration,
 }
 
+impl StoredValidity {
+    /// The same boot's `CLOCK_BOOTTIME` `span` later.
+    #[must_use]
+    pub fn later_by(&self, span: Duration) -> Self {
+        Self {
+            boot_id: self.boot_id.clone(),
+            until_boottime: self.until_boottime.saturating_add(span),
+        }
+    }
+}
+
 /// One reading of the host clock and the monotonic clock together.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostNow {
