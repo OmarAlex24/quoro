@@ -56,16 +56,16 @@ function TokenRow({ token, onRevoke }: { token: ApiToken; onRevoke: (token: ApiT
           <span className="min-w-0 break-words type-body-medium text-[14px] text-ink">
             {token.name}
           </span>
-          <span className="text-[13px] text-ink-muted">{words}</span>
+          <span className="text-[13px] text-ink-2">{words}</span>
           <span className="inline-flex min-w-0 items-center gap-1">
-            <span className="type-data text-[13px] text-ink" title={token.id}>
+            <span className="type-code text-[12px] text-ink" title={token.id}>
               {shortId(token.id)}
             </span>
             <CopyButton value={token.id} label="Copy token id" />
           </span>
         </div>
 
-        <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px] text-ink-muted">
+        <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px] text-ink-2">
           <span className="type-data" title={token.created_at}>
             created {relativeTime(token.created_at)}
           </span>
@@ -84,7 +84,7 @@ function TokenRow({ token, onRevoke }: { token: ApiToken; onRevoke: (token: ApiT
       </div>
 
       {state === 'active' ? (
-        <Button variant="danger" size="compact" className="ml-auto" onClick={() => onRevoke(token)}>
+        <Button variant="danger" size="sm" className="ml-auto" onClick={() => onRevoke(token)}>
           Revoke
         </Button>
       ) : null}
@@ -169,9 +169,9 @@ export function ApiTokens() {
   const created = create.data;
 
   return (
-    <section className="mt-4 rounded-[6px] border border-rail bg-panel px-4 py-4 bay-shadow sm:px-5">
+    <section className="mt-4 rounded-[10px] border border-line bg-surface px-4 py-4 card-sheen sm:px-5">
       <h2 className="type-display text-[18px] leading-tight">API tokens</h2>
-      <p className="mt-1 max-w-2xl text-[13px] leading-snug text-ink-muted">
+      <p className="mt-1 max-w-2xl text-[13px] leading-snug text-ink-2">
         A token signs the quoro CLI or a script in as you, with your role. Give each machine its
         own, so revoking one leaves the others working.
       </p>
@@ -184,8 +184,8 @@ export function ApiTokens() {
             note="Copy it now. You will not see it again: Quoro keeps only a hash of it. Set it as QUORO_TOKEN for the CLI."
           />
           <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-            <span className="text-[13px] text-ink-muted">{expiryLine(created)}</span>
-            <Button variant="secondary" onClick={() => create.reset()}>
+            <span className="text-[13px] text-ink-2">{expiryLine(created)}</span>
+            <Button variant="default" onClick={() => create.reset()}>
               Done
             </Button>
           </div>
@@ -209,7 +209,7 @@ export function ApiTokens() {
           htmlFor="token-name"
           hint={
             nameError ? (
-              <span className="text-lamp-fault">{nameError}</span>
+              <span className="text-fault">{nameError}</span>
             ) : (
               'Where the token is used, for example laptop cli.'
             )
@@ -263,13 +263,13 @@ export function ApiTokens() {
       {listError ? (
         <ProblemBanner view={listError} className="mt-4" />
       ) : tokens.isPending ? (
-        <p className="mt-4 text-[13px] text-ink-muted">Loading tokens…</p>
+        <p className="mt-4 text-[13px] text-ink-2">Loading tokens…</p>
       ) : items.length === 0 ? (
-        <p className="mt-4 border-y border-rail py-3 text-[13px] text-ink-muted">
+        <p className="mt-4 border-y border-line py-3 text-[13px] text-ink-2">
           No tokens yet. Create one to use the CLI or the API.
         </p>
       ) : (
-        <ul className="mt-4 flex flex-col divide-y divide-rail border-y border-rail">
+        <ul className="mt-4 flex flex-col divide-y divide-line border-y border-line">
           {items.map((token) => (
             <TokenRow
               key={token.id}
@@ -304,9 +304,9 @@ export function ApiTokens() {
               The next request made with this token is refused, from the CLI or anywhere else, and
               terminal sessions it opened close at their next check. This cannot be undone.
             </p>
-            <div className="flex flex-wrap justify-end gap-2 border-t border-rail pt-4">
+            <div className="flex flex-wrap justify-end gap-2 border-t border-line pt-4">
               <Button
-                variant="secondary"
+                variant="default"
                 disabled={revoke.isPending}
                 onClick={() => {
                   setRevokeTarget(null);
@@ -316,7 +316,7 @@ export function ApiTokens() {
                 Keep token
               </Button>
               <Button
-                variant="danger"
+                variant="danger-solid"
                 disabled={revoke.isPending}
                 onClick={() => {
                   if (revokeTarget) revoke.mutate(revokeTarget);
