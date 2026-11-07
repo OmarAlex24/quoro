@@ -234,7 +234,7 @@ impl Minter {
 }
 
 /// The cache file of `context`, or `None` when no directory is known.
-fn cache_path(environment: &Environment, context: &Context) -> Option<PathBuf> {
+pub(crate) fn cache_path(environment: &Environment, context: &Context) -> Option<PathBuf> {
     let absolute = |name: &str| {
         environment
             .var(name)

@@ -423,7 +423,7 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), F
 }
 
 /// A token is sent as a header value, so it must be one printable word.
-fn token_from(source: &str, text: &str) -> Result<Token, Failure> {
+pub(crate) fn token_from(source: &str, text: &str) -> Result<Token, Failure> {
     let token = text.trim();
     if token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()) {
         return Err(Failure::other(format!(

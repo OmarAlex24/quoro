@@ -52,6 +52,15 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 # event stream. The runtime is the binary's; reqwest already runs on tokio.
 tokio = { version = "1", default-features = false, features = ["time"] }
 
+# `quoro login` reads a personal API token with the terminal's echo off:
+# rustix's safe termios calls, so `unsafe_code = "forbid"` holds. Already in
+# the lock file through the engine and the node agent; `termios` adds no crate.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", default-features = false, features = [
+    "std",
+    "termios",
+] }
+
 [dev-dependencies]
 # The end-to-end tests run an in-process primary: the control plane's router
 # behind a TLS listener with a self-signed certificate, as `quoro serve` does.

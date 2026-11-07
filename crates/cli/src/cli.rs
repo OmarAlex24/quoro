@@ -56,8 +56,10 @@ pub struct Global {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Save a context and its credential: an agent's key file
+    /// Save a context and its credential: a personal API token or an agent key
     Login(LoginArgs),
+    /// Forget the context's stored credential
+    Logout(LogoutArgs),
     /// Show the context and the identity behind its credential
     Whoami,
     /// Call any API operation and print the response body
@@ -88,6 +90,9 @@ pub struct ApiArgs {
 
 #[derive(Debug, Args)]
 pub struct LoginArgs {
+    /// Read the personal API token from stdin instead of a prompt
+    #[arg(long, conflicts_with = "agent")]
+    pub token_stdin: bool,
     /// Log in as an agent, with --key-file
     #[arg(long, requires = "key_file")]
     pub agent: bool,
@@ -100,4 +105,11 @@ pub struct LoginArgs {
     /// The SHA-256 of the primary's certificate, sha256:<hex>
     #[arg(long, value_name = "FP")]
     pub fingerprint: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct LogoutArgs {
+    /// Revoke the token too; until the API can name it, this points to the panel
+    #[arg(long)]
+    pub revoke: bool,
 }

@@ -2455,6 +2455,7 @@ dependencies = [
  "quoro-control-plane",
  "rcgen 0.13.2",
  "reqwest 0.12.28",
+ "rustix",
  "rustls",
  "rustls-native-certs",
  "serde",
