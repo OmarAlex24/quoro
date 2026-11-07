@@ -189,9 +189,9 @@ pub(crate) async fn revoked_from_node(
 }
 
 /// What this primary has learned, in memory, about revoked leases whose last
-/// holder no longer runs anything under them (ADR 0017, `node-agent-protocol.md`
-/// sections 5.13 and 8.5): for each lease and holder, the highest token at
-/// which that is known.
+/// holder no longer runs anything under them (`node-agent-protocol.md`
+/// sections 5.13 and 8.5, ADR 0047): for each lease and holder, the highest
+/// token at which that is known.
 ///
 /// A holder releases a lease at a token when it answers a `lease_revoke` of
 /// that token `ok`: its bound VMs are stopped and recorded. So does a holder

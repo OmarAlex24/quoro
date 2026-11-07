@@ -14,7 +14,7 @@
 //! fencing token, pins the app's placement there, moves the instances there
 //! and starts the app. It does so only once the old holder released the
 //! lease: it answered the revoke `ok`, so its VMs are stopped and recorded,
-//! or it was declared lost (ADR 0017, sections 5.13 and 8.3, issue #392).
+//! or it was declared lost (sections 5.13 and 8.3, ADR 0047, issue #392).
 //! Until then the volume stays `restoring`, and the next `ready` report tries
 //! again. A reported `failed` leaves the app stopped with no lease, and its
 //! instances back in the desired state of the node they are on.
@@ -344,7 +344,7 @@ async fn restore_ready(
     )
     .await?;
 
-    // ADR 0017, section 5.13: the old holder's VMs may still run until it
+    // Section 5.13, ADR 0047: the old holder's VMs may still run until it
     // answers the revoke `ok`, so the lease moves only once it released it
     // (issue #392). That holds for a restore onto the same node too.
     if let Some(previous) = leases::app_lease(&mut w.tx, &current.app_id).await?

@@ -1406,7 +1406,7 @@ async fn a_restore_is_refused_while_another_runs_or_the_old_node_is_gone() {
 }
 
 // ---------------------------------------------------------------------------
-// The old holder's answer (ADR 0017, issue #392)
+// The old holder's answer (section 5.13, issue #392)
 // ---------------------------------------------------------------------------
 
 /// A restore onto node B, up to the target's snapshot that carries the new
@@ -1541,7 +1541,7 @@ async fn drop_old_session(setup: &mut Setup) {
     }
 }
 
-/// ADR 0017, section 5.13: a `ready` report does not move the lease while
+/// Section 5.13: a `ready` report does not move the lease while
 /// the old holder has not answered its revoke, since its VMs may still run.
 /// Its `ok` lets the next report finish the restore.
 #[tokio::test]

@@ -328,7 +328,7 @@ struct HubInner {
     disk_free_gb: Mutex<HashMap<String, f64>>,
     /// The revoked leases each last holder released, in memory only: a
     /// restore grants the lease to its target only once its holder did
-    /// (ADR 0017, issue #392).
+    /// (section 5.13, issue #392).
     releases: leases::Releases,
     generation: AtomicU64,
     /// Test seam: snapshots to hold between their build and their send.
