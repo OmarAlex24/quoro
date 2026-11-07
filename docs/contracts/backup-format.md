@@ -224,6 +224,28 @@ The restore:
 
 At its next start, before it serves, the primary reads `primary-node`. When the file names a node of the database that is not `removed` and does not already hold the status, the primary clears `cp_status` on the node that holds it and sets `cp_status = 'primary'` on the named node, in one change-log write, and records `cluster.primary_moved` (`audit-log-format.md` section 3.5). In every case it then deletes the file; a node it cannot use is logged with the reason. The file must have the same owner as the database file, so that the control plane can read and delete it.
 
+**When a restore is refused (from M5b, ADR 0261).** A restored log may lack writes that every node already holds, such as the write that ends an `expiring` lease's renewals (node-agent-protocol.md section 8.4), and the restored primary would reuse that log's term and `seq` values. So `quoro restore` refuses, before anything is installed, when a machine with the `node` role other than the new host's node, and not `removed`, appears in either of two sources:
+
+- the restored database;
+- the newest `spec.votes.voters` stored by the new host's node agent, which covers nodes enrolled after the backup.
+
+Such a cluster recovers by promoting a surviving node (node-agent-protocol.md section 7.3), which keeps every entry its nodes all acknowledged. A cluster whose only node is the new host's own restores as before. The refusal can miss a node enrolled after the backup if the host's agent never learned of it.
+
+**Override.** `quoro restore --accept-loss --statement <text>` restores anyway. The statement says that no other machine with the `node` role survives, and that no control plane of this cluster runs. The first part also rules out a concurrent promotion, because only such a machine can be a candidate. The second rules out an old primary on a host without the `node` role that keeps granting. A single-node cluster restored onto a fresh host needs the flag too, because the dead node is not the new host's node.
+
+**The first write.** The restored primary's first change-log write, at its first start and before it serves, marks every `expiring` lease row unsettled (`leases.unsettled`, node-agent-protocol.md section 8.4), after any restore. After a restore with `--accept-loss`, the same write also:
+
+- removes every machine with the `node` role that the statement declares gone, that is, every one in the restored database that is not `removed`, other than the new host's node;
+- raises the token of each lease those machines held, as declaring a node lost does (node-agent-protocol.md section 8.3);
+- deletes their custody seals (node-agent-protocol.md section 7.2);
+- records `cluster.restored` (`audit-log-format.md` section 3.9).
+
+That write is exempt from node-agent-protocol.md section 8.10 rule 2. Without it the dead nodes would count in every majority, so the restored primary would never hold support and could neither remove nor enroll a node.
+
+**Term.** The restored primary starts one above the highest of: the restored log's terms; the term its host's node agent stored; and the terms in any vote `check` answers it receives (a `check` changes nothing, node-agent-protocol.md section 8.9). A fresh host is no mesh peer and may reach no voter, so an `error` with code `stale_term` carries the sender's term (node-agent-protocol.md section 5.18). A primary restored with `--accept-loss` that receives one before it has sent any `lease_grant` starts again at one above that term, instead of demoting itself (node-agent-protocol.md section 8.8).
+
+**Tokens after a forced recovery.** A token issued in entries the restored log lacks may be issued again to another node, as node-agent-protocol.md section 7.3 says for `--ack-fence`.
+
 The restored database is as old as the backup. It lists the backup it was restored from as `running`, which the restored primary resolves at its first start (section 7.2, rows left behind at start). How a restored primary reconciles with nodes that applied newer desired state is part of the storage epic; it does not change this format.
 
 ## 9. Retention and garbage collection

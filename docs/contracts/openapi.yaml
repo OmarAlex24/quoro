@@ -4077,6 +4077,7 @@ components:
         - mode
         - fencing_token
         - granted_at
+        - local_pending
       properties:
         id:
           type: string
@@ -4101,7 +4102,10 @@ components:
             Local leases need no renewal; expiring leases do. When an app's
             HA policy becomes `warm`, its lease reads `local` until the primary
             answers the holder's first renewal after the mode change
-            (node-agent-protocol.md section 8.4, ADR 0244).
+            (node-agent-protocol.md section 8.4, ADR 0244). When the policy
+            leaves `warm`, the lease reads `local` at once, while
+            `local_pending` stays true until the primary sends the holder the
+            grant that ends its renewals (ADR 0261).
           enum:
             - local
             - expiring
@@ -4138,6 +4142,16 @@ components:
         revoked_at:
           type: [string, 'null']
           description: When the lease was revoked.
+        local_pending:
+          type: boolean
+          description: |
+            True while the lease row reads `local` after its app left `warm`,
+            but the primary has not yet sent the holder the same-token `local`
+            grant that ends its renewals, because the row's write is not yet
+            held by every machine with the `node` role or the primary lacks
+            majority support (node-agent-protocol.md section 8.4, ADR 0261).
+            Meanwhile the holder still renews, and it fences only if the
+            primary loses majority support. False otherwise.
     User:
       type: object
       title: User
@@ -7479,7 +7493,10 @@ paths:
         when the cluster has one, and turns the app's lease `expiring` as soon
         as the primary holds the support of a majority of voters
         (node-agent-protocol.md sections 6.13 and 8.4). Leaving `warm` deletes
-        the warm copy and turns the lease `local` again. `hot` is refused with
+        the warm copy and writes the lease `local` at once; `Lease.local_pending`
+        stays true until every machine with the `node` role holds that write
+        and the primary has sent the holder the grant that ends its renewals
+        (ADR 0261). `hot` is refused with
         `validation_failed` until M6 (ADR 0020). A new `replicas`
         adds or removes instances without a deployment; it is refused with
         `validation_failed` above the eligible nodes, and with `conflict` above

@@ -63,6 +63,10 @@ pub struct Lease {
     pub gate_at: Option<String>,
     /// When the lease was revoked.
     pub revoked_at: Option<String>,
+    /// True while the row reads `local` after the app left `warm` but the
+    /// primary has not yet sent the grant that ends the holder's renewals
+    /// (`node-agent-protocol.md` section 8.4, ADR 0261).
+    pub local_pending: bool,
 }
 
 impl Lease {
@@ -106,6 +110,10 @@ impl Lease {
             // 8.4), which the M5b lease work adds; a `local` lease has none.
             gate_at: None,
             revoked_at: row.revoked_at,
+            // Set from the replication of the row's `local` write (section
+            // 8.4), which the M5b lease work adds; until then no lease is
+            // pending.
+            local_pending: false,
         })
     }
 }
