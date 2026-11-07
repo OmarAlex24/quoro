@@ -262,6 +262,7 @@
   - [0258: A primary changes a lease's mode only with the same token](adr/0258-a-primary-changes-a-lease-s-mode-only-with-the-same-token.md)
   - [0259: Health checks: probes of a VM paused for a backup neither count nor restart it, and a health restart stops a VM only when it can start again](adr/0259-health-checks-probes-of-a-vm-paused-for-a-backup-neither.md)
   - [0262: fence_ack acknowledges a listed lease with no row at 2^53-1, the canonical-JSON bound, and migration 0001's comment names fencing_tokens](adr/0262-fence-ack-acknowledges-a-listed-lease-with-no-row-at-2-53-1.md)
+  - [0274: M7, deploy experience: after M6, Quoro adds docker-compose import, private registries and Git repositories, a container engine for hosts without KVM, and Railpack builds](adr/0274-m7-deploy-experience-after-m6-quoro-adds-docker-compose.md)
 
 # Background research
 
