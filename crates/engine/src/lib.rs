@@ -261,13 +261,18 @@ pub struct VsockAttach {
     pub socket: PathBuf,
 }
 
-/// How a stop is requested.
+/// How a stop is requested. Every stop is bounded by its caller (contract
+/// section 3.8, ADR 0243).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StopMode {
-    /// Ask the guest to stop and wait at most this long.
-    Graceful { timeout: Duration },
-    /// Stop now, without cooperation from the guest.
-    Force,
+    /// Ask the guest to stop and wait at most `timeout`, then stop it as
+    /// `Force { within: force_within }`.
+    Graceful {
+        timeout: Duration,
+        force_within: Duration,
+    },
+    /// Stop now, without cooperation from the guest, within `within`.
+    Force { within: Duration },
 }
 
 /// Mirrors the VM observed_status enum in README.md one to one.
@@ -570,7 +575,20 @@ pub trait Engine: Send + Sync {
 
     // Lifecycle
     fn create(&self, spec: &VmSpec) -> impl Future<Output = Result<VmInfo, EngineError>> + Send;
-    fn start(&self, id: &VmId) -> impl Future<Output = Result<VmInfo, EngineError>> + Send;
+    /// Boots a created or stopped VM within `within` (contract section 3.7,
+    /// ADR 0242). When the VM is not running once `within` has passed, the
+    /// engine begins a forced stop of what it started and returns
+    /// [`EngineError::Timeout`] without waiting for it, so the VM may still run
+    /// for a while.
+    fn start(
+        &self,
+        id: &VmId,
+        within: Duration,
+    ) -> impl Future<Output = Result<VmInfo, EngineError>> + Send;
+    /// Stops a VM within the bound `mode` carries (contract section 3.8, ADR
+    /// 0243). A forced stop the engine began goes on to the kill and the reap
+    /// after the call returned [`EngineError::Timeout`] or was dropped, and a
+    /// later stop of the VM joins it within its own bound.
     fn stop(
         &self,
         id: &VmId,

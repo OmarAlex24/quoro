@@ -372,7 +372,16 @@ impl<E: Engine + 'static> DockerfileBuilder<E> {
 
     /// Stops the builder VM with a forced stop, best effort.
     async fn stop_vm(&self, id: &VmId) {
-        if let Err(error) = self.engine.stop(id, StopMode::Force).await {
+        if let Err(error) = self
+            .engine
+            .stop(
+                id,
+                StopMode::Force {
+                    within: crate::FORCE_WITHIN,
+                },
+            )
+            .await
+        {
             tracing::warn!(vm_id = %id.0, error = ?error, "could not stop the builder VM");
         }
     }
@@ -602,7 +611,7 @@ impl<E: Engine + 'static> Builder for DockerfileBuilder<E> {
             .await;
         let deadline = tokio::time::sleep(Duration::from_secs(spec.limits.timeout_s));
         tokio::pin!(deadline);
-        if let Err(error) = self.engine.start(&id).await {
+        if let Err(error) = self.engine.start(&id, crate::START_WITHIN).await {
             self.delete_vm(&id).await;
             return Err(failure(
                 BuildPhase::Preparing,
@@ -1994,7 +2003,7 @@ mod tests {
             engine
                 .stop_calls()
                 .iter()
-                .any(|(vm, mode)| vm == &id && matches!(mode, StopMode::Force))
+                .any(|(vm, mode)| vm == &id && matches!(mode, StopMode::Force { .. }))
         );
         let _ = fs::remove_dir_all(&fixture.root);
     }
@@ -2025,7 +2034,7 @@ mod tests {
             engine
                 .stop_calls()
                 .iter()
-                .any(|(vm, mode)| vm == &id && matches!(mode, StopMode::Force))
+                .any(|(vm, mode)| vm == &id && matches!(mode, StopMode::Force { .. }))
         );
         assert!(engine.inspect(&id).await.is_err(), "the VM is gone");
         let _ = fs::remove_dir_all(&fixture.root);

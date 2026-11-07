@@ -108,6 +108,16 @@ impl ApiClient {
         self
     }
 
+    /// Also bounds each request by `deadline`: the timeout becomes the time
+    /// left until it, when that is shorter (contract §3.7 and §3.8).
+    #[must_use]
+    pub fn by(mut self, deadline: tokio::time::Instant) -> Self {
+        self.timeout = self
+            .timeout
+            .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        self
+    }
+
     /// The socket this client talks to.
     pub fn socket(&self) -> &Path {
         &self.socket

@@ -13,6 +13,15 @@ use quoro_engine::{
     LineStream, MacAddr, NetAttach, OutputLine, StopMode, VmId, VmSpec, VmState,
 };
 
+/// The bound every start in these shared tests gets: long enough for a real
+/// boot on the lab (engine-trait.md section 3.7).
+pub const START: Duration = Duration::from_secs(60);
+
+/// A forced stop whose bound no working stop reaches (section 3.8).
+pub const FORCE: StopMode = StopMode::Force {
+    within: Duration::from_secs(10),
+};
+
 /// The image every test prepares.
 pub fn image_ref() -> ImageRef {
     ImageRef {
@@ -104,12 +113,15 @@ pub async fn lifecycle_suite<E: Engine>(engine: &E, image: ImageRef) {
         "a different spec for the same id is a conflict"
     );
 
-    let running = engine.start(&created.id).await.expect("start succeeds");
+    let running = engine
+        .start(&created.id, START)
+        .await
+        .expect("start succeeds");
     assert_eq!(running.state, VmState::Running);
     assert!(running.pid.is_some());
 
     let running_again = engine
-        .start(&created.id)
+        .start(&created.id, START)
         .await
         .expect("start is idempotent");
     assert_eq!(running_again.pid, running.pid, "start must not reboot");
@@ -133,6 +145,7 @@ pub async fn lifecycle_suite<E: Engine>(engine: &E, image: ImageRef) {
             &created.id,
             StopMode::Graceful {
                 timeout: Duration::from_secs(5),
+                force_within: Duration::from_secs(10),
             },
         )
         .await
@@ -140,13 +153,13 @@ pub async fn lifecycle_suite<E: Engine>(engine: &E, image: ImageRef) {
     assert_eq!(stopped.state, VmState::Stopped);
 
     let stopped_again = engine
-        .stop(&created.id, StopMode::Force)
+        .stop(&created.id, FORCE)
         .await
         .expect("stopping a stopped VM succeeds");
     assert_eq!(stopped_again.state, VmState::Stopped);
 
     engine
-        .start(&created.id)
+        .start(&created.id, START)
         .await
         .expect("start after a stop succeeds");
     assert!(
@@ -158,7 +171,7 @@ pub async fn lifecycle_suite<E: Engine>(engine: &E, image: ImageRef) {
     );
 
     engine
-        .stop(&created.id, StopMode::Force)
+        .stop(&created.id, FORCE)
         .await
         .expect("forced stop succeeds");
     engine.delete(&created.id).await.expect("delete succeeds");
@@ -171,7 +184,7 @@ pub async fn lifecycle_suite<E: Engine>(engine: &E, image: ImageRef) {
         .await
         .expect("delete of a missing VM succeeds");
     assert!(matches!(
-        engine.start(&created.id).await,
+        engine.start(&created.id, START).await,
         Err(EngineError::NotFound)
     ));
 }

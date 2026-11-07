@@ -125,6 +125,7 @@ async fn stop_one<E: Engine>(engine: &E, id: VmId, timers: FenceTimers) -> (VmId
             &id,
             StopMode::Graceful {
                 timeout: timers.grace,
+                force_within: timers.force,
             },
         );
         match tokio::time::timeout(timers.grace, graceful).await {
@@ -138,7 +139,12 @@ async fn stop_one<E: Engine>(engine: &E, id: VmId, timers: FenceTimers) -> (VmId
     // shares that bound, so the whole stop of one VM never takes longer than
     // `T_grace + T_force` (section 8.4).
     let force_deadline = tokio::time::Instant::now() + timers.force;
-    let forced = engine.stop(&id, StopMode::Force);
+    let forced = engine.stop(
+        &id,
+        StopMode::Force {
+            within: timers.force,
+        },
+    );
     let failure = match tokio::time::timeout_at(force_deadline, forced).await {
         Ok(Ok(_)) => return (id, VmFenceOutcome::Forced),
         Ok(Err(EngineError::NotFound)) => return (id, VmFenceOutcome::Gone),

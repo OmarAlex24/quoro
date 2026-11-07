@@ -160,6 +160,17 @@ impl Vmm {
     /// answers or exits early it is killed, reaped, and the error carries the
     /// last lines of its log.
     pub async fn spawn(launch: &VmmLaunch<'_>) -> Result<Vmm, EngineError> {
+        Self::spawn_by(launch, tokio::time::Instant::now() + START_TIMEOUT).await
+    }
+
+    /// [`Self::spawn`], waiting for the API socket only until `deadline` when
+    /// that comes sooner than [`START_TIMEOUT`], for a bounded start (contract
+    /// §3.7, ADR 0242).
+    pub async fn spawn_by(
+        launch: &VmmLaunch<'_>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Vmm, EngineError> {
+        let deadline = deadline.min(tokio::time::Instant::now() + START_TIMEOUT);
         remove_stale_socket(launch.api_socket)?;
         // The supervisor reads the event log from offset 0: a `rebooting` left
         // by the previous run would kill this one as a guest reset.
@@ -217,12 +228,13 @@ impl Vmm {
         let shared = Arc::new(Shared { id, exit });
         tokio::spawn(watch_child(child, Arc::clone(&shared)));
 
-        let client = ApiClient::new(launch.api_socket).with_timeout(PING_TIMEOUT);
-        let deadline = tokio::time::Instant::now() + START_TIMEOUT;
         loop {
             if shared.exit.borrow().is_some() {
                 break;
             }
+            let client = ApiClient::new(launch.api_socket)
+                .with_timeout(PING_TIMEOUT)
+                .by(deadline);
             if client.ping().await.is_ok() {
                 return Ok(Self { shared });
             }
@@ -239,7 +251,7 @@ impl Vmm {
         let reason = if had_exited {
             "the process exited during start-up"
         } else {
-            "no answer on the API socket within 5 s"
+            "no answer on the API socket in time"
         };
         Err(start_failure(launch, reason))
     }

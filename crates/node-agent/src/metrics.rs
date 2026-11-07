@@ -657,7 +657,7 @@ Buffers:          100000 kB
             unimplemented!("not used by the sampler")
         }
 
-        async fn start(&self, _id: &VmId) -> Result<VmInfo, EngineError> {
+        async fn start(&self, _id: &VmId, _within: Duration) -> Result<VmInfo, EngineError> {
             unimplemented!("not used by the sampler")
         }
 

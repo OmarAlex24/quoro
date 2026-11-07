@@ -11,6 +11,7 @@
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use futures_core::Stream;
 use quoro_engine::{
@@ -108,7 +109,7 @@ impl Engine for NullEngine {
         Err(no_vms())
     }
 
-    async fn start(&self, _id: &VmId) -> Result<VmInfo, EngineError> {
+    async fn start(&self, _id: &VmId, _within: Duration) -> Result<VmInfo, EngineError> {
         Err(no_vms())
     }
 
@@ -266,8 +267,23 @@ mod tests {
             engine.inspect(&spec.id).await.expect_err("no VM exists"),
             EngineError::NotFound
         );
-        assert!(engine.start(&spec.id).await.is_err());
-        assert!(engine.stop(&spec.id, StopMode::Force).await.is_err());
+        assert!(
+            engine
+                .start(&spec.id, Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+        assert!(
+            engine
+                .stop(
+                    &spec.id,
+                    StopMode::Force {
+                        within: Duration::from_secs(1)
+                    }
+                )
+                .await
+                .is_err()
+        );
         assert!(engine.delete(&spec.id).await.is_err());
         assert!(engine.counters(&spec.id).await.is_err());
         assert!(
