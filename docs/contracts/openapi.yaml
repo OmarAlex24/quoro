@@ -4109,8 +4109,11 @@ components:
           description: |
             The earliest time the primary may grant this lease with a new token,
             to another node or again after expiry: the latest
-            `T_grant + duration_ms + 2M` over its grants to the holder
-            (node-agent-protocol.md section 8.4); expiring leases only.
+            `T_grant + duration_ms + 2M` over its grants to the holder, with
+            the first answer after a mode change to `expiring` counted at the
+            longer of its own and the conversion grant's duration
+            (node-agent-protocol.md section 8.4, ADR 0254); expiring leases
+            only.
         revoked_at:
           type: [string, 'null']
           description: When the lease was revoked.

@@ -1,12 +1,12 @@
 # ADR 0241: A lease converted from local to expiring opens no failover gate until a renewal is answered, and the node fences from its first renewal
 
-- **Status:** Accepted; refined by [ADR 0244](0244-a-converted-lease-s-row-keeps-mode-local-until-the-primary.md)
+- **Status:** Accepted; refined by [ADR 0244](0244-a-converted-lease-s-row-keeps-mode-local-until-the-primary.md), [ADR 0254](0254-a-converted-lease-s-first-gate-counts-the-conversion-grant.md), [ADR 0256](0256-an-expiring-grant-that-carries-re-never-converts-a-lease.md), [ADR 0258](0258-a-primary-changes-a-lease-s-mode-only-with-the-same-token.md)
 - **Date:** 2026-11-06
 - **Ledger id:** D-0241
 - **Tags:** m5b, leases, contracts, warm
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** [ADR 0218](0218-changing-ha-policy-changes-the-lease-mode-with-a-lease.md), [ADR 0244](0244-a-converted-lease-s-row-keeps-mode-local-until-the-primary.md)
+- **Related:** [ADR 0218](0218-changing-ha-policy-changes-the-lease-mode-with-a-lease.md), [ADR 0244](0244-a-converted-lease-s-row-keeps-mode-local-until-the-primary.md), [ADR 0254](0254-a-converted-lease-s-first-gate-counts-the-conversion-grant.md), [ADR 0256](0256-an-expiring-grant-that-carries-re-never-converts-a-lease.md), [ADR 0258](0258-a-primary-changes-a-lease-s-mode-only-with-the-same-token.md)
 
 ## Context
 
@@ -29,6 +29,9 @@ _Some wording was changed for the public repository._
 
 - Refines [ADR 0218](0218-changing-ha-policy-changes-the-lease-mode-with-a-lease.md): what the grant that converts a lease to expiring sets on the node and counts toward the failover gate. The rest of [ADR 0218](0218-changing-ha-policy-changes-the-lease-mode-with-a-lease.md) stands.
 - [ADR 0244](0244-a-converted-lease-s-row-keeps-mode-local-until-the-primary.md) refines what the lease row records during a conversion: mode stays local until the primary answers the first renewal. The rest of this decision stands.
+- [ADR 0254](0254-a-converted-lease-s-first-gate-counts-the-conversion-grant.md) refines the gate that the first answer after a conversion opens. The rest of this decision stands.
+- [ADR 0256](0256-an-expiring-grant-that-carries-re-never-converts-a-lease.md) refines which same-token grant converts a lease: one without re. The rest of this decision stands.
+- [ADR 0258](0258-a-primary-changes-a-lease-s-mode-only-with-the-same-token.md) refines which grants may change a lease's mode: only the same-token conversion. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---
