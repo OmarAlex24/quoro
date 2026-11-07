@@ -15,6 +15,7 @@ import type {
   HaPolicyCost,
   Node,
   Project,
+  Provider,
   User,
   Vm,
   Volume,
@@ -79,6 +80,8 @@ export interface MockDb {
   backups: Backup[];
   backupRepositories: BackupRepository[];
   auditExports: AuditExport[];
+  /** Provider entries, without their secrets: the mock keeps only `has_secret`. */
+  providers: Provider[];
 }
 
 export const db: MockDb = {
@@ -127,6 +130,7 @@ export const db: MockDb = {
   backups: [],
   backupRepositories: [],
   auditExports: [],
+  providers: [],
 };
 
 const timers = new Set<number>();
@@ -703,6 +707,7 @@ const seed = (): void => {
 
   seedGitApp(createdAt);
   seedAtlas(createdAt, repository.id);
+  seedSettings();
 };
 
 const seedBuildLog = (
@@ -1382,6 +1387,109 @@ const seedAtlas = (createdAt: string, repositoryId: string): void => {
     created_at: createdAt,
     updated_at: createdAt,
   });
+};
+
+/**
+ * What Settings shows: the provider entries behind the backup repository and
+ * the off-site audit copy (their ids are the ones seeded above), a tunnel and
+ * a DNS provider that nothing holds yet, and the control-plane database's own
+ * backups. Seeded last, so every id seeded before keeps its value.
+ */
+const seedSettings = (): void => {
+  const hoursAgo = (hours: number): string =>
+    new Date(Date.now() - hours * 3_600_000).toISOString();
+  const createdBy = db.backupRepositories[0]?.created_by ?? 'usr_01JC9Z6Q5W7X8Y9Z0A1B2C3D4E';
+  const repository = db.backupRepositories[0];
+  const auditExport = db.auditExports[0];
+
+  if (repository) {
+    db.providers.push({
+      id: repository.provider_id,
+      kind: 'object_store',
+      name: 'lab-r2-backups',
+      config: {
+        bucket: 'quoro-lab-backups',
+        endpoint: 'https://4f1c2b7e9a3d.r2.cloudflarestorage.com',
+        region: 'auto',
+      },
+      has_secret: true,
+      created_by: createdBy,
+      created_at: hoursAgo(24 * 40),
+      rotated_at: hoursAgo(24 * 9),
+    });
+  }
+  if (auditExport) {
+    db.providers.push({
+      id: auditExport.provider_id,
+      kind: 'object_store',
+      name: 'lab-r2-audit',
+      config: {
+        bucket: 'quoro-lab-audit',
+        endpoint: 'https://4f1c2b7e9a3d.r2.cloudflarestorage.com',
+        region: 'auto',
+      },
+      has_secret: true,
+      created_by: createdBy,
+      created_at: hoursAgo(24 * 40),
+      rotated_at: null,
+    });
+  }
+  db.providers.push(
+    {
+      id: mockId('prv'),
+      kind: 'tunnel',
+      name: 'cloudflare-tunnel',
+      config: { account_id: '8b4e1f0c2d6a4e9b' },
+      has_secret: true,
+      created_by: createdBy,
+      created_at: hoursAgo(24 * 40),
+      rotated_at: null,
+    },
+    {
+      id: mockId('prv'),
+      kind: 'dns',
+      name: 'cloudflare-dns',
+      config: { zone_id: '2a7d9c41e0b3f856', zone: 'lab.quoro.dev' },
+      has_secret: true,
+      created_by: createdBy,
+      created_at: hoursAgo(24 * 40),
+      rotated_at: null,
+    },
+  );
+
+  if (!repository) return;
+  const controlPlane = (
+    hours: number,
+    trigger: Backup['trigger'],
+    logicalMb: number,
+    uploadedMb: number,
+  ): Backup => ({
+    id: mockId('bkp'),
+    repository_id: repository.id,
+    source_kind: 'control_plane',
+    app_id: null,
+    volume_id: null,
+    node_id: db.node.id,
+    status: 'succeeded',
+    trigger,
+    snapshot_method: null,
+    pause_ms: null,
+    logical_bytes: logicalMb * 1024 ** 2,
+    uploaded_bytes: uploadedMb * 1024 ** 2,
+    chunk_count: Math.max(1, Math.round(logicalMb / 4)),
+    error: null,
+    created_at: hoursAgo(hours),
+    started_at: hoursAgo(hours),
+    finished_at: hoursAgo(hours - 0.01),
+    pruned_at: null,
+  });
+  db.backups.push(
+    controlPlane(2, 'schedule', 46, 3),
+    controlPlane(8, 'schedule', 46, 2),
+    controlPlane(14, 'schedule', 45, 2),
+    controlPlane(19, 'upgrade', 45, 6),
+    controlPlane(20, 'schedule', 44, 44),
+  );
 };
 
 seed();

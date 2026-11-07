@@ -8,6 +8,7 @@ import {
   meterDensity,
   meterEdge,
   meterMix,
+  noise,
   takesSecondTone,
 } from './dither';
 import type { AreaPlot } from './metric-area';
@@ -146,6 +147,61 @@ export function drawMark({ ctx, w, h }: DitherSurface, read: TokenReader = readT
       return 0.3 + 0.7 * angle(x, y);
     },
     (x, y) => clamp((angle(x, y) - 0.45) * 1.6),
+  );
+}
+
+/** The face the wordmark is set in: Archivo at its widest and heaviest. */
+export const WORDMARK_FONT = '"Archivo Variable", Archivo, ui-sans-serif, system-ui, sans-serif';
+
+/**
+ * The wordmark: "quoro" set in Archivo, widened and heavy, then dithered in
+ * the two tones, accent at the left turning to ion at the right. The letters
+ * are drawn to a hidden canvas first and sampled cell by cell. Draw it once
+ * the face has loaded, or it dithers the fallback font.
+ */
+export function drawWordmark({ ctx, w, h }: DitherSurface, read: TokenReader = readToken): void {
+  const width = Math.ceil(w);
+  const height = Math.ceil(h);
+  const scratch = document.createElement('canvas');
+  scratch.width = width;
+  scratch.height = height;
+  const letters = scratch.getContext('2d', { willReadFrequently: true });
+  if (!letters) return;
+  let size = height;
+  const setFont = () => {
+    letters.font = `800 ${size}px ${WORDMARK_FONT}`;
+    letters.fontStretch = 'expanded';
+  };
+  setFont();
+  let metrics = letters.measureText('quoro');
+  const fitHeight = metrics.actualBoundingBoxAscent + metrics.actualBoundingBoxDescent || size * 0.75;
+  size = (size * height * 0.86) / fitHeight;
+  setFont();
+  metrics = letters.measureText('quoro');
+  if (metrics.width > width) {
+    size *= (width / metrics.width) * 0.99;
+    setFont();
+    metrics = letters.measureText('quoro');
+  }
+  const ascent = metrics.actualBoundingBoxAscent;
+  const descent = metrics.actualBoundingBoxDescent;
+  letters.fillStyle = '#000';
+  letters.fillText('quoro', 0, (height - (ascent + descent)) / 2 + ascent);
+  const alpha = letters.getImageData(0, 0, width, height).data;
+  const ink = (x: number, y: number) =>
+    alpha[(Math.min(height - 1, y | 0) * width + Math.min(width - 1, x | 0)) * 4 + 3]! / 255;
+  const grain = noise('mark-a', 64);
+  const tint = noise('mark-c', 18);
+  dither2(
+    ctx,
+    w,
+    h,
+    2,
+    read('--accent'),
+    read('--ion'),
+    (x, y) => (ink(x, y) > 0.45 ? 0.5 + 0.5 * grain(x / w) : 0),
+    (x, y) =>
+      clamp(0.08 + 0.72 * Math.pow(x / w, 1.15) + 0.3 * (tint(x / w) - 0.5) - 0.18 * (y / h - 0.5)),
   );
 }
 

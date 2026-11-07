@@ -109,7 +109,7 @@ export const closeReasonText = (reason: CloseReason): string => {
     case 'access_revoked':
       return 'Access to this session was revoked.';
     case 'credential_expired':
-      return 'The credential that opened this session expired. Log in again.';
+      return 'The credential that opened this session expired. Sign in again.';
     case 'vm_stopped':
       return 'The VM stopped, so the session ended.';
     case 'node_disconnected':

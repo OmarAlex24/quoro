@@ -97,6 +97,7 @@ import { usersHandlers } from './handlers-users';
 import { interactiveHandlers } from './handlers-interactive';
 import { vulnerabilitiesHandlers } from './handlers-vulnerabilities';
 import { webhooksHandlers } from './handlers-webhooks';
+import { providersHandlers } from './handlers-providers';
 
 /** The mock cluster's id; one installation per page load. */
 const CLUSTER_ID = mockId('cls');
@@ -183,6 +184,8 @@ export const handlers = [
     };
     db.owner = owner;
     db.users = [owner];
+    // What the seed made before an owner existed is the owner's from now on.
+    for (const item of [...db.backupRepositories, ...db.providers]) item.created_by = owner.id;
     db.password = password;
     db.setupDone = true;
     db.sessionUserId = null;
@@ -1223,7 +1226,7 @@ export const handlers = [
   }),
 
   // Builds, then the agency screens: users, tokens, agents, grants, approvals, audit,
-  // webhooks, incidents.
+  // webhooks, providers and backups for Settings, incidents.
   ...buildsHandlers,
   ...usersHandlers,
   ...tokensHandlers,
@@ -1232,6 +1235,7 @@ export const handlers = [
   ...approvalsHandlers,
   ...auditHandlers,
   ...webhooksHandlers,
+  ...providersHandlers,
   ...incidentsHandlers,
   ...metricsHandlers,
   ...interactiveHandlers,

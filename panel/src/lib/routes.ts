@@ -303,6 +303,47 @@ export function hrefOf(home: NewHome): string {
   return query === '' ? path : `${path}?${query}`;
 }
 
+/* ---------- settings ---------- */
+
+/** The Settings pages, in the order of its sub-navigation. Each lives at `/settings/<page>`. */
+export const SETTINGS_PAGES = [
+  'members',
+  'webhooks',
+  'backups',
+  'providers',
+  'tokens',
+  'account',
+] as const;
+export type SettingsPage = (typeof SETTINGS_PAGES)[number];
+
+export const SETTINGS_LABELS: Record<SettingsPage, string> = {
+  members: 'Members',
+  webhooks: 'Webhooks',
+  backups: 'Backups',
+  providers: 'Providers',
+  tokens: 'API tokens',
+  account: 'Account',
+};
+
+/**
+ * The Settings page a path shows, so its entry in the sub-navigation is lit:
+ * one webhook belongs to Webhooks, and the old `/users`, `/webhooks` and
+ * `/account` light their page while the redirect is on its way. Null outside
+ * Settings, and for `/settings` itself, which redirects to Members.
+ */
+export function settingsPageOf(pathname: string): SettingsPage | null {
+  const path = pathname.replace(/\/+$/, '');
+  const inside = /^\/settings\/([^/]+)(?:\/.*)?$/.exec(path);
+  if (inside) {
+    const page = inside[1]!;
+    return (SETTINGS_PAGES as readonly string[]).includes(page) ? (page as SettingsPage) : null;
+  }
+  if (path === '/users') return 'members';
+  if (path === '/account') return 'account';
+  if (path === '/webhooks' || path.startsWith('/webhooks/')) return 'webhooks';
+  return null;
+}
+
 /* ---------- the sidebar ---------- */
 
 export const SECTIONS = ['projects', 'nodes', 'agents', 'approvals', 'activity', 'settings'] as const;

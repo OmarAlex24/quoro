@@ -1,29 +1,27 @@
-import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Link, useNavigate } from '@tanstack/react-router';
+import { ChevronLeft, FlaskConical, Send } from 'lucide-react';
 import { useState } from 'react';
-import {
-  deleteWebhook,
-  getGetWebhookQueryKey,
-  getListWebhookDeliveriesQueryKey,
-  getListWebhooksQueryKey,
-  testWebhook,
-  updateWebhook,
-  useGetWebhook,
-} from '../api/generated/webhooks/webhooks';
+import { useGetWebhook } from '../api/generated/webhooks/webhooks';
 import { canManageWebhooks } from '../lib/capabilities';
 import { problemView, type ProblemView } from '../lib/problem';
 import { useSession } from '../session';
+import { SettingsLoading, SettingsNote, SettingsPage } from '../components/settings-parts';
 import { Button } from '../components/ui/button';
-import { Dialog, DialogContent } from '../components/ui/dialog';
 import { NoticeLine, ProblemBanner } from '../components/ui/problem-banner';
+import { Tag } from '../components/ui/tag';
+import {
+  DeleteWebhookDialog,
+  useWebhookActions,
+  WebhookActionsMenu,
+} from '../components/webhook-actions';
 import { WebhookDeliveries } from '../components/webhook-deliveries';
 import { WebhookDialog } from '../components/webhook-dialog';
 import { WebhookPlate } from '../components/webhook-plate';
 import { LoginScreen } from './login-screen';
 
+/** Settings › Webhooks › one webhook: every field, then its deliveries, newest first. */
 export function WebhookScreen({ webhookId }: { webhookId: string }) {
   const { me, user, loading, unauthenticated } = useSession();
-  const queryClient = useQueryClient();
   const navigate = useNavigate();
   const [problem, setProblem] = useState<ProblemView | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -34,53 +32,34 @@ export function WebhookScreen({ webhookId }: { webhookId: string }) {
   const webhookQuery = useGetWebhook(webhookId, { query: { retry: false } });
   const webhook = webhookQuery.data;
 
-  const toggleEnabled = useMutation({
-    mutationFn: (webhook: { id: string; enabled: boolean }) =>
-      updateWebhook(webhook.id, { enabled: !webhook.enabled }),
-    onSuccess: (_updated, variables) => {
+  const actions = useWebhookActions({
+    onNotice: (words) => {
       setProblem(null);
-      setNotice(
-        variables.enabled ? 'Paused deliveries' : 'Resumed deliveries',
-      );
-      void queryClient.invalidateQueries({
-        queryKey: getGetWebhookQueryKey(webhookId),
-      });
-      void queryClient.invalidateQueries({ queryKey: getListWebhooksQueryKey() });
+      setNotice(words);
     },
-    onError: (error) =>
-      setProblem(
-        problemView(error, 'change this webhook'),
-      ),
-  });
-
-  const sendTest = useMutation({
-    mutationFn: () => testWebhook(webhookId),
-    onSuccess: () => {
-      setProblem(null);
-      setNotice('Sent a test delivery; watch it below.');
-      void queryClient.invalidateQueries({
-        queryKey: getListWebhookDeliveriesQueryKey(webhookId),
-      });
+    onProblem: (view) => {
+      setNotice(null);
+      setProblem(view);
     },
-    onError: (error) => setProblem(problemView(error, 'send a test delivery')),
-  });
-
-  const remove = useMutation({
-    mutationFn: () => deleteWebhook(webhookId),
-    onSuccess: () => {
-      setProblem(null);
-      void queryClient.invalidateQueries({ queryKey: getListWebhooksQueryKey() });
+    onDeleted: () => {
       setDeleteOpen(false);
       void navigate({ to: '/settings/webhooks' });
     },
-    onError: (error) => setProblem(problemView(error, 'delete this webhook')),
   });
+
+  const back = (
+    <Link to="/settings/webhooks" className="set-back">
+      <ChevronLeft strokeWidth={1.8} aria-hidden="true" />
+      All webhooks
+    </Link>
+  );
 
   if (loading) {
     return (
-      <main className="mx-auto w-full max-w-6xl px-4 py-8 sm:px-6">
-        <p className="text-[15px] text-ink-2">Loading…</p>
-      </main>
+      <SettingsPage label="Webhook">
+        {back}
+        <SettingsLoading label="Loading the webhook" />
+      </SettingsPage>
     );
   }
 
@@ -92,81 +71,57 @@ export function WebhookScreen({ webhookId }: { webhookId: string }) {
       : null;
 
   return (
-    <main className="mx-auto w-full max-w-6xl px-4 py-6 sm:px-6 sm:py-8">
-      <Link
-        to="/settings/webhooks"
-        className="text-[13px] text-ink-2 underline-offset-4 hover:text-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
-      >
-        All webhooks
-      </Link>
-
-      {loadError ? <ProblemBanner view={loadError} className="mt-4" /> : null}
+    <SettingsPage label={webhook?.name ?? 'Webhook'}>
+      {back}
+      {loadError ? <ProblemBanner view={loadError} /> : null}
 
       {webhookQuery.isPending ? (
-        <div className="mt-5 h-[240px] rounded-[10px] border border-line bg-surface/60" />
+        <SettingsLoading label="Loading the webhook" />
       ) : webhook ? (
         <>
-          <div className="mt-3 flex flex-wrap items-start justify-between gap-3">
-            <div className="min-w-0">
-              <h1 className="type-display text-[24px] leading-none">{webhook.name}</h1>
-              <p className="mt-2 text-[13px] text-ink-2">
-                {webhook.enabled
-                  ? 'Deliveries are attempted for matching events.'
-                  : 'Paused: no deliveries are attempted.'}
+          <div className="set-page-h set-page-h-thing">
+            <span className="glyph glyph-neutral" aria-hidden="true">
+              <Send strokeWidth={1.7} />
+            </span>
+            <div className="min-w-0 flex-1 max-md:basis-[calc(100%-40px)]">
+              <h2>
+                <span className="truncate">{webhook.name}</span>
+                {webhook.enabled ? null : <Tag tone="plain">Paused</Tag>}
+              </h2>
+              <p className="set-page-code type-code" title={webhook.url}>
+                {webhook.url}
               </p>
             </div>
-
             {writer ? (
-              <div className="flex flex-wrap gap-2">
-                <Button variant="default" onClick={() => setEditOpen(true)}>
-                  Edit
-                </Button>
+              <div className="flex flex-none items-center gap-1.5 max-md:ml-10">
                 <Button
-                  variant="default"
-                  disabled={toggleEnabled.isPending}
-                  onClick={() => {
-                    setNotice(null);
-                    toggleEnabled.mutate({ id: webhook.id, enabled: webhook.enabled });
-                  }}
+                  size="sm"
+                  disabled={actions.busy}
+                  onClick={() => actions.test.mutate(webhook)}
                 >
-                  {webhook.enabled ? 'Pause deliveries' : 'Resume deliveries'}
+                  <FlaskConical size={14} strokeWidth={1.8} aria-hidden="true" />
+                  {actions.test.isPending ? 'Sending…' : 'Send a test delivery'}
                 </Button>
-                <Button
-                  variant="default"
-                  disabled={sendTest.isPending}
-                  onClick={() => {
-                    setNotice(null);
-                    sendTest.mutate();
-                  }}
-                >
-                  {sendTest.isPending ? 'Sending…' : 'Send a test delivery'}
-                </Button>
-                <Button variant="danger" onClick={() => setDeleteOpen(true)}>
-                  Delete webhook
-                </Button>
+                <WebhookActionsMenu
+                  webhook={webhook}
+                  busy={actions.busy}
+                  onEdit={() => setEditOpen(true)}
+                  onToggle={() => actions.toggle.mutate(webhook)}
+                  onTest={() => actions.test.mutate(webhook)}
+                  onDelete={() => setDeleteOpen(true)}
+                />
               </div>
-            ) : (
-              <p className="text-[13px] text-ink-2">
-                Your role can read this webhook but not change it.
-              </p>
-            )}
+            ) : null}
           </div>
 
-          {notice ? (
-            <div className="mt-3">
-              <NoticeLine>{notice}</NoticeLine>
-            </div>
+          {!writer ? (
+            <SettingsNote>Your role can read this webhook but not change it.</SettingsNote>
           ) : null}
+          {notice ? <NoticeLine>{notice}</NoticeLine> : null}
+          {problem ? <ProblemBanner view={problem} /> : null}
 
-          {problem ? <ProblemBanner view={problem} className="mt-3" /> : null}
-
-          <div className="mt-5">
-            <WebhookPlate webhook={webhook} />
-          </div>
-
-          <div className="mt-7">
-            <WebhookDeliveries webhookId={webhook.id} />
-          </div>
+          <WebhookPlate webhook={webhook} />
+          <WebhookDeliveries webhookId={webhook.id} />
 
           <WebhookDialog
             mode="edit"
@@ -178,28 +133,14 @@ export function WebhookScreen({ webhookId }: { webhookId: string }) {
               setNotice('Saved changes');
             }}
           />
-
-          <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>
-            <DialogContent
-              title="Delete webhook"
-              description="Deliveries already attempted stay in the history. New matching events will not reach the receiver."
-            >
-              <div className="flex flex-wrap justify-end gap-2 border-t border-line pt-4">
-                <Button variant="default" onClick={() => setDeleteOpen(false)}>
-                  Cancel
-                </Button>
-                <Button
-                  variant="danger-solid"
-                  disabled={remove.isPending}
-                  onClick={() => remove.mutate()}
-                >
-                  {remove.isPending ? 'Deleting…' : 'Delete webhook'}
-                </Button>
-              </div>
-            </DialogContent>
-          </Dialog>
+          <DeleteWebhookDialog
+            webhook={deleteOpen ? webhook : null}
+            busy={actions.remove.isPending}
+            onKeep={() => setDeleteOpen(false)}
+            onDelete={(target) => actions.remove.mutate(target)}
+          />
         </>
       ) : null}
-    </main>
+    </SettingsPage>
   );
 }

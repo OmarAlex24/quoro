@@ -42,7 +42,7 @@ export function LoginScreen() {
         });
         return;
       }
-      setProblem(problemView(error, 'log in'));
+      setProblem(problemView(error, 'sign in'));
     },
   });
 
@@ -54,31 +54,28 @@ export function LoginScreen() {
 
   return (
     <AuthPanel
+      title="Sign in"
+      lede="One microVM per app, on your own metal."
       footer={
-        <p className="text-[13px] text-ink-2">
+        <p>
           First time here?{' '}
-          <Link
-            to="/setup"
-            className="text-accent underline-offset-4 hover:underline"
-          >
+          <Link to="/setup" className="auth-link">
             Set up the owner account
           </Link>
         </p>
       }
     >
       {ended ? (
-        <div className="mb-4 rounded-[10px] border border-line border-l-4 border-l-fault bg-surface px-3.5 py-2.5">
-          <p className="text-[15px] leading-snug text-ink">
-            Your session ended. Log in again.
-          </p>
-        </div>
+        <p role="status" className="auth-note auth-note-fault">
+          Your session ended. Sign in again.
+        </p>
       ) : created ? (
-        <p className="mb-4 text-[13px] text-ink-2">{created}</p>
+        <p role="status" className="auth-note">
+          {created}
+        </p>
       ) : null}
 
-      <h2 className="type-display text-[18px] leading-tight">Log in</h2>
-
-      <form onSubmit={submit} className="mt-4 flex flex-col gap-4" noValidate>
+      <form onSubmit={submit} className="grid gap-4" noValidate>
         {problem ? <ProblemBanner view={problem} /> : null}
 
         <Field label="Email" htmlFor="login-email">
@@ -109,10 +106,10 @@ export function LoginScreen() {
         <Button
           type="submit"
           variant="primary"
-          className="mt-1 w-full"
+          className="h-9 w-full"
           disabled={loginMutation.isPending}
         >
-          {loginMutation.isPending ? 'Logging in…' : 'Log in'}
+          {loginMutation.isPending ? 'Signing in…' : 'Sign in'}
         </Button>
       </form>
     </AuthPanel>

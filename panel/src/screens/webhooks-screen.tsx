@@ -1,28 +1,57 @@
+import { Plus } from 'lucide-react';
 import { useState } from 'react';
+import type { Webhook } from '../api/generated/model';
 import { useListWebhooks } from '../api/generated/webhooks/webhooks';
 import { canManageWebhooks } from '../lib/capabilities';
-import { problemView } from '../lib/problem';
+import { problemView, type ProblemView } from '../lib/problem';
 import { useSession } from '../session';
+import {
+  SettingsEmpty,
+  SettingsHead,
+  SettingsLoading,
+  SettingsNote,
+  SettingsPage,
+} from '../components/settings-parts';
 import { Button } from '../components/ui/button';
-import { ProblemBanner } from '../components/ui/problem-banner';
-import { WebhookBay } from '../components/webhook-bay';
+import { NoticeLine, ProblemBanner } from '../components/ui/problem-banner';
+import {
+  DeleteWebhookDialog,
+  useWebhookActions,
+  WebhookActionsMenu,
+} from '../components/webhook-actions';
 import { WebhookDialog } from '../components/webhook-dialog';
+import { WebhookRow } from '../components/webhook-row';
 import { LoginScreen } from './login-screen';
 
+/** Settings › Webhooks: where events go, the latest delivery of each, and the agent each wakes. */
 export function WebhooksScreen() {
   const { me, user, loading, unauthenticated } = useSession();
-  const [dialogOpen, setDialogOpen] = useState(false);
+  const [createOpen, setCreateOpen] = useState(false);
+  const [editing, setEditing] = useState<Webhook | null>(null);
+  const [deleting, setDeleting] = useState<Webhook | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [problem, setProblem] = useState<ProblemView | null>(null);
   const writer = canManageWebhooks(me);
 
-  const webhooksQuery = useListWebhooks(undefined, {
-    query: { refetchInterval: 15_000 },
+  const webhooksQuery = useListWebhooks(undefined, { query: { refetchInterval: 15_000 } });
+  const actions = useWebhookActions({
+    onNotice: (words) => {
+      setProblem(null);
+      setNotice(words);
+    },
+    onProblem: (view) => {
+      setNotice(null);
+      setProblem(view);
+    },
+    onDeleted: () => setDeleting(null),
   });
 
   if (loading) {
     return (
-      <main className="mx-auto w-full max-w-6xl px-4 py-8 sm:px-6">
-        <p className="text-[15px] text-ink-2">Loading…</p>
-      </main>
+      <SettingsPage label="Webhooks">
+        <SettingsHead title="Webhooks" />
+        <SettingsLoading label="Loading webhooks" />
+      </SettingsPage>
     );
   }
 
@@ -34,57 +63,69 @@ export function WebhooksScreen() {
       ? problemView(webhooksQuery.error, 'see webhooks')
       : null;
 
+  const add = writer ? (
+    <Button size="sm" onClick={() => setCreateOpen(true)}>
+      <Plus size={14} strokeWidth={1.8} aria-hidden="true" />
+      Add webhook
+    </Button>
+  ) : null;
+
   return (
-    <main className="mx-auto w-full max-w-6xl px-4 py-6 sm:px-6 sm:py-8">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h1 className="type-display text-[24px] leading-none">Webhooks</h1>
-          <p className="mt-2 max-w-2xl text-[15px] leading-snug text-ink-2">
-            Send events to a receiver, and optionally wake an agent with a short grant
-            for the incident.
-          </p>
-        </div>
-        {writer ? (
-          <Button variant="primary" onClick={() => setDialogOpen(true)}>
-            Add a webhook
-          </Button>
-        ) : null}
-      </div>
+    <SettingsPage label="Webhooks">
+      <SettingsHead title="Webhooks" action={add} />
 
-      {!writer ? (
-        <p className="mt-3 text-[13px] text-ink-2">
-          Your role can read webhooks but not change them.
-        </p>
-      ) : null}
+      {!writer ? <SettingsNote>Your role can read webhooks but not change them.</SettingsNote> : null}
+      {notice ? <NoticeLine>{notice}</NoticeLine> : null}
+      {problem ? <ProblemBanner view={problem} /> : null}
+      {listError ? <ProblemBanner view={listError} /> : null}
 
-      {listError ? <ProblemBanner view={listError} className="mt-4" /> : null}
+      {webhooksQuery.isPending ? (
+        <SettingsLoading label="Loading webhooks" />
+      ) : webhooks.length === 0 ? (
+        <SettingsEmpty title="No webhooks yet." action={add}>
+          {writer ? 'Add one to send events to a receiver.' : 'An owner or operator can add one.'}
+        </SettingsEmpty>
+      ) : (
+        <ul className="box">
+          {webhooks.map((webhook) => (
+            <WebhookRow
+              key={webhook.id}
+              webhook={webhook}
+              actions={
+                writer ? (
+                  <WebhookActionsMenu
+                    webhook={webhook}
+                    busy={actions.busy}
+                    open
+                    onEdit={() => setEditing(webhook)}
+                    onToggle={() => actions.toggle.mutate(webhook)}
+                    onTest={() => actions.test.mutate(webhook)}
+                    onDelete={() => setDeleting(webhook)}
+                  />
+                ) : undefined
+              }
+            />
+          ))}
+        </ul>
+      )}
 
-      <div className="mt-5 flex flex-col gap-2">
-        {webhooksQuery.isPending ? (
-          <div className="h-[104px] rounded-[10px] border border-line bg-surface/60" />
-        ) : webhooks.length === 0 ? (
-          <div className="rounded-[10px] border border-dashed border-line bg-surface/50 px-4 py-10 text-center">
-            <p className="text-[15px] text-ink">
-              {writer
-                ? 'No webhooks yet. Add one to send events to a receiver.'
-                : 'No webhooks yet.'}
-            </p>
-            {writer ? (
-              <Button
-                variant="primary"
-                className="mt-4"
-                onClick={() => setDialogOpen(true)}
-              >
-                Add a webhook
-              </Button>
-            ) : null}
-          </div>
-        ) : (
-          webhooks.map((webhook) => <WebhookBay key={webhook.id} webhook={webhook} />)
-        )}
-      </div>
-
-      <WebhookDialog mode="create" open={dialogOpen} onOpenChange={setDialogOpen} />
-    </main>
+      <WebhookDialog mode="create" open={createOpen} onOpenChange={setCreateOpen} />
+      <WebhookDialog
+        mode="edit"
+        open={editing !== null}
+        onOpenChange={(open) => (open ? undefined : setEditing(null))}
+        webhook={editing ?? undefined}
+        onSaved={() => {
+          setProblem(null);
+          setNotice(editing ? `Saved ${editing.name}` : 'Saved changes');
+        }}
+      />
+      <DeleteWebhookDialog
+        webhook={deleting}
+        busy={actions.remove.isPending}
+        onKeep={() => setDeleting(null)}
+        onDelete={(webhook) => actions.remove.mutate(webhook)}
+      />
+    </SettingsPage>
   );
 }

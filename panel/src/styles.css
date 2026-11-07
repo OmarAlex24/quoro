@@ -4386,6 +4386,435 @@
     overflow-wrap: anywhere;
   }
 
+  /* ---------- Settings: one sub-navigation, then a page of lists ---------- */
+  .set-layout {
+    display: grid;
+    grid-template-columns: 170px minmax(0, 1fr);
+    gap: 26px;
+    width: 100%;
+    max-width: 1040px;
+    margin: 0 auto;
+    padding: 28px 28px 40px;
+  }
+
+  .set-side {
+    min-width: 0;
+  }
+
+  .set-title {
+    padding: 0 10px 12px;
+    font-stretch: 112%;
+    font-weight: 620;
+    font-size: 19px;
+    line-height: 1.2;
+    letter-spacing: -0.005em;
+  }
+
+  .set-nav a:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+
+  .set-page {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 14px;
+    align-content: start;
+    min-width: 0;
+  }
+
+  .set-page-h {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-height: 28px;
+  }
+
+  .set-page-h h2 {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    font-weight: 600;
+    font-size: 15px;
+    line-height: 1.3;
+  }
+
+  .set-page-h p {
+    margin-top: 3px;
+    max-width: 62ch;
+    font-size: 12.5px;
+    line-height: 1.45;
+    color: var(--ink-2);
+  }
+
+  .set-page-h-thing {
+    align-items: flex-start;
+  }
+
+  .set-page-h p.set-page-code {
+    margin-top: 2px;
+    max-width: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11.5px;
+  }
+
+  .set-back {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    justify-self: start;
+    margin-left: -4px;
+    padding: 2px 4px;
+    border-radius: 6px;
+    font-size: 12.5px;
+    color: var(--ink-2);
+    text-decoration: none;
+  }
+
+  .set-back svg {
+    width: 15px;
+    height: 15px;
+  }
+
+  .set-back:hover {
+    color: var(--ink);
+  }
+
+  .set-back:focus-visible,
+  .set-inline-link:focus-visible,
+  .srow-link:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  .set-inline-link {
+    color: var(--ink);
+    text-decoration: underline;
+    text-decoration-color: var(--line-2);
+    text-underline-offset: 3px;
+  }
+
+  .set-inline-link:hover {
+    text-decoration-color: var(--ink-2);
+  }
+
+  .set-note {
+    margin-top: -6px;
+    font-size: 12.5px;
+    color: var(--ink-2);
+  }
+
+  .set-sub {
+    margin-top: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ink);
+  }
+
+  .set-sub-x {
+    margin-top: 2px;
+    font-size: 12px;
+    color: var(--ink-2);
+  }
+
+  .set-empty {
+    padding: 22px 16px;
+    border: 1px dashed var(--line-2);
+    border-radius: 10px;
+    text-align: center;
+  }
+
+  .set-empty-t {
+    font-size: 13.5px;
+    font-weight: 540;
+    color: var(--ink);
+  }
+
+  .set-empty-x {
+    margin-top: 4px;
+    font-size: 12.5px;
+    color: var(--ink-2);
+  }
+
+  .set-loading {
+    height: 118px;
+    background-color: color-mix(in oklab, var(--surface) 60%, transparent);
+  }
+
+  .set-form {
+    display: grid;
+    gap: 12px;
+    padding: 14px;
+  }
+
+  .set-ok {
+    padding: 9px 12px;
+    border: 1px solid color-mix(in oklab, var(--run) 40%, var(--line));
+    border-radius: 9px;
+    background-color: color-mix(in oklab, var(--run) 7%, var(--surface));
+    font-size: 13px;
+    color: var(--ink);
+  }
+
+  .set-av {
+    width: 16px;
+    height: 16px;
+    border-radius: 4px;
+  }
+
+  /* One thing in a Settings list: glyph or avatar, name, one code line, one state line, ⋯. */
+  .srow {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 14px;
+    border-top: 1px solid var(--line);
+  }
+
+  .srow:first-child {
+    border-top: 0;
+  }
+
+  .srow-tight {
+    align-items: center;
+    padding-top: 10px;
+    padding-bottom: 10px;
+  }
+
+  .srow > .glyph,
+  .srow-av {
+    flex: none;
+  }
+
+  .srow-av.avatar {
+    width: 28px;
+    height: 28px;
+    font-size: 11px;
+  }
+
+  .srow-lamp {
+    flex: none;
+    margin: 0 4px;
+  }
+
+  .srow-t {
+    display: grid;
+    gap: 4px;
+    min-width: 0;
+    flex: 1;
+  }
+
+  .srow-t b {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    font-weight: 540;
+    font-size: 13.5px;
+    line-height: 1.3;
+  }
+
+  .srow-t small {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 2px 6px;
+    min-width: 0;
+    font-size: 12px;
+    color: var(--ink-2);
+  }
+
+  .srow-t small .avatar {
+    width: 14px;
+    height: 14px;
+    border-radius: 3px;
+  }
+
+  .srow-sub {
+    font-size: 12.5px;
+    color: var(--ink-2);
+    min-width: 0;
+  }
+
+  .srow-code {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11px;
+    color: var(--ink-2);
+  }
+
+  .srow-link {
+    min-width: 0;
+    color: var(--ink);
+    text-decoration: none;
+  }
+
+  .srow-link:hover {
+    text-decoration: underline;
+    text-decoration-color: var(--line-2);
+    text-underline-offset: 3px;
+  }
+
+  .srow-test {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-weight: 500;
+    font-size: 12.5px;
+    color: var(--ink-2);
+  }
+
+  .srow-test svg {
+    color: var(--accent);
+  }
+
+  .srow-end {
+    display: inline-flex;
+    flex: none;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--ink-2);
+  }
+
+  .row-menu {
+    flex: none;
+  }
+
+  .srow > .row-menu {
+    margin: -4px -4px 0 0;
+  }
+
+  @media (max-width: 767.98px) {
+    .set-layout {
+      grid-template-columns: minmax(0, 1fr);
+      gap: 14px;
+      padding: 18px 16px 32px;
+    }
+
+    .set-title {
+      padding-bottom: 8px;
+    }
+
+    .set-nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+
+    .srow-end {
+      display: none;
+    }
+
+    /* A thing's own heading: its actions drop under the name on a phone. */
+    .set-page-h-thing {
+      flex-wrap: wrap;
+    }
+  }
+
+  /* ---------- Sign-in and setup: the one screen with a dithered ground ---------- */
+  .auth {
+    position: relative;
+    display: grid;
+    place-items: center;
+    min-height: 100dvh;
+    padding: 32px 16px;
+    overflow: hidden;
+    background-color: var(--ground);
+    isolation: isolate;
+  }
+
+  .auth-field {
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+
+  .auth-card {
+    display: grid;
+    gap: 16px;
+    width: min(380px, 100%);
+    padding: 28px;
+    border: 1px solid var(--line-2);
+    border-radius: 14px;
+    background-color: var(--surface);
+    box-shadow: var(--shadow);
+  }
+
+  .auth-mark {
+    display: block;
+    width: 150px;
+    height: 42px;
+  }
+
+  .auth-title {
+    font-weight: 600;
+    font-size: 16px;
+    line-height: 1.3;
+  }
+
+  .auth-lede {
+    margin-top: 2px;
+    font-size: 12.5px;
+    line-height: 1.45;
+    color: var(--ink-2);
+  }
+
+  .auth-note {
+    padding: 9px 12px;
+    border: 1px solid var(--line-2);
+    border-radius: 9px;
+    background-color: var(--sunk);
+    font-size: 13px;
+    line-height: 1.45;
+    color: var(--ink);
+  }
+
+  .auth-note-fault {
+    border-color: color-mix(in oklab, var(--fault) 40%, var(--line));
+    background-color: color-mix(in oklab, var(--fault) 7%, var(--surface));
+  }
+
+  .auth-foot {
+    font-size: 12.5px;
+    color: var(--ink-2);
+  }
+
+  .auth-foot:empty {
+    display: none;
+  }
+
+  .auth-link {
+    color: var(--ink);
+    text-decoration: underline;
+    text-decoration-color: var(--line-2);
+    text-underline-offset: 3px;
+  }
+
+  .auth-link:hover {
+    text-decoration-color: var(--ink-2);
+  }
+
+  .auth-link:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  @media (max-width: 479.98px) {
+    .auth-card {
+      padding: 22px 20px;
+    }
+  }
+
   @media (prefers-reduced-motion: reduce) {
     .lamp-pulse,
     .sweep,

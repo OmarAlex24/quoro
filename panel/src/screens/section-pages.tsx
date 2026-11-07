@@ -1,14 +1,22 @@
-import { getRouteApi, Link, Outlet } from '@tanstack/react-router';
+import { getRouteApi, Link, Outlet, useRouterState } from '@tanstack/react-router';
 import { useListNodes } from '../api/generated/nodes/nodes';
 import { useListVms } from '../api/generated/vms/vms';
 import { useGetVulnerabilitySummary } from '../api/generated/vulnerabilities/vulnerabilities';
+import { canManageProviders } from '../lib/capabilities';
 import { SERVICE_LIST_PARAMS } from '../lib/projects';
-import type { NodesTab } from '../lib/routes';
+import {
+  SETTINGS_LABELS,
+  SETTINGS_PAGES,
+  settingsPageOf,
+  type NodesTab,
+  type SettingsPage,
+} from '../lib/routes';
 import { cn } from '../lib/utils';
 import { nodeSecurityCount } from '../lib/vulnerabilities';
 import { useSession } from '../session';
 import { ApiTokens } from '../components/api-tokens';
 import { ClusterVulnerabilities } from '../components/cluster-vulnerabilities';
+import { SettingsPage as SettingsColumn } from '../components/settings-parts';
 import { TabbedPage } from '../components/shell/tab-strip';
 import { AgentScreen } from './agent-screen';
 import { AgentsScreen } from './agents-screen';
@@ -129,47 +137,56 @@ export function AgentsPage() {
   );
 }
 
-const SETTINGS = [
-  { to: '/settings/members', label: 'Members' },
-  { to: '/settings/webhooks', label: 'Webhooks' },
-  { to: '/settings/tokens', label: 'API tokens' },
-  { to: '/settings/account', label: 'Account' },
-] as const;
+const SETTINGS_TO = {
+  members: '/settings/members',
+  webhooks: '/settings/webhooks',
+  backups: '/settings/backups',
+  providers: '/settings/providers',
+  tokens: '/settings/tokens',
+  account: '/settings/account',
+} as const satisfies Record<SettingsPage, string>;
 
 /**
- * `/settings/...`: Members, Webhooks, API tokens and Account, each today's
- * screen. Backups and providers join this list when their screens exist.
+ * `/settings/...`: Members, Webhooks, Backups, Providers, API tokens and
+ * Account, one sub-navigation on the left and the page on the right. The
+ * entry of the page in view is lit, a webhook's own page lighting Webhooks.
+ * Providers is left out for a role that cannot read them.
  */
 export function SettingsLayout() {
+  const { me } = useSession();
+  const pathname = useRouterState({ select: (state) => state.location.pathname });
+  const current = settingsPageOf(pathname);
+  const pages = SETTINGS_PAGES.filter((page) => page !== 'providers' || canManageProviders(me));
+
   return (
-    <div className="mx-auto grid w-full max-w-6xl gap-x-8 gap-y-4 px-4 py-6 sm:px-6 sm:py-8 md:grid-cols-[170px_minmax(0,1fr)]">
-      <div>
-        <h1 className="type-display-light px-2.5 pb-3 text-[19px] leading-none">Settings</h1>
-        <nav className="subnav max-md:flex max-md:flex-wrap" aria-label="Settings">
-          {SETTINGS.map((item) => (
+    <div className="set-layout">
+      <div className="set-side">
+        <h1 className="set-title">Settings</h1>
+        <nav className="subnav set-nav" aria-label="Settings">
+          {pages.map((page) => (
             <Link
-              key={item.to}
-              to={item.to}
-              activeOptions={{ exact: false }}
-              activeProps={{ className: 'on', 'aria-current': 'page' }}
+              key={page}
+              to={SETTINGS_TO[page]}
+              className={cn(current === page && 'on')}
+              aria-current={current === page ? 'page' : undefined}
             >
-              {item.label}
+              {SETTINGS_LABELS[page]}
             </Link>
           ))}
         </nav>
       </div>
-      <div className="min-w-0 [&>main]:max-w-none [&>main]:p-0">
+      <div className="min-w-0">
         <Outlet />
       </div>
     </div>
   );
 }
 
-/** `/settings/tokens`: the signed-in person's API tokens, also on their account. */
+/** `/settings/tokens`: the signed-in person's API tokens. */
 export function SettingsTokens() {
   return (
-    <main className="mx-auto w-full max-w-6xl px-4 py-6 sm:px-6 sm:py-8 [&>section]:mt-0">
+    <SettingsColumn label="API tokens">
       <ApiTokens />
-    </main>
+    </SettingsColumn>
   );
 }

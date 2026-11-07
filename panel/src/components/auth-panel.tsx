@@ -1,36 +1,35 @@
 import type { ReactNode } from 'react';
-import { cn } from '../lib/utils';
-import { QuoroMark } from './avatar';
+import { DitherField } from './dither-field';
+import { Wordmark } from './wordmark';
 
-/** The centred plate used by setup and login: the mark, one line, one card. */
+/**
+ * Sign-in and setup: the only screens with a dithered field behind them, where
+ * the brand gets to speak. One card in the middle: the wordmark, a title and
+ * the line under it, then the form; `footer` closes the card with the way to
+ * the other screen.
+ */
 export function AuthPanel({
+  title,
+  lede,
   children,
   footer,
-  className,
 }: {
+  title: string;
+  lede?: ReactNode;
   children: ReactNode;
   footer?: ReactNode;
-  className?: string;
 }) {
   return (
-    <main className="flex min-h-dvh flex-col items-center justify-center px-4 py-10">
-      <div className="w-full max-w-[400px]">
-        <h1 className="flex items-center justify-center gap-3 text-ink">
-          <QuoroMark className="h-9 w-9" />
-          <span className="type-display text-[36px] leading-none">Quoro</span>
-        </h1>
-        <p className="mt-3 text-center text-[15px] leading-snug text-ink-2">
-          One microVM per app, on your own metal.
-        </p>
-        <div
-          className={cn(
-            'mt-6 rounded-[14px] border border-line-2 bg-surface p-5 shadow-[var(--shadow)] card-sheen sm:p-7',
-            className,
-          )}
-        >
-          {children}
+    <main className="auth">
+      <DitherField className="auth-field" />
+      <div className="auth-card">
+        <Wordmark className="auth-mark" />
+        <div>
+          <h1 className="auth-title">{title}</h1>
+          {lede ? <p className="auth-lede">{lede}</p> : null}
         </div>
-        {footer ? <div className="mt-4 text-center">{footer}</div> : null}
+        {children}
+        {footer ? <div className="auth-foot">{footer}</div> : null}
       </div>
     </main>
   );

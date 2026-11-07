@@ -32,6 +32,7 @@ export default defineConfig({
           'audit',
           'events',
           'webhooks',
+          'providers',
           'interactive',
           'vulnerabilities',
           'tokens',
