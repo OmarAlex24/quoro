@@ -29,7 +29,11 @@ fn local_node() -> LocalNode {
 /// A running control plane with the owner logged in, the local node registered
 /// and one project created through the API.
 async fn setup() -> (common::Server, reqwest::Client, String, String) {
-    let server = start().await;
+    setup_on(start().await).await
+}
+
+/// [`setup`] on `server`.
+async fn setup_on(server: common::Server) -> (common::Server, reqwest::Client, String, String) {
     let owner = server.owner().await;
     let node_id = driver::register_local_node(&server.state.store, &local_node())
         .await
@@ -805,7 +809,8 @@ async fn app_validation_and_authorization() {
 }
 
 // ---------------------------------------------------------------------------
-// `ha_policy: warm` and the dev-only `dev-warm-policy` feature (ADR 0223)
+// `ha_policy: warm` and the dev-only `dev-warm-policy` feature (ADR 0223,
+// ADR 0277)
 // ---------------------------------------------------------------------------
 
 async fn patch_app(
@@ -833,41 +838,22 @@ async fn ha_policy_of(owner: &reqwest::Client, server: &common::Server, app_id: 
     app["ha_policy"].clone()
 }
 
-/// A default build refuses `ha_policy` `warm` until the warm policy ships
-/// (ADR 0020), and the app keeps its policy.
+/// A default build refuses `ha_policy` `warm` and its settings until the last
+/// warm PR (ADR 0277), prices `warm` as not in this release, and the app
+/// keeps its policy.
 #[cfg(not(feature = "dev-warm-policy"))]
 #[tokio::test]
 async fn a_default_build_refuses_ha_policy_warm() {
-    let (server, owner, _node_id, project_id) = setup().await;
+    let (server, owner, node_id, project_id) = setup().await;
     let app = create_app(&owner, &server, &project_id).await;
     let app_id = app["id"].as_str().unwrap();
-    let (status, code, _) =
-        problem(patch_app(&owner, &server, app_id, json!({ "ha_policy": "warm" })).await).await;
-    assert_eq!((status, code.as_str()), (422, "validation_failed"));
-    assert_eq!(ha_policy_of(&owner, &server, app_id).await, "none");
-}
-
-/// A test-lab build with the dev-only `dev-warm-policy` feature accepts
-/// `ha_policy` `warm` on `updateApp` and stores it (ADR 0223, #533). It
-/// accepts nothing else the warm policy would bring: `hot`, warm settings and
-/// `warm` on `createApp` are still refused, and the app can leave `warm`.
-#[cfg(feature = "dev-warm-policy")]
-#[tokio::test]
-async fn a_dev_warm_policy_build_accepts_ha_policy_warm() {
-    let (server, owner, _node_id, project_id) = setup().await;
-    let app = create_app(&owner, &server, &project_id).await;
-    let app_id = app["id"].as_str().unwrap();
-
-    let res = patch_app(&owner, &server, app_id, json!({ "ha_policy": "warm" })).await;
-    assert_eq!(res.status(), 200, "warm: {}", res.text().await.unwrap());
-    let updated: Value = res.json().await.unwrap();
-    assert_eq!(updated["ha_policy"], "warm");
-    assert_eq!(ha_policy_of(&owner, &server, app_id).await, "warm");
-
+    // Even an app that could be `warm` in a test-lab build.
+    warm::stateful(&server, app_id, &node_id).await;
+    warm::eligible_node(&server, warm::NODE_A, 2).await;
     for body in [
-        json!({ "ha_policy": "hot" }),
+        json!({ "ha_policy": "warm" }),
         json!({ "warm": { "interval_s": 60 } }),
-        json!({ "ha_policy": "warm", "warm": { "interval_s": 60 } }),
+        json!({ "ha_policy": "warm", "warm": { "node_id": warm::NODE_A } }),
     ] {
         let (status, code, _) =
             problem(patch_app(&owner, &server, app_id, body.clone()).await).await;
@@ -877,8 +863,384 @@ async fn a_dev_warm_policy_build_accepts_ha_policy_warm() {
             "{body}"
         );
     }
-    assert_eq!(ha_policy_of(&owner, &server, app_id).await, "warm");
+    assert_eq!(ha_policy_of(&owner, &server, app_id).await, "none");
+    let cost = warm::cost(&owner, &server, app_id).await;
+    assert_eq!(cost["available"], false);
+    assert_eq!(cost["unavailable_reason"], "not_in_this_release");
+    assert_eq!(
+        cost["reserved"],
+        json!({ "vcpus": 1, "memory_mb": 256, "disk_gb": 1 })
+    );
+    assert!(cost["storage_bytes"].is_null());
 
+    // The sweep picks no warm node in this build, even for a `warm` app
+    // written directly with none.
+    sqlx::query("UPDATE apps SET ha_policy = 'warm' WHERE id = ?")
+        .bind(app_id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+    quoro_control_plane::sweeper::repick_warm_nodes(&server.state)
+        .await
+        .unwrap();
+    assert_eq!(warm::stored(&server, app_id).await, (None, 0, 30));
+}
+
+/// Rows for the warm policy tests (ADR 0277): nodes as a session would leave
+/// them, and an app's attached volume, written directly.
+#[cfg_attr(not(feature = "dev-warm-policy"), allow(dead_code))]
+mod warm {
+    use super::common;
+    use serde_json::Value;
+
+    pub const NODE_A: &str = "nod_0000000000000000000000000A";
+    pub const NODE_B: &str = "nod_0000000000000000000000000B";
+    pub const NODE_C: &str = "nod_0000000000000000000000000C";
+
+    /// A connected node with the `node` role that snapshots with `reflink`
+    /// and has the mesh address `10.43.0.<host>`: eligible as a warm node.
+    pub async fn eligible_node(server: &common::Server, id: &str, host: u8) {
+        let now = quoro_control_plane::store::now_rfc3339();
+        sqlx::query(
+            "INSERT INTO nodes (id, name, roles, cp_status, status, public_key, address, \
+             behind_nat, labels, capacity, allocated, kvm, created_at, volume_snapshot, \
+             mesh_address) \
+             VALUES (?, ?, '[\"node\"]', NULL, 'connected', '', NULL, 1, '{}', \
+             '{\"cpus\":8,\"memory_mb\":16384,\"disk_gb\":200}', \
+             '{\"cpus\":0,\"memory_mb\":0,\"disk_gb\":0}', \
+             '{\"available\":true,\"kernel\":\"6.9.0\"}', ?, 'reflink', ?)",
+        )
+        .bind(id)
+        .bind(format!("warm-{host}"))
+        .bind(&now)
+        .bind(format!("10.43.0.{host}"))
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+    }
+
+    /// The id of the volume [`stateful`] writes for `app_id`.
+    pub fn volume_id(app_id: &str) -> String {
+        format!("vol_{}", &app_id[4..])
+    }
+
+    /// Makes `app_id` stateful: a `ready` volume of 2 GiB with 4096 allocated
+    /// bytes on `node_id`, which snapshots with `reflink` and has a mesh
+    /// address.
+    pub async fn stateful(server: &common::Server, app_id: &str, node_id: &str) {
+        let pool = server.state.store.pool();
+        let now = quoro_control_plane::store::now_rfc3339();
+        sqlx::query(
+            "INSERT INTO volumes (id, app_id, node_id, size_gb, mount_path, state, \
+             allocated_bytes, restored_from_backup_id, error, created_at, updated_at) \
+             VALUES (?, ?, ?, 2, '/data', 'ready', 4096, NULL, NULL, ?, ?)",
+        )
+        .bind(volume_id(app_id))
+        .bind(app_id)
+        .bind(node_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE apps SET stateful = 1 WHERE id = ?")
+            .bind(app_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        set_node(
+            server,
+            node_id,
+            "volume_snapshot = 'reflink', mesh_address = '10.43.0.1'",
+        )
+        .await;
+    }
+
+    /// Runs `UPDATE nodes SET <set> WHERE id = <node_id>`.
+    pub async fn set_node(server: &common::Server, node_id: &str, set: &str) {
+        sqlx::query(&format!("UPDATE nodes SET {set} WHERE id = ?"))
+            .bind(node_id)
+            .execute(server.state.store.pool())
+            .await
+            .unwrap();
+    }
+
+    /// The stored `(warm_node_id, warm_node_pinned, warm_interval_s)`.
+    pub async fn stored(server: &common::Server, app_id: &str) -> (Option<String>, i64, i64) {
+        sqlx::query_as(
+            "SELECT warm_node_id, warm_node_pinned, warm_interval_s FROM apps WHERE id = ?",
+        )
+        .bind(app_id)
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap()
+    }
+
+    /// The `warm` entry of the app's `ha_cost`.
+    pub async fn cost(owner: &reqwest::Client, server: &common::Server, app_id: &str) -> Value {
+        let app = super::get_app(owner, server, app_id).await;
+        let policies = app["ha_cost"]["policies"].as_array().unwrap().clone();
+        assert_eq!(policies[2]["policy"], "warm", "{policies:?}");
+        policies[2].clone()
+    }
+
+    /// The `changed` lists of the app's `app.updated` events, oldest first.
+    pub async fn changes(server: &common::Server, app_id: &str) -> Vec<Value> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT data FROM events WHERE type = 'app.updated' \
+             AND json_extract(data, '$.app_id') = ? ORDER BY seq",
+        )
+        .bind(app_id)
+        .fetch_all(server.state.store.pool())
+        .await
+        .unwrap();
+        rows.into_iter()
+            .map(|(data,)| serde_json::from_str::<Value>(&data).unwrap()["changed"].clone())
+            .collect()
+    }
+}
+
+async fn get_app(owner: &reqwest::Client, server: &common::Server, app_id: &str) -> Value {
+    let res = owner
+        .get(server.url(&format!("/api/v1/apps/{app_id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "get app: {}", res.text().await.unwrap());
+    res.json().await.unwrap()
+}
+
+/// A test-lab build with the dev-only `dev-warm-policy` feature runs the warm
+/// policy (ADR 0277): the scheduler picks the warm node of an app that becomes
+/// `warm`, an operator pins and unpins it and sets the interval, and an app
+/// that leaves `warm` loses its node and pin and keeps its interval
+/// (`openapi.yaml` `UpdateAppRequest`, `WarmSettings`, `WarmCopy.node_id`,
+/// migration 0011).
+#[cfg(feature = "dev-warm-policy")]
+#[tokio::test]
+async fn a_dev_warm_policy_build_picks_and_pins_the_warm_node() {
+    let (server, owner, node_id, project_id) = setup().await;
+    let app = create_app(&owner, &server, &project_id).await;
+    let app_id = app["id"].as_str().unwrap();
+    warm::stateful(&server, app_id, &node_id).await;
+    warm::eligible_node(&server, warm::NODE_A, 2).await;
+    warm::eligible_node(&server, warm::NODE_B, 3).await;
+    // Not eligible: it snapshots with `pause_copy`.
+    warm::eligible_node(&server, warm::NODE_C, 4).await;
+    warm::set_node(&server, warm::NODE_C, "volume_snapshot = 'pause_copy'").await;
+
+    let available = warm::cost(&owner, &server, app_id).await;
+    assert_eq!(available["available"], true, "{available}");
+    assert!(available["unavailable_reason"].is_null());
+    // Disk only: the 2 GiB volume plus the 1 GiB root disk; the volume's
+    // allocated bytes before the warm node reports its copy.
+    assert_eq!(
+        available["reserved"],
+        json!({ "vcpus": 0, "memory_mb": 0, "disk_gb": 3 })
+    );
+    assert_eq!(available["storage_bytes"], 4096);
+    assert_eq!(available["restore_estimate_s"], 10);
+    assert_eq!(available["pause_estimate_ms"], 0);
+
+    // The scheduler picks the first eligible node by id when none keeps a copy.
+    let res = patch_app(&owner, &server, app_id, json!({ "ha_policy": "warm" })).await;
+    assert_eq!(res.status(), 200, "warm: {}", res.text().await.unwrap());
+    let updated: Value = res.json().await.unwrap();
+    assert_eq!(updated["ha_policy"], "warm");
+    assert_eq!(updated["warm"]["node_id"], warm::NODE_A);
+    assert_eq!(updated["warm"]["node_pinned"], false);
+    assert_eq!(updated["warm"]["interval_s"], 30);
+    assert_eq!(
+        warm::stored(&server, app_id).await,
+        (Some(warm::NODE_A.to_owned()), 0, 30)
+    );
+    assert_eq!(
+        warm::changes(&server, app_id).await.last().unwrap(),
+        &json!(["ha_policy", "warm"])
+    );
+
+    // Pins and settings the API refuses, with nothing written.
+    for body in [
+        json!({ "ha_policy": "hot" }),
+        json!({ "warm": { "interval_s": 4 } }),
+        json!({ "warm": { "interval_s": 3601 } }),
+        json!({ "warm": { "node_id": "node-a" } }),
+        // The volume's node, a `pause_copy` node and an unknown node.
+        json!({ "warm": { "node_id": node_id } }),
+        json!({ "warm": { "node_id": warm::NODE_C } }),
+        json!({ "warm": { "node_id": "nod_0000000000000000000000000Z" } }),
+        // Warm settings need the app to stay `warm`.
+        json!({ "ha_policy": "none", "warm": { "interval_s": 60 } }),
+    ] {
+        let (status, code, _) =
+            problem(patch_app(&owner, &server, app_id, body.clone()).await).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (422, "validation_failed"),
+            "{body}"
+        );
+    }
+    assert_eq!(
+        warm::stored(&server, app_id).await,
+        (Some(warm::NODE_A.to_owned()), 0, 30)
+    );
+
+    // A pin, then an interval that leaves the pin alone.
+    let res = patch_app(
+        &owner,
+        &server,
+        app_id,
+        json!({ "warm": { "node_id": warm::NODE_B } }),
+    )
+    .await;
+    assert_eq!(res.status(), 200, "pin: {}", res.text().await.unwrap());
+    let updated: Value = res.json().await.unwrap();
+    assert_eq!(updated["warm"]["node_id"], warm::NODE_B);
+    assert_eq!(updated["warm"]["node_pinned"], true);
+    assert_eq!(
+        warm::changes(&server, app_id).await.last().unwrap(),
+        &json!(["warm"])
+    );
+    let res = patch_app(
+        &owner,
+        &server,
+        app_id,
+        json!({ "warm": { "interval_s": 60 } }),
+    )
+    .await;
+    assert_eq!(res.status(), 200, "interval: {}", res.text().await.unwrap());
+    assert_eq!(
+        warm::stored(&server, app_id).await,
+        (Some(warm::NODE_B.to_owned()), 1, 60)
+    );
+    // The same settings again change nothing, and emit no event.
+    let events = warm::changes(&server, app_id).await.len();
+    let res = patch_app(
+        &owner,
+        &server,
+        app_id,
+        json!({ "ha_policy": "warm", "warm": { "node_id": warm::NODE_B, "interval_s": 60 } }),
+    )
+    .await;
+    assert_eq!(res.status(), 200, "same: {}", res.text().await.unwrap());
+    assert_eq!(warm::changes(&server, app_id).await.len(), events);
+
+    // `null` lets the scheduler pick: it keeps an eligible node, which
+    // already holds the copy.
+    let res = patch_app(
+        &owner,
+        &server,
+        app_id,
+        json!({ "warm": { "node_id": null } }),
+    )
+    .await;
+    assert_eq!(res.status(), 200, "unpin: {}", res.text().await.unwrap());
+    assert_eq!(
+        warm::stored(&server, app_id).await,
+        (Some(warm::NODE_B.to_owned()), 0, 60)
+    );
+    // Pinned again, then unpinned while disconnected: the scheduler picks among
+    // the connected nodes.
+    let res = patch_app(
+        &owner,
+        &server,
+        app_id,
+        json!({ "warm": { "node_id": warm::NODE_B } }),
+    )
+    .await;
+    assert_eq!(res.status(), 200, "pin: {}", res.text().await.unwrap());
+    warm::set_node(&server, warm::NODE_B, "status = 'disconnected'").await;
+    let res = patch_app(
+        &owner,
+        &server,
+        app_id,
+        json!({ "warm": { "node_id": null } }),
+    )
+    .await;
+    assert_eq!(res.status(), 200, "unpin: {}", res.text().await.unwrap());
+    assert_eq!(
+        warm::stored(&server, app_id).await,
+        (Some(warm::NODE_A.to_owned()), 0, 60)
+    );
+
+    // Leaving `warm` drops the node and the pin and keeps the interval.
+    let res = patch_app(
+        &owner,
+        &server,
+        app_id,
+        json!({ "warm": { "node_id": warm::NODE_A } }),
+    )
+    .await;
+    assert_eq!(res.status(), 200, "pin: {}", res.text().await.unwrap());
+    let res = patch_app(&owner, &server, app_id, json!({ "ha_policy": "none" })).await;
+    assert_eq!(res.status(), 200, "none: {}", res.text().await.unwrap());
+    let updated: Value = res.json().await.unwrap();
+    assert!(updated["warm"].is_null(), "{updated}");
+    assert_eq!(warm::stored(&server, app_id).await, (None, 0, 60));
+    assert_eq!(
+        warm::changes(&server, app_id).await.last().unwrap(),
+        &json!(["ha_policy", "warm"])
+    );
+
+    // Back to `warm` with a pin in the same request; a disconnected node is
+    // not eligible.
+    let (status, code, _) = problem(
+        patch_app(
+            &owner,
+            &server,
+            app_id,
+            json!({ "ha_policy": "warm", "warm": { "node_id": warm::NODE_B } }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!((status, code.as_str()), (422, "validation_failed"));
+    assert_eq!(ha_policy_of(&owner, &server, app_id).await, "none");
+    let res = patch_app(
+        &owner,
+        &server,
+        app_id,
+        json!({ "ha_policy": "warm", "warm": { "node_id": warm::NODE_A } }),
+    )
+    .await;
+    assert_eq!(res.status(), 200, "warm: {}", res.text().await.unwrap());
+    assert_eq!(
+        warm::stored(&server, app_id).await,
+        (Some(warm::NODE_A.to_owned()), 1, 60)
+    );
+
+    // With its volume gone, a `warm` app cannot pin a node, and can still be
+    // unpinned.
+    sqlx::query("UPDATE volumes SET state = 'deleting' WHERE app_id = ?")
+        .bind(app_id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+    let (status, code, _) = problem(
+        patch_app(
+            &owner,
+            &server,
+            app_id,
+            json!({ "warm": { "node_id": warm::NODE_B } }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!((status, code.as_str()), (422, "validation_failed"));
+    let res = patch_app(
+        &owner,
+        &server,
+        app_id,
+        json!({ "warm": { "node_id": null } }),
+    )
+    .await;
+    assert_eq!(res.status(), 200, "unpin: {}", res.text().await.unwrap());
+    assert_eq!(
+        warm::stored(&server, app_id).await,
+        (Some(warm::NODE_A.to_owned()), 0, 60)
+    );
+
+    // `createApp` still accepts only `none`.
     let mut body = create_body(&project_id);
     body["name"] = json!("born-warm");
     body["ha_policy"] = json!("warm");
@@ -892,10 +1254,433 @@ async fn a_dev_warm_policy_build_accepts_ha_policy_warm() {
     )
     .await;
     assert_eq!((status, code.as_str()), (422, "validation_failed"));
+}
 
-    let res = patch_app(&owner, &server, app_id, json!({ "ha_policy": "none" })).await;
-    assert_eq!(res.status(), 200, "none: {}", res.text().await.unwrap());
-    assert_eq!(ha_policy_of(&owner, &server, app_id).await, "none");
+/// A test-lab build refuses `warm` where it cannot run (`openapi.yaml`
+/// `UpdateAppRequest.ha_policy`, `HaPolicyCost.unavailable_reason`): a
+/// stateless app, a volume node that does not snapshot with `reflink`, no
+/// other eligible node, and an app with a Git source (ADR 0265). `ha_cost`
+/// gives the same reason.
+#[cfg(feature = "dev-warm-policy")]
+#[tokio::test]
+async fn a_dev_warm_policy_build_refuses_warm_where_it_cannot_run() {
+    let (server, owner, node_id, project_id) = setup().await;
+    let refused = |app_id: String, reason: &'static str| {
+        let (server, owner) = (&server, &owner);
+        async move {
+            let (status, code, _) =
+                problem(patch_app(owner, server, &app_id, json!({ "ha_policy": "warm" })).await)
+                    .await;
+            assert_eq!(
+                (status, code.as_str()),
+                (422, "validation_failed"),
+                "{reason}"
+            );
+            assert_eq!(ha_policy_of(owner, server, &app_id).await, "none");
+            let cost = warm::cost(owner, server, &app_id).await;
+            assert_eq!(cost["available"], false, "{reason}");
+            assert_eq!(cost["unavailable_reason"], reason);
+            cost
+        }
+    };
+
+    // Stateless: nothing to copy, and nothing reserved.
+    let stateless = create_app(&owner, &server, &project_id).await;
+    let stateless = stateless["id"].as_str().unwrap().to_owned();
+    let cost = refused(stateless, "stateless").await;
+    assert_eq!(
+        cost["reserved"],
+        json!({ "vcpus": 0, "memory_mb": 0, "disk_gb": 0 })
+    );
+    assert!(cost["restore_estimate_s"].is_null());
+
+    // Stateful, with no other node yet.
+    let app = create_app_named(&owner, &server, &project_id, "db").await;
+    let app_id = app["id"].as_str().unwrap().to_owned();
+    warm::stateful(&server, &app_id, &node_id).await;
+    refused(app_id.clone(), "no_warm_node").await;
+    // A node that is not eligible: disconnected, without a mesh address,
+    // without the `node` role, or with an unknown snapshot method.
+    warm::eligible_node(&server, warm::NODE_A, 2).await;
+    for set in [
+        "status = 'disconnected'",
+        "mesh_address = NULL",
+        "roles = '[\"edge\"]'",
+        "volume_snapshot = NULL",
+    ] {
+        warm::set_node(&server, warm::NODE_A, set).await;
+        refused(app_id.clone(), "no_warm_node").await;
+        warm::set_node(
+            &server,
+            warm::NODE_A,
+            "status = 'connected', mesh_address = '10.43.0.2', roles = '[\"node\"]', \
+             volume_snapshot = 'reflink'",
+        )
+        .await;
+    }
+    // The volume's node does not snapshot with `reflink`.
+    warm::set_node(&server, &node_id, "volume_snapshot = 'pause_copy'").await;
+    refused(app_id.clone(), "no_warm_node").await;
+    warm::set_node(&server, &node_id, "volume_snapshot = 'reflink'").await;
+    let res = patch_app(&owner, &server, &app_id, json!({ "ha_policy": "warm" })).await;
+    assert_eq!(res.status(), 200, "warm: {}", res.text().await.unwrap());
+
+    // An app built from a Git source, even stateful with an eligible node.
+    let res = owner
+        .post(server.url("/api/v1/apps"))
+        .json(&json!({
+            "project_id": project_id,
+            "name": "git-app",
+            "source": { "kind": "git", "repo_url": "https://example.com/app.git", "ref": "main" },
+            "port": 8080,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201, "git app: {}", res.text().await.unwrap());
+    let git: Value = res.json().await.unwrap();
+    let git_id = git["id"].as_str().unwrap().to_owned();
+    warm::stateful(&server, &git_id, &node_id).await;
+    refused(git_id, "not_in_this_release").await;
+}
+
+/// The sweeper keeps a `warm` app's warm node while it is disconnected, has no
+/// mesh address or has not reported its snapshot method, and picks another
+/// once it is lost for good (`openapi.yaml` `WarmCopy.node_id`, ADR 0278). An
+/// operator's pin lasts until the node is removed, and with no node eligible
+/// the app has none until one is.
+#[cfg(feature = "dev-warm-policy")]
+#[tokio::test]
+async fn a_dev_warm_policy_build_picks_another_warm_node_only_for_a_lasting_loss() {
+    let (server, owner, node_id, project_id) = setup().await;
+    let app = create_app(&owner, &server, &project_id).await;
+    let app_id = app["id"].as_str().unwrap();
+    warm::stateful(&server, app_id, &node_id).await;
+    warm::eligible_node(&server, warm::NODE_A, 2).await;
+    warm::eligible_node(&server, warm::NODE_B, 3).await;
+    let res = patch_app(&owner, &server, app_id, json!({ "ha_policy": "warm" })).await;
+    assert_eq!(res.status(), 200, "warm: {}", res.text().await.unwrap());
+    let sweep = || async {
+        quoro_control_plane::sweeper::repick_warm_nodes(&server.state)
+            .await
+            .unwrap();
+        warm::stored(&server, app_id).await
+    };
+    let on = |node: &str, pinned: i64| (Some(node.to_owned()), pinned, 30);
+    assert_eq!(sweep().await, on(warm::NODE_A, 0));
+
+    // Transient: the node stays the warm node.
+    for set in [
+        "status = 'disconnected'",
+        "mesh_address = NULL",
+        "volume_snapshot = NULL",
+    ] {
+        warm::set_node(&server, warm::NODE_A, set).await;
+        assert_eq!(sweep().await, on(warm::NODE_A, 0), "{set}");
+    }
+    warm::set_node(
+        &server,
+        warm::NODE_A,
+        "status = 'connected', mesh_address = '10.43.0.2', volume_snapshot = 'reflink'",
+    )
+    .await;
+    let events = warm::changes(&server, app_id).await.len();
+
+    // Lasting, for a node the scheduler picked: no `node` role, `pause_copy`,
+    // or the volume's node.
+    warm::set_node(&server, warm::NODE_A, "roles = '[\"edge\"]'").await;
+    assert_eq!(sweep().await, on(warm::NODE_B, 0));
+    assert_eq!(
+        warm::changes(&server, app_id).await[events..],
+        [json!(["warm"])]
+    );
+    warm::set_node(&server, warm::NODE_A, "roles = '[\"node\"]'").await;
+    warm::set_node(&server, warm::NODE_B, "volume_snapshot = 'pause_copy'").await;
+    assert_eq!(sweep().await, on(warm::NODE_A, 0));
+    warm::set_node(&server, warm::NODE_B, "volume_snapshot = 'reflink'").await;
+    sqlx::query("UPDATE volumes SET node_id = ? WHERE app_id = ?")
+        .bind(warm::NODE_A)
+        .bind(app_id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(sweep().await, on(warm::NODE_B, 0));
+    sqlx::query("UPDATE volumes SET node_id = ? WHERE app_id = ?")
+        .bind(&node_id)
+        .bind(app_id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+
+    // A pin outlasts all of that, and ends when its node is removed.
+    let res = patch_app(
+        &owner,
+        &server,
+        app_id,
+        json!({ "warm": { "node_id": warm::NODE_A } }),
+    )
+    .await;
+    assert_eq!(res.status(), 200, "pin: {}", res.text().await.unwrap());
+    warm::set_node(
+        &server,
+        warm::NODE_A,
+        "roles = '[\"edge\"]', volume_snapshot = 'pause_copy'",
+    )
+    .await;
+    assert_eq!(sweep().await, on(warm::NODE_A, 1));
+    warm::set_node(&server, warm::NODE_A, "status = 'removed'").await;
+    assert_eq!(sweep().await, on(warm::NODE_B, 0));
+
+    // No node eligible after a lasting loss: none, until one is.
+    warm::set_node(&server, warm::NODE_B, "status = 'removed'").await;
+    assert_eq!(sweep().await, (None, 0, 30));
+    let warm = get_app(&owner, &server, app_id).await["warm"].clone();
+    assert!(warm["node_id"].is_null(), "{warm}");
+    assert_eq!(warm["state"], "failed", "{warm}");
+    warm::eligible_node(&server, warm::NODE_C, 4).await;
+    assert_eq!(sweep().await, on(warm::NODE_C, 0));
+}
+
+/// A node's session with the primary, for the warm policy tests that need
+/// one: an enrolled node whose `hello` gives it a mesh address and `reflink`,
+/// and its `status_report`.
+#[cfg(feature = "dev-warm-policy")]
+mod session {
+    use super::common::Server;
+    use base64::Engine as _;
+    use futures_util::{SinkExt, StreamExt};
+    use quoro_proto::wire::{self, NodeMessage};
+    use serde_json::{Value, json};
+    use std::time::Duration;
+    use tokio::net::TcpStream;
+    use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    pub type Socket = WebSocketStream<TcpStream>;
+
+    fn capacity() -> wire::Capacity {
+        wire::Capacity {
+            cpus: 8,
+            memory_mb: 16_384,
+            disk_gb: 200,
+        }
+    }
+
+    async fn send(socket: &mut Socket, message: NodeMessage) {
+        let text = message
+            .to_frame("msg_01JC9Z6Q5W8N3K4T7R2M1XHB0D", None)
+            .to_text();
+        socket.send(WsMessage::Text(text.into())).await.unwrap();
+    }
+
+    /// Enrolls a node with the `node` role, opens its session and reads up to
+    /// its first `desired_state`. Returns its id and socket.
+    pub async fn connected_node(
+        server: &Server,
+        owner: &reqwest::Client,
+        name: &str,
+        seed: u8,
+    ) -> (String, Socket) {
+        let token: Value = owner
+            .post(server.url("/api/v1/nodes/join-tokens"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let res = server
+            .client()
+            .post(server.url("/api/v1/nodes/enroll"))
+            .json(&json!({
+                "join_token": token["token"].as_str().unwrap(),
+                "name": name,
+                "public_key": quoro_proto::sign::public_key_to_base64(
+                    &quoro_proto::sign::signing_key_from_seed(&[seed; 32]).verifying_key()
+                ),
+                "roles": ["node"],
+                "capacity": { "cpus": 8, "memory_mb": 16_384, "disk_gb": 200 },
+                "kvm": { "available": true, "kernel": "6.9.0", "nested": true }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 201, "enroll: {}", res.text().await.unwrap());
+        let body: Value = res.json().await.unwrap();
+        let node_id = body["node_id"].as_str().unwrap().to_string();
+        let credential = body["credential"].as_str().unwrap();
+
+        let url = format!("ws://{}/api/v1/nodes/session", server.address());
+        let mut request = url.into_client_request().unwrap();
+        request.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {credential}").parse().unwrap(),
+        );
+        let stream = TcpStream::connect(server.address()).await.unwrap();
+        let (mut socket, _) = tokio_tungstenite::client_async(request, stream)
+            .await
+            .expect("websocket upgrade");
+        let hello = NodeMessage::Hello(wire::Hello {
+            node_id: node_id.clone(),
+            agent_version: "test-agent".to_string(),
+            engine_version: "test-engine".to_string(),
+            boot_id: "boot-1".to_string(),
+            stored_rev: 0,
+            applied_rev: 0,
+            log_seq: 0,
+            log_hash: "0".repeat(64),
+            leases: Vec::new(),
+            mesh_public_key: Some(base64::engine::general_purpose::STANDARD.encode([seed; 32])),
+            capacity: capacity(),
+            allocated: wire::Capacity::default(),
+            kvm: wire::Kvm {
+                available: true,
+                kernel: "6.9.0".to_string(),
+                nested: Some(true),
+            },
+            dropped_events: 0,
+            volume_snapshot: Some(wire::SnapshotMethod::Reflink),
+        });
+        send(&mut socket, hello).await;
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(30), socket.next())
+                .await
+                .expect("a frame within 30 s")
+                .expect("the socket is open")
+                .expect("a valid websocket frame");
+            if let WsMessage::Text(text) = message {
+                let frame: Value = serde_json::from_str(text.as_str()).unwrap();
+                if frame["type"] == "desired_state" {
+                    break;
+                }
+            }
+        }
+        (node_id, socket)
+    }
+
+    /// The `spec` of the first `desired_state` that `wanted` accepts, within
+    /// 30 s; earlier frames are skipped.
+    pub async fn spec_where(socket: &mut Socket, wanted: impl Fn(&Value) -> bool) -> Value {
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(30), socket.next())
+                .await
+                .expect("a desired_state within 30 s")
+                .expect("the socket is open")
+                .expect("a valid websocket frame");
+            if let WsMessage::Text(text) = message {
+                let frame: Value = serde_json::from_str(text.as_str()).unwrap();
+                if frame["type"] == "desired_state" && wanted(&frame["body"]["spec"]) {
+                    return frame["body"]["spec"].clone();
+                }
+            }
+        }
+    }
+
+    /// Sends a `status_report` whose `warm` holds one `role: target` entry
+    /// for `volume_id` of `app_id`, with `allocated_bytes`.
+    pub async fn report_target(
+        socket: &mut Socket,
+        volume_id: &str,
+        app_id: &str,
+        allocated_bytes: u64,
+    ) {
+        let entry = wire::WarmStatus {
+            volume_id: volume_id.to_string(),
+            app_id: app_id.to_string(),
+            role: wire::WarmRole::Target,
+            snapshot_seq: Some(1),
+            snapshot_taken_at: None,
+            completed_at: None,
+            allocated_bytes: Some(allocated_bytes),
+            extent_count: None,
+            frozen: None,
+            rejected_token: None,
+            rejected_at: None,
+            error: None,
+        };
+        let report = NodeMessage::StatusReport(wire::StatusReport {
+            applied_rev: 0,
+            vms: Vec::new(),
+            routes: Vec::new(),
+            capacity: capacity(),
+            allocated: wire::Capacity::default(),
+            disk_free_gb: 90.0,
+            builds: Vec::new(),
+            edge_backends: Vec::new(),
+            backups: Vec::new(),
+            images: Vec::new(),
+            warm: vec![entry],
+            volumes: Vec::new(),
+        });
+        send(socket, report).await;
+    }
+}
+
+/// The node the scheduler picks is sent its target entry at once (section
+/// 6.13), and `ha_cost.warm.storage_bytes` is then the allocated bytes of the
+/// copy it last reported, and the volume's allocated bytes before that
+/// (`openapi.yaml` `HaPolicyCost.storage_bytes`). A report of the same volume
+/// from a node that is not the warm node does not count.
+#[cfg(feature = "dev-warm-policy")]
+#[tokio::test]
+async fn a_dev_warm_policy_build_wakes_the_warm_node_and_prices_its_report() {
+    // The node sends nothing while the test talks to the API.
+    let (server, owner, node_id, project_id) =
+        setup_on(common::start_with_patient_node_session().await).await;
+    let app = create_app(&owner, &server, &project_id).await;
+    let app_id = app["id"].as_str().unwrap();
+    warm::stateful(&server, app_id, &node_id).await;
+    let volume_id = warm::volume_id(app_id);
+    // The volume's node holds the app's lease, so the pair forms.
+    sqlx::query(
+        "INSERT INTO leases (id, resource_type, resource_id, holder_node_id, mode, \
+         fencing_token, granted_at) VALUES ('lse_0000000000000000000000000W', 'app', ?, ?, \
+         'local', 4, ?)",
+    )
+    .bind(app_id)
+    .bind(&node_id)
+    .bind(quoro_control_plane::store::now_rfc3339())
+    .execute(server.state.store.pool())
+    .await
+    .unwrap();
+    let (warm_node, mut socket) = session::connected_node(&server, &owner, "warm-a", 7).await;
+
+    let res = patch_app(&owner, &server, app_id, json!({ "ha_policy": "warm" })).await;
+    assert_eq!(res.status(), 200, "warm: {}", res.text().await.unwrap());
+    let updated: Value = res.json().await.unwrap();
+    assert_eq!(updated["warm"]["node_id"], warm_node.as_str());
+    session::spec_where(&mut socket, |spec| {
+        spec["volumes"].as_array().is_some_and(|files| {
+            files.iter().any(|file| {
+                file["volume_id"] == volume_id.as_str() && file["warm"]["role"] == "target"
+            })
+        })
+    })
+    .await;
+    assert_eq!(
+        warm::cost(&owner, &server, app_id).await["storage_bytes"],
+        4096
+    );
+
+    // Another node's report of the same volume is not the warm copy.
+    let (_other, mut other_socket) = session::connected_node(&server, &owner, "warm-b", 8).await;
+    session::report_target(&mut other_socket, &volume_id, app_id, 1_000).await;
+    session::report_target(&mut socket, &volume_id, app_id, 8_192).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let cost = warm::cost(&owner, &server, app_id).await;
+        if cost["storage_bytes"] == 8_192 {
+            break;
+        }
+        assert_ne!(cost["storage_bytes"], 1_000, "{cost}");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "storage_bytes never followed the report: {cost}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 async fn create_app_named(

@@ -76,8 +76,9 @@ impl AppStatus {
 }
 
 /// `apps.ha_policy` (`App.ha_policy`). M5a accepts `none` and `cold`; `warm`
-/// and `hot` are refused until M5b and M6 (ADR 0020). A test-lab build with
-/// the dev-only `dev-warm-policy` feature accepts `warm` (ADR 0223).
+/// and `hot` are refused until M5b and M6 (ADR 0020). Until the last warm PR,
+/// only a test-lab build with the dev-only `dev-warm-policy` feature accepts
+/// `warm` ([`crate::DEV_WARM_POLICY`], ADR 0277).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HaPolicy {
@@ -193,6 +194,19 @@ pub struct WarmCopy {
     pub error: Option<String>,
 }
 
+/// Whether this build accepts `ha_policy` `warm` (ADR 0277).
+const WARM_POLICY: bool = crate::DEV_WARM_POLICY;
+
+/// A field that tells an absent value (`None`) from an explicit `null`
+/// (`Some(None)`); used with `#[serde(default)]`.
+fn nullable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 /// Settings of an app's warm copy (`openapi.yaml` `WarmSettings`, ADR 0174).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[schema(
@@ -200,10 +214,18 @@ pub struct WarmCopy {
     description = "Settings of an app's warm copy (ADR 0174). Absent fields stay unchanged."
 )]
 pub struct WarmSettings {
-    /// Pins the warm node; null lets the scheduler pick.
-    #[serde(default)]
-    #[schema(pattern = "^nod_[0-9A-HJKMNP-TV-Z]{26}$", required = false)]
-    pub node_id: Option<String>,
+    /// Pins the warm node; null lets the scheduler pick. Absent: unchanged.
+    #[serde(
+        default,
+        deserialize_with = "nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(
+        value_type = Option<String>,
+        pattern = "^nod_[0-9A-HJKMNP-TV-Z]{26}$",
+        required = false
+    )]
+    pub node_id: Option<Option<String>>,
     /// Seconds between two snapshots on the source.
     #[serde(default)]
     #[schema(value_type = i64, minimum = 5, maximum = 3600, required = false)]
@@ -246,13 +268,16 @@ pub struct HaPolicyCost {
     pub unavailable_reason: Option<HaUnavailableReason>,
     /// Capacity reserved on other nodes.
     pub reserved: HaCapacity,
-    /// Bytes this policy keeps in object storage, or null when not computed.
+    /// Bytes this policy keeps outside the app's node: in object storage for
+    /// `cold`, on the warm node's disk for `warm`; null when not computed.
     #[schema(minimum = 0, required = true)]
     pub storage_bytes: Option<i64>,
-    /// For `cold`, seconds to restore the latest backup; null otherwise.
+    /// For `cold`, seconds to restore the latest backup; for `warm`, seconds
+    /// to start the warm copy; null otherwise.
     #[schema(minimum = 0, required = true)]
     pub restore_estimate_s: Option<i64>,
-    /// For `cold`, how long each backup pauses the app; null otherwise.
+    /// For `cold`, how long each backup pauses the app; 0 for `warm`; null
+    /// otherwise.
     #[schema(minimum = 0, required = true)]
     pub pause_estimate_ms: Option<i64>,
 }
@@ -1150,25 +1175,35 @@ fn validate_update(body: &UpdateAppRequest) -> Result<(), ApiError> {
     }
     match body.ha_policy {
         None | Some(HaPolicy::None | HaPolicy::Cold) => {}
-        // ADR 0223: a test-lab build with the dev-only `dev-warm-policy`
-        // feature accepts `warm` and only stores it, so an app's lease can be
-        // made `expiring` before the warm policy ships, once the primary sends
-        // the section 8.4 mode change (#555). Delete this arm and the feature
-        // when the warm policy merges (#533).
-        Some(HaPolicy::Warm) if cfg!(feature = "dev-warm-policy") => {}
+        // ADR 0277: until the last warm PR, only a test-lab build with the
+        // dev-only `dev-warm-policy` feature accepts `warm`; the checks that
+        // need the app and the cluster run in the write transaction
+        // (`update_warm`). The last warm PR deletes this arm with the feature.
+        Some(HaPolicy::Warm) if WARM_POLICY => {}
         Some(HaPolicy::Warm | HaPolicy::Hot) => {
             return Err(ApiError::validation(
                 "ha_policy warm and hot are not supported before M5b and M6",
             ));
         }
     }
-    // `UpdateAppRequest.warm` needs `ha_policy` `warm`, which this release
-    // still refuses. The dev-only `dev-warm-policy` feature accepts the policy
-    // but not its settings (ADR 0223).
-    if body.warm.is_some() {
-        return Err(ApiError::validation(
-            "warm settings need ha_policy warm, which is not supported before M5b",
-        ));
+    // `UpdateAppRequest.warm` needs `ha_policy` `warm`, which a build without
+    // the feature refuses (ADR 0277).
+    if let Some(warm) = &body.warm {
+        if !WARM_POLICY {
+            return Err(ApiError::validation(
+                "warm settings need ha_policy warm, which is not supported before M5b",
+            ));
+        }
+        if let Some(interval_s) = warm.interval_s
+            && !(5..=3600).contains(&interval_s)
+        {
+            return Err(ApiError::validation("warm.interval_s is outside 5-3600"));
+        }
+        if let Some(Some(node_id)) = &warm.node_id
+            && !deploy::is_id_with_prefix("nod", node_id)
+        {
+            return Err(ApiError::validation("warm.node_id is not a node id"));
+        }
     }
     if let Some(schedule) = &body.backup_schedule {
         validate_backup_schedule(schedule)?;
@@ -1666,9 +1701,14 @@ pub async fn update_app(
         .await?;
 
     match update_app_tx(&state, &ctx, &app_id, &body, &params).await {
-        Ok((mut app, vm_ids)) => {
+        Ok((mut app, vm_ids, warm_wake)) => {
             for vm_id in vm_ids {
                 state.notify_driver(&vm_id);
+            }
+            // A new warm node, pin or interval reaches the volume's node and
+            // the old and new warm nodes (section 6.13).
+            for node_id in warm_wake {
+                state.hub.node_changed(&node_id);
             }
             // `replicas`, `port` and the health check shape `spec.edge`.
             state.hub.edge_changed();
@@ -1699,7 +1739,7 @@ async fn update_app_tx(
     app_id: &str,
     body: &UpdateAppRequest,
     params: &Value,
-) -> Result<(App, Vec<String>), ApiError> {
+) -> Result<(App, Vec<String>, Vec<String>), ApiError> {
     validate_update(body)?;
     if !deploy::is_id_with_prefix("app", app_id) {
         return Err(ApiError::not_found("app"));
@@ -1711,6 +1751,7 @@ async fn update_app_tx(
         .await?
         .ok_or_else(|| ApiError::not_found("app"))?;
     let mut app = app_from_row(&row)?;
+    let was_warm = app.ha_policy == HaPolicy::Warm;
     let mut changed = Vec::new();
 
     // A new replica count is checked against the app as it is now, and against
@@ -1817,6 +1858,10 @@ async fn update_app_tx(
         app.placement = placement.clone();
         changed.push("placement");
     }
+    let warm_wake = update_warm(&mut w.tx, app_id, &app, was_warm, body.warm.as_ref()).await?;
+    if warm_wake.is_some() {
+        changed.push("warm");
+    }
 
     let mut vm_ids = app_vm_ids(&mut w.tx, app_id).await?;
     let target = app_target(app_id);
@@ -1899,7 +1944,149 @@ async fn update_app_tx(
         .await?;
     }
     w.commit().await?;
-    Ok((app, vm_ids))
+    Ok((app, vm_ids, warm_wake.unwrap_or_default()))
+}
+
+/// Why `updateApp` refuses `ha_policy` `warm` for an app (`openapi.yaml`
+/// `UpdateAppRequest.ha_policy`).
+fn warm_refusal(reason: HaUnavailableReason, has_source: bool) -> ApiError {
+    ApiError::validation(match reason {
+        HaUnavailableReason::NotInThisRelease if has_source => {
+            "ha_policy warm is not available in this release for an app built from a Git \
+             source: its image exists only on the node that built it"
+        }
+        HaUnavailableReason::NotInThisRelease => "ha_policy warm is not supported before M5b",
+        HaUnavailableReason::Stateless => "ha_policy warm needs a stateful app",
+        HaUnavailableReason::NoWarmNode | HaUnavailableReason::NoRepository => {
+            "ha_policy warm needs a volume node that snapshots with reflink and another \
+             eligible node"
+        }
+    })
+}
+
+/// The warm settings `updateApp` writes (`openapi.yaml`
+/// `UpdateAppRequest.ha_policy`, `WarmSettings`, migration 0011), for `app`
+/// as the request left it; `was_warm` says whether it was `warm` before.
+/// - An app that becomes `warm` needs an attached volume whose node
+///   snapshots with `reflink`, another eligible node and no Git source (ADR
+///   0265); `validation_failed` otherwise
+///   ([`crate::warm::warm_availability`]).
+/// - `warm.node_id` pins a node, which must be eligible
+///   ([`crate::warm::eligible_warm_nodes`]).
+/// - When the app becomes `warm` without a pin, or `warm.node_id` is `null`,
+///   the scheduler picks among the eligible nodes (ADR 0276). It keeps the
+///   current warm node while that one is eligible, since it already holds
+///   the copy. With none eligible, the app keeps its node, unpinned, and the
+///   sweeper picks once that node is lost for good
+///   ([`crate::warm::repick_warm_nodes`]).
+/// - `warm.interval_s` sets the interval.
+/// - Warm settings need the app to be `warm` after the request.
+/// - An app that leaves `warm` loses its warm node and the pin, and keeps
+///   its interval.
+///
+/// Returns `None` when nothing changed, otherwise the nodes whose snapshots
+/// change: the volume's node and the old and new warm nodes.
+async fn update_warm(
+    conn: &mut sqlx::SqliteConnection,
+    app_id: &str,
+    app: &App,
+    was_warm: bool,
+    settings: Option<&WarmSettings>,
+) -> Result<Option<Vec<String>>, ApiError> {
+    use crate::warm::{WarmAvailability, attached_volume, eligible_warm_nodes, warm_availability};
+    let warm_now = app.ha_policy == HaPolicy::Warm;
+    if settings.is_some() && !warm_now {
+        return Err(ApiError::validation("warm settings need ha_policy warm"));
+    }
+    if !warm_now && !was_warm {
+        return Ok(None);
+    }
+    let has_source = app.source.is_some();
+    let (stored_node, stored_pinned, stored_interval): (Option<String>, i64, i64) = sqlx::query_as(
+        "SELECT warm_node_id, warm_node_pinned, warm_interval_s FROM apps WHERE id = ?",
+    )
+    .bind(app_id)
+    .fetch_one(&mut *conn)
+    .await?;
+    let before = (stored_node.clone(), stored_pinned != 0, stored_interval);
+    let (mut node, mut pinned, mut interval) = before.clone();
+    let mut volume_node = None;
+    let pin = settings.and_then(|settings| settings.node_id.clone());
+    if !warm_now {
+        node = None;
+        pinned = false;
+    } else if !was_warm || pin.is_some() {
+        let (volume, eligible) = if was_warm {
+            let volume = attached_volume(conn, app_id).await?;
+            let eligible = match &volume {
+                Some(volume) => eligible_warm_nodes(conn, &volume.node_id).await?,
+                None => Vec::new(),
+            };
+            (volume, eligible)
+        } else {
+            match warm_availability(conn, app_id, has_source, WARM_POLICY).await? {
+                WarmAvailability::Available { volume, eligible } => (Some(volume), eligible),
+                WarmAvailability::Unavailable { reason, .. } => {
+                    return Err(warm_refusal(reason, has_source));
+                }
+            }
+        };
+        volume_node = volume.map(|volume| volume.node_id);
+        match pin {
+            // A `warm` app whose volume is gone has nothing to copy, so no
+            // node can be pinned for it.
+            Some(Some(_)) if volume_node.is_none() => {
+                return Err(warm_refusal(HaUnavailableReason::Stateless, has_source));
+            }
+            Some(Some(node_id)) => {
+                if !eligible.contains(&node_id) {
+                    return Err(ApiError::validation(format!(
+                        "node {node_id} cannot be the warm node: it must be connected, have \
+                         the node role, not hold the app's volume, snapshot with reflink and \
+                         have a mesh address"
+                    )));
+                }
+                node = Some(node_id);
+                pinned = true;
+            }
+            _ => {
+                pinned = false;
+                let keeps = node.as_ref().is_some_and(|node| eligible.contains(node));
+                if !keeps && let Some(first) = eligible.first() {
+                    node = Some(first.clone());
+                }
+            }
+        }
+    }
+    if warm_now && let Some(interval_s) = settings.and_then(|settings| settings.interval_s) {
+        interval = interval_s;
+    }
+    if (node.clone(), pinned, interval) == before {
+        return Ok(None);
+    }
+    sqlx::query(
+        "UPDATE apps SET warm_node_id = ?, warm_node_pinned = ?, warm_interval_s = ? WHERE id = ?",
+    )
+    .bind(&node)
+    .bind(i64::from(pinned))
+    .bind(interval)
+    .bind(app_id)
+    .execute(&mut *conn)
+    .await?;
+    let volume_node = match volume_node {
+        Some(volume_node) => Some(volume_node),
+        None => attached_volume(conn, app_id)
+            .await?
+            .map(|volume| volume.node_id),
+    };
+    let mut wake: Vec<String> = volume_node
+        .into_iter()
+        .chain(stored_node)
+        .chain(node)
+        .collect();
+    wake.sort();
+    wake.dedup();
+    Ok(Some(wake))
 }
 
 /// Deletes an app and its data. A human with `app:delete` calls it directly;

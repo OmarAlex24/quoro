@@ -47,11 +47,14 @@ pub mod vulns;
 pub(crate) mod warm;
 
 /// Whether this control plane was compiled with the dev-only
-/// `dev-warm-policy` feature, which accepts `ha_policy` `warm` in a test-lab
-/// build (ADR 0223). It is read from this crate's own `cfg`, so it is true
-/// however the feature was turned on, including by cargo's feature
-/// unification; `quoro version` reports it and CI fails a default or release
-/// binary that does. Removed with the feature when the warm policy merges.
+/// `dev-warm-policy` feature (ADR 0223, ADR 0277). Until the last warm PR
+/// merges, only such a test-lab build accepts `ha_policy` `warm`, and it runs
+/// everything of the warm policy merged so far: the warm node's choice, its
+/// settings and its cost. Every other build refuses `warm` as before. It is
+/// read from this crate's own `cfg`, so it is true however the feature was
+/// turned on, including by cargo's feature unification; `quoro version`
+/// reports it and CI fails a default or release binary that does. The last
+/// warm PR removes it with the feature.
 pub const DEV_WARM_POLICY: bool = cfg!(feature = "dev-warm-policy");
 
 use crate::keys::ClusterKeys;

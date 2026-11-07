@@ -27,10 +27,11 @@
 //! has a warm node.
 
 use crate::AppState;
-use crate::api::apps::{App, HaPolicy, WarmCopy, WarmState};
+use crate::api::apps::{App, HaPolicy, HaUnavailableReason, WarmCopy, WarmState};
 use crate::error::ApiError;
 use quoro_proto::wire::{Spec, SpecVm, SpecVolumeState, SpecWarm, WarmRole, WarmStatus};
 use sqlx::Row;
+use sqlx::SqliteConnection;
 use sqlx::sqlite::SqlitePool;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use time::OffsetDateTime;
@@ -643,6 +644,343 @@ pub(crate) async fn attach(state: &AppState, apps: &mut [App]) -> Result<(), Api
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// The warm policy: which node keeps the copy (ADR 0172, ADR 0174, ADR 0275,
+// ADR 0276, ADR 0278).
+// ---------------------------------------------------------------------------
+
+/// The attached volume of an app, as the warm policy reads it: the one in
+/// `creating`, `ready` or `restoring`, of which an app has at most one
+/// (migration 0006).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AttachedVolume {
+    pub id: String,
+    pub node_id: String,
+    pub size_gb: i64,
+    pub allocated_bytes: Option<i64>,
+}
+
+/// The attached volume of `app_id`, if it has one.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn attached_volume(
+    conn: &mut SqliteConnection,
+    app_id: &str,
+) -> Result<Option<AttachedVolume>, sqlx::Error> {
+    let row: Option<(String, String, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT id, node_id, size_gb, allocated_bytes FROM volumes \
+         WHERE app_id = ? AND state IN ('creating', 'ready', 'restoring') ORDER BY id LIMIT 1",
+    )
+    .bind(app_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(
+        row.map(|(id, node_id, size_gb, allocated_bytes)| AttachedVolume {
+            id,
+            node_id,
+            size_gb,
+            allocated_bytes,
+        }),
+    )
+}
+
+/// The nodes that can be the warm node of an app whose volume is on
+/// `volume_node` (`openapi.yaml` `WarmCopy.node_id`):
+/// - connected;
+/// - with the `node` role;
+/// - other than `volume_node`;
+/// - snapshotting with `reflink` (ADR 0172);
+/// - with a mesh address. Since ADR 0266 a node's endpoint is the source
+///   address of its session, so a connected node has one, and the source can
+///   always reach it when it is picked.
+///
+/// The app's placement does not narrow them (ADR 0275). They are ordered by
+/// how many `warm` apps already keep their copy on each, then by id, so the
+/// scheduler spreads the copies.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn eligible_warm_nodes(
+    conn: &mut SqliteConnection,
+    volume_node: &str,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT n.id FROM nodes n \
+         WHERE n.status = 'connected' AND n.id != ? AND n.volume_snapshot = 'reflink' \
+           AND n.mesh_address IS NOT NULL \
+           AND EXISTS (SELECT 1 FROM json_each(n.roles) WHERE json_each.value = 'node') \
+         ORDER BY (SELECT COUNT(*) FROM apps a \
+                   WHERE a.warm_node_id = n.id AND a.ha_policy = 'warm'), n.id",
+    )
+    .bind(volume_node)
+    .fetch_all(&mut *conn)
+    .await
+}
+
+/// Whether an app may switch to `warm` now (`openapi.yaml`
+/// `UpdateAppRequest.ha_policy`, `HaPolicyCost.unavailable_reason`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum WarmAvailability {
+    /// The app's volume and the nodes that can be its warm node, in the
+    /// scheduler's order ([`eligible_warm_nodes`]); never empty.
+    Available {
+        volume: AttachedVolume,
+        eligible: Vec<String>,
+    },
+    /// Why not, with the app's volume when it has one.
+    Unavailable {
+        reason: HaUnavailableReason,
+        volume: Option<AttachedVolume>,
+    },
+}
+
+/// Whether `warm` is available to `app_id`:
+/// - **`not_in_this_release`** in a build that does not accept `warm` yet
+///   (`accepted` false, ADR 0277), and for an app with a Git source, whose
+///   built image exists only on the node that built it (ADR 0265);
+/// - **`stateless`** for an app with no attached volume;
+/// - **`no_warm_node`** while the volume's node does not snapshot with
+///   `reflink` or no other node is eligible ([`eligible_warm_nodes`]).
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn warm_availability(
+    conn: &mut SqliteConnection,
+    app_id: &str,
+    has_source: bool,
+    accepted: bool,
+) -> Result<WarmAvailability, sqlx::Error> {
+    let unavailable = |reason, volume| Ok(WarmAvailability::Unavailable { reason, volume });
+    if !accepted {
+        return unavailable(HaUnavailableReason::NotInThisRelease, None);
+    }
+    let volume = attached_volume(conn, app_id).await?;
+    if has_source {
+        return unavailable(HaUnavailableReason::NotInThisRelease, volume);
+    }
+    let Some(volume) = volume else {
+        return unavailable(HaUnavailableReason::Stateless, None);
+    };
+    let method: Option<String> =
+        sqlx::query_scalar("SELECT volume_snapshot FROM nodes WHERE id = ?")
+            .bind(&volume.node_id)
+            .fetch_optional(&mut *conn)
+            .await?
+            .flatten();
+    if method.as_deref() != Some("reflink") {
+        return unavailable(HaUnavailableReason::NoWarmNode, Some(volume));
+    }
+    let eligible = eligible_warm_nodes(conn, &volume.node_id).await?;
+    if eligible.is_empty() {
+        return unavailable(HaUnavailableReason::NoWarmNode, Some(volume));
+    }
+    Ok(WarmAvailability::Available { volume, eligible })
+}
+
+/// What a `warm` app's warm node row says, for [`lost_for_good`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WarmNodeRow {
+    status: String,
+    roles: Vec<String>,
+    volume_snapshot: Option<String>,
+}
+
+/// Whether the scheduler picks another warm node for an app whose warm node
+/// is `node` (`None`: it has none) and whose volume is on `volume_node`
+/// (`openapi.yaml` `WarmCopy.node_id`, ADR 0276, ADR 0278):
+/// - **yes** while it has none, and once its node is removed;
+/// - for a node the scheduler picked, **yes** once it lost the `node` role,
+///   snapshots with `pause_copy` or is the volume's node;
+/// - **no** otherwise. A disconnected node, one without a mesh address, and
+///   one whose snapshot method is not known yet stay the warm node, and
+///   `App.warm` shows `failed` until they come back. An operator's pin lasts
+///   until the node is removed.
+fn lost_for_good(node: Option<(&str, &WarmNodeRow)>, pinned: bool, volume_node: &str) -> bool {
+    let Some((node_id, row)) = node else {
+        return true;
+    };
+    if row.status == "removed" {
+        return true;
+    }
+    if pinned {
+        return false;
+    }
+    !row.roles.iter().any(|role| role == "node")
+        || row.volume_snapshot.as_deref() == Some("pause_copy")
+        || node_id == volume_node
+}
+
+/// Picks a warm node again for every `warm` app whose warm node is lost for
+/// good ([`lost_for_good`]), and one for a `warm` app that has none, once a
+/// node is eligible. Each app is written in its own transaction, with its
+/// change-log entry and `app.updated`; afterwards the volume's node and the
+/// old and new warm nodes rebuild their snapshots, so the old one's copy gets
+/// its `deleted` entry once no failover can need it (section 5.11). Runs on
+/// the sweeper's tick, and only in a build that accepts `warm` (ADR 0277).
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn repick_warm_nodes(state: &AppState) -> Result<(), ApiError> {
+    if !crate::DEV_WARM_POLICY {
+        return Ok(());
+    }
+    let app_ids: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM apps WHERE ha_policy = 'warm' ORDER BY id")
+            .fetch_all(state.store.pool())
+            .await?;
+    for app_id in app_ids {
+        let wake = repick_one(state, &app_id).await?;
+        for node_id in wake {
+            state.hub.node_changed(&node_id);
+        }
+    }
+    Ok(())
+}
+
+/// What [`repick_one`] writes for one app: the node of its volume, its
+/// current warm node, and the one the scheduler picks (`None` while no node
+/// is eligible).
+struct Repick {
+    volume_node: String,
+    current: Option<String>,
+    picked: Option<String>,
+}
+
+/// The [`Repick`] `app_id` needs, read on `conn`, or `None` when it keeps its
+/// warm node: it is not `warm`, has no attached volume (the pair forms once
+/// it has one again), or its warm node is not lost for good.
+async fn repick_decision(
+    conn: &mut SqliteConnection,
+    app_id: &str,
+) -> Result<Option<Repick>, sqlx::Error> {
+    let row: Option<(Option<String>, i64)> = sqlx::query_as(
+        "SELECT warm_node_id, warm_node_pinned FROM apps WHERE id = ? AND ha_policy = 'warm'",
+    )
+    .bind(app_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((current, pinned)) = row else {
+        return Ok(None);
+    };
+    let Some(volume) = attached_volume(conn, app_id).await? else {
+        return Ok(None);
+    };
+    let node_row = match &current {
+        Some(node_id) => sqlx::query_as::<_, (String, String, Option<String>)>(
+            "SELECT status, roles, volume_snapshot FROM nodes WHERE id = ?",
+        )
+        .bind(node_id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .map(|(status, roles, volume_snapshot)| WarmNodeRow {
+            status,
+            roles: serde_json::from_str(&roles).unwrap_or_default(),
+            volume_snapshot,
+        }),
+        None => None,
+    };
+    // A warm node with no row at all is gone, like a removed one.
+    let node = current.as_deref().zip(node_row.as_ref());
+    if !lost_for_good(node, pinned != 0, &volume.node_id) {
+        return Ok(None);
+    }
+    let picked = eligible_warm_nodes(conn, &volume.node_id)
+        .await?
+        .into_iter()
+        .next();
+    if picked == current && pinned == 0 {
+        return Ok(None);
+    }
+    Ok(Some(Repick {
+        volume_node: volume.node_id,
+        current,
+        picked,
+    }))
+}
+
+/// [`repick_warm_nodes`] for one app; returns the nodes to wake.
+async fn repick_one(state: &AppState, app_id: &str) -> Result<Vec<String>, ApiError> {
+    // Most ticks change nothing, so the write lock is taken only for an app
+    // that needs another warm node.
+    {
+        let mut conn = state.store.pool().acquire().await?;
+        if repick_decision(&mut conn, app_id).await?.is_none() {
+            return Ok(Vec::new());
+        }
+    }
+    let mut w = state.store.begin_write().await?;
+    // Read again under the write lock: `updateApp` may have changed it.
+    let Some(Repick {
+        volume_node,
+        current,
+        picked,
+    }) = repick_decision(&mut w.tx, app_id).await?
+    else {
+        return Ok(Vec::new());
+    };
+    let now = crate::store::now_rfc3339();
+    sqlx::query(
+        "UPDATE apps SET warm_node_id = ?, warm_node_pinned = 0, updated_at = ? WHERE id = ?",
+    )
+    .bind(&picked)
+    .bind(&now)
+    .bind(app_id)
+    .execute(&mut *w.tx)
+    .await?;
+    let app_row = sqlx::query(&format!(
+        "SELECT {} FROM apps WHERE id = ?",
+        crate::api::apps::APP_COLUMNS
+    ))
+    .bind(app_id)
+    .fetch_one(&mut *w.tx)
+    .await?;
+    let app = crate::api::apps::app_from_row(&app_row)?;
+    let actor = crate::changelog::Actor::system("warm");
+    let payload = serde_json::to_value(&app)
+        .map_err(|error| ApiError::internal(&format!("app payload: {error}")))?;
+    crate::changelog::append(
+        &mut w.tx,
+        &actor,
+        "app",
+        app_id,
+        crate::changelog::Op::Update,
+        payload,
+    )
+    .await?;
+    crate::events::emit(
+        &mut w.tx,
+        crate::events::NewEvent {
+            kind: "app.updated",
+            source: crate::events::Source::ControlPlane,
+            subject_type: "app",
+            subject_id: app_id,
+            project_id: Some(&app.project_id),
+            request_id: None,
+            actor: Some(&actor),
+            data: serde_json::json!({ "app_id": app_id, "changed": ["warm"] }),
+        },
+    )
+    .await?;
+    w.commit().await?;
+    tracing::info!(
+        app_id,
+        old = ?current,
+        new = ?picked,
+        "picked the warm node again"
+    );
+    let mut wake: Vec<String> = vec![volume_node];
+    wake.extend(current);
+    wake.extend(picked);
+    wake.sort();
+    wake.dedup();
+    Ok(wake)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1110,5 +1448,112 @@ mod tests {
         );
         assert!(wake(Some(&Spec::default()), &Spec::default()).is_empty());
         assert!(facts_of(&Spec::default()).is_empty());
+    }
+
+    fn node_row(status: &str, roles: &[&str], method: Option<&str>) -> WarmNodeRow {
+        WarmNodeRow {
+            status: status.to_owned(),
+            roles: roles.iter().map(|role| (*role).to_owned()).collect(),
+            volume_snapshot: method.map(str::to_owned),
+        }
+    }
+
+    /// ADR 0278: only a lasting loss moves the copy, and a pin lasts until
+    /// its node is removed.
+    #[test]
+    fn a_warm_node_is_lost_for_good_only_for_a_lasting_reason() {
+        let healthy = node_row("connected", &["node"], Some("reflink"));
+        let cases = [
+            ("no warm node", None, false, true),
+            ("healthy", Some(("nod_t", healthy.clone())), false, false),
+            (
+                "disconnected",
+                Some((
+                    "nod_t",
+                    node_row("disconnected", &["node"], Some("reflink")),
+                )),
+                false,
+                false,
+            ),
+            (
+                "fenced",
+                Some(("nod_t", node_row("fenced", &["node"], Some("reflink")))),
+                false,
+                false,
+            ),
+            (
+                "snapshot method not known yet",
+                Some(("nod_t", node_row("connected", &["node"], None))),
+                false,
+                false,
+            ),
+            (
+                "removed",
+                Some(("nod_t", node_row("removed", &["node"], Some("reflink")))),
+                false,
+                true,
+            ),
+            (
+                "removed, pinned",
+                Some(("nod_t", node_row("removed", &["node"], Some("reflink")))),
+                true,
+                true,
+            ),
+            (
+                "no node role",
+                Some(("nod_t", node_row("connected", &["edge"], Some("reflink")))),
+                false,
+                true,
+            ),
+            (
+                "no node role, pinned",
+                Some(("nod_t", node_row("connected", &["edge"], Some("reflink")))),
+                true,
+                false,
+            ),
+            (
+                "pause_copy",
+                Some((
+                    "nod_t",
+                    node_row("connected", &["node"], Some("pause_copy")),
+                )),
+                false,
+                true,
+            ),
+            (
+                "pause_copy, pinned",
+                Some((
+                    "nod_t",
+                    node_row("connected", &["node"], Some("pause_copy")),
+                )),
+                true,
+                false,
+            ),
+            (
+                "the volume's node",
+                Some(("nod_s", healthy.clone())),
+                false,
+                true,
+            ),
+            (
+                "the volume's node, pinned",
+                Some(("nod_s", healthy.clone())),
+                true,
+                false,
+            ),
+            (
+                "the node and witness roles",
+                Some((
+                    "nod_t",
+                    node_row("connected", &["witness", "node"], Some("reflink")),
+                )),
+                false,
+                false,
+            ),
+        ];
+        for (case, node, pinned, lost) in cases {
+            let node = node.as_ref().map(|(id, row)| (*id, row));
+            assert_eq!(lost_for_good(node, pinned, "nod_s"), lost, "{case}");
+        }
     }
 }
