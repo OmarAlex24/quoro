@@ -91,12 +91,12 @@ export function NodesPage() {
 /** `/agents`, `/agents?agent=` and `/agents?tab=grants`: who may act, and what they may do. */
 export function AgentsPage() {
   const search = agentsRoute.useSearch();
-  const grants = search.tab === 'grants';
+  // `tab=grants` with an agent is that agent's Grants tab, not the cluster's.
+  const grants = search.agent === undefined && search.tab === 'grants';
 
   return (
     <TabbedPage
       label="Agents"
-      narrow={!grants && search.agent !== undefined}
       tabs={
         <>
           <Link

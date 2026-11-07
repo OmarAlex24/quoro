@@ -154,6 +154,7 @@ export function ApprovalPermit({
           approval={approval}
           onDecided={onDecided}
           onConflict={onConflict}
+          className="border-t border-line px-4 py-4 sm:px-5"
         />
       ) : null}
     </article>

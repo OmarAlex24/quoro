@@ -2,7 +2,12 @@ import { describe, expect, it } from 'vitest';
 import type { Approval } from '../api/generated/model';
 import {
   approvalConfirm,
+  approvalTitle,
+  approvalWants,
+  callText,
   approvalLamp,
+  approvalMeter,
+  approveWords,
   approvalWords,
   decidedAt,
   decidedNewestFirst,
@@ -140,5 +145,60 @@ describe('approvals', () => {
     ]);
     expect(decidedAt(expired)).toBe('2026-11-02T12:10:00.000Z');
     expect(decidedAt(denied)).toBe('2026-11-02T11:58:00.000Z');
+  });
+});
+
+describe('approvalMeter', () => {
+  const now = Date.UTC(2026, 10, 7, 17, 35);
+  const at = (minutes: number) => new Date(now + minutes * 60_000).toISOString();
+
+  it('drains from filing to expiry', () => {
+    const meter = approvalMeter({ created_at: at(-11), expires_at: at(49) }, now);
+    expect(meter.words).toBe('Expires in 49 min');
+    expect(meter.share).toBeCloseTo(49 / 60);
+    expect(meter.over).toBe(false);
+  });
+
+  it('is empty once the request lapsed', () => {
+    expect(approvalMeter({ created_at: at(-70), expires_at: at(-10) }, now)).toEqual({
+      share: 0,
+      words: 'Expired',
+      over: true,
+    });
+  });
+});
+
+describe('approveWords', () => {
+  it('says what the red button approves', () => {
+    expect(approveWords('app:delete')).toBe('Approve deletion');
+    expect(approveWords('backup:restore')).toBe('Approve restore');
+    expect(approveWords('app:restart')).toBe('Approve');
+  });
+});
+
+describe('the exact call', () => {
+  it('writes the operation with every parameter, as recorded', () => {
+    expect(callText({ operation: 'delete_app', params: { app_id: 'app_01JC9Z6Q5W0000000000000000' } })).toBe(
+      'delete_app { app_id: "app_01JC9Z6Q5W0000000000000000" }',
+    );
+    expect(callText({ operation: 'scale', params: { replicas: 2, nodes: ['a', 'b'], force: null } })).toBe(
+      'scale { replicas: 2, nodes: ["a","b"], force: null }',
+    );
+    expect(callText({ operation: 'list_apps', params: {} })).toBe('list_apps {}');
+  });
+
+  it('names what the request asks for', () => {
+    const names: Record<string, string> = { app_1: 'blog', prj_1: 'docs' };
+    const name = (_type: string, id: string) => names[id];
+    expect(approvalTitle({ scope: 'app:delete', target: { type: 'app', id: 'app_1' } }, name)).toBe('Delete blog');
+    expect(approvalTitle({ scope: 'project:delete', target: { type: 'project', id: 'prj_1' } }, name)).toBe(
+      'Delete project docs',
+    );
+    expect(approvalWants({ scope: 'app:delete', target: { type: 'app', id: 'app_1' } }, name)).toBe(
+      'wants to delete the app blog',
+    );
+    expect(approvalTitle({ scope: 'app:delete', target: { type: 'app', id: 'app_01JC9Z6Q5W0000000000000000' } }, name)).toBe(
+      'Delete app_01JC9Z…',
+    );
   });
 });

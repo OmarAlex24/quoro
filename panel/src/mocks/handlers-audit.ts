@@ -23,11 +23,11 @@ const queryText = (params: URLSearchParams, name: string): string => {
   return value === null ? '' : value.trim();
 };
 
-/** `limit` as the contract states it here: default 50, maximum 200. */
+/** `limit` as the contract states it (audit-log-format.md, section 2.4): default 50, maximum 500. */
 const pageLimit = (params: URLSearchParams): number => {
   const parsed = Number(params.get('limit') ?? '50');
   if (!Number.isInteger(parsed) || parsed < 1) return 50;
-  return Math.min(parsed, 200);
+  return Math.min(parsed, 500);
 };
 
 /** A cursor is the last returned `seq`, as an opaque string. */

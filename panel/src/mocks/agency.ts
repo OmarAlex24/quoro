@@ -317,8 +317,8 @@ const seedAgency = (): void => {
     owner_user_id: human.id,
     description: 'Woken by app.down; restarts the app and resolves the incident.',
     disabled: false,
-    created_at: minutesAgo(180),
-    updated_at: minutesAgo(180),
+    created_at: minutesAgo(30 * 60),
+    updated_at: minutesAgo(30 * 60),
   };
   const reporter: Agent = {
     id: mockId('agt'),
@@ -336,9 +336,9 @@ const seedAgency = (): void => {
     {
       id: mockId('akey'),
       agent_id: restarter.id,
-      created_at: minutesAgo(178),
+      created_at: minutesAgo(30 * 60 - 2),
       revoked_at: null,
-      last_used_at: minutesAgo(12),
+      last_used_at: minutesAgo(8),
     },
     {
       id: mockId('akey'),
@@ -356,17 +356,24 @@ const seedAgency = (): void => {
     },
   );
 
-  // The incident the demo restart belongs to.
+  // The incident the demo restart belongs to. The event data is the
+  // documented `app.down` payload (events.schema.json, data_app_down).
   const appDown = emitEvent(
     'app.down',
     { type: 'app', id: appId },
-    { app_id: appId, reason: 'health check failed 3 times' },
+    {
+      app_id: appId,
+      node_id: db.node.id,
+      check: 'health_check',
+      failures: 3,
+      last_error: 'GET /healthz timed out after 5 s',
+    },
     { project_id: projectId, time: minutesAgo(15), actor: { type: 'node', id: db.node.id } },
   );
   const incident: Incident = {
     id: mockId('inc'),
     status: 'open',
-    title: 'blog is down: health check failed 3 times',
+    title: 'blog is down',
     trigger_event_id: appDown.id,
     subject: { type: 'app', id: appId },
     project_id: projectId,
@@ -398,8 +405,8 @@ const seedAgency = (): void => {
       grant_max_uses: null,
     },
     created_by: human.id,
-    created_at: minutesAgo(170),
-    updated_at: minutesAgo(170),
+    created_at: minutesAgo(28 * 60),
+    updated_at: minutesAgo(28 * 60),
   };
   const notifier: Webhook = {
     id: mockId('whk'),
@@ -458,9 +465,9 @@ const seedAgency = (): void => {
     kind: 'standard',
     scopes: ['app:read', 'app:logs'],
     selector: { projects: ['blog'] },
-    expires_at: minutesAhead(60 * 20),
+    expires_at: minutesAhead(7 * 24 * 60 - 29 * 60),
     max_uses: null,
-    uses: 4,
+    uses: 10,
     status: 'active',
     incident_id: null,
     approval_id: null,
@@ -468,7 +475,7 @@ const seedAgency = (): void => {
     created_by_type: 'user',
     created_by_id: human.id,
     reason: 'Read access to the blog project for on-call triage',
-    created_at: minutesAgo(176),
+    created_at: minutesAgo(29 * 60),
     revoked_at: null,
     revoked_by: null,
   };
@@ -527,7 +534,7 @@ const seedAgency = (): void => {
     params: { app_id: appId },
     params_hash: sha256Hex(canonicalJson({ app_id: appId })),
     justification:
-      'Restart did not bring blog back and the image is gone from the registry; deleting the app so a clean deploy can replace it.',
+      'Restart did not bring blog back and the image is gone from the registry. Deleting the app lets a clean deploy replace it.',
     incident_id: incident.id,
     status: 'pending',
     expires_at: minutesAhead(52),
@@ -562,9 +569,67 @@ const seedAgency = (): void => {
     actor: { type: 'agent', id: restarter.id },
   });
 
-  // The audit trail behind the records above, oldest first.
+  // The audit trail behind the records above, oldest first: `seq` and
+  // `time` rise together, as they do in a real log.
+  const agentCall = (
+    agent: Agent,
+    minutes: number,
+    operation: string,
+    scope: string,
+    extra: Partial<AuditInput> = {},
+  ) =>
+    appendAudit({
+      time: minutesAgo(minutes),
+      actor_type: 'agent',
+      actor_id: agent.id,
+      agent_model: agent.model,
+      on_behalf_of: human.id,
+      channel: 'mcp',
+      operation,
+      scope,
+      params: {},
+      ...extra,
+    });
+
+  // weekly-reporter: created, granted, a few reads, one denied request, disabled.
   appendAudit({
-    time: minutesAgo(180),
+    time: minutesAgo(4_000),
+    operation: 'POST /api/v1/agents',
+    scope: 'agent:write',
+    target_type: 'agent',
+    target_id: reporter.id,
+    params: { name: reporter.name, model: reporter.model, owner_user_id: human.id },
+  });
+  appendAudit({
+    time: minutesAgo(3_998),
+    operation: 'POST /api/v1/grants',
+    scope: 'grant:write',
+    target_type: 'grant',
+    target_id: expired.id,
+    params: { agent_id: reporter.id, scopes: expired.scopes, selector: expired.selector, ttl_s: 3_300 * 60, max_uses: 10 },
+  });
+  agentCall(reporter, 3_990, 'list_audit', 'audit:read', { grant_id: expired.id, target_type: 'cluster', target_id: 'cluster' });
+  agentCall(reporter, 2_012, 'list_events', 'event:read', { grant_id: expired.id, target_type: 'cluster', target_id: 'cluster' });
+  agentCall(reporter, 2_000, 'request_approval', 'approval:create', {
+    target_type: 'approval',
+    target_id: denied.id,
+    project_id: projectId,
+    params: { scope: denied.scope, target: denied.target, operation: denied.operation, params: denied.params },
+    justification: denied.justification,
+  });
+  appendAudit({
+    time: minutesAgo(1_990),
+    operation: 'POST /api/v1/approvals/{approval_id}/deny',
+    scope: 'approval:decide',
+    target_type: 'approval',
+    target_id: denied.id,
+    project_id: projectId,
+    params: { approval_id: denied.id, note: denied.decision_note },
+  });
+
+  // on-call-restarter: created, keyed, granted read access, wired to a webhook.
+  appendAudit({
+    time: minutesAgo(30 * 60),
     operation: 'POST /api/v1/agents',
     scope: 'agent:write',
     target_type: 'agent',
@@ -572,7 +637,7 @@ const seedAgency = (): void => {
     params: { name: restarter.name, model: restarter.model, owner_user_id: human.id },
   });
   appendAudit({
-    time: minutesAgo(178),
+    time: minutesAgo(30 * 60 - 2),
     operation: 'POST /api/v1/agents/{agent_id}/keys',
     scope: 'agent:write',
     target_type: 'agent',
@@ -580,20 +645,61 @@ const seedAgency = (): void => {
     params: { agent_id: restarter.id, key: '[redacted]' },
   });
   appendAudit({
-    time: minutesAgo(176),
+    time: minutesAgo(29 * 60),
     operation: 'POST /api/v1/grants',
     scope: 'grant:write',
     target_type: 'grant',
     target_id: standard.id,
-    params: { agent_id: restarter.id, scopes: standard.scopes, selector: standard.selector, ttl_s: 86_400 },
+    params: { agent_id: restarter.id, scopes: standard.scopes, selector: standard.selector, ttl_s: 7 * 86_400 },
   });
   appendAudit({
-    time: minutesAgo(170),
+    time: minutesAgo(28 * 60),
     operation: 'POST /api/v1/webhooks',
     scope: 'webhook:write',
     target_type: 'webhook',
     target_id: webhook.id,
     params: { name: webhook.name, url: webhook.url, secret: '[redacted]' },
+  });
+  appendAudit({
+    time: minutesAgo(600),
+    operation: 'PATCH /api/v1/agents/{agent_id}',
+    scope: 'agent:write',
+    target_type: 'agent',
+    target_id: reporter.id,
+    params: { agent_id: reporter.id, disabled: true },
+  });
+
+  // Its routine reads of blog over the last day, under the read grant.
+  const onBlog = { target_type: 'app', target_id: appId, project_id: projectId, params: { app_id: appId }, grant_id: standard.id };
+  const reads: ReadonlyArray<readonly [number, string, string]> = [
+    [22.4 * 60, 'list_apps', 'app:read'],
+    [22.3 * 60, 'get_app', 'app:read'],
+    [18.9 * 60, 'get_app', 'app:read'],
+    [12.6 * 60, 'list_apps', 'app:read'],
+    [12.5 * 60, 'get_app', 'app:read'],
+    [12.4 * 60, 'get_app_logs', 'app:logs'],
+    [6.8 * 60, 'get_app', 'app:read'],
+    [3.3 * 60, 'list_apps', 'app:read'],
+    [3.2 * 60, 'get_app', 'app:read'],
+    [1.4 * 60, 'get_app', 'app:read'],
+  ];
+  for (const [minutes, operation, scope] of reads) {
+    agentCall(restarter, minutes, operation, scope, operation === 'list_apps' ? { grant_id: standard.id, params: {} } : onBlog);
+  }
+
+  // The incident: Quoro opens it and wakes the agent with an incident grant.
+  appendAudit({
+    time: minutesAgo(15),
+    actor_type: 'system',
+    actor_id: 'incidents',
+    channel: 'system',
+    operation: 'open_incident',
+    target_type: 'incident',
+    target_id: incident.id,
+    project_id: projectId,
+    params: { subject: incident.subject, trigger_event_id: appDown.id },
+    trigger_event_id: appDown.id,
+    incident_id: incident.id,
   });
   appendAudit({
     time: minutesAgo(15),
@@ -607,62 +713,40 @@ const seedAgency = (): void => {
     trigger_event_id: appDown.id,
     incident_id: incident.id,
   });
-  // The M3 demo record: an agent restarted the app through MCP.
-  appendAudit({
-    time: minutesAgo(12),
-    actor_type: 'agent',
-    actor_id: restarter.id,
-    agent_model: restarter.model,
-    on_behalf_of: human.id,
-    channel: 'mcp',
-    operation: 'restart_app',
-    scope: 'app:restart',
+  const inIncident = {
     target_type: 'app',
     target_id: appId,
     project_id: projectId,
     params: { app_id: appId },
-    justification: `app down per incident ${incident.id}; restarting its instance`,
     trigger_event_id: appDown.id,
     incident_id: incident.id,
+  };
+  // The M3 demo record: the agent restarted the app through MCP.
+  agentCall(restarter, 12, 'restart_app', 'app:restart', {
+    ...inIncident,
+    justification: 'blog is down after a failed health check. Restarting is the first step of the runbook.',
     grant_id: incidentGrant.id,
     change_seq: 412,
   });
-  // A refusal: the same agent tried to delete without approval.
-  appendAudit({
-    time: minutesAgo(9),
-    actor_type: 'agent',
-    actor_id: restarter.id,
-    agent_model: restarter.model,
-    on_behalf_of: human.id,
-    channel: 'mcp',
-    operation: 'delete_app',
-    scope: 'app:delete',
-    target_type: 'app',
-    target_id: appId,
-    project_id: projectId,
-    params: { app_id: appId },
-    justification: 'restart did not help; checking whether deleting is allowed',
-    trigger_event_id: appDown.id,
-    incident_id: incident.id,
+  agentCall(restarter, 10.5, 'get_app_logs', 'app:logs', {
+    ...inIncident,
+    params: { app_id: appId, tail: 200 },
+    justification: 'blog did not come back after the restart. Reading why.',
+    grant_id: incidentGrant.id,
+  });
+  // A refusal: deleting needs a person's approval first.
+  agentCall(restarter, 9, 'delete_app', 'app:delete', {
+    ...inIncident,
+    justification: 'The image is gone from the registry; checking whether deleting is allowed.',
     result: 'refused',
     result_detail: 'approval_required',
   });
-  appendAudit({
-    time: minutesAgo(8),
-    actor_type: 'agent',
-    actor_id: restarter.id,
-    agent_model: restarter.model,
-    on_behalf_of: human.id,
-    channel: 'mcp',
-    operation: 'request_approval',
-    scope: 'approval:create',
+  agentCall(restarter, 8, 'request_approval', 'approval:create', {
+    ...inIncident,
     target_type: 'approval',
     target_id: pending.id,
-    project_id: projectId,
     params: { scope: pending.scope, target: pending.target, operation: pending.operation, params: pending.params },
     justification: pending.justification,
-    trigger_event_id: appDown.id,
-    incident_id: incident.id,
     grant_id: incidentGrant.id,
   });
 };

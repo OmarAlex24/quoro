@@ -1,21 +1,23 @@
 import { Link, useNavigate } from '@tanstack/react-router';
 import { useState } from 'react';
-import { useListAgents } from '../api/generated/agents/agents';
 import { canManageAgents } from '../lib/capabilities';
 import { problemView } from '../lib/problem';
 import { useSession } from '../session';
-import { AgentBay } from '../components/agent-bay';
+import { AgentCard, useAgentDirectory } from '../components/agent-card';
 import { CreateAgentDialog } from '../components/agent-dialog';
 import { Button } from '../components/ui/button';
 import { ProblemBanner } from '../components/ui/problem-banner';
 import { LoginScreen } from './login-screen';
 
+/**
+ * `/agents`: every agent as a card, with where it stands, the grant it works
+ * under and its calls over the last day. A card opens the agent.
+ */
 export function AgentsScreen() {
   const { me, user, loading, unauthenticated } = useSession();
   const navigate = useNavigate();
   const [dialogOpen, setDialogOpen] = useState(false);
-
-  const agentsQuery = useListAgents(undefined);
+  const directory = useAgentDirectory();
 
   if (loading) {
     return (
@@ -28,64 +30,58 @@ export function AgentsScreen() {
   if (unauthenticated || !user) return <LoginScreen />;
 
   const canManage = canManageAgents(me);
-  const agents = agentsQuery.data?.items ?? [];
-  const listError =
-    agentsQuery.error !== null && agentsQuery.error !== undefined
-      ? problemView(agentsQuery.error, 'see agents')
-      : null;
+  const query = directory.agents;
+  const agents = query.data?.items ?? [];
+  const listError = query.error ? problemView(query.error, 'see agents') : null;
 
   return (
-    <main className="mx-auto w-full max-w-6xl px-4 py-6 sm:px-6 sm:py-8">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h1 className="type-display text-[24px] leading-none">Agents</h1>
-          <p className="mt-2 max-w-2xl text-[13px] leading-snug text-ink-2">
-            AI identities that act on the cluster through grants. Each has a human owner.
-          </p>
-        </div>
+    <main className="mx-auto w-full max-w-6xl px-4 pb-10 sm:px-6">
+      <div className="flex flex-wrap items-center gap-3">
+        <p className="min-w-0 flex-1 text-[13px] leading-snug text-ink-2">
+          {query.isPending
+            ? 'Reading the agents…'
+            : `${agents.length === 1 ? '1 agent' : `${agents.length} agents`}. AI identities that act on the cluster through grants; each has a human owner.`}
+        </p>
         {canManage ? (
           <Button variant="primary" onClick={() => setDialogOpen(true)}>
-            Create an agent
+            New agent
           </Button>
         ) : null}
       </div>
 
       {!canManage ? (
-        <p className="mt-3 text-[13px] text-ink-2">
-          Your role can read agents but not change them.
-        </p>
+        <p className="mt-2 text-[13px] text-ink-2">Your role can read agents but not change them.</p>
       ) : null}
 
       {listError ? <ProblemBanner view={listError} className="mt-4" /> : null}
 
-      <div className="mt-5 flex flex-col gap-2">
-        {agentsQuery.isPending ? (
-          <div className="h-[104px] rounded-[10px] border border-line bg-surface/60" />
-        ) : agents.length === 0 ? (
-          <div className="rounded-[10px] border border-dashed border-line bg-surface/50 px-4 py-10 text-center">
-            <p className="text-[15px] text-ink">
-              No agents yet. Create one, then give it a grant so it can act.
-            </p>
-            {canManage ? (
-              <Button
-                variant="primary"
-                className="mt-4"
-                onClick={() => setDialogOpen(true)}
-              >
-                Create an agent
-              </Button>
-            ) : (
-              <Button variant="default" className="mt-4" asChild>
-                <Link to="/agents" search={{ tab: 'grants' }}>
-                  See the grants
-                </Link>
-              </Button>
-            )}
-          </div>
-        ) : (
-          agents.map((agent) => <AgentBay key={agent.id} agent={agent} />)
-        )}
-      </div>
+      {query.isPending ? (
+        <div className="agents-grid mt-5">
+          <div className="h-[220px] rounded-[12px] border border-line bg-surface/60" />
+          <div className="h-[220px] rounded-[12px] border border-line bg-surface/60" />
+        </div>
+      ) : agents.length === 0 ? (
+        <div className="mt-5 rounded-[10px] border border-dashed border-line bg-surface/50 px-4 py-10 text-center">
+          <p className="text-[15px] text-ink">No agents yet. Create one, then give it a grant so it can act.</p>
+          {canManage ? (
+            <Button variant="primary" className="mt-4" onClick={() => setDialogOpen(true)}>
+              New agent
+            </Button>
+          ) : (
+            <Button variant="default" className="mt-4" asChild>
+              <Link to="/agents" search={{ tab: 'grants' }}>
+                See the grants
+              </Link>
+            </Button>
+          )}
+        </div>
+      ) : (
+        <div className="agents-grid mt-5">
+          {agents.map((agent) => (
+            <AgentCard key={agent.id} agent={agent} facts={directory.facts(agent.id)} selected={false} />
+          ))}
+        </div>
+      )}
 
       {canManage ? (
         <CreateAgentDialog

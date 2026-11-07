@@ -5,7 +5,9 @@ import {
   agentLamp,
   agentPatchIsEmpty,
   agentDisabledPatch,
+  agentStatus,
   buildAgentPatch,
+  callBuckets,
   isAgentKeyId,
 } from './agents';
 
@@ -111,5 +113,74 @@ describe('isAgentKeyId', () => {
     expect(isAgentKeyId('akey_01JC9Z6Q5W7X8Y9Z0A1B2C3D4E5')).toBe(false);
     expect(isAgentKeyId('akey_01JC9Z6Q5W7X8Y9Z0A1B2C3D4O')).toBe(false);
     expect(isAgentKeyId('')).toBe(false);
+  });
+});
+
+describe('agentStatus', () => {
+  const ask = { scope: 'app:delete' as const, target: { type: 'app', id: 'app_01JC9Z6Q5W7X8Y9Z0A1B2C3D4E' } };
+
+  it('puts a disabled agent first, with its grants counted', () => {
+    expect(agentStatus({ agent: { disabled: true }, activeGrants: 0, pending: [ask] })).toEqual({
+      tone: 'idle',
+      pulse: false,
+      attention: false,
+      phrase: 'Disabled · no active grants',
+    });
+    expect(agentStatus({ agent: { disabled: true }, activeGrants: 2, pending: [] }).phrase).toBe(
+      'Disabled · 2 active grants',
+    );
+  });
+
+  it('says what a waiting request asks, and breathes', () => {
+    const status = agentStatus({ agent: { disabled: false }, activeGrants: 1, pending: [ask], pendingTargetName: 'blog' });
+    expect(status).toEqual({ tone: 'shift', pulse: true, attention: true, phrase: 'Waiting on you · delete blog' });
+    expect(
+      agentStatus({ agent: { disabled: false }, activeGrants: 1, pending: [ask, ask], pendingTargetName: 'blog' }).phrase,
+    ).toBe('Waiting on you · 2 requests');
+    expect(agentStatus({ agent: { disabled: false }, activeGrants: 1, pending: [ask] }).phrase).toBe(
+      'Waiting on you · delete app',
+    );
+  });
+
+  it('names the incident it works when nothing waits', () => {
+    expect(
+      agentStatus({ agent: { disabled: false }, activeGrants: 2, pending: [], incident: { title: 'blog is down' } }),
+    ).toEqual({ tone: 'shift', pulse: false, attention: false, phrase: 'On an incident · blog is down' });
+  });
+
+  it('counts its grants otherwise', () => {
+    expect(agentStatus({ agent: { disabled: false }, activeGrants: 1, pending: [] }).phrase).toBe('Ready · 1 active grant');
+    expect(agentStatus({ agent: { disabled: false }, activeGrants: 0, pending: [] })).toMatchObject({
+      tone: 'idle',
+      phrase: 'Enabled · no active grants',
+    });
+  });
+});
+
+describe('callBuckets', () => {
+  const now = Date.UTC(2026, 10, 7, 18, 0);
+  const ago = (hours: number) => new Date(now - hours * 3_600_000).toISOString();
+
+  it('counts calls per hour, oldest hour first', () => {
+    const { buckets, total } = callBuckets([ago(0.1), ago(0.9), ago(1.5), ago(23.5)], now);
+    expect(buckets).toHaveLength(24);
+    expect(buckets[23]).toBe(2);
+    expect(buckets[22]).toBe(1);
+    expect(buckets[0]).toBe(1);
+    expect(total).toBe(4);
+  });
+
+  it('leaves out what is older than the window or unreadable', () => {
+    const { buckets, total } = callBuckets([ago(24), ago(30), 'yesterday'], now);
+    expect(total).toBe(0);
+    expect(buckets.every((count) => count === 0)).toBe(true);
+  });
+
+  it('counts a time slightly ahead of this clock in the last hour', () => {
+    expect(callBuckets([new Date(now + 20_000).toISOString()], now).buckets[23]).toBe(1);
+  });
+
+  it('takes another window length', () => {
+    expect(callBuckets([ago(2.5)], now, 6).buckets).toEqual([0, 0, 0, 1, 0, 0]);
   });
 });

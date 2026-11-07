@@ -5,43 +5,15 @@ import {
   probeAuditExport,
   useListAuditExports,
 } from '../api/generated/audit/audit';
-import type { LockStrength } from '../api/generated/model';
 import { shortId } from '../lib/agency-format';
 import { relativeTime } from '../lib/app-status';
+import { LOCK_VIEW } from '../lib/audit';
 import { canManageUsers } from '../lib/capabilities';
-import type { LampTone } from '../lib/lamp';
 import { problemView, type ProblemView } from '../lib/problem';
 import { useSession } from '../session';
 import { ToneLamp } from './tone-lamp';
 import { Button } from './ui/button';
 import { ProblemBanner } from './ui/problem-banner';
-
-/**
- * What each strength means for the copy, in the words audit-log-format.md
- * section 8.2 makes binding for the panel.
- */
-const LOCK_VIEW: Record<
-  LockStrength,
-  { tone: LampTone; words: string; meaning: string }
-> = {
-  compliance: {
-    tone: 'run',
-    words: 'Compliance lock',
-    meaning:
-      'Nobody can remove the copy before the retention ends, not even the account root.',
-  },
-  bucket_rule: {
-    tone: 'shift',
-    words: 'Bucket lock rule',
-    meaning:
-      'The rule refuses overwrites and deletes, but it is bucket configuration: whoever may edit the bucket’s settings can remove it.',
-  },
-  none: {
-    tone: 'fault',
-    words: 'No lock',
-    meaning: 'The copy is not protected against overwrite or delete.',
-  },
-};
 
 /**
  * The off-site copy of the audit log and the lock strength its probe observed

@@ -4,6 +4,7 @@ import type {
   AuditRecordChannel,
   AuditRecordResult,
   AuditVerificationRequest,
+  LockStrength,
 } from '../api/generated/model';
 import type { LampTone } from './lamp';
 
@@ -164,3 +165,44 @@ export const isConnectorBroken = (
   seq: number,
 ): boolean =>
   typeof brokenAtSeq === 'number' && Number.isInteger(brokenAtSeq) && brokenAtSeq === seq && seq > 1;
+
+/** The verification `reason` codes (audit-log-format.md, section 6), said plainly. */
+export const brokenReasonWords = (reason: string | null | undefined): string => {
+  switch (reason) {
+    case 'hash_mismatch':
+      return 'The entry was changed after it was written: its hash no longer matches its contents (hash_mismatch).';
+    case 'prev_mismatch':
+      return 'The entry no longer links to the one before it (prev_mismatch).';
+    case 'seq_gap':
+      return 'An entry is missing before this one (seq_gap).';
+    default:
+      return reason ?? 'The link does not match the record before it.';
+  }
+};
+
+/**
+ * What each strength means for the copy, in the words audit-log-format.md
+ * section 8.2 makes binding for the panel.
+ */
+export const LOCK_VIEW: Record<
+  LockStrength,
+  { tone: LampTone; words: string; meaning: string }
+> = {
+  compliance: {
+    tone: 'run',
+    words: 'Compliance lock',
+    meaning:
+      'Nobody can remove the copy before the retention ends, not even the account root.',
+  },
+  bucket_rule: {
+    tone: 'shift',
+    words: 'Bucket lock rule',
+    meaning:
+      'The rule refuses overwrites and deletes, but it is bucket configuration: whoever may edit the bucket’s settings can remove it.',
+  },
+  none: {
+    tone: 'fault',
+    words: 'No lock',
+    meaning: 'The copy is not protected against overwrite or delete.',
+  },
+};

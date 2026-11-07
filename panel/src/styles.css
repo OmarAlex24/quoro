@@ -3258,6 +3258,1134 @@
     animation: dialog-rise 140ms ease-out;
   }
 
+  /*
+   * Agents, grants, approvals and activity. An agent is a card: its square
+   * avatar, where it stands in one phrase, the grant it works under as a
+   * draining meter and its calls over the last day.
+   */
+  .agents-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr));
+    gap: 14px;
+  }
+
+  .acards {
+    display: grid;
+    gap: 10px;
+  }
+
+  .acard {
+    display: grid;
+    align-content: start;
+    gap: 12px;
+    min-width: 0;
+    padding: 14px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background-color: var(--surface);
+    background-image: linear-gradient(180deg, var(--surface-hi), var(--surface) 70%);
+    color: var(--ink);
+    text-decoration: none;
+    transition:
+      border-color 120ms ease,
+      box-shadow 120ms ease;
+  }
+
+  .acard:hover {
+    border-color: var(--line-2);
+  }
+
+  .acard:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .acard-on,
+  .acard-on:hover {
+    border-color: color-mix(in oklab, var(--accent) 55%, var(--line));
+    box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent) 16%, transparent);
+  }
+
+  .acard-off {
+    opacity: 0.72;
+  }
+
+  .acard-h {
+    display: flex;
+    align-items: center;
+    gap: 11px;
+    min-width: 0;
+  }
+
+  .acard-t {
+    display: grid;
+    gap: 1px;
+    min-width: 0;
+  }
+
+  .acard-t b {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 620;
+    font-size: 14px;
+  }
+
+  .acard-t small {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11.5px;
+    color: var(--ink-2);
+  }
+
+  .acard-state {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    font-size: 13px;
+    color: var(--ink-2);
+  }
+
+  .acard-state-ask {
+    color: color-mix(in oklab, var(--shift) 78%, var(--ink));
+  }
+
+  .acard-note {
+    font-size: 12px;
+    line-height: 1.45;
+    color: var(--ink-3);
+  }
+
+  /* An agent's calls per hour over the last day. */
+  .spark {
+    display: grid;
+    gap: 5px;
+  }
+
+  .spark canvas {
+    display: block;
+    width: 100%;
+    height: 28px;
+  }
+
+  .spark small {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: var(--ink-3);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .spark-wait {
+    height: 46px;
+    border-radius: 6px;
+    background-color: color-mix(in oklab, var(--sunk) 70%, transparent);
+  }
+
+  /* One agent open: the cards down the left, the agent on the right. */
+  .agents-split {
+    display: grid;
+    align-items: start;
+    gap: 20px;
+    overflow-x: clip;
+  }
+
+  .agents-list {
+    display: none;
+  }
+
+  .list-h {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 30px;
+    font-size: 12px;
+    font-weight: 560;
+    color: var(--ink-2);
+  }
+
+  .agent-pane {
+    min-width: 0;
+  }
+
+  .agent-top {
+    display: grid;
+    justify-items: start;
+    gap: 12px;
+    margin-bottom: 14px;
+  }
+
+  .agent-id {
+    display: flex;
+    align-items: center;
+    gap: 11px;
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .agent-id b {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-stretch: 110%;
+    font-weight: 640;
+    font-size: 19px;
+  }
+
+  .agent-id small {
+    display: block;
+    font-size: 12px;
+    color: var(--ink-2);
+  }
+
+  .agent-tabs {
+    margin-bottom: 20px;
+  }
+
+  @media (min-width: 1024px) {
+    .agents-split {
+      grid-template-columns: 300px minmax(0, 1fr);
+      gap: 32px;
+    }
+
+    .agents-list {
+      display: grid;
+      align-content: start;
+      gap: 6px;
+    }
+
+    .agent-top {
+      display: none;
+    }
+  }
+
+  .sec-h {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 13.5px;
+    font-weight: 560;
+    color: var(--ink);
+  }
+
+  .grant-line {
+    display: grid;
+    gap: 8px;
+    padding: 12px 14px;
+    border-top: 1px solid var(--line);
+  }
+
+  .grant-line:first-child {
+    border-top: 0;
+  }
+
+  /* The run: an incident as the agent handled it. */
+  .run-h {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: 10px 12px;
+  }
+
+  .run-h .run-lamp {
+    margin-top: 3px;
+  }
+
+  .run-h h2 {
+    font-stretch: 110%;
+    font-weight: 640;
+    font-size: 21px;
+    line-height: 1.25;
+    letter-spacing: -0.006em;
+    overflow-wrap: anywhere;
+  }
+
+  .run-h p {
+    margin-top: 3px;
+    font-size: 13px;
+    color: var(--ink-2);
+  }
+
+  .run-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-left: auto;
+  }
+
+  /* The hour ribbon: grant window dotted, calls as points, the wait amber, now. */
+  .ribbon {
+    position: relative;
+    height: 64px;
+    margin-top: 16px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background-color: var(--surface);
+  }
+
+  .ribbon .lane {
+    position: absolute;
+    inset: 0 16px;
+  }
+
+  .ribbon .gw {
+    position: absolute;
+    top: 11px;
+    height: 8px;
+    border-radius: 2px;
+    background-image: radial-gradient(circle, var(--accent) 0.9px, transparent 1.25px);
+    background-size: 4px 4px;
+    box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--accent) 35%, transparent);
+  }
+
+  .ribbon .ww {
+    position: absolute;
+    top: 28px;
+    height: 10px;
+    border-radius: 2px;
+    background-image: repeating-conic-gradient(var(--shift) 0 25%, transparent 0 50%);
+    background-size: 4px 4px;
+  }
+
+  .ribbon .ev {
+    position: absolute;
+    top: 28px;
+    width: 10px;
+    height: 10px;
+    border-radius: 3px;
+    transform: translateX(-50%);
+    background-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--surface);
+  }
+
+  .ribbon .ev-other {
+    background-color: var(--idle);
+  }
+
+  .ribbon .ev-x,
+  .mk2.mk2-refused {
+    background-color: var(--fault);
+  }
+
+  .ribbon .ev-x::before,
+  .ribbon .ev-x::after,
+  .mk2.mk2-refused::before,
+  .mk2.mk2-refused::after {
+    content: '';
+    position: absolute;
+    left: 2px;
+    top: 4.2px;
+    width: 6px;
+    height: 1.6px;
+    border-radius: 1px;
+    background-color: var(--on-accent);
+    transform: rotate(45deg);
+  }
+
+  .ribbon .ev-x::after,
+  .mk2.mk2-refused::after {
+    transform: rotate(-45deg);
+  }
+
+  .ribbon .tk {
+    position: absolute;
+    bottom: 5px;
+    transform: translateX(-50%);
+    white-space: nowrap;
+    font-size: 10.5px;
+    color: var(--ink-3);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .ribbon .tk-first {
+    transform: none;
+  }
+
+  .ribbon .now {
+    position: absolute;
+    top: 5px;
+    bottom: 20px;
+    width: 1px;
+    background-color: var(--ink);
+  }
+
+  .ribbon .now::before {
+    content: 'now';
+    position: absolute;
+    bottom: -17px;
+    left: -11px;
+    font-size: 10.5px;
+    font-weight: 600;
+    color: var(--ink);
+  }
+
+  /* The story: one step per record, on a spine. */
+  .story {
+    display: grid;
+    margin-top: 20px;
+  }
+
+  .st {
+    position: relative;
+    display: grid;
+    grid-template-columns: 42px 22px minmax(0, 1fr);
+    gap: 0 12px;
+    padding-bottom: 16px;
+  }
+
+  .st time {
+    padding-top: 2px;
+    text-align: right;
+    font-size: 11.5px;
+    color: var(--ink-3);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .st .spine {
+    position: relative;
+    display: flex;
+    justify-content: center;
+  }
+
+  .st .spine::before {
+    content: '';
+    position: absolute;
+    top: 16px;
+    bottom: -4px;
+    width: 1px;
+    background-color: var(--line-2);
+  }
+
+  .st:last-child .spine::before {
+    display: none;
+  }
+
+  .mk2 {
+    position: relative;
+    z-index: 1;
+    flex: none;
+    width: 12px;
+    height: 12px;
+    margin-top: 3px;
+    border-radius: 3px;
+    background-color: var(--idle);
+    box-shadow: 0 0 0 3px var(--ground);
+  }
+
+  .mk2.mk2-refused::before,
+  .mk2.mk2-refused::after {
+    left: 3px;
+    top: 5.2px;
+  }
+
+  .mk2.mk2-opened {
+    background-color: var(--fault);
+  }
+
+  .mk2.mk2-call {
+    background-color: var(--accent);
+  }
+
+  .mk2.mk2-grant {
+    background-color: var(--sunk);
+    background-image: repeating-conic-gradient(var(--accent) 0 25%, transparent 0 50%);
+    background-size: 4px 4px;
+    box-shadow:
+      0 0 0 3px var(--ground),
+      inset 0 0 0 1px var(--accent);
+  }
+
+  .mk2.mk2-ask {
+    background-color: var(--shift);
+  }
+
+  .mk2.mk2-person {
+    background-color: var(--ink-2);
+  }
+
+  .st-c {
+    display: grid;
+    gap: 6px;
+    min-width: 0;
+  }
+
+  .st-s {
+    font-size: 13.5px;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+  }
+
+  .st-s b {
+    font-weight: 620;
+  }
+
+  .st-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--ink-2);
+  }
+
+  .why {
+    padding: 8px 11px;
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    background-color: var(--sunk);
+    font-size: 12.5px;
+    line-height: 1.5;
+    color: var(--ink-2);
+    overflow-wrap: anywhere;
+  }
+
+  .why b {
+    margin-right: 6px;
+    font-weight: 600;
+    color: var(--ink-3);
+  }
+
+  /* The request that waits, inside its breathing amber aura. */
+  .decide-wrap {
+    position: relative;
+    isolation: isolate;
+    margin-top: 10px;
+  }
+
+  .decide {
+    position: relative;
+    z-index: 2;
+    display: grid;
+    gap: 12px;
+    padding: 16px;
+    border: 1px solid color-mix(in oklab, var(--shift) 50%, var(--line));
+    border-radius: 12px;
+    background-color: var(--surface);
+  }
+
+  .call {
+    display: block;
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background-color: var(--sunk);
+    font-family: var(--font-mono);
+    font-stretch: 87.5%;
+    font-size: 12.5px;
+    line-height: 1.55;
+    color: var(--ink);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  /* The inbox: a list of requests beside the one open. */
+  .page-h {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 20px;
+  }
+
+  .page-h h1 {
+    font-stretch: 112%;
+    font-weight: 620;
+    font-size: 22px;
+    line-height: 1.2;
+    letter-spacing: -0.005em;
+  }
+
+  .split {
+    display: grid;
+    align-items: start;
+    gap: 20px;
+  }
+
+  .split-list ul {
+    display: grid;
+  }
+
+  .split-list .list-h {
+    padding-right: 16px;
+  }
+
+  .list-empty {
+    padding: 2px 16px 8px 0;
+    font-size: 13px;
+    line-height: 1.45;
+    color: var(--ink-2);
+  }
+
+  .split-detail {
+    min-width: 0;
+  }
+
+  @media (min-width: 1024px) {
+    .split {
+      grid-template-columns: 330px minmax(0, 1fr);
+      gap: 0;
+    }
+
+    .split-list {
+      align-self: stretch;
+      min-height: 60vh;
+      border-right: 1px solid var(--line);
+    }
+
+    .split-detail {
+      padding-left: 32px;
+    }
+  }
+
+  @media (max-width: 1023px) {
+    .split[data-open='list'] .split-detail,
+    .split[data-open='detail'] .split-list {
+      display: none;
+    }
+  }
+
+  .li {
+    display: flex;
+    align-items: flex-start;
+    gap: 11px;
+    padding: 12px 16px;
+    border-left: 2px solid transparent;
+    color: var(--ink);
+    text-decoration: none;
+  }
+
+  .li:hover {
+    background-color: color-mix(in oklab, var(--surface) 55%, transparent);
+  }
+
+  .li:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+
+  .li-on,
+  .li-on:hover {
+    background-color: var(--surface);
+    border-left-color: var(--ink);
+  }
+
+  .li .avatar {
+    margin-top: 1px;
+  }
+
+  .li-t {
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .li-t b {
+    font-weight: 560;
+    font-size: 13.5px;
+  }
+
+  .li-t small {
+    display: block;
+    font-size: 12px;
+    line-height: 1.45;
+    color: var(--ink-2);
+  }
+
+  .apr {
+    display: grid;
+    gap: 20px;
+    min-width: 0;
+  }
+
+  .apr-back {
+    justify-self: start;
+  }
+
+  @media (min-width: 1024px) {
+    .apr-back {
+      display: none;
+    }
+  }
+
+  .apr-h {
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+  }
+
+  .apr-h h2 {
+    font-stretch: 110%;
+    font-weight: 640;
+    font-size: 22px;
+    line-height: 1.25;
+    letter-spacing: -0.006em;
+    overflow-wrap: anywhere;
+  }
+
+  .apr-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+  }
+
+  .apr-tag-link {
+    border-radius: 4px;
+    text-decoration: none;
+  }
+
+  .apr-tag-link:hover .tag {
+    color: var(--ink);
+  }
+
+  .apr-tag-link:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .apr-sub {
+    margin-top: 6px;
+    font-size: 12.5px;
+    color: var(--ink-2);
+  }
+
+  .apr-sec {
+    display: grid;
+    gap: 8px;
+  }
+
+  .apr-sec h3 {
+    font-size: 13.5px;
+    font-weight: 560;
+    color: var(--ink);
+  }
+
+  .quote {
+    padding: 12px 14px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background-color: var(--sunk);
+    font-size: 13.5px;
+    line-height: 1.55;
+    color: var(--ink);
+    overflow-wrap: anywhere;
+  }
+
+  .callbox {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 16px;
+    padding: 12px 14px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background-color: var(--sunk);
+  }
+
+  .callbox .call {
+    flex: 1 1 420px;
+    min-width: 0;
+    padding: 0;
+    border: 0;
+    background: none;
+    font-size: 13px;
+  }
+
+  .callbox-hash {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
+    font-size: 11.5px;
+    color: var(--ink-3);
+  }
+
+  /* The feed: one sentence per record, on the chain. */
+  .filters {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 6px;
+  }
+
+  .field.filter {
+    width: auto;
+    min-width: 132px;
+    max-width: 100%;
+    flex: 0 1 auto;
+    height: 34px;
+  }
+
+  .field.filter-wide {
+    min-width: 160px;
+    max-width: 260px;
+  }
+
+  .filter-find {
+    position: relative;
+    display: flex;
+    align-items: center;
+    flex: 1 1 220px;
+    min-width: 0;
+    max-width: 320px;
+  }
+
+  .filter-find svg {
+    position: absolute;
+    left: 10px;
+    color: var(--ink-3);
+    pointer-events: none;
+  }
+
+  .filter-find .field {
+    height: 34px;
+    padding-left: 32px;
+  }
+
+  .filter-narrow {
+    flex-basis: 170px;
+    max-width: 210px;
+  }
+
+  .filter-narrow .field {
+    padding-left: 10px;
+  }
+
+  .day {
+    padding: 16px 0 4px 34px;
+    font-size: 12px;
+    font-weight: 560;
+    color: var(--ink-2);
+  }
+
+  .feed {
+    display: grid;
+  }
+
+  .feed-box {
+    overflow: hidden;
+    padding: 0 14px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background-color: var(--surface);
+  }
+
+  .feed-box .fr:last-child {
+    border-bottom: 0;
+  }
+
+  .fr {
+    position: relative;
+    display: grid;
+    grid-template-columns: 22px 22px minmax(0, 1fr) auto auto;
+    align-items: center;
+    gap: 4px 12px;
+    padding: 11px 0;
+    border-bottom: 1px solid var(--line);
+    font-size: 13px;
+  }
+
+  .fr:hover {
+    background-color: color-mix(in oklab, var(--surface) 55%, transparent);
+  }
+
+  .fr-on,
+  .fr-on:hover {
+    background-color: var(--surface);
+  }
+
+  .fr:has(.fr-s:focus-visible) {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+    border-radius: 6px;
+  }
+
+  .fr-chain {
+    position: relative;
+    display: grid;
+    place-items: center;
+    align-self: stretch;
+  }
+
+  .fr-chain::before {
+    content: '';
+    position: absolute;
+    top: -12px;
+    bottom: -12px;
+    width: 1px;
+    background-color: var(--line-2);
+  }
+
+  .fr-chain i {
+    position: relative;
+    width: 7px;
+    height: 7px;
+    border-radius: 2px;
+    background-color: var(--surface);
+    box-shadow: 0 0 0 1px var(--ink-3);
+  }
+
+  .fr-broken .fr-chain::before {
+    background-color: var(--fault);
+  }
+
+  .fr-broken .fr-chain i {
+    background-color: var(--fault);
+    box-shadow: 0 0 0 1px var(--fault);
+  }
+
+  .fr-s {
+    min-width: 0;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--ink);
+    font: inherit;
+    line-height: 1.45;
+    text-align: left;
+    overflow-wrap: anywhere;
+    cursor: pointer;
+  }
+
+  .fr-s:focus-visible {
+    outline: none;
+  }
+
+  .fr-s::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+  }
+
+  .fr-s b {
+    font-weight: 600;
+  }
+
+  .fr .fr-tag {
+    justify-self: end;
+  }
+
+  .fr time {
+    width: 44px;
+    text-align: right;
+    font-size: 12px;
+    color: var(--ink-3);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .fr time.fr-when {
+    width: auto;
+    white-space: nowrap;
+  }
+
+  @media (max-width: 639px) {
+    .fr {
+      grid-template-columns: 22px 22px minmax(0, 1fr) auto;
+      align-items: start;
+    }
+
+    .fr-chain {
+      grid-row: 1 / span 2;
+    }
+
+    .fr .fr-tag {
+      grid-column: 3;
+      grid-row: 2;
+      justify-self: start;
+    }
+
+    .fr time {
+      grid-column: 4;
+      grid-row: 1;
+      width: auto;
+    }
+
+    .day {
+      padding-left: 0;
+    }
+  }
+
+  /* The chain strip over the feed, and what it opens. */
+  .chain-wrap {
+    margin-bottom: 14px;
+  }
+
+  .chain-strip {
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+  }
+
+  .chain-idle .n1-gl {
+    color: var(--ink-3);
+  }
+
+  .chain-more {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: auto;
+    padding: 4px 6px;
+    border: 0;
+    border-radius: 6px;
+    background: none;
+    font-size: 12.5px;
+    color: var(--ink-2);
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .chain-more:hover {
+    color: var(--ink);
+  }
+
+  .chain-more:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+
+  .chain-details {
+    display: grid;
+    gap: 18px;
+    margin-bottom: 8px;
+    padding: 14px 16px;
+    font-size: 13px;
+    line-height: 1.45;
+    color: var(--ink-2);
+  }
+
+  @media (min-width: 900px) {
+    .chain-details {
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr);
+    }
+  }
+
+  .chain-details h3 {
+    font-size: 13.5px;
+    font-weight: 560;
+    color: var(--ink);
+  }
+
+  .chain-part,
+  .chain-copy {
+    display: grid;
+    align-content: start;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .chain-facts {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: 6px 16px;
+    font-size: 12.5px;
+  }
+
+  .chain-facts dt {
+    color: var(--ink-3);
+  }
+
+  .chain-facts dd {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--ink);
+  }
+
+  .chain-facts .chain-fact-wide {
+    grid-column: 1 / -1;
+  }
+
+  .chain-facts .chain-fact-wide dd {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  /* A record opened in the sheet: its sentence first. */
+  .rec-lead {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 12px 14px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background-color: var(--sunk);
+    font-size: 14px;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+  }
+
+  .rec-lead b {
+    font-weight: 600;
+  }
+
+  /* A grant: what it allows, where, for how long, and why. */
+  .gcards {
+    display: grid;
+    gap: 10px;
+  }
+
+  .gcard {
+    display: grid;
+    gap: 10px;
+    min-width: 0;
+    padding: 14px 16px;
+  }
+
+  .gcard-past {
+    background-color: color-mix(in oklab, var(--surface) 55%, var(--ground));
+  }
+
+  .gcard-h {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 10px;
+    min-width: 0;
+  }
+
+  .gcard-agent {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .gcard-agent b {
+    font-weight: 600;
+    font-size: 14px;
+  }
+
+  .gcard-kind {
+    font-size: 13.5px;
+    font-weight: 560;
+  }
+
+  .gcard-scopes {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .gcard-facts,
+  .gcard-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 14px;
+    font-size: 12.5px;
+    color: var(--ink-2);
+  }
+
+  .gcard-reason {
+    font-size: 13.5px;
+    line-height: 1.5;
+    color: var(--ink);
+    overflow-wrap: anywhere;
+  }
+
   @media (prefers-reduced-motion: reduce) {
     .lamp-pulse,
     .sweep,

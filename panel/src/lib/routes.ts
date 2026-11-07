@@ -108,10 +108,30 @@ export interface GrantsSearch {
   kind?: GrantKind;
 }
 
-/** `/agents?agent=` opens one agent; `/agents?tab=grants` the grants with their filters. */
+/**
+ * An agent's tabs, after its Activity (no value): its grants, its keys and
+ * its settings. Without an agent, only `grants` means anything: the grants of
+ * the whole cluster.
+ */
+export const AGENT_TABS = ['grants', 'keys', 'settings'] as const;
+export type AgentTab = (typeof AGENT_TABS)[number];
+
+/**
+ * `/agents?agent=&tab=` opens one agent on a tab; `/agents?tab=grants` the
+ * grants of the whole cluster with their filters.
+ */
 export interface AgentsSearch extends GrantsSearch {
   agent?: string;
-  tab?: 'grants';
+  tab?: AgentTab;
+}
+
+/** The tab an open agent shows: the one in the URL, Activity when none is. */
+export const agentTab = (search: Pick<AgentsSearch, 'tab'>): AgentTab | 'activity' =>
+  search.tab ?? 'activity';
+
+/** `/approvals?approval=`: the inbox with one request open. */
+export interface ApprovalsSearch {
+  approval?: string;
 }
 
 /** `/activity?actor_id=&target_id=&result=&incident_id=&seq=`: filters plus the open record. */
@@ -150,12 +170,17 @@ export const validateGrantsSearch = (search: Raw): GrantsSearch =>
     kind: pick(search.kind, ['standard', 'incident', 'approval'] as const),
   });
 
-export const validateAgentsSearch = (search: Raw): AgentsSearch =>
-  compact({
-    agent: text(search.agent),
-    tab: pick(search.tab, ['grants'] as const),
+export const validateAgentsSearch = (search: Raw): AgentsSearch => {
+  const agent = text(search.agent);
+  return compact({
+    agent,
+    tab: agent ? pick(search.tab, AGENT_TABS) : pick(search.tab, ['grants'] as const),
     ...validateGrantsSearch(search),
   });
+};
+
+export const validateApprovalsSearch = (search: Raw): ApprovalsSearch =>
+  compact({ approval: text(search.approval) });
 
 export const validateAuditSearch = (search: Raw): AuditSearch =>
   compact({

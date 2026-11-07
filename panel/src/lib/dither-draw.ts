@@ -313,7 +313,7 @@ export function drawStepBar(
 }
 
 /** How a meter is drawn: in the two dither tones, or in one state colour. */
-export type MeterTone = 'accent' | 'fault';
+export type MeterTone = 'accent' | 'shift' | 'fault';
 
 /**
  * A meter: a dithered bar filled to `share` (0..1) over a faint dotted track,
@@ -330,11 +330,46 @@ export function drawMeter(
 ): void {
   const edge = meterEdge(share, w);
   const density = (x: number) => meterDensity(x, edge);
-  if (tone === 'fault') {
-    dither(ctx, w, h, 2, read('--fault'), density);
+  if (tone !== 'accent') {
+    // A state meter (amber while it waits on a person, red when nearly full) is one colour.
+    dither(ctx, w, h, 2, read(tone === 'fault' ? '--fault' : '--shift'), density);
     return;
   }
   dither2(ctx, w, h, 2, read('--accent'), read('--ion'), density, (x) => meterMix(x, edge));
+}
+
+/**
+ * A sparkline of counts: one dithered bar per bucket over a hairline base,
+ * scaled to the busiest bucket. Each bar is solid, accent at its foot and ion
+ * towards its top; an empty bucket draws nothing above the base.
+ */
+export function drawSpark({ ctx, w, h }: DitherSurface, values: readonly number[], read: TokenReader = readToken): void {
+  const count = values.length;
+  if (count === 0) return;
+  const most = Math.max(1, ...values);
+  const width = w / count;
+  const base = h - 2;
+  ctx.fillStyle = read('--line-2');
+  ctx.fillRect(0, h - 1, w, 1);
+  const bucket = (x: number) => Math.min(count - 1, Math.floor(x / width));
+  const top = (k: number) => {
+    const value = values[k] ?? 0;
+    return value > 0 ? base - Math.max(2, (base * value) / most) : base;
+  };
+  dither2(
+    ctx,
+    w,
+    base,
+    2,
+    read('--accent'),
+    read('--ion'),
+    (x, y) => {
+      const k = bucket(x);
+      if (!values[k] || x - k * width > width - 2) return 0;
+      return y >= top(k) ? 1 : 0;
+    },
+    (x, y) => clamp(1 - (y - top(bucket(x))) / 10),
+  );
 }
 
 const CHART_FONT = '500 11px "Archivo Variable", Archivo, ui-sans-serif, system-ui, sans-serif';

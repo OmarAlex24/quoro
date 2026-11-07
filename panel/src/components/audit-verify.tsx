@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import type { AuditVerificationRequest, AuditVerificationResult } from '../api/generated/model';
 import { shortHash } from '../lib/agency-format';
-import { buildVerifyBody } from '../lib/audit';
+import { brokenReasonWords, buildVerifyBody } from '../lib/audit';
 import type { ProblemView } from '../lib/problem';
 import { CopyButton } from './copy-button';
 import { ToneLamp } from './tone-lamp';
@@ -9,20 +9,6 @@ import { Button } from './ui/button';
 import { Field } from './ui/field';
 import { Input } from './ui/input';
 import { ProblemBanner } from './ui/problem-banner';
-
-/** The verification `reason` codes (audit-log-format.md, section 6), said plainly. */
-const brokenReasonWords = (reason: string | null | undefined): string => {
-  switch (reason) {
-    case 'hash_mismatch':
-      return 'The entry was changed after it was written: its hash no longer matches its contents (hash_mismatch).';
-    case 'prev_mismatch':
-      return 'The entry no longer links to the one before it (prev_mismatch).';
-    case 'seq_gap':
-      return 'An entry is missing before this one (seq_gap).';
-    default:
-      return reason ?? 'The link does not match the record before it.';
-  }
-};
 
 /** Empty means "leave it to the API"; anything else must be a whole number. */
 const parseBound = (text: string): number | undefined => {

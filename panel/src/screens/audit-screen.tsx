@@ -11,15 +11,18 @@ import type {
   AuditVerificationResult,
   ListAuditParams,
 } from '../api/generated/model';
-import { AuditEntryRow } from '../components/audit-chain';
-import { AuditCopy } from '../components/audit-copy';
+import { Link2 } from 'lucide-react';
+import { ActivityRow } from '../components/activity-row';
 import { AuditFilters } from '../components/audit-filters';
-import { AuditRecordPanel } from '../components/audit-record';
-import { AuditVerify } from '../components/audit-verify';
+import { AuditSheet } from '../components/audit-sheet';
+import { ChainStrip } from '../components/chain-strip';
 import { Button } from '../components/ui/button';
 import { ProblemBanner } from '../components/ui/problem-banner';
+import { groupByDay } from '../lib/activity';
 import { isConnectorBroken } from '../lib/audit';
 import { problemView, type ProblemView } from '../lib/problem';
+import { useNow } from '../lib/use-now';
+import { useRecordContext } from '../lib/use-record-context';
 import { useSession } from '../session';
 import { LoginScreen } from './login-screen';
 
@@ -31,7 +34,10 @@ export function AuditScreen() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
 
+  const ctx = useRecordContext();
+  const now = useNow(true, 60_000);
   const [verifyResult, setVerifyResult] = useState<AuditVerificationResult | null>(null);
+  const [checkedAt, setCheckedAt] = useState<number | null>(null);
   const [verifyProblem, setVerifyProblem] = useState<ProblemView | null>(null);
   const [scrollTo, setScrollTo] = useState<number | null>(null);
 
@@ -60,6 +66,7 @@ export function AuditScreen() {
     onSuccess: (result) => {
       setVerifyProblem(null);
       setVerifyResult(result);
+      setCheckedAt(Date.now());
       void queryClient.invalidateQueries({ queryKey: getListAuditQueryKey() });
     },
     onError: (error) => {
@@ -72,6 +79,7 @@ export function AuditScreen() {
     () => auditQuery.data?.pages.flatMap((page) => page.items) ?? [],
     [auditQuery.data],
   );
+  const days = useMemo(() => groupByDay(entries, now), [entries, now]);
 
   useEffect(() => {
     if (scrollTo === null) return;
@@ -135,113 +143,95 @@ export function AuditScreen() {
   const brokenAtSeq =
     verifyResult && !verifyResult.ok ? (verifyResult.broken_at_seq ?? null) : null;
 
+  const runVerify = (body: AuditVerificationRequest) => {
+    setVerifyResult(null);
+    setVerifyProblem(null);
+    verify.mutate(body);
+  };
+
   return (
     <main className="mx-auto w-full max-w-6xl px-4 py-6 sm:px-6 sm:py-8">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0">
-          <h1 className="type-display text-[24px] leading-none">Audit log</h1>
-          <p className="mt-2 max-w-2xl text-[14px] leading-snug text-ink-2">
-            Every call, by people and agents, in order. Each entry is chained to the one
-            before it, so an edit shows.
-          </p>
-        </div>
-        <Button
-          variant="ghost"
-          onClick={() => void auditQuery.refetch()}
-          disabled={auditQuery.isFetching}
-        >
+      <div className="page-h">
+        <h1>Activity</h1>
+        <span className="flex-1" />
+        <Button variant="ghost" onClick={() => void auditQuery.refetch()} disabled={auditQuery.isFetching}>
           {auditQuery.isFetching ? 'Refreshing…' : 'Refresh'}
+        </Button>
+        <Button variant="default" onClick={() => runVerify({})} disabled={verify.isPending}>
+          <Link2 size={15} strokeWidth={1.8} aria-hidden="true" />
+          {verify.isPending ? 'Verifying…' : 'Verify the chain'}
         </Button>
       </div>
 
-      <div className="mt-4 flex flex-col gap-3">
-        <AuditVerify
-          result={verifyResult}
-          problem={verifyProblem}
-          pending={verify.isPending}
-          onRun={(body) => {
-            setVerifyResult(null);
-            setVerifyProblem(null);
-            verify.mutate(body);
-          }}
-          onOpenEntry={(seq) => void openLoadedEntry(seq)}
-        />
-        <AuditFilters search={search} />
-        <AuditCopy />
-      </div>
+      <ChainStrip
+        result={verifyResult}
+        checkedAt={checkedAt}
+        problem={verifyProblem}
+        pending={verify.isPending}
+        onRun={runVerify}
+        onOpenEntry={(seq) => void openLoadedEntry(seq)}
+      />
+
+      <AuditFilters search={search} />
 
       {listError ? <ProblemBanner view={listError} className="mt-4" /> : null}
 
-      <div
-        className={
-          search.seq !== undefined
-            ? 'mt-4 grid items-start gap-4 lg:grid-cols-[minmax(0,1fr)_23rem]'
-            : 'mt-4'
-        }
-      >
-        <section aria-label="Audit entries" className="min-w-0">
-          {auditQuery.isPending ? (
-            <div className="flex flex-col gap-2">
-              {[0, 1, 2, 3].map((index) => (
-                <div
-                  key={index}
-                  className="h-[64px] rounded-[10px] border border-line bg-surface/60"
-                />
-              ))}
-            </div>
-          ) : entries.length === 0 ? (
-            <div className="rounded-[10px] border border-dashed border-line bg-surface/50 px-4 py-10 text-center">
-              <p className="text-[15px] text-ink">
-                {hasFilters
-                  ? 'No audit records match these filters.'
-                  : 'Nothing has been recorded yet. Actions will appear here.'}
-              </p>
-              {hasFilters ? (
-                <Button
-                  variant="default"
-                  className="mt-4"
-                  onClick={() => void navigate({ to: '/activity', search: {} })}
-                >
-                  Clear filters
-                </Button>
-              ) : null}
-            </div>
-          ) : (
-            <ol className="flex flex-col">
-              {entries.map((record, index) => (
-                <AuditEntryRow
-                  key={record.seq}
-                  record={record}
-                  above={entries[index - 1]}
-                  selected={search.seq === record.seq}
-                  broken={isConnectorBroken(brokenAtSeq, record.seq)}
-                  onSelect={() => openEntry(record.seq)}
-                />
-              ))}
-            </ol>
-          )}
-
-          <div className="mt-3 flex flex-wrap items-center gap-3 pl-[28px]">
-            {auditQuery.hasNextPage ? (
-              <Button
-                variant="default"
-                onClick={() => void auditQuery.fetchNextPage()}
-                disabled={auditQuery.isFetchingNextPage}
-              >
-                {auditQuery.isFetchingNextPage ? 'Loading more…' : 'Load more'}
+      <section aria-label="Activity" className="mt-2 min-w-0">
+        {auditQuery.isPending ? (
+          <div className="mt-3 flex flex-col gap-2">
+            {[0, 1, 2, 3].map((index) => (
+              <div key={index} className="h-[46px] rounded-[10px] border border-line bg-surface/60" />
+            ))}
+          </div>
+        ) : entries.length === 0 ? (
+          <div className="mt-3 rounded-[10px] border border-dashed border-line bg-surface/50 px-4 py-10 text-center">
+            <p className="text-[15px] text-ink">
+              {hasFilters
+                ? 'Nothing recorded matches these filters.'
+                : 'Nothing has been recorded yet. Every call by people and agents will appear here.'}
+            </p>
+            {hasFilters ? (
+              <Button variant="default" className="mt-4" onClick={() => void navigate({ to: '/activity', search: {} })}>
+                Clear filters
               </Button>
-            ) : entries.length > 0 ? (
-              <p className="text-[13px] text-ink-2">End of the log.</p>
             ) : null}
           </div>
-        </section>
+        ) : (
+          days.map((day) => (
+            <div key={`${day.label}-${day.records[0]?.seq}`}>
+              <h2 className="day">{day.label}</h2>
+              <ol className="feed">
+                {day.records.map((record) => (
+                  <ActivityRow
+                    key={record.seq}
+                    record={record}
+                    ctx={ctx}
+                    selected={search.seq === record.seq}
+                    broken={isConnectorBroken(brokenAtSeq, record.seq)}
+                    onOpen={() => openEntry(record.seq)}
+                  />
+                ))}
+              </ol>
+            </div>
+          ))
+        )}
 
-        {search.seq !== undefined ? (
-          <div className="min-w-0 lg:sticky lg:top-4">
-            <AuditRecordPanel seq={search.seq} onClose={closeEntry} />
-          </div>
-        ) : null}
-      </div>
+        <div className="mt-3 flex flex-wrap items-center gap-3 sm:pl-[34px]">
+          {auditQuery.hasNextPage ? (
+            <Button
+              variant="default"
+              onClick={() => void auditQuery.fetchNextPage()}
+              disabled={auditQuery.isFetchingNextPage}
+            >
+              {auditQuery.isFetchingNextPage ? 'Loading more…' : 'Load more'}
+            </Button>
+          ) : entries.length > 0 ? (
+            <p className="text-[13px] text-ink-2">End of the log.</p>
+          ) : null}
+        </div>
+      </section>
+
+      {search.seq !== undefined ? <AuditSheet seq={search.seq} ctx={ctx} onClose={closeEntry} /> : null}
     </main>
   );
 }
