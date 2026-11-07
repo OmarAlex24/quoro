@@ -37,11 +37,19 @@
 //! removes its hostnames (`domain.rs`); `volume` lists, creates and deletes
 //! its volume (`volume.rs`); `backup` lists, takes and restores backups of
 //! that volume (`backup.rs`).
+//!
+//! `vm` lists, creates, starts, stops and deletes VMs and follows a VM's
+//! read-only serial console (`vm.rs`); `ssh` opens a human's shell in the
+//! app's instance (`ssh.rs`). Both attach the WebSocket of an interactive
+//! session with its single-use ticket (`session.rs`). `incident` lists, shows
+//! and resolves incidents (`incident.rs`), and `audit list` reads the audit
+//! log (`audit.rs`).
 
 mod agent;
 mod api;
 mod app;
 mod approval;
+mod audit;
 mod backup;
 mod cli;
 mod client;
@@ -50,6 +58,7 @@ mod deploy;
 mod domain;
 mod env;
 mod error;
+mod incident;
 mod link;
 mod links;
 mod login;
@@ -58,9 +67,12 @@ mod logs;
 pub mod operations;
 mod project;
 mod scope;
+mod session;
+mod ssh;
 mod status;
 mod terminal;
 mod tls;
+mod vm;
 mod volume;
 mod whoami;
 
@@ -308,6 +320,14 @@ pub async fn run_with(
         cli::Command::Backup(command) => {
             backup::run(&cli.global, command, environment, stdout, stderr).await
         }
+        cli::Command::Ssh => ssh::run(&cli.global, environment, stdout, stderr).await,
+        cli::Command::Vm(command) => {
+            vm::run(&cli.global, command, environment, stdout, stderr).await
+        }
+        cli::Command::Incident(command) => {
+            incident::run(&cli.global, command, environment, stdout).await
+        }
+        cli::Command::Audit(command) => audit::run(&cli.global, command, environment, stdout).await,
         cli::Command::Api(args) => api::run(&cli.global, args, environment, stdout, stderr).await,
         cli::Command::Completion { shell } => {
             clap_complete::generate(shell, &mut command(), "quoro", stdout);

@@ -117,6 +117,12 @@ pub async fn start() -> Primary {
 }
 
 impl Primary {
+    /// `http://127.0.0.1:<port>`, the plain fixture listener, where a test's
+    /// fake node enrolls and opens its session.
+    pub fn plain_url(&self) -> &str {
+        &self.plain
+    }
+
     /// How many requests reached the TLS listener.
     pub fn requests(&self) -> usize {
         self.requests.load(Ordering::SeqCst)

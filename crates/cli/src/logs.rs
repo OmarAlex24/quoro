@@ -507,7 +507,7 @@ fn check_id(prefix: &str, id: &str, what: &str) -> Result<(), Failure> {
 }
 
 /// `--since`: an RFC 3339 time, or a duration ago such as `10m`, as UTC.
-fn since(text: &str) -> Result<String, Failure> {
+pub(crate) fn since(text: &str) -> Result<String, Failure> {
     let text = text.trim();
     let unit = match text.chars().last() {
         Some('s') => Some(1),
