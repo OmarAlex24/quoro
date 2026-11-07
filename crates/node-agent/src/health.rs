@@ -127,63 +127,88 @@ impl HealthTarget {
 /// its failed probes do not count and it is not restarted for its health;
 /// once it is resumed, its failures count from zero.
 ///
-/// The backup manager marks a VM for the length of the snapshot and the
-/// reconciler reads the marks; both hold a clone.
+/// Marks are kept per volume: the engine pauses whichever VM attaches the
+/// volume it snapshots (section 3.16), which need not be the VM the backup
+/// job names (#524). A VM is marked while one of its volumes is.
+///
+/// The backup manager marks a volume for the length of the snapshot and the
+/// reconciler reads the marks of each VM's volumes; both hold a clone.
 #[derive(Clone, Debug, Default)]
 pub struct PausedVms {
-    /// A VM's entry stays after its last mark is released: removing it would
-    /// start `pauses` from zero again, and a later count equal to the one the
-    /// reconciler last saw would hide a pause. One small entry per VM ever
-    /// backed up since the agent started.
-    marks: Arc<Mutex<HashMap<String, PauseMark>>>,
+    marks: Arc<Mutex<Marks>>,
 }
 
-/// One VM's pause marks.
+/// Every volume's pause marks.
+#[derive(Debug, Default)]
+struct Marks {
+    /// The number of the latest pause on the node; every mark takes the next.
+    latest: u64,
+    /// A volume's entry stays after its last mark is released: removing it
+    /// would lose the number of its latest pause, and a VM's `latest` could
+    /// then fall back to a value the reconciler saw before and hide a pause.
+    /// One small entry per volume ever backed up since the agent started.
+    volumes: HashMap<String, PauseMark>,
+}
+
+/// The pause marks of a volume, or of a VM's volumes taken together.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PauseMark {
-    /// How many pauses mark the VM now; zero when it is not paused.
+    /// How many pauses mark it now; zero when it is not paused.
     pub held: u32,
-    /// How many times the VM was marked since the agent started. A change
-    /// means it was paused since it was last looked at.
-    pub pauses: u64,
+    /// The number of its latest pause since the agent started, zero for
+    /// none. Numbers only grow across the node, so a value other than the
+    /// one last seen means a pause began since, also when the VM's volumes
+    /// changed in between.
+    pub latest: u64,
 }
 
 impl PausedVms {
-    /// Marks `vm_id` paused until the returned guard is dropped.
-    #[must_use = "the VM is unmarked as soon as the guard is dropped"]
-    pub fn mark(&self, vm_id: &str) -> PausedGuard {
+    /// Marks the VM that attaches `volume_id` paused until the returned guard
+    /// is dropped.
+    #[must_use = "the volume is unmarked as soon as the guard is dropped"]
+    pub fn mark(&self, volume_id: &str) -> PausedGuard {
         let mut marks = self.lock();
-        let mark = marks.entry(vm_id.to_owned()).or_default();
+        marks.latest = marks.latest.saturating_add(1);
+        let latest = marks.latest;
+        let mark = marks.volumes.entry(volume_id.to_owned()).or_default();
         mark.held = mark.held.saturating_add(1);
-        mark.pauses = mark.pauses.saturating_add(1);
+        mark.latest = latest;
         PausedGuard {
             paused: self.clone(),
-            vm_id: vm_id.to_owned(),
+            volume_id: volume_id.to_owned(),
         }
     }
 
-    /// The VM's marks now.
+    /// The marks of a VM that attaches `volumes` now: it is held while any
+    /// of them is, and its latest pause is the latest of theirs.
     #[must_use]
-    pub fn mark_of(&self, vm_id: &str) -> PauseMark {
-        self.lock().get(vm_id).copied().unwrap_or_default()
+    pub fn mark_of<'a>(&self, volumes: impl IntoIterator<Item = &'a str>) -> PauseMark {
+        let marks = self.lock();
+        volumes
+            .into_iter()
+            .filter_map(|volume_id| marks.volumes.get(volume_id))
+            .fold(PauseMark::default(), |vm, volume| PauseMark {
+                held: vm.held.saturating_add(volume.held),
+                latest: vm.latest.max(volume.latest),
+            })
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<String, PauseMark>> {
+    fn lock(&self) -> MutexGuard<'_, Marks> {
         self.marks.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
-/// A VM's pause mark: unmarks the VM when dropped, also when the task that
+/// A volume's pause mark: unmarks it when dropped, also when the task that
 /// holds it is aborted.
 #[derive(Debug)]
 pub struct PausedGuard {
     paused: PausedVms,
-    vm_id: String,
+    volume_id: String,
 }
 
 impl Drop for PausedGuard {
     fn drop(&mut self) {
-        if let Some(mark) = self.paused.lock().get_mut(&self.vm_id) {
+        if let Some(mark) = self.paused.lock().volumes.get_mut(&self.volume_id) {
             mark.held = mark.held.saturating_sub(1);
         }
     }
@@ -358,15 +383,59 @@ mod tests {
     #[test]
     fn a_pause_mark_lasts_as_long_as_its_guard_and_is_counted() {
         let paused = PausedVms::default();
-        assert_eq!(paused.mark_of("vm_1"), PauseMark::default());
-        let first = paused.mark("vm_1");
-        let second = paused.mark("vm_1");
-        assert_eq!(paused.mark_of("vm_1"), PauseMark { held: 2, pauses: 2 });
+        assert_eq!(paused.mark_of(["vol_1"]), PauseMark::default());
+        let first = paused.mark("vol_1");
+        let second = paused.mark("vol_1");
+        assert_eq!(paused.mark_of(["vol_1"]), PauseMark { held: 2, latest: 2 });
         drop(first);
-        assert_eq!(paused.mark_of("vm_1").held, 1);
+        assert_eq!(paused.mark_of(["vol_1"]).held, 1);
         drop(second);
-        assert_eq!(paused.mark_of("vm_1"), PauseMark { held: 0, pauses: 2 });
-        assert_eq!(paused.mark_of("vm_2"), PauseMark::default());
+        assert_eq!(paused.mark_of(["vol_1"]), PauseMark { held: 0, latest: 2 });
+        assert_eq!(paused.mark_of(["vol_2"]), PauseMark::default());
+        assert_eq!(paused.mark_of([]), PauseMark::default());
+    }
+
+    /// #524: a VM is marked through any of its volumes, and its latest pause
+    /// is the latest of theirs.
+    #[test]
+    fn a_vm_is_marked_while_one_of_its_volumes_is() {
+        let paused = PausedVms::default();
+        let data = paused.mark("vol_data");
+        assert_eq!(
+            paused.mark_of(["vol_data", "vol_cache"]),
+            PauseMark { held: 1, latest: 1 }
+        );
+        assert_eq!(paused.mark_of(["vol_cache"]), PauseMark::default());
+        drop(data);
+        let cache = paused.mark("vol_cache");
+        assert_eq!(
+            paused.mark_of(["vol_data", "vol_cache"]),
+            PauseMark { held: 1, latest: 2 }
+        );
+        drop(cache);
+        assert_eq!(
+            paused.mark_of(["vol_data", "vol_cache"]),
+            PauseMark { held: 0, latest: 2 }
+        );
+    }
+
+    /// A pause after a VM loses a volume still changes its latest pause, so
+    /// a set of volumes that shrinks never hides a later pause: neither a
+    /// sum of counts per volume nor the highest of them would give that.
+    #[test]
+    fn a_later_pause_is_seen_after_the_vm_loses_a_volume() {
+        // `vol_b` paused once (a sum of counts would hide the next pause),
+        // then twice (the highest count would).
+        for pauses_of_b in [1, 2] {
+            let paused = PausedVms::default();
+            drop(paused.mark("vol_a"));
+            for _ in 0..pauses_of_b {
+                drop(paused.mark("vol_b"));
+            }
+            let seen = paused.mark_of(["vol_a", "vol_b"]).latest;
+            drop(paused.mark("vol_a"));
+            assert_ne!(paused.mark_of(["vol_a"]).latest, seen, "{pauses_of_b}");
+        }
     }
 
     #[test]

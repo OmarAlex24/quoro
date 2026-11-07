@@ -571,18 +571,15 @@ async fn run_job<E: Engine, R: Repository>(
 
     // Section 7.1 step 3: take the snapshot, then report `running` with its
     // method and, for `pause_copy`, the pause. A `pause_copy` snapshot pauses
-    // the app's VM on this node (`vm_id`) for the whole copy while the engine
-    // still reports it running, so the VM is marked for that time: its health
-    // check neither counts the pause nor restarts it (D-0259).
-    let mark = match &job.vm_id {
-        Some(vm_id)
-            if engine.capabilities().await.volume_snapshot_method
-                == Some(SnapshotMethod::PauseCopy) =>
-        {
-            Some(paused.mark(vm_id))
-        }
-        _ => None,
-    };
+    // the VM that attaches the volume for the whole copy while the engine
+    // still reports it running, so the volume is marked for that time: the
+    // health check of the VM that attaches it neither counts the pause nor
+    // restarts it (D-0259). The volume is marked, not the job's `vm_id`: the
+    // engine pauses whichever VM attaches the volume when it looks, which a
+    // redeploy or a stale VM row can make another one (#524).
+    let mark = (engine.capabilities().await.volume_snapshot_method
+        == Some(SnapshotMethod::PauseCopy))
+    .then(|| paused.mark(&job.volume_id));
     let snapshot = engine
         .snapshot_volume(&VolumeId(job.volume_id.clone()))
         .await;
@@ -1320,9 +1317,9 @@ mod tests {
         (dir, keys, memory, repo, status)
     }
 
-    /// The fake engine, which also records `vm_1`'s pause marks at the
-    /// moment the backup manager takes a snapshot. The manager calls nothing
-    /// else of the engine for a backup.
+    /// The fake engine, which also records, at the moment the backup manager
+    /// takes a snapshot, the pause marks of a VM that attaches `vol_1`. The
+    /// manager calls nothing else of the engine for a backup.
     struct MarkSpy {
         fake: Arc<FakeEngine>,
         paused: PausedVms,
@@ -1338,7 +1335,7 @@ mod tests {
             &self,
             id: &VolumeId,
         ) -> Result<VolumeSnapshot, quoro_engine::EngineError> {
-            *self.at_snapshot.lock().unwrap() = Some(self.paused.mark_of("vm_1"));
+            *self.at_snapshot.lock().unwrap() = Some(self.paused.mark_of(["vol_1"]));
             self.fake.snapshot_volume(id).await
         }
 
@@ -1446,8 +1443,8 @@ mod tests {
         after: PauseMark,
     }
 
-    /// Runs one backup of `vol_1` for the VM `vm_id` with `method`, its
-    /// snapshot failing when `fail` is set.
+    /// Runs one backup of `vol_1` whose job names the VM `vm_id`, with
+    /// `method`, its snapshot failing when `fail` is set.
     async fn marks_of_a_backup(
         name: &str,
         method: SnapshotMethod,
@@ -1506,13 +1503,13 @@ mod tests {
         MarkRun {
             status: status.status,
             at_snapshot,
-            after: paused.mark_of("vm_1"),
+            after: paused.mark_of(["vol_1"]),
         }
     }
 
-    /// D-0259: a `pause_copy` snapshot marks the job's VM, which it pauses,
-    /// for the snapshot and no longer; a reflink snapshot pauses nothing and
-    /// marks nothing.
+    /// D-0259: a `pause_copy` snapshot marks the volume, and so the VM that
+    /// attaches it, which the engine pauses, for the snapshot and no longer;
+    /// a reflink snapshot pauses nothing and marks nothing.
     #[tokio::test]
     async fn a_pause_copy_snapshot_marks_the_vm_it_pauses_for_the_snapshot_only() {
         let run = marks_of_a_backup(
@@ -1523,8 +1520,8 @@ mod tests {
         )
         .await;
         assert_eq!(run.status, BackupState::Succeeded, "{run:?}");
-        assert_eq!(run.at_snapshot, Some(PauseMark { held: 1, pauses: 1 }));
-        assert_eq!(run.after, PauseMark { held: 0, pauses: 1 });
+        assert_eq!(run.at_snapshot, Some(PauseMark { held: 1, latest: 1 }));
+        assert_eq!(run.after, PauseMark { held: 0, latest: 1 });
 
         let run = marks_of_a_backup(
             "backup-reflink-mark",
@@ -1539,7 +1536,7 @@ mod tests {
     }
 
     /// D-0259: a snapshot that fails releases the mark like one that
-    /// succeeds, so a failed backup leaves no VM marked.
+    /// succeeds, so a failed backup leaves no volume marked.
     #[tokio::test]
     async fn a_failed_pause_copy_snapshot_releases_the_mark() {
         let run = marks_of_a_backup(
@@ -1550,19 +1547,28 @@ mod tests {
         )
         .await;
         assert_eq!(run.status, BackupState::Failed, "{run:?}");
-        assert_eq!(run.at_snapshot, Some(PauseMark { held: 1, pauses: 1 }));
-        assert_eq!(run.after, PauseMark { held: 0, pauses: 1 });
+        assert_eq!(run.at_snapshot, Some(PauseMark { held: 1, latest: 1 }));
+        assert_eq!(run.after, PauseMark { held: 0, latest: 1 });
     }
 
-    /// Section 5.11: a job without `vm_id` has no VM on this node to pause,
-    /// so nothing is marked.
+    /// #524: the engine pauses whichever VM attaches the volume, so the
+    /// volume is marked also when the job names another VM, as after a
+    /// redeploy or with a stale VM row on the primary, or no VM at all.
     #[tokio::test]
-    async fn a_pause_copy_snapshot_without_a_vm_marks_nothing() {
-        let run =
-            marks_of_a_backup("backup-no-vm-mark", SnapshotMethod::PauseCopy, None, false).await;
-        assert_eq!(run.status, BackupState::Succeeded, "{run:?}");
-        assert_eq!(run.at_snapshot, Some(PauseMark::default()));
-        assert_eq!(run.after, PauseMark::default());
+    async fn a_pause_copy_snapshot_marks_the_volume_whatever_vm_the_job_names() {
+        for (name, vm_id) in [
+            ("backup-other-vm-mark", Some("vm_old")),
+            ("backup-no-vm-mark", None),
+        ] {
+            let run = marks_of_a_backup(name, SnapshotMethod::PauseCopy, vm_id, false).await;
+            assert_eq!(run.status, BackupState::Succeeded, "{vm_id:?}: {run:?}");
+            assert_eq!(
+                run.at_snapshot,
+                Some(PauseMark { held: 1, latest: 1 }),
+                "{vm_id:?}"
+            );
+            assert_eq!(run.after, PauseMark { held: 0, latest: 1 }, "{vm_id:?}");
+        }
     }
 
     #[tokio::test]

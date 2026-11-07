@@ -153,6 +153,12 @@ struct SpecMeta {
     deployment_id: Option<String>,
 }
 
+/// The ids of the volumes `vm` attaches. A backup of one of them pauses the
+/// VM on a `pause_copy` node, whatever VM the backup job names (#524).
+fn volume_ids(vm: &SpecVm) -> impl Iterator<Item = &str> {
+    vm.volumes.iter().map(|volume| volume.volume_id.as_str())
+}
+
 /// What a health check needs from the VM's spec beyond the probe target: where
 /// a transition to failing or passing is reported.
 #[derive(Clone, Debug)]
@@ -161,6 +167,8 @@ struct HealthTargetInfo {
     deployment_id: Option<String>,
     app_id: Option<String>,
     project_id: String,
+    /// The volumes the VM attaches, whose backups may pause it (D-0259).
+    volumes: Vec<String>,
 }
 
 /// One VM's health-check state.
@@ -185,10 +193,10 @@ struct HealthState {
     run_ended: bool,
     /// A health restart was already asked for this run.
     restart_asked: bool,
-    /// The VM's [`crate::health::PauseMark::pauses`] after its last probe.
+    /// The VM's [`crate::health::PauseMark::latest`] after its last probe.
     /// Another value means it was paused since, so its failures count from
     /// zero and a restart asked before the pause is dropped (D-0259).
-    pauses_seen: u64,
+    latest_pause_seen: u64,
 }
 
 impl HealthState {
@@ -202,7 +210,7 @@ impl HealthState {
             seen_at: now,
             run_ended: false,
             restart_asked: false,
-            pauses_seen: 0,
+            latest_pause_seen: 0,
         }
     }
 
@@ -1293,14 +1301,14 @@ impl<E: Engine + 'static> Reconciler<E> {
         // (D-0259): not while it is paused, nor for failures from before a
         // pause that began after the probe that asked for the restart.
         if self.health_restarts.contains(&vm_id) {
-            let mark = self.paused.mark_of(&vm_id);
+            let mark = self.paused.mark_of(volume_ids(vm));
             let (still_failing, paused_since) =
                 self.health.get(&vm_id).map_or((false, false), |state| {
                     (
                         state.status == Health::Failing
                             && HealthTarget::for_vm(vm, state.target.ip)
                                 .is_some_and(|target| target.probes_like(&state.target)),
-                        mark.held > 0 || mark.pauses != state.pauses_seen,
+                        mark.held > 0 || mark.latest != state.latest_pause_seen,
                     )
                 });
             if vm.desired_status != DesiredStatus::Running
@@ -1997,6 +2005,23 @@ impl<E: Engine + 'static> Reconciler<E> {
                 continue;
             };
             if let Some(target) = HealthTarget::for_vm(vm, ip) {
+                // The VM that runs attaches the volumes it was created with,
+                // which differ from the spec's until a recreate is done, and
+                // a backup of either pauses it (D-0259).
+                let mut volumes: Vec<String> = volume_ids(vm).map(str::to_owned).collect();
+                if let Some(recorded) = self
+                    .store
+                    .meta(&volumes_key(&vm.vm_id))
+                    .await
+                    .ok()
+                    .flatten()
+                {
+                    for volume_id in signature_volume_ids(&recorded) {
+                        if !volumes.iter().any(|known| known == volume_id) {
+                            volumes.push(volume_id.to_owned());
+                        }
+                    }
+                }
                 targets.insert(
                     vm.vm_id.clone(),
                     HealthTargetInfo {
@@ -2004,6 +2029,7 @@ impl<E: Engine + 'static> Reconciler<E> {
                         deployment_id: vm.deployment_id.clone(),
                         app_id: vm.app_id.clone(),
                         project_id: vm.project_id.clone(),
+                        volumes,
                     },
                 );
             }
@@ -2043,6 +2069,7 @@ impl<E: Engine + 'static> Reconciler<E> {
                 deployment_id,
                 app_id,
                 project_id,
+                volumes,
             } = info;
             let started_at = started.get(&vm_id).copied().flatten();
             let mut state = self
@@ -2067,7 +2094,7 @@ impl<E: Engine + 'static> Reconciler<E> {
             }
             // D-0259: a VM paused for a backup is not probed; the probe could
             // only time out.
-            let before = self.paused.mark_of(&vm_id);
+            let before = self.paused.mark_of(volumes.iter().map(String::as_str));
             if before.held > 0 {
                 state.next_at = now + state.target.interval;
                 self.health.insert(vm_id, state);
@@ -2083,12 +2110,12 @@ impl<E: Engine + 'static> Reconciler<E> {
             };
             // D-0259: once a paused VM is resumed its failures count from
             // zero, and a probe a pause overlapped does not count.
-            let after = self.paused.mark_of(&vm_id);
-            if after.pauses != state.pauses_seen {
+            let after = self.paused.mark_of(volumes.iter().map(String::as_str));
+            if after.latest != state.latest_pause_seen {
                 state.failures = 0;
-                state.pauses_seen = after.pauses;
+                state.latest_pause_seen = after.latest;
             }
-            let paused = after.held > 0 || after.pauses != before.pauses;
+            let paused = after.held > 0 || after.latest != before.latest;
             let status = if reason.is_none() {
                 state.failures = 0;
                 Health::Passing
@@ -2524,6 +2551,14 @@ fn volumes_signature(volumes: &[quoro_proto::wire::SpecVolume]) -> String {
         .collect();
     parts.sort();
     parts.join("\n")
+}
+
+/// The volume ids of a signature [`volumes_signature`] made.
+fn signature_volume_ids(signature: &str) -> impl Iterator<Item = &str> {
+    signature
+        .lines()
+        .filter_map(|part| part.split('|').next())
+        .filter(|volume_id| !volume_id.is_empty())
 }
 
 /// The `node_meta` key that remembers one VM's attached-volume signature.
@@ -3429,6 +3464,122 @@ mod tests {
         server.abort();
     }
 
+    /// [`health_snapshot_with`], with the VM attaching the volume
+    /// `vol_health`, which a backup's pause marks (D-0259).
+    fn health_snapshot_with_volume(port: u16, check: quoro_proto::wire::HealthCheck) -> Snapshot {
+        health_snapshot_attaching(port, check, "vol_health", &["vol_health"])
+    }
+
+    /// [`health_snapshot_with`], with the VM attaching `attached` and
+    /// `present` in `spec.volumes`.
+    fn health_snapshot_attaching(
+        port: u16,
+        check: quoro_proto::wire::HealthCheck,
+        attached: &str,
+        present: &[&str],
+    ) -> Snapshot {
+        let mut snapshot = health_snapshot_with(port, check);
+        let spec = &mut snapshot.state.spec;
+        spec.vms[0].volumes.push(quoro_proto::wire::SpecVolume {
+            volume_id: attached.to_owned(),
+            serial: "quoro-vol-0".to_owned(),
+            mount_path: "/data".to_owned(),
+        });
+        for volume_id in present {
+            spec.volumes.push(SpecVolumeFile {
+                volume_id: (*volume_id).to_owned(),
+                app_id: "app_1".to_owned(),
+                size_gb: 1,
+                state: quoro_proto::wire::SpecVolumeState::Present,
+                restore: None,
+                warm: None,
+            });
+        }
+        snapshot
+    }
+
+    /// #524: until a recreate for a new set of volumes is done, the VM that
+    /// runs still attaches its old ones, and a backup of one of them pauses
+    /// it: it is not probed, so its check does not turn `failing`.
+    #[tokio::test]
+    async fn a_vm_paused_through_a_volume_it_attaches_until_its_recreate_is_not_probed() {
+        use quoro_engine::FakeEngine;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let healthy = Arc::new(AtomicBool::new(true));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let paused = crate::health::PausedVms::default();
+        let (port, server) = pausing_server(
+            Arc::clone(&healthy),
+            paused.clone(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&requests),
+        )
+        .await;
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let engine = Arc::new(FakeEngine::new());
+        let mut reconciler =
+            health_reconciler(Arc::clone(&engine), store.clone(), Duration::from_millis(1))
+                .with_paused_vms(paused.clone());
+        let before = health_snapshot_attaching(port, check(0, None), "vol_old", &["vol_old"]);
+        reconciler.reconcile_once(Some(&before)).await;
+        tokio::time::sleep(NEXT_PROBE).await;
+        let statuses = reconciler.reconcile_once(Some(&before)).await;
+        assert_eq!(statuses[0].health, Health::Passing);
+
+        // The spec moves the VM to another volume, and the stop of its
+        // recreate keeps failing, so the VM keeps running on `vol_old`.
+        engine.set_unkillable(&VmId("vm_health".to_owned()), true);
+        let after = health_snapshot_attaching(
+            port,
+            check(0, None),
+            "vol_health",
+            &["vol_old", "vol_health"],
+        );
+        let mark = paused.mark("vol_old");
+        healthy.store(false, Ordering::SeqCst);
+        let probed = requests.load(Ordering::SeqCst);
+        for _ in 0..2 {
+            tokio::time::sleep(NEXT_PROBE).await;
+            let statuses = reconciler.reconcile_once(Some(&after)).await;
+            assert_eq!(statuses[0].health, Health::Passing);
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), probed, "not probed");
+        assert!(app_events(&store).await.is_empty(), "no app.down");
+        drop(mark);
+        server.abort();
+    }
+
+    /// #524: a VM is held back only by a backup of a volume it attaches. A
+    /// pause of another volume does not hold its health restart.
+    #[tokio::test]
+    async fn a_backup_of_a_volume_the_vm_does_not_attach_does_not_hold_its_restart() {
+        use quoro_engine::FakeEngine;
+
+        let healthy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (port, server) = switchable_server(Arc::clone(&healthy)).await;
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let engine = Arc::new(FakeEngine::new());
+        let paused = crate::health::PausedVms::default();
+        let mut reconciler =
+            health_reconciler(Arc::clone(&engine), store.clone(), Duration::from_millis(1))
+                .with_paused_vms(paused.clone());
+        let snapshot = health_snapshot_with_volume(port, check(0, None));
+
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        tokio::time::sleep(NEXT_PROBE).await;
+        // This pass's probe fails and asks for a restart; then a backup
+        // pauses another app's VM.
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        let other = paused.mark("vol_other");
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        assert_eq!(engine.stop_calls().len(), 1, "restarted for its health");
+        drop(other);
+        server.abort();
+    }
+
     /// D-0259: a VM a backup paused is not restarted for its health. A
     /// restart asked before the pause is dropped, none is carried out while
     /// the VM stays paused, and after the pause a counted failure restarts it.
@@ -3445,14 +3596,14 @@ mod tests {
         let mut reconciler =
             health_reconciler(Arc::clone(&engine), store.clone(), Duration::from_millis(1))
                 .with_paused_vms(paused.clone());
-        let snapshot = health_snapshot_with(port, check(0, None));
+        let snapshot = health_snapshot_with_volume(port, check(0, None));
 
         reconciler.reconcile_once(Some(&snapshot)).await;
         tokio::time::sleep(NEXT_PROBE).await;
         // This pass's probe fails and asks for a restart; then a backup
         // pauses the VM before the next pass.
         reconciler.reconcile_once(Some(&snapshot)).await;
-        let mark = paused.mark("vm_health");
+        let mark = paused.mark("vol_health");
         reconciler.reconcile_once(Some(&snapshot)).await;
         assert!(
             engine.stop_calls().is_empty(),
@@ -3494,14 +3645,14 @@ mod tests {
             failures: Some(2),
             ..check(0, None)
         };
-        let snapshot = health_snapshot_with(port, two_failures);
+        let snapshot = health_snapshot_with_volume(port, two_failures);
 
         reconciler.reconcile_once(Some(&snapshot)).await;
         // One failure before the pause.
         tokio::time::sleep(NEXT_PROBE).await;
         reconciler.reconcile_once(Some(&snapshot)).await;
         // The pause, over before the next probe.
-        let mark = paused.mark("vm_health");
+        let mark = paused.mark("vol_health");
         tokio::time::sleep(NEXT_PROBE).await;
         reconciler.reconcile_once(Some(&snapshot)).await;
         drop(mark);
@@ -3523,8 +3674,8 @@ mod tests {
     }
 
     /// A health server for `vm_health` that counts the requests it gets.
-    /// While `pause_in_probe` is set, a pause of the VM begins and ends
-    /// before each answer, as a backup's would while the probe waits.
+    /// While `pause_in_probe` is set, a pause of the VM's volume begins and
+    /// ends before each answer, as a backup's would while the probe waits.
     async fn pausing_server(
         healthy: Arc<std::sync::atomic::AtomicBool>,
         paused: crate::health::PausedVms,
@@ -3545,7 +3696,7 @@ mod tests {
                 let _ = socket.read(&mut buffer).await;
                 requests.fetch_add(1, Ordering::SeqCst);
                 if pause_in_probe.load(Ordering::SeqCst) {
-                    drop(paused.mark("vm_health"));
+                    drop(paused.mark("vol_health"));
                 }
                 let status = if healthy.load(Ordering::SeqCst) {
                     "200 OK"
@@ -3576,14 +3727,14 @@ mod tests {
         let mut reconciler =
             health_reconciler(Arc::clone(&engine), store.clone(), Duration::from_millis(1))
                 .with_paused_vms(paused.clone());
-        let snapshot = health_snapshot_with(port, check(0, None));
+        let snapshot = health_snapshot_with_volume(port, check(0, None));
 
         reconciler.reconcile_once(Some(&snapshot)).await;
         tokio::time::sleep(NEXT_PROBE).await;
         // This pass's probe fails and asks for a restart; a backup pauses
         // the VM and resumes it before the next pass.
         reconciler.reconcile_once(Some(&snapshot)).await;
-        drop(paused.mark("vm_health"));
+        drop(paused.mark("vol_health"));
         reconciler.reconcile_once(Some(&snapshot)).await;
         assert!(
             engine.stop_calls().is_empty(),
@@ -3622,7 +3773,7 @@ mod tests {
         let mut reconciler =
             health_reconciler(Arc::clone(&engine), store.clone(), Duration::from_millis(1))
                 .with_paused_vms(paused.clone());
-        let snapshot = health_snapshot_with(port, check(0, None));
+        let snapshot = health_snapshot_with_volume(port, check(0, None));
 
         reconciler.reconcile_once(Some(&snapshot)).await;
         tokio::time::sleep(NEXT_PROBE).await;
@@ -3630,7 +3781,7 @@ mod tests {
         assert_eq!(statuses[0].health, Health::Passing);
 
         // A backup pauses the VM, which would fail every probe now.
-        let mark = paused.mark("vm_health");
+        let mark = paused.mark("vol_health");
         healthy.store(false, Ordering::SeqCst);
         let probed = requests.load(Ordering::SeqCst);
         for _ in 0..2 {
@@ -3679,7 +3830,7 @@ mod tests {
         let mut reconciler =
             health_reconciler(Arc::clone(&engine), store.clone(), Duration::from_millis(1))
                 .with_paused_vms(paused.clone());
-        let snapshot = health_snapshot_with(port, check(0, None));
+        let snapshot = health_snapshot_with_volume(port, check(0, None));
 
         reconciler.reconcile_once(Some(&snapshot)).await;
         for _ in 0..2 {
