@@ -15,7 +15,9 @@
 //! Errors from the API are mapped to fixed exit codes ([`exit`]) so a script
 //! or an agent can branch on them without reading text.
 //!
-//! An agent logs in with its key file (`login.rs`); every command then mints
+//! A human logs in with a personal API token typed at a hidden prompt or
+//! piped with `--token-stdin` (`login.rs`), and `logout` forgets it
+//! (`logout.rs`). An agent logs in with its key file; every command then mints
 //! a short-lived access token from it, cached between commands (`agent.rs`).
 //! An agent must say why it changes something (`--reason`), and a destructive
 //! call it may not make yet can file an approval request and wait for a
@@ -29,14 +31,17 @@ mod client;
 mod context;
 mod error;
 mod login;
+mod logout;
 pub mod operations;
+mod terminal;
 mod tls;
 mod whoami;
 
 use clap::Parser as _;
 use std::collections::BTreeMap;
-use std::io::{IsTerminal as _, Write};
+use std::io::{BufRead as _, IsTerminal as _, Read as _, Write};
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 
 pub use error::exit;
 
@@ -54,15 +59,29 @@ const VARIABLES: &[&str] = &[
     "XDG_CACHE_HOME",
 ];
 
-/// What the client reads from its process: environment variables and whether
-/// stdout and stdin are terminals. Tests build one by hand, so they never
-/// change the test process's environment.
+/// What the client reads from its process: environment variables, whether
+/// stdout and stdin are terminals, and stdin itself. Tests build one by hand,
+/// so they never change the test process's environment or read its stdin.
 #[derive(Clone, Debug, Default)]
 pub struct Environment {
     vars: BTreeMap<String, String>,
     stdout_is_terminal: bool,
-    /// Whether a question can be asked (`quoro login`'s first contact).
+    /// Whether a question can be asked (`quoro login`'s first contact and
+    /// token prompt).
     stdin_is_terminal: bool,
+    /// What stdin holds, for a test; `None` reads the process's stdin.
+    input: Option<Input>,
+}
+
+/// Bytes standing in for stdin. `Debug` never shows them: they may hold a
+/// token.
+#[derive(Clone)]
+struct Input(Arc<Mutex<std::io::Cursor<Vec<u8>>>>);
+
+impl std::fmt::Debug for Input {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Input(..)")
+    }
 }
 
 impl Environment {
@@ -77,6 +96,7 @@ impl Environment {
             vars,
             stdout_is_terminal: std::io::stdout().is_terminal(),
             stdin_is_terminal: std::io::stdin().is_terminal(),
+            input: None,
         }
     }
 
@@ -94,7 +114,62 @@ impl Environment {
                 .collect(),
             stdout_is_terminal,
             stdin_is_terminal: false,
+            input: None,
         }
+    }
+
+    /// This environment with `bytes` as stdin, a terminal when
+    /// `is_terminal` (what a user would type at the prompts).
+    #[must_use]
+    pub fn with_stdin(mut self, bytes: impl Into<Vec<u8>>, is_terminal: bool) -> Self {
+        self.input = Some(Input(Arc::new(Mutex::new(std::io::Cursor::new(
+            bytes.into(),
+        )))));
+        self.stdin_is_terminal = is_terminal;
+        self
+    }
+
+    /// One line from stdin, without its line ending.
+    fn read_line(&self) -> std::io::Result<String> {
+        let mut line = String::new();
+        match &self.input {
+            Some(Input(input)) => {
+                let mut input = input
+                    .lock()
+                    .map_err(|_| std::io::Error::other("stdin is poisoned"))?;
+                input.read_line(&mut line)?;
+            }
+            None => {
+                std::io::stdin().lock().read_line(&mut line)?;
+            }
+        }
+        Ok(line.trim_end_matches(['\r', '\n']).to_string())
+    }
+
+    /// All of stdin.
+    fn read_to_end(&self) -> std::io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        match &self.input {
+            Some(Input(input)) => {
+                let mut input = input
+                    .lock()
+                    .map_err(|_| std::io::Error::other("stdin is poisoned"))?;
+                input.read_to_end(&mut bytes)?;
+            }
+            None => {
+                std::io::stdin().lock().read_to_end(&mut bytes)?;
+            }
+        }
+        Ok(bytes)
+    }
+
+    /// One line typed on the terminal with its echo off, so a secret never
+    /// shows on screen. Stdin standing in for a test is read as it is.
+    fn read_hidden_line(&self) -> std::io::Result<String> {
+        if self.input.is_some() {
+            return self.read_line();
+        }
+        terminal::read_hidden_line()
     }
 
     /// A variable's value; an empty one counts as unset.
@@ -162,6 +237,7 @@ pub async fn run_with(
         cli::Command::Login(args) => {
             login::run(&cli.global, args, environment, stdout, stderr).await
         }
+        cli::Command::Logout => logout::run(&cli.global, environment, stdout),
         cli::Command::Whoami => whoami::run(&cli.global, environment, stdout).await,
         cli::Command::Api(args) => api::run(&cli.global, args, environment, stdout, stderr).await,
         cli::Command::Completion { shell } => {
