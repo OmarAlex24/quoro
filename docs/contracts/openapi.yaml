@@ -1858,15 +1858,20 @@ components:
           type: [string, 'null']
           pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
           description: |
-            The warm node. The scheduler picks it among the nodes the app may
-            run on unless an operator pinned it (`UpdateAppRequest.warm`).
-            Eligible: a connected node with the `node` role, in
-            `placement.node_ids` when that is not empty, other than the node of
-            the app's volume, that snapshots with `reflink` (ADR 0172) and that
-            the source can reach over the mesh (two nodes both behind NAT
-            cannot pair). After a failover it is the old source, which becomes
-            the warm copy when it returns (ADR 0176). Null while no node is
-            eligible; `state` is then `failed`.
+            The warm node. The scheduler picks it unless an operator pinned it
+            (`UpdateAppRequest.warm`). Eligible: a connected node with the
+            `node` role, other than the node of the app's volume, that
+            snapshots with `reflink` (ADR 0172) and that the source can reach
+            over the mesh (two nodes both behind NAT cannot pair). A stateful
+            app's placement names only its volume's node (ADR 0145), so it
+            does not narrow the choice; pin a node to choose it (ADR 0275).
+            After a failover it is the old source, which becomes the warm copy
+            when it returns (ADR 0176). Null while no node is eligible;
+            `state` is then `failed`. The scheduler keeps the warm node while
+            it is disconnected and picks another only when it is removed,
+            loses the node role, stops snapshotting with reflink or becomes
+            the volume's node; an operator's pin lasts until the node is
+            removed (ADR 0278).
         node_pinned:
           type: boolean
           description: Whether an operator chose `node_id` rather than the scheduler.
@@ -2130,8 +2135,9 @@ components:
             while the cluster has a backup repository, otherwise `conflict`
             (409). `warm` only for an app with a volume whose node snapshots
             with `reflink` and while another node is eligible as its warm node
-            (`WarmCopy.node_id`), otherwise `validation_failed` (ADR 0172,
-            ADR 0174). `hot` answers `validation_failed` until M6 (ADR 0020).
+            (`WarmCopy.node_id`), and in M5b not for an app with a `source`,
+            otherwise `validation_failed` (ADR 0172, ADR 0174, ADR 0265).
+            `hot` answers `validation_failed` until M6 (ADR 0020).
           enum:
             - none
             - cold
@@ -3023,7 +3029,10 @@ components:
             `no_warm_node` (`warm` needs a volume node that snapshots with
             `reflink` and another eligible node, `WarmCopy.node_id`) or
             `not_in_this_release` (`hot` before M6; `warm` on a primary older
-            than M5b).
+            than M5b). In M5b `warm` is also `not_in_this_release` for an app
+            with a `source`: its built image exists only on the node that
+            built it, so a warm node could not start it after a failover
+            (ADR 0265).
           oneOf:
             - type: string
               enum:
@@ -7451,8 +7460,9 @@ paths:
         Changes settings, not the image: a new image is rolled out as a deployment.
         `ha_policy: cold` needs a stateful app and a backup repository
         (`conflict`, 409, otherwise). `ha_policy: warm` needs a volume on a
-        node that snapshots with `reflink` and an eligible warm node
-        (`validation_failed` otherwise); it starts the copy to the warm node,
+        node that snapshots with `reflink` and an eligible warm node, and in
+        M5b an app without a `source` (`validation_failed` otherwise, ADR
+        0265); it starts the copy to the warm node,
         prepares the app's image there, moves the app's domains to the edge
         when the cluster has one, and turns the app's lease `expiring` as soon
         as the primary holds the support of a majority of voters
