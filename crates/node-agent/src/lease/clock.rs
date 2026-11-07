@@ -124,7 +124,10 @@ async fn sleep_on_boottime(period: Duration) {
     let fd = match armed {
         Ok(fd) => fd,
         Err(e) => {
-            tracing::warn!(error = %e, "could not arm a CLOCK_BOOTTIME timer; waiting on the monotonic clock");
+            timer_failed(
+                &e,
+                "could not arm a CLOCK_BOOTTIME timer; waiting on the monotonic clock",
+            );
             tokio::time::sleep(period).await;
             return;
         }
@@ -142,11 +145,29 @@ async fn sleep_on_boottime(period: Duration) {
     match fired {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            tracing::warn!(error = %e, "could not read a CLOCK_BOOTTIME timer; waiting on the monotonic clock");
+            timer_failed(
+                &e,
+                "could not read a CLOCK_BOOTTIME timer; waiting on the monotonic clock",
+            );
             tokio::time::sleep(period).await;
         }
         // The runtime is shutting down.
         Err(_) => tokio::time::sleep(period).await,
+    }
+}
+
+/// Logs a `CLOCK_BOOTTIME` timer failure: a warning the first time, then at
+/// debug level: the lease service arms a timer every 250 ms, and a host that
+/// cannot arm one once is unlikely to arm the next.
+#[cfg(target_os = "linux")]
+fn timer_failed(error: &dyn std::fmt::Display, message: &'static str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if WARNED.swap(true, Ordering::Relaxed) {
+        tracing::debug!(error = %error, "{message}");
+    } else {
+        tracing::warn!(error = %error, "{message}");
     }
 }
 
@@ -199,6 +220,14 @@ impl ManualHostClock {
         self.suspends.send_modify(|count| *count += 1);
     }
 
+    /// Models a suspend of `slept` whose wake-up no timer has seen yet:
+    /// `CLOCK_BOOTTIME` jumps ahead and no [`HostClock::sleep`] ends. A test
+    /// uses it to hand the lease service a message before the wake-up's
+    /// timer fires.
+    pub fn suspend_unnoticed(&self, slept: Duration) {
+        self.lock().at_origin += slept;
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, ManualInner> {
         self.inner
             .lock()
@@ -228,6 +257,15 @@ impl HostClock for ManualHostClock {
         })
     }
 }
+
+/// The widest spread between the two `CLOCK_BOOTTIME` reads around a
+/// measurement's instant that [`SuspendWatch::suspended`] accepts at once. Two
+/// reads with nothing between them take well under a microsecond.
+const TIGHT_READ: Duration = Duration::from_micros(100);
+
+/// How many times [`SuspendWatch::suspended`] reads before it accepts a wide
+/// spread.
+const TIGHT_READ_ATTEMPTS: u32 = 3;
 
 /// Measures how long the host has been suspended since a reading
 /// (`node-agent-protocol.md` section 8.4 "Suspend", ADR 0240).
@@ -268,14 +306,32 @@ impl SuspendWatch {
     }
 
     /// The time the host has spent suspended since the reading.
+    ///
+    /// The instant is read between two reads of `CLOCK_BOOTTIME`, and the
+    /// measurement uses the later one. A thread stall between the reads would
+    /// count as a suspend, and the lease table keeps what it applied as the
+    /// baseline for the next suspend, which would then be applied short by
+    /// the stall. So a measurement whose two reads lie [`TIGHT_READ`] or more
+    /// apart is taken again, a few times at most; the last one is used
+    /// whatever its spread, since it errs long.
     #[must_use]
     pub fn suspended(&self) -> Duration {
         let (Some(clock), Some((boot_origin, origin))) = (&self.clock, self.origin) else {
             return Duration::ZERO;
         };
-        let instant = Instant::now();
-        let Some(boottime) = clock.boottime() else {
-            return Duration::ZERO;
+        let mut attempt = 1;
+        let (instant, boottime) = loop {
+            let Some(before) = clock.boottime() else {
+                return Duration::ZERO;
+            };
+            let instant = Instant::now();
+            let Some(after) = clock.boottime() else {
+                return Duration::ZERO;
+            };
+            if after.saturating_sub(before) < TIGHT_READ || attempt == TIGHT_READ_ATTEMPTS {
+                break (instant, after);
+            }
+            attempt += 1;
         };
         // `CLOCK_BOOTTIME` never goes back within one boot; a reading from
         // another boot measures nothing.

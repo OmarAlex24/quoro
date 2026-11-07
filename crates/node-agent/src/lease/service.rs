@@ -273,6 +273,19 @@ impl LeaseView {
         table
     }
 
+    /// Records a renewal about to be sent (section 8.4, ADR 0240). Its send
+    /// time is read under the lock that caught up with every suspend measured
+    /// so far. A suspend another caller applies later then moves it like any
+    /// other instant, and a suspend already applied is not taken off a send
+    /// time read after it. A send time read outside the lock could miss a
+    /// suspend applied in between, and its answer would set a `valid_until`
+    /// later than the primary's gate by that suspend.
+    fn record_renewal(&self, lease_id: &LeaseId, msg: MsgId, clock: &dyn HostClock) {
+        let mut table = self.lock_at(Instant::now());
+        let reading = HostNow::read(clock);
+        table.renew_sent(lease_id, msg, &reading);
+    }
+
     /// Section 6.4: may a stateful VM with this spec token start now?
     ///
     /// Not while the node is marked failed, and not while a fence of the lease
@@ -964,26 +977,27 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                     lease_id,
                     fencing_token,
                 } => {
+                    let Some((_, renewals)) = &self.renewals else {
+                        continue;
+                    };
                     let id = MsgId(util::message_id());
-                    // `t_send` and its `CLOCK_BOOTTIME` are read before the
-                    // renewal is handed to the session, so both err early
-                    // (section 8.4, ADR 0240).
-                    let reading = HostNow::read(&*self.config.host_clock);
-                    let sent = self.renewals.as_ref().is_some_and(|(_, renewals)| {
-                        renewals
-                            .send(Envelope {
-                                id: id.clone(),
-                                re: None,
-                                body: LeaseRenew {
-                                    lease_id: lease_id.clone(),
-                                    fencing_token,
-                                },
-                            })
-                            .is_ok()
-                    });
-                    if sent {
-                        self.lock().renew_sent(&lease_id, id, &reading);
-                    } else if self.renewals.is_some() {
+                    // The renewal is recorded before it is handed to the
+                    // session, so `t_send` and its `CLOCK_BOOTTIME` err early
+                    // (section 8.4, ADR 0240). A renewal the session never
+                    // takes is never answered.
+                    self.view
+                        .record_renewal(&lease_id, id.clone(), &*self.config.host_clock);
+                    let sent = renewals
+                        .send(Envelope {
+                            id,
+                            re: None,
+                            body: LeaseRenew {
+                                lease_id,
+                                fencing_token,
+                            },
+                        })
+                        .is_ok();
+                    if !sent {
                         // The session is gone without detaching yet.
                         self.detach();
                     }
@@ -1146,13 +1160,20 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
             let _ = reply.send(Ok(result));
             return;
         }
-        let outcome = {
-            let mut table = self.lock();
+        // A revoke that `select!` takes before the wake-up's timer still
+        // counts the suspend: an `expiring` lease whose `valid_until` passed
+        // during it gets the stop time it has left, as at an expiry (ADR
+        // 0240).
+        let (outcome, valid_until) = {
+            let mut table = self.view.lock_at(Instant::now());
+            let valid_until = table
+                .get(&envelope.body.lease_id)
+                .and_then(|lease| lease.valid_until);
             let outcome = table.on_revoke(&envelope.body);
             if let Ok(RevokeOutcome::Fence { lease_id }) = &outcome {
                 self.view.gates.triggered(lease_id);
             }
-            outcome
+            (outcome, valid_until)
         };
         match outcome {
             Err(Refusal::BadMessage(message)) => {
@@ -1170,7 +1191,7 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                 let _ = reply.send(Ok(result));
             }
             Ok(RevokeOutcome::Fence { lease_id }) => {
-                let triggered_at = Instant::now();
+                let now = Instant::now();
                 let waiter = Some(Waiter {
                     msg: envelope.id,
                     reply,
@@ -1179,6 +1200,13 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                     .lock()
                     .get(&lease_id)
                     .is_some_and(|lease| lease.mode == LeaseMode::Expiring);
+                // An `expiring` lease's stop time counts from `valid_until`
+                // once that has passed (section 8.4).
+                let triggered_at = if expiring {
+                    valid_until.map_or(now, |until| until.min(now))
+                } else {
+                    now
+                };
                 if expiring {
                     // An `expiring` lease's VMs must stop before the primary's
                     // gate, so the stop begins before anything waits on the
@@ -1817,5 +1845,65 @@ mod tests {
         assert!(!view.may_start_stateful("lse_e", 1));
         assert!(!view.holds_app_lease("app_e", 1));
         assert_eq!(Instant::now(), now, "no time passed on the tokio clock");
+    }
+
+    /// ADR 0240, safety review M1: a renewal's send time is read under the
+    /// lock that applies the suspends. One recorded after a wake-up nobody has
+    /// caught up with yet does not move for that suspend, and a suspend
+    /// applied after it moves it, whichever caller applies it. Its answer then
+    /// sets `valid_until` from the send time on the lease clock, never later
+    /// by a suspend.
+    #[tokio::test(start_paused = true)]
+    async fn a_renewal_is_timed_under_the_lock_that_applies_the_suspends() {
+        let clock = Arc::new(ManualHostClock::new(
+            Some("boot-a"),
+            Duration::from_secs(1000),
+        ));
+        let reading = HostNow::read(&*clock);
+        let now = reading.instant;
+        let grant = LeaseGrant {
+            lease_id: LeaseId("lse_e".to_owned()),
+            resource_type: ResourceType::App,
+            resource_id: "app_e".to_owned(),
+            mode: LeaseMode::Expiring,
+            fencing_token: 1,
+            duration_ms: Some(15_000),
+            granted_at: "2026-11-06T10:00:00Z".to_owned(),
+        };
+        let mut table = LeaseTable::new();
+        table.on_grant(&grant, None, now).expect("grant");
+        let view =
+            LeaseView::with_suspends(table, false, SuspendWatch::new(clock.clone(), &reading));
+        let valid_until = || view.lock().get(&grant.lease_id).and_then(|l| l.valid_until);
+
+        // The first renewal, recorded after a 2 s suspend no caller has
+        // caught up with: the suspend came before it, so its answer gives
+        // the full `D - M` from now.
+        clock.suspend(Duration::from_secs(2));
+        let first = MsgId("msg_renew_1".to_owned());
+        view.record_renewal(&grant.lease_id, first.clone(), &*clock);
+        view.lock()
+            .on_grant(&grant, Some(&first), now)
+            .expect("the answer");
+        assert_eq!(valid_until(), Some(now + Duration::from_millis(13_500)));
+
+        // The second, recorded before a 10 s suspend that a start check then
+        // applies: its send time moves with every other instant, so its
+        // answer cannot revive the lease past the primary's gate.
+        let second = MsgId("msg_renew_2".to_owned());
+        view.record_renewal(&grant.lease_id, second.clone(), &*clock);
+        clock.suspend(Duration::from_secs(10));
+        assert!(view.may_start_stateful("lse_e", 1), "3.5 s are left");
+        view.lock()
+            .on_grant(&grant, Some(&second), now)
+            .expect("the answer");
+        assert_eq!(
+            valid_until(),
+            Some(now + Duration::from_millis(3_500)),
+            "the answer counts from the moved send time"
+        );
+        assert!(view.may_start_stateful("lse_e", 1));
+        clock.suspend(Duration::from_secs(4));
+        assert!(!view.may_start_stateful("lse_e", 1));
     }
 }

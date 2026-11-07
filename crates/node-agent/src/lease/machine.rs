@@ -109,13 +109,22 @@ impl Lease {
     /// is back. The stored deadline does not move: it is on `CLOCK_BOOTTIME`,
     /// which counted the suspend. An instant added to the lease on the lease
     /// clock must move here too.
+    ///
+    /// A renewal whose send time cannot move that far is dropped instead of
+    /// floored: its answer then matches nothing and changes nothing, so no
+    /// floor that is later than the real send time can set `valid_until`.
     fn suspended(&mut self, by: Duration, floor: Instant) {
         let earlier = |at: Instant| at.checked_sub(by).unwrap_or(floor);
         self.valid_until = self.valid_until.map(earlier);
         self.next_renew_at = self.next_renew_at.map(earlier);
-        for renewal in &mut self.outstanding {
-            renewal.sent = earlier(renewal.sent);
-        }
+        self.outstanding
+            .retain_mut(|renewal| match renewal.sent.checked_sub(by) {
+                Some(sent) => {
+                    renewal.sent = sent;
+                    true
+                }
+                None => false,
+            });
     }
 }
 

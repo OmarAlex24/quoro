@@ -23,7 +23,10 @@ use quoro_node_agent::{
     Attached, FenceTimers, HostClock, LeaseConfig, LeaseState, LocalLeases, ManualHostClock,
     StoredLease, StoredValidity, VmFenceOutcome, start_local_leases, stop_vms,
 };
-use quoro_proto::{Envelope, LeaseGrant, LeaseId, LeaseMode, LeaseRenew, MsgId, ResourceType};
+use quoro_proto::{
+    CommandStatus, Envelope, LeaseGrant, LeaseId, LeaseMode, LeaseRenew, LeaseRevoke, MsgId,
+    ResourceType, RevokeReason,
+};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
@@ -513,9 +516,11 @@ async fn a_suspend_past_valid_until_fences_at_once_on_wake_up() {
     );
     wait_for_fence_record(&store).await;
     let fenced_after = woke.elapsed();
+    // Before the 250 ms check: the wake-up itself ended the service's wait.
     assert!(
-        fenced_after < millis(1000),
-        "fenced at the wake-up, not at the old valid_until 13.5 s on: {fenced_after:?}"
+        fenced_after < millis(200),
+        "fenced at the wake-up, not at the next check or the old valid_until 13.5 s on: \
+         {fenced_after:?}"
     );
     assert_eq!(leases.view.state(LEASE), Some(LeaseState::Expired));
     assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Stopped);
@@ -529,6 +534,94 @@ async fn a_suspend_past_valid_until_fences_at_once_on_wake_up() {
     assert_eq!(fenced[0]["data"]["reason"], "lease_expired");
     assert!(!leases.view.is_failed(), "a suspend is not a failure");
     assert!(!store.node_failed().await.unwrap());
+    leases.abort();
+}
+
+/// ADR 0240: a revoke the service takes before the wake-up's timer fires
+/// still counts the suspend. The lease's `valid_until` passed during it, so
+/// its fence has no graceful stop left, as at an expiry. The timers give an
+/// `expiring` fence 1 000 ms of graceful stop when it starts in time.
+#[tokio::test]
+async fn a_revoke_right_after_a_wake_up_counts_the_suspend() {
+    let dir = TargetDir::new("expiring-suspend-revoke");
+    let engine = Arc::new(FakeEngine::new());
+    let desired = bound(&["vm_warm"]);
+    let clock = clock();
+    let config = LeaseConfig::new(
+        "nod_test",
+        FenceTimers {
+            grace: Duration::from_secs(1),
+            force: millis(300),
+        },
+    )
+    .with_host_clock(Arc::new(clock.clone()));
+    let (leases, store) = start(&dir, &engine, &desired, config).await;
+    let vm = running_vm(&engine, "vm_warm", 2).await;
+    let mut attached = leases.link.attach();
+    let _before = grant_and_confirm(&leases, &mut attached, 15_000).await;
+
+    clock.suspend_unnoticed(Duration::from_secs(60));
+    let result = leases
+        .link
+        .revoke(
+            MsgId("msg_revoke".to_owned()),
+            None,
+            LeaseRevoke {
+                lease_id: LeaseId(LEASE.to_owned()),
+                fencing_token: 1,
+                reason: RevokeReason::Moved,
+            },
+        )
+        .await
+        .expect("the revoke is taken");
+    assert_eq!(result.status, CommandStatus::Ok);
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Stopped);
+    assert_eq!(
+        stop_counts(&engine.stop_calls()),
+        (0, 1),
+        "no graceful stop: the deadline passed during the suspend"
+    );
+    let fenced = events_of(&store, "node.fenced").await;
+    assert_eq!(fenced.len(), 1);
+    assert_eq!(fenced[0]["data"]["reason"], "lease_revoked");
+    assert!(!leases.view.is_failed());
+    leases.abort();
+}
+
+/// ADR 0240: a lease the restore brought back `uncertain` keeps instants on
+/// the lease clock, so a suspend after the restart counts against it like
+/// one before. A suspend past what is left fences it at the wake-up.
+#[tokio::test]
+async fn a_suspend_after_a_restore_fences_the_restored_lease() {
+    let dir = TargetDir::new("expiring-restore-suspend");
+    let engine = Arc::new(FakeEngine::new());
+    let desired = bound(&["vm_warm"]);
+    let clock = clock();
+    let (leases, store) = start(&dir, &engine, &desired, config(&clock)).await;
+    let vm = running_vm(&engine, "vm_warm", 2).await;
+    let mut attached = leases.link.attach();
+    let _before = grant_and_confirm(&leases, &mut attached, 15_000).await;
+    drop(attached);
+    leases.abort();
+    drop(store);
+
+    let (leases, store) = start(&dir, &engine, &desired, config(&clock)).await;
+    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Uncertain));
+    assert!(leases.view.may_keep_running(LEASE, 1));
+    let woke = Instant::now();
+    clock.suspend(Duration::from_secs(60));
+    wait_for_fence_record(&store).await;
+    let fenced_after = woke.elapsed();
+    assert!(
+        fenced_after < millis(1000),
+        "fenced at the wake-up, not 13.5 s on: {fenced_after:?}"
+    );
+    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Expired));
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Stopped);
+    let fenced = events_of(&store, "node.fenced").await;
+    assert_eq!(fenced.len(), 1);
+    assert_eq!(fenced[0]["data"]["reason"], "lease_expired");
+    assert!(!leases.view.is_failed());
     leases.abort();
 }
 
