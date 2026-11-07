@@ -161,6 +161,10 @@ impl BackendRotation {
             interval: self.probe.interval,
             timeout: self.probe.timeout,
             failures: self.probe.failures,
+            // The edge ignores `start_period_s` and `restart`, which only
+            // the node acts on (section 6.3).
+            start_period: Duration::ZERO,
+            restart: false,
         })
     }
 
@@ -865,6 +869,8 @@ mod tests {
             interval: Duration::from_secs(1),
             timeout: Duration::from_secs(1),
             failures: 1,
+            start_period: Duration::ZERO,
+            restart: false,
         };
         assert_eq!(probe_one(&target).await, Ok(()));
         assert_eq!(probe_one(&target).await, Err("HTTP 503".to_string()));

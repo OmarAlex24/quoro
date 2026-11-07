@@ -6,8 +6,9 @@
 //! because the only thing that matters is the status code, and a full client
 //! would pull in connection pooling and TLS this path does not need.
 //!
-//! Defaults are the contract's: `path` `/`, `interval_s` 10, `timeout_s` 2 and
-//! `failures` 3. Any status in `200..=399` is a pass.
+//! Defaults are the contract's: `path` `/`, `interval_s` 10, `timeout_s` 2,
+//! `failures` 3, `start_period_s` 30 and `restart` true. Any status in
+//! `200..=399` is a pass.
 
 use std::net::Ipv4Addr;
 use std::time::Duration;
@@ -24,6 +25,12 @@ pub const DEFAULT_INTERVAL_S: u32 = 10;
 pub const DEFAULT_TIMEOUT_S: u32 = 2;
 /// Default number of consecutive failures before `failing` (section 6.3).
 pub const DEFAULT_FAILURES: u32 = 3;
+/// Default time after a start during which failed probes do not count
+/// (section 6.3, ADR 0184).
+pub const DEFAULT_START_PERIOD_S: u32 = 30;
+/// Whether a VM that stays unhealthy is restarted when the snapshot does not
+/// say (section 6.3, ADR 0184).
+pub const DEFAULT_RESTART: bool = true;
 /// How long after a VM reaches running the first probe runs.
 pub const FIRST_PROBE_DELAY: Duration = Duration::from_secs(1);
 
@@ -42,6 +49,12 @@ pub struct HealthTarget {
     pub timeout: Duration,
     /// Consecutive failures before the app is reported `failing`.
     pub failures: u32,
+    /// Time after each start during which failed probes do not count; zero
+    /// counts every probe.
+    pub start_period: Duration,
+    /// Whether the node restarts the VM after `failures` consecutive
+    /// failures outside the start period, or only reports them.
+    pub restart: bool,
 }
 
 impl HealthTarget {
@@ -81,7 +94,27 @@ impl HealthTarget {
                 .and_then(|check| check.failures)
                 .unwrap_or(DEFAULT_FAILURES)
                 .max(1),
+            start_period: Duration::from_secs(u64::from(
+                check
+                    .and_then(|check| check.start_period_s)
+                    .unwrap_or(DEFAULT_START_PERIOD_S),
+            )),
+            restart: check
+                .and_then(|check| check.restart)
+                .unwrap_or(DEFAULT_RESTART),
         })
+    }
+
+    /// Whether `other` probes the same way: everything but `start_period` and
+    /// `restart`, which only decide what a failure does.
+    #[must_use]
+    pub fn probes_like(&self, other: &Self) -> bool {
+        self.ip == other.ip
+            && self.port == other.port
+            && self.path == other.path
+            && self.interval == other.interval
+            && self.timeout == other.timeout
+            && self.failures == other.failures
     }
 }
 
@@ -185,6 +218,8 @@ mod tests {
         assert_eq!(target.interval, Duration::from_secs(10));
         assert_eq!(target.timeout, Duration::from_secs(2));
         assert_eq!(target.failures, 3);
+        assert_eq!(target.start_period, Duration::from_secs(30));
+        assert!(target.restart, "a snapshot without restart means true");
         assert!(HealthTarget::for_vm(&vm(None, None), Ipv4Addr::LOCALHOST).is_none());
 
         let target = HealthTarget::for_vm(
@@ -206,6 +241,46 @@ mod tests {
         assert_eq!(target.interval, Duration::from_secs(5));
         assert_eq!(target.timeout, Duration::from_secs(1));
         assert_eq!(target.failures, 4);
+        assert_eq!(target.start_period, Duration::from_secs(30));
+        assert!(target.restart);
+
+        let target = HealthTarget::for_vm(
+            &vm(
+                Some(8080),
+                Some(HealthCheck {
+                    path: None,
+                    interval_s: None,
+                    timeout_s: None,
+                    failures: None,
+                    start_period_s: Some(0),
+                    restart: Some(false),
+                }),
+            ),
+            Ipv4Addr::LOCALHOST,
+        )
+        .unwrap();
+        assert_eq!(
+            target.start_period,
+            Duration::ZERO,
+            "zero counts every probe"
+        );
+        assert!(!target.restart);
+    }
+
+    #[test]
+    fn start_period_and_restart_do_not_change_how_the_probe_runs() {
+        let target = HealthTarget::for_vm(&vm(Some(8080), None), Ipv4Addr::LOCALHOST).unwrap();
+        let other = HealthTarget {
+            start_period: Duration::ZERO,
+            restart: false,
+            ..target.clone()
+        };
+        assert!(target.probes_like(&other));
+        let moved = HealthTarget {
+            path: "/other".to_owned(),
+            ..target.clone()
+        };
+        assert!(!target.probes_like(&moved));
     }
 
     #[test]
@@ -236,6 +311,8 @@ mod tests {
             interval: Duration::from_secs(1),
             timeout: Duration::from_secs(1),
             failures: 1,
+            start_period: Duration::ZERO,
+            restart: true,
         };
         assert_eq!(probe(&target).await, Ok(204));
         server.await.unwrap();

@@ -28,8 +28,8 @@ use quoro_node_agent::warm::VolumeLocks;
 use quoro_node_agent::{EXPIRING_START_WITHIN, LeaseTable, LeaseView, START_WITHIN};
 use quoro_proto::wire::VolumeStatus;
 use quoro_proto::wire::{
-    DesiredStatus, Health, ObservedStatus, SpecEdge, SpecNetwork, SpecVm, SpecVolumeState,
-    SpecWarm, VolumeState, WarmRole,
+    DesiredStatus, Health, HealthCheck, ObservedStatus, SpecEdge, SpecNetwork, SpecVm,
+    SpecVolumeState, SpecWarm, VolumeState, WarmRole,
 };
 
 fn ip_of(text: Option<&String>) -> Ipv4Addr {
@@ -145,6 +145,41 @@ async fn a_crashed_vm_is_restarted_with_a_backoff_and_counted() {
     assert_eq!(record.restart_count, 1);
     assert_eq!(engine.inspect(&id).await.unwrap().state, VmState::Running);
     assert_eq!(store.applied_rev().await.unwrap(), 1);
+}
+
+/// Section 6.3: a VM that exits without being asked to stop is restarted on
+/// the crash path, counted, also when the engine reads it `stopped` (a guest
+/// that powered off) rather than `crashed`. The pass after the one that saw
+/// the exit must not take it for a plain start.
+#[tokio::test]
+async fn a_vm_read_stopped_after_an_exit_nobody_asked_for_is_restarted_and_counted() {
+    let dir = TempDir::new();
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let engine = Arc::new(RecordingEngine::new());
+    let (mut reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let snap = snapshot(1, vec![spec_vm("vm_off", "prj_1", DesiredStatus::Running)]);
+    reconciler.reconcile_once(Some(&snap)).await;
+
+    // The guest powers off: the agent asked for no stop.
+    let id = VmId("vm_off".to_owned());
+    engine
+        .inner()
+        .stop(
+            &id,
+            StopMode::Force {
+                within: Duration::from_secs(1),
+            },
+        )
+        .await
+        .unwrap();
+    let statuses = reconciler.reconcile_once(Some(&snap)).await;
+    assert_eq!(statuses[0].observed_status, ObservedStatus::Stopped);
+
+    // The 1 ms test backoff has run out by now.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let statuses = reconciler.reconcile_once(Some(&snap)).await;
+    assert_eq!(statuses[0].observed_status, ObservedStatus::Running);
+    assert_eq!(statuses[0].restart_count, 1, "a crash restart is counted");
 }
 
 /// #462: a start that failed, a `Timeout` included, is tried again only
@@ -1691,5 +1726,243 @@ async fn a_reconciler_stop_under_way_gives_up_when_the_fence_is_triggered() {
     assert_eq!(answer.status, quoro_proto::CommandStatus::Ok);
     assert_eq!(engine.inspect(&id).await.unwrap().state, VmState::Stopped);
     assert!(!leases.view.fence_owns_stop("lse_raced"));
+    leases.abort();
+}
+
+/// A stateful VM of `lease_id` on 127.0.0.1 whose health check fails at
+/// once: its app port is closed, every probe counts and one failure is
+/// enough, with `restart` unset (true).
+fn unhealthy_stateful_snapshot(vm_id: &str, lease_id: &str) -> Snapshot {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let vm = SpecVm {
+        port: Some(port),
+        health_check: Some(HealthCheck {
+            path: Some("/".to_owned()),
+            interval_s: Some(1),
+            timeout_s: Some(1),
+            failures: Some(1),
+            start_period_s: Some(0),
+            restart: None,
+        }),
+        ..stateful_vm(vm_id, lease_id, 1, Vec::new())
+    };
+    snapshot_on(1, "127.0.0.0/8", "127.0.0.2", vec![vm])
+}
+
+/// Starts the local lease service over `snap` and grants it `lease_id`
+/// with token 1, with fence timers of 60 s.
+async fn granted_leases(
+    engine: Arc<RecordingEngine>,
+    store: NodeStore,
+    snap: &Snapshot,
+    lease_id: &str,
+) -> (
+    quoro_node_agent::LocalLeases,
+    tokio::sync::watch::Sender<Option<Snapshot>>,
+) {
+    let (desired, desired_rx) = tokio::sync::watch::channel(Some(snap.clone()));
+    let leases = quoro_node_agent::start_local_leases(
+        engine,
+        store,
+        quoro_node_agent::LeaseConfig::new(
+            "nod_test",
+            quoro_node_agent::FenceTimers {
+                grace: Duration::from_secs(60),
+                force: Duration::from_secs(60),
+            },
+        ),
+        desired_rx,
+    )
+    .await
+    .unwrap();
+    leases
+        .link
+        .grant(
+            quoro_proto::MsgId("msg_grant".to_owned()),
+            None,
+            quoro_proto::LeaseGrant {
+                lease_id: quoro_proto::LeaseId(lease_id.to_owned()),
+                resource_type: quoro_proto::ResourceType::App,
+                resource_id: format!("app_{lease_id}"),
+                mode: quoro_proto::LeaseMode::Local,
+                fencing_token: 1,
+                duration_ms: None,
+                granted_at: "2026-11-02T10:15:33Z".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    (leases, desired)
+}
+
+/// Revokes `lease_id` (token 1) in the background.
+fn revoke(
+    leases: &quoro_node_agent::LocalLeases,
+    lease_id: &str,
+) -> tokio::task::JoinHandle<Result<quoro_proto::CommandResult, quoro_proto::ProtocolError>> {
+    let link = leases.link.clone();
+    let lease_id = lease_id.to_owned();
+    tokio::spawn(async move {
+        link.revoke(
+            quoro_proto::MsgId("msg_revoke".to_owned()),
+            None,
+            quoro_proto::LeaseRevoke {
+                lease_id: quoro_proto::LeaseId(lease_id),
+                fencing_token: 1,
+                reason: quoro_proto::RevokeReason::Deleted,
+            },
+        )
+        .await
+    })
+}
+
+/// Section 6.3 with section 8.5 step 1: a health restart's stop that is
+/// under way when a fence of the VM's lease is triggered gives up at once,
+/// the fence stops the VM, and nothing starts it again.
+#[tokio::test]
+async fn a_health_stop_under_way_gives_up_for_the_fence_and_nothing_restarts() {
+    let dir = TempDir::new();
+    let engine = Arc::new(RecordingEngine::new());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let snap = unhealthy_stateful_snapshot("vm_sick", "lse_sick");
+    let (leases, _desired) = granted_leases(engine.clone(), store.clone(), &snap, "lse_sick").await;
+    let (reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let mut reconciler = reconciler.with_lease_view(leases.view.clone());
+    let id = VmId("vm_sick".to_owned());
+
+    reconciler.reconcile_once(Some(&snap)).await;
+    assert_eq!(engine.inspect(&id).await.unwrap().state, VmState::Running);
+    // The first probe fails: the next pass stops the VM for a restart.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    reconciler.reconcile_once(Some(&snap)).await;
+    assert!(engine.stops().is_empty());
+
+    // That stop takes 3 s, and the lease is revoked while it runs.
+    engine.inner().set_stop_delay(&id, Duration::from_secs(3));
+    let pass_snap = snap.clone();
+    let stopping = tokio::spawn(async move {
+        reconciler.reconcile_once(Some(&pass_snap)).await;
+        reconciler
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while engine.inner().stop_calls().is_empty() {
+        assert!(Instant::now() < deadline, "the health restart stops the VM");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let revoked = revoke(&leases, "lse_sick");
+    let mut reconciler = tokio::time::timeout(Duration::from_secs(1), stopping)
+        .await
+        .expect("the health stop gives up for the fence")
+        .unwrap();
+
+    let answer = revoked.await.unwrap().expect("the revoke is answered");
+    assert_eq!(answer.status, quoro_proto::CommandStatus::Ok);
+    assert_eq!(engine.inspect(&id).await.unwrap().state, VmState::Stopped);
+    let fence_stop = StopMode::Graceful {
+        timeout: Duration::from_secs(60),
+        force_within: Duration::from_secs(60),
+    };
+    assert!(
+        engine
+            .inner()
+            .stop_calls()
+            .iter()
+            .any(|(_, mode)| *mode == fence_stop),
+        "the fence stops the VM"
+    );
+
+    // Past any backoff: the fenced VM stays stopped.
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        reconciler.reconcile_once(Some(&snap)).await;
+    }
+    assert_eq!(engine.inspect(&id).await.unwrap().state, VmState::Stopped);
+    assert_eq!(engine.starts().len(), 1, "only the first start");
+    assert_eq!(
+        store
+            .vm_record("vm_sick")
+            .await
+            .unwrap()
+            .unwrap()
+            .restart_count,
+        0
+    );
+    leases.abort();
+}
+
+/// Section 6.3 with section 6.4: a stateful VM stopped by a health restart
+/// starts again only while its lease is `held`. A revoke during the restart
+/// backoff leaves it stopped.
+#[tokio::test]
+async fn a_revoke_during_the_health_restart_backoff_keeps_the_vm_stopped() {
+    let dir = TempDir::new();
+    let engine = Arc::new(RecordingEngine::new());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let snap = unhealthy_stateful_snapshot("vm_wait", "lse_wait");
+    let (leases, _desired) = granted_leases(engine.clone(), store.clone(), &snap, "lse_wait").await;
+    let (reconciler, _observed) = Reconciler::new(
+        engine.clone(),
+        store.clone(),
+        reconcile_config(),
+        ReconcileOptions {
+            backoff_base: Duration::from_millis(500),
+            backoff_max: Duration::from_secs(4),
+            ..options()
+        },
+    );
+    let mut reconciler = reconciler.with_lease_view(leases.view.clone());
+    let id = VmId("vm_wait".to_owned());
+
+    reconciler.reconcile_once(Some(&snap)).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    reconciler.reconcile_once(Some(&snap)).await;
+    // The health restart stops the VM; its start waits out 500 ms.
+    reconciler.reconcile_once(Some(&snap)).await;
+    assert_eq!(engine.stops().len(), 1);
+    assert_eq!(engine.inspect(&id).await.unwrap().state, VmState::Stopped);
+
+    let answer = revoke(&leases, "lse_wait")
+        .await
+        .unwrap()
+        .expect("the revoke is answered");
+    assert_eq!(answer.status, quoro_proto::CommandStatus::Ok);
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    for _ in 0..3 {
+        reconciler.reconcile_once(Some(&snap)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(engine.inspect(&id).await.unwrap().state, VmState::Stopped);
+    assert_eq!(engine.starts().len(), 1, "only the first start");
+    leases.abort();
+}
+
+/// The same VM with its lease kept: after the backoff the health restart
+/// starts it again, so the test above shows the revoke at work.
+#[tokio::test]
+async fn a_held_lease_lets_the_health_restart_start_the_vm_again() {
+    let dir = TempDir::new();
+    let engine = Arc::new(RecordingEngine::new());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let snap = unhealthy_stateful_snapshot("vm_back", "lse_back");
+    let (leases, _desired) = granted_leases(engine.clone(), store.clone(), &snap, "lse_back").await;
+    let (reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let mut reconciler = reconciler.with_lease_view(leases.view.clone());
+    let id = VmId("vm_back".to_owned());
+
+    reconciler.reconcile_once(Some(&snap)).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    reconciler.reconcile_once(Some(&snap)).await;
+    reconciler.reconcile_once(Some(&snap)).await;
+    assert_eq!(engine.stops().len(), 1);
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let statuses = reconciler.reconcile_once(Some(&snap)).await;
+    assert_eq!(engine.inspect(&id).await.unwrap().state, VmState::Running);
+    assert_eq!(engine.starts().len(), 2);
+    assert_eq!(statuses[0].restart_count, 1);
     leases.abort();
 }
