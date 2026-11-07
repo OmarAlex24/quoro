@@ -1966,3 +1966,66 @@ async fn a_held_lease_lets_the_health_restart_start_the_vm_again() {
     assert_eq!(statuses[0].restart_count, 1);
     leases.abort();
 }
+
+/// A view whose `expiring` lease is `uncertain`: its renewal went
+/// unanswered for a third of its 15 s duration, and `valid_until` is still
+/// ahead (section 8.4). Its running VMs keep running; nothing starts.
+fn uncertain_lease_view(lease_id: &str, app_id: &str, token: u64) -> LeaseView {
+    let mut table = expiring_lease_table(lease_id, app_id, token);
+    let now = tokio::time::Instant::now();
+    table.renew_sent(
+        &quoro_proto::LeaseId(lease_id.to_owned()),
+        quoro_proto::MsgId("msg_renew_2".to_owned()),
+        &quoro_node_agent::HostNow::unknown(now),
+    );
+    // The renewal it asks to send is not wanted here.
+    let _ = table.poll(now + Duration::from_millis(5100));
+    let view = LeaseView::new(table, false);
+    assert!(view.may_keep_running(lease_id, token));
+    assert!(!view.may_start_stateful(lease_id, token));
+    view
+}
+
+/// Sections 6.3 and 8.4: under an `uncertain` lease a stateful VM whose
+/// health check keeps failing keeps running, since it could not start
+/// again. Once the lease is `held` again, the health restart goes ahead.
+#[tokio::test]
+async fn an_uncertain_lease_keeps_an_unhealthy_stateful_vm_running_until_it_is_held() {
+    let dir = TempDir::new();
+    let engine = Arc::new(RecordingEngine::new());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let snap = unhealthy_stateful_snapshot("vm_unsure", "lse_unsure");
+    let (reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let held = || LeaseView::new(local_lease_table("lse_unsure", "app_unsure", 1), false);
+    let mut reconciler = reconciler.with_lease_view(held());
+    let id = VmId("vm_unsure".to_owned());
+
+    reconciler.reconcile_once(Some(&snap)).await;
+    assert_eq!(engine.inspect(&id).await.unwrap().state, VmState::Running);
+
+    let mut reconciler =
+        reconciler.with_lease_view(uncertain_lease_view("lse_unsure", "app_unsure", 1));
+    for _ in 0..2 {
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        reconciler.reconcile_once(Some(&snap)).await;
+        reconciler.reconcile_once(Some(&snap)).await;
+    }
+    let statuses = reconciler.reconcile_once(Some(&snap)).await;
+    assert!(
+        engine.stops().is_empty(),
+        "nothing is stopped for its health"
+    );
+    assert_eq!(statuses[0].observed_status, ObservedStatus::Running);
+    assert_eq!(statuses[0].health, Health::Failing);
+
+    // Held again: the next counted failure restarts the VM.
+    let mut reconciler = reconciler.with_lease_view(held());
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    reconciler.reconcile_once(Some(&snap)).await;
+    reconciler.reconcile_once(Some(&snap)).await;
+    assert_eq!(engine.stops().len(), 1);
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let statuses = reconciler.reconcile_once(Some(&snap)).await;
+    assert_eq!(statuses[0].observed_status, ObservedStatus::Running);
+    assert_eq!(statuses[0].restart_count, 1);
+}

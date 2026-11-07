@@ -513,13 +513,13 @@ impl<E: Engine + 'static> Reconciler<E> {
                     self.reconcile_once(current.as_ref()).await;
                 }
                 _ = health_tick.tick() => {
-                    self.health_pass(current.as_ref()).await;
-                    // A health restart is due: a pass stops the VM now
-                    // rather than at the next tick.
-                    if self.health_restarts.is_empty() {
-                        self.publish().await;
-                    } else {
+                    // A health restart was just asked for: a pass stops the
+                    // VM now rather than at the next tick. One that a pass
+                    // could not carry out yet waits for the tick.
+                    if self.health_pass(current.as_ref()).await {
                         self.reconcile_once(current.as_ref()).await;
+                    } else {
+                        self.publish().await;
                     }
                 }
             }
@@ -1149,62 +1149,6 @@ impl<E: Engine + 'static> Reconciler<E> {
         };
         let mut reached = true;
 
-        // Section 6.3 (ADR 0184): a VM whose health check failed past its
-        // threshold outside the start period is stopped here and started
-        // again below on the crash path, with its backoff. A fence of a
-        // stateful VM's lease stops the VM itself (section 8.5), so a VM it
-        // is stopping is left to it. Starting the VM again needs the lease
-        // like any stateful start (section 6.4): without it the VM stays
-        // stopped.
-        if self.health_restarts.contains(&vm_id) {
-            if vm.desired_status != DesiredStatus::Running
-                || info.state != VmState::Running
-                || !restarts_when_unhealthy(vm)
-            {
-                self.health_restarts.remove(&vm_id);
-            } else if self.fence_owns_stop(vm) {
-                self.health_restarts.remove(&vm_id);
-                debug!(
-                    vm_id,
-                    "a fence of the VM's lease is stopping it; no health restart"
-                );
-            } else {
-                match self.unless_fenced(vm, self.stop_vm(&id)).await {
-                    None => {
-                        self.health_restarts.remove(&vm_id);
-                        debug!(
-                            vm_id,
-                            "a fence of the VM's lease took over its stop; no health restart"
-                        );
-                        return false;
-                    }
-                    Some(Ok(stopped)) => {
-                        self.health_restarts.remove(&vm_id);
-                        self.restarts_due.insert(vm_id.clone());
-                        if let Some(state) = self.health.get_mut(&vm_id) {
-                            state.run_ended = true;
-                        }
-                        warn!(
-                            vm_id,
-                            "stopped a VM whose health check kept failing; it starts again after the backoff"
-                        );
-                        self.deployment_line(
-                            vm,
-                            "health",
-                            "VM stopped after its health check kept failing; it starts again after the restart backoff",
-                        )
-                        .await;
-                        info = stopped;
-                    }
-                    Some(Err(e)) => {
-                        // Tried again on the next pass.
-                        warn!(vm_id, error = ?e, "could not stop a VM whose health check kept failing");
-                        return false;
-                    }
-                }
-            }
-        }
-
         // Section 6.4: a stateful VM starts only while its lease is `held`
         // with exactly the spec's token, and a VM whose volume is not `ready`
         // stays stopped. Neither is an error: the primary moved the lease or
@@ -1235,8 +1179,92 @@ impl<E: Engine + 'static> Reconciler<E> {
                 may_keep_running,
                 "the VM waits to start, or keeps running without restarts"
             );
+            // A health restart waits until the VM may start again; the next
+            // counted failure asks for it again.
+            self.drop_health_restart(&vm_id);
             self.remember(&vm_id, info.state);
             return true;
+        }
+
+        // Section 6.3 (ADR 0184): a VM whose health check failed past its
+        // threshold outside the start period is stopped here and started
+        // again below on the crash path, with its backoff. It is stopped only
+        // when it may start again: a stateful VM under a lease that is not
+        // `held` keeps running (section 8.4) and waits, since a stop could
+        // not be followed by a start. A lease that leaves `held` between the
+        // stop and the start leaves it stopped (section 6.4). A fence of the
+        // lease stops the VM itself (section 8.5), so a VM it is stopping is
+        // left to it.
+        if self.health_restarts.contains(&vm_id) {
+            let still_failing = self.health.get(&vm_id).is_some_and(|state| {
+                state.status == Health::Failing
+                    && HealthTarget::for_vm(vm, state.target.ip)
+                        .is_some_and(|target| target.probes_like(&state.target))
+            });
+            if vm.desired_status != DesiredStatus::Running
+                || info.state != VmState::Running
+                || !restarts_when_unhealthy(vm)
+                || !still_failing
+            {
+                self.drop_health_restart(&vm_id);
+            } else if self.fence_owns_stop(vm) {
+                self.drop_health_restart(&vm_id);
+                debug!(
+                    vm_id,
+                    "a fence of the VM's lease is stopping it; no health restart"
+                );
+            } else {
+                match self.unless_fenced(vm, self.stop_vm(&id)).await {
+                    None => {
+                        self.drop_health_restart(&vm_id);
+                        debug!(
+                            vm_id,
+                            "a fence of the VM's lease took over its stop; no health restart"
+                        );
+                        return false;
+                    }
+                    Some(Ok(stopped)) => {
+                        self.health_restarts.remove(&vm_id);
+                        self.restarts_due.insert(vm_id.clone());
+                        if let Some(state) = self.health.get_mut(&vm_id) {
+                            state.run_ended = true;
+                        }
+                        warn!(
+                            vm_id,
+                            "stopped a VM whose health check kept failing; it starts again after the backoff"
+                        );
+                        self.deployment_line(
+                            vm,
+                            "health",
+                            "VM stopped after its health check kept failing; it starts again after the restart backoff",
+                        )
+                        .await;
+                        info = stopped;
+                    }
+                    Some(Err(e)) => {
+                        // Given up until the VM starts again: the request
+                        // goes and the run's `restart_asked` stays. A stop
+                        // that failed after its graceful and forced attempts
+                        // would hold every pass for its whole bound if it
+                        // were tried again on each.
+                        self.health_restarts.remove(&vm_id);
+                        warn!(
+                            vm_id,
+                            error = ?e,
+                            "could not stop a VM whose health check kept failing; no health restart until it starts again"
+                        );
+                        self.deployment_line(
+                            vm,
+                            "health",
+                            &format!(
+                                "could not stop the VM for a health restart: {e}; it is not restarted for its health until it starts again"
+                            ),
+                        )
+                        .await;
+                        return false;
+                    }
+                }
+            }
         }
 
         if let Some(known) = self.known_digest(&vm_id).await
@@ -1451,6 +1479,8 @@ impl<E: Engine + 'static> Reconciler<E> {
         }
 
         if info.state == VmState::Running {
+            // Running again, however it got there: no crash restart is due.
+            self.restarts_due.remove(&vm_id);
             let now = Instant::now();
             let healthy_after = self.options.healthy_after;
             let base = self.options.backoff_base;
@@ -1746,18 +1776,19 @@ impl<E: Engine + 'static> Reconciler<E> {
     /// pass, so a deployment sees its first pass about a second after the VM
     /// reaches running. A check that failed past its threshold outside the
     /// start period, with `restart` on, queues a health restart for the next
-    /// reconcile pass (section 6.3).
-    pub async fn health_pass(&mut self, snapshot: Option<&Snapshot>) {
+    /// reconcile pass (section 6.3). Returns whether it queued one.
+    pub async fn health_pass(&mut self, snapshot: Option<&Snapshot>) -> bool {
         let Some(snapshot) = snapshot else {
-            return;
+            return false;
         };
         let infos = match self.engine.list().await {
             Ok(infos) => infos,
             Err(e) => {
                 warn!(error = ?e, "could not list VMs for health checks");
-                return;
+                return false;
             }
         };
+        let mut queued = false;
         let started: HashMap<String, Option<SystemTime>> = infos
             .iter()
             .filter(|info| info.state == VmState::Running)
@@ -1884,6 +1915,7 @@ impl<E: Engine + 'static> Reconciler<E> {
             if state.target.restart && failures >= state.target.failures && !state.restart_asked {
                 state.restart_asked = true;
                 self.health_restarts.insert(vm_id.clone());
+                queued = true;
                 warn!(
                     vm_id,
                     failures, "the VM's health check kept failing; restarting it"
@@ -1923,6 +1955,7 @@ impl<E: Engine + 'static> Reconciler<E> {
                 }
             }
         }
+        queued
     }
 
     /// The image digest the VM was created with, if it is on record.
@@ -1974,6 +2007,16 @@ impl<E: Engine + 'static> Reconciler<E> {
             return None;
         };
         self.lease.start_permit(lease_id, token).await.map(Some)
+    }
+
+    /// Drops a queued health restart that is not carried out, so the next
+    /// failure counted for the run asks for it again (section 6.3).
+    fn drop_health_restart(&mut self, vm_id: &str) {
+        if self.health_restarts.remove(vm_id)
+            && let Some(state) = self.health.get_mut(vm_id)
+        {
+            state.restart_asked = false;
+        }
     }
 
     /// Whether a fence of the stateful VM's lease is stopping it: then the
@@ -3071,6 +3114,84 @@ mod tests {
         assert_eq!(app_events(&store).await, ["app.down"]);
         assert!(engine.stop_calls().is_empty());
         assert_eq!(engine.inspect(&id).await.unwrap().state, VmState::Running);
+        server.abort();
+    }
+
+    /// A health stop that fails is given up until the VM starts again: it is
+    /// not tried on every pass, where each try of a VMM that hangs could hold
+    /// the reconciler for the stop's whole bound.
+    #[tokio::test]
+    async fn a_failed_health_stop_is_not_tried_again_on_every_pass() {
+        use quoro_engine::{FakeEngine, FakeOp};
+
+        let healthy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (port, server) = switchable_server(Arc::clone(&healthy)).await;
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let engine = Arc::new(FakeEngine::new());
+        let mut reconciler =
+            health_reconciler(Arc::clone(&engine), store.clone(), Duration::from_millis(1));
+        let snapshot = health_snapshot_with(port, check(0, None));
+
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        tokio::time::sleep(NEXT_PROBE).await;
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        // The one try fails. The fake logs only the stops it carries out, so
+        // a second try, which would succeed, would show in `stop_calls`.
+        engine.fail_next(FakeOp::Stop, EngineError::Timeout);
+        reconciler.reconcile_once(Some(&snapshot)).await;
+        let lines = store
+            .query_deployment_lines("dep_1", Some("health"))
+            .await
+            .unwrap();
+        assert!(
+            lines.iter().any(|line| line
+                .message
+                .starts_with("could not stop the VM for a health restart")),
+            "{lines:?}"
+        );
+
+        // More failed probes and passes: no second try in this run.
+        for _ in 0..2 {
+            tokio::time::sleep(NEXT_PROBE).await;
+            reconciler.reconcile_once(Some(&snapshot)).await;
+            reconciler.reconcile_once(Some(&snapshot)).await;
+        }
+        assert!(engine.stop_calls().is_empty(), "no second try");
+        let statuses = reconciler.reconcile_once(Some(&snapshot)).await;
+        assert_eq!(statuses[0].observed_status, ObservedStatus::Running);
+        assert_eq!(statuses[0].health, Health::Failing, "still reported");
+        server.abort();
+    }
+
+    /// A queued health restart that a pass drops without trying a stop (here
+    /// because `restart` went false for a while) is asked for again by the
+    /// next failure counted for the run.
+    #[tokio::test]
+    async fn a_dropped_health_restart_is_asked_again_at_the_next_counted_failure() {
+        use quoro_engine::FakeEngine;
+
+        let healthy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (port, server) = switchable_server(Arc::clone(&healthy)).await;
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let engine = Arc::new(FakeEngine::new());
+        let mut reconciler =
+            health_reconciler(Arc::clone(&engine), store.clone(), Duration::from_millis(1));
+        let restarting = health_snapshot_with(port, check(0, None));
+        let reporting = health_snapshot_with(port, check(0, Some(false)));
+
+        reconciler.reconcile_once(Some(&restarting)).await;
+        tokio::time::sleep(NEXT_PROBE).await;
+        reconciler.reconcile_once(Some(&restarting)).await;
+        // The request is queued; this snapshot turns restarts off.
+        reconciler.reconcile_once(Some(&reporting)).await;
+        assert!(engine.stop_calls().is_empty(), "restart is false");
+
+        tokio::time::sleep(NEXT_PROBE).await;
+        reconciler.reconcile_once(Some(&restarting)).await;
+        reconciler.reconcile_once(Some(&restarting)).await;
+        assert_eq!(engine.stop_calls().len(), 1, "asked for again");
         server.abort();
     }
 }
