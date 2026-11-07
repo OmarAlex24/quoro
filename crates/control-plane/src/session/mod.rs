@@ -325,8 +325,9 @@ struct HubInner {
     /// only ([`NodeHub::swap_warm_facts`]).
     warm_facts: Mutex<HashMap<String, crate::warm::WarmFacts>>,
     /// The volume ids `spec.volumes` named in the newest snapshot sent to
-    /// each node, in memory only ([`NodeHub::apply_warm_report`]).
-    warm_named: Mutex<HashMap<String, BTreeSet<String>>>,
+    /// each node, with the generation of the session that sent it, in memory
+    /// only ([`NodeHub::apply_warm_report`]).
+    warm_named: Mutex<HashMap<String, (u64, BTreeSet<String>)>>,
     /// Free space on the volume filesystem each node last reported
     /// (`status_report.disk_free_gb`, section 5.3).
     disk_free_gb: Mutex<HashMap<String, f64>>,
@@ -741,20 +742,20 @@ impl NodeHub {
             .unwrap_or_default()
     }
 
-    /// Keeps the newest `status_report.warm` of `node_id`, and rebuilds its
-    /// snapshot when a copy it holds as a warm node may need a `deleted`
-    /// entry (section 5.11, ADR 0267):
-    /// - when the copies it reports change;
-    /// - when it reports a copy its newest snapshot does not name: one kept
-    ///   because a failover may still need it. Nothing else wakes the node
-    ///   once the database makes such a copy stale, as when the lease is
-    ///   granted again or the volume or its app is deleted. The node reports
-    ///   at least every 30 s, so its entry follows within that. A rebuild that
-    ///   changes nothing sends nothing.
+    /// Keeps the newest `status_report.warm` of `node_id`. A change in the
+    /// copies it holds as a warm node rebuilds its snapshot, because such a
+    /// copy may get a `deleted` entry (section 5.11, ADR 0267); a new
+    /// snapshot number or lag changes only `App.warm`, which is read from
+    /// here.
     ///
-    /// A new snapshot number or lag changes only `App.warm`, which is read
-    /// from here.
-    fn apply_warm_report(&self, node_id: &str, report: &[wire::WarmStatus]) {
+    /// Returns the copies it reports that its newest snapshot does not name,
+    /// when the reported set did not change: copies kept because a failover
+    /// may still need them ([`NodeHub::recheck_kept_copies`]).
+    fn apply_warm_report(
+        &self,
+        node_id: &str,
+        report: &[wire::WarmStatus],
+    ) -> Vec<(String, String)> {
         let reported = crate::warm::reported_targets(report);
         let changed = {
             let mut reports = self.0.warm_reports.lock().expect("warm report lock");
@@ -769,31 +770,54 @@ impl NodeHub {
             }
             before != reported
         };
-        let kept = {
-            let named = self.0.warm_named.lock().expect("warm named lock");
-            let named = named.get(node_id);
-            reported
-                .iter()
-                .any(|(volume_id, _)| !named.is_some_and(|named| named.contains(volume_id)))
-        };
-        if changed || kept {
+        if changed {
             self.node_changed(node_id);
+            return Vec::new();
+        }
+        let named = self.0.warm_named.lock().expect("warm named lock");
+        let named = named.get(node_id).map(|(_, named)| named);
+        reported
+            .into_iter()
+            .filter(|(volume_id, _)| !named.is_some_and(|named| named.contains(volume_id)))
+            .collect()
+    }
+
+    /// Rebuilds `node_id`'s snapshot once a copy it keeps (`kept`, from
+    /// [`NodeHub::apply_warm_report`]) no longer needs keeping, so it gets its
+    /// `deleted` entry (section 5.11, ADR 0267). Nothing else wakes the node
+    /// when the database makes such a copy stale, as when the source's lease
+    /// is granted again or the volume or its app is deleted, so each of the
+    /// node's reports asks again. Only the copies' rows are read; the
+    /// snapshot is built only when one of them is stale.
+    async fn recheck_kept_copies(&self, node_id: &str, kept: &[(String, String)]) {
+        // No pairs: a copy whose pair names this node as its warm node is
+        // never stale anyway (`copy_is_stale`).
+        match crate::warm::stale_copies(self.0.store.pool(), node_id, kept, &[]).await {
+            Ok(stale) if !stale.is_empty() => self.node_changed(node_id),
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(node_id, error = %e, "cannot check the warm copies a node keeps");
+            }
         }
     }
 
-    /// Records the volume ids `spec.volumes` names in the snapshot just sent
-    /// to `node_id` ([`NodeHub::apply_warm_report`]).
-    fn record_warm_named(&self, node_id: &str, spec: &wire::Spec) {
-        let named = spec
+    /// Records the volume ids `spec.volumes` names in the snapshot that the
+    /// session of `generation` just sent to `node_id`
+    /// ([`NodeHub::apply_warm_report`]). An older session that sent its
+    /// snapshot first never overwrites a newer one's.
+    fn record_warm_named(&self, node_id: &str, generation: u64, spec: &wire::Spec) {
+        let named: BTreeSet<String> = spec
             .volumes
             .iter()
             .map(|file| file.volume_id.clone())
             .collect();
-        self.0
-            .warm_named
-            .lock()
-            .expect("warm named lock")
-            .insert(node_id.to_string(), named);
+        let mut all = self.0.warm_named.lock().expect("warm named lock");
+        if all
+            .get(node_id)
+            .is_none_or(|(recorded, _)| *recorded <= generation)
+        {
+            all.insert(node_id.to_string(), (generation, named));
+        }
     }
 
     /// Records the warm facts of the snapshot just sent to `node_id` and
@@ -2803,7 +2827,8 @@ impl Session {
                 self.hub.node_changed(&peer);
             }
         }
-        self.hub.record_warm_named(&self.node_id, &spec);
+        self.hub
+            .record_warm_named(&self.node_id, self.generation, &spec);
         self.last_spec = Some(spec);
         self.hub.tunnel_changed(&self.node_id);
         Ok(())
@@ -3202,7 +3227,10 @@ async fn apply_status_report(
     notified_deleted: &mut HashSet<String>,
 ) -> Result<(), String> {
     // First, so a database error on a VM below never loses it.
-    hub.apply_warm_report(node_id, &report.warm);
+    let kept = hub.apply_warm_report(node_id, &report.warm);
+    if !kept.is_empty() {
+        hub.recheck_kept_copies(node_id, &kept).await;
+    }
     for vm in &report.vms {
         let row = sqlx::query(
             "SELECT node_id, app_id, ip, observed_status, \
