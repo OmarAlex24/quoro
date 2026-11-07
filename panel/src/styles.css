@@ -1,42 +1,190 @@
 @import 'tailwindcss';
 
 /*
- * The machine-room chassis. Every colour in the panel comes from these tokens;
- * the lamp palette encodes desired (outer ring) vs observed (core) state.
+ * Every colour in the panel comes from these tokens. Dark is the default and
+ * light is designed on its own, not inverted. The theme follows
+ * `prefers-color-scheme`; `data-theme="dark"` or `"light"` on <html> overrides
+ * it. Greys lean blue to sit with the accent. run, shift, fault and idle
+ * are states; the kind colours (git, image, template, VM) say what a thing is
+ * and never how it is doing.
+ */
+:root {
+  color-scheme: dark;
+  --ground: #0c0e13;
+  --canvas: #0f1219;
+  --surface: #151923;
+  --raised: #1a1f2a;
+  --sunk: #10131a;
+  --line: #252b39;
+  --line-2: #343c4e;
+  --dot: #232a3a;
+  --ink: #e8ebf3;
+  --ink-2: #a3abbd;
+  --ink-3: #6e768b;
+  --accent: #8196ff;
+  --accent-solid: #4a63f0;
+  --on-accent: #ffffff;
+  --run: #3dbe7e;
+  --shift: #e9aa3b;
+  --fault: #f2624f;
+  --idle: #6f778b;
+  --surface-hi: #1a1f2b;
+  --ion: #5ed0f2;
+  --violet: #b494ff;
+  --k-git: #8196ff;
+  --k-image: #52c7e3;
+  --k-tpl: #b494ff;
+  --k-vm: #e68ccf;
+  --scrim: rgb(6 8 13 / 0.55);
+  --shadow: 0 18px 40px -18px rgb(0 0 0 / 0.7);
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme='dark']) {
+    color-scheme: light;
+    --ground: #e8ebf1;
+    --canvas: #f1f3f7;
+    --surface: #ffffff;
+    --raised: #ffffff;
+    --sunk: #f3f5f8;
+    --line: #dce0e8;
+    --line-2: #c6ccd8;
+    --dot: #cdd3de;
+    --ink: #11151e;
+    --ink-2: #4b5467;
+    --ink-3: #737c90;
+    --accent: #2643b5;
+    --accent-solid: #2643b5;
+    --on-accent: #ffffff;
+    --run: #1a9657;
+    --shift: #b57a05;
+    --fault: #cc3b2a;
+    --idle: #8a93a5;
+    --surface-hi: #ffffff;
+    --ion: #0b8db5;
+    --violet: #6a47d8;
+    --k-git: #2643b5;
+    --k-image: #0a84a6;
+    --k-tpl: #6a47d8;
+    --k-vm: #b03a95;
+    --scrim: rgb(20 26 40 / 0.22);
+    --shadow: 0 18px 40px -20px rgb(20 30 60 / 0.35);
+  }
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+  --ground: #e8ebf1;
+  --canvas: #f1f3f7;
+  --surface: #ffffff;
+  --raised: #ffffff;
+  --sunk: #f3f5f8;
+  --line: #dce0e8;
+  --line-2: #c6ccd8;
+  --dot: #cdd3de;
+  --ink: #11151e;
+  --ink-2: #4b5467;
+  --ink-3: #737c90;
+  --accent: #2643b5;
+  --accent-solid: #2643b5;
+  --on-accent: #ffffff;
+  --run: #1a9657;
+  --shift: #b57a05;
+  --fault: #cc3b2a;
+  --idle: #8a93a5;
+  --surface-hi: #ffffff;
+  --ion: #0b8db5;
+  --violet: #6a47d8;
+  --k-git: #2643b5;
+  --k-image: #0a84a6;
+  --k-tpl: #6a47d8;
+  --k-vm: #b03a95;
+  --scrim: rgb(20 26 40 / 0.22);
+  --shadow: 0 18px 40px -20px rgb(20 30 60 / 0.35);
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --ground: #0c0e13;
+  --canvas: #0f1219;
+  --surface: #151923;
+  --raised: #1a1f2a;
+  --sunk: #10131a;
+  --line: #252b39;
+  --line-2: #343c4e;
+  --dot: #232a3a;
+  --ink: #e8ebf3;
+  --ink-2: #a3abbd;
+  --ink-3: #6e768b;
+  --accent: #8196ff;
+  --accent-solid: #4a63f0;
+  --on-accent: #ffffff;
+  --run: #3dbe7e;
+  --shift: #e9aa3b;
+  --fault: #f2624f;
+  --idle: #6f778b;
+  --surface-hi: #1a1f2b;
+  --ion: #5ed0f2;
+  --violet: #b494ff;
+  --k-git: #8196ff;
+  --k-image: #52c7e3;
+  --k-tpl: #b494ff;
+  --k-vm: #e68ccf;
+  --scrim: rgb(6 8 13 / 0.55);
+  --shadow: 0 18px 40px -18px rgb(0 0 0 / 0.7);
+}
+
+/*
+ * Tailwind sees only the tokens: the default palette is dropped, so a utility
+ * like `bg-gray-500` or `text-white` does not exist here. `inline` makes each
+ * utility read the live token, so both themes switch without a rebuild.
  */
 @theme {
-  --font-sans: 'Archivo Variable', ui-sans-serif, system-ui, sans-serif;
+  --color-*: initial;
+  --font-sans: 'Archivo Variable', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'Martian Mono Variable', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+}
 
-  --color-enamel: #dce1e5;
-  --color-panel: #f3f5f7;
-  --color-rail: #c5ccd3;
-  --color-recess: #cdd4da;
-
-  --color-ink: #142030;
-  --color-ink-muted: #5b6878;
-
-  --color-cobalt: #2643b5;
-  --color-cobalt-deep: #1a3290;
-
-  --color-lamp-run: #1f9d5a;
-  --color-lamp-shift: #e3a008;
-  --color-lamp-fault: #d0412f;
-  --color-lamp-idle: #9aa5b1;
-  --color-lamp-unknown: #6b5fa8;
-
-  --radius-bay: 6px;
+@theme inline {
+  --color-ground: var(--ground);
+  --color-canvas: var(--canvas);
+  --color-surface: var(--surface);
+  --color-surface-hi: var(--surface-hi);
+  --color-raised: var(--raised);
+  --color-sunk: var(--sunk);
+  --color-line: var(--line);
+  --color-line-2: var(--line-2);
+  --color-dot: var(--dot);
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-accent: var(--accent);
+  --color-accent-solid: var(--accent-solid);
+  --color-on-accent: var(--on-accent);
+  --color-ion: var(--ion);
+  --color-violet: var(--violet);
+  --color-run: var(--run);
+  --color-shift: var(--shift);
+  --color-fault: var(--fault);
+  --color-idle: var(--idle);
+  --color-k-git: var(--k-git);
+  --color-k-image: var(--k-image);
+  --color-k-tpl: var(--k-tpl);
+  --color-k-vm: var(--k-vm);
+  --color-scrim: var(--scrim);
 }
 
 @layer base {
+  /*
+   * The root size stays at 15 px because every rem-based space in the layout
+   * is measured from it; the interface text size is set on body.
+   */
   html {
-    background-color: var(--color-enamel);
-    color: var(--color-ink);
+    background-color: var(--ground);
+    color: var(--ink);
     font-family: var(--font-sans);
     font-size: 15px;
     line-height: 1.5;
-    font-variation-settings:
-      'wdth' 100,
-      'wght' 400;
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
   }
@@ -44,15 +192,18 @@
   body {
     margin: 0;
     min-height: 100dvh;
+    background-color: var(--ground);
+    font-size: 13.5px;
+    line-height: 1.45;
   }
 
   ::selection {
-    background-color: var(--color-cobalt);
-    color: #fff;
+    background-color: var(--accent-solid);
+    color: var(--on-accent);
   }
 
   :focus-visible {
-    outline: 2px solid var(--color-cobalt);
+    outline: 2px solid var(--accent);
     outline-offset: 2px;
   }
 
@@ -73,105 +224,317 @@
 }
 
 @layer components {
-  /* Engraved plate lettering: expanded, heavy, spaced capitals. */
+  /* Titles: Archivo widened, never shouted. Sentence case everywhere. */
   .type-display {
-    font-variation-settings:
-      'wdth' 125,
-      'wght' 750;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
+    font-stretch: 118%;
+    font-weight: 620;
+    letter-spacing: -0.006em;
   }
 
   .type-display-light {
-    font-variation-settings:
-      'wdth' 125,
-      'wght' 700;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-  }
-
-  /* Data: semi-condensed, tabular figures, never a monospace face. */
-  .type-data {
-    font-variation-settings:
-      'wdth' 87,
-      'wght' 500;
-    font-variant-numeric: tabular-nums;
-    letter-spacing: 0.01em;
-  }
-
-  .type-body-medium {
-    font-variation-settings:
-      'wdth' 100,
-      'wght' 500;
+    font-stretch: 112%;
+    font-weight: 600;
+    letter-spacing: -0.005em;
   }
 
   .type-bay-title {
-    font-variation-settings:
-      'wdth' 112,
-      'wght' 650;
-    letter-spacing: 0.01em;
+    font-stretch: 106%;
+    font-weight: 620;
+    letter-spacing: -0.003em;
   }
 
-  /* An engraved plate: a light edge above, a dark edge below. */
-  .nameplate {
-    text-shadow:
-      0 1px 0 rgb(255 255 255 / 0.75),
-      0 -1px 0 rgb(20 32 48 / 0.22);
+  .type-body-medium {
+    font-weight: 540;
+  }
+
+  /* Figures: Archivo with tabular numbers, so counts and times line up. */
+  .type-data {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /*
+   * Code values only: keys, scopes, images, hashes, ids and logs. Never a
+   * label. Martian Mono at 87.5 % width, a step smaller than the text around it.
+   */
+  .type-code {
+    font-family: var(--font-mono);
+    font-stretch: 87.5%;
+    font-weight: 430;
+    font-size: 0.86em;
+    letter-spacing: 0;
+  }
+
+  /* A card face: a touch lighter at the top in dark, plain white in light. */
+  .card-sheen {
+    background-image: linear-gradient(180deg, var(--surface-hi), var(--surface) 70%);
   }
 
   .field {
-    height: 36px;
+    height: 32px;
     width: 100%;
-    border-radius: var(--radius-bay);
-    border: 1px solid var(--color-rail);
-    background-color: var(--color-panel);
+    border-radius: 7px;
+    border: 1px solid var(--line-2);
+    background-color: var(--sunk);
+    color: var(--ink);
     padding: 0 10px;
-    font-size: 15px;
-    box-shadow: inset 0 1px 2px rgb(20 32 48 / 0.06);
-    transition:
-      border-color 120ms ease,
-      box-shadow 120ms ease;
+    font-size: 13px;
+    transition: border-color 120ms ease;
+  }
+
+  .field::placeholder {
+    color: var(--ink-3);
   }
 
   .field:hover {
-    border-color: var(--color-ink-muted);
+    border-color: var(--ink-3);
   }
 
   .field:focus-visible {
-    outline: 2px solid var(--color-cobalt);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
-    border-color: var(--color-cobalt);
+    border-color: var(--accent);
   }
 
   .field[aria-invalid='true'] {
-    border-color: var(--color-lamp-fault);
+    border-color: var(--fault);
   }
 
-  .bay-shadow {
-    box-shadow:
-      0 1px 0 rgb(20 32 48 / 0.05),
-      inset 0 1px 0 rgb(255 255 255 / 0.6);
+  /*
+   * The lamp: the ring is the desired state, the core the observed one. The
+   * ring is an outline so the gap shows whatever sits behind the lamp.
+   */
+  .lamp {
+    --lamp-size: 8px;
+    --lamp-core: var(--idle);
+    --lamp-ring: var(--idle);
+    display: inline-block;
+    flex: none;
+    width: var(--lamp-size);
+    height: var(--lamp-size);
+    border-radius: 50%;
+    background-color: var(--lamp-core);
+    outline: max(1.5px, calc(var(--lamp-size) * 0.1875)) solid
+      color-mix(in oklab, var(--lamp-ring) 55%, transparent);
+    outline-offset: calc(var(--lamp-size) / 4);
   }
 
-  /* The lamp: still when desired and observed agree, a slow pulse while not. */
+  /* Unknown: nobody can say, so the core is hollow rather than a colour. */
+  .lamp.lamp-hollow {
+    background-color: transparent;
+    box-shadow: inset 0 0 0 max(1.5px, calc(var(--lamp-size) * 0.1875)) var(--lamp-core);
+  }
+
   @keyframes lamp-pulse {
-    0%,
-    100% {
-      opacity: 1;
-      box-shadow:
-        0 0 0 1px var(--lamp-ring),
-        0 0 7px -1px var(--lamp-ring);
-    }
     50% {
-      opacity: 0.55;
-      box-shadow:
-        0 0 0 1px var(--lamp-ring),
-        0 0 1px -1px var(--lamp-ring);
+      opacity: 0.4;
     }
   }
 
   .lamp-pulse {
-    animation: lamp-pulse 1.9s ease-in-out infinite;
+    animation: lamp-pulse 1.8s ease-in-out infinite;
+  }
+
+  .tag {
+    --tag: var(--idle);
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 20px;
+    padding: 0 6px;
+    border-radius: 4px;
+    font-size: 11.5px;
+    font-weight: 580;
+    line-height: 1;
+    white-space: nowrap;
+    background-color: color-mix(in oklab, var(--tag) 15%, transparent);
+    color: color-mix(in oklab, var(--tag) 62%, var(--ink));
+  }
+
+  .tag-run {
+    --tag: var(--run);
+  }
+
+  .tag-shift {
+    --tag: var(--shift);
+  }
+
+  .tag-fault {
+    --tag: var(--fault);
+  }
+
+  .tag-accent {
+    --tag: var(--accent);
+  }
+
+  .tag-plain,
+  .tag-code {
+    background-color: var(--sunk);
+    color: var(--ink-2);
+    box-shadow: inset 0 0 0 1px var(--line);
+  }
+
+  .tag-code {
+    font-family: var(--font-mono);
+    font-stretch: 87.5%;
+    font-weight: 450;
+    font-size: 10.5px;
+  }
+
+  /* Avatars: humans round with initials, agents square and dithered, the system with the mark. */
+  .avatar {
+    width: 22px;
+    height: 22px;
+    flex: none;
+    display: inline-grid;
+    place-items: center;
+    overflow: hidden;
+    vertical-align: middle;
+  }
+
+  .avatar canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+
+  .avatar-human {
+    border-radius: 50%;
+    background-color: color-mix(in oklab, var(--accent) 24%, var(--raised));
+    color: var(--ink);
+    font-size: 10px;
+    font-weight: 680;
+    line-height: 1;
+  }
+
+  .avatar-agent {
+    border-radius: 5px;
+    background-color: var(--sunk);
+    box-shadow: inset 0 0 0 1px var(--line-2);
+  }
+
+  .avatar-system {
+    border-radius: 5px;
+    background-color: var(--raised);
+    box-shadow: inset 0 0 0 1px var(--line-2);
+  }
+
+  .avatar-lg {
+    width: 36px;
+    height: 36px;
+    border-radius: 8px;
+  }
+
+  .avatar-human.avatar-lg {
+    border-radius: 50%;
+    font-size: 13px;
+  }
+
+  /* Glyph tile: an icon on a raised square, tinted by what kind of thing it is. */
+  .glyph {
+    --kind: var(--k-git);
+    width: 28px;
+    height: 28px;
+    flex: none;
+    display: grid;
+    place-items: center;
+    border-radius: 7px;
+    background-color: color-mix(in oklab, var(--kind) 14%, var(--raised));
+    background-image: conic-gradient(
+      from 270deg at 1px 1px,
+      color-mix(in oklab, var(--kind) 42%, transparent) 25%,
+      transparent 0
+    );
+    background-size: 3px 3px;
+    color: color-mix(in oklab, var(--kind) 82%, var(--ink));
+    box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--kind) 42%, transparent);
+  }
+
+  .glyph svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  .glyph-lg {
+    width: 34px;
+    height: 34px;
+    border-radius: 8px;
+  }
+
+  .glyph-lg svg {
+    width: 18px;
+    height: 18px;
+  }
+
+  .glyph-git {
+    --kind: var(--k-git);
+  }
+
+  .glyph-image {
+    --kind: var(--k-image);
+  }
+
+  .glyph-template {
+    --kind: var(--k-tpl);
+  }
+
+  .glyph-vm {
+    --kind: var(--k-vm);
+  }
+
+  /*
+   * Dither patterns in CSS, for flat tones without a canvas: 50, 25 and 12.5 %
+   * of the cells in `--dc` (accent by default).
+   */
+  .d50 {
+    background-image: repeating-conic-gradient(var(--dc, var(--accent)) 0 25%, transparent 0 50%);
+    background-size: 4px 4px;
+  }
+
+  .d25 {
+    background-image: conic-gradient(from 270deg at 2px 2px, var(--dc, var(--accent)) 25%, transparent 0);
+    background-size: 4px 4px;
+  }
+
+  .d12 {
+    background-image:
+      conic-gradient(from 270deg at 2px 2px, var(--dc, var(--accent)) 25%, transparent 0),
+      conic-gradient(from 270deg at 2px 2px, var(--dc, var(--accent)) 25%, transparent 0);
+    background-size:
+      8px 8px,
+      8px 8px;
+    background-position:
+      0 0,
+      4px 4px;
+  }
+
+  /* The sweep: the one signal that something is deploying right now. */
+  .sweep {
+    --dc: var(--accent);
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 0;
+    height: 3px;
+    pointer-events: none;
+    background-image: repeating-conic-gradient(var(--dc) 0 25%, transparent 0 50%);
+    background-size: 4px 4px;
+    /* A mask reads alpha only; any opaque token will do. */
+    -webkit-mask: linear-gradient(90deg, transparent, var(--ink) 35%, var(--ink) 65%, transparent) no-repeat;
+    mask: linear-gradient(90deg, transparent, var(--ink) 35%, var(--ink) 65%, transparent) no-repeat;
+    -webkit-mask-size: 42% 100%;
+    mask-size: 42% 100%;
+    animation: sweep 2.6s linear infinite;
+  }
+
+  @keyframes sweep {
+    from {
+      -webkit-mask-position: -75% 0;
+      mask-position: -75% 0;
+    }
+    to {
+      -webkit-mask-position: 175% 0;
+      mask-position: 175% 0;
+    }
   }
 
   @keyframes dialog-fade {
@@ -203,8 +566,15 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .lamp-pulse {
+    .lamp-pulse,
+    .sweep {
       animation: none;
+    }
+
+    /* A still sweep sits in the middle instead of vanishing off one edge. */
+    .sweep {
+      -webkit-mask-position: 50% 0;
+      mask-position: 50% 0;
     }
 
     *,

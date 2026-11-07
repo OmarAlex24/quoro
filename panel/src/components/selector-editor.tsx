@@ -66,7 +66,7 @@ export function SelectorEditor({
           <input
             type="radio"
             name={`${id}-mode`}
-            className="accent-cobalt"
+            className="accent-accent-solid"
             checked={!everything}
             onChange={() => onChange({})}
           />
@@ -76,7 +76,7 @@ export function SelectorEditor({
           <input
             type="radio"
             name={`${id}-mode`}
-            className="accent-cobalt"
+            className="accent-accent-solid"
             checked={everything}
             onChange={() => onChange({ all: true })}
           />
@@ -87,16 +87,16 @@ export function SelectorEditor({
       <div className={cn('flex flex-col gap-2', everything && 'opacity-45')} aria-disabled={everything}>
         {groups.map((group) => (
           <div key={group.kind} className="grid grid-cols-[72px_minmax(0,1fr)] items-baseline gap-x-3">
-            <span className="type-body-medium w-[72px] shrink-0 text-[13px] text-ink-muted">{group.label}</span>
+            <span className="type-body-medium w-[72px] shrink-0 text-[13px] text-ink-2">{group.label}</span>
             <span className="flex flex-wrap gap-x-3 gap-y-1">
             {group.options.length === 0 ? (
-              <span className="text-[13px] text-ink-muted">None yet</span>
+              <span className="text-[13px] text-ink-2">None yet</span>
             ) : (
               group.options.map((option) => (
                 <label key={option.value} className="inline-flex cursor-pointer items-center gap-1.5 text-[13px]">
                   <input
                     type="checkbox"
-                    className="h-3.5 w-3.5 accent-cobalt"
+                    className="h-3.5 w-3.5 accent-accent-solid"
                     disabled={everything}
                     checked={!everything && (value[group.kind] ?? []).includes(option.value)}
                     onChange={() =>

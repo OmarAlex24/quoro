@@ -79,37 +79,37 @@ function VolumeLine({
   return (
     <dl className="type-data grid grid-cols-1 gap-x-6 gap-y-1 text-[13px] sm:grid-cols-2">
       <div className="flex gap-2">
-        <dt className="text-ink-muted">Size</dt>
+        <dt className="text-ink-2">Size</dt>
         <dd className="text-ink">{volume.size_gb} GiB</dd>
       </div>
       <div className="flex min-w-0 gap-2">
-        <dt className="text-ink-muted">Mount path</dt>
-        <dd className="min-w-0 truncate text-ink" title={volume.mount_path}>
+        <dt className="text-ink-2">Mount path</dt>
+        <dd className="type-code min-w-0 truncate text-ink" title={volume.mount_path}>
           {volume.mount_path}
         </dd>
       </div>
       <div className="flex gap-2">
-        <dt className="text-ink-muted">Node</dt>
+        <dt className="text-ink-2">Node</dt>
         <dd className="text-ink">{nodeNames[volume.node_id] ?? 'an unknown node'}</dd>
       </div>
       <div className="flex gap-2">
-        <dt className="text-ink-muted">State</dt>
+        <dt className="text-ink-2">State</dt>
         <dd className="text-ink">{volume.state}</dd>
       </div>
       <div className="flex gap-2">
-        <dt className="text-ink-muted">Allocated</dt>
+        <dt className="text-ink-2">Allocated</dt>
         <dd className="text-ink">{formatBytes(volume.allocated_bytes)}</dd>
       </div>
       {volume.restored_from_backup_id ? (
         <div className="flex gap-2">
-          <dt className="text-ink-muted">Restored from</dt>
+          <dt className="text-ink-2">Restored from</dt>
           <dd className="min-w-0 truncate text-ink" title={volume.restored_from_backup_id}>
             {volume.restored_from_backup_id}
           </dd>
         </div>
       ) : null}
       {volume.error ? (
-        <div className="text-[13px] leading-snug text-lamp-fault sm:col-span-2">
+        <div className="text-[13px] leading-snug text-fault sm:col-span-2">
           {volume.error}
         </div>
       ) : null}
@@ -159,14 +159,14 @@ function AddVolumeForm({
 
   if (!canWrite) {
     return (
-      <p className="mt-2 text-[13px] leading-snug text-ink-muted">
+      <p className="mt-2 text-[13px] leading-snug text-ink-2">
         Your role can read storage but not add a volume.
       </p>
     );
   }
 
   return (
-    <div className="mt-3 flex flex-col gap-3 border-t border-rail pt-3 sm:flex-row sm:items-start">
+    <div className="mt-3 flex flex-col gap-3 border-t border-line pt-3 sm:flex-row sm:items-start">
       <Field label="Size (GiB)" htmlFor="volume-size" className="sm:w-32">
         <Input
           id="volume-size"
@@ -180,7 +180,7 @@ function AddVolumeForm({
           aria-invalid={fieldErrors.size !== undefined}
         />
         {fieldErrors.size ? (
-          <p className="text-[13px] text-lamp-fault">{fieldErrors.size}</p>
+          <p className="text-[13px] text-fault">{fieldErrors.size}</p>
         ) : null}
       </Field>
       <Field
@@ -197,7 +197,7 @@ function AddVolumeForm({
           aria-invalid={fieldErrors.mount !== undefined}
         />
         {fieldErrors.mount ? (
-          <p className="text-[13px] text-lamp-fault">{fieldErrors.mount}</p>
+          <p className="text-[13px] text-fault">{fieldErrors.mount}</p>
         ) : null}
       </Field>
       <div className="flex flex-col gap-1.5 sm:pt-[22px]">
@@ -265,14 +265,14 @@ function HaPolicyControl({
             </SelectContent>
           </Select>
         </Field>
-        <p className="max-w-md text-[13px] leading-snug text-ink-muted">
+        <p className="max-w-md text-[13px] leading-snug text-ink-2">
           {change.isPending
             ? 'Saving the policy…'
             : 'Cold backups run on the app’s schedule. Warm and hot keep a copy ready on another node, which this release does not offer.'}
         </p>
       </div>
       {!canWrite ? (
-        <p className="mt-1 text-[13px] leading-snug text-ink-muted">
+        <p className="mt-1 text-[13px] leading-snug text-ink-2">
           Your role can read the policy but not change it.
         </p>
       ) : null}
@@ -281,7 +281,7 @@ function HaPolicyControl({
   );
 }
 
-/** One row per policy, with the current policy in the recess tone. */
+/** One row per policy, with the current policy on the sunk tone. */
 function HaCostTable({
   policies,
   current,
@@ -296,7 +296,7 @@ function HaCostTable({
       <div className="overflow-x-auto">
         <table className="type-data w-full min-w-[640px] text-[13px]">
           <thead>
-            <tr className="border-b border-rail text-left text-ink-muted">
+            <tr className="border-b border-line text-left text-ink-2">
               <th className="py-1.5 pr-3 font-normal">Policy</th>
               <th className="py-1.5 pr-3 font-normal">Reserved vCPU</th>
               <th className="py-1.5 pr-3 font-normal">Reserved memory</th>
@@ -314,8 +314,8 @@ function HaCostTable({
                   key={row.policy}
                   aria-current={active ? 'true' : undefined}
                   className={cn(
-                    'border-b border-rail/70 last:border-b-0',
-                    active && 'bg-recess/45',
+                    'border-b border-line/70 last:border-b-0',
+                    active && 'bg-sunk/45',
                   )}
                 >
                   <td className="py-2 pr-3">
@@ -323,7 +323,7 @@ function HaCostTable({
                       {haPolicyWords[row.policy]}
                     </span>
                     {row.available ? null : (
-                      <span className="ml-1.5 text-ink-muted">
+                      <span className="ml-1.5 text-ink-2">
                         {policyAvailability(row).reason ?? 'unavailable'}
                       </span>
                     )}
@@ -346,15 +346,15 @@ function HaCostTable({
       </div>
 
       {snapshotMethodWords(snapshotMethod) ? (
-        <p className="mt-2 text-[13px] leading-snug text-ink-muted">
+        <p className="mt-2 text-[13px] leading-snug text-ink-2">
           Snapshot method: {snapshotMethodWords(snapshotMethod)}.
         </p>
       ) : (
-        <p className="mt-2 text-[13px] leading-snug text-ink-muted">
+        <p className="mt-2 text-[13px] leading-snug text-ink-2">
           This app has no volume, so there is nothing to snapshot.
         </p>
       )}
-      <p className="mt-1 text-[13px] leading-snug text-ink-muted">
+      <p className="mt-1 text-[13px] leading-snug text-ink-2">
         These numbers are estimates, not reservations.
       </p>
     </div>
@@ -427,7 +427,7 @@ function BackupScheduleForm({
             aria-invalid={fieldErrors.interval !== undefined}
           />
           {fieldErrors.interval ? (
-            <p className="text-[13px] text-lamp-fault">{fieldErrors.interval}</p>
+            <p className="text-[13px] text-fault">{fieldErrors.interval}</p>
           ) : null}
         </Field>
         <Field
@@ -449,12 +449,12 @@ function BackupScheduleForm({
             aria-invalid={fieldErrors.keep !== undefined}
           />
           {fieldErrors.keep ? (
-            <p className="text-[13px] text-lamp-fault">{fieldErrors.keep}</p>
+            <p className="text-[13px] text-fault">{fieldErrors.keep}</p>
           ) : null}
         </Field>
         {canWrite ? (
           <div className="flex flex-col gap-1.5 sm:pt-[22px]">
-            <Button variant="secondary" disabled={save.isPending} onClick={submit}>
+            <Button variant="default" disabled={save.isPending} onClick={submit}>
               {save.isPending ? 'Saving…' : 'Save schedule'}
             </Button>
           </div>
@@ -531,7 +531,7 @@ function BackupsList({
   return (
     <div>
       <div className="mt-2 flex flex-wrap items-end justify-between gap-x-3 gap-y-2">
-        <p className="max-w-md text-[13px] leading-snug text-ink-muted">
+        <p className="max-w-md text-[13px] leading-snug text-ink-2">
           {repositoriesQuery.isPending
             ? 'Reading the backup repository…'
             : repository
@@ -540,7 +540,7 @@ function BackupsList({
         </p>
         <div className="flex flex-col gap-1.5">
           <Button
-            variant="secondary"
+            variant="default"
             disabled={disabledReason !== null || backupNow.isPending}
             onClick={() => {
               setProblem(null);
@@ -550,7 +550,7 @@ function BackupsList({
             {backupNow.isPending ? 'Starting…' : 'Back up now'}
           </Button>
           {disabledReason ? (
-            <p className="max-w-[260px] text-[13px] leading-snug text-ink-muted">
+            <p className="max-w-[260px] text-[13px] leading-snug text-ink-2">
               {disabledReason}
             </p>
           ) : null}
@@ -565,14 +565,14 @@ function BackupsList({
           className="mt-3"
         />
       ) : backupsQuery.isPending ? (
-        <p className="mt-3 text-[13px] text-ink-muted">Reading backups…</p>
+        <p className="mt-3 text-[13px] text-ink-2">Reading backups…</p>
       ) : backups.length === 0 ? (
-        <p className="mt-3 text-[13px] text-ink-muted">
+        <p className="mt-3 text-[13px] text-ink-2">
           No backups yet. A cold policy takes them on its schedule; Back up now
           takes one outside it.
         </p>
       ) : (
-        <ul className="mt-3 flex flex-col divide-y divide-rail border-y border-rail">
+        <ul className="mt-3 flex flex-col divide-y divide-line border-y border-line">
           {backups.map((backup) => {
             const lamp = backupLamp(backup.status);
             return (
@@ -589,32 +589,32 @@ function BackupsList({
                 <span className="type-body-medium min-w-[76px] text-[14px] text-ink">
                   {lamp.words}
                 </span>
-                <span className="type-data text-[13px] text-ink-muted">
+                <span className="type-data text-[13px] text-ink-2">
                   {backup.trigger}
                 </span>
                 <span
-                  className="type-data text-[13px] text-ink-muted"
+                  className="type-data text-[13px] text-ink-2"
                   title={backup.created_at}
                 >
                   created {relativeTime(backup.created_at)}
                 </span>
-                <span className="type-data text-[13px] text-ink-muted">
+                <span className="type-data text-[13px] text-ink-2">
                   logical {formatBytes(backup.logical_bytes)}
                 </span>
-                <span className="type-data text-[13px] text-ink-muted">
+                <span className="type-data text-[13px] text-ink-2">
                   uploaded {formatBytes(backup.uploaded_bytes)}
                 </span>
-                <span className="type-data text-[13px] text-ink-muted">
+                <span className="type-data text-[13px] text-ink-2">
                   pause {formatPause(backup.pause_ms, backup.snapshot_method)}
                 </span>
                 <span
-                  className="type-data ml-auto text-[13px] text-ink-muted"
+                  className="type-code ml-auto text-[12px] text-ink-2"
                   title={backup.id}
                 >
                   {shortId(backup.id)}
                 </span>
                 {backup.error ? (
-                  <p className="w-full text-[13px] leading-snug text-lamp-fault">
+                  <p className="w-full text-[13px] leading-snug text-fault">
                     {backup.error}
                   </p>
                 ) : null}
@@ -665,14 +665,14 @@ export function AppStorage({
   const volume = volumesQuery.data?.items[0];
 
   return (
-    <section className="mt-5 rounded-[6px] border border-rail bg-panel px-4 py-4 sm:px-5">
+    <section className="mt-5 rounded-[10px] border border-line bg-surface px-4 py-4 sm:px-5">
       <h2 className="type-display-light text-[15px] leading-none text-ink">
         Storage and HA
       </h2>
 
       {!app.stateful ? (
         <>
-          <p className="mt-2 text-[13px] leading-snug text-ink-muted">
+          <p className="mt-2 text-[13px] leading-snug text-ink-2">
             This app keeps no data across redeploys. Add a volume to pin it to one
             node and keep its files.
           </p>
@@ -686,9 +686,9 @@ export function AppStorage({
                 view={problemView(volumesQuery.error, 'see the volume')}
               />
             ) : volumesQuery.isPending ? (
-              <p className="text-[13px] text-ink-muted">Reading the volume…</p>
+              <p className="text-[13px] text-ink-2">Reading the volume…</p>
             ) : volume === undefined ? (
-              <p className="text-[13px] text-ink-muted">
+              <p className="text-[13px] text-ink-2">
                 No volume is attached to this app right now.
               </p>
             ) : (
@@ -696,13 +696,13 @@ export function AppStorage({
             )}
           </div>
 
-          <div className="mt-4 border-t border-rail pt-3">
+          <div className="mt-4 border-t border-line pt-3">
             <h3 className="type-bay-title text-[14px] leading-tight text-ink">
               HA policy
             </h3>
             <HaPolicyControl app={app} canWrite={canWrite} onSaved={refresh} />
             {app.ha_cost === undefined || app.ha_cost === null ? (
-              <p className="mt-3 text-[13px] leading-snug text-ink-muted">
+              <p className="mt-3 text-[13px] leading-snug text-ink-2">
                 What each policy would cost this app is not computed yet.
               </p>
             ) : (
@@ -715,7 +715,7 @@ export function AppStorage({
           </div>
 
           {app.ha_policy === 'cold' ? (
-            <div className="mt-4 border-t border-rail pt-3">
+            <div className="mt-4 border-t border-line pt-3">
               <h3 className="type-bay-title text-[14px] leading-tight text-ink">
                 Backup schedule
               </h3>
@@ -727,7 +727,7 @@ export function AppStorage({
             </div>
           ) : null}
 
-          <div className="mt-4 border-t border-rail pt-3">
+          <div className="mt-4 border-t border-line pt-3">
             <h3 className="type-bay-title text-[14px] leading-tight text-ink">
               Backups
             </h3>

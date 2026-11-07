@@ -9,35 +9,41 @@ import {
   parseServerControl,
   type SessionViewState,
 } from '../lib/interactive';
+import { readToken, useResolvedTheme } from '../lib/use-theme';
 
 /**
- * The panel's dark face for a guest terminal: the room lights are off, the
- * guest's own colours and cursor are the only light. The font stack is the one
- * place the panel allows monospace.
+ * The terminal wears the log body of the panel: the sunk tone with ink text,
+ * and the guest's ANSI colours mapped onto the state and kind tokens. xterm.js
+ * needs resolved colours, so they are read from the tokens when the terminal
+ * opens and again whenever the theme changes. The font stack is the system
+ * monospace on purpose: xterm.js measures its cell before a web font loads.
  */
-const THEME: ITheme = {
-  background: '#0f1a26',
-  foreground: '#dce1e5',
-  cursor: '#e3a008',
-  cursorAccent: '#0f1a26',
-  selectionBackground: 'rgb(38 67 181 / 0.45)',
-  black: '#142030',
-  red: '#d0412f',
-  green: '#1f9d5a',
-  yellow: '#e3a008',
-  blue: '#5b83e6',
-  magenta: '#8a7cc0',
-  cyan: '#4aa3b8',
-  white: '#dce1e5',
-  brightBlack: '#5b6878',
-  brightRed: '#e0604d',
-  brightGreen: '#35b975',
-  brightYellow: '#f0b52e',
-  brightBlue: '#7c9cef',
-  brightMagenta: '#a396d8',
-  brightCyan: '#6cc2d4',
-  brightWhite: '#ffffff',
-};
+const withAlpha = (hex: string, alpha: string): string =>
+  /^#[0-9a-f]{6}$/i.test(hex) ? `${hex}${alpha}` : hex;
+
+export const terminalTheme = (read: (name: string) => string = readToken): ITheme => ({
+  background: read('--sunk'),
+  foreground: read('--ink'),
+  cursor: read('--shift'),
+  cursorAccent: read('--sunk'),
+  selectionBackground: withAlpha(read('--accent'), '59'),
+  black: read('--line-2'),
+  red: read('--fault'),
+  green: read('--run'),
+  yellow: read('--shift'),
+  blue: read('--accent'),
+  magenta: read('--violet'),
+  cyan: read('--ion'),
+  white: read('--ink-2'),
+  brightBlack: read('--ink-3'),
+  brightRed: read('--fault'),
+  brightGreen: read('--run'),
+  brightYellow: read('--shift'),
+  brightBlue: read('--accent'),
+  brightMagenta: read('--k-vm'),
+  brightCyan: read('--k-image'),
+  brightWhite: read('--ink'),
+});
 
 const FONT_STACK =
   'ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, "Liberation Mono", monospace';
@@ -64,6 +70,8 @@ export function XtermView({ ticket, kind, onState }: XtermViewProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const onStateRef = useRef(onState);
   onStateRef.current = onState;
+  const terminalRef = useRef<Terminal | null>(null);
+  const theme = useResolvedTheme();
 
   useEffect(() => {
     const container = containerRef.current;
@@ -78,12 +86,13 @@ export function XtermView({ ticket, kind, onState }: XtermViewProps) {
       fontSize: 13,
       lineHeight: 1.25,
       scrollback: 5_000,
-      theme: THEME,
+      theme: terminalTheme(),
       allowProposedApi: false,
     });
     const fit = new FitAddon();
     terminal.loadAddon(fit);
     terminal.open(container);
+    terminalRef.current = terminal;
 
     const report = (state: SessionViewState) => onStateRef.current(state);
 
@@ -221,10 +230,16 @@ export function XtermView({ ticket, kind, onState }: XtermViewProps) {
         socket.close(1000, 'panel unmounted');
         socket = null;
       }
+      terminalRef.current = null;
       terminal.dispose();
     };
     // The ticket is one-shot: any new ticket mounts a fresh terminal and socket.
   }, [ticket, kind]);
+
+  // A theme change repaints the open terminal without touching its session.
+  useEffect(() => {
+    if (terminalRef.current) terminalRef.current.options.theme = terminalTheme();
+  }, [theme]);
 
   return (
     <div

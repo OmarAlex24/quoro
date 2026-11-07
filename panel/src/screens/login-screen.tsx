@@ -55,11 +55,11 @@ export function LoginScreen() {
   return (
     <AuthPanel
       footer={
-        <p className="text-[13px] text-ink-muted">
+        <p className="text-[13px] text-ink-2">
           First time here?{' '}
           <Link
             to="/setup"
-            className="text-cobalt underline-offset-4 hover:underline"
+            className="text-accent underline-offset-4 hover:underline"
           >
             Set up the owner account
           </Link>
@@ -67,13 +67,13 @@ export function LoginScreen() {
       }
     >
       {ended ? (
-        <div className="mb-4 rounded-[6px] border border-rail border-l-4 border-l-lamp-fault bg-panel px-3.5 py-2.5">
+        <div className="mb-4 rounded-[10px] border border-line border-l-4 border-l-fault bg-surface px-3.5 py-2.5">
           <p className="text-[15px] leading-snug text-ink">
             Your session ended. Log in again.
           </p>
         </div>
       ) : created ? (
-        <p className="mb-4 text-[13px] text-ink-muted">{created}</p>
+        <p className="mb-4 text-[13px] text-ink-2">{created}</p>
       ) : null}
 
       <h2 className="type-display text-[18px] leading-tight">Log in</h2>

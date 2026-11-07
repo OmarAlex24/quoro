@@ -49,13 +49,13 @@ function MetricsBayCard({
   return (
     <section
       className={cn(
-        'rounded-[6px] border border-rail bg-panel px-4 py-4 sm:px-5',
+        'rounded-[10px] border border-line bg-surface px-4 py-4 sm:px-5',
         className,
       )}
     >
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
         <h2 className="type-bay-title text-[15px] leading-none text-ink">Metrics</h2>
-        <span className="type-data text-[12px] text-ink-muted">Last 10 minutes</span>
+        <span className="type-data text-[12px] text-ink-2">Last 10 minutes</span>
         <div className="ml-auto flex items-center gap-2">
           <ToneLamp
             tone={readout.tone}
@@ -112,7 +112,7 @@ export function NodeMetricsBay({
           value={(sample) => sample.cpu_usage}
           domain={cpuDomain(samples)}
           formatValue={formatPercent}
-          tone="cobalt"
+          tone="accent"
           emptyText={COLLECTING}
           notice={notice}
         />
@@ -127,7 +127,7 @@ export function NodeMetricsBay({
           value={(sample) => sample.memory_used_bytes}
           domain={memoryDomain(total)}
           formatValue={formatBytes}
-          tone="ink"
+          tone="ion"
           emptyText={COLLECTING}
           notice={notice}
         />
@@ -152,7 +152,7 @@ export function AppMetricsBay({
   return (
     <MetricsBayCard status={status} className={className}>
       {instances.length === 0 ? (
-        <p className="mt-3 text-[13px] leading-snug text-ink-muted">
+        <p className="mt-3 text-[13px] leading-snug text-ink-2">
           No instance is reporting metrics. They appear when the app has a
           running instance.
         </p>
@@ -168,13 +168,13 @@ export function AppMetricsBay({
             return (
               <div
                 key={instance.vm_id}
-                className={cn(index > 0 && 'mt-4 border-t border-rail pt-4')}
+                className={cn(index > 0 && 'mt-4 border-t border-line pt-4')}
               >
                 <div className="flex flex-wrap items-baseline gap-x-2">
-                  <h3 className="type-data text-[13px] text-ink">
+                  <h3 className="type-code text-[12px] text-ink">
                     {shortVmId(instance.vm_id)}
                   </h3>
-                  <span className="text-[12px] text-ink-muted">
+                  <span className="text-[12px] text-ink-2">
                     {nodeNames?.[instance.node_id] ?? 'node'}
                   </span>
                 </div>
@@ -186,7 +186,7 @@ export function AppMetricsBay({
                     value={(sample) => sample.cpu_usage}
                     domain={cpuDomain(instance.samples, true)}
                     formatValue={formatPercent}
-                    tone="cobalt"
+                    tone="accent"
                     emptyText={COLLECTING}
                     notice={notice}
                   />
@@ -201,7 +201,7 @@ export function AppMetricsBay({
                     value={(sample) => sample.memory_rss_bytes}
                     domain={memoryDomain(total)}
                     formatValue={formatBytes}
-                    tone="ink"
+                    tone="ion"
                     emptyText={COLLECTING}
                     notice={notice}
                   />

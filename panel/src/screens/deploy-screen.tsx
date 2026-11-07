@@ -37,6 +37,7 @@ import {
 } from '../lib/source-form';
 import { useSession } from '../session';
 import { ToneLamp } from '../components/tone-lamp';
+import { GlyphTile } from '../components/glyph-tile';
 import { Button } from '../components/ui/button';
 import { Field } from '../components/ui/field';
 import { Input } from '../components/ui/input';
@@ -403,7 +404,7 @@ export function DeployScreen() {
   if (loading) {
     return (
       <main className="mx-auto w-full max-w-3xl px-4 py-8 sm:px-6">
-        <p className="text-[15px] text-ink-muted">Loading…</p>
+        <p className="text-[15px] text-ink-2">Loading…</p>
       </main>
     );
   }
@@ -414,11 +415,11 @@ export function DeployScreen() {
     return (
       <main className="mx-auto w-full max-w-3xl px-4 py-6 sm:px-6 sm:py-8">
         <h1 className="type-display text-[24px] leading-none">Deploy an app</h1>
-        <div className="mt-5 rounded-[6px] border border-rail bg-panel px-4 py-8">
+        <div className="mt-5 rounded-[10px] border border-line bg-surface px-4 py-8">
           <p className="text-[15px] text-ink">
             Your role can read apps but not deploy them.
           </p>
-          <Button variant="secondary" className="mt-4" asChild>
+          <Button variant="default" className="mt-4" asChild>
             <Link to="/">Back to apps</Link>
           </Button>
         </div>
@@ -462,11 +463,11 @@ export function DeployScreen() {
     <main className="mx-auto w-full max-w-3xl px-4 py-6 sm:px-6 sm:py-8">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <h1 className="type-display text-[24px] leading-none">Deploy an app</h1>
-        <Button variant="quiet" asChild>
+        <Button variant="ghost" asChild>
           <Link to="/">Back to apps</Link>
         </Button>
       </div>
-      <p className="mt-2 text-[15px] text-ink-muted">
+      <p className="mt-2 text-[15px] text-ink-2">
         Name an image or a public Git repository, pick where it runs and deploy it. The
         app gets one microVM.
       </p>
@@ -474,7 +475,7 @@ export function DeployScreen() {
       <form
         onSubmit={submit}
         noValidate
-        className="mt-5 rounded-[6px] border border-rail bg-panel bay-shadow"
+        className="mt-5 rounded-[10px] border border-line bg-surface card-sheen"
       >
         <section className="px-4 py-5 sm:px-5">
           <h2 className="type-display-light text-[15px] leading-none text-ink">Source</h2>
@@ -485,10 +486,10 @@ export function DeployScreen() {
           >
             <label
               className={cn(
-                'flex cursor-pointer items-start gap-3 rounded-[6px] border px-3 py-3 transition-colors',
+                'flex cursor-pointer items-start gap-3 rounded-[10px] border px-3 py-3 transition-colors',
                 sourceKind === 'image'
-                  ? 'border-cobalt bg-cobalt/[0.04]'
-                  : 'border-rail hover:border-ink-muted',
+                  ? 'border-accent bg-raised shadow-[0_0_0_3px_color-mix(in_oklab,var(--accent)_22%,transparent)]'
+                  : 'border-line-2 hover:border-ink-3',
               )}
             >
               <input
@@ -497,23 +498,24 @@ export function DeployScreen() {
                 value="image"
                 checked={sourceKind === 'image'}
                 onChange={() => chooseSource('image')}
-                className="mt-1 h-4 w-4 shrink-0 accent-cobalt"
+                className="mt-1 h-4 w-4 shrink-0 accent-accent-solid"
               />
+              <GlyphTile kind="image" />
               <span className="min-w-0">
                 <span className="type-body-medium block text-[15px] leading-tight text-ink">
                   Image
                 </span>
-                <span className="mt-1 block text-[13px] leading-snug text-ink-muted">
+                <span className="mt-1 block text-[13px] leading-snug text-ink-2">
                   Deploy a public OCI reference as it is.
                 </span>
               </span>
             </label>
             <label
               className={cn(
-                'flex cursor-pointer items-start gap-3 rounded-[6px] border px-3 py-3 transition-colors',
+                'flex cursor-pointer items-start gap-3 rounded-[10px] border px-3 py-3 transition-colors',
                 sourceKind === 'git'
-                  ? 'border-cobalt bg-cobalt/[0.04]'
-                  : 'border-rail hover:border-ink-muted',
+                  ? 'border-accent bg-raised shadow-[0_0_0_3px_color-mix(in_oklab,var(--accent)_22%,transparent)]'
+                  : 'border-line-2 hover:border-ink-3',
               )}
             >
               <input
@@ -522,13 +524,14 @@ export function DeployScreen() {
                 value="git"
                 checked={sourceKind === 'git'}
                 onChange={() => chooseSource('git')}
-                className="mt-1 h-4 w-4 shrink-0 accent-cobalt"
+                className="mt-1 h-4 w-4 shrink-0 accent-accent-solid"
               />
+              <GlyphTile kind="git" />
               <span className="min-w-0">
                 <span className="type-body-medium block text-[15px] leading-tight text-ink">
                   Git repository
                 </span>
-                <span className="mt-1 block text-[13px] leading-snug text-ink-muted">
+                <span className="mt-1 block text-[13px] leading-snug text-ink-2">
                   Build the image from a public repository and a Dockerfile.
                 </span>
               </span>
@@ -556,7 +559,7 @@ export function DeployScreen() {
                   aria-invalid={fieldErrors.image !== undefined}
                 />
                 {fieldErrors.image ? (
-                  <p className="text-[13px] text-lamp-fault">{fieldErrors.image}</p>
+                  <p className="text-[13px] text-fault">{fieldErrors.image}</p>
                 ) : null}
               </Field>
               <Field label="Container port" htmlFor="app-port">
@@ -572,7 +575,7 @@ export function DeployScreen() {
                   aria-invalid={portError !== undefined}
                 />
                 {portError ? (
-                  <p className="text-[13px] text-lamp-fault">{portError}</p>
+                  <p className="text-[13px] text-fault">{portError}</p>
                 ) : null}
               </Field>
             </div>
@@ -602,7 +605,7 @@ export function DeployScreen() {
                     aria-invalid={repoError !== undefined}
                   />
                   {repoError ? (
-                    <p className="text-[13px] text-lamp-fault">{repoError}</p>
+                    <p className="text-[13px] text-fault">{repoError}</p>
                   ) : null}
                 </Field>
                 <Field label="Container port" htmlFor="app-port">
@@ -618,7 +621,7 @@ export function DeployScreen() {
                     aria-invalid={portError !== undefined}
                   />
                   {portError ? (
-                    <p className="text-[13px] text-lamp-fault">{portError}</p>
+                    <p className="text-[13px] text-fault">{portError}</p>
                   ) : null}
                 </Field>
               </div>
@@ -634,7 +637,7 @@ export function DeployScreen() {
                     aria-invalid={fieldErrors.ref !== undefined}
                   />
                   {fieldErrors.ref ? (
-                    <p className="text-[13px] text-lamp-fault">{fieldErrors.ref}</p>
+                    <p className="text-[13px] text-fault">{fieldErrors.ref}</p>
                   ) : null}
                 </Field>
                 <Field
@@ -651,7 +654,7 @@ export function DeployScreen() {
                     aria-invalid={fieldErrors.target !== undefined}
                   />
                   {fieldErrors.target ? (
-                    <p className="text-[13px] text-lamp-fault">{fieldErrors.target}</p>
+                    <p className="text-[13px] text-fault">{fieldErrors.target}</p>
                   ) : null}
                 </Field>
                 <Field
@@ -668,7 +671,7 @@ export function DeployScreen() {
                     aria-invalid={fieldErrors.dockerfile !== undefined}
                   />
                   {fieldErrors.dockerfile ? (
-                    <p className="text-[13px] text-lamp-fault">{fieldErrors.dockerfile}</p>
+                    <p className="text-[13px] text-fault">{fieldErrors.dockerfile}</p>
                   ) : null}
                 </Field>
                 <Field
@@ -685,26 +688,26 @@ export function DeployScreen() {
                     aria-invalid={fieldErrors.context !== undefined}
                   />
                   {fieldErrors.context ? (
-                    <p className="text-[13px] text-lamp-fault">{fieldErrors.context}</p>
+                    <p className="text-[13px] text-fault">{fieldErrors.context}</p>
                   ) : null}
                 </Field>
               </div>
 
               <div className="mt-4">
                 <div className="flex flex-wrap items-baseline justify-between gap-2">
-                  <span className="type-body-medium text-[13px] text-ink-muted">
+                  <span className="type-body-medium text-[13px] text-ink-2">
                     Build arguments
                   </span>
                   <button
                     type="button"
-                    className="text-[13px] text-cobalt underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+                    className="text-[13px] text-accent underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
                     onClick={addArgRow}
                   >
                     Add argument
                   </button>
                 </div>
-                <p className="mt-1 text-[13px] leading-snug text-ink-muted">
-                  Passed as <span className="type-data">--build-arg</span>. They are not
+                <p className="mt-1 text-[13px] leading-snug text-ink-2">
+                  Passed as <span className="type-code">--build-arg</span>. They are not
                   secret: they end up in the image history.
                 </p>
                 <div className="mt-2 flex flex-col gap-2">
@@ -728,7 +731,7 @@ export function DeployScreen() {
                         spellCheck={false}
                       />
                       <Button
-                        variant="quiet"
+                        variant="ghost"
                         className="justify-self-start px-2.5"
                         onClick={() => removeArgRow(row.key)}
                         disabled={buildArgRows.length === 1}
@@ -739,14 +742,14 @@ export function DeployScreen() {
                   ))}
                 </div>
                 {fieldErrors.build_args ? (
-                  <p className="mt-2 text-[13px] text-lamp-fault">{fieldErrors.build_args}</p>
+                  <p className="mt-2 text-[13px] text-fault">{fieldErrors.build_args}</p>
                 ) : null}
               </div>
             </>
           )}
         </section>
 
-        <section className="border-t border-rail px-4 py-5 sm:px-5">
+        <section className="border-t border-line px-4 py-5 sm:px-5">
           <h2 className="type-display-light text-[15px] leading-none text-ink">
             Where it runs
           </h2>
@@ -765,17 +768,17 @@ export function DeployScreen() {
                 aria-invalid={nameError !== undefined}
               />
               {nameError ? (
-                <p className="text-[13px] text-lamp-fault">{nameError}</p>
+                <p className="text-[13px] text-fault">{nameError}</p>
               ) : null}
             </Field>
 
             <div className="flex flex-col gap-1.5">
               <div className="flex items-baseline justify-between gap-3">
-                <span className="type-body-medium text-[13px] text-ink-muted">Project</span>
+                <span className="type-body-medium text-[13px] text-ink-2">Project</span>
                 {projectView === 'pick' ? (
                   <button
                     type="button"
-                    className="text-[13px] text-cobalt underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+                    className="text-[13px] text-accent underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
                     onClick={() => {
                       setProblem(null);
                       setProjectView('create');
@@ -811,11 +814,11 @@ export function DeployScreen() {
                     </SelectContent>
                   </Select>
                   {fieldErrors.project ? (
-                    <p className="text-[13px] text-lamp-fault">{fieldErrors.project}</p>
+                    <p className="text-[13px] text-fault">{fieldErrors.project}</p>
                   ) : null}
                 </>
               ) : (
-                <div className="rounded-[6px] border border-rail bg-recess/40 p-3">
+                <div className="rounded-[10px] border border-line bg-sunk/40 p-3">
                   <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                     <Field label="Project name" htmlFor="deploy-project-name">
                       <Input
@@ -845,13 +848,13 @@ export function DeployScreen() {
                         aria-invalid={projectSlugError !== undefined}
                       />
                       {projectSlugError ? (
-                        <p className="text-[13px] text-lamp-fault">{projectSlugError}</p>
+                        <p className="text-[13px] text-fault">{projectSlugError}</p>
                       ) : null}
                     </Field>
                   </div>
                   <div className="mt-3 flex flex-wrap gap-2">
                     <Button
-                      variant="secondary"
+                      variant="default"
                       disabled={
                         createProjectMutation.isPending ||
                         projectName.trim() === '' ||
@@ -865,7 +868,7 @@ export function DeployScreen() {
                       {createProjectMutation.isPending ? 'Creating…' : 'Create project'}
                     </Button>
                     <Button
-                      variant="quiet"
+                      variant="ghost"
                       onClick={() => {
                         setProjectView('pick');
                         setProjectName('');
@@ -904,13 +907,13 @@ export function DeployScreen() {
                 </SelectContent>
               </Select>
               {fieldErrors.node ? (
-                <p className="text-[13px] text-lamp-fault">{fieldErrors.node}</p>
+                <p className="text-[13px] text-fault">{fieldErrors.node}</p>
               ) : null}
             </Field>
           </div>
         </section>
 
-        <section className="border-t border-rail px-4 py-5 sm:px-5">
+        <section className="border-t border-line px-4 py-5 sm:px-5">
           <h2 className="type-display-light text-[15px] leading-none text-ink">Domain</h2>
           <div className="mt-4 flex flex-col gap-4">
             <Field
@@ -927,12 +930,12 @@ export function DeployScreen() {
                 aria-invalid={hostnameError !== undefined}
               />
               {hostnameError ? (
-                <p className="text-[13px] text-lamp-fault">{hostnameError}</p>
+                <p className="text-[13px] text-fault">{hostnameError}</p>
               ) : null}
             </Field>
 
             <fieldset className="flex flex-col gap-2">
-              <legend className="type-body-medium mb-1 text-[13px] text-ink-muted">
+              <legend className="type-body-medium mb-1 text-[13px] text-ink-2">
                 TLS mode
               </legend>
               <label className="flex items-center gap-2 text-[15px] text-ink">
@@ -942,7 +945,7 @@ export function DeployScreen() {
                   value="tunnel"
                   checked={tlsMode === 'tunnel'}
                   onChange={() => setTlsMode('tunnel')}
-                  className="h-4 w-4 accent-cobalt"
+                  className="h-4 w-4 accent-accent-solid"
                 />
                 Cloudflare Tunnel
               </label>
@@ -953,7 +956,7 @@ export function DeployScreen() {
                   value="acme"
                   checked={tlsMode === 'acme'}
                   onChange={() => setTlsMode('acme')}
-                  className="h-4 w-4 accent-cobalt"
+                  className="h-4 w-4 accent-accent-solid"
                 />
                 ACME certificate
               </label>
@@ -961,20 +964,20 @@ export function DeployScreen() {
           </div>
         </section>
 
-        <section className="border-t border-rail px-4 py-5 sm:px-5">
+        <section className="border-t border-line px-4 py-5 sm:px-5">
           <div className="flex flex-wrap items-baseline justify-between gap-2">
             <h2 className="type-display-light text-[15px] leading-none text-ink">
               Environment
             </h2>
             <button
               type="button"
-              className="text-[13px] text-cobalt underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+              className="text-[13px] text-accent underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
               onClick={addRow}
             >
               Add variable
             </button>
           </div>
-          <p className="mt-2 text-[13px] leading-snug text-ink-muted">
+          <p className="mt-2 text-[13px] leading-snug text-ink-2">
             Values are write-only: Quoro stores them encrypted and never shows them again.
           </p>
 
@@ -1001,7 +1004,7 @@ export function DeployScreen() {
                     spellCheck={false}
                   />
                   <Button
-                    variant="quiet"
+                    variant="ghost"
                     className="px-2.5"
                     aria-pressed={row.show}
                     onClick={() => updateRow(row.key, { show: !row.show })}
@@ -1010,7 +1013,7 @@ export function DeployScreen() {
                   </Button>
                 </div>
                 <Button
-                  variant="quiet"
+                  variant="ghost"
                   className="justify-self-start px-2.5"
                   onClick={() => removeRow(row.key)}
                   disabled={envRows.length === 1}
@@ -1021,20 +1024,20 @@ export function DeployScreen() {
             ))}
           </div>
           {fieldErrors.env ? (
-            <p className="mt-2 text-[13px] text-lamp-fault">{fieldErrors.env}</p>
+            <p className="mt-2 text-[13px] text-fault">{fieldErrors.env}</p>
           ) : null}
 
           {sourceKind === 'git' ? (
-            <fieldset className="mt-5 border-t border-rail pt-4">
-              <legend className="type-body-medium mb-1 text-[13px] text-ink-muted">
+            <fieldset className="mt-5 border-t border-line pt-4">
+              <legend className="type-body-medium mb-1 text-[13px] text-ink-2">
                 Build secrets
               </legend>
-              <p className="text-[13px] leading-snug text-ink-muted">
+              <p className="text-[13px] leading-snug text-ink-2">
                 Variables above to mount into the build. Their values still reach the
                 app and are never written to the build log.
               </p>
               {availableSecretNames.length === 0 ? (
-                <p className="mt-2 text-[13px] text-ink-muted">
+                <p className="mt-2 text-[13px] text-ink-2">
                   Name a variable above to use it as a build secret.
                 </p>
               ) : (
@@ -1050,22 +1053,22 @@ export function DeployScreen() {
                         onChange={(event) =>
                           toggleSecret(secretName, event.target.checked)
                         }
-                        className="h-4 w-4 accent-cobalt"
+                        className="h-4 w-4 accent-accent-solid"
                       />
-                      <span className="type-data">{secretName}</span>
+                      <span className="type-code">{secretName}</span>
                     </label>
                   ))}
                 </div>
               )}
               {fieldErrors.secrets ? (
-                <p className="mt-2 text-[13px] text-lamp-fault">{fieldErrors.secrets}</p>
+                <p className="mt-2 text-[13px] text-fault">{fieldErrors.secrets}</p>
               ) : null}
             </fieldset>
           ) : null}
         </section>
 
         {showChecklist ? (
-          <section className="border-t border-rail px-4 py-5 sm:px-5">
+          <section className="border-t border-line px-4 py-5 sm:px-5">
             <h2 className="type-display-light text-[15px] leading-none text-ink">
               Progress
             </h2>
@@ -1082,7 +1085,7 @@ export function DeployScreen() {
                         label={stateWords[state]}
                       />
                       <span className="text-[15px] text-ink">{step.label}</span>
-                      <span className="type-data text-[13px] text-ink-muted">
+                      <span className="type-data text-[13px] text-ink-2">
                         {stateWords[state]}
                       </span>
                     </div>
@@ -1096,7 +1099,7 @@ export function DeployScreen() {
           </section>
         ) : null}
 
-        <div className="flex flex-wrap items-center justify-end gap-2 border-t border-rail px-4 py-4 sm:px-5">
+        <div className="flex flex-wrap items-center justify-end gap-2 border-t border-line px-4 py-4 sm:px-5">
           {problem && failedStep === null ? <ProblemBanner view={problem} className="mr-auto" /> : null}
           {canOpenApp ? (
             <Button variant="primary" asChild>

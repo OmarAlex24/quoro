@@ -35,11 +35,11 @@ export function RevokeGrantDialog({
             already holds authorize nothing without an active grant.
           </p>
 
-          <div className="flex flex-wrap justify-end gap-2 border-t border-rail pt-4">
-            <Button variant="secondary" onClick={() => onOpenChange(false)}>
+          <div className="flex flex-wrap justify-end gap-2 border-t border-line pt-4">
+            <Button variant="default" onClick={() => onOpenChange(false)}>
               Keep grant
             </Button>
-            <Button variant="danger" disabled={pending} onClick={onConfirm}>
+            <Button variant="danger-solid" disabled={pending} onClick={onConfirm}>
               {pending ? 'Revoking…' : 'Revoke grant'}
             </Button>
           </div>

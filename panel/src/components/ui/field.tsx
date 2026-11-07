@@ -17,7 +17,7 @@ export function Field({ label, htmlFor, hint, children, className }: FieldProps)
       <Label htmlFor={htmlFor}>{label}</Label>
       {children}
       {hint ? (
-        <p className="text-[13px] leading-snug text-ink-muted">{hint}</p>
+        <p className="text-[13px] leading-snug text-ink-2">{hint}</p>
       ) : null}
     </div>
   );

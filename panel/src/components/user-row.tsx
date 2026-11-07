@@ -1,6 +1,8 @@
 import type { User, UserRole } from '../api/generated/model';
 import { roleLabel, userLamp } from '../lib/users';
+import { Avatar } from './avatar';
 import { ToneLamp } from './tone-lamp';
+import { Tag } from './ui/tag';
 import { Button } from './ui/button';
 
 const ROLES: UserRole[] = ['owner', 'operator', 'viewer'];
@@ -43,21 +45,22 @@ export function UserRow({
   const canEditRow = canManage && !isSelf;
 
   return (
-    <article className="grid grid-cols-[52px_minmax(0,1fr)] overflow-hidden rounded-[6px] border border-rail bg-panel bay-shadow">
-      <div className="flex items-center justify-center border-r border-rail bg-recess">
+    <article className="grid grid-cols-[52px_minmax(0,1fr)] overflow-hidden rounded-[10px] border border-line bg-surface card-sheen">
+      <div className="flex items-center justify-center border-r border-line bg-sunk">
         <ToneLamp tone={lamp.tone} label={lamp.statusText} />
       </div>
 
       <div className="flex flex-wrap items-start gap-x-4 gap-y-2 px-4 py-3">
         <div className="min-w-0 flex-1 basis-[min(100%,300px)]">
-          <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            <Avatar kind="human" name={user.name} />
             <span className="type-bay-title truncate text-[18px] leading-tight text-ink">
               {user.name}
             </span>
             {isSelf ? (
-              <span className="type-data text-[12px] text-ink-muted">you</span>
+              <Tag tone="accent">you</Tag>
             ) : null}
-            <span className="type-data text-[13px] text-ink-muted">{lamp.statusText}</span>
+            <span className="type-data text-[13px] text-ink-2">{lamp.statusText}</span>
           </div>
 
           <p className="type-data mt-1 truncate text-[13px] text-ink" title={user.email}>
@@ -66,7 +69,7 @@ export function UserRow({
 
           <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-2">
             {canEditRow ? (
-              <label className="flex items-center gap-2 text-[13px] text-ink-muted">
+              <label className="flex items-center gap-2 text-[13px] text-ink-2">
                 <span>Role</span>
                 <select
                   aria-label={`Role for ${user.name}`}
@@ -82,15 +85,13 @@ export function UserRow({
                 </select>
               </label>
             ) : (
-              <span className="inline-flex items-center gap-2 text-[13px] text-ink-muted">
+              <span className="inline-flex items-center gap-2 text-[13px] text-ink-2">
                 <span>Role</span>
-                <span className="type-data rounded-[3px] border border-rail px-1.5 py-0.5 text-[12px] text-ink">
-                  {roleLabel(user.role)}
-                </span>
+                <Tag tone="plain">{roleLabel(user.role)}</Tag>
               </span>
             )}
 
-            <span className="type-data text-[13px] text-ink-muted" title={user.created_at}>
+            <span className="type-data text-[13px] text-ink-2" title={user.created_at}>
               created {createdDate(user.created_at)}
             </span>
           </div>
@@ -100,16 +101,16 @@ export function UserRow({
           <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
             {canEditRow ? (
               <Button
-                variant="secondary"
-                size="compact"
+                variant="default"
+                size="sm"
                 onClick={() => onToggleDisabled(user, !user.disabled)}
               >
                 {user.disabled ? 'Enable' : 'Disable'}
               </Button>
             ) : null}
             <Button
-              variant="quiet"
-              size="compact"
+              variant="ghost"
+              size="sm"
               onClick={() => onResetPassword(user)}
             >
               Reset password
@@ -117,7 +118,7 @@ export function UserRow({
             {canEditRow ? (
               <Button
                 variant="danger"
-                size="compact"
+                size="sm"
                 onClick={() => onDelete(user)}
               >
                 Delete

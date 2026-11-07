@@ -26,13 +26,13 @@ const hasText = (value: string | null | undefined): value is string =>
   typeof value === 'string' && value.length > 0;
 
 function NotRecorded() {
-  return <span className="text-ink-muted">Not recorded</span>;
+  return <span className="text-ink-2">Not recorded</span>;
 }
 
 function DetailRow({ label, children }: { label: string; children: ReactNode }) {
   return (
-    <div className="grid gap-0.5 border-b border-rail/60 py-2 last:border-b-0 sm:grid-cols-[9.5rem_minmax(0,1fr)] sm:gap-3">
-      <dt className="text-[12px] leading-snug text-ink-muted">{label}</dt>
+    <div className="grid gap-0.5 border-b border-line/60 py-2 last:border-b-0 sm:grid-cols-[9.5rem_minmax(0,1fr)] sm:gap-3">
+      <dt className="text-[12px] leading-snug text-ink-2">{label}</dt>
       <dd className="min-w-0 text-[13px] leading-snug text-ink [overflow-wrap:anywhere]">{children}</dd>
     </div>
   );
@@ -48,20 +48,20 @@ function AgentOwner({ agentId }: { agentId: string }) {
 function Parameters({ params }: { params: AuditRecord['params'] }) {
   const entries = Object.entries(params ?? {});
   if (entries.length === 0) {
-    return <span className="text-ink-muted">No parameters recorded.</span>;
+    return <span className="text-ink-2">No parameters recorded.</span>;
   }
   return (
     <dl className="flex flex-col gap-1.5">
       {entries.map(([key, value]) => (
         <div key={key} className="min-w-0">
-          <dt className="type-data text-[12px] text-ink-muted">{key}</dt>
+          <dt className="type-code text-[11px] text-ink-2">{key}</dt>
           <dd className="min-w-0 [overflow-wrap:anywhere]">
             {value !== null && typeof value === 'object' ? (
-              <pre className="font-sans type-data mt-0.5 max-w-full overflow-x-auto whitespace-pre-wrap break-words text-[12px] leading-snug text-ink">
+              <pre className="type-code mt-0.5 max-w-full overflow-x-auto whitespace-pre-wrap break-words text-[11px] leading-snug text-ink">
                 {JSON.stringify(value, null, 2)}
               </pre>
             ) : (
-              <span className="type-data break-words text-[12px] text-ink">
+              <span className="type-code break-words text-[11px] text-ink">
                 {value === null ? 'null' : String(value)}
               </span>
             )}
@@ -75,7 +75,7 @@ function Parameters({ params }: { params: AuditRecord['params'] }) {
 function HashLine({ value }: { value: string }) {
   return (
     <div className="min-w-0">
-      <span className="type-data block break-all text-[12px] leading-snug">{value}</span>
+      <span className="type-code block break-all text-[11px] leading-snug">{value}</span>
       <CopyButton value={value} label="Copy hash" />
     </div>
   );
@@ -88,18 +88,18 @@ function TargetValue({ record }: { record: AuditRecord }) {
   const id = record.target_id;
   return (
     <span className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
-      <span className="text-ink-muted">{type}</span>
+      <span className="text-ink-2">{type}</span>
       {type === 'app' ? (
         <Link
           to="/apps/$appId"
           params={{ appId: id }}
           title={id}
-          className="type-data text-ink underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+          className="type-code text-ink underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
         >
           {shortId(id)}
         </Link>
       ) : (
-        <span className="type-data break-all" title={id}>
+        <span className="type-code break-all" title={id}>
           {shortId(id)}
         </span>
       )}
@@ -122,7 +122,7 @@ export function AuditRecordPanel({ seq, onClose }: { seq: number; onClose: () =>
         return (
           <span className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
             <span className="type-data text-[13px]">{localTime(value.time)}</span>
-            <span className="type-data text-[12px] text-ink-muted" title="RFC 3339">
+            <span className="type-data text-[12px] text-ink-2" title="RFC 3339">
               {value.time}
             </span>
           </span>
@@ -130,13 +130,13 @@ export function AuditRecordPanel({ seq, onClose }: { seq: number; onClose: () =>
       case 'actor':
         return (
           <span className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
-            <span className="text-ink-muted">{actorWords[value.actor_type]}</span>
+            <span className="text-ink-2">{actorWords[value.actor_type]}</span>
             {value.actor_type === 'agent' ? (
               <AgentName id={value.actor_id} />
             ) : value.actor_type === 'user' ? (
               <UserName id={value.actor_id} />
             ) : (
-              <span className="type-data break-all" title={value.actor_id}>
+              <span className="type-code break-all" title={value.actor_id}>
                 {shortId(value.actor_id)}
               </span>
             )}
@@ -159,10 +159,10 @@ export function AuditRecordPanel({ seq, onClose }: { seq: number; onClose: () =>
       case 'channel':
         return <span>{channelWords[value.channel]}</span>;
       case 'operation':
-        return <span className="type-data break-all">{value.operation}</span>;
+        return <span className="type-code break-all">{value.operation}</span>;
       case 'scope':
         return hasText(value.scope) ? (
-          <span className="type-data">{value.scope}</span>
+          <span className="type-code">{value.scope}</span>
         ) : (
           <NotRecorded />
         );
@@ -170,7 +170,7 @@ export function AuditRecordPanel({ seq, onClose }: { seq: number; onClose: () =>
         return <TargetValue record={value} />;
       case 'project':
         return hasText(value.project_id) ? (
-          <span className="type-data break-all" title={value.project_id}>
+          <span className="type-code break-all" title={value.project_id}>
             {shortId(value.project_id)}
           </span>
         ) : (
@@ -186,7 +186,7 @@ export function AuditRecordPanel({ seq, onClose }: { seq: number; onClose: () =>
         );
       case 'trigger_event':
         return hasText(value.trigger_event_id) ? (
-          <span className="type-data break-all" title={value.trigger_event_id}>
+          <span className="type-code break-all" title={value.trigger_event_id}>
             {shortId(value.trigger_event_id)}
           </span>
         ) : (
@@ -198,7 +198,7 @@ export function AuditRecordPanel({ seq, onClose }: { seq: number; onClose: () =>
             to="/audit"
             search={{ ...search, incident_id: value.incident_id, seq: undefined }}
             title={value.incident_id}
-            className="type-data text-ink underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+            className="type-code text-ink underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
           >
             {shortId(value.incident_id)}
           </Link>
@@ -207,7 +207,7 @@ export function AuditRecordPanel({ seq, onClose }: { seq: number; onClose: () =>
         );
       case 'grant':
         return hasText(value.grant_id) ? (
-          <span className="type-data break-all" title={value.grant_id}>
+          <span className="type-code break-all" title={value.grant_id}>
             {shortId(value.grant_id)}
           </span>
         ) : (
@@ -215,7 +215,7 @@ export function AuditRecordPanel({ seq, onClose }: { seq: number; onClose: () =>
         );
       case 'approval':
         return hasText(value.approval_id) ? (
-          <span className="type-data break-all" title={value.approval_id}>
+          <span className="type-code break-all" title={value.approval_id}>
             {shortId(value.approval_id)}
           </span>
         ) : (
@@ -224,7 +224,7 @@ export function AuditRecordPanel({ seq, onClose }: { seq: number; onClose: () =>
       case 'request_id':
         return (
           <span className="flex flex-wrap items-center gap-2">
-            <span className="type-data break-all" title={value.request_id}>
+            <span className="type-code break-all" title={value.request_id}>
               {shortId(value.request_id)}
             </span>
             <CopyButton value={value.request_id} label="Copy request id" />
@@ -243,7 +243,7 @@ export function AuditRecordPanel({ seq, onClose }: { seq: number; onClose: () =>
         );
       case 'result_detail':
         return hasText(value.result_detail) ? (
-          <span className="type-data">{value.result_detail}</span>
+          <span className="type-code">{value.result_detail}</span>
         ) : (
           <NotRecorded />
         );
@@ -263,25 +263,25 @@ export function AuditRecordPanel({ seq, onClose }: { seq: number; onClose: () =>
   return (
     <section
       aria-label={`Audit entry ${seq}`}
-      className="rounded-[6px] border border-rail bg-panel bay-shadow"
+      className="rounded-[10px] border border-line bg-surface card-sheen"
     >
-      <div className="flex items-start justify-between gap-3 border-b border-rail px-4 py-3">
+      <div className="flex items-start justify-between gap-3 border-b border-line px-4 py-3">
         <div className="min-w-0">
           <h2 className="type-bay-title text-[16px] leading-tight">
             Entry <span className="type-data">{seq}</span>
           </h2>
-          <p className="mt-0.5 type-data text-[11px] text-ink-muted" title={record?.hash}>
+          <p className="mt-0.5 type-code text-[10.5px] text-ink-2" title={record?.hash}>
             {record ? shortHash(record.hash) : 'reading the record'}
           </p>
         </div>
-        <Button variant="quiet" onClick={onClose}>
+        <Button variant="ghost" onClick={onClose}>
           Close
         </Button>
       </div>
 
       <div className="px-4 py-3">
         {recordQuery.isPending ? (
-          <p className="text-[13px] text-ink-muted">Reading entry {seq}…</p>
+          <p className="text-[13px] text-ink-2">Reading entry {seq}…</p>
         ) : missing ? (
           <p className="text-[13px] text-ink">No entry with that sequence number.</p>
         ) : recordQuery.error ? (

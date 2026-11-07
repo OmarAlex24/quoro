@@ -164,7 +164,7 @@ export function CreateVmDialog({
               aria-invalid={fieldErrors.name !== undefined}
             />
             {fieldErrors.name ? (
-              <p className="text-[13px] text-lamp-fault">{fieldErrors.name}</p>
+              <p className="text-[13px] text-fault">{fieldErrors.name}</p>
             ) : null}
           </Field>
 
@@ -181,7 +181,7 @@ export function CreateVmDialog({
                 aria-invalid={fieldErrors.vcpus !== undefined}
               />
               {fieldErrors.vcpus ? (
-                <p className="text-[13px] text-lamp-fault">{fieldErrors.vcpus}</p>
+                <p className="text-[13px] text-fault">{fieldErrors.vcpus}</p>
               ) : null}
             </Field>
             <Field label="Memory (MiB)" htmlFor="vm-memory">
@@ -196,7 +196,7 @@ export function CreateVmDialog({
                 aria-invalid={fieldErrors.memory !== undefined}
               />
               {fieldErrors.memory ? (
-                <p className="text-[13px] text-lamp-fault">{fieldErrors.memory}</p>
+                <p className="text-[13px] text-fault">{fieldErrors.memory}</p>
               ) : null}
             </Field>
             <Field label="Disk (GiB)" htmlFor="vm-disk">
@@ -211,7 +211,7 @@ export function CreateVmDialog({
                 aria-invalid={fieldErrors.disk !== undefined}
               />
               {fieldErrors.disk ? (
-                <p className="text-[13px] text-lamp-fault">{fieldErrors.disk}</p>
+                <p className="text-[13px] text-fault">{fieldErrors.disk}</p>
               ) : null}
             </Field>
           </div>
@@ -227,11 +227,11 @@ export function CreateVmDialog({
 
           <div className="flex flex-col gap-1.5">
             <div className="flex items-baseline justify-between gap-3">
-              <span className="type-body-medium text-[13px] text-ink-muted">Project</span>
+              <span className="type-body-medium text-[13px] text-ink-2">Project</span>
               {projectView === 'pick' ? (
                 <button
                   type="button"
-                  className="text-[13px] text-cobalt underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+                  className="text-[13px] text-accent underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
                   onClick={() => {
                     setProblem(null);
                     setProjectView('create');
@@ -267,15 +267,15 @@ export function CreateVmDialog({
                   </SelectContent>
                 </Select>
                 {fieldErrors.project ? (
-                  <p className="text-[13px] text-lamp-fault">{fieldErrors.project}</p>
+                  <p className="text-[13px] text-fault">{fieldErrors.project}</p>
                 ) : (
-                  <p className="text-[13px] text-ink-muted">
+                  <p className="text-[13px] text-ink-2">
                     VMs belong to a project; apps will group under it too.
                   </p>
                 )}
               </>
             ) : (
-              <div className="rounded-[6px] border border-rail bg-recess/40 p-3">
+              <div className="rounded-[10px] border border-line bg-sunk/40 p-3">
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                   <Field label="Project name" htmlFor="project-name">
                     <Input
@@ -305,13 +305,13 @@ export function CreateVmDialog({
                       aria-invalid={projectSlugError !== undefined}
                     />
                     {projectSlugError ? (
-                      <p className="text-[13px] text-lamp-fault">{projectSlugError}</p>
+                      <p className="text-[13px] text-fault">{projectSlugError}</p>
                     ) : null}
                   </Field>
                 </div>
                 <div className="mt-3 flex flex-wrap gap-2">
                   <Button
-                    variant="secondary"
+                    variant="default"
                     disabled={
                       createProjectMutation.isPending ||
                       projectName.trim() === '' ||
@@ -325,7 +325,7 @@ export function CreateVmDialog({
                     {createProjectMutation.isPending ? 'Creating…' : 'Create project'}
                   </Button>
                   <Button
-                    variant="quiet"
+                    variant="ghost"
                     onClick={() => {
                       setProjectView('pick');
                       setProjectName('');
@@ -357,12 +357,12 @@ export function CreateVmDialog({
               </SelectContent>
             </Select>
             {fieldErrors.node ? (
-              <p className="text-[13px] text-lamp-fault">{fieldErrors.node}</p>
+              <p className="text-[13px] text-fault">{fieldErrors.node}</p>
             ) : null}
           </Field>
 
-          <div className="mt-1 flex flex-wrap justify-end gap-2 border-t border-rail pt-4">
-            <Button variant="secondary" onClick={() => onOpenChange(false)}>
+          <div className="mt-1 flex flex-wrap justify-end gap-2 border-t border-line pt-4">
+            <Button variant="default" onClick={() => onOpenChange(false)}>
               Cancel
             </Button>
             <Button variant="primary" type="submit" disabled={createVmMutation.isPending}>

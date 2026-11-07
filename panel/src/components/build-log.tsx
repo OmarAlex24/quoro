@@ -51,7 +51,7 @@ const statusTone = (state: StreamState) => {
 };
 
 const RULING =
-  'repeating-linear-gradient(to bottom, transparent 0, transparent 19px, rgb(20 32 48 / 0.045) 19px, rgb(20 32 48 / 0.045) 20px)';
+  'repeating-linear-gradient(to bottom, transparent 0, transparent 19px, color-mix(in oklab, var(--line) 55%, transparent) 19px, color-mix(in oklab, var(--line) 55%, transparent) 20px)';
 
 const PAGE_LIMIT = 1_000;
 const MAX_PAGES = 20;
@@ -298,12 +298,12 @@ export function BuildLog({
 
         <div className="ml-auto flex flex-wrap items-center gap-1.5">
           {!follow ? (
-            <Button variant="quiet" className="px-2.5" onClick={jumpToNewest}>
+            <Button variant="ghost" className="px-2.5" onClick={jumpToNewest}>
               Jump to newest
             </Button>
           ) : null}
           <Button
-            variant="quiet"
+            variant="ghost"
             className="px-2.5"
             aria-pressed={follow}
             onClick={() => setFollow((current) => !current)}
@@ -311,14 +311,14 @@ export function BuildLog({
             Follow
           </Button>
           <Button
-            variant="quiet"
+            variant="ghost"
             className="px-2.5"
             aria-pressed={paused}
             onClick={togglePause}
           >
             {paused ? 'Resume' : 'Pause'}
           </Button>
-          <span className="type-data ml-1 text-[13px] text-ink-muted">
+          <span className="type-data ml-1 text-[13px] text-ink-2">
             {lines.length} {lines.length === 1 ? 'line' : 'lines'}
           </span>
         </div>
@@ -328,17 +328,17 @@ export function BuildLog({
         <div className="mt-2 flex flex-wrap items-start gap-2">
           <ProblemBanner view={problem} className="min-w-0 flex-1" />
           {state === 'error' ? (
-            <Button variant="quiet" className="px-2.5" onClick={() => setAttempt((n) => n + 1)}>
+            <Button variant="ghost" className="px-2.5" onClick={() => setAttempt((n) => n + 1)}>
               Reconnect
             </Button>
           ) : null}
         </div>
       ) : null}
       {note ? (
-        <p className="mt-2 text-[13px] leading-snug text-ink-muted">{note}</p>
+        <p className="mt-2 text-[13px] leading-snug text-ink-2">{note}</p>
       ) : null}
 
-      <div className="mt-2 rounded-[6px] border border-rail bg-recess p-1.5 shadow-[inset_0_2px_6px_rgb(20_32_48_/_0.18)]">
+      <div className="mt-2 rounded-[10px] border border-line bg-sunk p-1.5">
         <div
           ref={tapeRef}
           role="log"
@@ -350,11 +350,11 @@ export function BuildLog({
               element.scrollHeight - element.scrollTop - element.clientHeight < 24;
             setFollow(atBottom);
           }}
-          className="h-[320px] overflow-y-auto bg-panel px-2 py-2 sm:h-[420px]"
+          className="h-[320px] overflow-y-auto bg-surface px-2 py-2 sm:h-[420px]"
           style={{ backgroundImage: RULING }}
         >
           {lines.length === 0 ? (
-            <p className="px-1 py-2 text-[13px] leading-snug text-ink-muted">
+            <p className="px-1 py-2 text-[13px] leading-snug text-ink-2">
               {state === 'unreachable'
                 ? 'The node keeps this log; it cannot be read while the node is unreachable.'
                 : 'Waiting for build output. BuildKit lines appear here as the node writes them.'}
@@ -373,7 +373,7 @@ export function BuildLog({
                   className={cn(
                     'relative grid grid-cols-[76px_34px_minmax(0,1fr)] items-baseline gap-2 py-px leading-5',
                     entry.stream === 'stderr' && 'pl-2',
-                    failing && 'bg-lamp-fault/[0.08]',
+                    failing && 'bg-fault/[0.08]',
                   )}
                 >
                   {entry.stream === 'stderr' || failing ? (
@@ -381,22 +381,22 @@ export function BuildLog({
                       aria-hidden="true"
                       className={cn(
                         'absolute bottom-0 left-0 top-0 w-[3px]',
-                        failing ? 'bg-lamp-fault' : 'bg-lamp-fault/50',
+                        failing ? 'bg-fault' : 'bg-fault/50',
                       )}
                     />
                   ) : null}
                   <span
-                    className="type-data truncate text-[12px] text-ink-muted"
+                    className="type-data truncate text-[12px] text-ink-2"
                     title={entry.time}
                   >
                     {formatLogTime(entry.time)}
                   </span>
-                  <span className="type-data text-[11px] text-ink-muted/80">
+                  <span className="type-data text-[11px] text-ink-2/80">
                     {entry.vertex === null || entry.vertex === undefined
                       ? ' '
                       : `#${entry.vertex}`}
                   </span>
-                  <span className="whitespace-pre-wrap break-words font-mono text-[12.5px] text-ink">
+                  <span className="type-code whitespace-pre-wrap break-words text-[11.5px] text-ink">
                     {entry.line}
                   </span>
                 </div>

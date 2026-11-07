@@ -3,8 +3,8 @@ import { cn } from '../../lib/utils';
 import { problemFacts, type ProblemView } from '../../lib/problem';
 
 /**
- * A refusal or failure, said in plain words. Panel surface with a fault-red
- * edge; the machine facts (code, reason) sit in muted text below.
+ * A refusal or failure, said in plain words, on a faint fault tint; the
+ * machine facts (code, reason) sit below as code.
  */
 export function ProblemBanner({
   view,
@@ -18,13 +18,13 @@ export function ProblemBanner({
     <div
       role="alert"
       className={cn(
-        'rounded-[6px] border border-rail border-l-4 border-l-lamp-fault bg-panel px-3.5 py-2.5 shadow-[0_1px_0_rgb(20_32_48_/_0.04)]',
+        'rounded-[8px] border border-[color-mix(in_oklab,var(--fault)_35%,var(--line))] bg-[color-mix(in_oklab,var(--fault)_8%,var(--surface))] px-3 py-2.5',
         className,
       )}
     >
-      <p className="text-[15px] leading-snug text-ink">{view.message}</p>
+      <p className="text-[13.5px] font-[600] leading-snug text-ink">{view.message}</p>
       {facts ? (
-        <p className="type-data mt-1 text-[13px] text-ink-muted">{facts}</p>
+        <p className="type-code mt-1 text-ink-2">{facts}</p>
       ) : null}
     </div>
   );
@@ -33,7 +33,7 @@ export function ProblemBanner({
 /** A neutral confirmation line, e.g. "Stopped web-1". */
 export function NoticeLine({ children }: { children: ReactNode }) {
   return (
-    <p aria-live="polite" className="type-data text-[13px] text-ink-muted">
+    <p aria-live="polite" className="type-data text-[13px] text-ink-2">
       {children}
     </p>
   );

@@ -82,7 +82,7 @@ export function AuditFilters({ search }: { search: AuditSearch }) {
   return (
     <section
       aria-label="Audit filters"
-      className="rounded-[6px] border border-rail bg-panel px-4 py-3 bay-shadow"
+      className="rounded-[10px] border border-line bg-surface px-4 py-3 card-sheen"
     >
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <Field label="Actor" htmlFor="audit-actor">
@@ -205,7 +205,7 @@ export function AuditFilters({ search }: { search: AuditSearch }) {
       {hasFilters ? (
         <div className="mt-3 flex justify-end">
           <Button
-            variant="quiet"
+            variant="ghost"
             onClick={() => {
               setActorDraft('');
               setTargetDraft('');

@@ -62,9 +62,9 @@ export function SetupScreen() {
   return (
     <AuthPanel
       footer={
-        <p className="text-[13px] text-ink-muted">
+        <p className="text-[13px] text-ink-2">
           Setup already done?{' '}
-          <Link to="/login" className="text-cobalt underline-offset-4 hover:underline">
+          <Link to="/login" className="text-accent underline-offset-4 hover:underline">
             Log in
           </Link>
         </p>
@@ -74,15 +74,15 @@ export function SetupScreen() {
 
       <form onSubmit={submit} className="mt-4 flex flex-col gap-4" noValidate>
         {alreadyDone ? (
-          <div className="rounded-[6px] border border-rail border-l-4 border-l-lamp-fault bg-panel px-3.5 py-2.5">
+          <div className="rounded-[10px] border border-line border-l-4 border-l-fault bg-surface px-3.5 py-2.5">
             <p className="text-[15px] leading-snug text-ink">
               Setup is already done.{' '}
-              <Link to="/login" className="text-cobalt underline-offset-4 hover:underline">
+              <Link to="/login" className="text-accent underline-offset-4 hover:underline">
                 Log in instead
               </Link>
               .
             </p>
-            <p className="type-data mt-1 text-[13px] text-ink-muted">conflict</p>
+            <p className="type-code mt-1 text-[12px] text-ink-2">conflict</p>
           </div>
         ) : null}
 
@@ -106,7 +106,7 @@ export function SetupScreen() {
             autoFocus
           />
           {fieldErrors.token ? (
-            <p className="text-[13px] text-lamp-fault">{fieldErrors.token}</p>
+            <p className="text-[13px] text-fault">{fieldErrors.token}</p>
           ) : null}
         </Field>
 
@@ -120,7 +120,7 @@ export function SetupScreen() {
             aria-invalid={fieldErrors.email !== undefined}
           />
           {fieldErrors.email ? (
-            <p className="text-[13px] text-lamp-fault">{fieldErrors.email}</p>
+            <p className="text-[13px] text-fault">{fieldErrors.email}</p>
           ) : null}
         </Field>
 
@@ -133,7 +133,7 @@ export function SetupScreen() {
             aria-invalid={fieldErrors.name !== undefined}
           />
           {fieldErrors.name ? (
-            <p className="text-[13px] text-lamp-fault">{fieldErrors.name}</p>
+            <p className="text-[13px] text-fault">{fieldErrors.name}</p>
           ) : null}
         </Field>
 
@@ -151,7 +151,7 @@ export function SetupScreen() {
             aria-invalid={fieldErrors.password !== undefined}
           />
           {fieldErrors.password ? (
-            <p className="text-[13px] text-lamp-fault">{fieldErrors.password}</p>
+            <p className="text-[13px] text-fault">{fieldErrors.password}</p>
           ) : null}
         </Field>
 

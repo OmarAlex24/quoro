@@ -70,7 +70,7 @@ export function AuditVerify({
   return (
     <section
       aria-label="Chain verification"
-      className="rounded-[6px] border border-rail bg-panel px-4 py-3 bay-shadow"
+      className="rounded-[10px] border border-line bg-surface px-4 py-3 card-sheen"
     >
       <form
         onSubmit={(event) => {
@@ -81,7 +81,7 @@ export function AuditVerify({
       >
         <div className="min-w-0 flex-1 basis-64">
           <h2 className="type-bay-title text-[15px] leading-tight">Chain verification</h2>
-          <p className="mt-1 text-[13px] leading-snug text-ink-muted">
+          <p className="mt-1 text-[13px] leading-snug text-ink-2">
             Recomputes every link. Leave the bounds empty to check the whole log.
           </p>
         </div>
@@ -118,7 +118,7 @@ export function AuditVerify({
       {problem ? <ProblemBanner view={problem} className="mt-3" /> : null}
 
       {result ? (
-        <div className="mt-3 rounded-[6px] border border-rail bg-recess/45 px-3 py-2.5">
+        <div className="mt-3 rounded-[10px] border border-line bg-sunk/45 px-3 py-2.5">
           <div className="flex items-start gap-2.5">
             <ToneLamp
               tone={result.ok ? 'run' : 'fault'}
@@ -141,24 +141,24 @@ export function AuditVerify({
               )}
 
               {!result.ok ? (
-                <p className="mt-0.5 text-[13px] leading-snug text-ink-muted">
+                <p className="mt-0.5 text-[13px] leading-snug text-ink-2">
                   {brokenReasonWords(result.reason)}
                 </p>
               ) : null}
 
               {!result.ok ? (
-                <p className="type-data mt-1 text-[12px] text-ink-muted">
+                <p className="type-data mt-1 text-[12px] text-ink-2">
                   Checked {result.checked} entries, seq {result.first_seq} to {result.last_seq}.
                 </p>
               ) : null}
 
               <div className="mt-1.5 flex flex-wrap items-center gap-2">
-                <span className="type-data text-[12px] text-ink-muted" title={result.head_hash}>
+                <span className="type-code text-[11px] text-ink-2" title={result.head_hash}>
                   Head {shortHash(result.head_hash)}
                 </span>
                 <CopyButton value={result.head_hash} label="Copy head hash" />
                 {brokenAt !== null ? (
-                  <Button variant="secondary" onClick={() => onOpenEntry(brokenAt)}>
+                  <Button variant="default" onClick={() => onOpenEntry(brokenAt)}>
                     Open entry {brokenAt}
                   </Button>
                 ) : null}

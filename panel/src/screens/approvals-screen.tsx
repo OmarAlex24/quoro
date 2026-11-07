@@ -54,7 +54,7 @@ export function ApprovalsScreen() {
   if (loading) {
     return (
       <main className="mx-auto w-full max-w-6xl px-4 py-8 sm:px-6">
-        <p className="text-[15px] text-ink-muted">Loading…</p>
+        <p className="text-[15px] text-ink-2">Loading…</p>
       </main>
     );
   }
@@ -77,13 +77,13 @@ export function ApprovalsScreen() {
   return (
     <main className="mx-auto w-full max-w-6xl px-4 py-6 sm:px-6 sm:py-8">
       <h1 className="type-display text-[24px] leading-none">Approvals</h1>
-      <p className="mt-2 max-w-2xl text-[14px] leading-snug text-ink-muted">
+      <p className="mt-2 max-w-2xl text-[14px] leading-snug text-ink-2">
         Agents ask before any delete. Approving lets that one call run once, within 10
         minutes.
       </p>
 
       {!canDecide ? (
-        <p className="mt-4 rounded-[6px] border border-rail bg-panel px-3.5 py-2.5 text-[13px] leading-snug text-ink-muted">
+        <p className="mt-4 rounded-[10px] border border-line bg-surface px-3.5 py-2.5 text-[13px] leading-snug text-ink-2">
           {DECIDER_ONLY_SENTENCE}
         </p>
       ) : null}
@@ -92,21 +92,21 @@ export function ApprovalsScreen() {
         <div
           role="status"
           aria-live="polite"
-          className="mt-4 rounded-[6px] border border-rail bg-panel px-3.5 py-2.5"
+          className="mt-4 rounded-[10px] border border-line bg-surface px-3.5 py-2.5"
         >
           {notice.kind === 'approve' ? (
             <p className="text-[14px] leading-snug text-ink">
               {notice.approval.grant_id ? (
                 <>
                   Approved. Grant{' '}
-                  <span className="type-data" title={notice.approval.grant_id}>
+                  <span className="type-code" title={notice.approval.grant_id}>
                     {shortId(notice.approval.grant_id)}
                   </span>{' '}
                   is valid for 10 minutes.{' '}
                   <Link
                     to="/grants"
                     search={{ agent_id: notice.approval.agent_id, kind: 'approval' }}
-                    className="text-cobalt underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+                    className="text-accent underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
                   >
                     See the grant
                   </Link>
@@ -119,7 +119,7 @@ export function ApprovalsScreen() {
             <p className="text-[14px] leading-snug text-ink">
               Denied <AgentName id={notice.approval.agent_id} link={false} />
               &rsquo;s request to{' '}
-              <span className="type-data">{notice.approval.scope}</span>.
+              <span className="type-code">{notice.approval.scope}</span>.
             </p>
           )}
         </div>
@@ -136,11 +136,11 @@ export function ApprovalsScreen() {
         <div className="mt-3 flex flex-col gap-3">
           {pending.isPending ? (
             <>
-              <div className="h-[220px] rounded-[6px] border border-rail bg-panel/60" />
-              <div className="h-[220px] rounded-[6px] border border-rail bg-panel/60" />
+              <div className="h-[220px] rounded-[10px] border border-line bg-surface/60" />
+              <div className="h-[220px] rounded-[10px] border border-line bg-surface/60" />
             </>
           ) : waiting.length === 0 ? (
-            <div className="rounded-[6px] border border-dashed border-rail bg-panel/50 px-4 py-10 text-center">
+            <div className="rounded-[10px] border border-dashed border-line bg-surface/50 px-4 py-10 text-center">
               <p className="text-[15px] text-ink">
                 Nothing is waiting. When an agent asks to delete something, it shows up
                 here.
@@ -168,15 +168,15 @@ export function ApprovalsScreen() {
 
         {decided.length === 0 ? (
           approved.isPending || denied.isPending || expired.isPending ? (
-            <p className="mt-3 text-[13px] text-ink-muted">Loading…</p>
+            <p className="mt-3 text-[13px] text-ink-2">Loading…</p>
           ) : (
-            <p className="mt-3 text-[13px] text-ink-muted">
+            <p className="mt-3 text-[13px] text-ink-2">
               Nothing has been decided yet. Approved, denied and expired requests stay
               here.
             </p>
           )
         ) : (
-          <ul className="mt-2 flex flex-col divide-y divide-rail border-y border-rail">
+          <ul className="mt-2 flex flex-col divide-y divide-line border-y border-line">
             {decided.map((approval) => (
               <ApprovalRow key={approval.id} approval={approval} />
             ))}

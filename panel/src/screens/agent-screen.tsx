@@ -19,6 +19,7 @@ import { AgentKeys } from '../components/agent-keys';
 import { EditAgentDialog } from '../components/agent-dialog';
 import { CopyButton } from '../components/copy-button';
 import { UserName } from '../components/identity-name';
+import { Avatar } from '../components/avatar';
 import { ToneLamp } from '../components/tone-lamp';
 import { Button } from '../components/ui/button';
 import { Dialog, DialogContent } from '../components/ui/dialog';
@@ -30,7 +31,7 @@ const routeApi = getRouteApi('/agents/$agentId');
 const backLink = (
   <Link
     to="/agents"
-    className="text-[13px] text-ink-muted underline-offset-4 hover:text-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+    className="text-[13px] text-ink-2 underline-offset-4 hover:text-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
   >
     All agents
   </Link>
@@ -86,7 +87,7 @@ export function AgentScreen() {
   if (loading) {
     return (
       <main className="mx-auto w-full max-w-4xl px-4 py-8 sm:px-6">
-        <p className="text-[15px] text-ink-muted">Loading…</p>
+        <p className="text-[15px] text-ink-2">Loading…</p>
       </main>
     );
   }
@@ -96,7 +97,7 @@ export function AgentScreen() {
   if (agentQuery.isPending) {
     return (
       <main className="mx-auto w-full max-w-4xl px-4 py-8 sm:px-6">
-        <div className="h-[150px] rounded-[6px] border border-rail bg-panel/60" />
+        <div className="h-[150px] rounded-[10px] border border-line bg-surface/60" />
       </main>
     );
   }
@@ -131,22 +132,23 @@ export function AgentScreen() {
     <main className="mx-auto w-full max-w-4xl px-4 py-6 sm:px-6 sm:py-8">
       <div className="mb-3">{backLink}</div>
 
-      <header className="rounded-[6px] border border-rail bg-panel px-4 py-4 bay-shadow sm:px-5">
+      <header className="rounded-[10px] border border-line bg-surface px-4 py-4 card-sheen sm:px-5">
         <div className="flex flex-wrap items-start gap-x-4 gap-y-3">
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-2.5">
+              <Avatar kind="agent" seed={agent.id} size="lg" />
               <ToneLamp tone={lamp.tone} label={lamp.statusText} />
-              <h1 className="type-display nameplate min-w-0 truncate text-[26px] leading-none">
+              <h1 className="type-display min-w-0 truncate text-[26px] leading-none">
                 {agent.name}
               </h1>
-              <span className="type-data text-[13px] text-ink-muted">{lamp.statusText}</span>
+              <span className="type-data text-[13px] text-ink-2">{lamp.statusText}</span>
             </div>
             {agent.description ? (
-              <p className="mt-2 max-w-2xl text-[14px] leading-snug text-ink-muted">
+              <p className="mt-2 max-w-2xl text-[14px] leading-snug text-ink-2">
                 {agent.description}
               </p>
             ) : (
-              <p className="mt-2 text-[13px] text-ink-muted">
+              <p className="mt-2 text-[13px] text-ink-2">
                 No description yet. Edit the agent to say what it is for.
               </p>
             )}
@@ -154,11 +156,11 @@ export function AgentScreen() {
 
           {canManage ? (
             <div className="flex flex-wrap items-center gap-2">
-              <Button variant="secondary" onClick={() => setEditOpen(true)}>
+              <Button variant="default" onClick={() => setEditOpen(true)}>
                 Edit
               </Button>
               <Button
-                variant="secondary"
+                variant="default"
                 disabled={toggle.isPending}
                 onClick={() => {
                   setNotice(null);
@@ -184,42 +186,42 @@ export function AgentScreen() {
         </div>
 
         {canManage ? (
-          <p className="mt-2 text-[13px] leading-snug text-ink-muted">
+          <p className="mt-2 text-[13px] leading-snug text-ink-2">
             A disabled agent can't get new access tokens, so it is locked out within 5
             minutes.
           </p>
         ) : (
-          <p className="mt-2 text-[13px] text-ink-muted">
+          <p className="mt-2 text-[13px] text-ink-2">
             Your role can read this agent but not change it.
           </p>
         )}
 
-        <dl className="type-data mt-4 grid grid-cols-1 gap-x-6 gap-y-1 border-t border-rail pt-3 text-[13px] sm:grid-cols-2">
+        <dl className="type-data mt-4 grid grid-cols-1 gap-x-6 gap-y-1 border-t border-line pt-3 text-[13px] sm:grid-cols-2">
           <div className="flex gap-2">
-            <dt className="text-ink-muted">Model</dt>
+            <dt className="text-ink-2">Model</dt>
             <dd className="min-w-0 truncate text-ink">{agent.model}</dd>
           </div>
           <div className="flex gap-2">
-            <dt className="text-ink-muted">Owner</dt>
+            <dt className="text-ink-2">Owner</dt>
             <dd className="min-w-0 truncate text-ink">
               <UserName id={agent.owner_user_id} />
             </dd>
           </div>
           <div className="flex gap-2">
-            <dt className="text-ink-muted">Created</dt>
+            <dt className="text-ink-2">Created</dt>
             <dd className="text-ink" title={agent.created_at}>
               {relativeTime(agent.created_at)}
             </dd>
           </div>
           <div className="flex gap-2">
-            <dt className="text-ink-muted">Updated</dt>
+            <dt className="text-ink-2">Updated</dt>
             <dd className="text-ink" title={agent.updated_at}>
               {relativeTime(agent.updated_at)}
             </dd>
           </div>
           <div className="flex min-w-0 flex-wrap items-center gap-2 sm:col-span-2">
-            <dt className="text-ink-muted">Id</dt>
-            <dd className="type-data min-w-0 break-all text-ink" title={agent.id}>
+            <dt className="text-ink-2">Id</dt>
+            <dd className="type-code min-w-0 break-all text-ink" title={agent.id}>
               {agent.id}
             </dd>
             <CopyButton value={agent.id} label="Copy id" />
@@ -230,9 +232,9 @@ export function AgentScreen() {
       {notice ? <div className="mt-2">{<NoticeLine>{notice}</NoticeLine>}</div> : null}
       {problem ? <ProblemBanner view={problem} className="mt-3" /> : null}
 
-      <section className="mt-5 rounded-[6px] border border-rail bg-panel px-4 py-4 sm:px-5">
+      <section className="mt-5 rounded-[10px] border border-line bg-surface px-4 py-4 sm:px-5">
         <h2 className="type-display-light text-[15px] leading-none text-ink">Grants</h2>
-        <p className="mt-2 text-[13px] leading-snug text-ink-muted">
+        <p className="mt-2 text-[13px] leading-snug text-ink-2">
           {grantError
             ? grantError
             : grantCount === undefined
@@ -247,21 +249,21 @@ export function AgentScreen() {
           <Link
             to="/grants"
             search={{ agent_id: agent.id }}
-            className="text-cobalt underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+            className="text-accent underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
           >
             See its grants
           </Link>
           <Link
             to="/audit"
             search={{ actor_id: agent.id }}
-            className="text-cobalt underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+            className="text-accent underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
           >
             See what it did
           </Link>
         </div>
       </section>
 
-      <section className="mt-5 rounded-[6px] border border-rail bg-panel px-4 py-4 sm:px-5">
+      <section className="mt-5 rounded-[10px] border border-line bg-surface px-4 py-4 sm:px-5">
         <AgentKeys key={agent.id} agentId={agent.id} agentName={agent.name} canWrite={canManage} />
       </section>
 
@@ -284,11 +286,11 @@ export function AgentScreen() {
               description="Deletes the agent and revokes its keys and tokens. Its grants and audit entries stay readable."
             >
               <div className="flex flex-wrap justify-end gap-2">
-                <Button variant="secondary" onClick={() => setConfirmDelete(false)}>
+                <Button variant="default" onClick={() => setConfirmDelete(false)}>
                   Keep the agent
                 </Button>
                 <Button
-                  variant="danger"
+                  variant="danger-solid"
                   disabled={remove.isPending}
                   onClick={() => remove.mutate()}
                 >

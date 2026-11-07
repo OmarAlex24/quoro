@@ -51,6 +51,7 @@ import { AppDomains } from '../components/app-domains';
 import { AppEdgeBackends } from '../components/app-edge';
 import { AppEnvDialog } from '../components/app-env-dialog';
 import { AppInstances } from '../components/app-instances';
+import { ImageRef } from '../components/image-ref';
 import { AppStorage } from '../components/app-storage';
 import {
   AppVulnerabilities,
@@ -240,7 +241,7 @@ export function AppScreen() {
   if (loading) {
     return (
       <main className="mx-auto w-full max-w-4xl px-4 py-8 sm:px-6">
-        <p className="text-[15px] text-ink-muted">Loading…</p>
+        <p className="text-[15px] text-ink-2">Loading…</p>
       </main>
     );
   }
@@ -250,7 +251,7 @@ export function AppScreen() {
   if (appQuery.isPending) {
     return (
       <main className="mx-auto w-full max-w-4xl px-4 py-8 sm:px-6">
-        <div className="h-[140px] rounded-[6px] border border-rail bg-panel/60" />
+        <div className="h-[140px] rounded-[10px] border border-line bg-surface/60" />
       </main>
     );
   }
@@ -260,7 +261,7 @@ export function AppScreen() {
     return (
       <main className="mx-auto w-full max-w-4xl px-4 py-6 sm:px-6 sm:py-8">
         <ProblemBanner view={view} />
-        <Button variant="secondary" className="mt-4" asChild>
+        <Button variant="default" className="mt-4" asChild>
           <Link to="/">Back to apps</Link>
         </Button>
       </main>
@@ -309,28 +310,28 @@ export function AppScreen() {
       <div className="mb-3">
         <Link
           to="/"
-          className="text-[13px] text-ink-muted underline-offset-4 hover:text-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+          className="text-[13px] text-ink-2 underline-offset-4 hover:text-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
         >
           Apps
         </Link>
       </div>
 
-      <header className="rounded-[6px] border border-rail bg-panel px-4 py-4 bay-shadow sm:px-5">
+      <header className="rounded-[10px] border border-line bg-surface px-4 py-4 card-sheen sm:px-5">
         <div className="flex flex-wrap items-start gap-x-4 gap-y-3">
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-2.5">
               <ToneLamp tone={lamp.tone} pulse={lamp.pulse} label={lamp.statusText} />
-              <h1 className="type-display nameplate truncate text-[26px] leading-none">
+              <h1 className="type-display truncate text-[26px] leading-none">
                 {app.name}
               </h1>
             </div>
-            <p className="mt-1.5 text-[13px] text-ink-muted">{lamp.caption}</p>
+            <p className="mt-1.5 text-[13px] text-ink-2">{lamp.caption}</p>
           </div>
 
           {canWrite ? (
             <div className="flex flex-wrap items-center gap-2">
               {canOpenTerminal(me) ? (
-                <Button variant="secondary" asChild>
+                <Button variant="default" asChild>
                   <Link to="/apps/$appId/terminal" params={{ appId: app.id }}>
                     Terminal
                   </Link>
@@ -350,7 +351,7 @@ export function AppScreen() {
               ) : null}
               {canStop ? (
                 <Button
-                  variant="secondary"
+                  variant="default"
                   disabled={action.isPending}
                   onClick={() => {
                     setNotice(null);
@@ -361,7 +362,7 @@ export function AppScreen() {
                 </Button>
               ) : null}
               <Button
-                variant="secondary"
+                variant="default"
                 disabled={action.isPending}
                 onClick={() => {
                   setNotice(null);
@@ -372,7 +373,7 @@ export function AppScreen() {
               </Button>
               {source === null || app.image !== '' ? (
                 <Button
-                  variant="secondary"
+                  variant="default"
                   disabled={action.isPending}
                   onClick={() => {
                     setNotice(null);
@@ -393,33 +394,35 @@ export function AppScreen() {
           ) : null}
         </div>
 
-        <dl className="type-data mt-4 grid grid-cols-1 gap-x-6 gap-y-1 border-t border-rail pt-3 text-[13px] sm:grid-cols-2">
+        <dl className="type-data mt-4 grid grid-cols-1 gap-x-6 gap-y-1 border-t border-line pt-3 text-[13px] sm:grid-cols-2">
           <div className="flex gap-2">
-            <dt className="text-ink-muted">Image</dt>
+            <dt className="text-ink-2">Image</dt>
             <dd
               className="min-w-0 truncate text-ink"
               title={source === null ? app.image : imageLabel ?? undefined}
             >
-              {source !== null
-                ? imageLabel ?? 'Not built yet'
-                : app.image}
+              {source !== null && imageLabel === null ? (
+                'Not built yet'
+              ) : (
+                <ImageRef image={app.image} />
+              )}
             </dd>
           </div>
           <div className="flex gap-2">
-            <dt className="text-ink-muted">Port</dt>
+            <dt className="text-ink-2">Port</dt>
             <dd className="text-ink">{app.port}</dd>
           </div>
           <div className="flex gap-2">
-            <dt className="text-ink-muted">Replicas</dt>
+            <dt className="text-ink-2">Replicas</dt>
             <dd className="text-ink">{app.replicas}</dd>
           </div>
           <div className="flex gap-2">
-            <dt className="text-ink-muted">Node</dt>
+            <dt className="text-ink-2">Node</dt>
             <dd className="text-ink">{nodeName}</dd>
           </div>
           <div className="flex gap-2">
-            <dt className="text-ink-muted">Deployment</dt>
-            <dd className="text-ink" title={app.current_deployment_id ?? undefined}>
+            <dt className="text-ink-2">Deployment</dt>
+            <dd className="type-code text-ink" title={app.current_deployment_id ?? undefined}>
               {app.current_deployment_id
                 ? shortDeploymentId(app.current_deployment_id)
                 : 'None yet'}
@@ -433,40 +436,40 @@ export function AppScreen() {
 
       {source !== null ? (
         <>
-          <section className="mt-5 rounded-[6px] border border-rail bg-panel px-4 py-4 sm:px-5">
+          <section className="mt-5 rounded-[10px] border border-line bg-surface px-4 py-4 sm:px-5">
             <h2 className="type-display-light text-[15px] leading-none text-ink">Source</h2>
             <dl className="type-data mt-3 grid grid-cols-1 gap-x-6 gap-y-1 text-[13px] sm:grid-cols-2">
               <div className="flex min-w-0 gap-2 sm:col-span-2">
-                <dt className="text-ink-muted">Repository</dt>
-                <dd className="min-w-0 truncate text-ink" title={source.repo_url}>
+                <dt className="text-ink-2">Repository</dt>
+                <dd className="type-code min-w-0 truncate text-ink" title={source.repo_url}>
                   {source.repo_url}
                 </dd>
               </div>
               <div className="flex gap-2">
-                <dt className="text-ink-muted">Ref</dt>
-                <dd className="text-ink">{source.ref}</dd>
+                <dt className="text-ink-2">Ref</dt>
+                <dd className="type-code text-ink">{source.ref}</dd>
               </div>
               <div className="flex gap-2">
-                <dt className="text-ink-muted">Dockerfile</dt>
-                <dd className="min-w-0 truncate text-ink">{source.dockerfile_path}</dd>
+                <dt className="text-ink-2">Dockerfile</dt>
+                <dd className="type-code min-w-0 truncate text-ink">{source.dockerfile_path}</dd>
               </div>
               <div className="flex gap-2">
-                <dt className="text-ink-muted">Context</dt>
-                <dd className="min-w-0 truncate text-ink">{source.context_dir}</dd>
+                <dt className="text-ink-2">Context</dt>
+                <dd className="type-code min-w-0 truncate text-ink">{source.context_dir}</dd>
               </div>
               <div className="flex gap-2">
-                <dt className="text-ink-muted">Target</dt>
+                <dt className="text-ink-2">Target</dt>
                 <dd className="text-ink">{source.target ?? 'last stage'}</dd>
               </div>
               <div className="flex gap-2">
-                <dt className="text-ink-muted">Last built commit</dt>
+                <dt className="text-ink-2">Last built commit</dt>
                 <dd className="text-ink" title={lastCommit ?? undefined}>
                   {lastCommit === null ? 'Not built yet' : shortCommit(lastCommit)}
                 </dd>
               </div>
             </dl>
 
-            <div className="mt-4 flex flex-col gap-3 border-t border-rail pt-3 sm:flex-row sm:items-end">
+            <div className="mt-4 flex flex-col gap-3 border-t border-line pt-3 sm:flex-row sm:items-end">
               <Field
                 label="Build ref"
                 htmlFor="build-ref"
@@ -493,7 +496,7 @@ export function AppScreen() {
                   {buildNow.isPending ? 'Starting…' : 'Build now'}
                 </Button>
                 {buildDisabledReason ? (
-                  <p className="max-w-[260px] text-[13px] leading-snug text-ink-muted">
+                  <p className="max-w-[260px] text-[13px] leading-snug text-ink-2">
                     {buildDisabledReason}
                   </p>
                 ) : null}
@@ -507,10 +510,10 @@ export function AppScreen() {
             {buildProblem ? <ProblemBanner view={buildProblem} className="mt-3" /> : null}
           </section>
 
-          <section className="mt-5 rounded-[6px] border border-rail bg-panel px-4 py-4 sm:px-5">
+          <section className="mt-5 rounded-[10px] border border-line bg-surface px-4 py-4 sm:px-5">
             <div className="flex flex-wrap items-baseline justify-between gap-2">
               <h2 className="type-display-light text-[15px] leading-none text-ink">Builds</h2>
-              <span className="type-data text-[13px] text-ink-muted">
+              <span className="type-data text-[13px] text-ink-2">
                 {builds.length} {builds.length === 1 ? 'build' : 'builds'}
               </span>
             </div>
@@ -521,11 +524,11 @@ export function AppScreen() {
                 className="mt-3"
               />
             ) : builds.length === 0 ? (
-              <p className="mt-3 text-[13px] text-ink-muted">
+              <p className="mt-3 text-[13px] text-ink-2">
                 No builds yet. Build now to make the first image from this source.
               </p>
             ) : (
-              <ul className="mt-3 flex flex-col divide-y divide-rail border-y border-rail">
+              <ul className="mt-3 flex flex-col divide-y divide-line border-y border-line">
                 {builds.map((build) => {
                   const buildLamp = buildLampState(build.status);
                   return (
@@ -533,7 +536,7 @@ export function AppScreen() {
                       <Link
                         to="/apps/$appId/builds/$buildId"
                         params={{ appId, buildId: build.id }}
-                        className="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-[4px] px-1.5 py-2.5 hover:bg-recess/40 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+                        className="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-[4px] px-1.5 py-2.5 hover:bg-sunk/40 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
                       >
                         <ToneLamp
                           tone={buildLamp.tone}
@@ -544,21 +547,21 @@ export function AppScreen() {
                         <span className="type-body-medium min-w-[86px] text-[14px] text-ink">
                           {buildLamp.statusText}
                         </span>
-                        <span className="type-data text-[13px] text-ink-muted">
+                        <span className="type-data text-[13px] text-ink-2">
                           commit {shortCommit(build.commit)}
                         </span>
-                        <span className="type-data text-[13px] text-ink-muted">
+                        <span className="type-data text-[13px] text-ink-2">
                           {buildDurationLabel(build)}
                         </span>
-                        <span className="type-data text-[13px] text-ink-muted">
+                        <span className="type-data text-[13px] text-ink-2">
                           trigger {build.trigger}
                         </span>
-                        <span className="type-data min-w-0 truncate text-[13px] text-ink-muted">
+                        <span className="type-data min-w-0 truncate text-[13px] text-ink-2">
                           {build.created_by_type === 'system'
                             ? 'system'
                             : `${build.created_by_type} ${build.created_by_id.slice(0, 10)}…`}
                         </span>
-                        <span className="type-data ml-auto text-[13px] text-ink-muted" title={build.id}>
+                        <span className="type-code ml-auto text-[12px] text-ink-2" title={build.id}>
                           {shortBuildId(build.id)}
                         </span>
                       </Link>
@@ -571,7 +574,7 @@ export function AppScreen() {
         </>
       ) : null}
 
-      <section className="mt-5 rounded-[6px] border border-rail bg-panel px-4 py-4 sm:px-5">
+      <section className="mt-5 rounded-[10px] border border-line bg-surface px-4 py-4 sm:px-5">
         <h2 className="type-display-light text-[15px] leading-none text-ink">Deployment</h2>
         <div className="mt-3">
           {deployment ? (
@@ -580,7 +583,7 @@ export function AppScreen() {
               error={deployment.status === 'failed' ? deployment.error : null}
             />
           ) : (
-            <p className="text-[13px] text-ink-muted">
+            <p className="text-[13px] text-ink-2">
               {source !== null
                 ? 'No deployment yet. A successful build starts one.'
                 : 'No deployment yet. Redeploy to roll out the current image.'}
@@ -589,15 +592,15 @@ export function AppScreen() {
         </div>
 
         {deployment ? (
-          <details className="mt-4 border-t border-rail pt-3">
-            <summary className="cursor-pointer select-none text-[13px] text-ink underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt">
+          <details className="mt-4 border-t border-line pt-3">
+            <summary className="cursor-pointer select-none text-[13px] text-ink underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">
               Progress lines
               {logsQuery.data ? ` (${logsQuery.data.items.length})` : ''}
             </summary>
             {progressError ? (
-              <p className="mt-2 text-[13px] text-lamp-fault">{progressError}</p>
+              <p className="mt-2 text-[13px] text-fault">{progressError}</p>
             ) : logsQuery.isPending ? (
-              <p className="mt-2 text-[13px] text-ink-muted">Reading progress lines…</p>
+              <p className="mt-2 text-[13px] text-ink-2">Reading progress lines…</p>
             ) : logsQuery.data && logsQuery.data.items.length > 0 ? (
               <ul className="mt-2 flex flex-col gap-0.5">
                 {logsQuery.data.items.map((entry, index) => (
@@ -605,10 +608,10 @@ export function AppScreen() {
                     key={`${entry.time}-${index}`}
                     className="grid grid-cols-[80px_110px_minmax(0,1fr)] gap-2 text-[12.5px] leading-5"
                   >
-                    <span className="type-data text-ink-muted" title={entry.time}>
+                    <span className="type-data text-ink-2" title={entry.time}>
                       {formatLogTime(entry.time)}
                     </span>
-                    <span className="type-data text-ink-muted">
+                    <span className="type-data text-ink-2">
                       {deploymentPhaseWords(entry.phase)}
                     </span>
                     <span className="whitespace-pre-wrap break-words text-ink">
@@ -618,7 +621,7 @@ export function AppScreen() {
                 ))}
               </ul>
             ) : (
-              <p className="mt-2 text-[13px] text-ink-muted">
+              <p className="mt-2 text-[13px] text-ink-2">
                 No progress lines have been written yet.
               </p>
             )}
@@ -632,7 +635,7 @@ export function AppScreen() {
         onRebuilt={invalidate}
       />
 
-      <section className="mt-5 rounded-[6px] border border-rail bg-panel px-4 py-4 sm:px-5">
+      <section className="mt-5 rounded-[10px] border border-line bg-surface px-4 py-4 sm:px-5">
         <AppDomains
           appId={app.id}
           domains={app.domains}
@@ -641,34 +644,34 @@ export function AppScreen() {
         />
       </section>
 
-      <section className="mt-5 rounded-[6px] border border-rail bg-panel px-4 py-4 sm:px-5">
+      <section className="mt-5 rounded-[10px] border border-line bg-surface px-4 py-4 sm:px-5">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h2 className="type-display-light text-[15px] leading-none text-ink">
             Environment
           </h2>
           {canWrite ? (
-            <Button variant="quiet" className="px-2.5" onClick={() => setEnvDialogOpen(true)}>
+            <Button variant="ghost" className="px-2.5" onClick={() => setEnvDialogOpen(true)}>
               Edit variables
             </Button>
           ) : null}
         </div>
         {env.length === 0 ? (
-          <p className="mt-3 text-[13px] text-ink-muted">
+          <p className="mt-3 text-[13px] text-ink-2">
             No variables yet. Add one to pass configuration to the app.
           </p>
         ) : (
-          <ul className="mt-3 flex flex-col divide-y divide-rail border-y border-rail">
+          <ul className="mt-3 flex flex-col divide-y divide-line border-y border-line">
             {env.map((item) => (
               <li key={item.name} className="flex flex-wrap items-baseline gap-x-3 gap-y-1 py-2">
-                <span className="type-data text-[14px] text-ink">{item.name}</span>
-                <span className="text-[13px] text-ink-muted">
+                <span className="type-code text-[12.5px] text-ink">{item.name}</span>
+                <span className="text-[13px] text-ink-2">
                   changed {relativeTime(item.updated_at)}
                 </span>
               </li>
             ))}
           </ul>
         )}
-        <p className="mt-2 text-[13px] leading-snug text-ink-muted">
+        <p className="mt-2 text-[13px] leading-snug text-ink-2">
           Values are write-only: Quoro stores them encrypted and never shows them again.
         </p>
       </section>
@@ -704,11 +707,11 @@ export function AppScreen() {
           description={`Delete ${app.name}? Its VM, domains and environment are removed.`}
         >
           <div className="flex flex-wrap justify-end gap-2">
-            <Button variant="secondary" onClick={() => setConfirmDelete(false)}>
+            <Button variant="default" onClick={() => setConfirmDelete(false)}>
               Keep the app
             </Button>
             <Button
-              variant="danger"
+              variant="danger-solid"
               disabled={remove.isPending}
               onClick={() => remove.mutate()}
             >

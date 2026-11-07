@@ -84,7 +84,7 @@ export function AuditScreen() {
   if (loading) {
     return (
       <main className="mx-auto w-full max-w-6xl px-4 py-8 sm:px-6">
-        <p className="text-[15px] text-ink-muted">Loading…</p>
+        <p className="text-[15px] text-ink-2">Loading…</p>
       </main>
     );
   }
@@ -140,13 +140,13 @@ export function AuditScreen() {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
           <h1 className="type-display text-[24px] leading-none">Audit log</h1>
-          <p className="mt-2 max-w-2xl text-[14px] leading-snug text-ink-muted">
+          <p className="mt-2 max-w-2xl text-[14px] leading-snug text-ink-2">
             Every call, by people and agents, in order. Each entry is chained to the one
             before it, so an edit shows.
           </p>
         </div>
         <Button
-          variant="quiet"
+          variant="ghost"
           onClick={() => void auditQuery.refetch()}
           disabled={auditQuery.isFetching}
         >
@@ -185,12 +185,12 @@ export function AuditScreen() {
               {[0, 1, 2, 3].map((index) => (
                 <div
                   key={index}
-                  className="h-[64px] rounded-[6px] border border-rail bg-panel/60"
+                  className="h-[64px] rounded-[10px] border border-line bg-surface/60"
                 />
               ))}
             </div>
           ) : entries.length === 0 ? (
-            <div className="rounded-[6px] border border-dashed border-rail bg-panel/50 px-4 py-10 text-center">
+            <div className="rounded-[10px] border border-dashed border-line bg-surface/50 px-4 py-10 text-center">
               <p className="text-[15px] text-ink">
                 {hasFilters
                   ? 'No audit records match these filters.'
@@ -198,7 +198,7 @@ export function AuditScreen() {
               </p>
               {hasFilters ? (
                 <Button
-                  variant="secondary"
+                  variant="default"
                   className="mt-4"
                   onClick={() => void navigate({ to: '/audit', search: {} })}
                 >
@@ -224,14 +224,14 @@ export function AuditScreen() {
           <div className="mt-3 flex flex-wrap items-center gap-3 pl-[28px]">
             {auditQuery.hasNextPage ? (
               <Button
-                variant="secondary"
+                variant="default"
                 onClick={() => void auditQuery.fetchNextPage()}
                 disabled={auditQuery.isFetchingNextPage}
               >
                 {auditQuery.isFetchingNextPage ? 'Loading more…' : 'Load more'}
               </Button>
             ) : entries.length > 0 ? (
-              <p className="text-[13px] text-ink-muted">End of the log.</p>
+              <p className="text-[13px] text-ink-2">End of the log.</p>
             ) : null}
           </div>
         </section>

@@ -173,16 +173,16 @@ export function GrantDialog({
           </Field>
 
           <div className="flex flex-col gap-1.5">
-            <p className="type-body-medium text-[13px] text-ink-muted">Scopes</p>
+            <p className="type-body-medium text-[13px] text-ink-2">Scopes</p>
             <ScopePicker id="grant-scopes" value={scopes} onChange={setScopes} />
-            <p className="text-[13px] leading-snug text-ink-muted">
+            <p className="text-[13px] leading-snug text-ink-2">
               Delete and human-only scopes can't be granted: deleting needs an approval for each
               call.
             </p>
           </div>
 
           <div className="flex flex-col gap-1.5">
-            <p className="type-body-medium text-[13px] text-ink-muted">Resources</p>
+            <p className="type-body-medium text-[13px] text-ink-2">Resources</p>
             <SelectorEditor id="grant-selector" value={selector} onChange={setSelector} />
           </div>
 
@@ -280,12 +280,12 @@ export function GrantDialog({
             </select>
           </Field>
 
-          <p className="rounded-[6px] border border-rail bg-recess px-3 py-2 text-[13px] leading-snug text-ink">
+          <p className="rounded-[10px] border border-line bg-sunk px-3 py-2 text-[13px] leading-snug text-ink">
             {summary}
           </p>
 
-          <div className="mt-1 flex flex-wrap justify-end gap-2 border-t border-rail pt-4">
-            <Button variant="secondary" onClick={() => onOpenChange(false)}>
+          <div className="mt-1 flex flex-wrap justify-end gap-2 border-t border-line pt-4">
+            <Button variant="default" onClick={() => onOpenChange(false)}>
               Cancel
             </Button>
             <Button type="submit" variant="primary" disabled={issue.isPending}>

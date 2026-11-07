@@ -20,7 +20,7 @@ export function AppsScreen() {
   if (loading) {
     return (
       <main className="mx-auto w-full max-w-6xl px-4 py-8 sm:px-6">
-        <p className="text-[15px] text-ink-muted">Loading…</p>
+        <p className="text-[15px] text-ink-2">Loading…</p>
       </main>
     );
   }
@@ -48,9 +48,9 @@ export function AppsScreen() {
 
       <div className="mt-5 flex flex-col gap-2">
         {appsQuery.isPending ? (
-          <div className="h-[104px] rounded-[6px] border border-rail bg-panel/60" />
+          <div className="h-[104px] rounded-[10px] border border-line bg-surface/60" />
         ) : apps.length === 0 ? (
-          <div className="rounded-[6px] border border-dashed border-rail bg-panel/50 px-4 py-10 text-center">
+          <div className="rounded-[10px] border border-dashed border-line bg-surface/50 px-4 py-10 text-center">
             <p className="text-[15px] text-ink">
               No apps yet. Deploy an image to start one.
             </p>

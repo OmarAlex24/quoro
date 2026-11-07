@@ -79,7 +79,7 @@ export function GrantsScreen() {
   if (loading) {
     return (
       <main className="mx-auto w-full max-w-6xl px-4 py-8 sm:px-6">
-        <p className="text-[15px] text-ink-muted">Loading…</p>
+        <p className="text-[15px] text-ink-2">Loading…</p>
       </main>
     );
   }
@@ -117,7 +117,7 @@ export function GrantsScreen() {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h1 className="type-display text-[24px] leading-none">Grants</h1>
-          <p className="mt-1.5 text-[15px] text-ink-muted">
+          <p className="mt-1.5 text-[15px] text-ink-2">
             What each agent may do, on which resources, until when. Every grant expires.
           </p>
         </div>
@@ -129,14 +129,14 @@ export function GrantsScreen() {
       </div>
 
       {canManage ? null : (
-        <p className="mt-2 text-[13px] text-ink-muted">
+        <p className="mt-2 text-[13px] text-ink-2">
           Your role can read grants but not change them.
         </p>
       )}
 
       <div className="mt-5 flex flex-wrap items-end gap-3">
         <label className="flex flex-col gap-1">
-          <span className="type-body-medium text-[13px] text-ink-muted">Agent</span>
+          <span className="type-body-medium text-[13px] text-ink-2">Agent</span>
           <select
             className="field min-w-[170px]"
             value={search.agent_id ?? ''}
@@ -157,7 +157,7 @@ export function GrantsScreen() {
         </label>
 
         <label className="flex flex-col gap-1">
-          <span className="type-body-medium text-[13px] text-ink-muted">Status</span>
+          <span className="type-body-medium text-[13px] text-ink-2">Status</span>
           <select
             className="field min-w-[140px]"
             value={search.status ?? ''}
@@ -178,7 +178,7 @@ export function GrantsScreen() {
         </label>
 
         <label className="flex flex-col gap-1">
-          <span className="type-body-medium text-[13px] text-ink-muted">Kind</span>
+          <span className="type-body-medium text-[13px] text-ink-2">Kind</span>
           <select
             className="field min-w-[140px]"
             value={search.kind ?? ''}
@@ -198,7 +198,7 @@ export function GrantsScreen() {
         </label>
 
         {hasFilters ? (
-          <Button variant="quiet" onClick={clearFilters}>
+          <Button variant="ghost" onClick={clearFilters}>
             Clear filters
           </Button>
         ) : null}
@@ -214,16 +214,16 @@ export function GrantsScreen() {
 
       <div className="mt-5 flex flex-col gap-2">
         {grantsQuery.isPending ? (
-          <div className="h-[128px] rounded-[6px] border border-rail bg-panel/60" />
+          <div className="h-[128px] rounded-[10px] border border-line bg-surface/60" />
         ) : grants.length === 0 ? (
-          <div className="rounded-[6px] border border-dashed border-rail bg-panel/50 px-4 py-10 text-center">
+          <div className="rounded-[10px] border border-dashed border-line bg-surface/50 px-4 py-10 text-center">
             <p className="text-[15px] text-ink">
               {hasFilters
                 ? 'No grants match these filters.'
                 : 'No grants yet. Issue one to let an agent act.'}
             </p>
             {hasFilters ? (
-              <Button variant="secondary" className="mt-4" onClick={clearFilters}>
+              <Button variant="default" className="mt-4" onClick={clearFilters}>
                 Clear filters
               </Button>
             ) : canManage ? (
