@@ -186,6 +186,10 @@ struct Pending {
     /// when a `hello` revoke goes above it. An answer with `fence_failed` is
     /// recorded on the node (section 8.5 step 1).
     revoke_leases: HashMap<String, (String, u64)>,
+    /// Leases whose revoke this session answered `fence_failed` without the
+    /// primary recording the failure: their VMs may still run, so no restore
+    /// takes them until the next session's revoke reports the failure again.
+    unrecorded_failures: HashSet<String>,
 }
 
 impl Pending {
@@ -197,6 +201,7 @@ impl Pending {
     /// Fails every waiter because the session ended.
     fn fail_all(&mut self) {
         self.revoke_leases.clear();
+        self.unrecorded_failures.clear();
         for (_, tx) in self.commands.drain() {
             let _ = tx.send(Err(HubError::Closed));
         }
@@ -477,46 +482,18 @@ impl NodeHub {
     }
 
     /// Whether a `lease_revoke` of `lease_id` waits for its answer on the
-    /// live session of `node_id`.
+    /// live session of `node_id`, or was answered `fence_failed` there without
+    /// the failure being recorded.
     pub(crate) fn revoke_unanswered(&self, node_id: &str, lease_id: &str) -> bool {
         let sessions = self.0.sessions.lock().expect("session lock");
         sessions.get(node_id).is_some_and(|handle| {
-            handle
-                .pending
-                .lock()
-                .expect("pending lock")
-                .revoke_leases
-                .values()
-                .any(|(revoked, _)| revoked == lease_id)
+            let pending = handle.pending.lock().expect("pending lock");
+            pending.unrecorded_failures.contains(lease_id)
+                || pending
+                    .revoke_leases
+                    .values()
+                    .any(|(revoked, _)| revoked == lease_id)
         })
-    }
-
-    /// Revokes `lease` again on its holder's live session, at the lease's
-    /// token, when none of its revokes is unanswered there: a restore waits
-    /// for the holder's `ok` (section 5.13, issue #392), and a revoke the
-    /// holder refused, or that went to a session that was ending, has none.
-    /// Returns whether a session took it.
-    pub(crate) fn revoke_again(&self, lease: &leases::Lease) -> bool {
-        if self.revoke_unanswered(&lease.holder_node_id, &lease.id) {
-            return false;
-        }
-        let revoke = quoro_proto::LeaseRevoke {
-            lease_id: quoro_proto::LeaseId(lease.id.clone()),
-            fencing_token: lease.fencing_token.max(1) as u64,
-            reason: quoro_proto::RevokeReason::Moved,
-        };
-        let sent = self.send_control(
-            &lease.holder_node_id,
-            &quoro_proto::wire::ControlMessage::LeaseRevoke(revoke),
-        );
-        if sent {
-            tracing::info!(
-                lease_id = %lease.id,
-                node_id = %lease.holder_node_id,
-                "a restore revokes its lease again on the old holder's session"
-            );
-        }
-        sent
     }
 
     /// Tells the live session of `node_id` to rebuild and resend its desired
@@ -1220,6 +1197,26 @@ impl HubInner {
         let pending = self.pending_of(node_id, generation)?;
         let mut pending = pending.lock().expect("pending lock");
         pending.revoke_leases.remove(re)
+    }
+
+    /// The lease and token of the `lease_revoke` that `re` answers, left
+    /// unanswered until [`Self::take_revoke`].
+    fn peek_revoke(&self, node_id: &str, generation: u64, re: &str) -> Option<(String, u64)> {
+        let pending = self.pending_of(node_id, generation)?;
+        let pending = pending.lock().expect("pending lock");
+        pending.revoke_leases.get(re).cloned()
+    }
+
+    /// Notes that this session answered a revoke of `lease_id` `fence_failed`
+    /// and the primary could not record it.
+    fn note_unrecorded_failure(&self, node_id: &str, generation: u64, lease_id: &str) {
+        if let Some(pending) = self.pending_of(node_id, generation) {
+            pending
+                .lock()
+                .expect("pending lock")
+                .unrecorded_failures
+                .insert(lease_id.to_string());
+        }
     }
 
     /// Routes one `command_result` to its waiter, or ends a stream whose
@@ -2022,7 +2019,7 @@ impl Session {
                         return false;
                     }
                     if let Some((lease_id, token)) =
-                        self.hub.0.take_revoke(&self.node_id, self.generation, re)
+                        self.hub.0.peek_revoke(&self.node_id, self.generation, re)
                     {
                         // `ok`: the bound VMs are stopped and recorded
                         // (section 5.13), so the lease may move at that token.
@@ -2033,7 +2030,11 @@ impl Session {
                                 i64::try_from(token).unwrap_or(i64::MAX),
                             );
                         }
+                        // The revoke stays unanswered for a restore until a
+                        // failed fence is recorded (issue #392), so none
+                        // grants the lease in between.
                         self.note_revoke_answer(&lease_id, &result).await;
+                        self.hub.0.take_revoke(&self.node_id, self.generation, re);
                         self.revoke_answered(outbox).await;
                         return false;
                     }
@@ -2463,6 +2464,8 @@ impl Session {
         {
             return;
         }
+        // The VMs may run again, whatever this holder released before.
+        self.hub.0.releases.forget(lease_id, &self.node_id);
         let recorded: Result<bool, ApiError> = async {
             let mut w = self.hub.0.store.begin_write().await?;
             let app_ids: Vec<String> = leases::by_id(&mut w.tx, lease_id)
@@ -2509,6 +2512,9 @@ impl Session {
                     "cannot record a failed fence; the fence_ack waits for the next session"
                 );
                 self.fence_ack_stopped = true;
+                self.hub
+                    .0
+                    .note_unrecorded_failure(&self.node_id, self.generation, lease_id);
             }
         }
     }
@@ -3208,9 +3214,6 @@ async fn apply_status_report(
             // failed restore, the node they stayed on gets them back.
             for other in &applied.other_node_ids {
                 hub.node_changed(other);
-            }
-            for lease in &applied.waits {
-                hub.revoke_again(lease);
             }
         }
         Err(e) => tracing::warn!(

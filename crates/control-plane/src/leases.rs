@@ -226,6 +226,15 @@ impl Releases {
 
     /// Whether the holder `lease` names released it at its token or a higher
     /// one. A release at a lower token says nothing about a later grant.
+    /// Forgets what `holder` released of `lease_id`: a `fence_failed` answer
+    /// says its VMs may run again (section 8.5).
+    pub(crate) fn forget(&self, lease_id: &str, holder: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(lease_id.to_string(), holder.to_string()));
+    }
+
     fn covers(&self, lease: &Lease) -> bool {
         let released = self
             .0
@@ -244,8 +253,9 @@ impl Releases {
 /// `fence_failed` answer lists the lease again (ADR 0238). Its last holder
 /// must also have released it at its token ([`Releases`]); or have an
 /// operator's acknowledgement of it pending delivery (`fence_ack_pending`,
-/// section 8.5 step 3) at its token, made after the lease was granted and
-/// revoked, so that the acknowledgement's increment produced that token; or,
+/// section 8.5 step 3) at its token, made once the lease was revoked, and so
+/// after its grant, so that the acknowledgement's increment produced that
+/// token; or,
 /// for a `local` lease revoked by then, have been declared lost
 /// (`nodes.lost_at`, ADR 0183) or removed (section 10). An `expiring` lease
 /// of a lost or removed holder also waits for its gate (section 8.4, ADR
@@ -277,7 +287,6 @@ pub(crate) async fn is_released(
             .fencing_tokens
             .get(&lease.id)
             .is_some_and(|token| i64::try_from(*token).ok() == Some(lease.fencing_token))
-        && lease.granted_at.as_str() < pending.acked_at.as_str()
         && lease
             .revoked_at
             .as_deref()

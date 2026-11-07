@@ -80,11 +80,6 @@ pub(crate) struct AppliedRestores {
     /// nodes the instances stayed on (a `failed` restore), so they get them
     /// back.
     pub other_node_ids: Vec<String>,
-    /// Revoked leases that a `ready` restore waits for, whose holder has no
-    /// failed fence of them listed or acknowledged: the caller revokes each
-    /// again on its holder's live session, unless one is unanswered there
-    /// (issue #392).
-    pub waits: Vec<Lease>,
 }
 
 impl AppliedRestores {
@@ -92,7 +87,6 @@ impl AppliedRestores {
         self.desired_changed |= other.desired_changed;
         self.grants.extend(other.grants);
         self.other_node_ids.extend(other.other_node_ids);
-        self.waits.extend(other.waits);
     }
 }
 
@@ -330,7 +324,9 @@ async fn restore_ready(
     // answers the revoke `ok`, so the lease moves only once it released it
     // (issue #392). That holds for a restore onto the same node too. The
     // check comes before any write, so a restore that waits changes nothing
-    // and a later `ready` report tries again (section 5.3).
+    // and a later `ready` report tries again (section 5.3). A revoke the
+    // holder refused, because its token is higher (section 5.13), is sent
+    // again at its next session, at the token its `hello` names (section 9).
     if let Some(previous) = leases::app_lease(&mut w.tx, &current.app_id).await?
         && !leases::is_released(
             &mut w.tx,
@@ -346,19 +342,7 @@ async fn restore_ready(
             holder = %previous.holder_node_id,
             "a restored volume waits for its old holder to release the lease"
         );
-        // A failed fence waits for an operator, and an acknowledged one for
-        // its delivery (section 8.5); a revoke would only fence again.
-        let fenced = crate::fences::failure_of(&mut w.tx, &previous.holder_node_id)
-            .await?
-            .is_some_and(|failure| failure.lease_ids.contains(&previous.id))
-            || crate::fences::pending_of(&mut w.tx, &previous.holder_node_id)
-                .await?
-                .is_some_and(|pending| pending.lease_ids.contains(&previous.id));
-        let mut waits = AppliedRestores::default();
-        if previous.is_revoked() && !fenced {
-            waits.waits.push(previous);
-        }
-        return Ok(waits);
+        return Ok(AppliedRestores::default());
     }
 
     current.state = VolumeState::Ready;
@@ -465,7 +449,6 @@ async fn restore_ready(
         desired_changed: true,
         grants: vec![lease],
         other_node_ids,
-        waits: Vec::new(),
     })
 }
 
