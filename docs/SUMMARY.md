@@ -261,6 +261,7 @@
   - [0257: A primary answers, as a converted lease's first renewal, only a lease_renew the node sent after it took the conversion](adr/0257-a-primary-answers-as-a-converted-lease-s-first-renewal-only.md)
   - [0258: A primary changes a lease's mode only with the same token](adr/0258-a-primary-changes-a-lease-s-mode-only-with-the-same-token.md)
   - [0259: Health checks: probes of a VM paused for a backup neither count nor restart it, and a health restart stops a VM only when it can start again](adr/0259-health-checks-probes-of-a-vm-paused-for-a-backup-neither.md)
+  - [0262: fence_ack acknowledges a listed lease with no row at 2^53-1, the canonical-JSON bound, and migration 0001's comment names fencing_tokens](adr/0262-fence-ack-acknowledges-a-listed-lease-with-no-row-at-2-53-1.md)
 
 # Background research
 
