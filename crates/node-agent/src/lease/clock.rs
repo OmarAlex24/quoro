@@ -252,8 +252,10 @@ impl ManualHostClock {
     /// lease service that no test can reach between. `when` runs on every
     /// read until it holds, with no lock of this clock held but under
     /// whatever lock the reader holds. So it must not read this clock, nor
-    /// take a lock that any reader of this clock may hold: the lease table,
-    /// and anything taken while one of its readers holds it.
+    /// take a lock a reader may hold while it reads this clock, such as the
+    /// lease table's. A lock it does take must come after those in every
+    /// lock order: the lease service takes its fence sets after the table, so
+    /// `LeaseView::fence_owns_stop` is fine.
     pub fn suspend_when(&self, slept: Duration, when: impl Fn() -> bool + Send + Sync + 'static) {
         *self.armed_lock() = Some(ArmedSuspend {
             slept,

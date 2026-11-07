@@ -1259,7 +1259,8 @@ async fn a_suspend_while_a_fence_waits_for_a_start_uses_up_its_graceful_stop() {
 /// after that lock and before the fence begins: the renewal of another lease,
 /// due in the same look as the expiry, applies it to the table in between.
 /// The fence counts that suspend once. Missed, it would leave the graceful
-/// stop at most 5 600 ms; counted twice, it would leave none.
+/// stop about 5 600 ms, above the test's bound; counted twice, it would
+/// leave none.
 #[tokio::test]
 async fn a_suspend_applied_between_an_expiry_and_its_fence_counts_once() {
     let dir = TargetDir::new("expiring-trigger-suspend");

@@ -1092,9 +1092,10 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
         };
         let mut expired = Vec::new();
         let mut provisional = Vec::new();
-        // In the order the look returned them, by lease id. A renewal here
-        // catches up with a suspend before a later lease's fence begins, which
-        // is why that fence takes `applied` from the lock above
+        // In the order the look returned them, by lease id
+        // (`polls_are_sorted_by_lease_id`). A renewal here can catch up with a
+        // suspend before a later lease's fence begins, which is why that fence
+        // takes `applied` from the lock above
         // (`a_suspend_applied_between_an_expiry_and_its_fence_counts_once`).
         for action in actions {
             match action {
