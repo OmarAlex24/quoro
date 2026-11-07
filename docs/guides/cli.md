@@ -93,7 +93,7 @@ Besides these, the client reads only `HOME`, `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR
 
 ## Log in as a human
 
-A human logs in with a **personal API token** (`tok_...`). Create one in the panel under Settings → API tokens. The token is shown once. The client's own messages still call that place "Your account → API tokens", and the old `/account` address leads to Settings → Account, which links to API tokens.
+A human logs in with a **personal API token** (`tok_...`). Create one in the panel under Settings → API tokens. The token is shown once.
 
 Personal API tokens need a primary that serves the tokens API (`/api/v1/tokens`). That API arrived after v0.2.0, so a v0.2.0 primary cannot create one.
 
