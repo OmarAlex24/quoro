@@ -1871,7 +1871,7 @@ components:
             it is disconnected and picks another only when it is removed,
             loses the node role, stops snapshotting with reflink or becomes
             the volume's node; an operator's pin lasts until the node is
-            removed (ADR 0276).
+            removed (ADR 0278).
         node_pinned:
           type: boolean
           description: Whether an operator chose `node_id` rather than the scheduler.

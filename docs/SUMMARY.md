@@ -267,6 +267,7 @@
   - [0275: A warm app's placement does not narrow its warm node: a stateful app's placement names only its volume's node](adr/0275-a-warm-app-s-placement-does-not-narrow-its-warm-node-a.md)
   - [0276: When the scheduler picks a warm node again: not on a disconnect, only for a lasting reason](adr/0276-when-the-scheduler-picks-a-warm-node-again-not-on-a.md)
   - [0277: Warm turns on at the end of its chain: until then updateApp refuses warm outside dev builds, and the dev-warm-policy feature stays until the last warm PR](adr/0277-warm-turns-on-at-the-end-of-its-chain-until-then-updateapp.md)
+  - [0278: A warm node without a mesh address is not a lasting reason to pick another warm node; the contract sentence of D-0276 governs](adr/0278-a-warm-node-without-a-mesh-address-is-not-a-lasting-reason.md)
 
 # Background research
 
