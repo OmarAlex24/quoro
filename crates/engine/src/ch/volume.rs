@@ -938,7 +938,8 @@ where
 /// A VM another caller paused is left as it is and copied as it stands: its
 /// guest makes no writes, and its freeze is not this snapshot's to end. A VM
 /// whose VMM does not say its state is `Hypervisor`, since the copy could not
-/// be made consistent.
+/// be made consistent. A forced stop of the VM that waits for the lock meanwhile
+/// gets it at once, and the snapshot is `Conflict` (ADR 0243).
 async fn pause_running(
     vms: &[Arc<VmEntry>],
     volume: &VolumeId,
@@ -952,33 +953,18 @@ async fn pause_running(
             continue;
         };
         let api = ApiClient::new(&entry.paths.api_socket).with_timeout(SNAPSHOT_API_TIMEOUT);
-        let state = api
-            .info()
-            .await
-            .map_err(|err| {
-                EngineError::Hypervisor(format!(
-                    "cloud-hypervisor did not report the VM using volume {}: {err}",
+        let since = tokio::select! {
+            since = pause_if_running(&api, volume) => since?,
+            () = entry.forced_stop_waiting() => {
+                return Err(EngineError::Conflict(format!(
+                    "a forced stop of the VM using volume {} came before the snapshot's pause",
                     volume.0
-                ))
-            })?
-            .get("state")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-        if state.as_deref() != Some("Running") {
-            continue;
-        }
-        let since = Instant::now();
-        if let Err(err) = api.pause().await {
-            // The request may have reached the VMM and only its answer been
-            // lost; nobody else could pause the VM under its lock.
-            if is_paused(&api).await {
-                let _ = api.resume().await;
+                )));
             }
-            return Err(EngineError::Hypervisor(format!(
-                "cloud-hypervisor did not pause the VM using volume {}: {err}",
-                volume.0
-            )));
-        }
+        };
+        let Some(since) = since else {
+            continue;
+        };
         return Ok(Some(PausedVm {
             entry: Arc::clone(entry),
             process: vmm.id(),
@@ -988,32 +974,66 @@ async fn pause_running(
     Ok(None)
 }
 
+/// Pauses the VM if its VMM reports it running, and returns when the pause
+/// began; `None` when it is not running.
+async fn pause_if_running(
+    api: &ApiClient,
+    volume: &VolumeId,
+) -> Result<Option<Instant>, EngineError> {
+    let document = api.info().await.map_err(|err| {
+        EngineError::Hypervisor(format!(
+            "cloud-hypervisor did not report the VM using volume {}: {err}",
+            volume.0
+        ))
+    })?;
+    if document.get("state").and_then(serde_json::Value::as_str) != Some("Running") {
+        return Ok(None);
+    }
+    let since = Instant::now();
+    if let Err(err) = api.pause().await {
+        // The request may have reached the VMM and only its answer been lost;
+        // nobody else could pause the VM under its lock.
+        if is_paused(api).await {
+            let _ = api.resume().await;
+        }
+        return Err(EngineError::Hypervisor(format!(
+            "cloud-hypervisor did not pause the VM using volume {}: {err}",
+            volume.0
+        )));
+    }
+    Ok(Some(since))
+}
+
 /// Resumes the VM `paused` stopped, under its operation lock, if its VMM is
 /// still the process that was paused. A resume that fails, or a VMM that is
 /// gone, is `Hypervisor`, and the VM is left for the node agent's crash
-/// handling (§3.16).
+/// handling (§3.16). A forced stop of the VM that waits for the lock meanwhile
+/// gets it at once and ends the VM, which is then not resumed (ADR 0243).
 async fn resume_paused(paused: &PausedVm, volume: &VolumeId) -> Result<(), EngineError> {
     let entry = &paused.entry;
+    let stopped = || {
+        EngineError::Hypervisor(format!(
+            "the VM using volume {} stopped while it was paused for the copy",
+            volume.0
+        ))
+    };
     let _op = entry.op.lock().await;
     if !entry
         .live_vmm()
         .is_some_and(|vmm| vmm.id() == paused.process)
     {
-        return Err(EngineError::Hypervisor(format!(
-            "the VM using volume {} stopped while it was paused for the copy",
-            volume.0
-        )));
+        return Err(stopped());
     }
-    ApiClient::new(&entry.paths.api_socket)
-        .with_timeout(SNAPSHOT_API_TIMEOUT)
-        .resume()
-        .await
-        .map_err(|err| {
+    let api = ApiClient::new(&entry.paths.api_socket).with_timeout(SNAPSHOT_API_TIMEOUT);
+    tokio::select! {
+        resumed = api.resume() => resumed.map_err(|err| {
             EngineError::Hypervisor(format!(
                 "cloud-hypervisor did not resume the VM using volume {}: {err}",
                 volume.0
             ))
-        })
+        }),
+        () = entry.forced_stop_waiting() => Err(stopped()),
+    }
 }
 
 /// Whether the VMM reports its VM paused.

@@ -212,6 +212,14 @@ impl VmEntry {
         *lock(&self.phase)
     }
 
+    /// Resolves once a forced stop of this VM waits for its lock. A short
+    /// call that holds the lock gives it up then, so a fence's forced stop
+    /// keeps its bound (§3.8, ADR 0243, #434).
+    pub(super) async fn forced_stop_waiting(&self) {
+        let mut forced = self.force_waiting.subscribe();
+        let _ = forced.wait_for(|waiting| *waiting > 0).await;
+    }
+
     fn set_phase(&self, phase: Phase) {
         *lock(&self.phase) = phase;
     }
@@ -2988,8 +2996,8 @@ mod tests {
         std::fs::copy(source, clone).map_err(|err| EngineError::Io(err.to_string()))
     }
 
-    fn vol_1() -> VolumeId {
-        VolumeId("vol_1".to_owned())
+    fn vol_1() -> crate::VolumeId {
+        crate::VolumeId("vol_1".to_owned())
     }
 
     /// Polls `check` every 10 ms until it holds or `within` passes.
@@ -3211,5 +3219,45 @@ mod tests {
             "no call for a VM that is not booted"
         );
         assert!(clone.exists());
+    }
+
+    /// ADR 0243: a forced stop that waits for the VM's lock while a snapshot
+    /// holds it for its pause gets it at once. The snapshot gives up instead
+    /// of waiting out a VMM that does not answer.
+    #[tokio::test]
+    async fn a_snapshot_pause_gives_way_to_a_forced_stop() {
+        let vm = StandIn::new("snapforce");
+        vm.entry.booted.store(true, Ordering::SeqCst);
+        let api = silent_api(&vm.entry.paths.api_socket);
+        let (source, clone) = volume_files(&vm);
+
+        let snapshot = {
+            let vms = vec![Arc::clone(&vm.entry)];
+            let (source, clone) = (source.clone(), clone.clone());
+            tokio::spawn(async move {
+                crate::ch::volume::pause_and_copy(&vms, &vol_1(), &source, &clone, plain_copy).await
+            })
+        };
+        assert!(
+            eventually(Duration::from_secs(2), || vm.entry.op.try_lock().is_err()).await,
+            "the snapshot holds the lock"
+        );
+        let began = Instant::now();
+        let waiting = ForceWaiting::begin(&vm.entry);
+        let op = tokio::time::timeout(
+            Duration::from_secs(1),
+            Arc::clone(&vm.entry.op).lock_owned(),
+        )
+        .await
+        .expect("the forced stop gets the lock at once");
+        assert!(began.elapsed() < Duration::from_secs(1));
+        drop((op, waiting));
+        let failed = snapshot.await.expect("task");
+        assert!(
+            matches!(failed, Err(EngineError::Conflict(_))),
+            "{failed:?}"
+        );
+        assert!(!clone.exists());
+        api.abort();
     }
 }
