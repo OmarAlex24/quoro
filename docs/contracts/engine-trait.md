@@ -206,6 +206,26 @@ pub enum SnapshotMethod {
     PauseCopy,
 }
 
+/// What came of asking the guest to flush a volume's filesystem before a
+/// snapshot (ADR 0282). Added in M5b. Sections 3.16 and 3.22.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestFlush {
+    /// The init answered that it ran `syncfs` on the volume's mount.
+    Flushed,
+    /// No running VM attaches the volume, so no guest holds unwritten data of it.
+    NoRunningVm,
+    /// The VM that attaches the volume is paused and cannot answer, so it was
+    /// not asked.
+    Paused,
+    /// The VM has no vsock device, its init predates the sync session, or the
+    /// backend does not flush.
+    Unsupported,
+    /// The init did not answer within the bound.
+    TimedOut,
+    /// The init answered with an error, or the connection failed.
+    Failed,
+}
+
 /// The VM's network attachment on the node bridge.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NetAttach {
@@ -392,6 +412,9 @@ pub struct VolumeSnapshot {
     /// How long the VM using the volume was paused; zero for `Reflink` or
     /// when no VM was running. Added in M5a.
     pub pause: Duration,
+    /// Whether the guest flushed the volume's filesystem before the snapshot
+    /// was taken (section 3.16, ADR 0282). Added in M5b.
+    pub guest_flush: GuestFlush,
 }
 
 /// A byte range of a volume file. Added in M5b. Section 3.22.
@@ -698,6 +721,16 @@ pub trait Engine: Send + Sync {
     fn resume(&self, _id: &VmId) -> impl Future<Output = Result<(), EngineError>> + Send {
         async { Err(EngineError::Unsupported("pausing a VM is not implemented by this engine".into())) }
     }
+    /// Asks the guest of the running VM that attaches the volume to flush the
+    /// volume's filesystem, waiting at most `within`. Added in M5b (ADR 0282);
+    /// section 3.22.
+    fn flush_volume(
+        &self,
+        _id: &VolumeId,
+        _within: Duration,
+    ) -> impl Future<Output = Result<GuestFlush, EngineError>> + Send {
+        async { Ok(GuestFlush::Unsupported) }
+    }
 }
 
 /// The result of the host check in section 3.2.
@@ -720,7 +753,7 @@ M4 adds, additively: `VmSpec::serial`, `VmSpec::vsock` and `VmSpec::work_disks` 
 
 M5a adds, additively: `VolumeAttach::serial`, `VolumeInfo`, `SnapshotMethod`, `Capabilities::volume_snapshot_method`, `VolumeSnapshot::method` and `VolumeSnapshot::pause`, and the methods `ensure_volume`, `import_volume` and `delete_volume`, whose default implementations return `Unsupported` like `snapshot_volume` and `delete_volume_snapshot`. It also adds `ImageInventory`, `InventoryPackage` and the methods `image_inventory` and `inventory_cached_image`, whose default implementations return `Unsupported`, and `uninventoried_images`, whose default implementation returns an empty list, so a backend without inventories never starts a backfill. Code that builds a `Capabilities` literal sets the new field to `None`; `VmSpec::canonical` keeps sorting `volumes` by `(volume_id, mount_path)`, and the serial follows the volume.
 
-M5b adds, additively: `ByteRange`, `RangesOf`, `ChangedRanges`, `StageFrom` and `StagedVolume`, and the methods `volume_changed_ranges`, `stage_volume`, `commit_staged_volume`, `discard_staged_volume`, `pause` and `resume`, whose default implementations return `Unsupported`, so a backend without warm volumes still compiles and its node is never a warm node (ADR 0172). No existing type gains a field. `VmState` gains no variant: a paused VM is reported `Running` (section 3.22). One rule changes: a volume may have several snapshots at once (section 3.16).
+M5b adds, additively: `ByteRange`, `RangesOf`, `ChangedRanges`, `StageFrom` and `StagedVolume`, and the methods `volume_changed_ranges`, `stage_volume`, `commit_staged_volume`, `discard_staged_volume`, `pause` and `resume`, whose default implementations return `Unsupported`, so a backend without warm volumes still compiles and its node is never a warm node (ADR 0172). `VmState` gains no variant: a paused VM is reported `Running` (section 3.22). One rule changes: a volume may have several snapshots at once (section 3.16). ADR 0282 then adds `GuestFlush`, the method `flush_volume`, whose default implementation returns `Ok(GuestFlush::Unsupported)`, so a backend that does not flush still lets a switchover go on, and one field, `VolumeSnapshot::guest_flush`. Code that builds a `VolumeSnapshot` literal sets it, to `GuestFlush::Unsupported` in a backend that does not flush.
 
 ## 3. Method semantics
 
@@ -839,12 +872,28 @@ The point-in-time disk primitive the chunk engine needs (D-0023). Both are `Unsu
   - **Size.** The image is sparse. Before `ensure_volume` or `import_volume` the engine grows it to at least twice the sum of its volumes' sizes plus 1 GiB, which leaves room for one snapshot of every volume, by extending the image, refreshing the loop device's capacity and running `xfs_growfs`. It never shrinks it. The free-space checks of `ensure_volume` and of a snapshot use the filesystem that holds the image, not the pool's own free space.
   - **Volumes created before the pool.** If the volume directory already holds volume files when the pool would be created, the engine leaves them in place, keeps `PauseCopy` for that node and logs why; it creates the pool at the first start-up with no such file. It never moves a volume file that a VM may hold open.
   - **Fallback.** Without `mkfs.xfs` or a loop device the pool cannot be created and the method is `PauseCopy`.
-- **`Reflink`.** The engine clones the volume file into a snapshot file next to it with `FICLONE`, without touching the VM. The snapshot is crash-consistent at the instant of the clone; `pause` is zero.
-- **`PauseCopy`.** If a VM that attaches the volume is `Running`, the engine pauses it (`/vm.pause`), copies the volume file into a snapshot file keeping holes (`SEEK_DATA` and `SEEK_HOLE`), and resumes it (`/vm.resume`), whatever the copy's outcome. `pause` is the time between the pause and the resume. A volume no running VM attaches is copied without a pause. If a VM that attaches it starts during that copy, the snapshot is `Conflict` and leaves no file, since the guest may have written to the volume while it was copied (ADR 0269). A resume that fails is `Hypervisor`, and the VM is left for the node agent's crash handling.
+- **Guest flush first (ADR 0282).** Data an app wrote without `fsync` can still be in the guest's page cache, not in the volume file: with ext4's delayed allocation and the guest kernel's writeback defaults, it reaches the file up to about 35 s later. Before either method's own steps, the clone of `Reflink` or the pause of `PauseCopy`, the engine therefore asks the init of the running VM that attaches the volume to flush it. It opens a sync session on the VM's exec port that names the volume's serial (section 6), and waits at most 2 s for the answer.
+  - The guest keeps running during the flush, so `Reflink`'s `pause` stays zero and `PauseCopy`'s `pause` does not grow.
+  - The outcome is the descriptor's `guest_flush`:
+    - `Flushed` when the init answers `132`;
+    - `NoRunningVm` when no running VM attaches the volume;
+    - `Paused` when that VM is paused, whose guest is not asked because it cannot answer;
+    - `Unsupported` when the VM has no `vsock`, or when its init predates ADR 0282, which answers the sync frame with `131` and the message `the first frame must be open, got type 5`;
+    - `TimedOut` when no answer comes within 2 s;
+    - `Failed` for any other `131`, or a connection that fails.
+  - **The snapshot is taken whatever the outcome.** A flush that fails, times out or is unsupported never fails the snapshot (ADR 0282). Such a snapshot is crash-consistent, as below.
+  - The outcome describes the VM the engine found when the snapshot began. A VM that starts after that point is not flushed, and what it wrote since its boot is crash-consistent only.
+- **`Reflink`.** After the flush, the engine clones the volume file into a snapshot file next to it with `FICLONE`, without touching the VM. The snapshot is taken at the instant of the clone; `pause` is zero.
+- **`PauseCopy`.** After the flush, if a VM that attaches the volume is `Running`, the engine pauses it (`/vm.pause`), copies the volume file into a snapshot file keeping holes (`SEEK_DATA` and `SEEK_HOLE`), and resumes it (`/vm.resume`), whatever the copy's outcome. `pause` is the time between the pause and the resume. A volume no running VM attaches is copied without a pause. If a VM that attaches it starts during that copy, the snapshot is `Conflict` and leaves no file, since the guest may have written to the volume while it was copied (ADR 0269). A resume that fails is `Hypervisor`, and the VM is left for the node agent's crash handling.
   - **Locks and errors (ADR 0271).** The pause and the resume each take the VM's operation lock (section 4), which is free during the copy. A VM that attaches the volume and is already paused, by `pause` (section 3.22) or by a snapshot of another volume, is `Conflict`, since that freeze could end during the copy. A forced stop that waits for the lock gets it at once: before the pause the snapshot is then `Conflict`, and at the resume it is `Hypervisor`. A VM whose VMM stopped or was replaced during the copy is not resumed, its copy is not kept, and the snapshot is `Hypervisor`.
   - **A restart during the copy (ADR 0271).** Before the pause, the engine records the paused VMM process in the VM's runtime directory, and removes the record after the resume. When the engine starts again after a restart during the copy, it resumes that process once it adopts it, unless a stop of the VM was requested, a fence's included, which then ends it. A record of a process that is gone or runs is removed; while the VMM does not report whether the VM is paused, the record stays.
   - **A graceful stop during the copy (ADR 0270).** The record is the snapshot's claim on its pause. A graceful `stop` of the VM while the record names the VM's live VMM process ends that pause itself: under the VM's lock it removes the record, resumes the VM and asks the guest to power off (section 3.8). At its resume, a snapshot whose record is gone or names another process does not resume the VM and drops its copy, and the snapshot is `Hypervisor`, since the guest ran during the copy. A forced stop does not resume the VM; a fence's graceful phase is a graceful stop and does (section 3.8, ADR 0279). A `pause` freeze (section 3.22) has no such record, so a stop never resumes it.
-- **Crash consistency.** Both methods give the guest the guarantee of a power cut: an ext4 volume replays its journal after a restore. An app that needs more uses its own dump (ADR 0023). A guest-side freeze through the exec channel may shorten the pause later; it is not part of M5a.
+- **Consistency (ADR 0282).**
+  - **With `Flushed`,** the snapshot holds every write the guest completed before the flush, with or without `fsync`. Writes between the flush's answer and the clone or the pause, a few milliseconds, are crash-consistent only.
+  - **With `NoRunningVm`,** no guest holds unwritten data of the volume.
+  - **With any other outcome,** data written without `fsync` in about the last 35 s may be missing from the snapshot. This covers a VM whose init predates ADR 0282 until its next start, and a flush that failed or timed out.
+  - **Every snapshot** still gives the guest at least the guarantee of a power cut: an ext4 volume replays its journal after a restore, and data that was `fsync`ed is always in the snapshot.
+  - An app that needs more than "everything completed before the snapshot" uses its own dump (ADR 0023).
 - The snapshot is a node-local file that only the chunk engine reads. It is never attached to a VM and never mounted. `delete_volume_snapshot` removes it; a missing snapshot is `Ok`. Snapshots left by a crash are removed by the node agent at start. From M5b the node agent keeps those its store records: a warm volume's base and the snapshot being shipped, the candidate copies of a returning source and the quarantined copies (section 3.22, `node-agent-protocol.md` sections 6.13 and 9); it removes the rest.
 - In M5a at most one snapshot per volume exists at a time, and a second `snapshot_volume` while one exists is `Conflict`. From M5b a volume may have several at once, each with its own `snapshot_id`: a warm source keeps its base and the snapshot it ships, a backup may take another, and a returning source keeps its candidates and a quarantined copy. The node agent still runs at most one backup snapshot of a volume at a time. An unknown volume is `NotFound`. Too little free space for a `PauseCopy` is `ResourceExhausted`, checked before the pause.
 - They must **not** be implemented with Cloud Hypervisor VM snapshots. A CH snapshot is a paused VM's `config.json`, `memory-ranges` and `state.json`; it contains guest RAM and device state but no disk contents, and CH exposes no dirty bitmap (F-0035). `/vm.pause` and `/vm.resume` are the only VMM calls this method makes.
@@ -864,6 +913,11 @@ Turns a local OCI image layout, as a builder VM wrote it to its output disk, int
 ### 3.18 `exec`
 
 Starts a program on a PTY inside a running VM, in the app's root filesystem, with the app's environment and working directory, and returns its byte stream (ADR 0113). Added in M4; the web terminal is its only caller.
+
+- **The same port carries the engine's sync sessions (ADR 0282).** The engine opens them itself before a volume snapshot (section 3.16) and in `flush_volume` (section 3.22). `exec` never sends a sync frame.
+  - The web terminal is the only caller of `open`, and the engine's own volume flush is the only caller of `sync` (section 6).
+  - Neither the API nor MCP exposes a sync session.
+  - A terminal user cannot send one, because the engine frames the user's input as `2`.
 
 - The engine connects to the VM's vsock socket with Cloud Hypervisor's hybrid handshake (`CONNECT <port>\n`, answered `OK <port>\n`) on the init's exec port (section 6), and sends the open request. The guest init runs the program and relays bytes; the engine relays them to `ExecSession::io`.
 - `argv` is non-empty, holds no NUL, and is at most 64 items of at most 4096 bytes. `rows` and `cols` are 1 to 1000. Otherwise `Conflict`.
@@ -908,7 +962,7 @@ Returns the package inventory of a prepared image (ADR 0150, ADR 0151). Added in
   - The node agent calls `uninventoried_images` once, in the background, after it starts, then `inventory_cached_image` for one image at a time, and sends each inventory it gets as it does for a freshly prepared image (`node-agent-protocol.md` section 6.11). The pass never delays the node's start, a VM start or a preparation; an image that fails is logged and the pass goes on with the next one.
 - `remove_image` removes the inventory with the image. `inventory_cached_image` and `remove_image` of one digest are serialized, so a removal never races the inventory being written.
 
-### 3.22 Warm volumes: `volume_changed_ranges`, staging, `pause` and `resume`
+### 3.22 Warm volumes: `volume_changed_ranges`, staging, `pause`, `resume` and `flush_volume`
 
 What a warm source and a warm target need from the engine (ADR 0172 to ADR 0177, `node-agent-protocol.md` section 6.13). Added in M5b; the default implementations return `Unsupported`, and a node whose `volume_snapshot_method` is not `Reflink` is never offered a warm volume. The engine finds what changed and moves files into place; the node agent reads and writes the bytes, hashes them and talks to the other node, as for backups (section 3.16).
 
@@ -920,7 +974,12 @@ What a warm source and a warm target need from the engine (ADR 0172 to ADR 0177,
 - **`commit_staged_volume`** syncs the staging file, renames it over the volume file in one step on the same filesystem, syncs the directory and returns the volume's `VolumeInfo`. A volume that has no file yet (the first copy on a target) gets it. A VM that exists and attaches the volume is `Conflict`: the target's standby VM is not created until it is the source (`node-agent-protocol.md` section 5.11). After a crash the volume file is either the old copy or the new one, never a mix.
 - **`discard_staged_volume`** removes the staging file; a missing one is `Ok`. Staging files left by a crash are removed by the node agent at start, so a copy that did not complete leaves nothing.
 - **`pause`** freezes a running VM's vCPUs; its memory, devices and volumes stay as they are, and the guest sees no event. **`resume`** lets it run again. They are what a planned switchover freezes the app's writes with (ADR 0177, `node-agent-protocol.md` section 5.17). Pausing a paused VM and resuming a running one are `Ok`. A VM that is not running or paused is `Conflict`; an unknown one is `NotFound`. A paused VM keeps `VmState::Running` in `inspect` and `list`: the node agent records the freeze itself, so it knows after a restart which VM it paused. `stop` and `delete` work on a paused VM, and no stop ever resumes a VM `pause` froze (section 3.8, ADR 0270). A graceful stop resumes a VM that a `PauseCopy` snapshot paused before it presses the power button, also during a fence's graceful phase (`node-agent-protocol.md` section 8.5 step 1), and the snapshot then drops its copy; a forced stop, a fence's forced phase included, never resumes a VM (ADR 0279).
-- The node agent, not the engine, decides when to snapshot, compare, stage, commit or pause, and checks the lease and the token first (`node-agent-protocol.md` sections 6.13 and 8.6).
+- **`flush_volume`** (ADR 0282) asks the guest to flush the volume's filesystem, as a snapshot does first (section 3.16), and returns the outcome after at most `within`.
+  - The VM keeps running during the flush.
+  - A guest that does not answer, or answers with an error, is an outcome, never an error of the call. An unknown volume is `NotFound`.
+  - The default implementation returns `Ok(GuestFlush::Unsupported)`.
+  - A planned switchover calls it before `pause`, with a 2 s bound (`node-agent-protocol.md` section 5.17), since a paused guest can no longer answer. Writes the guest completed before the flush are then in the final snapshot, and that snapshot itself reports `Paused`.
+- The node agent, not the engine, decides when to snapshot, compare, stage, commit, flush or pause, and checks the lease and the token first (`node-agent-protocol.md` sections 6.13 and 8.6).
 
 ## 4. Concurrency
 
@@ -955,7 +1014,7 @@ One `cloud-hypervisor` process per VM with its own `--api-socket`, because the V
 | `exec` | Connects to `<vm dir>/vsock.sock`, sends `CONNECT` for the exec port, then the open frame; relays frames to the PTY stream (section 3.18) | Hybrid vsock socket; no API call |
 | `serial_output` | Reads the node-local ring, then follows the engine's own serial client (section 3.19) | No backend call; the client reads the `--serial socket=` endpoint |
 | `counters` | Reads the VM's I/O and device counters and maps them to `VmCounters`; the exact field names of the backend's counter document are not fixed by `docs/research/cloud-hypervisor.md`, so the mapping is **Hypothesis** | `/vm.counters` |
-| `snapshot_volume` | `FICLONE` of the volume file, natively or in the XFS volume pool, or pause, sparse copy and resume (section 3.16, ADR 0156) | `/vm.pause` and `/vm.resume` for `PauseCopy` only; never `/vm.snapshot` (F-0035) |
+| `snapshot_volume` | First the guest flush of `flush_volume`, bounded at 2 s, then `FICLONE` of the volume file, natively or in the XFS volume pool, or pause, sparse copy and resume (section 3.16, ADR 0156, ADR 0282) | The hybrid vsock socket for the flush; `/vm.pause` and `/vm.resume` for `PauseCopy` only; never `/vm.snapshot` (F-0035) |
 | `delete_volume_snapshot` | Removes the snapshot file | No backend call |
 | `volume_changed_ranges` | Reads both extent maps with `FS_IOC_FIEMAP` and compares their physical blocks (section 3.22, ADR 0172) | No backend call |
 | `stage_volume` | `FICLONE` of the volume file or of a snapshot into a staging file, or a sparse empty file (section 3.22) | No backend call |
@@ -963,6 +1022,7 @@ One `cloud-hypervisor` process per VM with its own `--api-socket`, because the V
 | `discard_staged_volume` | Removes the staging file | No backend call |
 | `pause` | Freezes the VM's vCPUs (section 3.22) | `/vm.pause` |
 | `resume` | Lets a paused VM run (section 3.22) | `/vm.resume` |
+| `flush_volume` | Connects to `<vm dir>/vsock.sock` of the running VM that attaches the volume, sends `CONNECT` for the exec port, then one sync frame naming the volume's serial, and waits for `132` or `131` (sections 3.22 and 6, ADR 0282) | Hybrid vsock socket; `/vm.info` to skip a paused VM |
 | `ensure_volume` | Creates the sparse file and runs `mkfs.ext4` on it (section 3.20) | No backend call |
 | `import_volume` | Renames the restored file into place (section 3.20) | No backend call |
 | `delete_volume` | Removes the volume file (section 3.20) | No backend call |
@@ -992,7 +1052,7 @@ The minimal init is part of the engine workstream and is the only process Quoro 
 | Working directory | The app's working directory |
 | Network | Address, prefix length, gateway, interface name and the DNS servers of the node network (`NodeNetwork::dns`) |
 | Console | Which console carries log lines |
-| Exec port | The vsock port the init listens on for exec sessions (M4) |
+| Exec port | The vsock port the init listens on for exec sessions (M4) and sync sessions (M5b) |
 | Volumes | For each attached volume, its disk serial and mount path (M5a) |
 
 **What the init must do.**
@@ -1007,12 +1067,23 @@ The minimal init is part of the engine workstream and is the only process Quoro 
 8. From M4, mount `cgroup2` on `/sys/fs/cgroup`, which BuildKit needs and app images may expect (ADR 0118).
 9. From M4, listen for exec sessions (below), and unmount or remount read-only every writable disk before powering off, so a work disk is clean for the next VM that attaches it, without journal recovery (ADR 0118).
 10. From M5a, after the switch into the app's root and before the app starts, find each volume's disk by its serial and mount it at its mount path inside the app's root, creating the directory if it is missing. A volume that cannot be found or mounted is a failed boot. Volumes are unmounted with the other writable disks before power-off.
+11. From M5b, answer a sync session (below) by running `syncfs` on the mount of each volume it names, so a host-side snapshot holds what the app wrote (ADR 0282).
 
 **Configuration version 2 (M4).** The init's configuration grammar refuses unknown keys, so M4 adds one: the header becomes `quoro-init-config v2`, and one line `exec_port=<u32>` follows `stop_timeout_ms` (`crates/init/README.md`). The engine writes `exec_port=1024`. The init still accepts a `v1` configuration and then starts no exec listener. The engine and the init ship together: the initramfs is rebuilt from the installed init, so a VM gets the new init at its next start, and a VM that kept running across the upgrade answers `exec` with `Conflict` until it restarts.
 
 **Configuration version 3 (M5a).** The header becomes `quoro-init-config v3`, and zero or more lines `volume=<serial>:<mount_path>` follow `exec_port`, one per attached volume in the order of `VmSpec::volumes` (`crates/init/README.md`). `serial` matches `quoro-vol-[0-9]+`; `mount_path` is absolute, at most 255 bytes, holds no `:`, no empty, `.` or `..` segment and no trailing `/`, and is not `/` nor under `/proc`, `/sys` or `/dev`; any other line is a configuration error. The engine writes `v3` for every VM from M5a, with no `volume=` line for a VM without volumes. The init still accepts `v1` and `v2`. A VM started before its node got the M5a init boots as before; a VM with a volume needs the M5a init, which it gets at its next start.
 
 **Exec sessions (M4).** After the switch into the app's root and before the app starts, the init listens on vsock port `exec_port` for the VM's lifetime; vsock delivers only connections from the host to a guest listener (ADR 0113). One connection is one session. Every frame is `[u8 type][u32 length, big-endian][payload]`, with a payload of at most 64 KiB; a larger or unknown frame ends the session. Host to guest: `1` open (JSON `{"argv":[...],"user":null|"...","rows":R,"cols":C}`, exactly once, first), `2` input bytes, `3` resize (`u16 rows`, `u16 cols`, big-endian), `4` close. Guest to host: `129` output bytes, `130` exit (`i32` big-endian, `128 + signal` when a signal ended the program), `131` error (UTF-8 message, then the guest closes). Per session the init allocates a PTY and starts the program as a session leader with the PTY as its controlling terminal, the app's environment with `TERM=xterm-256color`, the app's working directory, and the app's user unless the open names another. Because the workspace forbids `unsafe`, the init re-executes itself (`/proc/self/exe` with a helper argument) as a small helper that calls `setsid`, takes the PTY as its controlling terminal on stdin, stdout and stderr, and replaces itself with the program. A close, or the host dropping the connection, sends `SIGHUP` to the session's process group. The exec listener never writes to the app's stdout or to the log console.
+
+**Sync sessions (M5b, ADR 0282).** ADR 0282 extends the framing of ADR 0126 with one frame each way, for the engine's flush of a volume before a snapshot (section 3.16).
+
+- **Host to guest: `5` sync,** valid only as a session's first frame, in place of `1` open. Its payload is JSON `{"serials":["quoro-vol-0", ...]}`: one or more serials, each that of a volume in the configuration. The host sends nothing after it, and the init reads no further frame of that session.
+- **The init's work.** For each serial, in order, it opens that volume's mount path and calls `syncfs` on it.
+- **Guest to host: `132` synced,** with an empty payload, once every named volume was synced. The init then closes the session.
+- **Errors.** A malformed payload, an empty list, an unknown serial, a mount it cannot open, or a `syncfs` that fails is answered with `131` error and the reason, then a close.
+- **What a sync session does not do.** It starts no program, allocates no PTY, and writes nothing to the app's stdout or to the log console.
+- **Concurrency.** Each session is served on its own, as an exec session is. A host that stops waiting drops the connection, and a `syncfs` already under way still completes.
+- **Older inits and upgrades.** An init older than ADR 0282 accepts only `open` as a first frame: it answers `131` with the message `the first frame must be open, got type 5` and closes, which the engine reports as `Unsupported` (section 3.16). The configuration does not change: the M5b init reads the same `v3` configuration and serves sync sessions on `exec_port`. A VM gets the new init at its next start, as with every init change.
 
 While the app is running, the init must not write to the app's stdout, so a log line's stream tag is never ambiguous. On a failed boot — no configuration, a missing entrypoint, an unmountable disk — the init writes a diagnostic to the serial console and powers off with a non-zero code, so the failure surfaces as a `deployment.failed` event in the `boot` phase rather than as a silent hang.
 
@@ -1029,6 +1100,7 @@ Tests must run on machines without KVM, including CI and the laptops of people w
 - Inventory methods: `image_inventory` returns an injectable inventory for a prepared image; a test can mark an image as prepared before M5a, which `uninventoried_images` then lists and `image_inventory` reports `NotFound` until `inventory_cached_image` builds an injectable inventory for it, or fails with an injectable error.
 - Volume methods: `ensure_volume`, `import_volume` and `delete_volume` keep volume records in memory with their size; `snapshot_volume` and `delete_volume_snapshot` succeed and record a snapshot descriptor, so the M5 chunk-engine code is testable before a real primitive exists. `Capabilities::volume_snapshot_method` is injectable and defaults to `Reflink`; with `PauseCopy` the fake records a pause and resume of the VM that attaches the volume.
 - Warm methods (M5b): `volume_changed_ranges` returns injectable ranges, by default every range of the volume with `full: true`; `stage_volume`, `commit_staged_volume` and `discard_staged_volume` keep staging records and apply the volume rules of section 3.22, including the `Conflict` of a VM that attaches the volume; `pause` and `resume` flip a paused flag a test can read, and a test can make either fail.
+- Guest flush (M5b, ADR 0282): `flush_volume` returns an injectable `GuestFlush`, and `snapshot_volume` records the same outcome in `guest_flush`. The default is `Flushed` when a running VM that is not paused attaches the volume, `Paused` when that VM is paused, and `NoRunningVm` otherwise. So the node agent's report of every outcome, the false ones included, is testable.
 
 The node agent runs its protocol tests against `FakeEngine`: the M0 lease tests — revoking a `local` lease and expiring a test-only short `expiring` lease — need no VM at all beyond a fake (`node-agent-protocol.md`).
 
@@ -1049,4 +1121,4 @@ The node agent runs its protocol tests against `FakeEngine`: the M0 lease tests 
 | M2 | `output` feeds live app logs (D-0014, D-0033); isolation groups on `NetAttach` and guest DNS on `NodeNetwork` (D-0084) |
 | M4 | `counters` for metrics (D-0033, ADR 0014); `serial_output` and `VmSpec::serial` for the read-only console (ADR 0116); `exec` and `VmSpec::vsock` for the web terminal, with init configuration v2 (ADR 0113); `prepare_layout`, `VmSpec::work_disks` and `NetAttach::egress_only` for builds (ADR 0117, ADR 0118). `console` is superseded |
 | M5a | `image_inventory`, built by `prepare_image` and `prepare_layout` (ADR 0150, ADR 0151), and `uninventoried_images` and `inventory_cached_image` for images cached before M5a; `ensure_volume`, `import_volume`, `delete_volume` and `VolumeAttach::serial` for local volumes, with init configuration v3 (ADR 0145); `snapshot_volume` and `delete_volume_snapshot` with the `Reflink` or `PauseCopy` method probed per node (ADR 0146) |
-| M5b | `volume_changed_ranges` between two reflink snapshots of a warm volume, found by comparing their extent maps (ADR 0172, D-0023); `stage_volume`, `commit_staged_volume` and `discard_staged_volume` for the target's copy (ADR 0173); `pause` and `resume` for a planned switchover (ADR 0177); several snapshots per volume (section 3.16); a caller-supplied bound on `start` (ADR 0242) and on both stop modes, with forced stops that finish after a dropped call (ADR 0243, #434) |
+| M5b | `volume_changed_ranges` between two reflink snapshots of a warm volume, found by comparing their extent maps (ADR 0172, D-0023); `stage_volume`, `commit_staged_volume` and `discard_staged_volume` for the target's copy (ADR 0173); `pause` and `resume` for a planned switchover (ADR 0177); several snapshots per volume (section 3.16); a caller-supplied bound on `start` (ADR 0242) and on both stop modes, with forced stops that finish after a dropped call (ADR 0243, #434); a guest flush through the init before every volume snapshot, `flush_volume` and `VolumeSnapshot::guest_flush`, with the sync session of section 6 (ADR 0282, #400) |
