@@ -27,13 +27,12 @@ use rustix::fs::SeekFrom;
 use rustix::io::Errno;
 
 use super::api::ApiClient;
-use super::engine::{Inner, create_work_disk_file, io_error, lock};
+use super::engine::{Inner, VmEntry, create_work_disk_file, io_error, lock};
 use super::pool::VolumePool;
+use super::vmm::ProcessId;
 use crate::ch::state;
 use crate::ch::tools;
-use crate::{
-    EngineError, SnapshotMethod, VmId, VmSpec, VmState, VolumeId, VolumeInfo, VolumeSnapshot,
-};
+use crate::{EngineError, SnapshotMethod, VmId, VmSpec, VolumeId, VolumeInfo, VolumeSnapshot};
 
 /// Free bytes the volume directory keeps for the filesystem's metadata: a
 /// sparse file itself needs almost nothing up front, but `mkfs.ext4` writes
@@ -732,7 +731,7 @@ impl Inner {
     ///
     /// `Reflink` clones the file. `PauseCopy` pauses the VM that attaches the
     /// volume when it is running, copies the sparse file and always resumes the
-    /// VM, whatever the copy's outcome.
+    /// VM, whatever the copy's outcome (see [`Inner::pause_copy`]).
     pub(super) async fn snapshot_volume(
         &self,
         id: &VolumeId,
@@ -760,6 +759,7 @@ impl Inner {
         let allocated = metadata.blocks().saturating_mul(512);
         let method = self.volume_method;
         let mut pause = Duration::ZERO;
+        let mut copied = None;
         match method {
             SnapshotMethod::Reflink => {
                 let source = path.clone();
@@ -777,45 +777,9 @@ impl Inner {
                         id.0
                     )));
                 }
-                let running = self.running_vm_for_volume(id).await;
-                let api = running.as_ref().map(|entry| {
-                    ApiClient::new(&entry.paths.api_socket).with_timeout(SNAPSHOT_API_TIMEOUT)
-                });
-                let started = Instant::now();
-                if let Some(api) = &api
-                    && let Err(err) = api.pause().await
-                {
-                    return Err(EngineError::Hypervisor(format!(
-                        "cloud-hypervisor did not pause the VM using volume {}: {err}",
-                        id.0
-                    )));
-                }
-                let source = path.clone();
-                let clone = location.clone();
-                // No `?` before the resume: a failed or panicked copy task
-                // must still resume the VM.
-                let copied = tokio::task::spawn_blocking(move || copy_sparse(&source, &clone))
-                    .await
-                    .map_err(|err| EngineError::Io(format!("snapshot task failed: {err}")))
-                    .and_then(|result| result);
-                if api.is_some() {
-                    // Resume whatever the copy's outcome; the pause is the
-                    // window from before the pause to after the resume.
-                    if let Some(api) = &api
-                        && let Err(err) = api.resume().await
-                    {
-                        let _ = std::fs::remove_file(&location);
-                        return Err(EngineError::Hypervisor(format!(
-                            "cloud-hypervisor did not resume the VM using volume {}: {err}",
-                            id.0
-                        )));
-                    }
-                    pause = started.elapsed();
-                }
-                if let Err(err) = copied {
-                    let _ = std::fs::remove_file(&location);
-                    return Err(err);
-                }
+                let (paused, file) = self.pause_copy(id, &path, &location).await?;
+                pause = paused;
+                copied = Some(file);
             }
         }
 
@@ -830,6 +794,9 @@ impl Inner {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
+        if let Some(file) = copied {
+            file.keep();
+        }
         Ok(VolumeSnapshot {
             volume_id: id.clone(),
             snapshot_id,
@@ -857,26 +824,368 @@ impl Inner {
         }
     }
 
-    /// The running VM that attaches `id`, if any (§3.16).
-    async fn running_vm_for_volume(&self, id: &VolumeId) -> Option<Arc<super::engine::VmEntry>> {
-        for (vm_id, entry) in self.entries() {
-            let Ok((_, record)) = self.entry_with_spec(&vm_id) else {
-                continue;
-            };
-            if !record
-                .spec
-                .volumes
-                .iter()
-                .any(|volume| volume.volume_id == id.0)
-            {
-                continue;
-            }
-            if matches!(self.inspect(&vm_id).await, Ok(info) if info.state == VmState::Running) {
-                return Some(entry);
+    /// The `PauseCopy` snapshot of the volume file `path` into `location`
+    /// (§3.16): see [`spawn_pause_copy`].
+    async fn pause_copy(
+        &self,
+        id: &VolumeId,
+        path: &Path,
+        location: &Path,
+    ) -> Result<(Duration, SnapshotFile), EngineError> {
+        spawn_pause_copy(
+            self.vms_for_volume(id),
+            id.clone(),
+            path.to_owned(),
+            location.to_owned(),
+            copy_sparse,
+        )
+        .await
+    }
+
+    /// The VMs whose spec attaches `id`, whatever their state (§3.16).
+    fn vms_for_volume(&self, id: &VolumeId) -> Vec<Arc<VmEntry>> {
+        self.entries()
+            .into_iter()
+            .filter_map(|(vm_id, entry)| {
+                let (_, record) = self.entry_with_spec(&vm_id).ok()?;
+                record
+                    .spec
+                    .volumes
+                    .iter()
+                    .any(|volume| volume.volume_id == id.0)
+                    .then_some(entry)
+            })
+            .collect()
+    }
+}
+
+/// A snapshot file a `PauseCopy` made, removed when this is dropped unless
+/// [`Self::keep`] took it: a snapshot whose caller gave up is not left behind.
+pub(super) struct SnapshotFile(Option<PathBuf>);
+
+impl SnapshotFile {
+    /// The caller has the snapshot; the file stays.
+    pub(super) fn keep(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for SnapshotFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Runs [`pause_and_copy`] on a task of its own. A caller that drops the
+/// returned future does not leave the VM paused: the task carries the copy on
+/// to the resume. The snapshot file comes with a [`SnapshotFile`], so one
+/// nobody received is removed (§3.16).
+pub(super) fn spawn_pause_copy<F>(
+    vms: Vec<Arc<VmEntry>>,
+    volume: VolumeId,
+    source: PathBuf,
+    clone: PathBuf,
+    copy: F,
+) -> impl Future<Output = Result<(Duration, SnapshotFile), EngineError>> + Send
+where
+    F: FnOnce(&Path, &Path) -> Result<u64, EngineError> + Send + 'static,
+{
+    let (sent, received) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let result = pause_and_copy(&vms, &volume, &source, &clone, copy)
+            .await
+            .map(|pause| (pause, SnapshotFile(Some(clone))));
+        // A result nobody receives is dropped here, its file with it.
+        let _ = sent.send(result);
+    });
+    async move {
+        received
+            .await
+            .map_err(|_| EngineError::Io("snapshot task failed".to_owned()))?
+    }
+}
+
+/// The VM a `PauseCopy` snapshot paused: which VMM process, and since when.
+struct PausedVm {
+    entry: Arc<VmEntry>,
+    process: ProcessId,
+    since: Instant,
+}
+
+/// Pauses the one of `vms` that runs, copies `source` into `clone` with
+/// `copy` and resumes the VM whatever the copy's outcome (§3.16). Returns how
+/// long the VM was paused, zero when none ran and the volume was copied
+/// without a pause.
+///
+/// The VM's operation lock is held for the pause and for the resume, and the
+/// VM's state is read under it, so neither interleaves with a start, a stop
+/// or a delete of the VM, and one under way is waited out first (§4). It is
+/// not held during the copy, which can take a minute, so a stop of the paused
+/// VM, a fence's included, is not held up by it. The resume is for the VMM
+/// process that was paused only: when that process is gone, the copy is not
+/// kept, as the VM may have started again on the volume during it. While the
+/// VM is paused, its directory records the paused process, so an engine that
+/// restarts meanwhile resumes it ([`resume_left_paused`]).
+pub(super) async fn pause_and_copy<F>(
+    vms: &[Arc<VmEntry>],
+    volume: &VolumeId,
+    source: &Path,
+    clone: &Path,
+    copy: F,
+) -> Result<Duration, EngineError>
+where
+    F: FnOnce(&Path, &Path) -> Result<u64, EngineError> + Send + 'static,
+{
+    let paused = pause_running(vms, volume).await?;
+    let (from, to) = (source.to_owned(), clone.to_owned());
+    // No `?` before the resume: a failed or panicked copy task must still
+    // resume the VM.
+    let copied = tokio::task::spawn_blocking(move || copy(&from, &to))
+        .await
+        .map_err(|err| EngineError::Io(format!("snapshot task failed: {err}")))
+        .and_then(|result| result);
+    let mut pause = Duration::ZERO;
+    if let Some(paused) = paused {
+        match resume_paused(&paused, volume).await {
+            // The window from before the pause to after the resume.
+            Ok(resumed) => pause = resumed.saturating_duration_since(paused.since),
+            Err(err) => {
+                let _ = std::fs::remove_file(clone);
+                return Err(err);
             }
         }
-        None
     }
+    if let Err(err) = copied {
+        let _ = std::fs::remove_file(clone);
+        return Err(err);
+    }
+    Ok(pause)
+}
+
+/// Pauses the first of `vms` whose guest runs, under its operation lock.
+///
+/// A VM another caller paused is `Conflict`: its freeze is not this
+/// snapshot's, and it could end during the copy. A VM whose VMM does not say
+/// its state is `Hypervisor`, since the copy could not be made consistent. A
+/// forced stop of the VM that waits for the lock meanwhile gets it at once,
+/// and the snapshot is `Conflict` (§4, ADR 0243).
+async fn pause_running(
+    vms: &[Arc<VmEntry>],
+    volume: &VolumeId,
+) -> Result<Option<PausedVm>, EngineError> {
+    for entry in vms {
+        let _op = entry.op.lock().await;
+        if !entry.paths.dir.exists() || !entry.booted.load(Ordering::SeqCst) {
+            continue;
+        }
+        let Some(vmm) = entry.live_vmm() else {
+            continue;
+        };
+        let process = vmm.id();
+        let since = tokio::select! {
+            since = pause_if_running(entry, process, volume) => since?,
+            () = entry.forced_stop_waiting() => {
+                return Err(EngineError::Conflict(format!(
+                    "a forced stop of the VM using volume {} came before the snapshot's pause",
+                    volume.0
+                )));
+            }
+        };
+        let Some(since) = since else {
+            continue;
+        };
+        return Ok(Some(PausedVm {
+            entry: Arc::clone(entry),
+            process,
+            since,
+        }));
+    }
+    Ok(None)
+}
+
+/// Pauses the VM if its VMM reports it running, and returns when the pause
+/// began; `None` when it is not running. The paused process is recorded
+/// before the pause, and the record removed when the pause did not take
+/// effect. A VM that is already paused is `Conflict`.
+async fn pause_if_running(
+    entry: &VmEntry,
+    process: ProcessId,
+    volume: &VolumeId,
+) -> Result<Option<Instant>, EngineError> {
+    let api = ApiClient::new(&entry.paths.api_socket).with_timeout(SNAPSHOT_API_TIMEOUT);
+    let state = vm_state(&api).await.map_err(|err| {
+        EngineError::Hypervisor(format!(
+            "cloud-hypervisor did not report the VM using volume {}: {err}",
+            volume.0
+        ))
+    })?;
+    match state.as_deref() {
+        Some("Running") => {}
+        // A freeze another caller holds could end during the copy. The record
+        // names this process while another volume's snapshot copies, or after
+        // a resume of this engine's failed (§3.16).
+        Some("Paused") => {
+            let by = if recorded_pause(entry) == Some(process) {
+                "for another volume snapshot"
+            } else {
+                "by another caller"
+            };
+            return Err(EngineError::Conflict(format!(
+                "the VM using volume {} is paused {by}",
+                volume.0
+            )));
+        }
+        _ => return Ok(None),
+    }
+    // Recorded first: a pause the engine cannot record is not made, since a
+    // restart during the copy would leave it in place.
+    state::write_json_atomic(&entry.paths.snapshot_paused, &process)?;
+    let since = Instant::now();
+    if let Err(err) = api.pause().await {
+        // The request may have reached the VMM and only its answer been lost;
+        // nobody else could pause the VM under its lock. While the VMM does not
+        // say, the record stays, so a restart resumes the VM if it is paused.
+        let state = vm_state(&api).await;
+        match state.as_ref().map(Option::as_deref) {
+            Ok(Some("Paused")) => {
+                if api.resume().await.is_ok() {
+                    remove_record_of(entry, process);
+                }
+            }
+            Ok(_) => remove_record_of(entry, process),
+            Err(_) => {}
+        }
+        return Err(EngineError::Hypervisor(format!(
+            "cloud-hypervisor did not pause the VM using volume {}: {err}",
+            volume.0
+        )));
+    }
+    Ok(Some(since))
+}
+
+/// Resumes the VM `paused` stopped, under its operation lock, if its VMM is
+/// still the process that was paused, and returns when it was resumed. A
+/// resume that fails, or a VMM that is gone, is `Hypervisor`, and the VM is
+/// left for the node agent's crash handling (§3.16). A forced stop of the VM
+/// that waits for the lock meanwhile gets it at once and ends the VM, which
+/// is then not resumed (ADR 0243).
+async fn resume_paused(paused: &PausedVm, volume: &VolumeId) -> Result<Instant, EngineError> {
+    let entry = &paused.entry;
+    let stopped = || {
+        EngineError::Hypervisor(format!(
+            "the VM using volume {} stopped while it was paused for the copy",
+            volume.0
+        ))
+    };
+    let _op = entry.op.lock().await;
+    if !entry
+        .live_vmm()
+        .is_some_and(|vmm| vmm.id() == paused.process)
+    {
+        remove_record_of(entry, paused.process);
+        return Err(stopped());
+    }
+    let api = ApiClient::new(&entry.paths.api_socket).with_timeout(SNAPSHOT_API_TIMEOUT);
+    tokio::select! {
+        resumed = api.resume() => {
+            if let Err(err) = resumed {
+                // A resume whose answer was lost may have taken effect.
+                let state = vm_state(&api).await;
+                if matches!(state.as_ref().map(Option::as_deref), Ok(Some(state)) if state != "Paused") {
+                    remove_record_of(entry, paused.process);
+                }
+                return Err(EngineError::Hypervisor(format!(
+                    "cloud-hypervisor did not resume the VM using volume {}: {err}",
+                    volume.0
+                )));
+            }
+            let resumed = Instant::now();
+            remove_record_of(entry, paused.process);
+            Ok(resumed)
+        }
+        () = entry.forced_stop_waiting() => Err(stopped()),
+    }
+}
+
+/// Resumes a VM that a `PauseCopy` snapshot paused before the engine last
+/// stopped, once the engine has adopted its VMM again (§3.16): the record
+/// names the paused process, and only that process is resumed. A record of a
+/// process that is gone or runs is removed. A VM whose stop was requested is
+/// left paused for the stop, a fence's included. While the VMM does not say
+/// whether the VM is paused, the record stays.
+pub(super) async fn resume_left_paused(entry: &VmEntry) {
+    let process = match state::read_json::<ProcessId>(&entry.paths.snapshot_paused) {
+        Ok(Some(process)) => process,
+        Ok(None) => return,
+        Err(err) => {
+            eprintln!(
+                "quoro-engine: cannot read which process a volume snapshot paused for VM {}: {err}",
+                entry.id.0
+            );
+            return;
+        }
+    };
+    let _op = entry.op.lock().await;
+    if !entry.live_vmm().is_some_and(|vmm| vmm.id() == process) {
+        remove_record_of(entry, process);
+        return;
+    }
+    if state::marker_exists(&entry.paths.stop_requested) {
+        eprintln!(
+            "quoro-engine: VM {} stays paused, as a volume snapshot left it: its stop was requested",
+            entry.id.0
+        );
+        return;
+    }
+    let api = ApiClient::new(&entry.paths.api_socket).with_timeout(SNAPSHOT_API_TIMEOUT);
+    let state = vm_state(&api).await;
+    match state.as_ref().map(Option::as_deref) {
+        Ok(Some("Paused")) => {
+            if api.resume().await.is_ok() {
+                eprintln!(
+                    "quoro-engine: resumed VM {}, which a volume snapshot paused before the engine restarted",
+                    entry.id.0
+                );
+                remove_record_of(entry, process);
+            } else {
+                eprintln!(
+                    "quoro-engine: could not resume VM {}, which a volume snapshot paused before the engine restarted",
+                    entry.id.0
+                );
+            }
+        }
+        Ok(_) => remove_record_of(entry, process),
+        Err(err) => eprintln!(
+            "quoro-engine: VM {} may still be paused by a volume snapshot; its VMM did not say: {err}",
+            entry.id.0
+        ),
+    }
+}
+
+/// The paused process the VM's directory records, if any can be read.
+fn recorded_pause(entry: &VmEntry) -> Option<ProcessId> {
+    state::read_json(&entry.paths.snapshot_paused)
+        .ok()
+        .flatten()
+}
+
+/// Removes the record of a snapshot's pause if it names `process`, so one
+/// snapshot never removes the record of another's pause of a later process.
+fn remove_record_of(entry: &VmEntry, process: ProcessId) {
+    if recorded_pause(entry) == Some(process) {
+        let _ = state::remove_marker(&entry.paths.snapshot_paused);
+    }
+}
+
+/// The VM's state as its VMM reports it.
+async fn vm_state(api: &ApiClient) -> Result<Option<String>, super::api::ApiError> {
+    let document = api.info().await?;
+    Ok(document
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned))
 }
 
 /// How long one pause or resume may take. A paused VM makes no progress, so

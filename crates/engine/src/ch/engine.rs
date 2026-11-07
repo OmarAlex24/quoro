@@ -157,8 +157,9 @@ enum Phase {
 pub(super) struct VmEntry {
     pub(super) id: VmId,
     pub(super) paths: VmPaths,
-    /// Serializes create, start, stop and delete on this id. It is shared so
-    /// a forced stop's own task can hold it (§3.8).
+    /// Serializes create, start, stop, delete, pause and resume on this id,
+    /// a `PauseCopy` snapshot's pause and resume included. It is shared so a
+    /// forced stop's own task can hold it (§3.8, §4).
     pub(super) op: Arc<Mutex<()>>,
     /// The live VMM handle, while the process exists.
     pub(super) vmm: StdMutex<Option<Vmm>>,
@@ -211,6 +212,14 @@ impl VmEntry {
         *lock(&self.phase)
     }
 
+    /// Resolves once a forced stop of this VM waits for its lock. A short
+    /// call that holds the lock gives it up then, so a fence's forced stop
+    /// keeps its bound (§3.8, ADR 0243, #434).
+    pub(super) async fn forced_stop_waiting(&self) {
+        let mut forced = self.force_waiting.subscribe();
+        let _ = forced.wait_for(|waiting| *waiting > 0).await;
+    }
+
     fn set_phase(&self, phase: Phase) {
         *lock(&self.phase) = phase;
     }
@@ -225,7 +234,7 @@ impl VmEntry {
     /// A `/proc` that cannot be read proves nothing, so the VMM stays live: a
     /// stop goes on to stop it, and `inspect` keeps reporting it with its pid
     /// instead of stopped, which a fence would take for proof (D-0074).
-    fn live_vmm(&self) -> Option<Vmm> {
+    pub(super) fn live_vmm(&self) -> Option<Vmm> {
         let slot = lock(&self.vmm);
         let vmm = slot.as_ref()?;
         match vmm.id().liveness() {
@@ -445,10 +454,14 @@ impl Inner {
                             start_serial_client(&entry, spec);
                         }
                         lock(&self.vms).insert(id, Arc::clone(&entry));
+                        // A snapshot that paused the VM when the engine last
+                        // stopped never resumed it (§3.16).
+                        super::volume::resume_left_paused(&entry).await;
                         supervise::start(Arc::clone(self), entry, vmm);
                     }
                     None => {
                         entry.booted.store(vmm_record.booted, Ordering::SeqCst);
+                        let _ = state::remove_marker(&entry.paths.snapshot_paused);
                         supervise::finish(self, &entry, None, None, false);
                         lock(&self.vms).insert(id, entry);
                     }
@@ -2033,6 +2046,7 @@ fn rebased(paths: &VmPaths, dir: &Path) -> VmPaths {
         vmm: moved(&paths.vmm, dir),
         stop_requested: moved(&paths.stop_requested, dir),
         last_exit: moved(&paths.last_exit, dir),
+        snapshot_paused: moved(&paths.snapshot_paused, dir),
         config_disk: moved(&paths.config_disk, dir),
         data_disk: moved(&paths.data_disk, dir),
         api_socket: moved(&paths.api_socket, dir),
@@ -2906,5 +2920,655 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(recorded_bridge_to_restore("quoro0", false, &networks), None);
+    }
+
+    /// How a [`StatefulApi`] misbehaves.
+    #[derive(Clone, Copy, Default)]
+    struct Faults {
+        /// `vm.info` answers `500`.
+        info_fails: bool,
+        /// `vm.pause` answers `500`.
+        pause_fails: bool,
+        /// A `vm.pause` that answers `500` pauses the VM anyway, as when
+        /// the answer of a pause that took effect is lost.
+        pause_takes_effect: bool,
+        /// `vm.info` answers `500` once a `vm.pause` was asked for.
+        info_fails_after_pause: bool,
+        /// `vm.resume` answers `500` and leaves the VM paused.
+        resume_fails: bool,
+        /// `vm.resume` is never answered.
+        resume_hangs: bool,
+    }
+
+    /// A VMM's API that keeps its VM's state: `vm.info` reports it, and
+    /// `vm.pause` and `vm.resume` change it. Every request's endpoint is
+    /// recorded.
+    struct StatefulApi {
+        calls: Arc<StdMutex<Vec<String>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl StatefulApi {
+        fn serve(socket: &Path, state: &'static str, faults: Faults) -> Self {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let listener = tokio::net::UnixListener::bind(socket).expect("bind");
+            let calls = Arc::new(StdMutex::new(Vec::new()));
+            let recorded = Arc::clone(&calls);
+            let task = tokio::spawn(async move {
+                let mut state = state;
+                let mut pause_asked = false;
+                let mut held = Vec::new();
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut request = vec![0_u8; 4096];
+                    let read = stream.read(&mut request).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&request[..read]).into_owned();
+                    let endpoint = request
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|path| path.rsplit('/').next())
+                        .unwrap_or_default()
+                        .to_owned();
+                    let failed = "HTTP/1.1 500 \r\nContent-Length: 0\r\n\r\n".to_owned();
+                    let done = "HTTP/1.1 204 \r\n\r\n".to_owned();
+                    let answer = match endpoint.as_str() {
+                        "vm.info"
+                            if faults.info_fails
+                                || (faults.info_fails_after_pause && pause_asked) =>
+                        {
+                            Some(failed)
+                        }
+                        "vm.info" => {
+                            let body = format!("{{\"state\":\"{state}\"}}");
+                            Some(format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                                body.len()
+                            ))
+                        }
+                        "vm.pause" if faults.pause_fails => {
+                            pause_asked = true;
+                            if faults.pause_takes_effect {
+                                state = "Paused";
+                            }
+                            Some(failed)
+                        }
+                        "vm.pause" => {
+                            pause_asked = true;
+                            state = "Paused";
+                            Some(done)
+                        }
+                        "vm.resume" if faults.resume_fails => Some(failed),
+                        "vm.resume" if faults.resume_hangs => None,
+                        "vm.resume" => {
+                            state = "Running";
+                            Some(done)
+                        }
+                        _ => Some("HTTP/1.1 404 \r\nContent-Length: 0\r\n\r\n".to_owned()),
+                    };
+                    lock(&recorded).push(endpoint);
+                    match answer {
+                        Some(answer) => {
+                            let _ = stream.write_all(answer.as_bytes()).await;
+                        }
+                        None => held.push(stream),
+                    }
+                }
+            });
+            Self { calls, task }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            lock(&self.calls).clone()
+        }
+    }
+
+    impl Drop for StatefulApi {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    /// A stand-in VM whose guest has booted, with its API served.
+    fn booted(name: &str, state: &'static str, faults: Faults) -> (StandIn, StatefulApi) {
+        let vm = StandIn::new(name);
+        vm.entry.booted.store(true, Ordering::SeqCst);
+        let api = StatefulApi::serve(&vm.entry.paths.api_socket, state, faults);
+        (vm, api)
+    }
+
+    /// A volume file with some data in `vm`'s directory, and where its
+    /// snapshot goes.
+    fn volume_files(vm: &StandIn) -> (PathBuf, PathBuf) {
+        let source = vm.root.join("vol_1");
+        std::fs::write(&source, vec![7_u8; 64 * 1024]).expect("volume");
+        (source, vm.root.join("vol_1.snap"))
+    }
+
+    fn plain_copy(source: &Path, clone: &Path) -> Result<u64, EngineError> {
+        std::fs::copy(source, clone).map_err(|err| EngineError::Io(err.to_string()))
+    }
+
+    fn vol_1() -> crate::VolumeId {
+        crate::VolumeId("vol_1".to_owned())
+    }
+
+    /// The paused process a VM's directory records, if any.
+    fn recorded_pause(entry: &VmEntry) -> Option<crate::ch::vmm::ProcessId> {
+        state::read_json(&entry.paths.snapshot_paused).expect("readable")
+    }
+
+    async fn snapshot_of(vm: &StandIn, clone: &Path) -> Result<Duration, EngineError> {
+        let (source, _) = volume_files(vm);
+        crate::ch::volume::pause_and_copy(
+            &[Arc::clone(&vm.entry)],
+            &vol_1(),
+            &source,
+            clone,
+            plain_copy,
+        )
+        .await
+    }
+
+    /// Polls `check` every 10 ms until it holds or `within` passes.
+    async fn eventually(within: Duration, check: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if check() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        check()
+    }
+
+    /// Sections 3.16 and 4: a `PauseCopy` snapshot pauses the VM under its
+    /// operation lock, so a stop that holds the lock is waited out before
+    /// the VM's state is read. The lock is free during the copy, so a stop
+    /// or a fence of the paused VM is not held up by it, and the VM's
+    /// directory records the paused process until the resume.
+    #[tokio::test]
+    async fn a_snapshot_pause_waits_for_the_vm_lock_and_frees_it_for_the_copy() {
+        let (vm, api) = booted("snaplock", "Running", Faults::default());
+        let (source, clone) = volume_files(&vm);
+
+        let stop = Arc::clone(&vm.entry.op).lock_owned().await;
+        let during_copy = Arc::new(StdMutex::new(None));
+        let snapshot = {
+            let seen = Arc::clone(&during_copy);
+            let entry = Arc::clone(&vm.entry);
+            let vms = vec![Arc::clone(&vm.entry)];
+            let (source, clone) = (source.clone(), clone.clone());
+            tokio::spawn(async move {
+                crate::ch::volume::pause_and_copy(&vms, &vol_1(), &source, &clone, move |s, c| {
+                    *lock(&seen) = Some((entry.op.try_lock().is_ok(), recorded_pause(&entry)));
+                    plain_copy(s, c)
+                })
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            api.calls().is_empty(),
+            "nothing while a stop holds the lock"
+        );
+
+        drop(stop);
+        let pause = snapshot.await.expect("task").expect("snapshot");
+        assert_eq!(api.calls(), ["vm.info", "vm.pause", "vm.resume"]);
+        assert!(pause > Duration::ZERO);
+        let (free, recorded) = lock(&during_copy).take().expect("copied");
+        assert!(free, "the copy holds no lock");
+        assert_eq!(
+            recorded,
+            Some(vm.vmm.id()),
+            "the paused process is recorded"
+        );
+        assert_eq!(
+            recorded_pause(&vm.entry),
+            None,
+            "and the record goes with the resume"
+        );
+        assert_eq!(
+            std::fs::read(&clone).expect("snapshot"),
+            std::fs::read(&source).expect("volume")
+        );
+    }
+
+    /// Section 3.16: the VM is resumed whatever the copy's outcome, also when
+    /// the snapshot's caller drops its future during the copy. The snapshot
+    /// file nobody received is removed.
+    #[tokio::test]
+    async fn a_dropped_snapshot_still_resumes_the_vm_and_removes_its_file() {
+        let (vm, api) = booted("snapdrop", "Running", Faults::default());
+        let (source, clone) = volume_files(&vm);
+
+        let (copying, copy_started) = std::sync::mpsc::channel();
+        let snapshot = tokio::spawn(crate::ch::volume::spawn_pause_copy(
+            vec![Arc::clone(&vm.entry)],
+            vol_1(),
+            source,
+            clone.clone(),
+            move |s, c| {
+                let copied = plain_copy(s, c);
+                let _ = copying.send(());
+                std::thread::sleep(Duration::from_millis(300));
+                copied
+            },
+        ));
+        tokio::task::spawn_blocking(move || copy_started.recv())
+            .await
+            .expect("task")
+            .expect("the copy started");
+        assert_eq!(api.calls(), ["vm.info", "vm.pause"]);
+        snapshot.abort();
+
+        assert!(
+            eventually(Duration::from_secs(5), || api.calls().len() == 3).await,
+            "{:?}",
+            api.calls()
+        );
+        assert_eq!(api.calls(), ["vm.info", "vm.pause", "vm.resume"]);
+        assert!(
+            eventually(Duration::from_secs(5), || !clone.exists()).await,
+            "the snapshot file nobody received is removed"
+        );
+    }
+
+    /// A snapshot that is done but whose caller drops it before reading the
+    /// result leaves no file either.
+    #[tokio::test]
+    async fn a_finished_snapshot_nobody_reads_leaves_no_file() {
+        let (vm, api) = booted("snapunread", "Running", Faults::default());
+        let (source, clone) = volume_files(&vm);
+
+        // The task starts at once; the result is never polled for.
+        let snapshot = crate::ch::volume::spawn_pause_copy(
+            vec![Arc::clone(&vm.entry)],
+            vol_1(),
+            source,
+            clone.clone(),
+            plain_copy,
+        );
+        assert!(eventually(Duration::from_secs(5), || api.calls().len() == 3).await);
+        assert!(eventually(Duration::from_secs(5), || clone.exists()).await);
+        drop(snapshot);
+        assert!(
+            eventually(Duration::from_secs(5), || !clone.exists()).await,
+            "the file goes with the unread result"
+        );
+    }
+
+    /// Section 3.16: a copy that fails still resumes the VM, and leaves no
+    /// snapshot file.
+    #[tokio::test]
+    async fn a_failed_copy_still_resumes_the_vm() {
+        let (vm, api) = booted("snapfail", "Running", Faults::default());
+        let (source, clone) = volume_files(&vm);
+
+        let failed = crate::ch::volume::pause_and_copy(
+            &[Arc::clone(&vm.entry)],
+            &vol_1(),
+            &source,
+            &clone,
+            |s, c| {
+                plain_copy(s, c)?;
+                Err(EngineError::Io("the disk failed".to_owned()))
+            },
+        )
+        .await;
+        assert!(matches!(failed, Err(EngineError::Io(_))), "{failed:?}");
+        assert_eq!(api.calls(), ["vm.info", "vm.pause", "vm.resume"]);
+        assert!(!clone.exists());
+        assert_eq!(recorded_pause(&vm.entry), None);
+    }
+
+    /// A pause whose answer is lost may still have paused the VM: the
+    /// snapshot resumes it before it reports the failure.
+    #[tokio::test]
+    async fn a_failed_pause_that_took_effect_is_undone() {
+        let faults = Faults {
+            pause_fails: true,
+            pause_takes_effect: true,
+            ..Faults::default()
+        };
+        let (vm, api) = booted("snappause", "Running", faults);
+        let clone = vm.root.join("vol_1.snap");
+        let failed = snapshot_of(&vm, &clone).await;
+        assert!(
+            matches!(failed, Err(EngineError::Hypervisor(_))),
+            "{failed:?}"
+        );
+        assert_eq!(api.calls(), ["vm.info", "vm.pause", "vm.info", "vm.resume"]);
+        assert!(!clone.exists(), "nothing was copied");
+        assert_eq!(recorded_pause(&vm.entry), None);
+    }
+
+    /// A pause that failed without pausing the VM is not followed by a
+    /// resume.
+    #[tokio::test]
+    async fn a_failed_pause_that_did_not_take_effect_sends_no_resume() {
+        let faults = Faults {
+            pause_fails: true,
+            ..Faults::default()
+        };
+        let (vm, api) = booted("snapnopause", "Running", faults);
+        let clone = vm.root.join("vol_1.snap");
+        let failed = snapshot_of(&vm, &clone).await;
+        assert!(
+            matches!(failed, Err(EngineError::Hypervisor(_))),
+            "{failed:?}"
+        );
+        assert_eq!(api.calls(), ["vm.info", "vm.pause", "vm.info"]);
+        assert_eq!(recorded_pause(&vm.entry), None);
+    }
+
+    /// A VMM that does not report its VM's state is not paused, and the
+    /// snapshot is `Hypervisor`: its copy could not be made consistent.
+    #[tokio::test]
+    async fn a_vm_whose_vmm_does_not_report_is_not_copied() {
+        let faults = Faults {
+            info_fails: true,
+            ..Faults::default()
+        };
+        let (vm, api) = booted("snapnoinfo", "Running", faults);
+        let clone = vm.root.join("vol_1.snap");
+        let failed = snapshot_of(&vm, &clone).await;
+        assert!(
+            matches!(failed, Err(EngineError::Hypervisor(_))),
+            "{failed:?}"
+        );
+        assert_eq!(api.calls(), ["vm.info"]);
+        assert!(!clone.exists());
+    }
+
+    /// A VM whose VMM stopped during the copy is not resumed, and its copy is
+    /// not kept: the VM may have started again on the volume meanwhile.
+    #[tokio::test]
+    async fn a_vm_stopped_during_the_copy_is_not_resumed_and_its_copy_is_dropped() {
+        let (vm, api) = booted("snapstop", "Running", Faults::default());
+        let (source, clone) = volume_files(&vm);
+
+        let entry = Arc::clone(&vm.entry);
+        let failed = crate::ch::volume::pause_and_copy(
+            &[Arc::clone(&vm.entry)],
+            &vol_1(),
+            &source,
+            &clone,
+            move |s, c| {
+                // A stop of the paused VM ends its VMM during the copy.
+                *lock(&entry.vmm) = None;
+                plain_copy(s, c)
+            },
+        )
+        .await;
+        assert!(
+            matches!(failed, Err(EngineError::Hypervisor(_))),
+            "{failed:?}"
+        );
+        assert_eq!(api.calls(), ["vm.info", "vm.pause"]);
+        assert!(!clone.exists());
+        assert_eq!(
+            recorded_pause(&vm.entry),
+            None,
+            "the gone process's record goes"
+        );
+    }
+
+    /// A VM stopped and started again during the copy runs on a new VMM
+    /// process, which the snapshot did not pause: it is not resumed, and the
+    /// copy, which the new guest may have written to, is not kept.
+    #[tokio::test]
+    async fn a_vm_started_again_during_the_copy_is_not_resumed() {
+        let (vm, api) = booted("snaprestart", "Running", Faults::default());
+        let next = StandIn::new("snapnext");
+        let (source, clone) = volume_files(&vm);
+
+        let (entry, restarted) = (Arc::clone(&vm.entry), next.vmm.clone());
+        let failed = crate::ch::volume::pause_and_copy(
+            &[Arc::clone(&vm.entry)],
+            &vol_1(),
+            &source,
+            &clone,
+            move |s, c| {
+                // Another volume's snapshot pauses the new process meanwhile.
+                state::write_json_atomic(&entry.paths.snapshot_paused, &restarted.id())
+                    .expect("record");
+                *lock(&entry.vmm) = Some(restarted);
+                plain_copy(s, c)
+            },
+        )
+        .await;
+        assert!(
+            matches!(failed, Err(EngineError::Hypervisor(_))),
+            "{failed:?}"
+        );
+        assert_eq!(api.calls(), ["vm.info", "vm.pause"]);
+        assert!(!clone.exists());
+        assert_eq!(
+            recorded_pause(&vm.entry),
+            Some(next.vmm.id()),
+            "the record of the other snapshot's pause stays"
+        );
+    }
+
+    /// A VM another caller paused is `Conflict`: its freeze is not the
+    /// snapshot's, and could end during the copy.
+    #[tokio::test]
+    async fn a_vm_another_caller_paused_is_not_copied() {
+        let (vm, api) = booted("snapother", "Paused", Faults::default());
+        let clone = vm.root.join("vol_1.snap");
+        let failed = snapshot_of(&vm, &clone).await;
+        assert!(
+            matches!(failed, Err(EngineError::Conflict(_))),
+            "{failed:?}"
+        );
+        assert_eq!(api.calls(), ["vm.info"]);
+        assert!(!clone.exists());
+        assert_eq!(recorded_pause(&vm.entry), None);
+
+        // Paused for another volume's snapshot, which resumes it after its
+        // own copy: the same, and that snapshot's record stays.
+        state::write_json_atomic(&vm.entry.paths.snapshot_paused, &vm.vmm.id()).expect("record");
+        let failed = snapshot_of(&vm, &clone).await;
+        assert!(
+            matches!(failed, Err(EngineError::Conflict(_))),
+            "{failed:?}"
+        );
+        assert_eq!(api.calls(), ["vm.info", "vm.info"]);
+        assert_eq!(recorded_pause(&vm.entry), Some(vm.vmm.id()));
+    }
+
+    /// A VM whose guest never booted makes no writes: its volume is copied
+    /// without an API call and without a pause.
+    #[tokio::test]
+    async fn a_vm_that_is_not_booted_is_copied_without_a_pause() {
+        let (vm, api) = booted("snapidle", "Running", Faults::default());
+        vm.entry.booted.store(false, Ordering::SeqCst);
+        let clone = vm.root.join("vol_1.snap");
+        let pause = snapshot_of(&vm, &clone).await.expect("snapshot");
+        assert_eq!(pause, Duration::ZERO);
+        assert!(api.calls().is_empty());
+        assert!(clone.exists());
+    }
+
+    /// ADR 0243: a forced stop that waits for the VM's lock while a snapshot
+    /// holds it for its pause gets it at once. The snapshot gives up instead
+    /// of waiting out a VMM that does not answer.
+    #[tokio::test]
+    async fn a_snapshot_pause_gives_way_to_a_forced_stop() {
+        let vm = StandIn::new("snapforce");
+        vm.entry.booted.store(true, Ordering::SeqCst);
+        let api = silent_api(&vm.entry.paths.api_socket);
+        let (source, clone) = volume_files(&vm);
+
+        let snapshot = {
+            let vms = vec![Arc::clone(&vm.entry)];
+            let (source, clone) = (source.clone(), clone.clone());
+            tokio::spawn(async move {
+                crate::ch::volume::pause_and_copy(&vms, &vol_1(), &source, &clone, plain_copy).await
+            })
+        };
+        assert!(
+            eventually(Duration::from_secs(2), || vm.entry.op.try_lock().is_err()).await,
+            "the snapshot holds the lock"
+        );
+        let began = Instant::now();
+        let waiting = ForceWaiting::begin(&vm.entry);
+        let op = tokio::time::timeout(
+            Duration::from_secs(1),
+            Arc::clone(&vm.entry.op).lock_owned(),
+        )
+        .await
+        .expect("the forced stop gets the lock at once");
+        assert!(began.elapsed() < Duration::from_secs(1));
+        drop((op, waiting));
+        let failed = snapshot.await.expect("task");
+        assert!(
+            matches!(failed, Err(EngineError::Conflict(_))),
+            "{failed:?}"
+        );
+        assert!(!clone.exists());
+        api.abort();
+    }
+
+    /// The same for the resume: a forced stop that waits for the lock while
+    /// a resume the VMM does not answer holds it gets it at once. The VM is
+    /// the forced stop's to end, so its copy is not kept.
+    #[tokio::test]
+    async fn a_snapshot_resume_gives_way_to_a_forced_stop() {
+        let faults = Faults {
+            resume_hangs: true,
+            ..Faults::default()
+        };
+        let (vm, api) = booted("snapresume", "Running", faults);
+        let (source, clone) = volume_files(&vm);
+
+        let snapshot = {
+            let vms = vec![Arc::clone(&vm.entry)];
+            let (source, clone) = (source.clone(), clone.clone());
+            tokio::spawn(async move {
+                crate::ch::volume::pause_and_copy(&vms, &vol_1(), &source, &clone, plain_copy).await
+            })
+        };
+        assert!(eventually(Duration::from_secs(2), || api.calls().len() == 3).await);
+        assert!(vm.entry.op.try_lock().is_err(), "the resume holds the lock");
+        let waiting = ForceWaiting::begin(&vm.entry);
+        let op = tokio::time::timeout(
+            Duration::from_secs(1),
+            Arc::clone(&vm.entry.op).lock_owned(),
+        )
+        .await
+        .expect("the forced stop gets the lock at once");
+        drop((op, waiting));
+        let failed = snapshot.await.expect("task");
+        assert!(
+            matches!(failed, Err(EngineError::Hypervisor(_))),
+            "{failed:?}"
+        );
+        assert!(!clone.exists());
+    }
+
+    /// Section 3.16: a VM a snapshot paused when the engine last stopped is
+    /// resumed once its VMM is adopted again, if it is the process the
+    /// record names. A record of another process is only removed.
+    #[tokio::test]
+    async fn a_vm_a_snapshot_left_paused_is_resumed_after_a_restart() {
+        let (vm, api) = booted("snapleft", "Paused", Faults::default());
+        state::write_json_atomic(&vm.entry.paths.snapshot_paused, &vm.vmm.id()).expect("record");
+        crate::ch::volume::resume_left_paused(&vm.entry).await;
+        assert_eq!(api.calls(), ["vm.info", "vm.resume"]);
+        assert_eq!(recorded_pause(&vm.entry), None);
+
+        let (other, other_api) = booted("snapleftother", "Paused", Faults::default());
+        let mut stale = other.vmm.id();
+        stale.start_time += 1;
+        state::write_json_atomic(&other.entry.paths.snapshot_paused, &stale).expect("record");
+        crate::ch::volume::resume_left_paused(&other.entry).await;
+        assert!(
+            other_api.calls().is_empty(),
+            "another process is not resumed"
+        );
+        assert_eq!(recorded_pause(&other.entry), None);
+    }
+
+    /// A pause whose answer is lost, on a VMM that then does not report the
+    /// VM's state, may have paused the VM: its record stays, so a restart
+    /// resumes it.
+    #[tokio::test]
+    async fn a_failed_pause_the_vmm_does_not_report_keeps_its_record() {
+        let faults = Faults {
+            pause_fails: true,
+            pause_takes_effect: true,
+            info_fails_after_pause: true,
+            ..Faults::default()
+        };
+        let (vm, api) = booted("snappauseinfo", "Running", faults);
+        let clone = vm.root.join("vol_1.snap");
+        let failed = snapshot_of(&vm, &clone).await;
+        assert!(
+            matches!(failed, Err(EngineError::Hypervisor(_))),
+            "{failed:?}"
+        );
+        assert_eq!(api.calls(), ["vm.info", "vm.pause", "vm.info"]);
+        assert_eq!(recorded_pause(&vm.entry), Some(vm.vmm.id()));
+    }
+
+    /// Section 3.16: a resume that fails is `Hypervisor`, and the VM, still
+    /// paused, keeps its record, so a restart of the engine resumes it.
+    #[tokio::test]
+    async fn a_failed_resume_keeps_the_record_of_the_pause() {
+        let faults = Faults {
+            resume_fails: true,
+            ..Faults::default()
+        };
+        let (vm, api) = booted("snapresumefail", "Running", faults);
+        let clone = vm.root.join("vol_1.snap");
+        let failed = snapshot_of(&vm, &clone).await;
+        assert!(
+            matches!(failed, Err(EngineError::Hypervisor(_))),
+            "{failed:?}"
+        );
+        assert_eq!(api.calls(), ["vm.info", "vm.pause", "vm.resume", "vm.info"]);
+        assert!(!clone.exists());
+        assert_eq!(recorded_pause(&vm.entry), Some(vm.vmm.id()));
+    }
+
+    /// After a restart, a VM whose VMM does not report its state may still be
+    /// paused: it is not resumed blindly, and its record stays for the next
+    /// restart.
+    #[tokio::test]
+    async fn a_left_paused_vm_whose_vmm_does_not_report_keeps_its_record() {
+        let faults = Faults {
+            info_fails: true,
+            ..Faults::default()
+        };
+        let (vm, api) = booted("snapleftinfo", "Paused", faults);
+        state::write_json_atomic(&vm.entry.paths.snapshot_paused, &vm.vmm.id()).expect("record");
+        crate::ch::volume::resume_left_paused(&vm.entry).await;
+        assert_eq!(api.calls(), ["vm.info"]);
+        assert_eq!(recorded_pause(&vm.entry), Some(vm.vmm.id()));
+    }
+
+    /// ADR 0243: a VM whose stop was requested before the engine restarted,
+    /// a fence's forced stop included, is not resumed: the stop ends it, and
+    /// a resumed guest could write to a volume another node now owns.
+    #[tokio::test]
+    async fn a_left_paused_vm_whose_stop_was_requested_stays_paused() {
+        let (vm, api) = booted("snapleftstop", "Paused", Faults::default());
+        state::write_json_atomic(&vm.entry.paths.snapshot_paused, &vm.vmm.id()).expect("record");
+        state::touch_marker(&vm.entry.paths.stop_requested).expect("marker");
+        crate::ch::volume::resume_left_paused(&vm.entry).await;
+        assert!(api.calls().is_empty(), "{:?}", api.calls());
+        assert_eq!(recorded_pause(&vm.entry), Some(vm.vmm.id()));
+    }
+
+    /// A record of a VM that runs, for example one a restart's resume already
+    /// resumed, is removed without a resume.
+    #[tokio::test]
+    async fn a_record_of_a_running_vm_is_removed_without_a_resume() {
+        let (vm, api) = booted("snapleftrun", "Running", Faults::default());
+        state::write_json_atomic(&vm.entry.paths.snapshot_paused, &vm.vmm.id()).expect("record");
+        crate::ch::volume::resume_left_paused(&vm.entry).await;
+        assert_eq!(api.calls(), ["vm.info"]);
+        assert_eq!(recorded_pause(&vm.entry), None);
     }
 }

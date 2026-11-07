@@ -57,6 +57,10 @@ pub struct VmPaths {
     pub stop_requested: PathBuf,
     /// `last-exit.json`: the [`ExitRecord`] of the last exit.
     pub last_exit: PathBuf,
+    /// `snapshot-paused.json`: the VMM process a `PauseCopy` snapshot paused,
+    /// while it is paused, so an engine that restarts during the copy
+    /// resumes it (§3.16).
+    pub snapshot_paused: PathBuf,
     /// `config.img`: the config disk the init reads.
     pub config_disk: PathBuf,
     /// `data.img`: the VM's writable data disk.
@@ -80,6 +84,7 @@ impl VmPaths {
             vmm: dir.join("vmm.json"),
             stop_requested: dir.join("stop-requested"),
             last_exit: dir.join("last-exit.json"),
+            snapshot_paused: dir.join("snapshot-paused.json"),
             config_disk: dir.join("config.img"),
             data_disk: dir.join("data.img"),
             api_socket: dir.join("api.sock"),
@@ -960,6 +965,10 @@ mod tests {
         assert_eq!(paths.vmm, paths.dir.join("vmm.json"));
         assert_eq!(paths.stop_requested, paths.dir.join("stop-requested"));
         assert_eq!(paths.last_exit, paths.dir.join("last-exit.json"));
+        assert_eq!(
+            paths.snapshot_paused,
+            paths.dir.join("snapshot-paused.json")
+        );
         assert_eq!(paths.config_disk, paths.dir.join("config.img"));
         assert_eq!(paths.data_disk, paths.dir.join("data.img"));
         assert_eq!(paths.api_socket, paths.dir.join("api.sock"));
