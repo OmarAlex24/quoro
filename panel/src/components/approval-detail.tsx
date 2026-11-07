@@ -86,6 +86,14 @@ export function ApprovalDetail({
           </p>
           <p className="apr-sub">
             {agent ? `${agent.model} · ` : ''}asked <span title={approval.created_at}>{relativeTime(approval.created_at, now)}</span>
+            {approval.target.type === 'app' ? (
+              <>
+                {' · '}
+                <Link to="/apps/$appId" params={{ appId: approval.target.id }} title={approval.target.id} className={linkClass}>
+                  Open {name('app', approval.target.id) ?? 'the app'}
+                </Link>
+              </>
+            ) : null}
           </p>
         </div>
       </header>
