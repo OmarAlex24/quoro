@@ -98,9 +98,35 @@ impl TunnelController {
         hostnames: &BTreeSet<String>,
         published: &mut BTreeSet<String>,
     ) -> Result<Vec<(String, String)>, IngressError> {
+        self.sync_routes_draining(
+            tunnel_id,
+            origin_port,
+            hostnames,
+            &BTreeSet::new(),
+            published,
+        )
+        .await
+    }
+
+    /// [`Self::sync_routes`] for a tunnel that also drains the hostnames in
+    /// `draining`: they moved to another tunnel, and this one keeps answering
+    /// them for a while (ADR 0194). Each gets an ingress rule but no CNAME,
+    /// and a CNAME of one of them in `published` is left in place.
+    ///
+    /// # Errors
+    ///
+    /// The Cloudflare API refuses the ingress configuration.
+    pub async fn sync_routes_draining(
+        &self,
+        tunnel_id: &str,
+        origin_port: u16,
+        hostnames: &BTreeSet<String>,
+        draining: &BTreeSet<String>,
+        published: &mut BTreeSet<String>,
+    ) -> Result<Vec<(String, String)>, IngressError> {
         let service = format!("http://127.0.0.1:{origin_port}");
         let rules: Vec<IngressRule> = hostnames
-            .iter()
+            .union(draining)
             .map(|hostname| IngressRule {
                 hostname: hostname.clone(),
                 service: service.clone(),
@@ -120,7 +146,11 @@ impl TunnelController {
                 Err(e) => failures.push((hostname.clone(), e.to_string())),
             }
         }
-        let stale: Vec<String> = published.difference(hostnames).cloned().collect();
+        let stale: Vec<String> = published
+            .iter()
+            .filter(|hostname| !hostnames.contains(*hostname) && !draining.contains(*hostname))
+            .cloned()
+            .collect();
         for hostname in stale {
             match self.dns.delete_cname(&hostname, &target).await {
                 Ok(()) => {

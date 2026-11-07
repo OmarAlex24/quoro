@@ -43,6 +43,8 @@ struct Recorded {
     path: String,
     authorization: Option<String>,
     body: Option<Value>,
+    /// When the mock received it.
+    at: std::time::Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -220,6 +222,7 @@ fn record(
             .and_then(|value| value.to_str().ok())
             .map(str::to_string),
         body,
+        at: std::time::Instant::now(),
     });
 }
 
@@ -1390,6 +1393,12 @@ async fn a_new_tunnel_domain_of_a_replicated_app_reaches_the_edge_tunnel_at_once
 async fn a_replica_count_across_one_moves_the_hostname_between_node_and_edge() {
     let mock = start_mock().await;
     let server = start_with_cloudflare(&mock.base, &format!("{}/dns-query", mock.base)).await;
+    // The tunnel a hostname leaves keeps it for a drain window (ADR 0194); a
+    // short one keeps this test about where the CNAME points.
+    server
+        .state
+        .hub
+        .set_tunnel_drain_window(Duration::from_millis(500));
     let owner = server.owner().await;
     insert_machine(&server, NODE_A, "alpha", &["node"]).await;
     insert_machine(&server, NODE_B, "beta", &["node"]).await;
@@ -1848,6 +1857,12 @@ fn dns_writes(mock: &Mock) -> Vec<Recorded> {
 async fn a_hostname_that_moves_between_tunnels_keeps_its_cname_record() {
     let mock = start_mock().await;
     let server = start_with_cloudflare(&mock.base, &format!("{}/dns-query", mock.base)).await;
+    // A short drain window (ADR 0194): the tunnel the hostname left keeps
+    // its ingress rule for that long, and never touches the record.
+    server
+        .state
+        .hub
+        .set_tunnel_drain_window(Duration::from_millis(500));
     let owner = server.owner().await;
     insert_machine(&server, NODE_A, "alpha", &["node"]).await;
     insert_machine(&server, NODE_B, "beta", &["node"]).await;
@@ -1927,4 +1942,180 @@ async fn a_hostname_that_moves_between_tunnels_keeps_its_cname_record() {
             .then_some(())
     })
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// A moved hostname drains on the machine it left (issue #344, ADR 0194)
+// ---------------------------------------------------------------------------
+
+/// The route of `hostname` in a desired-state frame, from `spec.routes` or
+/// `spec.edge.routes`.
+fn route_in<'a>(frame: &'a Value, hostname: &str) -> Option<&'a Value> {
+    let spec = &frame["body"]["spec"];
+    spec["routes"]
+        .as_array()
+        .into_iter()
+        .chain(spec["edge"]["routes"].as_array())
+        .flatten()
+        .find(|route| route["hostname"] == hostname)
+}
+
+/// The first ingress configuration of `tunnel_id` in `requests` that no
+/// longer routes `hostname`.
+fn first_config_without<'a>(
+    requests: &'a [Recorded],
+    tunnel_id: &str,
+    hostname: &str,
+) -> Option<&'a Recorded> {
+    let path = format!("/cfd_tunnel/{tunnel_id}/configurations");
+    requests.iter().find(|request| {
+        request.method == "PUT"
+            && request.path.ends_with(&path)
+            && request.body.as_ref().is_some_and(|body| {
+                !body["config"]["ingress"]
+                    .as_array()
+                    .is_some_and(|rules| rules.iter().any(|rule| rule["hostname"] == hostname))
+            })
+    })
+}
+
+/// The DNS write in `requests` that pointed `hostname`'s record at `tunnel_id`.
+fn repoint_to<'a>(requests: &'a [Recorded], tunnel_id: &str) -> Option<&'a Recorded> {
+    let target = format!("{tunnel_id}.cfargotunnel.com");
+    requests.iter().find(|request| {
+        request.path.contains("/dns_records")
+            && matches!(request.method.as_str(), "PATCH" | "POST")
+            && request
+                .body
+                .as_ref()
+                .is_some_and(|body| body["content"] == target)
+    })
+}
+
+/// Polls `check` for up to `limit`.
+async fn wait_longer<T>(limit: Duration, mut check: impl FnMut() -> Option<T>) -> T {
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        if let Some(value) = check() {
+            return value;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "condition not met within {limit:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_moved_hostname_drains_on_the_machine_it_left_for_one_window() {
+    let window = Duration::from_secs(2);
+    let mock = start_mock().await;
+    let server = start_with_cloudflare(&mock.base, &format!("{}/dns-query", mock.base)).await;
+    server.state.hub.set_tunnel_drain_window(window);
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, "alpha").await;
+    insert_machine(&server, NODE_B, "beta", &["node"]).await;
+    insert_machine(&server, EDGE, "edge", &["edge"]).await;
+    let provider = create_provider(
+        &server,
+        &owner,
+        "tunnel",
+        "Tunnel",
+        json!({ "account_id": ACCOUNT_ID, "zone_id": ZONE_ID }),
+    )
+    .await;
+    let provider_id = provider["id"].as_str().unwrap().to_string();
+    let node_tunnel =
+        map_tunnel(&server, &owner, &mock, &node.node_id, "alpha", &provider_id).await;
+    let edge_tunnel = map_tunnel(&server, &owner, &mock, EDGE, "edge", &provider_id).await;
+    let app_id = setup_project_and_app(&server, &owner).await;
+    let vm_id = place_vm(&server, &app_id, &node.node_id, "web-a").await;
+    // The instance has a guest address, so the edge can keep it as a
+    // backend on the way back.
+    sqlx::query("UPDATE vms SET ip = '10.42.1.11' WHERE id = ?")
+        .bind(&vm_id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+    let hostname = "drain.example.com";
+    create_domain(&server, &owner, &app_id, hostname, "tunnel", &provider_id).await;
+    let (mut socket, snapshot) = open(&server, &node).await;
+    let route = route_in(&snapshot, hostname).expect("the node serves the hostname");
+    assert!(route["draining_until"].is_null(), "{snapshot}");
+    settles_on(&mock, hostname, &node_tunnel).await;
+
+    // One to two replicas: the edge takes the hostname. The node keeps its
+    // route, marked draining and with its own VM, in every snapshot until
+    // the window ends; no snapshot in between drops it.
+    let before = mock.requests().len();
+    set_replicas(&server, &owner, &app_id, 2).await;
+    let route = loop {
+        let frame = recv_type(&mut socket, "desired_state").await;
+        let route = route_in(&frame, hostname)
+            .unwrap_or_else(|| panic!("a snapshot dropped the route before its window: {frame}"))
+            .clone();
+        if route["draining_until"].is_string() {
+            break route;
+        }
+    };
+    assert_eq!(route["vm_ids"], json!([vm_id]));
+    assert_eq!(route["tls_mode"], "tunnel");
+    settles_on(&mock, hostname, &edge_tunnel).await;
+    assert!(
+        tunnel_routes(&mock, &node_tunnel, hostname),
+        "the node's tunnel dropped the hostname inside the window"
+    );
+    loop {
+        let frame = recv_type(&mut socket, "desired_state").await;
+        match route_in(&frame, hostname) {
+            None => break,
+            Some(route) => assert!(route["draining_until"].is_string(), "{frame}"),
+        }
+    }
+    wait_longer(window * 3, || {
+        (!tunnel_routes(&mock, &node_tunnel, hostname)).then_some(())
+    })
+    .await;
+    let requests = mock.requests().split_off(before);
+    let repoint = repoint_to(&requests, &edge_tunnel).expect("the edge repointed the CNAME");
+    let dropped = first_config_without(&requests, &node_tunnel, hostname)
+        .expect("the node's tunnel dropped the hostname");
+    let kept = dropped.at.duration_since(repoint.at);
+    assert!(
+        kept >= window && kept < window + Duration::from_secs(3),
+        "the node's tunnel kept the hostname {kept:?} after the repoint"
+    );
+
+    // Back to one replica: the hostname returns to the node, and the edge's
+    // tunnel keeps it for one window after the node repointed the CNAME.
+    let before = mock.requests().len();
+    set_replicas(&server, &owner, &app_id, 1).await;
+    settles_on(&mock, hostname, &node_tunnel).await;
+    assert!(
+        tunnel_routes(&mock, &edge_tunnel, hostname),
+        "the edge's tunnel dropped the hostname inside the window"
+    );
+    wait_longer(window * 3, || {
+        (!tunnel_routes(&mock, &edge_tunnel, hostname)).then_some(())
+    })
+    .await;
+    let requests = mock.requests().split_off(before);
+    let repoint = repoint_to(&requests, &node_tunnel).expect("the node repointed the CNAME");
+    let dropped = first_config_without(&requests, &edge_tunnel, hostname)
+        .expect("the edge's tunnel dropped the hostname");
+    let kept = dropped.at.duration_since(repoint.at);
+    assert!(
+        kept >= window && kept < window + Duration::from_secs(3),
+        "the edge's tunnel kept the hostname {kept:?} after the repoint"
+    );
+    // The record only ever moved: no tunnel deleted it on the way.
+    assert!(
+        dns_writes(&mock)
+            .iter()
+            .all(|write| write.method != "DELETE"),
+        "{:?}",
+        dns_writes(&mock)
+    );
+    assert!(tunnel_routes(&mock, &node_tunnel, hostname));
 }

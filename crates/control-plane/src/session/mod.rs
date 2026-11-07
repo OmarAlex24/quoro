@@ -12,6 +12,7 @@
 //! Change-log follow is a separate follow-up; its slot is marked below.
 
 pub mod desired;
+pub mod drain;
 mod mesh;
 pub mod serving;
 
@@ -294,6 +295,9 @@ struct HubInner {
     vm_nodes: Mutex<HashMap<String, String>>,
     /// The tunnel manager, so a session can ask for a route reconcile.
     tunnels: Mutex<Option<TunnelKick>>,
+    /// The departed `tunnel` routes machines keep for a while (ADR 0194),
+    /// shared by the snapshot builder and the tunnel manager.
+    drains: drain::Drains,
     /// The primary's vulnerability data, so a session can store inventories
     /// and ask the node to resend them.
     vulns: Mutex<Option<crate::vulns::Vulns>>,
@@ -386,6 +390,7 @@ impl NodeHub {
             digests: desired::DigestCache::default(),
             vm_nodes: Mutex::new(HashMap::new()),
             tunnels: Mutex::new(None),
+            drains: drain::Drains::default(),
             vulns: Mutex::new(None),
             endpoints: Mutex::new(CloudflareEndpoints::production()),
             advertised_urls: Mutex::new(None),
@@ -412,6 +417,18 @@ impl NodeHub {
             .expect("snapshot hold lock")
             .insert(node_id.to_string(), Arc::clone(&hold));
         hold
+    }
+
+    /// The departed `tunnel` routes machines keep for a while (ADR 0194).
+    pub(crate) fn drains(&self) -> &drain::Drains {
+        &self.0.drains
+    }
+
+    /// Test seam: how long a departed `tunnel` route stays on the machine it
+    /// left after its CNAME moved, instead of [`drain::DRAIN_WINDOW`].
+    #[doc(hidden)]
+    pub fn set_tunnel_drain_window(&self, window: std::time::Duration) {
+        self.0.drains.set_window(window);
     }
 
     /// Whether `node_id` has a live session.
@@ -2368,6 +2385,7 @@ impl Session {
             &self.hub.0.data_key,
             self.last_spec.as_ref(),
             &mesh_lookup,
+            &self.hub.0.drains,
         )
         .await?;
         self.note_holdbacks(&built.held_back).await;

@@ -9,6 +9,12 @@
 //! data-encryption key, and reconciles the tunnel's ingress rules and proxied
 //! CNAMEs with the node's `tunnel` routes.
 //!
+//! A hostname that moves to another machine's tunnel keeps its ingress rule
+//! on the tunnel it left for a while after the new tunnel repointed its CNAME
+//! (ADR 0194, [`crate::session::drain`]). The manager starts such a drain when
+//! a hostname leaves the set its last sync served, records when a tunnel takes
+//! a CNAME over, and ends every drain when its window is over.
+//!
 //! The node itself never sees the account credential: desired state carries
 //! only its own tunnel id, its run token and the loopback origin port.
 //! Tokens and provider secrets are never logged; errors are logged with the
@@ -19,6 +25,7 @@ use crate::changelog::{self, Actor, Op};
 use crate::crypto::{CryptoError, DataKey, Secret};
 use crate::error::ApiError;
 use crate::session::NodeHub;
+use crate::session::drain;
 use crate::store::{Store, now_rfc3339};
 use quoro_ingress::tunnel::TunnelController;
 use quoro_providers::Token;
@@ -79,8 +86,13 @@ struct NodeSync {
     provider_id: String,
     tunnel_id: Option<String>,
     origin_port: u16,
-    /// The hostname set of the last successful sync.
+    /// The hostname set of the last successful sync: the ingress rules,
+    /// draining hostnames included.
     hostnames: BTreeSet<String>,
+    /// The hostnames of the last successful sync that the tunnel serves as
+    /// usual, without the draining ones. A hostname that leaves this set for
+    /// another machine's tunnel starts draining here.
+    normal: BTreeSet<String>,
     /// The CNAMEs this manager created and has not removed yet.
     published: BTreeSet<String>,
     /// Whether `hostnames`/`origin_port` describe a completed sync.
@@ -176,7 +188,8 @@ impl TunnelManager {
     }
 
     /// Starts the background loop: a full reconcile at startup and then every
-    /// [`RECONCILE_INTERVAL`], plus one per [`Self::kick`].
+    /// [`RECONCILE_INTERVAL`], plus one per [`Self::kick`] and one for each
+    /// machine whose draining hostnames reached the end of their window.
     pub(crate) fn start(&self) {
         {
             let mut started = self.inner.started.lock().expect("tunnel start lock");
@@ -238,16 +251,30 @@ impl TunnelManager {
         self.inner.pending.lock().expect("tunnel pending lock").all = true;
         self.inner.wake.notify_one();
         loop {
+            let drains = self.inner.hub.drains();
+            let next_end = drains.next_end().map(|end| {
+                Duration::try_from(end - time::OffsetDateTime::now_utc()).unwrap_or(Duration::ZERO)
+            });
             tokio::select! {
                 () = self.inner.wake.notified() => {}
+                () = drains.changed() => {}
+                () = tokio::time::sleep(next_end.unwrap_or(RECONCILE_INTERVAL)),
+                    if next_end.is_some() => {}
                 () = tokio::time::sleep(RECONCILE_INTERVAL) => {
                     self.inner.pending.lock().expect("tunnel pending lock").all = true;
                 }
             }
-            let (all, nodes) = {
+            // A drain whose window is over leaves its machine's snapshot and
+            // its tunnel's ingress rules now (ADR 0194).
+            let ended = drains.expire(time::OffsetDateTime::now_utc());
+            for node_id in &ended {
+                self.inner.hub.node_changed(node_id);
+            }
+            let (all, mut nodes) = {
                 let mut pending = self.inner.pending.lock().expect("tunnel pending lock");
                 pending.take()
             };
+            nodes.extend(ended);
             let targets: Vec<String> = if all {
                 let mut targets: BTreeSet<String> = nodes.into_iter().collect();
                 if let Ok(rows) = sqlx::query("SELECT node_id FROM node_tunnels")
@@ -311,6 +338,7 @@ impl TunnelManager {
                     tunnel_id,
                     origin_port: u16::try_from(origin_port).unwrap_or(8081),
                     published: hostnames.clone(),
+                    normal: hostnames.clone(),
                     hostnames,
                     synced: true,
                 },
@@ -351,6 +379,7 @@ impl TunnelManager {
                         .lock()
                         .expect("tunnel state lock")
                         .remove(node_id);
+                    self.inner.hub.drains().forget(node_id);
                     return Ok(());
                 }
                 return Err(format!(
@@ -373,6 +402,7 @@ impl TunnelManager {
             && let Some(old_id) = previous.tunnel_id.clone()
         {
             self.retire(node_id, &previous, &old_id).await;
+            self.inner.hub.drains().forget(node_id);
         }
 
         let tunnel_id = match tunnel_id {
@@ -398,9 +428,41 @@ impl TunnelManager {
             }
         };
 
-        let hostnames = crate::session::desired::tunnel_hostnames(self.inner.store.pool(), node_id)
+        // Taken before the hostnames are read: a drain that starts after it
+        // may come from a newer change than the set below reflects.
+        let read_at = std::time::Instant::now();
+        let normal = crate::session::desired::tunnel_hostnames(self.inner.store.pool(), node_id)
             .await
             .map_err(|e| format!("cannot read the tunnel routes: {e}"))?;
+        let drains = self.inner.hub.drains();
+        // A hostname the last sync served as usual that moved to another
+        // machine's tunnel keeps its ingress rule here for a while (ADR 0194),
+        // whether or not the machine has a session to notice it.
+        let last_normal = self
+            .inner
+            .nodes
+            .lock()
+            .expect("tunnel state lock")
+            .get(node_id)
+            .filter(|state| state.provider_id == provider_id)
+            .map(|state| state.normal.clone());
+        if let Some(last_normal) = last_normal {
+            for hostname in last_normal.difference(&normal) {
+                let departed = drain::departed(self.inner.store.pool(), node_id, hostname)
+                    .await
+                    .map_err(|e| format!("cannot check a departed hostname: {e}"))?;
+                if let Some(app_id) = departed
+                    && drains.start(node_id, hostname, &app_id, time::OffsetDateTime::now_utc())
+                {
+                    self.inner.hub.node_changed(node_id);
+                }
+            }
+        }
+        drains.clear_served(node_id, &normal, read_at);
+        let draining = drain::draining_hostnames(self.inner.store.pool(), drains, node_id, &normal)
+            .await
+            .map_err(|e| format!("cannot read the draining hostnames: {e}"))?;
+        let hostnames: BTreeSet<String> = normal.union(&draining).cloned().collect();
         let unchanged = {
             let nodes = self.inner.nodes.lock().expect("tunnel state lock");
             nodes.get(node_id).is_some_and(|state| {
@@ -409,6 +471,7 @@ impl TunnelManager {
                     && state.tunnel_id.as_deref() == Some(tunnel_id.as_str())
                     && state.origin_port == origin_port
                     && state.hostnames == hostnames
+                    && state.normal == normal
             })
         };
         if unchanged {
@@ -425,15 +488,16 @@ impl TunnelManager {
             .unwrap_or_default();
         // A hostname this tunnel drops but another tunnel now serves keeps
         // its CNAME: the new tunnel repoints that record instead of this one
-        // deleting it and the new one creating another (issue #344).
+        // deleting it and the new one creating another (issue #344). A
+        // draining hostname is one of them: it keeps only its ingress rule.
         let handoff = self
-            .handoff(node_id, &provider_id, &published, &hostnames)
+            .handoff(node_id, &provider_id, &published, &normal)
             .await?;
         for hostname in handoff.keys() {
             published.remove(hostname);
         }
         match controller
-            .sync_routes(&tunnel_id, origin_port, &hostnames, &mut published)
+            .sync_routes_draining(&tunnel_id, origin_port, &normal, &draining, &mut published)
             .await
         {
             Ok(failures) => {
@@ -456,6 +520,18 @@ impl TunnelManager {
                         waiting = true;
                     }
                 }
+                // A CNAME this tunnel now holds for a hostname that drains on
+                // another machine starts that drain's window (ADR 0194).
+                let written: BTreeSet<String> = normal.intersection(&published).cloned().collect();
+                let repointed = drains.record_cnames(
+                    node_id,
+                    &written,
+                    &published,
+                    time::OffsetDateTime::now_utc(),
+                );
+                for machine in &repointed {
+                    self.inner.hub.node_changed(machine);
+                }
                 let synced = failures.is_empty() && !waiting;
                 self.inner.nodes.lock().expect("tunnel state lock").insert(
                     node_id.to_string(),
@@ -464,6 +540,7 @@ impl TunnelManager {
                         tunnel_id: Some(tunnel_id),
                         origin_port,
                         hostnames,
+                        normal,
                         published,
                         synced,
                     },
@@ -551,6 +628,7 @@ impl TunnelManager {
                 .lock()
                 .expect("tunnel state lock")
                 .remove(node_id);
+            self.inner.hub.drains().forget(node_id);
         }
         Ok(())
     }

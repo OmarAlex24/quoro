@@ -35,6 +35,11 @@
 //! Routes are built from the app's `domains` rows: the domains of an app with
 //! one replica point at the app's running VMs on this node, and the domains of
 //! an app with more replicas go to the edge machine as `spec.edge` (ADR 0143).
+//! A `tunnel` route that just moved to another machine's tunnel stays on the
+//! machine it left for a short window, marked `draining_until` ([`drain`],
+//! ADR 0194).
+//!
+//! [`drain`]: super::drain
 
 use crate::api::apps::AppSource;
 use crate::app_env;
@@ -52,6 +57,7 @@ use sqlx::{Row, SqlitePool};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use super::drain::{self, Drains};
 use super::mesh::{MeshLookup, build_mesh};
 
 /// The resolved digests, keyed by image reference, shared by every session.
@@ -103,7 +109,10 @@ struct AppInfo {
 /// reference does not freeze the rest of the node.
 ///
 /// `mesh_lookup` supplies the session source addresses and the advertised
-/// URLs that `spec.mesh` needs (ADR 0144).
+/// URLs that `spec.mesh` needs (ADR 0144). `drains` holds the departed
+/// `tunnel` routes the machine keeps for a while (ADR 0194); a `tunnel` route
+/// of `previous` that this snapshot drops can start one.
+#[allow(clippy::too_many_arguments)]
 pub async fn build_spec(
     store: &Store,
     node_id: &str,
@@ -112,6 +121,7 @@ pub async fn build_spec(
     data_key: &DataKey,
     previous: Option<&Spec>,
     mesh_lookup: &MeshLookup<'_>,
+    drains: &Drains,
 ) -> Result<BuiltSpec, String> {
     // An edge-only machine runs no VM and has no guest subnet (ADR 0144); a
     // node still waiting for its subnet cannot be sent a snapshot yet.
@@ -314,13 +324,31 @@ pub async fn build_spec(
         file.restore = restores.get(&file.volume_id).cloned();
     }
 
-    let routes = build_routes(store.pool(), &apps, &vms).await?;
+    let mut routes = build_routes(store.pool(), &apps, &vms).await?;
     let ingress = build_ingress(store.pool(), data_key, node_id).await?;
     let mesh = build_mesh(store, mesh_lookup, node_id).await?;
     // The edge's own tunnel is the one `spec.ingress` would carry for it
     // (section 5.11): one row in `node_tunnels`, decrypted once here.
     let tunnel = ingress.as_ref().and_then(|ingress| ingress.tunnel.clone());
-    let edge = build_edge(store.pool(), node_id, tunnel).await?;
+    let mut edge = build_edge(store.pool(), node_id, tunnel).await?;
+    drain_routes(
+        store.pool(),
+        drains,
+        node_id,
+        previous,
+        &apps,
+        &vms,
+        &mut routes,
+        &mut edge,
+    )
+    .await?;
+    // The edge runs its own tunnel only for `tunnel` routes, draining ones
+    // included: they are served from that tunnel until they leave.
+    if let Some(edge) = &mut edge
+        && !edge.routes.iter().any(|route| route.tls_mode == "tunnel")
+    {
+        edge.tunnel = None;
+    }
 
     Ok(BuiltSpec {
         spec: Spec {
@@ -790,18 +818,7 @@ async fn build_routes(
         let Some(app_vms) = by_app.get(app_id.as_str()) else {
             continue;
         };
-        // The VM of the app's current deployment first, then the rest in the
-        // snapshot's order.
-        let current = app.current_deployment_id.as_deref();
-        let mut ordered: Vec<&SpecVm> = app_vms
-            .iter()
-            .copied()
-            .filter(|vm| vm.desired_status == DesiredStatus::Running)
-            .collect();
-        if let Some(current) = current {
-            ordered.sort_by_key(|vm| vm.deployment_id.as_deref() != Some(current));
-        }
-        let vm_ids: Vec<String> = ordered.iter().map(|vm| vm.vm_id.clone()).collect();
+        let vm_ids = running_vm_ids(app, app_vms);
         if vm_ids.is_empty() {
             continue;
         }
@@ -819,6 +836,150 @@ async fn build_routes(
     Ok(routes)
 }
 
+/// The ids of `app_vms` that are meant to run: the VM of the app's current
+/// deployment first, then the rest in the snapshot's order.
+fn running_vm_ids(app: &AppInfo, app_vms: &[&SpecVm]) -> Vec<String> {
+    let mut ordered: Vec<&SpecVm> = app_vms
+        .iter()
+        .copied()
+        .filter(|vm| vm.desired_status == DesiredStatus::Running)
+        .collect();
+    if let Some(current) = app.current_deployment_id.as_deref() {
+        ordered.sort_by_key(|vm| vm.deployment_id.as_deref() != Some(current));
+    }
+    ordered.iter().map(|vm| vm.vm_id.clone()).collect()
+}
+
+/// The departed `tunnel` routes this machine keeps for a while (section 5.11
+/// "Draining tunnel routes", ADR 0194): added to `routes` on a node and to
+/// `edge` on the edge machine, each marked `draining_until`.
+///
+/// First, every `tunnel` route of `previous` that is not draining and that
+/// this snapshot no longer carries starts draining when it moved to another
+/// machine's tunnel ([`drain::departed`]). Then every open drain of the
+/// machine that still has a backend is added: on a node with the app's VMs
+/// here that are meant to run, which stay instances of the app; on the edge
+/// with the app's running instances. A hostname the machine serves as usual
+/// is never a draining route too, and a drain left with no backend is not
+/// sent.
+#[allow(clippy::too_many_arguments)]
+async fn drain_routes(
+    pool: &SqlitePool,
+    drains: &Drains,
+    node_id: &str,
+    previous: Option<&Spec>,
+    apps: &HashMap<String, AppInfo>,
+    vms: &[SpecVm],
+    routes: &mut Vec<SpecRoute>,
+    edge: &mut Option<SpecEdge>,
+) -> Result<(), String> {
+    let mut normal: HashSet<String> = routes.iter().map(|route| route.hostname.clone()).collect();
+    if let Some(edge) = edge.as_ref() {
+        normal.extend(edge.routes.iter().map(|route| route.hostname.clone()));
+    }
+    let now = time::OffsetDateTime::now_utc();
+    if let Some(previous) = previous {
+        let sent = previous
+            .routes
+            .iter()
+            .filter(|route| route.tls_mode == "tunnel" && route.draining_until.is_none())
+            .map(|route| &route.hostname)
+            .chain(
+                previous
+                    .edge
+                    .iter()
+                    .flat_map(|edge| edge.routes.iter())
+                    .filter(|route| route.tls_mode == "tunnel" && route.draining_until.is_none())
+                    .map(|route| &route.hostname),
+            );
+        for hostname in sent {
+            if normal.contains(hostname) {
+                continue;
+            }
+            if let Some(app_id) = drain::departed(pool, node_id, hostname).await? {
+                drains.start(node_id, hostname, &app_id, now);
+            }
+        }
+    }
+
+    let is_edge = edge.is_some();
+    for drain in drain::live(pool, drains, node_id, is_edge, &normal, now).await? {
+        let Some(app) = apps.get(&drain.app_id) else {
+            continue;
+        };
+        match edge.as_mut() {
+            Some(edge) => {
+                let backends = running_backends(pool, &drain.app_id, app.port).await?;
+                let Some(health_check) = app.health_check.clone() else {
+                    continue;
+                };
+                if backends.is_empty() {
+                    continue;
+                }
+                edge.routes.push(EdgeRoute {
+                    hostname: drain.hostname,
+                    domain_id: drain.domain_id,
+                    app_id: drain.app_id,
+                    tls_mode: "tunnel".to_string(),
+                    health_check,
+                    backends,
+                    draining_until: Some(drain.until),
+                });
+            }
+            None => {
+                let app_vms: Vec<&SpecVm> = vms
+                    .iter()
+                    .filter(|vm| vm.app_id.as_deref() == Some(drain.app_id.as_str()))
+                    .collect();
+                let vm_ids = running_vm_ids(app, &app_vms);
+                if vm_ids.is_empty() {
+                    continue;
+                }
+                routes.push(SpecRoute {
+                    hostname: drain.hostname,
+                    app_id: drain.app_id,
+                    vm_ids,
+                    port: app.port,
+                    tls_mode: "tunnel".to_string(),
+                    domain_id: Some(drain.domain_id),
+                    draining_until: Some(drain.until),
+                });
+            }
+        }
+    }
+    routes.sort_by(|a, b| a.hostname.cmp(&b.hostname));
+    if let Some(edge) = edge.as_mut() {
+        edge.routes.sort_by(|a, b| a.hostname.cmp(&b.hostname));
+    }
+    Ok(())
+}
+
+/// One backend per instance of `app_id` that is meant to run and has a guest
+/// address, ordered by VM id: the backends of a draining edge route.
+async fn running_backends(
+    pool: &SqlitePool,
+    app_id: &str,
+    port: u16,
+) -> Result<Vec<EdgeBackend>, String> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id, node_id, ip FROM vms \
+         WHERE app_id = ? AND desired_status = 'running' AND ip IS NOT NULL ORDER BY id",
+    )
+    .bind(app_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("cannot read the instances of {app_id}: {e}"))?;
+    Ok(rows
+        .into_iter()
+        .map(|(vm_id, node_id, address)| EdgeBackend {
+            vm_id,
+            node_id,
+            address,
+            port,
+        })
+        .collect())
+}
+
 /// `spec.edge` (section 5.11, ADR 0143): the routes the edge machine serves
 /// with remote backends. `None` on every other machine, including one whose
 /// role is `edge` but that the rule in [`edge_node_id`] does not pick.
@@ -827,8 +988,8 @@ async fn build_routes(
 /// hostname, with the app's health check and one backend per instance that is
 /// meant to run and has a guest address, ordered by VM id. A route with no
 /// backend is still sent: the edge answers 502 for it (ADR 0143). `tunnel` is the
-/// machine's own tunnel and is kept only when at least one route is a `tunnel`
-/// route.
+/// machine's own tunnel; [`build_spec`] keeps it only when at least one route,
+/// draining ones included, is a `tunnel` route.
 ///
 /// [`edge_node_id`]: super::mesh::edge_node_id
 async fn build_edge(
@@ -904,11 +1065,6 @@ async fn build_edge(
         }
     }
 
-    let tunnel = if routes.iter().any(|route| route.tls_mode == "tunnel") {
-        tunnel
-    } else {
-        None
-    };
     Ok(Some(SpecEdge { routes, tunnel }))
 }
 
@@ -916,7 +1072,11 @@ async fn build_edge(
 /// of apps with one replica and at least one running VM on the node (the same
 /// rule as [`build_routes`]); on the edge, also every `tunnel` domain of an app
 /// with more than one replica, which the edge answers itself. The tunnel
-/// manager uses it to reconcile the provider's ingress rules and CNAMEs.
+/// manager uses it to reconcile the provider's ingress rules and CNAMEs. It
+/// leaves out the hostnames the machine only drains ([`drain`], ADR 0194):
+/// those keep their ingress rule but never their CNAME.
+///
+/// [`drain`]: super::drain
 ///
 /// # Errors
 ///
@@ -1109,6 +1269,7 @@ mod tests {
             &key,
             None,
             &no_mesh_lookup(),
+            &Drains::default(),
         )
         .await
         .unwrap();
@@ -1171,6 +1332,7 @@ mod tests {
             &key,
             None,
             &no_mesh_lookup(),
+            &Drains::default(),
         )
         .await
         .unwrap();
@@ -1194,6 +1356,7 @@ mod tests {
                 &key,
                 None,
                 &no_mesh_lookup(),
+                &Drains::default(),
             )
             .await
             .is_err()
@@ -1213,6 +1376,7 @@ mod tests {
             &key,
             Some(&previous),
             &no_mesh_lookup(),
+            &Drains::default(),
         )
         .await
         .unwrap();
@@ -1376,6 +1540,7 @@ mod tests {
             &key,
             None,
             &no_mesh_lookup(),
+            &Drains::default(),
         )
         .await
         .unwrap()
@@ -1394,6 +1559,7 @@ mod tests {
             &key,
             None,
             &no_mesh_lookup(),
+            &Drains::default(),
         )
         .await
         .unwrap()
@@ -1449,6 +1615,7 @@ mod tests {
             &key,
             None,
             &no_mesh_lookup(),
+            &Drains::default(),
         )
         .await
         .unwrap()
@@ -1465,6 +1632,7 @@ mod tests {
             &key,
             None,
             &no_mesh_lookup(),
+            &Drains::default(),
         )
         .await
         .unwrap()
@@ -1534,6 +1702,7 @@ mod tests {
             &DataKey::ephemeral(),
             previous,
             &no_mesh_lookup(),
+            &Drains::default(),
         )
         .await
         .unwrap()
@@ -1630,5 +1799,284 @@ mod tests {
         assert_eq!(ids, expected);
         assert_eq!(on_old.routes.len(), 1);
         assert_eq!(on_old.routes[0].vm_ids, vec![vm_id]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Draining tunnel routes (ADR 0194)
+    // -----------------------------------------------------------------------
+
+    /// A `tunnel` provider and a tunnel of it for each of `machines`, with a
+    /// run token encrypted under `key`.
+    async fn insert_tunnels(store: &Store, key: &DataKey, machines: &[&str]) {
+        let now = crate::store::now_rfc3339();
+        sqlx::query(
+            "INSERT INTO users (id, email, name, role, password_hash, disabled, created_at) \
+             VALUES ('usr_tunnel', 'tunnel@example.com', 'tunnel', 'owner', 'x', 0, ?)",
+        )
+        .bind(&now)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO providers (id, kind, name, config_json, secret_enc, created_by, \
+             created_at, rotated_at) \
+             VALUES ('prv_tunnel', 'tunnel', 'tunnel', '{}', x'00', 'usr_tunnel', ?, NULL)",
+        )
+        .bind(&now)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        for machine in machines {
+            sqlx::query(
+                "INSERT INTO node_tunnels (node_id, provider_id, tunnel_id, token_enc, \
+                 origin_port, created_at, updated_at) \
+                 VALUES (?, 'prv_tunnel', ?, ?, 8081, ?, ?)",
+            )
+            .bind(machine)
+            .bind(format!("tun-{machine}"))
+            .bind(crate::tunnel::encrypt_token(key, machine, "run-token"))
+            .bind(&now)
+            .bind(&now)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+    }
+
+    /// The snapshot of `node_id` after `previous`, with `drains` and `key`.
+    async fn drained_spec(
+        store: &Store,
+        key: &DataKey,
+        drains: &Drains,
+        node_id: &str,
+        previous: Option<&Spec>,
+    ) -> Spec {
+        build_spec(
+            store,
+            node_id,
+            &ReferenceAsDigest,
+            &DigestCache::default(),
+            key,
+            previous,
+            &no_mesh_lookup(),
+            drains,
+        )
+        .await
+        .unwrap()
+        .spec
+    }
+
+    async fn set_replicas(store: &Store, app_id: &str, replicas: i64) {
+        sqlx::query("UPDATE apps SET replicas = ? WHERE id = ?")
+            .bind(replicas)
+            .bind(app_id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+    }
+
+    async fn stop_vm(store: &Store, vm_id: &str) {
+        sqlx::query("UPDATE vms SET desired_status = 'stopped' WHERE id = ?")
+            .bind(vm_id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+    }
+
+    /// Ends every drain whose CNAME `machine` took over for `hostname`.
+    fn repoint_and_end(drains: &Drains, machine: &str, hostname: &str) {
+        let names: BTreeSet<String> = [hostname.to_string()].into();
+        let past = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+        drains.record_cnames(machine, &names, &names, past);
+        drains.expire(time::OffsetDateTime::now_utc());
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_route_that_moves_to_the_edge_drains_on_its_node() {
+        let store = Store::open_in_memory().await.unwrap();
+        let key = DataKey::ephemeral();
+        let drains = Drains::default();
+        let edge = "nod_0000000000000000000000000E";
+        let node = "nod_00000000000000000000000001";
+        insert_node(&store, edge, &["edge"], None).await;
+        insert_node(&store, node, &["node"], Some("10.42.1.0/24")).await;
+        insert_tunnels(&store, &key, &[edge, node]).await;
+        let project_id = insert_project(&store, "move").await;
+        let app_id = deploy::new_id_with_prefix("app");
+        insert_app(&store, &project_id, &app_id, "web", 1).await;
+        let domain_id = deploy::new_id_with_prefix("dom");
+        insert_domain(&store, &domain_id, &app_id, "move.example.com", "tunnel").await;
+        let vm_id = new_id(Prefix::Vm);
+        insert_app_vm(
+            &store,
+            &project_id,
+            &app_id,
+            node,
+            &vm_id,
+            "web-1",
+            Some("10.42.1.11"),
+        )
+        .await;
+
+        let first = drained_spec(&store, &key, &drains, node, None).await;
+        assert_eq!(first.routes.len(), 1);
+        assert_eq!(first.routes[0].draining_until, None);
+
+        // Two replicas: the edge serves the hostname, and the node keeps its
+        // route, with its own VM, until the window ends.
+        set_replicas(&store, &app_id, 2).await;
+        let second = drained_spec(&store, &key, &drains, node, Some(&first)).await;
+        assert_eq!(second.routes.len(), 1, "{:?}", second.routes);
+        let route = &second.routes[0];
+        assert_eq!(route.hostname, "move.example.com");
+        assert_eq!(route.domain_id.as_deref(), Some(domain_id.as_str()));
+        assert_eq!(route.vm_ids, vec![vm_id.clone()]);
+        assert_eq!(route.tls_mode, "tunnel");
+        let until = route.draining_until.clone().expect("a draining route");
+        time::OffsetDateTime::parse(&until, &time::format_description::well_known::Rfc3339)
+            .expect("draining_until is RFC 3339");
+        let on_edge = drained_spec(&store, &key, &drains, edge, None).await;
+        let edge_spec = on_edge.edge.expect("spec.edge");
+        assert_eq!(edge_spec.routes.len(), 1);
+        assert_eq!(edge_spec.routes[0].draining_until, None);
+        assert!(edge_spec.tunnel.is_some());
+
+        // Built again, the snapshot is the same: the end does not move.
+        let third = drained_spec(&store, &key, &drains, node, Some(&second)).await;
+        assert_eq!(third.routes, second.routes);
+
+        // The edge's tunnel took the CNAME over long enough ago: the route
+        // leaves, and a draining route never starts draining again.
+        repoint_and_end(&drains, edge, "move.example.com");
+        let fourth = drained_spec(&store, &key, &drains, node, Some(&third)).await;
+        assert!(fourth.routes.is_empty(), "{:?}", fourth.routes);
+        let fifth = drained_spec(&store, &key, &drains, node, Some(&fourth)).await;
+        assert!(fifth.routes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_route_back_on_one_replica_drains_on_the_edge_with_the_remaining_instance() {
+        let store = Store::open_in_memory().await.unwrap();
+        let key = DataKey::ephemeral();
+        let drains = Drains::default();
+        let edge = "nod_0000000000000000000000000E";
+        let kept = "nod_00000000000000000000000001";
+        let other = "nod_00000000000000000000000002";
+        insert_node(&store, edge, &["edge"], None).await;
+        insert_node(&store, kept, &["node"], Some("10.42.1.0/24")).await;
+        insert_node(&store, other, &["node"], Some("10.42.2.0/24")).await;
+        insert_tunnels(&store, &key, &[edge, kept]).await;
+        let project_id = insert_project(&store, "back").await;
+        let app_id = deploy::new_id_with_prefix("app");
+        insert_app(&store, &project_id, &app_id, "web", 2).await;
+        insert_domain(
+            &store,
+            &deploy::new_id_with_prefix("dom"),
+            &app_id,
+            "back.example.com",
+            "tunnel",
+        )
+        .await;
+        let a = new_id(Prefix::Vm);
+        let b = new_id(Prefix::Vm);
+        insert_app_vm(
+            &store,
+            &project_id,
+            &app_id,
+            kept,
+            &a,
+            "web-a",
+            Some("10.42.1.11"),
+        )
+        .await;
+        insert_app_vm(
+            &store,
+            &project_id,
+            &app_id,
+            other,
+            &b,
+            "web-b",
+            Some("10.42.2.11"),
+        )
+        .await;
+
+        let first = drained_spec(&store, &key, &drains, edge, None).await;
+        assert_eq!(first.edge.as_ref().unwrap().routes[0].backends.len(), 2);
+
+        // Back to one replica on the node with a tunnel: the edge keeps the
+        // route with the remaining instance, and its tunnel with it.
+        set_replicas(&store, &app_id, 1).await;
+        stop_vm(&store, &b).await;
+        let second = drained_spec(&store, &key, &drains, edge, Some(&first)).await;
+        let edge_spec = second.edge.clone().expect("spec.edge");
+        assert_eq!(edge_spec.routes.len(), 1, "{:?}", edge_spec.routes);
+        let route = &edge_spec.routes[0];
+        assert!(route.draining_until.is_some());
+        let backends: Vec<&str> = route.backends.iter().map(|b| b.vm_id.as_str()).collect();
+        assert_eq!(backends, [a.as_str()]);
+        assert!(
+            edge_spec.tunnel.is_some(),
+            "the draining route needs the tunnel"
+        );
+        let on_node = drained_spec(&store, &key, &drains, kept, None).await;
+        assert_eq!(on_node.routes.len(), 1);
+        assert_eq!(on_node.routes[0].draining_until, None);
+
+        // With no instance left the edge gets no draining route, and no
+        // tunnel for it.
+        stop_vm(&store, &a).await;
+        let third = drained_spec(&store, &key, &drains, edge, Some(&second)).await;
+        let edge_spec = third.edge.expect("spec.edge");
+        assert!(edge_spec.routes.is_empty(), "{:?}", edge_spec.routes);
+        assert!(edge_spec.tunnel.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_route_that_no_other_tunnel_serves_leaves_at_once() {
+        let store = Store::open_in_memory().await.unwrap();
+        let key = DataKey::ephemeral();
+        let drains = Drains::default();
+        let edge = "nod_0000000000000000000000000E";
+        let node = "nod_00000000000000000000000001";
+        insert_node(&store, edge, &["edge"], None).await;
+        insert_node(&store, node, &["node"], Some("10.42.1.0/24")).await;
+        // Only the node has a tunnel: the edge cannot take the hostname.
+        insert_tunnels(&store, &key, &[node]).await;
+        let project_id = insert_project(&store, "gone").await;
+        let app_id = deploy::new_id_with_prefix("app");
+        insert_app(&store, &project_id, &app_id, "web", 1).await;
+        insert_domain(
+            &store,
+            &deploy::new_id_with_prefix("dom"),
+            &app_id,
+            "gone.example.com",
+            "tunnel",
+        )
+        .await;
+        insert_domain(
+            &store,
+            &deploy::new_id_with_prefix("dom"),
+            &app_id,
+            "acme.example.com",
+            "acme",
+        )
+        .await;
+        insert_app_vm(
+            &store,
+            &project_id,
+            &app_id,
+            node,
+            &new_id(Prefix::Vm),
+            "web-1",
+            Some("10.42.1.11"),
+        )
+        .await;
+
+        let first = drained_spec(&store, &key, &drains, node, None).await;
+        assert_eq!(first.routes.len(), 2);
+        set_replicas(&store, &app_id, 2).await;
+        let second = drained_spec(&store, &key, &drains, node, Some(&first)).await;
+        assert!(second.routes.is_empty(), "{:?}", second.routes);
+        assert!(drains.next_end().is_none());
     }
 }
