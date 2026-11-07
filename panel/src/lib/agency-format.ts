@@ -46,3 +46,15 @@ export const shortId = (id: string, keep = 10): string =>
 /** First and last eight hex characters of a 64-hex hash. */
 export const shortHash = (hash: string): string =>
   hash.length > 20 ? `${hash.slice(0, 8)}…${hash.slice(-8)}` : hash;
+
+/**
+ * Up to two initials for a human avatar: the first letters of the first and
+ * last words, or the first two letters of a single word.
+ */
+export const initials = (name: string): string => {
+  const words = name.split('@')[0]!.trim().split(/[\s._-]+/).filter(Boolean);
+  if (words.length === 0) return '?';
+  const first = words[0]!;
+  const last = words.length > 1 ? words[words.length - 1]! : '';
+  return (last ? `${first[0]}${last[0]}` : first.slice(0, 2)).toUpperCase();
+};

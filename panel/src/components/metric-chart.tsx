@@ -18,8 +18,8 @@ const BASELINE = HEIGHT - PAD_BOTTOM;
 const GRID_STEPS = [0.25, 0.5, 0.75];
 
 const STROKE = {
-  cobalt: 'var(--color-cobalt)',
-  ink: 'var(--color-ink)',
+  accent: 'var(--accent)',
+  ion: 'var(--ion)',
 } as const;
 
 export interface MetricChartProps<T extends TimedSample> {
@@ -39,7 +39,7 @@ export interface MetricChartProps<T extends TimedSample> {
 
 /**
  * One series over the last ten minutes. A thin line and a light area fill on
- * the panel's rail grid; the current value sits large beside the title, so the
+ * a faint line grid; the current value sits large beside the title, so the
  * chart reads at a glance before the shape does.
  */
 export function MetricChart<T extends TimedSample>({
@@ -49,7 +49,7 @@ export function MetricChart<T extends TimedSample>({
   value,
   domain,
   formatValue,
-  tone = 'cobalt',
+  tone = 'accent',
   emptyText = 'Collecting samples — first one within 5 s',
   notice,
   className,
@@ -84,12 +84,12 @@ export function MetricChart<T extends TimedSample>({
   return (
     <div className={cn('min-w-0', className)}>
       <div className="flex flex-wrap items-baseline gap-x-2.5 gap-y-1">
-        <h3 className="type-bay-title text-[13px] text-ink-muted">{title}</h3>
+        <h3 className="type-bay-title text-[13px] text-ink-2">{title}</h3>
         <p className="type-data text-[20px] leading-none text-ink">{currentText}</p>
       </div>
 
       {notice && samples.length > 0 ? (
-        <p className="mt-1 text-[12px] leading-snug text-lamp-fault">{notice}</p>
+        <p className="mt-1 text-[12px] leading-snug text-fault">{notice}</p>
       ) : null}
 
       <svg
@@ -108,7 +108,7 @@ export function MetricChart<T extends TimedSample>({
                 x2={WIDTH - PAD_RIGHT}
                 y1={y}
                 y2={y}
-                stroke="var(--color-rail)"
+                stroke="var(--line)"
                 strokeWidth={1}
               />
               <text
@@ -116,7 +116,7 @@ export function MetricChart<T extends TimedSample>({
                 y={y + 3}
                 textAnchor="end"
                 fontSize={9.5}
-                fill="var(--color-ink-muted)"
+                fill="var(--ink-3)"
               >
                 {formatValue(gridValue)}
               </text>
@@ -129,7 +129,7 @@ export function MetricChart<T extends TimedSample>({
           x2={WIDTH - PAD_RIGHT}
           y1={BASELINE}
           y2={BASELINE}
-          stroke="var(--color-rail)"
+          stroke="var(--line)"
           strokeWidth={1}
         />
 
@@ -153,13 +153,13 @@ export function MetricChart<T extends TimedSample>({
             y={(PAD_TOP + BASELINE) / 2}
             textAnchor="middle"
             fontSize={10.5}
-            fill="var(--color-ink-muted)"
+            fill="var(--ink-3)"
           >
             {notice ?? emptyText}
           </text>
         )}
 
-        <text x={PAD_LEFT} y={HEIGHT - 4} fontSize={9} fill="var(--color-ink-muted)">
+        <text x={PAD_LEFT} y={HEIGHT - 4} fontSize={9} fill="var(--ink-3)">
           -10 min
         </text>
         <text
@@ -167,7 +167,7 @@ export function MetricChart<T extends TimedSample>({
           y={HEIGHT - 4}
           textAnchor="end"
           fontSize={9}
-          fill="var(--color-ink-muted)"
+          fill="var(--ink-3)"
         >
           now
         </text>

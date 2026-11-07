@@ -30,7 +30,7 @@ export function WebhookEventPicker({
       <fieldset id={id} disabled={disabled} className="grid gap-x-5 gap-y-2.5 sm:grid-cols-2">
         {eventTypesBySubject().map((group) => (
           <div key={group.subject} className="flex flex-col gap-1">
-            <span className="type-body-medium text-[13px] capitalize text-ink-muted">
+            <span className="type-body-medium text-[13px] capitalize text-ink-2">
               {group.subject}
             </span>
             {group.types.map((type) => (
@@ -40,17 +40,17 @@ export function WebhookEventPicker({
               >
                 <input
                   type="checkbox"
-                  className="h-3.5 w-3.5 accent-cobalt"
+                  className="h-3.5 w-3.5 accent-accent-solid"
                   checked={selected.has(type)}
                   onChange={() => toggle(type)}
                 />
-                <span className="type-data">{type}</span>
+                <span className="type-code">{type}</span>
               </label>
             ))}
           </div>
         ))}
       </fieldset>
-      <p className="text-[13px] leading-snug text-ink-muted">
+      <p className="text-[13px] leading-snug text-ink-2">
         Leave all unchecked to send every event.
       </p>
     </div>

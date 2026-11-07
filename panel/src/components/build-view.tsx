@@ -17,6 +17,7 @@ import { problemView, type ProblemView } from '../lib/problem';
 import { BuildFailure } from './build-failure';
 import { BuildLog, type BuildJumpRequest } from './build-log';
 import { BuildStationList } from './build-rail';
+import { ImageRef } from './image-ref';
 import { ToneLamp } from './tone-lamp';
 import { Button } from './ui/button';
 import { NoticeLine, ProblemBanner } from './ui/problem-banner';
@@ -75,7 +76,7 @@ export function BuildView({
             <span className="type-body-medium text-[15px] text-ink" aria-live="polite">
               {lamp.statusText}
             </span>
-            <span className="text-[13px] text-ink-muted">{lamp.caption}</span>
+            <span className="text-[13px] text-ink-2">{lamp.caption}</span>
           </div>
         </div>
 
@@ -89,7 +90,7 @@ export function BuildView({
               {cancel.isPending ? 'Cancelling…' : 'Cancel build'}
             </Button>
           ) : null}
-          <Button variant="quiet" asChild>
+          <Button variant="ghost" asChild>
             <Link to="/apps/$appId" params={{ appId }}>
               Open the app
             </Link>
@@ -100,31 +101,31 @@ export function BuildView({
       {notice ? <div className="mt-2">{<NoticeLine>{notice}</NoticeLine>}</div> : null}
       {problem ? <ProblemBanner view={problem} className="mt-3" /> : null}
 
-      <dl className="type-data mt-4 grid grid-cols-1 gap-x-6 gap-y-1 border-t border-rail pt-3 text-[13px] sm:grid-cols-2">
+      <dl className="type-data mt-4 grid grid-cols-1 gap-x-6 gap-y-1 border-t border-line pt-3 text-[13px] sm:grid-cols-2">
         <div className="flex gap-2">
-          <dt className="text-ink-muted">App</dt>
+          <dt className="text-ink-2">App</dt>
           <dd className="min-w-0 truncate text-ink">{appName}</dd>
         </div>
         <div className="flex gap-2">
-          <dt className="text-ink-muted">Build</dt>
-          <dd className="min-w-0 truncate text-ink" title={build.id}>
+          <dt className="text-ink-2">Build</dt>
+          <dd className="type-code min-w-0 truncate text-ink" title={build.id}>
             {shortBuildId(build.id)}
           </dd>
         </div>
         <div className="flex gap-2">
-          <dt className="text-ink-muted">Commit</dt>
-          <dd className="text-ink">{shortCommit(build.commit)}</dd>
+          <dt className="text-ink-2">Commit</dt>
+          <dd className="type-code text-ink">{shortCommit(build.commit)}</dd>
         </div>
         <div className="flex gap-2">
-          <dt className="text-ink-muted">Duration</dt>
+          <dt className="text-ink-2">Duration</dt>
           <dd className="text-ink">{buildDurationLabel(build)}</dd>
         </div>
         <div className="flex gap-2">
-          <dt className="text-ink-muted">Trigger</dt>
+          <dt className="text-ink-2">Trigger</dt>
           <dd className="text-ink">{build.trigger}</dd>
         </div>
         <div className="flex gap-2">
-          <dt className="text-ink-muted">Started by</dt>
+          <dt className="text-ink-2">Started by</dt>
           <dd className="min-w-0 truncate text-ink" title={build.created_by_id}>
             {build.created_by_type === 'system'
               ? 'system'
@@ -132,14 +133,20 @@ export function BuildView({
           </dd>
         </div>
         <div className="flex gap-2 sm:col-span-2">
-          <dt className="text-ink-muted">Image</dt>
+          <dt className="text-ink-2">Image</dt>
           <dd className="min-w-0 truncate text-ink">
-            {builtImage ?? (build.status === 'succeeded' ? 'built' : 'Not built yet')}
+            {build.image !== null && builtImage !== null ? (
+              <ImageRef image={build.image} />
+            ) : build.status === 'succeeded' ? (
+              'built'
+            ) : (
+              'Not built yet'
+            )}
           </dd>
         </div>
         <div className="flex min-w-0 gap-2 sm:col-span-2">
-          <dt className="text-ink-muted">Source</dt>
-          <dd className="type-data min-w-0 truncate text-ink" title={build.source.repo_url}>
+          <dt className="text-ink-2">Source</dt>
+          <dd className="type-code min-w-0 truncate text-ink" title={build.source.repo_url}>
             {build.source.repo_url} @ {build.source.ref}
           </dd>
         </div>
@@ -154,13 +161,13 @@ export function BuildView({
       ) : null}
 
       {build.status === 'succeeded' && build.deployment_id !== null ? (
-        <div className="mt-4 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-[6px] border border-rail bg-panel px-4 py-3">
+        <div className="mt-4 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-[10px] border border-line bg-surface px-4 py-3">
           <ToneLamp tone="run" size={18} label="Build succeeded" />
           <p className="text-[13px] text-ink">
             The build started deployment{' '}
-            <span className="type-data">{shortDeploymentId(build.deployment_id)}</span>.
+            <span className="type-code">{shortDeploymentId(build.deployment_id)}</span>.
           </p>
-          <Button variant="quiet" className="px-2.5" asChild>
+          <Button variant="ghost" className="px-2.5" asChild>
             <Link to="/apps/$appId" params={{ appId }}>
               Open the deployment
             </Link>
@@ -169,7 +176,7 @@ export function BuildView({
       ) : null}
 
       {build.status === 'cancelled' ? (
-        <p className="mt-4 rounded-[6px] border border-rail bg-panel px-4 py-3 text-[13px] text-ink-muted">
+        <p className="mt-4 rounded-[10px] border border-line bg-surface px-4 py-3 text-[13px] text-ink-2">
           The build was cancelled before it finished. Nothing was deployed.
         </p>
       ) : null}

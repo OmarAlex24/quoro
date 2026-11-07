@@ -21,7 +21,7 @@ export function WebhooksScreen() {
   if (loading) {
     return (
       <main className="mx-auto w-full max-w-6xl px-4 py-8 sm:px-6">
-        <p className="text-[15px] text-ink-muted">Loading…</p>
+        <p className="text-[15px] text-ink-2">Loading…</p>
       </main>
     );
   }
@@ -39,7 +39,7 @@ export function WebhooksScreen() {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h1 className="type-display text-[24px] leading-none">Webhooks</h1>
-          <p className="mt-2 max-w-2xl text-[15px] leading-snug text-ink-muted">
+          <p className="mt-2 max-w-2xl text-[15px] leading-snug text-ink-2">
             Send events to a receiver, and optionally wake an agent with a short grant
             for the incident.
           </p>
@@ -52,7 +52,7 @@ export function WebhooksScreen() {
       </div>
 
       {!writer ? (
-        <p className="mt-3 text-[13px] text-ink-muted">
+        <p className="mt-3 text-[13px] text-ink-2">
           Your role can read webhooks but not change them.
         </p>
       ) : null}
@@ -61,9 +61,9 @@ export function WebhooksScreen() {
 
       <div className="mt-5 flex flex-col gap-2">
         {webhooksQuery.isPending ? (
-          <div className="h-[104px] rounded-[6px] border border-rail bg-panel/60" />
+          <div className="h-[104px] rounded-[10px] border border-line bg-surface/60" />
         ) : webhooks.length === 0 ? (
-          <div className="rounded-[6px] border border-dashed border-rail bg-panel/50 px-4 py-10 text-center">
+          <div className="rounded-[10px] border border-dashed border-line bg-surface/50 px-4 py-10 text-center">
             <p className="text-[15px] text-ink">
               {writer
                 ? 'No webhooks yet. Add one to send events to a receiver.'

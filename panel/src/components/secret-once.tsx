@@ -16,15 +16,15 @@ export function SecretOnce({
   note: string;
 }) {
   return (
-    <div className="rounded-[6px] border border-rail border-l-4 border-l-lamp-shift bg-panel px-3.5 py-3">
+    <div className="rounded-[10px] border border-line border-l-4 border-l-shift bg-surface px-3.5 py-3">
       <p className="type-body-medium text-[13px] text-ink">{label}</p>
       <div className="mt-2 flex flex-wrap items-center gap-2">
-        <code className="min-w-0 flex-1 break-all rounded-[4px] border border-rail bg-enamel px-2.5 py-1.5 font-sans type-data text-[14px] text-ink select-all">
+        <code className="min-w-0 flex-1 break-all rounded-[7px] border border-line-2 bg-sunk px-2.5 py-1.5 type-code text-[12.5px] text-ink select-all">
           {secret}
         </code>
         <CopyButton value={secret} label="Copy secret" />
       </div>
-      <p className="mt-2 text-[13px] leading-snug text-ink-muted">{note}</p>
+      <p className="mt-2 text-[13px] leading-snug text-ink-2">{note}</p>
     </div>
   );
 }

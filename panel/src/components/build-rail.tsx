@@ -23,7 +23,7 @@ export function BuildStationList({ build }: { build: Build }) {
       <div className="relative pb-1">
         <div
           aria-hidden="true"
-          className="absolute left-0 right-0 top-[10px] hidden h-px bg-rail sm:block"
+          className="absolute left-0 right-0 top-[10px] hidden h-px bg-line sm:block"
         />
         <ol className="relative grid grid-cols-3 gap-x-2 gap-y-4 sm:grid-cols-6">
           {rail.stations.map((station) => (
@@ -41,7 +41,7 @@ export function BuildStationList({ build }: { build: Build }) {
               <span className="type-body-medium text-[13px] leading-tight text-ink">
                 {BUILD_PHASE_LABELS[station.phase]}
               </span>
-              <span className="text-[12px] leading-tight text-ink-muted">
+              <span className="text-[12px] leading-tight text-ink-2">
                 {stationWords[station.state]}
               </span>
             </li>
@@ -50,7 +50,7 @@ export function BuildStationList({ build }: { build: Build }) {
       </div>
 
       {rail.caption ? (
-        <p className="mt-3 text-[13px] text-ink-muted">{rail.caption}</p>
+        <p className="mt-3 text-[13px] text-ink-2">{rail.caption}</p>
       ) : null}
     </div>
   );

@@ -60,7 +60,7 @@ function FindingLine({ finding }: { finding: VulnerabilityFinding }) {
       </span>
       {finding.kev ? (
         <span
-          className="type-data text-[12px] font-medium text-lamp-fault"
+          className="type-data text-[12px] font-medium text-fault"
           title="In CISA's Known Exploited Vulnerabilities catalog"
         >
           KEV
@@ -70,10 +70,10 @@ function FindingLine({ finding }: { finding: VulnerabilityFinding }) {
         <span className="type-data text-[13px] text-ink">{finding.component}</span>
       ) : null}
       <VulnIdLink vulnId={finding.vuln_id} />
-      <span className="type-data text-[13px] text-ink-muted">
+      <span className="type-data text-[13px] text-ink-2">
         installed {finding.installed_version}
       </span>
-      <span className="type-data text-[13px] text-ink-muted">
+      <span className="type-data text-[13px] text-ink-2">
         {finding.fixed_version === null
           ? 'no fix yet'
           : `fixed in ${finding.fixed_version}`}
@@ -90,35 +90,35 @@ function QuoroPart({ quoro }: { quoro: QuoroVulnerabilities }) {
   const kernelClear = guestKernelIsClear(quoro.items);
 
   return (
-    <div className="mt-4 border-t border-rail pt-3">
+    <div className="mt-4 border-t border-line pt-3">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <h3 className="type-bay-title text-[14px] leading-tight text-ink">
           Quoro {quoro.version}
         </h3>
-        <span className="type-data text-[13px] text-ink-muted">
+        <span className="type-data text-[13px] text-ink-2">
           {openFindingCount(quoro.counts)} open{' '}
           {openFindingCount(quoro.counts) === 1 ? 'finding' : 'findings'}
         </span>
       </div>
       <VulnerabilityCountsLine counts={quoro.counts} className="mt-2" />
 
-      <div className="mt-3 flex flex-wrap items-baseline gap-x-3 gap-y-1 border-t border-rail pt-2.5">
+      <div className="mt-3 flex flex-wrap items-baseline gap-x-3 gap-y-1 border-t border-line pt-2.5">
         <span className="type-body-medium text-[13px] text-ink">
           Guest kernel {GUEST_KERNEL_VERSION ?? 'not pinned'}
         </span>
         {GUEST_KERNEL_VERSION === null ? (
-          <span className="text-[13px] text-ink-muted">
+          <span className="text-[13px] text-ink-2">
             This panel build does not name a guest kernel.
           </span>
         ) : kernelClear ? (
-          <span className="text-[13px] text-ink-muted">
+          <span className="text-[13px] text-ink-2">
             no known vulnerabilities
           </span>
         ) : null}
       </div>
 
       {!kernelClear ? (
-        <ul className="mt-1 flex flex-col divide-y divide-rail border-y border-rail">
+        <ul className="mt-1 flex flex-col divide-y divide-line border-y border-line">
           {kernelFindings.map((finding) => (
             <FindingLine key={finding.id} finding={finding} />
           ))}
@@ -126,13 +126,13 @@ function QuoroPart({ quoro }: { quoro: QuoroVulnerabilities }) {
       ) : null}
 
       {otherFindings.length > 0 ? (
-        <ul className="mt-3 flex flex-col divide-y divide-rail border-y border-rail">
+        <ul className="mt-3 flex flex-col divide-y divide-line border-y border-line">
           {otherFindings.map((finding) => (
             <FindingLine key={finding.id} finding={finding} />
           ))}
         </ul>
       ) : (
-        <p className="mt-2 text-[13px] leading-snug text-ink-muted">
+        <p className="mt-2 text-[13px] leading-snug text-ink-2">
           No other Quoro component has an open finding.
         </p>
       )}
@@ -148,11 +148,11 @@ function HostKernelsPart({
   nodeNames: Record<string, string>;
 }) {
   return (
-    <div className="mt-4 border-t border-rail pt-3">
+    <div className="mt-4 border-t border-line pt-3">
       <h3 className="type-bay-title text-[14px] leading-tight text-ink">
         Host kernels
       </h3>
-      <ul className="mt-2 flex flex-col divide-y divide-rail border-y border-rail">
+      <ul className="mt-2 flex flex-col divide-y divide-line border-y border-line">
         {kernels.map((host) => {
           const upstreamOnly = host.items.some(
             (finding) => finding.upstream_version_only === true,
@@ -163,27 +163,27 @@ function HostKernelsPart({
                 <span className="type-body-medium text-[14px] text-ink">
                   {nodeNames[host.node_id] ?? host.node_id}
                 </span>
-                <span className="type-data text-[13px] text-ink-muted">
+                <span className="type-data text-[13px] text-ink-2">
                   {host.kernel}
                 </span>
-                <span className="type-data text-[13px] text-ink-muted">
+                <span className="type-data text-[13px] text-ink-2">
                   {openFindingCount(host.counts)} open{' '}
                   {openFindingCount(host.counts) === 1 ? 'finding' : 'findings'}
                 </span>
               </div>
               {host.items.length === 0 ? (
-                <p className="mt-1 text-[13px] text-ink-muted">
+                <p className="mt-1 text-[13px] text-ink-2">
                   No known vulnerabilities in this kernel.
                 </p>
               ) : (
-                <ul className="mt-1 flex flex-col divide-y divide-rail/70">
+                <ul className="mt-1 flex flex-col divide-y divide-line/70">
                   {host.items.map((finding) => (
                     <FindingLine key={finding.id} finding={finding} />
                   ))}
                 </ul>
               )}
               {upstreamOnly ? (
-                <p className="mt-1 text-[13px] leading-snug text-ink-muted">
+                <p className="mt-1 text-[13px] leading-snug text-ink-2">
                   Matched by upstream version: a distribution kernel may already
                   carry the fix.
                 </p>
@@ -198,17 +198,17 @@ function HostKernelsPart({
 
 function AppRow({ app }: { app: AppVulnerabilitySummary }) {
   return (
-    <tr className="border-b border-rail/70 last:border-b-0">
+    <tr className="border-b border-line/70 last:border-b-0">
       <td className="py-2 pr-3">
         <Link
           to="/apps/$appId"
           params={{ appId: app.app_id }}
-          className="text-ink underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+          className="text-ink underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
         >
           {app.name}
         </Link>
       </td>
-      <td className="py-2 pr-3 text-ink-muted">
+      <td className="py-2 pr-3 text-ink-2">
         {inventoryStatusWords(app.inventory_status)}
       </td>
       <td className="py-2 pr-3 text-ink">{openFindingCount(app.counts)}</td>
@@ -236,22 +236,22 @@ function AppsPart({
 }) {
   const apps = [...summary.apps, ...extraApps];
   return (
-    <div className="mt-4 border-t border-rail pt-3">
+    <div className="mt-4 border-t border-line pt-3">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <h3 className="type-bay-title text-[14px] leading-tight text-ink">Apps</h3>
-        <span className="type-data text-[13px] text-ink-muted">
+        <span className="type-data text-[13px] text-ink-2">
           {apps.length} {apps.length === 1 ? 'app' : 'apps'}
         </span>
       </div>
       {apps.length === 0 ? (
-        <p className="mt-2 text-[13px] text-ink-muted">
+        <p className="mt-2 text-[13px] text-ink-2">
           No app is visible to your role.
         </p>
       ) : (
         <div className="mt-2 overflow-x-auto">
           <table className="type-data w-full min-w-[640px] text-[13px]">
             <thead>
-              <tr className="border-b border-rail text-left text-ink-muted">
+              <tr className="border-b border-line text-left text-ink-2">
                 <th className="py-1.5 pr-3 font-normal">App</th>
                 <th className="py-1.5 pr-3 font-normal">Image</th>
                 <th className="py-1.5 pr-3 font-normal">Open findings</th>
@@ -269,7 +269,7 @@ function AppsPart({
       {loadProblem ? <ProblemBanner view={loadProblem} className="mt-3" /> : null}
       {nextCursor !== null ? (
         <Button
-          variant="secondary"
+          variant="default"
           className="mt-3"
           disabled={loadMorePending}
           onClick={onLoadMore}
@@ -283,33 +283,33 @@ function AppsPart({
 
 function DataPart({ data }: { data: VulnerabilityDataSource[] }) {
   return (
-    <div className="mt-4 border-t border-rail pt-3">
+    <div className="mt-4 border-t border-line pt-3">
       <h3 className="type-bay-title text-[14px] leading-tight text-ink">
         Vulnerability data
       </h3>
       {data.length === 0 ? (
-        <p className="mt-2 text-[13px] text-ink-muted">
+        <p className="mt-2 text-[13px] text-ink-2">
           No vulnerability data has been brought in yet.
         </p>
       ) : (
-        <ul className="mt-2 flex flex-col divide-y divide-rail border-y border-rail">
+        <ul className="mt-2 flex flex-col divide-y divide-line border-y border-line">
           {data.map((source) => (
             <li key={source.ecosystem} className="py-2">
               <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
                 <span className="type-data text-[14px] text-ink">
                   {source.ecosystem}
                 </span>
-                <span className="text-[13px] text-ink-muted">
+                <span className="text-[13px] text-ink-2">
                   source {source.source}
                 </span>
-                <span className="type-data text-[13px] text-ink-muted">
+                <span className="type-data text-[13px] text-ink-2">
                   {source.data_modified_at === null
                     ? 'no data yet'
                     : `data from ${relativeTime(source.data_modified_at)}`}
                 </span>
               </div>
               {source.last_error ? (
-                <p className="mt-1 text-[13px] leading-snug text-lamp-fault">
+                <p className="mt-1 text-[13px] leading-snug text-fault">
                   {source.last_error}
                 </p>
               ) : null}
@@ -397,7 +397,7 @@ export function ClusterVulnerabilities({
   return (
     <section
       className={cn(
-        'rounded-[6px] border border-rail bg-panel px-4 py-4 sm:px-5',
+        'rounded-[10px] border border-line bg-surface px-4 py-4 sm:px-5',
         className,
       )}
     >
@@ -405,7 +405,7 @@ export function ClusterVulnerabilities({
         <h2 className="type-display-light text-[15px] leading-none text-ink">
           Vulnerabilities
         </h2>
-        <span className="type-data text-[13px] text-ink-muted">
+        <span className="type-data text-[13px] text-ink-2">
           Cluster summary
         </span>
       </div>
@@ -413,7 +413,7 @@ export function ClusterVulnerabilities({
       {error ? (
         <ProblemBanner view={error} className="mt-3" />
       ) : summaryQuery.isPending ? (
-        <p className="mt-3 text-[13px] text-ink-muted">
+        <p className="mt-3 text-[13px] text-ink-2">
           Reading the vulnerability summary…
         </p>
       ) : summary === undefined ? null : (

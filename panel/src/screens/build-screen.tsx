@@ -43,7 +43,7 @@ export function BuildScreen() {
   if (loading) {
     return (
       <main className="mx-auto w-full max-w-4xl px-4 py-8 sm:px-6">
-        <p className="text-[15px] text-ink-muted">Loading…</p>
+        <p className="text-[15px] text-ink-2">Loading…</p>
       </main>
     );
   }
@@ -53,7 +53,7 @@ export function BuildScreen() {
   if (appQuery.isPending || buildQuery.isPending) {
     return (
       <main className="mx-auto w-full max-w-4xl px-4 py-8 sm:px-6">
-        <div className="h-[180px] rounded-[6px] border border-rail bg-panel/60" />
+        <div className="h-[180px] rounded-[10px] border border-line bg-surface/60" />
       </main>
     );
   }
@@ -69,7 +69,7 @@ export function BuildScreen() {
     return (
       <main className="mx-auto w-full max-w-4xl px-4 py-6 sm:px-6 sm:py-8">
         <ProblemBanner view={view} />
-        <Button variant="secondary" className="mt-4" asChild>
+        <Button variant="default" className="mt-4" asChild>
           <Link to="/apps/$appId" params={{ appId }}>
             Back to the app
           </Link>
@@ -84,19 +84,19 @@ export function BuildScreen() {
         <Link
           to="/apps/$appId"
           params={{ appId }}
-          className="text-[13px] text-ink-muted underline-offset-4 hover:text-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+          className="text-[13px] text-ink-2 underline-offset-4 hover:text-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
         >
           {app.name}
         </Link>
       </div>
 
       <div className="flex flex-wrap items-end justify-between gap-3">
-        <h1 className="type-display nameplate text-[24px] leading-none">
-          Build <span className="type-data text-[20px] normal-case">{shortBuildId(build.id)}</span>
+        <h1 className="type-display text-[24px] leading-none">
+          Build <span className="type-code text-[18px]">{shortBuildId(build.id)}</span>
         </h1>
       </div>
 
-      <section className="mt-4 rounded-[6px] border border-rail bg-panel px-4 py-4 bay-shadow sm:px-5">
+      <section className="mt-4 rounded-[10px] border border-line bg-surface px-4 py-4 card-sheen sm:px-5">
         <BuildView
           build={build}
           appId={app.id}

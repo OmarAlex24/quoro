@@ -14,14 +14,14 @@ export function SelectTrigger({
   return (
     <SelectPrimitive.Trigger
       className={cn(
-        'field flex items-center justify-between gap-2 text-left data-[placeholder]:text-ink-muted focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-cobalt',
+        'field flex items-center justify-between gap-2 text-left data-[placeholder]:text-ink-3 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent',
         className,
       )}
       {...props}
     >
       {children}
       <SelectPrimitive.Icon asChild>
-        <ChevronDown size={15} className="shrink-0 text-ink-muted" />
+        <ChevronDown size={15} className="shrink-0 text-ink-2" />
       </SelectPrimitive.Icon>
     </SelectPrimitive.Trigger>
   );
@@ -38,7 +38,7 @@ export function SelectContent({
         position="popper"
         sideOffset={4}
         className={cn(
-          'z-[60] max-h-72 min-w-[var(--radix-select-trigger-width)] overflow-hidden rounded-[6px] border border-rail bg-panel p-1 shadow-[0_16px_40px_-16px_rgb(20_32_48_/_0.45)]',
+          'z-[60] max-h-72 min-w-[var(--radix-select-trigger-width)] overflow-hidden rounded-[10px] border border-line-2 bg-raised p-1 shadow-[var(--shadow)]',
           className,
         )}
         {...props}
@@ -57,14 +57,14 @@ export function SelectItem({
   return (
     <SelectPrimitive.Item
       className={cn(
-        'relative flex cursor-default select-none items-center gap-2 rounded-[4px] py-2 pl-2.5 pr-8 text-[15px] outline-none data-[highlighted]:bg-recess data-[disabled]:opacity-45',
+        'relative flex cursor-default select-none items-center gap-2 rounded-[7px] py-1.5 pl-2.5 pr-8 text-[13px] outline-none data-[highlighted]:bg-surface data-[disabled]:opacity-45',
         className,
       )}
       {...props}
     >
       <SelectPrimitive.ItemText>{children}</SelectPrimitive.ItemText>
       <SelectPrimitive.ItemIndicator className="absolute right-2">
-        <Check size={14} className="text-cobalt" />
+        <Check size={14} className="text-accent" />
       </SelectPrimitive.ItemIndicator>
     </SelectPrimitive.Item>
   );

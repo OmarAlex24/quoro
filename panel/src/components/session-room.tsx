@@ -134,19 +134,19 @@ export function SessionRoom({
     <main className="mx-auto w-full max-w-5xl px-4 py-6 sm:px-6 sm:py-8">
       <div className="mb-3">{back}</div>
 
-      <header className="rounded-[6px] border border-rail bg-panel px-4 py-4 bay-shadow sm:px-5">
+      <header className="rounded-[10px] border border-line bg-surface px-4 py-4 card-sheen sm:px-5">
         <div className="flex flex-wrap items-start gap-x-4 gap-y-3">
           <div className="min-w-0 flex-1">
-            <p className="type-display-light text-[12px] leading-none text-ink-muted">
+            <p className="type-display-light text-[12px] leading-none text-ink-2">
               {eyebrow}
             </p>
             <div className="mt-1.5 flex flex-wrap items-center gap-2.5">
               <ToneLamp tone={stateTone(view)} pulse={view?.phase === 'connecting'} label={status} />
-              <h1 className="type-display nameplate truncate text-[24px] leading-none">
+              <h1 className="type-display truncate text-[24px] leading-none">
                 {title}
               </h1>
             </div>
-            <p className="mt-1.5 max-w-2xl text-[13px] leading-snug text-ink-muted">
+            <p className="mt-1.5 max-w-2xl text-[13px] leading-snug text-ink-2">
               {description}
             </p>
           </div>
@@ -154,8 +154,8 @@ export function SessionRoom({
           {canConnect ? (
             redeployHint ? (
               <Button
-                variant="secondary"
-                size="compact"
+                variant="default"
+                size="sm"
                 disabled={open.isPending}
                 onClick={retryAfterRedeploy}
               >
@@ -165,7 +165,7 @@ export function SessionRoom({
               <div className="flex flex-wrap items-center gap-2">
                 {ticket && live ? (
                   <Button
-                    variant="secondary"
+                    variant="default"
                     disabled={end.isPending}
                     onClick={() => end.mutate(ticket.id)}
                   >
@@ -187,17 +187,17 @@ export function SessionRoom({
       </header>
 
       {!canConnect ? (
-        <p className="mt-3 rounded-[6px] border border-rail bg-panel px-3.5 py-2.5 text-[13px] leading-snug text-ink">
+        <p className="mt-3 rounded-[10px] border border-line bg-surface px-3.5 py-2.5 text-[13px] leading-snug text-ink">
           {deniedMessage}
         </p>
       ) : null}
 
       {redeployHint ? (
-        <section className="mt-3 rounded-[6px] border border-rail bg-panel px-4 py-3.5 bay-shadow">
+        <section className="mt-3 rounded-[10px] border border-line bg-surface px-4 py-3.5 card-sheen">
           <h2 className="type-display-light text-[15px] leading-none text-ink">
             Redeploy to enable {kind === 'terminal' ? 'the terminal' : 'the console'}
           </h2>
-          <p className="mt-2 max-w-2xl text-[13px] leading-snug text-ink-muted">
+          <p className="mt-2 max-w-2xl text-[13px] leading-snug text-ink-2">
             This VM was created before the terminal and console existed. A restart keeps its
             devices; a redeploy creates a new VM that has them.
           </p>
@@ -205,7 +205,7 @@ export function SessionRoom({
             <Link
               to="/apps/$appId"
               params={{ appId }}
-              className="mt-3 inline-block text-[13px] text-cobalt underline underline-offset-4 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+              className="mt-3 inline-block text-[13px] text-accent underline underline-offset-4 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
             >
               Open the app to redeploy
             </Link>
@@ -226,35 +226,35 @@ export function SessionRoom({
             className={cn(
               'inline-block h-2.5 w-2.5 border-2',
               view?.phase === 'live'
-                ? 'border-lamp-run bg-lamp-run'
+                ? 'border-run bg-run'
                 : view?.phase === 'error'
-                  ? 'border-lamp-fault bg-lamp-fault'
+                  ? 'border-fault bg-fault'
                   : view?.phase === 'connecting'
-                    ? 'border-lamp-shift'
-                    : 'border-lamp-idle',
+                    ? 'border-shift'
+                    : 'border-idle',
             )}
           />
           <span className="type-body-medium text-[13px] text-ink">{status}</span>
           {ticket ? (
-            <span className="type-data ml-auto text-[12px] text-ink-muted" title={ticket.id}>
+            <span className="type-code ml-auto text-[11px] text-ink-2" title={ticket.id}>
               {kind === 'terminal' ? 'terminal' : 'console'} {shortSessionId(ticket.id)}
             </span>
           ) : null}
         </div>
 
-        <div className="mt-2 overflow-hidden rounded-[6px] border border-rail bg-[#0f1a26] p-1.5 shadow-[inset_0_2px_8px_rgb(0_0_0_/_0.35)]">
+        <div className="mt-2 overflow-hidden rounded-[10px] border border-line bg-sunk p-1.5">
           {ticket ? (
             <XtermView ticket={ticket} kind={kind} onState={setView} />
           ) : (
             <div className="flex h-[300px] flex-col items-center justify-center gap-2 px-6 text-center sm:h-[420px]">
-              <p className="text-[15px] text-[#dce1e5]">
+              <p className="text-[15px] text-ink">
                 {view?.phase === 'closed' || view?.phase === 'exited'
                   ? 'The session has ended.'
                   : kind === 'terminal'
                     ? 'No terminal is open.'
                     : 'No console is attached.'}
               </p>
-              <p className="max-w-md text-[13px] leading-snug text-[#7d8b9a]">
+              <p className="max-w-md text-[13px] leading-snug text-ink-2">
                 {redeployHint
                   ? `This VM has no ${kind === 'terminal' ? 'terminal' : 'console'} device yet. ${appId ? 'Redeploy the app' : 'Recreate the VM'}, then try again.`
                   : kind === 'terminal'

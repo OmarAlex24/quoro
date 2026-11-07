@@ -87,7 +87,7 @@ function AgentFields({
 }
 
 const ownerLine = (
-  <p className="text-[13px] text-ink-muted">Owner: you</p>
+  <p className="text-[13px] text-ink-2">Owner: you</p>
 );
 
 /** Create an agent owned by the signed-in human. */
@@ -161,8 +161,8 @@ export function CreateAgentDialog({
           <AgentFields idPrefix="agent-new" draft={draft} onChange={setDraft} autoFocus />
           {ownerLine}
 
-          <div className="mt-1 flex flex-wrap justify-end gap-2 border-t border-rail pt-4">
-            <Button variant="secondary" onClick={() => onOpenChange(false)}>
+          <div className="mt-1 flex flex-wrap justify-end gap-2 border-t border-line pt-4">
+            <Button variant="default" onClick={() => onOpenChange(false)}>
               Cancel
             </Button>
             <Button variant="primary" type="submit" disabled={create.isPending}>
@@ -244,13 +244,13 @@ export function EditAgentDialog({
             onChange={setDraft}
             autoFocus={false}
           />
-          <p className="flex flex-wrap items-baseline gap-1.5 text-[13px] text-ink-muted">
+          <p className="flex flex-wrap items-baseline gap-1.5 text-[13px] text-ink-2">
             <span>Owner</span>
             <UserName id={agent.owner_user_id} />
           </p>
 
-          <div className="mt-1 flex flex-wrap justify-end gap-2 border-t border-rail pt-4">
-            <Button variant="secondary" onClick={() => onOpenChange(false)}>
+          <div className="mt-1 flex flex-wrap justify-end gap-2 border-t border-line pt-4">
+            <Button variant="default" onClick={() => onOpenChange(false)}>
               Cancel
             </Button>
             <Button

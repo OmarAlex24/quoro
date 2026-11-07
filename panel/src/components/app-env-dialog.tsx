@@ -100,13 +100,13 @@ export function AppEnvDialog({
         <div className="flex flex-col gap-3">
           {problem ? <ProblemBanner view={problem} /> : null}
 
-          <p className="text-[13px] leading-snug text-ink-muted">
+          <p className="text-[13px] leading-snug text-ink-2">
             Variables you remove here are deleted. Every listed variable needs its value
             entered again.
           </p>
 
           {rows.length === 0 ? (
-            <p className="text-[13px] text-ink-muted">
+            <p className="text-[13px] text-ink-2">
               No variables yet. Add one below.
             </p>
           ) : null}
@@ -133,7 +133,7 @@ export function AppEnvDialog({
                   spellCheck={false}
                 />
                 <Button
-                  variant="quiet"
+                  variant="ghost"
                   className="px-2.5"
                   aria-pressed={row.show}
                   onClick={() => update(row.key, { show: !row.show })}
@@ -142,7 +142,7 @@ export function AppEnvDialog({
                 </Button>
               </div>
               <Button
-                variant="quiet"
+                variant="ghost"
                 className="justify-self-start px-2.5"
                 onClick={() =>
                   setRows((current) => current.filter((item) => item.key !== row.key))
@@ -156,7 +156,7 @@ export function AppEnvDialog({
           <div>
             <button
               type="button"
-              className="text-[13px] text-cobalt underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+              className="text-[13px] text-accent underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
               onClick={() => {
                 const key = nextKey.current;
                 nextKey.current += 1;
@@ -167,8 +167,8 @@ export function AppEnvDialog({
             </button>
           </div>
 
-          <div className="mt-1 flex flex-wrap justify-end gap-2 border-t border-rail pt-4">
-            <Button variant="secondary" onClick={() => onOpenChange(false)}>
+          <div className="mt-1 flex flex-wrap justify-end gap-2 border-t border-line pt-4">
+            <Button variant="default" onClick={() => onOpenChange(false)}>
               Cancel
             </Button>
             <Button

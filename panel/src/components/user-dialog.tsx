@@ -117,7 +117,7 @@ export function InviteUserDialog({ onClose }: { onClose: () => void }) {
               note={GENERATED_PASSWORD_NOTE}
             />
 
-            <div className="rounded-[6px] border border-rail bg-recess/40 px-3.5 py-3">
+            <div className="rounded-[10px] border border-line bg-sunk/40 px-3.5 py-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <p className="type-body-medium text-[13px] text-ink">Invite text</p>
                 <CopyButton value={text} label="Copy invite" />
@@ -127,7 +127,7 @@ export function InviteUserDialog({ onClose }: { onClose: () => void }) {
               </p>
             </div>
 
-            <div className="flex justify-end border-t border-rail pt-4">
+            <div className="flex justify-end border-t border-line pt-4">
               <Button variant="primary" onClick={close}>
                 Done
               </Button>
@@ -211,8 +211,8 @@ export function InviteUserDialog({ onClose }: { onClose: () => void }) {
             <div className="mt-1 flex flex-wrap gap-2">
               {ownPassword ? (
                 <Button
-                  variant="quiet"
-                  size="compact"
+                  variant="ghost"
+                  size="sm"
                   onClick={() => {
                     setOwnPassword(false);
                     setPassword(generatePassword());
@@ -223,15 +223,15 @@ export function InviteUserDialog({ onClose }: { onClose: () => void }) {
               ) : (
                 <>
                   <Button
-                    variant="quiet"
-                    size="compact"
+                    variant="ghost"
+                    size="sm"
                     onClick={() => setPassword(generatePassword())}
                   >
                     Generate another
                   </Button>
                   <Button
-                    variant="quiet"
-                    size="compact"
+                    variant="ghost"
+                    size="sm"
                     onClick={() => {
                       setOwnPassword(true);
                       setPassword('');
@@ -244,8 +244,8 @@ export function InviteUserDialog({ onClose }: { onClose: () => void }) {
             </div>
           </Field>
 
-          <div className="mt-1 flex flex-wrap justify-end gap-2 border-t border-rail pt-4">
-            <Button variant="secondary" onClick={close}>
+          <div className="mt-1 flex flex-wrap justify-end gap-2 border-t border-line pt-4">
+            <Button variant="default" onClick={close}>
               Cancel
             </Button>
             <Button variant="primary" type="submit" disabled={create.isPending}>
@@ -337,8 +337,8 @@ export function UserActionDialog({
         <div className="flex flex-col gap-4">
           {problem ? <ProblemBanner view={problem} /> : null}
 
-          <div className="flex flex-wrap justify-end gap-2 border-t border-rail pt-4">
-            <Button variant="secondary" onClick={onClose}>
+          <div className="flex flex-wrap justify-end gap-2 border-t border-line pt-4">
+            <Button variant="default" onClick={onClose}>
               Cancel
             </Button>
             <Button
@@ -408,7 +408,7 @@ export function ResetPasswordDialog({
               secret={shown}
               note={GENERATED_PASSWORD_NOTE}
             />
-            <div className="flex justify-end border-t border-rail pt-4">
+            <div className="flex justify-end border-t border-line pt-4">
               <Button variant="primary" onClick={close}>
                 Done
               </Button>
@@ -447,8 +447,8 @@ export function ResetPasswordDialog({
               />
               <div className="mt-1 flex flex-wrap gap-2">
                 <Button
-                  variant="quiet"
-                  size="compact"
+                  variant="ghost"
+                  size="sm"
                   onClick={() => setPassword(generatePassword())}
                 >
                   Generate another
@@ -456,8 +456,8 @@ export function ResetPasswordDialog({
               </div>
             </Field>
 
-            <div className="mt-1 flex flex-wrap justify-end gap-2 border-t border-rail pt-4">
-              <Button variant="secondary" onClick={close}>
+            <div className="mt-1 flex flex-wrap justify-end gap-2 border-t border-line pt-4">
+              <Button variant="default" onClick={close}>
                 Cancel
               </Button>
               <Button variant="primary" type="submit" disabled={save.isPending}>

@@ -43,7 +43,7 @@ export function UsersScreen() {
   if (loading) {
     return (
       <main className="mx-auto w-full max-w-6xl px-4 py-8 sm:px-6">
-        <p className="text-[15px] text-ink-muted">Loading…</p>
+        <p className="text-[15px] text-ink-2">Loading…</p>
       </main>
     );
   }
@@ -52,11 +52,11 @@ export function UsersScreen() {
     return (
       <main className="mx-auto w-full max-w-6xl px-4 py-6 sm:px-6 sm:py-8">
         <h1 className="type-display text-[24px] leading-none">Users</h1>
-        <div className="mt-5 rounded-[6px] border border-dashed border-rail bg-panel/50 px-4 py-10 text-center">
+        <div className="mt-5 rounded-[10px] border border-dashed border-line bg-surface/50 px-4 py-10 text-center">
           <p className="text-[15px] text-ink">
             Users is not available to an agent session.
           </p>
-          <p className="mx-auto mt-2 max-w-lg text-[13px] leading-snug text-ink-muted">
+          <p className="mx-auto mt-2 max-w-lg text-[13px] leading-snug text-ink-2">
             Human identities and their roles are read and changed by a signed-in
             person. Ask your owner to sign in to this screen.
           </p>
@@ -83,7 +83,7 @@ export function UsersScreen() {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h1 className="type-display text-[24px] leading-none">Users</h1>
-          <p className="mt-2 max-w-2xl text-[13px] leading-snug text-ink-muted">
+          <p className="mt-2 max-w-2xl text-[13px] leading-snug text-ink-2">
             Humans who can sign in. Roles are fixed scope bundles: owner, operator,
             viewer.
           </p>
@@ -96,7 +96,7 @@ export function UsersScreen() {
       </div>
 
       {!canManage ? (
-        <p className="mt-3 text-[13px] text-ink-muted">
+        <p className="mt-3 text-[13px] text-ink-2">
           Your role can read the users but not change them.
         </p>
       ) : null}
@@ -105,9 +105,9 @@ export function UsersScreen() {
 
       <div className="mt-5 flex flex-col gap-2">
         {usersQuery.isPending ? (
-          <div className="h-[92px] rounded-[6px] border border-rail bg-panel/60" />
+          <div className="h-[92px] rounded-[10px] border border-line bg-surface/60" />
         ) : users.length === 0 ? (
-          <div className="rounded-[6px] border border-dashed border-rail bg-panel/50 px-4 py-10 text-center">
+          <div className="rounded-[10px] border border-dashed border-line bg-surface/50 px-4 py-10 text-center">
             <p className="text-[15px] text-ink">
               No users yet. Invite the first person who should sign in.
             </p>
@@ -142,7 +142,7 @@ export function UsersScreen() {
       {usersQuery.hasNextPage ? (
         <div className="mt-4 flex justify-center">
           <Button
-            variant="secondary"
+            variant="default"
             onClick={() => void usersQuery.fetchNextPage()}
             disabled={usersQuery.isFetchingNextPage}
           >

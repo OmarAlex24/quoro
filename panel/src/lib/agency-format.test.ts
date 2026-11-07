@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { describeSelector, expiryWords, formatDuration, shortHash, shortId } from './agency-format';
+import {
+  describeSelector,
+  expiryWords,
+  formatDuration,
+  initials,
+  shortHash,
+  shortId,
+} from './agency-format';
 
 describe('agency format', () => {
   it('formats durations in the largest units', () => {
@@ -32,5 +39,27 @@ describe('agency format', () => {
   it('shortens ids and hashes', () => {
     expect(shortId('agt_01JC9Z6Q5W8N3K4T7R2M1XHB0D')).toBe('agt_01JC9Z…');
     expect(shortHash('a'.repeat(56) + 'bbbbbbbb')).toBe('aaaaaaaa…bbbbbbbb');
+  });
+});
+
+describe('initials', () => {
+  it('takes the first and last word of a name', () => {
+    expect(initials('Omar Espinosa')).toBe('OE');
+    expect(initials('Ada King Lovelace')).toBe('AL');
+  });
+
+  it('takes two letters of a single word and upper-cases them', () => {
+    expect(initials('owner')).toBe('OW');
+    expect(initials('  x  ')).toBe('X');
+  });
+
+  it('drops the domain of an email and splits on dots and dashes', () => {
+    expect(initials('jane.doe@example.com')).toBe('JD');
+    expect(initials('on-call')).toBe('OC');
+  });
+
+  it('never returns nothing', () => {
+    expect(initials('')).toBe('?');
+    expect(initials('   ')).toBe('?');
   });
 });

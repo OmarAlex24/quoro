@@ -1,14 +1,18 @@
 import type { Vm, VmDesiredStatus, VmObservedStatus } from '../api/generated/model';
 
-/** The five colours a lamp can take, each naming a token in `styles.css`. */
+/**
+ * The five tones a lamp can take, each naming a state token in `styles.css`.
+ * Nobody can say what an `unknown` lamp is doing, so it takes the idle tone
+ * and the lamp draws its core hollow instead of borrowing a kind colour.
+ */
 export type LampTone = 'run' | 'shift' | 'fault' | 'idle' | 'unknown';
 
 export const LAMP_COLORS: Record<LampTone, string> = {
-  run: 'var(--color-lamp-run)',
-  shift: 'var(--color-lamp-shift)',
-  fault: 'var(--color-lamp-fault)',
-  idle: 'var(--color-lamp-idle)',
-  unknown: 'var(--color-lamp-unknown)',
+  run: 'var(--run)',
+  shift: 'var(--shift)',
+  fault: 'var(--fault)',
+  idle: 'var(--idle)',
+  unknown: 'var(--idle)',
 };
 
 /** Colour of the observed (core) state. */

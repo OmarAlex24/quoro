@@ -6,6 +6,7 @@ import { useListNodes } from '../api/generated/nodes/nodes';
 import { authEvents } from '../api/auth-store';
 import { useSession } from '../session';
 import { cn } from '../lib/utils';
+import { Avatar, QuoroMark } from './avatar';
 import { Button } from './ui/button';
 
 interface NavItem {
@@ -45,7 +46,7 @@ const AGENCY_SECTIONS: NavItem[] = [
 
 const roleLabel = (role: string) => role.charAt(0).toUpperCase() + role.slice(1);
 
-/** Panel-colour header: the nameplate, the sections and who is signed in. */
+/** The header: the mark, the sections and who is signed in. */
 export function ChassisHeader() {
   const { user } = useSession();
   const navigate = useNavigate();
@@ -86,20 +87,16 @@ export function ChassisHeader() {
         key={item.to}
         to={item.to}
         className={cn(
-          'flex items-center gap-1.5 border-b-2 pt-0.5 text-[14px] underline-offset-4 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt',
+          'flex items-center gap-1.5 border-b-2 pt-0.5 text-[14px] underline-offset-4 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent',
           active
-            ? 'border-cobalt text-ink'
-            : 'border-transparent text-ink-muted hover:border-rail hover:text-ink',
+            ? 'border-ink text-ink'
+            : 'border-transparent text-ink-2 hover:border-line-2 hover:text-ink',
         )}
         aria-current={active ? 'page' : undefined}
       >
         {item.label}
         {item.to === '/approvals' && pendingCount > 0 ? (
-          <span className="type-data inline-flex items-center gap-1 text-[12px] text-ink">
-            <span
-              aria-hidden="true"
-              className="inline-block h-2 w-2 rounded-full bg-lamp-shift"
-            />
+          <span className="type-data inline-grid h-[17px] min-w-[17px] place-items-center rounded-[4px] bg-fault px-1 text-[10.5px] font-[650] leading-none text-on-accent">
             {pendingCount}
             <span className="sr-only"> waiting</span>
           </span>
@@ -109,38 +106,42 @@ export function ChassisHeader() {
   };
 
   return (
-    <header className="border-b border-rail bg-panel">
+    <header className="border-b border-line bg-ground">
       <div className="mx-auto flex min-h-14 w-full max-w-6xl flex-wrap items-center gap-x-3 gap-y-1 px-4 py-1.5 sm:gap-x-4 sm:px-6">
-        <span className="type-display text-[18px] leading-none">Quoro</span>
-        <span aria-hidden="true" className="hidden h-5 w-px bg-rail sm:block" />
+        <span className="flex items-center gap-2">
+          <QuoroMark className="h-6 w-6" />
+          <span className="type-display text-[18px] leading-none">Quoro</span>
+        </span>
+        <span aria-hidden="true" className="hidden h-5 w-px bg-line sm:block" />
 
         <nav
           aria-label="Sections"
           className="flex flex-wrap items-stretch gap-x-4 gap-y-1 self-stretch"
         >
           {MACHINE_SECTIONS.map(sectionLink)}
-          <span aria-hidden="true" className="my-auto h-4 w-px bg-rail" />
+          <span aria-hidden="true" className="my-auto h-4 w-px bg-line" />
           {AGENCY_SECTIONS.map(sectionLink)}
         </nav>
 
-        <p className="type-data hidden min-w-0 truncate text-[13px] text-ink-muted xl:block">
+        <p className="type-data hidden min-w-0 truncate text-[13px] text-ink-2 xl:block">
           {clusterLine}
         </p>
         <div className="ml-auto flex items-center gap-2 sm:gap-3">
           <Link
             to="/account"
-            className="flex min-w-0 items-baseline gap-2 underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+            className="flex min-w-0 items-center gap-2 underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
           >
+            <Avatar kind="human" name={user.name} />
             <span className="type-body-medium max-w-[14rem] truncate text-[13px] text-ink">
               {user.name}
             </span>
-            <span className="type-body-medium text-[13px] text-ink-muted">
+            <span className="type-body-medium text-[13px] text-ink-2">
               {roleLabel(user.role)}
             </span>
           </Link>
-          <span aria-hidden="true" className="h-4 w-px bg-rail" />
+          <span aria-hidden="true" className="h-4 w-px bg-line" />
           <Button
-            variant="quiet"
+            variant="ghost"
             className="px-2.5"
             onClick={() => logoutMutation.mutate()}
             disabled={logoutMutation.isPending}

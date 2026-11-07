@@ -7,8 +7,8 @@ export function CopyButton({ value, label = 'Copy' }: { value: string; label?: s
   const [copied, setCopied] = useState(false);
   return (
     <Button
-      variant="quiet"
-      size="compact"
+      variant="ghost"
+      size="sm"
       aria-label={copied ? 'Copied' : label}
       onClick={() => {
         void navigator.clipboard?.writeText(value).then(() => {

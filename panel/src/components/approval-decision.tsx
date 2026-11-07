@@ -72,7 +72,7 @@ export function ApprovalDecision({
   const trimmed = note.trim();
 
   return (
-    <div className="border-t border-rail px-4 py-4 sm:px-5">
+    <div className="border-t border-line px-4 py-4 sm:px-5">
       {problem ? <ProblemBanner view={problem} className="mb-3" /> : null}
 
       <Field
@@ -126,24 +126,24 @@ export function ApprovalDecision({
             <div className="flex flex-col gap-3">
               {problem ? <ProblemBanner view={problem} /> : null}
               <p className="type-data text-[13px] leading-snug text-ink">
-                {approval.scope} on {approval.target.type}{' '}
-                <span title={approval.target.id}>{shortId(approval.target.id)}</span>
+                <span className="type-code">{approval.scope}</span> on {approval.target.type}{' '}
+                <span className="type-code" title={approval.target.id}>{shortId(approval.target.id)}</span>
               </p>
               {trimmed !== '' ? (
-                <p className="border-l-2 border-rail pl-3 text-[13px] leading-snug text-ink">
+                <p className="border-l-2 border-line pl-3 text-[13px] leading-snug text-ink">
                   Your note: {trimmed}
                 </p>
               ) : null}
-              <div className="mt-1 flex flex-wrap justify-end gap-2 border-t border-rail pt-4">
+              <div className="mt-1 flex flex-wrap justify-end gap-2 border-t border-line pt-4">
                 <Button
-                  variant="secondary"
+                  variant="default"
                   disabled={decide.isPending}
                   onClick={() => setConfirm(null)}
                 >
                   Cancel
                 </Button>
                 <Button
-                  variant={confirm === 'approve' ? 'primary' : 'danger'}
+                  variant={confirm === 'approve' ? 'primary' : 'danger-solid'}
                   disabled={decide.isPending}
                   onClick={() => decide.mutate(confirm)}
                 >

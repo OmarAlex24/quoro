@@ -80,7 +80,7 @@ export function VulnerabilityCountsLine({
             label={severityLabel(severity)}
           />
           <span className="type-data text-[13px] text-ink">{counts[severity]}</span>
-          <span className="text-[13px] text-ink-muted">
+          <span className="text-[13px] text-ink-2">
             {severityLabel(severity).toLowerCase()}
           </span>
         </li>
@@ -92,7 +92,7 @@ export function VulnerabilityCountsLine({
           label="Known exploited"
         />
         <span className="type-data text-[13px] text-ink">{counts.kev}</span>
-        <span className="text-[13px] text-ink-muted">KEV</span>
+        <span className="text-[13px] text-ink-2">KEV</span>
       </li>
     </ul>
   );
@@ -105,7 +105,7 @@ export function VulnIdLink({ vulnId }: { vulnId: string }) {
       href={`https://osv.dev/vulnerability/${vulnId}`}
       target="_blank"
       rel="noreferrer"
-      className="type-data text-[13px] text-ink underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+      className="type-code text-[12px] text-ink underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
     >
       {vulnId}
     </a>
@@ -114,7 +114,7 @@ export function VulnIdLink({ vulnId }: { vulnId: string }) {
 
 const KevMark = () => (
   <span
-    className="type-data text-[12px] font-medium text-lamp-fault"
+    className="type-data text-[12px] font-medium text-fault"
     title="In CISA's Known Exploited Vulnerabilities catalog"
   >
     KEV
@@ -131,10 +131,10 @@ export function VersionPair({
 }) {
   return (
     <>
-      <span className="type-data text-[13px] text-ink-muted">
+      <span className="type-data text-[13px] text-ink-2">
         installed {installed}
       </span>
-      <span className="type-data text-[13px] text-ink-muted">
+      <span className="type-data text-[13px] text-ink-2">
         {fixed === null ? 'no fix yet' : `fixed in ${fixed}`}
       </span>
     </>
@@ -167,14 +167,14 @@ function FindingRow({ finding }: { finding: VulnerabilityFinding }) {
           fixed={finding.fixed_version}
         />
         {resolved && finding.resolved_at !== null ? (
-          <span className="w-full text-[13px] leading-snug text-ink-muted">
+          <span className="w-full text-[13px] leading-snug text-ink-2">
             resolved {relativeTime(finding.resolved_at)}:{' '}
             {resolvedReasonWords(finding.resolved_reason)}
           </span>
         ) : null}
       </div>
       {finding.summary ? (
-        <p className="mt-1 text-[13px] leading-snug text-ink-muted">
+        <p className="mt-1 text-[13px] leading-snug text-ink-2">
           {finding.summary}
         </p>
       ) : null}
@@ -192,14 +192,14 @@ export function RebuildWithRefreshedBase({
   disabled = false,
   disabledReason = null,
   onStarted,
-  variant = 'secondary',
+  variant = 'default',
   className,
 }: {
   appId: string;
   disabled?: boolean;
   disabledReason?: string | null;
   onStarted?: () => void;
-  variant?: 'primary' | 'secondary';
+  variant?: 'primary' | 'default';
   className?: string;
 }) {
   const navigate = useNavigate();
@@ -243,7 +243,7 @@ export function RebuildWithRefreshedBase({
         {rebuild.isPending ? 'Starting…' : 'Rebuild with refreshed base'}
       </Button>
       {disabledReason ? (
-        <p className="max-w-[280px] text-[13px] leading-snug text-ink-muted">
+        <p className="max-w-[280px] text-[13px] leading-snug text-ink-2">
           {disabledReason}
         </p>
       ) : null}
@@ -295,7 +295,7 @@ function SectionBody({
       {notInventoried.length > 0 ? (
         <ul className="mt-1 flex flex-col gap-0.5">
           {notInventoried.map((kind) => (
-            <li key={kind} className="text-[13px] leading-snug text-ink-muted">
+            <li key={kind} className="text-[13px] leading-snug text-ink-2">
               Could not inventory: {kind}
             </li>
           ))}
@@ -305,10 +305,10 @@ function SectionBody({
       {data.length > 0 ? (
         <ul className="type-data mt-2 flex flex-col gap-0.5 text-[13px]">
           {data.map((source) => (
-            <li key={source.ecosystem} className="leading-snug text-ink-muted">
+            <li key={source.ecosystem} className="leading-snug text-ink-2">
               {dataAgeSentence(source)}
               {source.last_error ? (
-                <span className="block text-lamp-fault">{source.last_error}</span>
+                <span className="block text-fault">{source.last_error}</span>
               ) : null}
             </li>
           ))}
@@ -319,7 +319,7 @@ function SectionBody({
         <VulnerabilityCountsLine counts={counts} className="mt-3" />
       ) : null}
 
-      <div className="mt-4 flex flex-wrap items-end gap-x-4 gap-y-3 border-t border-rail pt-3">
+      <div className="mt-4 flex flex-wrap items-end gap-x-4 gap-y-3 border-t border-line pt-3">
         <Field label="Severity" htmlFor="vuln-severity" className="w-48">
           <Select
             value={severityFilter}
@@ -339,7 +339,7 @@ function SectionBody({
           <input
             id="vuln-kev"
             type="checkbox"
-            className="h-3.5 w-3.5 accent-cobalt"
+            className="h-3.5 w-3.5 accent-accent-solid"
             checked={kevOnly}
             onChange={(event) => onKevChange(event.target.checked)}
           />
@@ -349,7 +349,7 @@ function SectionBody({
           <input
             id="vuln-resolved"
             type="checkbox"
-            className="h-3.5 w-3.5 accent-cobalt"
+            className="h-3.5 w-3.5 accent-accent-solid"
             checked={includeResolved}
             onChange={(event) => onResolvedChange(event.target.checked)}
           />
@@ -359,16 +359,16 @@ function SectionBody({
 
       {items.length === 0 ? (
         filtersActive ? (
-          <p className="mt-3 text-[13px] text-ink-muted">
+          <p className="mt-3 text-[13px] text-ink-2">
             No findings match these filters.
           </p>
         ) : checked && openCount === 0 ? (
-          <p className="mt-3 text-[13px] text-ink-muted">
+          <p className="mt-3 text-[13px] text-ink-2">
             No known vulnerabilities in this image.
           </p>
         ) : null
       ) : (
-        <ul className="mt-3 flex flex-col divide-y divide-rail border-y border-rail">
+        <ul className="mt-3 flex flex-col divide-y divide-line border-y border-line">
           {items.map((finding) => (
             <FindingRow key={finding.id} finding={finding} />
           ))}
@@ -379,7 +379,7 @@ function SectionBody({
 
       {nextCursor !== null ? (
         <Button
-          variant="secondary"
+          variant="default"
           className="mt-3"
           disabled={loadMorePending}
           onClick={onLoadMore}
@@ -471,13 +471,13 @@ function AppVulnerabilitiesSection({
     : null;
 
   return (
-    <section className="mt-5 rounded-[6px] border border-rail bg-panel px-4 py-4 sm:px-5">
+    <section className="mt-5 rounded-[10px] border border-line bg-surface px-4 py-4 sm:px-5">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <h2 className="type-display-light text-[15px] leading-none text-ink">
           Vulnerabilities
         </h2>
         {report ? (
-          <span className="type-data text-[13px] text-ink-muted">
+          <span className="type-data text-[13px] text-ink-2">
             {openCount} open {openCount === 1 ? 'finding' : 'findings'}
           </span>
         ) : null}
@@ -486,7 +486,7 @@ function AppVulnerabilitiesSection({
       {error ? (
         <ProblemBanner view={error} className="mt-3" />
       ) : reportQuery.isPending ? (
-        <p className="mt-3 text-[13px] text-ink-muted">
+        <p className="mt-3 text-[13px] text-ink-2">
           Reading the vulnerability report…
         </p>
       ) : report === undefined ? null : (
@@ -510,7 +510,7 @@ function AppVulnerabilitiesSection({
           />
 
           {showRebuild ? (
-            <div className="mt-4 border-t border-rail pt-3">
+            <div className="mt-4 border-t border-line pt-3">
               <RebuildWithRefreshedBase
                 appId={app.id}
                 disabled={!canWrite}
@@ -520,7 +520,7 @@ function AppVulnerabilitiesSection({
             </div>
           ) : null}
           {showImageNote ? (
-            <p className="mt-4 border-t border-rail pt-3 text-[13px] leading-snug text-ink-muted">
+            <p className="mt-4 border-t border-line pt-3 text-[13px] leading-snug text-ink-2">
               This app runs an image Quoro did not build: deploy a patched image
               to fix these.
             </p>

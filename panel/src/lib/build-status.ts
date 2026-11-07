@@ -238,10 +238,21 @@ export const buildDurationLabel = (
  * return null for an image given by reference.
  */
 export const builtImageLabel = (image: string): string | null => {
+  const buildId = builtImageBuildId(image);
+  if (buildId === null) return null;
+  return buildId === '' ? 'built image' : `built image ${buildId}`;
+};
+
+/**
+ * The short build id inside a built image reference, so a view can set the
+ * words in the text face and only the id in the code face. An empty string
+ * when the reference has no tag; null for an image given by reference.
+ */
+export const builtImageBuildId = (image: string): string | null => {
   const prefix = 'build.quoro.invalid/';
   if (!image.startsWith(prefix)) return null;
   const tag = image.slice(image.lastIndexOf(':') + 1);
-  return tag === '' ? 'built image' : `built image ${shortBuildId(tag)}`;
+  return tag === '' ? '' : shortBuildId(tag);
 };
 
 /** The commit of the newest successful build, for the source plate. */

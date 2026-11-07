@@ -6,6 +6,7 @@ import {
   buildDurationSeconds,
   buildLampState,
   buildRail,
+  builtImageBuildId,
   builtImageLabel,
   BUILD_PHASES,
   formatBuildDuration,
@@ -164,6 +165,13 @@ describe('build facts', () => {
     );
     expect(builtImageLabel('docker.io/library/nginx:alpine')).toBeNull();
     expect(builtImageLabel('')).toBeNull();
+  });
+
+  it('takes the short build id out of a built image reference', () => {
+    expect(builtImageBuildId('build.quoro.invalid/app_ABC:bld_01JXYZ')).toBe('bld_01JXYZ…');
+    expect(builtImageBuildId('build.quoro.invalid/app_ABC:')).toBe('');
+    expect(builtImageBuildId('docker.io/library/nginx:alpine')).toBeNull();
+    expect(builtImageBuildId('')).toBeNull();
   });
 
   it('finds the newest successful commit', () => {

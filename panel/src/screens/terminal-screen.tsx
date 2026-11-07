@@ -13,7 +13,7 @@ const backToApp = (appId: string) => (
   <Link
     to="/apps/$appId"
     params={{ appId }}
-    className="text-[13px] text-ink-muted underline-offset-4 hover:text-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cobalt"
+    className="text-[13px] text-ink-2 underline-offset-4 hover:text-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
   >
     App
   </Link>
@@ -34,7 +34,7 @@ export function TerminalScreen() {
   if (loading) {
     return (
       <main className="mx-auto w-full max-w-5xl px-4 py-8 sm:px-6">
-        <p className="text-[15px] text-ink-muted">Loading…</p>
+        <p className="text-[15px] text-ink-2">Loading…</p>
       </main>
     );
   }
@@ -44,7 +44,7 @@ export function TerminalScreen() {
   if (appQuery.isPending) {
     return (
       <main className="mx-auto w-full max-w-5xl px-4 py-8 sm:px-6">
-        <div className="h-[180px] rounded-[6px] border border-rail bg-panel/60" />
+        <div className="h-[180px] rounded-[10px] border border-line bg-surface/60" />
       </main>
     );
   }
@@ -53,7 +53,7 @@ export function TerminalScreen() {
     return (
       <main className="mx-auto w-full max-w-5xl px-4 py-6 sm:px-6 sm:py-8">
         <ProblemBanner view={problemView(appQuery.error, 'see this app')} />
-        <Button variant="secondary" className="mt-4" asChild>
+        <Button variant="default" className="mt-4" asChild>
           <Link to="/">Back to apps</Link>
         </Button>
       </main>

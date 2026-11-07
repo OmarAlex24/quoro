@@ -210,7 +210,7 @@ export function WebhookDialog({
               secret={created.secret}
               note={SECRET_NOTE}
             />
-            <div className="flex justify-end border-t border-rail pt-4">
+            <div className="flex justify-end border-t border-line pt-4">
               <Button
                 variant="primary"
                 onClick={() => {
@@ -262,7 +262,7 @@ export function WebhookDialog({
             </Field>
 
             <div className="flex flex-col gap-1.5">
-              <span className="type-body-medium text-[13px] text-ink-muted">Events</span>
+              <span className="type-body-medium text-[13px] text-ink-2">Events</span>
               <WebhookEventPicker
                 id="webhook-events"
                 value={form.event_types}
@@ -271,7 +271,7 @@ export function WebhookDialog({
             </div>
 
             <div className="flex flex-col gap-1.5">
-              <span className="type-body-medium text-[13px] text-ink-muted">Resources</span>
+              <span className="type-body-medium text-[13px] text-ink-2">Resources</span>
               <SelectorEditor
                 id="webhook-selector"
                 value={form.selector}
@@ -282,22 +282,22 @@ export function WebhookDialog({
             <label className="inline-flex cursor-pointer items-center gap-2 text-[14px]">
               <input
                 type="checkbox"
-                className="h-4 w-4 accent-cobalt"
+                className="h-4 w-4 accent-accent-solid"
                 checked={form.enabled}
                 onChange={(event) => update({ enabled: event.target.checked })}
               />
               Deliver right away
             </label>
 
-            <fieldset className="rounded-[6px] border border-rail bg-recess/40 px-3.5 py-3">
-              <legend className="type-body-medium px-1 text-[13px] text-ink-muted">
+            <fieldset className="rounded-[10px] border border-line bg-sunk/40 px-3.5 py-3">
+              <legend className="type-body-medium px-1 text-[13px] text-ink-2">
                 Wake
               </legend>
               <div className="flex flex-col gap-3">
                 {mode === 'edit' && webhook?.wake ? (
                   <>
                     <p className="text-[14px]">Wakes an agent with an incident grant.</p>
-                    <p className="text-[13px] leading-snug text-ink-muted">
+                    <p className="text-[13px] leading-snug text-ink-2">
                       To stop waking the agent, delete this webhook and add it again.
                     </p>
                   </>
@@ -305,7 +305,7 @@ export function WebhookDialog({
                   <label className="inline-flex cursor-pointer items-center gap-2 text-[14px]">
                     <input
                       type="checkbox"
-                      className="h-4 w-4 accent-cobalt"
+                      className="h-4 w-4 accent-accent-solid"
                       checked={form.wake !== undefined}
                       onChange={(event) => toggleWake(event.target.checked)}
                     />
@@ -332,7 +332,7 @@ export function WebhookDialog({
                     </Field>
 
                     <div className="flex flex-col gap-1.5">
-                      <span className="type-body-medium text-[13px] text-ink-muted">
+                      <span className="type-body-medium text-[13px] text-ink-2">
                         Grant scopes
                       </span>
                       <ScopePicker
@@ -384,7 +384,7 @@ export function WebhookDialog({
                       </Field>
                     </div>
 
-                    <p className="text-[13px] leading-snug text-ink-muted">
+                    <p className="text-[13px] leading-snug text-ink-2">
                       Incident grants act on your behalf, carry only non-destructive
                       scopes, and end when the incident resolves.
                     </p>
@@ -394,13 +394,13 @@ export function WebhookDialog({
             </fieldset>
 
             {mode === 'edit' ? (
-              <p className="text-[13px] leading-snug text-ink-muted">
+              <p className="text-[13px] leading-snug text-ink-2">
                 To change the signing secret, delete this webhook and add it again.
               </p>
             ) : null}
 
-            <div className="flex flex-wrap justify-end gap-2 border-t border-rail pt-4">
-              <Button variant="secondary" onClick={() => close(false)}>
+            <div className="flex flex-wrap justify-end gap-2 border-t border-line pt-4">
+              <Button variant="default" onClick={() => close(false)}>
                 Cancel
               </Button>
               <Button variant="primary" type="submit" disabled={pending}>

@@ -63,9 +63,9 @@ export function AppDomains({
 
       {problem ? <ProblemBanner view={problem} className="mt-3" /> : null}
 
-      <ul className="mt-3 flex flex-col divide-y divide-rail border-y border-rail">
+      <ul className="mt-3 flex flex-col divide-y divide-line border-y border-line">
         {domains.length === 0 ? (
-          <li className="py-3 text-[13px] text-ink-muted">
+          <li className="py-3 text-[13px] text-ink-2">
             No domains yet. Add a hostname to route traffic to this app.
           </li>
         ) : (
@@ -77,8 +77,8 @@ export function AppDomains({
               <span className="type-data min-w-0 flex-1 truncate text-[14px] text-ink">
                 {domain.hostname}
               </span>
-              <span className="text-[13px] text-ink-muted">{tlsWords[domain.tls_mode]}</span>
-              <span className="inline-flex items-center gap-1.5 text-[13px] text-ink-muted">
+              <span className="text-[13px] text-ink-2">{tlsWords[domain.tls_mode]}</span>
+              <span className="inline-flex items-center gap-1.5 text-[13px] text-ink-2">
                 <ToneLamp
                   tone={certTone(domain.cert_status)}
                   size={13}
@@ -86,7 +86,7 @@ export function AppDomains({
                 />
                 {certWords[domain.cert_status]}
               </span>
-              <span className="inline-flex items-center gap-1.5 text-[13px] text-ink-muted">
+              <span className="inline-flex items-center gap-1.5 text-[13px] text-ink-2">
                 <ToneLamp
                   tone={servingTone(domain.serving_status)}
                   size={13}
@@ -96,7 +96,7 @@ export function AppDomains({
               </span>
               {canWrite ? (
                 <Button
-                  variant="quiet"
+                  variant="ghost"
                   className="px-2.5"
                   disabled={remove.isPending}
                   onClick={() => {
@@ -108,7 +108,7 @@ export function AppDomains({
                 </Button>
               ) : null}
               {domain.serving_status === 'unserved' && domain.last_error ? (
-                <p className="basis-full text-[13px] leading-snug text-lamp-fault">
+                <p className="basis-full text-[13px] leading-snug text-fault">
                   {domain.last_error}
                 </p>
               ) : null}
@@ -149,7 +149,7 @@ export function AppDomains({
             <option value="tunnel">Cloudflare Tunnel</option>
             <option value="acme">ACME certificate</option>
           </select>
-          <Button variant="secondary" type="submit" disabled={add.isPending}>
+          <Button variant="default" type="submit" disabled={add.isPending}>
             {add.isPending ? 'Adding…' : 'Add domain'}
           </Button>
         </form>

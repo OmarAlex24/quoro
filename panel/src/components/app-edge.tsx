@@ -31,14 +31,14 @@ export function AppEdgeBackends({
   if (backends.length === 0) return null;
 
   return (
-    <section className="mt-5 rounded-[6px] border border-rail bg-panel px-4 py-4 sm:px-5">
+    <section className="mt-5 rounded-[10px] border border-line bg-surface px-4 py-4 sm:px-5">
       <h2 className="type-display-light text-[15px] leading-none text-ink">
         Edge backends
       </h2>
-      <p className="mt-1.5 text-[13px] leading-snug text-ink-muted">
+      <p className="mt-1.5 text-[13px] leading-snug text-ink-2">
         How the edge that serves this app sees each instance.
       </p>
-      <ul className="mt-3 flex flex-col divide-y divide-rail border-y border-rail">
+      <ul className="mt-3 flex flex-col divide-y divide-line border-y border-line">
         {backends.map((backend) => {
           const state = backend.in_rotation ? 'In rotation' : 'Out of rotation';
           return (
@@ -52,28 +52,28 @@ export function AppEdgeBackends({
                 label={state}
               />
               <span
-                className="type-data min-w-0 flex-1 truncate text-[14px] text-ink"
+                className="type-code min-w-0 flex-1 truncate text-[12.5px] text-ink"
                 title={backend.vm_id}
               >
                 {shortVmId(backend.vm_id)}
               </span>
-              <span className="type-data text-[13px] text-ink-muted">
+              <span className="type-data text-[13px] text-ink-2">
                 node {nodeNames[backend.node_id] ?? backend.node_id}
               </span>
               <span className="type-data text-[13px] text-ink">{state}</span>
-              <span className="type-data text-[13px] text-ink-muted">
+              <span className="type-data text-[13px] text-ink-2">
                 since {relativeTime(backend.since)}
               </span>
               {!backend.in_rotation && backend.reason ? (
                 <span
-                  className="type-data text-[13px] text-ink-muted"
+                  className="type-data text-[13px] text-ink-2"
                   title={backend.reason}
                 >
                   {reasonWords(backend.reason)}
                 </span>
               ) : null}
               {!backend.in_rotation && backend.last_error ? (
-                <p className="basis-full text-[13px] leading-snug text-lamp-fault">
+                <p className="basis-full text-[13px] leading-snug text-fault">
                   {backend.last_error}
                 </p>
               ) : null}

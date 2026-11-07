@@ -28,7 +28,7 @@ const statusWords: Record<TapeStatus, string> = {
 };
 
 const RULING =
-  'repeating-linear-gradient(to bottom, transparent 0, transparent 19px, rgb(20 32 48 / 0.045) 19px, rgb(20 32 48 / 0.045) 20px)';
+  'repeating-linear-gradient(to bottom, transparent 0, transparent 19px, color-mix(in oklab, var(--line) 55%, transparent) 19px, color-mix(in oklab, var(--line) 55%, transparent) 20px)';
 
 /**
  * The recorder tape: a recessed bay holding light paper with a faint ruling
@@ -188,12 +188,12 @@ export function LogTape({ appId }: { appId: string }) {
 
         <div className="ml-auto flex flex-wrap items-center gap-1.5">
           {!follow ? (
-            <Button variant="quiet" className="px-2.5" onClick={jumpToNewest}>
+            <Button variant="ghost" className="px-2.5" onClick={jumpToNewest}>
               Jump to newest
             </Button>
           ) : null}
           <Button
-            variant="quiet"
+            variant="ghost"
             className="px-2.5"
             aria-pressed={follow}
             onClick={() => setFollow((current) => !current)}
@@ -201,20 +201,20 @@ export function LogTape({ appId }: { appId: string }) {
             Follow
           </Button>
           <Button
-            variant="quiet"
+            variant="ghost"
             className="px-2.5"
             aria-pressed={paused}
             onClick={togglePause}
           >
             {paused ? 'Resume' : 'Pause'}
           </Button>
-          <span className="type-data ml-1 text-[13px] text-ink-muted">
+          <span className="type-data ml-1 text-[13px] text-ink-2">
             {lines.length} {lines.length === 1 ? 'line' : 'lines'}
           </span>
         </div>
       </div>
 
-      <div className="mt-2 rounded-[6px] border border-rail bg-recess p-1.5 shadow-[inset_0_2px_6px_rgb(20_32_48_/_0.18)]">
+      <div className="mt-2 rounded-[10px] border border-line bg-sunk p-1.5">
         <div
           ref={tapeRef}
           role="log"
@@ -226,11 +226,11 @@ export function LogTape({ appId }: { appId: string }) {
               element.scrollHeight - element.scrollTop - element.clientHeight < 24;
             setFollow(atBottom);
           }}
-          className="h-[280px] overflow-y-auto bg-panel px-2 py-2 sm:h-[360px]"
+          className="h-[280px] overflow-y-auto bg-surface px-2 py-2 sm:h-[360px]"
           style={{ backgroundImage: RULING }}
         >
           {lines.length === 0 ? (
-            <p className="px-1 py-2 text-[13px] leading-snug text-ink-muted">
+            <p className="px-1 py-2 text-[13px] leading-snug text-ink-2">
               Waiting for output. Lines appear here as the app writes to stdout or stderr.
             </p>
           ) : (
@@ -245,16 +245,16 @@ export function LogTape({ appId }: { appId: string }) {
                 {entry.stream === 'stderr' ? (
                   <span
                     aria-hidden="true"
-                    className="absolute bottom-0 left-0 top-0 w-[3px] bg-lamp-fault"
+                    className="absolute bottom-0 left-0 top-0 w-[3px] bg-fault"
                   />
                 ) : null}
                 <span
-                  className="type-data truncate text-[12px] text-ink-muted"
+                  className="type-data truncate text-[12px] text-ink-2"
                   title={entry.time}
                 >
                   {formatLogTime(entry.time)}
                 </span>
-                <span className="whitespace-pre-wrap break-words font-mono text-[12.5px] text-ink">
+                <span className="type-code whitespace-pre-wrap break-words text-[11.5px] text-ink">
                   {entry.line}
                 </span>
               </div>

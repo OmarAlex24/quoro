@@ -94,7 +94,7 @@ export function AccountScreen() {
   if (loading) {
     return (
       <main className="mx-auto w-full max-w-6xl px-4 py-8 sm:px-6">
-        <p className="text-[15px] text-ink-muted">Loading…</p>
+        <p className="text-[15px] text-ink-2">Loading…</p>
       </main>
     );
   }
@@ -105,29 +105,29 @@ export function AccountScreen() {
     <main className="mx-auto w-full max-w-6xl px-4 py-6 sm:px-6 sm:py-8">
       <div>
         <h1 className="type-display text-[24px] leading-none">Your account</h1>
-        <p className="mt-2 max-w-2xl text-[13px] leading-snug text-ink-muted">
+        <p className="mt-2 max-w-2xl text-[13px] leading-snug text-ink-2">
           The identity this panel is signed in as, and the password it signs in
           with.
         </p>
       </div>
 
-      <section className="mt-5 rounded-[6px] border border-rail bg-panel px-4 py-4 bay-shadow sm:px-5">
-        <h2 className="type-body-medium text-[13px] text-ink-muted">Signed in as</h2>
+      <section className="mt-5 rounded-[10px] border border-line bg-surface px-4 py-4 card-sheen sm:px-5">
+        <h2 className="type-body-medium text-[13px] text-ink-2">Signed in as</h2>
         <dl className="mt-3 grid gap-x-6 gap-y-3 sm:grid-cols-[8rem_1fr]">
-          <dt className="text-[13px] text-ink-muted">Name</dt>
+          <dt className="text-[13px] text-ink-2">Name</dt>
           <dd className="text-[15px] text-ink">{user.name}</dd>
-          <dt className="text-[13px] text-ink-muted">Email</dt>
+          <dt className="text-[13px] text-ink-2">Email</dt>
           <dd className="break-all text-[15px] text-ink">{user.email}</dd>
-          <dt className="text-[13px] text-ink-muted">Role</dt>
+          <dt className="text-[13px] text-ink-2">Role</dt>
           <dd className="text-[15px] text-ink">
             {user.role.charAt(0).toUpperCase() + user.role.slice(1)}
           </dd>
         </dl>
       </section>
 
-      <section className="mt-4 rounded-[6px] border border-rail bg-panel px-4 py-4 bay-shadow sm:px-5">
+      <section className="mt-4 rounded-[10px] border border-line bg-surface px-4 py-4 card-sheen sm:px-5">
         <h2 className="type-display text-[18px] leading-tight">Change password</h2>
-        <p className="mt-1 max-w-2xl text-[13px] leading-snug text-ink-muted">
+        <p className="mt-1 max-w-2xl text-[13px] leading-snug text-ink-2">
           Your other panel sessions are signed out; this one stays signed in.
         </p>
 
@@ -135,7 +135,7 @@ export function AccountScreen() {
           <p
             role="status"
             aria-live="polite"
-            className="mt-4 rounded-[6px] border border-rail border-l-4 border-l-lamp-run bg-panel px-3.5 py-2.5 text-[15px] leading-snug text-ink"
+            className="mt-4 rounded-[10px] border border-line border-l-4 border-l-run bg-surface px-3.5 py-2.5 text-[15px] leading-snug text-ink"
           >
             Password changed. Your other sessions were signed out.
           </p>
@@ -149,7 +149,7 @@ export function AccountScreen() {
             htmlFor="account-current-password"
             hint={
               fieldErrors.current ? (
-                <span className="text-lamp-fault">{fieldErrors.current}</span>
+                <span className="text-fault">{fieldErrors.current}</span>
               ) : undefined
             }
           >
@@ -169,7 +169,7 @@ export function AccountScreen() {
             htmlFor="account-new-password"
             hint={
               fieldErrors.next ? (
-                <span className="text-lamp-fault">{fieldErrors.next}</span>
+                <span className="text-fault">{fieldErrors.next}</span>
               ) : (
                 'At least 12 characters.'
               )
@@ -192,7 +192,7 @@ export function AccountScreen() {
             htmlFor="account-repeat-password"
             hint={
               fieldErrors.repeat ? (
-                <span className="text-lamp-fault">{fieldErrors.repeat}</span>
+                <span className="text-fault">{fieldErrors.repeat}</span>
               ) : undefined
             }
           >
@@ -207,7 +207,7 @@ export function AccountScreen() {
             />
           </Field>
 
-          <div className="mt-1 border-t border-rail pt-4">
+          <div className="mt-1 border-t border-line pt-4">
             <Button variant="primary" type="submit" disabled={change.isPending}>
               {change.isPending ? 'Changing…' : 'Change password'}
             </Button>

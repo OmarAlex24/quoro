@@ -10,11 +10,12 @@ import {
   stopVm,
   useListVms,
 } from '../api/generated/vms/vms';
-import { countVms, LAMP_COLORS, listIsConverging } from '../lib/lamp';
+import { countVms, listIsConverging, type LampTone } from '../lib/lamp';
 import { canViewConsole } from '../lib/capabilities';
 import { problemView, type ProblemView } from '../lib/problem';
 import { useSession } from '../session';
 import { CreateVmDialog } from '../components/create-vm-dialog';
+import { LampDot } from '../components/lamp';
 import { Button } from '../components/ui/button';
 import { ProblemBanner, NoticeLine } from '../components/ui/problem-banner';
 import { VmBay } from '../components/vm-bay';
@@ -43,21 +44,17 @@ const actionPhrase: Record<ActionKind, string> = {
 };
 
 function CountLamp({
-  color,
+  tone,
   value,
   label,
 }: {
-  color: string;
+  tone: LampTone;
   value: number;
   label: string;
 }) {
   return (
     <span className="inline-flex items-center gap-1.5">
-      <span
-        aria-hidden="true"
-        className="inline-block h-2.5 w-2.5 rounded-full border-2"
-        style={{ borderColor: color }}
-      />
+      <LampDot ring={tone} core={tone} size={12} />
       <span className="type-data">
         {value} {label}
       </span>
@@ -105,7 +102,7 @@ export function VmsScreen() {
   if (loading) {
     return (
       <main className="mx-auto w-full max-w-6xl px-4 py-8 sm:px-6">
-        <p className="text-[15px] text-ink-muted">Loading…</p>
+        <p className="text-[15px] text-ink-2">Loading…</p>
       </main>
     );
   }
@@ -142,12 +139,12 @@ export function VmsScreen() {
         ) : null}
       </div>
 
-      <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px] text-ink-muted">
-        <CountLamp color={LAMP_COLORS.run} value={counts.running} label="running" />
+      <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px] text-ink-2">
+        <CountLamp tone="run" value={counts.running} label="running" />
         <span aria-hidden="true">·</span>
-        <CountLamp color={LAMP_COLORS.idle} value={counts.stopped} label="stopped" />
+        <CountLamp tone="idle" value={counts.stopped} label="stopped" />
         <span aria-hidden="true">·</span>
-        <CountLamp color={LAMP_COLORS.fault} value={counts.crashed} label="crashed" />
+        <CountLamp tone="fault" value={counts.crashed} label="crashed" />
       </div>
 
       {notice ? <div className="mt-2">{<NoticeLine>{notice}</NoticeLine>}</div> : null}
@@ -156,9 +153,9 @@ export function VmsScreen() {
 
       <div className="mt-5 flex flex-col gap-2">
         {vmsQuery.isPending ? (
-          <div className="h-[104px] rounded-[6px] border border-rail bg-panel/60" />
+          <div className="h-[104px] rounded-[10px] border border-line bg-surface/60" />
         ) : vms.length === 0 ? (
-          <div className="rounded-[6px] border border-dashed border-rail bg-panel/50 px-4 py-10 text-center">
+          <div className="rounded-[10px] border border-dashed border-line bg-surface/50 px-4 py-10 text-center">
             <p className="text-[15px] text-ink">
               No VMs yet. Create one to boot a microVM on {emptyNodeName}.
             </p>

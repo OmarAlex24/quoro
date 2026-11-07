@@ -49,17 +49,17 @@ function KeyRow({
         <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
           <span className="type-body-medium text-[14px] text-ink">{statusWords}</span>
           <span className="inline-flex min-w-0 items-center gap-1">
-            <span className="type-data text-[13px] text-ink" title={agentKey.id}>
+            <span className="type-code text-[12px] text-ink" title={agentKey.id}>
               {shortId(agentKey.id)}
             </span>
             <CopyButton value={agentKey.id} label="Copy key id" />
           </span>
-          <span className="type-data text-[13px] text-ink-muted" title={agentKey.created_at}>
+          <span className="type-data text-[13px] text-ink-2" title={agentKey.created_at}>
             created {relativeTime(agentKey.created_at)}
           </span>
         </div>
 
-        <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px] text-ink-muted">
+        <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px] text-ink-2">
           <span className="type-data">
             {agentKey.last_used_at
               ? `last used ${relativeTime(agentKey.last_used_at)}`
@@ -74,7 +74,7 @@ function KeyRow({
       </div>
 
       {canWrite && !revoked ? (
-        <Button variant="danger" size="compact" className="ml-auto" onClick={() => onRevoke(agentKey)}>
+        <Button variant="danger" size="sm" className="ml-auto" onClick={() => onRevoke(agentKey)}>
           Revoke
         </Button>
       ) : null}
@@ -149,7 +149,7 @@ export function AgentKeys({
   return (
     <section>
       <h2 className="type-display-light text-[15px] leading-none text-ink">Keys</h2>
-      <p className="mt-2 text-[13px] leading-snug text-ink-muted">
+      <p className="mt-2 text-[13px] leading-snug text-ink-2">
         A key only mints 5-minute access tokens; what the agent may do comes from its grants.
       </p>
 
@@ -168,15 +168,15 @@ export function AgentKeys({
             note="Copy it now. Quoro shows it only once."
           />
           <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-            <span className="type-data text-[13px] text-ink" title={created.id}>
+            <span className="type-code text-[12px] text-ink" title={created.id}>
               {shortId(created.id)}
             </span>
             <CopyButton value={created.id} label="Copy key id" />
-            <span className="text-[13px] text-ink-muted" title={created.created_at}>
+            <span className="text-[13px] text-ink-2" title={created.created_at}>
               created {relativeTime(created.created_at)}
             </span>
             <Button
-              variant="secondary"
+              variant="default"
               onClick={() => {
                 setNotice(null);
                 setProblem(null);
@@ -192,13 +192,13 @@ export function AgentKeys({
       {listError ? (
         <ProblemBanner view={listError} className="mt-2" />
       ) : keys.isPending ? (
-        <p className="mt-3 text-[13px] text-ink-muted">Loading keys…</p>
+        <p className="mt-3 text-[13px] text-ink-2">Loading keys…</p>
       ) : items.length === 0 ? (
-        <p className="mt-3 border-y border-rail py-3 text-[13px] text-ink-muted">
+        <p className="mt-3 border-y border-line py-3 text-[13px] text-ink-2">
           No keys yet
         </p>
       ) : (
-        <ul className="mt-3 flex flex-col divide-y divide-rail border-y border-rail">
+        <ul className="mt-3 flex flex-col divide-y divide-line border-y border-line">
           {items.map((agentKey) => (
             <KeyRow
               key={agentKey.id}
@@ -229,7 +229,7 @@ export function AgentKeys({
           >
             {create.isPending ? 'Creating…' : 'Create a key'}
           </Button>
-          <p className="text-[13px] text-ink-muted">
+          <p className="text-[13px] text-ink-2">
             Use a new key per agent host, so revoking one leaves the others working.
           </p>
         </div>
@@ -258,9 +258,9 @@ export function AgentKeys({
               Tokens this key already minted stop working within 5 minutes. The agent needs
               another key to mint new ones.
             </p>
-            <div className="flex flex-wrap justify-end gap-2 border-t border-rail pt-4">
+            <div className="flex flex-wrap justify-end gap-2 border-t border-line pt-4">
               <Button
-                variant="secondary"
+                variant="default"
                 disabled={revoke.isPending}
                 onClick={() => {
                   setRevokeTarget(null);
@@ -270,7 +270,7 @@ export function AgentKeys({
                 Keep key
               </Button>
               <Button
-                variant="danger"
+                variant="danger-solid"
                 disabled={revoke.isPending}
                 onClick={() => {
                   if (revokeTarget) revoke.mutate(revokeTarget.id);
