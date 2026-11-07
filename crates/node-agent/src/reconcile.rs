@@ -1196,14 +1196,29 @@ impl<E: Engine + 'static> Reconciler<E> {
                         return true;
                     };
                     if unexpected_exit {
-                        if let Some(code) = info.exit_code
-                            && let Err(e) = self
+                        // The engine's start bound counts from the call, and
+                        // the permit must cover no more than that bound
+                        // (section 6.4, ADR 0242): a store write that waits
+                        // must not sit between the lease check and the start.
+                        // So the permit is taken again after it.
+                        let permit = if let Some(code) = info.exit_code {
+                            drop(permit);
+                            if let Err(e) = self
                                 .store
                                 .set_exit_code(&vm_id, Some(i64::from(code)))
                                 .await
-                        {
-                            warn!(vm_id, error = %e, "could not record the exit code");
-                        }
+                            {
+                                warn!(vm_id, error = %e, "could not record the exit code");
+                            }
+                            let Some(permit) = self.start_permit(vm).await else {
+                                debug!(vm_id, "the lease was lost before the start; the VM waits");
+                                self.remember(&vm_id, info.state);
+                                return true;
+                            };
+                            permit
+                        } else {
+                            permit
+                        };
                         match self
                             .crash_restart(&vm_id, &id, info.exit_code, permit)
                             .await
