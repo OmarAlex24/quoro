@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -23,7 +23,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::ch::api::ApiClient;
+use crate::ch::api::{ApiClient, ApiError};
 use crate::ch::net::{self, Subnet};
 use crate::ch::state::{
     self, ExitRecord, ExitState, SpecRecord, VmPaths, VmmRecord, ms_to_system_time, now_ms,
@@ -128,6 +128,9 @@ pub(super) struct Inner {
     /// The snapshot files the start-up sweep left, or `None` when it did not
     /// run (§3.16).
     pub(super) snapshots_at_start: Option<std::collections::BTreeSet<String>>,
+    /// How many starts each volume's VMs made, which a `PauseCopy` snapshot
+    /// compares before and after its copy (§3.16, #583).
+    pub(super) volume_starts: Arc<super::volume::VolumeStarts>,
 }
 
 /// A TAP whose `create` has not finished yet, and what its bridge sets need.
@@ -158,13 +161,21 @@ pub(super) struct VmEntry {
     pub(super) id: VmId,
     pub(super) paths: VmPaths,
     /// Serializes create, start, stop, delete, pause and resume on this id,
-    /// a `PauseCopy` snapshot's pause and resume included. It is shared so a
+    /// a `PauseCopy` snapshot's pause and resume included, and the snapshot's
+    /// reads of `starts` before and after its copy. It is shared so a
     /// forced stop's own task can hold it (§3.8, §4).
     pub(super) op: Arc<Mutex<()>>,
     /// The live VMM handle, while the process exists.
     pub(super) vmm: StdMutex<Option<Vmm>>,
     /// `/vm.boot` succeeded for the current VMM process.
     pub(super) booted: AtomicBool,
+    /// How many starts were about to send `/vm.boot` to a VMM of this VM,
+    /// counted under its operation lock before the guest can run, together
+    /// with its volumes' starts ([`super::volume::VolumeStarts`]). A
+    /// `PauseCopy` snapshot that copies a volume without a pause compares it
+    /// before and after the copy, since a guest that started meanwhile may
+    /// have written to the volume (§3.16, #583).
+    starts: AtomicU64,
     /// A stop was requested for the current VMM. The supervisor reads it with
     /// the `stop_requested` marker file, so an exit after a stop is a stop
     /// even when the marker could not be written (§3.8, #434).
@@ -198,6 +209,7 @@ impl VmEntry {
             op: Arc::new(Mutex::new(())),
             vmm: StdMutex::new(None),
             booted: AtomicBool::new(false),
+            starts: AtomicU64::new(0),
             stop_requested: AtomicBool::new(false),
             force_waiting: watch::channel(0).0,
             phase: StdMutex::new(Phase::Idle),
@@ -210,6 +222,19 @@ impl VmEntry {
 
     fn phase(&self) -> Phase {
         *lock(&self.phase)
+    }
+
+    /// How many starts were about to send `/vm.boot` to a VMM of this VM
+    /// (§3.16).
+    pub(super) fn starts(&self) -> u64 {
+        self.starts.load(Ordering::SeqCst)
+    }
+
+    /// Counts a start, under the VM's operation lock and before the guest can
+    /// run, so a `PauseCopy` snapshot sees it (§3.16, #583). Only
+    /// [`super::volume::VolumeStarts::count`] calls it, with the VM's volumes.
+    pub(super) fn count_start(&self) {
+        self.starts.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Resolves once a forced stop of this VM waits for its lock. A short
@@ -372,6 +397,7 @@ impl Inner {
             pool_grow: Mutex::new(()),
             peers_sync: Mutex::new(()),
             snapshots_at_start,
+            volume_starts: Arc::default(),
         });
         inner.rediscover(&vms_root).await?;
         Ok(inner)
@@ -960,11 +986,7 @@ impl Inner {
             }
             return Err(EngineError::Timeout);
         }
-        if let Err(err) = ApiClient::new(&entry.paths.api_socket)
-            .by(deadline)
-            .boot()
-            .await
-        {
+        if let Err(err) = counted_boot(entry, &self.volume_starts, &record, deadline).await {
             let _ = vmm.sigkill();
             let _ = wait_settled(entry, SETTLE_AFTER_SIGKILL).await;
             return Err(EngineError::Hypervisor(format!(
@@ -2403,6 +2425,23 @@ async fn wait_settled(entry: &VmEntry, timeout: Duration) -> bool {
     )
 }
 
+/// Counts a start of the VM and of the volumes its spec `record` attaches,
+/// and sends `/vm.boot` by `deadline`, with the VM's lock held. The start is
+/// counted first: a boot whose answer is lost may still have run the guest,
+/// which a `PauseCopy` snapshot must see (§3.16, #583).
+async fn counted_boot(
+    entry: &VmEntry,
+    starts: &super::volume::VolumeStarts,
+    record: &SpecRecord,
+    deadline: Instant,
+) -> Result<(), ApiError> {
+    starts.count_record(entry, record);
+    ApiClient::new(&entry.paths.api_socket)
+        .by(deadline)
+        .boot()
+        .await
+}
+
 /// True when the VMM reports the VM `Paused` (§3.22). An unanswered probe
 /// reads as not paused, so the stop asks the guest as before.
 async fn is_paused(socket: &Path) -> bool {
@@ -3059,7 +3098,8 @@ mod tests {
     async fn snapshot_of(vm: &StandIn, clone: &Path) -> Result<Duration, EngineError> {
         let (source, _) = volume_files(vm);
         crate::ch::volume::pause_and_copy(
-            &[Arc::clone(&vm.entry)],
+            &|| vec![Arc::clone(&vm.entry)],
+            &crate::ch::volume::VolumeStarts::default(),
             &vol_1(),
             &source,
             clone,
@@ -3098,10 +3138,17 @@ mod tests {
             let vms = vec![Arc::clone(&vm.entry)];
             let (source, clone) = (source.clone(), clone.clone());
             tokio::spawn(async move {
-                crate::ch::volume::pause_and_copy(&vms, &vol_1(), &source, &clone, move |s, c| {
-                    *lock(&seen) = Some((entry.op.try_lock().is_ok(), recorded_pause(&entry)));
-                    plain_copy(s, c)
-                })
+                crate::ch::volume::pause_and_copy(
+                    &|| vms.clone(),
+                    &crate::ch::volume::VolumeStarts::default(),
+                    &vol_1(),
+                    &source,
+                    &clone,
+                    move |s, c| {
+                        *lock(&seen) = Some((entry.op.try_lock().is_ok(), recorded_pause(&entry)));
+                        plain_copy(s, c)
+                    },
+                )
                 .await
             })
         };
@@ -3143,7 +3190,11 @@ mod tests {
 
         let (copying, copy_started) = std::sync::mpsc::channel();
         let snapshot = tokio::spawn(crate::ch::volume::spawn_pause_copy(
-            vec![Arc::clone(&vm.entry)],
+            {
+                let entry = Arc::clone(&vm.entry);
+                move || vec![Arc::clone(&entry)]
+            },
+            Arc::default(),
             vol_1(),
             source,
             clone.clone(),
@@ -3182,7 +3233,11 @@ mod tests {
 
         // The task starts at once; the result is never polled for.
         let snapshot = crate::ch::volume::spawn_pause_copy(
-            vec![Arc::clone(&vm.entry)],
+            {
+                let entry = Arc::clone(&vm.entry);
+                move || vec![Arc::clone(&entry)]
+            },
+            Arc::default(),
             vol_1(),
             source,
             clone.clone(),
@@ -3205,7 +3260,8 @@ mod tests {
         let (source, clone) = volume_files(&vm);
 
         let failed = crate::ch::volume::pause_and_copy(
-            &[Arc::clone(&vm.entry)],
+            &|| vec![Arc::clone(&vm.entry)],
+            &crate::ch::volume::VolumeStarts::default(),
             &vol_1(),
             &source,
             &clone,
@@ -3289,7 +3345,8 @@ mod tests {
 
         let entry = Arc::clone(&vm.entry);
         let failed = crate::ch::volume::pause_and_copy(
-            &[Arc::clone(&vm.entry)],
+            &|| vec![Arc::clone(&vm.entry)],
+            &crate::ch::volume::VolumeStarts::default(),
             &vol_1(),
             &source,
             &clone,
@@ -3324,7 +3381,8 @@ mod tests {
 
         let (entry, restarted) = (Arc::clone(&vm.entry), next.vmm.clone());
         let failed = crate::ch::volume::pause_and_copy(
-            &[Arc::clone(&vm.entry)],
+            &|| vec![Arc::clone(&vm.entry)],
+            &crate::ch::volume::VolumeStarts::default(),
             &vol_1(),
             &source,
             &clone,
@@ -3390,6 +3448,255 @@ mod tests {
         assert!(clone.exists());
     }
 
+    /// Section 3.16, #583: a VM that attaches the volume and starts during a
+    /// copy without a pause may write to the volume while it is copied, so
+    /// the snapshot is `Conflict` and leaves no file.
+    #[tokio::test]
+    async fn a_vm_started_during_a_copy_without_a_pause_is_conflict() {
+        let (vm, api) = booted("snapboot", "Running", Faults::default());
+        vm.entry.booted.store(false, Ordering::SeqCst);
+        let (source, clone) = volume_files(&vm);
+        let starts = Arc::new(crate::ch::volume::VolumeStarts::default());
+
+        let (entry, during) = (Arc::clone(&vm.entry), Arc::clone(&starts));
+        let failed = crate::ch::volume::pause_and_copy(
+            &|| vec![Arc::clone(&vm.entry)],
+            &starts,
+            &vol_1(),
+            &source,
+            &clone,
+            move |s, c| {
+                let copied = plain_copy(s, c);
+                // A start counts under the VM's lock, before its boot.
+                let _op = entry.op.blocking_lock();
+                during.count(&entry, &["vol_1"]);
+                entry.booted.store(true, Ordering::SeqCst);
+                copied
+            },
+        )
+        .await;
+        assert!(
+            matches!(failed, Err(EngineError::Conflict(_))),
+            "{failed:?}"
+        );
+        assert!(api.calls().is_empty(), "nothing was paused");
+        assert!(!clone.exists(), "the copy is not kept");
+    }
+
+    /// #583: a start is counted before `/vm.boot` is sent, the VM's own
+    /// starts and those of its volumes, so a boot that fails, or whose answer
+    /// is lost, still counts.
+    #[tokio::test]
+    async fn a_start_counts_before_its_boot_is_sent() {
+        let vm = StandIn::new("bootcount");
+        let api = StatefulApi::serve(&vm.entry.paths.api_socket, "Created", Faults::default());
+        let starts = crate::ch::volume::VolumeStarts::default();
+        let record = {
+            use crate::ch::volume::tests::{attach, spec};
+            let spec = spec(vec![
+                attach("vol_1", "quoro-vol-0"),
+                attach("vol_2", "quoro-vol-1"),
+            ]);
+            SpecRecord::new(&spec, "tap0", "br-quoro")
+        };
+        assert_eq!(vm.entry.starts(), 0);
+        let by = Instant::now() + Duration::from_secs(5);
+        let booted = counted_boot(&vm.entry, &starts, &record, by).await;
+        assert!(booted.is_err(), "the stand-in does not boot");
+        assert_eq!(api.calls(), ["vm.boot"]);
+        assert_eq!(vm.entry.starts(), 1);
+        assert_eq!(starts.of(&vol_1()), 1);
+        assert_eq!(starts.of(&crate::VolumeId("vol_2".to_owned())), 1);
+    }
+
+    /// A start that holds the VM's lock when the copy ends is waited out:
+    /// the snapshot compares the VM's starts only once it has the lock.
+    #[tokio::test]
+    async fn a_start_under_way_when_the_copy_ends_is_waited_out() {
+        let vm = StandIn::new("snapwait");
+        let (source, clone) = volume_files(&vm);
+        let starts = Arc::new(crate::ch::volume::VolumeStarts::default());
+
+        let (entry, during) = (Arc::clone(&vm.entry), Arc::clone(&starts));
+        let failed = crate::ch::volume::pause_and_copy(
+            &|| vec![Arc::clone(&vm.entry)],
+            &starts,
+            &vol_1(),
+            &source,
+            &clone,
+            move |s, c| {
+                let copied = plain_copy(s, c);
+                // A start takes the lock as the copy ends and counts itself
+                // a little later, before its boot.
+                let op = Arc::clone(&entry.op).blocking_lock_owned();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(300));
+                    during.count(&entry, &["vol_1"]);
+                    drop(op);
+                });
+                copied
+            },
+        )
+        .await;
+        assert!(
+            matches!(failed, Err(EngineError::Conflict(_))),
+            "{failed:?}"
+        );
+        assert!(!clone.exists());
+    }
+
+    /// A VM created during the copy that attaches the volume counts too,
+    /// though the snapshot did not list it: the volume's starts grow by more
+    /// than the listed VMs' own. One that was not started leaves the copy as
+    /// it is; one that was started makes it `Conflict`.
+    #[tokio::test]
+    async fn a_vm_created_during_the_copy_counts_once_it_started() {
+        let old = StandIn::new("snapold");
+        let new = StandIn::new("snapnew");
+        let (source, clone) = volume_files(&old);
+        let starts = Arc::new(crate::ch::volume::VolumeStarts::default());
+
+        let pause = crate::ch::volume::pause_and_copy(
+            &|| vec![Arc::clone(&old.entry)],
+            &starts,
+            &vol_1(),
+            &source,
+            &clone,
+            plain_copy,
+        )
+        .await
+        .expect("a VM that did not start leaves the copy");
+        assert_eq!(pause, Duration::ZERO);
+        assert!(clone.exists());
+
+        std::fs::remove_file(&clone).expect("remove");
+        let (entry, during) = (Arc::clone(&new.entry), Arc::clone(&starts));
+        let failed = crate::ch::volume::pause_and_copy(
+            &|| vec![Arc::clone(&old.entry)],
+            &starts,
+            &vol_1(),
+            &source,
+            &clone,
+            move |s, c| {
+                during.count(&entry, &["vol_1"]);
+                plain_copy(s, c)
+            },
+        )
+        .await;
+        assert!(
+            matches!(failed, Err(EngineError::Conflict(_))),
+            "{failed:?}"
+        );
+        assert!(!clone.exists());
+    }
+
+    /// #583: a VM that attaches the volume and is created, started, stopped
+    /// and deleted again, all during a copy without a pause, makes it
+    /// `Conflict` too: no list of the VMs after the copy holds it, but the
+    /// volume's starts still tell.
+    #[tokio::test]
+    async fn a_vm_created_started_and_deleted_during_the_copy_is_conflict() {
+        let vm = StandIn::new("snapgone");
+        let (source, clone) = volume_files(&vm);
+        let starts = Arc::new(crate::ch::volume::VolumeStarts::default());
+
+        let during = Arc::clone(&starts);
+        let failed = crate::ch::volume::pause_and_copy(
+            &|| vec![Arc::clone(&vm.entry)],
+            &starts,
+            &vol_1(),
+            &source,
+            &clone,
+            move |s, c| {
+                let copied = plain_copy(s, c);
+                let gone = StandIn::new("snapgoneother");
+                during.count(&gone.entry, &["vol_1"]);
+                // Its guest stops and the VM is deleted before the copy ends.
+                drop(gone);
+                copied
+            },
+        )
+        .await;
+        assert!(
+            matches!(failed, Err(EngineError::Conflict(_))),
+            "{failed:?}"
+        );
+        assert!(!clone.exists(), "the copy is not kept");
+    }
+
+    /// #583: a listed VM whose start lands after the listing but before the
+    /// snapshot holds its lock is running when the snapshot looks, so it is
+    /// paused for the copy, and the copy is kept: only a start the snapshot
+    /// did not see under the VM's lock counts.
+    #[tokio::test]
+    async fn a_listed_vm_started_before_its_pause_leaves_the_copy() {
+        let (vm, api) = booted("snapearly", "Running", Faults::default());
+        vm.entry.booted.store(false, Ordering::SeqCst);
+        let (source, clone) = volume_files(&vm);
+        let starts = Arc::new(crate::ch::volume::VolumeStarts::default());
+
+        // A start holds the VM's lock; it counts itself once the snapshot
+        // has listed the VM and waits for that lock. The snapshot lists the
+        // VM before its first await, and this current-thread runtime runs the
+        // start's task only then.
+        let op = Arc::clone(&vm.entry.op).lock_owned().await;
+        let start = {
+            let (entry, during) = (Arc::clone(&vm.entry), Arc::clone(&starts));
+            tokio::spawn(async move {
+                during.count(&entry, &["vol_1"]);
+                entry.booted.store(true, Ordering::SeqCst);
+                drop(op);
+            })
+        };
+        let pause = crate::ch::volume::pause_and_copy(
+            &|| vec![Arc::clone(&vm.entry)],
+            &starts,
+            &vol_1(),
+            &source,
+            &clone,
+            plain_copy,
+        )
+        .await
+        .expect("a start before the pause leaves the copy");
+        start.await.expect("task");
+        assert!(pause > Duration::ZERO);
+        assert_eq!(api.calls(), ["vm.info", "vm.pause", "vm.resume"]);
+        assert!(clone.exists());
+        assert_eq!(starts.of(&vol_1()), 1);
+    }
+
+    /// With a VM paused for the copy, another VM that attaches the volume and
+    /// starts during the copy still makes it `Conflict`, and the paused VM is
+    /// resumed first.
+    #[tokio::test]
+    async fn a_second_vm_started_during_a_paused_copy_is_conflict() {
+        let (vm, api) = booted("snappaused", "Running", Faults::default());
+        let other = StandIn::new("snapother2");
+        let (source, clone) = volume_files(&vm);
+        let starts = Arc::new(crate::ch::volume::VolumeStarts::default());
+
+        let (entry, during) = (Arc::clone(&other.entry), Arc::clone(&starts));
+        let failed = crate::ch::volume::pause_and_copy(
+            &|| vec![Arc::clone(&vm.entry), Arc::clone(&other.entry)],
+            &starts,
+            &vol_1(),
+            &source,
+            &clone,
+            move |s, c| {
+                during.count(&entry, &["vol_1"]);
+                plain_copy(s, c)
+            },
+        )
+        .await;
+        assert!(
+            matches!(failed, Err(EngineError::Conflict(_))),
+            "{failed:?}"
+        );
+        assert_eq!(api.calls(), ["vm.info", "vm.pause", "vm.resume"]);
+        assert!(!clone.exists());
+        assert_eq!(recorded_pause(&vm.entry), None);
+    }
+
     /// ADR 0243: a forced stop that waits for the VM's lock while a snapshot
     /// holds it for its pause gets it at once. The snapshot gives up instead
     /// of waiting out a VMM that does not answer.
@@ -3404,7 +3711,15 @@ mod tests {
             let vms = vec![Arc::clone(&vm.entry)];
             let (source, clone) = (source.clone(), clone.clone());
             tokio::spawn(async move {
-                crate::ch::volume::pause_and_copy(&vms, &vol_1(), &source, &clone, plain_copy).await
+                crate::ch::volume::pause_and_copy(
+                    &|| vms.clone(),
+                    &crate::ch::volume::VolumeStarts::default(),
+                    &vol_1(),
+                    &source,
+                    &clone,
+                    plain_copy,
+                )
+                .await
             })
         };
         assert!(
@@ -3446,7 +3761,15 @@ mod tests {
             let vms = vec![Arc::clone(&vm.entry)];
             let (source, clone) = (source.clone(), clone.clone());
             tokio::spawn(async move {
-                crate::ch::volume::pause_and_copy(&vms, &vol_1(), &source, &clone, plain_copy).await
+                crate::ch::volume::pause_and_copy(
+                    &|| vms.clone(),
+                    &crate::ch::volume::VolumeStarts::default(),
+                    &vol_1(),
+                    &source,
+                    &clone,
+                    plain_copy,
+                )
+                .await
             })
         };
         assert!(eventually(Duration::from_secs(2), || api.calls().len() == 3).await);
