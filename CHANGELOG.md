@@ -8,6 +8,8 @@ Each entry links the pull request that made the change and, where one exists, th
 
 ### Added
 
+- **A node takes a lease's change of mode.** When an app's HA policy changes, the primary changes its lease's mode with a grant that keeps the token. The node refused such a grant until now; it now adopts the new mode. A lease that becomes `expiring` stays held and its VMs keep running. The node renews it at once, and that first renewal gives it a provisional deadline. The node stops the lease's VMs at that deadline unless the primary answers first, and it stores the deadline for an agent restart. Until that first renewal is sent, a lost session changes nothing for the lease. A lease that becomes `local` again drops its deadline and stops renewing. The primary's side of the change comes with its handling of renewals ([#PR454], [#454], [ADR 0241]).
+
 - **A client CLI in the `quoro` binary.** Every command line that is not a host command now goes to a client that talks to a primary's API: `quoro api METHOD PATH [--data @FILE|-]` calls any operation and prints the response body, and `quoro completion SHELL` prints a shell completion script. The primary comes from a context in `~/.config/quoro/config.toml`: its URL and the SHA-256 pin of its self-signed certificate, checked before anything is sent, or `tls = "system"`. A token per context is read from `credentials.toml`, which is refused when other users can read it, or from `QUORO_TOKEN`; `QUORO_URL` and `QUORO_FINGERPRINT` give an ad-hoc context for CI. `--reason` and `--incident` are sent as `Quoro-Justification` and `Quoro-Incident`. API errors map to fixed exit codes (2 usage, 3 approval required, 4 forbidden, 5 not found, 6 conflict, 7 unreachable, 1 other) with the request id on stderr. `quoro --help` now shows the client commands; `quoro help host` lists the host commands as before ([#463], [ADR 0054]).
 - **Agents in the client CLI.** `quoro login --agent --key-file PATH [--url URL] [--fingerprint FP]` saves a context and the key file's absolute path in `credentials.toml` (mode 0600, written atomically), never the key; a key file other users can read is refused, as `quoro mcp stdio` refuses it, and nothing is written until a token minted from the key reads the agent back. Without `--fingerprint` the primary's certificate is shown and trusted only when confirmed on a terminal. `QUORO_AGENT_KEY_FILE` overrides the stored path. Each command mints a five-minute access token from the key, caches it in `$XDG_RUNTIME_DIR/quoro/` (else `~/.cache/quoro/`, mode 0600) until 30 s before it expires, and mints once more on a 401. An agent's call that changes something is refused locally, before anything is sent, without `--reason` or `QUORO_JUSTIFICATION`. A destructive call answered `approval_required` can file the matching approval request with `quoro api ... --request-approval` (exit 3 with the approval id) and, with `--wait`, wait for a human's decision in the panel and repeat the exact call once approved; a denial or an expiry exits 3. `quoro whoami` shows the context and the identity, with an agent's active grants. `quoro` with no arguments shows the client help ([#464]).
 - **Personal API tokens.** A signed-in human can now list, create and revoke their own `tok_` tokens with `GET`, `POST` and `DELETE /api/v1/tokens`, and from a new Tokens block on the panel's account screen, so a token for the client CLI or the API no longer has to be put in the database by hand. A token takes a label and an optional expiry in the future, authenticates as its human until it expires or is revoked, and is refused on the next call after a revoke. The secret is shown once, in the create response, and only its SHA-256 hash is stored; the change log and the audit log never carry it. A human sees and revokes only their own tokens; another user's token answers `not_found`. Any role may hold tokens, and an agent is refused with `human_only` on all three calls, audited ([#465]).
@@ -436,6 +438,7 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#446]: https://github.com/OmarAlex24/quoro/issues/446
 [#447]: https://github.com/OmarAlex24/quoro/pull/447
 [#452]: https://github.com/OmarAlex24/quoro/pull/452
+[#454]: https://github.com/OmarAlex24/quoro/issues/454
 [#455]: https://github.com/OmarAlex24/quoro/pull/455
 [#456]: https://github.com/OmarAlex24/quoro/issues/456
 [#458]: https://github.com/OmarAlex24/quoro/pull/458
@@ -446,6 +449,7 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#463]: https://github.com/OmarAlex24/quoro/issues/463
 [#464]: https://github.com/OmarAlex24/quoro/issues/464
 [#465]: https://github.com/OmarAlex24/quoro/issues/465
+[#PR454]: https://github.com/OmarAlex24/quoro/pull/PR454
 [ADR 0019]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0019-fencing-is-mandatory-and-lease-based-node-agent-self-fences.md
 [ADR 0020]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0020-per-app-ha-policies-none-cold-warm-hot-with-cost-shown-in.md
 [ADR 0027]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0027-signed-binaries-and-reproducible-builds-are-mandatory.md
@@ -527,5 +531,6 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [ADR 0225]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0225-remove-the-m0-leaseagent-once-the-new-lease-timer-lands.md
 [ADR 0238]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0238-a-new-failed-fence-of-a-lease-whose-acknowledgement-is.md
 [ADR 0240]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0240-node-measures-expiring-lease-validity-on-clock-boottime-so.md
+[ADR 0241]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0241-a-lease-converted-from-local-to-expiring-opens-no-failover.md
 [ADR 0242]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0242-a-stateful-start-under-an-expiring-lease-needs-valid-until.md
 [ADR 0243]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0243-both-stop-modes-carry-a-caller-supplied-bound-and-a-forced.md
