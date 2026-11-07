@@ -763,13 +763,23 @@ async fn a_stateful_vm_starts_only_with_a_held_lease_of_its_token() {
 /// A table that holds `lease_id` as an `expiring` lease with `token`, its
 /// first renewal answered (section 8.4).
 fn expiring_lease_table(lease_id: &str, app_id: &str, token: u64) -> LeaseTable {
+    expiring_lease_table_lasting(lease_id, app_id, token, 15_000)
+}
+
+/// The same with a grant of `duration_ms`.
+fn expiring_lease_table_lasting(
+    lease_id: &str,
+    app_id: &str,
+    token: u64,
+    duration_ms: u64,
+) -> LeaseTable {
     let grant = quoro_proto::LeaseGrant {
         lease_id: quoro_proto::LeaseId(lease_id.to_owned()),
         resource_type: quoro_proto::ResourceType::App,
         resource_id: app_id.to_owned(),
         mode: quoro_proto::LeaseMode::Expiring,
         fencing_token: token,
-        duration_ms: Some(15_000),
+        duration_ms: Some(duration_ms),
         granted_at: "2026-11-02T10:15:33Z".to_owned(),
     };
     let now = tokio::time::Instant::now();
@@ -2028,4 +2038,67 @@ async fn an_uncertain_lease_keeps_an_unhealthy_stateful_vm_running_until_it_is_h
     let statuses = reconciler.reconcile_once(Some(&snap)).await;
     assert_eq!(statuses[0].observed_status, ObservedStatus::Running);
     assert_eq!(statuses[0].restart_count, 1);
+}
+
+/// Sections 6.3 and 6.4 (ADR 0242): under an `expiring` lease a health
+/// restart stops the VM only with the start bound and the margin left on the
+/// lease, since otherwise it could not start again. A renewed 5 s lease is
+/// valid for 4 s (`D - M`), never the 3 s bound plus its 1 s margin, so the
+/// unhealthy VM keeps running. A 15 s lease leaves them, and the start that
+/// follows gets the 3 s bound.
+#[tokio::test]
+async fn a_health_restart_under_an_expiring_lease_needs_the_start_margin() {
+    let dir = TempDir::new();
+    let engine = Arc::new(RecordingEngine::new());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let snap = unhealthy_stateful_snapshot("vm_margin", "lse_margin");
+    let (reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let mut reconciler = reconciler.with_lease_view(LeaseView::new(
+        local_lease_table("lse_margin", "app_margin", 1),
+        false,
+    ));
+    let id = VmId("vm_margin".to_owned());
+    reconciler.reconcile_once(Some(&snap)).await;
+    assert_eq!(engine.inspect(&id).await.unwrap().state, VmState::Running);
+
+    // Held, but never with the start bound and the margin left.
+    let short = LeaseView::new(
+        expiring_lease_table_lasting("lse_margin", "app_margin", 1, 5_000),
+        false,
+    );
+    assert!(short.may_keep_running("lse_margin", 1));
+    assert!(!short.may_start_stateful("lse_margin", 1));
+    let mut reconciler = reconciler.with_lease_view(short);
+    for _ in 0..2 {
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        reconciler.reconcile_once(Some(&snap)).await;
+        reconciler.reconcile_once(Some(&snap)).await;
+    }
+    assert!(
+        engine.stops().is_empty(),
+        "no stop that could not be followed by a start"
+    );
+    assert_eq!(engine.inspect(&id).await.unwrap().state, VmState::Running);
+
+    // 15 s leave them: the health restart stops the VM and starts it again
+    // under the expiring lease's bound.
+    let long = LeaseView::new(
+        expiring_lease_table_lasting("lse_margin", "app_margin", 1, 15_000),
+        false,
+    );
+    assert!(long.may_start_stateful("lse_margin", 1));
+    let mut reconciler = reconciler.with_lease_view(long);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    reconciler.reconcile_once(Some(&snap)).await;
+    reconciler.reconcile_once(Some(&snap)).await;
+    assert_eq!(engine.stops().len(), 1);
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let statuses = reconciler.reconcile_once(Some(&snap)).await;
+    assert_eq!(statuses[0].observed_status, ObservedStatus::Running);
+    assert_eq!(statuses[0].restart_count, 1);
+    assert_eq!(
+        engine.starts().last(),
+        Some(&(id.clone(), EXPIRING_START_WITHIN)),
+        "the restart's start gets the expiring lease's bound"
+    );
 }
