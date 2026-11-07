@@ -4,6 +4,11 @@
 //!
 //! Every method takes `now: Instant` from the caller, so the same code runs
 //! against the paused test clock and against the node's real monotonic clock.
+//!
+//! Those instants are on the lease clock of section 8.4 only once a host
+//! suspend is counted: the caller measures it ([`crate::lease::SuspendWatch`])
+//! and hands it to [`LeaseTable::catch_up`], which brings every instant the
+//! table keeps earlier by it (ADR 0240).
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -11,7 +16,7 @@ use std::time::Duration;
 use quoro_proto::{FenceReason, LeaseGrant, LeaseId, LeaseMode, LeaseRevoke, MsgId, ResourceType};
 use tokio::time::Instant;
 
-use crate::lease::clock::HostNow;
+use crate::lease::clock::{HostNow, StoredValidity};
 use crate::lease::store::StoredLease;
 
 /// The floor the authority must respect for an `expiring` grant (section 8.4).
@@ -19,6 +24,10 @@ pub const MIN_DURATION: Duration = Duration::from_millis(3000);
 
 /// The longest `duration_ms` a grant may carry (section 5.12).
 const MAX_DURATION: Duration = Duration::from_millis(600_000);
+
+/// A measured suspend shorter than this is not applied yet: it is within the
+/// noise of reading two clocks, and it is applied once more adds up.
+const SUSPEND_RESOLUTION: Duration = Duration::from_millis(1);
 
 /// `M = max(1000 ms, D / 10)`, the margin of section 8.4.
 #[must_use]
@@ -61,10 +70,62 @@ pub struct Lease {
     /// answered, and once fenced (section 8.4). An `uncertain` lease with
     /// `None` never expires by the clock.
     pub valid_until: Option<Instant>,
+    /// `valid_until` as it is stored: `CLOCK_BOOTTIME(t_send) + D - M`, read
+    /// when the renewal was sent (section 8.4 "Agent restart", ADR 0240), or
+    /// the stored deadline a restore found. `None` whenever `valid_until` is,
+    /// and on a host that cannot tell its boot.
+    validity: Option<StoredValidity>,
     /// When to send the next renewal; `None` for `local` (section 8.4).
     next_renew_at: Option<Instant>,
-    /// Renewals sent and not yet answered, with their send times.
-    outstanding: Vec<(MsgId, Instant)>,
+    /// Renewals sent and not yet answered.
+    outstanding: Vec<Renewal>,
+}
+
+/// One renewal sent and not yet answered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Renewal {
+    msg: MsgId,
+    /// `t_send`, on the lease clock.
+    sent: Instant,
+    /// The stored deadline an answer to it gives: `CLOCK_BOOTTIME` read before
+    /// `sent`, plus `D - M`.
+    validity: Option<StoredValidity>,
+}
+
+impl Lease {
+    /// The stored form of `valid_until` (section 8.4 "Agent restart").
+    #[must_use]
+    pub fn validity(&self) -> Option<&StoredValidity> {
+        self.validity.as_ref()
+    }
+
+    /// Brings every instant the lease keeps on the lease clock earlier by
+    /// `by`, the length of a host suspend (ADR 0240), and none before `floor`.
+    ///
+    /// Section 8.4 names the timer for `valid_until`. The send times of the
+    /// renewals still outstanding move too, or an answer to a renewal sent
+    /// before the suspend would set a `valid_until` later by the suspend. The
+    /// next renewal moves with them, so the lease renews as soon as the host
+    /// is back. The stored deadline does not move: it is on `CLOCK_BOOTTIME`,
+    /// which counted the suspend. An instant added to the lease on the lease
+    /// clock must move here too.
+    ///
+    /// A renewal whose send time cannot move that far is dropped instead of
+    /// floored: its answer then matches nothing and changes nothing, so no
+    /// floor that is later than the real send time can set `valid_until`.
+    fn suspended(&mut self, by: Duration, floor: Instant) {
+        let earlier = |at: Instant| at.checked_sub(by).unwrap_or(floor);
+        self.valid_until = self.valid_until.map(earlier);
+        self.next_renew_at = self.next_renew_at.map(earlier);
+        self.outstanding
+            .retain_mut(|renewal| match renewal.sent.checked_sub(by) {
+                Some(sent) => {
+                    renewal.sent = sent;
+                    true
+                }
+                None => false,
+            });
+    }
 }
 
 /// Something the caller must do now.
@@ -111,6 +172,8 @@ pub enum RevokeOutcome {
 pub struct LeaseTable {
     leases: HashMap<LeaseId, Lease>,
     highest_token: HashMap<(ResourceType, String), u64>,
+    /// The part of the measured suspend already applied by [`Self::catch_up`].
+    suspend_applied: Duration,
 }
 
 impl LeaseTable {
@@ -120,7 +183,50 @@ impl LeaseTable {
         Self {
             leases: HashMap::new(),
             highest_token: HashMap::new(),
+            suspend_applied: Duration::ZERO,
         }
+    }
+
+    /// Section 8.4 "Suspend" (ADR 0240): `suspended` is how long the host has
+    /// been suspended since the table's lease clock started, as measured now.
+    /// Whatever part of it is new moves every `held` or `uncertain`
+    /// `expiring` lease's instants earlier by that much, so the next
+    /// [`Self::poll`] fences a lease whose `valid_until` passed during the
+    /// suspend, makes a lease whose renewal went unanswered meanwhile
+    /// `uncertain`, and renews the rest. Returns the part it applied.
+    ///
+    /// The caller measures and catches up before it records any instant, so
+    /// an instant taken after a suspend never moves for it: a suspend while no
+    /// `expiring` lease is held shortens no lease granted afterwards.
+    pub fn catch_up(&mut self, suspended: Duration, now: Instant) -> Duration {
+        let by = suspended.saturating_sub(self.suspend_applied);
+        if by < SUSPEND_RESOLUTION {
+            return Duration::ZERO;
+        }
+        self.suspend_applied = suspended;
+        // An instant too early to represent is long past: as early as the
+        // longest grant would ever look back, so a fence that counts its
+        // budget from it has none of its graceful stop left.
+        let floor = now.checked_sub(MAX_DURATION).unwrap_or(now);
+        for lease in self.leases.values_mut() {
+            if lease.mode == LeaseMode::Expiring
+                && matches!(lease.state, LeaseState::Held | LeaseState::Uncertain)
+            {
+                lease.suspended(by, floor);
+            }
+        }
+        by
+    }
+
+    /// Whether any lease keeps instants on the lease clock: an `expiring`
+    /// lease that is `held` or `uncertain`. Only then does a suspend need to
+    /// be checked for (section 8.4 "Suspend").
+    #[must_use]
+    pub fn has_timed_leases(&self) -> bool {
+        self.leases.values().any(|lease| {
+            lease.mode == LeaseMode::Expiring
+                && matches!(lease.state, LeaseState::Held | LeaseState::Uncertain)
+        })
     }
 
     /// Rebuilds the table from what the local store kept across a restart
@@ -159,6 +265,7 @@ impl LeaseTable {
         let mut actions = Vec::new();
         for stored in leases {
             let mut valid_until = None;
+            let mut validity = None;
             let state = match (stored.mode, stored.state) {
                 (LeaseMode::Expiring, LeaseState::Held | LeaseState::Uncertain) => match stored
                     .validity
@@ -170,7 +277,10 @@ impl LeaseTable {
                             .duration
                             .is_some_and(|d| plausible_validity(d, until, now.instant)) =>
                     {
+                        // The stored deadline itself is kept: converting it
+                        // back and forth would move it.
                         valid_until = Some(until);
+                        validity.clone_from(&stored.validity);
                         LeaseState::Uncertain
                     }
                     _ => {
@@ -217,6 +327,7 @@ impl LeaseTable {
                     state,
                     duration: stored.duration,
                     valid_until,
+                    validity,
                     // A lease that came back with its validity renews at once
                     // (section 8.4 "Agent restart").
                     next_renew_at: valid_until.map(|_| now.instant),
@@ -341,6 +452,7 @@ impl LeaseTable {
                         state: LeaseState::Held,
                         duration: None,
                         valid_until: None,
+                        validity: None,
                         next_renew_at: None,
                         outstanding: Vec::new(),
                     },
@@ -350,16 +462,21 @@ impl LeaseTable {
                 if same_token {
                     // D-0072: only a grant that answers an outstanding renewal
                     // moves the timing; anything else changes nothing.
-                    let t_send = existing.as_ref().and_then(|existing| {
+                    let answered = existing.as_ref().and_then(|existing| {
                         answers.and_then(|id| {
                             existing
                                 .outstanding
                                 .iter()
-                                .find(|(sent, _)| sent == id)
-                                .map(|(_, at)| *at)
+                                .find(|renewal| renewal.msg == *id)
+                                .cloned()
                         })
                     });
-                    let Some(t_send) = t_send else {
+                    let Some(Renewal {
+                        sent: t_send,
+                        validity,
+                        ..
+                    }) = answered
+                    else {
                         return Ok(());
                     };
                     // An answer that arrives once its own `valid_until` has
@@ -373,13 +490,13 @@ impl LeaseTable {
                     // Section 8.4: `valid_until = t_send + D - M`, renew every
                     // `D / 3`. Renewals sent at or before `t_send` are
                     // answered by this grant.
-                    let outstanding: Vec<(MsgId, Instant)> = existing
+                    let outstanding: Vec<Renewal> = existing
                         .as_ref()
                         .map(|existing| {
                             existing
                                 .outstanding
                                 .iter()
-                                .filter(|(_, at)| *at > t_send)
+                                .filter(|renewal| renewal.sent > t_send)
                                 .cloned()
                                 .collect()
                         })
@@ -388,6 +505,10 @@ impl LeaseTable {
                         lease.state = LeaseState::Held;
                         lease.duration = Some(d);
                         lease.valid_until = Some(valid_until);
+                        // ADR 0240: the stored deadline comes from the
+                        // reading made when the renewal was sent, so a
+                        // suspend before the answer cannot make it later.
+                        lease.validity = validity;
                         lease.next_renew_at = Some(t_send + d / 3);
                         lease.outstanding = outstanding;
                     }
@@ -398,13 +519,14 @@ impl LeaseTable {
                 // cannot prove the new grant until a renewal is answered, so
                 // the lease is `uncertain` and renews immediately. It never
                 // extends the validity the previous ownership had.
-                let valid_until = existing.as_ref().and_then(|existing| {
-                    if matches!(existing.state, LeaseState::Held | LeaseState::Uncertain) {
-                        existing.valid_until
-                    } else {
-                        None
-                    }
-                });
+                let (valid_until, validity) = existing
+                    .as_ref()
+                    .filter(|existing| {
+                        matches!(existing.state, LeaseState::Held | LeaseState::Uncertain)
+                    })
+                    .map_or((None, None), |existing| {
+                        (existing.valid_until, existing.validity.clone())
+                    });
                 self.highest_token.insert(key, grant.fencing_token);
                 self.leases.insert(
                     grant.lease_id.clone(),
@@ -417,6 +539,7 @@ impl LeaseTable {
                         state: LeaseState::Uncertain,
                         duration: Some(d),
                         valid_until,
+                        validity,
                         next_renew_at: Some(now),
                         outstanding: Vec::new(),
                     },
@@ -447,6 +570,7 @@ impl LeaseTable {
         lease.state = LeaseState::Revoked;
         lease.token = lease.token.max(revoke.fencing_token);
         lease.valid_until = None;
+        lease.validity = None;
         lease.next_renew_at = None;
         lease.outstanding.clear();
         let token = lease.token;
@@ -460,8 +584,12 @@ impl LeaseTable {
         })
     }
 
-    /// Records that a renewal for `lease_id` was just sent at `now`.
-    pub fn renew_sent(&mut self, lease_id: &LeaseId, msg: MsgId, now: Instant) {
+    /// Records that a renewal for `lease_id` was just sent: `sent` is the
+    /// reading taken just before it was handed to the session. Its instant is
+    /// `t_send`, and its `CLOCK_BOOTTIME` gives the deadline an answer stores
+    /// (section 8.4 "Agent restart", ADR 0240).
+    pub fn renew_sent(&mut self, lease_id: &LeaseId, msg: MsgId, sent: &HostNow) {
+        let now = sent.instant;
         let Some(lease) = self.leases.get_mut(lease_id) else {
             return;
         };
@@ -474,7 +602,11 @@ impl LeaseTable {
             return;
         };
         prune_outstanding(&mut lease.outstanding, d, now);
-        lease.outstanding.push((msg, now));
+        lease.outstanding.push(Renewal {
+            msg,
+            sent: now,
+            validity: sent.store(now + (d - margin(d))),
+        });
         lease.next_renew_at = Some(now + d / 3);
     }
 
@@ -530,6 +662,7 @@ impl LeaseTable {
             if lease.valid_until.is_some_and(|until| now >= until) {
                 lease.state = LeaseState::Expired;
                 lease.valid_until = None;
+                lease.validity = None;
                 lease.next_renew_at = None;
                 lease.outstanding.clear();
                 actions.push(Action::Fence {
@@ -544,7 +677,7 @@ impl LeaseTable {
                 && lease
                     .outstanding
                     .iter()
-                    .any(|(_, sent)| now >= *sent + d / 3)
+                    .any(|renewal| now >= renewal.sent + d / 3)
             {
                 lease.state = LeaseState::Uncertain;
             }
@@ -586,7 +719,7 @@ impl LeaseTable {
             let mut candidates: Vec<Instant> = Vec::new();
             candidates.extend(lease.valid_until);
             candidates.extend(lease.next_renew_at);
-            candidates.extend(lease.outstanding.iter().map(|(_, sent)| *sent + d / 3));
+            candidates.extend(lease.outstanding.iter().map(|renewal| renewal.sent + d / 3));
             for candidate in candidates {
                 if candidate <= now {
                     continue;
@@ -668,9 +801,9 @@ impl Default for LeaseTable {
 /// Drops the renewals whose answer could no longer set a `valid_until` in the
 /// future (`t_send + D - M <= now`), so a renewal the authority never answers
 /// is not kept forever.
-fn prune_outstanding(outstanding: &mut Vec<(MsgId, Instant)>, d: Duration, now: Instant) {
+fn prune_outstanding(outstanding: &mut Vec<Renewal>, d: Duration, now: Instant) {
     let keep = d - margin(d);
-    outstanding.retain(|(_, sent)| *sent + keep > now);
+    outstanding.retain(|renewal| renewal.sent + keep > now);
 }
 
 /// Whether a restored `valid_until` can come from a grant of duration `d`:
@@ -742,6 +875,13 @@ mod tests {
     ///
     /// After this the lease is `held` with `valid_until = now + D - M`.
     fn confirm(table: &mut LeaseTable, grant: &LeaseGrant, now: Instant) -> MsgId {
+        confirm_with(table, grant, &HostNow::unknown(now))
+    }
+
+    /// [`confirm`], with the renewal sent at `reading`, so the answer stores
+    /// a validity when the reading has `CLOCK_BOOTTIME`.
+    fn confirm_with(table: &mut LeaseTable, grant: &LeaseGrant, reading: &HostNow) -> MsgId {
+        let now = reading.instant;
         let sent = table
             .poll(now)
             .into_iter()
@@ -755,7 +895,7 @@ mod tests {
             .expect("a first expiring grant asks for a renewal at once");
         assert_eq!(sent, grant.fencing_token, "the renewal echoes the token");
         let id = MsgId(format!("msg_renew_{}", grant.lease_id.0));
-        table.renew_sent(&grant.lease_id, id.clone(), now);
+        table.renew_sent(&grant.lease_id, id.clone(), reading);
         table
             .on_grant(grant, Some(&id), now)
             .expect("the answering grant");
@@ -980,7 +1120,7 @@ mod tests {
         table.renew_sent(
             &LeaseId("lse_e".to_string()),
             MsgId("msg_1".to_string()),
-            at,
+            &HostNow::unknown(at),
         );
         assert_eq!(table.next_deadline(at), Some(at + millis(5000)));
     }
@@ -996,7 +1136,7 @@ mod tests {
         table.renew_sent(
             &LeaseId("lse_e".to_string()),
             MsgId("msg_1".to_string()),
-            renew_at,
+            &HostNow::unknown(renew_at),
         );
         let answer = MsgId("msg_1".to_string());
         // D-0073: a renewal answer carries the held token.
@@ -1021,7 +1161,7 @@ mod tests {
         let grant = expiring("lse_e", 1, 3000);
         table.on_grant(&grant, None, t0).expect("grant");
         let _ = table.poll(t0);
-        table.renew_sent(&id, MsgId("msg_first".to_string()), t0);
+        table.renew_sent(&id, MsgId("msg_first".to_string()), &HostNow::unknown(t0));
         // `valid_until` would be `t0 + 2 000`; the answer comes at `t0 + 2 000`.
         table
             .on_grant(
@@ -1038,7 +1178,11 @@ mod tests {
 
         // A timely answer to a later renewal makes it `held`.
         let later = t0 + millis(2500);
-        table.renew_sent(&id, MsgId("msg_second".to_string()), later);
+        table.renew_sent(
+            &id,
+            MsgId("msg_second".to_string()),
+            &HostNow::unknown(later),
+        );
         table
             .on_grant(
                 &grant,
@@ -1087,7 +1231,11 @@ mod tests {
         for step in 0..60 {
             for action in table.poll(now) {
                 if let Action::SendRenew { lease_id, .. } = action {
-                    table.renew_sent(&lease_id, MsgId(format!("msg_{step}")), now);
+                    table.renew_sent(
+                        &lease_id,
+                        MsgId(format!("msg_{step}")),
+                        &HostNow::unknown(now),
+                    );
                 }
             }
             now += millis(1000);
@@ -1111,7 +1259,7 @@ mod tests {
         table.renew_sent(
             &LeaseId("lse_e".to_string()),
             MsgId("msg_1".to_string()),
-            t0 + millis(5000),
+            &HostNow::unknown(t0 + millis(5000)),
         );
 
         let late = t0 + millis(10000);
@@ -1131,7 +1279,7 @@ mod tests {
         table.renew_sent(
             &LeaseId("lse_e".to_string()),
             MsgId("msg_1".to_string()),
-            t0 + millis(5000),
+            &HostNow::unknown(t0 + millis(5000)),
         );
         let late = t0 + millis(10000);
         let _ = table.poll(late);
@@ -1217,7 +1365,11 @@ mod tests {
         );
         let renew_at = t0 + millis(5000);
         let answer = MsgId("msg_1".to_string());
-        table.renew_sent(&LeaseId("lse_e".to_string()), answer.clone(), renew_at);
+        table.renew_sent(
+            &LeaseId("lse_e".to_string()),
+            answer.clone(),
+            &HostNow::unknown(renew_at),
+        );
         // D-0073: the answer carries the held token.
         table
             .on_grant(&grant, Some(&answer), renew_at)
@@ -1392,7 +1544,11 @@ mod tests {
 
         let sent_at = now;
         let id = MsgId("msg_1".to_string());
-        table.renew_sent(&LeaseId("lse_e".to_string()), id.clone(), sent_at);
+        table.renew_sent(
+            &LeaseId("lse_e".to_string()),
+            id.clone(),
+            &HostNow::unknown(sent_at),
+        );
         table
             .on_grant(&grant, Some(&id), sent_at)
             .expect("the answer");
@@ -1499,7 +1655,11 @@ mod tests {
 
         let renew_at = t0 + millis(5000);
         let renew_id = MsgId("msg_1".to_string());
-        table.renew_sent(&LeaseId("lse_e".to_string()), renew_id.clone(), renew_at);
+        table.renew_sent(
+            &LeaseId("lse_e".to_string()),
+            renew_id.clone(),
+            &HostNow::unknown(renew_at),
+        );
         // D-0073: a higher token is ownership change even when it answers a
         // renewal, so it is `uncertain`, never `held`.
         let second = expiring("lse_e", 2, 15000);
@@ -1717,10 +1877,12 @@ mod tests {
         let mut table = LeaseTable::new();
         let grant = expiring("lse_e", 7, 15000);
         table.on_grant(&grant, None, t0).expect("grant");
-        confirm(&mut table, &grant, t0);
+        let reading = HostNow::read(clock);
+        assert_eq!(reading.instant, t0, "the test clock is paused");
+        confirm_with(&mut table, &grant, &reading);
         let lease = table.get(&LeaseId("lse_e".to_string())).expect("lease");
         let until = lease.valid_until.expect("held with a deadline");
-        (StoredLease::from_lease(lease, &HostNow::read(clock)), until)
+        (StoredLease::from_lease(lease), until)
     }
 
     /// Section 8.4 "Agent restart" (ADR 0072): within the same boot a held
@@ -1794,7 +1956,7 @@ mod tests {
         let id = LeaseId("lse_e".to_string());
         let _ = table.poll(now.instant);
         let renew = MsgId("msg_after_restart".to_string());
-        table.renew_sent(&id, renew.clone(), now.instant);
+        table.renew_sent(&id, renew.clone(), &now);
         table
             .on_grant(&expiring("lse_e", 7, 15000), Some(&renew), now.instant)
             .expect("the answer");
@@ -1901,28 +2063,21 @@ mod tests {
         let id = LeaseId("lse_e".to_string());
         let lease = table.get(&id).expect("lease");
         assert_eq!(lease.state, LeaseState::Uncertain);
-        assert_eq!(
-            StoredLease::from_lease(lease, &HostNow::read(&clock)).validity,
-            None
-        );
+        assert_eq!(StoredLease::from_lease(lease).validity, None);
 
-        confirm(&mut table, &grant, t0);
+        confirm_with(&mut table, &grant, &HostNow::read(&clock));
+        let lease = table.get(&id).expect("lease");
+        assert!(StoredLease::from_lease(lease).validity.is_some(), "held");
         let _ = table.poll(t0 + millis(13_500));
         let lease = table.get(&id).expect("lease");
         assert_eq!(lease.state, LeaseState::Expired);
-        assert_eq!(
-            StoredLease::from_lease(lease, &HostNow::read(&clock)).validity,
-            None
-        );
+        assert_eq!(StoredLease::from_lease(lease).validity, None);
 
         table
             .on_grant(&local_on("lse_l", "app_l", 1), None, t0)
             .expect("grant");
         let local = table.get(&LeaseId("lse_l".to_string())).expect("lease");
-        assert_eq!(
-            StoredLease::from_lease(local, &HostNow::read(&clock)).validity,
-            None
-        );
+        assert_eq!(StoredLease::from_lease(local).validity, None);
     }
 
     #[test]
@@ -1943,5 +2098,172 @@ mod tests {
             })
             .collect();
         assert_eq!(ids, vec!["lse_a", "lse_b", "lse_c"]);
+    }
+
+    /// Section 8.4 "Suspend" (ADR 0240): a suspend moves `valid_until`, the
+    /// next renewal and the send time of a renewal still outstanding earlier
+    /// by its length, so an answer to that renewal sets a `valid_until` that
+    /// counts the suspend. The same measurement is applied once.
+    #[tokio::test(start_paused = true)]
+    async fn a_suspend_moves_the_lease_clock_instants_earlier() {
+        let t0 = Instant::now();
+        let mut table = LeaseTable::new();
+        let grant = expiring("lse_e", 1, 15000);
+        table.on_grant(&grant, None, t0).expect("grant");
+        confirm(&mut table, &grant, t0);
+        let id = LeaseId("lse_e".to_string());
+        let now = t0 + millis(2000);
+        let renew = MsgId("msg_before_the_suspend".to_string());
+        table.renew_sent(&id, renew.clone(), &HostNow::unknown(now));
+
+        assert_eq!(table.catch_up(millis(3000), now), millis(3000));
+        let lease = table.get(&id).expect("lease");
+        assert_eq!(lease.valid_until, Some(t0 + millis(10_500)));
+        assert_eq!(
+            table.catch_up(millis(3000), now),
+            Duration::ZERO,
+            "applied once"
+        );
+        assert_eq!(
+            table.get(&id).expect("lease").valid_until,
+            Some(t0 + millis(10_500))
+        );
+        // The renewal now counts as sent at t0 - 1 000 ms.
+        table
+            .on_grant(&grant, Some(&renew), now)
+            .expect("the answer");
+        assert_eq!(
+            table.get(&id).expect("lease").valid_until,
+            Some(t0 + millis(12_500))
+        );
+        // The next renewal moved too: it is due at t0 + 4 000 ms, not
+        // t0 + 4 000 + 3 000.
+        assert_eq!(table.next_deadline(now), Some(t0 + millis(4000)));
+    }
+
+    /// A lease whose `valid_until` passed during the suspend expires at the
+    /// next poll, and a suspend too long for an instant to represent still
+    /// fences.
+    #[tokio::test(start_paused = true)]
+    async fn a_suspend_past_valid_until_fences_at_the_next_poll() {
+        for suspended in [millis(12_000), Duration::MAX] {
+            let t0 = Instant::now();
+            let mut table = LeaseTable::new();
+            let grant = expiring("lse_e", 1, 15000);
+            table.on_grant(&grant, None, t0).expect("grant");
+            confirm(&mut table, &grant, t0);
+            let id = LeaseId("lse_e".to_string());
+            let now = t0 + millis(2000);
+            assert!(table.may_start_stateful(&id, 1, now));
+            assert_eq!(table.catch_up(suspended, now), suspended);
+            assert!(!table.may_start_stateful(&id, 1, now), "{suspended:?}");
+            assert_eq!(
+                table.poll(now),
+                vec![Action::Fence {
+                    lease_id: id.clone(),
+                    reason: FenceReason::LeaseExpired,
+                }],
+                "{suspended:?}"
+            );
+            assert_eq!(table.get(&id).expect("lease").state, LeaseState::Expired);
+        }
+    }
+
+    /// A measurement within the noise of two clock reads is not applied
+    /// until more adds up, and then all of it is.
+    #[tokio::test(start_paused = true)]
+    async fn a_suspend_below_the_resolution_waits_until_it_adds_up() {
+        let t0 = Instant::now();
+        let mut table = LeaseTable::new();
+        let grant = expiring("lse_e", 1, 15000);
+        table.on_grant(&grant, None, t0).expect("grant");
+        confirm(&mut table, &grant, t0);
+        let id = LeaseId("lse_e".to_string());
+        assert_eq!(
+            table.catch_up(Duration::from_micros(500), t0),
+            Duration::ZERO
+        );
+        assert_eq!(
+            table.get(&id).expect("lease").valid_until,
+            Some(t0 + millis(13_500))
+        );
+        assert_eq!(
+            table.catch_up(Duration::from_micros(1500), t0),
+            Duration::from_micros(1500)
+        );
+        assert_eq!(
+            table.get(&id).expect("lease").valid_until,
+            Some(t0 + millis(13_500) - Duration::from_micros(1500))
+        );
+    }
+
+    /// A suspend caught up with before a grant shortens nothing the grant
+    /// records afterwards, and only `held` or `uncertain` `expiring` leases
+    /// keep instants that move.
+    #[tokio::test(start_paused = true)]
+    async fn a_suspend_shortens_no_instant_recorded_after_it() {
+        let t0 = Instant::now();
+        let mut table = LeaseTable::new();
+        table
+            .on_grant(&local_on("lse_l", "app_l", 1), None, t0)
+            .expect("grant");
+        assert!(!table.has_timed_leases());
+        assert_eq!(table.catch_up(millis(60_000), t0), millis(60_000));
+        let grant = expiring("lse_e", 1, 15000);
+        table.on_grant(&grant, None, t0).expect("grant");
+        assert!(table.has_timed_leases());
+        confirm(&mut table, &grant, t0);
+        assert_eq!(table.catch_up(millis(60_000), t0), Duration::ZERO);
+        let id = LeaseId("lse_e".to_string());
+        assert_eq!(
+            table.get(&id).expect("lease").valid_until,
+            Some(t0 + millis(13_500))
+        );
+        assert!(table.may_start_stateful(&LeaseId("lse_l".to_string()), 1, t0));
+    }
+
+    /// Section 8.4 "Agent restart" (ADR 0240): the stored deadline is
+    /// `CLOCK_BOOTTIME(t_send) + D - M`, read when the renewal was sent, so a
+    /// suspend between the renewal and its answer does not make it later.
+    #[tokio::test(start_paused = true)]
+    async fn the_stored_deadline_comes_from_the_send_time() {
+        let clock = ManualHostClock::new(Some("boot-a"), millis(500_000));
+        let t0 = Instant::now();
+        let mut table = LeaseTable::new();
+        let grant = expiring("lse_e", 1, 15000);
+        table.on_grant(&grant, None, t0).expect("grant");
+        let _ = table.poll(t0);
+        let id = LeaseId("lse_e".to_string());
+        let renew = MsgId("msg_renew".to_string());
+        table.renew_sent(&id, renew.clone(), &HostNow::read(&clock));
+
+        clock.suspend(millis(3000));
+        assert_eq!(table.catch_up(millis(3000), t0), millis(3000));
+        table
+            .on_grant(&grant, Some(&renew), t0)
+            .expect("the answer");
+        let lease = table.get(&id).expect("lease");
+        assert_eq!(lease.state, LeaseState::Held);
+        assert_eq!(lease.valid_until, Some(t0 + millis(10_500)));
+        assert_eq!(
+            StoredLease::from_lease(lease).validity,
+            Some(StoredValidity {
+                boot_id: "boot-a".to_string(),
+                until_boottime: millis(513_500),
+            }),
+            "not 516 500: the suspend came after the send"
+        );
+        // Restored right away, it has the same 10 500 ms left.
+        let (restored, actions) = LeaseTable::restore(
+            vec![StoredLease::from_lease(lease)],
+            Vec::new(),
+            &HashSet::new(),
+            &HostNow::read(&clock),
+        );
+        assert!(actions.is_empty());
+        assert_eq!(
+            restored.get(&id).expect("lease").valid_until,
+            Some(t0 + millis(10_500))
+        );
     }
 }

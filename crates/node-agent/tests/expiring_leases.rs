@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! `expiring` leases on the node's lease service: renewals, `uncertain`,
-//! expiry and its self-fence, and a held lease across an agent restart
-//! (`node-agent-protocol.md` sections 5.5, 5.12, 8.4 and 8.5; ADR 0072).
+//! expiry and its self-fence, a host suspend, and a held lease across an agent
+//! restart (`node-agent-protocol.md` sections 5.5, 5.12, 8.4 and 8.5; ADR 0072,
+//! ADR 0240).
 //!
 //! These run in real time with `D` of a few seconds, because the service
 //! stores every change in SQLite and a paused clock would jump while it waits.
@@ -19,10 +20,13 @@ use common::{millis, running_vm, stop_counts, wait_for};
 use quoro_engine::{Engine, FakeEngine, VmState};
 use quoro_node_agent::store::NodeStore;
 use quoro_node_agent::{
-    Attached, FenceTimers, LeaseConfig, LeaseState, LocalLeases, ManualHostClock, StoredLease,
-    StoredValidity, VmFenceOutcome, start_local_leases, stop_vms,
+    Attached, FenceTimers, HostClock, LeaseConfig, LeaseState, LocalLeases, ManualHostClock,
+    StoredLease, StoredValidity, VmFenceOutcome, start_local_leases, stop_vms,
 };
-use quoro_proto::{Envelope, LeaseGrant, LeaseId, LeaseMode, LeaseRenew, MsgId, ResourceType};
+use quoro_proto::{
+    CommandStatus, Envelope, LeaseGrant, LeaseId, LeaseMode, LeaseRenew, LeaseRevoke, MsgId,
+    ResourceType, RevokeReason,
+};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
@@ -452,13 +456,11 @@ async fn a_held_lease_is_fenced_after_a_reboot_or_a_long_suspend() {
     }
 }
 
-/// Section 8.4 "Agent restart": the stored deadline is converted once, when
-/// `valid_until` is set. A later save of the same `valid_until`, here the
-/// higher-token grant of a new ownership, which keeps the old validity, stores
-/// the same deadline even after a suspend, which `CLOCK_BOOTTIME` counts and
-/// the monotonic clock does not. (A suspend before the conversion, between a
-/// renewal and its answer, is not covered: see the module doc of the lease
-/// service.)
+/// Section 8.4 "Agent restart": a later save of the same `valid_until`, here
+/// the higher-token grant of a new ownership, which keeps the old validity,
+/// stores the same deadline even after a suspend, which `CLOCK_BOOTTIME`
+/// counts and the monotonic clock does not. The suspend is shorter than what
+/// is left, so the lease stays valid.
 #[tokio::test]
 async fn a_suspend_after_the_conversion_never_moves_the_stored_deadline_later() {
     let dir = TargetDir::new("expiring-suspend-save");
@@ -471,7 +473,7 @@ async fn a_suspend_after_the_conversion_never_moves_the_stored_deadline_later() 
     let first: StoredLease = store.load_leases().await.unwrap()[0].clone();
     let first_validity: StoredValidity = first.validity.clone().expect("a stored validity");
 
-    clock.suspend(Duration::from_secs(30));
+    clock.suspend(Duration::from_secs(5));
     leases
         .link
         .grant(MsgId("msg_regrant".to_owned()), None, expiring(2, 15_000))
@@ -483,7 +485,249 @@ async fn a_suspend_after_the_conversion_never_moves_the_stored_deadline_later() 
     assert_eq!(
         after.validity,
         Some(first_validity),
-        "the same valid_until is stored as it was first converted"
+        "the same valid_until is stored as it was first stored"
+    );
+    leases.abort();
+}
+
+/// Section 8.4 "Suspend" (ADR 0240): a suspend longer than what was left of
+/// the validity expires the lease as soon as the host wakes. The fence counts
+/// its stop from the deadline the lease really had, long past, so it skips the
+/// graceful stop and forces at once. Nothing stateful may start from the
+/// moment of the wake-up, and the node is not marked failed.
+#[tokio::test]
+async fn a_suspend_past_valid_until_fences_at_once_on_wake_up() {
+    let dir = TargetDir::new("expiring-suspend-long");
+    let engine = Arc::new(FakeEngine::new());
+    let desired = bound(&["vm_warm"]);
+    let clock = clock();
+    let (leases, store) = start(&dir, &engine, &desired, config(&clock)).await;
+    let vm = running_vm(&engine, "vm_warm", 2).await;
+    let mut attached = leases.link.attach();
+    let _before = grant_and_confirm(&leases, &mut attached, 15_000).await;
+    tokio::time::sleep(millis(300)).await;
+    assert!(leases.view.may_start_stateful(LEASE, 1));
+
+    let woke = Instant::now();
+    clock.suspend(Duration::from_secs(60));
+    assert!(
+        !leases.view.may_start_stateful(LEASE, 1),
+        "the start check counts the suspend before the service does"
+    );
+    wait_for_fence_record(&store).await;
+    let fenced_after = woke.elapsed();
+    assert!(
+        fenced_after < millis(1000),
+        "fenced at the wake-up, not at the old valid_until 13.5 s on: {fenced_after:?}"
+    );
+    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Expired));
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Stopped);
+    assert_eq!(
+        stop_counts(&engine.stop_calls()),
+        (0, 1),
+        "no graceful stop: the deadline is long past"
+    );
+    let fenced = events_of(&store, "node.fenced").await;
+    assert_eq!(fenced.len(), 1);
+    assert_eq!(fenced[0]["data"]["reason"], "lease_expired");
+    assert!(!leases.view.is_failed(), "a suspend is not a failure");
+    assert!(!store.node_failed().await.unwrap());
+    leases.abort();
+}
+
+/// ADR 0240: a revoke the service takes before the wake-up's timer fires
+/// still counts the suspend. The lease's `valid_until` passed during it, so
+/// its fence has no graceful stop left, as at an expiry. The timers give an
+/// `expiring` fence 1 000 ms of graceful stop when it starts in time.
+#[tokio::test]
+async fn a_revoke_right_after_a_wake_up_counts_the_suspend() {
+    let dir = TargetDir::new("expiring-suspend-revoke");
+    let engine = Arc::new(FakeEngine::new());
+    let desired = bound(&["vm_warm"]);
+    let clock = clock();
+    let config = LeaseConfig::new(
+        "nod_test",
+        FenceTimers {
+            grace: Duration::from_secs(1),
+            force: millis(300),
+        },
+    )
+    .with_host_clock(Arc::new(clock.clone()));
+    let (leases, store) = start(&dir, &engine, &desired, config).await;
+    let vm = running_vm(&engine, "vm_warm", 2).await;
+    let mut attached = leases.link.attach();
+    let _before = grant_and_confirm(&leases, &mut attached, 15_000).await;
+
+    clock.suspend_unnoticed(Duration::from_secs(60));
+    let result = leases
+        .link
+        .revoke(
+            MsgId("msg_revoke".to_owned()),
+            None,
+            LeaseRevoke {
+                lease_id: LeaseId(LEASE.to_owned()),
+                fencing_token: 1,
+                reason: RevokeReason::Moved,
+            },
+        )
+        .await
+        .expect("the revoke is taken");
+    assert_eq!(result.status, CommandStatus::Ok);
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Stopped);
+    assert_eq!(
+        stop_counts(&engine.stop_calls()),
+        (0, 1),
+        "no graceful stop: the deadline passed during the suspend"
+    );
+    let fenced = events_of(&store, "node.fenced").await;
+    assert_eq!(fenced.len(), 1);
+    // The 250 ms check may still fire first; the revoke then joins that
+    // expiry's fence, which is just as late.
+    assert!(
+        ["lease_revoked", "lease_expired"].contains(&fenced[0]["data"]["reason"].as_str().unwrap()),
+        "{}",
+        fenced[0]["data"]["reason"]
+    );
+    assert!(!leases.view.is_failed());
+    leases.abort();
+}
+
+/// ADR 0240: a lease the restore brought back `uncertain` keeps instants on
+/// the lease clock, so a suspend after the restart counts against it like
+/// one before. A suspend past what is left fences it at the wake-up.
+#[tokio::test]
+async fn a_suspend_after_a_restore_fences_the_restored_lease() {
+    let dir = TargetDir::new("expiring-restore-suspend");
+    let engine = Arc::new(FakeEngine::new());
+    let desired = bound(&["vm_warm"]);
+    let clock = clock();
+    let (leases, store) = start(&dir, &engine, &desired, config(&clock)).await;
+    let vm = running_vm(&engine, "vm_warm", 2).await;
+    let mut attached = leases.link.attach();
+    let _before = grant_and_confirm(&leases, &mut attached, 15_000).await;
+    drop(attached);
+    leases.abort();
+    drop(store);
+
+    let (leases, store) = start(&dir, &engine, &desired, config(&clock)).await;
+    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Uncertain));
+    assert!(leases.view.may_keep_running(LEASE, 1));
+    let woke = Instant::now();
+    clock.suspend(Duration::from_secs(60));
+    wait_for_fence_record(&store).await;
+    let fenced_after = woke.elapsed();
+    assert!(
+        fenced_after < millis(1000),
+        "fenced at the wake-up, not 13.5 s on: {fenced_after:?}"
+    );
+    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Expired));
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Stopped);
+    let fenced = events_of(&store, "node.fenced").await;
+    assert_eq!(fenced.len(), 1);
+    assert_eq!(fenced[0]["data"]["reason"], "lease_expired");
+    assert!(!leases.view.is_failed());
+    leases.abort();
+}
+
+/// Section 8.4 "Suspend": a suspend shorter than what is left brings the
+/// expiry earlier by its length, and the lease renews as soon as the host
+/// wakes. With `D` = 6 000 and the renewals unanswered, `valid_until` is
+/// `t_send + 5 000`; after a 2 000 ms suspend the lease expires at
+/// `t_send + 3 000` on the tokio clock.
+#[tokio::test]
+async fn a_short_suspend_brings_the_expiry_earlier_by_its_length() {
+    let dir = TargetDir::new("expiring-suspend-short");
+    let engine = Arc::new(FakeEngine::new());
+    let desired = bound(&["vm_warm"]);
+    let clock = clock();
+    let (leases, store) = start(&dir, &engine, &desired, config(&clock)).await;
+    let vm = running_vm(&engine, "vm_warm", 2).await;
+    let mut attached = leases.link.attach();
+    let before = grant_and_confirm(&leases, &mut attached, 6000).await;
+
+    let woke = Instant::now();
+    clock.suspend(millis(2000));
+    // The renewal due at `t_send + 2 000` moved to `t_send`: it goes out now.
+    let _unanswered = next_renewal(&mut attached).await;
+    assert!(
+        woke.elapsed() < millis(500),
+        "renews at the wake-up: {:?}",
+        woke.elapsed()
+    );
+    wait_for_fence_record(&store).await;
+    let done = before.elapsed();
+    assert!(
+        done >= millis(3000),
+        "no earlier than the moved deadline: {done:?}"
+    );
+    assert!(done < millis(4500), "earlier than t_send + 5 000: {done:?}");
+    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Expired));
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Stopped);
+    leases.abort();
+}
+
+/// A suspend while no `expiring` lease is held shortens no lease granted
+/// after it: the service catches up with the suspend before it records the
+/// grant's instants.
+#[tokio::test]
+async fn a_suspend_before_a_grant_shortens_nothing() {
+    let dir = TargetDir::new("expiring-suspend-before");
+    let engine = Arc::new(FakeEngine::new());
+    let desired = bound(&["vm_warm"]);
+    let clock = clock();
+    let (leases, store) = start(&dir, &engine, &desired, config(&clock)).await;
+    let vm = running_vm(&engine, "vm_warm", 2).await;
+    let mut attached = leases.link.attach();
+    clock.suspend(Duration::from_secs(60));
+    tokio::time::sleep(millis(100)).await;
+
+    let _before = grant_and_confirm(&leases, &mut attached, 6000).await;
+    tokio::time::sleep(millis(1000)).await;
+    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Held));
+    assert!(leases.view.may_start_stateful(LEASE, 1));
+    assert!(engine.stop_calls().is_empty(), "nothing is fenced");
+    assert!(store.fences().await.unwrap().is_empty());
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Running);
+    leases.abort();
+}
+
+/// Section 8.4 "Agent restart" (ADR 0240): the stored deadline is
+/// `CLOCK_BOOTTIME(t_send) + D - M`, read when the renewal was sent. A
+/// suspend between the renewal and its answer makes it no later, and the
+/// answer still makes the lease `held` with what is left.
+#[tokio::test]
+async fn a_suspend_between_a_renewal_and_its_answer_stores_the_send_time_deadline() {
+    let dir = TargetDir::new("expiring-suspend-between");
+    let engine = Arc::new(FakeEngine::new());
+    let desired = bound(&["vm_warm"]);
+    let clock = clock();
+    let (leases, store) = start(&dir, &engine, &desired, config(&clock)).await;
+    let mut attached = leases.link.attach();
+    leases
+        .link
+        .grant(MsgId("msg_grant".to_owned()), None, expiring(1, 15_000))
+        .await
+        .expect("the grant is taken");
+    let renew = next_renewal(&mut attached).await;
+    // The renewal was read and sent no later than this.
+    let sent_by = clock.boottime().expect("a boottime");
+
+    clock.suspend(Duration::from_secs(3));
+    answer(&leases, &renew, 15_000).await;
+    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Held));
+    assert!(leases.view.may_start_stateful(LEASE, 1));
+    let stored = store.load_leases().await.unwrap()[0]
+        .validity
+        .clone()
+        .expect("a stored validity");
+    assert_eq!(stored.boot_id, "boot-a");
+    assert!(
+        stored.until_boottime <= sent_by + millis(13_500),
+        "from the send time, not later by the suspend: {stored:?}, sent by {sent_by:?}"
+    );
+    assert!(
+        stored.until_boottime + millis(500) >= sent_by + millis(13_500),
+        "{stored:?}, sent by {sent_by:?}"
     );
     leases.abort();
 }
