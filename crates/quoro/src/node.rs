@@ -31,6 +31,14 @@ use tracing::{info, warn};
 /// without KVM or with missing artifacts stops instead of looping.
 pub const EX_CONFIG: i32 = 78;
 
+/// The exit status of a refusal a later attempt may get past (`EX_TEMPFAIL`,
+/// sysexits.h): the engine could not adopt a VMM it left behind, for one
+/// because `/proc` cannot tell whether it still runs (#459). Any status but
+/// [`EX_CONFIG`] lets the unit's `Restart=always` start the agent again after
+/// `RestartSec`.
+#[cfg(target_os = "linux")]
+pub const EX_TEMPFAIL: i32 = 75;
+
 /// The file the control plane writes for the primary's own node agent: the
 /// loopback URL, a one-time token and the certificate fingerprint.
 pub const LOCAL_JOIN_FILE: &str = "local-node-join.json";
@@ -369,8 +377,9 @@ async fn cloud_hypervisor_engine(config: &Config) -> Result<quoro_engine::ch::Ch
     let engine = match ChEngine::new(ch_config).await {
         Ok(engine) => engine,
         Err(e) => {
-            eprintln!("cannot start the cloud-hypervisor engine: {e}");
-            return Err(EX_CONFIG);
+            let (line, code) = open_failure(&e);
+            eprintln!("{line}");
+            return Err(code);
         }
     };
     let capabilities = engine.capabilities().await;
@@ -401,6 +410,28 @@ async fn cloud_hypervisor_engine(config: &Config) -> Result<quoro_engine::ch::Ch
         return Err(EX_CONFIG);
     }
     Ok(engine)
+}
+
+/// The one line to print and the exit status for an engine that did not
+/// open. A VMM the engine could not adopt may still run, so the agent does not
+/// start without it; it exits with [`EX_TEMPFAIL`] for systemd to try again,
+/// never with [`EX_CONFIG`], which would stop the retries.
+#[cfg(target_os = "linux")]
+fn open_failure(error: &quoro_engine::ch::OpenError) -> (String, i32) {
+    use quoro_engine::ch::OpenError;
+    match error {
+        OpenError::Config(error) => (
+            format!("cannot start the cloud-hypervisor engine: {error}"),
+            EX_CONFIG,
+        ),
+        OpenError::Retry(error) => (
+            format!(
+                "cannot start the cloud-hypervisor engine yet: {error}; \
+                 exiting with {EX_TEMPFAIL} so that systemd starts the agent again"
+            ),
+            EX_TEMPFAIL,
+        ),
+    }
 }
 
 /// Enrolls through the local join file when needed, then runs the agent.
@@ -569,6 +600,34 @@ fn memory_mb() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #459: an engine that cannot adopt a VMM it left behind exits so that
+    /// systemd starts the agent again, with one line that names the VM. Any
+    /// other refusal keeps `EX_CONFIG`, which stops the retries.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_engine_that_cannot_adopt_a_vmm_exits_for_a_retry() {
+        use quoro_engine::EngineError;
+        use quoro_engine::ch::OpenError;
+
+        let (line, code) = open_failure(&OpenError::Retry(EngineError::Hypervisor(
+            "VM vm_a: cannot adopt cloud-hypervisor pid 7: cannot tell whether it still runs: \
+             Too many open files (os error 24)"
+                .to_string(),
+        )));
+        assert_eq!(code, EX_TEMPFAIL);
+        assert_ne!(code, EX_CONFIG, "78 would stop systemd's retries");
+        assert!(
+            line.contains("VM vm_a") && line.contains("Too many open files"),
+            "{line}"
+        );
+        assert!(!line.contains('\n'), "one line: {line}");
+
+        let (_, code) = open_failure(&OpenError::Config(EngineError::Unsupported(
+            "nft is missing".to_string(),
+        )));
+        assert_eq!(code, EX_CONFIG);
+    }
 
     #[test]
     fn the_local_join_file_is_read() {

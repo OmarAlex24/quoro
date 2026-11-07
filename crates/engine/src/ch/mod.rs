@@ -100,6 +100,45 @@ impl ChConfig {
     }
 }
 
+/// Why [`ChEngine::new`] failed, so the caller can tell a refusal that a
+/// restart may get past from one it cannot.
+#[derive(Debug)]
+pub enum OpenError {
+    /// The host or the engine's own files: a missing tool, a pin mismatch, an
+    /// artifact that does not run, a state directory that cannot be read. A
+    /// retry fails the same way until an operator changes the host.
+    Config(EngineError),
+    /// A VMM an earlier agent process started could not be adopted, for one
+    /// because `/proc` cannot tell whether it still runs (#459). The engine
+    /// does not start rather than forget a VMM that may still run a guest, and
+    /// a later attempt may succeed. The error names the VM.
+    Retry(EngineError),
+}
+
+impl OpenError {
+    /// The engine's error, either way.
+    #[must_use]
+    pub fn error(&self) -> &EngineError {
+        match self {
+            Self::Config(error) | Self::Retry(error) => error,
+        }
+    }
+}
+
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error().fmt(f)
+    }
+}
+
+impl std::error::Error for OpenError {}
+
+impl From<EngineError> for OpenError {
+    fn from(error: EngineError) -> Self {
+        Self::Config(error)
+    }
+}
+
 /// The Cloud Hypervisor backend (contract §5).
 pub struct ChEngine {
     inner: Arc<Inner>,
@@ -120,11 +159,12 @@ impl ChEngine {
     ///
     /// # Errors
     ///
-    /// `Unsupported` when a host tool or a pin is missing, `Hypervisor` or `Io`
-    /// when an artifact does not match its pin or `cloud-hypervisor` cannot run,
-    /// and whatever preparing the initramfs, the image store or the recorded
-    /// networks reports.
-    pub async fn new(config: ChConfig) -> Result<ChEngine, EngineError> {
+    /// [`OpenError::Config`] with `Unsupported` when a host tool or a pin is
+    /// missing, `Hypervisor` or `Io` when an artifact does not match its pin or
+    /// `cloud-hypervisor` cannot run, and whatever preparing the initramfs, the
+    /// image store or the recorded networks reports. [`OpenError::Retry`] when
+    /// a VMM left behind cannot be adopted.
+    pub async fn new(config: ChConfig) -> Result<ChEngine, OpenError> {
         let inner = Inner::new(config).await?;
         Ok(Self { inner })
     }

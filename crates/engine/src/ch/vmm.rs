@@ -51,16 +51,18 @@ pub struct ProcessId {
 }
 
 impl ProcessId {
-    /// Reads the identity of a live, non-zombie process; `None` when absent or
-    /// a zombie.
+    /// Reads the identity of a live, non-zombie process: `None` when no
+    /// process has the pid (`ENOENT` or `ESRCH`) or it is a zombie.
+    ///
+    /// Any other error, such as `EMFILE` or `EACCES`, or a line that does not
+    /// parse, is returned: it says nothing about whether the process runs.
     pub fn of(pid: u32) -> std::io::Result<Option<ProcessId>> {
         if pid == 0 {
             return Ok(None);
         }
-        let path = format!("/proc/{pid}/stat");
-        let stat = match std::fs::read_to_string(&path) {
+        let stat = match read_stat(pid) {
             Ok(stat) => stat,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) if is_no_such_process(&err) => return Ok(None),
             Err(err) => return Err(err),
         };
         match parse_start_time(pid, &stat)? {
@@ -69,13 +71,110 @@ impl ProcessId {
         }
     }
 
-    /// True while that exact process (same start time) exists and is not a
-    /// zombie.
-    pub fn is_alive(&self) -> bool {
-        matches!(
-            ProcessId::of(self.pid),
-            Ok(Some(current)) if current.start_time == self.start_time
-        )
+    /// Whether that exact process (same start time) still runs.
+    pub fn liveness(&self) -> Liveness {
+        match ProcessId::of(self.pid) {
+            Ok(Some(current)) if current.start_time == self.start_time => Liveness::Alive,
+            Ok(_) => Liveness::Gone,
+            Err(err) => Liveness::Unknown(err),
+        }
+    }
+
+    /// `Ok(true)` while that exact process runs and `Ok(false)` once it is
+    /// gone. When `/proc` cannot tell, the error says that `action` was not
+    /// done: a caller then neither forgets the process nor signals a pid it
+    /// cannot tie to it.
+    fn confirm_alive(&self, action: &str) -> Result<bool, EngineError> {
+        match self.liveness() {
+            Liveness::Alive => Ok(true),
+            Liveness::Gone => Ok(false),
+            Liveness::Unknown(err) => Err(EngineError::Hypervisor(format!(
+                "cannot {action} cloud-hypervisor pid {}: cannot tell whether it still runs: {err}",
+                self.pid
+            ))),
+        }
+    }
+}
+
+/// What `/proc/<pid>/stat` says about a [`ProcessId`].
+///
+/// Only proof that the process is gone counts as gone. A read that fails for
+/// another reason leaves it [`Liveness::Unknown`], and no caller takes that
+/// for gone: a fence must not report a VMM stopped that may still run.
+#[derive(Debug)]
+pub enum Liveness {
+    /// That exact process exists and is not a zombie.
+    Alive,
+    /// The process is gone: no process has the pid (`ENOENT` or `ESRCH`), it
+    /// is a zombie, or the pid now belongs to another process (another start
+    /// time).
+    Gone,
+    /// `/proc/<pid>/stat` could not be read or parsed for another reason, such
+    /// as `EMFILE`, `ENFILE` or `EACCES`. The process may still run.
+    Unknown(std::io::Error),
+}
+
+/// True for the errors that prove no process has the pid: `ENOENT` once its
+/// `/proc` entry is gone, and `ESRCH` when it exits during the read.
+fn is_no_such_process(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::NotFound
+        || err.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
+}
+
+/// Reads `/proc/<pid>/stat`.
+fn read_stat(pid: u32) -> std::io::Result<String> {
+    #[cfg(test)]
+    if let Some(fault) = proc_faults::read(pid) {
+        return fault;
+    }
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+}
+
+/// Test injection: what reading one pid's `/proc/<pid>/stat` gives, so a test
+/// can make `/proc` fail for the stand-in VMM it started and for no other
+/// process.
+#[cfg(test)]
+pub(crate) mod proc_faults {
+    use std::sync::{Mutex, PoisonError};
+
+    /// What a read of the pid's `stat` gives.
+    #[derive(Clone)]
+    pub(crate) enum Fault {
+        /// The read fails with this errno.
+        Errno(i32),
+        /// The read returns this text.
+        Text(String),
+    }
+
+    static FAULTS: Mutex<Vec<(u32, Fault)>> = Mutex::new(Vec::new());
+
+    /// Until the guard drops, every read of `pid`'s `stat` gives `fault`.
+    pub(crate) fn inject(pid: u32, fault: Fault) -> Guard {
+        let mut faults = FAULTS.lock().unwrap_or_else(PoisonError::into_inner);
+        faults.retain(|(faulty, _)| *faulty != pid);
+        faults.push((pid, fault));
+        Guard(pid)
+    }
+
+    /// Removes its pid's fault when dropped.
+    pub(crate) struct Guard(u32);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FAULTS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|(faulty, _)| *faulty != self.0);
+        }
+    }
+
+    pub(super) fn read(pid: u32) -> Option<std::io::Result<String>> {
+        let faults = FAULTS.lock().unwrap_or_else(PoisonError::into_inner);
+        let (_, fault) = faults.iter().find(|(faulty, _)| *faulty == pid)?;
+        Some(match fault {
+            Fault::Errno(errno) => Err(std::io::Error::from_raw_os_error(*errno)),
+            Fault::Text(text) => Ok(text.clone()),
+        })
     }
 }
 
@@ -261,8 +360,10 @@ impl Vmm {
     /// `Ok(None)` when that exact process (pid plus start time) is gone. The
     /// process is watched with a pidfd, so the pid cannot be recycled under us;
     /// when it becomes readable the exit is published as [`VmmExit::Gone`].
+    /// When `/proc` cannot tell whether the process runs, this is an error, so
+    /// a VMM that may still run is never forgotten.
     pub fn adopt(id: ProcessId) -> Result<Option<Vmm>, EngineError> {
-        if !id.is_alive() {
+        if !id.confirm_alive("adopt")? {
             return Ok(None);
         }
         let pid = Pid::from_raw(id.pid as i32).ok_or_else(|| {
@@ -280,7 +381,7 @@ impl Vmm {
         };
         // The pid could have been recycled between the two checks; the pidfd
         // pins the process, and this re-check ties the fd to the start time.
-        if !id.is_alive() {
+        if !id.confirm_alive("adopt")? {
             return Ok(None);
         }
         let (exit, _receiver) = watch::channel(None);
@@ -332,10 +433,12 @@ impl Vmm {
     ///
     /// The signal goes through a pidfd opened after the start-time check, so a
     /// recycled pid can never receive it. A process that is already gone
-    /// (`ESRCH`) is not an error.
+    /// (`ESRCH`) is not an error. When `/proc` cannot tell whether the process
+    /// runs, nothing is sent and the error says so: the pid cannot be tied to
+    /// this VMM, and the caller must not take the VMM for killed.
     pub fn sigkill(&self) -> Result<(), EngineError> {
         let id = self.shared.id;
-        if !id.is_alive() {
+        if !id.confirm_alive("kill")? {
             return Ok(());
         }
         let pid = Pid::from_raw(id.pid as i32).ok_or_else(|| {
@@ -360,7 +463,7 @@ impl Vmm {
                 )));
             }
         };
-        if !id.is_alive() {
+        if !id.confirm_alive("kill")? {
             return Ok(());
         }
         match pidfd_send_signal(&pidfd, Signal::KILL) {
@@ -454,7 +557,8 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use super::{EngineError, ProcessId, Vmm, VmmExit, VmmLaunch, parse_start_time};
+    use super::proc_faults::{Fault, inject};
+    use super::{EngineError, Liveness, ProcessId, Vmm, VmmExit, VmmLaunch, parse_start_time};
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("quoro-vmm-{name}-{}", std::process::id()));
@@ -533,7 +637,7 @@ mod tests {
             .expect("own pid is alive");
         assert_eq!(id.pid, std::process::id());
         assert!(id.start_time > 0);
-        assert!(id.is_alive());
+        assert!(matches!(id.liveness(), Liveness::Alive));
     }
 
     #[test]
@@ -551,7 +655,123 @@ mod tests {
             pid: id.pid,
             start_time: id.start_time.wrapping_add(1),
         };
-        assert!(!impostor.is_alive());
+        assert!(matches!(impostor.liveness(), Liveness::Gone));
+    }
+
+    /// A `sleep` child of the test, so a fault can be injected for its pid
+    /// alone.
+    fn sleeper() -> (std::process::Child, ProcessId) {
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("sleep");
+        let id = ProcessId::of(child.id()).expect("stat").expect("alive");
+        (child, id)
+    }
+
+    /// A `stat` line of `pid` in state `state` with `start_time` as field 22.
+    fn stat_line(pid: u32, state: &str, start_time: u64) -> String {
+        format!("{pid} (sleep) {state} 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 {start_time}")
+    }
+
+    /// #459: only proof that the process is gone counts as gone; any other
+    /// failure to read `/proc` leaves it unknown.
+    #[test]
+    fn only_proof_that_a_process_is_gone_counts_as_gone() {
+        use rustix::io::Errno;
+
+        let (mut child, id) = sleeper();
+        assert!(matches!(id.liveness(), Liveness::Alive));
+        for errno in [Errno::MFILE, Errno::NFILE, Errno::ACCESS, Errno::NOMEM] {
+            let _fault = inject(id.pid, Fault::Errno(errno.raw_os_error()));
+            assert!(
+                matches!(id.liveness(), Liveness::Unknown(_)),
+                "{errno:?} is not proof"
+            );
+            assert!(ProcessId::of(id.pid).is_err(), "{errno:?}");
+        }
+        for errno in [Errno::NOENT, Errno::SRCH] {
+            let _fault = inject(id.pid, Fault::Errno(errno.raw_os_error()));
+            assert!(matches!(id.liveness(), Liveness::Gone), "{errno:?}");
+        }
+        for (text, what) in [
+            (String::new(), "an empty line"),
+            ("1 (sleep".to_string(), "a cut line"),
+            (format!("{} (sleep) S 1 2", id.pid), "a short line"),
+        ] {
+            let _fault = inject(id.pid, Fault::Text(text));
+            assert!(
+                matches!(id.liveness(), Liveness::Unknown(_)),
+                "{what} is not proof"
+            );
+        }
+        for (text, what) in [
+            (stat_line(id.pid, "Z", id.start_time), "a zombie"),
+            (
+                stat_line(id.pid, "S", id.start_time.wrapping_add(1)),
+                "another process with the pid",
+            ),
+        ] {
+            let _fault = inject(id.pid, Fault::Text(text));
+            assert!(matches!(id.liveness(), Liveness::Gone), "{what}");
+        }
+        {
+            let _fault = inject(id.pid, Fault::Text(stat_line(id.pid, "S", id.start_time)));
+            assert!(matches!(id.liveness(), Liveness::Alive), "the same process");
+        }
+        assert!(
+            matches!(id.liveness(), Liveness::Alive),
+            "the fault is gone"
+        );
+
+        // The real thing: a killed child is a zombie until it is reaped, and
+        // then it has no `/proc` entry.
+        child.kill().expect("kill");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while matches!(id.liveness(), Liveness::Alive) {
+            assert!(std::time::Instant::now() < deadline, "the child exits");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(matches!(id.liveness(), Liveness::Gone), "a zombie");
+        child.wait().expect("wait");
+        assert!(matches!(id.liveness(), Liveness::Gone), "reaped");
+    }
+
+    /// #459: a process `/proc` cannot tell about is neither forgotten by
+    /// `adopt` nor signalled by `sigkill`, since its pid cannot be tied to the
+    /// VMM; both say why.
+    #[tokio::test]
+    async fn adopt_and_sigkill_refuse_a_process_proc_cannot_tell_about() {
+        let (mut child, id) = sleeper();
+        let emfile = rustix::io::Errno::MFILE.raw_os_error();
+        {
+            let _fault = inject(id.pid, Fault::Errno(emfile));
+            match Vmm::adopt(id) {
+                Err(EngineError::Hypervisor(message)) => assert!(
+                    message.contains("cannot adopt") && message.contains("cannot tell"),
+                    "{message}"
+                ),
+                Err(other) => panic!("{other:?}"),
+                Ok(adopted) => panic!("adopt answered {:?}", adopted.map(|vmm| vmm.id())),
+            }
+        }
+        let vmm = Vmm::adopt(id).expect("adopt").expect("adopted");
+        {
+            let _fault = inject(id.pid, Fault::Errno(emfile));
+            match vmm.sigkill() {
+                Err(EngineError::Hypervisor(message)) => assert!(
+                    message.contains("cannot kill") && message.contains("cannot tell"),
+                    "{message}"
+                ),
+                other => panic!("{other:?}"),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(child.try_wait().expect("try_wait").is_none(), "no signal");
+        }
+        vmm.sigkill().expect("sigkill");
+        let status = child.wait().expect("wait");
+        use std::os::unix::process::ExitStatusExt as _;
+        assert_eq!(status.signal(), Some(9));
     }
 
     #[tokio::test]

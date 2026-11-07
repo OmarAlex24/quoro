@@ -148,8 +148,10 @@ async fn stop_one<E: Engine>(engine: &E, id: VmId, timers: FenceTimers) -> (VmId
     let failure = match tokio::time::timeout_at(force_deadline, forced).await {
         Ok(Ok(_)) => return (id, VmFenceOutcome::Forced),
         Ok(Err(EngineError::NotFound)) => return (id, VmFenceOutcome::Gone),
+        // The engine's `within` ends with `force_deadline`, so its own
+        // `Timeout` can come first: both read the same.
+        Ok(Err(EngineError::Timeout)) | Err(_) => "forced stop timed out".to_string(),
         Ok(Err(error)) => error.to_string(),
-        Err(_) => "forced stop timed out".to_string(),
     };
 
     // D-0074: the forced stop could not confirm anything, so look at the VM
