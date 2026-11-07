@@ -1167,17 +1167,299 @@ async fn a_copy_left_pending_is_resolved_by_its_hash() {
 }
 
 #[tokio::test]
-async fn a_stream_resolves_a_copy_left_pending_before_its_checks() {
+async fn the_listeners_bind_while_a_copy_left_pending_is_resolved_at_start_up() {
+    // Resolving a copy hashes the whole volume. Done before the first pass,
+    // it would keep every listener unbound and every target entry
+    // unpublished until each pending copy is resolved.
+    let h = Harness::new("pending-start").await;
+    let first = ship_first(&h).await;
+    let mut newer = first.clone();
+    newer.write(2 * CELL, &[6_u8; 4096]);
+    write_file(&h, &newer);
+    leave_pending(&h, 2, &newer).await;
+
+    // A second receiver over the same store, engine and locks, as after a
+    // restart, listening on a port of its own.
+    let port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe");
+        probe.local_addr().expect("addr").port()
+    };
+    let mut target = entry(5);
+    target.warm.as_mut().expect("warm").port = port;
+    let (_desired, desired_rx) = watch::channel(Some(snapshot(1, vec![target])));
+    let (board, mut statuses) = StatusBoard::new();
+    let restarted = WarmReceiver::new(
+        Arc::clone(&h.engine),
+        h.store.clone(),
+        desired_rx,
+        h.locks.clone(),
+        board,
+        ReceiverOptions::quick(),
+    );
+    let gate = restarted.inner.recovery_gate.lock().await;
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(restarted.clone().run(async {
+        let _ = stopped.await;
+    }));
+
+    // The copy is not resolved, and still the listener accepts and the
+    // entry is published.
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_for("the listener, while the copy is resolved", || async {
+        TcpStream::connect(addr).await.is_ok()
+    })
+    .await;
+    let published = board_where(&mut statuses, |entries| entries.len() == 1).await;
+    assert_eq!(published[0].snapshot_seq, Some(1), "{published:?}");
+    // A stream of the volume is refused `busy` meanwhile, and names the copy
+    // the store names as complete.
+    let mut third = newer.clone();
+    third.write(3 * CELL, &[1_u8; 10]);
+    post_to(
+        addr,
+        super::REPLICATE_PATH,
+        stream(&header(5, 3, Some(2)), &third, &[(3 * CELL, 10)]),
+        End::Complete,
+    )
+    .await
+    .expect("a reply")
+    .assert_refused("busy", Some(1));
+    assert!(h.row().await.pending.is_some(), "not resolved yet");
+
+    drop(gate);
+    settled(&h).await;
+    h.assert_copy(&newer, Some(2), &newer.touched).await;
+    assert_eq!(statuses.borrow()[0].snapshot_seq, Some(2));
+    post_to(
+        addr,
+        super::REPLICATE_PATH,
+        stream(&header(5, 3, Some(2)), &third, &[(3 * CELL, 10)]),
+        End::Complete,
+    )
+    .await
+    .expect("a reply")
+    .assert_complete(3);
+    h.assert_copy(&third, Some(3), &third.touched).await;
+
+    let _ = stop.send(());
+    task.await.expect("the receiver stops");
+}
+
+#[tokio::test]
+async fn a_copy_a_stream_resolved_meanwhile_is_not_resolved_again_at_start_up() {
+    // The start-up reads the pending rows, then waits for each volume's
+    // lock. A stream can resolve the copy and swap a newer one in while it
+    // waits; the row it read before is out of date by then.
+    let h = Harness::new("pending-overtaken").await;
+    let first = ship_first(&h).await;
+    let mut newer = first.clone();
+    newer.write(2 * CELL, &[6_u8; 4096]);
+    leave_pending(&h, 2, &newer).await;
+
+    let held = h.locks.lock(VOL).await;
+    let recovering = h.receiver.clone();
+    let task = tokio::spawn(async move { recovering.recover_pending().await });
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        h.receiver.inner.pending_listed.notified(),
+    )
+    .await
+    .expect("the start-up lists the pending copies");
+    // What a stream does under the lock: it resolves the copy and swaps seq
+    // 3 in.
+    let mut third = newer.clone();
+    third.write(4 * CELL, &[8_u8; 4096]);
+    write_file(&h, &third);
+    let mut row = h.row().await;
+    row.pending = None;
+    row.complete_seq = Some(3);
+    row.taken_at = Some("2026-11-06T10:01:59Z".to_owned());
+    row.completed_at = Some("2026-11-06T10:02:01Z".to_owned());
+    row.cells = Some(third.hashes().to_bytes());
+    h.store.save_warm_target(&row).await.expect("save");
+    drop(held);
+
+    tokio::time::timeout(Duration::from_secs(30), task)
+        .await
+        .expect("the start-up resolution ends")
+        .expect("its task");
+    h.assert_copy(&third, Some(3), &third.touched).await;
+}
+
+#[tokio::test]
+async fn a_copy_left_pending_that_is_deleted_is_not_hashed_and_waits_for_nothing() {
+    let h = Harness::new("pending-deleted").await;
+    let first = ship_first(&h).await;
+    let mut newer = first.clone();
+    newer.write(2 * CELL, &[6_u8; 4096]);
+    leave_pending(&h, 2, &newer).await;
+    h.set_entry(|entry| entry.state = SpecVolumeState::Deleted);
+
+    // The start-up skips it: with the gate held, a hash would never end.
+    let gate = h.receiver.inner.recovery_gate.lock().await;
+    tokio::time::timeout(Duration::from_secs(5), h.receiver.recover_pending())
+        .await
+        .expect("a copy about to be deleted is not resolved first");
+    assert!(h.row().await.pending.is_some(), "not hashed");
+    drop(gate);
+
+    // A pass does not wait while something holds the volume.
+    let mut listeners = BTreeMap::new();
+    let held = h.locks.lock(VOL).await;
+    tokio::time::timeout(Duration::from_secs(5), h.receiver.pass(&mut listeners))
+        .await
+        .expect("the pass does not wait for the volume's lock");
+    assert!(!h.row().await.removed, "kept while the volume is held");
+    assert!(h.volume_path.exists());
+    // The copy left the status with that pass, so the primary stops sending
+    // the entry: the copy still goes once the volume is free, with no pass.
+    h.desired.send_modify(|current| {
+        let snapshot = current.as_mut().expect("a snapshot");
+        snapshot.rev += 1;
+        snapshot.state.rev = snapshot.rev;
+        snapshot.state.spec.volumes.clear();
+    });
+    drop(held);
+    wait_for("the copy to be removed", || async { h.row().await.removed }).await;
+    assert!(!h.volume_path.exists());
+}
+
+#[tokio::test]
+async fn a_held_copy_whose_entry_is_present_again_once_it_is_free_is_kept() {
+    // The node may be the target again, or the source of the volume, whose
+    // file the reconciler adopts: a removal that waited must not go ahead.
+    let h = Harness::new("deleted-then-present").await;
+    let first = ship_first(&h).await;
+    h.set_entry(|entry| entry.state = SpecVolumeState::Deleted);
+    let mut listeners = BTreeMap::new();
+    let held = h.locks.lock(VOL).await;
+    tokio::time::timeout(Duration::from_secs(5), h.receiver.pass(&mut listeners))
+        .await
+        .expect("the pass does not wait for the volume's lock");
+    assert!(!h.receiver.inner.deleting.lock().expect("set").is_empty());
+    h.set_entry(|entry| entry.state = SpecVolumeState::Present);
+    drop(held);
+    wait_for("the removal task to end", || async {
+        h.receiver.inner.deleting.lock().expect("set").is_empty()
+    })
+    .await;
+    assert!(!h.row().await.removed, "the copy is kept");
+    h.assert_copy(&first, Some(1), &first.touched).await;
+}
+
+#[tokio::test]
+async fn a_copy_left_pending_of_the_nodes_own_volume_is_not_hashed_at_start_up() {
+    // A node that turned from target into source holds the volume as its
+    // own: the file is the live volume, and its warm record waits for the
+    // hand-over.
+    let h = Harness::new("pending-own").await;
+    let first = ship_first(&h).await;
+    let mut newer = first.clone();
+    newer.write(2 * CELL, &[6_u8; 4096]);
+    leave_pending(&h, 2, &newer).await;
+    h.store
+        .save_volume(&VolumeRecord {
+            volume_id: VOL.to_owned(),
+            app_id: APP.to_owned(),
+            size_gb: 1,
+            state: VolumeState::Ready,
+            error: None,
+            allocated_bytes: None,
+        })
+        .await
+        .expect("row");
+    let gate = h.receiver.inner.recovery_gate.lock().await;
+    tokio::time::timeout(Duration::from_secs(5), h.receiver.recover_pending())
+        .await
+        .expect("the node's own volume is not resolved");
+    drop(gate);
+    assert!(h.row().await.pending.is_some(), "not hashed");
+}
+
+#[tokio::test]
+async fn a_copy_that_cannot_be_resolved_stays_pending_and_says_why() {
+    let h = Harness::new("pending-unresolved").await;
+    let first = ship_first(&h).await;
+    let mut newer = first.clone();
+    newer.write(2 * CELL, &[6_u8; 4096]);
+    write_file(&h, &newer);
+    leave_pending(&h, 2, &newer).await;
+    let mut third = newer.clone();
+    third.write(3 * CELL, &[1_u8; 10]);
+    let next = || stream(&header(5, 3, Some(2)), &third, &[(3 * CELL, 10)]);
+
+    h.engine.fail_next(
+        FakeOp::StageVolume,
+        EngineError::Io("the disk is full".to_owned()),
+    );
+    h.post(next(), End::Complete)
+        .await
+        .expect("a reply")
+        .assert_refused("busy", Some(1));
+    settled(&h).await;
+    assert!(h.row().await.pending.is_some(), "still pending");
+    let error = h.status().error.expect("an error");
+    assert!(
+        error.contains("could not resolve the copy left pending")
+            && error.contains("the disk is full"),
+        "{error}"
+    );
+    // The next stream resolves it, which clears that error, and the one
+    // after lands.
+    h.post(next(), End::Complete)
+        .await
+        .expect("a reply")
+        .assert_refused("busy", Some(1));
+    settled(&h).await;
+    h.assert_copy(&newer, Some(2), &newer.touched).await;
+    assert!(h.status().error.is_none(), "{:?}", h.status());
+    h.post(next(), End::Complete)
+        .await
+        .expect("a reply")
+        .assert_complete(3);
+    assert!(h.status().error.is_none(), "{:?}", h.status());
+}
+
+#[tokio::test]
+async fn a_stream_that_finds_the_copy_pending_is_busy_until_it_is_resolved() {
     let h = Harness::new("pending-stream").await;
     let first = ship_first(&h).await;
     let mut newer = first.clone();
     newer.write(2 * CELL, &[6_u8; 4096]);
     write_file(&h, &newer);
     leave_pending(&h, 2, &newer).await;
-    // The source got no answer for seq 2 and ships seq 3 from base 2, which
-    // the target holds once it resolved the pending copy.
     let mut third = newer.clone();
     third.write(3 * CELL, &[1_u8; 10]);
+    // The stream does not wait for the hash, which reads the whole volume:
+    // below the 20 s `post` waits for a reply, so a receiver that resolves
+    // the copy before it answers fails here.
+    let gate = h.receiver.inner.recovery_gate.lock().await;
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        h.post(
+            stream(&header(5, 3, Some(2)), &third, &[(3 * CELL, 10)]),
+            End::Complete,
+        ),
+    )
+    .await
+    .expect("the answer does not wait for the copy to be resolved")
+    .expect("a reply")
+    .assert_refused("busy", Some(1));
+    assert!(h.row().await.pending.is_some(), "not resolved yet");
+    // Until it is, the volume's lock is held: the next stream is busy too.
+    h.post(
+        stream(&header(5, 3, Some(2)), &third, &[(3 * CELL, 10)]),
+        End::Complete,
+    )
+    .await
+    .expect("a reply")
+    .assert_refused("busy", Some(1));
+    drop(gate);
+    settled(&h).await;
+    h.assert_copy(&newer, Some(2), &newer.touched).await;
+    assert_eq!(h.status().snapshot_seq, Some(2));
+    // The source got no answer for seq 2 and ships seq 3 from base 2, which
+    // the target holds now that it resolved the pending copy.
     h.post(
         stream(&header(5, 3, Some(2)), &third, &[(3 * CELL, 10)]),
         End::Complete,

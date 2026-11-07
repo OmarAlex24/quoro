@@ -24,7 +24,7 @@
 //!      of the volume is deleted (the engine deletes the file before the
 //!      store forgets it);
 //!    - `busy`: the target is still applying an earlier stream of this
-//!      node, so only `next` goes;
+//!      node, or resolving its copy, so only `next` goes;
 //!    - `root_mismatch`: the base and the target's copy disagree on content,
 //!      so every kept snapshot goes and the next cycle ships a full copy;
 //!    - any other refusal names the target's copy: the kept snapshot with
@@ -843,8 +843,9 @@ impl<E: Engine + 'static> Inner<E> {
             held.map_or_else(|| "no copy".to_owned(), |held| format!("snapshot {held}"))
         );
         match reason {
-            // An earlier stream of this node is still being applied: what
-            // the target holds is about to change, so nothing moves.
+            // An earlier stream of this node is still being applied, or the
+            // target is resolving its copy: what the target holds is about
+            // to change, so nothing moves.
             RefuseReason::Busy => {
                 self.release(next).await;
             }
