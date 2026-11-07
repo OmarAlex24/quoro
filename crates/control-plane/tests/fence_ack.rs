@@ -999,11 +999,14 @@ async fn a_revoke_answered_fence_failed_lists_its_lease() {
     let frames = recv_until(&mut socket, &["command"]).await;
     let command = of_type(&frames, "command")[0];
     assert_eq!(command["body"]["kind"], "fence_ack");
-    // A lease with no row has no token: the acknowledgement goes out
-    // without `fencing_tokens`, and the node clears it by lease id.
+    // P-0273: a lease with no row gets the highest token the change log
+    // carries, so the node clears every failed fence of it.
     assert_eq!(
         command["body"]["params"],
-        json!({ "lease_ids": [UNKNOWN_LEASE] }),
+        json!({
+            "lease_ids": [UNKNOWN_LEASE],
+            "fencing_tokens": { UNKNOWN_LEASE: 9_007_199_254_740_991u64 },
+        }),
         "{command}"
     );
     reply(
