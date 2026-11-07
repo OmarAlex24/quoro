@@ -6,11 +6,13 @@
 
 use clap::{Args, Parser, Subcommand};
 use clap_complete::Shell;
+use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "quoro",
     about = "Operate a Quoro cluster through its primary's API",
+    arg_required_else_help = true,
     after_help = "Host commands (serve, join, node, mcp stdio, audit verify, ...): quoro help host"
 )]
 pub struct Cli {
@@ -54,6 +56,10 @@ pub struct Global {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Save a context and its credential: an agent's key file
+    Login(LoginArgs),
+    /// Show the context and the identity behind its credential
+    Whoami,
     /// Call any API operation and print the response body
     Api(ApiArgs),
     /// Print a shell completion script
@@ -72,4 +78,26 @@ pub struct ApiArgs {
     /// The JSON request body: @FILE, or - to read it from stdin
     #[arg(long, value_name = "@FILE|-")]
     pub data: Option<String>,
+    /// When the call needs approval, file the approval request
+    #[arg(long)]
+    pub request_approval: bool,
+    /// With --request-approval: wait for the decision and repeat the call once approved
+    #[arg(long, requires = "request_approval")]
+    pub wait: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct LoginArgs {
+    /// Log in as an agent, with --key-file
+    #[arg(long, requires = "key_file")]
+    pub agent: bool,
+    /// The file holding the agent key (mode 0600); its path is saved, never the key
+    #[arg(long, value_name = "PATH", requires = "agent")]
+    pub key_file: Option<PathBuf>,
+    /// The primary, https://host[:port] (default: the context's)
+    #[arg(long, value_name = "URL")]
+    pub url: Option<String>,
+    /// The SHA-256 of the primary's certificate, sha256:<hex>
+    #[arg(long, value_name = "FP")]
+    pub fingerprint: Option<String>,
 }

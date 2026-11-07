@@ -6,25 +6,29 @@
 //! `--json` (keys then come out sorted); an error is mapped to its exit code.
 //! A request body is read from a file or stdin, never from the command line,
 //! where any local user could read it in the process list.
+//!
+//! An agent's call that changes something needs `--reason`. A call answered
+//! `approval_required` can file the approval request (`--request-approval`)
+//! and wait for the decision (`--wait`), then runs again unchanged
+//! (`approval.rs`).
 
+use crate::Environment;
+use crate::agent;
+use crate::approval;
 use crate::cli::{ApiArgs, Global};
-use crate::context::{self, Context, Trust};
+use crate::client::{self, Answer, Call, Session};
+use crate::context;
 use crate::error::{Failure, exit};
-use crate::{Environment, tls};
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
-use reqwest::{Client, Method, Response};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::{Method, Response};
 use std::io::{Read as _, Write};
-use std::time::Duration;
-
-/// The TCP connection and the TLS handshake together, so an address that
-/// never answers fails in bounded time; the node agent uses the same bound.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub async fn run(
     global: &Global,
     args: ApiArgs,
     environment: &Environment,
     stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> Result<(), Failure> {
     // Everything local is checked before the context, so a typo never
     // reaches the network.
@@ -36,41 +40,64 @@ pub async fn run(
         )));
     }
     let body = args.data.as_deref().map(read_body).transpose()?;
-    let mut headers = change_headers(&method, global)?;
+    let justification = environment.justification(global);
+    let headers = change_headers(&method, justification.as_deref(), global)?;
     let context = context::resolve(global.context.as_deref(), environment)?;
-    if let Some(token) = &context.token {
-        let mut value = HeaderValue::from_str(&format!("Bearer {}", token.expose()))
-            .map_err(|_| Failure::other("the token is not a valid header value"))?;
-        value.set_sensitive(true);
-        headers.insert(AUTHORIZATION, value);
+    // An agent says why it changes something (permission-model.md section
+    // 10, D-0031); without a reason nothing is sent, not even a mint.
+    if method != Method::GET && context.is_agent() && justification.is_none() {
+        return Err(Failure::usage(format!(
+            "an agent must say why it calls {} {}: pass --reason TEXT or set QUORO_JUSTIFICATION; nothing was sent",
+            method, args.path
+        )));
     }
-    let mut request = client(&context)?
-        .request(method, format!("{}{}", context.url, args.path))
-        .headers(headers);
-    if let Some(body) = body {
-        request = request.header(CONTENT_TYPE, "application/json").body(body);
-    }
+    let mint_reason = justification
+        .clone()
+        .unwrap_or_else(|| agent::default_justification("api"));
+    let mut session = Session::open(context, environment, &mint_reason)?;
+    let call = Call {
+        method,
+        path: args.path,
+        headers,
+        body,
+    };
 
-    let response = request
-        .send()
-        .await
-        .map_err(|e| unreachable(&context.url, &e))?;
-    let request_id = response
-        .headers()
-        .get("quoro-request-id")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let status = response.status();
-    if !status.is_success() {
-        let body = read_all(response, &context.url, request_id.clone()).await?;
-        if global.json {
-            write(stdout, &body)?;
+    let response = session.send(&call).await?;
+    let response = if !response.status().is_success() && args.request_approval {
+        let answer = Answer::read(response, &session.context.url).await?;
+        let failure = answer.failure();
+        if failure.code != exit::APPROVAL_REQUIRED {
+            return fail(answer, global, stdout);
         }
-        return Err(Failure::from_response(status.as_u16(), &body, request_id));
+        let request = approval::Request {
+            call: &call,
+            justification: justification.as_deref(),
+            incident: global.incident.as_deref(),
+            json: global.json,
+            wait: args.wait,
+        };
+        approval::file(&mut session, &request, &answer.body, stdout, stderr).await?
+    } else {
+        response
+    };
+    output(response, &session.context.url, environment, global, stdout).await
+}
+
+/// Prints a response: the body of a success, or the failure of an error.
+async fn output(
+    response: Response,
+    url: &str,
+    environment: &Environment,
+    global: &Global,
+    stdout: &mut dyn Write,
+) -> Result<(), Failure> {
+    let request_id = client::request_id(&response);
+    if !response.status().is_success() {
+        return fail(Answer::read(response, url).await?, global, stdout);
     }
     let pretty = environment.stdout_is_terminal && !global.json && is_json(&response);
     if pretty {
-        let body = read_all(response, &context.url, request_id).await?;
+        let body = client::read_all(response, url, request_id).await?;
         match serde_json::from_slice::<serde_json::Value>(&body) {
             Ok(value) => {
                 let text = serde_json::to_string_pretty(&value).unwrap_or_default();
@@ -79,8 +106,16 @@ pub async fn run(
             Err(_) => write(stdout, &body),
         }
     } else {
-        stream(response, &context.url, request_id, stdout).await
+        stream(response, url, request_id, stdout).await
     }
+}
+
+/// An error answer: its body on stdout with `--json`, and its failure.
+fn fail(answer: Answer, global: &Global, stdout: &mut dyn Write) -> Result<(), Failure> {
+    if global.json {
+        write(stdout, &answer.body)?;
+    }
+    Err(answer.failure())
 }
 
 /// The method, in any case; only those the API uses.
@@ -119,16 +154,20 @@ fn read_body(data: &str) -> Result<Vec<u8>, Failure> {
     Ok(body)
 }
 
-/// `--reason` and `--incident` on a call that changes something
-/// (`docs/contracts/README.md`, "Request headers").
-fn change_headers(method: &Method, global: &Global) -> Result<HeaderMap, Failure> {
+/// `--reason` (or `QUORO_JUSTIFICATION`) and `--incident` on a call that
+/// changes something (`docs/contracts/README.md`, "Request headers").
+fn change_headers(
+    method: &Method,
+    justification: Option<&str>,
+    global: &Global,
+) -> Result<HeaderMap, Failure> {
     let mut headers = HeaderMap::new();
     if *method == Method::GET {
         return Ok(headers);
     }
     let fields = [
-        ("quoro-justification", "--reason", &global.reason),
-        ("quoro-incident", "--incident", &global.incident),
+        ("quoro-justification", "--reason", justification),
+        ("quoro-incident", "--incident", global.incident.as_deref()),
     ];
     for (name, flag, value) in fields {
         let Some(value) = value else { continue };
@@ -139,55 +178,12 @@ fn change_headers(method: &Method, global: &Global) -> Result<HeaderMap, Failure
     Ok(headers)
 }
 
-fn client(context: &Context) -> Result<Client, Failure> {
-    let config = match context.trust {
-        Trust::Pin(pin) => tls::pinned(pin),
-        Trust::System => tls::system(),
-    }
-    .map_err(Failure::other)?;
-    Client::builder()
-        .use_preconfigured_tls(config)
-        .connect_timeout(CONNECT_TIMEOUT)
-        // The API never redirects; a redirect is not followed with the token.
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!("quoro/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|e| Failure::other(format!("cannot build the HTTP client: {e}")))
-}
-
 fn is_json(response: &Response) -> bool {
     response
         .headers()
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.starts_with("application/json"))
-}
-
-/// No response, or one cut short. The innermost cause is the useful one: a
-/// pin mismatch is several layers below "error sending request".
-fn unreachable(url: &str, error: &reqwest::Error) -> Failure {
-    let mut cause: &dyn std::error::Error = error;
-    while let Some(source) = cause.source() {
-        cause = source;
-    }
-    Failure::new(
-        exit::UNREACHABLE,
-        format!("cannot reach the primary at {url}: {cause}"),
-    )
-}
-
-async fn read_all(
-    response: Response,
-    url: &str,
-    request_id: Option<String>,
-) -> Result<Vec<u8>, Failure> {
-    match response.bytes().await {
-        Ok(body) => Ok(body.to_vec()),
-        Err(e) => Err(Failure {
-            request_id,
-            ..unreachable(url, &e)
-        }),
-    }
 }
 
 /// Copies the body as it arrives, so a stream through `quoro api` prints
@@ -205,14 +201,14 @@ async fn stream(
             Err(e) => {
                 return Err(Failure {
                     request_id,
-                    ..unreachable(url, &e)
+                    ..client::unreachable(url, &e)
                 });
             }
         }
     }
 }
 
-fn write(stdout: &mut dyn Write, bytes: &[u8]) -> Result<(), Failure> {
+pub(crate) fn write(stdout: &mut dyn Write, bytes: &[u8]) -> Result<(), Failure> {
     stdout
         .write_all(bytes)
         .and_then(|()| stdout.flush())

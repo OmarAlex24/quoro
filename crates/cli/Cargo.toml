@@ -48,6 +48,9 @@ serde = { version = "1", default-features = false, features = [
 ] }
 # Reads problem bodies and pretty-prints JSON for a terminal.
 serde_json = { version = "1", default-features = false, features = ["std"] }
+# The timers of `--wait`: the poll interval and the bound on each read of the
+# event stream. The runtime is the binary's; reqwest already runs on tokio.
+tokio = { version = "1", default-features = false, features = ["time"] }
 
 [dev-dependencies]
 # The end-to-end tests run an in-process primary: the control plane's router

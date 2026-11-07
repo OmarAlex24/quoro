@@ -14,13 +14,24 @@
 //! the SHA-256 pin of its self-signed certificate or the host's CA store.
 //! Errors from the API are mapped to fixed exit codes ([`exit`]) so a script
 //! or an agent can branch on them without reading text.
+//!
+//! An agent logs in with its key file (`login.rs`); every command then mints
+//! a short-lived access token from it, cached between commands (`agent.rs`).
+//! An agent must say why it changes something (`--reason`), and a destructive
+//! call it may not make yet can file an approval request and wait for a
+//! human's decision (`approval.rs`).
 
+mod agent;
 mod api;
+mod approval;
 mod cli;
+mod client;
 mod context;
 mod error;
+mod login;
 pub mod operations;
 mod tls;
+mod whoami;
 
 use clap::Parser as _;
 use std::collections::BTreeMap;
@@ -37,15 +48,21 @@ const VARIABLES: &[&str] = &[
     "QUORO_URL",
     "QUORO_FINGERPRINT",
     "QUORO_TOKEN",
+    "QUORO_AGENT_KEY_FILE",
+    "QUORO_JUSTIFICATION",
+    "XDG_RUNTIME_DIR",
+    "XDG_CACHE_HOME",
 ];
 
 /// What the client reads from its process: environment variables and whether
-/// stdout is a terminal. Tests build one by hand, so they never change the
-/// test process's environment.
+/// stdout and stdin are terminals. Tests build one by hand, so they never
+/// change the test process's environment.
 #[derive(Clone, Debug, Default)]
 pub struct Environment {
     vars: BTreeMap<String, String>,
     stdout_is_terminal: bool,
+    /// Whether a question can be asked (`quoro login`'s first contact).
+    stdin_is_terminal: bool,
 }
 
 impl Environment {
@@ -59,6 +76,7 @@ impl Environment {
         Self {
             vars,
             stdout_is_terminal: std::io::stdout().is_terminal(),
+            stdin_is_terminal: std::io::stdin().is_terminal(),
         }
     }
 
@@ -75,6 +93,7 @@ impl Environment {
                 .map(|(key, value)| (key.into(), value.into()))
                 .collect(),
             stdout_is_terminal,
+            stdin_is_terminal: false,
         }
     }
 
@@ -84,6 +103,17 @@ impl Environment {
             .get(name)
             .map(String::as_str)
             .filter(|value| !value.is_empty())
+    }
+
+    /// The command's justification: `--reason`, else `QUORO_JUSTIFICATION`.
+    fn justification(&self, global: &cli::Global) -> Option<String> {
+        global
+            .reason
+            .as_deref()
+            .or(self.var("QUORO_JUSTIFICATION"))
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
     }
 }
 
@@ -129,7 +159,11 @@ pub async fn run_with(
         }
     };
     let result = match cli.command {
-        cli::Command::Api(args) => api::run(&cli.global, args, environment, stdout).await,
+        cli::Command::Login(args) => {
+            login::run(&cli.global, args, environment, stdout, stderr).await
+        }
+        cli::Command::Whoami => whoami::run(&cli.global, environment, stdout).await,
+        cli::Command::Api(args) => api::run(&cli.global, args, environment, stdout, stderr).await,
         cli::Command::Completion { shell } => {
             clap_complete::generate(shell, &mut command(), "quoro", stdout);
             Ok(())
