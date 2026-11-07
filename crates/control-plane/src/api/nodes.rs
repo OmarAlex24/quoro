@@ -635,10 +635,9 @@ fn stored_token(token: i64) -> u64 {
 /// Every listed lease is still acknowledged to the node, each with a token
 /// (ADR 0245): a lease the node holds, its token after the increment; one
 /// another node holds, that lease's token plus one, so the node clears a
-/// failed fence it recorded at that token (ADR 0247). The node clears only
-/// the failed fences below its lease's token. A lease with no row gets no
-/// token, and the acknowledgement then goes out without `fencing_tokens`, as
-/// a primary before ADR 0245 sends it.
+/// failed fence it recorded at that token (ADR 0247); and one with no row,
+/// [`crate::fences::UNKNOWN_LEASE_TOKEN`] (P-0273). The node clears only the
+/// failed fences below its lease's token.
 async fn fence_ack_tx(
     state: &AppState,
     ctx: &CallCtx,
@@ -700,19 +699,17 @@ async fn fence_ack_tx(
     pending.acked_at = now_rfc3339();
     for lease_id in lease_ids {
         let token = match bumped.iter().find(|lease| &lease.id == lease_id) {
-            Some(lease) => Some(stored_token(lease.fencing_token)),
-            // Another node holds it (ADR 0247), or it has no row.
-            None => crate::leases::by_id(&mut w.tx, lease_id)
-                .await?
-                .map(|lease| stored_token(lease.fencing_token).saturating_add(1)),
+            Some(lease) => stored_token(lease.fencing_token),
+            None => match crate::leases::by_id(&mut w.tx, lease_id).await? {
+                // Another node holds it (ADR 0247).
+                Some(lease) => stored_token(lease.fencing_token).saturating_add(1),
+                None => crate::fences::UNKNOWN_LEASE_TOKEN,
+            },
         };
         if !pending.lease_ids.contains(lease_id) {
             pending.lease_ids.push(lease_id.clone());
         }
-        match token {
-            Some(token) => pending.fencing_tokens.insert(lease_id.clone(), token),
-            None => pending.fencing_tokens.remove(lease_id),
-        };
+        pending.fencing_tokens.insert(lease_id.clone(), token);
     }
     sqlx::query("UPDATE nodes SET fence_failure = NULL, fence_ack_pending = ? WHERE id = ?")
         .bind(crate::fences::pending_text(Some(&pending))?)

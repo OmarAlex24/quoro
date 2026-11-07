@@ -43,11 +43,27 @@ pub(crate) struct FenceAckPending {
     /// The acknowledged token of each lease in `lease_ids`: for a lease the
     /// node still holds, its `fencing_token` after the acknowledgement's
     /// increment; for one another node holds, that lease's token plus one
-    /// (ADR 0247). A lease with no row has none, and neither has an
-    /// acknowledgement a primary before ADR 0245 recorded.
+    /// (ADR 0247); for one with no row, [`UNKNOWN_LEASE_TOKEN`]. An
+    /// acknowledgement a primary before ADR 0245 recorded has none.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub fencing_tokens: BTreeMap<String, u64>,
 }
+
+/// The acknowledged token of a listed lease the primary has no row for
+/// (P-0273). Lease rows are never deleted, so this is a lease only a node
+/// knows, such as one a restore from an older backup lost. The primary
+/// grants it to no node, and sends the node nothing about it but the revoke
+/// of section 5.1 at each session start, which the node answers before the
+/// `fence_ack` goes out (section 8.5 step 4). So, as for a lease another
+/// node holds (ADR 0247), every failed fence the node records for it before
+/// the acknowledgement is delivered is one the operator saw or one its
+/// revoke answer lists again, and the highest token clears them all.
+///
+/// It is 2^53 - 1, the highest integer canonical JSON carries
+/// (`quoro_proto::jcs`): `fence_ack_pending` is part of the node's
+/// change-log payload. Every grant writes its lease row, token included, to
+/// the change log too, so no primary issues a token above it.
+pub(crate) const UNKNOWN_LEASE_TOKEN: u64 = (1 << 53) - 1;
 
 /// One delivery of the pending acknowledgement (section 8.5 step 4): the
 /// lease ids and the tokens stored for them when it went out.
@@ -75,9 +91,9 @@ impl Delivery {
 impl FenceAckPending {
     /// The next `fence_ack` of this acknowledgement (section 8.5 step 4), the
     /// same on every delivery while nothing changes. A lease without a stored
-    /// token, which an acknowledgement recorded before ADR 0245 or one of a
-    /// lease with no row leaves, goes out in a `fence_ack` of its own without
-    /// `fencing_tokens`, and the node clears it by lease id. The leases with
+    /// token, which only an acknowledgement recorded before ADR 0245 leaves,
+    /// goes out in a `fence_ack` of its own without `fencing_tokens`, and the
+    /// node clears it by lease id. The leases with
     /// a token follow, with their tokens, once the node answered it: one
     /// without tokens would clear them by lease id too, a failed fence the
     /// operator never saw included.
@@ -604,6 +620,21 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    /// P-0273: the token of a lease with no row is the highest integer the
+    /// change log can carry.
+    #[test]
+    fn the_token_of_a_lease_with_no_row_is_the_highest_the_change_log_carries() {
+        assert_eq!(UNKNOWN_LEASE_TOKEN, 9_007_199_254_740_991);
+        let pending = FenceAckPending {
+            acked_at: now_rfc3339(),
+            lease_ids: vec!["lse_gone".to_string()],
+            fencing_tokens: BTreeMap::from([("lse_gone".to_string(), UNKNOWN_LEASE_TOKEN)]),
+        };
+        let value = serde_json::to_value(&pending).unwrap();
+        assert!(crate::jcs::canonicalize(&value).is_ok());
+        assert!(crate::jcs::canonicalize(&json!(UNKNOWN_LEASE_TOKEN + 1)).is_err());
     }
 
     /// Section 8.5 step 4 and section 5.17: an acknowledgement with leases
