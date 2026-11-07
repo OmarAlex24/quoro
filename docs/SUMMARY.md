@@ -253,6 +253,7 @@
   - [0246: A fence started by a lease_revoke records its failure with the revoke's token; a fence acknowledgement bumps only the listed leases the node still holds](adr/0246-a-fence-started-by-a-lease-revoke-records-its-failure-with.md)
   - [0247: fence_ack stores current token + 1 for a listed lease another node holds, so the node can clear a failure recorded at that token](adr/0247-fence-ack-stores-current-token-1-for-a-listed-lease-another.md)
   - [0248: Warm replication: a root_mismatch answer makes the source's base a lost base; the source deletes it and the next cycle ships a full copy](adr/0248-warm-replication-a-root-mismatch-answer-makes-the-source-s.md)
+  - [0249: Panel redesign: a projects grid, a project canvas and a side sheet, drawn with a two-tone dither visual system](adr/0249-panel-redesign-a-projects-grid-a-project-canvas-and-a-side.md)
   - [0250: A failed engine start, an error or a Timeout, waits the reconciler's crash backoff before the next start; an explicit restart clears it](adr/0250-a-failed-engine-start-an-error-or-a-timeout-waits-the.md)
   - [0253: Baseline stack: same as ADR 0056 except metrics, which the panel draws with its own canvas charts instead of uPlot](adr/0253-baseline-stack-same-as-adr-0056-except-metrics-which-the.md)
   - [0254: A converted lease's first gate counts the conversion grant's duration](adr/0254-a-converted-lease-s-first-gate-counts-the-conversion-grant.md)
