@@ -13,9 +13,9 @@
 //! one the database no longer gives it. Such a copy gets a `deleted` entry
 //! once no failover can need it, and keeps it while the node reports the
 //! copy ([`stale_copies`], ADR 0267). A copy kept because a failover may
-//! still need it is checked again at each of the node's reports, at least
-//! every 30 s. The reports live in memory, so after a primary restart the
-//! node's first report brings the copy back into view.
+//! still need it is checked again at each of the node's reports. The reports
+//! live in memory, so after a primary restart the node's first report brings
+//! the copy back into view.
 //!
 //! Nothing about a copy's progress is stored (migration 0011). The primary
 //! keeps each node's newest `status_report.warm` in memory, as it does for the
@@ -914,6 +914,12 @@ mod tests {
                 "no warm node yet",
                 Some(ready.clone()),
                 Some(app("warm", None, held)),
+                false,
+            ),
+            (
+                "this node is the warm node, before its pair entry is sent",
+                Some(ready.clone()),
+                Some(app("warm", Some("nod_t"), held)),
                 false,
             ),
             (
