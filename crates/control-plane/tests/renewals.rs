@@ -408,12 +408,20 @@ async fn a_renewal_is_answered_at_its_token_while_voters_support_it() {
 }
 
 /// Section 8.8: without majority support the primary leaves the renewal
-/// unanswered, and records no gate. No build counts support yet.
+/// unanswered, records no gate, and keeps no raise of the stored duration.
+/// No build counts support yet. A lease the node no longer holds is revoked
+/// all the same.
 #[tokio::test]
 async fn without_voter_support_no_renewal_is_answered() {
     let server = start_with_patient_node_session().await;
     let owner = server.owner().await;
     let (_node, mut socket, lease_id, token) = node_with_expiring_lease(&server, &owner).await;
+    run(
+        &server,
+        "UPDATE leases SET duration_ms = 3000 WHERE id = ?",
+        &lease_id,
+    )
+    .await;
 
     send(&mut socket, renew(&lease_id, token), None).await;
     let frames = frames_until_settled(&mut socket).await;
@@ -421,16 +429,30 @@ async fn without_voter_support_no_renewal_is_answered() {
     assert!(of_type(&frames, "lease_revoke").is_empty(), "{frames:?}");
     assert!(server.state.hub.authority().passed(&lease_id));
     assert_eq!(server.state.hub.authority().view(&lease_id), None);
+    assert_eq!(
+        stored_duration(&server, &lease_id).await,
+        Some(3_000),
+        "the refused answer's raise rolls back"
+    );
+
+    send(&mut socket, renew(UNKNOWN_LEASE, 4), None).await;
+    let frames = recv_until(&mut socket, &["lease_revoke"]).await;
+    let revoke = of_type(&frames, "lease_revoke")[0];
+    assert_eq!(revoke["body"]["lease_id"], UNKNOWN_LEASE);
+    assert_eq!(revoke["body"]["fencing_token"], 4);
+    assert!(of_type(&frames, "lease_grant").is_empty(), "{frames:?}");
 }
 
 /// D-0256 part 2: the primary does not answer a renewal of a lease whose row
-/// is `local`, with support or without. Nor one above the row's token, nor
-/// one of a lease listed in a failed fence (section 8.5).
+/// is `local`, with support or without. Nor one above the row's token, one
+/// of a lease listed in any node's failed fence (section 8.5), or one the
+/// authority refuses because it keeps another holder's gate.
 #[tokio::test]
 async fn a_renewal_the_row_does_not_match_gets_no_answer() {
     let server = start_with_patient_node_session().await;
     let owner = server.owner().await;
     let (node, mut socket, lease_id, token) = node_with_expiring_lease(&server, &owner).await;
+    let other = enrolled_node(&server, &owner, "node-beta").await;
     server.state.hub.set_voter_support(Arc::new(EverySupport));
 
     run(
@@ -474,9 +496,11 @@ async fn a_renewal_the_row_does_not_match_gets_no_answer() {
         "vm_ids": [],
     })
     .to_string();
+    // Listed in another node's failed fence: the lease goes to no node until
+    // an operator acknowledges it (section 8.5).
     sqlx::query("UPDATE nodes SET fence_failure = ? WHERE id = ?")
         .bind(&failure)
-        .bind(&node.node_id)
+        .bind(&other.node_id)
         .execute(server.state.store.pool())
         .await
         .unwrap();
@@ -486,7 +510,45 @@ async fn a_renewal_the_row_does_not_match_gets_no_answer() {
         of_type(&frames, "lease_grant").is_empty(),
         "listed: {frames:?}"
     );
+    assert!(
+        of_type(&frames, "lease_revoke").is_empty(),
+        "listed: {frames:?}"
+    );
     assert!(server.state.hub.authority().passed(&lease_id));
+    sqlx::query("UPDATE nodes SET fence_failure = NULL WHERE id = ?")
+        .bind(&other.node_id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+
+    // The authority keeps another holder's gate for the lease, so it refuses
+    // the answer.
+    server
+        .state
+        .hub
+        .authority()
+        .seed(&lease_id, &other.node_id, Some(15_000));
+    send(&mut socket, renew(&lease_id, token), None).await;
+    let frames = frames_until_settled(&mut socket).await;
+    assert!(
+        of_type(&frames, "lease_grant").is_empty(),
+        "not holder: {frames:?}"
+    );
+    assert!(
+        of_type(&frames, "lease_revoke").is_empty(),
+        "not holder: {frames:?}"
+    );
+    assert_eq!(server.state.hub.authority().view(&lease_id), None);
+
+    // Once the row's holder holds the gate again, the renewal is answered.
+    server
+        .state
+        .hub
+        .authority()
+        .seed(&lease_id, &node.node_id, Some(15_000));
+    let id = send(&mut socket, renew(&lease_id, token), None).await;
+    let frames = recv_until(&mut socket, &["lease_grant"]).await;
+    assert_eq!(of_type(&frames, "lease_grant")[0]["re"], id.as_str());
 }
 
 /// Section 5.5: a renewal of a lease the node no longer holds is answered

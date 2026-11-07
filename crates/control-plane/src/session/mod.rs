@@ -2439,9 +2439,10 @@ impl Session {
     /// - A lease the node no longer holds in the primary's row is revoked,
     ///   as at the session's start ([`stale_lease_revoke`]): no row, another
     ///   holder, revoked, or a higher token.
-    /// - A `local` row gets no answer (D-0256 part 2). The node renews only
-    ///   `expiring` leases, so the primary made this one `local` after its
-    ///   grant, and the node's validity runs out.
+    /// - A `local` row gets no answer (D-0256 part 2), and the node's
+    ///   validity runs out. So would the first renewal after a conversion,
+    ///   whose row stays `local` until it is answered (ADR 0244); conversions
+    ///   wait for D-0261.
     /// - An `expiring` row at the renewal's token is answered with a
     ///   `lease_grant` at that token, `mode` `expiring`, for `D`, with `re`
     ///   set. Only while a majority of voters supports it (section 8.8): no
@@ -3828,6 +3829,66 @@ async fn primary_node_id(hub: &NodeHub, node_id: &str) -> Result<String, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(holder: &str, token: i64, revoked: bool) -> leases::Lease {
+        leases::Lease {
+            id: "lse_a".to_string(),
+            resource_type: "app".to_string(),
+            resource_id: "app_a".to_string(),
+            holder_node_id: holder.to_string(),
+            mode: "expiring".to_string(),
+            fencing_token: token,
+            duration_ms: Some(15_000),
+            granted_at: "2026-11-07T10:00:00Z".to_string(),
+            renewed_at: None,
+            expires_at: None,
+            revoked_at: revoked.then(|| "2026-11-07T10:01:00Z".to_string()),
+        }
+    }
+
+    /// Sections 5.5 and 9: a lease the node no longer holds is revoked at a
+    /// token the node accepts, at least its own, and the answer releases it
+    /// at the row's token only, or 0 without a row.
+    #[test]
+    fn a_stale_lease_is_revoked_at_a_token_the_node_accepts() {
+        use quoro_proto::RevokeReason::{Deleted, Moved, Superseded};
+        let revoke = |row: Option<&leases::Lease>, claimed: u64| {
+            stale_lease_revoke(row, "nod_a", "lse_a", claimed)
+                .map(|(revoke, released)| (revoke.reason, revoke.fencing_token, released))
+        };
+        assert_eq!(revoke(None, 4), Some((Moved, 4, 0)));
+        assert_eq!(
+            revoke(Some(&row("nod_a", 3, true)), 5),
+            Some((Deleted, 5, 3))
+        );
+        assert_eq!(
+            revoke(Some(&row("nod_a", 6, true)), 5),
+            Some((Deleted, 6, 6))
+        );
+        assert_eq!(
+            revoke(Some(&row("nod_b", 3, false)), 5),
+            Some((Moved, 5, 3))
+        );
+        assert_eq!(
+            revoke(Some(&row("nod_b", 7, false)), 5),
+            Some((Moved, 7, 7))
+        );
+        assert_eq!(
+            revoke(Some(&row("nod_a", 6, false)), 5),
+            Some((Superseded, 6, 6))
+        );
+        assert_eq!(revoke(Some(&row("nod_a", 5, false)), 5), None);
+        assert_eq!(
+            revoke(Some(&row("nod_a", 4, false)), 5),
+            None,
+            "a higher claim"
+        );
+        assert_eq!(
+            revoke(Some(&row("nod_a", 0, false)), 0),
+            None,
+            "tokens count from 1"
+        );
+    }
 
     #[test]
     fn observed_statuses_map_one_to_one() {
