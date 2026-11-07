@@ -2042,10 +2042,10 @@ async fn an_uncertain_lease_keeps_an_unhealthy_stateful_vm_running_until_it_is_h
 
 /// Sections 6.3 and 6.4 (ADR 0242): under an `expiring` lease a health
 /// restart stops the VM only with the start bound and the margin left on the
-/// lease, since otherwise it could not start again. A renewed 5 s lease is
-/// valid for 4 s (`D - M`), never the 3 s bound plus its 1 s margin, so the
-/// unhealthy VM keeps running. A 15 s lease leaves them, and the start that
-/// follows gets the 3 s bound.
+/// lease, since otherwise it could not start again. A 4.5 s lease just
+/// renewed is valid for 3.5 s (`D - M`): more than the 3 s bound, less than
+/// the bound plus its 1 s margin, so the unhealthy VM keeps running. A 15 s
+/// lease leaves them, and the start that follows gets the 3 s bound.
 #[tokio::test]
 async fn a_health_restart_under_an_expiring_lease_needs_the_start_margin() {
     let dir = TempDir::new();
@@ -2061,17 +2061,21 @@ async fn a_health_restart_under_an_expiring_lease_needs_the_start_margin() {
     reconciler.reconcile_once(Some(&snap)).await;
     assert_eq!(engine.inspect(&id).await.unwrap().state, VmState::Running);
 
-    // Held, but never with the start bound and the margin left.
-    let short = LeaseView::new(
-        expiring_lease_table_lasting("lse_margin", "app_margin", 1, 5_000),
-        false,
-    );
-    assert!(short.may_keep_running("lse_margin", 1));
-    assert!(!short.may_start_stateful("lse_margin", 1));
-    let mut reconciler = reconciler.with_lease_view(short);
+    // Held with the bound left but not the margin, renewed just before the
+    // pass that would stop the VM.
+    let short = || {
+        LeaseView::new(
+            expiring_lease_table_lasting("lse_margin", "app_margin", 1, 4_500),
+            false,
+        )
+    };
+    assert!(short().may_keep_running("lse_margin", 1));
+    assert!(!short().may_start_stateful("lse_margin", 1));
     for _ in 0..2 {
         tokio::time::sleep(Duration::from_millis(1100)).await;
+        // This pass's probe fails and asks for a restart.
         reconciler.reconcile_once(Some(&snap)).await;
+        reconciler = reconciler.with_lease_view(short());
         reconciler.reconcile_once(Some(&snap)).await;
     }
     assert!(
