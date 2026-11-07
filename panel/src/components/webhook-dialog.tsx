@@ -218,7 +218,7 @@ export function WebhookDialog({
                   saveCreate.reset();
                   onOpenChange(false);
                   void navigate({
-                    to: '/webhooks/$webhookId',
+                    to: '/settings/webhooks/$webhookId',
                     params: { webhookId: id },
                   });
                 }}

@@ -12,6 +12,7 @@ export default defineConfig({
         tags: [
           'health',
           'auth',
+          'cluster',
           'nodes',
           'projects',
           'vms',

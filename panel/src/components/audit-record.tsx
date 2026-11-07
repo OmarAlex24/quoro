@@ -108,7 +108,7 @@ function TargetValue({ record }: { record: AuditRecord }) {
 }
 
 export function AuditRecordPanel({ seq, onClose }: { seq: number; onClose: () => void }) {
-  const search = getRouteApi('/audit').useSearch();
+  const search = getRouteApi('/shell/activity').useSearch();
   const recordQuery = useGetAuditRecord(seq);
 
   const missing = isApiProblem(recordQuery.error) && recordQuery.error.code === 'not_found';
@@ -195,7 +195,7 @@ export function AuditRecordPanel({ seq, onClose }: { seq: number; onClose: () =>
       case 'incident':
         return hasText(value.incident_id) ? (
           <Link
-            to="/audit"
+            to="/activity"
             search={{ ...search, incident_id: value.incident_id, seq: undefined }}
             title={value.incident_id}
             className="type-code text-ink underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"

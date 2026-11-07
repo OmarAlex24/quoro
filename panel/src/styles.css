@@ -537,6 +537,530 @@
     }
   }
 
+  /*
+   * The shell. Outside a project: a 236 px sidebar with the workspace, six
+   * sections and the cluster at its foot. Inside one: a 52 px top bar with the
+   * breadcrumb and a 56 px rail. Below 768 px the sidebar folds into a menu
+   * button and the rail lies flat under the top bar.
+   */
+  .shell {
+    display: grid;
+    grid-template-columns: 236px minmax(0, 1fr);
+    min-height: 100dvh;
+    background-color: var(--ground);
+  }
+
+  .shell-content {
+    min-width: 0;
+  }
+
+  /* The column carries the border, so it runs the page's full height under the sticky bar. */
+  .side-col {
+    border-right: 1px solid var(--line);
+  }
+
+  .side {
+    position: sticky;
+    top: 0;
+    height: 100dvh;
+    width: 235px;
+    background-color: var(--ground);
+    display: flex;
+    flex-direction: column;
+    padding: 14px 12px;
+  }
+
+  .side.side-drawer {
+    position: static;
+    width: 100%;
+    height: 100%;
+  }
+
+  .ws {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 8px 16px;
+    border-bottom: 1px solid var(--line);
+    margin-bottom: 12px;
+  }
+
+  .ws b {
+    display: block;
+    font-weight: 600;
+    font-size: 13.5px;
+    line-height: 1.2;
+  }
+
+  .ws small {
+    display: block;
+    color: var(--ink-3);
+    font-size: 11.5px;
+  }
+
+  .logo {
+    width: 24px;
+    height: 24px;
+    flex: none;
+    display: block;
+  }
+
+  .nav {
+    display: grid;
+    gap: 2px;
+  }
+
+  .nav a {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    height: 34px;
+    padding: 0 10px;
+    border-radius: 7px;
+    color: var(--ink-2);
+    text-decoration: none;
+    font-size: 13.5px;
+    transition:
+      background-color 120ms ease,
+      color 120ms ease;
+  }
+
+  .nav a svg {
+    width: 16px;
+    height: 16px;
+    flex: none;
+    color: var(--ink-3);
+  }
+
+  .nav a:hover {
+    color: var(--ink);
+    background-color: color-mix(in oklab, var(--raised) 60%, transparent);
+  }
+
+  .nav a.on {
+    background-color: var(--raised);
+    color: var(--ink);
+    box-shadow: inset 0 0 0 1px var(--line);
+  }
+
+  .nav a.on svg {
+    color: var(--ink);
+  }
+
+  .nav a .count {
+    margin-left: auto;
+  }
+
+  .side-foot {
+    margin-top: auto;
+    border-top: 1px solid var(--line);
+    padding: 12px 8px 2px;
+    display: grid;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--ink-2);
+  }
+
+  .side-foot .state {
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
+    white-space: nowrap;
+  }
+
+  .count {
+    display: inline-grid;
+    place-items: center;
+    min-width: 17px;
+    height: 17px;
+    padding: 0 4px;
+    border-radius: 4px;
+    background-color: var(--fault);
+    color: var(--on-accent);
+    font-size: 10.5px;
+    font-weight: 650;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .count.count-soft {
+    background-color: var(--raised);
+    color: var(--ink-2);
+    box-shadow: inset 0 0 0 1px var(--line-2);
+  }
+
+  .top {
+    position: sticky;
+    top: 0;
+    z-index: 30;
+    height: 52px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 0 16px;
+    border-bottom: 1px solid var(--line);
+    background-color: var(--ground);
+  }
+
+  .crumb {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    font-weight: 560;
+  }
+
+  .crumb .slash {
+    flex: none;
+    color: var(--line-2);
+    font-size: 18px;
+    font-weight: 300;
+  }
+
+  .crumb .crumb-leaf {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .sw-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    padding: 4px 6px;
+    border-radius: 6px;
+    font-weight: 560;
+    transition: background-color 120ms ease;
+  }
+
+  .sw-btn > span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .sw-btn svg {
+    width: 12px;
+    height: 12px;
+    flex: none;
+    color: var(--ink-3);
+  }
+
+  .sw-btn:hover,
+  .sw-btn[aria-expanded='true'] {
+    background-color: var(--raised);
+  }
+
+  .iconbtn {
+    position: relative;
+    width: 32px;
+    height: 32px;
+    flex: none;
+    display: grid;
+    place-items: center;
+    border-radius: 7px;
+    color: var(--ink-2);
+    transition:
+      background-color 120ms ease,
+      color 120ms ease;
+  }
+
+  .iconbtn svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  .iconbtn:hover,
+  .iconbtn[aria-expanded='true'] {
+    background-color: var(--raised);
+    color: var(--ink);
+  }
+
+  .iconbtn .count {
+    position: absolute;
+    top: 1px;
+    right: 0;
+    height: 15px;
+    min-width: 15px;
+    padding: 0 3px;
+    font-size: 9.5px;
+  }
+
+  .vbar {
+    width: 1px;
+    height: 20px;
+    flex: none;
+    background-color: var(--line);
+  }
+
+  .project-shell {
+    display: grid;
+    grid-template-columns: 56px minmax(0, 1fr);
+    grid-template-rows: 52px minmax(0, 1fr);
+    min-height: 100dvh;
+    background-color: var(--ground);
+  }
+
+  .project-shell > .top {
+    grid-column: 1 / -1;
+  }
+
+  .rail-col {
+    border-right: 1px solid var(--line);
+  }
+
+  .rail {
+    position: sticky;
+    top: 52px;
+    height: calc(100dvh - 52px);
+    width: 55px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    padding-top: 12px;
+    background-color: var(--ground);
+  }
+
+  .rail a {
+    width: 36px;
+    height: 36px;
+    border-radius: 8px;
+    display: grid;
+    place-items: center;
+    color: var(--ink-3);
+    transition:
+      background-color 120ms ease,
+      color 120ms ease;
+  }
+
+  .rail a svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  .rail a:hover {
+    color: var(--ink);
+  }
+
+  .rail a.on {
+    background-color: var(--raised);
+    color: var(--ink);
+    box-shadow: inset 0 0 0 1px var(--line-2);
+  }
+
+  /* The canvas: a dotted field the cards sit on. */
+  .canvas-field {
+    background-color: var(--canvas);
+    background-image: radial-gradient(var(--dot) 1.1px, transparent 1.3px);
+    background-size: 22px 22px;
+  }
+
+  .tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0 20px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .tabs a {
+    padding: 9px 0 10px;
+    color: var(--ink-2);
+    text-decoration: none;
+    font-size: 13.5px;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .tabs a:hover {
+    color: var(--ink);
+  }
+
+  .tabs a.on {
+    color: var(--ink);
+    border-color: var(--ink);
+  }
+
+  .subnav {
+    display: grid;
+    gap: 2px;
+    align-content: start;
+  }
+
+  .subnav a {
+    padding: 7px 10px;
+    border-radius: 7px;
+    color: var(--ink-2);
+    text-decoration: none;
+    font-size: 13.5px;
+  }
+
+  .subnav a:hover {
+    color: var(--ink);
+  }
+
+  .subnav a.on {
+    background-color: var(--surface);
+    color: var(--ink);
+    box-shadow: inset 0 0 0 1px var(--line);
+  }
+
+  /* A popover menu: the avatar menu and the project switcher. */
+  .menu {
+    position: absolute;
+    top: calc(100% + 6px);
+    z-index: 50;
+    min-width: 240px;
+    padding: 6px;
+    background-color: var(--raised);
+    border: 1px solid var(--line-2);
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    animation: menu-in 120ms ease-out;
+  }
+
+  @keyframes menu-in {
+    from {
+      opacity: 0;
+      transform: translateY(-3px);
+    }
+  }
+
+  .menu-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    min-height: 32px;
+    padding: 6px 10px;
+    border-radius: 7px;
+    color: var(--ink);
+    font-size: 13.5px;
+    text-align: left;
+    text-decoration: none;
+    cursor: pointer;
+  }
+
+  .menu-item svg {
+    width: 16px;
+    height: 16px;
+    flex: none;
+    color: var(--ink-3);
+  }
+
+  .menu-item:hover,
+  .menu-item:focus-visible {
+    outline: none;
+    background-color: var(--surface);
+    box-shadow: inset 0 0 0 1px var(--line-2);
+  }
+
+  .menu-sep {
+    height: 1px;
+    margin: 6px -6px;
+    background-color: var(--line);
+  }
+
+  .menu-label {
+    padding: 6px 10px 4px;
+    font-size: 12px;
+    font-weight: 560;
+    color: var(--ink-2);
+  }
+
+  /* Segmented choice: three options in a framed row, the chosen one raised. */
+  .seg {
+    display: flex;
+    border: 1px solid var(--line-2);
+    border-radius: 8px;
+    padding: 2px;
+    background-color: var(--surface);
+    gap: 2px;
+  }
+
+  .seg button {
+    flex: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 4px 8px;
+    border-radius: 6px;
+    font-size: 13px;
+    color: var(--ink-2);
+    cursor: pointer;
+  }
+
+  .seg button svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  .seg button:hover {
+    color: var(--ink);
+  }
+
+  .seg button[aria-checked='true'] {
+    background-color: var(--raised);
+    color: var(--ink);
+    box-shadow: 0 0 0 1px var(--line-2);
+  }
+
+  .seg button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+
+  .drawer[data-state='open'] {
+    animation: drawer-in 160ms ease-out;
+  }
+
+  @keyframes drawer-in {
+    from {
+      transform: translateX(-100%);
+    }
+  }
+
+  @media (max-width: 767.98px) {
+    .shell {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .shell > .side-col {
+      display: none;
+    }
+
+    .project-shell {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: 52px auto minmax(0, 1fr);
+    }
+
+    .top {
+      gap: 8px;
+      padding: 0 12px;
+    }
+
+    .rail-col {
+      border-right: 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .rail {
+      position: static;
+      height: 48px;
+      width: auto;
+      flex-direction: row;
+      padding: 0 10px;
+    }
+  }
+
   @keyframes dialog-fade {
     from {
       opacity: 0;

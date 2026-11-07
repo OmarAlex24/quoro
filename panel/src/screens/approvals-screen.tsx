@@ -104,8 +104,8 @@ export function ApprovalsScreen() {
                   </span>{' '}
                   is valid for 10 minutes.{' '}
                   <Link
-                    to="/grants"
-                    search={{ agent_id: notice.approval.agent_id, kind: 'approval' }}
+                    to="/agents"
+                    search={{ tab: 'grants', agent_id: notice.approval.agent_id, kind: 'approval' }}
                     className="text-accent underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
                   >
                     See the grant

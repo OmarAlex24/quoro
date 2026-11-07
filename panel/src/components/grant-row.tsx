@@ -93,7 +93,7 @@ export function GrantRow({
               <span>
                 Incident{' '}
                 <Link
-                  to="/audit"
+                  to="/activity"
                   search={{ incident_id: grant.incident_id }}
                   title={grant.incident_id}
                   className="type-code text-ink underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"

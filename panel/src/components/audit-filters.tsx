@@ -5,7 +5,7 @@ import { useListIncidents } from '../api/generated/incidents/incidents';
 import type { AuditRecordResult } from '../api/generated/model';
 import { shortId } from '../lib/agency-format';
 import { useSession } from '../session';
-import type { AuditSearch } from '../router';
+import type { AuditSearch } from '../lib/routes';
 import { Button } from './ui/button';
 import { Field } from './ui/field';
 import { Input } from './ui/input';
@@ -36,7 +36,7 @@ export function AuditFilters({ search }: { search: AuditSearch }) {
 
   const go = (patch: Partial<AuditSearch>) => {
     void navigate({
-      to: '/audit',
+      to: '/activity',
       search: { ...search, ...patch, seq: undefined },
     });
   };
@@ -209,7 +209,7 @@ export function AuditFilters({ search }: { search: AuditSearch }) {
             onClick={() => {
               setActorDraft('');
               setTargetDraft('');
-              void navigate({ to: '/audit', search: {} });
+              void navigate({ to: '/activity', search: {} });
             }}
           >
             Clear filters

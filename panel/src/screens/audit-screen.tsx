@@ -23,11 +23,11 @@ import { problemView, type ProblemView } from '../lib/problem';
 import { useSession } from '../session';
 import { LoginScreen } from './login-screen';
 
-const auditRoute = getRouteApi('/audit');
+const activityRoute = getRouteApi('/shell/activity');
 
 export function AuditScreen() {
   const { user, loading, unauthenticated } = useSession();
-  const search = auditRoute.useSearch();
+  const search = activityRoute.useSearch();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
 
@@ -103,11 +103,11 @@ export function AuditScreen() {
     search.incident_id !== undefined;
 
   const openEntry = (seq: number) => {
-    void navigate({ to: '/audit', search: { ...search, seq } });
+    void navigate({ to: '/activity', search: { ...search, seq } });
   };
 
   const closeEntry = () => {
-    void navigate({ to: '/audit', search: { ...search, seq: undefined } });
+    void navigate({ to: '/activity', search: { ...search, seq: undefined } });
   };
 
   /**
@@ -200,7 +200,7 @@ export function AuditScreen() {
                 <Button
                   variant="default"
                   className="mt-4"
-                  onClick={() => void navigate({ to: '/audit', search: {} })}
+                  onClick={() => void navigate({ to: '/activity', search: {} })}
                 >
                   Clear filters
                 </Button>

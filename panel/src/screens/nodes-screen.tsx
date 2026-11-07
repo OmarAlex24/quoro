@@ -1,7 +1,6 @@
 import { useListNodes } from '../api/generated/nodes/nodes';
-import type { NodeStatus } from '../api/generated/model';
-import type { LampTone } from '../lib/lamp';
 import { formatBytes } from '../lib/metrics';
+import { nodeReadout } from '../lib/nodes';
 import { problemView } from '../lib/problem';
 import { useSession } from '../session';
 import { ClusterVulnerabilities } from '../components/cluster-vulnerabilities';
@@ -12,27 +11,6 @@ import { ProblemBanner } from '../components/ui/problem-banner';
 import { LoginScreen } from './login-screen';
 
 const MIB = 1024 * 1024;
-
-interface NodeReadout {
-  tone: LampTone;
-  words: string;
-  pulse: boolean;
-}
-
-const nodeReadout = (status: NodeStatus): NodeReadout => {
-  switch (status) {
-    case 'connected':
-      return { tone: 'run', words: 'Connected', pulse: false };
-    case 'pending':
-      return { tone: 'shift', words: 'Connecting', pulse: true };
-    case 'disconnected':
-      return { tone: 'fault', words: 'Disconnected', pulse: false };
-    case 'fenced':
-      return { tone: 'fault', words: 'Fenced', pulse: false };
-    case 'removed':
-      return { tone: 'idle', words: 'Removed', pulse: false };
-  }
-};
 
 /** The machines of the cluster: their record, and their live metrics. */
 export function NodesScreen() {

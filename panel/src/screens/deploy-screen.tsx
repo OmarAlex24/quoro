@@ -420,7 +420,7 @@ export function DeployScreen() {
             Your role can read apps but not deploy them.
           </p>
           <Button variant="default" className="mt-4" asChild>
-            <Link to="/">Back to apps</Link>
+            <Link to="/projects">Back to projects</Link>
           </Button>
         </div>
       </main>
@@ -464,7 +464,7 @@ export function DeployScreen() {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <h1 className="type-display text-[24px] leading-none">Deploy an app</h1>
         <Button variant="ghost" asChild>
-          <Link to="/">Back to apps</Link>
+          <Link to="/projects">Back to projects</Link>
         </Button>
       </div>
       <p className="mt-2 text-[15px] text-ink-2">

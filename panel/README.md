@@ -8,15 +8,54 @@ after each step), and the agency screens:
 chain verification, and **Webhooks** with their deliveries. React 19 + TypeScript on
 Vite, generated from the frozen contract in `../docs/contracts/openapi.yaml`.
 
-Routes: `/` is the apps list, `/apps/new` the deploy work order, `/apps/$appId`
-one app with its source, builds, deployment, domains, environment, instances and
-log tape, `/apps/$appId/builds/$buildId` one build with its live log,
-`/apps/$appId/terminal` a web terminal into the app's guest, `/vms` the virtual
-machines, `/vms/$vmId/console` the read-only serial console of one VM,
-`/agents` and `/agents/$agentId`, `/grants`
-(`?agent_id=&status=&kind=`), `/approvals`, `/audit`
-(`?actor_id=&target_id=&result=&incident_id=&seq=`), `/webhooks` and
-`/webhooks/$webhookId`, plus `/login` and `/setup`.
+The shell: outside a project, a sidebar with **Projects**, **Nodes**,
+**Agents**, **Approvals** (with the count waiting), **Activity** and
+**Settings**; the cluster's name and the person's role at the top with the
+avatar menu (account, theme, sign out); the primary node and how many nodes are
+connected at the foot. Inside a project, a top bar with the breadcrumb and the
+project switcher, and a rail with the canvas, metrics, logs and the project's
+settings. Below 768 px the sidebar folds into a menu button and the rail lies
+under the top bar.
+
+Routes:
+
+- `/projects` lists the projects with their apps; `?add=app` opens the deploy
+  work order.
+- `/projects/$projectId` is one project. `?view=metrics|logs|settings` picks a
+  rail view (the canvas when absent); `?app=$appId&tab=…` opens an app, with
+  the tab in the URL (`deployments`, `variables`, `metrics`, `logs`, `storage`,
+  `security`, `settings`); `&build=$buildId` opens one of its builds;
+  `?vm=$vmId` opens a VM.
+- `/nodes` (`?tab=vms` for every VM of the cluster), `/agents` (`?agent=$agentId`
+  for one agent, `?tab=grants&agent_id=&status=&kind=` for the grants),
+  `/approvals`, `/activity` (`?actor_id=&target_id=&result=&incident_id=&seq=`).
+- `/settings/members`, `/settings/webhooks`, `/settings/webhooks/$webhookId`,
+  `/settings/tokens` (personal API tokens, also on the account page) and
+  `/settings/account`; `/settings` opens Members.
+- Full screen, outside the shell: `/login`, `/setup`, `/apps/$appId/terminal`
+  (a web terminal into the app's guest) and `/vms/$vmId/console` (the read-only
+  serial console of one VM).
+
+Every URL from before the shell still works and redirects, replacing itself in
+the history, to its new place with the right tab open (`src/lib/routes.ts`,
+tested in `routes.test.ts`):
+
+| Old URL | Now |
+|---|---|
+| `/` | `/projects` |
+| `/apps/new` | `/projects?add=app` |
+| `/apps/$appId` | `/projects/$projectId?app=$appId&tab=deployments` (the project is read from the app) |
+| `/apps/$appId/builds/$buildId` | `/projects/$projectId?app=$appId&tab=deployments&build=$buildId` |
+| `/vms` | `/nodes?tab=vms` |
+| `/agents/$agentId` | `/agents?agent=$agentId` |
+| `/grants?agent_id=&status=&kind=` | `/agents?tab=grants&agent_id=&status=&kind=` |
+| `/audit?…` | `/activity?…`, every filter and the open record kept |
+| `/webhooks`, `/webhooks/$webhookId` | `/settings/webhooks`, `/settings/webhooks/$webhookId` |
+| `/users` | `/settings/members` |
+| `/account` | `/settings/account` |
+
+Until the canvas and the service sheet exist, each new place shows the screen
+that held it before, inside the shell.
 
 ## Commands
 
@@ -44,9 +83,10 @@ client is never hand-edited and is git-ignored.
 - **Mock** (`npm run dev:mock`, or `vite --mode mock`): the MSW service worker
   in `mock-public/` is served and `src/mocks/` answers every request from an
   in-memory database. The mock is stateful: setup creates the owner, login
-  starts a session, and it seeds `lab-3`, a **Blog** project with one running
-  `blog` app and a **Docs** project with one running `docs-site` app that builds
-  from `https://github.com/example/docs-site.git`. The Git app comes with one
+  starts a session, `GET /api/v1/cluster` names the cluster `lab cluster`, and
+  it seeds `lab-3`, a **Blog** project with one running `blog` app and a
+  **Docs** project with one running `docs-site` app that builds from
+  `https://github.com/example/docs-site.git`. The Git app comes with one
   succeeded and one failed build (the failed one is newest, with the BuildKit
   excerpt), a built image, a `trigger: build` deployment and an instance.
   Projects are created from the deploy screen or the New VM dialog. A created VM
@@ -67,10 +107,11 @@ client is never hand-edited and is git-ignored.
   The chosen password is the one you set up with. Any non-empty setup token
   works in mock mode.
 
-To see each screen in mock mode: set up, log in, then open `/` (apps rack),
-`/apps/new` (deploy), click `blog` for `/apps/<id>`, `docs-site` for its source
-and builds, or `/vms` for the VM rack. The seeded app's tape starts printing
-lines on the app screen. For a live build, open `/apps/new`, choose **Git
+To see each screen in mock mode: set up, log in, then open `/projects` (each
+project with its apps), **Deploy an app** for the work order, click `blog` for
+the app in its project, `docs-site` for its source and builds, or Nodes ›
+Virtual machines for the VM rack. The seeded app's tape starts printing
+lines on the app screen. For a live build, open **Deploy an app**, choose **Git
 repository**, use `https://github.com/example/docs-site.git` and submit; the
 build screen follows it to a deployment. To see a failure, use a URL containing
 `fail` (for example `https://github.com/example/fail-demo.git`). To see a
@@ -107,7 +148,10 @@ The production build contains no MSW code: `src/mocks/` is only reached through
 
 - Every colour comes from the tokens in `src/styles.css`, in a dark and a light
   set. The theme follows `prefers-color-scheme`; `data-theme="dark"` or
-  `"light"` on `<html>` overrides it. Tailwind sees only the tokens: its
+  `"light"` on `<html>` overrides it. The avatar menu's theme selector
+  (System, Dark, Light) sets that attribute and stores the choice in this
+  browser's `localStorage` (`quoro.theme`); System removes both. The stored
+  choice applies before the first render. Tailwind sees only the tokens: its
   default palette is dropped, so `bg-gray-500` or `text-white` do not exist.
 - Archivo sets every word; Martian Mono sets only code values (ids, keys,
   scopes, images, hashes, log lines), never a label. Both are self-hosted
@@ -239,7 +283,7 @@ Runtime:
 | --- | --- | --- |
 | `react` | 19.3.1 | The UI runtime. |
 | `react-dom` | 19.3.1 | Mounts the panel in the browser. |
-| `@tanstack/react-router` | 1.170.46 | Code-based routes (`/`, `/apps/new`, `/apps/$appId`, `/vms`, `/login`, `/setup`), no file-route codegen. |
+| `@tanstack/react-router` | 1.170.46 | Code-based routes (the shell, `/projects/$projectId`, the redirects from the old URLs), no file-route codegen. |
 | `@tanstack/react-query` | 5.105.2 | Server state, the 1 s / 10 s refresh, and invalidation after actions. |
 | `@fontsource-variable/archivo` | 5.3.0 | Self-hosted Archivo (weight and width axes); no CDN, no external request. |
 | `@fontsource-variable/martian-mono` | 5.3.0 | Self-hosted Martian Mono (OFL-1.1, weight and width axes) for code values only; no CDN. |
@@ -265,7 +309,7 @@ Development:
 | `orval` | 8.46.0 | Generates the typed client and MSW handlers from the frozen OpenAPI spec. |
 | `msw` | 3.0.3 | The stateful browser mock behind `dev:mock`; never in the build. |
 | `@faker-js/faker` | 10.6.0 | Peer of orval's generated mock data (fallback handlers). |
-| `vitest` | 5.1.0 | Runs the pure-logic unit tests (lamp, app status, deploy order, log buffer, dither, theme). |
+| `vitest` | 5.1.0 | Runs the pure-logic unit tests (lamp, app status, deploy order, log buffer, dither, theme, route redirects). |
 | `@types/react` | 19.3.0 | React types. |
 | `@types/react-dom` | 19.3.0 | React DOM types. |
 
@@ -276,6 +320,8 @@ src/
   api/            fetcher.ts (the mutator), client.ts (query client), auth-store.ts
   api/generated/  orval output (git-ignored, regenerated by `npm run generate`)
   components/     ui/ (button, tag, dialog, field, input, textarea, select, banner),
+                  shell/ (side-shell, sidebar, project-shell, avatar-menu, menu,
+                  tab-strip, shell-data),
                   lamp, avatar, glyph-tile, dither-canvas,
                   vm-bay, app-bay, deploy-rail, build-rail, build-failure,
                   build-log, build-view, log-tape, tone-lamp, app-domains,
@@ -286,11 +332,14 @@ src/
                   source-form.ts, deploy-flow.ts, log-buffer.ts, problem.ts,
                   slug.ts, capabilities.ts, scopes.ts, interactive.ts,
                   agency-format.ts, agents.ts, grants.ts, approvals.ts, audit.ts,
-                  webhooks.ts, dither.ts, dither-draw.ts, use-theme.ts
+                  webhooks.ts, dither.ts, dither-draw.ts, use-theme.ts,
+                  routes.ts, nodes.ts, projects.ts
                   (each with a test where pure)
   mocks/          db.ts, builds.ts, http.ts, agency.ts, handlers.ts,
                   handlers-builds.ts, handlers-<area>.ts, browser.ts (mock only)
-  screens/        apps-screen.tsx, deploy-screen.tsx, app-screen.tsx,
+  screens/        projects-screen.tsx, project-screen.tsx, section-pages.tsx,
+                  legacy-app-redirect.tsx,
+                  apps-screen.tsx, deploy-screen.tsx, app-screen.tsx,
                   build-screen.tsx, vms-screen.tsx, terminal-screen.tsx,
                   console-screen.tsx, agents-screen.tsx, agent-screen.tsx,
                   grants-screen.tsx, approvals-screen.tsx, audit-screen.tsx,

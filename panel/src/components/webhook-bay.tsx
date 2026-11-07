@@ -33,7 +33,7 @@ export function WebhookBay({ webhook }: { webhook: Webhook }) {
       <div className="min-w-0 px-4 py-3">
         <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
           <Link
-            to="/webhooks/$webhookId"
+            to="/settings/webhooks/$webhookId"
             params={{ webhookId: webhook.id }}
             className="type-bay-title truncate text-[18px] leading-tight text-ink underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
           >

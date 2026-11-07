@@ -18,6 +18,7 @@ This turns D-0033 into a gated plan and adds no features: where another decision
 | M5a — Stateless HA and backups | Done (demo approved on 2026-11-05) | [v0.2.0](https://github.com/OmarAlex24/quoro/releases/tag/v0.2.0) | [M5a](https://github.com/OmarAlex24/quoro/milestone/6) |
 | M5b — Witness, leases and warm replication | In progress (plan approved 2026-11-06) | — | [M5b](https://github.com/OmarAlex24/quoro/milestone/7) |
 | M6 — Automatic failover and hot | Planned | — | [M6](https://github.com/OmarAlex24/quoro/milestone/8) |
+| Panel redesign (parallel track) | In progress (approved 2026-11-06) | — | [Panel](https://github.com/OmarAlex24/quoro/milestone/10) |
 
 Status comes from each milestone's issues on GitHub, its Definition of Done below and the release tags. "Release" is the first tag that shipped the milestone. M4 still has two follow-up issues open in its GitHub milestone. What each release contains is in the [changelog](https://github.com/OmarAlex24/quoro/blob/main/CHANGELOG.md).
 

@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { Link, useNavigate, useParams } from '@tanstack/react-router';
+import { Link, useNavigate } from '@tanstack/react-router';
 import { useState } from 'react';
 import {
   deleteApp,
@@ -89,10 +89,9 @@ const deploymentPhaseWords = (phase: string): string =>
     ? DEPLOY_PHASE_LABELS[phase as keyof typeof DEPLOY_PHASE_LABELS]
     : 'Build';
 
-export function AppScreen() {
+/** One app with everything about it; the service sheet replaces it later. */
+export function AppScreen({ appId }: { appId: string }) {
   const { me, user, loading, unauthenticated, canWrite } = useSession();
-  const params = useParams({ strict: false });
-  const appId = params.appId ?? '';
   const navigate = useNavigate();
   const queryClient = useQueryClient();
 
@@ -230,7 +229,10 @@ export function AppScreen() {
     mutationFn: () => deleteApp(appId),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: getListAppsQueryKey() });
-      void navigate({ to: '/' });
+      const projectId = appQuery.data?.project_id;
+      void navigate(
+        projectId ? { to: '/projects/$projectId', params: { projectId } } : { to: '/projects' },
+      );
     },
     onError: (error) => {
       setConfirmDelete(false);
@@ -262,7 +264,7 @@ export function AppScreen() {
       <main className="mx-auto w-full max-w-4xl px-4 py-6 sm:px-6 sm:py-8">
         <ProblemBanner view={view} />
         <Button variant="default" className="mt-4" asChild>
-          <Link to="/">Back to apps</Link>
+          <Link to="/projects">Back to projects</Link>
         </Button>
       </main>
     );
@@ -309,10 +311,11 @@ export function AppScreen() {
     <main className="mx-auto w-full max-w-4xl px-4 py-6 sm:px-6 sm:py-8">
       <div className="mb-3">
         <Link
-          to="/"
+          to="/projects/$projectId"
+          params={{ projectId: app.project_id }}
           className="text-[13px] text-ink-2 underline-offset-4 hover:text-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
         >
-          Apps
+          All apps in this project
         </Link>
       </div>
 
