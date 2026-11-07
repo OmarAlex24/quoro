@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::{Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Crockford base32 alphabet used by ULIDs.
@@ -66,8 +67,54 @@ impl Prefix {
     }
 }
 
+/// The largest 48-bit millisecond timestamp and 80-bit random part of a ULID.
+const ULID_MAX_MILLIS: u64 = (1 << 48) - 1;
+const ULID_MAX_RANDOM: u128 = (1 << 80) - 1;
+
+/// The timestamp and random part of the last id this process minted, shared by
+/// every prefix (#541).
+static LAST_ID: Mutex<Option<(u64, u128)>> = Mutex::new(None);
+
+/// The next id's timestamp and random part, in the ULID specification's
+/// monotonic mode, so ids minted by one process sort in the order they were
+/// minted:
+/// - in a later millisecond than `last`, the id takes `now` and `fresh`;
+/// - in the same millisecond, or when the clock moved back, it keeps the last
+///   timestamp and takes the last random part plus one;
+/// - when that random part would overflow its 80 bits, it takes the next
+///   millisecond and `fresh` instead, so the order still holds (except at the
+///   48-bit cap, in the year 10889).
+fn next_ulid(last: Option<(u64, u128)>, now: u64, fresh: u128) -> (u64, u128) {
+    let now = now.min(ULID_MAX_MILLIS);
+    let fresh = fresh & ULID_MAX_RANDOM;
+    match last {
+        Some((millis, random)) if now <= millis => {
+            if random < ULID_MAX_RANDOM {
+                (millis, random + 1)
+            } else {
+                ((millis + 1).min(ULID_MAX_MILLIS), fresh)
+            }
+        }
+        _ => (now, fresh),
+    }
+}
+
 /// A new `<prefix>_<ULID>` id: 48 bits of milliseconds since the Unix epoch
 /// followed by 80 random bits, in Crockford base32 (26 characters).
+///
+/// Ids are monotonic within the process (#541): each one sorts after every id
+/// the process minted before it, whatever its prefix, including ids minted in
+/// the same millisecond, where the random part of the previous id is
+/// incremented instead of drawn again. After the clock steps back, ids keep
+/// the latest timestamp minted until the clock catches up with it. So
+/// `ORDER BY id` is creation order for the rows one process creates. The last
+/// id is kept in memory only: after a restart, and between processes or
+/// machines, ids sort by their timestamps alone, so a process that restarts
+/// within a clock step back mints ids that sort before the ones it minted
+/// just before.
+///
+/// Ids minted in one millisecond differ by one in their random part, so an id
+/// tells the next ones. Ids are not secrets: use [`new_secret`] for one.
 ///
 /// # Panics
 ///
@@ -75,15 +122,23 @@ impl Prefix {
 /// safe way to mint an id.
 #[must_use]
 pub fn new_id(prefix: Prefix) -> String {
-    let millis = SystemTime::now()
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis());
-    let mut random = [0u8; 10];
-    getrandom::fill(&mut random).expect("OS random generator");
-    let mut value: u128 = (millis & 0xFFFF_FFFF_FFFF) << 80;
-    for (i, byte) in random.iter().enumerate() {
-        value |= u128::from(*byte) << (8 * (9 - i));
-    }
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    let mut bytes = [0u8; 10];
+    getrandom::fill(&mut bytes).expect("OS random generator");
+    let fresh = bytes
+        .iter()
+        .fold(0u128, |value, byte| (value << 8) | u128::from(*byte));
+    let (millis, random) = {
+        // A panic while the lock is held cannot leave the pair half written,
+        // so a poisoned lock still holds a valid last id.
+        let mut last = LAST_ID.lock().unwrap_or_else(PoisonError::into_inner);
+        let next = next_ulid(*last, now, fresh);
+        *last = Some(next);
+        next
+    };
+    let value = (u128::from(millis) << 80) | random;
     let mut out = String::with_capacity(prefix.as_str().len() + 27);
     out.push_str(prefix.as_str());
     out.push('_');
@@ -489,6 +544,94 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         let b = new_id(Prefix::Vm);
         assert!(a < b);
+    }
+
+    /// The 26-character ULID of an id, which is what sorts.
+    fn ulid(id: &str) -> &str {
+        &id[id.len() - 26..]
+    }
+
+    /// #541: ids minted back to back, most of them in the same millisecond,
+    /// sort in the order they were minted, whatever their prefix.
+    #[test]
+    fn ids_minted_in_one_millisecond_sort_in_creation_order() {
+        let prefixes = [Prefix::AgentKey, Prefix::Vm, Prefix::Request];
+        let ids: Vec<String> = (0..20_000)
+            .map(|i| new_id(prefixes[i % prefixes.len()]))
+            .collect();
+        for pair in ids.windows(2) {
+            assert!(
+                ulid(&pair[0]) < ulid(&pair[1]),
+                "{} then {}",
+                pair[0],
+                pair[1]
+            );
+        }
+        for (i, id) in ids.iter().enumerate() {
+            assert!(is_id(prefixes[i % prefixes.len()], id), "{id}");
+        }
+        // The loop is fast enough that some neighbours share a millisecond,
+        // so the increment is what keeps the order.
+        assert!(
+            ids.windows(2)
+                .any(|pair| ulid(&pair[0])[..10] == ulid(&pair[1])[..10]),
+            "no two ids shared a millisecond"
+        );
+    }
+
+    /// Ids minted on several threads at once are unique, and each thread's own
+    /// ids sort in the order it minted them.
+    #[test]
+    fn ids_minted_on_many_threads_stay_ordered_and_unique() {
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    (0..5_000)
+                        .map(|_| new_id(Prefix::Event))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut all = Vec::new();
+        for thread in threads {
+            let ids = thread.join().unwrap();
+            assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+            all.extend(ids);
+        }
+        let count = all.len();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), count);
+    }
+
+    #[test]
+    fn next_ulid_follows_the_monotonic_mode() {
+        const MAX: u128 = ULID_MAX_RANDOM;
+        // The first id, and an id in a later millisecond, take the clock and
+        // fresh random bits.
+        assert_eq!(next_ulid(None, 5, 42), (5, 42));
+        assert_eq!(next_ulid(Some((5, 900)), 6, 42), (6, 42));
+        // In the same millisecond the random part is incremented.
+        assert_eq!(next_ulid(Some((5, 900)), 5, 42), (5, 901));
+        // A clock that moved back keeps the last timestamp.
+        assert_eq!(next_ulid(Some((5, 900)), 3, 42), (5, 901));
+        // An increment that would overflow moves to the next millisecond.
+        assert_eq!(next_ulid(Some((5, MAX)), 5, 42), (6, 42));
+        assert_eq!(next_ulid(Some((5, MAX)), 4, 42), (6, 42));
+        // Bits above 80 in the fresh value and a clock past 48 bits are cut.
+        assert_eq!(next_ulid(None, 5, u128::MAX), (5, MAX));
+        assert_eq!(next_ulid(None, u64::MAX, 1), (ULID_MAX_MILLIS, 1));
+        // Every step sorts after the one before.
+        let mut last = None;
+        let mut previous = None;
+        for (now, fresh) in [(5, MAX - 1), (5, 0), (5, 7), (4, 3), (9, 1), (9, 0)] {
+            let next = next_ulid(last, now, fresh);
+            if let Some(previous) = previous {
+                assert!(next > previous, "{previous:?} then {next:?}");
+            }
+            previous = Some(next);
+            last = Some(next);
+        }
     }
 
     #[test]

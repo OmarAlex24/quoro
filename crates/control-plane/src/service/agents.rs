@@ -485,7 +485,8 @@ pub async fn list_agent_keys(
         if exists.is_none() {
             return Err(ApiError::not_found("agent"));
         }
-        // Newest first; ids are ULIDs, so descending id is descending creation.
+        // Newest first; ids are ULIDs, monotonic within the primary (#541), so
+        // descending id is descending creation.
         let mut sql = String::from(
             "SELECT id, agent_id, created_at, revoked_at, last_used_at FROM agent_keys \
              WHERE agent_id = ?",

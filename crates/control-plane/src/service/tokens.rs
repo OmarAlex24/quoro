@@ -137,7 +137,8 @@ pub async fn list_tokens(
 ) -> Result<ApiTokenList, ApiError> {
     let user_id = caller(state, ctx, &json!({})).await?;
     let limit = limit?;
-    // Newest first; ids are ULIDs, so descending id is descending creation.
+    // Newest first; ids are ULIDs, monotonic within the primary (#541), so
+    // descending id is descending creation.
     let mut sql = format!("SELECT {TOKEN_COLUMNS} FROM api_tokens WHERE user_id = ?");
     if !after.is_empty() {
         sql.push_str(" AND id < ?");

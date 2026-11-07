@@ -61,7 +61,8 @@ fn deploy_actor() -> Actor {
 /// `quoro_types::Prefix` does not list the app id prefixes yet, so a freshly
 /// minted ULID gets its prefix swapped. The construction stays the one every
 /// other id uses (`README` "Identifiers"): 48 bits of milliseconds followed by
-/// 80 random bits, so ids sort by creation time.
+/// 80 random bits, monotonic within the process, so ids sort by creation time
+/// (#541).
 #[must_use]
 pub(crate) fn new_id_with_prefix(prefix: &str) -> String {
     let minted = quoro_types::new_id(quoro_types::Prefix::Request);
