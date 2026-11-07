@@ -14,7 +14,7 @@
 //! - An engine error on one VM is logged and never stops the loop or the other
 //!   VMs; the pass simply does not record `applied_rev`.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -373,6 +373,50 @@ pub struct Reconciler<E: Engine> {
     /// volume this node holds a warm copy of is created, adopted or removed
     /// here only between two streams (section 6.13).
     warm_locks: Option<crate::warm::VolumeLocks>,
+    /// The `standby` VMs of the current snapshot (sections 5.11 and 6.4,
+    /// ADR 0174): never created or started here, and reported `stopped`.
+    standby: BTreeSet<String>,
+    /// Per `standby` VM, what the node last did with its image.
+    standby_images: HashMap<String, StandbyImage>,
+    /// The `standby` ids the engine holds a VM under, warned about once.
+    standby_held: BTreeSet<String>,
+}
+
+/// How long a failed preparation of a `standby` VM's image waits before the
+/// node tries again: a warm copy's image is not urgent, and a registry that
+/// refuses it should not be asked on every pass.
+const STANDBY_RETRY: Duration = Duration::from_secs(60);
+
+/// What the node did with the image of one `standby` VM (section 6.2 step 2).
+#[derive(Clone, Debug)]
+struct StandbyImage {
+    /// The digest this outcome is for. A new digest starts over.
+    digest: String,
+    outcome: StandbyOutcome,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum StandbyOutcome {
+    /// Prepared, so a failover does not wait for a pull.
+    Prepared,
+    /// A build's output, which a node never pulls (section 6.6).
+    Built,
+    /// The preparation failed at this time; tried again after
+    /// [`STANDBY_RETRY`].
+    Failed(Instant),
+}
+
+impl StandbyOutcome {
+    /// What this outcome, for the digest the snapshot names, leaves to a pass
+    /// at `now`: `Some(reached)` when there is nothing to do, `None` when the
+    /// image is to be prepared again.
+    fn settled(self, now: Instant) -> Option<bool> {
+        match self {
+            Self::Prepared | Self::Built => Some(true),
+            Self::Failed(at) if now.saturating_duration_since(at) < STANDBY_RETRY => Some(false),
+            Self::Failed(_) => None,
+        }
+    }
 }
 
 impl<E: Engine + 'static> Reconciler<E> {
@@ -415,6 +459,9 @@ impl<E: Engine + 'static> Reconciler<E> {
                 inventory: None,
                 edge: None,
                 warm_locks: None,
+                standby: BTreeSet::new(),
+                standby_images: HashMap::new(),
+                standby_held: BTreeSet::new(),
             },
             receiver,
         )
@@ -569,6 +616,16 @@ impl<E: Engine + 'static> Reconciler<E> {
                 )
             })
             .collect();
+        self.standby = spec
+            .vms
+            .iter()
+            .filter(|vm| vm.standby)
+            .map(|vm| vm.vm_id.clone())
+            .collect();
+        let standby = &self.standby;
+        self.standby_images
+            .retain(|vm_id, _| standby.contains(vm_id));
+        self.standby_held.retain(|vm_id| standby.contains(vm_id));
 
         // A machine without the `node` role (an edge-only machine) gets no
         // `spec.network` and runs no VM (section 5.11). Its apply loop runs
@@ -612,7 +669,8 @@ impl<E: Engine + 'static> Reconciler<E> {
         // before anything is created. On a redeploy the old VM and its
         // replacement attach the same volume in one snapshot, and the engine
         // refuses to create a VM while another existing VM attaches that
-        // volume, so the removal must come first.
+        // volume, so the removal must come first. A `standby` entry is in the
+        // spec, so a VM the engine has under its id is not removed here.
         let desired: HashSet<&str> = spec.vms.iter().map(|vm| vm.vm_id.as_str()).collect();
         if !self.remove_extra_vms(&desired).await {
             reached = false;
@@ -623,8 +681,12 @@ impl<E: Engine + 'static> Reconciler<E> {
             reached = false;
         }
 
-        let mut vms: Vec<&SpecVm> = spec.vms.iter().collect();
+        // A `standby` VM is never created or started, whatever lease the node
+        // holds (sections 5.11 and 6.4, ADR 0174).
+        let (mut standby, mut vms): (Vec<&SpecVm>, Vec<&SpecVm>) =
+            spec.vms.iter().partition(|vm| vm.standby);
         vms.sort_by(|a, b| a.vm_id.cmp(&b.vm_id));
+        standby.sort_by(|a, b| a.vm_id.cmp(&b.vm_id));
 
         for vm in vms {
             if !self.reconcile_vm(vm, &subnet, network_ok).await {
@@ -642,6 +704,19 @@ impl<E: Engine + 'static> Reconciler<E> {
             ingress.update(&spec.routes, spec.ingress.as_ref(), addresses);
         }
         // --- end ingress hook ---
+
+        // Step 2 for the `standby` VMs (section 6.2): their image is prepared
+        // like any other, so a failover does not wait for a pull. It comes
+        // after the VMs that run and their routes, so a pull for a warm copy
+        // delays neither.
+        for vm in standby {
+            if !self.prepare_standby(vm).await {
+                reached = false;
+            }
+            if !self.standby_absent(&vm.vm_id).await {
+                reached = false;
+            }
+        }
 
         if reached && self.edge_applied(snapshot) {
             self.record_applied(snapshot.rev).await;
@@ -1544,6 +1619,88 @@ impl<E: Engine + 'static> Reconciler<E> {
         reached
     }
 
+    /// Prepares the image of a `standby` VM and creates nothing else
+    /// (section 5.11, ADR 0174). Returns whether the image is as the
+    /// snapshot wants it: prepared, or a build's output, which the node never
+    /// pulls (section 6.6). A failed preparation is tried again after
+    /// [`STANDBY_RETRY`].
+    async fn prepare_standby(&mut self, vm: &SpecVm) -> bool {
+        let vm_id = vm.vm_id.as_str();
+        let earlier = self
+            .standby_images
+            .get(vm_id)
+            .filter(|done| done.digest == vm.image_digest)
+            .map(|done| done.outcome);
+        if let Some(reached) = earlier.and_then(|earlier| earlier.settled(Instant::now())) {
+            return reached;
+        }
+        let outcome = if vm.build_id.is_some() {
+            info!(
+                vm_id,
+                image = %vm.image,
+                "a standby VM's image is a build's output, which is never pulled; it is not prepared here"
+            );
+            StandbyOutcome::Built
+        } else {
+            let image = ImageRef {
+                reference: vm.image.clone(),
+                digest: ImageDigest(vm.image_digest.clone()),
+            };
+            match self.engine.prepare_image(&image).await {
+                Ok(prepared) => {
+                    if let Some(hub) = &self.inventory {
+                        hub.notify_prepared(prepared.digest.clone());
+                    }
+                    info!(vm_id, digest = %prepared.digest.0, "prepared a standby VM's image");
+                    StandbyOutcome::Prepared
+                }
+                Err(e) => {
+                    if earlier.is_some() {
+                        debug!(vm_id, image = %vm.image, error = ?e, "still cannot prepare a standby VM's image");
+                    } else {
+                        warn!(vm_id, image = %vm.image, error = ?e, "could not prepare a standby VM's image");
+                    }
+                    StandbyOutcome::Failed(Instant::now())
+                }
+            }
+        };
+        self.standby_images.insert(
+            vm_id.to_owned(),
+            StandbyImage {
+                digest: vm.image_digest.clone(),
+                outcome,
+            },
+        );
+        !matches!(outcome, StandbyOutcome::Failed(_))
+    }
+
+    /// Whether the engine holds no VM under a `standby` id. A VM it does hold
+    /// is the app's earlier source, which section 5.11 deletes while keeping
+    /// its volume (section 9). That deletion comes with the return path; until
+    /// then the VM is left as it is and holds the revision back.
+    async fn standby_absent(&mut self, vm_id: &str) -> bool {
+        match self.engine.inspect(&VmId(vm_id.to_owned())).await {
+            Err(EngineError::NotFound) => {
+                self.standby_held.remove(vm_id);
+                true
+            }
+            Ok(info) => {
+                if self.standby_held.insert(vm_id.to_owned()) {
+                    warn!(
+                        vm_id,
+                        state = ?info.state,
+                        "the engine holds a VM under a standby id; it is left as it is and the revision is not applied"
+                    );
+                }
+                false
+            }
+            Err(e) => {
+                debug!(vm_id, error = ?e, "could not inspect a standby VM");
+                false
+            }
+        }
+    }
+
     /// Creates one VM: prepare the image, take an address, attach it to the
     /// project's isolation group.
     async fn create_vm(&mut self, vm: &SpecVm, subnet: &Subnet) -> Option<VmInfo> {
@@ -2304,6 +2461,21 @@ impl<E: Engine + 'static> Reconciler<E> {
             }
             Err(e) => warn!(error = ?e, "could not list the engine's VMs to report them"),
         }
+        // A `standby` VM is never created, so the node reports it `stopped`
+        // (section 5.11). A VM the engine does hold under that id is reported
+        // as the engine sees it.
+        for vm_id in &self.standby {
+            if !statuses.iter().any(|status| &status.vm_id == vm_id) {
+                statuses.push(VmStatus {
+                    vm_id: vm_id.clone(),
+                    observed_status: ObservedStatus::Stopped,
+                    health: Health::Unknown,
+                    ip: None,
+                    restart_count: 0,
+                    last_exit_code: None,
+                });
+            }
+        }
         statuses.sort_by(|a, b| a.vm_id.cmp(&b.vm_id));
         statuses.append(&mut self.once_only);
         statuses.sort_by(|a, b| a.vm_id.cmp(&b.vm_id));
@@ -2465,6 +2637,20 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_standby_image_is_prepared_again_only_after_the_retry_delay() {
+        let now = Instant::now();
+        assert_eq!(StandbyOutcome::Prepared.settled(now), Some(true));
+        assert_eq!(StandbyOutcome::Built.settled(now), Some(true));
+        assert_eq!(StandbyOutcome::Failed(now).settled(now), Some(false));
+        let almost = now + STANDBY_RETRY - Duration::from_millis(1);
+        assert_eq!(StandbyOutcome::Failed(now).settled(almost), Some(false));
+        assert_eq!(
+            StandbyOutcome::Failed(now).settled(now + STANDBY_RETRY),
+            None
+        );
+    }
+
+    #[test]
     fn subnets_skip_the_reserved_addresses() {
         let subnet = Subnet::parse("10.9.8.0/29", "10.9.8.1").unwrap();
         let used = HashSet::new();
@@ -2610,6 +2796,7 @@ mod tests {
                         env: BTreeMap::new(),
                         health_check: Some(check),
                         desired_status: DesiredStatus::Running,
+                        standby: false,
                         restart_generation: 0,
                         stateful: false,
                         lease_id: None,

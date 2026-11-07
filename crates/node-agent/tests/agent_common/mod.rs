@@ -125,6 +125,7 @@ pub fn spec_vm(vm_id: &str, project_id: &str, desired_status: DesiredStatus) -> 
         env: BTreeMap::from([("APP_ENV".to_owned(), "test".to_owned())]),
         health_check: None,
         desired_status,
+        standby: false,
         restart_generation: 0,
         stateful: false,
         lease_id: None,
@@ -346,6 +347,7 @@ pub struct RecordingEngine {
     created: Arc<Mutex<Vec<VmSpec>>>,
     stops: Arc<Mutex<Vec<(VmId, StopMode)>>>,
     starts: Arc<Mutex<Vec<(VmId, Duration)>>>,
+    prepares: Arc<Mutex<Vec<ImageRef>>>,
 }
 
 impl RecordingEngine {
@@ -357,6 +359,7 @@ impl RecordingEngine {
             created: Arc::new(Mutex::new(Vec::new())),
             stops: Arc::new(Mutex::new(Vec::new())),
             starts: Arc::new(Mutex::new(Vec::new())),
+            prepares: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -394,6 +397,14 @@ impl RecordingEngine {
     /// Every start call with its bound, in order.
     pub fn starts(&self) -> Vec<(VmId, Duration)> {
         Self::lock(&self.starts).clone()
+    }
+
+    /// How many `prepare_image` calls named `digest`, failed ones included.
+    pub fn prepare_count(&self, digest: &str) -> usize {
+        Self::lock(&self.prepares)
+            .iter()
+            .filter(|image| image.digest.0 == digest)
+            .count()
     }
 
     /// Creates and starts a VM directly on the engine, as a leftover from an
@@ -462,6 +473,7 @@ impl Engine for RecordingEngine {
     }
 
     async fn prepare_image(&self, image: &ImageRef) -> Result<PreparedImage, EngineError> {
+        Self::lock(&self.prepares).push(image.clone());
         self.inner.prepare_image(image).await
     }
 

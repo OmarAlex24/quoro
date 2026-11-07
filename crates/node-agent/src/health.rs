@@ -273,6 +273,7 @@ mod tests {
             env: BTreeMap::new(),
             health_check: check,
             desired_status: quoro_proto::wire::DesiredStatus::Running,
+            standby: false,
             restart_generation: 0,
             stateful: false,
             lease_id: None,

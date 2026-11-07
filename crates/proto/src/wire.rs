@@ -878,6 +878,11 @@ pub struct SpecVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_check: Option<HealthCheck>,
     pub desired_status: DesiredStatus,
+    /// On the warm node of a `warm` app: the node prepares the VM's image and
+    /// creates nothing else (sections 5.11 and 6.4, ADR 0174). Added in M5b;
+    /// absent means false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub standby: bool,
     pub restart_generation: u64,
     pub stateful: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1738,6 +1743,7 @@ mod tests {
                     env: BTreeMap::from([("A".to_owned(), "b".to_owned())]),
                     health_check: None,
                     desired_status: DesiredStatus::Running,
+                    standby: false,
                     restart_generation: 0,
                     stateful: false,
                     lease_id: None,
@@ -1767,6 +1773,28 @@ mod tests {
         let parsed = DesiredState::from_value(&received).unwrap();
         assert_eq!(parsed.spec, state.spec);
         assert!(!parsed.signature.is_empty());
+    }
+
+    #[test]
+    fn standby_is_absent_when_false_and_read_when_present() {
+        let vm = json!({
+            "vm_id": "vm_1", "project_id": "prj_1", "name": "web",
+            "image": "docker.io/library/nginx:1.27", "image_digest": "sha256:aa",
+            "vcpus": 1, "memory_mb": 256, "disk_gb": 1, "env": {},
+            "desired_status": "stopped", "restart_generation": 0,
+            "stateful": true, "lease_id": "lse_1", "fencing_token": 3, "volumes": [],
+        });
+        // A snapshot from a primary that predates `standby` still decodes.
+        let old: SpecVm = serde_json::from_value(vm.clone()).unwrap();
+        assert!(!old.standby);
+        // An absent flag is not serialized, so an older node sees the old shape.
+        assert_eq!(serde_json::to_value(&old).unwrap(), vm);
+
+        let mut standby = vm;
+        standby["standby"] = json!(true);
+        let parsed: SpecVm = serde_json::from_value(standby.clone()).unwrap();
+        assert!(parsed.standby);
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), standby);
     }
 
     #[test]
