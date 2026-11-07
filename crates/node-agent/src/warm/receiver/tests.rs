@@ -1455,13 +1455,19 @@ async fn the_nodes_own_volume_is_never_reported_as_a_copy_it_holds() {
     assert!(h.statuses.borrow().is_empty(), "{:?}", *h.statuses.borrow());
     assert!(!h.row().await.removed);
 
-    // Once the node gave the file up as its own, the copy is reported again.
+    // Once the node no longer holds the file as its own, the warm row is
+    // reported again. What it says of the file after a hand-over is the
+    // return path's (section 9).
     h.store
         .save_volume(&own(VolumeState::Deleted))
         .await
         .expect("row");
     h.receiver.pass(&mut listeners).await;
-    assert_eq!(h.status().snapshot_seq, Some(1));
+    let held = h.status();
+    assert_eq!(
+        (held.volume_id.as_str(), held.role),
+        (VOL, WarmRole::Target)
+    );
 }
 
 #[tokio::test]

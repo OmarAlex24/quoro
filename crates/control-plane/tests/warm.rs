@@ -707,12 +707,21 @@ async fn a_copy_a_failover_may_still_need_gets_no_entry_until_the_source_is_heal
         vec![(GONE_VOLUME.to_string(), "deleted".to_string(), false)]
     );
 
-    // Once the source holds the lease again, the copy gets its entry.
+    // The lease is granted again. Nothing wakes the warm node for that, but
+    // its next report, unchanged, has the copy it keeps checked again, and
+    // the copy gets its entry.
     sqlx::query("UPDATE leases SET revoked_at = NULL")
         .execute(pool)
         .await
         .unwrap();
-    server.state.hub.node_changed(&target.node_id);
+    send(
+        &mut on_target,
+        report(vec![
+            warm_entry(&volume_id, &app_id, WarmRole::Target),
+            warm_entry(GONE_VOLUME, GONE_APP, WarmRole::Target),
+        ]),
+    )
+    .await;
     let spec = spec_where(&mut on_target, |spec| volume_states(spec).len() == 2).await;
     let mut expected = vec![
         (volume_id.clone(), "deleted".to_string(), false),
@@ -721,9 +730,20 @@ async fn a_copy_a_failover_may_still_need_gets_no_entry_until_the_source_is_heal
     expected.sort();
     assert_eq!(volume_states(&spec), expected);
 
-    // So does a copy whose volume is gone while its app is not: the volume's
-    // own node removed its file, and the row went with it, while the warm
-    // node still holds the copy.
+    // Fenced again, and the other copy is gone: the copy is kept again, with
+    // no entry.
+    sqlx::query("UPDATE leases SET revoked_at = '2026-11-07T10:05:00Z'")
+        .execute(pool)
+        .await
+        .unwrap();
+    let held = || report(vec![warm_entry(&volume_id, &app_id, WarmRole::Target)]);
+    send(&mut on_target, held()).await;
+    spec_where(&mut on_target, |spec| volume_states(spec).is_empty()).await;
+
+    // Then its volume is deleted: the volume's own node removed the file, and
+    // the row went with it, while the warm node still holds the copy. No
+    // failover can start from it, so the node's next report, unchanged, gets
+    // it its entry, whatever the lease.
     sqlx::query("DELETE FROM volumes WHERE id = ?")
         .bind(&volume_id)
         .execute(pool)
@@ -734,11 +754,7 @@ async fn a_copy_a_failover_may_still_need_gets_no_entry_until_the_source_is_heal
         .execute(pool)
         .await
         .unwrap();
-    send(
-        &mut on_target,
-        report(vec![warm_entry(&volume_id, &app_id, WarmRole::Target)]),
-    )
-    .await;
+    send(&mut on_target, held()).await;
     let spec = spec_where(&mut on_target, |spec| volume_states(spec).len() == 1).await;
     assert_eq!(
         volume_states(&spec),
