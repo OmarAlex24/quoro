@@ -659,7 +659,7 @@ Four rules hold in every flow:
 
 ## 16. Stack confirmation (D-0056, superseding D-0028)
 
-D-0056 fixes the baseline stack, keeping the same items D-0028 listed and replacing the graphical console with text-only consoles. This section confirms it item by item, with the refinements the research forced; D-0057 adds the realtime split.
+D-0056 fixes the baseline stack, keeping the same items D-0028 listed and replacing the graphical console with text-only consoles. This section confirms it item by item, with the refinements the research forced; D-0057 adds the realtime split, and D-0253 replaces uPlot with the panel's own canvas charts.
 
 | Item | Baseline stack | Status here | Notes |
 | --- | --- | --- | --- |
@@ -670,7 +670,7 @@ D-0056 fixes the baseline stack, keeping the same items D-0028 listed and replac
 | API contract | OpenAPI via utoipa -> TS client (orval or openapi-ts) | Confirmed (D-0048) | The hand-written `docs/contracts/openapi.yaml` is frozen; CI diffs utoipa's output against it; every response needs a non-empty description because of F-0042; orval generates the panel client |
 | Panel | React + TanStack Router/Query/Table, shadcn/ui + Tailwind, rust-embed | Confirmed (D-0048) | The panel is built against a client generated from the frozen spec by orval |
 | Consoles | xterm.js; no noVNC (D-0056) | Confirmed (D-0056) | There is no VNC (F-0034): Cloud Hypervisor has no display device, so consoles are text-only, xterm.js over serial or virtio-console |
-| Metrics | uPlot | Confirmed | Fed by on-demand node telemetry (D-0014) |
+| Metrics | The panel's own canvas charts, no charting dependency (D-0253) | Confirmed (D-0253) | Fed by on-demand node telemetry (D-0014) and the node's 10-minute ring (D-0129); a dithered area with a crosshair and a text alternative |
 | Realtime | SSE for one-way streams, WebSockets for bidirectional sessions (D-0057) | Confirmed (D-0057) | Section 13: SSE for the event stream, live logs and deployment progress; WebSockets for terminal and VM console |
 | Builds | Dockerfile only, run by BuildKit inside an ephemeral builder microVM, output to a node-local OCI layout (D-0060) | Confirmed (D-0060) | The OCI layout feeds the normal OCI-to-rootfs path; that BuildKit runs under Cloud Hypervisor is a **Hypothesis** (section 19); Railpack/Nixpacks are re-verified before M4, and a zero-config builder may be added later as a second `Builder` implementation |
 | Docker client | bollard | Not needed | Confirmed: there is no Docker on nodes (D-0008) |
@@ -691,11 +691,10 @@ D-0056 requires that every dependency be justified, so each one above carries a 
 | React + TanStack + shadcn/ui + Tailwind | The panel; the TanStack pieces are the data and routing layer | Nothing planned |
 | rust-embed | One binary, no asset directory to lose (D-0012) | Nothing planned |
 | xterm.js | Text consoles over the serial or virtio-console (F-0034) | Nothing planned |
-| uPlot | Metrics rendering without a large charting stack | Nothing planned |
 | hyper + rustls + an ACME client | The embedded reverse proxy that serves ingress on hosts with a public IP (D-0059) | The M2 spike showing that owning ACME is too costly, in which case Caddy's admin API becomes the backend |
 | BuildKit, in an ephemeral builder microVM | Dockerfile-only builds in M4 (D-0060) | A different builder backend behind the same `Builder` implementation |
 
-Not on the list: bollard, because there is no Docker on nodes (D-0008); noVNC, because consoles are text-only (D-0056, F-0034); a container runtime, because a container Engine is a later implementation (D-0009).
+Not on the list: bollard, because there is no Docker on nodes (D-0008); uPlot, because the panel draws its metrics on a canvas itself (D-0253); noVNC, because consoles are text-only (D-0056, F-0034); a container runtime, because a container Engine is a later implementation (D-0009).
 
 ## 17. Workspace layout
 
