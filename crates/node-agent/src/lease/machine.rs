@@ -865,17 +865,33 @@ impl LeaseTable {
     /// must also be the highest seen for the resource, so a lease id that a
     /// newer ownership superseded can never start anything (D-0073).
     ///
-    /// An `expiring` lease must also be before its `valid_until` at `now`:
-    /// it stays `held` past that instant until the next [`Self::poll`], and
-    /// nothing may start in that gap (section 8.4). A converted lease starts
-    /// nothing until its first renewal gives it a provisional deadline (ADR
-    /// 0241); its VMs that already run keep running.
+    /// An `expiring` lease must also have time left for a start (section 6.4,
+    /// ADR 0242): `valid_until - now >= start bound + M`. The engine gives a
+    /// start up once the start bound passes, so a start that took its permit
+    /// is over at least `M` before `valid_until`, and the fence never waits
+    /// for it past its stop budget. That also keeps out the gap between
+    /// `valid_until` and the next [`Self::poll`], while the lease is still
+    /// `held` (section 8.4). A converted lease's provisional deadline stands in
+    /// for `valid_until`; before its first renewal it has none and starts
+    /// nothing, while its VMs that already run keep running (ADR 0241). A
+    /// lease granted for 5 000 ms or less never has the time left.
     #[must_use]
     pub fn may_start_stateful(&self, lease_id: &LeaseId, spec_token: u64, now: Instant) -> bool {
         self.leases.get(lease_id).is_some_and(|lease| {
             lease.state == LeaseState::Held
-                && (lease.mode == LeaseMode::Local
-                    || lease.valid_until.is_some_and(|until| now < until))
+                && match lease.mode {
+                    LeaseMode::Local => true,
+                    LeaseMode::Expiring => {
+                        lease
+                            .valid_until
+                            .zip(lease.duration)
+                            .is_some_and(|(until, d)| {
+                                until.checked_duration_since(now).is_some_and(|left| {
+                                    left >= crate::EXPIRING_START_WITHIN + margin(d)
+                                })
+                            })
+                    }
+                }
                 && lease.token == spec_token
                 && lease.token == self.highest_for(lease.resource_type, &lease.resource_id)
         })
@@ -1936,21 +1952,42 @@ mod tests {
         assert_eq!(lease.valid_until, Some(later + millis(2000)));
     }
 
-    /// Section 8.4: a held `expiring` lease past its `valid_until` starts
-    /// nothing, even before the next poll marks it `expired`.
+    /// Section 6.4 and section 8.4 (ADR 0242): a held `expiring` lease starts
+    /// a stateful VM only with the start bound and `M` left before
+    /// `valid_until`. Nothing starts in the last 4 500 ms of a 15 000 ms
+    /// lease, nor past `valid_until` before the next poll marks it `expired`,
+    /// while its VMs keep running. A lease of 5 000 ms or less has the time
+    /// at most at the instant its renewal was sent, never once an answer
+    /// arrives.
     #[test]
-    fn a_held_lease_past_valid_until_starts_nothing_before_the_poll() {
+    fn a_start_needs_the_start_bound_and_the_margin_left() {
         let t0 = Instant::now();
         let id = LeaseId("lse_e".to_string());
         let mut table = LeaseTable::new();
-        let grant = expiring("lse_e", 1, 3000);
+        let grant = expiring("lse_e", 1, 15000);
         table.on_grant(&grant, None, t0).expect("grant");
         confirm(&mut table, &grant, t0);
-        let until = t0 + millis(2000);
+        let until = t0 + millis(13_500);
         assert_eq!(table.get(&id).expect("lease").valid_until, Some(until));
-        assert!(table.may_start_stateful(&id, 1, until - millis(1)));
+        assert!(table.may_start_stateful(&id, 1, t0));
+        assert!(table.may_start_stateful(&id, 1, until - millis(4500)));
+        assert!(!table.may_start_stateful(&id, 1, until - millis(4499)));
+        assert!(!table.may_start_stateful(&id, 1, until - millis(1)));
         assert!(!table.may_start_stateful(&id, 1, until));
         assert_eq!(table.get(&id).expect("lease").state, LeaseState::Held);
+        assert!(table.may_keep_running(&id, 1));
+        for (lease, resource, duration_ms) in [("lse_5", "app_5", 5000), ("lse_3", "app_3", 3000)] {
+            let mut short = expiring(lease, 1, duration_ms);
+            short.resource_id = resource.to_string();
+            table.on_grant(&short, None, t0).expect("grant");
+            confirm(&mut table, &short, t0);
+            let short_id = LeaseId(lease.to_string());
+            assert_eq!(table.get(&short_id).expect("lease").state, LeaseState::Held);
+            assert!(
+                !table.may_start_stateful(&short_id, 1, t0 + millis(1)),
+                "{duration_ms}"
+            );
+        }
         // A `local` lease has no deadline.
         table
             .on_grant(&local_on("lse_l", "app_other", 1), None, t0)

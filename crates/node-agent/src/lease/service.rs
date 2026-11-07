@@ -355,18 +355,31 @@ impl LeaseView {
     /// The caller keeps the permit until the engine's start returned. A fence
     /// triggered meanwhile waits for it and then stops the VM, so a VM can
     /// never be started after the fence that should stop it.
+    ///
+    /// The answer and the mode that sets the start's bound come from one look
+    /// at the table, caught up with every suspend (ADR 0240), so a change of
+    /// mode in between cannot give a start under an `expiring` lease the
+    /// longer bound of a `local` one (ADR 0242).
     pub async fn start_permit(&self, lease_id: &str, spec_token: u64) -> Option<StartPermit> {
-        let gate = self.gates.gate(&LeaseId(lease_id.to_owned()));
+        let lease_id = LeaseId(lease_id.to_owned());
+        let gate = self.gates.gate(&lease_id);
         let shared = gate.read_owned().await;
-        let expiring = self
-            .lock()
-            .get(&LeaseId(lease_id.to_owned()))
+        if self.failed.load(Ordering::SeqCst) || self.gates.fencing().contains(&lease_id) {
+            return None;
+        }
+        let now = Instant::now();
+        let table = self.lock_at(now);
+        if !table.may_start_stateful(&lease_id, spec_token, now) {
+            return None;
+        }
+        let expiring = table
+            .get(&lease_id)
             .is_some_and(|lease| lease.mode == LeaseMode::Expiring);
-        self.may_start_stateful(lease_id, spec_token)
-            .then_some(StartPermit {
-                _shared: shared,
-                expiring,
-            })
+        drop(table);
+        Some(StartPermit {
+            _shared: shared,
+            expiring,
+        })
     }
 
     /// Section 8.5 step 1: whether a fence of the lease is stopping its VMs,
@@ -1945,6 +1958,74 @@ mod tests {
         assert_eq!(Instant::now(), now, "no time passed on the tokio clock");
     }
 
+    /// ADR 0242: a start permit under an `expiring` lease needs the start
+    /// bound and the margin left on the lease clock, counting a suspend the
+    /// service has not caught up with yet, and it carries the 3 s bound. A
+    /// `local` lease's permit carries the longer bound and needs no time left.
+    #[tokio::test(start_paused = true)]
+    async fn a_start_permit_needs_the_start_bound_and_the_margin_left() {
+        let clock = Arc::new(ManualHostClock::new(
+            Some("boot-a"),
+            Duration::from_secs(1000),
+        ));
+        let reading = HostNow::read(&*clock);
+        let now = reading.instant;
+        let grant = LeaseGrant {
+            lease_id: LeaseId("lse_e".to_owned()),
+            resource_type: ResourceType::App,
+            resource_id: "app_e".to_owned(),
+            mode: LeaseMode::Expiring,
+            fencing_token: 1,
+            duration_ms: Some(15_000),
+            granted_at: "2026-11-06T10:00:00Z".to_owned(),
+        };
+        let local = LeaseGrant {
+            lease_id: LeaseId("lse_l".to_owned()),
+            resource_id: "app_l".to_owned(),
+            mode: LeaseMode::Local,
+            duration_ms: None,
+            ..grant.clone()
+        };
+        let mut table = LeaseTable::new();
+        table.on_grant(&grant, None, now).expect("grant");
+        table.on_grant(&local, None, now).expect("local grant");
+        assert!(matches!(
+            table.poll(now).as_slice(),
+            [Action::SendRenew { .. }]
+        ));
+        let renew = MsgId("msg_renew".to_owned());
+        table.renew_sent(&grant.lease_id, renew.clone(), &reading);
+        table
+            .on_grant(&grant, Some(&renew), now)
+            .expect("the answer");
+        let view =
+            LeaseView::with_suspends(table, false, SuspendWatch::new(clock.clone(), &reading));
+        let permit = view
+            .start_permit("lse_e", 1)
+            .await
+            .expect("13.5 s are left");
+        assert_eq!(permit.start_within(), crate::EXPIRING_START_WITHIN);
+        drop(permit);
+
+        // `D` = 15 000 gives `M` = 1 500, so a start needs 4 500 ms left.
+        clock.suspend(Duration::from_secs(9));
+        assert!(
+            view.start_permit("lse_e", 1).await.is_some(),
+            "4 500 ms are left"
+        );
+        clock.suspend(Duration::from_millis(1));
+        assert!(view.start_permit("lse_e", 1).await.is_none());
+        assert!(view.holds_app_lease("app_e", 1), "the lease is still held");
+        assert_eq!(
+            view.lock().get(&grant.lease_id).map(|lease| lease.state),
+            Some(LeaseState::Held)
+        );
+
+        let permit = view.start_permit("lse_l", 1).await.expect("a local lease");
+        assert_eq!(permit.start_within(), crate::START_WITHIN);
+        assert_eq!(Instant::now(), now, "no time passed on the tokio clock");
+    }
+
     /// ADR 0240, safety review M1: a renewal's send time is read under the
     /// lock that applies the suspends. One recorded after a wake-up nobody has
     /// caught up with yet does not move for that suspend, and a suspend
@@ -1985,13 +2066,13 @@ mod tests {
             .expect("the answer");
         assert_eq!(valid_until(), Some(now + Duration::from_millis(13_500)));
 
-        // The second, recorded before a 10 s suspend that a start check then
-        // applies: its send time moves with every other instant, so its
-        // answer cannot revive the lease past the primary's gate.
+        // The second, recorded before a 10 s suspend that a backup's lease
+        // check then applies: its send time moves with every other instant,
+        // so its answer cannot revive the lease past the primary's gate.
         let second = MsgId("msg_renew_2".to_owned());
         view.record_renewal(&grant.lease_id, second.clone(), &*clock, || true);
         clock.suspend(Duration::from_secs(10));
-        assert!(view.may_start_stateful("lse_e", 1), "3.5 s are left");
+        assert!(view.holds_app_lease("app_e", 1), "3.5 s are left");
         view.lock()
             .on_grant(&grant, Some(&second), now)
             .expect("the answer");
@@ -2000,9 +2081,9 @@ mod tests {
             Some(now + Duration::from_millis(3_500)),
             "the answer counts from the moved send time"
         );
-        assert!(view.may_start_stateful("lse_e", 1));
+        assert!(view.holds_app_lease("app_e", 1));
         clock.suspend(Duration::from_secs(4));
-        assert!(!view.may_start_stateful("lse_e", 1));
+        assert!(!view.holds_app_lease("app_e", 1));
     }
 
     /// ADR 0241, safety review m1: a converted lease's first renewal that the

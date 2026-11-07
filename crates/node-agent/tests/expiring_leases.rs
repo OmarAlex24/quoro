@@ -141,7 +141,14 @@ async fn grant_and_confirm(
     );
     answer(leases, &renew, duration_ms).await;
     assert_eq!(leases.view.state(LEASE), Some(LeaseState::Held));
-    assert!(leases.view.may_start_stateful(LEASE, 1));
+    // Section 6.4 (ADR 0242): a start also needs the start bound, 3 000 ms,
+    // and `M` left before `valid_until`, which a lease of 5 000 ms or less
+    // never has once its answer arrives.
+    if duration_ms >= 15_000 {
+        assert!(leases.view.may_start_stateful(LEASE, 1));
+    } else if duration_ms <= 5000 {
+        assert!(!leases.view.may_start_stateful(LEASE, 1));
+    }
     before
 }
 
@@ -681,7 +688,7 @@ async fn a_suspend_before_a_grant_shortens_nothing() {
     clock.suspend(Duration::from_secs(60));
     tokio::time::sleep(millis(100)).await;
 
-    let _before = grant_and_confirm(&leases, &mut attached, 6000).await;
+    let _before = grant_and_confirm(&leases, &mut attached, 15_000).await;
     tokio::time::sleep(millis(1000)).await;
     assert_eq!(leases.view.state(LEASE), Some(LeaseState::Held));
     assert!(leases.view.may_start_stateful(LEASE, 1));
