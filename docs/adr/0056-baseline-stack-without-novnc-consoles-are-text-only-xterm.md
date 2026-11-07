@@ -1,11 +1,11 @@
 # ADR 0056: Baseline stack without noVNC: consoles are text-only (xterm.js) because Cloud Hypervisor has no VNC or display device
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR 0253](0253-baseline-stack-same-as-adr-0056-except-metrics-which-the.md)
 - **Date:** 2026-11-02
 - **Ledger id:** D-0056
 - **Tags:** stack, engine, console
 - **Supersedes:** [ADR 0028](0028-baseline-stack-to-be-confirmed-in-the-architecture-doc.md)
-- **Superseded by:** none
+- **Superseded by:** [ADR 0253](0253-baseline-stack-same-as-adr-0056-except-metrics-which-the.md)
 - **Related:** none
 
 ## Context
@@ -23,7 +23,7 @@ _Some wording was changed for the public repository._ _Some operational details 
 ## Consequences
 
 - Replaces ADR 0028.
-- This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
+- Superseded by [ADR 0253](0253-baseline-stack-same-as-adr-0056-except-metrics-which-the.md); this decision is no longer binding and is kept for history.
 
 ---
 Generated from decision D-0056 in the project decision ledger. Do not edit by hand; changes go through a new decision.
