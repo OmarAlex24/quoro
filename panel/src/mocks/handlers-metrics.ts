@@ -7,6 +7,7 @@ import type {
   Vm,
   VmMetricSample,
 } from '../api/generated/model';
+import { noise, rng } from '../lib/dither';
 import { formatSseFrame } from '../lib/log-buffer';
 import { db, findApp, now } from './db';
 import { json, problem, signedIn, unauthorized } from './http';
@@ -15,7 +16,8 @@ import { json, problem, signedIn, unauthorized } from './http';
 
 const MIB = 1024 * 1024;
 const INTERVAL_MS = 5_000;
-const HISTORY_COUNT = 20;
+/** The node keeps ten minutes at 5 s (D-0129): 120 samples. */
+const HISTORY_COUNT = 120;
 
 const clamp = (value: number, min: number, max: number): number =>
   Math.min(max, Math.max(min, value));
@@ -78,17 +80,40 @@ const vmSample = (vm: Vm, time: string, cpu: number, rss: number): VmMetricSampl
   memory_bytes: vmMemoryBytes(vm),
 });
 
-const vmHistory = (vm: Vm): VmMetricSample[] =>
-  Array.from({ length: HISTORY_COUNT }, (_, index) => {
-    const time = new Date(Date.now() - (HISTORY_COUNT - 1 - index) * INTERVAL_MS).toISOString();
-    const wave = Math.sin(index / 3.1);
-    return vmSample(
-      vm,
-      time,
-      0.3 + wave * 0.12 + (Math.random() - 0.5) * 0.03,
-      vmMemoryBytes(vm) * (0.8 + wave * 0.02),
-    );
-  });
+interface LiveVmState {
+  cpu: number;
+  memoryFraction: number;
+}
+
+/** Where each VM's live samples carry on from: the end of its history. */
+const liveVms = new Map<string, LiveVmState>();
+
+/**
+ * Ten minutes of a VM: CPU wandering around a quarter of its vCPUs with a
+ * busier stretch near the end, and resident memory creeping up the way a
+ * VMM's does (it never gives touched pages back). A VM named `…-2` lost half
+ * a minute of samples, so the chart has a gap to show.
+ */
+const vmHistory = (vm: Vm): VmMetricSample[] => {
+  const wobble = noise(`cpu-${vm.id}`, 26);
+  const jitter = rng(`jitter-${vm.id}`);
+  const creep = noise(`mem-${vm.id}`, 12);
+  const end = Date.now();
+  const samples: VmMetricSample[] = [];
+  let cpu = 0.24;
+  let memoryFraction = 0.73;
+  for (let index = 0; index < HISTORY_COUNT; index += 1) {
+    const at = index / (HISTORY_COUNT - 1);
+    const busy = index > 78 && index < 92 ? 0.16 : 0;
+    cpu = clamp(0.1 + 0.3 * wobble(at) + busy + (jitter() - 0.5) * 0.05, 0.04, 0.95);
+    memoryFraction = clamp(0.72 + 0.07 * at + 0.012 * (creep(at) - 0.5), 0.5, 0.95);
+    if (vm.name.endsWith('-2') && index >= 64 && index < 70) continue;
+    const time = new Date(end - (HISTORY_COUNT - 1 - index) * INTERVAL_MS).toISOString();
+    samples.push(vmSample(vm, time, cpu, vmMemoryBytes(vm) * memoryFraction));
+  }
+  liveVms.set(vm.id, { cpu, memoryFraction });
+  return samples;
+};
 
 interface AppStreamSample extends VmMetricSample {
   vm_id: string;
@@ -101,15 +126,13 @@ const runningInstances = (appId: string): Vm[] =>
   );
 
 const nextAppSamples = (appId: string): AppStreamSample[] =>
-  runningInstances(appId).map((vm, index) => {
-    const wave = Math.sin(Date.now() / 9_000 + index * 1.7);
+  runningInstances(appId).map((vm) => {
+    const state = liveVms.get(vm.id) ?? { cpu: 0.24, memoryFraction: 0.79 };
+    state.cpu = clamp(state.cpu + (Math.random() - 0.5) * 0.05 + (0.24 - state.cpu) * 0.08, 0.04, 0.95);
+    state.memoryFraction = clamp(state.memoryFraction + (Math.random() - 0.4) * 0.002, 0.5, 0.95);
+    liveVms.set(vm.id, state);
     return {
-      ...vmSample(
-        vm,
-        now(),
-        0.32 + wave * 0.11 + (Math.random() - 0.5) * 0.04,
-        vmMemoryBytes(vm) * (0.81 + wave * 0.02),
-      ),
+      ...vmSample(vm, now(), state.cpu, vmMemoryBytes(vm) * state.memoryFraction),
       vm_id: vm.id,
       node_id: vm.node_id,
     };

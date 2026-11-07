@@ -10,11 +10,14 @@ import {
   dataAgeSentence,
   guestKernelFindings,
   guestKernelIsClear,
+  groupFindings,
   guestKernelVersion,
   inventorySentence,
   openFindingCount,
   parsePins,
   resolvedReasonWords,
+  securityParams,
+  securityTabCount,
   severityLabel,
   severityRank,
   severityTone,
@@ -227,5 +230,79 @@ describe('openFindingCount', () => {
     expect(
       openFindingCount(counts({ critical: 1, high: 2, medium: 3, low: 4, unknown: 5, kev: 6 })),
     ).toBe(15);
+  });
+});
+
+describe('groupFindings', () => {
+  const finding = (
+    vuln_id: string,
+    severity: VulnerabilityFinding['severity'],
+    resolved = false,
+  ): VulnerabilityFinding => ({
+    id: `vln_${vuln_id}`,
+    subject_kind: 'app',
+    vuln_id,
+    aliases: [],
+    ecosystem: 'npm',
+    package: 'tar',
+    installed_version: '6.2.0',
+    fixed_version: null,
+    severity,
+    cvss_score: null,
+    kev: false,
+    epss: null,
+    first_seen_at: '2026-11-01T00:00:00Z',
+    resolved_at: resolved ? '2026-11-02T00:00:00Z' : null,
+    resolved_reason: resolved ? 'upgraded' : null,
+  });
+
+  it('groups open findings by severity, most severe first, and the resolved last', () => {
+    const groups = groupFindings([
+      finding('A', 'high'),
+      finding('B', 'low'),
+      finding('C', 'critical'),
+      finding('D', 'high'),
+      finding('E', 'medium', true),
+    ]);
+    expect(groups.map((group) => [group.label, group.items.map((item) => item.vuln_id)])).toEqual([
+      ['Critical', ['C']],
+      ['High', ['A', 'D']],
+      ['Low', ['B']],
+      ['Resolved', ['E']],
+    ]);
+  });
+
+  it('has no group for an empty report', () => {
+    expect(groupFindings([])).toEqual([]);
+  });
+});
+
+describe('securityTabCount', () => {
+  const counts = { critical: 0, high: 1, medium: 2, low: 0, unknown: 0, kev: 1 };
+
+  it('counts the open findings', () => {
+    expect(securityTabCount({ counts })).toBe(3);
+  });
+
+  it('shows nothing for zero or for a report that has not arrived', () => {
+    expect(securityTabCount({ counts: { ...counts, high: 0, medium: 0 } })).toBeNull();
+    expect(securityTabCount(undefined)).toBeNull();
+  });
+});
+
+describe('securityParams', () => {
+  it('asks for open findings of every severity by default, with no undefined keys', () => {
+    expect(securityParams()).toEqual({ limit: 50 });
+    expect(Object.keys(securityParams())).toEqual(['limit']);
+  });
+
+  it('maps each filter to the report query', () => {
+    expect(securityParams('high', true, true)).toEqual({
+      severity: 'high',
+      kev: true,
+      include_resolved: true,
+      limit: 50,
+    });
+    expect(securityParams('critical')).toEqual({ severity: 'critical', limit: 50 });
   });
 });

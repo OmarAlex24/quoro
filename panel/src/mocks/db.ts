@@ -1315,6 +1315,50 @@ const seedAtlas = (createdAt: string, repositoryId: string): void => {
     finished_at: minutesAgo(226),
     pruned_at: null,
   });
+  // The run before it failed, and the one before that succeeded: the
+  // Storage tab's list as the reference draws it.
+  db.backups.push(
+    {
+      id: mockId('bkp'),
+      repository_id: repositoryId,
+      source_kind: 'volume',
+      app_id: postgres.id,
+      volume_id: volumeId,
+      node_id: lab4,
+      status: 'failed',
+      trigger: 'schedule',
+      snapshot_method: null,
+      pause_ms: null,
+      logical_bytes: null,
+      uploaded_bytes: null,
+      chunk_count: null,
+      error: 'the node could not read the volume snapshot',
+      created_at: minutesAgo(587),
+      started_at: minutesAgo(587),
+      finished_at: minutesAgo(586),
+      pruned_at: null,
+    },
+    {
+      id: mockId('bkp'),
+      repository_id: repositoryId,
+      source_kind: 'volume',
+      app_id: postgres.id,
+      volume_id: volumeId,
+      node_id: lab4,
+      status: 'succeeded',
+      trigger: 'api',
+      snapshot_method: 'reflink',
+      pause_ms: 0,
+      logical_bytes: Math.round(4.1 * GIB),
+      uploaded_bytes: Math.round(2.1 * GIB),
+      chunk_count: 540,
+      error: null,
+      created_at: minutesAgo(947),
+      started_at: minutesAgo(947),
+      finished_at: minutesAgo(945),
+      pruned_at: null,
+    },
+  );
 
   db.vms.push({
     id: mockId('vm'),
