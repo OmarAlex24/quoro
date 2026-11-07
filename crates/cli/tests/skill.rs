@@ -9,6 +9,8 @@
 //!   `QUORO_BLESS=1 cargo test -p quoro-cli --test skill` rewrites them.
 //! - The copy compiled into the binary (`quoro_cli::skill::FILES`) is exactly
 //!   the files of the directory.
+//! - The command-line client guide (`docs/guides/cli.md`) is held to the same
+//!   name check, and its exit code table to `crates/cli/src/error.rs`.
 
 use clap::{Arg, Command};
 use std::collections::BTreeSet;
@@ -29,7 +31,13 @@ const HOST_COMMANDS: &[(&str, &[&str])] = &[
     ),
     ("audit verify", &["file", "db", "prev-hash"]),
     ("help host", &[]),
+    ("version", &[]),
 ];
+
+/// Other programs a code line may start with (`cargo build --release`); their
+/// flags are not the client's, so a line with no `quoro` command in it is not
+/// checked for flags.
+const OTHER_PROGRAMS: &[&str] = &["cargo", "curl", "gh", "git", "tar"];
 
 /// The first word of a name that is checked as an MCP tool.
 const TOOL_VERBS: &[&str] = &[
@@ -44,6 +52,9 @@ fn repository() -> PathBuf {
 fn skill_dir() -> PathBuf {
     repository().join("skills/quoro")
 }
+
+/// The command-line client guide in the documentation.
+const GUIDE: &str = "docs/guides/cli.md";
 
 fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
@@ -324,12 +335,24 @@ fn find_flag<'a>(root: &'a Command, command: &'a Command, flag: &str) -> Option<
         .or_else(|| root.get_arguments().filter(|a| is_global(a)).find(matches))
 }
 
+/// clap's help flag, which every command has.
+fn is_help(word: &str) -> bool {
+    matches!(word, "--help" | "-h")
+}
+
 /// Checks the command line that follows a `quoro` word.
 fn check_command_line(root: &Command, rest: &[String]) -> Result<(), String> {
     let line = format!("quoro {}", rest.join(" "));
-    let first_two = rest.iter().take(2).cloned().collect::<Vec<_>>().join(" ");
-    if let Some((_, flags)) = HOST_COMMANDS.iter().find(|(name, _)| *name == first_two) {
-        for word in &rest[2..] {
+    let host = HOST_COMMANDS.iter().find(|(name, _)| {
+        let name: Vec<&str> = name.split(' ').collect();
+        rest.len() >= name.len()
+            && rest
+                .iter()
+                .zip(&name)
+                .all(|(word, part)| word.as_str() == *part)
+    });
+    if let Some((name, flags)) = host {
+        for word in &rest[name.split(' ').count()..] {
             if let Some(flag) = word.strip_prefix("--") {
                 let flag = flag.split('=').next().unwrap_or_default();
                 if !flags.contains(&flag) {
@@ -344,8 +367,12 @@ fn check_command_line(root: &Command, rest: &[String]) -> Result<(), String> {
         .iter()
         .map(|w| w.trim_start_matches('[').trim_end_matches(']'));
     while let Some(word) = words.next() {
-        if word.is_empty() {
+        if word.is_empty() || is_help(word) {
             continue;
+        }
+        // A placeholder (`quoro <command> --help`) stands for any command.
+        if word.starts_with('<') && word.ends_with('>') {
+            return Ok(());
         }
         if word.starts_with('-') && word.len() > 1 {
             let flag = word.split('=').next().unwrap_or_default();
@@ -407,12 +434,15 @@ fn unknown_names(
                 command_line = true;
             }
         }
-        if !command_line {
+        let other_program = words
+            .first()
+            .is_some_and(|first| OTHER_PROGRAMS.contains(&first.as_str()));
+        if !command_line && !other_program {
             for word in &words {
                 if let Some(flag) = word.strip_prefix("--").filter(|f| !f.is_empty()) {
                     let flag = flag.split('=').next().unwrap_or_default();
                     let host = HOST_COMMANDS.iter().any(|(_, flags)| flags.contains(&flag));
-                    if !longs.contains(flag) && !host {
+                    if !longs.contains(flag) && !host && flag != "help" {
                         problems.push(format!("`{fragment}`: no command has --{flag}"));
                     }
                 }
@@ -455,6 +485,44 @@ fn the_skill_names_only_commands_flags_and_tools_that_exist() {
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
+#[test]
+fn the_cli_guide_names_only_commands_flags_and_tools_that_exist() {
+    let root = quoro_cli::command();
+    let mut longs = BTreeSet::new();
+    every_long(&root, &mut longs);
+    let tools = tool_names();
+    let text = read(&repository().join(GUIDE));
+    let problems: Vec<String> = unknown_names(&text, &root, &longs, &tools)
+        .into_iter()
+        .map(|problem| format!("{GUIDE}: {problem}"))
+        .collect();
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// The guide's exit code table has a row for every exit code of
+/// `crates/cli/src/error.rs`, and no other.
+#[test]
+fn the_cli_guide_lists_every_exit_code() {
+    use quoro_cli::exit;
+    let text = read(&repository().join(GUIDE));
+    let rows: BTreeSet<u8> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("| ")?.split(' ').next()?.parse().ok())
+        .collect();
+    let codes: BTreeSet<u8> = [
+        exit::OK,
+        exit::OTHER,
+        exit::USAGE,
+        exit::APPROVAL_REQUIRED,
+        exit::FORBIDDEN,
+        exit::NOT_FOUND,
+        exit::CONFLICT,
+        exit::UNREACHABLE,
+    ]
+    .into();
+    assert_eq!(rows, codes, "{GUIDE} has one row per exit code");
+}
+
 /// The check itself catches a renamed command, a renamed flag and a tool
 /// that does not exist.
 #[test]
@@ -476,12 +544,22 @@ fn the_name_check_catches_what_does_not_exist() {
         check("`quoro --context lab vm show web --json`"),
         Vec::<String>::new()
     );
+    assert_eq!(
+        check(
+            "`quoro version`, `quoro app --help`, `quoro <command> --help`, \
+             `cargo build --release --locked -p quoro`"
+        ),
+        Vec::<String>::new()
+    );
     for wrong in [
         "`quoro app crete web`",
         "`quoro deploy --imag REF`",
         "`quoro logs -x`",
         "`quoro vm list --image REF`",
         "`quoro mcp stdio --key KEY`",
+        "`quoro version --all`",
+        "`quoro app --help --imag REF`",
+        "`cargo build | quoro deploy --imag REF`",
         "pass `--wiat`",
         "`get_me`",
         "`get_capacity`",
