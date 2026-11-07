@@ -159,7 +159,11 @@ warns that the result will not match the published release.
 | `--locked` and a clean tree check | The dependency set and the sources are exactly what the tag says; a dirty tree is refused unless `QUORO_ALLOW_DIRTY=1`. |
 
 `QUORO_SKIP_PANEL=1` and `QUORO_ALLOW_DIRTY=1` exist for local iteration only:
-both print a warning and the result is **not** a release build. Without
+both print a warning and the result is **not** a release build.
+`QUORO_DEV_WARM_POLICY=1` is for test-lab dev builds only: it turns on the
+dev-only `dev-warm-policy` feature, which accepts `ha_policy: warm` before the
+warm policy ships (ADR 0223), and prints the same warning. `quoro version`
+reports it, and the release workflow fails a release whose binary does. Without
 `QUORO_SKIP_PANEL`, the build refuses to run when the pinned Node.js is not
 first on `PATH`; run `packaging/fetch-node.sh <dir>` and put `<dir>/bin` there.
 

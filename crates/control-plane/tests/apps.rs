@@ -659,8 +659,9 @@ async fn app_validation_and_authorization() {
     .await;
     assert_eq!((status, code.as_str()), (409, "conflict"));
     // The backup schedule is stored; `cold` needs a stateful app and a
-    // backup repository (409), `warm` and `hot` wait for M5b and M6 (422),
-    // and a schedule out of range is 422 (ADR 0147).
+    // backup repository (409), and a schedule out of range is 422 (ADR 0147).
+    // `warm` has its own tests below, since a build with the dev-only
+    // `dev-warm-policy` feature accepts it (ADR 0223).
     let res = owner
         .patch(server.url(&format!("/api/v1/apps/{app_id}")))
         .json(&json!({ "backup_schedule": { "interval_h": 6, "keep": 3 } }))
@@ -675,7 +676,7 @@ async fn app_validation_and_authorization() {
     );
     for (body, expected) in [
         (json!({ "ha_policy": "cold" }), (409, "conflict")),
-        (json!({ "ha_policy": "warm" }), (422, "validation_failed")),
+        (json!({ "ha_policy": "hot" }), (422, "validation_failed")),
         (
             json!({ "backup_schedule": { "interval_h": 0, "keep": 7 } }),
             (422, "validation_failed"),
@@ -801,6 +802,100 @@ async fn app_validation_and_authorization() {
     )
     .await;
     assert_eq!((status, code.as_str()), (422, "validation_failed"));
+}
+
+// ---------------------------------------------------------------------------
+// `ha_policy: warm` and the dev-only `dev-warm-policy` feature (ADR 0223)
+// ---------------------------------------------------------------------------
+
+async fn patch_app(
+    owner: &reqwest::Client,
+    server: &common::Server,
+    app_id: &str,
+    body: Value,
+) -> reqwest::Response {
+    owner
+        .patch(server.url(&format!("/api/v1/apps/{app_id}")))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn ha_policy_of(owner: &reqwest::Client, server: &common::Server, app_id: &str) -> Value {
+    let res = owner
+        .get(server.url(&format!("/api/v1/apps/{app_id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "get app: {}", res.text().await.unwrap());
+    let app: Value = res.json().await.unwrap();
+    app["ha_policy"].clone()
+}
+
+/// A default build refuses `ha_policy` `warm` until the warm policy ships
+/// (ADR 0020), and the app keeps its policy.
+#[cfg(not(feature = "dev-warm-policy"))]
+#[tokio::test]
+async fn a_default_build_refuses_ha_policy_warm() {
+    let (server, owner, _node_id, project_id) = setup().await;
+    let app = create_app(&owner, &server, &project_id).await;
+    let app_id = app["id"].as_str().unwrap();
+    let (status, code, _) =
+        problem(patch_app(&owner, &server, app_id, json!({ "ha_policy": "warm" })).await).await;
+    assert_eq!((status, code.as_str()), (422, "validation_failed"));
+    assert_eq!(ha_policy_of(&owner, &server, app_id).await, "none");
+}
+
+/// A test-lab build with the dev-only `dev-warm-policy` feature accepts
+/// `ha_policy` `warm` on `updateApp` and stores it (ADR 0223, #533). It
+/// accepts nothing else the warm policy would bring: `hot`, warm settings and
+/// `warm` on `createApp` are still refused, and the app can leave `warm`.
+#[cfg(feature = "dev-warm-policy")]
+#[tokio::test]
+async fn a_dev_warm_policy_build_accepts_ha_policy_warm() {
+    let (server, owner, _node_id, project_id) = setup().await;
+    let app = create_app(&owner, &server, &project_id).await;
+    let app_id = app["id"].as_str().unwrap();
+
+    let res = patch_app(&owner, &server, app_id, json!({ "ha_policy": "warm" })).await;
+    assert_eq!(res.status(), 200, "warm: {}", res.text().await.unwrap());
+    let updated: Value = res.json().await.unwrap();
+    assert_eq!(updated["ha_policy"], "warm");
+    assert_eq!(ha_policy_of(&owner, &server, app_id).await, "warm");
+
+    for body in [
+        json!({ "ha_policy": "hot" }),
+        json!({ "warm": { "interval_s": 60 } }),
+        json!({ "ha_policy": "warm", "warm": { "interval_s": 60 } }),
+    ] {
+        let (status, code, _) =
+            problem(patch_app(&owner, &server, app_id, body.clone()).await).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (422, "validation_failed"),
+            "{body}"
+        );
+    }
+    assert_eq!(ha_policy_of(&owner, &server, app_id).await, "warm");
+
+    let mut body = create_body(&project_id);
+    body["name"] = json!("born-warm");
+    body["ha_policy"] = json!("warm");
+    let (status, code, _) = problem(
+        owner
+            .post(server.url("/api/v1/apps"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!((status, code.as_str()), (422, "validation_failed"));
+
+    let res = patch_app(&owner, &server, app_id, json!({ "ha_policy": "none" })).await;
+    assert_eq!(res.status(), 200, "none: {}", res.text().await.unwrap());
+    assert_eq!(ha_policy_of(&owner, &server, app_id).await, "none");
 }
 
 async fn create_app_named(

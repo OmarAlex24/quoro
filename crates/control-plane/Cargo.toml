@@ -9,6 +9,15 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# ADR 0223: dev-only, for test-lab builds. It lets `updateApp` accept
+# `ha_policy: warm` before the warm policy ships, so an app's lease can turn
+# `expiring` once the primary side of that mode change exists (#555). It
+# creates no warm copy, no standby VM and no replication. Off by default, and
+# the release build never enables it: CI fails a default or release binary
+# that reports it. Removed when the warm policy merges (#533).
+dev-warm-policy = []
+
 [dependencies]
 quoro-types = { path = "../types" }
 # Wire messages, RFC 8785 canonical JSON and the desired-state signature.

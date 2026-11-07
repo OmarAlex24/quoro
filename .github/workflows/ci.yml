@@ -53,12 +53,40 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Build
         run: cargo build --workspace --all-targets --locked
+      # ADR 0223: the dev-only dev-warm-policy feature is for test-lab builds
+      # and never in the default build. `quoro version` reports it.
+      - name: No dev-only feature in the default build
+        run: |
+          reported="$(target/debug/quoro version)"
+          echo "$reported"
+          case "$reported" in
+            *dev-warm-policy*)
+              echo "error: the default build has the dev-only dev-warm-policy feature (ADR 0223)" >&2
+              exit 1
+              ;;
+          esac
       - name: Test
         env:
           QUORO_S3_TEST_ENDPOINT: http://127.0.0.1:19000
           QUORO_S3_TEST_ACCESS_KEY: quorotest
           QUORO_S3_TEST_SECRET_KEY: quorotestsecret
         run: cargo test --workspace --locked
+      # ADR 0223: the test of what the dev-only feature changes runs only in a
+      # build that has it. Such a build must report the feature in `quoro
+      # version`, or the checks of the default build and the release cannot
+      # see it. This rebuilds target/debug/quoro, so it stays the last step.
+      - name: Test the dev-only warm policy
+        run: |
+          cargo test -p quoro-control-plane --features dev-warm-policy --locked --test apps
+          reported="$(cargo run -q -p quoro --features dev-warm-policy --locked -- version)"
+          echo "$reported"
+          case "$reported" in
+            *dev-warm-policy*) ;;
+            *)
+              echo "error: a dev-warm-policy build does not report the feature in quoro version (ADR 0223)" >&2
+              exit 1
+              ;;
+          esac
 
   deny:
     name: Dependencies (cargo-deny)
