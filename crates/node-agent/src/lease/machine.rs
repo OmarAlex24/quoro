@@ -77,6 +77,11 @@ pub struct Lease {
     /// the stored deadline a restore found. `None` whenever `valid_until` is,
     /// and on a host that cannot tell its boot.
     validity: Option<StoredValidity>,
+    /// Whether `valid_until` is still a converted lease's provisional
+    /// deadline: its first renewal is out, and no answer has been taken since
+    /// the conversion (ADR 0241). The conversion grant counts toward no gate,
+    /// so until an answer is taken no gate backs this deadline.
+    provisional: bool,
     /// When to send the next renewal; `None` for `local` (section 8.4).
     next_renew_at: Option<Instant>,
     /// Renewals sent and not yet answered.
@@ -347,6 +352,7 @@ impl LeaseTable {
                     duration: stored.duration,
                     valid_until,
                     validity,
+                    provisional: false,
                     // A lease that came back with its validity renews at once
                     // (section 8.4 "Agent restart").
                     next_renew_at: valid_until.map(|_| now.instant),
@@ -479,6 +485,7 @@ impl LeaseTable {
             lease.duration = duration;
             lease.valid_until = None;
             lease.validity = None;
+            lease.provisional = false;
             lease.outstanding.clear();
             if duration.is_some() {
                 // To `expiring`: the lease stays `held`, its VMs run on, and
@@ -515,6 +522,7 @@ impl LeaseTable {
                         duration: None,
                         valid_until: None,
                         validity: None,
+                        provisional: false,
                         next_renew_at: None,
                         outstanding: Vec::new(),
                     },
@@ -543,10 +551,21 @@ impl LeaseTable {
                     };
                     // An answer that arrives once its own `valid_until` has
                     // passed proves nothing still valid: it changes nothing,
-                    // and the renewals go on. A held lease's current
-                    // `valid_until` is no later, so the clock expires it.
+                    // and the renewals go on. A `valid_until` an earlier
+                    // answer set stands, as that answer's gate does. A
+                    // provisional deadline has no gate behind it (ADR 0241),
+                    // and this answer may carry a shorter duration than the
+                    // conversion did: the lease takes the answer's deadline,
+                    // already past, and expires at the next poll.
                     let valid_until = t_send + (d - margin(d));
                     if valid_until <= now {
+                        if let Some(lease) = self.leases.get_mut(&grant.lease_id)
+                            && lease.provisional
+                            && lease.valid_until.is_some_and(|until| until > valid_until)
+                        {
+                            lease.valid_until = Some(valid_until);
+                            lease.validity = sent_boottime.map(|at| at.later_by(d - margin(d)));
+                        }
                         return Ok(());
                     }
                     // Section 8.4: `valid_until = t_send + D - M`, renew every
@@ -573,6 +592,7 @@ impl LeaseTable {
                         // and from this answer's duration, like
                         // `valid_until`.
                         lease.validity = sent_boottime.map(|at| at.later_by(d - margin(d)));
+                        lease.provisional = false;
                         lease.next_renew_at = Some(t_send + d / 3);
                         lease.outstanding = outstanding;
                     }
@@ -583,13 +603,17 @@ impl LeaseTable {
                 // cannot prove the new grant until a renewal is answered, so
                 // the lease is `uncertain` and renews immediately. It never
                 // extends the validity the previous ownership had.
-                let (valid_until, validity) = existing
+                let (valid_until, validity, provisional) = existing
                     .as_ref()
                     .filter(|existing| {
                         matches!(existing.state, LeaseState::Held | LeaseState::Uncertain)
                     })
-                    .map_or((None, None), |existing| {
-                        (existing.valid_until, existing.validity.clone())
+                    .map_or((None, None, false), |existing| {
+                        (
+                            existing.valid_until,
+                            existing.validity.clone(),
+                            existing.provisional,
+                        )
                     });
                 self.highest_token.insert(key, grant.fencing_token);
                 self.leases.insert(
@@ -604,6 +628,7 @@ impl LeaseTable {
                         duration: Some(d),
                         valid_until,
                         validity,
+                        provisional,
                         next_renew_at: Some(now),
                         outstanding: Vec::new(),
                     },
@@ -679,6 +704,7 @@ impl LeaseTable {
         if provisional {
             lease.valid_until = Some(deadline);
             lease.validity = sent_boottime.as_ref().map(|at| at.later_by(d - margin(d)));
+            lease.provisional = true;
         }
         prune_outstanding(&mut lease.outstanding, d, now);
         lease.outstanding.push(Renewal {
@@ -703,6 +729,7 @@ impl LeaseTable {
         if provisional && lease.outstanding.is_empty() {
             lease.valid_until = None;
             lease.validity = None;
+            lease.provisional = false;
         }
     }
 
@@ -1316,6 +1343,68 @@ mod tests {
             table.get(&id).expect("lease").valid_until,
             Some(later + millis(13_500))
         );
+    }
+
+    /// ADR 0241: a late answer to a converted lease's renewal, one that
+    /// arrives once its own deadline has passed, may carry a shorter duration
+    /// than the conversion did. No gate backs the provisional deadline, so
+    /// the lease takes the answer's deadline and expires at the next poll. A
+    /// deadline an answer set stands through a later late answer.
+    #[test]
+    fn a_late_answer_ends_a_provisional_deadline_but_not_an_answered_one() {
+        let t0 = Instant::now();
+        let id = LeaseId("lse_a".to_string());
+        let first = MsgId("msg_first".to_string());
+        let converted = |at: Instant| {
+            let mut table = LeaseTable::new();
+            table.on_grant(&local("lse_a", 1), None, at).expect("grant");
+            table
+                .on_grant(&expiring("lse_a", 1, 15000), None, at)
+                .expect("conversion");
+            assert!(matches!(
+                table.poll(at).as_slice(),
+                [Action::SendRenew { .. }]
+            ));
+            assert!(table.renew_sent(&id, first.clone(), &HostNow::unknown(at)));
+            table
+        };
+
+        let mut table = converted(t0);
+        let late = t0 + millis(2500);
+        table
+            .on_grant(&expiring("lse_a", 1, 3000), Some(&first), late)
+            .expect("the late answer");
+        assert_eq!(
+            table.get(&id).expect("lease").valid_until,
+            Some(t0 + millis(2000)),
+            "the answer's deadline, already past"
+        );
+        assert!(table.poll(late).contains(&Action::Fence {
+            lease_id: id.clone(),
+            reason: FenceReason::LeaseExpired,
+        }));
+
+        let mut table = converted(t0);
+        table
+            .on_grant(&expiring("lse_a", 1, 15000), Some(&first), t0 + millis(40))
+            .expect("the answer");
+        let later = t0 + millis(5000);
+        let second = MsgId("msg_second".to_string());
+        assert!(matches!(
+            table.poll(later).as_slice(),
+            [Action::SendRenew { .. }]
+        ));
+        assert!(!table.renew_sent(&id, second.clone(), &HostNow::unknown(later)));
+        table
+            .on_grant(
+                &expiring("lse_a", 1, 3000),
+                Some(&second),
+                later + millis(2500),
+            )
+            .expect("the late answer");
+        let lease = table.get(&id).expect("lease");
+        assert_eq!(lease.valid_until, Some(t0 + millis(13_500)), "it stands");
+        assert_eq!(lease.state, LeaseState::Held);
     }
 
     /// ADR 0241: until its first renewal is sent, a lost session leaves a
