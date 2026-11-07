@@ -4,11 +4,13 @@ import {
   buildCreateGrant,
   expirySentence,
   grantLamp,
+  grantMeter,
   grantRequestHeaders,
   grantSummary,
   TTL_PRESETS,
   ttlFromCustom,
   ttlFromPreset,
+  meterGrant,
   usesWords,
   type GrantDraft,
 } from './grants';
@@ -248,5 +250,62 @@ describe('grantSummary', () => {
         maxUses: '0',
       }),
     ).toBe('The agent may no scopes on nothing for an unchosen lifetime.');
+  });
+});
+
+describe('grantMeter', () => {
+  const now = Date.UTC(2026, 10, 7, 17, 35);
+  const at = (minutes: number) => new Date(now + minutes * 60_000).toISOString();
+
+  it('says the time left of the lifetime, in minutes up to two hours', () => {
+    const meter = grantMeter({ created_at: at(-18), expires_at: at(42), status: 'active' }, now);
+    expect(meter).toEqual({ share: 0.7, words: '42 of 60 min left', over: false });
+  });
+
+  it('counts a day-long grant in hours and a week in days', () => {
+    expect(grantMeter({ created_at: at(-4 * 60), expires_at: at(20 * 60), status: 'active' }, now)?.words).toBe(
+      '20 of 24 h left',
+    );
+    expect(grantMeter({ created_at: at(-24 * 60), expires_at: at(6 * 24 * 60), status: 'active' }, now)?.words).toBe(
+      '6 of 7 d left',
+    );
+  });
+
+  it('counts the last unit in minutes', () => {
+    expect(grantMeter({ created_at: at(-23.5 * 60), expires_at: at(30), status: 'active' }, now)?.words).toBe(
+      '30 min of 24 h left',
+    );
+    expect(grantMeter({ created_at: at(-59.5), expires_at: at(0.5), status: 'active' }, now)?.words).toBe(
+      '1 of 60 min left',
+    );
+  });
+
+  it('is empty once the grant expired, was revoked or used up', () => {
+    expect(grantMeter({ created_at: at(-70), expires_at: at(-10), status: 'active' }, now)).toEqual({
+      share: 0,
+      words: 'Expired',
+      over: true,
+    });
+    expect(grantMeter({ created_at: at(-10), expires_at: at(50), status: 'revoked' }, now)?.words).toBe('Revoked');
+    expect(grantMeter({ created_at: at(-10), expires_at: at(50), status: 'exhausted' }, now)?.words).toBe('Exhausted');
+  });
+
+  it('draws nothing when there is no readable expiry', () => {
+    expect(grantMeter({ created_at: at(-10), expires_at: '', status: 'active' }, now)).toBeNull();
+    expect(grantMeter({ created_at: 'then', expires_at: at(10), status: 'active' }, now)).toBeNull();
+    expect(grantMeter({ created_at: at(10), expires_at: at(10), status: 'active' }, now)).toBeNull();
+  });
+});
+
+describe('meterGrant', () => {
+  it('shows an incident grant before the one that ends first', () => {
+    const grants = [
+      { id: 'a', kind: 'standard' as const, status: 'active' as const, expires_at: '2026-11-07T18:00:00Z' },
+      { id: 'b', kind: 'incident' as const, status: 'active' as const, expires_at: '2026-11-07T19:00:00Z' },
+      { id: 'c', kind: 'incident' as const, status: 'expired' as const, expires_at: '2026-11-07T17:00:00Z' },
+    ];
+    expect(meterGrant(grants)?.id).toBe('b');
+    expect(meterGrant(grants.filter((grant) => grant.id !== 'b'))?.id).toBe('a');
+    expect(meterGrant([])).toBeUndefined();
   });
 });

@@ -107,7 +107,12 @@ function TargetValue({ record }: { record: AuditRecord }) {
   );
 }
 
-export function AuditRecordPanel({ seq, onClose }: { seq: number; onClose: () => void }) {
+/**
+ * Every field of one audit record, in the order of audit-log-format.md
+ * section 2, read with `getAuditRecord`. The side panel and the record sheet
+ * both show it.
+ */
+export function AuditRecordBody({ seq }: { seq: number }) {
   const search = getRouteApi('/shell/activity').useSearch();
   const recordQuery = useGetAuditRecord(seq);
 
@@ -260,6 +265,25 @@ export function AuditRecordPanel({ seq, onClose }: { seq: number; onClose: () =>
     }
   };
 
+  if (recordQuery.isPending) return <p className="text-[13px] text-ink-2">Reading entry {seq}…</p>;
+  if (missing) return <p className="text-[13px] text-ink">No entry with that sequence number.</p>;
+  if (recordQuery.error) return <ProblemBanner view={problemView(recordQuery.error, 'read this entry')} />;
+  if (!record) return null;
+  return (
+    <dl>
+      {AUDIT_DETAIL_FIELDS.map((field) => (
+        <DetailRow key={field.key} label={field.label}>
+          {renderValue(field.key, record)}
+        </DetailRow>
+      ))}
+    </dl>
+  );
+}
+
+export function AuditRecordPanel({ seq, onClose }: { seq: number; onClose: () => void }) {
+  const recordQuery = useGetAuditRecord(seq);
+  const record = recordQuery.data;
+
   return (
     <section
       aria-label={`Audit entry ${seq}`}
@@ -280,21 +304,7 @@ export function AuditRecordPanel({ seq, onClose }: { seq: number; onClose: () =>
       </div>
 
       <div className="px-4 py-3">
-        {recordQuery.isPending ? (
-          <p className="text-[13px] text-ink-2">Reading entry {seq}…</p>
-        ) : missing ? (
-          <p className="text-[13px] text-ink">No entry with that sequence number.</p>
-        ) : recordQuery.error ? (
-          <ProblemBanner view={problemView(recordQuery.error, 'read this entry')} />
-        ) : record ? (
-          <dl>
-            {AUDIT_DETAIL_FIELDS.map((field) => (
-              <DetailRow key={field.key} label={field.label}>
-                {renderValue(field.key, record)}
-              </DetailRow>
-            ))}
-          </dl>
-        ) : null}
+        <AuditRecordBody seq={seq} />
       </div>
     </section>
   );

@@ -7,6 +7,7 @@ import type {
   Selector,
 } from '../api/generated/model';
 import { describeSelector, expiryWords, formatDuration } from './agency-format';
+import { clamp } from './dither';
 import type { LampTone } from './lamp';
 import { DESTRUCTIVE_SCOPES, HUMAN_ONLY_SCOPES, isGrantableScope } from './scopes';
 
@@ -211,3 +212,69 @@ export const grantSummary = (input: {
       : '';
   return `${agent} may ${scopes} on ${where} ${lifetime}${cap}.`;
 };
+
+/* ---------- the grant meter ---------- */
+
+export interface GrantMeter {
+  /** The share of its lifetime the grant has left, 0..1. */
+  readonly share: number;
+  /** "42 of 60 min left", "20 of 24 h left", "Expired". */
+  readonly words: string;
+  /** No time left: expired, revoked or used up. */
+  readonly over: boolean;
+}
+
+const MINUTE = 60_000;
+const HOUR = 60 * MINUTE;
+const DAY = 24 * HOUR;
+
+/** The unit a lifetime is counted in: minutes up to 2 h, hours up to 2 d, then days. */
+const unitFor = (total: number): readonly [number, string] =>
+  total <= 2 * HOUR ? [MINUTE, 'min'] : total <= 2 * DAY ? [HOUR, 'h'] : [DAY, 'd'];
+
+/**
+ * How much of its lifetime a grant has left, from `created_at` to
+ * `expires_at`. A grant that is not active, or whose expiry has passed, has
+ * none. Null when the times cannot be read: there is nothing honest to draw.
+ */
+export const grantMeter = (
+  grant: Pick<Grant, 'created_at' | 'expires_at' | 'status'>,
+  now: number = Date.now(),
+): GrantMeter | null => {
+  const from = Date.parse(grant.created_at);
+  const until = Date.parse(grant.expires_at);
+  if (Number.isNaN(from) || Number.isNaN(until) || until <= from) return null;
+  if (grant.status !== 'active' || until <= now) {
+    return { share: 0, words: grantStatusWords[grant.status === 'active' ? 'expired' : grant.status], over: true };
+  }
+  const total = until - from;
+  const left = until - now;
+  const [unit, label] = unitFor(total);
+  const totalCount = Math.round(total / unit);
+  if (left < unit) {
+    // Less than one whole unit left: count what is left in minutes.
+    const minutes = Math.max(1, Math.ceil(left / MINUTE));
+    return {
+      share: clamp(left / total),
+      words: label === 'min' ? `${minutes} of ${totalCount} min left` : `${minutes} min of ${totalCount} ${label} left`,
+      over: false,
+    };
+  }
+  const leftCount = Math.min(totalCount, label === 'min' ? Math.ceil(left / unit) : Math.round(left / unit));
+  return { share: clamp(left / total), words: `${leftCount} of ${totalCount} ${label} left`, over: false };
+};
+
+/**
+ * The grant a card's meter shows: an incident grant first (it is what the
+ * agent works under right now), then the one that ends soonest.
+ */
+export const meterGrant = <T extends Pick<Grant, 'kind' | 'status' | 'expires_at'>>(
+  grants: readonly T[],
+): T | undefined =>
+  [...grants]
+    .filter((grant) => grant.status === 'active')
+    .sort(
+      (left, right) =>
+        Number(right.kind === 'incident') - Number(left.kind === 'incident') ||
+        Date.parse(left.expires_at) - Date.parse(right.expires_at),
+    )[0];

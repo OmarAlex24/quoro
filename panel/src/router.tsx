@@ -9,6 +9,7 @@ import {
 import {
   newHome,
   validateAgentsSearch,
+  validateApprovalsSearch,
   validateAuditSearch,
   validateGrantsSearch,
   validateNodesSearch,
@@ -119,6 +120,7 @@ const agentsRoute = createRoute({
 const approvalsRoute = createRoute({
   getParentRoute: () => shellRoute,
   path: '/approvals',
+  validateSearch: validateApprovalsSearch,
   component: ApprovalsScreen,
 });
 

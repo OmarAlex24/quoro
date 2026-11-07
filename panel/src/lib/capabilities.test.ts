@@ -5,6 +5,7 @@ import {
   canListUsers,
   canManageAgents,
   canManageGrants,
+  canResolveIncidents,
   canManageUsers,
   canManageWebhooks,
   isHumanSession,
@@ -37,7 +38,7 @@ const agentSession: MeResponse = {
   grants: [],
 };
 
-const writers = [canDecideApprovals, canManageAgents, canManageGrants, canManageWebhooks];
+const writers = [canDecideApprovals, canManageAgents, canManageGrants, canManageWebhooks, canResolveIncidents];
 
 describe('capabilities', () => {
   it('lets an owner and an operator decide and manage', () => {

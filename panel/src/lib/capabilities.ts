@@ -29,6 +29,12 @@ export const canManageAgents = humanWriter;
 /** Create and revoke grants (`grant:write`). */
 export const canManageGrants = humanWriter;
 
+/**
+ * Resolve an incident (`incident:resolve`). An owner and an operator hold it;
+ * a viewer holds only read scopes (permission-model.md, section 3).
+ */
+export const canResolveIncidents = humanWriter;
+
 /** Create, change, delete and test webhooks (`webhook:write`). */
 export const canManageWebhooks = humanWriter;
 

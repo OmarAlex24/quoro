@@ -1,11 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
+  agentTab,
   hrefOf,
   LEGACY_PATHS,
   newHome,
   sectionOf,
   sheetTab,
   validateAgentsSearch,
+  validateApprovalsSearch,
   validateAuditSearch,
   validateGrantsSearch,
   validateNodesSearch,
@@ -22,6 +24,7 @@ const PROJECT = 'prj_01JD5Z8Q4XK3M9V2T7B6N1R0SB';
 const BUILD = 'bld_01JD5Z8Q4XK3M9V2T7B6N1R0SC';
 const AGENT = 'agt_01JD5Z8Q4XK3M9V2T7B6N1R0SD';
 const WEBHOOK = 'whk_01JD5Z8Q4XK3M9V2T7B6N1R0SE';
+const APPROVAL = 'apr_01JD5Z8Q4XK3M9V2T7B6N1R0SF';
 
 /** One example of every old URL, with the data a redirect needs. */
 const EXAMPLES: Record<LegacyUrl['path'], LegacyUrl> = {
@@ -184,7 +187,24 @@ describe('search validators', () => {
     expect(validateNodesSearch({ tab: 'vms' })).toEqual({ tab: 'vms' });
     expect(validateNodesSearch({ tab: 'security' })).toEqual({ tab: 'security' });
     expect(validateNodesSearch({ tab: 'nodes' })).toEqual({});
-    expect(validateAgentsSearch({ agent: AGENT, tab: 'keys' })).toEqual({ agent: AGENT });
+    expect(validateAgentsSearch({ agent: AGENT, tab: 'keys' })).toEqual({ agent: AGENT, tab: 'keys' });
+    expect(validateAgentsSearch({ agent: AGENT, tab: 'grants' })).toEqual({ agent: AGENT, tab: 'grants' });
+    expect(validateAgentsSearch({ agent: AGENT, tab: 'story' })).toEqual({ agent: AGENT });
+    // Without an agent, only the cluster's grants are a tab.
+    expect(validateAgentsSearch({ tab: 'keys' })).toEqual({});
+    expect(validateAgentsSearch({ tab: 'settings' })).toEqual({});
+    expect(validateAgentsSearch({ tab: 'grants' })).toEqual({ tab: 'grants' });
+  });
+
+  it('opens an agent on Activity unless the URL names a tab', () => {
+    expect(agentTab(validateAgentsSearch({ agent: AGENT }))).toBe('activity');
+    expect(agentTab(validateAgentsSearch({ agent: AGENT, tab: 'settings' }))).toBe('settings');
+  });
+
+  it('keeps an approval open in the inbox', () => {
+    expect(validateApprovalsSearch({ approval: ` ${APPROVAL} ` })).toEqual({ approval: APPROVAL });
+    expect(validateApprovalsSearch({ approval: '' })).toEqual({});
+    expect(validateApprovalsSearch({})).toEqual({});
   });
 
   it('filters the VMs tab by node, and drops the node anywhere else', () => {

@@ -1,4 +1,5 @@
 import { useNavigate } from '@tanstack/react-router';
+import { Search } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { useListAgents } from '../api/generated/agents/agents';
 import { useListIncidents } from '../api/generated/incidents/incidents';
@@ -7,7 +8,6 @@ import { shortId } from '../lib/agency-format';
 import { useSession } from '../session';
 import type { AuditSearch } from '../lib/routes';
 import { Button } from './ui/button';
-import { Field } from './ui/field';
 import { Input } from './ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 
@@ -80,141 +80,119 @@ export function AuditFilters({ search }: { search: AuditSearch }) {
   };
 
   return (
-    <section
-      aria-label="Audit filters"
-      className="rounded-[10px] border border-line bg-surface px-4 py-3 card-sheen"
-    >
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-        <Field label="Actor" htmlFor="audit-actor">
-          <Select
-            value={actorValue}
-            onValueChange={(value) => {
-              if (value === 'any') go({ actor_id: undefined });
-              else if (value === 'you') go({ actor_id: user?.id });
-              else go({ actor_id: value });
-            }}
-          >
-            <SelectTrigger id="audit-actor" aria-label="Actor">
-              <SelectValue placeholder="Anyone">{actorName || 'Anyone'}</SelectValue>
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="any">Anyone</SelectItem>
-              {user ? <SelectItem value="you">You</SelectItem> : null}
-              {agentItems.map((agent) => (
-                <SelectItem key={agent.id} value={agent.id}>
-                  {agent.name}
-                </SelectItem>
-              ))}
-              {search.actor_id !== undefined &&
-              search.actor_id !== user?.id &&
-              !agentItems.some((agent) => agent.id === search.actor_id) ? (
-                <SelectItem value={search.actor_id}>
-                  {shortId(search.actor_id)}
-                </SelectItem>
-              ) : null}
-            </SelectContent>
-          </Select>
-        </Field>
+    <section aria-label="Activity filters" className="filters">
+      <Select
+        value={actorValue}
+        onValueChange={(value) => {
+          if (value === 'any') go({ actor_id: undefined });
+          else if (value === 'you') go({ actor_id: user?.id });
+          else go({ actor_id: value });
+        }}
+      >
+        <SelectTrigger aria-label="Actor" className="filter">
+          <SelectValue placeholder="Anyone">{actorName || 'Anyone'}</SelectValue>
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="any">Anyone</SelectItem>
+          {user ? <SelectItem value="you">You</SelectItem> : null}
+          {agentItems.map((agent) => (
+            <SelectItem key={agent.id} value={agent.id}>
+              {agent.name}
+            </SelectItem>
+          ))}
+          {search.actor_id !== undefined &&
+          search.actor_id !== user?.id &&
+          !agentItems.some((agent) => agent.id === search.actor_id) ? (
+            <SelectItem value={search.actor_id}>{shortId(search.actor_id)}</SelectItem>
+          ) : null}
+        </SelectContent>
+      </Select>
 
-        <Field
-          label="Actor id"
-          htmlFor="audit-actor-id"
-          hint="Use an id that is not in the list."
-        >
-          <Input
-            id="audit-actor-id"
-            value={actorDraft}
-            onChange={(event) => setActorDraft(event.target.value)}
-            onBlur={applyActorDraft}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter') {
-                event.preventDefault();
-                applyActorDraft();
-              }
-            }}
-            placeholder="agt_…"
-            spellCheck={false}
-            autoComplete="off"
-          />
-        </Field>
+      <Select
+        value={search.result ?? 'any'}
+        onValueChange={(value) => go({ result: value === 'any' ? undefined : (value as AuditRecordResult) })}
+      >
+        <SelectTrigger aria-label="Result" className="filter">
+          <SelectValue placeholder="Any result" />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="any">Any result</SelectItem>
+          {resultOptions.map((option) => (
+            <SelectItem key={option.value} value={option.value}>
+              {option.label}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
 
-        <Field label="Target id" htmlFor="audit-target-id">
-          <Input
-            id="audit-target-id"
-            value={targetDraft}
-            onChange={(event) => setTargetDraft(event.target.value)}
-            onBlur={applyTargetDraft}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter') {
-                event.preventDefault();
-                applyTargetDraft();
-              }
-            }}
-            placeholder="app_…"
-            spellCheck={false}
-            autoComplete="off"
-          />
-        </Field>
+      <Select
+        value={incidentValue}
+        onValueChange={(value) => go({ incident_id: value === 'any' ? undefined : value })}
+      >
+        <SelectTrigger aria-label="Incident" className="filter filter-wide">
+          <SelectValue placeholder="Any incident" />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="any">Any incident</SelectItem>
+          {incidentItems.map((incident) => (
+            <SelectItem key={incident.id} value={incident.id}>
+              {incident.title}
+            </SelectItem>
+          ))}
+          {search.incident_id !== undefined && !knownIncident ? (
+            <SelectItem value={search.incident_id}>{shortId(search.incident_id)}</SelectItem>
+          ) : null}
+        </SelectContent>
+      </Select>
 
-        <Field label="Result" htmlFor="audit-result">
-          <Select
-            value={search.result ?? 'any'}
-            onValueChange={(value) =>
-              go({ result: value === 'any' ? undefined : (value as AuditRecordResult) })
+      <label className="filter-find">
+        <Search size={15} aria-hidden="true" />
+        <span className="sr-only">Target id</span>
+        <Input
+          value={targetDraft}
+          onChange={(event) => setTargetDraft(event.target.value)}
+          onBlur={applyTargetDraft}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') {
+              event.preventDefault();
+              applyTargetDraft();
             }
-          >
-            <SelectTrigger id="audit-result" aria-label="Result">
-              <SelectValue placeholder="Any" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="any">Any</SelectItem>
-              {resultOptions.map((option) => (
-                <SelectItem key={option.value} value={option.value}>
-                  {option.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </Field>
+          }}
+          placeholder="Find a target by id"
+          spellCheck={false}
+          autoComplete="off"
+        />
+      </label>
 
-        <Field label="Incident" htmlFor="audit-incident" className="sm:col-span-2">
-          <Select
-            value={incidentValue}
-            onValueChange={(value) => go({ incident_id: value === 'any' ? undefined : value })}
-          >
-            <SelectTrigger id="audit-incident" aria-label="Incident">
-              <SelectValue placeholder="Any incident" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="any">Any incident</SelectItem>
-              {incidentItems.map((incident) => (
-                <SelectItem key={incident.id} value={incident.id}>
-                  {incident.title}
-                </SelectItem>
-              ))}
-              {search.incident_id !== undefined && !knownIncident ? (
-                <SelectItem value={search.incident_id}>
-                  {shortId(search.incident_id)}
-                </SelectItem>
-              ) : null}
-            </SelectContent>
-          </Select>
-        </Field>
-      </div>
+      <label className="filter-find filter-narrow">
+        <span className="sr-only">Actor id</span>
+        <Input
+          value={actorDraft}
+          onChange={(event) => setActorDraft(event.target.value)}
+          onBlur={applyActorDraft}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') {
+              event.preventDefault();
+              applyActorDraft();
+            }
+          }}
+          placeholder="Actor id not listed"
+          spellCheck={false}
+          autoComplete="off"
+        />
+      </label>
 
       {hasFilters ? (
-        <div className="mt-3 flex justify-end">
-          <Button
-            variant="ghost"
-            onClick={() => {
-              setActorDraft('');
-              setTargetDraft('');
-              void navigate({ to: '/activity', search: {} });
-            }}
-          >
-            Clear filters
-          </Button>
-        </div>
+        <Button
+          variant="ghost"
+          onClick={() => {
+            setActorDraft('');
+            setTargetDraft('');
+            void navigate({ to: '/activity', search: {} });
+          }}
+        >
+          Clear filters
+        </Button>
       ) : null}
     </section>
   );
