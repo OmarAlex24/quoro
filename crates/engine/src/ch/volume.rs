@@ -15,12 +15,13 @@
 //! module; they share its locks and its record view through the
 //! `pub(super)` items there.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use rustix::fs::SeekFrom;
@@ -731,9 +732,10 @@ impl Inner {
     ///
     /// `Reflink` clones the file. `PauseCopy` pauses the VM that attaches the
     /// volume when it is running, copies the sparse file and always resumes the
-    /// VM, whatever the copy's outcome (see [`Inner::pause_copy`]).
+    /// VM, whatever the copy's outcome. A VM that attaches the volume and
+    /// starts during the copy makes it `Conflict` (see [`Inner::pause_copy`]).
     pub(super) async fn snapshot_volume(
-        &self,
+        self: &Arc<Self>,
         id: &VolumeId,
     ) -> Result<VolumeSnapshot, EngineError> {
         validate_volume_id(id)?;
@@ -827,13 +829,15 @@ impl Inner {
     /// The `PauseCopy` snapshot of the volume file `path` into `location`
     /// (§3.16): see [`spawn_pause_copy`].
     async fn pause_copy(
-        &self,
+        self: &Arc<Self>,
         id: &VolumeId,
         path: &Path,
         location: &Path,
     ) -> Result<(Duration, SnapshotFile), EngineError> {
+        let (inner, volume) = (Arc::clone(self), id.clone());
         spawn_pause_copy(
-            self.vms_for_volume(id),
+            move || inner.vms_for_volume(&volume),
+            Arc::clone(&self.volume_starts),
             id.clone(),
             path.to_owned(),
             location.to_owned(),
@@ -882,19 +886,21 @@ impl Drop for SnapshotFile {
 /// returned future does not leave the VM paused: the task carries the copy on
 /// to the resume. The snapshot file comes with a [`SnapshotFile`], so one
 /// nobody received is removed (§3.16).
-pub(super) fn spawn_pause_copy<F>(
-    vms: Vec<Arc<VmEntry>>,
+pub(super) fn spawn_pause_copy<L, F>(
+    attached: L,
+    starts: Arc<VolumeStarts>,
     volume: VolumeId,
     source: PathBuf,
     clone: PathBuf,
     copy: F,
 ) -> impl Future<Output = Result<(Duration, SnapshotFile), EngineError>> + Send
 where
+    L: Fn() -> Vec<Arc<VmEntry>> + Send + Sync + 'static,
     F: FnOnce(&Path, &Path) -> Result<u64, EngineError> + Send + 'static,
 {
     let (sent, received) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        let result = pause_and_copy(&vms, &volume, &source, &clone, copy)
+        let result = pause_and_copy(&attached, &starts, &volume, &source, &clone, copy)
             .await
             .map(|pause| (pause, SnapshotFile(Some(clone))));
         // A result nobody receives is dropped here, its file with it.
@@ -914,10 +920,115 @@ struct PausedVm {
     since: Instant,
 }
 
-/// Pauses the one of `vms` that runs, copies `source` into `clone` with
-/// `copy` and resumes the VM whatever the copy's outcome (§3.16). Returns how
-/// long the VM was paused, zero when none ran and the volume was copied
-/// without a pause.
+/// How many starts a VM that attaches the volume had when the snapshot looked
+/// at it under the VM's operation lock, before the copy (§3.16, #583).
+struct StartCount {
+    entry: Arc<VmEntry>,
+    starts: u64,
+}
+
+/// How many starts each volume's VMs made in this engine process, for
+/// `PauseCopy` snapshots (§3.16, #583). A start counts its VM's own starts and
+/// those of every volume the VM attaches together, under one lock, and a
+/// snapshot reads them under the same lock. So the snapshot sees a start of
+/// any VM that attaches the volume, also one created and deleted again during
+/// its copy, which no list of the VMs after the copy would hold. One count per
+/// volume a started VM attached; a deleted volume's stays.
+#[derive(Default)]
+pub(super) struct VolumeStarts(StdMutex<HashMap<String, u64>>);
+
+/// What a snapshot noted before its copy: the volume's starts, and the VMs
+/// that attach it with their own starts, read together.
+struct Listing {
+    volume_starts: u64,
+    vms: Vec<(Arc<VmEntry>, u64)>,
+}
+
+impl VolumeStarts {
+    /// Counts a start of `entry`, whose spec `record` names the volumes it
+    /// attaches, under the VM's operation lock and before its guest can run.
+    pub(super) fn count_record(&self, entry: &VmEntry, record: &state::SpecRecord) {
+        let volumes: Vec<&str> = record
+            .spec
+            .volumes
+            .iter()
+            .map(|volume| volume.volume_id.as_str())
+            .collect();
+        self.count(entry, &volumes);
+    }
+
+    /// Counts a start of `entry`, which attaches `volumes`, under the VM's
+    /// operation lock and before its guest can run.
+    pub(super) fn count(&self, entry: &VmEntry, volumes: &[&str]) {
+        let mut counts = lock(&self.0);
+        entry.count_start();
+        for volume in volumes {
+            *counts.entry((*volume).to_owned()).or_default() += 1;
+        }
+    }
+
+    /// The starts of the VMs that attach `volume`.
+    #[cfg(test)]
+    pub(super) fn of(&self, volume: &VolumeId) -> u64 {
+        lock(&self.0).get(&volume.0).copied().unwrap_or(0)
+    }
+
+    /// Lists the VMs that attach `volume` with `attached`, under the lock, so
+    /// no start falls between the list and the counts. The lock is held while
+    /// `attached` reads the VMs' specs, which may read a `spec.json` file;
+    /// starts of other VMs wait that long to count themselves.
+    fn list(
+        &self,
+        volume: &VolumeId,
+        attached: &(dyn Fn() -> Vec<Arc<VmEntry>> + Sync),
+    ) -> Listing {
+        let counts = lock(&self.0);
+        let vms = attached()
+            .into_iter()
+            .map(|entry| {
+                let starts = entry.starts();
+                (entry, starts)
+            })
+            .collect();
+        Listing {
+            volume_starts: counts.get(&volume.0).copied().unwrap_or(0),
+            vms,
+        }
+    }
+
+    /// Whether a VM that `listing` does not hold started since: the volume's
+    /// starts grew by more than the listed VMs' own. A listed VM's start is
+    /// compared under its lock instead ([`started_during_copy`]).
+    fn unlisted_started(&self, volume: &VolumeId, listing: &Listing) -> bool {
+        let counts = lock(&self.0);
+        let volume_starts = counts
+            .get(&volume.0)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(listing.volume_starts);
+        let listed: u64 = listing
+            .vms
+            .iter()
+            .map(|(entry, starts)| entry.starts().saturating_sub(*starts))
+            .sum();
+        volume_starts > listed
+    }
+}
+
+/// Pauses the one of the VMs `attached` lists that runs, copies `source` into
+/// `clone` with `copy` and resumes the VM whatever the copy's outcome (§3.16).
+/// Returns how long the VM was paused, zero when none ran and the volume was
+/// copied without a pause.
+///
+/// A VM that attaches the volume and starts during the copy may have written
+/// to it while it was copied, so the copy is not kept and the snapshot is
+/// `Conflict` (§3.16, #583). Each VM `attached` lists has its starts counted
+/// under its lock before the copy and compared under it again after the copy,
+/// so a start under way at either moment is waited out, within that start's
+/// own bound; the wait is for whatever holds the lock, so a stop or a delete
+/// under way is waited out too. A VM that was not listed, created meanwhile,
+/// shows in `starts`: the volume's starts grew by more than the listed VMs'
+/// own, also when that VM was deleted again before the copy ended.
 ///
 /// The VM's operation lock is held for the pause and for the resume, and the
 /// VM's state is read under it, so neither interleaves with a start, a stop
@@ -929,7 +1040,8 @@ struct PausedVm {
 /// VM is paused, its directory records the paused process, so an engine that
 /// restarts meanwhile resumes it ([`resume_left_paused`]).
 pub(super) async fn pause_and_copy<F>(
-    vms: &[Arc<VmEntry>],
+    attached: &(dyn Fn() -> Vec<Arc<VmEntry>> + Sync),
+    starts: &VolumeStarts,
     volume: &VolumeId,
     source: &Path,
     clone: &Path,
@@ -938,7 +1050,13 @@ pub(super) async fn pause_and_copy<F>(
 where
     F: FnOnce(&Path, &Path) -> Result<u64, EngineError> + Send + 'static,
 {
-    let paused = pause_running(vms, volume).await?;
+    let listing = starts.list(volume, attached);
+    let vms: Vec<Arc<VmEntry>> = listing
+        .vms
+        .iter()
+        .map(|(entry, _)| Arc::clone(entry))
+        .collect();
+    let (paused, counts) = pause_running(&vms, volume).await?;
     let (from, to) = (source.to_owned(), clone.to_owned());
     // No `?` before the resume: a failed or panicked copy task must still
     // resume the VM.
@@ -946,6 +1064,9 @@ where
         .await
         .map_err(|err| EngineError::Io(format!("snapshot task failed: {err}")))
         .and_then(|result| result);
+    // Read as soon as the copy ends, so a VM created and started after it,
+    // while the checks below wait for the VMs' locks, does not count.
+    let unlisted_started = starts.unlisted_started(volume, &listing);
     let mut pause = Duration::ZERO;
     if let Some(paused) = paused {
         match resume_paused(&paused, volume).await {
@@ -961,10 +1082,28 @@ where
         let _ = std::fs::remove_file(clone);
         return Err(err);
     }
+    if let Some(started) = started_during_copy(&counts).await {
+        let _ = std::fs::remove_file(clone);
+        return Err(EngineError::Conflict(format!(
+            "VM {} attaches volume {} and started during its copy, so the copy is not kept",
+            started.0, volume.0
+        )));
+    }
+    if unlisted_started {
+        let _ = std::fs::remove_file(clone);
+        return Err(EngineError::Conflict(format!(
+            "a VM created during the copy of volume {} attaches it and started, so the copy is not kept",
+            volume.0
+        )));
+    }
     Ok(pause)
 }
 
-/// Pauses the first of `vms` whose guest runs, under its operation lock.
+/// Pauses the first of `vms` whose guest runs, under its operation lock, and
+/// counts the starts of every one of `vms` under its lock (§3.16, #583). The
+/// VMs after the paused one are counted while it is paused; the engine lets
+/// one VM at a time attach a volume (§3.6), so there are more only while one
+/// VM is deleted and the next created.
 ///
 /// A VM another caller paused is `Conflict`: its freeze is not this
 /// snapshot's, and it could end during the copy. A VM whose VMM does not say
@@ -974,35 +1113,61 @@ where
 async fn pause_running(
     vms: &[Arc<VmEntry>],
     volume: &VolumeId,
-) -> Result<Option<PausedVm>, EngineError> {
+) -> Result<(Option<PausedVm>, Vec<StartCount>), EngineError> {
+    let mut paused = None;
+    let mut counts = Vec::with_capacity(vms.len());
     for entry in vms {
         let _op = entry.op.lock().await;
-        if !entry.paths.dir.exists() || !entry.booted.load(Ordering::SeqCst) {
-            continue;
-        }
-        let Some(vmm) = entry.live_vmm() else {
-            continue;
-        };
-        let process = vmm.id();
-        let since = tokio::select! {
-            since = pause_if_running(entry, process, volume) => since?,
-            () = entry.forced_stop_waiting() => {
-                return Err(EngineError::Conflict(format!(
-                    "a forced stop of the VM using volume {} came before the snapshot's pause",
-                    volume.0
-                )));
-            }
-        };
-        let Some(since) = since else {
-            continue;
-        };
-        return Ok(Some(PausedVm {
+        counts.push(StartCount {
             entry: Arc::clone(entry),
-            process,
-            since,
-        }));
+            starts: entry.starts(),
+        });
+        if paused.is_none() {
+            paused = pause_if_booted(entry, volume).await?;
+        }
     }
-    Ok(None)
+    Ok((paused, counts))
+}
+
+/// Pauses `entry` if its guest booted and runs, with its operation lock held.
+async fn pause_if_booted(
+    entry: &Arc<VmEntry>,
+    volume: &VolumeId,
+) -> Result<Option<PausedVm>, EngineError> {
+    if !entry.paths.dir.exists() || !entry.booted.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
+    let Some(vmm) = entry.live_vmm() else {
+        return Ok(None);
+    };
+    let process = vmm.id();
+    let since = tokio::select! {
+        since = pause_if_running(entry, process, volume) => since?,
+        () = entry.forced_stop_waiting() => {
+            return Err(EngineError::Conflict(format!(
+                "a forced stop of the VM using volume {} came before the snapshot's pause",
+                volume.0
+            )));
+        }
+    };
+    Ok(since.map(|since| PausedVm {
+        entry: Arc::clone(entry),
+        process,
+        since,
+    }))
+}
+
+/// The first of the VMs counted before the copy whose starts changed since,
+/// read under its operation lock, so a start under way is waited out (§3.16,
+/// #583).
+async fn started_during_copy(counts: &[StartCount]) -> Option<VmId> {
+    for count in counts {
+        let _op = count.entry.op.lock().await;
+        if count.entry.starts() != count.starts {
+            return Some(count.entry.id.clone());
+        }
+    }
+    None
 }
 
 /// Pauses the VM if its VMM reports it running, and returns when the pause
@@ -1193,7 +1358,7 @@ async fn vm_state(api: &ApiClient) -> Result<Option<String>, super::api::ApiErro
 const SNAPSHOT_API_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::collections::BTreeSet;
     use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
     use std::path::{Path, PathBuf};
@@ -1222,7 +1387,7 @@ mod tests {
         VolumeId(text.to_string())
     }
 
-    fn spec(volumes: Vec<VolumeAttach>) -> VmSpec {
+    pub(in crate::ch) fn spec(volumes: Vec<VolumeAttach>) -> VmSpec {
         VmSpec {
             id: VmId("vm_01HX8Z4Q2M9W7T3YV6B1C0D5EF".to_string()),
             vcpus: 1,
@@ -1251,7 +1416,7 @@ mod tests {
         }
     }
 
-    fn attach(id: &str, serial: &str) -> VolumeAttach {
+    pub(in crate::ch) fn attach(id: &str, serial: &str) -> VolumeAttach {
         VolumeAttach {
             volume_id: volume_id(id),
             mount_path: "/data".to_string(),
