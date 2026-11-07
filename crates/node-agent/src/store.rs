@@ -11,6 +11,7 @@
 //! after a restart, and the signature is verified again before it is used, so a
 //! tampered store cannot drive the engine.
 
+use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -500,11 +501,37 @@ impl BackupRecord {
 const NODE_FAILED: &str = "node_failed";
 /// `node_meta` key of the failed fences the failed mark covers: a JSON array
 /// of the lease ids whose fence failed and no `fence_ack` cleared yet
-/// (section 12 `node_meta`, section 5.17).
+/// (section 12 `node_meta`). It keeps the form an agent before ADR 0245
+/// reads, so an agent rolled back to one still records a failed fence and
+/// buffers its `node.fence_failed`; their tokens are in
+/// [`FAILED_FENCE_TOKENS`].
 const FAILED_FENCES: &str = "failed_fences";
+/// `node_meta` key of the token of each lease in [`FAILED_FENCES`]: a JSON
+/// object keyed by lease id, with the highest token a failed fence of the
+/// lease was recorded at (section 5.17, ADR 0245). An agent before ADR 0245
+/// neither writes nor reads it; the store fills in what such an agent left
+/// when it opens.
+const FAILED_FENCE_TOKENS: &str = "failed_fence_tokens";
+
+/// A lease whose fence failed and no `fence_ack` cleared yet (section 8.5).
+///
+/// One entry stands for every failed fence of the lease, at the highest token
+/// any of them was recorded at. A `fence_ack` clears the failed fences below
+/// its acknowledged token (section 5.17, ADR 0245), so it clears the entry
+/// only when that token is above the highest: a failed fence at or above it
+/// keeps the lease failed, whatever lower ones the acknowledgement covers.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FailedFence {
+    /// The lease whose fence failed.
+    pub lease_id: String,
+    /// The highest token a failed fence of the lease was recorded at
+    /// (section 8.5 step 2).
+    pub fencing_token: u64,
+}
 /// `node_meta` key set when an upgrade built [`FAILED_FENCES`] from the fence
-/// records an older agent left: the agent reports those failed fences to the
-/// primary once, so the primary lists them for an acknowledgement.
+/// records an older agent left, or gave a lease an older agent listed an
+/// estimated token: the agent reports those failed fences to the primary
+/// once, so the primary lists them for an acknowledgement.
 const FAILED_FENCES_UNREPORTED: &str = "failed_fences_unreported";
 
 /// The `node_meta` key holding the kernel boot id the agent last started on
@@ -1850,7 +1877,7 @@ impl NodeStore {
         }
         insert_fence(&mut tx, record).await?;
         if !record.complete {
-            add_failed_fence(&mut tx, &record.lease_id.0).await?;
+            add_failed_fence(&mut tx, &record.lease_id.0, record.token).await?;
         }
         buffer_event(&mut tx, evt_id, event).await?;
         tx.commit().await.map_err(store_error)
@@ -1869,11 +1896,12 @@ impl NodeStore {
         rows.into_iter().map(fence_record).collect()
     }
 
-    /// Marks the node failed for `lease_id`'s failed fence and buffers its
-    /// `node.fence_failed` event, in one transaction: the fallback when the
-    /// whole fence record could not be written (section 8.5). The mark and
-    /// the list of failed fences always change together, so a `fence_ack` of
-    /// other leases never clears a mark this fence set.
+    /// Marks the node failed for `lease_id`'s failed fence at `token` and
+    /// buffers its `node.fence_failed` event, in one transaction: the
+    /// fallback when the whole fence record could not be written (section
+    /// 8.5). The mark and the list of failed fences always change together,
+    /// so a `fence_ack` of other leases, or one below `token`, never clears a
+    /// mark this fence set.
     ///
     /// # Errors
     ///
@@ -1881,11 +1909,12 @@ impl NodeStore {
     pub async fn mark_fence_failed(
         &self,
         lease_id: &str,
+        token: u64,
         evt_id: &str,
         event: &Value,
     ) -> Result<(), AgentError> {
         let mut tx = self.pool.begin().await.map_err(store_error)?;
-        add_failed_fence(&mut tx, lease_id).await?;
+        add_failed_fence(&mut tx, lease_id, token).await?;
         buffer_event(&mut tx, evt_id, event).await?;
         tx.commit().await.map_err(store_error)
     }
@@ -1928,31 +1957,44 @@ impl NodeStore {
             .await
     }
 
-    /// The lease ids whose fence failed and no `fence_ack` cleared yet
-    /// (section 12 `node_meta`).
+    /// The leases whose fence failed and no `fence_ack` cleared yet, each
+    /// with the highest token a failed fence of it was recorded at (section 12
+    /// `node_meta`).
     ///
     /// # Errors
     ///
     /// [`AgentError::Store`] on a SQLite failure or an unreadable list.
-    pub async fn failed_fences(&self) -> Result<Vec<String>, AgentError> {
+    pub async fn failed_fences(&self) -> Result<Vec<FailedFence>, AgentError> {
         let mut tx = self.pool.begin().await.map_err(store_error)?;
         let failed = read_failed_fences(&mut tx).await?;
         tx.commit().await.map_err(store_error)?;
         Ok(failed)
     }
 
-    /// Applies a `fence_ack` (section 5.17): clears the failed fence of each
-    /// listed lease, and the node's failed mark once none remains, in one
+    /// Applies a `fence_ack` (section 5.17): clears the failed fences of the
+    /// listed leases, and the node's failed mark once none remains, in one
     /// transaction. Returns the failed fences that remain. A listed lease with
     /// no failed fence is not an error.
+    ///
+    /// With `fencing_tokens` (ADR 0245), a listed lease's failed fences are
+    /// cleared only below its acknowledged token: a failed fence at or above
+    /// it is one the operator has not seen, and stays. A listed lease missing
+    /// from `fencing_tokens` keeps its failed fences; the caller refuses such
+    /// an acknowledgement before it gets here. Without `fencing_tokens`, as a
+    /// primary before M5b sends it, every failed fence of a listed lease is
+    /// cleared.
     ///
     /// # Errors
     ///
     /// [`AgentError::Store`] on a SQLite failure or an unreadable list.
-    pub async fn ack_fences(&self, lease_ids: &[String]) -> Result<Vec<String>, AgentError> {
+    pub async fn ack_fences(
+        &self,
+        lease_ids: &[String],
+        fencing_tokens: Option<&BTreeMap<String, u64>>,
+    ) -> Result<Vec<FailedFence>, AgentError> {
         let mut tx = self.pool.begin().await.map_err(store_error)?;
         let mut failed = read_failed_fences(&mut tx).await?;
-        failed.retain(|lease_id| !lease_ids.contains(lease_id));
+        failed.retain(|fence| !acknowledges(lease_ids, fencing_tokens, fence));
         write_failed_fences(&mut tx, &failed).await?;
         if failed.is_empty() {
             sqlx::query(
@@ -2424,11 +2466,31 @@ async fn upsert_lease(
     Ok(())
 }
 
-/// Sets the failed mark and adds `lease_id` to the failed fences, inside
-/// `tx`.
+/// Whether a `fence_ack` of `lease_ids`, with `fencing_tokens` when the
+/// primary sent them, clears `fence` (section 5.17, ADR 0245).
+#[must_use]
+pub fn acknowledges(
+    lease_ids: &[String],
+    fencing_tokens: Option<&BTreeMap<String, u64>>,
+    fence: &FailedFence,
+) -> bool {
+    if !lease_ids.contains(&fence.lease_id) {
+        return false;
+    }
+    match fencing_tokens {
+        None => true,
+        Some(tokens) => tokens
+            .get(&fence.lease_id)
+            .is_some_and(|acked| fence.fencing_token < *acked),
+    }
+}
+
+/// Sets the failed mark and adds a failed fence of `lease_id` at `token`,
+/// inside `tx`. A lease listed already keeps one entry, at the higher token.
 async fn add_failed_fence(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     lease_id: &str,
+    token: u64,
 ) -> Result<(), AgentError> {
     sqlx::query(
         "INSERT INTO node_meta (key, value) VALUES (?, '1') \
@@ -2439,45 +2501,136 @@ async fn add_failed_fence(
     .await
     .map_err(store_error)?;
     let mut failed = read_failed_fences(tx).await?;
-    if !failed.iter().any(|listed| listed == lease_id) {
-        failed.push(lease_id.to_owned());
+    match failed.iter_mut().find(|fence| fence.lease_id == lease_id) {
+        Some(fence) => fence.fencing_token = fence.fencing_token.max(token),
+        None => failed.push(FailedFence {
+            lease_id: lease_id.to_owned(),
+            fencing_token: token,
+        }),
     }
     write_failed_fences(tx, &failed).await
 }
 
-/// The failed fences in `node_meta`, inside `tx`.
+/// The failed fences in `node_meta`, inside `tx`. A lease without a stored
+/// token, which only an agent before ADR 0245 leaves, takes
+/// [`estimated_token`].
 async fn read_failed_fences(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-) -> Result<Vec<String>, AgentError> {
-    let text: Option<String> = sqlx::query_scalar("SELECT value FROM node_meta WHERE key = ?")
-        .bind(FAILED_FENCES)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(store_error)?;
-    match text {
-        None => Ok(Vec::new()),
-        Some(text) => serde_json::from_str(&text)
-            .map_err(|e| AgentError::Store(format!("could not read the failed fences: {e}"))),
+) -> Result<Vec<FailedFence>, AgentError> {
+    let (lease_ids, tokens) = read_failed_lists(tx).await?;
+    let mut failed: Vec<FailedFence> = Vec::with_capacity(lease_ids.len());
+    for lease_id in lease_ids {
+        if failed.iter().any(|fence| fence.lease_id == lease_id) {
+            continue;
+        }
+        let fencing_token = match tokens.get(&lease_id) {
+            Some(token) => *token,
+            None => estimated_token(tx, &lease_id).await?,
+        };
+        failed.push(FailedFence {
+            lease_id,
+            fencing_token,
+        });
     }
+    Ok(failed)
 }
 
-/// Replaces the failed fences in `node_meta`, inside `tx`.
+/// The two `node_meta` values behind the failed fences, as stored.
+async fn read_failed_lists(
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<(Vec<String>, BTreeMap<String, u64>), AgentError> {
+    let mut values = Vec::with_capacity(2);
+    for key in [FAILED_FENCES, FAILED_FENCE_TOKENS] {
+        let text: Option<String> = sqlx::query_scalar("SELECT value FROM node_meta WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(store_error)?;
+        values.push(text);
+    }
+    let unreadable =
+        |e: serde_json::Error| AgentError::Store(format!("could not read the failed fences: {e}"));
+    let tokens = values.pop().flatten();
+    let lease_ids = values.pop().flatten();
+    Ok((
+        lease_ids
+            .map(|text| serde_json::from_str(&text).map_err(unreadable))
+            .transpose()?
+            .unwrap_or_default(),
+        tokens
+            .map(|text| serde_json::from_str(&text).map_err(unreadable))
+            .transpose()?
+            .unwrap_or_default(),
+    ))
+}
+
+/// The token of a failed fence of `lease_id` that no token was stored for:
+/// the highest of its incomplete fence records and the token the node holds
+/// the lease at, which is at least the one a fence of it was recorded at, or
+/// 0 when the store has neither. A token above the real one is the safe
+/// side: an acknowledgement then clears nothing the real token would keep.
+async fn estimated_token(
+    conn: &mut sqlx::SqliteConnection,
+    lease_id: &str,
+) -> Result<u64, AgentError> {
+    let recorded = recorded_token(conn, lease_id).await?;
+    let held: Option<i64> = sqlx::query_scalar("SELECT token FROM leases WHERE lease_id = ?")
+        .bind(lease_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(store_error)?;
+    Ok(recorded.max(held.map_or(0, |token| u64::try_from(token).unwrap_or(0))))
+}
+
+/// The highest token an incomplete fence record of `lease_id` has, or 0.
+async fn recorded_token(
+    conn: &mut sqlx::SqliteConnection,
+    lease_id: &str,
+) -> Result<u64, AgentError> {
+    let recorded: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(token) FROM fences WHERE lease_id = ? AND complete = 0")
+            .bind(lease_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(store_error)?;
+    Ok(recorded.map_or(0, |token| u64::try_from(token).unwrap_or(0)))
+}
+
+/// Replaces the failed fences in `node_meta`, inside `tx`: the lease ids in
+/// the form an agent before ADR 0245 reads, and their tokens beside them.
 async fn write_failed_fences(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    failed: &[String],
+    failed: &[FailedFence],
 ) -> Result<(), AgentError> {
-    let text = serde_json::to_string(failed)
-        .map_err(|e| AgentError::Store(format!("could not encode the failed fences: {e}")))?;
-    sqlx::query(
-        "INSERT INTO node_meta (key, value) VALUES (?, ?) \
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .bind(FAILED_FENCES)
-    .bind(text)
-    .execute(&mut **tx)
-    .await
-    .map_err(store_error)
-    .map(|_| ())
+    let lease_ids: Vec<&str> = failed.iter().map(|fence| fence.lease_id.as_str()).collect();
+    let tokens: BTreeMap<&str, u64> = failed
+        .iter()
+        .map(|fence| (fence.lease_id.as_str(), fence.fencing_token))
+        .collect();
+    let encode = |e: serde_json::Error| {
+        AgentError::Store(format!("could not encode the failed fences: {e}"))
+    };
+    for (key, text) in [
+        (
+            FAILED_FENCES,
+            serde_json::to_string(&lease_ids).map_err(encode)?,
+        ),
+        (
+            FAILED_FENCE_TOKENS,
+            serde_json::to_string(&tokens).map_err(encode)?,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO node_meta (key, value) VALUES (?, ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(key)
+        .bind(text)
+        .execute(&mut **tx)
+        .await
+        .map_err(store_error)?;
+    }
+    Ok(())
 }
 
 /// Inserts one fence record inside `tx` (section 8.5 step 2).
@@ -2620,16 +2773,71 @@ async fn migrate(pool: &SqlitePool) -> Result<(), AgentError> {
         .await
         .map_err(store_error)?;
     if failed.as_deref() == Some("1") && listed.is_none() {
-        let mut lease_ids: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT lease_id FROM fences WHERE complete = 0 ORDER BY lease_id",
+        // Each with the token of its latest failed fence: tokens only grow,
+        // and an older failure of the lease was acknowledged before it.
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT lease_id, MAX(token) FROM fences WHERE complete = 0 \
+             GROUP BY lease_id ORDER BY lease_id",
         )
         .fetch_all(pool)
         .await
         .map_err(store_error)?;
-        lease_ids.dedup();
+        let fences: Vec<FailedFence> = rows
+            .into_iter()
+            .map(|(lease_id, token)| FailedFence {
+                lease_id,
+                fencing_token: u64::try_from(token).unwrap_or(0),
+            })
+            .collect();
         let mut tx = pool.begin().await.map_err(store_error)?;
-        write_failed_fences(&mut tx, &lease_ids).await?;
-        if !lease_ids.is_empty() {
+        write_failed_fences(&mut tx, &fences).await?;
+        if !fences.is_empty() {
+            sqlx::query("INSERT OR REPLACE INTO node_meta (key, value) VALUES (?, '1')")
+                .bind(FAILED_FENCES_UNREPORTED)
+                .execute(&mut *tx)
+                .await
+                .map_err(store_error)?;
+        }
+        tx.commit().await.map_err(store_error)?;
+    } else if listed.is_some() {
+        // The tokens beside the list are brought in line with it. An agent
+        // before ADR 0245 wrote the list alone: a lease it listed has no
+        // token, and takes `estimated_token`. One it cleared and listed again,
+        // after a rollback to it, keeps the token stored before; its new
+        // failed fence's record, which is at least as high, wins over that
+        // token. A token for a lease no longer listed is dropped.
+        //
+        // An estimated token can be above the one an acknowledgement the
+        // primary already recorded carries: the lease was granted to the node
+        // again before that acknowledgement arrived. The acknowledgement then
+        // clears nothing, and the primary, which cleared its `fence_failure`,
+        // would list nothing more. So the agent reports these failed fences
+        // once, as for an older failed mark: the primary lists them again,
+        // and an acknowledgement recorded after that carries a higher token.
+        let mut conn = pool.acquire().await.map_err(store_error)?;
+        let (lease_ids, tokens) = read_failed_lists(&mut conn).await?;
+        let mut fences: Vec<FailedFence> = Vec::with_capacity(lease_ids.len());
+        let mut estimated = false;
+        for lease_id in lease_ids {
+            if fences.iter().any(|fence| fence.lease_id == lease_id) {
+                continue;
+            }
+            let fencing_token = match tokens.get(&lease_id) {
+                Some(token) => (*token).max(recorded_token(&mut conn, &lease_id).await?),
+                None => {
+                    estimated = true;
+                    estimated_token(&mut conn, &lease_id).await?
+                }
+            };
+            fences.push(FailedFence {
+                lease_id,
+                fencing_token,
+            });
+        }
+        drop(conn);
+        let mut tx = pool.begin().await.map_err(store_error)?;
+        write_failed_fences(&mut tx, &fences).await?;
+        if estimated {
             sqlx::query("INSERT OR REPLACE INTO node_meta (key, value) VALUES (?, '1')")
                 .bind(FAILED_FENCES_UNREPORTED)
                 .execute(&mut *tx)

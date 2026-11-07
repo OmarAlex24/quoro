@@ -7,12 +7,13 @@
 mod agent_common;
 mod common;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use agent_common::{TargetDir, snapshot_full, stateful_vm};
 use quoro_engine::{Engine, FakeEngine, VmState};
-use quoro_node_agent::store::NodeStore;
+use quoro_node_agent::store::{FailedFence, NodeStore};
 use quoro_node_agent::{FenceTimers, LeaseConfig, LeaseState, LocalLeases, start_local_leases};
 use quoro_proto::{
     CommandStatus, ErrorCode, LeaseGrant, LeaseId, LeaseMode, LeaseRevoke, MsgId, ResourceType,
@@ -52,6 +53,28 @@ fn revoke(lease_id: &str, token: u64) -> LeaseRevoke {
 
 fn msg(id: &str) -> MsgId {
     MsgId(id.to_owned())
+}
+
+/// A `fence_ack`'s `fencing_tokens` (section 5.17, ADR 0245).
+fn tokens(entries: &[(&str, u64)]) -> Option<BTreeMap<String, u64>> {
+    Some(
+        entries
+            .iter()
+            .map(|(lease_id, token)| ((*lease_id).to_owned(), *token))
+            .collect(),
+    )
+}
+
+/// The failed fences the store lists, as [`NodeStore::failed_fences`] returns
+/// them.
+fn failed(entries: &[(&str, u64)]) -> Vec<FailedFence> {
+    entries
+        .iter()
+        .map(|(lease_id, token)| FailedFence {
+            lease_id: (*lease_id).to_owned(),
+            fencing_token: *token,
+        })
+        .collect()
 }
 
 async fn start(
@@ -1221,17 +1244,20 @@ async fn a_fence_ack_clears_the_failed_mark_once_no_failed_fence_remains() {
     assert!(leases.view.is_failed());
     assert_eq!(
         store.failed_fences().await.unwrap(),
-        vec!["lse_one".to_owned(), "lse_two".to_owned()]
+        failed(&[("lse_one", 1), ("lse_two", 1)])
     );
 
-    // The operator verified one of them.
-    let partial = leases.link.fence_ack(vec!["lse_one".to_owned()]).await;
+    // The operator verified one of them, and the primary bumped its token.
+    let partial = leases
+        .link
+        .fence_ack(vec!["lse_one".to_owned()], tokens(&[("lse_one", 2)]))
+        .await;
     assert_eq!(partial.status, CommandStatus::Ok);
     assert!(
         partial
             .detail
             .as_deref()
-            .is_some_and(|detail| detail.contains("lse_two")),
+            .is_some_and(|detail| detail.contains("lse_two (token 1)")),
         "{partial:?}"
     );
     assert!(leases.view.is_failed());
@@ -1240,13 +1266,19 @@ async fn a_fence_ack_clears_the_failed_mark_once_no_failed_fence_remains() {
     // And then both; a lease with no failed fence is not an error.
     let all = leases
         .link
-        .fence_ack(vec!["lse_two".to_owned(), "lse_one".to_owned()])
+        .fence_ack(
+            vec!["lse_two".to_owned(), "lse_one".to_owned()],
+            tokens(&[("lse_two", 2), ("lse_one", 2)]),
+        )
         .await;
     assert_eq!(all.status, CommandStatus::Ok);
     assert!(!leases.view.is_failed());
     assert!(!store.node_failed().await.unwrap());
     assert!(store.failed_fences().await.unwrap().is_empty());
-    let again = leases.link.fence_ack(vec!["lse_one".to_owned()]).await;
+    let again = leases
+        .link
+        .fence_ack(vec!["lse_one".to_owned()], tokens(&[("lse_one", 2)]))
+        .await;
     assert_eq!(again.status, CommandStatus::Ok);
 
     // The leases stay revoked: nothing starts at the old token, and a grant
@@ -1297,7 +1329,7 @@ async fn an_older_failed_mark_lists_its_incomplete_fences() {
     let store = NodeStore::open(dir.path()).await.unwrap();
     assert_eq!(
         store.failed_fences().await.unwrap(),
-        vec!["lse_old".to_owned()]
+        failed(&[("lse_old", 3)])
     );
     store.pool().close().await;
     drop(store);
@@ -1329,7 +1361,12 @@ async fn an_older_failed_mark_lists_its_incomplete_fences() {
     // Only once: a second start reports nothing more.
     let (leases, store) = start(&dir, engine, &desired).await;
     assert_eq!(fenced_events(&store).await.len(), 1);
-    let result = leases.link.fence_ack(vec!["lse_old".to_owned()]).await;
+    // An older primary sends no tokens: every failed fence of a listed lease
+    // is cleared, as before.
+    let result = leases
+        .link
+        .fence_ack(vec!["lse_old".to_owned()], None)
+        .await;
     assert_eq!(result.status, CommandStatus::Ok, "{result:?}");
     assert!(!leases.view.is_failed());
     assert!(!store.node_failed().await.unwrap());
@@ -1398,7 +1435,10 @@ async fn a_fence_ack_during_a_fence_leaves_that_fence_s_failure_standing() {
         stops_of(&engine, &slow) >= 3
     })
     .await;
-    let acked = leases.link.fence_ack(vec!["lse_slow".to_owned()]).await;
+    let acked = leases
+        .link
+        .fence_ack(vec!["lse_slow".to_owned()], tokens(&[("lse_slow", 2)]))
+        .await;
     assert_eq!(acked.status, CommandStatus::Ok, "{acked:?}");
     assert!(
         acked
@@ -1431,7 +1471,7 @@ async fn a_fence_ack_during_a_fence_leaves_that_fence_s_failure_standing() {
     assert!(store.node_failed().await.unwrap());
     assert_eq!(
         store.failed_fences().await.unwrap(),
-        vec!["lse_slow".to_owned()]
+        failed(&[("lse_slow", 2)])
     );
     let failed: Vec<_> = fenced_events(&store)
         .await
@@ -1440,12 +1480,429 @@ async fn a_fence_ack_during_a_fence_leaves_that_fence_s_failure_standing() {
         .collect();
     assert_eq!(failed.len(), 2, "one node.fence_failed per failed fence");
 
+    // A redelivered acknowledgement does not clear it: the failure is at
+    // its token, and the operator has not seen it.
+    let redelivered = leases
+        .link
+        .fence_ack(vec!["lse_slow".to_owned()], tokens(&[("lse_slow", 2)]))
+        .await;
+    assert_eq!(redelivered.status, CommandStatus::Ok, "{redelivered:?}");
+    assert!(leases.view.is_failed());
+
     // Only a new acknowledgement clears it.
-    let applied = leases.link.fence_ack(vec!["lse_slow".to_owned()]).await;
+    let applied = leases
+        .link
+        .fence_ack(vec!["lse_slow".to_owned()], tokens(&[("lse_slow", 3)]))
+        .await;
     assert_eq!(applied.status, CommandStatus::Ok, "{applied:?}");
     assert!(!leases.view.is_failed());
     assert!(!store.node_failed().await.unwrap());
     leases.abort();
+}
+
+/// One app with a stateful VM whose stop never confirms, granted `local` at
+/// token 1: every fence of its lease fails (section 8.5 "Failed fence").
+async fn hung_lease(
+    dir: &TargetDir,
+) -> (
+    LocalLeases,
+    NodeStore,
+    Arc<FakeEngine>,
+    watch::Sender<Option<quoro_node_agent::reconcile::Snapshot>>,
+) {
+    let engine = Arc::new(FakeEngine::new());
+    let snapshot = snapshot_full(
+        1,
+        vec![stateful_vm("vm_hung", "lse_hung", 1, Vec::new())],
+        Vec::new(),
+        Vec::new(),
+    );
+    let (desired, _) = watch::channel(Some(snapshot));
+    let (leases, store) = start(dir, engine.clone(), &desired).await;
+    leases
+        .link
+        .grant(
+            msg("msg_grant"),
+            None,
+            local_grant("lse_hung", "app_hung", 1),
+        )
+        .await
+        .unwrap();
+    let vm = common::running_vm(&engine, "vm_hung", 2).await;
+    engine.set_unkillable(&vm, true);
+    (leases, store, engine, desired)
+}
+
+/// Revokes `lse_hung` at `token` and checks that its fence failed.
+async fn fail_fence(leases: &LocalLeases, token: u64) {
+    let result = leases
+        .link
+        .revoke(
+            msg(&format!("msg_revoke_{token}")),
+            None,
+            revoke("lse_hung", token),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.error.map(|error| error.code),
+        Some(ErrorCode::FenceFailed),
+        "the fence at token {token} fails"
+    );
+}
+
+/// Section 5.17 and section 8.5 steps 3 and 5 (ADRs 0245 to 0247): a
+/// `fence_ack` clears a lease's failed fences only below its acknowledged
+/// token. Here the fence at token 1 fails, and before the acknowledgement
+/// arrives a revoke at token 2, as the primary sends at a session start once
+/// another node took the lease, fails too; its record carries the revoke's
+/// token (ADR 0246). An acknowledgement at token 2 covers the first failure
+/// only, so the node stays failed and `detail` names the second. One above
+/// it, as the primary stores for a lease another node holds at token 2 (ADR
+/// 0247), covers both.
+#[tokio::test]
+async fn a_fence_ack_clears_only_the_failed_fences_below_its_token() {
+    let dir = TargetDir::new("lease-fence-ack-tokens");
+    let (leases, store, _engine, _desired) = hung_lease(&dir).await;
+    fail_fence(&leases, 1).await;
+    fail_fence(&leases, 2).await;
+    assert_eq!(
+        store.failed_fences().await.unwrap(),
+        failed(&[("lse_hung", 2)])
+    );
+
+    let partial = leases
+        .link
+        .fence_ack(vec!["lse_hung".to_owned()], tokens(&[("lse_hung", 2)]))
+        .await;
+    assert_eq!(partial.status, CommandStatus::Ok, "{partial:?}");
+    assert!(
+        partial
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("lse_hung (token 2)")),
+        "{partial:?}"
+    );
+    assert!(leases.view.is_failed());
+    assert!(store.node_failed().await.unwrap());
+    assert_eq!(
+        store.failed_fences().await.unwrap(),
+        failed(&[("lse_hung", 2)])
+    );
+
+    let all = leases
+        .link
+        .fence_ack(vec!["lse_hung".to_owned()], tokens(&[("lse_hung", 3)]))
+        .await;
+    assert_eq!(all.status, CommandStatus::Ok, "{all:?}");
+    assert!(!leases.view.is_failed());
+    assert!(!store.node_failed().await.unwrap());
+    assert!(store.failed_fences().await.unwrap().is_empty());
+    leases.abort();
+}
+
+/// Section 5.17: a `fence_ack` whose `fencing_tokens` has no token for a
+/// listed lease is answered with status `error`, and the node clears nothing,
+/// not even the leases it has a token for.
+#[tokio::test]
+async fn a_fence_ack_whose_tokens_miss_a_listed_lease_clears_nothing() {
+    let dir = TargetDir::new("lease-fence-ack-missing-token");
+    let (leases, store, _engine, _desired) = hung_lease(&dir).await;
+    fail_fence(&leases, 1).await;
+
+    let refused = leases
+        .link
+        .fence_ack(
+            vec!["lse_hung".to_owned(), "lse_other".to_owned()],
+            tokens(&[("lse_hung", 2)]),
+        )
+        .await;
+    assert_eq!(refused.status, CommandStatus::Error, "{refused:?}");
+    assert_eq!(
+        refused.error.map(|error| error.code),
+        Some(ErrorCode::BadMessage)
+    );
+    assert!(leases.view.is_failed());
+    assert!(store.node_failed().await.unwrap());
+    assert_eq!(
+        store.failed_fences().await.unwrap(),
+        failed(&[("lse_hung", 1)])
+    );
+    leases.abort();
+}
+
+/// Makes every insert into `table` fail, as a full or broken store would.
+async fn break_inserts(store: &NodeStore, table: &str) {
+    for op in ["INSERT", "UPDATE"] {
+        sqlx::query(&format!(
+            "CREATE TRIGGER broken_{table}_{op} BEFORE {op} ON {table} \
+             BEGIN SELECT RAISE(ABORT, 'injected store fault'); END"
+        ))
+        .execute(store.pool())
+        .await
+        .unwrap();
+    }
+}
+
+async fn mend_inserts(store: &NodeStore, table: &str) {
+    for op in ["INSERT", "UPDATE"] {
+        sqlx::query(&format!("DROP TRIGGER broken_{table}_{op}"))
+            .execute(store.pool())
+            .await
+            .unwrap();
+    }
+}
+
+/// Section 8.5 and ADR 0245: a failed fence whose record cannot be written is
+/// still marked with its token by the fallback, and one whose mark cannot be
+/// written either is kept in memory with its token. Either way an
+/// acknowledgement below that token clears nothing, and one above it clears
+/// the failure.
+#[tokio::test]
+async fn a_failed_fence_the_store_could_not_record_keeps_its_token() {
+    let dir = TargetDir::new("lease-fence-ack-fallback");
+    let (leases, store, _engine, _desired) = hung_lease(&dir).await;
+
+    // The fence record cannot be written: the fallback marks the failure.
+    break_inserts(&store, "fences").await;
+    fail_fence(&leases, 2).await;
+    assert!(store.fences().await.unwrap().is_empty(), "no fence record");
+    assert!(store.node_failed().await.unwrap());
+    assert_eq!(
+        store.failed_fences().await.unwrap(),
+        failed(&[("lse_hung", 2)])
+    );
+    let below = leases
+        .link
+        .fence_ack(vec!["lse_hung".to_owned()], tokens(&[("lse_hung", 2)]))
+        .await;
+    assert_eq!(below.status, CommandStatus::Ok, "{below:?}");
+    assert!(leases.view.is_failed());
+    let above = leases
+        .link
+        .fence_ack(vec!["lse_hung".to_owned()], tokens(&[("lse_hung", 3)]))
+        .await;
+    assert_eq!(above.status, CommandStatus::Ok, "{above:?}");
+    assert!(!leases.view.is_failed());
+
+    // Nor can the mark: the failure holds in memory, with its token.
+    break_inserts(&store, "node_meta").await;
+    fail_fence(&leases, 3).await;
+    mend_inserts(&store, "node_meta").await;
+    assert!(leases.view.is_failed());
+    assert!(store.failed_fences().await.unwrap().is_empty());
+    let below = leases
+        .link
+        .fence_ack(vec!["lse_hung".to_owned()], tokens(&[("lse_hung", 3)]))
+        .await;
+    assert_eq!(below.status, CommandStatus::Ok, "{below:?}");
+    assert!(
+        below
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("lse_hung (token 3)")),
+        "{below:?}"
+    );
+    assert!(leases.view.is_failed());
+    let above = leases
+        .link
+        .fence_ack(vec!["lse_hung".to_owned()], tokens(&[("lse_hung", 4)]))
+        .await;
+    assert_eq!(above.status, CommandStatus::Ok, "{above:?}");
+    assert!(!leases.view.is_failed());
+    mend_inserts(&store, "fences").await;
+    leases.abort();
+}
+
+fn record(lease_id: &str, token: u64) -> quoro_node_agent::FenceRecord {
+    quoro_node_agent::FenceRecord {
+        lease_id: LeaseId(lease_id.to_owned()),
+        token,
+        vm_ids: vec![quoro_engine::VmId(format!("vm_{lease_id}"))],
+        at: std::time::SystemTime::now(),
+        reason: quoro_proto::FenceReason::LeaseRevoked,
+        complete: false,
+    }
+}
+
+fn revoked_row(lease_id: &str, token: u64) -> quoro_node_agent::StoredLease {
+    quoro_node_agent::StoredLease {
+        lease_id: LeaseId(lease_id.to_owned()),
+        resource_type: quoro_proto::ResourceType::App,
+        resource_id: format!("app_{lease_id}"),
+        mode: quoro_proto::LeaseMode::Local,
+        token,
+        state: LeaseState::Revoked,
+        duration: None,
+        validity: None,
+    }
+}
+
+/// Section 12 `node_meta` and ADR 0245: an agent before ADR 0245 kept the
+/// failed fences as plain lease ids, with no tokens. The store gives each the
+/// higher of its latest failed fence record and the token the node holds the
+/// lease at, or 0 without either, and an acknowledgement above those tokens
+/// clears them. An acknowledgement the primary recorded before the upgrade
+/// may carry a lower token, so the agent reports those failed fences once and
+/// the primary lists them again.
+#[tokio::test]
+async fn an_older_list_of_failed_fences_takes_their_tokens() {
+    let dir = TargetDir::new("lease-older-failed-list");
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    for (lease_id, token) in [("lse_recorded", 2), ("lse_recorded", 4), ("lse_both", 4)] {
+        store.record_fence(&record(lease_id, token)).await.unwrap();
+    }
+    // `lse_both` was granted again at 7 after its fence failed at 4.
+    for (lease_id, token) in [("lse_marked", 6), ("lse_both", 7)] {
+        store
+            .save_lease(&revoked_row(lease_id, token), token)
+            .await
+            .unwrap();
+    }
+    store.set_node_failed(true).await.unwrap();
+    store
+        .set_meta(
+            "failed_fences",
+            r#"["lse_recorded","lse_both","lse_marked","lse_unknown"]"#,
+        )
+        .await
+        .unwrap();
+    store.pool().close().await;
+    drop(store);
+
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    assert_eq!(
+        store.failed_fences().await.unwrap(),
+        failed(&[
+            ("lse_recorded", 4),
+            ("lse_both", 7),
+            ("lse_marked", 6),
+            ("lse_unknown", 0),
+        ])
+    );
+    assert!(store.failed_fences_unreported().await.unwrap());
+    store.pool().close().await;
+    drop(store);
+
+    let engine = Arc::new(FakeEngine::new());
+    let (desired, _) = watch::channel(None);
+    let (leases, store) = start(&dir, engine, &desired).await;
+    assert!(leases.view.is_failed());
+    // Reported once: the leases with a failed fence record.
+    let reported: Vec<serde_json::Value> = fenced_events(&store)
+        .await
+        .into_iter()
+        .map(|event| event["subject"]["id"].clone())
+        .collect();
+    assert_eq!(
+        reported,
+        vec![
+            serde_json::json!("lse_both"),
+            serde_json::json!("lse_recorded")
+        ]
+    );
+    assert!(!store.failed_fences_unreported().await.unwrap());
+    let kept = leases
+        .link
+        .fence_ack(
+            vec![
+                "lse_recorded".to_owned(),
+                "lse_both".to_owned(),
+                "lse_marked".to_owned(),
+                "lse_unknown".to_owned(),
+            ],
+            tokens(&[
+                ("lse_recorded", 5),
+                ("lse_both", 7),
+                ("lse_marked", 6),
+                ("lse_unknown", 1),
+            ]),
+        )
+        .await;
+    assert_eq!(kept.status, CommandStatus::Ok, "{kept:?}");
+    assert_eq!(
+        store.failed_fences().await.unwrap(),
+        failed(&[("lse_both", 7), ("lse_marked", 6)])
+    );
+    assert!(leases.view.is_failed());
+    let all = leases
+        .link
+        .fence_ack(
+            vec!["lse_both".to_owned(), "lse_marked".to_owned()],
+            tokens(&[("lse_both", 8), ("lse_marked", 7)]),
+        )
+        .await;
+    assert_eq!(all.status, CommandStatus::Ok, "{all:?}");
+    assert!(!leases.view.is_failed());
+    leases.abort();
+}
+
+/// Section 12 `node_meta`: the list of failed fences keeps the form an agent
+/// before ADR 0245 reads, plain lease ids, with the tokens under a key of
+/// their own. After a rollback to such an agent and an upgrade again, the
+/// store takes what that agent changed: a lease it listed takes its record's
+/// token, one it cleared and listed again after a new failed fence takes the
+/// newer record's token over the one stored before, and the token of one it
+/// cleared is dropped.
+#[tokio::test]
+async fn the_failed_fences_stay_readable_by_an_older_agent() {
+    let dir = TargetDir::new("lease-failed-list-rollback");
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    for (lease_id, token) in [("lse_again", 5), ("lse_cleared", 3)] {
+        store
+            .mark_fence_failed(
+                lease_id,
+                token,
+                &format!("evt_{lease_id}"),
+                &serde_json::json!({"type": "node.fence_failed"}),
+            )
+            .await
+            .unwrap();
+    }
+    let raw = |store: &NodeStore, key: &'static str| {
+        let pool = store.pool().clone();
+        async move {
+            sqlx::query_scalar::<_, String>("SELECT value FROM node_meta WHERE key = ?")
+                .bind(key)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    let ids: Vec<String> = serde_json::from_str(&raw(&store, "failed_fences").await).unwrap();
+    assert_eq!(ids, vec!["lse_again".to_owned(), "lse_cleared".to_owned()]);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&raw(&store, "failed_fence_tokens").await)
+            .unwrap(),
+        serde_json::json!({"lse_again": 5, "lse_cleared": 3})
+    );
+
+    // The older agent: an acknowledgement by id cleared both, then the fence
+    // of `lse_again` failed again at 8 and one of `lse_new` failed at 2. It
+    // wrote their records and the plain list, and left the tokens alone.
+    for (lease_id, token) in [("lse_again", 8), ("lse_new", 2)] {
+        store.record_fence(&record(lease_id, token)).await.unwrap();
+    }
+    store
+        .set_meta("failed_fences", r#"["lse_again","lse_new"]"#)
+        .await
+        .unwrap();
+    store.pool().close().await;
+    drop(store);
+
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    assert_eq!(
+        store.failed_fences().await.unwrap(),
+        failed(&[("lse_again", 8), ("lse_new", 2)])
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&raw(&store, "failed_fence_tokens").await)
+            .unwrap(),
+        serde_json::json!({"lse_again": 8, "lse_new": 2})
+    );
+    // `lse_new` took an estimated token, so the failed fences are reported
+    // once more.
+    assert!(store.failed_fences_unreported().await.unwrap());
 }
 
 /// Section 8.5 step 1: a fence the restore finds is the stop's owner before
