@@ -375,8 +375,17 @@ async fn an_event_recorded_during_a_session_is_sent_without_a_reconnect() {
         .expect("the primary saw an event");
     assert_eq!(frame["body"]["type"], "app.down");
     assert!(!serving.is_finished(), "no reconnect was needed");
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(store.buffered_events().await.unwrap().is_empty());
+    // The node removes the event from its buffer only after the frame was
+    // written, so the primary may read it first; a loaded runner can take a
+    // while to finish the removal (#598).
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !store.buffered_events().await.unwrap().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the sent event was still buffered after 3 s"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     serving.abort();
     primary.abort();
 }
