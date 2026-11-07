@@ -26,6 +26,11 @@
 //! A folder is linked to a project and an app (`links.rs`), so `status` and
 //! the `project` and `app` commands know what they act on; a resource is
 //! named by name or id, never by an id flag (`scope.rs`).
+//!
+//! `up` builds a Git app and follows its build, `deploy`, `redeploy` and
+//! `restart` roll an app out, `build` lists and cancels builds (`deploy.rs`),
+//! and `logs` reads and follows the app's, a build's or a deployment's logs
+//! over the API's reads and event streams (`logs.rs`).
 
 mod agent;
 mod api;
@@ -34,11 +39,13 @@ mod approval;
 mod cli;
 mod client;
 mod context;
+mod deploy;
 mod error;
 mod link;
 mod links;
 mod login;
 mod logout;
+mod logs;
 pub mod operations;
 mod project;
 mod scope;
@@ -271,6 +278,14 @@ pub async fn run_with(
         cli::Command::App(command) => {
             app::run(&cli.global, command, environment, stdout, stderr).await
         }
+        cli::Command::Up(args) => deploy::up(&cli.global, args, environment, stdout, stderr).await,
+        cli::Command::Deploy(args) => deploy::deploy(&cli.global, args, environment, stdout).await,
+        cli::Command::Redeploy => deploy::redeploy(&cli.global, environment, stdout).await,
+        cli::Command::Restart => deploy::restart(&cli.global, environment, stdout).await,
+        cli::Command::Build(command) => {
+            deploy::build(&cli.global, command, environment, stdout).await
+        }
+        cli::Command::Logs(args) => logs::run(&cli.global, args, environment, stdout, stderr).await,
         cli::Command::Api(args) => api::run(&cli.global, args, environment, stdout, stderr).await,
         cli::Command::Completion { shell } => {
             clap_complete::generate(shell, &mut command(), "quoro", stdout);

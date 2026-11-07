@@ -143,6 +143,97 @@ pub const LIST_APP_DEPLOYMENTS: Operation = Operation {
     path: "/api/v1/apps/{app_id}/deployments",
 };
 
+/// `restartApp` (`app:restart`).
+pub const RESTART_APP: Operation = Operation {
+    id: "restartApp",
+    method: "POST",
+    path: "/api/v1/apps/{app_id}/restart",
+};
+
+/// `redeployApp` (`app:redeploy`): the current image again.
+pub const REDEPLOY_APP: Operation = Operation {
+    id: "redeployApp",
+    method: "POST",
+    path: "/api/v1/apps/{app_id}/redeploy",
+};
+
+/// `createDeployment` (`app:deploy`): a new image; `conflict` for a Git app.
+pub const CREATE_DEPLOYMENT: Operation = Operation {
+    id: "createDeployment",
+    method: "POST",
+    path: "/api/v1/apps/{app_id}/deployments",
+};
+
+/// `getDeployment` (`app:read`).
+pub const GET_DEPLOYMENT: Operation = Operation {
+    id: "getDeployment",
+    method: "GET",
+    path: "/api/v1/deployments/{deployment_id}",
+};
+
+/// `getDeploymentLogs` (`app:logs`): progress lines, read from the node.
+pub const GET_DEPLOYMENT_LOGS: Operation = Operation {
+    id: "getDeploymentLogs",
+    method: "GET",
+    path: "/api/v1/deployments/{deployment_id}/logs",
+};
+
+/// `getAppLogs` (`app:logs`), read from the nodes.
+pub const GET_APP_LOGS: Operation = Operation {
+    id: "getAppLogs",
+    method: "GET",
+    path: "/api/v1/apps/{app_id}/logs",
+};
+
+/// `streamAppLogs` (`app:logs`): server-sent events of live output.
+pub const STREAM_APP_LOGS: Operation = Operation {
+    id: "streamAppLogs",
+    method: "GET",
+    path: "/api/v1/apps/{app_id}/logs/stream",
+};
+
+/// `listAppBuilds` (`app:read`), newest first.
+pub const LIST_APP_BUILDS: Operation = Operation {
+    id: "listAppBuilds",
+    method: "GET",
+    path: "/api/v1/apps/{app_id}/builds",
+};
+
+/// `startBuild` (`app:deploy`): a build of the app's Git source.
+pub const START_BUILD: Operation = Operation {
+    id: "startBuild",
+    method: "POST",
+    path: "/api/v1/apps/{app_id}/builds",
+};
+
+/// `getBuild` (`app:read`).
+pub const GET_BUILD: Operation = Operation {
+    id: "getBuild",
+    method: "GET",
+    path: "/api/v1/builds/{build_id}",
+};
+
+/// `cancelBuild` (`app:deploy`).
+pub const CANCEL_BUILD: Operation = Operation {
+    id: "cancelBuild",
+    method: "POST",
+    path: "/api/v1/builds/{build_id}/cancel",
+};
+
+/// `getBuildLogs` (`app:logs`): one page of the log, oldest first.
+pub const GET_BUILD_LOGS: Operation = Operation {
+    id: "getBuildLogs",
+    method: "GET",
+    path: "/api/v1/builds/{build_id}/logs",
+};
+
+/// `streamBuildLogs` (`app:logs`): server-sent events of the log and status.
+pub const STREAM_BUILD_LOGS: Operation = Operation {
+    id: "streamBuildLogs",
+    method: "GET",
+    path: "/api/v1/builds/{build_id}/logs/stream",
+};
+
 /// `getAppMetrics` (`app:read`), read from the nodes.
 pub const GET_APP_METRICS: Operation = Operation {
     id: "getAppMetrics",
@@ -218,6 +309,19 @@ pub const OPERATIONS: &[Operation] = &[
     START_APP,
     STOP_APP,
     LIST_APP_DEPLOYMENTS,
+    RESTART_APP,
+    REDEPLOY_APP,
+    CREATE_DEPLOYMENT,
+    GET_DEPLOYMENT,
+    GET_DEPLOYMENT_LOGS,
+    GET_APP_LOGS,
+    STREAM_APP_LOGS,
+    LIST_APP_BUILDS,
+    START_BUILD,
+    GET_BUILD,
+    CANCEL_BUILD,
+    GET_BUILD_LOGS,
+    STREAM_BUILD_LOGS,
     GET_APP_METRICS,
     GET_APP_VULNERABILITIES,
     GET_CLUSTER,

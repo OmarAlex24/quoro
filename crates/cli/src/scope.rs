@@ -347,7 +347,7 @@ pub fn text(value: &Value, key: &str) -> String {
 
 /// A cursor in a query string; cursors are opaque, so anything but the
 /// unreserved characters is escaped.
-fn query_value(text: &str) -> String {
+pub(crate) fn query_value(text: &str) -> String {
     text.bytes()
         .map(|b| {
             if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {

@@ -68,6 +68,19 @@ pub enum Command {
     /// List, create, change, start, stop and delete apps
     #[command(subcommand)]
     App(AppCommand),
+    /// Build the linked Git app and follow its build log
+    Up(UpArgs),
+    /// Deploy an image, or roll back to an earlier deployment
+    Deploy(DeployArgs),
+    /// Roll out the app's current image again
+    Redeploy,
+    /// Restart the app's instances
+    Restart,
+    /// List the app's builds and cancel one
+    #[command(subcommand)]
+    Build(BuildCommand),
+    /// Read or follow the app's, a build's or a deployment's logs
+    Logs(LogsArgs),
     /// Call any API operation and print the response body
     Api(ApiArgs),
     /// Print a shell completion script
@@ -198,6 +211,59 @@ pub struct AppUpdateArgs {
     /// The HTTP path the health check probes, starting with /
     #[arg(long, value_name = "PATH")]
     pub health_path: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct UpArgs {
+    /// Build this branch, tag or commit instead of the source's ref
+    #[arg(long = "ref", value_name = "REF")]
+    pub git_ref: Option<String>,
+    /// Start the build and return without following it
+    #[arg(long)]
+    pub detach: bool,
+}
+
+#[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("what").required(true).args(["image", "rollback"])))]
+pub struct DeployArgs {
+    /// The OCI image to deploy to an image app
+    #[arg(long, value_name = "REF")]
+    pub image: Option<String>,
+    /// Deploy what an earlier deployment ran; a Git app rebuilds its commit
+    #[arg(long, value_name = "DEPLOYMENT")]
+    pub rollback: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BuildCommand {
+    /// List the app's newest builds
+    List,
+    /// Cancel a build (default: the app's build in progress)
+    Cancel {
+        /// The build, by id (bld_...)
+        #[arg(value_name = "BUILD")]
+        build: Option<String>,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct LogsArgs {
+    /// Show the last N lines (app logs: 200 by default)
+    #[arg(short = 'n', long = "lines", value_name = "N",
+        value_parser = clap::value_parser!(u32).range(1..=5000))]
+    pub lines: Option<u32>,
+    /// Only lines since a time (RFC 3339) or a duration ago (30s, 10m, 2h, 1d)
+    #[arg(long, value_name = "T", conflicts_with_all = ["follow", "build", "deployment"])]
+    pub since: Option<String>,
+    /// Follow new lines until Ctrl-C (a build: until it finishes)
+    #[arg(short = 'f', long)]
+    pub follow: bool,
+    /// A build's log (default: the app's newest build)
+    #[arg(long, value_name = "BUILD", num_args = 0..=1, conflicts_with = "deployment")]
+    pub build: Option<Option<String>>,
+    /// A deployment's progress lines
+    #[arg(long, value_name = "DEPLOYMENT", conflicts_with = "follow")]
+    pub deployment: Option<String>,
 }
 
 #[derive(Debug, Args)]

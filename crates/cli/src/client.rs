@@ -240,6 +240,55 @@ pub fn now_unix() -> i64 {
         })
 }
 
+/// Unix seconds as an RFC 3339 time in UTC, such as `2026-11-06T10:00:00Z`.
+pub fn rfc3339(seconds: i64) -> String {
+    let (days, rest) = (seconds.div_euclid(86_400), seconds.rem_euclid(86_400));
+    // The civil date from days (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rest / 3600,
+        rest % 3600 / 60,
+        rest % 60
+    )
+}
+
+/// A fresh `Idempotency-Key` for one create (`startBuild`,
+/// `createDeployment`), so a request that reaches the primary twice starts
+/// one build or deployment. Unique per call: the time, the process and a
+/// counter, hashed.
+pub fn idempotency_key() -> HeaderValue {
+    use sha2::{Digest as _, Sha256};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let mut hash = Sha256::new();
+    hash.update(nanos.to_le_bytes());
+    hash.update(std::process::id().to_le_bytes());
+    hash.update(COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+    let hex: String = hash.finalize()[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    HeaderValue::from_str(&format!("quoro-cli-{hex}"))
+        .unwrap_or(HeaderValue::from_static("quoro-cli"))
+}
+
 /// Reads an RFC 3339 timestamp, such as the primary's
 /// `2026-11-06T10:00:00.000Z`, as seconds since the Unix epoch; a fraction is
 /// dropped.
@@ -322,6 +371,11 @@ mod tests {
             unix_seconds("2026-11-06T12:00:00+02:00"),
             Some(1_793_959_200)
         );
+        for seconds in [0, 951_868_799, 1_793_959_200, 4_102_444_800] {
+            assert_eq!(unix_seconds(&rfc3339(seconds)), Some(seconds));
+        }
+        assert_eq!(rfc3339(1_793_959_200), "2026-11-06T10:00:00Z");
+        assert_ne!(idempotency_key(), idempotency_key());
         for bad in [
             "",
             "2026-11-06",
