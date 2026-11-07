@@ -88,6 +88,7 @@ import { buildsHandlers } from './handlers-builds';
 import { grantsHandlers } from './handlers-grants';
 import { incidentsHandlers } from './handlers-incidents';
 import { metricsHandlers } from './handlers-metrics';
+import { tokensHandlers } from './handlers-tokens';
 import { usersHandlers } from './handlers-users';
 import { interactiveHandlers } from './handlers-interactive';
 import { vulnerabilitiesHandlers } from './handlers-vulnerabilities';
@@ -1178,10 +1179,11 @@ export const handlers = [
     });
   }),
 
-  // Builds, then the agency screens: users, agents, grants, approvals, audit,
+  // Builds, then the agency screens: users, tokens, agents, grants, approvals, audit,
   // webhooks, incidents.
   ...buildsHandlers,
   ...usersHandlers,
+  ...tokensHandlers,
   ...agentsHandlers,
   ...grantsHandlers,
   ...approvalsHandlers,

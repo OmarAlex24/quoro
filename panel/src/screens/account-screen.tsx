@@ -10,6 +10,7 @@ import {
 } from '../lib/password';
 import { problemView, type ProblemView } from '../lib/problem';
 import { useSession } from '../session';
+import { ApiTokens } from '../components/api-tokens';
 import { Button } from '../components/ui/button';
 import { Field } from '../components/ui/field';
 import { Input } from '../components/ui/input';
@@ -25,8 +26,8 @@ const emptyDraft = (): PasswordChangeDraft => ({
 type FieldErrors = Partial<Record<PasswordField, string>>;
 
 /**
- * The `/account` screen: who is signed in, and the form where they change
- * their own password. The three passwords live in this component's state for
+ * The `/account` screen: who is signed in, their personal API tokens, and the
+ * form where they change their own password. The three passwords live in this component's state for
  * as long as the form is open and nowhere else: not in storage, not in the
  * query cache, not in a log.
  */
@@ -106,8 +107,8 @@ export function AccountScreen() {
       <div>
         <h1 className="type-display text-[24px] leading-none">Your account</h1>
         <p className="mt-2 max-w-2xl text-[13px] leading-snug text-ink-2">
-          The identity this panel is signed in as, and the password it signs in
-          with.
+          The identity this panel is signed in as, the tokens that sign the CLI
+          and the API in as you, and your password.
         </p>
       </div>
 
@@ -124,6 +125,8 @@ export function AccountScreen() {
           </dd>
         </dl>
       </section>
+
+      <ApiTokens />
 
       <section className="mt-4 rounded-[10px] border border-line bg-surface px-4 py-4 card-sheen sm:px-5">
         <h2 className="type-display text-[18px] leading-tight">Change password</h2>
