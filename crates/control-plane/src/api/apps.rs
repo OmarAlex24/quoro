@@ -76,7 +76,8 @@ impl AppStatus {
 }
 
 /// `apps.ha_policy` (`App.ha_policy`). M5a accepts `none` and `cold`; `warm`
-/// and `hot` are refused until M5b and M6 (ADR 0020).
+/// and `hot` are refused until M5b and M6 (ADR 0020). A test-lab build with
+/// the dev-only `dev-warm-policy` feature accepts `warm` (ADR 0223).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HaPolicy {
@@ -1149,6 +1150,12 @@ fn validate_update(body: &UpdateAppRequest) -> Result<(), ApiError> {
     }
     match body.ha_policy {
         None | Some(HaPolicy::None | HaPolicy::Cold) => {}
+        // ADR 0223: a test-lab build with the dev-only `dev-warm-policy`
+        // feature accepts `warm` and only stores it, so an app's lease can be
+        // made `expiring` before the warm policy ships, once the primary sends
+        // the section 8.4 mode change (#555). Delete this arm and the feature
+        // when the warm policy merges (#533).
+        Some(HaPolicy::Warm) if cfg!(feature = "dev-warm-policy") => {}
         Some(HaPolicy::Warm | HaPolicy::Hot) => {
             return Err(ApiError::validation(
                 "ha_policy warm and hot are not supported before M5b and M6",
@@ -1156,7 +1163,8 @@ fn validate_update(body: &UpdateAppRequest) -> Result<(), ApiError> {
         }
     }
     // `UpdateAppRequest.warm` needs `ha_policy` `warm`, which this release
-    // still refuses.
+    // still refuses. The dev-only `dev-warm-policy` feature accepts the policy
+    // but not its settings (ADR 0223).
     if body.warm.is_some() {
         return Err(ApiError::validation(
             "warm settings need ha_policy warm, which is not supported before M5b",

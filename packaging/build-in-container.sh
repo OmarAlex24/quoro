@@ -23,6 +23,9 @@ Environment:
                           otherwise docker)
   QUORO_PACKAGE, QUORO_ALLOW_DIRTY, QUORO_SKIP_PANEL, SOURCE_DATE_EPOCH
                           passed to build-release.sh when set
+  QUORO_DEV_WARM_POLICY   set to 1 for a test-lab dev build only, never a
+                          release: enables the dev-only dev-warm-policy
+                          feature (ADR 0223); passed to build-release.sh
 
 The image is tagged quoro-release-build:<hash of its inputs> and kept, so the
 next build reuses it; the tag is printed on stderr. Downloads (crates, npm) are
@@ -129,7 +132,7 @@ fi
 # Only the build-release.sh variables are passed through; nothing else from
 # the host environment reaches the build.
 env_opts=
-for var in QUORO_PACKAGE QUORO_ALLOW_DIRTY QUORO_SKIP_PANEL SOURCE_DATE_EPOCH; do
+for var in QUORO_PACKAGE QUORO_ALLOW_DIRTY QUORO_SKIP_PANEL QUORO_DEV_WARM_POLICY SOURCE_DATE_EPOCH; do
 	eval "is_set=\${$var+x}"
 	# shellcheck disable=SC2154 # assigned by the eval above
 	if [ -n "$is_set" ]; then

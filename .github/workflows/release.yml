@@ -92,6 +92,30 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: packaging/build-in-container.sh "$VERSION"
 
+      # ADR 0223: the dev-only dev-warm-policy feature is for test-lab builds
+      # and never ships. A release whose binary reports it fails here, before
+      # anything is attested or uploaded.
+      - name: No dev-only feature in the release
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -eu
+          if [ -n "${QUORO_DEV_WARM_POLICY:-}" ] && [ "$QUORO_DEV_WARM_POLICY" != 0 ]; then
+            echo "error: QUORO_DEV_WARM_POLICY is set for a release build (ADR 0223)" >&2
+            exit 1
+          fi
+          name="quoro-${VERSION}-x86_64-unknown-linux-musl"
+          unpacked="$(mktemp -d)"
+          tar -xzf "dist/${name}.tar.gz" -C "$unpacked"
+          reported="$("$unpacked/$name/quoro" version)"
+          echo "$reported"
+          case "$reported" in
+            *dev-warm-policy*)
+              echo "error: the release binary has the dev-only dev-warm-policy feature (ADR 0223)" >&2
+              exit 1
+              ;;
+          esac
+
       - name: Attest build provenance
         id: attest
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2

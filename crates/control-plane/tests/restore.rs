@@ -1671,17 +1671,21 @@ async fn cold_needs_a_stateful_app_and_a_repository() {
     let app: Value = res.json().await.unwrap();
     assert_eq!(app["ha_policy"], "cold");
 
-    let (status, code, _) = problem(
-        patch_app(
-            &setup.state.owner,
-            &setup.state.server,
-            &setup.state.app_id,
-            json!({ "ha_policy": "warm" }),
+    // A test-lab build with the dev-only `dev-warm-policy` feature accepts
+    // `warm` (ADR 0223); `apps.rs` tests both builds.
+    if !cfg!(feature = "dev-warm-policy") {
+        let (status, code, _) = problem(
+            patch_app(
+                &setup.state.owner,
+                &setup.state.server,
+                &setup.state.app_id,
+                json!({ "ha_policy": "warm" }),
+            )
+            .await,
         )
-        .await,
-    )
-    .await;
-    assert_eq!((status, code.as_str()), (422, "validation_failed"));
+        .await;
+        assert_eq!((status, code.as_str()), (422, "validation_failed"));
+    }
 
     // A stateless app cannot be `cold`.
     let project_id = create_project(&setup.state.owner, &setup.state.server, "other").await;

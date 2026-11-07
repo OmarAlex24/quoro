@@ -13,6 +13,13 @@ workspace = true
 name = "quoro"
 path = "src/main.rs"
 
+[features]
+# ADR 0223: turns on the control plane's dev-only feature, for test-lab builds
+# only (`QUORO_DEV_WARM_POLICY=1 packaging/build-in-container.sh`). `quoro
+# version` reports the control plane's feature however it was turned on, and CI
+# fails a default or release binary that does.
+dev-warm-policy = ["quoro-control-plane/dev-warm-policy"]
+
 [dependencies]
 quoro-control-plane = { path = "../control-plane" }
 # The MCP server at `/mcp`, merged into the control plane's router (ADR 0054).

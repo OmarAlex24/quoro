@@ -83,6 +83,15 @@ to the primary at --url over TLS pinned to --fingerprint (the sha256: value a
 join command carries). The primary authorizes and audits every tool call;
 --justification is recorded with each token the session mints.";
 
+/// What `quoro version` adds when the control plane was compiled with its
+/// dev-only feature, however it was turned on (ADR 0223). CI fails a default
+/// or a release binary that prints it.
+const DEV_BUILD: &str = if quoro_control_plane::DEV_WARM_POLICY {
+    " (dev build: dev-warm-policy, ADR 0223; not a release)"
+} else {
+    ""
+};
+
 #[tokio::main]
 async fn main() -> ExitCode {
     // Logs to stderr, which systemd forwards to journald (D-0054).
@@ -97,7 +106,7 @@ async fn main() -> ExitCode {
 
     match command.as_str() {
         "version" | "--version" | "-V" => {
-            println!("quoro {}", env!("CARGO_PKG_VERSION"));
+            println!("quoro {}{DEV_BUILD}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         "serve" => serve_command(rest).await,

@@ -28,6 +28,11 @@ Environment:
   QUORO_ALLOW_DIRTY  set to 1 to build from a dirty tree (not a release build)
   QUORO_SKIP_PANEL   set to 1 to skip rebuilding the panel (not a release build);
                      panel/dist must already exist
+  QUORO_DEV_WARM_POLICY
+                     set to 1 for a test-lab dev build only (not a release
+                     build): enables the dev-only dev-warm-policy feature,
+                     which accepts ha_policy warm before the warm policy ships
+                     (ADR 0223); quoro version reports it
   SOURCE_DATE_EPOCH  build timestamp; defaults to the last commit time
   CARGO_HOME         defaults to $HOME/.cargo
 
@@ -128,6 +133,19 @@ if [ "$print_version" = "1" ]; then
 	printf '%s\n' "$version"
 	exit 0
 fi
+
+# ADR 0223: a test-lab dev build may enable the dev-only dev-warm-policy
+# feature. A release never does; the release workflow fails a binary whose
+# `quoro version` reports it.
+features=
+case "${QUORO_DEV_WARM_POLICY:-0}" in
+0) ;;
+1)
+	note "warning: QUORO_DEV_WARM_POLICY=1: the dev-only dev-warm-policy feature is on (ADR 0223); this is a test-lab dev build, NOT a release build"
+	features="--features=$QUORO_PACKAGE/dev-warm-policy"
+	;;
+*) die "QUORO_DEV_WARM_POLICY must be 0 or 1, not: $QUORO_DEV_WARM_POLICY" ;;
+esac
 
 # The SBOM is built and written with python3 (standard library only); the
 # release build image ships 3.12.
@@ -288,7 +306,9 @@ export QUORO_SBOM_COMPONENTS
 
 # Both binaries ship: quoro is the service, quoro-init is PID 1 inside every
 # microVM. One invocation so they share the exact same environment.
+# shellcheck disable=SC2086 # features is empty or one word on purpose
 cargo +"$channel" build --release --locked --target x86_64-unknown-linux-musl \
+	$features \
 	-p "$QUORO_PACKAGE" --bin quoro \
 	-p quoro-init --bin quoro-init
 
