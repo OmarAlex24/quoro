@@ -1126,7 +1126,10 @@ pub struct SpecBackup {
     pub backup_id: String,
     pub app_id: String,
     pub volume_id: String,
-    /// The app's VM on this node, which a `pause_copy` snapshot pauses.
+    /// The app's VM on this node as the primary placed it; absent when the
+    /// app has no VM here. Informational only: the node does not use it to
+    /// choose what to pause, since a `pause_copy` snapshot pauses the VM that
+    /// attaches the volume (`engine-trait.md` section 3.16).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vm_id: Option<String>,
     pub fencing_token: u64,
