@@ -122,9 +122,74 @@ impl Primary {
         self.requests.load(Ordering::SeqCst)
     }
 
+    /// Creates the first owner and signs it in on the plain fixture listener;
+    /// returns the owner's id and the `quoro_session=...` cookie pair.
+    pub async fn owner_session(&self) -> (String, String) {
+        let setup = setup_token::issue(&self.dir).unwrap();
+        let client = reqwest::Client::new();
+        let body = r#"{"email":"owner@example.com","name":"Owner","password":"correct horse battery staple"}"#;
+        let response = client
+            .post(format!("{}/api/v1/setup", self.plain))
+            .header("Quoro-Setup-Token", setup)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201, "setup");
+        let user: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+        let owner_id = user["id"].as_str().unwrap().to_string();
+        let response = client
+            .post(format!("{}/api/v1/auth/login", self.plain))
+            .header("Content-Type", "application/json")
+            .body(r#"{"email":"owner@example.com","password":"correct horse battery staple"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "login");
+        let cookie = response
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find_map(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .filter(|pair| pair.starts_with("quoro_session="))
+            })
+            .expect("a session cookie")
+            .to_string();
+        (owner_id, cookie)
+    }
+
+    /// A request with the session `cookie` on the plain fixture listener; the
+    /// status and the JSON body (`Value::Null` when there is none).
+    pub async fn with_session(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        cookie: &str,
+        body: Option<Value>,
+    ) -> (u16, Value) {
+        let mut request = reqwest::Client::new()
+            .request(method, format!("{}{path}", self.plain))
+            .header("Cookie", cookie);
+        if let Some(body) = body {
+            request = request
+                .header("Content-Type", "application/json")
+                .body(body.to_string());
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap();
+        (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
     /// Creates the first owner and a personal API token (`tok_...`) for it,
-    /// inserted directly as `crates/mcp/tests/auth.rs` does: the tokens API
-    /// is not there yet. Returns the owner's id and the token.
+    /// inserted directly as `crates/mcp/tests/auth.rs` does, so a test that is
+    /// not about tokens does not depend on the tokens API. Returns the owner's
+    /// id and the token.
     pub async fn owner_token(&self) -> (String, String) {
         let setup = setup_token::issue(&self.dir).unwrap();
         let response = reqwest::Client::new()

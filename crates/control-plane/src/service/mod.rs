@@ -28,6 +28,7 @@ pub mod interactive;
 pub mod logs;
 pub mod nodes;
 pub mod projects;
+pub mod tokens;
 pub mod users;
 pub mod volumes;
 pub mod vulnerabilities;

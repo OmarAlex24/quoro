@@ -26,6 +26,7 @@ pub mod nodes;
 pub mod page;
 pub mod projects;
 pub mod providers;
+pub mod tokens;
 pub mod users;
 pub mod vms;
 pub mod volumes;
@@ -96,6 +97,11 @@ pub fn routes() -> Router<AppState> {
             "/api/v1/users/{user_id}",
             axum::routing::patch(users::update_user).delete(users::delete_user),
         )
+        .route(
+            "/api/v1/tokens",
+            get(tokens::list_tokens).post(tokens::create_token),
+        )
+        .route("/api/v1/tokens/{token_id}", delete(tokens::revoke_token))
         .route("/api/v1/audit", get(audit::list_audit))
         .route("/api/v1/audit/verify", post(audit::verify_audit))
         .route("/api/v1/audit/{seq}", get(audit::get_audit_record))
