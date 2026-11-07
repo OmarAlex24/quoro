@@ -17,8 +17,15 @@
 --
 -- nodes.fence_ack_pending: an acknowledgement recorded by
 -- POST /api/v1/nodes/{node_id}/fence-ack that the node has not yet confirmed,
--- or NULL. JSON object {"acked_at": RFC 3339, "lease_ids": [lse_...]}. Cleared
--- when the node answers the fence_ack command with status ok.
+-- or NULL. JSON object
+--   {"acked_at": RFC 3339, "lease_ids": [lse_...],
+--    "fencing_tokens": {lse_...: integer}}
+-- From M5b, fencing_tokens holds the acknowledged token of each listed lease
+-- (node-agent-protocol.md section 8.5 step 3, ADR 0245, ADR 0247, ADR 0262).
+-- It is absent on a row a primary before ADR 0245 wrote; such a row is
+-- delivered without fencing_tokens. The ids leave the object when the node
+-- answers the fence_ack command with status ok, and the column is NULL once
+-- none is left.
 --
 -- Both columns are replicated state: they change through the change log like
 -- every other column of nodes.
