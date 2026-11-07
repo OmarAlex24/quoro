@@ -33,6 +33,7 @@ export default defineConfig({
           'webhooks',
           'interactive',
           'vulnerabilities',
+          'tokens',
         ],
       },
     },
