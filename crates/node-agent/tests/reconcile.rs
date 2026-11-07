@@ -2106,3 +2106,257 @@ async fn a_health_restart_under_an_expiring_lease_needs_the_start_margin() {
         "the restart's start gets the expiring lease's bound"
     );
 }
+/// The warm node's entry for a `warm` app's VM (section 5.11, ADR 0174):
+/// stopped, `standby`, bound to the app's lease and attaching its volume.
+fn standby_vm(vm_id: &str, lease_id: &str, token: u64, digest: &str) -> SpecVm {
+    SpecVm {
+        standby: true,
+        desired_status: DesiredStatus::Stopped,
+        image_digest: digest.to_owned(),
+        ..stateful_vm(
+            vm_id,
+            lease_id,
+            token,
+            vec![volume_attach("vol_w", "/data")],
+        )
+    }
+}
+
+/// The warm node's `spec.volumes` entry of that app's volume.
+fn warm_target_volume(token: u64) -> quoro_proto::wire::SpecVolumeFile {
+    let mut entry = spec_volume("vol_w", "app_w", 1, SpecVolumeState::Present);
+    entry.warm = Some(SpecWarm {
+        role: WarmRole::Target,
+        peer_node_id: "nod_source".to_owned(),
+        peer_address: "10.43.0.2".to_owned(),
+        port: 51822,
+        interval_s: 30,
+        lease_id: "lse_w".to_owned(),
+        fencing_token: token,
+    });
+    entry
+}
+
+/// Sections 5.11 and 6.4, ADR 0174: the node prepares a `standby` VM's image
+/// once and creates nothing else, even while it holds the VM's lease with the
+/// VM's token, and reports the VM `stopped`.
+#[tokio::test]
+async fn a_standby_vm_gets_its_image_and_is_never_created() {
+    let dir = TargetDir::new("standby-prepare");
+    let engine = Arc::new(RecordingEngine::new());
+    engine.inner().set_volume_dir(dir.path());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let (reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let mut reconciler = reconciler.with_lease_view(LeaseView::new(
+        local_lease_table("lse_w", "app_w", 3),
+        false,
+    ));
+
+    let snap = snapshot_full(
+        1,
+        vec![
+            standby_vm("vm_w", "lse_w", 3, "sha256:standby"),
+            spec_vm("vm_a", "prj_1", DesiredStatus::Running),
+        ],
+        Vec::new(),
+        vec![warm_target_volume(3)],
+    );
+    let statuses = reconciler.reconcile_once(Some(&snap)).await;
+
+    assert_eq!(engine.prepare_count("sha256:standby"), 1);
+    let created: Vec<String> = engine.created().into_iter().map(|spec| spec.id.0).collect();
+    assert_eq!(
+        created,
+        vec!["vm_a".to_owned()],
+        "only the plain VM is created"
+    );
+    assert!(matches!(
+        engine.inspect(&VmId("vm_w".to_owned())).await,
+        Err(EngineError::NotFound)
+    ));
+    let standby = statuses
+        .iter()
+        .find(|status| status.vm_id == "vm_w")
+        .unwrap_or_else(|| panic!("the standby VM is reported: {statuses:?}"));
+    assert_eq!(standby.observed_status, ObservedStatus::Stopped);
+    assert_eq!(standby.health, Health::Unknown);
+    assert!(standby.ip.is_none());
+    assert_eq!(store.applied_rev().await.unwrap(), 1);
+
+    // Another pass prepares nothing again; a new digest is prepared once.
+    reconciler.reconcile_once(Some(&snap)).await;
+    assert_eq!(engine.prepare_count("sha256:standby"), 1);
+    let moved = snapshot_full(
+        2,
+        vec![
+            standby_vm("vm_w", "lse_w", 3, "sha256:standby2"),
+            spec_vm("vm_a", "prj_1", DesiredStatus::Running),
+        ],
+        Vec::new(),
+        vec![warm_target_volume(3)],
+    );
+    reconciler.reconcile_once(Some(&moved)).await;
+    reconciler.reconcile_once(Some(&moved)).await;
+    assert_eq!(engine.prepare_count("sha256:standby2"), 1);
+    assert_eq!(engine.create_count(), 1, "still only the plain VM");
+    assert_eq!(store.applied_rev().await.unwrap(), 2);
+
+    // Once the entry leaves the spec, the node no longer reports the VM.
+    let gone = snapshot_full(
+        3,
+        vec![spec_vm("vm_a", "prj_1", DesiredStatus::Running)],
+        Vec::new(),
+        Vec::new(),
+    );
+    let statuses = reconciler.reconcile_once(Some(&gone)).await;
+    assert!(
+        statuses.iter().all(|status| status.vm_id != "vm_w"),
+        "{statuses:?}"
+    );
+}
+
+/// Section 6.6: a build's output is never pulled, so a `standby` VM of a
+/// built image is not prepared, and its revision still counts as applied.
+#[tokio::test]
+async fn a_standby_vm_of_a_built_image_is_never_pulled() {
+    let dir = TargetDir::new("standby-built");
+    let engine = Arc::new(RecordingEngine::new());
+    engine.inner().set_volume_dir(dir.path());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let (mut reconciler, _observed) = reconciler(engine.clone(), store.clone());
+
+    let mut built = standby_vm("vm_w", "lse_w", 3, "sha256:built");
+    built.image = "build.quoro.invalid/app_w:bld_1".to_owned();
+    built.build_id = Some("bld_1".to_owned());
+    let snap = snapshot_full(1, vec![built], Vec::new(), vec![warm_target_volume(3)]);
+    reconciler.reconcile_once(Some(&snap)).await;
+
+    assert_eq!(engine.prepare_count("sha256:built"), 0);
+    assert_eq!(engine.create_count(), 0);
+    assert_eq!(store.applied_rev().await.unwrap(), 1);
+}
+
+/// Section 6.2: a `standby` VM's image that cannot be prepared holds the
+/// revision back, like any image, and is not asked for again on the next
+/// pass.
+#[tokio::test]
+async fn a_standby_image_that_cannot_be_prepared_holds_the_revision() {
+    let dir = TargetDir::new("standby-failed");
+    let engine = Arc::new(RecordingEngine::new());
+    engine.inner().set_volume_dir(dir.path());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let (mut reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    engine.inner().fail_next(
+        FakeOp::PrepareImage,
+        EngineError::Image("the registry refused the pull".to_owned()),
+    );
+
+    let snap = snapshot_full(
+        1,
+        vec![standby_vm("vm_w", "lse_w", 3, "sha256:refused")],
+        Vec::new(),
+        vec![warm_target_volume(3)],
+    );
+    let statuses = reconciler.reconcile_once(Some(&snap)).await;
+    assert_eq!(engine.prepare_count("sha256:refused"), 1);
+    assert_eq!(store.applied_rev().await.unwrap(), 0);
+    assert!(
+        statuses
+            .iter()
+            .any(|status| status.vm_id == "vm_w"
+                && status.observed_status == ObservedStatus::Stopped),
+        "{statuses:?}"
+    );
+
+    reconciler.reconcile_once(Some(&snap)).await;
+    assert_eq!(
+        engine.prepare_count("sha256:refused"),
+        1,
+        "not asked again within the retry delay"
+    );
+    assert_eq!(store.applied_rev().await.unwrap(), 0);
+    assert_eq!(engine.create_count(), 0);
+}
+
+/// ADR 0174: `standby` alone keeps a VM from being created. Here the entry
+/// asks to run, the node holds its lease with its token and its volume is a
+/// plain ready one; without `standby` the same entry is created and started.
+#[tokio::test]
+async fn a_standby_vm_is_never_created_even_when_it_could_start() {
+    let dir = TargetDir::new("standby-held-lease");
+    let engine = Arc::new(RecordingEngine::new());
+    engine.inner().set_volume_dir(dir.path());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let (reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let mut reconciler = reconciler.with_lease_view(LeaseView::new(
+        local_lease_table("lse_1", "app_1", 1),
+        false,
+    ));
+
+    let mut vm = stateful_vm("vm_w", "lse_1", 1, vec![volume_attach("vol_data", "/data")]);
+    vm.standby = true;
+    assert_eq!(vm.desired_status, DesiredStatus::Running);
+    let volume = spec_volume("vol_data", "app_1", 1, SpecVolumeState::Present);
+    let snap = snapshot_full(1, vec![vm.clone()], Vec::new(), vec![volume.clone()]);
+    let statuses = reconciler.reconcile_once(Some(&snap)).await;
+
+    assert_eq!(engine.create_count(), 0);
+    assert!(engine.starts().is_empty());
+    assert!(
+        statuses
+            .iter()
+            .any(|status| status.vm_id == "vm_w"
+                && status.observed_status == ObservedStatus::Stopped),
+        "{statuses:?}"
+    );
+    assert_eq!(store.applied_rev().await.unwrap(), 1);
+
+    vm.standby = false;
+    let snap = snapshot_full(2, vec![vm], Vec::new(), vec![volume]);
+    reconciler.reconcile_once(Some(&snap)).await;
+    assert_eq!(engine.create_count(), 1, "the same entry, not standby");
+    assert_eq!(engine.starts().len(), 1);
+}
+
+/// A VM the engine already holds under a `standby` id is left as it is: not
+/// started, stopped or removed here. It holds the revision back until it is
+/// gone.
+#[tokio::test]
+async fn a_vm_the_engine_holds_under_a_standby_id_holds_the_revision() {
+    let dir = TargetDir::new("standby-existing");
+    let engine = Arc::new(RecordingEngine::new());
+    engine.inner().set_volume_dir(dir.path());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let (mut reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let id = engine.raw_running_vm("vm_w").await;
+    // The setup's own create and start, which the passes below must not add to.
+    let (created, started) = (engine.create_count(), engine.starts().len());
+
+    let snap = snapshot_full(
+        1,
+        vec![standby_vm("vm_w", "lse_w", 3, "sha256:standby")],
+        Vec::new(),
+        vec![warm_target_volume(3)],
+    );
+    for _ in 0..2 {
+        let statuses = reconciler.reconcile_once(Some(&snap)).await;
+        assert_eq!(store.applied_rev().await.unwrap(), 0);
+        assert!(
+            statuses.iter().any(|status| status.vm_id == "vm_w"
+                && status.observed_status == ObservedStatus::Running),
+            "reported as the engine sees it: {statuses:?}"
+        );
+    }
+    assert!(engine.stops().is_empty());
+    assert_eq!(engine.starts().len(), started);
+    assert_eq!(engine.create_count(), created);
+    assert_eq!(engine.prepare_count("sha256:standby"), 1);
+    assert!(engine.inspect(&id).await.is_ok(), "not deleted here");
+
+    engine.inner().crash(&id, "gone");
+    engine.inner().delete(&id).await.unwrap();
+    reconciler.reconcile_once(Some(&snap)).await;
+    assert_eq!(store.applied_rev().await.unwrap(), 1);
+    assert_eq!(engine.create_count(), created);
+    assert_eq!(engine.starts().len(), started);
+}

@@ -306,6 +306,7 @@ pub async fn build_spec(
             } else {
                 DesiredStatus::Stopped
             },
+            standby: false,
             restart_generation: u64::try_from(restart_generation.max(0)).unwrap_or(0),
             stateful,
             lease_id,

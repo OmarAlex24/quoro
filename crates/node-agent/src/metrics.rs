@@ -724,6 +724,7 @@ Buffers:          100000 kB
             env: BTreeMap::new(),
             health_check: None,
             desired_status: DesiredStatus::Running,
+            standby: false,
             restart_generation: 0,
             stateful: false,
             lease_id: None,

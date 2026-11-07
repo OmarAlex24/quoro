@@ -1885,16 +1885,11 @@ impl Session {
     }
 
     fn allocated(&self) -> Capacity {
-        let Some(snapshot) = &self.current else {
-            return Capacity::default();
-        };
-        let mut allocated = Capacity::default();
-        for vm in &snapshot.state.spec.vms {
-            allocated.cpus = allocated.cpus.saturating_add(vm.vcpus);
-            allocated.memory_mb = allocated.memory_mb.saturating_add(u64::from(vm.memory_mb));
-            allocated.disk_gb = allocated.disk_gb.saturating_add(u64::from(vm.disk_gb));
-        }
-        allocated
+        self.current
+            .as_ref()
+            .map_or_else(Capacity::default, |snapshot| {
+                allocated_by(&snapshot.state.spec.vms)
+            })
     }
 
     async fn send_status<S>(
@@ -2050,6 +2045,21 @@ struct LogsQuery {
     since: Option<i64>,
     until: Option<i64>,
     tail: Option<usize>,
+}
+
+/// What the VMs of a spec take on this node (`status_report.allocated`). A
+/// `standby` VM takes only its disk: its vCPUs and memory are needed only
+/// after a failover (ADR 0174).
+fn allocated_by(vms: &[wire::SpecVm]) -> Capacity {
+    let mut allocated = Capacity::default();
+    for vm in vms {
+        if !vm.standby {
+            allocated.cpus = allocated.cpus.saturating_add(vm.vcpus);
+            allocated.memory_mb = allocated.memory_mb.saturating_add(u64::from(vm.memory_mb));
+        }
+        allocated.disk_gb = allocated.disk_gb.saturating_add(u64::from(vm.disk_gb));
+    }
+    allocated
 }
 
 /// Parses one optional string member of a params object.
@@ -2790,15 +2800,19 @@ mod tests {
     }
 
     #[test]
-    fn allocated_capacity_sums_the_spec() {
-        // `allocated` only needs a snapshot; the totals are pure arithmetic.
-        let mut capacity = Capacity::default();
-        capacity.cpus += 2;
-        capacity.memory_mb += 512;
-        capacity.disk_gb += 4;
-        assert_eq!(capacity.cpus, 2);
-        assert_eq!(capacity.memory_mb, 512);
-        assert_eq!(capacity.disk_gb, 4);
+    fn allocated_capacity_sums_the_spec_and_a_standby_vm_takes_only_its_disk() {
+        let plain = vm_snapshot("sha256:a").state.spec.vms.remove(0);
+        let mut standby = plain.clone();
+        standby.vm_id = "vm_standby".to_owned();
+        standby.standby = true;
+        standby.desired_status = DesiredStatus::Stopped;
+        standby.vcpus = 4;
+        standby.memory_mb = 2048;
+        standby.disk_gb = 10;
+        let capacity = allocated_by(&[plain.clone(), plain, standby]);
+        assert_eq!(capacity.cpus, 4);
+        assert_eq!(capacity.memory_mb, 1024);
+        assert_eq!(capacity.disk_gb, 18);
     }
 
     struct TempDir(std::path::PathBuf);
@@ -3783,6 +3797,7 @@ mod tests {
                         env: std::collections::BTreeMap::new(),
                         health_check: None,
                         desired_status: DesiredStatus::Running,
+                        standby: false,
                         restart_generation: 0,
                         stateful: false,
                         lease_id: None,
