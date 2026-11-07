@@ -130,14 +130,36 @@ export const db: MockDb = {
 
 const timers = new Set<number>();
 
+/**
+ * How much slower than its default the mock runs what it simulates: builds,
+ * rollouts, convergence. `localStorage['quoro.mock.pace']`, 1 to 60, read on
+ * every call, so a demo can watch a deploy at a believable speed. Tests run
+ * without storage and keep the default.
+ */
+export const mockPace = (): number => {
+  try {
+    const raw = Number(globalThis.localStorage?.getItem('quoro.mock.pace') ?? '');
+    return Number.isFinite(raw) && raw >= 1 ? Math.min(60, raw) : 1;
+  } catch {
+    return 1;
+  }
+};
+
 /** Run `fn` later, so a test or a reset can see it as pending. */
 export const schedule = (fn: () => void, delay: number): void => {
   const id = window.setTimeout(() => {
     timers.delete(id);
     fn();
-  }, delay);
+  }, delay * mockPace());
   timers.add(id);
 };
+
+/** Newest first by `created_at`, the order the contract lists deployments and builds in. */
+export const newestFirst = <T extends { created_at: string }>(items: readonly T[]): T[] =>
+  items
+    .slice()
+    .reverse()
+    .sort((left, right) => Date.parse(right.created_at) - Date.parse(left.created_at));
 
 /**
  * Simulated convergence: the node reports each step, then settles on the
@@ -338,17 +360,23 @@ export const runDeployment = (
       vm: 'creating',
     },
     {
-      delay: 1_300,
+      delay: 1_100,
       status: 'preparing',
       phase: 'rootfs',
       message: 'Preparing the root filesystem',
     },
     {
-      delay: 2_100,
+      delay: 1_800,
       status: 'starting',
       phase: 'boot',
       message: 'Booting the microVM',
       vm: 'starting',
+    },
+    {
+      delay: 2_600,
+      status: 'starting',
+      phase: 'health',
+      message: `Waiting for the health check on port ${app?.port ?? 80}`,
     },
     {
       delay: 3_000,
@@ -399,6 +427,8 @@ const seed = (): void => {
   const createdAt = now();
   const hoursAgo = (hours: number): string =>
     new Date(Date.parse(createdAt) - hours * 3_600_000).toISOString();
+  const secondsAfter = (time: string, seconds: number): string =>
+    new Date(Date.parse(time) + seconds * 1_000).toISOString();
   const project: Project = {
     id: mockId('prj'),
     slug: 'blog',
@@ -471,14 +501,15 @@ const seed = (): void => {
     trigger: 'api',
     created_by_type: 'system',
     created_by_id: 'system',
-    created_at: createdAt,
-    finished_at: createdAt,
+    created_at: hoursAgo(2),
+    finished_at: secondsAfter(hoursAgo(2), 34),
   });
   db.deploymentLogs[deploymentId] = [
-    { time: createdAt, phase: 'pull', message: `Pulling ${app.image}` },
-    { time: createdAt, phase: 'rootfs', message: 'Preparing the root filesystem' },
-    { time: createdAt, phase: 'boot', message: 'Booting the microVM' },
-    { time: createdAt, phase: 'health', message: 'Health check passed; the app is running' },
+    { time: secondsAfter(hoursAgo(2), 0.2), phase: 'pull', message: `Pulling ${app.image}` },
+    { time: secondsAfter(hoursAgo(2), 4), phase: 'rootfs', message: 'Preparing the root filesystem' },
+    { time: secondsAfter(hoursAgo(2), 11), phase: 'boot', message: 'Booting the microVM' },
+    { time: secondsAfter(hoursAgo(2), 27), phase: 'health', message: 'Waiting for the health check on port 80' },
+    { time: secondsAfter(hoursAgo(2), 34), phase: 'health', message: 'Health check passed; the app is running' },
   ];
 
   db.vms.push({
@@ -683,6 +714,186 @@ const seedBuildLog = (
     vertex: entry.vertex,
     line: entry.line,
   }));
+};
+
+/** One Dockerfile step of a seeded build: its BuildKit name and how long it ran. */
+interface SeedStep {
+  name: string;
+  seconds: number;
+  cached?: boolean;
+}
+
+/**
+ * One past run of a seeded app: a build of `commit` that starts a deployment,
+ * or a deployment alone (`trigger` other than `build`). Times are seconds;
+ * `ago` is how long before the seed the run started. A `fail` stops the build
+ * in that step with that exit code, and nothing is deployed.
+ */
+interface SeedRun {
+  ago: number;
+  trigger?: Deployment['trigger'];
+  commit?: string;
+  queue?: number;
+  steps?: readonly SeedStep[];
+  fail?: { step: number; code: number };
+  /** Pull, rootfs, boot and health. */
+  deploy?: readonly [number, number, number, number];
+}
+
+const NODE_STEPS = (npmCi: number, npmBuild: number): SeedStep[] => [
+  { name: '[1/4] FROM docker.io/library/node:22-alpine', seconds: 0, cached: true },
+  { name: '[2/4] COPY package*.json ./', seconds: 0.4 },
+  { name: '[3/4] RUN npm ci', seconds: npmCi },
+  { name: '[4/4] RUN npm run build', seconds: npmBuild },
+];
+
+const iso = (ms: number): string => new Date(ms).toISOString();
+
+/**
+ * Seed an app's history, oldest run first, with the times the panel's deploy
+ * tape reads: each build's `created_at`, `started_at`, `finished_at` and its
+ * BuildKit lines (`vertex`, `time`); each deployment's progress lines
+ * (`time`, `phase`) and `finished_at`. The newest deployment that succeeded
+ * becomes the app's current one, with its image.
+ */
+const seedRuns = (app: App, runs: readonly SeedRun[], seededAt: number): void => {
+  let image = app.image;
+  for (const run of runs) {
+    const startedAt = seededAt - run.ago * 1_000;
+    let deployAt = startedAt;
+    let build: Build | null = null;
+
+    if (run.commit !== undefined && app.source) {
+      const buildId = mockId('bld');
+      const queued = startedAt;
+      const started = queued + (run.queue ?? 5) * 1_000;
+      const lines: BuildLogLine[] = [];
+      let clock = started;
+      const push = (vertex: number | null, line: string, stream: BuildLogLine['stream'] = 'stdout') =>
+        lines.push({ seq: lines.length + 1, time: iso(clock), stream, vertex, line });
+
+      push(1, '#1 [internal] load build definition from Dockerfile');
+      clock += 300;
+      push(1, '#1 transferring dockerfile: 412B done');
+      clock += 1_200;
+      push(2, '#2 [internal] load metadata for docker.io/library/node:22-alpine');
+      clock += 900;
+      push(2, '#2 DONE 0.9s');
+
+      let failedStep: Build['failed_step'] = null;
+      const steps = run.steps ?? [];
+      for (const [index, step] of steps.entries()) {
+        const vertex = index + 3;
+        push(vertex, `#${vertex} ${step.name}`);
+        if (step.cached) {
+          push(vertex, `#${vertex} CACHED`);
+          continue;
+        }
+        clock += step.seconds * 1_000;
+        if (run.fail?.step === index) {
+          const command = step.name.replace(/^\[[^\]]*\]\s*RUN\s*/, '');
+          const error = `process "/bin/sh -c ${command}" did not complete successfully: exit code: ${run.fail.code}`;
+          push(vertex, `#${vertex} ${step.seconds.toFixed(2)} npm error code ERESOLVE`, 'stderr');
+          push(vertex, `#${vertex} ERROR: ${error}`, 'stderr');
+          const dockerfile = steps.map((item, at) => {
+            const instruction = item.name.replace(/^\[[^\]]*\]\s*/, '');
+            return `${String(at + 1).padStart(4)} | ${at === index ? '>>> ' : ''}${instruction}`;
+          });
+          failedStep = {
+            vertex,
+            name: step.name,
+            error,
+            dockerfile_line: index + 1,
+            excerpt: [
+              `Dockerfile:${index + 1}`,
+              '--------------------',
+              ...dockerfile.slice(0, index + 1),
+              '--------------------',
+              `ERROR: failed to solve: ${error}`,
+            ],
+          };
+          break;
+        }
+        push(vertex, `#${vertex} DONE ${step.seconds.toFixed(1)}s`);
+      }
+
+      if (!failedStep) {
+        clock += 400;
+        push(null, `#${steps.length + 3} exporting to oci image format`);
+        clock += 1_800;
+        push(null, `#${steps.length + 3} writing image to the local store`);
+        clock += 400;
+        push(null, `#${steps.length + 3} DONE 2.6s`);
+      }
+
+      const builtImage = `build.quoro.invalid/${app.id}:${buildId}`;
+      build = {
+        id: buildId,
+        app_id: app.id,
+        node_id: app.placement.node_ids[0] ?? db.node.id,
+        source: app.source,
+        status: failedStep ? 'failed' : 'succeeded',
+        commit: run.commit,
+        image: failedStep ? null : builtImage,
+        image_digest: failedStep
+          ? null
+          : 'sha256:0c3e5a7b9d1f2a4c6e8b0d2f4a6c8e0b2d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2c',
+        failed_phase: failedStep ? 'building' : null,
+        error: failedStep ? failedStep.error : null,
+        failed_step: failedStep,
+        deployment_id: null,
+        trigger: 'api',
+        refresh_base: false,
+        created_by_type: 'system',
+        created_by_id: 'system',
+        created_at: iso(queued),
+        started_at: iso(started),
+        finished_at: iso(clock),
+      };
+      db.builds.push(build);
+      db.buildLogs[buildId] = lines;
+      if (failedStep) continue;
+      image = builtImage;
+      deployAt = clock + 800;
+    }
+
+    const [pull, rootfs, boot, health] = run.deploy ?? [5, 9, 14, 6];
+    const deploymentId = mockId('dep');
+    let clock = deployAt + 200;
+    const logs: DeploymentLogEntry[] = [];
+    logs.push({ time: iso(clock), phase: 'pull', message: `Pulling ${image}` });
+    clock += pull * 1_000;
+    logs.push({ time: iso(clock), phase: 'rootfs', message: 'Preparing the root filesystem' });
+    clock += rootfs * 1_000;
+    logs.push({ time: iso(clock), phase: 'boot', message: 'Booting the microVM' });
+    clock += boot * 1_000;
+    logs.push({
+      time: iso(clock),
+      phase: 'health',
+      message: `Waiting for the health check on port ${app.port}`,
+    });
+    clock += health * 1_000;
+    logs.push({ time: iso(clock), phase: 'health', message: 'Health check passed; the app is running' });
+
+    db.deployments.push({
+      id: deploymentId,
+      app_id: app.id,
+      image,
+      image_digest: 'sha256:0c3e5a7b9d1f2a4c6e8b0d2f4a6c8e0b2d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2c',
+      status: 'succeeded',
+      phase: 'health',
+      error: null,
+      trigger: run.trigger ?? (build ? 'build' : 'api'),
+      created_by_type: 'system',
+      created_by_id: 'system',
+      created_at: iso(deployAt),
+      finished_at: iso(clock),
+    });
+    db.deploymentLogs[deploymentId] = logs;
+    if (build) build.deployment_id = deploymentId;
+    app.current_deployment_id = deploymentId;
+    app.image = image;
+  }
 };
 
 /** A second app that builds from a public repository, with both outcomes. */
@@ -914,9 +1125,10 @@ const seedAtlas = (createdAt: string, repositoryId: string): void => {
     cold?: boolean;
     vcpus?: number;
     memoryMb?: number;
+    /** The app's history, oldest first; one image deploy 40 minutes ago by default. */
+    runs?: readonly SeedRun[];
   }): App => {
     const appId = mockId('app');
-    const deploymentId = mockId('dep');
     const replicas = input.replicas ?? 1;
     const nodes = replicas > 1 ? [db.node.id, lab4] : [lab4];
     const resources = {
@@ -939,31 +1151,13 @@ const seedAtlas = (createdAt: string, repositoryId: string): void => {
       resources,
       placement: { node_ids: nodes },
       status: 'running',
-      current_deployment_id: deploymentId,
+      current_deployment_id: null,
       restart_generation: 0,
       created_at: createdAt,
       updated_at: createdAt,
     };
     db.apps.push(app);
-    db.deployments.push({
-      id: deploymentId,
-      app_id: appId,
-      image: input.image,
-      image_digest:
-        'sha256:0c3e5a7b9d1f2a4c6e8b0d2f4a6c8e0b2d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2c',
-      status: 'succeeded',
-      phase: 'health',
-      error: null,
-      trigger: input.source ? 'build' : 'api',
-      created_by_type: 'system',
-      created_by_id: 'system',
-      created_at: createdAt,
-      finished_at: createdAt,
-    });
-    db.deploymentLogs[deploymentId] = [
-      { time: createdAt, phase: 'pull', message: `Pulling ${input.image}` },
-      { time: createdAt, phase: 'health', message: 'Health check passed; the app is running' },
-    ];
+    seedRuns(app, input.runs ?? [{ ago: 2_400, deploy: [5, 9, 14, 6] }], Date.parse(createdAt));
     nodes.forEach((nodeId, index) => {
       db.vms.push({
         id: mockId('vm'),
@@ -972,7 +1166,7 @@ const seedAtlas = (createdAt: string, repositoryId: string): void => {
         node_id: nodeId,
         name: `${input.name}-${index + 1}`,
         ...resources,
-        image: input.image,
+        image: app.image,
         desired_status: 'running',
         observed_status: 'running',
         ip: `10.0.1.${db.vms.length + 10}`,
@@ -998,34 +1192,6 @@ const seedAtlas = (createdAt: string, repositoryId: string): void => {
     secrets: [],
   });
 
-  const addBuild = (app: App, commit: string): void => {
-    if (!app.source) return;
-    const buildId = mockId('bld');
-    db.builds.push({
-      id: buildId,
-      app_id: app.id,
-      node_id: db.node.id,
-      source: app.source,
-      status: 'succeeded',
-      commit,
-      image: app.image,
-      image_digest:
-        'sha256:0c3e5a7b9d1f2a4c6e8b0d2f4a6c8e0b2d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2c',
-      failed_phase: null,
-      error: null,
-      failed_step: null,
-      deployment_id: app.current_deployment_id ?? null,
-      trigger: 'api',
-      refresh_base: false,
-      created_by_type: 'system',
-      created_by_id: 'system',
-      created_at: minutesAgo(40),
-      started_at: minutesAgo(40),
-      finished_at: minutesAgo(38),
-    });
-    seedBuildLog(buildId, [{ vertex: null, line: '#1 DONE 0.4s' }]);
-  };
-
   const webSource = gitSource('atlas-web');
   const web = addApp({
     name: 'web',
@@ -1033,8 +1199,16 @@ const seedAtlas = (createdAt: string, repositoryId: string): void => {
     port: 3000,
     replicas: 2,
     source: webSource,
+    runs: [
+      {
+        ago: 2_400,
+        commit: '7d41e0ab9c2f3e4d5a6b7c8d9e0f1a2b3c4d5e6f',
+        queue: 4,
+        steps: NODE_STEPS(36, 22),
+        deploy: [5, 10, 16, 8],
+      },
+    ],
   });
-  addBuild(web, '7d41e0ab9c2f3e4d5a6b7c8d9e0f1a2b3c4d5e6f');
   db.domains.push({
     id: mockId('dom'),
     app_id: web.id,
@@ -1047,14 +1221,54 @@ const seedAtlas = (createdAt: string, repositoryId: string): void => {
     created_at: createdAt,
   });
 
+  // The api's history, as the deploy reference draws it: three good builds,
+  // one that broke in `npm ci`, and a redeploy in between.
   const api = addApp({
     name: 'api',
     image: 'build.quoro.invalid/atlas-api',
     port: 3000,
     replicas: 2,
-    source: gitSource('atlas-api'),
+    source: { ...gitSource('atlas-api'), secrets: ['SESSION_SECRET'] },
+    runs: [
+      {
+        ago: 266_400,
+        commit: '2d8f3b0c4e6a8c0e2b4d6f8a0c2e4b6d8f0a2c4e',
+        queue: 5,
+        steps: NODE_STEPS(45, 13),
+        deploy: [5, 13, 19, 11],
+      },
+      {
+        ago: 180_000,
+        commit: '9b1e07d4c2a6e8f0b3d5a7c9e1f3b5d7a9c1e3f5',
+        queue: 7,
+        steps: NODE_STEPS(52, 15),
+        deploy: [6, 11, 22, 9],
+      },
+      {
+        ago: 93_600,
+        commit: '1c44a2e9f7d5b3a1c9e7f5d3b1a9c7e5f3d1b9a7',
+        queue: 5,
+        steps: NODE_STEPS(31, 0),
+        fail: { step: 2, code: 1 },
+      },
+      { ago: 18_000, trigger: 'redeploy', deploy: [3, 4, 8, 4] },
+      {
+        ago: 10_800,
+        commit: '4f2a9c1e8b7d6c5a4f3e2d1c0b9a8f7e6d5c4b3a',
+        queue: 6,
+        steps: NODE_STEPS(48, 14),
+        deploy: [6, 12, 20, 10],
+      },
+    ],
   });
-  addBuild(api, '4f2a9c1e8b7d6c5a4f3e2d1c0b9a8f7e6d5c4b3a');
+  // Names and when each was set; the values never come back.
+  const seededAt = Date.parse(now());
+  db.appEnv[api.id] = [
+    { app_id: api.id, name: 'DATABASE_URL', updated_at: iso(seededAt - 266_400_000) },
+    { app_id: api.id, name: 'REDIS_URL', updated_at: iso(seededAt - 266_400_000) },
+    { app_id: api.id, name: 'SESSION_SECRET', updated_at: iso(seededAt - 180_000_000) },
+    { app_id: api.id, name: 'LOG_LEVEL', updated_at: iso(seededAt - 20_000) },
+  ];
 
   addApp({ name: 'worker', image: 'ghcr.io/example/atlas-worker:1.8', port: 8080 });
 

@@ -39,6 +39,10 @@ export const PROJECT_TABS = [
 ] as const;
 export type ProjectTab = (typeof PROJECT_TABS)[number];
 
+/** The tab an open service shows: the one in the URL, Deployments when none is. */
+export const sheetTab = (search: Pick<ProjectSearch, 'tab'>): ProjectTab =>
+  search.tab ?? 'deployments';
+
 /** The project rail: canvas, metrics, logs and settings. No value means the canvas. */
 export const PROJECT_VIEWS = ['canvas', 'metrics', 'logs', 'settings'] as const;
 export type ProjectView = (typeof PROJECT_VIEWS)[number];

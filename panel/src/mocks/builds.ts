@@ -14,7 +14,7 @@ import type {
   BuildLogLine,
   LogStreamName,
 } from '../api/generated/model';
-import { db, findApp, mockId, now, runDeployment, schedule } from './db';
+import { db, findApp, mockId, newestFirst, now, runDeployment, schedule } from './db';
 
 const TERMINAL = new Set<Build['status']>([
   'succeeded',
@@ -30,10 +30,7 @@ export const findBuild = (buildId: string): Build | undefined =>
 
 /** Newest first, as the contract serves a build list. */
 export const appBuilds = (appId: string): Build[] =>
-  db.builds
-    .filter((build) => build.app_id === appId)
-    .slice()
-    .reverse();
+  newestFirst(db.builds.filter((build) => build.app_id === appId));
 
 export const hasLiveBuild = (appId: string): boolean =>
   db.builds.some(
@@ -157,19 +154,28 @@ export const startMockBuild = (app: App, refOverride?: string): Build => {
       '#2 [internal] load metadata for docker.io/library/node:22-alpine',
     );
   });
+  // When each step began, so its DONE line says how long it really took.
+  const began = new Map<number, number>();
+  const begin = (current: Build, vertex: number, text: string) => {
+    began.set(vertex, Date.now());
+    appendLine(current.id, vertex, `#${vertex} ${text}`);
+  };
+  const done = (current: Build, vertex: number) => {
+    const seconds = (Date.now() - (began.get(vertex) ?? Date.now())) / 1_000;
+    appendLine(current.id, vertex, `#${vertex} DONE ${seconds.toFixed(1)}s`);
+  };
+
   cue(1_000, (current) => {
     current.status = 'building';
     current.commit = commit;
-    appendLine(current.id, 3, '#3 [1/4] FROM docker.io/library/node:22-alpine');
+    begin(current, 3, '[1/4] FROM docker.io/library/node:22-alpine');
+    appendLine(current.id, 3, '#3 CACHED');
   });
-  cue(1_250, (current) => {
-    appendLine(current.id, 3, '#3 DONE 0.0s');
+  cue(1_020, (current) => {
+    begin(current, 4, '[2/4] COPY package.json package-lock.json ./');
   });
-  cue(1_500, (current) => {
-    appendLine(current.id, 4, '#4 [2/4] COPY package.json package-lock.json ./');
-  });
-  cue(1_750, (current) => {
-    appendLine(current.id, 4, '#4 DONE 0.1s');
+  cue(1_050, (current) => {
+    done(current, 4);
   });
 
   if (shouldFail) {
@@ -202,21 +208,22 @@ export const startMockBuild = (app: App, refOverride?: string): Build => {
     return build;
   }
 
-  cue(2_000, (current) => {
-    appendLine(current.id, 5, '#5 [3/4] RUN npm ci');
+  cue(1_080, (current) => {
+    begin(current, 5, '[3/4] RUN npm ci');
   });
-  cue(2_400, (current) => {
-    appendLine(current.id, 5, '#5 DONE 2.4s');
+  cue(2_200, (current) => {
+    appendLine(current.id, 5, '#5 11.92 added 312 packages, and audited 313 packages in 11s');
   });
-  cue(2_700, (current) => {
+  cue(2_750, (current) => {
+    done(current, 5);
+    begin(current, 6, '[4/4] RUN npm run build');
+  });
+  cue(3_350, (current) => {
+    done(current, 6);
     current.status = 'exporting';
-    appendLine(current.id, 6, '#6 [4/4] RUN npm run build');
-  });
-  cue(3_100, (current) => {
-    appendLine(current.id, 6, '#6 DONE 1.8s');
     appendLine(current.id, null, '#7 exporting to oci image format');
   });
-  cue(3_300, (current) => {
+  cue(3_550, (current) => {
     current.status = 'importing';
     appendLine(current.id, null, '#7 writing image to the local store');
   });

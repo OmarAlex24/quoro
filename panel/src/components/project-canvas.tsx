@@ -79,10 +79,13 @@ interface Pan {
 export function ProjectCanvas({
   projectId,
   project,
+  selected,
   onAdd,
 }: {
   projectId: string;
   project?: Project;
+  /** The service open in the sheet, by its key; its card is marked. */
+  selected?: string;
   /** Opens the Add menu; absent for a session that cannot write. */
   onAdd?: () => void;
 }) {
@@ -334,6 +337,7 @@ export function ProjectCanvas({
       <VmCard vm={service.vm} nodeNames={nodeNames} />
     ) : (
       <AppCard
+        selected={selected === service.key}
         app={service.app}
         builds={builds[service.app.id]}
         nodeIds={vms.filter((vm) => vm.app_id === service.app.id).map((vm) => vm.node_id)}

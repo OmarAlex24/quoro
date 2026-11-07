@@ -7,19 +7,19 @@ import { useListProjects } from '../api/generated/projects/projects';
 import { useGetVm } from '../api/generated/vms/vms';
 import { problemView } from '../lib/problem';
 import { PROJECT_LIST_PARAMS } from '../lib/projects';
-import type { AddKind } from '../lib/routes';
+import { sheetTab, type AddKind } from '../lib/routes';
+import { appKey } from '../lib/services';
 import { useSession } from '../session';
 import { CommandMenu } from '../components/command-menu';
 import { CreateSheet } from '../components/create-sheet';
 import { AppMetricsBay } from '../components/metrics-bay';
 import { LogTape } from '../components/log-tape';
 import { ProjectCanvas } from '../components/project-canvas';
+import { ServiceSheet } from '../components/service-sheet';
 import { ProjectShell } from '../components/shell/project-shell';
 import { SessionGate } from '../components/shell/side-shell';
 import { Button } from '../components/ui/button';
 import { ProblemBanner } from '../components/ui/problem-banner';
-import { AppScreen } from './app-screen';
-import { BuildScreen } from './build-screen';
 import { VmsScreen } from './vms-screen';
 
 const projectRoute = getRouteApi('/projects/$projectId');
@@ -27,9 +27,9 @@ const projectRoute = getRouteApi('/projects/$projectId');
 /**
  * `/projects/$projectId`: the project's top bar and rail around what is open.
  * The canvas shows the project's services; `?add=` opens a create sheet over
- * it. Until the service sheet arrives, an open service shows the screen that
- * held it before: the app screen for `?app=`, the build screen for
- * `?app=&build=`, the VM bay for `?vm=`.
+ * it and `?app=` the service sheet, on the tab in `?tab=` and the build in
+ * `?build=`. The canvas stays behind the service sheet. `?vm=` still shows
+ * the VM bay that held a VM before.
  */
 export function ProjectScreen() {
   return (
@@ -59,9 +59,10 @@ function ProjectPage() {
     query: { enabled: search.app === undefined && search.vm !== undefined, retry: false },
   });
   const leaf = search.app ? appQuery.data?.name : search.vm ? vmQuery.data?.name : undefined;
-  const onCanvas = !missing && !search.app && !search.vm && view === 'canvas';
-  const sheet = canWrite && onCanvas ? search.add : undefined;
-  const canAdd = canWrite && onCanvas;
+  const serviceApp = missing ? undefined : search.app;
+  const onCanvas = !missing && !search.vm && view === 'canvas';
+  const sheet = canWrite && onCanvas && !serviceApp ? search.add : undefined;
+  const canAdd = canWrite && onCanvas && !serviceApp;
   const shortcut = canAdd && sheet === undefined;
 
   // Cmd+K (Ctrl+K elsewhere) opens the Add menu while the canvas is in view
@@ -83,14 +84,25 @@ function ProjectPage() {
   // A sheet opens only over the canvas, which has no other search state.
   const closeSheet = () =>
     void navigate({ to: '/projects/$projectId', params: { projectId }, search: {} });
+  // Closing the service sheet goes back to what was behind it and puts focus
+  // on the card that opened it.
+  const closeService = () => {
+    const key = serviceApp ? appKey(serviceApp) : null;
+    void navigate({
+      to: '/projects/$projectId',
+      params: { projectId },
+      search: view === 'canvas' ? {} : { view },
+    }).then(() => {
+      if (!key) return;
+      requestAnimationFrame(() => {
+        document.querySelector<HTMLElement>(`[data-service="${CSS.escape(key)}"]`)?.focus();
+      });
+    });
+  };
 
   let content: ReactNode;
   if (missing) {
     content = <ProjectMissing />;
-  } else if (search.app && search.build) {
-    content = <BuildScreen key={search.build} appId={search.app} buildId={search.build} />;
-  } else if (search.app) {
-    content = <AppScreen key={search.app} appId={search.app} />;
   } else if (search.vm) {
     content = <VmsScreen key={search.vm} projectId={projectId} vmId={search.vm} />;
   } else if (view === 'metrics') {
@@ -105,6 +117,7 @@ function ProjectPage() {
         key={projectId}
         projectId={projectId}
         project={project}
+        selected={serviceApp ? appKey(serviceApp) : undefined}
         onAdd={canAdd ? () => setMenuOpen(true) : undefined}
       />
     );
@@ -125,6 +138,15 @@ function ProjectPage() {
       ) : null}
       {sheet ? (
         <CreateSheet key={sheet} kind={sheet} projectId={projectId} onClose={closeSheet} />
+      ) : null}
+      {serviceApp ? (
+        <ServiceSheet
+          projectId={projectId}
+          appId={serviceApp}
+          tab={sheetTab(search)}
+          buildId={search.build}
+          onClose={closeService}
+        />
       ) : null}
     </ProjectShell>
   );

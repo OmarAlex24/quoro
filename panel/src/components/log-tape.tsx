@@ -27,15 +27,12 @@ const statusWords: Record<TapeStatus, string> = {
   stopped: 'Stopped',
 };
 
-const RULING =
-  'repeating-linear-gradient(to bottom, transparent 0, transparent 19px, color-mix(in oklab, var(--line) 55%, transparent) 19px, color-mix(in oklab, var(--line) 55%, transparent) 20px)';
-
 /**
- * The recorder tape: a recessed bay holding light paper with a faint ruling
- * per line. The time column stays in the panel's data face; only the log line
- * itself uses a monospace stack.
+ * An app's live log in the shared log body: each line with its time, stderr
+ * in the fault colour. Follow keeps the newest line in view; Pause holds the
+ * view still while lines keep arriving.
  */
-export function LogTape({ appId }: { appId: string }) {
+export function LogTape({ appId, tall = false }: { appId: string; tall?: boolean }) {
   const [lines, setLines] = useState<LogEntry[]>([]);
   const [status, setStatus] = useState<TapeStatus>('connecting');
   const [problem, setProblem] = useState<ProblemView | null>(null);
@@ -214,53 +211,36 @@ export function LogTape({ appId }: { appId: string }) {
         </div>
       </div>
 
-      <div className="mt-2 rounded-[10px] border border-line bg-sunk p-1.5">
-        <div
-          ref={tapeRef}
-          role="log"
-          aria-live={paused ? 'off' : 'polite'}
-          aria-label="Live app logs"
-          onScroll={(event) => {
-            const element = event.currentTarget;
-            const atBottom =
-              element.scrollHeight - element.scrollTop - element.clientHeight < 24;
-            setFollow(atBottom);
-          }}
-          className="h-[280px] overflow-y-auto bg-surface px-2 py-2 sm:h-[360px]"
-          style={{ backgroundImage: RULING }}
-        >
-          {lines.length === 0 ? (
-            <p className="px-1 py-2 text-[13px] leading-snug text-ink-2">
-              Waiting for output. Lines appear here as the app writes to stdout or stderr.
-            </p>
-          ) : (
-            lines.map((entry, index) => (
-              <div
-                key={`${entry.time}-${entry.vm_id}-${index}`}
-                className={cn(
-                  'relative grid grid-cols-[84px_minmax(0,1fr)] items-baseline gap-2 leading-5',
-                  entry.stream === 'stderr' && 'pl-2',
-                )}
-              >
-                {entry.stream === 'stderr' ? (
-                  <span
-                    aria-hidden="true"
-                    className="absolute bottom-0 left-0 top-0 w-[3px] bg-fault"
-                  />
-                ) : null}
-                <span
-                  className="type-data truncate text-[12px] text-ink-2"
-                  title={entry.time}
-                >
-                  {formatLogTime(entry.time)}
-                </span>
-                <span className="type-code whitespace-pre-wrap break-words text-[11.5px] text-ink">
-                  {entry.line}
-                </span>
-              </div>
-            ))
-          )}
-        </div>
+      <div
+        ref={tapeRef}
+        role="log"
+        aria-live={paused ? 'off' : 'polite'}
+        aria-label="Live app logs"
+        onScroll={(event) => {
+          const element = event.currentTarget;
+          const atBottom = element.scrollHeight - element.scrollTop - element.clientHeight < 24;
+          setFollow(atBottom);
+        }}
+        className={cn(
+          'logs mt-2 overflow-y-auto',
+          tall ? 'h-[max(320px,calc(100dvh-300px))]' : 'h-[280px] sm:h-[360px]',
+        )}
+      >
+        {lines.length === 0 ? (
+          <p className="logs-empty">
+            Waiting for output. Lines appear here as the app writes to stdout or stderr.
+          </p>
+        ) : (
+          lines.map((entry, index) => (
+            <div key={`${entry.time}-${entry.vm_id}-${index}`}>
+              <span className="ts" title={entry.time}>
+                {formatLogTime(entry.time)}
+              </span>
+              <span className={entry.stream === 'stderr' ? 'er' : undefined}>{entry.line}</span>
+              {entry.stream === 'stderr' ? <span className="sr-only"> (stderr)</span> : null}
+            </div>
+          ))
+        )}
       </div>
     </section>
   );

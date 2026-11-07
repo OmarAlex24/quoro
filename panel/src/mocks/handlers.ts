@@ -65,6 +65,7 @@ import {
   findDeployment,
   mockHaCost,
   mockId,
+  newestFirst,
   now,
   runDeployment,
   schedule,
@@ -1014,10 +1015,9 @@ export const handlers = [
     if (!app) {
       return problem(404, 'not_found', { detail: 'That app no longer exists.' });
     }
-    const items = db.deployments
-      .filter((deployment) => deployment.app_id === app.id)
-      .slice()
-      .reverse();
+    const items = newestFirst(
+      db.deployments.filter((deployment) => deployment.app_id === app.id),
+    );
     const list: DeploymentList = { items, next_cursor: null };
     return json(list);
   }),

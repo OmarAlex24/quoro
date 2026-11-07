@@ -33,12 +33,15 @@ export function BuildView({
   appName,
   canWrite,
   onBuildChanged,
+  sheet,
 }: {
   build: Build;
   appId: string;
   appName: string;
   canWrite: boolean;
   onBuildChanged: (build: Build) => void;
+  /** Hosted in a project's service sheet: the app is already open, its deployments one tab away. */
+  sheet?: { projectId: string };
 }) {
   const [problem, setProblem] = useState<ProblemView | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -90,11 +93,13 @@ export function BuildView({
               {cancel.isPending ? 'Cancelling…' : 'Cancel build'}
             </Button>
           ) : null}
-          <Button variant="ghost" asChild>
-            <Link to="/apps/$appId" params={{ appId }}>
-              Open the app
-            </Link>
-          </Button>
+          {sheet ? null : (
+            <Button variant="ghost" asChild>
+              <Link to="/apps/$appId" params={{ appId }}>
+                Open the app
+              </Link>
+            </Button>
+          )}
         </div>
       </div>
 
@@ -168,9 +173,19 @@ export function BuildView({
             <span className="type-code">{shortDeploymentId(build.deployment_id)}</span>.
           </p>
           <Button variant="ghost" className="px-2.5" asChild>
-            <Link to="/apps/$appId" params={{ appId }}>
-              Open the deployment
-            </Link>
+            {sheet ? (
+              <Link
+                to="/projects/$projectId"
+                params={{ projectId: sheet.projectId }}
+                search={{ app: appId, tab: 'deployments' }}
+              >
+                Open the deployment
+              </Link>
+            ) : (
+              <Link to="/apps/$appId" params={{ appId }}>
+                Open the deployment
+              </Link>
+            )}
           </Button>
         </div>
       ) : null}

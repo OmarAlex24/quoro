@@ -1657,6 +1657,712 @@
     overflow-y: auto;
   }
 
+  /*
+   * The service sheet: an app opened from the canvas, under the top bar, the
+   * canvas live behind it. Full screen on a phone.
+   */
+  .sheet.svc-sheet {
+    top: 62px;
+    z-index: 40;
+    width: min(700px, calc(100vw - 20px));
+  }
+
+  .sheet.svc-sheet:focus {
+    outline: none;
+  }
+
+  .sh-head {
+    display: grid;
+    gap: 10px;
+    padding: 22px 26px 14px;
+  }
+
+  .sh-title {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+  }
+
+  .sh-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-stretch: 112%;
+    font-weight: 640;
+    font-size: 21px;
+    letter-spacing: -0.006em;
+    line-height: 1.2;
+  }
+
+  .sh-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 12px;
+    padding-left: 46px;
+    color: var(--ink-2);
+    font-size: 13px;
+  }
+
+  .sh-state {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    color: var(--ink);
+  }
+
+  .tabs.sh-tabs {
+    flex-wrap: nowrap;
+    padding: 0 26px;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .tabs.sh-tabs a {
+    flex: none;
+  }
+
+  .sh-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    align-content: start;
+    gap: 16px;
+    padding: 18px 26px 26px;
+  }
+
+  .metaline {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 14px;
+    min-width: 0;
+    font-size: 12.5px;
+    color: var(--ink-2);
+  }
+
+  .metaline > span {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 100%;
+  }
+
+  .metaline svg {
+    width: 14px;
+    height: 14px;
+    flex: none;
+    color: var(--ink-3);
+  }
+
+  .box {
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background-color: var(--surface);
+  }
+
+  .box-live {
+    border-color: color-mix(in oklab, var(--shift) 40%, var(--line));
+  }
+
+  .box-danger {
+    border-color: color-mix(in oklab, var(--fault) 35%, var(--line));
+  }
+
+  .box-h {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 14px;
+  }
+
+  .box-t {
+    display: grid;
+    gap: 1px;
+    min-width: 0;
+    flex: 1;
+  }
+
+  .box-t b {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 580;
+    font-size: 13.5px;
+  }
+
+  .box-t small {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 2px 6px;
+    min-width: 0;
+    font-size: 12px;
+    color: var(--ink-2);
+  }
+
+  .box-t .avatar {
+    width: 16px;
+    height: 16px;
+  }
+
+  .box-t .avatar-human {
+    font-size: 7.5px;
+  }
+
+  .box-t .avatar-agent,
+  .box-t .avatar-system {
+    border-radius: 4px;
+  }
+
+  .box-b {
+    border-top: 1px solid var(--line);
+    padding: 16px 16px 14px;
+  }
+
+  .box-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 14px;
+    border-top: 1px solid var(--line);
+    color: var(--ink);
+    text-decoration: none;
+  }
+
+  .box-row:first-child {
+    border-top: 0;
+  }
+
+  .box-row .box-t b {
+    font-weight: 540;
+    font-size: 13px;
+  }
+
+  a.box-row:hover {
+    background-color: color-mix(in oklab, var(--raised) 55%, transparent);
+  }
+
+  a.box-row:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+    border-radius: 9px;
+  }
+
+  .row-go {
+    width: 16px;
+    height: 16px;
+    flex: none;
+    color: var(--ink-3);
+  }
+
+  .hist-h {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 2px;
+    font-size: 12px;
+    font-weight: 560;
+    color: var(--ink-2);
+    cursor: pointer;
+    list-style: none;
+  }
+
+  .hist-h::-webkit-details-marker {
+    display: none;
+  }
+
+  .hist-h svg {
+    width: 12px;
+    height: 12px;
+    transition: transform 120ms ease;
+  }
+
+  details:not([open]) > .hist-h svg {
+    transform: rotate(-90deg);
+  }
+
+  /* The live run: one sentence and a clock. */
+  .phase-h {
+    display: flex;
+    align-items: flex-end;
+    gap: 12px;
+    margin-bottom: 12px;
+  }
+
+  .phase-h > div:first-child {
+    flex: 1;
+  }
+
+  .phase-h b {
+    display: block;
+    font-stretch: 108%;
+    font-weight: 620;
+    font-size: 17px;
+    letter-spacing: -0.004em;
+  }
+
+  .phase-h small {
+    font-size: 12px;
+    color: var(--ink-2);
+  }
+
+  .elapsed {
+    flex: none;
+    text-align: right;
+  }
+
+  .elapsed b {
+    font-weight: 600;
+    font-size: 26px;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.01em;
+  }
+
+  .elapsed small {
+    display: block;
+    margin-top: 4px;
+    font-size: 11.5px;
+  }
+
+  /* The steps, equal widths: done, the one running, the ones to come. */
+  .stepper {
+    display: grid;
+    grid-template-columns: repeat(var(--n, 6), minmax(0, 1fr));
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    overflow: hidden;
+    background-color: var(--surface);
+  }
+
+  .stp {
+    position: relative;
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+    padding: 8px 10px 9px;
+    border-left: 1px solid var(--line);
+  }
+
+  .stp:first-child {
+    border-left: 0;
+  }
+
+  .stp .sweep {
+    --dc: var(--shift);
+  }
+
+  .stp-n {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+    font-size: 11.5px;
+    color: var(--ink-2);
+    white-space: nowrap;
+  }
+
+  .stp-n svg {
+    width: 12px;
+    height: 12px;
+    flex: none;
+    color: var(--run);
+  }
+
+  .stp-v {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: 13px;
+    font-weight: 580;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  .stp-live {
+    background-color: color-mix(in oklab, var(--shift) 10%, var(--surface));
+  }
+
+  .stp-live .stp-v {
+    color: color-mix(in oklab, var(--shift) 72%, var(--ink));
+  }
+
+  .stp-next .stp-v,
+  .stp-skip .stp-v {
+    color: var(--ink-3);
+    font-weight: 500;
+  }
+
+  .stp-fail {
+    background-color: color-mix(in oklab, var(--fault) 10%, var(--surface));
+  }
+
+  .stp-fail .stp-n svg,
+  .stp-fail .stp-v {
+    color: var(--fault);
+  }
+
+  .stp-stop .stp-v {
+    color: var(--ink-2);
+  }
+
+  /* Where the time went, to scale. */
+  .tape {
+    display: flex;
+    gap: 2px;
+    height: 10px;
+    margin-top: 10px;
+  }
+
+  .tape-seg {
+    flex-basis: 0;
+    min-width: 2px;
+    height: 10px;
+    border-radius: 2px;
+    overflow: hidden;
+  }
+
+  .tape-seg canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+
+  .tape-ghost {
+    --dc: var(--ink-3);
+    flex-basis: 0;
+    border-radius: 2px;
+  }
+
+  .tape-k {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 2px 12px;
+    margin-top: 6px;
+    font-size: 11px;
+    color: var(--ink-3);
+  }
+
+  /* The build's Dockerfile steps, each with its share and its span. */
+  .bsteps {
+    display: grid;
+    grid-template-columns: minmax(0, auto) minmax(60px, 1fr) 54px;
+    align-items: center;
+    gap: 7px 12px;
+    margin-top: 16px;
+    padding-top: 12px;
+    border-top: 1px solid var(--line);
+    font-size: 12px;
+  }
+
+  .bsteps-h {
+    grid-column: 1 / -1;
+    font-size: 11.5px;
+    font-weight: 560;
+    color: var(--ink-2);
+  }
+
+  .bs {
+    display: contents;
+  }
+
+  .bs-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--font-mono);
+    font-stretch: 87.5%;
+    font-weight: 430;
+    font-size: 10.5px;
+    color: var(--ink);
+  }
+
+  .bs canvas {
+    display: block;
+    width: 100%;
+    height: 6px;
+  }
+
+  .bs-d {
+    text-align: right;
+    color: var(--ink-2);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  .minitape {
+    display: flex;
+    gap: 1.5px;
+    width: 118px;
+    height: 6px;
+    flex: none;
+  }
+
+  .minitape i {
+    display: block;
+    flex-basis: 0;
+    min-width: 1.5px;
+    height: 6px;
+    border-radius: 1px;
+    background-color: color-mix(in oklab, var(--accent) 75%, transparent);
+  }
+
+  .minitape i.mt-f {
+    background-color: var(--fault);
+  }
+
+  .minitape i.mt-l {
+    background-color: var(--shift);
+  }
+
+  .minitape i.mt-s {
+    background-color: var(--idle);
+  }
+
+  .minitape i.mt-g {
+    background-color: var(--line);
+  }
+
+  .progress-lines {
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid var(--line);
+  }
+
+  .progress-lines > summary {
+    width: fit-content;
+    cursor: pointer;
+    font-size: 12.5px;
+    color: var(--ink-2);
+    user-select: none;
+  }
+
+  .progress-lines > summary:hover {
+    color: var(--ink);
+  }
+
+  /* One plain line said once, on a sunk ground. */
+  .notice {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    background-color: var(--sunk);
+    border: 1px solid var(--line);
+    font-size: 12.5px;
+    color: var(--ink-2);
+  }
+
+  .notice svg {
+    width: 16px;
+    height: 16px;
+    flex: none;
+    margin-top: 1px;
+    color: var(--ink-3);
+  }
+
+  /* A variable by name: the value never comes back, so there is none to show. */
+  .keyrow {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 12px;
+    min-height: 44px;
+    padding: 9px 14px;
+    border-top: 1px solid var(--line);
+  }
+
+  .keyrow:first-child {
+    border-top: 0;
+  }
+
+  .keyrow-name {
+    width: 190px;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 12px;
+    color: var(--ink);
+  }
+
+  .keyrow-when {
+    flex: 1;
+    font-size: 12px;
+    color: var(--ink-2);
+  }
+
+  /* The log body every stream shares: app logs, build logs, progress lines. */
+  .logs {
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background-color: var(--sunk);
+    font-family: var(--font-mono);
+    font-stretch: 87.5%;
+    font-size: 11px;
+    line-height: 1.75;
+    color: var(--ink-2);
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+  }
+
+  .logs .ts {
+    margin-right: 10px;
+    color: var(--ink-3);
+    white-space: nowrap;
+  }
+
+  .logs .er {
+    color: var(--fault);
+  }
+
+  .logs-empty {
+    font-family: var(--font-sans);
+    font-stretch: 100%;
+    font-size: 12.5px;
+    white-space: normal;
+  }
+
+  /* Settings: groups of rows, each with a plain heading. */
+  .set-group {
+    display: grid;
+    gap: 10px;
+  }
+
+  .set-h {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ink);
+  }
+
+  .set-lede {
+    margin-top: -4px;
+    font-size: 12.5px;
+    color: var(--ink-2);
+  }
+
+  .set-rows {
+    display: grid;
+  }
+
+  .set-row {
+    display: grid;
+    grid-template-columns: 140px minmax(0, 1fr);
+    gap: 12px;
+    padding: 9px 14px;
+    border-top: 1px solid var(--line);
+    font-size: 13px;
+  }
+
+  .set-row:first-child {
+    border-top: 0;
+  }
+
+  .set-row dt {
+    color: var(--ink-2);
+  }
+
+  .set-row dd {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    color: var(--ink);
+  }
+
+  .set-host:empty {
+    display: none;
+  }
+
+  /* The card open in the service sheet. */
+  .svc[data-selected] {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent) 22%, transparent);
+  }
+
+  @media (max-width: 767.98px) {
+    .sheet.svc-sheet {
+      inset: 0;
+      width: auto;
+      z-index: 50;
+      border: 0;
+      border-radius: 0;
+    }
+
+    .sh-head {
+      padding: 16px 16px 12px;
+    }
+
+    .sh-meta {
+      padding-left: 0;
+    }
+
+    .tabs.sh-tabs {
+      padding: 0 16px;
+      gap: 0 18px;
+    }
+
+    .sh-body {
+      padding: 16px 16px 24px;
+    }
+  }
+
+  @media (max-width: 559.98px) {
+    .stepper[data-n='6'] {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .stepper[data-n='4'] {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .stepper[data-n='6'] .stp:nth-child(3n + 1),
+    .stepper[data-n='4'] .stp:nth-child(2n + 1) {
+      border-left: 0;
+    }
+
+    .stepper[data-n='6'] .stp:nth-child(n + 4),
+    .stepper[data-n='4'] .stp:nth-child(n + 3) {
+      border-top: 1px solid var(--line);
+    }
+
+    .phase-h b {
+      font-size: 15.5px;
+    }
+
+    .elapsed b {
+      font-size: 22px;
+    }
+
+    .bsteps {
+      grid-template-columns: minmax(0, 1fr) 54px;
+      grid-auto-flow: dense;
+    }
+
+    .bs canvas {
+      grid-column: 1 / -1;
+    }
+
+    .bs-d {
+      grid-column: 2;
+    }
+
+    .box-row .minitape {
+      width: 64px;
+    }
+
+    .set-row {
+      grid-template-columns: minmax(0, 1fr);
+      gap: 2px;
+    }
+  }
+
   @keyframes dialog-fade {
     from {
       opacity: 0;
