@@ -43,6 +43,7 @@ pub(crate) mod subnet;
 pub mod sweeper;
 pub mod tunnel;
 pub mod vulns;
+pub(crate) mod warm;
 
 use crate::keys::ClusterKeys;
 use crate::session::NodeHub;

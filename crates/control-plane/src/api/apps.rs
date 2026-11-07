@@ -431,9 +431,7 @@ pub struct App {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(required = false)]
     pub lease: Option<super::leases::Lease>,
-    /// The app's warm copy; absent until warm volumes ship, then null when
-    /// `ha_policy` is not `warm`.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// The app's warm copy; null when `ha_policy` is not `warm`.
     #[schema(required = false)]
     pub warm: Option<WarmCopy>,
     /// Current OCI reference of the app. For an app with a Git source, the
@@ -1669,6 +1667,7 @@ pub async fn update_app(
             // `openapi.yaml` `App.ha_cost`: every read answer carries it.
             crate::backups::cost::attach(&state, std::slice::from_mut(&mut app)).await?;
             super::leases::attach(&state, std::slice::from_mut(&mut app)).await?;
+            crate::warm::attach(&state, std::slice::from_mut(&mut app)).await?;
             Ok(Json(app))
         }
         Err(error) => {
