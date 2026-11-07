@@ -1060,6 +1060,56 @@ async fn a_local_grant_ends_a_converted_lease_s_renewals() {
     leases.abort();
 }
 
+/// ADR 0241 and ADR 0242: a start that took its permit before the
+/// conversion has a `local` lease's bound, and the fence of the converted
+/// lease would wait for it. So the first renewal, which gives the lease its
+/// deadline, waits until that start is done, and the lease stays `local` in
+/// all but name until then. The renewal interval after the start is done
+/// sends it: with `D` = 6 000, 2 000 ms after the conversion.
+#[tokio::test]
+async fn a_converted_lease_s_first_renewal_waits_for_a_start_permitted_before_it() {
+    let dir = TargetDir::new("expiring-convert-start");
+    let engine = Arc::new(FakeEngine::new());
+    let desired = bound(&["vm_warm"]);
+    let clock = clock();
+    let (leases, _store) = start(&dir, &engine, &desired, config(&clock)).await;
+    let mut attached = leases.link.attach();
+    leases
+        .link
+        .grant(MsgId("msg_local".to_owned()), None, local_grant(1))
+        .await
+        .expect("the local grant is taken");
+    let permit = leases
+        .view
+        .start_permit(LEASE, 1)
+        .await
+        .expect("a local lease starts");
+    leases
+        .link
+        .grant(MsgId("msg_convert".to_owned()), None, expiring(1, 6000))
+        .await
+        .expect("the conversion is taken");
+    let converted = Instant::now();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1500), attached.renewals.recv())
+            .await
+            .is_err(),
+        "no renewal while the start runs"
+    );
+    assert!(leases.view.start_permit(LEASE, 1).await.is_none());
+    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Held));
+    assert!(leases.view.may_keep_running(LEASE, 1));
+
+    drop(permit);
+    let _renew = next_renewal(&mut attached).await;
+    let sent = converted.elapsed();
+    assert!(
+        sent < Duration::from_millis(3000),
+        "the next renewal interval sends it: {sent:?}"
+    );
+    leases.abort();
+}
+
 /// ADR 0241: until its first renewal is sent, a converted lease behaves as
 /// `local`. With no session nothing is sent, so the lease stays `held` and
 /// its VMs run past any deadline the duration would give. Once a session

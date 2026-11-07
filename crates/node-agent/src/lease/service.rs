@@ -1030,6 +1030,21 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                     if self.renewals.is_none() {
                         continue;
                     }
+                    // A converted lease's first renewal gives it a deadline,
+                    // and its fence would wait for a start that took its
+                    // permit before the conversion, under a `local` lease's
+                    // bound. So that renewal waits until every such start is
+                    // done; until then the lease behaves as `local`, and no
+                    // new start can take a permit (ADR 0241, ADR 0242).
+                    if self
+                        .view
+                        .lock()
+                        .get(&lease_id)
+                        .is_some_and(Lease::awaits_first_renewal)
+                        && self.view.gates.gate(&lease_id).try_write().is_err()
+                    {
+                        continue;
+                    }
                     // A converted lease renews only once its row says
                     // `expiring`; until then it behaves as `local`, and the
                     // next renewal interval tries again (ADR 0241).
