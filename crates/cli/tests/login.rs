@@ -260,25 +260,14 @@ async fn on_a_terminal_the_certificate_is_confirmed_then_the_token_asked_for() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn logout_forgets_the_token_and_revoke_points_to_the_panel() {
+async fn logout_forgets_the_token_and_points_to_the_panel_to_revoke_it() {
     let lab = lab().await;
     assert_eq!(lab.login_piped(&lab.token).await.code, exit::OK);
     let credentials_path = lab.config_dir().join("credentials.toml");
 
-    // --revoke cannot name the token, so it removes nothing.
+    // There is no --revoke: the client cannot tell which token it holds.
     let output = quoro(&["logout", "--revoke"], &lab.environment(&[])).await;
     assert_eq!(output.code, exit::USAGE, "{}", output.stderr);
-    assert!(
-        output
-            .stderr
-            .contains("cannot tell which of your tokens this is")
-            && output
-                .stderr
-                .contains(&format!("API tokens ({}/account)", lab.primary.url))
-            && output.stderr.contains("Nothing was removed"),
-        "{}",
-        output.stderr
-    );
     assert!(read(&credentials_path).contains(&lab.token));
 
     let output = quoro(
@@ -295,6 +284,20 @@ async fn logout_forgets_the_token_and_revoke_points_to_the_panel() {
         "{}",
         output.stdout
     );
+    assert_eq!(
+        output.stdout.lines().last(),
+        Some(
+            format!(
+                "The token still works until it is revoked: revoke it in the panel, \
+                 Your account → API tokens ({}/account).",
+                lab.primary.url
+            )
+            .as_str()
+        ),
+        "{}",
+        output.stdout
+    );
+    lab.assert_quiet(&output);
     assert_eq!(read(&credentials_path), "");
     assert_eq!(mode(&credentials_path), 0o600);
     let config = read(&lab.config_dir().join("config.toml"));
@@ -340,21 +343,25 @@ async fn an_agent_logout_forgets_the_key_path_and_the_cached_token() {
     let cache = lab.home.join("run/quoro/lab.token");
     assert!(cache.exists());
 
-    let output = quoro(&["logout", "--revoke"], &lab.environment(&[])).await;
-    assert_eq!(output.code, exit::USAGE, "{}", output.stderr);
-    assert!(
-        output.stderr.contains("an agent cannot revoke its key"),
-        "{}",
-        output.stderr
-    );
-    assert!(cache.exists(), "nothing was removed");
-
     let output = quoro(&["logout"], &lab.environment(&[])).await;
     assert_eq!(output.code, exit::OK, "{}", output.stderr);
     assert!(
         output
             .stdout
             .contains("its agent key file path was removed"),
+        "{}",
+        output.stdout
+    );
+    assert_eq!(
+        output.stdout.lines().last(),
+        Some(
+            format!(
+                "The agent key still works until it is revoked: a human revokes it on the \
+                 agent's page in the panel, Agents ({}/agents).",
+                lab.primary.url
+            )
+            .as_str()
+        ),
         "{}",
         output.stdout
     );

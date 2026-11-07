@@ -237,7 +237,7 @@ pub async fn run_with(
         cli::Command::Login(args) => {
             login::run(&cli.global, args, environment, stdout, stderr).await
         }
-        cli::Command::Logout(args) => logout::run(&cli.global, &args, environment, stdout),
+        cli::Command::Logout => logout::run(&cli.global, environment, stdout),
         cli::Command::Whoami => whoami::run(&cli.global, environment, stdout).await,
         cli::Command::Api(args) => api::run(&cli.global, args, environment, stdout, stderr).await,
         cli::Command::Completion { shell } => {

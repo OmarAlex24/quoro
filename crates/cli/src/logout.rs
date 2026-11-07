@@ -1,4 +1,4 @@
-//! `quoro logout [--revoke]`: forgets the context's stored credential.
+//! `quoro logout`: forgets the context's stored credential.
 //!
 //! Removes the context's entry from `credentials.toml` (a human's token, or
 //! an agent's key file path) and the agent's cached access token. The context
@@ -7,19 +7,16 @@
 //! the current one; `QUORO_TOKEN` and `QUORO_AGENT_KEY_FILE` are not stored,
 //! so logging out does not touch them.
 //!
-//! `--revoke` is refused, and nothing is removed:
-//!
-//! - for a token, because the client cannot tell which token it is. The
-//!   token list (`listTokens`) never returns a secret and `getMe` does not
-//!   name the token in use, so the only id the client could send would be a
-//!   guess. The human revokes it in the panel (Your account → API tokens) and
-//!   then logs out.
-//! - for an agent key, because revoking a key is a human's decision, taken in
-//!   the panel.
+//! Forgetting is not revoking: the token or key still works until it is
+//! revoked, so the last line points to where that is done. The client cannot
+//! revoke a token itself: the token list (`listTokens`) never returns a
+//! secret and `getMe` does not name the token in use, so the only id it could
+//! send would be a guess. A human revokes the token in the panel (Your
+//! account → API tokens), and an agent's key on the panel's agent page.
 
 use crate::Environment;
 use crate::agent;
-use crate::cli::{Global, LogoutArgs};
+use crate::cli::Global;
 use crate::context::{self, Context, Trust};
 use crate::error::Failure;
 use crate::login::TOKEN_HOME;
@@ -27,7 +24,6 @@ use std::io::Write;
 
 pub fn run(
     global: &Global,
-    args: &LogoutArgs,
     environment: &Environment,
     stdout: &mut dyn Write,
 ) -> Result<(), Failure> {
@@ -50,23 +46,6 @@ pub fn run(
     let stored = credentials.contexts.get(&name);
     let has_token = stored.is_some_and(|entry| entry.token.is_some());
     let has_key = stored.is_some_and(|entry| entry.key_file.is_some());
-
-    if args.revoke && has_token {
-        let panel = url
-            .as_deref()
-            .map_or_else(String::new, |url| format!(" ({url}/account)"));
-        return Err(Failure::usage(format!(
-            "--revoke cannot tell which of your tokens this is: the API never shows a token's \
-             secret and getMe does not name the token in use. Revoke it in the panel: \
-             {TOKEN_HOME}{panel}, then run quoro logout. Nothing was removed"
-        )));
-    }
-    if args.revoke && has_key {
-        return Err(Failure::usage(
-            "an agent cannot revoke its key: a human revokes it in the panel (Agents). \
-             quoro logout without --revoke forgets the key file path. Nothing was removed",
-        ));
-    }
 
     // The cached access token goes too, whatever the credential was.
     if let Some(cache) = agent::cache_path(
@@ -101,6 +80,23 @@ pub fn run(
                 "{variable} is set in this shell and still overrides the stored credential.\n"
             ));
         }
+    }
+    // The last line says where the forgotten credential is revoked.
+    let panel = |path: &str| {
+        url.as_deref()
+            .map_or_else(String::new, |url| format!(" ({url}{path})"))
+    };
+    if has_token {
+        message.push_str(&format!(
+            "The token still works until it is revoked: revoke it in the panel, {TOKEN_HOME}{}.\n",
+            panel("/account")
+        ));
+    } else if has_key {
+        message.push_str(&format!(
+            "The agent key still works until it is revoked: a human revokes it on the agent's \
+             page in the panel, Agents{}.\n",
+            panel("/agents")
+        ));
     }
     crate::api::write(stdout, message.as_bytes())
 }

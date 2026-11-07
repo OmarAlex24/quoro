@@ -59,7 +59,7 @@ pub enum Command {
     /// Save a context and its credential: a personal API token or an agent key
     Login(LoginArgs),
     /// Forget the context's stored credential
-    Logout(LogoutArgs),
+    Logout,
     /// Show the context and the identity behind its credential
     Whoami,
     /// Call any API operation and print the response body
@@ -105,11 +105,4 @@ pub struct LoginArgs {
     /// The SHA-256 of the primary's certificate, sha256:<hex>
     #[arg(long, value_name = "FP")]
     pub fingerprint: Option<String>,
-}
-
-#[derive(Debug, Args)]
-pub struct LogoutArgs {
-    /// Revoke the token too; until the API can name it, this points to the panel
-    #[arg(long)]
-    pub revoke: bool,
 }
