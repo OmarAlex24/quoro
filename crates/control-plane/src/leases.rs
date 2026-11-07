@@ -367,6 +367,96 @@ pub(crate) async fn bump_tokens(
     Ok(bumped)
 }
 
+/// Raises the stored `duration_ms` of `lease_id` to `duration_ms`, before a
+/// grant that long goes out, and writes its change-log entry. The stored
+/// value is the longest duration the primary may have granted, which a
+/// restarted primary counts every gate from (section 8.4, ADR 0203). Returns
+/// the row when it changed; a lease with no row, or one whose stored
+/// duration is already at least as long, is left as it is.
+///
+/// # Errors
+///
+/// A database error.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the first expiring grant (#604) raises it")
+)]
+pub(crate) async fn raise_duration(
+    conn: &mut SqliteConnection,
+    lease_id: &str,
+    duration_ms: i64,
+    actor: &Actor,
+) -> Result<Option<Lease>, ApiError> {
+    let Some(lease) = by_id(conn, lease_id).await? else {
+        return Ok(None);
+    };
+    if lease
+        .duration_ms
+        .is_some_and(|stored| stored >= duration_ms)
+    {
+        return Ok(None);
+    }
+    write_duration(conn, lease, duration_ms, actor)
+        .await
+        .map(Some)
+}
+
+/// Lowers the stored `duration_ms` of `lease_id` to `duration_ms` once the
+/// gate of every longer grant has passed ([`Authority::may_lower`]), and
+/// writes its change-log entry. Returns the row when it changed.
+///
+/// [`Authority::may_lower`]: crate::authority::Authority
+///
+/// # Errors
+///
+/// A database error.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the first expiring grant (#604) lowers it")
+)]
+pub(crate) async fn lower_duration(
+    conn: &mut SqliteConnection,
+    authority: &crate::authority::Authority,
+    lease_id: &str,
+    duration_ms: i64,
+    actor: &Actor,
+) -> Result<Option<Lease>, ApiError> {
+    let Some(lease) = by_id(conn, lease_id).await? else {
+        return Ok(None);
+    };
+    let Ok(to_ms) = u64::try_from(duration_ms) else {
+        return Ok(None);
+    };
+    if !lease.duration_ms.is_some_and(|stored| stored > duration_ms)
+        || !authority.may_lower(lease_id, to_ms)
+    {
+        return Ok(None);
+    }
+    write_duration(conn, lease, duration_ms, actor)
+        .await
+        .map(Some)
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the first expiring grant (#604) writes it")
+)]
+async fn write_duration(
+    conn: &mut SqliteConnection,
+    mut lease: Lease,
+    duration_ms: i64,
+    actor: &Actor,
+) -> Result<Lease, ApiError> {
+    sqlx::query("UPDATE leases SET duration_ms = ? WHERE id = ?")
+        .bind(duration_ms)
+        .bind(&lease.id)
+        .execute(&mut *conn)
+        .await?;
+    lease.duration_ms = Some(duration_ms);
+    changelog::append(conn, actor, "lease", &lease.id, Op::Update, lease.payload()).await?;
+    Ok(lease)
+}
+
 /// Grants the app's `local` lease to `node_id` and writes its change-log
 /// entry, returning the row. The token is one more than whatever the app's
 /// lease last carried, so ownership changes never reuse a token (section 8.6).
@@ -473,6 +563,105 @@ pub(crate) async fn revoke_app_lease(
 #[cfg(test)]
 mod tests {
     use super::{Lease, Releases};
+    use crate::authority::{Authority, Grant, ManualClock, MonotonicClock};
+    use crate::changelog::{Actor, ActorType};
+    use crate::driver::{Capacity, Kvm};
+    use crate::store::Store;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// A store with one node and an app lease on it.
+    async fn store_with_lease() -> (Store, Lease, Actor, std::path::PathBuf) {
+        let data_dir = std::env::temp_dir().join(format!(
+            "quoro-leases-{}",
+            &crate::store::random_secret()[..16]
+        ));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let store = Store::open(&data_dir.join("quoro.db")).await.unwrap();
+        let node_id = crate::driver::register_local_node(
+            &store,
+            &crate::driver::LocalNode {
+                name: "node-a".to_string(),
+                capacity: Capacity {
+                    cpus: 2,
+                    memory_mb: 2048,
+                    disk_gb: 20,
+                },
+                kvm: Kvm {
+                    available: true,
+                    kernel: "6.8.0".to_string(),
+                    nested: None,
+                },
+                engine_version: "test".to_string(),
+                agent_version: "test".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let actor = Actor {
+            kind: ActorType::Node,
+            id: node_id.clone(),
+        };
+        let mut w = store.begin_write().await.unwrap();
+        let lease = super::grant_app_lease(&mut w.tx, "app_x", &node_id, &actor)
+            .await
+            .unwrap();
+        w.commit().await.unwrap();
+        (store, lease, actor, data_dir)
+    }
+
+    /// ADR 0203: the stored duration rises before a longer grant, never
+    /// falls with a raise, and falls only once the longer grant's gate has
+    /// passed.
+    #[tokio::test]
+    async fn a_stored_duration_rises_before_a_longer_grant_and_falls_after_its_gate() {
+        let (store, lease, actor, data_dir) = store_with_lease().await;
+        let clock = Arc::new(ManualClock::default());
+        let authority = Authority::new(Arc::clone(&clock) as Arc<dyn MonotonicClock>);
+        let mut conn = store.pool().acquire().await.unwrap();
+
+        let raised = super::raise_duration(&mut conn, &lease.id, 180_000, &actor)
+            .await
+            .unwrap();
+        assert_eq!(raised.unwrap().duration_ms, Some(180_000));
+        assert!(
+            super::raise_duration(&mut conn, &lease.id, 15_000, &actor)
+                .await
+                .unwrap()
+                .is_none(),
+            "a raise never lowers"
+        );
+        authority
+            .record_grant(&Grant {
+                lease_id: &lease.id,
+                holder: &lease.holder_node_id,
+                duration_ms: 180_000,
+                sent: authority.now(),
+                sent_wall: time::OffsetDateTime::now_utc(),
+                renewal: false,
+            })
+            .unwrap();
+        assert!(
+            super::lower_duration(&mut conn, &authority, &lease.id, 15_000, &actor)
+                .await
+                .unwrap()
+                .is_none(),
+            "the longer grant's gate is open"
+        );
+        clock.advance(Duration::from_secs(216));
+        let lowered = super::lower_duration(&mut conn, &authority, &lease.id, 15_000, &actor)
+            .await
+            .unwrap();
+        assert_eq!(lowered.unwrap().duration_ms, Some(15_000));
+        let stored: Option<i64> = sqlx::query_scalar("SELECT duration_ms FROM leases WHERE id = ?")
+            .bind(&lease.id)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(stored, Some(15_000));
+        drop(conn);
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
 
     fn revoked(holder: &str, token: i64) -> Lease {
         Lease {
