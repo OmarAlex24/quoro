@@ -187,7 +187,7 @@ pub struct ManualHostClock {
 /// `when` holds.
 struct ArmedSuspend {
     slept: Duration,
-    when: Box<dyn Fn() -> bool + Send + Sync>,
+    when: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 impl std::fmt::Debug for ArmedSuspend {
@@ -250,28 +250,39 @@ impl ManualHostClock {
     /// the first read of `CLOCK_BOOTTIME` at which `when` holds, just before
     /// that read. A test uses it to put a suspend between two steps of the
     /// lease service that no test can reach between. `when` runs on every
-    /// read until it holds, under whatever lock the reader holds, so it must
-    /// not take the lease table's lock or read this clock.
+    /// read until it holds, with no lock of this clock held but under
+    /// whatever lock the reader holds. So it must not read this clock, nor
+    /// take a lock that any reader of this clock may hold: the lease table,
+    /// and anything taken while one of its readers holds it.
     pub fn suspend_when(&self, slept: Duration, when: impl Fn() -> bool + Send + Sync + 'static) {
         *self.armed_lock() = Some(ArmedSuspend {
             slept,
-            when: Box::new(when),
+            when: Arc::new(when),
         });
     }
 
     /// The suspend [`Self::suspend_when`] armed, once its condition holds.
+    /// `CLOCK_BOOTTIME` jumps in the same critical section that disarms it,
+    /// so no reader sees the suspend disarmed and the clock not yet moved.
     fn fire_armed(&self) {
-        let fired = {
-            let mut armed = self.armed_lock();
-            if armed.as_ref().is_some_and(|armed| (armed.when)()) {
-                armed.take()
-            } else {
-                None
-            }
+        let Some(when) = self
+            .armed_lock()
+            .as_ref()
+            .map(|armed| Arc::clone(&armed.when))
+        else {
+            return;
         };
-        if let Some(fired) = fired {
-            self.suspend(fired.slept);
+        if !when() {
+            return;
         }
+        {
+            let mut armed = self.armed_lock();
+            let Some(fired) = armed.take_if(|armed| Arc::ptr_eq(&armed.when, &when)) else {
+                return;
+            };
+            self.lock().at_origin += fired.slept;
+        }
+        self.suspends.send_modify(|count| *count += 1);
     }
 
     fn armed_lock(&self) -> std::sync::MutexGuard<'_, Option<ArmedSuspend>> {

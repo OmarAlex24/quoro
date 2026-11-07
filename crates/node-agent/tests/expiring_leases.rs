@@ -1002,11 +1002,11 @@ async fn a_hung_stop_keeps_the_bounds_the_fence_hands_the_engine() {
 }
 
 /// Section 8.4, ADR 0240, #536: the same hung stop, on the path of an
-/// `expiring` fence with graceful time left. The lease clock says the
-/// graceful time is over before `T_grace` has passed on the tokio clock, as
-/// after a host suspend. The forced stop then begins at once with its full
-/// `T_force`, and the fence reports the VM failed when `T_force` has passed
-/// after that.
+/// `expiring` fence with graceful time left. A tokio sleep stands in for the
+/// lease clock and ends the graceful time before `T_grace`, as the lease
+/// clock does after a host suspend. The forced stop then begins at once with
+/// its full `T_force`, and the fence reports the VM failed when `T_force` has
+/// passed after that.
 #[tokio::test(start_paused = true)]
 async fn a_hung_stop_the_lease_clock_cuts_short_still_gets_its_full_t_force() {
     let engine = FakeEngine::new();
@@ -1259,30 +1259,32 @@ async fn a_suspend_while_a_fence_waits_for_a_start_uses_up_its_graceful_stop() {
 /// after that lock and before the fence begins: the renewal of another lease,
 /// due in the same look as the expiry, applies it to the table in between.
 /// The fence counts that suspend once. Missed, it would leave the graceful
-/// stop about 2 600 ms; counted twice, it would leave none.
+/// stop at most 5 600 ms; counted twice, it would leave none.
 #[tokio::test]
 async fn a_suspend_applied_between_an_expiry_and_its_fence_counts_once() {
     let dir = TargetDir::new("expiring-trigger-suspend");
     let engine = Arc::new(FakeEngine::new());
     let desired = bound(&["vm_warm"]);
     let clock = clock();
-    // `D` = 30 000, `M` = 3 000, which holds 2 700 ms of graceful stop and
+    // `D` = 60 000, `M` = 6 000, which holds 5 700 ms of graceful stop and
     // 300 ms forced.
     let config = config(&clock).with_expiring_timers(FenceTimers {
-        grace: millis(5000),
+        grace: millis(10_000),
         force: millis(300),
     });
     let (leases, store) = start(&dir, &engine, &desired, config).await;
     let vm = running_vm(&engine, "vm_warm", 2).await;
     let mut attached = leases.link.attach();
 
-    // The other lease, of 60 000 ms, renews 20 000 ms after its send time and
-    // is valid until 54 000 ms after it. It sorts first, so a look that finds
-    // its renewal due together with the expiry renews it first.
+    // The other lease, of 120 000 ms, renews 40 000 ms after its send time
+    // and is valid until 108 000 ms after it. A look returns its actions in
+    // lease id order (`polls_are_sorted_by_lease_id`) and the service runs
+    // them in that order, so a look that finds the other lease's renewal due
+    // together with the expiry renews it first.
     let other = LeaseGrant {
         lease_id: LeaseId(OTHER.to_owned()),
         resource_id: "app_other".to_owned(),
-        ..expiring(1, 60_000)
+        ..expiring(1, 120_000)
     };
     leases
         .link
@@ -1301,34 +1303,35 @@ async fn a_suspend_applied_between_an_expiry_and_its_fence_counts_once() {
         .await
         .expect("the answer is taken");
     assert_eq!(leases.view.state(OTHER), Some(LeaseState::Held));
-    let _before = grant_and_confirm(&leases, &mut attached, 30_000).await;
+    let _before = grant_and_confirm(&leases, &mut attached, 60_000).await;
     let confirmed = Instant::now();
 
-    // The app's lease is valid until at most 27 000 ms after `confirmed`, so
+    // The app's lease is valid until at most 54 000 ms after `confirmed`, so
     // a suspend that ends 100 ms past that leaves the next look with the
-    // expiry and the other lease's renewal due. A second suspend, of 1 400 ms,
-    // begins as soon as that look triggered the fence, before the renewal
-    // reads the clock.
+    // expiry and the other lease's renewal due. A second suspend, of 3 000 ms,
+    // begins at the first read of the clock after that look triggered the
+    // fence: the renewal's, before the fence begins.
     let view = leases.view.clone();
-    clock.suspend_when(millis(1400), move || view.fence_owns_stop(LEASE));
-    clock.suspend((confirmed + millis(27_100)).saturating_duration_since(Instant::now()));
+    clock.suspend_when(millis(3000), move || view.fence_owns_stop(LEASE));
+    clock.suspend((confirmed + millis(54_100)).saturating_duration_since(Instant::now()));
     wait_for_fence_record(&store).await;
     assert_eq!(leases.view.state(LEASE), Some(LeaseState::Expired));
     let renewed = next_renewal(&mut attached).await;
     assert_eq!(renewed.body.lease_id.0, OTHER, "the other lease renewed");
     assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Stopped);
-    // The fence began at least 100 ms past `valid_until`, and 1 400 ms of
-    // suspend came after the trigger: at most 1 200 ms of graceful stop
+    // The fence began at least 100 ms past `valid_until`, and 3 000 ms of
+    // suspend came after the trigger: at most 2 600 ms of graceful stop
     // remain.
     let calls = engine.stop_calls();
     assert!(
         matches!(
             &calls[..],
             [(_, StopMode::Graceful { timeout, .. })]
-                if !timeout.is_zero() && *timeout < millis(1300)
+                if !timeout.is_zero() && *timeout < millis(2700)
         ),
         "one graceful stop, short by the suspend once: {calls:?}"
     );
+    assert!(!leases.view.is_failed(), "a suspend is not a failure");
     leases.abort();
 }
 
