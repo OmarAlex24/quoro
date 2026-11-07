@@ -338,6 +338,9 @@ struct HubInner {
     /// memory only; the node reports the failure again in its buffered
     /// `node.fence_failed` and when the next session's revoke fences again.
     unrecorded_failures: Mutex<HashSet<(String, String)>>,
+    /// The gates of `expiring` leases and the voters' support (section 8.4,
+    /// "What the authority must enforce"; section 8.8).
+    authority: crate::authority::Authority,
     generation: AtomicU64,
     /// Test seam: snapshots to hold between their build and their send.
     snapshot_holds: Mutex<HashMap<String, Arc<SnapshotHold>>>,
@@ -422,6 +425,9 @@ impl NodeHub {
             disk_free_gb: Mutex::new(HashMap::new()),
             releases: leases::Releases::default(),
             unrecorded_failures: Mutex::new(HashSet::new()),
+            authority: crate::authority::Authority::new(Arc::new(
+                crate::authority::SystemMonotonic::default(),
+            )),
             generation: AtomicU64::new(0),
             snapshot_holds: Mutex::new(HashMap::new()),
             serving_inputs: Notify::new(),
@@ -440,6 +446,41 @@ impl NodeHub {
             .expect("snapshot hold lock")
             .insert(node_id.to_string(), Arc::clone(&hold));
         hold
+    }
+
+    /// The gates of `expiring` leases and the voters' support (section 8.4,
+    /// "What the authority must enforce"; section 8.8).
+    #[must_use]
+    pub fn authority(&self) -> &crate::authority::Authority {
+        &self.0.authority
+    }
+
+    /// Test seam: how this primary answers whether a majority of voters
+    /// supports it (section 8.8). Every build holds none until the support
+    /// accounting lands.
+    #[doc(hidden)]
+    pub fn set_voter_support(&self, support: Arc<dyn crate::authority::VoterSupport>) {
+        self.0.authority.set_support(support);
+    }
+
+    /// The restart rule of section 8.4: no gate survives a restart, so every
+    /// `expiring` lease, revoked or not, counts as granted now for its stored
+    /// `duration_ms` (ADR 0203). Runs once, before any session.
+    ///
+    /// # Errors
+    ///
+    /// The database error, as text.
+    pub(crate) async fn seed_lease_gates(&self) -> Result<(), String> {
+        let rows: Vec<(String, String, Option<i64>)> = sqlx::query_as(
+            "SELECT id, holder_node_id, duration_ms FROM leases WHERE mode = 'expiring'",
+        )
+        .fetch_all(self.0.store.pool())
+        .await
+        .map_err(|e| format!("cannot read the expiring leases: {e}"))?;
+        for (lease_id, holder, duration_ms) in rows {
+            self.0.authority.seed(&lease_id, &holder, duration_ms);
+        }
+        Ok(())
     }
 
     /// The departed `tunnel` routes machines keep for a while (ADR 0194).
