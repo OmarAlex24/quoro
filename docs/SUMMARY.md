@@ -263,6 +263,8 @@
   - [0259: Health checks: probes of a VM paused for a backup neither count nor restart it, and a health restart stops a VM only when it can start again](adr/0259-health-checks-probes-of-a-vm-paused-for-a-backup-neither.md)
   - [0262: fence_ack acknowledges a listed lease with no row at 2^53-1, the canonical-JSON bound, and migration 0001's comment names fencing_tokens](adr/0262-fence-ack-acknowledges-a-listed-lease-with-no-row-at-2-53-1.md)
   - [0265: M5b refuses warm for an app built from a Git source, with the reason not_in_this_release](adr/0265-m5b-refuses-warm-for-an-app-built-from-a-git-source-with.md)
+  - [0266: Where the primary takes a voter's mesh endpoint from (node-to-node peers, section 6.9)](adr/0266-where-the-primary-takes-a-voter-s-mesh-endpoint-from-node.md)
+  - [0267: A warm copy the node is no longer the target of is never reported, so the primary cannot always delete it](adr/0267-a-warm-copy-the-node-is-no-longer-the-target-of-is-never.md)
   - [0274: M7, deploy experience: after M6, Quoro adds docker-compose import, private registries and Git repositories, a container engine for hosts without KVM, and Railpack builds](adr/0274-m7-deploy-experience-after-m6-quoro-adds-docker-compose.md)
   - [0275: A warm app's placement does not narrow its warm node: a stateful app's placement names only its volume's node](adr/0275-a-warm-app-s-placement-does-not-narrow-its-warm-node-a.md)
   - [0276: When the scheduler picks a warm node again: not on a disconnect, only for a lasting reason](adr/0276-when-the-scheduler-picks-a-warm-node-again-not-on-a.md)
