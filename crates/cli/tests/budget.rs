@@ -135,3 +135,44 @@ fn top_level_help_fits_and_points_to_the_host_commands() {
     assert_eq!(pointers.len(), 1, "{help}");
     assert_eq!(help.trim_end().lines().last(), pointers.first().copied());
 }
+
+/// The top-level help lists the commands by topic, written by hand
+/// (`cli.rs`): each line of its `Commands:` section is a topic and its
+/// commands. That list names every top-level command exactly once and
+/// nothing else, so it cannot drift from the tree.
+#[test]
+fn the_grouped_command_list_names_every_command_once() {
+    let tree = tree();
+    let help = tree.clone().render_help().to_string();
+    let listed: Vec<String> = help
+        .lines()
+        .skip_while(|line| line.trim_end() != "Commands:")
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .flat_map(|line| {
+            let (topic, names) = line
+                .trim()
+                .split_once(char::is_whitespace)
+                .unwrap_or_else(|| panic!("'{line}' is a topic and its commands"));
+            assert!(
+                topic.chars().all(|c| c.is_ascii_alphabetic()),
+                "'{topic}' is a topic"
+            );
+            names
+                .split(',')
+                .map(|name| name.trim().to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(!listed.is_empty(), "no grouped command list:\n{help}");
+    let mut words: Vec<String> = commands(&tree)
+        .map(|command| command.get_name().to_string())
+        .collect();
+    let mut sorted = listed.clone();
+    sorted.sort();
+    words.sort();
+    let mut unique = sorted.clone();
+    unique.dedup();
+    assert_eq!(sorted, unique, "a command is listed twice: {listed:?}");
+    assert_eq!(sorted, words, "the grouped list and the tree differ");
+}

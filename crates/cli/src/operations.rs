@@ -9,9 +9,9 @@
 //!
 //! The destructive operations at the end are the ones whose approval params
 //! the client can reproduce (`approval.rs`); registering them checks their
-//! templates against the contract. `deleteApp`, `deleteVolume` and
-//! `restoreBackup` are also called by name (`quoro app delete`, `quoro volume
-//! delete`, `quoro backup restore`); `deleteVm` is reached with `quoro api`.
+//! templates against the contract. All four are also called by name (`quoro
+//! app delete`, `quoro vm delete`, `quoro volume delete`, `quoro backup
+//! restore`).
 
 /// One operation of `openapi.yaml`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -347,6 +347,114 @@ pub const GET_BACKUP: Operation = Operation {
     path: "/api/v1/backups/{backup_id}",
 };
 
+/// `listVms` (`vm:read`).
+pub const LIST_VMS: Operation = Operation {
+    id: "listVms",
+    method: "GET",
+    path: "/api/v1/vms",
+};
+
+/// `createVm` (`vm:create`).
+pub const CREATE_VM: Operation = Operation {
+    id: "createVm",
+    method: "POST",
+    path: "/api/v1/vms",
+};
+
+/// `getVm` (`vm:read`).
+pub const GET_VM: Operation = Operation {
+    id: "getVm",
+    method: "GET",
+    path: "/api/v1/vms/{vm_id}",
+};
+
+/// `startVm` (`vm:start`).
+pub const START_VM: Operation = Operation {
+    id: "startVm",
+    method: "POST",
+    path: "/api/v1/vms/{vm_id}/start",
+};
+
+/// `stopVm` (`vm:stop`).
+pub const STOP_VM: Operation = Operation {
+    id: "stopVm",
+    method: "POST",
+    path: "/api/v1/vms/{vm_id}/stop",
+};
+
+/// `createConsoleSession` (`vm:console`): a ticket for a VM's serial console.
+pub const CREATE_CONSOLE_SESSION: Operation = Operation {
+    id: "createConsoleSession",
+    method: "POST",
+    path: "/api/v1/vms/{vm_id}/console-sessions",
+};
+
+/// `createTerminalSession` (`app:terminal`, human-only): a ticket for a shell
+/// in the app's instance.
+pub const CREATE_TERMINAL_SESSION: Operation = Operation {
+    id: "createTerminalSession",
+    method: "POST",
+    path: "/api/v1/apps/{app_id}/terminal-sessions",
+};
+
+/// `connectInteractiveSession`: the WebSocket upgrade a ticket authorizes.
+pub const CONNECT_INTERACTIVE_SESSION: Operation = Operation {
+    id: "connectInteractiveSession",
+    method: "GET",
+    path: "/api/v1/interactive-sessions/{session_id}/ws",
+};
+
+/// `listIncidents` (`incident:read`).
+pub const LIST_INCIDENTS: Operation = Operation {
+    id: "listIncidents",
+    method: "GET",
+    path: "/api/v1/incidents",
+};
+
+/// `getIncident` (`incident:read`).
+pub const GET_INCIDENT: Operation = Operation {
+    id: "getIncident",
+    method: "GET",
+    path: "/api/v1/incidents/{incident_id}",
+};
+
+/// `resolveIncident` (`incident:resolve`).
+pub const RESOLVE_INCIDENT: Operation = Operation {
+    id: "resolveIncident",
+    method: "POST",
+    path: "/api/v1/incidents/{incident_id}/resolve",
+};
+
+/// `listAudit` (`audit:read`).
+pub const LIST_AUDIT: Operation = Operation {
+    id: "listAudit",
+    method: "GET",
+    path: "/api/v1/audit",
+};
+
+/// `getAuditRecord` (`audit:read`): one record, read to find where `--since`
+/// starts.
+pub const GET_AUDIT_RECORD: Operation = Operation {
+    id: "getAuditRecord",
+    method: "GET",
+    path: "/api/v1/audit/{seq}",
+};
+
+/// `listAgents` (`agent:read`): an agent named by `audit list --actor`.
+pub const LIST_AGENTS: Operation = Operation {
+    id: "listAgents",
+    method: "GET",
+    path: "/api/v1/agents",
+};
+
+/// `listUsers` (`user:read`, human-only): a user named by `audit list
+/// --actor`.
+pub const LIST_USERS: Operation = Operation {
+    id: "listUsers",
+    method: "GET",
+    path: "/api/v1/users",
+};
+
 /// `deleteApp` (`app:delete`).
 pub const DELETE_APP: Operation = Operation {
     id: "deleteApp",
@@ -423,6 +531,21 @@ pub const OPERATIONS: &[Operation] = &[
     LIST_APP_BACKUPS,
     CREATE_BACKUP,
     GET_BACKUP,
+    LIST_VMS,
+    CREATE_VM,
+    GET_VM,
+    START_VM,
+    STOP_VM,
+    CREATE_CONSOLE_SESSION,
+    CREATE_TERMINAL_SESSION,
+    CONNECT_INTERACTIVE_SESSION,
+    LIST_INCIDENTS,
+    GET_INCIDENT,
+    RESOLVE_INCIDENT,
+    LIST_AUDIT,
+    GET_AUDIT_RECORD,
+    LIST_AGENTS,
+    LIST_USERS,
     DELETE_APP,
     DELETE_VM,
     DELETE_VOLUME,

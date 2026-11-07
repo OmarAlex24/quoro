@@ -20,14 +20,12 @@ use std::process::ExitCode;
 /// Nothing: a bad command line, an unreadable file or database, and a broken
 /// chain are all reported through the exit code and stderr.
 pub async fn run(args: &[String]) -> ExitCode {
-    let Some((subcommand, rest)) = args.split_first() else {
-        return crate::usage_error("audit needs a subcommand: verify");
-    };
     // Only the offline verification is a host command; the rest of `audit`
-    // reads the primary's API through the client.
-    if subcommand != "verify" {
+    // (`audit list`, and `audit` alone, whose usage the client prints) reads
+    // the primary's API through the client.
+    let Some(rest) = args.strip_prefix(&["verify".to_string()]) else {
         return crate::client("audit", args).await;
-    }
+    };
     let flags = match crate::parse_flags(rest, &["file", "db", "prev-hash"]) {
         Ok(flags) => flags,
         Err(error) => return crate::usage_error(&error),

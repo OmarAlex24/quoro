@@ -16,7 +16,7 @@ use std::time::Duration;
 
 /// The TCP connection and the TLS handshake together, so an address that
 /// never answers fails in bounded time; the node agent uses the same bound.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One request, kept whole so it can be sent again unchanged.
 #[derive(Clone, Debug)]
@@ -135,12 +135,17 @@ async fn send(
 
 /// The HTTP client for a trust setting.
 pub fn http_client(trust: Trust) -> Result<Client, Failure> {
-    let config = match trust {
+    client_with(tls_config(trust)?)
+}
+
+/// The TLS configuration for a trust setting: the HTTP client's, and the
+/// WebSocket's of an interactive session (`session.rs`).
+pub fn tls_config(trust: Trust) -> Result<rustls::ClientConfig, Failure> {
+    match trust {
         Trust::Pin(pin) => tls::pinned(pin),
         Trust::System => tls::system(),
     }
-    .map_err(Failure::other)?;
-    client_with(config)
+    .map_err(Failure::other)
 }
 
 /// The HTTP client on a prepared TLS configuration.

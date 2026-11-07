@@ -8,11 +8,33 @@ use clap::{Args, Parser, Subcommand};
 use clap_complete::Shell;
 use std::path::PathBuf;
 
+/// The top-level help. Its command list is written by hand, grouped by topic,
+/// so it stays within the help's line budget; `tests/budget.rs` checks that
+/// it names every top-level command exactly once and nothing else.
+const HELP_TEMPLATE: &str = "\
+{about-with-newline}
+{usage-heading} {usage}
+
+Commands:
+  Account    login, logout, whoami
+  Folder     link, unlink, status
+  Ship       up, deploy, redeploy, restart, logs, ssh
+  Resources  project, app, env, domain, volume, backup, build
+  Machines   vm
+  Operate    incident, audit
+  Tools      api, completion
+
+Run 'quoro <command> --help' for a command's subcommands and flags.
+
+Options:
+{options}{after-help}";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "quoro",
     about = "Operate a Quoro cluster through its primary's API",
     arg_required_else_help = true,
+    help_template = HELP_TEMPLATE,
     after_help = "Host commands (serve, join, node, mcp stdio, audit verify, ...): quoro help host"
 )]
 pub struct Cli {
@@ -81,6 +103,8 @@ pub enum Command {
     Build(BuildCommand),
     /// Read or follow the app's, a build's or a deployment's logs
     Logs(LogsArgs),
+    /// Open a shell in the app's running instance; Ctrl-] closes it (humans only)
+    Ssh,
     /// List or replace the app's environment variables
     #[command(subcommand)]
     Env(EnvCommand),
@@ -93,6 +117,19 @@ pub enum Command {
     /// List, take and restore backups of the app's volume
     #[command(subcommand)]
     Backup(BackupCommand),
+    /// List, create, start, stop and delete VMs, and read a VM's console
+    #[command(subcommand)]
+    Vm(VmCommand),
+    /// List, read and resolve incidents
+    #[command(subcommand)]
+    Incident(IncidentCommand),
+    /// Read the audit log
+    #[command(
+        subcommand,
+        after_help = "The offline check of an exported log or a database is the host command \
+                      quoro audit verify --file PATH | --db PATH (quoro help host)."
+    )]
+    Audit(AuditCommand),
     /// Call any API operation and print the response body
     Api(ApiArgs),
     /// Print a shell completion script
@@ -352,6 +389,113 @@ pub enum BackupCommand {
         node: String,
         #[command(flatten)]
         approval: ApprovalArgs,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum VmCommand {
+    /// List the VMs of the project (all VMs when none is linked)
+    List,
+    /// Show one VM
+    Show {
+        /// The VM, by name or id (vm_...)
+        #[arg(value_name = "VM")]
+        vm: String,
+    },
+    /// Create a VM in the project on a node
+    Create(VmCreateArgs),
+    /// Start a VM
+    Start {
+        /// The VM, by name or id (vm_...)
+        #[arg(value_name = "VM")]
+        vm: String,
+    },
+    /// Stop a VM
+    Stop {
+        /// The VM, by name or id (vm_...)
+        #[arg(value_name = "VM")]
+        vm: String,
+    },
+    /// Delete a VM and its disks
+    Delete {
+        /// The VM, by name or id (vm_...)
+        #[arg(value_name = "VM")]
+        vm: String,
+        #[command(flatten)]
+        approval: ApprovalArgs,
+    },
+    /// Follow a VM's serial console, read-only, until Ctrl-C
+    Console {
+        /// The VM, by name or id (vm_...)
+        #[arg(value_name = "VM")]
+        vm: String,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct VmCreateArgs {
+    /// The VM's name
+    pub name: String,
+    /// The OCI image the VM boots
+    #[arg(long, value_name = "REF")]
+    pub image: String,
+    /// The node to place it on, by name or id
+    #[arg(long, value_name = "NODE")]
+    pub node: String,
+    /// Virtual CPUs (1 to 255)
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=255))]
+    pub vcpus: u32,
+    /// Memory, in MiB
+    #[arg(long, value_name = "MIB", value_parser = clap::value_parser!(u32).range(1..))]
+    pub memory: u32,
+    /// The root disk, in GiB
+    #[arg(long, value_name = "GB", default_value_t = 1,
+        value_parser = clap::value_parser!(u32).range(1..))]
+    pub disk: u32,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum IncidentCommand {
+    /// List the newest incidents
+    List {
+        /// Only incidents in this status
+        #[arg(long, value_name = "STATUS", value_parser = ["open", "resolved"])]
+        status: Option<String>,
+    },
+    /// Show an incident with its trigger event and grants
+    Show {
+        /// The incident, by id (inc_...)
+        #[arg(value_name = "INCIDENT")]
+        incident: String,
+    },
+    /// Resolve an incident; its incident grants stop working
+    Resolve {
+        /// The incident, by id (inc_...)
+        #[arg(value_name = "INCIDENT")]
+        incident: String,
+        /// What was done to resolve it; recorded with the incident
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuditCommand {
+    /// Show the 100 newest audit records, the newest at the bottom
+    #[command(
+        after_help = "The start of the page is found by reading single records \
+                            (getAuditRecord), a few dozen at most; an agent's reads are \
+                            audited, so each is a record and, under a grant with a use \
+                            limit, a use."
+    )]
+    List {
+        /// Only records of this actor: a user, agent or node id, or a name;
+        /// without --since, its newest among the log's newest 1000 records
+        #[arg(long, value_name = "ACTOR")]
+        actor: Option<String>,
+        /// The first 100 records from a time (RFC 3339) or a duration ago (30s, 10m, 2h, 1d)
+        #[arg(long, value_name = "T")]
+        since: Option<String>,
     },
 }
 
