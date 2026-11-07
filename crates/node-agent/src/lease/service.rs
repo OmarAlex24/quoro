@@ -85,7 +85,9 @@ use tracing::{debug, info, warn};
 
 use crate::AgentError;
 use crate::lease::clock::{HostClock, HostNow, Sleep, SuspendWatch, SystemHostClock};
-use crate::lease::fence::{FenceReport, FenceTimers, VmFenceOutcome, budget_for, stop_vms};
+use crate::lease::fence::{
+    FenceReport, FenceTimers, VmFenceOutcome, budget_for, stop_vms, stop_vms_until,
+};
 use crate::lease::machine::{Action, Lease, LeaseState, LeaseTable, Refusal, RevokeOutcome};
 use crate::lease::store::{FenceRecord, StoredLease};
 use crate::reconcile::Snapshot;
@@ -217,6 +219,55 @@ impl FenceGates {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Arc::clone(gates.entry(lease_id.clone()).or_default())
     }
+}
+
+/// The lease clock as the fence of an `expiring` lease reads it (section 8.4,
+/// ADR 0240): the time since the trigger on the tokio clock, plus every host
+/// suspend measured beyond what the table had applied when the fence began.
+/// Once the lease is `expired` or `revoked`, the table's catch-up no longer
+/// moves its instants, and the tokio clock alone stops during a suspend.
+struct FenceClock {
+    /// When the fence was triggered, on the tokio clock, as the table had it
+    /// after every suspend it applied.
+    since: Instant,
+    suspends: Arc<SuspendWatch>,
+    /// [`LeaseTable::suspend_applied`] when the fence was triggered.
+    applied: Duration,
+    host: Arc<dyn HostClock>,
+}
+
+impl FenceClock {
+    /// The time since the trigger on the lease clock. It errs long, as the
+    /// suspend measurement does.
+    fn elapsed(&self) -> Duration {
+        self.since.elapsed() + self.suspends.suspended().saturating_sub(self.applied)
+    }
+
+    /// Resolves once `mark` has passed since the trigger on the lease clock,
+    /// so at the wake-up from a suspend that passed it.
+    fn reaches(self, mark: Duration) -> Sleep {
+        Box::pin(async move {
+            loop {
+                let left = mark.saturating_sub(self.elapsed());
+                if left.is_zero() {
+                    return;
+                }
+                // Ends after `left` on `CLOCK_BOOTTIME`, or at a wake-up;
+                // either way the loop reads the clock again.
+                self.host.sleep(left).await;
+            }
+        })
+    }
+}
+
+/// When a fence was triggered, as the table had it: the instant on the tokio
+/// clock, and how much host suspend the table had applied to its instants
+/// then. Both are read under the same lock, so a suspend another look applies
+/// in between is neither counted twice nor missed by the fence's clock.
+#[derive(Clone, Copy, Debug)]
+struct Trigger {
+    at: Instant,
+    applied: Duration,
 }
 
 /// Held across the start of a stateful VM (section 6.4): while it lives, no
@@ -915,7 +966,14 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
         // run side by side (section 8.5).
         for action in std::mem::take(&mut self.pending) {
             if let crate::lease::Action::Fence { lease_id, reason } = action {
-                self.begin_fence(lease_id, reason, None, Instant::now());
+                let trigger = {
+                    let table = self.lock();
+                    Trigger {
+                        at: Instant::now(),
+                        applied: table.suspend_applied(),
+                    }
+                };
+                self.begin_fence(lease_id, reason, None, trigger);
             }
         }
         // Armed while a lease keeps instants on the lease clock; it waits on
@@ -1018,7 +1076,7 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
         // A suspend is caught up with first, so a lease whose `valid_until`
         // passed during it is fenced now, its stop time counted from the
         // deadline it really had (ADR 0240).
-        let (deadlines, actions): (HashMap<LeaseId, Instant>, _) = {
+        let (deadlines, applied, actions): (HashMap<LeaseId, Instant>, _, _) = {
             let mut table = self.view.lock_at(now);
             let deadlines = table
                 .leases()
@@ -1030,7 +1088,7 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                     self.view.gates.triggered(lease_id);
                 }
             }
-            (deadlines, actions)
+            (deadlines, table.suspend_applied(), actions)
         };
         let mut expired = Vec::new();
         let mut provisional = Vec::new();
@@ -1097,8 +1155,11 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                 Action::Fence { lease_id, reason } => {
                     // The stop must end by `t_send + D` (section 8.4), so it
                     // begins before anything waits on the store.
-                    let since = deadlines.get(&lease_id).copied().unwrap_or(now).min(now);
-                    self.begin_fence(lease_id.clone(), reason, None, since);
+                    let trigger = Trigger {
+                        at: deadlines.get(&lease_id).copied().unwrap_or(now).min(now),
+                        applied,
+                    };
+                    self.begin_fence(lease_id.clone(), reason, None, trigger);
                     expired.push(lease_id);
                 }
             }
@@ -1270,7 +1331,7 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
         // counts the suspend: an `expiring` lease whose `valid_until` passed
         // during it gets the stop time it has left, as at an expiry (ADR
         // 0240).
-        let (outcome, valid_until) = {
+        let (outcome, valid_until, applied) = {
             let mut table = self.view.lock_at(Instant::now());
             let valid_until = table
                 .get(&envelope.body.lease_id)
@@ -1279,7 +1340,7 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
             if let Ok(RevokeOutcome::Fence { lease_id }) = &outcome {
                 self.view.gates.triggered(lease_id);
             }
-            (outcome, valid_until)
+            (outcome, valid_until, table.suspend_applied())
         };
         match outcome {
             Err(Refusal::BadMessage(message)) => {
@@ -1308,10 +1369,13 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                     .is_some_and(|lease| lease.mode == LeaseMode::Expiring);
                 // An `expiring` lease's stop time counts from `valid_until`
                 // once that has passed (section 8.4).
-                let triggered_at = if expiring {
-                    valid_until.map_or(now, |until| until.min(now))
-                } else {
-                    now
+                let trigger = Trigger {
+                    at: if expiring {
+                        valid_until.map_or(now, |until| until.min(now))
+                    } else {
+                        now
+                    },
+                    applied,
                 };
                 if expiring {
                     // An `expiring` lease's VMs must stop before the primary's
@@ -1319,12 +1383,7 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                     // store. An agent that dies before the write restores the
                     // lease with its stored deadline, which is no later than
                     // the one it had, and the clock fences it (section 8.4).
-                    self.begin_fence(
-                        lease_id.clone(),
-                        FenceReason::LeaseRevoked,
-                        waiter,
-                        triggered_at,
-                    );
+                    self.begin_fence(lease_id.clone(), FenceReason::LeaseRevoked, waiter, trigger);
                     self.persist(&lease_id).await;
                 } else {
                     // A `local` lease has no deadline: its revoked state is
@@ -1332,7 +1391,7 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                     // dies mid-fence restores it as revoked, never as held
                     // (section 8.5 step 2).
                     self.persist(&lease_id).await;
-                    self.begin_fence(lease_id, FenceReason::LeaseRevoked, waiter, triggered_at);
+                    self.begin_fence(lease_id, FenceReason::LeaseRevoked, waiter, trigger);
                 }
                 self.publish_hello();
             }
@@ -1379,20 +1438,21 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
     /// task of its own. A lease whose fence is already running gets no second
     /// stop: the trigger joins that fence and is answered with its result.
     ///
-    /// `since` is when the fence was triggered: an `expiring` lease's stop
-    /// time counts from there (section 8.4).
+    /// `trigger` is when the fence was triggered: an `expiring` lease's stop
+    /// time counts from there on the lease clock (section 8.4).
     fn begin_fence(
         &mut self,
         lease_id: LeaseId,
         reason: FenceReason,
         waiter: Option<Waiter>,
-        since: Instant,
+        trigger: Trigger,
     ) {
         if let Some(flight) = self.in_flight.get_mut(&lease_id) {
             flight.waiters.extend(waiter);
             return;
         }
-        let Some(lease) = self.lock().get(&lease_id).cloned() else {
+        let lease = self.lock().get(&lease_id).cloned();
+        let Some(lease) = lease else {
             // Only a known lease reaches a fence; answer as for an unknown one.
             self.view.gates.fencing().remove(&lease_id);
             self.view.gates.stopping().remove(&lease_id);
@@ -1412,7 +1472,14 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
         self.note_bindings();
         let vms = self.bound.get(&lease_id).cloned().unwrap_or_default();
         let budget = budget_for(&lease, self.config.timers_for(&lease));
-        let bounded = lease.mode == LeaseMode::Expiring;
+        // An `expiring` lease must be stopped within `M` of the trigger on the
+        // lease clock (section 8.4), so its fence counts a host suspend.
+        let lease_clock = (lease.mode == LeaseMode::Expiring).then(|| FenceClock {
+            since: trigger.at,
+            suspends: Arc::clone(&self.view.suspends),
+            applied: trigger.applied,
+            host: Arc::clone(&self.config.host_clock),
+        });
         // Nothing stateful starts for this lease until the fence is recorded,
         // and nothing else stops its VMs until this stop finished.
         self.view.gates.triggered(&lease_id);
@@ -1432,19 +1499,29 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
             // among those stopped here.
             let _exclusive = gate.write_owned().await;
             let (stopping, unlisted) = fence_targets(&*engine, &desired, &fenced, known).await;
-            // An `expiring` lease must be stopped within `M` of the trigger
-            // (section 8.4), so the time since the trigger, waiting for a
-            // start or listing the VMs, comes out of the graceful stop.
-            let budget = if bounded {
-                FenceTimers {
-                    grace: budget.grace.saturating_sub(since.elapsed()),
-                    force: budget.force,
+            let report = match lease_clock {
+                // The time since the trigger on the lease clock, waiting for
+                // a start, listing the VMs and any host suspend meanwhile
+                // included, comes out of the graceful stop, and a suspend
+                // during the graceful stop ends it at the wake-up (ADR 0240).
+                Some(clock) => {
+                    let timers = FenceTimers {
+                        grace: budget.grace.saturating_sub(clock.elapsed()),
+                        force: budget.force,
+                    };
+                    if stopping.is_empty() || timers.grace.is_zero() {
+                        // No graceful stop to cut short: no timer is armed,
+                        // and no blocking thread waits on one.
+                        stop_vms(&*engine, &stopping, timers).await
+                    } else {
+                        let grace_over = clock.reaches(budget.grace);
+                        stop_vms_until(&*engine, &stopping, timers, grace_over).await
+                    }
                 }
-            } else {
-                budget
+                None => stop_vms(&*engine, &stopping, budget).await,
             };
             FenceOutcome {
-                report: stop_vms(&*engine, &stopping, budget).await,
+                report,
                 unlisted,
                 died: None,
             }

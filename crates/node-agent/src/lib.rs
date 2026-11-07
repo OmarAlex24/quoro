@@ -50,6 +50,7 @@ pub use lease::{
     LeaseConfig, LeaseLink, LeaseState, LeaseTable, LeaseView, LocalLeases, MIN_DURATION,
     ManualHostClock, Refusal, RevokeOutcome, StartPermit, StoredLease, StoredValidity,
     SystemHostClock, VmFenceOutcome, budget_for, margin, start_local_leases, stop_vms,
+    stop_vms_until,
 };
 pub use set_primary::{SetPrimary, set_primary, verify_primary, write_primary};
 
