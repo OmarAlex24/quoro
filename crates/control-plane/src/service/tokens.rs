@@ -33,15 +33,6 @@ const TOKEN_PREFIX: &str = "tok_";
 /// Crockford base32, the alphabet of the ULID in an id.
 const CROCKFORD: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
-/// A new `tok_<ULID>` id. `quoro_types::Prefix` has no `tok` member, so the
-/// ULID of a fresh id is re-prefixed; the ULID itself is generated the same
-/// way as every other id.
-fn new_token_id() -> String {
-    let id = new_id(Prefix::User);
-    let ulid = id.split_once('_').map_or(id.as_str(), |(_, ulid)| ulid);
-    format!("{TOKEN_PREFIX}{ulid}")
-}
-
 /// Whether `id` matches the contract's `TokenId` pattern.
 fn is_token_id(id: &str) -> bool {
     id.strip_prefix(TOKEN_PREFIX)
@@ -268,7 +259,7 @@ async fn insert_token(
     target: &Target,
     params: &Value,
 ) -> Result<ApiTokenCreated, ApiError> {
-    let id = new_token_id();
+    let id = new_id(Prefix::ApiToken);
     let secret = format!("{TOKEN_PREFIX}{}", random_secret());
     debug_assert_ne!(id, secret, "a token secret is never its id");
     let now = now_rfc3339();
