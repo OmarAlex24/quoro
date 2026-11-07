@@ -24,8 +24,8 @@ use quoro_node_agent::{
     StoredLease, StoredValidity, VmFenceOutcome, start_local_leases, stop_vms, stop_vms_until,
 };
 use quoro_proto::{
-    CommandStatus, Envelope, LeaseGrant, LeaseId, LeaseMode, LeaseRenew, LeaseRevoke, MsgId,
-    ResourceType, RevokeReason,
+    CommandStatus, Envelope, ErrorCode, LeaseGrant, LeaseId, LeaseMode, LeaseRenew, LeaseRevoke,
+    MsgId, ResourceType, RevokeReason,
 };
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -1375,6 +1375,76 @@ async fn a_local_grant_ends_a_converted_lease_s_renewals() {
     assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Running);
     assert!(store.fences().await.unwrap().is_empty());
     assert!(leases.view.may_start_stateful(LEASE, 1));
+    leases.abort();
+}
+
+/// Section 5.12, ADR 0258: while the node holds a lease, a grant with a
+/// higher token and the other mode is refused with `bad_message`, non-fatal,
+/// and changes nothing: the lease keeps its token and mode, its row is not
+/// rewritten, no renewal goes out and its VM runs on. Either way round.
+#[tokio::test]
+async fn a_higher_token_with_the_other_mode_is_refused_while_the_lease_is_held() {
+    let dir = TargetDir::new("expiring-mode-refusal");
+    let engine = Arc::new(FakeEngine::new());
+    let desired = bound(&["vm_warm"]);
+    let clock = clock();
+    let (leases, store) = start(&dir, &engine, &desired, config(&clock)).await;
+    let vm = running_vm(&engine, "vm_warm", 2).await;
+    let mut attached = leases.link.attach();
+    leases
+        .link
+        .grant(MsgId("msg_local".to_owned()), None, local_grant(1))
+        .await
+        .expect("the local grant is taken");
+    let row = store.load_leases().await.unwrap();
+
+    let refused = leases
+        .link
+        .grant(MsgId("msg_other".to_owned()), None, expiring(2, 15_000))
+        .await
+        .expect_err("a higher token with the other mode is refused");
+    assert_eq!(refused.code, ErrorCode::BadMessage);
+    assert!(!refused.fatal);
+    let hello = leases.link.hello();
+    assert_eq!(
+        (
+            hello[0].mode,
+            hello[0].fencing_token,
+            hello[0].state.as_str()
+        ),
+        (LeaseMode::Local, 1, "held")
+    );
+    assert_eq!(store.load_leases().await.unwrap(), row);
+    assert!(
+        tokio::time::timeout(millis(1000), attached.renewals.recv())
+            .await
+            .is_err(),
+        "no renewal for a refused grant"
+    );
+    assert!(leases.view.may_start_stateful(LEASE, 1));
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Running);
+
+    // An `expiring` lease the node holds keeps its deadline the same way.
+    leases
+        .link
+        .grant(MsgId("msg_convert".to_owned()), None, expiring(1, 15_000))
+        .await
+        .expect("the conversion is taken");
+    let renew = next_renewal(&mut attached).await;
+    answer(&leases, &renew, 15_000).await;
+    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Held));
+    let row = store.load_leases().await.unwrap();
+    let refused = leases
+        .link
+        .grant(MsgId("msg_local_higher".to_owned()), None, local_grant(2))
+        .await
+        .expect_err("a higher local token over a held expiring lease is refused");
+    assert_eq!(refused.code, ErrorCode::BadMessage);
+    assert_eq!(leases.link.hello()[0].mode, LeaseMode::Expiring);
+    assert_eq!(leases.link.hello()[0].fencing_token, 1);
+    assert_eq!(store.load_leases().await.unwrap(), row);
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Running);
+    assert!(engine.stop_calls().is_empty(), "nothing is fenced");
     leases.abort();
 }
 

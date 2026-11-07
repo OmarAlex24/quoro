@@ -472,6 +472,28 @@ impl LeaseTable {
             }
         }
 
+        // Section 5.12, ADR 0258: a lease changes mode only with the same
+        // token. A higher token with the other mode, over a lease the node
+        // holds, would replace it with nothing in between: a `local` lease's
+        // start, permitted with a 60 s bound, could still run under the new
+        // `expiring` lease, whose fence must stop its VMs within `M`, and an
+        // `expiring` lease would lose its deadline without a fence. After
+        // `expired` or `revoked`, the node holds nothing, and either mode is
+        // a new grant.
+        if !same_token
+            && let Some(existing) = &existing
+            && matches!(existing.state, LeaseState::Held | LeaseState::Uncertain)
+            && existing.mode != grant.mode
+        {
+            return Err(Refusal::BadMessage(format!(
+                "fencing_token {} would change lease {} from {} to {}; a lease changes mode only with the same token",
+                grant.fencing_token,
+                grant.lease_id.0,
+                mode_name(existing.mode),
+                mode_name(grant.mode)
+            )));
+        }
+
         // Section 5.12 and section 8.4 "Changing the mode" (ADR 0241): the
         // same token with the other mode changes the mode of the lease the
         // node holds. It is no ownership change and answers no renewal, so an
@@ -969,6 +991,14 @@ fn prune_outstanding(outstanding: &mut Vec<Renewal>, d: Duration, now: Instant) 
 fn plausible_validity(d: Duration, until: Instant, now: Instant) -> bool {
     (MIN_DURATION..=MAX_DURATION).contains(&d)
         && until.saturating_duration_since(now) <= d.saturating_sub(margin(d))
+}
+
+/// The wire name of a lease mode (section 5.12).
+fn mode_name(mode: LeaseMode) -> &'static str {
+    match mode {
+        LeaseMode::Local => "local",
+        LeaseMode::Expiring => "expiring",
+    }
 }
 
 #[cfg(test)]
@@ -1743,24 +1773,106 @@ mod tests {
             .expect("the ceiling itself is taken");
     }
 
-    /// A higher token is a new ownership whatever the mode, so a lease id
-    /// that held one mode can be granted again with the other (section 5.12).
-    /// A held `local` lease that a higher `expiring` grant replaces has no
-    /// deadline to keep: it is `uncertain` without one, so its VMs stop.
+    /// Section 5.12, ADR 0258: a higher token with the other mode is refused
+    /// while the node holds the lease, `held` or `uncertain`, and changes
+    /// nothing: the token, the mode, the deadline and the renewals stay, and
+    /// a grant the authority may send at that token is still taken.
     #[test]
-    fn a_higher_token_may_carry_the_other_mode() {
+    fn a_higher_token_never_changes_the_mode_of_a_lease_the_node_holds() {
+        let t0 = Instant::now();
+        let id = LeaseId("lse_a".to_string());
+
+        // `held` `local`, then a higher `expiring` grant.
+        let mut table = LeaseTable::new();
+        table.on_grant(&local("lse_a", 1), None, t0).expect("grant");
+        let before = table.get(&id).cloned().expect("lease");
+        let refused = table.on_grant(&expiring("lse_a", 2, 15000), None, t0);
+        assert!(
+            matches!(&refused, Err(Refusal::BadMessage(message)) if message.contains("only with the same token")),
+            "{refused:?}"
+        );
+        assert_eq!(table.get(&id), Some(&before));
+        assert!(table.may_keep_running(&id, 1));
+        assert!(table.poll(t0 + millis(60_000)).is_empty(), "no renewal");
+        table
+            .on_grant(&local("lse_a", 2), None, t0)
+            .expect("the same mode at that token is a new ownership");
+        assert_eq!(table.get(&id).expect("lease").token, 2);
+
+        // `held` `expiring`, then a higher `local` grant.
+        let mut table = LeaseTable::new();
+        let grant = expiring("lse_a", 1, 15000);
+        table.on_grant(&grant, None, t0).expect("grant");
+        confirm(&mut table, &grant, t0);
+        let before = table.get(&id).cloned().expect("lease");
+        assert_eq!(before.state, LeaseState::Held);
+        assert!(matches!(
+            table.on_grant(&local("lse_a", 2), None, t0),
+            Err(Refusal::BadMessage(_))
+        ));
+        assert_eq!(table.get(&id), Some(&before));
+        assert!(
+            matches!(
+                table.poll(t0 + millis(13_500)).as_slice(),
+                [Action::Fence { .. }]
+            ),
+            "the deadline it had still fences it"
+        );
+
+        // `uncertain` `expiring`, before its first renewal is answered.
+        let mut table = LeaseTable::new();
+        table
+            .on_grant(&expiring("lse_a", 1, 15000), None, t0)
+            .expect("grant");
+        let before = table.get(&id).cloned().expect("lease");
+        assert_eq!(before.state, LeaseState::Uncertain);
+        assert!(matches!(
+            table.on_grant(&local("lse_a", 2), None, t0),
+            Err(Refusal::BadMessage(_))
+        ));
+        assert_eq!(table.get(&id), Some(&before));
+        assert!(!table.may_keep_running(&id, 2));
+    }
+
+    /// Section 5.12, ADR 0258: after `expired` or `revoked` the node holds
+    /// nothing, so a higher token may carry either mode.
+    #[test]
+    fn a_higher_token_may_carry_the_other_mode_after_expired_or_revoked() {
         let t0 = Instant::now();
         let mut table = LeaseTable::new();
         table.on_grant(&local("lse_a", 1), None, t0).expect("grant");
         table
+            .on_revoke(&LeaseRevoke {
+                lease_id: LeaseId("lse_a".to_string()),
+                fencing_token: 1,
+                reason: RevokeReason::Moved,
+            })
+            .expect("revoke");
+        table
             .on_grant(&expiring("lse_a", 2, 15000), None, t0)
-            .expect("a new ownership");
-        let id = LeaseId("lse_a".to_string());
-        let lease = table.get(&id).expect("lease");
-        assert_eq!(lease.state, LeaseState::Uncertain);
-        assert_eq!(lease.valid_until, None);
-        assert!(!table.may_keep_running(&id, 2));
-        assert!(!table.may_keep_running(&id, 1));
+            .expect("granted again as expiring");
+        let lease = table.get(&LeaseId("lse_a".to_string())).expect("lease");
+        assert_eq!(
+            (lease.mode, lease.state, lease.token, lease.valid_until),
+            (LeaseMode::Expiring, LeaseState::Uncertain, 2, None)
+        );
+
+        let mut table = LeaseTable::new();
+        let grant = expiring("lse_x", 1, 15000);
+        table.on_grant(&grant, None, t0).expect("grant");
+        confirm(&mut table, &grant, t0);
+        assert!(matches!(
+            table.poll(t0 + millis(13_500)).as_slice(),
+            [Action::Fence { .. }]
+        ));
+        table
+            .on_grant(&local("lse_x", 2), None, t0)
+            .expect("granted again as local after expiry");
+        let lease = table.get(&LeaseId("lse_x".to_string())).expect("lease");
+        assert_eq!(
+            (lease.mode, lease.state, lease.token),
+            (LeaseMode::Local, LeaseState::Held, 2)
+        );
 
         let mut table = LeaseTable::new();
         let grant = expiring("lse_e", 1, 15000);
