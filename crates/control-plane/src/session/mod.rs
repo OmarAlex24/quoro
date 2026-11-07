@@ -38,7 +38,7 @@ use quoro_proto::wire::{self, ControlMessage, NodeMessage};
 use quoro_providers::DnsProvider;
 use serde_json::{Value, json};
 use sqlx::Row;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -322,6 +322,9 @@ struct HubInner {
     /// The warm facts of the newest snapshot sent to each node, in memory
     /// only ([`NodeHub::swap_warm_facts`]).
     warm_facts: Mutex<HashMap<String, crate::warm::WarmFacts>>,
+    /// The volume ids `spec.volumes` named in the newest snapshot sent to
+    /// each node, in memory only ([`NodeHub::apply_warm_report`]).
+    warm_named: Mutex<HashMap<String, BTreeSet<String>>>,
     /// Free space on the volume filesystem each node last reported
     /// (`status_report.disk_free_gb`, section 5.3).
     disk_free_gb: Mutex<HashMap<String, f64>>,
@@ -406,6 +409,7 @@ impl NodeHub {
             edge_health: Mutex::new(BTreeMap::new()),
             warm_reports: Mutex::new(HashMap::new()),
             warm_facts: Mutex::new(HashMap::new()),
+            warm_named: Mutex::new(HashMap::new()),
             disk_free_gb: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
             snapshot_holds: Mutex::new(HashMap::new()),
@@ -629,11 +633,21 @@ impl NodeHub {
             .unwrap_or_default()
     }
 
-    /// Keeps the newest `status_report.warm` of `node_id`. Only a change in
-    /// the copies it holds as a warm node rebuilds its snapshot, because such
-    /// a copy may get a `deleted` entry (section 5.11); a new snapshot number
-    /// or lag changes only `App.warm`, which is read from here.
+    /// Keeps the newest `status_report.warm` of `node_id`, and rebuilds its
+    /// snapshot when a copy it holds as a warm node may need a `deleted`
+    /// entry (section 5.11, ADR 0267):
+    /// - when the copies it reports change;
+    /// - when it reports a copy its newest snapshot does not name: one kept
+    ///   because a failover may still need it. Nothing else wakes the node
+    ///   once the database makes such a copy stale, as when the lease is
+    ///   granted again or the volume or its app is deleted. The node reports
+    ///   at least every 30 s, so its entry follows within that. A rebuild that
+    ///   changes nothing sends nothing.
+    ///
+    /// A new snapshot number or lag changes only `App.warm`, which is read
+    /// from here.
     fn apply_warm_report(&self, node_id: &str, report: &[wire::WarmStatus]) {
+        let reported = crate::warm::reported_targets(report);
         let changed = {
             let mut reports = self.0.warm_reports.lock().expect("warm report lock");
             let before = reports
@@ -645,11 +659,33 @@ impl NodeHub {
             } else {
                 reports.insert(node_id.to_string(), report.to_vec());
             }
-            before != crate::warm::reported_targets(report)
+            before != reported
         };
-        if changed {
+        let kept = {
+            let named = self.0.warm_named.lock().expect("warm named lock");
+            let named = named.get(node_id);
+            reported
+                .iter()
+                .any(|(volume_id, _)| !named.is_some_and(|named| named.contains(volume_id)))
+        };
+        if changed || kept {
             self.node_changed(node_id);
         }
+    }
+
+    /// Records the volume ids `spec.volumes` names in the snapshot just sent
+    /// to `node_id` ([`NodeHub::apply_warm_report`]).
+    fn record_warm_named(&self, node_id: &str, spec: &wire::Spec) {
+        let named = spec
+            .volumes
+            .iter()
+            .map(|file| file.volume_id.clone())
+            .collect();
+        self.0
+            .warm_named
+            .lock()
+            .expect("warm named lock")
+            .insert(node_id.to_string(), named);
     }
 
     /// Records the warm facts of the snapshot just sent to `node_id` and
@@ -659,11 +695,7 @@ impl NodeHub {
     /// compared with what it was last sent, so a pair that went away while it
     /// was disconnected still reaches the other node. A node's first session
     /// since the primary started rebuilds every node already.
-    fn swap_warm_facts(
-        &self,
-        node_id: &str,
-        facts: &crate::warm::WarmFacts,
-    ) -> std::collections::BTreeSet<String> {
+    fn swap_warm_facts(&self, node_id: &str, facts: &crate::warm::WarmFacts) -> BTreeSet<String> {
         let mut sent = self.0.warm_facts.lock().expect("warm facts lock");
         let before = if facts.is_empty() {
             sent.remove(node_id)
@@ -2566,6 +2598,7 @@ impl Session {
                 self.hub.node_changed(&peer);
             }
         }
+        self.hub.record_warm_named(&self.node_id, &spec);
         self.last_spec = Some(spec);
         self.hub.tunnel_changed(&self.node_id);
         Ok(())

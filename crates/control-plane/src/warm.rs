@@ -12,8 +12,10 @@
 //! A warm node keeps reporting every copy it holds until it is removed, also
 //! one the database no longer gives it. Such a copy gets a `deleted` entry
 //! once no failover can need it, and keeps it while the node reports the
-//! copy ([`stale_copies`], ADR 0267). The reports live in memory, so after a
-//! primary restart the node's first report brings the copy back into view.
+//! copy ([`stale_copies`], ADR 0267). A copy kept because a failover may
+//! still need it is checked again at each of the node's reports, at least
+//! every 30 s. The reports live in memory, so after a primary restart the
+//! node's first report brings the copy back into view.
 //!
 //! Nothing about a copy's progress is stored (migration 0011). The primary
 //! keeps each node's newest `status_report.warm` in memory, as it does for the
@@ -91,8 +93,10 @@ pub(crate) enum Unpaired {
     /// with this reason.
     Ineligible(&'static str),
     /// The volume's node holds no unrevoked lease of the app: the app is
-    /// moving, as during a fence, a restore or a switchover. Nothing is
-    /// shown, and the warm node keeps its copy ([`stale_copies`]).
+    /// moving, as during a fence, a restore or a switchover. `App.warm`
+    /// names no reason for it: the warm node keeps its copy
+    /// ([`stale_copies`]) and still reports it (ADR 0267), so `App.warm`
+    /// shows that copy, whose lag grows while nothing is shipped.
     NoLease,
 }
 

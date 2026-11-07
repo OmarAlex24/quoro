@@ -1293,9 +1293,9 @@ impl<E: Engine + 'static> Inner<E> {
     /// - one per copy the node still holds that the spec does not name so: a
     ///   copy whose app left `warm`, got another warm node, was deleted or is
     ///   moving, and one whose removal failed. It is reported until it is
-    ///   removed, so
-    ///   the primary keeps sending its `deleted` entry, also after its own
-    ///   restart (ADR 0267).
+    ///   removed, so the primary keeps sending its `deleted` entry, also
+    ///   after its own restart (ADR 0267). A row with no complete copy is
+    ///   reported too: a failed swap may have left a file of unknown content.
     ///
     /// A volume the node holds as its own is never reported the second way:
     /// its file is that volume, not a warm copy, and a `deleted` entry for it
