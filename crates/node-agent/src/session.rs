@@ -12,7 +12,7 @@
 //! `unauthenticated`/`node_removed` stops dialing for good;
 //! `unsupported_version` keeps dialing and only logs.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1258,8 +1258,8 @@ impl Session {
                     }
                 } else if command.kind == "fence_ack" {
                     let body = match parse_fence_ack(&command.params) {
-                        Ok(lease_ids) => match &self.leases {
-                            Some(leases) => leases.fence_ack(lease_ids).await,
+                        Ok((lease_ids, fencing_tokens)) => match &self.leases {
+                            Some(leases) => leases.fence_ack(lease_ids, fencing_tokens).await,
                             // Without a lease service no fence was recorded.
                             None => CommandResult {
                                 status: CommandStatus::Ok,
@@ -2103,9 +2103,15 @@ fn timestamp_param(params: &serde_json::Value, name: &str) -> Result<Option<i64>
     }
 }
 
-/// The `lease_ids` of a `fence_ack` command (section 5.17): at least one
-/// `lse_` id.
-fn parse_fence_ack(params: &serde_json::Value) -> Result<Vec<String>, String> {
+/// The params of a `fence_ack` command (section 5.17): `lease_ids`, at least
+/// one `lse_` id, and from M5b `fencing_tokens`, an object with a
+/// non-negative integer for every listed lease (ADR 0245). Without it, as a
+/// primary before M5b sends the command, the tokens are `None`. A
+/// `fencing_tokens` that misses a listed lease, or names one with anything
+/// but such an integer, refuses the whole command, so nothing is cleared.
+type FenceAckParams = (Vec<String>, Option<BTreeMap<String, u64>>);
+
+fn parse_fence_ack(params: &serde_json::Value) -> Result<FenceAckParams, String> {
     let ids = params
         .get("lease_ids")
         .and_then(serde_json::Value::as_array)
@@ -2120,7 +2126,26 @@ fn parse_fence_ack(params: &serde_json::Value) -> Result<Vec<String>, String> {
     if lease_ids.is_empty() {
         return Err("fence_ack needs at least one lease id".to_owned());
     }
-    Ok(lease_ids)
+    let fencing_tokens = match params.get("fencing_tokens") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Object(entries)) => {
+            let mut tokens = BTreeMap::new();
+            for lease_id in &lease_ids {
+                let token = entries
+                    .get(lease_id)
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| {
+                        format!(
+                            "fence_ack fencing_tokens has no non-negative integer for lease {lease_id}"
+                        )
+                    })?;
+                tokens.insert(lease_id.clone(), token);
+            }
+            Some(tokens)
+        }
+        Some(_) => return Err("fence_ack fencing_tokens is not an object".to_owned()),
+    };
+    Ok((lease_ids, fencing_tokens))
 }
 
 /// Parses `inventory_resend` params (section 5.26): the image's digest.
@@ -4082,5 +4107,43 @@ mod tests {
         })
         .await;
         assert_eq!(end, SessionEnd::Reconnect);
+    }
+
+    /// Section 5.17 (ADR 0245): a `fence_ack` without `fencing_tokens`, as a
+    /// primary before M5b sends it, has no tokens; with them, every listed
+    /// lease needs a non-negative integer, and an entry for a lease it does
+    /// not list is ignored.
+    #[test]
+    fn a_fence_ack_carries_a_token_for_every_listed_lease() {
+        let (ids, tokens) = parse_fence_ack(&json!({"lease_ids": ["lse_a"]})).unwrap();
+        assert_eq!(ids, vec!["lse_a".to_owned()]);
+        assert_eq!(tokens, None);
+        let (_, tokens) =
+            parse_fence_ack(&json!({"lease_ids": ["lse_a"], "fencing_tokens": null})).unwrap();
+        assert_eq!(tokens, None);
+
+        let (ids, tokens) = parse_fence_ack(&json!({
+            "lease_ids": ["lse_a", "lse_b"],
+            "fencing_tokens": {"lse_a": 8, "lse_b": 3, "lse_c": 1},
+        }))
+        .unwrap();
+        assert_eq!(ids, vec!["lse_a".to_owned(), "lse_b".to_owned()]);
+        assert_eq!(
+            tokens,
+            Some(BTreeMap::from([
+                ("lse_a".to_owned(), 8),
+                ("lse_b".to_owned(), 3)
+            ]))
+        );
+
+        for refused in [
+            json!({"lease_ids": ["lse_a", "lse_b"], "fencing_tokens": {"lse_a": 8}}),
+            json!({"lease_ids": ["lse_a"], "fencing_tokens": {"lse_a": -1}}),
+            json!({"lease_ids": ["lse_a"], "fencing_tokens": {"lse_a": "8"}}),
+            json!({"lease_ids": ["lse_a"], "fencing_tokens": {"lse_a": 8.5}}),
+            json!({"lease_ids": ["lse_a"], "fencing_tokens": [8]}),
+        ] {
+            assert!(parse_fence_ack(&refused).is_err(), "{refused}");
+        }
     }
 }

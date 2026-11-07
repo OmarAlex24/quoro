@@ -66,7 +66,7 @@
 //! again ([`LeaseTable::restore`]). A revoke is answered with success only once
 //! that transaction committed.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -91,7 +91,7 @@ use crate::lease::fence::{
 use crate::lease::machine::{Action, Lease, LeaseState, LeaseTable, Refusal, RevokeOutcome};
 use crate::lease::store::{FenceRecord, StoredLease};
 use crate::reconcile::Snapshot;
-use crate::store::{HOST_BOOT_ID, NodeStore};
+use crate::store::{FailedFence, HOST_BOOT_ID, NodeStore, acknowledges};
 use crate::util;
 
 /// How often the service looks for a host suspend while an `expiring` lease
@@ -513,6 +513,7 @@ enum LeaseCommand {
     },
     FenceAck {
         lease_ids: Vec<String>,
+        fencing_tokens: Option<BTreeMap<String, u64>>,
         reply: oneshot::Sender<CommandResult>,
     },
     /// A session is up: renewals go out through `renewals`, and every live
@@ -649,14 +650,23 @@ impl LeaseLink {
 
 impl LeaseLink {
     /// Applies a `fence_ack` (section 5.17, section 8.5): clears the failed
-    /// fence of each listed lease, and the node's failed mark once none
+    /// fences of each listed lease, below its entry in `fencing_tokens` when
+    /// the primary sent them (ADR 0245), and the node's failed mark once none
     /// remains. The listed leases stay `revoked` or `expired`: nothing starts
     /// for them before a grant with a higher token.
-    pub async fn fence_ack(&self, lease_ids: Vec<String>) -> CommandResult {
+    pub async fn fence_ack(
+        &self,
+        lease_ids: Vec<String>,
+        fencing_tokens: Option<BTreeMap<String, u64>>,
+    ) -> CommandResult {
         let (reply, answer) = oneshot::channel();
         if self
             .commands
-            .send(LeaseCommand::FenceAck { lease_ids, reply })
+            .send(LeaseCommand::FenceAck {
+                lease_ids,
+                fencing_tokens,
+                reply,
+            })
             .is_err()
         {
             return not_fenced("the lease service is not running");
@@ -782,7 +792,7 @@ pub async fn start_local_leases<E: Engine + 'static>(
         tasks: JoinSet::new(),
         task_leases: HashMap::new(),
         recorded,
-        unstored_failures: BTreeSet::new(),
+        unstored_failures: BTreeMap::new(),
         unstored_conversions: HashSet::new(),
         renewals: None,
     };
@@ -824,7 +834,10 @@ async fn unreported_failures(
     };
     let mut latest: HashMap<String, FenceRecord> = HashMap::new();
     for record in records.iter().filter(|record| !record.complete) {
-        if listed.contains(&record.lease_id.0) {
+        if listed
+            .iter()
+            .any(|fence| fence.lease_id == record.lease_id.0)
+        {
             latest.insert(record.lease_id.0.clone(), record.clone());
         }
     }
@@ -942,10 +955,11 @@ struct LocalLeaseService<E: Engine> {
     task_leases: HashMap<tokio::task::Id, LeaseId>,
     /// The complete fences recorded in the store, by lease and token.
     recorded: HashSet<(LeaseId, u64)>,
-    /// Leases whose failed fence the store did not take: the failed mark
-    /// holds for them in memory, and only a `fence_ack` naming them clears
-    /// them (section 5.17).
-    unstored_failures: BTreeSet<String>,
+    /// Leases whose failed fence the store did not take, each with the
+    /// highest token such a fence had: the failed mark holds for them in
+    /// memory, and only a `fence_ack` that covers them clears them (section
+    /// 5.17, ADR 0245).
+    unstored_failures: BTreeMap<String, u64>,
     /// Leases converted to `expiring` whose row could not be written yet
     /// (ADR 0241). Their first renewal waits until the row is stored: a
     /// restart must never find a row still `local` once the authority could
@@ -1042,8 +1056,12 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
             LeaseCommand::Revoke { envelope, reply } => {
                 self.revoke(envelope, reply).await;
             }
-            LeaseCommand::FenceAck { lease_ids, reply } => {
-                let _ = reply.send(self.fence_ack(&lease_ids).await);
+            LeaseCommand::FenceAck {
+                lease_ids,
+                fencing_tokens,
+                reply,
+            } => {
+                let _ = reply.send(self.fence_ack(&lease_ids, fencing_tokens.as_ref()).await);
             }
             LeaseCommand::Attach { session, renewals } => {
                 self.renewals = Some((session, renewals));
@@ -1202,12 +1220,35 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
     /// new acknowledgement clears it (ADR 0238). Until the fence is recorded,
     /// nothing starts for its lease.
     ///
-    /// The list names leases, not tokens, so a failure recorded after the
-    /// operator checked but before this command is taken (a fence that ended
-    /// while the command waited, or one whose event has not reached the
-    /// primary yet) is cleared with its lease. `fence_ack` carries no token
-    /// to tell them apart; that needs a contract change.
-    async fn fence_ack(&mut self, lease_ids: &[String]) -> CommandResult {
+    /// With `fencing_tokens` (ADR 0245), a listed lease's failed fences are
+    /// cleared only below its acknowledged token, so a failure recorded after
+    /// the operator checked but before this command is taken (a fence that
+    /// ended while the command waited, or one whose event has not reached the
+    /// primary yet) stays when its token is at or above that one. A primary
+    /// before M5b sends no tokens, and then every failed fence of a listed
+    /// lease is cleared, as before. A `fence_ack` whose `fencing_tokens`
+    /// misses a listed lease clears nothing.
+    async fn fence_ack(
+        &mut self,
+        lease_ids: &[String],
+        fencing_tokens: Option<&BTreeMap<String, u64>>,
+    ) -> CommandResult {
+        if let Some(tokens) = fencing_tokens
+            && let Some(missing) = lease_ids.iter().find(|id| !tokens.contains_key(*id))
+        {
+            return CommandResult {
+                status: CommandStatus::Error,
+                detail: Some(format!(
+                    "fence_ack names lease {missing} without a token in fencing_tokens; nothing was cleared"
+                )),
+                error: Some(ErrorBody {
+                    code: ErrorCode::BadMessage,
+                    message: format!("fencing_tokens has no token for lease {missing}"),
+                }),
+                lines: None,
+                metrics: None,
+            };
+        }
         let running: Vec<&str> = lease_ids
             .iter()
             .filter(|lease_id| self.in_flight.contains_key(&LeaseId((*lease_id).clone())))
@@ -1221,14 +1262,25 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                 running.join(", ")
             )
         };
-        match self.store.ack_fences(lease_ids).await {
+        match self.store.ack_fences(lease_ids, fencing_tokens).await {
             Ok(mut remaining) => {
-                for lease_id in lease_ids {
-                    self.unstored_failures.remove(lease_id);
-                }
-                for lease_id in &self.unstored_failures {
-                    if !remaining.contains(lease_id) {
-                        remaining.push(lease_id.clone());
+                self.unstored_failures.retain(|lease_id, token| {
+                    let fence = FailedFence {
+                        lease_id: lease_id.clone(),
+                        fencing_token: *token,
+                    };
+                    !acknowledges(lease_ids, fencing_tokens, &fence)
+                });
+                for (lease_id, token) in &self.unstored_failures {
+                    match remaining
+                        .iter_mut()
+                        .find(|fence| &fence.lease_id == lease_id)
+                    {
+                        Some(fence) => fence.fencing_token = fence.fencing_token.max(*token),
+                        None => remaining.push(FailedFence {
+                            lease_id: lease_id.clone(),
+                            fencing_token: *token,
+                        }),
                     }
                 }
                 if remaining.is_empty() {
@@ -1245,7 +1297,14 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                         status: CommandStatus::Ok,
                         detail: Some(format!(
                             "the node stays failed: failed fences remain for {}{running_note}",
-                            remaining.join(", ")
+                            remaining
+                                .iter()
+                                .map(|fence| format!(
+                                    "{} (token {})",
+                                    fence.lease_id, fence.fencing_token
+                                ))
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         )),
                         error: None,
                         lines: None,
@@ -1691,13 +1750,18 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                 if !complete
                     && let Err(e) = self
                         .store
-                        .mark_fence_failed(&lease_id.0, &evt_id, &event)
+                        .mark_fence_failed(&lease_id.0, token, &evt_id, &event)
                         .await
                 {
                     warn!(error = %e, "could not store the node's failed mark");
-                    // An acknowledgement of other leases must not clear the
-                    // mark this failure holds in memory.
-                    self.unstored_failures.insert(lease_id.0.clone());
+                    // An acknowledgement of other leases, or one below this
+                    // fence's token, must not clear the mark this failure
+                    // holds in memory.
+                    let stored = self
+                        .unstored_failures
+                        .entry(lease_id.0.clone())
+                        .or_insert(token);
+                    *stored = (*stored).max(token);
                 }
                 if complete {
                     not_fenced(&format!(

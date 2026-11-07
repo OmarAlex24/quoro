@@ -25,8 +25,8 @@ use quoro_node_agent::store::NodeStore;
 use quoro_node_agent::{FenceTimers, LeaseConfig, LeaseState, ManualHostClock, start_local_leases};
 use quoro_proto::sign::{self, SigningKey};
 use quoro_proto::wire::{
-    ControlMessage, DesiredState, DesiredStatus, EdgeBackend, EdgeRoute, HealthCheck, Spec,
-    SpecEdge, SpecNetwork, Welcome,
+    Command, ControlMessage, DesiredState, DesiredStatus, EdgeBackend, EdgeRoute, HealthCheck,
+    Spec, SpecEdge, SpecNetwork, Welcome,
 };
 use quoro_proto::{LeaseGrant, LeaseId, LeaseMode, LeaseRevoke, ResourceType, RevokeReason};
 use serde_json::Value;
@@ -1271,5 +1271,140 @@ async fn the_session_carries_renewals_and_its_end_makes_the_lease_uncertain() {
     .await;
     assert!(view.may_keep_running("lse_warm", 1));
     assert!(engine.stop_calls().is_empty(), "nothing is fenced");
+    leases.abort();
+}
+
+/// Reads frames until the answer to the message `id`.
+async fn answer_to(ws: &mut WebSocketStream<DuplexStream>, id: &str) -> Value {
+    loop {
+        let frame = read_frame(ws).await;
+        if frame["type"] == "command_result" && frame["re"] == id {
+            return frame;
+        }
+    }
+}
+
+fn fence_ack_frame(lease_id: &str, token: u64, id: &str) -> String {
+    ControlMessage::Command(Command {
+        kind: "fence_ack".to_owned(),
+        params: serde_json::json!({
+            "lease_ids": [lease_id],
+            "fencing_tokens": { lease_id: token },
+        }),
+    })
+    .to_frame(id, None)
+    .to_text()
+}
+
+/// Section 5.17 (ADR 0245): a `fence_ack` that reaches the node over its
+/// session clears only the failed fences below its `fencing_tokens`. The
+/// fence of a revoke at token 1 fails; an acknowledgement at token 1 leaves
+/// it standing, and one at token 2 clears it.
+#[tokio::test]
+async fn a_fence_ack_over_the_session_clears_only_below_its_tokens() {
+    let dir = TempDir::new();
+    let key = sign::signing_key_from_seed(&[4; 32]);
+    let identity = identity_files(dir.path(), &key);
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let engine = Arc::new(FakeEngine::new());
+    let (lease_desired, _) = watch::channel(Some(snapshot_full(
+        1,
+        vec![stateful_vm("vm_hung", "lse_hung", 1, Vec::new())],
+        Vec::new(),
+        Vec::new(),
+    )));
+    let leases = start_local_leases(
+        Arc::clone(&engine),
+        store.clone(),
+        LeaseConfig::new(
+            "nod_test",
+            FenceTimers {
+                grace: Duration::from_millis(50),
+                force: Duration::from_millis(50),
+            },
+        ),
+        lease_desired.subscribe(),
+    )
+    .await
+    .expect("the lease service starts");
+    leases
+        .link
+        .grant(
+            quoro_proto::MsgId("msg_grant".to_owned()),
+            None,
+            local_grant("lse_hung", "app_hung", 1),
+        )
+        .await
+        .unwrap();
+    let vm = common::running_vm(&engine, "vm_hung", 2).await;
+    engine.set_unkillable(&vm, true);
+    let view = leases.view.clone();
+    let (desired, _desired_rx) = watch::channel(None);
+    let (_observed_tx, observed_rx) = watch::channel(Vec::new());
+    let mut session = Session::new(SessionSetup {
+        identity,
+        store: store.clone(),
+        facts: facts(),
+        desired,
+        observed: observed_rx,
+        current: None,
+        builds: None,
+    })
+    .with_leases(leases.link.clone());
+
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let accept = tokio::spawn(tokio_tungstenite::accept_async(server));
+    let (client_ws, _response) = client_async("ws://primary.test/api/v1/nodes/session", client)
+        .await
+        .unwrap();
+    let mut ws = accept.await.unwrap().unwrap();
+    let serving =
+        tokio::spawn(async move { session.serve(client_ws, std::future::pending::<()>()).await });
+
+    let hello = read_frame(&mut ws).await;
+    send(
+        &mut ws,
+        ControlMessage::Welcome(Welcome {
+            cluster_id: "cls_test".to_owned(),
+            term: 1,
+            server_time: "2026-11-02T10:15:30Z".to_owned(),
+            heartbeat_interval_ms: 100,
+            session_timeout_ms: 15_000,
+            primary_node_id: "nod_primary".to_owned(),
+            primary_urls: Vec::new(),
+        })
+        .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
+        .to_text(),
+    )
+    .await;
+    read_until(&mut ws, "status_report").await;
+
+    send(&mut ws, revoke_frame("lse_hung", 1, "msg_revoke")).await;
+    let revoked = answer_to(&mut ws, "msg_revoke").await;
+    assert_eq!(
+        revoked["body"]["error"]["code"], "fence_failed",
+        "{revoked}"
+    );
+    assert!(view.is_failed());
+
+    send(&mut ws, fence_ack_frame("lse_hung", 1, "msg_ack_1")).await;
+    let kept = answer_to(&mut ws, "msg_ack_1").await;
+    assert_eq!(kept["body"]["status"], "ok", "{kept}");
+    assert!(
+        kept["body"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("lse_hung")),
+        "{kept}"
+    );
+    assert!(view.is_failed(), "a failed fence at the token stays");
+
+    send(&mut ws, fence_ack_frame("lse_hung", 2, "msg_ack_2")).await;
+    let cleared = answer_to(&mut ws, "msg_ack_2").await;
+    assert_eq!(cleared["body"]["status"], "ok", "{cleared}");
+    assert!(!view.is_failed(), "one above the token clears it");
+
+    ws.close(None).await.unwrap();
+    drop(ws);
+    assert_eq!(serving.await.unwrap().unwrap(), SessionEnd::Reconnect);
     leases.abort();
 }
