@@ -1,8 +1,6 @@
 import type {
   App,
   AppStatus,
-  Deployment,
-  DeploymentPhase,
   DomainCertStatus,
   DomainServingStatus,
   DomainTlsMode,
@@ -63,102 +61,6 @@ export const DEPLOY_PHASE_LABELS: Record<DeployPhase, string> = {
 };
 
 export type StationState = 'done' | 'current' | 'failed' | 'not-reached';
-
-export interface RailStation {
-  readonly phase: DeployPhase;
-  readonly state: StationState;
-}
-
-export interface DeploymentRail {
-  readonly stations: ReadonlyArray<RailStation>;
-  /** A rail-wide note, e.g. when a deployment was superseded. */
-  readonly caption: string | null;
-  /** True while the deployment is still moving, so the caller polls every 1 s. */
-  readonly live: boolean;
-}
-
-const phaseIndex = (phase: DeploymentPhase | null | undefined): number => {
-  if (phase === null || phase === undefined || phase === 'build') return -1;
-  const index = DEPLOY_PHASES.indexOf(phase);
-  return index;
-};
-
-const notReached = (): RailStation[] =>
-  DEPLOY_PHASES.map((phase) => ({ phase, state: 'not-reached' as const }));
-
-/**
- * Derive the four stations from `status` + `phase`. The order is the real
- * sequence, so the stations are never numbered.
- */
-export const deploymentRail = (
-  deployment: Pick<Deployment, 'status' | 'phase'>,
-): DeploymentRail => {
-  const live =
-    deployment.status === 'pending' ||
-    deployment.status === 'preparing' ||
-    deployment.status === 'starting';
-
-  if (deployment.status === 'succeeded') {
-    return {
-      stations: DEPLOY_PHASES.map((phase) => ({ phase, state: 'done' as const })),
-      caption: null,
-      live: false,
-    };
-  }
-
-  if (deployment.status === 'superseded') {
-    return {
-      stations: notReached(),
-      caption: 'Superseded by a newer deployment',
-      live: false,
-    };
-  }
-
-  if (deployment.status === 'failed') {
-    const failedAt = phaseIndex(deployment.phase);
-    return {
-      stations: DEPLOY_PHASES.map((phase, index) => ({
-        phase,
-        state:
-          failedAt < 0
-            ? 'not-reached'
-            : index < failedAt
-              ? 'done'
-              : index === failedAt
-                ? 'failed'
-                : 'not-reached',
-      })),
-      caption: null,
-      live: false,
-    };
-  }
-
-  // pending, preparing or starting: the current phase is the station lit amber.
-  let current = -1;
-  if (deployment.status === 'preparing') {
-    const index = phaseIndex(deployment.phase);
-    current = index >= 0 ? index : 0;
-  } else if (deployment.status === 'starting') {
-    const index = phaseIndex(deployment.phase);
-    current = index >= 0 ? index : 2;
-  }
-
-  return {
-    stations: DEPLOY_PHASES.map((phase, index) => ({
-      phase,
-      state:
-        current < 0
-          ? 'not-reached'
-          : index < current
-            ? 'done'
-            : index === current
-              ? 'current'
-              : 'not-reached',
-    })),
-    caption: deployment.status === 'pending' ? 'Queued, waiting for the node' : null,
-    live,
-  };
-};
 
 export const stationTone = (state: StationState): LampTone => {
   switch (state) {

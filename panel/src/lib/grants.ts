@@ -8,22 +8,7 @@ import type {
 } from '../api/generated/model';
 import { describeSelector, expiryWords, formatDuration } from './agency-format';
 import { clamp } from './dither';
-import type { LampTone } from './lamp';
 import { DESTRUCTIVE_SCOPES, HUMAN_ONLY_SCOPES, isGrantableScope } from './scopes';
-
-/** Grant lifecycle in the lamp language: active burns, terminal states settle. */
-export const grantLamp = (status: GrantStatus): LampTone => {
-  switch (status) {
-    case 'active':
-      return 'run';
-    case 'exhausted':
-      return 'idle';
-    case 'expired':
-      return 'idle';
-    case 'revoked':
-      return 'fault';
-  }
-};
 
 export const grantStatusWords: Record<GrantStatus, string> = {
   active: 'Active',

@@ -9,7 +9,6 @@ import {
 } from '../lib/metrics';
 import {
   useAppMetricsStream,
-  useNodeMetricsStream,
   type MetricsStreamStatus,
 } from '../lib/use-metrics-stream';
 import { cn } from '../lib/utils';
@@ -83,58 +82,6 @@ const noticeFor = (
 
 const lastOf = <T,>(samples: readonly T[]): T | undefined =>
   samples.length === 0 ? undefined : samples[samples.length - 1];
-
-/** A node's CPU and memory, live from the node itself. */
-export function NodeMetricsBay({
-  nodeId,
-  enabled = true,
-  className,
-}: {
-  nodeId: string;
-  enabled?: boolean;
-  className?: string;
-}) {
-  const { samples, status, problem } = useNodeMetricsStream(nodeId, enabled);
-  const last = lastOf(samples);
-  const total = samples.reduce(
-    (highest, sample) => Math.max(highest, sample.memory_total_bytes),
-    0,
-  );
-  const notice = noticeFor(status, problem);
-
-  return (
-    <MetricsBayCard status={status} className={className}>
-      <div className="mt-3 grid gap-x-6 gap-y-4 sm:grid-cols-2">
-        <MetricChart
-          title="CPU"
-          currentText={last ? formatPercent(last.cpu_usage) : '—'}
-          samples={samples}
-          value={(sample) => sample.cpu_usage}
-          domain={cpuDomain(samples)}
-          formatValue={formatPercent}
-          tone="accent"
-          emptyText={COLLECTING}
-          notice={notice}
-        />
-        <MetricChart
-          title="Memory"
-          currentText={
-            last
-              ? `${formatBytes(last.memory_used_bytes)} of ${formatBytes(last.memory_total_bytes)}`
-              : '—'
-          }
-          samples={samples}
-          value={(sample) => sample.memory_used_bytes}
-          domain={memoryDomain(total)}
-          formatValue={formatBytes}
-          tone="ion"
-          emptyText={COLLECTING}
-          notice={notice}
-        />
-      </div>
-    </MetricsBayCard>
-  );
-}
 
 /** An app's instances, each with its own pair of charts. */
 export function AppMetricsBay({

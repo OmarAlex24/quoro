@@ -5,7 +5,6 @@ import {
   approvalTitle,
   approvalWants,
   callText,
-  approvalLamp,
   approvalMeter,
   approveWords,
   approvalWords,
@@ -13,7 +12,6 @@ import {
   decidedNewestFirst,
   decisionBody,
   isDestructiveScope,
-  paramRows,
   pendingByExpiry,
 } from './approvals';
 
@@ -38,11 +36,7 @@ const approval = (overrides: Partial<Approval>): Approval => ({
 });
 
 describe('approvals', () => {
-  it('maps each status to its lamp and word', () => {
-    expect(approvalLamp('pending')).toBe('shift');
-    expect(approvalLamp('approved')).toBe('run');
-    expect(approvalLamp('denied')).toBe('fault');
-    expect(approvalLamp('expired')).toBe('idle');
+  it('says each status in one word', () => {
     expect(approvalWords.pending).toBe('Waiting');
     expect(approvalWords.expired).toBe('Expired');
   });
@@ -54,36 +48,6 @@ describe('approvals', () => {
     expect(isDestructiveScope('node:remove')).toBe(true);
     expect(isDestructiveScope('app:restart')).toBe(false);
     expect(isDestructiveScope('approval:create')).toBe(false);
-  });
-
-  it('flattens params by key, printing nested values as indented JSON', () => {
-    expect(paramRows({})).toEqual([]);
-    const rows = paramRows({
-      app_id: 'app_1',
-      force: true,
-      attempts: 2,
-      nothing: null,
-      limits: { cpu: 1, mem: 512 },
-      labels: ['a', 'b'],
-    });
-    expect(rows.map((row) => row.key)).toEqual([
-      'app_id',
-      'attempts',
-      'force',
-      'labels',
-      'limits',
-      'nothing',
-    ]);
-    expect(rows[0]).toEqual({ key: 'app_id', text: 'app_1', nested: false });
-    expect(rows[1]?.text).toBe('2');
-    expect(rows[2]?.text).toBe('true');
-    expect(rows[3]).toEqual({ key: 'labels', text: '[\n  "a",\n  "b"\n]', nested: true });
-    expect(rows[4]).toEqual({
-      key: 'limits',
-      text: '{\n  "cpu": 1,\n  "mem": 512\n}',
-      nested: true,
-    });
-    expect(rows[5]).toEqual({ key: 'nothing', text: 'null', nested: false });
   });
 
   it('says exactly what approving and denying do', () => {
