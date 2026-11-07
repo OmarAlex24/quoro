@@ -282,7 +282,7 @@ pub fn rfc3339_in(seconds: i64) -> String {
     format_rfc3339(time::OffsetDateTime::now_utc() + time::Duration::seconds(seconds))
 }
 
-fn format_rfc3339(t: time::OffsetDateTime) -> String {
+pub(crate) fn format_rfc3339(t: time::OffsetDateTime) -> String {
     let t = t.to_offset(time::UtcOffset::UTC);
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",

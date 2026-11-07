@@ -34,6 +34,7 @@ Each entry links the pull request that made the change and, where one exists, th
 
 ### Fixed
 
+- When an app went from one replica to more, or back to one, its `tunnel` hostname answered `404` through Cloudflare for about a minute. The machine the hostname left dropped it from its tunnel and its proxy at once, but Cloudflare kept sending it some requests for a while after the CNAME moved to the new tunnel. That machine now keeps the hostname until 120 s after the new tunnel repointed the CNAME, as long as it still has a backend for it: on a node, its own instance; on the edge, the remaining one. It keeps it in its tunnel's ingress rules and in its desired state, as a route marked `draining_until`, and never writes or deletes the record itself. The primary keeps these draining routes in memory, so a primary restart during the window ends them at once ([#457], [#344], [ADR 0194]).
 - When the engine failed to swap a warm copy in, the target hashed the whole volume to find which copy was in place before it answered the source. The source's cycle waited for that hash, up to its 10-minute answer timeout, with the source volume's lock held. The target now answers at once and resolves the copy afterwards, still under the volume's lock; a stream that arrives meanwhile is refused `busy`. Hashing a copy no longer runs BLAKE3 on its cells of zeros, and the source finds zeros with one comparison per cell. A whole-volume pass therefore costs about one read of the volume where the filesystem reports holes as data or the volume holds allocated zeros ([#519], [#498]).
 - A host suspend during the self-fence of an `expiring` lease did not shorten the fence's graceful stop, which runs on the monotonic clock: after the wake-up the stop still took what it had left, so the lease's VMs could stop up to `M` later than section 8.4 allows. The fence now counts its time on the lease clock. A suspend while it waits for a start or lists the VMs comes out of its graceful stop, and a suspend during the graceful stop that uses up the rest ends it at the wake-up, so the forced stop begins then ([#520], [#453], [ADR 0240]).
 - A stateful start under an `expiring` lease began whenever the lease's deadline had not passed, so a start that took its permit just before the deadline could hold the VM while the fence had to stop it. The node now starts such a VM only when the start's 3 s bound and the lease's margin `M` are both still left on the lease clock, counting a suspend it has not caught up with yet. A lease granted for 5 000 ms or less never leaves that much, and starts no stateful VM. Right after a renewal with `D` = 15 000 ms about 13.5 s remain, so the check holds back no start in steady state. The start check now reads the lease's mode and its answer in one look at the lease table ([#507], [#483], [ADR 0242]).
@@ -467,6 +468,7 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#507]: https://github.com/OmarAlex24/quoro/pull/507
 [#498]: https://github.com/OmarAlex24/quoro/issues/498
 [#519]: https://github.com/OmarAlex24/quoro/pull/519
+[#457]: https://github.com/OmarAlex24/quoro/pull/457
 [ADR 0014]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0014-telemetry-app-logs-metrics-stays-on-each-node-only-state-is.md
 [#78]: https://github.com/OmarAlex24/quoro/issues/78
 [#511]: https://github.com/OmarAlex24/quoro/pull/511
@@ -547,6 +549,7 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [ADR 0173]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0173-warm-replication-path-the-source-node-ships-changed-ranges.md
 [ADR 0184]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0184-health-checks-restart-hung-apps-78-after-the-configured.md
 [ADR 0186]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0186-add-287-old-node-recreates-a-moved-app-s-vm-and-240.md
+[ADR 0194]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0194-draining-until-is-an-rfc-3339-field-on-tunnel-routes-only.md
 [ADR 0210]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0210-snapshots-are-numbered-per-volume-and-the-source-keeps-its.md
 [ADR 0222]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0222-rule-3-of-section-4-2-lets-renewal-answers-for-other-leases.md
 [ADR 0225]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0225-remove-the-m0-leaseagent-once-the-new-lease-timer-lands.md
