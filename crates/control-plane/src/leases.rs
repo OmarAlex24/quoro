@@ -224,8 +224,6 @@ impl Releases {
         *entry = (*entry).max(token);
     }
 
-    /// Whether the holder `lease` names released it at its token or a higher
-    /// one. A release at a lower token says nothing about a later grant.
     /// Forgets what `holder` released of `lease_id`: a `fence_failed` answer
     /// says its VMs may run again (section 8.5).
     pub(crate) fn forget(&self, lease_id: &str, holder: &str) {
@@ -235,6 +233,8 @@ impl Releases {
             .remove(&(lease_id.to_string(), holder.to_string()));
     }
 
+    /// Whether the holder `lease` names released it at its token or a higher
+    /// one. A release at a lower token says nothing about a later grant.
     fn covers(&self, lease: &Lease) -> bool {
         let released = self
             .0

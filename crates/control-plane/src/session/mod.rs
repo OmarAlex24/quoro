@@ -186,10 +186,6 @@ struct Pending {
     /// when a `hello` revoke goes above it. An answer with `fence_failed` is
     /// recorded on the node (section 8.5 step 1).
     revoke_leases: HashMap<String, (String, u64)>,
-    /// Leases whose revoke this session answered `fence_failed` without the
-    /// primary recording the failure: their VMs may still run, so no restore
-    /// takes them until the next session's revoke reports the failure again.
-    unrecorded_failures: HashSet<String>,
 }
 
 impl Pending {
@@ -201,7 +197,6 @@ impl Pending {
     /// Fails every waiter because the session ended.
     fn fail_all(&mut self) {
         self.revoke_leases.clear();
-        self.unrecorded_failures.clear();
         for (_, tx) in self.commands.drain() {
             let _ = tx.send(Err(HubError::Closed));
         }
@@ -336,6 +331,13 @@ struct HubInner {
     /// restore grants the lease to its target only once its holder did
     /// (section 5.13, issue #392).
     releases: leases::Releases,
+    /// Each `(node, lease)` whose failed fence the node reported, by a revoke
+    /// answered `fence_failed`, while the primary could not record it: its
+    /// VMs may still run, so no restore takes the lease until a later report
+    /// of that failure is recorded (section 8.5 step 1, issue #392). In
+    /// memory only; the node reports the failure again in its buffered
+    /// `node.fence_failed` and when the next session's revoke fences again.
+    unrecorded_failures: Mutex<HashSet<(String, String)>>,
     generation: AtomicU64,
     /// Test seam: snapshots to hold between their build and their send.
     snapshot_holds: Mutex<HashMap<String, Arc<SnapshotHold>>>,
@@ -419,6 +421,7 @@ impl NodeHub {
             warm_facts: Mutex::new(HashMap::new()),
             disk_free_gb: Mutex::new(HashMap::new()),
             releases: leases::Releases::default(),
+            unrecorded_failures: Mutex::new(HashSet::new()),
             generation: AtomicU64::new(0),
             snapshot_holds: Mutex::new(HashMap::new()),
             serving_inputs: Notify::new(),
@@ -482,18 +485,44 @@ impl NodeHub {
     }
 
     /// Whether a `lease_revoke` of `lease_id` waits for its answer on the
-    /// live session of `node_id`, or was answered `fence_failed` there without
-    /// the failure being recorded.
+    /// live session of `node_id`, or `node_id` answered one `fence_failed`
+    /// that the primary could not record.
     pub(crate) fn revoke_unanswered(&self, node_id: &str, lease_id: &str) -> bool {
+        if self
+            .0
+            .unrecorded_failures
+            .lock()
+            .expect("unrecorded failures lock")
+            .contains(&(node_id.to_string(), lease_id.to_string()))
+        {
+            return true;
+        }
         let sessions = self.0.sessions.lock().expect("session lock");
         sessions.get(node_id).is_some_and(|handle| {
-            let pending = handle.pending.lock().expect("pending lock");
-            pending.unrecorded_failures.contains(lease_id)
-                || pending
-                    .revoke_leases
-                    .values()
-                    .any(|(revoked, _)| revoked == lease_id)
+            handle
+                .pending
+                .lock()
+                .expect("pending lock")
+                .revoke_leases
+                .values()
+                .any(|(revoked, _)| revoked == lease_id)
         })
+    }
+
+    /// Notes whether the failed fence of `lease_id` that `node_id` reported
+    /// is recorded ([`HubInner::unrecorded_failures`]).
+    fn note_failure_recorded(&self, node_id: &str, lease_id: &str, recorded: bool) {
+        let mut unrecorded = self
+            .0
+            .unrecorded_failures
+            .lock()
+            .expect("unrecorded failures lock");
+        let key = (node_id.to_string(), lease_id.to_string());
+        if recorded {
+            unrecorded.remove(&key);
+        } else {
+            unrecorded.insert(key);
+        }
     }
 
     /// Tells the live session of `node_id` to rebuild and resend its desired
@@ -1205,18 +1234,6 @@ impl HubInner {
         let pending = self.pending_of(node_id, generation)?;
         let pending = pending.lock().expect("pending lock");
         pending.revoke_leases.get(re).cloned()
-    }
-
-    /// Notes that this session answered a revoke of `lease_id` `fence_failed`
-    /// and the primary could not record it.
-    fn note_unrecorded_failure(&self, node_id: &str, generation: u64, lease_id: &str) {
-        if let Some(pending) = self.pending_of(node_id, generation) {
-            pending
-                .lock()
-                .expect("pending lock")
-                .unrecorded_failures
-                .insert(lease_id.to_string());
-        }
     }
 
     /// Routes one `command_result` to its waiter, or ends a stream whose
@@ -2031,11 +2048,18 @@ impl Session {
                             );
                         }
                         // The revoke stays unanswered for a restore until a
-                        // failed fence is recorded (issue #392), so none
-                        // grants the lease in between.
+                        // failed fence is recorded, or noted unrecorded on
+                        // the hub (issue #392), so none grants the lease in
+                        // between.
                         self.note_revoke_answer(&lease_id, &result).await;
-                        self.hub.0.take_revoke(&self.node_id, self.generation, re);
-                        self.revoke_answered(outbox).await;
+                        if self
+                            .hub
+                            .0
+                            .take_revoke(&self.node_id, self.generation, re)
+                            .is_some()
+                        {
+                            self.revoke_answered(outbox).await;
+                        }
                         return false;
                     }
                     self.hub
@@ -2493,6 +2517,10 @@ impl Session {
             Ok(changed)
         }
         .await;
+        if recorded.is_ok() {
+            self.hub
+                .note_failure_recorded(&self.node_id, lease_id, true);
+        }
         match recorded {
             Ok(true) => tracing::warn!(
                 node_id = %self.node_id,
@@ -2513,8 +2541,7 @@ impl Session {
                 );
                 self.fence_ack_stopped = true;
                 self.hub
-                    .0
-                    .note_unrecorded_failure(&self.node_id, self.generation, lease_id);
+                    .note_failure_recorded(&self.node_id, lease_id, false);
             }
         }
     }
@@ -3489,6 +3516,7 @@ async fn insert_node_event(
         .map_err(|e| format!("{e:?}"))?;
     // Section 8.5 step 1: a failed fence lists its leases on the node, in the
     // event's transaction.
+    let mut failed_leases = Vec::new();
     if event.kind == "node.fence_failed" {
         let ids = |key: &str| -> Vec<String> {
             event
@@ -3503,12 +3531,14 @@ async fn insert_node_event(
                 })
                 .unwrap_or_default()
         };
-        let (lease_ids, app_ids, vm_ids) = (ids("lease_ids"), ids("app_ids"), ids("vm_ids"));
+        let (app_ids, vm_ids) = (ids("app_ids"), ids("vm_ids"));
+        failed_leases = ids("lease_ids");
+        let lease_ids = &failed_leases;
         crate::fences::record_failure(
             &mut w.tx,
             node_id,
             &crate::fences::Failed {
-                lease_ids: &lease_ids,
+                lease_ids,
                 app_ids: &app_ids,
                 vm_ids: &vm_ids,
             },
@@ -3520,7 +3550,11 @@ async fn insert_node_event(
         .await
         .map_err(|e| format!("cannot record a failed fence: {}", e.code.as_str()))?;
     }
-    w.commit().await.map_err(|e| e.to_string())
+    w.commit().await.map_err(|e| e.to_string())?;
+    for lease_id in &failed_leases {
+        hub.note_failure_recorded(node_id, lease_id, true);
+    }
+    Ok(())
 }
 
 /// The current cluster term from `meta` (1 until elections exist).
