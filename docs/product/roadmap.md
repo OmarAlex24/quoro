@@ -1,8 +1,8 @@
 # Quoro roadmap
 
-Status: living document; the [status table](#status) below shows where each milestone stands. Source: D-0033 (milestones), D-0034 (out of scope), D-0036 (done = runs on the lab).
+Status: living document; the [status table](#status) below shows where each milestone stands. Source: D-0033 (milestones), D-0274 (M7), D-0034 (out of scope), D-0036 (done = runs on the lab).
 
-This turns D-0033 into a gated plan and adds no features: where another decision explains how an item behaves, the decision is cited next to the item, and every claim that rests on an unverified external fact is either answered in `docs/research/` or marked as a hypothesis.
+This turns D-0033 and D-0274 into a gated plan and adds no features: where another decision explains how an item behaves, the decision is cited next to the item, and every claim that rests on an unverified external fact is either answered in `docs/research/` or marked as a hypothesis.
 
 > **Release callout: first public release (D-0064, D-0137).** v0.1.0 is an experimental preview with signed builds, not for production; it was tagged after the M4 demo and contains M3 and M4 [D-0137]. The first general release and the broad announcement are a later tag after the M4 close-out [D-0064, D-0137]. The domain is registered; the trademark search was waived [D-0137].
 
@@ -18,6 +18,7 @@ This turns D-0033 into a gated plan and adds no features: where another decision
 | M5a — Stateless HA and backups | Done (demo approved on 2026-11-05) | [v0.2.0](https://github.com/OmarAlex24/quoro/releases/tag/v0.2.0) | [M5a](https://github.com/OmarAlex24/quoro/milestone/6) |
 | M5b — Witness, leases and warm replication | In progress (plan approved 2026-11-06) | — | [M5b](https://github.com/OmarAlex24/quoro/milestone/7) |
 | M6 — Automatic failover and hot | Planned | — | [M6](https://github.com/OmarAlex24/quoro/milestone/8) |
+| M7 — Deploy experience | Planned | — | [M7](https://github.com/OmarAlex24/quoro/milestone/11) |
 | Panel redesign (parallel track) | On main (all eight PRs merged 2026-11-07); demo against a real cluster still to come | — | [Panel](https://github.com/OmarAlex24/quoro/milestone/10) |
 
 Status comes from each milestone's issues on GitHub, its Definition of Done below and the release tags. "Release" is the first tag that shipped the milestone. M4 still has two follow-up issues open in its GitHub milestone. What each release contains is in the [changelog](https://github.com/OmarAlex24/quoro/blob/main/CHANGELOG.md).
@@ -62,6 +63,7 @@ High availability and backups are not part of the MVP, but the MVP architecture 
 | M5a | Stateless HA and backups | App replicas behind the edge, cold backups to object storage | M4 |
 | M5b | Witness, leases and warm replication | Three votes, lease-based fencing, warm volumes, capacity indicator | M5a |
 | M6 | Automatic failover and hot | Raft election with a majority, hot policy keeps apps serving | M5b |
+| M7 | Deploy experience | Compose import, private registries and Git repositories, a container engine for hosts without KVM, Railpack builds | M6 |
 
 ---
 
@@ -447,10 +449,43 @@ All three lab VMs are on one physical host. The lab simulates a split by cutting
 
 ---
 
+### M7 — Deploy experience
+
+#### Scope
+
+Quoro already runs OCI images from public registries, with anonymous pulls only, and builds Dockerfiles from public HTTPS Git repositories [D-0060, D-0123]. M7 adds the four pieces that deploying with Docker usually means beyond that [D-0274]:
+
+- Compose import: a compose file becomes a project with one app per service, with its image or build, environment, volumes, ports and internal network. Keys that have no Quoro equivalent are reported to the operator, never dropped silently [D-0274].
+- Private registries and private Git repositories: credential references for image pulls and for Git sources. This is the contract change that the `AppSource` description in the OpenAPI spec already announces [D-0274].
+- A container engine for hosts without KVM: the later Engine implementation that D-0009 foresees, behind the Engine trait, because many VPS do not expose nested virtualization [D-0009, D-0274].
+- Railpack builds: a second Builder behind the Builder trait, for repositories without a Dockerfile [D-0117, D-0274].
+
+The container engine is not Docker. It is another Engine implementation, and no Docker daemon runs on microVM nodes [D-0008]. Its isolation is weaker than a microVM's, so the threat model is updated with that weaker isolation before it ships [D-0274].
+
+#### Definition of Done
+
+M7 is not planned yet. Its Definition of Done is written when M7 is planned, together with its designs and contracts [D-0274].
+
+#### Demo script
+
+The demo script is written with the Definition of Done, when M7 is planned [D-0274].
+
+#### Dependencies
+
+- M6.
+- M7 starts only after M6's demo ran on the lab and the maintainer approved it [D-0036].
+- Its contract changes, such as the credential references for private sources, are standalone PRs [D-0036].
+
+#### Explicitly out of scope
+
+- The Docker daemon on microVM nodes: it stays excluded, and each app on a KVM host still runs in its own microVM [D-0008].
+
+---
+
 ## 4. Later
 
 - An optional managed offering may come later [D-0003]; nothing in this roadmap depends on it. The self-hosted witness is free and first-class [D-0017].
-- A container-fallback Engine implementation is a later backend behind the Engine trait, because many VPS do not expose nested virtualization [D-0009]. It is not part of the MVP.
+- The container engine for hosts without KVM is a later Engine implementation [D-0009]; it is planned in [M7](#m7--deploy-experience) [D-0274].
 - A self-hosted GitHub Actions runner stays deferred, because a self-hosted runner would let fork PRs on a public repository run arbitrary code on the project's infrastructure.
 
 ---
