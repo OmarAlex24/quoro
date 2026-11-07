@@ -27,8 +27,9 @@ export function AppBay({ app }: { app: App }) {
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
             <GlyphTile kind={app.source != null ? 'git' : 'image'} />
             <Link
-              to="/apps/$appId"
-              params={{ appId: app.id }}
+              to="/projects/$projectId"
+              params={{ projectId: app.project_id }}
+              search={{ app: app.id, tab: 'deployments' }}
               className="type-bay-title truncate text-[18px] leading-tight text-ink underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
             >
               {app.name}

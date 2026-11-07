@@ -138,7 +138,7 @@ export function ApprovalPermit({
           <p className="text-[13px] text-ink-2">
             Incident{' '}
             <Link
-              to="/audit"
+              to="/activity"
               search={{ incident_id: approval.incident_id }}
               title={approval.incident_id}
               className="type-code text-ink underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"

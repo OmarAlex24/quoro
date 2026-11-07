@@ -76,7 +76,9 @@ export function AgentsScreen() {
               </Button>
             ) : (
               <Button variant="default" className="mt-4" asChild>
-                <Link to="/grants">See the grants</Link>
+                <Link to="/agents" search={{ tab: 'grants' }}>
+                  See the grants
+                </Link>
               </Button>
             )}
           </div>
@@ -91,7 +93,7 @@ export function AgentsScreen() {
           onOpenChange={setDialogOpen}
           ownerUserId={user.id}
           onCreated={(agent) => {
-            void navigate({ to: '/agents/$agentId', params: { agentId: agent.id } });
+            void navigate({ to: '/agents', search: { agent: agent.id } });
           }}
         />
       ) : null}

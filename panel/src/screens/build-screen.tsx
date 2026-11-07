@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { Link, useParams } from '@tanstack/react-router';
+import { Link } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
 import type { Build } from '../api/generated/model';
 import { useGetApp } from '../api/generated/apps/apps';
@@ -17,11 +17,8 @@ import { LoginScreen } from './login-screen';
  * step and the log streamed from the node. The live `status` events move the
  * view; the build read fills in everything else.
  */
-export function BuildScreen() {
+export function BuildScreen({ appId, buildId }: { appId: string; buildId: string }) {
   const { user, loading, unauthenticated, canWrite } = useSession();
-  const params = useParams({ strict: false });
-  const appId = params.appId ?? '';
-  const buildId = params.buildId ?? '';
 
   const [streamBuild, setStreamBuild] = useState<Build | null>(null);
 

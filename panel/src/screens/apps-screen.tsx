@@ -8,10 +8,11 @@ import { Button } from '../components/ui/button';
 import { ProblemBanner } from '../components/ui/problem-banner';
 import { LoginScreen } from './login-screen';
 
-export function AppsScreen() {
+/** The apps rack: every app, or the apps of one project. */
+export function AppsScreen({ projectId }: { projectId?: string }) {
   const { user, loading, unauthenticated, canWrite } = useSession();
 
-  const appsQuery = useListApps(undefined, {
+  const appsQuery = useListApps(projectId ? { project_id: projectId } : undefined, {
     query: {
       refetchInterval: (query) => appsPollingInterval(query.state.data?.items ?? []),
     },
@@ -39,7 +40,9 @@ export function AppsScreen() {
         <h1 className="type-display text-[24px] leading-none">Apps</h1>
         {canWrite ? (
           <Button variant="primary" asChild>
-            <Link to="/apps/new">Deploy an app</Link>
+            <Link to="/projects" search={{ add: 'app' }}>
+              Deploy an app
+            </Link>
           </Button>
         ) : null}
       </div>
@@ -56,7 +59,9 @@ export function AppsScreen() {
             </p>
             {canWrite ? (
               <Button variant="primary" className="mt-4" asChild>
-                <Link to="/apps/new">Deploy an app</Link>
+                <Link to="/projects" search={{ add: 'app' }}>
+                  Deploy an app
+                </Link>
               </Button>
             ) : null}
           </div>

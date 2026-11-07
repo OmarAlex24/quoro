@@ -41,8 +41,8 @@ export function ApprovalRow({ approval }: { approval: Approval }) {
         )}
         {approval.status === 'approved' && approval.grant_id ? (
           <Link
-            to="/grants"
-            search={{ agent_id: approval.agent_id, kind: 'approval' }}
+            to="/agents"
+            search={{ tab: 'grants', agent_id: approval.agent_id, kind: 'approval' }}
             title={approval.grant_id}
             className="type-data text-[13px] text-ink underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
           >

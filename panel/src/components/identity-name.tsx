@@ -14,8 +14,8 @@ export function AgentName({ id, link = true }: { id: string; link?: boolean }) {
   if (!link) return <span title={id}>{label}</span>;
   return (
     <Link
-      to="/agents/$agentId"
-      params={{ agentId: id }}
+      to="/agents"
+      search={{ agent: id }}
       title={id}
       className="text-ink underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
     >

@@ -11,6 +11,7 @@ import type {
   BackupList,
   BackupRepositoryList,
   ChangePasswordRequest,
+  Cluster,
   CreateAppRequest,
   CreateDeploymentRequest,
   CreateDomainRequest,
@@ -93,6 +94,9 @@ import { usersHandlers } from './handlers-users';
 import { interactiveHandlers } from './handlers-interactive';
 import { vulnerabilitiesHandlers } from './handlers-vulnerabilities';
 import { webhooksHandlers } from './handlers-webhooks';
+
+/** The mock cluster's id; one installation per page load. */
+const CLUSTER_ID = mockId('cls');
 
 const findVm = (vmId: string): Vm | undefined =>
   db.vms.find((candidate) => candidate.id === vmId);
@@ -233,6 +237,30 @@ export const handlers = [
 
     db.password = next;
     return new HttpResponse(null, { status: 204 });
+  }),
+
+  http.get('*/api/v1/cluster', () => {
+    if (!signedIn()) return unauthorized();
+    const machines = [db.node, ...db.extraNodes].filter((node) => node.status !== 'removed');
+    const voters = machines
+      .filter((node) => node.roles.some((role) => role === 'node' || role === 'witness'))
+      .map((node) => ({
+        node_id: node.id,
+        roles: node.roles,
+        connected: node.status === 'connected',
+      }));
+    const cluster: Cluster = {
+      id: CLUSTER_ID,
+      name: 'lab cluster',
+      version: db.node.engine_version ?? '0.1.0',
+      primary_node_id: db.node.id,
+      log_seq: db.node.log_seq,
+      log_head_hash: '9f2c4e1a7b3d5c8e0f6a2b4d6e8c0a1f3b5d7e9c1a3f5b7d9e1c3a5f7b9d1e3c',
+      term: 1,
+      votes: { voters, count: voters.length, required: 3, ha_ready: false },
+      created_at: db.owner?.created_at ?? now(),
+    };
+    return json(cluster);
   }),
 
   http.get('*/api/v1/nodes', () => {

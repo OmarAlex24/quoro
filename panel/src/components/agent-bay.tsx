@@ -21,8 +21,8 @@ export function AgentBay({ agent }: { agent: Agent }) {
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
             <Avatar kind="agent" seed={agent.id} />
             <Link
-              to="/agents/$agentId"
-              params={{ agentId: agent.id }}
+              to="/agents"
+              search={{ agent: agent.id }}
               className="type-bay-title truncate text-[18px] leading-tight text-ink underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
             >
               {agent.name}

@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { getRouteApi, Link, useNavigate } from '@tanstack/react-router';
+import { Link, useNavigate } from '@tanstack/react-router';
 import { useState } from 'react';
 import {
   deleteAgent,
@@ -26,8 +26,6 @@ import { Dialog, DialogContent } from '../components/ui/dialog';
 import { NoticeLine, ProblemBanner } from '../components/ui/problem-banner';
 import { LoginScreen } from './login-screen';
 
-const routeApi = getRouteApi('/agents/$agentId');
-
 const backLink = (
   <Link
     to="/agents"
@@ -37,9 +35,8 @@ const backLink = (
   </Link>
 );
 
-export function AgentScreen() {
+export function AgentScreen({ agentId }: { agentId: string }) {
   const { me, user, loading, unauthenticated } = useSession();
-  const { agentId } = routeApi.useParams();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
 
@@ -247,14 +244,14 @@ export function AgentScreen() {
         </p>
         <div className="mt-3 flex flex-wrap gap-x-4 gap-y-2 text-[13px]">
           <Link
-            to="/grants"
-            search={{ agent_id: agent.id }}
+            to="/agents"
+            search={{ tab: 'grants', agent_id: agent.id }}
             className="text-accent underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
           >
             See its grants
           </Link>
           <Link
-            to="/audit"
+            to="/activity"
             search={{ actor_id: agent.id }}
             className="text-accent underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
           >

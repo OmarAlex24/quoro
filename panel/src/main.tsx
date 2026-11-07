@@ -6,7 +6,11 @@ import { createRoot } from 'react-dom/client';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { RouterProvider } from '@tanstack/react-router';
 import { queryClient } from './api/client';
+import { themeStore } from './lib/use-theme';
 import { router } from './router';
+
+// The theme stored in this browser applies before anything is drawn.
+themeStore();
 
 /**
  * In mock mode the MSW worker is started before the first render, so the very

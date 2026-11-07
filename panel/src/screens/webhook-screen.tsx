@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { getRouteApi, Link, useNavigate } from '@tanstack/react-router';
+import { Link, useNavigate } from '@tanstack/react-router';
 import { useState } from 'react';
 import {
   deleteWebhook,
@@ -21,8 +21,7 @@ import { WebhookDialog } from '../components/webhook-dialog';
 import { WebhookPlate } from '../components/webhook-plate';
 import { LoginScreen } from './login-screen';
 
-export function WebhookScreen() {
-  const { webhookId } = getRouteApi('/webhooks/$webhookId').useParams();
+export function WebhookScreen({ webhookId }: { webhookId: string }) {
   const { me, user, loading, unauthenticated } = useSession();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
@@ -72,7 +71,7 @@ export function WebhookScreen() {
       setProblem(null);
       void queryClient.invalidateQueries({ queryKey: getListWebhooksQueryKey() });
       setDeleteOpen(false);
-      void navigate({ to: '/webhooks' });
+      void navigate({ to: '/settings/webhooks' });
     },
     onError: (error) => setProblem(problemView(error, 'delete this webhook')),
   });
@@ -95,7 +94,7 @@ export function WebhookScreen() {
   return (
     <main className="mx-auto w-full max-w-6xl px-4 py-6 sm:px-6 sm:py-8">
       <Link
-        to="/webhooks"
+        to="/settings/webhooks"
         className="text-[13px] text-ink-2 underline-offset-4 hover:text-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
       >
         All webhooks

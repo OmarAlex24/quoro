@@ -62,14 +62,18 @@ function CountLamp({
   );
 }
 
-export function VmsScreen() {
+/**
+ * The virtual machines of the cluster, or of one project; with `vmId`, only
+ * that one.
+ */
+export function VmsScreen({ projectId, vmId }: { projectId?: string; vmId?: string } = {}) {
   const { me, user, loading, unauthenticated, canWrite } = useSession();
   const queryClient = useQueryClient();
   const [dialogOpen, setDialogOpen] = useState(false);
   const [problem, setProblem] = useState<ProblemView | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
-  const vmsQuery = useListVms(undefined, {
+  const vmsQuery = useListVms(projectId ? { project_id: projectId } : undefined, {
     query: {
       refetchInterval: (query) => {
         const data = query.state.data;
@@ -109,7 +113,8 @@ export function VmsScreen() {
 
   if (unauthenticated || !user) return <LoginScreen />;
 
-  const vms = vmsQuery.data?.items ?? [];
+  const listed = vmsQuery.data?.items ?? [];
+  const vms = vmId ? listed.filter((vm) => vm.id === vmId) : listed;
   const projects = projectsQuery.data?.items ?? [];
   const nodes = nodesQuery.data?.items ?? [];
   const counts = countVms(vms);

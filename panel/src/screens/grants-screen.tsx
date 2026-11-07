@@ -24,7 +24,7 @@ import { Button } from '../components/ui/button';
 import { NoticeLine, ProblemBanner } from '../components/ui/problem-banner';
 import { LoginScreen } from './login-screen';
 
-const grantsRoute = getRouteApi('/grants');
+const agentsRoute = getRouteApi('/shell/agents');
 
 const STATUS_OPTIONS: ReadonlyArray<{ value: GrantStatus; label: string }> = [
   { value: 'active', label: 'Active' },
@@ -41,7 +41,7 @@ const KIND_OPTIONS: ReadonlyArray<{ value: GrantKind; label: string }> = [
 
 export function GrantsScreen() {
   const { me, user, loading, unauthenticated } = useSession();
-  const search = grantsRoute.useSearch();
+  const search = agentsRoute.useSearch();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
 
@@ -102,11 +102,11 @@ export function GrantsScreen() {
     status?: GrantStatus;
     kind?: GrantKind;
   }) => {
-    void navigate({ to: '/grants', search: (prev) => ({ ...prev, ...patch }) });
+    void navigate({ to: '/agents', search: (prev) => ({ ...prev, ...patch, tab: 'grants' }) });
   };
 
   const clearFilters = () => {
-    void navigate({ to: '/grants', search: {} });
+    void navigate({ to: '/agents', search: { tab: 'grants' } });
   };
 
   const agentName = (id: string) =>
