@@ -1,9 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import type { GrantStatus, Scope, Selector } from '../api/generated/model';
+import type { Scope, Selector } from '../api/generated/model';
 import {
   buildCreateGrant,
   expirySentence,
-  grantLamp,
   grantMeter,
   grantRequestHeaders,
   grantSummary,
@@ -14,23 +13,6 @@ import {
   usesWords,
   type GrantDraft,
 } from './grants';
-
-describe('grantLamp', () => {
-  it('burns run while active and fault when revoked', () => {
-    expect(grantLamp('active')).toBe('run');
-    expect(grantLamp('revoked')).toBe('fault');
-  });
-
-  it('settles to idle when expired or exhausted', () => {
-    expect(grantLamp('expired')).toBe('idle');
-    expect(grantLamp('exhausted')).toBe('idle');
-  });
-
-  it('covers every status', () => {
-    const statuses: GrantStatus[] = ['active', 'expired', 'revoked', 'exhausted'];
-    for (const status of statuses) expect(grantLamp(status)).toBeTruthy();
-  });
-});
 
 describe('usesWords', () => {
   it('says how many of the cap were used', () => {

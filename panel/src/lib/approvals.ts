@@ -1,6 +1,5 @@
 import type {
   Approval,
-  ApprovalParams,
   ApprovalStatus,
   DecisionRequest,
   Scope,
@@ -9,28 +8,12 @@ import { scopeVerb } from './activity';
 import { clamp } from './dither';
 import { expiryWords, shortId } from './agency-format';
 import { DESTRUCTIVE_SCOPES } from './scopes';
-import type { LampTone } from './lamp';
 
 /**
- * The approvals queue, as pure rules: which lamp a request's state takes, what
- * its params look like when flattened for display, and exactly what a decision
- * sends. Keeping these here lets the screen and the plate stay thin and lets
- * the rules be tested without a DOM.
+ * The approvals queue, as pure rules: how a request's state is said, how the
+ * inbox orders requests, and exactly what a decision sends. Keeping these here
+ * lets the screens stay thin and lets the rules be tested without a DOM.
  */
-
-/** Pending is waiting (amber), approved run, denied fault, expired idle. */
-export const approvalLamp = (status: ApprovalStatus): LampTone => {
-  switch (status) {
-    case 'pending':
-      return 'shift';
-    case 'approved':
-      return 'run';
-    case 'denied':
-      return 'fault';
-    case 'expired':
-      return 'idle';
-  }
-};
 
 /** The status in one word, title case: "Waiting", "Approved", "Denied", "Expired". */
 export const approvalWords: Record<ApprovalStatus, string> = {
@@ -42,35 +25,6 @@ export const approvalWords: Record<ApprovalStatus, string> = {
 
 /** A destructive scope is one the panel marks fault-red on a request. */
 export const isDestructiveScope = (scope: Scope): boolean => DESTRUCTIVE_SCOPES.has(scope);
-
-/** One parameter as the plate shows it: a key, its text and whether it is nested. */
-export interface ParamRow {
-  readonly key: string;
-  readonly text: string;
-  /** Objects and arrays print as indented JSON; scalars print as one value. */
-  readonly nested: boolean;
-}
-
-const isNested = (value: unknown): boolean =>
-  value !== null && typeof value === 'object';
-
-/**
- * Flatten the approved call's parameters for display, sorted by key. Nested
- * values become indented JSON text; the plate renders it in `type-data`, never
- * in a monospace face.
- */
-export const paramRows = (params: ApprovalParams): ParamRow[] =>
-  Object.keys(params)
-    .sort()
-    .map((key) => {
-      const value = params[key];
-      if (isNested(value)) {
-        return { key, text: JSON.stringify(value, null, 2), nested: true };
-      }
-      if (value === null) return { key, text: 'null', nested: false };
-      if (typeof value === 'string') return { key, text: value, nested: false };
-      return { key, text: String(value), nested: false };
-    });
 
 /**
  * What the confirm step says, said exactly: approve issues one grant for this

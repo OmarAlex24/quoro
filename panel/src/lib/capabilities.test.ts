@@ -3,6 +3,8 @@ import type { MeResponse, User } from '../api/generated/model';
 import {
   canDecideApprovals,
   canListUsers,
+  canManageBackups,
+  canManageProviders,
   canManageAgents,
   canManageGrants,
   canResolveIncidents,
@@ -38,7 +40,14 @@ const agentSession: MeResponse = {
   grants: [],
 };
 
-const writers = [canDecideApprovals, canManageAgents, canManageGrants, canManageWebhooks, canResolveIncidents];
+const writers = [
+  canDecideApprovals,
+  canManageAgents,
+  canManageGrants,
+  canManageWebhooks,
+  canResolveIncidents,
+  canManageProviders,
+];
 
 describe('capabilities', () => {
   it('lets an owner and an operator decide and manage', () => {
@@ -83,5 +92,14 @@ describe('capabilities', () => {
     expect(canManageUsers(user('owner', true))).toBe(false);
     expect(canManageUsers(agentSession)).toBe(false);
     expect(canManageUsers(undefined)).toBe(false);
+  });
+
+  it('lets only an owner manage the backup repository and its recovery key', () => {
+    expect(canManageBackups(user('owner'))).toBe(true);
+    expect(canManageBackups(user('operator'))).toBe(false);
+    expect(canManageBackups(user('viewer'))).toBe(false);
+    expect(canManageBackups(user('owner', true))).toBe(false);
+    expect(canManageBackups(agentSession)).toBe(false);
+    expect(canManageBackups(undefined)).toBe(false);
   });
 });

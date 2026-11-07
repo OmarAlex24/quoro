@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 import type { Agent } from '../api/generated/model';
 import {
   agentDraftProblem,
-  agentLamp,
   agentPatchIsEmpty,
   agentDisabledPatch,
   agentStatus,
@@ -28,16 +27,6 @@ const draft = (patch: Partial<{ name: string; model: string; description: string
   model: 'claude-sonnet-5-5',
   description: 'Restarts an app when it goes down.',
   ...patch,
-});
-
-describe('agentLamp', () => {
-  it('lights run and says Enabled for a live agent', () => {
-    expect(agentLamp({ disabled: false })).toEqual({ tone: 'run', statusText: 'Enabled' });
-  });
-
-  it('lights idle and says Disabled for a disabled agent', () => {
-    expect(agentLamp({ disabled: true })).toEqual({ tone: 'idle', statusText: 'Disabled' });
-  });
 });
 
 describe('agentDraftProblem', () => {

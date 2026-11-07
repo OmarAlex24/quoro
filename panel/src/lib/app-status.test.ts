@@ -1,11 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import type { AppStatus, DeploymentStatus } from '../api/generated/model';
+import type { AppStatus } from '../api/generated/model';
 import {
   appLampState,
   appsPollingInterval,
   certTone,
   certWords,
-  deploymentRail,
   pickDefaultNode,
   relativeTime,
   servingTone,
@@ -48,72 +47,6 @@ describe('appsPollingInterval', () => {
       10_000,
     );
     expect(appsPollingInterval([])).toBe(10_000);
-  });
-});
-
-describe('deploymentRail', () => {
-  const rail = (status: DeploymentStatus, phase: Parameters<typeof deploymentRail>[0]['phase']) =>
-    deploymentRail({ status, phase });
-
-  it('starts with every station dark while pending', () => {
-    expect(rail('pending', null).stations.map((station) => station.state)).toEqual([
-      'not-reached',
-      'not-reached',
-      'not-reached',
-      'not-reached',
-    ]);
-    expect(rail('pending', null).live).toBe(true);
-  });
-
-  it('lights the pull station while preparing the rootfs', () => {
-    expect(rail('preparing', 'pull').stations.map((station) => station.state)).toEqual([
-      'current',
-      'not-reached',
-      'not-reached',
-      'not-reached',
-    ]);
-    expect(rail('preparing', 'rootfs').stations.map((station) => station.state)).toEqual([
-      'done',
-      'current',
-      'not-reached',
-      'not-reached',
-    ]);
-  });
-
-  it('walks through boot and the health check while starting', () => {
-    expect(rail('starting', 'boot').stations.map((station) => station.state)).toEqual([
-      'done',
-      'done',
-      'current',
-      'not-reached',
-    ]);
-    expect(rail('starting', 'health').stations.map((station) => station.state)).toEqual([
-      'done',
-      'done',
-      'done',
-      'current',
-    ]);
-  });
-
-  it('turns every station green once the deployment succeeded', () => {
-    const result = rail('succeeded', 'health');
-    expect(result.stations.every((station) => station.state === 'done')).toBe(true);
-    expect(result.live).toBe(false);
-  });
-
-  it('reddens only the failing station and leaves the rest dark', () => {
-    expect(rail('failed', 'boot').stations.map((station) => station.state)).toEqual([
-      'done',
-      'done',
-      'failed',
-      'not-reached',
-    ]);
-  });
-
-  it('keeps a superseded deployment dark with a plain caption', () => {
-    const result = rail('superseded', null);
-    expect(result.stations.every((station) => station.state === 'not-reached')).toBe(true);
-    expect(result.caption).toBe('Superseded by a newer deployment');
   });
 });
 

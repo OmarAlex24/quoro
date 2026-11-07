@@ -17,7 +17,7 @@ import { Tag } from '../ui/tag';
 import { MenuPanel, useMenu } from './menu';
 import { roleLabel } from './shell-data';
 
-const THEME_WORDS: Record<ThemeChoice, { label: string; Icon: LucideIcon }> = {
+export const THEME_WORDS: Record<ThemeChoice, { label: string; Icon: LucideIcon }> = {
   system: { label: 'System', Icon: Monitor },
   dark: { label: 'Dark', Icon: Moon },
   light: { label: 'Light', Icon: Sun },

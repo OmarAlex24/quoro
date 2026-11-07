@@ -30,7 +30,7 @@ export function SetupScreen() {
         { headers: { 'Quoro-Setup-Token': token.trim() } },
       ),
     onSuccess: () => {
-      setSetupNotice('Owner created. Log in.');
+      setSetupNotice('Owner created. Sign in with the email and password you chose.');
       void navigate({ to: '/login' });
     },
     onError: (error) => {
@@ -61,24 +61,24 @@ export function SetupScreen() {
 
   return (
     <AuthPanel
+      title="Set up the owner"
+      lede="The first account of this cluster. It holds every scope and invites everyone else."
       footer={
-        <p className="text-[13px] text-ink-2">
+        <p>
           Setup already done?{' '}
-          <Link to="/login" className="text-accent underline-offset-4 hover:underline">
-            Log in
+          <Link to="/login" className="auth-link">
+            Sign in
           </Link>
         </p>
       }
     >
-      <h2 className="type-display text-[18px] leading-tight">Set up owner</h2>
-
-      <form onSubmit={submit} className="mt-4 flex flex-col gap-4" noValidate>
+      <form onSubmit={submit} className="grid gap-4" noValidate>
         {alreadyDone ? (
-          <div className="rounded-[10px] border border-line border-l-4 border-l-fault bg-surface px-3.5 py-2.5">
-            <p className="text-[15px] leading-snug text-ink">
+          <div role="alert" className="auth-note auth-note-fault">
+            <p>
               Setup is already done.{' '}
-              <Link to="/login" className="text-accent underline-offset-4 hover:underline">
-                Log in instead
+              <Link to="/login" className="auth-link">
+                Sign in instead
               </Link>
               .
             </p>
@@ -92,9 +92,13 @@ export function SetupScreen() {
           label="Setup token"
           htmlFor="setup-token"
           hint={
-            isMock
-              ? 'Mock mode: any token works.'
-              : 'Printed by quoro setup-token on the server.'
+            fieldErrors.token ? (
+              <span className="text-fault">{fieldErrors.token}</span>
+            ) : isMock ? (
+              'Mock mode: any token works.'
+            ) : (
+              'Printed by quoro setup-token on the server.'
+            )
           }
         >
           <Input
@@ -102,15 +106,18 @@ export function SetupScreen() {
             value={token}
             onChange={(event) => setToken(event.target.value)}
             spellCheck={false}
+            autoComplete="off"
+            className="type-code"
             aria-invalid={fieldErrors.token !== undefined}
             autoFocus
           />
-          {fieldErrors.token ? (
-            <p className="text-[13px] text-fault">{fieldErrors.token}</p>
-          ) : null}
         </Field>
 
-        <Field label="Email" htmlFor="setup-email">
+        <Field
+          label="Email"
+          htmlFor="setup-email"
+          hint={fieldErrors.email ? <span className="text-fault">{fieldErrors.email}</span> : undefined}
+        >
           <Input
             id="setup-email"
             type="email"
@@ -119,12 +126,13 @@ export function SetupScreen() {
             onChange={(event) => setEmail(event.target.value)}
             aria-invalid={fieldErrors.email !== undefined}
           />
-          {fieldErrors.email ? (
-            <p className="text-[13px] text-fault">{fieldErrors.email}</p>
-          ) : null}
         </Field>
 
-        <Field label="Name" htmlFor="setup-name">
+        <Field
+          label="Name"
+          htmlFor="setup-name"
+          hint={fieldErrors.name ? <span className="text-fault">{fieldErrors.name}</span> : undefined}
+        >
           <Input
             id="setup-name"
             autoComplete="name"
@@ -132,15 +140,18 @@ export function SetupScreen() {
             onChange={(event) => setName(event.target.value)}
             aria-invalid={fieldErrors.name !== undefined}
           />
-          {fieldErrors.name ? (
-            <p className="text-[13px] text-fault">{fieldErrors.name}</p>
-          ) : null}
         </Field>
 
         <Field
           label="Password"
           htmlFor="setup-password"
-          hint="12 characters or more."
+          hint={
+            fieldErrors.password ? (
+              <span className="text-fault">{fieldErrors.password}</span>
+            ) : (
+              '12 characters or more.'
+            )
+          }
         >
           <Input
             id="setup-password"
@@ -150,18 +161,15 @@ export function SetupScreen() {
             onChange={(event) => setPassword(event.target.value)}
             aria-invalid={fieldErrors.password !== undefined}
           />
-          {fieldErrors.password ? (
-            <p className="text-[13px] text-fault">{fieldErrors.password}</p>
-          ) : null}
         </Field>
 
         <Button
           type="submit"
           variant="primary"
-          className="mt-1 w-full"
+          className="h-9 w-full"
           disabled={setupMutation.isPending}
         >
-          {setupMutation.isPending ? 'Setting up…' : 'Set up owner'}
+          {setupMutation.isPending ? 'Setting up…' : 'Create the owner'}
         </Button>
       </form>
     </AuthPanel>

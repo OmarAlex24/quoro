@@ -21,11 +21,13 @@ import { SideShell } from './components/shell/side-shell';
 import { AccountScreen } from './screens/account-screen';
 import { ApprovalsScreen } from './screens/approvals-screen';
 import { AuditScreen } from './screens/audit-screen';
+import { BackupsScreen } from './screens/backups-screen';
 import { ConsoleScreen } from './screens/console-screen';
 import { LegacyAppRedirect } from './screens/legacy-app-redirect';
 import { LoginScreen } from './screens/login-screen';
 import { ProjectScreen } from './screens/project-screen';
 import { ProjectsScreen } from './screens/projects-screen';
+import { ProvidersScreen } from './screens/providers-screen';
 import { AgentsPage, NodesPage, SettingsLayout, SettingsTokens } from './screens/section-pages';
 import { SetupScreen } from './screens/setup-screen';
 import { TerminalScreen } from './screens/terminal-screen';
@@ -168,6 +170,18 @@ const settingsWebhookRoute = createRoute({
   component: SettingsWebhook,
 });
 
+const settingsBackupsRoute = createRoute({
+  getParentRoute: () => settingsRoute,
+  path: '/backups',
+  component: BackupsScreen,
+});
+
+const settingsProvidersRoute = createRoute({
+  getParentRoute: () => settingsRoute,
+  path: '/providers',
+  component: ProvidersScreen,
+});
+
 const settingsTokensRoute = createRoute({
   getParentRoute: () => settingsRoute,
   path: '/tokens',
@@ -290,6 +304,8 @@ const routeTree = rootRoute.addChildren([
       settingsMembersRoute,
       settingsWebhooksRoute,
       settingsWebhookRoute,
+      settingsBackupsRoute,
+      settingsProvidersRoute,
       settingsTokensRoute,
       settingsAccountRoute,
     ]),

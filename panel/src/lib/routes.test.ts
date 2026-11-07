@@ -5,6 +5,9 @@ import {
   LEGACY_PATHS,
   newHome,
   sectionOf,
+  SETTINGS_LABELS,
+  SETTINGS_PAGES,
+  settingsPageOf,
   sheetTab,
   validateAgentsSearch,
   validateApprovalsSearch,
@@ -254,5 +257,42 @@ describe('sectionOf', () => {
     expect(sectionOf('/vms/vm_1/console')).toBeNull();
     expect(sectionOf('/login')).toBeNull();
     expect(sectionOf('/projectsx')).toBeNull();
+  });
+});
+
+describe('settingsPageOf', () => {
+  it.each([
+    ['/settings/members', 'members'],
+    ['/settings/webhooks', 'webhooks'],
+    [`/settings/webhooks/${WEBHOOK}`, 'webhooks'],
+    ['/settings/backups', 'backups'],
+    ['/settings/providers', 'providers'],
+    ['/settings/tokens', 'tokens'],
+    ['/settings/account', 'account'],
+    ['/settings/account/', 'account'],
+    ['/users', 'members'],
+    ['/webhooks', 'webhooks'],
+    [`/webhooks/${WEBHOOK}`, 'webhooks'],
+    ['/account', 'account'],
+  ] as const)('%s lights %s', (pathname, page) => {
+    expect(settingsPageOf(pathname)).toBe(page);
+  });
+
+  it('lights nothing outside Settings, on its index or on an unknown page', () => {
+    expect(settingsPageOf('/settings')).toBeNull();
+    expect(settingsPageOf('/settings/')).toBeNull();
+    expect(settingsPageOf('/settings/billing')).toBeNull();
+    expect(settingsPageOf('/settingsx/members')).toBeNull();
+    expect(settingsPageOf('/agents')).toBeNull();
+    expect(settingsPageOf('/login')).toBeNull();
+  });
+
+  it('names every page, in sub-navigation order, and every page is in Settings', () => {
+    expect(SETTINGS_PAGES).toEqual(['members', 'webhooks', 'backups', 'providers', 'tokens', 'account']);
+    for (const page of SETTINGS_PAGES) {
+      expect(SETTINGS_LABELS[page]).toMatch(/^[A-Z]/);
+      expect(settingsPageOf(`/settings/${page}`)).toBe(page);
+      expect(sectionOf(`/settings/${page}`)).toBe('settings');
+    }
   });
 });

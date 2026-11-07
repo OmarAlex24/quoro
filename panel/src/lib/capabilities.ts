@@ -54,6 +54,22 @@ export const canManageUsers = (me: MeResponse | undefined): boolean =>
 export const canListUsers = (me: MeResponse | undefined): boolean => isHumanSession(me);
 
 /**
+ * List, create, delete and rotate the secrets of providers (`provider:manage`).
+ * The scope is human-only and an owner and an operator hold it; a viewer does
+ * not, so the panel never asks for the list on a viewer's behalf
+ * (permission-model.md, sections 3 and 4.2).
+ */
+export const canManageProviders = humanWriter;
+
+/**
+ * Create the backup repository, replace its recovery key and change the
+ * control-plane schedule (`backup:manage`). Owner-only: the recovery key opens
+ * every backup, the control plane's included (permission-model.md, section 3).
+ */
+export const canManageBackups = (me: MeResponse | undefined): boolean =>
+  isHumanSession(me) && me?.user?.role === 'owner';
+
+/**
  * Open a web terminal into an app's guest (`app:terminal`). The scope is
  * human-only in M4 (ADR 0114), so an owner or operator may, an agent never.
  */

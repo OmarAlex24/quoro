@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import eventsSchema from '../../../docs/contracts/events.schema.json';
 import type { Webhook } from '../api/generated/model';
 import {
+  lastDeliveryLine,
   buildCreateWebhookBody,
   buildUpdateWebhookBody,
   deliveryAttemptWords,
@@ -219,5 +220,40 @@ describe('deliveryAttemptWords', () => {
 
   it('names a test delivery instead of numbering it', () => {
     expect(deliveryAttemptWords({ attempt: 1, test: true })).toBe('Test delivery');
+  });
+});
+
+describe('lastDeliveryLine', () => {
+  const NOW = Date.parse('2026-11-07T12:00:00Z');
+  const at = (minutes: number) => new Date(NOW - minutes * 60_000).toISOString();
+
+  it('says the latest delivery and its response in one line', () => {
+    expect(
+      lastDeliveryLine({ status: 'delivered', response_code: 200, created_at: at(12), test: false }, NOW),
+    ).toEqual({ tone: 'run', pulse: false, text: 'Delivered 200 · 12 min ago', fault: false });
+    expect(
+      lastDeliveryLine({ status: 'failed', response_code: 503, created_at: at(5), test: false }, NOW),
+    ).toEqual({ tone: 'fault', pulse: false, text: 'Last delivery failed with 503 · 5 min ago', fault: true });
+    expect(
+      lastDeliveryLine({ status: 'failed', response_code: null, created_at: at(5), test: false }, NOW).text,
+    ).toBe('Last delivery failed, no response · 5 min ago');
+    expect(
+      lastDeliveryLine({ status: 'pending', response_code: null, created_at: at(0), test: false }, NOW),
+    ).toEqual({ tone: 'shift', pulse: true, text: 'Delivering · just now', fault: false });
+  });
+
+  it('names a test delivery as one', () => {
+    expect(
+      lastDeliveryLine({ status: 'delivered', response_code: 204, created_at: at(1), test: true }, NOW).text,
+    ).toBe('Test delivery delivered 204 · 1 min ago');
+  });
+
+  it('says so when nothing was delivered yet', () => {
+    expect(lastDeliveryLine(undefined, NOW)).toEqual({
+      tone: 'idle',
+      pulse: false,
+      text: 'No deliveries yet',
+      fault: false,
+    });
   });
 });

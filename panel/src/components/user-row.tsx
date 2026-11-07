@@ -1,28 +1,26 @@
+import { Ban, Check, KeyRound, Play, Trash2, UserCog } from 'lucide-react';
 import type { User, UserRole } from '../api/generated/model';
 import { roleLabel, userLamp } from '../lib/users';
 import { Avatar } from './avatar';
+import { RowMenu, RowMenuItem } from './settings-parts';
 import { ToneLamp } from './tone-lamp';
 import { Tag } from './ui/tag';
-import { Button } from './ui/button';
 
 const ROLES: UserRole[] = ['owner', 'operator', 'viewer'];
 
-const createdDate = (iso: string): string => {
+const joinedDate = (iso: string): string => {
   const parsed = new Date(iso);
   return Number.isNaN(parsed.getTime())
     ? 'unknown'
-    : parsed.toLocaleDateString(undefined, {
-        year: 'numeric',
-        month: 'short',
-        day: 'numeric',
-      });
+    : parsed.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
 };
 
 /**
- * One human identity as a rack bay: the status lamp, the name and email, the
- * fixed role bundle and, for an owner, the controls that change them. The
- * signed-in owner's own row shows no role, disable or delete controls, so the
- * panel cannot lock them out of their own cluster.
+ * One member: the round avatar, the name with the role, the email and whether
+ * they can sign in, and for an owner a ⋯ menu that changes the role, disables,
+ * resets the password or deletes, each through its confirmation. The
+ * signed-in owner's own row offers only a password reset, so the panel cannot
+ * lock them out of their own cluster.
  */
 export function UserRow({
   user,
@@ -45,88 +43,60 @@ export function UserRow({
   const canEditRow = canManage && !isSelf;
 
   return (
-    <article className="grid grid-cols-[52px_minmax(0,1fr)] overflow-hidden rounded-[10px] border border-line bg-surface card-sheen">
-      <div className="flex items-center justify-center border-r border-line bg-sunk">
-        <ToneLamp tone={lamp.tone} label={lamp.statusText} />
+    <li className="srow">
+      <Avatar kind="human" name={user.name} className="srow-av" />
+      <div className="srow-t">
+        <b>
+          <span className="truncate">{user.name}</span>
+          {isSelf ? <Tag tone="accent">You</Tag> : null}
+          <Tag tone="plain">{roleLabel(user.role)}</Tag>
+        </b>
+        <span className="srow-sub truncate" title={user.email}>
+          {user.email}
+        </span>
+        <small>
+          <ToneLamp tone={lamp.tone} size={11} label={lamp.statusText} />
+          {user.disabled ? 'Disabled: cannot sign in' : 'Can sign in'}
+          <span className="dot-sep" aria-hidden="true" />
+          <span className="type-data" title={user.created_at}>
+            Joined {joinedDate(user.created_at)}
+          </span>
+        </small>
       </div>
-
-      <div className="flex flex-wrap items-start gap-x-4 gap-y-2 px-4 py-3">
-        <div className="min-w-0 flex-1 basis-[min(100%,300px)]">
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-            <Avatar kind="human" name={user.name} />
-            <span className="type-bay-title truncate text-[18px] leading-tight text-ink">
-              {user.name}
-            </span>
-            {isSelf ? (
-              <Tag tone="accent">you</Tag>
-            ) : null}
-            <span className="type-data text-[13px] text-ink-2">{lamp.statusText}</span>
-          </div>
-
-          <p className="type-data mt-1 truncate text-[13px] text-ink" title={user.email}>
-            {user.email}
-          </p>
-
-          <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-2">
-            {canEditRow ? (
-              <label className="flex items-center gap-2 text-[13px] text-ink-2">
-                <span>Role</span>
-                <select
-                  aria-label={`Role for ${user.name}`}
-                  className="field w-32 px-2 text-[14px]"
-                  value={user.role}
-                  onChange={(event) => onRoleChange(user, event.target.value as UserRole)}
+      {canManage ? (
+        <RowMenu label={`Actions for ${user.name}`}>
+          {canEditRow ? (
+            <>
+              <p className="menu-label">Role</p>
+              {ROLES.map((role) => (
+                <RowMenuItem
+                  key={role}
+                  icon={role === user.role ? Check : UserCog}
+                  checked={role === user.role}
+                  onSelect={() => onRoleChange(user, role)}
                 >
-                  {ROLES.map((role) => (
-                    <option key={role} value={role}>
-                      {roleLabel(role)}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            ) : (
-              <span className="inline-flex items-center gap-2 text-[13px] text-ink-2">
-                <span>Role</span>
-                <Tag tone="plain">{roleLabel(user.role)}</Tag>
-              </span>
-            )}
-
-            <span className="type-data text-[13px] text-ink-2" title={user.created_at}>
-              created {createdDate(user.created_at)}
-            </span>
-          </div>
-        </div>
-
-        {canManage ? (
-          <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
-            {canEditRow ? (
-              <Button
-                variant="default"
-                size="sm"
-                onClick={() => onToggleDisabled(user, !user.disabled)}
+                  {roleLabel(role)}
+                </RowMenuItem>
+              ))}
+              <div className="menu-sep" role="separator" />
+              <RowMenuItem
+                icon={user.disabled ? Play : Ban}
+                onSelect={() => onToggleDisabled(user, !user.disabled)}
               >
-                {user.disabled ? 'Enable' : 'Disable'}
-              </Button>
-            ) : null}
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => onResetPassword(user)}
-            >
-              Reset password
-            </Button>
-            {canEditRow ? (
-              <Button
-                variant="danger"
-                size="sm"
-                onClick={() => onDelete(user)}
-              >
-                Delete
-              </Button>
-            ) : null}
-          </div>
-        ) : null}
-      </div>
-    </article>
+                {user.disabled ? 'Enable…' : 'Disable…'}
+              </RowMenuItem>
+            </>
+          ) : null}
+          <RowMenuItem icon={KeyRound} onSelect={() => onResetPassword(user)}>
+            Reset password…
+          </RowMenuItem>
+          {canEditRow ? (
+            <RowMenuItem icon={Trash2} danger onSelect={() => onDelete(user)}>
+              Remove…
+            </RowMenuItem>
+          ) : null}
+        </RowMenu>
+      ) : null}
+    </li>
   );
 }

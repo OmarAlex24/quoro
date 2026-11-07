@@ -1,4 +1,5 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { KeyRound, Trash2 } from 'lucide-react';
 import { useState, type FormEvent } from 'react';
 import type { ApiToken } from '../api/generated/model';
 import {
@@ -29,7 +30,9 @@ import { Input } from './ui/input';
 import { NoticeLine, ProblemBanner } from './ui/problem-banner';
 import { CopyButton } from './copy-button';
 import { SecretOnce } from './secret-once';
+import { RowMenu, RowMenuItem, SettingsEmpty, SettingsHead, SettingsLoading } from './settings-parts';
 import { ToneLamp } from './tone-lamp';
+import { Tag } from './ui/tag';
 
 const revokeProblem = (error: unknown): ProblemView =>
   isApiProblem(error) && error.status === 404
@@ -48,45 +51,44 @@ function TokenRow({ token, onRevoke }: { token: ApiToken; onRevoke: (token: ApiT
   const words = tokenStateWords[state];
 
   return (
-    <li className="flex flex-wrap items-start gap-x-3 gap-y-2 py-3">
-      <ToneLamp tone={tokenLamp(state)} size={20} label={words} className="mt-0.5" />
-
-      <div className="min-w-0 flex-1 basis-[min(100%,260px)]">
-        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-          <span className="min-w-0 break-words type-body-medium text-[14px] text-ink">
-            {token.name}
+    <li className="srow">
+      <span className="glyph glyph-neutral" aria-hidden="true">
+        <KeyRound strokeWidth={1.7} />
+      </span>
+      <div className="srow-t">
+        <b>
+          <span className="truncate">{token.name}</span>
+          {state === 'active' ? null : <Tag tone="plain">{words}</Tag>}
+        </b>
+        <span className="srow-sub inline-flex min-w-0 items-center gap-1">
+          <span className="type-code" title={token.id}>
+            {shortId(token.id)}
           </span>
-          <span className="text-[13px] text-ink-2">{words}</span>
-          <span className="inline-flex min-w-0 items-center gap-1">
-            <span className="type-code text-[12px] text-ink" title={token.id}>
-              {shortId(token.id)}
-            </span>
-            <CopyButton value={token.id} label="Copy token id" />
-          </span>
-        </div>
-
-        <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px] text-ink-2">
-          <span className="type-data" title={token.created_at}>
-            created {relativeTime(token.created_at)}
-          </span>
-          <span className="type-data" title={token.expires_at ?? undefined}>
-            {expiryLine(token)}
-          </span>
-          <span className="type-data" title={token.last_used_at ?? undefined}>
+          <CopyButton value={token.id} label="Copy id" />
+        </span>
+        <small>
+          <ToneLamp tone={tokenLamp(state)} size={11} label={words} />
+          <span title={token.created_at}>Created {relativeTime(token.created_at)}</span>
+          <span className="dot-sep" aria-hidden="true" />
+          <span title={token.expires_at ?? undefined}>{expiryLine(token)}</span>
+          <span className="dot-sep" aria-hidden="true" />
+          <span title={token.last_used_at ?? undefined}>
             {token.last_used_at ? `last used ${relativeTime(token.last_used_at)}` : 'never used'}
           </span>
           {token.revoked_at ? (
-            <span className="type-data" title={token.revoked_at}>
-              revoked {relativeTime(token.revoked_at)}
-            </span>
+            <>
+              <span className="dot-sep" aria-hidden="true" />
+              <span title={token.revoked_at}>revoked {relativeTime(token.revoked_at)}</span>
+            </>
           ) : null}
-        </div>
+        </small>
       </div>
-
       {state === 'active' ? (
-        <Button variant="danger" size="sm" className="ml-auto" onClick={() => onRevoke(token)}>
-          Revoke
-        </Button>
+        <RowMenu label={`Actions for ${token.name}`}>
+          <RowMenuItem icon={Trash2} danger onSelect={() => onRevoke(token)}>
+            Revoke…
+          </RowMenuItem>
+        </RowMenu>
       ) : null}
     </li>
   );
@@ -169,15 +171,14 @@ export function ApiTokens() {
   const created = create.data;
 
   return (
-    <section className="mt-4 rounded-[10px] border border-line bg-surface px-4 py-4 card-sheen sm:px-5">
-      <h2 className="type-display text-[18px] leading-tight">API tokens</h2>
-      <p className="mt-1 max-w-2xl text-[13px] leading-snug text-ink-2">
-        A token signs the quoro CLI or a script in as you, with your role. Give each machine its
-        own, so revoking one leaves the others working.
-      </p>
+    <>
+      <SettingsHead
+        title="API tokens"
+        lede="A token signs the quoro CLI or a script in as you, with your role. Give each machine its own, so revoking one leaves the others working."
+      />
 
       {created ? (
-        <div className="mt-4 flex flex-col gap-2">
+        <div className="flex flex-col gap-2">
           <SecretOnce
             label={`New token “${created.name}”`}
             secret={created.token}
@@ -192,17 +193,14 @@ export function ApiTokens() {
         </div>
       ) : null}
 
-      {problem ? <ProblemBanner view={problem} className="mt-4" /> : null}
-      {notice ? (
-        <div className="mt-3">
-          <NoticeLine>{notice}</NoticeLine>
-        </div>
-      ) : null}
+      {problem ? <ProblemBanner view={problem} /> : null}
+      {notice ? <NoticeLine>{notice}</NoticeLine> : null}
 
       <form
         onSubmit={submit}
         noValidate
-        className="mt-4 grid gap-3 sm:grid-cols-[minmax(0,1fr)_11rem_auto] sm:items-start"
+        aria-label="Create a token"
+        className="box set-form sm:grid-cols-[minmax(0,1fr)_11rem_auto] sm:items-start"
       >
         <Field
           label="Name"
@@ -252,7 +250,7 @@ export function ApiTokens() {
           <Button
             variant="primary"
             type="submit"
-            className="self-start"
+            className="self-start max-sm:w-full"
             disabled={create.isPending}
           >
             {create.isPending ? 'Creating…' : 'Create token'}
@@ -261,15 +259,13 @@ export function ApiTokens() {
       </form>
 
       {listError ? (
-        <ProblemBanner view={listError} className="mt-4" />
+        <ProblemBanner view={listError} />
       ) : tokens.isPending ? (
-        <p className="mt-4 text-[13px] text-ink-2">Loading tokens…</p>
+        <SettingsLoading label="Loading tokens" />
       ) : items.length === 0 ? (
-        <p className="mt-4 border-y border-line py-3 text-[13px] text-ink-2">
-          No tokens yet. Create one to use the CLI or the API.
-        </p>
+        <SettingsEmpty title="No tokens yet.">Create one to use the CLI or the API.</SettingsEmpty>
       ) : (
-        <ul className="mt-4 flex flex-col divide-y divide-line border-y border-line">
+        <ul className="box">
           {items.map((token) => (
             <TokenRow
               key={token.id}
@@ -328,6 +324,6 @@ export function ApiTokens() {
           </div>
         </DialogContent>
       </Dialog>
-    </section>
+    </>
   );
 }

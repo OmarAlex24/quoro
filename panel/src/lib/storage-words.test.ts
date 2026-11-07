@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { Backup } from '../api/generated/model';
 import {
+  repeatWords,
   backupLine,
   haSentence,
   isActiveVolume,
@@ -146,5 +147,29 @@ describe('haSentence', () => {
     expect(haSentence('cold', { restore_estimate_s: null })).toBe('Cold: restores the last backup on another node.');
     expect(haSentence('none', { restore_estimate_s: null })).toMatch(/^None:/);
     expect(haSentence('hot', undefined)).toBe('Hot: not in this release.');
+  });
+});
+
+describe('repeatWords', () => {
+  const NOW = Date.parse('2026-11-07T12:00:00Z');
+  const hoursAgo = (hours: number) => new Date(NOW - hours * 3_600_000).toISOString();
+
+  it('counts the next run from the last succeeded backup', () => {
+    expect(
+      repeatWords(
+        { interval_h: 6, keep: 7 },
+        [
+          { status: 'failed', created_at: hoursAgo(1), finished_at: hoursAgo(1), pruned_at: null },
+          { status: 'succeeded', created_at: hoursAgo(4), finished_at: hoursAgo(4), pruned_at: null },
+        ],
+        NOW,
+      ),
+    ).toBe('Every 6 hours · next in 2 h · keeps 7');
+  });
+
+  it('says when none has succeeded yet, and an hourly schedule in words', () => {
+    expect(repeatWords({ interval_h: 1, keep: 3 }, [], NOW)).toBe(
+      'Every hour · none has succeeded yet · keeps 3',
+    );
   });
 });

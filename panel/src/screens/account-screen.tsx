@@ -1,5 +1,6 @@
 import { useMutation } from '@tanstack/react-query';
-import { useState, type FormEvent } from 'react';
+import { Link } from '@tanstack/react-router';
+import { useId, useState, type FormEvent } from 'react';
 import { changePassword } from '../api/generated/auth/auth';
 import { isApiProblem } from '../api/fetcher';
 import {
@@ -9,12 +10,17 @@ import {
   type PasswordField,
 } from '../lib/password';
 import { problemView, type ProblemView } from '../lib/problem';
+import { setThemeChoice, THEME_CHOICES, useThemeChoice } from '../lib/use-theme';
+import { roleLabel } from '../lib/users';
 import { useSession } from '../session';
-import { ApiTokens } from '../components/api-tokens';
+import { Avatar } from '../components/avatar';
+import { SettingsHead, SettingsLoading, SettingsPage } from '../components/settings-parts';
+import { THEME_WORDS } from '../components/shell/avatar-menu';
 import { Button } from '../components/ui/button';
 import { Field } from '../components/ui/field';
 import { Input } from '../components/ui/input';
 import { ProblemBanner } from '../components/ui/problem-banner';
+import { Tag } from '../components/ui/tag';
 import { LoginScreen } from './login-screen';
 
 const emptyDraft = (): PasswordChangeDraft => ({
@@ -25,11 +31,51 @@ const emptyDraft = (): PasswordChangeDraft => ({
 
 type FieldErrors = Partial<Record<PasswordField, string>>;
 
+const joinedDate = (iso: string): string => {
+  const parsed = new Date(iso);
+  return Number.isNaN(parsed.getTime())
+    ? 'unknown'
+    : parsed.toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' });
+};
+
+/** How the panel looks in this browser: follow the system, or always dark or light. */
+function ThemeChoiceBox() {
+  const choice = useThemeChoice();
+  const labelId = useId();
+  return (
+    <section className="box" aria-labelledby={labelId}>
+      <div className="box-h box-h-wrap">
+        <div className="box-t">
+          <b id={labelId}>Theme</b>
+          <small>Kept in this browser only. System follows your device.</small>
+        </div>
+        <div role="radiogroup" aria-labelledby={labelId} className="seg seg-fit">
+          {THEME_CHOICES.map((value) => {
+            const { label, Icon } = THEME_WORDS[value];
+            return (
+              <button
+                key={value}
+                type="button"
+                role="radio"
+                aria-checked={choice === value}
+                onClick={() => setThemeChoice(value)}
+              >
+                <Icon strokeWidth={1.7} aria-hidden="true" />
+                {label}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    </section>
+  );
+}
+
 /**
- * The `/account` screen: who is signed in, their personal API tokens, and the
- * form where they change their own password. The three passwords live in this component's state for
- * as long as the form is open and nowhere else: not in storage, not in the
- * query cache, not in a log.
+ * Settings › Account: who is signed in, the form where they change their own
+ * password (D-0135), and the theme. Their API tokens have their own page. The
+ * three passwords live in this component's state for as long as the form is
+ * open and nowhere else: not in storage, not in the query cache, not in a log.
  */
 export function AccountScreen() {
   const { user, loading } = useSession();
@@ -94,59 +140,69 @@ export function AccountScreen() {
 
   if (loading) {
     return (
-      <main className="mx-auto w-full max-w-6xl px-4 py-8 sm:px-6">
-        <p className="text-[15px] text-ink-2">Loading…</p>
-      </main>
+      <SettingsPage label="Account">
+        <SettingsHead title="Account" />
+        <SettingsLoading label="Loading your account" />
+      </SettingsPage>
     );
   }
 
   if (!user) return <LoginScreen />;
 
   return (
-    <main className="mx-auto w-full max-w-6xl px-4 py-6 sm:px-6 sm:py-8">
-      <div>
-        <h1 className="type-display text-[24px] leading-none">Your account</h1>
-        <p className="mt-2 max-w-2xl text-[13px] leading-snug text-ink-2">
-          The identity this panel is signed in as, the tokens that sign the CLI
-          and the API in as you, and your password.
-        </p>
-      </div>
+    <SettingsPage label="Account">
+      <SettingsHead
+        title="Account"
+        lede={
+          <>
+            Who this panel is signed in as, your password and how the panel looks. The tokens that
+            sign the CLI in as you are under{' '}
+            <Link to="/settings/tokens" className="set-inline-link">
+              API tokens
+            </Link>
+            .
+          </>
+        }
+      />
 
-      <section className="mt-5 rounded-[10px] border border-line bg-surface px-4 py-4 card-sheen sm:px-5">
-        <h2 className="type-body-medium text-[13px] text-ink-2">Signed in as</h2>
-        <dl className="mt-3 grid gap-x-6 gap-y-3 sm:grid-cols-[8rem_1fr]">
-          <dt className="text-[13px] text-ink-2">Name</dt>
-          <dd className="text-[15px] text-ink">{user.name}</dd>
-          <dt className="text-[13px] text-ink-2">Email</dt>
-          <dd className="break-all text-[15px] text-ink">{user.email}</dd>
-          <dt className="text-[13px] text-ink-2">Role</dt>
-          <dd className="text-[15px] text-ink">
-            {user.role.charAt(0).toUpperCase() + user.role.slice(1)}
-          </dd>
+      <section className="box" aria-label="Signed in as">
+        <div className="box-h">
+          <Avatar kind="human" name={user.name} size="lg" />
+          <div className="box-t">
+            <b className="inline-flex items-center gap-1.5">
+              <span className="truncate">{user.name}</span>
+              <Tag tone="plain">{roleLabel(user.role)}</Tag>
+            </b>
+            <small className="truncate" title={user.email}>
+              {user.email}
+            </small>
+          </div>
+        </div>
+        <dl className="set-rows border-t border-line">
+          <div className="set-row">
+            <dt>Member since</dt>
+            <dd title={user.created_at}>{joinedDate(user.created_at)}</dd>
+          </div>
         </dl>
       </section>
 
-      <ApiTokens />
-
-      <section className="mt-4 rounded-[10px] border border-line bg-surface px-4 py-4 card-sheen sm:px-5">
-        <h2 className="type-display text-[18px] leading-tight">Change password</h2>
-        <p className="mt-1 max-w-2xl text-[13px] leading-snug text-ink-2">
-          Your other panel sessions are signed out; this one stays signed in.
-        </p>
-
+      <section className="box" aria-labelledby="account-password">
+        <div className="box-h">
+          <div className="box-t">
+            <b id="account-password">Change password</b>
+            <small>Your other panel sessions are signed out; this one stays signed in.</small>
+          </div>
+        </div>
+        <div className="box-b grid gap-4">
         {changed ? (
-          <p
-            role="status"
-            aria-live="polite"
-            className="mt-4 rounded-[10px] border border-line border-l-4 border-l-run bg-surface px-3.5 py-2.5 text-[15px] leading-snug text-ink"
-          >
+          <p role="status" aria-live="polite" className="set-ok">
             Password changed. Your other sessions were signed out.
           </p>
         ) : null}
 
-        {problem ? <ProblemBanner view={problem} className="mt-4" /> : null}
+        {problem ? <ProblemBanner view={problem} /> : null}
 
-        <form onSubmit={submit} className="mt-4 flex max-w-md flex-col gap-4" noValidate>
+        <form onSubmit={submit} className="flex max-w-md flex-col gap-4" noValidate>
           <Field
             label="Current password"
             htmlFor="account-current-password"
@@ -210,13 +266,16 @@ export function AccountScreen() {
             />
           </Field>
 
-          <div className="mt-1 border-t border-line pt-4">
+          <div>
             <Button variant="primary" type="submit" disabled={change.isPending}>
               {change.isPending ? 'Changing…' : 'Change password'}
             </Button>
           </div>
         </form>
+        </div>
       </section>
-    </main>
+
+      <ThemeChoiceBox />
+    </SettingsPage>
   );
 }

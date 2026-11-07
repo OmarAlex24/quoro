@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import type { App, Backup, HaPolicyCost, HaPolicyCostPolicy, Volume } from '../api/generated/model';
+import type {
+  App,
+  Backup,
+  BackupSchedule,
+  HaPolicyCost,
+  HaPolicyCostPolicy,
+  Volume,
+} from '../api/generated/model';
 import { relativeTime } from './app-status';
 import { formatBytes } from './ha-cost';
 import type { LampTone } from './lamp';
@@ -125,7 +132,20 @@ export const scheduleWords = (
   now: number = Date.now(),
 ): string => {
   if (app.ha_policy !== 'cold') return 'Not scheduled: backups run on a schedule under the Cold policy';
-  const { interval_h: interval, keep } = app.backup_schedule;
+  return repeatWords(app.backup_schedule, backups, now);
+};
+
+/**
+ * A schedule in one line, counted from the last succeeded backup in `backups`
+ * (newest first): `Every 6 hours · next in 2 h 14 min · keeps 7`. The
+ * control-plane schedule of the backup repository reads the same way.
+ */
+export const repeatWords = (
+  schedule: Pick<BackupSchedule, 'interval_h' | 'keep'>,
+  backups: ReadonlyArray<Pick<Backup, 'status' | 'created_at' | 'finished_at' | 'pruned_at'>>,
+  now: number = Date.now(),
+): string => {
+  const { interval_h: interval, keep } = schedule;
   const last = backups.find((backup) => backup.status === 'succeeded');
   let next: string;
   if (!last) {

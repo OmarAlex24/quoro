@@ -26,7 +26,7 @@ export const problemView = (error: unknown, action: string): ProblemView => {
 
   switch (error.code) {
     case 'unauthenticated':
-      return { ...codes, message: 'Your session ended. Log in again.' };
+      return { ...codes, message: 'Your session ended. Sign in again.' };
     case 'forbidden':
       return {
         ...codes,

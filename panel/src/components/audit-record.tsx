@@ -4,7 +4,7 @@ import { useGetAgent } from '../api/generated/agents/agents';
 import { useGetAuditRecord } from '../api/generated/audit/audit';
 import type { AuditRecord } from '../api/generated/model';
 import { isApiProblem } from '../api/fetcher';
-import { shortHash, shortId } from '../lib/agency-format';
+import { shortId } from '../lib/agency-format';
 import {
   actorWords,
   AUDIT_DETAIL_FIELDS,
@@ -18,7 +18,6 @@ import { problemView } from '../lib/problem';
 import { CopyButton } from './copy-button';
 import { AgentName, UserName } from './identity-name';
 import { ToneLamp } from './tone-lamp';
-import { Button } from './ui/button';
 import { ProblemBanner } from './ui/problem-banner';
 
 /** A record field the format omits when it has no value. */
@@ -277,35 +276,5 @@ export function AuditRecordBody({ seq }: { seq: number }) {
         </DetailRow>
       ))}
     </dl>
-  );
-}
-
-export function AuditRecordPanel({ seq, onClose }: { seq: number; onClose: () => void }) {
-  const recordQuery = useGetAuditRecord(seq);
-  const record = recordQuery.data;
-
-  return (
-    <section
-      aria-label={`Audit entry ${seq}`}
-      className="rounded-[10px] border border-line bg-surface card-sheen"
-    >
-      <div className="flex items-start justify-between gap-3 border-b border-line px-4 py-3">
-        <div className="min-w-0">
-          <h2 className="type-bay-title text-[16px] leading-tight">
-            Entry <span className="type-data">{seq}</span>
-          </h2>
-          <p className="mt-0.5 type-code text-[10.5px] text-ink-2" title={record?.hash}>
-            {record ? shortHash(record.hash) : 'reading the record'}
-          </p>
-        </div>
-        <Button variant="ghost" onClick={onClose}>
-          Close
-        </Button>
-      </div>
-
-      <div className="px-4 py-3">
-        <AuditRecordBody seq={seq} />
-      </div>
-    </section>
   );
 }

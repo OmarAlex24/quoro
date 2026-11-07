@@ -9,6 +9,7 @@ import {
   type WebhookWake,
 } from '../api/generated/model';
 import { formatDuration } from './agency-format';
+import { relativeTime } from './app-status';
 import type { LampTone } from './lamp';
 
 export const allEventTypes = (): EventType[] => Object.values(EventType);
@@ -82,6 +83,39 @@ export const deliveryLamp = (status: WebhookDeliveryStatus): DeliveryLamp =>
 export const deliveryAttemptWords = (
   delivery: Pick<WebhookDelivery, 'attempt' | 'test'>,
 ): string => (delivery.test ? 'Test delivery' : `Attempt ${delivery.attempt}`);
+
+/**
+ * The latest delivery in one line, for a webhook's row: "Delivered 200 · 12 min
+ * ago", "Last delivery failed with 503 · 5 min ago", or "No deliveries yet".
+ * `fault` turns the whole line the fault colour, as a failure should read.
+ */
+export const lastDeliveryLine = (
+  delivery: Pick<WebhookDelivery, 'status' | 'response_code' | 'created_at' | 'test'> | undefined,
+  now: number = Date.now(),
+): { tone: LampTone; pulse: boolean; text: string; fault: boolean } => {
+  if (!delivery) return { tone: 'idle', pulse: false, text: 'No deliveries yet', fault: false };
+  const when = relativeTime(delivery.created_at, now);
+  const code = delivery.response_code ?? null;
+  const test = delivery.test ? 'Test delivery' : null;
+  switch (delivery.status) {
+    case 'delivered':
+      return {
+        tone: 'run',
+        pulse: false,
+        text: `${test ? `${test} delivered` : 'Delivered'}${code !== null ? ` ${code}` : ''} · ${when}`,
+        fault: false,
+      };
+    case 'failed':
+      return {
+        tone: 'fault',
+        pulse: false,
+        text: `${test ? `${test} failed` : 'Last delivery failed'}${code !== null ? ` with ${code}` : ', no response'} · ${when}`,
+        fault: true,
+      };
+    case 'pending':
+      return { tone: 'shift', pulse: true, text: `Delivering · ${when}`, fault: false };
+  }
+};
 
 /** Every 2 s while an attempt is still pending, otherwise every 15 s. */
 export const deliveryPollingInterval = (

@@ -2,21 +2,6 @@ import type { Agent, Approval, UpdateAgentRequest } from '../api/generated/model
 import { scopeVerb } from './activity';
 import type { LampTone } from './lamp';
 
-/** What the agent bay and plate show next to the lamp. */
-export interface AgentLampState {
-  readonly tone: LampTone;
-  readonly statusText: string;
-}
-
-/**
- * A disabled agent cannot mint access tokens, so it is off until someone
- * enables it again: `idle` and the word "Disabled". A live agent is `run`.
- */
-export const agentLamp = (agent: Pick<Agent, 'disabled'>): AgentLampState =>
-  agent.disabled
-    ? { tone: 'idle', statusText: 'Disabled' }
-    : { tone: 'run', statusText: 'Enabled' };
-
 export const AGENT_NAME_MAX = 200;
 export const AGENT_DESCRIPTION_MAX = 2_000;
 
