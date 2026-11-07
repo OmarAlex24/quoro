@@ -2086,6 +2086,18 @@ async fn a_moved_hostname_drains_on_the_machine_it_left_for_one_window() {
         kept >= window && kept < window + Duration::from_secs(3),
         "the node's tunnel kept the hostname {kept:?} after the repoint"
     );
+    // The node's tunnel never wrote the record back to itself.
+    let node_target = format!("{node_tunnel}.cfargotunnel.com");
+    assert!(
+        requests
+            .iter()
+            .filter(|request| request.path.contains("/dns_records") && request.method != "GET")
+            .all(|request| request
+                .body
+                .as_ref()
+                .is_none_or(|body| body["content"] != node_target.as_str())),
+        "{requests:?}"
+    );
 
     // Back to one replica: the hostname returns to the node, and the edge's
     // tunnel keeps it for one window after the node repointed the CNAME.
@@ -2108,6 +2120,17 @@ async fn a_moved_hostname_drains_on_the_machine_it_left_for_one_window() {
     assert!(
         kept >= window && kept < window + Duration::from_secs(3),
         "the edge's tunnel kept the hostname {kept:?} after the repoint"
+    );
+    let edge_target = format!("{edge_tunnel}.cfargotunnel.com");
+    assert!(
+        requests
+            .iter()
+            .filter(|request| request.path.contains("/dns_records") && request.method != "GET")
+            .all(|request| request
+                .body
+                .as_ref()
+                .is_none_or(|body| body["content"] != edge_target.as_str())),
+        "{requests:?}"
     );
     // The record only ever moved: no tunnel deleted it on the way.
     assert!(

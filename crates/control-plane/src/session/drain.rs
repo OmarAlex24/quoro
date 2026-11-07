@@ -21,10 +21,11 @@
 //! The window counts from the repoint, which the tunnel manager records when
 //! the gaining tunnel published the CNAME ([`Drains::record_cnames`]). The end
 //! is therefore the same whichever writer started the drain and however often
-//! it started: a drain started again after its window is already over. Until
-//! the repoint the CNAME still points at the losing tunnel, so the drain does
-//! not end: its provisional end moves on by one window each time it is
-//! reached.
+//! it started: a drain whose window is already over does not start again.
+//! Until the repoint the CNAME still points at the losing tunnel, so the drain
+//! does not end on its own: at its provisional end [`sweep`] checks again that
+//! the hostname still departed, and either gives it a new provisional end one
+//! window later or ends it.
 //!
 //! The registry lives in memory. A primary restart forgets the open drains,
 //! and the machines then drop those hostnames at once, as they did before
@@ -74,6 +75,24 @@ struct Drain {
 struct Owner {
     machine: String,
     since: OffsetDateTime,
+}
+
+/// What [`Drains::expire`] did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Expired {
+    /// The machines whose drains ended.
+    pub ended: BTreeSet<String>,
+    /// The drains that reached their provisional end before their CNAME
+    /// moved.
+    pub waiting: Vec<Waiting>,
+}
+
+/// A drain that reached its provisional end before its CNAME moved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Waiting {
+    pub machine: String,
+    pub hostname: String,
+    pub app_id: String,
 }
 
 /// One open drain of a machine.
@@ -128,22 +147,28 @@ impl Drains {
     }
 
     /// Starts draining `hostname` on `machine` for `app_id`, unless it
-    /// already drains there. Returns whether it started.
+    /// already drains there or the window after its CNAME moved away from
+    /// `machine` is already over. Returns whether it started.
+    ///
+    /// Refusing a drain that is already over keeps a caller that keeps
+    /// seeing the same departure, such as a tunnel whose syncs fail, from
+    /// starting and ending it again in a loop.
     pub fn start(&self, machine: &str, hostname: &str, app_id: &str, now: OffsetDateTime) -> bool {
         let mut state = self.state.lock().expect("drain lock");
         let key = (machine.to_string(), hostname.to_string());
         if state.open.contains_key(&key) {
             return false;
         }
-        let provisional = now + state.window;
-        state.open.insert(
-            key,
-            Drain {
-                app_id: app_id.to_string(),
-                started: Instant::now(),
-                provisional,
-            },
-        );
+        let drain = Drain {
+            app_id: app_id.to_string(),
+            started: Instant::now(),
+            provisional: now + state.window,
+        };
+        let (until, moved) = state.end_of(machine, hostname, &drain);
+        if moved && now >= until {
+            return false;
+        }
+        state.open.insert(key, drain);
         drop(state);
         self.changed.notify_one();
         true
@@ -242,12 +267,12 @@ impl Drains {
             .min()
     }
 
-    /// Removes the drains whose window is over at `now`, and moves the
-    /// provisional end of a drain whose CNAME has not moved yet on by one
-    /// window. Returns the machines whose drains changed.
-    pub fn expire(&self, now: OffsetDateTime) -> BTreeSet<String> {
+    /// Removes the drains whose window is over at `now`. Returns the machines
+    /// they belonged to, and the drains that reached their provisional end
+    /// while their CNAME has not moved: each needs [`Self::extend`] or
+    /// [`Self::end`].
+    pub fn expire(&self, now: OffsetDateTime) -> Expired {
         let mut state = self.state.lock().expect("drain lock");
-        let window = state.window;
         let mut over = Vec::new();
         let mut waiting = Vec::new();
         for ((m, hostname), drain) in &state.open {
@@ -256,26 +281,57 @@ impl Drains {
                 if moved {
                     over.push((m.clone(), hostname.clone()));
                 } else {
-                    waiting.push((m.clone(), hostname.clone()));
+                    waiting.push(Waiting {
+                        machine: m.clone(),
+                        hostname: hostname.clone(),
+                        app_id: drain.app_id.clone(),
+                    });
                 }
             }
         }
-        let mut affected = BTreeSet::new();
+        let mut ended = BTreeSet::new();
         for key in over {
             state.open.remove(&key);
-            affected.insert(key.0);
-        }
-        for key in waiting {
-            if let Some(drain) = state.open.get_mut(&key) {
-                drain.provisional = now + window;
-            }
-            affected.insert(key.0);
+            ended.insert(key.0);
         }
         drop(state);
-        if !affected.is_empty() {
+        if !ended.is_empty() {
             self.changed.notify_one();
         }
-        affected
+        Expired { ended, waiting }
+    }
+
+    /// Gives the drain of `hostname` on `machine` a new provisional end one
+    /// window after `now`, if its CNAME still has not moved.
+    pub fn extend(&self, machine: &str, hostname: &str, now: OffsetDateTime) {
+        let mut state = self.state.lock().expect("drain lock");
+        let window = state.window;
+        let key = (machine.to_string(), hostname.to_string());
+        let Some(drain) = state.open.get(&key).cloned() else {
+            return;
+        };
+        if state.end_of(machine, hostname, &drain).1 {
+            return;
+        }
+        if let Some(drain) = state.open.get_mut(&key) {
+            drain.provisional = now + window;
+        }
+        drop(state);
+        self.changed.notify_one();
+    }
+
+    /// Ends the drain of `hostname` on `machine` now.
+    pub fn end(&self, machine: &str, hostname: &str) {
+        let removed = self
+            .state
+            .lock()
+            .expect("drain lock")
+            .open
+            .remove(&(machine.to_string(), hostname.to_string()))
+            .is_some();
+        if removed {
+            self.changed.notify_one();
+        }
     }
 
     /// Forgets every drain of `machine` and the CNAMEs its tunnel held, when
@@ -350,6 +406,40 @@ pub(crate) async fn departed(
         return Ok(None);
     }
     Ok(Some(app_id))
+}
+
+/// Ends the drains whose window is over at `now`, and checks again each drain
+/// that reached its provisional end before its CNAME moved: one whose
+/// hostname still departed ([`departed`]) gets a new provisional end, and one
+/// that no longer did ends. That covers a gaining tunnel that was removed, a
+/// domain that was deleted and a backend that stopped. Returns the machines
+/// whose drains changed.
+pub(crate) async fn sweep(
+    pool: &SqlitePool,
+    drains: &Drains,
+    now: OffsetDateTime,
+) -> BTreeSet<String> {
+    let expired = drains.expire(now);
+    let mut changed = expired.ended;
+    for Waiting {
+        machine,
+        hostname,
+        app_id,
+    } in expired.waiting
+    {
+        match departed(pool, &machine, &hostname).await {
+            // Still the same app's hostname, still served elsewhere.
+            Ok(Some(departed)) if departed == app_id => drains.extend(&machine, &hostname, now),
+            Ok(_) => drains.end(&machine, &hostname),
+            Err(error) => {
+                // Checked again one window later.
+                tracing::warn!(machine, hostname, %error, "cannot check a draining hostname");
+                drains.extend(&machine, &hostname, now);
+            }
+        }
+        changed.insert(machine);
+    }
+    changed
 }
 
 /// Whether `machine` can still serve `app_id`: on the edge, an instance runs

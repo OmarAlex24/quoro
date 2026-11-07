@@ -1955,6 +1955,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_drain_that_waits_for_its_cname_ends_once_no_other_tunnel_serves_it() {
+        let store = Store::open_in_memory().await.unwrap();
+        let key = DataKey::ephemeral();
+        let drains = Drains::default();
+        let edge = "nod_0000000000000000000000000E";
+        let node = "nod_00000000000000000000000001";
+        insert_node(&store, edge, &["edge"], None).await;
+        insert_node(&store, node, &["node"], Some("10.42.1.0/24")).await;
+        insert_tunnels(&store, &key, &[edge, node]).await;
+        let project_id = insert_project(&store, "wait").await;
+        let app_id = deploy::new_id_with_prefix("app");
+        insert_app(&store, &project_id, &app_id, "web", 1).await;
+        insert_domain(
+            &store,
+            &deploy::new_id_with_prefix("dom"),
+            &app_id,
+            "wait.example.com",
+            "tunnel",
+        )
+        .await;
+        insert_app_vm(
+            &store,
+            &project_id,
+            &app_id,
+            node,
+            &new_id(Prefix::Vm),
+            "web-1",
+            Some("10.42.1.11"),
+        )
+        .await;
+        let first = drained_spec(&store, &key, &drains, node, None).await;
+        set_replicas(&store, &app_id, 2).await;
+        let second = drained_spec(&store, &key, &drains, node, Some(&first)).await;
+        assert!(second.routes[0].draining_until.is_some());
+
+        // The edge's tunnel never took the CNAME: at its provisional end the
+        // drain is checked again and, the edge still serving the hostname,
+        // gets a new end.
+        let later = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+        assert_eq!(
+            drain::sweep(store.pool(), &drains, later).await,
+            BTreeSet::from([node.to_string()])
+        );
+        assert!(drains.next_end().is_some_and(|end| end > later));
+        let third = drained_spec(&store, &key, &drains, node, Some(&second)).await;
+        assert_eq!(third.routes.len(), 1);
+        assert_ne!(
+            third.routes[0].draining_until,
+            second.routes[0].draining_until
+        );
+
+        // The edge's tunnel is removed: no other tunnel serves the hostname,
+        // so the next check ends the drain.
+        sqlx::query("DELETE FROM node_tunnels WHERE node_id = ?")
+            .bind(edge)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let even_later = later + time::Duration::hours(1);
+        assert_eq!(
+            drain::sweep(store.pool(), &drains, even_later).await,
+            BTreeSet::from([node.to_string()])
+        );
+        assert!(drains.next_end().is_none());
+        let fourth = drained_spec(&store, &key, &drains, node, Some(&third)).await;
+        assert!(fourth.routes.is_empty(), "{:?}", fourth.routes);
+    }
+
+    #[tokio::test]
     async fn a_route_back_on_one_replica_drains_on_the_edge_with_the_remaining_instance() {
         let store = Store::open_in_memory().await.unwrap();
         let key = DataKey::ephemeral();

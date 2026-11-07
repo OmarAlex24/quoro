@@ -250,6 +250,9 @@ impl TunnelManager {
         }
         self.inner.pending.lock().expect("tunnel pending lock").all = true;
         self.inner.wake.notify_one();
+        // The periodic pass keeps its own deadline, so the wake-ups of kicks
+        // and drains never postpone it.
+        let mut next_pass = tokio::time::Instant::now() + RECONCILE_INTERVAL;
         loop {
             let drains = self.inner.hub.drains();
             let next_end = drains.next_end().map(|end| {
@@ -260,13 +263,19 @@ impl TunnelManager {
                 () = drains.changed() => {}
                 () = tokio::time::sleep(next_end.unwrap_or(RECONCILE_INTERVAL)),
                     if next_end.is_some() => {}
-                () = tokio::time::sleep(RECONCILE_INTERVAL) => {
+                () = tokio::time::sleep_until(next_pass) => {
+                    next_pass = tokio::time::Instant::now() + RECONCILE_INTERVAL;
                     self.inner.pending.lock().expect("tunnel pending lock").all = true;
                 }
             }
             // A drain whose window is over leaves its machine's snapshot and
             // its tunnel's ingress rules now (ADR 0194).
-            let ended = drains.expire(time::OffsetDateTime::now_utc());
+            let ended = drain::sweep(
+                self.inner.store.pool(),
+                drains,
+                time::OffsetDateTime::now_utc(),
+            )
+            .await;
             for node_id in &ended {
                 self.inner.hub.node_changed(node_id);
             }
@@ -522,7 +531,17 @@ impl TunnelManager {
                 }
                 // A CNAME this tunnel now holds for a hostname that drains on
                 // another machine starts that drain's window (ADR 0194).
-                let written: BTreeSet<String> = normal.intersection(&published).cloned().collect();
+                // A hostname whose upsert failed may hold an older entry
+                // in `published`: it took nothing over.
+                let failed: BTreeSet<&str> = failures
+                    .iter()
+                    .map(|(hostname, _)| hostname.as_str())
+                    .collect();
+                let written: BTreeSet<String> = normal
+                    .intersection(&published)
+                    .filter(|hostname| !failed.contains(hostname.as_str()))
+                    .cloned()
+                    .collect();
                 let repointed = drains.record_cnames(
                     node_id,
                     &written,

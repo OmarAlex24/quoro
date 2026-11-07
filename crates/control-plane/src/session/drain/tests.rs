@@ -38,11 +38,13 @@ fn a_drain_ends_one_window_after_the_cname_moved() {
     assert_eq!(affected, set(&[NODE]));
     assert_eq!(ends(&drains, NODE, at(12)), [at(132)]);
 
-    assert!(drains.expire(at(131)).is_empty());
+    assert_eq!(drains.expire(at(131)), Expired::default());
     assert_eq!(drains.open_of(NODE, at(131)).len(), 1);
     // Past the end the drain is left out at once, before the sweep.
     assert!(drains.open_of(NODE, at(132)).is_empty());
-    assert_eq!(drains.expire(at(132)), set(&[NODE]));
+    let expired = drains.expire(at(132));
+    assert_eq!(expired.ended, set(&[NODE]));
+    assert!(expired.waiting.is_empty());
     assert!(drains.next_end().is_none());
 }
 
@@ -52,10 +54,31 @@ fn a_drain_waits_for_the_cname_to_move() {
     drains.record_cnames(NODE, &set(&[HOST]), &set(&[HOST]), at(0));
     drains.start(NODE, HOST, "app_1", at(0));
     // The gaining tunnel never published: the CNAME still points here, so
-    // the provisional end moves on instead of ending the drain.
-    assert_eq!(drains.expire(at(120)), set(&[NODE]));
+    // the drain does not end on its own; the sweep checks it again.
+    let expired = drains.expire(at(120));
+    assert!(expired.ended.is_empty());
+    assert_eq!(
+        expired.waiting,
+        [Waiting {
+            machine: NODE.to_string(),
+            hostname: HOST.to_string(),
+            app_id: "app_1".to_string(),
+        }]
+    );
+    drains.extend(NODE, HOST, at(120));
     assert_eq!(ends(&drains, NODE, at(120)), [at(240)]);
     assert_eq!(drains.next_end(), Some(at(240)));
+    drains.end(NODE, HOST);
+    assert!(drains.next_end().is_none());
+}
+
+#[test]
+fn a_drain_whose_cname_moved_keeps_its_end_when_extended() {
+    let drains = Drains::default();
+    drains.start(NODE, HOST, "app_1", at(0));
+    drains.record_cnames(EDGE, &set(&[HOST]), &set(&[HOST]), at(5));
+    drains.extend(NODE, HOST, at(100));
+    assert_eq!(ends(&drains, NODE, at(100)), [at(125)]);
 }
 
 #[test]
@@ -65,10 +88,13 @@ fn a_drain_started_after_the_repoint_counts_from_the_repoint() {
     drains.start(NODE, HOST, "app_1", at(100));
     assert_eq!(ends(&drains, NODE, at(100)), [at(120)]);
 
-    // Started again after its window, it is already over.
-    assert_eq!(drains.expire(at(120)), set(&[NODE]));
-    drains.start(NODE, HOST, "app_1", at(300));
+    // Seen again after its window, it does not start: a caller that keeps
+    // seeing the departure cannot start and end it in a loop.
+    assert_eq!(drains.expire(at(120)).ended, set(&[NODE]));
+    assert!(!drains.start(NODE, HOST, "app_1", at(300)));
     assert!(drains.open_of(NODE, at(300)).is_empty());
+    assert!(drains.next_end().is_none());
+    assert_eq!(drains.expire(at(300)), Expired::default());
 }
 
 #[test]
@@ -196,7 +222,12 @@ proptest! {
             match op {
                 Op::Start(m, h) => {
                     let started = drains.start(MACHINES[m], HOSTS[h], "app_1", now);
-                    prop_assert_eq!(started, open.insert((MACHINES[m], HOSTS[h])));
+                    let key = (MACHINES[m], HOSTS[h]);
+                    let expected = !open.contains(&key) && !over(&owners, key.0, key.1, now);
+                    prop_assert_eq!(started, expected);
+                    if expected {
+                        open.insert(key);
+                    }
                 }
                 Op::Publish(m, hosts) => {
                     let machine = MACHINES[m];
@@ -227,7 +258,17 @@ proptest! {
                 }
                 Op::Advance(seconds) => now += time::Duration::seconds(seconds),
                 Op::Expire => {
-                    drains.expire(now);
+                    let expired = drains.expire(now);
+                    // The sweep found every waiting drain still departed.
+                    for waiting in &expired.waiting {
+                        drains.extend(&waiting.machine, &waiting.hostname, now);
+                    }
+                    let ended: BTreeSet<String> = open
+                        .iter()
+                        .filter(|(m, h)| over(&owners, m, h, now))
+                        .map(|(m, _)| (*m).to_string())
+                        .collect();
+                    prop_assert_eq!(expired.ended, ended);
                     open.retain(|(m, h)| !over(&owners, m, h, now));
                     // A drain whose CNAME has not moved got a new end ahead.
                     for machine in MACHINES {
