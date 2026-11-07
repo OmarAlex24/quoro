@@ -650,7 +650,11 @@ fn expiring_lease_table(lease_id: &str, app_id: &str, token: u64) -> LeaseTable 
     table
         .on_grant(&grant, None, now)
         .expect("a valid expiring grant");
-    table.renew_sent(&grant.lease_id, renewal.clone(), now);
+    table.renew_sent(
+        &grant.lease_id,
+        renewal.clone(),
+        &quoro_node_agent::HostNow::unknown(now),
+    );
     table
         .on_grant(&grant, Some(&renewal), now)
         .expect("the renewal is answered");
