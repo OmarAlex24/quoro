@@ -265,6 +265,8 @@
   - [0265: M5b refuses warm for an app built from a Git source, with the reason not_in_this_release](adr/0265-m5b-refuses-warm-for-an-app-built-from-a-git-source-with.md)
   - [0266: Where the primary takes a voter's mesh endpoint from (node-to-node peers, section 6.9)](adr/0266-where-the-primary-takes-a-voter-s-mesh-endpoint-from-node.md)
   - [0267: A warm copy the node is no longer the target of is never reported, so the primary cannot always delete it](adr/0267-a-warm-copy-the-node-is-no-longer-the-target-of-is-never.md)
+  - [0271: Editorial: engine-trait sections 3.16 and 3.11 name the PauseCopy errors and the resume after a restart that #534 implements](adr/0271-editorial-engine-trait-sections-3-16-and-3-11-name-the.md)
+  - [0272: Editorial: node-agent-protocol 5.11 and 6.7 say a pause_copy backup pauses the VM that attaches the volume, not the job's vm_id](adr/0272-editorial-node-agent-protocol-5-11-and-6-7-say-a-pause-copy.md)
   - [0274: M7, deploy experience: after M6, Quoro adds docker-compose import, private registries and Git repositories, a container engine for hosts without KVM, and Railpack builds](adr/0274-m7-deploy-experience-after-m6-quoro-adds-docker-compose.md)
   - [0275: A warm app's placement does not narrow its warm node: a stateful app's placement names only its volume's node](adr/0275-a-warm-app-s-placement-does-not-narrow-its-warm-node-a.md)
   - [0276: When the scheduler picks a warm node again: not on a disconnect, only for a lasting reason](adr/0276-when-the-scheduler-picks-a-warm-node-again-not-on-a.md)
