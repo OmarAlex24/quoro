@@ -20,7 +20,7 @@ mod store;
 pub use clock::{
     HostClock, HostNow, ManualHostClock, Sleep, StoredValidity, SuspendWatch, SystemHostClock,
 };
-pub use fence::{FenceReport, FenceTimers, VmFenceOutcome, budget_for, stop_vms};
+pub use fence::{FenceReport, FenceTimers, VmFenceOutcome, budget_for, stop_vms, stop_vms_until};
 pub use machine::{
     Action, Lease, LeaseState, LeaseTable, MIN_DURATION, Refusal, RevokeOutcome, margin,
 };

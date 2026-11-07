@@ -242,6 +242,15 @@ impl LeaseTable {
         by
     }
 
+    /// The part of the measured suspend [`Self::catch_up`] has applied: a
+    /// suspend measured beyond it has moved no instant yet. A fence that runs
+    /// on after its lease left the table's catch-up counts the rest itself
+    /// (ADR 0240).
+    #[must_use]
+    pub fn suspend_applied(&self) -> Duration {
+        self.suspend_applied
+    }
+
     /// Whether any lease keeps instants on the lease clock: an `expiring`
     /// lease that is `held` or `uncertain`. Only then does a suspend need to
     /// be checked for (section 8.4 "Suspend").

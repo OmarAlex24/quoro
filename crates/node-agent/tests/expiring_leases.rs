@@ -17,11 +17,11 @@ use std::time::Duration;
 
 use agent_common::{TargetDir, snapshot_full, stateful_vm};
 use common::{millis, running_vm, stop_counts, wait_for};
-use quoro_engine::{Engine, FakeEngine, VmState};
+use quoro_engine::{Engine, FakeEngine, StopMode, VmState};
 use quoro_node_agent::store::NodeStore;
 use quoro_node_agent::{
     Attached, FenceTimers, HostClock, LeaseConfig, LeaseState, LocalLeases, ManualHostClock,
-    StoredLease, StoredValidity, VmFenceOutcome, start_local_leases, stop_vms,
+    StoredLease, StoredValidity, VmFenceOutcome, start_local_leases, stop_vms, stop_vms_until,
 };
 use quoro_proto::{
     CommandStatus, Envelope, LeaseGrant, LeaseId, LeaseMode, LeaseRenew, LeaseRevoke, MsgId,
@@ -670,6 +670,19 @@ async fn a_short_suspend_brings_the_expiry_earlier_by_its_length() {
     assert!(done < millis(4500), "earlier than t_send + 5 000: {done:?}");
     assert_eq!(leases.view.state(LEASE), Some(LeaseState::Expired));
     assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Stopped);
+    // The fence counts the suspend once (#453): the table had already moved
+    // the deadline by it, so the fence's clock leaves it out. Counted again,
+    // the 2 000 ms suspend would use up the 700 ms graceful stop and leave
+    // only the forced one.
+    let calls = engine.stop_calls();
+    assert!(
+        matches!(
+            &calls[..],
+            [(_, StopMode::Graceful { timeout, .. })]
+                if !timeout.is_zero() && *timeout <= millis(700)
+        ),
+        "one graceful stop, with the time it had left: {calls:?}"
+    );
     leases.abort();
 }
 
@@ -831,7 +844,9 @@ async fn an_old_session_ending_after_a_new_one_attached_changes_nothing() {
 
 /// Section 8.4: `T_grace + T_force <= M` holds for the whole stop, the check
 /// after a forced stop included. A VM whose stops both hang fails its fence,
-/// and the fence still ends by `t_send + D`.
+/// and the fence hands the engine stops that fit in `M`, so that it ends by
+/// `t_send + D`. That the fence keeps those bounds is shown on a paused clock
+/// by `a_hung_stop_keeps_the_bounds_the_fence_hands_the_engine`.
 #[tokio::test]
 async fn an_expiry_whose_stops_hang_fails_within_the_margin() {
     let dir = TargetDir::new("expiring-hang");
@@ -844,31 +859,47 @@ async fn an_expiry_whose_stops_hang_fails_within_the_margin() {
     engine.set_stop_delay(&vm, millis(5000));
     let mut attached = leases.link.attach();
 
-    // `D` = 3 000, `M` = 1 000: the fence starts at `t_send` + 2 000, the
-    // forced stop by `t_send` + 2 700, and the stop gives up at `t_send` +
-    // 3 000. Recording a failed fence takes a few writes after that.
+    // `D` = 3 000, `M` = 1 000: the fence starts at `t_send` + 2 000, with a
+    // graceful stop of at most `M - T_force` = 700 ms and a forced stop of
+    // 300 ms. The guest ignores the power button and the VMM takes 5 s to
+    // stop it, so neither stop ends before its bound. The test checks the
+    // bounds, not how long the stops took, so a loaded host cannot fail it.
     let before = grant_and_confirm(&leases, &mut attached, 3000).await;
+    wait_for("the graceful stop", || {
+        stop_counts(&engine.stop_calls()).0 == 1
+    })
+    .await;
+    let graceful_at = before.elapsed();
+    assert!(
+        graceful_at >= millis(2000),
+        "no early fence: {graceful_at:?}"
+    );
     wait_for("the forced stop", || {
         stop_counts(&engine.stop_calls()).1 == 1
     })
     .await;
-    let forced = before.elapsed();
-    assert!(forced >= millis(2000), "no early fence: {forced:?}");
-    assert!(
-        forced <= millis(2750),
-        "the graceful stop is clamped: {forced:?}"
+    let calls = engine.stop_calls();
+    let StopMode::Graceful {
+        timeout,
+        force_within,
+    } = calls[0].1
+    else {
+        panic!("a graceful stop first: {calls:?}");
+    };
+    assert!(timeout <= millis(700), "T_grace is clamped: {timeout:?}");
+    assert_eq!(force_within, millis(300));
+    assert_eq!(
+        calls[1].1,
+        StopMode::Force {
+            within: millis(300)
+        }
     );
     assert!(
         leases.view.fence_owns_stop(LEASE),
         "the reconciler leaves the VM to the fence"
     );
     wait_for_fence_record(&store).await;
-    let done = before.elapsed();
     assert!(!leases.view.fence_owns_stop(LEASE));
-    assert!(
-        done <= millis(3250),
-        "the stop gave up by t_send + D, then was recorded: {done:?}"
-    );
     let failed = events_of(&store, "node.fence_failed").await;
     assert_eq!(failed.len(), 1);
     assert_eq!(failed[0]["data"]["reason"], "lease_expired");
@@ -877,6 +908,286 @@ async fn an_expiry_whose_stops_hang_fails_within_the_margin() {
         serde_json::json!({ LEASE: 1 })
     );
     assert!(leases.view.is_failed());
+    leases.abort();
+}
+
+/// ADR 0240, #453: the graceful stops of a fence end as soon as the lease
+/// clock says their time is over, however much the tokio clock gave them.
+/// The forced stops then begin at once.
+#[tokio::test(start_paused = true)]
+async fn a_graceful_stop_ends_when_the_lease_clock_says_its_time_is_over() {
+    let engine = FakeEngine::new();
+    let vm = running_vm(&engine, "vm_hung", 2).await;
+    engine.set_ignore_power_button(&vm, true);
+
+    let began = Instant::now();
+    let report = stop_vms_until(
+        &engine,
+        std::slice::from_ref(&vm),
+        FenceTimers {
+            grace: millis(1000),
+            force: millis(300),
+        },
+        Box::pin(tokio::time::sleep(millis(100))),
+    )
+    .await;
+    let took = began.elapsed();
+    assert!(
+        took >= millis(100) && took < millis(400),
+        "the forced stop began at 100 ms: {took:?}"
+    );
+    assert!(
+        matches!(&report.vms[..], [(id, VmFenceOutcome::Forced)] if id == &vm),
+        "{report:?}"
+    );
+    let calls = engine.stop_calls();
+    assert_eq!(stop_counts(&calls), (1, 1));
+    assert_eq!(
+        calls[1].1,
+        StopMode::Force {
+            within: millis(300)
+        },
+        "the forced stop gets its full T_force"
+    );
+}
+
+/// Section 8.4: the fence keeps the bounds it hands the engine. Against a
+/// guest that ignores the power button and a VMM that takes 5 s to stop, the
+/// forced stop begins when `T_grace` has passed, and the fence reports the VM
+/// failed when `T_force` has passed after that, so the whole stop takes
+/// `T_grace + T_force`.
+#[tokio::test(start_paused = true)]
+async fn a_hung_stop_keeps_the_bounds_the_fence_hands_the_engine() {
+    let engine = FakeEngine::new();
+    let vm = running_vm(&engine, "vm_hung", 2).await;
+    engine.set_ignore_power_button(&vm, true);
+    engine.set_stop_delay(&vm, millis(5000));
+
+    let began = Instant::now();
+    let fence = async {
+        let report = stop_vms(
+            &engine,
+            std::slice::from_ref(&vm),
+            FenceTimers {
+                grace: millis(700),
+                force: millis(300),
+            },
+        )
+        .await;
+        (report, began.elapsed())
+    };
+    let watch = async {
+        tokio::time::sleep(millis(699)).await;
+        let before_grace = stop_counts(&engine.stop_calls());
+        tokio::time::sleep(millis(2)).await;
+        (before_grace, stop_counts(&engine.stop_calls()))
+    };
+    let ((report, took), (before_grace, after_grace)) = tokio::join!(fence, watch);
+    assert_eq!(before_grace, (1, 0), "graceful until T_grace");
+    assert_eq!(after_grace, (1, 1), "forced once T_grace has passed");
+    assert!(took <= millis(1000), "T_grace + T_force: {took:?}");
+    assert!(
+        matches!(&report.vms[..], [(id, VmFenceOutcome::Failed(_))] if id == &vm),
+        "{report:?}"
+    );
+    assert_eq!(
+        engine.stop_calls()[0].1,
+        StopMode::Graceful {
+            timeout: millis(700),
+            force_within: millis(300)
+        }
+    );
+}
+
+/// Section 8.4, ADR 0240, #453: a host suspend during an `expiring` lease's
+/// graceful stop counts against it. A suspend longer than what was left ends
+/// it at the wake-up, and the forced stop begins then, instead of when the
+/// tokio clock, which stopped during the suspend, reaches `T_grace`.
+#[tokio::test]
+async fn a_suspend_during_a_fence_s_graceful_stop_ends_it_at_the_wake_up() {
+    let dir = TargetDir::new("expiring-fence-suspend");
+    let engine = Arc::new(FakeEngine::new());
+    let desired = bound(&["vm_hung"]);
+    let clock = clock();
+    // `D` = 60 000, `M` = 6 000, which holds 5 000 ms of graceful stop and
+    // 300 ms forced.
+    let config = config(&clock).with_expiring_timers(FenceTimers {
+        grace: millis(5000),
+        force: millis(300),
+    });
+    let (leases, _store) = start(&dir, &engine, &desired, config).await;
+    let vm = running_vm(&engine, "vm_hung", 2).await;
+    engine.set_ignore_power_button(&vm, true);
+    let mut attached = leases.link.attach();
+    let _before = grant_and_confirm(&leases, &mut attached, 60_000).await;
+
+    let revoke = leases.link.revoke(
+        MsgId("msg_revoke".to_owned()),
+        None,
+        LeaseRevoke {
+            lease_id: LeaseId(LEASE.to_owned()),
+            fencing_token: 1,
+            reason: RevokeReason::Moved,
+        },
+    );
+    let suspend = async {
+        wait_for("the graceful stop", || {
+            stop_counts(&engine.stop_calls()).0 == 1
+        })
+        .await;
+        let woke = Instant::now();
+        clock.suspend(Duration::from_secs(60));
+        wait_for("the forced stop", || {
+            stop_counts(&engine.stop_calls()).1 == 1
+        })
+        .await;
+        woke.elapsed()
+    };
+    let (result, forced_after) = tokio::join!(revoke, suspend);
+    assert_eq!(
+        result.expect("the revoke is taken").status,
+        CommandStatus::Ok
+    );
+    let calls = engine.stop_calls();
+    let StopMode::Graceful { timeout, .. } = calls[0].1 else {
+        panic!("a graceful stop first: {calls:?}");
+    };
+    assert!(
+        timeout > millis(4500),
+        "the graceful stop began in time: {timeout:?}"
+    );
+    assert!(
+        forced_after < timeout / 2,
+        "the forced stop began at the wake-up, not {timeout:?} into the graceful stop: {forced_after:?}"
+    );
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Stopped);
+    assert_eq!(stop_counts(&calls), (1, 1));
+    leases.abort();
+}
+
+/// ADR 0240, #453: a suspend shorter than what is left of a fence's graceful
+/// stop shortens it by its length. At the wake-up the fence's clock waits
+/// again for what is left, and the forced stop begins then.
+#[tokio::test]
+async fn a_short_suspend_during_a_fence_s_graceful_stop_shortens_it_by_its_length() {
+    let dir = TargetDir::new("expiring-fence-suspend-short");
+    let engine = Arc::new(FakeEngine::new());
+    let desired = bound(&["vm_hung"]);
+    let clock = clock();
+    // `D` = 60 000, `M` = 6 000, which holds 5 000 ms of graceful stop and
+    // 300 ms forced.
+    let config = config(&clock).with_expiring_timers(FenceTimers {
+        grace: millis(5000),
+        force: millis(300),
+    });
+    let (leases, _store) = start(&dir, &engine, &desired, config).await;
+    let vm = running_vm(&engine, "vm_hung", 2).await;
+    engine.set_ignore_power_button(&vm, true);
+    let mut attached = leases.link.attach();
+    let _before = grant_and_confirm(&leases, &mut attached, 60_000).await;
+
+    let revoke = leases.link.revoke(
+        MsgId("msg_revoke".to_owned()),
+        None,
+        LeaseRevoke {
+            lease_id: LeaseId(LEASE.to_owned()),
+            fencing_token: 1,
+            reason: RevokeReason::Moved,
+        },
+    );
+    let suspend = async {
+        wait_for("the graceful stop", || {
+            stop_counts(&engine.stop_calls()).0 == 1
+        })
+        .await;
+        let woke = Instant::now();
+        clock.suspend(millis(1000));
+        wait_for("the forced stop", || {
+            stop_counts(&engine.stop_calls()).1 == 1
+        })
+        .await;
+        woke.elapsed()
+    };
+    let (result, forced_after) = tokio::join!(revoke, suspend);
+    assert_eq!(
+        result.expect("the revoke is taken").status,
+        CommandStatus::Ok
+    );
+    let calls = engine.stop_calls();
+    let StopMode::Graceful { timeout, .. } = calls[0].1 else {
+        panic!("a graceful stop first: {calls:?}");
+    };
+    assert!(
+        timeout > millis(4500),
+        "the graceful stop began in time: {timeout:?}"
+    );
+    // The wake-up comes after the graceful stop began, so the forced stop
+    // begins at most `timeout - 1 000` after it, and the test sees it a few
+    // milliseconds later. Without the suspend counted, it would begin about
+    // `timeout` after the wake-up.
+    assert!(
+        forced_after > millis(2500),
+        "the fence waited again at the wake-up: {forced_after:?}"
+    );
+    assert!(
+        forced_after + millis(500) < timeout,
+        "the suspend shortened the graceful stop of {timeout:?}: {forced_after:?}"
+    );
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Stopped);
+    assert_eq!(stop_counts(&calls), (1, 1));
+    leases.abort();
+}
+
+/// Section 8.4, ADR 0240, #453: a fence of an `expiring` lease waits for a
+/// start that holds the lease's gate, and a host suspend while it waits comes
+/// out of its graceful stop like the wait itself. A suspend longer than the
+/// whole graceful stop leaves only the forced one.
+#[tokio::test]
+async fn a_suspend_while_a_fence_waits_for_a_start_uses_up_its_graceful_stop() {
+    let dir = TargetDir::new("expiring-fence-suspend-start");
+    let engine = Arc::new(FakeEngine::new());
+    let desired = bound(&["vm_warm"]);
+    let clock = clock();
+    let (leases, _store) = start(&dir, &engine, &desired, config(&clock)).await;
+    let vm = running_vm(&engine, "vm_warm", 2).await;
+    let mut attached = leases.link.attach();
+    let _before = grant_and_confirm(&leases, &mut attached, 60_000).await;
+    let permit = leases
+        .view
+        .start_permit(LEASE, 1)
+        .await
+        .expect("the lease starts its VMs");
+
+    let revoke = leases.link.revoke(
+        MsgId("msg_revoke".to_owned()),
+        None,
+        LeaseRevoke {
+            lease_id: LeaseId(LEASE.to_owned()),
+            fencing_token: 1,
+            reason: RevokeReason::Moved,
+        },
+    );
+    let suspend = async {
+        wait_for("the fence", || leases.view.fence_owns_stop(LEASE)).await;
+        clock.suspend(Duration::from_secs(60));
+        tokio::time::sleep(millis(50)).await;
+        assert!(
+            engine.stop_calls().is_empty(),
+            "the fence waits for the start"
+        );
+        drop(permit);
+    };
+    let (result, ()) = tokio::join!(revoke, suspend);
+    assert_eq!(
+        result.expect("the revoke is taken").status,
+        CommandStatus::Ok
+    );
+    assert_eq!(
+        stop_counts(&engine.stop_calls()),
+        (0, 1),
+        "the suspend used up the graceful stop"
+    );
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Stopped);
     leases.abort();
 }
 

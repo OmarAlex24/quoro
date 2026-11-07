@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use quoro_engine::{Engine, EngineError, StopMode, VmId, VmState};
 use quoro_proto::LeaseMode;
+use tokio::sync::watch;
 
+use crate::lease::clock::Sleep;
 use crate::lease::machine::{Lease, margin};
 
 /// The two stop timeouts used when fencing (section 8.4, section 8.5).
@@ -87,15 +89,45 @@ type StopFuture<'a> = Pin<Box<dyn Future<Output = (VmId, VmFenceOutcome)> + Send
 /// by hand still runs the whole group as one future and returns the results in
 /// the same order as `vms`.
 pub async fn stop_vms<E: Engine>(engine: &E, vms: &[VmId], timers: FenceTimers) -> FenceReport {
+    stop_vms_until(engine, vms, timers, Box::pin(std::future::pending())).await
+}
+
+/// [`stop_vms`], whose graceful stops also end as soon as `grace_over`
+/// resolves: for an `expiring` lease, once `T_grace` has passed on the lease
+/// clock, which counts a host suspend (section 8.4, ADR 0240). The tokio
+/// clock that bounds each stop does not, so after a wake-up the graceful
+/// stops would otherwise run on for what they had left. The forced stops then
+/// begin at once, each with its full `T_force`.
+pub async fn stop_vms_until<E: Engine>(
+    engine: &E,
+    vms: &[VmId],
+    timers: FenceTimers,
+    grace_over: Sleep,
+) -> FenceReport {
+    let (over, over_seen) = watch::channel(false);
+    let mut grace_over = Some(grace_over);
     let mut futures: Vec<StopFuture<'_>> = Vec::with_capacity(vms.len());
     for vm in vms {
-        futures.push(Box::pin(stop_one(engine, vm.clone(), timers)));
+        futures.push(Box::pin(stop_one(
+            engine,
+            vm.clone(),
+            timers,
+            over_seen.clone(),
+        )));
     }
 
     let mut results: Vec<Option<(VmId, VmFenceOutcome)>> =
         (0..futures.len()).map(|_| None).collect();
     let mut pending = futures.len();
     std::future::poll_fn(|cx| {
+        // Polled before the stops, so a stop polled in the same pass already
+        // sees the graceful time over.
+        if let Some(sleep) = grace_over.as_mut()
+            && sleep.as_mut().poll(cx).is_ready()
+        {
+            grace_over = None;
+            over.send_replace(true);
+        }
         for (slot, future) in results.iter_mut().zip(futures.iter_mut()) {
             if slot.is_some() {
                 continue;
@@ -118,9 +150,15 @@ pub async fn stop_vms<E: Engine>(engine: &E, vms: &[VmId], timers: FenceTimers) 
     }
 }
 
-async fn stop_one<E: Engine>(engine: &E, id: VmId, timers: FenceTimers) -> (VmId, VmFenceOutcome) {
-    // Section 8.5 step 1: graceful first, bounded by `T_grace`.
-    if !timers.grace.is_zero() {
+async fn stop_one<E: Engine>(
+    engine: &E,
+    id: VmId,
+    timers: FenceTimers,
+    mut grace_over: watch::Receiver<bool>,
+) -> (VmId, VmFenceOutcome) {
+    // Section 8.5 step 1: graceful first, bounded by `T_grace`, and over as
+    // soon as the lease clock says so.
+    if !timers.grace.is_zero() && !*grace_over.borrow_and_update() {
         let graceful = engine.stop(
             &id,
             StopMode::Graceful {
@@ -128,10 +166,17 @@ async fn stop_one<E: Engine>(engine: &E, id: VmId, timers: FenceTimers) -> (VmId
                 force_within: timers.force,
             },
         );
-        match tokio::time::timeout(timers.grace, graceful).await {
-            Ok(Ok(_)) => return (id, VmFenceOutcome::Stopped),
-            Ok(Err(EngineError::NotFound)) => return (id, VmFenceOutcome::Gone),
-            Ok(Err(_)) | Err(_) => {}
+        let stopped = tokio::select! {
+            biased;
+            stopped = tokio::time::timeout(timers.grace, graceful) => stopped.ok(),
+            // The sender lives until every stop is done, so this ends only
+            // when the graceful time is over.
+            _ = grace_over.wait_for(|over| *over) => None,
+        };
+        match stopped {
+            Some(Ok(_)) => return (id, VmFenceOutcome::Stopped),
+            Some(Err(EngineError::NotFound)) => return (id, VmFenceOutcome::Gone),
+            Some(Err(_)) | None => {}
         }
     }
 
