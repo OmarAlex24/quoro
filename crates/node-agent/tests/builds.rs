@@ -17,6 +17,7 @@ use quoro_engine::{
     ConsoleMode, Engine, FakeEngine, ImageDigest, ImageRef, InitConfig, MacAddr, NetAttach, VmId,
     VmSpec,
 };
+use quoro_node_agent::START_WITHIN;
 use quoro_node_agent::build::fake::{DEFAULT_DIGEST, FakeBuilder, FakeOutcome};
 use quoro_node_agent::build::log::BuildLogs;
 use quoro_node_agent::build::manager::{
@@ -547,7 +548,10 @@ async fn a_restart_fails_a_running_build_and_removes_its_builder_vm() {
         work_disks: Vec::new(),
     };
     engine.create(&spec).await.unwrap();
-    engine.start(&VmId(BUILD.to_owned())).await.unwrap();
+    engine
+        .start(&VmId(BUILD.to_owned()), START_WITHIN)
+        .await
+        .unwrap();
 
     let harness = Harness::with(dir, Arc::clone(&engine), store, FakeBuilder::new()).await;
     let row = harness.wait_row(BUILD, BuildState::Failed).await;

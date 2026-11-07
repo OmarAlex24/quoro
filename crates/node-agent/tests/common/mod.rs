@@ -13,6 +13,7 @@ use quoro_engine::{
     ConsoleMode, Engine, FakeEngine, ImageDigest, ImageRef, InitConfig, MacAddr, NetAttach,
     StopMode, VmId, VmSpec,
 };
+use quoro_node_agent::START_WITHIN;
 
 /// Shorthand for a duration in milliseconds.
 #[must_use]
@@ -68,7 +69,7 @@ pub async fn running_vm(engine: &FakeEngine, id: &str, index: u8) -> VmId {
         work_disks: Vec::new(),
     };
     engine.create(&spec).await.expect("create");
-    engine.start(&vm).await.expect("start");
+    engine.start(&vm, START_WITHIN).await.expect("start");
     vm
 }
 

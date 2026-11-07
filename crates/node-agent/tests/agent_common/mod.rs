@@ -21,6 +21,7 @@ use quoro_engine::{
 };
 use quoro_node_agent::LeaseTable;
 use quoro_node_agent::NodeFacts;
+use quoro_node_agent::START_WITHIN;
 use quoro_node_agent::identity::{self, Identity, IdentityHandle};
 use quoro_node_agent::reconcile::{ReconcileConfig, ReconcileOptions, Reconciler, Snapshot};
 use quoro_node_agent::store::NodeStore;
@@ -344,6 +345,7 @@ pub struct RecordingEngine {
     networks: Arc<Mutex<Vec<NodeNetwork>>>,
     created: Arc<Mutex<Vec<VmSpec>>>,
     stops: Arc<Mutex<Vec<(VmId, StopMode)>>>,
+    starts: Arc<Mutex<Vec<(VmId, Duration)>>>,
 }
 
 impl RecordingEngine {
@@ -354,6 +356,7 @@ impl RecordingEngine {
             networks: Arc::new(Mutex::new(Vec::new())),
             created: Arc::new(Mutex::new(Vec::new())),
             stops: Arc::new(Mutex::new(Vec::new())),
+            starts: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -386,6 +389,11 @@ impl RecordingEngine {
     /// Every stop call, in order.
     pub fn stops(&self) -> Vec<(VmId, StopMode)> {
         Self::lock(&self.stops).clone()
+    }
+
+    /// Every start call with its bound, in order.
+    pub fn starts(&self) -> Vec<(VmId, Duration)> {
+        Self::lock(&self.starts).clone()
     }
 
     /// Creates and starts a VM directly on the engine, as a leftover from an
@@ -426,7 +434,9 @@ impl RecordingEngine {
             work_disks: Vec::new(),
         };
         self.create(&spec).await.expect("create the raw VM");
-        self.start(&id).await.expect("start the raw VM");
+        self.start(&id, START_WITHIN)
+            .await
+            .expect("start the raw VM");
         id
     }
 }
@@ -464,8 +474,9 @@ impl Engine for RecordingEngine {
         self.inner.create(spec).await
     }
 
-    async fn start(&self, id: &VmId) -> Result<VmInfo, EngineError> {
-        self.inner.start(id).await
+    async fn start(&self, id: &VmId, within: Duration) -> Result<VmInfo, EngineError> {
+        Self::lock(&self.starts).push((id.clone(), within));
+        self.inner.start(id, within).await
     }
 
     async fn stop(&self, id: &VmId, mode: StopMode) -> Result<VmInfo, EngineError> {

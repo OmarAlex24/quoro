@@ -225,6 +225,20 @@ impl FenceGates {
 #[derive(Debug)]
 pub struct StartPermit {
     _shared: OwnedRwLockReadGuard<()>,
+    expiring: bool,
+}
+
+impl StartPermit {
+    /// The bound the engine gets for this start: 3 s under an `expiring` lease
+    /// (section 6.4, ADR 0242), [`crate::START_WITHIN`] under a `local` one.
+    #[must_use]
+    pub fn start_within(&self) -> Duration {
+        if self.expiring {
+            crate::EXPIRING_START_WITHIN
+        } else {
+            crate::START_WITHIN
+        }
+    }
 }
 
 impl Default for LeaseView {
@@ -323,8 +337,15 @@ impl LeaseView {
     pub async fn start_permit(&self, lease_id: &str, spec_token: u64) -> Option<StartPermit> {
         let gate = self.gates.gate(&LeaseId(lease_id.to_owned()));
         let shared = gate.read_owned().await;
+        let expiring = self
+            .lock()
+            .get(&LeaseId(lease_id.to_owned()))
+            .is_some_and(|lease| lease.mode == LeaseMode::Expiring);
         self.may_start_stateful(lease_id, spec_token)
-            .then_some(StartPermit { _shared: shared })
+            .then_some(StartPermit {
+                _shared: shared,
+                expiring,
+            })
     }
 
     /// Section 8.5 step 1: whether a fence of the lease is stopping its VMs,

@@ -25,6 +25,7 @@ use quoro_node_agent::interactive::Interactive;
 use quoro_node_agent::session::{Session, SessionEnd, SessionSetup};
 use quoro_node_agent::store::NodeStore;
 use quoro_node_agent::transcript::{TranscriptLimits, transcript_path};
+use quoro_node_agent::{FORCE_WITHIN, START_WITHIN};
 use quoro_proto::sign;
 use quoro_proto::wire::{
     ControlMessage, StreamAck, StreamClose, StreamInput, StreamOpen, WindowSize,
@@ -107,7 +108,7 @@ impl Node {
         let id = spec.id.clone();
         self.engine.create(&spec).await.unwrap();
         if start {
-            self.engine.start(&id).await.unwrap();
+            self.engine.start(&id, START_WITHIN).await.unwrap();
         }
         id
     }
@@ -651,11 +652,12 @@ async fn console_replays_fans_out_live_output_and_ends_when_the_vm_is_deleted() 
                     &vm_primary,
                     StopMode::Graceful {
                         timeout: Duration::from_millis(20),
+                        force_within: FORCE_WITHIN,
                     },
                 )
                 .await
                 .unwrap();
-            engine.start(&vm_primary).await.unwrap();
+            engine.start(&vm_primary, START_WITHIN).await.unwrap();
             engine.push_serial(&vm_primary, b"reboot\n");
             for _ in 0..2 {
                 let reboot = read_data_until(&mut ws, b"reboot\n").await;
@@ -668,6 +670,7 @@ async fn console_replays_fans_out_live_output_and_ends_when_the_vm_is_deleted() 
                     &vm_primary,
                     StopMode::Graceful {
                         timeout: Duration::from_millis(20),
+                        force_within: FORCE_WITHIN,
                     },
                 )
                 .await

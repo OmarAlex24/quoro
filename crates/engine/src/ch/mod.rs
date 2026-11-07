@@ -47,15 +47,16 @@ use crate::{ByteStream, ExecRequest, ExecSession};
 /// Latest time a forced stop sends `SIGKILL` to a VMM that is still running,
 /// counted from when it holds the VM's lock (contract §3.8, D-0074, #434).
 ///
-/// `Force` sends `vmm.shutdown` with a 100 ms timeout. A VMM that does not
-/// answer is killed at once; one that answers gets 150 ms to exit before it is
-/// killed.
+/// `Force { within }` sends `vmm.shutdown` with a 100 ms timeout. A VMM that
+/// does not answer is killed at once; one that answers gets 150 ms to exit
+/// before it is killed. A `within` shorter than 500 ms scales both down, so
+/// `SIGKILL` goes out by half of `within`, leaving the rest for the reap.
 pub const FORCE_KILL_BOUND: Duration = Duration::from_millis(250);
 
-/// Worst case a forced stop takes once it holds the VM's lock: the
-/// [`FORCE_KILL_BOUND`], then 5 s for the killed VMM to be reaped. By then
-/// the stop has returned, with the stopped VM or with an error. The stop runs
-/// on its own task, so it finishes even when the caller stops waiting; only a
+/// Worst case a forced stop's task takes once it holds the VM's lock: the
+/// [`FORCE_KILL_BOUND`], then 5 s for the killed VMM to be reaped. The caller
+/// waits only for its own `within` and gets `Timeout` after it. The task goes
+/// on to the reap even then, and when the caller stopped waiting; only a
 /// runtime that shuts down cancels it, and the restarted agent fences the VM
 /// again (node-agent-protocol §8.5).
 pub const FORCE_STOP_BOUND: Duration = Duration::from_millis(5250);
@@ -212,8 +213,8 @@ impl Engine for ChEngine {
         self.inner.create(spec).await
     }
 
-    async fn start(&self, id: &VmId) -> Result<VmInfo, EngineError> {
-        self.inner.start(id).await
+    async fn start(&self, id: &VmId, within: Duration) -> Result<VmInfo, EngineError> {
+        self.inner.start(id, within).await
     }
 
     async fn stop(&self, id: &VmId, mode: StopMode) -> Result<VmInfo, EngineError> {

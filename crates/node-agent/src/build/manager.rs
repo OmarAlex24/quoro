@@ -321,7 +321,15 @@ impl<E: Engine + 'static, B: Builder + 'static> BuildManager<E, B> {
                     if matches!(
                         info.state,
                         VmState::Running | VmState::Starting | VmState::Stopping
-                    ) && let Err(e) = self.engine.stop(&info.id, StopMode::Force).await
+                    ) && let Err(e) = self
+                        .engine
+                        .stop(
+                            &info.id,
+                            StopMode::Force {
+                                within: crate::FORCE_WITHIN,
+                            },
+                        )
+                        .await
                     {
                         warn!(build_id = %build_id, error = ?e, "could not force-stop a leftover builder VM");
                     }

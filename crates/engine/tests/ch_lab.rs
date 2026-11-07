@@ -41,6 +41,17 @@ use quoro_engine::{
 };
 use tokio::io::AsyncReadExt as _;
 
+/// The bound of every start here: long enough for a real boot (contract §3.7).
+const START: Duration = Duration::from_secs(60);
+
+/// The force bound of the graceful stops here (contract §3.8).
+const FORCE_WITHIN: Duration = Duration::from_secs(10);
+
+/// A forced stop that no working stop overruns (contract §3.8).
+const FORCE: StopMode = StopMode::Force {
+    within: FORCE_WITHIN,
+};
+
 /// The lab switch every test checks.
 const LAB_ENV: &str = "QUORO_ENGINE_LAB";
 /// The bridge every test uses.
@@ -470,7 +481,12 @@ fn assert_no_leftovers(id: &VmId) {
         "TAP {} still exists",
         tap_name(id)
     );
-    let needle = dir.to_string_lossy().into_owned();
+    assert_no_vmm(id);
+}
+
+/// No process runs for `id`: nothing names its runtime directory.
+fn assert_no_vmm(id: &VmId) {
+    let needle = vm_dir(id).to_string_lossy().into_owned();
     for entry in std::fs::read_dir("/proc").expect("read /proc") {
         let Ok(entry) = entry else { continue };
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -490,7 +506,7 @@ fn assert_no_leftovers(id: &VmId) {
 
 /// Starts a created VM and returns its info.
 async fn start_vm(engine: &ChEngine, id: &VmId) {
-    let started = engine.start(id).await.expect("start");
+    let started = engine.start(id, START).await.expect("start");
     assert_eq!(started.state, VmState::Running, "{id:?} did not start");
     assert!(started.pid.is_some(), "{id:?} started without a pid");
 }
@@ -551,6 +567,7 @@ async fn run_cycle(engine: &ChEngine, events: &SharedEvents, cycle: u8, rootfs: 
             &id,
             StopMode::Graceful {
                 timeout: Duration::from_secs(20),
+                force_within: FORCE_WITHIN,
             },
         )
         .await
@@ -573,7 +590,7 @@ async fn run_cycle(engine: &ChEngine, events: &SharedEvents, cycle: u8, rootfs: 
     drop(output);
 
     start_vm(engine, &id).await;
-    let forced = engine.stop(&id, StopMode::Force).await.expect("force stop");
+    let forced = engine.stop(&id, FORCE).await.expect("force stop");
     assert_eq!(forced.state, VmState::Stopped);
     assert_eq!(forced.exit_code, Some(137), "a forced stop reports 137");
 
@@ -630,7 +647,7 @@ async fn a_vm_restarts_on_its_recorded_bridge_after_a_host_reboot() {
     // The reboot: the VMM, its TAP, the bridge and its nftables table are gone,
     // and the next agent does not ensure this bridge again (a node whose subnet
     // changed ensures only its new one).
-    engine.stop(&id, StopMode::Force).await.expect("stop");
+    engine.stop(&id, FORCE).await.expect("stop");
     drop(engine);
     let tools = HostTools::discover().expect("host tools");
     net::delete_tap(&tools, &tap_name(&id))
@@ -655,7 +672,7 @@ async fn a_vm_restarts_on_its_recorded_bridge_after_a_host_reboot() {
     let up = read_output(&mut output, "up", Duration::from_secs(45)).await;
     assert_eq!(up.line, "up", "the VM did not boot on the restored bridge");
 
-    engine.stop(&id, StopMode::Force).await.expect("stop again");
+    engine.stop(&id, FORCE).await.expect("stop again");
     engine.delete(&id).await.expect("delete");
     assert_no_leftovers(&id);
     net::remove_network(&tools, BRIDGE)
@@ -739,8 +756,8 @@ async fn isolation_between_vms() {
         "A reached B through the bridge; port isolation is broken"
     );
 
-    engine.stop(&a, StopMode::Force).await.expect("stop A");
-    engine.stop(&b, StopMode::Force).await.expect("stop B");
+    engine.stop(&a, FORCE).await.expect("stop A");
+    engine.stop(&b, FORCE).await.expect("stop B");
     engine.delete(&a).await.expect("delete A");
     engine.delete(&b).await.expect("delete B");
     assert_no_leftovers(&a);
@@ -778,7 +795,7 @@ async fn rediscovery_after_engine_restart() {
     assert_eq!(adopted.state, VmState::Running, "the VM was not adopted");
     assert_eq!(adopted.pid, pid, "the adopted VM is the same process");
 
-    let stopped = engine.stop(&id, StopMode::Force).await.expect("stop");
+    let stopped = engine.stop(&id, FORCE).await.expect("stop");
     assert_eq!(stopped.state, VmState::Stopped);
     engine.delete(&id).await.expect("delete");
     assert_no_leftovers(&id);
@@ -899,13 +916,10 @@ async fn egress_only_vm_reaches_only_the_outside() {
     drop(listener);
 
     engine
-        .stop(&builder, StopMode::Force)
+        .stop(&builder, FORCE)
         .await
         .expect("stop the builder");
-    engine
-        .stop(&peer, StopMode::Force)
-        .await
-        .expect("stop the peer");
+    engine.stop(&peer, FORCE).await.expect("stop the peer");
     engine.delete(&builder).await.expect("delete the builder");
     engine.delete(&peer).await.expect("delete the peer");
     assert_no_leftovers(&builder);
@@ -1090,7 +1104,7 @@ async fn local_volume_snapshot_cycle() {
         "the snapshot is sparse: {allocated} bytes"
     );
 
-    engine.stop(&id, StopMode::Force).await.expect("stop");
+    engine.stop(&id, FORCE).await.expect("stop");
     engine.delete(&id).await.expect("delete");
     assert_no_leftovers(&id);
     assert!(
@@ -1247,7 +1261,7 @@ async fn volume_pool_on_ext4_snapshots_with_reflink() {
         "the engine reports the snapshots its sweep left"
     );
 
-    engine.stop(&id, StopMode::Force).await.expect("stop");
+    engine.stop(&id, FORCE).await.expect("stop");
     engine.delete(&id).await.expect("delete");
     engine
         .delete_volume_snapshot(&snapshot)
@@ -1519,6 +1533,7 @@ async fn warm_volume_calls() {
             &id,
             StopMode::Graceful {
                 timeout: Duration::from_secs(10),
+                force_within: FORCE_WITHIN,
             },
         )
         .await
@@ -1790,7 +1805,7 @@ async fn exec_and_serial_console() {
     assert_eq!(code, 0);
 
     // Read-only: the console accepts no input, and the stream ends on delete.
-    engine.stop(&id, StopMode::Force).await.expect("stop");
+    engine.stop(&id, FORCE).await.expect("stop");
     engine.delete(&id).await.expect("delete");
     assert_no_leftovers(&id);
     assert!(!serial.exists(), "the serial socket survived the delete");
@@ -1834,9 +1849,10 @@ async fn freeze(engine: &ChEngine, id: &VmId) -> u32 {
     pid
 }
 
-/// #434 (contract §3.8): a forced stop kills a hung VMM within a few hundred
-/// milliseconds, finishes the kill even when its caller stops waiting, and
-/// does not wait out a graceful stop that holds the VM.
+/// #434 (contract §3.7 and §3.8): a forced stop kills a hung VMM within its
+/// bound, finishes the kill even when its caller stops waiting, and does not
+/// wait out a graceful stop that holds the VM; a bounded graceful stop and a
+/// bounded start keep to their bounds.
 #[tokio::test]
 #[ignore = "needs /dev/kvm, root and the pinned artifacts on the lab host"]
 async fn a_forced_stop_kills_a_hung_vmm_quickly_even_when_abandoned() {
@@ -1850,18 +1866,19 @@ async fn a_forced_stop_kills_a_hung_vmm_quickly_even_when_abandoned() {
     let spec = console_spec(&id, &rootfs, "10.77.0.19", "sleep 120", 19);
     engine.create(&spec).await.expect("create");
 
-    // A frozen VMM is killed well inside a fence's `T_force`.
+    // A frozen VMM is killed inside a fence's `T_force` of 300 ms.
     start_vm(&engine, &id).await;
     let pid = freeze(&engine, &id).await;
     let began = std::time::Instant::now();
-    let stopped = engine.stop(&id, StopMode::Force).await.expect("force stop");
+    let within = Duration::from_millis(300);
+    let stopped = engine
+        .stop(&id, StopMode::Force { within })
+        .await
+        .expect("force stop");
     let took = began.elapsed();
     assert_eq!(stopped.state, VmState::Stopped);
     assert_eq!(stopped.pid, None);
-    assert!(
-        took < Duration::from_secs(1),
-        "the forced stop took {took:?}"
-    );
+    assert!(took < within, "the forced stop took {took:?}");
     assert!(
         !Path::new(&format!("/proc/{pid}")).exists(),
         "the VMM {pid} survived"
@@ -1870,8 +1887,7 @@ async fn a_forced_stop_kills_a_hung_vmm_quickly_even_when_abandoned() {
     // The caller stops waiting after 50 ms; the kill still happens.
     start_vm(&engine, &id).await;
     let pid = freeze(&engine, &id).await;
-    let abandoned =
-        tokio::time::timeout(Duration::from_millis(50), engine.stop(&id, StopMode::Force)).await;
+    let abandoned = tokio::time::timeout(Duration::from_millis(50), engine.stop(&id, FORCE)).await;
     assert!(abandoned.is_err(), "the caller stopped waiting");
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     loop {
@@ -1899,12 +1915,13 @@ async fn a_forced_stop_kills_a_hung_vmm_quickly_even_when_abandoned() {
         &id,
         StopMode::Graceful {
             timeout: Duration::from_secs(30),
+            force_within: FORCE_WITHIN,
         },
     );
     let forced = async {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let began = std::time::Instant::now();
-        let stopped = engine.stop(&id, StopMode::Force).await;
+        let stopped = engine.stop(&id, FORCE).await;
         (stopped, began.elapsed())
     };
     let (graceful, (forced, took)) = tokio::join!(graceful, forced);
@@ -1918,6 +1935,55 @@ async fn a_forced_stop_kills_a_hung_vmm_quickly_even_when_abandoned() {
         !Path::new(&format!("/proc/{pid}")).exists(),
         "the VMM {pid} survived"
     );
+
+    // A graceful stop of a frozen VMM returns within its two bounds
+    // (ADR 0243): the power button gets no answer, and the forced part kills.
+    start_vm(&engine, &id).await;
+    let pid = freeze(&engine, &id).await;
+    let (timeout, force_within) = (Duration::from_millis(200), Duration::from_millis(300));
+    let began = std::time::Instant::now();
+    let stopped = engine
+        .stop(
+            &id,
+            StopMode::Graceful {
+                timeout,
+                force_within,
+            },
+        )
+        .await
+        .expect("graceful stop");
+    let took = began.elapsed();
+    assert_eq!(stopped.state, VmState::Stopped);
+    assert!(
+        took < timeout + force_within,
+        "the bounded graceful stop took {took:?}"
+    );
+    assert!(
+        !Path::new(&format!("/proc/{pid}")).exists(),
+        "the VMM {pid} survived"
+    );
+
+    // A start that overruns its bound returns `Timeout`, and what it started
+    // is stopped (ADR 0242). The VM boots again afterwards.
+    let began = std::time::Instant::now();
+    let bound = Duration::from_millis(30);
+    assert_eq!(engine.start(&id, bound).await, Err(EngineError::Timeout));
+    assert!(began.elapsed() < bound + Duration::from_millis(50));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let info = engine.inspect(&id).await.expect("inspect");
+        if info.state == VmState::Stopped && info.pid.is_none() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "still {info:?} 10 s after the start gave up"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_no_vmm(&id);
+    start_vm(&engine, &id).await;
+    engine.stop(&id, FORCE).await.expect("force stop");
 
     engine.delete(&id).await.expect("delete");
     assert_no_leftovers(&id);

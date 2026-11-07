@@ -39,14 +39,20 @@ fn calls_are_send<E: Engine>(engine: &E, sample: &Sample<'_>) {
     assert_send(&engine.prepare_image(sample.image));
     assert_send(&engine.remove_image(sample.digest));
     assert_send(&engine.create(sample.spec));
-    assert_send(&engine.start(sample.id));
+    assert_send(&engine.start(sample.id, Duration::from_secs(1)));
     assert_send(&engine.stop(
         sample.id,
         StopMode::Graceful {
             timeout: Duration::from_secs(1),
+            force_within: Duration::from_secs(1),
         },
     ));
-    assert_send(&engine.stop(sample.id, StopMode::Force));
+    assert_send(&engine.stop(
+        sample.id,
+        StopMode::Force {
+            within: Duration::from_secs(1),
+        },
+    ));
     assert_send(&engine.delete(sample.id));
     assert_send(&engine.inspect(sample.id));
     assert_send(&engine.list());

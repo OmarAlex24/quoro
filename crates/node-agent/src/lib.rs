@@ -37,6 +37,7 @@ pub mod warm;
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::time::Duration;
 
 pub use agent::run;
 pub use backup::S3Repository;
@@ -55,6 +56,24 @@ pub use set_primary::{SetPrimary, set_primary, verify_primary, write_primary};
 /// The ACME directory `acme` routes use unless the configuration names another
 /// one (a staging directory for tests and labs).
 pub use quoro_ingress::acme::LETS_ENCRYPT_PRODUCTION as DEFAULT_ACME_DIRECTORY;
+
+/// The bound of a stateful start under an `expiring` lease, 3 000 ms
+/// (node-agent-protocol.md section 6.4, ADR 0242).
+pub const EXPIRING_START_WITHIN: Duration = Duration::from_millis(3000);
+
+/// The bound of every other start the node agent asks the engine for
+/// (engine-trait.md section 3.7). The contract leaves it to the node agent.
+/// It is longer than any start that works today, a wait for the VM's lock
+/// behind another call included, so it changes none of them; it only ends a
+/// start that would otherwise hang.
+pub const START_WITHIN: Duration = Duration::from_secs(60);
+
+/// The bound of a forced stop outside a fence, and of the forced part of the
+/// reconciler's graceful stop (engine-trait.md section 3.8, ADR 0243). A
+/// fence uses its own `T_force`. Like [`START_WITHIN`] it is longer than any
+/// forced stop that works today: a forced stop queued behind the longest
+/// start, which ends by [`START_WITHIN`], still finishes within it.
+pub const FORCE_WITHIN: Duration = Duration::from_secs(90);
 
 /// Loopback metrics address of the `cloudflared` connector unless configured
 /// otherwise.

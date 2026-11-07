@@ -3,18 +3,20 @@
 //!
 //! It implements the same trait with no hypervisor: VMs are records, lifecycle
 //! calls change their state, and `list` returns exactly what was created since
-//! the instance started. Booting completes when `start` returns, so no test has
-//! to wait for a machine that does not exist.
+//! the instance started. Booting completes when `start` returns, unless a test
+//! makes it slow, so no test has to wait for a machine that does not exist.
 //!
-//! Determinism: there are no threads. The only awaits are the two explicit
+//! Determinism: there are no threads. The only awaits are the explicit
 //! injections — a guest that ignores the power button
-//! (`set_ignore_power_button`) and a slow VMM (`set_stop_delay`) — and they are
-//! plain `tokio::time::sleep` calls, so they are deterministic under
-//! `tokio::time::pause` / `#[tokio::test(start_paused = true)]`. The one
-//! background task is a slow forced stop's: it runs on its own task, as the
-//! Cloud Hypervisor backend's does, so it finishes even when the caller stops
-//! waiting (contract §3.8). Everything else, including scheduled crashes, runs
-//! on the fake's own manual clock (`advance`), not on wall-clock time.
+//! (`set_ignore_power_button`), a slow VMM (`set_stop_delay`) and a slow boot
+//! (`set_start_delay`) — and the bounds `start` and `stop` carry. They are
+//! plain `tokio::time` sleeps and timeouts, so they are deterministic under
+//! `tokio::time::pause` / `#[tokio::test(start_paused = true)]`. A slow boot
+//! and a slow forced stop run on tasks of their own, as the Cloud Hypervisor
+//! backend's do, so a forced stop the fake began finishes even when the call
+//! returned `Timeout` or its caller stopped waiting (contract §3.7, §3.8 and
+//! §7). Everything else, including scheduled crashes, runs on the fake's own
+//! manual clock (`advance`), not on wall-clock time.
 //!
 //! Injection hooks are documented on the methods that provide them. They exist
 //! so every error path and every event the node agent must map is reachable:
@@ -144,6 +146,9 @@ struct VmRecord {
     /// keeps the VM `Stopping` meanwhile and finishes even when its caller
     /// stops waiting.
     stop_delay: Duration,
+    /// Injection: a start takes this long before the VM runs, and keeps it
+    /// `Starting` meanwhile.
+    start_delay: Duration,
     /// Set while a slow forced stop runs on its own task; it turns `true` once
     /// that stop has finished, so a later stop can join it.
     forced_stop: Option<watch::Receiver<bool>>,
@@ -613,47 +618,6 @@ impl FakeEngine {
             .is_some_and(|record| record.paused && record.info.state == VmState::Running)
     }
 
-    /// A forced stop of a slow VMM (contract §3.8): a running VM reads
-    /// `Stopping` until `delay` has passed, then `Stopped` with code 137. The
-    /// stop runs on its own task, so it finishes even when the caller stops
-    /// waiting. It acts only on the VMM it began with, `pid`: a VM that a
-    /// later `start` booted again keeps running. [`FakeEngine::stop`] has
-    /// already registered it on the VM, in the same critical section that
-    /// found no stop to join, and `done` tells the stops that join it.
-    async fn slow_forced_stop(
-        &self,
-        id: &VmId,
-        pid: Option<u32>,
-        delay: Duration,
-        done: watch::Sender<bool>,
-    ) -> Result<VmInfo, EngineError> {
-        let shared = Arc::clone(&self.state);
-        let id = id.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
-            let mut state = shared
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let result = match state.vms.get_mut(&id) {
-                None => Err(EngineError::NotFound),
-                Some(record) => {
-                    record.forced_stop = None;
-                    let same_vmm = record.info.pid == pid;
-                    let info = record.info.clone();
-                    if same_vmm {
-                        stop_now(&mut state, &id, 137)
-                    } else {
-                        Ok(info)
-                    }
-                }
-            };
-            let _ = done.send(true);
-            result
-        })
-        .await
-        .map_err(|err| EngineError::Hypervisor(format!("the forced stop did not finish: {err}")))?
-    }
-
     fn take_failure(&self, op: FakeOp) -> Option<EngineError> {
         self.lock().failures.get_mut(&op)?.pop_front()
     }
@@ -679,16 +643,36 @@ impl FakeEngine {
         }
     }
 
-    /// Injection: models a slow VMM. Every stop call on this VM awaits `delay`
-    /// before acting; the default is zero. The sleep is deterministic under a
-    /// paused tokio clock. A forced stop marks a running VM `Stopping` and runs
-    /// on its own task, as the Cloud Hypervisor backend's does: a caller that
-    /// stops waiting does not cancel it, and the VM is `Stopped` once `delay`
-    /// has passed (contract §3.8). Meanwhile a later stop of the VM joins it,
-    /// and `start` and `delete` are `Conflict`.
+    /// Injection: models a slow VMM; the default is zero. A forced stop marks
+    /// a running VM `Stopping` and runs on its own task, as the Cloud
+    /// Hypervisor backend's does, and the VM is `Stopped` once `delay` has
+    /// passed. A `delay` longer than the stop's `within` makes the call return
+    /// `Timeout` at `within`, and the stop still finishes: a caller that got
+    /// `Timeout` or stopped waiting does not cancel it (contract §3.8, §7).
+    /// Meanwhile a later stop of the VM joins it within its own bound, and
+    /// `start` and `delete` are `Conflict`. A graceful stop of a guest that
+    /// reacts to the power button takes `delay` too, when that fits in its
+    /// `timeout`; otherwise it goes on as a slow forced stop once `timeout`
+    /// has passed. The sleeps are deterministic under a paused tokio clock.
     pub fn set_stop_delay(&self, id: &VmId, delay: Duration) {
         if let Some(record) = self.lock().vms.get_mut(id) {
             record.stop_delay = delay;
+        }
+    }
+
+    /// Injection: models a slow boot; the default is zero. A start of this VM
+    /// keeps it `Starting`, with its pid, until `delay` has passed, then
+    /// `Running`. A start whose `within` passes first returns `Timeout` at
+    /// `within`, as does a start whose caller stops waiting: the fake gives
+    /// the boot up and begins a forced stop of what it started, which takes
+    /// the VM's stop delay ([`Self::set_stop_delay`]). Until the test lets that
+    /// stop finish, the VM reads `Stopping` with its pid, a later stop joins
+    /// it, and `start` and `delete` are `Conflict`; then it is `Stopped` with
+    /// no pid and no event, as it never booted (contract §3.7, §7). While a
+    /// slow boot runs, `stop` and `delete` are `Conflict`.
+    pub fn set_start_delay(&self, id: &VmId, delay: Duration) {
+        if let Some(record) = self.lock().vms.get_mut(id) {
+            record.start_delay = delay;
         }
     }
 
@@ -942,18 +926,177 @@ fn fake_image(digest: &ImageDigest) -> PreparedImage {
 
 /// What a [`FakeEngine::stop`] call does, decided under the state lock.
 enum StopPlan {
-    Unkillable,
+    /// The VM is already stopped.
     Stopped,
+    /// A forced stop of the VM runs; the call joins it.
     Join(watch::Receiver<bool>),
+    /// A slow forced stop, already registered on the VM.
     SlowForce {
         pid: Option<u32>,
         delay: Duration,
         done: watch::Sender<bool>,
     },
-    Inline {
-        delay: Duration,
-        ignores: bool,
-    },
+    /// A graceful stop asks the guest first.
+    Guest { delay: Duration, ignores: bool },
+}
+
+/// Decides what a stop of `id` does, in one critical section with the
+/// registration of a slow forced stop, so two stops never both find nothing
+/// to join. A forced stop of a fast VMM happens here at once.
+fn plan_stop(state: &mut State, id: &VmId, forced: bool) -> Result<StopPlan, EngineError> {
+    let Some(record) = state.vms.get_mut(id) else {
+        return Err(EngineError::NotFound);
+    };
+    if record.unkillable {
+        return Err(EngineError::Hypervisor(
+            "VMM process did not exit after SIGKILL".into(),
+        ));
+    }
+    if record.info.state == VmState::Stopped {
+        return Ok(StopPlan::Stopped);
+    }
+    if let Some(pending) = record.forced_stop.clone() {
+        return Ok(StopPlan::Join(pending));
+    }
+    if record.info.state == VmState::Starting {
+        return Err(EngineError::Conflict(format!("VM {} is starting", id.0)));
+    }
+    if !forced {
+        return Ok(StopPlan::Guest {
+            delay: record.stop_delay,
+            ignores: record.ignores_power_button,
+        });
+    }
+    if record.stop_delay.is_zero() {
+        stop_now(state, id, 137)?;
+        return Ok(StopPlan::Stopped);
+    }
+    let (done, joined) = watch::channel(false);
+    record.info.state = VmState::Stopping;
+    record.forced_stop = Some(joined);
+    Ok(StopPlan::SlowForce {
+        pid: record.info.pid,
+        delay: record.stop_delay,
+        done,
+    })
+}
+
+/// A slow forced stop on its own task (contract §3.8): the VM is stopped once
+/// `delay` has passed, with `code`, or with no code and no event when it never
+/// booted. It acts only on the VMM it began with, `pid`: a VM that a later
+/// `start` booted again keeps running. `done` tells the stops that join it.
+fn spawn_slow_stop(
+    shared: &Arc<Mutex<State>>,
+    id: &VmId,
+    pid: Option<u32>,
+    delay: Duration,
+    done: watch::Sender<bool>,
+    code: Option<i32>,
+) -> tokio::task::JoinHandle<Result<VmInfo, EngineError>> {
+    let shared = Arc::clone(shared);
+    let id = id.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        let mut state = lock_state(&shared);
+        let result = finish_slow_stop(&mut state, &id, pid, code);
+        let _ = done.send(true);
+        result
+    })
+}
+
+/// The end of a slow forced stop, under the state lock.
+fn finish_slow_stop(
+    state: &mut State,
+    id: &VmId,
+    pid: Option<u32>,
+    code: Option<i32>,
+) -> Result<VmInfo, EngineError> {
+    let Some(record) = state.vms.get_mut(id) else {
+        return Err(EngineError::NotFound);
+    };
+    record.forced_stop = None;
+    if record.info.pid != pid {
+        return Ok(record.info.clone());
+    }
+    match code {
+        Some(code) => stop_now(state, id, code),
+        None => {
+            record.info.state = VmState::Stopped;
+            record.info.pid = None;
+            record.info.exit_code = None;
+            record.paused = false;
+            Ok(record.info.clone())
+        }
+    }
+}
+
+/// Boots `id` now, if it is still `Starting` with `pid`: it reads `Running`
+/// and `Started` is emitted. `None` when the boot was given up or the VM is
+/// gone.
+fn boot_now(state: &mut State, id: &VmId, pid: u32) -> Option<VmInfo> {
+    let record = state.vms.get_mut(id)?;
+    if record.info.state != VmState::Starting || record.info.pid != Some(pid) {
+        return None;
+    }
+    record.info.state = VmState::Running;
+    record.info.started_at = Some(SystemTime::now());
+    record.scheduled_crash = None;
+    record.paused = false;
+    let info = record.info.clone();
+    emit(state, EngineEvent::Started { id: id.clone() });
+    Some(info)
+}
+
+/// Gives up the slow boot of `id` with `pid` (contract §3.7): a VM still
+/// `Starting` gets a forced stop of what the start began, with the VM's stop
+/// delay. `Some` when the boot landed first and the VM runs.
+fn give_up_start(shared: &Arc<Mutex<State>>, id: &VmId, pid: u32) -> Option<VmInfo> {
+    let mut state = lock_state(shared);
+    let record = state.vms.get_mut(id)?;
+    if record.info.pid != Some(pid) {
+        return None;
+    }
+    match record.info.state {
+        VmState::Running => return Some(record.info.clone()),
+        VmState::Starting => {}
+        _ => return None,
+    }
+    let delay = record.stop_delay;
+    let (done, joined) = watch::channel(false);
+    let runtime = tokio::runtime::Handle::try_current();
+    if delay.is_zero() || runtime.is_err() {
+        let _ = finish_slow_stop(&mut state, id, Some(pid), None);
+        return None;
+    }
+    record.info.state = VmState::Stopping;
+    record.forced_stop = Some(joined);
+    drop(state);
+    // Detached: the stop goes on after the caller gave the start up.
+    drop(spawn_slow_stop(shared, id, Some(pid), delay, done, None));
+    None
+}
+
+/// Gives a slow boot up when its caller's future is dropped (contract §4).
+struct GiveUpStart {
+    state: Arc<Mutex<State>>,
+    id: VmId,
+    pid: u32,
+    armed: bool,
+}
+
+impl Drop for GiveUpStart {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = give_up_start(&self.state, &self.id, self.pid);
+        }
+    }
+}
+
+/// Locks the fake's state, ignoring poisoning as [`FakeEngine::lock`] does.
+fn lock_state(shared: &Mutex<State>) -> MutexGuard<'_, State> {
+    shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Stops `id` now with `code`, unless it already stopped: its execs end, it
@@ -1247,6 +1390,7 @@ impl Engine for FakeEngine {
                 info: info.clone(),
                 ignores_power_button: false,
                 stop_delay: Duration::ZERO,
+                start_delay: Duration::ZERO,
                 forced_stop: None,
                 unkillable: false,
                 scheduled_crash: None,
@@ -1263,106 +1407,132 @@ impl Engine for FakeEngine {
         Ok(info)
     }
 
-    async fn start(&self, id: &VmId) -> Result<VmInfo, EngineError> {
+    async fn start(&self, id: &VmId, within: Duration) -> Result<VmInfo, EngineError> {
         if let Some(err) = self.take_failure(FakeOp::Start) {
             return Err(err);
         }
-        let mut state = self.lock();
-        let Some(record) = state.vms.get(id) else {
-            return Err(EngineError::NotFound);
+        let deadline = tokio::time::Instant::now() + within;
+        let (pid, delay) = {
+            let mut state = self.lock();
+            let Some(record) = state.vms.get(id) else {
+                return Err(EngineError::NotFound);
+            };
+            if record.info.state == VmState::Running {
+                return Ok(record.info.clone());
+            }
+            if record.info.state == VmState::Stopping || record.forced_stop.is_some() {
+                return Err(EngineError::Conflict(format!("VM {} is stopping", id.0)));
+            }
+            if record.info.state == VmState::Starting {
+                return Err(EngineError::Conflict(format!("VM {} is starting", id.0)));
+            }
+            state.next_pid += 1;
+            let pid = state.next_pid;
+            let Some(record) = state.vms.get_mut(id) else {
+                return Err(EngineError::NotFound);
+            };
+            record.info.pid = Some(pid);
+            record.info.exit_code = None;
+            if record.start_delay.is_zero() {
+                record.info.state = VmState::Starting;
+                return boot_now(&mut state, id, pid).ok_or(EngineError::NotFound);
+            }
+            record.info.state = VmState::Starting;
+            (pid, record.start_delay)
         };
-        if record.info.state == VmState::Running {
-            return Ok(record.info.clone());
-        }
-        if record.info.state == VmState::Stopping || record.forced_stop.is_some() {
-            return Err(EngineError::Conflict(format!("VM {} is stopping", id.0)));
-        }
-        state.next_pid += 1;
-        let pid = state.next_pid;
-        let Some(record) = state.vms.get_mut(id) else {
-            return Err(EngineError::NotFound);
+
+        // A slow boot (contract §3.7): it runs on its own task, and the call
+        // waits for it until `within` has passed.
+        let shared = Arc::clone(&self.state);
+        let booting = id.clone();
+        let mut boot = tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            boot_now(&mut lock_state(&shared), &booting, pid)
+        });
+        // A caller that stops waiting gives the boot up, as `within` does.
+        let mut give_up = GiveUpStart {
+            state: Arc::clone(&self.state),
+            id: id.clone(),
+            pid,
+            armed: true,
         };
-        record.info.state = VmState::Running;
-        record.info.pid = Some(pid);
-        record.info.started_at = Some(SystemTime::now());
-        record.info.exit_code = None;
-        record.scheduled_crash = None;
-        record.paused = false;
-        let info = record.info.clone();
-        emit(&mut state, EngineEvent::Started { id: id.clone() });
-        Ok(info)
+        let booted = tokio::time::timeout_at(deadline, &mut boot).await;
+        give_up.armed = false;
+        match booted {
+            Ok(Ok(Some(info))) => Ok(info),
+            Ok(Ok(None)) => self.inspect(id).await,
+            Ok(Err(err)) => Err(EngineError::Hypervisor(format!(
+                "the start did not finish: {err}"
+            ))),
+            // A boot that lands at the deadline still counts.
+            Err(_) => give_up_start(&self.state, id, pid).ok_or(EngineError::Timeout),
+        }
     }
 
     async fn stop(&self, id: &VmId, mode: StopMode) -> Result<VmInfo, EngineError> {
         if let Some(err) = self.take_failure(FakeOp::Stop) {
             return Err(err);
         }
+        let began = tokio::time::Instant::now();
+        let (graceful, force_within) = match mode {
+            StopMode::Graceful {
+                timeout,
+                force_within,
+            } => (Some(timeout), force_within),
+            StopMode::Force { within } => (None, within),
+        };
+        let deadline = began + graceful.unwrap_or_default() + force_within;
 
-        // One critical section decides and, for a slow forced stop, registers
-        // it, so two stops never both find nothing to join.
         let plan = {
             let mut state = self.lock();
-            let Some(record) = state.vms.get_mut(id) else {
+            if !state.vms.contains_key(id) {
                 return Err(EngineError::NotFound);
-            };
-            let plan = if record.unkillable {
-                StopPlan::Unkillable
-            } else if record.info.state == VmState::Stopped {
-                StopPlan::Stopped
-            } else if let Some(pending) = record.forced_stop.clone() {
-                StopPlan::Join(pending)
-            } else if matches!(mode, StopMode::Force) && !record.stop_delay.is_zero() {
-                let (done, joined) = watch::channel(false);
-                if record.info.state == VmState::Running {
-                    record.info.state = VmState::Stopping;
-                }
-                record.forced_stop = Some(joined);
-                StopPlan::SlowForce {
-                    pid: record.info.pid,
-                    delay: record.stop_delay,
-                    done,
-                }
-            } else {
-                StopPlan::Inline {
-                    delay: record.stop_delay,
-                    ignores: record.ignores_power_button,
-                }
-            };
-            state.stop_log.push((id.clone(), mode.clone()));
-            plan
-        };
-        let (delay, ignores) = match plan {
-            StopPlan::Unkillable => {
-                return Err(EngineError::Hypervisor(
-                    "VMM process did not exit after SIGKILL".into(),
-                ));
             }
-            StopPlan::Stopped => return self.inspect(id).await,
-            // A stop while a forced stop of the same VM runs joins it
-            // (contract §4, D-0243).
+            state.stop_log.push((id.clone(), mode.clone()));
+            plan_stop(&mut state, id, graceful.is_none())?
+        };
+        let plan = match plan {
+            StopPlan::Guest { delay, ignores } => {
+                let timeout = graceful.unwrap_or_default();
+                // A guest that reacts to the power button exits once the slow
+                // VMM let it, if that fits in the graceful timeout.
+                if !ignores && delay <= timeout {
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    return stop_now(&mut self.lock(), id, 0);
+                }
+                tokio::time::sleep(timeout).await;
+                // Then the VM is stopped as `Force { within: force_within }`.
+                plan_stop(&mut self.lock(), id, true)?
+            }
+            plan => plan,
+        };
+        match plan {
+            StopPlan::Stopped | StopPlan::Guest { .. } => self.inspect(id).await,
+            // A stop while a forced stop of the same VM runs joins it, within
+            // its own bound (contract §4, ADR 0243).
             StopPlan::Join(mut done) => {
-                let _ = done.wait_for(|done| *done).await;
-                return self.inspect(id).await;
+                let joined = tokio::time::timeout_at(deadline, done.wait_for(|done| *done))
+                    .await
+                    .is_ok();
+                if joined {
+                    self.inspect(id).await
+                } else {
+                    Err(EngineError::Timeout)
+                }
             }
             StopPlan::SlowForce { pid, delay, done } => {
-                return self.slow_forced_stop(id, pid, delay, done).await;
+                let task = spawn_slow_stop(&self.state, id, pid, delay, done, Some(137));
+                match tokio::time::timeout_at(deadline, task).await {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(err)) => Err(EngineError::Hypervisor(format!(
+                        "the forced stop did not finish: {err}"
+                    ))),
+                    Err(_) => Err(EngineError::Timeout),
+                }
             }
-            StopPlan::Inline { delay, ignores } => (delay, ignores),
-        };
-
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
         }
-        let graceful = matches!(mode, StopMode::Graceful { .. });
-        if let StopMode::Graceful { timeout } = mode
-            && ignores
-        {
-            tokio::time::sleep(timeout).await;
-        }
-
-        // A guest that did not react to the power button is stopped by force.
-        let code = if graceful && !ignores { 0 } else { 137 };
-        stop_now(&mut self.lock(), id, code)
     }
 
     async fn delete(&self, id: &VmId) -> Result<(), EngineError> {
@@ -1373,8 +1543,10 @@ impl Engine for FakeEngine {
         let Some(record) = state.vms.get(id) else {
             return Ok(());
         };
-        if matches!(record.info.state, VmState::Running | VmState::Stopping)
-            || record.forced_stop.is_some()
+        if matches!(
+            record.info.state,
+            VmState::Running | VmState::Starting | VmState::Stopping
+        ) || record.forced_stop.is_some()
         {
             return Err(EngineError::Conflict(format!("VM {} is running", id.0)));
         }

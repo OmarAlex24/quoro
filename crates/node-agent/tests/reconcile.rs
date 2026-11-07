@@ -19,12 +19,12 @@ use agent_common::{
 };
 use quoro_engine::{Engine, EngineError, FakeOp, StopMode, VmId, VmState, VolumeId};
 use quoro_ingress::cloudflared::CloudflaredConfig;
-use quoro_node_agent::LeaseView;
 use quoro_node_agent::edge::EdgeManager;
 use quoro_node_agent::ingress::{CertificateEvents, DnsBridge, IngressConfig, IngressSupervisor};
 use quoro_node_agent::reconcile::Snapshot;
 use quoro_node_agent::store::{NodeStore, VolumeRecord};
 use quoro_node_agent::warm::VolumeLocks;
+use quoro_node_agent::{EXPIRING_START_WITHIN, LeaseTable, LeaseView, START_WITHIN};
 use quoro_proto::wire::VolumeStatus;
 use quoro_proto::wire::{
     DesiredStatus, Health, ObservedStatus, SpecEdge, SpecNetwork, SpecVm, SpecVolumeState,
@@ -209,7 +209,7 @@ async fn a_stop_and_a_removal_reach_the_engine_and_the_removal_is_reported_once(
         engine
             .stops()
             .iter()
-            .any(|(id, mode)| id.0 == "vm_leftover" && matches!(mode, StopMode::Force)),
+            .any(|(id, mode)| id.0 == "vm_leftover" && matches!(mode, StopMode::Force { .. })),
         "an extra running VM is force-stopped: {:?}",
         engine.stops()
     );
@@ -608,6 +608,17 @@ async fn a_stateful_vm_starts_only_with_a_held_lease_of_its_token() {
     // The VM with the wrong token was created but never started.
     let bad = VmId("vm_bad".to_owned());
     assert_eq!(engine.inspect(&bad).await.unwrap().state, VmState::Stopped);
+    // Under a `local` lease, and for a stateless VM, the start gets the
+    // agent's own bound (engine-trait.md section 3.7).
+    let mut starts = engine.starts();
+    starts.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+    assert_eq!(
+        starts,
+        vec![
+            (VmId("vm_ok".to_owned()), START_WITHIN),
+            (VmId("vm_plain".to_owned()), START_WITHIN),
+        ]
+    );
 
     // The attached volumes reached the engine with their mount paths.
     let ok_spec = engine
@@ -619,6 +630,70 @@ async fn a_stateful_vm_starts_only_with_a_held_lease_of_its_token() {
     assert_eq!(ok_spec.volumes[0].volume_id.0, "vol_ok");
     assert_eq!(ok_spec.volumes[0].mount_path, "/data");
     assert_eq!(ok_spec.volumes[0].serial, "quoro-vol-0");
+}
+
+/// A table that holds `lease_id` as an `expiring` lease with `token`, its
+/// first renewal answered (section 8.4).
+fn expiring_lease_table(lease_id: &str, app_id: &str, token: u64) -> LeaseTable {
+    let grant = quoro_proto::LeaseGrant {
+        lease_id: quoro_proto::LeaseId(lease_id.to_owned()),
+        resource_type: quoro_proto::ResourceType::App,
+        resource_id: app_id.to_owned(),
+        mode: quoro_proto::LeaseMode::Expiring,
+        fencing_token: token,
+        duration_ms: Some(15_000),
+        granted_at: "2026-11-02T10:15:33Z".to_owned(),
+    };
+    let now = tokio::time::Instant::now();
+    let renewal = quoro_proto::MsgId("msg_renew_1".to_owned());
+    let mut table = LeaseTable::new();
+    table
+        .on_grant(&grant, None, now)
+        .expect("a valid expiring grant");
+    table.renew_sent(
+        &grant.lease_id,
+        renewal.clone(),
+        &quoro_node_agent::HostNow::unknown(now),
+    );
+    table
+        .on_grant(&grant, Some(&renewal), now)
+        .expect("the renewal is answered");
+    table
+}
+
+/// Section 6.4, ADR 0242: a stateful start under an `expiring` lease gets the
+/// 3 s start bound, and a stateless start beside it the agent's own bound.
+#[tokio::test]
+async fn a_stateful_start_under_an_expiring_lease_is_bounded_by_3_s() {
+    let dir = TargetDir::new("expiring-start");
+    let engine = Arc::new(RecordingEngine::new());
+    engine.inner().set_volume_dir(dir.path());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let (reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let table = expiring_lease_table("lse_1", "app_1", 1);
+    let mut reconciler = reconciler.with_lease_view(LeaseView::new(table, false));
+
+    let snap = snapshot_full(
+        1,
+        vec![
+            stateful_vm("vm_warm", "lse_1", 1, Vec::new()),
+            spec_vm("vm_plain", "prj_1", DesiredStatus::Running),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+    reconciler.reconcile_once(Some(&snap)).await;
+
+    let mut starts = engine.starts();
+    starts.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+    assert_eq!(
+        starts,
+        vec![
+            (VmId("vm_plain".to_owned()), START_WITHIN),
+            (VmId("vm_warm".to_owned()), EXPIRING_START_WITHIN),
+        ]
+    );
+    assert_eq!(EXPIRING_START_WITHIN, Duration::from_millis(3000));
 }
 
 #[tokio::test]
@@ -1397,7 +1472,8 @@ async fn the_reconciler_leaves_a_fenced_vm_to_its_fence() {
     assert_eq!(
         calls[0].1,
         StopMode::Graceful {
-            timeout: Duration::from_secs(60)
+            timeout: Duration::from_secs(60),
+            force_within: Duration::from_secs(60),
         },
         "the one stop is the fence's"
     );
@@ -1503,6 +1579,7 @@ async fn a_reconciler_stop_under_way_gives_up_when_the_fence_is_triggered() {
     // The fence's own stop follows, once its lease is saved revoked.
     let fence_stop = StopMode::Graceful {
         timeout: Duration::from_secs(60),
+        force_within: Duration::from_secs(60),
     };
     while !engine
         .inner()

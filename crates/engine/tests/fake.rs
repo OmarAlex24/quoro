@@ -13,6 +13,17 @@ use quoro_engine::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// A start bound no fake boot reaches, unless a test makes it slow.
+const START: Duration = Duration::from_secs(60);
+
+/// The force bound of a graceful stop no fake stop reaches.
+const FORCE_WITHIN: Duration = Duration::from_secs(60);
+
+/// A forced stop no fake stop overruns, unless a test makes it slow.
+const FORCE: StopMode = StopMode::Force {
+    within: FORCE_WITHIN,
+};
+
 /// An engine with one created (stopped) VM and a prepared image.
 async fn created() -> (FakeEngine, VmId) {
     let engine = FakeEngine::new();
@@ -72,16 +83,13 @@ async fn events_deliver_started_exited_and_crashed() {
     let (engine, id) = created().await;
     let mut events = engine.events();
 
-    engine.start(&id).await.expect("start succeeds");
+    engine.start(&id, START).await.expect("start succeeds");
     assert_eq!(
         common::next_event(&mut events).await,
         Some(EngineEvent::Started { id: id.clone() })
     );
 
-    engine
-        .stop(&id, StopMode::Force)
-        .await
-        .expect("stop succeeds");
+    engine.stop(&id, FORCE).await.expect("stop succeeds");
     assert_eq!(
         common::next_event(&mut events).await,
         Some(EngineEvent::Exited {
@@ -90,7 +98,7 @@ async fn events_deliver_started_exited_and_crashed() {
         })
     );
 
-    engine.start(&id).await.expect("start succeeds");
+    engine.start(&id, START).await.expect("start succeeds");
     assert_eq!(
         common::next_event(&mut events).await,
         Some(EngineEvent::Started { id: id.clone() })
@@ -112,7 +120,7 @@ async fn events_deliver_started_exited_and_crashed() {
 async fn an_app_that_exits_on_its_own_is_a_crash_with_its_code() {
     let (engine, id) = created().await;
     let mut events = engine.events();
-    engine.start(&id).await.expect("start succeeds");
+    engine.start(&id, START).await.expect("start succeeds");
     assert_eq!(
         common::next_event(&mut events).await,
         Some(EngineEvent::Started { id: id.clone() })
@@ -133,7 +141,7 @@ async fn an_app_that_exits_on_its_own_is_a_crash_with_its_code() {
 #[tokio::test(start_paused = true)]
 async fn an_ignored_power_button_waits_the_timeout_then_forces() {
     let (engine, id) = created().await;
-    engine.start(&id).await.expect("start succeeds");
+    engine.start(&id, START).await.expect("start succeeds");
     engine.set_ignore_power_button(&id, true);
 
     let began = tokio::time::Instant::now();
@@ -142,6 +150,7 @@ async fn an_ignored_power_button_waits_the_timeout_then_forces() {
             &id,
             StopMode::Graceful {
                 timeout: Duration::from_secs(1),
+                force_within: FORCE_WITHIN,
             },
         )
         .await
@@ -156,7 +165,8 @@ async fn an_ignored_power_button_waits_the_timeout_then_forces() {
     assert_eq!(
         calls[0].1,
         StopMode::Graceful {
-            timeout: Duration::from_secs(1)
+            timeout: Duration::from_secs(1),
+            force_within: FORCE_WITHIN,
         }
     );
 }
@@ -164,7 +174,7 @@ async fn an_ignored_power_button_waits_the_timeout_then_forces() {
 #[tokio::test(start_paused = true)]
 async fn a_cooperative_graceful_stop_exits_zero_without_waiting() {
     let (engine, id) = created().await;
-    engine.start(&id).await.expect("start succeeds");
+    engine.start(&id, START).await.expect("start succeeds");
 
     let began = tokio::time::Instant::now();
     let info = engine
@@ -172,6 +182,7 @@ async fn a_cooperative_graceful_stop_exits_zero_without_waiting() {
             &id,
             StopMode::Graceful {
                 timeout: Duration::from_secs(30),
+                force_within: FORCE_WITHIN,
             },
         )
         .await
@@ -183,14 +194,11 @@ async fn a_cooperative_graceful_stop_exits_zero_without_waiting() {
 #[tokio::test(start_paused = true)]
 async fn a_stop_delay_is_awaited_before_acting() {
     let (engine, id) = created().await;
-    engine.start(&id).await.expect("start succeeds");
+    engine.start(&id, START).await.expect("start succeeds");
     engine.set_stop_delay(&id, Duration::from_secs(2));
 
     let began = tokio::time::Instant::now();
-    let info = engine
-        .stop(&id, StopMode::Force)
-        .await
-        .expect("forced stop succeeds");
+    let info = engine.stop(&id, FORCE).await.expect("forced stop succeeds");
     assert_eq!(began.elapsed(), Duration::from_secs(2));
     assert_eq!(info.exit_code, Some(137));
 }
@@ -201,21 +209,17 @@ async fn a_stop_delay_is_awaited_before_acting() {
 #[tokio::test(start_paused = true)]
 async fn a_forced_stop_finishes_after_its_caller_stops_waiting() {
     let (engine, id) = created().await;
-    let started = engine.start(&id).await.expect("start succeeds");
+    let started = engine.start(&id, START).await.expect("start succeeds");
     let mut events = engine.events();
     engine.set_stop_delay(&id, Duration::from_millis(500));
 
-    let gave_up = tokio::time::timeout(
-        Duration::from_millis(100),
-        engine.stop(&id, StopMode::Force),
-    )
-    .await;
+    let gave_up = tokio::time::timeout(Duration::from_millis(100), engine.stop(&id, FORCE)).await;
     assert!(gave_up.is_err(), "the caller stopped waiting");
     let stopping = engine.inspect(&id).await.expect("inspect succeeds");
     assert_eq!(stopping.state, VmState::Stopping);
     assert_eq!(stopping.pid, started.pid);
     assert!(matches!(
-        engine.start(&id).await,
+        engine.start(&id, START).await,
         Err(EngineError::Conflict(_))
     ));
     assert!(matches!(
@@ -238,7 +242,7 @@ async fn a_forced_stop_finishes_after_its_caller_stops_waiting() {
     );
     // Stopped once: a later start boots the VM again and nothing stops it.
     engine.set_stop_delay(&id, Duration::ZERO);
-    engine.start(&id).await.expect("start succeeds");
+    engine.start(&id, START).await.expect("start succeeds");
     assert_eq!(
         common::next_event(&mut events).await,
         Some(EngineEvent::Started { id: id.clone() })
@@ -256,15 +260,11 @@ async fn a_forced_stop_finishes_after_its_caller_stops_waiting() {
 #[tokio::test(start_paused = true)]
 async fn a_later_stop_joins_a_forced_stop_in_progress() {
     let (engine, id) = created().await;
-    engine.start(&id).await.expect("start succeeds");
+    engine.start(&id, START).await.expect("start succeeds");
     let mut events = engine.events();
     engine.set_stop_delay(&id, Duration::from_millis(500));
     let began = tokio::time::Instant::now();
-    let gave_up = tokio::time::timeout(
-        Duration::from_millis(100),
-        engine.stop(&id, StopMode::Force),
-    )
-    .await;
+    let gave_up = tokio::time::timeout(Duration::from_millis(100), engine.stop(&id, FORCE)).await;
     assert!(gave_up.is_err(), "the caller stopped waiting");
 
     let joined = engine
@@ -272,6 +272,7 @@ async fn a_later_stop_joins_a_forced_stop_in_progress() {
             &id,
             StopMode::Graceful {
                 timeout: Duration::from_secs(30),
+                force_within: FORCE_WITHIN,
             },
         )
         .await
@@ -289,10 +290,194 @@ async fn a_later_stop_joins_a_forced_stop_in_progress() {
     assert_eq!(engine.stop_calls().len(), 2);
 }
 
+/// No event is waiting on `events` right now.
+async fn no_event(events: &mut quoro_engine::EventStream) {
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), common::next_event(events))
+            .await
+            .is_err(),
+        "an event was emitted"
+    );
+}
+
+/// ADR 0243, contract §7: a forced stop that overruns its bound returns
+/// `Timeout` at the bound, and the stop goes on until the VM is stopped.
+#[tokio::test(start_paused = true)]
+async fn a_forced_stop_that_overruns_its_bound_times_out_and_still_stops() {
+    let (engine, id) = created().await;
+    let started = engine.start(&id, START).await.expect("start succeeds");
+    engine.set_stop_delay(&id, Duration::from_millis(500));
+
+    let began = tokio::time::Instant::now();
+    let within = Duration::from_millis(100);
+    assert_eq!(
+        engine.stop(&id, StopMode::Force { within }).await,
+        Err(EngineError::Timeout)
+    );
+    assert_eq!(began.elapsed(), within);
+    let stopping = engine.inspect(&id).await.expect("inspect succeeds");
+    assert_eq!(stopping.state, VmState::Stopping);
+    assert_eq!(stopping.pid, started.pid, "the VM may still run");
+
+    // A later stop joins it within its own bound.
+    assert_eq!(
+        engine
+            .stop(
+                &id,
+                StopMode::Force {
+                    within: Duration::from_millis(50)
+                }
+            )
+            .await,
+        Err(EngineError::Timeout)
+    );
+    assert_eq!(began.elapsed(), Duration::from_millis(150));
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let stopped = engine.inspect(&id).await.expect("inspect succeeds");
+    assert_eq!(stopped.state, VmState::Stopped);
+    assert_eq!(stopped.pid, None);
+    assert_eq!(stopped.exit_code, Some(137));
+}
+
+/// ADR 0243: a graceful stop returns within `timeout + force_within`, and the
+/// forced stop it began goes on after its `Timeout`.
+#[tokio::test(start_paused = true)]
+async fn a_graceful_stop_returns_within_its_two_bounds() {
+    let (engine, id) = created().await;
+    engine.start(&id, START).await.expect("start succeeds");
+    engine.set_ignore_power_button(&id, true);
+    engine.set_stop_delay(&id, Duration::from_millis(500));
+
+    let began = tokio::time::Instant::now();
+    let (timeout, force_within) = (Duration::from_millis(200), Duration::from_millis(100));
+    assert_eq!(
+        engine
+            .stop(
+                &id,
+                StopMode::Graceful {
+                    timeout,
+                    force_within
+                }
+            )
+            .await,
+        Err(EngineError::Timeout)
+    );
+    assert_eq!(began.elapsed(), timeout + force_within);
+    assert_eq!(
+        engine.inspect(&id).await.expect("inspect succeeds").state,
+        VmState::Stopping
+    );
+
+    // The forced part began at 200 ms and takes the 500 ms of the slow VMM;
+    // wake past its end, not at it.
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    let stopped = engine.inspect(&id).await.expect("inspect succeeds");
+    assert_eq!(stopped.state, VmState::Stopped);
+    assert_eq!(stopped.exit_code, Some(137));
+}
+
+/// ADR 0242, contract §7: a slow boot within the start's bound runs.
+#[tokio::test(start_paused = true)]
+async fn a_slow_start_within_its_bound_runs() {
+    let (engine, id) = created().await;
+    let mut events = engine.events();
+    engine.set_start_delay(&id, Duration::from_millis(200));
+
+    let began = tokio::time::Instant::now();
+    let started = engine
+        .start(&id, Duration::from_secs(1))
+        .await
+        .expect("start succeeds");
+    assert_eq!(began.elapsed(), Duration::from_millis(200));
+    assert_eq!(started.state, VmState::Running);
+    assert!(started.pid.is_some());
+    assert_eq!(
+        common::next_event(&mut events).await,
+        Some(EngineEvent::Started { id: id.clone() })
+    );
+}
+
+/// ADR 0242, contract §3.7 and §7: a start that overruns its bound returns
+/// `Timeout` at the bound. The fake then stops what it started; the VM may
+/// still run until the test lets that stop finish, and it never boots.
+#[tokio::test(start_paused = true)]
+async fn a_start_that_overruns_its_bound_times_out_and_stops_what_it_started() {
+    let (engine, id) = created().await;
+    let mut events = engine.events();
+    engine.set_start_delay(&id, Duration::from_millis(500));
+    engine.set_stop_delay(&id, Duration::from_millis(300));
+
+    let began = tokio::time::Instant::now();
+    let within = Duration::from_millis(100);
+    assert_eq!(engine.start(&id, within).await, Err(EngineError::Timeout));
+    assert_eq!(began.elapsed(), within);
+    let stopping = engine.inspect(&id).await.expect("inspect succeeds");
+    assert_eq!(stopping.state, VmState::Stopping);
+    assert!(stopping.pid.is_some(), "the VM may still run");
+    assert!(matches!(
+        engine.start(&id, START).await,
+        Err(EngineError::Conflict(_))
+    ));
+    assert!(matches!(
+        engine.delete(&id).await,
+        Err(EngineError::Conflict(_))
+    ));
+
+    // A stop joins the one the start began.
+    let joined = engine.stop(&id, FORCE).await.expect("the stop joins");
+    assert_eq!(began.elapsed(), Duration::from_millis(400));
+    assert_eq!(joined.state, VmState::Stopped);
+    assert_eq!(joined.pid, None);
+    assert_eq!(joined.exit_code, None, "the VM never booted");
+
+    // The boot the start gave up never lands, and nothing was emitted.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        engine.inspect(&id).await.expect("inspect succeeds").state,
+        VmState::Stopped
+    );
+    no_event(&mut events).await;
+
+    engine.set_start_delay(&id, Duration::ZERO);
+    engine.start(&id, START).await.expect("start succeeds");
+    assert_eq!(
+        common::next_event(&mut events).await,
+        Some(EngineEvent::Started { id: id.clone() })
+    );
+}
+
+/// Contract §4: a start whose caller stops waiting is given up like one that
+/// overran its bound, and a fast VMM stops at once.
+#[tokio::test(start_paused = true)]
+async fn a_start_whose_caller_stops_waiting_is_given_up() {
+    let (engine, id) = created().await;
+    let mut events = engine.events();
+    engine.set_start_delay(&id, Duration::from_millis(500));
+
+    let gave_up = tokio::time::timeout(
+        Duration::from_millis(100),
+        engine.start(&id, Duration::from_secs(1)),
+    )
+    .await;
+    assert!(gave_up.is_err(), "the caller stopped waiting");
+    let stopped = engine.inspect(&id).await.expect("inspect succeeds");
+    assert_eq!(stopped.state, VmState::Stopped);
+    assert_eq!(stopped.pid, None);
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        engine.inspect(&id).await.expect("inspect succeeds").state,
+        VmState::Stopped,
+        "the given-up boot never lands"
+    );
+    no_event(&mut events).await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn an_unkillable_vm_keeps_its_state_and_every_stop_fails() {
     let (engine, id) = created().await;
-    engine.start(&id).await.expect("start succeeds");
+    engine.start(&id, START).await.expect("start succeeds");
     let running = engine.inspect(&id).await.expect("inspect succeeds");
     assert_eq!(running.state, VmState::Running);
     engine.set_unkillable(&id, true);
@@ -303,6 +488,7 @@ async fn an_unkillable_vm_keeps_its_state_and_every_stop_fails() {
             &id,
             StopMode::Graceful {
                 timeout: Duration::from_secs(30),
+                force_within: FORCE_WITHIN,
             },
         )
         .await;
@@ -313,7 +499,7 @@ async fn an_unkillable_vm_keeps_its_state_and_every_stop_fails() {
         ))
     );
 
-    let forced = engine.stop(&id, StopMode::Force).await;
+    let forced = engine.stop(&id, FORCE).await;
     assert_eq!(
         forced,
         Err(EngineError::Hypervisor(
@@ -330,7 +516,7 @@ async fn an_unkillable_vm_keeps_its_state_and_every_stop_fails() {
 
     engine.set_unkillable(&id, false);
     let info = engine
-        .stop(&id, StopMode::Force)
+        .stop(&id, FORCE)
         .await
         .expect("a forced stop succeeds once the VMM is killable");
     assert_eq!(info.state, VmState::Stopped);
@@ -390,7 +576,7 @@ async fn console_allows_one_client_until_it_is_dropped() {
 #[tokio::test]
 async fn advance_crashes_a_vm_once_its_deadline_passes() {
     let (engine, id) = created().await;
-    engine.start(&id).await.expect("start succeeds");
+    engine.start(&id, START).await.expect("start succeeds");
     let mut events = engine.events();
     // The Started event from before the subscription is not in this stream.
     engine.schedule_crash(&id, Duration::from_secs(5));
@@ -450,24 +636,27 @@ async fn fail_next_returns_an_error_once_for_every_operation() {
 
     engine.fail_next(FakeOp::Start, EngineError::Timeout);
     assert_eq!(
-        engine.start(&id).await.expect_err("injected failure"),
+        engine
+            .start(&id, START)
+            .await
+            .expect_err("injected failure"),
         EngineError::Timeout
     );
-    engine.start(&id).await.expect("the next call succeeds");
+    engine
+        .start(&id, START)
+        .await
+        .expect("the next call succeeds");
 
     engine.fail_next(
         FakeOp::Stop,
         EngineError::Hypervisor("injected".to_string()),
     );
     assert_eq!(
-        engine
-            .stop(&id, StopMode::Force)
-            .await
-            .expect_err("injected failure"),
+        engine.stop(&id, FORCE).await.expect_err("injected failure"),
         EngineError::Hypervisor("injected".to_string())
     );
     engine
-        .stop(&id, StopMode::Force)
+        .stop(&id, FORCE)
         .await
         .expect("the next call succeeds");
 
@@ -511,11 +700,8 @@ async fn events_are_dropped_and_counted_when_a_subscriber_is_full() {
     let (engine, id) = created().await;
     let _subscriber = engine.events();
     for _ in 0..600 {
-        engine.start(&id).await.expect("start succeeds");
-        engine
-            .stop(&id, StopMode::Force)
-            .await
-            .expect("stop succeeds");
+        engine.start(&id, START).await.expect("start succeeds");
+        engine.stop(&id, FORCE).await.expect("stop succeeds");
     }
     assert!(engine.dropped_events() > 0);
 }
@@ -648,7 +834,7 @@ async fn a_pause_copy_snapshot_reports_its_pause_only_for_a_running_vm() {
         serial: "quoro-vol-0".to_string(),
     }];
     engine.create(&spec).await.expect("create");
-    engine.start(&spec.id).await.expect("start");
+    engine.start(&spec.id, START).await.expect("start");
     let running = engine.snapshot_volume(&volume).await.expect("snapshot");
     assert_eq!(running.method, SnapshotMethod::PauseCopy);
     assert_eq!(running.pause, Duration::from_millis(250));
@@ -746,7 +932,7 @@ async fn exec_echoes_input_reports_resizes_and_exits() {
         ),
         "a stopped VM has no exec"
     );
-    engine.start(&id).await.expect("start");
+    engine.start(&id, START).await.expect("start");
 
     let mut session = engine.exec(&id, &shell()).await.expect("exec");
     session.io.write_all(b"uname -a\n").await.expect("write");
@@ -773,7 +959,7 @@ async fn exec_echoes_input_reports_resizes_and_exits() {
 #[tokio::test]
 async fn exec_validates_requests_and_ends_with_the_vm() {
     let (engine, id) = interactive().await;
-    engine.start(&id).await.expect("start");
+    engine.start(&id, START).await.expect("start");
     for bad in [
         quoro_engine::ExecRequest {
             argv: Vec::new(),
@@ -808,7 +994,7 @@ async fn exec_validates_requests_and_ends_with_the_vm() {
     assert!(engine.exec_closed(&id, 1));
     assert!(!engine.exec_closed(&id, 0));
 
-    engine.stop(&id, StopMode::Force).await.expect("stop");
+    engine.stop(&id, FORCE).await.expect("stop");
     assert!(
         first.exit.await.is_err(),
         "no exit code when the VM stopped"
@@ -818,7 +1004,7 @@ async fn exec_validates_requests_and_ends_with_the_vm() {
 #[tokio::test]
 async fn serial_output_replays_the_ring_and_follows_live_output() {
     let (engine, id) = interactive().await;
-    engine.start(&id).await.expect("start");
+    engine.start(&id, START).await.expect("start");
     engine.push_serial(&id, b"quoro-init: booting\n");
     engine.push_serial(&id, b"quoro-init: app started\n");
 
@@ -833,11 +1019,11 @@ async fn serial_output_replays_the_ring_and_follows_live_output() {
     assert_eq!(next_bytes(&mut tail).await, b"live\n");
 
     // A console stream outlives a restart and ends when the VM is deleted.
-    engine.stop(&id, StopMode::Force).await.expect("stop");
-    engine.start(&id).await.expect("start again");
+    engine.stop(&id, FORCE).await.expect("stop");
+    engine.start(&id, START).await.expect("start again");
     engine.push_serial(&id, b"second boot\n");
     assert_eq!(next_bytes(&mut all).await, b"second boot\n");
-    engine.stop(&id, StopMode::Force).await.expect("stop");
+    engine.stop(&id, FORCE).await.expect("stop");
     engine.delete(&id).await.expect("delete");
     assert!(
         std::future::poll_fn(|cx| all.as_mut().poll_next(cx))
@@ -1531,7 +1717,7 @@ async fn pause_and_resume_flip_a_flag_and_the_vm_still_reads_running() {
         matches!(engine.pause(&id).await, Err(EngineError::Conflict(_))),
         "a stopped VM cannot be paused"
     );
-    engine.start(&id).await.expect("start");
+    engine.start(&id, START).await.expect("start");
     engine.pause(&id).await.expect("pause");
     engine.pause(&id).await.expect("pausing a paused VM is Ok");
     assert!(engine.is_paused(&id));
@@ -1547,16 +1733,13 @@ async fn pause_and_resume_flip_a_flag_and_the_vm_still_reads_running() {
     assert!(!engine.is_paused(&id));
 
     engine.pause(&id).await.expect("pause");
-    engine
-        .stop(&id, StopMode::Force)
-        .await
-        .expect("a paused VM stops");
+    engine.stop(&id, FORCE).await.expect("a paused VM stops");
     assert!(!engine.is_paused(&id));
     assert!(matches!(
         engine.resume(&id).await,
         Err(EngineError::Conflict(_))
     ));
-    engine.start(&id).await.expect("start");
+    engine.start(&id, START).await.expect("start");
     assert!(!engine.is_paused(&id), "a new start is not paused");
 
     engine.fail_next(FakeOp::Pause, EngineError::Timeout);

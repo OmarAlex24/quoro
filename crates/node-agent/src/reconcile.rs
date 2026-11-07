@@ -38,6 +38,7 @@ use crate::lease::{LeaseView, StartPermit};
 use crate::logs::LogCollector;
 use crate::store::{NodeStore, VolumeRecord};
 use crate::util;
+use crate::{FORCE_WITHIN, START_WITHIN};
 
 /// The guest context id of every VM's vsock device: each VM has its own vsock
 /// namespace, so all of them use 3 (`engine-trait.md` section 3.18).
@@ -983,7 +984,15 @@ impl<E: Engine + 'static> Reconciler<E> {
                 )
             {
                 match self
-                    .unless_fenced(vm, self.engine.stop(&id, StopMode::Force))
+                    .unless_fenced(
+                        vm,
+                        self.engine.stop(
+                            &id,
+                            StopMode::Force {
+                                within: FORCE_WITHIN,
+                            },
+                        ),
+                    )
                     .await
                 {
                     None => {
@@ -1138,7 +1147,7 @@ impl<E: Engine + 'static> Reconciler<E> {
                     self.remember(&vm_id, info.state);
                     return true;
                 };
-                let started = self.engine.start(&id).await;
+                let started = self.engine.start(&id, start_within(&permit)).await;
                 // A fence of the lease may stop the VM from here on.
                 drop(permit);
                 match started {
@@ -1202,7 +1211,7 @@ impl<E: Engine + 'static> Reconciler<E> {
                             }
                         }
                     } else {
-                        let started = self.engine.start(&id).await;
+                        let started = self.engine.start(&id, start_within(&permit)).await;
                         // A fence of the lease may stop the VM from here on.
                         drop(permit);
                         match started {
@@ -1777,6 +1786,7 @@ impl<E: Engine + 'static> Reconciler<E> {
                 id,
                 StopMode::Graceful {
                     timeout: self.options.stop_timeout,
+                    force_within: FORCE_WITHIN,
                 },
             )
             .await
@@ -1811,7 +1821,7 @@ impl<E: Engine + 'static> Reconciler<E> {
             return Ok(None);
         }
 
-        let started = self.engine.start(id).await;
+        let started = self.engine.start(id, start_within(&permit)).await;
         // A fence of the lease may stop the VM from here on.
         drop(permit);
         match started {
@@ -1858,7 +1868,15 @@ impl<E: Engine + 'static> Reconciler<E> {
             if matches!(
                 info.state,
                 VmState::Running | VmState::Starting | VmState::Stopping
-            ) && let Err(e) = self.engine.stop(&info.id, StopMode::Force).await
+            ) && let Err(e) = self
+                .engine
+                .stop(
+                    &info.id,
+                    StopMode::Force {
+                        within: FORCE_WITHIN,
+                    },
+                )
+                .await
             {
                 warn!(vm_id, error = ?e, "could not force-stop the removed VM");
                 reached = false;
@@ -2073,6 +2091,15 @@ fn observed_status(state: VmState) -> ObservedStatus {
 /// Awaits the next engine event without pulling in a `futures` dependency.
 async fn next_event(stream: &mut EventStream) -> Option<EngineEvent> {
     stream.next().await
+}
+
+/// The bound the engine gets for a start: a stateful VM's permit names it
+/// (node-agent-protocol.md section 6.4), and a stateless VM gets
+/// [`START_WITHIN`].
+fn start_within(permit: &Option<StartPermit>) -> Duration {
+    permit
+        .as_ref()
+        .map_or(START_WITHIN, StartPermit::start_within)
 }
 
 #[cfg(test)]
