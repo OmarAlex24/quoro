@@ -863,15 +863,7 @@ async fn a_partial_or_broken_transfer_never_replaces_the_complete_copy() {
                 .assert_refused(reason, Some(1));
         }
         // The stream's lock is released once the receiver is done with it.
-        let mut freed = false;
-        for _ in 0..100 {
-            if h.locks.try_lock(VOL).is_some() {
-                freed = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(freed, "{how:?}: the volume lock is released");
+        settled(&h).await;
         h.assert_copy(&first, Some(1), &newer.touched).await;
         assert!(
             h.row().await.error.is_some(),
@@ -904,12 +896,7 @@ async fn a_full_copy_cut_short_leaves_no_copy_at_all() {
         &model.allocated(),
     );
     let _ = h.post(chunks, end).await;
-    for _ in 0..100 {
-        if h.locks.try_lock(VOL).is_some() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    settled(&h).await;
     h.assert_copy(&model, None, &model.touched).await;
     assert!(!h.volume_path.exists(), "no file before a complete stream");
     assert!(h.engine.volumes().is_empty());
@@ -1013,6 +1000,7 @@ async fn a_failed_swap_keeps_the_copy_the_store_names() {
         .expect("a reply");
     assert_eq!(reply.status, 500, "{reply:?}");
     assert!(reply.body.contains("the disk is full"), "{reply:?}");
+    settled(&h).await;
     h.assert_copy(&first, Some(1), &newer.touched).await;
     assert!(h.status().error.is_some());
     // The next cycle from the same base lands.
@@ -1024,6 +1012,88 @@ async fn a_failed_swap_keeps_the_copy_the_store_names() {
     .expect("a reply")
     .assert_complete(2);
     h.assert_copy(&newer, Some(2), &newer.touched).await;
+}
+
+#[tokio::test]
+async fn a_failed_swap_answers_first_and_holds_the_lock_until_the_copy_is_resolved() {
+    // Resolving the copy hashes the whole volume; the source must not wait
+    // for that to get its answer (it gives up after `answer_timeout`).
+    let h = Harness::new("failed-swap-answer").await;
+    let first = ship_first(&h).await;
+    let mut newer = first.clone();
+    newer.write(CELL, &[4_u8; 4096]);
+    let gate = h.receiver.inner.recovery_gate.lock().await;
+    h.engine.fail_next(
+        FakeOp::CommitStagedVolume,
+        EngineError::Io("the disk is full".to_owned()),
+    );
+    // Below the 20 s `post` waits for a reply, so a receiver that waits for
+    // the recovery fails here.
+    let reply = tokio::time::timeout(
+        Duration::from_secs(15),
+        h.post(
+            stream(&header(5, 2, Some(1)), &newer, &[(CELL, 4096)]),
+            End::Complete,
+        ),
+    )
+    .await
+    .expect("the answer does not wait for the copy to be resolved")
+    .expect("a reply");
+    assert_eq!(reply.status, 500, "{reply:?}");
+    assert!(
+        h.row().await.pending.is_some(),
+        "the copy is not resolved yet"
+    );
+    // Until it is, the volume's lock is held: the next stream is busy and
+    // the answer names the complete copy.
+    h.post(
+        stream(&header(5, 2, Some(1)), &newer, &[(CELL, 4096)]),
+        End::Complete,
+    )
+    .await
+    .expect("a reply")
+    .assert_refused("busy", Some(1));
+    drop(gate);
+    settled(&h).await;
+    h.assert_copy(&first, Some(1), &newer.touched).await;
+    assert!(h.status().error.is_some());
+    h.post(
+        stream(&header(5, 2, Some(1)), &newer, &[(CELL, 4096)]),
+        End::Complete,
+    )
+    .await
+    .expect("a reply")
+    .assert_complete(2);
+    h.assert_copy(&newer, Some(2), &newer.touched).await;
+}
+
+#[tokio::test]
+async fn a_failed_swap_whose_rename_happened_reports_the_new_copy_once_resolved() {
+    // The engine can fail after its rename (section 3.22): the copy found by
+    // its hash is the new one, and the status names it once it is resolved.
+    let h = Harness::new("failed-swap-renamed").await;
+    let first = ship_first(&h).await;
+    let mut newer = first.clone();
+    newer.write(CELL, &[4_u8; 4096]);
+    let gate = h.receiver.inner.recovery_gate.lock().await;
+    h.engine.fail_next(
+        FakeOp::CommitStagedVolume,
+        EngineError::Io("the rename was not confirmed".to_owned()),
+    );
+    let reply = h
+        .post(
+            stream(&header(5, 2, Some(1)), &newer, &[(CELL, 4096)]),
+            End::Complete,
+        )
+        .await
+        .expect("a reply");
+    assert_eq!(reply.status, 500, "{reply:?}");
+    write_file(&h, &newer);
+    assert_eq!(h.status().snapshot_seq, Some(1), "not resolved yet");
+    drop(gate);
+    settled(&h).await;
+    h.assert_copy(&newer, Some(2), &newer.touched).await;
+    assert_eq!(h.status().snapshot_seq, Some(2));
 }
 
 /// Writes `model`'s touched cells straight into the volume file, as a swap
@@ -1392,14 +1462,16 @@ async fn open_stream(addr: SocketAddr, chunks: &[Vec<u8>]) -> TcpStream {
     stream
 }
 
-async fn wait_unlocked(h: &Harness) {
-    for _ in 0..250 {
-        if h.locks.try_lock(VOL).is_some() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("the volume lock is never released");
+/// Waits until the receiver is done with the volume. After a failed swap it
+/// hashes the whole volume once it has answered, which takes a while on a
+/// filesystem that reports no holes; the bound only keeps a lock that is
+/// never released from hanging the test.
+async fn settled(h: &Harness) {
+    drop(
+        tokio::time::timeout(Duration::from_secs(300), h.locks.lock(VOL))
+            .await
+            .expect("the receiver releases the volume's lock"),
+    );
 }
 
 #[tokio::test]
@@ -1440,7 +1512,7 @@ async fn a_source_that_closes_after_its_last_frame_does_not_cut_the_swap() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(ended, "the stream ends");
-    wait_unlocked(&h).await;
+    settled(&h).await;
     h.assert_copy(&newer, Some(2), &newer.touched).await;
 
     let mut third = newer.clone();
@@ -1617,12 +1689,7 @@ async fn random_cycles_keep_the_copy_equal_to_the_last_complete_snapshot() {
                     true
                 }
             };
-            for _ in 0..100 {
-                if h.locks.try_lock(VOL).is_some() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            settled(&h).await;
             if completed {
                 complete = Some((seq, source.clone()));
                 base = Some(seq);

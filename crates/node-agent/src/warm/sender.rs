@@ -73,7 +73,7 @@ use tracing::{debug, info, warn};
 
 use super::frame::{Answer, AnswerStatus, Frame, Manifest, RefuseReason, StreamHeader, encode};
 use super::receiver::REPLICATE_PATH;
-use super::{StatusBoard, VolumeLocks, data_segments, hash_copy};
+use super::{StatusBoard, VolumeLocks, data_segments, hash_copy, is_zero};
 use crate::LeaseView;
 use crate::kept::{self, KeepPurpose};
 use crate::reconcile::Snapshot;
@@ -1306,7 +1306,7 @@ fn produce(
                 file.read_exact_at(bytes, offset)
                     .map_err(|e| format!("cannot read the snapshot: {e}"))?;
                 stream.read_since_frame += stop - offset;
-                if bytes.iter().all(|byte| *byte == 0) {
+                if is_zero(bytes) {
                     stream.zeros(offset, stop)?;
                 } else {
                     stream.flush_zeros()?;

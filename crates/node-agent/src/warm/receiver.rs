@@ -31,6 +31,9 @@
 //! naming the copy it may hold; the next start, or the next stream, hashes
 //! the volume file once and keeps whichever copy it matches. A copy that
 //! matches neither is treated as no copy, and the source ships a full one.
+//! When the swap itself fails, the source gets its answer first and the
+//! hash runs after it, still under the volume's lock: the hash reads the
+//! whole volume, which can take longer than the source waits for an answer.
 //!
 //! The copy is never created except from a complete stream, and it is
 //! reported in `status_report.warm`, never in `status_report.volumes`.
@@ -141,6 +144,12 @@ struct Inner<E: Engine> {
     /// volume's lock; without that, the engine refuses every new staging
     /// file of the volume until the agent restarts.
     leftovers: StdMutex<HashMap<String, StagedVolume>>,
+    /// Held from reading the rows to setting the entries, so a publish that
+    /// read older rows never overwrites a newer one's entries.
+    publishing: tokio::sync::Mutex<()>,
+    /// Held by a test to keep a failed swap's recovery from starting.
+    #[cfg(test)]
+    recovery_gate: tokio::sync::Mutex<()>,
 }
 
 /// A staging file of a stream or a recovery. Dropped before it is committed
@@ -234,6 +243,9 @@ impl<E: Engine + 'static> WarmReceiver<E> {
                 bind_errors: StdMutex::new(BTreeMap::new()),
                 connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
                 leftovers: StdMutex::new(HashMap::new()),
+                publishing: tokio::sync::Mutex::new(()),
+                #[cfg(test)]
+                recovery_gate: tokio::sync::Mutex::new(()),
             }),
         }
     }
@@ -432,7 +444,11 @@ impl<E: Engine + 'static> WarmReceiver<E> {
 
 impl<E: Engine + 'static> Inner<E> {
     /// Answers one request.
-    async fn handle(&self, request: Request<Incoming>, remote: IpAddr) -> Response<Full<Bytes>> {
+    async fn handle(
+        self: &Arc<Self>,
+        request: Request<Incoming>,
+        remote: IpAddr,
+    ) -> Response<Full<Bytes>> {
         if request.method() != Method::POST || request.uri().path() != REPLICATE_PATH {
             let reader = FrameReader::new(request.into_body(), self.options.frame_timeout);
             tokio::spawn(reader.drain(self.options.drain_timeout, self.options.drain_bytes));
@@ -469,7 +485,7 @@ impl<E: Engine + 'static> Inner<E> {
 
     /// Checks one stream, applies it and answers.
     async fn receive<B>(
-        &self,
+        self: &Arc<Self>,
         header: &StreamHeader,
         remote: IpAddr,
         reader: &mut FrameReader<B>,
@@ -629,7 +645,7 @@ impl<E: Engine + 'static> Inner<E> {
 
     /// Writes an accepted stream into a staging file and swaps it in.
     async fn apply<B>(
-        &self,
+        self: &Arc<Self>,
         header: &StreamHeader,
         remote: IpAddr,
         accepted: Accepted,
@@ -640,7 +656,7 @@ impl<E: Engine + 'static> Inner<E> {
         B::Error: std::fmt::Display,
     {
         let Accepted {
-            _guard,
+            _guard: guard,
             mut record,
             size_gb,
         } = accepted;
@@ -741,16 +757,44 @@ impl<E: Engine + 'static> Inner<E> {
             }
             Err(e) => {
                 // The volume file is the old copy or the new one (section
-                // 3.22); which one is found by its hash.
+                // 3.22); which one is found by its hash, which reads the
+                // whole volume. The source gets its answer now, not after
+                // that read; the copy is resolved after the answer, still
+                // under the volume's lock, so a stream that comes before it
+                // is done is refused `busy`.
                 staging.discard().await;
-                if let Err(re) = self.recover(&mut record).await {
-                    warn!(volume_id = %header.volume_id, error = %re, "could not resolve a failed swap");
-                }
                 let reason = format!("could not swap the copy in: {e}");
                 self.set_error(&header.volume_id, Some(&reason)).await;
+                self.resolve_failed_swap(guard, record);
                 Outcome::Failed(reason)
             }
         }
+    }
+
+    /// Resolves the copy of a failed swap in a task of its own, which holds
+    /// the volume's lock until the copy is resolved and published. Nothing
+    /// aborts the task; an agent that stops during the hash leaves the copy
+    /// pending, and the next start or stream resolves it.
+    fn resolve_failed_swap(
+        self: &Arc<Self>,
+        guard: OwnedMutexGuard<()>,
+        mut record: WarmTargetRecord,
+    ) {
+        let inner = Arc::clone(self);
+        tokio::spawn(async move {
+            #[cfg(test)]
+            let gate = inner.recovery_gate.lock().await;
+            if let Err(e) = inner.recover(&mut record).await {
+                warn!(volume_id = %record.volume_id, error = %e, "could not resolve a failed swap");
+            }
+            #[cfg(test)]
+            drop(gate);
+            inner.publish().await;
+            // Only now. A stream that came before was refused `busy`; what
+            // waits for the lock (a `deleted` entry, this node's sender)
+            // finds the copy resolved and published.
+            drop(guard);
+        });
     }
 
     /// The checks of [`Inner::check_entry`] again, against the desired state
@@ -1093,6 +1137,7 @@ impl<E: Engine + 'static> Inner<E> {
     /// Publishes one `status_report.warm` entry per volume this node is the
     /// target of.
     async fn publish(&self) {
+        let _publishing = self.publishing.lock().await;
         let spec = self
             .desired
             .borrow()
