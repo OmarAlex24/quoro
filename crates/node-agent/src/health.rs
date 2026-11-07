@@ -6,10 +6,13 @@
 //! because the only thing that matters is the status code, and a full client
 //! would pull in connection pooling and TLS this path does not need.
 //!
-//! Defaults are the contract's: `path` `/`, `interval_s` 10, `timeout_s` 2 and
-//! `failures` 3. Any status in `200..=399` is a pass.
+//! Defaults are the contract's: `path` `/`, `interval_s` 10, `timeout_s` 2,
+//! `failures` 3, `start_period_s` 30 and `restart` true. Any status in
+//! `200..=399` is a pass.
 
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use quoro_proto::wire::SpecVm;
@@ -24,6 +27,12 @@ pub const DEFAULT_INTERVAL_S: u32 = 10;
 pub const DEFAULT_TIMEOUT_S: u32 = 2;
 /// Default number of consecutive failures before `failing` (section 6.3).
 pub const DEFAULT_FAILURES: u32 = 3;
+/// Default time after a start during which failed probes do not count
+/// (section 6.3, ADR 0184).
+pub const DEFAULT_START_PERIOD_S: u32 = 30;
+/// Whether a VM that stays unhealthy is restarted when the snapshot does not
+/// say (section 6.3, ADR 0184).
+pub const DEFAULT_RESTART: bool = true;
 /// How long after a VM reaches running the first probe runs.
 pub const FIRST_PROBE_DELAY: Duration = Duration::from_secs(1);
 
@@ -42,6 +51,12 @@ pub struct HealthTarget {
     pub timeout: Duration,
     /// Consecutive failures before the app is reported `failing`.
     pub failures: u32,
+    /// Time after each start during which failed probes do not count; zero
+    /// counts every probe.
+    pub start_period: Duration,
+    /// Whether the node restarts the VM after `failures` consecutive
+    /// failures outside the start period, or only reports them.
+    pub restart: bool,
 }
 
 impl HealthTarget {
@@ -81,7 +96,96 @@ impl HealthTarget {
                 .and_then(|check| check.failures)
                 .unwrap_or(DEFAULT_FAILURES)
                 .max(1),
+            start_period: Duration::from_secs(u64::from(
+                check
+                    .and_then(|check| check.start_period_s)
+                    .unwrap_or(DEFAULT_START_PERIOD_S),
+            )),
+            restart: check
+                .and_then(|check| check.restart)
+                .unwrap_or(DEFAULT_RESTART),
         })
+    }
+
+    /// Whether `other` probes the same way: everything but `start_period` and
+    /// `restart`, which only decide what a failure does.
+    #[must_use]
+    pub fn probes_like(&self, other: &Self) -> bool {
+        self.ip == other.ip
+            && self.port == other.port
+            && self.path == other.path
+            && self.interval == other.interval
+            && self.timeout == other.timeout
+            && self.failures == other.failures
+    }
+}
+
+/// The VMs the node paused on purpose (D-0259). A backup's `pause_copy`
+/// snapshot pauses the app's VM for the whole copy, and the engine still
+/// reports a paused VM `running` (`engine-trait.md` section 3.22), so its
+/// health check fails for as long as the pause lasts. While a VM is marked,
+/// its failed probes do not count and it is not restarted for its health;
+/// once it is resumed, its failures count from zero.
+///
+/// The backup manager marks a VM for the length of the snapshot and the
+/// reconciler reads the marks; both hold a clone.
+#[derive(Clone, Debug, Default)]
+pub struct PausedVms {
+    /// A VM's entry stays after its last mark is released: removing it would
+    /// start `pauses` from zero again, and a later count equal to the one the
+    /// reconciler last saw would hide a pause. One small entry per VM ever
+    /// backed up since the agent started.
+    marks: Arc<Mutex<HashMap<String, PauseMark>>>,
+}
+
+/// One VM's pause marks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PauseMark {
+    /// How many pauses mark the VM now; zero when it is not paused.
+    pub held: u32,
+    /// How many times the VM was marked since the agent started. A change
+    /// means it was paused since it was last looked at.
+    pub pauses: u64,
+}
+
+impl PausedVms {
+    /// Marks `vm_id` paused until the returned guard is dropped.
+    #[must_use = "the VM is unmarked as soon as the guard is dropped"]
+    pub fn mark(&self, vm_id: &str) -> PausedGuard {
+        let mut marks = self.lock();
+        let mark = marks.entry(vm_id.to_owned()).or_default();
+        mark.held = mark.held.saturating_add(1);
+        mark.pauses = mark.pauses.saturating_add(1);
+        PausedGuard {
+            paused: self.clone(),
+            vm_id: vm_id.to_owned(),
+        }
+    }
+
+    /// The VM's marks now.
+    #[must_use]
+    pub fn mark_of(&self, vm_id: &str) -> PauseMark {
+        self.lock().get(vm_id).copied().unwrap_or_default()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, PauseMark>> {
+        self.marks.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// A VM's pause mark: unmarks the VM when dropped, also when the task that
+/// holds it is aborted.
+#[derive(Debug)]
+pub struct PausedGuard {
+    paused: PausedVms,
+    vm_id: String,
+}
+
+impl Drop for PausedGuard {
+    fn drop(&mut self) {
+        if let Some(mark) = self.paused.lock().get_mut(&self.vm_id) {
+            mark.held = mark.held.saturating_sub(1);
+        }
     }
 }
 
@@ -185,6 +289,8 @@ mod tests {
         assert_eq!(target.interval, Duration::from_secs(10));
         assert_eq!(target.timeout, Duration::from_secs(2));
         assert_eq!(target.failures, 3);
+        assert_eq!(target.start_period, Duration::from_secs(30));
+        assert!(target.restart, "a snapshot without restart means true");
         assert!(HealthTarget::for_vm(&vm(None, None), Ipv4Addr::LOCALHOST).is_none());
 
         let target = HealthTarget::for_vm(
@@ -206,6 +312,60 @@ mod tests {
         assert_eq!(target.interval, Duration::from_secs(5));
         assert_eq!(target.timeout, Duration::from_secs(1));
         assert_eq!(target.failures, 4);
+        assert_eq!(target.start_period, Duration::from_secs(30));
+        assert!(target.restart);
+
+        let target = HealthTarget::for_vm(
+            &vm(
+                Some(8080),
+                Some(HealthCheck {
+                    path: None,
+                    interval_s: None,
+                    timeout_s: None,
+                    failures: None,
+                    start_period_s: Some(0),
+                    restart: Some(false),
+                }),
+            ),
+            Ipv4Addr::LOCALHOST,
+        )
+        .unwrap();
+        assert_eq!(
+            target.start_period,
+            Duration::ZERO,
+            "zero counts every probe"
+        );
+        assert!(!target.restart);
+    }
+
+    #[test]
+    fn start_period_and_restart_do_not_change_how_the_probe_runs() {
+        let target = HealthTarget::for_vm(&vm(Some(8080), None), Ipv4Addr::LOCALHOST).unwrap();
+        let other = HealthTarget {
+            start_period: Duration::ZERO,
+            restart: false,
+            ..target.clone()
+        };
+        assert!(target.probes_like(&other));
+        let moved = HealthTarget {
+            path: "/other".to_owned(),
+            ..target.clone()
+        };
+        assert!(!target.probes_like(&moved));
+    }
+
+    #[test]
+    fn a_pause_mark_lasts_as_long_as_its_guard_and_is_counted() {
+        let paused = PausedVms::default();
+        assert_eq!(paused.mark_of("vm_1"), PauseMark::default());
+        let first = paused.mark("vm_1");
+        let second = paused.mark("vm_1");
+        assert_eq!(paused.mark_of("vm_1"), PauseMark { held: 2, pauses: 2 });
+        drop(first);
+        assert_eq!(paused.mark_of("vm_1").held, 1);
+        drop(second);
+        assert_eq!(paused.mark_of("vm_1"), PauseMark { held: 0, pauses: 2 });
+        assert_eq!(paused.mark_of("vm_2"), PauseMark::default());
     }
 
     #[test]
@@ -236,6 +396,8 @@ mod tests {
             interval: Duration::from_secs(1),
             timeout: Duration::from_secs(1),
             failures: 1,
+            start_period: Duration::ZERO,
+            restart: true,
         };
         assert_eq!(probe(&target).await, Ok(204));
         server.await.unwrap();

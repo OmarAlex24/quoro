@@ -26,6 +26,7 @@ use crate::build::buildkit::{
 };
 use crate::build::manager::BuildManager;
 use crate::edge::EdgeManager;
+use crate::health::PausedVms;
 use crate::identity::IdentityHandle;
 use crate::ingress::{CertificateEvents, DnsBridge, IngressSupervisor};
 use crate::interactive::Interactive;
@@ -134,7 +135,11 @@ pub async fn run<E: Engine + 'static>(
     // One lock per warm volume, shared by the warm receiver and the
     // reconciler (section 6.13).
     let warm_locks = VolumeLocks::new();
+    // The VMs a backup's `pause_copy` snapshot pauses, marked by the backup
+    // manager and read by the reconciler's health checks (D-0259).
+    let paused = PausedVms::default();
     let reconciler = reconciler
+        .with_paused_vms(paused.clone())
         .with_warm_locks(warm_locks.clone())
         .with_node_id(node_id)
         .with_lease_view(leases.view.clone())
@@ -174,6 +179,7 @@ pub async fn run<E: Engine + 'static>(
         leases.view.clone(),
         cluster_id,
     );
+    let backup_manager = backup_manager.with_paused_vms(paused);
 
     // Warm replication (section 6.13): the receiver holds the copies this
     // node is the target of, and the sender ships the volumes it is the

@@ -37,6 +37,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
+use crate::health::PausedVms;
 use crate::lease::LeaseView;
 use crate::reconcile::Snapshot;
 use crate::store::{BackupRecord, NodeStore, VolumeRecord};
@@ -109,6 +110,9 @@ pub struct BackupManager<E: Engine, R: Repository> {
     /// Task completions; taken by [`BackupManager::run`].
     events: Option<mpsc::UnboundedReceiver<BackupRecord>>,
     done: mpsc::UnboundedSender<BackupRecord>,
+    /// The pause marks shared with the reconciler: a `pause_copy` snapshot
+    /// marks the VM it pauses (D-0259).
+    paused: PausedVms,
 }
 
 impl<E: Engine + 'static, R: Repository> BackupManager<E, R> {
@@ -139,6 +143,7 @@ impl<E: Engine + 'static, R: Repository> BackupManager<E, R> {
                 options: BackupOptions::default(),
                 events: Some(events),
                 done,
+                paused: PausedVms::default(),
             },
             statuses_rx,
         )
@@ -148,6 +153,15 @@ impl<E: Engine + 'static, R: Repository> BackupManager<E, R> {
     #[must_use]
     pub fn with_options(mut self, options: BackupOptions) -> Self {
         self.options = options;
+        self
+    }
+
+    /// Shares the pause marks with the reconciler, so the VM a `pause_copy`
+    /// snapshot pauses is neither counted failing nor restarted for its
+    /// health during the pause (D-0259).
+    #[must_use]
+    pub fn with_paused_vms(mut self, paused: PausedVms) -> Self {
+        self.paused = paused;
         self
     }
 
@@ -362,6 +376,7 @@ impl<E: Engine + 'static, R: Repository> BackupManager<E, R> {
                 cluster_id: self.cluster_id.clone(),
                 options: self.options.clone(),
                 done: self.done.clone(),
+                paused: self.paused.clone(),
             },
             self.lease.clone(),
             job.clone(),
@@ -468,6 +483,8 @@ struct JobContext<E: Engine, R: Repository> {
     cluster_id: String,
     options: BackupOptions,
     done: mpsc::UnboundedSender<BackupRecord>,
+    /// The pause marks shared with the reconciler (D-0259).
+    paused: PausedVms,
 }
 
 /// One backup job: check the lease, snapshot, chunk, upload, write the
@@ -485,6 +502,7 @@ async fn run_job<E: Engine, R: Repository>(
         cluster_id,
         options,
         done,
+        paused,
     } = context;
     let mut record = BackupRecord {
         backup_id: job.backup_id.clone(),
@@ -552,11 +570,24 @@ async fn run_job<E: Engine, R: Repository>(
     };
 
     // Section 7.1 step 3: take the snapshot, then report `running` with its
-    // method and, for `pause_copy`, the pause.
-    let snapshot = match engine
+    // method and, for `pause_copy`, the pause. A `pause_copy` snapshot pauses
+    // the app's VM on this node (`vm_id`) for the whole copy while the engine
+    // still reports it running, so the VM is marked for that time: its health
+    // check neither counts the pause nor restarts it (D-0259).
+    let mark = match &job.vm_id {
+        Some(vm_id)
+            if engine.capabilities().await.volume_snapshot_method
+                == Some(SnapshotMethod::PauseCopy) =>
+        {
+            Some(paused.mark(vm_id))
+        }
+        _ => None,
+    };
+    let snapshot = engine
         .snapshot_volume(&VolumeId(job.volume_id.clone()))
-        .await
-    {
+        .await;
+    drop(mark);
+    let snapshot = match snapshot {
         Ok(snapshot) => snapshot,
         Err(e) => {
             finish_failed(
@@ -906,6 +937,7 @@ mod tests {
     use tokio::time::{Duration, sleep, timeout};
 
     use super::*;
+    use crate::health::PauseMark;
     use crate::lease::LeaseTable;
 
     /// One gibibyte, the size a `vol_` file has in these tests.
@@ -1286,6 +1318,251 @@ mod tests {
         let status = wait_backup(&mut statuses, "bkp_1").await;
         handle.abort();
         (dir, keys, memory, repo, status)
+    }
+
+    /// The fake engine, which also records `vm_1`'s pause marks at the
+    /// moment the backup manager takes a snapshot. The manager calls nothing
+    /// else of the engine for a backup.
+    struct MarkSpy {
+        fake: Arc<FakeEngine>,
+        paused: PausedVms,
+        at_snapshot: std::sync::Mutex<Option<PauseMark>>,
+    }
+
+    impl Engine for MarkSpy {
+        async fn capabilities(&self) -> quoro_engine::Capabilities {
+            self.fake.capabilities().await
+        }
+
+        async fn snapshot_volume(
+            &self,
+            id: &VolumeId,
+        ) -> Result<VolumeSnapshot, quoro_engine::EngineError> {
+            *self.at_snapshot.lock().unwrap() = Some(self.paused.mark_of("vm_1"));
+            self.fake.snapshot_volume(id).await
+        }
+
+        async fn delete_volume_snapshot(
+            &self,
+            snap: &VolumeSnapshot,
+        ) -> Result<(), quoro_engine::EngineError> {
+            self.fake.delete_volume_snapshot(snap).await
+        }
+
+        async fn probe_host(&self) -> Result<quoro_engine::HostProbe, quoro_engine::EngineError> {
+            unimplemented!("not used by a backup")
+        }
+
+        async fn ensure_network(
+            &self,
+            _net: &quoro_engine::NodeNetwork,
+        ) -> Result<(), quoro_engine::EngineError> {
+            unimplemented!("not used by a backup")
+        }
+
+        async fn prepare_image(
+            &self,
+            _image: &quoro_engine::ImageRef,
+        ) -> Result<quoro_engine::PreparedImage, quoro_engine::EngineError> {
+            unimplemented!("not used by a backup")
+        }
+
+        async fn remove_image(
+            &self,
+            _digest: &quoro_engine::ImageDigest,
+        ) -> Result<(), quoro_engine::EngineError> {
+            unimplemented!("not used by a backup")
+        }
+
+        async fn create(
+            &self,
+            _spec: &quoro_engine::VmSpec,
+        ) -> Result<quoro_engine::VmInfo, quoro_engine::EngineError> {
+            unimplemented!("not used by a backup")
+        }
+
+        async fn start(
+            &self,
+            _id: &quoro_engine::VmId,
+            _within: Duration,
+        ) -> Result<quoro_engine::VmInfo, quoro_engine::EngineError> {
+            unimplemented!("not used by a backup")
+        }
+
+        async fn stop(
+            &self,
+            _id: &quoro_engine::VmId,
+            _mode: quoro_engine::StopMode,
+        ) -> Result<quoro_engine::VmInfo, quoro_engine::EngineError> {
+            unimplemented!("not used by a backup")
+        }
+
+        async fn delete(&self, _id: &quoro_engine::VmId) -> Result<(), quoro_engine::EngineError> {
+            unimplemented!("not used by a backup")
+        }
+
+        async fn inspect(
+            &self,
+            _id: &quoro_engine::VmId,
+        ) -> Result<quoro_engine::VmInfo, quoro_engine::EngineError> {
+            unimplemented!("not used by a backup")
+        }
+
+        async fn list(&self) -> Result<Vec<quoro_engine::VmInfo>, quoro_engine::EngineError> {
+            unimplemented!("not used by a backup")
+        }
+
+        fn events(&self) -> quoro_engine::EventStream {
+            unimplemented!("not used by a backup")
+        }
+
+        fn output(
+            &self,
+            _id: &quoro_engine::VmId,
+        ) -> Result<quoro_engine::LineStream, quoro_engine::EngineError> {
+            unimplemented!("not used by a backup")
+        }
+
+        fn console(
+            &self,
+            _id: &quoro_engine::VmId,
+        ) -> Result<quoro_engine::ConsoleStream, quoro_engine::EngineError> {
+            unimplemented!("not used by a backup")
+        }
+
+        async fn counters(
+            &self,
+            _id: &quoro_engine::VmId,
+        ) -> Result<quoro_engine::VmCounters, quoro_engine::EngineError> {
+            unimplemented!("not used by a backup")
+        }
+    }
+
+    /// How one backup of `vol_1` went for the pause marks of `vm_1`.
+    #[derive(Debug)]
+    struct MarkRun {
+        status: BackupState,
+        at_snapshot: Option<PauseMark>,
+        after: PauseMark,
+    }
+
+    /// Runs one backup of `vol_1` for the VM `vm_id` with `method`, its
+    /// snapshot failing when `fail` is set.
+    async fn marks_of_a_backup(
+        name: &str,
+        method: SnapshotMethod,
+        vm_id: Option<&str>,
+        fail: bool,
+    ) -> MarkRun {
+        let dir = TestDir::new(name);
+        let store = NodeStore::open(dir.path()).await.unwrap();
+        let volumes = dir.path().join("volumes");
+        std::fs::create_dir_all(&volumes).unwrap();
+        let fake = Arc::new(FakeEngine::new());
+        fake.set_volume_dir(&volumes);
+        fake.set_snapshot_method(method, Duration::from_millis(50));
+        fake.ensure_volume(&VolumeId("vol_1".to_owned()), 1)
+            .await
+            .unwrap();
+        seed_volume(&volumes.join("vol_1"), &[(0, 1 << 20)]);
+        ready_volume(&store, "vol_1").await;
+        if fail {
+            fake.fail_next(
+                quoro_engine::fake::FakeOp::SnapshotVolume,
+                quoro_engine::EngineError::Io("the copy failed".to_owned()),
+            );
+        }
+
+        let keys = keys_for("app_1");
+        let paused = PausedVms::default();
+        let engine = Arc::new(MarkSpy {
+            fake,
+            paused: paused.clone(),
+            at_snapshot: std::sync::Mutex::new(None),
+        });
+        let (manager, mut statuses) = BackupManager::new(
+            Arc::clone(&engine),
+            store,
+            Arc::new(SharedStore(Arc::new(MemoryStore::new()))),
+            lease_view(7),
+            "cls_1".to_owned(),
+        );
+        let manager = manager
+            .with_options(BackupOptions::quick())
+            .with_paused_vms(paused.clone());
+        let backup = SpecBackup {
+            vm_id: vm_id.map(str::to_owned),
+            ..job("bkp_1", "vol_1", &keys, 7)
+        };
+        let (_tx, rx) = watch::channel(Some(snapshot(
+            vec![present("vol_1", None)],
+            vec![backup],
+            Some(repository(&format!("tests/{name}"))),
+        )));
+        let handle = tokio::spawn(manager.run(rx, std::future::pending::<()>()));
+        let status = wait_backup(&mut statuses, "bkp_1").await;
+        handle.abort();
+        let at_snapshot = *engine.at_snapshot.lock().unwrap();
+        MarkRun {
+            status: status.status,
+            at_snapshot,
+            after: paused.mark_of("vm_1"),
+        }
+    }
+
+    /// D-0259: a `pause_copy` snapshot marks the job's VM, which it pauses,
+    /// for the snapshot and no longer; a reflink snapshot pauses nothing and
+    /// marks nothing.
+    #[tokio::test]
+    async fn a_pause_copy_snapshot_marks_the_vm_it_pauses_for_the_snapshot_only() {
+        let run = marks_of_a_backup(
+            "backup-pause-mark",
+            SnapshotMethod::PauseCopy,
+            Some("vm_1"),
+            false,
+        )
+        .await;
+        assert_eq!(run.status, BackupState::Succeeded, "{run:?}");
+        assert_eq!(run.at_snapshot, Some(PauseMark { held: 1, pauses: 1 }));
+        assert_eq!(run.after, PauseMark { held: 0, pauses: 1 });
+
+        let run = marks_of_a_backup(
+            "backup-reflink-mark",
+            SnapshotMethod::Reflink,
+            Some("vm_1"),
+            false,
+        )
+        .await;
+        assert_eq!(run.status, BackupState::Succeeded, "{run:?}");
+        assert_eq!(run.at_snapshot, Some(PauseMark::default()));
+        assert_eq!(run.after, PauseMark::default());
+    }
+
+    /// D-0259: a snapshot that fails releases the mark like one that
+    /// succeeds, so a failed backup leaves no VM marked.
+    #[tokio::test]
+    async fn a_failed_pause_copy_snapshot_releases_the_mark() {
+        let run = marks_of_a_backup(
+            "backup-failed-pause-mark",
+            SnapshotMethod::PauseCopy,
+            Some("vm_1"),
+            true,
+        )
+        .await;
+        assert_eq!(run.status, BackupState::Failed, "{run:?}");
+        assert_eq!(run.at_snapshot, Some(PauseMark { held: 1, pauses: 1 }));
+        assert_eq!(run.after, PauseMark { held: 0, pauses: 1 });
+    }
+
+    /// Section 5.11: a job without `vm_id` has no VM on this node to pause,
+    /// so nothing is marked.
+    #[tokio::test]
+    async fn a_pause_copy_snapshot_without_a_vm_marks_nothing() {
+        let run =
+            marks_of_a_backup("backup-no-vm-mark", SnapshotMethod::PauseCopy, None, false).await;
+        assert_eq!(run.status, BackupState::Succeeded, "{run:?}");
+        assert_eq!(run.at_snapshot, Some(PauseMark::default()));
+        assert_eq!(run.after, PauseMark::default());
     }
 
     #[tokio::test]
