@@ -19,7 +19,7 @@ async fn lease(
     let node_id = quoro_control_plane::driver::register_local_node(
         &server.state.store,
         &LocalNode {
-            name: format!("node-{}", &id[4..10].to_lowercase()),
+            name: format!("node-{}", id[4..10].to_lowercase()),
             capacity: Capacity {
                 cpus: 2,
                 memory_mb: 2048,

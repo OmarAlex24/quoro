@@ -7,8 +7,9 @@
 //!   current holder, on the primary's own monotonic clock. A shorter grant
 //!   after a longer one never brings it forward. The primary grants the lease
 //!   with a new token, to another node or to the same one after expiry or
-//!   revoke, only once the gate has passed; renewals by the current holder are
-//!   not gated.
+//!   revoke, `expiring` or `local`, only once the gate has passed
+//!   ([`Authority::record_grant`], [`Authority::record_local_grant`]);
+//!   renewals by the current holder are not gated.
 //! - **The restart rule.** No monotonic time survives a restart: at start
 //!   every `expiring` lease counts as granted at that moment for its stored
 //!   `leases.duration_ms`, the longest duration the primary may have granted.
@@ -17,6 +18,15 @@
 //!   `max_lease_ms` is at least `d` (section 8.8). The support accounting is
 //!   not built yet, so every build refuses ([`NoVoterSupport`]); tests set
 //!   their own.
+//!
+//! A grant is checked and recorded in one step, under one lock, before it
+//! goes out: [`Authority::record_grant`] refuses it, or counts its gate from
+//! the authority's clock at that moment. The caller does that inside the
+//! single-writer transaction that raises the stored duration
+//! ([`crate::leases::raise_duration`]), commits that transaction, and only
+//! then sends the grant. A lowering checks [`Authority::may_lower`] inside its
+//! own single-writer transaction ([`crate::leases::lower_duration`]), so a
+//! longer grant and a lowering never interleave.
 //!
 //! All of it is in memory only, and nothing here writes the database:
 //! renewals change no state and append no change-log entry. The API's
@@ -35,6 +45,9 @@ use crate::store::format_rfc3339;
 
 /// The longest `duration_ms` a grant may carry (section 5.12).
 pub const MAX_DURATION_MS: u64 = 600_000;
+
+/// The shortest `duration_ms` the authority grants (section 8.4).
+pub const MIN_DURATION_MS: u64 = 3_000;
 
 /// `D`, the duration of an `expiring` grant outside a maintenance window
 /// (section 8.4, ADR 0171).
@@ -123,23 +136,34 @@ impl VoterSupport for NoVoterSupport {
     }
 }
 
-/// One `expiring` grant the primary is about to send.
+/// What an `expiring` grant is to the lease.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrantKind {
+    /// A grant with a new token, to another node or to the same one after
+    /// expiry or revoke: gated (section 8.4).
+    NewToken,
+    /// The answer to a renewal by the lease's current holder (`re` set): not
+    /// gated.
+    Renewal,
+}
+
+/// One `expiring` grant the primary is about to send. Its `T_grant` is the
+/// authority's clock when [`Authority::record_grant`] records it.
 #[derive(Debug)]
 pub struct Grant<'a> {
     pub lease_id: &'a str,
     pub holder: &'a str,
     pub duration_ms: u64,
-    /// `T_grant`: the authority's clock when the grant goes out, read by the
-    /// caller in the step that sends it ([`Authority::now`]).
-    pub sent: Duration,
-    /// The wall-clock time of the grant, its `granted_at`.
+    pub kind: GrantKind,
+    /// The wall-clock time of the grant, for the API's view only
+    /// ([`LeaseTimes`]). Nothing decides on it.
     pub sent_wall: time::OffsetDateTime,
-    /// Whether the grant answers a renewal (`re` set), for `renewed_at`.
-    pub renewal: bool,
 }
 
 /// The primary's in-memory view of an `expiring` lease (`openapi.yaml`,
-/// `Lease`).
+/// `Lease`). Wall-clock times, for display: after a restart `gate_at` shows
+/// only the gates of this process's grants, not the restart rule's, so no
+/// decision reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LeaseTimes {
     /// When the primary last answered a renewal.
@@ -150,12 +174,20 @@ pub struct LeaseTimes {
     pub gate_at: String,
 }
 
-/// Why a grant to a new holder was not recorded: the current holder's gate is
-/// still open.
+/// Why a grant was not recorded, so must not be sent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GateOpen {
-    /// How long until the gate passes.
-    pub remaining: Duration,
+pub enum Refused {
+    /// A new token while the lease's gate is open (section 8.4).
+    GateOpen {
+        /// How long until the gate passes.
+        remaining: Duration,
+    },
+    /// No majority of voters supports a grant this long (section 8.8).
+    NoSupport,
+    /// A duration outside 3 000 to 600 000 ms (sections 5.12 and 8.4).
+    Duration(u64),
+    /// A renewal answer to a node that is not the lease's current holder.
+    NotHolder,
 }
 
 /// The gate of one lease.
@@ -242,11 +274,22 @@ impl Authority {
     /// `holder` as its last holder, counts as granted now for
     /// `duration_ms`, the longest duration this primary may have granted. A
     /// revoked lease counts too: a lost holder's lease keeps its gate
-    /// (section 8.3, ADR 0202). A missing or invalid duration counts as
-    /// [`MAX_DURATION_MS`]. The view stays empty until the next grant.
+    /// (section 8.3, ADR 0202). A missing duration, or one below
+    /// [`MIN_DURATION_MS`], counts as [`MAX_DURATION_MS`]; one above it counts
+    /// as stored. Either way the gate is no shorter than the stored value's.
+    /// The view stays empty until the next grant.
     pub fn seed(&self, lease_id: &str, holder: &str, duration_ms: Option<i64>) {
-        let duration_ms = match duration_ms.and_then(|d| u64::try_from(d).ok()) {
-            Some(d) if (1..=MAX_DURATION_MS).contains(&d) => d,
+        let stored = duration_ms.and_then(|d| u64::try_from(d).ok());
+        let duration_ms = match stored {
+            Some(d) if (MIN_DURATION_MS..=MAX_DURATION_MS).contains(&d) => d,
+            Some(d) if d > MAX_DURATION_MS => {
+                tracing::warn!(
+                    lease_id,
+                    duration_ms = d,
+                    "an expiring lease stores a duration above the longest; its gate counts it"
+                );
+                d
+            }
             _ => {
                 tracing::warn!(
                     lease_id,
@@ -267,50 +310,75 @@ impl Authority {
         );
     }
 
-    /// Records an `expiring` grant before it goes out. A grant to the
-    /// lease's current holder raises its gate when it ends later, and never
-    /// brings it forward. A grant to another holder starts a new gate, and is
-    /// refused while the current holder's gate is open: no lease goes to a
-    /// new holder before the old one has fenced (section 8.4).
-    pub fn record_grant(&self, grant: &Grant<'_>) -> Result<(), GateOpen> {
-        let now = self.now();
+    /// Checks an `expiring` grant and records it, before it goes out, with
+    /// `T_grant` the authority's clock now. Refused, it must not be sent:
+    ///
+    /// - a duration outside 3 000 to 600 000 ms;
+    /// - no majority support for the duration (section 8.8);
+    /// - a [`GrantKind::NewToken`] while the lease's gate is open, whatever
+    ///   the holder (section 8.4);
+    /// - a [`GrantKind::Renewal`] to a node that is not the current holder.
+    ///
+    /// A new token starts the holder's gate afresh. A renewal answer raises
+    /// the gate when it ends later, and never brings it forward. A renewal of
+    /// a lease with no gate starts one: a converted lease gets its first gate
+    /// from the first answer (ADR 0254; conversions are not built yet).
+    ///
+    /// # Errors
+    ///
+    /// Why the grant was refused ([`Refused`]).
+    pub fn record_grant(&self, grant: &Grant<'_>) -> Result<(), Refused> {
+        if !(MIN_DURATION_MS..=MAX_DURATION_MS).contains(&grant.duration_ms) {
+            return Err(Refused::Duration(grant.duration_ms));
+        }
+        if !self.supports(grant.duration_ms) {
+            return Err(Refused::NoSupport);
+        }
         let after = gate_after(grant.duration_ms);
-        let gate_mono = grant.sent + after;
         let gate_wall = grant.sent_wall + after;
         let expires_wall = grant.sent_wall + Duration::from_millis(grant.duration_ms);
         let mut gates = self.gates();
-        if let Some(current) = gates.get(grant.lease_id)
-            && current.holder != grant.holder
-        {
-            let open = current.gate();
-            if now < open {
-                return Err(GateOpen {
-                    remaining: open - now,
-                });
+        let now = self.now();
+        let current = gates.get(grant.lease_id);
+        match grant.kind {
+            GrantKind::NewToken => {
+                if let Some(current) = current {
+                    let open = current.gate();
+                    if now < open {
+                        return Err(Refused::GateOpen {
+                            remaining: open - now,
+                        });
+                    }
+                }
+                gates.insert(
+                    grant.lease_id.to_string(),
+                    Gate {
+                        holder: grant.holder.to_string(),
+                        by_duration: BTreeMap::new(),
+                        times: None,
+                    },
+                );
+            }
+            GrantKind::Renewal => {
+                if current.is_some_and(|current| current.holder != grant.holder) {
+                    return Err(Refused::NotHolder);
+                }
             }
         }
         let entry = gates
             .entry(grant.lease_id.to_string())
-            .and_modify(|gate| {
-                if gate.holder != grant.holder {
-                    *gate = Gate {
-                        holder: grant.holder.to_string(),
-                        by_duration: BTreeMap::new(),
-                        times: None,
-                    };
-                }
-            })
             .or_insert_with(|| Gate {
                 holder: grant.holder.to_string(),
                 by_duration: BTreeMap::new(),
                 times: None,
             });
+        let gate_mono = now + after;
         let slot = entry
             .by_duration
             .entry(grant.duration_ms)
             .or_insert(gate_mono);
         *slot = (*slot).max(gate_mono);
-        let renewed_at = if grant.renewal {
+        let renewed_at = if grant.kind == GrantKind::Renewal {
             Some(grant.sent_wall)
         } else {
             entry.times.as_ref().and_then(|times| times.renewed_at)
@@ -327,6 +395,28 @@ impl Authority {
         Ok(())
     }
 
+    /// Checks a `local` grant of `lease_id` with a new token, before it goes
+    /// out: refused while the lease's gate is open, whatever the holder
+    /// (section 8.4, ADR 0258). Allowed, the lease's gate is dropped: a
+    /// `local` lease has none.
+    ///
+    /// # Errors
+    ///
+    /// [`Refused::GateOpen`] with the time until the gate passes.
+    pub fn record_local_grant(&self, lease_id: &str) -> Result<(), Refused> {
+        let mut gates = self.gates();
+        let now = self.now();
+        if let Some(open) = gates.get(lease_id).map(Gate::gate)
+            && now < open
+        {
+            return Err(Refused::GateOpen {
+                remaining: open - now,
+            });
+        }
+        gates.remove(lease_id);
+        Ok(())
+    }
+
     /// Whether `lease_id` may be granted with a new token: its holder's gate
     /// has passed, or the lease has none (it was never `expiring` in this
     /// process or at its start).
@@ -340,7 +430,10 @@ impl Authority {
 
     /// Whether the stored `duration_ms` of `lease_id` may be lowered to
     /// `to_ms`: the gate of every grant longer than that has passed (ADR
-    /// 0203).
+    /// 0203). A lease with no gate had no `expiring` grant in this process
+    /// and was not `expiring` at its start, so none is running; a conversion
+    /// grant (ADR 0254, not built yet) must add its duration here before it
+    /// is sent.
     #[must_use]
     pub fn may_lower(&self, lease_id: &str, to_ms: u64) -> bool {
         let now = self.now();
@@ -370,34 +463,44 @@ mod tests {
     use super::*;
 
     const D: u64 = DEFAULT_DURATION_MS;
+    const NEW: GrantKind = GrantKind::NewToken;
+    const RENEWAL: GrantKind = GrantKind::Renewal;
 
+    #[derive(Debug)]
+    struct UpTo(u64);
+
+    impl VoterSupport for UpTo {
+        fn supports(&self, duration_ms: u64) -> bool {
+            duration_ms <= self.0
+        }
+    }
+
+    /// An authority on a manual clock, supported for every duration.
     fn authority() -> (Authority, Arc<ManualClock>) {
         let clock = Arc::new(ManualClock::default());
-        (
-            Authority::new(Arc::clone(&clock) as Arc<dyn MonotonicClock>),
-            clock,
-        )
+        let authority = Authority::new(Arc::clone(&clock) as Arc<dyn MonotonicClock>);
+        authority.set_support(Arc::new(UpTo(MAX_DURATION_MS)));
+        (authority, clock)
     }
 
     fn wall(seconds: i64) -> time::OffsetDateTime {
         time::OffsetDateTime::from_unix_timestamp(1_800_000_000 + seconds).unwrap()
     }
 
-    fn grant<'a>(
-        authority: &Authority,
-        holder: &'a str,
-        duration_ms: u64,
-        renewal: bool,
-        wall_s: i64,
-    ) -> Grant<'a> {
+    fn grant(holder: &str, duration_ms: u64, kind: GrantKind, wall_s: i64) -> Grant<'_> {
         Grant {
             lease_id: "lse_a",
             holder,
             duration_ms,
-            sent: authority.now(),
+            kind,
             sent_wall: wall(wall_s),
-            renewal,
         }
+    }
+
+    fn gate_open(seconds: u64) -> Result<(), Refused> {
+        Err(Refused::GateOpen {
+            remaining: Duration::from_secs(seconds),
+        })
     }
 
     #[test]
@@ -411,9 +514,7 @@ mod tests {
     #[test]
     fn a_grant_opens_its_gate_after_its_duration_and_two_margins() {
         let (authority, clock) = authority();
-        authority
-            .record_grant(&grant(&authority, "nod_a", D, false, 0))
-            .unwrap();
+        authority.record_grant(&grant("nod_a", D, NEW, 0)).unwrap();
         assert!(!authority.passed("lse_a"));
         clock.advance(Duration::from_millis(17_999));
         assert!(!authority.passed("lse_a"));
@@ -428,11 +529,11 @@ mod tests {
     fn a_shorter_grant_after_a_longer_one_keeps_the_gate() {
         let (authority, clock) = authority();
         authority
-            .record_grant(&grant(&authority, "nod_a", 180_000, false, 0))
+            .record_grant(&grant("nod_a", 180_000, NEW, 0))
             .unwrap();
         clock.advance(Duration::from_secs(1));
         authority
-            .record_grant(&grant(&authority, "nod_a", D, true, 1))
+            .record_grant(&grant("nod_a", D, RENEWAL, 1))
             .unwrap();
         // 180 s + 2 x 18 s from the first grant.
         clock.advance(Duration::from_secs(214));
@@ -441,7 +542,7 @@ mod tests {
         assert!(authority.passed("lse_a"));
 
         authority
-            .record_grant(&grant(&authority, "nod_a", D, true, 216))
+            .record_grant(&grant("nod_a", D, RENEWAL, 216))
             .unwrap();
         clock.advance(Duration::from_millis(17_999));
         assert!(!authority.passed("lse_a"));
@@ -452,31 +553,73 @@ mod tests {
     #[test]
     fn a_new_holder_waits_for_the_old_holders_gate() {
         let (authority, clock) = authority();
+        authority.record_grant(&grant("nod_a", D, NEW, 0)).unwrap();
         authority
-            .record_grant(&grant(&authority, "nod_a", D, false, 0))
-            .unwrap();
-        authority
-            .record_grant(&grant(&authority, "nod_a", D, true, 0))
+            .record_grant(&grant("nod_a", D, RENEWAL, 0))
             .unwrap();
         clock.advance(Duration::from_secs(10));
         assert_eq!(
-            authority.record_grant(&grant(&authority, "nod_b", D, false, 10)),
-            Err(GateOpen {
-                remaining: Duration::from_secs(8)
-            })
+            authority.record_grant(&grant("nod_b", D, NEW, 10)),
+            gate_open(8)
         );
         clock.advance(Duration::from_secs(8));
-        authority
-            .record_grant(&grant(&authority, "nod_b", D, false, 18))
-            .unwrap();
+        authority.record_grant(&grant("nod_b", D, NEW, 18)).unwrap();
         // The new holder's gate starts at its own grant.
         assert!(!authority.passed("lse_a"));
         assert_eq!(
-            authority.record_grant(&grant(&authority, "nod_a", D, false, 18)),
-            Err(GateOpen {
-                remaining: Duration::from_secs(18)
-            })
+            authority.record_grant(&grant("nod_a", D, NEW, 18)),
+            gate_open(18)
         );
+        assert_eq!(
+            authority.record_grant(&grant("nod_a", D, RENEWAL, 18)),
+            Err(Refused::NotHolder),
+            "the old holder's renewal is not answered"
+        );
+    }
+
+    /// Section 8.4: a new token to the same node after expiry or revoke, and
+    /// a `local` grant with a new token (ADR 0258), wait for the gate too.
+    #[test]
+    fn a_new_token_to_the_same_holder_or_a_local_grant_waits_for_the_gate() {
+        let (authority, clock) = authority();
+        authority.record_grant(&grant("nod_a", D, NEW, 0)).unwrap();
+        clock.advance(Duration::from_secs(10));
+        assert_eq!(
+            authority.record_grant(&grant("nod_a", D, NEW, 10)),
+            gate_open(8)
+        );
+        assert_eq!(authority.record_local_grant("lse_a"), gate_open(8));
+        clock.advance(Duration::from_secs(8));
+        authority.record_local_grant("lse_a").unwrap();
+        assert!(authority.passed("lse_a"));
+        assert_eq!(authority.view("lse_a"), None, "a local lease has no gate");
+        authority.record_local_grant("lse_other").unwrap();
+    }
+
+    /// A grant is refused, and records nothing, without majority support for
+    /// its duration or outside 3 000 to 600 000 ms.
+    #[test]
+    fn a_grant_needs_support_and_a_duration_in_range() {
+        let (authority, _) = authority();
+        authority.set_support(Arc::new(UpTo(D)));
+        assert_eq!(
+            authority.record_grant(&grant("nod_a", D + 1, NEW, 0)),
+            Err(Refused::NoSupport)
+        );
+        assert_eq!(
+            authority.record_grant(&grant("nod_a", 2_999, NEW, 0)),
+            Err(Refused::Duration(2_999))
+        );
+        authority.set_support(Arc::new(UpTo(u64::MAX)));
+        assert_eq!(
+            authority.record_grant(&grant("nod_a", 600_001, NEW, 0)),
+            Err(Refused::Duration(600_001))
+        );
+        assert!(authority.passed("lse_a"));
+        assert_eq!(authority.view("lse_a"), None);
+        authority
+            .record_grant(&grant("nod_a", MIN_DURATION_MS, NEW, 0))
+            .unwrap();
     }
 
     /// The restart rule: every `expiring` lease, revoked or not, counts as
@@ -488,22 +631,33 @@ mod tests {
         clock.advance(Duration::from_secs(100));
         authority.seed("lse_a", "nod_a", Some(15_000));
         authority.seed("lse_b", "nod_a", None);
+        authority.seed("lse_c", "nod_a", Some(2_999));
+        authority.seed("lse_d", "nod_a", Some(1_200_000));
         assert!(!authority.passed("lse_a"));
         assert_eq!(authority.view("lse_a"), None);
         assert_eq!(
-            authority.record_grant(&grant(&authority, "nod_b", D, false, 0)),
-            Err(GateOpen {
-                remaining: Duration::from_secs(18)
-            })
+            authority.record_grant(&grant("nod_b", D, NEW, 0)),
+            gate_open(18)
         );
         clock.advance(Duration::from_secs(18));
         assert!(authority.passed("lse_a"));
         // No valid duration counts as the longest: 600 s + 2 x 60 s.
-        assert!(!authority.passed("lse_b"));
+        for lease in ["lse_b", "lse_c"] {
+            assert!(!authority.passed(lease));
+        }
         clock.advance(Duration::from_secs(720 - 18 - 1));
-        assert!(!authority.passed("lse_b"));
+        for lease in ["lse_b", "lse_c"] {
+            assert!(!authority.passed(lease));
+        }
         clock.advance(Duration::from_secs(1));
-        assert!(authority.passed("lse_b"));
+        for lease in ["lse_b", "lse_c"] {
+            assert!(authority.passed(lease));
+        }
+        // One above the longest counts as stored: 1 200 s + 2 x 120 s.
+        clock.advance(Duration::from_secs(1_440 - 720 - 1));
+        assert!(!authority.passed("lse_d"));
+        clock.advance(Duration::from_secs(1));
+        assert!(authority.passed("lse_d"));
     }
 
     /// ADR 0203: the stored duration is lowered only once every longer
@@ -513,10 +667,10 @@ mod tests {
         let (authority, clock) = authority();
         assert!(authority.may_lower("lse_a", D));
         authority
-            .record_grant(&grant(&authority, "nod_a", 180_000, false, 0))
+            .record_grant(&grant("nod_a", 180_000, NEW, 0))
             .unwrap();
         authority
-            .record_grant(&grant(&authority, "nod_a", D, true, 0))
+            .record_grant(&grant("nod_a", D, RENEWAL, 0))
             .unwrap();
         assert!(!authority.may_lower("lse_a", D));
         assert!(authority.may_lower("lse_a", 180_000));
@@ -532,7 +686,7 @@ mod tests {
     fn the_view_shows_the_last_grant_and_the_latest_gate() {
         let (authority, clock) = authority();
         authority
-            .record_grant(&grant(&authority, "nod_a", 180_000, false, 0))
+            .record_grant(&grant("nod_a", 180_000, NEW, 0))
             .unwrap();
         let first = authority.view("lse_a").unwrap();
         assert_eq!(first.renewed_at, None);
@@ -540,7 +694,7 @@ mod tests {
         assert_eq!(first.gate_at, format_rfc3339(wall(216)));
         clock.advance(Duration::from_secs(5));
         authority
-            .record_grant(&grant(&authority, "nod_a", D, true, 5))
+            .record_grant(&grant("nod_a", D, RENEWAL, 5))
             .unwrap();
         let second = authority.view("lse_a").unwrap();
         assert_eq!(second.renewed_at, Some(format_rfc3339(wall(5))));
@@ -548,19 +702,16 @@ mod tests {
         assert_eq!(second.gate_at, format_rfc3339(wall(216)));
     }
 
-    /// Section 8.8: no build counts voter support yet, so none is held; a
-    /// test can set its own.
+    /// Section 8.8: no build counts voter support yet, so none is held and
+    /// every grant is refused; a test can set its own.
     #[test]
     fn no_support_is_held_until_a_test_sets_it() {
-        #[derive(Debug)]
-        struct UpTo(u64);
-        impl VoterSupport for UpTo {
-            fn supports(&self, duration_ms: u64) -> bool {
-                duration_ms <= self.0
-            }
-        }
-        let (authority, _) = authority();
+        let authority = Authority::new(Arc::new(ManualClock::default()));
         assert!(!authority.supports(D));
+        assert_eq!(
+            authority.record_grant(&grant("nod_a", D, NEW, 0)),
+            Err(Refused::NoSupport)
+        );
         authority.set_support(Arc::new(UpTo(D)));
         assert!(authority.supports(D));
         assert!(!authority.supports(D + 1));
