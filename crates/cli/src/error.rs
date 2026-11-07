@@ -22,7 +22,8 @@ use std::io::Write;
 pub mod exit {
     /// Success.
     pub const OK: u8 = 0;
-    /// Any other failure: unauthenticated, invalid input, a local file.
+    /// Any other failure: unauthenticated, invalid input, a local file, and
+    /// a build `quoro up` followed that failed or was cancelled.
     pub const OTHER: u8 = 1;
     /// A command line, a context or a request body the client refused.
     pub const USAGE: u8 = 2;
