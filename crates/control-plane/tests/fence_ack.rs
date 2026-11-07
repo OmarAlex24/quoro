@@ -24,6 +24,7 @@ type Socket = WebSocketStream<TcpStream>;
 const IMAGE: &str =
     "ghcr.io/example/web@sha256:0000000000000000000000000000000000000000000000000000000000000000";
 const UNKNOWN_LEASE: &str = "lse_01JC9Z6Q5W8N3K4T7R2M1XHB0D";
+const OTHER_LEASE: &str = "lse_01JC9Z6Q5W8N3K4T7R2M1XHB0E";
 
 struct Enrolled {
     node_id: String,
@@ -605,7 +606,14 @@ async fn a_failed_fence_is_listed_and_a_human_acknowledgement_reaches_the_node()
     let command = of_type(&frames, "command")[0];
     assert_eq!(command["body"]["kind"], "fence_ack", "{command}");
     assert_eq!(command["body"]["params"]["lease_ids"], json!([lease_id]));
-    assert!(fence_ack_pending(&server, &node_id).await.is_some());
+    // ADR 0245: with the token after the increment, so the node clears only
+    // the failed fences below it.
+    assert_eq!(
+        command["body"]["params"]["fencing_tokens"],
+        json!({ lease_id.as_str(): 2 })
+    );
+    let pending = fence_ack_pending(&server, &node_id).await.expect("pending");
+    assert_eq!(pending["fencing_tokens"], json!({ lease_id.as_str(): 2 }));
     reply(
         &mut socket,
         ok_result(),
@@ -724,6 +732,11 @@ async fn a_pending_fence_ack_goes_out_once_the_revokes_are_answered() {
     let command = of_type(&frames, "command")[0].clone();
     assert_eq!(command["body"]["kind"], "fence_ack");
     assert_eq!(command["body"]["params"]["lease_ids"], json!([lease_id]));
+    assert_eq!(
+        command["body"]["params"]["fencing_tokens"],
+        json!({ lease_id.as_str(): 2 }),
+        "the token the acknowledgement stored, as the revoke carried"
+    );
     heartbeat(&mut socket).await;
     none_of(&mut socket, &["desired_state"], Duration::from_millis(500)).await;
     reply(
@@ -911,6 +924,12 @@ async fn an_ack_leaves_a_lease_another_node_holds_alone() {
     );
     let command = of_type(&recv_until(&mut socket, &["command"]).await, "command")[0].clone();
     assert_eq!(command["body"]["params"]["lease_ids"], json!([lease_id]));
+    // ADR 0247: one above the other node's token, so this node clears a
+    // failed fence it recorded at that token.
+    assert_eq!(
+        command["body"]["params"]["fencing_tokens"],
+        json!({ lease_id.as_str(): 6 })
+    );
     reply(
         &mut socket,
         ok_result(),
@@ -980,6 +999,13 @@ async fn a_revoke_answered_fence_failed_lists_its_lease() {
     let frames = recv_until(&mut socket, &["command"]).await;
     let command = of_type(&frames, "command")[0];
     assert_eq!(command["body"]["kind"], "fence_ack");
+    // A lease with no row has no token: the acknowledgement goes out
+    // without `fencing_tokens`, and the node clears it by lease id.
+    assert_eq!(
+        command["body"]["params"],
+        json!({ "lease_ids": [UNKNOWN_LEASE] }),
+        "{command}"
+    );
     reply(
         &mut socket,
         ok_result(),
@@ -987,4 +1013,76 @@ async fn a_revoke_answered_fence_failed_lists_its_lease() {
     )
     .await;
     wait_for_no_pending_ack(&server, &mut socket, &node.node_id).await;
+}
+
+/// ADR 0245: an acknowledgement a primary before ADR 0245 recorded has no
+/// tokens. It goes out without `fencing_tokens`, as that primary sent it, and
+/// the node's `ok` clears it. An acknowledgement recorded since, with a
+/// token, follows in a `fence_ack` of its own with its token, so the first
+/// one never clears it by lease id.
+#[tokio::test]
+async fn an_acknowledgement_recorded_without_tokens_goes_out_without_them() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let (node, app_id, lease_id) = acked_while_away(&server, &owner).await;
+    let node_id = node.node_id.clone();
+    sqlx::query("UPDATE nodes SET fence_ack_pending = ? WHERE id = ?")
+        .bind(
+            json!({
+                "acked_at": "2026-11-01T00:00:00Z",
+                "lease_ids": [lease_id, OTHER_LEASE],
+                "fencing_tokens": { OTHER_LEASE: 9 },
+            })
+            .to_string(),
+        )
+        .bind(&node_id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+
+    let mut socket = connect(&server, &node.credential).await;
+    send(
+        &mut socket,
+        hello(
+            &node_id,
+            vec![hello_lease(&lease_id, &app_id, 1, "revoked")],
+        ),
+    )
+    .await;
+    let frames = recv_until(&mut socket, &["welcome", "lease_revoke"]).await;
+    let revoke = of_type(&frames, "lease_revoke")[0].clone();
+    reply(
+        &mut socket,
+        ok_result(),
+        Some(revoke["id"].as_str().unwrap()),
+    )
+    .await;
+    let frames = recv_until(&mut socket, &["command"]).await;
+    let command = of_type(&frames, "command")[0].clone();
+    assert_eq!(command["body"]["kind"], "fence_ack");
+    assert_eq!(
+        command["body"]["params"],
+        json!({ "lease_ids": [lease_id] }),
+        "{command}"
+    );
+    reply(
+        &mut socket,
+        ok_result(),
+        Some(command["id"].as_str().unwrap()),
+    )
+    .await;
+    let frames = recv_until(&mut socket, &["command"]).await;
+    let command = of_type(&frames, "command")[0].clone();
+    assert_eq!(
+        command["body"]["params"],
+        json!({ "lease_ids": [OTHER_LEASE], "fencing_tokens": { OTHER_LEASE: 9 } }),
+        "{command}"
+    );
+    reply(
+        &mut socket,
+        ok_result(),
+        Some(command["id"].as_str().unwrap()),
+    )
+    .await;
+    wait_for_no_pending_ack(&server, &mut socket, &node_id).await;
 }
