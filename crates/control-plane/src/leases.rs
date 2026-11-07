@@ -168,19 +168,25 @@ pub(crate) async fn by_id(
     read_one(conn, "id = ?", lease_id).await
 }
 
-/// Every lease the primary has revoked while `node_id` still is its last
-/// holder, oldest first.
+/// Every app lease the primary has revoked while `node_id` still is its
+/// last holder and that a restore waits for: its app's volume is still
+/// `restoring` from a backup, and the restore grants the lease again only
+/// once `node_id` released it ([`is_released`], issue #392).
 ///
 /// # Errors
 ///
 /// A database error.
-pub(crate) async fn revoked_from_node(
+pub(crate) async fn awaited_by_restores(
     conn: &mut SqliteConnection,
     node_id: &str,
 ) -> Result<Vec<Lease>, ApiError> {
     let rows = sqlx::query(&format!(
         "SELECT {LEASE_COLUMNS} FROM leases \
-         WHERE holder_node_id = ? AND revoked_at IS NOT NULL ORDER BY id"
+         WHERE holder_node_id = ? AND revoked_at IS NOT NULL \
+         AND resource_type = 'app' \
+         AND EXISTS (SELECT 1 FROM volumes WHERE volumes.app_id = leases.resource_id \
+         AND volumes.state = 'restoring' AND volumes.restored_from_backup_id IS NOT NULL) \
+         ORDER BY id"
     ))
     .bind(node_id)
     .fetch_all(&mut *conn)
@@ -194,14 +200,14 @@ pub(crate) async fn revoked_from_node(
 /// token at which that is known.
 ///
 /// A holder releases a lease at a token when it answers a `lease_revoke` of
-/// that token `ok`: its bound VMs are stopped and recorded. So does a holder
-/// whose `hello` does not name a lease the primary had already revoked from
-/// it, since a node names every lease it knows, whatever its state (section
-/// 5.1); and an operator's acknowledgement of the lease's failed fence, which
+/// that token `ok`: its bound VMs are stopped and recorded (section 5.13). So
+/// does an operator's acknowledgement of the lease's failed fence, which
 /// increments the token as declaring the node lost does (section 8.5 step 3).
 /// Nothing here survives a restart of the primary. Every node then starts a
-/// new session, and its `hello` either names the lease, which the primary
-/// revokes again, or releases it.
+/// new session, at whose start the primary revokes again every lease it has
+/// revoked from that node, so the holder's answer releases it again; and an
+/// acknowledgement not yet delivered stays in `fence_ack_pending`, which
+/// [`is_released`] reads.
 #[derive(Debug, Default)]
 pub(crate) struct Releases(Mutex<HashMap<(String, String), i64>>);
 
@@ -220,7 +226,7 @@ impl Releases {
 
     /// Whether the holder `lease` names released it at its token or a higher
     /// one. A release at a lower token says nothing about a later grant.
-    fn covers(&self, lease: &Lease) -> bool {
+    pub(crate) fn covers(&self, lease: &Lease) -> bool {
         let released = self
             .0
             .lock()
@@ -232,13 +238,15 @@ impl Releases {
 }
 
 /// Whether `lease` may be granted to another holder, or to the same one with
-/// a higher token: it is revoked in the primary's view, and its last holder
-/// released it ([`Releases`]), was declared lost (`nodes.lost_at`, ADR 0183)
-/// or was removed (section 10). A lease its holder still holds is not
-/// released. An `expiring` lease is released the same way; the gate of
-/// section 8.4 (ADR 0203) is not kept yet, so it never releases one sooner.
-/// A lease listed in a node's `fence_failure` is refused by
-/// [`grant_app_lease`] whatever this says.
+/// a higher token. It must be revoked in the primary's view, and its last
+/// holder must have released it at its token ([`Releases`]), have an
+/// operator's acknowledgement of it pending delivery at that token or a
+/// higher one (`fence_ack_pending`, section 8.5 step 3), or, for a `local`
+/// lease revoked by then, have been declared lost (`nodes.lost_at`, ADR 0183)
+/// or removed (section 10). An `expiring` lease of a lost holder also waits
+/// for its gate (section 8.4, ADR 0202), which the primary does not keep yet,
+/// so only its holder's answer releases one. A lease listed in a node's
+/// `fence_failure` is refused by [`grant_app_lease`] whatever this says.
 ///
 /// # Errors
 ///
@@ -254,12 +262,27 @@ pub(crate) async fn is_released(
     if releases.covers(lease) {
         return Ok(true);
     }
+    if let Some(pending) = crate::fences::pending_of(conn, &lease.holder_node_id).await?
+        && pending.lease_ids.contains(&lease.id)
+        && pending
+            .fencing_tokens
+            .get(&lease.id)
+            .is_some_and(|token| i64::try_from(*token).unwrap_or(i64::MAX) >= lease.fencing_token)
+    {
+        return Ok(true);
+    }
+    if lease.mode != "local" {
+        return Ok(false);
+    }
     let holder: Option<(Option<String>, String)> =
         sqlx::query_as("SELECT lost_at, status FROM nodes WHERE id = ?")
             .bind(&lease.holder_node_id)
             .fetch_optional(&mut *conn)
             .await?;
-    Ok(holder.is_some_and(|(lost_at, status)| lost_at.is_some() || status == "removed"))
+    let revoked_at = lease.revoked_at.as_deref().unwrap_or_default();
+    Ok(holder.is_some_and(|(lost_at, status)| {
+        status == "removed" || lost_at.is_some_and(|lost_at| revoked_at <= lost_at.as_str())
+    }))
 }
 
 /// Every unrevoked lease `node_id` holds, oldest first.

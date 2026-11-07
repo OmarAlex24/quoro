@@ -318,6 +318,20 @@ async fn restore_ready(
     if current.state != VolumeState::Restoring {
         return Ok(AppliedRestores::default());
     }
+    // Section 5.13, ADR 0047: the old holder's VMs may still run until it
+    // answers the revoke `ok`, so the lease moves only once it released it
+    // (issue #392). That holds for a restore onto the same node too. The
+    // check comes before any write, so a restore that waits changes nothing
+    // and the next `ready` report tries again.
+    if let Some(previous) = leases::app_lease(&mut w.tx, &current.app_id).await?
+        && !leases::is_released(&mut w.tx, releases, &previous).await?
+    {
+        return Err(ApiError::conflict(format!(
+            "lease {} waits for node {} to answer its revoke",
+            previous.id, previous.holder_node_id
+        )));
+    }
+
     current.state = VolumeState::Ready;
     current.allocated_bytes = reported
         .allocated_bytes
@@ -343,18 +357,6 @@ async fn restore_ready(
         current.payload()?,
     )
     .await?;
-
-    // Section 5.13, ADR 0047: the old holder's VMs may still run until it
-    // answers the revoke `ok`, so the lease moves only once it released it
-    // (issue #392). That holds for a restore onto the same node too.
-    if let Some(previous) = leases::app_lease(&mut w.tx, &current.app_id).await?
-        && !leases::is_released(&mut w.tx, releases, &previous).await?
-    {
-        return Err(ApiError::conflict(format!(
-            "lease {} waits for node {} to answer its revoke",
-            previous.id, previous.holder_node_id
-        )));
-    }
 
     // `grant_app_lease` takes the app's last token, revoked or not, and adds
     // one, so the target node's token is strictly higher than the old one

@@ -9,7 +9,7 @@ use common::{Server, problem, start_with_patient_node_session};
 use futures_util::{SinkExt, StreamExt};
 use quoro_backup::{BackupWriter, Chunker, FORMAT, Manifest, RepoKey, SourceKind, layout};
 use quoro_control_plane::backups::{Bucket, BucketFactory, BucketStore, RepositoryTarget};
-use quoro_control_plane::deploy;
+use quoro_control_plane::{ReferenceAsDigest, deploy};
 use quoro_proto::wire::{
     self, BackupState, Capacity as WireCapacity, Health, Heartbeat, Kvm as WireKvm, NodeMessage,
     ObservedStatus, StatusReport, VmStatus, VolumeState as WireVolumeState, VolumeStatus,
@@ -1610,30 +1610,107 @@ async fn a_refused_revoke_keeps_the_restore_waiting_until_a_later_session_answer
     ready_grants(&mut setup, &moving, moving.old_token).await;
 }
 
-/// Section 5.1: a node names every lease it knows in `hello`, whatever its
-/// state. One whose `hello` leaves out a lease revoked from it never took
-/// that lease, so nothing runs there under it, and the restore finishes.
+/// Connects the old node again with a `hello` that names no lease, and returns
+/// the `lease_revoke` the primary sends after `welcome`.
+async fn reconnect_old_node(setup: &mut Setup, moving: &Moving) -> Value {
+    let mut socket = connect(&setup.state.server, &setup.state.node.credential).await;
+    send(&mut socket, hello(&setup.state.node.node_id)).await;
+    recv_type(&mut socket, "welcome").await;
+    let revoke = recv_type(&mut socket, "lease_revoke").await;
+    assert_eq!(revoke["body"]["lease_id"], moving.lease_id);
+    assert_eq!(revoke["body"]["fencing_token"], json!(moving.old_token));
+    assert_eq!(revoke["body"]["reason"], "moved");
+    setup.state.socket = socket;
+    revoke
+}
+
+/// Closes both node sessions and starts a second primary on the same
+/// database, which knows nothing a session told the first one. Node B
+/// connects to it; the old node stays away.
+async fn restart_primary(setup: &mut Setup) -> Server {
+    drop_old_session(setup).await;
+    setup.socket_b.close(None).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while setup
+        .state
+        .server
+        .state
+        .hub
+        .is_connected(&setup.node_b.node_id)
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "node B's session did not drop"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let restarted =
+        common::restart_with_resolver(&setup.state.server, Arc::new(ReferenceAsDigest)).await;
+    let (socket_b, _) = open(&restarted, &setup.node_b).await;
+    setup.socket_b = socket_b;
+    let owner = restarted.client();
+    restarted
+        .login(&owner, common::OWNER_EMAIL, common::OWNER_PASSWORD)
+        .await;
+    setup.state.owner = owner;
+    restarted
+}
+
+/// A revoke the old node never answered, because its session ended, is sent
+/// again at the start of its next session, also when its `hello` does not
+/// name the lease: only that revoke's `ok` lets the restore finish.
 #[tokio::test]
-async fn a_hello_that_leaves_out_the_revoked_lease_releases_it() {
+async fn a_restore_revokes_its_lease_again_when_the_old_node_returns() {
     let mut setup = setup().await;
     let moving = start_moving(&mut setup, 13).await;
     drop_old_session(&mut setup).await;
     ready_waits(&mut setup, &moving).await;
 
-    let (socket, _) = open(&setup.state.server, &setup.state.node).await;
-    setup.state.socket = socket;
+    let revoke = reconnect_old_node(&mut setup, &moving).await;
+    ready_waits(&mut setup, &moving).await;
+
+    reply(
+        &mut setup.state.socket,
+        ok_result(),
+        Some(revoke["id"].as_str().unwrap()),
+    )
+    .await;
     round_trip(&mut setup.state.socket).await;
     ready_grants(&mut setup, &moving, moving.old_token).await;
 }
 
-/// Section 8.5: a revoke answered `fence_failed` lists the lease in the old
-/// node's `fence_failure`, so the restore waits. An operator's acknowledgement
-/// increments the token, as declaring the node lost does, and the restore
-/// finishes above it.
+/// The old holder's `ok` is held in memory. A restarted primary has lost it,
+/// so the restore waits until the old node returns and answers the revoke
+/// sent again at the start of its session.
 #[tokio::test]
-async fn an_acknowledged_failed_fence_lets_the_restore_finish() {
+async fn a_restarted_primary_waits_for_the_old_node_to_answer_again() {
     let mut setup = setup().await;
-    let moving = start_moving(&mut setup, 14).await;
+    let moving = start_moving(&mut setup, 16).await;
+    reply(
+        &mut setup.state.socket,
+        ok_result(),
+        Some(&moving.revoke_id),
+    )
+    .await;
+    round_trip(&mut setup.state.socket).await;
+
+    setup.state.server = restart_primary(&mut setup).await;
+    ready_waits(&mut setup, &moving).await;
+
+    let revoke = reconnect_old_node(&mut setup, &moving).await;
+    reply(
+        &mut setup.state.socket,
+        ok_result(),
+        Some(revoke["id"].as_str().unwrap()),
+    )
+    .await;
+    round_trip(&mut setup.state.socket).await;
+    ready_grants(&mut setup, &moving, moving.old_token).await;
+}
+
+/// Answers the old node's revoke with `fence_failed` (section 8.5), then
+/// acknowledges the failed fence as an operator.
+async fn fail_and_acknowledge(setup: &mut Setup, moving: &Moving) {
     reply(
         &mut setup.state.socket,
         NodeMessage::CommandResult(CommandResult {
@@ -1650,7 +1727,7 @@ async fn an_acknowledged_failed_fence_lets_the_restore_finish() {
     )
     .await;
     round_trip(&mut setup.state.socket).await;
-    ready_waits(&mut setup, &moving).await;
+    ready_waits(setup, moving).await;
 
     let res = setup
         .state
@@ -1669,21 +1746,88 @@ async fn an_acknowledged_failed_fence_lets_the_restore_finish() {
         "fence-ack: {}",
         res.text().await.unwrap()
     );
+}
+
+/// Section 8.5: a revoke answered `fence_failed` lists the lease in the old
+/// node's `fence_failure`, so the restore waits. An operator's acknowledgement
+/// increments the token, as declaring the node lost does, and the restore
+/// finishes above it, also once the node took the acknowledgement and it is
+/// no longer pending.
+#[tokio::test]
+async fn an_acknowledged_failed_fence_lets_the_restore_finish() {
+    let mut setup = setup().await;
+    let moving = start_moving(&mut setup, 14).await;
+    fail_and_acknowledge(&mut setup, &moving).await;
+
+    let command = recv_type(&mut setup.state.socket, "command").await;
+    assert_eq!(command["body"]["kind"], "fence_ack", "{command}");
+    reply(
+        &mut setup.state.socket,
+        ok_result(),
+        Some(command["id"].as_str().unwrap()),
+    )
+    .await;
+    round_trip(&mut setup.state.socket).await;
+    let pending: Option<String> =
+        sqlx::query_scalar("SELECT fence_ack_pending FROM nodes WHERE id = ?")
+            .bind(&setup.state.node.node_id)
+            .fetch_one(setup.state.server.state.store.pool())
+            .await
+            .unwrap();
+    assert!(pending.is_none(), "the node took the acknowledgement");
     ready_grants(&mut setup, &moving, moving.old_token + 1).await;
 }
 
-/// Section 8.3, ADR 0183: a holder declared lost releases its leases. The
-/// API call is not there yet, so the test sets `nodes.lost_at` itself.
+/// An acknowledgement still pending delivery is in the database
+/// (`fence_ack_pending`), so a restarted primary finishes the restore without
+/// the old node.
+#[tokio::test]
+async fn a_pending_acknowledgement_lets_a_restarted_primary_finish_the_restore() {
+    let mut setup = setup().await;
+    let moving = start_moving(&mut setup, 17).await;
+    fail_and_acknowledge(&mut setup, &moving).await;
+
+    setup.state.server = restart_primary(&mut setup).await;
+    ready_grants(&mut setup, &moving, moving.old_token + 1).await;
+}
+
+/// Section 8.3, ADR 0183: a holder declared lost releases a `local` lease
+/// revoked by then. The API call is not there yet, so the test sets
+/// `nodes.lost_at` itself. A declaration older than the revoke says nothing
+/// about it, and an `expiring` lease also waits for its gate (section 8.4).
 #[tokio::test]
 async fn a_holder_declared_lost_releases_the_lease() {
     let mut setup = setup().await;
     let moving = start_moving(&mut setup, 15).await;
     drop_old_session(&mut setup).await;
     ready_waits(&mut setup, &moving).await;
+    let pool = setup.state.server.state.store.pool().clone();
 
-    sqlx::query("UPDATE nodes SET lost_at = '2026-11-07T12:00:00Z' WHERE id = ?")
+    sqlx::query("UPDATE nodes SET lost_at = '2000-01-01T00:00:00Z' WHERE id = ?")
         .bind(&setup.state.node.node_id)
-        .execute(setup.state.server.state.store.pool())
+        .execute(&pool)
+        .await
+        .unwrap();
+    ready_waits(&mut setup, &moving).await;
+
+    sqlx::query("UPDATE leases SET mode = 'expiring' WHERE id = ?")
+        .bind(&moving.lease_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE nodes SET lost_at = (SELECT revoked_at FROM leases WHERE id = ?) WHERE id = ?",
+    )
+    .bind(&moving.lease_id)
+    .bind(&setup.state.node.node_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    ready_waits(&mut setup, &moving).await;
+
+    sqlx::query("UPDATE leases SET mode = 'local' WHERE id = ?")
+        .bind(&moving.lease_id)
+        .execute(&pool)
         .await
         .unwrap();
     ready_grants(&mut setup, &moving, moving.old_token).await;

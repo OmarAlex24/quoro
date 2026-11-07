@@ -181,9 +181,10 @@ struct Pending {
     streams: HashMap<String, StreamSlot>,
     /// `stream_open` msg id to the stream it opened, so a failed open ends it.
     opens: HashMap<String, String>,
-    /// `lease_revoke` msg id to its lease and token, so an answer with
-    /// `fence_failed` is recorded on the node (section 8.5 step 1) and an
-    /// `ok` releases the lease at that token ([`leases::Releases`]).
+    /// `lease_revoke` msg id to its lease and the token an `ok` releases the
+    /// lease at ([`leases::Releases`]): the revoke's own, or the primary's
+    /// when a `hello` revoke goes above it. An answer with `fence_failed` is
+    /// recorded on the node (section 8.5 step 1).
     revoke_leases: HashMap<String, (String, u64)>,
 }
 
@@ -2155,25 +2156,37 @@ impl Session {
                 return;
             }
         };
-        // A node names every lease it knows, whatever its state (section
-        // 5.1). A lease revoked from it that its `hello` does not name is one
-        // it never took, so nothing runs there under it (issue #392). One
-        // revoked after this read reaches the node on this session.
-        match leases::revoked_from_node(&mut conn, &self.node_id).await {
-            Ok(revoked) => {
-                for lease in revoked {
-                    if !reported.iter().any(|claimed| claimed.lease_id == lease.id) {
-                        self.hub
-                            .0
-                            .releases
-                            .record(&lease.id, &self.node_id, lease.fencing_token);
+        // A restore grants its lease again only once the old holder answered
+        // the revoke `ok` (section 5.13, issue #392). That answer is lost with
+        // the session that carried the revoke, and what this primary learned
+        // is lost when it restarts, so each lease a restore still waits for is
+        // revoked again here, at its own token; one the `hello` names is
+        // revoked below. A node answers a revoke it already fenced `ok` again
+        // without fencing anew.
+        match leases::awaited_by_restores(&mut conn, &self.node_id).await {
+            Ok(awaited) => {
+                for lease in awaited {
+                    if reported.iter().any(|claimed| claimed.lease_id == lease.id)
+                        || self.hub.0.releases.covers(&lease)
+                    {
+                        continue;
                     }
+                    let token = lease.fencing_token.max(1) as u64;
+                    self.queue_hello_revoke(
+                        quoro_proto::LeaseRevoke {
+                            lease_id: quoro_proto::LeaseId(lease.id.clone()),
+                            fencing_token: token,
+                            reason: quoro_proto::RevokeReason::Moved,
+                        },
+                        token,
+                        outbox,
+                    );
                 }
             }
             Err(e) => tracing::warn!(
                 code = %e.code.as_str(),
                 node_id = %self.node_id,
-                "cannot read the leases revoked from the node"
+                "cannot read the leases restores wait for"
             ),
         }
         if reported.is_empty() {
@@ -2204,25 +2217,46 @@ impl Session {
                 }
                 None => claimed.fencing_token.max(1),
             };
-            let revoke = quoro_proto::LeaseRevoke {
-                lease_id: quoro_proto::LeaseId(claimed.lease_id.clone()),
-                fencing_token: token,
-                reason,
-            };
-            let id = new_msg_id();
-            if let Some(pending) = self.hub.0.pending_of(&self.node_id, self.generation) {
-                pending
-                    .lock()
-                    .expect("pending lock")
-                    .revoke_leases
-                    .insert(id.clone(), (claimed.lease_id.clone(), token));
-            }
-            outbox.push(
-                ControlMessage::LeaseRevoke(revoke)
-                    .to_frame(&id, None)
-                    .to_text(),
+            // The answer releases the lease at the primary's token, never
+            // above it: a higher one could cover a later grant to this node
+            // that the answer says nothing about.
+            let released = row
+                .as_ref()
+                .map_or(0, |lease| lease.fencing_token.max(1) as u64);
+            self.queue_hello_revoke(
+                quoro_proto::LeaseRevoke {
+                    lease_id: quoro_proto::LeaseId(claimed.lease_id.clone()),
+                    fencing_token: token,
+                    reason,
+                },
+                released,
+                outbox,
             );
         }
+    }
+
+    /// Queues a `lease_revoke` of the session's start, after `welcome`, and
+    /// notes it unanswered, so that its `ok` releases the lease at `released`
+    /// ([`leases::Releases`]).
+    fn queue_hello_revoke(
+        &self,
+        revoke: quoro_proto::LeaseRevoke,
+        released: u64,
+        outbox: &mut Vec<String>,
+    ) {
+        let id = new_msg_id();
+        if let Some(pending) = self.hub.0.pending_of(&self.node_id, self.generation) {
+            pending
+                .lock()
+                .expect("pending lock")
+                .revoke_leases
+                .insert(id.clone(), (revoke.lease_id.0.clone(), released));
+        }
+        outbox.push(
+            ControlMessage::LeaseRevoke(revoke)
+                .to_frame(&id, None)
+                .to_text(),
+        );
     }
 
     /// Whether an operator's acknowledgement waits for delivery to this node
