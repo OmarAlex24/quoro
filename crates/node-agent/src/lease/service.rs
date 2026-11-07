@@ -294,10 +294,13 @@ impl LeaseView {
     /// time read after it. A send time read outside the lock could miss a
     /// suspend applied in between, and its answer would set a `valid_until`
     /// later than the primary's gate by that suspend.
-    fn record_renewal(&self, lease_id: &LeaseId, msg: MsgId, clock: &dyn HostClock) {
+    ///
+    /// Returns whether the renewal gave a converted lease its provisional
+    /// deadline (ADR 0241).
+    fn record_renewal(&self, lease_id: &LeaseId, msg: MsgId, clock: &dyn HostClock) -> bool {
         let mut table = self.lock_at(Instant::now());
         let reading = HostNow::read(clock);
-        table.renew_sent(lease_id, msg, &reading);
+        table.renew_sent(lease_id, msg, &reading)
     }
 
     /// Section 6.4: may a stateful VM with this spec token start now?
@@ -992,6 +995,7 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
             (deadlines, actions)
         };
         let mut expired = Vec::new();
+        let mut provisional = Vec::new();
         for action in actions {
             match action {
                 Action::SendRenew {
@@ -1006,8 +1010,12 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                     // session, so `t_send` and its `CLOCK_BOOTTIME` err early
                     // (section 8.4, ADR 0240). A renewal the session never
                     // takes is never answered.
-                    self.view
-                        .record_renewal(&lease_id, id.clone(), &*self.config.host_clock);
+                    if self
+                        .view
+                        .record_renewal(&lease_id, id.clone(), &*self.config.host_clock)
+                    {
+                        provisional.push(lease_id.clone());
+                    }
                     let sent = renewals
                         .send(Envelope {
                             id,
@@ -1031,6 +1039,12 @@ impl<E: Engine + 'static> LocalLeaseService<E> {
                     expired.push(lease_id);
                 }
             }
+        }
+        // A converted lease's provisional deadline is stored once its first
+        // renewal is out (ADR 0241). Until the write lands, a restart finds
+        // the lease `expiring` with no deadline and fences it.
+        for lease_id in &provisional {
+            self.persist(lease_id).await;
         }
         if expired.is_empty() {
             return now;

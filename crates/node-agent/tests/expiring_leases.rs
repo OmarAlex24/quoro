@@ -912,3 +912,257 @@ async fn a_forced_stop_that_outlives_t_force_still_stops_the_vm() {
     assert_eq!(info.pid, None);
     assert_eq!(info.exit_code, Some(137));
 }
+
+/// The app's lease as a `local` grant with `token`.
+fn local_grant(token: u64) -> LeaseGrant {
+    LeaseGrant {
+        lease_id: LeaseId(LEASE.to_owned()),
+        resource_type: ResourceType::App,
+        resource_id: APP.to_owned(),
+        mode: LeaseMode::Local,
+        fencing_token: token,
+        duration_ms: None,
+        granted_at: "2026-11-02T10:15:33Z".to_owned(),
+    }
+}
+
+/// Grants the lease `local` with token 1, as the primary does for a stateful
+/// app, then converts it to `expiring` with the same token (section 8.4
+/// "Changing the mode"). Returns the instant just before the conversion.
+async fn grant_local_then_convert(leases: &LocalLeases, duration_ms: u64) -> Instant {
+    leases
+        .link
+        .grant(MsgId("msg_local".to_owned()), None, local_grant(1))
+        .await
+        .expect("the local grant is taken");
+    assert!(leases.view.may_start_stateful(LEASE, 1));
+    let before = Instant::now();
+    leases
+        .link
+        .grant(
+            MsgId("msg_convert".to_owned()),
+            None,
+            expiring(1, duration_ms),
+        )
+        .await
+        .expect("the conversion is taken");
+    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Held));
+    assert!(leases.view.may_keep_running(LEASE, 1), "its VMs run on");
+    before
+}
+
+async fn wait_for_stored_validity(store: &NodeStore) -> StoredValidity {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(validity) = store.load_leases().await.unwrap()[0].validity.clone() {
+            return validity;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the provisional deadline is stored"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Section 8.4 "Changing the mode" (ADR 0241): a converted lease keeps its
+/// VMs and renews at once. Its first renewal gives it a provisional deadline,
+/// `t_send + D - M`, and with no answer the node fences there. With `D` =
+/// 6 000 that is 5 000 ms after the renewal.
+#[tokio::test]
+async fn a_converted_lease_keeps_its_vms_and_fences_at_its_first_renewal_s_deadline() {
+    let dir = TargetDir::new("expiring-convert-unanswered");
+    let engine = Arc::new(FakeEngine::new());
+    let desired = bound(&["vm_warm"]);
+    let clock = clock();
+    let (leases, store) = start(&dir, &engine, &desired, config(&clock)).await;
+    let vm = running_vm(&engine, "vm_warm", 2).await;
+    let mut attached = leases.link.attach();
+    let before = grant_local_then_convert(&leases, 6000).await;
+    assert_eq!(leases.link.hello()[0].mode, LeaseMode::Expiring);
+
+    let renew = next_renewal(&mut attached).await;
+    assert_eq!(renew.body.fencing_token, 1, "the same token");
+    assert!(
+        before.elapsed() < millis(500),
+        "the first renewal goes out at once"
+    );
+    let stored = wait_for_stored_validity(&store).await;
+    assert_eq!(stored.boot_id, "boot-a");
+
+    tokio::time::sleep(millis(4000)).await;
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Running);
+    assert!(leases.view.may_keep_running(LEASE, 1));
+    wait_for_fence_record(&store).await;
+    let done = before.elapsed();
+    assert!(
+        done >= millis(5000),
+        "no earlier than t_send + 5 000: {done:?}"
+    );
+    assert!(done < millis(6500), "at the provisional deadline: {done:?}");
+    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Expired));
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Stopped);
+    let fenced = events_of(&store, "node.fenced").await;
+    assert_eq!(fenced.len(), 1);
+    assert_eq!(fenced[0]["data"]["reason"], "lease_expired");
+    assert_eq!(
+        fenced[0]["data"]["fencing_tokens"],
+        serde_json::json!({ LEASE: 1 })
+    );
+    assert!(!leases.view.is_failed());
+    leases.abort();
+}
+
+/// Section 8.4 "Changing the mode": an answered first renewal holds the
+/// converted lease like any `expiring` one. A `local` grant with the same
+/// token then ends the renewals and the deadline, and the app runs on.
+#[tokio::test]
+async fn a_local_grant_ends_a_converted_lease_s_renewals() {
+    let dir = TargetDir::new("expiring-convert-back");
+    let engine = Arc::new(FakeEngine::new());
+    let desired = bound(&["vm_warm"]);
+    let clock = clock();
+    let (leases, store) = start(&dir, &engine, &desired, config(&clock)).await;
+    let vm = running_vm(&engine, "vm_warm", 2).await;
+    let mut attached = leases.link.attach();
+    let _before = grant_local_then_convert(&leases, 6000).await;
+    let first = next_renewal(&mut attached).await;
+    answer(&leases, &first, 6000).await;
+    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Held));
+    assert!(leases.view.may_start_stateful(LEASE, 1));
+    let second = next_renewal(&mut attached).await;
+    answer(&leases, &second, 6000).await;
+
+    leases
+        .link
+        .grant(MsgId("msg_local_again".to_owned()), None, local_grant(1))
+        .await
+        .expect("the conversion back is taken");
+    let after = Instant::now();
+    assert_eq!(leases.link.hello()[0].mode, LeaseMode::Local);
+    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Held));
+    let row = store.load_leases().await.unwrap()[0].clone();
+    assert_eq!(row.mode, LeaseMode::Local);
+    assert_eq!(row.validity, None);
+    assert!(
+        tokio::time::timeout(millis(3000), attached.renewals.recv())
+            .await
+            .is_err(),
+        "no renewal after the local grant"
+    );
+    // Past the deadline the last answer gave, `t_send + 5 000`.
+    tokio::time::sleep(millis(5500).saturating_sub(after.elapsed())).await;
+    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Held));
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Running);
+    assert!(store.fences().await.unwrap().is_empty());
+    assert!(leases.view.may_start_stateful(LEASE, 1));
+    leases.abort();
+}
+
+/// ADR 0241: until its first renewal is sent, a converted lease behaves as
+/// `local`. With no session nothing is sent, so the lease stays `held` and
+/// its VMs run past any deadline the duration would give. Once a session
+/// attaches, the renewal goes out and the provisional deadline counts from
+/// it: `D` = 3 000 gives 2 000 ms.
+#[tokio::test]
+async fn a_converted_lease_runs_on_without_a_session_until_its_first_renewal() {
+    let dir = TargetDir::new("expiring-convert-no-session");
+    let engine = Arc::new(FakeEngine::new());
+    let desired = bound(&["vm_warm"]);
+    let clock = clock();
+    let (leases, store) = start(&dir, &engine, &desired, config(&clock)).await;
+    let vm = running_vm(&engine, "vm_warm", 2).await;
+    let _before = grant_local_then_convert(&leases, 3000).await;
+
+    tokio::time::sleep(millis(3500)).await;
+    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Held));
+    assert!(leases.view.may_keep_running(LEASE, 1));
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Running);
+    assert!(store.fences().await.unwrap().is_empty());
+    assert_eq!(store.load_leases().await.unwrap()[0].validity, None);
+
+    let attached_at = Instant::now();
+    let mut attached = leases.link.attach();
+    let _renew = next_renewal(&mut attached).await;
+    assert!(
+        attached_at.elapsed() < millis(500),
+        "renews as soon as a session attaches"
+    );
+    wait_for_fence_record(&store).await;
+    let done = attached_at.elapsed();
+    assert!(
+        done >= millis(2000),
+        "no earlier than t_send + 2 000: {done:?}"
+    );
+    assert!(done < millis(3500), "at the provisional deadline: {done:?}");
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Stopped);
+    assert!(!leases.view.is_failed());
+    leases.abort();
+}
+
+/// Section 8.4 "Agent restart" (ADR 0241): the provisional deadline is stored
+/// once the first renewal is out, so a restart on the same boot brings the
+/// converted lease back `uncertain` with it, keeping its VMs. An answer to
+/// the renewal the restored lease sends holds it again.
+#[tokio::test]
+async fn a_restart_keeps_a_converted_lease_s_provisional_deadline() {
+    let dir = TargetDir::new("expiring-convert-restart");
+    let engine = Arc::new(FakeEngine::new());
+    let desired = bound(&["vm_warm"]);
+    let clock = clock();
+    let (leases, store) = start(&dir, &engine, &desired, config(&clock)).await;
+    let vm = running_vm(&engine, "vm_warm", 2).await;
+    let mut attached = leases.link.attach();
+    let _before = grant_local_then_convert(&leases, 15_000).await;
+    let _unanswered = next_renewal(&mut attached).await;
+    let stored = wait_for_stored_validity(&store).await;
+    drop(attached);
+    leases.abort();
+    drop(store);
+
+    let (leases, store) = start(&dir, &engine, &desired, config(&clock)).await;
+    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Uncertain));
+    assert!(leases.view.may_keep_running(LEASE, 1));
+    assert_eq!(
+        store.load_leases().await.unwrap()[0].validity,
+        Some(stored),
+        "the restore keeps the provisional deadline"
+    );
+    let mut attached = leases.link.attach();
+    let renew = next_renewal(&mut attached).await;
+    answer(&leases, &renew, 15_000).await;
+    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Held));
+    assert!(engine.stop_calls().is_empty(), "nothing is fenced");
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Running);
+    leases.abort();
+}
+
+/// Section 8.4 "Agent restart": a converted lease stored before its first
+/// renewal has no deadline. Nothing proves the authority set no gate for it
+/// since, so a restart brings it back `expired` and fences it.
+#[tokio::test]
+async fn a_restart_before_a_converted_lease_s_first_renewal_fences_it() {
+    let dir = TargetDir::new("expiring-convert-restart-early");
+    let engine = Arc::new(FakeEngine::new());
+    let desired = bound(&["vm_warm"]);
+    let clock = clock();
+    let (leases, store) = start(&dir, &engine, &desired, config(&clock)).await;
+    let vm = running_vm(&engine, "vm_warm", 2).await;
+    let _before = grant_local_then_convert(&leases, 15_000).await;
+    let row = store.load_leases().await.unwrap()[0].clone();
+    assert_eq!(
+        (row.mode, row.state, row.validity),
+        (LeaseMode::Expiring, LeaseState::Held, None)
+    );
+    leases.abort();
+    drop(store);
+
+    let (leases, store) = start(&dir, &engine, &desired, config(&clock)).await;
+    assert_eq!(leases.view.state(LEASE), Some(LeaseState::Expired));
+    wait_for_fence_record(&store).await;
+    assert_eq!(engine.inspect(&vm).await.unwrap().state, VmState::Stopped);
+    let fenced = events_of(&store, "node.fenced").await;
+    assert_eq!(fenced.len(), 1);
+    assert_eq!(fenced[0]["data"]["reason"], "lease_expired");
+    leases.abort();
+}
