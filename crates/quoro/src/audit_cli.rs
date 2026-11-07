@@ -23,8 +23,10 @@ pub async fn run(args: &[String]) -> ExitCode {
     let Some((subcommand, rest)) = args.split_first() else {
         return crate::usage_error("audit needs a subcommand: verify");
     };
+    // Only the offline verification is a host command; the rest of `audit`
+    // reads the primary's API through the client.
     if subcommand != "verify" {
-        return crate::usage_error(&format!("unknown audit subcommand '{subcommand}'"));
+        return crate::client("audit", args).await;
     }
     let flags = match crate::parse_flags(rest, &["file", "db", "prev-hash"]) {
         Ok(flags) => flags,

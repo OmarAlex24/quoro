@@ -8,6 +8,8 @@ Each entry links the pull request that made the change and, where one exists, th
 
 ### Added
 
+- **A client CLI in the `quoro` binary.** Every command line that is not a host command now goes to a client that talks to a primary's API: `quoro api METHOD PATH [--data @FILE|-]` calls any operation and prints the response body, and `quoro completion SHELL` prints a shell completion script. The primary comes from a context in `~/.config/quoro/config.toml`: its URL and the SHA-256 pin of its self-signed certificate, checked before anything is sent, or `tls = "system"`. A token per context is read from `credentials.toml`, which is refused when other users can read it, or from `QUORO_TOKEN`; `QUORO_URL` and `QUORO_FINGERPRINT` give an ad-hoc context for CI. `--reason` and `--incident` are sent as `Quoro-Justification` and `Quoro-Incident`. API errors map to fixed exit codes (2 usage, 3 approval required, 4 forbidden, 5 not found, 6 conflict, 7 unreachable, 1 other) with the request id on stderr. `quoro --help` now shows the client commands; `quoro help host` lists the host commands as before ([#463], [ADR 0054]).
+
 - **A host suspend counts against `expiring` leases.** The node measures lease time on a clock that keeps counting while the host is suspended (`CLOCK_BOOTTIME` on Linux). Its timers run on the monotonic clock, which stops during a suspend, while the primary's gate keeps running. So the node checks at least every 250 ms, and at once when the host wakes, how far `CLOCK_BOOTTIME` has moved beyond that clock. It then moves every `expiring` lease's deadline, renewals and pending renewals earlier by the difference. A lease whose deadline passed during the suspend expires and is fenced as soon as the host wakes, with no graceful stop, and so does one a revoke reaches first. No stateful start passes in between, and the node is not marked failed. The deadline a held lease stores for an agent restart now comes from the `CLOCK_BOOTTIME` reading taken when its renewal was sent, not when the answer arrived, so a suspend between the two cannot make it later ([#452], [#446], [ADR 0240]).
 
 - **Fence events name the lease's token and the stopped VMs.** A node's `node.fenced` and `node.fence_failed` events now carry `fencing_tokens`: the token the node held for each fenced lease, the same one as in the fence's local record. When a revoke with a higher token joined a running fence, the event carries that revoke's token. `node.fenced` also carries `vm_ids`, the VMs the fence stopped. The failed fences an upgraded agent reports again carry their recorded token too ([#445], [#442], [#436]).
@@ -439,11 +441,13 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#482]: https://github.com/OmarAlex24/quoro/pull/482
 [#462]: https://github.com/OmarAlex24/quoro/issues/462
 [#493]: https://github.com/OmarAlex24/quoro/pull/493
+[#463]: https://github.com/OmarAlex24/quoro/issues/463
 [ADR 0019]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0019-fencing-is-mandatory-and-lease-based-node-agent-self-fences.md
 [ADR 0020]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0020-per-app-ha-policies-none-cold-warm-hot-with-cost-shown-in.md
 [ADR 0027]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0027-signed-binaries-and-reproducible-builds-are-mandatory.md
 [ADR 0049]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0049-agent-runner-d-0032-wake-reference-runner-in-examples-agent.md
 [ADR 0050]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0050-cluster-keys-separate-ed25519-signing-key-and-xchacha20.md
+[ADR 0054]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0054-host-layout-and-cli-one-tls-listener-for-api-panel-mcp-on.md
 [ADR 0059]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0059-q-0001-embedded-rust-reverse-proxy-behind-the-ingress.md
 [ADR 0061]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0061-q-0003-write-our-own-minimal-init-and-oci-to-ext4-pipeline.md
 [ADR 0064]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0064-first-public-release-is-an-m3-preview-v0-1-experimental-not.md

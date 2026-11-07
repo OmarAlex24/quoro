@@ -2,10 +2,12 @@
 //!
 //! One binary serves the HTTPS listener, issues the first-run setup token,
 //! joins a cluster and runs the node agent (`join`, `node`), and relays MCP
-//! over stdio to a primary for a local MCP client (`mcp stdio`). The command
-//! line is parsed by hand: it has a few commands and a handful of flags, so a
-//! parser dependency would be more code and one more licence than the `match`
-//! below.
+//! over stdio to a primary for a local MCP client (`mcp stdio`). Host command
+//! lines are parsed by hand: they have a few commands and a handful of flags,
+//! so the `match` below is less code than a parser. Every other command line
+//! goes to the client CLI (`quoro_cli`), which talks to a primary's API; the
+//! hand-offs are the unknown-command arm, `mcp` other than `stdio`, `audit`
+//! other than `verify`, and `--help`.
 
 mod advertise;
 mod audit_cli;
@@ -25,7 +27,8 @@ use quoro_control_plane::store::Store;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-/// Printed on `--help` and on a command that does not exist.
+/// The host commands: printed by `quoro help host` and on a host command's
+/// usage error.
 const USAGE: &str = "\
 usage: quoro <command> [options]
 
@@ -114,12 +117,26 @@ async fn main() -> ExitCode {
             }
         }
         "mcp" => mcp_command(rest).await,
-        "--help" | "-h" | "help" => usage(),
-        other => {
-            eprintln!("quoro: unknown command '{other}'");
-            usage()
+        "help" if rest == ["host"] => {
+            println!("{USAGE}");
+            ExitCode::SUCCESS
         }
+        // The client's help, which ends with a line pointing to
+        // `quoro help host`.
+        "--help" | "-h" | "help" => quoro_cli::run(args.clone()).await,
+        // Not a host command: the client CLI's.
+        _ => quoro_cli::run(args.clone()).await,
     }
+}
+
+/// Hands `quoro <word> <args...>` to the client CLI.
+pub(crate) async fn client(word: &str, args: &[String]) -> ExitCode {
+    quoro_cli::run(
+        std::iter::once(word.to_string())
+            .chain(args.iter().cloned())
+            .collect(),
+    )
+    .await
 }
 
 /// Prints the usage text on stderr, the way a usage error does.
@@ -219,9 +236,7 @@ async fn mcp_command(args: &[String]) -> ExitCode {
         return usage_error("mcp needs a transport: quoro mcp stdio ...");
     };
     if transport != "stdio" {
-        return usage_error(&format!(
-            "unknown MCP transport '{transport}'; expected stdio"
-        ));
+        return client("mcp", args).await;
     }
     let flags = match parse_flags(rest, &["url", "fingerprint", "key-file", "justification"]) {
         Ok(flags) => flags,
