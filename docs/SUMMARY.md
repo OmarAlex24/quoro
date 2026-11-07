@@ -264,6 +264,9 @@
   - [0262: fence_ack acknowledges a listed lease with no row at 2^53-1, the canonical-JSON bound, and migration 0001's comment names fencing_tokens](adr/0262-fence-ack-acknowledges-a-listed-lease-with-no-row-at-2-53-1.md)
   - [0265: M5b refuses warm for an app built from a Git source, with the reason not_in_this_release](adr/0265-m5b-refuses-warm-for-an-app-built-from-a-git-source-with.md)
   - [0274: M7, deploy experience: after M6, Quoro adds docker-compose import, private registries and Git repositories, a container engine for hosts without KVM, and Railpack builds](adr/0274-m7-deploy-experience-after-m6-quoro-adds-docker-compose.md)
+  - [0275: A warm app's placement does not narrow its warm node: a stateful app's placement names only its volume's node](adr/0275-a-warm-app-s-placement-does-not-narrow-its-warm-node-a.md)
+  - [0276: When the scheduler picks a warm node again: not on a disconnect, only for a lasting reason](adr/0276-when-the-scheduler-picks-a-warm-node-again-not-on-a.md)
+  - [0277: Warm turns on at the end of its chain: until then updateApp refuses warm outside dev builds, and the dev-warm-policy feature stays until the last warm PR](adr/0277-warm-turns-on-at-the-end-of-its-chain-until-then-updateapp.md)
 
 # Background research
 

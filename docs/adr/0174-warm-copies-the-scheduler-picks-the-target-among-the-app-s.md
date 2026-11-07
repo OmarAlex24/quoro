@@ -1,12 +1,12 @@
 # ADR 0174: Warm copies: the scheduler picks the target among the app's placement nodes (or the operator pins it); the target prepares the image and keeps a standby VM that never starts without the lease; warm apps' domains are served through the edge when one exists
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0275](0275-a-warm-app-s-placement-does-not-narrow-its-warm-node-a.md)
 - **Date:** 2026-11-06
 - **Ledger id:** D-0174
 - **Tags:** m5b, control-plane, ingress, contracts
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** none
+- **Related:** [ADR 0275](0275-a-warm-app-s-placement-does-not-narrow-its-warm-node-a.md)
 
 ## Context
 
@@ -22,6 +22,7 @@ _Some wording was changed for the public repository._
 
 ## Consequences
 
+- [ADR 0275](0275-a-warm-app-s-placement-does-not-narrow-its-warm-node-a.md) refines which nodes the scheduler picks a warm copy's target among: the app's placement no longer narrows it. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---

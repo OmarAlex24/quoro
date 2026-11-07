@@ -1,12 +1,12 @@
 # ADR 0212: The scheduler picks the warm node unless an operator pins it through UpdateAppRequest.warm
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0275](0275-a-warm-app-s-placement-does-not-narrow-its-warm-node-a.md)
 - **Date:** 2026-11-06
 - **Ledger id:** D-0212
 - **Tags:** m5b, contracts, warm
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** none
+- **Related:** [ADR 0275](0275-a-warm-app-s-placement-does-not-narrow-its-warm-node-a.md)
 
 ## Context
 
@@ -20,6 +20,7 @@ Eligible: a connected node with the node role, in placement.node_ids when set, n
 
 ## Consequences
 
+- [ADR 0275](0275-a-warm-app-s-placement-does-not-narrow-its-warm-node-a.md) refines which nodes are eligible as warm node: placement.node_ids no longer narrows them. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---
