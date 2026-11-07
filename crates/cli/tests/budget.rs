@@ -7,12 +7,19 @@
 //! Raising a limit is a pull request of its own that names the task needing
 //! it and carries the maintainer's approval; never raise one to make a feature
 //! fit.
+//!
+//! The budget counts what a user sees as commands. clap adds a `help`
+//! subcommand to every command that has subcommands, with a copy of the tree
+//! under it (`quoro help app create`); those generated help subcommands are
+//! not counted, at any level.
 
 use clap::Command;
 
-/// Words directly under `quoro` (the generated `help` counts).
+/// Words directly under `quoro`; clap's generated help subcommands are not
+/// counted.
 const MAX_TOP_LEVEL_WORDS: usize = 25;
-/// Commands with no subcommand of their own.
+/// Commands with no subcommand of their own; clap's generated help
+/// subcommands are not counted.
 const MAX_LEAF_COMMANDS: usize = 50;
 /// Options every command accepts.
 const MAX_GLOBAL_FLAGS: usize = 7;
@@ -26,7 +33,8 @@ const GLOBAL_FLAGS: [&str; 7] = [
     "context", "project", "app", "json", "yes", "reason", "incident",
 ];
 
-/// The tree as a user sees it, with clap's generated `help` subcommand.
+/// The tree as clap builds it, generated `help` subcommands included; the
+/// counts leave them out ([`commands`]).
 fn tree() -> Command {
     let mut command = quoro_cli::command();
     command.build();
@@ -38,9 +46,19 @@ fn generated(argument: &clap::Arg) -> bool {
     argument.get_id() == "help"
 }
 
+/// The subcommands of `command` a user sees: without clap's generated
+/// `help` subcommand (the tree defines no command of that name).
+fn commands(command: &Command) -> impl Iterator<Item = &Command> {
+    command
+        .get_subcommands()
+        .filter(|sub| sub.get_name() != "help")
+}
+
+/// `command` and every command under it, generated help subcommands left
+/// out.
 fn every_command(command: &Command) -> Vec<&Command> {
     let mut all = vec![command];
-    for sub in command.get_subcommands() {
+    for sub in commands(command) {
         all.extend(every_command(sub));
     }
     all
@@ -49,7 +67,7 @@ fn every_command(command: &Command) -> Vec<&Command> {
 #[test]
 fn top_level_words_fit() {
     let tree = tree();
-    let words: Vec<&str> = tree.get_subcommands().map(Command::get_name).collect();
+    let words: Vec<&str> = commands(&tree).map(Command::get_name).collect();
     assert!(
         words.len() <= MAX_TOP_LEVEL_WORDS,
         "{} top-level words, the budget is {MAX_TOP_LEVEL_WORDS}: {words:?}",
@@ -62,7 +80,7 @@ fn leaf_commands_fit() {
     let tree = tree();
     let leaves = every_command(&tree)
         .into_iter()
-        .filter(|command| command.get_subcommands().next().is_none())
+        .filter(|command| commands(command).next().is_none())
         .count();
     assert!(
         leaves <= MAX_LEAF_COMMANDS,
