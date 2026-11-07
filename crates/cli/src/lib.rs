@@ -44,6 +44,12 @@
 //! session with its single-use ticket (`session.rs`). `incident` lists, shows
 //! and resolves incidents (`incident.rs`), and `audit list` reads the audit
 //! log (`audit.rs`).
+//!
+//! `mcp install` makes an MCP client (Claude Code, Codex, Cursor) run
+//! `quoro mcp stdio --context NAME` for an agent's context, merged into the
+//! client's own configuration file, and installs the agent skill compiled
+//! into the binary (`mcp.rs`, `skill.rs`). [`stdio_context`] is what the relay
+//! reads from that context.
 
 mod agent;
 mod api;
@@ -64,10 +70,12 @@ mod links;
 mod login;
 mod logout;
 mod logs;
+mod mcp;
 pub mod operations;
 mod project;
 mod scope;
 mod session;
+pub mod skill;
 mod ssh;
 mod status;
 mod terminal;
@@ -112,6 +120,9 @@ pub struct Environment {
     input: Option<Input>,
     /// The directory the command runs in, where a link is looked up.
     cwd: Option<std::path::PathBuf>,
+    /// The `quoro` binary an MCP client is told to run; `None` is this
+    /// process's own executable.
+    executable: Option<std::path::PathBuf>,
 }
 
 /// Bytes standing in for stdin. `Debug` never shows them: they may hold a
@@ -139,6 +150,7 @@ impl Environment {
             stdin_is_terminal: std::io::stdin().is_terminal(),
             input: None,
             cwd: std::env::current_dir().ok(),
+            executable: None,
         }
     }
 
@@ -158,6 +170,7 @@ impl Environment {
             stdin_is_terminal: false,
             input: None,
             cwd: None,
+            executable: None,
         }
     }
 
@@ -166,6 +179,25 @@ impl Environment {
     pub fn with_cwd(mut self, cwd: impl Into<std::path::PathBuf>) -> Self {
         self.cwd = Some(cwd.into());
         self
+    }
+
+    /// This environment with `path` as the `quoro` binary `mcp install`
+    /// writes into a client's configuration.
+    #[must_use]
+    pub fn with_executable(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.executable = Some(path.into());
+        self
+    }
+
+    /// The absolute path of the `quoro` binary.
+    fn executable(&self) -> Result<std::path::PathBuf, error::Failure> {
+        let path = match &self.executable {
+            Some(path) => path.clone(),
+            None => std::env::current_exe().map_err(|e| {
+                error::Failure::other(format!("cannot find the quoro binary's path: {e}"))
+            })?,
+        };
+        Ok(std::fs::canonicalize(&path).unwrap_or(path))
     }
 
     /// This environment with `bytes` as stdin, a terminal when
@@ -248,6 +280,33 @@ pub fn command() -> clap::Command {
     <cli::Cli as clap::CommandFactory>::command()
 }
 
+/// What `quoro mcp stdio --context NAME` reads from a context: its primary,
+/// the pin of its certificate and its agent key file.
+#[derive(Debug)]
+pub struct StdioContext {
+    /// `https://host[:port]`.
+    pub url: String,
+    /// `sha256:<hex>`; `None` when the context trusts the system's CA store.
+    pub fingerprint: Option<String>,
+    /// The agent key file; `None` when the context stores a personal API
+    /// token or no credential.
+    pub key_file: Option<std::path::PathBuf>,
+}
+
+/// The context `name` of this process's `config.toml` and
+/// `credentials.toml`, as stored: `QUORO_*` variables do not apply. The
+/// error names files and the context, never a credential.
+pub fn stdio_context(name: &str) -> Result<StdioContext, String> {
+    let environment = Environment::from_process();
+    let directory = context::config_dir(&environment).map_err(|e| e.message)?;
+    let stored = context::stored(&directory, name).map_err(|e| e.message)?;
+    Ok(StdioContext {
+        url: stored.url,
+        fingerprint: stored.fingerprint,
+        key_file: stored.key_file,
+    })
+}
+
 /// Runs a client command line (`args` without the program name) against the
 /// process's environment, stdout and stderr.
 pub async fn run(args: Vec<String>) -> ExitCode {
@@ -328,6 +387,7 @@ pub async fn run_with(
             incident::run(&cli.global, command, environment, stdout).await
         }
         cli::Command::Audit(command) => audit::run(&cli.global, command, environment, stdout).await,
+        cli::Command::Mcp(command) => mcp::run(&cli.global, command, environment, stdout),
         cli::Command::Api(args) => api::run(&cli.global, args, environment, stdout, stderr).await,
         cli::Command::Completion { shell } => {
             clap_complete::generate(shell, &mut command(), "quoro", stdout);

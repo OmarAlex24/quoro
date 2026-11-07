@@ -153,6 +153,47 @@ pub fn resolve(flag: Option<&str>, environment: &Environment) -> Result<Context,
     })
 }
 
+/// A named context as `config.toml` and `credentials.toml` hold it, without
+/// the environment's overrides: what `quoro mcp install` writes into an MCP
+/// client's configuration and `quoro mcp stdio --context` reads back.
+#[derive(Debug)]
+pub struct Stored {
+    /// The base URL, `https://host[:port]`.
+    pub url: String,
+    /// `sha256:<hex>` as written; `None` for `tls = "system"`.
+    pub fingerprint: Option<String>,
+    /// The agent key file's path; `None` when the context stores a token or
+    /// no credential.
+    pub key_file: Option<PathBuf>,
+    /// Whether the context stores a personal API token.
+    pub has_token: bool,
+}
+
+/// The context `name` of `directory`'s `config.toml` and `credentials.toml`.
+pub fn stored(directory: &Path, name: &str) -> Result<Stored, Failure> {
+    let (path, mut config) = read_config(directory)?;
+    let entry = config.contexts.remove(name).ok_or_else(|| {
+        Failure::usage(format!(
+            "the context '{name}' is not defined in {}",
+            path.display()
+        ))
+    })?;
+    let fingerprint = entry.fingerprint.clone();
+    let (url, _) = entry_trust(&path, name, entry)?;
+    let credentials = directory.join("credentials.toml");
+    let (key_file, has_token) = match stored_credential(&credentials, name)? {
+        Some(Credential::AgentKey(path)) => (Some(path), false),
+        Some(Credential::Token(_)) => (None, true),
+        None => (None, false),
+    };
+    Ok(Stored {
+        url: base_url(&url)?,
+        fingerprint,
+        key_file,
+        has_token,
+    })
+}
+
 /// `$XDG_CONFIG_HOME/quoro`, or `$HOME/.config/quoro`.
 pub(crate) fn config_dir(environment: &Environment) -> Result<PathBuf, Failure> {
     let base = environment
@@ -186,7 +227,7 @@ pub(crate) fn read_config(directory: &Path) -> Result<(PathBuf, ConfigFile), Fai
 }
 
 /// The `current` context of `config.toml`.
-fn current(directory: &Path) -> Result<String, Failure> {
+pub(crate) fn current(directory: &Path) -> Result<String, Failure> {
     let (path, config) = read_config(directory)?;
     config.current.ok_or_else(|| {
         Failure::usage(format!(
@@ -388,9 +429,16 @@ pub(crate) fn create_private_dir(directory: &Path) -> Result<(), Failure> {
 /// sees the old file or the new one and a secret is never readable by others,
 /// not even for a moment.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), Failure> {
+    create_private_dir(path.parent().unwrap_or(Path::new(".")))?;
+    replace_atomic(path, bytes, mode)
+}
+
+/// [`write_atomic`] into a directory that already exists: the temporary file
+/// is created with `mode` and then given exactly `mode`, whatever the umask,
+/// so a caller that keeps a file's mode keeps it to the bit.
+pub(crate) fn replace_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), Failure> {
     use std::io::Write as _;
     let directory = path.parent().unwrap_or(Path::new("."));
-    create_private_dir(directory)?;
     let file_name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -412,6 +460,11 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), F
         .open(&temporary)
         .and_then(|mut file| {
             file.write_all(bytes)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+            }
             file.sync_all()
         })
         .and_then(|()| std::fs::rename(&temporary, path));
