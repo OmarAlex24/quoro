@@ -265,6 +265,8 @@
   - [0265: M5b refuses warm for an app built from a Git source, with the reason not_in_this_release](adr/0265-m5b-refuses-warm-for-an-app-built-from-a-git-source-with.md)
   - [0266: Where the primary takes a voter's mesh endpoint from (node-to-node peers, section 6.9)](adr/0266-where-the-primary-takes-a-voter-s-mesh-endpoint-from-node.md)
   - [0267: A warm copy the node is no longer the target of is never reported, so the primary cannot always delete it](adr/0267-a-warm-copy-the-node-is-no-longer-the-target-of-is-never.md)
+  - [0269: A PauseCopy snapshot whose volume's VM starts during the copy is Conflict, not a torn copy reported Ok](adr/0269-a-pausecopy-snapshot-whose-volume-s-vm-starts-during-the.md)
+  - [0270: A graceful stop of a VM that a PauseCopy snapshot paused resumes it and asks the guest to power off, instead of a hard shutdown](adr/0270-a-graceful-stop-of-a-vm-that-a-pausecopy-snapshot-paused.md)
   - [0271: Editorial: engine-trait sections 3.16 and 3.11 name the PauseCopy errors and the resume after a restart that #534 implements](adr/0271-editorial-engine-trait-sections-3-16-and-3-11-name-the.md)
   - [0272: Editorial: node-agent-protocol 5.11 and 6.7 say a pause_copy backup pauses the VM that attaches the volume, not the job's vm_id](adr/0272-editorial-node-agent-protocol-5-11-and-6-7-say-a-pause-copy.md)
   - [0273: Contract 6.13: busy also covers a target resolving its copy](adr/0273-contract-6-13-busy-also-covers-a-target-resolving-its-copy.md)
