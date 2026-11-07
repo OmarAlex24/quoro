@@ -70,9 +70,10 @@ pub struct ReconcileOptions {
     pub tick: Duration,
     /// Graceful stop timeout for a desired stop or a restart (10 s).
     pub stop_timeout: Duration,
-    /// First crash-restart backoff (1 s).
+    /// First backoff of a crash restart, and of the next try after a start
+    /// that failed (1 s).
     pub backoff_base: Duration,
-    /// Crash-restart backoff ceiling (5 min).
+    /// Ceiling of that backoff (5 min).
     pub backoff_max: Duration,
     /// How long a VM must run before its restart count resets (10 min).
     pub healthy_after: Duration,
@@ -1141,6 +1142,9 @@ impl<E: Engine + 'static> Reconciler<E> {
             {
                 warn!(vm_id, error = %e, "could not record the restart generation");
             }
+            // An operator's restart is tried at once, whatever a failed start
+            // or a crash left to wait out (#462).
+            self.clear_backoff(&vm_id);
             if vm.desired_status == DesiredStatus::Running {
                 let Some(permit) = self.start_permit(vm).await else {
                     debug!(vm_id, "the lease was lost before the restart; the VM waits");
@@ -1158,6 +1162,7 @@ impl<E: Engine + 'static> Reconciler<E> {
                     }
                     Err(e) => {
                         warn!(vm_id, error = ?e, "could not start the VM after its restart");
+                        self.back_off(&vm_id, Instant::now());
                         let error = e.to_string();
                         self.deployment_line(vm, "boot", &format!("VM start failed: {error}"))
                             .await;
@@ -1210,6 +1215,13 @@ impl<E: Engine + 'static> Reconciler<E> {
                                 reached = false;
                             }
                         }
+                    } else if self.start_backing_off(&vm_id) {
+                        // #462: a start that failed, a `Timeout` included,
+                        // waits out the crash-restart backoff before the next
+                        // try, so a boot slower than its bound does not loop.
+                        drop(permit);
+                        debug!(vm_id, "waiting out the backoff after a failed start");
+                        reached = false;
                     } else {
                         let started = self.engine.start(&id, start_within(&permit)).await;
                         // A fence of the lease may stop the VM from here on.
@@ -1217,11 +1229,13 @@ impl<E: Engine + 'static> Reconciler<E> {
                         match started {
                             Ok(started) => {
                                 debug!(vm_id, "VM started");
+                                self.clear_backoff(&vm_id);
                                 self.deployment_line(vm, "boot", "VM started").await;
                                 info = started;
                             }
                             Err(e) => {
                                 warn!(vm_id, error = ?e, "could not start the VM");
+                                self.back_off(&vm_id, Instant::now());
                                 let error = e.to_string();
                                 self.deployment_line(
                                     vm,
@@ -1841,11 +1855,40 @@ impl<E: Engine + 'static> Reconciler<E> {
                 Ok(Some(started))
             }
             Err(e) => {
-                let timing = self.timings.entry(vm_id.to_owned()).or_default();
-                timing.retry_at = Some(now + timing.backoff);
-                timing.backoff = (timing.backoff * 2).min(max);
+                self.back_off(vm_id, Instant::now());
                 Err(e)
             }
+        }
+    }
+
+    /// Whether a failed start of the VM still waits out its backoff (#462).
+    /// Only a failure sets the wait, so a first start never waits.
+    fn start_backing_off(&self, vm_id: &str) -> bool {
+        self.timings
+            .get(vm_id)
+            .and_then(|timing| timing.retry_at)
+            .is_some_and(|retry_at| Instant::now() < retry_at)
+    }
+
+    /// After a failed start or crash restart, a `Timeout` included: the next
+    /// start waits the VM's backoff from `now`, the moment the start returned,
+    /// and the backoff doubles up to `backoff_max`. It resets to
+    /// `backoff_base` only once the VM has run for `healthy_after`.
+    fn back_off(&mut self, vm_id: &str, now: Instant) {
+        let base = self.options.backoff_base;
+        let max = self.options.backoff_max;
+        let timing = self.timings.entry(vm_id.to_owned()).or_default();
+        if timing.backoff.is_zero() {
+            timing.backoff = base;
+        }
+        timing.retry_at = Some(now + timing.backoff);
+        timing.backoff = (timing.backoff * 2).min(max);
+    }
+
+    /// Lets the next start of the VM run at once; its backoff keeps its length.
+    fn clear_backoff(&mut self, vm_id: &str) {
+        if let Some(timing) = self.timings.get_mut(vm_id) {
+            timing.retry_at = None;
         }
     }
 
