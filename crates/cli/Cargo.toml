@@ -1,0 +1,72 @@
+[package]
+name = "quoro-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+# The client half of the `quoro` binary: it talks to a primary over HTTPS and
+# nothing else, so at runtime it depends on no other workspace crate (no
+# engine, node agent or control plane) and its build stays small.
+[dependencies]
+# The client command tree, its help and the parse errors (derive, no colour).
+clap = { version = "4", default-features = false, features = [
+    "std",
+    "derive",
+    "help",
+    "usage",
+    "error-context",
+] }
+# `quoro completion SHELL` prints the tree as a shell completion script.
+clap_complete = { version = "4", default-features = false }
+# The HTTP/1 client. Manual roots and no provider: the TLS configuration is
+# built below with `ring`, so neither aws-lc-rs (ADR 0080) nor webpki-roots
+# (CDLA-Permissive-2.0, outside ADR 0080) enters the build.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls-manual-roots-no-provider",
+] }
+# The `ClientConfig` with the pinned-fingerprint verifier, on `ring`.
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
+# The host's CA store for a context with `tls = "system"`; already in the lock
+# file through the control plane's webhook client.
+rustls-native-certs = { version = "0.8", default-features = false }
+# SHA-256 of the presented leaf certificate, compared with the pin.
+sha2 = { version = "0.10", default-features = false }
+# `config.toml` and `credentials.toml` are TOML.
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+serde = { version = "1", default-features = false, features = [
+    "derive",
+    "std",
+] }
+# Reads problem bodies and pretty-prints JSON for a terminal.
+serde_json = { version = "1", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# The end-to-end tests run an in-process primary: the control plane's router
+# behind a TLS listener with a self-signed certificate, as `quoro serve` does.
+quoro-control-plane = { path = "../control-plane" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "tokio",
+] }
+axum-server = { version = "0.7", default-features = false, features = [
+    "tls-rustls-no-provider",
+] }
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+# The tests insert a personal API token and read the audit log with SQL; the
+# crate itself never touches a database.
+sqlx = { version = "0.8", default-features = false, features = [
+    "sqlite",
+    "runtime-tokio",
+] }
+# The contract test reads the frozen openapi.yaml (ADR 0048).
+serde_norway = { version = "0.9", default-features = false }
