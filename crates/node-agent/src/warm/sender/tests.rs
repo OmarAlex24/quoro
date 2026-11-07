@@ -1118,12 +1118,34 @@ async fn a_volume_that_stops_being_warm_keeps_nothing_and_a_new_target_keeps_all
         source.statuses.borrow().is_empty()
     })
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // A cycle already under way may still finish: the lease gates its
+    // manifest, not the role (section 6.13), and the primary revokes the
+    // lease before it changes the role. A cycle holds the volume's lock from
+    // start to end, so taking the lock waits for it, however slow the
+    // filesystem makes its copies; every cycle after it sees the new role.
+    drop(source.locks.lock(VOL).await);
     let kept = source.kept().await;
     assert!(!kept.is_empty(), "the snapshots stay");
     let shipped = target.complete_seq().await;
+    let mut taken: Vec<String> = source
+        .engine
+        .volume_snapshots()
+        .into_iter()
+        .map(|snapshot| snapshot.snapshot_id)
+        .collect();
+    taken.sort();
+    // Three cycle intervals: no cycle starts, so no snapshot is taken and
+    // nothing new reaches the target.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(target.complete_seq().await, shipped, "no cycle runs");
+    let mut now: Vec<String> = source
+        .engine
+        .volume_snapshots()
+        .into_iter()
+        .map(|snapshot| snapshot.snapshot_id)
+        .collect();
+    now.sort();
+    assert_eq!(now, taken, "no snapshot is taken");
 
     // No longer warm: every snapshot goes.
     set_entry(&source.desired, |entry| entry.warm = None);
