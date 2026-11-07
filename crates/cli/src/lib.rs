@@ -22,17 +22,27 @@
 //! An agent must say why it changes something (`--reason`), and a destructive
 //! call it may not make yet can file an approval request and wait for a
 //! human's decision (`approval.rs`).
+//!
+//! A folder is linked to a project and an app (`links.rs`), so `status` and
+//! the `project` and `app` commands know what they act on; a resource is
+//! named by name or id, never by an id flag (`scope.rs`).
 
 mod agent;
 mod api;
+mod app;
 mod approval;
 mod cli;
 mod client;
 mod context;
 mod error;
+mod link;
+mod links;
 mod login;
 mod logout;
 pub mod operations;
+mod project;
+mod scope;
+mod status;
 mod terminal;
 mod tls;
 mod whoami;
@@ -71,6 +81,8 @@ pub struct Environment {
     stdin_is_terminal: bool,
     /// What stdin holds, for a test; `None` reads the process's stdin.
     input: Option<Input>,
+    /// The directory the command runs in, where a link is looked up.
+    cwd: Option<std::path::PathBuf>,
 }
 
 /// Bytes standing in for stdin. `Debug` never shows them: they may hold a
@@ -97,6 +109,7 @@ impl Environment {
             stdout_is_terminal: std::io::stdout().is_terminal(),
             stdin_is_terminal: std::io::stdin().is_terminal(),
             input: None,
+            cwd: std::env::current_dir().ok(),
         }
     }
 
@@ -115,7 +128,15 @@ impl Environment {
             stdout_is_terminal,
             stdin_is_terminal: false,
             input: None,
+            cwd: None,
         }
+    }
+
+    /// This environment running in the directory `cwd`.
+    #[must_use]
+    pub fn with_cwd(mut self, cwd: impl Into<std::path::PathBuf>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
     }
 
     /// This environment with `bytes` as stdin, a terminal when
@@ -239,6 +260,17 @@ pub async fn run_with(
         }
         cli::Command::Logout => logout::run(&cli.global, environment, stdout),
         cli::Command::Whoami => whoami::run(&cli.global, environment, stdout).await,
+        cli::Command::Link(args) => {
+            link::link(&cli.global, args, environment, stdout, stderr).await
+        }
+        cli::Command::Unlink => link::unlink(environment, stdout),
+        cli::Command::Status(args) => status::run(&cli.global, args, environment, stdout).await,
+        cli::Command::Project(command) => {
+            project::run(&cli.global, command, environment, stdout, stderr).await
+        }
+        cli::Command::App(command) => {
+            app::run(&cli.global, command, environment, stdout, stderr).await
+        }
         cli::Command::Api(args) => api::run(&cli.global, args, environment, stdout, stderr).await,
         cli::Command::Completion { shell } => {
             clap_complete::generate(shell, &mut command(), "quoro", stdout);

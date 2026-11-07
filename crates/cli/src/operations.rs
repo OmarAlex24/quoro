@@ -7,9 +7,10 @@
 //! `docs/contracts/openapi.yaml`, so a call the contract does not define, or
 //! one whose method or path drifted, fails CI instead of failing on a primary.
 //!
-//! The destructive operations at the end are not called by name: they are
-//! the ones whose approval params the client can reproduce (`approval.rs`),
-//! and registering them checks their templates against the contract.
+//! The destructive operations at the end are the ones whose approval params
+//! the client can reproduce (`approval.rs`); registering them checks their
+//! templates against the contract. Of them only `deleteApp` is also called by
+//! name (`quoro app delete`); the others are reached with `quoro api`.
 
 /// One operation of `openapi.yaml`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +65,112 @@ pub const STREAM_EVENTS: Operation = Operation {
     path: "/api/v1/events/stream",
 };
 
+/// `listProjects` (`project:read`).
+pub const LIST_PROJECTS: Operation = Operation {
+    id: "listProjects",
+    method: "GET",
+    path: "/api/v1/projects",
+};
+
+/// `createProject` (`project:write`).
+pub const CREATE_PROJECT: Operation = Operation {
+    id: "createProject",
+    method: "POST",
+    path: "/api/v1/projects",
+};
+
+/// `getProject` (`project:read`).
+pub const GET_PROJECT: Operation = Operation {
+    id: "getProject",
+    method: "GET",
+    path: "/api/v1/projects/{project_id}",
+};
+
+/// `deleteProject` (`project:delete`). In the contract, not served by the
+/// primary yet: `quoro project delete` says so on its 405.
+pub const DELETE_PROJECT: Operation = Operation {
+    id: "deleteProject",
+    method: "DELETE",
+    path: "/api/v1/projects/{project_id}",
+};
+
+/// `listApps` (`app:read`).
+pub const LIST_APPS: Operation = Operation {
+    id: "listApps",
+    method: "GET",
+    path: "/api/v1/apps",
+};
+
+/// `createApp` (`app:create`).
+pub const CREATE_APP: Operation = Operation {
+    id: "createApp",
+    method: "POST",
+    path: "/api/v1/apps",
+};
+
+/// `getApp` (`app:read`): the app with its instances and domains.
+pub const GET_APP: Operation = Operation {
+    id: "getApp",
+    method: "GET",
+    path: "/api/v1/apps/{app_id}",
+};
+
+/// `updateApp` (`app:update`).
+pub const UPDATE_APP: Operation = Operation {
+    id: "updateApp",
+    method: "PATCH",
+    path: "/api/v1/apps/{app_id}",
+};
+
+/// `startApp` (`app:start`).
+pub const START_APP: Operation = Operation {
+    id: "startApp",
+    method: "POST",
+    path: "/api/v1/apps/{app_id}/start",
+};
+
+/// `stopApp` (`app:stop`).
+pub const STOP_APP: Operation = Operation {
+    id: "stopApp",
+    method: "POST",
+    path: "/api/v1/apps/{app_id}/stop",
+};
+
+/// `listAppDeployments` (`app:read`), newest first.
+pub const LIST_APP_DEPLOYMENTS: Operation = Operation {
+    id: "listAppDeployments",
+    method: "GET",
+    path: "/api/v1/apps/{app_id}/deployments",
+};
+
+/// `getAppMetrics` (`app:read`), read from the nodes.
+pub const GET_APP_METRICS: Operation = Operation {
+    id: "getAppMetrics",
+    method: "GET",
+    path: "/api/v1/apps/{app_id}/metrics",
+};
+
+/// `getAppVulnerabilities` (`app:read`).
+pub const GET_APP_VULNERABILITIES: Operation = Operation {
+    id: "getAppVulnerabilities",
+    method: "GET",
+    path: "/api/v1/apps/{app_id}/vulnerabilities",
+};
+
+/// `getCluster` (`cluster:read`).
+pub const GET_CLUSTER: Operation = Operation {
+    id: "getCluster",
+    method: "GET",
+    path: "/api/v1/cluster",
+};
+
+/// `listNodes` (`node:read`).
+pub const LIST_NODES: Operation = Operation {
+    id: "listNodes",
+    method: "GET",
+    path: "/api/v1/nodes",
+};
+
 /// `deleteApp` (`app:delete`).
 pub const DELETE_APP: Operation = Operation {
     id: "deleteApp",
@@ -100,6 +207,21 @@ pub const OPERATIONS: &[Operation] = &[
     CREATE_APPROVAL,
     GET_APPROVAL,
     STREAM_EVENTS,
+    LIST_PROJECTS,
+    CREATE_PROJECT,
+    GET_PROJECT,
+    DELETE_PROJECT,
+    LIST_APPS,
+    CREATE_APP,
+    GET_APP,
+    UPDATE_APP,
+    START_APP,
+    STOP_APP,
+    LIST_APP_DEPLOYMENTS,
+    GET_APP_METRICS,
+    GET_APP_VULNERABILITIES,
+    GET_CLUSTER,
+    LIST_NODES,
     DELETE_APP,
     DELETE_VM,
     DELETE_VOLUME,

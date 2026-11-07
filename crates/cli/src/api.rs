@@ -41,7 +41,11 @@ pub async fn run(
     }
     let body = args.data.as_deref().map(read_body).transpose()?;
     let justification = environment.justification(global);
-    let headers = change_headers(&method, justification.as_deref(), global)?;
+    let headers = change_headers(
+        &method,
+        justification.as_deref(),
+        global.incident.as_deref(),
+    )?;
     let context = context::resolve(global.context.as_deref(), environment)?;
     // An agent says why it changes something (permission-model.md section
     // 10, D-0031); without a reason nothing is sent, not even a mint.
@@ -63,7 +67,7 @@ pub async fn run(
     };
 
     let response = session.send(&call).await?;
-    let response = if !response.status().is_success() && args.request_approval {
+    let response = if !response.status().is_success() && args.approval.request_approval {
         let answer = Answer::read(response, &session.context.url).await?;
         let failure = answer.failure();
         if failure.code != exit::APPROVAL_REQUIRED {
@@ -74,7 +78,7 @@ pub async fn run(
             justification: justification.as_deref(),
             incident: global.incident.as_deref(),
             json: global.json,
-            wait: args.wait,
+            wait: args.approval.wait,
         };
         approval::file(&mut session, &request, &answer.body, stdout, stderr).await?
     } else {
@@ -156,10 +160,10 @@ fn read_body(data: &str) -> Result<Vec<u8>, Failure> {
 
 /// `--reason` (or `QUORO_JUSTIFICATION`) and `--incident` on a call that
 /// changes something (`docs/contracts/README.md`, "Request headers").
-fn change_headers(
+pub(crate) fn change_headers(
     method: &Method,
     justification: Option<&str>,
-    global: &Global,
+    incident: Option<&str>,
 ) -> Result<HeaderMap, Failure> {
     let mut headers = HeaderMap::new();
     if *method == Method::GET {
@@ -167,7 +171,7 @@ fn change_headers(
     }
     let fields = [
         ("quoro-justification", "--reason", justification),
-        ("quoro-incident", "--incident", global.incident.as_deref()),
+        ("quoro-incident", "--incident", incident),
     ];
     for (name, flag, value) in fields {
         let Some(value) = value else { continue };
