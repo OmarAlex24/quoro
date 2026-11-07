@@ -352,7 +352,7 @@ pub(crate) fn write_credentials(directory: &Path, file: &CredentialsFile) -> Res
 }
 
 /// A TOML basic string.
-fn toml_string(text: &str) -> String {
+pub(crate) fn toml_string(text: &str) -> String {
     let mut quoted = String::with_capacity(text.len() + 2);
     quoted.push('"');
     for c in text.chars() {
