@@ -49,7 +49,8 @@ impl VolumeLocks {
     }
 
     /// The volume's lock, or `None` while someone else holds it: a second
-    /// stream of a volume is refused `busy` (section 6.13).
+    /// stream of a volume, or one that arrives while its copy is resolved,
+    /// is refused `busy` (section 6.13).
     #[must_use]
     pub fn try_lock(&self, volume_id: &str) -> Option<OwnedMutexGuard<()>> {
         self.lock_of(volume_id).try_lock_owned().ok()

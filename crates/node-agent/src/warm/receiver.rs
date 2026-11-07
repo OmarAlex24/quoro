@@ -11,7 +11,8 @@
 //! - the stream names the entry's lease (`wrong_lease`);
 //! - its token is at least the entry's token and the highest token it has
 //!   accepted for the volume (`stale_token`, recorded and reported);
-//! - no other stream of the volume is open (`busy`);
+//! - no other stream of the volume is open and no copy of it is being
+//!   resolved (`busy`, below);
 //! - `base_seq` is null or names its complete copy (`base_mismatch`);
 //! - `snapshot_seq` is above `base_seq`, and for a full copy above its
 //!   complete copy (`not_newer`).
@@ -28,12 +29,16 @@
 //! the desired state it started under. Then it writes the copy it is about
 //! to swap in to its store (`pending`), swaps, and records the new copy. A
 //! crash or an error between the swap and that record leaves the store
-//! naming the copy it may hold; the next start, or the next stream, hashes
-//! the volume file once and keeps whichever copy it matches. A copy that
-//! matches neither is treated as no copy, and the source ships a full one.
-//! When the swap itself fails, the source gets its answer first and the
-//! hash runs after it, still under the volume's lock: the hash reads the
-//! whole volume, which can take longer than the source waits for an answer.
+//! naming the copy it may hold. Resolving it hashes the volume file once and
+//! keeps whichever copy it matches; a copy that matches neither is treated
+//! as no copy, and the source ships a full one. The hash reads the whole
+//! volume, which can take longer than a source waits, so it never runs
+//! while a stream or a pass waits for it. It runs in a task that holds the
+//! volume's lock, and a stream that arrives meanwhile is refused `busy`:
+//! - after a failed swap, once the source has its answer;
+//! - when a stream finds the copy pending, which is refused `busy` too;
+//! - at start-up, while the listeners bind and the streams of other volumes
+//!   are served.
 //!
 //! The copy is never created except from a complete stream, and it is
 //! reported in `status_report.warm`, never in `status_report.volumes`.
@@ -77,6 +82,8 @@ const MAX_CONNECTIONS: usize = 16;
 const PART: &str = "target";
 /// The longest `error` in `status_report.warm` (section 5.3).
 const ERROR_CHARS: usize = 500;
+/// How the error of a copy that could not be resolved starts.
+const UNRESOLVED: &str = "could not resolve the copy left pending";
 
 /// Timings; tests shorten them.
 #[derive(Clone, Debug)]
@@ -147,9 +154,14 @@ struct Inner<E: Engine> {
     /// Held from reading the rows to setting the entries, so a publish that
     /// read older rows never overwrites a newer one's entries.
     publishing: tokio::sync::Mutex<()>,
-    /// Held by a test to keep a failed swap's recovery from starting.
+    /// Volumes whose copy a task removes once their lock is free.
+    deleting: StdMutex<BTreeSet<String>>,
+    /// Held by a test to keep a pending copy's resolution from starting.
     #[cfg(test)]
     recovery_gate: tokio::sync::Mutex<()>,
+    /// Notified once the start-up has listed the pending copies.
+    #[cfg(test)]
+    pending_listed: tokio::sync::Notify,
 }
 
 /// A staging file of a stream or a recovery. Dropped before it is committed
@@ -244,18 +256,25 @@ impl<E: Engine + 'static> WarmReceiver<E> {
                 connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
                 leftovers: StdMutex::new(HashMap::new()),
                 publishing: tokio::sync::Mutex::new(()),
+                deleting: StdMutex::new(BTreeSet::new()),
                 #[cfg(test)]
                 recovery_gate: tokio::sync::Mutex::new(()),
+                #[cfg(test)]
+                pending_listed: tokio::sync::Notify::new(),
             }),
         }
     }
 
-    /// Resolves the copies a crash left pending, then keeps the listeners,
-    /// the target rows and the status entries in step with the desired
-    /// state until `shutdown` resolves.
+    /// Keeps the listeners, the target rows and the status entries in step
+    /// with the desired state until `shutdown` resolves. The copies a crash
+    /// left pending are resolved meanwhile, in a task of their own.
     pub async fn run(self, shutdown: impl Future<Output = ()> + Send) {
         let mut shutdown = std::pin::pin!(shutdown);
-        self.recover_pending().await;
+        // Not awaited: the hashes would hold back every listener. Nothing
+        // aborts the task; an agent that stops during a hash leaves the copy
+        // pending, and the next start or stream resolves it.
+        let recovering = self.clone();
+        tokio::spawn(async move { recovering.recover_pending().await });
         let mut desired = self.inner.desired.clone();
         let mut listeners: BTreeMap<SocketAddr, JoinHandle<()>> = BTreeMap::new();
         let mut tick = tokio::time::interval(self.inner.options.bind_retry);
@@ -424,7 +443,7 @@ impl<E: Engine + 'static> WarmReceiver<E> {
     }
 
     /// Resolves every copy a crash left pending (see the module
-    /// documentation).
+    /// documentation), one at a time.
     pub async fn recover_pending(&self) {
         let rows = match self.inner.store.warm_targets().await {
             Ok(rows) => rows,
@@ -433,11 +452,42 @@ impl<E: Engine + 'static> WarmReceiver<E> {
                 return;
             }
         };
-        for mut row in rows.into_iter().filter(|row| row.pending.is_some()) {
-            let _guard = self.inner.locks.lock(&row.volume_id).await;
-            if let Err(e) = self.inner.recover(&mut row).await {
-                warn!(volume_id = %row.volume_id, error = %e, "could not resolve a warm copy left pending");
+        let pending: Vec<String> = rows
+            .into_iter()
+            .filter(|row| row.pending.is_some())
+            .map(|row| row.volume_id)
+            .collect();
+        #[cfg(test)]
+        self.inner.pending_listed.notify_one();
+        for volume_id in pending {
+            let guard = self.inner.locks.lock(&volume_id).await;
+            // Read again under the lock: a stream may have resolved the copy,
+            // and swapped a newer one in, while this waited for it.
+            let row = match self.inner.store.warm_target(&volume_id).await {
+                Ok(Some(row)) if row.pending.is_some() && !row.removed => row,
+                Ok(_) => continue,
+                Err(e) => {
+                    warn!(volume_id, error = %e, "could not read a warm target");
+                    continue;
+                }
+            };
+            // A copy about to be deleted needs no hash.
+            if self.inner.entry_state(&volume_id) == Some(SpecVolumeState::Deleted) {
+                continue;
             }
+            // The node holds the volume as its own (it turned from target
+            // into source): the file is the live volume, which no stream
+            // writes and nothing hashes here. Its warm record waits for the
+            // hand-over of section 9.
+            match self.inner.own_volume(&volume_id).await {
+                Ok(false) => {}
+                Ok(true) => continue,
+                Err(e) => {
+                    warn!(volume_id, error = %e, "could not read the volume row");
+                    continue;
+                }
+            }
+            self.inner.resolve(guard, row).await;
         }
     }
 }
@@ -571,8 +621,26 @@ impl<E: Engine + 'static> Inner<E> {
         }
     }
 
+    /// The state of the desired state's entry for `volume_id`, if it names
+    /// the volume.
+    fn entry_state(&self, volume_id: &str) -> Option<SpecVolumeState> {
+        let desired = self.desired.borrow();
+        desired
+            .as_ref()?
+            .state
+            .spec
+            .volumes
+            .iter()
+            .find(|file| file.volume_id == volume_id)
+            .map(|file| file.state)
+    }
+
     /// Every check of section 6.13, then the volume's lock.
-    async fn accept(&self, header: &StreamHeader, remote: IpAddr) -> Result<Accepted, Reject> {
+    async fn accept(
+        self: &Arc<Self>,
+        header: &StreamHeader,
+        remote: IpAddr,
+    ) -> Result<Accepted, Reject> {
         let (size_gb, seq) = self.check_entry(header, remote).await?;
         if header.size_bytes != u64::from(size_gb) * GIB {
             return Err(Reject::Refuse(RefuseReason::BadFrame, seq));
@@ -606,10 +674,15 @@ impl<E: Engine + 'static> Inner<E> {
             .await
             .map_err(|e| Reject::Failed(e.to_string()))?
             .ok_or_else(|| Reject::Failed("the warm target row is gone".to_owned()))?;
-        if record.pending.is_some() {
-            self.recover(&mut record).await.map_err(Reject::Failed)?;
-        }
         let seq = record.complete_seq;
+        if record.pending.is_some() {
+            // Resolving the copy reads the whole volume, longer than the
+            // source waits for its next frame: it runs in a task that keeps
+            // the lock, and the source tries again on its next cycle.
+            info!(volume_id = %header.volume_id, "a stream found the copy pending; resolving it first");
+            self.resolve_in_task(guard, record);
+            return Err(Reject::Refuse(RefuseReason::Busy, seq));
+        }
         if header.fencing_token < record.highest_token {
             self.record_stale(&file, header.fencing_token).await;
             return Err(Reject::Refuse(RefuseReason::StaleToken, seq));
@@ -765,36 +838,58 @@ impl<E: Engine + 'static> Inner<E> {
                 staging.discard().await;
                 let reason = format!("could not swap the copy in: {e}");
                 self.set_error(&header.volume_id, Some(&reason)).await;
-                self.resolve_failed_swap(guard, record);
+                self.resolve_in_task(guard, record);
                 Outcome::Failed(reason)
             }
         }
     }
 
-    /// Resolves the copy of a failed swap in a task of its own, which holds
-    /// the volume's lock until the copy is resolved and published. Nothing
+    /// Resolves a pending copy in a task of its own, which holds the
+    /// volume's lock until the copy is resolved and published. Nothing
     /// aborts the task; an agent that stops during the hash leaves the copy
     /// pending, and the next start or stream resolves it.
-    fn resolve_failed_swap(
-        self: &Arc<Self>,
-        guard: OwnedMutexGuard<()>,
-        mut record: WarmTargetRecord,
-    ) {
+    fn resolve_in_task(self: &Arc<Self>, guard: OwnedMutexGuard<()>, record: WarmTargetRecord) {
         let inner = Arc::clone(self);
-        tokio::spawn(async move {
-            #[cfg(test)]
-            let gate = inner.recovery_gate.lock().await;
-            if let Err(e) = inner.recover(&mut record).await {
-                warn!(volume_id = %record.volume_id, error = %e, "could not resolve a failed swap");
+        tokio::spawn(async move { inner.resolve(guard, record).await });
+    }
+
+    /// Resolves the pending copy of `record`, whose lock `guard` holds,
+    /// publishes the result, and only then releases the lock.
+    async fn resolve(&self, guard: OwnedMutexGuard<()>, mut record: WarmTargetRecord) {
+        #[cfg(test)]
+        let gate = self.recovery_gate.lock().await;
+        match self.recover(&mut record).await {
+            Ok(()) => {
+                // Only an earlier resolution's error goes: a failed swap's
+                // stays until a stream lands. Read from the store, since a
+                // failed swap set its error after `record` was read.
+                let unresolved = self
+                    .store
+                    .warm_target(&record.volume_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|row| row.error)
+                    .is_some_and(|error| error.starts_with(UNRESOLVED));
+                if unresolved {
+                    self.set_error(&record.volume_id, None).await;
+                }
             }
-            #[cfg(test)]
-            drop(gate);
-            inner.publish().await;
-            // Only now. A stream that came before was refused `busy`; what
-            // waits for the lock (a `deleted` entry, this node's sender)
-            // finds the copy resolved and published.
-            drop(guard);
-        });
+            Err(e) => {
+                warn!(volume_id = %record.volume_id, error = %e, "could not resolve a warm copy left pending");
+                // The copy stays pending and the next stream tries again;
+                // the status says why the copy does not move.
+                let reason = format!("{UNRESOLVED}: {e}");
+                self.set_error(&record.volume_id, Some(&reason)).await;
+            }
+        }
+        #[cfg(test)]
+        drop(gate);
+        self.publish().await;
+        // Only now. A stream that came before was refused `busy`; what takes
+        // the lock next (a `deleted` entry's removal, this node's sender)
+        // finds the copy resolved and published.
+        drop(guard);
     }
 
     /// The checks of [`Inner::check_entry`] again, against the desired state
@@ -1009,17 +1104,71 @@ impl<E: Engine + 'static> Inner<E> {
     }
 
     /// Removes the copy of a `deleted` entry this node holds as a target,
-    /// then forgets it.
-    async fn delete_copy(&self, volume_id: &str) {
+    /// then forgets it. While a stream or a resolution holds the volume, a
+    /// task waits for its lock and removes the copy then, so the pass never
+    /// waits for a hash of the volume. The removal must not depend on a later
+    /// pass: the copy leaves `status_report.warm` with this one, and the
+    /// primary stops sending the entry once the node no longer reports it.
+    async fn delete_copy(self: &Arc<Self>, volume_id: &str) {
+        if !self.holds_copy(volume_id).await {
+            return;
+        }
+        if let Some(guard) = self.locks.try_lock(volume_id) {
+            self.remove_if_deleted(volume_id, guard).await;
+            return;
+        }
+        let waiting = self
+            .deleting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(volume_id.to_owned());
+        if !waiting {
+            return;
+        }
+        debug!(
+            volume_id,
+            "the warm copy is busy; removing it once it is free"
+        );
+        let inner = Arc::clone(self);
+        let volume_id = volume_id.to_owned();
+        tokio::spawn(async move {
+            let guard = inner.locks.lock(&volume_id).await;
+            inner.remove_if_deleted(&volume_id, guard).await;
+            inner
+                .deleting
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&volume_id);
+        });
+    }
+
+    /// Removes the copy of `volume_id`, whose lock `guard` holds, unless its
+    /// entry is `present` again: this node may be the target again, or the
+    /// source, whose file the reconciler adopts. Only a volume still
+    /// `deleted`, or no longer named, goes.
+    async fn remove_if_deleted(&self, volume_id: &str, guard: OwnedMutexGuard<()>) {
+        if self.entry_state(volume_id) != Some(SpecVolumeState::Present)
+            && self.holds_copy(volume_id).await
+        {
+            self.remove_copy(volume_id, guard).await;
+        }
+    }
+
+    /// Whether the node has a warm target row for `volume_id` not yet
+    /// marked removed.
+    async fn holds_copy(&self, volume_id: &str) -> bool {
         match self.store.warm_target(volume_id).await {
-            Ok(Some(row)) if !row.removed => {}
-            Ok(_) => return,
+            Ok(row) => row.is_some_and(|row| !row.removed),
             Err(e) => {
                 warn!(volume_id, error = %e, "could not read a warm target");
-                return;
+                false
             }
         }
-        let _guard = self.locks.lock(volume_id).await;
+    }
+
+    /// Removes the copy of `volume_id`, whose lock `_guard` holds, and marks
+    /// its row removed.
+    async fn remove_copy(&self, volume_id: &str, _guard: OwnedMutexGuard<()>) {
         let own = match self.own_volume(volume_id).await {
             Ok(own) => own,
             Err(e) => {
