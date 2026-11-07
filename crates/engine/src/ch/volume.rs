@@ -1166,7 +1166,9 @@ pub(super) async fn resume_left_paused(entry: &VmEntry) {
 
 /// The paused process the VM's directory records, if any can be read.
 fn recorded_pause(entry: &VmEntry) -> Option<ProcessId> {
-    state::read_json(&entry.paths.snapshot_paused).ok().flatten()
+    state::read_json(&entry.paths.snapshot_paused)
+        .ok()
+        .flatten()
 }
 
 /// Removes the record of a snapshot's pause if it names `process`, so one
