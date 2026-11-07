@@ -6,7 +6,7 @@
 //! lines are parsed by hand: they have a few commands and a handful of flags,
 //! so the `match` below is less code than a parser. Every other command line
 //! goes to the client CLI (`quoro_cli`), which talks to a primary's API; the
-//! hand-offs are the unknown-command arm, `mcp` other than `stdio`, `audit`
+//! hand-offs are the unknown-command arm, `mcp` other than `mcp stdio`, `audit`
 //! other than `verify`, and `--help`.
 
 mod advertise;
@@ -46,6 +46,8 @@ commands:
   node set-primary <url> [--config PATH] [--no-restart]
                                         point this enrolled node at its
                                         primary's new address
+  mcp stdio --context NAME [--url URL] [--fingerprint FINGERPRINT]
+            [--key-file PATH] [--justification TEXT]
   mcp stdio --url URL --fingerprint FINGERPRINT --key-file PATH
             [--justification TEXT]
                                         serve MCP over stdio for a local MCP
@@ -81,7 +83,13 @@ it is never accepted on the command line. The key is exchanged for a
 five-minute access token, renewed before it expires, and every message goes
 to the primary at --url over TLS pinned to --fingerprint (the sha256: value a
 join command carries). The primary authorizes and audits every tool call;
---justification is recorded with each token the session mints.";
+--justification is recorded with each token the session mints.
+
+With --context NAME the URL, the fingerprint and the key file come from that
+context of the client's config.toml and credentials.toml (quoro login --agent
+saves them; quoro mcp install writes this command into an MCP client). A flag
+given as well overrides the context, and QUORO_AGENT_KEY_FILE overrides the
+context's key file, as it does for every client command.";
 
 /// What `quoro version` adds when the control plane was compiled with its
 /// dev-only feature, however it was turned on (ADR 0223). CI fails a default
@@ -238,35 +246,101 @@ fn join_role(flags: &[(String, String)]) -> Result<node::Role, String> {
     }
 }
 
-/// `quoro mcp stdio --url URL --fingerprint FINGERPRINT --key-file PATH
-/// [--justification TEXT]`.
+/// `quoro mcp stdio [--context NAME] [--url URL] [--fingerprint FINGERPRINT]
+/// [--key-file PATH] [--justification TEXT]`; `quoro mcp` and any other
+/// `mcp` command line (`mcp install`) are the client's.
 async fn mcp_command(args: &[String]) -> ExitCode {
-    let Some((transport, rest)) = args.split_first() else {
-        return usage_error("mcp needs a transport: quoro mcp stdio ...");
-    };
-    if transport != "stdio" {
+    let Some((_, rest)) = args.split_first().filter(|(word, _)| *word == "stdio") else {
         return client("mcp", args).await;
-    }
-    let flags = match parse_flags(rest, &["url", "fingerprint", "key-file", "justification"]) {
+    };
+    let flags = match parse_flags(
+        rest,
+        &["context", "url", "fingerprint", "key-file", "justification"],
+    ) {
         Ok(flags) => flags,
         Err(e) => return usage_error(&e),
     };
-    let (Some(url), Some(fingerprint), Some(key_file)) = (
-        flag(&flags, "url"),
-        flag(&flags, "fingerprint"),
-        flag(&flags, "key-file"),
-    ) else {
-        return usage_error("mcp stdio needs --url, --fingerprint and --key-file");
+    let context = match flag(&flags, "context") {
+        Some(name) => match quoro_cli::stdio_context(name) {
+            Ok(context) => Some((name, context)),
+            Err(message) => {
+                eprintln!("quoro mcp stdio: {message}");
+                return ExitCode::from(1);
+            }
+        },
+        None => None,
     };
-    mcp_stdio::run(mcp_stdio::Options {
-        url: url.to_string(),
-        fingerprint: fingerprint.to_string(),
-        key_file: PathBuf::from(key_file),
-        justification: flag(&flags, "justification")
-            .unwrap_or(mcp_stdio::DEFAULT_JUSTIFICATION)
-            .to_string(),
+    let key_variable = std::env::var("QUORO_AGENT_KEY_FILE")
+        .ok()
+        .filter(|path| !path.is_empty());
+    let options = match stdio_options(&flags, key_variable.as_deref(), context) {
+        Ok(options) => options,
+        Err(StdioError::Usage(message)) => return usage_error(&message),
+        Err(StdioError::Context(message)) => {
+            eprintln!("quoro mcp stdio: {message}");
+            return ExitCode::from(1);
+        }
+    };
+    mcp_stdio::run(options).await
+}
+
+/// Why `quoro mcp stdio`'s options could not be put together.
+#[derive(Debug)]
+enum StdioError {
+    /// The command line is incomplete.
+    Usage(String),
+    /// The context lacks what the relay needs.
+    Context(String),
+}
+
+/// The relay's options: each flag, else for the key `QUORO_AGENT_KEY_FILE`,
+/// else the context's value.
+fn stdio_options(
+    flags: &[(String, String)],
+    key_variable: Option<&str>,
+    context: Option<(&str, quoro_cli::StdioContext)>,
+) -> Result<mcp_stdio::Options, StdioError> {
+    let justification = flag(flags, "justification")
+        .unwrap_or(mcp_stdio::DEFAULT_JUSTIFICATION)
+        .to_string();
+    let key_override = flag(flags, "key-file").or(key_variable).map(PathBuf::from);
+    let Some((name, context)) = context else {
+        let (Some(url), Some(fingerprint), Some(key_file)) =
+            (flag(flags, "url"), flag(flags, "fingerprint"), key_override)
+        else {
+            return Err(StdioError::Usage(
+                "mcp stdio needs --context NAME, or --url, --fingerprint and --key-file"
+                    .to_string(),
+            ));
+        };
+        return Ok(mcp_stdio::Options {
+            url: url.to_string(),
+            fingerprint: fingerprint.to_string(),
+            key_file,
+            justification,
+        });
+    };
+    let fingerprint = flag(flags, "fingerprint")
+        .map(str::to_string)
+        .or(context.fingerprint)
+        .ok_or_else(|| {
+            StdioError::Context(format!(
+                "the context '{name}' trusts the system's CA store and the relay pins the \
+                 primary's certificate: pass --fingerprint sha256:..."
+            ))
+        })?;
+    let key_file = key_override.or(context.key_file).ok_or_else(|| {
+        StdioError::Context(format!(
+            "the context '{name}' has no agent key file, and MCP runs as an agent: log in with \
+             quoro login --agent --key-file PATH --context {name}, or pass --key-file"
+        ))
+    })?;
+    Ok(mcp_stdio::Options {
+        url: flag(flags, "url").map_or(context.url, str::to_string),
+        fingerprint,
+        key_file,
+        justification,
     })
-    .await
 }
 
 /// `quoro node [--config PATH]`: the node agent alone, until SIGTERM.
@@ -577,6 +651,101 @@ mod tests {
         assert!(parse_serve_flags(&args(&["--skip-upgrade-backup=yes"])).is_err());
         assert!(parse_serve_flags(&args(&["--config"])).is_err());
         assert!(parse_serve_flags(&args(&["--nope", "1"])).is_err());
+    }
+
+    #[test]
+    fn stdio_options_take_flags_then_the_key_variable_then_the_context() {
+        let flags = |list: &[&str]| {
+            parse_flags(
+                &args(list),
+                &["context", "url", "fingerprint", "key-file", "justification"],
+            )
+            .unwrap()
+        };
+        let context = |fingerprint: Option<&str>, key_file: Option<&str>| quoro_cli::StdioContext {
+            url: "https://lab.example:8443".to_string(),
+            fingerprint: fingerprint.map(str::to_string),
+            key_file: key_file.map(PathBuf::from),
+        };
+        let pin = "sha256:aa";
+
+        let options = stdio_options(
+            &flags(&["--context", "lab"]),
+            None,
+            Some(("lab", context(Some(pin), Some("/k/agent.key")))),
+        )
+        .unwrap();
+        assert_eq!(options.url, "https://lab.example:8443");
+        assert_eq!(options.fingerprint, pin);
+        assert_eq!(options.key_file, PathBuf::from("/k/agent.key"));
+        assert_eq!(options.justification, mcp_stdio::DEFAULT_JUSTIFICATION);
+
+        let options = stdio_options(
+            &flags(&[
+                "--context",
+                "lab",
+                "--url",
+                "https://other:1",
+                "--justification",
+                "j",
+            ]),
+            Some("/env/agent.key"),
+            Some(("lab", context(Some(pin), Some("/k/agent.key")))),
+        )
+        .unwrap();
+        assert_eq!(
+            options.url, "https://other:1",
+            "a flag overrides the context"
+        );
+        assert_eq!(options.key_file, PathBuf::from("/env/agent.key"));
+        assert_eq!(options.justification, "j");
+
+        let options = stdio_options(
+            &flags(&["--context", "lab", "--key-file", "/flag.key"]),
+            Some("/env/agent.key"),
+            Some(("lab", context(Some(pin), None))),
+        )
+        .unwrap();
+        assert_eq!(
+            options.key_file,
+            PathBuf::from("/flag.key"),
+            "the flag wins"
+        );
+
+        let error = stdio_options(
+            &flags(&["--context", "lab"]),
+            None,
+            Some(("lab", context(Some(pin), None))),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, StdioError::Context(m) if m.contains("quoro login --agent")),
+            "{error:?}"
+        );
+        let error = stdio_options(
+            &flags(&["--context", "lab"]),
+            None,
+            Some(("lab", context(None, Some("/k")))),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, StdioError::Context(m) if m.contains("--fingerprint")),
+            "{error:?}"
+        );
+
+        // Without a context every value is a flag, and the key may be the
+        // variable's.
+        assert!(matches!(
+            stdio_options(&flags(&["--url", "https://x"]), None, None),
+            Err(StdioError::Usage(_))
+        ));
+        let options = stdio_options(
+            &flags(&["--url", "https://x", "--fingerprint", pin]),
+            Some("/env/agent.key"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(options.key_file, PathBuf::from("/env/agent.key"));
     }
 
     #[test]

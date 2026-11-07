@@ -64,7 +64,9 @@ pub const DEFAULT_JUSTIFICATION: &str =
 const PARSE_ERROR: i64 = -32700;
 const INTERNAL_ERROR: i64 = -32603;
 
-/// What `quoro mcp stdio` was started with.
+/// What `quoro mcp stdio` was started with. It holds the key file's path,
+/// never the key.
+#[derive(Debug)]
 pub struct Options {
     /// `https://host[:port]` of the primary.
     pub url: String,

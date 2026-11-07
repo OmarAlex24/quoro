@@ -22,7 +22,7 @@ Commands:
   Resources  project, app, env, domain, volume, backup, build
   Machines   vm
   Operate    incident, audit
-  Tools      api, completion
+  Tools      api, completion, mcp
 
 Run 'quoro <command> --help' for a command's subcommands and flags.
 
@@ -132,6 +132,13 @@ pub enum Command {
     Audit(AuditCommand),
     /// Call any API operation and print the response body
     Api(ApiArgs),
+    /// Connect an MCP client (Claude Code, Codex, Cursor) and teach it Quoro
+    #[command(
+        subcommand,
+        after_help = "The relay the client runs is the host command \
+                      quoro mcp stdio --context NAME (quoro help host)."
+    )]
+    Mcp(McpCommand),
     /// Print a shell completion script
     Completion {
         /// The shell to complete for
@@ -497,6 +504,24 @@ pub enum AuditCommand {
         #[arg(long, value_name = "T")]
         since: Option<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum McpCommand {
+    /// Make an MCP client run quoro mcp stdio with this context, and install the skill
+    Install(McpInstallArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct McpInstallArgs {
+    /// The MCP client to configure
+    #[arg(long, value_name = "CLIENT", default_value = "claude",
+        value_parser = ["claude", "codex", "cursor"])]
+    pub client: String,
+    /// user: your home directory, for every project; project: this folder
+    #[arg(long, value_name = "SCOPE", default_value = "user",
+        value_parser = ["user", "project"])]
+    pub scope: String,
 }
 
 #[derive(Debug, Args)]

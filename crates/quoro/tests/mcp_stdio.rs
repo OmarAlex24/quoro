@@ -9,9 +9,14 @@
 //! show the call as the agent's, on the `mcp` channel, because the relay only
 //! forwards to the primary's `/mcp` and adds nothing of its own (ADR 0031).
 //!
+//! A third session runs as `quoro mcp install` sets it up, with
+//! `--context NAME` alone: the URL, the pin and the key file come from the
+//! client's `config.toml` and `credentials.toml`.
+//!
 //! The failure cases need no session: a missing, shared or malformed key
-//! file, and a fingerprint that does not match the primary, all end the
-//! process with a message on stderr before it reads stdin.
+//! file, a fingerprint that does not match the primary, and a context with a
+//! token or none at all, all end the process with a message on stderr before
+//! it reads stdin.
 
 use serde_json::{Value, json};
 use std::os::unix::fs::PermissionsExt as _;
@@ -210,6 +215,43 @@ fn spawn_relay(primary: &Primary, key_file: &Path, fingerprint: &str) -> Child {
         .kill_on_drop(true)
         .spawn()
         .expect("spawn quoro mcp stdio")
+}
+
+/// Writes a client configuration under `xdg` whose context `name` holds
+/// `url`, `fingerprint` and the credential line `credential`
+/// (`key_file = "..."` or `token = "..."`), as `quoro login` saves them.
+fn write_context(xdg: &Path, name: &str, url: &str, fingerprint: &str, credential: &str) {
+    let directory = xdg.join("quoro");
+    std::fs::create_dir_all(&directory).expect("create the config directory");
+    write_file(
+        &directory,
+        "config.toml",
+        &format!(
+            "current = \"{name}\"\n\n[contexts.{name}]\nurl = \"{url}\"\nfingerprint = \"{fingerprint}\"\n"
+        ),
+        0o644,
+    );
+    write_file(
+        &directory,
+        "credentials.toml",
+        &format!("[contexts.{name}]\n{credential}\n"),
+        0o600,
+    );
+}
+
+/// Spawns `quoro mcp stdio --context NAME` with the client configuration
+/// in `xdg`, the way `quoro mcp install` makes an MCP client run it.
+fn spawn_context_relay(xdg: &Path, name: &str) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_quoro"))
+        .args(["mcp", "stdio", "--context", name])
+        .env("XDG_CONFIG_HOME", xdg)
+        .env_remove("QUORO_AGENT_KEY_FILE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn quoro mcp stdio --context")
 }
 
 /// The relay's stdout. The relay forwards messages concurrently, so answers
@@ -452,6 +494,58 @@ async fn a_stdio_session_lists_tools_and_reads_through_the_primary() {
         "the mint carries --justification: {mint}"
     );
 
+    // `--context` reads the URL, the pin and the key file from a context of
+    // the client's configuration, as `quoro mcp install` sets it up.
+    let xdg = dir.path().join("xdg");
+    write_context(
+        &xdg,
+        "lab",
+        base,
+        &primary.fingerprint,
+        &format!("key_file = \"{}\"", key_file.display()),
+    );
+    let mut relay = spawn_context_relay(&xdg, "lab");
+    let mut stdin = relay.stdin.take().expect("stdin is piped");
+    let mut stdout = Answers {
+        lines: BufReader::new(relay.stdout.take().expect("stdout is piped")).lines(),
+        early: Vec::new(),
+    };
+    for message in [
+        json!({
+            "jsonrpc": "2.0", "id": 21, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "stdio-test-context", "version": "0" },
+            },
+        }),
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        json!({ "jsonrpc": "2.0", "id": 22, "method": "tools/list" }),
+    ] {
+        stdin
+            .write_all(send(message).as_bytes())
+            .await
+            .expect("write a message");
+    }
+    let initialized = stdout.response(21).await;
+    assert_eq!(
+        initialized["result"]["serverInfo"]["name"], "quoro",
+        "the context's primary answered: {initialized}"
+    );
+    let listed = stdout.response(22).await;
+    assert!(
+        listed["result"]["tools"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "get_cluster")),
+        "tools/list through the context: {listed}"
+    );
+    drop(stdin);
+    let status = timeout(WAIT, relay.wait())
+        .await
+        .expect("the relay exits")
+        .expect("wait");
+    assert!(status.success(), "the relay exits 0 at end of input");
+
     // A pin that does not match this primary fails before stdin is read.
     let wrong = format!("sha256:{}", "0".repeat(64));
     let output = spawn_relay(&primary, &key_file, &wrong)
@@ -524,6 +618,35 @@ async fn a_missing_shared_or_malformed_key_file_fails_clearly() {
     let malformed = write_file(dir.path(), "malformed.key", "not a key\n", 0o600);
     let stderr = run(malformed).await;
     assert!(stderr.contains("does not hold an agent key"), "{stderr}");
+
+    // A context the relay cannot run as: one with a personal API token, and
+    // one that does not exist. Both fail before anything is sent.
+    let xdg = dir.path().join("xdg");
+    let pin = format!("sha256:{}", "a".repeat(64));
+    write_context(
+        &xdg,
+        "human",
+        "https://127.0.0.1:9",
+        &pin,
+        "token = \"tok_secret\"",
+    );
+    for (name, expected) in [
+        (
+            "human",
+            "quoro login --agent --key-file PATH --context human",
+        ),
+        ("absent", "'absent' is not defined"),
+    ] {
+        let output = spawn_context_relay(&xdg, name)
+            .wait_with_output()
+            .await
+            .expect("run quoro mcp stdio --context");
+        assert_eq!(output.status.code(), Some(1), "{name}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{name}: {stderr}");
+        assert!(!stderr.contains("tok_secret"), "the token is never echoed");
+        assert!(output.stdout.is_empty(), "nothing is written on stdout");
+    }
 
     // The key is never taken from the command line.
     let output = Command::new(env!("CARGO_BIN_EXE_quoro"))
