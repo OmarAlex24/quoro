@@ -371,6 +371,26 @@ async fn round_trip(socket: &mut Socket) {
     }
 }
 
+/// Every frame the primary sends before the `pong`s of two `ping`s. A frame
+/// queued for the session before the first `ping` is among them: the session
+/// may take the `ping` first, but not both.
+async fn frames_until_settled(socket: &mut Socket) -> Vec<Value> {
+    let mut frames = Vec::new();
+    for _ in 0..2 {
+        let id = format!("msg_{}", ulid_like());
+        let text = NodeMessage::Ping.to_frame(&id, None).to_text();
+        socket.send(WsMessage::Text(text.into())).await.unwrap();
+        loop {
+            let frame = recv_frame(socket).await;
+            if frame["type"] == "pong" && frame["re"] == id.as_str() {
+                break;
+            }
+            frames.push(frame);
+        }
+    }
+    frames
+}
+
 /// The answer of a node that stopped and recorded the lease's VMs.
 fn ok_result() -> NodeMessage {
     NodeMessage::CommandResult(CommandResult {
@@ -1561,8 +1581,8 @@ async fn a_restore_grants_its_lease_only_once_the_old_holder_answers_its_revoke(
 }
 
 /// A revoke refused with `error` says nothing about the VMs, so the restore
-/// waits. The node's next session names the lease, the primary revokes it
-/// again, and that revoke's `ok` lets the restore finish.
+/// waits. The node's next session names the lease `revoked`, the primary
+/// revokes it again once, and that revoke's `ok` lets the restore finish.
 #[tokio::test]
 async fn a_refused_revoke_keeps_the_restore_waiting_until_a_later_session_answers() {
     let mut setup = setup().await;
@@ -1581,23 +1601,7 @@ async fn a_refused_revoke_keeps_the_restore_waiting_until_a_later_session_answer
     ready_waits(&mut setup, &moving).await;
 
     drop_old_session(&mut setup).await;
-    let mut socket = connect(&setup.state.server, &setup.state.node.credential).await;
-    let NodeMessage::Hello(mut hello) = hello(&setup.state.node.node_id) else {
-        unreachable!("hello builds a hello");
-    };
-    hello.leases = vec![wire::HelloLease {
-        lease_id: moving.lease_id.clone(),
-        resource_type: quoro_proto::ResourceType::App,
-        resource_id: setup.state.app_id.clone(),
-        mode: quoro_proto::LeaseMode::Local,
-        fencing_token: u64::try_from(moving.old_token).unwrap(),
-        state: "held".to_string(),
-    }];
-    send(&mut socket, NodeMessage::Hello(hello)).await;
-    recv_type(&mut socket, "welcome").await;
-    let revoke = recv_type(&mut socket, "lease_revoke").await;
-    assert_eq!(revoke["body"]["lease_id"], moving.lease_id);
-    setup.state.socket = socket;
+    let revoke = reconnect_old_node(&mut setup, &moving, true).await;
     ready_waits(&mut setup, &moving).await;
 
     reply(
@@ -1610,16 +1614,40 @@ async fn a_refused_revoke_keeps_the_restore_waiting_until_a_later_session_answer
     ready_grants(&mut setup, &moving, moving.old_token).await;
 }
 
-/// Connects the old node again with a `hello` that names no lease, and returns
-/// the `lease_revoke` the primary sends after `welcome`.
-async fn reconnect_old_node(setup: &mut Setup, moving: &Moving) -> Value {
+/// Connects the old node again, with a `hello` that names the lease
+/// `revoked` at its token when `named`, as a node that took the revoke does,
+/// or names no lease. Returns the one `lease_revoke` of the lease that the
+/// primary sends between `welcome` and `desired_state`.
+async fn reconnect_old_node(setup: &mut Setup, moving: &Moving, named: bool) -> Value {
     let mut socket = connect(&setup.state.server, &setup.state.node.credential).await;
-    send(&mut socket, hello(&setup.state.node.node_id)).await;
+    let NodeMessage::Hello(mut hello) = hello(&setup.state.node.node_id) else {
+        unreachable!("hello builds a hello");
+    };
+    if named {
+        hello.leases = vec![wire::HelloLease {
+            lease_id: moving.lease_id.clone(),
+            resource_type: quoro_proto::ResourceType::App,
+            resource_id: setup.state.app_id.clone(),
+            mode: quoro_proto::LeaseMode::Local,
+            fencing_token: u64::try_from(moving.old_token).unwrap(),
+            state: "revoked".to_string(),
+        }];
+    }
+    send(&mut socket, NodeMessage::Hello(hello)).await;
     recv_type(&mut socket, "welcome").await;
-    let revoke = recv_type(&mut socket, "lease_revoke").await;
+    let frames = recv_until(&mut socket, &["desired_state"]).await;
+    let revokes: Vec<&Value> = frames
+        .iter()
+        .filter(|frame| frame["type"] == "lease_revoke")
+        .collect();
+    assert_eq!(revokes.len(), 1, "one revoke of the lease: {frames:?}");
+    let revoke = revokes[0].clone();
     assert_eq!(revoke["body"]["lease_id"], moving.lease_id);
     assert_eq!(revoke["body"]["fencing_token"], json!(moving.old_token));
-    assert_eq!(revoke["body"]["reason"], "moved");
+    assert_eq!(
+        revoke["body"]["reason"],
+        if named { "deleted" } else { "moved" }
+    );
     setup.state.socket = socket;
     revoke
 }
@@ -1666,7 +1694,7 @@ async fn a_restore_revokes_its_lease_again_when_the_old_node_returns() {
     drop_old_session(&mut setup).await;
     ready_waits(&mut setup, &moving).await;
 
-    let revoke = reconnect_old_node(&mut setup, &moving).await;
+    let revoke = reconnect_old_node(&mut setup, &moving, false).await;
     ready_waits(&mut setup, &moving).await;
 
     reply(
@@ -1680,8 +1708,8 @@ async fn a_restore_revokes_its_lease_again_when_the_old_node_returns() {
 }
 
 /// The old holder's `ok` is held in memory. A restarted primary has lost it,
-/// so the restore waits until the old node returns and answers the revoke
-/// sent again at the start of its session.
+/// so the restore waits until the old node returns, names the lease
+/// `revoked`, and answers the revoke sent again at the start of its session.
 #[tokio::test]
 async fn a_restarted_primary_waits_for_the_old_node_to_answer_again() {
     let mut setup = setup().await;
@@ -1697,7 +1725,53 @@ async fn a_restarted_primary_waits_for_the_old_node_to_answer_again() {
     setup.state.server = restart_primary(&mut setup).await;
     ready_waits(&mut setup, &moving).await;
 
-    let revoke = reconnect_old_node(&mut setup, &moving).await;
+    let revoke = reconnect_old_node(&mut setup, &moving, true).await;
+    reply(
+        &mut setup.state.socket,
+        ok_result(),
+        Some(revoke["id"].as_str().unwrap()),
+    )
+    .await;
+    round_trip(&mut setup.state.socket).await;
+    ready_grants(&mut setup, &moving, moving.old_token).await;
+}
+
+/// A revoke refused on a live session, here because the node's token is
+/// higher (section 5.13), has no answer that releases the lease. The target's
+/// next `ready` report revokes it again on that session, once, and that
+/// revoke's `ok` lets the restore finish.
+#[tokio::test]
+async fn a_ready_report_revokes_the_lease_again_on_the_old_nodes_live_session() {
+    let mut setup = setup().await;
+    let moving = start_moving(&mut setup, 18).await;
+    // While the first revoke is unanswered, no second one goes out.
+    ready_waits(&mut setup, &moving).await;
+    reply(
+        &mut setup.state.socket,
+        NodeMessage::Error(ProtocolError {
+            code: ErrorCode::BadMessage,
+            message: "the revoke's token is lower than the node's".to_string(),
+            fatal: false,
+        }),
+        Some(&moving.revoke_id),
+    )
+    .await;
+    round_trip(&mut setup.state.socket).await;
+
+    ready_waits(&mut setup, &moving).await;
+    ready_waits(&mut setup, &moving).await;
+    let frames = frames_until_settled(&mut setup.state.socket).await;
+    let revokes: Vec<&Value> = frames
+        .iter()
+        .filter(|frame| frame["type"] == "lease_revoke")
+        .collect();
+    assert_eq!(revokes.len(), 1, "one revoke for three reports: {frames:?}");
+    let revoke = revokes[0].clone();
+    assert_eq!(revoke["body"]["lease_id"], moving.lease_id);
+    assert_eq!(revoke["body"]["fencing_token"], json!(moving.old_token));
+    assert_eq!(revoke["body"]["reason"], "moved");
+    assert_ne!(revoke["id"], json!(moving.revoke_id));
+
     reply(
         &mut setup.state.socket,
         ok_result(),
@@ -1711,6 +1785,12 @@ async fn a_restarted_primary_waits_for_the_old_node_to_answer_again() {
 /// Answers the old node's revoke with `fence_failed` (section 8.5), then
 /// acknowledges the failed fence as an operator.
 async fn fail_and_acknowledge(setup: &mut Setup, moving: &Moving) {
+    fail_fence(setup, moving).await;
+    acknowledge(setup, moving).await;
+}
+
+/// Answers the old node's first revoke with `fence_failed` (section 8.5).
+async fn fail_fence(setup: &mut Setup, moving: &Moving) {
     reply(
         &mut setup.state.socket,
         NodeMessage::CommandResult(CommandResult {
@@ -1728,7 +1808,10 @@ async fn fail_and_acknowledge(setup: &mut Setup, moving: &Moving) {
     .await;
     round_trip(&mut setup.state.socket).await;
     ready_waits(setup, moving).await;
+}
 
+/// An operator acknowledges the old node's failed fence of the lease.
+async fn acknowledge(setup: &mut Setup, moving: &Moving) {
     let res = setup
         .state
         .owner
@@ -1789,6 +1872,114 @@ async fn a_pending_acknowledgement_lets_a_restarted_primary_finish_the_restore()
 
     setup.state.server = restart_primary(&mut setup).await;
     ready_grants(&mut setup, &moving, moving.old_token + 1).await;
+}
+
+/// A failed fence keeps the lease ungrantable until an operator acknowledges
+/// it, also once the node answers a later revoke `ok` (section 8.5 step 1).
+#[tokio::test]
+async fn a_failed_fence_waits_for_its_acknowledgement_whatever_the_node_answers_later() {
+    let mut setup = setup().await;
+    let moving = start_moving(&mut setup, 19).await;
+    fail_fence(&mut setup, &moving).await;
+    drop_old_session(&mut setup).await;
+    let revoke = reconnect_old_node(&mut setup, &moving, true).await;
+    reply(
+        &mut setup.state.socket,
+        ok_result(),
+        Some(revoke["id"].as_str().unwrap()),
+    )
+    .await;
+    round_trip(&mut setup.state.socket).await;
+    ready_waits(&mut setup, &moving).await;
+
+    acknowledge(&mut setup, &moving).await;
+    ready_grants(&mut setup, &moving, moving.old_token + 1).await;
+}
+
+/// An acknowledgement made while a revoke of the lease is unanswered on the
+/// old node's session does not release the lease: that revoke's fence may
+/// still fail and list it again (ADR 0238). Its answer does.
+#[tokio::test]
+async fn an_acknowledgement_waits_for_an_unanswered_revoke_of_the_lease() {
+    let mut setup = setup().await;
+    let moving = start_moving(&mut setup, 20).await;
+    fail_fence(&mut setup, &moving).await;
+    drop_old_session(&mut setup).await;
+    let revoke = reconnect_old_node(&mut setup, &moving, true).await;
+    acknowledge(&mut setup, &moving).await;
+    ready_waits(&mut setup, &moving).await;
+
+    reply(
+        &mut setup.state.socket,
+        ok_result(),
+        Some(revoke["id"].as_str().unwrap()),
+    )
+    .await;
+    round_trip(&mut setup.state.socket).await;
+    ready_grants(&mut setup, &moving, moving.old_token + 1).await;
+}
+
+/// Writes the old node's `fence_ack_pending` with the lease at `token`.
+async fn set_pending_ack(setup: &Setup, moving: &Moving, acked_at: &str, token: i64) {
+    let pending = json!({
+        "acked_at": acked_at,
+        "lease_ids": [moving.lease_id],
+        "fencing_tokens": { moving.lease_id.clone(): token },
+    });
+    sqlx::query("UPDATE nodes SET fence_ack_pending = ? WHERE id = ?")
+        .bind(pending.to_string())
+        .bind(&setup.state.node.node_id)
+        .execute(setup.state.server.state.store.pool())
+        .await
+        .unwrap();
+}
+
+/// A pending acknowledgement releases the lease only at the lease's token and
+/// when it is newer than the lease's grant and revoke, so that its increment
+/// made that token; an older one says nothing about a later grant at a token
+/// it happens to name (ADR 0247).
+#[tokio::test]
+async fn a_pending_acknowledgement_releases_only_the_grant_it_covered() {
+    let mut setup = setup().await;
+    let moving = start_moving(&mut setup, 21).await;
+    drop_old_session(&mut setup).await;
+    ready_waits(&mut setup, &moving).await;
+
+    set_pending_ack(
+        &setup,
+        &moving,
+        "2000-01-01T00:00:00.000Z",
+        moving.old_token,
+    )
+    .await;
+    ready_waits(&mut setup, &moving).await;
+    // Newer than the grant, older than the revoke.
+    let (granted_at, revoked_at): (String, String) =
+        sqlx::query_as("SELECT granted_at, revoked_at FROM leases WHERE id = ?")
+            .bind(&moving.lease_id)
+            .fetch_one(setup.state.server.state.store.pool())
+            .await
+            .unwrap();
+    let between = format!("{granted_at}0");
+    assert!(granted_at < between && between < revoked_at);
+    set_pending_ack(&setup, &moving, &between, moving.old_token).await;
+    ready_waits(&mut setup, &moving).await;
+    set_pending_ack(
+        &setup,
+        &moving,
+        "2999-01-01T00:00:00.000Z",
+        moving.old_token + 1,
+    )
+    .await;
+    ready_waits(&mut setup, &moving).await;
+    set_pending_ack(
+        &setup,
+        &moving,
+        "2999-01-01T00:00:00.000Z",
+        moving.old_token,
+    )
+    .await;
+    ready_grants(&mut setup, &moving, moving.old_token).await;
 }
 
 /// Section 8.3, ADR 0183: a holder declared lost releases a `local` lease

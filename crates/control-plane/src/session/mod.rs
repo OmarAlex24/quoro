@@ -471,6 +471,54 @@ impl NodeHub {
         self.0.releases.record(lease_id, holder, token);
     }
 
+    /// What the holders' answers released ([`leases::is_released`]).
+    pub(crate) fn releases(&self) -> &leases::Releases {
+        &self.0.releases
+    }
+
+    /// Whether a `lease_revoke` of `lease_id` waits for its answer on the
+    /// live session of `node_id`.
+    pub(crate) fn revoke_unanswered(&self, node_id: &str, lease_id: &str) -> bool {
+        let sessions = self.0.sessions.lock().expect("session lock");
+        sessions.get(node_id).is_some_and(|handle| {
+            handle
+                .pending
+                .lock()
+                .expect("pending lock")
+                .revoke_leases
+                .values()
+                .any(|(revoked, _)| revoked == lease_id)
+        })
+    }
+
+    /// Revokes `lease` again on its holder's live session, at the lease's
+    /// token, when none of its revokes is unanswered there: a restore waits
+    /// for the holder's `ok` (section 5.13, issue #392), and a revoke the
+    /// holder refused, or that went to a session that was ending, has none.
+    /// Returns whether a session took it.
+    pub(crate) fn revoke_again(&self, lease: &leases::Lease) -> bool {
+        if self.revoke_unanswered(&lease.holder_node_id, &lease.id) {
+            return false;
+        }
+        let revoke = quoro_proto::LeaseRevoke {
+            lease_id: quoro_proto::LeaseId(lease.id.clone()),
+            fencing_token: lease.fencing_token.max(1) as u64,
+            reason: quoro_proto::RevokeReason::Moved,
+        };
+        let sent = self.send_control(
+            &lease.holder_node_id,
+            &quoro_proto::wire::ControlMessage::LeaseRevoke(revoke),
+        );
+        if sent {
+            tracing::info!(
+                lease_id = %lease.id,
+                node_id = %lease.holder_node_id,
+                "a restore revokes its lease again on the old holder's session"
+            );
+        }
+        sent
+    }
+
     /// Tells the live session of `node_id` to rebuild and resend its desired
     /// state (section 5.11). A node without a session is left alone: it gets
     /// the new snapshot when it dials.
@@ -2161,15 +2209,22 @@ impl Session {
         // the session that carried the revoke, and what this primary learned
         // is lost when it restarts, so each lease a restore still waits for is
         // revoked again here, at its own token; one the `hello` names is
-        // revoked below. A node answers a revoke it already fenced `ok` again
-        // without fencing anew.
+        // revoked below. The node fences again at that token (section 8.5),
+        // which stops nothing more once the lease's VMs are stopped.
         match leases::awaited_by_restores(&mut conn, &self.node_id).await {
             Ok(awaited) => {
                 for lease in awaited {
-                    if reported.iter().any(|claimed| claimed.lease_id == lease.id)
-                        || self.hub.0.releases.covers(&lease)
-                    {
+                    if reported.iter().any(|claimed| claimed.lease_id == lease.id) {
                         continue;
+                    }
+                    match leases::is_released(&mut conn, &self.hub.0.releases, false, &lease).await
+                    {
+                        Ok(false) => {}
+                        Ok(true) => continue,
+                        Err(e) => {
+                            tracing::warn!(code = %e.code.as_str(), lease_id = %lease.id, "cannot read a lease's release");
+                            continue;
+                        }
                     }
                     let token = lease.fencing_token.max(1) as u64;
                     self.queue_hello_revoke(
@@ -3135,14 +3190,7 @@ async fn apply_status_report(
         .lock()
         .expect("disk free lock")
         .insert(node_id.to_string(), report.disk_free_gb);
-    match crate::backups::restore::apply_status(
-        &hub.0.store,
-        &hub.0.releases,
-        node_id,
-        &report.volumes,
-    )
-    .await
-    {
+    match crate::backups::restore::apply_status(&hub.0.store, hub, node_id, &report.volumes).await {
         Ok(applied) => {
             // The grant reaches the node before the snapshot that starts the
             // app there (section 8.3).
@@ -3160,6 +3208,9 @@ async fn apply_status_report(
             // failed restore, the node they stayed on gets them back.
             for other in &applied.other_node_ids {
                 hub.node_changed(other);
+            }
+            for lease in &applied.waits {
+                hub.revoke_again(lease);
             }
         }
         Err(e) => tracing::warn!(

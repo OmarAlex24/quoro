@@ -226,7 +226,7 @@ impl Releases {
 
     /// Whether the holder `lease` names released it at its token or a higher
     /// one. A release at a lower token says nothing about a later grant.
-    pub(crate) fn covers(&self, lease: &Lease) -> bool {
+    fn covers(&self, lease: &Lease) -> bool {
         let released = self
             .0
             .lock()
@@ -238,15 +238,20 @@ impl Releases {
 }
 
 /// Whether `lease` may be granted to another holder, or to the same one with
-/// a higher token. It must be revoked in the primary's view, and its last
-/// holder must have released it at its token ([`Releases`]), have an
-/// operator's acknowledgement of it pending delivery at that token or a
-/// higher one (`fence_ack_pending`, section 8.5 step 3), or, for a `local`
-/// lease revoked by then, have been declared lost (`nodes.lost_at`, ADR 0183)
-/// or removed (section 10). An `expiring` lease of a lost holder also waits
-/// for its gate (section 8.4, ADR 0202), which the primary does not keep yet,
-/// so only its holder's answer releases one. A lease listed in a node's
-/// `fence_failure` is refused by [`grant_app_lease`] whatever this says.
+/// a higher token. It must be revoked in the primary's view, with no
+/// `lease_revoke` of it unanswered on its holder's live session
+/// (`unanswered`): until the answer, the holder's fence may still run, and a
+/// `fence_failed` answer lists the lease again (ADR 0238). Its last holder
+/// must also have released it at its token ([`Releases`]); or have an
+/// operator's acknowledgement of it pending delivery (`fence_ack_pending`,
+/// section 8.5 step 3) at its token, made after the lease was granted and
+/// revoked, so that the acknowledgement's increment produced that token; or,
+/// for a `local` lease revoked by then, have been declared lost
+/// (`nodes.lost_at`, ADR 0183) or removed (section 10). An `expiring` lease
+/// of a lost or removed holder also waits for its gate (section 8.4, ADR
+/// 0202), which the primary does not keep yet, so only its holder's answer
+/// releases one. A lease listed in a node's `fence_failure` is refused by
+/// [`grant_app_lease`] whatever this says.
 ///
 /// # Errors
 ///
@@ -254,20 +259,29 @@ impl Releases {
 pub(crate) async fn is_released(
     conn: &mut SqliteConnection,
     releases: &Releases,
+    unanswered: bool,
     lease: &Lease,
 ) -> Result<bool, ApiError> {
-    if !lease.is_revoked() {
+    if !lease.is_revoked() || unanswered {
         return Ok(false);
     }
     if releases.covers(lease) {
         return Ok(true);
     }
+    // The acknowledgement's time is that of the latest one added to it, so
+    // a lease granted to its holder again after an earlier acknowledgement
+    // at that token (ADR 0247) is told apart only while no later one came.
     if let Some(pending) = crate::fences::pending_of(conn, &lease.holder_node_id).await?
         && pending.lease_ids.contains(&lease.id)
         && pending
             .fencing_tokens
             .get(&lease.id)
-            .is_some_and(|token| i64::try_from(*token).unwrap_or(i64::MAX) >= lease.fencing_token)
+            .is_some_and(|token| i64::try_from(*token).ok() == Some(lease.fencing_token))
+        && lease.granted_at.as_str() < pending.acked_at.as_str()
+        && lease
+            .revoked_at
+            .as_deref()
+            .is_some_and(|revoked_at| revoked_at <= pending.acked_at.as_str())
     {
         return Ok(true);
     }

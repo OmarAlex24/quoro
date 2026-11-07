@@ -29,8 +29,9 @@ use crate::api::volumes::{VOLUME_COLUMNS, Volume, VolumeState};
 use crate::changelog::{self, Actor, Op};
 use crate::error::{ApiError, Code};
 use crate::events::{self, NewEvent, Source};
-use crate::leases::{self, Lease, Releases};
+use crate::leases::{self, Lease};
 use crate::request::CallCtx;
+use crate::session::NodeHub;
 use crate::store::{Store, now_rfc3339};
 use quoro_proto::wire;
 use quoro_proto::{LeaseRevoke, RevokeReason};
@@ -79,6 +80,11 @@ pub(crate) struct AppliedRestores {
     /// nodes the instances stayed on (a `failed` restore), so they get them
     /// back.
     pub other_node_ids: Vec<String>,
+    /// Revoked leases that a `ready` restore waits for, whose holder has no
+    /// failed fence of them listed or acknowledged: the caller revokes each
+    /// again on its holder's live session, unless one is unanswered there
+    /// (issue #392).
+    pub waits: Vec<Lease>,
 }
 
 impl AppliedRestores {
@@ -86,6 +92,7 @@ impl AppliedRestores {
         self.desired_changed |= other.desired_changed;
         self.grants.extend(other.grants);
         self.other_node_ids.extend(other.other_node_ids);
+        self.waits.extend(other.waits);
     }
 }
 
@@ -241,7 +248,7 @@ pub(crate) async fn accept(
 /// A database error.
 pub(crate) async fn apply_status(
     store: &Store,
-    releases: &Releases,
+    hub: &NodeHub,
     node_id: &str,
     volumes: &[wire::VolumeStatus],
 ) -> Result<AppliedRestores, ApiError> {
@@ -265,14 +272,15 @@ pub(crate) async fn apply_status(
         }
         match reported.state {
             wire::VolumeState::Ready => {
-                match restore_ready(store, releases, node_id, &volume, reported).await {
+                match restore_ready(store, hub, node_id, &volume, reported).await {
                     Ok(outcome) => applied.merge(outcome),
-                    // The app's lease waits for its old holder to release it,
-                    // or for an operator's acknowledgement of a failed fence
-                    // (section 8.5), so it is granted to no node yet. The
-                    // transaction rolled back; the volume stays `restoring`,
-                    // and the next status report applies it once the lease
-                    // may move. The other volumes go on.
+                    // The app's lease waits for an operator's acknowledgement
+                    // of a failed fence (section 8.5), so it is granted to no
+                    // node yet. The transaction rolled back; the volume stays
+                    // `restoring`, and a later status report applies it once
+                    // the lease may move: the node reports every volume of
+                    // its snapshot (section 5.3) at least every 30 s (section
+                    // 2 step 7). The other volumes go on.
                     Err(e) if e.code == Code::Conflict => tracing::warn!(
                         volume_id = %volume.id,
                         node_id,
@@ -300,7 +308,7 @@ pub(crate) async fn apply_status(
 /// transition is applied once.
 async fn restore_ready(
     store: &Store,
-    releases: &Releases,
+    hub: &NodeHub,
     node_id: &str,
     before: &Volume,
     reported: &wire::VolumeStatus,
@@ -322,14 +330,35 @@ async fn restore_ready(
     // answers the revoke `ok`, so the lease moves only once it released it
     // (issue #392). That holds for a restore onto the same node too. The
     // check comes before any write, so a restore that waits changes nothing
-    // and the next `ready` report tries again.
+    // and a later `ready` report tries again (section 5.3).
     if let Some(previous) = leases::app_lease(&mut w.tx, &current.app_id).await?
-        && !leases::is_released(&mut w.tx, releases, &previous).await?
+        && !leases::is_released(
+            &mut w.tx,
+            hub.releases(),
+            hub.revoke_unanswered(&previous.holder_node_id, &previous.id),
+            &previous,
+        )
+        .await?
     {
-        return Err(ApiError::conflict(format!(
-            "lease {} waits for node {} to answer its revoke",
-            previous.id, previous.holder_node_id
-        )));
+        tracing::debug!(
+            volume_id = %current.id,
+            lease_id = %previous.id,
+            holder = %previous.holder_node_id,
+            "a restored volume waits for its old holder to release the lease"
+        );
+        // A failed fence waits for an operator, and an acknowledged one for
+        // its delivery (section 8.5); a revoke would only fence again.
+        let fenced = crate::fences::failure_of(&mut w.tx, &previous.holder_node_id)
+            .await?
+            .is_some_and(|failure| failure.lease_ids.contains(&previous.id))
+            || crate::fences::pending_of(&mut w.tx, &previous.holder_node_id)
+                .await?
+                .is_some_and(|pending| pending.lease_ids.contains(&previous.id));
+        let mut waits = AppliedRestores::default();
+        if previous.is_revoked() && !fenced {
+            waits.waits.push(previous);
+        }
+        return Ok(waits);
     }
 
     current.state = VolumeState::Ready;
@@ -436,6 +465,7 @@ async fn restore_ready(
         desired_changed: true,
         grants: vec![lease],
         other_node_ids,
+        waits: Vec::new(),
     })
 }
 
