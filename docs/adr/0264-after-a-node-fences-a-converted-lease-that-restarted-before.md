@@ -1,11 +1,11 @@
 # ADR 0264: After a node fences a converted lease that restarted before its first renewal, the primary regrants it from hello at a higher token
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR 0281](0281-the-primary-regrants-a-lease-from-hello-only-when-the-node.md)
 - **Date:** 2026-11-07
 - **Ledger id:** D-0264
 - **Tags:** m5b, leases, contracts
 - **Supersedes:** none
-- **Superseded by:** none
+- **Superseded by:** [ADR 0281](0281-the-primary-regrants-a-lease-from-hello-only-when-the-node.md)
 - **Related:** none
 
 ## Context
@@ -22,7 +22,7 @@ _Some wording was changed for the public repository._
 
 ## Consequences
 
-- This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
+- Superseded by [ADR 0281](0281-the-primary-regrants-a-lease-from-hello-only-when-the-node.md); this decision is no longer binding and is kept for history.
 
 ---
 Generated from decision D-0264 in the project decision ledger. Do not edit by hand; changes go through a new decision.
