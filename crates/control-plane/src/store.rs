@@ -12,7 +12,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::sync::{Mutex, OwnedMutexGuard, watch};
 
 const BASE_SCHEMA: &str = include_str!("../../../docs/contracts/db-schema.sql");
 
@@ -44,23 +44,44 @@ pub struct Store {
     pool: SqlitePool,
     writer: Arc<Mutex<()>>,
     migrations: Arc<[&'static str]>,
+    /// The newest change-log `seq`, raised after each commit
+    /// ([`Store::change_log_head`]).
+    head: Arc<watch::Sender<u64>>,
 }
 
 /// A write transaction holding the single-writer gate. Dropping it without
 /// [`WriteTx::commit`] rolls back.
 pub struct WriteTx {
     pub tx: Transaction<'static, Sqlite>,
+    head: Arc<watch::Sender<u64>>,
     _gate: OwnedMutexGuard<()>,
 }
 
 impl WriteTx {
-    /// Commits and releases the writer gate.
+    /// Commits, raises the change log's head watch to the newest `seq` this
+    /// commit leaves ([`Store::change_log_head`]), and releases the writer
+    /// gate.
+    ///
+    /// The newest `seq` is read inside the transaction, which holds SQLite's
+    /// write lock, so it is exactly what the commit leaves; the watch is raised
+    /// only once the commit succeeded, and before the gate is released, so
+    /// the watch rises in commit order. A failed read is logged and leaves the
+    /// watch where it was: the commit itself is not refused, and the next
+    /// commit raises the watch past it.
     ///
     /// # Errors
     ///
     /// The database error from `COMMIT`.
-    pub async fn commit(self) -> Result<(), sqlx::Error> {
-        self.tx.commit().await
+    pub async fn commit(mut self) -> Result<(), sqlx::Error> {
+        let head = head_of(&mut self.tx).await;
+        self.tx.commit().await?;
+        match head {
+            Ok(seq) => raise(&self.head, seq),
+            Err(error) => {
+                tracing::warn!(%error, "cannot read the change log's newest seq after a write");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -97,7 +118,7 @@ impl Store {
             .max_connections(8)
             .connect_with(options)
             .await?;
-        Ok(Self::connect(pool))
+        Self::connect(pool).await
     }
 
     /// An in-memory database for tests: one shared connection, same schema.
@@ -126,7 +147,7 @@ impl Store {
             .max_lifetime(None)
             .connect_with(options)
             .await?;
-        Ok(Self::connect(pool))
+        Self::connect(pool).await
     }
 
     /// The newest schema version this binary ships, for tests that stand in
@@ -179,12 +200,39 @@ impl Store {
         Ok(Some((version, newest)))
     }
 
-    fn connect(pool: SqlitePool) -> Self {
-        Self {
+    /// Wraps `pool`, seeding the change log's head watch from the newest
+    /// `seq` it holds (0 for a database without a change log yet).
+    async fn connect(pool: SqlitePool) -> Result<Self, sqlx::Error> {
+        let has_log: Option<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'change_log'",
+        )
+        .fetch_optional(&pool)
+        .await?;
+        let head = if has_log.is_some() {
+            head_of(&mut *pool.acquire().await?).await?
+        } else {
+            0
+        };
+        Ok(Self {
             pool,
             writer: Arc::new(Mutex::new(())),
             migrations: Arc::from(MIGRATIONS),
-        }
+            head: Arc::new(watch::channel(head).0),
+        })
+    }
+
+    /// A watch of the change log's newest `seq`. It is seeded when the store
+    /// opens and raised after every [`WriteTx::commit`], and it only ever
+    /// grows. Node sessions wait on it to send new entries as they are written
+    /// instead of polling the database (`node-agent-protocol.md` section 7.1,
+    /// ADR 0227).
+    ///
+    /// Only writes through [`Store::begin_write`] raise it. Another process
+    /// that appends to the same file, such as `quoro vuln import`, is seen at
+    /// this process's next commit.
+    #[must_use]
+    pub fn change_log_head(&self) -> watch::Receiver<u64> {
+        self.head.subscribe()
     }
 
     /// Applies the pending migrations in one write transaction. A new database
@@ -236,8 +284,33 @@ impl Store {
     pub async fn begin_write(&self) -> Result<WriteTx, sqlx::Error> {
         let gate = Arc::clone(&self.writer).lock_owned().await;
         let tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        Ok(WriteTx { tx, _gate: gate })
+        Ok(WriteTx {
+            tx,
+            head: Arc::clone(&self.head),
+            _gate: gate,
+        })
     }
+}
+
+/// The change log's newest `seq` through `conn`, 0 when it is empty.
+async fn head_of(conn: &mut SqliteConnection) -> Result<u64, sqlx::Error> {
+    let seq: Option<i64> = sqlx::query_scalar("SELECT MAX(seq) FROM change_log")
+        .fetch_one(conn)
+        .await?;
+    Ok(seq.map_or(0, |seq| u64::try_from(seq).unwrap_or(0)))
+}
+
+/// Raises `head` to `seq` when that is higher, notifying its receivers; a
+/// lower or equal `seq` changes nothing, so the watch only ever grows.
+fn raise(head: &watch::Sender<u64>, seq: u64) {
+    head.send_if_modified(|current| {
+        if seq > *current {
+            *current = seq;
+            true
+        } else {
+            false
+        }
+    });
 }
 
 /// Reads `meta.schema_version` through `conn`.
@@ -376,6 +449,89 @@ mod tests {
                 .unwrap();
         assert_eq!(version, (MIGRATIONS.len() + 2).to_string());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Appends one change-log entry in its own write and commits it.
+    async fn append_one(store: &Store, entity_id: &str) {
+        let mut w = store.begin_write().await.unwrap();
+        crate::changelog::append(
+            &mut w.tx,
+            &crate::changelog::Actor::system("test"),
+            "vm",
+            entity_id,
+            crate::changelog::Op::Create,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        w.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_head_watch_is_seeded_at_open_and_rises_only_after_a_commit() {
+        let dir = std::env::temp_dir().join(format!("quoro-store-{}", random_secret()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("quoro.db");
+        let store = Store::open(&path).await.unwrap();
+        let mut head = store.change_log_head();
+        let start = *head.borrow_and_update();
+
+        // Raised after the commit, not before.
+        let mut w = store.begin_write().await.unwrap();
+        crate::changelog::append(
+            &mut w.tx,
+            &crate::changelog::Actor::system("test"),
+            "vm",
+            "vm_1",
+            crate::changelog::Op::Create,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        assert!(!head.has_changed().unwrap(), "nothing before the commit");
+        w.commit().await.unwrap();
+        assert!(head.has_changed().unwrap());
+        assert_eq!(*head.borrow_and_update(), start + 1);
+
+        // A rolled-back append and a commit that appends nothing leave it.
+        let mut w = store.begin_write().await.unwrap();
+        crate::changelog::append(
+            &mut w.tx,
+            &crate::changelog::Actor::system("test"),
+            "vm",
+            "vm_2",
+            crate::changelog::Op::Create,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        drop(w);
+        store.begin_write().await.unwrap().commit().await.unwrap();
+        assert!(!head.has_changed().unwrap());
+
+        // Every clone shares the watch.
+        append_one(&store.clone(), "vm_3").await;
+        assert_eq!(*head.borrow_and_update(), start + 2);
+
+        // It never goes down.
+        raise(&store.head, 1);
+        assert!(!head.has_changed().unwrap());
+        assert_eq!(*head.borrow(), start + 2);
+
+        // A reopened store starts at the newest seq.
+        drop(store);
+        let store = Store::open(&path).await.unwrap();
+        assert_eq!(*store.change_log_head().borrow(), start + 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unmigrated_new_database_starts_the_head_watch_at_zero() {
+        let store = Store::open_in_memory_unmigrated().await.unwrap();
+        assert_eq!(*store.change_log_head().borrow(), 0);
+        store.migrate().await.unwrap();
+        append_one(&store, "vm_1").await;
+        assert_eq!(*store.change_log_head().borrow(), 1);
     }
 
     #[test]

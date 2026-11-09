@@ -8,14 +8,16 @@ use common::{
 };
 use futures_util::{SinkExt, StreamExt};
 use quoro_control_plane::api::enroll::{ensure_local_join, local_join_token};
+use quoro_control_plane::changelog::{self, Actor, Op};
 use quoro_control_plane::driver::{self, Capacity, Kvm, LocalNode};
-use quoro_proto::sign;
 use quoro_proto::wire::{
-    self, Capacity as WireCapacity, Health, Heartbeat, Kvm as WireKvm, NodeMessage, ObservedStatus,
-    StatusReport, VmStatus,
+    self, Capacity as WireCapacity, Health, Heartbeat, Kvm as WireKvm, LogAck, NodeMessage,
+    ObservedStatus, StatusReport, VmStatus,
 };
+use quoro_proto::{ErrorCode, ProtocolError, jcs, sign};
 use serde_json::{Value, json};
-use std::time::Duration;
+use sha2::{Digest, Sha256};
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::WebSocketStream;
@@ -1420,4 +1422,891 @@ async fn a_restarted_primary_keeps_an_instance_on_its_create_time_digest() {
         .find(|vm| vm["vm_id"] != vm_id.as_str())
         .unwrap();
     assert_eq!(new_vm["image_digest"], MOVED_DIGEST);
+}
+
+// ---------------------------------------------------------------------------
+// Change-log follow (sections 5.6, 5.14 and 7.1, ADR 0227)
+// ---------------------------------------------------------------------------
+
+/// 64 zeros: the `log_hash` of an empty copy and the `prev_hash` of `seq` 1.
+fn genesis() -> String {
+    "0".repeat(64)
+}
+
+fn hello_at(node_id: &str, log_seq: u64, log_hash: &str) -> NodeMessage {
+    let NodeMessage::Hello(mut hello) = hello(node_id) else {
+        panic!("hello() builds a hello");
+    };
+    hello.log_seq = log_seq;
+    hello.log_hash = log_hash.to_string();
+    NodeMessage::Hello(hello)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The primary's newest change-log `seq`.
+async fn log_head(server: &Server) -> u64 {
+    let head: Option<i64> = sqlx::query_scalar("SELECT MAX(seq) FROM change_log")
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+    u64::try_from(head.unwrap_or(0)).unwrap()
+}
+
+/// The primary's `hash` at `seq`.
+async fn log_hash_at(server: &Server, seq: u64) -> String {
+    sqlx::query_scalar("SELECT hash FROM change_log WHERE seq = ?")
+        .bind(i64::try_from(seq).unwrap())
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap()
+}
+
+async fn stored_log_seq(server: &Server, node_id: &str) -> u64 {
+    let seq: i64 = sqlx::query_scalar("SELECT log_seq FROM nodes WHERE id = ?")
+        .bind(node_id)
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+    u64::try_from(seq).unwrap()
+}
+
+/// Writes `nodes.log_seq` directly, as a session's end write would have.
+async fn set_stored_log_seq(server: &Server, node_id: &str, seq: u64) {
+    sqlx::query("UPDATE nodes SET log_seq = ? WHERE id = ?")
+        .bind(i64::try_from(seq).unwrap())
+        .bind(node_id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+}
+
+/// Waits until the primary has recorded the end of the node's session, and
+/// with it the end write of `nodes.log_seq`.
+async fn wait_disconnected(server: &Server, owner: &reqwest::Client, node_id: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if node_json(server, owner, node_id).await["status"] == "disconnected" {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the node is not disconnected"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Appends `count` change-log entries in one write, as any state change does;
+/// the entity ids are `<tag>-0`, `<tag>-1` and so on.
+async fn append_entries(server: &Server, tag: &str, count: usize) {
+    let mut w = server.state.store.begin_write().await.unwrap();
+    for i in 0..count {
+        changelog::append(
+            &mut w.tx,
+            &Actor::system("test"),
+            "probe",
+            &format!("{tag}-{i}"),
+            Op::Create,
+            json!({ "n": i }),
+        )
+        .await
+        .unwrap();
+    }
+    w.commit().await.unwrap();
+}
+
+fn of_type<'a>(frames: &'a [Value], kind: &str) -> Vec<&'a Value> {
+    frames
+        .iter()
+        .filter(|frame| frame["type"] == kind)
+        .collect()
+}
+
+/// Sends `hello` and reads every frame up to the first `log_entries`, which
+/// must come after the session's first `desired_state` (section 4.2 rule 6).
+async fn follow_from(server: &Server, node: &Enrolled, hello: NodeMessage) -> (Socket, Vec<Value>) {
+    let mut socket = connect(server, &node.credential).await;
+    send(&mut socket, hello).await;
+    let mut frames = Vec::new();
+    loop {
+        let frame = recv_frame(&mut socket).await;
+        let done = frame["type"] == "log_entries";
+        frames.push(frame);
+        if done {
+            break;
+        }
+    }
+    let snapshot = frames
+        .iter()
+        .position(|frame| frame["type"] == "desired_state");
+    assert!(
+        snapshot.is_some_and(|index| index < frames.len() - 1),
+        "log_entries before the desired_state: {frames:?}"
+    );
+    (socket, frames)
+}
+
+/// Checks one `log_entries` body as a node does (section 7.1,
+/// "Verification"): its entries run without a gap from `from_seq`, each has
+/// exactly the 11 fields of section 5.14, hashes to its `hash` (SHA-256 over
+/// the RFC 8785 form of the entry without `hash`) and links to the hash
+/// before it, starting from `prev_hash`; `head_seq` is at least the last
+/// `seq`. Returns the last entry's `seq` and `hash`.
+fn check_entries(body: &Value, prev_hash: &str) -> (u64, String) {
+    let from_seq = body["from_seq"].as_u64().unwrap();
+    let entries = body["entries"].as_array().unwrap();
+    assert!(!entries.is_empty() && entries.len() <= 500, "{body}");
+    let mut prev = prev_hash.to_string();
+    let mut seq = from_seq;
+    for entry in entries {
+        let mut fields = entry.as_object().unwrap().clone();
+        assert_eq!(fields.len(), 11, "{entry}");
+        assert_eq!(entry["seq"], seq, "{entry}");
+        assert_eq!(entry["prev_hash"], prev.as_str(), "{entry}");
+        let hash = fields.remove("hash").unwrap();
+        let canonical = jcs::canonicalize(&Value::Object(fields)).unwrap();
+        prev = sha256_hex(canonical.as_bytes());
+        assert_eq!(hash, prev.as_str(), "{entry}");
+        seq += 1;
+    }
+    let last = seq - 1;
+    assert!(body["head_seq"].as_u64().unwrap() >= last, "{body}");
+    (last, prev)
+}
+
+async fn ack(socket: &mut Socket, seq: u64, hash: &str) {
+    send(
+        socket,
+        NodeMessage::LogAck(LogAck {
+            seq,
+            hash: hash.to_string(),
+        }),
+    )
+    .await;
+}
+
+/// Pings twice and returns every frame that came before the answers: what
+/// the primary queued before it handled them.
+async fn settle(socket: &mut Socket) -> Vec<Value> {
+    let mut frames = Vec::new();
+    for round in 0..2 {
+        let id = format!("msg_settle{round:020}");
+        send_text(socket, NodeMessage::Ping.to_frame(&id, None).to_text()).await;
+        loop {
+            let frame = recv_frame(socket).await;
+            if frame["type"] == "pong" && frame["re"] == id.as_str() {
+                break;
+            }
+            frames.push(frame);
+        }
+    }
+    frames
+}
+
+/// How many `log_entries` messages [`catch_up`] acknowledges before it
+/// fails, so an endless stream fails the test instead of hanging it.
+const CATCH_UP_MESSAGES: usize = 50;
+
+/// Acknowledges `log_entries` until the primary sends none: the session has
+/// caught up. Returns the newest acknowledged `seq` and `hash`. Panics after
+/// [`CATCH_UP_MESSAGES`] messages.
+async fn catch_up(socket: &mut Socket, mut last: u64, mut hash: String) -> (u64, String) {
+    for _ in 0..CATCH_UP_MESSAGES {
+        let settled = settle(socket).await;
+        let messages = of_type(&settled, "log_entries");
+        assert!(
+            messages.len() <= 1,
+            "more than one outstanding: {settled:?}"
+        );
+        let Some(message) = messages.first() else {
+            return (last, hash);
+        };
+        assert_eq!(message["body"]["from_seq"], last + 1, "{message}");
+        (last, hash) = check_entries(&message["body"], &hash);
+        ack(socket, last, &hash).await;
+    }
+    panic!("still not caught up after {CATCH_UP_MESSAGES} log_entries messages, at seq {last}");
+}
+
+#[tokio::test]
+async fn a_node_follows_the_change_log_from_seq_1_after_its_desired_state() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+
+    let (_socket, frames) = follow_from(&server, &node, hello(&node.node_id)).await;
+    assert!(of_type(&frames, "error").is_empty(), "{frames:?}");
+    let body = &frames.last().unwrap()["body"];
+    assert_eq!(body["from_seq"], 1);
+    let (last, _) = check_entries(body, &genesis());
+    // Fewer than 500 entries exist, so one message carries them all, up to
+    // the head it names.
+    assert_eq!(body["head_seq"], last);
+    assert!(last <= log_head(&server).await);
+}
+
+#[tokio::test]
+async fn one_log_entries_message_is_outstanding_until_its_ack() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+    append_entries(&server, "bulk", 600).await;
+
+    let (mut socket, frames) = follow_from(&server, &node, hello(&node.node_id)).await;
+    let first = &frames.last().unwrap()["body"];
+    assert_eq!(first["from_seq"], 1);
+    assert_eq!(first["entries"].as_array().unwrap().len(), 500);
+    assert!(
+        first["head_seq"].as_u64().unwrap() > 600,
+        "{}",
+        first["head_seq"]
+    );
+    let (last, hash) = check_entries(first, &genesis());
+    assert_eq!(last, 500);
+
+    // Nothing more goes out while it is unacknowledged, not even for a new
+    // write.
+    append_entries(&server, "more", 1).await;
+    let settled = settle(&mut socket).await;
+    assert!(of_type(&settled, "log_entries").is_empty(), "{settled:?}");
+
+    ack(&mut socket, last, &hash).await;
+    let next = recv_type(&mut socket, "log_entries").await;
+    assert_eq!(next["body"]["from_seq"], 501);
+    check_entries(&next["body"], &hash);
+}
+
+#[tokio::test]
+async fn an_ack_that_skips_or_does_not_match_is_ignored() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+    append_entries(&server, "bulk", 600).await;
+
+    let (mut socket, frames) = follow_from(&server, &node, hello(&node.node_id)).await;
+    let first = &frames.last().unwrap()["body"];
+    let (last, hash) = check_entries(first, &genesis());
+    assert_eq!(last, 500);
+    let before_last = first["entries"][498]["hash"].as_str().unwrap().to_string();
+
+    // Not the last entry, the wrong hash, and a seq past the message.
+    ack(&mut socket, 499, &before_last).await;
+    ack(&mut socket, 500, &"f".repeat(64)).await;
+    ack(&mut socket, 501, &log_hash_at(&server, 501).await).await;
+    let settled = settle(&mut socket).await;
+    assert!(of_type(&settled, "log_entries").is_empty(), "{settled:?}");
+
+    // The right ack still moves on from 501.
+    ack(&mut socket, last, &hash).await;
+    let next = recv_type(&mut socket, "log_entries").await;
+    assert_eq!(next["body"]["from_seq"], 501);
+}
+
+#[tokio::test]
+async fn a_write_after_catch_up_is_sent_through_the_head_watch() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+
+    let (mut socket, frames) = follow_from(&server, &node, hello(&node.node_id)).await;
+    let (last, hash) = check_entries(&frames.last().unwrap()["body"], &genesis());
+    ack(&mut socket, last, &hash).await;
+    let (mut last, mut hash) = catch_up(&mut socket, last, hash).await;
+
+    // Nothing but the write wakes the session: no ack is outstanding.
+    append_entries(&server, "after-catch-up", 1).await;
+    let delivered = timeout(Duration::from_secs(30), async {
+        loop {
+            let message = recv_type(&mut socket, "log_entries").await;
+            assert_eq!(message["body"]["from_seq"], last + 1, "{message}");
+            let (seq, seq_hash) = check_entries(&message["body"], &hash);
+            if message["body"]["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["entity_id"] == "after-catch-up-0")
+            {
+                break;
+            }
+            // Another write came first: acknowledged, the next goes out.
+            ack(&mut socket, seq, &seq_hash).await;
+            (last, hash) = (seq, seq_hash);
+        }
+    })
+    .await;
+    assert!(delivered.is_ok(), "the new entry was not sent within 30 s");
+}
+
+/// The frames of a session whose `hello` position differs: exactly one
+/// `log_diverged`, non-fatal, after the `desired_state` and before the
+/// `log_entries`, which start at `seq` 1.
+fn check_diverged(frames: &[Value]) {
+    let snapshot = frames
+        .iter()
+        .position(|frame| frame["type"] == "desired_state")
+        .unwrap();
+    let diverged: Vec<usize> = frames
+        .iter()
+        .enumerate()
+        .filter(|(_, frame)| frame["type"] == "error")
+        .map(|(index, frame)| {
+            assert_eq!(frame["body"]["code"], "log_diverged", "{frame}");
+            assert_eq!(frame["body"]["fatal"], false, "{frame}");
+            index
+        })
+        .collect();
+    assert_eq!(diverged.len(), 1, "{frames:?}");
+    assert!(snapshot < diverged[0], "{frames:?}");
+    assert!(diverged[0] < frames.len() - 1, "{frames:?}");
+    let body = &frames.last().unwrap()["body"];
+    assert_eq!(body["from_seq"], 1);
+    check_entries(body, &genesis());
+}
+
+#[tokio::test]
+async fn a_diverged_position_gets_log_diverged_before_any_entries() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+
+    // Another hash at a seq the primary holds.
+    let head = log_head(&server).await;
+    let (socket, frames) = follow_from(
+        &server,
+        &node,
+        hello_at(&node.node_id, head, &"f".repeat(64)),
+    )
+    .await;
+    check_diverged(&frames);
+    drop(socket);
+
+    // A seq above the primary's head, as after a promotion (section 7.3).
+    let head = log_head(&server).await;
+    let hash = log_hash_at(&server, head).await;
+    let (socket, frames) =
+        follow_from(&server, &node, hello_at(&node.node_id, head + 1000, &hash)).await;
+    check_diverged(&frames);
+    drop(socket);
+
+    // An empty copy names 64 zeros.
+    let (_socket, frames) =
+        follow_from(&server, &node, hello_at(&node.node_id, 0, &"f".repeat(64))).await;
+    check_diverged(&frames);
+}
+
+/// Sends `hello` on `socket` and returns every frame up to the session's
+/// first `desired_state` and what the primary queued after it before it
+/// answered two pings (section 4.2 rule 6).
+async fn hello_then_settle(socket: &mut Socket, hello: NodeMessage) -> Vec<Value> {
+    send(socket, hello).await;
+    let mut frames = Vec::new();
+    loop {
+        let frame = recv_frame(socket).await;
+        let done = frame["type"] == "desired_state";
+        frames.push(frame);
+        if done {
+            break;
+        }
+    }
+    frames.extend(settle(socket).await);
+    frames
+}
+
+/// A machine without the `node` role gets neither `log_diverged` nor
+/// `log_entries`, even for a position that differs from the primary's log
+/// and is below its stored `nodes.log_seq`, and not after a new write either.
+async fn does_not_follow(server: &Server, machine: &Enrolled, tag: &str) {
+    append_entries(server, tag, 3).await;
+    let stored = log_head(server).await;
+    assert!(stored > 3, "{stored}");
+    set_stored_log_seq(server, &machine.node_id, stored).await;
+
+    let mut socket = connect(server, &machine.credential).await;
+    let mut frames =
+        hello_then_settle(&mut socket, hello_at(&machine.node_id, 3, &"f".repeat(64))).await;
+    append_entries(server, tag, 1).await;
+    frames.extend(settle(&mut socket).await);
+    assert!(of_type(&frames, "log_entries").is_empty(), "{frames:?}");
+    assert!(of_type(&frames, "error").is_empty(), "{frames:?}");
+}
+
+#[tokio::test]
+async fn an_edge_only_machine_does_not_follow() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let edge = enrolled_with_roles(&server, &owner, "edge-1", &["edge"]).await;
+    does_not_follow(&server, &edge, "edge").await;
+}
+
+#[tokio::test]
+async fn a_witness_only_machine_does_not_follow() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let witness = enrolled_with_roles(&server, &owner, "witness-1", &["witness"]).await;
+    does_not_follow(&server, &witness, "witness").await;
+}
+
+#[tokio::test]
+async fn a_bad_message_answer_is_sent_again_from_the_last_ack_after_a_delay() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+    append_entries(&server, "bulk", 600).await;
+
+    let (mut socket, frames) = follow_from(&server, &node, hello(&node.node_id)).await;
+    let (last, hash) = check_entries(&frames.last().unwrap()["body"], &genesis());
+    ack(&mut socket, last, &hash).await;
+    let refused = recv_type(&mut socket, "log_entries").await;
+    assert_eq!(refused["body"]["from_seq"], last + 1);
+
+    // The node could not verify it (section 7.1, "Verification").
+    let error = NodeMessage::Error(ProtocolError {
+        code: ErrorCode::BadMessage,
+        message: "log_entries does not verify".to_string(),
+        fatal: false,
+    })
+    .to_frame("msg_refusal0000000000000000", refused["id"].as_str())
+    .to_text();
+    let refused_at = Instant::now();
+    send_text(&mut socket, error).await;
+
+    let again = recv_type(&mut socket, "log_entries").await;
+    let waited = refused_at.elapsed();
+    assert!(
+        waited >= Duration::from_millis(2_900),
+        "sent again after {waited:?}"
+    );
+    assert_ne!(again["id"], refused["id"]);
+    assert_eq!(again["body"]["from_seq"], last + 1);
+    check_entries(&again["body"], &hash);
+}
+
+#[tokio::test]
+async fn a_bad_message_that_answers_another_message_resends_nothing() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+    append_entries(&server, "bulk", 600).await;
+
+    let (mut socket, frames) = follow_from(&server, &node, hello(&node.node_id)).await;
+    let outstanding = frames.last().unwrap();
+    let (last, hash) = check_entries(&outstanding["body"], &genesis());
+    assert_eq!(last, 500);
+
+    // A bad_message that answers another message, and one that answers none,
+    // while the log_entries is outstanding.
+    let other = "msg_notthelogentries0000000000";
+    assert_ne!(outstanding["id"], other);
+    for (id, re) in [
+        ("msg_refusalother0000000000000", Some(other)),
+        ("msg_refusalnore00000000000000", None),
+    ] {
+        let error = NodeMessage::Error(ProtocolError {
+            code: ErrorCode::BadMessage,
+            message: "not about log_entries".to_string(),
+            fatal: false,
+        })
+        .to_frame(id, re)
+        .to_text();
+        send_text(&mut socket, error).await;
+    }
+    let settled = settle(&mut socket).await;
+    assert!(of_type(&settled, "log_entries").is_empty(), "{settled:?}");
+
+    // The log_entries is still outstanding: its ack moves on from 501, with
+    // no resend from seq 1 in between.
+    ack(&mut socket, last, &hash).await;
+    let next = recv_type(&mut socket, "log_entries").await;
+    assert_ne!(next["id"], outstanding["id"]);
+    assert_eq!(next["body"]["from_seq"], last + 1, "{next}");
+    check_entries(&next["body"], &hash);
+}
+
+#[tokio::test]
+async fn nodes_log_seq_is_written_when_a_session_starts_and_ends() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+
+    // A node that already holds the log up to the current head.
+    let start = log_head(&server).await;
+    assert!(start > 0);
+    let start_hash = log_hash_at(&server, start).await;
+    let (mut socket, frames) =
+        follow_from(&server, &node, hello_at(&node.node_id, start, &start_hash)).await;
+    assert_eq!(stored_log_seq(&server, &node.node_id).await, start);
+    let body = &frames.last().unwrap()["body"];
+    assert_eq!(body["from_seq"], start + 1);
+    let (last, hash) = check_entries(body, &start_hash);
+    ack(&mut socket, last, &hash).await;
+    let (last, _) = catch_up(&mut socket, last, hash).await;
+    assert!(last > start);
+    assert_eq!(
+        stored_log_seq(&server, &node.node_id).await,
+        start,
+        "an ack is kept in memory, not written"
+    );
+
+    // The session's end writes the newest ack.
+    drop(socket);
+    wait_disconnected(&server, &owner, &node.node_id).await;
+    assert_eq!(stored_log_seq(&server, &node.node_id).await, last);
+}
+
+// ---------------------------------------------------------------------------
+// A log that went back (section 7.1, "On `hello`", ADR 0261)
+// ---------------------------------------------------------------------------
+
+/// The node's change-log `update` entries in `seq` order, each `seq` with its
+/// payload.
+async fn node_updates(server: &Server, node_id: &str) -> Vec<(u64, Value)> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT seq, payload FROM change_log \
+         WHERE entity_type = 'node' AND entity_id = ? AND op = 'update' ORDER BY seq",
+    )
+    .bind(node_id)
+    .fetch_all(server.state.store.pool())
+    .await
+    .unwrap();
+    rows.into_iter()
+        .map(|(seq, payload)| {
+            (
+                u64::try_from(seq).unwrap(),
+                serde_json::from_str(&payload).unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// Makes the 0 write before `log_diverged` fail: a write of
+/// `nodes.log_seq = 0` over a nonzero value aborts. A start write, which
+/// stores the `hello`'s nonzero `seq`, and an end write of a nonzero `seq`
+/// pass.
+async fn refuse_log_seq_reset(server: &Server) {
+    sqlx::query(
+        "CREATE TRIGGER test_refuse_log_seq_reset BEFORE UPDATE OF log_seq ON nodes \
+         WHEN NEW.log_seq = 0 AND OLD.log_seq > 0 \
+         BEGIN SELECT RAISE(ABORT, 'test: the 0 write fails'); END",
+    )
+    .execute(server.state.store.pool())
+    .await
+    .unwrap();
+}
+
+/// Ends [`refuse_log_seq_reset`].
+async fn allow_log_seq_reset(server: &Server) {
+    sqlx::query("DROP TRIGGER test_refuse_log_seq_reset")
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+}
+
+/// Reads every frame up to and including the next `log_entries`.
+async fn recv_through_log_entries(socket: &mut Socket) -> Vec<Value> {
+    let mut frames = Vec::new();
+    loop {
+        let frame = recv_frame(socket).await;
+        let done = frame["type"] == "log_entries";
+        frames.push(frame);
+        if done {
+            return frames;
+        }
+    }
+}
+
+/// A session from an empty copy that acknowledges up to the primary's head
+/// and ends. Returns that `seq`, which `nodes.log_seq` then holds, as does
+/// the primary's memory.
+async fn acked_then_ended(server: &Server, owner: &reqwest::Client, node: &Enrolled) -> u64 {
+    let (mut socket, frames) = follow_from(server, node, hello(&node.node_id)).await;
+    let (last, hash) = check_entries(&frames.last().unwrap()["body"], &genesis());
+    ack(&mut socket, last, &hash).await;
+    let (acked, _) = catch_up(&mut socket, last, hash).await;
+    assert!(acked > 1, "{acked}");
+    drop(socket);
+    wait_disconnected(server, owner, &node.node_id).await;
+    assert_eq!(stored_log_seq(server, &node.node_id).await, acked);
+    acked
+}
+
+/// (j) A node acknowledged up to N, then comes back with a matching `hello`
+/// below N: `log_diverged` before any `log_entries`, entries from `seq` 1,
+/// and `nodes.log_seq` is 0 while that session is still open.
+#[tokio::test]
+async fn a_hello_below_an_earlier_ack_gets_log_diverged_and_resets_nodes_log_seq() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+    let acked = acked_then_ended(&server, &owner, &node).await;
+
+    // The primary's own entry at that seq: only the ack makes it diverge.
+    let below = acked - 1;
+    let below_hash = log_hash_at(&server, below).await;
+    let (socket, frames) =
+        follow_from(&server, &node, hello_at(&node.node_id, below, &below_hash)).await;
+    check_diverged(&frames);
+    assert_eq!(
+        stored_log_seq(&server, &node.node_id).await,
+        0,
+        "written with log_diverged, not with the session's end"
+    );
+    // The 0 write is a change-log entry of its own, after the session's
+    // start entry (section 7.1, "Lag").
+    let updates = node_updates(&server, &node.node_id).await;
+    let start = updates
+        .iter()
+        .rposition(|(_, payload)| payload["log_seq"] == below && payload["status"] == "connected")
+        .expect("the session's start entry");
+    assert!(
+        updates[start + 1..]
+            .iter()
+            .any(|(_, payload)| payload["log_seq"] == 0),
+        "no update entry with log_seq 0 after the start entry: {updates:?}"
+    );
+    drop(socket);
+}
+
+/// (k) `nodes.log_seq` alone, with nothing in the primary's memory: a
+/// matching `hello` below it gets `log_diverged`, one at exactly it does not.
+#[tokio::test]
+async fn a_hello_below_the_stored_log_seq_alone_gets_log_diverged() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+    append_entries(&server, "bulk", 3).await;
+
+    // As a session of an earlier primary process would have left it.
+    let stored = log_head(&server).await;
+    set_stored_log_seq(&server, &node.node_id, stored).await;
+    let below = stored - 1;
+    let below_hash = log_hash_at(&server, below).await;
+    let (socket, frames) =
+        follow_from(&server, &node, hello_at(&node.node_id, below, &below_hash)).await;
+    check_diverged(&frames);
+    assert_eq!(stored_log_seq(&server, &node.node_id).await, 0);
+    drop(socket);
+    wait_disconnected(&server, &owner, &node.node_id).await;
+
+    // At exactly the stored seq, the node follows on from it.
+    set_stored_log_seq(&server, &node.node_id, stored).await;
+    let stored_hash = log_hash_at(&server, stored).await;
+    let (_socket, frames) = follow_from(
+        &server,
+        &node,
+        hello_at(&node.node_id, stored, &stored_hash),
+    )
+    .await;
+    assert!(of_type(&frames, "error").is_empty(), "{frames:?}");
+    let body = &frames.last().unwrap()["body"];
+    assert_eq!(body["from_seq"], stored + 1);
+    check_entries(body, &stored_hash);
+}
+
+/// (l) Session A acknowledges up to N; session B of the same node replaces
+/// it while A is still attached, with a matching `hello` below N. Only the
+/// primary's memory holds N: A's start write left 0 in `nodes.log_seq`.
+#[tokio::test]
+async fn an_ack_of_a_superseded_session_still_counts() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+
+    let (mut a, frames) = follow_from(&server, &node, hello(&node.node_id)).await;
+    let (last, hash) = check_entries(&frames.last().unwrap()["body"], &genesis());
+    ack(&mut a, last, &hash).await;
+    let (acked, _) = catch_up(&mut a, last, hash).await;
+    assert!(acked > 1, "{acked}");
+    assert_eq!(stored_log_seq(&server, &node.node_id).await, 0);
+
+    let below = acked - 1;
+    let below_hash = log_hash_at(&server, below).await;
+    let (b, frames) =
+        follow_from(&server, &node, hello_at(&node.node_id, below, &below_hash)).await;
+    check_diverged(&frames);
+    assert_eq!(stored_log_seq(&server, &node.node_id).await, 0);
+    drop(b);
+    drop(a);
+}
+
+/// (m) After `log_diverged`, the node's next `hello` from an empty copy
+/// follows from `seq` 1 without another `log_diverged`: the primary set its
+/// memory and `nodes.log_seq` to 0, so it does not read as a log that went
+/// back.
+#[tokio::test]
+async fn after_log_diverged_a_hello_from_an_empty_copy_follows_normally() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+    let acked = acked_then_ended(&server, &owner, &node).await;
+
+    let below = acked - 1;
+    let below_hash = log_hash_at(&server, below).await;
+    let (socket, frames) =
+        follow_from(&server, &node, hello_at(&node.node_id, below, &below_hash)).await;
+    check_diverged(&frames);
+    // The node moves its copy aside; it acknowledges nothing on this session.
+    drop(socket);
+    wait_disconnected(&server, &owner, &node.node_id).await;
+    assert_eq!(stored_log_seq(&server, &node.node_id).await, 0);
+
+    let (_socket, frames) = follow_from(&server, &node, hello(&node.node_id)).await;
+    assert!(of_type(&frames, "error").is_empty(), "{frames:?}");
+    let body = &frames.last().unwrap()["body"];
+    assert_eq!(body["from_seq"], 1);
+    check_entries(body, &genesis());
+}
+
+/// `log_diverged` never goes out before `nodes.log_seq = 0` is written: while
+/// that write fails, the session gets neither the error nor entries, and the
+/// follow start is tried again after the retry delay.
+#[tokio::test]
+async fn log_diverged_waits_for_its_0_write() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+
+    refuse_log_seq_reset(&server).await;
+
+    // Another hash at a seq the primary holds.
+    let head = log_head(&server).await;
+    let mut socket = connect(&server, &node.credential).await;
+    let mut frames =
+        hello_then_settle(&mut socket, hello_at(&node.node_id, head, &"f".repeat(64))).await;
+    assert!(of_type(&frames, "error").is_empty(), "{frames:?}");
+    assert!(of_type(&frames, "log_entries").is_empty(), "{frames:?}");
+    assert_eq!(stored_log_seq(&server, &node.node_id).await, head);
+
+    // Once the write can succeed, the retry answers log_diverged after it.
+    allow_log_seq_reset(&server).await;
+    frames.extend(recv_through_log_entries(&mut socket).await);
+    check_diverged(&frames);
+    assert_eq!(stored_log_seq(&server, &node.node_id).await, 0);
+}
+
+/// The same with the (l) setup: the acknowledgement is held only in the
+/// primary's memory, from session A, still attached when session B replaces
+/// it with a matching `hello` below it. While the 0 write fails, B gets
+/// neither the error nor entries; the retry after it still answers
+/// `log_diverged`. Had the memory been set to 0 before the write succeeded,
+/// the retry would find nothing above B's position and send entries.
+#[tokio::test]
+async fn log_diverged_waits_for_its_0_write_with_the_ack_in_memory_only() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+
+    let (mut a, frames) = follow_from(&server, &node, hello(&node.node_id)).await;
+    let (last, hash) = check_entries(&frames.last().unwrap()["body"], &genesis());
+    ack(&mut a, last, &hash).await;
+    let (acked, _) = catch_up(&mut a, last, hash).await;
+    assert!(acked > 1, "{acked}");
+    assert_eq!(stored_log_seq(&server, &node.node_id).await, 0);
+    refuse_log_seq_reset(&server).await;
+
+    let below = acked - 1;
+    let below_hash = log_hash_at(&server, below).await;
+    let mut b = connect(&server, &node.credential).await;
+    let mut frames = hello_then_settle(&mut b, hello_at(&node.node_id, below, &below_hash)).await;
+    assert!(of_type(&frames, "error").is_empty(), "{frames:?}");
+    assert!(of_type(&frames, "log_entries").is_empty(), "{frames:?}");
+    assert_eq!(stored_log_seq(&server, &node.node_id).await, below);
+
+    allow_log_seq_reset(&server).await;
+    frames.extend(recv_through_log_entries(&mut b).await);
+    check_diverged(&frames);
+    assert_eq!(stored_log_seq(&server, &node.node_id).await, 0);
+    drop(b);
+    drop(a);
+}
+
+/// (n) `nodes.log_seq` holds N, with nothing in the primary's memory. A
+/// session's matching `hello` below N is stored by its start write, but the
+/// session ends before its check completes: the 0 write keeps failing. Its
+/// end puts N back, so the next `hello` at the same position still draws
+/// `log_diverged` (section 7.1, "On `hello`", ADR 0261).
+#[tokio::test]
+async fn a_session_ended_before_its_check_puts_the_stored_log_seq_back() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+    append_entries(&server, "bulk", 3).await;
+
+    // As a session of an earlier primary process would have left it.
+    let stored = log_head(&server).await;
+    set_stored_log_seq(&server, &node.node_id, stored).await;
+    refuse_log_seq_reset(&server).await;
+
+    let below = stored - 1;
+    let below_hash = log_hash_at(&server, below).await;
+    let mut socket = connect(&server, &node.credential).await;
+    let frames = hello_then_settle(&mut socket, hello_at(&node.node_id, below, &below_hash)).await;
+    assert!(of_type(&frames, "error").is_empty(), "{frames:?}");
+    assert!(of_type(&frames, "log_entries").is_empty(), "{frames:?}");
+    assert_eq!(
+        stored_log_seq(&server, &node.node_id).await,
+        below,
+        "the start write"
+    );
+
+    drop(socket);
+    wait_disconnected(&server, &owner, &node.node_id).await;
+    assert_eq!(
+        stored_log_seq(&server, &node.node_id).await,
+        stored,
+        "the end write puts back what the start write replaced"
+    );
+
+    allow_log_seq_reset(&server).await;
+    let (_socket, frames) =
+        follow_from(&server, &node, hello_at(&node.node_id, below, &below_hash)).await;
+    check_diverged(&frames);
+    assert_eq!(stored_log_seq(&server, &node.node_id).await, 0);
+}
+
+/// (o) `nodes.log_seq` holds N, with nothing in the primary's memory.
+/// Session A's matching `hello` below N is stored by its start write, and
+/// its check keeps failing on the 0 write. Session B replaces A, still
+/// attached, with the same `hello`: B's start write reads A's as the stored
+/// value, but the primary raised its memory to N at A's start, so B's check
+/// still finds the log went back and B gets `log_diverged` once the write
+/// can succeed.
+#[tokio::test]
+async fn a_session_superseded_before_its_check_leaves_the_stored_log_seq_in_memory() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+    append_entries(&server, "bulk", 3).await;
+
+    let stored = log_head(&server).await;
+    set_stored_log_seq(&server, &node.node_id, stored).await;
+    refuse_log_seq_reset(&server).await;
+
+    let below = stored - 1;
+    let below_hash = log_hash_at(&server, below).await;
+    let mut a = connect(&server, &node.credential).await;
+    let frames = hello_then_settle(&mut a, hello_at(&node.node_id, below, &below_hash)).await;
+    assert!(of_type(&frames, "error").is_empty(), "{frames:?}");
+    assert!(of_type(&frames, "log_entries").is_empty(), "{frames:?}");
+    assert_eq!(stored_log_seq(&server, &node.node_id).await, below);
+
+    let mut b = connect(&server, &node.credential).await;
+    let mut frames = hello_then_settle(&mut b, hello_at(&node.node_id, below, &below_hash)).await;
+    assert!(
+        of_type(&frames, "log_entries").is_empty(),
+        "B's hello below N passed the check: {frames:?}"
+    );
+    assert!(of_type(&frames, "error").is_empty(), "{frames:?}");
+
+    allow_log_seq_reset(&server).await;
+    frames.extend(recv_through_log_entries(&mut b).await);
+    check_diverged(&frames);
+    assert_eq!(stored_log_seq(&server, &node.node_id).await, 0);
+    drop(b);
+    drop(a);
 }
