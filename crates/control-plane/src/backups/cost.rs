@@ -3,10 +3,10 @@
 //! `HaPolicyCost`, ADR 0020).
 //!
 //! The primary computes these values from rows it already holds: the app's
-//! resources and volume, the snapshot method of the volume's node (ADR 0146)
-//! and the manifests of the app's backups (ADR 0147). Nothing is stored and no
-//! column is added (`openapi.yaml` `AppHaCost`, "These are estimates, not
-//! reservations").
+//! resources and volume, the snapshot method of the volume's node (ADR 0146),
+//! the manifests of the app's backups (ADR 0147) and, for `warm`, the warm
+//! node's newest report (ADR 0174). Nothing is stored and no column is added
+//! (`openapi.yaml` `AppHaCost`, "These are estimates, not reservations").
 //!
 //! The two rates below stand in for measurements until one exists: the restore
 //! rate until the app has a volume a restore wrote, and the copy rate until a
@@ -18,6 +18,8 @@ use crate::api::apps::{
 };
 use crate::error::ApiError;
 use crate::store::now_rfc3339;
+use crate::warm::WarmAvailability;
+use quoro_proto::wire::WarmRole;
 use sqlx::Row;
 
 /// Bytes per second a restore is estimated at before the first measured one:
@@ -27,6 +29,12 @@ pub(crate) const DEFAULT_RESTORE_RATE: i64 = 50 * 1024 * 1024;
 /// Bytes per second a `pause_copy` snapshot is estimated at before the first
 /// measured pause: 80 MiB/s. An estimate, not a measurement.
 pub(crate) const DEFAULT_COPY_RATE: i64 = 80 * 1024 * 1024;
+
+/// Seconds a warm copy is estimated to take to start before the primary
+/// observed a start of the app (`openapi.yaml` `HaPolicyCost.restore_estimate_s`,
+/// ADR 0174). The primary does not time starts yet, so this is the estimate
+/// every `warm` entry shows.
+pub(crate) const DEFAULT_WARM_START_S: i64 = 10;
 
 /// The app's attached volume, as far as the cost cares.
 struct VolumeFacts {
@@ -81,7 +89,8 @@ pub(crate) async fn app_ha_cost(
     })
     .transpose()?;
     let Some(volume) = volume else {
-        return Ok(Some(stateless(app)));
+        let warm = warm_cost(state, app).await?;
+        return Ok(Some(stateless(app, warm)));
     };
     if volume.node_id.is_empty() {
         return Ok(None);
@@ -141,7 +150,7 @@ pub(crate) async fn app_ha_cost(
             repository.is_some(),
             rate,
         ),
-        unavailable_cost(HaPolicy::Warm, &app.resources),
+        warm_cost(state, app).await?,
         unavailable_cost(HaPolicy::Hot, &app.resources),
     ];
     Ok(Some(AppHaCost {
@@ -151,8 +160,9 @@ pub(crate) async fn app_ha_cost(
     }))
 }
 
-/// The cost of every policy for an app with no attached volume.
-fn stateless(app: &App) -> AppHaCost {
+/// The cost of every policy for an app with no attached volume; `warm` is its
+/// [`warm_cost`].
+fn stateless(app: &App, warm: HaPolicyCost) -> AppHaCost {
     AppHaCost {
         snapshot_method: None,
         policies: vec![
@@ -174,7 +184,7 @@ fn stateless(app: &App) -> AppHaCost {
                 restore_estimate_s: None,
                 pause_estimate_ms: None,
             },
-            unavailable_cost(HaPolicy::Warm, &app.resources),
+            warm,
             unavailable_cost(HaPolicy::Hot, &app.resources),
         ],
         computed_at: now_rfc3339(),
@@ -228,7 +238,85 @@ fn cold_cost(
     }
 }
 
-/// A policy that is not available in this release (`warm`, `hot`).
+/// The `warm` entry (`openapi.yaml` `HaPolicyCost`, ADR 0174). A build that
+/// refuses `warm` (ADR 0277) prices it as not in this release, as before.
+/// Otherwise:
+/// - `available` and `unavailable_reason` as `updateApp` decides
+///   ([`crate::warm::warm_availability`]);
+/// - `reserved` is disk only: the volume's size plus the app's root disk on
+///   the warm node; nothing for an app with no volume;
+/// - `storage_bytes` is the allocated bytes of the copy the warm node last
+///   reported, or the volume's allocated bytes before that;
+/// - `restore_estimate_s` is [`DEFAULT_WARM_START_S`], and
+///   `pause_estimate_ms` is 0: a warm volume is only snapshotted with
+///   `reflink` (ADR 0172); both are null with no volume.
+async fn warm_cost(state: &AppState, app: &App) -> Result<HaPolicyCost, ApiError> {
+    if !crate::DEV_WARM_POLICY {
+        return Ok(unavailable_cost(HaPolicy::Warm, &app.resources));
+    }
+    let mut conn = state.store.pool().acquire().await?;
+    let (available, unavailable_reason, volume) = match crate::warm::warm_availability(
+        &mut conn,
+        &app.id,
+        app.source.is_some(),
+        crate::DEV_WARM_POLICY,
+    )
+    .await?
+    {
+        WarmAvailability::Available { volume, .. } => (true, None, Some(volume)),
+        WarmAvailability::Unavailable { reason, volume } => (false, Some(reason), volume),
+    };
+    let Some(volume) = volume else {
+        return Ok(HaPolicyCost {
+            policy: HaPolicy::Warm,
+            available,
+            unavailable_reason,
+            reserved: zero_capacity(),
+            storage_bytes: Some(0),
+            restore_estimate_s: None,
+            pause_estimate_ms: None,
+        });
+    };
+    let warm_node: Option<Option<String>> =
+        sqlx::query_scalar("SELECT warm_node_id FROM apps WHERE id = ? AND ha_policy = 'warm'")
+            .bind(&app.id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let reported = warm_node.flatten().and_then(|node_id| {
+        state
+            .hub
+            .warm_reports()
+            .get(&node_id)?
+            .iter()
+            .find_map(|entry| {
+                (entry.role == WarmRole::Target
+                    && entry.volume_id == volume.id
+                    && entry.app_id == app.id)
+                    .then_some(entry.allocated_bytes)
+                    .flatten()
+            })
+    });
+    let storage_bytes = reported
+        .and_then(|bytes| i64::try_from(bytes).ok())
+        .or(volume.allocated_bytes)
+        .unwrap_or(0);
+    Ok(HaPolicyCost {
+        policy: HaPolicy::Warm,
+        available,
+        unavailable_reason,
+        reserved: HaCapacity {
+            vcpus: 0,
+            memory_mb: 0,
+            disk_gb: volume.size_gb.saturating_add(app.resources.disk_gb),
+        },
+        storage_bytes: Some(storage_bytes.max(0)),
+        restore_estimate_s: Some(DEFAULT_WARM_START_S),
+        pause_estimate_ms: Some(0),
+    })
+}
+
+/// A policy that is not available in this release: `hot`, and `warm` in a
+/// build that refuses it (ADR 0277).
 fn unavailable_cost(policy: HaPolicy, resources: &crate::api::apps::AppResources) -> HaPolicyCost {
     HaPolicyCost {
         policy,

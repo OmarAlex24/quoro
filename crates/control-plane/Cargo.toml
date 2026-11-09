@@ -10,12 +10,12 @@ license.workspace = true
 workspace = true
 
 [features]
-# ADR 0223: dev-only, for test-lab builds. It lets `updateApp` accept
-# `ha_policy: warm` before the warm policy ships, so an app's lease can turn
-# `expiring` once the primary side of that mode change exists (#555). It
-# creates no warm copy, no standby VM and no replication. Off by default, and
-# the release build never enables it: CI fails a default or release binary
-# that reports it. Removed when the warm policy merges (#533).
+# ADR 0223, ADR 0277: dev-only, for test-lab builds. Until the last warm PR
+# merges, only a build with it accepts `ha_policy: warm`, and it runs
+# everything of the warm policy merged so far, so the test lab can exercise
+# each part (an app's lease turns `expiring` once #555 lands). Off by default,
+# and the release build never enables it: CI fails a default or release
+# binary that reports it. The last warm PR removes it.
 dev-warm-policy = []
 
 [dependencies]
