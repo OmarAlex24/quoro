@@ -250,7 +250,8 @@ function AgentOverview({ agent, facts, ctx }: { agent: Agent; facts: AgentFacts;
   const calls = useAgentCalls(agent.id);
   const keys = useListAgentKeys(agent.id, { limit: 200 }, { query: { staleTime: 15_000, retry: false } });
 
-  const recent = useMemo(() => (calls.data ? [...calls.data.records].slice(-RECENT) : []), [calls.data]);
+  // Newest first, as Activity reads: the first page always holds the latest.
+  const recent = useMemo(() => (calls.data ? calls.data.records.slice(0, RECENT) : []), [calls.data]);
   const active = facts.grants.filter((grant) => grant.status === 'active');
   const liveKeys = (keys.data?.items ?? []).filter((key) => !key.revoked_at);
   const lastUsed = liveKeys
@@ -303,10 +304,6 @@ function AgentOverview({ agent, facts, ctx }: { agent: Agent; facts: AgentFacts;
           <div className="h-[120px] rounded-[10px] border border-line bg-surface/60" />
         ) : calls.isError ? (
           <ProblemBanner view={problemView(calls.error, 'read the audit log')} />
-        ) : calls.data?.capped ? (
-          <p className="box px-4 py-3 text-[13px] text-ink-2">
-            It has more records than this view reads, oldest first. Activity, filtered to this agent, has the newest.
-          </p>
         ) : recent.length === 0 ? (
           <p className="box px-4 py-3 text-[13px] text-ink-2">Nothing recorded yet. Its calls will show here.</p>
         ) : (
