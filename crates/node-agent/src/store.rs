@@ -134,6 +134,7 @@ CREATE TABLE IF NOT EXISTS backups (
     status          TEXT NOT NULL,
     snapshot_method TEXT,
     pause_ms        INTEGER,
+    guest_flush     INTEGER,
     manifest_key    TEXT,
     manifest_digest TEXT,
     logical_bytes   INTEGER,
@@ -455,6 +456,10 @@ pub struct BackupRecord {
     pub snapshot_method: Option<SnapshotMethod>,
     /// From `running`, for `pause_copy`: how long the VM was paused.
     pub pause_ms: Option<u64>,
+    /// From `running`: whether the snapshot followed a guest flush, `true`
+    /// for `Flushed` or `NoRunningVm` (ADR 0282). `None` for a row from
+    /// before `running` or from an agent older than M5b.
+    pub guest_flush: Option<bool>,
     /// On `succeeded`: the manifest's key, relative to the repository root.
     pub manifest_key: Option<String>,
     /// On `succeeded`: BLAKE3 of the encrypted manifest object.
@@ -485,6 +490,7 @@ impl BackupRecord {
             status: self.status,
             snapshot_method: self.snapshot_method,
             pause_ms: self.pause_ms,
+            guest_flush: self.guest_flush,
             manifest_key: self.manifest_key.clone(),
             manifest_digest: self.manifest_digest.clone(),
             logical_bytes: self.logical_bytes,
@@ -1731,13 +1737,14 @@ impl NodeStore {
     pub async fn save_backup(&self, record: &BackupRecord) -> Result<(), AgentError> {
         sqlx::query(
             "INSERT INTO backups (backup_id, app_id, volume_id, status, snapshot_method, \
-             pause_ms, manifest_key, manifest_digest, logical_bytes, uploaded_bytes, \
-             chunk_count, error, started_at, finished_at, snapshot_path) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             pause_ms, guest_flush, manifest_key, manifest_digest, logical_bytes, \
+             uploaded_bytes, chunk_count, error, started_at, finished_at, snapshot_path) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(backup_id) DO UPDATE SET app_id = excluded.app_id, \
              volume_id = excluded.volume_id, status = excluded.status, \
              snapshot_method = excluded.snapshot_method, pause_ms = excluded.pause_ms, \
-             manifest_key = excluded.manifest_key, manifest_digest = excluded.manifest_digest, \
+             guest_flush = excluded.guest_flush, manifest_key = excluded.manifest_key, \
+             manifest_digest = excluded.manifest_digest, \
              logical_bytes = excluded.logical_bytes, uploaded_bytes = excluded.uploaded_bytes, \
              chunk_count = excluded.chunk_count, error = excluded.error, \
              started_at = excluded.started_at, finished_at = excluded.finished_at, \
@@ -1749,6 +1756,7 @@ impl NodeStore {
         .bind(backup_state_str(record.status))
         .bind(record.snapshot_method.map(snapshot_method_str))
         .bind(record.pause_ms.and_then(|ms| i64::try_from(ms).ok()))
+        .bind(record.guest_flush)
         .bind(record.manifest_key.as_deref())
         .bind(record.manifest_digest.as_deref())
         .bind(
@@ -2172,6 +2180,7 @@ fn backup_record(row: sqlx::sqlite::SqliteRow) -> Result<BackupRecord, AgentErro
     let status: String = row.try_get("status").map_err(store_error)?;
     let method: Option<String> = row.try_get("snapshot_method").map_err(store_error)?;
     let pause_ms: Option<i64> = row.try_get("pause_ms").map_err(store_error)?;
+    let guest_flush: Option<bool> = row.try_get("guest_flush").map_err(store_error)?;
     let logical_bytes: Option<i64> = row.try_get("logical_bytes").map_err(store_error)?;
     let uploaded_bytes: Option<i64> = row.try_get("uploaded_bytes").map_err(store_error)?;
     let chunk_count: Option<i64> = row.try_get("chunk_count").map_err(store_error)?;
@@ -2182,6 +2191,7 @@ fn backup_record(row: sqlx::sqlite::SqliteRow) -> Result<BackupRecord, AgentErro
         status: parse_backup_state(&status)?,
         snapshot_method: method.as_deref().map(parse_snapshot_method).transpose()?,
         pause_ms: pause_ms.and_then(|ms| u64::try_from(ms).ok()),
+        guest_flush,
         manifest_key: row.try_get("manifest_key").map_err(store_error)?,
         manifest_digest: row.try_get("manifest_digest").map_err(store_error)?,
         logical_bytes: logical_bytes.and_then(|bytes| u64::try_from(bytes).ok()),
@@ -2720,9 +2730,10 @@ async fn buffer_event(
 }
 
 /// Adds the columns newer agents need to a database an older agent created:
-/// `desired_state.body_enc` (bodies encrypted) and the two validity columns
-/// of `leases`. New databases get them from [`SCHEMA`]; existing ones are
-/// altered once, and the old rows keep loading.
+/// `desired_state.body_enc` (bodies encrypted), the two validity columns of
+/// `leases` and `backups.guest_flush` (M5b, ADR 0282). New databases get them
+/// from [`SCHEMA`]; existing ones are altered once, and the old rows keep
+/// loading.
 async fn migrate(pool: &SqlitePool) -> Result<(), AgentError> {
     let columns = sqlx::query("PRAGMA table_info(desired_state)")
         .fetch_all(pool)
@@ -2759,6 +2770,23 @@ async fn migrate(pool: &SqlitePool) -> Result<(), AgentError> {
                 .await
                 .map_err(store_error)?;
         }
+    }
+
+    // Whether a backup's snapshot followed a guest flush (section 5.3, ADR
+    // 0282); rows written before it read as unknown.
+    let columns = sqlx::query("PRAGMA table_info(backups)")
+        .fetch_all(pool)
+        .await
+        .map_err(store_error)?;
+    let has_flush = columns.iter().any(|row| {
+        row.try_get::<String, _>("name")
+            .is_ok_and(|name| name == "guest_flush")
+    });
+    if !has_flush {
+        sqlx::query("ALTER TABLE backups ADD COLUMN guest_flush INTEGER")
+            .execute(pool)
+            .await
+            .map_err(store_error)?;
     }
 
     // A node an older agent marked failed has no list of the failed fences
@@ -3055,5 +3083,110 @@ mod tests {
             store.latest_desired().await,
             Err(AgentError::LocalKey(_))
         ));
+    }
+
+    fn running_backup(backup_id: &str, guest_flush: Option<bool>) -> BackupRecord {
+        BackupRecord {
+            backup_id: backup_id.to_owned(),
+            app_id: "app_1".to_owned(),
+            volume_id: "vol_1".to_owned(),
+            status: BackupState::Running,
+            snapshot_method: Some(SnapshotMethod::PauseCopy),
+            pause_ms: Some(120),
+            guest_flush,
+            manifest_key: None,
+            manifest_digest: None,
+            logical_bytes: None,
+            uploaded_bytes: None,
+            chunk_count: None,
+            error: None,
+            started_at: Some("2026-11-09T03:00:00Z".to_owned()),
+            finished_at: None,
+            snapshot_path: Some("/var/lib/quoro/volumes/vol_1.snap-1".to_owned()),
+        }
+    }
+
+    /// Section 5.3, ADR 0282: a backup row keeps whether its snapshot followed
+    /// a guest flush, `true`, `false` or unknown, and reports it.
+    #[tokio::test]
+    async fn a_backup_row_keeps_its_guest_flush() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        for (backup_id, guest_flush) in [
+            ("bkp_1", Some(true)),
+            ("bkp_2", Some(false)),
+            ("bkp_3", None),
+        ] {
+            let record = running_backup(backup_id, guest_flush);
+            store.save_backup(&record).await.unwrap();
+            let loaded = store.backup(backup_id).await.unwrap().unwrap();
+            assert_eq!(loaded, record);
+            assert_eq!(loaded.to_status().guest_flush, guest_flush);
+        }
+
+        // The upsert replaces it as the row moves on.
+        let mut record = running_backup("bkp_3", Some(false));
+        store.save_backup(&record).await.unwrap();
+        record.status = BackupState::Succeeded;
+        record.guest_flush = Some(true);
+        store.save_backup(&record).await.unwrap();
+        assert_eq!(
+            store.backup("bkp_3").await.unwrap().unwrap().guest_flush,
+            Some(true)
+        );
+        let flushes: Vec<Option<bool>> = store
+            .backups()
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.guest_flush)
+            .collect();
+        assert_eq!(flushes, vec![Some(true), Some(false), Some(true)]);
+    }
+
+    /// Section 12 `backups`: a database an agent older than M5b created gains
+    /// the `guest_flush` column, its rows load with none, and a new row
+    /// stores the value.
+    #[tokio::test]
+    async fn the_backup_table_of_an_older_agent_gains_the_guest_flush_column() {
+        let dir = TempDir::new();
+        {
+            let options = SqliteConnectOptions::new()
+                .filename(dir.0.join("node.db"))
+                .create_if_missing(true);
+            let pool = SqlitePool::connect_with(options).await.unwrap();
+            sqlx::raw_sql(
+                "CREATE TABLE backups (backup_id TEXT PRIMARY KEY, app_id TEXT NOT NULL, \
+                 volume_id TEXT NOT NULL, status TEXT NOT NULL, snapshot_method TEXT, \
+                 pause_ms INTEGER, manifest_key TEXT, manifest_digest TEXT, \
+                 logical_bytes INTEGER, uploaded_bytes INTEGER, chunk_count INTEGER, \
+                 error TEXT, started_at TEXT, finished_at TEXT, snapshot_path TEXT); \
+                 INSERT INTO backups (backup_id, app_id, volume_id, status, \
+                 snapshot_method, pause_ms, started_at) VALUES ('bkp_old', 'app_1', \
+                 'vol_1', 'running', 'reflink', NULL, '2026-11-05T03:00:00Z');",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+        }
+        let store = NodeStore::open(&dir.0).await.expect("the store opens");
+        let old = store.backup("bkp_old").await.unwrap().unwrap();
+        assert_eq!(old.status, BackupState::Running);
+        assert_eq!(old.snapshot_method, Some(SnapshotMethod::Reflink));
+        assert_eq!(old.guest_flush, None);
+        assert_eq!(old.to_status().guest_flush, None);
+
+        let new = running_backup("bkp_new", Some(false));
+        store.save_backup(&new).await.unwrap();
+        assert_eq!(store.backup("bkp_new").await.unwrap(), Some(new));
+
+        // A second start finds the column and alters nothing.
+        drop(store);
+        let store = NodeStore::open(&dir.0).await.expect("the store reopens");
+        assert_eq!(
+            store.backup("bkp_new").await.unwrap().unwrap().guest_flush,
+            Some(false)
+        );
     }
 }
