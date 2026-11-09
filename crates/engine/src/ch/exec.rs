@@ -307,7 +307,9 @@ impl OutputPump {
                         }
                         Ok(GuestFrame::Exit(code)) => return SessionEnd::GuestExit(code),
                         Ok(GuestFrame::Error(_)) => return SessionEnd::GuestError,
-                        Err(_) => return SessionEnd::Malformed,
+                        // `SYNCED` answers a sync session (ADR 0282), never a
+                        // PTY session: here it breaks the format.
+                        Ok(GuestFrame::Synced) | Err(_) => return SessionEnd::Malformed,
                     }
                     // A read can carry several frames: parse them all before
                     // reading again, or a frame already buffered waits for a

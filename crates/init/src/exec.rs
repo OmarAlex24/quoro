@@ -941,6 +941,17 @@ mod tests {
                 .join(",")
         );
         assert!(SyncRequest::from_json(&too_many).is_err());
+        let most = format!(
+            "{{\"serials\":[{}]}}",
+            (0..MAX_SYNC_SERIALS)
+                .map(|n| format!("\"quoro-vol-{n}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert_eq!(
+            SyncRequest::from_json(&most).map(|request| request.serials.len()),
+            Ok(MAX_SYNC_SERIALS)
+        );
         assert!(
             SyncRequest {
                 serials: Vec::new()

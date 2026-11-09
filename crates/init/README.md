@@ -282,9 +282,11 @@ calls `syncfs` on it. It then answers `SYNCED` (type 132, no payload) and
 closes. A serial the configuration lacks, a mount path it cannot open, or a
 `syncfs` that fails answers `ERROR` with the reason and closes. A sync session
 starts no program, allocates no PTY, reads no frame after the `SYNC`, and
-writes nothing to the app's console. A failure is logged on the serial console
-only the first time, or when its reason changes, so a sync every few seconds
-cannot push the boot output out of the serial ring. A `SYNC` after an `OPEN`
+writes nothing to the app's console. A volume whose sync fails is logged on
+the serial console only the first time, or when its reason changes, until a
+sync of that volume succeeds, so a sync every few seconds cannot push the boot
+output out of the serial ring. A malformed `SYNC` is answered with `ERROR` and
+not logged. A `SYNC` after an `OPEN`
 ends that PTY session with `ERROR`. An init older than ADR 0282 answers a
 `SYNC` with `ERROR` "the first frame must be open, got type 5", which the engine
 reads as an init that cannot flush.

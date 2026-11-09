@@ -14,6 +14,7 @@
 //! the program's terminal fills up, and the program blocks. Nothing here
 //! buffers output beyond one 8 KiB read.
 
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -115,8 +116,9 @@ pub(super) struct Context {
     identity: Identity,
     /// `(serial, mount_path)` of every volume in the configuration.
     volumes: Vec<(String, String)>,
-    /// The reason of the last failed sync, cleared by a sync that succeeds.
-    sync_failure: Mutex<Option<String>>,
+    /// Per volume serial, the reason of its last failed sync, cleared when a
+    /// sync of that volume succeeds.
+    sync_failures: Mutex<HashMap<String, String>>,
 }
 
 impl Context {
@@ -130,28 +132,29 @@ impl Context {
                 .iter()
                 .map(|volume| (volume.serial.clone(), volume.mount_path.clone()))
                 .collect(),
-            sync_failure: Mutex::new(None),
+            sync_failures: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Records a sync's result. A failure is logged on the serial console
-    /// only when it is the first one or its reason changed, so a sync every
-    /// few seconds that keeps failing does not push the boot output out of
-    /// the serial ring (`engine-trait.md` section 6). Returns whether it was
-    /// logged.
-    fn note_sync(&self, failure: Option<&str>) -> bool {
-        let Ok(mut last) = self.sync_failure.lock() else {
+    /// Records the result of one volume's sync. A failure is logged on the
+    /// serial console only when it is that volume's first one or its reason
+    /// changed, so a sync every few seconds that keeps failing, even
+    /// alternating with another volume's success, does not push the boot
+    /// output out of the serial ring (`engine-trait.md` section 6). Returns
+    /// whether it was logged.
+    fn note_sync(&self, serial: &str, failure: Option<&str>) -> bool {
+        let Ok(mut failures) = self.sync_failures.lock() else {
             return false;
         };
         let Some(reason) = failure else {
-            *last = None;
+            failures.remove(serial);
             return false;
         };
-        if last.as_deref() == Some(reason) {
+        if failures.get(serial).map(String::as_str) == Some(reason) {
             return false;
         }
         diag::log(&format!("exec: {reason}"));
-        *last = Some(reason.to_string());
+        failures.insert(serial.to_string(), reason.to_string());
         true
     }
 }
@@ -430,36 +433,32 @@ fn read_open<R: Read>(reader: &mut R, frames: &mut FrameReader) -> Opened {
 /// first reason. It starts no program, allocates no PTY and writes nothing to
 /// the app's console.
 fn serve_sync<S: SessionIo>(request: &SyncRequest, context: &Context, sink: &Sink<S>) {
-    match sync_volumes(&request.serials, &context.volumes) {
-        Ok(()) => {
-            context.note_sync(None);
-            sink.finish(&GuestFrame::Synced);
-        }
-        Err(reason) => {
-            context.note_sync(Some(&reason));
+    for serial in &request.serials {
+        if let Err(reason) = sync_volume(serial, &context.volumes) {
+            context.note_sync(serial, Some(&reason));
             sink.error(&reason);
+            sink.shutdown();
+            return;
         }
+        context.note_sync(serial, None);
     }
+    sink.finish(&GuestFrame::Synced);
     sink.shutdown();
 }
 
-/// `syncfs` on each serial's mount path, opened now, so a path the app
+/// `syncfs` on the serial's mount path, opened now, so a path the app
 /// remounted or the init unmounted is seen as it is at this moment.
-fn sync_volumes(serials: &[String], volumes: &[(String, String)]) -> Result<(), String> {
-    for serial in serials {
-        let Some((_, path)) = volumes.iter().find(|(known, _)| known == serial) else {
-            return Err(format!("sync: no volume {serial} in the configuration"));
-        };
-        let directory = rustix::fs::open(
-            path.as_str(),
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|err| format!("sync: open {path} of {serial}: {err}"))?;
-        rustix::fs::syncfs(&directory)
-            .map_err(|err| format!("sync: syncfs {path} of {serial}: {err}"))?;
-    }
-    Ok(())
+fn sync_volume(serial: &str, volumes: &[(String, String)]) -> Result<(), String> {
+    let Some((_, path)) = volumes.iter().find(|(known, _)| known == serial) else {
+        return Err(format!("sync: no volume {serial} in the configuration"));
+    };
+    let directory = rustix::fs::open(
+        path.as_str(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|err| format!("sync: open {path} of {serial}: {err}"))?;
+    rustix::fs::syncfs(&directory).map_err(|err| format!("sync: syncfs {path} of {serial}: {err}"))
 }
 
 /// Host frames to the PTY. Returns when the host closes, drops the connection,
@@ -760,7 +759,7 @@ mod tests {
                 home: "/".to_string(),
             },
             volumes: Vec::new(),
-            sync_failure: Mutex::new(None),
+            sync_failures: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1012,8 +1011,12 @@ mod tests {
         assert!(synced, "error: {error:?}");
         assert_eq!(error, None);
         assert_eq!(
-            context.sync_failure.lock().map(|last| last.clone()).ok(),
-            Some(None)
+            context
+                .sync_failures
+                .lock()
+                .map(|failures| failures.len())
+                .ok(),
+            Some(0)
         );
     }
 
@@ -1041,8 +1044,13 @@ mod tests {
         let message = error.unwrap_or_default();
         assert!(message.contains("quoro-vol-7"), "{message:?}");
         assert_eq!(
-            context.sync_failure.lock().map(|last| last.clone()).ok(),
-            Some(Some(message))
+            context
+                .sync_failures
+                .lock()
+                .map(|failures| failures.get("quoro-vol-7").cloned())
+                .ok(),
+            Some(Some(message)),
+            "the failure is recorded against the volume that failed"
         );
     }
 
@@ -1079,18 +1087,36 @@ mod tests {
     }
 
     #[test]
-    fn a_failing_sync_is_logged_once_per_reason() {
+    fn a_failing_sync_is_logged_once_per_volume_and_reason() {
         let context = test_context();
-        assert!(context.note_sync(Some("sync: syncfs /data of quoro-vol-0: EIO")));
+        let eio = "sync: syncfs /data of quoro-vol-0: EIO";
+        let gone = "sync: open /srv of quoro-vol-1: ENOENT";
+        assert!(context.note_sync("quoro-vol-0", Some(eio)));
         assert!(
-            !context.note_sync(Some("sync: syncfs /data of quoro-vol-0: EIO")),
+            !context.note_sync("quoro-vol-0", Some(eio)),
             "the same reason again is not logged"
         );
-        assert!(context.note_sync(Some("sync: no volume quoro-vol-3 in the configuration")));
-        assert!(!context.note_sync(None), "a success is never logged");
+        // Another volume's success and failure, alternating as warm cycles of
+        // two volumes would, log only each volume's first failure.
         assert!(
-            context.note_sync(Some("sync: no volume quoro-vol-3 in the configuration")),
-            "a failure after a success is logged again"
+            !context.note_sync("quoro-vol-2", None),
+            "a success is never logged"
+        );
+        assert!(context.note_sync("quoro-vol-1", Some(gone)));
+        assert!(!context.note_sync("quoro-vol-2", None));
+        assert!(!context.note_sync("quoro-vol-0", Some(eio)));
+        assert!(!context.note_sync("quoro-vol-1", Some(gone)));
+        assert!(
+            context.note_sync(
+                "quoro-vol-0",
+                Some("sync: syncfs /data of quoro-vol-0: EROFS")
+            ),
+            "a new reason is logged"
+        );
+        assert!(!context.note_sync("quoro-vol-0", None));
+        assert!(
+            context.note_sync("quoro-vol-0", Some(eio)),
+            "a failure after that volume's success is logged again"
         );
     }
 
