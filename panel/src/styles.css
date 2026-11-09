@@ -4199,6 +4199,35 @@
     white-space: nowrap;
   }
 
+  /* A run of the same read, said once: its node drawn as a small stack. */
+  .fr-group .fr-chain i {
+    box-shadow:
+      0 0 0 1px var(--ink-3),
+      2px -2px 0 0 var(--surface),
+      2px -2px 0 1px var(--ink-3);
+  }
+
+  .fr-caret {
+    display: inline-block;
+    margin-left: 6px;
+    vertical-align: -2px;
+    color: var(--ink-3);
+    transition: transform 120ms ease;
+  }
+
+  .fr-group-open .fr-caret {
+    transform: rotate(90deg);
+  }
+
+  /* The single records of an opened run. */
+  .fr-sub {
+    background-color: color-mix(in oklab, var(--sunk) 70%, transparent);
+  }
+
+  .fr-sub .fr-s {
+    color: var(--ink-2);
+  }
+
   @media (max-width: 639px) {
     .fr {
       grid-template-columns: 22px 22px minmax(0, 1fr) auto;

@@ -10,9 +10,9 @@ import {
   useListAgentKeys,
 } from '../api/generated/agents/agents';
 import { useListGrants } from '../api/generated/grants/grants';
-import type { Agent, Grant } from '../api/generated/model';
+import type { Agent, AuditRecord, Grant } from '../api/generated/model';
 import { isApiProblem } from '../api/fetcher';
-import { recordTargets, type RecordContext } from '../lib/activity';
+import { groupReads, recordTargets, type RecordContext } from '../lib/activity';
 import { agentDisabledPatch, agentStatus } from '../lib/agents';
 import { relativeTime } from '../lib/app-status';
 import {
@@ -29,7 +29,7 @@ import { useNow } from '../lib/use-now';
 import { useKeptNames } from '../lib/use-record-context';
 import { cn } from '../lib/utils';
 import { useSession } from '../session';
-import { ActivityRow } from '../components/activity-row';
+import { ActivityRow, ReadsRow } from '../components/activity-row';
 import { AgentCard, useAgentDirectory, type AgentFacts } from '../components/agent-card';
 import { CreateAgentDialog, EditAgentDialog } from '../components/agent-dialog';
 import { AgentKeys } from '../components/agent-keys';
@@ -252,7 +252,17 @@ function AgentOverview({ agent, facts, ctx: records }: { agent: Agent; facts: Ag
   const keys = useListAgentKeys(agent.id, { limit: 200 }, { query: { staleTime: 15_000, retry: false } });
 
   // Newest first, as Activity reads: the first page always holds the latest.
-  const recent = useMemo(() => (calls.data ? calls.data.records.slice(0, RECENT) : []), [calls.data]);
+  // A run of the same read is one row, so a polling agent's request and the
+  // decision on it stay in view: fold first, then keep the newest rows.
+  const recentItems = useMemo(
+    () => (calls.data ? groupReads(calls.data.records).slice(0, RECENT) : []),
+    [calls.data],
+  );
+  const recent = useMemo(
+    () => recentItems.flatMap((item) => (item.kind === 'one' ? [item.record] : item.records)),
+    [recentItems],
+  );
+  const [openRuns, setOpenRuns] = useState<ReadonlySet<string>>(() => new Set());
   const targets = useMemo(() => recordTargets(recent, records), [recent, records]);
   const ctx = useKeptNames(records, targets, recent);
   const active = facts.grants.filter((grant) => grant.status === 'active');
@@ -311,17 +321,40 @@ function AgentOverview({ agent, facts, ctx: records }: { agent: Agent; facts: Ag
           <p className="box px-4 py-3 text-[13px] text-ink-2">Nothing recorded yet. Its calls will show here.</p>
         ) : (
           <ol className="feed feed-box">
-            {recent.map((record) => (
-              <ActivityRow
-                key={record.seq}
-                record={record}
-                ctx={ctx}
-                selected={false}
-                broken={false}
-                withDay
-                onOpen={() => void navigate({ to: '/activity', search: { actor_id: agent.id, seq: record.seq } })}
-              />
-            ))}
+            {recentItems.map((item) => {
+              const row = (record: AuditRecord, nested = false) => (
+                <ActivityRow
+                  key={record.seq}
+                  record={record}
+                  ctx={ctx}
+                  selected={false}
+                  broken={false}
+                  withDay
+                  nested={nested}
+                  onOpen={() => void navigate({ to: '/activity', search: { actor_id: agent.id, seq: record.seq } })}
+                />
+              );
+              if (item.kind === 'one') return row(item.record);
+              return (
+                <ReadsRow
+                  key={item.key}
+                  records={item.records}
+                  ctx={ctx}
+                  withDay
+                  open={openRuns.has(item.key)}
+                  onToggle={() =>
+                    setOpenRuns((current) => {
+                      const next = new Set(current);
+                      if (next.has(item.key)) next.delete(item.key);
+                      else next.add(item.key);
+                      return next;
+                    })
+                  }
+                >
+                  {item.records.map((record) => row(record, true))}
+                </ReadsRow>
+              );
+            })}
           </ol>
         )}
       </section>
