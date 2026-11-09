@@ -108,8 +108,8 @@ pub(super) fn close_stream<S: SessionIo>(stream: &S) {
 }
 
 /// What every session of this VM shares: the app's environment, working
-/// directory and identity, its volumes for sync sessions, and the reason of
-/// the last sync that failed.
+/// directory and identity, its volumes for sync sessions, and per volume the
+/// reason of its last failed sync.
 pub(super) struct Context {
     env: Vec<(String, String)>,
     workdir: Option<String>,
@@ -117,9 +117,15 @@ pub(super) struct Context {
     /// `(serial, mount_path)` of every volume in the configuration.
     volumes: Vec<(String, String)>,
     /// Per volume serial, the reason of its last failed sync, cleared when a
-    /// sync of that volume succeeds.
+    /// sync of that volume succeeds. Serials the configuration lacks share
+    /// [`UNKNOWN_VOLUME`], so the map holds at most one entry more than the
+    /// VM has volumes, whatever a host sends.
     sync_failures: Mutex<HashMap<String, String>>,
 }
+
+/// The key under which [`Context::note_sync`] records every serial the
+/// configuration lacks.
+const UNKNOWN_VOLUME: &str = "";
 
 impl Context {
     pub(super) fn new(config: &quoro_init::GuestConfig, identity: &Identity) -> Self {
@@ -435,7 +441,13 @@ fn read_open<R: Read>(reader: &mut R, frames: &mut FrameReader) -> Opened {
 fn serve_sync<S: SessionIo>(request: &SyncRequest, context: &Context, sink: &Sink<S>) {
     for serial in &request.serials {
         if let Err(reason) = sync_volume(serial, &context.volumes) {
-            context.note_sync(serial, Some(&reason));
+            let known = context.volumes.iter().any(|(volume, _)| volume == serial);
+            let key = if known {
+                serial.as_str()
+            } else {
+                UNKNOWN_VOLUME
+            };
+            context.note_sync(key, Some(&reason));
             sink.error(&reason);
             sink.shutdown();
             return;
@@ -1047,10 +1059,38 @@ mod tests {
             context
                 .sync_failures
                 .lock()
-                .map(|failures| failures.get("quoro-vol-7").cloned())
+                .map(|failures| failures.clone())
                 .ok(),
-            Some(Some(message)),
-            "the failure is recorded against the volume that failed"
+            Some(HashMap::from([(UNKNOWN_VOLUME.to_string(), message)])),
+            "quoro-vol-0 succeeded and is clear; the unknown serial shares one key"
+        );
+    }
+
+    #[test]
+    fn unknown_serials_never_grow_the_failure_record() {
+        let data = TempDir::new("bounded");
+        let mut context = test_context();
+        context.volumes = vec![("quoro-vol-0".to_string(), data.path())];
+        let context = Arc::new(context);
+        for n in 1..=40 {
+            let (host, guest) = UnixStream::pair().unwrap_or_else(|err| panic!("pair: {err}"));
+            let shared = Arc::clone(&context);
+            let served = thread::spawn(move || serve(guest, &shared, &test_helper(), Wait::Direct));
+            let mut client = Client::new(host);
+            client.send_raw(&sync_frame(&[&format!("quoro-vol-{n}")]));
+            while client.pump() {}
+            served
+                .join()
+                .unwrap_or_else(|_| panic!("the session panicked"));
+            assert!(client.error.is_some());
+        }
+        assert_eq!(
+            context
+                .sync_failures
+                .lock()
+                .map(|failures| failures.len())
+                .ok(),
+            Some(1)
         );
     }
 
