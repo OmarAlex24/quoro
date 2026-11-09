@@ -186,6 +186,10 @@ struct Pending {
     /// when a `hello` revoke goes above it. An answer with `fence_failed` is
     /// recorded on the node (section 8.5 step 1).
     revoke_leases: HashMap<String, (String, u64)>,
+    /// Every lease a `lease_revoke` on this session named, answered or not:
+    /// a refused same-token grant of one is not given back (section 8.5,
+    /// "Regrant from `hello`").
+    revoked: HashSet<String>,
 }
 
 impl Pending {
@@ -247,6 +251,16 @@ fn renewal_revoke(
         return Some((revoke, 0));
     }
     Some((revoke, released))
+}
+
+/// What [`NodeHub::regrant_lease`] decided.
+pub(crate) enum Regrant {
+    /// The row is written; send this grant.
+    Grant(quoro_proto::LeaseGrant),
+    /// An `expiring` row's gate is still open for this long.
+    Wait(Duration),
+    /// Nothing is given back.
+    No,
 }
 
 /// A lease's token as the wire carries it: at least 1.
@@ -714,6 +728,168 @@ impl NodeHub {
             .copied()
     }
 
+    /// Writes the regrant of `lease_id` to `node_id` at the token above
+    /// `token` and returns the grant to send, once the node reported the
+    /// lease's expiry (section 8.5, "Regrant from `hello`", ADR 0281). It
+    /// gives nothing back unless, in one single-writer transaction:
+    ///
+    /// - `generation` is still the node's session, so the grant goes out on
+    ///   the session whose `hello` reported the expiry. A later session
+    ///   decides from its own `hello`;
+    /// - the row is an app's, names the node, is not revoked, and is still at
+    ///   `token`, so a lease that changed since the report is left alone.
+    ///   Every `lease_revoke` the hub sends follows a committed write of the
+    ///   row (a restore, a deletion), so this read sees it;
+    /// - the lease is in no node's `fence_failure` and not in this node's
+    ///   `fence_ack_pending`;
+    /// - the app's HA policy wants a `local` lease: `none` or `cold` (D-0047).
+    ///   A `warm` or `hot` app's lease is `expiring`, whose first grant #604
+    ///   builds; it is not given back yet;
+    /// - for an `expiring` row, the lease's gate has passed (section 8.4).
+    ///   Until then it answers [`Regrant::Wait`].
+    pub(crate) async fn regrant_lease(
+        &self,
+        node_id: &str,
+        generation: u64,
+        lease_id: &str,
+        token: u64,
+    ) -> Regrant {
+        match self.try_regrant(node_id, generation, lease_id, token).await {
+            Ok(regrant) => regrant,
+            Err(e) => {
+                tracing::warn!(code = %e.code.as_str(), node_id, lease_id, "cannot give a lease back");
+                Regrant::No
+            }
+        }
+    }
+
+    async fn try_regrant(
+        &self,
+        node_id: &str,
+        generation: u64,
+        lease_id: &str,
+        token: u64,
+    ) -> Result<Regrant, ApiError> {
+        let mut w = self.0.store.begin_write().await?;
+        // Under the writer gate: a session that ended before this point
+        // leaves the row alone, so the next session's `hello` finds it at the
+        // token its node reported.
+        if !self.is_current(node_id, generation) {
+            return Ok(Regrant::No);
+        }
+        let Some(row) = leases::by_id(&mut w.tx, lease_id).await? else {
+            return Ok(Regrant::No);
+        };
+        if row.resource_type != "app"
+            || row.holder_node_id != node_id
+            || row.is_revoked()
+            || lease_token(&row) != token
+        {
+            return Ok(Regrant::No);
+        }
+        if crate::fences::listed_leases(&mut w.tx)
+            .await?
+            .contains(lease_id)
+            || crate::fences::pending_of(&mut w.tx, node_id)
+                .await?
+                .is_some_and(|pending| pending.lease_ids.iter().any(|id| id == lease_id))
+        {
+            tracing::info!(
+                node_id,
+                lease_id,
+                "a lease with a failed fence is not given back"
+            );
+            return Ok(Regrant::No);
+        }
+        let policy: Option<String> = sqlx::query_scalar("SELECT ha_policy FROM apps WHERE id = ?")
+            .bind(&row.resource_id)
+            .fetch_optional(&mut *w.tx)
+            .await?;
+        match policy.as_deref() {
+            Some("none" | "cold") => {}
+            Some(policy) => {
+                tracing::info!(
+                    node_id,
+                    lease_id,
+                    policy,
+                    "this policy's lease is given back expiring, which is not built yet"
+                );
+                return Ok(Regrant::No);
+            }
+            None => return Ok(Regrant::No),
+        }
+        // The gate of an `expiring` row; a `local` row has none.
+        match self.0.authority.record_local_grant(lease_id) {
+            Ok(()) => {}
+            Err(crate::authority::Refused::GateOpen { remaining }) => {
+                return Ok(Regrant::Wait(remaining));
+            }
+            Err(refused) => {
+                tracing::warn!(
+                    node_id,
+                    lease_id,
+                    ?refused,
+                    "the authority refused a regrant"
+                );
+                return Ok(Regrant::No);
+            }
+        }
+        let actor = Actor {
+            kind: ActorType::Node,
+            id: node_id.to_string(),
+        };
+        let lease = leases::grant_app_lease(&mut w.tx, &row.resource_id, node_id, &actor).await?;
+        w.commit().await?;
+        tracing::info!(
+            node_id,
+            lease_id,
+            token = lease.fencing_token,
+            "gave a fenced lease back"
+        );
+        Ok(Regrant::Grant(lease.grant()))
+    }
+
+    /// Tries the regrant of `lease_id` again after `wait`, while `generation`
+    /// is still the node's session, and sends the grant on that session
+    /// only, followed by a desired state carrying the new token (section
+    /// 6.4).
+    fn regrant_later(
+        &self,
+        node_id: String,
+        generation: u64,
+        lease_id: String,
+        token: u64,
+        wait: Duration,
+    ) {
+        let hub = self.clone();
+        tokio::spawn(async move {
+            let mut wait = wait;
+            loop {
+                tokio::time::sleep(wait).await;
+                if !hub.is_current(&node_id, generation) {
+                    return;
+                }
+                match hub
+                    .regrant_lease(&node_id, generation, &lease_id, token)
+                    .await
+                {
+                    Regrant::Grant(grant) => {
+                        let text = ControlMessage::LeaseGrant(grant)
+                            .to_frame(&new_msg_id(), None)
+                            .to_text();
+                        if hub.0.send_text(&node_id, generation, text) {
+                            hub.node_changed(&node_id);
+                        }
+                        return;
+                    }
+                    // Never a busy loop on the writer gate.
+                    Regrant::Wait(remaining) => wait = remaining.max(Duration::from_millis(10)),
+                    Regrant::No => return,
+                }
+            }
+        });
+    }
+
     /// Queues one control frame to `node_id`'s live session, whatever its
     /// generation. Returns whether a session took the frame; a node without
     /// one receives the change with its next snapshot.
@@ -734,12 +910,11 @@ impl NodeHub {
             handle.revokes += 1;
             // Registered before the frame is queued, so its answer always
             // finds its lease (section 8.5 step 1).
-            handle
-                .pending
-                .lock()
-                .expect("pending lock")
+            let mut pending = handle.pending.lock().expect("pending lock");
+            pending
                 .revoke_leases
                 .insert(id, (revoke.lease_id.0.clone(), revoke.fencing_token));
+            pending.revoked.insert(revoke.lease_id.0.clone());
         }
         handle.tx.send(text).is_ok()
     }
@@ -1371,6 +1546,19 @@ impl HubInner {
             .map(|handle| Arc::clone(&handle.pending))
     }
 
+    /// Whether a `lease_revoke` of `lease_id` went out on `generation` of the
+    /// node's session, answered or not. A session that ended counts as one
+    /// that did.
+    fn revoked_on_session(&self, node_id: &str, generation: u64, lease_id: &str) -> bool {
+        self.pending_of(node_id, generation).is_none_or(|pending| {
+            pending
+                .lock()
+                .expect("pending lock")
+                .revoked
+                .contains(lease_id)
+        })
+    }
+
     /// Whether a `lease_revoke` sent on `generation` of the node's session is
     /// still unanswered.
     fn revokes_unanswered(&self, node_id: &str, generation: u64) -> bool {
@@ -1840,6 +2028,13 @@ struct Session {
     /// reported could not be recorded: no `fence_ack` goes out again on this
     /// session, and the next session sends the pending one.
     fence_ack_stopped: bool,
+    /// What the `hello` reported of each lease: its state and token.
+    hello_leases: HashMap<String, (String, u64)>,
+    /// The same-token `local` grants this session sent of leases its `hello`
+    /// listed `held` or `uncertain` at that token, by message id: a refusal
+    /// with `bad_message` means the lease expired on the way (section 8.5,
+    /// "Regrant from `hello`").
+    same_token_grants: HashMap<String, (String, u64)>,
 }
 
 /// A `fence_ack` the node has not answered: its message id and what it
@@ -1879,6 +2074,8 @@ async fn run_session(
         start_wait: None,
         fence_ack: None,
         fence_ack_stopped: false,
+        hello_leases: HashMap::new(),
+        same_token_grants: HashMap::new(),
     };
     let mut superseded = false;
     let mut reason = "session_closed";
@@ -2093,6 +2290,16 @@ impl Session {
             // (rule 4), whose answer the desired state waits for; then the
             // desired state (rule 5) and the app leases this node holds
             // (section 5.12).
+            self.hello_leases = hello
+                .leases
+                .iter()
+                .map(|lease| {
+                    (
+                        lease.lease_id.clone(),
+                        (lease.state.clone(), lease.fencing_token),
+                    )
+                })
+                .collect();
             self.revoke_stale_leases(&hello.leases, outbox).await;
             if self.has_pending_fence_ack().await {
                 self.start_wait = Some(hello.stored_rev);
@@ -2270,6 +2477,16 @@ impl Session {
                         .is_some()
                     {
                         self.revoke_answered(outbox).await;
+                    } else if let Some((lease_id, token)) = self.same_token_grants.remove(re)
+                        && error.code == quoro_proto::ErrorCode::BadMessage
+                        && !self
+                            .hub
+                            .0
+                            .revoked_on_session(&self.node_id, self.generation, &lease_id)
+                    {
+                        // The lease expired while the grant was on its way
+                        // (section 8.5, "Regrant from `hello`").
+                        self.regrant(&lease_id, token, outbox).await;
                     }
                 }
             }
@@ -2595,11 +2812,11 @@ impl Session {
     ) {
         let id = new_msg_id();
         if let Some(pending) = self.hub.0.pending_of(&self.node_id, self.generation) {
+            let mut pending = pending.lock().expect("pending lock");
             pending
-                .lock()
-                .expect("pending lock")
                 .revoke_leases
                 .insert(id.clone(), (revoke.lease_id.0.clone(), released));
+            pending.revoked.insert(revoke.lease_id.0.clone());
         }
         outbox.push(
             ControlMessage::LeaseRevoke(revoke)
@@ -2818,7 +3035,16 @@ impl Session {
     /// Sends a `lease_grant` for every unrevoked lease this node holds
     /// (section 5.12), except a lease listed in a node's `fence_failure`
     /// (section 8.5). A `local` lease carries no `duration_ms`.
-    async fn send_grants(&self, outbox: &mut Vec<String>) {
+    ///
+    /// A lease the `hello` listed `expired` gets no grant at the row's token,
+    /// which the node refuses (section 5.12): the primary gives it back at a
+    /// higher token instead ([`Session::regrant`]). One it listed `revoked`
+    /// gets none, and is never given back (ADR 0281); below the row's token
+    /// it was revoked at the row's token (section 5.1), so a grant at that
+    /// token would be refused as well. A same-token `local` grant of a lease the `hello` listed `held`
+    /// or `uncertain` at that token is noted, so its refusal gives the lease
+    /// back.
+    async fn send_grants(&mut self, outbox: &mut Vec<String>) {
         let mut conn = match self.hub.0.store.pool().acquire().await {
             Ok(conn) => conn,
             Err(e) => {
@@ -2837,15 +3063,55 @@ impl Session {
                 return;
             }
         };
-        match leases::held_by_node(&mut conn, &self.node_id).await {
+        let held = leases::held_by_node(&mut conn, &self.node_id).await;
+        // A regrant takes the writer gate; this read connection is not held
+        // across it.
+        drop(conn);
+        match held {
             Ok(leases) => {
                 for lease in leases
                     .into_iter()
                     .filter(|lease| !listed.contains(&lease.id))
                 {
+                    let token = lease_token(&lease);
+                    let reported = self.hello_leases.remove(&lease.id);
+                    match reported
+                        .as_ref()
+                        .map(|(state, claimed)| (state.as_str(), *claimed))
+                    {
+                        Some(("expired", claimed)) => {
+                            if claimed <= token {
+                                self.regrant(&lease.id, token, outbox).await;
+                            } else {
+                                // A node token above the row's: this primary
+                                // may lack the grants since, so it gives
+                                // nothing back.
+                                tracing::warn!(
+                                    lease_id = %lease.id,
+                                    node_token = claimed,
+                                    "an expired lease above the row's token is not given back"
+                                );
+                            }
+                            continue;
+                        }
+                        // Never given back (ADR 0281). Below the row's
+                        // token it was revoked at the row's token (section
+                        // 5.1), so a grant at that token is refused too.
+                        Some(("revoked", _)) => continue,
+                        _ => {}
+                    }
+                    let id = new_msg_id();
+                    if lease.mode == "local"
+                        && reported.is_some_and(|(state, claimed)| {
+                            claimed == token && (state == "held" || state == "uncertain")
+                        })
+                    {
+                        self.same_token_grants
+                            .insert(id.clone(), (lease.id.clone(), token));
+                    }
                     outbox.push(
                         ControlMessage::LeaseGrant(lease.grant())
-                            .to_frame(&new_msg_id(), None)
+                            .to_frame(&id, None)
                             .to_text(),
                     );
                 }
@@ -2857,6 +3123,38 @@ impl Session {
                     "cannot read the leases of the node"
                 );
             }
+        }
+    }
+
+    /// Gives `lease_id` back to this node at a token above `token`, the row's
+    /// when the node reported its expiry (section 8.5, "Regrant from
+    /// `hello`", ADR 0281). While an `expiring` row's gate is open it tries
+    /// again once the gate has passed, on this session only: a later session
+    /// decides from its own `hello`. A desired state carrying the new token
+    /// follows the grant, since a stateful VM starts only when its spec's
+    /// token matches the lease's (section 6.4).
+    async fn regrant(&self, lease_id: &str, token: u64, outbox: &mut Vec<String>) {
+        match self
+            .hub
+            .regrant_lease(&self.node_id, self.generation, lease_id, token)
+            .await
+        {
+            Regrant::Grant(grant) => {
+                outbox.push(
+                    ControlMessage::LeaseGrant(grant)
+                        .to_frame(&new_msg_id(), None)
+                        .to_text(),
+                );
+                self.hub.node_changed(&self.node_id);
+            }
+            Regrant::Wait(remaining) => self.hub.regrant_later(
+                self.node_id.clone(),
+                self.generation,
+                lease_id.to_string(),
+                token,
+                remaining,
+            ),
+            Regrant::No => {}
         }
     }
 
