@@ -841,8 +841,9 @@ pub(crate) async fn repick_warm_nodes(state: &AppState) -> Result<(), ApiError> 
     // the next tick.
     for app_id in app_ids {
         match repick_one(state, &app_id).await {
+            Ok(wake) if wake.is_empty() => {}
             Ok(wake) => {
-                for node_id in wake {
+                for node_id in with_copy_holders(state, &app_id, wake) {
                     state.hub.node_changed(&node_id);
                 }
             }
@@ -852,6 +853,25 @@ pub(crate) async fn repick_warm_nodes(state: &AppState) -> Result<(), ApiError> 
         }
     }
     Ok(())
+}
+
+/// `wake` and every node whose newest report holds a `role: target` copy of
+/// `app_id`, sorted and without duplicates. After a change of an app's warm
+/// node, such a node may hold a copy no failover can need any more, as an
+/// old warm node the app passed through having none (section 5.11).
+pub(crate) fn with_copy_holders(state: &AppState, app_id: &str, wake: Vec<String>) -> Vec<String> {
+    let holders = state
+        .hub
+        .warm_reports()
+        .into_iter()
+        .filter(|(_, entries)| {
+            entries
+                .iter()
+                .any(|entry| entry.role == WarmRole::Target && entry.app_id == app_id)
+        })
+        .map(|(node_id, _)| node_id);
+    let wake: BTreeSet<String> = wake.into_iter().chain(holders).collect();
+    wake.into_iter().collect()
 }
 
 /// What [`repick_one`] writes for one app: the node of its volume, its

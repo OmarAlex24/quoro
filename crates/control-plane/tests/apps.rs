@@ -864,6 +864,21 @@ async fn a_default_build_refuses_ha_policy_warm() {
         );
     }
     assert_eq!(ha_policy_of(&owner, &server, app_id).await, "none");
+    // The refused settings are audited as before: an absent `node_id` reads
+    // null.
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT params FROM audit_log WHERE operation = 'PATCH /api/v1/apps/{app_id}' ORDER BY seq",
+    )
+    .fetch_all(server.state.store.pool())
+    .await
+    .unwrap();
+    let audited: Vec<Value> = rows
+        .iter()
+        .map(|(params,)| serde_json::from_str::<Value>(params).unwrap())
+        .filter(|params| params["ha_policy"].is_null() && !params["warm"].is_null())
+        .map(|params| params["warm"].clone())
+        .collect();
+    assert_eq!(audited, [json!({ "node_id": null, "interval_s": 60 })]);
     let cost = warm::cost(&owner, &server, app_id).await;
     assert_eq!(cost["available"], false);
     assert_eq!(cost["unavailable_reason"], "not_in_this_release");
@@ -1693,9 +1708,11 @@ async fn a_dev_warm_policy_build_wakes_the_warm_node_and_prices_its_report() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
-    // A sweep that picks another warm node wakes both: the new one gets its
-    // target entry, and the old one, which reports the copy, a `deleted`
-    // entry (section 5.11).
+    // The warm node stops snapshotting with `reflink` while no other node is
+    // eligible: the app has no warm node, and the old one keeps its copy, which
+    // a failover may still need. Once another node is eligible the sweep picks
+    // it. The new node gets its target entry, and the old one, which still
+    // reports the copy, now gets a `deleted` entry (section 5.11).
     let has = |state: &'static str, target: bool| {
         let volume_id = volume_id.clone();
         move |spec: &Value| {
@@ -1708,11 +1725,17 @@ async fn a_dev_warm_policy_build_wakes_the_warm_node_and_prices_its_report() {
             })
         }
     };
-    warm::set_node(&server, &warm_node, "roles = '[\"edge\"]'").await;
-    quoro_control_plane::sweeper::repick_warm_nodes(&server.state)
-        .await
-        .unwrap();
-    assert_eq!(warm::stored(&server, app_id).await.0, Some(other.clone()));
+    let sweep = || async {
+        quoro_control_plane::sweeper::repick_warm_nodes(&server.state)
+            .await
+            .unwrap();
+        warm::stored(&server, app_id).await.0
+    };
+    warm::set_node(&server, &other, "volume_snapshot = 'pause_copy'").await;
+    warm::set_node(&server, &warm_node, "volume_snapshot = 'pause_copy'").await;
+    assert_eq!(sweep().await, None);
+    warm::set_node(&server, &other, "volume_snapshot = 'reflink'").await;
+    assert_eq!(sweep().await, Some(other.clone()));
     session::spec_where(&mut other_socket, has("present", true)).await;
     session::spec_where(&mut socket, has("deleted", false)).await;
 

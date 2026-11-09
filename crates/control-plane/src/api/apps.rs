@@ -1701,10 +1701,14 @@ pub async fn update_app(
             for vm_id in vm_ids {
                 state.notify_driver(&vm_id);
             }
-            // A new warm node, pin or interval reaches the volume's node and
-            // the old and new warm nodes (section 6.13).
-            for node_id in warm_wake {
-                state.hub.node_changed(&node_id);
+            // A new warm node, pin or interval reaches the volume's node, the
+            // old and new warm nodes, and every node that still reports a copy
+            // of the app, whose copy may now get its `deleted` entry (section
+            // 6.13, section 5.11).
+            if let Some(wake) = warm_wake {
+                for node_id in crate::warm::with_copy_holders(&state, &app_id, wake) {
+                    state.hub.node_changed(&node_id);
+                }
             }
             // `replicas`, `port` and the health check shape `spec.edge`.
             state.hub.edge_changed();
@@ -1735,7 +1739,7 @@ async fn update_app_tx(
     app_id: &str,
     body: &UpdateAppRequest,
     params: &Value,
-) -> Result<(App, Vec<String>, Vec<String>), ApiError> {
+) -> Result<(App, Vec<String>, Option<Vec<String>>), ApiError> {
     validate_update(body)?;
     if !deploy::is_id_with_prefix("app", app_id) {
         return Err(ApiError::not_found("app"));
@@ -1940,7 +1944,7 @@ async fn update_app_tx(
         .await?;
     }
     w.commit().await?;
-    Ok((app, vm_ids, warm_wake.unwrap_or_default()))
+    Ok((app, vm_ids, warm_wake))
 }
 
 /// Why `updateApp` refuses `ha_policy` `warm` for an app (`openapi.yaml`
