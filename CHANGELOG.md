@@ -6,6 +6,14 @@ Each entry links the pull request that made the change and, where one exists, th
 
 ## [Unreleased]
 
+## [v0.3.0] - 2026-11-09
+
+The panel redesign: a sidebar, projects as tiles, a canvas per project with its apps and VMs as cards, a side sheet with an app's tabs, and designed dark and light themes ([ADR 0249]). Its milestone, Panel — Railway-style redesign, is complete: its demo ran on a lab cluster on 2026-11-09 and the maintainer approved it. The lines between apps on the canvas, for environment variable references ([#502]) and for observed traffic between apps ([#503]), moved to the milestone Panel — Connections between apps and wait for M5b. Still an experimental preview, not for production ([ADR 0137]).
+
+This release also carries the client CLI, `quoro mcp install` and the agent skill, from the milestone CLI — Client CLI, MCP and agent skill, which is still open. Its later phase, setting a single environment variable ([#477]) and device login ([#478]), waits for M5b.
+
+It also carries groundwork for M5b, whose milestone (M5b — Witness, leases, warm volumes) is still in progress. Parts of it work in a release build, such as health checks that restart an unhealthy instance ([#511]) and the acknowledgement of a failed self-fence ([#423]). The `warm` policy does not. A release build refuses `ha_policy` `warm` in `updateApp`, and its `ha_cost.warm` reads `available: false` with the reason `not_in_this_release`. Only a test-lab build made with the dev-only `dev-warm-policy` feature accepts `warm`, and the release workflow fails on a binary that has the feature ([ADR 0277]). With no app `warm`, warm replication and standby VMs stay idle, and since the primary grants no `expiring` lease yet ([#555]), so does the node's side of expiring leases. The contract already holds operations of later M5b work that the primary does not serve yet: `getClusterCapacity`, `rotateSigningKey`, `updateNodeRoles`, `declareNodeLost`, `failoverApp`, `switchoverApp` and `deleteVolumeQuarantine`. So on a cluster with more than one node, the Nodes page does not show its sentence on whether the cluster can lose its biggest node.
+
 ### Added
 
 - **Add providers and create and edit the backup repository in the panel.** Settings › Providers has Add provider: one form per kind (DNS, tunnel, object storage) with the settings the server reads and a write-only secret, sent once and never shown again. Settings › Backups lets an owner create the backup repository on an object storage provider, with its prefix and control-plane schedule, and shows the recovery key once, as replacing it does. Edit settings changes the repository's name and control-plane schedule with the same fields and words as an app's backup schedule. Mock mode answers all three with the server's refusals ([#692](https://github.com/OmarAlex24/quoro/pull/692)).
@@ -107,6 +115,26 @@ Each entry links the pull request that made the change and, where one exists, th
 
 - rmcp, the MCP SDK, moves to 3.9 (RUSTSEC-2026-0462). Before 3.9.0 its Streamable HTTP clients read a server's response body with no size limit, so a hostile MCP server could exhaust the client's memory. Quoro uses only rmcp's server side and was not exposed, but the dependency check fails on 3.8 ([#620], [#618]).
 - The dependency check ignores RUSTSEC-2026-0459 for now. The SQLite that sqlx bundles, before 3.54, can return uninitialised memory when it opens a database together with a crafted `-wal` file. Quoro opens only the SQLite files it writes in its own data directory, a restore removes stale `-wal` and `-shm` files before it opens the database, and the image inventory reads `rpmdb.sqlite` with its own reader, not with SQLite. No sqlx release takes the fixed SQLite yet; the ignore goes once one does ([#619]) ([#620], [#618]).
+
+### Known issues
+
+- A node can report a disk capacity of 0, as a single-machine test cluster did: `GET /api/v1/nodes` gives `capacity.disk_gb` 0, and the Nodes page says the node reports no disk capacity instead of drawing its disk meter ([#636]).
+- `DELETE /api/v1/vms/{vm_id}` removes the VM's record at once, so `getVm` answers `not_found` straight away. The contract describes the VM staying, with `observed_status` moving to `deleted`, so a client cannot see when the node has removed the VM and its disks ([#599]).
+- `deleteProject` is in the contract, but the primary does not serve it: `DELETE /api/v1/projects/{project_id}` answers `405`, and `quoro project delete` says that nothing was deleted ([#515]).
+- Personal API tokens always read "never used": nothing writes their `last_used_at` ([#504]).
+- On a node that snapshots volumes by pausing the VM (`pause_copy`), a VM can stay paused while it is reported `running`. This happens when the node agent dies while it stops a VM that a backup paused, to restart that VM: after the agent restarts, the engine does not resume a VM whose stop was requested ([#539]).
+- A VM created through `POST /api/v1/vms` with an image tag resolves the tag again after a primary restart. If the tag has moved, the desired state names a digest the VM does not run; the node refuses the change, logs it once and keeps the VM as it was. A VM created with a digest reference (`@sha256:`) is not affected, and neither are app instances ([#404]).
+
+### Upgrading from v0.2.0
+
+- Upgrade the primary first, then every node and edge to the same version: re-run the installer with the version and, on a node or an edge, its role (`QUORO_ROLE=node` or `QUORO_ROLE=edge`). An enrolled host needs no join token. The installer now reports the upgrade (`upgraded from 0.2.0 to 0.3.0`), skips the first-run steps on a primary that is set up, and refuses to install a control plane on an enrolled node or edge that is upgraded without its role ([#401]). Health-check restarts, the guest flush before a snapshot and the grace window for a `tunnel` hostname that moves run in the node agent, so they take effect on a machine only once its agent runs v0.3.0.
+- The control-plane database moves from schema version 9 to 14 (migrations 0009 to 0013). When a backup repository is configured, the new primary backs the database up at its first start, before it migrates and before it listens ([ADR 0157]). If that backup fails, the primary migrates nothing and exits with the reason. A later start tries again, and `quoro serve --skip-upgrade-backup`, run once, migrates without the backup and records the skip in the audit log. Without a repository, the primary logs that it migrates without a backup. A v0.2.0 binary does not open the migrated database.
+- The pre-upgrade backup makes the primary's restart longer, and the nodes are without a session until it ends. On the test lab the API was down for about 2.6 s, and a node with several primary addresses took about 8 s to reconnect; nothing failed ([#587]).
+- Every app has a health check (`/` on the app port by default), and a node now restarts an instance that fails it `failures` times in a row outside its start period (30 s by default), with the crash backoff. An app created before this release has no `restart` setting, which means true, so this applies to it too. To keep v0.2.0's report-only behaviour for an app, set `health_check.restart` to `false` with `updateApp` ([#511], [ADR 0184]).
+- A running VM gets the new `quoro-init`, which flushes a volume's filesystem before each snapshot, only at its next start. Until then its snapshots are crash-consistent, as in v0.2.0 ([#635], [ADR 0282]).
+- On a node that snapshots volumes by pausing the VM (`pause_copy`), avoid upgrading the node agent while a backup copies a volume. A VM that the v0.2.0 engine left paused is not resumed after the upgrade: stop it and start it again ([#523]).
+- Every two machines with the `node` or `witness` role now also become direct WireGuard peers on the mesh's UDP port (51820 unless the operator changed it), not only peers of the edge ([#671], [ADR 0266]). Nothing in this release sends traffic over those peers yet: they are for M5b's votes and warm replication. Where a firewall sits between nodes, open that UDP port between them before those features arrive.
+- A node that marked itself failed under v0.2.0, because a self-fence could not confirm that a VM stopped, stays failed after the upgrade until a human acknowledges it. Its agent reports the stored failure again, the primary lists it in the node's `fence_failure` (`GET /api/v1/nodes/{node_id}`), and a human calls `POST /api/v1/nodes/{node_id}/fence-ack` with the listed lease ids after checking out of band that the VMs are stopped ([#423], [#544]).
 
 ## [v0.2.0] - 2026-11-05
 
@@ -273,7 +301,8 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 - **CI.** A cargo workspace with a pinned toolchain, and `cargo-deny` enforcing the dependency license and advisory policy ([#12], [#33], [ADR 0080], [ADR 0086]).
 - ADRs 0081 to 0090 ([#53], [#56]); smaller debug info in dev and test builds ([#46]).
 
-[Unreleased]: https://github.com/OmarAlex24/quoro/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/OmarAlex24/quoro/compare/v0.3.0...HEAD
+[v0.3.0]: https://github.com/OmarAlex24/quoro/releases/tag/v0.3.0
 [v0.2.0]: https://github.com/OmarAlex24/quoro/releases/tag/v0.2.0
 [v0.1.1]: https://github.com/OmarAlex24/quoro/releases/tag/v0.1.1
 [v0.1.0]: https://github.com/OmarAlex24/quoro/releases/tag/v0.1.0
@@ -674,3 +703,15 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#400]: https://github.com/OmarAlex24/quoro/issues/400
 [ADR 0282]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0282-400-flush-a-volume-s-guest-filesystem-through-quoro-init.md
 [ADR 0293]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0293-getsetup-a-public-get-api-v1-setup-answers-required-bool.md
+[ADR 0249]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0249-panel-redesign-a-projects-grid-a-project-canvas-and-a-side.md
+[#404]: https://github.com/OmarAlex24/quoro/issues/404
+[#477]: https://github.com/OmarAlex24/quoro/issues/477
+[#478]: https://github.com/OmarAlex24/quoro/issues/478
+[#502]: https://github.com/OmarAlex24/quoro/issues/502
+[#503]: https://github.com/OmarAlex24/quoro/issues/503
+[#504]: https://github.com/OmarAlex24/quoro/issues/504
+[#515]: https://github.com/OmarAlex24/quoro/issues/515
+[#539]: https://github.com/OmarAlex24/quoro/issues/539
+[#587]: https://github.com/OmarAlex24/quoro/issues/587
+[#599]: https://github.com/OmarAlex24/quoro/issues/599
+[#636]: https://github.com/OmarAlex24/quoro/issues/636
