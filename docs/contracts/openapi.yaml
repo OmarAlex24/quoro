@@ -4077,6 +4077,8 @@ components:
         - mode
         - fencing_token
         - granted_at
+        - local_pending
+        - unsettled
       properties:
         id:
           type: string
@@ -4101,7 +4103,12 @@ components:
             Local leases need no renewal; expiring leases do. When an app's
             HA policy becomes `warm`, its lease reads `local` until the primary
             answers the holder's first renewal after the mode change
-            (node-agent-protocol.md section 8.4, ADR 0244).
+            (node-agent-protocol.md section 8.4, ADR 0244). When the policy
+            leaves `warm`, the lease reads `local` at once and carries the
+            unsettled mark (`unsettled`), and `local_pending` stays true until
+            the primary knows that the holder took the grant that ends its
+            renewals (ADR 0261, ADR 0280). While `unsettled` is true the lease
+            moves only as a `local` lease does, whatever this mode says.
           enum:
             - local
             - expiring
@@ -4138,6 +4145,50 @@ components:
         revoked_at:
           type: [string, 'null']
           description: When the lease was revoked.
+        local_pending:
+          type: boolean
+          description: |
+            True while the lease row reads `local` and carries the unsettled
+            mark (`unsettled`), that is, until the primary knows that the
+            holder took the row's `local` grant: from the `pong` that follows
+            a same-token `local` grant, or from the holder's report of the
+            lease as `local` (node-agent-protocol.md section 8.4, ADR 0261,
+            ADR 0280). It usually turns true when the app leaves `warm`, with
+            the write that ends an `expiring` lease's renewals; while the row
+            is marked, a `local` write with a new token leaves it true. On an
+            unmarked row, such a write turns it true when it marks the row:
+            a row that read `expiring`, or any row while the app's HA policy
+            is `warm` (ADR 0285). After a `local` grant with a new token, such
+            as a restore's, it stays true until the holder's next session. The
+            grant waits until every machine with the `node` role holds the
+            row's newest write and the primary holds majority support;
+            meanwhile a holder that still holds the lease `expiring` renews,
+            and it fences only if the primary loses majority support. The mark
+            is stored in the row, so a restarted primary still knows it. False
+            otherwise.
+        unsettled:
+          type: boolean
+          description: |
+            True while the lease row carries the unsettled mark
+            (`leases.unsettled`, node-agent-protocol.md section 8.4, "The
+            mark", ADR 0280): the row may disagree with its holder's mode.
+            The write that ends an `expiring` lease's renewals sets it, and so
+            does any other write that turns a row that reads `expiring` into
+            `local`, and any write that names a node `local` at a new token,
+            to grant it the lease, while the app's HA policy is `warm`,
+            whatever the row's mode, such as a volume restore of a `warm` app
+            (`restoreBackup`, ADR 0285). So does the first write of a
+            control-plane restore (`quoro restore`) or of a promotion with
+            `--accept-loss`, on every `expiring` row. The write that records
+            the holder's own `local` report never sets it: it clears it, as
+            below. While it is true, the
+            lease moves only as a `local` lease does, and every grant of it
+            other than the answer to a renewal waits until every machine with
+            the `node` role holds the row's newest write and the primary holds
+            majority support. No write with a new token clears it; only a
+            write that records what the holder holds does: its report of its
+            mode, the `pong` that follows a same-token `local` grant, or the
+            settle of an `expiring` lease. False otherwise.
     User:
       type: object
       title: User
@@ -7479,7 +7530,11 @@ paths:
         when the cluster has one, and turns the app's lease `expiring` as soon
         as the primary holds the support of a majority of voters
         (node-agent-protocol.md sections 6.13 and 8.4). Leaving `warm` deletes
-        the warm copy and turns the lease `local` again. `hot` is refused with
+        the warm copy and, in the same transaction, writes the lease `local`
+        with the unsettled mark (`Lease.unsettled`); `Lease.local_pending`
+        stays true until every machine with the `node` role holds that write,
+        the primary has sent the holder the grant that ends its renewals, and
+        the holder has taken it (ADR 0261, ADR 0280). `hot` is refused with
         `validation_failed` until M6 (ADR 0020). A new `replicas`
         adds or removes instances without a deployment; it is refused with
         `validation_failed` above the eligible nodes, and with `conflict` above
@@ -7748,7 +7803,18 @@ paths:
           declared lost (`declareNodeLost`). That includes a warm app's
           lease until the primary answers its holder's first renewal after
           the mode change, because the lease stays `local` until then
-          (ADR 0244).
+          (ADR 0244), and a lease whose row carries the unsettled mark
+          (`App.lease.unsettled`), whatever its mode, while its holder is
+          neither connected nor declared lost (section 8.4, "The mark",
+          ADR 0280, ADR 0285). While the mark is set, the grant to the warm
+          node also waits until every machine with the `node` role holds the
+          row's newest write and the primary holds majority support. A node
+          declared lost stays in that set until it is removed, so when the
+          holder is declared lost the grant waits until that holder is
+          removed, or reports again and has acknowledged the row's newest
+          write (section 8.4, "Grants of a marked row"). The call is not
+          refused for that wait: it answers once the grant is sent
+          (ADR 0285), so the request stays open until then.
 
         When the source is connected, the primary first revokes its lease
         over the session and goes on once the revoke is answered; that loses
@@ -7760,7 +7826,9 @@ paths:
         an edge the tunnel route with the grace window of ADR 0168), makes the
         old source the app's warm node, and emits `app.failed_over`. The call
         answers `202` with the app once the lease moved; the instance starts
-        asynchronously. The old source's lease is revoked when it reconnects;
+        asynchronously. While the row carries the unsettled mark, the lease
+        has moved once its grant to the warm node is sent (above). The old
+        source's lease is revoked when it reconnects;
         it keeps its divergent writes as a quarantined copy and becomes the
         warm copy (node-agent-protocol.md section 9). Destructive and off by
         default for agents: without an approval grant on `{type: app, id}`
@@ -10714,16 +10782,27 @@ paths:
       description: |
         Restores a succeeded, unpruned volume backup into a new volume on
         `node_id` and moves the app there (ADR 0147). The primary stops the
-        app's instance and revokes its `local` lease on the old node (reason
+        app's instance and revokes its lease on the old node (reason
         `moved`); in the same change it turns the app's current volume
         `detached` and creates the new volume in `restoring` with
         `restored_from_backup_id`. The target node downloads, verifies and
         writes the snapshot. When the node reports the volume `ready`, the
         primary grants the target node a new `local` lease with a higher
         fencing token, pins the app's placement there and starts the app;
-        then it emits `restore.succeeded`. If the restore fails, the new
-        volume turns `failed`, the app stays stopped with no lease and
-        `restore.failed` is emitted; another restore may follow. A `detached`
+        then it emits `restore.succeeded`. While the app's HA policy is
+        `warm`, the restore's write that names the target node `local` sets
+        the row's unsettled mark (`Lease.unsettled`), whatever the row's
+        mode, as the end of an `expiring` lease's renewals does: the row can
+        read `local` while the old holder still holds the lease `expiring`,
+        between a conversion grant and the answer to its first renewal
+        (ADR 0244, ADR 0285). Any row that reads `expiring` is marked the
+        same way. While the lease row carries the mark, that grant waits
+        until every machine with the `node` role holds the row's newest
+        write and the primary holds majority support; the restore is not
+        refused for it (node-agent-protocol.md sections 8.3 and 8.4,
+        ADR 0280, ADR 0285). If the restore fails, the new volume turns
+        `failed`, the app stays stopped with no lease and `restore.failed` is
+        emitted; another restore may follow. A `detached`
         volume's file stays on its node until an operator deletes it with
         `deleteVolume`. The restore replaces the app's current
         data: it is destructive and off by default for agents; without an

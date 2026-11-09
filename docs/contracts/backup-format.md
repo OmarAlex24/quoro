@@ -222,7 +222,41 @@ The restore:
 - An explicit `--node-id` that the restored database does not hold, or holds as `removed`, refuses the restore before anything is installed.
 - An identity file that names another cluster, or a node the restored database does not hold or holds as `removed`, writes no `primary-node` file; the restore says why and goes on. Without `--node-id` and without an identity file, no file is written either. In these cases the primary status stays where the backup had it.
 
-At its next start, before it serves, the primary reads `primary-node`. When the file names a node of the database that is not `removed` and does not already hold the status, the primary clears `cp_status` on the node that holds it and sets `cp_status = 'primary'` on the named node, in one change-log write, and records `cluster.primary_moved` (`audit-log-format.md` section 3.5). In every case it then deletes the file; a node it cannot use is logged with the reason. The file must have the same owner as the database file, so that the control plane can read and delete it.
+At its next start, before it serves, the primary reads `primary-node`. When the file names a node of the database that is not `removed` and does not already hold the status, the primary clears `cp_status` on the node that holds it and sets `cp_status = 'primary'` on the named node, in one change-log write, and records `cluster.primary_moved` (`audit-log-format.md` section 3.5). From M5b that write is the restored primary's first write (below), so the two are one write (ADR 0280). In every case it then deletes the file; a node it cannot use is logged with the reason. The file must have the same owner as the database file, so that the control plane can read and delete it.
+
+**When a restore is refused (from M5b, ADR 0261).** A restored log may lack writes that every node already holds, such as the write that ends an `expiring` lease's renewals (node-agent-protocol.md section 8.4), and the restored primary would reuse that log's term and `seq` values. So `quoro restore` refuses, before anything is installed, when a machine with the `node` role other than the new host's node, and not `removed`, appears in either of two sources:
+
+- the restored database;
+- the newest `spec.votes.voters` stored by the new host's node agent, which covers nodes enrolled after the backup.
+
+Such a cluster recovers by promoting a surviving node (node-agent-protocol.md section 7.3), which keeps every entry its nodes all acknowledged. A cluster whose only node is the new host's own restores as before. The refusal can miss a node enrolled after the backup if the host's agent never learned of it.
+
+**Override.** `quoro restore --accept-loss --statement <text>` restores anyway. The statement says that no other machine with the `node` role survives, and that no control plane of this cluster runs. The first part also rules out a concurrent promotion, because only such a machine can be a candidate. The second rules out an old primary on a host without the `node` role that keeps granting. A single-node cluster restored onto a fresh host needs the flag too, because the dead node is not the new host's node.
+
+**The first write.** The restored primary's first change-log write, at its first start and before it serves, marks every `expiring` lease row unsettled (`leases.unsettled`, node-agent-protocol.md section 8.4, "The mark"), after any restore. When `primary-node` asks for it, the same write also moves the primary status and records `cluster.primary_moved` (above, ADR 0280). After a restore with `--accept-loss`, the same write also:
+
+- removes every machine with the `node` role that the statement declares gone, that is, every one in the restored database that is not `removed`, other than the new host's node;
+- raises the token of each lease those machines held, as declaring a node lost does (node-agent-protocol.md section 8.3);
+- deletes their custody seals (node-agent-protocol.md section 7.2);
+- records `cluster.restored` (`audit-log-format.md` section 3.9).
+
+That write may remove more than one voter at once, so it is exempt from node-agent-protocol.md section 8.10 rules 1 and 2 (ADR 0280). Without it the dead nodes would count in every majority, so the restored primary would never hold support and could neither remove nor enroll a node. What is left after it: the restored primary needs a majority of the remaining voters, as any primary does. A new host without the `node` role leaves a cluster with no node.
+
+**Detecting the first start (ADR 0285).** From M5b, `quoro restore` also writes a marker file, `restore-pending`, next to the database and to `primary-node`, with the same owner as `primary-node`. It writes the marker before it installs the database in step 5, so no restored database is installed without it. The marker names the database it belongs to: it holds the restored log's head `seq` and that entry's hash. It also holds whether `--accept-loss` was given and, if so, the operator's statement. When `quoro restore` stops before it installs the database, it deletes the marker.
+
+At each start, the primary looks for the marker and deletes it before it serves:
+
+- **The marker matches `meta.restore_marker`:** the first write above already committed. The primary deletes the marker without writing again.
+- **The marker matches the installed database's log head:** this is the first start after a restore. The primary makes the first write above from it, taking `--accept-loss` and the statement from the marker. The first write is one transaction, and it also records the marker's head `seq` and hash in `meta`, under the key `restore_marker`. `meta` is not in the log (node-agent-protocol.md section 7.3 step 4), so this is a local record. The primary deletes the marker once that transaction commits.
+- **Otherwise:** the marker belongs to another database. The primary logs it and deletes it, and makes no first write from it.
+
+A crash before the first write commits leaves nothing written, and the next start makes the write. A crash after the commit and before the deletion leaves a marker that matches `meta.restore_marker`, so the next start deletes it without writing again. The first write therefore runs once per restore: no second `cluster.restored` is recorded, and no node enrolled after the restore is removed.
+
+While a `restore-pending` marker exists on the host, `quoro cluster promote` refuses (node-agent-protocol.md section 7.3). The operator finishes the restore, or deletes the marker after checking that no `quoro restore` runs on the host.
+
+**Term.** The restored primary starts one above the highest of: the restored log's terms; the term its host's node agent stored; and the terms in any vote `check` answers it receives (a `check` changes nothing, node-agent-protocol.md section 8.9). A fresh host is no mesh peer and may reach no voter, so an `error` with code `stale_term` carries the sender's term (node-agent-protocol.md section 5.18). A primary restored with `--accept-loss` that receives one before it has sent any `lease_grant` starts again at one above that term, instead of demoting itself (node-agent-protocol.md section 8.8). A voter that voted in the restored primary's own term for another candidate answers its `support_request` with `bad_message` instead, which carries the voter's `term` (node-agent-protocol.md section 5.27, ADR 0280). A primary restored with `--accept-loss` that has sent no `lease_grant` yet treats it like `stale_term`, and starts again at one above that term. A plain restore lacks that voter's support. The way out is to restore again, which starts above the term the voters then report, or to remove that voter's vote, with `force` when node-agent-protocol.md section 8.10 asks for it.
+
+**Tokens after a forced recovery.** A token issued in entries the restored log lacks may be issued again to another node, as node-agent-protocol.md section 7.3 says for `--ack-fence`.
 
 The restored database is as old as the backup. It lists the backup it was restored from as `running`, which the restored primary resolves at its first start (section 7.2, rows left behind at start). How a restored primary reconciles with nodes that applied newer desired state is part of the storage epic; it does not change this format.
 

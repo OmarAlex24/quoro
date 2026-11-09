@@ -1,12 +1,12 @@
 # ADR 0256: An expiring grant that carries re never converts a lease (part 1 of 2)
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0261](0261-every-node-holds-a-lease-row-s-local-write-before-an.md)
 - **Date:** 2026-11-07
 - **Ledger id:** D-0256
 - **Tags:** m5b, leases, contracts
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** [ADR 0241](0241-a-lease-converted-from-local-to-expiring-opens-no-failover.md)
+- **Related:** [ADR 0241](0241-a-lease-converted-from-local-to-expiring-opens-no-failover.md), [ADR 0261](0261-every-node-holds-a-lease-row-s-local-write-before-an.md)
 
 ## Context
 
@@ -23,6 +23,7 @@ _Some wording was changed for the public repository._
 ## Consequences
 
 - Refines [ADR 0241](0241-a-lease-converted-from-local-to-expiring-opens-no-failover.md): which same-token grant converts a lease: one without re. The rest of [ADR 0241](0241-a-lease-converted-from-local-to-expiring-opens-no-failover.md) stands.
+- [ADR 0261](0261-every-node-holds-a-lease-row-s-local-write-before-an.md) refines the reading of part 2: the primary answers no renewal of the lease once it has sent the local grant on that session. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---

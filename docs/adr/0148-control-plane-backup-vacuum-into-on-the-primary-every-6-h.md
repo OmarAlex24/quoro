@@ -1,12 +1,12 @@
 # ADR 0148: Control-plane backup: VACUUM INTO on the primary every 6 h and before upgrades, fed through the same chunk engine; restore is a CLI step on a fresh host with the recovery key (quoro restore)
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0261](0261-every-node-holds-a-lease-row-s-local-write-before-an.md)
 - **Date:** 2026-11-04
 - **Ledger id:** D-0148
 - **Tags:** m5a, contracts, sync
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** none
+- **Related:** [ADR 0261](0261-every-node-holds-a-lease-row-s-local-write-before-an.md)
 
 ## Context
 
@@ -20,6 +20,7 @@ Contract B: source kind control_plane in manifests; schedule settable by the own
 
 ## Consequences
 
+- [ADR 0261](0261-every-node-holds-a-lease-row-s-local-write-before-an.md) refines the restore refusal, its override, its first write and its term. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---

@@ -1,12 +1,12 @@
 # ADR 0232: quoro cluster promote refuses on a host that already has a control plane, prepares the host as the installer does for a primary, and has a --dry-run
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0261](0261-every-node-holds-a-lease-row-s-local-write-before-an.md)
 - **Date:** 2026-11-06
 - **Ledger id:** D-0232
 - **Tags:** m5b, contracts, promotion
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** none
+- **Related:** [ADR 0261](0261-every-node-holds-a-lease-row-s-local-write-before-an.md)
 
 ## Context
 
@@ -20,6 +20,7 @@ Promote refuses before any change when this host has a control-plane database or
 
 ## Consequences
 
+- [ADR 0261](0261-every-node-holds-a-lease-row-s-local-write-before-an.md) refines the candidate builds from the log it froze, takes its term from the vote answers, and gains --accept-loss. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---

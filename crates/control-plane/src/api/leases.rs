@@ -63,6 +63,17 @@ pub struct Lease {
     pub gate_at: Option<String>,
     /// When the lease was revoked.
     pub revoked_at: Option<String>,
+    /// True while the row reads `local` and carries the unsettled mark, that
+    /// is, until the primary knows the holder took the row's `local` grant: it
+    /// usually turns true with the write that ends the holder's renewals, when
+    /// the app leaves `warm` (`node-agent-protocol.md` section 8.4, ADR 0261,
+    /// ADR 0280).
+    pub local_pending: bool,
+    /// True while the row carries the unsettled mark (`leases.unsettled`):
+    /// the row may disagree with its holder's mode, so the lease moves only
+    /// as a `local` lease does (`node-agent-protocol.md` section 8.4, "The
+    /// mark", ADR 0280).
+    pub unsettled: bool,
 }
 
 impl Lease {
@@ -106,6 +117,12 @@ impl Lease {
             // 8.4), which the M5b lease work adds; a `local` lease has none.
             gate_at: None,
             revoked_at: row.revoked_at,
+            // Set from the row's unsettled mark and mode (section 8.4), which
+            // the M5b lease work adds; until then no lease is pending.
+            local_pending: false,
+            // Read from `leases.unsettled` (migration 0013), which the M5b
+            // lease work adds to the row; until then no row carries the mark.
+            unsettled: false,
         })
     }
 }
