@@ -304,6 +304,7 @@
   - [0299: A node's hello counts toward a marked row's grant only once that session's revokes are answered, and step 4 revokes first a lease listed in the other mode](adr/0299-a-node-s-hello-counts-toward-a-marked-row-s-grant-only-once.md)
   - [0301: Node.log_lag is absent only until change-log follow ships, not until the promotion and custody work](adr/0301-node-log-lag-is-absent-only-until-change-log-follow-ships.md)
   - [0302: Change log: append refuses an entry a follower could not receive (one that alone exceeds a log_entries frame, or whose stored payload has no RFC 8785 form)](adr/0302-change-log-append-refuses-an-entry-a-follower-could-not.md)
+  - [0303: failoverApp before the primary can send a held grant: what a failover answers when its grant must wait for replication](adr/0303-failoverapp-before-the-primary-can-send-a-held-grant-what-a.md)
 
 # Background research
 
