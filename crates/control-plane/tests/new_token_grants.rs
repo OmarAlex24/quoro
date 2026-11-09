@@ -1,0 +1,479 @@
+//! A new token for an app's lease, through `createVolume`: its mode, the
+//! previous holder's gate, and ADR 0258 on the primary's side
+//! (`node-agent-protocol.md` sections 8.4 and 8.8; issue #604), over real
+//! HTTP and WebSocket with a fake node.
+
+mod common;
+
+use common::{Server, problem, start_with_patient_node_session};
+use futures_util::{SinkExt, StreamExt};
+use quoro_control_plane::authority::VoterSupport;
+use quoro_proto::wire::{self, Capacity as WireCapacity, Heartbeat, Kvm as WireKvm, NodeMessage};
+use quoro_proto::{CommandResult, CommandStatus, LeaseId, LeaseRenew};
+use serde_json::{Value, json};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::TcpStream;
+use tokio::time::timeout;
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+type Socket = WebSocketStream<TcpStream>;
+
+const IMAGE: &str =
+    "ghcr.io/example/web@sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+struct Enrolled {
+    node_id: String,
+    credential: String,
+}
+
+fn hello(node_id: &str, leases: Vec<wire::HelloLease>) -> NodeMessage {
+    NodeMessage::Hello(wire::Hello {
+        node_id: node_id.to_string(),
+        agent_version: "test-agent".to_string(),
+        engine_version: "test-engine".to_string(),
+        boot_id: "boot-1".to_string(),
+        stored_rev: 0,
+        applied_rev: 0,
+        log_seq: 0,
+        log_hash: "0".repeat(64),
+        leases,
+        mesh_public_key: None,
+        capacity: WireCapacity {
+            cpus: 8,
+            memory_mb: 16_384,
+            disk_gb: 200,
+        },
+        allocated: WireCapacity::default(),
+        kvm: WireKvm {
+            available: true,
+            kernel: "6.9.0".to_string(),
+            nested: Some(true),
+        },
+        dropped_events: 0,
+        volume_snapshot: Some(wire::SnapshotMethod::Reflink),
+    })
+}
+
+async fn enrolled_node(server: &Server, owner: &reqwest::Client, name: &str) -> Enrolled {
+    let token: Value = owner
+        .post(server.url("/api/v1/nodes/join-tokens"))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let res = server
+        .client()
+        .post(server.url("/api/v1/nodes/enroll"))
+        .json(&json!({
+            "join_token": token["token"].as_str().unwrap(),
+            "name": name,
+            "public_key": quoro_proto::sign::public_key_to_base64(
+                &quoro_proto::sign::signing_key_from_seed(&[3u8; 32]).verifying_key()
+            ),
+            "roles": ["node"],
+            "capacity": { "cpus": 8, "memory_mb": 16_384, "disk_gb": 200 },
+            "kvm": { "available": true, "kernel": "6.9.0", "nested": true }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201, "enroll: {}", res.text().await.unwrap());
+    let body: Value = res.json().await.unwrap();
+    Enrolled {
+        node_id: body["node_id"].as_str().unwrap().to_string(),
+        credential: body["credential"].as_str().unwrap().to_string(),
+    }
+}
+
+async fn connect(server: &Server, credential: &str) -> Socket {
+    let url = format!("ws://{}/api/v1/nodes/session", server.address());
+    let mut request = url.into_client_request().unwrap();
+    request.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {credential}").parse().unwrap(),
+    );
+    let stream = TcpStream::connect(server.address()).await.unwrap();
+    let (socket, response) = tokio_tungstenite::client_async(request, stream)
+        .await
+        .expect("websocket upgrade");
+    assert_eq!(response.status(), 101);
+    socket
+}
+
+/// Sends `message` and returns its id.
+async fn send(socket: &mut Socket, message: NodeMessage, re: Option<&str>) -> String {
+    let id = format!("msg_{}", ulid_like());
+    let text = message.to_frame(&id, re).to_text();
+    socket.send(WsMessage::Text(text.into())).await.unwrap();
+    id
+}
+
+/// A fresh 26-character suffix, so every frame of the fake node has its own id.
+fn ulid_like() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "01JC9Z6Q5W8N3K4T7R2M{:06}",
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    )
+}
+
+async fn heartbeat(socket: &mut Socket) {
+    send(
+        socket,
+        NodeMessage::Heartbeat(Heartbeat {
+            time: "2026-11-07T10:15:32Z".to_string(),
+            busy: None,
+        }),
+        None,
+    )
+    .await;
+}
+
+async fn recv_frame(socket: &mut Socket) -> Value {
+    loop {
+        let message = timeout(Duration::from_secs(30), socket.next())
+            .await
+            .expect("a frame within 30 s")
+            .expect("the socket is open")
+            .expect("a valid websocket frame");
+        match message {
+            WsMessage::Text(text) => return serde_json::from_str(text.as_str()).unwrap(),
+            WsMessage::Close(_) => panic!("the socket closed"),
+            _ => {}
+        }
+    }
+}
+
+/// Reads frames until one of each `wanted` type was seen, and returns them in
+/// arrival order. Earlier frames of other types are kept in the result.
+async fn recv_until(socket: &mut Socket, wanted: &[&str]) -> Vec<Value> {
+    let mut remaining: Vec<&str> = wanted.to_vec();
+    let mut seen = Vec::new();
+    while !remaining.is_empty() {
+        let frame = recv_frame(socket).await;
+        let kind = frame["type"].as_str().unwrap_or_default().to_string();
+        if let Some(index) = remaining.iter().position(|wanted| *wanted == kind) {
+            remaining.remove(index);
+        }
+        seen.push(frame);
+    }
+    seen
+}
+
+/// Every frame the primary sends before it answers two pings in a row: the
+/// session handles messages in order, so whatever a renewal before them
+/// caused is in the result.
+async fn frames_until_settled(socket: &mut Socket) -> Vec<Value> {
+    let mut frames = Vec::new();
+    for _ in 0..2 {
+        let id = send(socket, NodeMessage::Ping, None).await;
+        loop {
+            let frame = recv_frame(socket).await;
+            if frame["type"] == "pong" && frame["re"] == id.as_str() {
+                break;
+            }
+            frames.push(frame);
+        }
+    }
+    frames
+}
+
+/// A majority of voters supports every duration.
+#[derive(Debug)]
+struct EverySupport;
+
+impl VoterSupport for EverySupport {
+    fn supports(&self, _duration_ms: u64) -> bool {
+        true
+    }
+}
+
+fn renew(lease_id: &str, token: u64) -> NodeMessage {
+    NodeMessage::LeaseRenew(LeaseRenew {
+        lease_id: LeaseId(lease_id.to_string()),
+        fencing_token: token,
+    })
+}
+
+fn ok_result() -> NodeMessage {
+    NodeMessage::CommandResult(CommandResult {
+        status: CommandStatus::Ok,
+        detail: None,
+        error: None,
+        lines: None,
+        metrics: None,
+    })
+}
+
+/// A connected node and a project.
+async fn connected_node(server: &Server, owner: &reqwest::Client) -> (Enrolled, Socket, String) {
+    let node = enrolled_node(server, owner, "node-alpha").await;
+    let mut socket = connect(server, &node.credential).await;
+    send(&mut socket, hello(&node.node_id, Vec::new()), None).await;
+    recv_until(&mut socket, &["welcome", "desired_state"]).await;
+    heartbeat(&mut socket).await;
+    let project: Value = owner
+        .post(server.url("/api/v1/projects"))
+        .json(&json!({ "slug": "demo", "name": "demo" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let project_id = project["id"].as_str().unwrap().to_string();
+    (node, socket, project_id)
+}
+
+/// An app named `name` with `ha_policy` set to `policy` in the store, as the
+/// test-lab build's `updateApp` would after its volume exists (#632). The API
+/// takes `warm` only for an app with a volume, and this test creates one.
+async fn app_with_policy(
+    server: &Server,
+    owner: &reqwest::Client,
+    project_id: &str,
+    name: &str,
+    policy: &str,
+) -> String {
+    let res = owner
+        .post(server.url("/api/v1/apps"))
+        .json(&json!({
+            "project_id": project_id,
+            "name": name,
+            "image": IMAGE,
+            "port": 8080,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+    let app_id = res.json::<Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    sqlx::query("UPDATE apps SET ha_policy = ? WHERE id = ?")
+        .bind(policy)
+        .bind(&app_id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+    app_id
+}
+
+async fn create_volume(
+    server: &Server,
+    owner: &reqwest::Client,
+    app_id: &str,
+) -> reqwest::Response {
+    owner
+        .post(server.url(&format!("/api/v1/apps/{app_id}/volumes")))
+        .json(&json!({ "size_gb": 5, "mount_path": "/data" }))
+        .send()
+        .await
+        .unwrap()
+}
+
+/// Creates the app's volume and returns its id and the grant the node got.
+async fn volume_and_grant(
+    server: &Server,
+    owner: &reqwest::Client,
+    socket: &mut Socket,
+    app_id: &str,
+) -> (String, Value) {
+    let res = create_volume(server, owner, app_id).await;
+    assert_eq!(res.status(), 201, "{}", res.text().await.unwrap());
+    let volume_id = res.json::<Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let frames = recv_until(socket, &["lease_grant"]).await;
+    let grant = frames
+        .into_iter()
+        .find(|frame| frame["type"] == "lease_grant")
+        .unwrap();
+    (volume_id, grant)
+}
+
+/// Deletes the volume and returns the id of the revoke the node got.
+async fn delete_volume(
+    server: &Server,
+    owner: &reqwest::Client,
+    socket: &mut Socket,
+    volume_id: &str,
+) -> String {
+    let res = owner
+        .delete(server.url(&format!("/api/v1/volumes/{volume_id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 202, "{}", res.text().await.unwrap());
+    let frames = recv_until(socket, &["lease_revoke"]).await;
+    let revoke = frames
+        .into_iter()
+        .find(|frame| frame["type"] == "lease_revoke")
+        .unwrap();
+    assert_eq!(revoke["body"]["reason"], "deleted");
+    revoke["id"].as_str().unwrap().to_string()
+}
+
+async fn mode_and_duration(server: &Server, lease_id: &str) -> (String, Option<i64>) {
+    sqlx::query_as("SELECT mode, duration_ms FROM leases WHERE id = ?")
+        .bind(lease_id)
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap()
+}
+
+/// #604, section 8.4 "First grant": a `warm` or `hot` app's first volume
+/// gets its lease `expiring` for `D` while a majority of voters supports
+/// `D`, with the row written first, and the node's first renewal is
+/// answered. Without that support the lease is `local`, as a `cold` app's
+/// always is.
+#[tokio::test]
+async fn a_new_volume_gets_the_mode_the_policy_wants() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let (_node, mut socket, project_id) = connected_node(&server, &owner).await;
+
+    for (name, policy, supported, mode) in [
+        ("web-cold", "cold", true, "local"),
+        ("web-warm-alone", "warm", false, "local"),
+        ("web-warm", "warm", true, "expiring"),
+        ("web-hot", "hot", true, "expiring"),
+    ] {
+        let support: Arc<dyn VoterSupport> = if supported {
+            Arc::new(EverySupport)
+        } else {
+            Arc::new(quoro_control_plane::authority::NoVoterSupport)
+        };
+        server.state.hub.set_voter_support(support);
+        let app_id = app_with_policy(&server, &owner, &project_id, name, policy).await;
+        let (_, grant) = volume_and_grant(&server, &owner, &mut socket, &app_id).await;
+        assert_eq!(grant["body"]["mode"], mode, "{name}: {grant}");
+        assert_eq!(grant["body"]["fencing_token"], 1, "{name}");
+        let lease_id = grant["body"]["lease_id"].as_str().unwrap();
+        if mode == "expiring" {
+            assert_eq!(grant["body"]["duration_ms"], 15_000, "{name}");
+            assert_eq!(
+                mode_and_duration(&server, lease_id).await,
+                ("expiring".to_string(), Some(15_000)),
+                "{name}"
+            );
+            let renewal = send(&mut socket, renew(lease_id, 1), None).await;
+            let frames = frames_until_settled(&mut socket).await;
+            let answers: Vec<&Value> = frames
+                .iter()
+                .filter(|frame| frame["type"] == "lease_grant" && frame["re"] == renewal.as_str())
+                .collect();
+            assert_eq!(answers.len(), 1, "{name}: {frames:?}");
+        } else {
+            assert!(grant["body"].get("duration_ms").is_none(), "{name}");
+            assert_eq!(
+                mode_and_duration(&server, lease_id).await,
+                ("local".to_string(), None),
+                "{name}"
+            );
+        }
+    }
+}
+
+/// Section 8.4, #604: a new token waits until the previous `expiring`
+/// holder's gate has passed, whatever mode it has. `createVolume` answers
+/// `conflict` meanwhile and writes nothing; once the gate has passed it
+/// grants the next token.
+#[tokio::test]
+async fn a_new_volume_waits_for_the_previous_expiring_holders_gate() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let (node, mut socket, project_id) = connected_node(&server, &owner).await;
+    let app_id = app_with_policy(&server, &owner, &project_id, "web", "none").await;
+    let (volume_id, grant) = volume_and_grant(&server, &owner, &mut socket, &app_id).await;
+    let lease_id = grant["body"]["lease_id"].as_str().unwrap().to_string();
+    let revoke_id = delete_volume(&server, &owner, &mut socket, &volume_id).await;
+    send(&mut socket, ok_result(), Some(&revoke_id)).await;
+    frames_until_settled(&mut socket).await;
+
+    // The lease was `expiring`: its gate passes 5 s after the seed (3 s and
+    // two margins of 1 s).
+    sqlx::query("UPDATE leases SET mode = 'expiring', duration_ms = 3000 WHERE id = ?")
+        .bind(&lease_id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+    server
+        .state
+        .hub
+        .authority()
+        .seed(&lease_id, &node.node_id, Some(3_000));
+    let passes = tokio::time::Instant::now() + Duration::from_millis(5_000);
+    let (status, code, _) = problem(create_volume(&server, &owner, &app_id).await).await;
+    assert_eq!((status, code.as_str()), (409, "conflict"));
+    let (token, mode): (i64, String) =
+        sqlx::query_as("SELECT fencing_token, mode FROM leases WHERE id = ?")
+            .bind(&lease_id)
+            .fetch_one(server.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        (token, mode.as_str()),
+        (1, "expiring"),
+        "nothing was written"
+    );
+    let volumes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM volumes WHERE app_id = ?")
+        .bind(&app_id)
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(volumes, 1, "only the deleted volume");
+    assert!(
+        tokio::time::Instant::now() < passes,
+        "the test ran too slowly"
+    );
+
+    tokio::time::sleep_until(passes).await;
+    let (_, grant) = volume_and_grant(&server, &owner, &mut socket, &app_id).await;
+    assert_eq!(grant["body"]["fencing_token"], 2);
+    assert_eq!(grant["body"]["mode"], "local");
+}
+
+/// ADR 0258 on the primary's side (#604): a new token carries the mode the
+/// node holds the lease in while it may still hold it. A node that has not
+/// answered the revoke of the app's `local` lease gets the next one `local`,
+/// even for a `warm` app with voter support; once it has answered, the next
+/// one is `expiring`.
+#[tokio::test]
+async fn a_node_that_may_still_hold_a_local_lease_gets_the_new_token_local() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let (_node, mut socket, project_id) = connected_node(&server, &owner).await;
+    let app_id = app_with_policy(&server, &owner, &project_id, "web", "none").await;
+    let (volume_id, _) = volume_and_grant(&server, &owner, &mut socket, &app_id).await;
+    sqlx::query("UPDATE apps SET ha_policy = 'warm' WHERE id = ?")
+        .bind(&app_id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+    server.state.hub.set_voter_support(Arc::new(EverySupport));
+
+    // The revoke is not answered yet.
+    let first = delete_volume(&server, &owner, &mut socket, &volume_id).await;
+    let (volume_id, grant) = volume_and_grant(&server, &owner, &mut socket, &app_id).await;
+    assert_eq!(grant["body"]["fencing_token"], 2);
+    assert_eq!(grant["body"]["mode"], "local", "{grant}");
+    send(&mut socket, ok_result(), Some(&first)).await;
+
+    // Answered: the node holds no lease, so the next token is `expiring`.
+    let revoke_id = delete_volume(&server, &owner, &mut socket, &volume_id).await;
+    send(&mut socket, ok_result(), Some(&revoke_id)).await;
+    frames_until_settled(&mut socket).await;
+    let (_, grant) = volume_and_grant(&server, &owner, &mut socket, &app_id).await;
+    assert_eq!(grant["body"]["fencing_token"], 3);
+    assert_eq!(grant["body"]["mode"], "expiring", "{grant}");
+}

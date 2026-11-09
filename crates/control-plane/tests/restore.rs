@@ -8,13 +8,16 @@ mod common;
 use common::{Server, problem, start_with_patient_node_session};
 use futures_util::{SinkExt, StreamExt};
 use quoro_backup::{BackupWriter, Chunker, FORMAT, Manifest, RepoKey, SourceKind, layout};
+use quoro_control_plane::authority::VoterSupport;
 use quoro_control_plane::backups::{Bucket, BucketFactory, BucketStore, RepositoryTarget};
 use quoro_control_plane::{ReferenceAsDigest, deploy};
 use quoro_proto::wire::{
     self, BackupState, Capacity as WireCapacity, Health, Heartbeat, Kvm as WireKvm, NodeMessage,
     ObservedStatus, StatusReport, VmStatus, VolumeState as WireVolumeState, VolumeStatus,
 };
-use quoro_proto::{CommandResult, CommandStatus, ErrorBody, ErrorCode, ProtocolError};
+use quoro_proto::{
+    CommandResult, CommandStatus, ErrorBody, ErrorCode, LeaseId, LeaseRenew, ProtocolError,
+};
 use quoro_providers::object_store::{MemoryStore, ObjectInfo, ObjectStore, ObjectStoreError};
 use serde_json::{Value, json};
 use std::future::Future;
@@ -1557,8 +1560,8 @@ async fn ready_waits(setup: &mut Setup, moving: &Moving) {
 }
 
 /// The target reports the volume `ready` and gets the lease, with a token
-/// above `above`.
-async fn ready_grants(setup: &mut Setup, moving: &Moving, above: i64) {
+/// above `above`. Returns the grant.
+async fn ready_grants(setup: &mut Setup, moving: &Moving, above: i64) -> Value {
     send(&mut setup.socket_b, restored(moving)).await;
     wait_for_volume(
         &setup.state.owner,
@@ -1579,6 +1582,7 @@ async fn ready_grants(setup: &mut Setup, moving: &Moving, above: i64) {
     assert!(revoked.is_none());
     let grant = recv_type(&mut setup.socket_b, "lease_grant").await;
     assert_eq!(grant["body"]["fencing_token"], json!(token));
+    grant
 }
 
 /// Closes the old node's session and waits until the primary sees it gone.
@@ -2063,7 +2067,8 @@ async fn a_pending_acknowledgement_releases_only_the_grant_it_covered() {
 /// Section 8.3, ADR 0183: a holder declared lost releases a `local` lease
 /// revoked by then. The API call is not there yet, so the test sets
 /// `nodes.lost_at` itself. A declaration older than the revoke says nothing
-/// about it, and an `expiring` lease also waits for its gate (section 8.4).
+/// about it. An `expiring` lease also waits for its gate (section 8.4): see
+/// `a_lost_holders_expiring_lease_is_released_by_its_gate`.
 #[tokio::test]
 async fn a_holder_declared_lost_releases_the_lease() {
     let mut setup = setup().await;
@@ -2079,11 +2084,6 @@ async fn a_holder_declared_lost_releases_the_lease() {
         .unwrap();
     ready_waits(&mut setup, &moving).await;
 
-    sqlx::query("UPDATE leases SET mode = 'expiring' WHERE id = ?")
-        .bind(&moving.lease_id)
-        .execute(&pool)
-        .await
-        .unwrap();
     sqlx::query(
         "UPDATE nodes SET lost_at = (SELECT revoked_at FROM leases WHERE id = ?) WHERE id = ?",
     )
@@ -2092,14 +2092,179 @@ async fn a_holder_declared_lost_releases_the_lease() {
     .execute(&pool)
     .await
     .unwrap();
-    ready_waits(&mut setup, &moving).await;
+    ready_grants(&mut setup, &moving, moving.old_token).await;
+}
 
-    sqlx::query("UPDATE leases SET mode = 'local' WHERE id = ?")
+/// Makes the moving lease `expiring` for 3 s, with its gate counted from
+/// now, as a restarted primary counts it (section 8.4): it passes 5 s later,
+/// after 3 s and two margins of 1 s. Returns when it passes.
+async fn expiring_with_gate(setup: &Setup, moving: &Moving) -> tokio::time::Instant {
+    sqlx::query("UPDATE leases SET mode = 'expiring', duration_ms = 3000 WHERE id = ?")
         .bind(&moving.lease_id)
-        .execute(&pool)
+        .execute(setup.state.server.state.store.pool())
         .await
         .unwrap();
+    setup.state.server.state.hub.authority().seed(
+        &moving.lease_id,
+        &setup.state.node.node_id,
+        Some(3_000),
+    );
+    tokio::time::Instant::now() + Duration::from_millis(5_000)
+}
+
+/// ADR 0202, #604: a revoked `expiring` lease of a holder declared lost is
+/// released by its gate. The restore waits until the gate has passed, then
+/// moves the lease.
+#[tokio::test]
+async fn a_lost_holders_expiring_lease_is_released_by_its_gate() {
+    let mut setup = setup().await;
+    let moving = start_moving(&mut setup, 17).await;
+    drop_old_session(&mut setup).await;
+    let passes = expiring_with_gate(&setup, &moving).await;
+    sqlx::query(
+        "UPDATE nodes SET lost_at = (SELECT revoked_at FROM leases WHERE id = ?) WHERE id = ?",
+    )
+    .bind(&moving.lease_id)
+    .bind(&setup.state.node.node_id)
+    .execute(setup.state.server.state.store.pool())
+    .await
+    .unwrap();
+    ready_waits(&mut setup, &moving).await;
+    assert!(
+        tokio::time::Instant::now() < passes,
+        "the test ran too slowly"
+    );
+
+    tokio::time::sleep_until(passes).await;
     ready_grants(&mut setup, &moving, moving.old_token).await;
+}
+
+/// Section 8.4, #604: a lease that was `expiring` moves only once its
+/// holder's gate has passed, even after the holder answered the revoke `ok`,
+/// and whatever mode the new grant has.
+#[tokio::test]
+async fn an_expiring_lease_moves_only_after_its_gate() {
+    let mut setup = setup().await;
+    let moving = start_moving(&mut setup, 16).await;
+    let passes = expiring_with_gate(&setup, &moving).await;
+    reply(
+        &mut setup.state.socket,
+        ok_result(),
+        Some(&moving.revoke_id),
+    )
+    .await;
+    round_trip(&mut setup.state.socket).await;
+    ready_waits(&mut setup, &moving).await;
+    assert!(
+        tokio::time::Instant::now() < passes,
+        "the test ran too slowly"
+    );
+
+    tokio::time::sleep_until(passes).await;
+    let grant = ready_grants(&mut setup, &moving, moving.old_token).await;
+    assert_eq!(grant["body"]["mode"], "local");
+}
+
+/// A majority of voters supports every duration.
+#[derive(Debug)]
+struct EverySupport;
+
+impl VoterSupport for EverySupport {
+    fn supports(&self, _duration_ms: u64) -> bool {
+        true
+    }
+}
+
+async fn set_warm(setup: &Setup) {
+    sqlx::query("UPDATE apps SET ha_policy = 'warm' WHERE id = ?")
+        .bind(&setup.state.app_id)
+        .execute(setup.state.server.state.store.pool())
+        .await
+        .unwrap();
+}
+
+/// #604, section 8.4 "First grant": the target of a `warm` app's restore
+/// gets the lease `expiring` for `D` at a new token while a majority of
+/// voters supports `D`, with the row written first. It renews at once, and
+/// the primary answers that renewal.
+#[tokio::test]
+async fn a_warm_apps_restore_target_gets_an_expiring_lease_while_voters_support_it() {
+    let mut setup = setup().await;
+    set_warm(&setup).await;
+    setup
+        .state
+        .server
+        .state
+        .hub
+        .set_voter_support(Arc::new(EverySupport));
+    let moving = start_moving(&mut setup, 18).await;
+    reply(
+        &mut setup.state.socket,
+        ok_result(),
+        Some(&moving.revoke_id),
+    )
+    .await;
+    round_trip(&mut setup.state.socket).await;
+    let grant = ready_grants(&mut setup, &moving, moving.old_token).await;
+    assert_eq!(grant["body"]["mode"], "expiring");
+    assert_eq!(grant["body"]["duration_ms"], 15_000);
+    let token = grant["body"]["fencing_token"].as_u64().unwrap();
+    let (mode, duration_ms): (String, Option<i64>) =
+        sqlx::query_as("SELECT mode, duration_ms FROM leases WHERE id = ?")
+            .bind(&moving.lease_id)
+            .fetch_one(setup.state.server.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!((mode.as_str(), duration_ms), ("expiring", Some(15_000)));
+    // The new holder's gate holds any other new token.
+    assert!(
+        !setup
+            .state
+            .server
+            .state
+            .hub
+            .authority()
+            .passed(&moving.lease_id)
+    );
+
+    let renewal = format!("msg_{}", ulid_like());
+    let text = NodeMessage::LeaseRenew(LeaseRenew {
+        lease_id: LeaseId(moving.lease_id.clone()),
+        fencing_token: token,
+    })
+    .to_frame(&renewal, None)
+    .to_text();
+    setup
+        .socket_b
+        .send(WsMessage::Text(text.into()))
+        .await
+        .unwrap();
+    let frames = frames_until_settled(&mut setup.socket_b).await;
+    let answers: Vec<&Value> = frames
+        .iter()
+        .filter(|frame| frame["type"] == "lease_grant" && frame["re"] == renewal.as_str())
+        .collect();
+    assert_eq!(answers.len(), 1, "{frames:?}");
+    assert_eq!(answers[0]["body"]["fencing_token"], json!(token));
+}
+
+/// #604: without voter support, a `warm` app's restore target gets the lease
+/// `local`, as any other app's (section 8.4, "Changing the mode").
+#[tokio::test]
+async fn a_warm_apps_restore_target_gets_a_local_lease_without_support() {
+    let mut setup = setup().await;
+    set_warm(&setup).await;
+    let moving = start_moving(&mut setup, 19).await;
+    reply(
+        &mut setup.state.socket,
+        ok_result(),
+        Some(&moving.revoke_id),
+    )
+    .await;
+    round_trip(&mut setup.state.socket).await;
+    let grant = ready_grants(&mut setup, &moving, moving.old_token).await;
+    assert_eq!(grant["body"]["mode"], "local");
+    assert!(grant["body"].get("duration_ms").is_none(), "{grant}");
 }
 
 // ---------------------------------------------------------------------------
