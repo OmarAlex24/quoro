@@ -298,6 +298,7 @@
   - [0291: Engine-trait section 6 names quoro-init's sync refusal 131 for an earlier syncfs that has not returned, and the rule when the host gives up after its 2 s](adr/0291-engine-trait-section-6-names-quoro-init-s-sync-refusal-131.md)
   - [0292: failoverApp answers 202 at once while the grant of a marked lease waits, and the lease shows the wait (grant_pending, grant_waiting_on)](adr/0292-failoverapp-answers-202-at-once-while-the-grant-of-a-marked.md)
   - [0293: getSetup: a public GET /api/v1/setup answers {required: bool}, whether first-run setup is still open](adr/0293-getsetup-a-public-get-api-v1-setup-answers-required-bool.md)
+  - [0296: spec.mesh on the edge: the warm target's allow entry, and no endpoints on an edge-only machine's node entries](adr/0296-spec-mesh-on-the-edge-the-warm-target-s-allow-entry-and-no.md)
 
 # Background research
 
