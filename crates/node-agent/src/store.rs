@@ -26,7 +26,7 @@ use quoro_proto::{FenceReason, LeaseId, LeaseMode, ResourceType};
 use serde_json::Value;
 use sqlx::Row as _;
 use sqlx::SqlitePool;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use tokio::sync::{broadcast, watch};
 
 use crate::AgentError;
@@ -598,6 +598,21 @@ const FAILED_FENCES_UNREPORTED: &str = "failed_fences_unreported";
 /// (section 12 `host_boot_id`, section 8.4 "Agent restart").
 pub const HOST_BOOT_ID: &str = "host_boot_id";
 
+/// The `node_meta` key holding the highest term the machine has seen, voter
+/// or not (sections 8.8 "Terms" and 12). Absent until the first one.
+pub const HIGHEST_TERM: &str = "highest_term";
+/// The `node_meta` key holding a voter's vote: a JSON
+/// [`StoredVote`](crate::vote::StoredVote), the candidate it voted for and the
+/// term it voted in (sections 8.8, 8.9 and 12). Only the vote listener of
+/// section 8.9 sets it.
+pub const VOTE: &str = "vote";
+/// The `node_meta` key holding a voter's support: a JSON
+/// [`StoredSupport`](crate::vote::StoredSupport), the primary it supports with
+/// the last `S` and `L`, and its promise and lease horizon on
+/// `CLOCK_BOOTTIME` next to the kernel boot id (sections 8.8 "Restarts" and
+/// 12). A machine that stops being a voter keeps it (section 6.12).
+pub const SUPPORT: &str = "support";
+
 impl NodeStore {
     /// Opens (creating when missing) `<data_dir>/node.db` in WAL mode with
     /// foreign keys on, and creates the tables.
@@ -612,6 +627,10 @@ impl NodeStore {
             .filename(&path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
+            // Every commit reaches the disk before it returns: a voter's
+            // promise must survive a power loss before its `support_grant`
+            // goes out (section 8.8 "Restarts").
+            .synchronous(SqliteSynchronous::Full)
             .foreign_keys(true)
             // Deleted rows (pruned log lines, resealed plaintext bodies) are
             // overwritten, not left in free pages.
@@ -747,6 +766,139 @@ impl NodeStore {
         .await
         .map_err(store_error)
         .map(|_| ())
+    }
+
+    /// The highest term the machine has seen, or `None` before the first
+    /// (section 8.8 "Terms").
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure or a value that is not a
+    /// term.
+    pub async fn highest_term(&self) -> Result<Option<u64>, AgentError> {
+        self.meta(HIGHEST_TERM)
+            .await?
+            .map(|text| parse_term(&text))
+            .transpose()
+    }
+
+    /// Stores `term` as the highest term seen when it is above the stored one,
+    /// in one statement, so a term is never lowered (section 8.8 "Terms").
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn raise_term(&self, term: u64) -> Result<(), AgentError> {
+        let mut conn = self.pool.acquire().await.map_err(store_error)?;
+        raise_term_on(&mut conn, term).await
+    }
+
+    /// Reads a voter's term, vote and support, lets `decide` choose what to
+    /// write, and writes it, in one transaction (sections 8.8 and 8.9).
+    ///
+    /// The transaction starts with `BEGIN IMMEDIATE`, so it holds SQLite's
+    /// write lock from its first read: a vote written by another task either
+    /// commits before it, and `decide` sees it, or waits for it, and then
+    /// sees the promise it stored. A support is therefore never granted on a
+    /// vote state that a vote changed in between. What `decide` returns is
+    /// handed back only once the transaction committed, so an answer built
+    /// from it goes out after what it promises is durable.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] when the state cannot be read or parsed, or the
+    /// writes or the commit fail; nothing is written then.
+    pub async fn update_vote_state<T>(
+        &self,
+        decide: impl FnOnce(&crate::vote::VoteState) -> (T, crate::vote::VoteWrite),
+    ) -> Result<T, AgentError> {
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(store_error)?;
+        let highest_term = meta_on(&mut tx, HIGHEST_TERM)
+            .await?
+            .map(|text| parse_term(&text))
+            .transpose()?;
+        let vote = meta_on(&mut tx, VOTE)
+            .await?
+            .map(|text| parse_json(VOTE, &text))
+            .transpose()?;
+        let support = meta_on(&mut tx, SUPPORT)
+            .await?
+            .map(|text| parse_json(SUPPORT, &text))
+            .transpose()?;
+        let state = crate::vote::VoteState {
+            highest_term,
+            vote,
+            support,
+        };
+        let (decided, write) = decide(&state);
+        if let Some(term) = write.term {
+            raise_term_on(&mut tx, term).await?;
+        }
+        if let Some(support) = &write.support {
+            let text = serde_json::to_string(support)
+                .map_err(|e| AgentError::Store(format!("could not encode the support: {e}")))?;
+            sqlx::query(
+                "INSERT INTO node_meta (key, value) VALUES (?, ?) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )
+            .bind(SUPPORT)
+            .bind(text)
+            .execute(&mut *tx)
+            .await
+            .map_err(store_error)?;
+        }
+        tx.commit().await.map_err(store_error)?;
+        Ok(decided)
+    }
+
+    /// The voter's vote, when it voted (section 8.9).
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure or a value that does not
+    /// parse.
+    pub async fn vote(&self) -> Result<Option<crate::vote::StoredVote>, AgentError> {
+        self.meta_json(VOTE).await
+    }
+
+    /// The voter's support and its promise and lease horizon (section 8.8).
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure or a value that does not
+    /// parse.
+    pub async fn support(&self) -> Result<Option<crate::vote::StoredSupport>, AgentError> {
+        self.meta_json(SUPPORT).await
+    }
+
+    /// Replaces the voter's support. It is durable once this returns, which is
+    /// what lets the voter answer `support_grant` (sections 5.28 and 8.8).
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn save_support(
+        &self,
+        support: &crate::vote::StoredSupport,
+    ) -> Result<(), AgentError> {
+        let text = serde_json::to_string(support)
+            .map_err(|e| AgentError::Store(format!("could not encode the support: {e}")))?;
+        self.set_meta(SUPPORT, &text).await
+    }
+
+    /// One JSON `node_meta` value.
+    async fn meta_json<T: serde::de::DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> Result<Option<T>, AgentError> {
+        self.meta(key)
+            .await?
+            .map(|text| parse_json(key, &text))
+            .transpose()
     }
 
     /// The newest stored revision and its signed body.
@@ -2409,6 +2561,46 @@ fn transcript_row(row: sqlx::sqlite::SqliteRow) -> Result<StoredTranscript, Agen
 
 fn store_error(error: sqlx::Error) -> AgentError {
     AgentError::Store(error.to_string())
+}
+
+/// One `node_meta` value, read on `conn`.
+async fn meta_on(
+    conn: &mut sqlx::SqliteConnection,
+    key: &str,
+) -> Result<Option<String>, AgentError> {
+    sqlx::query_scalar("SELECT value FROM node_meta WHERE key = ?")
+        .bind(key)
+        .fetch_optional(conn)
+        .await
+        .map_err(store_error)
+}
+
+/// Stores `term` as the highest term seen when it is above the stored one,
+/// in one statement on `conn`, so a term is never lowered (section 8.8).
+async fn raise_term_on(conn: &mut sqlx::SqliteConnection, term: u64) -> Result<(), AgentError> {
+    sqlx::query(
+        "INSERT INTO node_meta (key, value) VALUES (?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value \
+         WHERE CAST(node_meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)",
+    )
+    .bind(HIGHEST_TERM)
+    .bind(term.to_string())
+    .execute(conn)
+    .await
+    .map_err(store_error)
+    .map(|_| ())
+}
+
+/// A stored term ([`HIGHEST_TERM`]).
+fn parse_term(text: &str) -> Result<u64, AgentError> {
+    text.parse::<u64>()
+        .map_err(|_| AgentError::Store(format!("the stored term {text:?} is not a term")))
+}
+
+/// A JSON `node_meta` value stored under `key`.
+fn parse_json<T: serde::de::DeserializeOwned>(key: &str, text: &str) -> Result<T, AgentError> {
+    serde_json::from_str(text)
+        .map_err(|e| AgentError::Store(format!("the stored {key} does not parse: {e}")))
 }
 
 /// The directory under the data directory that holds quarantined copies of

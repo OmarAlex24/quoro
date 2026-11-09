@@ -30,7 +30,7 @@ use crate::health::PausedVms;
 use crate::identity::IdentityHandle;
 use crate::ingress::{CertificateEvents, DnsBridge, IngressSupervisor};
 use crate::interactive::Interactive;
-use crate::lease::{FenceTimers, LeaseConfig};
+use crate::lease::{FenceTimers, HostClock, LeaseConfig, SystemHostClock};
 use crate::mesh::{MeshKey, MeshManager, PlatformMeshDriver};
 use crate::metrics::{MetricsRing, MetricsSampler};
 use crate::reconcile::{ReconcileConfig, ReconcileOptions, Reconciler, Snapshot};
@@ -61,6 +61,16 @@ pub async fn run<E: Engine + 'static>(
 ) -> Result<(), AgentError> {
     let identity = IdentityHandle::load(&config.data_dir)?;
     let store = NodeStore::open(&config.data_dir).await?;
+    // One host clock measures the leases (section 8.4) and a voter's
+    // promise (section 8.8).
+    let host_clock: Arc<dyn HostClock> = Arc::new(SystemHostClock);
+    // Section 8.8 "Restarts": after a reboot a voter's promise and lease
+    // horizon start again from this first start, before any session can
+    // answer a `support_request`. A failure is only logged: the grant path
+    // brings a support from another boot onto this one as well.
+    if let Err(e) = crate::vote::rebase_at_start(&store, &*host_clock).await {
+        warn!(error = %e, "could not bring the stored support onto this boot");
+    }
     // The engine's start-up sweep already ran. Once every snapshot it left
     // is recorded, the store tracks them and later sweeps remove the others
     // (section 12); until then the sweep keeps every snapshot.
@@ -118,7 +128,8 @@ pub async fn run<E: Engine + 'static>(
                 grace: Duration::from_secs(10),
                 force: Duration::from_secs(5),
             },
-        ),
+        )
+        .with_host_clock(Arc::clone(&host_clock)),
         desired.subscribe(),
     )
     .await?;
@@ -255,6 +266,7 @@ pub async fn run<E: Engine + 'static>(
         builds: Some(builds),
     })
     .with_leases(leases.link.clone())
+    .with_host_clock(host_clock)
     .with_volume_snapshot(
         capabilities
             .volume_snapshot_method

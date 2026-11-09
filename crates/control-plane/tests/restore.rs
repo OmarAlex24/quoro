@@ -1639,6 +1639,7 @@ async fn a_refused_revoke_keeps_the_restore_waiting_until_a_later_session_answer
             code: ErrorCode::BadMessage,
             message: "the revoke's token is lower than the node's".to_string(),
             fatal: false,
+            term: None,
         }),
         Some(&moving.revoke_id),
     )

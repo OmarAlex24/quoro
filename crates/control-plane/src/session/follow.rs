@@ -300,6 +300,7 @@ impl Session {
                 code: quoro_proto::ErrorCode::LogDiverged,
                 message,
                 fatal: false,
+                term: None,
             })
             .to_frame(&new_msg_id(), None)
             .to_text();

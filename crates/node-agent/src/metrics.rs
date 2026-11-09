@@ -755,6 +755,8 @@ Buffers:          100000 kB
                     volumes: Vec::new(),
                     backups: Vec::new(),
                     backup_repository: None,
+                    votes: None,
+                    witness: None,
                 },
                 signature: String::new(),
             },

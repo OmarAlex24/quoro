@@ -10,7 +10,8 @@
 //! Redial follows section 4.4: 1 s doubling to 60 s with full jitter, reset
 //! after a session that stayed up for at least 60 s. A fatal
 //! `unauthenticated`/`node_removed` stops dialing for good;
-//! `unsupported_version` keeps dialing and only logs.
+//! `unsupported_version` keeps dialing and only logs, and so do `stale_term`,
+//! sent or received, and `not_primary` (section 8.8).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
@@ -46,12 +47,13 @@ use crate::identity::{Identity, IdentityHandle};
 use crate::ingress::{DnsBridge, DnsRequest, IngressSupervisor};
 use crate::interactive::{Door, Interactive, OpenError, StreamKind};
 use crate::inventory::InventoryHub;
-use crate::lease::LeaseLink;
+use crate::lease::{HostClock, LeaseLink, SystemHostClock};
 use crate::logs::{LogFilter, StoredLogLine};
 use crate::metrics::{MetricsRing, Tick, parse_metrics_params, tick_report};
 use crate::reconcile::Snapshot;
 use crate::store::{NodeStore, Refollowing};
 use crate::tls::{self, Endpoint};
+use crate::vote::{self, Received, SupportAnswer, TermCheck};
 use crate::{AgentError, FatalReason, NodeFacts, util};
 
 /// Path of the session endpoint (section 3.1).
@@ -308,6 +310,13 @@ pub struct Session {
     /// run, so the loop keeps the session alive while its fence runs (section
     /// 5.13, ADR 0222).
     started_revoke: Option<StartedRevoke>,
+    /// The host clock a voter's promise is measured on: `CLOCK_BOOTTIME`
+    /// and the kernel boot id (section 8.8), the lease service's own.
+    host_clock: Arc<dyn HostClock>,
+    /// The `primary_node_id` of the current session's `welcome`: in a term
+    /// it did not vote in, a voter supports only this primary (section 8.8
+    /// "Terms"). `None` before the `welcome`.
+    session_primary: Option<String>,
 }
 
 /// A `lease_revoke` whose fence the session loop runs.
@@ -376,8 +385,9 @@ fn session_end(handled: Result<Option<SessionEnd>, AgentError>) -> Option<Sessio
 /// `lease_revoke`. A grant for a lease whose revoke waits in `held` waits
 /// too, so it never overtakes that revoke. A frame that cannot be read waits
 /// as well, so its error answer keeps its place. From M5b a voter also
-/// answers `support_request` at once (ADR 0237); that message arrives with
-/// the voters.
+/// answers `support_request` at once (ADR 0237): a promise starts no VM and
+/// changes no lease on this node, and a voter whose support lapsed during a
+/// long fence could cost the primary its majority.
 fn passes_a_running_fence(
     text: &str,
     revoking: &str,
@@ -387,7 +397,7 @@ fn passes_a_running_fence(
         return false;
     };
     match ControlMessage::from_raw(&raw) {
-        Ok(ControlMessage::Ping | ControlMessage::Pong) => true,
+        Ok(ControlMessage::Ping | ControlMessage::Pong | ControlMessage::SupportRequest(_)) => true,
         Ok(ControlMessage::LeaseGrant(grant)) => {
             grant.lease_id.0 != revoking && !held_revokes.contains_key(&grant.lease_id.0)
         }
@@ -433,7 +443,18 @@ impl Session {
             dialed_url: None,
             reported_applied_rev: 0,
             started_revoke: None,
+            host_clock: Arc::new(SystemHostClock),
+            session_primary: None,
         }
+    }
+
+    /// Measures a voter's promise on `clock` instead of the running host's
+    /// (section 8.8): the agent passes the lease service's clock, a test a
+    /// [`ManualHostClock`](crate::lease::ManualHostClock).
+    #[must_use]
+    pub fn with_host_clock(mut self, clock: Arc<dyn HostClock>) -> Self {
+        self.host_clock = clock;
+        self
     }
 
     /// Attaches the lease service: `lease_grant` and `lease_revoke` are applied
@@ -720,9 +741,9 @@ impl Session {
                 ) => first,
             };
             match first {
-                Ok(Some(Ok(Message::Text(text)))) => match parse_control(&text) {
-                    Ok(ControlMessage::Welcome(welcome)) => welcome,
-                    Ok(other) => {
+                Ok(Some(Ok(Message::Text(text)))) => match parse_raw_control(&text) {
+                    Ok((raw, ControlMessage::Welcome(welcome))) => (raw.id, welcome),
+                    Ok((_, other)) => {
                         warn!(
                             kind = other.kind(),
                             "the primary did not start with welcome; reconnecting"
@@ -749,6 +770,33 @@ impl Session {
             }
         };
 
+        let (welcome_id, welcome) = welcome;
+        self.session_primary = None;
+
+        // Section 8.8 "Terms" (rule 2 of section 4.2): the welcome's term is
+        // compared with the highest term this machine has seen before
+        // anything acts on the welcome. A lower one ends the session with
+        // `stale_term`, and the node keeps dialing (section 4.4) while it
+        // runs its stored desired state; a higher one is stored first.
+        match vote::check_term(&self.store, welcome.term).await {
+            Ok(TermCheck::Current | TermCheck::Raised) => {}
+            Ok(TermCheck::Stale { highest }) => {
+                warn!(
+                    term = welcome.term,
+                    highest,
+                    "the primary's term is lower than the highest seen; ending the session"
+                );
+                let _ = write_message(&mut sink, stale_term("welcome", highest), Some(&welcome_id))
+                    .await;
+                return Ok(SessionEnd::Reconnect);
+            }
+            Err(e) => {
+                warn!(error = %e, "could not keep the welcome's term; reconnecting");
+                return Ok(SessionEnd::Reconnect);
+            }
+        }
+
+        self.session_primary = Some(welcome.primary_node_id.clone());
         let heartbeat = Duration::from_millis(welcome.heartbeat_interval_ms.max(1));
         let timeout = Duration::from_millis(welcome.session_timeout_ms.max(1));
         info!(
@@ -1109,6 +1157,7 @@ impl Session {
                                 code: ErrorCode::BadMessage,
                                 message: "binary frames are not used in v1".to_owned(),
                                 fatal: false,
+                                term: None,
                             };
                             if write_message(&mut sink, NodeMessage::Error(error), None).await.is_err() {
                                 return Ok(SessionEnd::Reconnect);
@@ -1161,6 +1210,7 @@ impl Session {
                     code: e.code(),
                     message: e.to_string(),
                     fatal: e.is_fatal(),
+                    term: None,
                 };
                 write_message(sink, NodeMessage::Error(error), e.message_id()).await?;
                 return Ok(if e.is_fatal() {
@@ -1178,6 +1228,7 @@ impl Session {
                     code: ErrorCode::BadMessage,
                     message: e.to_string(),
                     fatal: false,
+                    term: None,
                 };
                 write_message(sink, NodeMessage::Error(error), Some(&raw.id)).await?;
                 return Ok(None);
@@ -1186,7 +1237,10 @@ impl Session {
 
         match message {
             ControlMessage::DesiredState(body) => {
-                self.on_desired_state(&raw, &body, sink).await?;
+                return self.on_desired_state(&raw, &body, sink).await;
+            }
+            ControlMessage::SupportRequest(request) => {
+                return self.on_support_request(&raw, &request, sink).await;
             }
             ControlMessage::SigningKeyRotate(body) => {
                 self.on_signing_key_rotate(&raw, &body, sink).await?;
@@ -1342,6 +1396,7 @@ impl Session {
                             code: ErrorCode::BadMessage,
                             message: "no stateful apps run in this version".to_owned(),
                             fatal: false,
+                            term: None,
                         };
                         write_message(sink, NodeMessage::Error(error), Some(&raw.id)).await?;
                     }
@@ -1391,6 +1446,17 @@ impl Session {
                             );
                             return Ok(Some(SessionEnd::Reconnect));
                         }
+                        // The primary of a higher term may be reached at
+                        // another address or start later (section 4.4).
+                        ErrorCode::StaleTerm | ErrorCode::NotPrimary => {
+                            warn!(
+                                code = ?error.code,
+                                term = ?error.term,
+                                message = %error.message,
+                                "the primary is not the primary of the newest term; will redial"
+                            );
+                            return Ok(Some(SessionEnd::Reconnect));
+                        }
                         _ => {
                             warn!(
                                 code = ?error.code,
@@ -1416,12 +1482,17 @@ impl Session {
     }
 
     /// Verifies, stores and publishes one `desired_state` (sections 5.11, 6.1).
+    ///
+    /// Its term is checked after the signature and before the snapshot is
+    /// stored (section 8.8 "Terms"): a lower one is answered `stale_term` and
+    /// ends the session, keeping the stored snapshot; a higher one is stored
+    /// first, and a snapshot whose term cannot be kept is not stored.
     async fn on_desired_state<S>(
         &mut self,
         raw: &RawFrame,
         body: &serde_json::Value,
         sink: &mut SplitSink<WebSocketStream<S>, Message>,
-    ) -> Result<(), AgentError>
+    ) -> Result<Option<SessionEnd>, AgentError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -1433,9 +1504,10 @@ impl Session {
                     "desired_state signature does not verify against the cluster signing key: {e}"
                 ),
                 fatal: false,
+                term: None,
             };
             write_message(sink, NodeMessage::Error(error), Some(&raw.id)).await?;
-            return Ok(());
+            return Ok(None);
         }
         let state = match DesiredState::from_value(body) {
             Ok(state) => state,
@@ -1444,12 +1516,36 @@ impl Session {
                     code: ErrorCode::BadMessage,
                     message: format!("desired_state body is malformed: {e}"),
                     fatal: false,
+                    term: None,
                 };
                 write_message(sink, NodeMessage::Error(error), Some(&raw.id)).await?;
-                return Ok(());
+                return Ok(None);
             }
         };
         let rev = state.rev;
+        match vote::check_term(&self.store, state.term).await {
+            Ok(TermCheck::Current | TermCheck::Raised) => {}
+            Ok(TermCheck::Stale { highest }) => {
+                warn!(
+                    term = state.term,
+                    highest,
+                    "a desired_state's term is lower than the highest seen; ending the session"
+                );
+                write_message(sink, stale_term("desired_state", highest), Some(&raw.id)).await?;
+                return Ok(Some(SessionEnd::Reconnect));
+            }
+            Err(e) => {
+                let result = CommandResult {
+                    status: CommandStatus::Error,
+                    detail: Some(format!("could not keep the term of rev {rev}: {e}")),
+                    error: None,
+                    lines: None,
+                    metrics: None,
+                };
+                write_message(sink, NodeMessage::CommandResult(result), Some(&raw.id)).await?;
+                return Ok(None);
+            }
+        }
         let stored = self
             .store
             .latest_desired()
@@ -1464,7 +1560,7 @@ impl Session {
                 metrics: None,
             };
             write_message(sink, NodeMessage::CommandResult(result), Some(&raw.id)).await?;
-            return Ok(());
+            return Ok(None);
         }
 
         if let Err(e) = self.store.store_desired(rev, body).await {
@@ -1476,7 +1572,7 @@ impl Session {
                 metrics: None,
             };
             write_message(sink, NodeMessage::CommandResult(result), Some(&raw.id)).await?;
-            return Ok(());
+            return Ok(None);
         }
         let result = CommandResult {
             status: CommandStatus::Ok,
@@ -1492,7 +1588,70 @@ impl Session {
         // The reconciler wakes on the new snapshot; a closed channel means the
         // reconciler already stopped, which is a shutdown in progress.
         let _ = self.desired.send_replace(Some(snapshot));
-        Ok(())
+        Ok(None)
+    }
+
+    /// Answers one `support_request` (sections 5.27, 5.28 and 8.8, ADR 0169).
+    ///
+    /// `v_recv` is read before anything else, so the promise errs late. The
+    /// rules and their order are [`vote::decide_support`]'s; the voter's
+    /// `voters_version` is that of the newest stored desired state, which is
+    /// the one the session holds, and the primary of its session is the one
+    /// this session's `welcome` named. A lower term ends the session like a
+    /// stale `welcome`; a promise that could not be stored sends nothing.
+    async fn on_support_request<S>(
+        &mut self,
+        raw: &RawFrame,
+        request: &wire::SupportRequest,
+        sink: &mut SplitSink<WebSocketStream<S>, Message>,
+    ) -> Result<Option<SessionEnd>, AgentError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let received = Received::read(&*self.host_clock);
+        let voters_version = self
+            .current
+            .as_ref()
+            .and_then(|snapshot| snapshot.state.spec.votes.as_ref())
+            .map(|votes| votes.version);
+        match vote::answer_support(
+            &self.store,
+            voters_version,
+            self.session_primary.as_deref(),
+            request,
+            &received,
+        )
+        .await
+        {
+            SupportAnswer::Ignore => {
+                debug!("not a voter; ignoring a support_request");
+            }
+            SupportAnswer::Stale { highest } => {
+                warn!(
+                    term = request.term,
+                    highest,
+                    "a support_request's term is lower than the highest seen; ending the session"
+                );
+                write_message(sink, stale_term("support_request", highest), Some(&raw.id)).await?;
+                return Ok(Some(SessionEnd::Reconnect));
+            }
+            SupportAnswer::Refuse { message, term } => {
+                let error = ProtocolError {
+                    code: ErrorCode::BadMessage,
+                    message,
+                    fatal: false,
+                    term,
+                };
+                write_message(sink, NodeMessage::Error(error), Some(&raw.id)).await?;
+            }
+            SupportAnswer::Grant(grant) => {
+                write_message(sink, NodeMessage::SupportGrant(grant), Some(&raw.id)).await?;
+            }
+            SupportAnswer::Withhold(reason) => {
+                warn!(reason = %reason, "no support granted");
+            }
+        }
+        Ok(None)
     }
 
     /// Verifies, stores and acknowledges one `log_entries` (sections 5.6,
@@ -1543,6 +1702,7 @@ impl Session {
                     code: ErrorCode::BadMessage,
                     message: format!("log_entries does not verify: {rejection}"),
                     fatal: false,
+                    term: None,
                 };
                 write_message(sink, NodeMessage::Error(error), Some(&raw.id)).await?;
                 return Ok(());
@@ -1562,6 +1722,7 @@ impl Session {
                                   after a quarantine needs (section 7.1)"
                             .to_owned(),
                         fatal: false,
+                        term: None,
                     };
                     write_message(sink, NodeMessage::Error(error), Some(&raw.id)).await?;
                     return Ok(());
@@ -1583,6 +1744,7 @@ impl Session {
                              quarantine cannot record it (section 7.1)"
                         ),
                         fatal: false,
+                        term: None,
                     };
                     write_message(sink, NodeMessage::Error(error), Some(&raw.id)).await?;
                     return Ok(());
@@ -1671,6 +1833,7 @@ impl Session {
             code: ErrorCode::BadSignature,
             message,
             fatal: false,
+            term: None,
         };
         if let Err(e) = quoro_proto::sign::verify_body(&key, body) {
             let error = bad_signature(format!(
@@ -1949,6 +2112,7 @@ impl Session {
                     code: ErrorCode::BadMessage,
                     message: "this stream does not take input".to_owned(),
                     fatal: false,
+                    term: None,
                 };
                 write_message(sink, NodeMessage::Error(error), Some(&raw.id)).await?;
             }
@@ -1959,6 +2123,7 @@ impl Session {
                 code: ErrorCode::BadMessage,
                 message: "a console stream is read-only".to_owned(),
                 fatal: false,
+                term: None,
             };
             write_message(sink, NodeMessage::Error(error), Some(&raw.id)).await?;
             return Ok(());
@@ -1970,6 +2135,7 @@ impl Session {
                     code: ErrorCode::BadMessage,
                     message,
                     fatal: false,
+                    term: None,
                 };
                 write_message(sink, NodeMessage::Error(error), Some(&raw.id)).await?;
                 return Ok(());
@@ -2006,6 +2172,7 @@ impl Session {
                     ack.acked_bytes
                 ),
                 fatal: false,
+                term: None,
             };
             write_message(sink, NodeMessage::Error(error), Some(&raw.id)).await?;
         }
@@ -2845,10 +3012,24 @@ where
     source.next().await
 }
 
-/// Parses one control frame.
-fn parse_control(text: &str) -> Result<ControlMessage, AgentError> {
+/// Parses one control frame, keeping its envelope.
+fn parse_raw_control(text: &str) -> Result<(RawFrame, ControlMessage), AgentError> {
     let raw = RawFrame::parse(text).map_err(|e| AgentError::Protocol(format!("bad frame: {e}")))?;
-    ControlMessage::from_raw(&raw).map_err(|e| AgentError::Protocol(format!("bad message: {e}")))
+    let message = ControlMessage::from_raw(&raw)
+        .map_err(|e| AgentError::Protocol(format!("bad message: {e}")))?;
+    Ok((raw, message))
+}
+
+/// The `stale_term` a machine answers a `welcome`, `desired_state` or
+/// `support_request` from an older primary with: fatal, carrying the highest
+/// term it has seen (sections 5.18 and 8.8, ADR 0261).
+fn stale_term(kind: &str, highest: u64) -> NodeMessage {
+    NodeMessage::Error(ProtocolError {
+        code: ErrorCode::StaleTerm,
+        message: format!("the {kind}'s term is lower than this machine's term {highest}"),
+        fatal: true,
+        term: Some(highest),
+    })
 }
 
 /// The connect timeout of the advertised addresses after `failed_attempts`
@@ -3680,6 +3861,8 @@ mod tests {
                     volumes: Vec::new(),
                     backups: Vec::new(),
                     backup_repository: None,
+                    votes: None,
+                    witness: None,
                 },
                 signature: String::new(),
             },
@@ -4032,6 +4215,8 @@ mod tests {
                     volumes: Vec::new(),
                     backups: Vec::new(),
                     backup_repository: None,
+                    votes: None,
+                    witness: None,
                 },
                 signature: String::new(),
             },
@@ -4338,5 +4523,52 @@ mod tests {
         ] {
             assert!(parse_fence_ack(&refused).is_err(), "{refused}");
         }
+    }
+
+    /// Section 5.13 "Order while the fence runs" (ADR 0222, ADR 0237): only
+    /// `ping`, `pong`, a `lease_grant` for a lease neither revoking nor held
+    /// back, and `support_request` pass a running fence.
+    #[test]
+    fn what_passes_a_running_fence() {
+        let held = HashMap::from([("lse_held".to_owned(), 1)]);
+        let passes = |message: ControlMessage| {
+            passes_a_running_fence(
+                &message.to_frame("msg_1", None).to_text(),
+                "lse_revoking",
+                &held,
+            )
+        };
+        let grant = |lease_id: &str| {
+            ControlMessage::LeaseGrant(quoro_proto::LeaseGrant {
+                lease_id: quoro_proto::LeaseId(lease_id.to_owned()),
+                resource_type: quoro_proto::ResourceType::App,
+                resource_id: "app_1".to_owned(),
+                mode: quoro_proto::LeaseMode::Local,
+                fencing_token: 2,
+                duration_ms: None,
+                granted_at: "2026-11-02T10:15:33Z".to_owned(),
+            })
+        };
+        assert!(passes(ControlMessage::Ping));
+        assert!(passes(ControlMessage::Pong));
+        assert!(passes(ControlMessage::SupportRequest(
+            wire::SupportRequest {
+                term: 1,
+                primary_node_id: "nod_primary".to_owned(),
+                support_ms: 15_000,
+                max_lease_ms: 15_000,
+                voters_version: 3120,
+            }
+        )));
+        assert!(passes(grant("lse_other")));
+        assert!(!passes(grant("lse_revoking")));
+        assert!(!passes(grant("lse_held")));
+        assert!(!passes(ControlMessage::DesiredState(json!({}))));
+        assert!(!passes(ControlMessage::LeaseRevoke(LeaseRevoke {
+            lease_id: quoro_proto::LeaseId("lse_other".to_owned()),
+            fencing_token: 1,
+            reason: quoro_proto::RevokeReason::Moved,
+        })));
+        assert!(!passes_a_running_fence("not json", "lse_revoking", &held));
     }
 }

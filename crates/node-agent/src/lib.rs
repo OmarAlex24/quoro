@@ -33,6 +33,7 @@ pub mod store;
 pub mod tls;
 pub mod transcript;
 mod util;
+pub mod vote;
 pub mod warm;
 
 use std::fmt;

@@ -1870,6 +1870,7 @@ async fn a_bad_message_answer_is_sent_again_from_the_last_ack_after_a_delay() {
         code: ErrorCode::BadMessage,
         message: "log_entries does not verify".to_string(),
         fatal: false,
+        term: None,
     })
     .to_frame("msg_refusal0000000000000000", refused["id"].as_str())
     .to_text();
@@ -1911,6 +1912,7 @@ async fn a_bad_message_that_answers_another_message_resends_nothing() {
             code: ErrorCode::BadMessage,
             message: "not about log_entries".to_string(),
             fatal: false,
+            term: None,
         })
         .to_frame(id, re)
         .to_text();

@@ -725,6 +725,8 @@ pub enum NodeMessage {
     CommandResult(CommandResult),
     DnsChallenge(DnsChallenge),
     ImageInventory(ImageInventoryBody),
+    /// From M5b, a voter's answer to `support_request` (section 5.28).
+    SupportGrant(SupportGrant),
     Error(ProtocolError),
     Ping,
     Pong,
@@ -746,6 +748,7 @@ impl NodeMessage {
             Self::CommandResult(_) => "command_result",
             Self::DnsChallenge(_) => "dns_challenge",
             Self::ImageInventory(_) => "image_inventory",
+            Self::SupportGrant(_) => "support_grant",
             Self::Error(_) => "error",
             Self::Ping => "ping",
             Self::Pong => "pong",
@@ -768,6 +771,7 @@ impl NodeMessage {
             Self::CommandResult(b) => frame(kind, id, re, b),
             Self::DnsChallenge(b) => frame(kind, id, re, b),
             Self::ImageInventory(b) => frame(kind, id, re, b),
+            Self::SupportGrant(b) => frame(kind, id, re, b),
             Self::Error(b) => frame(kind, id, re, b),
             Self::Ping | Self::Pong => frame(kind, id, re, &empty_object()),
         }
@@ -791,6 +795,7 @@ impl NodeMessage {
             "command_result" => Self::CommandResult(raw.body_as()?),
             "dns_challenge" => Self::DnsChallenge(raw.body_as()?),
             "image_inventory" => Self::ImageInventory(raw.body_as()?),
+            "support_grant" => Self::SupportGrant(raw.body_as()?),
             "error" => Self::Error(raw.body_as()?),
             "ping" => Self::Ping,
             "pong" => Self::Pong,
@@ -1042,7 +1047,42 @@ pub struct Spec {
     /// a `volumes[].restore` is not empty. Added in M5a.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup_repository: Option<SpecBackupRepository>,
+    /// Present on every voter: a machine with the `node` or `witness` role
+    /// (section 6.12, ADR 0170). Added in M5b.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub votes: Option<SpecVotes>,
+    /// Present on a machine with the `witness` role; its presence is the role
+    /// (section 6.12). Added in M5b.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub witness: Option<SpecWitness>,
 }
+
+/// `spec.votes` (section 6.12): the voter set this machine counts in.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecVotes {
+    /// The voter-set version: the change-log `seq` of the entry that last
+    /// changed the voter set (section 8.10).
+    pub version: u64,
+    /// TCP port of the vote listener on the voter's mesh address.
+    pub port: u16,
+    /// Every voter, this machine included.
+    pub voters: Vec<SpecVoter>,
+}
+
+/// One entry of `spec.votes.voters` (section 6.12).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecVoter {
+    pub node_id: String,
+    /// `node`, `witness` and `edge`, as enrolled.
+    pub roles: Vec<String>,
+    /// The voter's mesh address, or `null` while it has none.
+    #[serde(default)]
+    pub mesh_address: Option<String>,
+}
+
+/// `spec.witness` (section 6.12): an empty object in M5b.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecWitness {}
 
 /// `state` of a `spec.volumes[]` entry (section 5.11).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1478,6 +1518,40 @@ pub struct Command {
     pub params: Value,
 }
 
+/// Body of `support_request` (section 5.27): the primary asks a voter for
+/// its support (section 8.8, ADR 0169).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupportRequest {
+    /// The primary's term.
+    pub term: u64,
+    /// The node holding the primary status, as in `welcome`.
+    pub primary_node_id: String,
+    /// `S`, the support window asked for; at least [`MIN_SUPPORT_MS`].
+    pub support_ms: u64,
+    /// `L`, the longest `duration_ms` the primary may grant while this
+    /// support lasts.
+    pub max_lease_ms: u64,
+    /// The voter-set version the primary counts against (section 8.10).
+    pub voters_version: u64,
+}
+
+/// Body of `support_grant` (section 5.28): a voter's promise, sent once it is
+/// stored.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupportGrant {
+    /// The term supported, equal to the request's.
+    pub term: u64,
+    /// The window granted, equal to the request's.
+    pub support_ms: u64,
+    /// The `L` recorded with the promise, equal to the request's.
+    pub max_lease_ms: u64,
+    /// The voter-set version of the voter's stored desired state.
+    pub voters_version: u64,
+}
+
+/// The floor of `support_request.support_ms` (sections 5.27 and 8.8).
+pub const MIN_SUPPORT_MS: u64 = 3_000;
+
 /// A control-plane-to-node message with a typed body.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ControlMessage {
@@ -1495,6 +1569,8 @@ pub enum ControlMessage {
     /// The raw signed body (section 5.21).
     SigningKeyRotate(Value),
     DnsChallengeResult(DnsChallengeResult),
+    /// From M5b, to a voter (section 5.27).
+    SupportRequest(SupportRequest),
     Error(ProtocolError),
     Ping,
     Pong,
@@ -1517,6 +1593,7 @@ impl ControlMessage {
             Self::Command(_) => "command",
             Self::SigningKeyRotate(_) => "signing_key_rotate",
             Self::DnsChallengeResult(_) => "dns_challenge_result",
+            Self::SupportRequest(_) => "support_request",
             Self::Error(_) => "error",
             Self::Ping => "ping",
             Self::Pong => "pong",
@@ -1539,6 +1616,7 @@ impl ControlMessage {
             Self::StreamAck(b) => frame(kind, id, re, b),
             Self::Command(b) => frame(kind, id, re, b),
             Self::DnsChallengeResult(b) => frame(kind, id, re, b),
+            Self::SupportRequest(b) => frame(kind, id, re, b),
             Self::Error(b) => frame(kind, id, re, b),
             Self::Ping | Self::Pong => frame(kind, id, re, &empty_object()),
         }
@@ -1563,6 +1641,7 @@ impl ControlMessage {
             "command" => Self::Command(raw.body_as()?),
             "signing_key_rotate" => Self::SigningKeyRotate(raw.body.clone()),
             "dns_challenge_result" => Self::DnsChallengeResult(raw.body_as()?),
+            "support_request" => Self::SupportRequest(raw.body_as()?),
             "error" => Self::Error(raw.body_as()?),
             "ping" => Self::Ping,
             "pong" => Self::Pong,
@@ -1898,6 +1977,130 @@ mod tests {
         let value = serde_json::to_value(&new).unwrap();
         assert_eq!(value["domain_id"], "dom_01JC9Z8D5Q7S9V1X3Z5B7D9F1H");
         assert_eq!(serde_json::from_value::<SpecRoute>(value).unwrap(), new);
+    }
+
+    /// Sections 5.27 and 5.28: the protocol's examples decode and round-trip.
+    #[test]
+    fn the_support_examples_decode_and_round_trip() {
+        let text = r#"{"v":1,"type":"support_request","id":"msg_01JCA0B2C3D4E5F6G7H8J9K0MN",
+            "body":{"term":1,"primary_node_id":"nod_01JC9Z0000000000000000000Q",
+            "support_ms":15000,"max_lease_ms":15000,"voters_version":3120}}"#;
+        let raw = RawFrame::parse(text).unwrap();
+        let message = ControlMessage::from_raw(&raw).unwrap();
+        assert_eq!(message.kind(), "support_request");
+        let ControlMessage::SupportRequest(request) = &message else {
+            panic!("not a support_request");
+        };
+        assert_eq!(
+            request,
+            &SupportRequest {
+                term: 1,
+                primary_node_id: "nod_01JC9Z0000000000000000000Q".to_owned(),
+                support_ms: 15_000,
+                max_lease_ms: 15_000,
+                voters_version: 3120,
+            }
+        );
+        let again = RawFrame::parse(&message.to_frame(&raw.id, None).to_text()).unwrap();
+        assert_eq!(ControlMessage::from_raw(&again).unwrap(), message);
+
+        let text = r#"{"v":1,"type":"support_grant","id":"msg_01JCA0B3D4E5F6G7H8J9K0MNPQ",
+            "re":"msg_01JCA0B2C3D4E5F6G7H8J9K0MN",
+            "body":{"term":1,"support_ms":15000,"max_lease_ms":15000,"voters_version":3120}}"#;
+        let raw = RawFrame::parse(text).unwrap();
+        let message = NodeMessage::from_raw(&raw).unwrap();
+        assert_eq!(message.kind(), "support_grant");
+        let NodeMessage::SupportGrant(grant) = &message else {
+            panic!("not a support_grant");
+        };
+        assert_eq!(grant.voters_version, 3120);
+        let again =
+            RawFrame::parse(&message.to_frame(&raw.id, raw.re.as_deref()).to_text()).unwrap();
+        assert_eq!(again.re.as_deref(), Some("msg_01JCA0B2C3D4E5F6G7H8J9K0MN"));
+        assert_eq!(NodeMessage::from_raw(&again).unwrap(), message);
+
+        // A request missing a required field is a bad body (section 3.4).
+        let raw =
+            RawFrame::parse(r#"{"v":1,"type":"support_request","id":"msg_1","body":{"term":1}}"#)
+                .unwrap();
+        assert!(matches!(
+            ControlMessage::from_raw(&raw),
+            Err(DecodeError::BadBody { .. })
+        ));
+    }
+
+    /// Section 6.12: `spec.votes` and `spec.witness` as the example shows
+    /// them, and a spec from a primary older than M5b without either.
+    #[test]
+    fn spec_votes_and_witness_are_optional_and_round_trip() {
+        let old: Spec = serde_json::from_value(json!({"vms": [], "routes": []})).unwrap();
+        assert_eq!((old.votes.as_ref(), old.witness), (None, None));
+        let value = serde_json::to_value(&old).unwrap();
+        assert!(value.get("votes").is_none() && value.get("witness").is_none());
+
+        let example = json!({
+            "vms": [],
+            "routes": [],
+            "witness": {},
+            "votes": {
+                "version": 3120,
+                "port": 51821,
+                "voters": [
+                    { "node_id": "nod_01JC9Z0000000000000000000Q", "roles": ["node"], "mesh_address": "10.43.0.2" },
+                    { "node_id": "nod_01JC9Y2M4Q7V8B1N6T3R5K9XZP", "roles": ["node"], "mesh_address": null },
+                    { "node_id": "nod_01JCA0A1B2C3D4E5F6G7H8J9KM", "roles": ["edge", "witness"], "mesh_address": "10.43.0.1" }
+                ]
+            }
+        });
+        let spec: Spec = serde_json::from_value(example.clone()).unwrap();
+        assert_eq!(spec.witness, Some(SpecWitness {}));
+        let votes = spec.votes.as_ref().unwrap();
+        assert_eq!((votes.version, votes.port), (3120, 51821));
+        assert_eq!(votes.voters.len(), 3);
+        assert_eq!(votes.voters[1].mesh_address, None);
+        assert_eq!(votes.voters[2].roles, vec!["edge", "witness"]);
+        assert_eq!(serde_json::to_value(&spec).unwrap(), example);
+
+        // A voter entry without `mesh_address` reads as null.
+        let voter: SpecVoter =
+            serde_json::from_value(json!({"node_id": "nod_1", "roles": ["witness"]})).unwrap();
+        assert_eq!(voter.mesh_address, None);
+    }
+
+    /// Section 5.18: `stale_term` and `not_primary` are new codes, `term` is
+    /// carried only when set, and an `error` without it still parses.
+    #[test]
+    fn an_error_carries_term_only_when_set() {
+        let stale = ControlMessage::Error(ProtocolError {
+            code: crate::ErrorCode::StaleTerm,
+            message: "the welcome's term is lower than the node's".to_owned(),
+            fatal: true,
+            term: Some(4),
+        });
+        let raw = RawFrame::parse(&stale.to_frame("msg_1", Some("msg_0")).to_text()).unwrap();
+        assert_eq!(raw.body["code"], "stale_term");
+        assert_eq!(raw.body["term"], 4);
+        assert_eq!(ControlMessage::from_raw(&raw).unwrap(), stale);
+
+        let not_primary = NodeMessage::Error(ProtocolError {
+            code: crate::ErrorCode::NotPrimary,
+            message: "demoted".to_owned(),
+            fatal: true,
+            term: None,
+        });
+        let raw = RawFrame::parse(&not_primary.to_frame("msg_2", None).to_text()).unwrap();
+        assert_eq!(raw.body["code"], "not_primary");
+        assert!(raw.body.get("term").is_none(), "{}", raw.body);
+        assert_eq!(NodeMessage::from_raw(&raw).unwrap(), not_primary);
+
+        let raw = RawFrame::parse(
+            r#"{"v":1,"type":"error","id":"msg_3","body":{"code":"bad_signature","message":"x","fatal":false}}"#,
+        )
+        .unwrap();
+        let ControlMessage::Error(error) = ControlMessage::from_raw(&raw).unwrap() else {
+            panic!("not an error");
+        };
+        assert_eq!(error.term, None);
     }
 
     #[test]
