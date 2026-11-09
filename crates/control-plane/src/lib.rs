@@ -13,6 +13,7 @@ pub mod app_env;
 pub mod audit;
 pub mod audit_export;
 pub mod auth;
+pub mod authority;
 pub mod authz;
 pub mod backups;
 pub mod build;
@@ -263,6 +264,7 @@ impl AppState {
             backups.clone(),
         );
         hub.reset_stale_connections().await?;
+        hub.seed_lease_gates().await?;
         let vulns = vulns::Vulns::open(&config.data_dir, store.clone()).await?;
         hub.set_vulns(&vulns);
         let tunnel = tunnel::TunnelManager::new(store.clone(), Arc::clone(&data_key), hub.clone());
