@@ -144,7 +144,7 @@ export function DecideBox({
         <DitherMeter
           tone="shift"
           label={meter.words}
-          words={meter.over ? 'it was denied by itself' : 'then it is denied by itself'}
+          words={meter.then}
           share={meter.share}
         />
         {canDecide ? (

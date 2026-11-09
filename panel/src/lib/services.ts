@@ -73,6 +73,13 @@ export const memoryWords = (mb: number): string => {
   return Number.isInteger(gib) ? `${gib} GiB` : `${gib.toFixed(1)} GiB`;
 };
 
+/**
+ * An app's resources on one line: `1 vCPU, 256 MiB, 1 GiB disk`. The
+ * contract's `disk_gb` counts gibibytes, as Storage and the VM views say.
+ */
+export const resourcesLine = (resources: Pick<App['resources'], 'vcpus' | 'memory_mb' | 'disk_gb'>): string =>
+  `${resources.vcpus} vCPU, ${memoryWords(resources.memory_mb)}, ${resources.disk_gb} GiB disk`;
+
 /** A VM's size on one line: `VM · 4 vCPU · 8 GiB`. */
 export const vmSize = (vm: Pick<Vm, 'vcpus' | 'memory_mb'>): string =>
   `VM · ${vm.vcpus} vCPU · ${memoryWords(vm.memory_mb)}`;

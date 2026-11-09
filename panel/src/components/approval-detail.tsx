@@ -126,7 +126,7 @@ export function ApprovalDetail({
           <DitherMeter
             tone="shift"
             label={meter.words}
-            words={meter.over ? 'it was denied by itself' : 'then it is denied by itself'}
+            words={meter.then}
             share={meter.share}
           />
           {canDecide ? (
@@ -142,8 +142,7 @@ export function ApprovalDetail({
             {approval.status === 'expired' ? (
               <>
                 Nobody decided; it expired{' '}
-                <span title={decidedAt(approval)}>{relativeTime(decidedAt(approval), now)}</span> and was denied by
-                itself.
+                <span title={decidedAt(approval)}>{relativeTime(decidedAt(approval), now)}</span>.
               </>
             ) : (
               <>

@@ -10,6 +10,7 @@ import {
   nextBackupLine,
   nodesLine,
   replicasMark,
+  resourcesLine,
   servicesCount,
   vmSize,
   volumeLine,
@@ -43,6 +44,13 @@ describe('service lines', () => {
     expect(memoryWords(8192)).toBe('8 GiB');
     expect(memoryWords(1536)).toBe('1.5 GiB');
     expect(vmSize({ vcpus: 4, memory_mb: 8192 })).toBe('VM · 4 vCPU · 8 GiB');
+  });
+
+  // Issue 638: `disk_gb` counts gibibytes, as Storage says; Settings said GB.
+  it('says an app’s disk in GiB', () => {
+    expect(resourcesLine({ vcpus: 1, memory_mb: 256, disk_gb: 1 })).toBe('1 vCPU, 256 MiB, 1 GiB disk');
+    expect(resourcesLine({ vcpus: 2, memory_mb: 2048, disk_gb: 10 })).toBe('2 vCPU, 2 GiB, 10 GiB disk');
+    expect(resourcesLine({ vcpus: 1, memory_mb: 256, disk_gb: 1 })).not.toMatch(/\bGB\b/);
   });
 });
 
