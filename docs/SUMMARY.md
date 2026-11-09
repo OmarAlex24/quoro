@@ -290,6 +290,8 @@
   - [0283: listAudit can return records newest first: order (asc default, desc) and before_seq; list_audit takes the same](adr/0283-listaudit-can-return-records-newest-first-order-asc-default.md)
   - [0284: Ignore RUSTSEC-2026-0459 (bundled SQLite before 3.54 via libsqlite3-sys 0.30) in cargo-deny until sqlx allows libsqlite3-sys 0.39 or later](adr/0284-ignore-rustsec-2026-0459-bundled-sqlite-before-3-54-via.md)
   - [0285: A volume restore that turns an expiring lease row local at a new token sets the unsettled mark as R does, so its grant waits for replication and majority support](adr/0285-a-volume-restore-that-turns-an-expiring-lease-row-local-at.md)
+  - [0286: An app's change-log payload carries warm_node_id, warm_node_pinned and warm_interval_s beside the App fields, and App.warm stays null in it](adr/0286-an-app-s-change-log-payload-carries-warm-node-id-warm-node.md)
+  - [0287: A released pin keeps an eligible warm node, and only a reported pause_copy counts as no longer snapshotting with reflink](adr/0287-a-released-pin-keeps-an-eligible-warm-node-and-only-a.md)
 
 # Background research
 
