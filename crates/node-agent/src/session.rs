@@ -4491,6 +4491,40 @@ mod tests {
     /// primary before M5b sends it, has no tokens; with them, every listed
     /// lease needs a non-negative integer, and an entry for a lease it does
     /// not list is ignored.
+    #[test]
+    fn a_fence_ack_carries_a_token_for_every_listed_lease() {
+        let (ids, tokens) = parse_fence_ack(&json!({"lease_ids": ["lse_a"]})).unwrap();
+        assert_eq!(ids, vec!["lse_a".to_owned()]);
+        assert_eq!(tokens, None);
+        let (_, tokens) =
+            parse_fence_ack(&json!({"lease_ids": ["lse_a"], "fencing_tokens": null})).unwrap();
+        assert_eq!(tokens, None);
+
+        let (ids, tokens) = parse_fence_ack(&json!({
+            "lease_ids": ["lse_a", "lse_b"],
+            "fencing_tokens": {"lse_a": 8, "lse_b": 3, "lse_c": 1},
+        }))
+        .unwrap();
+        assert_eq!(ids, vec!["lse_a".to_owned(), "lse_b".to_owned()]);
+        assert_eq!(
+            tokens,
+            Some(BTreeMap::from([
+                ("lse_a".to_owned(), 8),
+                ("lse_b".to_owned(), 3)
+            ]))
+        );
+
+        for refused in [
+            json!({"lease_ids": ["lse_a", "lse_b"], "fencing_tokens": {"lse_a": 8}}),
+            json!({"lease_ids": ["lse_a"], "fencing_tokens": {"lse_a": -1}}),
+            json!({"lease_ids": ["lse_a"], "fencing_tokens": {"lse_a": "8"}}),
+            json!({"lease_ids": ["lse_a"], "fencing_tokens": {"lse_a": 8.5}}),
+            json!({"lease_ids": ["lse_a"], "fencing_tokens": [8]}),
+        ] {
+            assert!(parse_fence_ack(&refused).is_err(), "{refused}");
+        }
+    }
+
     /// Section 5.13 "Order while the fence runs" (ADR 0222, ADR 0237): only
     /// `ping`, `pong`, a `lease_grant` for a lease neither revoking nor held
     /// back, and `support_request` pass a running fence.
@@ -4536,39 +4570,5 @@ mod tests {
             reason: quoro_proto::RevokeReason::Moved,
         })));
         assert!(!passes_a_running_fence("not json", "lse_revoking", &held));
-    }
-
-    #[test]
-    fn a_fence_ack_carries_a_token_for_every_listed_lease() {
-        let (ids, tokens) = parse_fence_ack(&json!({"lease_ids": ["lse_a"]})).unwrap();
-        assert_eq!(ids, vec!["lse_a".to_owned()]);
-        assert_eq!(tokens, None);
-        let (_, tokens) =
-            parse_fence_ack(&json!({"lease_ids": ["lse_a"], "fencing_tokens": null})).unwrap();
-        assert_eq!(tokens, None);
-
-        let (ids, tokens) = parse_fence_ack(&json!({
-            "lease_ids": ["lse_a", "lse_b"],
-            "fencing_tokens": {"lse_a": 8, "lse_b": 3, "lse_c": 1},
-        }))
-        .unwrap();
-        assert_eq!(ids, vec!["lse_a".to_owned(), "lse_b".to_owned()]);
-        assert_eq!(
-            tokens,
-            Some(BTreeMap::from([
-                ("lse_a".to_owned(), 8),
-                ("lse_b".to_owned(), 3)
-            ]))
-        );
-
-        for refused in [
-            json!({"lease_ids": ["lse_a", "lse_b"], "fencing_tokens": {"lse_a": 8}}),
-            json!({"lease_ids": ["lse_a"], "fencing_tokens": {"lse_a": -1}}),
-            json!({"lease_ids": ["lse_a"], "fencing_tokens": {"lse_a": "8"}}),
-            json!({"lease_ids": ["lse_a"], "fencing_tokens": {"lse_a": 8.5}}),
-            json!({"lease_ids": ["lse_a"], "fencing_tokens": [8]}),
-        ] {
-            assert!(parse_fence_ack(&refused).is_err(), "{refused}");
-        }
     }
 }

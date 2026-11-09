@@ -2862,9 +2862,12 @@ async fn a_support_request_with_a_lower_term_ends_the_session() {
     assert_eq!(store.support().await.unwrap(), None);
 }
 
-/// Sections 5.28 and 8.8: a voter stores its promise and lease horizon, then
-/// answers `support_grant` echoing the request, with the voter-set version of
-/// its desired state. A later request with a shorter `L` never lowers the
+/// Sections 5.28 and 8.8: a voter answers `support_grant` echoing the
+/// request, with the voter-set version of its desired state, and its store
+/// then holds the promise and lease horizon the grant stands for. That the
+/// store is written before the grant is sent is what
+/// [`a_promise_the_store_cannot_keep_sends_no_grant`] shows: a write that
+/// fails sends no grant. A later request with a shorter `L` never lowers the
 /// horizon.
 #[tokio::test]
 async fn a_voter_grants_support_once_its_promise_is_stored() {
@@ -2883,7 +2886,7 @@ async fn a_voter_grants_support_once_its_promise_is_stored() {
     )
     .await;
     let grant = reply_to(&mut ws, "msg_support_1").await;
-    // Stored before it was sent: the store has it as the grant arrives.
+    // The store holds the promise once the grant has arrived.
     let first = store
         .support()
         .await
@@ -2919,8 +2922,9 @@ async fn a_voter_grants_support_once_its_promise_is_stored() {
     end_session(ws, serving).await;
 }
 
-/// Section 8.8: a promise that cannot be stored is not granted. The session
-/// goes on, and the next request is granted once the store takes writes.
+/// Sections 5.28 and 8.8: the promise is stored before the grant is sent, so
+/// a promise that cannot be stored is not granted. The session goes on, and
+/// the next request is granted once the store takes writes.
 #[tokio::test]
 async fn a_promise_the_store_cannot_keep_sends_no_grant() {
     let dir = TempDir::new();
