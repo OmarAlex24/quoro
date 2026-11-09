@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { Archive, KeyRound } from 'lucide-react';
+import { Archive, KeyRound, Plus, Settings2 } from 'lucide-react';
 import { useState } from 'react';
 import type { Backup, BackupRepository } from '../api/generated/model';
 import {
@@ -8,6 +8,7 @@ import {
   useListBackupRepositories,
   useListBackups,
 } from '../api/generated/backups/backups';
+import { useListAuditExports } from '../api/generated/audit/audit';
 import { useListProviders } from '../api/generated/providers/providers';
 import { relativeTime } from '../lib/app-status';
 import { canManageBackups, canManageProviders } from '../lib/capabilities';
@@ -16,6 +17,10 @@ import { problemView, type ProblemView } from '../lib/problem';
 import { PROVIDER_KIND_WORDS } from '../lib/providers';
 import { backupLine, repeatWords } from '../lib/storage-words';
 import { useSession } from '../session';
+import {
+  CreateRepositoryDialog,
+  RepositorySettingsDialog,
+} from '../components/backup-repository-dialogs';
 import { UserName } from '../components/identity-name';
 import { SecretOnce } from '../components/secret-once';
 import {
@@ -62,12 +67,14 @@ function RepositoryBox({
   providerName,
   controlPlane,
   owner,
+  onEdit,
   onReplaceKey,
 }: {
   repository: BackupRepository;
   providerName: string | null;
   controlPlane: Backup[];
   owner: boolean;
+  onEdit: () => void;
   onReplaceKey: () => void;
 }) {
   return (
@@ -85,10 +92,16 @@ function RepositoryBox({
           </small>
         </div>
         {owner ? (
-          <Button size="sm" onClick={onReplaceKey}>
-            <KeyRound size={14} strokeWidth={1.8} aria-hidden="true" />
-            Replace the recovery key…
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            <Button size="sm" onClick={onEdit}>
+              <Settings2 size={14} strokeWidth={1.8} aria-hidden="true" />
+              Edit settings…
+            </Button>
+            <Button size="sm" onClick={onReplaceKey}>
+              <KeyRound size={14} strokeWidth={1.8} aria-hidden="true" />
+              Replace the recovery key…
+            </Button>
+          </div>
         ) : null}
       </div>
       <dl className="set-rows border-t border-line">
@@ -127,14 +140,17 @@ function RepositoryBox({
 
 /**
  * Settings › Backups: the cluster's backup repository (at most one in M5a),
- * the recovery key an owner can replace, and the control-plane database's own
- * backups. App volume backups stay on each app's Storage tab.
+ * which an owner creates, renames and reschedules, the recovery key an owner
+ * can replace, and the control-plane database's own backups. App volume
+ * backups stay on each app's Storage tab.
  */
 export function BackupsScreen() {
   const { me, user, loading, unauthenticated } = useSession();
   const queryClient = useQueryClient();
   const owner = canManageBackups(me);
   const [target, setTarget] = useState<BackupRepository | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [editing, setEditing] = useState<BackupRepository | null>(null);
   const [problem, setProblem] = useState<ProblemView | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
@@ -144,12 +160,19 @@ export function BackupsScreen() {
     { query: { enabled: user !== undefined, refetchInterval: 30_000 } },
   );
   // Provider names need provider:manage; other roles see the kind only.
-  const providers = useListProviders(undefined, {
-    query: { enabled: user !== undefined && canManageProviders(me), staleTime: 30_000 },
+  const providers = useListProviders(
+    { limit: 200 },
+    { query: { enabled: user !== undefined && canManageProviders(me), staleTime: 30_000 } },
+  );
+  // A new repository cannot share the audit copy's provider; only an owner creates one.
+  const auditExports = useListAuditExports({
+    query: { enabled: user !== undefined && owner, staleTime: 30_000 },
   });
 
   const rotate = useMutation({
     mutationFn: (repository: BackupRepository) => rotateBackupRecoveryKey(repository.id),
+    // The answer holds the recovery key: keep the mutation no longer than the dialog.
+    gcTime: 0,
     onSuccess: () => {
       setProblem(null);
       void queryClient.invalidateQueries({ queryKey: getListBackupRepositoriesQueryKey() });
@@ -188,15 +211,31 @@ export function BackupsScreen() {
     return provider ? `${provider.name} (${PROVIDER_KIND_WORDS[provider.kind].toLowerCase()})` : null;
   };
   const created = rotate.data;
+  const create =
+    owner && repositories.isSuccess && items.length === 0 ? (
+      <Button
+        size="sm"
+        onClick={() => {
+          setNotice(null);
+          setCreating(true);
+        }}
+      >
+        <Plus size={14} strokeWidth={1.8} aria-hidden="true" />
+        Create repository
+      </Button>
+    ) : null;
 
   return (
     <SettingsPage label="Backups">
       <SettingsHead
         title="Backups"
         lede="Where backups are kept, and the key that opens them without this cluster. Each app's volume backups are on its Storage tab."
+        action={create}
       />
       {!owner ? (
-        <SettingsNote>Only an owner can replace the recovery key.</SettingsNote>
+        <SettingsNote>
+          Only an owner can create the repository, change its settings or replace its recovery key.
+        </SettingsNote>
       ) : null}
       {notice ? <NoticeLine>{notice}</NoticeLine> : null}
       {listError ? <ProblemBanner view={listError} /> : null}
@@ -204,9 +243,10 @@ export function BackupsScreen() {
       {repositories.isPending ? (
         <SettingsLoading label="Loading backup repositories" />
       ) : items.length === 0 ? (
-        <SettingsEmpty title="No backup repository yet.">
-          An owner creates one on an object storage provider through the API. Until then, nothing
-          is backed up.
+        <SettingsEmpty title="No backup repository yet." action={create}>
+          {owner
+            ? 'Create one in the bucket of an object storage provider. Until then, nothing is backed up.'
+            : 'An owner creates one in the bucket of an object storage provider. Until then, nothing is backed up.'}
         </SettingsEmpty>
       ) : (
         items.map((repository) => (
@@ -216,6 +256,10 @@ export function BackupsScreen() {
             providerName={providerName(repository.provider_id)}
             controlPlane={cpBackups.filter((backup) => backup.repository_id === repository.id)}
             owner={owner}
+            onEdit={() => {
+              setNotice(null);
+              setEditing(repository);
+            }}
             onReplaceKey={() => {
               setNotice(null);
               setProblem(null);
@@ -246,6 +290,31 @@ export function BackupsScreen() {
             </ul>
           )}
         </section>
+      ) : null}
+
+      {creating ? (
+        <CreateRepositoryDialog
+          providers={providers.data?.items ?? []}
+          auditExports={auditExports.data?.items ?? []}
+          loading={providers.isPending || auditExports.isPending}
+          onClose={() => setCreating(false)}
+          onCreated={(repository) =>
+            setNotice(
+              `Created the backup repository ${repository.name}. Control-plane backups run on its schedule.`,
+            )
+          }
+        />
+      ) : null}
+
+      {editing ? (
+        <RepositorySettingsDialog
+          repository={editing}
+          onClose={() => setEditing(null)}
+          onSaved={(repository) => {
+            setEditing(null);
+            setNotice(`Saved the settings of ${repository.name}.`);
+          }}
+        />
       ) : null}
 
       <Dialog open={target !== null} onOpenChange={(open) => (open ? undefined : close())}>

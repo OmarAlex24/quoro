@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { Backup } from '../api/generated/model';
 import {
   repeatWords,
+  scheduleSummary,
   backupLine,
   haSentence,
   isActiveVolume,
@@ -171,5 +172,12 @@ describe('repeatWords', () => {
     expect(repeatWords({ interval_h: 1, keep: 3 }, [], NOW)).toBe(
       'Every hour · none has succeeded yet · keeps 3',
     );
+  });
+});
+
+describe('scheduleSummary', () => {
+  it('says a schedule with the words repeatWords uses, without the next run', () => {
+    expect(scheduleSummary({ interval_h: 6, keep: 7 })).toBe('Every 6 hours · keeps 7');
+    expect(scheduleSummary({ interval_h: 1, keep: 1 })).toBe('Every hour · keeps 1');
   });
 });

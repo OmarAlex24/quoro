@@ -4,6 +4,7 @@ import {
   Cable,
   Globe,
   KeyRound,
+  Plus,
   Split,
   Trash2,
   type LucideIcon,
@@ -39,6 +40,7 @@ import {
   SettingsLoading,
   SettingsPage,
 } from '../components/settings-parts';
+import { AddProviderDialog } from '../components/add-provider-dialog';
 import { ToneLamp } from '../components/tone-lamp';
 import { Button } from '../components/ui/button';
 import { Dialog, DialogContent } from '../components/ui/dialog';
@@ -211,8 +213,8 @@ function ReplaceSecretDialog({
 /**
  * Settings › Providers: the credentials Quoro holds for DNS, tunnels, load
  * balancers and object storage, grouped by kind. Managing them is human-only
- * and needs `provider:manage` (owner or operator); a secret is write-only.
- * Adding a provider is not in the panel yet.
+ * and needs `provider:manage` (owner or operator): add one, replace its
+ * secret, delete it. A secret is write-only.
  */
 export function ProvidersScreen() {
   const { me, user, loading, unauthenticated } = useSession();
@@ -220,6 +222,7 @@ export function ProvidersScreen() {
   const manager = canManageProviders(me);
   const [replacing, setReplacing] = useState<Provider | null>(null);
   const [deleting, setDeleting] = useState<Provider | null>(null);
+  const [adding, setAdding] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [problem, setProblem] = useState<ProblemView | null>(null);
 
@@ -250,10 +253,25 @@ export function ProvidersScreen() {
 
   if (unauthenticated || !user) return <LoginScreen />;
 
+  const add = manager ? (
+    <Button
+      size="sm"
+      onClick={() => {
+        setNotice(null);
+        setProblem(null);
+        setAdding(true);
+      }}
+    >
+      <Plus size={14} strokeWidth={1.8} aria-hidden="true" />
+      Add provider
+    </Button>
+  ) : null;
+
   const head = (
     <SettingsHead
       title="Providers"
       lede="The accounts Quoro uses outside the cluster: DNS, tunnels, load balancers and object storage. A secret is write-only; the panel never sees one."
+      action={add}
     />
   );
 
@@ -287,8 +305,8 @@ export function ProvidersScreen() {
       {providers.isPending ? (
         <SettingsLoading label="Loading providers" />
       ) : items.length === 0 ? (
-        <SettingsEmpty title="No providers yet.">
-          Add one through the API to give the cluster a DNS zone, a tunnel or a bucket.
+        <SettingsEmpty title="No providers yet." action={add}>
+          Add one to give the cluster a DNS zone, a tunnel or a bucket.
         </SettingsEmpty>
       ) : (
         PROVIDER_KINDS.filter((kind) => items.some((item) => item.kind === kind)).map((kind) => (
@@ -324,6 +342,16 @@ export function ProvidersScreen() {
           </section>
         ))
       )}
+
+      {adding ? (
+        <AddProviderDialog
+          onClose={() => setAdding(false)}
+          onAdded={(provider) => {
+            setAdding(false);
+            setNotice(`Added ${provider.name}. Its secret is stored encrypted and never shown again.`);
+          }}
+        />
+      ) : null}
 
       <ReplaceSecretDialog
         provider={replacing}

@@ -16,6 +16,7 @@ import type {
   Node,
   Project,
   Provider,
+  ProviderConfig,
   User,
   Vm,
   Volume,
@@ -82,6 +83,12 @@ export interface MockDb {
   auditExports: AuditExport[];
   /** Provider entries, without their secrets: the mock keeps only `has_secret`. */
   providers: Provider[];
+  /**
+   * The repository config objects the buckets hold, one per bucket and prefix
+   * (`repositoryObjectKey`). Creating a repository where one already sits
+   * answers `conflict`, as the server's `put_new` probe does.
+   */
+  repositoryObjects: string[];
 }
 
 export const db: MockDb = {
@@ -131,7 +138,12 @@ export const db: MockDb = {
   backupRepositories: [],
   auditExports: [],
   providers: [],
+  repositoryObjects: [],
 };
+
+/** Where a repository's config object sits: the provider's endpoint and bucket, and the prefix. */
+export const repositoryObjectKey = (config: ProviderConfig, prefix: string): string =>
+  `${String(config.endpoint ?? '')}|${String(config.bucket ?? '')}|${prefix}`;
 
 const timers = new Set<number>();
 
@@ -708,6 +720,29 @@ const seed = (): void => {
   seedGitApp(createdAt);
   seedAtlas(createdAt, repository.id);
   seedSettings();
+  applyRepositoryStart();
+};
+
+/**
+ * Mock mode only: `localStorage['quoro.mock.repository']` starts the cluster
+ * without its backup repository, so the create form can be tried. `none`: no
+ * repository was ever made. `lost`: the repository and its backups are gone
+ * from the database, but its bucket still holds the config object, so
+ * creating one on `lab-r2-backups` under `quoro-backups` answers `conflict`.
+ * Anything else, or no storage (the tests), keeps the seeded repository.
+ */
+const applyRepositoryStart = (): void => {
+  let start: string | null = null;
+  try {
+    start = globalThis.localStorage?.getItem('quoro.mock.repository') ?? null;
+  } catch {
+    start = null;
+  }
+  if (start !== 'none' && start !== 'lost') return;
+  const gone = new Set(db.backupRepositories.map((repository) => repository.id));
+  db.backupRepositories = [];
+  db.backups = db.backups.filter((backup) => !gone.has(backup.repository_id));
+  if (start === 'none') db.repositoryObjects = [];
 };
 
 const seedBuildLog = (
@@ -1408,6 +1443,7 @@ const seedSettings = (): void => {
       kind: 'object_store',
       name: 'lab-r2-backups',
       config: {
+        access_key_id: '6d0b3f8e2a9c4517',
         bucket: 'quoro-lab-backups',
         endpoint: 'https://4f1c2b7e9a3d.r2.cloudflarestorage.com',
         region: 'auto',
@@ -1417,6 +1453,10 @@ const seedSettings = (): void => {
       created_at: hoursAgo(24 * 40),
       rotated_at: hoursAgo(24 * 9),
     });
+    const backupsProvider = db.providers[db.providers.length - 1];
+    if (backupsProvider) {
+      db.repositoryObjects.push(repositoryObjectKey(backupsProvider.config, repository.prefix));
+    }
   }
   if (auditExport) {
     db.providers.push({
@@ -1424,6 +1464,7 @@ const seedSettings = (): void => {
       kind: 'object_store',
       name: 'lab-r2-audit',
       config: {
+        access_key_id: 'c27e9a0f5b3d8e16',
         bucket: 'quoro-lab-audit',
         endpoint: 'https://4f1c2b7e9a3d.r2.cloudflarestorage.com',
         region: 'auto',

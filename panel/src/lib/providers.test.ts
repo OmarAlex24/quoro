@@ -1,8 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import type { Provider } from '../api/generated/model';
 import {
+  buildCreateProviderBody,
   configEntries,
   configSummary,
+  CREATABLE_KINDS,
+  newProviderForm,
+  PROVIDER_CONFIG_FIELDS,
+  PROVIDER_SECRET_WORDS,
+  providerFormProblems,
+  type CreatableKind,
+  type ProviderForm,
   PROVIDER_KIND_USE,
   PROVIDER_KIND_WORDS,
   PROVIDER_KINDS,
@@ -98,5 +106,78 @@ describe('providers', () => {
   it('asks for a secret before it sends one', () => {
     expect(secretProblem('')).toBe('Paste the new secret.');
     expect(secretProblem(' token ')).toBeNull();
+  });
+});
+
+describe('adding a provider', () => {
+  it('offers every kind something in the cluster reads, with the settings the server reads', () => {
+    expect(CREATABLE_KINDS).toEqual(['dns', 'tunnel', 'object_store']);
+    const keys = (kind: CreatableKind) => PROVIDER_CONFIG_FIELDS[kind].map((field) => field.key);
+    expect(keys('dns')).toEqual(['zone_id']);
+    expect(keys('tunnel')).toEqual(['account_id', 'zone_id']);
+    expect(keys('object_store')).toEqual(['endpoint', 'bucket', 'access_key_id', 'region']);
+    expect(PROVIDER_CONFIG_FIELDS.object_store.find((field) => field.key === 'region')?.missing).toBeUndefined();
+    expect(PROVIDER_SECRET_WORDS.object_store.label).toBe('Secret access key');
+  });
+
+  it('names every empty field of the chosen kind', () => {
+    expect(providerFormProblems(newProviderForm('tunnel'))).toEqual({
+      name: 'Name the provider.',
+      'config.account_id': 'Enter the account ID.',
+      'config.zone_id': 'Enter the zone ID.',
+      secret: 'Paste the API token.',
+    });
+    expect(providerFormProblems(newProviderForm('object_store'))).toEqual({
+      name: 'Name the provider.',
+      'config.endpoint': 'Enter the endpoint.',
+      'config.bucket': 'Enter the bucket.',
+      'config.access_key_id': 'Enter the access key ID.',
+      secret: 'Paste the secret access key.',
+    });
+  });
+
+  it('wants an https endpoint, a short name and a secret under 16 KiB', () => {
+    const form: ProviderForm = {
+      kind: 'object_store',
+      name: 'x'.repeat(201),
+      config: { endpoint: 'http://minio.local:9000', bucket: 'b', access_key_id: 'k' },
+      secret: 's'.repeat(16_385),
+    };
+    expect(providerFormProblems(form)).toEqual({
+      name: 'Use at most 200 characters.',
+      'config.endpoint': 'Use an https:// address.',
+      secret: 'The secret is longer than 16 KiB.',
+    });
+    expect(
+      providerFormProblems({ ...form, name: 'r2', config: { ...form.config, endpoint: 'https:' }, secret: 's' }),
+    ).toEqual({ 'config.endpoint': 'Use an https:// address.' });
+  });
+
+  it("sends only the chosen kind's settings, trimmed, with the secret exactly as pasted", () => {
+    const form: ProviderForm = {
+      kind: 'object_store',
+      name: '  r2-backups ',
+      config: {
+        zone_id: 'left over from DNS',
+        endpoint: ' https://acct.r2.cloudflarestorage.com ',
+        bucket: 'lab',
+        access_key_id: 'key-id',
+        region: '  ',
+      },
+      secret: ' secret with spaces ',
+    };
+    expect(providerFormProblems(form)).toEqual({});
+    expect(buildCreateProviderBody(form)).toEqual({
+      kind: 'object_store',
+      name: 'r2-backups',
+      config: { endpoint: 'https://acct.r2.cloudflarestorage.com', bucket: 'lab', access_key_id: 'key-id' },
+      secret: ' secret with spaces ',
+    });
+    expect(buildCreateProviderBody({ ...form, kind: 'dns', config: { zone_id: 'z1' } }).config).toEqual({
+      zone_id: 'z1',
+    });
+    expect(
+      buildCreateProviderBody({ ...form, config: { ...form.config, region: 'eu-west-1' } }).config.region,
+    ).toBe('eu-west-1');
   });
 });
