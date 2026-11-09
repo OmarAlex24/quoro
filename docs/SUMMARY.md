@@ -302,6 +302,7 @@
   - [0296: spec.mesh on the edge: the warm target's allow entry, and no endpoints on an edge-only machine's node entries](adr/0296-spec-mesh-on-the-edge-the-warm-target-s-allow-entry-and-no.md)
   - [0297: Change-log payloads: an update carries the fields it writes and the rebuild merges them over the row; a delete's payload is ignored](adr/0297-change-log-payloads-an-update-carries-the-fields-it-writes.md)
   - [0299: A node's hello counts toward a marked row's grant only once that session's revokes are answered, and step 4 revokes first a lease listed in the other mode](adr/0299-a-node-s-hello-counts-toward-a-marked-row-s-grant-only-once.md)
+  - [0301: Node.log_lag is absent only until change-log follow ships, not until the promotion and custody work](adr/0301-node-log-lag-is-absent-only-until-change-log-follow-ships.md)
 
 # Background research
 
