@@ -8,14 +8,16 @@ use common::{
 };
 use futures_util::{SinkExt, StreamExt};
 use quoro_control_plane::api::enroll::{ensure_local_join, local_join_token};
+use quoro_control_plane::changelog::{self, Actor, Op};
 use quoro_control_plane::driver::{self, Capacity, Kvm, LocalNode};
-use quoro_proto::sign;
 use quoro_proto::wire::{
-    self, Capacity as WireCapacity, Health, Heartbeat, Kvm as WireKvm, NodeMessage, ObservedStatus,
-    StatusReport, VmStatus,
+    self, Capacity as WireCapacity, Health, Heartbeat, Kvm as WireKvm, LogAck, NodeMessage,
+    ObservedStatus, StatusReport, VmStatus,
 };
+use quoro_proto::{ErrorCode, ProtocolError, jcs, sign};
 use serde_json::{Value, json};
-use std::time::Duration;
+use sha2::{Digest, Sha256};
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::WebSocketStream;
@@ -1420,4 +1422,448 @@ async fn a_restarted_primary_keeps_an_instance_on_its_create_time_digest() {
         .find(|vm| vm["vm_id"] != vm_id.as_str())
         .unwrap();
     assert_eq!(new_vm["image_digest"], MOVED_DIGEST);
+}
+
+// ---------------------------------------------------------------------------
+// Change-log follow (sections 5.6, 5.14 and 7.1, ADR 0227)
+// ---------------------------------------------------------------------------
+
+/// 64 zeros: the `log_hash` of an empty copy and the `prev_hash` of `seq` 1.
+fn genesis() -> String {
+    "0".repeat(64)
+}
+
+fn hello_at(node_id: &str, log_seq: u64, log_hash: &str) -> NodeMessage {
+    let NodeMessage::Hello(mut hello) = hello(node_id) else {
+        panic!("hello() builds a hello");
+    };
+    hello.log_seq = log_seq;
+    hello.log_hash = log_hash.to_string();
+    NodeMessage::Hello(hello)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The primary's newest change-log `seq`.
+async fn log_head(server: &Server) -> u64 {
+    let head: Option<i64> = sqlx::query_scalar("SELECT MAX(seq) FROM change_log")
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+    u64::try_from(head.unwrap_or(0)).unwrap()
+}
+
+/// The primary's `hash` at `seq`.
+async fn log_hash_at(server: &Server, seq: u64) -> String {
+    sqlx::query_scalar("SELECT hash FROM change_log WHERE seq = ?")
+        .bind(i64::try_from(seq).unwrap())
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap()
+}
+
+async fn stored_log_seq(server: &Server, node_id: &str) -> u64 {
+    let seq: i64 = sqlx::query_scalar("SELECT log_seq FROM nodes WHERE id = ?")
+        .bind(node_id)
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+    u64::try_from(seq).unwrap()
+}
+
+/// Appends `count` change-log entries in one write, as any state change does;
+/// the entity ids are `<tag>-0`, `<tag>-1` and so on.
+async fn append_entries(server: &Server, tag: &str, count: usize) {
+    let mut w = server.state.store.begin_write().await.unwrap();
+    for i in 0..count {
+        changelog::append(
+            &mut w.tx,
+            &Actor::system("test"),
+            "probe",
+            &format!("{tag}-{i}"),
+            Op::Create,
+            json!({ "n": i }),
+        )
+        .await
+        .unwrap();
+    }
+    w.commit().await.unwrap();
+}
+
+fn of_type<'a>(frames: &'a [Value], kind: &str) -> Vec<&'a Value> {
+    frames
+        .iter()
+        .filter(|frame| frame["type"] == kind)
+        .collect()
+}
+
+/// Sends `hello` and reads every frame up to the first `log_entries`, which
+/// must come after the session's first `desired_state` (section 4.2 rule 6).
+async fn follow_from(server: &Server, node: &Enrolled, hello: NodeMessage) -> (Socket, Vec<Value>) {
+    let mut socket = connect(server, &node.credential).await;
+    send(&mut socket, hello).await;
+    let mut frames = Vec::new();
+    loop {
+        let frame = recv_frame(&mut socket).await;
+        let done = frame["type"] == "log_entries";
+        frames.push(frame);
+        if done {
+            break;
+        }
+    }
+    let snapshot = frames
+        .iter()
+        .position(|frame| frame["type"] == "desired_state");
+    assert!(
+        snapshot.is_some_and(|index| index < frames.len() - 1),
+        "log_entries before the desired_state: {frames:?}"
+    );
+    (socket, frames)
+}
+
+/// Checks one `log_entries` body as a node does (section 7.1,
+/// "Verification"): its entries run without a gap from `from_seq`, each has
+/// exactly the 11 fields of section 5.14, hashes to its `hash` (SHA-256 over
+/// the RFC 8785 form of the entry without `hash`) and links to the hash
+/// before it, starting from `prev_hash`; `head_seq` is at least the last
+/// `seq`. Returns the last entry's `seq` and `hash`.
+fn check_entries(body: &Value, prev_hash: &str) -> (u64, String) {
+    let from_seq = body["from_seq"].as_u64().unwrap();
+    let entries = body["entries"].as_array().unwrap();
+    assert!(!entries.is_empty() && entries.len() <= 500, "{body}");
+    let mut prev = prev_hash.to_string();
+    let mut seq = from_seq;
+    for entry in entries {
+        let mut fields = entry.as_object().unwrap().clone();
+        assert_eq!(fields.len(), 11, "{entry}");
+        assert_eq!(entry["seq"], seq, "{entry}");
+        assert_eq!(entry["prev_hash"], prev.as_str(), "{entry}");
+        let hash = fields.remove("hash").unwrap();
+        let canonical = jcs::canonicalize(&Value::Object(fields)).unwrap();
+        prev = sha256_hex(canonical.as_bytes());
+        assert_eq!(hash, prev.as_str(), "{entry}");
+        seq += 1;
+    }
+    let last = seq - 1;
+    assert!(body["head_seq"].as_u64().unwrap() >= last, "{body}");
+    (last, prev)
+}
+
+async fn ack(socket: &mut Socket, seq: u64, hash: &str) {
+    send(
+        socket,
+        NodeMessage::LogAck(LogAck {
+            seq,
+            hash: hash.to_string(),
+        }),
+    )
+    .await;
+}
+
+/// Pings twice and returns every frame that came before the answers: what
+/// the primary queued before it handled them.
+async fn settle(socket: &mut Socket) -> Vec<Value> {
+    let mut frames = Vec::new();
+    for round in 0..2 {
+        let id = format!("msg_settle{round:020}");
+        send_text(socket, NodeMessage::Ping.to_frame(&id, None).to_text()).await;
+        loop {
+            let frame = recv_frame(socket).await;
+            if frame["type"] == "pong" && frame["re"] == id.as_str() {
+                break;
+            }
+            frames.push(frame);
+        }
+    }
+    frames
+}
+
+/// Acknowledges `log_entries` until the primary sends none: the session has
+/// caught up. Returns the newest acknowledged `seq` and `hash`.
+async fn catch_up(socket: &mut Socket, mut last: u64, mut hash: String) -> (u64, String) {
+    loop {
+        let settled = settle(socket).await;
+        let messages = of_type(&settled, "log_entries");
+        assert!(
+            messages.len() <= 1,
+            "more than one outstanding: {settled:?}"
+        );
+        let Some(message) = messages.first() else {
+            return (last, hash);
+        };
+        assert_eq!(message["body"]["from_seq"], last + 1, "{message}");
+        (last, hash) = check_entries(&message["body"], &hash);
+        ack(socket, last, &hash).await;
+    }
+}
+
+#[tokio::test]
+async fn a_node_follows_the_change_log_from_seq_1_after_its_desired_state() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+
+    let (_socket, frames) = follow_from(&server, &node, hello(&node.node_id)).await;
+    assert!(of_type(&frames, "error").is_empty(), "{frames:?}");
+    let body = &frames.last().unwrap()["body"];
+    assert_eq!(body["from_seq"], 1);
+    let (last, _) = check_entries(body, &genesis());
+    // Fewer than 500 entries exist, so one message carries them all, up to
+    // the head it names.
+    assert_eq!(body["head_seq"], last);
+    assert!(last <= log_head(&server).await);
+}
+
+#[tokio::test]
+async fn one_log_entries_message_is_outstanding_until_its_ack() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+    append_entries(&server, "bulk", 600).await;
+
+    let (mut socket, frames) = follow_from(&server, &node, hello(&node.node_id)).await;
+    let first = &frames.last().unwrap()["body"];
+    assert_eq!(first["from_seq"], 1);
+    assert_eq!(first["entries"].as_array().unwrap().len(), 500);
+    assert!(
+        first["head_seq"].as_u64().unwrap() > 600,
+        "{}",
+        first["head_seq"]
+    );
+    let (last, hash) = check_entries(first, &genesis());
+    assert_eq!(last, 500);
+
+    // Nothing more goes out while it is unacknowledged, not even for a new
+    // write.
+    append_entries(&server, "more", 1).await;
+    let settled = settle(&mut socket).await;
+    assert!(of_type(&settled, "log_entries").is_empty(), "{settled:?}");
+
+    ack(&mut socket, last, &hash).await;
+    let next = recv_type(&mut socket, "log_entries").await;
+    assert_eq!(next["body"]["from_seq"], 501);
+    check_entries(&next["body"], &hash);
+}
+
+#[tokio::test]
+async fn an_ack_that_skips_or_does_not_match_is_ignored() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+    append_entries(&server, "bulk", 600).await;
+
+    let (mut socket, frames) = follow_from(&server, &node, hello(&node.node_id)).await;
+    let first = &frames.last().unwrap()["body"];
+    let (last, hash) = check_entries(first, &genesis());
+    assert_eq!(last, 500);
+    let before_last = first["entries"][498]["hash"].as_str().unwrap().to_string();
+
+    // Not the last entry, the wrong hash, and a seq past the message.
+    ack(&mut socket, 499, &before_last).await;
+    ack(&mut socket, 500, &"f".repeat(64)).await;
+    ack(&mut socket, 501, &log_hash_at(&server, 501).await).await;
+    let settled = settle(&mut socket).await;
+    assert!(of_type(&settled, "log_entries").is_empty(), "{settled:?}");
+
+    // The right ack still moves on from 501.
+    ack(&mut socket, last, &hash).await;
+    let next = recv_type(&mut socket, "log_entries").await;
+    assert_eq!(next["body"]["from_seq"], 501);
+}
+
+#[tokio::test]
+async fn a_write_after_catch_up_is_sent_through_the_head_watch() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+
+    let (mut socket, frames) = follow_from(&server, &node, hello(&node.node_id)).await;
+    let (last, hash) = check_entries(&frames.last().unwrap()["body"], &genesis());
+    ack(&mut socket, last, &hash).await;
+    let (mut last, mut hash) = catch_up(&mut socket, last, hash).await;
+
+    // Nothing but the write wakes the session: no ack is outstanding.
+    append_entries(&server, "after-catch-up", 1).await;
+    let delivered = timeout(Duration::from_secs(5), async {
+        loop {
+            let message = recv_type(&mut socket, "log_entries").await;
+            assert_eq!(message["body"]["from_seq"], last + 1, "{message}");
+            let (seq, seq_hash) = check_entries(&message["body"], &hash);
+            if message["body"]["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["entity_id"] == "after-catch-up-0")
+            {
+                break;
+            }
+            // Another write came first: acknowledged, the next goes out.
+            ack(&mut socket, seq, &seq_hash).await;
+            (last, hash) = (seq, seq_hash);
+        }
+    })
+    .await;
+    assert!(delivered.is_ok(), "the new entry was not sent within 5 s");
+}
+
+/// The frames of a session whose `hello` position differs: exactly one
+/// `log_diverged`, non-fatal, after the `desired_state` and before the
+/// `log_entries`, which start at `seq` 1.
+fn check_diverged(frames: &[Value]) {
+    let snapshot = frames
+        .iter()
+        .position(|frame| frame["type"] == "desired_state")
+        .unwrap();
+    let diverged: Vec<usize> = frames
+        .iter()
+        .enumerate()
+        .filter(|(_, frame)| frame["type"] == "error")
+        .map(|(index, frame)| {
+            assert_eq!(frame["body"]["code"], "log_diverged", "{frame}");
+            assert_eq!(frame["body"]["fatal"], false, "{frame}");
+            index
+        })
+        .collect();
+    assert_eq!(diverged.len(), 1, "{frames:?}");
+    assert!(snapshot < diverged[0], "{frames:?}");
+    assert!(diverged[0] < frames.len() - 1, "{frames:?}");
+    let body = &frames.last().unwrap()["body"];
+    assert_eq!(body["from_seq"], 1);
+    check_entries(body, &genesis());
+}
+
+#[tokio::test]
+async fn a_diverged_position_gets_log_diverged_before_any_entries() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+
+    // Another hash at a seq the primary holds.
+    let head = log_head(&server).await;
+    let (socket, frames) = follow_from(
+        &server,
+        &node,
+        hello_at(&node.node_id, head, &"f".repeat(64)),
+    )
+    .await;
+    check_diverged(&frames);
+    drop(socket);
+
+    // A seq above the primary's head, as after a promotion (section 7.3).
+    let head = log_head(&server).await;
+    let hash = log_hash_at(&server, head).await;
+    let (socket, frames) =
+        follow_from(&server, &node, hello_at(&node.node_id, head + 1000, &hash)).await;
+    check_diverged(&frames);
+    drop(socket);
+
+    // An empty copy names 64 zeros.
+    let (_socket, frames) =
+        follow_from(&server, &node, hello_at(&node.node_id, 0, &"f".repeat(64))).await;
+    check_diverged(&frames);
+}
+
+#[tokio::test]
+async fn an_edge_only_machine_does_not_follow() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let edge = enrolled_with_roles(&server, &owner, "edge-1", &["edge"]).await;
+
+    // Even a position that differs draws no log_diverged.
+    let mut socket = connect(&server, &edge.credential).await;
+    send(&mut socket, hello_at(&edge.node_id, 3, &"f".repeat(64))).await;
+    let mut frames = Vec::new();
+    loop {
+        let frame = recv_frame(&mut socket).await;
+        let done = frame["type"] == "desired_state";
+        frames.push(frame);
+        if done {
+            break;
+        }
+    }
+    append_entries(&server, "edge", 1).await;
+    frames.extend(settle(&mut socket).await);
+    assert!(of_type(&frames, "log_entries").is_empty(), "{frames:?}");
+    assert!(of_type(&frames, "error").is_empty(), "{frames:?}");
+}
+
+#[tokio::test]
+async fn a_bad_message_answer_is_sent_again_from_the_last_ack_after_a_delay() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+    append_entries(&server, "bulk", 600).await;
+
+    let (mut socket, frames) = follow_from(&server, &node, hello(&node.node_id)).await;
+    let (last, hash) = check_entries(&frames.last().unwrap()["body"], &genesis());
+    ack(&mut socket, last, &hash).await;
+    let refused = recv_type(&mut socket, "log_entries").await;
+    assert_eq!(refused["body"]["from_seq"], last + 1);
+
+    // The node could not verify it (section 7.1, "Verification").
+    let error = NodeMessage::Error(ProtocolError {
+        code: ErrorCode::BadMessage,
+        message: "log_entries does not verify".to_string(),
+        fatal: false,
+    })
+    .to_frame("msg_refusal0000000000000000", refused["id"].as_str())
+    .to_text();
+    let refused_at = Instant::now();
+    send_text(&mut socket, error).await;
+
+    let again = recv_type(&mut socket, "log_entries").await;
+    let waited = refused_at.elapsed();
+    assert!(
+        waited >= Duration::from_millis(2_900),
+        "sent again after {waited:?}"
+    );
+    assert_ne!(again["id"], refused["id"]);
+    assert_eq!(again["body"]["from_seq"], last + 1);
+    check_entries(&again["body"], &hash);
+}
+
+#[tokio::test]
+async fn nodes_log_seq_is_written_when_a_session_starts_and_ends() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+
+    // A node that already holds the log up to the current head.
+    let start = log_head(&server).await;
+    assert!(start > 0);
+    let start_hash = log_hash_at(&server, start).await;
+    let (mut socket, frames) =
+        follow_from(&server, &node, hello_at(&node.node_id, start, &start_hash)).await;
+    assert_eq!(stored_log_seq(&server, &node.node_id).await, start);
+    let body = &frames.last().unwrap()["body"];
+    assert_eq!(body["from_seq"], start + 1);
+    let (last, hash) = check_entries(body, &start_hash);
+    ack(&mut socket, last, &hash).await;
+    let (last, _) = catch_up(&mut socket, last, hash).await;
+    assert!(last > start);
+    assert_eq!(
+        stored_log_seq(&server, &node.node_id).await,
+        start,
+        "an ack is kept in memory, not written"
+    );
+
+    // The session's end writes the newest ack.
+    drop(socket);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if node_json(&server, &owner, &node.node_id).await["status"] == "disconnected" {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the node is not disconnected"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(stored_log_seq(&server, &node.node_id).await, last);
 }

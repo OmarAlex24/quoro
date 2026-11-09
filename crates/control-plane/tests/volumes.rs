@@ -299,9 +299,14 @@ async fn recv_frame(socket: &mut Socket) -> Value {
     }
 }
 
+/// Reads frames until one of type `kind` arrives, and returns it; frames of
+/// other types before it, such as `log_entries`, are skipped.
 async fn recv_type(socket: &mut Socket, kind: &str) -> Value {
-    let mut frames = recv_until(socket, &[kind]).await;
-    frames.remove(0)
+    let frames = recv_until(socket, &[kind]).await;
+    frames
+        .into_iter()
+        .find(|frame| frame["type"] == kind)
+        .expect("recv_until stops at a frame of the wanted type")
 }
 
 /// Reads frames until one of each `wanted` type was seen, and returns them in

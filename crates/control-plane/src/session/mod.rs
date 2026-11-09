@@ -9,10 +9,12 @@
 //!
 //! M5a revokes stale or superseded leases from `hello` and grants the
 //! node's `local` app leases after the snapshot (sections 4.2 and 5.12).
-//! Change-log follow is a separate follow-up; its slot is marked below.
+//! From M5b a machine with the `node` role follows the change log after its
+//! first snapshot ([`follow`], sections 5.14 and 7.1).
 
 pub mod desired;
 pub mod drain;
+mod follow;
 mod mesh;
 pub mod serving;
 
@@ -365,6 +367,22 @@ struct SessionHandle {
     /// this session. A snapshot built before one of them is not sent after it
     /// (section 8.3, issue #384).
     revokes: u64,
+    /// Where this session's node stands in the change log, once it follows
+    /// (section 7.1, "Lag"). In memory only: `nodes.log_seq` is written only
+    /// when a session starts and ends.
+    log_position: Option<LogPosition>,
+}
+
+/// A follower's position in the change log, kept in memory for its live
+/// session (section 7.1, ADR 0227).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LogPosition {
+    /// The newest `seq` the node acknowledged, or the session's starting
+    /// position until it acknowledges one: the `hello`'s `log_seq`, or 0
+    /// after `log_diverged`.
+    seq: u64,
+    /// Whether the session has acknowledged anything.
+    acked: bool,
 }
 
 /// A source of `welcome.primary_urls` (section 5.10). The binary installs one
@@ -1456,7 +1474,7 @@ impl NodeHub {
                 .await
                 .map_err(|e| format!("cannot read the node list: {e}"))?;
         for (node_id,) in stale {
-            disconnect_node(self, &node_id, "session_closed").await?;
+            disconnect_node(self, &node_id, "session_closed", None).await?;
         }
         Ok(())
     }
@@ -1501,9 +1519,67 @@ impl NodeHub {
                 pending: Arc::new(Mutex::new(Pending::default())),
                 hello_recorded: false,
                 revokes: 0,
+                log_position: None,
             },
         );
         (generation, rx, closed_rx, changed)
+    }
+
+    /// Sets `generation`'s position in the change log: the start of follow,
+    /// or a `log_ack` of it when `acked` (section 7.1). A superseded
+    /// generation is left alone, so only the node's current session moves
+    /// the position.
+    fn set_log_position(&self, node_id: &str, generation: u64, seq: u64, acked: bool) {
+        if let Some(handle) = self
+            .0
+            .sessions
+            .lock()
+            .expect("session lock")
+            .get_mut(node_id)
+            .filter(|handle| handle.generation == generation)
+        {
+            let acked = acked || handle.log_position.is_some_and(|position| position.acked);
+            handle.log_position = Some(LogPosition { seq, acked });
+        }
+    }
+
+    /// The newest change-log `seq` `node_id` acknowledged on its live
+    /// session, or the position that session's follow started from until it
+    /// acknowledges one; `None` when the node has no live session that
+    /// follows. This is `Node.log_seq` while the node is connected, and
+    /// `Node.log_lag` is the primary's newest `seq` minus it (section 7.1,
+    /// ADR 0227); `nodes.log_seq` holds it once the session ended.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Node.log_seq and Node.log_lag read it in the API's next change"
+        )
+    )]
+    pub(crate) fn log_seq(&self, node_id: &str) -> Option<u64> {
+        self.0
+            .sessions
+            .lock()
+            .expect("session lock")
+            .get(node_id)
+            .and_then(|handle| handle.log_position)
+            .map(|position| position.seq)
+    }
+
+    /// The newest `seq` `generation`'s session acknowledged, read before the
+    /// session is detached so its end can write `nodes.log_seq` (section
+    /// 7.1); `None` for a session that does not follow, acknowledged
+    /// nothing, or was superseded.
+    fn acked_log_seq(&self, node_id: &str, generation: u64) -> Option<u64> {
+        self.0
+            .sessions
+            .lock()
+            .expect("session lock")
+            .get(node_id)
+            .filter(|handle| handle.generation == generation)
+            .and_then(|handle| handle.log_position)
+            .filter(|position| position.acked)
+            .map(|position| position.seq)
     }
 
     /// Removes the session if it is still the current generation, returning
@@ -2192,6 +2268,36 @@ struct Session {
     /// with `bad_message` means the lease expired on the way (section 8.5,
     /// "Regrant from `hello`").
     same_token_grants: HashMap<String, (String, u64)>,
+    /// Change-log follow on this session (sections 5.14 and 7.1).
+    follow: follow::Follow,
+    /// When follow goes on after a `bad_message` or a failed read
+    /// ([`follow::LOG_RETRY_DELAY`]); nothing is sent before.
+    follow_retry: Option<Instant>,
+}
+
+impl Session {
+    fn new(hub: NodeHub, node_id: String, generation: u64) -> Self {
+        Self {
+            hub,
+            node_id,
+            generation,
+            connected: false,
+            desired_rev: 0,
+            last_spec: None,
+            notified_deleted: HashSet::new(),
+            retry_pending: false,
+            digest_failures: HashMap::new(),
+            inventory_parts: Assembler::new(),
+            inventory_requests: HashMap::new(),
+            start_wait: None,
+            fence_ack: None,
+            fence_ack_stopped: false,
+            hello_leases: HashMap::new(),
+            same_token_grants: HashMap::new(),
+            follow: follow::Follow::Off,
+            follow_retry: None,
+        }
+    }
 }
 
 /// A `fence_ack` the node has not answered: its message id and what it
@@ -2217,24 +2323,10 @@ async fn run_session(
     let timeout = Duration::from_millis(hub.0.config.session_timeout_ms.max(1));
     let mut deadline = Instant::now() + timeout;
     let mut outbox: Vec<String> = Vec::new();
-    let mut session = Session {
-        hub,
-        node_id,
-        generation,
-        connected: false,
-        desired_rev: 0,
-        last_spec: None,
-        notified_deleted: HashSet::new(),
-        retry_pending: false,
-        digest_failures: HashMap::new(),
-        inventory_parts: Assembler::new(),
-        inventory_requests: HashMap::new(),
-        start_wait: None,
-        fence_ack: None,
-        fence_ack_stopped: false,
-        hello_leases: HashMap::new(),
-        same_token_grants: HashMap::new(),
-    };
+    // Change-log follow sends new entries when this watch rises (section 7.1).
+    let mut head = hub.0.store.change_log_head();
+    let mut head_open = true;
+    let mut session = Session::new(hub, node_id, generation);
     let mut superseded = false;
     let mut reason = "session_closed";
     let mut close_after_error = false;
@@ -2255,6 +2347,7 @@ async fn run_session(
         }
 
         let sleep = tokio::time::sleep_until(deadline);
+        let follow_due = tokio::time::sleep_until(session.follow_retry.unwrap_or(deadline));
         tokio::select! {
             message = socket.recv() => {
                 match message {
@@ -2320,6 +2413,18 @@ async fn run_session(
                     }
                 }
             }
+            // A new change-log entry while nothing is outstanding (section
+            // 7.1, ADR 0227).
+            changed_head = head.changed(), if head_open && session.follow_idle() => {
+                if changed_head.is_ok() {
+                    session.send_log_entries().await;
+                } else {
+                    head_open = false;
+                }
+            }
+            () = follow_due, if session.follow_retry.is_some() => {
+                session.follow_retry_due().await;
+            }
             () = sleep => {
                 if session.connected {
                     reason = "heartbeat_timeout";
@@ -2356,10 +2461,12 @@ async fn end_session(
     record_disconnect: bool,
     reason: &str,
 ) {
+    // Read before the detach drops it (section 7.1, "Lag").
+    let log_seq = hub.acked_log_seq(node_id, generation);
     if let Some(pending) = hub.detach(node_id, generation) {
         pending.lock().expect("pending lock").fail_all();
     }
-    if record_disconnect && let Err(e) = disconnect_node(hub, node_id, reason).await {
+    if record_disconnect && let Err(e) = disconnect_node(hub, node_id, reason, log_seq).await {
         tracing::warn!(%e, node_id = %node_id, "cannot record the disconnect");
     }
 }
@@ -2418,6 +2525,12 @@ impl Session {
                 }
             }
             self.connected = true;
+            // Change-log follow starts from this position once the first
+            // desired state has been sent (section 7.1).
+            self.follow = follow::Follow::Waiting {
+                log_seq: hello.log_seq,
+                log_hash: hello.log_hash.clone(),
+            };
 
             let term = cluster_term(&self.hub).await.unwrap_or_else(|e| {
                 tracing::warn!(%e, "cannot read the cluster term");
@@ -2617,6 +2730,11 @@ impl Session {
                     message = %error.message,
                     "node reported an error"
                 );
+                if let Some(re) = raw.re.as_deref()
+                    && self.on_log_refused(re, error.code)
+                {
+                    return false;
+                }
                 // A refused revoke is answered with `error` (section 5.13);
                 // it is answered all the same. So is a refused `fence_ack`,
                 // which the session start no longer waits for.
@@ -2655,8 +2773,7 @@ impl Session {
                 Some(&raw.id),
             )),
             NodeMessage::LeaseRenew(renew) => self.answer_renewal(&raw.id, &renew, outbox).await,
-            // No change-log follow exists yet.
-            NodeMessage::LogAck(_) => {}
+            NodeMessage::LogAck(ack) => self.on_log_ack(&ack).await,
             NodeMessage::DnsChallenge(challenge) => {
                 let acme_routes: HashSet<String> = self
                     .last_spec
@@ -3504,6 +3621,9 @@ impl Session {
             .record_warm_named(&self.node_id, self.generation, &spec);
         self.last_spec = Some(spec);
         self.hub.tunnel_changed(&self.node_id);
+        // The session's first desired state went out: change-log follow
+        // starts behind it (section 4.2 rule 6).
+        self.start_follow().await;
         Ok(())
     }
 
@@ -3696,6 +3816,10 @@ fn i64_of(value: u64) -> i64 {
 
 /// Records the start of a session and emits `node.connected` (section 5.1).
 ///
+/// `nodes.log_seq` takes the `hello`'s `log_seq` in the same write: from M5b
+/// the primary writes it only when a session starts and ends (section 7.1,
+/// "Lag").
+///
 /// It also stores the mesh public key the `hello` carried and assigns the
 /// node's mesh address when it has none (ADR 0144). The `bool` says
 /// whether either was newly stored, so the caller can rebuild every snapshot.
@@ -3719,7 +3843,8 @@ async fn connect_node(
     let mut w = hub.0.store.begin_write().await.map_err(|e| e.to_string())?;
     sqlx::query(
         "UPDATE nodes SET status = 'connected', agent_version = ?, engine_version = ?, \
-         capacity = ?, kvm = ?, volume_snapshot = ?, applied_rev = ?, last_seen_at = ? WHERE id = ?",
+         capacity = ?, kvm = ?, volume_snapshot = ?, applied_rev = ?, log_seq = ?, last_seen_at = ? \
+         WHERE id = ?",
     )
     .bind(&hello.agent_version)
     .bind(&hello.engine_version)
@@ -3727,6 +3852,7 @@ async fn connect_node(
     .bind(&kvm)
     .bind(volume_snapshot)
     .bind(i64_of(hello.applied_rev))
+    .bind(i64_of(hello.log_seq))
     .bind(&now)
     .bind(node_id)
     .execute(&mut *w.tx)
@@ -3771,11 +3897,20 @@ async fn connect_node(
 
 /// Records the end of a session and emits `node.disconnected`.
 ///
+/// `log_seq` is the newest `seq` the session acknowledged, when it followed
+/// the change log and acknowledged anything; `nodes.log_seq` takes it in the
+/// same write and is otherwise left alone (section 7.1, "Lag").
+///
 /// Records nothing when a newer session of the node already recorded its
 /// `hello`: the ending session is stale and the node is connected. The check
 /// runs inside the write transaction, so it is ordered against that
 /// session's [`connect_node`] by the writer gate (issue #324).
-async fn disconnect_node(hub: &NodeHub, node_id: &str, reason: &str) -> Result<(), String> {
+async fn disconnect_node(
+    hub: &NodeHub,
+    node_id: &str,
+    reason: &str,
+    log_seq: Option<u64>,
+) -> Result<(), String> {
     let actor = Actor {
         kind: ActorType::Node,
         id: node_id.to_string(),
@@ -3786,9 +3921,11 @@ async fn disconnect_node(hub: &NodeHub, node_id: &str, reason: &str) -> Result<(
         return Ok(());
     }
     let updated = sqlx::query(
-        "UPDATE nodes SET status = 'disconnected', last_seen_at = ? WHERE id = ? AND status = 'connected'",
+        "UPDATE nodes SET status = 'disconnected', last_seen_at = ?, log_seq = COALESCE(?, log_seq) \
+         WHERE id = ? AND status = 'connected'",
     )
     .bind(&now)
+    .bind(log_seq.map(i64_of))
     .bind(node_id)
     .execute(&mut *w.tx)
     .await
@@ -4065,7 +4202,7 @@ async fn apply_edge_report(
     node_id: &str,
     report: &[wire::EdgeBackendStatus],
 ) -> Result<(), String> {
-    if !has_edge_role(hub, node_id).await? {
+    if !has_role(hub, node_id, "edge").await? {
         return Ok(());
     }
     {
@@ -4153,8 +4290,9 @@ async fn apply_edge_report(
     w.commit().await.map_err(|e| e.to_string())
 }
 
-/// Whether `node_id` is a non-removed machine with the `edge` role.
-async fn has_edge_role(hub: &NodeHub, node_id: &str) -> Result<bool, String> {
+/// Whether `node_id` is a non-removed machine with `role` (`node`, `edge` or
+/// `witness`).
+async fn has_role(hub: &NodeHub, node_id: &str, role: &str) -> Result<bool, String> {
     let roles: Option<String> =
         sqlx::query_scalar("SELECT roles FROM nodes WHERE id = ? AND status <> 'removed'")
             .bind(node_id)
@@ -4163,7 +4301,7 @@ async fn has_edge_role(hub: &NodeHub, node_id: &str) -> Result<bool, String> {
             .map_err(|e| format!("cannot read the roles of {node_id}: {e}"))?;
     Ok(roles
         .and_then(|roles| serde_json::from_str::<Vec<String>>(&roles).ok())
-        .is_some_and(|roles| roles.iter().any(|role| role == "edge")))
+        .is_some_and(|roles| roles.iter().any(|held| held == role)))
 }
 
 /// The certificate state a node reported for the hostnames it serves
@@ -4631,13 +4769,106 @@ mod tests {
         connect_node(hub, &node_id, b, &hello(&node_id))
             .await
             .unwrap();
-        disconnect_node(hub, &node_id, "heartbeat_timeout")
+        disconnect_node(hub, &node_id, "heartbeat_timeout", None)
             .await
             .unwrap();
         assert_eq!(
             status_and_disconnects(&state, &node_id).await,
             ("connected".to_string(), 0)
         );
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    /// Every frame queued on a session, parsed.
+    fn queued(rx: &mut mpsc::UnboundedReceiver<String>) -> Vec<Value> {
+        let mut frames = Vec::new();
+        while let Ok(text) = rx.try_recv() {
+            frames.push(serde_json::from_str(&text).unwrap());
+        }
+        frames
+    }
+
+    async fn node_log_seq(state: &AppState, node_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT log_seq FROM nodes WHERE id = ?")
+            .bind(node_id)
+            .fetch_one(state.store.pool())
+            .await
+            .unwrap()
+    }
+
+    /// Section 7.1, "Lag": the hub keeps the newest ack of the node's live
+    /// session in memory, writes no ack to the database, and the session's
+    /// end writes the newest ack to `nodes.log_seq`.
+    #[tokio::test]
+    async fn the_hub_keeps_the_newest_ack_in_memory_until_the_session_ends() {
+        let (state, node_id, data_dir) = hub_with_node().await;
+        // A machine with the `node` role gets a snapshot only with its guest
+        // subnet.
+        sqlx::query("UPDATE nodes SET subnet = '10.42.1.0/24' WHERE id = ?")
+            .bind(&node_id)
+            .execute(state.store.pool())
+            .await
+            .unwrap();
+        let hub = &state.hub;
+        let (a, mut rx, _closed, _) = hub.attach(&node_id);
+        let mut session = Session::new(hub.clone(), node_id.clone(), a);
+        let mut outbox = Vec::new();
+        assert_eq!(hub.log_seq(&node_id), None, "no follow before hello");
+
+        let hello = NodeMessage::Hello(hello(&node_id))
+            .to_frame("msg_hello", None)
+            .to_text();
+        assert!(!session.handle_text(&hello, &mut outbox).await);
+        // The snapshot, then the entries from seq 1 behind it.
+        let frames = queued(&mut rx);
+        let kinds: Vec<&str> = frames
+            .iter()
+            .map(|frame| frame["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            ["desired_state", "log_entries"],
+            "{frames:?} {outbox:?}"
+        );
+        assert_eq!(hub.log_seq(&node_id), Some(0), "seeded from hello");
+        let message = &frames[1];
+        assert_eq!(message["body"]["from_seq"], 1);
+        let last = message["body"]["entries"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        let seq = last["seq"].as_u64().unwrap();
+
+        // A wrong hash is ignored.
+        let wrong = NodeMessage::LogAck(wire::LogAck {
+            seq,
+            hash: "f".repeat(64),
+        })
+        .to_frame("msg_wrong", message["id"].as_str())
+        .to_text();
+        session.handle_text(&wrong, &mut outbox).await;
+        assert_eq!(hub.log_seq(&node_id), Some(0));
+
+        let ack = NodeMessage::LogAck(wire::LogAck {
+            seq,
+            hash: last["hash"].as_str().unwrap().to_string(),
+        })
+        .to_frame("msg_ack", message["id"].as_str())
+        .to_text();
+        session.handle_text(&ack, &mut outbox).await;
+        assert_eq!(hub.log_seq(&node_id), Some(seq));
+        assert_eq!(node_log_seq(&state, &node_id).await, 0, "no write per ack");
+
+        // Only the current generation moves the position.
+        hub.set_log_position(&node_id, a + 100, 1, true);
+        assert_eq!(hub.log_seq(&node_id), Some(seq));
+
+        // The session's end writes the newest ack and drops the memory.
+        end_session(hub, &node_id, a, true, "session_closed").await;
+        assert_eq!(hub.log_seq(&node_id), None);
+        assert_eq!(node_log_seq(&state, &node_id).await, i64_of(seq));
         std::fs::remove_dir_all(&data_dir).unwrap();
     }
 
