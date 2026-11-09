@@ -204,28 +204,74 @@ export interface DeployRun {
   readonly key: string;
   readonly build: Build | null;
   readonly deployment: Deployment | null;
+  /**
+   * The build succeeded and names its deployment, but the deployments were
+   * read before it started: the run is still rolling out, not settled.
+   */
+  readonly awaiting: boolean;
 }
 
 const runStart = (run: DeployRun): number =>
   parseTime(run.build?.created_at ?? run.deployment?.created_at) ?? 0;
 
+const buildBroke = (build: Build): boolean => build.status === 'failed' || build.status === 'cancelled';
+
 /**
  * Join builds to the deployments they started (`Build.deployment_id`), newest
  * run first. A deployment no listed build started (an image deploy, a
  * redeploy, a rollback, or a build older than the page) is a run of its own.
+ *
+ * The two lists are read on their own and land at different moments, so the
+ * join lines them up:
+ * - The builds read can be ahead: a build that just succeeded names a
+ *   deployment the deployments read does not have yet. If the build ended
+ *   after the oldest listed deployment started, its deployment would be on the
+ *   page, so the page predates it and the run is `awaiting`. Otherwise it fell
+ *   off the page. `deployments` is undefined until it has been read.
+ * - The deployments read can be ahead: the newest build's own deployment is
+ *   listed while the build still reads as running. An app has one unfinished
+ *   build at a time (`startBuild` refuses another), so a deployment a build
+ *   started after the newest build was created is that build's.
  */
-export function joinRuns(builds: readonly Build[], deployments: readonly Deployment[]): DeployRun[] {
-  const byId = new Map(deployments.map((deployment) => [deployment.id, deployment]));
+export function joinRuns(
+  builds: readonly Build[],
+  deployments: readonly Deployment[] | undefined,
+): DeployRun[] {
+  const listed = deployments ?? [];
+  const byId = new Map(listed.map((deployment) => [deployment.id, deployment]));
+  const oldestListed = listed.reduce<number | null>((oldest, deployment) => {
+    const created = parseTime(deployment.created_at);
+    return created === null ? oldest : oldest === null ? created : Math.min(oldest, created);
+  }, null);
   const claimed = new Set<string>();
+  const newest = builds[0];
+  const unnamed =
+    newest && newest.deployment_id === null && !buildBroke(newest)
+      ? listed.find(
+          (deployment) =>
+            deployment.trigger === 'build' &&
+            !builds.some((build) => build.deployment_id === deployment.id) &&
+            (parseTime(deployment.created_at) ?? 0) >= (parseTime(newest.created_at) ?? Infinity),
+        )
+      : undefined;
+
   const runs: DeployRun[] = builds.map((build) => {
-    const deployment =
+    let deployment =
       build.deployment_id !== null ? (byId.get(build.deployment_id) ?? null) : null;
+    if (build === newest && unnamed) deployment = unnamed;
     if (deployment) claimed.add(deployment.id);
-    return { key: `build:${build.id}`, build, deployment };
+    const ended = parseTime(build.finished_at) ?? parseTime(build.created_at) ?? 0;
+    const awaiting =
+      deployments !== undefined &&
+      deployment === null &&
+      build.status === 'succeeded' &&
+      build.deployment_id !== null &&
+      (oldestListed === null || ended >= oldestListed);
+    return { key: `build:${build.id}`, build, deployment, awaiting };
   });
-  for (const deployment of deployments) {
+  for (const deployment of listed) {
     if (!claimed.has(deployment.id)) {
-      runs.push({ key: `deployment:${deployment.id}`, build: null, deployment });
+      runs.push({ key: `deployment:${deployment.id}`, build: null, deployment, awaiting: false });
     }
   }
   return runs
@@ -273,8 +319,9 @@ export function runTimeline(
     const buildLive = !isBuildTerminal(build.status);
     steps.push(...blank(buildLive ? 'pending' : 'skipped'));
     state = buildLive ? 'live' : build.status === 'failed' ? 'failed' : 'cancelled';
-  } else if (!deployment && build?.deployment_id == null) {
-    // The build succeeded and the deployment it starts is not named yet.
+  } else if (!deployment && (build?.deployment_id == null || run.awaiting)) {
+    // The build succeeded and the deployment it starts is not named yet, or
+    // not in the deployments read yet.
     steps.push(...blank('pending'));
     state = 'live';
   } else if (!deployment) {
@@ -304,6 +351,38 @@ export function runTimeline(
   const elapsed = Math.max(0, ((end ?? now) - start) / 1_000);
   const recorded = steps.reduce((total, step) => total + (step.seconds ?? 0), 0);
   return { run, kind, state, steps, start, end, elapsed, recorded };
+}
+
+/** True while a run still moves: its build runs, or its deployment is to come or rolls out. */
+export function isRunLive(run: DeployRun | undefined): boolean {
+  if (!run) return false;
+  const { build, deployment } = run;
+  if (build && build.status !== 'succeeded') return !isBuildTerminal(build.status);
+  if (!deployment) return build !== null && (build.deployment_id === null || run.awaiting);
+  return isDeploymentLive(deployment.status);
+}
+
+/** When a run's deployment started; a build's end stands in for one off the page. */
+const deployedAt = (run: DeployRun): number =>
+  parseTime(run.deployment?.created_at ?? run.build?.finished_at) ?? runStart(run);
+
+/**
+ * The deployment the tab calls Active, from the two lists alone: the run
+ * whose deployment started last among those that read as deployed. The
+ * server makes a deployment the app's `current_deployment_id` in the same
+ * write that marks it succeeded, and a newer deployment supersedes every
+ * older one still rolling out, so the newest succeeded deployment is the
+ * current one. Reading it from the lists, not from the app read, keeps one
+ * row Active through a deploy: the old one until the new run itself reads as
+ * deployed. Null when no listed run is deployed.
+ */
+export function activeDeploymentId(timelines: readonly RunTimeline[]): string | null {
+  let active: RunTimeline | null = null;
+  for (const timeline of timelines) {
+    if (timeline.state !== 'succeeded') continue;
+    if (active === null || deployedAt(timeline.run) > deployedAt(active.run)) active = timeline;
+  }
+  return active ? (active.run.deployment?.id ?? active.run.build?.deployment_id ?? null) : null;
 }
 
 /** The step a live run is in: the running one, or the first still to come. */
@@ -629,10 +708,13 @@ export function runSentence(timeline: RunTimeline, replicas = 1): string {
 
 export type RunTagTone = 'shift' | 'run' | 'fault' | 'plain';
 
-/** The tag a run wears in the list: what it is, in one word. */
+/**
+ * The tag a run wears in the list: what it is, in one word. `activeId` is the
+ * deployment the tab reads as current (`activeDeploymentId`).
+ */
 export function runTag(
   timeline: RunTimeline,
-  currentDeploymentId: string | null | undefined,
+  activeId: string | null | undefined,
 ): { word: string; tone: RunTagTone } {
   switch (timeline.state) {
     case 'live':
@@ -640,7 +722,7 @@ export function runTag(
         ? { word: 'Building', tone: 'shift' }
         : { word: 'Deploying', tone: 'shift' };
     case 'succeeded':
-      return (timeline.run.deployment?.id ?? timeline.run.build?.deployment_id) === currentDeploymentId
+      return (timeline.run.deployment?.id ?? timeline.run.build?.deployment_id) === activeId
         ? { word: 'Active', tone: 'run' }
         : { word: 'Removed', tone: 'plain' };
     case 'failed':

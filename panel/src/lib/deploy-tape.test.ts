@@ -7,6 +7,7 @@ import type {
   DeploymentLogEntry,
 } from '../api/generated/model';
 import {
+  activeDeploymentId,
   buildkitSteps,
   buildSpans,
   currentStep,
@@ -14,6 +15,7 @@ import {
   estimateRun,
   formatClock,
   formatSpan,
+  isRunLive,
   joinRuns,
   miniTape,
   miniTapeScale,
@@ -228,8 +230,14 @@ describe('joinRuns', () => {
   });
 
   it('draws a build whose deployment fell off the page as settled, not as deploying', () => {
-    const [run] = joinRuns([build({ deployment_id: 'dep_gone' })], []);
-    const timeline = runTimeline(run!, undefined, ms(9_000));
+    // The page starts after the build ended: its deployment is older than the page.
+    const runs = joinRuns(
+      [build({ deployment_id: 'dep_gone' })],
+      [deployment({ id: 'dep_N', trigger: 'redeploy', created_at: at(900), finished_at: at(905) })],
+    );
+    const run = runs.find((candidate) => candidate.build !== null)!;
+    expect(run.awaiting).toBe(false);
+    const timeline = runTimeline(run, undefined, ms(9_000));
     expect(timeline.state).toBe('succeeded');
     expect(timeline.end).not.toBeNull();
     expect(timeline.steps.slice(2).map((step) => step.state)).toEqual(['skipped', 'skipped', 'skipped', 'skipped']);
@@ -240,6 +248,168 @@ describe('joinRuns', () => {
   it('waits on the deployment a build just started before it is named', () => {
     const [run] = joinRuns([build({ deployment_id: null })], []);
     expect(runTimeline(run!, undefined, ms(9_000)).state).toBe('live');
+  });
+
+  it('waits on a deployment the build names but the deployments read does not have yet', () => {
+    const older = deployment({ id: 'dep_O', trigger: 'build', created_at: at(-300), finished_at: at(-296) });
+    const [run] = joinRuns([build({ deployment_id: 'dep_new', finished_at: at(74) })], [older]);
+    expect(run!.awaiting).toBe(true);
+    const timeline = runTimeline(run!, undefined, ms(75));
+    expect(timeline.state).toBe('live');
+    expect(timeline.steps.slice(2).every((step) => step.state === 'pending')).toBe(true);
+    expect(runSentence(timeline)).toBe('Starting the deployment');
+    expect(runTag(timeline, 'dep_O')).toEqual({ word: 'Deploying', tone: 'shift' });
+    expect(isRunLive(run)).toBe(true);
+    // An empty read predates every deployment; an unread one says nothing.
+    expect(joinRuns([build({ deployment_id: 'dep_new' })], [])[0]!.awaiting).toBe(true);
+    expect(joinRuns([build({ deployment_id: 'dep_new' })], undefined)[0]!.awaiting).toBe(false);
+  });
+
+  it('gives a still-running build the deployment the deployments read already lists for it', () => {
+    const running = build({ id: 'bld_N', status: 'exporting', finished_at: null, deployment_id: null, created_at: at(100) });
+    const earlier = build({ id: 'bld_P', deployment_id: 'dep_P', created_at: at(0) });
+    const runs = joinRuns(
+      [running, earlier],
+      [
+        deployment({ id: 'dep_N', trigger: 'build', status: 'succeeded', created_at: at(160), finished_at: at(162) }),
+        deployment({ id: 'dep_P', trigger: 'build', created_at: at(76), finished_at: at(80) }),
+      ],
+    );
+    expect(runs.map((run) => [run.build?.id ?? null, run.deployment?.id ?? null])).toEqual([
+      ['bld_N', 'dep_N'],
+      ['bld_P', 'dep_P'],
+    ]);
+    // The build still reads as running, so the run does too, whatever its deployment says.
+    expect(runTimeline(runs[0]!, undefined, ms(163)).state).toBe('live');
+    // A deployment the newest build cannot have started stays a run of its own.
+    const apart = joinRuns(
+      [running],
+      [deployment({ id: 'dep_X', trigger: 'build', created_at: at(50), finished_at: at(55) })],
+    );
+    expect(apart.map((run) => [run.build?.id ?? null, run.deployment?.id ?? null])).toEqual([
+      ['bld_N', null],
+      [null, 'dep_X'],
+    ]);
+  });
+});
+
+describe('activeDeploymentId', () => {
+  const timelines = (builds: Build[], deployments: Deployment[] | undefined): RunTimeline[] =>
+    joinRuns(builds, deployments).map((run) => runTimeline(run, undefined, ms(10_000)));
+
+  it('is the deployment that started last among the runs that read as deployed', () => {
+    const list = timelines(
+      [],
+      [
+        deployment({ id: 'dep_F', status: 'failed', phase: 'boot', created_at: at(200), finished_at: at(204) }),
+        deployment({ id: 'dep_B', created_at: at(100), finished_at: at(104) }),
+        deployment({ id: 'dep_A', created_at: at(0), finished_at: at(4) }),
+      ],
+    );
+    expect(activeDeploymentId(list)).toBe('dep_B');
+    expect(activeDeploymentId([])).toBeNull();
+  });
+
+  it('follows the deployment, not the run order, when a redeploy ran during a build', () => {
+    // The build started first and its deployment last, so it is current.
+    const list = timelines(
+      [build({ id: 'bld_A', deployment_id: 'dep_B', created_at: at(0), finished_at: at(60) })],
+      [
+        deployment({ id: 'dep_B', trigger: 'build', created_at: at(61), finished_at: at(64) }),
+        deployment({ id: 'dep_R', trigger: 'redeploy', created_at: at(20), finished_at: at(24) }),
+      ],
+    );
+    expect(list.map((timeline) => timeline.run.deployment?.id)).toEqual(['dep_R', 'dep_B']);
+    expect(activeDeploymentId(list)).toBe('dep_B');
+  });
+});
+
+/**
+ * A Git deploy on a single-node cluster, read as the sheet read it: the builds
+ * and the deployments land at different moments, and the app read (not used
+ * here) at yet another. At every step exactly one row is Active, and it moves
+ * to the new run only once that run reads as deployed.
+ */
+describe('the Deployments tab through a deploy', () => {
+  const previous = build({ id: 'bld_P', deployment_id: 'dep_P', created_at: at(0), started_at: at(1), finished_at: at(6) });
+  const previousDeployment = deployment({ id: 'dep_P', trigger: 'build', created_at: at(6), finished_at: at(8) });
+  const older = deployment({ id: 'dep_O', trigger: 'api', created_at: at(-600), finished_at: at(-596) });
+  const next = (overrides: Partial<Build>) =>
+    build({ id: 'bld_N', created_at: at(300), started_at: at(301), finished_at: null, deployment_id: null, ...overrides });
+  const newDeployment = (overrides: Partial<Deployment>) =>
+    deployment({ id: 'dep_N', trigger: 'build', created_at: at(311), finished_at: null, ...overrides });
+
+  const tab = (builds: Build[], deployments: Deployment[], now: number) => {
+    const list = joinRuns(builds, deployments).map((run) => runTimeline(run, undefined, now));
+    const activeId = activeDeploymentId(list);
+    return {
+      top: `${runTag(list[0]!, activeId).word} | ${runSentence(list[0]!)}`,
+      tags: list.map((timeline) => `${timeline.run.key}: ${runTag(timeline, activeId).word}`),
+      active: list.filter((timeline) => runTag(timeline, activeId).word === 'Active').length,
+    };
+  };
+
+  const steps = [
+    {
+      what: 'the build is queued',
+      builds: [next({ status: 'queued', started_at: null }), previous],
+      deployments: [previousDeployment, older],
+      top: 'Building | Waiting for the node',
+      active: 'build:bld_P',
+    },
+    {
+      what: 'the build exports the image',
+      builds: [next({ status: 'exporting' }), previous],
+      deployments: [previousDeployment, older],
+      top: 'Building | Exporting the image',
+      active: 'build:bld_P',
+    },
+    {
+      what: 'the deployments read lists the new deployment before the builds read ends the build',
+      builds: [next({ status: 'exporting' }), previous],
+      deployments: [newDeployment({ status: 'succeeded', finished_at: at(313) }), previousDeployment, older],
+      top: 'Building | Exporting the image',
+      active: 'build:bld_P',
+    },
+    {
+      what: 'the builds read names a deployment the deployments read does not have yet',
+      builds: [next({ status: 'succeeded', finished_at: at(310), deployment_id: 'dep_N' }), previous],
+      deployments: [previousDeployment, older],
+      top: 'Deploying | Starting the deployment',
+      active: 'build:bld_P',
+    },
+    {
+      what: 'the new deployment rolls out',
+      builds: [next({ status: 'succeeded', finished_at: at(310), deployment_id: 'dep_N' }), previous],
+      deployments: [newDeployment({ status: 'starting', phase: 'boot' }), previousDeployment, older],
+      top: 'Deploying | Starting the deployment',
+      active: 'build:bld_P',
+    },
+    {
+      what: 'the new deployment is current',
+      builds: [next({ status: 'succeeded', finished_at: at(310), deployment_id: 'dep_N' }), previous],
+      deployments: [newDeployment({ status: 'succeeded', finished_at: at(313) }), previousDeployment, older],
+      top: 'Active | Deployed',
+      active: 'build:bld_N',
+    },
+  ];
+
+  for (const step of steps) {
+    it(`keeps one row Active when ${step.what}`, () => {
+      const view = tab(step.builds, step.deployments, ms(312));
+      expect(view.top).toBe(step.top);
+      expect(view.active).toBe(1);
+      expect(view.tags).toContain(`${step.active}: Active`);
+    });
+  }
+
+  it('keeps one row Active through an image redeploy', () => {
+    const current = deployment({ id: 'dep_A', created_at: at(0), finished_at: at(4) });
+    const rolling = deployment({ id: 'dep_R', trigger: 'redeploy', status: 'preparing', phase: 'rootfs', created_at: at(100), finished_at: null });
+    const during = tab([], [rolling, current], ms(102));
+    expect(during.tags).toEqual(['deployment:dep_R: Deploying', 'deployment:dep_A: Active']);
+    const after = tab([], [{ ...rolling, status: 'succeeded', phase: 'health', finished_at: at(104) }, current], ms(105));
+    expect(after.tags).toEqual(['deployment:dep_R: Active', 'deployment:dep_A: Removed']);
   });
 });
 
