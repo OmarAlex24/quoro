@@ -296,6 +296,7 @@
   - [0288: A new-token local grant of a warm app's lease sets the unsettled mark whatever the row reads, which also covers the conversion window](adr/0288-a-new-token-local-grant-of-a-warm-app-s-lease-sets-the.md)
   - [0289: Two readings of D-0268: a maintenance window fails when the raise is not replicated within D/3 plus one margin, and a conversion with no stored duration_ms waits for the raise](adr/0289-two-readings-of-d-0268-a-maintenance-window-fails-when-the.md)
   - [0292: failoverApp answers 202 at once while the grant of a marked lease waits, and the lease shows the wait (grant_pending, grant_waiting_on)](adr/0292-failoverapp-answers-202-at-once-while-the-grant-of-a-marked.md)
+  - [0293: getSetup: a public GET /api/v1/setup answers {required: bool}, whether first-run setup is still open](adr/0293-getsetup-a-public-get-api-v1-setup-answers-required-bool.md)
 
 # Background research
 

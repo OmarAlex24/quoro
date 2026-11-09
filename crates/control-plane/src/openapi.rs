@@ -72,6 +72,7 @@ pub struct RateLimited(Problem);
     security(("bearerAuth" = []), ("sessionCookie" = [])),
     paths(
         crate::api::health::get_health,
+        crate::api::auth::get_setup,
         crate::api::auth::setup,
         crate::api::auth::login,
         crate::api::auth::logout,

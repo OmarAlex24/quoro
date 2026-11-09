@@ -609,6 +609,21 @@ components:
           enum:
             - ok
           description: Fixed liveness value.
+    SetupState:
+      type: object
+      title: SetupState
+      description: |
+        Whether first-run setup is still open (ADR 0293). It carries that one bit
+        and nothing else.
+      required:
+        - required
+      properties:
+        required:
+          type: boolean
+          description: |
+            True while no user exists, so `POST /api/v1/setup` can still create
+            the first owner; false once a user exists, after which setup answers
+            `conflict`.
     SetupRequest:
       type: object
       title: SetupRequest
@@ -6169,6 +6184,32 @@ paths:
         '500':
           $ref: '#/components/responses/Internal'
   /api/v1/setup:
+    get:
+      tags: [health]
+      operationId: getSetup
+      summary: Whether first-run setup is still open
+      description: |
+        Unauthenticated read of one bit: `required` is true while the `users`
+        table is empty and false once a user exists (ADR 0293). It reveals
+        nothing else: no user, no count, no token state. Knowing that a cluster
+        has no owner yet does not let anyone claim it, because
+        `POST /api/v1/setup` still needs the one-time setup token printed on the
+        host (D-0054). Liveness stays on `GET /api/v1/health`, which carries no
+        state.
+      x-quoro-scope: public
+      security: []
+      responses:
+        '200':
+          description: Whether setup is still open.
+          headers:
+            Quoro-Request-Id:
+              $ref: '#/components/headers/QuoroRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SetupState'
+        '500':
+          $ref: '#/components/responses/Internal'
     post:
       tags: [health]
       operationId: setup
