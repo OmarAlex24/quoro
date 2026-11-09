@@ -1,12 +1,12 @@
 # ADR 0280: Every grant of a marked lease waits until every node holds the row's write, the mark is kept in the row, the frozen log is checked again, and removals count only machines not removed (completes ADR 0261)
 
-- **Status:** Accepted; refined by [ADR 0285](0285-a-volume-restore-that-turns-an-expiring-lease-row-local-at.md)
+- **Status:** Accepted; refined by [ADR 0285](0285-a-volume-restore-that-turns-an-expiring-lease-row-local-at.md), [ADR 0295](0295-a-restarted-primary-sends-a-marked-row-s-pending-new-token.md)
 - **Date:** 2026-11-07
 - **Ledger id:** D-0280
 - **Tags:** m5b, leases, contracts, review
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** [ADR 0261](0261-every-node-holds-a-lease-row-s-local-write-before-an.md), [ADR 0285](0285-a-volume-restore-that-turns-an-expiring-lease-row-local-at.md)
+- **Related:** [ADR 0261](0261-every-node-holds-a-lease-row-s-local-write-before-an.md), [ADR 0285](0285-a-volume-restore-that-turns-an-expiring-lease-row-local-at.md), [ADR 0295](0295-a-restarted-primary-sends-a-marked-row-s-pending-new-token.md)
 
 ## Context
 
@@ -139,6 +139,7 @@ _Some wording was changed for the public repository._
 
 - Refines [ADR 0261](0261-every-node-holds-a-lease-row-s-local-write-before-an.md): which grants wait and what the mark covers: while a lease row is marked, every grant of the lease, a new token's included, waits until every node holds the row's newest write; R sets the mark and only the holder's report clears it; the frozen log is checked again; a removal counts only machines not removed; and the side paths listed here are fixed or stated as limits. The rest of [ADR 0261](0261-every-node-holds-a-lease-row-s-local-write-before-an.md) stands.
 - [ADR 0285](0285-a-volume-restore-that-turns-an-expiring-lease-row-local-at.md) refines which writes set the mark and what a raise records: any write that turns a row reading expiring into local, at any token, sets the mark, a volume restore's included; the raise of a marked row's token also sets revoked_at; and the side paths listed here are fixed or stated as limits. The rest of this decision stands.
+- [ADR 0295](0295-a-restarted-primary-sends-a-marked-row-s-pending-new-token.md) refines which marked rows step 4 of 'The holder fenced first' sends a grant for: any marked row whose newest write names the node as holder at a higher token than the node reports, in either mode, or a lease the node does not list. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---
