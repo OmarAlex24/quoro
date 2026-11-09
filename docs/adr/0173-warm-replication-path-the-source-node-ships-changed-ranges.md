@@ -1,12 +1,12 @@
 # ADR 0173: Warm replication path: the source node ships changed ranges straight to the target node over the WireGuard mesh, as BLAKE3-hashed blocks under a per-snapshot manifest; the target applies them to a staging clone and swaps it in only when complete; every message carries the lease token
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0296](0296-spec-mesh-on-the-edge-the-warm-target-s-allow-entry-and-no.md)
 - **Date:** 2026-11-06
 - **Ledger id:** D-0173
 - **Tags:** m5b, sync, node-agent, contracts
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** none
+- **Related:** [ADR 0296](0296-spec-mesh-on-the-edge-the-warm-target-s-allow-entry-and-no.md)
 
 ## Context
 
@@ -22,6 +22,7 @@ _Some wording was changed for the public repository._
 
 ## Consequences
 
+- [ADR 0296](0296-spec-mesh-on-the-edge-the-warm-target-s-allow-entry-and-no.md) refines on which machines a warm volume's target gets the allow rule for the replication port: on any machine, the edge included. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---

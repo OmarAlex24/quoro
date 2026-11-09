@@ -1,12 +1,12 @@
 # ADR 0266: Where the primary takes a voter's mesh endpoint from (node-to-node peers, section 6.9)
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0296](0296-spec-mesh-on-the-edge-the-warm-target-s-allow-entry-and-no.md)
 - **Date:** 2026-11-07
 - **Ledger id:** D-0266
 - **Tags:** m5b, mesh, contracts, warm, voters
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** none
+- **Related:** [ADR 0296](0296-spec-mesh-on-the-edge-the-warm-target-s-allow-entry-and-no.md)
 
 ## Context
 
@@ -37,6 +37,7 @@ _Some wording was changed for the public repository._
 
 ## Consequences
 
+- [ADR 0296](0296-spec-mesh-on-the-edge-the-warm-target-s-allow-entry-and-no.md) refines which peer entries carry an endpoint: on a machine whose only role is edge, the entries for nodes carry no endpoint and no keepalive, as in M5a. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---
