@@ -23,8 +23,11 @@
 //! So the progress fields are null after a primary restart until the nodes
 //! report again.
 //!
-//! Nothing sends `warm` yet: `updateApp` refuses `ha_policy: warm`, so no app
-//! has a warm node.
+//! Which node is the warm node is the warm policy, at the end of this module
+//! ([`warm_availability`], [`repick_warm_nodes`]). Until the last warm PR only
+//! a test-lab build with the dev-only `dev-warm-policy` feature accepts
+//! `ha_policy: warm` (ADR 0277), so in every other build no app has a warm
+//! node.
 
 use crate::AppState;
 use crate::api::apps::{App, HaPolicy, HaUnavailableReason, WarmCopy, WarmState};
@@ -692,9 +695,9 @@ pub(crate) async fn attached_volume(
 /// - with the `node` role;
 /// - other than `volume_node`;
 /// - snapshotting with `reflink` (ADR 0172);
-/// - with a mesh address. Since ADR 0266 a node's endpoint is the source
-///   address of its session, so a connected node has one, and the source can
-///   always reach it when it is picked.
+/// - with a mesh address, without which no pair forms (section 6.13). Two
+///   nodes that are both behind NAT may still never connect; `App.warm` then
+///   shows the copy `syncing` or `failed` (ADR 0266).
 ///
 /// The app's placement does not narrow them (ADR 0275). They are ordered by
 /// how many `warm` apps already keep their copy on each, then by id, so the
@@ -824,7 +827,8 @@ fn lost_for_good(node: Option<(&str, &WarmNodeRow)>, pinned: bool, volume_node: 
 ///
 /// # Errors
 ///
-/// A database error.
+/// A database error reading the `warm` apps; an error on one app is logged
+/// and the others go on.
 pub(crate) async fn repick_warm_nodes(state: &AppState) -> Result<(), ApiError> {
     if !crate::DEV_WARM_POLICY {
         return Ok(());
@@ -833,10 +837,18 @@ pub(crate) async fn repick_warm_nodes(state: &AppState) -> Result<(), ApiError> 
         sqlx::query_scalar("SELECT id FROM apps WHERE ha_policy = 'warm' ORDER BY id")
             .fetch_all(state.store.pool())
             .await?;
+    // One app that fails does not hold back the others; it is tried again at
+    // the next tick.
     for app_id in app_ids {
-        let wake = repick_one(state, &app_id).await?;
-        for node_id in wake {
-            state.hub.node_changed(&node_id);
+        match repick_one(state, &app_id).await {
+            Ok(wake) => {
+                for node_id in wake {
+                    state.hub.node_changed(&node_id);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(app_id, error = ?error, "cannot pick the warm node again");
+            }
         }
     }
     Ok(())

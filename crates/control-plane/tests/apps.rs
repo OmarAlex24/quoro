@@ -1439,6 +1439,17 @@ async fn a_dev_warm_policy_build_picks_another_warm_node_only_for_a_lasting_loss
     assert_eq!(warm["state"], "failed", "{warm}");
     warm::eligible_node(&server, warm::NODE_C, 4).await;
     assert_eq!(sweep().await, on(warm::NODE_C, 0));
+
+    // A `warm` app with no warm node that leaves `warm` still changes
+    // `App.warm`, to null.
+    warm::set_node(&server, warm::NODE_C, "status = 'removed'").await;
+    assert_eq!(sweep().await, (None, 0, 30));
+    let res = patch_app(&owner, &server, app_id, json!({ "ha_policy": "none" })).await;
+    assert_eq!(res.status(), 200, "none: {}", res.text().await.unwrap());
+    assert_eq!(
+        warm::changes(&server, app_id).await.last().unwrap(),
+        &json!(["ha_policy", "warm"])
+    );
 }
 
 /// A node's session with the primary, for the warm policy tests that need
@@ -1665,7 +1676,7 @@ async fn a_dev_warm_policy_build_wakes_the_warm_node_and_prices_its_report() {
     );
 
     // Another node's report of the same volume is not the warm copy.
-    let (_other, mut other_socket) = session::connected_node(&server, &owner, "warm-b", 8).await;
+    let (other, mut other_socket) = session::connected_node(&server, &owner, "warm-b", 8).await;
     session::report_target(&mut other_socket, &volume_id, app_id, 1_000).await;
     session::report_target(&mut socket, &volume_id, app_id, 8_192).await;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -1681,6 +1692,56 @@ async fn a_dev_warm_policy_build_wakes_the_warm_node_and_prices_its_report() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+
+    // A sweep that picks another warm node wakes both: the new one gets its
+    // target entry, and the old one, which reports the copy, a `deleted`
+    // entry (section 5.11).
+    let has = |state: &'static str, target: bool| {
+        let volume_id = volume_id.clone();
+        move |spec: &Value| {
+            spec["volumes"].as_array().is_some_and(|files| {
+                files.iter().any(|file| {
+                    file["volume_id"] == volume_id.as_str()
+                        && file["state"] == state
+                        && (file["warm"]["role"] == "target") == target
+                })
+            })
+        }
+    };
+    warm::set_node(&server, &warm_node, "roles = '[\"edge\"]'").await;
+    quoro_control_plane::sweeper::repick_warm_nodes(&server.state)
+        .await
+        .unwrap();
+    assert_eq!(warm::stored(&server, app_id).await.0, Some(other.clone()));
+    session::spec_where(&mut other_socket, has("present", true)).await;
+    session::spec_where(&mut socket, has("deleted", false)).await;
+
+    // Leaving `warm` wakes the warm node, whose reported copy gets its
+    // `deleted` entry.
+    let res = patch_app(&owner, &server, app_id, json!({ "ha_policy": "none" })).await;
+    assert_eq!(res.status(), 200, "none: {}", res.text().await.unwrap());
+    session::spec_where(&mut other_socket, has("deleted", false)).await;
+}
+
+/// The scheduler spreads warm copies: each app that becomes `warm` gets the
+/// eligible node that keeps the fewest copies, then the lowest id.
+#[cfg(feature = "dev-warm-policy")]
+#[tokio::test]
+async fn a_dev_warm_policy_build_spreads_warm_copies_over_the_nodes() {
+    let (server, owner, node_id, project_id) = setup().await;
+    warm::eligible_node(&server, warm::NODE_A, 2).await;
+    warm::eligible_node(&server, warm::NODE_B, 3).await;
+    let mut picked = Vec::new();
+    for name in ["db-1", "db-2", "db-3"] {
+        let app = create_app_named(&owner, &server, &project_id, name).await;
+        let app_id = app["id"].as_str().unwrap().to_owned();
+        warm::stateful(&server, &app_id, &node_id).await;
+        let res = patch_app(&owner, &server, &app_id, json!({ "ha_policy": "warm" })).await;
+        assert_eq!(res.status(), 200, "warm: {}", res.text().await.unwrap());
+        let updated: Value = res.json().await.unwrap();
+        picked.push(updated["warm"]["node_id"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(picked, [warm::NODE_A, warm::NODE_B, warm::NODE_A]);
 }
 
 async fn create_app_named(

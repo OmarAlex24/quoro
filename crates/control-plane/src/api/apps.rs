@@ -215,11 +215,7 @@ where
 )]
 pub struct WarmSettings {
     /// Pins the warm node; null lets the scheduler pick. Absent: unchanged.
-    #[serde(
-        default,
-        deserialize_with = "nullable",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, deserialize_with = "nullable")]
     #[schema(
         value_type = Option<String>,
         pattern = "^nod_[0-9A-HJKMNP-TV-Z]{26}$",
@@ -1984,8 +1980,8 @@ fn warm_refusal(reason: HaUnavailableReason, has_source: bool) -> ApiError {
 /// - An app that leaves `warm` loses its warm node and the pin, and keeps
 ///   its interval.
 ///
-/// Returns `None` when nothing changed, otherwise the nodes whose snapshots
-/// change: the volume's node and the old and new warm nodes.
+/// Returns `None` when `App.warm` does not change, otherwise the nodes whose
+/// snapshots change: the volume's node and the old and new warm nodes.
 async fn update_warm(
     conn: &mut sqlx::SqliteConnection,
     app_id: &str,
@@ -2061,7 +2057,9 @@ async fn update_warm(
     if warm_now && let Some(interval_s) = settings.and_then(|settings| settings.interval_s) {
         interval = interval_s;
     }
-    if (node.clone(), pinned, interval) == before {
+    // A move into or out of `warm` changes `App.warm` even when the stored
+    // settings stay, as for a `warm` app with no warm node that leaves.
+    if (node.clone(), pinned, interval) == before && warm_now == was_warm {
         return Ok(None);
     }
     sqlx::query(
