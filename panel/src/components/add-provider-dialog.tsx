@@ -72,7 +72,13 @@ function KindPicker({
   };
 
   return (
-    <div role="radiogroup" aria-labelledby="provider-kind" className="seg" onKeyDown={onKeyDown}>
+    <div
+      role="radiogroup"
+      aria-labelledby="provider-kind"
+      // On a phone the three kinds stack, so none has to wrap its name.
+      className="seg max-sm:flex-col max-sm:[&>button]:justify-start max-sm:[&>button]:py-1.5"
+      onKeyDown={onKeyDown}
+    >
       {CREATABLE_KINDS.map((kind) => {
         const Icon = KIND_ICON[kind];
         const on = kind === value;

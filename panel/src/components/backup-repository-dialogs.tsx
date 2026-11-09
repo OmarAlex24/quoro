@@ -45,6 +45,18 @@ const NEW_KEY_NOTE =
 const CONTROL_PLANE_LINE =
   'The cluster database, copied on the primary on this schedule and before every upgrade.';
 
+/** The errors left once `keys` are edited: a field's error goes as soon as it changes. */
+const dropErrors = <E extends Partial<Record<string, string>>>(errors: E, keys: readonly string[]): E => {
+  if (!keys.some((key) => key in errors)) return errors;
+  const next = { ...errors };
+  for (const key of keys) delete next[key];
+  return next;
+};
+
+/** Which of the two schedule numbers an edit changed. */
+const changedNumbers = (before: ScheduleForm, after: ScheduleForm): Array<keyof ScheduleForm> =>
+  (['interval', 'keep'] as const).filter((key) => before[key] !== after[key]);
+
 /** A field's error under its control, as the schedule fields show theirs. */
 function FieldError({ text }: { text: string | undefined }) {
   return text ? <p className="text-[12.5px] text-fault">{text}</p> : null;
@@ -138,7 +150,11 @@ export function CreateRepositoryDialog({
     onClose();
   };
 
-  const update = (patch: Partial<RepositoryForm>) => setForm((current) => ({ ...current, ...patch }));
+  const update = (patch: Partial<RepositoryForm>) => {
+    setForm((current) => ({ ...current, ...patch }));
+    const keys = patch.schedule ? changedNumbers(form.schedule, patch.schedule) : Object.keys(patch);
+    setErrors((current) => dropErrors(current, keys));
+  };
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -340,7 +356,10 @@ export function RepositorySettingsDialog({
               autoComplete="off"
               spellCheck={false}
               disabled={save.isPending}
-              onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))}
+              onChange={(event) => {
+                setForm((current) => ({ ...current, name: event.target.value }));
+                setErrors((current) => dropErrors(current, ['name']));
+              }}
               aria-invalid={errors.name !== undefined}
             />
             <FieldError text={errors.name} />
@@ -350,7 +369,10 @@ export function RepositorySettingsDialog({
             value={form.schedule}
             errors={errors}
             disabled={save.isPending}
-            onChange={(schedule) => setForm((current) => ({ ...current, schedule }))}
+            onChange={(schedule) => {
+              setErrors((current) => dropErrors(current, changedNumbers(form.schedule, schedule)));
+              setForm((current) => ({ ...current, schedule }));
+            }}
           />
           <div className="flex flex-wrap justify-end gap-2 border-t border-line pt-4">
             <Button variant="default" type="button" disabled={save.isPending} onClick={close}>
