@@ -974,8 +974,7 @@ async fn repick_one(state: &AppState, app_id: &str) -> Result<Vec<String>, ApiEr
     .await?;
     let app = crate::api::apps::app_from_row(&app_row)?;
     let actor = crate::changelog::Actor::system("warm");
-    let payload = serde_json::to_value(&app)
-        .map_err(|error| ApiError::internal(&format!("app payload: {error}")))?;
+    let payload = crate::api::apps::app_payload(&mut w.tx, &app).await?;
     crate::changelog::append(
         &mut w.tx,
         &actor,

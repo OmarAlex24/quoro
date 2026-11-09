@@ -14,7 +14,7 @@
 //! `local` lease, which the VM spec echoes (section 8.3).
 
 use crate::AppState;
-use crate::api::apps::{APP_COLUMNS, AppPlacement, app_from_row, app_target};
+use crate::api::apps::{APP_COLUMNS, AppPlacement, app_from_row, app_payload, app_target};
 use crate::api::volumes::{
     CreateVolumeRequest, VOLUME_COLUMNS, Volume, VolumeList, VolumeState, volume_from_row,
     volume_target,
@@ -334,9 +334,8 @@ pub(crate) async fn create_volume(
         .bind(app_id)
         .execute(&mut *w.tx)
         .await?;
-    let app_payload = serde_json::to_value(&app)
-        .map_err(|error| ApiError::internal(&format!("app payload: {error}")))?;
-    changelog::append(&mut w.tx, &actor, "app", app_id, Op::Update, app_payload).await?;
+    let payload = app_payload(&mut w.tx, &app).await?;
+    changelog::append(&mut w.tx, &actor, "app", app_id, Op::Update, payload).await?;
     events::emit(
         &mut w.tx,
         NewEvent {
@@ -644,8 +643,7 @@ pub(crate) async fn clear_stateful(
     .bind(app_id)
     .execute(&mut *conn)
     .await?;
-    let payload = serde_json::to_value(&app)
-        .map_err(|error| ApiError::internal(&format!("app payload: {error}")))?;
+    let payload = app_payload(conn, &app).await?;
     changelog::append(conn, actor, "app", app_id, Op::Update, payload).await?;
     Ok(true)
 }

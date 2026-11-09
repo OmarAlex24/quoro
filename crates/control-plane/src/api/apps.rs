@@ -842,6 +842,38 @@ impl ListAppsQuery {
     }
 }
 
+/// An app's change-log payload (`db-schema.sql` header, ADR 0286): the `App`
+/// fields with `warm` null, since `App.warm` is derived on read, and beside
+/// them the three columns `App` has no field of its own for (migration 0011):
+/// `warm_node_id`, `warm_node_pinned` and `warm_interval_s`. They are read in
+/// the caller's transaction, so they are the values it wrote. A primary
+/// rebuilt from the log then keeps each app's warm node, pin and interval.
+///
+/// # Errors
+///
+/// A database error, or an app that cannot be serialized.
+pub(crate) async fn app_payload(
+    conn: &mut sqlx::SqliteConnection,
+    app: &App,
+) -> Result<Value, ApiError> {
+    let (node_id, pinned, interval_s): (Option<String>, i64, i64) = sqlx::query_as(
+        "SELECT warm_node_id, warm_node_pinned, warm_interval_s FROM apps WHERE id = ?",
+    )
+    .bind(&app.id)
+    .fetch_one(&mut *conn)
+    .await?;
+    let mut payload = serde_json::to_value(app)
+        .map_err(|error| ApiError::internal(&format!("app payload: {error}")))?;
+    let fields = payload
+        .as_object_mut()
+        .ok_or_else(|| ApiError::internal(&"an app payload is not an object"))?;
+    fields.insert("warm".to_string(), Value::Null);
+    fields.insert("warm_node_id".to_string(), json!(node_id));
+    fields.insert("warm_node_pinned".to_string(), json!(pinned != 0));
+    fields.insert("warm_interval_s".to_string(), json!(interval_s));
+    Ok(payload)
+}
+
 /// Builds an [`App`] from an `apps` row.
 pub(crate) fn app_from_row(row: &SqliteRow) -> Result<App, ApiError> {
     let ha_policy: String = row.try_get("ha_policy")?;
@@ -1557,8 +1589,7 @@ async fn insert_app(
     .await?;
 
     let actor = ctx.identity.actor();
-    let payload = serde_json::to_value(&app)
-        .map_err(|error| ApiError::internal(&format!("app payload: {error}")))?;
+    let payload = app_payload(&mut w.tx, &app).await?;
     let change_seq =
         changelog::append(&mut w.tx, &actor, "app", &app.id, Op::Create, payload).await?;
     events::emit(
@@ -1905,8 +1936,7 @@ async fn update_app_tx(
             vm_ids.extend(deploy::scale(&mut w.tx, app_id, app.replicas).await?);
         }
         let actor = ctx.identity.actor();
-        let payload = serde_json::to_value(&app)
-            .map_err(|error| ApiError::internal(&format!("app payload: {error}")))?;
+        let payload = app_payload(&mut w.tx, &app).await?;
         let change_seq =
             changelog::append(&mut w.tx, &actor, "app", app_id, Op::Update, payload).await?;
         events::emit(

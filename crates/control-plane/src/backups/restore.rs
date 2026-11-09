@@ -20,7 +20,7 @@
 //! instances back in the desired state of the node they are on.
 
 use crate::AppState;
-use crate::api::apps::{APP_COLUMNS, AppPlacement, AppStatus, app_from_row};
+use crate::api::apps::{APP_COLUMNS, AppPlacement, AppStatus, app_from_row, app_payload};
 use crate::api::backups::{
     BACKUP_COLUMNS, BackupRecord, BackupSourceKind, BackupStatus, backup_from_row, backup_target,
 };
@@ -401,16 +401,8 @@ async fn restore_ready(
     .bind(&app.id)
     .execute(&mut *w.tx)
     .await?;
-    changelog::append(
-        &mut w.tx,
-        &actor,
-        "app",
-        &app.id,
-        Op::Update,
-        serde_json::to_value(&app)
-            .map_err(|error| ApiError::internal(&format!("app payload: {error}")))?,
-    )
-    .await?;
+    let payload = app_payload(&mut w.tx, &app).await?;
+    changelog::append(&mut w.tx, &actor, "app", &app.id, Op::Update, payload).await?;
     let other_node_ids = move_vms(&mut w.tx, &app.id, node_id, &actor).await?;
 
     events::emit(
