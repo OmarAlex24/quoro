@@ -762,7 +762,24 @@ fn schema_list_audit() -> Value {
                     "description": "Only records that belong to this incident."
                 }),
             ),
+            (
+                "order",
+                json!({
+                    "type": "string",
+                    "enum": ["asc", "desc"],
+                    "default": "asc",
+                    "description": "Order of the page by `seq`, `asc` (oldest first) or `desc` (newest first)."
+                }),
+            ),
             ("after_seq", after_seq()),
+            (
+                "before_seq",
+                json!({
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Return only entries whose `seq` is less than this value."
+                }),
+            ),
             ("limit", limit()),
             ("cursor", cursor()),
         ],

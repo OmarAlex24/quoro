@@ -53,36 +53,74 @@ fn limit_of(query: &ListAuditQuery) -> Result<i64, ApiError> {
     }
 }
 
-/// The `seq` the page starts after: the larger of `after_seq` and the cursor.
-fn after_of(query: &ListAuditQuery) -> Result<i64, ApiError> {
+/// The `seq` window one page reads, `after < seq < before`, and its order
+/// (ADR 0283).
+struct Window {
+    after: i64,
+    before: Option<i64>,
+    newest_first: bool,
+}
+
+/// `order`, `after_seq`, `before_seq` and the cursor as the page's window.
+/// The cursor is the `seq` of the last record of the previous page: oldest
+/// first the page continues after it, so it narrows `after_seq`; newest first
+/// it continues before it, so it narrows `before_seq`. A window that holds no
+/// `seq` is not an error: it reads an empty page.
+fn window_of(query: &ListAuditQuery) -> Result<Window, ApiError> {
+    let newest_first = match query.order.as_deref() {
+        None | Some("asc") => false,
+        Some("desc") => true,
+        Some(order) => {
+            return Err(ApiError::validation(format!(
+                "order {order:?} is not asc or desc"
+            )));
+        }
+    };
     let after_seq = query.after_seq.unwrap_or(0);
     if after_seq < 0 {
         return Err(ApiError::validation("after_seq must not be negative"));
     }
+    if query.before_seq.is_some_and(|before_seq| before_seq < 1) {
+        return Err(ApiError::validation("before_seq must be at least 1"));
+    }
     let cursor = match query.cursor.as_deref() {
-        None | Some("") => 0,
-        Some(cursor) => cursor.parse::<i64>().map_err(|_| {
+        None | Some("") => None,
+        Some(cursor) => Some(cursor.parse::<i64>().map_err(|_| {
             ApiError::validation(format!("cursor {cursor:?} is not a sequence number"))
-        })?,
+        })?),
     };
-    Ok(cursor.max(after_seq))
+    Ok(if newest_first {
+        Window {
+            after: after_seq,
+            before: [query.before_seq, cursor].into_iter().flatten().min(),
+            newest_first,
+        }
+    } else {
+        Window {
+            after: cursor.unwrap_or(0).max(after_seq),
+            before: query.before_seq,
+            newest_first,
+        }
+    })
 }
 
-/// Lists one page of audit records, oldest first. The page cursor is computed
-/// from the unfiltered rows, then the page is filtered for an agent's
-/// selector, so a filtered page never ends the listing early.
+/// Lists one page of audit records, oldest first, or newest first with
+/// `order=desc` (ADR 0283). The filters select the same records in both
+/// orders. The page cursor is computed from the unfiltered rows, then the
+/// page is filtered for an agent's selector, so a filtered page never ends
+/// the listing early.
 ///
 /// # Errors
 ///
 /// `forbidden` without `audit:read`, `validation_failed` for a bad limit,
-/// cursor, filter or result value, or a database error.
+/// cursor, order, bound, filter or result value, or a database error.
 pub async fn list_audit(
     state: &AppState,
     ctx: &CallCtx,
     query: &ListAuditQuery,
 ) -> Result<AuditList, ApiError> {
     let limit = limit_of(query)?;
-    let after = after_of(query)?;
+    let window = window_of(query)?;
     if let Some(result) = query.result.as_deref()
         && !matches!(result, "ok" | "refused" | "error")
     {
@@ -95,7 +133,9 @@ pub async fn list_audit(
         "target_id": query.target_id,
         "result": query.result,
         "incident_id": query.incident_id,
+        "order": query.order,
         "after_seq": query.after_seq,
+        "before_seq": query.before_seq,
         "limit": query.limit,
         "cursor": query.cursor,
     });
@@ -103,16 +143,20 @@ pub async fn list_audit(
         .authorize_read(state, Scope::AuditRead, None, &params)
         .await?;
     let result: Result<_, ApiError> = async {
+        let direction = if window.newest_first { "DESC" } else { "ASC" };
         let rows = sqlx::query(&format!(
             "SELECT {} FROM audit_log WHERE seq > ? \
+             AND (? IS NULL OR seq < ?) \
              AND (? IS NULL OR actor_id = ?) \
              AND (? IS NULL OR target_id = ?) \
              AND (? IS NULL OR result = ?) \
              AND (? IS NULL OR incident_id = ?) \
-             ORDER BY seq LIMIT ?",
+             ORDER BY seq {direction} LIMIT ?",
             audit::COLUMNS
         ))
-        .bind(after)
+        .bind(window.after)
+        .bind(window.before)
+        .bind(window.before)
         .bind(&query.actor_id)
         .bind(&query.actor_id)
         .bind(&query.target_id)
