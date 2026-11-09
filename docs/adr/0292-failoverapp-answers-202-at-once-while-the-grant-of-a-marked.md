@@ -1,12 +1,12 @@
 # ADR 0292: failoverApp answers 202 at once while the grant of a marked lease waits, and the lease shows the wait (grant_pending, grant_waiting_on)
 
-- **Status:** Accepted; refined by [ADR 0295](0295-a-restarted-primary-sends-a-marked-row-s-pending-new-token.md)
+- **Status:** Accepted; refined by [ADR 0295](0295-a-restarted-primary-sends-a-marked-row-s-pending-new-token.md), [ADR 0303](0303-failoverapp-before-the-primary-can-send-a-held-grant-what-a.md)
 - **Date:** 2026-11-09
 - **Ledger id:** D-0292
 - **Tags:** m5b, leases, contracts, warm, failover
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** [ADR 0285](0285-a-volume-restore-that-turns-an-expiring-lease-row-local-at.md), [ADR 0295](0295-a-restarted-primary-sends-a-marked-row-s-pending-new-token.md)
+- **Related:** [ADR 0285](0285-a-volume-restore-that-turns-an-expiring-lease-row-local-at.md), [ADR 0295](0295-a-restarted-primary-sends-a-marked-row-s-pending-new-token.md), [ADR 0303](0303-failoverapp-before-the-primary-can-send-a-held-grant-what-a.md)
 
 ## Context
 
@@ -131,6 +131,7 @@ _Some wording was changed for the public repository._
 
 - Refines [ADR 0285](0285-a-volume-restore-that-turns-an-expiring-lease-row-local-at.md): how failoverApp answers while a marked lease's grant waits: 202 at once, with the wait shown in Lease.grant_pending and Lease.grant_waiting_on. The rest of [ADR 0285](0285-a-volume-restore-that-turns-an-expiring-lease-row-local-at.md) stands.
 - [ADR 0295](0295-a-restarted-primary-sends-a-marked-row-s-pending-new-token.md) refines what a primary restart does to a failover's waiting grant: the grant is sent at the warm node's next session start, and grant_pending is true again until then. The rest of this decision stands.
+- [ADR 0303](0303-failoverapp-before-the-primary-can-send-a-held-grant-what-a.md) refines which failovers wait under the mark, and how long failoverApp stays open for a connected source: through the gate wait after the revoke is answered, then it commits or answers no_support. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---
