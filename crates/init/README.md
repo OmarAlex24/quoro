@@ -266,10 +266,28 @@ The listener never writes to the app's stdout or to its log console;
 diagnostics go only to `/dev/ttyS0`.
 
 One connection is one session, and the first frame must be `OPEN` (JSON
-`{"argv":[...],"user":null|"...","rows":R,"cols":C}`). Any other first frame, a
-malformed or oversized frame, or an unknown type answers `ERROR` when the
-connection still allows it and closes. At most 16 sessions run at once; the
-next connection is refused with `ERROR` "too many sessions".
+`{"argv":[...],"user":null|"...","rows":R,"cols":C}`) or `SYNC` (below). Any
+other first frame, a malformed or oversized frame, or an unknown type answers
+`ERROR` when the connection still allows it and closes. At most 16 sessions,
+PTY and sync sessions together, run at once; the next connection is refused
+with `ERROR` "too many sessions".
+
+**Sync sessions (ADR 0282).** The engine flushes a volume's filesystem before
+it snapshots the volume file on the host, so the snapshot holds what the app
+wrote without `fsync` (`engine-trait.md` sections 3.16 and 6). The first and
+only frame is `SYNC` (type 5, JSON `{"serials":["quoro-vol-0",...]}`: one to 64
+distinct volume serials, no other member). For each serial in order, the init
+opens that volume's mount path from the configuration, at that moment, and
+calls `syncfs` on it. It then answers `SYNCED` (type 132, no payload) and
+closes. A serial the configuration lacks, a mount path it cannot open, or a
+`syncfs` that fails answers `ERROR` with the reason and closes. A sync session
+starts no program, allocates no PTY, reads no frame after the `SYNC`, and
+writes nothing to the app's console. A failure is logged on the serial console
+only the first time, or when its reason changes, so a sync every few seconds
+cannot push the boot output out of the serial ring. A `SYNC` after an `OPEN`
+ends that PTY session with `ERROR`. An init older than ADR 0282 answers a
+`SYNC` with `ERROR` "the first frame must be open, got type 5", which the engine
+reads as an init that cannot flush.
 
 Per session:
 

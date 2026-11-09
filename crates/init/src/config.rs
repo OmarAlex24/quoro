@@ -867,7 +867,7 @@ fn validate_workdir(workdir: &str) -> Result<(), String> {
 
 /// A volume serial is `quoro-vol-` followed by one or more ASCII digits; no
 /// sign, no whitespace, at least one digit.
-fn validate_volume_serial(serial: &str) -> Result<(), String> {
+pub(crate) fn validate_volume_serial(serial: &str) -> Result<(), String> {
     let Some(number) = serial.strip_prefix(SERIAL_VOLUME_PREFIX) else {
         return Err(format!("must start with {SERIAL_VOLUME_PREFIX:?}"));
     };

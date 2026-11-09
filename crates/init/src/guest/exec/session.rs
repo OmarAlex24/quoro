@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! One exec session: read the open, allocate a PTY, start the program through
-//! the helper, relay both directions, report the exit.
+//! the helper, relay both directions, report the exit. Or, when the first
+//! frame is a sync (ADR 0282), one sync session: `syncfs` on each named
+//! volume's mount and one `SYNCED` or `ERROR` answer, with no program and no
+//! PTY.
 //!
 //! The relay is generic over the connection ([`SessionIo`]) so the tests can
 //! run a real PTY and real programs over `UnixStream::pair()` without a vsock
@@ -26,7 +29,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use quoro_init::exec::{FrameReader, GuestFrame, HostFrame, MAX_PAYLOAD, OPEN, OpenRequest};
+use quoro_init::exec::{
+    FrameReader, GuestFrame, HostFrame, MAX_PAYLOAD, OPEN, OpenRequest, SYNC, SyncRequest,
+};
 use rustix::fs::{Mode, OFlags};
 #[cfg(test)]
 use rustix::io::Errno;
@@ -102,11 +107,16 @@ pub(super) fn close_stream<S: SessionIo>(stream: &S) {
 }
 
 /// What every session of this VM shares: the app's environment, working
-/// directory and identity.
+/// directory and identity, its volumes for sync sessions, and the reason of
+/// the last sync that failed.
 pub(super) struct Context {
     env: Vec<(String, String)>,
     workdir: Option<String>,
     identity: Identity,
+    /// `(serial, mount_path)` of every volume in the configuration.
+    volumes: Vec<(String, String)>,
+    /// The reason of the last failed sync, cleared by a sync that succeeds.
+    sync_failure: Mutex<Option<String>>,
 }
 
 impl Context {
@@ -115,7 +125,34 @@ impl Context {
             env: config.env.clone(),
             workdir: config.workdir.clone(),
             identity: identity.clone(),
+            volumes: config
+                .volumes
+                .iter()
+                .map(|volume| (volume.serial.clone(), volume.mount_path.clone()))
+                .collect(),
+            sync_failure: Mutex::new(None),
         }
+    }
+
+    /// Records a sync's result. A failure is logged on the serial console
+    /// only when it is the first one or its reason changed, so a sync every
+    /// few seconds that keeps failing does not push the boot output out of
+    /// the serial ring (`engine-trait.md` section 6). Returns whether it was
+    /// logged.
+    fn note_sync(&self, failure: Option<&str>) -> bool {
+        let Ok(mut last) = self.sync_failure.lock() else {
+            return false;
+        };
+        let Some(reason) = failure else {
+            *last = None;
+            return false;
+        };
+        if last.as_deref() == Some(reason) {
+            return false;
+        }
+        diag::log(&format!("exec: {reason}"));
+        *last = Some(reason.to_string());
+        true
     }
 }
 
@@ -161,6 +198,11 @@ pub(super) fn serve<S: SessionIo>(stream: S, context: &Context, helper: &Helper,
     let mut frames = FrameReader::new();
     let request = match read_open(&mut reader, &mut frames) {
         Opened::Request(request) => request,
+        Opened::Sync(request) => {
+            // A sync is the session's only frame: nothing after it is read.
+            serve_sync(&request, context, &sink);
+            return;
+        }
         Opened::Closed => return,
         Opened::Bad(message) => {
             sink.error(&message);
@@ -333,15 +375,17 @@ pub(super) fn serve<S: SessionIo>(stream: S, context: &Context, helper: &Helper,
 /// How the first frame was read.
 enum Opened {
     Request(OpenRequest),
+    /// A sync session (ADR 0282).
+    Sync(SyncRequest),
     /// The host closed before the open completed; there is nobody to answer.
     Closed,
     /// The host broke the format; the message goes back as `ERROR`.
     Bad(String),
 }
 
-/// Read frames until the open arrives. Any other first frame, a malformed or
-/// oversized one, is refused; extra bytes already buffered stay in `frames`
-/// for the relay.
+/// Read frames until the open or the sync arrives. Any other first frame, a
+/// malformed or oversized one, is refused; extra bytes already buffered stay
+/// in `frames` for the relay.
 fn read_open<R: Read>(reader: &mut R, frames: &mut FrameReader) -> Opened {
     let mut chunk = [0_u8; 8192];
     loop {
@@ -357,14 +401,17 @@ fn read_open<R: Read>(reader: &mut R, frames: &mut FrameReader) -> Opened {
                 frames.push(&chunk[..read]);
                 match frames.next_frame() {
                     Ok(Some((kind, payload))) => {
-                        if kind != OPEN {
+                        if kind != OPEN && kind != SYNC {
                             return Opened::Bad(format!(
-                                "the first frame must be open, got type {kind}"
+                                "the first frame must be open or sync, got type {kind}"
                             ));
                         }
                         return match HostFrame::decode(kind, &payload) {
                             Ok(HostFrame::Open(request)) => Opened::Request(request),
-                            Ok(_) => Opened::Bad("the first frame is not an open".to_string()),
+                            Ok(HostFrame::Sync(request)) => Opened::Sync(request),
+                            Ok(_) => {
+                                Opened::Bad("the first frame is not an open or a sync".to_string())
+                            }
                             Err(err) => Opened::Bad(err.to_string()),
                         };
                     }
@@ -376,6 +423,43 @@ fn read_open<R: Read>(reader: &mut R, frames: &mut FrameReader) -> Opened {
             Err(_) => return Opened::Closed,
         }
     }
+}
+
+/// A sync session (ADR 0282, `engine-trait.md` section 6): `syncfs` on the
+/// mount of each named volume, in order, then `SYNCED`; or `ERROR` with the
+/// first reason. It starts no program, allocates no PTY and writes nothing to
+/// the app's console.
+fn serve_sync<S: SessionIo>(request: &SyncRequest, context: &Context, sink: &Sink<S>) {
+    match sync_volumes(&request.serials, &context.volumes) {
+        Ok(()) => {
+            context.note_sync(None);
+            sink.finish(&GuestFrame::Synced);
+        }
+        Err(reason) => {
+            context.note_sync(Some(&reason));
+            sink.error(&reason);
+        }
+    }
+    sink.shutdown();
+}
+
+/// `syncfs` on each serial's mount path, opened now, so a path the app
+/// remounted or the init unmounted is seen as it is at this moment.
+fn sync_volumes(serials: &[String], volumes: &[(String, String)]) -> Result<(), String> {
+    for serial in serials {
+        let Some((_, path)) = volumes.iter().find(|(known, _)| known == serial) else {
+            return Err(format!("sync: no volume {serial} in the configuration"));
+        };
+        let directory = rustix::fs::open(
+            path.as_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|err| format!("sync: open {path} of {serial}: {err}"))?;
+        rustix::fs::syncfs(&directory)
+            .map_err(|err| format!("sync: syncfs {path} of {serial}: {err}"))?;
+    }
+    Ok(())
 }
 
 /// Host frames to the PTY. Returns when the host closes, drops the connection,
@@ -434,6 +518,11 @@ fn handle_frames<S: SessionIo>(
                 }
                 Ok(HostFrame::Open(_)) => {
                     sink.error("the open frame may appear only once");
+                    hangup(pid);
+                    return false;
+                }
+                Ok(HostFrame::Sync(_)) => {
+                    sink.error("a sync frame may only be a session's first frame");
                     hangup(pid);
                     return false;
                 }
@@ -670,6 +759,8 @@ mod tests {
                 gid: rustix::process::getgid().as_raw(),
                 home: "/".to_string(),
             },
+            volumes: Vec::new(),
+            sync_failure: Mutex::new(None),
         }
     }
 
@@ -700,6 +791,7 @@ mod tests {
         output: Vec<u8>,
         exit: Option<i32>,
         error: Option<String>,
+        synced: bool,
     }
 
     impl Client {
@@ -713,6 +805,7 @@ mod tests {
                 output: Vec::new(),
                 exit: None,
                 error: None,
+                synced: false,
             }
         }
 
@@ -743,6 +836,7 @@ mod tests {
                                 Ok(GuestFrame::Output(bytes)) => self.output.extend(bytes),
                                 Ok(GuestFrame::Exit(code)) => self.exit = Some(code),
                                 Ok(GuestFrame::Error(message)) => self.error = Some(message),
+                                Ok(GuestFrame::Synced) => self.synced = true,
                                 Err(err) => panic!("decode: {err}"),
                             },
                             Ok(None) => return true,
@@ -847,6 +941,157 @@ mod tests {
         let mut client = start(&["/no/such/program"], 24, 80);
         client.wait_for_output("quoro-init: /no/such/program: not found");
         assert_eq!(client.finish(), 127);
+    }
+
+    /// A directory of its own for one test, removed when dropped.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("quoro-init-sync-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap_or_else(|err| panic!("mkdir: {err}"));
+            Self(path)
+        }
+
+        fn path(&self) -> String {
+            self.0.to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A sync session over a socket pair: sends the sync and reads until the
+    /// guest closes. Returns the `SYNCED` flag and the `ERROR` message.
+    fn sync(volumes: &[(&str, &str)], first: &[u8]) -> (bool, Option<String>, Arc<Context>) {
+        let (host, guest) = UnixStream::pair().unwrap_or_else(|err| panic!("pair: {err}"));
+        let mut context = test_context();
+        context.volumes = volumes
+            .iter()
+            .map(|(serial, path)| ((*serial).to_string(), (*path).to_string()))
+            .collect();
+        let context = Arc::new(context);
+        let shared = Arc::clone(&context);
+        let helper = test_helper();
+        let served = thread::spawn(move || serve(guest, &shared, &helper, Wait::Direct));
+        let mut client = Client::new(host);
+        client.send_raw(first);
+        while client.pump() {}
+        served
+            .join()
+            .unwrap_or_else(|_| panic!("the session panicked"));
+        assert!(client.output.is_empty(), "a sync session writes no output");
+        assert_eq!(client.exit, None, "a sync session runs no program");
+        (client.synced, client.error, context)
+    }
+
+    fn sync_frame(serials: &[&str]) -> Vec<u8> {
+        HostFrame::Sync(SyncRequest {
+            serials: serials.iter().map(|serial| (*serial).to_string()).collect(),
+        })
+        .encode()
+        .unwrap_or_else(|err| panic!("encode: {err}"))
+    }
+
+    #[test]
+    fn a_sync_session_flushes_each_named_volume_and_answers_synced() {
+        let data = TempDir::new("data");
+        let uploads = TempDir::new("uploads");
+        let (synced, error, context) = sync(
+            &[
+                ("quoro-vol-0", &data.path()),
+                ("quoro-vol-1", &uploads.path()),
+            ],
+            &sync_frame(&["quoro-vol-1", "quoro-vol-0"]),
+        );
+        assert!(synced, "error: {error:?}");
+        assert_eq!(error, None);
+        assert_eq!(
+            context.sync_failure.lock().map(|last| last.clone()).ok(),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn a_sync_session_reads_nothing_after_the_sync() {
+        let data = TempDir::new("after");
+        let mut first = sync_frame(&["quoro-vol-0"]);
+        first.extend(
+            HostFrame::Input(b"ignored".to_vec())
+                .encode()
+                .unwrap_or_default(),
+        );
+        let (synced, error, _) = sync(&[("quoro-vol-0", &data.path())], &first);
+        assert!(synced, "error: {error:?}");
+    }
+
+    #[test]
+    fn a_sync_of_a_volume_the_configuration_lacks_is_an_error() {
+        let data = TempDir::new("lacks");
+        let (synced, error, context) = sync(
+            &[("quoro-vol-0", &data.path())],
+            &sync_frame(&["quoro-vol-0", "quoro-vol-7"]),
+        );
+        assert!(!synced);
+        let message = error.unwrap_or_default();
+        assert!(message.contains("quoro-vol-7"), "{message:?}");
+        assert_eq!(
+            context.sync_failure.lock().map(|last| last.clone()).ok(),
+            Some(Some(message))
+        );
+    }
+
+    #[test]
+    fn a_sync_whose_mount_path_is_gone_is_an_error() {
+        let gone = TempDir::new("gone");
+        let path = gone.path();
+        drop(gone);
+        let (synced, error, _) = sync(&[("quoro-vol-0", &path)], &sync_frame(&["quoro-vol-0"]));
+        assert!(!synced);
+        let message = error.unwrap_or_default();
+        assert!(message.contains(&path), "{message:?}");
+    }
+
+    #[test]
+    fn a_malformed_sync_is_an_error() {
+        let mut empty = vec![SYNC];
+        let payload = br#"{"serials":[]}"#;
+        empty.extend_from_slice(&u32::try_from(payload.len()).unwrap_or(0).to_be_bytes());
+        empty.extend_from_slice(payload);
+        let (synced, error, _) = sync(&[], &empty);
+        assert!(!synced);
+        assert!(error.is_some());
+    }
+
+    #[test]
+    fn a_sync_after_the_open_is_an_error() {
+        let mut client = start(&["/bin/sh", "-c", "read line; echo never"], 24, 80);
+        client.send(HostFrame::Sync(SyncRequest {
+            serials: vec!["quoro-vol-0".to_string()],
+        }));
+        let message = client.finish_error();
+        assert!(message.contains("first frame"), "{message:?}");
+    }
+
+    #[test]
+    fn a_failing_sync_is_logged_once_per_reason() {
+        let context = test_context();
+        assert!(context.note_sync(Some("sync: syncfs /data of quoro-vol-0: EIO")));
+        assert!(
+            !context.note_sync(Some("sync: syncfs /data of quoro-vol-0: EIO")),
+            "the same reason again is not logged"
+        );
+        assert!(context.note_sync(Some("sync: no volume quoro-vol-3 in the configuration")));
+        assert!(!context.note_sync(None), "a success is never logged");
+        assert!(
+            context.note_sync(Some("sync: no volume quoro-vol-3 in the configuration")),
+            "a failure after a success is logged again"
+        );
     }
 
     #[test]

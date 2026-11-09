@@ -1,18 +1,22 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The exec channel between the engine and the init (`engine-trait.md`
-//! section 6, ADR 0113): one vsock connection is one PTY session.
+//! section 6, ADR 0113): one vsock connection is one session, a PTY session
+//! or, from ADR 0282, a sync session.
 //!
 //! Every frame is `[u8 type][u32 length, big-endian][payload]`, with a payload
 //! of at most [`MAX_PAYLOAD`] bytes. A larger or unknown frame ends the
 //! session. Host to guest: [`OPEN`] (JSON, exactly once, first), [`INPUT`],
-//! [`RESIZE`] (`u16 rows`, `u16 cols`, big-endian), [`CLOSE`]. Guest to host:
-//! [`OUTPUT`], [`EXIT`] (`i32`, big-endian, `128 + signal` when a signal ended
-//! the program), [`ERROR`] (UTF-8 message; the guest then closes).
+//! [`RESIZE`] (`u16 rows`, `u16 cols`, big-endian), [`CLOSE`], and [`SYNC`]
+//! (JSON, first and only, in place of the open). Guest to host: [`OUTPUT`],
+//! [`EXIT`] (`i32`, big-endian, `128 + signal` when a signal ended the
+//! program), [`ERROR`] (UTF-8 message; the guest then closes), and [`SYNCED`]
+//! (no payload; the guest then closes).
 //!
 //! Both sides use this module, so there is one copy of the format. It has no
-//! dependencies: the open request's JSON is written and read by hand, and the
-//! reader accepts exactly the shape the writer produces plus insignificant
-//! whitespace, so a malformed open is refused rather than guessed at.
+//! dependencies: the JSON of the open and sync requests is written and read by
+//! hand, and the reader accepts exactly the shape the writer produces plus
+//! insignificant whitespace, so a malformed request is refused rather than
+//! guessed at.
 
 use std::fmt;
 
@@ -24,12 +28,18 @@ pub const INPUT: u8 = 2;
 pub const RESIZE: u8 = 3;
 /// Host to guest: end the session (`SIGHUP` to its process group).
 pub const CLOSE: u8 = 4;
+/// Host to guest: flush the named volumes' filesystems, JSON, first and only
+/// frame of a sync session (ADR 0282).
+pub const SYNC: u8 = 5;
 /// Guest to host: bytes the program wrote to its terminal.
 pub const OUTPUT: u8 = 129;
 /// Guest to host: the program's exit code, `i32` big-endian.
 pub const EXIT: u8 = 130;
 /// Guest to host: a UTF-8 message; the guest closes after it.
 pub const ERROR: u8 = 131;
+/// Guest to host: every volume the sync named was flushed; no payload, and the
+/// guest closes after it (ADR 0282).
+pub const SYNCED: u8 = 132;
 
 /// Bytes of a frame header: the type and the big-endian length.
 pub const HEADER_LEN: usize = 5;
@@ -44,6 +54,8 @@ pub const MAX_ARG_BYTES: usize = 4096;
 pub const MAX_USER_BYTES: usize = 64;
 /// The largest `rows` or `cols` value.
 pub const MAX_DIMENSION: u16 = 1000;
+/// The most serials a sync request may name.
+pub const MAX_SYNC_SERIALS: usize = 64;
 
 /// A frame or an open request that breaks the format.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,6 +83,13 @@ pub struct OpenRequest {
     pub cols: u16,
 }
 
+/// What the host asks for in a sync session (ADR 0282).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyncRequest {
+    /// One to [`MAX_SYNC_SERIALS`] volume serials, `quoro-vol-<n>`, each once.
+    pub serials: Vec<String>,
+}
+
 /// A frame the host sends.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostFrame {
@@ -78,6 +97,7 @@ pub enum HostFrame {
     Input(Vec<u8>),
     Resize { rows: u16, cols: u16 },
     Close,
+    Sync(SyncRequest),
 }
 
 /// A frame the guest sends.
@@ -86,6 +106,7 @@ pub enum GuestFrame {
     Output(Vec<u8>),
     Exit(i32),
     Error(String),
+    Synced,
 }
 
 /// Encodes one frame.
@@ -183,11 +204,12 @@ impl HostFrame {
     ///
     /// # Errors
     ///
-    /// An open request that breaks [`OpenRequest::validate`], or a payload
+    /// An open or sync request that breaks its `validate`, or a payload
     /// larger than [`MAX_PAYLOAD`].
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
         match self {
             Self::Open(request) => encode_frame(OPEN, request.to_json()?.as_bytes()),
+            Self::Sync(request) => encode_frame(SYNC, request.to_json()?.as_bytes()),
             Self::Input(bytes) => encode_frame(INPUT, bytes),
             Self::Resize { rows, cols } => {
                 check_dimension("rows", *rows)?;
@@ -205,14 +227,19 @@ impl HostFrame {
     ///
     /// # Errors
     ///
-    /// An unknown type, a malformed payload, or an open that breaks
-    /// [`OpenRequest::validate`].
+    /// An unknown type, a malformed payload, or an open or sync request that
+    /// breaks its `validate`.
     pub fn decode(kind: u8, payload: &[u8]) -> Result<Self, FrameError> {
         match kind {
             OPEN => {
                 let text = std::str::from_utf8(payload)
                     .map_err(|_| FrameError("the open request is not UTF-8".to_string()))?;
                 Ok(Self::Open(OpenRequest::from_json(text)?))
+            }
+            SYNC => {
+                let text = std::str::from_utf8(payload)
+                    .map_err(|_| FrameError("the sync request is not UTF-8".to_string()))?;
+                Ok(Self::Sync(SyncRequest::from_json(text)?))
             }
             INPUT => Ok(Self::Input(payload.to_vec())),
             RESIZE => {
@@ -248,6 +275,7 @@ impl GuestFrame {
         match self {
             Self::Output(bytes) => encode_frame(OUTPUT, bytes),
             Self::Exit(code) => encode_frame(EXIT, &code.to_be_bytes()),
+            Self::Synced => encode_frame(SYNCED, &[]),
             Self::Error(message) => {
                 let mut end = message.len().min(MAX_PAYLOAD);
                 while !message.is_char_boundary(end) {
@@ -263,10 +291,18 @@ impl GuestFrame {
     ///
     /// # Errors
     ///
-    /// An unknown type or an exit frame that is not 4 bytes.
+    /// An unknown type, an exit frame that is not 4 bytes, or a synced frame
+    /// with a payload.
     pub fn decode(kind: u8, payload: &[u8]) -> Result<Self, FrameError> {
         match kind {
             OUTPUT => Ok(Self::Output(payload.to_vec())),
+            SYNCED => {
+                if payload.is_empty() {
+                    Ok(Self::Synced)
+                } else {
+                    Err(FrameError("a synced frame carries no payload".to_string()))
+                }
+            }
             EXIT => {
                 let bytes = <[u8; 4]>::try_from(payload).map_err(|_| {
                     FrameError(format!("an exit frame is 4 bytes, got {}", payload.len()))
@@ -366,6 +402,7 @@ impl OpenRequest {
         let mut parser = Parser {
             bytes: text.as_bytes(),
             pos: 0,
+            what: "the open request",
         };
         let mut argv: Option<Vec<String>> = None;
         let mut user: Option<Option<String>> = None;
@@ -418,6 +455,102 @@ impl OpenRequest {
     }
 }
 
+impl SyncRequest {
+    /// Checks that the request names one to [`MAX_SYNC_SERIALS`] volume
+    /// serials, each a valid `quoro-vol-<n>` and none twice.
+    ///
+    /// # Errors
+    ///
+    /// An empty or too long list, a malformed serial, or a repeated one.
+    pub fn validate(&self) -> Result<(), FrameError> {
+        if self.serials.is_empty() {
+            return Err(FrameError("the sync request names no volume".to_string()));
+        }
+        if self.serials.len() > MAX_SYNC_SERIALS {
+            return Err(FrameError(format!(
+                "the sync request names {} volumes, more than {MAX_SYNC_SERIALS}",
+                self.serials.len()
+            )));
+        }
+        for (index, serial) in self.serials.iter().enumerate() {
+            crate::config::validate_volume_serial(serial)
+                .map_err(|why| FrameError(format!("serial {serial:?} {why}")))?;
+            if self.serials[..index].contains(serial) {
+                return Err(FrameError(format!("serial {serial:?} is named twice")));
+            }
+        }
+        Ok(())
+    }
+
+    /// The JSON payload of the sync frame: `{"serials":[...]}`.
+    ///
+    /// # Errors
+    ///
+    /// A request that breaks [`SyncRequest::validate`].
+    pub fn to_json(&self) -> Result<String, FrameError> {
+        self.validate()?;
+        let mut out = String::from("{\"serials\":[");
+        for (index, serial) in self.serials.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            push_json_string(&mut out, serial);
+        }
+        out.push_str("]}");
+        Ok(out)
+    }
+
+    /// Parses the JSON payload of a sync frame. `serials` is its only member;
+    /// any other member, a duplicate, or trailing data is refused.
+    ///
+    /// # Errors
+    ///
+    /// Malformed JSON, a missing or extra member, or a request that breaks
+    /// [`SyncRequest::validate`].
+    pub fn from_json(text: &str) -> Result<Self, FrameError> {
+        let mut parser = Parser {
+            bytes: text.as_bytes(),
+            pos: 0,
+            what: "the sync request",
+        };
+        let mut serials: Option<Vec<String>> = None;
+        parser.expect(b'{')?;
+        if !parser.eat(b'}') {
+            loop {
+                let key = parser.string()?;
+                parser.expect(b':')?;
+                match key.as_str() {
+                    "serials" if serials.is_none() => {
+                        serials = Some(parser.list(MAX_SYNC_SERIALS, "serials")?);
+                    }
+                    other => {
+                        return Err(FrameError(format!(
+                            "unexpected or repeated member {other:?} in the sync request"
+                        )));
+                    }
+                }
+                if parser.eat(b',') {
+                    continue;
+                }
+                parser.expect(b'}')?;
+                break;
+            }
+        }
+        parser.skip_ws();
+        if parser.pos != parser.bytes.len() {
+            return Err(FrameError(
+                "trailing data after the sync request".to_string(),
+            ));
+        }
+        let request = Self {
+            serials: serials
+                .ok_or_else(|| FrameError("the sync request has no serials".to_string()))?,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+}
+
 fn push_json_string(out: &mut String, value: &str) {
     out.push('"');
     for ch in value.chars() {
@@ -434,10 +567,12 @@ fn push_json_string(out: &mut String, value: &str) {
     out.push('"');
 }
 
-/// A strict reader for the small JSON subset of the open request.
+/// A strict reader for the small JSON subset of the open and sync requests.
 struct Parser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    /// Names the request in error messages.
+    what: &'static str,
 }
 
 impl Parser<'_> {
@@ -472,22 +607,28 @@ impl Parser<'_> {
             Ok(())
         } else {
             Err(FrameError(format!(
-                "expected {:?} at byte {} of the open request",
+                "expected {:?} at byte {} of {}",
                 char::from(byte),
-                self.pos
+                self.pos,
+                self.what
             )))
         }
     }
 
     fn string_array(&mut self) -> Result<Vec<String>, FrameError> {
+        self.list(MAX_ARGS, "argv")
+    }
+
+    /// A JSON array of at most `max` strings; `name` is the member, for errors.
+    fn list(&mut self, max: usize, name: &str) -> Result<Vec<String>, FrameError> {
         self.expect(b'[')?;
         let mut items = Vec::new();
         if self.eat(b']') {
             return Ok(items);
         }
         loop {
-            if items.len() == MAX_ARGS {
-                return Err(FrameError(format!("argv has more than {MAX_ARGS} items")));
+            if items.len() == max {
+                return Err(FrameError(format!("{name} has more than {max} items")));
             }
             items.push(self.string()?);
             if self.eat(b',') {
@@ -507,7 +648,8 @@ impl Parser<'_> {
         let digits = &self.bytes[start..self.pos];
         if digits.is_empty() || digits.len() > 5 || (digits.len() > 1 && digits[0] == b'0') {
             return Err(FrameError(format!(
-                "expected a small integer at byte {start} of the open request"
+                "expected a small integer at byte {start} of {}",
+                self.what
             )));
         }
         let text = std::str::from_utf8(digits).unwrap_or("0");
@@ -520,9 +662,7 @@ impl Parser<'_> {
         let mut out: Vec<u8> = Vec::new();
         loop {
             let Some(&byte) = self.bytes.get(self.pos) else {
-                return Err(FrameError(
-                    "unterminated string in the open request".to_string(),
-                ));
+                return Err(FrameError(format!("unterminated string in {}", self.what)));
             };
             self.pos += 1;
             match byte {
@@ -548,22 +688,25 @@ impl Parser<'_> {
                         }
                         other => {
                             return Err(FrameError(format!(
-                                "bad escape \\{} in the open request",
-                                char::from(other)
+                                "bad escape \\{} in {}",
+                                char::from(other),
+                                self.what
                             )));
                         }
                     }
                 }
                 0x00..=0x1f => {
-                    return Err(FrameError(
-                        "control character inside a string in the open request".to_string(),
-                    ));
+                    return Err(FrameError(format!(
+                        "control character inside a string in {}",
+                        self.what
+                    )));
                 }
                 other => out.push(other),
             }
             if out.len() > MAX_ARG_BYTES {
                 return Err(FrameError(format!(
-                    "a string in the open request is longer than {MAX_ARG_BYTES} bytes"
+                    "a string in {} is longer than {MAX_ARG_BYTES} bytes",
+                    self.what
                 )));
             }
         }
@@ -741,6 +884,90 @@ mod tests {
             let (kind, payload) = reader.next_frame().expect("ok").expect("whole");
             assert_eq!(GuestFrame::decode(kind, &payload).expect("decodes"), frame);
         }
+    }
+
+    #[test]
+    fn sync_request_round_trips() {
+        let request = SyncRequest {
+            serials: vec!["quoro-vol-0".to_string(), "quoro-vol-12".to_string()],
+        };
+        let json = request.to_json().expect("encodes");
+        assert_eq!(json, r#"{"serials":["quoro-vol-0","quoro-vol-12"]}"#);
+        assert_eq!(SyncRequest::from_json(&json).expect("decodes"), request);
+        assert_eq!(
+            SyncRequest::from_json(" { \"serials\" : [ \"quoro-vol-3\" ] } ")
+                .expect("whitespace")
+                .serials,
+            vec!["quoro-vol-3".to_string()]
+        );
+
+        let bytes = HostFrame::Sync(request.clone()).encode().expect("frame");
+        assert_eq!(bytes[0], SYNC);
+        let mut reader = FrameReader::new();
+        reader.push(&bytes);
+        let (kind, payload) = reader.next_frame().expect("ok").expect("whole");
+        assert_eq!(
+            HostFrame::decode(kind, &payload).expect("decodes"),
+            HostFrame::Sync(request)
+        );
+    }
+
+    #[test]
+    fn sync_request_refuses_bad_input() {
+        for text in [
+            "",
+            "{}",
+            r#"{"serials":[]}"#,
+            r#"{"serials":["quoro-vol-"]}"#,
+            r#"{"serials":["quoro-vol-a"]}"#,
+            r#"{"serials":["vol-1"]}"#,
+            r#"{"serials":["quoro-vol-1","quoro-vol-1"]}"#,
+            r#"{"serials":["quoro-vol-1"],"serials":["quoro-vol-2"]}"#,
+            r#"{"serials":["quoro-vol-1"],"force":true}"#,
+            r#"{"serials":"quoro-vol-1"}"#,
+            r#"{"serials":["quoro-vol-1"]} x"#,
+        ] {
+            assert!(
+                SyncRequest::from_json(text).is_err(),
+                "{text:?} should be refused"
+            );
+            assert!(HostFrame::decode(SYNC, text.as_bytes()).is_err());
+        }
+        let too_many = format!(
+            "{{\"serials\":[{}]}}",
+            (0..=MAX_SYNC_SERIALS)
+                .map(|n| format!("\"quoro-vol-{n}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(SyncRequest::from_json(&too_many).is_err());
+        assert!(
+            SyncRequest {
+                serials: Vec::new()
+            }
+            .to_json()
+            .is_err(),
+            "the writer refuses what the reader refuses"
+        );
+    }
+
+    #[test]
+    fn synced_frame_has_no_payload() {
+        let bytes = GuestFrame::Synced.encode().expect("encodes");
+        assert_eq!(bytes, vec![SYNCED, 0, 0, 0, 0]);
+        assert_eq!(
+            GuestFrame::decode(SYNCED, &[]).expect("decodes"),
+            GuestFrame::Synced
+        );
+        assert!(GuestFrame::decode(SYNCED, &[0]).is_err());
+        assert!(
+            HostFrame::decode(SYNCED, &[]).is_err(),
+            "synced is a guest frame"
+        );
+        assert!(
+            GuestFrame::decode(SYNC, &[]).is_err(),
+            "sync is a host frame"
+        );
     }
 
     #[test]
