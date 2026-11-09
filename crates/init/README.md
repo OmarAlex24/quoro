@@ -294,13 +294,16 @@ The syncs run on a thread of their own, and the session ends when the
 connection does: after the answer, or as soon as the host hangs up. The engine
 stops waiting after its bound, 2 s, and drops the connection, so a `syncfs`
 that does not return, on a filesystem the app froze or a disk that stopped
-answering, holds its thread but not one of the 16 session slots, and the web
-terminal stays reachable. That `syncfs` still completes when it can. One sync
-of a volume waits for another, as when a backup and a warm cycle overlap: the
-second waits up to 2 s for the first to end, then runs its own `syncfs`, since
-the first may not cover what was written since it began. If the first has not
-ended by then, the second is answered with `ERROR`, so a volume whose `syncfs`
-hangs holds one thread, however often the engine asks.
+answering, keeps its thread but not its session slot, and the web terminal
+stays reachable. That `syncfs` still completes when it can. One sync of a
+volume waits for another, as when a backup and a warm cycle overlap: the
+second session waits up to 2 s, in its slot, for the first to end, then runs
+its own `syncfs`, since the first may not cover what was written since it
+began. If the first has not ended by then, the second is answered with
+`ERROR`; the engine has normally reached its own 2 s bound by then and
+reports a timeout. Either way a volume whose `syncfs` hangs keeps one thread,
+however often the engine asks, and a waiting session frees its slot within
+2 s.
 
 Per session:
 

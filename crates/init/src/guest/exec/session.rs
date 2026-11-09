@@ -283,12 +283,17 @@ impl Drop for Claim {
     }
 }
 
-/// Ends the connection when the sync's thread ends however it ends, a panic
-/// included, so the session does not wait for the host to hang up.
+/// Ends the connection when the sync's thread ends however it ends, so the
+/// session does not wait for the host to hang up. A thread that panics
+/// answers `ERROR` first; after an answer, that frame is not sent.
 struct EndOnDrop<S: SessionIo>(Arc<Sink<S>>);
 
 impl<S: SessionIo> Drop for EndOnDrop<S> {
     fn drop(&mut self) {
+        if thread::panicking() {
+            diag::log("exec: sync: the sync thread panicked");
+            self.0.error("sync: the sync thread panicked");
+        }
         self.0.shutdown();
     }
 }
@@ -591,11 +596,13 @@ fn serve_sync<S: SessionIo>(
             return;
         }
     };
-    let end = EndOnDrop(Arc::clone(sink));
+    let answer = Arc::clone(sink);
     let worker = thread::Builder::new()
         .name("exec-sync".to_string())
         .spawn(move || {
-            let end = end;
+            // Built in the thread, so a thread that never starts does not
+            // close the connection before the `ERROR` below.
+            let end = EndOnDrop(answer);
             sync_all(&request.serials, &claim.syncs, &end.0);
             // The volumes are released only after their results are
             // recorded, so a later sync never records before this one.
@@ -1302,24 +1309,38 @@ mod tests {
         }
     }
 
+    /// How often a test `syncfs` of `quoro-vol-0` ran, and the most that ran
+    /// at once.
+    #[derive(Default)]
+    struct Calls {
+        now: std::sync::atomic::AtomicUsize,
+        most: std::sync::atomic::AtomicUsize,
+        total: std::sync::atomic::AtomicUsize,
+    }
+
     /// A context whose `syncfs` of `quoro-vol-0` waits for `gate` and then
     /// succeeds without the real call: these tests are about who waits, not
     /// about the syscall. Other volumes get the real `syncfs`.
-    fn held_context(volumes: &[(&str, &str)], gate: &Arc<Gate>) -> Arc<Context> {
+    fn held_context(volumes: &[(&str, &str)], gate: &Arc<Gate>) -> (Arc<Context>, Arc<Calls>) {
         let held = Arc::clone(gate);
+        let calls = Arc::new(Calls::default());
+        let counted = Arc::clone(&calls);
         let mut context = test_context();
         context.syncs = Arc::new(Syncs::with_syncfs(
             self::volumes(volumes),
             Box::new(move |serial, directory| {
-                if serial == "quoro-vol-0" {
-                    held.wait();
-                    Ok(())
-                } else {
-                    rustix::fs::syncfs(directory)
+                if serial != "quoro-vol-0" {
+                    return rustix::fs::syncfs(directory);
                 }
+                let now = counted.now.fetch_add(1, Ordering::SeqCst) + 1;
+                counted.most.fetch_max(now, Ordering::SeqCst);
+                counted.total.fetch_add(1, Ordering::SeqCst);
+                held.wait();
+                counted.now.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
             }),
         ));
-        Arc::new(context)
+        (Arc::new(context), calls)
     }
 
     /// Serves one session on a thread of its own and sends `first`. The
@@ -1367,7 +1388,7 @@ mod tests {
         let uploads = TempDir::new("free");
         let gate = Arc::new(Gate::default());
         let _opener = gate.opener();
-        let context = held_context(
+        let (context, _) = held_context(
             &[
                 ("quoro-vol-0", &data.path()),
                 ("quoro-vol-1", &uploads.path()),
@@ -1416,19 +1437,38 @@ mod tests {
         let data = TempDir::new("overlap");
         let gate = Arc::new(Gate::default());
         let opener = gate.opener();
-        let context = held_context(&[("quoro-vol-0", &data.path())], &gate);
+        let (context, calls) = held_context(&[("quoro-vol-0", &data.path())], &gate);
 
         let (mut first, _) = serve_in_thread(&context, &sync_frame(&["quoro-vol-0"]));
         wait_until("the first syncfs", || {
-            running(&context).contains("quoro-vol-0")
+            calls.total.load(Ordering::SeqCst) == 1
         });
-        let (mut second, _) = serve_in_thread(&context, &sync_frame(&["quoro-vol-0"]));
+        let (mut second, second_ended) = serve_in_thread(&context, &sync_frame(&["quoro-vol-0"]));
         thread::sleep(Duration::from_millis(200));
+        // The second waits: no answer, no second syncfs, the session open.
+        assert_eq!(calls.total.load(Ordering::SeqCst), 1);
+        assert!(second_ended.try_recv().is_err());
+        second
+            .stream
+            .set_nonblocking(true)
+            .unwrap_or_else(|err| panic!("nonblocking: {err}"));
+        let mut byte = [0_u8; 1];
+        assert!(
+            matches!(second.stream.read(&mut byte), Err(err) if err.kind() == io::ErrorKind::WouldBlock),
+            "the second sync answered while the first still ran"
+        );
+        second
+            .stream
+            .set_nonblocking(false)
+            .unwrap_or_else(|err| panic!("blocking: {err}"));
+
         drop(opener);
         while first.pump() {}
         while second.pump() {}
         assert!(first.synced, "error: {:?}", first.error);
         assert!(second.synced, "error: {:?}", second.error);
+        assert_eq!(calls.total.load(Ordering::SeqCst), 2, "each ran its own");
+        assert_eq!(calls.most.load(Ordering::SeqCst), 1, "never two at once");
         assert!(failures(&context).is_empty(), "{:?}", failures(&context));
         wait_until("the volume to be released", || running(&context).is_empty());
     }
@@ -1440,20 +1480,21 @@ mod tests {
         let data = TempDir::new("discard");
         let gate = Arc::new(Gate::default());
         let opener = gate.opener();
-        let context = held_context(&[("quoro-vol-0", &data.path())], &gate);
+        let (context, _) = held_context(&[("quoro-vol-0", &data.path())], &gate);
 
         let (mut client, ended) = serve_in_thread(&context, &sync_frame(&["quoro-vol-0"]));
         wait_until("the syncfs", || running(&context).contains("quoro-vol-0"));
         client.send(HostFrame::Input(b"ignored".to_vec()));
         client.send_raw(b"not even a frame");
         thread::sleep(Duration::from_millis(100));
+        assert!(ended.try_recv().is_err(), "stray bytes ended the session");
         drop(opener);
         while client.pump() {}
         assert!(client.synced, "error: {:?}", client.error);
         assert!(ended.recv_timeout(Duration::from_secs(5)).is_ok());
     }
 
-    /// A `syncfs` that panics ends the connection at once, with no answer, and
+    /// A `syncfs` that panics ends the connection at once with `ERROR`, and
     /// releases the volume for the next sync.
     #[test]
     fn a_sync_thread_that_panics_ends_the_session_and_releases_the_volume() {
@@ -1475,7 +1516,10 @@ mod tests {
         let (mut client, ended) = serve_in_thread(&context, &sync_frame(&["quoro-vol-0"]));
         while client.pump() {}
         assert!(!client.synced);
-        assert_eq!(client.error, None);
+        assert_eq!(
+            client.error.as_deref(),
+            Some("sync: the sync thread panicked")
+        );
         assert!(ended.recv_timeout(Duration::from_secs(5)).is_ok());
         assert!(panicked.load(Ordering::SeqCst));
 
