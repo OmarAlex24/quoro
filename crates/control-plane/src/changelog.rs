@@ -4,14 +4,23 @@
 //! the state tables. `hash` is `SHA-256(JCS(entry without hash))`, the same
 //! construction as the audit log (`audit-log-format.md` section 5). The
 //! schema's triggers enforce `seq` contiguity and the `prev_hash` link.
+//!
+//! An entry a node could not receive alone and verify is never written
+//! (`node-agent-protocol.md` section 7.1, "Entries a node can receive", ADR
+//! 0302): [`append`] refuses it.
 
 use crate::jcs;
 use crate::store::{GENESIS_HASH, now_rfc3339, sha256_hex};
+use quoro_proto::wire::{self, ControlMessage};
 use serde_json::{Value, json};
 use sqlx::SqliteConnection;
 
 /// `term` is 1 until elections exist (D-0016).
 pub const TERM: i64 = 1;
+
+/// The highest `seq` the change log carries, 2^53 - 1
+/// (`node-agent-protocol.md` section 7.1).
+pub(crate) const MAX_SEQ: u64 = (1 << 53) - 1;
 
 /// Kind of identity behind a change (`change_log.actor_type`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,6 +85,18 @@ impl Op {
 pub enum AppendError {
     Db(sqlx::Error),
     NotCanonical(jcs::NotCanonical),
+    /// The change-log entry, with its payload read back from the text the
+    /// primary stores, has no RFC 8785 form, so a node could not verify it
+    /// (`node-agent-protocol.md` section 7.1, "Entries a node can receive",
+    /// ADR 0302).
+    ReadBackNotCanonical(jcs::NotCanonical),
+    /// The `log_entries` message that carries the change-log entry alone
+    /// takes `bytes` bytes (`alone_frame_bytes`), above the 1 MiB message
+    /// limit (`node-agent-protocol.md` sections 3.2 and 7.1, "Entries a node
+    /// can receive", ADR 0302).
+    FrameTooLarge {
+        bytes: usize,
+    },
 }
 
 impl From<sqlx::Error> for AppendError {
@@ -89,6 +110,16 @@ impl std::fmt::Display for AppendError {
         match self {
             Self::Db(e) => write!(f, "database: {e}"),
             Self::NotCanonical(e) => write!(f, "not canonical: {}", e.0),
+            Self::ReadBackNotCanonical(e) => write!(
+                f,
+                "the change-log entry as read back has no canonical form, so a node could not verify it: {}",
+                e.0
+            ),
+            Self::FrameTooLarge { bytes } => write!(
+                f,
+                "a log_entries message holding the change-log entry alone takes {bytes} bytes, above the {} byte message limit",
+                wire::MAX_MESSAGE_BYTES
+            ),
         }
     }
 }
@@ -98,9 +129,27 @@ impl std::error::Error for AppendError {}
 /// Appends one entry and returns its `seq`. Must run inside the caller's
 /// write transaction, together with the state-table change it describes.
 ///
+/// The entry is built from the payload exactly as it reads back from the
+/// canonical text stored for it, the way `StoredEntry::unhashed` and
+/// [`verify`] rebuild it, and hashed in that form. For the payloads Quoro
+/// writes, whose only floats are scores with one decimal, the read-back form
+/// is the original canonical form, so their hash is the one an entry had
+/// before this check (ADR 0302).
+///
+/// An entry a node could not receive alone and verify is refused before
+/// anything is written (`node-agent-protocol.md` section 7.1, "Entries a
+/// node can receive", ADR 0302): one whose read-back form has no RFC 8785
+/// form, such as a whole-number float above 2^53, which is stored as a plain
+/// integer and reads back as one RFC 8785 refuses; and one whose
+/// `log_entries` message alone (`alone_frame_bytes`) exceeds the 1 MiB
+/// message limit (section 3.2). The caller's write then fails like any other
+/// write error: its transaction is dropped, and the change log and its head
+/// watch stay as they were.
+///
 /// # Errors
 ///
-/// A database error, or a payload with a value JCS cannot canonicalize.
+/// A database error, a payload with a value JCS cannot canonicalize,
+/// [`AppendError::ReadBackNotCanonical`] or [`AppendError::FrameTooLarge`].
 pub async fn append(
     conn: &mut SqliteConnection,
     actor: &Actor,
@@ -117,40 +166,87 @@ pub async fn append(
         Some((seq, hash)) => (seq + 1, hash),
         None => (1, GENESIS_HASH.to_string()),
     };
-    let time = now_rfc3339();
-    let entry = json!({
-        "seq": seq,
-        "term": TERM,
-        "time": time,
-        "actor_type": actor.kind.as_str(),
-        "actor_id": actor.id,
-        "entity_type": entity_type,
-        "entity_id": entity_id,
-        "op": op.as_str(),
-        "payload": payload,
-        "prev_hash": prev_hash,
-    });
-    let canonical = jcs::canonicalize(&entry).map_err(AppendError::NotCanonical)?;
-    let hash = sha256_hex(canonical.as_bytes());
-    let payload_text = jcs::canonicalize(&entry["payload"]).map_err(AppendError::NotCanonical)?;
-    sqlx::query(
-        "INSERT INTO change_log (seq, term, time, actor_type, actor_id, entity_type, entity_id, op, payload, prev_hash, hash) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(seq)
-    .bind(TERM)
-    .bind(&time)
-    .bind(actor.kind.as_str())
-    .bind(&actor.id)
-    .bind(entity_type)
-    .bind(entity_id)
-    .bind(op.as_str())
-    .bind(&payload_text)
-    .bind(&prev_hash)
-    .bind(&hash)
+    let mut entry = StoredEntry {
+        seq,
+        term: TERM,
+        time: now_rfc3339(),
+        actor_type: actor.kind.as_str().to_string(),
+        actor_id: actor.id.clone(),
+        entity_type: entity_type.to_string(),
+        entity_id: entity_id.to_string(),
+        op: op.as_str().to_string(),
+        payload: jcs::canonicalize(&payload).map_err(AppendError::NotCanonical)?,
+        prev_hash,
+        hash: String::new(),
+    };
+    let unhashed = entry.unhashed()?;
+    let canonical = jcs::canonicalize(&unhashed).map_err(AppendError::ReadBackNotCanonical)?;
+    entry.hash = sha256_hex(canonical.as_bytes());
+    let bytes = alone_frame_bytes(
+        u64::try_from(seq).unwrap_or(MAX_SEQ),
+        &with_hash(unhashed, &entry.hash),
+    );
+    if bytes > wire::MAX_MESSAGE_BYTES {
+        return Err(AppendError::FrameTooLarge { bytes });
+    }
+    sqlx::query(&format!(
+        "INSERT INTO change_log ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ))
+    .bind(entry.seq)
+    .bind(entry.term)
+    .bind(&entry.time)
+    .bind(&entry.actor_type)
+    .bind(&entry.actor_id)
+    .bind(&entry.entity_type)
+    .bind(&entry.entity_id)
+    .bind(&entry.op)
+    .bind(&entry.payload)
+    .bind(&entry.prev_hash)
+    .bind(&entry.hash)
     .execute(&mut *conn)
     .await?;
     Ok(seq)
+}
+
+/// The `log_entries` frame (`node-agent-protocol.md` section 5.14), as
+/// change-log follow sends it.
+pub(crate) fn log_entries_frame(
+    msg_id: &str,
+    from_seq: u64,
+    head_seq: u64,
+    entries: Vec<Value>,
+) -> String {
+    ControlMessage::LogEntries(wire::LogEntries {
+        from_seq,
+        entries,
+        head_seq: Some(head_seq),
+    })
+    .to_frame(msg_id, None)
+    .to_text()
+}
+
+/// The size in bytes of the [`log_entries_frame`] that carries `entry`, the
+/// entry at `seq` as [`StoredEntry::wire_entry`] builds it, alone, in the
+/// longest envelope follow can send it in: a message id as long as every
+/// `msg_` id ([`wire::msg_id`]), `from_seq` at `seq`, `head_seq` at
+/// [`MAX_SEQ`], and no `re`. The envelope adds `v`, `type` and `id` around
+/// `body`, and no other field, no time among them. The frame follow sends for
+/// this entry alone is therefore never larger.
+///
+/// [`append`] refuses an entry this puts above the 1 MiB message limit, and
+/// follow sends a first entry alone when this is within it
+/// (`node-agent-protocol.md` section 7.1, "Entries a node can receive", ADR
+/// 0302).
+pub(crate) fn alone_frame_bytes(seq: u64, entry: &Value) -> usize {
+    log_entries_frame(&wire::msg_id([0; 16]), seq, MAX_SEQ, vec![entry.clone()]).len()
+}
+
+/// `unhashed` with `hash` added: the 11 fields of an entry on the wire.
+fn with_hash(mut unhashed: Value, hash: &str) -> Value {
+    if let Value::Object(fields) = &mut unhashed {
+        fields.insert("hash".to_string(), Value::String(hash.to_string()));
+    }
+    unhashed
 }
 
 /// The columns of a `change_log` row, in [`Row`] order.
@@ -222,8 +318,9 @@ impl From<Row> for StoredEntry {
 
 impl StoredEntry {
     /// The entry without `hash`, with `payload` parsed from its stored text:
-    /// what `hash` covers. [`verify`] and change-log follow both build it
-    /// here, so the entry a node verifies is the one the primary verifies.
+    /// what `hash` covers. [`append`] hashes it, and [`verify`] and
+    /// change-log follow build it here too, so the entry a node verifies is
+    /// the one the primary hashed and verifies (ADR 0302).
     ///
     /// # Errors
     ///
@@ -250,12 +347,9 @@ impl StoredEntry {
     /// in a payload is stored as a plain integer, and parsing it again gives
     /// an integer that has no canonical form.
     pub(crate) fn wire_entry(&self) -> Result<Value, AppendError> {
-        let mut entry = self.unhashed()?;
+        let entry = self.unhashed()?;
         jcs::canonicalize(&entry).map_err(AppendError::NotCanonical)?;
-        if let Value::Object(fields) = &mut entry {
-            fields.insert("hash".to_string(), Value::String(self.hash.clone()));
-        }
-        Ok(entry)
+        Ok(with_hash(entry, &self.hash))
     }
 }
 
@@ -437,5 +531,222 @@ mod tests {
             entry.wire_entry(),
             Err(AppendError::NotCanonical(_))
         ));
+    }
+
+    /// The newest `seq` and the number of rows of the change log.
+    async fn log_state(conn: &mut SqliteConnection) -> (i64, i64) {
+        sqlx::query_as("SELECT COALESCE(MAX(seq), 0), COUNT(*) FROM change_log")
+            .fetch_one(conn)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_entry_whose_frame_alone_passes_the_message_limit_is_refused() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut w = store.begin_write().await.unwrap();
+        let actor = Actor::system("test");
+        // Nine entries first, so the two below take two-digit seqs: a
+        // measure with the wrong from_seq or head_seq is then off by bytes.
+        let start = log_state(&mut w.tx).await.0;
+        for i in 0..9 {
+            append(
+                &mut w.tx,
+                &actor,
+                "vm",
+                &format!("vm_{i}"),
+                Op::Update,
+                json!({}),
+            )
+            .await
+            .unwrap();
+        }
+        let seq = start + 10;
+        assert!((10..=98).contains(&seq), "{seq}");
+        // The worst-case envelope, written out: a 30-character msg_ id,
+        // from_seq at the entry's seq, head_seq 2^53 - 1 and no re. The
+        // payload as read back: 10.0 is stored, and so read back, as 10.
+        let frame_of = |seq: i64, blob: &str| {
+            let entry = json!({
+                "seq": seq, "term": 1, "time": "2026-11-09T10:15:31.000Z",
+                "actor_type": "system", "actor_id": "test", "entity_type": "vm",
+                "entity_id": "vm_big", "op": "update",
+                "payload": {"blob": blob, "whole": 10}, "prev_hash": "a".repeat(64),
+                "hash": "b".repeat(64),
+            });
+            ControlMessage::LogEntries(wire::LogEntries {
+                from_seq: u64::try_from(seq).unwrap(),
+                entries: vec![entry],
+                head_seq: Some(9_007_199_254_740_991),
+            })
+            .to_frame("msg_01JC9ZN1Q6C8D0F2H4K6N8Q0S2", None)
+            .to_text()
+            .len()
+        };
+        let room = wire::MAX_MESSAGE_BYTES - frame_of(seq, "");
+        let payload = |len: usize| json!({"blob": "x".repeat(len), "whole": 10.0});
+
+        // Exactly at the limit: accepted, and its frame is that size.
+        let at = append(&mut w.tx, &actor, "vm", "vm_big", Op::Update, payload(room))
+            .await
+            .unwrap();
+        assert_eq!(at, seq);
+        let (_, rows) = read_after(&mut w.tx, seq - 1, 1).await.unwrap();
+        let wire_entry = rows[0].wire_entry().unwrap();
+        let sent = ControlMessage::LogEntries(wire::LogEntries {
+            from_seq: u64::try_from(seq).unwrap(),
+            entries: vec![wire_entry.clone()],
+            head_seq: Some(9_007_199_254_740_991),
+        })
+        .to_frame("msg_01JC9ZN1Q6C8D0F2H4K6N8Q0S2", None)
+        .to_text();
+        assert_eq!(sent.len(), wire::MAX_MESSAGE_BYTES);
+        assert_eq!(
+            alone_frame_bytes(u64::try_from(seq).unwrap(), &wire_entry),
+            wire::MAX_MESSAGE_BYTES
+        );
+
+        // One byte more: refused with the size, and nothing written.
+        let refused = append(
+            &mut w.tx,
+            &actor,
+            "vm",
+            "vm_big",
+            Op::Update,
+            payload(room + 1),
+        )
+        .await;
+        assert_eq!(
+            frame_of(seq + 1, &"x".repeat(room + 1)),
+            wire::MAX_MESSAGE_BYTES + 1
+        );
+        match refused {
+            Err(AppendError::FrameTooLarge { bytes }) => {
+                assert_eq!(bytes, wire::MAX_MESSAGE_BYTES + 1);
+            }
+            other => panic!("not refused for its size: {other:?}"),
+        }
+        assert_eq!(log_state(&mut w.tx).await, (seq, seq));
+        assert_eq!(verify(&mut w.tx).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_whole_number_float_above_2_53_is_refused() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut w = store.begin_write().await.unwrap();
+        let payload = json!({"n": 1e16});
+        // The caller's value has a canonical form; the integer it is stored
+        // as, and reads back as, has none.
+        assert_eq!(
+            jcs::canonicalize(&payload).unwrap(),
+            "{\"n\":10000000000000000}"
+        );
+        let before = log_state(&mut w.tx).await;
+        let refused = append(
+            &mut w.tx,
+            &Actor::system("test"),
+            "vm",
+            "vm_1",
+            Op::Update,
+            payload,
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(AppendError::ReadBackNotCanonical(_))),
+            "{refused:?}"
+        );
+        assert_eq!(log_state(&mut w.tx).await, before);
+    }
+
+    #[tokio::test]
+    async fn a_refused_append_leaves_the_log_and_the_head_watch() {
+        let store = Store::open_in_memory().await.unwrap();
+        let actor = Actor::system("test");
+        let mut w = store.begin_write().await.unwrap();
+        append(&mut w.tx, &actor, "vm", "vm_1", Op::Create, json!({}))
+            .await
+            .unwrap();
+        w.commit().await.unwrap();
+        let mut head = store.change_log_head();
+        let before = {
+            let mut conn = store.pool().acquire().await.unwrap();
+            log_state(&mut conn).await
+        };
+        assert_eq!(*head.borrow_and_update(), u64::try_from(before.0).unwrap());
+
+        // A write that appends one entry, then one append refuses: the error
+        // drops the transaction, as `?` in any caller does.
+        let mut w = store.begin_write().await.unwrap();
+        append(&mut w.tx, &actor, "vm", "vm_2", Op::Create, json!({}))
+            .await
+            .unwrap();
+        let refused = append(
+            &mut w.tx,
+            &actor,
+            "vm",
+            "vm_2",
+            Op::Update,
+            json!({"blob": "x".repeat(wire::MAX_MESSAGE_BYTES)}),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(AppendError::FrameTooLarge { .. })),
+            "{refused:?}"
+        );
+        // The refused entry wrote no row, even before the rollback.
+        assert_eq!(log_state(&mut w.tx).await, (before.0 + 1, before.1 + 1));
+        drop(w);
+
+        let mut conn = store.pool().acquire().await.unwrap();
+        assert_eq!(log_state(&mut conn).await, before);
+        assert!(!head.has_changed().unwrap());
+        assert_eq!(
+            *store.change_log_head().borrow(),
+            u64::try_from(before.0).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_payload_keeps_the_hash_verify_recomputes() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut w = store.begin_write().await.unwrap();
+        let actor = Actor::system("test");
+        let payloads = [
+            json!({"name": "blog", "score": 9.8, "whole": 10.0, "zero": -0.0}),
+            json!({"nested": {"b": [1, 2, null, true], "a": "\u{e9}\n\"q\""}}),
+            json!({"big": 9_007_199_254_740_991_i64, "neg": -9_007_199_254_740_991_i64}),
+            json!({}),
+        ];
+        let start = log_state(&mut w.tx).await.0;
+        for payload in &payloads {
+            append(&mut w.tx, &actor, "vm", "vm_1", Op::Update, payload.clone())
+                .await
+                .unwrap();
+        }
+        let (_, rows) = read_after(&mut w.tx, start, 500).await.unwrap();
+        assert_eq!(rows.len(), payloads.len());
+        for (row, payload) in rows.iter().zip(&payloads) {
+            // What verify recomputes from the stored row.
+            let recomputed = sha256_hex(
+                jcs::canonicalize(&row.unhashed().unwrap())
+                    .unwrap()
+                    .as_bytes(),
+            );
+            assert_eq!(row.hash, recomputed, "seq {}", row.seq);
+            // The hash the entry had before append hashed the read-back
+            // form: the same, over the caller's payload.
+            let before = json!({
+                "seq": row.seq, "term": TERM, "time": row.time, "actor_type": "system",
+                "actor_id": "test", "entity_type": "vm", "entity_id": "vm_1",
+                "op": "update", "payload": payload, "prev_hash": row.prev_hash,
+            });
+            assert_eq!(
+                row.hash,
+                sha256_hex(jcs::canonicalize(&before).unwrap().as_bytes()),
+                "seq {}",
+                row.seq
+            );
+        }
+        assert_eq!(verify(&mut w.tx).await.unwrap(), None);
     }
 }

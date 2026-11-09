@@ -11,9 +11,10 @@
 //! its newest `seq`, or is below that acknowledgement (section 7.1, "On
 //! `hello`"). It then sends `log_entries` from the node's position: at most
 //! 500 entries per message, within the 1 MiB message limit (section 3.2),
-//! each message with `head_seq`, and never more than one message
-//! unacknowledged. The next one goes out when the `log_ack` of the previous
-//! one arrives, or when the store's head watch
+//! a first entry alone when no other fits with it (section 7.1, "Entries a
+//! node can receive", ADR 0302), each message with `head_seq`, and never
+//! more than one message unacknowledged. The next one goes out when the
+//! `log_ack` of the previous one arrives, or when the store's head watch
 //! ([`crate::store::Store::change_log_head`]) rises while nothing is
 //! outstanding.
 //!
@@ -33,7 +34,7 @@
 //! that `desired_state` on the wire.
 
 use super::{Session, has_role, new_msg_id};
-use crate::changelog::{self, StoredEntry};
+use crate::changelog::{self, StoredEntry, log_entries_frame};
 use crate::store::{GENESIS_HASH, Store};
 use quoro_proto::wire::{self, ControlMessage};
 use serde_json::Value;
@@ -42,11 +43,14 @@ use tokio::time::{Duration, Instant};
 /// Most entries one `log_entries` carries (section 5.14).
 pub(super) const MAX_LOG_ENTRIES: usize = 500;
 
-/// Bytes a `log_entries` frame leaves free below the 1 MiB message limit
-/// (section 3.2).
+/// Bytes a `log_entries` frame of more than one entry leaves free below the
+/// 1 MiB message limit (section 3.2). A first entry sent alone may use them
+/// ([`build_batch`]).
 const FRAME_MARGIN: usize = 16 * 1024;
 
-/// The largest `log_entries` frame the primary builds.
+/// The largest `log_entries` frame the primary builds with more than one
+/// entry. A first entry that does not fit in it goes alone, in a frame of up
+/// to the 1 MiB message limit ([`build_batch`]).
 const FRAME_BUDGET: usize = wire::MAX_MESSAGE_BYTES - FRAME_MARGIN;
 
 /// How long follow waits before it sends again after the node refused a
@@ -97,8 +101,12 @@ pub(super) enum Batch {
         last_seq: u64,
         last_hash: String,
     },
-    /// The first entry after the position cannot be sent: it does not fit in
-    /// a message alone, or the node could not verify it.
+    /// The first entry after the position cannot be sent: its `log_entries`
+    /// message alone exceeds the 1 MiB message limit, or the node could not
+    /// verify it. [`changelog::append`] refuses such an entry
+    /// (`node-agent-protocol.md` section 7.1, "Entries a node can receive",
+    /// ADR 0302), so this is a guard for a row written before that refusal
+    /// existed, and it should never fire otherwise.
     Blocked { seq: u64, reason: String },
 }
 
@@ -106,7 +114,14 @@ pub(super) enum Batch {
 /// position: at most [`MAX_LOG_ENTRIES`] entries whose serialized forms, with
 /// the commas between them, fit in `room` bytes. An entry that does not fit,
 /// or that has no RFC 8785 form ([`StoredEntry::wire_entry`]), ends the batch
-/// before it; when it is the first, the batch is blocked on it.
+/// before it.
+///
+/// A first entry that does not fit in `room` goes alone when its
+/// `log_entries` message alone, measured as [`changelog::append`] measured it
+/// ([`changelog::alone_frame_bytes`]), is within the 1 MiB message limit:
+/// the primary sends every entry `append` accepts (section 7.1, "Entries a
+/// node can receive", ADR 0302). Otherwise, and for a first entry without an
+/// RFC 8785 form, the batch is blocked on it.
 pub(super) fn build_batch(rows: &[StoredEntry], room: usize) -> Batch {
     let mut entries = Vec::new();
     let mut used = 0usize;
@@ -126,15 +141,24 @@ pub(super) fn build_batch(rows: &[StoredEntry], room: usize) -> Batch {
         let size = serde_json::to_string(&entry).map_or(usize::MAX, |text| text.len())
             + usize::from(!entries.is_empty());
         if used.saturating_add(size) > room {
-            if entries.is_empty() {
+            if !entries.is_empty() {
+                break;
+            }
+            let alone = changelog::alone_frame_bytes(seq, &entry);
+            if alone > wire::MAX_MESSAGE_BYTES {
                 return Batch::Blocked {
                     seq,
                     reason: format!(
-                        "it takes {size} bytes alone, and a log_entries message has room for {room}"
+                        "a log_entries message holding it alone takes {alone} bytes, above the {} byte message limit",
+                        wire::MAX_MESSAGE_BYTES
                     ),
                 };
             }
-            break;
+            return Batch::Entries {
+                entries: vec![entry],
+                last_seq: seq,
+                last_hash: row.hash.clone(),
+            };
         }
         used += size;
         entries.push(entry);
@@ -148,17 +172,6 @@ pub(super) fn build_batch(rows: &[StoredEntry], room: usize) -> Batch {
         },
         None => Batch::Empty,
     }
-}
-
-/// The `log_entries` frame (section 5.14).
-fn log_entries_frame(msg_id: &str, from_seq: u64, head_seq: u64, entries: Vec<Value>) -> String {
-    ControlMessage::LogEntries(wire::LogEntries {
-        from_seq,
-        entries,
-        head_seq: Some(head_seq),
-    })
-    .to_frame(msg_id, None)
-    .to_text()
 }
 
 /// Whether a `hello` position differs from the primary's log (section 7.1,
@@ -323,8 +336,10 @@ impl Session {
     /// Sends the next `log_entries` from the position + 1 (section 5.14),
     /// when following with nothing outstanding and no retry waiting, and the
     /// log holds more entries. An entry that cannot be sent stops follow on
-    /// this session: the contract has no rule for it, and sending it would
-    /// only draw `bad_message` again and again.
+    /// this session, since sending it would only draw `bad_message` again and
+    /// again. [`changelog::append`] refuses such an entry (section 7.1,
+    /// "Entries a node can receive", ADR 0302), so only a row written before
+    /// that refusal existed can stop it.
     pub(super) async fn send_log_entries(&mut self) {
         if self.follow_retry.is_some() {
             return;
@@ -552,6 +567,62 @@ mod tests {
         let rows = [row(6, "{}"), row(7, &huge)];
         let (count, _) = frame_of(build_batch(&rows, room(6, 7)), 6, 7);
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn a_first_entry_above_the_budget_within_the_limit_goes_alone() {
+        // A frame about 8 KiB below 1 MiB: above FRAME_BUDGET, within the
+        // limit.
+        let big = format!(
+            "{{\"blob\":\"{}\"}}",
+            "x".repeat(wire::MAX_MESSAGE_BYTES - 8 * 1024)
+        );
+        let rows = [row(7, &big), row(8, "{}")];
+        let batch = build_batch(&rows, room(7, 8));
+        let Batch::Entries {
+            entries,
+            last_seq,
+            last_hash,
+        } = batch
+        else {
+            panic!("not a batch of entries: {batch:?}");
+        };
+        assert_eq!(entries.len(), 1, "the entry behind it waits");
+        assert_eq!(entries[0]["seq"], 7);
+        assert_eq!((last_seq, last_hash), (7, format!("{:064x}", 7)));
+        let sent = log_entries_frame(&new_msg_id(), 7, 8, entries.clone());
+        assert!(sent.len() > FRAME_BUDGET, "{} bytes", sent.len());
+        assert!(
+            sent.len() <= wire::MAX_MESSAGE_BYTES,
+            "{} bytes",
+            sent.len()
+        );
+        // The measure append uses is that frame with the longest envelope:
+        // a msg_ id as long as follow's, head_seq 2^53 - 1.
+        assert_eq!(
+            changelog::alone_frame_bytes(7, &entries[0]),
+            log_entries_frame(&new_msg_id(), 7, changelog::MAX_SEQ, entries).len()
+        );
+        // The next batch, from the ack of seq 7, carries the entry behind it.
+        let (count, _) = frame_of(build_batch(&rows[1..], room(8, 8)), 8, 8);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn a_first_entry_goes_alone_up_to_the_limit_and_not_one_byte_past_it() {
+        let blob = |len: usize| format!("{{\"blob\":\"{}\"}}", "x".repeat(len));
+        let base = changelog::alone_frame_bytes(7, &row(7, &blob(0)).wire_entry().unwrap());
+        let at = wire::MAX_MESSAGE_BYTES - base;
+        let rows = [row(7, &blob(at))];
+        assert_eq!(
+            changelog::alone_frame_bytes(7, &rows[0].wire_entry().unwrap()),
+            wire::MAX_MESSAGE_BYTES
+        );
+        let (count, _) = frame_of(build_batch(&rows, room(7, 7)), 7, 7);
+        assert_eq!(count, 1);
+        let rows = [row(7, &blob(at + 1))];
+        let batch = build_batch(&rows, room(7, 7));
+        assert!(matches!(batch, Batch::Blocked { seq: 7, .. }), "{batch:?}");
     }
 
     #[test]
