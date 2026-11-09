@@ -22,6 +22,9 @@ export const appKind = (app: Pick<App, 'source'>): 'git' | 'image' =>
   app.source != null ? 'git' : 'image';
 
 export const appKey = (appId: string): string => `app:${appId}`;
+/** The app id in a service key, or undefined for a VM's key or none. */
+export const appIdOfKey = (key: string | undefined): string | undefined =>
+  key?.startsWith('app:') ? key.slice('app:'.length) : undefined;
 export const vmKey = (vmId: string): string => `vm:${vmId}`;
 
 /** A VM with no app is a service of its own; an app's instances are part of the app. */

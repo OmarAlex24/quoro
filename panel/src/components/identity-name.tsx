@@ -1,8 +1,10 @@
 import { Link } from '@tanstack/react-router';
+import type { Build, Deployment } from '../api/generated/model';
 import { useListAgents } from '../api/generated/agents/agents';
 import { useListUsers } from '../api/generated/users/users';
 import { canListUsers } from '../lib/capabilities';
 import { shortId } from '../lib/agency-format';
+import { personLabel } from '../lib/users';
 import { useSession } from '../session';
 import { Avatar } from './avatar';
 
@@ -41,12 +43,46 @@ const useUserLabel = (id: string): { name: string | null; self: boolean } => {
 
 export function UserName({ id }: { id: string }) {
   const { name, self } = useUserLabel(id);
-  if (self) return <span title={id}>{name} (you)</span>;
-  return <span title={id}>{name ?? shortId(id)}</span>;
+  return <span title={id}>{personLabel(id, name, self)}</span>;
 }
 
 /** The round initials avatar for a user id; a neutral mark until the name is known. */
 export function UserAvatar({ id }: { id: string }) {
   const { name } = useUserLabel(id);
   return <Avatar kind="human" name={name ?? '?'} />;
+}
+
+/**
+ * Who started a build or a deployment: a person, an agent or the system, with
+ * their avatar. The deployment card and the build view say it the same way.
+ */
+export function StartedBy({
+  type,
+  id,
+}: {
+  type: Deployment['created_by_type'] | Build['created_by_type'];
+  id: string;
+}) {
+  if (type === 'user') {
+    return (
+      <>
+        <UserAvatar id={id} />
+        <UserName id={id} />
+      </>
+    );
+  }
+  if (type === 'agent') {
+    return (
+      <>
+        <Avatar kind="agent" seed={id} />
+        <AgentName id={id} link={false} />
+      </>
+    );
+  }
+  return (
+    <>
+      <Avatar kind="system" />
+      System
+    </>
+  );
 }

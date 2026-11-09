@@ -2,9 +2,13 @@ import { describe, expect, it } from 'vitest';
 import type { AuditRecord } from '../api/generated/model';
 import {
   capitalize,
+  channelPhrase,
+  createdName,
   dayLabel,
   groupByDay,
+  namesFromRecords,
   recordAction,
+  recordTargets,
   recordSentence,
   resultTag,
   segmentsText,
@@ -103,7 +107,7 @@ describe('recordSentence', () => {
         target_type: 'approval',
         target_id: APPROVAL,
       }),
-    ).toBe('Omar denied on-call-restarter’s request to delete blog in the panel');
+    ).toBe('Omar denied on-call-restarter’s request to delete blog while signed in');
   });
 
   it('says what a person created, from the parameters', () => {
@@ -117,7 +121,7 @@ describe('recordSentence', () => {
         target_id: AGENT,
         params: { name: 'on-call-restarter' },
       }),
-    ).toBe('Omar created the agent on-call-restarter in the panel');
+    ).toBe('Omar created the agent on-call-restarter while signed in');
     expect(
       say({
         actor_type: 'user',
@@ -128,7 +132,7 @@ describe('recordSentence', () => {
         target_id: GRANT,
         params: { agent_id: AGENT, scopes: ['app:read', 'app:logs'], selector: { projects: ['blog'] } },
       }),
-    ).toBe('Omar gave on-call-restarter a grant to read apps on project blog in the panel');
+    ).toBe('Omar gave on-call-restarter a grant to read apps on project blog while signed in');
   });
 
   it('says what Quoro did from the target, not the operation name', () => {
@@ -189,6 +193,103 @@ describe('days', () => {
     expect(groups.map((group) => [group.label, group.records.length])).toEqual([
       ['Yesterday', 2],
       ['Today', 1],
+    ]);
+  });
+});
+
+describe('issue 637: what the record can and cannot tell', () => {
+  const say = (patch: Partial<AuditRecord>, context: RecordContext = ctx) =>
+    segmentsText(recordSentence(record(patch), context));
+
+  it('says "signed in" for a session call: a script with the cookie records the same channel as the panel', () => {
+    expect(channelPhrase('panel')).toBe('while signed in');
+    expect(channelPhrase('api')).toBe('via the API');
+    expect(
+      say({ actor_type: 'user', actor_id: USER, channel: 'panel', operation: 'POST /api/v1/agents', target_type: 'agent', target_id: AGENT, params: { name: 'x' } }),
+    ).not.toContain('in the panel');
+  });
+
+  it('names every scope of a grant the plain phrase cannot say', () => {
+    const grantRecord = (scopes: string[]) =>
+      say({
+        actor_type: 'user',
+        actor_id: USER,
+        channel: 'panel',
+        operation: 'POST /api/v1/grants',
+        target_type: 'grant',
+        target_id: GRANT,
+        params: { agent_id: AGENT, scopes, selector: { projects: ['approval-demo'] } },
+      });
+    expect(grantRecord(['app:read', 'approval:create', 'approval:read'])).toBe(
+      `${NAMES[USER]} gave on-call-restarter a grant for app:read, approval:create and approval:read on project approval-demo while signed in`,
+    );
+    expect(grantRecord(['app:read', 'app:restart'])).toBe(
+      `${NAMES[USER]} gave on-call-restarter a grant to read and restart apps on project approval-demo while signed in`,
+    );
+    expect(grantRecord(['app:read', 'approval:create', 'approval:read', 'event:read', 'audit:read'])).toBe(
+      `${NAMES[USER]} gave on-call-restarter a grant for app:read and 4 more on project approval-demo while signed in`,
+    );
+  });
+
+  it('sets the scopes of such a grant in code type', () => {
+    const segments = recordSentence(
+      record({
+        actor_type: 'user',
+        actor_id: USER,
+        channel: 'panel',
+        operation: 'POST /api/v1/grants',
+        target_type: 'grant',
+        target_id: GRANT,
+        params: { agent_id: AGENT, scopes: ['app:read', 'approval:create'] },
+      }),
+      ctx,
+    );
+    expect(segments.filter((segment) => segment.code).map((segment) => segment.text)).toEqual([
+      'app:read',
+      'approval:create',
+    ]);
+  });
+
+  it('says "a deleted app" for a target that is gone and whose name nothing kept', () => {
+    const GONE = 'app_01JD5Z8Q4XK3M9V2T7B6N1R0SZ';
+    const goneCtx: RecordContext = { ...ctx, gone: (type, id) => type === 'app' && id === GONE };
+    expect(say({ operation: 'GET /api/v1/apps/{app_id}', channel: 'api', target_id: GONE }, goneCtx)).toBe(
+      'on-call-restarter read a deleted app via the API',
+    );
+    // Still listed, or not known to be gone: the short id, as before.
+    expect(say({ operation: 'GET /api/v1/apps/{app_id}', channel: 'api', target_id: GONE })).toBe(
+      'on-call-restarter read app app_01JD5Z… via the API',
+    );
+  });
+
+  it('keeps the name a create record gave a target', () => {
+    const create = record({
+      actor_type: 'user',
+      actor_id: USER,
+      channel: 'panel',
+      operation: 'POST /api/v1/apps',
+      target_type: 'app',
+      target_id: 'app_01M70C9KQ6M3BRAVMXJ0G2DJAJ',
+      params: { name: 'scratch', image: 'docker.io/traefik/whoami:v1.10', port: 80 },
+    });
+    expect(createdName(create)).toBe('scratch');
+    expect(createdName({ ...create, result: 'refused' })).toBeUndefined();
+    expect(createdName({ ...create, operation: 'DELETE /api/v1/apps/{app_id}' })).toBeUndefined();
+    expect([...namesFromRecords([create, record({})])]).toEqual([['app_01M70C9KQ6M3BRAVMXJ0G2DJAJ', 'scratch']]);
+  });
+
+  it('lists the targets a sentence names, with the target of an approval record', () => {
+    expect(
+      recordTargets(
+        [
+          record({}),
+          record({ operation: 'POST /api/v1/approvals/{approval_id}/approve', target_type: 'approval', target_id: APPROVAL }),
+        ],
+        ctx,
+      ),
+    ).toEqual([
+      { type: 'app', id: APP },
+      { type: 'approval', id: APPROVAL },
     ]);
   });
 });

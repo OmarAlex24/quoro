@@ -5,7 +5,7 @@ import type { App, Build, Vm } from '../api/generated/model';
 import { useListAppBackups } from '../api/generated/backups/backups';
 import { useListAppDomains } from '../api/generated/domains/domains';
 import { useListAppVolumes } from '../api/generated/volumes/volumes';
-import { appLampState } from '../lib/app-status';
+import { serviceLampState } from '../lib/app-status';
 import { lampState } from '../lib/lamp';
 import {
   appAddress,
@@ -120,7 +120,8 @@ export function AppCard({
   /** Open in the service sheet. */
   selected?: boolean;
 }) {
-  const lamp = appLampState(app.status);
+  // The sheet's header reads the same two things the same way.
+  const lamp = serviceLampState(app.status, builds);
   const domains = useListAppDomains(app.id, undefined, {
     query: { staleTime: 10_000, retry: false },
   });
@@ -158,7 +159,7 @@ export function AppCard({
       lamp={<LampDot ring={lamp.tone} core={lamp.tone} pulse={lamp.pulse} size={15} />}
       word={lamp.statusText}
       foot={foot}
-      deploying={app.status === 'deploying'}
+      deploying={lamp.pulse}
       link={{ projectId: app.project_id, search: { app: app.id, tab: 'deployments' } }}
       selected={selected}
     />

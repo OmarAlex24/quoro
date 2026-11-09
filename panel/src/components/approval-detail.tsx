@@ -7,6 +7,7 @@ import { shortHash } from '../lib/agency-format';
 import { relativeTime } from '../lib/app-status';
 import {
   approvalMeter,
+  askState,
   approvalWants,
   approvalWords,
   callText,
@@ -59,11 +60,12 @@ export function ApprovalDetail({
   const agent = agents.data?.items.find((candidate) => candidate.id === approval.agent_id);
   const agentName = agent?.name ?? ctx.name?.('agent', approval.agent_id) ?? 'An agent';
   const name = (type: string, id: string) => ctx.name?.(type, id);
+  const state = askState(approval, ctx);
   const meter = approvalMeter(approval, now);
   const incident = approval.incident_id ? ctx.name?.('incident', approval.incident_id) : undefined;
 
   return (
-    <article className="apr" aria-label={`${agentName} ${approvalWants(approval, name)}`}>
+    <article className="apr" aria-label={`${agentName} ${approvalWants(approval, name, state)}`}>
       <Link to="/approvals" className={cn('apr-back text-[13px]', linkClass)}>
         All requests
       </Link>
@@ -72,7 +74,7 @@ export function ApprovalDetail({
         <Avatar kind="agent" seed={approval.agent_id} size="lg" />
         <div className="min-w-0">
           <h2>
-            {agentName} {approvalWants(approval, name)}
+            {agentName} {approvalWants(approval, name, state)}
           </h2>
           <p className="apr-tags">
             <Tag tone="code">{approval.scope}</Tag>
@@ -86,7 +88,7 @@ export function ApprovalDetail({
           </p>
           <p className="apr-sub">
             {agent ? `${agent.model} · ` : ''}asked <span title={approval.created_at}>{relativeTime(approval.created_at, now)}</span>
-            {approval.target.type === 'app' ? (
+            {approval.target.type === 'app' && !state.gone ? (
               <>
                 {' · '}
                 <Link to="/apps/$appId" params={{ appId: approval.target.id }} title={approval.target.id} className={linkClass}>

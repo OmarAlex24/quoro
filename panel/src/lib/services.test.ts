@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import type { App, Backup, Build } from '../api/generated/model';
 import {
   appAddress,
+  appIdOfKey,
+  appKey,
   commitLine,
   lastBuildFailed,
   memoryWords,
@@ -84,5 +86,13 @@ describe('footer lines', () => {
   it('names the nodes once each, sorted, and skips unknown ones', () => {
     expect(nodesLine(['n2', 'n1', 'n2', 'n9'], { n1: 'lab-1', n2: 'lab-2' })).toBe('lab-1 · lab-2');
     expect(nodesLine(['n9'], {})).toBeNull();
+  });
+});
+
+describe('appIdOfKey', () => {
+  it('reads the app id back from a service key, and nothing from a VM key', () => {
+    expect(appIdOfKey(appKey('app_1'))).toBe('app_1');
+    expect(appIdOfKey('vm:vm_1')).toBeUndefined();
+    expect(appIdOfKey(undefined)).toBeUndefined();
   });
 });

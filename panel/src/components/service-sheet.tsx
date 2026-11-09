@@ -20,12 +20,13 @@ import { getListAppDeploymentsQueryKey } from '../api/generated/deployments/depl
 import type { App, AppDetail, Deployment } from '../api/generated/model';
 import { useListNodes } from '../api/generated/nodes/nodes';
 import { useGetAppVulnerabilities } from '../api/generated/vulnerabilities/vulnerabilities';
-import { appLampState, relativeTime } from '../lib/app-status';
+import { appsPollingInterval, relativeTime, serviceLampState } from '../lib/app-status';
 import { canOpenTerminal } from '../lib/capabilities';
 import { problemView, type ProblemView } from '../lib/problem';
 import { PROJECT_TABS, type ProjectTab } from '../lib/routes';
 import { appAddress, appKind } from '../lib/services';
 import { securityParams, securityTabCount } from '../lib/vulnerabilities';
+import { cachedBuildLive, useRecentBuilds } from '../lib/use-builds';
 import { useSession } from '../session';
 import { AppEnvDialog } from './app-env-dialog';
 import { GlyphTile } from './glyph-tile';
@@ -88,10 +89,17 @@ export function ServiceSheet({
   onClose: () => void;
 }) {
   const contentRef = useRef<HTMLDivElement>(null);
+  const queryClient = useQueryClient();
+  // The canvas draws this app's card from this same read, with the same
+  // refresh rule as the list: every 2 s while it deploys or builds.
   const appQuery = useGetApp(appId, {
     query: {
       retry: false,
-      refetchInterval: (query) => (query.state.data?.status === 'deploying' ? 2_000 : 10_000),
+      refetchInterval: (query) =>
+        appsPollingInterval(
+          query.state.data ? [query.state.data] : [],
+          query.state.data?.source != null && cachedBuildLive(queryClient, appId),
+        ),
     },
   });
   const app = appQuery.data;
@@ -207,7 +215,9 @@ function SheetBody({
     action.mutate(kind);
   };
 
-  const lamp = appLampState(app.status);
+  // The card reads the same two things the same way (`serviceLampState`).
+  const builds = useRecentBuilds([app]);
+  const lamp = serviceLampState(app.status, builds[app.id]);
   const terminal = canWrite && canOpenTerminal(me);
   // The open findings on the Security tab: the same request the tab makes
   // with no filter, so opening the tab reads it from the cache.

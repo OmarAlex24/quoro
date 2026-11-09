@@ -36,7 +36,7 @@ export const actorWords: Record<AuditRecordActorType, string> = {
 
 export const channelWords: Record<AuditRecordChannel, string> = {
   api: 'API',
-  panel: 'Panel',
+  panel: 'Signed-in session',
   mcp: 'MCP',
   cli: 'CLI',
   system: 'System',

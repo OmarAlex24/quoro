@@ -4,7 +4,7 @@ import type {
   DecisionRequest,
   Scope,
 } from '../api/generated/model';
-import { scopeVerb } from './activity';
+import { deletedWords, kindWord, scopeVerb, type RecordContext } from './activity';
 import { clamp } from './dither';
 import { expiryWords, shortId } from './agency-format';
 import { DESTRUCTIVE_SCOPES } from './scopes';
@@ -108,33 +108,83 @@ export const callText = (approval: Pick<Approval, 'operation' | 'params'>): stri
   return `${approval.operation} { ${parts.join(', ')} }`;
 };
 
-/** The target of a request by name: "blog" for an app or VM, "project docs" otherwise. */
-const askTarget = (
-  approval: Pick<Approval, 'target'>,
-  name: (type: string, id: string) => string | undefined,
-): { name: string; kind: string } => {
-  const { type, id } = approval.target;
-  const known = name(type, id);
-  return { name: known ?? shortId(id), kind: type };
+/**
+ * True once the one call an approval allowed has run: it was approved and the
+ * one-time grant it issued was used. Until then the request is said as asked.
+ */
+export const approvalRan = (
+  approval: Pick<Approval, 'status'>,
+  grant: { readonly uses?: number } | undefined,
+): boolean => approval.status === 'approved' && (grant?.uses ?? 0) > 0;
+
+/** Where a request stands for its words: whether its call ran, and whether its target is gone. */
+export interface AskState {
+  readonly ran?: boolean;
+  readonly gone?: boolean;
+}
+
+/** The state of a request from the grants and lists the context holds. */
+export const askState = (
+  approval: Pick<Approval, 'status' | 'grant_id' | 'target'>,
+  ctx: Pick<RecordContext, 'grant' | 'gone'>,
+): AskState => ({
+  ran: approvalRan(approval, approval.grant_id ? ctx.grant?.(approval.grant_id) : undefined),
+  gone: ctx.gone?.(approval.target.type, approval.target.id) ?? false,
+});
+
+/** "an app", "a VM": a kind with its article. */
+const aKind = (type: string): string => {
+  const word = kindWord(type);
+  return `${/^[aeiou]/i.test(word) ? 'an' : 'a'} ${word}`;
 };
 
-/** A request in two words for a list: "Delete blog", "Delete project docs". */
+/**
+ * What a request acts on, in words. A known name stays, also once the target
+ * is gone. A gone target with no name left is "a deleted app", or just "an
+ * app" after a verb that already says it was deleted. Otherwise the short id.
+ */
+const askObject = (
+  approval: Pick<Approval, 'scope' | 'target'>,
+  name: (type: string, id: string) => string | undefined,
+  state: AskState,
+  withKind: boolean,
+): string => {
+  const { type, id } = approval.target;
+  const known = name(type, id);
+  if (known) return withKind || (type !== 'app' && type !== 'vm') ? `${withKind ? 'the ' : ''}${kindWord(type)} ${known}` : known;
+  if (state.gone) {
+    const verb = approval.scope.slice(approval.scope.indexOf(':') + 1);
+    return state.ran && (verb === 'delete' || verb === 'remove') ? aKind(type) : deletedWords(type);
+  }
+  return withKind ? `the ${kindWord(type)} ${shortId(id)}` : shortId(id);
+};
+
+/**
+ * A request in two words for a list: "Delete blog", "Delete project docs";
+ * once its call ran, "Deleted blog".
+ */
 export const approvalTitle = (
   approval: Pick<Approval, 'scope' | 'target'>,
   name: (type: string, id: string) => string | undefined,
+  state: AskState = {},
 ): string => {
-  const [base] = scopeVerb(approval.scope);
-  const target = askTarget(approval, name);
-  const object = target.kind === 'app' || target.kind === 'vm' ? target.name : `${target.kind} ${target.name}`;
-  return `${base.charAt(0).toUpperCase()}${base.slice(1)} ${object}`;
+  const [base, , past] = scopeVerb(approval.scope);
+  const verb = state.ran ? past : base;
+  return `${verb.charAt(0).toUpperCase()}${verb.slice(1)} ${askObject(approval, name, state, false)}`;
 };
 
-/** What the agent wants, after its name: "wants to delete the app blog". */
+/**
+ * What the agent asked, after its name: "wants to delete the app blog" while
+ * it waits, "asked to delete the app blog" once decided, and "deleted the app
+ * blog" once the call ran.
+ */
 export const approvalWants = (
-  approval: Pick<Approval, 'scope' | 'target'>,
+  approval: Pick<Approval, 'scope' | 'target' | 'status'>,
   name: (type: string, id: string) => string | undefined,
+  state: AskState = {},
 ): string => {
-  const [base] = scopeVerb(approval.scope);
-  const target = askTarget(approval, name);
-  return `wants to ${base} the ${target.kind} ${target.name}`;
+  const [base, , past] = scopeVerb(approval.scope);
+  const object = askObject(approval, name, state, true);
+  if (state.ran) return `${past} ${object}`;
+  return approval.status === 'pending' ? `wants to ${base} ${object}` : `asked to ${base} ${object}`;
 };

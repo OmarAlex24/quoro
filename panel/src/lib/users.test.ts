@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  personLabel,
   emailProblem,
   generatePassword,
   inviteText,
@@ -82,5 +83,16 @@ describe('roles and invite text', () => {
   it('lights a disabled user idle and an enabled one run', () => {
     expect(userLamp({ disabled: true })).toEqual({ tone: 'idle', statusText: 'Disabled' });
     expect(userLamp({ disabled: false })).toEqual({ tone: 'run', statusText: 'Enabled' });
+  });
+});
+
+describe('personLabel', () => {
+  it('names a person the way the deployment card does, with (you) for the one signed in', () => {
+    expect(personLabel('usr_01M70BF53B541C2D4X0EWYCFXF', 'Lab owner', true)).toBe('Lab owner (you)');
+    expect(personLabel('usr_01M70BF53B541C2D4X0EWYCFXF', 'Ada Moreno')).toBe('Ada Moreno');
+  });
+
+  it('shows a short id, never a raw one, until a name is known', () => {
+    expect(personLabel('usr_01M70BF53B541C2D4X0EWYCFXF', null)).toBe('usr_01M70B…');
   });
 });

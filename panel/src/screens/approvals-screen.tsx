@@ -4,9 +4,11 @@ import { useGetApproval, useListApprovals } from '../api/generated/approvals/app
 import type { Approval } from '../api/generated/model';
 import { expiryWords } from '../lib/agency-format';
 import { relativeTime } from '../lib/app-status';
+import type { RecordContext } from '../lib/activity';
 import {
   approvalTitle,
   approvalWords,
+  askState,
   decidedAt,
   decidedNewestFirst,
   pendingByExpiry,
@@ -15,7 +17,7 @@ import {
 import { canDecideApprovals } from '../lib/capabilities';
 import { problemView, type ProblemView } from '../lib/problem';
 import { useNow } from '../lib/use-now';
-import { useRecordContext } from '../lib/use-record-context';
+import { useKeptNames, useRecordContext } from '../lib/use-record-context';
 import { cn } from '../lib/utils';
 import { useSession } from '../session';
 import { ApprovalDetail } from '../components/approval-detail';
@@ -38,15 +40,16 @@ const linkClass =
 function ApprovalItem({
   approval,
   selected,
-  name,
+  ctx,
   now,
 }: {
   approval: Approval;
   selected: boolean;
-  name: (type: string, id: string) => string | undefined;
+  ctx: RecordContext;
   now: number;
 }) {
   const left = expiryWords(approval.expires_at, now);
+  const name = (type: string, id: string) => ctx.name?.(type, id);
   return (
     <li>
       <Link
@@ -57,7 +60,7 @@ function ApprovalItem({
       >
         <Avatar kind="agent" seed={approval.agent_id} />
         <span className="li-t">
-          <b>{approvalTitle(approval, name)}</b>
+          <b>{approvalTitle(approval, name, askState(approval, ctx))}</b>
           <small>
             <AgentName id={approval.agent_id} link={false} />
             {' · '}
@@ -93,7 +96,7 @@ export function ApprovalsScreen() {
   const { me, loading, unauthenticated } = useSession();
   const search = approvalsRoute.useSearch();
   const canDecide = canDecideApprovals(me);
-  const ctx = useRecordContext();
+  const records = useRecordContext();
   const now = useNow(true, 30_000);
   const [notice, setNotice] = useState<DecisionNotice | null>(null);
   const [decisionProblem, setDecisionProblem] = useState<ProblemView | null>(null);
@@ -130,6 +133,11 @@ export function ApprovalsScreen() {
     query: { enabled: enabled && search.approval !== undefined && listedChoice === undefined && !pending.isPending, retry: false },
   });
   const chosen = listedChoice ?? direct.data;
+  // A request about an app deleted since still says its name.
+  const ctx = useKeptNames(
+    records,
+    [...listed, ...(direct.data ? [direct.data] : [])].map((approval) => approval.target),
+  );
 
   if (loading) {
     return (
@@ -143,7 +151,6 @@ export function ApprovalsScreen() {
 
   const listError = pending.error ?? approved.error ?? denied.error ?? expired.error;
   const errorView = listError ? problemView(listError, 'see approvals') : null;
-  const name = (type: string, id: string) => ctx.name?.(type, id);
   const loadingDecided = approved.isPending || denied.isPending || expired.isPending;
 
   return (
@@ -192,7 +199,7 @@ export function ApprovalsScreen() {
           ) : (
             <ul>
               {waiting.map((approval) => (
-                <ApprovalItem key={approval.id} approval={approval} selected={approval.id === chosen?.id} name={name} now={now} />
+                <ApprovalItem key={approval.id} approval={approval} selected={approval.id === chosen?.id} ctx={ctx} now={now} />
               ))}
             </ul>
           )}
@@ -205,7 +212,7 @@ export function ApprovalsScreen() {
           ) : (
             <ul>
               {decided.map((approval) => (
-                <ApprovalItem key={approval.id} approval={approval} selected={approval.id === chosen?.id} name={name} now={now} />
+                <ApprovalItem key={approval.id} approval={approval} selected={approval.id === chosen?.id} ctx={ctx} now={now} />
               ))}
             </ul>
           )}

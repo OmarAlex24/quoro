@@ -17,6 +17,7 @@ import { problemView, type ProblemView } from '../lib/problem';
 import { BuildFailure } from './build-failure';
 import { BuildLog, type BuildJumpRequest } from './build-log';
 import { BuildStationList } from './build-rail';
+import { StartedBy } from './identity-name';
 import { ImageRef } from './image-ref';
 import { ToneLamp } from './tone-lamp';
 import { Button } from './ui/button';
@@ -131,10 +132,8 @@ export function BuildView({
         </div>
         <div className="flex gap-2">
           <dt className="text-ink-2">Started by</dt>
-          <dd className="min-w-0 truncate text-ink" title={build.created_by_id}>
-            {build.created_by_type === 'system'
-              ? 'system'
-              : `${build.created_by_type} ${build.created_by_id.slice(0, 10)}…`}
+          <dd className="flex min-w-0 items-center gap-1.5 text-ink">
+            <StartedBy type={build.created_by_type} id={build.created_by_id} />
           </dd>
         </div>
         <div className="flex gap-2 sm:col-span-2">
