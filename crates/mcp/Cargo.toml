@@ -18,7 +18,7 @@ quoro-control-plane = { path = "../control-plane" }
 quoro-types = { path = "../types" }
 # The official MCP SDK, pinned to one minor version (ADR 0048): the server
 # handler model and the Streamable HTTP transport as a Tower service.
-rmcp = { version = "~3.8", default-features = false, features = [
+rmcp = { version = "~3.9", default-features = false, features = [
     "server",
     "transport-streamable-http-server",
 ] }

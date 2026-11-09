@@ -86,6 +86,11 @@ Each entry links the pull request that made the change and, where one exists, th
 - Deleting an app deleted its volume records at once, so the node was never told and the volume files stayed on its disk until an operator removed them. Every volume of the deleted app now stays `deleting`, readable with `getVolume`, until its node removes the file and reports it, and its node is told even when it keeps only a detached volume. The holder of the app's lease now also receives the `lease_revoke` with reason `deleted` that deleting the app was meant to send ([#420], [ADR 0165]).
 - Every domain stayed `pending` in the API and the panel, even while its hostname was served: nothing computed a domain's serving status. The primary now recomputes it whenever an app's instances, its replicas, a domain, a tunnel mapping or the edge change, and at least every 30 s. A domain is `serving` when a machine serves its hostname, `unserved` with the reason in `last_error` when its app has an instance meant to run but no machine can serve it (for example a `tunnel` hostname of a one-replica app whose node has no tunnel), and `pending` while its app runs no instance. Becoming `unserved` emits `domain.unserved`, and being served again emits `domain.served` with the time it became `unserved`, even when the app was stopped in between; a `tunnel` domain no tunnel serves is no longer reported as `certificate.failed`. The app's Domains card shows the serving status and the reason ([#422], [ADR 0167]).
 
+### Security
+
+- rmcp, the MCP SDK, moves to 3.9 (RUSTSEC-2026-0462). Before 3.9.0 its Streamable HTTP clients read a server's response body with no size limit, so a hostile MCP server could exhaust the client's memory. Quoro uses only rmcp's server side and was not exposed, but the dependency check fails on 3.8 ([#620], [#618]).
+- The dependency check ignores RUSTSEC-2026-0459 for now. The SQLite that sqlx bundles, before 3.54, can return uninitialised memory when it opens a database together with a crafted `-wal` file. Quoro opens only the SQLite files it writes in its own data directory, a restore removes stale `-wal` and `-shm` files before it opens the database, and the image inventory reads `rpmdb.sqlite` with its own reader, not with SQLite. No sqlx release takes the fixed SQLite yet; the ignore goes once one does ([#619]) ([#620], [#618]).
+
 ## [v0.2.0] - 2026-11-05
 
 Milestone M5a: stateless replicas behind an edge, local volumes, cold backups and vulnerability tracking. The milestone is complete: its demo ran on the lab and was approved on 2026-11-05. Still an experimental preview, not for production ([ADR 0137]).
@@ -629,3 +634,6 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [ADR 0246]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0246-a-fence-started-by-a-lease-revoke-records-its-failure-with.md
 [ADR 0247]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0247-fence-ack-stores-current-token-1-for-a-listed-lease-another.md
 [ADR 0258]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0258-a-primary-changes-a-lease-s-mode-only-with-the-same-token.md
+[#618]: https://github.com/OmarAlex24/quoro/issues/618
+[#619]: https://github.com/OmarAlex24/quoro/issues/619
+[#620]: https://github.com/OmarAlex24/quoro/pull/620
