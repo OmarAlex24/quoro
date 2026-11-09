@@ -1,12 +1,12 @@
 # ADR 0268: A grant longer than a lease's stored duration_ms waits until every node-role machine holds the raise
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0289](0289-two-readings-of-d-0268-a-maintenance-window-fails-when-the.md)
 - **Date:** 2026-11-07
 - **Ledger id:** D-0268
 - **Tags:** m5b, leases, contracts, warm
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** [ADR 0254](0254-a-converted-lease-s-first-gate-counts-the-conversion-grant.md), [ADR 0171](0171-expiring-lease-defaults-for-warm-d-15-s-m-1-5-s-t-grace-1-s.md)
+- **Related:** [ADR 0254](0254-a-converted-lease-s-first-gate-counts-the-conversion-grant.md), [ADR 0171](0171-expiring-lease-defaults-for-warm-d-15-s-m-1-5-s-t-grace-1-s.md), [ADR 0289](0289-two-readings-of-d-0268-a-maintenance-window-fails-when-the.md)
 
 ## Context
 
@@ -24,6 +24,7 @@ _Some wording was changed for the public repository._
 
 - Refines [ADR 0254](0254-a-converted-lease-s-first-gate-counts-the-conversion-grant.md): when a conversion grant longer than the stored duration_ms is sent: only once the raise before it is replicated. The rest of [ADR 0254](0254-a-converted-lease-s-first-gate-counts-the-conversion-grant.md) stands.
 - Refines [ADR 0171](0171-expiring-lease-defaults-for-warm-d-15-s-m-1-5-s-t-grace-1-s.md): when a maintenance window's W is answered: only once the raise of duration_ms to W is replicated. The rest of [ADR 0171](0171-expiring-lease-defaults-for-warm-d-15-s-m-1-5-s-t-grace-1-s.md) stands.
+- [ADR 0289](0289-two-readings-of-d-0268-a-maintenance-window-fails-when-the.md) refines what happens while a node does not hold the raise: a maintenance window fails when the raise is not replicated within D/3 plus one margin, and a conversion with no stored duration_ms waits for the raise. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---

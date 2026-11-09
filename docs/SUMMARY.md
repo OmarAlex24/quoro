@@ -293,6 +293,9 @@
   - [0285: A volume restore that turns an expiring lease row local at a new token sets the unsettled mark as R does, so its grant waits for replication and majority support](adr/0285-a-volume-restore-that-turns-an-expiring-lease-row-local-at.md)
   - [0286: An app's change-log payload carries warm_node_id, warm_node_pinned and warm_interval_s beside the App fields, and App.warm stays null in it](adr/0286-an-app-s-change-log-payload-carries-warm-node-id-warm-node.md)
   - [0287: A released pin keeps an eligible warm node, and only a reported pause_copy counts as no longer snapshotting with reflink](adr/0287-a-released-pin-keeps-an-eligible-warm-node-and-only-a.md)
+  - [0288: A new-token local grant of a warm app's lease sets the unsettled mark whatever the row reads, which also covers the conversion window](adr/0288-a-new-token-local-grant-of-a-warm-app-s-lease-sets-the.md)
+  - [0289: Two readings of D-0268: a maintenance window fails when the raise is not replicated within D/3 plus one margin, and a conversion with no stored duration_ms waits for the raise](adr/0289-two-readings-of-d-0268-a-maintenance-window-fails-when-the.md)
+  - [0292: failoverApp answers 202 at once while the grant of a marked lease waits, and the lease shows the wait (grant_pending, grant_waiting_on)](adr/0292-failoverapp-answers-202-at-once-while-the-grant-of-a-marked.md)
 
 # Background research
 
