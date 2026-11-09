@@ -1045,7 +1045,7 @@ components:
             How many change-log entries the node is behind the primary: the
             primary's newest seq minus `log_seq`. Null for a machine that does
             not follow, one without the `node` role (node-agent-protocol.md
-            section 7.1). Absent until the promotion and custody work ships.
+            section 7.1). Absent until change-log follow ships (ADR 0301).
         custody:
           description: |
             Whether the cluster keys are sealed to this machine, so it can be
