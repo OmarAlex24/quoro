@@ -1,12 +1,12 @@
 # ADR 0227: Change-log follow sends one log_entries batch at a time and keeps each node's acknowledged seq in memory; Node.log_lag shows the gap
 
-- **Status:** Accepted; refined by [ADR 0261](0261-every-node-holds-a-lease-row-s-local-write-before-an.md), [ADR 0301](0301-node-log-lag-is-absent-only-until-change-log-follow-ships.md)
+- **Status:** Accepted; refined by [ADR 0261](0261-every-node-holds-a-lease-row-s-local-write-before-an.md), [ADR 0301](0301-node-log-lag-is-absent-only-until-change-log-follow-ships.md), [ADR 0302](0302-change-log-append-refuses-an-entry-a-follower-could-not.md)
 - **Date:** 2026-11-06
 - **Ledger id:** D-0227
 - **Tags:** m5b, contracts, promotion
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** [ADR 0261](0261-every-node-holds-a-lease-row-s-local-write-before-an.md), [ADR 0301](0301-node-log-lag-is-absent-only-until-change-log-follow-ships.md)
+- **Related:** [ADR 0261](0261-every-node-holds-a-lease-row-s-local-write-before-an.md), [ADR 0301](0301-node-log-lag-is-absent-only-until-change-log-follow-ships.md), [ADR 0302](0302-change-log-append-refuses-an-entry-a-follower-could-not.md)
 
 ## Context
 
@@ -22,6 +22,7 @@ The primary keeps at most one log_entries message per session unacknowledged (up
 
 - [ADR 0261](0261-every-node-holds-a-lease-row-s-local-write-before-an.md) refines durable acknowledgements, the high-water mark, the refollowing state, and acknowledgements reset on a divergence. The rest of this decision stands.
 - [ADR 0301](0301-node-log-lag-is-absent-only-until-change-log-follow-ships.md) refines when Node.log_lag appears: once change-log follow ships. The rest of this decision stands.
+- [ADR 0302](0302-change-log-append-refuses-an-entry-a-follower-could-not.md) refines which entries the primary may write: only one that can be sent alone in one log_entries message and verified by a node. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---
