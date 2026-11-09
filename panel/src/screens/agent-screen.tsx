@@ -12,7 +12,7 @@ import {
 import { useListGrants } from '../api/generated/grants/grants';
 import type { Agent, Grant } from '../api/generated/model';
 import { isApiProblem } from '../api/fetcher';
-import type { RecordContext } from '../lib/activity';
+import { recordTargets, type RecordContext } from '../lib/activity';
 import { agentDisabledPatch, agentStatus } from '../lib/agents';
 import { relativeTime } from '../lib/app-status';
 import {
@@ -26,6 +26,7 @@ import { problemView, type ProblemView } from '../lib/problem';
 import { agentTab, type AgentTab } from '../lib/routes';
 import { useAgentCalls } from '../lib/use-agent-calls';
 import { useNow } from '../lib/use-now';
+import { useKeptNames } from '../lib/use-record-context';
 import { cn } from '../lib/utils';
 import { useSession } from '../session';
 import { ActivityRow } from '../components/activity-row';
@@ -240,7 +241,7 @@ function AgentPane({
 }
 
 /** No incident open: what the agent did lately, the grants it holds and its keys. */
-function AgentOverview({ agent, facts, ctx }: { agent: Agent; facts: AgentFacts; ctx: RecordContext }) {
+function AgentOverview({ agent, facts, ctx: records }: { agent: Agent; facts: AgentFacts; ctx: RecordContext }) {
   const { me } = useSession();
   const navigate = useNavigate();
   const now = useNow(true, 30_000);
@@ -252,6 +253,8 @@ function AgentOverview({ agent, facts, ctx }: { agent: Agent; facts: AgentFacts;
 
   // Newest first, as Activity reads: the first page always holds the latest.
   const recent = useMemo(() => (calls.data ? calls.data.records.slice(0, RECENT) : []), [calls.data]);
+  const targets = useMemo(() => recordTargets(recent, records), [recent, records]);
+  const ctx = useKeptNames(records, targets, recent);
   const active = facts.grants.filter((grant) => grant.status === 'active');
   const liveKeys = (keys.data?.items ?? []).filter((key) => !key.revoked_at);
   const lastUsed = liveKeys

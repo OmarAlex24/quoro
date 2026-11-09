@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import type { AppStatus } from '../api/generated/model';
+import type { App, AppDetail, AppStatus } from '../api/generated/model';
 import {
   appLampState,
   appsPollingInterval,
+  newestBuildLive,
+  serviceLampState,
+  withOpenApp,
   certTone,
   certWords,
   pickDefaultNode,
@@ -122,5 +125,39 @@ describe('pickDefaultNode', () => {
 
   it('returns an empty id when no node is listed', () => {
     expect(pickDefaultNode([])).toBe('');
+  });
+});
+
+describe('issue 637: the card and the sheet say the same state', () => {
+  it('says Building while the newest build runs, on a first build too', () => {
+    expect(serviceLampState('stopped', [{ status: 'preparing' }]).statusText).toBe('Building');
+    expect(serviceLampState('running', [{ status: 'exporting' }, { status: 'succeeded' }]).statusText).toBe('Building');
+    expect(serviceLampState('stopped', [{ status: 'preparing' }]).pulse).toBe(true);
+  });
+
+  it('says the app status once the build ended or the deployment started', () => {
+    expect(serviceLampState('deploying', [{ status: 'importing' }]).statusText).toBe('Deploying');
+    expect(serviceLampState('stopped', [{ status: 'failed' }]).statusText).toBe('Stopped');
+    expect(serviceLampState('running', [{ status: 'succeeded' }, { status: 'building' }]).statusText).toBe('Running');
+    expect(serviceLampState('running').statusText).toBe('Running');
+    expect(newestBuildLive([])).toBe(false);
+    expect(newestBuildLive(undefined)).toBe(false);
+  });
+
+  it('polls every 2 s while a build runs, even with no app deploying', () => {
+    expect(appsPollingInterval([{ status: 'stopped' }], true)).toBe(2_000);
+    expect(appsPollingInterval([{ status: 'stopped' }], false)).toBe(10_000);
+  });
+
+  it('draws the open app from the sheet’s read, keeping the other cards as listed', () => {
+    const listed = [
+      { id: 'app_web', name: 'web', status: 'stopped' },
+      { id: 'app_whoami', name: 'whoami', status: 'stopped' },
+    ] as App[];
+    const open = { id: 'app_whoami', name: 'whoami', status: 'running', instances: [], domains: [] } as unknown as AppDetail;
+    const merged = withOpenApp(listed, open);
+    expect(merged.map((app) => app.status)).toEqual(['stopped', 'running']);
+    expect('instances' in merged[1]!).toBe(false);
+    expect(withOpenApp(listed, undefined)).toEqual(listed);
   });
 });

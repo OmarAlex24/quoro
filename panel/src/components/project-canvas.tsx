@@ -9,11 +9,12 @@ import {
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from 'react';
-import { useListApps } from '../api/generated/apps/apps';
+import { useQueryClient } from '@tanstack/react-query';
+import { useGetApp, useListApps } from '../api/generated/apps/apps';
 import type { Project } from '../api/generated/model';
 import { useListNodes } from '../api/generated/nodes/nodes';
 import { useListVms } from '../api/generated/vms/vms';
-import { appsPollingInterval } from '../lib/app-status';
+import { appsPollingInterval, serviceLampState, withOpenApp } from '../lib/app-status';
 import { appFailed, chooseAuras, vmFailed, waitsOnApproval } from '../lib/canvas-aura';
 import {
   autoLayout,
@@ -35,8 +36,8 @@ import {
 import { listIsConverging } from '../lib/lamp';
 import { problemView } from '../lib/problem';
 import { SERVICE_LIST_PARAMS } from '../lib/projects';
-import { lastBuildFailed, projectServices, type ServiceItem } from '../lib/services';
-import { useRecentBuilds } from '../lib/use-builds';
+import { appIdOfKey, lastBuildFailed, projectServices, type ServiceItem } from '../lib/services';
+import { cachedBuildLive, useRecentBuilds } from '../lib/use-builds';
 import { useSession } from '../session';
 import { AccessChip } from './access-chip';
 import { Aura } from './aura';
@@ -90,10 +91,25 @@ export function ProjectCanvas({
   onAdd?: () => void;
 }) {
   const { canWrite } = useSession();
+  const queryClient = useQueryClient();
   const appsQuery = useListApps(
     { project_id: projectId, ...SERVICE_LIST_PARAMS },
-    { query: { refetchInterval: (query) => appsPollingInterval(query.state.data?.items ?? []) } },
+    {
+      query: {
+        refetchInterval: (query) => {
+          const items = query.state.data?.items ?? [];
+          return appsPollingInterval(
+            items,
+            items.some((app) => app.source != null && cachedBuildLive(queryClient, app.id)),
+          );
+        },
+      },
+    },
   );
+  // The app open in the sheet is drawn from the sheet's own read (same query
+  // key, so no second request), so its card never lags the sheet's header.
+  const openAppId = appIdOfKey(selected);
+  const openApp = useGetApp(openAppId ?? '', { query: { enabled: openAppId !== undefined, retry: false } });
   const vmsQuery = useListVms(
     { project_id: projectId, ...SERVICE_LIST_PARAMS },
     {
@@ -104,7 +120,10 @@ export function ProjectCanvas({
     },
   );
   const nodesQuery = useListNodes(undefined, { query: { staleTime: 10_000 } });
-  const apps = useMemo(() => appsQuery.data?.items ?? [], [appsQuery.data]);
+  const apps = useMemo(
+    () => withOpenApp(appsQuery.data?.items ?? [], openApp.data),
+    [appsQuery.data, openApp.data],
+  );
   const vms = useMemo(() => vmsQuery.data?.items ?? [], [vmsQuery.data]);
   const builds = useRecentBuilds(apps);
   const approvals = usePendingApprovals();
@@ -220,7 +239,7 @@ export function ProjectCanvas({
             {
               key,
               waiting: waitsOnApproval(approvals, { type: 'app', id: service.app.id }),
-              deploying: service.app.status === 'deploying',
+              deploying: serviceLampState(service.app.status, appBuilds).pulse,
               failed: appFailed(service.app, appBuilds ? lastBuildFailed(appBuilds) : false),
             },
           ];

@@ -105,7 +105,7 @@ describe('audit actor and channel words', () => {
   it('says how the call arrived', () => {
     expect(channelWords).toEqual({
       api: 'API',
-      panel: 'Panel',
+      panel: 'Signed-in session',
       mcp: 'MCP',
       cli: 'CLI',
       system: 'System',

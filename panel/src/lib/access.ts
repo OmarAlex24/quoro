@@ -74,6 +74,19 @@ export const accessPhrase = (scopes: readonly Scope[]): string | null => {
   return phrases.length === 0 ? null : joinAnd(phrases);
 };
 
+/**
+ * True when `accessPhrase` says every one of these scopes: each acts on a
+ * project's apps, VMs, backups or the project itself with a verb the phrase
+ * knows. A scope it would leave out (`approval:create`, `app:terminal`) makes
+ * it false, so a summary names the scopes instead.
+ */
+export const accessCovers = (scopes: readonly Scope[]): boolean =>
+  scopes.every((scope) => {
+    const resource = scope.slice(0, scope.indexOf(':'));
+    const verb = scope.slice(scope.indexOf(':') + 1);
+    return resource in NOUNS && (verb === 'logs' || VERBS.some(([known]) => known === verb));
+  });
+
 /** "6 d left", "20 h left", "45 min left": the time a grant has, in its largest unit. */
 export const timeLeft = (iso: string, now: number = Date.now()): string => {
   const seconds = Math.max(0, (Date.parse(iso) - now) / 1_000);

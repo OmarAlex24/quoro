@@ -36,10 +36,9 @@ import { problemView, type ProblemView } from '../lib/problem';
 import { useBuildLines } from '../lib/use-build-lines';
 import { useNow } from '../lib/use-now';
 import { cn } from '../lib/utils';
-import { Avatar } from './avatar';
 import { BuildView } from './build-view';
 import { BuildSteps, MiniTape, Stepper, Tape } from './deploy-tape';
-import { AgentName, UserAvatar, UserName } from './identity-name';
+import { StartedBy } from './identity-name';
 import { RebuildWithRefreshedBase } from './app-vulnerabilities';
 import { Button } from './ui/button';
 import { Field } from './ui/field';
@@ -89,32 +88,6 @@ const runTitle = (run: DeployRun): string => {
 
 const clockTime = (ms: number): string =>
   new Date(ms).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
-
-/** Who started a run: a person, an agent or the system, with their avatar. */
-function StartedBy({ type, id }: { type: Deployment['created_by_type']; id: string }) {
-  if (type === 'user') {
-    return (
-      <>
-        <UserAvatar id={id} />
-        <UserName id={id} />
-      </>
-    );
-  }
-  if (type === 'agent') {
-    return (
-      <>
-        <Avatar kind="agent" seed={id} />
-        <AgentName id={id} link={false} />
-      </>
-    );
-  }
-  return (
-    <>
-      <Avatar kind="system" />
-      System
-    </>
-  );
-}
 
 const startedBy = (run: DeployRun) => {
   const source = run.build ?? run.deployment!;

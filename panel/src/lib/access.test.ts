@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { Grant } from '../api/generated/model';
 import {
+  accessCovers,
   accessPhrase,
   approvalAsk,
   approvalExpiry,
@@ -56,6 +57,14 @@ describe('accessPhrase', () => {
   it('leaves out scopes that do not act inside a project', () => {
     expect(accessPhrase(['audit:read', 'event:read'])).toBeNull();
     expect(accessPhrase(['app:read', 'incident:resolve', 'approval:create'])).toBe('read apps');
+  });
+});
+
+describe('accessCovers', () => {
+  it('is true only when the plain phrase says every scope', () => {
+    expect(accessCovers(['app:read', 'app:logs', 'app:restart', 'vm:start'])).toBe(true);
+    expect(accessCovers(['app:read', 'approval:create', 'approval:read'])).toBe(false);
+    expect(accessCovers(['app:terminal'])).toBe(false);
   });
 });
 

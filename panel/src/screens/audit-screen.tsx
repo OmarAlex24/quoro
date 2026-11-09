@@ -18,11 +18,11 @@ import { AuditSheet } from '../components/audit-sheet';
 import { ChainStrip } from '../components/chain-strip';
 import { Button } from '../components/ui/button';
 import { ProblemBanner } from '../components/ui/problem-banner';
-import { groupByDay } from '../lib/activity';
+import { groupByDay, recordTargets } from '../lib/activity';
 import { isConnectorBroken } from '../lib/audit';
 import { problemView, type ProblemView } from '../lib/problem';
 import { useNow } from '../lib/use-now';
-import { useRecordContext } from '../lib/use-record-context';
+import { useKeptNames, useRecordContext } from '../lib/use-record-context';
 import { useSession } from '../session';
 import { LoginScreen } from './login-screen';
 
@@ -34,7 +34,7 @@ export function AuditScreen() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
 
-  const ctx = useRecordContext();
+  const records = useRecordContext();
   const now = useNow(true, 60_000);
   const [verifyResult, setVerifyResult] = useState<AuditVerificationResult | null>(null);
   const [checkedAt, setCheckedAt] = useState<number | null>(null);
@@ -84,6 +84,9 @@ export function AuditScreen() {
     [auditQuery.data],
   );
   const days = useMemo(() => groupByDay(entries, now), [entries, now]);
+  // A deleted app, VM or project keeps the name its creation recorded.
+  const targets = useMemo(() => recordTargets(entries, records), [entries, records]);
+  const ctx = useKeptNames(records, targets, entries);
 
   useEffect(() => {
     if (scrollTo === null) return;

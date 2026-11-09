@@ -7,7 +7,7 @@ import type {
   Scope,
   Selector,
 } from '../api/generated/model';
-import { accessPhrase } from './access';
+import { accessCovers, accessPhrase } from './access';
 import { describeSelector, formatDuration, shortId } from './agency-format';
 
 /*
@@ -33,7 +33,15 @@ export interface RecordContext {
   readonly approval?: (id: string) => Pick<Approval, 'scope' | 'target' | 'status' | 'agent_id'> | undefined;
   readonly grant?: (
     id: string,
-  ) => Pick<Grant, 'agent_id' | 'kind' | 'scopes' | 'selector' | 'created_at' | 'expires_at'> | undefined;
+  ) =>
+    | (Pick<Grant, 'agent_id' | 'kind' | 'scopes' | 'selector' | 'created_at' | 'expires_at'> &
+        Partial<Pick<Grant, 'uses'>>)
+    | undefined;
+  /**
+   * True when the id is known to be gone: its kind's whole list was read and
+   * does not hold it (an app, VM or project deleted since). Unknown is false.
+   */
+  readonly gone?: (type: string, id: string) => boolean;
 }
 
 const plain = (text: string): Segment => ({ text });
@@ -69,8 +77,11 @@ export const channelPhrase = (channel: AuditRecordChannel): string | null => {
   switch (channel) {
     case 'mcp':
       return 'via MCP';
+    // The server records `panel` for every call made with a session cookie
+    // (README "Channels"), so a script that borrows the cookie is `panel` too.
+    // The record cannot tell them apart; "signed in" is what it does know.
     case 'panel':
-      return 'in the panel';
+      return 'while signed in';
     case 'api':
       return 'via the API';
     case 'cli':
@@ -104,10 +115,16 @@ export const scopeVerb = (scope: string): readonly [string, string, string] => {
   return [words, `${stem}ing`, `${stem}ed`];
 };
 
+/** How a kind is said inside a sentence: `app`, `VM`, `project`. */
+export const kindWord = (type: string): string => (type === 'vm' ? 'VM' : type);
+
+/** "a deleted app": a target that is gone and whose name nothing kept. */
+export const deletedWords = (type: string): string => `a deleted ${kindWord(type)}`;
+
 /** "the app blog", "the project docs": a target said with its kind, unless it is an app or VM. */
 const targetWords = (ctx: RecordContext, type: string, id: string): Segment[] => {
   const name = ctx.name?.(type, id);
-  if (!name) return [strong(`${type} ${shortId(id)}`)];
+  if (!name) return ctx.gone?.(type, id) ? [plain(deletedWords(type))] : [strong(`${type} ${shortId(id)}`)];
   if (type === 'app' || type === 'vm') return [strong(name)];
   return [plain(`the ${type} `), strong(name)];
 };
@@ -151,11 +168,36 @@ const alone = (base: string, past: string): Phrase => ({
   tried: () => [plain(`tried to ${base}`)],
 });
 
-/** "a grant to read and restart apps on project blog", from scopes and a selector. */
-const grantWords = (scopes: readonly Scope[], selector: Selector | undefined): string => {
-  const access = accessPhrase(scopes) ?? scopes.join(', ');
+/** A grant names this many scopes one by one; past it, the first and how many more. */
+export const GRANT_SCOPES_NAMED = 3;
+
+/**
+ * "a grant to read and restart apps on project blog", from scopes and a
+ * selector. The plain phrase stands only when it says every scope; otherwise
+ * every scope is named ("a grant for app:read, approval:create and
+ * approval:read"), or the first one and how many more past three.
+ */
+const grantWords = (scopes: readonly Scope[], selector: Selector | undefined): Segment[] => {
+  const access = accessPhrase(scopes);
   const where = selector ? describeSelector(selector).toLowerCase() : '';
-  return where ? `${access} on ${where}` : access;
+  const what: Segment[] =
+    access !== null && accessCovers(scopes)
+      ? [plain(` a grant to ${access}`)]
+      : scopes.length === 0
+        ? [plain(' a grant with no scopes')]
+        : [plain(' a grant for '), ...scopeList(scopes)];
+  return where ? [...what, plain(` on ${where}`)] : what;
+};
+
+/** `app:read, approval:create and approval:read`, or `app:read and 4 more`. */
+const scopeList = (scopes: readonly Scope[]): Segment[] => {
+  if (scopes.length > GRANT_SCOPES_NAMED) {
+    return [code(scopes[0]!), plain(` and ${scopes.length - 1} more`)];
+  }
+  return scopes.flatMap((scope, index) => [
+    ...(index === 0 ? [] : [plain(index === scopes.length - 1 ? ' and ' : ', ')]),
+    code(scope),
+  ]);
 };
 
 /** "1 hour", "45 minutes", "7 days"; anything uneven in the short form, "2 h 5 min". */
@@ -244,7 +286,7 @@ const grantIssued: Phrase = {
     return [
       plain('gave '),
       strong(agentId ? nameOf(ctx, 'agent', agentId) : 'an agent'),
-      plain(` a grant to ${grantWords(scopes, selector)}`),
+      ...grantWords(scopes, selector),
     ];
   },
   tried: () => [plain('tried to issue a grant')],
@@ -384,6 +426,57 @@ export const recordAction = (record: AuditRecord, ctx: RecordContext = {}): Segm
     code(record.operation),
     ...(target.length > 0 ? [plain(' on '), ...target] : []),
   ];
+};
+
+/* ---------- names a deleted target keeps ---------- */
+
+/** The call that creates each kind a sentence names by its own name (`params.name`). */
+export const CREATED_BY: Readonly<Record<string, string>> = {
+  app: 'POST /api/v1/apps',
+  vm: 'POST /api/v1/vms',
+  project: 'POST /api/v1/projects',
+};
+
+/**
+ * The name a create record gave its target, from the request it recorded
+ * (`params.name`), or undefined. A deleted app leaves no list to name it, but
+ * the record of its creation still does.
+ */
+export const createdName = (
+  record: Pick<AuditRecord, 'operation' | 'result' | 'target_type' | 'target_id' | 'params'>,
+): string | undefined =>
+  record.result === 'ok' && record.target_type && CREATED_BY[record.target_type] === record.operation
+    ? str(record.params?.name)
+    : undefined;
+
+/** Names the loaded records already hold for their targets, by id. */
+export const namesFromRecords = (
+  records: ReadonlyArray<Pick<AuditRecord, 'operation' | 'result' | 'target_type' | 'target_id' | 'params'>>,
+): Map<string, string> => {
+  const names = new Map<string, string>();
+  for (const record of records) {
+    const name = createdName(record);
+    if (name && record.target_id) names.set(record.target_id, name);
+  }
+  return names;
+};
+
+/**
+ * The targets a sentence about these records may name: each record's own,
+ * and the target of the request an approval record decides or files.
+ */
+export const recordTargets = (
+  records: ReadonlyArray<Pick<AuditRecord, 'target_type' | 'target_id' | 'approval_id'>>,
+  ctx: RecordContext,
+): { type: string; id: string }[] => {
+  const seen = new Map<string, { type: string; id: string }>();
+  for (const record of records) {
+    if (record.target_type && record.target_id) seen.set(record.target_id, { type: record.target_type, id: record.target_id });
+    const approvalId = record.target_type === 'approval' ? record.target_id : record.approval_id;
+    const target = approvalId ? ctx.approval?.(approvalId)?.target : undefined;
+    if (target) seen.set(target.id, { type: target.type, id: target.id });
+  }
+  return [...seen.values()];
 };
 
 /** The whole sentence for the feed: who, what, and how it arrived. */

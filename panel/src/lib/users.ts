@@ -1,4 +1,5 @@
 import type { User, UserRole } from '../api/generated/model';
+import { shortId } from './agency-format';
 import type { LampTone } from './lamp';
 
 /**
@@ -108,3 +109,12 @@ export const userLamp = (user: Pick<User, 'disabled'>): {
 /** The line under the invite dialog's password field. */
 export const GENERATED_PASSWORD_NOTE =
   'Share the password over a separate channel. It is not shown again; the user cannot change it themselves yet, so you can reset it from this screen.';
+
+/**
+ * A person as every view names them: their name, with "(you)" for the one
+ * signed in, or a short id until a list the session may read holds the name.
+ */
+export const personLabel = (id: string, name: string | null | undefined, self = false): string => {
+  if (name === null || name === undefined || name === '') return shortId(id);
+  return self ? `${name} (you)` : name;
+};

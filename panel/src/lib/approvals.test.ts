@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import type { Approval } from '../api/generated/model';
 import {
   approvalConfirm,
+  approvalRan,
+  askState,
   approvalTitle,
   approvalWants,
   callText,
@@ -158,11 +160,51 @@ describe('the exact call', () => {
     expect(approvalTitle({ scope: 'project:delete', target: { type: 'project', id: 'prj_1' } }, name)).toBe(
       'Delete project docs',
     );
-    expect(approvalWants({ scope: 'app:delete', target: { type: 'app', id: 'app_1' } }, name)).toBe(
+    expect(approvalWants({ scope: 'app:delete', target: { type: 'app', id: 'app_1' }, status: 'pending' }, name)).toBe(
       'wants to delete the app blog',
     );
     expect(approvalTitle({ scope: 'app:delete', target: { type: 'app', id: 'app_01JC9Z6Q5W0000000000000000' } }, name)).toBe(
       'Delete app_01JC9Z…',
     );
+  });
+});
+
+describe('issue 637: a request about an app that is gone', () => {
+  const SCRATCH = 'app_01M70C9KQ6M3BRAVMXJ0G2DJAJ';
+  const ask = { scope: 'app:delete' as const, target: { type: 'app', id: SCRATCH } };
+  const named = (_type: string, id: string) => (id === SCRATCH ? 'scratch' : undefined);
+  const nameless = () => undefined;
+
+  it('ran once the approval was used: approved, and its one-time grant has a use', () => {
+    expect(approvalRan({ status: 'approved' }, { uses: 1 })).toBe(true);
+    expect(approvalRan({ status: 'approved' }, { uses: 0 })).toBe(false);
+    expect(approvalRan({ status: 'approved' }, undefined)).toBe(false);
+    expect(approvalRan({ status: 'denied' }, { uses: 1 })).toBe(false);
+  });
+
+  it('reads the state from the grants and lists the panel holds', () => {
+    const approval = { status: 'approved' as const, grant_id: 'grt_1', target: ask.target };
+    expect(askState(approval, { grant: () => ({ uses: 1 }) as never, gone: () => true })).toEqual({ ran: true, gone: true });
+    expect(askState({ ...approval, grant_id: null }, {})).toEqual({ ran: false, gone: false });
+  });
+
+  it('keeps the name it still has and says the call ran in the past tense', () => {
+    expect(approvalWants({ ...ask, status: 'approved' }, named, { ran: true, gone: true })).toBe('deleted the app scratch');
+    expect(approvalTitle(ask, named, { ran: true, gone: true })).toBe('Deleted scratch');
+  });
+
+  it('says asked once decided and wants only while it waits', () => {
+    expect(approvalWants({ ...ask, status: 'pending' }, named)).toBe('wants to delete the app scratch');
+    expect(approvalWants({ ...ask, status: 'approved' }, named)).toBe('asked to delete the app scratch');
+    expect(approvalWants({ ...ask, status: 'denied' }, named)).toBe('asked to delete the app scratch');
+  });
+
+  it('falls back to a deleted app when no name is left, never to the bare id', () => {
+    expect(approvalWants({ ...ask, status: 'approved' }, nameless, { ran: true, gone: true })).toBe('deleted an app');
+    expect(approvalTitle(ask, nameless, { ran: true, gone: true })).toBe('Deleted an app');
+    expect(approvalWants({ ...ask, status: 'pending' }, nameless, { gone: true })).toBe('wants to delete a deleted app');
+    expect(
+      approvalTitle({ scope: 'app:restart' as never, target: ask.target }, nameless, { gone: true }),
+    ).toBe('Restart a deleted app');
   });
 });
