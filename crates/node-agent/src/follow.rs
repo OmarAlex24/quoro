@@ -110,13 +110,15 @@ pub(crate) async fn raise_mark(data_dir: &Path, seq: u64) -> Result<(), AgentErr
 
 /// Lowers the change-log mark to `seq` when it is above it, and never raises
 /// it: the node learned the `head_seq` it refollows to (section 7.1
-/// "Refollowing", ADR 0280). Returns whether it wrote.
+/// "Refollowing", ADR 0280). A missing mark is written as `seq` too: since
+/// [`raise_mark`] counts a missing mark as 0, the ack of a batch below the
+/// head would otherwise write a mark below it. Returns whether it wrote.
 ///
 /// # Errors
 ///
 /// The errors of [`read_mark`] and of the write.
 pub(crate) async fn lower_mark(data_dir: &Path, seq: u64) -> Result<bool, AgentError> {
-    if read_mark(data_dir)?.is_some_and(|mark| mark > seq) {
+    if read_mark(data_dir)?.is_none_or(|mark| mark > seq) {
         write_mark(data_dir, seq).await?;
         return Ok(true);
     }
@@ -128,16 +130,24 @@ pub(crate) async fn lower_mark(data_dir: &Path, seq: u64) -> Result<bool, AgentE
 /// session runs it before every `hello`. It is idempotent: once it has run,
 /// a second run writes nothing.
 ///
-/// - **The mark is [`MAX_SEQ`] and no refollowing state is recorded:** the
-///   agent stopped between writing the mark and recording the state (ADR
-///   0285). It records [`Refollowing::HeadUnknown`] and goes on as below.
+/// - **The mark is [`MAX_SEQ`], whatever state is recorded:** a quarantine
+///   wrote it and the agent may have stopped before it recorded
+///   [`Refollowing::HeadUnknown`] (ADR 0285). With no state recorded, that
+///   is the only reading. With [`Refollowing::Head`] `h` recorded there are
+///   two: a second `log_diverged` came while the node refollowed to `h`, so
+///   the stored copy is diverged and must be moved aside; or the agent
+///   recorded `h` and stopped before lowering the mark. They read the same,
+///   so it takes the first: it records [`Refollowing::HeadUnknown`] and goes
+///   on as below. The second loses nothing by it, since nothing was stored
+///   since the quarantine and the node relearns the head from the next
+///   `log_entries`, whose `head_seq` from the same primary is never below
+///   `h`.
 /// - **The state is [`Refollowing::HeadUnknown`]:** the stored copy is moved
 ///   aside ([`NodeStore::quarantine_log`]; an empty copy needs nothing). The
 ///   session stores no entry in that state, so every entry the copy holds
 ///   predates the quarantine, which stopped before it moved the copy.
-/// - **The state is [`Refollowing::Head`] `h` and the mark is above `h`:**
-///   the agent stopped between recording `h` and lowering the mark, which is
-///   lowered to `h` now.
+/// - **The state is [`Refollowing::Head`] `h` and the mark is above `h` or
+///   missing:** the mark is lowered to `h` ([`lower_mark`]).
 ///
 /// # Errors
 ///
@@ -147,9 +157,10 @@ pub(crate) async fn lower_mark(data_dir: &Path, seq: u64) -> Result<bool, AgentE
 pub(crate) async fn recover(store: &NodeStore) -> Result<(), AgentError> {
     let data_dir = store.data_dir();
     let mut state = store.refollowing().await?;
-    if state.is_none() && read_mark(data_dir)? == Some(MAX_SEQ) {
+    if read_mark(data_dir)? == Some(MAX_SEQ) && state != Some(Refollowing::HeadUnknown) {
         warn!(
-            "the change-log mark is at its quarantine value with no refollowing state; finishing the quarantine"
+            state = ?state,
+            "the change-log mark is at its quarantine value with the head not unknown; finishing the quarantine"
         );
         store.set_refollowing(Refollowing::HeadUnknown).await?;
         state = Some(Refollowing::HeadUnknown);
@@ -169,7 +180,7 @@ pub(crate) async fn recover(store: &NodeStore) -> Result<(), AgentError> {
             if lowered {
                 warn!(
                     head_seq = head,
-                    "the change-log mark was above the head the node refollows to; lowered"
+                    "the change-log mark was above the head the node refollows to, or missing; lowered to it"
                 );
             }
         }

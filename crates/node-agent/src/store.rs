@@ -4095,7 +4095,9 @@ mod tests {
 
     /// Section 7.1 "The node's mark": the mark is written as the decimal
     /// `seq`, `0600`. A raise never lowers it and a missing mark counts as 0,
-    /// so raising to 0 creates no file; a lower never raises it.
+    /// so raising to 0 creates no file; a lower never raises it. A lower
+    /// writes a missing mark (section 7.1 "Refollowing"), so a later raise
+    /// below the head the node refollows to writes nothing.
     #[tokio::test]
     async fn the_mark_is_raised_and_lowered_only_as_asked() {
         use crate::follow::{lower_mark, raise_mark, write_mark};
@@ -4103,8 +4105,12 @@ mod tests {
         let path = dir.0.join(crate::identity::LOG_MARK_FILE);
         raise_mark(&dir.0, 0).await.unwrap();
         assert!(!path.exists());
-        assert!(!lower_mark(&dir.0, 0).await.unwrap());
-        assert!(!path.exists());
+        assert!(lower_mark(&dir.0, 5).await.unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "5");
+        raise_mark(&dir.0, 3).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "5");
+        assert!(!lower_mark(&dir.0, 5).await.unwrap());
+        std::fs::remove_file(&path).unwrap();
 
         raise_mark(&dir.0, 7).await.unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "7");

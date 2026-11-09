@@ -1510,12 +1510,13 @@ impl Session {
     /// While the node refollows after a quarantine (section 7.1
     /// "Refollowing", ADR 0261, ADR 0280), before anything is stored:
     ///
-    /// - with the head unknown, the message's `head_seq` is recorded and the
-    ///   mark lowered to it. A message without `head_seq` stores nothing and
-    ///   is answered `bad_message`, since the node cannot tell how far it
-    ///   must refollow;
-    /// - with a head recorded, a mark still above it is lowered to it: the
-    ///   agent stopped between the two writes.
+    /// - with the head unknown, the message's `head_seq` is recorded and then
+    ///   the mark lowered to it. A message without `head_seq`, or with one
+    ///   below its own last `seq` or above [`follow::MAX_SEQ`], stores
+    ///   nothing, changes neither the state nor the mark, and is answered
+    ///   `bad_message`, since the node cannot tell how far it must refollow;
+    /// - with a head recorded, a mark still above it, or missing, is lowered
+    ///   to it.
     ///
     /// The batch that brings the copy to that head ends the refollowing state
     /// in its own transaction ([`NodeStore::store_log_batch`]).
@@ -1565,6 +1566,27 @@ impl Session {
                     write_message(sink, NodeMessage::Error(error), Some(&raw.id)).await?;
                     return Ok(());
                 };
+                // `verify_batch` refused an empty batch, so there is a last.
+                let last_seq = entries.last().map_or(0, |entry| entry.seq);
+                if head_seq < last_seq || head_seq > follow::MAX_SEQ {
+                    warn!(
+                        from_seq = body.from_seq,
+                        head_seq,
+                        last_seq,
+                        "log_entries after a quarantine carries a head_seq below its last seq or above 2^53 - 1; nothing stored"
+                    );
+                    let error = ProtocolError {
+                        code: ErrorCode::BadMessage,
+                        message: format!(
+                            "log_entries carries head_seq {head_seq}, which is below its last seq \
+                             {last_seq} or above 2^53 - 1, so a node refollowing after a \
+                             quarantine cannot record it (section 7.1)"
+                        ),
+                        fatal: false,
+                    };
+                    write_message(sink, NodeMessage::Error(error), Some(&raw.id)).await?;
+                    return Ok(());
+                }
                 self.store
                     .set_refollowing(Refollowing::Head(head_seq))
                     .await?;
@@ -1579,7 +1601,7 @@ impl Session {
                 if lowered {
                     warn!(
                         head_seq = head,
-                        "the change-log mark was above the head the node refollows to; lowered"
+                        "the change-log mark was above the head the node refollows to, or missing; lowered to it"
                     );
                 }
             }
