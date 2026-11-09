@@ -34,10 +34,10 @@ use quoro_engine::ch::state::{self, VmmRecord};
 use quoro_engine::ch::tools::{self, HostTools};
 use quoro_engine::ch::{ChConfig, ChEngine};
 use quoro_engine::{
-    ByteStream, ConsoleMode, Engine, EngineError, EngineEvent, ExecRequest, ImageDigest, ImageRef,
-    InitConfig, LineStream, MacAddr, NetAttach, NodeNetwork, OutputLine, OutputStream, RangesOf,
-    SerialMode, SnapshotMethod, SnapshotSweep, StageFrom, StopMode, VmId, VmSpec, VmState,
-    VolumeAttach, VolumeId, VolumeSnapshot, VsockAttach,
+    ByteStream, ConsoleMode, Engine, EngineError, EngineEvent, ExecRequest, GuestFlush,
+    ImageDigest, ImageRef, InitConfig, LineStream, MacAddr, NetAttach, NodeNetwork, OutputLine,
+    OutputStream, RangesOf, SerialMode, SnapshotMethod, SnapshotSweep, StageFrom, StopMode, VmId,
+    VmSpec, VmState, VolumeAttach, VolumeId, VolumeSnapshot, VsockAttach,
 };
 use tokio::io::AsyncReadExt as _;
 
@@ -1131,6 +1131,133 @@ async fn local_volume_snapshot_cycle() {
         .delete_volume(&volume)
         .await
         .expect("deleting a missing volume is Ok");
+
+    let tools = HostTools::discover().expect("host tools");
+    net::remove_network(&tools, BRIDGE)
+        .await
+        .expect("remove the network");
+}
+
+/// M5b, #400: a snapshot holds a file the guest wrote without `fsync` just
+/// before it, because the engine first asks the init to flush the volume
+/// (§3.16, ADR 0282). Without the flush the file's data would still be in
+/// the guest's page cache for up to about 35 s, and the snapshot would hold
+/// an empty file or none. `flush_volume` reports each outcome (§3.22).
+#[tokio::test]
+#[ignore = "needs /dev/kvm, root and the pinned artifacts on the lab host"]
+async fn a_snapshot_holds_what_the_guest_wrote_without_fsync() {
+    const WITHIN: Duration = Duration::from_secs(2);
+    const BYTES: usize = 1 << 20;
+    if !enter_lab() {
+        return;
+    }
+    let _guard = Guard::new();
+    let engine = new_engine().await;
+    let rootfs = prepare(&engine).await;
+
+    let volume = VolumeId("vol_01HX8Z4Q2M9W7T3YV6B1C0D5FA".to_string());
+    engine.ensure_volume(&volume, 1).await.expect("ensure");
+    assert_eq!(
+        engine.flush_volume(&volume, WITHIN).await,
+        Ok(GuestFlush::NoRunningVm),
+        "no VM attaches the volume yet"
+    );
+    assert_eq!(
+        engine
+            .flush_volume(
+                &VolumeId("vol_01HX8Z4Q2M9W7T3YV6B1C0D5FB".to_string()),
+                WITHIN
+            )
+            .await,
+        Err(EngineError::NotFound)
+    );
+
+    let id = VmId("vm_w5b_flush".to_string());
+    let mut spec = console_spec(&id, &rootfs, "10.77.0.22", "sleep 300", 22);
+    spec.volumes = vec![VolumeAttach {
+        volume_id: volume.clone(),
+        mount_path: "/data".to_string(),
+        serial: "quoro-vol-0".to_string(),
+    }];
+    spec.vsock = Some(VsockAttach {
+        cid: 3,
+        socket: vm_dir(&id).join("vsock.sock"),
+    });
+    engine.create(&spec).await.expect("create with a volume");
+    start_vm(&engine, &id).await;
+
+    // A new 1 MiB file, never `fsync`ed: ext4's delayed allocation keeps
+    // its data in the guest's memory, with no block allocated. The exec
+    // also waits until the init accepts sessions, so the flush finds it.
+    exec_in_guest(
+        &engine,
+        &id,
+        &["sh", "-c", "yes quoro | head -c 1048576 > /data/unsynced"],
+    )
+    .await;
+    let snapshot = engine
+        .snapshot_volume(&volume)
+        .await
+        .expect("snapshot a running volume");
+    assert_eq!(snapshot.guest_flush, GuestFlush::Flushed);
+
+    // Read the file as a restore would: replay the journal, then read the
+    // filesystem without mounting it.
+    let check = std::process::Command::new("e2fsck")
+        .args(["-f", "-y"])
+        .arg(&snapshot.location)
+        .output()
+        .expect("run e2fsck");
+    assert!(
+        matches!(check.status.code(), Some(0 | 1)),
+        "e2fsck: {}",
+        String::from_utf8_lossy(&check.stdout)
+    );
+    let read = std::process::Command::new("debugfs")
+        .args(["-R", "cat /unsynced"])
+        .arg(&snapshot.location)
+        .output()
+        .expect("run debugfs");
+    assert!(read.status.success(), "debugfs: {read:?}");
+    assert_eq!(
+        read.stdout.len(),
+        BYTES,
+        "the snapshot holds the whole file"
+    );
+    assert!(
+        read.stdout
+            .chunks(6)
+            .all(|line| line == &b"quoro\n"[..line.len()]),
+        "the snapshot holds the file's data"
+    );
+
+    assert_eq!(
+        engine.flush_volume(&volume, WITHIN).await,
+        Ok(GuestFlush::Flushed)
+    );
+    engine.pause(&id).await.expect("pause");
+    assert_eq!(
+        engine.flush_volume(&volume, WITHIN).await,
+        Ok(GuestFlush::Paused),
+        "a paused guest is not asked"
+    );
+    engine.resume(&id).await.expect("resume");
+
+    engine.stop(&id, FORCE).await.expect("stop");
+    assert_eq!(
+        engine.flush_volume(&volume, WITHIN).await,
+        Ok(GuestFlush::NoRunningVm)
+    );
+    engine.delete(&id).await.expect("delete");
+    assert_no_leftovers(&id);
+    engine
+        .delete_volume_snapshot(&snapshot)
+        .await
+        .expect("delete the snapshot");
+    engine
+        .delete_volume(&volume)
+        .await
+        .expect("delete the volume");
 
     let tools = HostTools::discover().expect("host tools");
     net::remove_network(&tools, BRIDGE)
