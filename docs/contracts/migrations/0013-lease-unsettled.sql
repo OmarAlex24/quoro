@@ -1,18 +1,39 @@
--- Migration 0013: the unsettled mark of an expiring lease after a restore or a
--- forced recovery (ADR 0261, which completes ADR 0255).
+-- Migration 0013: the unsettled mark of a lease row (ADR 0261, which completes
+-- ADR 0255, and ADR 0280).
 --
--- leases.unsettled is 1 while the row may lack the write that ends an
--- expiring lease's renewals, or the writes after it, and 0 otherwise. The
--- first change-log write of any restore, plain or with --accept-loss
--- (backup-format.md section 8.2), and of any `quoro cluster promote
--- --accept-loss` (node-agent-protocol.md section 7.3) sets it on every row
--- whose mode is 'expiring'. The column is part of the row, so the mark is in
--- the change log for every later primary. An unsettled row moves only as a
--- local lease does: never on its gate alone. Only the holder's report clears
--- it (node-agent-protocol.md section 8.4, "Unsettled rows"): a report of the
--- lease as local writes the row local, and a report of it as expiring
--- settles the lease, whose row write clears the mark. Existing rows start
--- with 0.
+-- leases.unsettled is 1 while the row may disagree with its holder's mode, so
+-- the lease moves only as a local lease does, whatever the row's mode, and 0
+-- otherwise. Two writes set it (node-agent-protocol.md section 8.4, "The
+-- mark"):
+--
+-- - the write that ends an expiring lease's renewals, on the row it writes
+--   local, in the same transaction as the HA-policy change off warm;
+-- - the first change-log write of any restore, plain or with --accept-loss
+--   (backup-format.md section 8.2), and of any `quoro cluster promote
+--   --accept-loss` (node-agent-protocol.md section 7.3), on every row whose
+--   mode is 'expiring', because these may lack that write or the writes after
+--   it.
+--
+-- The column is part of the row, so the mark is in the change log for every
+-- later primary, and a restarted primary still has it. While it is set, the
+-- primary sends a grant of the lease, other than the answer to a renewal,
+-- only once the row's newest change-log write is replicated over the machines
+-- with the node role and while it holds majority support ("Grants of a marked
+-- row"). Every other write of the row keeps it, a write with a new token
+-- included. Only a write that records what the holder holds clears it:
+--
+-- - the holder reports the lease local at the row's token, or at a higher
+--   token while the row names that holder: the row is written local at the
+--   holder's token;
+-- - on a live session, the pong to the ping that follows the same-token local
+--   grant arrives with no refusal of the grant before it: the row is written
+--   local;
+-- - the holder holds the lease expiring and the policy is warm: the primary
+--   settles the lease, whose row write clears the mark.
+--
+-- A holder that reports the lease expiring while the policy is off warm
+-- leaves the mark, and the primary sends the same-token local grant again.
+-- Existing rows start with 0.
 --
 -- A promotion that rebuilds the database from a log written before this
 -- migration finds no unsettled field in the lease payloads, and the rows take
