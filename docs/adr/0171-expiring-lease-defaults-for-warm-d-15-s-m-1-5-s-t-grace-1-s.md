@@ -1,12 +1,12 @@
 # ADR 0171: Expiring lease defaults for warm: D = 15 s (M = 1.5 s, T_grace 1 s, T_force 0.3 s); before a planned primary restart the primary answers renewals with a longer duration so warm apps survive upgrades
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0268](0268-a-grant-longer-than-a-lease-s-stored-duration-ms-waits.md)
 - **Date:** 2026-11-06
 - **Ledger id:** D-0171
 - **Tags:** m5b, reliability, node-agent
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** none
+- **Related:** [ADR 0268](0268-a-grant-longer-than-a-lease-s-stored-duration-ms-waits.md)
 
 ## Context
 
@@ -22,6 +22,7 @@ _Some wording was changed for the public repository._
 
 ## Consequences
 
+- [ADR 0268](0268-a-grant-longer-than-a-lease-s-stored-duration-ms-waits.md) refines when a maintenance window's W is answered: only once the raise of duration_ms to W is replicated. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---

@@ -1,12 +1,12 @@
 # ADR 0254: A converted lease's first gate counts the conversion grant's duration
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0268](0268-a-grant-longer-than-a-lease-s-stored-duration-ms-waits.md)
 - **Date:** 2026-11-07
 - **Ledger id:** D-0254
 - **Tags:** m5b, leases, contracts, warm
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** [ADR 0241](0241-a-lease-converted-from-local-to-expiring-opens-no-failover.md)
+- **Related:** [ADR 0241](0241-a-lease-converted-from-local-to-expiring-opens-no-failover.md), [ADR 0268](0268-a-grant-longer-than-a-lease-s-stored-duration-ms-waits.md)
 
 ## Context
 
@@ -23,6 +23,7 @@ _Some wording was changed for the public repository._
 ## Consequences
 
 - Refines [ADR 0241](0241-a-lease-converted-from-local-to-expiring-opens-no-failover.md): the gate that the first answer after a conversion opens. The rest of [ADR 0241](0241-a-lease-converted-from-local-to-expiring-opens-no-failover.md) stands.
+- [ADR 0268](0268-a-grant-longer-than-a-lease-s-stored-duration-ms-waits.md) refines when a conversion grant longer than the stored duration_ms is sent: only once the raise before it is replicated. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---
