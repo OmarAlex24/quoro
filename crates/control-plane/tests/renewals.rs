@@ -7,7 +7,7 @@ mod common;
 
 use common::{Server, start_with_patient_node_session};
 use futures_util::{SinkExt, StreamExt};
-use quoro_control_plane::authority::VoterSupport;
+use quoro_control_plane::authority::{Grant, GrantKind, Refused, VoterSupport};
 use quoro_proto::wire::{
     self, Capacity as WireCapacity, Heartbeat, Kvm as WireKvm, NodeMessage, StatusReport,
     VolumeState as WireVolumeState, VolumeStatus,
@@ -382,6 +382,19 @@ async fn a_renewal_is_answered_at_its_token_while_voters_support_it() {
     let authority = server.state.hub.authority();
     assert!(!authority.passed(&lease_id), "the answer opens a gate");
     assert!(
+        matches!(
+            authority.record_grant(&Grant {
+                lease_id: &lease_id,
+                holder: "nod_00000000000000000000000000",
+                duration_ms: 15_000,
+                kind: GrantKind::NewToken,
+                sent_wall: time::OffsetDateTime::now_utc(),
+            }),
+            Err(Refused::GateOpen { .. })
+        ),
+        "no new token goes to another node while the answer's gate is open"
+    );
+    assert!(
         authority
             .view(&lease_id)
             .and_then(|view| view.renewed_at)
@@ -539,6 +552,10 @@ async fn a_renewal_the_row_does_not_match_gets_no_answer() {
         "not holder: {frames:?}"
     );
     assert_eq!(server.state.hub.authority().view(&lease_id), None);
+    assert!(
+        !server.state.hub.authority().passed(&lease_id),
+        "the other holder's gate stays"
+    );
 
     // Once the row's holder holds the gate again, the renewal is answered.
     server
@@ -583,8 +600,28 @@ async fn a_renewal_of_a_lease_the_node_no_longer_holds_is_revoked() {
     send(&mut socket, renew(&lease_id, token), None).await;
     let mut frames = recv_until(&mut socket, &["lease_revoke"]).await;
     frames.extend(frames_until_settled(&mut socket).await);
-    let revoke = expect_revoke(&frames, &lease_id, token + 1, "superseded");
+    // At the renewal's token: a node that already holds the row's refuses it.
+    let revoke = expect_revoke(&frames, &lease_id, token, "superseded");
     send(&mut socket, ok_result(), Some(&revoke)).await;
+
+    // The same for a `local` row: the revoke comes before the mode check.
+    run(
+        &server,
+        "UPDATE leases SET mode = 'local', duration_ms = NULL WHERE id = ?",
+        &lease_id,
+    )
+    .await;
+    send(&mut socket, renew(&lease_id, token), None).await;
+    let mut frames = recv_until(&mut socket, &["lease_revoke"]).await;
+    frames.extend(frames_until_settled(&mut socket).await);
+    let revoke = expect_revoke(&frames, &lease_id, token, "superseded");
+    send(&mut socket, ok_result(), Some(&revoke)).await;
+    run(
+        &server,
+        "UPDATE leases SET mode = 'expiring', duration_ms = 15000 WHERE id = ?",
+        &lease_id,
+    )
+    .await;
 
     // Another node holds it, at the node's token.
     sqlx::query("UPDATE leases SET holder_node_id = ?, fencing_token = ? WHERE id = ?")

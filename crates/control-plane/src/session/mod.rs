@@ -2438,7 +2438,11 @@ impl Session {
     ///
     /// - A lease the node no longer holds in the primary's row is revoked,
     ///   as at the session's start ([`stale_lease_revoke`]): no row, another
-    ///   holder, revoked, or a higher token.
+    ///   holder, revoked, or a higher token. A higher token whose row still
+    ///   names this node is revoked at the renewal's token, releasing
+    ///   nothing: the renewal may have crossed this node's grant at the row's
+    ///   token, and a node that holds that grant refuses the revoke (section
+    ///   5.13) instead of fencing the lease it was just given.
     /// - A `local` row gets no answer (D-0256 part 2), and the node's
     ///   validity runs out. So would the first renewal after a conversion,
     ///   whose row stays `local` until it is answered (ADR 0244); conversions
@@ -2479,10 +2483,14 @@ impl Session {
                 return;
             }
         };
-        if let Some((revoke, released)) =
+        if let Some((mut revoke, mut released)) =
             stale_lease_revoke(row.as_ref(), &self.node_id, lease_id, renew.fencing_token)
         {
             drop(w);
+            if revoke.reason == quoro_proto::RevokeReason::Superseded {
+                revoke.fencing_token = renew.fencing_token.max(1);
+                released = 0;
+            }
             self.queue_revoke(revoke, released, outbox);
             return;
         }
