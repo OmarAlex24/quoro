@@ -179,6 +179,29 @@ pub enum SnapshotMethod {
     PauseCopy,
 }
 
+/// What came of asking the guest to flush a volume's filesystem before a
+/// snapshot (ADR 0282). Added in M5b. Sections 3.16 and 3.22.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestFlush {
+    /// The init answered that it ran `syncfs` on the volume's mount.
+    Flushed,
+    /// No VM that attaches the volume was running when the snapshot began, so
+    /// no guest held unwritten data of it.
+    NoRunningVm,
+    /// The VM that attaches the volume is paused and cannot answer, so it was
+    /// not asked.
+    Paused,
+    /// The VM has no vsock device, its init predates the sync session, or the
+    /// backend does not flush.
+    Unsupported,
+    /// The flush had no result within the bound.
+    TimedOut,
+    /// Any other result: an error or an unexpected answer, a close without an
+    /// answer, a failed connection, or a VMM that cannot report whether the VM
+    /// is paused.
+    Failed,
+}
+
 /// The VM's network attachment on the node bridge.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NetAttach {
@@ -412,6 +435,9 @@ pub struct VolumeSnapshot {
     /// How long the VM using the volume was paused; zero for `Reflink` or
     /// when no VM was running. Added in M5a.
     pub pause: Duration,
+    /// Whether the guest flushed the volume's filesystem before the snapshot
+    /// was taken (section 3.16, ADR 0282). Added in M5b.
+    pub guest_flush: GuestFlush,
 }
 
 /// A byte range of a volume file. Added in M5b. Section 3.22.
@@ -783,6 +809,16 @@ pub trait Engine: Send + Sync {
                 "pausing a VM is not implemented by this engine".into(),
             ))
         }
+    }
+    /// Asks the guest of the running VM that attaches the volume to flush the
+    /// volume's filesystem, waiting at most `within`. Added in M5b (ADR 0282);
+    /// section 3.22.
+    fn flush_volume(
+        &self,
+        _id: &VolumeId,
+        _within: Duration,
+    ) -> impl Future<Output = Result<GuestFlush, EngineError>> + Send {
+        async { Ok(GuestFlush::Unsupported) }
     }
 }
 

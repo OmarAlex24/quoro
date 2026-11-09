@@ -34,10 +34,10 @@ use quoro_engine::ch::state::{self, VmmRecord};
 use quoro_engine::ch::tools::{self, HostTools};
 use quoro_engine::ch::{ChConfig, ChEngine};
 use quoro_engine::{
-    ByteStream, ConsoleMode, Engine, EngineError, EngineEvent, ExecRequest, ImageDigest, ImageRef,
-    InitConfig, LineStream, MacAddr, NetAttach, NodeNetwork, OutputLine, OutputStream, RangesOf,
-    SerialMode, SnapshotMethod, SnapshotSweep, StageFrom, StopMode, VmId, VmSpec, VmState,
-    VolumeAttach, VolumeId, VolumeSnapshot, VsockAttach,
+    ByteStream, ConsoleMode, Engine, EngineError, EngineEvent, ExecRequest, GuestFlush,
+    ImageDigest, ImageRef, InitConfig, LineStream, MacAddr, NetAttach, NodeNetwork, OutputLine,
+    OutputStream, RangesOf, SerialMode, SnapshotMethod, SnapshotSweep, StageFrom, StopMode, VmId,
+    VmSpec, VmState, VolumeAttach, VolumeId, VolumeSnapshot, VsockAttach,
 };
 use tokio::io::AsyncReadExt as _;
 
@@ -1136,6 +1136,186 @@ async fn local_volume_snapshot_cycle() {
     net::remove_network(&tools, BRIDGE)
         .await
         .expect("remove the network");
+}
+
+/// M5b, #400: a snapshot holds a file the guest wrote without `fsync` just
+/// before it, because the engine first asks the init to flush the volume
+/// (§3.16, ADR 0282). A copy of the volume file taken just before with the VM
+/// paused and without the flush, as a `PauseCopy` snapshot was before, lacks
+/// the file's data, which the guest still holds in its page cache. `flush_volume` reports
+/// `NoRunningVm`, `Flushed` and `Paused` from a real guest, and `NotFound`
+/// for an unknown volume (§3.22).
+#[tokio::test]
+#[ignore = "needs /dev/kvm, root and the pinned artifacts on the lab host"]
+async fn a_snapshot_holds_what_the_guest_wrote_without_fsync() {
+    const WITHIN: Duration = Duration::from_secs(2);
+    if !enter_lab() {
+        return;
+    }
+    let _guard = Guard::new();
+    let engine = new_engine().await;
+    let rootfs = prepare(&engine).await;
+
+    let volume = VolumeId("vol_01HX8Z4Q2M9W7T3YV6B1C0D5FA".to_string());
+    let created = engine.ensure_volume(&volume, 1).await.expect("ensure");
+    assert_eq!(
+        engine.flush_volume(&volume, WITHIN).await,
+        Ok(GuestFlush::NoRunningVm),
+        "no VM attaches the volume yet"
+    );
+    assert_eq!(
+        engine
+            .flush_volume(
+                &VolumeId("vol_01HX8Z4Q2M9W7T3YV6B1C0D5FB".to_string()),
+                WITHIN
+            )
+            .await,
+        Err(EngineError::NotFound)
+    );
+
+    let id = VmId("vm_w5b_flush".to_string());
+    let mut spec = console_spec(&id, &rootfs, "10.77.0.22", "sleep 300", 22);
+    spec.volumes = vec![VolumeAttach {
+        volume_id: volume.clone(),
+        mount_path: "/data".to_string(),
+        serial: "quoro-vol-0".to_string(),
+    }];
+    spec.vsock = Some(VsockAttach {
+        cid: 3,
+        socket: vm_dir(&id).join("vsock.sock"),
+    });
+    engine.create(&spec).await.expect("create with a volume");
+    start_vm(&engine, &id).await;
+
+    // A new 1 MiB file, never `fsync`ed: ext4's delayed allocation keeps
+    // its data in the guest's memory, with no block allocated. The exec
+    // also waits until the init accepts sessions, so the flush finds it.
+    exec_in_guest(
+        &engine,
+        &id,
+        &["sh", "-c", "yes quoro | head -c 1048576 > /data/unsynced"],
+    )
+    .await;
+    let written = std::time::Instant::now();
+    // The control: a copy of the volume file with no flush, taken with the
+    // VM paused, as a `PauseCopy` snapshot was before ADR 0282, within a
+    // second or two of the write. The guest writes such data back only after
+    // about 30 s, so the copy lacks it, as the lab saw in #400. It lives in
+    // the state directory, which the next run wipes if this one fails.
+    let control = state_dir().join("flush-control.img");
+    engine.pause(&id).await.expect("pause for the control copy");
+    let copied = std::process::Command::new("cp")
+        .arg("--sparse=always")
+        .arg(&created.path)
+        .arg(&control)
+        .status()
+        .expect("run cp");
+    engine
+        .resume(&id)
+        .await
+        .expect("resume after the control copy");
+    assert!(copied.success(), "copy the volume file");
+    let unflushed = unsynced_in(&control);
+    let _ = std::fs::remove_file(&control);
+    assert!(
+        !holds_unsynced(&unflushed),
+        "a copy without the flush already holds the file ({} bytes): the guest \
+         wrote it back early, so this run proves nothing about the flush",
+        unflushed.len()
+    );
+    // Only a snapshot well inside the guest's writeback delay credits the
+    // flush: past it, the guest may have written the file back on its own.
+    assert!(
+        written.elapsed() < Duration::from_secs(20),
+        "the control took {:?}, too close to the guest's own writeback for \
+         the snapshot to prove the flush",
+        written.elapsed()
+    );
+
+    let snapshot = engine
+        .snapshot_volume(&volume)
+        .await
+        .expect("snapshot a running volume");
+    assert_eq!(snapshot.guest_flush, GuestFlush::Flushed);
+    let flushed = unsynced_in(&snapshot.location);
+    assert!(
+        holds_unsynced(&flushed),
+        "the snapshot holds the whole file: {} bytes",
+        flushed.len()
+    );
+
+    assert_eq!(
+        engine.flush_volume(&volume, WITHIN).await,
+        Ok(GuestFlush::Flushed)
+    );
+    engine.pause(&id).await.expect("pause");
+    assert_eq!(
+        engine.flush_volume(&volume, WITHIN).await,
+        Ok(GuestFlush::Paused),
+        "a paused guest is not asked"
+    );
+    engine.resume(&id).await.expect("resume");
+
+    engine.stop(&id, FORCE).await.expect("stop");
+    assert_eq!(
+        engine.flush_volume(&volume, WITHIN).await,
+        Ok(GuestFlush::NoRunningVm)
+    );
+    engine.delete(&id).await.expect("delete");
+    assert_no_leftovers(&id);
+    engine
+        .delete_volume_snapshot(&snapshot)
+        .await
+        .expect("delete the snapshot");
+    engine
+        .delete_volume(&volume)
+        .await
+        .expect("delete the volume");
+
+    let tools = HostTools::discover().expect("host tools");
+    net::remove_network(&tools, BRIDGE)
+        .await
+        .expect("remove the network");
+}
+
+/// `/unsynced` of the ext4 image `image`, read as a restore would: the
+/// journal replayed, then the filesystem read without mounting it. Empty when
+/// the file is missing, as it usually is in a copy taken before the guest's
+/// journal commit.
+fn unsynced_in(image: &Path) -> Vec<u8> {
+    let check = std::process::Command::new("e2fsck")
+        .args(["-f", "-y"])
+        .arg(image)
+        .output()
+        .expect("run e2fsck");
+    assert!(
+        matches!(check.status.code(), Some(0 | 1)),
+        "e2fsck: {}",
+        String::from_utf8_lossy(&check.stdout)
+    );
+    let read = std::process::Command::new("debugfs")
+        .args(["-R", "cat /unsynced"])
+        .arg(image)
+        .output()
+        .expect("run debugfs");
+    let stderr = String::from_utf8_lossy(&read.stderr);
+    if stderr.contains("File not found by ext2_lookup") {
+        return Vec::new();
+    }
+    assert!(
+        read.status.success() && !stderr.contains("Filesystem not open"),
+        "debugfs: {read:?}"
+    );
+    read.stdout
+}
+
+/// Whether `bytes` is the whole 1 MiB of `quoro` lines the guest wrote, not a
+/// shorter file or one whose blocks were never written.
+fn holds_unsynced(bytes: &[u8]) -> bool {
+    bytes.len() == 1 << 20
+        && bytes
+            .chunks(6)
+            .all(|line| line == &b"quoro\n"[..line.len()])
 }
 
 /// M5a: on a data directory without reflink the volume pool gives `Reflink`

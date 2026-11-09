@@ -906,6 +906,7 @@ mod tests {
             location,
             method: SnapshotMethod::Reflink,
             pause: std::time::Duration::ZERO,
+            guest_flush: crate::GuestFlush::NoRunningVm,
         };
         let good = dir.join(format!("{}.19a2b3c4d5e-0.snapshot", id.0));
         assert_eq!(

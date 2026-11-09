@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use quoro_engine::{
     ByteRange, ChangedRanges, Engine, EngineError, EngineEvent, FakeEngine, FakeOp, FakeRanges,
-    ImageDigest, NodeNetwork, OciLayout, OutputStream, RangesOf, SnapshotMethod, SnapshotSweep,
-    StageFrom, StopMode, VmCounters, VmId, VmState, VolumeAttach, VolumeId, VolumeSnapshot,
-    WorkDisk,
+    GuestFlush, ImageDigest, NodeNetwork, OciLayout, OutputStream, RangesOf, SnapshotMethod,
+    SnapshotSweep, StageFrom, StopMode, VmCounters, VmId, VmState, VolumeAttach, VolumeId,
+    VolumeSnapshot, WorkDisk,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -838,6 +838,124 @@ async fn a_pause_copy_snapshot_reports_its_pause_only_for_a_running_vm() {
     let running = engine.snapshot_volume(&volume).await.expect("snapshot");
     assert_eq!(running.method, SnapshotMethod::PauseCopy);
     assert_eq!(running.pause, Duration::from_millis(250));
+}
+
+/// The guest flush follows the VM that attaches the volume by default, and a
+/// test can set any outcome or error (section 7, ADR 0282).
+#[tokio::test]
+async fn the_guest_flush_follows_the_vm_and_can_be_injected() {
+    const WITHIN: Duration = Duration::from_secs(2);
+    let engine = FakeEngine::new();
+    let volume = VolumeId("vol_01".to_string());
+    assert_eq!(
+        engine.flush_volume(&volume, WITHIN).await,
+        Err(EngineError::NotFound),
+        "an unknown volume"
+    );
+    engine.ensure_volume(&volume, 1).await.expect("volume");
+    assert_eq!(
+        engine.flush_volume(&volume, WITHIN).await,
+        Ok(GuestFlush::NoRunningVm)
+    );
+    let snapshot = engine.snapshot_volume(&volume).await.expect("snapshot");
+    assert_eq!(snapshot.guest_flush, GuestFlush::NoRunningVm);
+
+    let prepared = engine
+        .prepare_image(&common::image_ref())
+        .await
+        .expect("image");
+    let mut spec = common::sample_spec(&prepared.digest, "vm_flush");
+    spec.volumes = vec![VolumeAttach {
+        volume_id: volume.clone(),
+        mount_path: "/data".to_string(),
+        serial: "quoro-vol-0".to_string(),
+    }];
+    engine.create(&spec).await.expect("create");
+    assert_eq!(
+        engine.flush_volume(&volume, WITHIN).await,
+        Ok(GuestFlush::NoRunningVm),
+        "a VM that exists but does not run"
+    );
+    engine.start(&spec.id, START).await.expect("start");
+    assert_eq!(
+        engine.flush_volume(&volume, WITHIN).await,
+        Ok(GuestFlush::Flushed)
+    );
+    let snapshot = engine.snapshot_volume(&volume).await.expect("snapshot");
+    assert_eq!(snapshot.guest_flush, GuestFlush::Flushed);
+    engine.pause(&spec.id).await.expect("pause");
+    assert_eq!(
+        engine.flush_volume(&volume, WITHIN).await,
+        Ok(GuestFlush::Paused)
+    );
+    let snapshot = engine.snapshot_volume(&volume).await.expect("snapshot");
+    assert_eq!(snapshot.guest_flush, GuestFlush::Paused);
+    engine.resume(&spec.id).await.expect("resume");
+
+    // An injected outcome holds until it is set again.
+    engine.set_guest_flush(Some(Ok(GuestFlush::TimedOut)));
+    for _ in 0..2 {
+        assert_eq!(
+            engine.flush_volume(&volume, WITHIN).await,
+            Ok(GuestFlush::TimedOut)
+        );
+    }
+    let snapshot = engine.snapshot_volume(&volume).await.expect("snapshot");
+    assert_eq!(snapshot.guest_flush, GuestFlush::TimedOut);
+
+    // An injected error: `flush_volume` returns it, a snapshot records
+    // `Failed`, and `NotFound` fails the snapshot.
+    let hypervisor = EngineError::Hypervisor("vsock gone".to_string());
+    engine.set_guest_flush(Some(Err(hypervisor.clone())));
+    assert_eq!(
+        engine.flush_volume(&volume, WITHIN).await,
+        Err(hypervisor.clone())
+    );
+    let snapshot = engine.snapshot_volume(&volume).await.expect("snapshot");
+    assert_eq!(snapshot.guest_flush, GuestFlush::Failed);
+    engine.set_guest_flush(Some(Err(EngineError::NotFound)));
+    assert_eq!(
+        engine.snapshot_volume(&volume).await,
+        Err(EngineError::NotFound)
+    );
+
+    // `fail_next` fails one `flush_volume` call and not a snapshot.
+    engine.set_guest_flush(None);
+    engine.fail_next(FakeOp::FlushVolume, EngineError::Timeout);
+    let snapshot = engine.snapshot_volume(&volume).await.expect("snapshot");
+    assert_eq!(snapshot.guest_flush, GuestFlush::Flushed);
+    assert_eq!(
+        engine.flush_volume(&volume, WITHIN).await,
+        Err(EngineError::Timeout)
+    );
+    assert_eq!(
+        engine.flush_volume(&volume, WITHIN).await,
+        Ok(GuestFlush::Flushed)
+    );
+
+    let calls: Vec<_> = engine
+        .flush_calls()
+        .into_iter()
+        .map(|(id, result)| {
+            assert_eq!(id, volume);
+            result
+        })
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            Err(EngineError::NotFound),
+            Ok(GuestFlush::NoRunningVm),
+            Ok(GuestFlush::NoRunningVm),
+            Ok(GuestFlush::Flushed),
+            Ok(GuestFlush::Paused),
+            Ok(GuestFlush::TimedOut),
+            Ok(GuestFlush::TimedOut),
+            Err(hypervisor),
+            Err(EngineError::Timeout),
+            Ok(GuestFlush::Flushed),
+        ]
+    );
 }
 
 #[tokio::test]

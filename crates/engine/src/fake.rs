@@ -22,7 +22,8 @@
 //! so every error path and every event the node agent must map is reachable:
 //! `fail_next` returns an error once, `crash` and `schedule_crash` produce a
 //! `Crashed` event, `set_console_echo` makes a console round-trip, and
-//! `set_unkillable` makes every stop fail as a VMM that survives `SIGKILL`.
+//! `set_unkillable` makes every stop fail as a VMM that survives `SIGKILL`,
+//! and `set_guest_flush` sets what a guest flush comes to.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io;
@@ -40,10 +41,10 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::{ByteRange, ChangedRanges};
 use crate::{
     ByteStream, Capabilities, ConsoleMode, ConsoleStream, Engine, EngineError, EngineEvent,
-    EventStream, ExecRequest, ExecSession, HostProbe, ImageConfig, ImageDigest, ImageInventory,
-    ImageRef, LineStream, NodeNetwork, OciLayout, OutputLine, OutputStream, PreparedImage,
-    RangesOf, SerialMode, SnapshotMethod, SnapshotSweep, StageFrom, StagedVolume, StopMode,
-    VmCounters, VmId, VmInfo, VmSpec, VmState, VolumeId, VolumeInfo, VolumeSnapshot,
+    EventStream, ExecRequest, ExecSession, GuestFlush, HostProbe, ImageConfig, ImageDigest,
+    ImageInventory, ImageRef, LineStream, NodeNetwork, OciLayout, OutputLine, OutputStream,
+    PreparedImage, RangesOf, SerialMode, SnapshotMethod, SnapshotSweep, StageFrom, StagedVolume,
+    StopMode, VmCounters, VmId, VmInfo, VmSpec, VmState, VolumeId, VolumeInfo, VolumeSnapshot,
 };
 
 /// Bytes in one gibibyte, the unit of `size_gb`.
@@ -103,6 +104,9 @@ pub enum FakeOp {
     Pause,
     /// `resume` (M5b).
     Resume,
+    /// `flush_volume` (M5b, ADR 0282). It fails that call only; a snapshot's
+    /// own flush follows [`FakeEngine::set_guest_flush`].
+    FlushVolume,
 }
 
 /// A volume the fake holds (M5a). With a volume directory set
@@ -338,6 +342,11 @@ struct State {
     dropped_events: u64,
     failures: HashMap<FakeOp, VecDeque<EngineError>>,
     stop_log: Vec<(VmId, StopMode)>,
+    /// What `flush_volume` returns and `snapshot_volume` records, when a test
+    /// set it (M5b, ADR 0282); `None` derives it from the VMs.
+    guest_flush: Option<Result<GuestFlush, EngineError>>,
+    /// The `flush_volume` calls and their results, in order.
+    flush_log: Vec<(VolumeId, Result<GuestFlush, EngineError>)>,
     next_pid: u32,
     next_snapshot: u64,
     /// The fake's manual clock, in time since the instance was created.
@@ -365,6 +374,8 @@ impl State {
             dropped_events: 0,
             failures: HashMap::new(),
             stop_log: Vec::new(),
+            guest_flush: None,
+            flush_log: Vec::new(),
             next_pid: 1000,
             next_snapshot: 1,
             clock: Duration::ZERO,
@@ -518,6 +529,24 @@ impl FakeEngine {
         let mut state = self.lock();
         state.snapshot_method = method;
         state.snapshot_pause = pause;
+    }
+
+    /// What `flush_volume` returns and `snapshot_volume` records in
+    /// `guest_flush`, until it is set again (M5b, ADR 0282). An injected error
+    /// is what `flush_volume` returns; `snapshot_volume` then records
+    /// `Failed`, or returns `NotFound` for `NotFound`. `None` restores the
+    /// default: `Flushed` when a running VM that is not paused attaches the
+    /// volume, `Paused` when that VM is paused, and `NoRunningVm` otherwise.
+    pub fn set_guest_flush(&self, outcome: Option<Result<GuestFlush, EngineError>>) {
+        self.lock().guest_flush = outcome;
+    }
+
+    /// The `flush_volume` calls this engine has received and what each
+    /// returned, in order (M5b). A snapshot's own flush is not one of them;
+    /// it is in the snapshot's `guest_flush`.
+    #[must_use]
+    pub fn flush_calls(&self) -> Vec<(VolumeId, Result<GuestFlush, EngineError>)> {
+        self.lock().flush_log.clone()
     }
 
     /// The volumes this engine holds, with their sizes, sorted by id.
@@ -1811,6 +1840,14 @@ impl Engine for FakeEngine {
         let Some(volume) = state.volumes.get(id) else {
             return Err(EngineError::NotFound);
         };
+        // The flush comes first, and only `NotFound` fails the snapshot
+        // (section 3.16, ADR 0282).
+        let guest_flush = match &state.guest_flush {
+            None => default_guest_flush(&state, id),
+            Some(Ok(outcome)) => *outcome,
+            Some(Err(EngineError::NotFound)) => return Err(EngineError::NotFound),
+            Some(Err(_)) => GuestFlush::Failed,
+        };
         let size_bytes = u64::from(volume.size_gb) * GIB;
         let n = state.next_snapshot;
         let location = match &state.volume_dir {
@@ -1840,6 +1877,7 @@ impl Engine for FakeEngine {
             location,
             method,
             pause,
+            guest_flush,
         };
         state
             .snapshots
@@ -2119,6 +2157,37 @@ impl Engine for FakeEngine {
         }
         record.paused = false;
         Ok(())
+    }
+
+    async fn flush_volume(
+        &self,
+        id: &VolumeId,
+        _within: Duration,
+    ) -> Result<GuestFlush, EngineError> {
+        let failure = self.take_failure(FakeOp::FlushVolume);
+        let mut state = self.lock();
+        let result = match (failure, &state.guest_flush) {
+            (Some(err), _) => Err(err),
+            (None, _) if !state.volumes.contains_key(id) => Err(EngineError::NotFound),
+            (None, None) => Ok(default_guest_flush(&state, id)),
+            (None, Some(injected)) => injected.clone(),
+        };
+        state.flush_log.push((id.clone(), result.clone()));
+        result
+    }
+}
+
+/// What the guest flush of `id` comes to when no test set it (section 7): the
+/// running VM that attaches the volume answers unless it is paused.
+fn default_guest_flush(state: &State, id: &VolumeId) -> GuestFlush {
+    let attached = state.vms.values().find(|record| {
+        record.info.state == VmState::Running
+            && record.spec.volumes.iter().any(|v| &v.volume_id == id)
+    });
+    match attached {
+        Some(record) if record.paused => GuestFlush::Paused,
+        Some(_) => GuestFlush::Flushed,
+        None => GuestFlush::NoRunningVm,
     }
 }
 

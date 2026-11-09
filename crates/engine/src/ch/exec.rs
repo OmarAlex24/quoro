@@ -114,7 +114,7 @@ async fn connect(vm: &str, socket: &Path) -> Result<UnixStream, EngineError> {
 
 /// Sends `CONNECT <port>\n` and reads the reply line, bounded to
 /// [`REPLY_BYTES`].
-async fn handshake(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
+pub(super) async fn handshake(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
     stream
         .write_all(format!("CONNECT {}\n", quoro_init::EXEC_PORT).as_bytes())
         .await?;
@@ -135,7 +135,7 @@ async fn handshake(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
 
 /// True when `reply` is the VMM's `OK <port>\n`. The port is the host-side
 /// port of the connection, which the VMM picks, so only its form is checked.
-fn is_connect_ok(reply: &[u8]) -> bool {
+pub(super) fn is_connect_ok(reply: &[u8]) -> bool {
     let Some(line) = reply.strip_suffix(b"\n") else {
         return false;
     };

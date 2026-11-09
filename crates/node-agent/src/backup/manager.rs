@@ -1319,7 +1319,9 @@ mod tests {
 
     /// The fake engine, which also records, at the moment the backup manager
     /// takes a snapshot, the pause marks of a VM that attaches `vol_1`. The
-    /// manager calls nothing else of the engine for a backup.
+    /// manager calls nothing else of the engine for a backup. `flush_volume`
+    /// is a plain passthrough to the fake, for callers to come; the
+    /// snapshot's own flush outcome comes from the fake's `snapshot_volume`.
     struct MarkSpy {
         fake: Arc<FakeEngine>,
         paused: PausedVms,
@@ -1344,6 +1346,14 @@ mod tests {
             snap: &VolumeSnapshot,
         ) -> Result<(), quoro_engine::EngineError> {
             self.fake.delete_volume_snapshot(snap).await
+        }
+
+        async fn flush_volume(
+            &self,
+            id: &VolumeId,
+            within: Duration,
+        ) -> Result<quoro_engine::GuestFlush, quoro_engine::EngineError> {
+            self.fake.flush_volume(id, within).await
         }
 
         async fn probe_host(&self) -> Result<quoro_engine::HostProbe, quoro_engine::EngineError> {

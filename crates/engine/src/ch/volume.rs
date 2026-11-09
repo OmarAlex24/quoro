@@ -33,7 +33,9 @@ use super::pool::VolumePool;
 use super::vmm::ProcessId;
 use crate::ch::state;
 use crate::ch::tools;
-use crate::{EngineError, SnapshotMethod, VmId, VmSpec, VolumeId, VolumeInfo, VolumeSnapshot};
+use crate::{
+    EngineError, GuestFlush, SnapshotMethod, VmId, VmSpec, VolumeId, VolumeInfo, VolumeSnapshot,
+};
 
 /// Free bytes the volume directory keeps for the filesystem's metadata: a
 /// sparse file itself needs almost nothing up front, but `mkfs.ext4` writes
@@ -730,9 +732,11 @@ impl Inner {
     /// Takes a snapshot of one volume (§3.16, ADR 0146). From M5b a volume may
     /// have several at once, each with its own file name.
     ///
-    /// `Reflink` clones the file. `PauseCopy` pauses the VM that attaches the
-    /// volume when it is running, copies the sparse file and always resumes the
-    /// VM, whatever the copy's outcome. A VM that attaches the volume and
+    /// The guest first flushes the volume, bounded at 2 s, and the outcome is
+    /// the snapshot's `guest_flush`; no outcome fails the snapshot (ADR 0282).
+    /// `Reflink` then clones the file. `PauseCopy` pauses the VM that attaches
+    /// the volume when it is running, copies the sparse file and always resumes
+    /// the VM, whatever the copy's outcome. A VM that attaches the volume and
     /// starts during the copy makes it `Conflict` (see [`Inner::pause_copy`]).
     pub(super) async fn snapshot_volume(
         self: &Arc<Self>,
@@ -742,19 +746,12 @@ impl Inner {
         self.volume_pool_error()?;
         let dir = self.volumes_dir();
         let path = volume_path(&dir, id);
-        let metadata = match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_file() => metadata,
-            Ok(_) => {
-                return Err(EngineError::Conflict(format!(
-                    "volume {} exists and is not a regular file",
-                    id.0
-                )));
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(EngineError::NotFound);
-            }
-            Err(err) => return Err(io_error(&path, &err)),
-        };
+        volume_file(&path, id)?;
+        // Before either method's own steps, with the VM running (§3.16).
+        let guest_flush = self.guest_flush(id, super::flush::SNAPSHOT_BOUND).await;
+        // Read after the flush: it gives the guest's delayed writes their
+        // blocks, so the size before it understates what a copy needs.
+        let metadata = volume_file(&path, id)?;
         let location = new_snapshot_path(&dir, id);
 
         let length = metadata.len();
@@ -807,7 +804,55 @@ impl Inner {
             location,
             method,
             pause,
+            guest_flush,
         })
+    }
+
+    /// Asks the guest to flush one volume, within `within` (§3.22, ADR 0282).
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` for an unknown volume, and nothing else: every other result
+    /// is an outcome. A volume pool that does not mount gives `Unsupported`.
+    pub(super) async fn flush_volume(
+        &self,
+        id: &VolumeId,
+        within: Duration,
+    ) -> Result<GuestFlush, EngineError> {
+        if validate_volume_id(id).is_err() {
+            return Err(EngineError::NotFound);
+        }
+        // Before the file check: the directory under a pool that did not mount
+        // is empty, so every volume would look unknown (§3.16).
+        if self.volume_pool_error().is_err() {
+            return Ok(GuestFlush::Unsupported);
+        }
+        let path = volume_path(&self.volumes_dir(), id);
+        if let Err(err) = std::fs::symlink_metadata(&path)
+            && err.kind() == std::io::ErrorKind::NotFound
+        {
+            return Err(EngineError::NotFound);
+        }
+        Ok(self.guest_flush(id, within).await)
+    }
+
+    /// The guest flush of `snapshot_volume` and `flush_volume`: it asks the
+    /// running VM that attaches the volume, as found now, and takes no VM
+    /// operation lock (§3.16, §4).
+    async fn guest_flush(&self, id: &VolumeId, within: Duration) -> GuestFlush {
+        let candidates = self
+            .entries()
+            .into_iter()
+            .map(|(vm_id, entry)| super::flush::Candidate {
+                running: entry.live_vmm().is_some() && entry.booted.load(Ordering::SeqCst),
+                spec: self
+                    .entry_with_spec(&vm_id)
+                    .ok()
+                    .and_then(|(_, record)| record.to_spec().ok()),
+                api_socket: entry.paths.api_socket.clone(),
+            })
+            .collect();
+        super::flush::flush(super::flush::target(id, candidates), within).await
     }
 
     /// Removes one snapshot file; a missing file is `Ok` (§3.16).
@@ -860,6 +905,20 @@ impl Inner {
                     .then_some(entry)
             })
             .collect()
+    }
+}
+
+/// The metadata of the volume file at `path`: `NotFound` when it is missing,
+/// `Conflict` when it is not a regular file (§3.16).
+fn volume_file(path: &Path, id: &VolumeId) -> Result<std::fs::Metadata, EngineError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(metadata),
+        Ok(_) => Err(EngineError::Conflict(format!(
+            "volume {} exists and is not a regular file",
+            id.0
+        ))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(EngineError::NotFound),
+        Err(err) => Err(io_error(path, &err)),
     }
 }
 
