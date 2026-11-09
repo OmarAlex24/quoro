@@ -12,13 +12,182 @@
 //! stored position, its entries must be numbered without a gap, and every
 //! entry must link to the hash before it and hash to its own `hash`, so no
 //! path stores an entry twice, out of order, or after a broken link (D-0013).
+//!
+//! The node also keeps the mark of section 7.1 (ADR 0261): the highest `seq`
+//! it has acknowledged, in the file [`crate::identity::LOG_MARK_FILE`] outside
+//! `node.db`, so a log that went back is noticed even when the store did not
+//! survive. The mark is raised before every `log_ack` and `hello` that
+//! reports a higher `seq` ([`raise_mark`]). It moves down only while the
+//! node refollows after a quarantine: to [`MAX_SEQ`] before the copy is moved
+//! aside, then to the `head_seq` it refollows to ([`lower_mark`], ADR 0280).
+//! [`recover`] finishes, before every `hello`, what an agent that stopped
+//! between those writes left (ADR 0285).
+
+use std::path::Path;
 
 use quoro_proto::jcs;
 use quoro_proto::wire::LogEntries;
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
+use tracing::warn;
 
+use crate::AgentError;
+use crate::identity;
+use crate::store::{NodeStore, Refollowing};
 use crate::util;
+
+/// The highest `seq` the change log carries, 2^53 - 1 (section 7.1
+/// "Refollowing"): RFC 8785 refuses larger integers (`quoro_proto::jcs`),
+/// and the control plane's fence token for an unknown lease uses the same
+/// bound. A quarantine writes the mark as this value before it moves the
+/// copy aside (ADR 0261), so no copy is at or above the mark until the node
+/// learns the `head_seq` it refollows to.
+pub const MAX_SEQ: u64 = 9_007_199_254_740_991;
+
+/// Reads the change-log mark from `data_dir` (section 7.1 "The node's mark",
+/// section 12, ADR 0261): `None` when there is no mark file, which is the
+/// case before the node first acknowledged an entry, and on an edge-only or
+/// witness-only machine, which never follows.
+///
+/// `quoro cluster promote` reads it to refuse a log below the mark (section
+/// 7.3), as [`NodeStore::log_below_mark`] does; the agent reads it before
+/// each write of the mark.
+///
+/// # Errors
+///
+/// [`AgentError::Io`] when the file exists but cannot be read, and
+/// [`AgentError::Store`] when it does not hold a decimal `seq`. The session
+/// then ends before `hello`, since it can neither report nor guard its log.
+pub fn read_mark(data_dir: &Path) -> Result<Option<u64>, AgentError> {
+    let path = data_dir.join(identity::LOG_MARK_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(AgentError::io("read the change-log mark", e)),
+    };
+    text.trim().parse::<u64>().map(Some).map_err(|_| {
+        AgentError::Store(format!(
+            "{} holds {text:?}, which is not a change-log seq",
+            path.display()
+        ))
+    })
+}
+
+/// Writes the change-log mark as `seq`, `0600`, through
+/// [`identity::write_private`], which syncs the file and the directory, so
+/// the mark is durable before the `log_ack` or `hello` it covers goes out
+/// (section 7.1). The write runs off the async runtime. Only a quarantine
+/// writes it directly, as [`MAX_SEQ`]; every other write goes through
+/// [`raise_mark`] or [`lower_mark`].
+///
+/// # Errors
+///
+/// [`AgentError::Io`] when the file cannot be written and synced.
+pub(crate) async fn write_mark(data_dir: &Path, seq: u64) -> Result<(), AgentError> {
+    let dir = data_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        identity::write_private(&dir, identity::LOG_MARK_FILE, seq.to_string().as_bytes())
+    })
+    .await
+    .map_err(|e| AgentError::Store(format!("the change-log mark writer stopped: {e}")))?
+}
+
+/// Raises the change-log mark to `seq` when `seq` is above it, and never
+/// lowers it (section 7.1 "The node's mark", ADR 0261). A missing mark
+/// counts as 0, so `seq` 0 writes nothing. Called before every `log_ack` and
+/// `hello`; while the node refollows below its head, the mark is that head
+/// and nothing is written.
+///
+/// # Errors
+///
+/// The errors of [`read_mark`] and of the write.
+pub(crate) async fn raise_mark(data_dir: &Path, seq: u64) -> Result<(), AgentError> {
+    if seq > read_mark(data_dir)?.unwrap_or(0) {
+        write_mark(data_dir, seq).await?;
+    }
+    Ok(())
+}
+
+/// Lowers the change-log mark to `seq` when it is above it, and never raises
+/// it: the node learned the `head_seq` it refollows to (section 7.1
+/// "Refollowing", ADR 0280). A missing mark is written as `seq` too: since
+/// [`raise_mark`] counts a missing mark as 0, the ack of a batch below the
+/// head would otherwise write a mark below it. Returns whether it wrote.
+///
+/// # Errors
+///
+/// The errors of [`read_mark`] and of the write.
+pub(crate) async fn lower_mark(data_dir: &Path, seq: u64) -> Result<bool, AgentError> {
+    if read_mark(data_dir)?.is_none_or(|mark| mark > seq) {
+        write_mark(data_dir, seq).await?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Finishes what an agent that stopped during a quarantine or a refollowing
+/// left (section 7.1 "Refollowing", ADR 0261, ADR 0280, ADR 0285). The
+/// session runs it before every `hello`. It is idempotent: once it has run,
+/// a second run writes nothing.
+///
+/// - **The mark is [`MAX_SEQ`], whatever state is recorded:** a quarantine
+///   wrote it and the agent may have stopped before it recorded
+///   [`Refollowing::HeadUnknown`] (ADR 0285). With no state recorded, that
+///   is the only reading. With [`Refollowing::Head`] `h` recorded there are
+///   two: a second `log_diverged` came while the node refollowed to `h`, so
+///   the stored copy is diverged and must be moved aside; or the agent
+///   recorded `h` and stopped before lowering the mark. They read the same,
+///   so it takes the first: it records [`Refollowing::HeadUnknown`] and goes
+///   on as below. The second loses nothing by it, since nothing was stored
+///   since the quarantine and the node relearns the head from the next
+///   `log_entries`, whose `head_seq` from the same primary is never below
+///   `h`.
+/// - **The state is [`Refollowing::HeadUnknown`]:** the stored copy is moved
+///   aside ([`NodeStore::quarantine_log`]; an empty copy needs nothing). The
+///   session stores no entry in that state, so every entry the copy holds
+///   predates the quarantine, which stopped before it moved the copy.
+/// - **The state is [`Refollowing::Head`] `h` and the mark is above `h` or
+///   missing:** the mark is lowered to `h` ([`lower_mark`]).
+///
+/// # Errors
+///
+/// The errors of the store, of [`read_mark`] and of the writes. The session
+/// then sends no `hello`: it would report a copy that must first be moved
+/// aside, or a mark it could not keep.
+pub(crate) async fn recover(store: &NodeStore) -> Result<(), AgentError> {
+    let data_dir = store.data_dir();
+    let mut state = store.refollowing().await?;
+    if read_mark(data_dir)? == Some(MAX_SEQ) && state != Some(Refollowing::HeadUnknown) {
+        warn!(
+            state = ?state,
+            "the change-log mark is at its quarantine value with the head not unknown; finishing the quarantine"
+        );
+        store.set_refollowing(Refollowing::HeadUnknown).await?;
+        state = Some(Refollowing::HeadUnknown);
+    }
+    match state {
+        Some(Refollowing::HeadUnknown) => {
+            let reason = "refollowing: a quarantine that had not moved the copy aside";
+            if let Some(path) = store.quarantine_log(reason).await? {
+                warn!(
+                    path = %path.display(),
+                    "a change-log copy stored before an unfinished quarantine is quarantined"
+                );
+            }
+        }
+        Some(Refollowing::Head(head)) => {
+            let lowered = lower_mark(data_dir, head).await?;
+            if lowered {
+                warn!(
+                    head_seq = head,
+                    "the change-log mark was above the head the node refollows to, or missing; lowered to it"
+                );
+            }
+        }
+        None => {}
+    }
+    Ok(())
+}
 
 /// `prev_hash` of `seq` 1, and `log_hash` while `log_seq` is 0 (sections 5.1
 /// and 5.14).

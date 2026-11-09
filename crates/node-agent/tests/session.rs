@@ -18,10 +18,11 @@ use quoro_engine::{Engine as _, FakeEngine, VmState};
 use quoro_ingress::cloudflared::CloudflaredConfig;
 use quoro_ingress::proxy::BackendObserver as _;
 use quoro_node_agent::edge::EdgeManager;
+use quoro_node_agent::identity::LOG_MARK_FILE;
 use quoro_node_agent::ingress::{CertificateEvents, DnsBridge, IngressConfig, IngressSupervisor};
 use quoro_node_agent::reconcile::Snapshot;
 use quoro_node_agent::session::{Session, SessionEnd, SessionSetup};
-use quoro_node_agent::store::NodeStore;
+use quoro_node_agent::store::{NodeStore, Refollowing};
 use quoro_node_agent::{FenceTimers, LeaseConfig, LeaseState, ManualHostClock, start_local_leases};
 use quoro_proto::sign::{self, SigningKey};
 use quoro_proto::wire::{
@@ -1506,7 +1507,16 @@ type Serving = tokio::task::JoinHandle<(Session, Result<SessionEnd, quoro_node_a
 /// Serves `session` over a new duplex stream: a fake primary reads `hello`,
 /// answers `welcome` and waits for the first status report. The task hands
 /// the session back when it ends, so a test can reconnect it.
-async fn follow_session(mut session: Session) -> (WebSocketStream<DuplexStream>, Value, Serving) {
+async fn follow_session(session: Session) -> (WebSocketStream<DuplexStream>, Value, Serving) {
+    let (mut ws, hello, serving) = open_session(session).await;
+    welcome(&mut ws, &hello).await;
+    (ws, hello, serving)
+}
+
+/// Serves `session` over a new duplex stream and reads its `hello`, and
+/// nothing more: the node waits for `welcome`, so the test sees its state
+/// as it was when the primary received `hello`.
+async fn open_session(mut session: Session) -> (WebSocketStream<DuplexStream>, Value, Serving) {
     let (client, server) = tokio::io::duplex(1 << 16);
     let accept = tokio::spawn(tokio_tungstenite::accept_async(server));
     let (client_ws, _response) = client_async("ws://primary.test/api/v1/nodes/session", client)
@@ -1519,8 +1529,13 @@ async fn follow_session(mut session: Session) -> (WebSocketStream<DuplexStream>,
     });
     let hello = read_frame(&mut ws).await;
     assert_eq!(hello["type"], "hello", "hello is the first message");
+    (ws, hello, serving)
+}
+
+/// Answers `hello` with `welcome` and waits for the first status report.
+async fn welcome(ws: &mut WebSocketStream<DuplexStream>, hello: &Value) {
     send(
-        &mut ws,
+        ws,
         ControlMessage::Welcome(Welcome {
             cluster_id: "cls_test".to_owned(),
             term: 1,
@@ -1534,8 +1549,7 @@ async fn follow_session(mut session: Session) -> (WebSocketStream<DuplexStream>,
         .to_text(),
     )
     .await;
-    read_until(&mut ws, "status_report").await;
-    (ws, hello, serving)
+    read_until(ws, "status_report").await;
 }
 
 /// Closes the primary's side and returns the session once it ended.
@@ -1785,9 +1799,11 @@ async fn ended(serving: Serving) -> Session {
 }
 
 /// Section 7.1: when the quarantined copy cannot be written, nothing is
-/// deleted and nothing recorded; the session ends, so the next `hello` draws
-/// `log_diverged` again. A regular file where the quarantine directory goes
-/// makes creating the copy fail.
+/// deleted and nothing recorded in `quarantine`, and the session ends. The
+/// mark and the refollowing state were written before the copy was to move
+/// (ADR 0261), so the next session moves it before its `hello`, and sends
+/// no `hello` while it cannot. A regular file where the quarantine
+/// directory goes makes creating the copy fail.
 #[tokio::test]
 async fn a_failed_quarantine_export_deletes_nothing_and_ends_the_session() {
     let dir = TempDir::new();
@@ -1812,14 +1828,33 @@ async fn a_failed_quarantine_export_deletes_nothing_and_ends_the_session() {
     });
     send(&mut ws, diverged.to_frame("msg_diverged", None).to_text()).await;
     frames_until_closed(&mut ws).await;
-    ended(serving).await;
+    let session = ended(serving).await;
 
     assert_eq!(stored_log(&store).await, old);
-    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM quarantine")
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-    assert_eq!(rows, 0);
+    assert_eq!(quarantined(&store).await, 0);
+    assert_eq!(mark_text(&dir).as_deref(), Some(MAX_SEQ_TEXT));
+    assert_eq!(
+        store.refollowing().await.unwrap(),
+        Some(Refollowing::HeadUnknown)
+    );
+
+    // The copy still cannot move: no `hello` reports it.
+    let (session, frames) = no_hello(session).await;
+    assert!(frames.is_empty(), "no hello: {frames:?}");
+    assert_eq!(stored_log(&store).await, old);
+
+    // Once it can, the next session moves it before its `hello`.
+    std::fs::remove_file(dir.path().join("quarantine")).unwrap();
+    let (ws, hello, serving) = open_session(session).await;
+    assert_eq!(hello["body"]["log_seq"], 0);
+    assert!(stored_log(&store).await.is_empty());
+    assert_eq!(quarantined(&store).await, 1);
+    assert_eq!(
+        store.refollowing().await.unwrap(),
+        Some(Refollowing::HeadUnknown)
+    );
+    drop(ws);
+    ended(serving).await;
 }
 
 /// Section 7.1: a batch the store cannot write is neither acknowledged nor
@@ -1891,4 +1926,668 @@ async fn no_hello_is_sent_without_the_change_log_position() {
     let (ws, hello, serving) = follow_session(session).await;
     assert_eq!(hello["body"]["log_seq"], 0);
     end_session(ws, serving).await;
+}
+
+/// The change-log mark at a quarantine, 2^53 - 1, as the file holds it
+/// (section 7.1 "Refollowing").
+const MAX_SEQ_TEXT: &str = "9007199254740991";
+
+/// The mark file's text, read straight from the disk, or `None` when there
+/// is no mark file (section 7.1 "The node's mark", section 12).
+fn mark_text(dir: &TempDir) -> Option<String> {
+    match std::fs::read_to_string(dir.path().join(LOG_MARK_FILE)) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => panic!("the mark file cannot be read: {e}"),
+    }
+}
+
+/// Writes the mark file straight to the disk, as an earlier agent left it.
+fn seed_mark(dir: &TempDir, text: &str) {
+    std::fs::write(dir.path().join(LOG_MARK_FILE), text).unwrap();
+}
+
+/// Stores `entries` as an earlier session would have.
+async fn seed_log(store: &NodeStore, entries: &[Value]) {
+    let from_seq = entries[0]["seq"].as_u64().unwrap();
+    let prev_hash = entries[0]["prev_hash"].as_str().unwrap();
+    let body = LogEntries {
+        from_seq,
+        entries: entries.to_vec(),
+        head_seq: None,
+    };
+    let verified = quoro_node_agent::follow::verify_batch(from_seq - 1, prev_hash, &body).unwrap();
+    store.store_log_batch(&verified, None).await.unwrap();
+}
+
+/// How many copies were quarantined.
+async fn quarantined(store: &NodeStore) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM quarantine")
+        .fetch_one(store.pool())
+        .await
+        .unwrap()
+}
+
+/// The primary's non-fatal `log_diverged` (section 7.1).
+fn diverged_frame(id: &str) -> String {
+    ControlMessage::Error(ProtocolError {
+        code: ErrorCode::LogDiverged,
+        message: "log_seq 3 does not match".to_owned(),
+        fatal: false,
+    })
+    .to_frame(id, None)
+    .to_text()
+}
+
+/// Serves `session` once, expecting it to end before `welcome`; returns the
+/// session and every frame it sent.
+async fn no_hello(mut session: Session) -> (Session, Vec<Value>) {
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let accept = tokio::spawn(tokio_tungstenite::accept_async(server));
+    let (client_ws, _response) = client_async("ws://primary.test/api/v1/nodes/session", client)
+        .await
+        .unwrap();
+    let mut ws = accept.await.unwrap().unwrap();
+    let serving = tokio::spawn(async move {
+        let end = session.serve(client_ws, std::future::pending::<()>()).await;
+        (session, end)
+    });
+    let frames = frames_until_closed(&mut ws).await;
+    (ended(serving).await, frames)
+}
+
+/// (a) ADR 0285: an agent that stopped after writing the mark as 2^53 - 1
+/// and before recording the state takes the state as "head unknown" and
+/// moves its copy aside before it follows: when the primary receives
+/// `hello`, both are done and `hello` reports an empty log.
+#[tokio::test]
+async fn a_quarantine_mark_without_state_finishes_the_quarantine_before_hello() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let old = log_chain(1, ZEROS, 3, "old");
+    seed_log(&store, &old).await;
+    seed_mark(&dir, MAX_SEQ_TEXT);
+
+    let (mut ws, hello, serving) = open_session(Session::new(setup)).await;
+    assert_eq!(hello["body"]["log_seq"], 0);
+    assert_eq!(hello["body"]["log_hash"], ZEROS);
+    assert_eq!(
+        store.refollowing().await.unwrap(),
+        Some(Refollowing::HeadUnknown)
+    );
+    assert!(stored_log(&store).await.is_empty());
+    assert_eq!(quarantined(&store).await, 1);
+    let copy: Vec<Value> = std::fs::read_dir(dir.path().join("quarantine"))
+        .unwrap()
+        .flat_map(|entry| {
+            std::fs::read_to_string(entry.unwrap().path())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(copy, old);
+    assert_eq!(mark_text(&dir).as_deref(), Some(MAX_SEQ_TEXT));
+
+    welcome(&mut ws, &hello).await;
+    end_session(ws, serving).await;
+}
+
+/// (b) Section 7.1 "Refollowing": with the state "head unknown" recorded,
+/// any stored copy predates the quarantine, which stopped before it moved
+/// the copy. It is moved aside before `hello`, whatever the mark.
+#[tokio::test]
+async fn a_copy_under_head_unknown_is_quarantined_before_hello() {
+    for mark in [Some(MAX_SEQ_TEXT), None] {
+        let dir = TempDir::new();
+        let (setup, _observed) = follow_node(&dir).await;
+        let store = setup.store.clone();
+        seed_log(&store, &log_chain(1, ZEROS, 3, "old")).await;
+        store
+            .set_refollowing(Refollowing::HeadUnknown)
+            .await
+            .unwrap();
+        if let Some(mark) = mark {
+            seed_mark(&dir, mark);
+        }
+
+        let (mut ws, hello, serving) = open_session(Session::new(setup)).await;
+        assert_eq!(hello["body"]["log_seq"], 0, "mark {mark:?}");
+        assert!(stored_log(&store).await.is_empty(), "mark {mark:?}");
+        assert_eq!(quarantined(&store).await, 1, "mark {mark:?}");
+        assert_eq!(
+            store.refollowing().await.unwrap(),
+            Some(Refollowing::HeadUnknown)
+        );
+        assert_eq!(mark_text(&dir).as_deref(), mark);
+        welcome(&mut ws, &hello).await;
+        end_session(ws, serving).await;
+    }
+}
+
+/// (c) Section 7.1 "Refollowing", ADR 0285: a mark at 2^53 - 1 is a
+/// quarantine's, whatever state is recorded. With a head recorded and a copy
+/// stored, a second `log_diverged` came while the node refollowed, and the
+/// agent stopped before it recorded "head unknown": the copy is diverged.
+/// When the primary receives `hello`, the state is "head unknown" and the
+/// copy is moved aside. The node then learns its head again from the next
+/// batch, as an agent that stopped between recording the head and lowering
+/// the mark, which reads the same, does.
+#[tokio::test]
+async fn a_quarantine_mark_over_a_recorded_head_finishes_the_quarantine_before_hello() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let old = log_chain(1, ZEROS, 3, "old");
+    seed_log(&store, &old).await;
+    store.set_refollowing(Refollowing::Head(5)).await.unwrap();
+    seed_mark(&dir, MAX_SEQ_TEXT);
+
+    let (mut ws, hello, serving) = open_session(Session::new(setup)).await;
+    assert_eq!(hello["body"]["log_seq"], 0);
+    assert_eq!(hello["body"]["log_hash"], ZEROS);
+    assert_eq!(
+        store.refollowing().await.unwrap(),
+        Some(Refollowing::HeadUnknown)
+    );
+    assert!(stored_log(&store).await.is_empty());
+    assert_eq!(quarantined(&store).await, 1);
+    assert_eq!(mark_text(&dir).as_deref(), Some(MAX_SEQ_TEXT));
+    welcome(&mut ws, &hello).await;
+
+    send(
+        &mut ws,
+        log_entries_frame(log_chain(1, ZEROS, 2, "new"), Some(7), "msg_log_1"),
+    )
+    .await;
+    let ack = reply_to(&mut ws, "msg_log_1").await;
+    assert_eq!(ack["type"], "log_ack", "{ack}");
+    assert_eq!(ack["body"]["seq"], 2);
+    assert_eq!(
+        store.refollowing().await.unwrap(),
+        Some(Refollowing::Head(7))
+    );
+    assert_eq!(mark_text(&dir).as_deref(), Some("7"));
+    end_session(ws, serving).await;
+}
+
+/// (c2) ADR 0280: with a head recorded, a mark that is missing or above it
+/// is lowered to that head, and not to the `head_seq` of the batch at hand,
+/// before anything is stored: before `hello`, and in a session before the
+/// next batch, which here the store refuses. Lowering a missing mark keeps a
+/// later ack below the head from writing a mark below it.
+#[tokio::test]
+async fn a_mark_above_the_recorded_head_is_lowered_to_it_before_the_next_batch() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    store.set_refollowing(Refollowing::Head(5)).await.unwrap();
+
+    let (mut ws, hello, serving) = open_session(Session::new(setup)).await;
+    assert_eq!(hello["body"]["log_seq"], 0);
+    assert_eq!(mark_text(&dir).as_deref(), Some("5"));
+    welcome(&mut ws, &hello).await;
+
+    // A mark above the head in a running session, as recovery left it
+    // before it read a mark at 2^53 - 1 as a quarantine's. The batch
+    // carries a later `head_seq`, which does not move the mark.
+    seed_mark(&dir, MAX_SEQ_TEXT);
+    sqlx::query("CREATE TRIGGER t BEFORE INSERT ON change_log BEGIN SELECT RAISE(ABORT,'x'); END;")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    send(
+        &mut ws,
+        log_entries_frame(log_chain(1, ZEROS, 2, "new"), Some(9), "msg_log_1"),
+    )
+    .await;
+    let frames = frames_until_closed(&mut ws).await;
+    assert!(log_acks(&frames).is_empty(), "no ack: {frames:?}");
+    ended(serving).await;
+    assert_eq!(mark_text(&dir).as_deref(), Some("5"));
+    assert!(stored_log(&store).await.is_empty());
+    assert_eq!(
+        store.refollowing().await.unwrap(),
+        Some(Refollowing::Head(5))
+    );
+}
+
+/// (d) Section 7.1 "The node's mark": a node with a stored copy at L and no
+/// mark, as an agent before the mark left it, or a mark below L, as a stop
+/// between a batch's commit and its mark write leaves it, reports L in
+/// `hello`, and the mark reads L by the time the primary receives it.
+#[tokio::test]
+async fn hello_raises_a_missing_or_lower_mark_to_the_stored_position() {
+    for mark in [None, Some("1")] {
+        let dir = TempDir::new();
+        let (setup, _observed) = follow_node(&dir).await;
+        let store = setup.store.clone();
+        let entries = log_chain(1, ZEROS, 3, "a");
+        seed_log(&store, &entries).await;
+        if let Some(mark) = mark {
+            seed_mark(&dir, mark);
+        }
+
+        let (mut ws, hello, serving) = open_session(Session::new(setup)).await;
+        assert_eq!(hello["body"]["log_seq"], 3, "mark {mark:?}");
+        assert_eq!(hello["body"]["log_hash"], entries[2]["hash"]);
+        assert_eq!(mark_text(&dir).as_deref(), Some("3"), "mark {mark:?}");
+        welcome(&mut ws, &hello).await;
+        end_session(ws, serving).await;
+    }
+}
+
+/// (e) Section 7.1 "The node's mark": a node whose `node.db` was lost keeps
+/// its mark. `hello` reports the empty log, the mark stays where it was,
+/// also over a batch below it, and the stored copy reads as below the mark,
+/// which `quoro cluster promote` refuses (section 7.3).
+#[tokio::test]
+async fn a_lost_store_leaves_the_log_below_the_mark() {
+    let dir = TempDir::new();
+    seed_mark(&dir, "7");
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+
+    let (mut ws, hello, serving) = open_session(Session::new(setup)).await;
+    assert_eq!(hello["body"]["log_seq"], 0);
+    assert_eq!(mark_text(&dir).as_deref(), Some("7"));
+    assert!(store.log_below_mark().await.unwrap());
+    welcome(&mut ws, &hello).await;
+
+    send(
+        &mut ws,
+        log_entries_frame(log_chain(1, ZEROS, 3, "a"), Some(3), "msg_log_1"),
+    )
+    .await;
+    let ack = reply_to(&mut ws, "msg_log_1").await;
+    assert_eq!(ack["type"], "log_ack", "{ack}");
+    assert_eq!(ack["body"]["seq"], 3);
+    assert_eq!(mark_text(&dir).as_deref(), Some("7"));
+    assert!(store.log_below_mark().await.unwrap());
+    end_session(ws, serving).await;
+}
+
+/// (f) Section 7.1 "The node's mark": the mark covers every `log_ack`
+/// before it leaves. When the mark cannot be kept, the committed batch goes
+/// unacknowledged and the session ends, and no `hello` goes out while the
+/// mark is unreadable; the next `hello` reports the batch and raises the
+/// mark to it.
+#[tokio::test]
+async fn every_log_ack_follows_its_mark() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let (mut ws, _hello, serving) = follow_session(Session::new(setup)).await;
+    assert_eq!(mark_text(&dir), None);
+
+    let first = log_chain(1, ZEROS, 3, "a");
+    send(
+        &mut ws,
+        log_entries_frame(first.clone(), Some(6), "msg_log_1"),
+    )
+    .await;
+    let ack = reply_to(&mut ws, "msg_log_1").await;
+    assert_eq!(ack["body"]["seq"], 3, "{ack}");
+    assert_eq!(mark_text(&dir).as_deref(), Some("3"));
+
+    let second = log_chain(4, first[2]["hash"].as_str().unwrap(), 2, "a");
+    send(
+        &mut ws,
+        log_entries_frame(second.clone(), Some(6), "msg_log_2"),
+    )
+    .await;
+    let ack = reply_to(&mut ws, "msg_log_2").await;
+    assert_eq!(ack["body"]["seq"], 5, "{ack}");
+    assert_eq!(mark_text(&dir).as_deref(), Some("5"));
+
+    // A mark the node cannot read: the batch commits, but no ack goes out.
+    seed_mark(&dir, "not a seq");
+    let third = log_chain(6, second[1]["hash"].as_str().unwrap(), 1, "a");
+    send(&mut ws, log_entries_frame(third, Some(6), "msg_log_3")).await;
+    let frames = frames_until_closed(&mut ws).await;
+    assert!(log_acks(&frames).is_empty(), "no ack: {frames:?}");
+    let session = ended(serving).await;
+    assert_eq!(stored_log(&store).await.len(), 6);
+
+    // While the mark cannot be read, no `hello` goes out.
+    let (session, frames) = no_hello(session).await;
+    assert!(frames.is_empty(), "no hello: {frames:?}");
+
+    std::fs::remove_file(dir.path().join(LOG_MARK_FILE)).unwrap();
+    let (mut ws, hello, serving) = open_session(session).await;
+    assert_eq!(hello["body"]["log_seq"], 6);
+    assert_eq!(mark_text(&dir).as_deref(), Some("6"));
+    welcome(&mut ws, &hello).await;
+    end_session(ws, serving).await;
+}
+
+/// (g) Section 7.1 "Refollowing", ADR 0261: `log_diverged` writes the mark
+/// as 2^53 - 1, records "head unknown" and moves the copy aside, on a full
+/// copy and on an empty one, which has nothing to move. The mark comes
+/// first: when the state cannot be recorded, the mark is already written
+/// and the copy has not moved, and the next session finishes the quarantine
+/// before its `hello` (ADR 0285).
+#[tokio::test]
+async fn log_diverged_marks_records_and_quarantines_in_that_order() {
+    // A full copy.
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let (mut ws, _hello, serving) = follow_session(Session::new(setup)).await;
+    send(
+        &mut ws,
+        log_entries_frame(log_chain(1, ZEROS, 3, "old"), Some(3), "msg_log_1"),
+    )
+    .await;
+    assert_eq!(reply_to(&mut ws, "msg_log_1").await["type"], "log_ack");
+    send(&mut ws, diverged_frame("msg_diverged")).await;
+    frames_before_pong(&mut ws, "msg_ping_1").await;
+    assert_eq!(mark_text(&dir).as_deref(), Some(MAX_SEQ_TEXT));
+    assert_eq!(
+        store.refollowing().await.unwrap(),
+        Some(Refollowing::HeadUnknown)
+    );
+    assert!(stored_log(&store).await.is_empty());
+    assert_eq!(quarantined(&store).await, 1);
+    end_session(ws, serving).await;
+
+    // An empty copy, as a lost `node.db` leaves it.
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let (mut ws, _hello, serving) = follow_session(Session::new(setup)).await;
+    send(&mut ws, diverged_frame("msg_diverged")).await;
+    frames_before_pong(&mut ws, "msg_ping_1").await;
+    assert_eq!(mark_text(&dir).as_deref(), Some(MAX_SEQ_TEXT));
+    assert_eq!(
+        store.refollowing().await.unwrap(),
+        Some(Refollowing::HeadUnknown)
+    );
+    assert_eq!(quarantined(&store).await, 0);
+    assert!(!dir.path().join("quarantine").exists());
+    end_session(ws, serving).await;
+
+    // The state cannot be recorded: only the mark is written.
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let (mut ws, _hello, serving) = follow_session(Session::new(setup)).await;
+    let old = log_chain(1, ZEROS, 3, "old");
+    send(
+        &mut ws,
+        log_entries_frame(old.clone(), Some(3), "msg_log_1"),
+    )
+    .await;
+    assert_eq!(reply_to(&mut ws, "msg_log_1").await["type"], "log_ack");
+    sqlx::query(
+        "CREATE TRIGGER r BEFORE INSERT ON node_meta WHEN NEW.key = 'log_refollowing' \
+         BEGIN SELECT RAISE(ABORT,'x'); END;",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+    send(&mut ws, diverged_frame("msg_diverged")).await;
+    frames_until_closed(&mut ws).await;
+    let session = ended(serving).await;
+    assert_eq!(mark_text(&dir).as_deref(), Some(MAX_SEQ_TEXT));
+    assert_eq!(store.refollowing().await.unwrap(), None);
+    assert_eq!(stored_log(&store).await, old);
+    assert_eq!(quarantined(&store).await, 0);
+
+    sqlx::query("DROP TRIGGER r")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let (mut ws, hello, serving) = open_session(session).await;
+    assert_eq!(hello["body"]["log_seq"], 0);
+    assert_eq!(
+        store.refollowing().await.unwrap(),
+        Some(Refollowing::HeadUnknown)
+    );
+    assert!(stored_log(&store).await.is_empty());
+    assert_eq!(quarantined(&store).await, 1);
+    welcome(&mut ws, &hello).await;
+    end_session(ws, serving).await;
+}
+
+/// (h) ADR 0280: the first batch after a quarantine records its `head_seq`
+/// H and lowers the mark to H before it is stored: a batch the store
+/// refuses leaves both. A batch that ends below H keeps them: its ack does
+/// not raise the mark, and a later `head_seq` does not replace H.
+#[tokio::test]
+async fn the_first_batch_after_a_quarantine_records_its_head_and_lowers_the_mark() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let (mut ws, _hello, serving) = follow_session(Session::new(setup)).await;
+    send(
+        &mut ws,
+        log_entries_frame(log_chain(1, ZEROS, 3, "old"), Some(3), "msg_log_1"),
+    )
+    .await;
+    assert_eq!(reply_to(&mut ws, "msg_log_1").await["type"], "log_ack");
+    send(&mut ws, diverged_frame("msg_diverged")).await;
+    frames_before_pong(&mut ws, "msg_ping_1").await;
+
+    sqlx::query("CREATE TRIGGER t BEFORE INSERT ON change_log BEGIN SELECT RAISE(ABORT,'x'); END;")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let new = log_chain(1, ZEROS, 2, "new");
+    send(
+        &mut ws,
+        log_entries_frame(new.clone(), Some(5), "msg_log_2"),
+    )
+    .await;
+    let frames = frames_until_closed(&mut ws).await;
+    assert!(log_acks(&frames).is_empty(), "no ack: {frames:?}");
+    let session = ended(serving).await;
+    assert_eq!(
+        store.refollowing().await.unwrap(),
+        Some(Refollowing::Head(5))
+    );
+    assert_eq!(mark_text(&dir).as_deref(), Some("5"));
+    assert!(stored_log(&store).await.is_empty());
+
+    sqlx::query("DROP TRIGGER t")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let (mut ws, hello, serving) = open_session(session).await;
+    assert_eq!(hello["body"]["log_seq"], 0);
+    assert_eq!(mark_text(&dir).as_deref(), Some("5"));
+    welcome(&mut ws, &hello).await;
+    send(&mut ws, log_entries_frame(new, Some(9), "msg_log_3")).await;
+    let ack = reply_to(&mut ws, "msg_log_3").await;
+    assert_eq!(ack["type"], "log_ack", "{ack}");
+    assert_eq!(ack["body"]["seq"], 2);
+    assert_eq!(mark_text(&dir).as_deref(), Some("5"));
+    assert_eq!(
+        store.refollowing().await.unwrap(),
+        Some(Refollowing::Head(5))
+    );
+    assert_eq!(stored_log(&store).await.len(), 2);
+    end_session(ws, serving).await;
+}
+
+/// (i) Section 7.1 "Refollowing": the batch that brings the copy to the
+/// head it refollows to ends the state, and its ack raises the mark to its
+/// last `seq`.
+#[tokio::test]
+async fn the_batch_that_reaches_the_head_ends_refollowing_and_raises_the_mark() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let new = log_chain(1, ZEROS, 2, "new");
+    seed_log(&store, &new).await;
+    store.set_refollowing(Refollowing::Head(5)).await.unwrap();
+    seed_mark(&dir, "5");
+
+    let (mut ws, hello, serving) = open_session(Session::new(setup)).await;
+    assert_eq!(hello["body"]["log_seq"], 2);
+    assert_eq!(mark_text(&dir).as_deref(), Some("5"));
+    welcome(&mut ws, &hello).await;
+
+    let rest = log_chain(3, new[1]["hash"].as_str().unwrap(), 4, "new");
+    send(&mut ws, log_entries_frame(rest, Some(9), "msg_log_1")).await;
+    let ack = reply_to(&mut ws, "msg_log_1").await;
+    assert_eq!(ack["type"], "log_ack", "{ack}");
+    assert_eq!(ack["body"]["seq"], 6);
+    assert_eq!(mark_text(&dir).as_deref(), Some("6"));
+    assert_eq!(store.refollowing().await.unwrap(), None);
+    assert_eq!(store.log_head().await.unwrap().unwrap().0, 9);
+    end_session(ws, serving).await;
+}
+
+/// (j) Section 7.1 "Refollowing": with the head unknown, a batch without
+/// `head_seq` cannot say how far the node must refollow. It stores nothing
+/// and is answered `bad_message`, non-fatal, with `re`; the state and the
+/// mark do not move, and the session goes on.
+#[tokio::test]
+async fn a_batch_without_head_seq_while_the_head_is_unknown_is_a_bad_message() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let (mut ws, _hello, serving) = follow_session(Session::new(setup)).await;
+    send(&mut ws, diverged_frame("msg_diverged")).await;
+    frames_before_pong(&mut ws, "msg_ping_1").await;
+
+    let entries = log_chain(1, ZEROS, 2, "new");
+    send(
+        &mut ws,
+        log_entries_frame(entries.clone(), None, "msg_log_1"),
+    )
+    .await;
+    let error = reply_to(&mut ws, "msg_log_1").await;
+    assert_eq!(error["type"], "error", "{error}");
+    assert_eq!(error["body"]["code"], "bad_message");
+    assert_eq!(error["body"]["fatal"], false);
+    let after = frames_before_pong(&mut ws, "msg_ping_2").await;
+    assert!(log_acks(&after).is_empty(), "no ack: {after:?}");
+    assert!(stored_log(&store).await.is_empty());
+    assert_eq!(
+        store.refollowing().await.unwrap(),
+        Some(Refollowing::HeadUnknown)
+    );
+    assert_eq!(mark_text(&dir).as_deref(), Some(MAX_SEQ_TEXT));
+
+    send(&mut ws, log_entries_frame(entries, Some(2), "msg_log_2")).await;
+    let ack = reply_to(&mut ws, "msg_log_2").await;
+    assert_eq!(ack["type"], "log_ack", "{ack}");
+    assert_eq!(ack["body"]["seq"], 2);
+    end_session(ws, serving).await;
+}
+
+/// (k) Section 7.1: an edge-only machine never follows, so it acknowledges
+/// nothing and its `hello` reports 0: no mark file is ever written.
+#[tokio::test]
+async fn an_edge_session_leaves_no_mark_file() {
+    let mut run = EdgeSession::start(edge_snapshot(1, vec![edge_backend("vm_a", 18080)], 60)).await;
+    let frames = frames_before_pong(&mut run.ws, "msg_ping_1").await;
+    assert!(log_acks(&frames).is_empty(), "{frames:?}");
+    assert!(!run._dir.path().join(LOG_MARK_FILE).exists());
+    assert_eq!(run.store.log_position().await.unwrap().0, 0);
+    run.finish().await;
+}
+
+/// (l) ADR 0280: with the head unknown, the first batch records its
+/// `head_seq` before it lowers the mark. When the head cannot be recorded,
+/// the mark still reads 2^53 - 1, nothing is stored and no ack goes out.
+#[tokio::test]
+async fn the_head_is_recorded_before_the_mark_is_lowered() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let (mut ws, _hello, serving) = follow_session(Session::new(setup)).await;
+    send(&mut ws, diverged_frame("msg_diverged")).await;
+    frames_before_pong(&mut ws, "msg_ping_1").await;
+    assert_eq!(
+        store.refollowing().await.unwrap(),
+        Some(Refollowing::HeadUnknown)
+    );
+
+    // Recording a numeric head fails. "head unknown" is already recorded, so
+    // the upsert takes its update path; both paths abort.
+    for trigger in [
+        "CREATE TRIGGER h_insert BEFORE INSERT ON node_meta \
+         WHEN NEW.key = 'log_refollowing' AND NEW.value GLOB '[0-9]*' \
+         BEGIN SELECT RAISE(ABORT,'x'); END;",
+        "CREATE TRIGGER h_update BEFORE UPDATE ON node_meta \
+         WHEN NEW.key = 'log_refollowing' AND NEW.value GLOB '[0-9]*' \
+         BEGIN SELECT RAISE(ABORT,'x'); END;",
+    ] {
+        sqlx::query(trigger).execute(store.pool()).await.unwrap();
+    }
+    send(
+        &mut ws,
+        log_entries_frame(log_chain(1, ZEROS, 2, "new"), Some(5), "msg_log_1"),
+    )
+    .await;
+    let frames = frames_until_closed(&mut ws).await;
+    assert!(log_acks(&frames).is_empty(), "no ack: {frames:?}");
+    ended(serving).await;
+    assert_eq!(mark_text(&dir).as_deref(), Some(MAX_SEQ_TEXT));
+    assert!(stored_log(&store).await.is_empty());
+    assert_eq!(
+        store.refollowing().await.unwrap(),
+        Some(Refollowing::HeadUnknown)
+    );
+}
+
+/// With the head unknown, sends a three-entry batch carrying `head_seq`,
+/// which the node must refuse: `bad_message`, non-fatal, with `re`, nothing
+/// stored, and neither the state nor the mark moved; the session goes on.
+/// The same batch with `head_seq` at its last `seq` is then recorded,
+/// stored and acknowledged, and ends the refollowing it reaches.
+async fn a_refused_head_seq(head_seq: u64) {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let (mut ws, _hello, serving) = follow_session(Session::new(setup)).await;
+    send(&mut ws, diverged_frame("msg_diverged")).await;
+    frames_before_pong(&mut ws, "msg_ping_1").await;
+
+    let entries = log_chain(1, ZEROS, 3, "new");
+    send(
+        &mut ws,
+        log_entries_frame(entries.clone(), Some(head_seq), "msg_log_1"),
+    )
+    .await;
+    let error = reply_to(&mut ws, "msg_log_1").await;
+    assert_eq!(error["type"], "error", "head_seq {head_seq}: {error}");
+    assert_eq!(error["body"]["code"], "bad_message");
+    assert_eq!(error["body"]["fatal"], false);
+    let after = frames_before_pong(&mut ws, "msg_ping_2").await;
+    assert!(log_acks(&after).is_empty(), "no ack: {after:?}");
+    assert!(stored_log(&store).await.is_empty());
+    assert_eq!(
+        store.refollowing().await.unwrap(),
+        Some(Refollowing::HeadUnknown)
+    );
+    assert_eq!(mark_text(&dir).as_deref(), Some(MAX_SEQ_TEXT));
+
+    send(&mut ws, log_entries_frame(entries, Some(3), "msg_log_2")).await;
+    let ack = reply_to(&mut ws, "msg_log_2").await;
+    assert_eq!(ack["type"], "log_ack", "{ack}");
+    assert_eq!(ack["body"]["seq"], 3);
+    assert_eq!(store.refollowing().await.unwrap(), None);
+    assert_eq!(mark_text(&dir).as_deref(), Some("3"));
+    end_session(ws, serving).await;
+}
+
+/// (m) Section 7.1 "Refollowing": with the head unknown, a `head_seq` below
+/// the batch's own last `seq` cannot be the primary's newest, so the node
+/// does not record it.
+#[tokio::test]
+async fn a_head_seq_below_the_batch_while_the_head_is_unknown_is_a_bad_message() {
+    a_refused_head_seq(2).await;
+}
+
+/// (n) Section 7.1 "Refollowing": with the head unknown, a `head_seq` above
+/// 2^53 - 1, which no change log reaches, is not recorded either.
+#[tokio::test]
+async fn a_head_seq_above_the_highest_seq_while_the_head_is_unknown_is_a_bad_message() {
+    a_refused_head_seq(quoro_node_agent::follow::MAX_SEQ + 1).await;
 }
