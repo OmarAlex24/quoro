@@ -128,7 +128,25 @@ describe('node meters', () => {
       allocated: { cpus: 0, memory_mb: 0, disk_gb: 0 },
     });
     expect(memory!.share).toBeNull();
-    expect(memory!.spoken).toBe('Memory: no capacity reported');
+    expect(memory!.spoken).toBe('Memory: 0 GiB reserved, no capacity reported');
+  });
+
+  // Issue 639: a node that reports a disk capacity of 0 read "2 of 0 GiB reserved" over an empty meter.
+  it('says what is reserved, and that the capacity is unknown, when a node reports none', () => {
+    const [cpu, memory, disk] = nodeMeters({
+      capacity: { cpus: 2, memory_mb: 3922, disk_gb: 0 },
+      allocated: { cpus: 2, memory_mb: 512, disk_gb: 2 },
+    });
+    expect(disk).toMatchObject({
+      share: null,
+      words: '2 GiB reserved',
+      unknown: 'The node reports no disk capacity',
+      spoken: 'Disk: 2 GiB reserved, no capacity reported',
+    });
+    expect(disk!.words).not.toMatch(/of 0/);
+    expect(cpu).toMatchObject({ share: 1, words: '2 of 2 CPUs reserved', unknown: null });
+    expect(memory!.unknown).toBeNull();
+    expect(memory!.words).toBe('0.5 of 3.8 GiB reserved');
   });
 
   it('says gibibytes with as few digits as needed', () => {

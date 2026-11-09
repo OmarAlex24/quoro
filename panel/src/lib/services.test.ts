@@ -5,6 +5,7 @@ import {
   appIdOfKey,
   appKey,
   commitLine,
+  keepInView,
   lastBuildFailed,
   memoryWords,
   nextBackupLine,
@@ -102,5 +103,28 @@ describe('appIdOfKey', () => {
     expect(appIdOfKey(appKey('app_1'))).toBe('app_1');
     expect(appIdOfKey('vm:vm_1')).toBeUndefined();
     expect(appIdOfKey(undefined)).toBeUndefined();
+  });
+});
+
+describe('keepInView', () => {
+  // Issue 639: at 390 px the sheet's selected Settings tab ended 23 px past
+  // the right edge once Security's count arrived and widened the row.
+  it('scrolls the selected tab back into view after the row widened', () => {
+    // Measured on a phone: Settings at 453, 50 wide, in a 518 px row seen through 390 px.
+    expect(keepInView({ left: 453, width: 50, scrollLeft: 105, clientWidth: 390, scrollWidth: 518 })).toBe(128);
+  });
+
+  it('leaves a tab that already shows whole', () => {
+    expect(keepInView({ left: 453, width: 50, scrollLeft: 128, clientWidth: 390, scrollWidth: 518 })).toBeNull();
+    expect(keepInView({ left: 40, width: 80, scrollLeft: 0, clientWidth: 390, scrollWidth: 518 })).toBeNull();
+  });
+
+  it('scrolls back left for a tab before the view, never past the start', () => {
+    expect(keepInView({ left: 0, width: 90, scrollLeft: 128, clientWidth: 390, scrollWidth: 518 })).toBe(0);
+    expect(keepInView({ left: 200, width: 60, scrollLeft: 300, clientWidth: 390, scrollWidth: 900 })).toBe(168);
+  });
+
+  it('keeps room on the far side when the row can scroll that far', () => {
+    expect(keepInView({ left: 600, width: 60, scrollLeft: 0, clientWidth: 390, scrollWidth: 900 })).toBe(302);
   });
 });

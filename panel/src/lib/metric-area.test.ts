@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   agoWords,
   areaPlot,
+  capacityAxis,
   clockTime,
   cpuAxis,
   memoryFigures,
@@ -62,6 +63,26 @@ describe('axes', () => {
 
   it('gives an empty series an axis that still has a top', () => {
     expect(niceAxis(0).max).toBeGreaterThan(0);
+  });
+
+  // Issue 639: a 3922 MiB host drew its memory on an axis to 6000, so the line sat in the bottom third.
+  it('ends a host memory axis at the host’s memory, with round grid lines under it', () => {
+    expect(niceAxis(3922).max).toBe(6000);
+    expect(capacityAxis(3922)).toEqual({ max: 3922, ticks: [0, 1000, 2000, 3000] });
+    expect(capacityAxis(2048)).toEqual({ max: 2048, ticks: [0, 500, 1000, 1500, 2000] });
+    expect(capacityAxis(16_384)).toEqual({ max: 16_384, ticks: [0, 5000, 10_000, 15_000] });
+    expect(capacityAxis(1024)).toEqual({ max: 1024, ticks: [0, 250, 500, 750, 1000] });
+    for (const capacity of [100, 3922, 7_812, 65_536, 257_000]) {
+      const axis = capacityAxis(capacity);
+      expect(axis.max).toBe(capacity);
+      expect(axis.ticks.length).toBeGreaterThanOrEqual(4);
+      expect(axis.ticks[axis.ticks.length - 1]!).toBeLessThanOrEqual(capacity);
+    }
+  });
+
+  it('falls back to a round axis without a capacity', () => {
+    expect(capacityAxis(0)).toEqual(niceAxis(0));
+    expect(capacityAxis(Number.NaN).max).toBeGreaterThan(0);
   });
 
   it('labels the CPU floor without a unit, the way the reference does', () => {
@@ -164,6 +185,23 @@ describe('gaps', () => {
     expect(plot.ticks[0]!.y).toBe(plot.box.bottom);
     expect(plot.limit?.label).toBe('limit 512 MiB');
     expect(plot.limit!.y).toBeCloseTo(yForValue(512, 600, plot.box));
+    expect(plot.limit!.below).toBe(false);
+  });
+
+  it('puts the limit’s label under its line when the line runs along the top', () => {
+    const plot = areaPlot({
+      series: { times: [END], values: [611] },
+      end: END,
+      width: 600,
+      height: 150,
+      axis: capacityAxis(3922),
+      tickLabel: String,
+      intervalMs: INTERVAL,
+      limit: { value: 3922, label: 'total 3.8 GiB' },
+    });
+    expect(plot.limit!.y).toBe(plot.box.top);
+    expect(plot.limit!.below).toBe(true);
+    expect(plot.ticks.map((tick) => tick.label)).toEqual(['0', '1000', '2000', '3000']);
   });
 
   it('draws nothing for an empty series', () => {

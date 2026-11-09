@@ -508,8 +508,8 @@ export function drawMetricArea({ ctx, w, h }: DitherSurface, plot: AreaPlot, rea
     ctx.fillStyle = faint;
     ctx.fillRect(box.left, Math.round(plot.limit.y), width, 1);
     ctx.textAlign = 'right';
-    ctx.textBaseline = 'bottom';
-    ctx.fillText(plot.limit.label, box.right, plot.limit.y - 3);
+    ctx.textBaseline = plot.limit.below ? 'top' : 'bottom';
+    ctx.fillText(plot.limit.label, box.right, plot.limit.below ? plot.limit.y + 4 : plot.limit.y - 3);
     ctx.textBaseline = 'middle';
   }
 

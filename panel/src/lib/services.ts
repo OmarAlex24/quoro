@@ -144,3 +144,33 @@ export const nodesLine = (
     .filter((name): name is string => name !== undefined && name !== '');
   return known.length === 0 ? null : known.sort().join(' · ');
 };
+
+/**
+ * Where a scrolling tab row should rest so its selected tab shows whole, with
+ * `pad` pixels to spare, or null when it already does. Offsets are from the
+ * row's own left edge; the answer stays within what the row can scroll.
+ */
+export const keepInView = ({
+  left,
+  width,
+  scrollLeft,
+  clientWidth,
+  scrollWidth,
+  pad = 32,
+}: {
+  left: number;
+  width: number;
+  scrollLeft: number;
+  clientWidth: number;
+  scrollWidth: number;
+  pad?: number;
+}): number | null => {
+  const most = Math.max(0, scrollWidth - clientWidth);
+  const right = left + width;
+  let next: number | null = null;
+  if (left - pad < scrollLeft) next = left - pad;
+  else if (right + pad > scrollLeft + clientWidth) next = right + pad - clientWidth;
+  if (next === null) return null;
+  const clamped = Math.min(most, Math.max(0, next));
+  return Math.abs(clamped - scrollLeft) < 1 ? null : clamped;
+};
