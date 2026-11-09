@@ -2237,6 +2237,9 @@ fn kept_snapshot_record(row: sqlx::sqlite::SqliteRow) -> Result<KeptSnapshotReco
             location: std::path::PathBuf::from(location),
             method,
             pause: Duration::from_millis(u64::try_from(pause_ms).unwrap_or(0)),
+            // The store keeps no flush outcome for a kept snapshot, and
+            // nothing reads it from one: only a backup reports it.
+            guest_flush: quoro_engine::GuestFlush::Unsupported,
         },
         purpose: row.try_get("purpose").map_err(store_error)?,
         seq: seq.and_then(|seq| u64::try_from(seq).ok()),

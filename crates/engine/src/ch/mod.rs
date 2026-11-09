@@ -16,10 +16,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{
-    Capabilities, ChangedRanges, ConsoleStream, Engine, EngineError, EventStream, HostProbe,
-    ImageDigest, ImageInventory, ImageRef, LineStream, NodeNetwork, OciLayout, PreparedImage,
-    RangesOf, StageFrom, StagedVolume, StopMode, VmCounters, VmId, VmInfo, VmSpec, VolumeId,
-    VolumeInfo, VolumeSnapshot,
+    Capabilities, ChangedRanges, ConsoleStream, Engine, EngineError, EventStream, GuestFlush,
+    HostProbe, ImageDigest, ImageInventory, ImageRef, LineStream, NodeNetwork, OciLayout,
+    PreparedImage, RangesOf, StageFrom, StagedVolume, StopMode, VmCounters, VmId, VmInfo, VmSpec,
+    VolumeId, VolumeInfo, VolumeSnapshot,
 };
 
 pub mod api;
@@ -32,6 +32,7 @@ pub mod vmm;
 
 mod engine;
 mod exec;
+mod flush;
 mod host;
 mod pool;
 mod serial;
@@ -320,6 +321,14 @@ impl Engine for ChEngine {
 
     async fn delete_volume_snapshot(&self, snapshot: &VolumeSnapshot) -> Result<(), EngineError> {
         self.inner.delete_volume_snapshot(snapshot).await
+    }
+
+    async fn flush_volume(
+        &self,
+        id: &VolumeId,
+        within: std::time::Duration,
+    ) -> Result<GuestFlush, EngineError> {
+        self.inner.flush_volume(id, within).await
     }
 
     async fn volume_changed_ranges(

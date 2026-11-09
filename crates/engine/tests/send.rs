@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use quoro_engine::{
-    Engine, FakeEngine, ImageDigest, ImageRef, NodeNetwork, RangesOf, SnapshotMethod, StageFrom,
-    StagedVolume, StopMode, VmId, VmSpec, VolumeId, VolumeSnapshot,
+    Engine, FakeEngine, GuestFlush, ImageDigest, ImageRef, NodeNetwork, RangesOf, SnapshotMethod,
+    StageFrom, StagedVolume, StopMode, VmId, VmSpec, VolumeId, VolumeSnapshot,
 };
 
 fn assert_send<T: Send>(_: &T) {}
@@ -61,6 +61,7 @@ fn calls_are_send<E: Engine>(engine: &E, sample: &Sample<'_>) {
     assert_send(&engine.import_volume(sample.volume, 1, Path::new("/fake/restore")));
     assert_send(&engine.delete_volume(sample.volume));
     assert_send(&engine.snapshot_volume(sample.volume));
+    assert_send(&engine.flush_volume(sample.volume, Duration::from_secs(2)));
     assert_send(&engine.delete_volume_snapshot(sample.snapshot));
     let newer = RangesOf::Snapshot(sample.snapshot.clone());
     assert_send(&engine.volume_changed_ranges(&newer, Some(sample.snapshot)));
@@ -100,6 +101,7 @@ async fn a_generic_caller_can_spawn_an_engine_call() {
         location: "/fake/snapshots/1".into(),
         method: SnapshotMethod::Reflink,
         pause: Duration::ZERO,
+        guest_flush: GuestFlush::NoRunningVm,
     };
 
     calls_are_send(
