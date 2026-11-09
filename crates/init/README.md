@@ -295,10 +295,12 @@ connection does: after the answer, or as soon as the host hangs up. The engine
 stops waiting after its bound, 2 s, and drops the connection, so a `syncfs`
 that does not return, on a filesystem the app froze or a disk that stopped
 answering, holds its thread but not one of the 16 session slots, and the web
-terminal stays reachable. That `syncfs` still completes when it can. Only one `syncfs` of a
-volume runs at a time: a `SYNC` naming a volume whose earlier `syncfs` has not
-returned is answered with `ERROR` at once, so such a volume never holds more
-than one thread.
+terminal stays reachable. That `syncfs` still completes when it can. One sync
+of a volume waits for another, as when a backup and a warm cycle overlap: the
+second waits up to 2 s for the first to end, then runs its own `syncfs`, since
+the first may not cover what was written since it began. If the first has not
+ended by then, the second is answered with `ERROR`, so a volume whose `syncfs`
+hangs holds one thread, however often the engine asks.
 
 Per session:
 
