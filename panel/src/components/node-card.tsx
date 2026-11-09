@@ -6,7 +6,7 @@ import { useCallback, useState } from 'react';
 import type { Node, NodeMetricSample } from '../api/generated/model';
 import type { DitherSurface, TokenReader } from '../lib/dither-draw';
 import { drawMeter } from '../lib/dither-draw';
-import { cpuAxis, memoryFigures, niceAxis, percentTick, plainTick, streamReadout } from '../lib/metric-area';
+import { capacityAxis, cpuAxis, memoryFigures, percentTick, plainTick, streamReadout } from '../lib/metric-area';
 import { formatBytes, formatPercent } from '../lib/metrics';
 import { liveWords, loadWords, meterTone, nodeMeters, nodeTags, type NodeLoad, type NodeMeter } from '../lib/node-capacity';
 import { nodeReadout } from '../lib/nodes';
@@ -34,7 +34,11 @@ function Meter({ meter }: { meter: NodeMeter }) {
         <b>{meter.label}</b>
         <span>{meter.words}</span>
       </div>
-      <DitherCanvas paint={paint} label={meter.spoken} />
+      {meter.unknown !== null ? (
+        <p className="meter-unknown">{meter.unknown}</p>
+      ) : (
+        <DitherCanvas paint={paint} label={meter.spoken} />
+      )}
     </div>
   );
 }
@@ -215,7 +219,7 @@ function NodeMetricsSheet({
                 subtitle="host memory in use, MiB"
                 samples={samples}
                 value={memoryValue}
-                axis={niceAxis(total / MIB)}
+                axis={capacityAxis(total / MIB)}
                 tickLabel={plainTick}
                 formatValue={formatMemory}
                 intervalS={5}

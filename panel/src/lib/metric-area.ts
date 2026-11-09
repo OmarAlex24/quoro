@@ -65,6 +65,22 @@ export const niceAxis = (top: number, steps = 3): Axis => {
   return { max, ticks: ticksTo(max, step) };
 };
 
+/**
+ * An axis for a value that cannot pass a known capacity, such as a host's
+ * memory in use: it ends at the capacity itself, so the line uses the whole
+ * height, with grid lines at the largest round step that still draws at least
+ * three: a 3922 MiB host gets 0, 1000, 2000, 3000 under its top at 3922.
+ * Without a capacity it falls back to `niceAxis`.
+ */
+export const capacityAxis = (capacity: number, steps = 3): Axis => {
+  if (!Number.isFinite(capacity) || capacity <= 0) return niceAxis(capacity, steps);
+  const raw = capacity / steps;
+  const magnitude = 10 ** Math.floor(Math.log10(raw));
+  const fits = NICE_STEPS.filter((candidate) => candidate * magnitude <= raw);
+  const step = (fits[fits.length - 1] ?? 1) * magnitude;
+  return { max: capacity, ticks: ticksTo(Math.floor(capacity / step) * step, step) };
+};
+
 /** Where a time lands: the window's start at the left edge, its end (the newest sample) at the right. */
 export const xForTime = (time: number, end: number, box: PlotBox, windowMs = METRICS_WINDOW_MS): number =>
   box.left + (box.right - box.left) * clamp01((time - (end - windowMs)) / windowMs);
@@ -181,11 +197,23 @@ export interface AreaPlot {
   ticks: AxisTick[];
   /** Each run is drawn on its own, so a gap stays empty. */
   runs: Array<Array<{ x: number; y: number }>>;
-  /** The configured limit, drawn as a thin line with its label. */
-  limit: { y: number; label: string } | null;
+  /**
+   * The configured limit, drawn as a thin line with its label: above the line,
+   * or below it when the line runs along the top of the plot.
+   */
+  limit: { y: number; label: string; below: boolean } | null;
   /** The newest sample, which gets the dot at the right edge. */
   newest: { x: number; y: number } | null;
 }
+
+/** The limit's label needs this much room above its line, in CSS pixels; with less it goes below. */
+export const LIMIT_LABEL_ROOM = 15;
+
+const limitMark = (y: number, label: string): { y: number; label: string; below: boolean } => ({
+  y,
+  label,
+  below: y < LIMIT_LABEL_ROOM,
+});
 
 export const areaPlot = ({
   series,
@@ -228,7 +256,7 @@ export const areaPlot = ({
     box,
     ticks: axis.ticks.map((value) => ({ y: yForValue(value, axis.max, box), label: tickLabel(value) })),
     runs,
-    limit: limit === null ? null : { y: yForValue(limit.value, axis.max, box), label: limit.label },
+    limit: limit === null ? null : limitMark(yForValue(limit.value, axis.max, box), limit.label),
     newest: lastIndex >= 0 ? point(lastIndex) : null,
   };
 };

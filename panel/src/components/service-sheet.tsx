@@ -24,7 +24,7 @@ import { appsPollingInterval, relativeTime, serviceLampState } from '../lib/app-
 import { canOpenTerminal } from '../lib/capabilities';
 import { problemView, type ProblemView } from '../lib/problem';
 import { PROJECT_TABS, type ProjectTab } from '../lib/routes';
-import { appAddress, appKind } from '../lib/services';
+import { appAddress, appKind, keepInView } from '../lib/services';
 import { securityParams, securityTabCount } from '../lib/vulnerabilities';
 import { cachedBuildLive, useRecentBuilds } from '../lib/use-builds';
 import { useSession } from '../session';
@@ -349,17 +349,30 @@ export function SheetTabs({ label, tab, children }: { label: string; tab: string
   }, []);
 
   // Scroll the row itself, not the page: scrollIntoView could also move the
-  // sheet's body.
+  // sheet's body. A tab can widen after this runs (Security's count arrives
+  // with its own read), which pushes the selected tab out again, so the row
+  // checks once more whenever a tab changes size.
   useLayoutEffect(() => {
     const nav = ref.current;
-    const active = nav?.querySelector<HTMLElement>('a.on');
-    if (!nav || !active) return;
-    // The row is positioned, so a tab's offset is measured from the row itself.
-    const pad = 32;
-    const left = active.offsetLeft;
-    const right = left + active.offsetWidth;
-    if (left - pad < nav.scrollLeft) nav.scrollLeft = Math.max(0, left - pad);
-    else if (right + pad > nav.scrollLeft + nav.clientWidth) nav.scrollLeft = right + pad - nav.clientWidth;
+    if (!nav) return;
+    const keep = () => {
+      const active = nav.querySelector<HTMLElement>('a.on');
+      if (!active) return;
+      // The row is positioned, so a tab's offset is measured from the row itself.
+      const next = keepInView({
+        left: active.offsetLeft,
+        width: active.offsetWidth,
+        scrollLeft: nav.scrollLeft,
+        clientWidth: nav.clientWidth,
+        scrollWidth: nav.scrollWidth,
+      });
+      if (next !== null) nav.scrollLeft = next;
+    };
+    keep();
+    const observer = new ResizeObserver(keep);
+    observer.observe(nav);
+    for (const child of Array.from(nav.children)) observer.observe(child);
+    return () => observer.disconnect();
   }, [tab]);
 
   return (

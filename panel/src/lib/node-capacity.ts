@@ -50,8 +50,13 @@ export interface NodeMeter {
   label: string;
   /** Reserved over capacity; null when the node reports no capacity. */
   share: number | null;
-  /** The reading beside the label: `8 of 12 CPUs reserved`. */
+  /** The reading beside the label: `8 of 12 CPUs reserved`, or `2 GiB reserved` without a capacity. */
   words: string;
+  /**
+   * Said in place of the meter when the node reports no capacity (a missing
+   * or zero figure): a share of nothing is unknown, not empty.
+   */
+  unknown: string | null;
   /** The meter's spoken name. */
   spoken: string;
 }
@@ -59,32 +64,52 @@ export interface NodeMeter {
 /**
  * A node's CPU, memory and disk as reserved against capacity: what the VMs
  * placed on it were given (`allocated`), out of what it has (`capacity`).
+ * A capacity of 0 or none is not drawn as a meter: the words say what is
+ * reserved and that the node reports no capacity.
  */
 export const nodeMeters = (node: Pick<Node, 'capacity' | 'allocated'>): NodeMeter[] => {
   const { capacity, allocated } = node;
-  const meter = (key: MeterKey, label: string, used: number, total: number, words: string): NodeMeter => {
+  const meter = (
+    key: MeterKey,
+    label: string,
+    noun: string,
+    used: number,
+    total: number,
+    words: { of: string; alone: string },
+  ): NodeMeter => {
     const share = capacityShare(used, total);
+    if (share === null) {
+      return {
+        key,
+        label,
+        share,
+        words: words.alone,
+        unknown: `The node reports no ${noun} capacity`,
+        spoken: `${label}: ${words.alone}, no capacity reported`,
+      };
+    }
     return {
       key,
       label,
       share,
-      words,
-      spoken:
-        share === null
-          ? `${label}: no capacity reported`
-          : `${label}: ${Math.round(share * 100)}% reserved, ${words}`,
+      words: words.of,
+      unknown: null,
+      spoken: `${label}: ${Math.round(share * 100)}% reserved, ${words.of}`,
     };
   };
   return [
-    meter('cpu', 'CPU', allocated.cpus, capacity.cpus, `${allocated.cpus} of ${plural(capacity.cpus, 'CPU')} reserved`),
-    meter(
-      'memory',
-      'Memory',
-      allocated.memory_mb,
-      capacity.memory_mb,
-      `${gibWords(allocated.memory_mb)} of ${gibWords(capacity.memory_mb)} GiB reserved`,
-    ),
-    meter('disk', 'Disk', allocated.disk_gb, capacity.disk_gb, `${allocated.disk_gb} of ${capacity.disk_gb} GiB reserved`),
+    meter('cpu', 'CPU', 'CPU', allocated.cpus, capacity.cpus, {
+      of: `${allocated.cpus} of ${plural(capacity.cpus, 'CPU')} reserved`,
+      alone: `${plural(allocated.cpus, 'CPU')} reserved`,
+    }),
+    meter('memory', 'Memory', 'memory', allocated.memory_mb, capacity.memory_mb, {
+      of: `${gibWords(allocated.memory_mb)} of ${gibWords(capacity.memory_mb)} GiB reserved`,
+      alone: `${gibWords(allocated.memory_mb)} GiB reserved`,
+    }),
+    meter('disk', 'Disk', 'disk', allocated.disk_gb, capacity.disk_gb, {
+      of: `${allocated.disk_gb} of ${capacity.disk_gb} GiB reserved`,
+      alone: `${allocated.disk_gb} GiB reserved`,
+    }),
   ];
 };
 
