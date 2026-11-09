@@ -120,6 +120,13 @@ export const backupLine = (backup: Backup, now: number = Date.now()): BackupLine
 const hoursWords = (hours: number): string => (hours === 1 ? 'Every hour' : `Every ${hours} hours`);
 
 /**
+ * A schedule on its own, before any backup has run against it: `Every 6 hours
+ * · keeps 7`. The same words `repeatWords` uses, without the next one due.
+ */
+export const scheduleSummary = (schedule: Pick<BackupSchedule, 'interval_h' | 'keep'>): string =>
+  `${hoursWords(schedule.interval_h)} · keeps ${schedule.keep}`;
+
+/**
  * The app's backup schedule in one line: `Every 6 hours · next in 2 h 14 min
  * · keeps 7`. The schedule runs only under the `cold` policy and counts from
  * the last succeeded backup (openapi.yaml `BackupSchedule`), so with no

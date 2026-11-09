@@ -140,6 +140,22 @@ hash chain, recomputed by verify. Three console helpers exist in mock mode only:
 - `quoroMock.setRole('viewer')` (or `operator`, `owner`) changes the owner's
   role; log out and in again to see the panel as that role.
 
+Settings › Providers and Settings › Backups are seeded too: a DNS, a tunnel and
+two object storage providers, and the backup repository `lab-backups` on
+`lab-r2-backups` with its control-plane backups. **Add provider**,
+**Create repository** and a repository's **Edit settings…** answer as the
+server does, with its refusal words: a taken provider name is `conflict`, a
+second repository is `conflict`, and a provider that is not object storage, holds
+the audit copy or lacks `endpoint`, `bucket` or `access_key_id` is
+`validation_failed`. The cluster has at most one repository and the contract
+cannot delete it, so to try the create form set
+`localStorage['quoro.mock.repository']` before the page loads:
+
+- `none`: no repository was ever made.
+- `lost`: the repository is gone from the database, but its bucket still holds
+  the config object, so creating one on `lab-r2-backups` under `quoro-backups`
+  answers `conflict`; another prefix works.
+
 The production build contains no MSW code: `src/mocks/` is only reached through
 `import.meta.env.MODE === 'mock'` in `src/main.tsx`, and `mock-public/` is the
 `publicDir` only in mock mode. `grep -r msw dist` prints nothing.

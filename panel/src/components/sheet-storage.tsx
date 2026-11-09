@@ -10,7 +10,8 @@ import {
   useListAppBackups,
   useListBackupRepositories,
 } from '../api/generated/backups/backups';
-import type { AppDetail, AppHaPolicy, HaPolicyCost, Volume } from '../api/generated/model';
+import type { AppDetail, AppHaPolicy, BackupSchedule, HaPolicyCost, Volume } from '../api/generated/model';
+import { readSchedule, scheduleForm, type ScheduleErrors, type ScheduleForm } from '../lib/backup-forms';
 import { createVolume, getListAppVolumesQueryKey, useListAppVolumes } from '../api/generated/volumes/volumes';
 import { relativeTime } from '../lib/app-status';
 import { drawMeter, type DitherSurface, type TokenReader } from '../lib/dither-draw';
@@ -40,6 +41,7 @@ import {
 } from '../lib/storage-words';
 import { DitherCanvas } from './dither-canvas';
 import { LampDot } from './lamp';
+import { ScheduleFields } from './schedule-fields';
 import { Button } from './ui/button';
 import { Dialog, DialogContent } from './ui/dialog';
 import { Field } from './ui/field';
@@ -368,13 +370,12 @@ function ScheduleDialog({
   onClose: () => void;
   onSaved: () => void;
 }) {
-  const [interval, setIntervalHours] = useState(String(app.backup_schedule.interval_h));
-  const [keep, setKeep] = useState(String(app.backup_schedule.keep));
+  const [schedule, setSchedule] = useState<ScheduleForm>(() => scheduleForm(app.backup_schedule));
   const [problem, setProblem] = useState<ProblemView | null>(null);
-  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [errors, setErrors] = useState<ScheduleErrors>({});
 
   const save = useMutation({
-    mutationFn: (body: { interval_h: number; keep: number }) => updateApp(app.id, { backup_schedule: body }),
+    mutationFn: (body: BackupSchedule) => updateApp(app.id, { backup_schedule: body }),
     onSuccess: () => {
       setProblem(null);
       onSaved();
@@ -385,55 +386,22 @@ function ScheduleDialog({
 
   const submit = () => {
     setProblem(null);
-    const next: Record<string, string> = {};
-    const intervalValue = Number(interval);
-    if (!Number.isInteger(intervalValue) || intervalValue < 1 || intervalValue > 168) {
-      next.interval = 'Use a whole number of hours, 1 to 168.';
-    }
-    const keepValue = Number(keep);
-    if (!Number.isInteger(keepValue) || keepValue < 1 || keepValue > 100) {
-      next.keep = 'Keep a whole number of backups, 1 to 100.';
-    }
-    setErrors(next);
-    if (Object.keys(next).length > 0) return;
-    save.mutate({ interval_h: intervalValue, keep: keepValue });
+    const read = readSchedule(schedule);
+    setErrors(read.errors);
+    if (!read.schedule) return;
+    save.mutate(read.schedule);
   };
 
   return (
     <Dialog open onOpenChange={(open) => (open ? undefined : onClose())}>
       <DialogContent title="Backup schedule" description="Scheduled backups run while the HA policy is Cold.">
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-start">
-          <Field label="Every (hours)" htmlFor="backup-interval" hint="Counted from the last succeeded backup." className="sm:flex-1">
-            <Input
-              id="backup-interval"
-              type="number"
-              min={1}
-              max={168}
-              step={1}
-              inputMode="numeric"
-              value={interval}
-              disabled={!canWrite}
-              onChange={(event) => setIntervalHours(event.target.value)}
-              aria-invalid={errors.interval !== undefined}
-            />
-            {errors.interval ? <p className="text-[12.5px] text-fault">{errors.interval}</p> : null}
-          </Field>
-          <Field label="Keep" htmlFor="backup-keep" hint="Succeeded backups kept; older ones are pruned." className="sm:flex-1">
-            <Input
-              id="backup-keep"
-              type="number"
-              min={1}
-              max={100}
-              step={1}
-              inputMode="numeric"
-              value={keep}
-              disabled={!canWrite}
-              onChange={(event) => setKeep(event.target.value)}
-              aria-invalid={errors.keep !== undefined}
-            />
-            {errors.keep ? <p className="text-[12.5px] text-fault">{errors.keep}</p> : null}
-          </Field>
-        </div>
+        <ScheduleFields
+          idPrefix="backup"
+          value={schedule}
+          errors={errors}
+          disabled={!canWrite}
+          onChange={setSchedule}
+        />
         {problem ? <ProblemBanner view={problem} className="mt-3" /> : null}
         <div className="mt-5 flex justify-end gap-2">
           <Button variant="ghost" onClick={onClose}>
