@@ -134,6 +134,37 @@ fn volume_body(size_gb: i64, mount_path: &str) -> Value {
     json!({ "size_gb": size_gb, "mount_path": mount_path })
 }
 
+/// The payload of the app's newest change-log entry that carries the whole
+/// app, and its warm fields (ADR 0286).
+async fn whole_app_payload(server: &Server, app_id: &str) -> (Value, Value) {
+    let (payload,): (String,) = sqlx::query_as(
+        "SELECT payload FROM change_log WHERE entity_type = 'app' AND entity_id = ? \
+         AND json_extract(payload, '$.placement') IS NOT NULL ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(app_id)
+    .fetch_one(server.state.store.pool())
+    .await
+    .unwrap();
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    let warm = json!({
+        "warm": payload["warm"],
+        "warm_node_id": payload["warm_node_id"],
+        "warm_node_pinned": payload["warm_node_pinned"],
+        "warm_interval_s": payload["warm_interval_s"],
+    });
+    (payload, warm)
+}
+
+/// The warm fields of an app that never was `warm`.
+fn no_warm() -> Value {
+    json!({
+        "warm": null,
+        "warm_node_id": null,
+        "warm_node_pinned": false,
+        "warm_interval_s": 30,
+    })
+}
+
 async fn create_volume(
     owner: &reqwest::Client,
     server: &Server,
@@ -381,6 +412,10 @@ async fn create_makes_the_app_stateful_and_validates_the_body() {
     let app = get_app(&owner, &server, &app_id).await;
     assert_eq!(app["stateful"], true);
     assert_eq!(app["placement"]["node_ids"], json!([node_id]));
+    // Its change-log entry carries the warm columns too (ADR 0286).
+    let (payload, warm) = whole_app_payload(&server, &app_id).await;
+    assert_eq!(payload["stateful"], true);
+    assert_eq!(warm, no_warm());
 
     // One attached volume per app (ADR 0145).
     let (status, code, _) =
@@ -910,6 +945,9 @@ async fn delete_releases_the_lease_and_the_deleted_report_ends_the_stateful_app(
     let app = get_app(&owner, &server, &app_id).await;
     assert_eq!(app["stateful"], false);
     assert_eq!(app["placement"]["node_ids"], json!([]));
+    let (payload, warm) = whole_app_payload(&server, &app_id).await;
+    assert_eq!(payload["stateful"], false);
+    assert_eq!(warm, no_warm());
     let (lease_rows,): (i64,) = sqlx::query_as(
         "SELECT count(*) FROM leases WHERE resource_id = ? AND revoked_at IS NOT NULL",
     )

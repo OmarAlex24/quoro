@@ -470,6 +470,80 @@ async fn both_nodes_get_their_part_and_app_warm_follows_their_reports() {
     assert_eq!(warm["state"], "failed");
 }
 
+/// The two nodes of a warm volume are voters, so each has the other as a peer
+/// without any edge, and the warm node's firewall admits the source's stream
+/// (sections 6.9 and 6.13, ADR 0266).
+#[tokio::test]
+async fn the_two_nodes_are_mesh_peers_and_the_warm_node_admits_the_stream() {
+    let server = common::start_with_peer_addresses().await;
+    // Sessions come from loopback, so every endpoint is the advertised host
+    // (section 6.9).
+    let _ = server
+        .state
+        .clone()
+        .with_advertised_urls(|| vec!["https://192.0.2.10:8443".to_string()]);
+    let owner = server.owner().await;
+    let source = enroll(&server, &owner, "source", 3).await;
+    let target = enroll(&server, &owner, "target", 4).await;
+    let mut on_source = open(&server, &source, 1).await;
+    let mut on_target = open(&server, &target, 2).await;
+    let mesh_address = |node_id: &str| {
+        let pool = server.state.store.pool().clone();
+        let node_id = node_id.to_string();
+        async move {
+            sqlx::query_scalar::<_, String>("SELECT mesh_address FROM nodes WHERE id = ?")
+                .bind(node_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    let source_address = mesh_address(&source.node_id).await;
+    let target_address = mesh_address(&target.node_id).await;
+    let key = |seed: u8| base64::engine::general_purpose::STANDARD.encode([seed; 32]);
+
+    warm_app(&server, &owner, &source.node_id, &target.node_id).await;
+    server.state.hub.node_changed(&source.node_id);
+    let spec = spec_where(&mut on_target, |spec| {
+        spec["mesh"]["allow"]
+            .as_array()
+            .is_some_and(|allow| !allow.is_empty())
+    })
+    .await;
+    let mesh = &spec["mesh"];
+    assert_eq!(mesh["address"], format!("{target_address}/16"));
+    assert_eq!(mesh["listen_port"], 51820);
+    assert_eq!(
+        mesh["peers"],
+        json!([{
+            "node_id": source.node_id,
+            "public_key": key(1),
+            "endpoint": "192.0.2.10:51820",
+            "allowed_ips": [format!("{source_address}/32")],
+            "persistent_keepalive_s": 25,
+        }])
+    );
+    assert_eq!(
+        mesh["allow"],
+        json!([{
+            "source": source_address,
+            "address": target_address,
+            "port": 51822,
+        }])
+    );
+
+    let spec = spec_where(&mut on_source, |spec| {
+        spec["volumes"][0]["warm"].is_object()
+    })
+    .await;
+    let mesh = &spec["mesh"];
+    assert_eq!(mesh["peers"][0]["node_id"], target.node_id.as_str());
+    assert_eq!(mesh["peers"][0]["public_key"], key(2));
+    assert_eq!(mesh["peers"][0]["endpoint"], "192.0.2.10:51820");
+    assert_eq!(mesh["peers"].as_array().map(Vec::len), Some(1));
+    assert_eq!(mesh["allow"], json!([]), "the source dials out");
+}
+
 #[tokio::test]
 async fn a_pair_that_goes_away_while_the_source_is_away_reaches_the_warm_node() {
     let server = start().await;

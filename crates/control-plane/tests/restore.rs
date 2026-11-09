@@ -162,6 +162,37 @@ async fn deploy_app(owner: &reqwest::Client, server: &Server, app_id: &str) -> S
         .0
 }
 
+/// The payload of the app's newest change-log entry that carries the whole
+/// app, and its warm fields (ADR 0286).
+async fn whole_app_payload(server: &Server, app_id: &str) -> (Value, Value) {
+    let (payload,): (String,) = sqlx::query_as(
+        "SELECT payload FROM change_log WHERE entity_type = 'app' AND entity_id = ? \
+         AND json_extract(payload, '$.placement') IS NOT NULL ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(app_id)
+    .fetch_one(server.state.store.pool())
+    .await
+    .unwrap();
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    let warm = json!({
+        "warm": payload["warm"],
+        "warm_node_id": payload["warm_node_id"],
+        "warm_node_pinned": payload["warm_node_pinned"],
+        "warm_interval_s": payload["warm_interval_s"],
+    });
+    (payload, warm)
+}
+
+/// The warm fields of an app that never was `warm`.
+fn no_warm() -> Value {
+    json!({
+        "warm": null,
+        "warm_node_id": null,
+        "warm_node_pinned": false,
+        "warm_interval_s": 30,
+    })
+}
+
 async fn create_volume(
     owner: &reqwest::Client,
     server: &Server,
@@ -1071,6 +1102,13 @@ async fn a_restore_moves_the_app_and_the_ready_report_finishes_it() {
     let app = get_app(&setup.state.owner, &setup.state.server, &setup.state.app_id).await;
     assert_eq!(app["placement"]["node_ids"], json!([setup.node_b.node_id]));
     assert_eq!(app["stateful"], true);
+    // The move's change-log entry carries the warm columns (ADR 0286).
+    let (payload, warm) = whole_app_payload(&setup.state.server, &setup.state.app_id).await;
+    assert_eq!(
+        payload["placement"]["node_ids"],
+        json!([setup.node_b.node_id])
+    );
+    assert_eq!(warm, no_warm());
     let desired: String = sqlx::query_scalar("SELECT desired_status FROM vms WHERE id = ?")
         .bind(&setup.state.vm_id)
         .fetch_one(setup.state.server.state.store.pool())

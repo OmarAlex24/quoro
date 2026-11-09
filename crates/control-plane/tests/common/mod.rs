@@ -105,7 +105,7 @@ impl Server {
 
 /// Starts a control plane on 127.0.0.1 with an empty database.
 pub async fn start() -> Server {
-    start_inner(200, 800, None).await
+    start_inner(200, 800, None, false).await
 }
 
 /// Starts a control plane on an existing data directory, reusing its key
@@ -116,7 +116,7 @@ pub async fn start() -> Server {
 /// production: a fresh key would leave stored webhook secrets undecryptable.
 pub async fn start_in(data_dir: PathBuf) -> Server {
     let data_key = Arc::new(DataKey::load_or_create(&data_dir).unwrap());
-    start_at(data_dir, 200, 800, None, data_key).await
+    start_at(data_dir, 200, 800, None, data_key, false).await
 }
 
 /// Starts a control plane whose node sessions outlive the time a test spends
@@ -125,7 +125,15 @@ pub async fn start_in(data_dir: PathBuf) -> Server {
 /// nothing is only dropped after thirty seconds. Use this for every node test
 /// that is not itself about the session timeout.
 pub async fn start_with_patient_node_session() -> Server {
-    start_inner(200, 30_000, None).await
+    start_inner(200, 30_000, None, false).await
+}
+
+/// Like [`start_with_patient_node_session`], but the router sees each
+/// connection's peer address, as the binary's does. The hub then records the
+/// source address of every node session, which the mesh endpoints come from
+/// (`node-agent-protocol.md` section 6.9, ADR 0144, ADR 0266).
+pub async fn start_with_peer_addresses() -> Server {
+    start_inner(200, 30_000, None, true).await
 }
 
 /// Starts a control plane whose Cloudflare clients reach a local mock, with a
@@ -136,6 +144,7 @@ pub async fn start_with_cloudflare(api_base: &str, doh_base: &str) -> Server {
         5_000,
         60_000,
         Some((api_base.to_string(), doh_base.to_string())),
+        false,
     )
     .await
 }
@@ -144,6 +153,7 @@ async fn start_inner(
     heartbeat_interval_ms: u64,
     session_timeout_ms: u64,
     cloudflare: Option<(String, String)>,
+    peer_addresses: bool,
 ) -> Server {
     let data_dir = std::env::temp_dir().join(format!("quoro-test-{}", &random_secret()[..16]));
     start_at(
@@ -152,6 +162,7 @@ async fn start_inner(
         session_timeout_ms,
         cloudflare,
         Arc::new(DataKey::ephemeral()),
+        peer_addresses,
     )
     .await
 }
@@ -162,6 +173,7 @@ async fn start_at(
     session_timeout_ms: u64,
     cloudflare: Option<(String, String)>,
     data_key: Arc<DataKey>,
+    peer_addresses: bool,
 ) -> Server {
     // reqwest may carry the binary's no-provider rustls feature in a workspace
     // build; an earlier test having installed it already is fine.
@@ -194,7 +206,12 @@ async fn start_at(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        if peer_addresses {
+            let app = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+            axum::serve(listener, app).await.unwrap();
+        } else {
+            axum::serve(listener, app).await.unwrap();
+        }
     });
     Server {
         base,

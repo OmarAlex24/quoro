@@ -6,7 +6,9 @@
 //! to the credential and never sent anywhere; `hello` carries only the public
 //! key. `spec.mesh` is applied to the `quoro-wg0` interface with `ip` and
 //! generic netlink, and the interface's traffic is filtered by the
-//! `inet quoro_mesh` table so only the `allow` entries reach a guest.
+//! `inet quoro_mesh` table so only the `allow` entries get through: to a
+//! guest, or, for a warm volume's replication stream, to the host's own mesh
+//! address (section 6.13).
 //!
 //! [`MeshManager`] keeps the interface equal to the newest verified snapshot:
 //! every changed snapshot is evaluated, and a failed apply or an unchanged one
@@ -23,7 +25,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use curve25519_dalek::MontgomeryPoint;
 use quoro_engine::MESH_MARK;
-use quoro_proto::wire::SpecMesh;
+use quoro_proto::wire::{MeshPeer, SpecMesh};
 use tokio::sync::watch;
 use tracing::warn;
 
@@ -150,10 +152,12 @@ pub fn desired_routes(mesh: &SpecMesh) -> Vec<String> {
 /// The first two lines declare and then delete `inet quoro_mesh`, so applying
 /// the file replaces the table in one transaction instead of stacking
 /// duplicates. `allow` entries become prerouting rules that set
-/// [`MESH_MARK`]; the forward and input chains then admit only marked packets
-/// from the mesh interface and drop everything else. Any entry whose `source`
-/// or `address` is not an IPv4 address is skipped with a warning: unparsed
-/// text is never written into nftables syntax.
+/// [`MESH_MARK`]. The forward chain then admits only marked packets from the
+/// mesh interface; the input chain admits replies to what this machine dialed
+/// and marked packets, such as the warm replication stream to the target's
+/// own mesh address (section 6.13). Both drop everything else. Any entry whose
+/// `source` or `address` is not an IPv4 address is skipped with a warning:
+/// unparsed text is never written into nftables syntax.
 #[must_use]
 pub fn nft_ruleset(mesh: Option<&SpecMesh>) -> String {
     let mut rules = String::with_capacity(1024);
@@ -209,6 +213,13 @@ pub fn nft_ruleset(mesh: Option<&SpecMesh>) -> String {
     let _ = writeln!(
         rules,
         "        iifname \"{INTERFACE}\" ct state established,related accept"
+    );
+    // An `allow` entry whose `address` is this machine's own mesh address,
+    // the warm target's replication listener (section 6.13), reaches the
+    // host instead of a guest.
+    let _ = writeln!(
+        rules,
+        "        iifname \"{INTERFACE}\" meta mark {MESH_MARK:#010x} accept"
     );
     let _ = writeln!(rules, "        iifname \"{INTERFACE}\" drop");
     let _ = writeln!(rules, "    }}");
@@ -267,6 +278,27 @@ fn cidr_contains(outer: (IpAddr, u8), inner: (IpAddr, u8)) -> bool {
     inner.1 >= outer.1 && network((inner.0, outer.1)) == network(outer)
 }
 
+/// Whether an apply sets `peer`'s endpoint on the device: when the device
+/// does not have the peer yet (`on_device` is false), or when `previous`, the
+/// mesh the last successful apply set, did not name this endpoint for the
+/// peer's key.
+///
+/// Otherwise the endpoint stays as WireGuard has it, which may be one it
+/// learned by roaming. A voter behind NAT gets its NAT's address as its
+/// endpoint, and is reached once its own keepalive arrives (section 6.9,
+/// ADR 0266). Setting the spec's endpoint again on every periodic apply would
+/// undo that, and its peers would lose it until its next keepalive.
+#[must_use]
+pub fn sets_endpoint(peer: &MeshPeer, on_device: bool, previous: Option<&SpecMesh>) -> bool {
+    let unchanged = previous.is_some_and(|previous| {
+        previous
+            .peers
+            .iter()
+            .any(|old| old.public_key == peer.public_key && old.endpoint == peer.endpoint)
+    });
+    !on_device || !unchanged
+}
+
 /// Applies and removes the mesh interface.
 ///
 /// Implementations return a readable error string rather than an error type:
@@ -274,10 +306,14 @@ fn cidr_contains(outer: (IpAddr, u8), inner: (IpAddr, u8)) -> bool {
 /// by the rest of the agent.
 pub trait MeshDriver: Send + Sync {
     /// Makes the interface equal to `mesh`, using `key` as its private key.
+    /// `previous` is the mesh the last successful apply set, if any, less the
+    /// peers whose endpoint a failed apply since may have changed: a peer's
+    /// endpoint is set only when [`sets_endpoint`] says so.
     fn apply(
         &self,
         key: &MeshKey,
         mesh: &SpecMesh,
+        previous: Option<&SpecMesh>,
     ) -> impl Future<Output = Result<(), String>> + Send;
 
     /// Removes the interface and its firewall table.
@@ -288,6 +324,8 @@ pub trait MeshDriver: Send + Sync {
 #[derive(Clone, Default)]
 pub struct RecordingMeshDriver {
     calls: Arc<Mutex<Vec<MeshCall>>>,
+    previous: Arc<Mutex<Vec<Option<SpecMesh>>>>,
+    failing: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// One call a [`RecordingMeshDriver`] saw.
@@ -312,6 +350,22 @@ impl RecordingMeshDriver {
         self.lock().clone()
     }
 
+    /// Makes every later [`MeshDriver::apply`] fail after it is recorded, or
+    /// succeed again.
+    pub fn fail_applies(&self, failing: bool) {
+        self.failing
+            .store(failing, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The `previous` mesh of every [`MeshDriver::apply`] call, in order.
+    #[must_use]
+    pub fn previous(&self) -> Vec<Option<SpecMesh>> {
+        self.previous
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<MeshCall>> {
         self.calls
             .lock()
@@ -324,15 +378,27 @@ impl MeshDriver for RecordingMeshDriver {
         &self,
         _key: &MeshKey,
         mesh: &SpecMesh,
+        previous: Option<&SpecMesh>,
     ) -> impl Future<Output = Result<(), String>> + Send {
         let mesh = mesh.clone();
+        let previous = previous.cloned();
         let calls = Arc::clone(&self.calls);
+        let previous_meshes = Arc::clone(&self.previous);
+        let failing = self.failing.load(std::sync::atomic::Ordering::SeqCst);
         async move {
             calls
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(MeshCall::Apply(mesh));
-            Ok(())
+            previous_meshes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(previous);
+            if failing {
+                Err("a failing test driver".to_owned())
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -378,6 +444,7 @@ impl MeshDriver for UnsupportedMeshDriver {
         &self,
         _key: &MeshKey,
         _mesh: &SpecMesh,
+        _previous: Option<&SpecMesh>,
     ) -> impl Future<Output = Result<(), String>> + Send {
         let warned = &self.warned;
         async move {
@@ -461,7 +528,11 @@ impl<D: MeshDriver> MeshManager<D> {
         match mesh {
             Some(mesh) => {
                 if state.should_apply(mesh, force) {
-                    match self.driver.apply(&self.key, mesh).await {
+                    match self
+                        .driver
+                        .apply(&self.key, mesh, state.applied.as_ref())
+                        .await
+                    {
                         Ok(()) => {
                             state.applied = Some(mesh.clone());
                             state.failed = false;
@@ -471,6 +542,18 @@ impl<D: MeshDriver> MeshManager<D> {
                         Err(error) => {
                             warn!(error = %error, "could not apply the mesh");
                             state.failed = true;
+                            // The apply may have set WireGuard before a later
+                            // step failed, so the device may hold this mesh's
+                            // endpoints. Forget the peers whose endpoint it
+                            // changed: the next apply sets theirs again.
+                            if let Some(applied) = &mut state.applied {
+                                applied.peers.retain(|old| {
+                                    !mesh.peers.iter().any(|new| {
+                                        new.public_key == old.public_key
+                                            && new.endpoint != old.endpoint
+                                    })
+                                });
+                            }
                         }
                     }
                 }
@@ -543,6 +626,7 @@ mod linux {
 
     use super::{
         INTERFACE, MeshDriver, MeshKey, desired_routes, nft_ruleset, parse_cidr, parse_endpoint,
+        sets_endpoint,
     };
 
     /// Where `ip` and `nft` are looked for, in order.
@@ -566,10 +650,16 @@ mod linux {
     }
 
     impl MeshDriver for LinuxMeshDriver {
-        async fn apply(&self, key: &MeshKey, mesh: &SpecMesh) -> Result<(), String> {
+        async fn apply(
+            &self,
+            key: &MeshKey,
+            mesh: &SpecMesh,
+            previous: Option<&SpecMesh>,
+        ) -> Result<(), String> {
             let key = key.clone();
             let mesh = mesh.clone();
-            apply(&key, &mesh).await
+            let previous = previous.cloned();
+            apply(&key, &mesh, previous.as_ref()).await
         }
 
         async fn remove(&self) -> Result<(), String> {
@@ -578,7 +668,11 @@ mod linux {
     }
 
     /// Applies one mesh specification.
-    async fn apply(key: &MeshKey, mesh: &SpecMesh) -> Result<(), String> {
+    async fn apply(
+        key: &MeshKey,
+        mesh: &SpecMesh,
+        previous: Option<&SpecMesh>,
+    ) -> Result<(), String> {
         let ip = find_tool("ip", "iproute2")?;
         let nft = find_tool("nft", "nftables")?;
         let own = parse_cidr(&mesh.address)
@@ -598,7 +692,7 @@ mod linux {
         remove_other_addresses(&ip, own_address, own.1).await?;
         run(&ip, &["link", "set", "dev", INTERFACE, "up"]).await?;
 
-        set_wireguard(key, mesh).await?;
+        set_wireguard(key, mesh, previous).await?;
 
         let desired = desired_routes(mesh);
         for cidr in &desired {
@@ -632,10 +726,17 @@ mod linux {
     /// would drop the endpoint the hub learned from each node and the session
     /// with it, so the edge could not reach a node until that node's next
     /// keepalive. Every apply, the periodic one included, would cut the edge
-    /// off its backends. A peer that left `spec.mesh.peers` is removed on its
-    /// own. A peer whose public key is not 32 base64 bytes is skipped with a
-    /// warning rather than failing the whole apply.
-    async fn set_wireguard(key: &MeshKey, mesh: &SpecMesh) -> Result<(), String> {
+    /// off its backends. For the same reason a peer's endpoint is set only
+    /// when it is new or changed since `previous` ([`sets_endpoint`]), so an
+    /// endpoint learned by roaming survives a re-apply. A peer that left
+    /// `spec.mesh.peers` is removed on its own. A peer whose public key is not
+    /// 32 base64 bytes is skipped with a warning rather than failing the whole
+    /// apply.
+    async fn set_wireguard(
+        key: &MeshKey,
+        mesh: &SpecMesh,
+        previous: Option<&SpecMesh>,
+    ) -> Result<(), String> {
         let (connection, mut handle, _) =
             new_connection().map_err(|e| format!("could not open generic netlink: {e}"))?;
         tokio::spawn(connection);
@@ -645,7 +746,7 @@ mod linux {
             WireguardAttribute::IfName(INTERFACE.to_owned()),
             WireguardAttribute::PrivateKey(key.private),
             WireguardAttribute::ListenPort(mesh.listen_port),
-            WireguardAttribute::Peers(peer_updates(&mesh.peers, &current)),
+            WireguardAttribute::Peers(peer_updates(&mesh.peers, &current, previous)),
         ];
         let genlmsg: GenlMessage<WireguardMessage> = GenlMessage::from_payload(WireguardMessage {
             cmd: WireguardCmd::SetDevice,
@@ -725,9 +826,17 @@ mod linux {
 
     /// The peer list of one `SetDevice` request: every desired peer, updated in
     /// place with its allowed IPs replaced, and a removal for every current peer
-    /// that is no longer desired.
-    pub(super) fn peer_updates(desired: &[MeshPeer], current: &[[u8; 32]]) -> Vec<WireguardPeer> {
-        let mut updates: Vec<WireguardPeer> = desired.iter().filter_map(peer).collect();
+    /// that is no longer desired. `previous` is the mesh the last successful
+    /// apply set ([`sets_endpoint`]).
+    pub(super) fn peer_updates(
+        desired: &[MeshPeer],
+        current: &[[u8; 32]],
+        previous: Option<&SpecMesh>,
+    ) -> Vec<WireguardPeer> {
+        let mut updates: Vec<WireguardPeer> = desired
+            .iter()
+            .filter_map(|wanted| peer(wanted, current, previous))
+            .collect();
         let kept: Vec<[u8; 32]> = updates
             .iter()
             .flat_map(|WireguardPeer(attributes)| attributes.iter())
@@ -750,8 +859,14 @@ mod linux {
     /// Builds one netlink peer, or `None` when its public key is unusable.
     ///
     /// It carries `ReplaceAllowedIps`, so an entry that left the peer's
-    /// allowed IPs disappears while its endpoint and session stay.
-    fn peer(peer: &MeshPeer) -> Option<WireguardPeer> {
+    /// allowed IPs disappears while its endpoint and session stay. It carries
+    /// the endpoint only when [`sets_endpoint`] says so for a device whose
+    /// peers are `current`.
+    fn peer(
+        peer: &MeshPeer,
+        current: &[[u8; 32]],
+        previous: Option<&SpecMesh>,
+    ) -> Option<WireguardPeer> {
         let decoded = STANDARD.decode(&peer.public_key).ok();
         let Some(public_key) = decoded
             .as_deref()
@@ -767,7 +882,11 @@ mod linux {
             WireguardPeerAttribute::PublicKey(public_key),
             WireguardPeerAttribute::Flags(WireguardPeerFlags::ReplaceAllowedIps),
         ];
-        if let Some(endpoint) = &peer.endpoint {
+        if let Some(endpoint) = peer
+            .endpoint
+            .as_ref()
+            .filter(|_| sets_endpoint(peer, current.contains(&public_key), previous))
+        {
             match parse_endpoint(endpoint) {
                 Some(address) => attributes.push(WireguardPeerAttribute::Endpoint(address)),
                 None => warn!(
@@ -1008,7 +1127,7 @@ mod linux {
         #[test]
         fn an_unchanged_peer_set_is_updated_in_place() {
             let desired = [mesh_peer(1, None), mesh_peer(2, None)];
-            let updates = peer_updates(&desired, &[key(1), key(2)]);
+            let updates = peer_updates(&desired, &[key(1), key(2)], None);
             assert_eq!(updates.len(), 2);
             for update in &updates {
                 assert_eq!(
@@ -1025,10 +1144,56 @@ mod linux {
             }
         }
 
+        /// An entry between two voters may have no endpoint (the other voter
+        /// dials in) and still carries the keepalive (section 6.9, ADR 0266).
+        #[test]
+        fn a_peer_without_an_endpoint_keeps_its_keepalive() {
+            let mut desired = mesh_peer(1, None);
+            desired.persistent_keepalive_s = Some(25);
+            let update = peer(&desired, &[], None).expect("a valid key");
+            assert!(update.0.iter().any(|attribute| matches!(
+                attribute,
+                WireguardPeerAttribute::PersistentKeepalive(25)
+            )));
+            assert!(
+                !update
+                    .0
+                    .iter()
+                    .any(|attribute| matches!(attribute, WireguardPeerAttribute::Endpoint(_)))
+            );
+        }
+
+        /// A periodic re-apply of the same mesh leaves the endpoint WireGuard
+        /// learned by roaming; a changed one, or a peer new to the device,
+        /// gets the spec's (section 6.9, ADR 0266).
+        #[test]
+        fn an_unchanged_endpoint_is_not_set_again() {
+            let has_endpoint = |update: &WireguardPeer| {
+                update
+                    .0
+                    .iter()
+                    .any(|attribute| matches!(attribute, WireguardPeerAttribute::Endpoint(_)))
+            };
+            let desired = [mesh_peer(1, Some("192.0.2.10:51820"))];
+            let previous = SpecMesh {
+                address: "10.43.0.2/16".to_owned(),
+                listen_port: 51820,
+                peers: desired.to_vec(),
+                allow: Vec::new(),
+            };
+            let updates = peer_updates(&desired, &[key(1)], Some(&previous));
+            assert!(!has_endpoint(&updates[0]), "unchanged and on the device");
+            let updates = peer_updates(&desired, &[], Some(&previous));
+            assert!(has_endpoint(&updates[0]), "the device lost the peer");
+            let moved = [mesh_peer(1, Some("192.0.2.11:51820"))];
+            let updates = peer_updates(&moved, &[key(1)], Some(&previous));
+            assert!(has_endpoint(&updates[0]), "the endpoint changed");
+        }
+
         #[test]
         fn a_peer_that_left_the_spec_is_removed_alone() {
             let desired = [mesh_peer(1, None)];
-            let updates = peer_updates(&desired, &[key(1), key(3)]);
+            let updates = peer_updates(&desired, &[key(1), key(3)], None);
             assert_eq!(updates.len(), 2);
             assert_eq!(key_of(&updates[0]), key(1));
             assert_eq!(
@@ -1042,7 +1207,7 @@ mod linux {
         #[test]
         fn a_new_peer_is_added_without_touching_the_others() {
             let desired = [mesh_peer(1, None), mesh_peer(2, Some("192.0.2.10:51820"))];
-            let updates = peer_updates(&desired, &[key(1)]);
+            let updates = peer_updates(&desired, &[key(1)], None);
             assert_eq!(updates.len(), 2);
             assert!(updates.iter().all(|update| {
                 !flags_of(update)
@@ -1234,11 +1399,58 @@ table inet quoro_mesh {
     chain input {
         type filter hook input priority filter - 2; policy accept;
         iifname \"quoro-wg0\" ct state established,related accept
+        iifname \"quoro-wg0\" meta mark 0x5155008c accept
         iifname \"quoro-wg0\" drop
     }
 }
 ";
         assert_eq!(nft_ruleset(Some(&mesh())), expected);
+    }
+
+    /// The warm target's entry names its own mesh address, so the marked
+    /// stream is delivered to the host and the input chain must admit it
+    /// before its drop (section 6.13).
+    #[test]
+    fn the_warm_target_admits_the_replication_stream_to_its_own_address() {
+        let mut mesh = mesh();
+        mesh.allow = vec![MeshAllow {
+            source: "10.43.0.2".to_owned(),
+            address: "10.43.0.5".to_owned(),
+            port: 51822,
+        }];
+        let rules = nft_ruleset(Some(&mesh));
+        assert!(rules.contains(
+            "iifname \"quoro-wg0\" ip saddr 10.43.0.2 ip daddr 10.43.0.5 tcp dport 51822 meta mark set 0x5155008c"
+        ));
+        let input = &rules[rules.find("chain input").expect("an input chain")..];
+        let accept = input
+            .find("iifname \"quoro-wg0\" meta mark 0x5155008c accept")
+            .expect("the input chain admits marked packets");
+        let drop = input
+            .find("iifname \"quoro-wg0\" drop")
+            .expect("the input chain drops the rest");
+        assert!(accept < drop, "the accept comes before the drop");
+    }
+
+    #[test]
+    fn an_endpoint_is_set_only_when_new_or_changed() {
+        let mesh = mesh();
+        let peer = &mesh.peers[0];
+        assert!(sets_endpoint(peer, false, Some(&mesh)), "new to the device");
+        assert!(sets_endpoint(peer, true, None), "nothing applied yet");
+        assert!(
+            !sets_endpoint(peer, true, Some(&mesh)),
+            "unchanged: the roamed endpoint stays"
+        );
+        let mut moved = mesh.clone();
+        moved.peers[0].endpoint = Some("203.0.113.8:51820".to_owned());
+        assert!(sets_endpoint(&moved.peers[0], true, Some(&mesh)), "changed");
+        let mut rekeyed = mesh.clone();
+        rekeyed.peers[0].public_key = "HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=".to_owned();
+        assert!(
+            sets_endpoint(&rekeyed.peers[0], true, Some(&mesh)),
+            "another key is another peer"
+        );
     }
 
     #[test]
@@ -1309,6 +1521,50 @@ table inet quoro_mesh {
             vec![MeshCall::Remove, MeshCall::Apply(mesh()), MeshCall::Remove]
         );
 
+        // The removal forgot the applied mesh: the next apply sets every
+        // endpoint again.
+        desired_tx.send(Some(snapshot(mesh()))).unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(recorded.previous(), vec![None, None]);
+
+        stop_tx.send(true).unwrap();
+        task.await.unwrap();
+    }
+
+    /// A failed apply may have set the new endpoints before a later step
+    /// failed. If the spec then goes back, the next apply must set the old
+    /// endpoint again, so the failed attempt's peers are not counted as
+    /// applied.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_apply_does_not_count_its_endpoints_as_applied() {
+        let (desired_tx, desired_rx) = watch::channel(Some(snapshot(mesh())));
+        let driver = RecordingMeshDriver::new();
+        let recorded = driver.clone();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(
+            MeshManager::new(driver, test_key()).run(desired_rx, stop_future(stop_rx)),
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        let mut moved = mesh();
+        moved.peers[0].endpoint = Some("203.0.113.8:51820".to_owned());
+        recorded.fail_applies(true);
+        desired_tx.send(Some(snapshot(moved))).unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        recorded.fail_applies(false);
+        desired_tx.send(Some(snapshot(mesh()))).unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        let previous = recorded.previous();
+        assert_eq!(previous.len(), 3, "{previous:?}");
+        assert_eq!(previous[1], Some(mesh()), "the failed apply knew the first");
+        let after_failure = previous[2].clone().expect("the first apply stays");
+        assert!(
+            after_failure.peers.is_empty(),
+            "the peer whose endpoint the failed apply changed is forgotten"
+        );
+        assert!(sets_endpoint(&mesh().peers[0], true, Some(&after_failure)));
+
         stop_tx.send(true).unwrap();
         task.await.unwrap();
     }
@@ -1329,6 +1585,9 @@ table inet quoro_mesh {
             recorded.calls(),
             vec![MeshCall::Apply(mesh()), MeshCall::Apply(mesh())]
         );
+        // The re-apply knows what the first apply set, so it leaves the
+        // endpoints WireGuard learned since.
+        assert_eq!(recorded.previous(), vec![None, Some(mesh())]);
         desired_tx.send(None).unwrap();
         task.abort();
     }

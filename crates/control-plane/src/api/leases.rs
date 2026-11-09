@@ -74,6 +74,16 @@ pub struct Lease {
     /// as a `local` lease does (`node-agent-protocol.md` section 8.4, "The
     /// mark", ADR 0280).
     pub unsettled: bool,
+    /// True while the primary holds a grant of this lease that it has not
+    /// sent, because it waits for the row's newest write to be replicated and
+    /// for majority support (`node-agent-protocol.md` section 8.4, "Grants of
+    /// a marked row", ADR 0292). Derived on read; never stored.
+    pub grant_pending: bool,
+    /// While `grant_pending` is true, the machines with the `node` role that
+    /// have not acknowledged the row's newest write; empty otherwise (ADR
+    /// 0292). Derived on read; never stored.
+    #[schema(value_type = Vec<super::auth::NodeIdItem>, inline)]
+    pub grant_waiting_on: Vec<String>,
 }
 
 impl Lease {
@@ -123,6 +133,10 @@ impl Lease {
             // Read from `leases.unsettled` (migration 0013), which the M5b
             // lease work adds to the row; until then no row carries the mark.
             unsettled: false,
+            // Derived from the grants the primary holds back (section 8.4),
+            // which the M5b lease work adds; until then no grant waits.
+            grant_pending: false,
+            grant_waiting_on: Vec::new(),
         })
     }
 }

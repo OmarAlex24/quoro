@@ -333,7 +333,7 @@ pub async fn build_spec(
 
     let mut routes = build_routes(store.pool(), &apps, &vms).await?;
     let ingress = build_ingress(store.pool(), data_key, node_id).await?;
-    let mesh = build_mesh(store, mesh_lookup, node_id).await?;
+    let mesh = build_mesh(store, mesh_lookup, &pairs, node_id).await?;
     // The edge's own tunnel is the one `spec.ingress` would carry for it
     // (section 5.11): one row in `node_tunnels`, decrypted once here.
     let tunnel = ingress.as_ref().and_then(|ingress| ingress.tunnel.clone());

@@ -906,7 +906,7 @@ async fn a_default_build_refuses_ha_policy_warm() {
 #[cfg_attr(not(feature = "dev-warm-policy"), allow(dead_code))]
 mod warm {
     use super::common;
-    use serde_json::Value;
+    use serde_json::{Value, json};
 
     pub const NODE_A: &str = "nod_0000000000000000000000000A";
     pub const NODE_B: &str = "nod_0000000000000000000000000B";
@@ -999,6 +999,29 @@ mod warm {
         policies[2].clone()
     }
 
+    /// The payload of the app's newest change-log entry.
+    pub async fn payload(server: &common::Server, app_id: &str) -> Value {
+        let (payload,): (String,) = sqlx::query_as(
+            "SELECT payload FROM change_log WHERE entity_type = 'app' AND entity_id = ? \
+             ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(app_id)
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+        serde_json::from_str(&payload).unwrap()
+    }
+
+    /// The warm fields of an app's change-log payload (ADR 0286).
+    pub fn warm_fields(payload: &Value) -> Value {
+        json!({
+            "warm": payload["warm"],
+            "warm_node_id": payload["warm_node_id"],
+            "warm_node_pinned": payload["warm_node_pinned"],
+            "warm_interval_s": payload["warm_interval_s"],
+        })
+    }
+
     /// The `changed` lists of the app's `app.updated` events, oldest first.
     pub async fn changes(server: &common::Server, app_id: &str) -> Vec<Value> {
         let rows: Vec<(String,)> = sqlx::query_as(
@@ -1013,6 +1036,45 @@ mod warm {
             .map(|(data,)| serde_json::from_str::<Value>(&data).unwrap()["changed"].clone())
             .collect()
     }
+}
+
+/// Every app's change-log payload carries the three warm columns beside the
+/// App fields, with `warm` null, in every build (ADR 0286).
+#[tokio::test]
+async fn an_app_change_log_payload_carries_the_warm_columns() {
+    let (server, owner, _node_id, project_id) = setup().await;
+    let app = create_app(&owner, &server, &project_id).await;
+    let app_id = app["id"].as_str().unwrap();
+    let defaults = json!({
+        "warm": null,
+        "warm_node_id": null,
+        "warm_node_pinned": false,
+        "warm_interval_s": 30,
+    });
+    let payload = warm::payload(&server, app_id).await;
+    assert_eq!(payload["id"], app_id);
+    assert_eq!(payload["name"], app["name"]);
+    assert_eq!(warm::warm_fields(&payload), defaults);
+
+    // An update writes the stored values, not the defaults.
+    sqlx::query("UPDATE apps SET warm_interval_s = 45 WHERE id = ?")
+        .bind(app_id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+    let res = patch_app(&owner, &server, app_id, json!({ "name": "renamed" })).await;
+    assert_eq!(res.status(), 200, "rename: {}", res.text().await.unwrap());
+    let payload = warm::payload(&server, app_id).await;
+    assert_eq!(payload["name"], "renamed");
+    assert_eq!(
+        warm::warm_fields(&payload),
+        json!({
+            "warm": null,
+            "warm_node_id": null,
+            "warm_node_pinned": false,
+            "warm_interval_s": 45,
+        })
+    );
 }
 
 async fn get_app(owner: &reqwest::Client, server: &common::Server, app_id: &str) -> Value {
@@ -1073,6 +1135,19 @@ async fn a_dev_warm_policy_build_picks_and_pins_the_warm_node() {
         warm::changes(&server, app_id).await.last().unwrap(),
         &json!(["ha_policy", "warm"])
     );
+    // The change log carries the stored settings beside the App fields, with
+    // `warm` null (ADR 0286).
+    let payload = warm::payload(&server, app_id).await;
+    assert_eq!(payload["ha_policy"], "warm");
+    assert_eq!(
+        warm::warm_fields(&payload),
+        json!({
+            "warm": null,
+            "warm_node_id": warm::NODE_A,
+            "warm_node_pinned": false,
+            "warm_interval_s": 30,
+        })
+    );
 
     // Pins and settings the API refuses, with nothing written.
     for body in [
@@ -1127,6 +1202,15 @@ async fn a_dev_warm_policy_build_picks_and_pins_the_warm_node() {
     assert_eq!(
         warm::stored(&server, app_id).await,
         (Some(warm::NODE_B.to_owned()), 1, 60)
+    );
+    assert_eq!(
+        warm::warm_fields(&warm::payload(&server, app_id).await),
+        json!({
+            "warm": null,
+            "warm_node_id": warm::NODE_B,
+            "warm_node_pinned": true,
+            "warm_interval_s": 60,
+        })
     );
     // The same settings again change nothing, and emit no event.
     let events = warm::changes(&server, app_id).await.len();
@@ -1408,6 +1492,16 @@ async fn a_dev_warm_policy_build_picks_another_warm_node_only_for_a_lasting_loss
     assert_eq!(
         warm::changes(&server, app_id).await[events..],
         [json!(["warm"])]
+    );
+    // The sweep's change-log entry carries the new node (ADR 0286).
+    assert_eq!(
+        warm::warm_fields(&warm::payload(&server, app_id).await),
+        json!({
+            "warm": null,
+            "warm_node_id": warm::NODE_B,
+            "warm_node_pinned": false,
+            "warm_interval_s": 30,
+        })
     );
     warm::set_node(&server, warm::NODE_A, "roles = '[\"node\"]'").await;
     warm::set_node(&server, warm::NODE_B, "volume_snapshot = 'pause_copy'").await;
