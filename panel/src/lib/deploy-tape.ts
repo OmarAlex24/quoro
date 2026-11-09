@@ -362,6 +362,18 @@ export function isRunLive(run: DeployRun | undefined): boolean {
   return isDeploymentLive(deployment.status);
 }
 
+export type RunPhase = 'building' | 'deploying';
+
+/**
+ * What a live run is doing, as its tag in the tab says it (`runTag`):
+ * `building` while its build runs, `deploying` while its deployment is to
+ * come or rolls out. Null once the run settled, and with no run.
+ */
+export function runPhase(run: DeployRun | undefined): RunPhase | null {
+  if (!run || !isRunLive(run)) return null;
+  return run.build && !isBuildTerminal(run.build.status) ? 'building' : 'deploying';
+}
+
 /** When a run's deployment started; a build's end stands in for one off the page. */
 const deployedAt = (run: DeployRun): number =>
   parseTime(run.deployment?.created_at ?? run.build?.finished_at) ?? runStart(run);

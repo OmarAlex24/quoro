@@ -21,6 +21,7 @@ import {
   miniTapeScale,
   nodeLineSpans,
   remainingSeconds,
+  runPhase,
   runSentence,
   runTag,
   runTimeline,
@@ -402,6 +403,16 @@ describe('the Deployments tab through a deploy', () => {
       expect(view.tags).toContain(`${step.active}: Active`);
     });
   }
+
+  it('names the phase of the newest run in the words of its tag', () => {
+    for (const step of steps) {
+      const runs = joinRuns(step.builds, step.deployments);
+      const top = runTimeline(runs[0]!, undefined, ms(312));
+      const tag = runTag(top, activeDeploymentId([top])).word;
+      expect(runPhase(runs[0])).toBe(tag === 'Building' ? 'building' : tag === 'Deploying' ? 'deploying' : null);
+    }
+    expect(runPhase(undefined)).toBeNull();
+  });
 
   it('keeps one row Active through an image redeploy', () => {
     const current = deployment({ id: 'dep_A', created_at: at(0), finished_at: at(4) });

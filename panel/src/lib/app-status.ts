@@ -9,6 +9,7 @@ import type {
   Node,
 } from '../api/generated/model';
 import { isBuildLive } from './build-status';
+import type { RunPhase } from './deploy-tape';
 import type { LampTone } from './lamp';
 
 /** Everything the app lamp and its caption need, from the aggregated status. */
@@ -60,19 +61,34 @@ export const newestBuildLive = (
 };
 
 /**
- * The lamp the canvas card and the sheet both show, from the same two reads:
- * the app's status and its newest build. `AppStatus` has no build state, so a
- * Git app keeps its own status (`stopped` on a first build) until the build's
- * deployment starts; while its newest build runs, the panel says Building.
+ * The lamp the canvas card and the sheet both show.
+ *
+ * `run` is what the newest run in the Deployments tab's own two lists is
+ * doing (`runPhase`). While that run moves, the lamp says what the tab's tag
+ * says, Building and then Deploying, from the same reads at the same moment.
+ * Once it settled (`null`), the app's status speaks.
+ *
+ * Without the tab's lists (`undefined`: the card of an app that is not open,
+ * or lists not read yet), it reads the app's status and its newest build.
+ * `AppStatus` has no build state, so a Git app keeps its own status
+ * (`stopped` on a first build) until the build's deployment starts; while its
+ * newest build runs, the panel says Building.
  */
 export const serviceLampState = (
   status: AppStatus,
   builds?: ReadonlyArray<Pick<Build, 'status'>> | null,
-): AppLampState => (status !== 'deploying' && newestBuildLive(builds) ? building : appLamp[status]);
+  run?: RunPhase | null,
+): AppLampState => {
+  if (run === 'building') return building;
+  if (run === 'deploying') return appLamp.deploying;
+  if (run === null) return appLamp[status];
+  return status !== 'deploying' && newestBuildLive(builds) ? building : appLamp[status];
+};
 
 /**
  * The apps list refreshes every 2 s while anything deploys or builds and every
- * 10 s otherwise. Pure so the refresh rule can be tested without a query client.
+ * 10 s otherwise. `anyBuildLive` says a build or a run of one of them still
+ * moves. Pure so the refresh rule can be tested without a query client.
  */
 export const appsPollingInterval = (
   apps: ReadonlyArray<Pick<App, 'status'>>,

@@ -148,6 +148,26 @@ describe('issue 637: the card and the sheet say the same state', () => {
     expect(appsPollingInterval([{ status: 'stopped' }], true)).toBe(2_000);
     expect(appsPollingInterval([{ status: 'stopped' }], false)).toBe(10_000);
   });
+});
+
+describe("issue 684: the sheet's header follows the tab's run", () => {
+  it('says what the newest run does, whatever the app read last said', () => {
+    expect(serviceLampState('running', [], 'building').statusText).toBe('Building');
+    expect(serviceLampState('stopped', [{ status: 'succeeded' }], 'building').pulse).toBe(true);
+    expect(serviceLampState('running', [{ status: 'exporting' }], 'deploying').statusText).toBe('Deploying');
+    expect(serviceLampState('running', [], 'deploying').pulse).toBe(true);
+  });
+
+  it('lets the app speak once the run settled, whatever the shared page of builds says', () => {
+    expect(serviceLampState('running', [{ status: 'building' }], null).statusText).toBe('Running');
+    expect(serviceLampState('deploying', [], null).statusText).toBe('Deploying');
+    expect(serviceLampState('down', [], null).statusText).toBe('Down');
+  });
+
+  it('keeps the rule from issue 637 without the lists', () => {
+    expect(serviceLampState('running', [{ status: 'building' }], undefined).statusText).toBe('Building');
+    expect(serviceLampState('running', [{ status: 'succeeded' }], undefined).statusText).toBe('Running');
+  });
 
   it('draws the open app from the sheet’s read, keeping the other cards as listed', () => {
     const listed = [
