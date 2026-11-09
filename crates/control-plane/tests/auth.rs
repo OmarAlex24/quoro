@@ -158,6 +158,85 @@ async fn setup_is_idempotent_under_idempotency_key() {
     assert_eq!(problem(res).await.0, 409);
 }
 
+/// `GET /api/v1/setup` from a plain client: no cookie jar, no bearer token, no
+/// setup token.
+async fn read_setup(server: &common::Server) -> Value {
+    let res = reqwest::get(server.url("/api/v1/setup")).await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.headers()["content-type"], "application/json");
+    let id = res.headers()["quoro-request-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        quoro_types::is_id(quoro_types::Prefix::Request, &id),
+        "{id}"
+    );
+    res.json().await.unwrap()
+}
+
+/// ADR 0293: `GET /api/v1/setup` answers one public bit, whether setup is
+/// still open, to a caller with no credential, and nothing else.
+#[tokio::test]
+async fn get_setup_tells_anyone_whether_setup_is_still_open_and_nothing_else() {
+    let server = common::start().await;
+    let read = || read_setup(&server);
+
+    // No user yet: setup is open. The body is exactly the one bit.
+    assert_eq!(read().await, json!({ "required": true }));
+
+    // An issued setup token changes nothing the read says.
+    let token = server.setup_token();
+    assert_eq!(read().await, json!({ "required": true }));
+
+    // Once the owner exists, setup is closed, for anyone who asks.
+    let res = server
+        .client()
+        .post(server.url("/api/v1/setup"))
+        .header("Quoro-Setup-Token", &token)
+        .json(&owner_body())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+    assert_eq!(read().await, json!({ "required": false }));
+
+    // A signed-in owner reads the same bit, no more.
+    let owner = server.client();
+    server.login(&owner, OWNER_EMAIL, OWNER_PASSWORD).await;
+    let body: Value = owner
+        .get(server.url("/api/v1/setup"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body, json!({ "required": false }));
+
+    // POST keeps its own answer: a second setup is still `conflict`.
+    let res = server
+        .client()
+        .post(server.url("/api/v1/setup"))
+        .header("Quoro-Setup-Token", server.setup_token())
+        .json(&owner_body())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(problem(res).await, (409, "conflict".into(), None));
+
+    // A read is not audited: no record names the GET.
+    assert!(
+        server
+            .audit()
+            .await
+            .iter()
+            .all(|(operation, _, _)| !operation.starts_with("GET ")),
+        "{:?}",
+        server.audit().await
+    );
+}
+
 #[tokio::test]
 async fn login_session_me_and_logout() {
     let server = common::start().await;

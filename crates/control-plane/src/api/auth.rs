@@ -1,4 +1,4 @@
-//! First-run setup and human sessions: `POST /api/v1/setup`,
+//! First-run setup and human sessions: `GET /api/v1/setup`, `POST /api/v1/setup`,
 //! `POST /api/v1/auth/login`, `POST /api/v1/auth/logout`,
 //! `POST /api/v1/auth/password`, `GET /api/v1/auth/me`.
 //!
@@ -34,6 +34,14 @@ use utoipa::openapi::schema::{ObjectBuilder, Schema, Type};
 // ---------------------------------------------------------------------------
 // Schemas (components of the frozen openapi.yaml)
 // ---------------------------------------------------------------------------
+
+/// Whether first-run setup is still open (ADR 0293). One bit, nothing else.
+#[derive(Debug, Serialize, ToSchema)]
+#[schema(title = "SetupState")]
+pub struct SetupState {
+    /// True while no user exists; false once a user exists.
+    pub required: bool,
+}
 
 /// First-run setup. Creates the first user as `owner`.
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
@@ -317,6 +325,30 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 const SETUP: &str = "POST /api/v1/setup";
+
+/// Whether first-run setup is still open (ADR 0293).
+///
+/// Public like `getHealth`: no credential, no audit record (a read), no state
+/// beyond whether the `users` table is empty. Claiming the cluster still
+/// needs the setup token printed on the host (D-0054).
+#[utoipa::path(
+    get,
+    path = "/api/v1/setup",
+    tag = "health",
+    operation_id = "getSetup",
+    security(()),
+    extensions(("x-quoro-scope" = json!("public"))),
+    responses(
+        (status = 200, description = "Whether setup is still open.", body = SetupState,
+            headers(("Quoro-Request-Id" = String, description = "Correlation id of this call."))),
+        (status = 500, response = crate::openapi::Internal),
+    )
+)]
+pub async fn get_setup(State(state): State<AppState>) -> Result<Json<SetupState>, ApiError> {
+    Ok(Json(SetupState {
+        required: !users_exist(&state).await?,
+    }))
+}
 
 /// Create the first owner while no user exists.
 #[utoipa::path(

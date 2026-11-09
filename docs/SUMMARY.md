@@ -293,6 +293,7 @@
   - [0285: A volume restore that turns an expiring lease row local at a new token sets the unsettled mark as R does, so its grant waits for replication and majority support](adr/0285-a-volume-restore-that-turns-an-expiring-lease-row-local-at.md)
   - [0286: An app's change-log payload carries warm_node_id, warm_node_pinned and warm_interval_s beside the App fields, and App.warm stays null in it](adr/0286-an-app-s-change-log-payload-carries-warm-node-id-warm-node.md)
   - [0287: A released pin keeps an eligible warm node, and only a reported pause_copy counts as no longer snapshotting with reflink](adr/0287-a-released-pin-keeps-an-eligible-warm-node-and-only-a.md)
+  - [0293: getSetup: a public GET /api/v1/setup answers {required: bool}, whether first-run setup is still open](adr/0293-getsetup-a-public-get-api-v1-setup-answers-required-bool.md)
 
 # Background research
 

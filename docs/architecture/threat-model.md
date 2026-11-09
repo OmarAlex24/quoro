@@ -184,6 +184,7 @@ T tampering, R repudiation, I information disclosure, D denial of service, E ele
 | T-API-09 | E | A viewer escalates to owner through the panel | Human roles are fixed scope bundles; `user:write` is owner-only; no endpoint grants a role to oneself | `../contracts/README.md` roles, D-0030 | A viewer who obtains an owner's token is an owner (T-API-01) |
 | T-API-10 | I | A `forbidden` response leaks which resources exist | Refusals use a fixed `reason` set and do not echo resource contents | `../contracts/README.md` forbidden reasons | `not_found` versus `forbidden` still reveals existence of ids the caller guessed |
 | T-API-11 | S | Unclaimed first-run setup: between install and the first `POST /api/v1/setup`, anyone who reaches the listener can claim `owner` | The installer prints a one-time setup token, required in the `Quoro-Setup-Token` header; it is single use and expires after one hour, the primary stores only its hash, and `quoro setup-token` refuses once an owner exists (D-0054) | D-0054, architecture section 2, host layout | The token is printed on the host console and in the install log, so whoever reads that output within the hour can claim `owner` |
+| T-API-12 | I | `GET /api/v1/setup` (`getSetup`) tells anyone who reaches the listener whether the cluster has an owner yet, so a scanner can find clusters still waiting for first-run setup | The answer is one bit, `required`, and nothing else: no user, no count, no token state; the read needs no credential, writes no audit record and changes nothing. Knowing that setup is open does not let anyone claim the cluster, because `POST /api/v1/setup` still needs the one-time setup token printed on the host (T-API-11, D-0054) | ADR 0293, `../contracts/openapi.yaml` `getSetup` | The window T-API-11 describes is now visible from outside: a scanner learns which listeners are unclaimed, but still needs the host's token output within its hour to claim one |
 
 ### (b) MCP server and agents
 
@@ -402,6 +403,7 @@ decisions with a single narrow threat.
 | D-0051 (human-only `providers` resource, write-only secrets) | T-PRV-01, T-PRV-02, T-PRV-08 |
 | D-0053 (off-site copy in M5a, object-lock probe) | T-AUD-06, T-PRV-05 |
 | D-0054 (setup token, listener and pin model) | T-API-11 |
+| ADR 0293 (`getSetup`: a public read of whether first-run setup is still open, one bit) | T-API-12, T-API-11 (the token still guards the claim) |
 | D-0059 (embedded reverse proxy behind the `Ingress` interface) | T-ING-01 to T-ING-09 (the proxy and its certificate handling are Quoro code; Caddy remains a fallback backend) |
 | D-0061 (own init, own OCI-to-ext4 pipeline with `RESOLVE_IN_ROOT`) | T-VM-05 (layer paths cannot escape the rootfs), T-VM-07 (PID 1 is Quoro's own init) |
 | D-0063 (kernel WireGuard configured over netlink) | Boundary 9, node <-> node: replication traffic and chunks cross it under per-node keys instead of trusting the network |

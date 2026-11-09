@@ -41,7 +41,7 @@ use axum::routing::{delete, get, post, put};
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/v1/health", get(health::get_health))
-        .route("/api/v1/setup", post(auth::setup))
+        .route("/api/v1/setup", get(auth::get_setup).post(auth::setup))
         .route("/api/v1/auth/login", post(auth::login))
         .route("/api/v1/auth/logout", post(auth::logout))
         .route("/api/v1/auth/me", get(auth::get_me))
