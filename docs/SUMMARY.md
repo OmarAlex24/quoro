@@ -295,6 +295,7 @@
   - [0287: A released pin keeps an eligible warm node, and only a reported pause_copy counts as no longer snapshotting with reflink](adr/0287-a-released-pin-keeps-an-eligible-warm-node-and-only-a.md)
   - [0288: A new-token local grant of a warm app's lease sets the unsettled mark whatever the row reads, which also covers the conversion window](adr/0288-a-new-token-local-grant-of-a-warm-app-s-lease-sets-the.md)
   - [0289: Two readings of D-0268: a maintenance window fails when the raise is not replicated within D/3 plus one margin, and a conversion with no stored duration_ms waits for the raise](adr/0289-two-readings-of-d-0268-a-maintenance-window-fails-when-the.md)
+  - [0291: Engine-trait section 6 names quoro-init's sync refusal 131 for an earlier syncfs that has not returned, and the rule when the host gives up after its 2 s](adr/0291-engine-trait-section-6-names-quoro-init-s-sync-refusal-131.md)
   - [0292: failoverApp answers 202 at once while the grant of a marked lease waits, and the lease shows the wait (grant_pending, grant_waiting_on)](adr/0292-failoverapp-answers-202-at-once-while-the-grant-of-a-marked.md)
   - [0293: getSetup: a public GET /api/v1/setup answers {required: bool}, whether first-run setup is still open](adr/0293-getsetup-a-public-get-api-v1-setup-answers-required-bool.md)
 
