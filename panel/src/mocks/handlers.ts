@@ -32,6 +32,7 @@ import type {
   Project,
   ProjectList,
   SetupRequest,
+  SetupState,
   UpdateAppRequest,
   User,
   Vm,
@@ -133,6 +134,9 @@ export const handlers = [
   http.get('*/api/v1/health', () =>
     json({ status: 'ok' }),
   ),
+
+  // `getSetup` (ADR 0293): open until the mock's own setup creates the owner.
+  http.get('*/api/v1/setup', () => json({ required: !db.setupDone } satisfies SetupState)),
 
   http.post('*/api/v1/setup', async ({ request }) => {
     if (db.setupDone) {

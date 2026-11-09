@@ -1,9 +1,16 @@
-import { useMutation } from '@tanstack/react-query';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Link, useNavigate } from '@tanstack/react-router';
 import { useState, type FormEvent } from 'react';
-import { setup } from '../api/generated/health/health';
+import { getGetSetupQueryKey, setup, useGetSetup } from '../api/generated/health/health';
+import type { SetupState } from '../api/generated/model';
 import { problemView, type ProblemView } from '../lib/problem';
-import { SETUP_DONE, setSetupNotice, setupAlreadyDone } from '../lib/setup-notice';
+import {
+  SETUP_CHECKING,
+  SETUP_DONE,
+  setSetupNotice,
+  setupAlreadyDone,
+  setupView,
+} from '../lib/setup-notice';
 import { AuthPanel } from '../components/auth-panel';
 import { Button } from '../components/ui/button';
 import { Field } from '../components/ui/field';
@@ -12,6 +19,11 @@ import { ProblemBanner } from '../components/ui/problem-banner';
 
 export function SetupScreen() {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  // ADR 0293: ask the cluster whether setup is still open before offering the
+  // form. No retry: a failed read falls back to the form at once (see setupView).
+  const setupState = useGetSetup({ query: { retry: false } });
+  const view = setupView({ pending: setupState.isPending, state: setupState.data });
   const [token, setToken] = useState('');
   const [email, setEmail] = useState('');
   const [name, setName] = useState('');
@@ -22,6 +34,11 @@ export function SetupScreen() {
 
   const isMock = import.meta.env.MODE === 'mock';
 
+  // Once an owner exists, sign-in stops offering setup without asking again.
+  const closeSetup = () => {
+    queryClient.setQueryData<SetupState>(getGetSetupQueryKey(), { required: false });
+  };
+
   const setupMutation = useMutation({
     mutationFn: () =>
       setup(
@@ -29,11 +46,14 @@ export function SetupScreen() {
         { headers: { 'Quoro-Setup-Token': token.trim() } },
       ),
     onSuccess: () => {
+      closeSetup();
       setSetupNotice('Owner created. Sign in with the email and password you chose.');
       void navigate({ to: '/login' });
     },
     onError: (error) => {
+      // Another first run won the race: the cluster has its owner now.
       if (setupAlreadyDone(error)) {
+        closeSetup();
         setAlreadyDone(true);
         setProblem(null);
         return;
@@ -58,8 +78,28 @@ export function SetupScreen() {
     setupMutation.mutate();
   };
 
+  const signInFooter = (
+    <p>
+      Setup already done?{' '}
+      <Link to="/login" className="auth-link">
+        Sign in
+      </Link>
+    </p>
+  );
+
+  if (view === 'checking') {
+    return (
+      <AuthPanel title={SETUP_CHECKING.title} lede={SETUP_CHECKING.lede} footer={signInFooter}>
+        <p role="status" className="auth-note">
+          {SETUP_CHECKING.note}
+        </p>
+      </AuthPanel>
+    );
+  }
+
   // Nothing typed here can succeed any more: say so and lead back to sign-in.
-  if (alreadyDone) {
+  // A submit that just succeeded keeps the form until sign-in takes over.
+  if (alreadyDone || (view === 'done' && !setupMutation.isSuccess)) {
     return (
       <AuthPanel title={SETUP_DONE.title} lede={SETUP_DONE.lede}>
         <div className="grid gap-4">
@@ -78,14 +118,7 @@ export function SetupScreen() {
     <AuthPanel
       title="Set up the owner"
       lede="The first account of this cluster. It holds every scope and invites everyone else."
-      footer={
-        <p>
-          Setup already done?{' '}
-          <Link to="/login" className="auth-link">
-            Sign in
-          </Link>
-        </p>
-      }
+      footer={signInFooter}
     >
       <form onSubmit={submit} className="grid gap-4" noValidate>
         {problem ? <ProblemBanner view={problem} /> : null}
