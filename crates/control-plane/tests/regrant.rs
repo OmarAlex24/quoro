@@ -692,3 +692,137 @@ async fn a_warm_apps_lease_is_not_given_back_yet() {
         i64::try_from(token).unwrap()
     );
 }
+
+/// A regrant that waits for a gate decides again once the gate has passed:
+/// a row that moved to another holder, went to a higher token, was revoked,
+/// or whose lease another node's failed fence lists, is not given back.
+#[tokio::test]
+async fn a_waiting_regrant_gives_nothing_back_once_the_row_changed() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let (node, app_id, lease_id, token) = node_with_lease(&server, &owner).await;
+    let other = enrolled_node(&server, &owner, "node-beta").await;
+    let pool = server.state.store.pool();
+    let failure = json!({
+        "detected_at": "2026-11-09T10:00:00Z",
+        "lease_ids": [lease_id],
+        "app_ids": [app_id],
+        "vm_ids": [],
+    })
+    .to_string();
+    let changes: [(&str, &str); 4] = [
+        (
+            "another holder",
+            "UPDATE leases SET holder_node_id = ? WHERE id = ?",
+        ),
+        (
+            "a higher token",
+            "UPDATE leases SET fencing_token = fencing_token + 1 WHERE id = ?",
+        ),
+        (
+            "revoked",
+            "UPDATE leases SET revoked_at = '2026-11-09T10:00:00Z' WHERE id = ?",
+        ),
+        (
+            "a failed fence",
+            "UPDATE nodes SET fence_failure = ? WHERE id = ?",
+        ),
+    ];
+    for (case, change) in changes {
+        sqlx::query(
+            "UPDATE leases SET mode = 'expiring', duration_ms = 3000, holder_node_id = ?, \
+             fencing_token = ?, revoked_at = NULL WHERE id = ?",
+        )
+        .bind(&node.node_id)
+        .bind(i64::try_from(token).unwrap())
+        .bind(&lease_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE nodes SET fence_failure = NULL")
+            .execute(pool)
+            .await
+            .unwrap();
+        server
+            .state
+            .hub
+            .authority()
+            .seed(&lease_id, &node.node_id, Some(3_000));
+        let (mut socket, frames) =
+            reconnect(&server, &node, &app_id, &lease_id, token, "expired").await;
+        assert!(
+            grants_of(&frames, &lease_id).is_empty(),
+            "{case}: {frames:?}"
+        );
+
+        let query = sqlx::query(change);
+        let query = match case {
+            "another holder" => query.bind(&other.node_id).bind(&lease_id),
+            "a failed fence" => query.bind(&failure).bind(&other.node_id),
+            _ => query.bind(&lease_id),
+        };
+        query.execute(pool).await.unwrap();
+        // The gate passes 5 s after the seed; wait past it.
+        tokio::time::sleep(Duration::from_millis(5_500)).await;
+        let frames = frames_until_settled(&mut socket).await;
+        assert!(
+            grants_of(&frames, &lease_id).is_empty(),
+            "{case}: {frames:?}"
+        );
+        drop(socket);
+    }
+}
+
+/// A refused same-token grant gives nothing back when a `lease_revoke` of
+/// the lease went out on the same session, here the revoke of a renewal
+/// that crossed the row's newer token.
+#[tokio::test]
+async fn a_refused_grant_after_a_revoke_on_the_session_gives_nothing_back() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let (node, app_id, lease_id, token) = node_with_lease(&server, &owner).await;
+    run(
+        &server,
+        "UPDATE leases SET fencing_token = fencing_token + 1 WHERE id = ?",
+        &lease_id,
+    )
+    .await;
+
+    let (mut socket, frames) =
+        reconnect(&server, &node, &app_id, &lease_id, token + 1, "held").await;
+    let grant_id = of_type(&frames, "lease_grant")[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    send(
+        &mut socket,
+        NodeMessage::LeaseRenew(quoro_proto::LeaseRenew {
+            lease_id: quoro_proto::LeaseId(lease_id.clone()),
+            fencing_token: token,
+        }),
+        None,
+    )
+    .await;
+    let frames = recv_until(&mut socket, &["lease_revoke"]).await;
+    let revoke_id = of_type(&frames, "lease_revoke")[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    send(&mut socket, ok_result(), Some(&revoke_id)).await;
+    send(
+        &mut socket,
+        NodeMessage::Error(ProtocolError {
+            code: ErrorCode::BadMessage,
+            message: "the lease is not held".to_string(),
+            fatal: false,
+        }),
+        Some(&grant_id),
+    )
+    .await;
+    let frames = frames_until_settled(&mut socket).await;
+    assert!(grants_of(&frames, &lease_id).is_empty(), "{frames:?}");
+    assert_eq!(
+        row(&server, &lease_id).await.0,
+        i64::try_from(token + 1).unwrap()
+    );
+}
