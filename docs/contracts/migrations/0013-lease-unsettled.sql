@@ -16,8 +16,8 @@
 --   between a conversion grant and the answer to its first renewal
 --   (ADR 0244). A volume restore of a warm app is such a write: it revokes
 --   the holder and names the target node local at a new token (section 8.3,
---   ADR 0285). A write that grants nothing, such as declaring a node lost,
---   is not one;
+--   ADR 0285, ADR 0288). A write that grants nothing, such as declaring a
+--   node lost, is not one;
 -- - the first change-log write of any restore, plain or with --accept-loss
 --   (backup-format.md section 8.2), and of any `quoro cluster promote
 --   --accept-loss` (node-agent-protocol.md section 7.3), on every row whose

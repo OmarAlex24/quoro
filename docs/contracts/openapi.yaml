@@ -4079,6 +4079,8 @@ components:
         - granted_at
         - local_pending
         - unsettled
+        - grant_pending
+        - grant_waiting_on
       properties:
         id:
           type: string
@@ -4177,7 +4179,7 @@ components:
             `local`, and any write that names a node `local` at a new token,
             to grant it the lease, while the app's HA policy is `warm`,
             whatever the row's mode, such as a volume restore of a `warm` app
-            (`restoreBackup`, ADR 0285). So does the first write of a
+            (`restoreBackup`, ADR 0285, ADR 0288). So does the first write of a
             control-plane restore (`quoro restore`) or of a promotion with
             `--accept-loss`, on every `expiring` row. The write that records
             the holder's own `local` report never sets it: it clears it, as
@@ -4189,6 +4191,26 @@ components:
             write that records what the holder holds does: its report of its
             mode, the `pong` that follows a same-token `local` grant, or the
             settle of an `expiring` lease. False otherwise.
+        grant_pending:
+          type: boolean
+          description: |
+            True while the primary holds a grant of this lease that it has not
+            sent: the row carries the unsettled mark, and its newest write is
+            not yet replicated over every machine with the `node` role, or the
+            primary does not hold majority support (node-agent-protocol.md
+            section 8.4, "Grants of a marked row", ADR 0292). Derived on read;
+            never stored. False otherwise.
+        grant_waiting_on:
+          type: array
+          items:
+            type: string
+            pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: |
+            While `grant_pending` is true, the machines with the `node` role
+            that have not acknowledged the row's newest write, a declared-lost
+            node included until it is removed (ADR 0292). Empty otherwise, and
+            empty when only majority support is missing. Derived on read;
+            never stored.
     User:
       type: object
       title: User
@@ -7788,7 +7810,9 @@ paths:
         copies never write at once (ADR 0019). Refused with `conflict` and
         `reason`:
         - `not_warm`: the app's `ha_policy` is not `warm`;
-        - `in_progress`: a failover or switchover of the app is running;
+        - `in_progress`: a failover or switchover of the app is running, or
+          its grant to the warm node waits (`App.lease.grant_pending`,
+          ADR 0292);
         - `no_copy`: as far as the primary knows, the warm node holds no
           complete copy;
         - `node_disconnected`: the warm node is not connected;
@@ -7812,9 +7836,11 @@ paths:
           declared lost stays in that set until it is removed, so when the
           holder is declared lost the grant waits until that holder is
           removed, or reports again and has acknowledged the row's newest
-          write (section 8.4, "Grants of a marked row"). The call is not
-          refused for that wait: it answers once the grant is sent
-          (ADR 0285), so the request stays open until then.
+          write (section 8.4, "Grants of a marked row"). The call is neither
+          refused for that wait nor held open by it: it answers once the
+          change that moves the lease commits, and the grant follows
+          (ADR 0292). `App.lease.grant_pending` and
+          `App.lease.grant_waiting_on` show the wait.
 
         When the source is connected, the primary first revokes its lease
         over the session and goes on once the revoke is answered; that loses
@@ -7826,9 +7852,14 @@ paths:
         an edge the tunnel route with the grace window of ADR 0168), makes the
         old source the app's warm node, and emits `app.failed_over`. The call
         answers `202` with the app once the lease moved; the instance starts
-        asynchronously. While the row carries the unsettled mark, the lease
-        has moved once its grant to the warm node is sent (above). The old
-        source's lease is revoked when it reconnects;
+        asynchronously. While the row carries the unsettled mark, the grant
+        to the warm node is sent once the row's newest write is replicated
+        over every machine with the `node` role and the primary holds
+        majority support (node-agent-protocol.md section 8.4, "Grants of a
+        marked row"). Until then `App.lease.grant_pending` is true, and the
+        standby VM stays stopped, because the warm node does not hold the
+        lease (section 6.4, ADR 0292). The old source's lease is revoked when
+        it reconnects;
         it keeps its divergent writes as a quarantined copy and becomes the
         warm copy (node-agent-protocol.md section 9). Destructive and off by
         default for agents: without an approval grant on `{type: app, id}`
@@ -7851,7 +7882,10 @@ paths:
               $ref: '#/components/schemas/FailoverAppRequest'
       responses:
         '202':
-          description: The lease moved to the warm node; the app starts there.
+          description: |
+            The lease moved to the warm node in the primary's state. The app
+            starts there once the warm node holds the lease
+            (`App.lease.grant_pending`, ADR 0292).
           headers:
             Quoro-Request-Id:
               $ref: '#/components/headers/QuoroRequestId'
@@ -7889,7 +7923,9 @@ paths:
         backend while the old backend's requests finish
         (node-agent-protocol.md section 6.13). The app does not serve from
         the freeze until the new instance runs, typically a few seconds.
-        Refused with `conflict` and `reason`: `not_warm`; `in_progress`;
+        Refused with `conflict` and `reason`: `not_warm`; `in_progress`, also
+        while a failover's grant to the warm node waits
+        (`App.lease.grant_pending`, ADR 0292);
         `not_in_sync` unless `App.warm.state` is `in_sync`, a lag of at most
         two intervals; `node_disconnected` unless both nodes are connected;
         `fence_failed`; `no_support`. The call answers `202` with the app
