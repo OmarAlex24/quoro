@@ -2329,7 +2329,21 @@ Definitions, each on the clock of the machine that uses it:
 - A primary that receives `stale_term` stops granting and renewing `expiring` leases at once, and demotes itself: it ends its sessions with `not_primary` and answers every later request with `503` `not_primary` (section 7.4, ADR 0182). The error carries the sender's `term` (section 5.18). A primary restored with `quoro restore --accept-loss` that has sent no `lease_grant` yet starts again at one above that term instead of demoting itself (`backup-format.md` section 8.2, ADR 0261).
 - A voter that voted in the primary's term for another candidate answers its `support_request` with `bad_message`, which carries the voter's `term` (section 5.27). A primary restored with `--accept-loss` that has sent no `lease_grant` yet treats it like `stale_term`: it starts again at one above that term. A plain restore lacks that voter's support, and `backup-format.md` section 8.2 gives the way out (ADR 0280).
 
-**Restarts.** The voter stores its term, the candidate it voted for, the promise and the lease horizon before it answers, with the promise and the horizon measured on `CLOCK_BOOTTIME` next to the host's kernel boot id, as for held leases (section 8.4). After an agent restart within the same boot both keep counting. After a reboot the voter cannot tell how long it was down, so it starts both again from its first start: the promise until `now + S` and the horizon until `now + S + L + 2 M_L`, with the stored `S` and `L`. Both can only end later than before, which is the safe side. The primary keeps support in memory only: after it restarts it has none, and it asks again before it grants or renews any `expiring` lease.
+**Restarts.** Before it answers, the voter stores:
+
+- its term and the candidate it voted for;
+- the `S`, `L` and `v_recv` of the last request it granted;
+- the promise and the lease horizon.
+
+`v_recv`, the promise and the horizon are measured on `CLOCK_BOOTTIME` next to the host's kernel boot id, as for held leases (section 8.4). After an agent restart within the same boot they keep counting.
+
+After a reboot the voter cannot tell how long it was down, so it starts both again from its first start, `now`, and neither is shorter than the longest window it may still owe:
+
+- the promise until `now + max(S, promise - v_recv)`;
+- the horizon until `now + max(S + L + 2 M_L, horizon - v_recv)`;
+- `S`, `L`, `v_recv`, the promise and the horizon are the stored values, and the voter then stores `now` as its `v_recv` (ADR 0305).
+
+An earlier grant with a longer window can have set the stored promise or horizon, and the primary keeps the newest support it got an answer for. So when the answer to the last request was lost, the primary may still count that earlier support. An example is a lost answer after a maintenance window's `W` ended (section 8.11), when `L` went back to `D` while a grant of up to `W` may still be before its gate. When the last grant set both, the two spans are exactly `S` and `S + L + 2 M_L`. Both can only end later than before, which is the safe side. The primary keeps support in memory only: after it restarts it has none, and it asks again before it grants or renews any `expiring` lease.
 
 ### 8.9 Promotion votes (M5b)
 
@@ -2496,7 +2510,7 @@ The node keeps a SQLite file, owned by root, that holds everything it needs to r
 
 | Table | Holds | Why |
 | --- | --- | --- |
-| `node_meta` | `node_id`, `cluster_id`, `boot_id`, `host_boot_id` (the kernel boot id), the failed mark and the failed fences it covers (cleared by `command` kind `fence_ack`, section 5.17), agent and engine versions, the cluster public key and its `key_id`, a reference to the credential; from M5b the highest term seen, the newest `welcome.schema_version`, and on a voter its vote state: the candidate it voted for in that term, the primary it supports with the last `S` and `L`, and the promise and lease horizon on `CLOCK_BOOTTIME` (section 8.8); on a machine with the `node` role, whether a promotion on this host froze the agent (section 7.3) | Identity across restarts; a voter's promise survives an agent restart and errs late after a reboot; a frozen agent stays frozen across a restart |
+| `node_meta` | `node_id`, `cluster_id`, `boot_id`, `host_boot_id` (the kernel boot id), the failed mark and the failed fences it covers (cleared by `command` kind `fence_ack`, section 5.17), agent and engine versions, the cluster public key and its `key_id`, a reference to the credential; from M5b the highest term seen, the newest `welcome.schema_version`, and on a voter its vote state: the candidate it voted for in that term, the primary it supports with the `S`, `L` and `v_recv` of the last request it granted (its first start after a reboot), and the promise and lease horizon, the instants on `CLOCK_BOOTTIME` next to the kernel boot id (section 8.8); on a machine with the `node` role, whether a promotion on this host froze the agent (section 7.3) | Identity across restarts; a voter's promise survives an agent restart and errs late after a reboot; a frozen agent stays frozen across a restart |
 | `desired_state` | One row per accepted `rev`: the full signed body, its hash, `issued_at`, `term` | The snapshot to reconcile from, and the signature to re-verify |
 | `applied_state` | Per VM the last applied spec digest, observed status, restart count, last exit code | Detects drift without the primary |
 | `leases` | Lease id, resource, mode, token, state, `valid_until`, duration, remaining validity on `CLOCK_BOOTTIME` for `held` and `uncertain` expiring leases | Survives an agent restart: a fenced lease stays fenced, a held one keeps its remaining validity within the same host boot |

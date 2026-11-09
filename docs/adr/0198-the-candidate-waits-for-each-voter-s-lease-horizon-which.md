@@ -1,12 +1,12 @@
 # ADR 0198: The candidate waits for each voter's lease horizon, which covers the longest lease the old primary declared (max_lease_ms), plus a vote pre-check (refines ADR 0169)
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0305](0305-section-8-8-restarts-after-a-reboot-a-voter-restarts-its.md)
 - **Date:** 2026-11-06
 - **Ledger id:** D-0198
 - **Tags:** m5b, contracts, leases
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** [ADR 0169](0169-m5b-lease-authority-the-primary-may-grant-or-renew-expiring.md)
+- **Related:** [ADR 0169](0169-m5b-lease-authority-the-primary-may-grant-or-renew-expiring.md), [ADR 0305](0305-section-8-8-restarts-after-a-reboot-a-voter-restarts-its.md)
 
 ## Context
 
@@ -21,6 +21,7 @@ Each support_request declares L = max_lease_ms (D, or W during a maintenance win
 ## Consequences
 
 - Refines [ADR 0169](0169-m5b-lease-authority-the-primary-may-grant-or-renew-expiring.md): the candidate's wait before it starts at the new term (each voter's lease horizon instead of S + D + 2M). The rest of [ADR 0169](0169-m5b-lease-authority-the-primary-may-grant-or-renew-expiring.md) stands.
+- [ADR 0305](0305-section-8-8-restarts-after-a-reboot-a-voter-restarts-its.md) refines where a voter's promise and lease horizon start again after a reboot: from its first start, each for the longer of the rule's span and what was left of it at the last grant. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---
