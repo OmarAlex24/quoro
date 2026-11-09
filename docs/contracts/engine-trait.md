@@ -1082,7 +1082,7 @@ The minimal init is part of the engine workstream and is the only process Quoro 
 
 **Sync sessions (M5b, ADR 0282).** ADR 0282 extends the framing of ADR 0126 with one frame each way, for the engine's flush of a volume before a snapshot (section 3.16).
 
-- **Host to guest: `5` sync,** valid only as a session's first frame, in place of `1` open. Its payload is the JSON object `{"serials":["quoro-vol-0", ...]}` with no other key: one or more serials, each that of a volume in the configuration. The host sends nothing after it, and the init reads no further frame of that session. A `5` anywhere but first is an unknown frame and ends the session.
+- **Host to guest: `5` sync,** valid only as a session's first frame, in place of `1` open. Its payload is the JSON object `{"serials":["quoro-vol-0", ...]}` with no other key: one to 64 serials, each that of a volume in the configuration and each named once. The engine names one volume per session. The host sends nothing after it, and the init reads no further frame of that session. A `5` anywhere but first is an unknown frame and ends the session.
 - **The init's work.** For each serial, in order, it opens that volume's mount path at that moment and calls `syncfs` on it.
 - **Guest to host: `132` synced,** with an empty payload, once every named volume was synced. The init then closes the session.
 - **Errors.** A malformed payload, an empty list, an unknown serial, a mount it cannot open, or a `syncfs` that fails is answered with `131` error and the reason, then a close.
