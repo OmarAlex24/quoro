@@ -99,7 +99,7 @@ A row raised this way has every property step 4 tests. So a later primary can se
 
 ## Consequences
 
-- Refines [ADR 0280](0280-every-grant-of-a-marked-lease-waits-until-every-node-holds.md): any write that turns a row reading expiring into local, at any token, sets the mark, a volume restore's included; the raise of a marked row's token also sets revoked_at; and the side paths listed here are fixed or stated as limits. The rest of [ADR 0280](0280-every-grant-of-a-marked-lease-waits-until-every-node-holds.md) stands.
+- Refines [ADR 0280](0280-every-grant-of-a-marked-lease-waits-until-every-node-holds.md): which writes set the mark and what a raise records: any write that turns a row reading expiring into local, at any token, sets the mark, a volume restore's included; the raise of a marked row's token also sets revoked_at; and the side paths listed here are fixed or stated as limits. The rest of [ADR 0280](0280-every-grant-of-a-marked-lease-waits-until-every-node-holds.md) stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---

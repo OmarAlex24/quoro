@@ -151,8 +151,8 @@ _Some wording was changed for the public repository._
 
 ## Consequences
 
-- Refines [ADR 0261](0261-every-node-holds-a-lease-row-s-local-write-before-an.md): while a lease row is marked, every grant of the lease, a new token's included, waits until every node holds the row's newest write; R sets the mark and only the holder's report clears it; the frozen log is checked again; a removal counts only machines not removed; and the side paths listed here are fixed or stated as limits. The rest of [ADR 0261](0261-every-node-holds-a-lease-row-s-local-write-before-an.md) stands.
-- [ADR 0285](0285-a-volume-restore-that-turns-an-expiring-lease-row-local-at.md) refines any write that turns a row reading expiring into local, at any token, sets the mark, a volume restore's included; the raise of a marked row's token also sets revoked_at; and the side paths listed here are fixed or stated as limits. The rest of this decision stands.
+- Refines [ADR 0261](0261-every-node-holds-a-lease-row-s-local-write-before-an.md): which grants wait and what the mark covers: while a lease row is marked, every grant of the lease, a new token's included, waits until every node holds the row's newest write; R sets the mark and only the holder's report clears it; the frozen log is checked again; a removal counts only machines not removed; and the side paths listed here are fixed or stated as limits. The rest of [ADR 0261](0261-every-node-holds-a-lease-row-s-local-write-before-an.md) stands.
+- [ADR 0285](0285-a-volume-restore-that-turns-an-expiring-lease-row-local-at.md) refines which writes set the mark and what a raise records: any write that turns a row reading expiring into local, at any token, sets the mark, a volume restore's included; the raise of a marked row's token also sets revoked_at; and the side paths listed here are fixed or stated as limits. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---
