@@ -2,9 +2,8 @@ import { useMutation } from '@tanstack/react-query';
 import { Link, useNavigate } from '@tanstack/react-router';
 import { useState, type FormEvent } from 'react';
 import { setup } from '../api/generated/health/health';
-import { isApiProblem } from '../api/fetcher';
 import { problemView, type ProblemView } from '../lib/problem';
-import { setSetupNotice } from '../lib/setup-notice';
+import { SETUP_DONE, setSetupNotice, setupAlreadyDone } from '../lib/setup-notice';
 import { AuthPanel } from '../components/auth-panel';
 import { Button } from '../components/ui/button';
 import { Field } from '../components/ui/field';
@@ -34,7 +33,7 @@ export function SetupScreen() {
       void navigate({ to: '/login' });
     },
     onError: (error) => {
-      if (isApiProblem(error) && error.status === 409) {
+      if (setupAlreadyDone(error)) {
         setAlreadyDone(true);
         setProblem(null);
         return;
@@ -59,6 +58,22 @@ export function SetupScreen() {
     setupMutation.mutate();
   };
 
+  // Nothing typed here can succeed any more: say so and lead back to sign-in.
+  if (alreadyDone) {
+    return (
+      <AuthPanel title={SETUP_DONE.title} lede={SETUP_DONE.lede}>
+        <div className="grid gap-4">
+          <p role="status" className="auth-note">
+            {SETUP_DONE.next}
+          </p>
+          <Button variant="primary" className="h-9 w-full" asChild>
+            <Link to="/login">Sign in</Link>
+          </Button>
+        </div>
+      </AuthPanel>
+    );
+  }
+
   return (
     <AuthPanel
       title="Set up the owner"
@@ -73,19 +88,6 @@ export function SetupScreen() {
       }
     >
       <form onSubmit={submit} className="grid gap-4" noValidate>
-        {alreadyDone ? (
-          <div role="alert" className="auth-note auth-note-fault">
-            <p>
-              Setup is already done.{' '}
-              <Link to="/login" className="auth-link">
-                Sign in instead
-              </Link>
-              .
-            </p>
-            <p className="type-code mt-1 text-[12px] text-ink-2">conflict</p>
-          </div>
-        ) : null}
-
         {problem ? <ProblemBanner view={problem} /> : null}
 
         <Field
