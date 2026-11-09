@@ -1,12 +1,12 @@
 # ADR 0295: A restarted primary sends a marked row's pending new-token grant at the named holder's next session start, whatever the row's mode
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0299](0299-a-node-s-hello-counts-toward-a-marked-row-s-grant-only-once.md)
 - **Date:** 2026-11-09
 - **Ledger id:** D-0295
 - **Tags:** m5b, leases, contracts, warm, failover
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** [ADR 0280](0280-every-grant-of-a-marked-lease-waits-until-every-node-holds.md), [ADR 0292](0292-failoverapp-answers-202-at-once-while-the-grant-of-a-marked.md)
+- **Related:** [ADR 0280](0280-every-grant-of-a-marked-lease-waits-until-every-node-holds.md), [ADR 0292](0292-failoverapp-answers-202-at-once-while-the-grant-of-a-marked.md), [ADR 0299](0299-a-node-s-hello-counts-toward-a-marked-row-s-grant-only-once.md)
 
 ## Context
 
@@ -24,6 +24,7 @@ _Some wording was changed for the public repository._
 
 - Refines [ADR 0280](0280-every-grant-of-a-marked-lease-waits-until-every-node-holds.md): which marked rows step 4 of 'The holder fenced first' sends a grant for: any marked row whose newest write names the node as holder at a higher token than the node reports, in either mode, or a lease the node does not list. The rest of [ADR 0280](0280-every-grant-of-a-marked-lease-waits-until-every-node-holds.md) stands.
 - Refines [ADR 0292](0292-failoverapp-answers-202-at-once-while-the-grant-of-a-marked.md): what a primary restart does to a failover's waiting grant: the grant is sent at the warm node's next session start, and grant_pending is true again until then. The rest of [ADR 0292](0292-failoverapp-answers-202-at-once-while-the-grant-of-a-marked.md) stands.
+- [ADR 0299](0299-a-node-s-hello-counts-toward-a-marked-row-s-grant-only-once.md) refines what step 4 does when it sends: it checks its conditions again, and a node that lists the lease in the other mode at a lower token is revoked at that token first. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---
