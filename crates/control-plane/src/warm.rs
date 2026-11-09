@@ -820,9 +820,10 @@ fn lost_for_good(node: Option<(&str, &WarmNodeRow)>, pinned: bool, volume_node: 
 /// Picks a warm node again for every `warm` app whose warm node is lost for
 /// good ([`lost_for_good`]), and one for a `warm` app that has none, once a
 /// node is eligible. Each app is written in its own transaction, with its
-/// change-log entry and `app.updated`; afterwards the volume's node and the
-/// old and new warm nodes rebuild their snapshots, so the old one's copy gets
-/// its `deleted` entry once no failover can need it (section 5.11). Runs on
+/// change-log entry and `app.updated`; afterwards the volume's node, the old
+/// and new warm nodes and every node that reports a copy of the app rebuild
+/// their snapshots ([`with_copy_holders`]), so an old copy gets its `deleted`
+/// entry once no failover can need it (section 5.11). Runs on
 /// the sweeper's tick, and only in a build that accepts `warm` (ADR 0277).
 ///
 /// # Errors

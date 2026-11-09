@@ -1734,6 +1734,16 @@ async fn a_dev_warm_policy_build_wakes_the_warm_node_and_prices_its_report() {
     warm::set_node(&server, &other, "volume_snapshot = 'pause_copy'").await;
     warm::set_node(&server, &warm_node, "volume_snapshot = 'pause_copy'").await;
     assert_eq!(sweep().await, None);
+    // The old warm node's snapshot drops the copy and sends it no entry:
+    // nothing is stale while the app has no warm node.
+    session::spec_where(&mut socket, |spec| {
+        !spec["volumes"].as_array().is_some_and(|files| {
+            files
+                .iter()
+                .any(|file| file["volume_id"] == volume_id.as_str())
+        })
+    })
+    .await;
     warm::set_node(&server, &other, "volume_snapshot = 'reflink'").await;
     assert_eq!(sweep().await, Some(other.clone()));
     session::spec_where(&mut other_socket, has("present", true)).await;
