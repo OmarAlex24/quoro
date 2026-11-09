@@ -37,6 +37,7 @@ import { listIsConverging } from '../lib/lamp';
 import { problemView } from '../lib/problem';
 import { SERVICE_LIST_PARAMS } from '../lib/projects';
 import { appIdOfKey, lastBuildFailed, projectServices, type ServiceItem } from '../lib/services';
+import { useAppRuns } from '../lib/use-app-runs';
 import { cachedBuildLive, useRecentBuilds } from '../lib/use-builds';
 import { useSession } from '../session';
 import { AccessChip } from './access-chip';
@@ -110,6 +111,13 @@ export function ProjectCanvas({
   // key, so no second request), so its card never lags the sheet's header.
   const openAppId = appIdOfKey(selected);
   const openApp = useGetApp(openAppId ?? '', { query: { enabled: openAppId !== undefined, retry: false } });
+  // Its card says what the sheet's header says while a run moves, from the
+  // Deployments tab's own two lists (same query keys, so no second request).
+  const openRun = useAppRuns(openApp.data).phase;
+  const runOf = useCallback(
+    (appId: string) => (appId === openAppId ? openRun : undefined),
+    [openAppId, openRun],
+  );
   const vmsQuery = useListVms(
     { project_id: projectId, ...SERVICE_LIST_PARAMS },
     {
@@ -239,13 +247,13 @@ export function ProjectCanvas({
             {
               key,
               waiting: waitsOnApproval(approvals, { type: 'app', id: service.app.id }),
-              deploying: serviceLampState(service.app.status, appBuilds).pulse,
+              deploying: serviceLampState(service.app.status, appBuilds, runOf(service.app.id)).pulse,
               failed: appFailed(service.app, appBuilds ? lastBuildFailed(appBuilds) : false),
             },
           ];
         }),
       ),
-    [order, byKey, approvals, builds],
+    [order, byKey, approvals, builds, runOf],
   );
 
   /* ---------- dragging a card ---------- */
@@ -359,6 +367,7 @@ export function ProjectCanvas({
         selected={selected === service.key}
         app={service.app}
         builds={builds[service.app.id]}
+        run={runOf(service.app.id)}
         nodeIds={vms.filter((vm) => vm.app_id === service.app.id).map((vm) => vm.node_id)}
         nodeNames={nodeNames}
       />

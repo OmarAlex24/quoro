@@ -20,20 +20,22 @@ import { getListAppDeploymentsQueryKey } from '../api/generated/deployments/depl
 import type { App, AppDetail, Deployment } from '../api/generated/model';
 import { useListNodes } from '../api/generated/nodes/nodes';
 import { useGetAppVulnerabilities } from '../api/generated/vulnerabilities/vulnerabilities';
-import { appsPollingInterval, relativeTime, serviceLampState } from '../lib/app-status';
+import { relativeTime, serviceLampState } from '../lib/app-status';
 import { canOpenTerminal } from '../lib/capabilities';
+import type { RunPhase } from '../lib/deploy-tape';
 import { problemView, type ProblemView } from '../lib/problem';
 import { PROJECT_TABS, type ProjectTab } from '../lib/routes';
 import { appAddress, appKind, keepInView } from '../lib/services';
 import { securityParams, securityTabCount } from '../lib/vulnerabilities';
-import { cachedBuildLive, useRecentBuilds } from '../lib/use-builds';
+import { appReadInterval, RUN_PAGE, useAppRuns } from '../lib/use-app-runs';
+import { useRecentBuilds } from '../lib/use-builds';
 import { useSession } from '../session';
 import { AppEnvDialog } from './app-env-dialog';
 import { GlyphTile } from './glyph-tile';
 import { LampDot } from './lamp';
 import { LogTape } from './log-tape';
 import { MenuPanel, useMenu } from './shell/menu';
-import { DeploymentsTab, RUN_PAGE } from './sheet-deployments';
+import { DeploymentsTab } from './sheet-deployments';
 import { MetricsTab } from './sheet-metrics';
 import { SecurityTab } from './sheet-security';
 import { SettingsTab } from './sheet-settings';
@@ -90,19 +92,16 @@ export function ServiceSheet({
 }) {
   const contentRef = useRef<HTMLDivElement>(null);
   const queryClient = useQueryClient();
-  // The canvas draws this app's card from this same read, with the same
-  // refresh rule as the list: every 2 s while it deploys or builds.
+  // The canvas draws this app's card from this same read: every 2 s while it
+  // deploys, builds or its newest run moves.
   const appQuery = useGetApp(appId, {
-    query: {
-      retry: false,
-      refetchInterval: (query) =>
-        appsPollingInterval(
-          query.state.data ? [query.state.data] : [],
-          query.state.data?.source != null && cachedBuildLive(queryClient, appId),
-        ),
-    },
+    query: { retry: false, refetchInterval: (query) => appReadInterval(queryClient, query.state.data) },
   });
   const app = appQuery.data;
+  // The header reads the newest run from the Deployments tab's own two lists,
+  // on every tab. Reading them here also renders the sheet again when they
+  // change, so the app read's interval follows the run, not only its own read.
+  const runs = useAppRuns(app);
 
   return (
     <DialogPrimitive.Root open modal={false} onOpenChange={(open) => (open ? undefined : onClose())}>
@@ -127,7 +126,14 @@ export function ServiceSheet({
         }}
       >
         {app ? (
-          <SheetBody key={app.id} app={app} projectId={projectId} tab={tab} buildId={buildId} />
+          <SheetBody
+            key={app.id}
+            app={app}
+            runPhase={runs.phase}
+            projectId={projectId}
+            tab={tab}
+            buildId={buildId}
+          />
         ) : (
           <>
             <div className="sh-head">
@@ -164,11 +170,14 @@ export function CloseButton() {
 
 function SheetBody({
   app,
+  runPhase,
   projectId,
   tab,
   buildId,
 }: {
   app: AppDetail;
+  /** What the newest run in the Deployments tab's lists is doing (`useAppRuns`). */
+  runPhase: RunPhase | null | undefined;
   projectId: string;
   tab: ProjectTab;
   buildId?: string;
@@ -215,9 +224,10 @@ function SheetBody({
     action.mutate(kind);
   };
 
-  // The card reads the same two things the same way (`serviceLampState`).
+  // The card of the open app reads the same things the same way
+  // (`serviceLampState`); while a run moves, both say what the tab's tag says.
   const builds = useRecentBuilds([app]);
-  const lamp = serviceLampState(app.status, builds[app.id]);
+  const lamp = serviceLampState(app.status, builds[app.id], runPhase);
   const terminal = canWrite && canOpenTerminal(me);
   // The open findings on the Security tab: the same request the tab makes
   // with no filter, so opening the tab reads it from the cache.

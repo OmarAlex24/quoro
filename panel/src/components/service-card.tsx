@@ -6,6 +6,7 @@ import { useListAppBackups } from '../api/generated/backups/backups';
 import { useListAppDomains } from '../api/generated/domains/domains';
 import { useListAppVolumes } from '../api/generated/volumes/volumes';
 import { serviceLampState } from '../lib/app-status';
+import type { RunPhase } from '../lib/deploy-tape';
 import { lampState } from '../lib/lamp';
 import {
   appAddress,
@@ -107,6 +108,7 @@ function CardFace({
 export function AppCard({
   app,
   builds,
+  run,
   nodeIds,
   nodeNames,
   selected = false,
@@ -114,14 +116,16 @@ export function AppCard({
   app: App;
   /** Recent builds, newest first; only for an app with a Git source. */
   builds?: readonly Build[];
+  /** For the app open in the sheet: what its newest run is doing (`useAppRuns`). */
+  run?: RunPhase | null;
   /** Nodes the app's instances run on. */
   nodeIds: readonly string[];
   nodeNames: Readonly<Record<string, string>>;
   /** Open in the service sheet. */
   selected?: boolean;
 }) {
-  // The sheet's header reads the same two things the same way.
-  const lamp = serviceLampState(app.status, builds);
+  // The sheet's header reads the same things the same way.
+  const lamp = serviceLampState(app.status, builds, run);
   const domains = useListAppDomains(app.id, undefined, {
     query: { staleTime: 10_000, retry: false },
   });

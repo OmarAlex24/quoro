@@ -2,14 +2,13 @@
 import { useMutation, useQueries } from '@tanstack/react-query';
 import { Link, useNavigate } from '@tanstack/react-router';
 import { ChevronDown, ChevronLeft, ChevronRight, GitBranch, Box, Server } from 'lucide-react';
-import { useMemo, useState, type ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 import type { AppDetail, Build, Deployment, DeploymentLogEntry } from '../api/generated/model';
-import { cancelBuild, startBuild, useGetBuild, useListAppBuilds } from '../api/generated/builds/builds';
+import { cancelBuild, startBuild, useGetBuild } from '../api/generated/builds/builds';
 import {
   createDeployment,
   getGetDeploymentLogsQueryOptions,
   useGetDeploymentLogs,
-  useListAppDeployments,
 } from '../api/generated/deployments/deployments';
 import { isApiProblem } from '../api/fetcher';
 import { DEPLOY_PHASE_LABELS, relativeTime } from '../lib/app-status';
@@ -21,7 +20,6 @@ import {
   formatClock,
   formatSpan,
   isRunLive,
-  joinRuns,
   miniTape,
   miniTapeScale,
   nodeLineSpans,
@@ -35,6 +33,7 @@ import {
 } from '../lib/deploy-tape';
 import { formatLogTime } from '../lib/log-buffer';
 import { problemView, type ProblemView } from '../lib/problem';
+import { useAppRuns } from '../lib/use-app-runs';
 import { useBuildLines } from '../lib/use-build-lines';
 import { useNow } from '../lib/use-now';
 import { cn } from '../lib/utils';
@@ -48,8 +47,6 @@ import { Input } from './ui/input';
 import { ProblemBanner } from './ui/problem-banner';
 import { Tag } from './ui/tag';
 
-/** One page of builds and deployments: the newest run and its history. */
-export const RUN_PAGE = { limit: 20 } as const;
 /** History rows read their progress lines; older ones keep to the list. */
 const HISTORY_ROWS = 10;
 
@@ -164,30 +161,8 @@ function RunsView({
   redeploying: boolean;
 }) {
   const source = app.source ?? null;
-  const buildsQuery = useListAppBuilds(app.id, RUN_PAGE, {
-    query: {
-      enabled: source !== null,
-      refetchInterval: (query) => {
-        const newest = query.state.data?.items[0];
-        return newest !== undefined && !isBuildTerminal(newest.status) ? 2_000 : 10_000;
-      },
-    },
-  });
-  const builds = useMemo(
-    () => (source !== null ? (buildsQuery.data?.items ?? []) : []),
-    [source, buildsQuery.data],
-  );
-  // Every 2 s while the newest run moves, the build's included: when the
-  // build ends, the deployment it starts is read without waiting 10 s.
-  const deploymentsQuery = useListAppDeployments(app.id, RUN_PAGE, {
-    query: {
-      refetchInterval: (query) =>
-        isRunLive(joinRuns(builds, query.state.data?.items)[0]) ? 2_000 : 10_000,
-    },
-  });
-
-  const deployments = deploymentsQuery.data?.items;
-  const runs = useMemo(() => joinRuns(builds, deployments), [builds, deployments]);
+  // The sheet's header reads the same two lists with the same rules.
+  const { runs, error: listError, loading } = useAppRuns(app);
   const top = runs[0];
   const history = runs.slice(1, 1 + HISTORY_ROWS);
   const live = isRunLive(top);
@@ -220,9 +195,6 @@ function RunsView({
   // Which row is Active comes from the same two lists the rows are drawn
   // from, never from the app read, which lands at another moment.
   const activeId = activeDeploymentId(topTimeline ? [topTimeline, ...historyTimelines] : historyTimelines);
-
-  const listError = deploymentsQuery.error ?? (source !== null ? buildsQuery.error : null);
-  const loading = deploymentsQuery.isPending || (source !== null && buildsQuery.isPending);
 
   return (
     <>
