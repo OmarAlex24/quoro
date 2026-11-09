@@ -32,7 +32,7 @@ use crate::store::{KeptSnapshotRecord, NodeStore};
 use crate::warm::frame::{Decoder, Frame, RefuseReason, Sequence, StreamHeader};
 use crate::warm::frame::{Manifest, encode};
 use crate::warm::receiver::{ReceiverOptions, WarmReceiver};
-use crate::warm::{StatusBoard, VolumeLocks, hash_copy};
+use crate::warm::{CopyAsBase, StatusBoard, VolumeLocks, hash_copy, keep_copy_as_base};
 
 const VOL: &str = "vol_01JD0WARM0000000000000002";
 const APP: &str = "app_01JD0WARM0000000000000002";
@@ -590,6 +590,85 @@ async fn cycles_ship_a_full_copy_then_only_what_changed() {
         bytes[2] < 64 << 10,
         "an empty increment is small: {bytes:?}"
     );
+}
+
+/// Section 6.13, "Failover": a warm node that a failover makes the source
+/// keeps its complete copy as its base and numbers its own snapshots after
+/// it, so its first stream ships snapshot 4 from base 3. A target that does
+/// not hold copy 3 answers `base_mismatch`, and the next cycle ships a full
+/// copy of the same data.
+#[tokio::test]
+async fn a_warm_node_made_the_source_numbers_its_snapshots_after_its_copy() {
+    let warm_node = Target::new("made-source").await;
+    let source = Source::new("made-source", warm_node.addr.port(), lease_view(TOKEN)).await;
+    write_first(&source);
+    for seq in 1..=3 {
+        assert_eq!(source.cycle().await, CycleOutcome::Complete(seq));
+    }
+    assert_eq!(warm_node.complete_seq().await, Some(3));
+    let copy_root = root_of(&warm_node.copy);
+    warm_node.server.abort();
+
+    // The desired state makes it the source, under the new token. Its sender
+    // takes nothing before the copy is kept as the base.
+    warm_node
+        .engine
+        .set_changed_ranges_mode(FakeRanges::Content);
+    let new_target = Target::new("made-source-next").await;
+    let proxy = Proxy::new(new_target.addr).await;
+    let token = TOKEN + 1;
+    let (_desired, desired_rx) = watch::channel(Some(snapshot(
+        1,
+        vec![warm_entry(WarmRole::Source, proxy.addr.port(), token)],
+    )));
+    let (board, _statuses) = StatusBoard::new();
+    let sender = WarmSender::new(
+        Arc::clone(&warm_node.engine),
+        warm_node.store.clone(),
+        desired_rx,
+        lease_view(token),
+        warm_node.locks.clone(),
+        board,
+        source_options(),
+    );
+    assert!(matches!(
+        sender.cycle_once(VOL).await,
+        CycleOutcome::Skipped(_)
+    ));
+    assert!(
+        warm_node.engine.volume_snapshots().is_empty(),
+        "no snapshot"
+    );
+    assert!(proxy.headers().is_empty(), "no stream");
+
+    // The reconciler keeps the copy as the base; then the sender ships,
+    // comparing with that base as any source does.
+    assert_eq!(
+        keep_copy_as_base(&*warm_node.engine, &warm_node.store, VOL).await,
+        CopyAsBase::Kept
+    );
+    assert!(
+        warm_node
+            .store
+            .warm_target(VOL)
+            .await
+            .expect("store")
+            .is_none()
+    );
+    assert_eq!(
+        sender.cycle_once(VOL).await,
+        CycleOutcome::Refused(RefuseReason::BaseMismatch, None)
+    );
+    let first = proxy.headers()[0].clone();
+    assert_eq!(first.snapshot_seq, 4, "numbered after the copy");
+    assert_eq!(first.base_seq, Some(3), "from the copy it started from");
+    assert_eq!(first.fencing_token, token);
+
+    // The new target holds no copy, so the numbers start over (section
+    // 6.13, "Snapshots and sequence numbers").
+    assert_eq!(sender.cycle_once(VOL).await, CycleOutcome::Complete(1));
+    assert_eq!(proxy.headers()[1].base_seq, None, "a full copy");
+    assert_eq!(root_of(&new_target.copy), copy_root, "the same data");
 }
 
 #[tokio::test]

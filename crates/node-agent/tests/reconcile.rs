@@ -23,7 +23,7 @@ use quoro_ingress::cloudflared::CloudflaredConfig;
 use quoro_node_agent::edge::EdgeManager;
 use quoro_node_agent::ingress::{CertificateEvents, DnsBridge, IngressConfig, IngressSupervisor};
 use quoro_node_agent::reconcile::{ReconcileOptions, Reconciler, Snapshot};
-use quoro_node_agent::store::{NodeStore, VolumeRecord};
+use quoro_node_agent::store::{NodeStore, PendingCommit, VolumeRecord, WarmTargetRecord};
 use quoro_node_agent::warm::VolumeLocks;
 use quoro_node_agent::{EXPIRING_START_WITHIN, LeaseTable, LeaseView, START_WITHIN};
 use quoro_proto::wire::VolumeStatus;
@@ -1082,7 +1082,15 @@ async fn a_warm_copy_turning_into_the_source_waits_for_its_stream() {
     let locks = VolumeLocks::new();
     let (reconciler, _observed) = reconciler(engine.clone(), store.clone());
     let mut reconciler = reconciler.with_warm_locks(locks.clone());
-    store.add_warm_target("vol_warm", "app_1", 1).await.unwrap();
+    engine
+        .inner()
+        .ensure_volume(&VolumeId("vol_warm".to_owned()), 1)
+        .await
+        .expect("the copy");
+    store
+        .save_warm_target(&complete_copy("vol_warm", "app_1", 3))
+        .await
+        .unwrap();
 
     let mut source = spec_volume("vol_warm", "app_1", 1, SpecVolumeState::Present);
     source.warm = Some(SpecWarm {
@@ -1098,18 +1106,341 @@ async fn a_warm_copy_turning_into_the_source_waits_for_its_stream() {
     let stream = locks.try_lock("vol_warm").expect("free");
     reconciler.reconcile_once(Some(&snap)).await;
     assert!(
-        engine.inner().volumes().is_empty(),
+        store.volume("vol_warm").await.unwrap().is_none(),
         "not while a stream runs"
     );
+    assert!(engine.inner().volume_snapshots().is_empty());
     assert_eq!(store.applied_rev().await.unwrap(), 0, "not applied yet");
     drop(stream);
     reconciler.reconcile_once(Some(&snap)).await;
     assert_eq!(
-        engine.inner().volumes().len(),
-        1,
+        store.volume("vol_warm").await.unwrap().map(|row| row.state),
+        Some(VolumeState::Ready),
         "adopted after the stream"
     );
+    assert_eq!(engine.inner().volume_snapshots().len(), 1, "with its base");
     assert_eq!(store.applied_rev().await.unwrap(), 1);
+}
+
+/// A complete warm copy of `snapshot_seq` `seq`, as the warm receiver
+/// records it once a stream swapped it in (section 6.13).
+fn complete_copy(volume_id: &str, app_id: &str, seq: u64) -> WarmTargetRecord {
+    WarmTargetRecord {
+        volume_id: volume_id.to_owned(),
+        app_id: app_id.to_owned(),
+        size_gb: 1,
+        complete_seq: Some(seq),
+        taken_at: Some("2026-11-09T10:00:00Z".to_owned()),
+        completed_at: Some("2026-11-09T10:00:02Z".to_owned()),
+        allocated_bytes: Some(4096),
+        cells: Some(vec![7_u8; 64]),
+        highest_token: 4,
+        ..WarmTargetRecord::default()
+    }
+}
+
+/// The warm node's `spec.volumes` entry of `vol_w` once a failover made it
+/// the source, with the new token.
+fn warm_source_volume(token: u64) -> quoro_proto::wire::SpecVolumeFile {
+    let mut entry = warm_target_volume(token);
+    if let Some(warm) = entry.warm.as_mut() {
+        warm.role = WarmRole::Source;
+    }
+    entry
+}
+
+/// What a failover sends the warm node (section 6.13, "Failover"): `vol_w`
+/// as its own volume with this node as the source, and the app's VM no
+/// longer `standby`, `running` with the new token.
+fn failover_snapshot(rev: u64, token: u64) -> Snapshot {
+    snapshot_full(
+        rev,
+        vec![stateful_vm(
+            "vm_w",
+            "lse_w",
+            token,
+            vec![volume_attach("vol_w", "/data")],
+        )],
+        Vec::new(),
+        vec![warm_source_volume(token)],
+    )
+}
+
+/// A warm node with a complete copy of `vol_w` at `snapshot_seq` 3, its
+/// file holding `marker` at offset 0, holding the lease with token 5.
+async fn warm_node_with_a_copy(
+    tag: &str,
+    marker: &[u8],
+) -> (
+    TargetDir,
+    Arc<RecordingEngine>,
+    NodeStore,
+    Reconciler<RecordingEngine>,
+) {
+    use std::os::unix::fs::FileExt as _;
+    let dir = TargetDir::new(tag);
+    let engine = Arc::new(RecordingEngine::new());
+    engine.inner().set_volume_dir(dir.path());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let (reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let reconciler = reconciler
+        .with_warm_locks(VolumeLocks::new())
+        .with_lease_view(LeaseView::new(
+            local_lease_table("lse_w", "app_w", 5),
+            false,
+        ));
+    engine
+        .inner()
+        .ensure_volume(&VolumeId("vol_w".to_owned()), 1)
+        .await
+        .expect("the copy");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("vol_w"))
+        .and_then(|file| file.write_all_at(marker, 0))
+        .expect("the copy's data");
+    store
+        .save_warm_target(&complete_copy("vol_w", "app_w", 3))
+        .await
+        .unwrap();
+    (dir, engine, store, reconciler)
+}
+
+fn first_bytes(path: &std::path::Path, len: usize) -> Vec<u8> {
+    use std::os::unix::fs::FileExt as _;
+    let mut bytes = vec![0_u8; len];
+    std::fs::File::open(path)
+        .and_then(|file| file.read_exact_at(&mut bytes, 0))
+        .expect("read");
+    bytes
+}
+
+/// Section 6.13, "Failover": before it creates the VM, the warm node keeps
+/// its complete copy as its base, a snapshot numbered with the copy's
+/// `snapshot_seq`; then it starts the VM on the copy itself.
+#[tokio::test]
+async fn a_warm_node_made_the_source_keeps_its_copy_as_the_base_before_the_vm_starts() {
+    let marker = b"the last shipped data";
+    let (dir, engine, store, mut reconciler) = warm_node_with_a_copy("failover-base", marker).await;
+    let snap = failover_snapshot(1, 5);
+
+    // The base cannot be taken: nothing starts, and the copy stays the warm
+    // receiver's.
+    engine.inner().fail_next(
+        FakeOp::SnapshotVolume,
+        EngineError::Io("no space for the snapshot".to_owned()),
+    );
+    reconciler.reconcile_once(Some(&snap)).await;
+    assert!(engine.created().is_empty(), "no VM before the base");
+    let volumes = reconciler.volume_statuses().borrow().clone();
+    let status = volume_in(&volumes, "vol_w").expect("a status");
+    assert_eq!(status.state, VolumeState::Failed);
+    assert!(
+        status
+            .error
+            .unwrap_or_default()
+            .contains("no space for the snapshot"),
+        "the reason is reported"
+    );
+    assert!(store.volume("vol_w").await.unwrap().is_none());
+    assert!(store.warm_target("vol_w").await.unwrap().is_some());
+    assert!(store.kept_snapshots().await.unwrap().is_empty());
+    assert_eq!(store.applied_rev().await.unwrap(), 0);
+
+    reconciler.reconcile_once(Some(&snap)).await;
+    let kept = store.kept_snapshots().await.unwrap();
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(kept[0].purpose, "warm_base");
+    assert_eq!(
+        kept[0].seq,
+        Some(3),
+        "numbered with the copy's snapshot_seq"
+    );
+    assert_eq!(kept[0].cells, Some(vec![7_u8; 64]), "with the copy's cells");
+    assert_eq!(kept[0].app_id, "app_w");
+    assert_eq!(
+        first_bytes(&kept[0].snapshot.location, marker.len()),
+        marker,
+        "the base holds the copy"
+    );
+    assert_eq!(
+        first_bytes(&dir.path().join("vol_w"), marker.len()),
+        marker,
+        "the volume is the copy, not a new file"
+    );
+    assert!(
+        store.warm_target("vol_w").await.unwrap().is_none(),
+        "the copy is the node's own volume now"
+    );
+    assert_eq!(
+        store.volume("vol_w").await.unwrap().map(|row| row.state),
+        Some(VolumeState::Ready)
+    );
+    let created = engine.created();
+    assert_eq!(created.len(), 1);
+    assert_eq!(created[0].volumes[0].volume_id.0, "vol_w");
+    assert_eq!(engine.starts().len(), 1, "started under the new token");
+    assert_eq!(store.applied_rev().await.unwrap(), 1);
+
+    // Later passes keep it as it is.
+    reconciler.reconcile_once(Some(&snap)).await;
+    assert_eq!(engine.inner().volume_snapshots().len(), 1);
+    assert_eq!(store.kept_snapshots().await.unwrap().len(), 1);
+}
+
+/// A crash after the base was recorded and before the copy's row went: the
+/// next pass does not take the base again.
+#[tokio::test]
+async fn a_base_already_kept_is_not_taken_again() {
+    let (_dir, engine, store, mut reconciler) =
+        warm_node_with_a_copy("failover-base-again", b"data").await;
+    let base = engine
+        .inner()
+        .snapshot_volume(&VolumeId("vol_w".to_owned()))
+        .await
+        .expect("a snapshot");
+    quoro_node_agent::kept::keep(
+        &store,
+        "app_w",
+        &base,
+        quoro_node_agent::kept::KeepPurpose::WarmBase,
+        Some(3),
+        Some(vec![7_u8; 64]),
+    )
+    .await
+    .unwrap();
+
+    reconciler
+        .reconcile_once(Some(&failover_snapshot(1, 5)))
+        .await;
+    assert_eq!(engine.inner().volume_snapshots().len(), 1, "no second base");
+    assert_eq!(store.kept_snapshots().await.unwrap().len(), 1);
+    assert!(store.warm_target("vol_w").await.unwrap().is_none());
+    assert_eq!(engine.created().len(), 1);
+    assert_eq!(store.applied_rev().await.unwrap(), 1);
+}
+
+/// A copy a crash or a failed swap left pending is resolved first (section
+/// 6.13, "Applying"): until then the node keeps no base and starts nothing.
+/// Once it is resolved, the node keeps it as its base and starts on it.
+#[tokio::test]
+async fn a_pending_copy_holds_the_start_back_until_it_is_resolved() {
+    let (_dir, engine, store, mut reconciler) =
+        warm_node_with_a_copy("failover-pending", b"data").await;
+    let mut record = store.warm_target("vol_w").await.unwrap().expect("the copy");
+    record.pending = Some(PendingCommit {
+        seq: 4,
+        taken_at: "2026-11-09T10:00:30Z".to_owned(),
+        root: "0".repeat(64),
+        cells: vec![8_u8; 64],
+    });
+    store.save_warm_target(&record).await.unwrap();
+
+    reconciler
+        .reconcile_once(Some(&failover_snapshot(1, 5)))
+        .await;
+    assert!(engine.inner().volume_snapshots().is_empty());
+    assert!(engine.created().is_empty());
+    assert!(store.volume("vol_w").await.unwrap().is_none());
+    assert_eq!(store.applied_rev().await.unwrap(), 0);
+
+    // The warm receiver resolved it: the complete copy is unchanged.
+    record.pending = None;
+    store.save_warm_target(&record).await.unwrap();
+    reconciler
+        .reconcile_once(Some(&failover_snapshot(1, 5)))
+        .await;
+    let kept = store.kept_snapshots().await.unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].seq, Some(3));
+    assert_eq!(engine.created().len(), 1);
+    assert_eq!(store.applied_rev().await.unwrap(), 1);
+}
+
+/// A base the node kept as an earlier source can carry the copy's number
+/// for other data: it does not stand in for the copy's base.
+#[tokio::test]
+async fn a_base_of_the_same_number_for_other_data_is_not_the_copys() {
+    let (_dir, engine, store, mut reconciler) =
+        warm_node_with_a_copy("failover-other-base", b"data").await;
+    let earlier = engine
+        .inner()
+        .snapshot_volume(&VolumeId("vol_w".to_owned()))
+        .await
+        .expect("a snapshot");
+    quoro_node_agent::kept::keep(
+        &store,
+        "app_w",
+        &earlier,
+        quoro_node_agent::kept::KeepPurpose::WarmBase,
+        Some(3),
+        Some(vec![1_u8; 64]),
+    )
+    .await
+    .unwrap();
+
+    reconciler
+        .reconcile_once(Some(&failover_snapshot(1, 5)))
+        .await;
+    assert_eq!(
+        engine.inner().volume_snapshots().len(),
+        2,
+        "a base of its own"
+    );
+    let kept = store.kept_snapshots().await.unwrap();
+    assert!(
+        kept.iter()
+            .any(|kept| kept.seq == Some(3) && kept.cells == Some(vec![7_u8; 64])),
+        "{kept:?}"
+    );
+    assert_eq!(engine.created().len(), 1);
+}
+
+/// A warm node with no complete copy has nothing to start the app on: it
+/// creates no empty volume and no VM, and reports the volume `failed`.
+#[tokio::test]
+async fn a_warm_node_without_a_complete_copy_starts_nothing() {
+    let dir = TargetDir::new("failover-no-copy");
+    let engine = Arc::new(RecordingEngine::new());
+    engine.inner().set_volume_dir(dir.path());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let (reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let mut reconciler = reconciler.with_lease_view(LeaseView::new(
+        local_lease_table("lse_w", "app_w", 5),
+        false,
+    ));
+    store.add_warm_target("vol_w", "app_w", 1).await.unwrap();
+
+    reconciler
+        .reconcile_once(Some(&failover_snapshot(1, 5)))
+        .await;
+    assert!(engine.inner().volumes().is_empty(), "no empty volume");
+    assert!(engine.created().is_empty(), "no VM");
+    assert!(store.volume("vol_w").await.unwrap().is_none(), "no row");
+    let volumes = reconciler.volume_statuses().borrow().clone();
+    let status = volume_in(&volumes, "vol_w").expect("a status");
+    assert_eq!(status.state, VolumeState::Failed);
+    assert!(
+        status
+            .error
+            .unwrap_or_default()
+            .contains("no complete warm copy"),
+        "the reason is reported"
+    );
+    assert_eq!(store.applied_rev().await.unwrap(), 0);
+
+    // The same once the receiver removed the copy.
+    store.mark_warm_removed("vol_w").await.unwrap();
+    reconciler
+        .reconcile_once(Some(&failover_snapshot(1, 5)))
+        .await;
+    assert!(engine.inner().volumes().is_empty());
+    assert!(engine.created().is_empty());
+    let volumes = reconciler.volume_statuses().borrow().clone();
+    assert_eq!(
+        volume_in(&volumes, "vol_w").map(|status| status.state),
+        Some(VolumeState::Failed)
+    );
 }
 
 #[tokio::test]

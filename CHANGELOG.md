@@ -6,6 +6,10 @@ Each entry links the pull request that made the change and, where one exists, th
 
 ## [Unreleased]
 
+### Added
+
+- **The warm node keeps its copy as its base when a failover makes it the source.** When the desired state makes a node the source of a volume it holds the warm copy of, its node agent now keeps that complete copy as its base before the volume is ready, and so before the VM starts on it: a snapshot numbered with the copy's `snapshot_seq` and carrying its cell hashes, the common base a returning source resyncs from. The copy's file becomes the node's volume and its warm-target record goes. The sender takes no snapshot until the base is kept, then numbers its snapshots after the copy, and its first stream names the copy as its base instead of shipping a full copy. A copy a crash or a failed swap left pending is resolved first, by the warm receiver's pass, since no stream comes for it any more. A warm node with no complete copy creates neither the volume nor the VM and reports the volume `failed` with the reason, where it would have started the app on an empty volume. The primary's side of the failover is not part of this change ([#696], [#694], [ADR 0175]).
+
 ## [v0.3.0] - 2026-11-09
 
 The panel redesign: a sidebar, projects as tiles, a canvas per project with its apps and VMs as cards, a side sheet with an app's tabs, and designed dark and light themes ([ADR 0249]). Its milestone, Panel — Railway-style redesign, is complete: its demo ran on a lab cluster on 2026-11-09 and the maintainer approved it. The lines between apps on the canvas, for environment variable references ([#502]) and for observed traffic between apps ([#503]), moved to the milestone Panel — Connections between apps and wait for M5b. Still an experimental preview, not for production ([ADR 0137]).
@@ -578,6 +582,8 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [ADR 0179]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0179-change-log-follow-74-every-machine-with-role-node-follows.md
 [ADR 0227]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0227-change-log-follow-sends-one-log-entries-batch-at-a-time-and.md
 [ADR 0261]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0261-every-node-holds-a-lease-row-s-local-write-before-an.md
+[#696]: https://github.com/OmarAlex24/quoro/pull/696
+[#694]: https://github.com/OmarAlex24/quoro/issues/694
 [ADR 0266]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0266-where-the-primary-takes-a-voter-s-mesh-endpoint-from-node.md
 [ADR 0286]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0286-an-app-s-change-log-payload-carries-warm-node-id-warm-node.md
 [ADR 0265]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0265-m5b-refuses-warm-for-an-app-built-from-a-git-source-with.md
@@ -684,6 +690,7 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [ADR 0178]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0178-n-1-indicator-get-api-v1-cluster-capacity-lost-node-id.md
 [ADR 0184]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0184-health-checks-restart-hung-apps-78-after-the-configured.md
 [ADR 0174]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0174-warm-copies-the-scheduler-picks-the-target-among-the-app-s.md
+[ADR 0175]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0175-manual-failover-of-a-warm-app-post-apps-app-id-failover.md
 [ADR 0186]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0186-add-287-old-node-recreates-a-moved-app-s-vm-and-240.md
 [ADR 0194]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0194-draining-until-is-an-rfc-3339-field-on-tunnel-routes-only.md
 [ADR 0210]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0210-snapshots-are-numbered-per-volume-and-the-source-keeps-its.md

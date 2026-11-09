@@ -1499,6 +1499,35 @@ async fn a_copy_left_pending_of_the_nodes_own_volume_is_not_hashed_at_start_up()
     assert!(h.row().await.pending.is_some(), "not hashed");
 }
 
+/// A failover made the node the source of a volume whose copy a crash left
+/// pending. No stream comes to resolve it any more, so a pass does, and the
+/// node can then keep the copy as its base (section 6.13, "Failover").
+#[tokio::test]
+async fn a_pass_resolves_a_pending_copy_of_a_volume_the_node_now_runs() {
+    let h = Harness::new("pending-made-source").await;
+    let first = ship_first(&h).await;
+    let mut newer = first.clone();
+    newer.write(2 * CELL, &[6_u8; 4096]);
+    write_file(&h, &newer);
+    leave_pending(&h, 2, &newer).await;
+    h.set_warm(|warm| warm.role = WarmRole::Source);
+
+    let mut listeners = BTreeMap::new();
+    h.receiver.pass(&mut listeners).await;
+    wait_for("the copy to be resolved", || async {
+        h.row().await.pending.is_none()
+    })
+    .await;
+    assert_eq!(h.row().await.complete_seq, Some(2), "the swap happened");
+    assert_eq!(
+        crate::warm::keep_copy_as_base(&*h.engine, &h.store, VOL).await,
+        crate::warm::CopyAsBase::Kept
+    );
+    let kept = h.store.kept_snapshots().await.expect("kept");
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].seq, Some(2));
+}
+
 #[tokio::test]
 async fn a_copy_that_cannot_be_resolved_stays_pending_and_says_why() {
     let h = Harness::new("pending-unresolved").await;
