@@ -9,6 +9,7 @@ use crate::auth::Identity;
 use crate::changelog::{self, Op};
 use crate::error::{ApiError, Target};
 use crate::request::{ApiJson, CallCtx, RequestId};
+use crate::session::NodeHub;
 use crate::store::now_rfc3339;
 use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
@@ -66,12 +67,15 @@ pub struct Node {
     /// Revision the node last reported as applied.
     #[schema(minimum = 0)]
     pub applied_rev: i64,
-    /// Last change-log seq the node has verified.
+    /// Last change-log seq the node has verified. From M5b the newest
+    /// acknowledgement the primary holds in memory (`node-agent-protocol.md`
+    /// section 7.1).
     #[schema(minimum = 0)]
     pub log_seq: i64,
-    /// Change-log entries the node is behind, or null for a machine that does
-    /// not follow; absent until the promotion and custody work ships
-    /// (`node-agent-protocol.md` section 7.1).
+    /// How many change-log entries the node is behind the primary: the
+    /// primary's newest seq minus `log_seq`. Null for a machine that does not
+    /// follow, one without the `node` role (`node-agent-protocol.md` section
+    /// 7.1, ADR 0227, ADR 0301).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<i64>, minimum = 0, required = false)]
     pub log_lag: Option<Option<i64>>,
@@ -344,6 +348,7 @@ pub(crate) fn node_from_row(row: &SqliteRow) -> Result<Node, ApiError> {
         agent_version: row.try_get("agent_version")?,
         desired_rev: row.try_get("desired_rev")?,
         applied_rev: row.try_get("applied_rev")?,
+        // Both filled by `attach_log_position` (section 7.1, "Lag").
         log_seq: row.try_get("log_seq")?,
         log_lag: None,
         custody: None,
@@ -354,6 +359,46 @@ pub(crate) fn node_from_row(row: &SqliteRow) -> Result<Node, ApiError> {
         lost_at: row.try_get("lost_at")?,
         created_at: row.try_get("created_at")?,
     })
+}
+
+/// Fills `log_seq` and `log_lag` of nodes built by [`node_from_row`]
+/// (`node-agent-protocol.md` section 7.1, "Lag", ADR 0227, ADR 0301):
+///
+/// - `log_seq` is the newest acknowledgement the primary holds in memory for
+///   a node that follows on a live session ([`NodeHub::log_seq`]), and
+///   otherwise stays the row's `nodes.log_seq`, which a session's end wrote.
+/// - `log_lag` is the change log's newest `seq` minus `log_seq`, never below
+///   0, for a machine with the `node` role, and null for any other machine.
+///   It is never absent.
+///
+/// The newest `seq` is read once, through `executor`, after the positions in
+/// memory, so it is at least every acknowledgement read.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn attach_log_position<'e, E>(
+    executor: E,
+    hub: &NodeHub,
+    nodes: &mut [Node],
+) -> Result<(), ApiError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    for node in nodes.iter_mut() {
+        if let Some(seq) = hub.log_seq(&node.id) {
+            node.log_seq = i64::try_from(seq).unwrap_or(i64::MAX);
+        }
+    }
+    let head: Option<i64> = sqlx::query_scalar("SELECT MAX(seq) FROM change_log")
+        .fetch_one(executor)
+        .await?;
+    let head = head.unwrap_or(0);
+    for node in nodes {
+        let follows = node.roles.contains(&NodeRole::Node);
+        node.log_lag = Some(follows.then(|| head.saturating_sub(node.log_seq).max(0)));
+    }
+    Ok(())
 }
 
 /// The node's tunnel mapping, without the run token (`NodeTunnel`).
@@ -737,7 +782,9 @@ async fn fence_ack_tx(
     .bind(node_id)
     .fetch_one(&mut *w.tx)
     .await?;
-    let tunnel = tunnel_of(&mut *w.tx, node_id).await?;
+    let mut node = node_from_row(&row)?;
+    node.tunnel = tunnel_of(&mut *w.tx, node_id).await?;
+    attach_log_position(&mut *w.tx, &state.hub, std::slice::from_mut(&mut node)).await?;
     w.commit().await?;
     // The operator checked that the failed fence's VMs are stopped, and the
     // token moved as when declaring the node lost (section 8.5 step 3), so a
@@ -747,8 +794,6 @@ async fn fence_ack_tx(
             .hub
             .record_release(&lease.id, node_id, lease.fencing_token);
     }
-    let mut node = node_from_row(&row)?;
-    node.tunnel = tunnel;
     Ok(node)
 }
 
@@ -866,10 +911,10 @@ async fn set_tunnel_tx(
         Some(seq),
     )
     .await?;
-    let tunnel = tunnel_of(&mut *w.tx, node_id).await?;
-    w.commit().await?;
     let mut node = node_from_row(&node)?;
-    node.tunnel = tunnel;
+    node.tunnel = tunnel_of(&mut *w.tx, node_id).await?;
+    attach_log_position(&mut *w.tx, &state.hub, std::slice::from_mut(&mut node)).await?;
+    w.commit().await?;
     Ok(node)
 }
 

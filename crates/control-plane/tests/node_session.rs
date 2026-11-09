@@ -2312,3 +2312,158 @@ async fn a_session_superseded_before_its_check_leaves_the_stored_log_seq_in_memo
     drop(b);
     drop(a);
 }
+
+// ---------------------------------------------------------------------------
+// The lag in the API (section 7.1, "Lag", ADR 0227, ADR 0301)
+// ---------------------------------------------------------------------------
+
+/// `log_seq` and `log_lag` of `node_id` as `GET /api/v1/nodes/{node_id}`
+/// reports them, `None` for a null `log_lag`. Checks that `log_lag` is
+/// present, never absent, and that the node's item in `GET /api/v1/nodes`
+/// carries the same values.
+async fn log_position(
+    server: &Server,
+    owner: &reqwest::Client,
+    node_id: &str,
+) -> (u64, Option<u64>) {
+    let node = node_json(server, owner, node_id).await;
+    let res = owner
+        .get(server.url("/api/v1/nodes?limit=500"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let list: Value = res.json().await.unwrap();
+    let listed = list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == node_id)
+        .expect("the node is listed");
+    for body in [&node, listed] {
+        assert!(
+            body.as_object().unwrap().contains_key("log_lag"),
+            "log_lag is absent: {body}"
+        );
+    }
+    assert_eq!(listed["log_seq"], node["log_seq"], "{listed}");
+    assert_eq!(listed["log_lag"], node["log_lag"], "{listed}");
+    let log_seq = node["log_seq"].as_u64().expect("log_seq is a whole number");
+    let log_lag = if node["log_lag"].is_null() {
+        None
+    } else {
+        Some(node["log_lag"].as_u64().expect("log_lag is a whole number"))
+    };
+    (log_seq, log_lag)
+}
+
+#[tokio::test]
+async fn the_api_reports_a_following_nodes_newest_ack_and_its_lag() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+    append_entries(&server, "bulk", 600).await;
+
+    let (mut socket, frames) = follow_from(&server, &node, hello(&node.node_id)).await;
+    let (acked, hash) = check_entries(&frames.last().unwrap()["body"], &genesis());
+    assert_eq!(acked, 500);
+    ack(&mut socket, acked, &hash).await;
+    // The ack is handled once the pings after it are answered; the next
+    // message went out before their answers.
+    let settled = settle(&mut socket).await;
+    let next = of_type(&settled, "log_entries");
+    assert_eq!(next.len(), 1, "{settled:?}");
+
+    // Acknowledged up to 500: the API reads the acknowledgement in memory,
+    // not the row, which still holds the hello's 0.
+    assert_eq!(stored_log_seq(&server, &node.node_id).await, 0);
+    let head = log_head(&server).await;
+    assert!(head > 600, "{head}");
+    assert_eq!(
+        log_position(&server, &owner, &node.node_id).await,
+        (500, Some(head - 500))
+    );
+
+    // Caught up: no lag.
+    let (last, hash) = check_entries(&next[0]["body"], &hash);
+    ack(&mut socket, last, &hash).await;
+    let (last, hash) = catch_up(&mut socket, last, hash).await;
+    assert_eq!(last, log_head(&server).await);
+    assert_eq!(
+        log_position(&server, &owner, &node.node_id).await,
+        (last, Some(0))
+    );
+
+    // A new write puts the node one entry behind until it acknowledges it.
+    append_entries(&server, "lag", 1).await;
+    assert_eq!(log_head(&server).await, last + 1);
+    assert_eq!(
+        log_position(&server, &owner, &node.node_id).await,
+        (last, Some(1))
+    );
+    let message = recv_type(&mut socket, "log_entries").await;
+    assert_eq!(message["body"]["from_seq"], last + 1, "{message}");
+    let (seq, seq_hash) = check_entries(&message["body"], &hash);
+    assert_eq!(seq, last + 1);
+    ack(&mut socket, seq, &seq_hash).await;
+    settle(&mut socket).await;
+    assert_eq!(
+        log_position(&server, &owner, &node.node_id).await,
+        (seq, Some(0))
+    );
+}
+
+#[tokio::test]
+async fn a_machine_without_the_node_role_reads_a_null_log_lag() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let edge = enrolled_with_roles(&server, &owner, "edge-1", &["edge"]).await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+
+    // `log_position` checks that the null is present, not absent.
+    assert_eq!(
+        log_position(&server, &owner, &edge.node_id).await,
+        (0, None)
+    );
+    // A machine with the `node` role that never followed is behind by the
+    // whole log.
+    let head = log_head(&server).await;
+    assert!(head > 0);
+    assert_eq!(
+        log_position(&server, &owner, &node.node_id).await,
+        (0, Some(head))
+    );
+}
+
+#[tokio::test]
+async fn a_disconnected_node_reads_the_log_seq_its_session_end_wrote() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, NODE_NAME).await;
+
+    let acked = acked_then_ended(&server, &owner, &node).await;
+    // The end write is itself a change-log entry, so the node is behind.
+    let head = log_head(&server).await;
+    assert!(head > acked, "{head} {acked}");
+    assert_eq!(
+        log_position(&server, &owner, &node.node_id).await,
+        (acked, Some(head - acked))
+    );
+
+    // Once the session ended the API reads the row, not the primary's
+    // memory, which still holds `acked`.
+    set_stored_log_seq(&server, &node.node_id, acked - 1).await;
+    assert_eq!(log_head(&server).await, head);
+    assert_eq!(
+        log_position(&server, &owner, &node.node_id).await,
+        (acked - 1, Some(head - acked + 1))
+    );
+
+    // A row above the primary's newest seq, as a session's start writes from
+    // a `hello` before its check, reads as no lag, never below 0.
+    set_stored_log_seq(&server, &node.node_id, head + 5).await;
+    assert_eq!(
+        log_position(&server, &owner, &node.node_id).await,
+        (head + 5, Some(0))
+    );
+}

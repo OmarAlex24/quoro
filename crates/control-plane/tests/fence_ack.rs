@@ -595,6 +595,9 @@ async fn a_failed_fence_is_listed_and_a_human_acknowledgement_reaches_the_node()
     let body: Value = res.json().await.unwrap();
     assert!(body["fence_failure"].is_null(), "{body}");
     assert_eq!(body["id"], node_id);
+    // The returned node carries its change-log lag, as every node read does
+    // (node-agent-protocol.md section 7.1, ADR 0301).
+    assert!(body["log_lag"].is_u64(), "{body}");
     let (token, revoked_at, holder) = lease_row(&server, &lease_id).await;
     assert_eq!(token, 2);
     assert!(revoked_at.is_some());

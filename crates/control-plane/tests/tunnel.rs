@@ -742,6 +742,9 @@ async fn tunnel_mapping_reaches_the_node_and_never_leaks_the_token() {
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["tunnel"]["provider_id"], provider_id);
     assert_eq!(body["tunnel"]["origin_port"], 8080);
+    // The returned node carries its change-log lag, as every node read does
+    // (node-agent-protocol.md section 7.1, ADR 0301).
+    assert!(body["log_lag"].is_u64(), "{body}");
 
     let tunnel_id = wait_for(|| mock.tunnels().first().map(|tunnel| tunnel.id.clone())).await;
     let token = format!("tunnel-token-{tunnel_id}");

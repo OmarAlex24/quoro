@@ -116,6 +116,8 @@ export const db: MockDb = {
     desired_rev: 1,
     applied_rev: 1,
     log_seq: 1,
+    // Has the `node` role and holds the mock cluster's newest entry.
+    log_lag: 0,
     fence_failure: null,
     tunnel: null,
     last_seen_at: now(),
@@ -479,6 +481,8 @@ const seed = (): void => {
     desired_rev: 1,
     applied_rev: 1,
     log_seq: 1,
+    // Has the `node` role and holds the mock cluster's newest entry.
+    log_lag: 0,
     fence_failure: null,
     tunnel: null,
     last_seen_at: createdAt,
