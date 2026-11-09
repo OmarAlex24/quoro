@@ -1,22 +1,28 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Change-log follow, the primary's side (`node-agent-protocol.md` sections
-//! 5.6, 5.14 and 7.1; ADR 0179, ADR 0227).
+//! 5.6, 5.14 and 7.1; ADR 0179, ADR 0227, ADR 0261).
 //!
 //! Every machine with the `node` role follows the change log, the primary's
 //! own host included; edge-only and witness-only machines do not. Follow
 //! starts once the session's first `desired_state` has been sent (section 4.2
-//! rule 6). The primary first compares the `hello` position with its own log
-//! and sends `log_diverged` when they differ (section 7.1, "On `hello`"). It
-//! then sends `log_entries` from the node's position: at most 500 entries per
-//! message, within the 1 MiB message limit (section 3.2), each message with
-//! `head_seq`, and never more than one message unacknowledged. The next one
-//! goes out when the `log_ack` of the previous one arrives, or when the
-//! store's head watch ([`crate::store::Store::change_log_head`]) rises while
-//! nothing is outstanding.
+//! rule 6). The primary first checks the `hello` position against its own
+//! log and against the newest acknowledgement it holds for the node, and
+//! answers `log_diverged` when the position differs from its log, is above
+//! its newest `seq`, or is below that acknowledgement (section 7.1, "On
+//! `hello`"). It then sends `log_entries` from the node's position: at most
+//! 500 entries per message, within the 1 MiB message limit (section 3.2),
+//! each message with `head_seq`, and never more than one message
+//! unacknowledged. The next one goes out when the `log_ack` of the previous
+//! one arrives, or when the store's head watch
+//! ([`crate::store::Store::change_log_head`]) rises while nothing is
+//! outstanding.
 //!
-//! The node's newest acknowledged `seq` is kept in memory in the hub
-//! ([`super::NodeHub::log_seq`]); `nodes.log_seq` is written only with the
-//! writes a session's start and end already make (section 7.1, "Lag").
+//! The node's newest acknowledged `seq` is kept in memory in the hub: for
+//! its live session ([`super::NodeHub::log_seq`]), and per node across
+//! sessions ([`super::NodeHub::newest_log_ack`]). `nodes.log_seq` is written
+//! only with the writes a session's start and end already make, and with the
+//! 0 the primary writes when it answers `log_diverged` (section 7.1, "Lag",
+//! ADR 0261).
 //!
 //! Every frame goes through the session's queue, the channel its
 //! `desired_state` takes, so `log_diverged` and `log_entries` always follow
@@ -51,8 +57,15 @@ pub(super) enum Follow {
     /// on an entry the primary cannot send.
     Off,
     /// The `hello` position, until the session's first `desired_state` has
-    /// been sent.
-    Waiting { log_seq: u64, log_hash: String },
+    /// been sent, with `nodes.log_seq` as it stood before the session's
+    /// start write replaced it ([`super::connect_node`]): the stored half of
+    /// the check for a log that went back (section 7.1, "On `hello`", ADR
+    /// 0261).
+    Waiting {
+        log_seq: u64,
+        log_hash: String,
+        stored_log_seq: u64,
+    },
     /// Following from `position`, the newest acknowledged `seq` (or the
     /// seed), with at most one `log_entries` unacknowledged.
     Active {
@@ -184,19 +197,38 @@ impl Session {
 
     /// Starts follow once the session's first `desired_state` has been sent
     /// (section 4.2 rule 6, section 7.1). A machine without the `node` role
-    /// does not follow. A position that differs from the primary's log draws
-    /// `error` `log_diverged`, non-fatal, once and before any `log_entries`,
-    /// and the node then follows from `seq` 1; otherwise it follows from the
-    /// `hello` position. The hub's in-memory position is seeded with that
-    /// start. A failed read tries again after [`LOG_RETRY_DELAY`].
+    /// does not follow.
+    ///
+    /// The `hello` position draws `error` `log_diverged`, non-fatal, once and
+    /// before any `log_entries`, when it is below the newest acknowledgement
+    /// the primary holds for the node, in memory
+    /// ([`super::NodeHub::newest_log_ack`]) or in `nodes.log_seq` as it stood
+    /// before this session's start write (a log that went back, ADR 0261),
+    /// or when it differs from the primary's log or is above its newest
+    /// `seq` (section 7.1, "On `hello`", ADR 0227). The node then follows
+    /// from `seq` 1. In the same step the primary first commits
+    /// `nodes.log_seq = 0`, then sets its in-memory acknowledgement to 0, and
+    /// only then queues the error, so `log_diverged` never goes out without
+    /// the 0 written and the node's next `hello` does not read as a log that
+    /// went back (ADR 0261). A failed write sends nothing and tries again
+    /// after [`LOG_RETRY_DELAY`], as a failed read does.
+    ///
+    /// Otherwise the node follows from the `hello` position, which seeds the
+    /// hub's in-memory position and acknowledgement (section 8.4,
+    /// "Acknowledgements").
     pub(super) async fn start_follow(&mut self) {
         if self.follow_retry.is_some() {
             return;
         }
-        let Follow::Waiting { log_seq, log_hash } = &self.follow else {
+        let Follow::Waiting {
+            log_seq,
+            log_hash,
+            stored_log_seq,
+        } = &self.follow
+        else {
             return;
         };
-        let (log_seq, log_hash) = (*log_seq, log_hash.clone());
+        let (log_seq, log_hash, stored_log_seq) = (*log_seq, log_hash.clone(), *stored_log_seq);
         match has_role(&self.hub, &self.node_id, "node").await {
             Ok(true) => {}
             Ok(false) => {
@@ -209,25 +241,57 @@ impl Session {
                 return;
             }
         }
-        let diverged = match diverged(&self.hub.0.store, log_seq, &log_hash).await {
-            Ok(diverged) => diverged,
-            Err(e) => {
-                tracing::warn!(%e, node_id = %self.node_id, "cannot compare the node's change log with the primary's; trying again");
-                self.retry_follow_later();
-                return;
-            }
-        };
-        let position = if diverged {
+        let newest_ack = self.hub.newest_log_ack(&self.node_id).max(stored_log_seq);
+        let reason = if log_seq < newest_ack {
             tracing::warn!(
                 node_id = %self.node_id,
                 log_seq,
-                "the node's change log differs from the primary's; it follows again from seq 1"
+                newest_ack,
+                "the node's change log is below its newest acknowledgement, so it went back; it follows again from seq 1"
             );
+            Some(format!(
+                "the change log at seq {log_seq} is below seq {newest_ack}, the newest the primary holds as acknowledged; follow again from seq 1"
+            ))
+        } else {
+            match diverged(&self.hub.0.store, log_seq, &log_hash).await {
+                Ok(false) => None,
+                Ok(true) => {
+                    tracing::warn!(
+                        node_id = %self.node_id,
+                        log_seq,
+                        "the node's change log differs from the primary's; it follows again from seq 1"
+                    );
+                    Some(format!(
+                        "the change log at seq {log_seq} does not match the primary's; follow again from seq 1"
+                    ))
+                }
+                Err(e) => {
+                    tracing::warn!(%e, node_id = %self.node_id, "cannot compare the node's change log with the primary's; trying again");
+                    self.retry_follow_later();
+                    return;
+                }
+            }
+        };
+        let position = if let Some(message) = reason {
+            match super::reset_log_seq(&self.hub, &self.node_id, self.generation).await {
+                Ok(true) => {}
+                // A newer session of the node took over; it runs its own
+                // check.
+                Ok(false) => {
+                    self.follow = Follow::Off;
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(%e, node_id = %self.node_id, "cannot write nodes.log_seq = 0 before log_diverged; nothing is sent, trying again");
+                    self.retry_follow_later();
+                    return;
+                }
+            }
+            self.hub
+                .set_log_position(&self.node_id, self.generation, 0, false);
             let text = ControlMessage::Error(quoro_proto::ProtocolError {
                 code: quoro_proto::ErrorCode::LogDiverged,
-                message: format!(
-                    "the change log at seq {log_seq} does not match the primary's; follow again from seq 1"
-                ),
+                message,
                 fatal: false,
             })
             .to_frame(&new_msg_id(), None)
@@ -237,10 +301,10 @@ impl Session {
             }
             0
         } else {
+            self.hub
+                .set_log_position(&self.node_id, self.generation, log_seq, false);
             log_seq
         };
-        self.hub
-            .set_log_position(&self.node_id, self.generation, position, false);
         self.follow = Follow::Active {
             position,
             outstanding: None,
