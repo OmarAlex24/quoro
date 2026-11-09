@@ -50,7 +50,7 @@ use crate::lease::LeaseLink;
 use crate::logs::{LogFilter, StoredLogLine};
 use crate::metrics::{MetricsRing, Tick, parse_metrics_params, tick_report};
 use crate::reconcile::Snapshot;
-use crate::store::NodeStore;
+use crate::store::{NodeStore, Refollowing};
 use crate::tls::{self, Endpoint};
 use crate::{AgentError, FatalReason, NodeFacts, util};
 
@@ -688,12 +688,20 @@ impl Session {
         };
 
         // 1. `hello` is the first message on every session (section 4.2).
-        //    Without the change-log position it is not sent: a `log_seq` of 0
-        //    would skip the primary's divergence check (section 7.1).
+        //    Before it is built, the node finishes what a stopped agent left
+        //    of a quarantine or a refollowing (section 7.1, ADR 0285). It is
+        //    not sent when that fails, or without the change-log position or
+        //    the mark: a `log_seq` of 0 would skip the primary's divergence
+        //    check, and neither a copy that must first be moved aside nor a
+        //    position the mark does not cover may be reported (section 7.1).
+        if let Err(e) = follow::recover(&self.store).await {
+            warn!(error = %e, "could not finish the change-log quarantine or refollowing before hello; reconnecting");
+            return Ok(SessionEnd::Reconnect);
+        }
         let hello = match self.hello().await {
             Ok(hello) => hello,
             Err(e) => {
-                warn!(error = %e, "could not read the change-log position for hello; reconnecting");
+                warn!(error = %e, "could not read the change-log position or keep the mark for hello; reconnecting");
                 return Ok(SessionEnd::Reconnect);
             }
         };
@@ -1493,10 +1501,24 @@ impl Session {
     /// A message that does not continue the stored copy, or whose entries do
     /// not verify, stores nothing and is answered `error` `bad_message`; the
     /// primary sends again from the node's last ack. A valid one is stored in
-    /// one transaction and, once it committed, acknowledged with one
-    /// `log_ack` for its highest entry. A store failure is returned, so the
-    /// session ends without an ack and the next `hello` reports the stored
-    /// position.
+    /// one transaction and, once it committed, the mark is raised to its
+    /// highest entry and it is acknowledged with one `log_ack` for that entry
+    /// (section 7.1 "The node's mark", ADR 0261). A store or mark failure is
+    /// returned, so the session ends without an ack and the next `hello`
+    /// reports the stored position.
+    ///
+    /// While the node refollows after a quarantine (section 7.1
+    /// "Refollowing", ADR 0261, ADR 0280), before anything is stored:
+    ///
+    /// - with the head unknown, the message's `head_seq` is recorded and the
+    ///   mark lowered to it. A message without `head_seq` stores nothing and
+    ///   is answered `bad_message`, since the node cannot tell how far it
+    ///   must refollow;
+    /// - with a head recorded, a mark still above it is lowered to it: the
+    ///   agent stopped between the two writes.
+    ///
+    /// The batch that brings the copy to that head ends the refollowing state
+    /// in its own transaction ([`NodeStore::store_log_batch`]).
     async fn on_log_entries<S>(
         &mut self,
         raw: &RawFrame,
@@ -1525,8 +1547,56 @@ impl Session {
                 return Ok(());
             }
         };
-        self.store.store_log_batch(&entries, body.head_seq).await?;
+        let data_dir = self.store.data_dir();
+        match self.store.refollowing().await? {
+            Some(Refollowing::HeadUnknown) => {
+                let Some(head_seq) = body.head_seq else {
+                    warn!(
+                        from_seq = body.from_seq,
+                        "log_entries after a quarantine carries no head_seq; nothing stored"
+                    );
+                    let error = ProtocolError {
+                        code: ErrorCode::BadMessage,
+                        message: "log_entries carries no head_seq, which a node refollowing \
+                                  after a quarantine needs (section 7.1)"
+                            .to_owned(),
+                        fatal: false,
+                    };
+                    write_message(sink, NodeMessage::Error(error), Some(&raw.id)).await?;
+                    return Ok(());
+                };
+                self.store
+                    .set_refollowing(Refollowing::Head(head_seq))
+                    .await?;
+                follow::lower_mark(data_dir, head_seq).await?;
+                info!(
+                    head_seq,
+                    "refollowing the change log up to the primary's head_seq"
+                );
+            }
+            Some(Refollowing::Head(head)) => {
+                let lowered = follow::lower_mark(data_dir, head).await?;
+                if lowered {
+                    warn!(
+                        head_seq = head,
+                        "the change-log mark was above the head the node refollows to; lowered"
+                    );
+                }
+            }
+            None => {}
+        }
+        let ended = self.store.store_log_batch(&entries, body.head_seq).await?;
         if let Some(last) = entries.last() {
+            if ended {
+                info!(
+                    log_seq = last.seq,
+                    "the change log reached the head it refollowed to"
+                );
+            }
+            // The mark covers the ack before it leaves. While the node
+            // refollows below its head the mark is that head, and this writes
+            // nothing.
+            follow::raise_mark(data_dir, last.seq).await?;
             let ack = LogAck {
                 seq: last.seq,
                 hash: last.hash.clone(),
@@ -1537,11 +1607,18 @@ impl Session {
     }
 
     /// Quarantines the node's copy of the change log on `log_diverged`
-    /// (section 7.1). It finishes before the next message is handled, since
-    /// the primary follows with entries from `seq` 1. A failed export deletes
-    /// nothing and is returned, so the session ends and the next `hello` draws
-    /// `log_diverged` again.
+    /// (section 7.1), in the order of ADR 0261: the mark is written as
+    /// [`follow::MAX_SEQ`] and synced, then the refollowing state "head
+    /// unknown" is recorded, and only then the copy is moved aside. All three
+    /// run when the copy is empty too, which is what a node whose `node.db`
+    /// was lost holds. It finishes before the next message is handled, since
+    /// the primary follows with entries from `seq` 1. A failure is returned,
+    /// so the session ends. When the mark write itself failed nothing
+    /// changed, and the next `hello` draws `log_diverged` again; after it,
+    /// [`follow::recover`] finishes the quarantine before the next `hello`.
     async fn on_log_diverged(&self, message: &str) -> Result<(), AgentError> {
+        follow::write_mark(self.store.data_dir(), follow::MAX_SEQ).await?;
+        self.store.set_refollowing(Refollowing::HeadUnknown).await?;
         let reason = format!("log_diverged: {message}");
         match self.store.quarantine_log(&reason).await? {
             Some(path) => warn!(
@@ -1935,11 +2012,17 @@ impl Session {
         Ok(())
     }
 
-    /// The `hello` of a new session (section 5.1).
+    /// The `hello` of a new session (section 5.1). Before it is built, the
+    /// change-log mark is raised to the `log_seq` it reports when that is
+    /// above the mark (section 7.1 "The node's mark", ADR 0261). That gives a
+    /// node that followed before the mark existed its mark, and covers an
+    /// agent that stopped between a batch's commit and its mark write.
     ///
     /// # Errors
     ///
-    /// [`AgentError::Store`] when the change-log position cannot be read.
+    /// [`AgentError::Store`] when the change-log position cannot be read or
+    /// the mark holds no `seq`, [`AgentError::Io`] when the mark cannot be
+    /// read or written.
     async fn hello(&self) -> Result<NodeMessage, AgentError> {
         let stored_rev = self
             .store
@@ -1951,6 +2034,7 @@ impl Session {
         let applied_rev = self.store.applied_rev().await.unwrap_or(0);
         let dropped_events = self.store.dropped_events().await.unwrap_or(0);
         let (log_seq, log_hash) = self.store.log_position().await?;
+        follow::raise_mark(self.store.data_dir(), log_seq).await?;
         let identity = self.identity.get();
         Ok(NodeMessage::Hello(Hello {
             node_id: identity.node_id,

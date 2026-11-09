@@ -54,6 +54,29 @@ const LOG_HEAD_SEQ: &str = "log_head_seq";
 /// `key` of `node_meta` holding when the node received [`LOG_HEAD_SEQ`], RFC
 /// 3339.
 const LOG_HEAD_SEQ_AT: &str = "log_head_seq_at";
+/// `key` of `node_meta` holding the refollowing state (section 7.1
+/// "Refollowing", section 12 `change_log`, ADR 0261, ADR 0280): absent when
+/// the node is not refollowing, [`REFOLLOWING_HEAD_UNKNOWN`] from a
+/// quarantine until a `log_entries` carries a `head_seq`, and then that
+/// `head_seq` in decimal. [`NodeStore::quarantine_log`] never deletes it.
+const LOG_REFOLLOWING: &str = "log_refollowing";
+/// The value of [`LOG_REFOLLOWING`] for [`Refollowing::HeadUnknown`].
+const REFOLLOWING_HEAD_UNKNOWN: &str = "head unknown";
+
+/// Where a node that refollows the change log after a quarantine stands
+/// (section 7.1 "Refollowing", ADR 0261, ADR 0280). It is kept in the local
+/// store, so it survives an agent crash at any point (section 12), and while
+/// it lasts `quoro cluster promote` refuses on this node (section 7.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refollowing {
+    /// The log was moved aside and no `log_entries` since carried the
+    /// `head_seq` to refollow to. Nothing is stored in this state.
+    HeadUnknown,
+    /// The `head_seq` of the first `log_entries` after the quarantine: the
+    /// node refollows until its copy reaches it, and its mark is this value
+    /// meanwhile.
+    Head(u64),
+}
 
 /// The schema. Every statement is `IF NOT EXISTS`, so opening an existing file
 /// is idempotent.
@@ -2091,6 +2114,12 @@ impl NodeStore {
     /// copy stays one gap-free chain. The rows go in first, so the
     /// transaction holds the write lock before it reads anything.
     ///
+    /// When the node refollows to [`Refollowing::Head`] `h` and the batch
+    /// brings the copy to `h` or past it, the same transaction ends the
+    /// refollowing state (section 7.1 "Refollowing", ADR 0261), so the copy
+    /// never reaches `h` with the state still recorded, nor the state ends
+    /// without it. Returns whether it ended.
+    ///
     /// # Errors
     ///
     /// [`AgentError::Store`] when the batch does not continue the copy or
@@ -2099,9 +2128,9 @@ impl NodeStore {
         &self,
         entries: &[LogEntry],
         head_seq: Option<u64>,
-    ) -> Result<(), AgentError> {
+    ) -> Result<bool, AgentError> {
         let (Some(first), Some(last)) = (entries.first(), entries.last()) else {
-            return Ok(());
+            return Ok(false);
         };
         let mut tx = self.pool.begin().await.map_err(store_error)?;
         for entry in entries {
@@ -2162,7 +2191,77 @@ impl NodeStore {
                 .map_err(store_error)?;
             }
         }
-        tx.commit().await.map_err(store_error)
+        let refollowing: Option<String> =
+            sqlx::query_scalar("SELECT value FROM node_meta WHERE key = ?")
+                .bind(LOG_REFOLLOWING)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(store_error)?;
+        let ended = match refollowing.as_deref().map(parse_refollowing).transpose()? {
+            Some(Refollowing::Head(head)) => last.seq >= head,
+            Some(Refollowing::HeadUnknown) | None => false,
+        };
+        if ended {
+            sqlx::query("DELETE FROM node_meta WHERE key = ?")
+                .bind(LOG_REFOLLOWING)
+                .execute(&mut *tx)
+                .await
+                .map_err(store_error)?;
+        }
+        tx.commit().await.map_err(store_error)?;
+        Ok(ended)
+    }
+
+    /// The refollowing state (section 7.1 "Refollowing", section 12
+    /// `change_log`, ADR 0261, ADR 0280), or `None` when the node is not
+    /// refollowing.
+    ///
+    /// `quoro cluster promote` reads it and refuses while it is set (section
+    /// 7.3); the agent reads it on every `log_entries` and before every
+    /// `hello`.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure or a stored value that is
+    /// neither `head unknown` nor a decimal `seq`.
+    pub async fn refollowing(&self) -> Result<Option<Refollowing>, AgentError> {
+        self.meta(LOG_REFOLLOWING)
+            .await?
+            .as_deref()
+            .map(parse_refollowing)
+            .transpose()
+    }
+
+    /// Records the refollowing state and commits it (section 7.1
+    /// "Refollowing"). Only [`Self::store_log_batch`] ends it.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn set_refollowing(&self, state: Refollowing) -> Result<(), AgentError> {
+        let value = match state {
+            Refollowing::HeadUnknown => REFOLLOWING_HEAD_UNKNOWN.to_owned(),
+            Refollowing::Head(head) => head.to_string(),
+        };
+        self.set_meta(LOG_REFOLLOWING, &value).await
+    }
+
+    /// Whether the stored copy of the change log is below the change-log
+    /// mark (section 7.1 "The node's mark", ADR 0261): its newest `seq` is
+    /// lower than the mark. No log is below a missing mark. Such a log lost
+    /// entries the node once acknowledged, or is refollowing toward the
+    /// mark, and `quoro cluster promote` refuses on it without
+    /// `--accept-loss` (section 7.3). The agent itself does not read it yet;
+    /// the promotion will.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure, and the errors of
+    /// [`crate::follow::read_mark`].
+    pub async fn log_below_mark(&self) -> Result<bool, AgentError> {
+        let mark = crate::follow::read_mark(&self.data_dir)?;
+        let (log_seq, _) = self.log_position().await?;
+        Ok(log_seq < mark.unwrap_or(0))
     }
 
     /// The primary's newest `seq` as its last `log_entries` reported it, and
@@ -2225,7 +2324,9 @@ impl NodeStore {
     /// `0600` file under `<data_dir>/quarantine/`, never over an existing one.
     /// The file and the directory are synced, and only then, in one
     /// transaction, the copy is recorded in `quarantine`, the `change_log`
-    /// rows it holds are deleted and the primary's `head_seq` is cleared.
+    /// rows it holds are deleted and the primary's `head_seq` is cleared. The
+    /// refollowing state is kept: the caller records it before the copy moves
+    /// (section 7.1 "Refollowing", ADR 0261).
     /// Returns the file, or `None` when the copy is empty, which needs no
     /// file, so a second call does nothing.
     ///
@@ -2319,6 +2420,18 @@ const QUARANTINE_DIR: &str = "quarantine";
 fn seq_column(value: u64) -> Result<i64, AgentError> {
     i64::try_from(value)
         .map_err(|_| AgentError::Store(format!("change-log number {value} does not fit SQLite")))
+}
+
+/// A stored [`LOG_REFOLLOWING`] value.
+fn parse_refollowing(value: &str) -> Result<Refollowing, AgentError> {
+    if value == REFOLLOWING_HEAD_UNKNOWN {
+        return Ok(Refollowing::HeadUnknown);
+    }
+    value.parse::<u64>().map(Refollowing::Head).map_err(|_| {
+        AgentError::Store(format!(
+            "the stored refollowing state {value:?} is neither {REFOLLOWING_HEAD_UNKNOWN:?} nor a seq"
+        ))
+    })
 }
 
 /// A stored change-log `seq` or `term`, which is never negative.
@@ -3827,5 +3940,194 @@ mod tests {
         drop(store);
         let store = NodeStore::open(&dir.0).await.expect("the store reopens");
         assert_eq!(quarantine_rows(&store).await.len(), 1);
+    }
+
+    /// The stored refollowing value, as it is in `node_meta`.
+    async fn refollowing_value(store: &NodeStore) -> Option<String> {
+        store.meta(LOG_REFOLLOWING).await.unwrap()
+    }
+
+    /// Section 7.1 "Refollowing", section 12: the state reads back as it was
+    /// set, across a reopen, for any `head_seq` the wire can carry; a value
+    /// that is neither form is an error, not "not refollowing".
+    #[tokio::test]
+    async fn the_refollowing_state_round_trips() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        assert_eq!(store.refollowing().await.unwrap(), None);
+
+        store
+            .set_refollowing(Refollowing::HeadUnknown)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.refollowing().await.unwrap(),
+            Some(Refollowing::HeadUnknown)
+        );
+        assert_eq!(
+            refollowing_value(&store).await.as_deref(),
+            Some("head unknown")
+        );
+        for head in [0, 42, crate::follow::MAX_SEQ, u64::MAX] {
+            store
+                .set_refollowing(Refollowing::Head(head))
+                .await
+                .unwrap();
+            assert_eq!(
+                store.refollowing().await.unwrap(),
+                Some(Refollowing::Head(head))
+            );
+        }
+        store.set_refollowing(Refollowing::Head(42)).await.unwrap();
+        assert_eq!(refollowing_value(&store).await.as_deref(), Some("42"));
+        drop(store);
+
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        assert_eq!(
+            store.refollowing().await.unwrap(),
+            Some(Refollowing::Head(42))
+        );
+        store.set_meta(LOG_REFOLLOWING, "head").await.unwrap();
+        assert!(store.refollowing().await.is_err());
+    }
+
+    /// Section 7.1 "Refollowing": a quarantine clears the primary's
+    /// `head_seq` but keeps the refollowing state the session recorded
+    /// before it, whichever form it has.
+    #[tokio::test]
+    async fn quarantine_keeps_the_refollowing_state() {
+        for state in [Refollowing::HeadUnknown, Refollowing::Head(9)] {
+            let dir = TempDir::new();
+            let store = NodeStore::open(&dir.0).await.unwrap();
+            let entries = verified(1, ZERO_HASH, 3, "a");
+            store.store_log_batch(&entries, Some(3)).await.unwrap();
+            store.set_refollowing(state).await.unwrap();
+
+            assert!(store.quarantine_log("test").await.unwrap().is_some());
+            assert!(store.log_entries().await.unwrap().is_empty());
+            assert_eq!(store.log_head().await.unwrap(), None);
+            assert_eq!(store.refollowing().await.unwrap(), Some(state));
+        }
+    }
+
+    /// Section 7.1 "Refollowing": the batch that brings the copy to the head
+    /// the node refollows to ends the state in its own transaction. A batch
+    /// below the head keeps it, a batch that fails keeps it with nothing
+    /// stored, and with the head unknown no batch ends it.
+    #[tokio::test]
+    async fn the_batch_that_reaches_the_head_ends_refollowing_with_it() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        store.set_refollowing(Refollowing::Head(5)).await.unwrap();
+        let first = verified(1, ZERO_HASH, 3, "a");
+        assert!(!store.store_log_batch(&first, Some(5)).await.unwrap());
+        assert_eq!(
+            store.refollowing().await.unwrap(),
+            Some(Refollowing::Head(5))
+        );
+
+        // The batch that would reach the head fails: neither its rows nor
+        // the end of the state are kept.
+        let mut second = verified(4, &first[2].hash, 2, "a");
+        second.push(second[0].clone());
+        assert!(store.store_log_batch(&second, Some(5)).await.is_err());
+        assert_eq!(store.log_entries().await.unwrap(), first);
+        assert_eq!(
+            store.refollowing().await.unwrap(),
+            Some(Refollowing::Head(5))
+        );
+
+        // The same batch, whole, reaches seq 5 and ends the state.
+        let second = verified(4, &first[2].hash, 2, "a");
+        assert!(store.store_log_batch(&second, Some(8)).await.unwrap());
+        assert_eq!(store.refollowing().await.unwrap(), None);
+        assert_eq!(store.log_head().await.unwrap().unwrap().0, 8);
+
+        // A batch past the head ends it too, and with the head unknown none
+        // does.
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        store
+            .set_refollowing(Refollowing::HeadUnknown)
+            .await
+            .unwrap();
+        assert!(!store.store_log_batch(&first, Some(2)).await.unwrap());
+        assert_eq!(
+            store.refollowing().await.unwrap(),
+            Some(Refollowing::HeadUnknown)
+        );
+        store.set_refollowing(Refollowing::Head(2)).await.unwrap();
+        let more = verified(4, &first[2].hash, 1, "a");
+        assert!(store.store_log_batch(&more, None).await.unwrap());
+        assert_eq!(store.refollowing().await.unwrap(), None);
+    }
+
+    /// Section 7.1 "The node's mark", section 12: no file is no mark, a
+    /// decimal `seq` is the mark, and anything else is an error. Whether the
+    /// stored copy is below it follows the mark, a missing one included.
+    #[tokio::test]
+    async fn the_mark_file_is_missing_valid_or_unparsable() {
+        use crate::follow::read_mark;
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let path = dir.0.join(crate::identity::LOG_MARK_FILE);
+        assert_eq!(read_mark(&dir.0).unwrap(), None);
+        assert!(!store.log_below_mark().await.unwrap());
+
+        std::fs::write(&path, "3").unwrap();
+        assert_eq!(read_mark(&dir.0).unwrap(), Some(3));
+        assert!(store.log_below_mark().await.unwrap());
+        store
+            .store_log_batch(&verified(1, ZERO_HASH, 3, "a"), None)
+            .await
+            .unwrap();
+        assert!(!store.log_below_mark().await.unwrap());
+        std::fs::write(&path, "9007199254740991\n").unwrap();
+        assert_eq!(read_mark(&dir.0).unwrap(), Some(crate::follow::MAX_SEQ));
+        assert!(store.log_below_mark().await.unwrap());
+
+        for text in ["", "x", "-1", "3.0", "18446744073709551616"] {
+            std::fs::write(&path, text).unwrap();
+            assert!(read_mark(&dir.0).is_err(), "{text:?}");
+            assert!(store.log_below_mark().await.is_err(), "{text:?}");
+        }
+    }
+
+    /// Section 7.1 "The node's mark": the mark is written as the decimal
+    /// `seq`, `0600`. A raise never lowers it and a missing mark counts as 0,
+    /// so raising to 0 creates no file; a lower never raises it.
+    #[tokio::test]
+    async fn the_mark_is_raised_and_lowered_only_as_asked() {
+        use crate::follow::{lower_mark, raise_mark, write_mark};
+        let dir = TempDir::new();
+        let path = dir.0.join(crate::identity::LOG_MARK_FILE);
+        raise_mark(&dir.0, 0).await.unwrap();
+        assert!(!path.exists());
+        assert!(!lower_mark(&dir.0, 0).await.unwrap());
+        assert!(!path.exists());
+
+        raise_mark(&dir.0, 7).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "7");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        raise_mark(&dir.0, 5).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "7");
+        assert!(!lower_mark(&dir.0, 9).await.unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "7");
+        assert!(lower_mark(&dir.0, 4).await.unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "4");
+
+        write_mark(&dir.0, crate::follow::MAX_SEQ).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "9007199254740991");
+        let names: Vec<String> = std::fs::read_dir(&dir.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("log-mark"))
+            .collect();
+        assert_eq!(names, ["log-mark"]);
     }
 }

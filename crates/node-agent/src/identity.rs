@@ -10,6 +10,9 @@
 //! - `credential` — the session credential returned once by enrollment.
 //! - `identity.json` — the identity the primary gave us and the cluster key
 //!   that signs desired state.
+//! - `log-mark` — on a machine with the `node` role, the change-log mark: the
+//!   highest `seq` the node has acknowledged (section 7.1, section 12, ADR
+//!   0261), read and written by [`crate::follow`].
 //!
 //! [`IdentityHandle`] is the in-process view the session keeps: it answers with
 //! the current pin and can persist a `signing_key_rotate` atomically.
@@ -31,6 +34,12 @@ pub const SEED_FILE: &str = "node-ed25519.seed";
 pub const CREDENTIAL_FILE: &str = "credential";
 /// File name of the enrolled identity.
 pub const IDENTITY_FILE: &str = "identity.json";
+/// File name of the change-log mark: the decimal `seq` of the highest entry
+/// the node has acknowledged, mode `0600` (section 7.1 "The node's mark",
+/// section 12, ADR 0261). It sits next to [`SEED_FILE`] and
+/// [`CREDENTIAL_FILE`], where `custody.key` joins them (section 7.2), so it
+/// survives a lost `node.db`. [`crate::follow::read_mark`] reads it.
+pub const LOG_MARK_FILE: &str = "log-mark";
 
 /// The identity the node received at enrollment (section 2.4), as
 /// `identity.json` holds it.
@@ -191,12 +200,15 @@ pub fn save_identity(data_dir: &Path, identity: &Identity) -> Result<(), AgentEr
 }
 
 /// Writes `bytes` to `data_dir/name` through a temporary file in the same
-/// directory, `0600`, then renames it into place.
+/// directory, `0600`, then renames it into place, durably: the file is synced
+/// before the rename and the directory after it, so once this returns the new
+/// contents survive a crash. The change-log mark depends on it (section 7.1,
+/// ADR 0261).
 ///
 /// # Errors
 ///
-/// [`AgentError::Io`] when the temporary file, its mode, the write or the
-/// rename fails.
+/// [`AgentError::Io`] when the temporary file, its mode, the write, the
+/// rename or the directory sync fails.
 pub fn write_private(data_dir: &Path, name: &str, bytes: &[u8]) -> Result<(), AgentError> {
     ensure_data_dir(data_dir)?;
     let temp = data_dir.join(format!(
@@ -215,7 +227,10 @@ pub fn write_private(data_dir: &Path, name: &str, bytes: &[u8]) -> Result<(), Ag
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&temp, data_dir.join(name))
+        fs::rename(&temp, data_dir.join(name))?;
+        // The rename is a change to the directory: without this sync a crash
+        // can bring back the old file, or none.
+        fs::File::open(data_dir)?.sync_all()
     };
     let result = write();
     if result.is_err() {
@@ -404,6 +419,32 @@ fn missing(path: &Path, error: &std::io::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `write_private` replaces the file through a temporary one, `0600`, and
+    /// leaves no temporary file behind, also when it replaces an existing
+    /// file.
+    #[test]
+    fn write_private_leaves_no_temporary_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "quoro-identity-unit-{}",
+            util::hex(&util::random_bytes::<8>())
+        ));
+        write_private(&dir, "file", b"first").unwrap();
+        write_private(&dir, "file", b"second").unwrap();
+        let names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["file"]);
+        assert_eq!(fs::read(dir.join("file")).unwrap(), b"second");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::metadata(dir.join("file")).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_key_id_is_the_sha256_of_the_raw_key() {
