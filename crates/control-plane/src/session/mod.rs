@@ -4843,6 +4843,7 @@ mod tests {
             renewed_at: None,
             expires_at: None,
             revoked_at: revoked.then(|| "2026-11-07T10:01:00Z".to_string()),
+            unsettled: false,
         }
     }
 

@@ -127,12 +127,11 @@ impl Lease {
             // 8.4), which the M5b lease work adds; a `local` lease has none.
             gate_at: None,
             revoked_at: row.revoked_at,
-            // Set from the row's unsettled mark and mode (section 8.4), which
-            // the M5b lease work adds; until then no lease is pending.
-            local_pending: false,
-            // Read from `leases.unsettled` (migration 0013), which the M5b
-            // lease work adds to the row; until then no row carries the mark.
-            unsettled: false,
+            // Section 8.4, "The mark": the row reads `local` while it carries
+            // the mark, until the primary knows the holder took that grant.
+            local_pending: mode == LeaseModeView::Local && row.unsettled,
+            // `leases.unsettled` (migration 0013).
+            unsettled: row.unsettled,
             // Derived from the grants the primary holds back (section 8.4),
             // which the M5b lease work adds; until then no grant waits.
             grant_pending: false,

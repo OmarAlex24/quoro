@@ -23,7 +23,7 @@ use std::sync::Mutex;
 
 /// Columns of [`Lease`], in the order [`lease_from_row`] expects them.
 pub(crate) const LEASE_COLUMNS: &str = "id, resource_type, resource_id, holder_node_id, mode, \
-     fencing_token, duration_ms, granted_at, renewed_at, expires_at, revoked_at";
+     fencing_token, duration_ms, granted_at, renewed_at, expires_at, revoked_at, unsettled";
 
 /// One `leases` row.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,6 +42,12 @@ pub(crate) struct Lease {
     pub renewed_at: Option<String>,
     pub expires_at: Option<String>,
     pub revoked_at: Option<String>,
+    /// The unsettled mark (`leases.unsettled`, migration 0013; section 8.4,
+    /// "The mark"): the row may disagree with its holder's mode, so the lease
+    /// moves only as a `local` lease does. No write with a new token clears
+    /// it; only the writes that record what the holder holds do (issue #555,
+    /// not built yet).
+    pub unsettled: bool,
 }
 
 impl Lease {
@@ -66,6 +72,11 @@ impl Lease {
             "renewed_at": self.renewed_at,
             "expires_at": self.expires_at,
             "revoked_at": self.revoked_at,
+            // Section 7.2: an update carries every field the change writes,
+            // and the mark is a column of the row (migration 0013), so a
+            // promotion's rebuild (section 7.3 step 4) merges it like any
+            // other.
+            "unsettled": self.unsettled,
         })
     }
 
@@ -124,6 +135,7 @@ pub(crate) fn lease_from_row(row: &SqliteRow) -> Result<Lease, ApiError> {
         renewed_at: row.try_get("renewed_at")?,
         expires_at: row.try_get("expires_at")?,
         revoked_at: row.try_get("revoked_at")?,
+        unsettled: row.try_get::<i64, _>("unsettled")? != 0,
     })
 }
 
@@ -661,15 +673,18 @@ pub(crate) async fn grant_app_lease(
     let mode = if expiring { "expiring" } else { "local" };
     let duration_ms = expiring.then(|| i64::try_from(DEFAULT_DURATION_MS).unwrap_or(i64::MAX));
     let now = crate::store::format_rfc3339(sent_wall);
-    sqlx::query(
+    // Nothing above writes a marked row yet; held grants come with #703.
+    let unsettled = false;
+    let unsettled = sqlx::query(
         "INSERT INTO leases (id, resource_type, resource_id, holder_node_id, mode, fencing_token, \
-         duration_ms, granted_at, renewed_at, expires_at, revoked_at) \
-         VALUES (?, 'app', ?, ?, ?, ?, ?, ?, NULL, NULL, NULL) \
+         duration_ms, granted_at, renewed_at, expires_at, revoked_at, unsettled) \
+         VALUES (?, 'app', ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?) \
          ON CONFLICT (resource_type, resource_id) DO UPDATE SET \
            holder_node_id = excluded.holder_node_id, mode = excluded.mode, \
            fencing_token = excluded.fencing_token, duration_ms = excluded.duration_ms, \
            granted_at = excluded.granted_at, renewed_at = NULL, expires_at = NULL, \
-           revoked_at = NULL",
+           revoked_at = NULL, unsettled = MAX(leases.unsettled, excluded.unsettled) \
+         RETURNING unsettled",
     )
     .bind(&id)
     .bind(app_id)
@@ -678,8 +693,13 @@ pub(crate) async fn grant_app_lease(
     .bind(token)
     .bind(duration_ms)
     .bind(&now)
-    .execute(&mut *conn)
-    .await?;
+    .bind(i64::from(unsettled))
+    .fetch_one(&mut *conn)
+    .await?
+    // Section 8.4, "The mark": "no write with a new token clears it", so the
+    // row keeps a mark it already carries whatever this write sets.
+    .try_get::<i64, _>("unsettled")?
+        != 0;
     let lease = Lease {
         id,
         resource_type: "app".to_string(),
@@ -692,6 +712,7 @@ pub(crate) async fn grant_app_lease(
         renewed_at: None,
         expires_at: None,
         revoked_at: None,
+        unsettled,
     };
     changelog::append(conn, actor, "lease", &lease.id, op, lease.payload()).await?;
     Ok(NewGrant::Granted(Box::new(lease)))
@@ -874,6 +895,7 @@ mod tests {
             renewed_at: None,
             expires_at: None,
             revoked_at: Some("2026-11-07T11:00:00Z".to_string()),
+            unsettled: false,
         }
     }
 
