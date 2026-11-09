@@ -26,7 +26,7 @@ use quoro_proto::{FenceReason, LeaseId, LeaseMode, ResourceType};
 use serde_json::Value;
 use sqlx::Row as _;
 use sqlx::SqlitePool;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use tokio::sync::{broadcast, watch};
 
 use crate::AgentError;
@@ -627,6 +627,10 @@ impl NodeStore {
             .filename(&path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
+            // Every commit reaches the disk before it returns: a voter's
+            // promise must survive a power loss before its `support_grant`
+            // goes out (section 8.8 "Restarts").
+            .synchronous(SqliteSynchronous::Full)
             .foreign_keys(true)
             // Deleted rows (pruned log lines, resealed plaintext bodies) are
             // overwritten, not left in free pages.
