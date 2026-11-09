@@ -331,6 +331,7 @@ fn protocol_error(
         code,
         message: message.to_string(),
         fatal,
+        term: None,
     })
     .to_frame(&new_msg_id(), re)
     .to_text()
@@ -2853,6 +2854,10 @@ impl Session {
             )),
             NodeMessage::LeaseRenew(renew) => self.answer_renewal(&raw.id, &renew, outbox).await,
             NodeMessage::LogAck(ack) => self.on_log_ack(&ack).await,
+            // This primary sends no `support_request` yet, and an answer that
+            // does not pair with an outstanding request is ignored (section
+            // 5.28).
+            NodeMessage::SupportGrant(_) => {}
             NodeMessage::DnsChallenge(challenge) => {
                 let acme_routes: HashSet<String> = self
                     .last_spec

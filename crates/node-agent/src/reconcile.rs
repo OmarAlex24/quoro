@@ -2921,6 +2921,8 @@ mod tests {
                     volumes: Vec::new(),
                     backups: Vec::new(),
                     backup_repository: None,
+                    votes: None,
+                    witness: None,
                 },
                 signature: String::new(),
             },

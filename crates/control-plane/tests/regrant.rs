@@ -632,6 +632,7 @@ async fn a_lease_the_row_does_not_give_the_node_is_not_given_back() {
             code: ErrorCode::BadMessage,
             message: "refused".to_string(),
             fatal: false,
+            term: None,
         }),
         Some(&command),
     )
@@ -672,6 +673,7 @@ async fn a_refused_same_token_grant_gives_the_lease_back() {
             code,
             message: "the lease is not held".to_string(),
             fatal: false,
+            term: None,
         })
     };
 
@@ -1193,6 +1195,7 @@ async fn a_refused_grant_after_a_revoke_on_the_session_gives_nothing_back() {
             code: ErrorCode::BadMessage,
             message: "the lease is not held".to_string(),
             fatal: false,
+            term: None,
         }),
         Some(&grant_id),
     )

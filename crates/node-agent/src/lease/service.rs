@@ -1920,6 +1920,7 @@ fn refused(message: &str) -> ProtocolError {
         code: ErrorCode::BadMessage,
         message: message.to_owned(),
         fatal: false,
+        term: None,
     }
 }
 
@@ -1929,6 +1930,7 @@ fn service_gone() -> ProtocolError {
         code: ErrorCode::BadMessage,
         message: "the lease service is not running".to_owned(),
         fatal: false,
+        term: None,
     }
 }
 

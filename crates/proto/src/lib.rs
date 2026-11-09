@@ -100,6 +100,12 @@ pub enum ErrorCode {
     /// The VM exists but cannot serve the requested stream now, such as a
     /// `terminal` on a stopped VM (M4, carried in a `command_result`).
     NotAvailable,
+    /// From M5b: the other side's term is lower than the highest term the
+    /// sender has seen (fatal, section 8.8). It carries the sender's `term`.
+    StaleTerm,
+    /// From M5b: the sender was the primary and has learned of a higher term
+    /// (fatal, section 7.4).
+    NotPrimary,
 }
 
 /// The `data.reason` enum of the `node.fenced` event (section 8.5,
@@ -190,6 +196,12 @@ pub struct ProtocolError {
     pub message: String,
     /// Whether the session ends.
     pub fatal: bool,
+    /// From M5b: the sender's term, the highest it has seen. Carried with
+    /// `stale_term`, and with the `bad_message` a voter answers a
+    /// `support_request` with when it voted in that term for another
+    /// candidate (sections 5.18, 5.27, ADR 0261, ADR 0280). Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub term: Option<u64>,
 }
 
 /// Data of the `node.fenced` event (section 8.5, `events.schema.json`

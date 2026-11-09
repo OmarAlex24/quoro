@@ -22,12 +22,12 @@ use quoro_node_agent::identity::LOG_MARK_FILE;
 use quoro_node_agent::ingress::{CertificateEvents, DnsBridge, IngressConfig, IngressSupervisor};
 use quoro_node_agent::reconcile::Snapshot;
 use quoro_node_agent::session::{Session, SessionEnd, SessionSetup};
-use quoro_node_agent::store::{NodeStore, Refollowing};
+use quoro_node_agent::store::{NodeStore, Refollowing, VOTE};
 use quoro_node_agent::{FenceTimers, LeaseConfig, LeaseState, ManualHostClock, start_local_leases};
 use quoro_proto::sign::{self, SigningKey};
 use quoro_proto::wire::{
     Command, ControlMessage, DesiredState, DesiredStatus, EdgeBackend, EdgeRoute, HealthCheck,
-    LogEntries, Spec, SpecEdge, SpecNetwork, Welcome,
+    LogEntries, Spec, SpecEdge, SpecNetwork, SpecVoter, SpecVotes, SupportRequest, Welcome,
 };
 use quoro_proto::{
     ErrorCode, LeaseGrant, LeaseId, LeaseMode, LeaseRevoke, ProtocolError, ResourceType,
@@ -61,6 +61,8 @@ fn desired_frame(rev: u64, key: &SigningKey, id: &str) -> String {
             volumes: Vec::new(),
             backups: Vec::new(),
             backup_repository: None,
+            votes: None,
+            witness: None,
         },
         signature: String::new(),
     };
@@ -862,9 +864,10 @@ fn revoke_frame(lease_id: &str, token: u64, id: &str) -> String {
 
 /// Section 5.13 "Order while the fence runs" (ADR 0222): while a revoke's
 /// fence stops a slow VM, the session stays alive. It keeps sending
-/// heartbeats, answers `ping`, and applies a `lease_grant` for another lease;
-/// a `desired_state` and a second revoke of the same lease wait, and are
-/// processed in the order they arrived once the revoke is answered.
+/// heartbeats, answers `ping`, applies a `lease_grant` for another lease and,
+/// on a voter, answers `support_request` (ADR 0237); a `desired_state` and a
+/// second revoke of the same lease wait, and are processed in the order they
+/// arrived once the revoke is answered.
 #[tokio::test]
 async fn a_revoke_s_fence_keeps_the_session_alive_and_holds_back_the_rest() {
     let dir = TempDir::new();
@@ -904,10 +907,14 @@ async fn a_revoke_s_fence_keeps_the_session_alive_and_holds_back_the_rest() {
         facts: facts(),
         desired,
         observed: observed_rx,
-        current: None,
+        current: Some(voter_snapshot(1, 3120)),
         builds: None,
     })
-    .with_leases(leases.link.clone());
+    .with_leases(leases.link.clone())
+    .with_host_clock(Arc::new(ManualHostClock::new(
+        Some("boot-a"),
+        Duration::from_secs(1000),
+    )));
 
     let (client, server) = tokio::io::duplex(1 << 16);
     let accept = tokio::spawn(tokio_tungstenite::accept_async(server));
@@ -999,6 +1006,11 @@ async fn a_revoke_s_fence_keeps_the_session_alive_and_holds_back_the_rest() {
     .await;
     send(
         &mut ws,
+        support_frame(1, "nod_primary", 15_000, 15_000, "msg_support"),
+    )
+    .await;
+    send(
+        &mut ws,
         ControlMessage::Ping.to_frame("msg_ping", None).to_text(),
     )
     .await;
@@ -1006,6 +1018,7 @@ async fn a_revoke_s_fence_keeps_the_session_alive_and_holds_back_the_rest() {
     // Everything let through is answered while the fence runs.
     let mut heartbeats = 0;
     let mut pong_before_answer = false;
+    let mut grant_before_answer = false;
     let mut answered: Vec<String> = Vec::new();
     let mut first_answered_at = None;
     let mut desired_answered_at = None;
@@ -1015,6 +1028,10 @@ async fn a_revoke_s_fence_keeps_the_session_alive_and_holds_back_the_rest() {
             // Only the heartbeats between the pong, sent during the fence,
             // and the revoke's answer count.
             "heartbeat" if pong_before_answer && answered.is_empty() => heartbeats += 1,
+            "support_grant" => {
+                assert_eq!(frame["re"], "msg_support");
+                grant_before_answer = answered.is_empty();
+            }
             "pong" => {
                 assert_eq!(frame["re"], "msg_ping");
                 pong_before_answer = answered.is_empty();
@@ -1034,6 +1051,11 @@ async fn a_revoke_s_fence_keeps_the_session_alive_and_holds_back_the_rest() {
         }
     }
     assert!(pong_before_answer, "the ping was answered during the fence");
+    assert!(
+        grant_before_answer,
+        "the support_request was answered during the fence"
+    );
+    assert!(store.support().await.unwrap().is_some());
     assert!(
         heartbeats >= 5,
         "heartbeats kept flowing during the 1.5 s fence, before its answer: {heartbeats}"
@@ -1727,6 +1749,7 @@ async fn log_diverged_quarantines_the_copy_and_the_node_refollows_from_seq_1() {
         code: ErrorCode::LogDiverged,
         message: "log_seq 3 does not match".to_owned(),
         fatal: false,
+        term: None,
     });
     send(&mut ws, diverged.to_frame("msg_diverged", None).to_text()).await;
     let new = log_chain(1, ZEROS, 2, "new");
@@ -1825,6 +1848,7 @@ async fn a_failed_quarantine_export_deletes_nothing_and_ends_the_session() {
         code: ErrorCode::LogDiverged,
         message: "log_seq 3 does not match".to_owned(),
         fatal: false,
+        term: None,
     });
     send(&mut ws, diverged.to_frame("msg_diverged", None).to_text()).await;
     frames_until_closed(&mut ws).await;
@@ -1974,6 +1998,7 @@ fn diverged_frame(id: &str) -> String {
         code: ErrorCode::LogDiverged,
         message: "log_seq 3 does not match".to_owned(),
         fatal: false,
+        term: None,
     })
     .to_frame(id, None)
     .to_text()
@@ -2590,4 +2615,479 @@ async fn a_head_seq_below_the_batch_while_the_head_is_unknown_is_a_bad_message()
 #[tokio::test]
 async fn a_head_seq_above_the_highest_seq_while_the_head_is_unknown_is_a_bad_message() {
     a_refused_head_seq(quoro_node_agent::follow::MAX_SEQ + 1).await;
+}
+
+// --- terms and voter support (section 8.8) ----------------------------------
+
+/// `spec.votes` at voter-set version `version` (section 6.12).
+fn votes(version: u64) -> SpecVotes {
+    SpecVotes {
+        version,
+        port: 51821,
+        voters: vec![SpecVoter {
+            node_id: "nod_test".to_owned(),
+            roles: vec!["node".to_owned()],
+            mesh_address: Some("10.43.0.2".to_owned()),
+        }],
+    }
+}
+
+/// A snapshot that makes the machine a voter, with no signature check.
+fn voter_snapshot(rev: u64, version: u64) -> Snapshot {
+    let mut snapshot = snapshot(rev, Vec::new());
+    snapshot.state.spec.votes = Some(votes(version));
+    snapshot
+}
+
+/// A signed `desired_state` at `term`, a voter's when `votes` is set.
+fn desired_frame_at(
+    rev: u64,
+    term: u64,
+    votes: Option<SpecVotes>,
+    key: &SigningKey,
+    id: &str,
+) -> String {
+    let mut state = snapshot(rev, Vec::new()).state;
+    state.term = term;
+    state.spec.votes = votes;
+    let mut body = state.to_unsigned_value();
+    sign::sign_body(key, &mut body).unwrap();
+    ControlMessage::DesiredState(body)
+        .to_frame(id, None)
+        .to_text()
+}
+
+fn support_frame(term: u64, primary: &str, support_ms: u64, max_lease_ms: u64, id: &str) -> String {
+    ControlMessage::SupportRequest(SupportRequest {
+        term,
+        primary_node_id: primary.to_owned(),
+        support_ms,
+        max_lease_ms,
+        voters_version: 3120,
+    })
+    .to_frame(id, None)
+    .to_text()
+}
+
+fn welcome_frame(term: u64, re: &str) -> String {
+    ControlMessage::Welcome(Welcome {
+        cluster_id: "cls_test".to_owned(),
+        term,
+        server_time: "2026-11-02T10:15:30Z".to_owned(),
+        heartbeat_interval_ms: 100,
+        session_timeout_ms: 15_000,
+        primary_node_id: "nod_primary".to_owned(),
+        primary_urls: Vec::new(),
+    })
+    .to_frame("msg_welcome", Some(re))
+    .to_text()
+}
+
+/// The node of a term test: its session, store and cluster key, and the
+/// sender of its observed VMs, which the test keeps alive for as long as the
+/// session runs.
+struct TermNode {
+    session: Session,
+    store: NodeStore,
+    key: SigningKey,
+    _observed: watch::Sender<Vec<quoro_proto::wire::VmStatus>>,
+}
+
+/// A session over `dir` whose newest snapshot is `current` (a voter's when it
+/// carries `spec.votes`), measuring a promise on a manual clock on boot
+/// `boot-a`.
+async fn term_node(dir: &TempDir, current: Option<Snapshot>) -> TermNode {
+    let key = sign::signing_key_from_seed(&[8; 32]);
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let (desired, _desired_rx) = watch::channel(None);
+    let (observed_tx, observed_rx) = watch::channel(Vec::new());
+    let session = Session::new(SessionSetup {
+        identity: identity_files(dir.path(), &key),
+        store: store.clone(),
+        facts: facts(),
+        desired,
+        observed: observed_rx,
+        current,
+        builds: None,
+    })
+    .with_host_clock(Arc::new(ManualHostClock::new(
+        Some("boot-a"),
+        Duration::from_secs(1000),
+    )));
+    TermNode {
+        session,
+        store,
+        key,
+        _observed: observed_tx,
+    }
+}
+
+/// A session whose `welcome` at `term` was accepted.
+async fn welcomed(session: Session, term: u64) -> (WebSocketStream<DuplexStream>, Serving) {
+    let (mut ws, hello, serving) = open_session(session).await;
+    send(&mut ws, welcome_frame(term, hello["id"].as_str().unwrap())).await;
+    read_until(&mut ws, "status_report").await;
+    (ws, serving)
+}
+
+/// Asserts that `frame` is the fatal `stale_term` answering `re`, carrying
+/// `term`.
+fn assert_stale_term(frame: &Value, re: &str, term: u64) {
+    assert_eq!(frame["type"], "error", "{frame}");
+    assert_eq!(frame["re"], re, "{frame}");
+    assert_eq!(frame["body"]["code"], "stale_term", "{frame}");
+    assert_eq!(frame["body"]["fatal"], true, "{frame}");
+    assert_eq!(frame["body"]["term"], term, "{frame}");
+}
+
+/// Sections 4.2 rule 2 and 8.8: a `welcome` below the highest term seen is
+/// answered `stale_term`, fatal, carrying that term; the session ends and the
+/// node redials, keeping its stored desired state. A `welcome` of that term
+/// is then accepted.
+#[tokio::test]
+async fn a_welcome_with_a_lower_term_is_answered_stale_term_and_the_node_redials() {
+    let dir = TempDir::new();
+    let TermNode {
+        session,
+        store,
+        key,
+        _observed,
+    } = term_node(&dir, None).await;
+    let mut body = snapshot(2, Vec::new()).state.to_unsigned_value();
+    sign::sign_body(&key, &mut body).unwrap();
+    store.store_desired(2, &body).await.unwrap();
+    store.raise_term(3).await.unwrap();
+
+    let (mut ws, hello, serving) = open_session(session).await;
+    send(&mut ws, welcome_frame(2, hello["id"].as_str().unwrap())).await;
+    let frames = frames_until_closed(&mut ws).await;
+    assert_eq!(frames.len(), 1, "only the error: {frames:?}");
+    assert_stale_term(&frames[0], "msg_welcome", 3);
+    let session = ended(serving).await;
+    assert_eq!(store.highest_term().await.unwrap(), Some(3));
+    assert_eq!(store.latest_desired().await.unwrap().unwrap().0, 2);
+
+    let (ws, serving) = welcomed(session, 3).await;
+    end_session(ws, serving).await;
+}
+
+/// Section 8.8: a higher term in a `welcome` is stored before the session
+/// goes on, and the stored term never goes down.
+#[tokio::test]
+async fn a_welcome_with_a_higher_term_is_stored() {
+    let dir = TempDir::new();
+    let TermNode {
+        session,
+        store,
+        _observed,
+        ..
+    } = term_node(&dir, None).await;
+    assert_eq!(store.highest_term().await.unwrap(), None);
+    let (ws, serving) = welcomed(session, 4).await;
+    assert_eq!(store.highest_term().await.unwrap(), Some(4));
+    end_session(ws, serving).await;
+}
+
+/// Sections 5.11 and 8.8: a `desired_state`'s term is checked after its
+/// signature and before it is stored. A badly signed one is `bad_signature`
+/// whatever its term; a lower term is `stale_term` and nothing is stored; a
+/// higher one is stored with the snapshot.
+#[tokio::test]
+async fn a_desired_state_with_a_lower_term_is_refused_and_a_higher_one_adopted() {
+    let dir = TempDir::new();
+    let TermNode {
+        session,
+        store,
+        key,
+        _observed,
+    } = term_node(&dir, None).await;
+    let (mut ws, serving) = welcomed(session, 2).await;
+
+    let other = sign::signing_key_from_seed(&[99; 32]);
+    send(&mut ws, desired_frame_at(4, 1, None, &other, "msg_forged")).await;
+    let forged = reply_to(&mut ws, "msg_forged").await;
+    assert_eq!(forged["body"]["code"], "bad_signature", "{forged}");
+
+    send(&mut ws, desired_frame_at(4, 1, None, &key, "msg_old")).await;
+    let frames = frames_until_closed(&mut ws).await;
+    let stale = frames
+        .iter()
+        .find(|frame| frame["re"] == "msg_old")
+        .expect("an answer to the old snapshot");
+    assert_stale_term(stale, "msg_old", 2);
+    let session = ended(serving).await;
+    assert_eq!(
+        store.latest_desired().await.unwrap(),
+        None,
+        "nothing stored"
+    );
+
+    let (mut ws, serving) = welcomed(session, 2).await;
+    send(&mut ws, desired_frame_at(5, 3, None, &key, "msg_new")).await;
+    let stored = reply_to(&mut ws, "msg_new").await;
+    assert_eq!(stored["body"]["status"], "ok", "{stored}");
+    assert_eq!(store.highest_term().await.unwrap(), Some(3));
+    assert_eq!(store.latest_desired().await.unwrap().unwrap().0, 5);
+    end_session(ws, serving).await;
+}
+
+/// Sections 5.27 and 8.8: a `support_request` below the highest term seen,
+/// learned here after the session began, is answered `stale_term` and ends
+/// the session.
+#[tokio::test]
+async fn a_support_request_with_a_lower_term_ends_the_session() {
+    let dir = TempDir::new();
+    let TermNode {
+        session,
+        store,
+        _observed,
+        ..
+    } = term_node(&dir, Some(voter_snapshot(1, 3120))).await;
+    let (mut ws, serving) = welcomed(session, 2).await;
+    store.raise_term(3).await.unwrap();
+
+    send(
+        &mut ws,
+        support_frame(2, "nod_primary", 15_000, 15_000, "msg_support"),
+    )
+    .await;
+    let frames = frames_until_closed(&mut ws).await;
+    let stale = frames
+        .iter()
+        .find(|frame| frame["re"] == "msg_support")
+        .expect("an answer to the request");
+    assert_stale_term(stale, "msg_support", 3);
+    assert!(frames.iter().all(|frame| frame["type"] != "support_grant"));
+    ended(serving).await;
+    assert_eq!(store.support().await.unwrap(), None);
+}
+
+/// Sections 5.28 and 8.8: a voter stores its promise and lease horizon, then
+/// answers `support_grant` echoing the request, with the voter-set version of
+/// its desired state. A later request with a shorter `L` never lowers the
+/// horizon.
+#[tokio::test]
+async fn a_voter_grants_support_once_its_promise_is_stored() {
+    let dir = TempDir::new();
+    let TermNode {
+        session,
+        store,
+        _observed,
+        ..
+    } = term_node(&dir, Some(voter_snapshot(1, 3120))).await;
+    let (mut ws, serving) = welcomed(session, 1).await;
+
+    send(
+        &mut ws,
+        support_frame(1, "nod_primary", 15_000, 15_000, "msg_support_1"),
+    )
+    .await;
+    let grant = reply_to(&mut ws, "msg_support_1").await;
+    // Stored before it was sent: the store has it as the grant arrives.
+    let first = store
+        .support()
+        .await
+        .unwrap()
+        .expect("the promise is stored");
+    assert_eq!(grant["type"], "support_grant", "{grant}");
+    assert_eq!(
+        grant["body"],
+        json!({"term": 1, "support_ms": 15000, "max_lease_ms": 15000, "voters_version": 3120})
+    );
+    assert_eq!(first.boot_id, "boot-a");
+    assert_eq!(first.primary_node_id, "nod_primary");
+    let v_recv = Duration::from_nanos(first.received_ns);
+    assert!(v_recv >= Duration::from_secs(1000), "{v_recv:?}");
+    assert_eq!(first.promise(), v_recv + Duration::from_secs(15));
+    assert_eq!(first.horizon(), v_recv + Duration::from_secs(15 + 15 + 3));
+
+    send(
+        &mut ws,
+        support_frame(1, "nod_primary", 15_000, 5_000, "msg_support_2"),
+    )
+    .await;
+    let grant = reply_to(&mut ws, "msg_support_2").await;
+    assert_eq!(grant["body"]["max_lease_ms"], 5000, "{grant}");
+    let second = store.support().await.unwrap().unwrap();
+    assert_eq!(
+        second.horizon(),
+        first.horizon(),
+        "the horizon is not lowered"
+    );
+    assert!(second.promise() >= first.promise());
+    assert_eq!(second.max_lease_ms, 5_000);
+    end_session(ws, serving).await;
+}
+
+/// Section 8.8: a promise that cannot be stored is not granted. The session
+/// goes on, and the next request is granted once the store takes writes.
+#[tokio::test]
+async fn a_promise_the_store_cannot_keep_sends_no_grant() {
+    let dir = TempDir::new();
+    let TermNode {
+        session,
+        store,
+        _observed,
+        ..
+    } = term_node(&dir, Some(voter_snapshot(1, 3120))).await;
+    let (mut ws, serving) = welcomed(session, 1).await;
+    sqlx::query(
+        "CREATE TRIGGER no_support BEFORE INSERT ON node_meta WHEN NEW.key = 'support' \
+         BEGIN SELECT RAISE(ABORT, 'x'); END;",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    send(
+        &mut ws,
+        support_frame(1, "nod_primary", 15_000, 15_000, "msg_support_1"),
+    )
+    .await;
+    let frames = frames_before_pong(&mut ws, "msg_ping_1").await;
+    assert!(
+        frames.iter().all(|frame| frame["re"] != "msg_support_1"),
+        "no answer: {frames:?}"
+    );
+    assert_eq!(store.support().await.unwrap(), None);
+
+    sqlx::query("DROP TRIGGER no_support")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    send(
+        &mut ws,
+        support_frame(1, "nod_primary", 15_000, 15_000, "msg_support_2"),
+    )
+    .await;
+    let grant = reply_to(&mut ws, "msg_support_2").await;
+    assert_eq!(grant["type"], "support_grant", "{grant}");
+    end_session(ws, serving).await;
+}
+
+/// Sections 5.27 and 6.12: a machine that is not a voter ignores
+/// `support_request`, and one whose desired state loses `spec.votes` stops
+/// answering and keeps its vote state.
+#[tokio::test]
+async fn a_machine_that_is_not_a_voter_ignores_support_request() {
+    let dir = TempDir::new();
+    let TermNode {
+        session,
+        store,
+        key,
+        _observed,
+    } = term_node(&dir, Some(snapshot(1, Vec::new()))).await;
+    let (mut ws, serving) = welcomed(session, 1).await;
+    send(
+        &mut ws,
+        support_frame(1, "nod_primary", 15_000, 15_000, "msg_support_1"),
+    )
+    .await;
+    let frames = frames_before_pong(&mut ws, "msg_ping_1").await;
+    assert!(
+        frames.iter().all(|frame| frame["re"] != "msg_support_1"),
+        "no answer, no error: {frames:?}"
+    );
+    assert_eq!(store.support().await.unwrap(), None);
+
+    // A voter's snapshot makes it answer.
+    send(
+        &mut ws,
+        desired_frame_at(2, 1, Some(votes(7)), &key, "msg_voter"),
+    )
+    .await;
+    reply_to(&mut ws, "msg_voter").await;
+    send(
+        &mut ws,
+        support_frame(1, "nod_primary", 15_000, 15_000, "msg_support_2"),
+    )
+    .await;
+    let grant = reply_to(&mut ws, "msg_support_2").await;
+    assert_eq!(grant["type"], "support_grant", "{grant}");
+    assert_eq!(grant["body"]["voters_version"], 7);
+    let kept = store.support().await.unwrap().expect("stored");
+
+    // Losing `spec.votes` stops the answers and keeps the vote state.
+    send(&mut ws, desired_frame_at(3, 1, None, &key, "msg_not_voter")).await;
+    reply_to(&mut ws, "msg_not_voter").await;
+    send(
+        &mut ws,
+        support_frame(1, "nod_primary", 15_000, 15_000, "msg_support_3"),
+    )
+    .await;
+    let frames = frames_before_pong(&mut ws, "msg_ping_2").await;
+    assert!(
+        frames.iter().all(|frame| frame["re"] != "msg_support_3"),
+        "no answer once not a voter: {frames:?}"
+    );
+    assert_eq!(store.support().await.unwrap(), Some(kept));
+    end_session(ws, serving).await;
+}
+
+/// Section 5.27: `support_ms` below the 3 000 ms floor is `bad_message`,
+/// non-fatal, and promises nothing.
+#[tokio::test]
+async fn a_support_window_below_the_floor_is_a_bad_message() {
+    let dir = TempDir::new();
+    let TermNode {
+        session,
+        store,
+        _observed,
+        ..
+    } = term_node(&dir, Some(voter_snapshot(1, 3120))).await;
+    let (mut ws, serving) = welcomed(session, 1).await;
+    send(
+        &mut ws,
+        support_frame(1, "nod_primary", 2_999, 15_000, "msg_support"),
+    )
+    .await;
+    let refused = reply_to(&mut ws, "msg_support").await;
+    assert_eq!(refused["type"], "error", "{refused}");
+    assert_eq!(refused["body"]["code"], "bad_message");
+    assert_eq!(refused["body"]["fatal"], false);
+    assert!(refused["body"].get("term").is_none(), "{refused}");
+    assert_eq!(store.support().await.unwrap(), None);
+    // The session goes on.
+    frames_before_pong(&mut ws, "msg_ping").await;
+    end_session(ws, serving).await;
+}
+
+/// Sections 5.27 and 8.8 (ADR 0280): a voter that voted in this term for
+/// another candidate answers `bad_message`, non-fatal, carrying its term, and
+/// promises nothing.
+#[tokio::test]
+async fn a_vote_in_this_term_for_another_candidate_refuses_support() {
+    let dir = TempDir::new();
+    let TermNode {
+        session,
+        store,
+        _observed,
+        ..
+    } = term_node(&dir, Some(voter_snapshot(1, 3120))).await;
+    store
+        .set_meta(VOTE, r#"{"term":2,"candidate":"nod_other"}"#)
+        .await
+        .unwrap();
+    let (mut ws, serving) = welcomed(session, 2).await;
+    send(
+        &mut ws,
+        support_frame(2, "nod_primary", 15_000, 15_000, "msg_support"),
+    )
+    .await;
+    let refused = reply_to(&mut ws, "msg_support").await;
+    assert_eq!(refused["type"], "error", "{refused}");
+    assert_eq!(refused["body"]["code"], "bad_message");
+    assert_eq!(refused["body"]["fatal"], false);
+    assert_eq!(refused["body"]["term"], 2);
+    assert_eq!(store.support().await.unwrap(), None);
+
+    // The candidate it voted for is supported.
+    send(
+        &mut ws,
+        support_frame(2, "nod_other", 15_000, 15_000, "msg_support_other"),
+    )
+    .await;
+    let grant = reply_to(&mut ws, "msg_support_other").await;
+    assert_eq!(grant["type"], "support_grant", "{grant}");
+    end_session(ws, serving).await;
 }

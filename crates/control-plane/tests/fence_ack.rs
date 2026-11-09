@@ -835,6 +835,7 @@ async fn a_refused_fence_ack_lets_the_desired_state_out_and_is_sent_again() {
             code: ErrorCode::BadMessage,
             message: "the fence_ack could not be read".to_string(),
             fatal: false,
+            term: None,
         }),
         Some(command["id"].as_str().unwrap()),
     )

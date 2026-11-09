@@ -373,6 +373,10 @@ pub async fn build_spec(
             backup_repository,
             backups,
             volumes,
+            // The voters' side of section 6.12 is sent once the primary's
+            // side of section 8.8 exists; until then no machine is a voter.
+            votes: None,
+            witness: None,
         },
         held_back,
     })

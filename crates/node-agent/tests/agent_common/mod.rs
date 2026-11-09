@@ -173,6 +173,8 @@ pub fn snapshot_full(
                 volumes,
                 backups: Vec::new(),
                 backup_repository: None,
+                votes: None,
+                witness: None,
             },
             signature: String::new(),
         },
