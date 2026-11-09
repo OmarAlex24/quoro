@@ -15,11 +15,12 @@ import { isApiProblem } from '../api/fetcher';
 import { DEPLOY_PHASE_LABELS, relativeTime } from '../lib/app-status';
 import { isBuildTerminal, shortBuildId, shortCommit } from '../lib/build-status';
 import {
+  activeDeploymentId,
   buildkitSteps,
   estimateRun,
   formatClock,
   formatSpan,
-  isDeploymentLive,
+  isRunLive,
   joinRuns,
   miniTape,
   miniTapeScale,
@@ -51,13 +52,6 @@ import { Tag } from './ui/tag';
 export const RUN_PAGE = { limit: 20 } as const;
 /** History rows read their progress lines; older ones keep to the list. */
 const HISTORY_ROWS = 10;
-
-const runIsLive = (run: DeployRun | undefined): boolean => {
-  if (!run) return false;
-  if (run.build && !isBuildTerminal(run.build.status)) return true;
-  if (run.build?.status === 'succeeded' && !run.deployment) return run.build.deployment_id === null;
-  return run.deployment !== null && isDeploymentLive(run.deployment.status);
-};
 
 /** `github.com/example/api` from `https://github.com/example/api.git`. */
 const repoLabel = (url: string): string =>
@@ -179,24 +173,24 @@ function RunsView({
       },
     },
   });
-  const deploymentsQuery = useListAppDeployments(app.id, RUN_PAGE, {
-    query: {
-      refetchInterval: (query) => {
-        const newest = query.state.data?.items[0];
-        return newest !== undefined && isDeploymentLive(newest.status) ? 2_000 : 10_000;
-      },
-    },
-  });
-
   const builds = useMemo(
     () => (source !== null ? (buildsQuery.data?.items ?? []) : []),
     [source, buildsQuery.data],
   );
-  const deployments = useMemo(() => deploymentsQuery.data?.items ?? [], [deploymentsQuery.data]);
+  // Every 2 s while the newest run moves, the build's included: when the
+  // build ends, the deployment it starts is read without waiting 10 s.
+  const deploymentsQuery = useListAppDeployments(app.id, RUN_PAGE, {
+    query: {
+      refetchInterval: (query) =>
+        isRunLive(joinRuns(builds, query.state.data?.items)[0]) ? 2_000 : 10_000,
+    },
+  });
+
+  const deployments = deploymentsQuery.data?.items;
   const runs = useMemo(() => joinRuns(builds, deployments), [builds, deployments]);
   const top = runs[0];
   const history = runs.slice(1, 1 + HISTORY_ROWS);
-  const live = runIsLive(top);
+  const live = isRunLive(top);
 
   const topLogs = useGetDeploymentLogs(top?.deployment?.id ?? '', {
     query: {
@@ -210,7 +204,7 @@ function RunsView({
       getGetDeploymentLogsQueryOptions(run.deployment?.id ?? '', {
         query: {
           enabled: run.deployment !== null,
-          staleTime: runIsLive(run) ? 0 : Infinity,
+          staleTime: isRunLive(run) ? 0 : Infinity,
           retry: false,
         },
       }),
@@ -223,6 +217,9 @@ function RunsView({
     runTimeline(run, historyLogs[index]?.data?.items, now),
   );
   const estimate = topTimeline ? estimateRun(historyTimelines, topTimeline.kind) : null;
+  // Which row is Active comes from the same two lists the rows are drawn
+  // from, never from the app read, which lands at another moment.
+  const activeId = activeDeploymentId(topTimeline ? [topTimeline, ...historyTimelines] : historyTimelines);
 
   const listError = deploymentsQuery.error ?? (source !== null ? buildsQuery.error : null);
   const loading = deploymentsQuery.isPending || (source !== null && buildsQuery.isPending);
@@ -277,6 +274,7 @@ function RunsView({
           app={app}
           projectId={projectId}
           timeline={topTimeline}
+          activeId={activeId}
           estimate={estimate}
           entries={topLogs.data?.items}
           entriesError={topLogs.error}
@@ -288,7 +286,7 @@ function RunsView({
       )}
 
       {historyTimelines.length > 0 ? (
-        <History app={app} projectId={projectId} timelines={historyTimelines} />
+        <History app={app} projectId={projectId} timelines={historyTimelines} activeId={activeId} />
       ) : null}
     </>
   );
@@ -299,6 +297,7 @@ function RunBox({
   app,
   projectId,
   timeline,
+  activeId,
   estimate,
   entries,
   entriesError,
@@ -310,6 +309,7 @@ function RunBox({
   app: AppDetail;
   projectId: string;
   timeline: RunTimeline;
+  activeId: string | null;
   estimate: Estimate | null;
   entries: readonly DeploymentLogEntry[] | undefined;
   entriesError: unknown;
@@ -321,7 +321,7 @@ function RunBox({
   const { run } = timeline;
   const build = run.build;
   const live = timeline.state === 'live';
-  const tag = runTag(timeline, app.current_deployment_id);
+  const tag = runTag(timeline, activeId);
   const remaining = remainingSeconds(timeline, estimate);
   const buildLive = build !== null && !isBuildTerminal(build.status);
   const lines = useBuildLines(build?.id ?? null, buildLive);
@@ -465,10 +465,12 @@ function History({
   app,
   projectId,
   timelines,
+  activeId,
 }: {
   app: AppDetail;
   projectId: string;
   timelines: readonly RunTimeline[];
+  activeId: string | null;
 }) {
   const scale = miniTapeScale(timelines);
   return (
@@ -484,6 +486,7 @@ function History({
             app={app}
             projectId={projectId}
             timeline={timeline}
+            activeId={activeId}
             scale={scale}
           />
         ))}
@@ -501,15 +504,17 @@ function HistoryRow({
   app,
   projectId,
   timeline,
+  activeId,
   scale,
 }: {
   app: AppDetail;
   projectId: string;
   timeline: RunTimeline;
+  activeId: string | null;
   scale: number;
 }) {
   const { run } = timeline;
-  const tag = runTag(timeline, app.current_deployment_id);
+  const tag = runTag(timeline, activeId);
   const when = relativeTime(new Date(timeline.start).toISOString());
   const failedBuild: Build | null = run.build?.status === 'failed' ? run.build : null;
   const label = `${formatSpan(timeline.recorded)} recorded${timeline.state === 'failed' ? ', failed' : ''}`;
