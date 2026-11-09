@@ -778,11 +778,7 @@ impl NodeStore {
     pub async fn highest_term(&self) -> Result<Option<u64>, AgentError> {
         self.meta(HIGHEST_TERM)
             .await?
-            .map(|text| {
-                text.parse::<u64>().map_err(|_| {
-                    AgentError::Store(format!("the stored term {text:?} is not a term"))
-                })
-            })
+            .map(|text| parse_term(&text))
             .transpose()
     }
 
@@ -793,17 +789,70 @@ impl NodeStore {
     ///
     /// [`AgentError::Store`] on a SQLite failure.
     pub async fn raise_term(&self, term: u64) -> Result<(), AgentError> {
-        sqlx::query(
-            "INSERT INTO node_meta (key, value) VALUES (?, ?) \
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value \
-             WHERE CAST(node_meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)",
-        )
-        .bind(HIGHEST_TERM)
-        .bind(term.to_string())
-        .execute(&self.pool)
-        .await
-        .map_err(store_error)
-        .map(|_| ())
+        let mut conn = self.pool.acquire().await.map_err(store_error)?;
+        raise_term_on(&mut conn, term).await
+    }
+
+    /// Reads a voter's term, vote and support, lets `decide` choose what to
+    /// write, and writes it, in one transaction (sections 8.8 and 8.9).
+    ///
+    /// The transaction starts with `BEGIN IMMEDIATE`, so it holds SQLite's
+    /// write lock from its first read: a vote written by another task either
+    /// commits before it, and `decide` sees it, or waits for it, and then
+    /// sees the promise it stored. A support is therefore never granted on a
+    /// vote state that a vote changed in between. What `decide` returns is
+    /// handed back only once the transaction committed, so an answer built
+    /// from it goes out after what it promises is durable.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] when the state cannot be read or parsed, or the
+    /// writes or the commit fail; nothing is written then.
+    pub async fn update_vote_state<T>(
+        &self,
+        decide: impl FnOnce(&crate::vote::VoteState) -> (T, crate::vote::VoteWrite),
+    ) -> Result<T, AgentError> {
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(store_error)?;
+        let highest_term = meta_on(&mut tx, HIGHEST_TERM)
+            .await?
+            .map(|text| parse_term(&text))
+            .transpose()?;
+        let vote = meta_on(&mut tx, VOTE)
+            .await?
+            .map(|text| parse_json(VOTE, &text))
+            .transpose()?;
+        let support = meta_on(&mut tx, SUPPORT)
+            .await?
+            .map(|text| parse_json(SUPPORT, &text))
+            .transpose()?;
+        let state = crate::vote::VoteState {
+            highest_term,
+            vote,
+            support,
+        };
+        let (decided, write) = decide(&state);
+        if let Some(term) = write.term {
+            raise_term_on(&mut tx, term).await?;
+        }
+        if let Some(support) = &write.support {
+            let text = serde_json::to_string(support)
+                .map_err(|e| AgentError::Store(format!("could not encode the support: {e}")))?;
+            sqlx::query(
+                "INSERT INTO node_meta (key, value) VALUES (?, ?) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )
+            .bind(SUPPORT)
+            .bind(text)
+            .execute(&mut *tx)
+            .await
+            .map_err(store_error)?;
+        }
+        tx.commit().await.map_err(store_error)?;
+        Ok(decided)
     }
 
     /// The voter's vote, when it voted (section 8.9).
@@ -848,10 +897,7 @@ impl NodeStore {
     ) -> Result<Option<T>, AgentError> {
         self.meta(key)
             .await?
-            .map(|text| {
-                serde_json::from_str(&text)
-                    .map_err(|e| AgentError::Store(format!("the stored {key} does not parse: {e}")))
-            })
+            .map(|text| parse_json(key, &text))
             .transpose()
     }
 
@@ -2515,6 +2561,46 @@ fn transcript_row(row: sqlx::sqlite::SqliteRow) -> Result<StoredTranscript, Agen
 
 fn store_error(error: sqlx::Error) -> AgentError {
     AgentError::Store(error.to_string())
+}
+
+/// One `node_meta` value, read on `conn`.
+async fn meta_on(
+    conn: &mut sqlx::SqliteConnection,
+    key: &str,
+) -> Result<Option<String>, AgentError> {
+    sqlx::query_scalar("SELECT value FROM node_meta WHERE key = ?")
+        .bind(key)
+        .fetch_optional(conn)
+        .await
+        .map_err(store_error)
+}
+
+/// Stores `term` as the highest term seen when it is above the stored one,
+/// in one statement on `conn`, so a term is never lowered (section 8.8).
+async fn raise_term_on(conn: &mut sqlx::SqliteConnection, term: u64) -> Result<(), AgentError> {
+    sqlx::query(
+        "INSERT INTO node_meta (key, value) VALUES (?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value \
+         WHERE CAST(node_meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)",
+    )
+    .bind(HIGHEST_TERM)
+    .bind(term.to_string())
+    .execute(conn)
+    .await
+    .map_err(store_error)
+    .map(|_| ())
+}
+
+/// A stored term ([`HIGHEST_TERM`]).
+fn parse_term(text: &str) -> Result<u64, AgentError> {
+    text.parse::<u64>()
+        .map_err(|_| AgentError::Store(format!("the stored term {text:?} is not a term")))
+}
+
+/// A JSON `node_meta` value stored under `key`.
+fn parse_json<T: serde::de::DeserializeOwned>(key: &str, text: &str) -> Result<T, AgentError> {
+    serde_json::from_str(text)
+        .map_err(|e| AgentError::Store(format!("the stored {key} does not parse: {e}")))
 }
 
 /// The directory under the data directory that holds quarantined copies of

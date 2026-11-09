@@ -313,6 +313,10 @@ pub struct Session {
     /// The host clock a voter's promise is measured on: `CLOCK_BOOTTIME`
     /// and the kernel boot id (section 8.8), the lease service's own.
     host_clock: Arc<dyn HostClock>,
+    /// The `primary_node_id` of the current session's `welcome`: in a term
+    /// it did not vote in, a voter supports only this primary (section 8.8
+    /// "Terms"). `None` before the `welcome`.
+    session_primary: Option<String>,
 }
 
 /// A `lease_revoke` whose fence the session loop runs.
@@ -440,6 +444,7 @@ impl Session {
             reported_applied_rev: 0,
             started_revoke: None,
             host_clock: Arc::new(SystemHostClock),
+            session_primary: None,
         }
     }
 
@@ -766,6 +771,7 @@ impl Session {
         };
 
         let (welcome_id, welcome) = welcome;
+        self.session_primary = None;
 
         // Section 8.8 "Terms" (rule 2 of section 4.2): the welcome's term is
         // compared with the highest term this machine has seen before
@@ -790,6 +796,7 @@ impl Session {
             }
         }
 
+        self.session_primary = Some(welcome.primary_node_id.clone());
         let heartbeat = Duration::from_millis(welcome.heartbeat_interval_ms.max(1));
         let timeout = Duration::from_millis(welcome.session_timeout_ms.max(1));
         info!(
@@ -1587,9 +1594,10 @@ impl Session {
     /// Answers one `support_request` (sections 5.27, 5.28 and 8.8, ADR 0169).
     ///
     /// `v_recv` is read before anything else, so the promise errs late. The
-    /// rules and their order are [`vote::answer_support`]'s; the voter's
+    /// rules and their order are [`vote::decide_support`]'s; the voter's
     /// `voters_version` is that of the newest stored desired state, which is
-    /// the one the session holds. A lower term ends the session like a
+    /// the one the session holds, and the primary of its session is the one
+    /// this session's `welcome` named. A lower term ends the session like a
     /// stale `welcome`; a promise that could not be stored sends nothing.
     async fn on_support_request<S>(
         &mut self,
@@ -1606,7 +1614,15 @@ impl Session {
             .as_ref()
             .and_then(|snapshot| snapshot.state.spec.votes.as_ref())
             .map(|votes| votes.version);
-        match vote::answer_support(&self.store, voters_version, request, &received).await {
+        match vote::answer_support(
+            &self.store,
+            voters_version,
+            self.session_primary.as_deref(),
+            request,
+            &received,
+        )
+        .await
+        {
             SupportAnswer::Ignore => {
                 debug!("not a voter; ignoring a support_request");
             }

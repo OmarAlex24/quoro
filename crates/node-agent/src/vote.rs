@@ -190,14 +190,17 @@ pub enum TermCheck {
 
 /// Compares `term` with the highest term seen and stores it when it is higher
 /// (section 8.8 "Terms"). A machine with no stored term has seen none; terms
-/// start at 1.
+/// start at 1. A vote counts among the terms seen (section 8.8), so the term
+/// of a stored vote counts even if the stored term was not raised with it.
 ///
 /// # Errors
 ///
 /// [`AgentError::Store`] when the stored term cannot be read or the higher one
 /// cannot be stored. The caller then acts on nothing the frame carries.
 pub async fn check_term(store: &NodeStore, term: u64) -> Result<TermCheck, AgentError> {
-    let highest = store.highest_term().await?.unwrap_or(0);
+    let stored = store.highest_term().await?.unwrap_or(0);
+    let voted = store.vote().await?.map_or(0, |vote| vote.term);
+    let highest = stored.max(voted);
     if term < highest {
         return Ok(TermCheck::Stale { highest });
     }
@@ -256,11 +259,47 @@ pub enum SupportAnswer {
     Withhold(String),
 }
 
-/// Answers one `support_request` (sections 5.27 and 8.8).
+/// A voter's term, vote and support as one transaction read them
+/// ([`NodeStore::update_vote_state`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VoteState {
+    /// The highest term seen, `None` before the first.
+    pub highest_term: Option<u64>,
+    /// The vote, when the voter voted (section 8.9).
+    pub vote: Option<StoredVote>,
+    /// The support, when the voter granted one.
+    pub support: Option<StoredSupport>,
+}
+
+impl VoteState {
+    /// The highest term seen: the stored one, or the term of the vote when
+    /// that is higher. A vote is a term the voter has seen (section 8.8
+    /// "Terms"), so it counts even if the stored term was not raised with it.
+    #[must_use]
+    pub fn highest(&self) -> u64 {
+        let stored = self.highest_term.unwrap_or(0);
+        self.vote
+            .as_ref()
+            .map_or(stored, |vote| stored.max(vote.term))
+    }
+}
+
+/// What the transaction of [`NodeStore::update_vote_state`] writes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VoteWrite {
+    /// A term to store as the highest seen; a lower one changes nothing.
+    pub term: Option<u64>,
+    /// The new support, written before the grant that promises it goes out.
+    pub support: Option<StoredSupport>,
+}
+
+/// Decides the answer to one `support_request` from the vote state `state`
+/// (sections 5.27 and 8.8), and what to write with it.
 ///
 /// `voters_version` is `spec.votes.version` of the machine's newest desired
 /// state, `None` when it carries no `spec.votes` and the machine is therefore
-/// not a voter (section 6.12). `received` is the clock read when the request
+/// not a voter (section 6.12). `session_primary` is the `primary_node_id` of
+/// this session's `welcome`. `received` is the clock read when the request
 /// arrived.
 ///
 /// The order:
@@ -268,80 +307,126 @@ pub enum SupportAnswer {
 /// 1. The term, on every machine. Section 8.8 "Terms" has every machine,
 ///    voter or not, refuse a lower term in a `support_request` and keep a
 ///    higher one, so the term check runs before the voter check; a
-///    non-voter then ignores a request of its own term or a higher one.
+///    non-voter then ignores a request of its own term or a higher one. The
+///    term of a stored vote counts ([`VoteState::highest`]), and is stored
+///    as the highest term when it is above it.
 /// 2. A machine that is not a voter ignores the request.
-/// 3. `support_ms` below 3 000 is `bad_message`, without a term.
-/// 4. A vote in this term for a candidate other than `primary_node_id` is
+/// 3. A vote in this term for a candidate other than `primary_node_id` is
 ///    `bad_message` carrying the voter's term (section 5.27, ADR 0280). After
-///    step 1 the request's term is the voter's highest.
-/// 5. The promise and the horizon are stored, and only then is the grant
-///    returned. A host with no `CLOCK_BOOTTIME` or no boot id cannot keep a
-///    promise across a restart (section 8.8 "Restarts"): a stored instant
-///    would mean nothing to the next agent, and the voter could vote for a
-///    candidate while the primary still counts its support. So it grants
-///    nothing, as when the store cannot be written: the primary then lacks
-///    this voter's support, which is the safe side of ADR 0169.
-pub async fn answer_support(
-    store: &NodeStore,
-    voters_version: Option<u64>,
+///    step 1 the request's term is the voter's highest. It comes before the
+///    floor, so a request from the wrong candidate always learns the term.
+/// 4. In a term the voter did not vote in, it supports only the primary of
+///    its session (section 8.8 "Terms"): a `primary_node_id` other than the
+///    `welcome`'s is `bad_message`, without a term.
+/// 5. `support_ms` below 3 000 is `bad_message`, without a term.
+/// 6. A host with no `CLOCK_BOOTTIME` or no boot id cannot keep a promise
+///    across a restart (section 8.8 "Restarts"): a stored instant would mean
+///    nothing to the next agent, and the voter could vote for a candidate
+///    while the primary still counts its support. So it grants nothing, as
+///    when the store cannot be written: the primary then lacks this voter's
+///    support, which is the safe side of ADR 0169.
+/// 7. Otherwise the new promise and horizon ([`support_after`]) are written,
+///    and the grant follows.
+#[must_use]
+pub fn decide_support(
+    state: &VoteState,
     request: &SupportRequest,
+    voters_version: Option<u64>,
+    session_primary: Option<&str>,
     received: &Received,
-) -> SupportAnswer {
-    match check_term(store, request.term).await {
-        Ok(TermCheck::Stale { highest }) => return SupportAnswer::Stale { highest },
-        Ok(TermCheck::Current | TermCheck::Raised) => {}
-        Err(e) => return SupportAnswer::Withhold(format!("could not keep the term: {e}")),
+) -> (SupportAnswer, VoteWrite) {
+    let highest = state.highest();
+    if request.term < highest {
+        let write = VoteWrite {
+            term: (state.highest_term.unwrap_or(0) < highest).then_some(highest),
+            support: None,
+        };
+        return (SupportAnswer::Stale { highest }, write);
     }
-    let Some(voters_version) = voters_version else {
-        return SupportAnswer::Ignore;
+    let raise = VoteWrite {
+        term: (state.highest_term.unwrap_or(0) < request.term).then_some(request.term),
+        support: None,
     };
+    let Some(voters_version) = voters_version else {
+        return (SupportAnswer::Ignore, raise);
+    };
+    let voted_in_term = state.vote.as_ref().filter(|vote| vote.term == request.term);
+    if let Some(vote) = voted_in_term
+        && vote.candidate != request.primary_node_id
+    {
+        let answer = SupportAnswer::Refuse {
+            message: format!(
+                "this voter voted in term {} for {}, not for {}",
+                vote.term, vote.candidate, request.primary_node_id
+            ),
+            term: Some(request.term),
+        };
+        return (answer, raise);
+    }
+    if voted_in_term.is_none() && session_primary != Some(request.primary_node_id.as_str()) {
+        let answer = SupportAnswer::Refuse {
+            message: format!(
+                "{} is not the primary of this session ({}), and this voter did not vote in \
+                 term {}",
+                request.primary_node_id,
+                session_primary.unwrap_or("none"),
+                request.term
+            ),
+            term: None,
+        };
+        return (answer, raise);
+    }
     if request.support_ms < MIN_SUPPORT_MS {
-        return SupportAnswer::Refuse {
+        let answer = SupportAnswer::Refuse {
             message: format!(
                 "support_ms {} is below the {MIN_SUPPORT_MS} ms floor",
                 request.support_ms
             ),
             term: None,
         };
-    }
-    match store.vote().await {
-        Ok(Some(vote))
-            if vote.term == request.term && vote.candidate != request.primary_node_id =>
-        {
-            return SupportAnswer::Refuse {
-                message: format!(
-                    "this voter voted in term {} for {}, not for {}",
-                    vote.term, vote.candidate, request.primary_node_id
-                ),
-                term: Some(request.term),
-            };
-        }
-        Ok(_) => {}
-        // A vote that cannot be read may be one for another candidate.
-        Err(e) => return SupportAnswer::Withhold(format!("could not read the vote: {e}")),
+        return (answer, raise);
     }
     let (Some(boot_id), Some(v_recv)) = (received.boot_id.as_deref(), received.boottime) else {
-        return SupportAnswer::Withhold(
+        let answer = SupportAnswer::Withhold(
             "this host has no CLOCK_BOOTTIME or no boot id, so a promise could not outlast an \
              agent restart (section 8.8)"
                 .to_owned(),
         );
+        return (answer, raise);
     };
-    let stored = match store.support().await {
-        Ok(stored) => stored,
-        // Without the stored horizon a new one might be earlier.
-        Err(e) => return SupportAnswer::Withhold(format!("could not read the support: {e}")),
-    };
-    let support = support_after(stored.as_ref(), request, boot_id, v_recv);
-    if let Err(e) = store.save_support(&support).await {
-        return SupportAnswer::Withhold(format!("could not store the promise: {e}"));
-    }
-    SupportAnswer::Grant(SupportGrant {
+    let support = support_after(state.support.as_ref(), request, boot_id, v_recv);
+    let answer = SupportAnswer::Grant(SupportGrant {
         term: request.term,
         support_ms: request.support_ms,
         max_lease_ms: request.max_lease_ms,
         voters_version,
-    })
+    });
+    (
+        answer,
+        VoteWrite {
+            support: Some(support),
+            ..raise
+        },
+    )
+}
+
+/// Answers one `support_request` (sections 5.27 and 8.8): reads the vote
+/// state, decides ([`decide_support`]) and writes what the answer promises,
+/// in one transaction, and returns the answer only once it committed. A
+/// state that cannot be read or written sends nothing.
+pub async fn answer_support(
+    store: &NodeStore,
+    voters_version: Option<u64>,
+    session_primary: Option<&str>,
+    request: &SupportRequest,
+    received: &Received,
+) -> SupportAnswer {
+    store
+        .update_vote_state(|state| {
+            decide_support(state, request, voters_version, session_primary, received)
+        })
+        .await
+        .unwrap_or_else(|e| SupportAnswer::Withhold(format!("could not keep the vote state: {e}")))
 }
 
 /// Brings the stored support onto the current boot at agent start, before any
@@ -382,8 +467,8 @@ mod tests {
     use quoro_proto::wire::SupportRequest;
 
     use super::{
-        Received, StoredSupport, StoredVote, SupportAnswer, TermCheck, answer_support, check_term,
-        horizon_span, rebase_at_start, support_after,
+        Received, StoredSupport, StoredVote, SupportAnswer, TermCheck, VoteState, VoteWrite,
+        answer_support, check_term, decide_support, horizon_span, rebase_at_start, support_after,
     };
     use crate::lease::{HostClock, ManualHostClock};
     use crate::store::{NodeStore, VOTE};
@@ -396,6 +481,9 @@ mod tests {
     fn ms(ms: u64) -> Duration {
         Duration::from_millis(ms)
     }
+
+    /// The `primary_node_id` of the session's `welcome`.
+    const PRIMARY: Option<&str> = Some("nod_primary");
 
     fn request(term: u64, support_ms: u64, max_lease_ms: u64) -> SupportRequest {
         SupportRequest {
@@ -433,7 +521,7 @@ mod tests {
     }
 
     async fn granted(store: &NodeStore, request: &SupportRequest, received: &Received) {
-        let answer = answer_support(store, Some(3120), request, received).await;
+        let answer = answer_support(store, Some(3120), PRIMARY, request, received).await;
         assert!(matches!(answer, SupportAnswer::Grant(_)), "{answer:?}");
     }
 
@@ -559,6 +647,7 @@ mod tests {
         let answer = answer_support(
             &store,
             Some(3120),
+            PRIMARY,
             &request(2, 15_000, 15_000),
             &at("boot-a", secs(500)),
         )
@@ -601,8 +690,14 @@ mod tests {
                 boottime: None,
             },
         ] {
-            let answer =
-                answer_support(&store, Some(3120), &request(1, 15_000, 15_000), &received).await;
+            let answer = answer_support(
+                &store,
+                Some(3120),
+                PRIMARY,
+                &request(1, 15_000, 15_000),
+                &received,
+            )
+            .await;
             assert!(matches!(answer, SupportAnswer::Withhold(_)), "{answer:?}");
         }
         assert_eq!(store.support().await.unwrap(), None);
@@ -618,15 +713,15 @@ mod tests {
         let now = at("boot-a", secs(500));
         store.raise_term(4).await.unwrap();
         assert_eq!(
-            answer_support(&store, None, &request(3, 15_000, 15_000), &now).await,
+            answer_support(&store, None, PRIMARY, &request(3, 15_000, 15_000), &now).await,
             SupportAnswer::Stale { highest: 4 }
         );
         assert_eq!(
-            answer_support(&store, None, &request(4, 15_000, 15_000), &now).await,
+            answer_support(&store, None, PRIMARY, &request(4, 15_000, 15_000), &now).await,
             SupportAnswer::Ignore
         );
         assert!(matches!(
-            answer_support(&store, Some(1), &request(4, 2_999, 15_000), &now).await,
+            answer_support(&store, Some(1), PRIMARY, &request(4, 2_999, 15_000), &now).await,
             SupportAnswer::Refuse { term: None, .. }
         ));
         let vote = StoredVote {
@@ -638,7 +733,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            answer_support(&store, Some(1), &request(4, 15_000, 15_000), &now).await,
+            answer_support(&store, Some(1), PRIMARY, &request(4, 15_000, 15_000), &now).await,
             SupportAnswer::Refuse { term: Some(4), .. }
         ));
         assert_eq!(store.support().await.unwrap(), None, "nothing promised");
@@ -731,5 +826,175 @@ mod tests {
         assert_eq!(stored.boot_id, "boot-b");
         assert_eq!(stored.promise(), secs(20 + 60));
         assert_eq!(stored.horizon(), secs(20 + 60 + 60 + 12));
+    }
+
+    fn store_vote(term: u64, candidate: &str) -> String {
+        serde_json::to_string(&StoredVote {
+            term,
+            candidate: candidate.to_owned(),
+        })
+        .unwrap()
+    }
+
+    /// Section 8.8 "Terms": a stored vote above the request's term makes the
+    /// request stale, carrying the higher of the vote's term and the stored
+    /// one, even when the stored term was not raised with the vote; the
+    /// vote's term is then stored. The welcome's and the desired state's
+    /// check count it too.
+    #[tokio::test]
+    async fn a_vote_above_the_request_term_makes_it_stale() {
+        let (_dir, store) = open().await;
+        let now = at("boot-a", secs(500));
+        store.raise_term(2).await.unwrap();
+        store
+            .set_meta(VOTE, &store_vote(4, "nod_primary"))
+            .await
+            .unwrap();
+        assert_eq!(
+            answer_support(&store, Some(1), PRIMARY, &request(3, 15_000, 15_000), &now).await,
+            SupportAnswer::Stale { highest: 4 }
+        );
+        assert_eq!(store.highest_term().await.unwrap(), Some(4));
+        assert_eq!(store.support().await.unwrap(), None);
+        assert_eq!(
+            check_term(&store, 3).await.unwrap(),
+            TermCheck::Stale { highest: 4 }
+        );
+
+        // A stored term above the vote's is the one carried.
+        store.raise_term(6).await.unwrap();
+        assert_eq!(
+            answer_support(&store, Some(1), PRIMARY, &request(5, 15_000, 15_000), &now).await,
+            SupportAnswer::Stale { highest: 6 }
+        );
+    }
+
+    /// Section 8.8 "Terms": the voter decides on the vote state as one
+    /// transaction reads it, and what it promises is written in the same
+    /// transaction. A vote for another candidate in the request's term
+    /// refuses it; with no vote the same request is granted.
+    #[test]
+    fn the_decision_reads_the_vote_with_the_support() {
+        let now = at("boot-a", secs(500));
+        let request = request(3, 15_000, 15_000);
+        let voted = VoteState {
+            highest_term: Some(3),
+            vote: Some(StoredVote {
+                term: 3,
+                candidate: "nod_other".to_owned(),
+            }),
+            support: None,
+        };
+        let (answer, write) = decide_support(&voted, &request, Some(1), PRIMARY, &now);
+        assert!(matches!(
+            answer,
+            SupportAnswer::Refuse { term: Some(3), .. }
+        ));
+        assert_eq!(write, VoteWrite::default(), "nothing written");
+
+        let not_voted = VoteState {
+            highest_term: Some(2),
+            ..VoteState::default()
+        };
+        let (answer, write) = decide_support(&not_voted, &request, Some(1), PRIMARY, &now);
+        assert!(matches!(answer, SupportAnswer::Grant(_)), "{answer:?}");
+        assert_eq!(write.term, Some(3), "the higher term is stored with it");
+        assert_eq!(write.support.unwrap().promise(), secs(515));
+    }
+
+    /// Section 5.27: the vote is checked before the floor, so a request from
+    /// the wrong candidate learns the voter's term even when its window is
+    /// also below the floor.
+    #[tokio::test]
+    async fn the_vote_is_checked_before_the_floor() {
+        let (_dir, store) = open().await;
+        store
+            .set_meta(VOTE, &store_vote(2, "nod_other"))
+            .await
+            .unwrap();
+        let answer = answer_support(
+            &store,
+            Some(1),
+            PRIMARY,
+            &request(2, 2_999, 15_000),
+            &at("boot-a", secs(500)),
+        )
+        .await;
+        assert!(
+            matches!(answer, SupportAnswer::Refuse { term: Some(2), .. }),
+            "{answer:?}"
+        );
+    }
+
+    /// Section 8.8 "Terms": in a term it did not vote in, a voter supports
+    /// only the primary of its session; in a term it voted in, the candidate
+    /// it voted for, whoever the session's primary is.
+    #[tokio::test]
+    async fn without_a_vote_only_the_session_s_primary_is_supported() {
+        let (_dir, store) = open().await;
+        let now = at("boot-a", secs(500));
+        let mut other = request(2, 15_000, 15_000);
+        other.primary_node_id = "nod_other".to_owned();
+        let answer = answer_support(&store, Some(1), PRIMARY, &other, &now).await;
+        assert!(
+            matches!(answer, SupportAnswer::Refuse { term: None, .. }),
+            "{answer:?}"
+        );
+        let answer = answer_support(&store, Some(1), None, &request(2, 15_000, 15_000), &now).await;
+        assert!(
+            matches!(answer, SupportAnswer::Refuse { term: None, .. }),
+            "no session primary, no support: {answer:?}"
+        );
+        assert_eq!(store.support().await.unwrap(), None, "nothing promised");
+
+        store
+            .set_meta(VOTE, &store_vote(2, "nod_other"))
+            .await
+            .unwrap();
+        let answer = answer_support(&store, Some(1), PRIMARY, &other, &now).await;
+        assert!(matches!(answer, SupportAnswer::Grant(_)), "{answer:?}");
+    }
+
+    /// Section 8.9 needs that the primary held no support from a voter once
+    /// it had voted. A vote written while a `support_request` is answered
+    /// either commits first and refuses the request, or waits for the
+    /// answer's promise: the answer's reads and its write are one
+    /// transaction, so it cannot grant on the state from before the vote.
+    #[tokio::test]
+    async fn a_vote_written_meanwhile_is_seen_by_the_answer() {
+        let (_dir, store) = open().await;
+        store.raise_term(2).await.unwrap();
+        // The vote listener of section 8.9 takes the write lock first.
+        let mut voting = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        sqlx::query("INSERT INTO node_meta (key, value) VALUES (?, ?)")
+            .bind(VOTE)
+            .bind(store_vote(2, "nod_other"))
+            .execute(&mut *voting)
+            .await
+            .unwrap();
+
+        let answering = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                answer_support(
+                    &store,
+                    Some(1),
+                    PRIMARY,
+                    &request(2, 15_000, 15_000),
+                    &at("boot-a", secs(500)),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(ms(200)).await;
+        assert!(!answering.is_finished(), "the answer waits for the vote");
+        voting.commit().await.unwrap();
+
+        let answer = answering.await.unwrap();
+        assert!(
+            matches!(answer, SupportAnswer::Refuse { term: Some(2), .. }),
+            "{answer:?}"
+        );
+        assert_eq!(store.support().await.unwrap(), None, "nothing promised");
     }
 }

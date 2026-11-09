@@ -3091,3 +3091,40 @@ async fn a_vote_in_this_term_for_another_candidate_refuses_support() {
     assert_eq!(grant["type"], "support_grant", "{grant}");
     end_session(ws, serving).await;
 }
+
+/// Section 8.8 "Terms": in a term it did not vote in, a voter supports only
+/// the primary of its session. A `support_request` naming another primary
+/// than the session's `welcome` is `bad_message`, non-fatal, without a term,
+/// and promises nothing; the session goes on.
+#[tokio::test]
+async fn a_support_request_for_another_primary_than_the_session_s_is_refused() {
+    let dir = TempDir::new();
+    let TermNode {
+        session,
+        store,
+        _observed,
+        ..
+    } = term_node(&dir, Some(voter_snapshot(1, 3120))).await;
+    let (mut ws, serving) = welcomed(session, 1).await;
+    send(
+        &mut ws,
+        support_frame(1, "nod_impostor", 15_000, 15_000, "msg_support"),
+    )
+    .await;
+    let refused = reply_to(&mut ws, "msg_support").await;
+    assert_eq!(refused["type"], "error", "{refused}");
+    assert_eq!(refused["body"]["code"], "bad_message");
+    assert_eq!(refused["body"]["fatal"], false);
+    assert!(refused["body"].get("term").is_none(), "{refused}");
+    assert_eq!(store.support().await.unwrap(), None);
+
+    // The session's own primary is still supported.
+    send(
+        &mut ws,
+        support_frame(1, "nod_primary", 15_000, 15_000, "msg_support_own"),
+    )
+    .await;
+    let grant = reply_to(&mut ws, "msg_support_own").await;
+    assert_eq!(grant["type"], "support_grant", "{grant}");
+    end_session(ws, serving).await;
+}
