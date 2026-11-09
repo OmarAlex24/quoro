@@ -871,7 +871,7 @@ An entry with `warm.role` `target` is the warm copy, not a second volume: the no
 | `address` | string | yes | This machine's mesh address, `nodes.mesh_address`, with prefix length `/16` |
 | `listen_port` | integer | yes | UDP port the interface listens on; 51820 unless the operator changed it |
 | `peers` | array of object | yes | The other end of each tunnel; on a node the edge, on the edge every node with the `node` role (a star in M5a). From M5b a voter also has every other voter, except that two witness-only machines are not peers (section 6.9) |
-| `allow` | array of object | yes | On a node: what the edge may reach through the interface, one `{ "source": <edge mesh address>, "address": <guest address>, "port": <integer> }` per backend of this node; from M5b also, on the target of a warm volume, `{ "source": <the source's mesh address>, "address": <this node's own mesh address>, "port": <the warm entry's port> }` (section 6.13); `[]` on the edge |
+| `allow` | array of object | yes | On a node: what the edge may reach through the interface, one `{ "source": <edge mesh address>, "address": <guest address>, "port": <integer> }` per backend of this node. From M5b the target of a warm volume also gets `{ "source": <the source's mesh address>, "address": <this machine's own mesh address>, "port": <the warm entry's port> }` (section 6.13), on any machine, the edge included: a machine with both `edge` and `node` can be the warm node (ADR 0275), and a failover makes the source the target. On the edge `allow` is otherwise `[]` (ADR 0296) |
 
 Each peer:
 
@@ -879,7 +879,7 @@ Each peer:
 | --- | --- | --- | --- |
 | `node_id` | string (`nod_`) | yes | The peer machine |
 | `public_key` | string | yes | Its `mesh_public_key` |
-| `endpoint` | string | no | `host:port` to dial: the source address of the peer's session with `listen_port`, with the loopback fallback of section 6.9 (ADR 0144, ADR 0266); absent for a peer whose session the primary has not seen since it started, which dials this machine instead |
+| `endpoint` | string | no | `host:port` to dial: the source address of the peer's session with `listen_port`, with the loopback fallback of section 6.9 (ADR 0144, ADR 0266); absent for a peer whose session the primary has not seen since it started, which dials this machine instead. On a machine whose only role is `edge`, the entries for nodes carry no `endpoint` and no `persistent_keepalive_s`, as in M5a: that machine is not a voter, and the nodes dial it (section 6.9, ADR 0296) |
 | `allowed_ips` | array of string | yes | CIDRs routed to the peer: on the edge, a node's mesh address `/32` and its guest subnet; on a node, the edge's mesh address `/32`; between two voters, the other voter's mesh address `/32` |
 | `persistent_keepalive_s` | integer | no | Keepalive interval, 25: on a node's entry for the edge, since any node may be behind NAT (ADR 0144), and from M5b on every entry between two voters (ADR 0266) |
 
