@@ -742,11 +742,12 @@ impl NodeHub {
     ///   row (a restore, a deletion), so this read sees it;
     /// - the lease is in no node's `fence_failure` and not in this node's
     ///   `fence_ack_pending`;
-    /// - the app's HA policy wants a `local` lease: `none` or `cold` (D-0047).
-    ///   A `warm` or `hot` app's lease is `expiring`, whose first grant #604
-    ///   builds; it is not given back yet;
     /// - for an `expiring` row, the lease's gate has passed (section 8.4).
     ///   Until then it answers [`Regrant::Wait`].
+    ///
+    /// The grant has the mode the app's HA policy wants: `expiring` for a
+    /// `warm` or `hot` app while voters support it, `local` otherwise
+    /// ([`leases::grant_app_lease`]).
     pub(crate) async fn regrant_lease(
         &self,
         node_id: &str,
@@ -801,44 +802,25 @@ impl NodeHub {
             );
             return Ok(Regrant::No);
         }
-        let policy: Option<String> = sqlx::query_scalar("SELECT ha_policy FROM apps WHERE id = ?")
-            .bind(&row.resource_id)
-            .fetch_optional(&mut *w.tx)
-            .await?;
-        match policy.as_deref() {
-            Some("none" | "cold") => {}
-            Some(policy) => {
-                tracing::info!(
-                    node_id,
-                    lease_id,
-                    policy,
-                    "this policy's lease is given back expiring, which is not built yet"
-                );
-                return Ok(Regrant::No);
-            }
-            None => return Ok(Regrant::No),
-        }
-        // The gate of an `expiring` row; a `local` row has none.
-        match self.0.authority.record_local_grant(lease_id) {
-            Ok(()) => {}
-            Err(crate::authority::Refused::GateOpen { remaining }) => {
-                return Ok(Regrant::Wait(remaining));
-            }
-            Err(refused) => {
-                tracing::warn!(
-                    node_id,
-                    lease_id,
-                    ?refused,
-                    "the authority refused a regrant"
-                );
-                return Ok(Regrant::No);
-            }
-        }
         let actor = Actor {
             kind: ActorType::Node,
             id: node_id.to_string(),
         };
-        let lease = leases::grant_app_lease(&mut w.tx, &row.resource_id, node_id, &actor).await?;
+        // The node reported the lease's expiry, so it holds none and the
+        // grant's mode is free (ADR 0258).
+        let lease = match leases::grant_app_lease(
+            &mut w.tx,
+            &self.0.authority,
+            &row.resource_id,
+            node_id,
+            &actor,
+            false,
+        )
+        .await?
+        {
+            leases::NewGrant::Granted(lease) => *lease,
+            leases::NewGrant::GateOpen(remaining) => return Ok(Regrant::Wait(remaining)),
+        };
         w.commit().await?;
         tracing::info!(
             node_id,
@@ -2623,7 +2605,14 @@ impl Session {
                     if reported.iter().any(|claimed| claimed.lease_id == lease.id) {
                         continue;
                     }
-                    match leases::is_released(&mut conn, &self.hub.0.releases, false, &lease).await
+                    match leases::is_released(
+                        &mut conn,
+                        &self.hub.0.releases,
+                        &self.hub.0.authority,
+                        false,
+                        &lease,
+                    )
+                    .await
                     {
                         Ok(false) => {}
                         Ok(true) => continue,

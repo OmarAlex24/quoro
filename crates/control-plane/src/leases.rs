@@ -256,12 +256,12 @@ impl Releases {
 /// section 8.5 step 3) at its token, made once the lease was revoked, and so
 /// after its grant, so that the acknowledgement's increment produced that
 /// token; or,
-/// for a `local` lease revoked by then, have been declared lost
-/// (`nodes.lost_at`, ADR 0183) or removed (section 10). An `expiring` lease
-/// of a lost or removed holder also waits for its gate (section 8.4, ADR
-/// 0202), which the primary does not keep yet, so only its holder's answer
-/// releases one. A lease listed in a node's `fence_failure` is refused by
-/// [`grant_app_lease`] whatever this says.
+/// for a lease revoked by then, have been declared lost (`nodes.lost_at`,
+/// ADR 0183) or removed (section 10). Such an `expiring` lease is released
+/// only once its gate has passed on the authority's clock (section 8.4, ADR
+/// 0202): until then its holder may still run the app. A lease listed in a
+/// node's `fence_failure` is refused by [`grant_app_lease`] whatever this
+/// says, and every new token also waits for the lease's gate there.
 ///
 /// # Errors
 ///
@@ -269,6 +269,7 @@ impl Releases {
 pub(crate) async fn is_released(
     conn: &mut SqliteConnection,
     releases: &Releases,
+    authority: &crate::authority::Authority,
     unanswered: bool,
     lease: &Lease,
 ) -> Result<bool, ApiError> {
@@ -294,18 +295,16 @@ pub(crate) async fn is_released(
     {
         return Ok(true);
     }
-    if lease.mode != "local" {
-        return Ok(false);
-    }
     let holder: Option<(Option<String>, String)> =
         sqlx::query_as("SELECT lost_at, status FROM nodes WHERE id = ?")
             .bind(&lease.holder_node_id)
             .fetch_optional(&mut *conn)
             .await?;
     let revoked_at = lease.revoked_at.as_deref().unwrap_or_default();
-    Ok(holder.is_some_and(|(lost_at, status)| {
+    let gone = holder.is_some_and(|(lost_at, status)| {
         status == "removed" || lost_at.is_some_and(|lost_at| revoked_at <= lost_at.as_str())
-    }))
+    });
+    Ok(gone && (lease.mode == "local" || authority.passed(&lease.id)))
 }
 
 /// Every unrevoked lease `node_id` holds, oldest first.
@@ -480,9 +479,41 @@ async fn write_duration(
     Ok(lease)
 }
 
-/// Grants the app's `local` lease to `node_id` and writes its change-log
-/// entry, returning the row. The token is one more than whatever the app's
-/// lease last carried, so ownership changes never reuse a token (section 8.6).
+/// What [`grant_app_lease`] did.
+#[derive(Debug)]
+pub(crate) enum NewGrant {
+    /// The row is written. The caller commits, then sends `lease.grant()`.
+    Granted(Box<Lease>),
+    /// The previous holder's gate is open for this long (section 8.4).
+    /// Nothing is written or recorded.
+    GateOpen(std::time::Duration),
+}
+
+/// Grants the app's lease to `node_id` with a new token and writes its
+/// change-log entry. The token is one more than whatever the app's lease last
+/// carried, so ownership changes never reuse a token (section 8.6).
+///
+/// - **Mode.** A `warm` or `hot` app's lease is `expiring` with duration `D`
+///   (D-0047) while a majority of voters supports `D` (section 8.8);
+///   otherwise it is `local`, and a failover needs the source connected or
+///   declared lost (sections 8.3 and 8.4, "Changing the mode"). The row's
+///   `duration_ms` is `D`, written with the grant: the raise before the grant
+///   (ADR 0203). The previous holder's gate has passed, so nothing it was
+///   granted is still running.
+/// - **Gate.** Whatever the new mode, a new token waits until the previous
+///   `expiring` holder's gate has passed on the authority's clock (section
+///   8.4): [`NewGrant::GateOpen`].
+/// - **ADR 0258.** A new token goes to a node that does not hold the lease
+///   (`held` or `uncertain`), so its mode is free. A restore grants only once
+///   the old holder released the lease, and a regrant only once the node
+///   reported its expiry. Otherwise the caller passes `may_hold`: a node that
+///   may still hold the previous `local` lease gets `local`. An `expiring`
+///   lease whose gate has passed is held by no node, because its holder has
+///   fenced.
+///
+/// The authority records the grant before the caller commits. A failed
+/// commit leaves it ahead of the row, so a later gate ends later than it
+/// must, never earlier.
 ///
 /// # Errors
 ///
@@ -490,11 +521,13 @@ async fn write_duration(
 /// database error.
 pub(crate) async fn grant_app_lease(
     conn: &mut SqliteConnection,
+    authority: &crate::authority::Authority,
     app_id: &str,
     node_id: &str,
     actor: &Actor,
-) -> Result<Lease, ApiError> {
-    let now = now_rfc3339();
+    may_hold: bool,
+) -> Result<NewGrant, ApiError> {
+    use crate::authority::{DEFAULT_DURATION_MS, Grant, GrantKind, Refused};
     let previous = app_lease(conn, app_id).await?;
     // Section 8.5: a lease listed in a node's `fence_failure` is granted to
     // no node until an operator acknowledges the failed fence.
@@ -520,20 +553,63 @@ pub(crate) async fn grant_app_lease(
         || deploy::new_id_with_prefix("lse"),
         |lease| lease.id.clone(),
     );
+    let policy: Option<String> = sqlx::query_scalar("SELECT ha_policy FROM apps WHERE id = ?")
+        .bind(app_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    let pinned_local = may_hold
+        && previous
+            .as_ref()
+            .is_some_and(|lease| lease.mode == "local" && lease.holder_node_id == node_id);
+    let wants_expiring = matches!(policy.as_deref(), Some("warm" | "hot")) && !pinned_local;
+    let sent_wall = time::OffsetDateTime::now_utc();
+    let refused = |refused: Refused| {
+        ApiError::internal(&format!(
+            "the authority refused a new token of lease {id}: {refused:?}"
+        ))
+    };
+    let mut expiring = false;
+    if wants_expiring {
+        match authority.record_grant(&Grant {
+            lease_id: &id,
+            holder: node_id,
+            duration_ms: DEFAULT_DURATION_MS,
+            kind: GrantKind::NewToken,
+            sent_wall,
+        }) {
+            Ok(()) => expiring = true,
+            Err(Refused::GateOpen { remaining }) => return Ok(NewGrant::GateOpen(remaining)),
+            // No support for `D`: the lease is `local` until there is.
+            Err(Refused::NoSupport) => {}
+            Err(other) => return Err(refused(other)),
+        }
+    }
+    if !expiring {
+        match authority.record_local_grant(&id) {
+            Ok(()) => {}
+            Err(Refused::GateOpen { remaining }) => return Ok(NewGrant::GateOpen(remaining)),
+            Err(other) => return Err(refused(other)),
+        }
+    }
+    let mode = if expiring { "expiring" } else { "local" };
+    let duration_ms = expiring.then(|| i64::try_from(DEFAULT_DURATION_MS).unwrap_or(i64::MAX));
+    let now = crate::store::format_rfc3339(sent_wall);
     sqlx::query(
         "INSERT INTO leases (id, resource_type, resource_id, holder_node_id, mode, fencing_token, \
          duration_ms, granted_at, renewed_at, expires_at, revoked_at) \
-         VALUES (?, 'app', ?, ?, 'local', ?, NULL, ?, NULL, NULL, NULL) \
+         VALUES (?, 'app', ?, ?, ?, ?, ?, ?, NULL, NULL, NULL) \
          ON CONFLICT (resource_type, resource_id) DO UPDATE SET \
-           holder_node_id = excluded.holder_node_id, mode = 'local', \
-           fencing_token = excluded.fencing_token, duration_ms = NULL, \
+           holder_node_id = excluded.holder_node_id, mode = excluded.mode, \
+           fencing_token = excluded.fencing_token, duration_ms = excluded.duration_ms, \
            granted_at = excluded.granted_at, renewed_at = NULL, expires_at = NULL, \
            revoked_at = NULL",
     )
     .bind(&id)
     .bind(app_id)
     .bind(node_id)
+    .bind(mode)
     .bind(token)
+    .bind(duration_ms)
     .bind(&now)
     .execute(&mut *conn)
     .await?;
@@ -542,16 +618,16 @@ pub(crate) async fn grant_app_lease(
         resource_type: "app".to_string(),
         resource_id: app_id.to_string(),
         holder_node_id: node_id.to_string(),
-        mode: "local".to_string(),
+        mode: mode.to_string(),
         fencing_token: token,
-        duration_ms: None,
+        duration_ms,
         granted_at: now,
         renewed_at: None,
         expires_at: None,
         revoked_at: None,
     };
     changelog::append(conn, actor, "lease", &lease.id, op, lease.payload()).await?;
-    Ok(lease)
+    Ok(NewGrant::Granted(Box::new(lease)))
 }
 
 /// Revokes the app's lease and writes its change-log entry; the caller builds
@@ -637,9 +713,15 @@ mod tests {
             id: node_id.clone(),
         };
         let mut w = store.begin_write().await.unwrap();
-        let lease = super::grant_app_lease(&mut w.tx, "app_x", &node_id, &actor)
-            .await
-            .unwrap();
+        let authority = Authority::new(Arc::new(crate::authority::SystemMonotonic::default()));
+        let super::NewGrant::Granted(lease) =
+            super::grant_app_lease(&mut w.tx, &authority, "app_x", &node_id, &actor, false)
+                .await
+                .unwrap()
+        else {
+            panic!("a first lease has no gate");
+        };
+        let lease = *lease;
         w.commit().await.unwrap();
         (store, lease, actor, data_dir)
     }
@@ -726,6 +808,98 @@ mod tests {
             expires_at: None,
             revoked_at: Some("2026-11-07T11:00:00Z".to_string()),
         }
+    }
+
+    /// Section 8.4 and ADR 0202: a new token, whatever its mode, waits until
+    /// the previous `expiring` holder's gate has passed, and a revoked
+    /// `expiring` lease of a holder declared lost or removed is released only
+    /// then. Nothing is written while the gate is open.
+    #[tokio::test]
+    async fn a_new_token_and_a_lost_holders_release_wait_for_the_gate() {
+        let (store, lease, actor, data_dir) = store_with_lease().await;
+        let clock = Arc::new(ManualClock::default());
+        let authority = Authority::new(Arc::clone(&clock) as Arc<dyn MonotonicClock>);
+        let releases = Releases::default();
+        let pool = store.pool();
+        sqlx::query(
+            "UPDATE leases SET mode = 'expiring', duration_ms = 15000, \
+             revoked_at = '2026-11-09T10:00:00.000Z' WHERE id = ?",
+        )
+        .bind(&lease.id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let revoked = super::by_id(&mut pool.acquire().await.unwrap(), &lease.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let holder = &lease.holder_node_id;
+        let gone = [
+            (
+                "declared lost",
+                "UPDATE nodes SET lost_at = '2026-11-09T10:00:00.000Z' WHERE id = ?",
+            ),
+            (
+                "removed",
+                "UPDATE nodes SET lost_at = NULL, status = 'removed' WHERE id = ?",
+            ),
+        ];
+        for (case, sql) in gone {
+            sqlx::query(sql).bind(holder).execute(pool).await.unwrap();
+            // D = 15 s and M = 1.5 s: the gate passes 18 s after the seed.
+            authority.seed(&lease.id, holder, Some(15_000));
+            let mut w = store.begin_write().await.unwrap();
+            assert!(
+                !super::is_released(&mut w.tx, &releases, &authority, false, &revoked)
+                    .await
+                    .unwrap(),
+                "{case}: the gate is open"
+            );
+            clock.advance(Duration::from_millis(17_999));
+            assert!(
+                !super::is_released(&mut w.tx, &releases, &authority, false, &revoked)
+                    .await
+                    .unwrap(),
+                "{case}: 1 ms before the gate"
+            );
+            clock.advance(Duration::from_millis(1));
+            assert!(
+                super::is_released(&mut w.tx, &releases, &authority, false, &revoked)
+                    .await
+                    .unwrap(),
+                "{case}: the gate has passed"
+            );
+            w.commit().await.unwrap();
+        }
+
+        // A new token waits for the gate; nothing is written meanwhile.
+        authority.seed(&lease.id, holder, Some(15_000));
+        let mut w = store.begin_write().await.unwrap();
+        let open = super::grant_app_lease(&mut w.tx, &authority, "app_x", holder, &actor, false)
+            .await
+            .unwrap();
+        assert!(
+            matches!(open, super::NewGrant::GateOpen(remaining) if remaining == Duration::from_millis(18_000)),
+            "{open:?}"
+        );
+        let row = super::by_id(&mut w.tx, &lease.id).await.unwrap().unwrap();
+        assert_eq!(row.fencing_token, lease.fencing_token);
+        clock.advance(Duration::from_millis(18_000));
+        let super::NewGrant::Granted(granted) =
+            super::grant_app_lease(&mut w.tx, &authority, "app_x", holder, &actor, false)
+                .await
+                .unwrap()
+        else {
+            panic!("the gate has passed");
+        };
+        assert_eq!(granted.fencing_token, lease.fencing_token + 1);
+        // No app row, so no policy that wants `expiring`: the grant is
+        // `local`, and the lease keeps no gate.
+        assert_eq!(granted.mode, "local");
+        assert_eq!(granted.duration_ms, None);
+        assert!(authority.passed(&lease.id));
+        w.commit().await.unwrap();
+        std::fs::remove_dir_all(&data_dir).unwrap();
     }
 
     /// Issue #392: a release covers the lease only at its token or a lower

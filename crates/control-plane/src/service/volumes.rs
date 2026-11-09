@@ -205,12 +205,14 @@ pub(crate) async fn get_volume(
 }
 
 /// Creates the app's local volume, makes the app stateful and grants the
-/// node its `local` lease, all in one write transaction.
+/// node the app's lease with a new token, all in one write transaction
+/// ([`leases::grant_app_lease`]).
 ///
 /// # Errors
 ///
 /// `not_found` for an unknown app, `conflict` when the app already has an
-/// attached volume or its node is not connected, `validation_failed` for a
+/// attached volume, its node is not connected, or the previous holder's gate
+/// is still open (section 8.4), `validation_failed` for a
 /// bad body or a size larger than the node's free disk, or a database error.
 pub(crate) async fn create_volume(
     state: &AppState,
@@ -351,7 +353,42 @@ pub(crate) async fn create_volume(
     )
     .await?;
 
-    let lease = leases::grant_app_lease(&mut w.tx, app_id, &node_id, &actor).await?;
+    // ADR 0258: a node that may still hold the app's previous lease, because
+    // it has not released it, gets a new token in the mode it holds.
+    let may_hold = match leases::app_lease(&mut w.tx, app_id).await? {
+        Some(previous) if previous.holder_node_id == node_id => {
+            !leases::is_released(
+                &mut w.tx,
+                state.hub.releases(),
+                state.hub.authority(),
+                state
+                    .hub
+                    .revoke_unanswered(&previous.holder_node_id, &previous.id),
+                &previous,
+            )
+            .await?
+        }
+        _ => false,
+    };
+    let lease = match leases::grant_app_lease(
+        &mut w.tx,
+        state.hub.authority(),
+        app_id,
+        &node_id,
+        &actor,
+        may_hold,
+    )
+    .await?
+    {
+        leases::NewGrant::Granted(lease) => *lease,
+        leases::NewGrant::GateOpen(remaining) => {
+            return Err(ApiError::conflict(format!(
+                "the app's previous lease holder may still run it for {} s more (its gate is \
+                 open); retry then",
+                remaining.as_secs() + 1
+            )));
+        }
+    };
     ctx.append_ok(
         &mut w.tx,
         Some(Scope::AppUpdate),
