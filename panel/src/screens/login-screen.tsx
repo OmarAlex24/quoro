@@ -2,10 +2,11 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Link, useNavigate } from '@tanstack/react-router';
 import { useEffect, useState, type FormEvent } from 'react';
 import { getGetMeQueryKey, login } from '../api/generated/auth/auth';
+import { useGetSetup } from '../api/generated/health/health';
 import { authEvents } from '../api/auth-store';
 import { isApiProblem } from '../api/fetcher';
 import { problemView, type ProblemView } from '../lib/problem';
-import { takeSetupNotice } from '../lib/setup-notice';
+import { offerSetup, takeSetupNotice } from '../lib/setup-notice';
 import { useSession } from '../session';
 import { AuthPanel } from '../components/auth-panel';
 import { Button } from '../components/ui/button';
@@ -21,6 +22,8 @@ export function LoginScreen() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [problem, setProblem] = useState<ProblemView | null>(null);
+  // ADR 0293: the link to setup shows only while the cluster says it has no owner.
+  const setupState = useGetSetup({ query: { retry: false } });
 
   useEffect(() => {
     if (user) void navigate({ to: '/' });
@@ -57,12 +60,14 @@ export function LoginScreen() {
       title="Sign in"
       lede="One microVM per app, on your own metal."
       footer={
-        <p>
-          A new cluster with no owner yet?{' '}
-          <Link to="/setup" className="auth-link">
-            Set up the owner account
-          </Link>
-        </p>
+        offerSetup(setupState.data) ? (
+          <p>
+            A new cluster with no owner yet?{' '}
+            <Link to="/setup" className="auth-link">
+              Set up the owner account
+            </Link>
+          </p>
+        ) : undefined
       }
     >
       {ended ? (

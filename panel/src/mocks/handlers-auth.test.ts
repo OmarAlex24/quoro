@@ -1,6 +1,6 @@
 import { setupServer } from 'msw/node';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import type { ChangePasswordRequest, Problem } from '../api/generated/model';
+import type { ChangePasswordRequest, Problem, SetupState } from '../api/generated/model';
 import { db, mockId, now } from './db';
 import { handlers } from './handlers';
 
@@ -101,5 +101,44 @@ describe('change password mock', () => {
       }),
     });
     expect(login.status).toBe(200);
+  });
+});
+
+// ADR 0293: the mock answers `getSetup` both ways, from its own setup state.
+describe('getSetup mock', () => {
+  const SETUP_URL = 'http://panel.test/api/v1/setup';
+
+  const read = async (): Promise<SetupState> => {
+    const response = await fetch(SETUP_URL);
+    expect(response.status).toBe(200);
+    return (await response.json()) as SetupState;
+  };
+
+  it('answers required: true while the cluster has no owner, and nothing else', async () => {
+    db.setupDone = false;
+    expect(await read()).toEqual({ required: true });
+  });
+
+  it('answers required: false once the owner exists', async () => {
+    expect(await read()).toEqual({ required: false });
+  });
+
+  it('closes after a setup, which then answers conflict', async () => {
+    db.setupDone = false;
+    const created = await fetch(SETUP_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Quoro-Setup-Token': 'mock' },
+      body: JSON.stringify({ email: 'owner@example.com', name: 'Owner', password: 'current-password-1' }),
+    });
+    expect(created.status).toBe(201);
+    expect(await read()).toEqual({ required: false });
+
+    const again = await fetch(SETUP_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Quoro-Setup-Token': 'mock' },
+      body: JSON.stringify({ email: 'owner@example.com', name: 'Owner', password: 'current-password-1' }),
+    });
+    expect(again.status).toBe(409);
+    expect(((await again.json()) as Problem).code).toBe('conflict');
   });
 });
