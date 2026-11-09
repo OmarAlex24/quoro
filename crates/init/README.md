@@ -290,6 +290,16 @@ logged. A `SYNC` after an `OPEN` ends that PTY session with `ERROR`. An init
 older than ADR 0282 answers a `SYNC` with `ERROR` "the first frame must be
 open, got type 5", which the engine reads as an init that cannot flush.
 
+The syncs run on a thread of their own, and the session ends when the
+connection does: after the answer, or as soon as the host hangs up. The engine
+stops waiting after its bound, 2 s, and drops the connection, so a `syncfs`
+that does not return, on a filesystem the app froze or a disk that stopped
+answering, holds its thread but not one of the 16 session slots, and the web
+terminal stays reachable. That `syncfs` still completes when it can. Only one `syncfs` of a
+volume runs at a time: a `SYNC` naming a volume whose earlier `syncfs` has not
+returned is answered with `ERROR` at once, so such a volume never holds more
+than one thread.
+
 Per session:
 
 - A PTY is allocated (`rustix::pty`), its initial window size set on the

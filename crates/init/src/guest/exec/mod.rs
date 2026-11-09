@@ -28,7 +28,9 @@
 //! A connection whose first frame is a sync (ADR 0282) is a sync session
 //! instead: [`session::serve`] runs `syncfs` on the mount of each volume it
 //! names and answers `SYNCED` or `ERROR`, with no program and no PTY. The
-//! engine sends it before it snapshots a volume.
+//! engine sends it before it snapshots a volume. The syncs run on a thread of
+//! their own and the session ends when the host hangs up, so a `syncfs` that
+//! never returns does not keep a session slot.
 //!
 //! PID 1 reaps every child in its own `supervise` loop, so the session cannot
 //! call `waitpid`: it registers the helper's pid with [`reaper`] and waits on
