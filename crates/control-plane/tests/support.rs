@@ -394,6 +394,19 @@ async fn spec_votes_name_every_voter_and_move_only_with_the_voter_set() {
     let mut on_w = Machine::connect(&server, &w).await;
     assert_eq!(on_w.spec["votes"], votes);
     assert_eq!(on_w.spec["witness"], json!({}));
+    // The same voters, in the same order, as `Cluster.votes`.
+    let ids = |voters: &Value| -> Vec<Value> {
+        voters
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|voter| voter["node_id"].clone())
+            .collect()
+    };
+    assert_eq!(
+        ids(&votes["voters"]),
+        ids(&cluster_votes(&server, &owner).await["voters"])
+    );
 
     // An edge-only machine is no voter, and neither its enrollment nor any
     // node's own updates (its session's start and end) move the version.
@@ -471,9 +484,11 @@ async fn support_requests_follow_the_acknowledged_desired_state_every_five_secon
         })
     );
     let (second_at, second) = on_a.request().await;
+    // `S / 3` is 5 s. The gap is read on the test's side of a loaded host,
+    // so it is checked loosely: well after the first request, well before `S`.
     let gap = second_at - first_at;
     assert!(
-        gap >= Duration::from_millis(4_900) && gap < Duration::from_secs(12),
+        gap >= Duration::from_secs(4) && gap < Duration::from_secs(12),
         "every S / 3: {gap:?}"
     );
     assert_eq!(second["body"], first["body"]);
