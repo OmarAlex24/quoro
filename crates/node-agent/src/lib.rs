@@ -14,6 +14,7 @@ pub mod backup;
 pub mod build;
 pub mod edge;
 pub mod enroll;
+pub mod follow;
 pub mod health;
 pub mod identity;
 pub mod ingress;

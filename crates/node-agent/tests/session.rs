@@ -26,10 +26,14 @@ use quoro_node_agent::{FenceTimers, LeaseConfig, LeaseState, ManualHostClock, st
 use quoro_proto::sign::{self, SigningKey};
 use quoro_proto::wire::{
     Command, ControlMessage, DesiredState, DesiredStatus, EdgeBackend, EdgeRoute, HealthCheck,
-    Spec, SpecEdge, SpecNetwork, Welcome,
+    LogEntries, Spec, SpecEdge, SpecNetwork, Welcome,
 };
-use quoro_proto::{LeaseGrant, LeaseId, LeaseMode, LeaseRevoke, ResourceType, RevokeReason};
-use serde_json::Value;
+use quoro_proto::{
+    ErrorCode, LeaseGrant, LeaseId, LeaseMode, LeaseRevoke, ProtocolError, ResourceType,
+    RevokeReason,
+};
+use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use tokio::io::DuplexStream;
 use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message;
@@ -1416,4 +1420,475 @@ async fn a_fence_ack_over_the_session_clears_only_below_its_tokens() {
     drop(ws);
     assert_eq!(serving.await.unwrap().unwrap(), SessionEnd::Reconnect);
     leases.abort();
+}
+
+/// `prev_hash` of seq 1 and `log_hash` at `log_seq` 0 (sections 5.1, 5.14).
+const ZEROS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// `count` change-log entries from `from_seq`, the first linking to
+/// `prev_hash`, hashed the way the primary's `changelog::append` hashes them:
+/// hex SHA-256 over the RFC 8785 text of the entry without `hash`.
+fn log_chain(from_seq: u64, prev_hash: &str, count: u64, salt: &str) -> Vec<Value> {
+    let mut prev = prev_hash.to_owned();
+    (from_seq..from_seq + count)
+        .map(|seq| {
+            let mut entry = json!({
+                "seq": seq,
+                "term": 1,
+                "time": "2026-11-02T10:15:31Z",
+                "actor_type": "agent",
+                "actor_id": "agt_1",
+                "entity_type": "app",
+                "entity_id": format!("app_{seq}"),
+                "op": "update",
+                "payload": { "name": format!("blog-{seq}"), "salt": salt },
+                "prev_hash": prev,
+            });
+            let canonical = quoro_proto::jcs::canonicalize(&entry).unwrap();
+            let hash: String = Sha256::digest(canonical.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            entry["hash"] = json!(hash);
+            prev = hash;
+            entry
+        })
+        .collect()
+}
+
+fn log_entries_frame(entries: Vec<Value>, head_seq: Option<u64>, id: &str) -> String {
+    let from_seq = entries[0]["seq"].as_u64().unwrap();
+    ControlMessage::LogEntries(LogEntries {
+        from_seq,
+        entries,
+        head_seq,
+    })
+    .to_frame(id, None)
+    .to_text()
+}
+
+/// The stored copy of the change log, as section 5.14 entries.
+async fn stored_log(store: &NodeStore) -> Vec<Value> {
+    store
+        .log_entries()
+        .await
+        .unwrap()
+        .iter()
+        .map(|entry| entry.to_value().unwrap())
+        .collect()
+}
+
+/// A node's session setup over `dir`, and the sender of its observed VMs,
+/// which the test keeps alive for as long as the session runs.
+async fn follow_node(
+    dir: &TempDir,
+) -> (
+    SessionSetup,
+    watch::Sender<Vec<quoro_proto::wire::VmStatus>>,
+) {
+    let key = sign::signing_key_from_seed(&[8; 32]);
+    let (desired, _desired_rx) = watch::channel(None);
+    let (observed_tx, observed_rx) = watch::channel(Vec::new());
+    let setup = SessionSetup {
+        identity: identity_files(dir.path(), &key),
+        store: NodeStore::open(dir.path()).await.unwrap(),
+        facts: facts(),
+        desired,
+        observed: observed_rx,
+        current: None,
+        builds: None,
+    };
+    (setup, observed_tx)
+}
+
+type Serving = tokio::task::JoinHandle<(Session, Result<SessionEnd, quoro_node_agent::AgentError>)>;
+
+/// Serves `session` over a new duplex stream: a fake primary reads `hello`,
+/// answers `welcome` and waits for the first status report. The task hands
+/// the session back when it ends, so a test can reconnect it.
+async fn follow_session(mut session: Session) -> (WebSocketStream<DuplexStream>, Value, Serving) {
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let accept = tokio::spawn(tokio_tungstenite::accept_async(server));
+    let (client_ws, _response) = client_async("ws://primary.test/api/v1/nodes/session", client)
+        .await
+        .unwrap();
+    let mut ws = accept.await.unwrap().unwrap();
+    let serving = tokio::spawn(async move {
+        let end = session.serve(client_ws, std::future::pending::<()>()).await;
+        (session, end)
+    });
+    let hello = read_frame(&mut ws).await;
+    assert_eq!(hello["type"], "hello", "hello is the first message");
+    send(
+        &mut ws,
+        ControlMessage::Welcome(Welcome {
+            cluster_id: "cls_test".to_owned(),
+            term: 1,
+            server_time: "2026-11-02T10:15:30Z".to_owned(),
+            heartbeat_interval_ms: 100,
+            session_timeout_ms: 15_000,
+            primary_node_id: "nod_primary".to_owned(),
+            primary_urls: Vec::new(),
+        })
+        .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
+        .to_text(),
+    )
+    .await;
+    read_until(&mut ws, "status_report").await;
+    (ws, hello, serving)
+}
+
+/// Closes the primary's side and returns the session once it ended.
+async fn end_session(mut ws: WebSocketStream<DuplexStream>, serving: Serving) -> Session {
+    ws.close(None).await.unwrap();
+    drop(ws);
+    let (session, end) = tokio::time::timeout(Duration::from_secs(5), serving)
+        .await
+        .expect("the session ended")
+        .unwrap();
+    assert_eq!(end.unwrap(), SessionEnd::Reconnect);
+    session
+}
+
+/// The first frame that answers the message `id`.
+async fn reply_to(ws: &mut WebSocketStream<DuplexStream>, id: &str) -> Value {
+    loop {
+        let frame = read_frame(ws).await;
+        if frame["re"] == id {
+            return frame;
+        }
+    }
+}
+
+/// Sends a `ping` and returns every frame the node sent before its `pong`.
+/// Messages are handled in order, so these include every answer to what was
+/// sent before the ping.
+async fn frames_before_pong(ws: &mut WebSocketStream<DuplexStream>, id: &str) -> Vec<Value> {
+    send(ws, ControlMessage::Ping.to_frame(id, None).to_text()).await;
+    let mut frames = Vec::new();
+    loop {
+        let frame = read_frame(ws).await;
+        if frame["type"] == "pong" && frame["re"] == id {
+            return frames;
+        }
+        frames.push(frame);
+    }
+}
+
+fn log_acks(frames: &[Value]) -> Vec<&Value> {
+    frames
+        .iter()
+        .filter(|frame| frame["type"] == "log_ack")
+        .collect()
+}
+
+/// Sections 5.6 and 7.1: a valid `log_entries` is stored, then acknowledged
+/// once with its highest entry; a second batch continues the first.
+#[tokio::test]
+async fn valid_log_entries_are_stored_then_acknowledged_once() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let (mut ws, hello, serving) = follow_session(Session::new(setup)).await;
+    assert_eq!(hello["body"]["log_seq"], 0);
+    assert_eq!(hello["body"]["log_hash"], ZEROS);
+
+    let first = log_chain(1, ZEROS, 3, "a");
+    send(
+        &mut ws,
+        log_entries_frame(first.clone(), Some(5), "msg_log_1"),
+    )
+    .await;
+    let ack = reply_to(&mut ws, "msg_log_1").await;
+    // The batch was committed before the ack left.
+    assert_eq!(stored_log(&store).await, first);
+    assert_eq!(ack["type"], "log_ack", "{ack}");
+    assert_eq!(ack["body"]["seq"], 3);
+    assert_eq!(ack["body"]["hash"], first[2]["hash"]);
+    assert_eq!(store.log_head().await.unwrap().unwrap().0, 5);
+    let after = frames_before_pong(&mut ws, "msg_ping_1").await;
+    assert!(
+        log_acks(&after).is_empty(),
+        "one ack per message: {after:?}"
+    );
+
+    let second = log_chain(4, first[2]["hash"].as_str().unwrap(), 2, "a");
+    send(
+        &mut ws,
+        log_entries_frame(second.clone(), Some(5), "msg_log_2"),
+    )
+    .await;
+    let ack = reply_to(&mut ws, "msg_log_2").await;
+    assert_eq!(ack["type"], "log_ack", "{ack}");
+    assert_eq!(ack["body"]["seq"], 5);
+    assert_eq!(ack["body"]["hash"], second[1]["hash"]);
+    assert_eq!(stored_log(&store).await.len(), 5);
+
+    end_session(ws, serving).await;
+}
+
+/// Section 7.1: a message whose entries do not verify stores nothing, not
+/// even its valid first entry, and is answered `bad_message`, never acked.
+#[tokio::test]
+async fn invalid_log_entries_are_a_bad_message_and_store_nothing() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let (mut ws, _hello, serving) = follow_session(Session::new(setup)).await;
+
+    let mut broken = log_chain(1, ZEROS, 3, "a");
+    broken[1]["payload"]["name"] = json!("tampered");
+    send(&mut ws, log_entries_frame(broken, Some(3), "msg_log_bad")).await;
+    let error = reply_to(&mut ws, "msg_log_bad").await;
+    assert_eq!(error["type"], "error", "{error}");
+    assert_eq!(error["body"]["code"], "bad_message");
+    assert_eq!(error["body"]["fatal"], false);
+    let after = frames_before_pong(&mut ws, "msg_ping_1").await;
+    assert!(log_acks(&after).is_empty(), "no ack: {after:?}");
+    assert!(store.log_entries().await.unwrap().is_empty());
+    assert_eq!(store.log_head().await.unwrap(), None);
+
+    // A resend from seq 1 of the right entries is then accepted.
+    let entries = log_chain(1, ZEROS, 3, "a");
+    send(
+        &mut ws,
+        log_entries_frame(entries.clone(), None, "msg_log_good"),
+    )
+    .await;
+    let ack = reply_to(&mut ws, "msg_log_good").await;
+    assert_eq!(ack["type"], "log_ack", "{ack}");
+    assert_eq!(ack["body"]["seq"], 3);
+    assert_eq!(stored_log(&store).await, entries);
+
+    end_session(ws, serving).await;
+}
+
+/// Section 5.1: after storing entries, the `hello` of the next session
+/// reports the newest stored `seq` and its hash.
+#[tokio::test]
+async fn a_reconnect_s_hello_carries_the_stored_log_position() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let session = Session::new(setup);
+    let (mut ws, hello, serving) = follow_session(session).await;
+    assert_eq!(hello["body"]["log_seq"], 0);
+    assert_eq!(hello["body"]["log_hash"], ZEROS);
+
+    let entries = log_chain(1, ZEROS, 3, "a");
+    send(
+        &mut ws,
+        log_entries_frame(entries.clone(), Some(3), "msg_log_1"),
+    )
+    .await;
+    let ack = reply_to(&mut ws, "msg_log_1").await;
+    assert_eq!(ack["type"], "log_ack", "{ack}");
+    let session = end_session(ws, serving).await;
+
+    let (ws, hello, serving) = follow_session(session).await;
+    assert_eq!(hello["body"]["log_seq"], 3);
+    assert_eq!(hello["body"]["log_hash"], entries[2]["hash"]);
+    end_session(ws, serving).await;
+}
+
+/// Section 7.1: on `log_diverged` the node moves its copy aside, never
+/// deleting it, before it handles the next message: the primary's entries
+/// from seq 1 that follow at once are accepted and acked.
+#[tokio::test]
+async fn log_diverged_quarantines_the_copy_and_the_node_refollows_from_seq_1() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let (mut ws, _hello, serving) = follow_session(Session::new(setup)).await;
+
+    let old = log_chain(1, ZEROS, 3, "old");
+    send(
+        &mut ws,
+        log_entries_frame(old.clone(), Some(3), "msg_log_1"),
+    )
+    .await;
+    let ack = reply_to(&mut ws, "msg_log_1").await;
+    assert_eq!(ack["type"], "log_ack", "{ack}");
+
+    let diverged = ControlMessage::Error(ProtocolError {
+        code: ErrorCode::LogDiverged,
+        message: "log_seq 3 does not match".to_owned(),
+        fatal: false,
+    });
+    send(&mut ws, diverged.to_frame("msg_diverged", None).to_text()).await;
+    let new = log_chain(1, ZEROS, 2, "new");
+    send(
+        &mut ws,
+        log_entries_frame(new.clone(), Some(2), "msg_log_2"),
+    )
+    .await;
+    let ack = reply_to(&mut ws, "msg_log_2").await;
+    assert_eq!(ack["type"], "log_ack", "{ack}");
+    assert_eq!(ack["body"]["seq"], 2);
+    assert_eq!(ack["body"]["hash"], new[1]["hash"]);
+    assert_eq!(stored_log(&store).await, new);
+
+    let files: Vec<std::path::PathBuf> = std::fs::read_dir(dir.path().join("quarantine"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(files.len(), 1, "{files:?}");
+    let copy: Vec<Value> = std::fs::read_to_string(&files[0])
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(copy, old);
+    let rows: Vec<(String, String, i64, String)> =
+        sqlx::query_as("SELECT kind, path, last_seq, last_hash FROM quarantine")
+            .fetch_all(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        rows,
+        vec![(
+            "change_log".to_owned(),
+            files[0].to_string_lossy().into_owned(),
+            3,
+            old[2]["hash"].as_str().unwrap().to_owned(),
+        )]
+    );
+
+    end_session(ws, serving).await;
+}
+
+/// Every text frame the node sends until its session ends and the socket
+/// closes.
+async fn frames_until_closed(ws: &mut WebSocketStream<DuplexStream>) -> Vec<Value> {
+    let mut frames = Vec::new();
+    loop {
+        let message = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("the session ended in time");
+        match message {
+            Some(Ok(Message::Text(text))) => {
+                frames.push(serde_json::from_str(text.as_str()).expect("a JSON frame"));
+            }
+            Some(Ok(Message::Close(_)) | Err(_)) | None => return frames,
+            Some(Ok(_)) => {}
+        }
+    }
+}
+
+/// The session's end, once the socket closed.
+async fn ended(serving: Serving) -> Session {
+    let (session, end) = tokio::time::timeout(Duration::from_secs(5), serving)
+        .await
+        .expect("the session ended")
+        .unwrap();
+    assert_eq!(end.unwrap(), SessionEnd::Reconnect);
+    session
+}
+
+/// Section 7.1: when the quarantined copy cannot be written, nothing is
+/// deleted and nothing recorded; the session ends, so the next `hello` draws
+/// `log_diverged` again. A regular file where the quarantine directory goes
+/// makes creating the copy fail.
+#[tokio::test]
+async fn a_failed_quarantine_export_deletes_nothing_and_ends_the_session() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let (mut ws, _hello, serving) = follow_session(Session::new(setup)).await;
+
+    let old = log_chain(1, ZEROS, 3, "old");
+    send(
+        &mut ws,
+        log_entries_frame(old.clone(), Some(3), "msg_log_1"),
+    )
+    .await;
+    let ack = reply_to(&mut ws, "msg_log_1").await;
+    assert_eq!(ack["type"], "log_ack", "{ack}");
+
+    std::fs::write(dir.path().join("quarantine"), b"not a directory").unwrap();
+    let diverged = ControlMessage::Error(ProtocolError {
+        code: ErrorCode::LogDiverged,
+        message: "log_seq 3 does not match".to_owned(),
+        fatal: false,
+    });
+    send(&mut ws, diverged.to_frame("msg_diverged", None).to_text()).await;
+    frames_until_closed(&mut ws).await;
+    ended(serving).await;
+
+    assert_eq!(stored_log(&store).await, old);
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM quarantine")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
+/// Section 7.1: a batch the store cannot write is neither acknowledged nor
+/// answered `bad_message`; the session ends, and the next `hello` reports
+/// the position actually stored.
+#[tokio::test]
+async fn a_store_failure_sends_no_ack_and_ends_the_session() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let (mut ws, _hello, serving) = follow_session(Session::new(setup)).await;
+
+    sqlx::query("CREATE TRIGGER t BEFORE INSERT ON change_log BEGIN SELECT RAISE(ABORT,'x'); END;")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let entries = log_chain(1, ZEROS, 3, "a");
+    send(&mut ws, log_entries_frame(entries, Some(3), "msg_log_1")).await;
+    let frames = frames_until_closed(&mut ws).await;
+    assert!(log_acks(&frames).is_empty(), "no ack: {frames:?}");
+    assert!(
+        frames.iter().all(|frame| frame["re"] != "msg_log_1"),
+        "no answer at all: {frames:?}"
+    );
+    let session = ended(serving).await;
+
+    sqlx::query("DROP TRIGGER t")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let (ws, hello, serving) = follow_session(session).await;
+    assert_eq!(hello["body"]["log_seq"], 0);
+    assert_eq!(hello["body"]["log_hash"], ZEROS);
+    end_session(ws, serving).await;
+}
+
+/// Section 5.1: a node that cannot read its change-log position sends no
+/// `hello` rather than one reporting an empty log, which would skip the
+/// primary's divergence check (section 7.1). The session ends at once.
+#[tokio::test]
+async fn no_hello_is_sent_without_the_change_log_position() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let mut session = Session::new(setup);
+    sqlx::query("ALTER TABLE change_log RENAME TO change_log_away")
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let accept = tokio::spawn(tokio_tungstenite::accept_async(server));
+    let (client_ws, _response) = client_async("ws://primary.test/api/v1/nodes/session", client)
+        .await
+        .unwrap();
+    let mut ws = accept.await.unwrap().unwrap();
+    let serving = tokio::spawn(async move {
+        let end = session.serve(client_ws, std::future::pending::<()>()).await;
+        (session, end)
+    });
+    let frames = frames_until_closed(&mut ws).await;
+    assert!(frames.is_empty(), "no hello: {frames:?}");
+    let session = ended(serving).await;
+
+    sqlx::query("ALTER TABLE change_log_away RENAME TO change_log")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let (ws, hello, serving) = follow_session(session).await;
+    assert_eq!(hello["body"]["log_seq"], 0);
+    end_session(ws, serving).await;
 }
