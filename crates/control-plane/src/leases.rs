@@ -156,6 +156,23 @@ pub(crate) async fn app_lease(
     .await
 }
 
+/// Whether the lease row carries the unsettled mark (`leases.unsettled`,
+/// section 8.4, "The mark"). A lease with no row carries none.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn is_marked(
+    conn: &mut SqliteConnection,
+    lease_id: &str,
+) -> Result<bool, ApiError> {
+    let unsettled: Option<i64> = sqlx::query_scalar("SELECT unsettled FROM leases WHERE id = ?")
+        .bind(lease_id)
+        .fetch_optional(conn)
+        .await?;
+    Ok(unsettled.is_some_and(|unsettled| unsettled != 0))
+}
+
 /// One lease by id, revoked or not.
 ///
 /// # Errors
@@ -513,15 +530,15 @@ pub(crate) enum NewGrant {
 ///   a row that reads `expiring`, which sets it too; and any new token of a
 ///   row that already carries it, because no write with a new token clears
 ///   it.
-/// - **The raise.** An `expiring` new token over a row that stores no
-///   duration, or one shorter than `D`, is [`NewGrant::Held`] too: it is a
-///   grant longer than the stored duration, which goes out only once the
-///   raise is replicated over the machines with the `node` role (section
-///   8.4, "What the authority must enforce", ADR 0268). A successor that
-///   lacked the write would count the old row's shorter gate, or none, also
-///   one promoted with `--ack-fence` (section 7.3). So in this build an
-///   `expiring` new token goes out only over a row that already reads
-///   `expiring` for at least `D`.
+/// - **The raise.** An `expiring` new token over a row that does not read
+///   `expiring` for at least `D` is [`NewGrant::Held`] too: it is a grant
+///   longer than the duration a successor would count, which goes out only
+///   once the raise is replicated over the machines with the `node` role
+///   (section 8.4, "What the authority must enforce", ADR 0268). A successor
+///   that lacked the write would count the old row's shorter gate, or none
+///   for a row that reads `local`, also one promoted with `--ack-fence`
+///   (section 7.3). So in this build an `expiring` new token goes out only
+///   over a row that already reads `expiring` for at least `D`.
 /// - **Gate.** Whatever the new mode, a new token waits until the previous
 ///   `expiring` holder's gate has passed on the authority's clock (section
 ///   8.4): [`NewGrant::GateOpen`].
@@ -590,13 +607,7 @@ pub(crate) async fn grant_app_lease(
     let warm = matches!(policy.as_deref(), Some("warm" | "hot"));
     // Section 8.4, "The mark": checked before the authority records anything.
     let marked = match &previous {
-        Some(previous) => {
-            sqlx::query_scalar::<_, i64>("SELECT unsettled FROM leases WHERE id = ?")
-                .bind(&previous.id)
-                .fetch_one(&mut *conn)
-                .await?
-                != 0
-        }
+        Some(previous) => is_marked(conn, &previous.id).await?,
         None => false,
     };
     let was_expiring = previous
@@ -604,12 +615,15 @@ pub(crate) async fn grant_app_lease(
         .is_some_and(|previous| previous.mode == "expiring");
     // ADR 0268: an `expiring` grant longer than the stored duration goes out
     // only once the raise is replicated over the machines with the `node`
-    // role, so that every possible next primary counts its gate.
-    let raises = warm
+    // role, so that every possible next primary counts its gate. A successor
+    // counts a gate only for a row that reads `expiring`, so a row must read
+    // it for at least `D`.
+    let stores_d = was_expiring
         && previous
             .as_ref()
             .and_then(|previous| previous.duration_ms)
-            .is_none_or(|stored| stored < i64::try_from(DEFAULT_DURATION_MS).unwrap_or(i64::MAX));
+            .is_some_and(|stored| stored >= i64::try_from(DEFAULT_DURATION_MS).unwrap_or(i64::MAX));
+    let raises = warm && !stores_d;
     if marked || (warm && keep_local) || (!warm && was_expiring) || raises {
         return Ok(NewGrant::Held);
     }

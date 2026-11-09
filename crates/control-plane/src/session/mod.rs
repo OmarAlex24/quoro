@@ -3050,11 +3050,13 @@ impl Session {
     /// or `uncertain` at that token is noted, so its refusal gives the lease
     /// back.
     ///
-    /// An `expiring` lease the `hello` listed `held` or `uncertain` at the
-    /// row's token or above gets no grant: the node renews it, and a
+    /// An `expiring` lease the `hello` listed gets no grant. Listed `held`
+    /// or `uncertain` at the row's token, the node renews it, and a
     /// same-token `expiring` grant without `re` has no row in the node state
-    /// machine (section 8.4). One the node does not hold at that token gets
-    /// its first grant again only through the authority
+    /// machine (section 8.4). Listed at a lower token, the stale-lease revoke
+    /// went out at the row's token, and a grant at that token would be
+    /// refused (section 5.12). One the `hello` does not list gets its first
+    /// grant again only through the authority
     /// ([`Session::resent_first_grant`]).
     async fn send_grants(&mut self, outbox: &mut Vec<String>) {
         let mut conn = match self.hub.0.store.pool().acquire().await {
@@ -3113,10 +3115,9 @@ impl Session {
                         _ => {}
                     }
                     if lease.mode == "expiring" {
-                        let holds = reported.as_ref().is_some_and(|(state, claimed)| {
-                            *claimed >= token && (state == "held" || state == "uncertain")
-                        });
-                        if !holds && let Some(grant) = self.resent_first_grant(&lease) {
+                        if reported.is_none()
+                            && let Some(grant) = self.resent_first_grant(&lease.id, token).await
+                        {
                             outbox.push(
                                 ControlMessage::LeaseGrant(grant)
                                     .to_frame(&new_msg_id(), None)
@@ -3151,34 +3152,97 @@ impl Session {
         }
     }
 
-    /// The first grant of an `expiring` lease that names this node at the
-    /// row's token, sent again because the node does not hold the lease at
-    /// that token: the grant was lost with a session, or never arrived. Like
-    /// any `expiring` grant, it goes out only once the authority records it
-    /// under majority support (section 8.8), which extends this holder's
-    /// gate to cover it ("What the authority must enforce"). It is not gated:
-    /// the gate is this holder's own, at the same token. It carries the
-    /// stored duration, so it is no longer than the row (ADR 0268). `None`
-    /// when the authority refuses it; the node's next session tries again.
-    fn resent_first_grant(&self, lease: &leases::Lease) -> Option<quoro_proto::LeaseGrant> {
+    /// The first grant of the `expiring` lease `lease_id`, whose row names
+    /// this node at `token`, sent again because the node's `hello` does not
+    /// list the lease: the grant was lost with a session, or never arrived.
+    /// `None`, with nothing sent, unless in one single-writer transaction,
+    /// so that no change of the row or its duration comes in between:
+    ///
+    /// - the row still names this node at `token`, reads `expiring` and is
+    ///   not revoked;
+    /// - it carries no unsettled mark: a marked row's lease the holder does
+    ///   not list is not given back (section 8.4, "The holder fenced first");
+    /// - no node's `fence_failure` lists it (section 8.5);
+    /// - the authority records it as a grant with a new token would be:
+    ///   under majority support (section 8.8), and only once the lease's
+    ///   gate has passed. A primary that lacks the writes after this row,
+    ///   such as one promoted with `--ack-fence`, may not know of a grant of
+    ///   the lease to another node, and its start gate covers that grant
+    ///   ("What the authority must enforce"). Recording it extends this
+    ///   holder's gate to cover the resend.
+    ///
+    /// It carries the stored duration, so it is no longer than the row
+    /// (ADR 0268). A refused resend is tried again at the node's next
+    /// session.
+    async fn resent_first_grant(
+        &self,
+        lease_id: &str,
+        token: u64,
+    ) -> Option<quoro_proto::LeaseGrant> {
         use crate::authority::{Grant, GrantKind};
-        let duration_ms = u64::try_from(lease.duration_ms?).ok()?;
-        let sent_wall = time::OffsetDateTime::now_utc();
-        if let Err(refused) = self.hub.0.authority.record_grant(&Grant {
-            lease_id: &lease.id,
-            holder: &self.node_id,
-            duration_ms,
-            kind: GrantKind::Renewal,
-            sent_wall,
-        }) {
+        let not_sent = |why: &dyn std::fmt::Display| {
             tracing::info!(
-                lease_id = %lease.id,
-                ?refused,
+                lease_id,
+                node_id = %self.node_id,
+                %why,
                 "an expiring lease's first grant is not sent again"
             );
+        };
+        let mut w = match self.hub.0.store.begin_write().await {
+            Ok(w) => w,
+            Err(e) => {
+                not_sent(&e);
+                return None;
+            }
+        };
+        let checked = async {
+            let row = leases::by_id(&mut w.tx, lease_id).await?;
+            let row = row.filter(|row| {
+                row.mode == "expiring"
+                    && row.holder_node_id == self.node_id
+                    && !row.is_revoked()
+                    && lease_token(row) == token
+            });
+            let Some(row) = row else {
+                return Ok::<_, ApiError>(None);
+            };
+            if leases::is_marked(&mut w.tx, lease_id).await?
+                || crate::fences::listed_leases(&mut w.tx)
+                    .await?
+                    .contains(lease_id)
+            {
+                return Ok(None);
+            }
+            Ok(Some(row))
+        }
+        .await;
+        let row = match checked {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                not_sent(&"the row changed, carries the mark or has a failed fence");
+                return None;
+            }
+            Err(e) => {
+                not_sent(&e.code.as_str());
+                return None;
+            }
+        };
+        let duration_ms = u64::try_from(row.duration_ms?).ok()?;
+        let sent_wall = time::OffsetDateTime::now_utc();
+        if let Err(refused) = self.hub.0.authority.record_grant(&Grant {
+            lease_id,
+            holder: &self.node_id,
+            duration_ms,
+            kind: GrantKind::NewToken,
+            sent_wall,
+        }) {
+            not_sent(&format!("{refused:?}"));
             return None;
         }
-        let mut grant = lease.grant();
+        // Nothing was written; the writer was held only so that no lowering
+        // of the duration interleaves with the record.
+        drop(w);
+        let mut grant = row.grant();
         grant.granted_at = crate::store::format_rfc3339(sent_wall);
         Some(grant)
     }

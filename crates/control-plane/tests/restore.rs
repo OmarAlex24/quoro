@@ -2313,6 +2313,16 @@ async fn a_warm_apps_restore_waits_until_its_grant_can_go_out() {
         );
     }
 
+    // A row that reads `local` with `D` stored, as the raise before a
+    // conversion grant leaves it (ADR 0254): a successor counts no gate for
+    // a row that reads `local`, so the grant still waits.
+    sqlx::query("UPDATE leases SET duration_ms = 15000 WHERE id = ?")
+        .bind(&moving.lease_id)
+        .execute(setup.state.server.state.store.pool())
+        .await
+        .unwrap();
+    ready_waits(&mut setup, &moving).await;
+
     sqlx::query("UPDATE leases SET mode = 'expiring', duration_ms = 15000 WHERE id = ?")
         .bind(&moving.lease_id)
         .execute(setup.state.server.state.store.pool())
