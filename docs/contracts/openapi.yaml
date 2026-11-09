@@ -4214,8 +4214,10 @@ components:
             not yet replicated over every machine with the `node` role, or the
             primary does not hold majority support (node-agent-protocol.md
             section 8.4, "Grants of a marked row", ADR 0292). Derived on read;
-            never stored, so a grant held back before a primary restart is not
-            held after it (section 8.4). False otherwise.
+            never stored: after a primary restart it turns true again at the
+            session start of the node the row names, while that node does not
+            hold the row's token, until the grant is sent (section 8.4, "The
+            holder fenced first" step 4, ADR 0295). False otherwise.
         grant_waiting_on:
           type: array
           items:
@@ -7904,10 +7906,10 @@ paths:
         marked row"). Until then `App.lease.grant_pending` is true, and the
         standby VM stays stopped, because the warm node does not hold the
         lease (section 6.4, ADR 0292). A primary that restarts while the grant
-        waits no longer holds it: `grant_pending` then reads false while
-        `unsettled` stays true and the warm node does not hold the lease, and
-        the app stays stopped until an operator acts (section 8.4, "The holder
-        fenced first"). The old source's lease is revoked when it reconnects;
+        waits sends it at the warm node's next session start, under the same
+        rule, and `grant_pending` is true again from then until it is sent
+        (section 8.4, "The holder fenced first" step 4, ADR 0295). The old
+        source's lease is revoked when it reconnects;
         it keeps its divergent writes as a quarantined copy and becomes the
         warm copy (node-agent-protocol.md section 9). Destructive and off by
         default for agents: without an approval grant on `{type: app, id}`
