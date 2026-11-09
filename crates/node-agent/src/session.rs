@@ -21,8 +21,8 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt as _, StreamExt as _};
 use quoro_proto::wire::{
     self, BackupStatus, Capacity, Command, ControlMessage, DesiredState, EventBody, Heartbeat,
-    Hello, LogLine, NodeMessage, RawFrame, RouteStatus, StatusReport, StreamClose, StreamData,
-    StreamEnd, StreamEndReason, StreamOpen, VmStatus, VolumeStatus,
+    Hello, LogAck, LogEntries, LogLine, NodeMessage, RawFrame, RouteStatus, StatusReport,
+    StreamClose, StreamData, StreamEnd, StreamEndReason, StreamOpen, VmStatus, VolumeStatus,
 };
 use quoro_proto::{
     CommandResult, CommandStatus, ErrorBody, ErrorCode, LeaseRevoke, MsgId, ProtocolError,
@@ -41,6 +41,7 @@ use tracing::{debug, info, warn};
 
 use crate::build::manager::{BuildStart, BuildsError, BuildsHandle};
 use crate::edge::EdgeManager;
+use crate::follow::{self, ZERO_HASH};
 use crate::identity::{Identity, IdentityHandle};
 use crate::ingress::{DnsBridge, DnsRequest, IngressSupervisor};
 use crate::interactive::{Door, Interactive, OpenError, StreamKind};
@@ -94,9 +95,6 @@ const ADVERTISED_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// two. A report sent for another reason in the meantime carries the
 /// revision, and then none is sent for it.
 const APPLIED_REPORT_DELAY: Duration = Duration::from_millis(250);
-
-/// `log_hash` while `log_seq` is 0 (section 5.1).
-const ZERO_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Why one session ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1180,8 +1178,9 @@ impl Session {
             ControlMessage::Ping => {
                 write_message(sink, NodeMessage::Pong, Some(&raw.id)).await?;
             }
-            ControlMessage::Pong | ControlMessage::LogEntries(_) => {
-                // Change-log follow is a follow-up.
+            ControlMessage::Pong => {}
+            ControlMessage::LogEntries(body) => {
+                self.on_log_entries(&raw, &body, sink).await?;
             }
             ControlMessage::StreamInput(input) => {
                 Self::on_stream_input(&raw, &input, streams, sink).await?;
@@ -1386,6 +1385,10 @@ impl Session {
                         }
                     }
                 }
+                if error.code == ErrorCode::LogDiverged {
+                    self.on_log_diverged(&error.message).await?;
+                    return Ok(None);
+                }
                 warn!(
                     code = ?error.code,
                     message = %error.message,
@@ -1473,6 +1476,76 @@ impl Session {
         // The reconciler wakes on the new snapshot; a closed channel means the
         // reconciler already stopped, which is a shutdown in progress.
         let _ = self.desired.send_replace(Some(snapshot));
+        Ok(())
+    }
+
+    /// Verifies, stores and acknowledges one `log_entries` (sections 5.6,
+    /// 5.14 and 7.1).
+    ///
+    /// A message that does not continue the stored copy, or whose entries do
+    /// not verify, stores nothing and is answered `error` `bad_message`; the
+    /// primary sends again from the node's last ack. A valid one is stored in
+    /// one transaction and, once it committed, acknowledged with one
+    /// `log_ack` for its highest entry. A store failure is returned, so the
+    /// session ends without an ack and the next `hello` reports the stored
+    /// position.
+    async fn on_log_entries<S>(
+        &mut self,
+        raw: &RawFrame,
+        body: &LogEntries,
+        sink: &mut SplitSink<WebSocketStream<S>, Message>,
+    ) -> Result<(), AgentError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let (pos_seq, pos_hash) = self.store.log_position().await?;
+        let entries = match follow::verify_batch(pos_seq, &pos_hash, body) {
+            Ok(entries) => entries,
+            Err(rejection) => {
+                warn!(
+                    from_seq = body.from_seq,
+                    log_seq = pos_seq,
+                    error = %rejection,
+                    "log_entries did not verify; nothing stored"
+                );
+                let error = ProtocolError {
+                    code: ErrorCode::BadMessage,
+                    message: format!("log_entries does not verify: {rejection}"),
+                    fatal: false,
+                };
+                write_message(sink, NodeMessage::Error(error), Some(&raw.id)).await?;
+                return Ok(());
+            }
+        };
+        self.store.store_log_batch(&entries, body.head_seq).await?;
+        if let Some(last) = entries.last() {
+            let ack = LogAck {
+                seq: last.seq,
+                hash: last.hash.clone(),
+            };
+            write_message(sink, NodeMessage::LogAck(ack), Some(&raw.id)).await?;
+        }
+        Ok(())
+    }
+
+    /// Quarantines the node's copy of the change log on `log_diverged`
+    /// (section 7.1). It finishes before the next message is handled, since
+    /// the primary follows with entries from `seq` 1. A failed export deletes
+    /// nothing and is returned, so the session ends and the next `hello` draws
+    /// `log_diverged` again.
+    async fn on_log_diverged(&self, message: &str) -> Result<(), AgentError> {
+        let reason = format!("log_diverged: {message}");
+        match self.store.quarantine_log(&reason).await? {
+            Some(path) => warn!(
+                path = %path.display(),
+                message = %message,
+                "the primary reported a diverged change log; the local copy is quarantined"
+            ),
+            None => warn!(
+                message = %message,
+                "the primary reported a diverged change log, but the local copy is empty"
+            ),
+        }
         Ok(())
     }
 
@@ -1864,6 +1937,11 @@ impl Session {
             .map_or(0, |(rev, _)| rev);
         let applied_rev = self.store.applied_rev().await.unwrap_or(0);
         let dropped_events = self.store.dropped_events().await.unwrap_or(0);
+        let (log_seq, log_hash) = self
+            .store
+            .log_position()
+            .await
+            .unwrap_or_else(|_| (0, ZERO_HASH.to_owned()));
         let identity = self.identity.get();
         NodeMessage::Hello(Hello {
             node_id: identity.node_id,
@@ -1872,8 +1950,8 @@ impl Session {
             boot_id: self.boot_id.clone(),
             stored_rev,
             applied_rev,
-            log_seq: 0,
-            log_hash: ZERO_HASH.to_owned(),
+            log_seq,
+            log_hash,
             leases: self.leases.as_ref().map_or_else(Vec::new, LeaseLink::hello),
             capacity: self.facts.capacity,
             allocated: self.allocated(),

@@ -1413,6 +1413,11 @@ impl DesiredState {
 pub struct LogEntries {
     pub from_seq: u64,
     pub entries: Vec<Value>,
+    /// From M5b: the `seq` of the primary's newest entry when it sent this
+    /// message, so the node knows how far behind it is (section 7.1, ADR
+    /// 0227). Absent from a primary older than M5b.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_seq: Option<u64>,
 }
 
 /// Body of `stream_open` (section 5.15).
@@ -1697,6 +1702,32 @@ mod tests {
             welcome.primary_urls,
             vec!["https://primary.example:8443".to_owned()]
         );
+    }
+
+    #[test]
+    fn log_entries_carry_head_seq_only_when_present() {
+        let text = r#"{"v":1,"type":"log_entries","id":"msg_1","body":{"from_seq":903,
+            "entries":[{"seq":903}],"head_seq":950}}"#;
+        let raw = RawFrame::parse(text).unwrap();
+        let ControlMessage::LogEntries(entries) = ControlMessage::from_raw(&raw).unwrap() else {
+            panic!("not log_entries");
+        };
+        assert_eq!(entries.from_seq, 903);
+        assert_eq!(entries.head_seq, Some(950));
+
+        // A primary older than M5b sends no `head_seq` (section 5.14).
+        let raw = RawFrame::parse(
+            r#"{"v":1,"type":"log_entries","id":"msg_2","body":{"from_seq":1,"entries":[]}}"#,
+        )
+        .unwrap();
+        let ControlMessage::LogEntries(entries) = ControlMessage::from_raw(&raw).unwrap() else {
+            panic!("not log_entries");
+        };
+        assert_eq!(entries.head_seq, None);
+        let frame = ControlMessage::LogEntries(entries)
+            .to_frame("msg_2", None)
+            .to_text();
+        assert!(!frame.contains("head_seq"), "{frame}");
     }
 
     #[test]

@@ -2,9 +2,11 @@
 //! The local node store (`node-agent-protocol.md` section 12).
 //!
 //! One SQLite file, `<data_dir>/node.db`, owned by root, holding the verified
-//! desired state, what was applied per VM, the buffered events and a small
-//! metadata table. Nothing here is replicated; the tables are local and may
-//! evolve.
+//! desired state, what was applied per VM, the buffered events, the node's
+//! verified copy of the change log (`change_log`, section 7.1), the records of
+//! quarantined copies (`quarantine`) and a small metadata table. Nothing here
+//! is replicated; the tables are local and may evolve. A quarantined copy of
+//! the change log itself is a file under `<data_dir>/quarantine/`.
 //!
 //! The whole point of the store is that the node keeps running without the
 //! control plane (D-0011): the newest verified snapshot is the source of truth
@@ -13,10 +15,11 @@
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use quoro_proto::jcs;
 use quoro_proto::wire::{
     BackupState, BuildPhase, BuildState, FailedStep, SnapshotMethod, VolumeState,
 };
@@ -28,6 +31,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use tokio::sync::{broadcast, watch};
 
 use crate::AgentError;
+use crate::follow::{LogEntry, ZERO_HASH};
 use crate::lease::{FenceRecord, LeaseState, StoredLease, StoredValidity};
 use crate::localkey::LocalKey;
 use crate::logs::CapturedLine;
@@ -45,6 +49,12 @@ pub const EVENT_BUFFER_LIMIT: i64 = 10_000;
 const APPLIED_REV: &str = "applied_rev";
 /// `key` of `node_meta` holding the count of events dropped from the buffer.
 const DROPPED_EVENTS: &str = "dropped_events";
+/// `key` of `node_meta` holding the primary's newest `seq` as its last
+/// `log_entries` reported it (`head_seq`, sections 5.14 and 12).
+const LOG_HEAD_SEQ: &str = "log_head_seq";
+/// `key` of `node_meta` holding when the node received [`LOG_HEAD_SEQ`], RFC
+/// 3339.
+const LOG_HEAD_SEQ_AT: &str = "log_head_seq_at";
 
 /// The schema. Every statement is `IF NOT EXISTS`, so opening an existing file
 /// is idempotent.
@@ -202,6 +212,28 @@ CREATE TABLE IF NOT EXISTS fences (
     at_ns     INTEGER NOT NULL,
     reason    TEXT NOT NULL,
     complete  INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS change_log (
+    seq         INTEGER PRIMARY KEY,
+    term        INTEGER NOT NULL,
+    time        TEXT NOT NULL,
+    actor_type  TEXT NOT NULL,
+    actor_id    TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id   TEXT NOT NULL,
+    op          TEXT NOT NULL,
+    payload     TEXT NOT NULL,
+    prev_hash   TEXT NOT NULL,
+    hash        TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS quarantine (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind           TEXT NOT NULL,
+    path           TEXT NOT NULL,
+    quarantined_at TEXT NOT NULL,
+    reason         TEXT NOT NULL,
+    last_seq       INTEGER,
+    last_hash      TEXT
 );
 ";
 
@@ -2030,6 +2062,217 @@ impl NodeStore {
             .is_some_and(|value| value == "1"))
     }
 
+    /// The newest `(seq, hash)` of the node's copy of the change log, or
+    /// `(0, ZERO_HASH)` when it holds none: what `hello` reports as `log_seq`
+    /// and `log_hash` (section 5.1), and what the next `log_entries` must
+    /// continue (section 7.1).
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn log_position(&self) -> Result<(u64, String), AgentError> {
+        let newest: Option<(i64, String)> =
+            sqlx::query_as("SELECT seq, hash FROM change_log ORDER BY seq DESC LIMIT 1")
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(store_error)?;
+        match newest {
+            Some((seq, hash)) => Ok((stored_seq(seq)?, hash)),
+            None => Ok((0, ZERO_HASH.to_owned())),
+        }
+    }
+
+    /// Stores one verified batch of change-log entries (section 7.1) and,
+    /// when the message carried one, the primary's `head_seq` with the time it
+    /// arrived, in one transaction: all of it is stored, or nothing.
+    ///
+    /// The batch must continue the stored copy. A `seq` already stored fails
+    /// its insert, and once the rows are in, the entry before the batch must
+    /// be the one its first `prev_hash` names and none may follow it, so the
+    /// copy stays one gap-free chain. The rows go in first, so the
+    /// transaction holds the write lock before it reads anything.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] when the batch does not continue the copy or
+    /// SQLite fails; nothing is stored then.
+    pub async fn store_log_batch(
+        &self,
+        entries: &[LogEntry],
+        head_seq: Option<u64>,
+    ) -> Result<(), AgentError> {
+        let (Some(first), Some(last)) = (entries.first(), entries.last()) else {
+            return Ok(());
+        };
+        let mut tx = self.pool.begin().await.map_err(store_error)?;
+        for entry in entries {
+            sqlx::query(
+                "INSERT INTO change_log (seq, term, time, actor_type, actor_id, entity_type, \
+                 entity_id, op, payload, prev_hash, hash) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(seq_column(entry.seq)?)
+            .bind(seq_column(entry.term)?)
+            .bind(&entry.time)
+            .bind(&entry.actor_type)
+            .bind(&entry.actor_id)
+            .bind(&entry.entity_type)
+            .bind(&entry.entity_id)
+            .bind(&entry.op)
+            .bind(&entry.payload)
+            .bind(&entry.prev_hash)
+            .bind(&entry.hash)
+            .execute(&mut *tx)
+            .await
+            .map_err(store_error)?;
+        }
+        let before: Option<String> = if first.seq <= 1 {
+            Some(ZERO_HASH.to_owned())
+        } else {
+            sqlx::query_scalar("SELECT hash FROM change_log WHERE seq = ?")
+                .bind(seq_column(first.seq - 1)?)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(store_error)?
+        };
+        let newest: Option<i64> = sqlx::query_scalar("SELECT MAX(seq) FROM change_log")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(store_error)?;
+        if before.as_deref() != Some(first.prev_hash.as_str())
+            || newest != Some(seq_column(last.seq)?)
+        {
+            return Err(AgentError::Store(format!(
+                "change-log entries {} to {} do not continue the stored copy",
+                first.seq, last.seq
+            )));
+        }
+        if let Some(head_seq) = head_seq {
+            for (key, value) in [
+                (LOG_HEAD_SEQ, head_seq.to_string()),
+                (LOG_HEAD_SEQ_AT, util::now_rfc3339()),
+            ] {
+                sqlx::query(
+                    "INSERT INTO node_meta (key, value) VALUES (?, ?) \
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                )
+                .bind(key)
+                .bind(value)
+                .execute(&mut *tx)
+                .await
+                .map_err(store_error)?;
+            }
+        }
+        tx.commit().await.map_err(store_error)
+    }
+
+    /// The primary's newest `seq` as its last `log_entries` reported it, and
+    /// when the node received it (section 12 `change_log`); `None` before
+    /// any `log_entries` carried a `head_seq`, and after a quarantine.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure or a value that is not a
+    /// number.
+    pub async fn log_head(&self) -> Result<Option<(u64, String)>, AgentError> {
+        let Some(seq) = self.meta(LOG_HEAD_SEQ).await? else {
+            return Ok(None);
+        };
+        let seq = seq
+            .parse::<u64>()
+            .map_err(|_| AgentError::Store(format!("the stored head_seq {seq:?} is no number")))?;
+        let at = self.meta(LOG_HEAD_SEQ_AT).await?.unwrap_or_default();
+        Ok(Some((seq, at)))
+    }
+
+    /// Every entry of the node's copy of the change log, in `seq` order.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn log_entries(&self) -> Result<Vec<LogEntry>, AgentError> {
+        let rows = sqlx::query(
+            "SELECT seq, term, time, actor_type, actor_id, entity_type, entity_id, op, \
+             payload, prev_hash, hash FROM change_log ORDER BY seq",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_error)?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(LogEntry {
+                    seq: stored_seq(row.try_get("seq").map_err(store_error)?)?,
+                    term: stored_seq(row.try_get("term").map_err(store_error)?)?,
+                    time: row.try_get("time").map_err(store_error)?,
+                    actor_type: row.try_get("actor_type").map_err(store_error)?,
+                    actor_id: row.try_get("actor_id").map_err(store_error)?,
+                    entity_type: row.try_get("entity_type").map_err(store_error)?,
+                    entity_id: row.try_get("entity_id").map_err(store_error)?,
+                    op: row.try_get("op").map_err(store_error)?,
+                    payload: row.try_get("payload").map_err(store_error)?,
+                    prev_hash: row.try_get("prev_hash").map_err(store_error)?,
+                    hash: row.try_get("hash").map_err(store_error)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Moves the node's copy of the change log aside after `log_diverged`
+    /// (section 7.1): divergent local writes are never silently dropped
+    /// (D-0022).
+    ///
+    /// Every stored entry is written, in `seq` order, as one RFC 8785 JSON
+    /// object per line with the fields of section 5.14, to a new `0600` file
+    /// under `<data_dir>/quarantine/`, never over an existing one. The file
+    /// and the directory are synced, and only then, in one transaction, the
+    /// copy is recorded in `quarantine`, every `change_log` row is deleted and
+    /// the primary's `head_seq` is cleared. Returns the file, or `None` when
+    /// the copy is empty, which needs no file, so a second call does nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Io`] when the file cannot be written and synced, and
+    /// [`AgentError::Store`] on a SQLite failure. Nothing is deleted then.
+    pub async fn quarantine_log(&self, reason: &str) -> Result<Option<PathBuf>, AgentError> {
+        let entries = self.log_entries().await?;
+        let Some(last) = entries.last() else {
+            return Ok(None);
+        };
+        let last_seq = seq_column(last.seq)?;
+        let last_hash = last.hash.clone();
+        let dir = self.data_dir.join(QUARANTINE_DIR);
+        let stamp = util::rfc3339_nanos(util::now_ns()).replace(['-', ':'], "");
+        let path = tokio::task::spawn_blocking(move || write_log_copy(&dir, &stamp, &entries))
+            .await
+            .map_err(|e| AgentError::Store(format!("the quarantine writer stopped: {e}")))??;
+
+        let mut tx = self.pool.begin().await.map_err(store_error)?;
+        sqlx::query(
+            "INSERT INTO quarantine (kind, path, quarantined_at, reason, last_seq, last_hash) \
+             VALUES ('change_log', ?, ?, ?, ?, ?)",
+        )
+        .bind(path.to_string_lossy().into_owned())
+        .bind(util::now_rfc3339())
+        .bind(reason)
+        .bind(last_seq)
+        .bind(&last_hash)
+        .execute(&mut *tx)
+        .await
+        .map_err(store_error)?;
+        sqlx::query("DELETE FROM change_log")
+            .execute(&mut *tx)
+            .await
+            .map_err(store_error)?;
+        sqlx::query("DELETE FROM node_meta WHERE key IN (?, ?)")
+            .bind(LOG_HEAD_SEQ)
+            .bind(LOG_HEAD_SEQ_AT)
+            .execute(&mut *tx)
+            .await
+            .map_err(store_error)?;
+        tx.commit().await.map_err(store_error)?;
+        Ok(Some(path))
+    }
+
     /// The pool, for a test that wants to inspect a table directly.
     #[doc(hidden)]
     #[must_use]
@@ -2054,6 +2297,105 @@ fn transcript_row(row: sqlx::sqlite::SqliteRow) -> Result<StoredTranscript, Agen
 
 fn store_error(error: sqlx::Error) -> AgentError {
     AgentError::Store(error.to_string())
+}
+
+/// The directory under the data directory that holds quarantined copies of
+/// the change log (section 7.1).
+const QUARANTINE_DIR: &str = "quarantine";
+
+/// A change-log `seq` or `term` as SQLite stores it. A verified entry's are
+/// below 2^53, since RFC 8785 refuses larger integers.
+fn seq_column(value: u64) -> Result<i64, AgentError> {
+    i64::try_from(value)
+        .map_err(|_| AgentError::Store(format!("change-log number {value} does not fit SQLite")))
+}
+
+/// A stored change-log `seq` or `term`, which is never negative.
+fn stored_seq(value: i64) -> Result<u64, AgentError> {
+    u64::try_from(value)
+        .map_err(|_| AgentError::Store(format!("the stored change-log number {value} is negative")))
+}
+
+/// Writes `entries` as one RFC 8785 JSON object per line to a new file in
+/// `dir`, named after `stamp`, and syncs it and `dir` (section 7.1). A file
+/// that could not be completed is removed: it is not a copy.
+fn write_log_copy(dir: &Path, stamp: &str, entries: &[LogEntry]) -> Result<PathBuf, AgentError> {
+    use std::io::Write as _;
+
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    match builder.create(dir) {
+        Ok(()) => {
+            // The new directory's own entry must survive a crash too.
+            if let Some(parent) = dir.parent() {
+                sync_dir(parent).map_err(|e| AgentError::io("sync the data directory", e))?;
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(AgentError::io("create the quarantine directory", e)),
+    }
+    let (path, file) = create_log_copy_file(dir, stamp)
+        .map_err(|e| AgentError::io("create the quarantine file", e))?;
+    let written = (|| -> std::io::Result<()> {
+        let mut out = std::io::BufWriter::new(file);
+        for entry in entries {
+            let line = entry
+                .to_value()
+                .map_err(std::io::Error::other)
+                .and_then(|value| {
+                    jcs::canonicalize(&value).map_err(|e| std::io::Error::other(e.0))
+                })?;
+            out.write_all(line.as_bytes())?;
+            out.write_all(b"\n")?;
+        }
+        out.into_inner()
+            .map_err(std::io::IntoInnerError::into_error)?
+            .sync_all()?;
+        sync_dir(dir)
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&path);
+        return Err(AgentError::io("write the quarantined change log", e));
+    }
+    Ok(path)
+}
+
+/// Creates `change_log-<stamp>.jsonl` in `dir`, mode `0600`, or the same name
+/// with a counter when it exists: an existing file is never opened.
+fn create_log_copy_file(dir: &Path, stamp: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    for attempt in 0..1_000_u32 {
+        let name = if attempt == 0 {
+            format!("change_log-{stamp}.jsonl")
+        } else {
+            format!("change_log-{stamp}-{attempt}.jsonl")
+        };
+        let path = dir.join(name);
+        match options.open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "every quarantine file name for this time is taken",
+    ))
+}
+
+/// Syncs a directory, so the entries created in it survive a crash.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
 }
 
 /// Reads one `builds` row back into a [`BuildRecord`].
@@ -3188,5 +3530,220 @@ mod tests {
             store.backup("bkp_new").await.unwrap().unwrap().guest_flush,
             Some(false)
         );
+    }
+
+    /// Verified entries `from_seq..from_seq + count`, chained on `prev_hash`.
+    fn verified(from_seq: u64, prev_hash: &str, count: u64, salt: &str) -> Vec<LogEntry> {
+        let entries = crate::follow::testing::chain(from_seq, prev_hash, count, salt);
+        crate::follow::verify_batch(
+            from_seq - 1,
+            prev_hash,
+            &crate::follow::testing::message(entries),
+        )
+        .unwrap()
+    }
+
+    /// The `quarantine` rows, oldest first: kind, path, reason, last seq and
+    /// hash.
+    async fn quarantine_rows(
+        store: &NodeStore,
+    ) -> Vec<(String, String, String, Option<i64>, Option<String>)> {
+        sqlx::query_as("SELECT kind, path, reason, last_seq, last_hash FROM quarantine ORDER BY id")
+            .fetch_all(store.pool())
+            .await
+            .unwrap()
+    }
+
+    /// Section 7.1: a batch is stored whole or not at all. The second batch
+    /// continues the copy but repeats seq 4 in its last entry, so its insert
+    /// fails after seq 4 and 5 went in; neither stays, nor does its
+    /// `head_seq`.
+    #[tokio::test]
+    async fn a_log_batch_commits_atomically() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let first = verified(1, ZERO_HASH, 3, "a");
+        store.store_log_batch(&first, Some(3)).await.unwrap();
+        assert_eq!(store.log_entries().await.unwrap(), first);
+        assert_eq!(store.log_head().await.unwrap().unwrap().0, 3);
+
+        let mut second = verified(4, &first[2].hash, 2, "a");
+        second.push(second[0].clone());
+        assert!(store.store_log_batch(&second, Some(9)).await.is_err());
+        assert_eq!(
+            store.log_position().await.unwrap(),
+            (3, first[2].hash.clone())
+        );
+        assert_eq!(store.log_entries().await.unwrap(), first);
+        assert_eq!(store.log_head().await.unwrap().unwrap().0, 3);
+
+        // A batch that does not continue the copy stores nothing either.
+        let other = verified(4, &"1".repeat(64), 2, "a");
+        assert!(store.store_log_batch(&other, Some(9)).await.is_err());
+        let gap = verified(5, &first[2].hash, 1, "a");
+        assert!(store.store_log_batch(&gap, Some(9)).await.is_err());
+        assert_eq!(store.log_entries().await.unwrap(), first);
+        assert_eq!(store.log_head().await.unwrap().unwrap().0, 3);
+
+        // The batch that does continue it goes in, without a `head_seq`.
+        let second = verified(4, &first[2].hash, 2, "a");
+        store.store_log_batch(&second, None).await.unwrap();
+        assert_eq!(store.log_entries().await.unwrap().len(), 5);
+        assert_eq!(store.log_head().await.unwrap().unwrap().0, 3);
+    }
+
+    /// Section 5.1: the position `hello` reports is the newest stored entry,
+    /// 0 and 64 zeros before any, and it survives a reopen.
+    #[tokio::test]
+    async fn the_log_position_survives_a_reopen() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        assert_eq!(
+            store.log_position().await.unwrap(),
+            (0, ZERO_HASH.to_owned())
+        );
+        assert_eq!(store.log_head().await.unwrap(), None);
+        let entries = verified(1, ZERO_HASH, 3, "a");
+        store.store_log_batch(&entries, Some(7)).await.unwrap();
+        drop(store);
+
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        assert_eq!(
+            store.log_position().await.unwrap(),
+            (3, entries[2].hash.clone())
+        );
+        assert_eq!(store.log_entries().await.unwrap(), entries);
+        let (head, at) = store.log_head().await.unwrap().unwrap();
+        assert_eq!(head, 7);
+        assert!(util::parse_rfc3339_nanos(&at).is_some(), "{at}");
+    }
+
+    /// Section 7.1: a quarantine writes the copy to a new file, one canonical
+    /// entry per line, records it, and empties the log; a second one has
+    /// nothing to move and does nothing; the node then follows from seq 1.
+    #[tokio::test]
+    async fn quarantine_writes_the_copy_records_it_and_empties_the_log() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let entries = verified(1, ZERO_HASH, 3, "a");
+        store.store_log_batch(&entries, Some(3)).await.unwrap();
+
+        let path = store
+            .quarantine_log("log_diverged: test")
+            .await
+            .unwrap()
+            .expect("a copy was written");
+        assert_eq!(path.parent(), Some(dir.0.join("quarantine").as_path()));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), entries.len());
+        for (line, entry) in lines.iter().zip(&entries) {
+            let value: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(value, entry.to_value().unwrap());
+            assert_eq!(*line, jcs::canonicalize(&value).unwrap());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        assert_eq!(
+            quarantine_rows(&store).await,
+            vec![(
+                "change_log".to_owned(),
+                path.to_string_lossy().into_owned(),
+                "log_diverged: test".to_owned(),
+                Some(3),
+                Some(entries[2].hash.clone()),
+            )]
+        );
+        assert!(store.log_entries().await.unwrap().is_empty());
+        assert_eq!(
+            store.log_position().await.unwrap(),
+            (0, ZERO_HASH.to_owned())
+        );
+        assert_eq!(store.log_head().await.unwrap(), None);
+
+        // Idempotent: nothing left to move, no second file or row.
+        assert_eq!(store.quarantine_log("again").await.unwrap(), None);
+        assert_eq!(quarantine_rows(&store).await.len(), 1);
+        assert_eq!(
+            std::fs::read_dir(dir.0.join("quarantine")).unwrap().count(),
+            1
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+
+        // A fresh chain from seq 1 is accepted after it.
+        let fresh = verified(1, ZERO_HASH, 2, "b");
+        store.store_log_batch(&fresh, None).await.unwrap();
+        assert_eq!(store.log_entries().await.unwrap(), fresh);
+    }
+
+    /// A quarantine file is never written over an existing one, even with the
+    /// same time in its name.
+    #[test]
+    fn a_quarantine_file_never_replaces_an_existing_one() {
+        let dir = TempDir::new();
+        let entries = vec![LogEntry {
+            seq: 1,
+            term: 1,
+            time: "2026-11-02T10:15:31Z".to_owned(),
+            actor_type: "system".to_owned(),
+            actor_id: "test".to_owned(),
+            entity_type: "app".to_owned(),
+            entity_id: "app_1".to_owned(),
+            op: "create".to_owned(),
+            payload: "{}".to_owned(),
+            prev_hash: ZERO_HASH.to_owned(),
+            hash: "1".repeat(64),
+        }];
+        let quarantine = dir.0.join("quarantine");
+        let first = write_log_copy(&quarantine, "20261109T101530Z", &entries).unwrap();
+        let first_text = std::fs::read_to_string(&first).unwrap();
+        let second = write_log_copy(&quarantine, "20261109T101530Z", &entries[..0]).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), first_text);
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "");
+    }
+
+    /// Section 12: a database an agent without change-log follow created
+    /// gains `change_log` and `quarantine` on open, and both work.
+    #[tokio::test]
+    async fn an_older_database_gains_the_change_log_and_quarantine_tables() {
+        let dir = TempDir::new();
+        {
+            let options = SqliteConnectOptions::new()
+                .filename(dir.0.join("node.db"))
+                .create_if_missing(true);
+            let pool = SqlitePool::connect_with(options).await.unwrap();
+            sqlx::raw_sql(
+                "CREATE TABLE node_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); \
+                 CREATE TABLE desired_state (rev INTEGER PRIMARY KEY, body TEXT NOT NULL, \
+                 body_enc BLOB, issued_at TEXT NOT NULL, term INTEGER NOT NULL, \
+                 stored_at TEXT NOT NULL); \
+                 INSERT INTO node_meta (key, value) VALUES ('applied_rev', '4');",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+        }
+        let store = NodeStore::open(&dir.0).await.expect("the store opens");
+        assert_eq!(store.applied_rev().await.unwrap(), 4);
+        assert_eq!(
+            store.log_position().await.unwrap(),
+            (0, ZERO_HASH.to_owned())
+        );
+        let entries = verified(1, ZERO_HASH, 2, "a");
+        store.store_log_batch(&entries, Some(2)).await.unwrap();
+        assert_eq!(store.log_entries().await.unwrap(), entries);
+        assert!(store.quarantine_log("test").await.unwrap().is_some());
+        assert_eq!(quarantine_rows(&store).await.len(), 1);
+
+        // A second start finds the tables and keeps the record.
+        drop(store);
+        let store = NodeStore::open(&dir.0).await.expect("the store reopens");
+        assert_eq!(quarantine_rows(&store).await.len(), 1);
     }
 }
