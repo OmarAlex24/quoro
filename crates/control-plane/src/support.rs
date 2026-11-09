@@ -167,6 +167,14 @@ struct State {
 }
 
 /// The voters' support of this primary ([module docs](self)).
+///
+/// Section 8.10 rule 2 is not built here, on purpose: the primary does not
+/// yet hold a voter-set change until a majority of the current voters has
+/// acknowledged the current version. That gate comes with the voter-set
+/// change operations in #687, before any vote listener (section 8.9). The
+/// support counted here is safe against a candidate's majority only once
+/// rule 2 gates voter-set changes; until then it is safe because no build
+/// collects votes yet, so no candidate can form a majority.
 #[derive(Debug)]
 pub struct SupportTracker {
     clock: RwLock<Arc<dyn BootClock>>,
@@ -257,7 +265,8 @@ impl SupportTracker {
 
     /// Takes a `support_grant` that `node_id` sent on session `generation`
     /// with `re` (section 5.28). A counted answer keeps the voter's later
-    /// `p_send`. The outstanding request it pairs with is used up whether it
+    /// `p_send` at the current version, and replaces a support held at an
+    /// older one. The outstanding request it pairs with is used up whether it
     /// counts or not.
     pub(crate) fn granted(
         &self,
@@ -307,11 +316,14 @@ impl SupportTracker {
             max_lease_ms: sent.max_lease_ms,
             voters_version: grant.voters_version,
         };
+        // The later `p_send` wins at one version. A support held at another
+        // version can never count again, since the version only grows
+        // (section 8.10), so an answer at the current one replaces it.
         state
             .held
             .entry(node_id.to_string())
             .and_modify(|held| {
-                if held.p_send < support.p_send {
+                if held.voters_version != support.voters_version || held.p_send < support.p_send {
                     *held = support;
                 }
             })
@@ -360,14 +372,19 @@ impl SupportTracker {
 
     /// How many voters of the current set support a grant of `duration_ms`
     /// now, and how many voters the set has; `None` when no support can be
-    /// held at all (after `stale_term`, without `CLOCK_BOOTTIME`, or before
-    /// the first voter set is read).
+    /// held at all (after `stale_term`, without `CLOCK_BOOTTIME`, before the
+    /// first voter set is read, or while the set is not countable because
+    /// the `nodes` rows and the change log disagree at its version, sections
+    /// 6.12 and 8.10 rule 4).
     fn count(&self, duration_ms: u64) -> Option<(usize, usize)> {
         if self.stopped.load(Ordering::SeqCst) {
             return None;
         }
         let now = self.now()?;
         let set = self.voters.latest()?;
+        if !set.countable {
+            return None;
+        }
         let state = self.state();
         let supporting = set
             .voters
@@ -417,6 +434,8 @@ mod tests {
                     mesh_address: None,
                 })
                 .collect(),
+            disagreement: None,
+            countable: true,
         });
         let clock = Arc::new(ManualBootClock::default());
         let tracker = SupportTracker::new(
@@ -473,6 +492,13 @@ mod tests {
         assert!(!two.supports(D), "1 of 2");
         answer(&two, "msg_2", "nod_b", 7);
         assert!(two.supports(D), "2 of 2");
+
+        let (four, _, _) = tracker(&["nod_a", "nod_b", "nod_c", "nod_d"], 7);
+        answer(&four, "msg_1", "nod_a", 7);
+        answer(&four, "msg_2", "nod_b", 7);
+        assert!(!four.supports(D), "2 of 4 is half, not more");
+        answer(&four, "msg_3", "nod_c", 7);
+        assert!(four.supports(D), "3 of 4");
 
         let (none, _, _) = tracker(&[], 7);
         assert!(!none.supports(D), "no voter, no majority");
@@ -546,8 +572,14 @@ mod tests {
             head: 9,
             version: 9,
             voters: voters.latest().unwrap().voters.clone(),
+            disagreement: None,
+            countable: true,
         });
         assert!(!tracker.supports(D));
+        // An answer at the new version replaces it, even one whose `p_send`
+        // is no later.
+        assert_eq!(answer(&tracker, "msg_4", "nod_a", 9), Answer::Counted);
+        assert!(tracker.supports(D));
     }
 
     /// Section 8.8, "Terms": after `stale_term` nothing counts.

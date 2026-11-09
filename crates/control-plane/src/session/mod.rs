@@ -2681,9 +2681,12 @@ impl Session {
                 ));
             };
             // Section 8.8, "Terms": `welcome` carries the cluster term as
-            // stored, never a guess. A term below the node's would end the
-            // session with `stale_term` and stop this primary's support, so a
-            // term that cannot be read starts no session.
+            // `meta` stores it. A term below the node's would end the session
+            // with `stale_term` and stop this primary's support, so a term
+            // that cannot be read starts no session. A missing or unparseable
+            // `meta.term` reads as 1 (`cluster_term`): that can only be at or
+            // below the real term, so at worst it draws `stale_term` and
+            // stops support, never a grant.
             let term = match cluster_term(&self.hub).await {
                 Ok(term) => term,
                 Err(e) => {

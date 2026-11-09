@@ -20,11 +20,20 @@
 //! entries after the last one it applied, in the same read transaction as the
 //! rows, so a set is never older than the log it was read with. The newest
 //! set read is kept for the support count ([`VoterLog::latest`]).
+//!
+//! - **The two must agree.** The set comes from the rows and the version from
+//!   the log, so a write whose change-log payload leaves out a `roles` or
+//!   `status` it changed would give the voters another set at the same
+//!   version, which sections 6.12 and 8.10 rule 4 rule out. Each read
+//!   compares the members the replay makes voters with the rows' voters.
+//!   While they differ, and for the rest of that version once they have
+//!   differed, the set is not [`VoterSet::countable`]: no support is counted
+//!   at it, and a warning names the machines on each side.
 
 use quoro_proto::wire::{SpecVoter, SpecVotes, SpecWitness};
 use serde_json::Value;
 use sqlx::SqlitePool;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 /// `spec.votes.port`: the TCP port of the vote listener on a voter's mesh
@@ -48,6 +57,16 @@ pub struct Voter {
     pub mesh_address: Option<String>,
 }
 
+/// Where the voters of the `nodes` rows and those of the change-log replay
+/// differ ([module docs](self)).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Disagreement {
+    /// Voters in the rows that the replay does not make voters.
+    pub only_in_rows: Vec<String>,
+    /// Voters in the replay that the rows do not list as voters.
+    pub only_in_log: Vec<String>,
+}
+
 /// The voter set and its version, as one read transaction saw them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VoterSet {
@@ -58,6 +77,14 @@ pub struct VoterSet {
     pub version: u64,
     /// Every voter, oldest enrolled first.
     pub voters: Vec<Voter>,
+    /// How the rows and the log differ in this read, `None` when they agree.
+    pub disagreement: Option<Disagreement>,
+    /// Whether support may be counted at this set: the rows and the log
+    /// agree in this read and have agreed in every read at this version
+    /// (sections 6.12 and 8.10 rule 4). Once they have differed, a voter may
+    /// hold another set at this version, so nothing counts until the version
+    /// moves on.
+    pub countable: bool,
 }
 
 impl VoterSet {
@@ -173,12 +200,39 @@ impl Replay {
         }
         self.applied = self.applied.max(seq);
     }
+
+    /// The nodes the replay makes voters.
+    fn members(&self) -> BTreeSet<&str> {
+        self.nodes
+            .iter()
+            .filter(|(_, facts)| facts.votes())
+            .map(|(node_id, _)| node_id.as_str())
+            .collect()
+    }
+}
+
+/// How the rows' voters `listed` and the replay's `logged` differ, `None`
+/// when they are the same machines.
+fn disagreement(listed: &BTreeSet<&str>, logged: &BTreeSet<&str>) -> Option<Disagreement> {
+    (listed != logged).then(|| Disagreement {
+        only_in_rows: listed
+            .difference(logged)
+            .map(|id| (*id).to_string())
+            .collect(),
+        only_in_log: logged
+            .difference(listed)
+            .map(|id| (*id).to_string())
+            .collect(),
+    })
 }
 
 #[derive(Debug, Default)]
 struct Cache {
     replay: Replay,
     latest: Option<Arc<VoterSet>>,
+    /// The newest version at which a read found the rows and the log
+    /// differing.
+    disagreed: Option<u64>,
 }
 
 /// The voter set's replay of the change log, kept in memory ([module
@@ -248,21 +302,44 @@ impl VoterLog {
                 });
             }
         }
-        let set = Arc::new(VoterSet {
-            head,
-            version: replay.version,
-            voters,
-        });
+        let version = replay.version;
+        let listed: BTreeSet<&str> = voters.iter().map(|voter| voter.node_id.as_str()).collect();
+        let disagreement = disagreement(&listed, &replay.members());
 
         let mut cache = self.cache();
         if replay.applied > cache.replay.applied {
             cache.replay = replay;
         }
+        if disagreement.is_some() {
+            cache.disagreed = cache.disagreed.max(Some(version));
+        }
+        let countable = disagreement.is_none() && cache.disagreed != Some(version);
+        let set = Arc::new(VoterSet {
+            head,
+            version,
+            voters,
+            disagreement,
+            countable,
+        });
         if cache
             .latest
             .as_ref()
             .is_none_or(|latest| latest.head <= set.head)
         {
+            let before = cache
+                .latest
+                .as_ref()
+                .and_then(|latest| latest.disagreement.as_ref());
+            if let Some(differs) = &set.disagreement
+                && before != Some(differs)
+            {
+                tracing::warn!(
+                    version,
+                    only_in_rows = ?differs.only_in_rows,
+                    only_in_log = ?differs.only_in_log,
+                    "the voters in the nodes rows and those the change log replays differ; no voter support counts at this version (sections 6.12 and 8.10 rule 4)"
+                );
+            }
             cache.latest = Some(Arc::clone(&set));
         }
         Ok(set)
@@ -370,6 +447,8 @@ mod tests {
                 voter("nod_a", &["node"], Some("10.43.0.2")),
                 voter("nod_w", &["edge", "witness"], None),
             ],
+            disagreement: None,
+            countable: true,
         };
         let (votes, witness) = set.spec_for("nod_a");
         let votes = votes.unwrap();
@@ -382,5 +461,206 @@ mod tests {
         assert!(votes.is_some());
         assert_eq!(witness, Some(SpecWitness {}));
         assert_eq!(set.spec_for("nod_edge"), (None, None));
+    }
+
+    mod agreement {
+        use super::super::*;
+        use super::node;
+        use crate::authority::VoterSupport;
+        use crate::changelog::{self, Actor, Op};
+        use crate::store::{Store, now_rfc3339};
+        use crate::support::{BootClock, ManualBootClock, SUPPORT_MS, SupportTracker};
+        use quoro_proto::wire::{SupportGrant, SupportRequest};
+        use quoro_types::{Prefix, new_id};
+        use serde_json::json;
+
+        const D: u64 = 15_000;
+
+        struct Cluster {
+            store: Store,
+            voters: Arc<VoterLog>,
+            tracker: SupportTracker,
+        }
+
+        impl Cluster {
+            async fn new() -> Self {
+                let voters = Arc::new(VoterLog::default());
+                let clock = Arc::new(ManualBootClock::default()) as Arc<dyn BootClock>;
+                Self {
+                    store: Store::open_in_memory().await.unwrap(),
+                    tracker: SupportTracker::new(clock, Arc::clone(&voters)),
+                    voters,
+                }
+            }
+
+            /// Enrolls a machine with the `node` role: its row and its create
+            /// entry, in one write.
+            async fn enroll(&self) -> String {
+                let id = new_id(Prefix::Node);
+                let mut w = self.store.begin_write().await.unwrap();
+                sqlx::query(
+                    "INSERT INTO nodes (id, name, roles, cp_status, status, public_key, address, \
+                     behind_nat, labels, capacity, allocated, kvm, engine_version, agent_version, \
+                     desired_rev, applied_rev, log_seq, last_seen_at, created_at) \
+                     VALUES (?, ?, '[\"node\"]', NULL, 'pending', '', NULL, 1, '{}', '{}', '{}', \
+                     '{}', NULL, NULL, 0, 0, 0, NULL, ?)",
+                )
+                .bind(&id)
+                .bind(&id)
+                .bind(now_rfc3339())
+                .execute(&mut *w.tx)
+                .await
+                .unwrap();
+                changelog::append(
+                    &mut w.tx,
+                    &Actor::system("test"),
+                    "node",
+                    &id,
+                    Op::Create,
+                    node(&["node"], "pending"),
+                )
+                .await
+                .unwrap();
+                w.commit().await.unwrap();
+                id
+            }
+
+            /// Sets `node_id`'s row status without a change-log entry.
+            async fn set_row_status(&self, node_id: &str, status: &str) {
+                sqlx::query("UPDATE nodes SET status = ? WHERE id = ?")
+                    .bind(status)
+                    .bind(node_id)
+                    .execute(self.store.pool())
+                    .await
+                    .unwrap();
+            }
+
+            /// Writes a change-log entry for `node_id` without changing its row.
+            async fn log_only(&self, node_id: &str, payload: Value) {
+                let mut w = self.store.begin_write().await.unwrap();
+                changelog::append(
+                    &mut w.tx,
+                    &Actor::system("test"),
+                    "node",
+                    node_id,
+                    Op::Update,
+                    payload,
+                )
+                .await
+                .unwrap();
+                w.commit().await.unwrap();
+            }
+
+            async fn read(&self) -> Arc<VoterSet> {
+                self.voters.current(self.store.pool()).await.unwrap()
+            }
+
+            /// Asks each of `ids` for support at `version`, and each answers.
+            fn answer(&self, ids: &[&String], version: u64) {
+                for id in ids {
+                    let msg_id = format!("msg_{version}_{id}");
+                    self.tracker.sent(
+                        &msg_id,
+                        id,
+                        1,
+                        &SupportRequest {
+                            term: 1,
+                            primary_node_id: "nod_p".to_string(),
+                            support_ms: SUPPORT_MS,
+                            max_lease_ms: D,
+                            voters_version: version,
+                        },
+                    );
+                    self.tracker.granted(
+                        id,
+                        1,
+                        Some(&msg_id),
+                        &SupportGrant {
+                            term: 1,
+                            support_ms: SUPPORT_MS,
+                            max_lease_ms: D,
+                            voters_version: version,
+                        },
+                    );
+                }
+            }
+        }
+
+        /// Sections 6.12 and 8.10 rule 4: a row whose status changes without
+        /// a change-log entry leaves the rows' set and the log's apart at one
+        /// version. No support counts while they differ, nor at that version
+        /// once they agree again; a change of the set that both carry moves
+        /// the version and support counts again.
+        #[tokio::test]
+        async fn a_row_change_the_log_does_not_carry_counts_no_support() {
+            let cluster = Cluster::new().await;
+            let a = cluster.enroll().await;
+            let b = cluster.enroll().await;
+            let c = cluster.enroll().await;
+            let set = cluster.read().await;
+            assert!(set.countable && set.disagreement.is_none(), "{set:?}");
+            cluster.answer(&[&a, &b], set.version);
+            assert!(cluster.tracker.supports(D), "2 of 3");
+
+            cluster.set_row_status(&c, "removed").await;
+            let apart = cluster.read().await;
+            assert_eq!(apart.version, set.version, "the log saw no change");
+            assert_eq!(apart.voters.len(), 2);
+            assert_eq!(
+                apart.disagreement,
+                Some(Disagreement {
+                    only_in_rows: Vec::new(),
+                    only_in_log: vec![c.clone()],
+                })
+            );
+            assert!(!apart.countable);
+            assert!(!cluster.tracker.supports(D), "the sets differ");
+            cluster.answer(&[&a, &b], apart.version);
+            assert!(!cluster.tracker.supports(D), "2 of the rows' 2");
+
+            cluster.set_row_status(&c, "pending").await;
+            let again = cluster.read().await;
+            assert!(again.disagreement.is_none());
+            assert!(!again.countable, "they differed at this version");
+            cluster.answer(&[&a, &b], again.version);
+            assert!(!cluster.tracker.supports(D));
+
+            let d = cluster.enroll().await;
+            let moved = cluster.read().await;
+            assert!(moved.version > again.version);
+            assert!(moved.countable && moved.disagreement.is_none(), "{moved:?}");
+            cluster.answer(&[&a, &b, &d], moved.version);
+            assert!(cluster.tracker.supports(D), "3 of 4");
+        }
+
+        /// The reverse: a log entry that removes a voter while its row stays
+        /// moves the version, but the rows still list it, so nothing counts
+        /// at that version, even with every listed voter answering.
+        #[tokio::test]
+        async fn a_log_change_the_rows_do_not_carry_counts_no_support() {
+            let cluster = Cluster::new().await;
+            let a = cluster.enroll().await;
+            let b = cluster.enroll().await;
+            let c = cluster.enroll().await;
+            let set = cluster.read().await;
+            assert!(set.countable);
+
+            cluster
+                .log_only(&c, json!({ "id": c, "status": "removed" }))
+                .await;
+            let apart = cluster.read().await;
+            assert!(apart.version > set.version);
+            assert_eq!(apart.voters.len(), 3);
+            assert_eq!(
+                apart.disagreement,
+                Some(Disagreement {
+                    only_in_rows: vec![c.clone()],
+                    only_in_log: Vec::new(),
+                })
+            );
+            assert!(!apart.countable);
+            cluster.answer(&[&a, &b, &c], apart.version);
+            assert!(!cluster.tracker.supports(D), "3 of the rows' 3");
+        }
     }
 }
