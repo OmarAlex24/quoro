@@ -11,7 +11,8 @@
 //! Each volume has one lock ([`VolumeLocks`]): a stream holds it from its
 //! checks to its answer, and anything else that replaces or removes the warm
 //! copy (deleting it, keeping it as the base when the node becomes the
-//! source) takes it first, so it never runs in the middle of a stream.
+//! source, [`keep_copy_as_base`]) takes it first, so it never runs in the
+//! middle of a stream.
 
 pub mod frame;
 pub mod receiver;
@@ -23,10 +24,15 @@ use std::os::unix::fs::FileExt as _;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use quoro_backup::cells::{CELL, CellHashes, hash_cell, zero_cell_hash};
+use quoro_engine::{Engine, VolumeId};
 use quoro_proto::wire::WarmStatus;
 use rustix::fs::SeekFrom;
 use rustix::io::Errno;
 use tokio::sync::{Mutex, OwnedMutexGuard, watch};
+use tracing::{info, warn};
+
+use crate::kept::{self, KeepPurpose};
+use crate::store::NodeStore;
 
 /// One async lock per warm volume, by volume id.
 #[derive(Clone, Default)]
@@ -60,6 +66,106 @@ impl VolumeLocks {
     pub async fn lock(&self, volume_id: &str) -> OwnedMutexGuard<()> {
         self.lock_of(volume_id).lock_owned().await
     }
+}
+
+/// What [`keep_copy_as_base`] did with a volume.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CopyAsBase {
+    /// The node holds no warm copy of the volume, so there is nothing to
+    /// keep: the volume is a plain one.
+    NoCopyRow,
+    /// The copy is kept as the source's base and its row is gone, so the
+    /// volume file is the node's own from now on.
+    Kept,
+    /// The copy was left pending by a crash or a failed swap and is not
+    /// resolved yet (section 6.13, "Applying"). The warm receiver resolves
+    /// it; the next pass tries again.
+    Resolving,
+    /// A step failed, with this reason; the next pass tries again.
+    Failed(String),
+    /// The node holds no complete copy, so it has nothing to start the app
+    /// on: its copy never completed, or it was removed.
+    NoCompleteCopy,
+}
+
+/// Keeps the warm copy of `volume_id` as the source's base, for a warm node
+/// that a failover or a switchover makes the source (section 6.13,
+/// "Failover", ADR 0175).
+///
+/// The copy file is already the volume file, so the reconciler adopts it as
+/// the node's own volume. Before it does, and so before any VM writes to it,
+/// this takes a snapshot of the copy, numbered with the copy's
+/// `snapshot_seq` and carrying its cell hashes, and records it as the warm
+/// base ([`kept::keep`]). The node then numbers its own snapshots after that
+/// copy, and the base is the common point the returning old source resyncs
+/// from (section 9). Last, the copy's row goes: the file is no longer the
+/// warm receiver's.
+///
+/// A crash between the steps is safe. A snapshot with no record is swept at
+/// the next start, and a recorded base of that number is not taken again.
+/// Once the row is gone, the volume file holds the copy, which
+/// `ensure_volume` keeps.
+///
+/// The caller holds the volume's lock, so no stream or resolution of the
+/// copy runs meanwhile.
+pub async fn keep_copy_as_base<E: Engine>(
+    engine: &E,
+    store: &NodeStore,
+    volume_id: &str,
+) -> CopyAsBase {
+    let record = match store.warm_target(volume_id).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return CopyAsBase::NoCopyRow,
+        Err(e) => return CopyAsBase::Failed(format!("cannot read the warm copy: {e}")),
+    };
+    if record.pending.is_some() {
+        return CopyAsBase::Resolving;
+    }
+    let Some(seq) = record.complete_seq.filter(|_| !record.removed) else {
+        return CopyAsBase::NoCompleteCopy;
+    };
+    let kept_already = match store.kept_snapshots_of(volume_id).await {
+        // The number alone is not enough: a base the node kept as an
+        // earlier source can carry the same number for other data.
+        Ok(records) => records.iter().any(|kept| {
+            kept.purpose == KeepPurpose::WarmBase.as_str()
+                && kept.seq == Some(seq)
+                && kept.cells == record.cells
+        }),
+        Err(e) => return CopyAsBase::Failed(format!("cannot read the kept snapshots: {e}")),
+    };
+    if !kept_already {
+        let snapshot = match engine
+            .snapshot_volume(&VolumeId(volume_id.to_owned()))
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(e) => return CopyAsBase::Failed(format!("cannot snapshot the warm copy: {e}")),
+        };
+        if let Err(e) = kept::keep(
+            store,
+            &record.app_id,
+            &snapshot,
+            KeepPurpose::WarmBase,
+            Some(seq),
+            record.cells.clone(),
+        )
+        .await
+        {
+            if let Err(de) = engine.delete_volume_snapshot(&snapshot).await {
+                warn!(volume_id, error = %de, "could not delete an unrecorded snapshot of the warm copy");
+            }
+            return CopyAsBase::Failed(format!("cannot record the base: {e}"));
+        }
+        info!(
+            volume_id,
+            seq, "kept the warm copy as the base before starting the app on it"
+        );
+    }
+    if let Err(e) = store.forget_warm_target(volume_id).await {
+        return CopyAsBase::Failed(format!("cannot forget the warm copy's row: {e}"));
+    }
+    CopyAsBase::Kept
 }
 
 /// What `status_report.warm` reports (section 5.3): the target side's

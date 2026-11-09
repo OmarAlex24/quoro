@@ -388,6 +388,19 @@ impl<E: Engine + 'static> WarmReceiver<E> {
             }
         }
         self.inner.forget_removed(&spec).await;
+        // A volume this node holds a copy of and now runs, because a failover
+        // or a switchover made it the source: no stream comes any more to
+        // resolve a copy left pending, and the node keeps the copy as its
+        // base only once it is resolved (section 6.13, "Failover").
+        for file in spec.volumes.iter().filter(|file| {
+            file.state == SpecVolumeState::Present
+                && !file
+                    .warm
+                    .as_ref()
+                    .is_some_and(|warm| warm.role == WarmRole::Target)
+        }) {
+            self.inner.resolve_left_pending(&file.volume_id).await;
+        }
 
         let wanted: BTreeSet<SocketAddr> = match mesh_ip(&spec) {
             Some(ip) => targets
@@ -853,6 +866,39 @@ impl<E: Engine + 'static> Inner<E> {
     fn resolve_in_task(self: &Arc<Self>, guard: OwnedMutexGuard<()>, record: WarmTargetRecord) {
         let inner = Arc::clone(self);
         tokio::spawn(async move { inner.resolve(guard, record).await });
+    }
+
+    /// Resolves, in a task of its own, the copy of `volume_id` that a crash
+    /// or a failed swap left pending, once the volume's lock is free; while
+    /// something holds it, a later pass tries again. As at start-up, the
+    /// node's own volume is not resolved here.
+    async fn resolve_left_pending(self: &Arc<Self>, volume_id: &str) {
+        let pending = |row: &Option<WarmTargetRecord>| {
+            row.as_ref()
+                .is_some_and(|row| row.pending.is_some() && !row.removed)
+        };
+        match self.store.warm_target(volume_id).await {
+            Ok(row) if pending(&row) => {}
+            Ok(_) => return,
+            Err(e) => {
+                warn!(volume_id, error = %e, "could not read a warm target");
+                return;
+            }
+        }
+        let Some(guard) = self.locks.try_lock(volume_id) else {
+            return;
+        };
+        // Read again under the lock: a resolution may have run meanwhile.
+        let row = match self.store.warm_target(volume_id).await {
+            Ok(row) if pending(&row) => row,
+            _ => return,
+        };
+        if !matches!(self.own_volume(volume_id).await, Ok(false)) {
+            return;
+        }
+        if let Some(row) = row {
+            self.resolve_in_task(guard, row);
+        }
     }
 
     /// Resolves the pending copy of `record`, whose lock `guard` holds,

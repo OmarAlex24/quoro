@@ -40,6 +40,7 @@ use crate::lease::{LeaseView, StartPermit};
 use crate::logs::LogCollector;
 use crate::store::{NodeStore, VolumeRecord};
 use crate::util;
+use crate::warm::CopyAsBase;
 use crate::{FORCE_WITHIN, START_WITHIN};
 
 /// The guest context id of every VM's vsock device: each VM has its own vsock
@@ -990,6 +991,54 @@ impl<E: Engine + 'static> Reconciler<E> {
                         self.ready_volumes.insert(entry.volume_id.clone());
                         continue;
                     }
+                    // A warm node that a failover or a switchover made the
+                    // source: its copy becomes its volume, and is kept as
+                    // the base first, before the volume is ready and so
+                    // before any VM writes to it (section 6.13, "Failover").
+                    if warm_copies.contains(&entry.volume_id) {
+                        match crate::warm::keep_copy_as_base(
+                            &*self.engine,
+                            &self.store,
+                            &entry.volume_id,
+                        )
+                        .await
+                        {
+                            CopyAsBase::Kept | CopyAsBase::NoCopyRow => {}
+                            CopyAsBase::Resolving => {
+                                debug!(
+                                    volume_id = %entry.volume_id,
+                                    "the warm copy is still being resolved; retrying on the next pass"
+                                );
+                                reached = false;
+                                continue;
+                            }
+                            CopyAsBase::Failed(reason) => {
+                                warn!(
+                                    volume_id = %entry.volume_id,
+                                    error = %reason,
+                                    "could not keep the warm copy as the base"
+                                );
+                                self.report_unadopted_copy(
+                                    &mut statuses,
+                                    entry,
+                                    &format!("could not keep the warm copy as the base: {reason}"),
+                                );
+                                reached = false;
+                                continue;
+                            }
+                            CopyAsBase::NoCompleteCopy => {
+                                // No file is created: an empty volume would
+                                // start the app with none of its data.
+                                self.report_unadopted_copy(
+                                    &mut statuses,
+                                    entry,
+                                    "this node holds no complete warm copy of the volume to start the app on",
+                                );
+                                reached = false;
+                                continue;
+                            }
+                        }
+                    }
                     self.record_volume(
                         &mut statuses,
                         entry,
@@ -1127,6 +1176,27 @@ impl<E: Engine + 'static> Reconciler<E> {
         {
             warn!(volume_id = %entry.volume_id, error = %e, "could not record the volume");
         }
+        self.publish_volumes(statuses.values().cloned().collect());
+    }
+
+    /// Reports `entry` `failed` with `error` and writes no row, so the warm
+    /// copy stays the warm receiver's until the node adopts it (section
+    /// 6.13, "Failover").
+    fn report_unadopted_copy(
+        &self,
+        statuses: &mut BTreeMap<String, VolumeStatus>,
+        entry: &SpecVolumeFile,
+        error: &str,
+    ) {
+        statuses.insert(
+            entry.volume_id.clone(),
+            VolumeStatus {
+                volume_id: entry.volume_id.clone(),
+                state: VolumeState::Failed,
+                allocated_bytes: None,
+                error: Some(truncate_error(error)),
+            },
+        );
         self.publish_volumes(statuses.values().cloned().collect());
     }
 

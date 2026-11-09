@@ -538,6 +538,20 @@ impl<E: Engine + 'static> Inner<E> {
         let Some((file, warm, mesh)) = self.source_entry(volume_id) else {
             return CycleOutcome::Skipped("this node is not the volume's source".to_owned());
         };
+        // A warm node made the source keeps its copy as its base before
+        // anything else (section 6.13, "Failover"). Until the reconciler has
+        // ([`super::keep_copy_as_base`]), the copy's row is still there, and
+        // nothing is snapshotted: a snapshot now would come before the base,
+        // under a number that does not follow the copy.
+        match self.store.warm_target(volume_id).await {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                return CycleOutcome::Skipped(
+                    "the warm copy is not kept as the base yet".to_owned(),
+                );
+            }
+            Err(e) => return self.fail(volume_id, format!("cannot read the warm copy: {e}")),
+        }
         let Some(local) = mesh else {
             return self.fail(volume_id, "this node has no mesh address yet".to_owned());
         };
