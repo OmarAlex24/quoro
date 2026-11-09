@@ -604,12 +604,16 @@ async fn run_job<E: Engine, R: Repository>(
     record.snapshot_method = Some(wire_method(snapshot.method));
     record.pause_ms = (snapshot.method == SnapshotMethod::PauseCopy)
         .then(|| u64::try_from(snapshot.pause.as_millis()).unwrap_or(u64::MAX));
-    // Any other outcome leaves the snapshot crash-consistent only; it never
-    // fails the backup (section 5.3).
-    record.guest_flush = Some(matches!(
-        snapshot.guest_flush,
-        GuestFlush::Flushed | GuestFlush::NoRunningVm
-    ));
+    // Only `Flushed` and `NoRunningVm` mean the snapshot holds every write
+    // the guest completed before it. Any other outcome leaves it
+    // crash-consistent only, and never fails the backup (section 5.3).
+    record.guest_flush = Some(match snapshot.guest_flush {
+        GuestFlush::Flushed | GuestFlush::NoRunningVm => true,
+        GuestFlush::Paused
+        | GuestFlush::Unsupported
+        | GuestFlush::TimedOut
+        | GuestFlush::Failed => false,
+    });
     record.snapshot_path = Some(snapshot.location.display().to_string());
     save(&store, &done, record.clone()).await;
 
@@ -1884,6 +1888,54 @@ mod tests {
         );
         let row = store.backup("bkp_1").await.unwrap().expect("a backup row");
         assert_eq!(row.status, BackupState::Failed);
+        handle.abort();
+    }
+
+    /// Section 5.3, ADR 0282: `guest_flush` is set with `running`, before the
+    /// upload, so a backup whose upload then fails still reports it.
+    #[tokio::test]
+    async fn a_backup_that_fails_after_running_keeps_its_guest_flush() {
+        let dir = TestDir::new("backup-failed-flush");
+        let store = NodeStore::open(dir.path()).await.unwrap();
+        let volumes = dir.path().join("volumes");
+        std::fs::create_dir_all(&volumes).unwrap();
+        let engine = Arc::new(FakeEngine::new());
+        engine.set_volume_dir(&volumes);
+        engine
+            .ensure_volume(&VolumeId("vol_1".to_owned()), 1)
+            .await
+            .unwrap();
+        engine.set_guest_flush(Some(Ok(GuestFlush::TimedOut)));
+        ready_volume(&store, "vol_1").await;
+
+        let keys = keys_for("app_1");
+        let faulty = Arc::new(FaultyStore {
+            inner: Arc::new(MemoryStore::new()),
+            fail_puts: AtomicBool::new(true),
+        });
+        let (manager, mut statuses) = BackupManager::new(
+            Arc::clone(&engine),
+            store.clone(),
+            Arc::new(FaultyRepository {
+                store: Arc::clone(&faulty),
+            }),
+            lease_view(7),
+            "cls_1".to_owned(),
+        );
+        let manager = manager.with_options(BackupOptions::quick());
+        let (_tx, rx) = watch::channel(Some(snapshot(
+            vec![present("vol_1", None)],
+            vec![job("bkp_1", "vol_1", &keys, 7)],
+            Some(repository("tests/failed-flush")),
+        )));
+        let handle = tokio::spawn(manager.run(rx, std::future::pending::<()>()));
+
+        let status = wait_backup(&mut statuses, "bkp_1").await;
+        assert_eq!(status.status, BackupState::Failed);
+        assert_eq!(status.guest_flush, Some(false));
+        let row = store.backup("bkp_1").await.unwrap().expect("a backup row");
+        assert_eq!(row.status, BackupState::Failed);
+        assert_eq!(row.guest_flush, Some(false));
         handle.abort();
     }
 
