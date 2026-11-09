@@ -5,10 +5,15 @@ import {
   channelPhrase,
   createdName,
   dayLabel,
+  clockTime,
   groupByDay,
+  groupReads,
+  isPlainRead,
   namesFromRecords,
   recordAction,
   recordTargets,
+  readsSentence,
+  readsWhen,
   recordSentence,
   resultTag,
   segmentsText,
@@ -291,5 +296,109 @@ describe('issue 637: what the record can and cannot tell', () => {
       { type: 'app', id: APP },
       { type: 'approval', id: APPROVAL },
     ]);
+  });
+});
+
+describe('issue 641: runs of the same read fold into one row', () => {
+  const at = (seconds: number) => new Date(Date.parse('2026-11-09T14:45:00Z') + seconds * 1_000).toISOString();
+  // As on the lab: the agent asks, polls its request every second, the owner
+  // approves, the agent reads once more, then deletes with the approval.
+  const poll = (seq: number) =>
+    record({
+      seq,
+      time: at(seq * 10),
+      channel: 'api',
+      operation: 'GET /api/v1/approvals/{approval_id}',
+      scope: 'approval:read',
+      target_type: 'approval',
+      target_id: APPROVAL,
+      params: {},
+    });
+  const ask = record({
+    seq: 19,
+    time: at(190),
+    channel: 'api',
+    operation: 'POST /api/v1/approvals',
+    target_type: 'approval',
+    target_id: APPROVAL,
+  });
+  const approve = record({
+    seq: 60,
+    time: at(600),
+    actor_type: 'user',
+    actor_id: USER,
+    channel: 'panel',
+    operation: 'POST /api/v1/approvals/{approval_id}/approve',
+    target_type: 'approval',
+    target_id: APPROVAL,
+    approval_id: APPROVAL,
+  });
+  const deleted = record({
+    seq: 62,
+    time: at(620),
+    channel: 'api',
+    operation: 'DELETE /api/v1/apps/{app_id}',
+    approval_id: APPROVAL,
+  });
+  const ascending = [ask, ...Array.from({ length: 40 }, (_, index) => poll(20 + index)), approve, poll(61), deleted];
+  const shape = (items: ReturnType<typeof groupReads>) =>
+    items.map((item) => (item.kind === 'one' ? item.record.seq : `${item.records.length} reads`));
+
+  it('folds 40 polls into one row and keeps the request, the decision and the delete', () => {
+    expect(shape(groupReads(ascending))).toEqual([19, '40 reads', 60, 61, 62]);
+  });
+
+  it('folds the same way when the feed reads newest first', () => {
+    const items = groupReads([...ascending].reverse());
+    expect(shape(items)).toEqual([62, 61, 60, '40 reads', 19]);
+    const run = items[3]!;
+    expect(run.kind === 'reads' && run.key).toBe('reads-20');
+  });
+
+  it('says the run once, with how many and when', () => {
+    const run = groupReads(ascending)[1]!;
+    if (run.kind !== 'reads') throw new Error('expected a run');
+    expect(segmentsText(readsSentence([...run.records], ctx))).toBe(
+      `on-call-restarter read the request to delete blog 40 times via the API, ${clockTime(at(200))}–${clockTime(at(590))}`,
+    );
+    expect(readsWhen(run.records).words).toBe(`${clockTime(at(200))}–${clockTime(at(590))}`);
+    expect(readsWhen([poll(20), poll(21)]).words).toBe(clockTime(at(200)));
+  });
+
+  it('never folds a write, a refusal, an error, an approval or the system', () => {
+    expect(isPlainRead(poll(20))).toBe(true);
+    expect(isPlainRead(record({ operation: 'get_app' }))).toBe(true);
+    expect(isPlainRead(record({ operation: 'list_apps', target_type: null, target_id: null }))).toBe(true);
+    expect(isPlainRead(record({ operation: 'restart_app' }))).toBe(false);
+    expect(isPlainRead({ ...poll(20), result: 'refused' })).toBe(false);
+    expect(isPlainRead({ ...poll(20), result: 'error' })).toBe(false);
+    expect(isPlainRead({ ...poll(20), approval_id: APPROVAL })).toBe(false);
+    expect(isPlainRead({ ...poll(20), actor_type: 'system' })).toBe(false);
+    const refused = [20, 21, 22].map((seq) => ({ ...poll(seq), result: 'refused' as const }));
+    expect(shape(groupReads(refused))).toEqual([20, 21, 22]);
+  });
+
+  it('starts a new run on another actor, channel, operation or target, and leaves a single read alone', () => {
+    const other = (seq: number, patch: Partial<AuditRecord>) => ({ ...poll(seq), ...patch });
+    expect(shape(groupReads([poll(1), other(2, { actor_id: 'agt_other' }), poll(3)]))).toEqual([1, 2, 3]);
+    expect(shape(groupReads([poll(1), poll(2), other(3, { channel: 'mcp' }), other(4, { channel: 'mcp' })]))).toEqual([
+      '2 reads',
+      '2 reads',
+    ]);
+    expect(shape(groupReads([poll(1), other(2, { target_id: 'apr_other' })]))).toEqual([1, 2]);
+    expect(shape(groupReads([poll(1), other(2, { operation: 'get_approval' })]))).toEqual([1, 2]);
+    const list = (seq: number) =>
+      record({ seq, operation: 'list_apps', scope: 'app:read', target_type: null, target_id: null, params: {} });
+    expect(shape(groupReads([list(1), list(2), list(3)]))).toEqual(['3 reads']);
+    expect(shape(groupReads([poll(5)]))).toEqual([5]);
+  });
+
+  it('says what a read of a request asks for', () => {
+    expect(say({ operation: 'GET /api/v1/approvals/{approval_id}', target_type: 'approval', target_id: APPROVAL })).toBe(
+      'on-call-restarter read the request to delete blog via MCP',
+    );
+    expect(say({ operation: 'get_approval', target_type: 'approval', target_id: 'apr_unknown' })).toBe(
+      'on-call-restarter read a request via MCP',
+    );
   });
 });

@@ -268,6 +268,17 @@ const askPhrase: Phrase = {
   },
 };
 
+/** "read the request to delete blog": an agent checking on what it asked for. */
+const readRequest: Phrase = {
+  done: (record, ctx) => {
+    const asked = approvalTarget(record, ctx);
+    if (!asked) return [plain('read a request')];
+    const [base] = scopeVerb(asked.scope);
+    return [plain(`read the request to ${base} `), ...targetWords(ctx, asked.target.type, asked.target.id)];
+  },
+  tried: () => [plain('tried to read a request')],
+};
+
 const logsPhrase: Phrase = {
   done: (record, ctx) => {
     const tail = record.params?.tail;
@@ -354,7 +365,8 @@ const PHRASES: Readonly<Record<string, Phrase>> = {
   get_incident: onTarget('read', 'read'),
   list_audit: alone('read the audit log', 'read the audit log'),
   list_events: alone('read the events', 'read the events'),
-  get_approval: alone('read a request', 'read a request'),
+  get_approval: readRequest,
+  'GET /api/v1/approvals/{approval_id}': readRequest,
   request_approval: askPhrase,
   'POST /api/v1/approvals': askPhrase,
   'POST /api/v1/approvals/{approval_id}/approve': decision('approved'),
@@ -499,6 +511,110 @@ export const capitalize = (segments: readonly Segment[]): Segment[] => {
   const [first, ...rest] = segments;
   if (!first) return [];
   return [{ ...first, text: first.text.charAt(0).toUpperCase() + first.text.slice(1) }, ...rest];
+};
+
+/* ---------- runs of reads ---------- */
+
+/**
+ * Whether a record only read something and went through: a `GET` endpoint or
+ * an MCP `get_`/`list_` tool, with an `ok` result. Writes, refusals, errors,
+ * the system's own records and anything tied to an approval never count.
+ */
+export const isPlainRead = (
+  record: Pick<AuditRecord, 'operation' | 'result' | 'actor_type' | 'approval_id'>,
+): boolean =>
+  record.result === 'ok' &&
+  record.actor_type !== 'system' &&
+  !record.approval_id &&
+  (record.operation.startsWith('GET ') || /^(get|list)_/.test(record.operation));
+
+/** Two reads belong to one run: same actor, channel and operation, on the same target (or both on none). */
+const sameRead = (
+  left: Pick<AuditRecord, 'actor_type' | 'actor_id' | 'channel' | 'operation' | 'target_type' | 'target_id'>,
+  right: Pick<AuditRecord, 'actor_type' | 'actor_id' | 'channel' | 'operation' | 'target_type' | 'target_id'>,
+): boolean =>
+  left.actor_type === right.actor_type &&
+  left.actor_id === right.actor_id &&
+  left.channel === right.channel &&
+  left.operation === right.operation &&
+  (left.target_type ?? null) === (right.target_type ?? null) &&
+  (left.target_id ?? null) === (right.target_id ?? null);
+
+/** A row of the feed: one record, or a run of the same read said once. */
+export type FeedItem<T> =
+  | { readonly kind: 'one'; readonly record: T }
+  | { readonly kind: 'reads'; readonly key: string; readonly records: readonly T[] };
+
+/** A run of reads becomes one row from this many records. */
+export const READS_RUN_MIN = 2;
+
+/**
+ * The feed with every run of consecutive identical reads folded into one row,
+ * in the order the records came (newest or oldest first alike). An agent that
+ * polls would otherwise bury its own request and the decision on it under its
+ * reads; `listAudit` has no filter by action, so the panel folds them. Only
+ * plain reads fold (`isPlainRead`); any other record ends a run.
+ */
+export const groupReads = <
+  T extends Pick<
+    AuditRecord,
+    'seq' | 'operation' | 'result' | 'actor_type' | 'actor_id' | 'approval_id' | 'channel' | 'target_type' | 'target_id'
+  >,
+>(
+  records: readonly T[],
+  min: number = READS_RUN_MIN,
+): FeedItem<T>[] => {
+  const items: FeedItem<T>[] = [];
+  let run: T[] = [];
+  const flush = () => {
+    if (run.length >= min) {
+      const oldest = Math.min(...run.map((record) => record.seq));
+      items.push({ kind: 'reads', key: `reads-${oldest}`, records: run });
+    } else {
+      for (const record of run) items.push({ kind: 'one', record });
+    }
+    run = [];
+  };
+  for (const record of records) {
+    if (!isPlainRead(record)) {
+      flush();
+      items.push({ kind: 'one', record });
+      continue;
+    }
+    if (run.length > 0 && !sameRead(run[0]!, record)) flush();
+    run.push(record);
+  }
+  flush();
+  return items;
+};
+
+/**
+ * A run said once, with when it ran: "cleanup-bot read the request to delete
+ * scratch 40 times via the API, 14:45–14:46".
+ */
+export const readsSentence = (records: readonly AuditRecord[], ctx: RecordContext = {}): Segment[] => {
+  const first = records[0];
+  if (!first) return [];
+  const channel = channelPhrase(first.channel);
+  return [
+    strong(actorName(first, ctx)),
+    plain(' '),
+    ...recordAction(first, ctx),
+    plain(` ${records.length} times`),
+    ...(channel ? [{ text: ` ${channel}`, faint: true }] : []),
+    { text: `, ${readsWhen(records).words}`, faint: true },
+  ];
+};
+
+/** When a run happened: "14:31–14:44", or one clock time when it fits in a minute. */
+export const readsWhen = (records: ReadonlyArray<Pick<AuditRecord, 'time'>>): { from: string; to: string; words: string } => {
+  const times = records.map((record) => Date.parse(record.time)).filter((time) => !Number.isNaN(time));
+  if (times.length === 0) return { from: '', to: '', words: '--:--' };
+  const from = new Date(Math.min(...times)).toISOString();
+  const to = new Date(Math.max(...times)).toISOString();
+  const start = clockTime(from);
+  const end = clockTime(to);
+  return { from, to, words: start === end ? start : `${start}–${end}` };
 };
 
 /* ---------- the result tag ---------- */

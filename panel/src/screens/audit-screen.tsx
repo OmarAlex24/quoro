@@ -7,18 +7,19 @@ import {
   verifyAudit,
 } from '../api/generated/audit/audit';
 import type {
+  AuditRecord,
   AuditVerificationRequest,
   AuditVerificationResult,
   ListAuditParams,
 } from '../api/generated/model';
 import { Link2 } from 'lucide-react';
-import { ActivityRow } from '../components/activity-row';
+import { ActivityRow, ReadsRow } from '../components/activity-row';
 import { AuditFilters } from '../components/audit-filters';
 import { AuditSheet } from '../components/audit-sheet';
 import { ChainStrip } from '../components/chain-strip';
 import { Button } from '../components/ui/button';
 import { ProblemBanner } from '../components/ui/problem-banner';
-import { groupByDay, recordTargets } from '../lib/activity';
+import { groupByDay, groupReads, recordTargets } from '../lib/activity';
 import { isConnectorBroken } from '../lib/audit';
 import { problemView, type ProblemView } from '../lib/problem';
 import { useNow } from '../lib/use-now';
@@ -83,7 +84,19 @@ export function AuditScreen() {
     () => auditQuery.data?.pages.flatMap((page) => page.items) ?? [],
     [auditQuery.data],
   );
-  const days = useMemo(() => groupByDay(entries, now), [entries, now]);
+  // Each day's runs of the same read fold into one row (an agent that polls).
+  const days = useMemo(
+    () => groupByDay(entries, now).map((day) => ({ ...day, items: groupReads(day.records) })),
+    [entries, now],
+  );
+  const [openRuns, setOpenRuns] = useState<ReadonlySet<string>>(() => new Set());
+  const toggleRun = (key: string) =>
+    setOpenRuns((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
   // A deleted app, VM or project keeps the name its creation recorded.
   const targets = useMemo(() => recordTargets(entries, records), [entries, records]);
   const ctx = useKeptNames(records, targets, entries);
@@ -208,16 +221,35 @@ export function AuditScreen() {
             <div key={`${day.label}-${day.records[0]?.seq}`}>
               <h2 className="day">{day.label}</h2>
               <ol className="feed">
-                {day.records.map((record) => (
-                  <ActivityRow
-                    key={record.seq}
-                    record={record}
-                    ctx={ctx}
-                    selected={search.seq === record.seq}
-                    broken={isConnectorBroken(brokenAtSeq, record.seq)}
-                    onOpen={() => openEntry(record.seq)}
-                  />
-                ))}
+                {day.items.map((item) => {
+                  const row = (record: AuditRecord, nested = false) => (
+                    <ActivityRow
+                      key={record.seq}
+                      record={record}
+                      ctx={ctx}
+                      selected={search.seq === record.seq}
+                      broken={isConnectorBroken(brokenAtSeq, record.seq)}
+                      onOpen={() => openEntry(record.seq)}
+                      nested={nested}
+                    />
+                  );
+                  if (item.kind === 'one') return row(item.record);
+                  // A run opens by itself when it holds the open record or the broken link.
+                  const held = item.records.some(
+                    (record) => search.seq === record.seq || isConnectorBroken(brokenAtSeq, record.seq),
+                  );
+                  return (
+                    <ReadsRow
+                      key={item.key}
+                      records={item.records}
+                      ctx={ctx}
+                      open={held || openRuns.has(item.key)}
+                      onToggle={() => toggleRun(item.key)}
+                    >
+                      {item.records.map((record) => row(record, true))}
+                    </ReadsRow>
+                  );
+                })}
               </ol>
             </div>
           ))
