@@ -41,7 +41,7 @@ use tracing::{debug, info, warn};
 
 use crate::build::manager::{BuildStart, BuildsError, BuildsHandle};
 use crate::edge::EdgeManager;
-use crate::follow::{self, ZERO_HASH};
+use crate::follow;
 use crate::identity::{Identity, IdentityHandle};
 use crate::ingress::{DnsBridge, DnsRequest, IngressSupervisor};
 use crate::interactive::{Door, Interactive, OpenError, StreamKind};
@@ -688,7 +688,15 @@ impl Session {
         };
 
         // 1. `hello` is the first message on every session (section 4.2).
-        let hello = self.hello().await;
+        //    Without the change-log position it is not sent: a `log_seq` of 0
+        //    would skip the primary's divergence check (section 7.1).
+        let hello = match self.hello().await {
+            Ok(hello) => hello,
+            Err(e) => {
+                warn!(error = %e, "could not read the change-log position for hello; reconnecting");
+                return Ok(SessionEnd::Reconnect);
+            }
+        };
         if let Err(e) = write_message(&mut sink, hello, None).await {
             warn!(error = %e, "could not send hello; reconnecting");
             return Ok(SessionEnd::Reconnect);
@@ -1927,7 +1935,12 @@ impl Session {
         Ok(())
     }
 
-    async fn hello(&self) -> NodeMessage {
+    /// The `hello` of a new session (section 5.1).
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] when the change-log position cannot be read.
+    async fn hello(&self) -> Result<NodeMessage, AgentError> {
         let stored_rev = self
             .store
             .latest_desired()
@@ -1937,13 +1950,9 @@ impl Session {
             .map_or(0, |(rev, _)| rev);
         let applied_rev = self.store.applied_rev().await.unwrap_or(0);
         let dropped_events = self.store.dropped_events().await.unwrap_or(0);
-        let (log_seq, log_hash) = self
-            .store
-            .log_position()
-            .await
-            .unwrap_or_else(|_| (0, ZERO_HASH.to_owned()));
+        let (log_seq, log_hash) = self.store.log_position().await?;
         let identity = self.identity.get();
-        NodeMessage::Hello(Hello {
+        Ok(NodeMessage::Hello(Hello {
             node_id: identity.node_id,
             agent_version: self.facts.agent_version.clone(),
             engine_version: self.facts.engine_version.clone(),
@@ -1959,7 +1968,7 @@ impl Session {
             dropped_events,
             mesh_public_key: self.mesh_public_key.clone(),
             volume_snapshot: self.volume_snapshot,
-        })
+        }))
     }
 
     fn allocated(&self) -> Capacity {

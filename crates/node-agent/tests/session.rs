@@ -1755,3 +1755,140 @@ async fn log_diverged_quarantines_the_copy_and_the_node_refollows_from_seq_1() {
 
     end_session(ws, serving).await;
 }
+
+/// Every text frame the node sends until its session ends and the socket
+/// closes.
+async fn frames_until_closed(ws: &mut WebSocketStream<DuplexStream>) -> Vec<Value> {
+    let mut frames = Vec::new();
+    loop {
+        let message = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("the session ended in time");
+        match message {
+            Some(Ok(Message::Text(text))) => {
+                frames.push(serde_json::from_str(text.as_str()).expect("a JSON frame"));
+            }
+            Some(Ok(Message::Close(_)) | Err(_)) | None => return frames,
+            Some(Ok(_)) => {}
+        }
+    }
+}
+
+/// The session's end, once the socket closed.
+async fn ended(serving: Serving) -> Session {
+    let (session, end) = tokio::time::timeout(Duration::from_secs(5), serving)
+        .await
+        .expect("the session ended")
+        .unwrap();
+    assert_eq!(end.unwrap(), SessionEnd::Reconnect);
+    session
+}
+
+/// Section 7.1: when the quarantined copy cannot be written, nothing is
+/// deleted and nothing recorded; the session ends, so the next `hello` draws
+/// `log_diverged` again. A regular file where the quarantine directory goes
+/// makes creating the copy fail.
+#[tokio::test]
+async fn a_failed_quarantine_export_deletes_nothing_and_ends_the_session() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let (mut ws, _hello, serving) = follow_session(Session::new(setup)).await;
+
+    let old = log_chain(1, ZEROS, 3, "old");
+    send(
+        &mut ws,
+        log_entries_frame(old.clone(), Some(3), "msg_log_1"),
+    )
+    .await;
+    let ack = reply_to(&mut ws, "msg_log_1").await;
+    assert_eq!(ack["type"], "log_ack", "{ack}");
+
+    std::fs::write(dir.path().join("quarantine"), b"not a directory").unwrap();
+    let diverged = ControlMessage::Error(ProtocolError {
+        code: ErrorCode::LogDiverged,
+        message: "log_seq 3 does not match".to_owned(),
+        fatal: false,
+    });
+    send(&mut ws, diverged.to_frame("msg_diverged", None).to_text()).await;
+    frames_until_closed(&mut ws).await;
+    ended(serving).await;
+
+    assert_eq!(stored_log(&store).await, old);
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM quarantine")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
+/// Section 7.1: a batch the store cannot write is neither acknowledged nor
+/// answered `bad_message`; the session ends, and the next `hello` reports
+/// the position actually stored.
+#[tokio::test]
+async fn a_store_failure_sends_no_ack_and_ends_the_session() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let (mut ws, _hello, serving) = follow_session(Session::new(setup)).await;
+
+    sqlx::query("CREATE TRIGGER t BEFORE INSERT ON change_log BEGIN SELECT RAISE(ABORT,'x'); END;")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let entries = log_chain(1, ZEROS, 3, "a");
+    send(&mut ws, log_entries_frame(entries, Some(3), "msg_log_1")).await;
+    let frames = frames_until_closed(&mut ws).await;
+    assert!(log_acks(&frames).is_empty(), "no ack: {frames:?}");
+    assert!(
+        frames.iter().all(|frame| frame["re"] != "msg_log_1"),
+        "no answer at all: {frames:?}"
+    );
+    let session = ended(serving).await;
+
+    sqlx::query("DROP TRIGGER t")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let (ws, hello, serving) = follow_session(session).await;
+    assert_eq!(hello["body"]["log_seq"], 0);
+    assert_eq!(hello["body"]["log_hash"], ZEROS);
+    end_session(ws, serving).await;
+}
+
+/// Section 5.1: a node that cannot read its change-log position sends no
+/// `hello` rather than one reporting an empty log, which would skip the
+/// primary's divergence check (section 7.1). The session ends at once.
+#[tokio::test]
+async fn no_hello_is_sent_without_the_change_log_position() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let mut session = Session::new(setup);
+    sqlx::query("ALTER TABLE change_log RENAME TO change_log_away")
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let accept = tokio::spawn(tokio_tungstenite::accept_async(server));
+    let (client_ws, _response) = client_async("ws://primary.test/api/v1/nodes/session", client)
+        .await
+        .unwrap();
+    let mut ws = accept.await.unwrap().unwrap();
+    let serving = tokio::spawn(async move {
+        let end = session.serve(client_ws, std::future::pending::<()>()).await;
+        (session, end)
+    });
+    let frames = frames_until_closed(&mut ws).await;
+    assert!(frames.is_empty(), "no hello: {frames:?}");
+    let session = ended(serving).await;
+
+    sqlx::query("ALTER TABLE change_log_away RENAME TO change_log")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let (ws, hello, serving) = follow_session(session).await;
+    assert_eq!(hello["body"]["log_seq"], 0);
+    end_session(ws, serving).await;
+}

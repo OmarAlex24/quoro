@@ -19,7 +19,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use quoro_proto::jcs;
 use quoro_proto::wire::{
     BackupState, BuildPhase, BuildState, FailedStep, SnapshotMethod, VolumeState,
 };
@@ -2221,18 +2220,20 @@ impl NodeStore {
     /// (section 7.1): divergent local writes are never silently dropped
     /// (D-0022).
     ///
-    /// Every stored entry is written, in `seq` order, as one RFC 8785 JSON
-    /// object per line with the fields of section 5.14, to a new `0600` file
-    /// under `<data_dir>/quarantine/`, never over an existing one. The file
-    /// and the directory are synced, and only then, in one transaction, the
-    /// copy is recorded in `quarantine`, every `change_log` row is deleted and
-    /// the primary's `head_seq` is cleared. Returns the file, or `None` when
-    /// the copy is empty, which needs no file, so a second call does nothing.
+    /// Every stored entry is written, in `seq` order, as one JSON object per
+    /// line with the fields of section 5.14 (see [`log_copy_line`]), to a new
+    /// `0600` file under `<data_dir>/quarantine/`, never over an existing one.
+    /// The file and the directory are synced, and only then, in one
+    /// transaction, the copy is recorded in `quarantine`, the `change_log`
+    /// rows it holds are deleted and the primary's `head_seq` is cleared.
+    /// Returns the file, or `None` when the copy is empty, which needs no
+    /// file, so a second call does nothing.
     ///
     /// # Errors
     ///
     /// [`AgentError::Io`] when the file cannot be written and synced, and
-    /// [`AgentError::Store`] on a SQLite failure. Nothing is deleted then.
+    /// [`AgentError::Store`] on a SQLite failure or when the rows to delete
+    /// are not the ones exported. Nothing is deleted then.
     pub async fn quarantine_log(&self, reason: &str) -> Result<Option<PathBuf>, AgentError> {
         let entries = self.log_entries().await?;
         let Some(last) = entries.last() else {
@@ -2240,6 +2241,7 @@ impl NodeStore {
         };
         let last_seq = seq_column(last.seq)?;
         let last_hash = last.hash.clone();
+        let exported = u64::try_from(entries.len()).unwrap_or(u64::MAX);
         let dir = self.data_dir.join(QUARANTINE_DIR);
         let stamp = util::rfc3339_nanos(util::now_ns()).replace(['-', ':'], "");
         let path = tokio::task::spawn_blocking(move || write_log_copy(&dir, &stamp, &entries))
@@ -2259,10 +2261,19 @@ impl NodeStore {
         .execute(&mut *tx)
         .await
         .map_err(store_error)?;
-        sqlx::query("DELETE FROM change_log")
+        let deleted = sqlx::query("DELETE FROM change_log WHERE seq <= ?")
+            .bind(last_seq)
             .execute(&mut *tx)
             .await
-            .map_err(store_error)?;
+            .map_err(store_error)?
+            .rows_affected();
+        if deleted != exported {
+            // Dropping the transaction rolls it back: the copy stays.
+            return Err(AgentError::Store(format!(
+                "the change log changed while it was quarantined: {exported} entries were \
+                 exported, {deleted} would be deleted"
+            )));
+        }
         sqlx::query("DELETE FROM node_meta WHERE key IN (?, ?)")
             .bind(LOG_HEAD_SEQ)
             .bind(LOG_HEAD_SEQ_AT)
@@ -2316,9 +2327,9 @@ fn stored_seq(value: i64) -> Result<u64, AgentError> {
         .map_err(|_| AgentError::Store(format!("the stored change-log number {value} is negative")))
 }
 
-/// Writes `entries` as one RFC 8785 JSON object per line to a new file in
-/// `dir`, named after `stamp`, and syncs it and `dir` (section 7.1). A file
-/// that could not be completed is removed: it is not a copy.
+/// Writes `entries` as one JSON object per line ([`log_copy_line`]) to a new
+/// file in `dir`, named after `stamp`, and syncs it and `dir` (section 7.1).
+/// A file that could not be completed is removed: it is not a copy.
 fn write_log_copy(dir: &Path, stamp: &str, entries: &[LogEntry]) -> Result<PathBuf, AgentError> {
     use std::io::Write as _;
 
@@ -2343,12 +2354,7 @@ fn write_log_copy(dir: &Path, stamp: &str, entries: &[LogEntry]) -> Result<PathB
     let written = (|| -> std::io::Result<()> {
         let mut out = std::io::BufWriter::new(file);
         for entry in entries {
-            let line = entry
-                .to_value()
-                .map_err(std::io::Error::other)
-                .and_then(|value| {
-                    jcs::canonicalize(&value).map_err(|e| std::io::Error::other(e.0))
-                })?;
+            let line = log_copy_line(entry).map_err(std::io::Error::other)?;
             out.write_all(line.as_bytes())?;
             out.write_all(b"\n")?;
         }
@@ -2362,6 +2368,39 @@ fn write_log_copy(dir: &Path, stamp: &str, entries: &[LogEntry]) -> Result<PathB
         return Err(AgentError::io("write the quarantined change log", e));
     }
     Ok(path)
+}
+
+/// One line of a quarantined copy: the entry as the JSON object of section
+/// 5.14, members in RFC 8785 order, with the stored canonical payload text
+/// spliced in as it is. The payload is never parsed and serialized again: a
+/// whole-number float above 2^53 the primary hashed as a plain integer would
+/// have no canonical form the second time, and the copy must still be
+/// written.
+///
+/// # Errors
+///
+/// A stored payload that is not JSON, which only a tampered store holds; the
+/// line would not be JSON either.
+fn log_copy_line(entry: &LogEntry) -> Result<String, serde_json::Error> {
+    serde_json::from_str::<serde::de::IgnoredAny>(&entry.payload)?;
+    let text = |value: &str| serde_json::to_string(value);
+    // Every key is ASCII, so this order is the UTF-16 order RFC 8785 sorts by.
+    Ok(format!(
+        "{{\"actor_id\":{},\"actor_type\":{},\"entity_id\":{},\"entity_type\":{},\
+         \"hash\":{},\"op\":{},\"payload\":{},\"prev_hash\":{},\"seq\":{},\"term\":{},\
+         \"time\":{}}}",
+        text(&entry.actor_id)?,
+        text(&entry.actor_type)?,
+        text(&entry.entity_id)?,
+        text(&entry.entity_type)?,
+        text(&entry.hash)?,
+        text(&entry.op)?,
+        entry.payload,
+        text(&entry.prev_hash)?,
+        entry.seq,
+        entry.term,
+        text(&entry.time)?,
+    ))
 }
 
 /// Creates `change_log-<stamp>.jsonl` in `dir`, mode `0600`, or the same name
@@ -3259,6 +3298,7 @@ async fn max_log_instant(pool: &SqlitePool) -> Result<i64, AgentError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quoro_proto::jcs;
     use serde_json::json;
 
     struct TempDir(std::path::PathBuf);
@@ -3678,6 +3718,48 @@ mod tests {
         let fresh = verified(1, ZERO_HASH, 2, "b");
         store.store_log_batch(&fresh, None).await.unwrap();
         assert_eq!(store.log_entries().await.unwrap(), fresh);
+    }
+
+    /// A quarantined line carries the stored payload text as it is. A float
+    /// the primary hashed as `1e16` is stored as the integer text
+    /// `10000000000000000`, which parsed again has no RFC 8785 form; the
+    /// copy is still written, and its line parses back to the entry.
+    #[tokio::test]
+    async fn quarantine_exports_the_stored_payload_text_as_it_is() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let mut sent = crate::follow::testing::genesis(1, "a").remove(0);
+        sent["payload"] = json!({"big": 1e16, "name": "blog"});
+        crate::follow::testing::rehash(&mut sent);
+        let entries =
+            crate::follow::verify_batch(0, ZERO_HASH, &crate::follow::testing::message(vec![sent]))
+                .unwrap();
+        let stored = r#"{"big":10000000000000000,"name":"blog"}"#;
+        assert_eq!(entries[0].payload, stored);
+        assert!(jcs::canonicalize(&entries[0].to_value().unwrap()).is_err());
+        store.store_log_batch(&entries, None).await.unwrap();
+
+        let path = store.quarantine_log("test").await.unwrap().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains(&format!(r#""payload":{stored}"#)),
+            "{}",
+            lines[0]
+        );
+        let value: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(value, entries[0].to_value().unwrap());
+        let keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut fields = crate::follow::ENTRY_FIELDS.to_vec();
+        fields.sort_unstable();
+        assert_eq!(keys, fields);
+        assert!(store.log_entries().await.unwrap().is_empty());
     }
 
     /// A quarantine file is never written over an existing one, even with the
