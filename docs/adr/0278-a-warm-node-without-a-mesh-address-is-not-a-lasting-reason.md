@@ -1,12 +1,12 @@
 # ADR 0278: A warm node without a mesh address is not a lasting reason to pick another warm node; the contract sentence of D-0276 governs
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0287](0287-a-released-pin-keeps-an-eligible-warm-node-and-only-a.md)
 - **Date:** 2026-11-07
 - **Ledger id:** D-0278
 - **Tags:** m5b, warm, contracts
 - **Supersedes:** [ADR 0276](0276-when-the-scheduler-picks-a-warm-node-again-not-on-a.md)
 - **Superseded by:** none
-- **Related:** [ADR 0212](0212-the-scheduler-picks-the-warm-node-unless-an-operator-pins.md)
+- **Related:** [ADR 0212](0212-the-scheduler-picks-the-warm-node-unless-an-operator-pins.md), [ADR 0287](0287-a-released-pin-keeps-an-eligible-warm-node-and-only-a.md)
 
 ## Context
 
@@ -24,6 +24,7 @@ _Some wording was changed for the public repository._
 
 - Replaces ADR 0276.
 - Refines [ADR 0212](0212-the-scheduler-picks-the-warm-node-unless-an-operator-pins.md): when the scheduler picks the warm node again: not on a disconnect or a missing mesh address, only for a lasting reason. The rest of [ADR 0212](0212-the-scheduler-picks-the-warm-node-unless-an-operator-pins.md) stands.
+- [ADR 0287](0287-a-released-pin-keeps-an-eligible-warm-node-and-only-a.md) refines when the warm node changes: a released pin keeps it while it is still eligible, and only a reported pause_copy counts as no longer snapshotting with reflink. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---
