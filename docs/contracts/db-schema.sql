@@ -4,15 +4,23 @@
 -- change log, the audit log, the event log and the state tables that are derived
 -- from them. Column names and types follow the shared entity model used by
 -- openapi.yaml and events.schema.json, so a row, an API object and an event
--- payload use the same field names. A column with no field of its own in the
--- API object travels in the object's change-log payload under the column's
--- name, beside the object's fields, so a database rebuilt from the log keeps
--- it (ADR 0286). An app's warm settings are the case: apps.warm_node_id,
+-- payload use the same field names. A change-log payload carries the whole
+-- row for a create, and for an update the entity's key and the fields the
+-- update writes. A database rebuilt from the log merges an update over the
+-- row, so a field the payload lacks keeps its value, and a column's default
+-- applies only to a create that lacks it. It ignores a delete's payload,
+-- which is {} or the deleted object (node-agent-protocol.md section 7.3,
+-- ADR 0297). A column with no field of its own in the API object travels in
+-- the object's change-log payload under the column's name, beside the
+-- object's fields, so a database rebuilt from the log keeps it (ADR 0286).
+-- An app's warm settings are the case: apps.warm_node_id,
 -- apps.warm_node_pinned and apps.warm_interval_s (migration 0011) appear in
--- the API only inside `App.warm`. A field the primary derives on read is null
--- in the payload or absent from it: `App.warm` is null. What the primary
--- keeps only in memory, such as the progress of a warm copy, stays out of the
--- payload and the hash chain.
+-- the API only inside `App.warm`. A whole-App payload carries them, and a
+-- partial app payload omits them, so the rebuild keeps their values. A field
+-- the primary derives on read is null in the payload or absent from it:
+-- `App.warm` is null. A rebuild ignores a payload field with no column. What
+-- the primary keeps only in memory, such as the progress of a warm copy,
+-- stays out of the payload and the hash chain.
 --
 -- D-0015: SQLite first; state is stored as a numbered change log, and the state
 -- tables (nodes, projects, vms, apps, deployments, domains, volumes, leases,
