@@ -283,6 +283,7 @@
   - [0278: A warm node without a mesh address is not a lasting reason to pick another warm node; the contract sentence of D-0276 governs](adr/0278-a-warm-node-without-a-mesh-address-is-not-a-lasting-reason.md)
   - [0279: A fence's graceful phase also resumes a VM that a PauseCopy snapshot paused before it asks the guest to power off](adr/0279-a-fence-s-graceful-phase-also-resumes-a-vm-that-a-pausecopy.md)
   - [0281: The primary regrants a lease from hello only when the node lists it expired or refused a same-token local grant, never when it lists it revoked](adr/0281-the-primary-regrants-a-lease-from-hello-only-when-the-node.md)
+  - [0282: #400: flush a volume's guest filesystem through quoro-init (syncfs over the exec port) before every volume snapshot and before a switchover freeze, with a crash-consistent fallback](adr/0282-400-flush-a-volume-s-guest-filesystem-through-quoro-init.md)
 
 # Background research
 
