@@ -30,14 +30,44 @@ const pageLimit = (params: URLSearchParams): number => {
   return Math.min(parsed, 500);
 };
 
-/** A cursor is the last returned `seq`, as an opaque string. */
-const resumeSeq = (params: URLSearchParams): number | null => {
-  const cursor = queryText(params, 'cursor');
-  const after = queryText(params, 'after_seq');
-  const raw = cursor !== '' ? cursor : after;
+/** A whole number read from the query, `null` when absent, `NaN` when unreadable. */
+const queryInt = (params: URLSearchParams, name: string): number | null => {
+  const raw = queryText(params, name);
   if (raw === '') return null;
-  const parsed = Number(raw);
-  return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
+  return /^-?[0-9]+$/.test(raw) ? Number(raw) : Number.NaN;
+};
+
+/** The `seq` window one page reads, `after < seq < before`, and its order (ADR 0283). */
+interface SeqWindow {
+  readonly after: number;
+  readonly before: number | null;
+  readonly newestFirst: boolean;
+}
+
+/**
+ * `order`, `after_seq`, `before_seq` and the cursor as the page's window, as
+ * the control plane reads them. The cursor is the last returned `seq`, as an
+ * opaque string: oldest first the page continues after it, so it narrows
+ * `after_seq`; newest first it continues before it, so it narrows
+ * `before_seq`. A window that holds no `seq` is not an error.
+ */
+const windowOf = (params: URLSearchParams): SeqWindow | string => {
+  const order = queryText(params, 'order');
+  if (order !== '' && order !== 'asc' && order !== 'desc') return `order "${order}" is not asc or desc.`;
+  const newestFirst = order === 'desc';
+
+  const afterSeq = queryInt(params, 'after_seq');
+  if (afterSeq !== null && !(afterSeq >= 0)) return 'after_seq must be a whole number of 0 or more.';
+  const beforeSeq = queryInt(params, 'before_seq');
+  if (beforeSeq !== null && !(beforeSeq >= 1)) return 'before_seq must be a whole number of 1 or more.';
+  const cursor = queryInt(params, 'cursor');
+  if (cursor !== null && Number.isNaN(cursor)) return 'cursor is not a sequence number.';
+
+  if (newestFirst) {
+    const bounds = [beforeSeq, cursor].filter((bound): bound is number => bound !== null);
+    return { after: afterSeq ?? 0, before: bounds.length > 0 ? Math.min(...bounds) : null, newestFirst };
+  }
+  return { after: Math.max(afterSeq ?? 0, cursor ?? 0), before: beforeSeq, newestFirst };
 };
 
 export const auditHandlers: HttpHandler[] = [
@@ -49,19 +79,20 @@ export const auditHandlers: HttpHandler[] = [
     const targetId = queryText(url.searchParams, 'target_id');
     const result = queryText(url.searchParams, 'result');
     const incidentId = queryText(url.searchParams, 'incident_id');
-    const after = resumeSeq(url.searchParams);
+    const seqWindow = windowOf(url.searchParams);
+    if (typeof seqWindow === 'string') return validationFailed(seqWindow);
 
-    let records: AuditRecord[] = agency()
+    const records: AuditRecord[] = agency()
       .audit.filter(
         (record) =>
+          record.seq > seqWindow.after &&
+          (seqWindow.before === null || record.seq < seqWindow.before) &&
           (actorId === '' || record.actor_id === actorId) &&
           (targetId === '' || record.target_id === targetId) &&
           (result === '' || record.result === result) &&
           (incidentId === '' || record.incident_id === incidentId),
       )
-      .sort((left, right) => left.seq - right.seq);
-
-    if (after !== null) records = records.filter((record) => record.seq > after);
+      .sort((left, right) => (seqWindow.newestFirst ? right.seq - left.seq : left.seq - right.seq));
 
     const items = records.slice(0, pageLimit(url.searchParams));
     const last = items[items.length - 1];

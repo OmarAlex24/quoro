@@ -41,12 +41,16 @@ export function AuditScreen() {
   const [verifyProblem, setVerifyProblem] = useState<ProblemView | null>(null);
   const [scrollTo, setScrollTo] = useState<number | null>(null);
 
+  // Newest first (ADR 0283): the feed opens at the latest record and each
+  // page's cursor continues toward older ones. The order is part of the query
+  // key, so a cursor is never reused with another order or other filters.
   const filters = useMemo<ListAuditParams>(
     () => ({
       actor_id: search.actor_id,
       target_id: search.target_id,
       result: search.result,
       incident_id: search.incident_id,
+      order: 'desc',
       limit: 50,
     }),
     [search.actor_id, search.target_id, search.result, search.incident_id],
@@ -119,8 +123,8 @@ export function AuditScreen() {
   };
 
   /**
-   * Open a failed entry and make sure it is on screen: keep loading pages
-   * until the record is present, then scroll to its node on the rail.
+   * Open a failed entry and make sure it is on screen: keep loading older
+   * pages until the record is present, then scroll to its node on the rail.
    */
   const openLoadedEntry = async (seq: number) => {
     openEntry(seq);
@@ -223,10 +227,12 @@ export function AuditScreen() {
               onClick={() => void auditQuery.fetchNextPage()}
               disabled={auditQuery.isFetchingNextPage}
             >
-              {auditQuery.isFetchingNextPage ? 'Loading more…' : 'Load more'}
+              {auditQuery.isFetchingNextPage ? 'Loading older…' : 'Load older'}
             </Button>
           ) : entries.length > 0 ? (
-            <p className="text-[13px] text-ink-2">End of the log.</p>
+            <p className="text-[13px] text-ink-2">
+              {hasFilters ? 'Nothing older matches these filters.' : 'Nothing older. The log starts here.'}
+            </p>
           ) : null}
         </div>
       </section>

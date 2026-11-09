@@ -660,18 +660,12 @@ const seedAgency = (): void => {
     target_id: webhook.id,
     params: { name: webhook.name, url: webhook.url, secret: '[redacted]' },
   });
-  appendAudit({
-    time: minutesAgo(600),
-    operation: 'PATCH /api/v1/agents/{agent_id}',
-    scope: 'agent:write',
-    target_type: 'agent',
-    target_id: reporter.id,
-    params: { agent_id: reporter.id, disabled: true },
-  });
 
-  // Its routine reads of blog over the last day, under the read grant.
+  // Its routine reads of blog under the read grant: a health check every
+  // 45 minutes since the grant, and a closer look now and then. With them the
+  // log runs past one page of Activity, so "Load older" shows in mock mode.
   const onBlog = { target_type: 'app', target_id: appId, project_id: projectId, params: { app_id: appId }, grant_id: standard.id };
-  const reads: ReadonlyArray<readonly [number, string, string]> = [
+  const reads: [number, string, string][] = [
     [22.4 * 60, 'list_apps', 'app:read'],
     [22.3 * 60, 'get_app', 'app:read'],
     [18.9 * 60, 'get_app', 'app:read'],
@@ -683,9 +677,29 @@ const seedAgency = (): void => {
     [3.2 * 60, 'get_app', 'app:read'],
     [1.4 * 60, 'get_app', 'app:read'],
   ];
-  for (const [minutes, operation, scope] of reads) {
-    agentCall(restarter, minutes, operation, scope, operation === 'list_apps' ? { grant_id: standard.id, params: {} } : onBlog);
-  }
+  for (let minutes = 27.6 * 60; minutes > 60; minutes -= 45) reads.push([minutes, 'get_app', 'app:read']);
+
+  // Appended in time order, with the reporter disabled in between.
+  const timeline: [number, () => void][] = [
+    [
+      600,
+      () =>
+        appendAudit({
+          time: minutesAgo(600),
+          operation: 'PATCH /api/v1/agents/{agent_id}',
+          scope: 'agent:write',
+          target_type: 'agent',
+          target_id: reporter.id,
+          params: { agent_id: reporter.id, disabled: true },
+        }),
+    ],
+    ...reads.map(([minutes, operation, scope]): [number, () => void] => [
+      minutes,
+      () =>
+        agentCall(restarter, minutes, operation, scope, operation === 'list_apps' ? { grant_id: standard.id, params: {} } : onBlog),
+    ]),
+  ];
+  for (const [, append] of timeline.sort((left, right) => right[0] - left[0])) append();
 
   // The incident: Quoro opens it and wakes the agent with an incident grant.
   appendAudit({

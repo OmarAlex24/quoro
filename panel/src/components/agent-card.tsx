@@ -142,7 +142,7 @@ export function AgentCard({ agent, facts, selected }: { agent: Agent; facts: Age
         <CallSpark buckets={spark.buckets} total={spark.total} />
       ) : calls.data?.capped ? (
         <span className="acard-note">
-          More of its calls are recorded than the card reads; Activity has them all.
+          More calls in the last day than the card counts; Activity has them all.
         </span>
       ) : calls.isError ? (
         <span className="acard-note">Its calls could not be read.</span>
