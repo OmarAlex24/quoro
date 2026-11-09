@@ -1,12 +1,12 @@
 # ADR 0182: Manual promotion (#19): quoro cluster promote on the candidate, refused while the old primary may still hold expiring leases unless the operator acknowledges the fence; a returning old primary demotes itself and rejoins with quoro node rejoin
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0261](0261-every-node-holds-a-lease-row-s-local-write-before-an.md)
 - **Date:** 2026-11-06
 - **Ledger id:** D-0182
 - **Tags:** m5b, control-plane, reliability, contracts
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** none
+- **Related:** [ADR 0261](0261-every-node-holds-a-lease-row-s-local-write-before-an.md)
 
 ## Context
 
@@ -22,6 +22,7 @@ _Some wording was changed for the public repository._
 
 ## Consequences
 
+- [ADR 0261](0261-every-node-holds-a-lease-row-s-local-write-before-an.md) refines the candidate builds from the log it froze, takes its term from the vote answers, and gains --accept-loss. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---

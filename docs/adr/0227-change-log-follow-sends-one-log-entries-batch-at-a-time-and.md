@@ -1,12 +1,12 @@
 # ADR 0227: Change-log follow sends one log_entries batch at a time and keeps each node's acknowledged seq in memory; Node.log_lag shows the gap
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0261](0261-every-node-holds-a-lease-row-s-local-write-before-an.md)
 - **Date:** 2026-11-06
 - **Ledger id:** D-0227
 - **Tags:** m5b, contracts, promotion
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** none
+- **Related:** [ADR 0261](0261-every-node-holds-a-lease-row-s-local-write-before-an.md)
 
 ## Context
 
@@ -20,6 +20,7 @@ The primary keeps at most one log_entries message per session unacknowledged (up
 
 ## Consequences
 
+- [ADR 0261](0261-every-node-holds-a-lease-row-s-local-write-before-an.md) refines durable acknowledgements, the high-water mark, the refollowing state, and acknowledgements reset on a divergence. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---
