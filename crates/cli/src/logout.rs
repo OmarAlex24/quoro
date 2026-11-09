@@ -11,8 +11,8 @@
 //! revoked, so the last line points to where that is done. The client cannot
 //! revoke a token itself: the token list (`listTokens`) never returns a
 //! secret and `getMe` does not name the token in use, so the only id it could
-//! send would be a guess. A human revokes the token in the panel (Your
-//! account → API tokens), and an agent's key on the panel's agent page.
+//! send would be a guess. A human revokes the token in the panel (Settings →
+//! API tokens), and an agent's key on the panel's agent page.
 
 use crate::Environment;
 use crate::agent;
@@ -89,7 +89,7 @@ pub fn run(
     if has_token {
         message.push_str(&format!(
             "The token still works until it is revoked: revoke it in the panel, {TOKEN_HOME}{}.\n",
-            panel("/account")
+            panel("/settings/tokens")
         ));
     } else if has_key {
         message.push_str(&format!(

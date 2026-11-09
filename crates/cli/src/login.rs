@@ -8,7 +8,7 @@
 //! else the current one, else `default`.
 //!
 //! A human's credential is a personal API token (`tok_`), created in the
-//! panel (Your account → API tokens). It is typed at a prompt with the
+//! panel (Settings → API tokens). It is typed at a prompt with the
 //! terminal's echo off, or piped with `--token-stdin`, and never read from the
 //! command line, where any local user could see it in the process list.
 //! Without a terminal and without `--token-stdin` the login is refused before
@@ -48,7 +48,7 @@ const DEFAULT_CONTEXT: &str = "default";
 /// The prefix of a personal API token.
 const TOKEN_PREFIX: &str = "tok_";
 /// Where a human creates and revokes a token in the panel.
-pub const TOKEN_HOME: &str = "Your account → API tokens";
+pub const TOKEN_HOME: &str = "Settings → API tokens";
 
 pub async fn run(
     global: &Global,
@@ -98,7 +98,7 @@ async fn human_login(
             let _ = write!(
                 stderr,
                 "Paste a personal API token (tok_...) for {url}. Create one in the panel: \
-                 {TOKEN_HOME} ({url}/account).\nToken: ",
+                 {TOKEN_HOME} ({url}/settings/tokens).\nToken: ",
                 url = target.url
             );
             let _ = stderr.flush();
