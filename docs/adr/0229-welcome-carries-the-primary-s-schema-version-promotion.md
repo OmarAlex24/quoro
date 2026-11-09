@@ -1,12 +1,12 @@
 # ADR 0229: welcome carries the primary's schema_version; promotion refuses a newer log, and a column missing from an older payload takes its default
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0297](0297-change-log-payloads-an-update-carries-the-fields-it-writes.md)
 - **Date:** 2026-11-06
 - **Ledger id:** D-0229
 - **Tags:** m5b, contracts, promotion
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** none
+- **Related:** [ADR 0297](0297-change-log-payloads-an-update-carries-the-fields-it-writes.md)
 
 ## Context
 
@@ -20,6 +20,7 @@ welcome gains an optional schema_version (the primary's meta.schema_version); th
 
 ## Consequences
 
+- [ADR 0297](0297-change-log-payloads-an-update-carries-the-fields-it-writes.md) refines which payloads take a column's default: only a create that lacks the column; an update carries the fields it writes and is merged over the row, and a delete's payload is ignored. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---

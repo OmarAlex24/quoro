@@ -1,12 +1,12 @@
 # ADR 0286: An app's change-log payload carries warm_node_id, warm_node_pinned and warm_interval_s beside the App fields, and App.warm stays null in it
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0297](0297-change-log-payloads-an-update-carries-the-fields-it-writes.md)
 - **Date:** 2026-11-09
 - **Ledger id:** D-0286
 - **Tags:** m5b, warm, contracts, changelog
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** none
+- **Related:** [ADR 0297](0297-change-log-payloads-an-update-carries-the-fields-it-writes.md)
 
 ## Context
 
@@ -22,6 +22,7 @@ _Some wording was changed for the public repository._
 
 ## Consequences
 
+- [ADR 0297](0297-change-log-payloads-an-update-carries-the-fields-it-writes.md) refines what a partial app payload does: it omits the warm columns, and the rebuild keeps their values. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---

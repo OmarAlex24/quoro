@@ -299,6 +299,7 @@
   - [0292: failoverApp answers 202 at once while the grant of a marked lease waits, and the lease shows the wait (grant_pending, grant_waiting_on)](adr/0292-failoverapp-answers-202-at-once-while-the-grant-of-a-marked.md)
   - [0293: getSetup: a public GET /api/v1/setup answers {required: bool}, whether first-run setup is still open](adr/0293-getsetup-a-public-get-api-v1-setup-answers-required-bool.md)
   - [0296: spec.mesh on the edge: the warm target's allow entry, and no endpoints on an edge-only machine's node entries](adr/0296-spec-mesh-on-the-edge-the-warm-target-s-allow-entry-and-no.md)
+  - [0297: Change-log payloads: an update carries the fields it writes and the rebuild merges them over the row; a delete's payload is ignored](adr/0297-change-log-payloads-an-update-carries-the-fields-it-writes.md)
 
 # Background research
 
