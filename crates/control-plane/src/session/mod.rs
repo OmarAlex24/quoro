@@ -229,6 +229,26 @@ fn new_msg_id() -> String {
     wire::msg_id(random)
 }
 
+/// The `lease_revoke` that answers a renewal at `claimed` of a lease the
+/// node no longer holds (section 5.5), as [`stale_lease_revoke`], except
+/// that a lower token whose row still names the node is revoked at the
+/// renewal's token and releases nothing. The renewal may have crossed this
+/// node's grant at the row's token: a node still at `claimed` fences, and a
+/// node that holds the grant refuses the revoke (section 5.13).
+fn renewal_revoke(
+    row: Option<&leases::Lease>,
+    node_id: &str,
+    lease_id: &str,
+    claimed: u64,
+) -> Option<(quoro_proto::LeaseRevoke, u64)> {
+    let (mut revoke, released) = stale_lease_revoke(row, node_id, lease_id, claimed)?;
+    if revoke.reason == quoro_proto::RevokeReason::Superseded {
+        revoke.fencing_token = claimed.max(1);
+        return Some((revoke, 0));
+    }
+    Some((revoke, released))
+}
+
 /// A lease's token as the wire carries it: at least 1.
 fn lease_token(lease: &leases::Lease) -> u64 {
     u64::try_from(lease.fencing_token.max(1)).unwrap_or(1)
@@ -2483,14 +2503,10 @@ impl Session {
                 return;
             }
         };
-        if let Some((mut revoke, mut released)) =
-            stale_lease_revoke(row.as_ref(), &self.node_id, lease_id, renew.fencing_token)
+        if let Some((revoke, released)) =
+            renewal_revoke(row.as_ref(), &self.node_id, lease_id, renew.fencing_token)
         {
             drop(w);
-            if revoke.reason == quoro_proto::RevokeReason::Superseded {
-                revoke.fencing_token = renew.fencing_token.max(1);
-                released = 0;
-            }
             self.queue_revoke(revoke, released, outbox);
             return;
         }
@@ -3896,6 +3912,32 @@ mod tests {
             None,
             "tokens count from 1"
         );
+    }
+
+    /// Section 5.5: a renewal is revoked as at the session start, except a
+    /// lower token whose row still names the node, revoked at the renewal's
+    /// token and releasing nothing.
+    #[test]
+    fn a_crossed_renewal_is_revoked_at_its_own_token() {
+        use quoro_proto::RevokeReason::{Deleted, Moved, Superseded};
+        let revoke = |row: Option<&leases::Lease>, claimed: u64| {
+            renewal_revoke(row, "nod_a", "lse_a", claimed)
+                .map(|(revoke, released)| (revoke.reason, revoke.fencing_token, released))
+        };
+        assert_eq!(
+            revoke(Some(&row("nod_a", 6, false)), 5),
+            Some((Superseded, 5, 0))
+        );
+        assert_eq!(revoke(None, 4), Some((Moved, 4, 0)));
+        assert_eq!(
+            revoke(Some(&row("nod_a", 3, true)), 5),
+            Some((Deleted, 5, 3))
+        );
+        assert_eq!(
+            revoke(Some(&row("nod_b", 7, false)), 5),
+            Some((Moved, 7, 7))
+        );
+        assert_eq!(revoke(Some(&row("nod_a", 5, false)), 5), None);
     }
 
     #[test]
