@@ -15,9 +15,9 @@ use std::time::Duration;
 
 use quoro_engine::{
     ByteStream, Capabilities, ChangedRanges, ConsoleStream, Engine, EngineError, EngineEvent,
-    EventStream, ExecRequest, ExecSession, FakeEngine, HostProbe, ImageConfig, ImageDigest,
-    ImageRef, LineStream, NodeNetwork, PreparedImage, RangesOf, StageFrom, StagedVolume, StopMode,
-    VmCounters, VmId, VmInfo, VmSpec, VolumeId, VolumeInfo, VolumeSnapshot,
+    EventStream, ExecRequest, ExecSession, FakeEngine, GuestFlush, HostProbe, ImageConfig,
+    ImageDigest, ImageRef, LineStream, NodeNetwork, PreparedImage, RangesOf, StageFrom,
+    StagedVolume, StopMode, VmCounters, VmId, VmInfo, VmSpec, VolumeId, VolumeInfo, VolumeSnapshot,
 };
 use quoro_node_agent::LeaseTable;
 use quoro_node_agent::NodeFacts;
@@ -588,6 +588,14 @@ impl Engine for RecordingEngine {
 
     async fn resume(&self, id: &VmId) -> Result<(), EngineError> {
         self.inner.resume(id).await
+    }
+
+    async fn flush_volume(
+        &self,
+        id: &VolumeId,
+        within: std::time::Duration,
+    ) -> Result<GuestFlush, EngineError> {
+        self.inner.flush_volume(id, within).await
     }
 }
 

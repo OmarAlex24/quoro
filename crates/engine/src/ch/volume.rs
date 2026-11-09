@@ -746,21 +746,12 @@ impl Inner {
         self.volume_pool_error()?;
         let dir = self.volumes_dir();
         let path = volume_path(&dir, id);
-        let metadata = match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_file() => metadata,
-            Ok(_) => {
-                return Err(EngineError::Conflict(format!(
-                    "volume {} exists and is not a regular file",
-                    id.0
-                )));
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(EngineError::NotFound);
-            }
-            Err(err) => return Err(io_error(&path, &err)),
-        };
+        volume_file(&path, id)?;
         // Before either method's own steps, with the VM running (§3.16).
         let guest_flush = self.guest_flush(id, super::flush::SNAPSHOT_BOUND).await;
+        // Read after the flush: it gives the guest's delayed writes their
+        // blocks, so the size before it understates what a copy needs.
+        let metadata = volume_file(&path, id)?;
         let location = new_snapshot_path(&dir, id);
 
         let length = metadata.len();
@@ -914,6 +905,20 @@ impl Inner {
                     .then_some(entry)
             })
             .collect()
+    }
+}
+
+/// The metadata of the volume file at `path`: `NotFound` when it is missing,
+/// `Conflict` when it is not a regular file (§3.16).
+fn volume_file(path: &Path, id: &VolumeId) -> Result<std::fs::Metadata, EngineError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(metadata),
+        Ok(_) => Err(EngineError::Conflict(format!(
+            "volume {} exists and is not a regular file",
+            id.0
+        ))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(EngineError::NotFound),
+        Err(err) => Err(io_error(path, &err)),
     }
 }
 
