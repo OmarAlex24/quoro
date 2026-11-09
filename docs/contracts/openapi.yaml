@@ -7892,9 +7892,15 @@ paths:
           `App.lease.grant_waiting_on` show the wait.
 
         When the source is connected, the primary first revokes its lease
-        over the session and goes on once the revoke is answered; that loses
-        the writes made since the last shipped snapshot, which a planned
-        switchover (`switchoverApp`) does not. Then, in one change, it writes
+        over the session; that loses the writes made since the last shipped
+        snapshot, which a planned switchover (`switchoverApp`) does not. Once
+        the revoke is answered, the new token still waits for the lease's
+        gate (node-agent-protocol.md section 8.4, "What the authority must
+        enforce"), at most `duration_ms + 2M`, and the call stays open through
+        that wait. If the primary loses majority support meanwhile, the call
+        answers `no_support`: the source stays revoked and stopped, so no
+        copy runs, and a retry goes on from the grant, because the revoke was
+        already answered (ADR 0303). Then, in one change, it writes
         the warm node as the holder of an `expiring` lease with a higher
         fencing token, which it then grants (below), turns
         the standby VM there `running` on the last shipped snapshot, moves the
@@ -7902,7 +7908,11 @@ paths:
         an edge the tunnel route with the grace window of ADR 0168), makes the
         old source the app's warm node, and emits `app.failed_over`. The call
         answers `202` with the app once the lease moved; the instance starts
-        asynchronously. While the row carries the unsettled mark, the grant
+        asynchronously. The change sets the row's unsettled mark whenever the
+        grant must wait for replication, as when the row does not read
+        `expiring` with a `duration_ms` of at least the grant's, so the grant
+        waits for that raise (section 8.4, "The mark", ADR 0268, ADR 0303).
+        While the row carries the unsettled mark, the grant
         to the warm node is sent once the row's newest write is replicated
         over every machine with the `node` role and the primary holds
         majority support (node-agent-protocol.md section 8.4, "Grants of a
