@@ -796,6 +796,7 @@ async fn run_backup(setup: &mut Setup, data: &[u8]) -> String {
                 status: BackupState::Succeeded,
                 snapshot_method: Some(wire::SnapshotMethod::Reflink),
                 pause_ms: Some(0),
+                guest_flush: None,
                 manifest_key: Some(key),
                 manifest_digest: Some(digest),
                 logical_bytes: Some(logical_bytes),

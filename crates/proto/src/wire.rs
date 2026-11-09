@@ -506,6 +506,12 @@ pub struct BackupStatus {
     /// For `pause_copy`: how long the VM was paused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_ms: Option<u64>,
+    /// From `running` (M5b, ADR 0282): `true` when the engine reported
+    /// `Flushed` or `NoRunningVm`, `false` for any other outcome, which
+    /// leaves the backup crash-consistent only. It never fails the backup.
+    /// Absent from an agent older than M5b.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_flush: Option<bool>,
     /// On `succeeded`: the manifest's key, relative to the repository root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_key: Option<String>,
@@ -1798,6 +1804,44 @@ mod tests {
         let parsed: SpecVm = serde_json::from_value(standby.clone()).unwrap();
         assert!(parsed.standby);
         assert_eq!(serde_json::to_value(&parsed).unwrap(), standby);
+    }
+
+    #[test]
+    fn a_backup_guest_flush_is_absent_when_unknown_and_read_when_present() {
+        let entry =
+            json!({"backup_id": "bkp_1", "status": "running", "snapshot_method": "reflink"});
+        // An entry from an agent older than M5b still decodes.
+        let old: BackupStatus = serde_json::from_value(entry.clone()).unwrap();
+        assert_eq!(old.guest_flush, None);
+        // An unknown outcome is not serialized, so the entry keeps the old shape.
+        assert_eq!(serde_json::to_value(&old).unwrap(), entry);
+
+        let unflushed = BackupStatus {
+            guest_flush: Some(false),
+            ..old.clone()
+        };
+        let value = serde_json::to_value(&unflushed).unwrap();
+        assert_eq!(value["guest_flush"], json!(false));
+        assert!(
+            serde_json::to_string(&unflushed)
+                .unwrap()
+                .contains(r#""guest_flush":false"#)
+        );
+        assert_eq!(
+            serde_json::from_value::<BackupStatus>(value).unwrap(),
+            unflushed
+        );
+
+        let flushed = BackupStatus {
+            guest_flush: Some(true),
+            ..old
+        };
+        let value = serde_json::to_value(&flushed).unwrap();
+        assert_eq!(value["guest_flush"], json!(true));
+        assert_eq!(
+            serde_json::from_value::<BackupStatus>(value).unwrap(),
+            flushed
+        );
     }
 
     #[test]

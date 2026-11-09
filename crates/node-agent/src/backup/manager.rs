@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use quoro_backup::layout;
 use quoro_backup::{BackupWriter, ChunkId, Manifest, Restorer, SourceKeys, chunks, open_manifest};
-use quoro_engine::{Engine, SnapshotMethod, VolumeId, VolumeInfo, VolumeSnapshot};
+use quoro_engine::{Engine, GuestFlush, SnapshotMethod, VolumeId, VolumeInfo, VolumeSnapshot};
 use quoro_proto::wire::{
     BackupState, BackupStatus, Spec, SpecBackup, SpecBackupRepository, SpecRestore, SpecVolumeFile,
     SpecVolumeState, VolumeState,
@@ -353,6 +353,7 @@ impl<E: Engine + 'static, R: Repository> BackupManager<E, R> {
             status: BackupState::Queued,
             snapshot_method: None,
             pause_ms: None,
+            guest_flush: None,
             manifest_key: None,
             manifest_digest: None,
             logical_bytes: None,
@@ -511,6 +512,7 @@ async fn run_job<E: Engine, R: Repository>(
         status: BackupState::Queued,
         snapshot_method: None,
         pause_ms: None,
+        guest_flush: None,
         manifest_key: None,
         manifest_digest: None,
         logical_bytes: None,
@@ -570,11 +572,12 @@ async fn run_job<E: Engine, R: Repository>(
     };
 
     // Section 7.1 step 3: take the snapshot, then report `running` with its
-    // method and, for `pause_copy`, the pause. A `pause_copy` snapshot pauses
-    // the VM that attaches the volume for the whole copy while the engine
-    // still reports it running, so the volume is marked for that time: the
-    // health check of the VM that attaches it neither counts the pause nor
-    // restarts it (D-0259). The volume is marked, not the job's `vm_id`: the
+    // method, for `pause_copy` the pause, and whether the guest flushed the
+    // volume first (ADR 0282). A `pause_copy` snapshot pauses the VM that
+    // attaches the volume for the whole copy while the engine still reports
+    // it running, so the volume is marked for that time: the health check of
+    // the VM that attaches it neither counts the pause nor restarts it
+    // (D-0259). The volume is marked, not the job's `vm_id`: the
     // engine pauses whichever VM attaches the volume when it looks, which a
     // redeploy or a stale VM row can make another one (#524).
     let mark = (engine.capabilities().await.volume_snapshot_method
@@ -601,6 +604,12 @@ async fn run_job<E: Engine, R: Repository>(
     record.snapshot_method = Some(wire_method(snapshot.method));
     record.pause_ms = (snapshot.method == SnapshotMethod::PauseCopy)
         .then(|| u64::try_from(snapshot.pause.as_millis()).unwrap_or(u64::MAX));
+    // Any other outcome leaves the snapshot crash-consistent only; it never
+    // fails the backup (section 5.3).
+    record.guest_flush = Some(matches!(
+        snapshot.guest_flush,
+        GuestFlush::Flushed | GuestFlush::NoRunningVm
+    ));
     record.snapshot_path = Some(snapshot.location.display().to_string());
     save(&store, &done, record.clone()).await;
 
@@ -1678,6 +1687,114 @@ mod tests {
         handle.abort();
     }
 
+    /// Runs one backup of `vol_1` per guest flush outcome the fake engine
+    /// gives its snapshot, one after another in one manager, and returns each
+    /// job's terminal entry with its stored row.
+    async fn backups_with_flushes(
+        name: &str,
+        outcomes: &[GuestFlush],
+    ) -> Vec<(GuestFlush, BackupStatus, BackupRecord)> {
+        let dir = TestDir::new(name);
+        let store = NodeStore::open(dir.path()).await.unwrap();
+        let volumes = dir.path().join("volumes");
+        std::fs::create_dir_all(&volumes).unwrap();
+        let engine = Arc::new(FakeEngine::new());
+        engine.set_volume_dir(&volumes);
+        engine
+            .ensure_volume(&VolumeId("vol_1".to_owned()), 1)
+            .await
+            .unwrap();
+        seed_volume(&volumes.join("vol_1"), &[(0, 1 << 20)]);
+        ready_volume(&store, "vol_1").await;
+
+        let keys = keys_for("app_1");
+        let repo = repository(&format!("tests/{name}"));
+        let (manager, mut statuses) = BackupManager::new(
+            Arc::clone(&engine),
+            store.clone(),
+            Arc::new(SharedStore(Arc::new(MemoryStore::new()))),
+            lease_view(7),
+            "cls_1".to_owned(),
+        );
+        let manager = manager.with_options(BackupOptions::quick());
+        let (tx, rx) = watch::channel(Some(snapshot(
+            vec![present("vol_1", None)],
+            Vec::new(),
+            Some(repo.clone()),
+        )));
+        let handle = tokio::spawn(manager.run(rx, std::future::pending::<()>()));
+
+        let mut results = Vec::new();
+        for (n, outcome) in outcomes.iter().enumerate() {
+            let backup_id = format!("bkp_{n}");
+            engine.set_guest_flush(Some(Ok(*outcome)));
+            tx.send(Some(snapshot(
+                vec![present("vol_1", None)],
+                vec![job(&backup_id, "vol_1", &keys, 7)],
+                Some(repo.clone()),
+            )))
+            .unwrap();
+            let status = wait_backup(&mut statuses, &backup_id).await;
+            let row = store
+                .backup(&backup_id)
+                .await
+                .unwrap()
+                .expect("the backup row is stored");
+            results.push((*outcome, status, row));
+        }
+        handle.abort();
+        results
+    }
+
+    /// Section 5.3, ADR 0282: a snapshot the guest flushed first, or of a
+    /// volume no running VM attached, is reported with `guest_flush: true`.
+    #[tokio::test]
+    async fn a_flushed_snapshot_reports_guest_flush_true() {
+        let results = backups_with_flushes(
+            "backup-flushed",
+            &[GuestFlush::Flushed, GuestFlush::NoRunningVm],
+        )
+        .await;
+        assert_eq!(results.len(), 2);
+        for (outcome, status, row) in results {
+            assert_eq!(
+                status.status,
+                BackupState::Succeeded,
+                "{outcome:?}: {status:?}"
+            );
+            assert_eq!(status.guest_flush, Some(true), "{outcome:?}");
+            assert_eq!(row.guest_flush, Some(true), "{outcome:?}");
+        }
+    }
+
+    /// Section 5.3, ADR 0282: any other flush outcome is reported with
+    /// `guest_flush: false`, and the backup still succeeds.
+    #[tokio::test]
+    async fn an_unflushed_snapshot_reports_guest_flush_false_and_still_succeeds() {
+        let results = backups_with_flushes(
+            "backup-unflushed",
+            &[
+                GuestFlush::Failed,
+                GuestFlush::TimedOut,
+                GuestFlush::Unsupported,
+                GuestFlush::Paused,
+            ],
+        )
+        .await;
+        assert_eq!(results.len(), 4);
+        for (outcome, status, row) in results {
+            assert_eq!(
+                status.status,
+                BackupState::Succeeded,
+                "{outcome:?}: {status:?}"
+            );
+            assert_eq!(status.error, None, "{outcome:?}");
+            assert!(status.manifest_key.is_some(), "{outcome:?}");
+            assert_eq!(status.guest_flush, Some(false), "{outcome:?}");
+            assert_eq!(row.guest_flush, Some(false), "{outcome:?}");
+        }
+    }
+
     #[tokio::test]
     async fn a_wrong_token_fails_with_lease_mismatch_and_uploads_nothing() {
         let dir = TestDir::new("backup-lease");
@@ -1787,6 +1904,7 @@ mod tests {
                 status: BackupState::Running,
                 snapshot_method: Some(quoro_proto::wire::SnapshotMethod::Reflink),
                 pause_ms: None,
+                guest_flush: None,
                 manifest_key: None,
                 manifest_digest: None,
                 logical_bytes: None,

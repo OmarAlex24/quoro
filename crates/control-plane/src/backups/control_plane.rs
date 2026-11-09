@@ -677,6 +677,7 @@ async fn run(state: &AppState, backup: &BackupRecord, now: OffsetDateTime) -> Re
         status: wire::BackupState::Succeeded,
         snapshot_method: None,
         pause_ms: None,
+        guest_flush: None,
         manifest_key: Some(uploaded.manifest_key),
         manifest_digest: Some(uploaded.manifest_digest),
         logical_bytes: Some(uploaded.logical_bytes),
