@@ -212,7 +212,8 @@ pub enum SnapshotMethod {
 pub enum GuestFlush {
     /// The init answered that it ran `syncfs` on the volume's mount.
     Flushed,
-    /// No running VM attaches the volume, so no guest holds unwritten data of it.
+    /// No VM that attaches the volume was running when the snapshot began, so
+    /// no guest held unwritten data of it.
     NoRunningVm,
     /// The VM that attaches the volume is paused and cannot answer, so it was
     /// not asked.
@@ -220,9 +221,11 @@ pub enum GuestFlush {
     /// The VM has no vsock device, its init predates the sync session, or the
     /// backend does not flush.
     Unsupported,
-    /// The init did not answer within the bound.
+    /// The flush had no result within the bound.
     TimedOut,
-    /// The init answered with an error, or the connection failed.
+    /// Any other result: an error or an unexpected answer, a close without an
+    /// answer, a failed connection, or a VMM that cannot report whether the VM
+    /// is paused.
     Failed,
 }
 
@@ -872,7 +875,7 @@ The point-in-time disk primitive the chunk engine needs (D-0023). Both are `Unsu
   - **Size.** The image is sparse. Before `ensure_volume` or `import_volume` the engine grows it to at least twice the sum of its volumes' sizes plus 1 GiB, which leaves room for one snapshot of every volume, by extending the image, refreshing the loop device's capacity and running `xfs_growfs`. It never shrinks it. The free-space checks of `ensure_volume` and of a snapshot use the filesystem that holds the image, not the pool's own free space.
   - **Volumes created before the pool.** If the volume directory already holds volume files when the pool would be created, the engine leaves them in place, keeps `PauseCopy` for that node and logs why; it creates the pool at the first start-up with no such file. It never moves a volume file that a VM may hold open.
   - **Fallback.** Without `mkfs.xfs` or a loop device the pool cannot be created and the method is `PauseCopy`.
-- **Guest flush first (ADR 0282).** Data an app wrote without `fsync` can still be in the guest's page cache, not in the volume file: with ext4's delayed allocation and the guest kernel's writeback defaults, it reaches the file up to about 35 s later. Before either method's own steps, the clone of `Reflink` or the pause of `PauseCopy`, the engine therefore asks the init of the running VM that attaches the volume to flush it. It opens a sync session on the VM's exec port that names the volume's serial (section 6). The whole flush, from the connect to the answer, takes at most 2 s.
+- **Guest flush first (ADR 0282).** Data an app wrote without `fsync` can still be in the guest's page cache, not in the volume file: with ext4's delayed allocation and the guest kernel's writeback defaults, it reaches the file up to about 35 s later. Before either method's own steps, the clone of `Reflink` or the pause of `PauseCopy`, the engine therefore asks the init of the running VM that attaches the volume to flush it. It opens a sync session on the VM's exec port that names the volume's serial (section 6). The whole flush, from the `/vm.info` that tells whether the VM is paused through the connect to the answer, takes at most 2 s.
   - An unknown volume is `NotFound` before the flush.
   - The guest keeps running during the flush, so `Reflink`'s `pause` stays zero and `PauseCopy`'s `pause` does not grow.
   - The flush takes no VM operation lock (section 4).
@@ -881,7 +884,7 @@ The point-in-time disk primitive the chunk engine needs (D-0023). Both are `Unsu
     - `NoRunningVm` when no running VM attaches the volume;
     - `Paused` when that VM is paused: a paused guest cannot answer, so it is not asked;
     - `Unsupported` when the VM has no `vsock`, or when its init predates ADR 0282. Such an init answers the sync frame with `131` and the message `the first frame must be open, got type 5`, the wording of every init from M4 until ADR 0282, which the engine matches exactly;
-    - `TimedOut` when the flush has no answer within 2 s;
+    - `TimedOut` when the flush has no result within 2 s, a `/vm.info` that does not return in time included;
     - `Failed` for every other result: any other `131`, any other answer (a `132` with a payload, a `129` or a `130` included), a close without an answer, a connection that fails, or a VMM that cannot report whether the VM is paused.
   - **The snapshot is taken whatever the outcome.** A flush that fails, times out or is unsupported never fails the snapshot (ADR 0282). Such a snapshot is crash-consistent, as below.
   - The outcome describes the VM the engine found when the snapshot began. A VM that starts after that point is not flushed, and what it wrote since its boot is crash-consistent only. A VM that is paused, stopped or fenced during the flush gives `TimedOut` or `Failed`.
@@ -976,9 +979,9 @@ What a warm source and a warm target need from the engine (ADR 0172 to ADR 0177,
 - **`discard_staged_volume`** removes the staging file; a missing one is `Ok`. Staging files left by a crash are removed by the node agent at start, so a copy that did not complete leaves nothing.
 - **`pause`** freezes a running VM's vCPUs; its memory, devices and volumes stay as they are, and the guest sees no event. **`resume`** lets it run again. They are what a planned switchover freezes the app's writes with (ADR 0177, `node-agent-protocol.md` section 5.17). Pausing a paused VM and resuming a running one are `Ok`. A VM that is not running or paused is `Conflict`; an unknown one is `NotFound`. A paused VM keeps `VmState::Running` in `inspect` and `list`: the node agent records the freeze itself, so it knows after a restart which VM it paused. `stop` and `delete` work on a paused VM, and no stop ever resumes a VM `pause` froze (section 3.8, ADR 0270). A graceful stop resumes a VM that a `PauseCopy` snapshot paused before it presses the power button, also during a fence's graceful phase (`node-agent-protocol.md` section 8.5 step 1), and the snapshot then drops its copy; a forced stop, a fence's forced phase included, never resumes a VM (ADR 0279).
 - **`flush_volume`** (ADR 0282) asks the guest to flush the volume's filesystem, as a snapshot does first (section 3.16), and returns the outcome after at most `within`.
-  - The VM keeps running during the flush, which takes no VM operation lock (section 4). `within` bounds the whole flush, from the connect to the answer.
+  - The VM keeps running during the flush, which takes no VM operation lock (section 4). `within` bounds the whole flush, from the `/vm.info` check through the connect to the answer.
   - The outcomes are those of section 3.16, with `TimedOut` after `within`.
-  - The only error of the call is `NotFound`, for an unknown volume. Any other failure to reach the guest, a failed `/vm.info` included, is the outcome `Failed`.
+  - The only error of the call is `NotFound`, for an unknown volume. Any other failure to reach the guest, a failed `/vm.info` included, is the outcome `Failed`. On a node whose volume pool does not mount (section 3.16), the call returns `Ok(GuestFlush::Unsupported)`.
   - The default implementation returns `Ok(GuestFlush::Unsupported)`.
   - A planned switchover calls it before `pause`, with a 2 s bound (`node-agent-protocol.md` section 5.17), since a paused guest can no longer answer. Writes the guest completed before the flush are then in the final snapshot, and that snapshot itself reports `Paused`.
 - The node agent, not the engine, decides when to snapshot, compare, stage, commit, flush or pause, and checks the lease and the token first (`node-agent-protocol.md` sections 6.13 and 8.6).
@@ -1083,8 +1086,8 @@ The minimal init is part of the engine workstream and is the only process Quoro 
 - **The init's work.** For each serial, in order, it opens that volume's mount path at that moment and calls `syncfs` on it.
 - **Guest to host: `132` synced,** with an empty payload, once every named volume was synced. The init then closes the session.
 - **Errors.** A malformed payload, an empty list, an unknown serial, a mount it cannot open, or a `syncfs` that fails is answered with `131` error and the reason, then a close.
-- **What a sync session does not do.** It starts no program, allocates no PTY, and writes nothing to the app's stdout or to the log console. It writes a line to the diagnostic console only when it fails, so a sync every few seconds does not push the boot output out of the serial ring (section 3.19).
-- **Concurrency.** Each session is served on its own, as an exec session is, and takes one of the init's session slots. A sync refused because every slot is taken gets a `131`, which the engine reports as `Failed`. A host that stops waiting drops the connection, and a `syncfs` already under way still completes.
+- **What a sync session does not do.** It starts no program, allocates no PTY, and writes nothing to the app's stdout or to the log console. It writes a line to the serial console only when it fails, and only for the first failure or a change of reason, so a sync every few seconds does not push the boot output out of the serial ring (section 3.19).
+- **Concurrency.** Each session is served on its own, as an exec session is, and counts toward the init's 16 concurrent sessions (`crates/init/README.md`). A sync refused because every slot is taken gets a `131`, which the engine reports as `Failed`. A host that stops waiting drops the connection, and a `syncfs` already under way still completes.
 - **Older inits and upgrades.** An init older than ADR 0282 accepts only `open` as a first frame: it answers `131` with the message `the first frame must be open, got type 5` and closes. The engine matches that message exactly and reports `Unsupported` (section 3.16). Only that wording, of the inits from M4 until ADR 0282, is part of the contract; a newer init's error messages are not. The configuration does not change: the M5b init reads the same `v3` configuration and serves sync sessions on `exec_port`. A VM gets the new init at its next start, as with every init change.
 
 While the app is running, the init must not write to the app's stdout, so a log line's stream tag is never ambiguous. On a failed boot — no configuration, a missing entrypoint, an unmountable disk — the init writes a diagnostic to the serial console and powers off with a non-zero code, so the failure surfaces as a `deployment.failed` event in the `boot` phase rather than as a silent hang.
@@ -1102,7 +1105,7 @@ Tests must run on machines without KVM, including CI and the laptops of people w
 - Inventory methods: `image_inventory` returns an injectable inventory for a prepared image; a test can mark an image as prepared before M5a, which `uninventoried_images` then lists and `image_inventory` reports `NotFound` until `inventory_cached_image` builds an injectable inventory for it, or fails with an injectable error.
 - Volume methods: `ensure_volume`, `import_volume` and `delete_volume` keep volume records in memory with their size; `snapshot_volume` and `delete_volume_snapshot` succeed and record a snapshot descriptor, so the M5 chunk-engine code is testable before a real primitive exists. `Capabilities::volume_snapshot_method` is injectable and defaults to `Reflink`; with `PauseCopy` the fake records a pause and resume of the VM that attaches the volume.
 - Warm methods (M5b): `volume_changed_ranges` returns injectable ranges, by default every range of the volume with `full: true`; `stage_volume`, `commit_staged_volume` and `discard_staged_volume` keep staging records and apply the volume rules of section 3.22, including the `Conflict` of a VM that attaches the volume; `pause` and `resume` flip a paused flag a test can read, and a test can make either fail.
-- Guest flush (M5b, ADR 0282): `flush_volume` returns an injectable `GuestFlush` or error, and `snapshot_volume` records the injected outcome in `guest_flush`. The default is `Flushed` when a running VM that is not paused attaches the volume, `Paused` when that VM is paused, and `NoRunningVm` otherwise. So the node agent's report of every outcome, the false ones included, is testable.
+- Guest flush (M5b, ADR 0282): `flush_volume` returns an injectable `GuestFlush` or error, and `snapshot_volume` records the injected outcome in `guest_flush`; an injected error other than `NotFound` makes it record `Failed`. The default is `Flushed` when a running VM that is not paused attaches the volume, `Paused` when that VM is paused, and `NoRunningVm` otherwise. So the node agent's report of every outcome, the false ones included, is testable.
 
 The node agent runs its protocol tests against `FakeEngine`: the M0 lease tests — revoking a `local` lease and expiring a test-only short `expiring` lease — need no VM at all beyond a fake (`node-agent-protocol.md`).
 
