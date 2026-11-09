@@ -19,10 +19,14 @@
 //!
 //! The node's newest acknowledged `seq` is kept in memory in the hub: for
 //! its live session ([`super::NodeHub::log_seq`]), and per node across
-//! sessions ([`super::NodeHub::newest_log_ack`]). `nodes.log_seq` is written
-//! only with the writes a session's start and end already make, and with the
-//! 0 the primary writes when it answers `log_diverged` (section 7.1, "Lag",
-//! ADR 0261).
+//! sessions ([`super::NodeHub::newest_log_ack`]), which each session's start
+//! raises to `nodes.log_seq` as that start found it. `nodes.log_seq` is
+//! written only with the writes a session's start and end already make, and
+//! with the 0 the primary writes when it answers `log_diverged` (section
+//! 7.1, "Lag", ADR 0261). A session whose follow never reached its check
+//! writes back at its end the acknowledgement its start write replaced, so a
+//! `hello` that was never checked cannot lower it
+//! ([`super::NodeHub::end_log_seq`]).
 //!
 //! Every frame goes through the session's queue, the channel its
 //! `desired_state` takes, so `log_diverged` and `log_entries` always follow
@@ -205,7 +209,10 @@ impl Session {
     /// ([`super::NodeHub::newest_log_ack`]) or in `nodes.log_seq` as it stood
     /// before this session's start write (a log that went back, ADR 0261),
     /// or when it differs from the primary's log or is above its newest
-    /// `seq` (section 7.1, "On `hello`", ADR 0227). The node then follows
+    /// `seq` (section 7.1, "On `hello`", ADR 0227). The start write raised
+    /// the memory to that stored value already, so for a session still
+    /// current here the memory covers it; the stored value stays in the
+    /// comparison as a second guard. The node then follows
     /// from `seq` 1. In the same step the primary first commits
     /// `nodes.log_seq = 0`, then sets its in-memory acknowledgement to 0, and
     /// only then queues the error, so `log_diverged` never goes out without

@@ -403,12 +403,13 @@ struct HubInner {
     /// The newest change-log acknowledgement the primary holds in memory for
     /// each node (section 7.1, "On `hello`", ADR 0261): the newest `log_ack`
     /// a current session accepted, or a `hello` position that passed the
-    /// check, and 0 once the primary answered `log_diverged`. Unlike a
+    /// check, and 0 once the primary answered `log_diverged`; raised at each
+    /// session start to `nodes.log_seq` as that start found it. Unlike a
     /// session's [`LogPosition`], it outlives the session, so a later
     /// `hello` below it reads as a log that went back. Written only through
-    /// [`NodeHub::set_log_position`], with the `sessions` lock held and
-    /// taken after it. In memory only: lost when the primary restarts
-    /// (section 7.1, "What neither check catches").
+    /// [`NodeHub::set_log_position`] and [`NodeHub::raise_log_ack`], each with
+    /// the `sessions` lock held and taken after it. In memory only: lost when
+    /// the primary restarts (section 7.1, "What neither check catches").
     log_acks: Mutex<HashMap<String, u64>>,
     digests: desired::DigestCache,
     /// `vm_` id to node, kept for VMs whose row is already deleted.
@@ -1560,6 +1561,26 @@ impl NodeHub {
         }
     }
 
+    /// Raises the node's newest acknowledgement in memory
+    /// ([`NodeHub::newest_log_ack`]) to `seq` when it is below it, and never
+    /// lowers it. [`connect_node`] calls it with `nodes.log_seq` as it stood
+    /// before its start write replaced it, so the primary holds that
+    /// acknowledgement in memory for the rest of its process, whether or not
+    /// this session's check completes: a later session's start write then
+    /// cannot hide it (section 7.1, "On `hello`", ADR 0261). As in
+    /// [`NodeHub::set_log_position`], a superseded generation is left alone.
+    fn raise_log_ack(&self, node_id: &str, generation: u64, seq: u64) {
+        let sessions = self.0.sessions.lock().expect("session lock");
+        if sessions
+            .get(node_id)
+            .is_some_and(|handle| handle.generation == generation)
+        {
+            let mut acks = self.0.log_acks.lock().expect("log ack lock");
+            let newest = acks.entry(node_id.to_string()).or_insert(0);
+            *newest = (*newest).max(seq);
+        }
+    }
+
     /// The newest change-log acknowledgement the primary holds in memory for
     /// `node_id`, from this or an earlier session of it, 0 when it holds
     /// none or answered `log_diverged` since. A `hello` whose `log_seq` is
@@ -1598,20 +1619,35 @@ impl NodeHub {
             .map(|position| position.seq)
     }
 
-    /// The newest `seq` `generation`'s session acknowledged, read before the
-    /// session is detached so its end can write `nodes.log_seq` (section
-    /// 7.1); `None` for a session that does not follow, acknowledged
-    /// nothing, or was superseded.
-    fn acked_log_seq(&self, node_id: &str, generation: u64) -> Option<u64> {
-        self.0
-            .sessions
-            .lock()
-            .expect("session lock")
+    /// What the end of `generation`'s session writes to `nodes.log_seq`,
+    /// read before the session is detached (section 7.1, "Lag", ADR 0261);
+    /// `None` writes nothing:
+    ///
+    /// - The newest `seq` the session acknowledged, once it acknowledged
+    ///   one.
+    /// - `None` when follow started without an acknowledgement since: from
+    ///   a `hello` position that passed the check, which the start write
+    ///   already stored, or from 0 after `log_diverged`, which
+    ///   [`reset_log_seq`] already wrote.
+    /// - The node's newest acknowledgement in memory
+    ///   ([`NodeHub::newest_log_ack`]) when the session recorded its `hello`
+    ///   but follow never reached its check, or never started: that puts back
+    ///   the acknowledgement the start write replaced, which
+    ///   [`connect_node`] raised the memory to, so a `hello` that was never
+    ///   checked cannot lower it.
+    /// - `None` for a session that never recorded its `hello`, or was
+    ///   superseded.
+    fn end_log_seq(&self, node_id: &str, generation: u64) -> Option<u64> {
+        let sessions = self.0.sessions.lock().expect("session lock");
+        let handle = sessions
             .get(node_id)
-            .filter(|handle| handle.generation == generation)
-            .and_then(|handle| handle.log_position)
-            .filter(|position| position.acked)
-            .map(|position| position.seq)
+            .filter(|handle| handle.generation == generation)?;
+        match handle.log_position {
+            Some(LogPosition { seq, acked: true }) => Some(seq),
+            Some(LogPosition { acked: false, .. }) => None,
+            None if handle.hello_recorded => Some(self.newest_log_ack(node_id)),
+            None => None,
+        }
     }
 
     /// Removes the session if it is still the current generation, returning
@@ -2480,7 +2516,9 @@ async fn run_session(
 }
 
 /// Ends `generation`'s session: fails its pending commands and streams and,
-/// when `record_disconnect`, records the disconnect.
+/// when `record_disconnect`, records the disconnect, with the
+/// `nodes.log_seq` that [`NodeHub::end_log_seq`] gives (section 7.1, "Lag",
+/// ADR 0261).
 ///
 /// A session that a newer one replaced may leave its loop through any branch
 /// (a heartbeat timeout, a socket error) before it sees the `closed` signal.
@@ -2493,8 +2531,8 @@ async fn end_session(
     record_disconnect: bool,
     reason: &str,
 ) {
-    // Read before the detach drops it (section 7.1, "Lag").
-    let log_seq = hub.acked_log_seq(node_id, generation);
+    // Read before the detach drops it (section 7.1, "Lag", ADR 0261).
+    let log_seq = hub.end_log_seq(node_id, generation);
     if let Some(pending) = hub.detach(node_id, generation) {
         pending.lock().expect("pending lock").fail_all();
     }
@@ -3862,7 +3900,8 @@ struct SessionStart {
     mesh_changed: bool,
     /// `nodes.log_seq` as it stood before this write replaced it with the
     /// `hello`'s `log_seq`: the newest acknowledgement the primary had stored
-    /// for the node, which follow's check reads (section 7.1, "On `hello`",
+    /// for the node, which follow's check reads, and which the node's newest
+    /// acknowledgement in memory was raised to (section 7.1, "On `hello`",
     /// ADR 0261).
     stored_log_seq: u64,
 }
@@ -3875,10 +3914,21 @@ struct SessionStart {
 /// first, in the same transaction, and returned: follow starts only after
 /// the first `desired_state`, and its check compares the `hello` with the
 /// stored acknowledgement, not with this write (section 7.1, "On `hello`",
-/// ADR 0261).
+/// ADR 0261). The node's newest acknowledgement in memory is raised to that
+/// value in the same step ([`NodeHub::raise_log_ack`]), so the primary holds
+/// it even when this session ends, or a newer one replaces it, before the
+/// check completes: the session's end puts it back ([`NodeHub::end_log_seq`])
+/// and a newer session's check still reads it.
 ///
 /// It also stores the mesh public key the `hello` carried and assigns the
 /// node's mesh address when it has none (ADR 0144).
+///
+/// Records nothing and returns an error when `generation` is no longer the
+/// node's current session: a newer session's start write must not be
+/// overwritten. The check runs inside the write transaction, ordered against
+/// the newer session's own start write by the writer gate, as in
+/// [`disconnect_node`] and [`reset_log_seq`] (issue #324). The superseded
+/// session never counts as connected, so its end records nothing.
 async fn connect_node(
     hub: &NodeHub,
     node_id: &str,
@@ -3897,12 +3947,20 @@ async fn connect_node(
     });
     let now = now_rfc3339();
     let mut w = hub.0.store.begin_write().await.map_err(|e| e.to_string())?;
+    // A newer session's start write must not be overwritten (issue #324).
+    if !hub.is_current(node_id, generation) {
+        return Err("a newer session of the node took over before this hello was recorded".into());
+    }
     let stored_log_seq: Option<i64> = sqlx::query_scalar("SELECT log_seq FROM nodes WHERE id = ?")
         .bind(node_id)
         .fetch_optional(&mut *w.tx)
         .await
         .map_err(|e| e.to_string())?;
     let stored_log_seq = stored_log_seq.map_or(0, |seq| u64::try_from(seq).unwrap_or(0));
+    // Held in memory before the write below replaces it, so neither this
+    // session's end nor a later session's check reads this hello's own
+    // log_seq as the stored acknowledgement (ADR 0261).
+    hub.raise_log_ack(node_id, generation, stored_log_seq);
     sqlx::query(
         "UPDATE nodes SET status = 'connected', agent_version = ?, engine_version = ?, \
          capacity = ?, kvm = ?, volume_snapshot = ?, applied_rev = ?, log_seq = ?, last_seen_at = ? \
@@ -3962,11 +4020,13 @@ async fn connect_node(
 
 /// Records the end of a session and emits `node.disconnected`.
 ///
-/// `log_seq` is the newest `seq` the session acknowledged, when it followed
-/// the change log and acknowledged anything; `nodes.log_seq` takes it in the
-/// same write and is otherwise left alone (section 7.1, "Lag"), so a session
-/// that drew `log_diverged` and acknowledged nothing after it leaves the 0
-/// that [`reset_log_seq`] wrote (ADR 0261).
+/// `log_seq` is what the session's end writes ([`NodeHub::end_log_seq`]):
+/// the newest `seq` the session acknowledged, or, when its follow never
+/// reached the check, the acknowledgement its start write replaced.
+/// `nodes.log_seq` takes it in the same write and is otherwise left alone
+/// (section 7.1, "Lag"), so a session that drew `log_diverged` and
+/// acknowledged nothing after it leaves the 0 that [`reset_log_seq`] wrote
+/// (ADR 0261).
 ///
 /// Records nothing when a newer session of the node already recorded its
 /// `hello`: the ending session is stale and the node is connected. The check
@@ -5001,6 +5061,70 @@ mod tests {
             status_and_disconnects(&state, &node_id).await,
             ("connected".to_string(), 1)
         );
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    /// The node's `node.connected` events and change-log entries.
+    async fn connects_and_entries(state: &AppState, node_id: &str) -> (i64, i64) {
+        let connects: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE type = 'node.connected' \
+             AND json_extract(subject, '$.id') = ?",
+        )
+        .bind(node_id)
+        .fetch_one(state.store.pool())
+        .await
+        .unwrap();
+        let entries: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM change_log WHERE entity_type = 'node' AND entity_id = ?",
+        )
+        .bind(node_id)
+        .fetch_one(state.store.pool())
+        .await
+        .unwrap();
+        (connects, entries)
+    }
+
+    /// A session that a newer one replaced before its `hello` got the writer
+    /// gate records nothing: its start write would overwrite the newer
+    /// session's `nodes.log_seq`, which that session's check reads (issue
+    /// #324, ADR 0261). Nor does it raise the node's newest acknowledgement
+    /// in memory. The newer session's start reads the stored value and
+    /// raises the memory to it, never lowering it.
+    #[tokio::test]
+    async fn a_superseded_session_records_no_start() {
+        let (state, node_id, data_dir) = hub_with_node().await;
+        let hub = &state.hub;
+        sqlx::query("UPDATE nodes SET log_seq = 7 WHERE id = ?")
+            .bind(&node_id)
+            .execute(state.store.pool())
+            .await
+            .unwrap();
+        let (status, _) = status_and_disconnects(&state, &node_id).await;
+        let before = connects_and_entries(&state, &node_id).await;
+        let mut below = hello(&node_id);
+        below.log_seq = 3;
+
+        let (a, _rx_a, _closed_a, _) = hub.attach(&node_id);
+        let (b, _rx_b, _closed_b, _) = hub.attach(&node_id);
+        assert!(connect_node(hub, &node_id, a, &below).await.is_err());
+        assert_eq!(node_log_seq(&state, &node_id).await, 7);
+        assert_eq!(status_and_disconnects(&state, &node_id).await.0, status);
+        assert_eq!(connects_and_entries(&state, &node_id).await, before);
+        assert_eq!(hub.newest_log_ack(&node_id), 0);
+        // A's end writes nothing either.
+        assert_eq!(hub.end_log_seq(&node_id, a), None);
+
+        let start = connect_node(hub, &node_id, b, &below).await.unwrap();
+        assert_eq!(start.stored_log_seq, 7);
+        assert_eq!(hub.newest_log_ack(&node_id), 7);
+        assert_eq!(node_log_seq(&state, &node_id).await, 3);
+        // B's follow has not reached its check: its end puts 7 back.
+        assert_eq!(hub.end_log_seq(&node_id, b), Some(7));
+        // A lower stored value never lowers the memory.
+        let (c, _rx_c, _closed_c, _) = hub.attach(&node_id);
+        let start = connect_node(hub, &node_id, c, &below).await.unwrap();
+        assert_eq!(start.stored_log_seq, 3);
+        assert_eq!(hub.newest_log_ack(&node_id), 7);
         std::fs::remove_dir_all(&data_dir).unwrap();
     }
 }
