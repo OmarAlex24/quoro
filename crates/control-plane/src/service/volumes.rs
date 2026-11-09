@@ -205,12 +205,15 @@ pub(crate) async fn get_volume(
 }
 
 /// Creates the app's local volume, makes the app stateful and grants the
-/// node its `local` lease, all in one write transaction.
+/// node the app's lease with a new token, all in one write transaction
+/// ([`leases::grant_app_lease`]).
 ///
 /// # Errors
 ///
 /// `not_found` for an unknown app, `conflict` when the app already has an
-/// attached volume or its node is not connected, `validation_failed` for a
+/// attached volume, its node is not connected, the previous holder's gate
+/// is still open (section 8.4), or the grant would carry the lease row's
+/// unsettled mark ([`leases::NewGrant::Held`]), `validation_failed` for a
 /// bad body or a size larger than the node's free disk, or a database error.
 pub(crate) async fn create_volume(
     state: &AppState,
@@ -351,7 +354,43 @@ pub(crate) async fn create_volume(
     )
     .await?;
 
-    let lease = leases::grant_app_lease(&mut w.tx, app_id, &node_id, &actor).await?;
+    // Deleting the app's volume revoked its previous lease, so the node took
+    // that revoke before this grant and its mode is free (ADR 0258). A
+    // volume that failed leaves the lease unrevoked: the node still holds it,
+    // so a new token keeps the mode it holds, `local` (section 8.4).
+    let keep_local = leases::app_lease(&mut w.tx, app_id)
+        .await?
+        .is_some_and(|previous| {
+            !previous.is_revoked() && previous.mode == "local" && previous.holder_node_id == node_id
+        });
+    let lease = match leases::grant_app_lease(
+        &mut w.tx,
+        state.hub.authority(),
+        app_id,
+        &node_id,
+        &actor,
+        keep_local,
+    )
+    .await?
+    {
+        leases::NewGrant::Granted(lease) => *lease,
+        leases::NewGrant::GateOpen(remaining) => {
+            return Err(ApiError::conflict(format!(
+                "the app's previous lease holder may still run it for {} s more (its gate is \
+                 open); retry then",
+                remaining.as_secs() + 1
+            )));
+        }
+        // Section 8.4 ("Grants of a marked row", ADR 0268) says the grant
+        // waits. This build cannot count what it waits for, so nothing is
+        // created.
+        leases::NewGrant::Held => {
+            return Err(ApiError::conflict(
+                "the app's lease cannot be granted yet: this grant needs majority voter support \
+                 and its lease row on every node first, which this build does not track yet",
+            ));
+        }
+    };
     ctx.append_ok(
         &mut w.tx,
         Some(Scope::AppUpdate),

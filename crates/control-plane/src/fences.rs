@@ -382,6 +382,24 @@ mod tests {
         (store, node_id, data_dir)
     }
 
+    /// The lease of a new-token grant that no gate held back.
+    async fn grant(
+        w: &mut crate::store::WriteTx,
+        node_id: &str,
+        actor: &Actor,
+    ) -> Result<crate::leases::Lease, crate::error::ApiError> {
+        let authority = crate::authority::Authority::new(std::sync::Arc::new(
+            crate::authority::SystemMonotonic::default(),
+        ));
+        match crate::leases::grant_app_lease(&mut w.tx, &authority, "app_x", node_id, actor, false)
+            .await?
+        {
+            crate::leases::NewGrant::Granted(lease) => Ok(*lease),
+            crate::leases::NewGrant::GateOpen(remaining) => panic!("a gate open for {remaining:?}"),
+            crate::leases::NewGrant::Held => panic!("a grant held for the unsettled mark"),
+        }
+    }
+
     fn node_actor(node_id: &str) -> Actor {
         Actor {
             kind: ActorType::Node,
@@ -394,9 +412,7 @@ mod tests {
         let (store, node_id, data_dir) = store_with_node().await;
         let actor = node_actor(&node_id);
         let mut w = store.begin_write().await.unwrap();
-        let lease = crate::leases::grant_app_lease(&mut w.tx, "app_x", &node_id, &actor)
-            .await
-            .unwrap();
+        let lease = grant(&mut w, &node_id, &actor).await.unwrap();
         assert_eq!(lease.fencing_token, 1);
         let lease_ids = [lease.id.clone()];
         let app_ids = ["app_x".to_string()];
@@ -418,9 +434,7 @@ mod tests {
         );
         assert!(listed_leases(&mut w.tx).await.unwrap().contains(&lease.id));
 
-        let refused = crate::leases::grant_app_lease(&mut w.tx, "app_x", &node_id, &actor)
-            .await
-            .unwrap_err();
+        let refused = grant(&mut w, &node_id, &actor).await.unwrap_err();
         assert_eq!(refused.code, crate::error::Code::Conflict);
 
         // The acknowledgement's token step, then the failure cleared: the
@@ -444,9 +458,7 @@ mod tests {
             .execute(&mut *w.tx)
             .await
             .unwrap();
-        let granted = crate::leases::grant_app_lease(&mut w.tx, "app_x", &node_id, &actor)
-            .await
-            .unwrap();
+        let granted = grant(&mut w, &node_id, &actor).await.unwrap();
         assert_eq!(granted.fencing_token, 3);
         w.commit().await.unwrap();
         std::fs::remove_dir_all(&data_dir).unwrap();

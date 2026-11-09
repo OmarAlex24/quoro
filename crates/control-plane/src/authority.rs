@@ -23,7 +23,8 @@
 //! goes out: [`Authority::record_grant`] refuses it, or counts its gate from
 //! the authority's clock at that moment. The caller does that inside the
 //! single-writer transaction that raises the stored duration
-//! ([`crate::leases::raise_duration`]), commits that transaction, and only
+//! ([`crate::leases::raise_duration`]) or writes a new token's row
+//! ([`crate::leases::grant_app_lease`]), commits that transaction, and only
 //! then sends the grant. A lowering checks [`Authority::may_lower`] inside its
 //! own single-writer transaction ([`crate::leases::lower_duration`]), so a
 //! longer grant and a lowering never interleave.

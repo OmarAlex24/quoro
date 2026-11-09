@@ -327,14 +327,18 @@ async fn restore_ready(
     // and a later `ready` report tries again (section 5.3). A revoke the
     // holder refused, because its token is higher (section 5.13), is sent
     // again at its next session, at the token its `hello` names (section 9).
+    // A lease that was `expiring` also waits for its holder's gate (section
+    // 8.4), whatever mode the new grant has.
     if let Some(previous) = leases::app_lease(&mut w.tx, &current.app_id).await?
-        && !leases::is_released(
+        && !(leases::is_released(
             &mut w.tx,
             hub.releases(),
+            hub.authority(),
             hub.revoke_unanswered(&previous.holder_node_id, &previous.id),
             &previous,
         )
         .await?
+            && hub.authority().passed(&previous.id))
     {
         tracing::debug!(
             volume_id = %current.id,
@@ -373,8 +377,27 @@ async fn restore_ready(
 
     // `grant_app_lease` takes the app's last token, revoked or not, and adds
     // one, so the target node's token is strictly higher than the old one
-    // (section 8.6).
-    let lease = leases::grant_app_lease(&mut w.tx, &current.app_id, node_id, &actor).await?;
+    // (section 8.6). The old holder released the lease, so the grant's mode
+    // is free (ADR 0258). A gate that is open after all, or a grant held
+    // until its write is replicated (`NewGrant::Held`: the unsettled mark or
+    // a raise of the stored duration, section 8.4), leaves everything
+    // unwritten, and the node's next report, at most 30 s away (section 5.3),
+    // tries again.
+    let lease = match leases::grant_app_lease(
+        &mut w.tx,
+        hub.authority(),
+        &current.app_id,
+        node_id,
+        &actor,
+        false,
+    )
+    .await?
+    {
+        leases::NewGrant::Granted(lease) => *lease,
+        leases::NewGrant::GateOpen(_) | leases::NewGrant::Held => {
+            return Ok(AppliedRestores::default());
+        }
+    };
 
     // Placement follows the volume, as `createVolume` pins it (ADR 0145); the
     // app's instance moves with it.
