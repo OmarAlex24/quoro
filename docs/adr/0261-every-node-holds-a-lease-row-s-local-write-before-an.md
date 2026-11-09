@@ -1,12 +1,12 @@
 # ADR 0261: Every node holds a lease row's local write before an expiring lease's renewals end (completes ADR 0255 and ADR 0256 part 2)
 
-- **Status:** Accepted; refined by [ADR 0280](0280-every-grant-of-a-marked-lease-waits-until-every-node-holds.md)
+- **Status:** Accepted; refined by [ADR 0280](0280-every-grant-of-a-marked-lease-waits-until-every-node-holds.md), [ADR 0299](0299-a-node-s-hello-counts-toward-a-marked-row-s-grant-only-once.md)
 - **Date:** 2026-11-07
 - **Ledger id:** D-0261
 - **Tags:** m5b, leases, contracts, election, warm
 - **Supersedes:** an internal decision (not published)
 - **Superseded by:** none
-- **Related:** [ADR 0255](0255-a-conversion-of-an-expiring-lease-to-local-is-sent-only.md), [ADR 0256](0256-an-expiring-grant-that-carries-re-never-converts-a-lease.md), [ADR 0179](0179-change-log-follow-74-every-machine-with-role-node-follows.md), [ADR 0227](0227-change-log-follow-sends-one-log-entries-batch-at-a-time-and.md), [ADR 0182](0182-manual-promotion-19-quoro-cluster-promote-on-the-candidate.md), [ADR 0232](0232-quoro-cluster-promote-refuses-on-a-host-that-already-has-a.md), [ADR 0148](0148-control-plane-backup-vacuum-into-on-the-primary-every-6-h.md), [ADR 0280](0280-every-grant-of-a-marked-lease-waits-until-every-node-holds.md)
+- **Related:** [ADR 0255](0255-a-conversion-of-an-expiring-lease-to-local-is-sent-only.md), [ADR 0256](0256-an-expiring-grant-that-carries-re-never-converts-a-lease.md), [ADR 0179](0179-change-log-follow-74-every-machine-with-role-node-follows.md), [ADR 0227](0227-change-log-follow-sends-one-log-entries-batch-at-a-time-and.md), [ADR 0182](0182-manual-promotion-19-quoro-cluster-promote-on-the-candidate.md), [ADR 0232](0232-quoro-cluster-promote-refuses-on-a-host-that-already-has-a.md), [ADR 0148](0148-control-plane-backup-vacuum-into-on-the-primary-every-6-h.md), [ADR 0280](0280-every-grant-of-a-marked-lease-waits-until-every-node-holds.md), [ADR 0299](0299-a-node-s-hello-counts-toward-a-marked-row-s-grant-only-once.md)
 
 ## Context
 
@@ -274,6 +274,7 @@ _Some wording was changed for the public repository._
 - Refines [ADR 0232](0232-quoro-cluster-promote-refuses-on-a-host-that-already-has-a.md): the candidate builds from the log it froze, takes its term from the vote answers, and gains --accept-loss. The rest of [ADR 0232](0232-quoro-cluster-promote-refuses-on-a-host-that-already-has-a.md) stands.
 - Refines [ADR 0148](0148-control-plane-backup-vacuum-into-on-the-primary-every-6-h.md): the restore refusal, its override, its first write and its term. The rest of [ADR 0148](0148-control-plane-backup-vacuum-into-on-the-primary-every-6-h.md) stands.
 - [ADR 0280](0280-every-grant-of-a-marked-lease-waits-until-every-node-holds.md) refines which grants wait and what the mark covers: while a lease row is marked, every grant of the lease, a new token's included, waits until every node holds the row's newest write; R sets the mark and only the holder's report clears it; the frozen log is checked again; a removal counts only machines not removed; and the side paths listed here are fixed or stated as limits. The rest of this decision stands.
+- [ADR 0299](0299-a-node-s-hello-counts-toward-a-marked-row-s-grant-only-once.md) refines when a hello.log_seq counts toward a marked row's grant: only once the node has answered every lease_revoke sent at that session start and every token raise they cause is committed. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---
