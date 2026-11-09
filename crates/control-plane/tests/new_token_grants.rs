@@ -202,6 +202,16 @@ fn renew(lease_id: &str, token: u64) -> NodeMessage {
     })
 }
 
+/// Whether a majority of voters supports this primary from now on.
+fn set_support(server: &Server, supported: bool) {
+    let support: Arc<dyn VoterSupport> = if supported {
+        Arc::new(EverySupport)
+    } else {
+        Arc::new(quoro_control_plane::authority::NoVoterSupport)
+    };
+    server.state.hub.set_voter_support(support);
+}
+
 fn ok_result() -> NodeMessage {
     NodeMessage::CommandResult(CommandResult {
         status: CommandStatus::Ok,
@@ -348,12 +358,7 @@ async fn a_new_volume_gets_the_mode_the_policy_wants() {
         ("web-warm", "warm", true, "expiring"),
         ("web-hot", "hot", true, "expiring"),
     ] {
-        let support: Arc<dyn VoterSupport> = if supported {
-            Arc::new(EverySupport)
-        } else {
-            Arc::new(quoro_control_plane::authority::NoVoterSupport)
-        };
-        server.state.hub.set_voter_support(support);
+        set_support(&server, supported);
         let app_id = app_with_policy(&server, &owner, &project_id, name, policy).await;
         let (_, grant) = volume_and_grant(&server, &owner, &mut socket, &app_id).await;
         assert_eq!(grant["body"]["mode"], mode, "{name}: {grant}");
@@ -385,95 +390,118 @@ async fn a_new_volume_gets_the_mode_the_policy_wants() {
 }
 
 /// Section 8.4, #604: a new token waits until the previous `expiring`
-/// holder's gate has passed, whatever mode it has. `createVolume` answers
-/// `conflict` meanwhile and writes nothing; once the gate has passed it
-/// grants the next token.
+/// holder's gate has passed, whatever mode it has: `local` for a `none` app,
+/// `expiring` for a `warm` app with voter support, and `local` for one
+/// without. `createVolume` answers `conflict` meanwhile and writes nothing;
+/// once the gate has passed it grants the next token.
 #[tokio::test]
 async fn a_new_volume_waits_for_the_previous_expiring_holders_gate() {
     let server = start_with_patient_node_session().await;
     let owner = server.owner().await;
     let (node, mut socket, project_id) = connected_node(&server, &owner).await;
-    let app_id = app_with_policy(&server, &owner, &project_id, "web", "none").await;
-    let (volume_id, grant) = volume_and_grant(&server, &owner, &mut socket, &app_id).await;
-    let lease_id = grant["body"]["lease_id"].as_str().unwrap().to_string();
-    let revoke_id = delete_volume(&server, &owner, &mut socket, &volume_id).await;
-    send(&mut socket, ok_result(), Some(&revoke_id)).await;
-    frames_until_settled(&mut socket).await;
+    for (name, policy, supported, mode) in [
+        ("web-none", "none", false, "local"),
+        ("web-warm", "warm", true, "expiring"),
+        ("web-warm-alone", "warm", false, "local"),
+    ] {
+        set_support(&server, supported);
+        let app_id = app_with_policy(&server, &owner, &project_id, name, "none").await;
+        let (volume_id, grant) = volume_and_grant(&server, &owner, &mut socket, &app_id).await;
+        let lease_id = grant["body"]["lease_id"].as_str().unwrap().to_string();
+        let revoke_id = delete_volume(&server, &owner, &mut socket, &volume_id).await;
+        send(&mut socket, ok_result(), Some(&revoke_id)).await;
+        frames_until_settled(&mut socket).await;
+        sqlx::query("UPDATE apps SET ha_policy = ? WHERE id = ?")
+            .bind(policy)
+            .bind(&app_id)
+            .execute(server.state.store.pool())
+            .await
+            .unwrap();
 
-    // The lease was `expiring`: its gate passes 5 s after the seed (3 s and
-    // two margins of 1 s).
-    sqlx::query("UPDATE leases SET mode = 'expiring', duration_ms = 3000 WHERE id = ?")
-        .bind(&lease_id)
-        .execute(server.state.store.pool())
-        .await
-        .unwrap();
-    server
-        .state
-        .hub
-        .authority()
-        .seed(&lease_id, &node.node_id, Some(3_000));
-    let passes = tokio::time::Instant::now() + Duration::from_millis(5_000);
-    let (status, code, _) = problem(create_volume(&server, &owner, &app_id).await).await;
-    assert_eq!((status, code.as_str()), (409, "conflict"));
-    let (token, mode): (i64, String) =
-        sqlx::query_as("SELECT fencing_token, mode FROM leases WHERE id = ?")
+        // The lease was `expiring`: its gate passes 5 s after the seed (3 s
+        // and two margins of 1 s).
+        sqlx::query("UPDATE leases SET mode = 'expiring', duration_ms = 3000 WHERE id = ?")
             .bind(&lease_id)
+            .execute(server.state.store.pool())
+            .await
+            .unwrap();
+        server
+            .state
+            .hub
+            .authority()
+            .seed(&lease_id, &node.node_id, Some(3_000));
+        let passes = tokio::time::Instant::now() + Duration::from_millis(5_000);
+        let (status, code, _) = problem(create_volume(&server, &owner, &app_id).await).await;
+        assert_eq!((status, code.as_str()), (409, "conflict"), "{name}");
+        let (token, stored): (i64, String) =
+            sqlx::query_as("SELECT fencing_token, mode FROM leases WHERE id = ?")
+                .bind(&lease_id)
+                .fetch_one(server.state.store.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            (token, stored.as_str()),
+            (1, "expiring"),
+            "{name}: nothing was written"
+        );
+        let volumes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM volumes WHERE app_id = ?")
+            .bind(&app_id)
             .fetch_one(server.state.store.pool())
             .await
             .unwrap();
-    assert_eq!(
-        (token, mode.as_str()),
-        (1, "expiring"),
-        "nothing was written"
-    );
-    let volumes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM volumes WHERE app_id = ?")
-        .bind(&app_id)
-        .fetch_one(server.state.store.pool())
-        .await
-        .unwrap();
-    assert_eq!(volumes, 1, "only the deleted volume");
-    assert!(
-        tokio::time::Instant::now() < passes,
-        "the test ran too slowly"
-    );
+        assert_eq!(volumes, 1, "{name}: only the deleted volume");
+        assert!(
+            tokio::time::Instant::now() < passes,
+            "{name}: the test ran too slowly"
+        );
 
-    tokio::time::sleep_until(passes).await;
-    let (_, grant) = volume_and_grant(&server, &owner, &mut socket, &app_id).await;
-    assert_eq!(grant["body"]["fencing_token"], 2);
-    assert_eq!(grant["body"]["mode"], "local");
+        tokio::time::sleep_until(passes).await;
+        let (_, grant) = volume_and_grant(&server, &owner, &mut socket, &app_id).await;
+        assert_eq!(grant["body"]["fencing_token"], 2, "{name}");
+        assert_eq!(grant["body"]["mode"], mode, "{name}");
+    }
 }
 
-/// ADR 0258 on the primary's side (#604): a new token carries the mode the
-/// node holds the lease in while it may still hold it. A node that has not
-/// answered the revoke of the app's `local` lease gets the next one `local`,
-/// even for a `warm` app with voter support; once it has answered, the next
-/// one is `expiring`.
+/// ADR 0258 on the primary's side (#604): a new token reaches the node after
+/// the revoke of the app's previous lease on its session, so the node takes
+/// it once it has answered that revoke, with the lease `revoked`, and the
+/// grant's mode is free. A `warm` app with voter support gets the new token
+/// `expiring` although its previous lease was `local` and the revoke is not
+/// answered yet.
 #[tokio::test]
-async fn a_node_that_may_still_hold_a_local_lease_gets_the_new_token_local() {
+async fn a_new_token_follows_the_revoke_of_the_previous_lease() {
     let server = start_with_patient_node_session().await;
     let owner = server.owner().await;
     let (_node, mut socket, project_id) = connected_node(&server, &owner).await;
     let app_id = app_with_policy(&server, &owner, &project_id, "web", "none").await;
-    let (volume_id, _) = volume_and_grant(&server, &owner, &mut socket, &app_id).await;
+    let (volume_id, first) = volume_and_grant(&server, &owner, &mut socket, &app_id).await;
+    assert_eq!(first["body"]["mode"], "local");
     sqlx::query("UPDATE apps SET ha_policy = 'warm' WHERE id = ?")
         .bind(&app_id)
         .execute(server.state.store.pool())
         .await
         .unwrap();
-    server.state.hub.set_voter_support(Arc::new(EverySupport));
+    set_support(&server, true);
 
-    // The revoke is not answered yet.
-    let first = delete_volume(&server, &owner, &mut socket, &volume_id).await;
-    let (volume_id, grant) = volume_and_grant(&server, &owner, &mut socket, &app_id).await;
-    assert_eq!(grant["body"]["fencing_token"], 2);
-    assert_eq!(grant["body"]["mode"], "local", "{grant}");
-    send(&mut socket, ok_result(), Some(&first)).await;
-
-    // Answered: the node holds no lease, so the next token is `expiring`.
-    let revoke_id = delete_volume(&server, &owner, &mut socket, &volume_id).await;
-    send(&mut socket, ok_result(), Some(&revoke_id)).await;
-    frames_until_settled(&mut socket).await;
-    let (_, grant) = volume_and_grant(&server, &owner, &mut socket, &app_id).await;
-    assert_eq!(grant["body"]["fencing_token"], 3);
-    assert_eq!(grant["body"]["mode"], "expiring", "{grant}");
+    let res = owner
+        .delete(server.url(&format!("/api/v1/volumes/{volume_id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 202, "{}", res.text().await.unwrap());
+    let res = create_volume(&server, &owner, &app_id).await;
+    assert_eq!(res.status(), 201, "{}", res.text().await.unwrap());
+    let frames = recv_until(&mut socket, &["lease_revoke", "lease_grant"]).await;
+    let revoke = frames
+        .iter()
+        .position(|frame| frame["type"] == "lease_revoke")
+        .unwrap();
+    let grant = frames
+        .iter()
+        .position(|frame| frame["type"] == "lease_grant")
+        .unwrap();
+    assert!(revoke < grant, "{frames:?}");
+    assert_eq!(frames[revoke]["body"]["fencing_token"], 1);
+    assert_eq!(frames[grant]["body"]["fencing_token"], 2);
+    assert_eq!(frames[grant]["body"]["mode"], "expiring", "{frames:?}");
 }

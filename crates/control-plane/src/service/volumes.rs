@@ -353,42 +353,21 @@ pub(crate) async fn create_volume(
     )
     .await?;
 
-    // ADR 0258: a node that may still hold the app's previous lease, because
-    // it has not released it, gets a new token in the mode it holds.
-    let may_hold = match leases::app_lease(&mut w.tx, app_id).await? {
-        Some(previous) if previous.holder_node_id == node_id => {
-            !leases::is_released(
-                &mut w.tx,
-                state.hub.releases(),
-                state.hub.authority(),
-                state
-                    .hub
-                    .revoke_unanswered(&previous.holder_node_id, &previous.id),
-                &previous,
-            )
+    // The app's previous lease, if any, was revoked with its volume, so the
+    // node took that revoke before this grant (ADR 0258).
+    let lease =
+        match leases::grant_app_lease(&mut w.tx, state.hub.authority(), app_id, &node_id, &actor)
             .await?
-        }
-        _ => false,
-    };
-    let lease = match leases::grant_app_lease(
-        &mut w.tx,
-        state.hub.authority(),
-        app_id,
-        &node_id,
-        &actor,
-        may_hold,
-    )
-    .await?
-    {
-        leases::NewGrant::Granted(lease) => *lease,
-        leases::NewGrant::GateOpen(remaining) => {
-            return Err(ApiError::conflict(format!(
-                "the app's previous lease holder may still run it for {} s more (its gate is \
+        {
+            leases::NewGrant::Granted(lease) => *lease,
+            leases::NewGrant::GateOpen(remaining) => {
+                return Err(ApiError::conflict(format!(
+                    "the app's previous lease holder may still run it for {} s more (its gate is \
                  open); retry then",
-                remaining.as_secs() + 1
-            )));
-        }
-    };
+                    remaining.as_secs() + 1
+                )));
+            }
+        };
     ctx.append_ok(
         &mut w.tx,
         Some(Scope::AppUpdate),

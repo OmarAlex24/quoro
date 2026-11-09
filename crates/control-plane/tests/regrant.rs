@@ -733,7 +733,7 @@ async fn a_refused_same_token_grant_gives_the_lease_back() {
 }
 
 /// Section 8.4: an `expiring` row's lease is given back only once its gate
-/// has passed, on the same session.
+/// has passed, on the same session, whatever mode the regrant has.
 #[tokio::test]
 async fn an_expiring_rows_regrant_waits_for_its_gate() {
     let server = start_with_patient_node_session().await;
@@ -766,6 +766,34 @@ async fn an_expiring_rows_regrant_waits_for_its_gate() {
         (i64::try_from(token + 1).unwrap(), None, "local".to_string())
     );
     await_spec_token(&mut socket, &frames, &lease_id, token + 1).await;
+    drop(socket);
+
+    // A `warm` app with voter support: the `expiring` regrant waits for the
+    // gate too.
+    run(
+        &server,
+        "UPDATE leases SET mode = 'expiring', duration_ms = 3000 WHERE id = ?",
+        &lease_id,
+    )
+    .await;
+    set_policy(&server, &app_id, "warm").await;
+    support(&server, true);
+    server
+        .state
+        .hub
+        .authority()
+        .seed(&lease_id, &node.node_id, Some(3_000));
+    let seeded = tokio::time::Instant::now();
+    let (mut socket, frames) =
+        reconnect(&server, &node, &app_id, &lease_id, token + 1, "expired").await;
+    assert!(grants_of(&frames, &lease_id).is_empty(), "{frames:?}");
+    let frames = recv_until(&mut socket, &["lease_grant"]).await;
+    assert!(seeded.elapsed() >= Duration::from_millis(4_900));
+    assert_eq!(grants_of(&frames, &lease_id), vec![token + 2]);
+    assert_eq!(
+        of_type(&frames, "lease_grant")[0]["body"]["mode"],
+        "expiring"
+    );
 }
 
 /// The regrant has the mode the app's HA policy wants (D-0047, #604): a
