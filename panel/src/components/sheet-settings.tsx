@@ -8,7 +8,7 @@ import type { AppDetail, Build, Node } from '../api/generated/model';
 import { shortDeploymentId } from '../lib/app-status';
 import { builtImageLabel, lastBuiltCommit, shortCommit } from '../lib/build-status';
 import { problemView, type ProblemView } from '../lib/problem';
-import { memoryWords } from '../lib/services';
+import { resourcesLine } from '../lib/services';
 import { AppDomains } from './app-domains';
 import { AppEdgeBackends } from './app-edge';
 import { AppInstances } from './app-instances';
@@ -137,7 +137,7 @@ export function SettingsTab({
             ['Replicas', `${app.replicas} ${app.replicas === 1 ? 'instance' : 'instances, one per node'}`],
             [
               'Resources',
-              `${app.resources.vcpus} vCPU, ${memoryWords(app.resources.memory_mb)}, ${app.resources.disk_gb} GB disk`,
+              resourcesLine(app.resources),
             ],
             ['Placement', placement],
           ]}

@@ -493,6 +493,76 @@ export function buildkitSteps(
   }));
 }
 
+/* ---------- the node's own lines ---------- */
+
+/** A line of the node's own is listed with the build steps once it took this long. */
+export const NODE_LINE_MIN_SECONDS = 1;
+
+const BUILDKIT_LINE = /^\s*#\d+\s/;
+
+export interface NodeLineSpan {
+  readonly seq: number;
+  /** The node's words, as logged: `preparing the builder image docker.io/moby/buildkit:v0.34.2`. */
+  readonly line: string;
+  readonly start: number;
+  readonly end: number;
+  readonly seconds: number;
+  readonly state: 'done' | 'live';
+  /** The span's share of the build, 0..1. */
+  readonly share: number;
+}
+
+/**
+ * The time the Dockerfile steps do not cover, said in the node's own words.
+ * The build record has no per-phase times, but the node logs what it does
+ * outside BuildKit as lines with no step (`vertex` null): fetching the
+ * source, pulling the builder image, starting the builder VM. Each such line
+ * runs until the next line of any kind, or until the build ended (now while
+ * it runs). The first build on a node spends most of its time here. Lines
+ * that took under a second are left out, except the one a live build is in.
+ * No phase is made up: a stretch no line opens (BuildKit's own export, the
+ * import after it) stays unlabelled.
+ */
+export function nodeLineSpans(
+  lines: readonly BuildLogLine[],
+  build: Pick<Build, 'status' | 'started_at' | 'finished_at'>,
+  now: number,
+): NodeLineSpan[] {
+  const timed = lines
+    .flatMap((line) => {
+      const time = parseTime(line.time);
+      return time === null ? [] : [{ line, time }];
+    })
+    .sort((left, right) => left.time - right.time || left.line.seq - right.line.seq);
+  const live = !isBuildTerminal(build.status);
+  const started = parseTime(build.started_at);
+  const finished = parseTime(build.finished_at) ?? (live ? now : null);
+  const buildSeconds =
+    started !== null && finished !== null ? Math.max(0, (finished - started) / 1_000) : 0;
+
+  const spans: NodeLineSpan[] = [];
+  timed.forEach(({ line, time }, index) => {
+    if (line.vertex !== null && line.vertex !== undefined) return;
+    // BuildKit's own text (`#7 exporting layers`) that came without its step is not the node's.
+    if (BUILDKIT_LINE.test(line.line)) return;
+    const next = timed[index + 1];
+    const running = next === undefined && live;
+    const end = next !== undefined ? next.time : running ? now : Math.max(time, finished ?? time);
+    const seconds = Math.max(0, (end - time) / 1_000);
+    if (seconds < NODE_LINE_MIN_SECONDS && !running) return;
+    spans.push({
+      seq: line.seq,
+      line: line.line.trim(),
+      start: time,
+      end,
+      seconds,
+      state: running ? 'live' : 'done',
+      share: buildSeconds > 0 ? Math.min(1, seconds / buildSeconds) : 0,
+    });
+  });
+  return spans;
+}
+
 /* ---------- words and numbers ---------- */
 
 const pad2 = (value: number): string => String(value).padStart(2, '0');

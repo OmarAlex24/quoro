@@ -17,6 +17,7 @@ import {
   joinRuns,
   miniTape,
   miniTapeScale,
+  nodeLineSpans,
   remainingSeconds,
   runSentence,
   runTag,
@@ -446,6 +447,78 @@ describe('buildkitSteps', () => {
     );
     expect(steps[0]?.name).toBe('[builder 2/5] RUN cargo build --release');
     expect(steps[0]?.share).toBe(1);
+  });
+});
+
+describe('nodeLineSpans', () => {
+  // Issue 638: the first build of a Git app on a single-node cluster, from its
+  // real log (times as the node logged them; the repo and base image renamed).
+  // The deploy tape said Build took 50 s while the Dockerfile steps added up
+  // to about 13 s: the rest was the node pulling the builder image and
+  // starting the builder VM, which it logs as lines with no step.
+  const real = (seq: number, time: string, vertex: number | null, text: string): BuildLogLine => ({
+    seq,
+    time: `2026-11-09T${time}Z`,
+    stream: 'stdout',
+    vertex,
+    line: text,
+  });
+  const firstBuild = build({
+    created_at: '2026-11-09T14:40:34.954Z',
+    started_at: '2026-11-09T14:40:35.007414069Z',
+    finished_at: '2026-11-09T14:41:25.401998515Z',
+  });
+  const log = [
+    real(1, '14:40:35.022929370', null, 'fetching https://github.com/example/site main'),
+    real(2, '14:40:35.523831851', null, 'resolved cf78b51189054e9b5c612bffdb572248f17e5d89'),
+    real(3, '14:40:35.624274693', null, 'writing the source disk'),
+    real(4, '14:40:35.625033077', null, 'preparing the builder image docker.io/moby/buildkit:v0.34.2'),
+    real(5, '14:41:02.056489957', null, 'starting the builder VM'),
+    real(6, '14:41:04.728956471', 1, '#1 [internal] load build definition from Dockerfile'),
+    real(20, '14:41:06.974337423', 6, '#6 [1/2] FROM docker.io/library/nginx:alpine'),
+    real(73, '14:41:18.604199874', 6, '#6 extracting sha256:237d424ec589 done'),
+    real(74, '14:41:18.617160019', 4, '#4 [2/2] COPY index.html /usr/share/nginx/html/index.html'),
+    real(75, '14:41:19.288419225', 4, '#4 DONE 0.7s'),
+    real(84, '14:41:20.670683888', 7, '#7 DONE 1.4s'),
+    real(86, '14:41:25.418568775', null, 'build succeeded: sha256:e7f77d290384'),
+  ];
+
+  it('names the time the steps leave out in the node’s own words', () => {
+    const spans = nodeLineSpans(log, firstBuild, Date.parse('2026-11-09T15:00:00Z'));
+    expect(spans.map((span) => [span.seq, span.line, span.state])).toEqual([
+      [4, 'preparing the builder image docker.io/moby/buildkit:v0.34.2', 'done'],
+      [5, 'starting the builder VM', 'done'],
+    ]);
+    expect(spans[0]!.seconds).toBeCloseTo(26.43, 2);
+    expect(spans[1]!.seconds).toBeCloseTo(2.67, 2);
+    expect(spans[0]!.share).toBeCloseTo(26.43 / 50.39, 2);
+    // With the steps, they account for the build; no phase is invented.
+    const steps = buildkitSteps(log, firstBuild, Date.parse('2026-11-09T15:00:00Z'));
+    const covered = [...spans, ...steps].reduce((total, item) => total + item.seconds, 0);
+    expect(covered).toBeLessThanOrEqual(50.4);
+    expect(covered).toBeGreaterThan(40);
+  });
+
+  it('runs the line a live build is in to now, even under a second', () => {
+    const live = build({ status: 'preparing', started_at: '2026-11-09T14:40:35.007414069Z', finished_at: null });
+    const spans = nodeLineSpans(log.slice(0, 4), live, Date.parse('2026-11-09T14:40:36.125Z'));
+    expect(spans).toHaveLength(1);
+    expect(spans[0]).toMatchObject({ seq: 4, state: 'live' });
+    expect(spans[0]!.seconds).toBeCloseTo(0.5, 1);
+  });
+
+  it('skips the node’s quick lines and the steps’ own lines', () => {
+    const spans = nodeLineSpans(log, firstBuild, Date.parse('2026-11-09T15:00:00Z'));
+    expect(spans.some((span) => span.seq === 1 || span.seq === 3 || span.seq === 86)).toBe(false);
+    expect(nodeLineSpans([], firstBuild, Date.parse('2026-11-09T15:00:00Z'))).toEqual([]);
+  });
+
+  it('leaves BuildKit’s text to BuildKit even when it came without a step', () => {
+    const export_ = [
+      real(1, '14:41:19.329000000', null, '#7 exporting to oci image format'),
+      real(2, '14:41:25.418568775', null, 'build succeeded: sha256:e7f77d290384'),
+    ];
+    expect(nodeLineSpans(export_, firstBuild, Date.parse('2026-11-09T15:00:00Z'))).toEqual([]);
   });
 });
 

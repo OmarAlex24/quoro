@@ -121,6 +121,7 @@ describe('approvalMeter', () => {
   it('drains from filing to expiry', () => {
     const meter = approvalMeter({ created_at: at(-11), expires_at: at(49) }, now);
     expect(meter.words).toBe('Expires in 49 min');
+    expect(meter.then).toBe('unless someone decides first');
     expect(meter.share).toBeCloseTo(49 / 60);
     expect(meter.over).toBe(false);
   });
@@ -129,8 +130,18 @@ describe('approvalMeter', () => {
     expect(approvalMeter({ created_at: at(-70), expires_at: at(-10) }, now)).toEqual({
       share: 0,
       words: 'Expired',
+      then: 'nobody decided in time',
       over: true,
     });
+  });
+
+  // Issue 638: the contract turns an unanswered request into `expired`, never `denied`.
+  it('says an unanswered request expires, never that it is denied', () => {
+    for (const minutes of [49, 1, -1, -600]) {
+      const meter = approvalMeter({ created_at: at(-11), expires_at: at(minutes) }, now);
+      expect(`${meter.words} ${meter.then}`).not.toMatch(/den(y|ied)/i);
+    }
+    expect(approvalMeter({ created_at: at(-11), expires_at: at(1) }, now).words).toMatch(/^Expires /);
   });
 });
 

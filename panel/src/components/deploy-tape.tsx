@@ -8,6 +8,7 @@ import {
   type BuildkitStep,
   type Estimate,
   type MiniSegment,
+  type NodeLineSpan,
   type RunTimeline,
   type StepSpan,
   type StepState,
@@ -186,29 +187,56 @@ function StepBar({ share, tone }: { share: number; tone: TapeTone }) {
   return <DitherCanvas paint={paint} />;
 }
 
-/** The build's Dockerfile steps, each with its share of the build and its span. */
-export function BuildSteps({ steps }: { steps: readonly BuildkitStep[] }) {
-  if (steps.length === 0) return null;
+/**
+ * Where the build's time went: its Dockerfile steps, and in between, in the
+ * order they ran, the node's own lines that took a second or more (pulling
+ * the builder image, starting the builder VM), each with its share of the
+ * build and its span. The node's lines are its own words, in the text face.
+ */
+export function BuildSteps({
+  steps,
+  nodeLines = [],
+}: {
+  steps: readonly BuildkitStep[];
+  nodeLines?: readonly NodeLineSpan[];
+}) {
+  if (steps.length === 0 && nodeLines.length === 0) return null;
+  const rows = [
+    ...nodeLines.map((span) => ({ kind: 'node' as const, start: span.start, span })),
+    ...steps.map((step) => ({ kind: 'step' as const, start: step.start, step })),
+  ].sort((left, right) => left.start - right.start);
   return (
     <div className="bsteps">
       <span className="bsteps-h">Build steps</span>
-      {steps.map((step) => (
-        <div key={step.vertex} className="bs">
-          <span className="bs-name" title={step.name}>
-            {step.name}
-          </span>
-          <StepBar share={step.share} tone={tapeTone(step.state)} />
-          <span className={cn('bs-d', step.state === 'failed' && 'text-fault')}>
-            {step.cached ? (
-              <Tag tone="plain">cached</Tag>
-            ) : step.state === 'live' ? (
-              formatClock(step.seconds)
-            ) : (
-              formatSpan(step.seconds)
-            )}
-          </span>
-        </div>
-      ))}
+      {rows.map((row) =>
+        row.kind === 'node' ? (
+          <div key={`line-${row.span.seq}`} className="bs">
+            <span className="bs-name bs-node" title={row.span.line}>
+              {row.span.line.charAt(0).toUpperCase() + row.span.line.slice(1)}
+            </span>
+            <StepBar share={row.span.share} tone={tapeTone(row.span.state)} />
+            <span className="bs-d">
+              {row.span.state === 'live' ? formatClock(row.span.seconds) : formatSpan(row.span.seconds)}
+            </span>
+          </div>
+        ) : (
+          <div key={row.step.vertex} className="bs">
+            <span className="bs-name" title={row.step.name}>
+              {row.step.name}
+            </span>
+            <StepBar share={row.step.share} tone={tapeTone(row.step.state)} />
+            <span className={cn('bs-d', row.step.state === 'failed' && 'text-fault')}>
+              {row.step.cached ? (
+                <Tag tone="plain">cached</Tag>
+              ) : row.step.state === 'live' ? (
+                formatClock(row.step.seconds)
+              ) : (
+                formatSpan(row.step.seconds)
+              )}
+            </span>
+          </div>
+        ),
+      )}
     </div>
   );
 }

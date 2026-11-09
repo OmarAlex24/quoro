@@ -23,6 +23,7 @@ import {
   joinRuns,
   miniTape,
   miniTapeScale,
+  nodeLineSpans,
   remainingSeconds,
   runSentence,
   runTag,
@@ -325,6 +326,7 @@ function RunBox({
   const buildLive = build !== null && !isBuildTerminal(build.status);
   const lines = useBuildLines(build?.id ?? null, buildLive);
   const steps = build ? buildkitSteps(lines, build, now) : [];
+  const nodeLines = build ? nodeLineSpans(lines, build, now) : [];
   const [problem, setProblem] = useState<ProblemView | null>(null);
 
   const cancel = useMutation({
@@ -406,7 +408,7 @@ function RunBox({
         <Stepper timeline={timeline} estimate={live ? estimate : null} />
         <Tape timeline={timeline} remaining={remaining} estimate={estimate} />
         {failure ? <p className="mt-3 text-[12.5px] leading-snug text-fault">{failure}</p> : null}
-        <BuildSteps steps={steps} />
+        <BuildSteps steps={steps} nodeLines={nodeLines} />
         {run.deployment ? <ProgressLines entries={entries} error={entriesError} /> : null}
       </div>
     </section>

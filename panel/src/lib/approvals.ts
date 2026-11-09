@@ -73,18 +73,25 @@ export const DECIDER_ONLY_SENTENCE =
 
 /**
  * The expiry meter of a waiting request: the share of its time it has left,
- * from filing to `expires_at`, and the words over it.
+ * from filing to `expires_at`, the words over it, and what happens then. The
+ * contract makes an unanswered request `expired`, not `denied`, so the meter
+ * says it expires.
  */
 export const approvalMeter = (
   approval: Pick<Approval, 'created_at' | 'expires_at'>,
   now: number = Date.now(),
-): { share: number; words: string; over: boolean } => {
+): { share: number; words: string; then: string; over: boolean } => {
   const from = Date.parse(approval.created_at);
   const until = Date.parse(approval.expires_at);
-  if (Number.isNaN(until)) return { share: 0, words: 'No expiry recorded', over: false };
-  if (until <= now) return { share: 0, words: 'Expired', over: true };
+  if (Number.isNaN(until)) return { share: 0, words: 'No expiry recorded', then: '', over: false };
+  if (until <= now) return { share: 0, words: 'Expired', then: 'nobody decided in time', over: true };
   const share = Number.isNaN(from) || until <= from ? 1 : clamp((until - now) / (until - from));
-  return { share, words: `Expires ${expiryWords(approval.expires_at, now)}`, over: false };
+  return {
+    share,
+    words: `Expires ${expiryWords(approval.expires_at, now)}`,
+    then: 'unless someone decides first',
+    over: false,
+  };
 };
 
 /** The button that approves: it says what it approves when the action destroys something. */
