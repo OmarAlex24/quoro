@@ -13,7 +13,7 @@ Each entry links the pull request that made the change and, where one exists, th
 
 ### Changed
 
-- **A write whose change-log entry a node could not receive now fails.** The primary refuses a write whose change-log entry a following node could not receive alone in one `log_entries` message or verify: one that alone exceeds the 1 MiB message limit, or one whose payload, read back from the stored text, has no canonical form, such as a whole-number float above 2^53. Such a write fails like any other write error instead of stopping change-log follow at that entry, and follow now sends every entry the primary accepts ([#713], [ADR 0302]).
+- **A write whose change-log entry a node could not receive now fails.** The primary refuses a write whose change-log entry a following node could not receive alone in one `log_entries` message or verify: one whose payload is not a JSON object; one that alone exceeds the 1 MiB message limit; one whose payload, read back from the stored text, has no canonical form, such as a whole-number float above 2^53; and one that a node, parsing the message, would not find hashing to its hash, such as a float the JSON parser reads back as another number. Such a write fails like any other write error instead of stopping change-log follow at that entry, and follow now sends every entry the primary accepts ([#713], [ADR 0302]).
 
 ## [v0.3.0] - 2026-11-09
 
