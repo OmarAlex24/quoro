@@ -746,8 +746,11 @@ impl NodeHub {
     ///   Until then it answers [`Regrant::Wait`].
     ///
     /// The grant has the mode the app's HA policy wants: `expiring` for a
-    /// `warm` or `hot` app while voters support it, `local` otherwise
-    /// ([`leases::grant_app_lease`]).
+    /// `warm` or `hot` app while voters support it, `local` for any other
+    /// app ([`leases::grant_app_lease`]). A grant that would carry the row's
+    /// unsettled mark, a `warm` app's without support among them, gives
+    /// nothing back on this session ([`leases::NewGrant::Held`]); the node's
+    /// next `hello` tries again.
     pub(crate) async fn regrant_lease(
         &self,
         node_id: &str,
@@ -820,6 +823,17 @@ impl NodeHub {
         {
             leases::NewGrant::Granted(lease) => *lease,
             leases::NewGrant::GateOpen(remaining) => return Ok(Regrant::Wait(remaining)),
+            // Section 8.4, "The holder fenced first": without majority
+            // support the primary sends nothing. The row is unchanged, so the
+            // node's next `hello` reports the expiry again and tries again.
+            leases::NewGrant::Held => {
+                tracing::info!(
+                    node_id,
+                    lease_id,
+                    "a regrant that would carry the unsettled mark waits for the node's next session"
+                );
+                return Ok(Regrant::No);
+            }
         };
         w.commit().await?;
         tracing::info!(

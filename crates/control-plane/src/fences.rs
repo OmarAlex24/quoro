@@ -396,6 +396,7 @@ mod tests {
         {
             crate::leases::NewGrant::Granted(lease) => Ok(*lease),
             crate::leases::NewGrant::GateOpen(remaining) => panic!("a gate open for {remaining:?}"),
+            crate::leases::NewGrant::Held => panic!("a grant held for the unsettled mark"),
         }
     }
 

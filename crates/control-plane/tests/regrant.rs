@@ -733,7 +733,10 @@ async fn a_refused_same_token_grant_gives_the_lease_back() {
 }
 
 /// Section 8.4: an `expiring` row's lease is given back only once its gate
-/// has passed, on the same session, whatever mode the regrant has.
+/// has passed, on the same session: a `warm` app with voter support gets it
+/// back `expiring`. A `cold` app's `local` regrant over that row would set
+/// the row's unsettled mark ("The mark"), so it is not given back on that
+/// session, even after the gate, and nothing is written.
 #[tokio::test]
 async fn an_expiring_rows_regrant_waits_for_its_gate() {
     let server = start_with_patient_node_session().await;
@@ -745,37 +748,22 @@ async fn an_expiring_rows_regrant_waits_for_its_gate() {
         &lease_id,
     )
     .await;
+    let expiring = (i64::try_from(token).unwrap(), None, "expiring".to_string());
     // 3 s and two margins of 1 s from now.
     server
         .state
         .hub
         .authority()
         .seed(&lease_id, &node.node_id, Some(3_000));
-    let seeded = tokio::time::Instant::now();
-
     let (mut socket, frames) =
         reconnect(&server, &node, &app_id, &lease_id, token, "expired").await;
     assert!(grants_of(&frames, &lease_id).is_empty(), "{frames:?}");
-    let frames = recv_until(&mut socket, &["lease_grant"]).await;
-    assert!(seeded.elapsed() >= Duration::from_millis(4_900));
-    assert_eq!(grants_of(&frames, &lease_id), vec![token + 1]);
-    let grant = of_type(&frames, "lease_grant")[0];
-    assert_eq!(grant["body"]["mode"], "local");
-    assert_eq!(
-        row(&server, &lease_id).await,
-        (i64::try_from(token + 1).unwrap(), None, "local".to_string())
-    );
-    await_spec_token(&mut socket, &frames, &lease_id, token + 1).await;
+    tokio::time::sleep(Duration::from_millis(5_500)).await;
+    let frames = frames_until_settled(&mut socket).await;
+    assert!(grants_of(&frames, &lease_id).is_empty(), "{frames:?}");
+    assert_eq!(row(&server, &lease_id).await, expiring);
     drop(socket);
 
-    // A `warm` app with voter support: the `expiring` regrant waits for the
-    // gate too.
-    run(
-        &server,
-        "UPDATE leases SET mode = 'expiring', duration_ms = 3000 WHERE id = ?",
-        &lease_id,
-    )
-    .await;
     set_policy(&server, &app_id, "warm").await;
     support(&server, true);
     server
@@ -785,22 +773,34 @@ async fn an_expiring_rows_regrant_waits_for_its_gate() {
         .seed(&lease_id, &node.node_id, Some(3_000));
     let seeded = tokio::time::Instant::now();
     let (mut socket, frames) =
-        reconnect(&server, &node, &app_id, &lease_id, token + 1, "expired").await;
+        reconnect(&server, &node, &app_id, &lease_id, token, "expired").await;
     assert!(grants_of(&frames, &lease_id).is_empty(), "{frames:?}");
     let frames = recv_until(&mut socket, &["lease_grant"]).await;
     assert!(seeded.elapsed() >= Duration::from_millis(4_900));
-    assert_eq!(grants_of(&frames, &lease_id), vec![token + 2]);
+    assert_eq!(grants_of(&frames, &lease_id), vec![token + 1]);
     assert_eq!(
         of_type(&frames, "lease_grant")[0]["body"]["mode"],
         "expiring"
     );
+    assert_eq!(
+        row(&server, &lease_id).await,
+        (
+            i64::try_from(token + 1).unwrap(),
+            None,
+            "expiring".to_string()
+        )
+    );
+    await_spec_token(&mut socket, &frames, &lease_id, token + 1).await;
 }
 
 /// The regrant has the mode the app's HA policy wants (D-0047, #604): a
-/// `warm` or `hot` app's lease comes back `local` without voter support, as a
-/// `cold` app's does, and `expiring` with duration `D` while voters support
-/// it. The node then renews at once (section 8.4, "First grant"), and the
-/// primary answers that renewal.
+/// `cold` app's lease comes back `local`, with or without voter support, and
+/// a `warm` app's `expiring` with duration `D` while voters support it. The
+/// node then renews at once (section 8.4, "First grant"), and the primary
+/// answers that renewal. Without support, a `warm` or `hot` app's lease
+/// would come back `local`, a write that sets the row's unsettled mark
+/// (ADR 0285): nothing is given back on that session and nothing is
+/// written, and the node's next `hello` tries again.
 #[tokio::test]
 async fn the_regrant_has_the_mode_the_policy_wants() {
     let server = start_with_patient_node_session().await;
@@ -808,7 +808,7 @@ async fn the_regrant_has_the_mode_the_policy_wants() {
     let (node, app_id, lease_id, token) = node_with_lease(&server, &owner).await;
 
     let mut current = token;
-    for (policy, supported) in [("cold", true), ("warm", false), ("hot", false)] {
+    for (policy, supported) in [("cold", true), ("cold", false)] {
         set_policy(&server, &app_id, policy).await;
         support(&server, supported);
         let (socket, frames) =
@@ -825,6 +825,23 @@ async fn the_regrant_has_the_mode_the_policy_wants() {
         assert_eq!(
             row(&server, &lease_id).await,
             (i64::try_from(current).unwrap(), None, "local".to_string())
+        );
+        drop(socket);
+    }
+
+    support(&server, false);
+    for policy in ["warm", "hot"] {
+        set_policy(&server, &app_id, policy).await;
+        let (socket, frames) =
+            reconnect(&server, &node, &app_id, &lease_id, current, "expired").await;
+        assert!(
+            grants_of(&frames, &lease_id).is_empty(),
+            "{policy}: {frames:?}"
+        );
+        assert_eq!(
+            row(&server, &lease_id).await,
+            (i64::try_from(current).unwrap(), None, "local".to_string()),
+            "{policy}: nothing was written"
         );
         drop(socket);
     }
@@ -875,12 +892,16 @@ async fn the_regrant_has_the_mode_the_policy_wants() {
 
 /// A regrant that waits for a gate decides again once the gate has passed:
 /// a row that moved to another holder, went to a higher token, was revoked,
-/// or whose lease another node's failed fence lists, is not given back.
+/// or whose lease another node's failed fence lists, is not given back. The
+/// app is `warm` with voter support, so the regrant would be `expiring` and
+/// waits for the gate rather than for the unsettled mark.
 #[tokio::test]
 async fn a_waiting_regrant_gives_nothing_back_once_the_row_changed() {
     let server = start_with_patient_node_session().await;
     let owner = server.owner().await;
     let (node, app_id, lease_id, token) = node_with_lease(&server, &owner).await;
+    set_policy(&server, &app_id, "warm").await;
+    support(&server, true);
     let other = enrolled_node(&server, &owner, "node-beta").await;
     let pool = server.state.store.pool();
     let failure = json!({

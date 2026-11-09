@@ -2097,8 +2097,18 @@ async fn a_holder_declared_lost_releases_the_lease() {
 
 /// Makes the moving lease `expiring` for 3 s, with its gate counted from
 /// now, as a restarted primary counts it (section 8.4): it passes 5 s later,
-/// after 3 s and two margins of 1 s. Returns when it passes.
+/// after 3 s and two margins of 1 s. Returns when it passes. The app is
+/// `warm` with voter support, as an `expiring` lease's app is, so the new
+/// token is `expiring` too: a `local` one over a row that reads `expiring`
+/// would set the row's unsettled mark and wait (section 8.4, "The mark").
 async fn expiring_with_gate(setup: &Setup, moving: &Moving) -> tokio::time::Instant {
+    set_warm(setup).await;
+    setup
+        .state
+        .server
+        .state
+        .hub
+        .set_voter_support(Arc::new(EverySupport));
     sqlx::query("UPDATE leases SET mode = 'expiring', duration_ms = 3000 WHERE id = ?")
         .bind(&moving.lease_id)
         .execute(setup.state.server.state.store.pool())
@@ -2140,8 +2150,7 @@ async fn a_lost_holders_expiring_lease_is_released_by_its_gate() {
 }
 
 /// Section 8.4, #604: a lease that was `expiring` moves only once its
-/// holder's gate has passed, even after the holder answered the revoke `ok`,
-/// and whatever mode the new grant has.
+/// holder's gate has passed, even after the holder answered the revoke `ok`.
 #[tokio::test]
 async fn an_expiring_lease_moves_only_after_its_gate() {
     let mut setup = setup().await;
@@ -2162,7 +2171,7 @@ async fn an_expiring_lease_moves_only_after_its_gate() {
 
     tokio::time::sleep_until(passes).await;
     let grant = ready_grants(&mut setup, &moving, moving.old_token).await;
-    assert_eq!(grant["body"]["mode"], "local");
+    assert_eq!(grant["body"]["mode"], "expiring");
 }
 
 /// A majority of voters supports every duration.
@@ -2248,10 +2257,15 @@ async fn a_warm_apps_restore_target_gets_an_expiring_lease_while_voters_support_
     assert_eq!(answers[0]["body"]["fencing_token"], json!(token));
 }
 
-/// #604: without voter support, a `warm` app's restore target gets the lease
-/// `local`, as any other app's (section 8.4, "Changing the mode").
+/// Section 8.3 and 8.4, "The mark" (ADR 0285): without voter support, a
+/// `warm` app's restore target would get the lease `local` at a new token, a
+/// write that sets the row's unsettled mark, whose grant waits for majority
+/// support. The restore is not refused: the volume stays `restoring` and the
+/// lease stays revoked on the old node, at its token, with nothing written.
+/// Once voters support the primary, the target's next report gets the lease
+/// `expiring`.
 #[tokio::test]
-async fn a_warm_apps_restore_target_gets_a_local_lease_without_support() {
+async fn a_warm_apps_restore_waits_for_voter_support() {
     let mut setup = setup().await;
     set_warm(&setup).await;
     let moving = start_moving(&mut setup, 19).await;
@@ -2262,9 +2276,28 @@ async fn a_warm_apps_restore_target_gets_a_local_lease_without_support() {
     )
     .await;
     round_trip(&mut setup.state.socket).await;
+    for _ in 0..2 {
+        ready_waits(&mut setup, &moving).await;
+        let (token, mode, unsettled): (i64, String, i64) =
+            sqlx::query_as("SELECT fencing_token, mode, unsettled FROM leases WHERE id = ?")
+                .bind(&moving.lease_id)
+                .fetch_one(setup.state.server.state.store.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            (token, mode.as_str(), unsettled),
+            (moving.old_token, "local", 0)
+        );
+    }
+
+    setup
+        .state
+        .server
+        .state
+        .hub
+        .set_voter_support(Arc::new(EverySupport));
     let grant = ready_grants(&mut setup, &moving, moving.old_token).await;
-    assert_eq!(grant["body"]["mode"], "local");
-    assert!(grant["body"].get("duration_ms").is_none(), "{grant}");
+    assert_eq!(grant["body"]["mode"], "expiring");
 }
 
 // ---------------------------------------------------------------------------

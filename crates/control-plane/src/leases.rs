@@ -487,6 +487,13 @@ pub(crate) enum NewGrant {
     /// The previous holder's gate is open for this long (section 8.4).
     /// Nothing is written or recorded.
     GateOpen(std::time::Duration),
+    /// The write would carry the row's unsettled mark (section 8.4, "The
+    /// mark", ADR 0280, ADR 0285), so its grant could go out only once that
+    /// write is replicated over the machines with the `node` role and while
+    /// a majority of voters supports the primary ("Grants of a marked row").
+    /// This build counts neither, so nothing is written or recorded, and the
+    /// caller tries again later.
+    Held,
 }
 
 /// Grants the app's lease to `node_id` with a new token and writes its
@@ -494,12 +501,17 @@ pub(crate) enum NewGrant {
 /// carried, so ownership changes never reuse a token (section 8.6).
 ///
 /// - **Mode.** A `warm` or `hot` app's lease is `expiring` with duration `D`
-///   (D-0047) while a majority of voters supports `D` (section 8.8);
-///   otherwise it is `local`, and a failover needs the source connected or
-///   declared lost (sections 8.3 and 8.4, "Changing the mode"). The row's
-///   `duration_ms` is `D`, written with the grant: the raise before the grant
-///   (ADR 0203). The previous holder's gate has passed, so nothing it was
-///   granted is still running.
+///   (D-0047) while a majority of voters supports `D` (section 8.8); any
+///   other app's is `local`. The row's `duration_ms` is `D`, written with the
+///   grant: the raise before the grant (ADR 0203). The previous holder's gate
+///   has passed, so nothing it was granted is still running.
+/// - **The mark.** A write that would carry the row's unsettled mark is
+///   [`NewGrant::Held`] (section 8.4, "The mark"): a `local` new token of a
+///   `warm` or `hot` app's lease, which sets it (ADR 0285), so a `warm` app
+///   without support waits rather than run `local`; a `local` new token over
+///   a row that reads `expiring`, which sets it too; and any new token of a
+///   row that already carries it, because no write with a new token clears
+///   it.
 /// - **Gate.** Whatever the new mode, a new token waits until the previous
 ///   `expiring` holder's gate has passed on the authority's clock (section
 ///   8.4): [`NewGrant::GateOpen`].
@@ -516,7 +528,8 @@ pub(crate) enum NewGrant {
 ///   held by no node, because its holder has fenced. The one exception is
 ///   `keep_local`: the caller passes it when the node still holds the
 ///   previous lease `local`, unrevoked, and the new token then stays `local`
-///   (section 8.4, "Changing the mode").
+///   (section 8.4, "Changing the mode"), which for a `warm` or `hot` app is
+///   [`NewGrant::Held`].
 ///
 /// The authority records the grant before the caller commits. A failed
 /// commit leaves it ahead of the row, so a later gate ends later than it
@@ -564,15 +577,31 @@ pub(crate) async fn grant_app_lease(
         .bind(app_id)
         .fetch_optional(&mut *conn)
         .await?;
-    let wants_expiring = matches!(policy.as_deref(), Some("warm" | "hot")) && !keep_local;
+    let warm = matches!(policy.as_deref(), Some("warm" | "hot"));
+    // Section 8.4, "The mark": checked before the authority records anything.
+    let marked = match &previous {
+        Some(previous) => {
+            sqlx::query_scalar::<_, i64>("SELECT unsettled FROM leases WHERE id = ?")
+                .bind(&previous.id)
+                .fetch_one(&mut *conn)
+                .await?
+                != 0
+        }
+        None => false,
+    };
+    let was_expiring = previous
+        .as_ref()
+        .is_some_and(|previous| previous.mode == "expiring");
+    if marked || (warm && keep_local) || (!warm && was_expiring) {
+        return Ok(NewGrant::Held);
+    }
     let sent_wall = time::OffsetDateTime::now_utc();
     let refused = |refused: Refused| {
         ApiError::internal(&format!(
             "the authority refused a new token of lease {id}: {refused:?}"
         ))
     };
-    let mut expiring = false;
-    if wants_expiring {
+    if warm {
         match authority.record_grant(&Grant {
             lease_id: &id,
             holder: node_id,
@@ -580,20 +609,21 @@ pub(crate) async fn grant_app_lease(
             kind: GrantKind::NewToken,
             sent_wall,
         }) {
-            Ok(()) => expiring = true,
+            Ok(()) => {}
             Err(Refused::GateOpen { remaining }) => return Ok(NewGrant::GateOpen(remaining)),
-            // No support for `D`: the lease is `local` until there is.
-            Err(Refused::NoSupport) => {}
+            // Without support for `D` the new token would be `local`, a write
+            // that sets the mark (ADR 0285).
+            Err(Refused::NoSupport) => return Ok(NewGrant::Held),
             Err(other) => return Err(refused(other)),
         }
-    }
-    if !expiring {
+    } else {
         match authority.record_local_grant(&id) {
             Ok(()) => {}
             Err(Refused::GateOpen { remaining }) => return Ok(NewGrant::GateOpen(remaining)),
             Err(other) => return Err(refused(other)),
         }
     }
+    let expiring = warm;
     let mode = if expiring { "expiring" } else { "local" };
     let duration_ms = expiring.then(|| i64::try_from(DEFAULT_DURATION_MS).unwrap_or(i64::MAX));
     let now = crate::store::format_rfc3339(sent_wall);
@@ -813,10 +843,11 @@ mod tests {
         }
     }
 
-    /// Section 8.4 and ADR 0202: a new token, whatever its mode, waits until
-    /// the previous `expiring` holder's gate has passed, and a revoked
-    /// `expiring` lease of a holder declared lost or removed is released only
-    /// then. Nothing is written while the gate is open.
+    /// Section 8.4 and ADR 0202: a revoked `expiring` lease of a holder
+    /// declared lost or removed is released only once its gate has passed. A
+    /// new token waits for the gate, and is held whatever the gate when its
+    /// write would carry the row's unsettled mark. Nothing is written
+    /// meanwhile.
     #[tokio::test]
     async fn a_new_token_and_a_lost_holders_release_wait_for_the_gate() {
         let (store, lease, actor, data_dir) = store_with_lease().await;
@@ -875,9 +906,32 @@ mod tests {
             w.commit().await.unwrap();
         }
 
-        // A new token waits for the gate; nothing is written meanwhile.
+        // No app row, so no policy wants `expiring`: a new token is `local`.
+        // Over a row that reads `expiring` that write would set the row's
+        // unsettled mark (section 8.4, "The mark"), so it is held, before
+        // the gate and after it, and nothing is written.
         authority.seed(&lease.id, holder, Some(15_000));
         let mut w = store.begin_write().await.unwrap();
+        for when in ["before the gate", "after the gate"] {
+            let held =
+                super::grant_app_lease(&mut w.tx, &authority, "app_x", holder, &actor, false)
+                    .await
+                    .unwrap();
+            assert!(matches!(held, super::NewGrant::Held), "{when}: {held:?}");
+            let row = super::by_id(&mut w.tx, &lease.id).await.unwrap().unwrap();
+            assert_eq!(row.fencing_token, lease.fencing_token, "{when}");
+            clock.advance(Duration::from_millis(18_000));
+        }
+
+        // A row that reads `local` while the authority holds a gate for it,
+        // as a commit that failed after the authority recorded an `expiring`
+        // grant leaves: the new token waits for the gate, writing nothing.
+        sqlx::query("UPDATE leases SET mode = 'local', duration_ms = NULL WHERE id = ?")
+            .bind(&lease.id)
+            .execute(&mut *w.tx)
+            .await
+            .unwrap();
+        authority.seed(&lease.id, holder, Some(15_000));
         let open = super::grant_app_lease(&mut w.tx, &authority, "app_x", holder, &actor, false)
             .await
             .unwrap();
@@ -896,11 +950,23 @@ mod tests {
             panic!("the gate has passed");
         };
         assert_eq!(granted.fencing_token, lease.fencing_token + 1);
-        // No app row, so no policy that wants `expiring`: the grant is
-        // `local`, and the lease keeps no gate.
         assert_eq!(granted.mode, "local");
         assert_eq!(granted.duration_ms, None);
         assert!(authority.passed(&lease.id));
+
+        // A row that carries the mark: no new token clears it, so any new
+        // token is held, and nothing is written.
+        sqlx::query("UPDATE leases SET unsettled = 1 WHERE id = ?")
+            .bind(&lease.id)
+            .execute(&mut *w.tx)
+            .await
+            .unwrap();
+        let held = super::grant_app_lease(&mut w.tx, &authority, "app_x", holder, &actor, false)
+            .await
+            .unwrap();
+        assert!(matches!(held, super::NewGrant::Held), "{held:?}");
+        let row = super::by_id(&mut w.tx, &lease.id).await.unwrap().unwrap();
+        assert_eq!(row.fencing_token, lease.fencing_token + 1);
         w.commit().await.unwrap();
         std::fs::remove_dir_all(&data_dir).unwrap();
     }

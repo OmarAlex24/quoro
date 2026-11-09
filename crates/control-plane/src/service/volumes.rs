@@ -211,8 +211,9 @@ pub(crate) async fn get_volume(
 /// # Errors
 ///
 /// `not_found` for an unknown app, `conflict` when the app already has an
-/// attached volume, its node is not connected, or the previous holder's gate
-/// is still open (section 8.4), `validation_failed` for a
+/// attached volume, its node is not connected, the previous holder's gate
+/// is still open (section 8.4), or the grant would carry the lease row's
+/// unsettled mark ([`leases::NewGrant::Held`]), `validation_failed` for a
 /// bad body or a size larger than the node's free disk, or a database error.
 pub(crate) async fn create_volume(
     state: &AppState,
@@ -379,6 +380,14 @@ pub(crate) async fn create_volume(
                  open); retry then",
                 remaining.as_secs() + 1
             )));
+        }
+        // Section 8.4, "Grants of a marked row", says the grant waits. This
+        // build cannot count what it waits for, so nothing is created.
+        leases::NewGrant::Held => {
+            return Err(ApiError::conflict(
+                "the app's lease cannot be granted yet: this grant needs majority voter support \
+                 and its lease row on every node first, which this build does not track yet",
+            ));
         }
     };
     ctx.append_ok(

@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{Server, problem, start_with_patient_node_session};
+use common::{Server, start_with_patient_node_session};
 use futures_util::{SinkExt, StreamExt};
 use quoro_control_plane::authority::VoterSupport;
 use quoro_proto::wire::{
@@ -314,6 +314,14 @@ async fn create_volume(
         .unwrap()
 }
 
+/// The `detail` of a `409 conflict` problem.
+async fn conflict_detail(res: reqwest::Response) -> String {
+    assert_eq!(res.status(), 409);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["code"], "conflict", "{body}");
+    body["detail"].as_str().unwrap_or_default().to_string()
+}
+
 /// Creates the app's volume and returns its id and the grant the node got.
 async fn volume_and_grant(
     server: &Server,
@@ -368,8 +376,7 @@ async fn mode_and_duration(server: &Server, lease_id: &str) -> (String, Option<i
 /// #604, section 8.4 "First grant": a `warm` or `hot` app's first volume
 /// gets its lease `expiring` for `D` while a majority of voters supports
 /// `D`, with the row written first, and the node's first renewal is
-/// answered. Without that support the lease is `local`, as a `cold` app's
-/// always is.
+/// answered. A `cold` app's lease is `local`, with or without that support.
 #[tokio::test]
 async fn a_new_volume_gets_the_mode_the_policy_wants() {
     let server = start_with_patient_node_session().await;
@@ -378,7 +385,7 @@ async fn a_new_volume_gets_the_mode_the_policy_wants() {
 
     for (name, policy, supported, mode) in [
         ("web-cold", "cold", true, "local"),
-        ("web-warm-alone", "warm", false, "local"),
+        ("web-cold-alone", "cold", false, "local"),
         ("web-warm", "warm", true, "expiring"),
         ("web-hot", "hot", true, "expiring"),
     ] {
@@ -413,20 +420,61 @@ async fn a_new_volume_gets_the_mode_the_policy_wants() {
     }
 }
 
+/// Section 8.4, "The mark" (ADR 0285): without voter support, a `warm` or
+/// `hot` app's new token would be `local`, a write that sets the row's
+/// unsettled mark, and a marked row's grant waits for majority support and
+/// for the write's replication. This build counts neither, so `createVolume`
+/// answers `conflict` and creates nothing. With support, the same request
+/// gets the lease `expiring`.
+#[tokio::test]
+async fn a_warm_apps_new_volume_waits_for_voter_support() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let (_node, mut socket, project_id) = connected_node(&server, &owner).await;
+
+    for (name, policy) in [("web-warm", "warm"), ("web-hot", "hot")] {
+        set_support(&server, false);
+        let app_id = app_with_policy(&server, &owner, &project_id, name, policy).await;
+        let detail = conflict_detail(create_volume(&server, &owner, &app_id).await).await;
+        assert!(detail.contains("cannot be granted yet"), "{name}: {detail}");
+        let (volumes, leases): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM volumes WHERE app_id = ?1), \
+             (SELECT COUNT(*) FROM leases WHERE resource_id = ?1)",
+        )
+        .bind(&app_id)
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+        assert_eq!((volumes, leases), (0, 0), "{name}: nothing was written");
+        let frames = frames_until_settled(&mut socket).await;
+        assert!(
+            !frames.iter().any(|frame| frame["type"] == "lease_grant"),
+            "{name}: {frames:?}"
+        );
+
+        set_support(&server, true);
+        let (_, grant) = volume_and_grant(&server, &owner, &mut socket, &app_id).await;
+        assert_eq!(grant["body"]["mode"], "expiring", "{name}: {grant}");
+        assert_eq!(grant["body"]["fencing_token"], 1, "{name}");
+    }
+}
+
 /// Section 8.4, #604: a new token waits until the previous `expiring`
-/// holder's gate has passed, whatever mode it has: `local` for a `none` app,
-/// `expiring` for a `warm` app with voter support, and `local` for one
-/// without. `createVolume` answers `conflict` meanwhile and writes nothing;
-/// once the gate has passed it grants the next token.
+/// holder's gate has passed. `createVolume` answers `conflict` meanwhile and
+/// writes nothing; once the gate has passed, a `warm` app with voter support
+/// gets the next token `expiring`. Two new tokens stay held after the gate
+/// too, because their write would set the row's unsettled mark ("The
+/// mark"): a `local` one over the row that reads `expiring`, for a `none`
+/// app, and a `warm` app's without support.
 #[tokio::test]
 async fn a_new_volume_waits_for_the_previous_expiring_holders_gate() {
     let server = start_with_patient_node_session().await;
     let owner = server.owner().await;
     let (node, mut socket, project_id) = connected_node(&server, &owner).await;
     for (name, policy, supported, mode) in [
-        ("web-none", "none", false, "local"),
-        ("web-warm", "warm", true, "expiring"),
-        ("web-warm-alone", "warm", false, "local"),
+        ("web-warm", "warm", true, Some("expiring")),
+        ("web-none", "none", false, None),
+        ("web-warm-alone", "warm", false, None),
     ] {
         set_support(&server, supported);
         let app_id = app_with_policy(&server, &owner, &project_id, name, "none").await;
@@ -455,35 +503,58 @@ async fn a_new_volume_waits_for_the_previous_expiring_holders_gate() {
             .authority()
             .seed(&lease_id, &node.node_id, Some(3_000));
         let passes = tokio::time::Instant::now() + Duration::from_millis(5_000);
-        let (status, code, _) = problem(create_volume(&server, &owner, &app_id).await).await;
-        assert_eq!((status, code.as_str()), (409, "conflict"), "{name}");
-        let (token, stored): (i64, String) =
-            sqlx::query_as("SELECT fencing_token, mode FROM leases WHERE id = ?")
-                .bind(&lease_id)
-                .fetch_one(server.state.store.pool())
-                .await
-                .unwrap();
-        assert_eq!(
-            (token, stored.as_str()),
-            (1, "expiring"),
-            "{name}: nothing was written"
-        );
-        let volumes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM volumes WHERE app_id = ?")
-            .bind(&app_id)
-            .fetch_one(server.state.store.pool())
-            .await
-            .unwrap();
-        assert_eq!(volumes, 1, "{name}: only the deleted volume");
+        let refused = if mode.is_some() {
+            "gate is open"
+        } else {
+            "cannot be granted yet"
+        };
+        refused_unwritten(&server, &owner, name, &app_id, &lease_id, refused).await;
         assert!(
             tokio::time::Instant::now() < passes,
             "{name}: the test ran too slowly"
         );
 
         tokio::time::sleep_until(passes).await;
-        let (_, grant) = volume_and_grant(&server, &owner, &mut socket, &app_id).await;
-        assert_eq!(grant["body"]["fencing_token"], 2, "{name}");
-        assert_eq!(grant["body"]["mode"], mode, "{name}");
+        if let Some(mode) = mode {
+            let (_, grant) = volume_and_grant(&server, &owner, &mut socket, &app_id).await;
+            assert_eq!(grant["body"]["fencing_token"], 2, "{name}");
+            assert_eq!(grant["body"]["mode"], mode, "{name}");
+        } else {
+            refused_unwritten(&server, &owner, name, &app_id, &lease_id, refused).await;
+        }
     }
+}
+
+/// `createVolume` answers `conflict` with `detail` containing `refused`, and
+/// writes nothing: the lease is still the deleted volume's, at token 1 and
+/// `expiring`, and only that volume exists.
+async fn refused_unwritten(
+    server: &Server,
+    owner: &reqwest::Client,
+    name: &str,
+    app_id: &str,
+    lease_id: &str,
+    refused: &str,
+) {
+    let detail = conflict_detail(create_volume(server, owner, app_id).await).await;
+    assert!(detail.contains(refused), "{name}: {detail}");
+    let (token, stored): (i64, String) =
+        sqlx::query_as("SELECT fencing_token, mode FROM leases WHERE id = ?")
+            .bind(lease_id)
+            .fetch_one(server.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        (token, stored.as_str()),
+        (1, "expiring"),
+        "{name}: nothing was written"
+    );
+    let volumes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM volumes WHERE app_id = ?")
+        .bind(app_id)
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(volumes, 1, "{name}: only the deleted volume");
 }
 
 /// ADR 0258 on the primary's side (#604): a new token reaches the node after
@@ -532,8 +603,9 @@ async fn a_new_token_follows_the_revoke_of_the_previous_lease() {
 
 /// ADR 0258 and section 8.4: a volume that failed leaves the app's lease
 /// unrevoked, so the node still holds it `local`. A new volume's token on
-/// that node keeps `local`, even for a `warm` app with voter support, and
-/// no revoke goes out.
+/// that node keeps `local`, and no revoke goes out. For a `warm` app, even
+/// with voter support, that `local` write would set the row's unsettled mark
+/// (ADR 0285), so `createVolume` answers `conflict` and writes nothing.
 #[tokio::test]
 async fn a_new_token_to_a_node_that_still_holds_the_lease_stays_local() {
     let server = start_with_patient_node_session().await;
@@ -590,6 +662,21 @@ async fn a_new_token_to_a_node_that_still_holds_the_lease_stays_local() {
         .await
         .unwrap();
     assert_eq!(res.status(), 202, "{}", res.text().await.unwrap());
+    let detail = conflict_detail(create_volume(&server, &owner, &app_id).await).await;
+    assert!(detail.contains("cannot be granted yet"), "{detail}");
+    let (token, revoked): (i64, Option<String>) =
+        sqlx::query_as("SELECT fencing_token, revoked_at FROM leases WHERE resource_id = ?")
+            .bind(&app_id)
+            .fetch_one(server.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!((token, revoked), (1, None), "nothing was written");
+
+    sqlx::query("UPDATE apps SET ha_policy = 'none' WHERE id = ?")
+        .bind(&app_id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
     let res = create_volume(&server, &owner, &app_id).await;
     assert_eq!(res.status(), 201, "{}", res.text().await.unwrap());
     let mut frames = recv_until(&mut socket, &["lease_grant"]).await;
