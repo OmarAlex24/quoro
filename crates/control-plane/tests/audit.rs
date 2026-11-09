@@ -15,6 +15,183 @@ fn items(page: &Value) -> Vec<Value> {
     page["items"].as_array().unwrap().clone()
 }
 
+fn seqs(page: &Value) -> Vec<i64> {
+    items(page)
+        .iter()
+        .map(|record| record["seq"].as_i64().unwrap())
+        .collect()
+}
+
+/// Every `seq` of `listAudit` with `query`, read `limit` records at a time by
+/// following `next_cursor` to the last page.
+async fn walk(
+    server: &common::Server,
+    owner: &reqwest::Client,
+    query: &str,
+    limit: usize,
+) -> Vec<i64> {
+    let mut seen = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let url = match &cursor {
+            None => server.url(&format!("/api/v1/audit?{query}&limit={limit}")),
+            Some(cursor) => server.url(&format!(
+                "/api/v1/audit?{query}&limit={limit}&cursor={cursor}"
+            )),
+        };
+        let page = list(owner, &url).await;
+        let batch = seqs(&page);
+        assert!(batch.len() <= limit, "{page}");
+        seen.extend(&batch);
+        match page["next_cursor"].as_str() {
+            Some(next) => {
+                assert_eq!(
+                    batch.len(),
+                    limit,
+                    "only a full page has a next page: {page}"
+                );
+                cursor = Some(next.to_string());
+            }
+            None => break,
+        }
+    }
+    seen
+}
+
+/// The stored `seq`s, oldest first, of the records `filter` selects.
+async fn stored_seqs(server: &common::Server, filter: &str) -> Vec<i64> {
+    let rows: Vec<(i64,)> = sqlx::query_as(&format!(
+        "SELECT seq FROM audit_log WHERE {filter} ORDER BY seq"
+    ))
+    .fetch_all(server.state.store.pool())
+    .await
+    .unwrap();
+    rows.into_iter().map(|(seq,)| seq).collect()
+}
+
+#[tokio::test]
+async fn audit_lists_newest_first_within_a_window() {
+    let server = common::start().await;
+    let owner = server.owner().await;
+
+    // Each project is created once and then again under the same slug, which
+    // is a conflict: the log interleaves `ok` and `error` records. An owner's
+    // reads are not audited, so the log stays as it is while the test reads.
+    for slug in ["one", "two", "three"] {
+        for status in [201, 409] {
+            let res = owner
+                .post(server.url("/api/v1/projects"))
+                .json(&json!({ "slug": slug, "name": slug }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), status, "{}", res.text().await.unwrap());
+        }
+    }
+    let all = stored_seqs(&server, "1 = 1").await;
+    assert!(all.len() >= 7, "{all:?}");
+    let newest_first: Vec<i64> = all.iter().rev().copied().collect();
+
+    // No `order` reads oldest first, exactly as `order=asc` does.
+    let plain = list(&owner, &server.url("/api/v1/audit?limit=500")).await;
+    let ascending = list(&owner, &server.url("/api/v1/audit?order=asc&limit=500")).await;
+    assert_eq!(seqs(&plain), all, "{plain}");
+    assert_eq!(plain, ascending);
+    assert_eq!(walk(&server, &owner, "order=asc", 2).await, all);
+
+    // `desc` returns the same records newest first, and its cursor walks
+    // toward older records across pages.
+    let descending = list(&owner, &server.url("/api/v1/audit?order=desc&limit=500")).await;
+    let mut reversed = items(&ascending);
+    reversed.reverse();
+    assert_eq!(items(&descending), reversed, "{descending}");
+    assert!(descending["next_cursor"].is_null(), "{descending}");
+    assert_eq!(walk(&server, &owner, "order=desc", 2).await, newest_first);
+    assert_eq!(walk(&server, &owner, "order=desc", 3).await, newest_first);
+
+    // Both bounds are exclusive and bound the window in both orders.
+    assert_eq!(
+        walk(&server, &owner, "after_seq=2&before_seq=6", 2).await,
+        vec![3, 4, 5]
+    );
+    assert_eq!(
+        walk(&server, &owner, "order=desc&after_seq=2&before_seq=6", 2).await,
+        vec![5, 4, 3]
+    );
+    assert_eq!(
+        walk(&server, &owner, "order=desc&before_seq=3", 1).await,
+        vec![2, 1]
+    );
+    assert_eq!(
+        walk(&server, &owner, "order=asc&before_seq=3", 1).await,
+        vec![1, 2]
+    );
+
+    // A window that holds no `seq` is an empty last page, not an error.
+    for window in [
+        "after_seq=5&before_seq=5",
+        "after_seq=5&before_seq=3",
+        "after_seq=4&before_seq=5",
+    ] {
+        for order in ["asc", "desc"] {
+            let page = list(
+                &owner,
+                &server.url(&format!("/api/v1/audit?order={order}&{window}")),
+            )
+            .await;
+            assert!(items(&page).is_empty(), "{order} {window}: {page}");
+            assert!(page["next_cursor"].is_null(), "{order} {window}: {page}");
+        }
+    }
+
+    // A filter selects the same records in both orders.
+    let errors = stored_seqs(&server, "result = 'error'").await;
+    assert_eq!(errors.len(), 3, "{errors:?}");
+    let errors_newest_first: Vec<i64> = errors.iter().rev().copied().collect();
+    assert_eq!(walk(&server, &owner, "result=error", 2).await, errors);
+    assert_eq!(
+        walk(&server, &owner, "order=desc&result=error", 2).await,
+        errors_newest_first
+    );
+    let filtered = list(
+        &owner,
+        &server.url("/api/v1/audit?order=desc&result=error&limit=500"),
+    )
+    .await;
+    assert!(
+        items(&filtered)
+            .iter()
+            .all(|record| record["result"] == "error"),
+        "{filtered}"
+    );
+    let below = errors[2];
+    assert_eq!(
+        walk(
+            &server,
+            &owner,
+            &format!("order=desc&result=error&before_seq={below}"),
+            1
+        )
+        .await,
+        vec![errors[1], errors[0]]
+    );
+
+    // An unknown order and a `before_seq` below 1 are refused.
+    for query in ["order=newest", "before_seq=0"] {
+        let res = owner
+            .get(server.url(&format!("/api/v1/audit?{query}")))
+            .send()
+            .await
+            .unwrap();
+        let (status, code, _) = common::problem(res).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (422, "validation_failed"),
+            "{query}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn audit_lists_verifies_and_reports_a_tampered_record() {
     let server = common::start().await;

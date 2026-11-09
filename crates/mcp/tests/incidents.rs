@@ -565,6 +565,35 @@ async fn list_audit_filters_by_incident() {
     assert_eq!(resolved["justification"], justify, "{resolved}");
     assert_eq!(resolved["incident_id"], incident_id, "{resolved}");
 
+    // Newest first, the filter selects the same records (ADR 0283).
+    // `before_seq` closes the window after the page above, so the records of
+    // the reads since then stay outside it.
+    let newest = items
+        .last()
+        .and_then(|row| row["seq"].as_i64())
+        .unwrap_or_else(|| panic!("no seq in {result}"));
+    let result_desc = call_tool(
+        &seeded.server,
+        &seeded.access_token,
+        "list_audit",
+        json!({
+            "incident_id": incident_id,
+            "order": "desc",
+            "before_seq": newest + 1,
+            "limit": 500,
+        }),
+    )
+    .await;
+    assert!(
+        !is_error(&result_desc),
+        "list_audit newest first: {result_desc}"
+    );
+    let newest_first = result_desc["structuredContent"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no items in {result_desc}"));
+    let expected: Vec<Value> = items.iter().rev().cloned().collect();
+    assert_eq!(*newest_first, expected, "{result_desc}");
+
     // Unfiltered: the same log also holds records outside the incident, so
     // the filter above really selected.
     let result = call_tool(

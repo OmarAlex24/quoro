@@ -119,7 +119,8 @@ pub struct AuditRecord {
     pub hash: String,
 }
 
-/// One page of audit records in ascending `seq` order.
+/// One page of audit records in ascending `seq` order, or descending with
+/// `order=desc`.
 #[derive(Clone, Debug, Serialize, ToSchema)]
 #[schema(title = "AuditList")]
 pub struct AuditList {
@@ -177,6 +178,17 @@ pub fn audit_result_param() -> utoipa::openapi::schema::Object {
         .build()
 }
 
+/// Schema of the `order` query parameter, inline with its default as the
+/// frozen contract writes it (ADR 0283).
+#[must_use]
+pub fn audit_order_param() -> utoipa::openapi::schema::Object {
+    utoipa::openapi::schema::ObjectBuilder::new()
+        .schema_type(utoipa::openapi::schema::Type::String)
+        .enum_values(Some(["asc", "desc"]))
+        .default(Some(serde_json::json!("asc")))
+        .build()
+}
+
 /// Filters and paging of `listAudit` (`openapi.yaml` section 2.4).
 #[derive(Debug, Default, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
@@ -191,9 +203,16 @@ pub struct ListAuditQuery {
     /// Only records that belong to this incident.
     #[param(pattern = "^inc_[0-9A-HJKMNP-TV-Z]{26}$")]
     pub incident_id: Option<String>,
+    /// Order of the page by `seq`, `asc` (oldest first) or `desc` (newest
+    /// first).
+    #[param(schema_with = audit_order_param)]
+    pub order: Option<String>,
     /// Return only entries whose `seq` is greater than this value.
     #[param(minimum = 0)]
     pub after_seq: Option<i64>,
+    /// Return only entries whose `seq` is less than this value.
+    #[param(minimum = 1)]
+    pub before_seq: Option<i64>,
     /// Maximum number of items to return (default 50, maximum 500).
     #[param(minimum = 1, maximum = 500, default = 50)]
     pub limit: Option<i64>,
@@ -205,7 +224,8 @@ pub struct ListAuditQuery {
 // Handlers
 // ---------------------------------------------------------------------------
 
-/// Every audit record in ascending `seq` order (D-0031).
+/// The audit records in ascending `seq` order (D-0031), or newest first with
+/// `order=desc` (ADR 0283).
 #[utoipa::path(
     get,
     path = "/api/v1/audit",
@@ -227,8 +247,8 @@ pub struct ListAuditQuery {
 ///
 /// # Errors
 ///
-/// `forbidden` without `audit:read`, `validation_failed` for a bad limit or
-/// cursor, or a database error.
+/// `forbidden` without `audit:read`, `validation_failed` for a bad limit,
+/// cursor, order or bound, or a database error.
 pub async fn list_audit(
     State(state): State<AppState>,
     identity: Identity,

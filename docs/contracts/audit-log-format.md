@@ -150,8 +150,10 @@ A human record has no `agent_model` and no `on_behalf_of` (the human acted for t
 
 ### 2.4 Reading the log
 
-- `GET /api/v1/audit` requires `audit:read`, takes `limit` (default 50, max 500), `cursor` and `after_seq`, and returns `{ "items": [...], "next_cursor": ... }` (shared entity model, "Pagination and lists").
-- Records are returned in `seq` order, oldest first (D-0031).
+- `GET /api/v1/audit` requires `audit:read`, takes `limit` (default 50, max 500), `cursor`, `order`, `after_seq` and `before_seq`, and returns `{ "items": [...], "next_cursor": ... }` (shared entity model, "Pagination and lists"). The MCP tool `list_audit` takes the same parameters.
+- Records are returned in `seq` order, oldest first (D-0031). With `order=desc` they are returned newest first, and `next_cursor` continues toward older records (ADR 0283).
+- `after_seq` and `before_seq` bound a window from both sides: only records with `after_seq < seq < before_seq`. A window that holds no `seq` answers an empty page with a null `next_cursor`, not an error (ADR 0283).
+- The filters (`actor_id`, `target_id`, `result`, `incident_id`) apply the same way in both orders. The order changes only how records are read: verification (section 6) and the off-site copy (section 8) do not depend on it (ADR 0283).
 - An agent's selector filters the rows it may see; the list is filtered, never refused (permission-model.md, section 5.1; D-0030).
 - There is no endpoint that updates or deletes a record. `GET /api/v1/audit` and `POST /api/v1/audit/verify` are the only audit operations in [openapi.yaml](openapi.yaml) (D-0031).
 

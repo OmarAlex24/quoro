@@ -5680,7 +5680,7 @@ components:
     AuditList:
       type: object
       title: AuditList
-      description: One page of audit records in ascending `seq` order.
+      description: One page of audit records in ascending `seq` order, or descending with `order=desc`.
       required:
         - items
         - next_cursor
@@ -9224,10 +9224,18 @@ paths:
       operationId: listAudit
       summary: List audit records
       description: |
-        The append-only, hash-chained audit log in ascending `seq` order. Filter by
-        actor, target, result or incident, or resume after a sequence number.
-        Secrets in `params` are redacted (D-0031). Exposed as the MCP tool
-        `list_audit` (D-0033).
+        The append-only, hash-chained audit log in ascending `seq` order, or
+        newest first with `order=desc` (ADR 0283). Filter by actor, target,
+        result or incident; the filters apply the same way in both orders.
+        `after_seq` and `before_seq` bound a window from both sides,
+        `after_seq < seq < before_seq`; a window that holds no `seq`, such as
+        `before_seq` at or below `after_seq`, answers an empty page with a null
+        `next_cursor`, not an error. Pages follow `seq` in the requested order;
+        `next_cursor` is an opaque string that continues after the last record
+        of the page, toward newer records with `asc` and toward older ones with
+        `desc`, and is valid only with the same `order` and filters. Secrets in
+        `params` are redacted (D-0031). Exposed as the MCP tool `list_audit`
+        (D-0033).
       x-quoro-scope: audit:read
       x-quoro-mcp-tool: list_audit
       parameters:
@@ -9257,7 +9265,22 @@ paths:
           schema:
             type: string
             pattern: '^inc_[0-9A-HJKMNP-TV-Z]{26}$'
+        - name: order
+          in: query
+          required: false
+          description: Order of the page by `seq`, `asc` (oldest first) or `desc` (newest first).
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: asc
         - $ref: '#/components/parameters/AfterSeq'
+        - name: before_seq
+          in: query
+          required: false
+          description: Return only entries whose `seq` is less than this value.
+          schema:
+            type: integer
+            minimum: 1
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
       responses:
