@@ -58,7 +58,7 @@ export function LoginScreen() {
       lede="One microVM per app, on your own metal."
       footer={
         <p>
-          First time here?{' '}
+          A new cluster with no owner yet?{' '}
           <Link to="/setup" className="auth-link">
             Set up the owner account
           </Link>
