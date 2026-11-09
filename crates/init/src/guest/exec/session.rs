@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! One exec session: read the open, allocate a PTY, start the program through
-//! the helper, relay both directions, report the exit.
+//! the helper, relay both directions, report the exit. Or, when the first
+//! frame is a sync (ADR 0282), one sync session: `syncfs` on each named
+//! volume's mount and one `SYNCED` or `ERROR` answer, with no program and no
+//! PTY. The syncs run on a thread of their own, so a `syncfs` that never
+//! returns keeps that thread and not the session's slot once the host hangs
+//! up, and one sync of a volume waits for another, so at most one `syncfs` of
+//! a volume runs at a time.
 //!
 //! The relay is generic over the connection ([`SessionIo`]) so the tests can
 //! run a real PTY and real programs over `UnixStream::pair()` without a vsock
@@ -11,10 +17,12 @@
 //! the program's terminal fills up, and the program blocks. Nothing here
 //! buffers output beyond one 8 KiB read.
 
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt as _;
@@ -22,11 +30,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use quoro_init::exec::{FrameReader, GuestFrame, HostFrame, MAX_PAYLOAD, OPEN, OpenRequest};
+use quoro_init::exec::{
+    FrameReader, GuestFrame, HostFrame, MAX_PAYLOAD, OPEN, OpenRequest, SYNC, SyncRequest,
+};
 use rustix::fs::{Mode, OFlags};
 #[cfg(test)]
 use rustix::io::Errno;
@@ -102,11 +112,12 @@ pub(super) fn close_stream<S: SessionIo>(stream: &S) {
 }
 
 /// What every session of this VM shares: the app's environment, working
-/// directory and identity.
+/// directory and identity, and what its sync sessions share.
 pub(super) struct Context {
     env: Vec<(String, String)>,
     workdir: Option<String>,
     identity: Identity,
+    syncs: Arc<Syncs>,
 }
 
 impl Context {
@@ -115,7 +126,175 @@ impl Context {
             env: config.env.clone(),
             workdir: config.workdir.clone(),
             identity: identity.clone(),
+            syncs: Arc::new(Syncs::new(
+                config
+                    .volumes
+                    .iter()
+                    .map(|volume| (volume.serial.clone(), volume.mount_path.clone()))
+                    .collect(),
+            )),
         }
+    }
+}
+
+/// How a sync runs `syncfs` on a volume's opened mount, given its serial: the
+/// real call in production, one a test can hold in the tests.
+type Syncfs = Box<dyn Fn(&str, &OwnedFd) -> rustix::io::Result<()> + Send + Sync>;
+
+/// How long a sync waits for an earlier sync of the same volume to end
+/// before it is refused: the engine's own bound (`engine-trait.md` section
+/// 3.16), after which that host has normally hung up anyway.
+const BUSY_WAIT: Duration = Duration::from_secs(2);
+
+/// What every sync session of this VM shares (ADR 0282). It outlives the
+/// session that started a sync, since the sync's thread may outlive it.
+struct Syncs {
+    /// `(serial, mount_path)` of every volume in the configuration.
+    volumes: Vec<(String, String)>,
+    /// Per volume serial, the reason of its last failed sync, cleared when a
+    /// sync of that volume succeeds. Serials the configuration lacks share
+    /// [`UNKNOWN_VOLUME`], so the map holds at most one entry more than the
+    /// VM has volumes, whatever a host sends.
+    failures: Mutex<HashMap<String, String>>,
+    /// The volumes a sync holds, from before its first `syncfs` until its
+    /// results are recorded. A sync of a held volume waits for it, so at most
+    /// one `syncfs` of a volume runs at a time, and one that never returns
+    /// keeps one thread per volume, however often the host asks.
+    running: Mutex<HashSet<String>>,
+    /// Signalled whenever a sync releases its volumes.
+    released: Condvar,
+    syncfs: Syncfs,
+}
+
+/// The key under which [`Syncs::note`] records every serial the
+/// configuration lacks.
+const UNKNOWN_VOLUME: &str = "";
+
+impl Syncs {
+    fn new(volumes: Vec<(String, String)>) -> Self {
+        Self::with_syncfs(
+            volumes,
+            Box::new(|_, directory| rustix::fs::syncfs(directory)),
+        )
+    }
+
+    fn with_syncfs(volumes: Vec<(String, String)>, syncfs: Syncfs) -> Self {
+        Self {
+            volumes,
+            failures: Mutex::new(HashMap::new()),
+            running: Mutex::new(HashSet::new()),
+            released: Condvar::new(),
+            syncfs,
+        }
+    }
+
+    fn mount_path(&self, serial: &str) -> Option<&str> {
+        self.volumes
+            .iter()
+            .find(|(known, _)| known == serial)
+            .map(|(_, path)| path.as_str())
+    }
+
+    /// Holds every volume of `serials` the configuration has, waiting up to
+    /// `within` while another sync holds one of them. It takes all of them or
+    /// none, so a sync never holds one volume while it waits for another.
+    /// `Err` names the volume that stayed held.
+    fn claim(self: &Arc<Self>, serials: &[String], within: Duration) -> Result<Claim, String> {
+        let deadline = Instant::now() + within;
+        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+        while let Some(busy) = serials.iter().find(|serial| running.contains(*serial)) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(busy.clone());
+            }
+            running = self
+                .released
+                .wait_timeout(running, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        let held: Vec<String> = serials
+            .iter()
+            .filter(|serial| self.mount_path(serial).is_some())
+            .cloned()
+            .collect();
+        running.extend(held.iter().cloned());
+        Ok(Claim {
+            syncs: Arc::clone(self),
+            serials: held,
+        })
+    }
+
+    /// `syncfs` on the serial's mount path, opened now, so a path the app
+    /// remounted or the init unmounted is seen as it is at this moment.
+    fn sync_volume(&self, serial: &str) -> Result<(), String> {
+        let Some(path) = self.mount_path(serial) else {
+            return Err(format!("sync: no volume {serial} in the configuration"));
+        };
+        let directory = rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|err| format!("sync: open {path} of {serial}: {err}"))?;
+        (self.syncfs)(serial, &directory)
+            .map_err(|err| format!("sync: syncfs {path} of {serial}: {err}"))
+    }
+
+    /// Records the result of one volume's sync. A failure is logged on the
+    /// serial console only when it is that volume's first one or its reason
+    /// changed, so a sync every few seconds that keeps failing, even
+    /// alternating with another volume's success, does not push the boot
+    /// output out of the serial ring (`engine-trait.md` section 6). Returns
+    /// whether it was logged.
+    fn note(&self, serial: &str, failure: Option<&str>) -> bool {
+        let mut failures = self.failures.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(reason) = failure else {
+            failures.remove(serial);
+            return false;
+        };
+        if failures.get(serial).map(String::as_str) == Some(reason) {
+            return false;
+        }
+        diag::log(&format!("exec: {reason}"));
+        failures.insert(serial.to_string(), reason.to_string());
+        true
+    }
+}
+
+/// The volumes one sync holds, released when the sync's thread ends, after
+/// it recorded its results, or unwinds.
+struct Claim {
+    syncs: Arc<Syncs>,
+    serials: Vec<String>,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        let mut running = self
+            .syncs
+            .running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for serial in &self.serials {
+            running.remove(serial);
+        }
+        self.syncs.released.notify_all();
+    }
+}
+
+/// Ends the connection when the sync's thread ends however it ends, so the
+/// session does not wait for the host to hang up. A thread that panics
+/// answers `ERROR` first; after an answer, that frame is not sent.
+struct EndOnDrop<S: SessionIo>(Arc<Sink<S>>);
+
+impl<S: SessionIo> Drop for EndOnDrop<S> {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            diag::log("exec: sync: the sync thread panicked");
+            self.0.error("sync: the sync thread panicked");
+        }
+        self.0.shutdown();
     }
 }
 
@@ -161,6 +340,12 @@ pub(super) fn serve<S: SessionIo>(stream: S, context: &Context, helper: &Helper,
     let mut frames = FrameReader::new();
     let request = match read_open(&mut reader, &mut frames) {
         Opened::Request(request) => request,
+        Opened::Sync(request) => {
+            // A sync is the session's only frame: what follows it is
+            // discarded, not read as frames.
+            serve_sync(request, reader, context, &sink);
+            return;
+        }
         Opened::Closed => return,
         Opened::Bad(message) => {
             sink.error(&message);
@@ -333,15 +518,17 @@ pub(super) fn serve<S: SessionIo>(stream: S, context: &Context, helper: &Helper,
 /// How the first frame was read.
 enum Opened {
     Request(OpenRequest),
+    /// A sync session (ADR 0282).
+    Sync(SyncRequest),
     /// The host closed before the open completed; there is nobody to answer.
     Closed,
     /// The host broke the format; the message goes back as `ERROR`.
     Bad(String),
 }
 
-/// Read frames until the open arrives. Any other first frame, a malformed or
-/// oversized one, is refused; extra bytes already buffered stay in `frames`
-/// for the relay.
+/// Read frames until the open or the sync arrives. Any other first frame, a
+/// malformed or oversized one, is refused; extra bytes already buffered stay
+/// in `frames` for the relay.
 fn read_open<R: Read>(reader: &mut R, frames: &mut FrameReader) -> Opened {
     let mut chunk = [0_u8; 8192];
     loop {
@@ -357,14 +544,17 @@ fn read_open<R: Read>(reader: &mut R, frames: &mut FrameReader) -> Opened {
                 frames.push(&chunk[..read]);
                 match frames.next_frame() {
                     Ok(Some((kind, payload))) => {
-                        if kind != OPEN {
+                        if kind != OPEN && kind != SYNC {
                             return Opened::Bad(format!(
-                                "the first frame must be open, got type {kind}"
+                                "the first frame must be open or sync, got type {kind}"
                             ));
                         }
                         return match HostFrame::decode(kind, &payload) {
                             Ok(HostFrame::Open(request)) => Opened::Request(request),
-                            Ok(_) => Opened::Bad("the first frame is not an open".to_string()),
+                            Ok(HostFrame::Sync(request)) => Opened::Sync(request),
+                            Ok(_) => {
+                                Opened::Bad("the first frame is not an open or a sync".to_string())
+                            }
                             Err(err) => Opened::Bad(err.to_string()),
                         };
                     }
@@ -374,6 +564,93 @@ fn read_open<R: Read>(reader: &mut R, frames: &mut FrameReader) -> Opened {
             }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => return Opened::Closed,
+        }
+    }
+}
+
+/// A sync session (ADR 0282, `engine-trait.md` section 6): `syncfs` on the
+/// mount of each named volume, in order, then `SYNCED`; or `ERROR` with the
+/// first reason. It starts no program, allocates no PTY and writes nothing to
+/// the app's console.
+///
+/// It first holds the named volumes, waiting up to [`BUSY_WAIT`] for an
+/// earlier sync of one of them to end. The syncs then run on a thread of
+/// their own, which answers and ends the connection; this one, which holds
+/// the session's slot, waits until the connection ends. That is the answer,
+/// or the host hanging up: a host stops waiting after its bound and drops the
+/// connection. A `syncfs` that never returns then keeps its thread and its
+/// volume, not one of the init's session slots.
+fn serve_sync<S: SessionIo>(
+    request: SyncRequest,
+    reader: S,
+    context: &Context,
+    sink: &Arc<Sink<S>>,
+) {
+    let claim = match context.syncs.claim(&request.serials, BUSY_WAIT) {
+        Ok(claim) => claim,
+        Err(serial) => {
+            let reason = format!("sync: an earlier syncfs of {serial} has not returned");
+            context.syncs.note(&serial, Some(&reason));
+            sink.error(&reason);
+            sink.shutdown();
+            return;
+        }
+    };
+    let answer = Arc::clone(sink);
+    let worker = thread::Builder::new()
+        .name("exec-sync".to_string())
+        .spawn(move || {
+            // Built in the thread, so a thread that never starts does not
+            // close the connection before the `ERROR` below.
+            let end = EndOnDrop(answer);
+            sync_all(&request.serials, &claim.syncs, &end.0);
+            // The volumes are released only after their results are
+            // recorded, so a later sync never records before this one.
+            drop(claim);
+        });
+    if let Err(err) = worker {
+        let reason = format!("sync: cannot start a sync thread: {err}");
+        diag::log(&format!("exec: {reason}"));
+        sink.error(&reason);
+        sink.shutdown();
+        return;
+    }
+    wait_for_close(reader);
+}
+
+/// Syncs each serial in order, then answers `SYNCED`, or `ERROR` at the
+/// first failure, and ends the connection.
+fn sync_all<S: SessionIo>(serials: &[String], syncs: &Syncs, sink: &Sink<S>) {
+    for serial in serials {
+        if let Err(reason) = syncs.sync_volume(serial) {
+            let known = syncs.volumes.iter().any(|(volume, _)| volume == serial);
+            let key = if known {
+                serial.as_str()
+            } else {
+                UNKNOWN_VOLUME
+            };
+            syncs.note(key, Some(&reason));
+            sink.error(&reason);
+            sink.shutdown();
+            return;
+        }
+        syncs.note(serial, None);
+    }
+    sink.finish(&GuestFrame::Synced);
+    sink.shutdown();
+}
+
+/// Returns when the connection ends: the host hung up, or the sync's thread
+/// shut it down after its answer. The host sends nothing after the sync, and
+/// bytes it sends anyway are discarded, not read as frames.
+fn wait_for_close<S: SessionIo>(mut reader: S) {
+    let mut discard = [0_u8; 512];
+    loop {
+        match reader.read(&mut discard) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return,
         }
     }
 }
@@ -434,6 +711,11 @@ fn handle_frames<S: SessionIo>(
                 }
                 Ok(HostFrame::Open(_)) => {
                     sink.error("the open frame may appear only once");
+                    hangup(pid);
+                    return false;
+                }
+                Ok(HostFrame::Sync(_)) => {
+                    sink.error("a sync frame may only be a session's first frame");
                     hangup(pid);
                     return false;
                 }
@@ -639,6 +921,7 @@ impl<S: SessionIo> Sink<S> {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
 
     /// A wrapper that behaves like the real helper's `setsid` + `exec`, minus
     /// the controlling-terminal dance (the PTY is already the child's
@@ -670,7 +953,24 @@ mod tests {
                 gid: rustix::process::getgid().as_raw(),
                 home: "/".to_string(),
             },
+            syncs: Arc::new(Syncs::new(Vec::new())),
         }
+    }
+
+    fn volumes(volumes: &[(&str, &str)]) -> Vec<(String, String)> {
+        volumes
+            .iter()
+            .map(|(serial, path)| ((*serial).to_string(), (*path).to_string()))
+            .collect()
+    }
+
+    fn failures(context: &Context) -> HashMap<String, String> {
+        context
+            .syncs
+            .failures
+            .lock()
+            .map(|failures| failures.clone())
+            .unwrap_or_default()
     }
 
     /// A session over one end of a socket pair. The other end is the host.
@@ -700,6 +1000,7 @@ mod tests {
         output: Vec<u8>,
         exit: Option<i32>,
         error: Option<String>,
+        synced: bool,
     }
 
     impl Client {
@@ -713,6 +1014,7 @@ mod tests {
                 output: Vec::new(),
                 exit: None,
                 error: None,
+                synced: false,
             }
         }
 
@@ -743,6 +1045,7 @@ mod tests {
                                 Ok(GuestFrame::Output(bytes)) => self.output.extend(bytes),
                                 Ok(GuestFrame::Exit(code)) => self.exit = Some(code),
                                 Ok(GuestFrame::Error(message)) => self.error = Some(message),
+                                Ok(GuestFrame::Synced) => self.synced = true,
                                 Err(err) => panic!("decode: {err}"),
                             },
                             Ok(None) => return true,
@@ -847,6 +1150,448 @@ mod tests {
         let mut client = start(&["/no/such/program"], 24, 80);
         client.wait_for_output("quoro-init: /no/such/program: not found");
         assert_eq!(client.finish(), 127);
+    }
+
+    /// A directory of its own for one test, removed when dropped.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("quoro-init-sync-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap_or_else(|err| panic!("mkdir: {err}"));
+            Self(path)
+        }
+
+        fn path(&self) -> String {
+            self.0.to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A sync session over a socket pair: sends the sync and reads until the
+    /// guest closes. Returns the `SYNCED` flag and the `ERROR` message.
+    fn sync(volumes: &[(&str, &str)], first: &[u8]) -> (bool, Option<String>, Arc<Context>) {
+        let (host, guest) = UnixStream::pair().unwrap_or_else(|err| panic!("pair: {err}"));
+        let mut context = test_context();
+        context.syncs = Arc::new(Syncs::new(self::volumes(volumes)));
+        let context = Arc::new(context);
+        let shared = Arc::clone(&context);
+        let helper = test_helper();
+        let served = thread::spawn(move || serve(guest, &shared, &helper, Wait::Direct));
+        let mut client = Client::new(host);
+        client.send_raw(first);
+        while client.pump() {}
+        served
+            .join()
+            .unwrap_or_else(|_| panic!("the session panicked"));
+        assert!(client.output.is_empty(), "a sync session writes no output");
+        assert_eq!(client.exit, None, "a sync session runs no program");
+        (client.synced, client.error, context)
+    }
+
+    fn sync_frame(serials: &[&str]) -> Vec<u8> {
+        HostFrame::Sync(SyncRequest {
+            serials: serials.iter().map(|serial| (*serial).to_string()).collect(),
+        })
+        .encode()
+        .unwrap_or_else(|err| panic!("encode: {err}"))
+    }
+
+    #[test]
+    fn a_sync_session_flushes_each_named_volume_and_answers_synced() {
+        let data = TempDir::new("data");
+        let uploads = TempDir::new("uploads");
+        let (synced, error, context) = sync(
+            &[
+                ("quoro-vol-0", &data.path()),
+                ("quoro-vol-1", &uploads.path()),
+            ],
+            &sync_frame(&["quoro-vol-1", "quoro-vol-0"]),
+        );
+        assert!(synced, "error: {error:?}");
+        assert_eq!(error, None);
+        assert!(failures(&context).is_empty());
+    }
+
+    #[test]
+    fn a_sync_session_reads_nothing_after_the_sync() {
+        let data = TempDir::new("after");
+        let mut first = sync_frame(&["quoro-vol-0"]);
+        first.extend(
+            HostFrame::Input(b"ignored".to_vec())
+                .encode()
+                .unwrap_or_default(),
+        );
+        let (synced, error, _) = sync(&[("quoro-vol-0", &data.path())], &first);
+        assert!(synced, "error: {error:?}");
+    }
+
+    #[test]
+    fn a_sync_of_a_volume_the_configuration_lacks_is_an_error() {
+        let data = TempDir::new("lacks");
+        let (synced, error, context) = sync(
+            &[("quoro-vol-0", &data.path())],
+            &sync_frame(&["quoro-vol-0", "quoro-vol-7"]),
+        );
+        assert!(!synced);
+        let message = error.unwrap_or_default();
+        assert!(message.contains("quoro-vol-7"), "{message:?}");
+        assert_eq!(
+            failures(&context),
+            HashMap::from([(UNKNOWN_VOLUME.to_string(), message)]),
+            "quoro-vol-0 succeeded and is clear; the unknown serial shares one key"
+        );
+    }
+
+    #[test]
+    fn unknown_serials_never_grow_the_failure_record() {
+        let data = TempDir::new("bounded");
+        let mut context = test_context();
+        context.syncs = Arc::new(Syncs::new(volumes(&[("quoro-vol-0", &data.path())])));
+        let context = Arc::new(context);
+        for n in 1..=40 {
+            let (host, guest) = UnixStream::pair().unwrap_or_else(|err| panic!("pair: {err}"));
+            let shared = Arc::clone(&context);
+            let served = thread::spawn(move || serve(guest, &shared, &test_helper(), Wait::Direct));
+            let mut client = Client::new(host);
+            client.send_raw(&sync_frame(&[&format!("quoro-vol-{n}")]));
+            while client.pump() {}
+            served
+                .join()
+                .unwrap_or_else(|_| panic!("the session panicked"));
+            assert!(client.error.is_some());
+        }
+        assert_eq!(failures(&context).len(), 1);
+    }
+
+    /// What a test `syncfs` waits on until the test opens it. Dropping the
+    /// guard that [`Gate::opener`] returns opens it too, so a test that fails
+    /// half way leaves no thread parked.
+    #[derive(Default)]
+    struct Gate {
+        open: Mutex<bool>,
+        opened: Condvar,
+    }
+
+    impl Gate {
+        fn wait(&self) {
+            let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+            while !*open {
+                open = self
+                    .opened
+                    .wait(open)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+        }
+
+        fn open(&self) {
+            *self.open.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            self.opened.notify_all();
+        }
+
+        fn opener(self: &Arc<Self>) -> GateOpener {
+            GateOpener(Arc::clone(self))
+        }
+    }
+
+    struct GateOpener(Arc<Gate>);
+
+    impl Drop for GateOpener {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+
+    /// How often a test `syncfs` of `quoro-vol-0` ran, and the most that ran
+    /// at once.
+    #[derive(Default)]
+    struct Calls {
+        now: std::sync::atomic::AtomicUsize,
+        most: std::sync::atomic::AtomicUsize,
+        total: std::sync::atomic::AtomicUsize,
+    }
+
+    /// A context whose `syncfs` of `quoro-vol-0` waits for `gate` and then
+    /// succeeds without the real call: these tests are about who waits, not
+    /// about the syscall. Other volumes get the real `syncfs`.
+    fn held_context(volumes: &[(&str, &str)], gate: &Arc<Gate>) -> (Arc<Context>, Arc<Calls>) {
+        let held = Arc::clone(gate);
+        let calls = Arc::new(Calls::default());
+        let counted = Arc::clone(&calls);
+        let mut context = test_context();
+        context.syncs = Arc::new(Syncs::with_syncfs(
+            self::volumes(volumes),
+            Box::new(move |serial, directory| {
+                if serial != "quoro-vol-0" {
+                    return rustix::fs::syncfs(directory);
+                }
+                let now = counted.now.fetch_add(1, Ordering::SeqCst) + 1;
+                counted.most.fetch_max(now, Ordering::SeqCst);
+                counted.total.fetch_add(1, Ordering::SeqCst);
+                held.wait();
+                counted.now.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            }),
+        ));
+        (Arc::new(context), calls)
+    }
+
+    /// Serves one session on a thread of its own and sends `first`. The
+    /// receiver gets a message once `serve` returned, which is when the
+    /// session's slot is released.
+    fn serve_in_thread(context: &Arc<Context>, first: &[u8]) -> (Client, mpsc::Receiver<()>) {
+        let (host, guest) = UnixStream::pair().unwrap_or_else(|err| panic!("pair: {err}"));
+        let shared = Arc::clone(context);
+        let (done, ended) = channel();
+        thread::spawn(move || {
+            serve(guest, &shared, &test_helper(), Wait::Direct);
+            let _ = done.send(());
+        });
+        let mut client = Client::new(host);
+        client.send_raw(first);
+        (client, ended)
+    }
+
+    fn running(context: &Context) -> HashSet<String> {
+        context
+            .syncs
+            .running
+            .lock()
+            .map(|running| running.clone())
+            .unwrap_or_default()
+    }
+
+    fn wait_until(what: &str, done: impl Fn() -> bool) {
+        for _ in 0..500 {
+            if done() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("{what} did not happen within 5 s");
+    }
+
+    /// The engine stops waiting after its bound and drops the connection. A
+    /// `syncfs` that does not return must not keep the session, and so one of
+    /// the init's 16 slots, nor start a second `syncfs` of the same volume
+    /// (`engine-trait.md` section 6).
+    #[test]
+    fn a_host_that_hangs_up_frees_the_session_while_syncfs_blocks() {
+        let data = TempDir::new("held");
+        let uploads = TempDir::new("free");
+        let gate = Arc::new(Gate::default());
+        let _opener = gate.opener();
+        let (context, _) = held_context(
+            &[
+                ("quoro-vol-0", &data.path()),
+                ("quoro-vol-1", &uploads.path()),
+            ],
+            &gate,
+        );
+
+        let (client, ended) = serve_in_thread(&context, &sync_frame(&["quoro-vol-0"]));
+        wait_until("the syncfs of quoro-vol-0", || {
+            running(&context).contains("quoro-vol-0")
+        });
+        drop(client);
+        assert!(
+            ended.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the session ends when the host hangs up, while its syncfs blocks"
+        );
+
+        // Another volume still syncs.
+        let (mut other, other_ended) = serve_in_thread(&context, &sync_frame(&["quoro-vol-1"]));
+        while other.pump() {}
+        assert!(other.synced, "error: {:?}", other.error);
+        assert!(other_ended.recv_timeout(Duration::from_secs(5)).is_ok());
+
+        // A sync of the held volume waits for it, then is refused, without
+        // starting a second syncfs.
+        let started = std::time::Instant::now();
+        let (mut again, again_ended) = serve_in_thread(&context, &sync_frame(&["quoro-vol-0"]));
+        while again.pump() {}
+        let message = again.error.clone().unwrap_or_default();
+        assert!(message.contains("has not returned"), "{message:?}");
+        assert!(!again.synced);
+        assert!(
+            started.elapsed() >= BUSY_WAIT - Duration::from_millis(100),
+            "refused after {:?}, before the wait",
+            started.elapsed()
+        );
+        assert!(again_ended.recv_timeout(Duration::from_secs(5)).is_ok());
+        assert_eq!(failures(&context).len(), 1, "{:?}", failures(&context));
+    }
+
+    /// Two syncs of one volume that overlap, as a backup and a warm cycle can:
+    /// the second waits for the first and then runs its own `syncfs`, since
+    /// the first may not cover what was written since it began.
+    #[test]
+    fn an_overlapping_sync_of_a_volume_waits_and_then_syncs() {
+        let data = TempDir::new("overlap");
+        let gate = Arc::new(Gate::default());
+        let opener = gate.opener();
+        let (context, calls) = held_context(&[("quoro-vol-0", &data.path())], &gate);
+
+        let (mut first, _) = serve_in_thread(&context, &sync_frame(&["quoro-vol-0"]));
+        wait_until("the first syncfs", || {
+            calls.total.load(Ordering::SeqCst) == 1
+        });
+        let (mut second, second_ended) = serve_in_thread(&context, &sync_frame(&["quoro-vol-0"]));
+        thread::sleep(Duration::from_millis(200));
+        // The second waits: no answer, no second syncfs, the session open.
+        assert_eq!(calls.total.load(Ordering::SeqCst), 1);
+        assert!(second_ended.try_recv().is_err());
+        second
+            .stream
+            .set_nonblocking(true)
+            .unwrap_or_else(|err| panic!("nonblocking: {err}"));
+        let mut byte = [0_u8; 1];
+        assert!(
+            matches!(second.stream.read(&mut byte), Err(err) if err.kind() == io::ErrorKind::WouldBlock),
+            "the second sync answered while the first still ran"
+        );
+        second
+            .stream
+            .set_nonblocking(false)
+            .unwrap_or_else(|err| panic!("blocking: {err}"));
+
+        drop(opener);
+        while first.pump() {}
+        while second.pump() {}
+        assert!(first.synced, "error: {:?}", first.error);
+        assert!(second.synced, "error: {:?}", second.error);
+        assert_eq!(calls.total.load(Ordering::SeqCst), 2, "each ran its own");
+        assert_eq!(calls.most.load(Ordering::SeqCst), 1, "never two at once");
+        assert!(failures(&context).is_empty(), "{:?}", failures(&context));
+        wait_until("the volume to be released", || running(&context).is_empty());
+    }
+
+    /// Bytes a host sends after the sync, while the `syncfs` runs, are
+    /// discarded and do not end the session or change its answer.
+    #[test]
+    fn bytes_after_the_sync_are_discarded() {
+        let data = TempDir::new("discard");
+        let gate = Arc::new(Gate::default());
+        let opener = gate.opener();
+        let (context, _) = held_context(&[("quoro-vol-0", &data.path())], &gate);
+
+        let (mut client, ended) = serve_in_thread(&context, &sync_frame(&["quoro-vol-0"]));
+        wait_until("the syncfs", || running(&context).contains("quoro-vol-0"));
+        client.send(HostFrame::Input(b"ignored".to_vec()));
+        client.send_raw(b"not even a frame");
+        thread::sleep(Duration::from_millis(100));
+        assert!(ended.try_recv().is_err(), "stray bytes ended the session");
+        drop(opener);
+        while client.pump() {}
+        assert!(client.synced, "error: {:?}", client.error);
+        assert!(ended.recv_timeout(Duration::from_secs(5)).is_ok());
+    }
+
+    /// A `syncfs` that panics ends the connection at once with `ERROR`, and
+    /// releases the volume for the next sync.
+    #[test]
+    fn a_sync_thread_that_panics_ends_the_session_and_releases_the_volume() {
+        let data = TempDir::new("panic");
+        let panicked = Arc::new(AtomicBool::new(false));
+        let once = Arc::clone(&panicked);
+        let mut context = test_context();
+        context.syncs = Arc::new(Syncs::with_syncfs(
+            volumes(&[("quoro-vol-0", &data.path())]),
+            Box::new(move |_, directory| {
+                if !once.swap(true, Ordering::SeqCst) {
+                    panic!("a syncfs that panics");
+                }
+                rustix::fs::syncfs(directory)
+            }),
+        ));
+        let context = Arc::new(context);
+
+        let (mut client, ended) = serve_in_thread(&context, &sync_frame(&["quoro-vol-0"]));
+        while client.pump() {}
+        assert!(!client.synced);
+        assert_eq!(
+            client.error.as_deref(),
+            Some("sync: the sync thread panicked")
+        );
+        assert!(ended.recv_timeout(Duration::from_secs(5)).is_ok());
+        assert!(panicked.load(Ordering::SeqCst));
+
+        let (mut later, _) = serve_in_thread(&context, &sync_frame(&["quoro-vol-0"]));
+        while later.pump() {}
+        assert!(later.synced, "error: {:?}", later.error);
+    }
+
+    #[test]
+    fn a_sync_whose_mount_path_is_gone_is_an_error() {
+        let gone = TempDir::new("gone");
+        let path = gone.path();
+        drop(gone);
+        let (synced, error, _) = sync(&[("quoro-vol-0", &path)], &sync_frame(&["quoro-vol-0"]));
+        assert!(!synced);
+        let message = error.unwrap_or_default();
+        assert!(message.contains(&path), "{message:?}");
+    }
+
+    #[test]
+    fn a_malformed_sync_is_an_error() {
+        let mut empty = vec![SYNC];
+        let payload = br#"{"serials":[]}"#;
+        empty.extend_from_slice(&u32::try_from(payload.len()).unwrap_or(0).to_be_bytes());
+        empty.extend_from_slice(payload);
+        let (synced, error, _) = sync(&[], &empty);
+        assert!(!synced);
+        assert!(error.is_some());
+    }
+
+    #[test]
+    fn a_sync_after_the_open_is_an_error() {
+        let mut client = start(&["/bin/sh", "-c", "read line; echo never"], 24, 80);
+        client.send(HostFrame::Sync(SyncRequest {
+            serials: vec!["quoro-vol-0".to_string()],
+        }));
+        let message = client.finish_error();
+        assert!(message.contains("first frame"), "{message:?}");
+    }
+
+    #[test]
+    fn a_failing_sync_is_logged_once_per_volume_and_reason() {
+        let syncs = Syncs::new(Vec::new());
+        let eio = "sync: syncfs /data of quoro-vol-0: EIO";
+        let gone = "sync: open /srv of quoro-vol-1: ENOENT";
+        assert!(syncs.note("quoro-vol-0", Some(eio)));
+        assert!(
+            !syncs.note("quoro-vol-0", Some(eio)),
+            "the same reason again is not logged"
+        );
+        // Another volume's success and failure, alternating as warm cycles of
+        // two volumes would, log only each volume's first failure.
+        assert!(
+            !syncs.note("quoro-vol-2", None),
+            "a success is never logged"
+        );
+        assert!(syncs.note("quoro-vol-1", Some(gone)));
+        assert!(!syncs.note("quoro-vol-2", None));
+        assert!(!syncs.note("quoro-vol-0", Some(eio)));
+        assert!(!syncs.note("quoro-vol-1", Some(gone)));
+        assert!(
+            syncs.note(
+                "quoro-vol-0",
+                Some("sync: syncfs /data of quoro-vol-0: EROFS")
+            ),
+            "a new reason is logged"
+        );
+        assert!(!syncs.note("quoro-vol-0", None));
+        assert!(
+            syncs.note("quoro-vol-0", Some(eio)),
+            "a failure after that volume's success is logged again"
+        );
     }
 
     #[test]
