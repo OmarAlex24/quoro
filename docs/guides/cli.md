@@ -464,6 +464,8 @@ An agent can use the client directly, or through MCP. Both reach the same servic
 
 The user scope writes under your home directory, for every project. The project scope writes in the current folder, in a file meant to be committed. Codex reads a project's `.codex/config.toml` only in a project you trust.
 
+Cursor also loads the skills in `~/.claude/skills/` and `~/.agents/skills/`. If you install for Cursor and for Claude Code or Codex, Cursor lists the `quoro` skill twice. Both copies are the same files, so either one works.
+
 - The server entry is named `quoro`, and its command is the absolute path of the running binary. Only that entry changes. A JSON file keeps every other byte, and a TOML file keeps its comments and order. Running the command again changes nothing and says so.
 - Installing another context replaces the entry and says what it ran before.
 - The context must hold an agent key file and pin the primary's certificate. A context with a personal API token, with `tls = "system"`, or an ad-hoc `QUORO_URL` is refused, with the `quoro login --agent` command to run.
