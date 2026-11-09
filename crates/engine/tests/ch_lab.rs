@@ -1140,14 +1140,15 @@ async fn local_volume_snapshot_cycle() {
 
 /// M5b, #400: a snapshot holds a file the guest wrote without `fsync` just
 /// before it, because the engine first asks the init to flush the volume
-/// (§3.16, ADR 0282). Without the flush the file's data would still be in
-/// the guest's page cache for up to about 35 s, and the snapshot would hold
-/// an empty file or none. `flush_volume` reports each outcome (§3.22).
+/// (§3.16, ADR 0282). A copy of the volume file taken at the same moment
+/// without the flush, as every snapshot was before, lacks the file's data,
+/// which the guest still holds in its page cache. `flush_volume` reports
+/// `NoRunningVm`, `Flushed` and `Paused` from a real guest, and `NotFound`
+/// for an unknown volume (§3.22).
 #[tokio::test]
 #[ignore = "needs /dev/kvm, root and the pinned artifacts on the lab host"]
 async fn a_snapshot_holds_what_the_guest_wrote_without_fsync() {
     const WITHIN: Duration = Duration::from_secs(2);
-    const BYTES: usize = 1 << 20;
     if !enter_lab() {
         return;
     }
@@ -1156,7 +1157,7 @@ async fn a_snapshot_holds_what_the_guest_wrote_without_fsync() {
     let rootfs = prepare(&engine).await;
 
     let volume = VolumeId("vol_01HX8Z4Q2M9W7T3YV6B1C0D5FA".to_string());
-    engine.ensure_volume(&volume, 1).await.expect("ensure");
+    let created = engine.ensure_volume(&volume, 1).await.expect("ensure");
     assert_eq!(
         engine.flush_volume(&volume, WITHIN).await,
         Ok(GuestFlush::NoRunningVm),
@@ -1195,40 +1196,36 @@ async fn a_snapshot_holds_what_the_guest_wrote_without_fsync() {
         &["sh", "-c", "yes quoro | head -c 1048576 > /data/unsynced"],
     )
     .await;
+    // The control: a copy of the live volume file with no flush, taken
+    // within a second or two of the write. The guest writes such data back
+    // only after about 30 s, so the copy lacks it, as the lab saw in #400.
+    let control = std::env::temp_dir().join("quoro-lab-flush-control.img");
+    let copied = std::process::Command::new("cp")
+        .arg("--sparse=always")
+        .arg(&created.path)
+        .arg(&control)
+        .status()
+        .expect("run cp");
+    assert!(copied.success(), "copy the live volume file");
+    let unflushed = unsynced_in(&control);
+    let _ = std::fs::remove_file(&control);
+    assert!(
+        !holds_unsynced(&unflushed),
+        "a copy without the flush already holds the file ({} bytes): the guest \
+         wrote it back early, so this run proves nothing about the flush",
+        unflushed.len()
+    );
+
     let snapshot = engine
         .snapshot_volume(&volume)
         .await
         .expect("snapshot a running volume");
     assert_eq!(snapshot.guest_flush, GuestFlush::Flushed);
-
-    // Read the file as a restore would: replay the journal, then read the
-    // filesystem without mounting it.
-    let check = std::process::Command::new("e2fsck")
-        .args(["-f", "-y"])
-        .arg(&snapshot.location)
-        .output()
-        .expect("run e2fsck");
+    let flushed = unsynced_in(&snapshot.location);
     assert!(
-        matches!(check.status.code(), Some(0 | 1)),
-        "e2fsck: {}",
-        String::from_utf8_lossy(&check.stdout)
-    );
-    let read = std::process::Command::new("debugfs")
-        .args(["-R", "cat /unsynced"])
-        .arg(&snapshot.location)
-        .output()
-        .expect("run debugfs");
-    assert!(read.status.success(), "debugfs: {read:?}");
-    assert_eq!(
-        read.stdout.len(),
-        BYTES,
-        "the snapshot holds the whole file"
-    );
-    assert!(
-        read.stdout
-            .chunks(6)
-            .all(|line| line == &b"quoro\n"[..line.len()]),
-        "the snapshot holds the file's data"
+        holds_unsynced(&flushed),
+        "the snapshot holds the whole file: {} bytes",
+        flushed.len()
     );
 
     assert_eq!(
@@ -1263,6 +1260,38 @@ async fn a_snapshot_holds_what_the_guest_wrote_without_fsync() {
     net::remove_network(&tools, BRIDGE)
         .await
         .expect("remove the network");
+}
+
+/// `/unsynced` of the ext4 image `image`, read as a restore would: the
+/// journal replayed, then the filesystem read without mounting it. Empty when
+/// the file is missing.
+fn unsynced_in(image: &Path) -> Vec<u8> {
+    let check = std::process::Command::new("e2fsck")
+        .args(["-f", "-y"])
+        .arg(image)
+        .output()
+        .expect("run e2fsck");
+    assert!(
+        matches!(check.status.code(), Some(0 | 1)),
+        "e2fsck: {}",
+        String::from_utf8_lossy(&check.stdout)
+    );
+    let read = std::process::Command::new("debugfs")
+        .args(["-R", "cat /unsynced"])
+        .arg(image)
+        .output()
+        .expect("run debugfs");
+    assert!(read.status.success(), "debugfs: {read:?}");
+    read.stdout
+}
+
+/// Whether `bytes` is the whole 1 MiB of `quoro` lines the guest wrote, not a
+/// shorter file or one whose blocks were never written.
+fn holds_unsynced(bytes: &[u8]) -> bool {
+    bytes.len() == 1 << 20
+        && bytes
+            .chunks(6)
+            .all(|line| line == &b"quoro\n"[..line.len()])
 }
 
 /// M5a: on a data directory without reflink the volume pool gives `Reflink`

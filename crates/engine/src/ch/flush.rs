@@ -525,16 +525,29 @@ mod tests {
 
     #[tokio::test]
     async fn any_other_error_is_failed() {
-        let run = run(
-            "error",
-            Info::State("Running"),
-            Some(Guest::Answers(frame(&GuestFrame::Error(
-                "sync: syncfs /data: I/O error".to_owned(),
-            )))),
-            WITHIN,
-        )
-        .await;
-        assert_eq!(run.outcome, GuestFlush::Failed);
+        // Only the exact old wording is `Unsupported`: not the new init's
+        // own first-frame error, and not a near match.
+        for (tag, message) in [
+            ("syncfs", "sync: syncfs /data of quoro-vol-0: EIO"),
+            (
+                "busy",
+                "sync: an earlier syncfs of quoro-vol-0 has not returned",
+            ),
+            ("new", "the first frame must be open or sync, got type 6"),
+            ("longer", "the first frame must be open, got type 5."),
+            ("other", "the first frame must be open, got type 6"),
+        ] {
+            let run = run(
+                tag,
+                Info::State("Running"),
+                Some(Guest::Answers(frame(&GuestFrame::Error(
+                    message.to_owned(),
+                )))),
+                WITHIN,
+            )
+            .await;
+            assert_eq!(run.outcome, GuestFlush::Failed, "{tag}");
+        }
     }
 
     #[tokio::test]
@@ -563,12 +576,20 @@ mod tests {
 
     #[tokio::test]
     async fn a_vmm_that_cannot_tell_the_state_is_failed() {
+        // The guest would answer, so only the `/vm.info` check can fail it.
         for (tag, info) in [
             ("info500", Info::Fails),
             ("created", Info::State("Created")),
         ] {
-            let run = run(tag, info, None, WITHIN).await;
+            let run = run(
+                tag,
+                info,
+                Some(Guest::Answers(frame(&GuestFrame::Synced))),
+                WITHIN,
+            )
+            .await;
             assert_eq!(run.outcome, GuestFlush::Failed, "{tag}");
+            assert_eq!(run.sent, None, "{tag}: the guest got a sync frame");
         }
     }
 
