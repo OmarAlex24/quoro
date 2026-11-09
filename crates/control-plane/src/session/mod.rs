@@ -747,10 +747,10 @@ impl NodeHub {
     ///
     /// The grant has the mode the app's HA policy wants: `expiring` for a
     /// `warm` or `hot` app while voters support it, `local` for any other
-    /// app ([`leases::grant_app_lease`]). A grant that would carry the row's
-    /// unsettled mark, a `warm` app's without support among them, gives
-    /// nothing back on this session ([`leases::NewGrant::Held`]); the node's
-    /// next `hello` tries again.
+    /// app ([`leases::grant_app_lease`]). A grant held until its write is
+    /// replicated, a `warm` app's without support among them, gives nothing
+    /// back on this session ([`leases::NewGrant::Held`]); the node's next
+    /// `hello` tries again.
     pub(crate) async fn regrant_lease(
         &self,
         node_id: &str,
@@ -823,14 +823,15 @@ impl NodeHub {
         {
             leases::NewGrant::Granted(lease) => *lease,
             leases::NewGrant::GateOpen(remaining) => return Ok(Regrant::Wait(remaining)),
-            // Section 8.4, "The holder fenced first": without majority
-            // support the primary sends nothing. The row is unchanged, so the
+            // Held until its write is replicated (section 8.4): nothing is
+            // sent, as "The holder fenced first" step 4 says for a session
+            // start without majority support. The row is unchanged, so the
             // node's next `hello` reports the expiry again and tries again.
             leases::NewGrant::Held => {
                 tracing::info!(
                     node_id,
                     lease_id,
-                    "a regrant that would carry the unsettled mark waits for the node's next session"
+                    "a held regrant waits for the node's next session"
                 );
                 return Ok(Regrant::No);
             }
@@ -3048,6 +3049,13 @@ impl Session {
     /// token would be refused as well. A same-token `local` grant of a lease the `hello` listed `held`
     /// or `uncertain` at that token is noted, so its refusal gives the lease
     /// back.
+    ///
+    /// An `expiring` lease the `hello` listed `held` or `uncertain` at the
+    /// row's token or above gets no grant: the node renews it, and a
+    /// same-token `expiring` grant without `re` has no row in the node state
+    /// machine (section 8.4). One the node does not hold at that token gets
+    /// its first grant again only through the authority
+    /// ([`Session::resent_first_grant`]).
     async fn send_grants(&mut self, outbox: &mut Vec<String>) {
         let mut conn = match self.hub.0.store.pool().acquire().await {
             Ok(conn) => conn,
@@ -3104,6 +3112,19 @@ impl Session {
                         Some(("revoked", _)) => continue,
                         _ => {}
                     }
+                    if lease.mode == "expiring" {
+                        let holds = reported.as_ref().is_some_and(|(state, claimed)| {
+                            *claimed >= token && (state == "held" || state == "uncertain")
+                        });
+                        if !holds && let Some(grant) = self.resent_first_grant(&lease) {
+                            outbox.push(
+                                ControlMessage::LeaseGrant(grant)
+                                    .to_frame(&new_msg_id(), None)
+                                    .to_text(),
+                            );
+                        }
+                        continue;
+                    }
                     let id = new_msg_id();
                     if lease.mode == "local"
                         && reported.is_some_and(|(state, claimed)| {
@@ -3128,6 +3149,38 @@ impl Session {
                 );
             }
         }
+    }
+
+    /// The first grant of an `expiring` lease that names this node at the
+    /// row's token, sent again because the node does not hold the lease at
+    /// that token: the grant was lost with a session, or never arrived. Like
+    /// any `expiring` grant, it goes out only once the authority records it
+    /// under majority support (section 8.8), which extends this holder's
+    /// gate to cover it ("What the authority must enforce"). It is not gated:
+    /// the gate is this holder's own, at the same token. It carries the
+    /// stored duration, so it is no longer than the row (ADR 0268). `None`
+    /// when the authority refuses it; the node's next session tries again.
+    fn resent_first_grant(&self, lease: &leases::Lease) -> Option<quoro_proto::LeaseGrant> {
+        use crate::authority::{Grant, GrantKind};
+        let duration_ms = u64::try_from(lease.duration_ms?).ok()?;
+        let sent_wall = time::OffsetDateTime::now_utc();
+        if let Err(refused) = self.hub.0.authority.record_grant(&Grant {
+            lease_id: &lease.id,
+            holder: &self.node_id,
+            duration_ms,
+            kind: GrantKind::Renewal,
+            sent_wall,
+        }) {
+            tracing::info!(
+                lease_id = %lease.id,
+                ?refused,
+                "an expiring lease's first grant is not sent again"
+            );
+            return None;
+        }
+        let mut grant = lease.grant();
+        grant.granted_at = crate::store::format_rfc3339(sent_wall);
+        Some(grant)
     }
 
     /// Gives `lease_id` back to this node at a token above `token`, the row's

@@ -381,8 +381,9 @@ pub(crate) async fn create_volume(
                 remaining.as_secs() + 1
             )));
         }
-        // Section 8.4, "Grants of a marked row", says the grant waits. This
-        // build cannot count what it waits for, so nothing is created.
+        // Section 8.4 ("Grants of a marked row", ADR 0268) says the grant
+        // waits. This build cannot count what it waits for, so nothing is
+        // created.
         leases::NewGrant::Held => {
             return Err(ApiError::conflict(
                 "the app's lease cannot be granted yet: this grant needs majority voter support \

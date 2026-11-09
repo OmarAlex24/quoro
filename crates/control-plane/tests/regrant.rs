@@ -659,8 +659,8 @@ async fn a_lease_the_row_does_not_give_the_node_is_not_given_back() {
 /// Section 8.5: a same-token `local` grant the node refuses with
 /// `bad_message`, on a session whose `hello` listed the lease `held` or
 /// `uncertain` at that token, means the lease expired on its way: it is
-/// given back. Another refusal code, or a refused grant of an `expiring`
-/// row, gives nothing back.
+/// given back. Another refusal code gives nothing back, and an `expiring`
+/// row gets no same-token grant to refuse.
 #[tokio::test]
 async fn a_refused_same_token_grant_gives_the_lease_back() {
     let server = start_with_patient_node_session().await;
@@ -711,7 +711,9 @@ async fn a_refused_same_token_grant_gives_the_lease_back() {
     assert_eq!(grants_of(&frames, &lease_id), vec![token + 2]);
     drop(socket);
 
-    // An `expiring` row's same-token grant is not a `local` one.
+    // An `expiring` row listed `held` gets no same-token grant at all
+    // (section 8.4), so there is nothing to refuse, and nothing is given
+    // back.
     run(
         &server,
         "UPDATE leases SET mode = 'expiring', duration_ms = 15000 WHERE id = ?",
@@ -720,10 +722,7 @@ async fn a_refused_same_token_grant_gives_the_lease_back() {
     .await;
     let (mut socket, frames) =
         reconnect(&server, &node, &app_id, &lease_id, token + 2, "held").await;
-    let grant = of_type(&frames, "lease_grant")[0];
-    assert_eq!(grant["body"]["fencing_token"], token + 2);
-    let grant_id = grant["id"].as_str().unwrap().to_string();
-    send(&mut socket, refuse(ErrorCode::BadMessage), Some(&grant_id)).await;
+    assert!(grants_of(&frames, &lease_id).is_empty(), "{frames:?}");
     let frames = frames_until_settled(&mut socket).await;
     assert!(grants_of(&frames, &lease_id).is_empty(), "{frames:?}");
     assert_eq!(
@@ -736,7 +735,9 @@ async fn a_refused_same_token_grant_gives_the_lease_back() {
 /// has passed, on the same session: a `warm` app with voter support gets it
 /// back `expiring`. A `cold` app's `local` regrant over that row would set
 /// the row's unsettled mark ("The mark"), so it is not given back on that
-/// session, even after the gate, and nothing is written.
+/// session, even after the gate, and nothing is written. The row stores `D`;
+/// the seed counts the gate at 3 s, the test's shortcut for a gate that has
+/// run most of its course.
 #[tokio::test]
 async fn an_expiring_rows_regrant_waits_for_its_gate() {
     let server = start_with_patient_node_session().await;
@@ -744,7 +745,7 @@ async fn an_expiring_rows_regrant_waits_for_its_gate() {
     let (node, app_id, lease_id, token) = node_with_lease(&server, &owner).await;
     run(
         &server,
-        "UPDATE leases SET mode = 'expiring', duration_ms = 3000 WHERE id = ?",
+        "UPDATE leases SET mode = 'expiring', duration_ms = 15000 WHERE id = ?",
         &lease_id,
     )
     .await;
@@ -795,12 +796,14 @@ async fn an_expiring_rows_regrant_waits_for_its_gate() {
 
 /// The regrant has the mode the app's HA policy wants (D-0047, #604): a
 /// `cold` app's lease comes back `local`, with or without voter support, and
-/// a `warm` app's `expiring` with duration `D` while voters support it. The
-/// node then renews at once (section 8.4, "First grant"), and the primary
-/// answers that renewal. Without support, a `warm` or `hot` app's lease
-/// would come back `local`, a write that sets the row's unsettled mark
-/// (ADR 0285): nothing is given back on that session and nothing is
-/// written, and the node's next `hello` tries again.
+/// a `warm` app's `expiring` with duration `D` while voters support it, over
+/// a row that stores `D`. The node then renews at once (section 8.4, "First
+/// grant"), and the primary answers that renewal. A held regrant gives
+/// nothing back on that session and writes nothing, and the node's next
+/// `hello` tries again: without support a `warm` or `hot` app's lease would
+/// come back `local`, a write that sets the row's unsettled mark
+/// (ADR 0285), and with support over a row that stores no duration it would
+/// raise it (ADR 0268).
 #[tokio::test]
 async fn the_regrant_has_the_mode_the_policy_wants() {
     let server = start_with_patient_node_session().await;
@@ -846,10 +849,27 @@ async fn the_regrant_has_the_mode_the_policy_wants() {
         drop(socket);
     }
 
-    // With support, `expiring`. The new holder's gate then holds every later
-    // new token for `D + 2M`, so this case comes last.
+    // With support, over the `local` row that stores no duration, the
+    // `expiring` regrant would raise it (ADR 0268), so it is held too.
     set_policy(&server, &app_id, "warm").await;
     support(&server, true);
+    let (socket, frames) = reconnect(&server, &node, &app_id, &lease_id, current, "expired").await;
+    assert!(grants_of(&frames, &lease_id).is_empty(), "{frames:?}");
+    assert_eq!(
+        row(&server, &lease_id).await,
+        (i64::try_from(current).unwrap(), None, "local".to_string()),
+        "a raise: nothing was written"
+    );
+    drop(socket);
+
+    // Over a row that stores `D`, `expiring`. The new holder's gate then
+    // holds every later new token for `D + 2M`, so this case comes last.
+    run(
+        &server,
+        "UPDATE leases SET mode = 'expiring', duration_ms = 15000 WHERE id = ?",
+        &lease_id,
+    )
+    .await;
     let (mut socket, frames) =
         reconnect(&server, &node, &app_id, &lease_id, current, "expired").await;
     assert_eq!(
@@ -888,6 +908,76 @@ async fn the_regrant_has_the_mode_the_policy_wants() {
     assert_eq!(answers.len(), 1, "{frames:?}");
     assert_eq!(answers[0]["body"]["fencing_token"], current);
     assert_eq!(answers[0]["body"]["mode"], "expiring");
+}
+
+/// A new session of `node` whose `hello` lists no lease. Returns the socket
+/// and every frame up to the end of the session start.
+async fn session_listing_nothing(server: &Server, node: &Enrolled) -> (Socket, Vec<Value>) {
+    let mut socket = connect(server, &node.credential).await;
+    send(&mut socket, hello(&node.node_id, Vec::new()), None).await;
+    let mut frames = recv_until(&mut socket, &["welcome", "desired_state"]).await;
+    frames.extend(frames_until_settled(&mut socket).await);
+    (socket, frames)
+}
+
+/// Section 8.4: a holder that lists its `expiring` lease `held` or
+/// `uncertain` at the row's token gets no grant at a session start: it
+/// renews, and a same-token `expiring` grant without `re` has no row in the
+/// node state machine. A holder that does not list the lease gets its first
+/// grant again, without `re`, only while voters support the primary
+/// (section 8.8). The authority records it, so the holder's gate covers it,
+/// and the node's renewal is answered.
+#[tokio::test]
+async fn an_expiring_lease_is_granted_again_only_to_a_holder_that_lacks_it() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let (node, app_id, lease_id, token) = node_with_lease(&server, &owner).await;
+    run(
+        &server,
+        "UPDATE leases SET mode = 'expiring', duration_ms = 15000 WHERE id = ?",
+        &lease_id,
+    )
+    .await;
+    set_policy(&server, &app_id, "warm").await;
+    let passed = || server.state.hub.authority().passed(&lease_id);
+
+    support(&server, true);
+    for state in ["held", "uncertain"] {
+        let (socket, frames) = reconnect(&server, &node, &app_id, &lease_id, token, state).await;
+        assert!(
+            grants_of(&frames, &lease_id).is_empty(),
+            "{state}: {frames:?}"
+        );
+        drop(socket);
+    }
+    assert!(passed(), "nothing was recorded");
+
+    support(&server, false);
+    let (socket, frames) = session_listing_nothing(&server, &node).await;
+    assert!(grants_of(&frames, &lease_id).is_empty(), "{frames:?}");
+    assert!(passed(), "nothing was recorded");
+    drop(socket);
+
+    support(&server, true);
+    let (mut socket, frames) = session_listing_nothing(&server, &node).await;
+    assert_eq!(grants_of(&frames, &lease_id), vec![token], "{frames:?}");
+    let grant = of_type(&frames, "lease_grant")
+        .into_iter()
+        .find(|frame| frame["body"]["lease_id"] == lease_id.as_str())
+        .unwrap();
+    assert_eq!(grant["body"]["mode"], "expiring");
+    assert_eq!(grant["body"]["duration_ms"], 15_000);
+    assert!(grant.get("re").is_none_or(Value::is_null), "{grant}");
+    assert!(!passed(), "the holder's gate covers the grant");
+
+    let renewal = send(&mut socket, renew(&lease_id, token), None).await;
+    let frames = frames_until_settled(&mut socket).await;
+    let answers: Vec<&Value> = of_type(&frames, "lease_grant")
+        .into_iter()
+        .filter(|frame| frame["re"] == renewal.as_str())
+        .collect();
+    assert_eq!(answers.len(), 1, "{frames:?}");
+    assert_eq!(answers[0]["body"]["fencing_token"], token);
 }
 
 /// A regrant that waits for a gate decides again once the gate has passed:
@@ -931,7 +1021,7 @@ async fn a_waiting_regrant_gives_nothing_back_once_the_row_changed() {
     ];
     for (case, change) in changes {
         sqlx::query(
-            "UPDATE leases SET mode = 'expiring', duration_ms = 3000, holder_node_id = ?, \
+            "UPDATE leases SET mode = 'expiring', duration_ms = 15000, holder_node_id = ?, \
              fencing_token = ?, revoked_at = NULL WHERE id = ?",
         )
         .bind(&node.node_id)

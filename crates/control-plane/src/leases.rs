@@ -487,12 +487,13 @@ pub(crate) enum NewGrant {
     /// The previous holder's gate is open for this long (section 8.4).
     /// Nothing is written or recorded.
     GateOpen(std::time::Duration),
-    /// The write would carry the row's unsettled mark (section 8.4, "The
-    /// mark", ADR 0280, ADR 0285), so its grant could go out only once that
-    /// write is replicated over the machines with the `node` role and while
-    /// a majority of voters supports the primary ("Grants of a marked row").
-    /// This build counts neither, so nothing is written or recorded, and the
-    /// caller tries again later.
+    /// The grant could go out only once its write is replicated over the
+    /// machines with the `node` role: the write would carry the row's
+    /// unsettled mark (section 8.4, "The mark", ADR 0280, ADR 0285), whose
+    /// grant also needs majority voter support ("Grants of a marked row"), or
+    /// it raises the row's `duration_ms` (ADR 0268). This build counts
+    /// neither replication nor support, so nothing is written or recorded,
+    /// and the caller tries again later.
     Held,
 }
 
@@ -512,6 +513,15 @@ pub(crate) enum NewGrant {
 ///   a row that reads `expiring`, which sets it too; and any new token of a
 ///   row that already carries it, because no write with a new token clears
 ///   it.
+/// - **The raise.** An `expiring` new token over a row that stores no
+///   duration, or one shorter than `D`, is [`NewGrant::Held`] too: it is a
+///   grant longer than the stored duration, which goes out only once the
+///   raise is replicated over the machines with the `node` role (section
+///   8.4, "What the authority must enforce", ADR 0268). A successor that
+///   lacked the write would count the old row's shorter gate, or none, also
+///   one promoted with `--ack-fence` (section 7.3). So in this build an
+///   `expiring` new token goes out only over a row that already reads
+///   `expiring` for at least `D`.
 /// - **Gate.** Whatever the new mode, a new token waits until the previous
 ///   `expiring` holder's gate has passed on the authority's clock (section
 ///   8.4): [`NewGrant::GateOpen`].
@@ -592,7 +602,15 @@ pub(crate) async fn grant_app_lease(
     let was_expiring = previous
         .as_ref()
         .is_some_and(|previous| previous.mode == "expiring");
-    if marked || (warm && keep_local) || (!warm && was_expiring) {
+    // ADR 0268: an `expiring` grant longer than the stored duration goes out
+    // only once the raise is replicated over the machines with the `node`
+    // role, so that every possible next primary counts its gate.
+    let raises = warm
+        && previous
+            .as_ref()
+            .and_then(|previous| previous.duration_ms)
+            .is_none_or(|stored| stored < i64::try_from(DEFAULT_DURATION_MS).unwrap_or(i64::MAX));
+    if marked || (warm && keep_local) || (!warm && was_expiring) || raises {
         return Ok(NewGrant::Held);
     }
     let sent_wall = time::OffsetDateTime::now_utc();

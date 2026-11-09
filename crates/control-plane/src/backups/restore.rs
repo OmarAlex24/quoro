@@ -378,9 +378,9 @@ async fn restore_ready(
     // `grant_app_lease` takes the app's last token, revoked or not, and adds
     // one, so the target node's token is strictly higher than the old one
     // (section 8.6). The old holder released the lease, so the grant's mode
-    // is free (ADR 0258). A gate that is open after all, or a grant that
-    // would carry the row's unsettled mark (a `warm` app's without voter
-    // support, section 8.4, "Grants of a marked row"), leaves everything
+    // is free (ADR 0258). A gate that is open after all, or a grant held
+    // until its write is replicated (`NewGrant::Held`: the unsettled mark or
+    // a raise of the stored duration, section 8.4), leaves everything
     // unwritten, and the node's next report, at most 30 s away (section 5.3),
     // tries again.
     let lease = match leases::grant_app_lease(

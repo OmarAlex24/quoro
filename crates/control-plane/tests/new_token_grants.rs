@@ -373,67 +373,108 @@ async fn mode_and_duration(server: &Server, lease_id: &str) -> (String, Option<i
         .unwrap()
 }
 
-/// #604, section 8.4 "First grant": a `warm` or `hot` app's first volume
-/// gets its lease `expiring` for `D` while a majority of voters supports
-/// `D`, with the row written first, and the node's first renewal is
-/// answered. A `cold` app's lease is `local`, with or without that support.
+/// Gives the app a released lease whose row reads `expiring` for `D`: a
+/// first volume while the app's policy is `none`, deleted, its revoke
+/// answered, then the row set as an `expiring` lease's reads. The authority
+/// keeps no gate for it, as once its gate has passed. Then sets the app's
+/// policy to `policy`. Returns the lease id.
+async fn released_expiring_lease(
+    server: &Server,
+    owner: &reqwest::Client,
+    socket: &mut Socket,
+    app_id: &str,
+    policy: &str,
+) -> String {
+    let set_policy = |policy: &str| {
+        sqlx::query("UPDATE apps SET ha_policy = ? WHERE id = ?")
+            .bind(policy.to_string())
+            .bind(app_id.to_string())
+            .execute(server.state.store.pool())
+    };
+    set_policy("none").await.unwrap();
+    let (volume_id, grant) = volume_and_grant(server, owner, socket, app_id).await;
+    let lease_id = grant["body"]["lease_id"].as_str().unwrap().to_string();
+    let revoke_id = delete_volume(server, owner, socket, &volume_id).await;
+    send(socket, ok_result(), Some(&revoke_id)).await;
+    frames_until_settled(socket).await;
+    sqlx::query("UPDATE leases SET mode = 'expiring', duration_ms = 15000 WHERE id = ?")
+        .bind(&lease_id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+    set_policy(policy).await.unwrap();
+    lease_id
+}
+
+/// #604, section 8.4 "First grant": a `cold` app's lease is `local`, with
+/// or without voter support. A `warm` or `hot` app's new token is `expiring`
+/// for `D` while a majority of voters supports `D`, over a previous row that
+/// already stores `D` (ADR 0268), with the row written first, and the node's
+/// first renewal is answered.
 #[tokio::test]
 async fn a_new_volume_gets_the_mode_the_policy_wants() {
     let server = start_with_patient_node_session().await;
     let owner = server.owner().await;
     let (_node, mut socket, project_id) = connected_node(&server, &owner).await;
 
-    for (name, policy, supported, mode) in [
-        ("web-cold", "cold", true, "local"),
-        ("web-cold-alone", "cold", false, "local"),
-        ("web-warm", "warm", true, "expiring"),
-        ("web-hot", "hot", true, "expiring"),
-    ] {
+    for (name, supported) in [("web-cold", true), ("web-cold-alone", false)] {
         set_support(&server, supported);
-        let app_id = app_with_policy(&server, &owner, &project_id, name, policy).await;
+        let app_id = app_with_policy(&server, &owner, &project_id, name, "cold").await;
         let (_, grant) = volume_and_grant(&server, &owner, &mut socket, &app_id).await;
-        assert_eq!(grant["body"]["mode"], mode, "{name}: {grant}");
+        assert_eq!(grant["body"]["mode"], "local", "{name}: {grant}");
         assert_eq!(grant["body"]["fencing_token"], 1, "{name}");
+        assert!(grant["body"].get("duration_ms").is_none(), "{name}");
         let lease_id = grant["body"]["lease_id"].as_str().unwrap();
-        if mode == "expiring" {
-            assert_eq!(grant["body"]["duration_ms"], 15_000, "{name}");
-            assert_eq!(
-                mode_and_duration(&server, lease_id).await,
-                ("expiring".to_string(), Some(15_000)),
-                "{name}"
-            );
-            let renewal = send(&mut socket, renew(lease_id, 1), None).await;
-            let frames = frames_until_settled(&mut socket).await;
-            let answers: Vec<&Value> = frames
-                .iter()
-                .filter(|frame| frame["type"] == "lease_grant" && frame["re"] == renewal.as_str())
-                .collect();
-            assert_eq!(answers.len(), 1, "{name}: {frames:?}");
-        } else {
-            assert!(grant["body"].get("duration_ms").is_none(), "{name}");
-            assert_eq!(
-                mode_and_duration(&server, lease_id).await,
-                ("local".to_string(), None),
-                "{name}"
-            );
-        }
+        assert_eq!(
+            mode_and_duration(&server, lease_id).await,
+            ("local".to_string(), None),
+            "{name}"
+        );
+    }
+
+    set_support(&server, true);
+    for (name, policy) in [("web-warm", "warm"), ("web-hot", "hot")] {
+        let app_id = app_with_policy(&server, &owner, &project_id, name, policy).await;
+        let lease_id = released_expiring_lease(&server, &owner, &mut socket, &app_id, policy).await;
+        let (_, grant) = volume_and_grant(&server, &owner, &mut socket, &app_id).await;
+        assert_eq!(grant["body"]["mode"], "expiring", "{name}: {grant}");
+        assert_eq!(grant["body"]["fencing_token"], 2, "{name}");
+        assert_eq!(grant["body"]["duration_ms"], 15_000, "{name}");
+        assert_eq!(
+            mode_and_duration(&server, &lease_id).await,
+            ("expiring".to_string(), Some(15_000)),
+            "{name}"
+        );
+        let renewal = send(&mut socket, renew(&lease_id, 2), None).await;
+        let frames = frames_until_settled(&mut socket).await;
+        let answers: Vec<&Value> = frames
+            .iter()
+            .filter(|frame| frame["type"] == "lease_grant" && frame["re"] == renewal.as_str())
+            .collect();
+        assert_eq!(answers.len(), 1, "{name}: {frames:?}");
     }
 }
 
-/// Section 8.4, "The mark" (ADR 0285): without voter support, a `warm` or
-/// `hot` app's new token would be `local`, a write that sets the row's
-/// unsettled mark, and a marked row's grant waits for majority support and
-/// for the write's replication. This build counts neither, so `createVolume`
-/// answers `conflict` and creates nothing. With support, the same request
-/// gets the lease `expiring`.
+/// Section 8.4: a `warm` or `hot` app's first volume has no previous lease
+/// row. Without voter support its new token would be `local`, a write that
+/// sets the row's unsettled mark ("The mark", ADR 0285). With support it
+/// would be `expiring` for `D` over a row that stored no duration, a raise
+/// (ADR 0268). Either grant goes out only once its write is replicated over
+/// the machines with the `node` role, which this build cannot count, so
+/// `createVolume` answers `conflict` and creates nothing.
 #[tokio::test]
-async fn a_warm_apps_new_volume_waits_for_voter_support() {
+async fn a_warm_apps_first_volume_creates_nothing_while_its_grant_is_held() {
     let server = start_with_patient_node_session().await;
     let owner = server.owner().await;
     let (_node, mut socket, project_id) = connected_node(&server, &owner).await;
 
-    for (name, policy) in [("web-warm", "warm"), ("web-hot", "hot")] {
-        set_support(&server, false);
+    for (name, policy, supported) in [
+        ("web-warm-alone", "warm", false),
+        ("web-hot-alone", "hot", false),
+        ("web-warm", "warm", true),
+        ("web-hot", "hot", true),
+    ] {
+        set_support(&server, supported);
         let app_id = app_with_policy(&server, &owner, &project_id, name, policy).await;
         let detail = conflict_detail(create_volume(&server, &owner, &app_id).await).await;
         assert!(detail.contains("cannot be granted yet"), "{name}: {detail}");
@@ -451,30 +492,29 @@ async fn a_warm_apps_new_volume_waits_for_voter_support() {
             !frames.iter().any(|frame| frame["type"] == "lease_grant"),
             "{name}: {frames:?}"
         );
-
-        set_support(&server, true);
-        let (_, grant) = volume_and_grant(&server, &owner, &mut socket, &app_id).await;
-        assert_eq!(grant["body"]["mode"], "expiring", "{name}: {grant}");
-        assert_eq!(grant["body"]["fencing_token"], 1, "{name}");
     }
 }
 
 /// Section 8.4, #604: a new token waits until the previous `expiring`
 /// holder's gate has passed. `createVolume` answers `conflict` meanwhile and
 /// writes nothing; once the gate has passed, a `warm` app with voter support
-/// gets the next token `expiring`. Two new tokens stay held after the gate
-/// too, because their write would set the row's unsettled mark ("The
-/// mark"): a `local` one over the row that reads `expiring`, for a `none`
-/// app, and a `warm` app's without support.
+/// gets the next token `expiring` over a row that stores `D`. Three new
+/// tokens stay held after the gate too, because each goes out only once its
+/// write is replicated: an `expiring` one over a row that stores less than
+/// `D` (a raise, ADR 0268), a `local` one over the row that reads
+/// `expiring`, for a `none` app ("The mark"), and a `warm` app's without
+/// support ("The mark", ADR 0285). The seed counts the gate at 3 s, the
+/// test's shortcut for a gate that has run most of its course.
 #[tokio::test]
 async fn a_new_volume_waits_for_the_previous_expiring_holders_gate() {
     let server = start_with_patient_node_session().await;
     let owner = server.owner().await;
     let (node, mut socket, project_id) = connected_node(&server, &owner).await;
-    for (name, policy, supported, mode) in [
-        ("web-warm", "warm", true, Some("expiring")),
-        ("web-none", "none", false, None),
-        ("web-warm-alone", "warm", false, None),
+    for (name, policy, supported, stored, mode) in [
+        ("web-warm", "warm", true, 15_000, Some("expiring")),
+        ("web-warm-short", "warm", true, 3_000, None),
+        ("web-none", "none", false, 15_000, None),
+        ("web-warm-alone", "warm", false, 15_000, None),
     ] {
         set_support(&server, supported);
         let app_id = app_with_policy(&server, &owner, &project_id, name, "none").await;
@@ -492,7 +532,8 @@ async fn a_new_volume_waits_for_the_previous_expiring_holders_gate() {
 
         // The lease was `expiring`: its gate passes 5 s after the seed (3 s
         // and two margins of 1 s).
-        sqlx::query("UPDATE leases SET mode = 'expiring', duration_ms = 3000 WHERE id = ?")
+        sqlx::query("UPDATE leases SET mode = 'expiring', duration_ms = ? WHERE id = ?")
+            .bind(stored)
             .bind(&lease_id)
             .execute(server.state.store.pool())
             .await
@@ -561,8 +602,9 @@ async fn refused_unwritten(
 /// the revoke of the app's previous lease on its session, so the node takes
 /// it once it has answered that revoke, with the lease `revoked`, and the
 /// grant's mode is free. A `warm` app with voter support gets the new token
-/// `expiring` although its previous lease was `local` and the revoke is not
-/// answered yet.
+/// `expiring` while the revoke is not answered yet. The previous row reads
+/// `expiring` for `D`, so the new token raises nothing (ADR 0268); the
+/// authority keeps no gate for it here, as once its gate has passed.
 #[tokio::test]
 async fn a_new_token_follows_the_revoke_of_the_previous_lease() {
     let server = start_with_patient_node_session().await;
@@ -573,6 +615,11 @@ async fn a_new_token_follows_the_revoke_of_the_previous_lease() {
     assert_eq!(first["body"]["mode"], "local");
     sqlx::query("UPDATE apps SET ha_policy = 'warm' WHERE id = ?")
         .bind(&app_id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE leases SET mode = 'expiring', duration_ms = 15000 WHERE id = ?")
+        .bind(first["body"]["lease_id"].as_str().unwrap())
         .execute(server.state.store.pool())
         .await
         .unwrap();
