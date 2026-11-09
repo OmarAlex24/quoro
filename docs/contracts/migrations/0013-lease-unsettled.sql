@@ -1,13 +1,18 @@
 -- Migration 0013: the unsettled mark of a lease row (ADR 0261, which completes
--- ADR 0255, and ADR 0280).
+-- ADR 0255, ADR 0280 and ADR 0285).
 --
 -- leases.unsettled is 1 while the row may disagree with its holder's mode, so
 -- the lease moves only as a local lease does, whatever the row's mode, and 0
--- otherwise. Two writes set it (node-agent-protocol.md section 8.4, "The
+-- otherwise. These writes set it (node-agent-protocol.md section 8.4, "The
 -- mark"):
 --
 -- - the write that ends an expiring lease's renewals, on the row it writes
 --   local, in the same transaction as the HA-policy change off warm;
+-- - any other write that turns a row whose mode is 'expiring' into 'local',
+--   at any token, such as a volume restore of a warm app, whose write
+--   revokes the expiring holder and names the target node local at a new
+--   token (section 8.3, ADR 0285). The write that records the holder's own
+--   local report is not one of them: it clears the mark (below);
 -- - the first change-log write of any restore, plain or with --accept-loss
 --   (backup-format.md section 8.2), and of any `quoro cluster promote
 --   --accept-loss` (node-agent-protocol.md section 7.3), on every row whose
