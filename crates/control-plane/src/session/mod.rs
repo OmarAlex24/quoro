@@ -814,6 +814,7 @@ impl NodeHub {
             &row.resource_id,
             node_id,
             &actor,
+            false,
         )
         .await?
         {

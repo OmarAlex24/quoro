@@ -381,13 +381,19 @@ async fn restore_ready(
     // is free (ADR 0258). A gate that is open after all leaves everything
     // unwritten, and the node's next report, at most 30 s away (section 5.3),
     // tries again.
-    let lease =
-        match leases::grant_app_lease(&mut w.tx, hub.authority(), &current.app_id, node_id, &actor)
-            .await?
-        {
-            leases::NewGrant::Granted(lease) => *lease,
-            leases::NewGrant::GateOpen(_) => return Ok(AppliedRestores::default()),
-        };
+    let lease = match leases::grant_app_lease(
+        &mut w.tx,
+        hub.authority(),
+        &current.app_id,
+        node_id,
+        &actor,
+        false,
+    )
+    .await?
+    {
+        leases::NewGrant::Granted(lease) => *lease,
+        leases::NewGrant::GateOpen(_) => return Ok(AppliedRestores::default()),
+    };
 
     // Placement follows the volume, as `createVolume` pins it (ADR 0145); the
     // app's instance moves with it.

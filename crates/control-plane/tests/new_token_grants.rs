@@ -8,7 +8,10 @@ mod common;
 use common::{Server, problem, start_with_patient_node_session};
 use futures_util::{SinkExt, StreamExt};
 use quoro_control_plane::authority::VoterSupport;
-use quoro_proto::wire::{self, Capacity as WireCapacity, Heartbeat, Kvm as WireKvm, NodeMessage};
+use quoro_proto::wire::{
+    self, Capacity as WireCapacity, Heartbeat, Kvm as WireKvm, NodeMessage, StatusReport,
+    VolumeState as WireVolumeState, VolumeStatus,
+};
 use quoro_proto::{CommandResult, CommandStatus, LeaseId, LeaseRenew};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -210,6 +213,27 @@ fn set_support(server: &Server, supported: bool) {
         Arc::new(quoro_control_plane::authority::NoVoterSupport)
     };
     server.state.hub.set_voter_support(support);
+}
+
+fn status_report(applied_rev: u64, volumes: Vec<VolumeStatus>) -> NodeMessage {
+    NodeMessage::StatusReport(StatusReport {
+        applied_rev,
+        vms: Vec::new(),
+        routes: Vec::new(),
+        capacity: WireCapacity {
+            cpus: 8,
+            memory_mb: 16_384,
+            disk_gb: 200,
+        },
+        allocated: WireCapacity::default(),
+        disk_free_gb: 90.0,
+        builds: Vec::new(),
+        edge_backends: Vec::new(),
+        backups: Vec::new(),
+        images: Vec::new(),
+        volumes,
+        warm: Vec::new(),
+    })
 }
 
 fn ok_result() -> NodeMessage {
@@ -504,4 +528,80 @@ async fn a_new_token_follows_the_revoke_of_the_previous_lease() {
     assert_eq!(frames[revoke]["body"]["fencing_token"], 1);
     assert_eq!(frames[grant]["body"]["fencing_token"], 2);
     assert_eq!(frames[grant]["body"]["mode"], "expiring", "{frames:?}");
+}
+
+/// ADR 0258 and section 8.4: a volume that failed leaves the app's lease
+/// unrevoked, so the node still holds it `local`. A new volume's token on
+/// that node keeps `local`, even for a `warm` app with voter support, and
+/// no revoke goes out.
+#[tokio::test]
+async fn a_new_token_to_a_node_that_still_holds_the_lease_stays_local() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let (_node, mut socket, project_id) = connected_node(&server, &owner).await;
+    let app_id = app_with_policy(&server, &owner, &project_id, "web", "none").await;
+    let res = create_volume(&server, &owner, &app_id).await;
+    assert_eq!(res.status(), 201, "{}", res.text().await.unwrap());
+    let volume_id = res.json::<Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let frames = recv_until(&mut socket, &["lease_grant", "desired_state"]).await;
+    let rev = frames
+        .iter()
+        .find(|frame| frame["type"] == "desired_state")
+        .unwrap()["body"]["rev"]
+        .as_u64()
+        .unwrap();
+    send(
+        &mut socket,
+        status_report(
+            rev,
+            vec![VolumeStatus {
+                volume_id: volume_id.clone(),
+                state: WireVolumeState::Failed,
+                allocated_bytes: None,
+                error: Some("the disk is full".to_string()),
+            }],
+        ),
+        None,
+    )
+    .await;
+    frames_until_settled(&mut socket).await;
+    let (state, revoked): (String, Option<String>) = sqlx::query_as(
+        "SELECT v.state, l.revoked_at FROM volumes v JOIN leases l ON l.resource_id = v.app_id \
+         WHERE v.id = ?",
+    )
+    .bind(&volume_id)
+    .fetch_one(server.state.store.pool())
+    .await
+    .unwrap();
+    assert_eq!((state.as_str(), revoked), ("failed", None));
+
+    sqlx::query("UPDATE apps SET ha_policy = 'warm' WHERE id = ?")
+        .bind(&app_id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+    set_support(&server, true);
+    let res = owner
+        .delete(server.url(&format!("/api/v1/volumes/{volume_id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 202, "{}", res.text().await.unwrap());
+    let res = create_volume(&server, &owner, &app_id).await;
+    assert_eq!(res.status(), 201, "{}", res.text().await.unwrap());
+    let mut frames = recv_until(&mut socket, &["lease_grant"]).await;
+    frames.extend(frames_until_settled(&mut socket).await);
+    assert!(
+        !frames.iter().any(|frame| frame["type"] == "lease_revoke"),
+        "{frames:?}"
+    );
+    let grant = frames
+        .iter()
+        .find(|frame| frame["type"] == "lease_grant")
+        .unwrap();
+    assert_eq!(grant["body"]["fencing_token"], 2);
+    assert_eq!(grant["body"]["mode"], "local", "{grant}");
 }

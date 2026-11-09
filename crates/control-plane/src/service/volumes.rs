@@ -353,21 +353,34 @@ pub(crate) async fn create_volume(
     )
     .await?;
 
-    // The app's previous lease, if any, was revoked with its volume, so the
-    // node took that revoke before this grant (ADR 0258).
-    let lease =
-        match leases::grant_app_lease(&mut w.tx, state.hub.authority(), app_id, &node_id, &actor)
-            .await?
-        {
-            leases::NewGrant::Granted(lease) => *lease,
-            leases::NewGrant::GateOpen(remaining) => {
-                return Err(ApiError::conflict(format!(
-                    "the app's previous lease holder may still run it for {} s more (its gate is \
+    // Deleting the app's volume revoked its previous lease, so the node took
+    // that revoke before this grant and its mode is free (ADR 0258). A
+    // volume that failed leaves the lease unrevoked: the node still holds it,
+    // so a new token keeps the mode it holds, `local` (section 8.4).
+    let keep_local = leases::app_lease(&mut w.tx, app_id)
+        .await?
+        .is_some_and(|previous| {
+            !previous.is_revoked() && previous.mode == "local" && previous.holder_node_id == node_id
+        });
+    let lease = match leases::grant_app_lease(
+        &mut w.tx,
+        state.hub.authority(),
+        app_id,
+        &node_id,
+        &actor,
+        keep_local,
+    )
+    .await?
+    {
+        leases::NewGrant::Granted(lease) => *lease,
+        leases::NewGrant::GateOpen(remaining) => {
+            return Err(ApiError::conflict(format!(
+                "the app's previous lease holder may still run it for {} s more (its gate is \
                  open); retry then",
-                    remaining.as_secs() + 1
-                )));
-            }
-        };
+                remaining.as_secs() + 1
+            )));
+        }
+    };
     ctx.append_ok(
         &mut w.tx,
         Some(Scope::AppUpdate),

@@ -507,13 +507,16 @@ pub(crate) enum NewGrant {
 ///   (`held` or `uncertain`), so its mode is free. Every caller grants only
 ///   once the previous lease ended for that node: a restore once the old
 ///   holder released it, a regrant once the node reported its expiry, and
-///   `createVolume` for an app whose volume, and so whose lease, is gone. A
-///   revoked lease's `lease_revoke` reached the node's session before this
-///   grant, or its next `hello` names the lease and gets one first (section
-///   9). The node holds a grant of that lease back until it has answered the
-///   revoke, and the lease is then `revoked`, which takes either mode
-///   (sections 4.2 rule 3, 5.12 and 5.13). An `expiring` lease whose gate
-///   has passed is held by no node, because its holder has fenced.
+///   `createVolume` once its deletion revoked the app's lease. A revoked
+///   lease's `lease_revoke` reached the node's session before this grant, or
+///   its next `hello` names the lease and gets one first (section 9). The
+///   node holds a grant of that lease back until it has answered the revoke,
+///   and the lease is then `revoked`, which takes either mode (sections 4.2
+///   rule 3, 5.12 and 5.13). An `expiring` lease whose gate has passed is
+///   held by no node, because its holder has fenced. The one exception is
+///   `keep_local`: the caller passes it when the node still holds the
+///   previous lease `local`, unrevoked, and the new token then stays `local`
+///   (section 8.4, "Changing the mode").
 ///
 /// The authority records the grant before the caller commits. A failed
 /// commit leaves it ahead of the row, so a later gate ends later than it
@@ -529,6 +532,7 @@ pub(crate) async fn grant_app_lease(
     app_id: &str,
     node_id: &str,
     actor: &Actor,
+    keep_local: bool,
 ) -> Result<NewGrant, ApiError> {
     use crate::authority::{DEFAULT_DURATION_MS, Grant, GrantKind, Refused};
     let previous = app_lease(conn, app_id).await?;
@@ -560,7 +564,7 @@ pub(crate) async fn grant_app_lease(
         .bind(app_id)
         .fetch_optional(&mut *conn)
         .await?;
-    let wants_expiring = matches!(policy.as_deref(), Some("warm" | "hot"));
+    let wants_expiring = matches!(policy.as_deref(), Some("warm" | "hot")) && !keep_local;
     let sent_wall = time::OffsetDateTime::now_utc();
     let refused = |refused: Refused| {
         ApiError::internal(&format!(
@@ -714,7 +718,7 @@ mod tests {
         let mut w = store.begin_write().await.unwrap();
         let authority = Authority::new(Arc::new(crate::authority::SystemMonotonic::default()));
         let super::NewGrant::Granted(lease) =
-            super::grant_app_lease(&mut w.tx, &authority, "app_x", &node_id, &actor)
+            super::grant_app_lease(&mut w.tx, &authority, "app_x", &node_id, &actor, false)
                 .await
                 .unwrap()
         else {
@@ -874,7 +878,7 @@ mod tests {
         // A new token waits for the gate; nothing is written meanwhile.
         authority.seed(&lease.id, holder, Some(15_000));
         let mut w = store.begin_write().await.unwrap();
-        let open = super::grant_app_lease(&mut w.tx, &authority, "app_x", holder, &actor)
+        let open = super::grant_app_lease(&mut w.tx, &authority, "app_x", holder, &actor, false)
             .await
             .unwrap();
         assert!(
@@ -885,7 +889,7 @@ mod tests {
         assert_eq!(row.fencing_token, lease.fencing_token);
         clock.advance(Duration::from_millis(18_000));
         let super::NewGrant::Granted(granted) =
-            super::grant_app_lease(&mut w.tx, &authority, "app_x", holder, &actor)
+            super::grant_app_lease(&mut w.tx, &authority, "app_x", holder, &actor, false)
                 .await
                 .unwrap()
         else {

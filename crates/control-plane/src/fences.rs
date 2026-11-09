@@ -391,7 +391,8 @@ mod tests {
         let authority = crate::authority::Authority::new(std::sync::Arc::new(
             crate::authority::SystemMonotonic::default(),
         ));
-        match crate::leases::grant_app_lease(&mut w.tx, &authority, "app_x", node_id, actor).await?
+        match crate::leases::grant_app_lease(&mut w.tx, &authority, "app_x", node_id, actor, false)
+            .await?
         {
             crate::leases::NewGrant::Granted(lease) => Ok(*lease),
             crate::leases::NewGrant::GateOpen(remaining) => panic!("a gate open for {remaining:?}"),
