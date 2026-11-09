@@ -10,7 +10,7 @@
 
 ## Context
 
-An independent review of the contract change for D-0261 found two Blockers and three Majors in its side paths, none in its core rule. A placement grant during R's wait, and the hello regrant on revoked (ADR 0264), can each let a successor that lacks a move start a second copy; a row R wrote is not marked; the log refusals run before the freeze; two pending removals keep each other in the required set.
+An independent review of the contract change for D-0261 found five gaps in its side paths, none in its core rule. A placement grant during R's wait, and the hello regrant on revoked (ADR 0264), can each let a successor that lacks a move start a second copy; a row R wrote is not marked; the log refusals run before the freeze; two pending removals keep each other in the required set.
 
 ## Decision
 
@@ -35,7 +35,7 @@ The event sequences are the reviewer's. These were checked against the text:
 - `restoreBackup` lists no refusal for a lease whose `local` write is waiting;
 - both cases that motivate ADR 0264 (an agent restart before a converted lease's first renewal was sent, and a deadline that passed while the session was down) come back `expired`, not `revoked` (section 8.4, "Agent restart").
 
-### Blocker: a placement grant moves the lease while R waits
+### A placement grant moves the lease while R waits
 
 **Text.** Section 8.4: "The lease moves only as a `local` lease does: through a revoke its holder answered, a fence acknowledgement, or a node declared lost", and "Placement grants need none, as before". `restoreBackup` revokes the holder's lease and grants the target a new `local` lease with no replication and no support.
 
@@ -50,7 +50,7 @@ The event sequences are the reviewer's. These were checked against the text:
 
 **Fix.** While R, or a regrant's own write, is not replicated, give every new-token grant of that lease R's treatment: write it first, and send it only once that write is replicated over the required set and while the primary holds majority support. The alternative is to refuse, with `409 conflict`, every operation that grants the lease to another node while `local_pending` holds. Declaring a node lost and removing a node grant nothing, so they stay as they are.
 
-### Blocker: the regrant from `hello` on `revoked` hands back a lease that was moved
+### The regrant from `hello` on `revoked` hands back a lease that was moved
 
 This is in ADR 0264's text, which D-0261 widens to an unlisted lease.
 
@@ -76,7 +76,7 @@ The rule cannot tell "the old primary revoked it and the move's grant is in entr
 
 ADR 0281, which supersedes ADR 0264, decides it.
 
-### Major: nothing persisted marks a row that R wrote
+### Nothing persisted marks a row that R wrote
 
 **Text.** "for a row that R wrote", section 8.5's "For a row that the end of an `expiring` lease's renewals wrote `local`", and "the primary cannot tell the two apart". `local_pending` is not stored. A restarted primary cannot tell an R row from a placement row, nor find R's `seq` to check its replication.
 
@@ -91,7 +91,7 @@ ADR 0281, which supersedes ADR 0264, decides it.
 
 **Fix.** Persist the mark in the row. R could set `leases.unsettled`, or a new column, that only the write following the holder's `local` report clears. While it is set, every grant of the lease gets R's treatment. Also say what a `local` report at a token above an `expiring` row does. This changes migration 0013 and the resend and regrant rules.
 
-### Major: the log checks run before the freeze, and step 4 only compares with the frozen log
+### The log checks run before the freeze, and step 4 only compares with the frozen log
 
 **Text.** Section 7.3: the refusals run "Before it changes anything", and step 4 "builds from exactly the frozen log: it checks that the freeze held, and stops if the log has changed".
 
@@ -103,7 +103,7 @@ ADR 0281, which supersedes ADR 0264, decides it.
 
 **Fix.** In step 4, re-run every log refusal (empty, quarantined, below the mark, refollowing) against the frozen log.
 
-### Major: two pending removals keep each other in the required set
+### Two pending removals keep each other in the required set
 
 **Text.** "A removed machine leaves the set only once its removal entry is itself replicated over the remaining machines of the set; until then it still counts".
 
@@ -111,41 +111,27 @@ ADR 0281, which supersedes ADR 0264, decides it.
 
 **Fix (wording).** "replicated over the machines of the set that are not removed". The reviewer checked that this stays safe for two removals in a row.
 
-### Minors
+### Smaller gaps
 
-1. **The refollowing guard and the mark.** The guard lives in `node.db`, and the mark drops to 0 at the quarantine. The order inside "the same step" is not stated. Write a value above any `seq` to the mark at the quarantine, then the `head_seq` once it is known.
-2. **A primary host reverted to a VM snapshot** comes back at the same term with a shorter log, and its nodes refollow a history without R. Say this is unsupported, or refollow only from a higher term.
-3. **The term from `check` answers.** Learning a higher term needs a second `check` at the raised term, and a rerun of the command should start from what it learned. Say so.
-4. **The freeze has no owner** after a killed command or a reboot, and a frozen agent holds back every R. Add a way to end it.
-5. **A return to `warm` on a live session while R waits** is not covered. Apply the settle there too.
-6. **"or right after it".** A crash between the policy write and R leaves an `expiring` row under a policy off `warm`. Require one transaction, or a sweep at start.
-7. **A restore with `--accept-loss`** also breaks section 8.10 rule 1 ("exactly one voter"). A fresh host with no node of its own removes every node.
-8. **Regrant details.**
+- **The refollowing guard and the mark.** The guard lives in `node.db`, and the mark drops to 0 at the quarantine. The order inside "the same step" is not stated. Write a value above any `seq` to the mark at the quarantine, then the `head_seq` once it is known.
+- **A primary host reverted to a VM snapshot** comes back at the same term with a shorter log, and its nodes refollow a history without R. Say this is unsupported, or refollow only from a higher term.
+- **The term from `check` answers.** Learning a higher term needs a second `check` at the raised term, and a rerun of the command should start from what it learned. Say so.
+- **The freeze has no owner** after a killed command or a reboot, and a frozen agent holds back every R. Add a way to end it.
+- **A return to `warm` on a live session while R waits** is not covered. Apply the settle there too.
+- **"or right after it".** A crash between the policy write and R leaves an `expiring` row under a policy off `warm`. Require one transaction, or a sweep at start.
+- **A restore with `--accept-loss`** also breaks section 8.10 rule 1 ("exactly one voter"). A fresh host with no node of its own removes every node.
+- **Regrant details.**
    - A restarted primary has no gate for a `local` R row in step 1.
    - The regrant waits on a node that is down, and that cost is not stated.
    - Step 4 at a session start without support sends neither a revoke nor a grant.
-9. **Cross-references.**
+- **Cross-references.**
    - `failoverApp`'s `lease_held` covers only a lease "still `local`", yet an unsettled row reads `expiring`.
    - `Lease` has no `unsettled` field.
    - No new-token write clears the mark.
    - `local_pending` cannot be known after a restart.
-10. **An equal-term restore** gets a `bad_message` without a term from a voter that voted in that term.
-11. **Two writes at first start:** the first write and `cluster.primary_moved`. Say which comes first, or merge them.
-
-**Nit.** `cluster.restored` has channel `cli`, but the control plane writes it at its first start; `cluster.primary_moved` uses `system`.
-
-### Shape of the work
-
-- **Design, needing a decision:**
-  - the placement grant during the wait;
-  - the regrant on `revoked`, which refines D-0264;
-  - the persisted R mark.
-- **Mechanical, once those are decided:**
-  - the log recheck in step 4;
-  - the removal wording;
-  - Minors 5, 6, 9 and 11;
-  - the nit.
-- **Each needs a sentence, as a fix or as a stated limit:** Minors 1 to 4, 7, 8 and 10.
+- **An equal-term restore** gets a `bad_message` without a term from a voter that voted in that term.
+- **Two writes at first start:** the first write and `cluster.primary_moved`. Say which comes first, or merge them.
+- `cluster.restored` has channel `cli`, but the control plane writes it at its first start; `cluster.primary_moved` uses `system`.
 
 _Some wording was changed for the public repository._
 

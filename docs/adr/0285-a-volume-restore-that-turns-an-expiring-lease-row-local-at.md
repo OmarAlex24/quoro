@@ -10,7 +10,7 @@
 
 ## Context
 
-A second independent review of the contract change for D-0261 with the D-0280 fixes found a new Blocker. A volume restore of a warm app revokes the expiring holder and grants the target local at a new token on an unmarked row, with no replication and no support, so a successor that lacks those entries fails the app over to its warm copy while the target runs it local. The core rule and the earlier fixes held; one Major and eleven Minors are mechanical.
+A second independent review of the contract change for D-0261 with the D-0280 fixes found a new path to a double run. A volume restore of a warm app revokes the expiring holder and grants the target local at a new token on an unmarked row, with no replication and no support, so a successor that lacks those entries fails the app over to its warm copy while the target runs it local. The core rule and the earlier fixes held; the other gaps it found are mechanical.
 
 ## Decision
 
@@ -29,10 +29,10 @@ A second independent review covered the contract change for D-0261 with the fixe
 
 **Earlier findings.** Every earlier finding is closed, with two exceptions:
 
-- The placement Blocker is closed for marked rows. The Blocker below is its unmarked twin.
-- The fix of the regrant on `revoked` holds for the regrant from `hello`, but a side door reopens it (Major below).
+- The placement grant during the wait is closed for marked rows. The volume restore below is its unmarked twin.
+- The fix of the regrant on `revoked` holds for the regrant from `hello`, but a side door reopens it (the raise below).
 
-### Blocker: a volume restore of a `warm` app grants `local` at a new token on an unmarked row
+### A volume restore of a `warm` app grants `local` at a new token on an unmarked row
 
 **Text.**
 
@@ -59,13 +59,13 @@ The contract names this hazard itself in "Ending the renewals": "A new token doe
 
 **Options.**
 
-- **(a) Recommended.** Any write that turns a row that reads `expiring` `local`, at any token, sets the unsettled mark as R does. A restore's write onto a `warm` app's row is the case at hand. Its grant then falls under "Grants of a marked row": the restore is not refused, and its grant waits until every machine with the `node` role holds the write and the primary holds majority support. This reuses the rule already chosen for marked rows, and it covers any later path that turns an `expiring` row `local`.
+- **(a), which the maintainer chose on 2026-11-09.** Any write that turns a row that reads `expiring` `local`, at any token, sets the unsettled mark as R does. A restore's write onto a `warm` app's row is the case at hand. Its grant then falls under "Grants of a marked row": the restore is not refused, and its grant waits until every machine with the `node` role holds the write and the primary holds majority support. This reuses the rule already chosen for marked rows, and it covers any later path that turns an `expiring` row `local`.
 - **(b)** `restoreBackup` answers `409 conflict` while the app's policy is `warm`. The operator leaves `warm` first, which runs R, and restores after. This is simple, but it closes only this one path.
 - **(c)** A restore grants in the mode the policy asks for, `expiring` for a `warm` app, so the target fences on its own deadline. This changes the restore semantics of ADR 0147 for `warm` apps.
 
 Also, state the token at which a primary revokes a non-holder that lists a lease of an unmarked row: the token the node reports, as for a marked row.
 
-### Major: the raise of a marked row's token reopens the regrant on `revoked`
+### The raise of a marked row's token reopens the regrant on `revoked`
 
 **Text.**
 
@@ -74,28 +74,30 @@ Also, state the token at which a primary revokes a non-holder that lists a lease
 
 A row raised this way has every property step 4 tests. So a later primary can send the old holder a `local` grant at the raised token, although that holder listed the lease `revoked`. The sequence needs a node enrolled in entries the successor lacks, and a reading of "reports the lease" that includes a `revoked` listing.
 
-**Fix (mechanical, within ADR 0280):**
+**Fix (within ADR 0280):**
 
 - the raise also sets `revoked_at`, as declaring a node lost does, so step 4 never sends it;
 - "reports the lease" means lists it `held` or `uncertain`;
 - state as a limit a node enrolled in entries the successor lacks.
 
-### Minors (mechanical, within ADR 0280)
+### Smaller fixes (within ADR 0280)
 
-1. Say what the statement for `quoro cluster promote --accept-loss` asserts.
-2. The regrant from `hello` takes a token above both the row's token and the one the node reports.
-3. In "The holder's next `hello`", a `local` or `expiring` report means the lease is `held` or `uncertain`.
-4. T-LEASE-16 also lists the settle among the writes that clear the mark.
-5. `failoverApp` and section 8.4 say the same thing about when a marked lease answers `lease_held`.
-6. `cluster.restored.params.term` names the term of the first write, which a restart above a `stale_term` may raise.
-7. At start, a mark at 2^53 - 1 with no refollowing state means "refollowing, head unknown".
-8. Specify the restored primary's first write further:
+- Say what the statement for `quoro cluster promote --accept-loss` asserts.
+- The regrant from `hello` takes a token above both the row's token and the one the node reports.
+- In "The holder's next `hello`", a `local` or `expiring` report means the lease is `held` or `uncertain`.
+- T-LEASE-16 also lists the settle among the writes that clear the mark.
+- `failoverApp` and section 8.4 say the same thing about when a marked lease answers `lease_held`.
+- `cluster.restored.params.term` names the term of the first write, which a restart above a `stale_term` may raise.
+- At start, a mark at 2^53 - 1 with no refollowing state means "refollowing, head unknown".
+- Specify the restored primary's first write further:
    - how the primary detects its first start after a restore, through a marker file that the first write's commit consumes;
    - how it learns of `--accept-loss` and the statement;
    - that the write is safe to repeat after a crash.
-9. A failover of a marked row whose holder is declared lost waits until that holder is removed or reports, because a lost node stays in the required set. State it, and that `failoverApp` answers once the grant is sent.
-10. After a new-token `local` grant, the mark and `local_pending` stay until the node's next session. State it.
-11. `--abort` after the new database is written: the operator moves that database aside before a rerun.
+- A failover of a marked row whose holder is declared lost waits until that holder is removed or reports, because a lost node stays in the required set. State it, and that `failoverApp` answers once the grant is sent.
+- After a new-token `local` grant, the mark and `local_pending` stay until the node's next session. State it.
+- `--abort` after the new database is written: the operator moves that database aside before a rerun.
+
+_Some wording was changed for the public repository._
 
 ## Consequences
 
