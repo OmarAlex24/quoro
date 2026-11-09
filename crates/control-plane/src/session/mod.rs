@@ -2051,8 +2051,9 @@ async fn run_session(
     peer_ip: Option<IpAddr>,
 ) {
     let (generation, mut rx, mut closed, changed) = hub.attach(&node_id);
-    // ADR 0144: the edge's WireGuard endpoint is the source address of its
-    // session, so a changed address changes every node's peer entry.
+    // ADR 0144, ADR 0266: the WireGuard endpoint of the edge and of every
+    // voter is the source address of its session, so a changed address
+    // changes its peers' entries.
     if hub.remember_session_ip(&node_id, peer_ip) {
         hub.nodes_changed_all();
     }
