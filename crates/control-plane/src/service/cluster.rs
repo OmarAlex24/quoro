@@ -95,11 +95,13 @@ pub async fn get_cluster(state: &AppState, ctx: &CallCtx) -> Result<Cluster, Api
 const REQUIRED_VOTES: i64 = 3;
 
 /// The voters of the cluster (`Cluster.votes`): every machine with the `node`
-/// or `witness` role that is not removed, connected or not (ADR 0170).
+/// or `witness` role that is not removed, connected or not, oldest enrolled
+/// first (ADR 0170). `spec.votes.voters` lists them in the same order
+/// ([`crate::voters`]).
 ///
-/// `ha_ready` stays false: the primary does not track voter support before
-/// the M5b lease work, so it cannot yet grant `expiring` leases
-/// (`node-agent-protocol.md` section 8.8).
+/// `ha_ready` is true while `count` is at least `required` and a majority of
+/// the voters supports this primary for `D` right now, so it can grant and
+/// renew `expiring` leases (`node-agent-protocol.md` section 8.8).
 ///
 /// # Errors
 ///
@@ -127,10 +129,15 @@ async fn votes(state: &AppState) -> Result<ClusterVotes, ApiError> {
     }
     let count = i64::try_from(voters.len())
         .map_err(|e| ApiError::internal(&format!("voter count: {e}")))?;
+    let ha_ready = count >= REQUIRED_VOTES
+        && state
+            .hub
+            .authority()
+            .supports(crate::authority::DEFAULT_DURATION_MS);
     Ok(ClusterVotes {
         voters,
         count,
         required: REQUIRED_VOTES,
-        ha_ready: false,
+        ha_ready,
     })
 }

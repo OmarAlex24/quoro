@@ -15,9 +15,10 @@
 //!   `leases.duration_ms`, the longest duration the primary may have granted.
 //! - **Voter support.** An `expiring` grant of duration `d`, a first grant or
 //!   the answer to a renewal, needs the support of a majority of voters whose
-//!   `max_lease_ms` is at least `d` (section 8.8). The support accounting is
-//!   not built yet, so every build refuses ([`NoVoterSupport`]); tests set
-//!   their own.
+//!   `max_lease_ms` is at least `d` (section 8.8). An authority holds none
+//!   until it is given a [`VoterSupport`]: the primary's session hub gives it
+//!   the voters' answers ([`crate::support::SupportTracker`]), and tests may
+//!   set their own.
 //!
 //! A grant is checked and recorded in one step, under one lock, before it
 //! goes out: [`Authority::record_grant`] refuses it, or counts its gate from
@@ -125,9 +126,9 @@ pub trait VoterSupport: Send + Sync + std::fmt::Debug {
     fn supports(&self, duration_ms: u64) -> bool;
 }
 
-/// The support of a primary that counts no voter support yet: none. Without
-/// support the primary sends no `expiring` grant and answers no renewal
-/// (section 8.8). Every build uses it until the support accounting lands.
+/// No support at all, what an [`Authority`] answers until it is given a
+/// [`VoterSupport`]. Without support the primary sends no `expiring` grant
+/// and answers no renewal (section 8.8).
 #[derive(Debug, Default)]
 pub struct NoVoterSupport;
 
@@ -703,10 +704,10 @@ mod tests {
         assert_eq!(second.gate_at, format_rfc3339(wall(216)));
     }
 
-    /// Section 8.8: no build counts voter support yet, so none is held and
-    /// every grant is refused; a test can set its own.
+    /// Section 8.8: a new authority holds no support, so every grant is
+    /// refused until it is given a [`VoterSupport`].
     #[test]
-    fn no_support_is_held_until_a_test_sets_it() {
+    fn no_support_is_held_until_one_is_set() {
         let authority = Authority::new(Arc::new(ManualClock::default()));
         assert!(!authority.supports(D));
         assert_eq!(

@@ -59,6 +59,7 @@ use std::sync::{Arc, Mutex};
 
 use super::drain::{self, Drains};
 use super::mesh::{MeshLookup, build_mesh};
+use crate::voters::VoterLog;
 
 /// The resolved digests, keyed by image reference, shared by every session.
 pub type DigestCache = Arc<Mutex<HashMap<String, String>>>;
@@ -115,6 +116,10 @@ struct AppInfo {
 /// the `(volume_id, app_id)` of each copy the node last reported holding as
 /// a warm node, from the primary's memory (section 5.3): one that no failover
 /// can need any more gets a `deleted` entry.
+///
+/// `voters` gives `spec.votes` and `spec.witness` (section 6.12): the voter
+/// set and its version are read when this snapshot is built, never from an
+/// older read ([`VoterLog::current`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn build_spec(
     store: &Store,
@@ -126,6 +131,7 @@ pub async fn build_spec(
     mesh_lookup: &MeshLookup<'_>,
     drains: &Drains,
     warm_copies: &[(String, String)],
+    voters: &VoterLog,
 ) -> Result<BuiltSpec, String> {
     // An edge-only machine runs no VM and has no guest subnet (ADR 0144); a
     // node still waiting for its subnet cannot be sent a snapshot yet.
@@ -360,6 +366,9 @@ pub async fn build_spec(
     // `stopped`, which the routes and the drains skip already; it is added
     // after them all the same, so neither ever reads it.
     vms.extend(standby_vms(store, data_key, node_id, &pairs, &apps, resolver, cache).await?);
+    // Section 6.12: every voter gets the whole voter set and its version, a
+    // machine with the `witness` role its `spec.witness`.
+    let (votes, witness) = voters.current(store.pool()).await?.spec_for(node_id);
 
     Ok(BuiltSpec {
         spec: Spec {
@@ -373,10 +382,8 @@ pub async fn build_spec(
             backup_repository,
             backups,
             volumes,
-            // The voters' side of section 6.12 is sent once the primary's
-            // side of section 8.8 exists; until then no machine is a voter.
-            votes: None,
-            witness: None,
+            votes,
+            witness,
         },
         held_back,
     })
@@ -1481,6 +1488,7 @@ mod tests {
             &no_mesh_lookup(),
             &Drains::default(),
             &[],
+            &VoterLog::default(),
         )
         .await
         .unwrap();
@@ -1545,6 +1553,7 @@ mod tests {
             &no_mesh_lookup(),
             &Drains::default(),
             &[],
+            &VoterLog::default(),
         )
         .await
         .unwrap();
@@ -1570,6 +1579,7 @@ mod tests {
                 &no_mesh_lookup(),
                 &Drains::default(),
                 &[],
+                &VoterLog::default(),
             )
             .await
             .is_err()
@@ -1591,6 +1601,7 @@ mod tests {
             &no_mesh_lookup(),
             &Drains::default(),
             &[],
+            &VoterLog::default(),
         )
         .await
         .unwrap();
@@ -1756,6 +1767,7 @@ mod tests {
             &no_mesh_lookup(),
             &Drains::default(),
             &[],
+            &VoterLog::default(),
         )
         .await
         .unwrap()
@@ -1776,6 +1788,7 @@ mod tests {
             &no_mesh_lookup(),
             &Drains::default(),
             &[],
+            &VoterLog::default(),
         )
         .await
         .unwrap()
@@ -1833,6 +1846,7 @@ mod tests {
             &no_mesh_lookup(),
             &Drains::default(),
             &[],
+            &VoterLog::default(),
         )
         .await
         .unwrap()
@@ -1851,6 +1865,7 @@ mod tests {
             &no_mesh_lookup(),
             &Drains::default(),
             &[],
+            &VoterLog::default(),
         )
         .await
         .unwrap()
@@ -1922,6 +1937,7 @@ mod tests {
             &no_mesh_lookup(),
             &Drains::default(),
             &[],
+            &VoterLog::default(),
         )
         .await
         .unwrap()
@@ -2080,6 +2096,7 @@ mod tests {
             &no_mesh_lookup(),
             drains,
             &[],
+            &VoterLog::default(),
         )
         .await
         .unwrap()
@@ -2445,6 +2462,7 @@ mod tests {
             &no_mesh_lookup(),
             &Drains::default(),
             copies,
+            &VoterLog::default(),
         )
         .await
         .unwrap()

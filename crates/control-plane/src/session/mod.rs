@@ -10,13 +10,15 @@
 //! M5a revokes stale or superseded leases from `hello` and grants the
 //! node's `local` app leases after the snapshot (sections 4.2 and 5.12).
 //! From M5b a machine with the `node` role follows the change log after its
-//! first snapshot ([`follow`], sections 5.14 and 7.1).
+//! first snapshot ([`follow`], sections 5.14 and 7.1), and every voter is
+//! asked for its support ([`votes`], sections 5.27 and 8.8).
 
 pub mod desired;
 pub mod drain;
 mod follow;
 mod mesh;
 pub mod serving;
+mod votes;
 
 use crate::AppState;
 use crate::changelog::{self, Actor, ActorType, Op};
@@ -40,7 +42,7 @@ use quoro_proto::wire::{self, ControlMessage, NodeMessage};
 use quoro_providers::DnsProvider;
 use serde_json::{Value, json};
 use sqlx::Row;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -68,6 +70,10 @@ const INVENTORY_RESEND_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// How long an `inventory_resend` command may take to be answered.
 const INVENTORY_RESEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How many `desired_state` frames carrying `spec.votes` one session keeps
+/// waiting for their acknowledgement (section 4.2 rule 7).
+const MAX_VOTER_SNAPSHOTS: usize = 8;
 
 /// The outbox sender of one session.
 type SessionSender = mpsc::UnboundedSender<String>;
@@ -465,6 +471,12 @@ struct HubInner {
     /// The gates of `expiring` leases and the voters' support (section 8.4,
     /// "What the authority must enforce"; section 8.8).
     authority: crate::authority::Authority,
+    /// The voter set and its version, replayed from the change log (sections
+    /// 6.12 and 8.10).
+    voters: Arc<crate::voters::VoterLog>,
+    /// The voters' support of this primary (section 8.8), which the
+    /// authority answers from unless a test replaced it.
+    support: Arc<crate::support::SupportTracker>,
     generation: AtomicU64,
     /// Test seam: snapshots to hold between their build and their send.
     snapshot_holds: Mutex<HashMap<String, Arc<SnapshotHold>>>,
@@ -524,6 +536,17 @@ impl NodeHub {
         data_key: Arc<DataKey>,
         backups: crate::backups::Backups,
     ) -> Self {
+        let voters = Arc::new(crate::voters::VoterLog::default());
+        let support = Arc::new(crate::support::SupportTracker::new(
+            Arc::new(crate::support::SystemBootClock),
+            Arc::clone(&voters),
+        ));
+        let authority = crate::authority::Authority::new(Arc::new(
+            crate::authority::SystemMonotonic::default(),
+        ));
+        // Section 8.8: the authority grants and renews `expiring` leases only
+        // while the voters' support, counted here, allows it.
+        authority.set_support(Arc::clone(&support) as Arc<dyn crate::authority::VoterSupport>);
         Self(Arc::new(HubInner {
             store,
             config,
@@ -551,9 +574,9 @@ impl NodeHub {
             disk_free_gb: Mutex::new(HashMap::new()),
             releases: leases::Releases::default(),
             unrecorded_failures: Mutex::new(HashSet::new()),
-            authority: crate::authority::Authority::new(Arc::new(
-                crate::authority::SystemMonotonic::default(),
-            )),
+            authority,
+            voters,
+            support,
             generation: AtomicU64::new(0),
             snapshot_holds: Mutex::new(HashMap::new()),
             serving_inputs: Notify::new(),
@@ -582,11 +605,59 @@ impl NodeHub {
     }
 
     /// Test seam: how this primary answers whether a majority of voters
-    /// supports it (section 8.8). Every build holds none until the support
-    /// accounting lands.
+    /// supports it (section 8.8), in place of the support its voters' answers
+    /// give ([`crate::support::SupportTracker`]).
     #[doc(hidden)]
     pub fn set_voter_support(&self, support: Arc<dyn crate::authority::VoterSupport>) {
         self.0.authority.set_support(support);
+    }
+
+    /// Test seam: the `CLOCK_BOOTTIME` the voters' support is measured on
+    /// (section 8.8, ADR 0263), set before any session starts.
+    #[doc(hidden)]
+    pub fn set_support_clock(&self, clock: Arc<dyn crate::support::BootClock>) {
+        self.0.support.set_clock(clock);
+    }
+
+    /// The voter set and its version now (sections 6.12 and 8.10).
+    ///
+    /// # Errors
+    ///
+    /// The database error, as text.
+    pub(crate) async fn voter_set(&self) -> Result<Arc<crate::voters::VoterSet>, String> {
+        self.0.voters.current(self.0.store.pool()).await
+    }
+
+    /// Rebuilds every live session's desired state whenever the voter set or
+    /// its version changes, whichever write changed it: every voter's
+    /// `spec.votes` names them all (section 6.12). It reads the set again
+    /// after every commit that moves the change log's head, and stops with
+    /// the hub.
+    pub(crate) fn spawn_voter_watch(&self) {
+        let hub = Arc::downgrade(&self.0);
+        let mut head = self.0.store.change_log_head();
+        tokio::spawn(async move {
+            let mut last: Option<Arc<crate::voters::VoterSet>> = None;
+            loop {
+                let Some(inner) = hub.upgrade() else {
+                    break;
+                };
+                let hub = NodeHub(inner);
+                match hub.voter_set().await {
+                    Ok(set) => {
+                        if last.as_ref().is_some_and(|last| !last.same_voters(&set)) {
+                            hub.nodes_changed_all();
+                        }
+                        last = Some(set);
+                    }
+                    Err(e) => tracing::warn!(%e, "cannot read the voter set"),
+                }
+                drop(hub);
+                if head.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
     }
 
     /// The restart rule of section 8.4: no gate survives a restart, so every
@@ -2339,6 +2410,20 @@ struct Session {
     /// When follow goes on after a `bad_message` or a failed read
     /// ([`follow::LOG_RETRY_DELAY`]); nothing is sent before.
     follow_retry: Option<Instant>,
+    /// The `primary_node_id` this session's `welcome` carried, which every
+    /// `support_request` on it carries too (section 5.27).
+    welcome_primary: Option<String>,
+    /// The `desired_state` frames this session sent with `spec.votes` and
+    /// that the node has not acknowledged yet: message id and voter-set
+    /// version, oldest first.
+    voter_snapshots: VecDeque<(String, u64)>,
+    /// The voter-set version of the newest `desired_state` with `spec.votes`
+    /// the node acknowledged on this session. `support_request` goes out only
+    /// from then on (section 4.2 rule 7).
+    acked_votes_version: Option<u64>,
+    /// When the next `support_request` is due, every `S / 3` (section 5.27);
+    /// `None` while none goes out.
+    support_due: Option<Instant>,
 }
 
 impl Session {
@@ -2362,6 +2447,10 @@ impl Session {
             same_token_grants: HashMap::new(),
             follow: follow::Follow::Off,
             follow_retry: None,
+            welcome_primary: None,
+            voter_snapshots: VecDeque::new(),
+            acked_votes_version: None,
+            support_due: None,
         }
     }
 }
@@ -2414,6 +2503,7 @@ async fn run_session(
 
         let sleep = tokio::time::sleep_until(deadline);
         let follow_due = tokio::time::sleep_until(session.follow_retry.unwrap_or(deadline));
+        let support_due = tokio::time::sleep_until(session.support_due.unwrap_or(deadline));
         tokio::select! {
             message = socket.recv() => {
                 match message {
@@ -2491,6 +2581,10 @@ async fn run_session(
             () = follow_due, if session.follow_retry.is_some() => {
                 session.follow_retry_due().await;
             }
+            // Every `S / 3` while the voter's session lives (section 5.27).
+            () = support_due, if session.support_due.is_some() => {
+                session.send_support_request(&mut outbox).await;
+            }
             () = sleep => {
                 if session.connected {
                     reason = "heartbeat_timeout";
@@ -2534,6 +2628,9 @@ async fn end_session(
     if let Some(pending) = hub.detach(node_id, generation) {
         pending.lock().expect("pending lock").fail_all();
     }
+    // Nothing can answer this session's support requests any more; the
+    // support the node already granted lasts its window (section 8.8).
+    hub.0.support.session_ended(node_id, generation);
     if record_disconnect && let Err(e) = disconnect_node(hub, node_id, reason, log_seq).await {
         tracing::warn!(%e, node_id = %node_id, "cannot record the disconnect");
     }
@@ -2575,6 +2672,34 @@ impl Session {
                 ));
                 return true;
             }
+            let not_recorded = |outbox: &mut Vec<String>| {
+                outbox.push(protocol_error(
+                    quoro_proto::ErrorCode::BadMessage,
+                    "the primary could not record this session",
+                    false,
+                    Some(&raw.id),
+                ));
+            };
+            // Section 8.8, "Terms": `welcome` carries the cluster term as
+            // stored, never a guess. A term below the node's would end the
+            // session with `stale_term` and stop this primary's support, so a
+            // term that cannot be read starts no session.
+            let term = match cluster_term(&self.hub).await {
+                Ok(term) => term,
+                Err(e) => {
+                    tracing::warn!(%e, node_id = %self.node_id, "cannot read the cluster term; the session does not start");
+                    not_recorded(outbox);
+                    return false;
+                }
+            };
+            let primary_node_id = match primary_node_id(&self.hub, &self.node_id).await {
+                Ok(primary) => primary,
+                Err(e) => {
+                    tracing::warn!(%e, node_id = %self.node_id, "cannot read the primary node; the session does not start");
+                    not_recorded(outbox);
+                    return false;
+                }
+            };
             let stored_log_seq = match connect_node(
                 &self.hub,
                 &self.node_id,
@@ -2591,12 +2716,7 @@ impl Session {
                 }
                 Err(e) => {
                     tracing::warn!(%e, node_id = %self.node_id, "cannot record the session start");
-                    outbox.push(protocol_error(
-                        quoro_proto::ErrorCode::BadMessage,
-                        "the primary could not record this session",
-                        false,
-                        Some(&raw.id),
-                    ));
+                    not_recorded(outbox);
                     return false;
                 }
             };
@@ -2609,16 +2729,7 @@ impl Session {
                 stored_log_seq,
             };
 
-            let term = cluster_term(&self.hub).await.unwrap_or_else(|e| {
-                tracing::warn!(%e, "cannot read the cluster term");
-                1
-            });
-            let primary_node_id = primary_node_id(&self.hub, &self.node_id)
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::warn!(%e, "cannot read the primary node");
-                    self.node_id.clone()
-                });
+            self.welcome_primary = Some(primary_node_id.clone());
             outbox.push(
                 ControlMessage::Welcome(wire::Welcome {
                     cluster_id: self.hub.0.cluster_id.clone(),
@@ -2779,6 +2890,9 @@ impl Session {
                         }
                         return false;
                     }
+                    if self.snapshot_answered(re, &result, outbox).await {
+                        return false;
+                    }
                     self.hub
                         .0
                         .resolve_command_result(&self.node_id, self.generation, re, result);
@@ -2807,6 +2921,29 @@ impl Session {
                     message = %error.message,
                     "node reported an error"
                 );
+                // Section 8.8, "Terms": a `stale_term`, whatever it answers,
+                // means a higher term exists.
+                if error.code == quoro_proto::ErrorCode::StaleTerm {
+                    self.on_stale_term(error.term);
+                }
+                if let Some(re) = raw.re.as_deref()
+                    && self
+                        .hub
+                        .0
+                        .support
+                        .refused(&self.node_id, self.generation, re)
+                {
+                    // Section 5.27: a `bad_message` (or any other refusal)
+                    // of a `support_request` grants nothing.
+                    tracing::warn!(
+                        node_id = %self.node_id,
+                        code = ?error.code,
+                        node_term = ?error.term,
+                        message = %error.message,
+                        "a voter refused a support_request; it is not counted"
+                    );
+                    return false;
+                }
                 if let Some(re) = raw.re.as_deref()
                     && self.on_log_refused(re, error.code)
                 {
@@ -2851,10 +2988,9 @@ impl Session {
             )),
             NodeMessage::LeaseRenew(renew) => self.answer_renewal(&raw.id, &renew, outbox).await,
             NodeMessage::LogAck(ack) => self.on_log_ack(&ack).await,
-            // This primary sends no `support_request` yet, and an answer that
-            // does not pair with an outstanding request is ignored (section
-            // 5.28).
-            NodeMessage::SupportGrant(_) => {}
+            NodeMessage::SupportGrant(grant) => {
+                self.on_support_grant(raw.re.as_deref(), &grant).await;
+            }
             NodeMessage::DnsChallenge(challenge) => {
                 let acme_routes: HashSet<String> = self
                     .last_spec
@@ -3602,6 +3738,7 @@ impl Session {
             &mesh_lookup,
             &self.hub.0.drains,
             &self.hub.reported_warm_targets(&self.node_id),
+            &self.hub.0.voters,
         )
         .await?;
         self.note_holdbacks(&built.held_back).await;
@@ -3655,14 +3792,24 @@ impl Session {
         let mut body = state.to_unsigned_value();
         quoro_proto::sign::sign_body(self.hub.0.keys.signing_key(), &mut body)
             .map_err(|e| format!("cannot sign the desired state: {e}"))?;
+        let msg_id = new_msg_id();
         let text = ControlMessage::DesiredState(body)
-            .to_frame(&new_msg_id(), None)
+            .to_frame(&msg_id, None)
             .to_text();
         match self
             .hub
             .send_snapshot(&self.node_id, self.generation, revokes, text)
         {
-            SnapshotSent::Sent => {}
+            SnapshotSent::Sent => {
+                // Its acknowledgement lets the support requests go out
+                // (section 4.2 rule 7).
+                if let Some(votes) = &spec.votes {
+                    if self.voter_snapshots.len() == MAX_VOTER_SNAPSHOTS {
+                        self.voter_snapshots.pop_front();
+                    }
+                    self.voter_snapshots.push_back((msg_id, votes.version));
+                }
+            }
             // A revoke was queued while this snapshot was on its way: built
             // again, it leaves out what the revoke took away.
             SnapshotSent::Stale => {
