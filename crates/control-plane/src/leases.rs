@@ -18,6 +18,8 @@ use quoro_proto::{LeaseGrant, LeaseId, LeaseMode, LeaseRevoke, ResourceType, Rev
 use serde_json::{Value, json};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqliteConnection};
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 /// Columns of [`Lease`], in the order [`lease_from_row`] expects them.
 pub(crate) const LEASE_COLUMNS: &str = "id, resource_type, resource_id, holder_node_id, mode, \
@@ -164,6 +166,146 @@ pub(crate) async fn by_id(
     lease_id: &str,
 ) -> Result<Option<Lease>, ApiError> {
     read_one(conn, "id = ?", lease_id).await
+}
+
+/// Every app lease the primary has revoked while `node_id` still is its
+/// last holder and that a restore waits for: its app's volume is still
+/// `restoring` from a backup, and the restore grants the lease again only
+/// once `node_id` released it ([`is_released`], issue #392).
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn awaited_by_restores(
+    conn: &mut SqliteConnection,
+    node_id: &str,
+) -> Result<Vec<Lease>, ApiError> {
+    let rows = sqlx::query(&format!(
+        "SELECT {LEASE_COLUMNS} FROM leases \
+         WHERE holder_node_id = ? AND revoked_at IS NOT NULL \
+         AND resource_type = 'app' \
+         AND EXISTS (SELECT 1 FROM volumes WHERE volumes.app_id = leases.resource_id \
+         AND volumes.state = 'restoring' AND volumes.restored_from_backup_id IS NOT NULL) \
+         ORDER BY id"
+    ))
+    .bind(node_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    rows.iter().map(lease_from_row).collect()
+}
+
+/// What this primary has learned, in memory, about revoked leases whose last
+/// holder no longer runs anything under them (`node-agent-protocol.md`
+/// sections 5.13 and 8.5, ADR 0047): for each lease and holder, the highest
+/// token at which that is known.
+///
+/// A holder releases a lease at a token when it answers a `lease_revoke` of
+/// that token `ok`: its bound VMs are stopped and recorded (section 5.13). So
+/// does an operator's acknowledgement of the lease's failed fence, which
+/// increments the token as declaring the node lost does (section 8.5 step 3).
+/// Nothing here survives a restart of the primary. Every node then starts a
+/// new session, at whose start the primary revokes again every lease it has
+/// revoked from that node, so the holder's answer releases it again; and an
+/// acknowledgement not yet delivered stays in `fence_ack_pending`, which
+/// [`is_released`] reads.
+#[derive(Debug, Default)]
+pub(crate) struct Releases(Mutex<HashMap<(String, String), i64>>);
+
+impl Releases {
+    /// `holder` released `lease_id` at `token`.
+    pub(crate) fn record(&self, lease_id: &str, holder: &str, token: i64) {
+        let mut released = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = released
+            .entry((lease_id.to_string(), holder.to_string()))
+            .or_insert(token);
+        *entry = (*entry).max(token);
+    }
+
+    /// Forgets what `holder` released of `lease_id`: a `fence_failed` answer
+    /// says its VMs may run again (section 8.5).
+    pub(crate) fn forget(&self, lease_id: &str, holder: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(lease_id.to_string(), holder.to_string()));
+    }
+
+    /// Whether the holder `lease` names released it at its token or a higher
+    /// one. A release at a lower token says nothing about a later grant.
+    fn covers(&self, lease: &Lease) -> bool {
+        let released = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        released
+            .get(&(lease.id.clone(), lease.holder_node_id.clone()))
+            .is_some_and(|token| *token >= lease.fencing_token)
+    }
+}
+
+/// Whether `lease` may be granted to another holder, or to the same one with
+/// a higher token. It must be revoked in the primary's view, with no
+/// `lease_revoke` of it unanswered on its holder's live session
+/// (`unanswered`): until the answer, the holder's fence may still run, and a
+/// `fence_failed` answer lists the lease again (ADR 0238). Its last holder
+/// must also have released it at its token ([`Releases`]); or have an
+/// operator's acknowledgement of it pending delivery (`fence_ack_pending`,
+/// section 8.5 step 3) at its token, made once the lease was revoked, and so
+/// after its grant, so that the acknowledgement's increment produced that
+/// token; or,
+/// for a `local` lease revoked by then, have been declared lost
+/// (`nodes.lost_at`, ADR 0183) or removed (section 10). An `expiring` lease
+/// of a lost or removed holder also waits for its gate (section 8.4, ADR
+/// 0202), which the primary does not keep yet, so only its holder's answer
+/// releases one. A lease listed in a node's `fence_failure` is refused by
+/// [`grant_app_lease`] whatever this says.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn is_released(
+    conn: &mut SqliteConnection,
+    releases: &Releases,
+    unanswered: bool,
+    lease: &Lease,
+) -> Result<bool, ApiError> {
+    if !lease.is_revoked() || unanswered {
+        return Ok(false);
+    }
+    if releases.covers(lease) {
+        return Ok(true);
+    }
+    // The acknowledgement's time is that of the latest one added to it, so
+    // a lease granted to its holder again after an earlier acknowledgement
+    // at that token (ADR 0247) is told apart only while no later one came.
+    if let Some(pending) = crate::fences::pending_of(conn, &lease.holder_node_id).await?
+        && pending.lease_ids.contains(&lease.id)
+        && pending
+            .fencing_tokens
+            .get(&lease.id)
+            .is_some_and(|token| i64::try_from(*token).ok() == Some(lease.fencing_token))
+        && lease
+            .revoked_at
+            .as_deref()
+            .is_some_and(|revoked_at| revoked_at <= pending.acked_at.as_str())
+    {
+        return Ok(true);
+    }
+    if lease.mode != "local" {
+        return Ok(false);
+    }
+    let holder: Option<(Option<String>, String)> =
+        sqlx::query_as("SELECT lost_at, status FROM nodes WHERE id = ?")
+            .bind(&lease.holder_node_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let revoked_at = lease.revoked_at.as_deref().unwrap_or_default();
+    Ok(holder.is_some_and(|(lost_at, status)| {
+        status == "removed" || lost_at.is_some_and(|lost_at| revoked_at <= lost_at.as_str())
+    }))
 }
 
 /// Every unrevoked lease `node_id` holds, oldest first.
@@ -326,4 +468,46 @@ pub(crate) async fn revoke_app_lease(
     lease.revoked_at = Some(now);
     changelog::append(conn, actor, "lease", &lease.id, Op::Update, lease.payload()).await?;
     Ok(Some(lease))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Lease, Releases};
+
+    fn revoked(holder: &str, token: i64) -> Lease {
+        Lease {
+            id: "lse_a".to_string(),
+            resource_type: "app".to_string(),
+            resource_id: "app_a".to_string(),
+            holder_node_id: holder.to_string(),
+            mode: "local".to_string(),
+            fencing_token: token,
+            duration_ms: None,
+            granted_at: "2026-11-07T10:00:00Z".to_string(),
+            renewed_at: None,
+            expires_at: None,
+            revoked_at: Some("2026-11-07T11:00:00Z".to_string()),
+        }
+    }
+
+    /// Issue #392: a release covers the lease only at its token or a lower
+    /// one, and only for the holder that released it.
+    #[test]
+    fn a_release_covers_only_its_holder_up_to_its_token() {
+        let releases = Releases::default();
+        assert!(!releases.covers(&revoked("nod_a", 3)));
+        releases.record("lse_a", "nod_a", 3);
+        assert!(releases.covers(&revoked("nod_a", 3)));
+        assert!(releases.covers(&revoked("nod_a", 2)));
+        assert!(
+            !releases.covers(&revoked("nod_a", 4)),
+            "a later grant to the same node needs its own release"
+        );
+        assert!(!releases.covers(&revoked("nod_b", 3)), "another holder");
+        releases.record("lse_a", "nod_a", 1);
+        assert!(
+            releases.covers(&revoked("nod_a", 3)),
+            "a lower token never lowers it"
+        );
+    }
 }

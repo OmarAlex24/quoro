@@ -12,8 +12,12 @@
 //! downloads, verifies and writes the snapshot; when it reports the volume
 //! `ready`, [`apply_status`] grants the node a new `local` lease with a higher
 //! fencing token, pins the app's placement there, moves the instances there
-//! and starts the app. A reported `failed` leaves the app stopped with no
-//! lease, and its instances back in the desired state of the node they are on.
+//! and starts the app. It does so only once the old holder released the
+//! lease: it answered the revoke `ok`, so its VMs are stopped and recorded,
+//! or it was declared lost (sections 5.13 and 8.3, ADR 0047, issue #392).
+//! Until then the volume stays `restoring`, and the next `ready` report tries
+//! again. A reported `failed` leaves the app stopped with no lease, and its
+//! instances back in the desired state of the node they are on.
 
 use crate::AppState;
 use crate::api::apps::{APP_COLUMNS, AppPlacement, AppStatus, app_from_row};
@@ -27,6 +31,7 @@ use crate::error::{ApiError, Code};
 use crate::events::{self, NewEvent, Source};
 use crate::leases::{self, Lease};
 use crate::request::CallCtx;
+use crate::session::NodeHub;
 use crate::store::{Store, now_rfc3339};
 use quoro_proto::wire;
 use quoro_proto::{LeaseRevoke, RevokeReason};
@@ -237,6 +242,7 @@ pub(crate) async fn accept(
 /// A database error.
 pub(crate) async fn apply_status(
     store: &Store,
+    hub: &NodeHub,
     node_id: &str,
     volumes: &[wire::VolumeStatus],
 ) -> Result<AppliedRestores, ApiError> {
@@ -260,13 +266,15 @@ pub(crate) async fn apply_status(
         }
         match reported.state {
             wire::VolumeState::Ready => {
-                match restore_ready(store, node_id, &volume, reported).await {
+                match restore_ready(store, hub, node_id, &volume, reported).await {
                     Ok(outcome) => applied.merge(outcome),
                     // The app's lease waits for an operator's acknowledgement
                     // of a failed fence (section 8.5), so it is granted to no
                     // node yet. The transaction rolled back; the volume stays
-                    // `restoring`, and the next status report applies it once
-                    // the lease is acknowledged. The other volumes go on.
+                    // `restoring`, and a later status report applies it once
+                    // the lease may move: the node reports every volume of
+                    // its snapshot (section 5.3) at least every 30 s (section
+                    // 2 step 7). The other volumes go on.
                     Err(e) if e.code == Code::Conflict => tracing::warn!(
                         volume_id = %volume.id,
                         node_id,
@@ -294,6 +302,7 @@ pub(crate) async fn apply_status(
 /// transition is applied once.
 async fn restore_ready(
     store: &Store,
+    hub: &NodeHub,
     node_id: &str,
     before: &Volume,
     reported: &wire::VolumeStatus,
@@ -311,6 +320,31 @@ async fn restore_ready(
     if current.state != VolumeState::Restoring {
         return Ok(AppliedRestores::default());
     }
+    // Section 5.13, ADR 0047: the old holder's VMs may still run until it
+    // answers the revoke `ok`, so the lease moves only once it released it
+    // (issue #392). That holds for a restore onto the same node too. The
+    // check comes before any write, so a restore that waits changes nothing
+    // and a later `ready` report tries again (section 5.3). A revoke the
+    // holder refused, because its token is higher (section 5.13), is sent
+    // again at its next session, at the token its `hello` names (section 9).
+    if let Some(previous) = leases::app_lease(&mut w.tx, &current.app_id).await?
+        && !leases::is_released(
+            &mut w.tx,
+            hub.releases(),
+            hub.revoke_unanswered(&previous.holder_node_id, &previous.id),
+            &previous,
+        )
+        .await?
+    {
+        tracing::debug!(
+            volume_id = %current.id,
+            lease_id = %previous.id,
+            holder = %previous.holder_node_id,
+            "a restored volume waits for its old holder to release the lease"
+        );
+        return Ok(AppliedRestores::default());
+    }
+
     current.state = VolumeState::Ready;
     current.allocated_bytes = reported
         .allocated_bytes
