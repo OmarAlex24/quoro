@@ -17,7 +17,8 @@
 -- leases.renewed_at and leases.expires_at stay as the grant wrote them, and
 -- leases.duration_ms holds the longest duration the primary may have granted
 -- the holder, raised before a longer grant (a maintenance window, section
--- 8.11) and lowered only once that grant's gate has passed (section 8.4).
+-- 8.11), which waits until the raise is replicated (ADR 0268), and lowered
+-- only once that grant's gate has passed (section 8.4).
 
 ALTER TABLE nodes ADD COLUMN lost_at TEXT;
 

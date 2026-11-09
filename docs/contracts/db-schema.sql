@@ -292,7 +292,8 @@ CREATE TABLE volumes (
 -- primary answers the holder's first renewal after the conversion grant; that
 -- answer writes `expiring` before it is sent (ADR 0218, ADR 0244). Before it
 -- sends the conversion grant, the primary raises duration_ms to at least that
--- grant's duration (ADR 0254). A lease changes mode only with the same token
+-- grant's duration (ADR 0254), and it sends a longer grant only once that raise
+-- is replicated (ADR 0268). A lease changes mode only with the same token
 -- (ADR 0258). The node-side states `held`, `uncertain`, `expired` and
 -- `revoked` are fixed in node-agent-protocol.md.
 CREATE TABLE leases (

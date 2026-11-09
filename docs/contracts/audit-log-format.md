@@ -329,7 +329,7 @@ System records, with `actor_type` `system` and no `scope`:
 | --- | --- | --- | --- | --- |
 | `lease.grant` | `leases` | `system` | `app` / the app | Also an `expiring` lease granted with a new token, to a new holder or again after expiry or revoke; `params` is `{node_id, fencing_token, mode, duration_ms}`. Renewals write no record |
 | `lease.revoke` | `leases` | `system` | `app` / the app | Also the revokes of a returning node declared lost, with reason `declared_lost` |
-| `cluster.maintenance` | `cluster` | `cli` | `cluster` / the cluster id | The operator or the installer ran `quoro cluster maintenance` on the primary's host and the primary opened the window (node-agent-protocol.md section 8.11); `params` is `{duration_s}`, `ok` once a majority supported it, `error` with the reason otherwise. `--end` writes another record with `params` `{end: true}` |
+| `cluster.maintenance` | `cluster` | `cli` | `cluster` / the cluster id | The operator or the installer ran `quoro cluster maintenance` on the primary's host and the primary opened the window (node-agent-protocol.md section 8.11); `params` is `{duration_s}`, `ok` once a majority supported it and its raise of `leases.duration_ms` was replicated (ADR 0268), `error` with the reason otherwise. `--end` writes another record with `params` `{end: true}` |
 
 Support requests and grants, promotion votes and the loss of a majority write no record: they change no state on the primary. What follows from them is recorded: the fences of the nodes (`node.fenced` events) and, with promotion, the promotion itself.
 
