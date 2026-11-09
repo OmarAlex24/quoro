@@ -59,6 +59,7 @@ It also carries groundwork for M5b, whose milestone (M5b — Witness, leases, wa
 - **Expiring leases on the node.** The node agent now runs the `expiring` lease mode of section 8.4. It renews each such lease every third of its duration through its session, and counts a lease as valid only from the send time of a renewal the primary answered. A lease whose renewal is late, or whose session is lost, goes `uncertain`: its VMs keep running and nothing new starts for it. At the lease's deadline the node stops every VM bound to it within the margin `M` (a 1 s graceful stop, then a 0.3 s forced one), before the primary may grant the lease to another node. A held lease survives an agent restart on the same host boot: its deadline is converted to `CLOCK_BOOTTIME` once, when a renewal is answered, so a suspend after that can only shorten it, and after a reboot the lease comes back expired and is fenced. The primary grants no `expiring` lease yet; warm apps bring that. The M0 lease agent, which only tests used, is removed and its tests are ported to the lease service ([#431], [#75], [ADR 0072], [ADR 0225]).
 
 - **Acknowledging a failed self-fence.** When a node cannot confirm that a VM stopped during a self-fence, including when it cannot list the engine's VMs, it marks itself failed and starts nothing stateful. Until now nothing could clear that mark, and the primary did not record the failure, so it could grant the lease again. The primary now lists the lease, app and VM ids in the node's `fence_failure` (`GET /api/v1/nodes/{node_id}`) and grants none of those leases until a human calls `POST /api/v1/nodes/{node_id}/fence-ack` with exactly the listed lease ids, after checking out of band that the VMs are stopped. Agents are refused with `human_only`, and the call is audited. The acknowledgement increments each lease's fencing token and reaches the node at once, or at its next session before its desired state; the node then clears those failed fences, and its failed mark once none remains ([#423], [#391], [#399], [ADR 0074], [ADR 0079]).
+- **Nodes keep a copy of the change log.** The primary now sends its change log to every machine with the `node` role, its own host included, one batch of at most 500 entries at a time. The node checks each batch against the hash chain, stores it in its own database and only then acknowledges it. A node whose copy no longer matches the primary's writes that copy to a file under `quarantine/` in its data directory and receives the log again from its first entry. This is groundwork for promoting a node to primary in M5b: nothing reads the copy yet, and the API does not show a node's lag yet ([#668], [#697], [ADR 0179], [ADR 0227], [ADR 0261]).
 
 ### Fixed
 
@@ -134,6 +135,7 @@ It also carries groundwork for M5b, whose milestone (M5b — Witness, leases, wa
 - A running VM gets the new `quoro-init`, which flushes a volume's filesystem before each snapshot, only at its next start. Until then its snapshots are crash-consistent, as in v0.2.0 ([#635], [ADR 0282]).
 - On a node that snapshots volumes by pausing the VM (`pause_copy`), avoid upgrading the node agent while a backup copies a volume. A VM that the v0.2.0 engine left paused is not resumed after the upgrade: stop it and start it again ([#523]).
 - Every two machines with the `node` or `witness` role now also become direct WireGuard peers on the mesh's UDP port (51820 unless the operator changed it), not only peers of the edge ([#671], [ADR 0266]). Nothing in this release sends traffic over those peers yet: they are for M5b's votes and warm replication. Where a firewall sits between nodes, open that UDP port between them before those features arrive.
+- After the upgrade, each node receives the primary's whole change log once, from its first entry, and keeps it in its own database, which grows by about the size of the primary's log. Secrets in the log (environment variable values, webhook and provider secrets) stay encrypted with the cluster key, which nodes do not hold ([#668], [#697]).
 - A node that marked itself failed under v0.2.0, because a self-fence could not confirm that a VM stopped, stays failed after the upgrade until a human acknowledges it. Its agent reports the stored failure again, the primary lists it in the node's `fence_failure` (`GET /api/v1/nodes/{node_id}`), and a human calls `POST /api/v1/nodes/{node_id}/fence-ack` with the listed lease ids after checking out of band that the VMs are stopped ([#423], [#544]).
 
 ## [v0.2.0] - 2026-11-05
@@ -570,7 +572,12 @@ Milestones M0 and M1: frozen contracts, then a one-command install with the engi
 [#611]: https://github.com/OmarAlex24/quoro/issues/611
 [#632]: https://github.com/OmarAlex24/quoro/pull/632
 [#650]: https://github.com/OmarAlex24/quoro/issues/650
+[#668]: https://github.com/OmarAlex24/quoro/pull/668
 [#671]: https://github.com/OmarAlex24/quoro/pull/671
+[#697]: https://github.com/OmarAlex24/quoro/pull/697
+[ADR 0179]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0179-change-log-follow-74-every-machine-with-role-node-follows.md
+[ADR 0227]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0227-change-log-follow-sends-one-log-entries-batch-at-a-time-and.md
+[ADR 0261]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0261-every-node-holds-a-lease-row-s-local-write-before-an.md
 [ADR 0266]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0266-where-the-primary-takes-a-voter-s-mesh-endpoint-from-node.md
 [ADR 0286]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0286-an-app-s-change-log-payload-carries-warm-node-id-warm-node.md
 [ADR 0265]: https://github.com/OmarAlex24/quoro/blob/main/docs/adr/0265-m5b-refuses-warm-for-an-app-built-from-a-git-source-with.md
