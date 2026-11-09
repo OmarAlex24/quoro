@@ -1777,7 +1777,9 @@ components:
           description: |
             From M5b: the app's warm copy (ADR 0173, ADR 0174), on every read
             of the app. Null when `ha_policy` is not `warm`; absent on a primary
-            older than M5b.
+            older than M5b. Null in a change-log payload, which carries the
+            three settings by their column names, `warm_node_id`,
+            `warm_node_pinned` and `warm_interval_s` (ADR 0286).
           oneOf:
             - $ref: '#/components/schemas/WarmCopy'
             - type: 'null'
@@ -1871,9 +1873,15 @@ components:
             warm copy when it returns (ADR 0176). Null while no node is
             eligible; `state` is then `failed`. The scheduler keeps the warm
             node while it is disconnected and picks another only when it is
-            removed, loses the node role, stops snapshotting with reflink or
-            becomes the volume's node; an operator's pin lasts until the node
-            is removed (ADR 0278).
+            removed, loses the node role, reports `pause_copy` or becomes the
+            volume's node; an operator's pin lasts until the node is removed
+            (ADR 0278). A warm node that has not reported a snapshot method
+            yet, for example before its first `hello` after an upgrade, keeps
+            its place; picking a new one still needs `reflink`. When an
+            operator releases the pin (`UpdateAppRequest.warm.node_id` null),
+            the scheduler keeps the current warm node while it is still
+            eligible, since it already holds the copy, and otherwise picks
+            among the connected eligible nodes (ADR 0287).
         node_pinned:
           type: boolean
           description: Whether an operator chose `node_id` rather than the scheduler.
@@ -1939,10 +1947,12 @@ components:
           type: [string, 'null']
           pattern: '^nod_[0-9A-HJKMNP-TV-Z]{26}$'
           description: |
-            Pins the warm node; null lets the scheduler pick. A node that is
-            not eligible (`WarmCopy.node_id`) answers `validation_failed`. A
-            new warm node receives a full copy, and the copy on the previous
-            one is deleted.
+            Pins the warm node; null releases the pin and lets the scheduler
+            pick: it keeps the current warm node while it is still eligible,
+            since it already holds the copy, and otherwise picks among the
+            connected eligible nodes (ADR 0287). A node that is not eligible
+            (`WarmCopy.node_id`) answers `validation_failed`. A new warm node
+            receives a full copy, and the copy on the previous one is deleted.
         interval_s:
           type: integer
           minimum: 5

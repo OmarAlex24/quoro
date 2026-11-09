@@ -6,15 +6,26 @@
 -- its prepared image and its standby VM (node-agent-protocol.md section 6.13).
 -- NULL while no node is eligible and for any other HA policy. The scheduler
 -- sets it unless an operator pinned it (apps.warm_node_pinned = 1, set by
--- `UpdateAppRequest.warm.node_id`). A failover or a switchover swaps it with
--- volumes.node_id in the transaction that grants the lease to the warm node,
--- so the old source becomes the warm node. A policy change away from `warm`
+-- `UpdateAppRequest.warm.node_id`). Only a reported `pause_copy` counts as no
+-- longer snapshotting with reflink: a warm node whose nodes.volume_snapshot
+-- is still NULL keeps its place, while picking a new one still needs
+-- `reflink`. A released pin (`warm.node_id` null) keeps the warm node while
+-- it is still eligible; otherwise the scheduler picks among the connected
+-- eligible nodes (`WarmCopy.node_id`, ADR 0287). A failover or a switchover
+-- swaps it with volumes.node_id in the transaction that grants the lease to
+-- the warm node, so the old source becomes the warm node. A policy change away from `warm`
 -- clears it and the pin.
 --
 -- apps.warm_interval_s is the number of seconds between two snapshots on the
 -- source (`WarmCopy.interval_s`): 30 by default, 5 to 3600 (ADR 0173, measured
 -- in docs/research/m5b-warm-and-leases.md). It is kept when the policy changes,
 -- so an app that goes back to `warm` keeps its interval.
+--
+-- `App` has no field of its own for these three columns, so an app's
+-- change-log payload carries them as `warm_node_id`, `warm_node_pinned` and
+-- `warm_interval_s`, beside the `App` fields, and its `warm` is null
+-- (db-schema.sql header, ADR 0286). A promoted primary that rebuilds apps from
+-- the log keeps the warm node, the pin and the interval.
 --
 -- Nothing about the progress of a warm copy is stored: the primary keeps each
 -- node's newest `status_report.warm` entries in memory (section 5.3), as it
