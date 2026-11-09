@@ -285,6 +285,8 @@
   - [0281: The primary regrants a lease from hello only when the node lists it expired or refused a same-token local grant, never when it lists it revoked](adr/0281-the-primary-regrants-a-lease-from-hello-only-when-the-node.md)
   - [0282: #400: flush a volume's guest filesystem through quoro-init (syncfs over the exec port) before every volume snapshot and before a switchover freeze, with a crash-consistent fallback](adr/0282-400-flush-a-volume-s-guest-filesystem-through-quoro-init.md)
   - [0283: listAudit can return records newest first: order (asc default, desc) and before_seq; list_audit takes the same](adr/0283-listaudit-can-return-records-newest-first-order-asc-default.md)
+  - [0286: An app's change-log payload carries warm_node_id, warm_node_pinned and warm_interval_s beside the App fields, and App.warm stays null in it](adr/0286-an-app-s-change-log-payload-carries-warm-node-id-warm-node.md)
+  - [0287: A released pin keeps an eligible warm node, and only a reported pause_copy counts as no longer snapshotting with reflink](adr/0287-a-released-pin-keeps-an-eligible-warm-node-and-only-a.md)
 
 # Background research
 

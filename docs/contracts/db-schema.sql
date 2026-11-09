@@ -4,7 +4,15 @@
 -- change log, the audit log, the event log and the state tables that are derived
 -- from them. Column names and types follow the shared entity model used by
 -- openapi.yaml and events.schema.json, so a row, an API object and an event
--- payload use the same field names.
+-- payload use the same field names. A column with no field of its own in the
+-- API object travels in the object's change-log payload under the column's
+-- name, beside the object's fields, so a database rebuilt from the log keeps
+-- it (ADR 0286). An app's warm settings are the case: apps.warm_node_id,
+-- apps.warm_node_pinned and apps.warm_interval_s (migration 0011) appear in
+-- the API only inside `App.warm`. A field the primary derives on read is null
+-- in the payload or absent from it: `App.warm` is null. What the primary
+-- keeps only in memory, such as the progress of a warm copy, stays out of the
+-- payload and the hash chain.
 --
 -- D-0015: SQLite first; state is stored as a numbered change log, and the state
 -- tables (nodes, projects, vms, apps, deployments, domains, volumes, leases,
