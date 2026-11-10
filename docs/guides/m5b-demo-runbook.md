@@ -19,6 +19,7 @@ The readers are the person who runs the demo and the maintainer, who approves it
 - [Step 5: planned switchover and the N+1 indicator](#step-5-planned-switchover-and-the-n1-indicator)
 - [Step 6: promotion](#step-6-promotion)
 - [Cleanup](#cleanup)
+- [Decided points](#decided-points)
 - [Open points](#open-points)
 
 ## Definition of Done map
@@ -45,23 +46,29 @@ The runbook is written against the contracts. On the day of the demo, check each
 
 | Needed for | Operation or behaviour | Issue |
 | --- | --- | --- |
-| Step 1 | `POST /api/v1/nodes/{node_id}/roles` (`updateNodeRoles`) and a witness that runs without an engine | [#687](https://github.com/OmarAlex24/quoro/issues/687) |
-| Step 1 | The panel's HA view: the voters, and the offer of a witness | [#688](https://github.com/OmarAlex24/quoro/issues/688) |
 | Steps 2, 3 | `expiring` leases on the primary: the conversion grant and the renewals | [#555](https://github.com/OmarAlex24/quoro/issues/555) |
-| Step 3 | A failover whose grant waits for replication (a lease row with the unsettled mark). Until then `failoverApp` answers `no_support` in that case | [#703](https://github.com/OmarAlex24/quoro/issues/703) |
-| Step 3, fallback | `POST /api/v1/nodes/{node_id}/declare-lost` (`declareNodeLost`) | [#734](https://github.com/OmarAlex24/quoro/issues/734) |
-| Step 4 | The returning source's quarantined copy on the node, and its record and deletion on the primary (`Volume.quarantines`, `deleteVolumeQuarantine`) | [#557](https://github.com/OmarAlex24/quoro/issues/557), [#732](https://github.com/OmarAlex24/quoro/issues/732) |
+| Step 2 | The panel's view of the warm copy and its last shipped snapshot (box 4) | [#562](https://github.com/OmarAlex24/quoro/issues/562) |
+| Step 3b | `quoro cluster maintenance` (a maintenance window), to widen the refusal's window | [#764](https://github.com/OmarAlex24/quoro/issues/764) |
+| Step 4 | A `deleted` entry that reaches the returning source's volume before its hand-over must not remove it | [#557](https://github.com/OmarAlex24/quoro/issues/557) |
 | Step 5 | `POST /api/v1/apps/{app_id}/switchover` (`switchoverApp`) | [#735](https://github.com/OmarAlex24/quoro/issues/735) |
 | Step 5 | A health check must not restart a VM that a switchover freeze paused | [#630](https://github.com/OmarAlex24/quoro/issues/630) |
 | Step 5 | `GET /api/v1/cluster/capacity` (`getClusterCapacity`, the N+1 indicator) | [#717](https://github.com/OmarAlex24/quoro/issues/717) |
-| Step 6 | The cluster keys sealed to each node, so that `Node.custody` reads `sealed` | [#727](https://github.com/OmarAlex24/quoro/issues/727) |
-| Open point | `quoro cluster maintenance` (a maintenance window) | Not on `main`; no issue named here |
 | Step 6 | `quoro cluster promote` | [#19](https://github.com/OmarAlex24/quoro/issues/19) |
 | Step 6 | The old primary demotes itself on a newer term, and `quoro node rejoin` | [#728](https://github.com/OmarAlex24/quoro/issues/728) |
 
-`failoverApp` ([#726](https://github.com/OmarAlex24/quoro/pull/726)), `Cluster.votes` with `ha_ready`, voter support on the primary, change-log follow with `Node.log_seq` and `Node.log_lag`, and the warm copy's progress in `App.warm` are on `main`.
+These are on `main`:
 
-The panel on `main` has no view of the warm copy's last shipped snapshot, no switchover action and no HA view. Until it does, each panel action below has an API call that does the same thing, and the API answer is the evidence.
+- `failoverApp` ([#726](https://github.com/OmarAlex24/quoro/pull/726)). A failover whose grant waits for replication answers `202` with `grant_pending` ([#742](https://github.com/OmarAlex24/quoro/pull/742), ADR 0292).
+- `Cluster.votes` with `ha_ready`, and voter support on the primary.
+- `updateNodeRoles` and a witness-only machine ([#744](https://github.com/OmarAlex24/quoro/pull/744)).
+- The panel's HA view ([#745](https://github.com/OmarAlex24/quoro/pull/745)).
+- `declareNodeLost` ([#759](https://github.com/OmarAlex24/quoro/pull/759)).
+- Custody seals, so that `Node.custody` reads `sealed` ([#743](https://github.com/OmarAlex24/quoro/pull/743)).
+- Change-log follow, with `Node.log_seq` and `Node.log_lag`.
+- The warm copy's progress in `App.warm`.
+- The returning source's hand-over and its quarantined copies, on the node ([#763](https://github.com/OmarAlex24/quoro/pull/763)) and on the primary ([#738](https://github.com/OmarAlex24/quoro/pull/738)).
+
+The panel on `main` has no view of the warm copy's last shipped snapshot and no switchover action. Until it does, each panel action below has an API call that does the same thing, and the API answer is the evidence.
 
 ## Preconditions
 
@@ -134,7 +141,7 @@ cargo test --locked -p quoro-node-agent --test expiring_leases -- \
   a_held_lease_survives_an_agent_restart_on_the_same_boot
 ```
 
-Run them on a Linux host, from the commit the demo build was made from. The lab run that goes with them is an [open point](#open-points). Do not run them on a lab VM: the lab VMs are too small for a build.
+Run them on a Linux host, from the commit the demo build was made from. The lab run that goes with them is step 3a with a second `warm` app ([decided points](#decided-points)). Do not run them on a lab VM: the lab VMs are too small for a build.
 
 **Evidence:** the commit, the test output, and the link to the CI run of that commit.
 
@@ -265,7 +272,7 @@ Take `APP` from the `id` of the first answer and `VOL` from the `id` of the seco
 
 **Pre-flight for this step.** Read `q "$QUORO/api/v1/apps/$APP" | jq '{lease, warm}'` and `q "$QUORO/api/v1/cluster" | jq .votes`. Go on only when all of these hold:
 
-- `lease.mode` is `expiring` and `lease.unsettled` is `false`. On `main`, a failover of a marked row answers `no_support` ([#703](https://github.com/OmarAlex24/quoro/issues/703));
+- `lease.mode` is `expiring` and `lease.unsettled` is `false`. A failover of a marked row answers `202` with `grant_pending`, and its grant waits until the row's newest write is replicated (ADR 0292), which this step does not show;
 - `warm.state` is `in_sync`, and record A has shipped (step 2c);
 - `votes.ha_ready` is `true`. Without lab-3's vote, lab-2 alone is not a majority once lab-1 is cut off, and it cannot grant the lease.
 
@@ -331,7 +338,9 @@ q -X POST "$QUORO/api/v1/apps/$APP/failover" -H 'Content-Type: application/json'
 
 Do not call `failoverApp` before the primary shows lab-1 `disconnected`. While the primary still sees lab-1 as connected, it first revokes the lease over the session and waits for the answer. That is the connected-source path, not this refusal.
 
-**The window is short, and some runs have none.** The primary marks lab-1 `disconnected` 15 s after its last frame of any kind: a heartbeat, a status report or a log acknowledgement. The gate passes 18 s after the last renewal it answered. The window is therefore 3 s minus the time between that renewal and lab-1's last frame. Heartbeats and renewals run on separate 5 s cycles, so the window ranges from about -2 s to 3 s. When it is negative, no call is ever refused. Fire the call from a loop that polls `status` every 200 ms. If the call lands after `gate_at`, it is not refused: it starts the warm copy, which is step 3c, and box 6 is not shown in this run. Budget for repeated runs: repeat the demo from step 2 for box 6 after [cleanup](#cleanup), or see the [open point](#open-points).
+**The window is short, and some runs have none.** The primary marks lab-1 `disconnected` 15 s after its last frame of any kind: a heartbeat, a status report or a log acknowledgement. The gate passes 18 s after the last renewal it answered. The window is therefore 3 s minus the time between that renewal and lab-1's last frame. Heartbeats and renewals run on separate 5 s cycles, so the window ranges from about -2 s to 3 s. When it is negative, no call is ever refused. Fire the call from a loop that polls `status` every 200 ms. If the call lands after `gate_at`, it is not refused: it starts the warm copy, which is step 3c, and box 6 is not shown in this run. Budget for repeated runs: repeat the demo from step 2 for box 6 after [cleanup](#cleanup). The demo avoids this with a maintenance window (below).
+
+**The demo widens the window with a maintenance window.** Before arming the cut, on lab-2 as root: `quoro cluster maintenance --duration 30`. With `W` = 30 s, lab-1 fences about 27 s after its last answered renewal and the gate passes 36 s after it, so the refusal shows for roughly 16 to 21 s on every run ([protocol section 8.11](../contracts/node-agent-protocol.md#811-maintenance-window-m5b)). The command is not on `main` yet ([#764](https://github.com/OmarAlex24/quoro/issues/764)). Until it is, use repeated runs as above.
 
 ### 3c. Fail over to lab-2
 
@@ -357,7 +366,7 @@ Once `gate_at` has passed, send the call again, with a new `Idempotency-Key`. An
 
 - `no_support`:
   - check `votes.ha_ready` and lab-3's connection;
-  - on `main`, also check that `lease.unsettled` is `false` ([#703](https://github.com/OmarAlex24/quoro/issues/703)).
+  - also check `lease.unsettled`: for a marked row the answer is `202` with `grant_pending`, and the grant waits for replication (ADR 0292).
 - `no_copy`: lab-2 holds no complete copy. Step 2c did not complete. End the cut, wait for `in_sync`, and start step 3 again.
 - `fence_failed`: lab-1 reported a failed fence. End the cut. Check on lab-1 that the VM stopped. Then acknowledge the fence with `POST /api/v1/nodes/$LAB1/fence-ack`, using the `lease_ids` of `fence_failure`. Never acknowledge without checking.
 - A lease that stays `lease_held` after its gate passes. A `local` or marked lease moves only once the node is declared lost: `POST /api/v1/nodes/$LAB1/declare-lost` ([ADR 0183](../adr/0183-add-post-api-v1-nodes-node-id-declare-lost-human-only.md), [#734](https://github.com/OmarAlex24/quoro/issues/734)). It is human-only and audited. Use it only while the cut holds and lab-1's VM has stopped.
@@ -510,9 +519,9 @@ Switch `$QUORO` to lab-1's address for every call from here.
 - After the real votes, go forward only. Run `quoro cluster promote` again at the same or a higher term, and do not start lab-2's control plane. A primary that sees a higher term demotes itself ([ADR 0230](../adr/0230-a-primary-that-learns-of-a-higher-term-demotes-itself-with.md)).
 - If a node does not find lab-1, point it there with `quoro node set-primary <lab-1 URL>`. The certificate pin does not change.
 
-### 6c. The end of step 6: the maintainer's choice
+### 6c. The end of step 6: promote lab-2 back
 
-The roadmap's step 6 ends by promoting lab-2 back. The maintainer picks one of these two endings in the review of this runbook.
+The roadmap's step 6 ends by promoting lab-2 back. The demo uses option A. Option B stays here as the fallback if the second promotion cannot run.
 
 **Option A: promote lab-2 back (the roadmap's script).**
 
@@ -545,12 +554,18 @@ In this order:
 5. **Quarantined control-plane directories** from step 6. They stay on the hosts until the maintainer decides. Record where they are.
 6. **Final state.** `GET /api/v1/nodes`, `GET /api/v1/cluster` and `GET /api/v1/apps`, compared with the pre-flight readings. Request every demo domain once.
 
+## Decided points
+
+The maintainer approved these choices on 2026-11-10:
+
+- **Step 3b** uses a 30 s maintenance window, so the refusal of box 6 shows on every run ([#764](https://github.com/OmarAlex24/quoro/issues/764)). Until the command is on `main`, repeated runs.
+- **Box 12's lab run** is step 3a with a second `warm` app on lab-1, so that two `expiring` fences run at once on the same node. The second app is not failed over; it comes back on lab-1 when the cut ends.
+- **Step 6 ends with option A:** promote lab-2 back, as the roadmap says.
+
 ## Open points
 
-- **The window of step 3b.** With the defaults, the refusal `lease_held` is visible for about -2 to 3 s, between the primary marking lab-1 `disconnected` and the lease's gate, so some runs show no refusal. A maintenance window would widen it: `quoro cluster maintenance --duration 30` grants leases of `W` = 30 s, so lab-1 fences about 27 s after its last answered renewal and the gate passes 36 s after it. That leaves a window of roughly 16 to 21 s, with the fence well inside the cut's 120 s ([protocol section 8.11](../contracts/node-agent-protocol.md#811-maintenance-window-m5b)). The command is not on `main`, and using a maintenance window in the demo is the maintainer's call. The session timeout in `welcome` is another lever, but the contracts do not say that an operator can change it.
 - **The demo app.** Which image, its port, its data path, and the HTTP calls that write and read a record. It must be an image app, not a Git one.
-- **A disabled control-plane unit.** After `quoro node rejoin`, a promotion on the same host needs no control-plane database or unit on that host. The contracts do not say whether the unit file that `rejoin` stops and disables still counts as a control-plane unit. This decides whether option A works without removing that file by hand.
-- **The panel.** The panel on `main` shows neither the warm copy's last shipped snapshot (box 4) nor the switchover action (step 5), and no issue tracks them. The HA view is [#688](https://github.com/OmarAlex24/quoro/issues/688). Until they ship, the API answers are the evidence for those boxes.
-- **The lab run of the fence tests.** The approved plan proves box 12 with the CI tests and one lab run. This runbook proposes as that run step 3a with a second `warm` app on lab-1, so that two `expiring` fences run at once on the same node. The second app is not failed over; it comes back on lab-1 when the cut ends. The other choice is to accept step 3a alone. The maintainer picks one.
+- **A disabled control-plane unit.** After `quoro node rejoin`, a promotion on the same host needs no control-plane database or unit on that host. The contracts do not say whether the unit file that `rejoin` stops and disables still counts as a control-plane unit. This decides whether option A works without removing that file by hand. A reading is being proposed to the maintainer: a stopped and disabled unit does not count, and a promotion refuses on a control-plane database or an enabled unit.
+- **The panel.** The panel on `main` shows neither the warm copy's last shipped snapshot (box 4, [#562](https://github.com/OmarAlex24/quoro/issues/562)) nor the switchover action (step 5, no issue yet). Until they ship, the API answers are the evidence for those boxes.
 - **Reaching the VM from its host.** Step 3a writes record B from lab-1's host to the app's VM at its private address. The lab allows it today, but the contracts do not state that the node's firewall admits that path.
 - **TLS after the promotion.** The promoted primary keeps the old primary's certificate. Curl options that pin the certificate and do not check the host name work against lab-1. Options that check the name against the certificate fail if the certificate does not name lab-1's address. Which names the certificate carries is not stated here.
