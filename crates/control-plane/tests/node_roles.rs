@@ -845,3 +845,99 @@ async fn force_does_not_bypass_rule_2_when_removing_a_vote() {
     )
     .await;
 }
+
+/// The `detail` of a problem answer, with its status and code.
+async fn problem_detail(res: reqwest::Response) -> (u16, String, String) {
+    let status = res.status().as_u16();
+    let body: Value = res.json().await.unwrap();
+    (
+        status,
+        body["code"].as_str().unwrap_or_default().to_string(),
+        body["detail"].as_str().unwrap_or_default().to_string(),
+    )
+}
+
+/// Review finding F1 of #687: while the `nodes` rows and the change log
+/// disagree on the voters, rule 2 refuses every voter-set change with its own
+/// detail, even when the rows' voters all hold the current version. Without
+/// it, adding the witness role to a machine the log already counts as a voter
+/// would pass without moving the version, and the next change would pass on
+/// the same acknowledgements: two voters apart from the last acknowledged
+/// set (section 8.10 rules 1 and 2). The machine's next `hello` writes its
+/// whole row to the log, which heals the disagreement and moves the version;
+/// once the voters hold it, the change passes with the same token.
+#[tokio::test]
+async fn a_voter_change_waits_while_the_rows_and_the_log_disagree() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let a = enrolled(&server, &owner, "node-a", &["node"]).await;
+    let mut machine_a = connected(&server, &a).await;
+    let b = enrolled(&server, &owner, "node-b", &["node"]).await;
+    let mut machine_b = connected(&server, &b).await;
+    holds_voters(&mut machine_a, 2).await;
+    let x = enrolled(&server, &owner, "edge-x", &["edge", "witness"]).await;
+    holds_voters(&mut machine_a, 3).await;
+    holds_voters(&mut machine_b, 3).await;
+    let version = machine_a.version();
+    assert_eq!(machine_b.version(), version);
+
+    // X's row loses its vote with no change-log entry: the rows name {A, B},
+    // both holding the version, the log {A, B, X}.
+    sqlx::query("UPDATE nodes SET roles = '[\"edge\"]' WHERE id = ?")
+        .bind(&x.node_id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+    let token = join_token(&server, &owner).await;
+    let head = state_head(&server).await;
+
+    // The roles operation, which would otherwise pass at 2 of 2 and leave
+    // the version where it is.
+    let (status, code, detail) =
+        problem_detail(roles(&owner, &server, &x.node_id, json!({ "add": ["witness"] })).await)
+            .await;
+    assert_eq!((status, code.as_str()), (409, "conflict"), "{detail}");
+    assert!(detail.contains("disagree"), "{detail}");
+    assert_eq!(roles_of(&server, &x.node_id).await, json!(["edge"]));
+    // The enrollment of a voter, without consuming its token.
+    let (status, code, detail) =
+        problem_detail(enroll_with(&server, &token, "node-c", &["node"]).await).await;
+    assert_eq!((status, code.as_str()), (409, "conflict"), "{detail}");
+    assert!(detail.contains("disagree"), "{detail}");
+    assert!(token_unused(&server, &token).await, "not consumed");
+    // A and B's sessions may persist a `desired_rev` meanwhile; neither
+    // refused call wrote anything of its own.
+    let written: Vec<(String, String)> = sqlx::query_as(
+        "SELECT entity_type, entity_id FROM change_log \
+         WHERE seq > ? AND entity_type <> 'audit' AND entity_id NOT IN (?, ?)",
+    )
+    .bind(head)
+    .bind(&a.node_id)
+    .bind(&b.node_id)
+    .fetch_all(server.state.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(written, Vec::new(), "nothing written");
+    let named: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nodes WHERE name = 'node-c'")
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(named, 0);
+
+    // X's next session writes its whole row: the log agrees again and the
+    // version moves on, so A and B get a new `spec.votes`.
+    let _machine_x = connected(&server, &x).await;
+    while machine_a.version() == version {
+        machine_a.until("desired_state").await;
+    }
+    let healed = machine_a.version();
+    assert!(healed > version);
+    holds_version(&mut machine_a, healed).await;
+    holds_version(&mut machine_b, healed).await;
+    assert_eq!(
+        machine_a.spec["votes"]["voters"].as_array().map(Vec::len),
+        Some(2)
+    );
+    let res = enroll_with(&server, &token, "node-c", &["node"]).await;
+    assert_eq!(res.status(), 201, "{}", res.text().await.unwrap());
+}

@@ -29,6 +29,10 @@ use tokio::time::Instant;
 /// The `detail` of rule 2's refusal (section 8.10).
 pub const VOTERS_CHANGING: &str = "the previous voter-set change has not reached a majority of voters yet; try again once they have acknowledged it";
 
+/// The `detail` of the refusal while the `nodes` rows and the change log
+/// disagree on the voters ([`NodeHub::voter_change_gate`]).
+pub const VOTERS_DISAGREE: &str = "the voter rows and the change log disagree on the voters; the change waits until they agree, which the disagreeing machine's next session brings about";
+
 impl NodeHub {
     /// Records that `node_id` acknowledged, with `command_result` `ok`, a
     /// `desired_state` carrying voter-set version `version`. The version
@@ -49,29 +53,54 @@ impl NodeHub {
     /// nobody has acknowledged yet. Returns that version and the number of
     /// current voters.
     ///
-    /// When the rows and the change log disagree on the voters, the gate
-    /// still counts the rows' voters at the log's version: refusing there
-    /// would keep the version from ever moving on, and no support counts at a
-    /// disagreeing version anyway (rule 4, [`crate::voters`]).
+    /// **Rows and log must agree.** While the `nodes` rows and the change
+    /// log disagree on the voters (the bug class of [`crate::voters`]), the
+    /// gate refuses before it counts anything. Counting the rows' voters at
+    /// the log's version would let a change pass that the log does not see
+    /// as one: adding a vote the log already gives keeps the version, so the
+    /// next change would pass on the same acknowledgements and land two
+    /// voters away from the last acknowledged set (rules 1 and 2). Only this
+    /// read's disagreement refuses, not the one [`crate::voters::VoterLog`]
+    /// remembers for support: that one lasts until the version moves, which
+    /// would then never happen.
+    ///
+    /// A disagreement heals at the disagreeing machine's next session:
+    /// `connect_node` (its `hello`) always appends the whole row
+    /// (`driver::node_payload`, with `roles` and `status`) to the change log,
+    /// and `disconnect_node` does too when the row was `connected`. The
+    /// replay then follows the row, the version moves to that entry's `seq`
+    /// if the machine joined or left the set, and the voter watch sends every
+    /// voter the new `spec.votes`. A machine that never connects again, or a
+    /// row turned `removed` without its entry (a removed machine has no
+    /// session), does not heal this way.
     ///
     /// # Errors
     ///
-    /// `conflict` while a majority of the current voters has not
-    /// acknowledged the current version; `internal` when the set cannot be
-    /// read.
+    /// `conflict` while the rows and the log disagree on the voters, or
+    /// while a majority of the current voters has not acknowledged the
+    /// current version; `internal` when the set cannot be read.
     pub(crate) async fn voter_change_gate(
         &self,
         conn: &mut SqliteConnection,
     ) -> Result<(u64, usize), ApiError> {
-        let (version, voters) = self
+        let set = self
             .0
             .voters
             .read_on(conn)
             .await
             .map_err(|e| ApiError::internal(&e))?;
+        if let Some(differs) = &set.disagreement {
+            tracing::warn!(
+                version = set.version,
+                only_in_rows = ?differs.only_in_rows,
+                only_in_log = ?differs.only_in_log,
+                "a voter-set change waits: the voters in the nodes rows and those the change log replays differ"
+            );
+            return Err(ApiError::conflict(VOTERS_DISAGREE));
+        }
         let acks = self.0.votes_acks.lock().expect("votes acks lock");
-        if crate::voters::change_allowed(version, &voters, |id| acks.get(id).copied()) {
-            Ok((version, voters.len()))
+        if crate::voters::change_allowed(set.version, &set.voters, |id| acks.get(id).copied()) {
+            Ok((set.version, set.voters.len()))
         } else {
             Err(ApiError::conflict(VOTERS_CHANGING))
         }

@@ -137,6 +137,17 @@ impl VoterSet {
     }
 }
 
+/// The voter set as a write transaction sees it ([`VoterLog::read_on`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetOnWrite {
+    /// The voter-set version the change log gives.
+    pub version: u64,
+    /// The voters the `nodes` rows give, oldest enrolled first.
+    pub voters: Vec<Voter>,
+    /// How the rows and the log differ in this read, `None` when they agree.
+    pub disagreement: Option<Disagreement>,
+}
+
 /// What the replay knows of one node.
 #[derive(Clone, Debug, Default)]
 struct NodeFacts {
@@ -501,18 +512,19 @@ impl VoterLog {
         Ok(set)
     }
 
-    /// The voter-set version and the voters as `conn` sees them: the replay
-    /// kept in memory, the `node` entries after it and the `nodes` rows. The
-    /// kept replay is not advanced, because `conn` may be a write transaction
-    /// whose entries could still roll back (as [`VoterLog::required_set`]).
-    /// A change of the voter set reads it here, in its own write
-    /// transaction, so rule 2 of section 8.10 counts against the version that
-    /// transaction sees ([`change_allowed`]).
+    /// The voter-set version, the voters and how the rows and the log
+    /// disagree, as `conn` sees them: the replay kept in memory, the `node`
+    /// entries after it and the `nodes` rows. The kept replay is not
+    /// advanced, nor is the disagreement remembered, because `conn` may be a
+    /// write transaction whose entries could still roll back (as
+    /// [`VoterLog::required_set`]). A change of the voter set reads it here,
+    /// in its own write transaction, so rule 2 of section 8.10 counts against
+    /// the version that transaction sees ([`change_allowed`]).
     ///
     /// # Errors
     ///
     /// A database error, or a `roles` column that is not a list of roles.
-    pub async fn read_on(&self, conn: &mut SqliteConnection) -> Result<(u64, Vec<Voter>), String> {
+    pub async fn read_on(&self, conn: &mut SqliteConnection) -> Result<SetOnWrite, String> {
         let mut replay = self.cache().replay.clone();
         let read = |e: sqlx::Error| format!("cannot read the voter set: {e}");
         let entries: Vec<(i64, String, String, String)> = sqlx::query_as(
@@ -535,7 +547,14 @@ impl VoterLog {
             let payload: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
             replay.apply(seq, &op, &node_id, &payload);
         }
-        Ok((replay.version, voters_of(rows)?))
+        let voters = voters_of(rows)?;
+        let listed: BTreeSet<&str> = voters.iter().map(|voter| voter.node_id.as_str()).collect();
+        let disagreement = disagreement(&listed, &replay.members());
+        Ok(SetOnWrite {
+            version: replay.version,
+            voters,
+            disagreement,
+        })
     }
 
     /// The newest set [`VoterLog::current`] read, `None` before the first.
