@@ -212,7 +212,7 @@ function DangerZone({ app }: { app: AppDetail }) {
             <Button variant="default" onClick={() => setConfirm(false)}>
               Keep the app
             </Button>
-            <Button variant="danger-solid" disabled={remove.isPending} onClick={() => remove.mutate()}>
+            <Button busy={remove.isPending} variant="danger-solid" disabled={remove.isPending} onClick={() => remove.mutate()}>
               {remove.isPending ? 'Deleting…' : 'Delete'}
             </Button>
           </div>

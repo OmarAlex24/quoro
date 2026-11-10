@@ -172,6 +172,7 @@ export function AppEnvDialog({
               Cancel
             </Button>
             <Button
+              busy={save.isPending}
               variant="primary"
               disabled={save.isPending}
               onClick={submit}

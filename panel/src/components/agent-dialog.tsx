@@ -165,7 +165,7 @@ export function CreateAgentDialog({
             <Button variant="default" onClick={() => onOpenChange(false)}>
               Cancel
             </Button>
-            <Button variant="primary" type="submit" disabled={create.isPending}>
+            <Button busy={create.isPending} variant="primary" type="submit" disabled={create.isPending}>
               {create.isPending ? 'Creating…' : 'Create agent'}
             </Button>
           </div>
@@ -254,6 +254,7 @@ export function EditAgentDialog({
               Cancel
             </Button>
             <Button
+              busy={save.isPending}
               variant="primary"
               type="submit"
               disabled={save.isPending || agentPatchIsEmpty(patch)}

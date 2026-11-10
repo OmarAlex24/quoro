@@ -305,6 +305,7 @@ export function CreateVmDialog({
                 </div>
                 <div className="mt-3 flex flex-wrap gap-2">
                   <Button
+                    busy={createProjectMutation.isPending}
                     variant="default"
                     disabled={
                       createProjectMutation.isPending ||
@@ -359,7 +360,7 @@ export function CreateVmDialog({
             <Button variant="default" onClick={() => onOpenChange(false)}>
               Cancel
             </Button>
-            <Button variant="primary" type="submit" disabled={createVmMutation.isPending}>
+            <Button busy={createVmMutation.isPending} variant="primary" type="submit" disabled={createVmMutation.isPending}>
               {createVmMutation.isPending ? 'Creating…' : 'Create VM'}
             </Button>
           </div>

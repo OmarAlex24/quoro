@@ -123,6 +123,7 @@ export function UsersScreen() {
       {usersQuery.hasNextPage ? (
         <div className="flex justify-center">
           <Button
+            busy={usersQuery.isFetchingNextPage}
             variant="default"
             onClick={() => void usersQuery.fetchNextPage()}
             disabled={usersQuery.isFetchingNextPage}

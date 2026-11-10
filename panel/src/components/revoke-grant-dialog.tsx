@@ -39,7 +39,7 @@ export function RevokeGrantDialog({
             <Button variant="default" onClick={() => onOpenChange(false)}>
               Keep grant
             </Button>
-            <Button variant="danger-solid" disabled={pending} onClick={onConfirm}>
+            <Button busy={pending} variant="danger-solid" disabled={pending} onClick={onConfirm}>
               {pending ? 'Revoking…' : 'Revoke grant'}
             </Button>
           </div>

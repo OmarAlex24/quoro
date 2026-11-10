@@ -87,6 +87,7 @@ export function BuildView({
         <div className="flex flex-wrap items-center gap-2">
           {!terminal && canWrite ? (
             <Button
+              busy={cancel.isPending}
               variant="danger"
               disabled={cancel.isPending}
               onClick={() => cancel.mutate()}

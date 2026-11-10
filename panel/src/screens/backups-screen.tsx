@@ -348,6 +348,7 @@ export function BackupsScreen() {
                       Keep the current key
                     </Button>
                     <Button
+                      busy={rotate.isPending}
                       variant="primary"
                       disabled={rotate.isPending}
                       onClick={() => rotate.mutate(target)}

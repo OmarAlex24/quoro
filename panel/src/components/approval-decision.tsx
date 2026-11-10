@@ -195,6 +195,7 @@ export function ApprovalDecision({
                   Cancel
                 </Button>
                 <Button
+                  busy={decide.isPending}
                   variant={confirm === 'approve' && destructive ? 'danger-solid' : 'primary'}
                   disabled={decide.isPending}
                   onClick={() => decide.mutate({ kind: confirm, note })}

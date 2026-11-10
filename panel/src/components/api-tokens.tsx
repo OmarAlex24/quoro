@@ -248,6 +248,7 @@ export function ApiTokens() {
             Create
           </span>
           <Button
+            busy={create.isPending}
             variant="primary"
             type="submit"
             className="self-start max-sm:w-full"
@@ -312,6 +313,7 @@ export function ApiTokens() {
                 Keep token
               </Button>
               <Button
+                busy={revoke.isPending}
                 variant="danger-solid"
                 disabled={revoke.isPending}
                 onClick={() => {

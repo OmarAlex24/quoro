@@ -149,7 +149,7 @@ export function AppDomains({
             <option value="tunnel">Cloudflare Tunnel</option>
             <option value="acme">ACME certificate</option>
           </select>
-          <Button variant="default" type="submit" disabled={add.isPending}>
+          <Button busy={add.isPending} variant="default" type="submit" disabled={add.isPending}>
             {add.isPending ? 'Adding…' : 'Add domain'}
           </Button>
         </form>

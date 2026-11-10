@@ -591,6 +591,7 @@ function AgentSettings({ agent }: { agent: Agent }) {
               Edit
             </Button>
             <Button
+              busy={toggle.isPending}
               variant="default"
               disabled={toggle.isPending}
               onClick={() => {
@@ -634,7 +635,7 @@ function AgentSettings({ agent }: { agent: Agent }) {
                 <Button variant="default" onClick={() => setConfirmDelete(false)}>
                   Keep the agent
                 </Button>
-                <Button variant="danger-solid" disabled={remove.isPending} onClick={() => remove.mutate()}>
+                <Button busy={remove.isPending} variant="danger-solid" disabled={remove.isPending} onClick={() => remove.mutate()}>
                   {remove.isPending ? 'Deleting…' : 'Delete agent'}
                 </Button>
               </div>

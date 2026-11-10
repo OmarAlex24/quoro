@@ -269,6 +269,7 @@ function AppsPart({
       {loadProblem ? <ProblemBanner view={loadProblem} className="mt-3" /> : null}
       {nextCursor !== null ? (
         <Button
+          busy={loadMorePending}
           variant="default"
           className="mt-3"
           disabled={loadMorePending}

@@ -100,7 +100,7 @@ export function NewProjectDialog({
             <Button variant="default" onClick={() => onOpenChange(false)}>
               Cancel
             </Button>
-            <Button variant="primary" type="submit" disabled={!ready || create.isPending}>
+            <Button busy={create.isPending} variant="primary" type="submit" disabled={!ready || create.isPending}>
               {create.isPending ? 'Creating…' : 'Create project'}
             </Button>
           </div>
