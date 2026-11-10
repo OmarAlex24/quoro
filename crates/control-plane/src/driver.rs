@@ -429,7 +429,9 @@ fn optional_json_value(text: Option<String>) -> Result<Value, ApiError> {
     }
 }
 
-/// The full `nodes` row as JSON, the change-log payload of a node change.
+/// The full `nodes` row as JSON, the change-log payload of a node change:
+/// every column of `db-schema.sql` and its migrations, so a rebuild from the
+/// log (section 7.3 step 4) gets the whole row from the newest entry.
 pub(crate) async fn node_payload(conn: &mut SqliteConnection, id: &str) -> Result<Value, ApiError> {
     let row = sqlx::query("SELECT * FROM nodes WHERE id = ?")
         .bind(id)
@@ -457,7 +459,14 @@ pub(crate) async fn node_payload(conn: &mut SqliteConnection, id: &str) -> Resul
         "created_at": row.try_get::<String, _>("created_at")?,
         "fence_failure": optional_json_value(row.try_get("fence_failure")?)?,
         "fence_ack_pending": optional_json_value(row.try_get("fence_ack_pending")?)?,
+        "volume_snapshot": row.try_get::<Option<String>, _>("volume_snapshot")?,
+        "subnet": row.try_get::<Option<String>, _>("subnet")?,
+        "mesh_public_key": row.try_get::<Option<String>, _>("mesh_public_key")?,
+        "mesh_address": row.try_get::<Option<String>, _>("mesh_address")?,
         "lost_at": row.try_get::<Option<String>, _>("lost_at")?,
+        "custody_public_key": row.try_get::<Option<String>, _>("custody_public_key")?,
+        "custody_key_changed_at": row.try_get::<Option<String>, _>("custody_key_changed_at")?,
+        "signing_key_id": row.try_get::<Option<String>, _>("signing_key_id")?,
     }))
 }
 

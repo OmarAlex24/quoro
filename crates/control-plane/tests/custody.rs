@@ -8,6 +8,7 @@ mod common;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use common::replay;
 use common::{Server, restart_with_resolver, start_patient_in};
 use futures_util::{SinkExt, StreamExt};
 use quoro_control_plane::ReferenceAsDigest;
@@ -302,12 +303,15 @@ async fn seal_rows(server: &Server, node_id: &str) -> Vec<(String, String)> {
 }
 
 /// Every custody write in the change log: seals, bound keys and refused
-/// changes. A `hello` also writes the node's row, which carries none of them.
+/// changes. A `hello` also writes the node's whole row, which carries both
+/// custody columns with every other column; it is told apart by `status`,
+/// which no custody write carries.
 async fn custody_writes(server: &Server) -> i64 {
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM change_log WHERE entity_type = 'node_key_custody' \
-         OR json_type(payload, '$.custody_public_key') IS NOT NULL \
-         OR json_type(payload, '$.custody_key_changed_at') IS NOT NULL",
+         OR (entity_type = 'node' AND json_type(payload, '$.status') IS NULL \
+             AND (json_type(payload, '$.custody_public_key') IS NOT NULL \
+                  OR json_type(payload, '$.custody_key_changed_at') IS NOT NULL))",
     )
     .fetch_one(server.state.store.pool())
     .await
@@ -1032,4 +1036,139 @@ async fn the_cluster_reports_its_signing_key_id() {
         expected_keys(&server.data_dir)[0].1.as_str()
     );
     assert!(cluster.get("signing_key_rotation").is_none(), "{cluster}");
+}
+
+/// Section 7.3 step 4 (ADR 0297): every column of a node's row survives a
+/// rebuild from the change log. The machine enrolls (its subnet), says
+/// `hello` with a mesh key (its mesh address), a snapshot method and a
+/// custody key, and says `hello` again with another custody key (its
+/// `custody_key_changed_at`). Its `signing_key_id`, which no code path
+/// writes yet, is set in the row before the first `hello`, whose entry
+/// carries the whole row. Replaying the `node` entries in `seq` order into
+/// an empty database gives the same rows, column for column, and the
+/// newest whole-row entry names every column of `nodes`.
+#[tokio::test]
+async fn node_entries_rebuild_every_column_of_the_row() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, "node-a", &["node"]).await;
+    let mesh_key = STANDARD.encode([5u8; 32]);
+    let signing_key_id = server.state.keys.key_id().to_string();
+    sqlx::query("UPDATE nodes SET signing_key_id = ? WHERE id = ?")
+        .bind(&signing_key_id)
+        .bind(&node.node_id)
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+
+    let full_hello = |key: &CustodyKey| {
+        let mut message = hello(&node.node_id, Some(key.public_key().to_base64()));
+        if let NodeMessage::Hello(hello) = &mut message {
+            hello.mesh_public_key = Some(mesh_key.clone());
+            hello.volume_snapshot = Some(wire::SnapshotMethod::Reflink);
+        }
+        message
+    };
+    let open = |message: NodeMessage| async {
+        let mut socket = connect(&server, &node.credential).await;
+        send_with_id(&mut socket, message, HELLO_ID).await;
+        let mut frames = Vec::new();
+        loop {
+            let frame = recv_frame(&mut socket).await;
+            let done = frame["type"] == "desired_state";
+            frames.push(frame);
+            if done {
+                return (socket, frames);
+            }
+        }
+    };
+
+    // The first key binds; the session ends and the primary records it.
+    let (socket, frames) = open(full_hello(&new_key())).await;
+    assert!(of_type(&frames, "error").is_empty(), "{frames:?}");
+    drop(socket);
+    let mut ended = false;
+    for _ in 0..400 {
+        let status: String = sqlx::query_scalar("SELECT status FROM nodes WHERE id = ?")
+            .bind(&node.node_id)
+            .fetch_one(server.state.store.pool())
+            .await
+            .unwrap();
+        if status == "disconnected" {
+            ended = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(ended, "the primary never recorded the first session's end");
+    // Another key is refused and recorded; this session stays open, so no
+    // session end writes the row while the test reads it.
+    let (mut socket, frames) = open(full_hello(&new_key())).await;
+    let errors = of_type(&frames, "error");
+    assert_eq!(errors.len(), 1, "{frames:?}");
+    assert_eq!(errors[0]["body"]["code"], "custody_key_changed");
+    assert!(of_type(&ping(&mut socket, 1).await, "error").is_empty());
+
+    #[allow(clippy::type_complexity)]
+    let row: (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT volume_snapshot, subnet, mesh_public_key, mesh_address, custody_public_key, \
+         custody_key_changed_at, signing_key_id FROM nodes WHERE id = ?",
+    )
+    .bind(&node.node_id)
+    .fetch_one(server.state.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(row.0.as_deref(), Some("reflink"));
+    assert!(row.1.is_some(), "a subnet: {row:?}");
+    assert_eq!(row.2.as_deref(), Some(mesh_key.as_str()));
+    assert!(row.3.is_some(), "a mesh address: {row:?}");
+    assert!(row.4.is_some(), "a bound custody key: {row:?}");
+    assert!(row.5.is_some(), "a changed custody key: {row:?}");
+    assert_eq!(row.6.as_deref(), Some(signing_key_id.as_str()));
+
+    let rebuilt = replay::rebuild(&server, &["node"], &[]).await;
+    let columns = replay::column_names(&server.state.store, "nodes").await;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nodes")
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+    let names: Vec<&str> = columns.iter().map(String::as_str).collect();
+    replay::assert_rebuilt(
+        &server,
+        &rebuilt,
+        "nodes",
+        &names,
+        usize::try_from(count).unwrap(),
+    )
+    .await;
+
+    // A whole-row entry names every column, so a column no write path sets
+    // yet still travels once one does.
+    let payload: String = sqlx::query_scalar(
+        "SELECT payload FROM change_log WHERE entity_type = 'node' AND entity_id = ? \
+         AND json_type(payload, '$.status') IS NOT NULL ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(&node.node_id)
+    .fetch_one(server.state.store.pool())
+    .await
+    .unwrap();
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    let mut logged: Vec<&str> = payload
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    logged.sort_unstable();
+    let mut expected = names.clone();
+    expected.sort_unstable();
+    assert_eq!(logged, expected);
 }
