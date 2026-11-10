@@ -1212,6 +1212,49 @@ async fn a_restart_keeps_the_newest_base_and_the_newest_candidate_above_it() {
     assert_eq!(source.status().snapshot_seq, Some(3));
 }
 
+/// A returning source restarts as the target of its volume: every snapshot
+/// it kept stays, also the ones the restart rule would drop, and a
+/// quarantined copy is never one of its warm snapshots (section 9).
+#[tokio::test]
+async fn a_restart_as_the_target_keeps_every_snapshot_for_the_hand_over() {
+    let target = Target::new("restart-as-target").await;
+    let source = Source::new("restart-as-target", target.addr.port(), lease_view(TOKEN)).await;
+    let id = VolumeId(VOL.to_owned());
+    for (purpose, seq) in [
+        (KeepPurpose::WarmBase, Some(1)),
+        (KeepPurpose::WarmBase, Some(3)),
+        (KeepPurpose::WarmShipping, Some(2)),
+        (KeepPurpose::WarmShipping, Some(4)),
+        (KeepPurpose::Quarantine, None),
+    ] {
+        let snapshot = source.engine.snapshot_volume(&id).await.expect("snapshot");
+        kept::keep(&source.store, APP, &snapshot, purpose, seq, None)
+            .await
+            .expect("keep");
+    }
+    set_entry(&source.desired, |entry| {
+        entry.warm.as_mut().expect("warm").role = WarmRole::Target;
+    });
+    source.sender.restore().await;
+    assert_eq!(source.kept().await.len(), 5);
+    assert_eq!(source.snapshot_count(), 5);
+
+    // As the source again, the rule applies to the warm snapshots only.
+    set_entry(&source.desired, |entry| {
+        entry.warm.as_mut().expect("warm").role = WarmRole::Source;
+    });
+    source.sender.restore().await;
+    assert_eq!(
+        source.kept().await,
+        vec![
+            (KeepPurpose::Quarantine.as_str().to_owned(), None),
+            base_entry(KeepPurpose::WarmBase, 3),
+            base_entry(KeepPurpose::WarmShipping, 4)
+        ]
+    );
+    assert_eq!(source.snapshot_count(), 3);
+}
+
 #[tokio::test]
 async fn a_volume_that_stops_being_warm_keeps_nothing_and_a_new_target_keeps_all() {
     let target = Target::new("retired").await;

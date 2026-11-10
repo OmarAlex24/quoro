@@ -42,6 +42,10 @@ use crate::warm::sender::{SenderOptions, WarmSender};
 use crate::warm::{StatusBoard, VolumeLocks};
 use crate::{AgentConfig, AgentError, NodeFacts, util};
 
+/// How many times the quarantined copies are read at start, a second apart,
+/// before the start fails.
+const QUARANTINE_LOAD_TRIES: u32 = 10;
+
 /// Runs the node until `shutdown` resolves.
 ///
 /// The reconciler keeps the engine matching the last verified snapshot, and the
@@ -50,7 +54,8 @@ use crate::{AgentConfig, AgentError, NodeFacts, util};
 /// # Errors
 ///
 /// [`AgentError::Identity`] when the node is not enrolled,
-/// [`AgentError::Store`] when the database cannot be opened, and
+/// [`AgentError::Store`] when the database cannot be opened or the
+/// quarantined copies cannot be read, and
 /// [`AgentError::Fatal`] when the primary rejected the credential or removed
 /// the node.
 pub async fn run<E: Engine + 'static>(
@@ -209,7 +214,9 @@ pub async fn run<E: Engine + 'static>(
 
     // Warm replication (section 6.13): the receiver holds the copies this
     // node is the target of, and the sender ships the volumes it is the
-    // source of. Their status entries go out in `status_report.warm`.
+    // source of. Their status entries go out in `status_report.warm`, and
+    // the copies a returning source quarantined in
+    // `status_report.quarantines` (section 9).
     let (warm_board, warm_statuses) = StatusBoard::new();
     let warm_receiver = WarmReceiver::new(
         Arc::clone(&engine),
@@ -219,6 +226,19 @@ pub async fn run<E: Engine + 'static>(
         warm_board.clone(),
         ReceiverOptions::default(),
     );
+    let quarantine_statuses = warm_receiver.quarantine_statuses();
+    // The primary forgets a deleted copy once a report omits it: the first
+    // report goes out with the list read, never an empty one for a failed
+    // read.
+    let mut tries = 0_u32;
+    while let Err(e) = warm_receiver.load_quarantines().await {
+        tries += 1;
+        if tries >= QUARANTINE_LOAD_TRIES {
+            return Err(AgentError::Store(e));
+        }
+        warn!(error = %e, tries, "could not read the quarantined copies; trying again");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
     let warm_sender = WarmSender::new(
         Arc::clone(&engine),
         store.clone(),
@@ -291,6 +311,7 @@ pub async fn run<E: Engine + 'static>(
     .with_disk_free_path(config.data_dir.clone())
     .with_backups(backup_statuses)
     .with_warm(warm_statuses)
+    .with_quarantines(quarantine_statuses)
     .with_ingress(Arc::clone(&ingress), dns)
     .with_metrics(metrics)
     .with_edge(Arc::clone(&edge))

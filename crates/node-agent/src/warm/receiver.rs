@@ -44,6 +44,13 @@
 //! reported in `status_report.warm`, never in `status_report.volumes`. A
 //! copy the node is no longer the target of stays reported until it is
 //! removed, so the primary can always send its `deleted` entry (ADR 0267).
+//!
+//! **A returning source** (section 9) still holds the volume as its own when
+//! it finds itself the target. Each pass hands such a volume over before any
+//! stream of it is accepted ([`handover`]): its live file goes, kept first as
+//! a quarantined copy unless it shows no change against the base, and the
+//! next stream is a full copy. The first complete stream then releases the
+//! warm snapshots the node kept as the volume's source.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::Infallible;
@@ -60,7 +67,8 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use quoro_backup::cells::{CELL, CellHashes, hash_cell, zero_cell_hash};
 use quoro_engine::{Engine, EngineError, StageFrom, StagedVolume, VolumeId};
 use quoro_proto::wire::{
-    Spec, SpecVolumeFile, SpecVolumeState, SpecWarm, VolumeState, WarmRole, WarmStatus,
+    QuarantineStatus, Spec, SpecVolumeFile, SpecVolumeState, SpecWarm, VolumeState, WarmRole,
+    WarmStatus,
 };
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedMutexGuard, Semaphore, watch};
@@ -68,9 +76,12 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use super::frame::{Answer, AnswerStatus, Decoder, Frame, RefuseReason, Sequence, StreamHeader};
+use super::quarantine::Quarantines;
 use super::{StatusBoard, VolumeLocks};
 use crate::reconcile::Snapshot;
-use crate::store::{NodeStore, PendingCommit, WarmTargetRecord};
+use crate::store::{
+    KeptSnapshotRecord, NodeStore, PendingCommit, VolumeQuarantineRecord, WarmTargetRecord,
+};
 use crate::util;
 
 /// The path a stream is posted to (section 6.13).
@@ -99,6 +110,9 @@ pub struct ReceiverOptions {
     pub drain_bytes: u64,
     /// How often a listener that could not bind is tried again.
     pub bind_retry: Duration,
+    /// How long a quarantined copy whose hash failed waits before the next
+    /// try; each further failure doubles it, up to 30 minutes.
+    pub hash_retry: Duration,
 }
 
 impl Default for ReceiverOptions {
@@ -108,6 +122,7 @@ impl Default for ReceiverOptions {
             drain_timeout: Duration::from_secs(5),
             drain_bytes: 64 << 20,
             bind_retry: Duration::from_secs(5),
+            hash_retry: Duration::from_secs(30),
         }
     }
 }
@@ -121,6 +136,7 @@ impl ReceiverOptions {
             drain_timeout: Duration::from_secs(2),
             drain_bytes: 64 << 20,
             bind_retry: Duration::from_millis(50),
+            hash_retry: Duration::from_millis(50),
         }
     }
 }
@@ -158,6 +174,17 @@ struct Inner<E: Engine> {
     publishing: tokio::sync::Mutex<()>,
     /// Volumes whose copy a task removes once their lock is free.
     deleting: StdMutex<BTreeSet<String>>,
+    /// The quarantined copies a hand-over keeps (section 9).
+    quarantines: Quarantines<E>,
+    /// The volumes whose hand-over waits for a VM, logged once.
+    waiting_for_vm: StdMutex<BTreeSet<String>>,
+    /// How many passes in a row the engine refused each volume's hand-over.
+    hand_over_refusals: StdMutex<HashMap<String, u32>>,
+    /// The quarantined copy of each volume whose records could not be
+    /// committed: kept, since the commit may still come back at the next
+    /// start, and recorded by the next run while the live file still matches
+    /// it.
+    unrecorded: StdMutex<HashMap<String, (KeptSnapshotRecord, VolumeQuarantineRecord)>>,
     /// Held by a test to keep a pending copy's resolution from starting.
     #[cfg(test)]
     recovery_gate: tokio::sync::Mutex<()>,
@@ -246,6 +273,8 @@ impl<E: Engine + 'static> WarmReceiver<E> {
         board: StatusBoard,
         options: ReceiverOptions,
     ) -> Self {
+        let (quarantines, _) =
+            Quarantines::new(Arc::clone(&engine), store.clone(), options.hash_retry);
         Self {
             inner: Arc::new(Inner {
                 engine,
@@ -259,6 +288,10 @@ impl<E: Engine + 'static> WarmReceiver<E> {
                 leftovers: StdMutex::new(HashMap::new()),
                 publishing: tokio::sync::Mutex::new(()),
                 deleting: StdMutex::new(BTreeSet::new()),
+                quarantines,
+                waiting_for_vm: StdMutex::new(BTreeSet::new()),
+                hand_over_refusals: StdMutex::new(HashMap::new()),
+                unrecorded: StdMutex::new(HashMap::new()),
                 #[cfg(test)]
                 recovery_gate: tokio::sync::Mutex::new(()),
                 #[cfg(test)]
@@ -267,9 +300,39 @@ impl<E: Engine + 'static> WarmReceiver<E> {
         }
     }
 
+    /// What `status_report.quarantines` carries: the quarantined copies of a
+    /// volume this node keeps (sections 5.3 and 9).
+    #[must_use]
+    pub fn quarantine_statuses(&self) -> watch::Receiver<Vec<QuarantineStatus>> {
+        self.inner.quarantines.statuses()
+    }
+
+    /// Reads the recorded quarantined copies into the list, before the
+    /// session sends its first report: the primary drops the record of a
+    /// copy an operator deleted once a report no longer lists it, so no
+    /// report may omit a copy the node still keeps.
+    ///
+    /// # Errors
+    ///
+    /// The store's error when the records cannot be read; the list stays
+    /// empty, and no report may go out with it.
+    pub async fn load_quarantines(&self) -> Result<(), String> {
+        self.inner.quarantines.publish().await
+    }
+
+    /// Reports the quarantined copies when the list changed, so a failed
+    /// read leaves no deleted copy listed for long, and hashes the copies
+    /// without a hash.
+    async fn refresh_quarantines(&self) {
+        if let Err(e) = self.inner.quarantines.refresh().await {
+            warn!(error = %e, "could not read the quarantined copies; the next pass tries again");
+        }
+    }
+
     /// Keeps the listeners, the target rows and the status entries in step
     /// with the desired state until `shutdown` resolves. The copies a crash
-    /// left pending are resolved meanwhile, in a task of their own.
+    /// left pending are resolved meanwhile, in a task of their own, and each
+    /// pass hashes the quarantined copies without a hash.
     pub async fn run(self, shutdown: impl Future<Output = ()> + Send) {
         let mut shutdown = std::pin::pin!(shutdown);
         // Not awaited: the hashes would hold back every listener. Nothing
@@ -357,9 +420,11 @@ impl<E: Engine + 'static> WarmReceiver<E> {
         }
     }
 
-    /// One pass: records the volumes this node is the target of, removes the
-    /// copies of `deleted` entries, opens and closes listeners, and publishes
-    /// the status entries.
+    /// One pass: records the volumes this node is the target of, hands over
+    /// the ones it still holds as its own (section 9), deletes the
+    /// quarantined copies an operator deleted, reports the quarantined copies
+    /// and hashes the ones without a hash, removes the copies of `deleted`
+    /// entries, opens and closes listeners, and publishes the status entries.
     async fn pass(&self, listeners: &mut BTreeMap<SocketAddr, JoinHandle<()>>) {
         let spec = self
             .inner
@@ -368,6 +433,7 @@ impl<E: Engine + 'static> WarmReceiver<E> {
             .as_ref()
             .map(|snapshot| snapshot.state.spec.clone());
         let Some(spec) = spec else {
+            self.refresh_quarantines().await;
             self.inner.publish().await;
             return;
         };
@@ -382,6 +448,16 @@ impl<E: Engine + 'static> WarmReceiver<E> {
                 warn!(volume_id = %file.volume_id, error = %e, "could not record a warm target");
             }
         }
+        // Before any stream of it is accepted: a stream finds the volume
+        // still the node's own until its hand-over ends.
+        for (file, _) in &targets {
+            self.inner.hand_over(&file.volume_id).await;
+        }
+        self.inner
+            .quarantines
+            .delete(&spec.quarantine_deletes)
+            .await;
+        self.refresh_quarantines().await;
         for file in &spec.volumes {
             if file.state == SpecVolumeState::Deleted {
                 self.inner.delete_copy(&file.volume_id).await;
@@ -677,11 +753,14 @@ impl<E: Engine + 'static> Inner<E> {
             .await
             .map_err(Reject::Failed)?
         {
-            let reason = "this node holds the volume as its own; it takes no stream until \
-                          the volume is handed over as the warm copy"
-                .to_owned();
-            self.set_error(&header.volume_id, Some(&reason)).await;
-            return Err(Reject::Failed(reason));
+            // Not now, not an error: the hand-over waits for the old VM to
+            // go, and the source keeps its base and sends again (`busy`,
+            // section 6.13).
+            debug!(
+                volume_id = %header.volume_id,
+                "refused a stream: the node still holds the volume as its own until its hand-over ends"
+            );
+            return Err(Reject::Refuse(RefuseReason::Busy, seq));
         }
         let mut record = self
             .store
@@ -830,6 +909,8 @@ impl<E: Engine + 'static> Inner<E> {
                     // The pending copy is still recorded: the next stream or
                     // start finds it by its hash.
                     warn!(volume_id = %header.volume_id, error = %e, "could not record a swapped-in copy");
+                } else {
+                    self.release_returning_snapshots(&header.volume_id).await;
                 }
                 self.set_error(&header.volume_id, None).await;
                 info!(
@@ -1611,6 +1692,8 @@ where
         }
     }
 }
+
+mod handover;
 
 #[cfg(test)]
 mod tests;
