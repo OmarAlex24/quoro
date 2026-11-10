@@ -816,7 +816,7 @@ async fn build_and_deployment_entries_rebuild_their_rows() {
         .unwrap();
     assert_eq!(marker.as_deref(), Some("cancel requested"));
 
-    let rebuilt = replay::rebuild(&server, &["build", "deployment"], &[]).await;
+    let rebuilt = replay::rebuild(&server, &["build", "deployment"]).await;
     replay::assert_rebuilt(
         &server,
         &rebuilt,

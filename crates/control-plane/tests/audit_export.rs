@@ -247,7 +247,7 @@ async fn create_probes_and_refuses_a_second_or_a_wrong_provider() {
 #[tokio::test]
 async fn export_entries_rebuild_the_row() {
     let (server, _export) = setup(&MemoryStore::new()).await;
-    let rebuilt = replay::rebuild(&server, &["audit_export"], &[]).await;
+    let rebuilt = replay::rebuild(&server, &["audit_export"]).await;
     replay::assert_rebuilt(
         &server,
         &rebuilt,

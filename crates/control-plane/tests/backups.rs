@@ -1065,7 +1065,7 @@ async fn a_provider_entry_rebuilds_its_row() {
     let owner = server.owner().await;
     create_repository(&owner, &server).await;
 
-    let rebuilt = replay::rebuild(&server, &["provider"], &[]).await;
+    let rebuilt = replay::rebuild(&server, &["provider"]).await;
     replay::assert_rebuilt(
         &server,
         &rebuilt,

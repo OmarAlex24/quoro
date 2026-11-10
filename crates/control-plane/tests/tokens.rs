@@ -2,7 +2,9 @@
 //! `revokeToken`).
 //!
 //! The security-critical parts: the secret is shown once and only its hash is
-//! stored or logged, a token authenticates as its human until it expires or
+//! stored, the hash travels in the change log only in the token's `create`
+//! entry (`node-agent-protocol.md` section 7.1, ADR 0317), a token
+//! authenticates as its human until it expires or
 //! is revoked, a human only ever sees and revokes their own tokens, and an
 //! agent can never manage tokens (`human_only`).
 
@@ -141,8 +143,25 @@ async fn create_shows_the_secret_once_and_it_authenticates_as_the_user() {
     assert_eq!(hash, sha256_hex(secret.as_bytes()));
     for text in logged_text(&server).await {
         assert!(!text.contains(&secret), "a log carries the secret");
-        assert!(!text.contains(&hash), "a log carries the hash");
     }
+    // The hash travels only as the create entry's `token_hash`, and no
+    // audit record carries it.
+    let audit: Vec<(String,)> = sqlx::query_as(AUDIT_PARAMS)
+        .fetch_all(server.state.store.pool())
+        .await
+        .unwrap();
+    assert!(audit.iter().all(|(params,)| !params.contains(&hash)));
+    let carrying: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT entity_type, entity_id, op FROM change_log WHERE instr(payload, ?) > 0",
+    )
+    .bind(&hash)
+    .fetch_all(server.state.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        carrying,
+        vec![("api_token".to_string(), id.clone(), "create".to_string())]
+    );
 
     // The secret authenticates as the owner.
     let (status, me) = me_status(&server, &secret).await;
@@ -200,7 +219,11 @@ async fn each_create_and_revoke_writes_one_change_and_one_audit_record() {
     assert_eq!(payload["id"], id.as_str());
     assert_eq!(payload["user_id"], owner_id.as_str());
     assert_eq!(payload["name"], "ci");
-    assert!(payload.get("token_hash").is_none());
+    assert_eq!(
+        payload["token_hash"],
+        sha256_hex(created["token"].as_str().unwrap().as_bytes()).as_str(),
+        "the create carries the hash"
+    );
 
     let record: AuditRow = sqlx::query_as(
         "SELECT channel, result, scope, target_type, target_id, params, change_seq FROM audit_log \
@@ -238,6 +261,10 @@ async fn each_create_and_revoke_writes_one_change_and_one_audit_record() {
     assert_eq!(rows[1].1, "update");
     let payload: Value = serde_json::from_str(&rows[1].2).unwrap();
     assert!(payload["revoked_at"].is_string());
+    assert!(
+        payload.get("token_hash").is_none(),
+        "an update leaves the hash out"
+    );
     let (revoked_at,): (Option<String>,) =
         sqlx::query_as("SELECT revoked_at FROM api_tokens WHERE id = ?")
             .bind(&id)
@@ -654,4 +681,54 @@ async fn an_agent_is_refused_human_only_on_every_operation() {
             .await
             .unwrap();
     assert_eq!((count, revoked), (1, 0));
+}
+
+/// Section 7.3 step 4 and ADR 0317: replaying the `api_token` entries into an
+/// empty database rebuilds every column of every token, `token_hash`
+/// included, with no placeholder. A revoked token's update merges over a
+/// create that carries the hash. Each rebuilt hash is the SHA-256 of the
+/// secret the API handed out, so a promoted primary accepts the token.
+#[tokio::test]
+async fn the_change_log_rebuilds_every_token_column_and_the_hash_of_its_secret() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let kept = create_ok(&owner, &server, "kept").await;
+    let revoked = create_ok(&owner, &server, "revoked").await;
+    let res = create(
+        &owner,
+        &server,
+        json!({ "name": "dated", "expires_at": rfc3339_in(3600) }),
+    )
+    .await;
+    assert_eq!(res.status(), 201, "create a dated token");
+    let dated: Value = res.json().await.unwrap();
+    let res = owner
+        .delete(server.url(&format!(
+            "/api/v1/tokens/{}",
+            revoked["id"].as_str().unwrap()
+        )))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 204, "revoke");
+
+    let rebuilt = common::replay::rebuild(&server, &["api_token"]).await;
+    let columns = common::replay::column_names(&server.state.store, "api_tokens").await;
+    assert!(columns.iter().any(|c| c == "token_hash"), "{columns:?}");
+    let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
+    common::replay::assert_rebuilt(&server, &rebuilt, "api_tokens", &columns, 3).await;
+
+    for created in [&kept, &revoked, &dated] {
+        let (hash,): (String,) = sqlx::query_as("SELECT token_hash FROM api_tokens WHERE id = ?")
+            .bind(created["id"].as_str().unwrap())
+            .fetch_one(rebuilt.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            hash,
+            sha256_hex(created["token"].as_str().unwrap().as_bytes()),
+            "the rebuilt hash of {} matches its secret",
+            created["id"]
+        );
+    }
 }

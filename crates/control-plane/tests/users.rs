@@ -637,7 +637,7 @@ async fn a_deleted_users_tokens_leave_the_log_with_it() {
     let res = delete_user(&owner, &server, &operator_id).await;
     assert_eq!(res.status(), 204, "delete: {}", res.text().await.unwrap());
 
-    let rebuilt = replay::rebuild(&server, &["user", "api_token"], replay::TOKEN_HASHES).await;
+    let rebuilt = replay::rebuild(&server, &["user", "api_token"]).await;
     replay::assert_rebuilt(
         &server,
         &rebuilt,
@@ -654,6 +654,7 @@ async fn a_deleted_users_tokens_leave_the_log_with_it() {
             "id",
             "user_id",
             "name",
+            "token_hash",
             "expires_at",
             "last_used_at",
             "created_at",

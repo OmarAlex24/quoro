@@ -105,9 +105,9 @@ fn token_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ApiToken, sqlx::Error
 
 const TOKEN_COLUMNS: &str = "id, user_id, name, expires_at, last_used_at, created_at, revoked_at";
 
-/// The change-log payload: the row without `token_hash`. The hash is a
-/// credential, so it stays out of the replicated log, as for `agent_key`
-/// and `node_join_token`.
+/// The change-log payload of an update: the row without `token_hash`, which
+/// a rebuild keeps from the create. Only the create adds the hash
+/// ([`insert_token`]).
 fn token_payload(token: &ApiToken) -> Value {
     json!({
         "id": token.id,
@@ -264,6 +264,7 @@ async fn insert_token(
     let secret = format!("{TOKEN_PREFIX}{}", random_secret());
     debug_assert_ne!(id, secret, "a token secret is never its id");
     let now = now_rfc3339();
+    let token_hash = sha256_hex(secret.as_bytes());
     let mut w = state.store.begin_write().await?;
     sqlx::query(
         "INSERT INTO api_tokens (id, user_id, name, token_hash, expires_at, last_used_at, created_at, revoked_at) \
@@ -272,7 +273,7 @@ async fn insert_token(
     .bind(&id)
     .bind(user_id)
     .bind(name)
-    .bind(sha256_hex(secret.as_bytes()))
+    .bind(&token_hash)
     .bind(&expires_at)
     .bind(&now)
     .execute(&mut *w.tx)
@@ -286,13 +287,20 @@ async fn insert_token(
         created_at: now,
         revoked_at: None,
     };
+    // The create carries the whole row, `token_hash` included
+    // (`node-agent-protocol.md` section 7.1, ADR 0317). A SHA-256 of a random
+    // 32-byte secret gives a following node no usable credential, and a
+    // promoted primary must keep accepting the token, which a recovery run by
+    // agents needs.
+    let mut payload = token_payload(&token_info);
+    payload["token_hash"] = json!(token_hash);
     let seq = changelog::append(
         &mut w.tx,
         &ctx.identity.actor(),
         "api_token",
         &id,
         Op::Create,
-        token_payload(&token_info),
+        payload,
     )
     .await?;
     // The new id goes into the record so it can be paired with its revoke.

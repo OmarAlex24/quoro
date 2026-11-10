@@ -625,13 +625,14 @@ async fn insert_agent_key(
     let secret = format!("{AGENT_KEY_PREFIX}{}", random_secret());
     debug_assert_ne!(id, secret, "an agent key secret is never its id");
     let now = now_rfc3339();
+    let key_hash = sha256_hex(secret.as_bytes());
     sqlx::query(
         "INSERT INTO agent_keys (id, agent_id, key_hash, created_at, revoked_at, last_used_at) \
          VALUES (?, ?, ?, ?, NULL, NULL)",
     )
     .bind(&id)
     .bind(agent_id)
-    .bind(sha256_hex(secret.as_bytes()))
+    .bind(&key_hash)
     .bind(&now)
     .execute(&mut *w.tx)
     .await?;
@@ -642,15 +643,21 @@ async fn insert_agent_key(
         revoked_at: None,
         last_used_at: None,
     };
-    // agent_keys is replicated, but the hash is a credential: the change log
-    // carries the row without `key_hash`, exactly like `node_join_tokens`.
+    // The create carries the whole row, `key_hash` included
+    // (`node-agent-protocol.md` section 7.1, ADR 0317). A SHA-256 of a random
+    // 32-byte secret gives a following node no usable credential, and a
+    // promoted primary must keep accepting the key, which a recovery run by
+    // agents needs. Updates leave the hash out; a rebuild merges them over
+    // this row.
+    let mut payload = agent_key_payload(&key_info);
+    payload["key_hash"] = json!(key_hash);
     let seq = changelog::append(
         &mut w.tx,
         &ctx.identity.actor(),
         "agent_key",
         &id,
         Op::Create,
-        agent_key_payload(&key_info),
+        payload,
     )
     .await?;
     ctx.append_ok(
