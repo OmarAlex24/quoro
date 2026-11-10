@@ -280,6 +280,10 @@ impl Drop for Node {
 
 impl Node {
     async fn enroll(lab: &Lab, name: &str) -> Self {
+        // The registered local node is a voter without a session: record its
+        // acknowledgement, so this second voter passes rule 2 of
+        // node-agent-protocol.md section 8.10.
+        lab.primary.state.hub.ack_voter_set().await;
         let (status, token) = lab
             .primary
             .fixture(
