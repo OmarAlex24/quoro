@@ -147,6 +147,17 @@ pub enum GrantKind {
     /// The answer to a renewal by the lease's current holder (`re` set): not
     /// gated.
     Renewal,
+    /// An answer to a renewal whose gate counts at least `counted_ms`: the
+    /// first answer after a conversion, with the conversion grant's
+    /// duration, or a settle's answer, with the stored `duration_ms` (section
+    /// 8.4, ADR 0254). It is checked as a [`GrantKind::Renewal`], and the
+    /// support it needs is for the duration it carries, as section 8.8 says
+    /// of the grant sent; its gate is `T_grant + D_1 + 2M(D_1)` with `D_1`
+    /// the longer of the two.
+    CountedRenewal {
+        /// The duration the gate counts at least.
+        counted_ms: u64,
+    },
 }
 
 /// One `expiring` grant the primary is about to send. Its `T_grant` is the
@@ -227,6 +238,10 @@ impl Gate {
 #[derive(Debug)]
 pub struct Authority {
     clock: Arc<dyn MonotonicClock>,
+    /// In-crate tests only: a clock that replaces `clock`, so the hub's
+    /// authority runs on a [`ManualClock`].
+    #[cfg(test)]
+    test_clock: Mutex<Option<Arc<dyn MonotonicClock>>>,
     gates: Mutex<HashMap<String, Gate>>,
     support: RwLock<Arc<dyn VoterSupport>>,
 }
@@ -237,6 +252,8 @@ impl Authority {
     pub fn new(clock: Arc<dyn MonotonicClock>) -> Self {
         Self {
             clock,
+            #[cfg(test)]
+            test_clock: Mutex::new(None),
             gates: Mutex::new(HashMap::new()),
             support: RwLock::new(Arc::new(NoVoterSupport)),
         }
@@ -245,7 +262,25 @@ impl Authority {
     /// The authority's clock now.
     #[must_use]
     pub fn now(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(clock) = self
+            .test_clock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            return clock.now();
+        }
         self.clock.now()
+    }
+
+    /// In-crate tests only: measures every gate on `clock` from now on.
+    #[cfg(test)]
+    pub(crate) fn set_test_clock(&self, clock: Arc<dyn MonotonicClock>) {
+        *self
+            .test_clock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(clock);
     }
 
     /// Whether a majority of voters supports a grant of `duration_ms`
@@ -319,12 +354,14 @@ impl Authority {
     /// - no majority support for the duration (section 8.8);
     /// - a [`GrantKind::NewToken`] while the lease's gate is open, whatever
     ///   the holder (section 8.4);
-    /// - a [`GrantKind::Renewal`] to a node that is not the current holder.
+    /// - a [`GrantKind::Renewal`] or [`GrantKind::CountedRenewal`] to a node
+    ///   that is not the current holder.
     ///
     /// A new token starts the holder's gate afresh. A renewal answer raises
     /// the gate when it ends later, and never brings it forward. A renewal of
     /// a lease with no gate starts one: a converted lease gets its first gate
-    /// from the first answer (ADR 0254; conversions are not built yet).
+    /// from the first answer, counted at the longer of its own and the
+    /// conversion grant's duration ([`GrantKind::CountedRenewal`], ADR 0254).
     ///
     /// # Errors
     ///
@@ -336,7 +373,13 @@ impl Authority {
         if !self.supports(grant.duration_ms) {
             return Err(Refused::NoSupport);
         }
-        let after = gate_after(grant.duration_ms);
+        // ADR 0254: the first answer after a conversion counts the longer
+        // of its own and the conversion grant's duration, and `M` from it.
+        let counted = match grant.kind {
+            GrantKind::CountedRenewal { counted_ms } => grant.duration_ms.max(counted_ms),
+            GrantKind::NewToken | GrantKind::Renewal => grant.duration_ms,
+        };
+        let after = gate_after(counted);
         let gate_wall = grant.sent_wall + after;
         let expires_wall = grant.sent_wall + Duration::from_millis(grant.duration_ms);
         let mut gates = self.gates();
@@ -361,7 +404,7 @@ impl Authority {
                     },
                 );
             }
-            GrantKind::Renewal => {
+            GrantKind::Renewal | GrantKind::CountedRenewal { .. } => {
                 if current.is_some_and(|current| current.holder != grant.holder) {
                     return Err(Refused::NotHolder);
                 }
@@ -375,12 +418,9 @@ impl Authority {
                 times: None,
             });
         let gate_mono = now + after;
-        let slot = entry
-            .by_duration
-            .entry(grant.duration_ms)
-            .or_insert(gate_mono);
+        let slot = entry.by_duration.entry(counted).or_insert(gate_mono);
         *slot = (*slot).max(gate_mono);
-        let renewed_at = if grant.kind == GrantKind::Renewal {
+        let renewed_at = if grant.kind != GrantKind::NewToken {
             Some(grant.sent_wall)
         } else {
             entry.times.as_ref().and_then(|times| times.renewed_at)
@@ -445,9 +485,10 @@ impl Authority {
     /// Whether the stored `duration_ms` of `lease_id` may be lowered to
     /// `to_ms`: the gate of every grant longer than that has passed (ADR
     /// 0203). A lease with no gate had no `expiring` grant in this process
-    /// and was not `expiring` at its start, so none is running; a conversion
-    /// grant (ADR 0254, not built yet) must add its duration here before it
-    /// is sent.
+    /// and was not `expiring` at its start, so none is running. A conversion
+    /// grant counts toward no gate (ADR 0241); the first answer after it adds
+    /// the conversion's duration here ([`GrantKind::CountedRenewal`], ADR
+    /// 0254).
     #[must_use]
     pub fn may_lower(&self, lease_id: &str, to_ms: u64) -> bool {
         let now = self.now();
@@ -714,6 +755,47 @@ mod tests {
         assert_eq!(second.renewed_at, Some(format_rfc3339(wall(5))));
         assert_eq!(second.expires_at, format_rfc3339(wall(20)));
         assert_eq!(second.gate_at, format_rfc3339(wall(216)));
+    }
+
+    /// ADR 0254: the first answer after a conversion opens a gate counted at
+    /// the longer of its own and the conversion grant's duration, with `M`
+    /// from that duration, on the authority's monotonic clock only: a
+    /// conversion of 30 s answered at 15 s gates for 30 s + 2 x 3 s, and the
+    /// stored duration may not be lowered below 30 s before it. Support is
+    /// asked for the duration the answer carries (section 8.8).
+    #[test]
+    fn a_first_answer_after_a_conversion_counts_the_conversions_duration() {
+        let (authority, clock) = authority();
+        authority.set_support(Arc::new(UpTo(D)));
+        assert!(authority.passed("lse_a"), "the conversion opened no gate");
+        let first = GrantKind::CountedRenewal { counted_ms: 30_000 };
+        authority
+            .record_grant(&grant("nod_a", D, first, 0))
+            .unwrap();
+        assert!(!authority.may_lower("lse_a", D));
+        clock.advance(Duration::from_millis(35_999));
+        assert!(!authority.passed("lse_a"));
+        clock.advance(Duration::from_millis(1));
+        assert!(authority.passed("lse_a"));
+        assert!(authority.may_lower("lse_a", D));
+        assert_eq!(
+            authority.view("lse_a").unwrap().gate_at,
+            format_rfc3339(wall(36))
+        );
+        // A shorter conversion counts the answer's own duration.
+        let short = GrantKind::CountedRenewal { counted_ms: 3_000 };
+        authority
+            .record_grant(&grant("nod_a", D, short, 36))
+            .unwrap();
+        clock.advance(Duration::from_millis(17_999));
+        assert!(!authority.passed("lse_a"));
+        clock.advance(Duration::from_millis(1));
+        assert!(authority.passed("lse_a"));
+        assert_eq!(
+            authority.record_grant(&grant("nod_b", D, first, 54)),
+            Err(Refused::NotHolder),
+            "only the holder's renewal is answered"
+        );
     }
 
     /// Section 8.8: a new authority holds no support, so every grant is
