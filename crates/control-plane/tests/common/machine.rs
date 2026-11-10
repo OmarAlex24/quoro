@@ -161,6 +161,8 @@ pub struct Machine {
     pub unfollowed: Vec<Value>,
     /// Its copy of the log: the newest `seq` and `hash` it holds.
     pub log: (u64, String),
+    /// Every frame of the session up to its first `desired_state`.
+    pub start: Vec<Value>,
 }
 
 impl Machine {
@@ -204,14 +206,23 @@ impl Machine {
             follows,
             unfollowed: Vec::new(),
             log: (hello.log_seq, hello.log_hash.clone()),
+            start: Vec::new(),
         };
         machine.send(NodeMessage::Hello(hello), None).await;
-        let welcome = machine.until("welcome").await;
-        machine.primary = welcome["body"]["primary_node_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        machine.until("desired_state").await;
+        loop {
+            let frame = machine.next().await;
+            if frame["type"] == "welcome" {
+                machine.primary = frame["body"]["primary_node_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+            }
+            let done = frame["type"] == "desired_state";
+            machine.start.push(frame);
+            if done {
+                break;
+            }
+        }
         machine
     }
 
