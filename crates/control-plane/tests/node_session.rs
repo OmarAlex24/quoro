@@ -3,6 +3,7 @@
 
 mod common;
 
+use common::log::{check_entries, genesis, log_hash_at, log_head};
 use common::{
     Server, TLS_FINGERPRINT, problem, restart_with_resolver, start, start_with_patient_node_session,
 };
@@ -14,9 +15,8 @@ use quoro_proto::wire::{
     self, Capacity as WireCapacity, Health, Heartbeat, Kvm as WireKvm, LogAck, NodeMessage,
     ObservedStatus, StatusReport, VmStatus,
 };
-use quoro_proto::{ErrorCode, ProtocolError, jcs, sign};
+use quoro_proto::{ErrorCode, ProtocolError, sign};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -1470,11 +1470,6 @@ async fn a_restarted_primary_keeps_an_instance_on_its_create_time_digest() {
 // Change-log follow (sections 5.6, 5.14 and 7.1, ADR 0227)
 // ---------------------------------------------------------------------------
 
-/// 64 zeros: the `log_hash` of an empty copy and the `prev_hash` of `seq` 1.
-fn genesis() -> String {
-    "0".repeat(64)
-}
-
 fn hello_at(node_id: &str, log_seq: u64, log_hash: &str) -> NodeMessage {
     let NodeMessage::Hello(mut hello) = hello(node_id) else {
         panic!("hello() builds a hello");
@@ -1482,31 +1477,6 @@ fn hello_at(node_id: &str, log_seq: u64, log_hash: &str) -> NodeMessage {
     hello.log_seq = log_seq;
     hello.log_hash = log_hash.to_string();
     NodeMessage::Hello(hello)
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-/// The primary's newest change-log `seq`.
-async fn log_head(server: &Server) -> u64 {
-    let head: Option<i64> = sqlx::query_scalar("SELECT MAX(seq) FROM change_log")
-        .fetch_one(server.state.store.pool())
-        .await
-        .unwrap();
-    u64::try_from(head.unwrap_or(0)).unwrap()
-}
-
-/// The primary's `hash` at `seq`.
-async fn log_hash_at(server: &Server, seq: u64) -> String {
-    sqlx::query_scalar("SELECT hash FROM change_log WHERE seq = ?")
-        .bind(i64::try_from(seq).unwrap())
-        .fetch_one(server.state.store.pool())
-        .await
-        .unwrap()
 }
 
 async fn stored_log_seq(server: &Server, node_id: &str) -> u64 {
@@ -1592,34 +1562,6 @@ async fn follow_from(server: &Server, node: &Enrolled, hello: NodeMessage) -> (S
         "log_entries before the desired_state: {frames:?}"
     );
     (socket, frames)
-}
-
-/// Checks one `log_entries` body as a node does (section 7.1,
-/// "Verification"): its entries run without a gap from `from_seq`, each has
-/// exactly the 11 fields of section 5.14, hashes to its `hash` (SHA-256 over
-/// the RFC 8785 form of the entry without `hash`) and links to the hash
-/// before it, starting from `prev_hash`; `head_seq` is at least the last
-/// `seq`. Returns the last entry's `seq` and `hash`.
-fn check_entries(body: &Value, prev_hash: &str) -> (u64, String) {
-    let from_seq = body["from_seq"].as_u64().unwrap();
-    let entries = body["entries"].as_array().unwrap();
-    assert!(!entries.is_empty() && entries.len() <= 500, "{body}");
-    let mut prev = prev_hash.to_string();
-    let mut seq = from_seq;
-    for entry in entries {
-        let mut fields = entry.as_object().unwrap().clone();
-        assert_eq!(fields.len(), 11, "{entry}");
-        assert_eq!(entry["seq"], seq, "{entry}");
-        assert_eq!(entry["prev_hash"], prev.as_str(), "{entry}");
-        let hash = fields.remove("hash").unwrap();
-        let canonical = jcs::canonicalize(&Value::Object(fields)).unwrap();
-        prev = sha256_hex(canonical.as_bytes());
-        assert_eq!(hash, prev.as_str(), "{entry}");
-        seq += 1;
-    }
-    let last = seq - 1;
-    assert!(body["head_seq"].as_u64().unwrap() >= last, "{body}");
-    (last, prev)
 }
 
 async fn ack(socket: &mut Socket, seq: u64, hash: &str) {
