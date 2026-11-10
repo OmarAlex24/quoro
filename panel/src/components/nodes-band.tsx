@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { ShieldAlert, ShieldCheck } from 'lucide-react';
 import { useGetCluster } from '../api/generated/cluster/cluster';
-import type { App, ClusterCapacity, Node } from '../api/generated/model';
+import type { App, ClusterCapacity, Node, Vm } from '../api/generated/model';
 import { n1Readout, type Segment } from '../lib/node-capacity';
 import { clusterFacts, simulationSentence } from '../lib/nodes-page';
 import { cn } from '../lib/utils';
@@ -22,12 +22,14 @@ type LossSimulation = ReturnType<typeof useLossSimulation>;
  */
 export function NodesBand({
   nodes,
+  vms,
   apps,
   loss,
   simulated,
   onSimulate,
 }: {
   nodes: readonly Node[];
+  vms: readonly Vm[];
   apps: readonly App[];
   loss: LossSimulation;
   /** The answer drawn on the cards now, or null when no loss is simulated. */
@@ -43,7 +45,7 @@ export function NodesBand({
 
   const segments: Segment[] | null =
     simulated && simulatedLost
-      ? simulationSentence({ lost: simulatedLost, answer: simulated, nodes, apps })
+      ? simulationSentence({ lost: simulatedLost, answer: simulated, nodes, apps, vms })
       : (readout?.segments ?? null);
   // A loss that leaves an app without room stays red while it is drawn; one that fits is amber, a what-if.
   const tone = simulated ? (simulated.fits ? 'shift' : 'fault') : (readout?.tone ?? 'run');

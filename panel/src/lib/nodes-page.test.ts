@@ -149,15 +149,15 @@ describe('the simulated loss of a node', () => {
     ],
   };
 
-  it('dims the lost node and puts the apps that move on the node that takes them, as ghosts', () => {
+  it('dims the lost node and puts the apps that move on the node that takes them, as ghosts, starts first', () => {
     const cards = simulateOnCards(nodes, answer, apps);
     expect(cards.nod_3).toEqual({ lost: true, ghosts: [], reserved: null });
     expect(cards.nod_4!.lost).toBe(false);
     expect(cards.nod_4!.ghosts.map((cell) => [cell.label, cell.kind, cell.units, cell.ghost])).toEqual([
-      ['blog restore', 'image', 1, true],
       ['docs-site', 'git', 1, true],
+      ['blog restore', 'image', 1, true],
     ]);
-    expect(cards.nod_4!.ghosts[0]!.title).toBe('blog would be restored here from its latest backup');
+    expect(cards.nod_4!.ghosts[1]!.title).toBe('blog would be restored here from its latest backup');
   });
 
   it('raises the receiving node to what would be reserved there', () => {
@@ -180,9 +180,22 @@ describe('the simulated loss of a node', () => {
     expect(simulateOnCards(nodes, null, apps)).toEqual({});
   });
 
-  it('says what happens to each app, in placement order', () => {
+  it('says what starts before what is restored, and how many replicas the kept apps have left', () => {
     expect(n1Text({ segments: simulationSentence({ lost: lab3, answer, nodes, apps }) })).toBe(
-      'Without lab-3: blog is restored on lab-4 from its latest backup and docs-site starts there. web keeps running on its other replica.',
+      'Without lab-3: docs-site starts on lab-4 and blog is restored there from its latest backup. web keeps running on its other replica.',
+    );
+    const web = (node_id: string, observed_status: Vm['observed_status'] = 'running') => ({
+      app_id: 'app_web',
+      node_id,
+      observed_status,
+    });
+    const oneLeft = [web('nod_3'), web('nod_4'), web('nod_4', 'deleted')];
+    expect(n1Text({ segments: simulationSentence({ lost: lab3, answer, nodes, apps, vms: oneLeft }) })).toBe(
+      'Without lab-3: docs-site starts on lab-4 and blog is restored there from its latest backup. web keeps one replica.',
+    );
+    const twoLeft = [web('nod_3'), web('nod_4'), web('nod_4')];
+    expect(n1Text({ segments: simulationSentence({ lost: lab3, answer, nodes, apps, vms: twoLeft }) })).toBe(
+      'Without lab-3: docs-site starts on lab-4 and blog is restored there from its latest backup. web keeps running on its other replicas.',
     );
   });
 

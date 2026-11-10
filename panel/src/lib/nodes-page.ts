@@ -177,6 +177,11 @@ export interface SimulatedNode {
 const moving = (app: ClusterCapacityApp): app is ClusterCapacityApp & { node_id: string; action: 'start' | 'failover' | 'restore' } =>
   app.node_id !== null && app.action !== 'keep';
 
+/** The order moves are told and drawn in: what starts, then warm copies, then restores. */
+const MOVE_ORDER = { start: 0, failover: 1, restore: 2 } as const;
+const moves = (answer: ClusterCapacity) =>
+  answer.apps.filter(moving).sort((a, b) => MOVE_ORDER[a.action] - MOVE_ORDER[b.action]);
+
 /**
  * The primary's answer for a lost node, per card: the lost node dims, and
  * every node an app would move to shows it as a ghost cell and the
@@ -190,10 +195,10 @@ export const simulateOnCards = (
   if (!answer) return {};
   const result: Record<string, SimulatedNode> = {};
   for (const node of nodes) {
-    const arriving = answer.apps.filter((app) => moving(app) && app.node_id === node.id);
+    const arriving = moves(answer).filter((app) => app.node_id === node.id);
     const known = arriving.map((entry) => ({ entry, app: apps.find((app) => app.id === entry.app_id) }));
     const ghosts: VmCell[] = known.flatMap(({ entry, app }) => {
-      if (!app || entry.action === 'keep') return [];
+      if (!app) return [];
       const words = MOVE_WORDS[entry.action];
       return [
         {
@@ -228,29 +233,32 @@ const listWords = (items: readonly string[]): string =>
   items.length <= 1 ? (items[0] ?? '') : `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`;
 
 /**
- * The band's sentence while a loss is simulated: what happens to each app,
- * in the primary's placement order. `Without lab-3: blog is restored on lab-4
- * from its latest backup and docs-site starts there. web and api keep running
- * on their other replicas.` An app or node missing from the lists is named
- * `an app` or `another node`, never by id.
+ * The band's sentence while a loss is simulated: what happens to each app.
+ * `Without lab-3: docs-site starts on lab-4 and blog is restored there from
+ * its latest backup. web and api keep one replica each.` The kept apps say
+ * "one replica" only when the VM list shows each has exactly one instance
+ * left off the lost node; otherwise "their other replicas". An app or node
+ * missing from the lists is named `an app` or `another node`, never by id.
  */
 export const simulationSentence = ({
   lost,
   answer,
   nodes,
   apps,
+  vms = [],
 }: {
   lost: Pick<Node, 'name'>;
   answer: ClusterCapacity;
   nodes: ReadonlyArray<Pick<Node, 'id' | 'name'>>;
   apps: ReadonlyArray<Pick<App, 'id' | 'name'>>;
+  vms?: ReadonlyArray<Pick<Vm, 'app_id' | 'node_id' | 'observed_status'>>;
 }): Segment[] => {
   const appName = (id: string) => apps.find((app) => app.id === id)?.name ?? 'an app';
   const nodeName = (id: string) => nodes.find((node) => node.id === id)?.name ?? 'another node';
 
   const clauses: Segment[][] = [];
   let lastTarget: string | null = null;
-  for (const entry of answer.apps.filter(moving)) {
+  for (const entry of moves(answer)) {
     const where = entry.node_id === lastTarget ? 'there' : `on ${nodeName(entry.node_id)}`;
     lastTarget = entry.node_id;
     const name = { strong: appName(entry.app_id) };
@@ -286,11 +294,20 @@ export const simulationSentence = ({
   });
   segments.push('.');
 
-  const kept = answer.apps.filter((app) => app.action === 'keep' && app.node_id !== null).map((app) => appName(app.app_id));
+  const kept = answer.apps.filter((app) => app.action === 'keep' && app.node_id !== null);
   if (kept.length > 0) {
     const one = kept.length === 1;
+    const left = (appId: string) =>
+      vms.filter((vm) => vm.app_id === appId && vm.node_id !== answer.lost_node_id && vm.observed_status !== 'deleted')
+        .length;
+    const single = kept.every((app) => left(app.app_id) === 1);
+    const names = listWords(kept.map((app) => appName(app.app_id)));
     segments.push(
-      ` ${listWords(kept)} ${one ? 'keeps' : 'keep'} running on ${one ? 'its other replica' : 'their other replicas'}.`,
+      single
+        ? ` ${names} ${one ? 'keeps one replica' : 'keep one replica each'}.`
+        : one
+          ? ` ${names} keeps running on its other ${left(kept[0]!.app_id) > 1 ? 'replicas' : 'replica'}.`
+          : ` ${names} keep running on their other replicas.`,
     );
   }
   return segments;

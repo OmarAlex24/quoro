@@ -40,7 +40,7 @@ export function NodesBoard({
 
   return (
     <LiveNodesProvider nodes={nodes}>
-      <NodesBand nodes={nodes} apps={apps} loss={loss} simulated={simulated} onSimulate={setSimulating} />
+      <NodesBand nodes={nodes} vms={vms} apps={apps} loss={loss} simulated={simulated} onSimulate={setSimulating} />
       <div className="ncards">
         {nodes.map((node) => (
           <NodeCard
