@@ -819,6 +819,18 @@ async fn force_does_not_bypass_rule_2_when_removing_a_vote() {
     .await;
     // A holds the new version, the edge does not: 1 of 2.
     holds_voters(&mut machine_a, 2).await;
+    // The edge's session writes its `desired_rev` before it sends the new
+    // version (section 5.11). Take that frame without acknowledging it, so
+    // the head below is read after that write and the edge still lacks the
+    // version.
+    machine_edge.acks = false;
+    while machine_edge.spec["votes"]["voters"]
+        .as_array()
+        .map_or(0, Vec::len)
+        != 2
+    {
+        machine_edge.until("desired_state").await;
+    }
     let head = state_head(&server).await;
     assert_eq!(
         roles_refused(
@@ -836,6 +848,7 @@ async fn force_does_not_bypass_rule_2_when_removing_a_vote() {
     );
     assert_eq!(state_head(&server).await, head, "nothing written");
     // Once the edge holds it too, the same request passes.
+    machine_edge.start_acking().await;
     holds_voters(&mut machine_edge, 2).await;
     roles_ok(
         &owner,
