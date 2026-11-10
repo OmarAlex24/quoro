@@ -352,7 +352,7 @@ System record, with `actor_type` `system` and no `scope`:
 
 | `operation` | `actor_id` | `channel` | `target_type` / `target_id` | When |
 | --- | --- | --- | --- | --- |
-| `volume.quarantine` | `volumes` | `system` | `volume` / the volume | The primary recorded a quarantined copy that a node reported (node-agent-protocol.md section 9): `params` is `{app_id, volume_id, node_id, quarantine_id, size_bytes, sha256}`. Written once per copy, in the same transaction as its `volume_quarantines` row, so the divergent writes a failover left behind are on the audit chain (D-0022, D-0031) |
+| `volume.quarantine` | `volumes` | `system` | `volume` / the volume | The primary recorded a quarantined copy that a node reported (node-agent-protocol.md section 9): `params` is `{app_id, volume_id, node_id, quarantine_id, size_bytes, sha256}`. Written once per copy, in the same transaction as its `volume_quarantines` row, so the divergent writes a failover left behind are on the audit chain (ADR 0022, ADR 0031). A copy of a volume that is gone or `deleting` gets this record with no row, once per `quarantine_id` (node-agent-protocol.md section 9, ADR 0316) |
 
 Replication cycles, streams and their refusals write no record: they change no state on the primary, which keeps their progress in memory (node-agent-protocol.md section 5.3).
 
