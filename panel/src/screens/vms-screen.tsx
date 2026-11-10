@@ -145,8 +145,8 @@ export function VmsScreen({ nodeId }: { nodeId?: string } = {}) {
             }
           >
             {nodeId
-              ? 'The scheduler places VMs on the nodes with room for them. Clear the node to see every VM.'
-              : `A VM is a microVM of its own, outside any app. Create one to boot it on ${primary?.name ?? 'a node'}.`}
+              ? 'The VMs and app instances placed on this node show here.'
+              : `Every microVM of the cluster shows here, app instances included. Create one to boot a VM on ${primary?.name ?? 'a node'}.`}
           </EmptyState>
         ) : (
           <div className="box vmt-box">

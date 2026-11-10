@@ -68,7 +68,7 @@ export function MetricsTab({ app, nodeNames }: { app: AppDetail; nodeNames: Reco
         <SkeletonCards label="Loading the app’s instances" count={2} height={150} />
       ) : current === undefined ? (
         <EmptyState title="No instance is reporting metrics">
-          CPU, memory, disk and network appear here when the app has a running instance.
+          CPU and memory of each instance appear here when the app has a running instance.
         </EmptyState>
       ) : (
         <InstanceCharts

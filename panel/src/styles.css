@@ -2759,6 +2759,27 @@
     background-color: color-mix(in oklab, var(--sunk) 75%, transparent);
   }
 
+  /* The highlight keeps the box's rounded corners; the box itself does not clip, so row menus can open. */
+  .box > .srow:first-child,
+  .box > .keyrow:first-child {
+    border-top-left-radius: 9px;
+    border-top-right-radius: 9px;
+  }
+
+  .box > .srow:last-child,
+  .box > .keyrow:last-child {
+    border-bottom-left-radius: 9px;
+    border-bottom-right-radius: 9px;
+  }
+
+  .vmt tbody tr:last-child td:first-child {
+    border-bottom-left-radius: 9px;
+  }
+
+  .vmt tbody tr:last-child td:last-child {
+    border-bottom-right-radius: 9px;
+  }
+
   .set-row dd {
     min-width: 0;
     overflow-wrap: anywhere;
