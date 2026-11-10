@@ -1749,3 +1749,67 @@ async fn a_failed_clear_of_lost_at_ends_the_session() {
     assert!(of_type(&frames, "lease_revoke").is_empty(), "{frames:?}");
     wait_lost_at_cleared(&server, &mut socket, &node_id).await;
 }
+
+/// When the write that clears `lost_at` fails, the answer that triggered it
+/// unlocks nothing: no `fence_ack` and no desired state follow it, only the
+/// non-fatal `bad_message` that ends the session (section 4.2 rules 3 to 5).
+/// The node has a pending `fence_ack` for one lease, so the session start
+/// waits for the revokes before sending it, and holds a second lease that
+/// the declaration revoked. The `declared_lost` revoke of that second lease
+/// is answered with a `command_result`, then, on a second server, with an
+/// `error`; either answer is the last one `lost_at` waits for.
+#[tokio::test]
+async fn a_failed_clear_of_lost_at_sends_nothing_after_the_answer() {
+    for refused in [false, true] {
+        let case = if refused { "error" } else { "command_result" };
+        let server = start_with_patient_node_session().await;
+        let owner = server.owner().await;
+        let (node, _app_id, _lease_id) = acked_while_away(&server, &owner).await;
+        let node_id = node.node_id.clone();
+        sqlx::query(
+            "INSERT INTO leases (id, resource_type, resource_id, holder_node_id, mode, \
+             fencing_token, granted_at) VALUES (?, 'app', ?, ?, 'local', 3, ?)",
+        )
+        .bind(SECOND_LEASE)
+        .bind(SECOND_APP)
+        .bind(&node_id)
+        .bind(quoro_control_plane::store::now_rfc3339())
+        .execute(server.state.store.pool())
+        .await
+        .unwrap();
+        let res = declare_lost(&owner, &server, &node_id).await;
+        assert_eq!(res.status(), 200, "{case}: {}", res.text().await.unwrap());
+
+        server.state.hub.inject_fault(Fault::ClearLostAt {
+            node_id: node_id.clone(),
+        });
+        let mut socket = connect(&server, &node.credential).await;
+        send(&mut socket, hello(&node_id, Vec::new())).await;
+        let frames = recv_until(&mut socket, &["welcome", "lease_revoke"]).await;
+        let revoke = of_type(&frames, "lease_revoke")[0].clone();
+        assert_eq!(revoke["body"]["lease_id"], SECOND_LEASE, "{case}: {revoke}");
+        assert_eq!(revoke["body"]["reason"], "declared_lost", "{case}");
+        let answer = if refused {
+            NodeMessage::Error(quoro_proto::ProtocolError {
+                code: ErrorCode::BadMessage,
+                message: "the revoke could not be read".to_string(),
+                fatal: false,
+                term: None,
+            })
+        } else {
+            ok_result()
+        };
+        reply(&mut socket, answer, revoke["id"].as_str()).await;
+        let frames = frames_until_closed(&mut socket).await;
+        let kinds: Vec<&str> = frames.iter().map(|f| f["type"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["error"], "{case}: {frames:?}");
+        assert_eq!(frames[0]["body"]["code"], "bad_message", "{case}");
+        assert_eq!(frames[0]["body"]["fatal"], false, "{case}");
+        wait_disconnected(&server, &node_id).await;
+        assert!(lost_at(&server, &node_id).await.is_some(), "{case}");
+        assert!(
+            fence_ack_pending(&server, &node_id).await.is_some(),
+            "{case}: never delivered"
+        );
+    }
+}

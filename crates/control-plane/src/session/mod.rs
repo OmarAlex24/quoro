@@ -3122,7 +3122,13 @@ impl Session {
                             .is_some()
                         {
                             goes_on = self.lost_revoke_answered(re).await;
-                            self.revoke_answered(outbox).await;
+                            // A failed clear ends the session: what the
+                            // answer would unlock (the `hello` latch, the
+                            // held grants, a `fence_ack`, the desired state)
+                            // waits for the next session.
+                            if goes_on {
+                                self.revoke_answered(outbox).await;
+                            }
                         }
                         self.hub.0.revoke_answers.notify_waiters();
                         if !goes_on {
@@ -3207,12 +3213,13 @@ impl Session {
                         .take_revoke(&self.node_id, self.generation, re)
                         .is_some()
                     {
-                        let goes_on = self.lost_revoke_answered(re).await;
-                        self.revoke_answered(outbox).await;
-                        if !goes_on {
+                        // As for a `command_result`: a failed clear ends
+                        // the session and unlocks nothing.
+                        if !self.lost_revoke_answered(re).await {
                             outbox.push(lost_at_not_cleared(&raw.id));
                             return true;
                         }
+                        self.revoke_answered(outbox).await;
                     } else if let Some((lease_id, token)) = self.same_token_grants.remove(re)
                         && error.code == quoro_proto::ErrorCode::BadMessage
                         && !self
