@@ -446,7 +446,7 @@ struct HubInner {
     /// (section 8.4, "Grants of a marked row"; [`held`]).
     held: Mutex<held::Registry>,
     /// Wakes the held-grant task ([`NodeHub::spawn_held_grants`]).
-    held_wake: Notify,
+    held_wake: Arc<Notify>,
     digests: desired::DigestCache,
     /// `vm_` id to node, kept for VMs whose row is already deleted.
     vm_nodes: Mutex<HashMap<String, String>>,
@@ -595,7 +595,7 @@ impl NodeHub {
             log_acks: Mutex::new(HashMap::new()),
             countable_acks: Mutex::new(HashMap::new()),
             held: Mutex::new(held::Registry::default()),
-            held_wake: Notify::new(),
+            held_wake: Arc::new(Notify::new()),
             digests: desired::DigestCache::default(),
             vm_nodes: Mutex::new(HashMap::new()),
             tunnels: Mutex::new(None),
@@ -3927,6 +3927,10 @@ impl Session {
             .record_warm_named(&self.node_id, self.generation, &spec);
         self.last_spec = Some(spec);
         self.hub.tunnel_changed(&self.node_id);
+        // A desired state went out after the session's start, its revokes
+        // and its fence acknowledgement (section 4.2 rules 3 to 5): held
+        // grants may go out on this session (held.rs).
+        self.hub.mark_start_done(&self.node_id, self.generation);
         // The session's first desired state went out: change-log follow
         // starts behind it (section 4.2 rule 6).
         self.start_follow().await;

@@ -185,6 +185,126 @@ pub(crate) async fn is_marked(
     Ok(unsettled.is_some_and(|unsettled| unsettled != 0))
 }
 
+/// The `seq` of the newest `lease` change-log write of `lease_id`, `None`
+/// for a lease the log has no entry of: the write a held grant waits on
+/// (section 8.4, "Grants of a marked row").
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn newest_write_seq(
+    conn: &mut SqliteConnection,
+    lease_id: &str,
+) -> Result<Option<u64>, ApiError> {
+    let seq: Option<i64> = sqlx::query_scalar(
+        "SELECT MAX(seq) FROM change_log WHERE entity_type = 'lease' AND entity_id = ?",
+    )
+    .bind(lease_id)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(seq.and_then(|seq| u64::try_from(seq).ok()))
+}
+
+/// Whether the newest `lease` change-log write of `lease_id` gave the lease
+/// a new token ("The holder fenced first" step 4, ADR 0295): its payload's
+/// `fencing_token` is above the one the newest earlier entry carried, or it
+/// is the lease's first entry. A payload without `fencing_token` did not
+/// change the token. Derived from the change log alone, so a promoted
+/// primary with the same log gets the same answer. Earlier entries that all
+/// lack a `fencing_token` give nothing to compare with, and read as no new
+/// token, the side that grants less.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn newest_write_gave_new_token(
+    conn: &mut SqliteConnection,
+    lease_id: &str,
+) -> Result<bool, ApiError> {
+    let payloads: Vec<String> = sqlx::query_scalar(
+        "SELECT payload FROM change_log WHERE entity_type = 'lease' AND entity_id = ? \
+         ORDER BY seq DESC",
+    )
+    .bind(lease_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    let token = |payload: &str| {
+        serde_json::from_str::<Value>(payload)
+            .ok()
+            .and_then(|payload| payload.get("fencing_token").and_then(Value::as_i64))
+    };
+    let mut entries = payloads.iter();
+    let Some(newest) = entries.next() else {
+        return Ok(false);
+    };
+    let Some(newest) = token(newest) else {
+        return Ok(false);
+    };
+    if payloads.len() == 1 {
+        return Ok(true);
+    }
+    Ok(entries
+        .find_map(|payload| token(payload))
+        .is_some_and(|before| newest > before))
+}
+
+/// Whether `lease` is a step-4 row for the node it names ("The holder fenced
+/// first" step 4; ADR 0295, ADR 0299): an app lease that carries the mark,
+/// is not revoked, is in no node's `fence_failure` and not in its holder's
+/// `fence_ack_pending`, and whose newest write gave it a new token
+/// ([`newest_write_gave_new_token`]). The rows decide, read live at every
+/// call: an operator's acknowledgement can change any of them.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn is_step4(conn: &mut SqliteConnection, lease: &Lease) -> Result<bool, ApiError> {
+    if lease.resource_type != "app" || !lease.unsettled || lease.is_revoked() {
+        return Ok(false);
+    }
+    if crate::fences::listed_leases(conn)
+        .await?
+        .contains(&lease.id)
+    {
+        return Ok(false);
+    }
+    if crate::fences::pending_of(conn, &lease.holder_node_id)
+        .await?
+        .is_some_and(|pending| pending.lease_ids.contains(&lease.id))
+    {
+        return Ok(false);
+    }
+    newest_write_gave_new_token(conn, &lease.id).await
+}
+
+/// Every step-4 row ([`is_step4`]) naming `node_id`, or naming any node
+/// when `None`, oldest id first.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn step4_rows(
+    conn: &mut SqliteConnection,
+    node_id: Option<&str>,
+) -> Result<Vec<Lease>, ApiError> {
+    let rows = sqlx::query(&format!(
+        "SELECT {LEASE_COLUMNS} FROM leases WHERE unsettled = 1 AND revoked_at IS NULL \
+         AND resource_type = 'app' AND (? IS NULL OR holder_node_id = ?) ORDER BY id"
+    ))
+    .bind(node_id)
+    .bind(node_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut step4 = Vec::new();
+    for row in &rows {
+        let lease = lease_from_row(row)?;
+        if is_step4(conn, &lease).await? {
+            step4.push(lease);
+        }
+    }
+    Ok(step4)
+}
+
 /// One lease by id, revoked or not.
 ///
 /// # Errors
