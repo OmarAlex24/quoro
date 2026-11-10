@@ -351,3 +351,76 @@ async fn an_edge_or_witness_join_sends_no_custody_key_and_keeps_none() {
         assert!(!dir.path().join(CUSTODY_KEY_FILE).exists(), "{roles:?}");
     }
 }
+
+/// Sections 2.3 and 8.10: while the previous voter-set change has not
+/// reached a majority of voters, the primary refuses a voter's enrollment
+/// with `409` without consuming the token. The join reports the refusal,
+/// leaves the machine not enrolled, and running it again on the same data
+/// directory with the same token enrolls it, keeping the custody key it
+/// already sent.
+#[tokio::test]
+async fn a_join_refused_while_the_voters_change_can_be_run_again() {
+    let dir = TempDir::new();
+    let (cert, key) = self_signed();
+    let pin = cert_fingerprint(cert.as_ref());
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let acceptor = TlsAcceptor::from(server_config(cert, key));
+    let server = tokio::spawn(async move {
+        let mut bodies = Vec::new();
+        for attempt in 0..2 {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut stream = acceptor.accept(tcp).await.unwrap();
+            let (_headers, body) = read_request(&mut stream).await;
+            bodies.push(serde_json::from_slice::<Value>(&body).unwrap());
+            if attempt == 0 {
+                let problem = serde_json::json!({
+                    "type": "about:blank",
+                    "title": "Conflict",
+                    "status": 409,
+                    "code": "conflict",
+                    "detail": "the previous voter-set change has not reached a majority of voters yet; try again once they have acknowledged it",
+                })
+                .to_string();
+                respond(&mut stream, "409 Conflict", &problem).await;
+            } else {
+                let cluster = quoro_proto::sign::signing_key_from_seed(&[21; 32]);
+                let response = serde_json::json!({
+                    "node_id": "nod_1",
+                    "cluster_id": "cls_1",
+                    "primary_url": "https://primary.test",
+                    "credential": "the-credential",
+                    "cluster_public_key": quoro_proto::sign::public_key_to_base64(&cluster.verifying_key()),
+                })
+                .to_string();
+                respond(&mut stream, "201 Created", &response).await;
+            }
+        }
+        bodies
+    });
+    let target = JoinTarget {
+        url: format!("https://127.0.0.1:{}", address.port()),
+        token: "join-secret".to_owned(),
+        fingerprint: format!("sha256:{pin}"),
+    };
+    let config = config(&dir);
+
+    let error = join(&config, &target, &facts()).await.unwrap_err();
+    assert!(
+        matches!(&error, AgentError::Enroll { status: 409, .. }),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("majority of voters"), "{error}");
+    assert!(!quoro_node_agent::is_enrolled(&config.data_dir));
+
+    join(&config, &target, &facts())
+        .await
+        .expect("the second join enrolls");
+    assert!(quoro_node_agent::is_enrolled(&config.data_dir));
+    let bodies = server.await.unwrap();
+    assert_eq!(bodies[0]["join_token"], bodies[1]["join_token"]);
+    assert_eq!(
+        bodies[0]["custody_public_key"], bodies[1]["custody_public_key"],
+        "the custody key kept from the first attempt"
+    );
+}

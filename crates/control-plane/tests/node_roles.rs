@@ -8,7 +8,7 @@
 mod common;
 
 use common::machine::{Machine, Node};
-use common::{Server, problem, start_with_patient_node_session};
+use common::{Server, problem, restart_with_resolver, start_with_patient_node_session};
 use serde_json::{Value, json};
 
 /// A join token's secret.
@@ -770,4 +770,78 @@ async fn a_witness_gets_a_mesh_address_when_it_enrolls_or_gains_the_role() {
     let owner = server.owner().await;
     let witness = enrolled(&server, &owner, "witness", &["witness"]).await;
     assert!(mesh_address(&server, &witness.node_id).await.is_some());
+}
+
+/// Finding 1 of #687: the acknowledgements live in the primary's memory.
+/// After a restart nobody holds the version, so a voter's enrollment answers
+/// `409` until the existing voters' next sessions acknowledge it again,
+/// which their first `desired_state` lets them do.
+#[tokio::test]
+async fn after_a_restart_the_voters_acknowledge_again_on_their_next_session() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let a = enrolled(&server, &owner, "node-a", &["node"]).await;
+    let machine_a = connected(&server, &a).await;
+    let token = join_token(&server, &owner).await;
+    drop(machine_a);
+    while node_status(&server, &a.node_id).await != "disconnected" {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let restarted = restart_with_resolver(
+        &server,
+        std::sync::Arc::new(quoro_control_plane::ReferenceAsDigest),
+    )
+    .await;
+    let res = enroll_with(&restarted, &token, "node-b", &["node"]).await;
+    assert_eq!(problem(res).await.0, 409, "no acknowledgement survives");
+    let _machine_a = connected(&restarted, &a).await;
+    let res = enroll_with(&restarted, &token, "node-b", &["node"]).await;
+    assert_eq!(res.status(), 201, "{}", res.text().await.unwrap());
+}
+
+/// `force` bypasses only D-0170's guard: removing a vote with `force` while
+/// rule 2 waits still answers `409 conflict` and changes nothing.
+#[tokio::test]
+async fn force_does_not_bypass_rule_2_when_removing_a_vote() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let a = enrolled(&server, &owner, "node-a", &["node"]).await;
+    let mut machine_a = connected(&server, &a).await;
+    let edge = enrolled(&server, &owner, "edge", &["edge"]).await;
+    let mut machine_edge = connected(&server, &edge).await;
+    roles_ok(
+        &owner,
+        &server,
+        &edge.node_id,
+        json!({ "add": ["witness"] }),
+    )
+    .await;
+    // A holds the new version, the edge does not: 1 of 2.
+    holds_voters(&mut machine_a, 2).await;
+    let head = state_head(&server).await;
+    assert_eq!(
+        roles_refused(
+            &owner,
+            &server,
+            &edge.node_id,
+            json!({ "remove": ["witness"], "force": true })
+        )
+        .await,
+        (409, "conflict".to_string())
+    );
+    assert_eq!(
+        roles_of(&server, &edge.node_id).await,
+        json!(["edge", "witness"])
+    );
+    assert_eq!(state_head(&server).await, head, "nothing written");
+    // Once the edge holds it too, the same request passes.
+    holds_voters(&mut machine_edge, 2).await;
+    roles_ok(
+        &owner,
+        &server,
+        &edge.node_id,
+        json!({ "remove": ["witness"], "force": true }),
+    )
+    .await;
 }
