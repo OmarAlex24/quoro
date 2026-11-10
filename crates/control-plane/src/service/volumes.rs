@@ -382,12 +382,16 @@ pub(crate) async fn create_volume(
             )));
         }
         // Section 8.4 ("Grants of a marked row", ADR 0268) says the grant
-        // waits. This build cannot count what it waits for, so nothing is
-        // created.
+        // waits until its write is replicated, and goes out with majority
+        // voter support. Support is counted, and so is replication (the
+        // follow positions of section 7.1), but this build cannot hold a
+        // grant and send it later (#703), so nothing is created.
         leases::NewGrant::Held => {
             return Err(ApiError::conflict(
-                "the app's lease cannot be granted yet: this grant needs majority voter support \
-                 and its lease row on every node first, which this build does not track yet",
+                "the app's lease cannot be granted yet: this grant goes out only once its lease \
+                 row is on every machine with the node role, and while a majority of voters \
+                 supports this primary; this build does not yet hold such a grant to send it \
+                 later, so nothing was created; retry later",
             ));
         }
     };

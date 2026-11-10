@@ -508,9 +508,11 @@ pub(crate) enum NewGrant {
     /// machines with the `node` role: the write would carry the row's
     /// unsettled mark (section 8.4, "The mark", ADR 0280, ADR 0285), whose
     /// grant also needs majority voter support ("Grants of a marked row"), or
-    /// it raises the row's `duration_ms` (ADR 0268). This build counts
-    /// neither replication nor support, so nothing is written or recorded,
-    /// and the caller tries again later.
+    /// it raises the row's `duration_ms` (ADR 0268). An `expiring` new token
+    /// without majority support is held too. This build counts support
+    /// ([`crate::support`]) and follow positions, but does not hold a grant
+    /// to send it once both allow it (#703), so nothing is written or
+    /// recorded, and the caller tries again later.
     Held,
 }
 

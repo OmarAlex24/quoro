@@ -1,7 +1,7 @@
 //! How the primary answers `lease_renew` (`node-agent-protocol.md` sections
 //! 5.5, 8.4 and 8.8; D-0256 part 2; issue #603), over real HTTP and WebSocket
-//! with a fake node. No build counts voter support yet, so the tests that
-//! need an answer set their own.
+//! with a fake node. These tests set their own voter support; `support.rs`
+//! drives the same renewals under the support real voter answers give.
 
 mod common;
 
@@ -422,8 +422,8 @@ async fn a_renewal_is_answered_at_its_token_while_voters_support_it() {
 
 /// Section 8.8: without majority support the primary leaves the renewal
 /// unanswered, records no gate, and keeps no raise of the stored duration.
-/// No build counts support yet. A lease the node no longer holds is revoked
-/// all the same.
+/// No voter answered here, so none supports it. A lease the node no longer
+/// holds is revoked all the same.
 #[tokio::test]
 async fn without_voter_support_no_renewal_is_answered() {
     let server = start_with_patient_node_session().await;

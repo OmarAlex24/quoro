@@ -41,8 +41,10 @@ pub mod service;
 pub mod session;
 pub mod store;
 pub(crate) mod subnet;
+pub mod support;
 pub mod sweeper;
 pub mod tunnel;
+pub mod voters;
 pub mod vulns;
 pub(crate) mod warm;
 
@@ -268,6 +270,7 @@ impl AppState {
         );
         hub.reset_stale_connections().await?;
         hub.seed_lease_gates().await?;
+        hub.spawn_voter_watch();
         let vulns = vulns::Vulns::open(&config.data_dir, store.clone()).await?;
         hub.set_vulns(&vulns);
         let tunnel = tunnel::TunnelManager::new(store.clone(), Arc::clone(&data_key), hub.clone());

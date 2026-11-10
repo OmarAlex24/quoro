@@ -70,6 +70,12 @@ pep440_rs = { version = "0.7.3", default-features = false }
 # CVSS base scores from a record's v3 and v4 vectors, for its severity band.
 cvss = { version = "3", default-features = false, features = ["std", "v3", "v4"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# `CLOCK_BOOTTIME`, which the primary measures its voters' support on
+# (node-agent-protocol.md section 8.8, ADR 0263); already in the lock file
+# through the node agent and the engine.
+rustix = { version = "1.1", default-features = false, features = ["std", "time"] }
+
 [build-dependencies]
 # `build.rs` writes the embedded component list, so it reads and rewrites the
 # SBOM's JSON with the version this crate already uses.

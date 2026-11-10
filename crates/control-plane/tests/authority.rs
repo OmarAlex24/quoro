@@ -81,6 +81,6 @@ async fn a_restarted_primary_counts_every_expiring_gate_from_its_start() {
     assert_eq!(authority.view(held), None);
     assert!(
         !authority.supports(15_000),
-        "no build holds voter support yet"
+        "a restarted primary holds no voter support until its voters answer it"
     );
 }
