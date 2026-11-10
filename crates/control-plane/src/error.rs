@@ -97,6 +97,7 @@ pub enum Reason {
     LeaseHeld,
     InProgress,
     HasQuarantines,
+    TokenExhausted,
 }
 
 impl Reason {
@@ -119,6 +120,7 @@ impl Reason {
             Self::LeaseHeld => "lease_held",
             Self::InProgress => "in_progress",
             Self::HasQuarantines => "has_quarantines",
+            Self::TokenExhausted => "token_exhausted",
         }
     }
 }

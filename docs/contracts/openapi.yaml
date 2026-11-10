@@ -577,7 +577,8 @@ components:
             (`not_warm`, `no_copy`, `not_in_sync`, `node_disconnected`,
             `fence_failed`, `no_support`, `lease_held`, `in_progress`; each
             operation says when), by `deleteApp` and `deleteVolume`
-            (`has_quarantines`), or by `rotateSigningKey` (`in_progress`).
+            (`has_quarantines`), by `rotateSigningKey` (`in_progress`), or by
+            `ackNodeFence` (`token_exhausted`).
             Absent for other codes and other conflicts.
           enum:
             - scope_missing
@@ -596,6 +597,7 @@ components:
             - lease_held
             - in_progress
             - has_quarantines
+            - token_exhausted
         scope:
           type: string
           description: |
@@ -6778,7 +6780,11 @@ paths:
         listed lease that another node already holds as it is (ADR 0246),
         clears `fence_failure`, and queues the `fence_ack` command for the node
         (node-agent-protocol.md sections 5.17 and 8.5); from then on those
-        leases may be granted again. The call is audited (D-0031).
+        leases may be granted again. When a listed lease the node still holds
+        is already at the highest token, 2^53 - 1, nothing is written and the
+        call answers `conflict` with `reason: token_exhausted`
+        (node-agent-protocol.md section 8.6, ADR 0321). The call is audited
+        (D-0031).
       x-quoro-scope: node:fence_ack
       parameters:
         - $ref: '#/components/parameters/NodeId'
@@ -6827,9 +6833,13 @@ paths:
         the machine has, or removing one it lacks, changes nothing and answers
         `200`. A change that adds or removes a vote is refused with `conflict`
         while the previous voter-set change has not reached a majority of voters
-        (section 8.10), and removing a vote is refused with `conflict` when fewer
-        than three voters would remain while any `expiring` lease exists, unless
-        `force` is set. A request with both or neither of `add` and `remove`, or
+        (section 8.10), or while the `nodes` rows and the change log disagree
+        on a voter (removing that machine with `removeNode` is the repair), and
+        removing a vote is refused with `conflict` when fewer than three voters
+        would remain while any `expiring` lease exists, unless `force` is set.
+        An `expiring` lease counts there while its row is not revoked, or is
+        revoked with its gate not yet passed (ADR 0321). `force` bypasses only
+        that guard. A request with both or neither of `add` and `remove`, or
         that would leave the machine with no role, is refused with
         `validation_failed`; a removed node with `conflict`. The call is audited
         (D-0031).
