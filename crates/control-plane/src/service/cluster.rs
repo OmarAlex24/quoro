@@ -1,12 +1,14 @@
-//! Cluster read (`GET /api/v1/cluster`; MCP tool `get_cluster`).
+//! Cluster read (`GET /api/v1/cluster`; MCP tool `get_cluster`) and the N+1
+//! indicator (`GET /api/v1/cluster/capacity`; MCP tool `get_capacity`).
 
 use crate::AppState;
-use crate::api::cluster::{Cluster, ClusterVoter, ClusterVotes};
+use crate::api::cluster::{Cluster, ClusterCapacity, ClusterVoter, ClusterVotes};
 use crate::api::nodes::NodeRole;
+use crate::capacity::{self, Loaded};
 use crate::error::ApiError;
-use crate::request::CallCtx;
+use crate::request::{CallCtx, Resource};
 use crate::store::{GENESIS_HASH, now_rfc3339};
-use quoro_types::Scope;
+use quoro_types::{Prefix, Scope, is_id};
 use serde_json::json;
 
 /// Reads cluster identity and the change-log position. A human read is not
@@ -88,6 +90,76 @@ pub async fn get_cluster(state: &AppState, ctx: &CallCtx) -> Result<Cluster, Api
             signing_key_id: Some(state.keys.key_id().to_string()),
             signing_key_rotation: None,
             created_at,
+        })
+    }
+    .await;
+    ctx.finish_read(state, access, result).await
+}
+
+/// Simulates the loss of `lost_node_id` (the N+1 indicator, ADR 0178): whether
+/// its apps fit on the other nodes, or which resources are missing
+/// ([`capacity`]). A human read is not audited; an agent read is.
+///
+/// Under `cluster:read` with a narrower selector than `{"all": true}`, the
+/// answer lists only the apps the selector matches (permission-model.md
+/// section 5.1), and `fits` and `missing` are worked out from those entries,
+/// so an app the caller may not see never shows through them. The simulation
+/// itself places every app, so a visible app gets the node it would really
+/// get.
+///
+/// # Errors
+///
+/// `forbidden` without `cluster:read` or under a `{}` selector,
+/// `validation_failed` without a well-formed `lost_node_id`, `not_found` for
+/// an unknown or removed node, or a database error.
+pub async fn get_cluster_capacity(
+    state: &AppState,
+    ctx: &CallCtx,
+    lost_node_id: Option<&str>,
+) -> Result<ClusterCapacity, ApiError> {
+    let params = lost_node_id.map_or_else(|| json!({}), |id| json!({ "lost_node_id": id }));
+    let access = ctx
+        .authorize_read(state, Scope::ClusterRead, None, &params)
+        .await?;
+    let result: Result<_, ApiError> = async {
+        if access.reads_nothing() {
+            return Err(ApiError::forbidden(
+                crate::error::Reason::SelectorMismatch,
+                Some(Scope::ClusterRead.as_str()),
+            ));
+        }
+        let lost = match lost_node_id {
+            None => return Err(ApiError::validation("lost_node_id is required")),
+            Some(id) if !is_id(Prefix::Node, id) => {
+                return Err(ApiError::validation(
+                    "lost_node_id is not a node id (`nod_...`)",
+                ));
+            }
+            Some(id) => id,
+        };
+        let mut tx = state.store.pool().begin().await?;
+        let loaded = capacity::load(&mut tx, state, lost).await?;
+        drop(tx);
+        let Loaded::Inputs { rooms, apps } = loaded else {
+            return Err(ApiError::not_found("node"));
+        };
+        let entries = capacity::simulate(lost, &rooms, &apps);
+        let entries = access
+            .filter(state, entries, |entry| Resource {
+                kind: "app",
+                id: &entry.app.app_id,
+                app_id: Some(&entry.app.app_id),
+                project_id: Some(&entry.project_id),
+                node_id: None,
+            })
+            .await?;
+        let (fits, missing) = capacity::summarize(&entries);
+        Ok(ClusterCapacity {
+            lost_node_id: lost.to_string(),
+            fits,
+            missing,
+            apps: entries.into_iter().map(|entry| entry.app).collect(),
+            computed_at: now_rfc3339(),
         })
     }
     .await;

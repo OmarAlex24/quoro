@@ -562,7 +562,7 @@ fn the_name_check_catches_what_does_not_exist() {
         "`cargo build | quoro deploy --imag REF`",
         "pass `--wiat`",
         "`get_me`",
-        "`get_capacity`",
+        "`get_quota`",
     ] {
         assert_eq!(check(wrong).len(), 1, "{wrong} is caught");
     }

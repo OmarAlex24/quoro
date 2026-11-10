@@ -59,11 +59,11 @@ use crate::request::CallCtx;
 use crate::session::Fault;
 use crate::store::now_rfc3339;
 use quoro_proto::RevokeReason;
-use quoro_proto::wire::{ControlMessage, WarmRole};
+use quoro_proto::wire::{ControlMessage, WarmRole, WarmStatus};
 use quoro_types::Scope;
 use serde_json::{Value, json};
 use sqlx::SqliteConnection;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -375,18 +375,24 @@ fn complete_copy(
     volume_id: &str,
     app_id: &str,
 ) -> Option<(u64, Option<String>)> {
-    state
-        .hub
-        .warm_reports()
-        .get(warm)?
-        .iter()
-        .find_map(|entry| {
-            let target = entry.role == WarmRole::Target
-                && entry.volume_id == volume_id
-                && entry.app_id == app_id;
-            target.then_some(())?;
-            Some((entry.snapshot_seq?, entry.snapshot_taken_at.clone()))
-        })
+    complete_copy_in(&state.hub.warm_reports(), warm, volume_id, app_id)
+}
+
+/// [`complete_copy`] in a copy of the hub's warm reports, so a caller that
+/// asks for many apps reads the reports once (`getClusterCapacity`).
+pub(crate) fn complete_copy_in(
+    reports: &HashMap<String, Vec<WarmStatus>>,
+    warm: &str,
+    volume_id: &str,
+    app_id: &str,
+) -> Option<(u64, Option<String>)> {
+    reports.get(warm)?.iter().find_map(|entry| {
+        let target = entry.role == WarmRole::Target
+            && entry.volume_id == volume_id
+            && entry.app_id == app_id;
+        target.then_some(())?;
+        Some((entry.snapshot_seq?, entry.snapshot_taken_at.clone()))
+    })
 }
 
 /// The app's row and its `warm_node_id`.

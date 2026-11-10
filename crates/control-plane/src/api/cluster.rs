@@ -1,12 +1,14 @@
 //! Cluster identity and change-log position: `GET /api/v1/cluster`
-//! (MCP tool `get_cluster`).
+//! (MCP tool `get_cluster`); the N+1 indicator: `GET /api/v1/cluster/capacity`
+//! (MCP tool `get_capacity`).
 
 use crate::AppState;
 use crate::auth::Identity;
 use crate::error::ApiError;
 use crate::request::{CallCtx, RequestId};
 use axum::Json;
-use axum::extract::{Extension, State};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{Extension, Query, State};
 use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -134,4 +136,158 @@ pub async fn get_cluster(
     let ctx = CallCtx::new(identity, request_id, "GET /api/v1/cluster", &headers);
     let cluster = crate::service::cluster::get_cluster(&state, &ctx).await?;
     Ok(Json(cluster))
+}
+
+/// The N+1 indicator (`openapi.yaml` `ClusterCapacity`, ADR 0021, ADR 0178).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(
+    title = "ClusterCapacity",
+    description = "The N+1 indicator: whether the apps of one node would fit on the others if that node were lost, or which resources are missing (ADR 0021, ADR 0178). The primary simulates the loss with the allocation it holds now; nothing is reserved."
+)]
+pub struct ClusterCapacity {
+    /// The node whose loss was simulated.
+    #[schema(pattern = "^nod_[0-9A-HJKMNP-TV-Z]{26}$")]
+    pub lost_node_id: String,
+    /// Whether every listed app that needs a node got one, that is no app has
+    /// `reason` `no_capacity`.
+    pub fits: bool,
+    /// The resources of the apps left without a node for lack of capacity.
+    pub missing: CapacityShortfall,
+    /// One entry per app with an instance meant to run on the lost node, or
+    /// whose volume is there; in placement order.
+    pub apps: Vec<ClusterCapacityApp>,
+    /// When the primary computed the answer.
+    #[schema(format = "date-time")]
+    pub computed_at: String,
+}
+
+/// The resources of the apps left without a node for lack of capacity,
+/// summed (`openapi.yaml` `CapacityShortfall`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(
+    title = "CapacityShortfall",
+    description = "The resources of the apps left without a node for lack of capacity, summed; all zero when `fits` is true."
+)]
+pub struct CapacityShortfall {
+    /// vCPUs.
+    #[schema(minimum = 0)]
+    pub cpus: i64,
+    /// Memory in mebibytes.
+    #[schema(minimum = 0)]
+    pub memory_mb: i64,
+    /// Disk in gibibytes.
+    #[schema(minimum = 0)]
+    pub disk_gb: i64,
+}
+
+/// What one app of the lost node would need (`openapi.yaml`
+/// `ClusterCapacityApp`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(
+    title = "ClusterCapacityApp",
+    description = "What one app of the lost node would need."
+)]
+pub struct ClusterCapacityApp {
+    /// The app.
+    #[schema(pattern = "^app_[0-9A-HJKMNP-TV-Z]{26}$")]
+    pub app_id: String,
+    /// The app's `ha_policy`.
+    #[schema(inline)]
+    pub policy: crate::api::apps::HaPolicy,
+    /// `keep`, `start`, `failover` or `restore`.
+    #[schema(inline)]
+    pub action: CapacityAction,
+    /// Where the app would go; the node it keeps running on for `keep`. Null
+    /// when it gets no node.
+    #[schema(pattern = "^nod_[0-9A-HJKMNP-TV-Z]{26}$", required = true)]
+    pub node_id: Option<String>,
+    /// Why `node_id` is null, or null.
+    #[schema(inline, required = true)]
+    pub reason: Option<CapacityReason>,
+}
+
+/// What a lost node's app would do (`ClusterCapacityApp.action`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityAction {
+    /// A stateless app that still has an instance on another node.
+    Keep,
+    /// A stateless app whose only instance was on the lost node.
+    Start,
+    /// A `warm` app whose source is the lost node.
+    Failover,
+    /// A stateful `none` or `cold` app, restored from its latest backup.
+    Restore,
+}
+
+/// Why an app gets no node (`ClusterCapacityApp.reason`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityReason {
+    /// No remaining node has room.
+    NoCapacity,
+    /// A stateful app with no succeeded backup.
+    NoBackup,
+    /// The warm node holds no complete copy.
+    NoWarmCopy,
+}
+
+/// Query of `getClusterCapacity`. `lost_node_id` is required by the contract;
+/// it is optional here so a missing one answers `validation_failed` like a
+/// malformed one, through the service, on HTTP and MCP alike.
+#[derive(Debug, Default, Deserialize)]
+pub struct ClusterCapacityQuery {
+    /// The node whose loss is simulated (`nod_...`).
+    pub lost_node_id: Option<String>,
+}
+
+/// Simulate the loss of a node (the N+1 indicator).
+#[utoipa::path(
+    get,
+    path = "/api/v1/cluster/capacity",
+    tag = "cluster",
+    operation_id = "getClusterCapacity",
+    extensions(
+        ("x-quoro-scope" = json!("cluster:read")),
+        ("x-quoro-mcp-tool" = json!("get_capacity")),
+    ),
+    params(
+        ("lost_node_id" = String, Query,
+            description = "The node whose loss the N+1 indicator simulates (`nod_...`).",
+            pattern = "^nod_[0-9A-HJKMNP-TV-Z]{26}$"),
+    ),
+    responses(
+        (status = 200, description = "The simulated loss.", body = ClusterCapacity,
+            headers(("Quoro-Request-Id" = String, description = "Correlation id of this call."))),
+        (status = 401, response = crate::openapi::Unauthenticated),
+        (status = 403, response = crate::openapi::Forbidden),
+        (status = 404, response = crate::openapi::NotFound),
+        (status = 422, response = crate::openapi::ValidationFailed),
+        (status = 429, response = crate::openapi::RateLimited),
+    )
+)]
+///
+/// # Errors
+///
+/// `forbidden` without `cluster:read`, `validation_failed` without a
+/// well-formed `lost_node_id`, `not_found` for an unknown or removed node, or
+/// a database error.
+pub async fn get_cluster_capacity(
+    State(state): State<AppState>,
+    identity: Identity,
+    headers: HeaderMap,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    query: Result<Query<ClusterCapacityQuery>, QueryRejection>,
+) -> Result<Json<ClusterCapacity>, ApiError> {
+    let ctx = CallCtx::new(
+        identity,
+        request_id,
+        "GET /api/v1/cluster/capacity",
+        &headers,
+    );
+    let Query(query) = query.map_err(|rejection| ApiError::validation(rejection.body_text()))?;
+    let capacity =
+        crate::service::cluster::get_cluster_capacity(&state, &ctx, query.lost_node_id.as_deref())
+            .await?;
+    Ok(Json(capacity))
 }
