@@ -12,9 +12,11 @@
 //! recorded until an operator deletes it with `deleteVolumeQuarantine`
 //! ([`delete_copy`]), which sets `deleting_at` and puts the id in its node's
 //! `spec.quarantine_deletes` ([`deletes_on`]); the row goes once that node's
-//! report no longer lists the copy. Nothing else in this build removes a
-//! record (`removeNode`, which drops a removed node's records in section 10,
-//! does not exist yet). `deleteVolume` and `deleteApp` are refused with
+//! report no longer lists the copy. `removeNode` drops every record of the
+//! node it removes in its own transaction ([`drop_node_copies`], section 10),
+//! then forgets the copies that node listed ([`forget_listed`]); the files
+//! stay on its disk. Nothing else removes a record. `deleteVolume` and
+//! `deleteApp` are refused with
 //! `has_quarantines` while a record names the volume, or while a node's
 //! latest report lists a copy of it that could get a row, hashed or not
 //! ([`ListedCopies`], [`refuse_volume_with_copies`],
@@ -202,6 +204,12 @@ impl ListedCopies {
         } else {
             by_node.insert(node_id.to_string(), copies);
         }
+    }
+
+    /// Forgets the copies `node_id` listed, as a report listing none would.
+    #[cfg_attr(not(test), expect(dead_code, reason = "removeNode (#740) calls it"))]
+    pub(crate) fn forget(&self, node_id: &str) {
+        self.0.lock().expect("listed copies lock").remove(node_id);
     }
 
     /// A copy some node lists that `wanted` accepts. Never held across an
@@ -593,6 +601,61 @@ async fn drop_deleted(
     )
     .await?;
     Ok(true)
+}
+
+/// Drops every record of a quarantined copy that `node_id` keeps, `deleting`
+/// or not, each with a change-log `delete` under `actor`, in the caller's
+/// transaction: `removeNode` calls it in the transaction that marks the node
+/// `removed` (section 10), so a node that is gone for good no longer blocks
+/// `deleteVolume` or `deleteApp`. The copies stay on the node's disk. No
+/// audit record or event is written per copy: the call's own audit record
+/// covers them. Returns the dropped ids, by id. After the transaction
+/// commits, the caller calls [`forget_listed`].
+///
+/// # Errors
+///
+/// A database or change-log error; the caller's transaction then rolls back
+/// with nothing dropped.
+#[cfg_attr(not(test), expect(dead_code, reason = "removeNode (#740) calls it"))]
+pub(crate) async fn drop_node_copies(
+    conn: &mut SqliteConnection,
+    actor: &Actor,
+    node_id: &str,
+) -> Result<Vec<String>, ApiError> {
+    let rows = sqlx::query(&format!(
+        "SELECT {COLUMNS} FROM volume_quarantines WHERE node_id = ? ORDER BY id"
+    ))
+    .bind(node_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut dropped = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let copy = CopyRow::from_row(row)?;
+        sqlx::query("DELETE FROM volume_quarantines WHERE id = ?")
+            .bind(&copy.id)
+            .execute(&mut *conn)
+            .await?;
+        changelog::append(
+            &mut *conn,
+            actor,
+            ENTITY_TYPE,
+            &copy.id,
+            Op::Delete,
+            copy.payload(),
+        )
+        .await?;
+        dropped.push(copy.id);
+    }
+    Ok(dropped)
+}
+
+/// Forgets the copies `node_id` listed in its latest report
+/// ([`ListedCopies`]), so a removed node's unhashed copies no longer refuse
+/// `deleteVolume` and `deleteApp`. `removeNode` calls it once the transaction
+/// that ran [`drop_node_copies`] has committed.
+#[expect(dead_code, reason = "removeNode (#740) calls it")]
+pub(crate) fn forget_listed(hub: &NodeHub, node_id: &str) {
+    hub.listed_copies().forget(node_id);
 }
 
 /// `spec.quarantine_deletes` of `node_id` (section 5.11): the ids of the
@@ -992,5 +1055,186 @@ mod tests {
         for bad in ["", "yesterday", "2026-11-09", "2026-11-09T10:00:00"] {
             assert!(parse_time(bad).is_none(), "{bad}");
         }
+    }
+
+    /// A store with two nodes, one app with a volume, and three recorded
+    /// copies: two on `nod_a` (one of them `deleting`), one on `nod_b`.
+    async fn store_with_copies() -> Store {
+        let store = Store::open_in_memory().await.unwrap();
+        let pool = store.pool();
+        let now = "2026-11-10T10:00:00Z";
+        for node_id in ["nod_a", "nod_b"] {
+            sqlx::query(
+                "INSERT INTO nodes (id, name, roles, status, public_key, behind_nat, labels, \
+                 capacity, allocated, kvm, created_at) \
+                 VALUES (?, ?, '[\"node\"]', 'disconnected', 'key', 0, '{}', '{}', '{}', '{}', ?)",
+            )
+            .bind(node_id)
+            .bind(node_id)
+            .bind(now)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO projects (id, slug, name, created_at, updated_at) \
+             VALUES ('prj_1', 'p', 'p', ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO apps (id, project_id, name, image, port, health_check, resources, \
+             placement, status, created_at, updated_at) \
+             VALUES ('app_1', 'prj_1', 'db', 'image', 8080, '{}', '{}', '{}', 'running', ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO volumes (id, app_id, node_id, size_gb, mount_path, state, \
+             created_at, updated_at) VALUES ('vol_1', 'app_1', 'nod_b', 1, '/data', 'ready', ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+        for (id, node_id, deleting_at) in [
+            ("qrn_2", "nod_a", None),
+            ("qrn_1", "nod_a", Some(now)),
+            ("qrn_3", "nod_b", None),
+        ] {
+            sqlx::query(&format!(
+                "INSERT INTO volume_quarantines ({COLUMNS}) \
+                 VALUES (?, 'vol_1', 'app_1', ?, 7, ?, ?, ?)"
+            ))
+            .bind(id)
+            .bind(node_id)
+            .bind("a".repeat(64))
+            .bind(now)
+            .bind(deleting_at)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        store
+    }
+
+    /// The `(entity_type, entity_id, op, payload)` of every change-log entry.
+    async fn log_entries(store: &Store) -> Vec<(String, String, String, Value)> {
+        let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT entity_type, entity_id, op, payload FROM change_log ORDER BY seq",
+        )
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        rows.into_iter()
+            .map(|(kind, id, op, payload)| (kind, id, op, serde_json::from_str(&payload).unwrap()))
+            .collect()
+    }
+
+    async fn remaining(store: &Store) -> Vec<String> {
+        sqlx::query_scalar("SELECT id FROM volume_quarantines ORDER BY id")
+            .fetch_all(store.pool())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn removing_a_node_drops_all_its_records_and_logs_each_delete() {
+        let store = store_with_copies().await;
+        let before = log_entries(&store).await.len();
+        let actor = Actor::system("nodes");
+
+        let mut w = store.begin_write().await.unwrap();
+        let dropped = drop_node_copies(&mut w.tx, &actor, "nod_a").await.unwrap();
+        w.commit().await.unwrap();
+
+        // Both of the node's copies, `deleting` or not, by id; the other
+        // node's copy stays.
+        assert_eq!(dropped, ["qrn_1", "qrn_2"]);
+        assert_eq!(remaining(&store).await, ["qrn_3"]);
+
+        let entries = log_entries(&store).await;
+        let new = &entries[before..];
+        assert_eq!(new.len(), 2, "{new:?}");
+        for ((kind, id, op, payload), expected) in new.iter().zip(["qrn_1", "qrn_2"]) {
+            assert_eq!(
+                (kind.as_str(), id.as_str(), op.as_str()),
+                (ENTITY_TYPE, expected, "delete")
+            );
+            assert_eq!(payload["id"], expected);
+            assert_eq!(payload["node_id"], "nod_a");
+            assert_eq!(payload["volume_id"], "vol_1");
+        }
+        let (deleting_at, sha256) = (&new[0].3["deleting_at"], &new[0].3["sha256"]);
+        assert_eq!(
+            deleting_at, "2026-11-10T10:00:00Z",
+            "the whole row is the payload"
+        );
+        assert_eq!(sha256, &json!("a".repeat(64)));
+
+        // No audit record per copy: the caller's own record covers them.
+        let audited: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(audited, 0);
+    }
+
+    #[tokio::test]
+    async fn a_node_without_records_drops_nothing() {
+        let store = store_with_copies().await;
+        let before = log_entries(&store).await.len();
+        let mut w = store.begin_write().await.unwrap();
+        let dropped = drop_node_copies(&mut w.tx, &Actor::system("nodes"), "nod_c")
+            .await
+            .unwrap();
+        w.commit().await.unwrap();
+        assert!(dropped.is_empty());
+        assert_eq!(remaining(&store).await, ["qrn_1", "qrn_2", "qrn_3"]);
+        assert_eq!(log_entries(&store).await.len(), before);
+    }
+
+    #[tokio::test]
+    async fn a_transaction_that_does_not_commit_keeps_every_record() {
+        let store = store_with_copies().await;
+        let before = log_entries(&store).await.len();
+        {
+            let mut w = store.begin_write().await.unwrap();
+            let dropped = drop_node_copies(&mut w.tx, &Actor::system("nodes"), "nod_a")
+                .await
+                .unwrap();
+            assert_eq!(dropped.len(), 2);
+            // Dropped without a commit, as a later refusal in removeNode would.
+        }
+        assert_eq!(remaining(&store).await, ["qrn_1", "qrn_2", "qrn_3"]);
+        assert_eq!(log_entries(&store).await.len(), before);
+    }
+
+    #[test]
+    fn forgetting_a_node_leaves_the_other_nodes_listed_copies() {
+        let entry = |volume_id: &str| wire::QuarantineStatus {
+            quarantine_id: "qrn_01JC9Z6Q5W8N3K4T7R2M000001".to_string(),
+            volume_id: volume_id.to_string(),
+            app_id: "app_1".to_string(),
+            created_at: "2026-11-09T10:00:00Z".to_string(),
+            size_bytes: 1,
+            sha256: None,
+        };
+        let listed = ListedCopies::default();
+        listed.replace("nod_a", &[entry("vol_a")]);
+        listed.replace("nod_b", &[entry("vol_b")]);
+        listed.forget("nod_a");
+        assert_eq!(listed.find(|copy| copy.volume_id == "vol_a"), None);
+        assert!(listed.find(|copy| copy.volume_id == "vol_b").is_some());
+        // Forgetting a node that listed nothing changes nothing.
+        listed.forget("nod_c");
+        assert!(listed.find(|copy| copy.volume_id == "vol_b").is_some());
     }
 }
