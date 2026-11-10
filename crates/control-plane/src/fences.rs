@@ -357,6 +357,11 @@ pub(crate) async fn has_failed_fence(
 
 /// Every lease [`has_failed_fence`] answers `true` for.
 ///
+/// The in-memory set is read before the database, and the order matters on
+/// a connection outside the writer: the set drops an entry only after its
+/// record has committed, so a failure recorded between the two reads is in
+/// the snapshot or in the rows. Read the other way, it could be in neither.
+///
 /// # Errors
 ///
 /// A database error, or a stored value that does not parse.
@@ -364,8 +369,8 @@ pub(crate) async fn failed_leases(
     conn: &mut SqliteConnection,
     unrecorded: &UnrecordedFailures,
 ) -> Result<HashSet<String>, ApiError> {
-    let mut failed = listed_leases(conn).await?;
-    failed.extend(unrecorded.leases());
+    let mut failed = unrecorded.leases();
+    failed.extend(listed_leases(conn).await?);
     Ok(failed)
 }
 

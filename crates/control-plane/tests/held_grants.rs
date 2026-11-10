@@ -1840,3 +1840,74 @@ async fn a_step_4_row_with_an_unrecorded_failed_fence_gets_the_superseded_revoke
     assert!(grants_of(&seen, &lease_id).is_empty(), "{seen:?}");
     assert_eq!(row(&server, &lease_id).await.0, 2, "no token minted");
 }
+
+/// Section 8.5 step 1 and section 5.12. A's unmarked `local` row of a `none`
+/// app stands at token 2. B, an old holder, lists the lease `held` at token
+/// 1; it answers its revoke `fence_failed`, and the primary cannot record
+/// the failure, which it then keeps in memory only. A's next session lists
+/// nothing, and no `lease_grant` of the lease goes out to it: the session
+/// start's grants read the unrecorded failures as well as the recorded ones.
+#[tokio::test]
+async fn an_unrecorded_failed_fence_holds_an_unmarked_rows_grant_at_the_session_start() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    manual_clock(&server);
+    let a = enroll(&server, &owner, "node-a", &["node"]).await;
+    let (mut on_a, _) = session(&server, &a, None, Vec::new(), true).await;
+    heartbeat(&mut on_a).await;
+    let project_id = project(&server, &owner).await;
+    let (app_id, lease_id) = app_with_lease(&server, &owner, &mut on_a, &project_id, "web").await;
+    run(
+        &server,
+        "UPDATE leases SET fencing_token = 2 WHERE id = ?",
+        &lease_id,
+    )
+    .await;
+    assert_eq!(
+        row(&server, &lease_id).await,
+        (2, "local".to_string(), None, 0, false)
+    );
+    let a_log = on_a.log.clone();
+    drop(on_a);
+    wait_disconnected(&server, &a).await;
+
+    let b = enroll(&server, &owner, "node-b", &["node"]).await;
+    server.state.hub.inject_fault(Fault::FailureRecord {
+        node_id: b.node_id.clone(),
+    });
+    let listing = vec![listed(&lease_id, &app_id, LeaseMode::Local, 1, "held")];
+    let (mut on_b, frames) = session(&server, &b, None, listing, true).await;
+    let revokes = revokes_of(&frames, &lease_id);
+    assert_eq!(revokes.len(), 1, "{frames:?}");
+    on_b.send(
+        NodeMessage::CommandResult(CommandResult {
+            status: CommandStatus::Error,
+            detail: Some("the VM may still run".to_string()),
+            error: Some(ErrorBody {
+                code: ErrorCode::FenceFailed,
+                message: "the forced stop could not be confirmed".to_string(),
+            }),
+            lines: None,
+            metrics: None,
+        }),
+        revokes[0]["id"].as_str(),
+    )
+    .await;
+    on_b.settle().await;
+    let failure: Option<String> =
+        sqlx::query_scalar("SELECT fence_failure FROM nodes WHERE id = ?")
+            .bind(&b.node_id)
+            .fetch_one(server.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(failure, None, "not recorded");
+
+    let (mut on_a, frames) = session(&server, &a, Some(a_log), Vec::new(), true).await;
+    let mut seen = frames;
+    seen.extend(after_a_tick(&mut on_a).await);
+    assert!(grants_of(&seen, &lease_id).is_empty(), "{seen:?}");
+    assert_eq!(
+        row(&server, &lease_id).await,
+        (2, "local".to_string(), None, 0, false)
+    );
+}
