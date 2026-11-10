@@ -193,7 +193,9 @@ pub async fn abort(data_dir: &Path) -> Result<(), AgentError> {
 
 /// What `quoro cluster promote` reads from the agent's store for its
 /// refusals and its step 1 (section 7.3), before the freeze and again after
-/// it. Each value is read on its own. After the freeze commits, the agent
+/// it. Each value is read once, on its own, and [`Self::below_mark`] is
+/// worked out from the `log_seq` and `mark` read here, so the two always
+/// agree. After the freeze commits, the agent
 /// stores no entry and changes neither its log nor its refollowing state;
 /// the only later writes are the two mark writes of the module
 /// documentation, and neither turns a refusal into a pass.
@@ -209,8 +211,8 @@ pub struct PromotionReads {
     /// The change-log mark ([`follow::read_mark`]), `None` without a mark
     /// file.
     pub mark: Option<u64>,
-    /// Whether the followed log is below the mark (section 7.1 "The node's
-    /// mark", [`NodeStore::log_below_mark`]); no log is below a missing mark.
+    /// Whether `log_seq` is below `mark` (section 7.1 "The node's mark",
+    /// [`follow::below_mark`]); no log is below a missing mark.
     pub below_mark: bool,
     /// The refollowing state ([`NodeStore::refollowing`]).
     pub refollowing: Option<Refollowing>,
@@ -255,7 +257,7 @@ pub async fn promotion_reads(store: &NodeStore) -> Result<PromotionReads, AgentE
         log_hash,
         head,
         mark,
-        below_mark: store.log_below_mark().await?,
+        below_mark: follow::below_mark(log_seq, mark),
         refollowing,
         quarantined,
         welcome_schema_version: store.welcome_schema_version().await?,
@@ -268,7 +270,7 @@ mod tests {
     use super::*;
     use crate::follow::{ZERO_HASH, verify_batch};
     use crate::identity::LOG_MARK_FILE;
-    use crate::store::{BatchStored, FreezeChecked};
+    use crate::store::{BatchStored, FreezeChecked, LogQuarantine};
 
     struct TempDir(std::path::PathBuf);
 
@@ -365,7 +367,10 @@ mod tests {
         );
 
         // A quarantine keeps the log as it stands too, and leaves no file.
-        assert!(store.quarantine_log("test").await.is_err());
+        assert_eq!(
+            store.quarantine_log("test").await.unwrap(),
+            LogQuarantine::Frozen
+        );
         assert_eq!(store.log_entries().await.unwrap(), first);
         let quarantine = dir.0.join("quarantine");
         assert!(
@@ -595,8 +600,9 @@ mod tests {
 
     /// Section 7.1 "Refollowing", section 7.3 "The freeze" (ADR 0261, ADR
     /// 0285): a freeze that commits between a quarantine's first writes and
-    /// the move leaves the log in place, read as quarantined, and the move
-    /// is finished by `recover` once the freeze ends, not before. A mark at
+    /// the move leaves the log in place, read as quarantined. The move and
+    /// `recover` return frozen, not an error, and the move is finished by
+    /// `recover` once the freeze ends, not before. A mark at
     /// 2^53 - 1 with no state recorded is not finished while frozen either:
     /// `recover` returns frozen and records nothing.
     #[tokio::test]
@@ -611,8 +617,14 @@ mod tests {
         );
         freeze(&dir.0).await.unwrap();
 
-        assert!(store.quarantine_log("log_diverged: test").await.is_err());
-        assert!(follow::recover(&store).await.is_err());
+        assert_eq!(
+            store.quarantine_log("log_diverged: test").await.unwrap(),
+            LogQuarantine::Frozen
+        );
+        assert_eq!(
+            follow::recover(&store).await.unwrap(),
+            FreezeChecked::Frozen
+        );
         assert_eq!(store.log_entries().await.unwrap(), entries);
         assert_eq!(quarantined_copies(&store).await, 0);
         let reads = promotion_reads(&store).await.unwrap();
@@ -659,5 +671,126 @@ mod tests {
         );
         assert!(store.log_entries().await.unwrap().is_empty());
         assert_eq!(quarantined_copies(&store).await, 1);
+    }
+
+    /// Section 7.3 "The freeze", section 7.1: a move of the copy that a
+    /// freeze stopped is reported as frozen, not as an error, so the session
+    /// and `recover` end as frozen. The copy, the quarantine table and the
+    /// quarantine directory stay as they were; once the freeze ends, the
+    /// copy moves.
+    #[tokio::test]
+    async fn a_move_a_freeze_stopped_is_reported_as_frozen_not_as_an_error() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let entries = verified(1, ZERO_HASH, 3, "a");
+        store.store_log_batch(&entries, Some(3)).await.unwrap();
+        freeze(&dir.0).await.unwrap();
+
+        assert_eq!(
+            store.quarantine_log("log_diverged: test").await.unwrap(),
+            LogQuarantine::Frozen
+        );
+        assert_eq!(store.log_entries().await.unwrap(), entries);
+        assert_eq!(quarantined_copies(&store).await, 0);
+        let files = std::fs::read_dir(dir.0.join("quarantine")).map_or(0, Iterator::count);
+        assert_eq!(files, 0, "no quarantine file is left");
+
+        unfreeze(&dir.0).await.unwrap();
+        let LogQuarantine::Moved(path) = store.quarantine_log("log_diverged: test").await.unwrap()
+        else {
+            panic!("the copy moves once the freeze ended");
+        };
+        assert!(path.exists());
+        assert_eq!(quarantined_copies(&store).await, 1);
+        assert!(store.log_entries().await.unwrap().is_empty());
+    }
+
+    /// Runs `call` while a second connection to `node.db`, as another
+    /// process, holds SQLite's write lock with the freeze written and not
+    /// yet committed (section 7.3 "The freeze"). The call must still be
+    /// waiting after 300 ms: in WAL mode only a write waits on that lock, so
+    /// the call waits in its own transaction. The freeze then commits, well
+    /// inside the store's 5 s busy timeout, and the call's result is
+    /// returned.
+    async fn race_a_freeze<F>(dir: &TempDir, call: F) -> FreezeChecked
+    where
+        F: Future<Output = Result<FreezeChecked, AgentError>> + Send + 'static,
+    {
+        let mut conn = connect(&dir.0).await.unwrap();
+        let mut freezing = conn.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        sqlx::query("INSERT INTO node_meta (key, value) VALUES (?, ?)")
+            .bind(PROMOTION_FREEZE)
+            .bind(util::now_rfc3339())
+            .execute(&mut *freezing)
+            .await
+            .unwrap();
+        let call = tokio::spawn(call);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !call.is_finished(),
+            "the call waits on the write lock the freeze holds"
+        );
+        freezing.commit().await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .expect("the call ends once the freeze committed")
+            .unwrap()
+            .unwrap();
+        let _ = conn.close().await;
+        result
+    }
+
+    /// Section 7.1 "Refollowing", section 7.3 "The freeze" (ADR 0261): the
+    /// quarantine's first writes read the freeze inside their transaction,
+    /// not before it. A freeze that another process commits while the call
+    /// waits on its write lock is read: nothing is written, and the mark
+    /// file, the refollowing state and the log stay as they were.
+    #[tokio::test]
+    async fn the_quarantine_s_mark_reads_a_freeze_that_commits_while_it_waits() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let entries = verified(1, ZERO_HASH, 3, "a");
+        store.store_log_batch(&entries, Some(3)).await.unwrap();
+        std::fs::write(dir.0.join(LOG_MARK_FILE), "3").unwrap();
+
+        let quarantining = store.clone();
+        let result = race_a_freeze(&dir, async move { quarantining.mark_quarantine().await }).await;
+        assert_eq!(result, FreezeChecked::Frozen);
+        assert!(is_frozen(&store).await.unwrap());
+        assert_eq!(mark_text(&dir).as_deref(), Some("3"));
+        assert_eq!(store.refollowing().await.unwrap(), None);
+        assert_eq!(store.log_entries().await.unwrap(), entries);
+    }
+
+    /// Section 7.1 "Refollowing", section 7.3 "The freeze" (ADR 0261): the
+    /// refollowing state reads the freeze inside its transaction, not before
+    /// it. A freeze that another process commits while the call waits on
+    /// its write lock is read: nothing is written, and the recorded head,
+    /// the mark file and the log stay as they were.
+    #[tokio::test]
+    async fn the_refollowing_state_reads_a_freeze_that_commits_while_it_waits() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let entries = verified(1, ZERO_HASH, 3, "a");
+        store.store_log_batch(&entries, Some(5)).await.unwrap();
+        assert_eq!(
+            store.set_refollowing(Refollowing::Head(5)).await.unwrap(),
+            FreezeChecked::Written
+        );
+        std::fs::write(dir.0.join(LOG_MARK_FILE), "5").unwrap();
+
+        let refollowing = store.clone();
+        let result = race_a_freeze(&dir, async move {
+            refollowing.set_refollowing(Refollowing::HeadUnknown).await
+        })
+        .await;
+        assert_eq!(result, FreezeChecked::Frozen);
+        assert!(is_frozen(&store).await.unwrap());
+        assert_eq!(
+            store.refollowing().await.unwrap(),
+            Some(Refollowing::Head(5))
+        );
+        assert_eq!(mark_text(&dir).as_deref(), Some("5"));
+        assert_eq!(store.log_entries().await.unwrap(), entries);
     }
 }

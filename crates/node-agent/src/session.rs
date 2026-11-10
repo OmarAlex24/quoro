@@ -53,7 +53,7 @@ use crate::lease::{HostClock, LeaseLink, SystemHostClock};
 use crate::logs::{LogFilter, StoredLogLine};
 use crate::metrics::{MetricsRing, Tick, parse_metrics_params, tick_report};
 use crate::reconcile::Snapshot;
-use crate::store::{BatchStored, FreezeChecked, NodeStore, Refollowing};
+use crate::store::{BatchStored, FreezeChecked, LogQuarantine, NodeStore, Refollowing};
 use crate::tls::{self, Endpoint};
 use crate::vote::{self, Received, SupportAnswer, TermCheck};
 use crate::{AgentError, FatalReason, NodeFacts, util};
@@ -1659,8 +1659,8 @@ impl Session {
                     // as it stands, mark and refollowing state included.
                     // `on_log_diverged` reads the freeze under the write lock
                     // its first writes hold, and ends the session when it is
-                    // set. The primary declares the log diverged again at the
-                    // `hello` after the freeze ends.
+                    // set. The primary checks the log again at the next
+                    // `hello`, after the freeze ends.
                     return self.on_log_diverged(&error.message).await;
                 }
                 warn!(
@@ -2061,9 +2061,11 @@ impl Session {
     ///
     /// A freeze that commits after the two and before the copy moves stops
     /// the move: [`NodeStore::quarantine_log`] reads the freeze in its own
-    /// transaction, refuses, and the session ends. The log then stays as the
-    /// promotion reads it, with the mark at [`follow::MAX_SEQ`] and "head
-    /// unknown", which reads as quarantined
+    /// transaction and returns [`LogQuarantine::Frozen`], and the session
+    /// ends with [`SessionEnd::Frozen`] as well, so the agent dials again
+    /// within about a second of the freeze's end, with no backoff. The log
+    /// then stays as the promotion reads it, with the mark at
+    /// [`follow::MAX_SEQ`] and "head unknown", which reads as quarantined
     /// ([`crate::freeze::PromotionReads::quarantined`]), so the promotion
     /// refuses it. Once the freeze ends, [`follow::recover`] finds "head
     /// unknown" and moves the copy aside before the next `hello`.
@@ -2076,15 +2078,21 @@ impl Session {
         }
         let reason = format!("log_diverged: {message}");
         match self.store.quarantine_log(&reason).await? {
-            Some(path) => warn!(
+            LogQuarantine::Moved(path) => warn!(
                 path = %path.display(),
                 message = %message,
                 "the primary reported a diverged change log; the local copy is quarantined"
             ),
-            None => warn!(
+            LogQuarantine::Empty => warn!(
                 message = %message,
                 "the primary reported a diverged change log, but the local copy is empty"
             ),
+            LogQuarantine::Frozen => {
+                info!(
+                    "a promotion on this host froze the agent; the diverged change log is moved aside once the freeze ends"
+                );
+                return Ok(Some(SessionEnd::Frozen));
+            }
         }
         Ok(None)
     }

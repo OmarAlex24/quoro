@@ -3794,53 +3794,106 @@ async fn an_agent_started_frozen_never_dials_until_the_freeze_ends() {
     primary.abort();
 }
 
+/// Waits until `done` holds, checking every 10 ms, and panics with `what`
+/// after `limit`.
+async fn wait_until(done: impl Fn() -> bool, limit: Duration, what: &str) {
+    let deadline = Instant::now() + limit;
+    while !done() {
+        assert!(Instant::now() < deadline, "{what} within {limit:?}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// Section 7.3 "The freeze" and section 4.4: a dial attempt under way when
-/// the freeze commits ends. Here `primary_url` refuses, as a primary that is
-/// down does, so the attempt redials it for 2 s and would then try the
-/// advertised address, which accepts and never answers. Frozen at 0.1 s,
-/// well before the dial loop's first check of the flag at 1 s, the agent
-/// never reaches that address while the freeze lasts, and does once it ends.
+/// the freeze commits ends. Here `primary_url` accepts the TCP connection of
+/// the first dial and never answers its TLS handshake, as a hung primary
+/// does, so that attempt would wait the full connect timeout, 10 s, and then
+/// try the advertised address, which accepts and never answers. The freeze
+/// commits only once that first connection was accepted, so a dial is under
+/// way: the agent closes it within the dial loop's check of the flag, about
+/// a second, and dials nowhere while the freeze lasts. Once it ends, the
+/// agent dials again. `primary_url` now drops each connection, so the
+/// handshake fails at once; unlike a refused connection, `dial_known` does
+/// not dial it again, and the attempt reaches the advertised address.
 #[tokio::test]
 async fn a_freeze_ends_a_dial_attempt_under_way() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::io::AsyncReadExt as _;
+
     let dir = TempDir::new();
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let closed = format!("https://127.0.0.1:{}", probe.local_addr().unwrap().port());
-    drop(probe);
+    let hung = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let hung_url = format!("https://127.0.0.1:{}", hung.local_addr().unwrap().port());
+    let hung_accepts = Arc::new(AtomicUsize::new(0));
+    let first_closed = Arc::new(AtomicBool::new(false));
+    let hung_listener = {
+        let accepts = Arc::clone(&hung_accepts);
+        let closed = Arc::clone(&first_closed);
+        tokio::spawn(async move {
+            while let Ok((mut tcp, _)) = hung.accept().await {
+                if accepts.fetch_add(1, Ordering::SeqCst) > 0 {
+                    // Every later connection is dropped at once.
+                    continue;
+                }
+                // The first is held, unanswered, until the agent closes it.
+                let closed = Arc::clone(&closed);
+                tokio::spawn(async move {
+                    let mut buf = [0_u8; 1024];
+                    while matches!(tcp.read(&mut buf).await, Ok(read) if read > 0) {}
+                    closed.store(true, Ordering::SeqCst);
+                });
+            }
+        })
+    };
     let silent = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let silent_url = format!("https://127.0.0.1:{}", silent.local_addr().unwrap().port());
-    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let accepted = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&accepted);
     let listener = tokio::spawn(async move {
         let mut held = Vec::new();
         while let Ok((tcp, _)) = silent.accept().await {
-            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            counter.fetch_add(1, Ordering::SeqCst);
             held.push(tcp);
         }
     });
     let (_store, stop, running) =
-        dialing_agent(&dir, &closed, &"0".repeat(64), &[silent_url]).await;
+        dialing_agent(&dir, &hung_url, &"0".repeat(64), &[silent_url]).await;
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_until(
+        || hung_accepts.load(Ordering::SeqCst) >= 1,
+        Duration::from_secs(5),
+        "the agent dials primary_url",
+    )
+    .await;
     freeze::freeze(dir.path()).await.unwrap();
+    wait_until(
+        || first_closed.load(Ordering::SeqCst),
+        Duration::from_secs(3),
+        "the dial under way ends after the freeze",
+    )
+    .await;
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(
-        accepted.load(std::sync::atomic::Ordering::SeqCst),
+        accepted.load(Ordering::SeqCst),
         0,
         "the attempt under way went on to the advertised address while frozen"
     );
+    assert_eq!(
+        hung_accepts.load(Ordering::SeqCst),
+        1,
+        "no new dial while frozen"
+    );
 
     freeze::unfreeze(dir.path()).await.unwrap();
-    let deadline = Instant::now() + Duration::from_secs(6);
-    while accepted.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-        assert!(
-            Instant::now() < deadline,
-            "no dial reached the advertised address after the freeze ended"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    wait_until(
+        || accepted.load(Ordering::SeqCst) > 0,
+        Duration::from_secs(6),
+        "a dial reaches the advertised address after the freeze ended",
+    )
+    .await;
 
     let _ = stop.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
+    hung_listener.abort();
     listener.abort();
 }
 
@@ -3880,13 +3933,44 @@ async fn log_diverged_after_the_freeze_changes_nothing_and_ends_the_session() {
     assert!(!dir.path().join("quarantine").exists());
 }
 
+/// Waits until the session holds a second connection of `store`'s pool,
+/// besides the one the test holds with SQLite's write lock, for 200 ms in a
+/// row: a transaction waiting on that lock. In WAL mode a read never waits
+/// on it, and while the session's loop handles one message it does nothing
+/// else, so on the `log_entries` path that is the transaction that would
+/// record the head. It panics after 3 s, well inside the store's 5 s busy
+/// timeout.
+async fn waiting_on_the_write_lock(store: &NodeStore) {
+    let pool = store.pool();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut since: Option<Instant> = None;
+    loop {
+        let in_use = usize::try_from(pool.size())
+            .unwrap()
+            .saturating_sub(pool.num_idle());
+        if in_use >= 2 {
+            if since.get_or_insert_with(Instant::now).elapsed() >= Duration::from_millis(200) {
+                return;
+            }
+        } else {
+            since = None;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the session never waited on the write lock"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 /// Section 7.3 "The freeze", section 7.1 "Refollowing" (ADR 0261, ADR
 /// 0280): a frozen agent refollowing with the head unknown that receives
 /// `log_entries` records no head, leaves the mark at 2^53 - 1, stores
 /// nothing and answers nothing. The test holds SQLite's write lock with the
 /// freeze written but not committed, so the session passes its first read
-/// of the flag and waits in the transaction that would record the head;
-/// the freeze then commits, and that transaction reads it.
+/// of the flag and waits in the transaction that would record the head. The
+/// freeze commits only once the session is seen waiting there
+/// ([`waiting_on_the_write_lock`]), and that transaction reads it.
 #[tokio::test]
 async fn a_frozen_agent_refollowing_with_the_head_unknown_records_no_head() {
     let dir = TempDir::new();
@@ -3915,9 +3999,7 @@ async fn a_frozen_agent_refollowing_with_the_head_unknown_records_no_head() {
         log_entries_frame(log_chain(1, ZEROS, 2, "new"), Some(5), "msg_log_1"),
     )
     .await;
-    // Well inside the store's 5 s busy timeout, which the session's own
-    // transaction waits on.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    waiting_on_the_write_lock(&store).await;
     freezing.commit().await.unwrap();
 
     let frames = frames_until_closed_within(&mut ws, Duration::from_secs(2)).await;
@@ -3935,4 +4017,51 @@ async fn a_frozen_agent_refollowing_with_the_head_unknown_records_no_head() {
     assert_eq!(mark_text(&dir).as_deref(), Some(MAX_SEQ_TEXT));
     assert!(stored_log(&store).await.is_empty());
     assert_eq!(store.log_head().await.unwrap(), None);
+}
+
+/// Section 7.3 "The freeze", section 7.1 "Refollowing" (ADR 0261): a freeze
+/// that commits after a quarantine's mark and state and before its copy
+/// moves ends the session as `Frozen`, not `Reconnect`, so the agent dials
+/// again within about a second of the freeze's end, with no backoff. A
+/// trigger on the test's store sets the freeze in the transaction that
+/// records "head unknown", so it commits with that state, before the move
+/// reads it. The copy stays where it was, read as quarantined, with no
+/// quarantined copy recorded and no file left.
+#[tokio::test]
+async fn a_freeze_that_stops_the_move_of_a_diverged_log_ends_the_session_as_frozen() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let entries = log_chain(1, ZEROS, 3, "a");
+    seed_log(&store, &entries).await;
+    seed_mark(&dir, "3");
+    let (mut ws, hello, serving) = follow_session(Session::new(setup)).await;
+    assert_eq!(hello["body"]["log_seq"], 3);
+    assert_eq!(store.refollowing().await.unwrap(), None);
+
+    sqlx::query(&format!(
+        "CREATE TRIGGER freeze_after_the_state AFTER INSERT ON node_meta \
+         WHEN NEW.key = 'log_refollowing' BEGIN \
+         INSERT INTO node_meta (key, value) VALUES ('{PROMOTION_FREEZE}', '2026-11-10T00:00:00Z'); \
+         END;"
+    ))
+    .execute(store.pool())
+    .await
+    .unwrap();
+    send(&mut ws, diverged_frame("msg_diverged")).await;
+    let frames = frames_until_closed_within(&mut ws, Duration::from_secs(2)).await;
+    assert_no_hello_or_ack(&frames);
+    let (_session, end) = ended_with(serving).await;
+    assert_eq!(end, SessionEnd::Frozen);
+    assert!(freeze::is_frozen(&store).await.unwrap());
+    assert_eq!(mark_text(&dir).as_deref(), Some(MAX_SEQ_TEXT));
+    assert_eq!(
+        store.refollowing().await.unwrap(),
+        Some(Refollowing::HeadUnknown)
+    );
+    assert_eq!(stored_log(&store).await, entries);
+    assert_eq!(quarantined(&store).await, 0);
+    let files = std::fs::read_dir(dir.path().join("quarantine")).map_or(0, Iterator::count);
+    assert_eq!(files, 0, "no quarantine file is left");
+    assert!(freeze::promotion_reads(&store).await.unwrap().quarantined);
 }

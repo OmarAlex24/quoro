@@ -640,13 +640,28 @@ pub enum BatchStored {
 /// ([`NodeStore::set_refollowing`], [`NodeStore::mark_quarantine`], section
 /// 7.3 "The freeze", ADR 0261). Each such write reads the freeze inside its
 /// own `BEGIN IMMEDIATE` transaction, as [`NodeStore::store_log_batch`] does,
-/// so it either commits before a freeze or writes nothing.
+/// so once a freeze has committed it writes nothing.
 #[must_use]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FreezeChecked {
     /// The agent was not frozen, and the write committed.
     Written,
     /// A promotion on this host froze the agent: nothing was written.
+    Frozen,
+}
+
+/// What [`NodeStore::quarantine_log`] did with the node's copy of the change
+/// log (section 7.1).
+#[must_use]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LogQuarantine {
+    /// The copy was moved aside to this file.
+    Moved(PathBuf),
+    /// The copy is empty, so there was nothing to move.
+    Empty,
+    /// A promotion on this host froze the agent (section 7.3 "The freeze",
+    /// ADR 0261): the copy stays as it stands and no file is left. This is
+    /// no failure; the caller stops as for any write the freeze refuses.
     Frozen,
 }
 
@@ -2535,8 +2550,10 @@ impl NodeStore {
     /// the transaction rolls back, the mark file is not touched and the
     /// result is [`FreezeChecked::Frozen`]. Otherwise a freeze from another
     /// process waits on its busy timeout until this commits, so it never
-    /// commits between the flag read and the mark: a quarantine either
-    /// writes both before the freeze or neither.
+    /// commits between the flag read and the mark: once a freeze has
+    /// committed, a quarantine writes nothing. The mark can be written
+    /// without the state only when the state write itself fails (see the
+    /// errors below).
     ///
     /// # Errors
     ///
@@ -2567,7 +2584,8 @@ impl NodeStore {
     /// entries the node once acknowledged, or is refollowing toward the
     /// mark, and `quoro cluster promote` refuses on it without
     /// `--accept-loss` (section 7.3). The agent itself does not read it; the
-    /// promotion does, through [`crate::freeze::promotion_reads`].
+    /// promotion applies the same rule, [`crate::follow::below_mark`], to
+    /// the values [`crate::freeze::promotion_reads`] reads.
     ///
     /// # Errors
     ///
@@ -2576,7 +2594,7 @@ impl NodeStore {
     pub async fn log_below_mark(&self) -> Result<bool, AgentError> {
         let mark = crate::follow::read_mark(&self.data_dir)?;
         let (log_seq, _) = self.log_position().await?;
-        Ok(log_seq < mark.unwrap_or(0))
+        Ok(crate::follow::below_mark(log_seq, mark))
     }
 
     /// The primary's newest `seq` as its last `log_entries` reported it, and
@@ -2642,13 +2660,15 @@ impl NodeStore {
     /// rows it holds are deleted and the primary's `head_seq` is cleared. The
     /// refollowing state is kept: the caller records it before the copy moves
     /// (section 7.1 "Refollowing", ADR 0261).
-    /// Returns the file, or `None` when the copy is empty, which needs no
-    /// file, so a second call does nothing.
+    /// Returns [`LogQuarantine::Moved`] with the file, or
+    /// [`LogQuarantine::Empty`] when the copy is empty, which needs no file,
+    /// so a second call does nothing.
     ///
     /// While a promotion froze the agent the copy stays as it stands (section
     /// 7.3 "The freeze"): the transaction holds the write lock before it
     /// reads the freeze, as [`Self::store_log_batch`] does, and when it is
-    /// set the file is removed and nothing changes. [`Self::mark_quarantine`]
+    /// set the file is removed, nothing changes and the result is
+    /// [`LogQuarantine::Frozen`], which is no error. [`Self::mark_quarantine`]
     /// committed the mark and "head unknown" before, so the copy reads as
     /// quarantined meanwhile, and [`crate::follow::recover`] moves it aside
     /// before the first `hello` after the freeze.
@@ -2656,13 +2676,12 @@ impl NodeStore {
     /// # Errors
     ///
     /// [`AgentError::Io`] when the file cannot be written and synced, and
-    /// [`AgentError::Store`] on a SQLite failure, while a promotion froze the
-    /// agent, or when the rows to delete are not the ones exported. Nothing
-    /// is deleted then.
-    pub async fn quarantine_log(&self, reason: &str) -> Result<Option<PathBuf>, AgentError> {
+    /// [`AgentError::Store`] on a SQLite failure or when the rows to delete
+    /// are not the ones exported. Nothing is deleted then.
+    pub async fn quarantine_log(&self, reason: &str) -> Result<LogQuarantine, AgentError> {
         let entries = self.log_entries().await?;
         let Some(last) = entries.last() else {
-            return Ok(None);
+            return Ok(LogQuarantine::Empty);
         };
         let last_seq = seq_column(last.seq)?;
         let last_hash = last.hash.clone();
@@ -2682,9 +2701,7 @@ impl NodeStore {
             // Dropping the transaction rolls it back; the file is no copy.
             drop(tx);
             let _ = std::fs::remove_file(&path);
-            return Err(AgentError::Store(
-                "a promotion froze the agent, so the change log stays as it stands".to_owned(),
-            ));
+            return Ok(LogQuarantine::Frozen);
         }
         sqlx::query(
             "INSERT INTO quarantine (kind, path, quarantined_at, reason, last_seq, last_hash) \
@@ -2718,7 +2735,7 @@ impl NodeStore {
             .await
             .map_err(store_error)?;
         tx.commit().await.map_err(store_error)?;
-        Ok(Some(path))
+        Ok(LogQuarantine::Moved(path))
     }
 
     /// The pool, for a test that wants to inspect a table directly.
@@ -4204,11 +4221,10 @@ mod tests {
         let entries = verified(1, ZERO_HASH, 3, "a");
         store.store_log_batch(&entries, Some(3)).await.unwrap();
 
-        let path = store
-            .quarantine_log("log_diverged: test")
-            .await
-            .unwrap()
-            .expect("a copy was written");
+        let LogQuarantine::Moved(path) = store.quarantine_log("log_diverged: test").await.unwrap()
+        else {
+            panic!("a copy was written");
+        };
         assert_eq!(path.parent(), Some(dir.0.join("quarantine").as_path()));
         let text = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = text.lines().collect();
@@ -4242,7 +4258,10 @@ mod tests {
         assert_eq!(store.log_head().await.unwrap(), None);
 
         // Idempotent: nothing left to move, no second file or row.
-        assert_eq!(store.quarantine_log("again").await.unwrap(), None);
+        assert_eq!(
+            store.quarantine_log("again").await.unwrap(),
+            LogQuarantine::Empty
+        );
         assert_eq!(quarantine_rows(&store).await.len(), 1);
         assert_eq!(
             std::fs::read_dir(dir.0.join("quarantine")).unwrap().count(),
@@ -4275,7 +4294,9 @@ mod tests {
         assert!(jcs::canonicalize(&entries[0].to_value().unwrap()).is_err());
         store.store_log_batch(&entries, None).await.unwrap();
 
-        let path = store.quarantine_log("test").await.unwrap().unwrap();
+        let LogQuarantine::Moved(path) = store.quarantine_log("test").await.unwrap() else {
+            panic!("a copy was written");
+        };
         let text = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 1);
@@ -4356,7 +4377,10 @@ mod tests {
         let entries = verified(1, ZERO_HASH, 2, "a");
         store.store_log_batch(&entries, Some(2)).await.unwrap();
         assert_eq!(store.log_entries().await.unwrap(), entries);
-        assert!(store.quarantine_log("test").await.unwrap().is_some());
+        assert!(matches!(
+            store.quarantine_log("test").await.unwrap(),
+            LogQuarantine::Moved(_)
+        ));
         assert_eq!(quarantine_rows(&store).await.len(), 1);
 
         // A second start finds the tables and keeps the record.
@@ -4438,7 +4462,10 @@ mod tests {
                 FreezeChecked::Written
             );
 
-            assert!(store.quarantine_log("test").await.unwrap().is_some());
+            assert!(matches!(
+                store.quarantine_log("test").await.unwrap(),
+                LogQuarantine::Moved(_)
+            ));
             assert!(store.log_entries().await.unwrap().is_empty());
             assert_eq!(store.log_head().await.unwrap(), None);
             assert_eq!(store.refollowing().await.unwrap(), Some(state));

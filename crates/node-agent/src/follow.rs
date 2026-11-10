@@ -33,7 +33,7 @@ use tracing::warn;
 
 use crate::AgentError;
 use crate::identity;
-use crate::store::{FreezeChecked, NodeStore, Refollowing};
+use crate::store::{FreezeChecked, LogQuarantine, NodeStore, Refollowing};
 use crate::util;
 
 /// The highest `seq` the change log carries, 2^53 - 1 (section 7.1
@@ -71,6 +71,16 @@ pub fn read_mark(data_dir: &Path) -> Result<Option<u64>, AgentError> {
             path.display()
         ))
     })
+}
+
+/// Whether a copy of the change log whose newest `seq` is `log_seq` is below
+/// the change-log mark `mark` (section 7.1 "The node's mark", ADR 0261): no
+/// log is below a missing mark. [`NodeStore::log_below_mark`] and
+/// [`crate::freeze::promotion_reads`] apply it to the values they read, so
+/// the rule lives in one place and each read happens once.
+#[must_use]
+pub fn below_mark(log_seq: u64, mark: Option<u64>) -> bool {
+    log_seq < mark.unwrap_or(0)
 }
 
 /// Writes the change-log mark as `seq`, `0600`, through
@@ -154,9 +164,10 @@ pub(crate) async fn lower_mark(data_dir: &Path, seq: u64) -> Result<bool, AgentE
 /// refollowing state is not written: [`NodeStore::set_refollowing`] reads
 /// the freeze in its own transaction, and when it refuses, this stops there
 /// and returns [`FreezeChecked::Frozen`], so the session sends no `hello`.
-/// A copy is not moved aside either: [`NodeStore::quarantine_log`] refuses
-/// with an error. Otherwise it returns [`FreezeChecked::Written`], also when
-/// there was nothing to write.
+/// A copy is not moved aside either: [`NodeStore::quarantine_log`] returns
+/// [`LogQuarantine::Frozen`], and this stops there and returns
+/// [`FreezeChecked::Frozen`] too. Otherwise it returns
+/// [`FreezeChecked::Written`], also when there was nothing to write.
 ///
 /// # Errors
 ///
@@ -179,11 +190,13 @@ pub(crate) async fn recover(store: &NodeStore) -> Result<FreezeChecked, AgentErr
     match state {
         Some(Refollowing::HeadUnknown) => {
             let reason = "refollowing: a quarantine that had not moved the copy aside";
-            if let Some(path) = store.quarantine_log(reason).await? {
-                warn!(
+            match store.quarantine_log(reason).await? {
+                LogQuarantine::Moved(path) => warn!(
                     path = %path.display(),
                     "a change-log copy stored before an unfinished quarantine is quarantined"
-                );
+                ),
+                LogQuarantine::Empty => {}
+                LogQuarantine::Frozen => return Ok(FreezeChecked::Frozen),
             }
         }
         Some(Refollowing::Head(head)) => {
