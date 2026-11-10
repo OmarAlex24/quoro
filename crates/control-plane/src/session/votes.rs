@@ -170,6 +170,20 @@ impl Session {
         if result.status != quoro_proto::CommandStatus::Ok {
             return true;
         }
+        // An `ok` counts as holding `version` even though the agent also
+        // answers `ok` to a `desired_state` it ignores as old ("ignored rev
+        // N", node agent `session.rs`): no snapshot this session sends is
+        // ignored, so every `ok` here means the node stored it.
+        // - The agent's `hello.stored_rev` and its "ignored" check both read
+        //   its `latest_desired()`, the newest revision it stored.
+        // - `refresh` sends `rev` = max(`nodes.desired_rev`, the session's
+        //   last `rev`, that `stored_rev`) + 1, the first revision above
+        //   that floor.
+        // - Within a session revisions only grow, and only this session's
+        //   snapshots raise what the agent stores, so each one is above it.
+        // - A promoted primary must send above both its own
+        //   `nodes.desired_rev` and the node's `stored_rev` (section 7.3),
+        //   so no older primary's revision makes this one look old.
         self.hub.record_votes_ack(&self.node_id, version);
         let first = self.acked_votes_version.is_none() || self.support_due.is_none();
         let moved = self.acked_votes_version != Some(version);
