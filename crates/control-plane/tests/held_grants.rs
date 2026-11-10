@@ -13,8 +13,11 @@
 //! `support.rs`; `failoverApp`'s held grant (ADR 0292) lives in
 //! `failover.rs`.
 //!
-//! Out of scope here, as in the code: the writes that clear the mark (#555),
-//! R, the conversion grant and the same-token resend.
+//! The holder's `local` report, which clears the mark at its next session
+//! start (#555), is checked here over the case 2 row; its other cases are
+//! the `session::local_report` unit tests. Out of scope here, as in the
+//! code: the `pong` after a same-token `local` grant, R, the conversion
+//! grant and the same-token resend.
 
 mod common;
 
@@ -548,7 +551,8 @@ async fn wait_disconnected(server: &Server, node: &Node) {
 /// (reading: "Grants of a marked row" asks support of every grant of a
 /// marked row, and `D` is what every `support_request` carries); once the
 /// write is replicated and the one voter supports `D`, it goes out `local`,
-/// and the row stays `local` and marked until #555's writes clear it.
+/// and the row stays `local` and marked until the holder reports it
+/// (`a_holders_local_report_clears_the_mark_and_drops_the_held_grant`).
 #[tokio::test]
 async fn a_local_marked_row_shows_local_pending_and_its_grant_waits_for_support() {
     let server = start_with_patient_node_session().await;
@@ -592,6 +596,84 @@ async fn a_local_marked_row_shows_local_pending_and_its_grant_waits_for_support(
     let view = lease_view(&server, &owner, &app_id).await;
     assert_eq!(view["grant_pending"], false, "{view}");
     assert_eq!(view["local_pending"], true, "{view}");
+}
+
+/// #555, the holder's `local` report (section 8.4, "The holder's next
+/// `hello`" and "The mark"): the case 2 row, `local` at token 2 with the
+/// mark after its grant went out, is listed `local` `held` at token 2 by
+/// its holder's next session. One change-log entry writes the row `local`,
+/// unmarked, at token 2, so `local_pending` and `unsettled` turn false. The
+/// session start sends the same-token `local` repeat with no
+/// `duration_ms`, which the node takes as a no-op (section 8.4, node state
+/// machine), and no other grant: the row was a step-4 row, and its held
+/// grant was dropped at the session start (`grant_pending` false).
+#[tokio::test]
+async fn a_holders_local_report_clears_the_mark_and_drops_the_held_grant() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    manual_clock(&server);
+    let a = enroll(&server, &owner, "node-a", &["node"]).await;
+    let (mut on_a, _) = session(&server, &a, None, Vec::new(), true).await;
+    heartbeat(&mut on_a).await;
+    let project_id = project(&server, &owner).await;
+    let (app_id, lease_id) = app_with_lease(&server, &owner, &mut on_a, &project_id, "web").await;
+    run(
+        &server,
+        "UPDATE leases SET mode = 'expiring', duration_ms = 15000 WHERE id = ?",
+        &lease_id,
+    )
+    .await;
+    let lease = listed(&lease_id, &app_id, LeaseMode::Local, 1, "expired");
+    let (mut on_a, _) = session(&server, &a, Some(on_a.log.clone()), vec![lease], true).await;
+    follow_to(&mut on_a, newest_write(&server, &lease_id).await).await;
+    let (_, request) = on_a.request().await;
+    let grant = echo(&request, on_a.version());
+    on_a.send(NodeMessage::SupportGrant(grant), request["id"].as_str())
+        .await;
+    let grant = on_a.until("lease_grant").await;
+    assert_eq!(grant["body"]["lease_id"], lease_id.as_str());
+    assert_eq!(grant["body"]["fencing_token"], 2);
+    assert_eq!(grant["body"]["mode"], "local");
+    on_a.settle().await;
+    assert_eq!(
+        row(&server, &lease_id).await,
+        (2, "local".to_string(), None, 1, false)
+    );
+    let view = lease_view(&server, &owner, &app_id).await;
+    assert_eq!(view["local_pending"], true, "{view}");
+    let entries = |server: &Server| {
+        let pool = server.state.store.pool().clone();
+        let lease_id = lease_id.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM change_log WHERE entity_type = 'lease' AND entity_id = ?",
+            )
+            .bind(lease_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let before = entries(&server).await;
+
+    let lease = listed(&lease_id, &app_id, LeaseMode::Local, 2, "held");
+    let (_on_a, frames) = session(&server, &a, Some(on_a.log.clone()), vec![lease], true).await;
+    assert_eq!(
+        row(&server, &lease_id).await,
+        (2, "local".to_string(), None, 0, false)
+    );
+    assert_eq!(entries(&server).await, before + 1, "one change-log entry");
+    let view = lease_view(&server, &owner, &app_id).await;
+    assert_eq!(view["local_pending"], false, "{view}");
+    assert_eq!(view["unsettled"], false, "{view}");
+    assert_eq!(view["grant_pending"], false, "{view}");
+    let grants = grants_of(&frames, &lease_id);
+    assert_eq!(grants.len(), 1, "{frames:?}");
+    assert_eq!(grants[0]["body"]["mode"], "local");
+    assert_eq!(grants[0]["body"]["fencing_token"], 2);
+    assert!(grants[0]["body"].get("duration_ms").is_none(), "{frames:?}");
+    assert!(grants[0]["re"].is_null(), "{frames:?}");
+    assert!(revokes_of(&frames, &lease_id).is_empty(), "{frames:?}");
 }
 
 /// Case 3, ADR 0299. A `hello.log_seq` that covers the write counts only
@@ -1637,8 +1719,11 @@ async fn an_unmarked_row_listed_by_a_node_it_does_not_name_is_revoked_not_raised
 /// grant itself. A's regrant over a row that reads `expiring` is written
 /// marked, `local` at token 2, on a session that does not follow the log:
 /// A, the one voter, never acknowledges the write and supports nothing, so
-/// a grant would be wrong. A's next session lists the lease `held` `local`
-/// at token 2, and no `lease_grant` of it goes out.
+/// a grant would be wrong. A's next session lists the lease `held` at
+/// token 2, `expiring`, so that the row stays marked (listed `local`, it is
+/// the holder's `local` report, which clears the mark:
+/// `a_holders_local_report_clears_the_mark_and_drops_the_held_grant`), and
+/// no `lease_grant` of it goes out.
 #[tokio::test]
 async fn a_marked_row_listed_held_at_its_token_gets_no_grant_at_the_session_start() {
     let server = start_with_patient_node_session().await;
@@ -1674,7 +1759,7 @@ async fn a_marked_row_listed_held_at_its_token_gets_no_grant_at_the_session_star
     drop(on_a);
     wait_disconnected(&server, &a).await;
 
-    let lease = listed(&lease_id, &app_id, LeaseMode::Local, 2, "held");
+    let lease = listed(&lease_id, &app_id, LeaseMode::Expiring, 2, "held");
     let (mut on_a, frames) = session(&server, &a, Some(a_log), vec![lease], false).await;
     assert!(grants_of(&frames, &lease_id).is_empty(), "{frames:?}");
     let frames = after_a_tick(&mut on_a).await;

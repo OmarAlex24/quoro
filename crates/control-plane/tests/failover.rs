@@ -773,6 +773,87 @@ async fn a_disconnected_sources_local_lease_is_held_until_a_declaration_revokes_
     none_of(s.on_warm(), "lease_grant", "local row").await;
 }
 
+/// #555, the holder's `local` report (section 8.4, "The mark" and "The
+/// holder's next `hello`"; ADR 0285, ADR 0288). The row names the source
+/// `local` at token 4 with the unsettled mark, as a new-token `local`
+/// grant of a `warm` app's lease leaves it, whose grant the source took
+/// (reading: section 8.3 says a `warm` app's restore names its target
+/// `local`, while `restoreBackup` here grants a `warm` app's target
+/// `expiring`, so the row is written directly, as this file writes the
+/// warm app's rows). While the row carries the mark, `local_pending` is
+/// true. The source's next `hello` lists the lease `local` `held` at the
+/// row's token: one change-log entry writes the row `local`, unmarked,
+/// `local_pending` turns false, and the session start sends only the
+/// same-token `local` repeat. With the source gone, a failover then
+/// answers `lease_held` because the lease is `local`, not because of the
+/// mark.
+#[tokio::test]
+async fn a_marked_local_row_its_holder_reports_local_is_held_as_local() {
+    let mut s = Setup::new().await;
+    s.sql("UPDATE leases SET unsettled = 1 WHERE id = ?").await;
+    let lease = s.lease_view().await;
+    assert_eq!(lease["local_pending"], true, "{lease}");
+    let pool = s.server.state.store.pool().clone();
+    let entries = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM change_log WHERE entity_type = 'lease' AND entity_id = ?",
+        )
+        .bind(LEASE_ID)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    let before = entries().await;
+
+    s.disconnect_source().await;
+    let NodeMessage::Hello(mut body) = hello(&s.source.node_id, 1) else {
+        unreachable!()
+    };
+    body.leases = vec![wire::HelloLease {
+        lease_id: LEASE_ID.to_string(),
+        resource_type: quoro_proto::ResourceType::App,
+        resource_id: s.app_id.clone(),
+        mode: quoro_proto::LeaseMode::Local,
+        fencing_token: 4,
+        state: "held".to_string(),
+    }];
+    let mut on_source = connect(&s.server, &s.source.credential).await;
+    send(&mut on_source, NodeMessage::Hello(body), None).await;
+    let frames = frames_until_settled(&mut on_source).await;
+    let grants: Vec<&Value> = frames
+        .iter()
+        .filter(|frame| frame["type"] == "lease_grant")
+        .collect();
+    assert_eq!(grants.len(), 1, "{frames:?}");
+    assert_eq!(grants[0]["body"]["lease_id"], LEASE_ID);
+    assert_eq!(grants[0]["body"]["mode"], "local");
+    assert_eq!(grants[0]["body"]["fencing_token"], 4);
+    assert!(grants[0]["body"].get("duration_ms").is_none(), "{frames:?}");
+    assert!(grants[0]["re"].is_null(), "{frames:?}");
+
+    let (mode, token, unsettled): (String, i64, i64) =
+        sqlx::query_as("SELECT mode, fencing_token, unsettled FROM leases WHERE id = ?")
+            .bind(LEASE_ID)
+            .fetch_one(s.server.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!((mode.as_str(), token, unsettled), ("local", 4, 0));
+    assert_eq!(entries().await, before + 1, "one change-log entry");
+    let lease = s.lease_view().await;
+    assert_eq!(lease["local_pending"], false, "{lease}");
+    assert_eq!(lease["unsettled"], false, "{lease}");
+
+    drop(on_source);
+    disconnected(&s.server, &s.source.node_id).await;
+    s.report_copy().await;
+    set_support(&s.server, true);
+    let body = refused(s.failover().await, 409, "conflict", Some("lease_held")).await;
+    let detail = body["detail"].as_str().unwrap();
+    assert!(detail.contains("its lease is local"), "{detail}");
+    assert!(!detail.contains("unsettled mark"), "{detail}");
+    s.unmoved(false, "a local row reported local").await;
+}
+
 /// `declareNodeLost` of the source (section 8.3, ADR 0183): returns the
 /// node it answers.
 async fn declare_source_lost(s: &Setup) -> Value {

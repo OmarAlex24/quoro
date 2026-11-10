@@ -18,6 +18,7 @@ pub mod desired;
 pub mod drain;
 mod follow;
 mod held;
+mod local_report;
 pub(crate) mod mesh;
 pub mod serving;
 mod votes;
@@ -4294,8 +4295,13 @@ impl Session {
     }
 
     /// Section 4.2 rule 5 and section 5.12: the first desired state of the
-    /// session, then the app leases this node holds.
+    /// session, then the app leases this node holds. The holder's `local`
+    /// reports are written first (section 8.4, "The holder's next `hello`";
+    /// [`local_report`]), after the session start's pass over the leases and
+    /// its `declared_lost` revokes, so the desired state and the grants
+    /// follow the rows as written.
     async fn finish_start(&mut self, stored_rev: u64, outbox: &mut Vec<String>) {
+        self.record_local_reports().await;
         match self.refresh(stored_rev, true).await {
             Ok(()) => self.retry_pending = false,
             Err(e) => {
@@ -4498,9 +4504,11 @@ impl Session {
                     // "Grants of a marked row": every grant of a marked row
                     // other than a renewal's answer goes through the
                     // held-grant path; the regrant above does (its write
-                    // waits). One the node lists `held` or `uncertain` at the
-                    // row's token gets nothing here otherwise: the same-token
-                    // `local` resend and the holder's `local` report are #555.
+                    // waits). A holder's `local` report cleared the mark
+                    // before this pass ([`local_report`]); one the node lists
+                    // `expiring` at the row's token while the policy is off
+                    // `warm` gets nothing here: the same-token `local` resend
+                    // is #555.
                     if lease.unsettled {
                         continue;
                     }
