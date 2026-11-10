@@ -1,5 +1,5 @@
 import { Link } from '@tanstack/react-router';
-import { CalendarClock, GitBranch, HardDrive, Server, type LucideIcon } from 'lucide-react';
+import { CalendarClock, Copy, GitBranch, HardDrive, Server, type LucideIcon } from 'lucide-react';
 import type { ReactNode } from 'react';
 import type { App, Build, Vm } from '../api/generated/model';
 import { useListAppBackups } from '../api/generated/backups/backups';
@@ -22,6 +22,7 @@ import {
   volumeLine,
   type ServiceKind,
 } from '../lib/services';
+import { warmCardLine } from '../lib/warm-words';
 import { GlyphTile } from './glyph-tile';
 import { LampDot } from './lamp';
 
@@ -29,7 +30,11 @@ interface FootRow {
   key: string;
   Icon: LucideIcon;
   text: string;
-  /** Said in the fault colour: the row is why the card glows red. */
+  /**
+   * Said in the fault colour. Only the text: a failed build is also why the
+   * card glows red, but a failed warm copy is not, since the lamp and the
+   * aura stay the app's status (`appFailed` reads neither row).
+   */
   fault?: boolean;
 }
 
@@ -149,6 +154,16 @@ export function AppCard({
   if (volume) foot.push({ key: 'volume', Icon: HardDrive, text: volume });
   const backup = backups.data ? nextBackupLine(app, backups.data.items) : null;
   if (backup) foot.push({ key: 'backup', Icon: CalendarClock, text: backup });
+  // A warm app's copy, where a cold app's next backup goes; the full error is
+  // in the Storage tab.
+  if (app.warm) {
+    foot.push({
+      key: 'warm',
+      Icon: Copy,
+      text: warmCardLine(app.warm, nodeNames),
+      fault: app.warm.state === 'failed',
+    });
+  }
   if (foot.length === 0) {
     const nodes = nodesLine(nodeIds, nodeNames);
     if (nodes) foot.push({ key: 'nodes', Icon: Server, text: nodes });

@@ -61,6 +61,7 @@ import { getWebhooksMock } from '../api/generated/webhooks/webhooks.msw';
 import { formatSseFrame } from '../lib/log-buffer';
 import { SLUG_PATTERN } from '../lib/slug';
 import {
+  appAt,
   converge,
   db,
   findApp,
@@ -119,7 +120,7 @@ const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const TLS_MODES = new Set(['acme', 'tunnel']);
 
 const appDetail = (app: App): AppDetail => ({
-  ...app,
+  ...appAt(app),
   ha_cost: mockHaCost(app),
   instances: db.vms.filter((vm) => vm.app_id === app.id),
   domains: db.domains.filter((domain) => domain.app_id === app.id),
@@ -506,7 +507,7 @@ export const handlers = [
     const items = db.apps.filter(
       (app) => projectId === null || app.project_id === projectId,
     );
-    const list: AppList = { items, next_cursor: null };
+    const list: AppList = { items: items.map((app) => appAt(app)), next_cursor: null };
     return json(list);
   }),
 
@@ -570,6 +571,7 @@ export const handlers = [
       name,
       stateful: body.stateful ?? false,
       ha_policy: 'none',
+      warm: null,
       backup_schedule: body.backup_schedule ?? { interval_h: 24, keep: 7 },
       replicas: body.replicas ?? 1,
       image: hasSource ? '' : (body.image ?? '').trim(),
@@ -658,6 +660,9 @@ export const handlers = [
         }
       }
       app.ha_policy = body.ha_policy;
+      // `warm` is refused above, so an accepted policy always leaves it, and
+      // an app that is not `warm` answers `warm: null`.
+      app.warm = null;
     }
 
     if (body.backup_schedule !== undefined) {
@@ -674,7 +679,7 @@ export const handlers = [
     }
 
     app.updated_at = now();
-    return json({ ...app, ha_cost: mockHaCost(app) });
+    return json({ ...appAt(app), ha_cost: mockHaCost(app) });
   }),
 
   http.delete('*/api/v1/apps/:appId', ({ params }) => {
@@ -702,7 +707,7 @@ export const handlers = [
     delete db.appEnv[appId];
     delete db.edgeBackends[appId];
 
-    return json({ ...app, updated_at: now() }, { status: 202 });
+    return json({ ...appAt(app), updated_at: now() }, { status: 202 });
   }),
 
   http.post('*/api/v1/apps/:appId/start', ({ params }) => {
@@ -723,7 +728,7 @@ export const handlers = [
         converge(vm.id, [[1_200, 'running']]);
       }
     }
-    return json(app, { status: 202 });
+    return json(appAt(app), { status: 202 });
   }),
 
   http.post('*/api/v1/apps/:appId/stop', ({ params }) => {
@@ -744,7 +749,7 @@ export const handlers = [
         converge(vm.id, [[1_200, 'stopped']]);
       }
     }
-    return json(app, { status: 202 });
+    return json(appAt(app), { status: 202 });
   }),
 
   http.post('*/api/v1/apps/:appId/restart', ({ params }) => {
@@ -766,7 +771,7 @@ export const handlers = [
       vm.observed_status = 'starting';
       converge(vm.id, [[1_200, 'running']]);
     }
-    return json(app, { status: 202 });
+    return json(appAt(app), { status: 202 });
   }),
 
   http.post('*/api/v1/apps/:appId/redeploy', ({ params }) => {

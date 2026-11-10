@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { CalendarClock, HardDrive } from 'lucide-react';
+import { Link } from '@tanstack/react-router';
+import { CalendarClock, Copy, HardDrive } from 'lucide-react';
 import { useCallback, useState, type KeyboardEvent } from 'react';
 import { getGetAppQueryKey, updateApp } from '../api/generated/apps/apps';
 import {
@@ -10,7 +11,7 @@ import {
   useListAppBackups,
   useListBackupRepositories,
 } from '../api/generated/backups/backups';
-import type { AppDetail, AppHaPolicy, BackupSchedule, HaPolicyCost, Volume } from '../api/generated/model';
+import type { AppDetail, AppHaPolicy, BackupSchedule, HaPolicyCost, Volume, WarmCopy } from '../api/generated/model';
 import { readSchedule, scheduleForm, type ScheduleErrors, type ScheduleForm } from '../lib/backup-forms';
 import { createVolume, getListAppVolumesQueryKey, useListAppVolumes } from '../api/generated/volumes/volumes';
 import { relativeTime } from '../lib/app-status';
@@ -39,6 +40,15 @@ import {
   volumeTag,
   volumeUsedWords,
 } from '../lib/storage-words';
+import { cn } from '../lib/utils';
+import {
+  warmExtentWords,
+  warmIntervalWords,
+  warmLagSentence,
+  warmNodeLine,
+  warmShippedLine,
+  warmTag,
+} from '../lib/warm-words';
 import { DitherCanvas } from './dither-canvas';
 import { LampDot } from './lamp';
 import { ScheduleFields } from './schedule-fields';
@@ -50,8 +60,9 @@ import { ProblemBanner } from './ui/problem-banner';
 import { Tag } from './ui/tag';
 
 /**
- * The Storage tab: the app's volume and how full it is, its backups with the
- * schedule and the next one due, and its HA policy as a choice of four with
+ * The Storage tab: the app's volume and how full it is, a warm app's copy on
+ * its warm node, its backups with the schedule and the next one due, and its
+ * HA policy as a choice of four with
  * one sentence for the chosen one. The seven-column cost table opens from
  * Compare. Every action the app page had stays: add a volume, change the
  * policy, edit the schedule and back up now.
@@ -96,6 +107,7 @@ export function StorageTab({
           <VolumeBox key={volume.id} volume={volume} node={nodeNames[volume.node_id] ?? 'an unknown node'} />
         ))
       )}
+      {app.warm ? <WarmCopyBox warm={app.warm} nodeNames={nodeNames} /> : null}
       <BackupsBox app={app} volumes={volumes} canWrite={canWrite} onChanged={refresh} />
       <HaBox app={app} canWrite={canWrite} onSaved={refresh} />
     </>
@@ -149,6 +161,77 @@ function VolumeBox({ volume, node }: { volume: Volume; node: string }) {
         ) : null}
         {volume.error ? <p className="mt-2.5 text-[12.5px] leading-snug text-fault">{volume.error}</p> : null}
       </div>
+    </section>
+  );
+}
+
+/**
+ * A warm app's copy (openapi.yaml `WarmCopy`), read-only: the state as a tag,
+ * the warm node and who chose it, the primary's error in full, what a
+ * failover now would lose, the last shipped snapshot, and the interval and
+ * extents as secondary text. The lag is said in words only: a bar could look
+ * fuller or emptier than the tag says.
+ */
+function WarmCopyBox({ warm, nodeNames }: { warm: WarmCopy; nodeNames: Record<string, string> }) {
+  const tag = warmTag(warm);
+  const where = warmNodeLine(warm, nodeNames);
+  const shipped = warmShippedLine(warm);
+  const lag = warmLagSentence(warm);
+  const extents = warmExtentWords(warm);
+  return (
+    <section className="box" aria-labelledby="warm-title">
+      <div className="box-h">
+        <span className="glyph glyph-neutral" aria-hidden="true">
+          <Copy strokeWidth={1.7} />
+        </span>
+        <div className="box-t">
+          <b id="warm-title">Warm copy</b>
+          <small>
+            {where.node ? (
+              <>
+                <span>
+                  On{' '}
+                  <Link to="/nodes" search={{ tab: 'vms', node: where.node.id }} className="set-inline-link">
+                    {where.node.name}
+                  </Link>
+                </span>
+                <span aria-hidden="true">·</span>
+                <span>{where.how}</span>
+              </>
+            ) : (
+              <span>{where.text}</span>
+            )}
+          </small>
+        </div>
+        <Tag tone={tag.tone}>
+          {/* Still under prefers-reduced-motion; the word always says the state. */}
+          {tag.pulse ? <LampDot ring="shift" core="shift" pulse size={9} /> : null}
+          {tag.words}
+        </Tag>
+      </div>
+      {warm.error ? <p className="warm-error">{warm.error}</p> : null}
+      <div className="box-b warm-b">
+        {lag ? <p className={cn('warm-lag', warm.state === 'lagging' && 'warm-lag-risk')}>{lag}</p> : null}
+        <div className="meter-h">
+          <b>Last shipped</b>
+          {warm.last_shipped_at !== null && shipped.title !== null ? (
+            <time dateTime={warm.last_shipped_at} title={shipped.title}>
+              {shipped.text}
+            </time>
+          ) : (
+            <span>{shipped.text}</span>
+          )}
+        </div>
+      </div>
+      <p className="box-foot warm-foot">
+        <span>{warmIntervalWords(warm)}</span>
+        {extents ? (
+          <>
+            <span className="dot-sep" aria-hidden="true" />
+            <span>{extents}</span>
+          </>
+        ) : null}
+      </p>
     </section>
   );
 }

@@ -20,7 +20,7 @@ import { getListAppDeploymentsQueryKey } from '../api/generated/deployments/depl
 import type { App, AppDetail, Deployment } from '../api/generated/model';
 import { useListNodes } from '../api/generated/nodes/nodes';
 import { useGetAppVulnerabilities } from '../api/generated/vulnerabilities/vulnerabilities';
-import { relativeTime, serviceLampState } from '../lib/app-status';
+import { relativeTime, serviceLampState, warmReadInterval } from '../lib/app-status';
 import { canOpenTerminal } from '../lib/capabilities';
 import type { RunPhase } from '../lib/deploy-tape';
 import { problemView, type ProblemView } from '../lib/problem';
@@ -93,9 +93,16 @@ export function ServiceSheet({
   const contentRef = useRef<HTMLDivElement>(null);
   const queryClient = useQueryClient();
   // The canvas draws this app's card from this same read: every 2 s while it
-  // deploys, builds or its newest run moves.
+  // deploys, builds or its newest run moves, and for a warm app at least every
+  // `interval_s` (never under 5 s), so its copy's progress keeps up.
+  // `refetchIntervalInBackground` stays unset (false): nothing is read while
+  // the browser tab is hidden.
   const appQuery = useGetApp(appId, {
-    query: { retry: false, refetchInterval: (query) => appReadInterval(queryClient, query.state.data) },
+    query: {
+      retry: false,
+      refetchInterval: (query) =>
+        warmReadInterval(appReadInterval(queryClient, query.state.data), query.state.data),
+    },
   });
   const app = appQuery.data;
   // The header reads the newest run from the Deployments tab's own two lists,

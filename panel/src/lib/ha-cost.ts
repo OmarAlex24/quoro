@@ -86,6 +86,9 @@ export const unavailableReasonWords = (
       return 'needs a volume';
     case 'no_repository':
       return 'needs a backup repository';
+    case 'no_warm_node':
+      // `warm` needs a volume node that snapshots with `reflink` and another eligible node.
+      return 'needs another eligible node';
     case 'not_in_this_release':
       return 'not in this release';
     default:

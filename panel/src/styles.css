@@ -2345,6 +2345,50 @@
     color: var(--ink-2);
   }
 
+  /*
+   * The warm copy box: the primary's error in full under the heading, its
+   * line breaks kept and a long path broken anywhere; the lag as the body's
+   * first sentence, in the shift tone while it is the data at risk.
+   */
+  .warm-error {
+    margin-top: -4px;
+    padding: 0 14px 12px;
+    font-size: 12.5px;
+    line-height: 1.45;
+    white-space: pre-line;
+    overflow-wrap: anywhere;
+    color: var(--fault);
+  }
+
+  .warm-b {
+    display: grid;
+    gap: 8px;
+    padding-top: 13px;
+    padding-bottom: 13px;
+  }
+
+  .warm-lag {
+    font-size: 13px;
+    font-weight: 540;
+    line-height: 1.35;
+    color: var(--ink);
+  }
+
+  .warm-lag-risk {
+    font-size: 15px;
+    font-weight: 600;
+    font-stretch: 104%;
+    letter-spacing: -0.005em;
+    color: color-mix(in oklab, var(--shift) 62%, var(--ink));
+  }
+
+  .warm-foot {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 2px 8px;
+  }
+
   .box-foot {
     padding: 9px 14px;
     border-top: 1px solid var(--line);
@@ -2583,7 +2627,8 @@
     font-weight: 560;
   }
 
-  .meter-h span {
+  .meter-h span,
+  .meter-h time {
     margin-left: auto;
     color: var(--ink-2);
     font-variant-numeric: tabular-nums;

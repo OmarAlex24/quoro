@@ -96,6 +96,24 @@ export const appsPollingInterval = (
 ): number => (anyBuildLive || apps.some((app) => app.status === 'deploying') ? 2_000 : 10_000);
 
 /**
+ * A warm app's copy moves every `interval_s` (openapi.yaml `WarmCopy`), so
+ * a read that shows it comes at least that often, and never more often than
+ * every 5 s: `min(base, max(5, interval_s) × 1000)`. An app without a warm
+ * copy keeps `base`, and so does a faster base, such as the 2 s poll while
+ * the app deploys. The callers leave `refetchIntervalInBackground` unset, so
+ * TanStack Query stops polling while the browser tab is hidden.
+ */
+export const warmReadInterval = (base: number, app: Pick<App, 'warm'> | undefined): number => {
+  const warm = app?.warm;
+  if (warm === null || warm === undefined) return base;
+  return Math.min(base, Math.max(5, warm.interval_s) * 1_000);
+};
+
+/** The fastest `warmReadInterval` over a list of apps, from `base`. */
+export const warmListInterval = (base: number, apps: ReadonlyArray<Pick<App, 'warm'>>): number =>
+  apps.reduce((interval, app) => warmReadInterval(interval, app), base);
+
+/**
  * The canvas lists apps and the sheet reads the open one on its own, and the
  * two reads land at different moments. The canvas draws the open app from the
  * sheet's read, so its card and the sheet's header always say the same thing.
