@@ -47,7 +47,6 @@ The runbook is written against the contracts. On the day of the demo, check each
 | Needed for | Operation or behaviour | Issue |
 | --- | --- | --- |
 | Steps 2, 3 | `expiring` leases on the primary: the conversion grant and the renewals | [#555](https://github.com/OmarAlex24/quoro/issues/555) |
-| Step 2 | The panel's view of the warm copy and its last shipped snapshot (box 4) | [#562](https://github.com/OmarAlex24/quoro/issues/562) |
 | Step 3b | `quoro cluster maintenance` (a maintenance window), to widen the refusal's window | [#764](https://github.com/OmarAlex24/quoro/issues/764) |
 | Step 4 | A `deleted` entry that reaches the returning source's volume before its hand-over must not remove it | [#557](https://github.com/OmarAlex24/quoro/issues/557) |
 | Step 5 | `POST /api/v1/apps/{app_id}/switchover` (`switchoverApp`) | [#735](https://github.com/OmarAlex24/quoro/issues/735) |
@@ -68,7 +67,7 @@ These are on `main`:
 - The warm copy's progress in `App.warm`.
 - The returning source's hand-over and its quarantined copies, on the node ([#763](https://github.com/OmarAlex24/quoro/pull/763)) and on the primary ([#738](https://github.com/OmarAlex24/quoro/pull/738)).
 
-The panel on `main` has no view of the warm copy's last shipped snapshot and no switchover action. Until it does, each panel action below has an API call that does the same thing, and the API answer is the evidence.
+The panel on `main` has no switchover action. Until it does, step 5's panel action has an API call that does the same thing, and the API answer is the evidence.
 
 ## Preconditions
 
@@ -237,7 +236,7 @@ Take `APP` from the `id` of the first answer and `VOL` from the `id` of the seco
 1. Write record **A** through the demo domain. Note the time.
 2. Poll `q "$QUORO/api/v1/apps/$APP" | jq '{warm, lease}'` until the shipped copy's snapshot was taken after record A: the time of the reading minus `warm.lag_s` is later than the time of record A, with `state: in_sync`. `last_shipped_at` alone is not enough, because it is when lab-2 completed the copy, and the snapshot may have been taken before A was written. Waiting until `last_snapshot_seq` has advanced twice after A also works.
 
-- **Panel:** the app's last shipped snapshot on lab-2 (not on `main` yet; see [above](#what-main-does-not-serve-yet)).
+- **Panel:** the app's last shipped snapshot on lab-2 ([#839](https://github.com/OmarAlex24/quoro/pull/839)).
 
 **Expected:** `last_snapshot_seq` grows by one about every 30 s. `lag_s` stays at or below 60 s.
 
@@ -246,7 +245,7 @@ Take `APP` from the `id` of the first answer and `VOL` from the `id` of the seco
 - the `PATCH` answer;
 - three readings of `App.warm`, at least 30 s apart;
 - the time of record A and the first `last_shipped_at` after it;
-- the screenshot of the panel when it exists.
+- a screenshot of the panel showing the last shipped snapshot.
 
 ### 2d. A held lease survives an agent restart
 
@@ -527,11 +526,11 @@ The roadmap's step 6 ends by promoting lab-2 back. The demo uses option A. Optio
 
 **Option A: promote lab-2 back (the roadmap's script).**
 
-1. On lab-2: `quoro node rejoin` ([#728](https://github.com/OmarAlex24/quoro/issues/728)). lab-2 counts as demoted, so no `--force` is needed. It stops and disables lab-2's control-plane unit, then moves its data directory and the unit file into a copy named with the term and the time. Nothing is deleted. lab-2's agent finds lab-1. Its followed log differs from lab-1's, so it quarantines that log and follows again from `seq` 1 ([protocol section 7.4](../contracts/node-agent-protocol.md#74-the-old-primary)). Wait until lab-2's `log_lag` is 0 and its `custody` is `sealed`.
-2. On lab-2: `quoro cluster promote`. Expected: refused with `support_held`, because lab-1's control plane runs. lab-2 has neither a control-plane database nor a unit any more, so that is the only reason it can be refused.
+1. On lab-2: `quoro node rejoin` ([#728](https://github.com/OmarAlex24/quoro/issues/728)). lab-2's control plane was stopped by hand in 6b and never learned of lab-1's term, but its agent has seen it, so lab-2 counts as demoted and no `--force` is needed. It stops and disables lab-2's control-plane unit, then moves its data directory and the unit file into a copy named with the term and the time. Nothing is deleted. lab-2's agent finds lab-1. Its followed log differs from lab-1's, so it quarantines that log and follows again from `seq` 1 ([protocol section 7.4](../contracts/node-agent-protocol.md#74-the-old-primary)). Wait until lab-2's `log_lag` is 0 and its `custody` is `sealed`.
+2. On lab-2: `quoro cluster promote`. Expected: refused with `support_held`, because lab-1's control plane runs. lab-2 has neither a control-plane database nor a unit any more, so section 7.3 does not refuse it for them. With its `log_lag` at 0 and its `custody` `sealed` (step 1), `support_held` is the expected refusal.
 3. On lab-1: `systemctl stop quoro`. Its agent keeps running.
 4. Wait at least 15 s, then on lab-2: `quoro cluster promote`. Expected: it waits as in 6b, then lab-2 is the primary at the next term. As in 6b, lab-1 fences the demo app once its control plane stops, and lab-2 gives the lease back to lab-1 once it holds majority support.
-5. On lab-1: `quoro node rejoin`. Its control plane was stopped by hand in step 3 and never learned of the newer term, but its agent has seen lab-2's higher term, so lab-1 counts as demoted and no `--force` is needed. lab-1 is a node again.
+5. On lab-1: `quoro node rejoin`. Its control plane was stopped by hand in step 3 and never learned of the newer term, but its agent has seen lab-2's higher term, so lab-1 counts as demoted and no `--force` is needed. If it refuses, lab-1's agent has not reached lab-2 yet: check that lab-1 is `connected` and run it again. Do not use `--force`. lab-1 is a node again.
 6. Check: `GET /api/v1/cluster` against lab-2 shows `primary_node_id` lab-2. Every machine is connected, and the demo app runs.
 
 This is the state the demo started from, with a higher term and two quarantined control-plane directories, one on each host.
