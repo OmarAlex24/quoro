@@ -30,6 +30,8 @@ pub struct Node {
 }
 
 pub async fn enroll(server: &Server, owner: &reqwest::Client, name: &str, roles: &[&str]) -> Node {
+    // Section 8.10 rule 2: these tests enroll voters back to back.
+    super::settle_voters(server).await;
     let token: Value = owner
         .post(server.url("/api/v1/nodes/join-tokens"))
         .json(&json!({}))

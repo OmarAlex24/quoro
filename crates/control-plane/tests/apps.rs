@@ -1602,6 +1602,8 @@ mod session {
         name: &str,
         seed: u8,
     ) -> (String, Socket) {
+        // Section 8.10 rule 2: these tests enroll voters back to back.
+        super::common::settle_voters(server).await;
         let token: Value = owner
             .post(server.url("/api/v1/nodes/join-tokens"))
             .json(&json!({}))

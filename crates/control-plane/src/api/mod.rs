@@ -133,6 +133,10 @@ pub fn routes() -> Router<AppState> {
             post(nodes::ack_node_fence),
         )
         .route(
+            "/api/v1/nodes/{node_id}/roles",
+            post(nodes::update_node_roles),
+        )
+        .route(
             "/api/v1/projects",
             get(projects::list_projects).post(projects::create_project),
         )

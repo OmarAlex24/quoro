@@ -1222,3 +1222,322 @@ async fn delete_tunnel_tx(
     w.commit().await?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Roles (`updateNodeRoles`, ADR 0170)
+// ---------------------------------------------------------------------------
+
+/// The operation string recorded in the audit log.
+const ROLES_OPERATION: &str = "POST /api/v1/nodes/{node_id}/roles";
+
+/// The only role `updateNodeRoles` changes in M5b (`NodeRolesRequest`).
+const WITNESS: &str = "witness";
+
+/// Body of `updateNodeRoles` (`openapi.yaml` `NodeRolesRequest`).
+///
+/// The handler reads the body as JSON and validates it after the caller is
+/// authorized, so an agent is refused `human_only` whatever it sends, and
+/// every refusal is audited.
+#[derive(Clone, Debug, Default, Deserialize, ToSchema)]
+#[schema(
+    title = "NodeRolesRequest",
+    description = "Add or remove the `witness` role of an enrolled machine (ADR 0170)."
+)]
+pub struct NodeRolesRequest {
+    /// Roles to add.
+    #[serde(default)]
+    #[schema(schema_with = roles_change_schema)]
+    pub add: Option<Vec<String>>,
+    /// Roles to remove.
+    #[serde(default)]
+    #[schema(schema_with = roles_change_schema)]
+    pub remove: Option<Vec<String>>,
+    /// Remove a vote even though fewer than three voters would remain while
+    /// `expiring` leases exist.
+    #[serde(default)]
+    #[schema(default = false)]
+    pub force: bool,
+}
+
+/// `NodeRolesRequest.add` and `.remove`: at least one unique role, and only
+/// `witness` can change in M5b.
+fn roles_change_schema() -> utoipa::openapi::schema::Array {
+    use utoipa::openapi::schema::{ArrayBuilder, ObjectBuilder, Type};
+    ArrayBuilder::new()
+        .items(
+            ObjectBuilder::new()
+                .schema_type(Type::String)
+                .enum_values(Some([WITNESS])),
+        )
+        .min_items(Some(1))
+        .unique_items(true)
+        .build()
+}
+
+/// One validated change of `updateNodeRoles`: add or remove `witness`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RolesChange {
+    AddWitness,
+    RemoveWitness,
+}
+
+/// Reads a `NodeRolesRequest`: exactly one of `add` and `remove`, each a
+/// non-empty list of unique roles of which only `witness` can change.
+fn roles_change(body: &Value) -> Result<(RolesChange, bool), ApiError> {
+    let request: NodeRolesRequest = serde_json::from_value(body.clone())
+        .map_err(|e| ApiError::validation(format!("the body is not a NodeRolesRequest: {e}")))?;
+    let (change, roles) = match (&request.add, &request.remove) {
+        (Some(roles), None) => (RolesChange::AddWitness, roles),
+        (None, Some(roles)) => (RolesChange::RemoveWitness, roles),
+        (Some(_), Some(_)) => {
+            return Err(ApiError::validation(
+                "give exactly one of add and remove, not both",
+            ));
+        }
+        (None, None) => {
+            return Err(ApiError::validation("give exactly one of add and remove"));
+        }
+    };
+    if roles.is_empty() {
+        return Err(ApiError::validation("the list of roles must not be empty"));
+    }
+    if roles.len() > 1 {
+        return Err(ApiError::validation(
+            "the list of roles contains a duplicate or a role that cannot change",
+        ));
+    }
+    if roles[0] != WITNESS {
+        return Err(ApiError::validation(format!(
+            "only the witness role can be added or removed; {} is chosen at enrollment",
+            roles[0]
+        )));
+    }
+    Ok((change, request.force))
+}
+
+/// Adds or removes the `witness` role of an enrolled machine without
+/// enrolling it again (ADR 0170, `node-agent-protocol.md` sections 6.12 and
+/// 8.10). The machine acts on its next `desired_state`.
+#[utoipa::path(
+    post,
+    path = "/api/v1/nodes/{node_id}/roles",
+    tag = "nodes",
+    operation_id = "updateNodeRoles",
+    extensions(("x-quoro-scope" = json!("node:roles"))),
+    params(
+        ("node_id" = String, Path, description = "Node id (`nod_...`).", pattern = "^nod_[0-9A-HJKMNP-TV-Z]{26}$"),
+    ),
+    request_body(content = NodeRolesRequest, description = "The role to add or to remove."),
+    responses(
+        (status = 200, description = "The node with its roles after the change.", body = Node,
+            headers(("Quoro-Request-Id" = String, description = "Correlation id of this call."))),
+        (status = 401, response = crate::openapi::Unauthenticated),
+        (status = 403, response = crate::openapi::Forbidden),
+        (status = 404, response = crate::openapi::NotFound),
+        (status = 409, response = crate::openapi::Conflict),
+        (status = 422, response = crate::openapi::ValidationFailed),
+        (status = 429, response = crate::openapi::RateLimited),
+        (status = 503, response = crate::openapi::NotPrimary),
+    )
+)]
+///
+/// # Errors
+///
+/// In this order: `forbidden` for an agent (`human_only`) or without
+/// `node:roles`; `validation_failed` for a body with both or neither of
+/// `add` and `remove` or a role other than `witness`; `not_found` for an
+/// unknown node. Adding a role the machine has, or removing one it lacks,
+/// then answers `200` and changes nothing. After that: `validation_failed`
+/// when the machine would be left with no role; `conflict` for a removed
+/// node; `conflict` while the previous voter-set change has not reached a
+/// majority of voters (section 8.10 rule 2); `conflict` when removing the
+/// vote would leave fewer than three voters while any `expiring` lease
+/// exists, unless `force` is set (D-0170's guard). Or a database error.
+pub async fn update_node_roles(
+    State(state): State<AppState>,
+    identity: Identity,
+    headers: HeaderMap,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Path(node_id): Path<String>,
+    ApiJson(body): ApiJson<Value>,
+) -> Result<Json<Node>, ApiError> {
+    // `params` is the request body (audit-log-format.md section 3.7).
+    let params = body.clone();
+    let target = Target {
+        kind: "node".to_string(),
+        id: node_id.clone(),
+    };
+    let ctx = CallCtx::new(identity, request_id, ROLES_OPERATION, &headers);
+    ctx.authorize_human(&state, Scope::NodeRoles, Some(&target), None, &params)
+        .await?;
+    match roles_tx(&state, &ctx, &node_id, &body, &params).await {
+        Ok((node, changed)) => {
+            if changed {
+                // Every voter's `spec.votes` names the roles of every voter,
+                // and a new witness changes the mesh's peers (sections 6.9
+                // and 6.12): every machine builds its desired state again.
+                state.hub.nodes_changed_all();
+            }
+            Ok(Json(node))
+        }
+        Err(error) => {
+            ctx.audit_error(
+                &state,
+                Some(Scope::NodeRoles),
+                Some(&target),
+                None,
+                &params,
+                &error,
+            )
+            .await?;
+            Err(error)
+        }
+    }
+}
+
+/// The checks and the write of `updateNodeRoles`, in one write transaction
+/// so rule 2 counts against the version this write moves (section 8.10).
+/// Returns the node after the call and whether anything changed.
+async fn roles_tx(
+    state: &AppState,
+    ctx: &CallCtx,
+    node_id: &str,
+    body: &Value,
+    params: &Value,
+) -> Result<(Node, bool), ApiError> {
+    let (change, force) = roles_change(body)?;
+    let mut w = state.store.begin_write().await?;
+    if !is_id(Prefix::Node, node_id) {
+        return Err(ApiError::not_found("node"));
+    }
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT roles, status FROM nodes WHERE id = ?")
+            .bind(node_id)
+            .fetch_optional(&mut *w.tx)
+            .await?;
+    let Some((roles, status)) = row else {
+        return Err(ApiError::not_found("node"));
+    };
+    let roles: Vec<String> = serde_json::from_str(&roles).map_err(|e| ApiError::internal(&e))?;
+    let target = Target {
+        kind: "node".to_string(),
+        id: node_id.to_string(),
+    };
+    let has_witness = roles.iter().any(|role| role == WITNESS);
+
+    // Adding a role the machine has, or removing one it lacks, changes
+    // nothing and answers `200` before any other check; it is still
+    // recorded, with no `change_seq` (audit-log-format.md section 3.7).
+    let unchanged = match change {
+        RolesChange::AddWitness => has_witness,
+        RolesChange::RemoveWitness => !has_witness,
+    };
+    if unchanged {
+        ctx.append_ok(
+            &mut w.tx,
+            Some(Scope::NodeRoles),
+            Some(&target),
+            None,
+            params,
+            None,
+        )
+        .await?;
+        let node = node_in(&mut w.tx, &state.hub, node_id).await?;
+        w.commit().await?;
+        return Ok((node, false));
+    }
+
+    let new_roles: Vec<String> = match change {
+        RolesChange::AddWitness => roles
+            .iter()
+            .cloned()
+            .chain(std::iter::once(WITNESS.to_string()))
+            .collect(),
+        RolesChange::RemoveWitness => roles
+            .iter()
+            .filter(|role| *role != WITNESS)
+            .cloned()
+            .collect(),
+    };
+    if new_roles.is_empty() {
+        return Err(ApiError::validation(
+            "removing witness would leave the machine with no role",
+        ));
+    }
+    if status == "removed" {
+        return Err(ApiError::conflict("the node is removed"));
+    }
+
+    // One machine has one vote: only a change that adds or removes it
+    // changes the voter set (sections 6.12 and 8.10).
+    let votes_before = crate::voters::is_voter_roles(&roles);
+    let votes_after = crate::voters::is_voter_roles(&new_roles);
+    let changes_vote = votes_before != votes_after;
+    if changes_vote {
+        let (_, voters) = state.hub.voter_change_gate(&mut w.tx).await?;
+        if votes_before && !force && voters.saturating_sub(1) < 3 {
+            let expiring: bool =
+                sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM leases WHERE mode = 'expiring')")
+                    .fetch_one(&mut *w.tx)
+                    .await?;
+            if expiring {
+                return Err(ApiError::conflict(
+                    "removing this vote would leave fewer than three voters while expiring leases exist; set force to remove it anyway",
+                ));
+            }
+        }
+    }
+
+    let actor = ctx.identity.actor();
+    // A machine that gains the witness role gets a mesh address if it has
+    // none (section 6.12), before the entry that changes its roles, so that
+    // entry is the one that moves the voter-set version.
+    if change == RolesChange::AddWitness {
+        crate::session::mesh::assign_address(&mut w.tx, &actor, node_id)
+            .await
+            .map_err(|e| ApiError::internal(&e))?;
+    }
+    let roles_json = serde_json::to_string(&new_roles).map_err(|e| ApiError::internal(&e))?;
+    sqlx::query("UPDATE nodes SET roles = ? WHERE id = ?")
+        .bind(&roles_json)
+        .bind(node_id)
+        .execute(&mut *w.tx)
+        .await?;
+    let payload = crate::driver::node_payload(&mut w.tx, node_id).await?;
+    let seq = changelog::append(&mut w.tx, &actor, "node", node_id, Op::Update, payload).await?;
+    if changes_vote {
+        // The change moved the voter-set version to its own entry, or
+        // nothing is written (section 8.10 rules 1 and 2).
+        state.hub.voter_change_landed(&mut w.tx, seq).await?;
+    }
+    ctx.append_ok(
+        &mut w.tx,
+        Some(Scope::NodeRoles),
+        Some(&target),
+        None,
+        params,
+        Some(seq),
+    )
+    .await?;
+    let node = node_in(&mut w.tx, &state.hub, node_id).await?;
+    w.commit().await?;
+    Ok((node, true))
+}
+
+/// The node `node_id` as the API returns it, read on `conn`.
+async fn node_in(
+    conn: &mut SqliteConnection,
+    hub: &NodeHub,
+    node_id: &str,
+) -> Result<Node, ApiError> {
+    let row = sqlx::query(&format!(
+        "SELECT {NODE_COLUMNS} FROM nodes n WHERE n.id = ?"
+    ))
+    .bind(node_id)
+    .fetch_one(&mut *conn)
+    .await?;
+    let mut node = node_from_row(&row)?;
+    node.tunnel = tunnel_of(&mut *conn, node_id).await?;
+    attach_log_position(&mut *conn, hub, std::slice::from_mut(&mut node)).await?;
+    Ok(node)
+}

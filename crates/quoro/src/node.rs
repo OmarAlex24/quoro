@@ -44,17 +44,20 @@ pub const EX_TEMPFAIL: i32 = 75;
 pub const LOCAL_JOIN_FILE: &str = "local-node-join.json";
 
 /// The file under the node data directory that records the role this machine
-/// enrolled with. It holds one word, `node` or `edge`, is written `0600` like
+/// enrolled with. It holds one word, `node`, `edge` or `witness`, is written `0600` like
 /// the other identity files, and is absent on installs from before edge
 /// existed, which means [`Role::Node`].
 pub const ROLE_FILE: &str = "role";
 
-/// The role a machine took when it enrolled (ADR 0143).
+/// The role a machine took when it enrolled (ADR 0143, ADR 0170).
 ///
 /// A `node` runs microVMs and needs KVM; an `edge` runs the proxy and the mesh
-/// only, so it runs the agent without an engine. A machine may hold both roles
+/// only, and a `witness` only votes (`node-agent-protocol.md` section 6.12),
+/// so both run the agent without an engine. A machine may hold several roles
 /// in the protocol, but `quoro join` records one, and a machine that runs VMs
-/// enrolls as a node.
+/// enrolls as a node. An edge gains or loses the `witness` role later through
+/// the roles operation, without enrolling again; its agent learns it from its
+/// desired state, so the role file keeps `edge`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Role {
     /// Runs microVMs for the primary; needs KVM and Cloud Hypervisor.
@@ -62,10 +65,12 @@ pub enum Role {
     Node,
     /// Runs the edge proxy and the mesh only; holds no engine.
     Edge,
+    /// Only votes (ADR 0170): no engine, no VM, no application data.
+    Witness,
 }
 
 impl Role {
-    /// Reads `node` or `edge`; anything else is a usage error.
+    /// Reads `node`, `edge` or `witness`; anything else is a usage error.
     ///
     /// # Errors
     ///
@@ -74,8 +79,9 @@ impl Role {
         match text {
             "node" => Ok(Self::Node),
             "edge" => Ok(Self::Edge),
+            "witness" => Ok(Self::Witness),
             other => Err(format!(
-                "unknown role '{other}'; expected node or edge (a primary runs 'quoro serve' instead)"
+                "unknown role '{other}'; expected node, edge or witness (a primary runs 'quoro serve' instead)"
             )),
         }
     }
@@ -86,6 +92,7 @@ impl Role {
         match self {
             Self::Node => "node",
             Self::Edge => "edge",
+            Self::Witness => "witness",
         }
     }
 
@@ -158,7 +165,7 @@ fn agent_config(config: &Config, role: Role) -> AgentConfig {
     }
 }
 
-/// `quoro join <url> --token --fingerprint [--role node|edge]`: enrolls this
+/// `quoro join <url> --token --fingerprint [--role node|edge|witness]`: enrolls this
 /// machine and writes its identity and role, without starting anything.
 /// `quoro node` (or its systemd unit) then runs the agent. Returns the process
 /// exit code.
@@ -301,9 +308,10 @@ fn systemctl(action: &str) -> Result<(), String> {
 /// control plane's local join file, which lives in the control plane's data
 /// directory; any other machine must have run `quoro join`.
 ///
-/// The role persisted at enrollment picks the engine. An edge-only machine
-/// holds no engine at all, so [`NullEngine`] lets the agent run on a host
-/// without KVM (ADR 0143); a node needs Cloud Hypervisor as before.
+/// The role persisted at enrollment picks the engine. An edge-only or
+/// witness-only machine holds no engine at all, so [`NullEngine`] lets the
+/// agent run on a host without KVM (ADR 0143, ADR 0170); a node needs Cloud
+/// Hypervisor as before.
 ///
 /// # Errors
 ///
@@ -521,8 +529,8 @@ fn parse_local_join(text: &str) -> Result<JoinTarget, String> {
 /// The facts `quoro join` reports, from the engine the machine will run.
 async fn join_facts(config: &Config, role: Role) -> Result<NodeFacts, i32> {
     if !role.runs_vms() {
-        // An edge enrolls without KVM and without an engine; the probe still
-        // reports /dev/kvm as it finds it (section 2.3).
+        // An edge or a witness enrolls without KVM and without an engine;
+        // the probe still reports /dev/kvm as it finds it (section 2.3).
         return Ok(facts_of(&NullEngine::new()).await);
     }
     facts_for(config).await
@@ -646,13 +654,19 @@ mod tests {
         assert_eq!(Role::default(), Role::Node, "an unasked machine is a node");
         assert_eq!(Role::parse("node"), Ok(Role::Node));
         assert_eq!(Role::parse("edge"), Ok(Role::Edge));
-        for bad in ["primary", "witness", "Edge", ""] {
-            let err = Role::parse(bad).expect_err("only node and edge are join roles");
-            assert!(err.contains("expected node or edge"), "{err}");
+        assert_eq!(Role::parse("witness"), Ok(Role::Witness));
+        for bad in ["primary", "Edge", "Witness", ""] {
+            let err = Role::parse(bad).expect_err("only node, edge and witness are join roles");
+            assert!(err.contains("expected node, edge or witness"), "{err}");
         }
         assert_eq!(Role::Edge.enrollment_roles(), vec!["edge".to_string()]);
         assert_eq!(Role::Node.enrollment_roles(), vec!["node".to_string()]);
+        assert_eq!(
+            Role::Witness.enrollment_roles(),
+            vec!["witness".to_string()]
+        );
         assert!(!Role::Edge.runs_vms());
+        assert!(!Role::Witness.runs_vms(), "a witness runs no engine");
         assert!(Role::Node.runs_vms());
     }
 
@@ -677,6 +691,9 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600, "the role is private like the identity");
         }
+
+        write_role(&dir, Role::Witness).unwrap();
+        assert_eq!(read_role(&dir), Role::Witness);
 
         write_role(&dir, Role::Node).unwrap();
         assert_eq!(read_role(&dir), Role::Node);

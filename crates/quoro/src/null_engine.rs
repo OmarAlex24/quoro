@@ -1,7 +1,8 @@
 //! An [`Engine`] for a machine that runs no virtual machines.
 //!
 //! An edge-only machine (ADR 0143) runs the node agent for its proxy routes
-//! and its mesh peer, but it holds no engine and starts no guest. This backend
+//! and its mesh peer, and a witness-only machine (ADR 0170) runs it to vote;
+//! neither holds an engine or starts a guest. This backend
 //! implements the trait with that fact: nothing is ever created, and every call
 //! that would observe or change a VM says so instead of pretending.
 //!
@@ -32,7 +33,7 @@ const MINIMUM_KERNEL: (u32, u32) = (6, 8);
 /// The reason every VM call returns: this machine holds no engine.
 fn no_vms() -> EngineError {
     EngineError::Unsupported(
-        "this machine runs no VMs: an edge-only node has no engine (ADR 0143)".to_string(),
+        "this machine runs no VMs: an edge-only or witness-only machine has no engine (ADR 0143, ADR 0170)".to_string(),
     )
 }
 

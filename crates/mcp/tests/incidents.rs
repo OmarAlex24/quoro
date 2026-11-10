@@ -56,6 +56,10 @@ struct Enrolled {
 }
 
 async fn enrolled(server: &Server, owner: &reqwest::Client) -> Enrolled {
+    // The registered local node is a voter without a session: record its
+    // acknowledgement, so this second voter passes rule 2 of
+    // node-agent-protocol.md section 8.10.
+    server.state.hub.ack_voter_set().await;
     let res = owner
         .post(server.url("/api/v1/nodes/join-tokens"))
         .json(&json!({}))

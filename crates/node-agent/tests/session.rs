@@ -28,7 +28,8 @@ use quoro_proto::custody::CustodyKey;
 use quoro_proto::sign::{self, SigningKey};
 use quoro_proto::wire::{
     Command, ControlMessage, DesiredState, DesiredStatus, EdgeBackend, EdgeRoute, HealthCheck,
-    LogEntries, Spec, SpecEdge, SpecNetwork, SpecVoter, SpecVotes, SupportRequest, Welcome,
+    LogEntries, Spec, SpecEdge, SpecNetwork, SpecVoter, SpecVotes, SpecWitness, SupportRequest,
+    Welcome,
 };
 use quoro_proto::{
     ErrorCode, LeaseGrant, LeaseId, LeaseMode, LeaseRevoke, ProtocolError, ResourceType,
@@ -3275,4 +3276,125 @@ async fn a_malformed_custody_key_is_kept_and_hello_goes_out_without_it() {
             .collect();
         assert_eq!(names, vec![CUSTODY_KEY_FILE.to_owned()], "no new key file");
     }
+}
+
+// --- the witness role (sections 6.12 and 8.8, ADR 0170) ---------------------
+
+/// A machine without the `node` role: no `spec.network`, no VM; an edge
+/// when `edge` is set, and a voter with the `witness` role when `version`
+/// is given.
+fn roleless_state(rev: u64, edge: bool, version: Option<u64>) -> DesiredState {
+    let mut state = snapshot(rev, Vec::new()).state;
+    state.spec.network = None;
+    state.spec.edge = edge.then(SpecEdge::default);
+    state.spec.witness = version.map(|_| SpecWitness {});
+    state.spec.votes = version.map(votes);
+    state
+}
+
+/// The same, as a snapshot the session starts with.
+fn roleless_snapshot(rev: u64, edge: bool, version: Option<u64>) -> Snapshot {
+    let mut snapshot = snapshot(rev, Vec::new());
+    snapshot.state = roleless_state(rev, edge, version);
+    snapshot
+}
+
+/// The same, as a signed `desired_state` frame.
+fn roleless_frame(
+    rev: u64,
+    edge: bool,
+    version: Option<u64>,
+    key: &SigningKey,
+    id: &str,
+) -> String {
+    let mut body = roleless_state(rev, edge, version).to_unsigned_value();
+    sign::sign_body(key, &mut body).unwrap();
+    ControlMessage::DesiredState(body)
+        .to_frame(id, None)
+        .to_text()
+}
+
+/// Section 6.12: a witness-only machine (enrolled with `roles:
+/// ["witness"]`) has no `spec.network` and no VM, and answers
+/// `support_request` at the version of its `spec.votes`.
+#[tokio::test]
+async fn a_witness_only_machine_answers_support_request() {
+    let dir = TempDir::new();
+    let TermNode {
+        session,
+        store,
+        _observed,
+        ..
+    } = term_node(&dir, Some(roleless_snapshot(1, false, Some(41)))).await;
+    let (mut ws, serving) = welcomed(session, 1).await;
+    send(
+        &mut ws,
+        support_frame(1, "nod_primary", 15_000, 15_000, "msg_support"),
+    )
+    .await;
+    let grant = reply_to(&mut ws, "msg_support").await;
+    assert_eq!(grant["type"], "support_grant", "{grant}");
+    assert_eq!(grant["body"]["voters_version"], 41);
+    assert!(
+        store.support().await.unwrap().is_some(),
+        "the promise is stored"
+    );
+    end_session(ws, serving).await;
+}
+
+/// Sections 6.12 and 8.8: an edge-only machine ignores `support_request`.
+/// Once it gains the witness role, its next `desired_state` carries
+/// `spec.witness` and `spec.votes`, and it answers on the same session,
+/// without a restart. Losing the role stops the answers again.
+#[tokio::test]
+async fn an_edge_that_gains_the_witness_role_votes_on_its_next_desired_state() {
+    let dir = TempDir::new();
+    let TermNode {
+        session,
+        store,
+        key,
+        _observed,
+    } = term_node(&dir, Some(roleless_snapshot(1, true, None))).await;
+    let (mut ws, serving) = welcomed(session, 1).await;
+    send(
+        &mut ws,
+        support_frame(1, "nod_primary", 15_000, 15_000, "msg_support_1"),
+    )
+    .await;
+    let frames = frames_before_pong(&mut ws, "msg_ping_1").await;
+    assert!(
+        frames.iter().all(|frame| frame["re"] != "msg_support_1"),
+        "an edge does not vote: {frames:?}"
+    );
+    assert_eq!(store.support().await.unwrap(), None);
+
+    send(
+        &mut ws,
+        roleless_frame(2, true, Some(52), &key, "msg_witness"),
+    )
+    .await;
+    let stored = reply_to(&mut ws, "msg_witness").await;
+    assert_eq!(stored["body"]["status"], "ok", "{stored}");
+    send(
+        &mut ws,
+        support_frame(1, "nod_primary", 15_000, 15_000, "msg_support_2"),
+    )
+    .await;
+    let grant = reply_to(&mut ws, "msg_support_2").await;
+    assert_eq!(grant["type"], "support_grant", "{grant}");
+    assert_eq!(grant["body"]["voters_version"], 52);
+
+    send(&mut ws, roleless_frame(3, true, None, &key, "msg_edge")).await;
+    reply_to(&mut ws, "msg_edge").await;
+    send(
+        &mut ws,
+        support_frame(1, "nod_primary", 15_000, 15_000, "msg_support_3"),
+    )
+    .await;
+    let frames = frames_before_pong(&mut ws, "msg_ping_2").await;
+    assert!(
+        frames.iter().all(|frame| frame["re"] != "msg_support_3"),
+        "no answer once the role is gone: {frames:?}"
+    );
+    end_session(ws, serving).await;
 }

@@ -38,10 +38,12 @@ commands:
   setup-token [--config PATH]           print a one-time first-run setup token
   version                               print the version
   join <url> --token TOKEN --fingerprint FINGERPRINT [--config PATH]
-            [--role node|edge]
+            [--role node|edge|witness]
                                         enroll this machine as a node (the
-                                        default, runs microVMs) or as an edge
+                                        default, runs microVMs), as an edge
                                         (runs the proxy, no engine, no KVM)
+                                        or as a witness (only votes, no
+                                        engine, no KVM)
   node [--config PATH]                  run the node agent with the role joined
   node set-primary <url> [--config PATH] [--no-restart]
                                         point this enrolled node at its
@@ -176,7 +178,10 @@ async fn serve_command(args: &[String]) -> ExitCode {
     match role {
         "node" => {}
         "witness" => {
-            eprintln!("role {role} arrives in M5");
+            // A witness is its own agent on its own machine (ADR 0170).
+            eprintln!(
+                "a witness is not a serve role; enroll the machine with 'quoro join --role witness' and run 'quoro node'"
+            );
             return ExitCode::from(2);
         }
         "edge" => {
@@ -210,7 +215,7 @@ async fn serve_command(args: &[String]) -> ExitCode {
 }
 
 /// `quoro join <url> --token TOKEN --fingerprint FINGERPRINT [--config PATH]
-/// [--role node|edge]`.
+/// [--role node|edge|witness]`.
 async fn join_command(args: &[String]) -> ExitCode {
     let Some((url, rest)) = args.split_first().filter(|(url, _)| !url.starts_with("--")) else {
         return usage_error("join needs the primary's URL");
@@ -628,10 +633,12 @@ mod tests {
         assert_eq!(join_role(&flags).unwrap(), node::Role::Edge);
         let flags = parse_flags(&args(&["--role", "node"]), &["role"]).unwrap();
         assert_eq!(join_role(&flags).unwrap(), node::Role::Node);
+        let flags = parse_flags(&args(&["--role", "witness"]), &["role"]).unwrap();
+        assert_eq!(join_role(&flags).unwrap(), node::Role::Witness);
 
         let flags = parse_flags(&args(&["--role", "primary"]), &["role"]).unwrap();
         let err = join_role(&flags).expect_err("a primary does not join");
-        assert!(err.contains("expected node or edge"), "{err}");
+        assert!(err.contains("expected node, edge or witness"), "{err}");
     }
 
     #[test]

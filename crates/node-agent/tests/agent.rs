@@ -141,10 +141,14 @@ async fn run_refuses_a_node_that_is_not_enrolled() {
 
 /// Section 7.2: a machine with the `node` role upgraded to M5b generates its
 /// custody key when the agent starts, `0600`, even while no session can
-/// reach the primary; an edge-only machine never writes one.
+/// reach the primary; an edge-only or witness-only machine never writes one.
 #[tokio::test]
 async fn an_agent_start_keeps_a_custody_key_only_with_the_node_role() {
-    for (roles, keeps) in [(vec!["node"], true), (vec!["edge"], false)] {
+    for (roles, keeps) in [
+        (vec!["node"], true),
+        (vec!["edge"], false),
+        (vec!["witness"], false),
+    ] {
         let dir = TempDir::new();
         let key = sign::signing_key_from_seed(&[4; 32]);
         // Port 1 refuses immediately: no session ever sends a `hello`, so
@@ -199,4 +203,59 @@ async fn an_agent_start_keeps_a_custody_key_only_with_the_node_role() {
         // machine without the `node` role that has stopped wrote none.
         assert_eq!(path.exists(), keeps, "{roles:?}");
     }
+}
+
+/// Section 6.12 (ADR 0170): a witness-only machine runs the node agent with
+/// no engine work at all. Its desired state has no `spec.network` and no VM,
+/// only `spec.witness` and `spec.votes`; the agent records the revision as
+/// applied and never asks the engine for a network or a VM.
+#[tokio::test]
+async fn a_witness_only_agent_runs_without_an_engine() {
+    let dir = TempDir::new();
+    let key = sign::signing_key_from_seed(&[4; 32]);
+    // Port 1 refuses immediately: the agent runs from its stored state.
+    identity_files_with_url(dir.path(), &key, "https://127.0.0.1:1");
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let mut witness = snapshot(5, Vec::new());
+    witness.state.spec.network = None;
+    witness.state.spec.witness = Some(quoro_proto::wire::SpecWitness {});
+    witness.state.spec.votes = Some(quoro_proto::wire::SpecVotes {
+        version: 12,
+        port: 51821,
+        voters: vec![quoro_proto::wire::SpecVoter {
+            node_id: "nod_test".to_owned(),
+            roles: vec!["witness".to_owned()],
+            mesh_address: Some("10.43.0.4".to_owned()),
+        }],
+    });
+    store
+        .store_desired(5, &signed_body(&witness, &key))
+        .await
+        .unwrap();
+
+    let engine = RecordingEngine::new();
+    let observed = engine.clone();
+    let mut config = config(&dir);
+    config.roles = vec!["witness".to_owned()];
+    let (shutdown, stop) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(run(config, engine, facts(), async move {
+        let _ = stop.await;
+    }));
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while store.applied_rev().await.unwrap() < 5 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the agent applied the witness's desired state");
+    assert_eq!(observed.create_count(), 0, "a witness starts no VM");
+    assert!(observed.networks().is_empty(), "a witness has no bridge");
+
+    shutdown.send(()).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("the agent stops on shutdown")
+        .expect("the agent task did not panic");
+    assert!(result.is_ok(), "{result:?}");
 }
