@@ -65,6 +65,8 @@ async fn enrolled(
     name: &str,
     roles: &[&str],
 ) -> Enrolled {
+    // Section 8.10 rule 2: these tests enroll voters back to back.
+    common::settle_voters(server).await;
     let res = owner
         .post(server.url("/api/v1/nodes/join-tokens"))
         .json(&json!({}))
