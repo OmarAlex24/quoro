@@ -421,3 +421,62 @@ async fn a_demoted_primary_with_pending_migrations_neither_migrates_nor_backs_up
     assert_eq!(version, "1", "schema_version is unchanged");
     pool.close().await;
 }
+
+/// Runs `quoro <args> --config <config>` to its end.
+async fn run_quoro(args: &[&str], config: &Path) -> std::process::Output {
+    timeout(
+        Duration::from_secs(30),
+        Command::new(env!("CARGO_BIN_EXE_quoro"))
+            .args(args)
+            .arg("--config")
+            .arg(config)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("the command ends within 30 s")
+    .expect("run quoro")
+}
+
+/// `quoro setup-token` on a demoted host issues nothing and writes nothing:
+/// no migration, no token file.
+#[tokio::test(flavor = "multi_thread")]
+async fn setup_token_refuses_on_a_demoted_host() {
+    let dir = TempDir::new("demoted-setup-token");
+    let config = write_config(dir.path());
+    let cp = dir.path().join("cp");
+    demoted_data_dir_with_pending_migrations(&cp).await;
+    let sum_before = checksum(&cp.join("quoro.db"));
+    let entries_before = entries(&cp);
+
+    let output = run_quoro(&["setup-token"], &config).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "a refusal: {stderr}");
+    assert!(stderr.contains("demoted primary at term 5"), "{stderr}");
+    assert_eq!(stderr.trim().lines().count(), 1, "one line: {stderr}");
+    assert!(output.stdout.is_empty(), "no token is printed");
+    assert_eq!(checksum(&cp.join("quoro.db")), sum_before, "no migration");
+    assert_eq!(entries(&cp), entries_before, "no token file");
+}
+
+/// `quoro vuln import` on a demoted host imports nothing and writes nothing,
+/// not even its error audit record or the cache.
+#[tokio::test(flavor = "multi_thread")]
+async fn vuln_import_refuses_on_a_demoted_host() {
+    let dir = TempDir::new("demoted-vuln-import");
+    let config = write_config(dir.path());
+    let cp = dir.path().join("cp");
+    demoted_data_dir(&cp, true).await;
+    let data = dir.path().join("osv");
+    std::fs::create_dir_all(&data).unwrap();
+    let sum_before = checksum(&cp.join("quoro.db"));
+    let entries_before = entries(&cp);
+
+    let output = run_quoro(&["vuln", "import", data.to_str().unwrap()], &config).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "a refusal: {stderr}");
+    assert!(stderr.contains("demoted primary at term 5"), "{stderr}");
+    assert_eq!(stderr.trim().lines().count(), 1, "one line: {stderr}");
+    assert_eq!(checksum(&cp.join("quoro.db")), sum_before);
+    assert_eq!(entries(&cp), entries_before, "no cache database");
+}

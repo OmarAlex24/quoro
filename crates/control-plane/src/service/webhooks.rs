@@ -903,6 +903,14 @@ async fn test_webhook_tx(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| ApiError::internal(&format!("HTTP client: {error}")))?;
+    // A request that passed the guard before a demotion sends nothing after
+    // it (`node-agent-protocol.md` section 7.4).
+    if state.store.is_demoted() {
+        return Err(ApiError::new(
+            crate::error::Code::NotPrimary,
+            crate::store::DEMOTED_REFUSAL,
+        ));
+    }
     // A test delivery never carries `data.wake` and never issues a grant.
     let outcome: SendOutcome =
         dispatcher::send_once(&client, &webhook, &event, &delivery_id, &secret, None).await;

@@ -393,6 +393,14 @@ pub(crate) async fn create(
     let body_bytes = serde_json::to_vec(&config)
         .map_err(|error| ApiError::internal(&format!("repository config: {error}")))?;
     let config_key = object_key(&target.root, &layout::config(1));
+    // A request that passed the guard before a demotion writes no object
+    // after it (`node-agent-protocol.md` section 7.4).
+    if state.store.is_demoted() {
+        return Err(ApiError::new(
+            crate::error::Code::NotPrimary,
+            crate::store::DEMOTED_REFUSAL,
+        ));
+    }
     match bucket.put_new(&config_key, body_bytes).await {
         Ok(()) => {}
         Err(ObjectStoreError::AlreadyExists) => {
@@ -512,6 +520,12 @@ pub(crate) async fn rotate(
     let body = serde_json::to_vec(&config)
         .map_err(|error| ApiError::internal(&format!("repository config: {error}")))?;
     let key = object_key(&target.root, &layout::config(next));
+    if state.store.is_demoted() {
+        return Err(ApiError::new(
+            crate::error::Code::NotPrimary,
+            crate::store::DEMOTED_REFUSAL,
+        ));
+    }
     match bucket.put_new(&key, body).await {
         Ok(()) => {}
         Err(ObjectStoreError::AlreadyExists) => {

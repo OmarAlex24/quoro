@@ -413,6 +413,10 @@ fn protocol_error(
     .to_text()
 }
 
+/// How long a session waits to send its last frames, `not_primary` after a
+/// demotion and the close frame, before it ends without them.
+const DEMOTED_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The fatal `error` `not_primary` a demoted primary ends every session with
 /// (sections 5.18 and 7.4, ADR 0230).
 fn not_primary_frame() -> String {
@@ -1370,6 +1374,19 @@ impl NodeHub {
                 }
             }
         });
+    }
+
+    /// Test seam: runs a node's `dns_challenge` as its session would, for
+    /// `node_id` with `acme_routes` as its acme hostnames, and returns the
+    /// result the session would send.
+    #[doc(hidden)]
+    pub async fn dns_challenge_for_test(
+        &self,
+        node_id: &str,
+        challenge: &wire::DnsChallenge,
+        acme_routes: &HashSet<String>,
+    ) -> wire::DnsChallengeResult {
+        dns_challenge(self, node_id, challenge, acme_routes).await
     }
 
     /// Test seam: queues `message` on `node_id`'s session as
@@ -2784,7 +2801,13 @@ async fn run_session(
         if session.hub.0.store.is_demoted() {
             outbox.clear();
             while rx.try_recv().is_ok() {}
-            let _ = socket.send(Message::Text(not_primary_frame().into())).await;
+            // A node that stops reading must not hold the session open: the
+            // session ends whether the frame went out or not.
+            let _ = tokio::time::timeout(
+                DEMOTED_SEND_TIMEOUT,
+                socket.send(Message::Text(not_primary_frame().into())),
+            )
+            .await;
             break;
         }
         while let Ok(text) = rx.try_recv() {
@@ -2913,8 +2936,8 @@ async fn run_session(
     )
     .await;
     // A close frame tells the node the session ended; the client may already
-    // be gone, which is fine.
-    let _ = socket.send(Message::Close(None)).await;
+    // be gone, which is fine, or have stopped reading, which ends the wait.
+    let _ = tokio::time::timeout(DEMOTED_SEND_TIMEOUT, socket.send(Message::Close(None))).await;
 }
 
 /// Ends `generation`'s session: fails its pending commands and streams and,

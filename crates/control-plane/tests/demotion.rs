@@ -441,8 +441,17 @@ async fn nothing_is_written_or_sent_after_the_demotion() {
             .is_err()
     );
     quoro_control_plane::vulns::findings::run_once(state).await;
-    // The dispatcher ticks every second: three ticks pass.
-    tokio::time::sleep(Duration::from_millis(3_200)).await;
+    // The dispatcher's next tick sees the flag and its loop ends: from then
+    // on it sends nothing.
+    timeout(
+        Duration::from_secs(10),
+        server
+            .state
+            .store
+            .stopped_for_demotion("the webhook dispatcher"),
+    )
+    .await
+    .expect("the dispatcher stops at its next tick");
 
     let mut after = heads(&server).await;
     // The retry row this test wrote is the only new row.
@@ -525,9 +534,13 @@ async fn a_write_queued_on_the_gate_does_not_commit_after_the_demotion() {
     hold.reached().await;
     assert_eq!(meta(&server, "demoted_by_term").await.as_deref(), Some("5"));
 
+    // This runtime has one thread: once the task said it is writing, it ran
+    // on until it waits on the gate.
+    let (writing, started) = tokio::sync::oneshot::channel();
     let queued = {
         let store = store.clone();
         tokio::spawn(async move {
+            let _ = writing.send(());
             let mut w = store.begin_write().await?;
             sqlx::query("INSERT INTO meta (key, value) VALUES ('queued_write', 'committed')")
                 .execute(&mut *w.tx)
@@ -535,7 +548,8 @@ async fn a_write_queued_on_the_gate_does_not_commit_after_the_demotion() {
             w.commit().await
         })
     };
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    started.await.unwrap();
+    tokio::task::yield_now().await;
     assert!(
         !queued.is_finished(),
         "the queued write waits on the gate the demotion holds"
@@ -733,4 +747,29 @@ async fn the_guard_lets_everything_through_before_a_demotion() {
     assert_eq!(res.status(), 200);
     assert!(!server.state.store.is_demoted());
     assert!(server.state.store.begin_write().await.is_ok());
+}
+
+/// A clean shutdown makes one last attempt at a demotion the retry has not
+/// recorded yet.
+#[tokio::test]
+async fn a_clean_shutdown_records_an_unrecorded_demotion() {
+    let server = start_with_patient_node_session().await;
+    let store = server.state.store.clone();
+    store.set_demotion_retry_for_test(Duration::from_secs(3_600));
+    sqlx::query(
+        "CREATE TRIGGER refuse_demotion BEFORE INSERT ON meta \
+         WHEN NEW.key = 'demoted_by_term' BEGIN SELECT RAISE(ABORT, 'refused by the test'); END",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+    server.state.hub.stale_term(Some(5)).await;
+    assert_eq!(meta(&server, "demoted_by_term").await, None);
+    sqlx::query("DROP TRIGGER refuse_demotion")
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    store.record_demotion_before_exit().await;
+    assert_eq!(meta(&server, "demoted_by_term").await.as_deref(), Some("5"));
 }

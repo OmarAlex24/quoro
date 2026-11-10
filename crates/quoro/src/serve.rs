@@ -162,14 +162,42 @@ pub async fn run(config: Config, skip_upgrade_backup: bool) -> Result<i32, Strin
             .map_err(|e| format!("cannot write the local node's join file: {e}"))?;
     }
     let local_node = start_local_node(&config, stop_rx);
-    serve_until_stopped(
+    let served = serve_until_stopped(
         listener,
         material.config,
         handle,
         service(state),
         local_node,
     )
-    .await
+    .await;
+    // A demotion whose record is still being retried gets one last attempt,
+    // so a clean stop does not come back as a primary
+    // (`node-agent-protocol.md` section 7.4).
+    store.record_demotion_before_exit().await;
+    served
+}
+
+/// `meta.demoted_by_term` of the database at `database`, read without any
+/// write or migration, or `None` when there is no database yet. The other
+/// commands that write `quoro.db` refuse on a demoted host with it
+/// (`node-agent-protocol.md` section 7.4).
+///
+/// # Errors
+///
+/// A one-line message when the database cannot be read.
+pub async fn demoted_by_term(database: &std::path::Path) -> Result<Option<String>, String> {
+    if !database.is_file() {
+        return Ok(None);
+    }
+    let store = Store::open_unmigrated(database)
+        .await
+        .map_err(|e| format!("cannot open {}: {e}", database.display()))?;
+    let term = store
+        .demoted_by_term()
+        .await
+        .map_err(|e| format!("cannot read {}: {e}", database.display()));
+    store.pool().close().await;
+    term
 }
 
 /// The whole service of a primary: the API, MCP and the panel as the

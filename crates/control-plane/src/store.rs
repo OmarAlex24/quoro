@@ -57,6 +57,9 @@ pub struct Store {
     /// The `meta.demoted_by_term` record of the demotion, and its retry
     /// until it is recorded ([`Store::demote`]).
     demotion: Arc<DemotionRecord>,
+    /// What [`Store::stops_for_demotion`] stopped, by name: a loop's own stop
+    /// signal ([`Store::stopped_for_demotion`]).
+    stopped: Arc<watch::Sender<Vec<String>>>,
     /// Test seam: the next demotion waits here, after its `meta` write and
     /// before it sets the flag, with the gate held
     /// ([`Store::hold_next_demotion`]).
@@ -305,6 +308,7 @@ impl Store {
             head: Arc::new(watch::channel(head).0),
             demoted: Arc::new(watch::channel(false).0),
             demotion: Arc::new(DemotionRecord::default()),
+            stopped: Arc::new(watch::channel(Vec::new()).0),
             demotion_hold: Arc::new(std::sync::Mutex::new(None)),
         })
     }
@@ -421,9 +425,26 @@ impl Store {
     pub fn stops_for_demotion(&self, what: &str) -> bool {
         if self.is_demoted() {
             tracing::info!("{what} stops: this primary is demoted");
+            self.stopped.send_if_modified(|stopped| {
+                if stopped.iter().any(|name| name == what) {
+                    return false;
+                }
+                stopped.push(what.to_string());
+                true
+            });
             return true;
         }
         false
+    }
+
+    /// Waits until [`Store::stops_for_demotion`] stopped `what`: for a loop,
+    /// until its pass after the demotion saw the flag, so it sends and writes
+    /// nothing more.
+    pub async fn stopped_for_demotion(&self, what: &str) {
+        let mut stopped = self.stopped.subscribe();
+        let _ = stopped
+            .wait_for(|stopped| stopped.iter().any(|name| name == what))
+            .await;
     }
 
     /// `meta.demoted_by_term`, read through the pool: `None` when the key is
@@ -581,6 +602,29 @@ impl Store {
                 wait = wait.saturating_mul(2).min(DEMOTION_RETRY_MAX);
             }
         });
+    }
+
+    /// One last attempt at an unrecorded demotion, for a clean shutdown: the
+    /// retry task stops with the process. Does nothing when the primary is not
+    /// demoted or its demotion is recorded.
+    pub async fn record_demotion_before_exit(&self) {
+        if !self.is_demoted() {
+            return;
+        }
+        let _gate = Arc::clone(&self.writer).lock_owned().await;
+        if self.demotion.recorded.load(Ordering::SeqCst) {
+            return;
+        }
+        match self.record_demotion(None).await {
+            Ok(term) => tracing::info!(
+                demoted_by_term = term,
+                "meta.demoted_by_term is recorded at shutdown: a restart stays demoted"
+            ),
+            Err(error) => tracing::error!(
+                %error,
+                "cannot record meta.demoted_by_term at shutdown: a restart would not stay demoted"
+            ),
+        }
     }
 
     /// Test seam: the first wait of the retry of an unrecorded demotion,
