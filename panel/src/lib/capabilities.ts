@@ -23,6 +23,14 @@ const humanWriter = (me: MeResponse | undefined): boolean =>
  */
 export const canDecideApprovals = humanWriter;
 
+/**
+ * Change the voters: add or remove the `witness` role of an enrolled machine
+ * (`node:roles`) and create join tokens (`node:enroll`). Both are human-only,
+ * and an owner and an operator hold them (permission-model.md, sections 3 and
+ * 4.2).
+ */
+export const canChangeVoters = humanWriter;
+
 /** Create, change, disable or delete agents and their keys (`agent:write`). */
 export const canManageAgents = humanWriter;
 
