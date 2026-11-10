@@ -52,7 +52,7 @@ export function GrantCard({
   const status = grantStatusWords[grant.status];
 
   return (
-    <article className={cn('box gcard', grant.status !== 'active' && 'gcard-past')}>
+    <article className={cn('card gcard', grant.status !== 'active' && 'gcard-past')}>
       <div className="gcard-h">
         {showAgent ? (
           <span className="gcard-agent">

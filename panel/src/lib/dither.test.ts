@@ -8,6 +8,7 @@ import {
   avatarPair,
   avatarPairIndex,
   isLit,
+  meterMarkX,
   noise,
   rev3,
   rng,
@@ -172,5 +173,26 @@ describe('agent avatars', () => {
       expect(avatarCellAt(grid, 4, row)).toBe(avatarCellAt(grid, 0, row));
       expect(avatarCellAt(grid, 3, row)).toBe(avatarCellAt(grid, 1, row));
     }
+  });
+});
+
+describe('meterMarkX', () => {
+  it('puts the 2 px rule centred on the share', () => {
+    expect(meterMarkX(0.5, 200)).toBe(99);
+    expect(meterMarkX(0.25, 200)).toBe(49);
+  });
+
+  it('keeps the rule inside the bar at either end', () => {
+    expect(meterMarkX(0, 200)).toBe(0);
+    expect(meterMarkX(1, 200)).toBe(198);
+    expect(meterMarkX(1.4, 200)).toBe(198);
+    expect(meterMarkX(-0.2, 200)).toBe(0);
+  });
+
+  it('draws no mark without a share or a bar', () => {
+    expect(meterMarkX(null, 200)).toBeNull();
+    expect(meterMarkX(undefined, 200)).toBeNull();
+    expect(meterMarkX(Number.NaN, 200)).toBeNull();
+    expect(meterMarkX(0.5, 1)).toBeNull();
   });
 });

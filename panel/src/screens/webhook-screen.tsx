@@ -95,6 +95,7 @@ export function WebhookScreen({ webhookId }: { webhookId: string }) {
             {writer ? (
               <div className="flex flex-none items-center gap-1.5 max-md:ml-10">
                 <Button
+                  busy={actions.test.isPending}
                   size="sm"
                   disabled={actions.busy}
                   onClick={() => actions.test.mutate(webhook)}

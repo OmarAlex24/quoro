@@ -116,7 +116,7 @@ export function AgentCard({ agent, facts, selected }: { agent: Agent; facts: Age
     <Link
       to="/agents"
       search={{ agent: agent.id }}
-      className={cn('acard', selected && 'acard-on', agent.disabled && 'acard-off')}
+      className={cn('card card-lift acard', selected && 'acard-on', agent.disabled && 'acard-off')}
       aria-current={selected ? 'page' : undefined}
     >
       <span className="acard-h">

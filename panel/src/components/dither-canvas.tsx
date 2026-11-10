@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef } from 'react';
+import { useCallback, useLayoutEffect, useRef } from 'react';
 import { prepCanvas, type DitherSurface, type TokenReader } from '../lib/dither-draw';
 import { readToken, useResolvedTheme } from '../lib/use-theme';
 
@@ -21,21 +21,31 @@ export function DitherCanvas({
   className?: string;
 }) {
   const ref = useRef<HTMLCanvasElement | null>(null);
+  const painter = useRef(paint);
   const theme = useResolvedTheme();
 
+  const draw = useCallback(() => {
+    const canvas = ref.current;
+    if (!canvas) return;
+    const surface = prepCanvas(canvas);
+    if (surface) painter.current(surface, readToken);
+  }, []);
+
+  // A new painter (a new value, or each frame of a tween) is one draw, nothing more.
+  useLayoutEffect(() => {
+    painter.current = paint;
+    draw();
+  }, [paint, draw]);
+
+  // A canvas with no box yet (first paint, hidden tab) draws once it gets one;
+  // a theme change redraws with the new tokens.
   useLayoutEffect(() => {
     const canvas = ref.current;
     if (!canvas) return;
-    const draw = () => {
-      const surface = prepCanvas(canvas);
-      if (surface) paint(surface, readToken);
-    };
-    draw();
-    // A canvas with no box yet (first paint, hidden tab) draws once it gets one.
     const observer = new ResizeObserver(draw);
     observer.observe(canvas);
     return () => observer.disconnect();
-  }, [paint, theme]);
+  }, [theme, draw]);
 
   return label ? (
     <canvas ref={ref} role="img" aria-label={label} className={className} />

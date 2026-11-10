@@ -7,6 +7,7 @@ import {
   isLit,
   meterDensity,
   meterEdge,
+  meterMarkX,
   meterMix,
   noise,
   takesSecondTone,
@@ -376,22 +377,30 @@ export type MeterTone = 'accent' | 'shift' | 'fault';
  * its leading edge thinning out so the reading point shows. The fill runs from
  * the accent towards ion as it grows; a `fault` meter, one that is nearly
  * full, is drawn fill and track in the fault colour, so it reads without
- * reading the number.
+ * reading the number. An optional `mark` (0..1) draws a thin rule at what is
+ * in use right now, against the share reserved.
  */
 export function drawMeter(
   { ctx, w, h }: DitherSurface,
   share: number,
   read: TokenReader = readToken,
   tone: MeterTone = 'accent',
+  mark: number | null = null,
 ): void {
   const edge = meterEdge(share, w);
   const density = (x: number) => meterDensity(x, edge);
   if (tone !== 'accent') {
     // A state meter (amber while it waits on a person, red when nearly full) is one colour.
     dither(ctx, w, h, 2, read(tone === 'fault' ? '--fault' : '--shift'), density);
-    return;
+  } else {
+    dither2(ctx, w, h, 2, read('--accent'), read('--ion'), density, (x) => meterMix(x, edge));
   }
-  dither2(ctx, w, h, 2, read('--accent'), read('--ion'), density, (x) => meterMix(x, edge));
+  // The live-use mark: a 2 px rule in ink with a 1.5 px gap cleared on each side.
+  const x = meterMarkX(mark, w);
+  if (x === null) return;
+  ctx.clearRect(x - 1.5, 0, 5, h);
+  ctx.fillStyle = read('--ink');
+  ctx.fillRect(x, 0, 2, h);
 }
 
 /**

@@ -109,7 +109,7 @@ function ProjectsGrid() {
   return (
     <main className="mx-auto w-full max-w-6xl px-4 py-6 sm:px-6 sm:py-8">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <h1 className="type-display text-[24px] leading-none">Projects</h1>
+        <h1 className="type-title">Projects</h1>
         {newProject}
       </div>
 
@@ -129,7 +129,7 @@ function ProjectsGrid() {
 
       {pending ? (
         <div className="pgrid mt-5" aria-hidden="true">
-          <div className="ptile ptile-ghost" />
+          <div className="card ptile ptile-ghost" />
         </div>
       ) : tiles.length === 0 ? (
         listError ? null : (

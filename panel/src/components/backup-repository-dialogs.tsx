@@ -279,6 +279,7 @@ export function CreateRepositoryDialog({
                 Cancel
               </Button>
               <Button
+                busy={create.isPending}
                 variant="primary"
                 type="submit"
                 disabled={create.isPending || (!loading && !usable)}
@@ -378,7 +379,7 @@ export function RepositorySettingsDialog({
             <Button variant="default" type="button" disabled={save.isPending} onClick={close}>
               Cancel
             </Button>
-            <Button variant="primary" type="submit" disabled={save.isPending}>
+            <Button busy={save.isPending} variant="primary" type="submit" disabled={save.isPending}>
               {save.isPending ? 'Saving…' : 'Save settings'}
             </Button>
           </div>

@@ -339,6 +339,7 @@ function RunBox({
         </div>
         {buildLive && canWrite ? (
           <Button
+            busy={cancel.isPending}
             variant="danger"
             size="sm"
             disabled={cancel.isPending}
@@ -684,7 +685,7 @@ function DeployActions({
           {problem ? <ProblemBanner view={problem} /> : null}
           {blocked ? <p className="text-[12.5px] text-ink-2">{blocked}</p> : null}
           <div className="flex flex-wrap items-start gap-2">
-            <Button type="submit" variant="primary" disabled={busy || blocked !== null}>
+            <Button busy={busy} type="submit" variant="primary" disabled={busy || blocked !== null}>
               {busy ? 'Starting…' : source !== null ? 'Build now' : 'Deploy'}
             </Button>
             {source !== null ? (

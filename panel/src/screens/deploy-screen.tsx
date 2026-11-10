@@ -427,7 +427,7 @@ export function DeployScreen({
   if (!canWrite) {
     return (
       <main className="mx-auto w-full max-w-3xl px-4 py-6 sm:px-6 sm:py-8">
-        <h1 className="type-display text-[24px] leading-none">Deploy an app</h1>
+        <h1 className="type-title">Deploy an app</h1>
         <div className="mt-5 rounded-[10px] border border-line bg-surface px-4 py-8">
           <p className="text-[15px] text-ink">
             Your role can read apps but not deploy them.
@@ -480,7 +480,7 @@ export function DeployScreen({
       {sheet ? null : (
         <>
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <h1 className="type-display text-[24px] leading-none">Deploy an app</h1>
+            <h1 className="type-title">Deploy an app</h1>
             <Button variant="ghost" asChild>
               <Link to="/projects">Back to projects</Link>
             </Button>
@@ -880,6 +880,7 @@ export function DeployScreen({
                   </div>
                   <div className="mt-3 flex flex-wrap gap-2">
                     <Button
+                      busy={createProjectMutation.isPending}
                       variant="default"
                       disabled={
                         createProjectMutation.isPending ||
@@ -1134,7 +1135,7 @@ export function DeployScreen({
               </Link>
             </Button>
           ) : (
-            <Button variant="primary" type="submit" disabled={submitting}>
+            <Button busy={submitting} variant="primary" type="submit" disabled={submitting}>
               {submitting
                 ? sourceKind === 'git'
                   ? 'Starting the build…'

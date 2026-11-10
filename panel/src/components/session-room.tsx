@@ -142,7 +142,7 @@ export function SessionRoom({
             </p>
             <div className="mt-1.5 flex flex-wrap items-center gap-2.5">
               <ToneLamp tone={stateTone(view)} pulse={view?.phase === 'connecting'} label={status} />
-              <h1 className="type-display truncate text-[24px] leading-none">
+              <h1 className="type-title truncate">
                 {title}
               </h1>
             </div>
@@ -154,6 +154,7 @@ export function SessionRoom({
           {canConnect ? (
             redeployHint ? (
               <Button
+                busy={open.isPending}
                 variant="default"
                 size="sm"
                 disabled={open.isPending}
@@ -165,6 +166,7 @@ export function SessionRoom({
               <div className="flex flex-wrap items-center gap-2">
                 {ticket && live ? (
                   <Button
+                    busy={end.isPending}
                     variant="default"
                     disabled={end.isPending}
                     onClick={() => end.mutate(ticket.id)}
@@ -173,6 +175,7 @@ export function SessionRoom({
                   </Button>
                 ) : (
                   <Button
+                    busy={open.isPending}
                     variant="primary"
                     disabled={open.isPending}
                     onClick={() => open.mutate()}

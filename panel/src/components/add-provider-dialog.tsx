@@ -273,7 +273,7 @@ export function AddProviderDialog({
             <Button variant="default" type="button" disabled={add.isPending} onClick={close}>
               Cancel
             </Button>
-            <Button variant="primary" type="submit" disabled={add.isPending}>
+            <Button busy={add.isPending} variant="primary" type="submit" disabled={add.isPending}>
               {add.isPending ? 'Adding…' : 'Add provider'}
             </Button>
           </div>

@@ -135,6 +135,7 @@ export function RebuildWithRefreshedBase({
   return (
     <div className={cn('flex flex-col gap-1.5', className)}>
       <Button
+        busy={rebuild.isPending}
         variant={variant}
         disabled={disabled || rebuild.isPending}
         onClick={() => {

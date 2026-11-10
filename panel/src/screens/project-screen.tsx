@@ -168,7 +168,7 @@ function ProjectPage() {
 function ProjectMissing() {
   return (
     <main className="mx-auto w-full max-w-4xl px-4 py-6 sm:px-6 sm:py-8">
-      <h1 className="type-display text-[24px] leading-none">Project not found</h1>
+      <h1 className="type-title">Project not found</h1>
       <p className="mt-2 text-[14px] text-ink-2">
         No project with this id exists, or your session cannot see it.
       </p>
@@ -200,7 +200,7 @@ function PerApp({
 
   return (
     <main className="mx-auto w-full max-w-4xl px-4 py-6 sm:px-6 sm:py-8">
-      <h1 className="type-display text-[24px] leading-none">{title}</h1>
+      <h1 className="type-title">{title}</h1>
       <p className="mt-2 text-[14px] text-ink-2">{lede}</p>
       {listError ? <ProblemBanner view={listError} className="mt-4" /> : null}
       {appsQuery.isPending ? (
@@ -263,7 +263,7 @@ function ProjectSettings({ project }: { project: Project }) {
   ];
   return (
     <main className="mx-auto w-full max-w-4xl px-4 py-6 sm:px-6 sm:py-8">
-      <h1 className="type-display text-[24px] leading-none">Project settings</h1>
+      <h1 className="type-title">Project settings</h1>
       <dl className="mt-5 grid grid-cols-[minmax(0,110px)_minmax(0,1fr)] gap-x-4 gap-y-2.5 rounded-[10px] border border-line bg-surface px-4 py-4 text-[13.5px] sm:px-5">
         {rows.map(([label, value]) => (
           <div key={label} className="contents">

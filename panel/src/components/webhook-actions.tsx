@@ -138,7 +138,7 @@ export function DeleteWebhookDialog({
             <Button variant="default" disabled={busy} onClick={onKeep}>
               Keep the webhook
             </Button>
-            <Button variant="danger-solid" disabled={busy} onClick={() => onDelete(webhook)}>
+            <Button busy={busy} variant="danger-solid" disabled={busy} onClick={() => onDelete(webhook)}>
               {busy ? 'Deleting…' : 'Delete webhook'}
             </Button>
           </div>

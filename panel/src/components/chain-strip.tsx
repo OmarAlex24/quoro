@@ -170,7 +170,7 @@ export function ChainStrip({
                   onChange={(event) => setToText(event.target.value)}
                 />
               </Field>
-              <Button variant="default" type="submit" disabled={pending}>
+              <Button busy={pending} variant="default" type="submit" disabled={pending}>
                 {pending ? 'Checking…' : 'Check'}
               </Button>
             </div>
@@ -191,6 +191,7 @@ export function ChainStrip({
               <h3 className="min-w-0 flex-1">Off-site copy</h3>
               {copy && canProbe ? (
                 <Button
+                  busy={probe.isPending}
                   variant="default"
                   size="sm"
                   disabled={probe.isPending}

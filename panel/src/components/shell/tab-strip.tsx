@@ -28,7 +28,7 @@ export function TabbedPage({
           narrow ? 'max-w-4xl' : 'max-w-6xl',
         )}
       >
-        {title ? <h1 className="type-display mb-5 text-[24px] leading-none">{title}</h1> : null}
+        {title ? <h1 className="type-title mb-5">{title}</h1> : null}
         <nav className="tabs" aria-label={label}>
           {tabs}
         </nav>

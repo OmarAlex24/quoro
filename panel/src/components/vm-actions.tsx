@@ -134,7 +134,7 @@ export function DeleteVmDialog({
             <Button variant="default" onClick={onKeep}>
               Keep the VM
             </Button>
-            <Button variant="danger-solid" disabled={busy} onClick={() => onDelete(vm)}>
+            <Button busy={busy} variant="danger-solid" disabled={busy} onClick={() => onDelete(vm)}>
               {busy ? 'Deleting…' : 'Delete'}
             </Button>
           </div>

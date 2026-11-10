@@ -199,6 +199,8 @@ export function SetupScreen() {
         </Field>
 
         <Button
+
+          busy={setupMutation.isPending}
           type="submit"
           variant="primary"
           className="h-9 w-full"

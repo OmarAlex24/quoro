@@ -159,7 +159,7 @@ export function SecurityTab({ app, canWrite, onRebuilt }: { app: AppDetail; canW
       {loadProblem ? <ProblemBanner view={loadProblem} /> : null}
       {cursor !== null ? (
         <div>
-          <Button size="sm" disabled={loadMore.isPending} onClick={() => loadMore.mutate(cursor)}>
+          <Button busy={loadMore.isPending} size="sm" disabled={loadMore.isPending} onClick={() => loadMore.mutate(cursor)}>
             {loadMore.isPending ? 'Loading…' : 'Load more'}
           </Button>
         </div>

@@ -174,10 +174,10 @@ export function AuditScreen() {
       <div className="page-h">
         <h1>Activity</h1>
         <span className="flex-1" />
-        <Button variant="ghost" onClick={() => void auditQuery.refetch()} disabled={auditQuery.isFetching}>
+        <Button busy={auditQuery.isRefetching && !auditQuery.isFetchingNextPage} variant="ghost" onClick={() => void auditQuery.refetch()} disabled={auditQuery.isFetching}>
           {auditQuery.isFetching ? 'Refreshing…' : 'Refresh'}
         </Button>
-        <Button variant="default" onClick={() => runVerify({})} disabled={verify.isPending}>
+        <Button busy={verify.isPending} variant="default" onClick={() => runVerify({})} disabled={verify.isPending}>
           <Link2 size={15} strokeWidth={1.8} aria-hidden="true" />
           {verify.isPending ? 'Verifying…' : 'Verify the chain'}
         </Button>
@@ -258,6 +258,7 @@ export function AuditScreen() {
         <div className="mt-3 flex flex-wrap items-center gap-3 sm:pl-[34px]">
           {auditQuery.hasNextPage ? (
             <Button
+              busy={auditQuery.isFetchingNextPage}
               variant="default"
               onClick={() => void auditQuery.fetchNextPage()}
               disabled={auditQuery.isFetchingNextPage}

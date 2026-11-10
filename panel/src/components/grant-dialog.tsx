@@ -288,7 +288,7 @@ export function GrantDialog({
             <Button variant="default" onClick={() => onOpenChange(false)}>
               Cancel
             </Button>
-            <Button type="submit" variant="primary" disabled={issue.isPending}>
+            <Button busy={issue.isPending} type="submit" variant="primary" disabled={issue.isPending}>
               {issue.isPending ? 'Issuing…' : 'Issue grant'}
             </Button>
           </div>

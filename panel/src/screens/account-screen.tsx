@@ -267,7 +267,7 @@ export function AccountScreen() {
           </Field>
 
           <div>
-            <Button variant="primary" type="submit" disabled={change.isPending}>
+            <Button busy={change.isPending} variant="primary" type="submit" disabled={change.isPending}>
               {change.isPending ? 'Changing…' : 'Change password'}
             </Button>
           </div>

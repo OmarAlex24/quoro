@@ -424,7 +424,7 @@ export function IncidentRun({
               <Button variant="default" type="button" onClick={() => setResolveOpen(false)}>
                 Keep it open
               </Button>
-              <Button variant="primary" type="submit" disabled={resolve.isPending}>
+              <Button busy={resolve.isPending} variant="primary" type="submit" disabled={resolve.isPending}>
                 {resolve.isPending ? 'Resolving…' : 'Resolve incident'}
               </Button>
             </div>

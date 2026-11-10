@@ -199,7 +199,7 @@ function ReplaceSecretDialog({
               <Button variant="default" type="button" disabled={replace.isPending} onClick={close}>
                 Keep the current secret
               </Button>
-              <Button variant="primary" type="submit" disabled={replace.isPending}>
+              <Button busy={replace.isPending} variant="primary" type="submit" disabled={replace.isPending}>
                 {replace.isPending ? 'Replacing…' : 'Replace the secret'}
               </Button>
             </div>
@@ -396,6 +396,7 @@ export function ProvidersScreen() {
                   Keep the provider
                 </Button>
                 <Button
+                  busy={remove.isPending}
                   variant="danger-solid"
                   disabled={remove.isPending}
                   onClick={() => remove.mutate(deleting)}

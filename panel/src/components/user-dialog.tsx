@@ -248,7 +248,7 @@ export function InviteUserDialog({ onClose }: { onClose: () => void }) {
             <Button variant="default" onClick={close}>
               Cancel
             </Button>
-            <Button variant="primary" type="submit" disabled={create.isPending}>
+            <Button busy={create.isPending} variant="primary" type="submit" disabled={create.isPending}>
               {create.isPending ? 'Inviting…' : 'Invite user'}
             </Button>
           </div>
@@ -342,6 +342,7 @@ export function UserActionDialog({
               Cancel
             </Button>
             <Button
+              busy={save.isPending}
               variant={copy.danger ? 'danger' : 'primary'}
               onClick={() => {
                 setProblem(null);
@@ -460,7 +461,7 @@ export function ResetPasswordDialog({
               <Button variant="default" onClick={close}>
                 Cancel
               </Button>
-              <Button variant="primary" type="submit" disabled={save.isPending}>
+              <Button busy={save.isPending} variant="primary" type="submit" disabled={save.isPending}>
                 {save.isPending ? 'Saving…' : 'Reset password'}
               </Button>
             </div>

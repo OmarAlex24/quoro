@@ -109,6 +109,8 @@ export function LoginScreen() {
         </Field>
 
         <Button
+
+          busy={loginMutation.isPending}
           type="submit"
           variant="primary"
           className="h-9 w-full"

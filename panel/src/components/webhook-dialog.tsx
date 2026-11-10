@@ -403,7 +403,7 @@ export function WebhookDialog({
               <Button variant="default" onClick={() => close(false)}>
                 Cancel
               </Button>
-              <Button variant="primary" type="submit" disabled={pending}>
+              <Button busy={pending} variant="primary" type="submit" disabled={pending}>
                 {pending
                   ? 'Saving…'
                   : mode === 'edit'

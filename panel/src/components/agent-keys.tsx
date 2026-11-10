@@ -219,6 +219,7 @@ export function AgentKeys({
       {canWrite ? (
         <div className="mt-4 flex flex-wrap items-center gap-x-3 gap-y-2">
           <Button
+            busy={create.isPending}
             variant="primary"
             disabled={create.isPending}
             onClick={() => {
@@ -270,6 +271,7 @@ export function AgentKeys({
                 Keep key
               </Button>
               <Button
+                busy={revoke.isPending}
                 variant="danger-solid"
                 disabled={revoke.isPending}
                 onClick={() => {

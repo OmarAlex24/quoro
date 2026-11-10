@@ -9,14 +9,15 @@ const CORE_SHARE = 8 / 15;
 /**
  * The lamp itself: a core in the observed tone inside a ring in the desired
  * tone, in a square box of `size` px. Still when they agree, a slow pulse while
- * converging (not under `prefers-reduced-motion`). An unknown core is hollow.
+ * converging (not under `prefers-reduced-motion`). An unknown core is hollow;
+ * an idle one does not glow. A change of tone cross-fades (styles.css).
  * Without a label it is decoration and hidden from assistive technology.
  */
 export function LampDot({
   ring,
   core,
   pulse = false,
-  size = 15,
+  size = 12,
   label,
   className,
 }: {
@@ -43,7 +44,12 @@ export function LampDot({
     >
       <span
         aria-hidden="true"
-        className={cn('lamp', core === 'unknown' && 'lamp-hollow', pulse && 'lamp-pulse')}
+        className={cn(
+          'lamp',
+          core === 'unknown' && 'lamp-hollow',
+          core === 'idle' && 'lamp-still',
+          pulse && 'lamp-pulse',
+        )}
         style={dotStyle}
       />
     </span>

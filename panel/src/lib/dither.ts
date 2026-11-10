@@ -58,6 +58,15 @@ export const clamp = (v: number, lo = 0, hi = 1): number => Math.max(lo, Math.mi
 export const meterEdge = (share: number, width: number): number =>
   Number.isFinite(share) ? clamp(share) * width : 0;
 
+/**
+ * Where a meter's live-use mark sits: the left edge, in whole pixels, of a
+ * 2 px rule at `share` of `width`, kept inside the bar. Null without a share.
+ */
+export const meterMarkX = (share: number | null | undefined, width: number): number | null => {
+  if (share === null || share === undefined || !Number.isFinite(share) || width < 2) return null;
+  return Math.min(width - 2, Math.max(0, Math.round(clamp(share) * width) - 1));
+};
+
 /** The density at `x` of a meter whose reading point is at `edge`. */
 export const meterDensity = (x: number, edge: number): number => {
   const fade = Math.min(10, edge);
