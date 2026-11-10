@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useCallback, useMemo } from 'react';
-import type { App, Vm } from '../api/generated/model';
-import { bandAxisMax, bandFacts, gibOne, gibTotal, sumNodeSeries } from '../lib/board';
+import type { App, Node, Vm } from '../api/generated/model';
+import { bandAxisMax, bandFacts, bandReadout, gibOne, gibTotal, sumNodeSeries, worstStream } from '../lib/board';
 import { drawMetricArea, type DitherSurface, type TokenReader } from '../lib/dither-draw';
-import { areaPlot, BARE_PAD, seriesSummary, streamReadout, toSeries } from '../lib/metric-area';
+import { areaPlot, BARE_PAD, seriesSummary, toSeries } from '../lib/metric-area';
 import { formatPercent } from '../lib/metrics';
-import type { MetricsStreamStatus } from '../lib/use-metrics-stream';
 import { DitherCanvas } from './dither-canvas';
 import { LampDot } from './lamp';
 import { useLiveNodes } from './live-nodes';
@@ -15,25 +14,31 @@ const BAND_PAD = { ...BARE_PAD, right: 6 };
 const INTERVAL_MS = 5_000;
 const LOOK = { labels: false, dot: true, lineWidth: 1.5 } as const;
 
-/** The worst state among the streams: one that stopped beats one that retries beats one that opens. */
-const RANK: Record<MetricsStreamStatus, number> = { live: 0, connecting: 1, reconnecting: 2, unreachable: 3, error: 4 };
-
 /**
  * The cluster's load on top of the board: CPU busy now and over the last ten
  * minutes, summed from each node's own samples, behind the apps running, the
- * VMs and the memory in use. Each new sample redraws the area at once.
+ * VMs and the memory in use. Each new sample redraws the area at once. It says
+ * Live only while every listed node is in the sums, and how many are otherwise.
  */
-export function ClusterBand({ apps, vms }: { apps: readonly App[]; vms: readonly Vm[] }) {
+export function ClusterBand({
+  apps,
+  vms,
+  nodes,
+}: {
+  apps: readonly App[];
+  vms: readonly Vm[];
+  nodes: readonly Node[];
+}) {
   const feeds = useLiveNodes();
   const states = useMemo(() => Object.values(feeds), [feeds]);
   const samples = useMemo(() => sumNodeSeries(states.map((feed) => feed.samples)), [states]);
   const newest = samples[samples.length - 1];
   const facts = bandFacts(apps, vms);
-  const status = states.reduce<MetricsStreamStatus | null>(
-    (worst, feed) => (worst === null || RANK[feed.status] > RANK[worst] ? feed.status : worst),
-    null,
-  );
-  const readout = status ? streamReadout(status) : null;
+  const readout = bandReadout({
+    status: worstStream(states.map((feed) => feed.status)),
+    covered: newest?.nodes ?? 0,
+    listed: nodes.filter((node) => node.status !== 'removed').length,
+  });
 
   const series = useMemo(() => toSeries(samples, (sample) => sample.cpu_usage * 100), [samples]);
   const peak = series.values.reduce((top, value) => Math.max(top, value), 0);
@@ -93,7 +98,7 @@ export function ClusterBand({ apps, vms }: { apps: readonly App[]; vms: readonly
         {readout ? (
           <span className="band-live">
             <LampDot ring={readout.tone} core={readout.tone} pulse={readout.pulse} size={11} />
-            {status === 'live' ? 'Live' : readout.words}
+            {readout.words}
           </span>
         ) : null}
       </div>

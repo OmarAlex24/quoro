@@ -7,6 +7,7 @@ import {
   approvalProjectId,
   bandAxisMax,
   bandFacts,
+  bandReadout,
   gibOne,
   gibTotal,
   openFor,
@@ -15,6 +16,7 @@ import {
   sumNodeSeries,
   tileFoot,
   tileStatus,
+  worstStream,
 } from './board';
 
 const at = (seconds: number) => new Date(Date.UTC(2026, 10, 9, 12, 0, 0) + seconds * 1_000).toISOString();
@@ -49,24 +51,26 @@ describe('alignSeries', () => {
     expect(buckets[2]!.samples.map((sample) => sample.time)).toEqual([at(10), at(6)]);
   });
 
-  it('waits until every series has a sample before the first bucket', () => {
+  it('keeps the window of the others when a series starts late, as a restarted node does', () => {
     const buckets = alignSeries([
       [{ time: at(0) }, { time: at(5) }, { time: at(10) }],
       [{ time: at(10) }],
     ]);
-    expect(buckets.map((bucket) => bucket.time)).toEqual([Date.parse(at(10))]);
+    expect(buckets.map((bucket) => bucket.time)).toEqual([at(0), at(5), at(10)].map((time) => Date.parse(time)));
+    expect(buckets.map((bucket) => bucket.series)).toEqual([[0], [0], [0, 1]]);
   });
 
-  it('leaves out a series that stopped reporting, so the others keep going', () => {
+  it('keeps the past of a series that stopped reporting and leaves it out after', () => {
     const buckets = alignSeries([
       [{ time: at(0) }, { time: at(30) }, { time: at(35) }],
       [{ time: at(0) }],
     ]);
-    expect(buckets.map((bucket) => bucket.samples.length)).toEqual([1, 1, 1]);
+    expect(buckets.map((bucket) => bucket.series)).toEqual([[0, 1], [0], [0]]);
   });
 
   it('skips empty series and unreadable times', () => {
     expect(alignSeries([[], [{ time: 'not a time' }]])).toEqual([]);
+    expect(alignSeries([[], [{ time: at(0) }]])[0]!.series).toEqual([1]);
   });
 });
 
@@ -80,6 +84,16 @@ describe('sumNodeSeries', () => {
     expect(sample!.cpus).toBe(20);
     expect(sample!.memory_used_bytes).toBe(13 * GIB);
     expect(sample!.memory_total_bytes).toBe(32 * GIB);
+    expect(sample!.nodes).toBe(2);
+  });
+
+  it('says how many nodes each moment covers when one stops reporting', () => {
+    const samples = sumNodeSeries([
+      [node(0, 0.5, 4), node(5, 0.5, 4), node(30, 0.5, 4)],
+      [node(0, 0.1, 4), node(5, 0.1, 4)],
+    ]);
+    expect(samples.map((sample) => sample.nodes)).toEqual([2, 2, 1]);
+    expect(samples[2]!.memory_total_bytes).toBe(4 * GIB);
   });
 
   it('keeps the total steady when the nodes take turns reporting', () => {
@@ -117,6 +131,31 @@ describe('bandAxisMax', () => {
     expect(bandAxisMax(2)).toBe(20);
     expect(bandAxisMax(90)).toBe(100);
     expect(bandAxisMax(Number.NaN)).toBe(20);
+  });
+});
+
+describe('bandReadout', () => {
+  it('says Live only while every listed node is in the sums', () => {
+    expect(bandReadout({ status: 'live', covered: 3, listed: 3 })).toEqual({ tone: 'run', words: 'Live', pulse: false });
+    expect(bandReadout({ status: 'live', covered: 2, listed: 3 })).toEqual({ tone: 'shift', words: '2 of 3 nodes', pulse: false });
+  });
+
+  it('says no node reports when none is summed', () => {
+    expect(bandReadout({ status: null, covered: 0, listed: 2 })).toEqual({ tone: 'fault', words: '0 of 2 nodes', pulse: false });
+  });
+
+  it('says a stream opens or retries before counting nodes', () => {
+    expect(bandReadout({ status: 'connecting', covered: 0, listed: 3 })?.words).toBe('Connecting');
+    expect(bandReadout({ status: 'reconnecting', covered: 3, listed: 3 })?.words).toBe('Reconnecting');
+  });
+
+  it('says nothing for a cluster with no nodes', () => {
+    expect(bandReadout({ status: null, covered: 0, listed: 0 })).toBeNull();
+  });
+
+  it('takes the worst stream state', () => {
+    expect(worstStream(['live', 'reconnecting', 'connecting'])).toBe('reconnecting');
+    expect(worstStream([])).toBeNull();
   });
 });
 

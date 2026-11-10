@@ -243,7 +243,7 @@ function ProjectsBoard() {
 
         <div className="board">
           <div className="board-main">
-            <ClusterBand apps={apps} vms={vms} />
+            <ClusterBand apps={apps} vms={vms} nodes={nodes} />
             {loading ? (
               <SkeletonCards label="Loading projects" height={222} lines={4} count={2} className="ptiles-grid" />
             ) : tiles.length === 0 ? (

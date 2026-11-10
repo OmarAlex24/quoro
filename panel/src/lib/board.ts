@@ -14,7 +14,9 @@ import type {
 import { recordSentence, type RecordContext, type Segment } from './activity';
 import { BUILD_FAILED_PHASE_LABELS } from './build-status';
 import type { LampTone } from './lamp';
+import { streamReadout, type StreamReadout } from './metric-area';
 import { projectSummary, type ProjectSummaryInput } from './projects';
+import type { MetricsStreamStatus } from './use-metrics-stream';
 
 /*
  * The projects board as pure data: the cluster's load summed from each
@@ -33,53 +35,55 @@ export const SAMPLE_INTERVAL_MS = 5_000;
 export interface AlignedBucket<T> {
   /** The start of the bucket, in milliseconds. */
   time: number;
-  /** One sample per series, in the order the series were given. */
+  /** One sample per series that was reporting then, in the order the series were given. */
   samples: T[];
+  /** Which series those samples come from, as indexes into the series given. */
+  series: number[];
 }
 
 /**
  * Lines several series up on one clock. Samples fall into buckets of
- * `intervalMs`; a bucket is emitted only when every series has a sample in it
- * or in one of the `carry` buckets before it, so a sum never drops a node
- * that simply reported a moment later than the others. A series whose newest
- * sample is older than `carry` buckets behind the newest of all has stopped
- * reporting and is left out, so one silent node does not freeze the rest.
+ * `intervalMs`; each bucket holds the newest sample of every series that has
+ * one in it or in one of the `carry` buckets before it, so a sum never drops a
+ * node that simply reported a moment later than the others. A series that
+ * stopped reporting keeps its past and leaves the buckets after it; one that
+ * started late, such as a node that restarted, joins when it starts and never
+ * shortens the window of the others. `series` on each bucket says who is in.
  */
 export const alignSeries = <T extends { time: string }>(
   series: ReadonlyArray<readonly T[]>,
   intervalMs: number = SAMPLE_INTERVAL_MS,
   carry = 2,
 ): AlignedBucket<T>[] => {
-  const keyed = series
-    .map((samples) => {
-      const byBucket = new Map<number, T>();
-      for (const sample of samples) {
-        const time = Date.parse(sample.time);
-        if (!Number.isFinite(time)) continue;
-        const bucket = Math.floor(time / intervalMs);
-        const held = byBucket.get(bucket);
-        if (!held || Date.parse(held.time) <= time) byBucket.set(bucket, sample);
-      }
-      return byBucket;
-    })
-    .filter((byBucket) => byBucket.size > 0);
-  if (keyed.length === 0) return [];
+  const keyed = series.map((samples) => {
+    const byBucket = new Map<number, T>();
+    for (const sample of samples) {
+      const time = Date.parse(sample.time);
+      if (!Number.isFinite(time)) continue;
+      const bucket = Math.floor(time / intervalMs);
+      const held = byBucket.get(bucket);
+      if (!held || Date.parse(held.time) <= time) byBucket.set(bucket, sample);
+    }
+    return byBucket;
+  });
+  const buckets = [...new Set(keyed.flatMap((byBucket) => [...byBucket.keys()]))].sort((a, b) => a - b);
 
-  const newestOf = (byBucket: Map<number, T>) => Math.max(...byBucket.keys());
-  const newest = Math.max(...keyed.map(newestOf));
-  const active = keyed.filter((byBucket) => newest - newestOf(byBucket) <= carry);
-  const buckets = [...new Set(active.flatMap((byBucket) => [...byBucket.keys()]))].sort((a, b) => a - b);
-
-  const held: Array<{ bucket: number; sample: T } | undefined> = active.map(() => undefined);
+  const held: Array<{ bucket: number; sample: T } | undefined> = keyed.map(() => undefined);
   const out: AlignedBucket<T>[] = [];
   for (const bucket of buckets) {
-    active.forEach((byBucket, index) => {
+    keyed.forEach((byBucket, index) => {
       const sample = byBucket.get(bucket);
       if (sample) held[index] = { bucket, sample };
     });
-    if (held.every((entry) => entry !== undefined && bucket - entry.bucket <= carry)) {
-      out.push({ time: bucket * intervalMs, samples: held.map((entry) => entry!.sample) });
-    }
+    const samples: T[] = [];
+    const present: number[] = [];
+    held.forEach((entry, index) => {
+      if (entry !== undefined && bucket - entry.bucket <= carry) {
+        samples.push(entry.sample);
+        present.push(index);
+      }
+    });
+    out.push({ time: bucket * intervalMs, samples, series: present });
   }
   return out;
 };
@@ -93,9 +97,14 @@ export interface ClusterSample {
   cpus: number;
   memory_used_bytes: number;
   memory_total_bytes: number;
+  /** How many nodes reported at this moment; the sums cover only them. */
+  nodes: number;
 }
 
-/** The cluster's CPU and memory over the window, from each node's own samples. */
+/**
+ * The cluster's CPU and memory over the window, from each node's own samples.
+ * Each moment sums the nodes that reported then and says how many they were.
+ */
 export const sumNodeSeries = (series: ReadonlyArray<readonly NodeMetricSample[]>): ClusterSample[] =>
   alignSeries(series).map(({ time, samples }) => {
     let busy = 0;
@@ -114,6 +123,7 @@ export const sumNodeSeries = (series: ReadonlyArray<readonly NodeMetricSample[]>
       cpus,
       memory_used_bytes: used,
       memory_total_bytes: total,
+      nodes: samples.length,
     };
   });
 
@@ -133,6 +143,41 @@ export const appCpuSeries = (
     }
     return { time: new Date(time).toISOString(), cpu_usage: vcpus > 0 ? busy / vcpus : 0 };
   });
+
+/** The worst state among the streams: one that stopped beats one that retries beats one that opens. */
+const STREAM_RANK: Record<MetricsStreamStatus, number> = { live: 0, connecting: 1, reconnecting: 2, unreachable: 3, error: 4 };
+
+export const worstStream = (statuses: readonly MetricsStreamStatus[]): MetricsStreamStatus | null =>
+  statuses.reduce<MetricsStreamStatus | null>(
+    (worst, status) => (worst === null || STREAM_RANK[status] > STREAM_RANK[worst] ? status : worst),
+    null,
+  );
+
+/**
+ * What the cluster band says next to its numbers: "Live" only while every
+ * listed node is in the sums; otherwise how many of them are, so a part of
+ * the cluster never reads as all of it. A stream that is opening or retrying
+ * says so first.
+ */
+export const bandReadout = ({
+  status,
+  covered,
+  listed,
+}: {
+  /** The worst state among the node streams, or null when none is open. */
+  status: MetricsStreamStatus | null;
+  /** How many nodes the newest moment sums. */
+  covered: number;
+  /** How many nodes the cluster lists, removed ones aside. */
+  listed: number;
+}): StreamReadout | null => {
+  if (listed === 0) return null;
+  if (covered >= listed && status !== null) {
+    return status === 'live' ? { tone: 'run', words: 'Live', pulse: false } : streamReadout(status);
+  }
+  if (status === 'connecting' || status === 'reconnecting') return streamReadout(status);
+  return { tone: covered === 0 ? 'fault' : 'shift', words: `${covered} of ${listed} nodes`, pulse: false };
+};
 
 /**
  * The top of the cluster band's hidden axis, in percent: half again the
