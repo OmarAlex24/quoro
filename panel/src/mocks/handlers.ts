@@ -86,6 +86,7 @@ import {
   validationFailed,
   writeRefusal,
 } from './http';
+import { tickDeployCycle } from './agency';
 import { allocatedFrom, simulateLoss } from './capacity';
 import { agentsHandlers } from './handlers-agents';
 import { approvalsHandlers } from './handlers-approvals';
@@ -133,6 +134,12 @@ const appDetail = (app: App): AppDetail => ({
  * stay as the fallback for anything the panel does not drive.
  */
 export const handlers = [
+  // Before anything answers, the deploy cycle catches up with the clock. It
+  // returns nothing, so the request goes on to the handler that answers it.
+  http.all('*/api/v1/*', () => {
+    tickDeployCycle();
+  }),
+
   http.get('*/api/v1/health', () =>
     json({ status: 'ok' }),
   ),

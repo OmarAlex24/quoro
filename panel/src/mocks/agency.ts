@@ -23,7 +23,7 @@ import type {
   Webhook,
   WebhookDelivery,
 } from '../api/generated/model';
-import { db, mockId, now } from './db';
+import { advanceDeployCycle, db, findApp, findDeployment, mockId, now } from './db';
 
 // ---------------------------------------------------------------- SHA-256
 
@@ -294,6 +294,88 @@ export const tamperAudit = (seq: number): boolean => {
 /** Switch the signed-in owner's role, to see the panel as an operator or viewer. */
 export const setRole = (role: User['role']): void => {
   if (db.owner) db.owner.role = role;
+};
+
+// ---------------------------------------------------------------- the deploy cycle
+
+/** What of the deploy cycle is already in the audit log and the events, `<deployment id>:<what>`. */
+const recordedCycle = new Set<string>();
+
+/**
+ * Put the deploy cycle's deployments in the logs, oldest first, each once:
+ * the owner's redeploy call in the audit log with `deployment.started`, then
+ * `deployment.succeeded` or `deployment.failed` once it ends. The seed
+ * starts the cycle before an owner exists, so it is recorded from the
+ * moment the agency state is, and its redeploys become the owner's.
+ */
+const recordCycle = (human: User): void => {
+  for (const deploymentId of db.deployCycle?.deploymentIds ?? []) {
+    const deployment = findDeployment(deploymentId);
+    if (!deployment) continue;
+    const appId = deployment.app_id;
+    const projectId = findApp(appId)?.project_id;
+    const subject = { type: 'deployment', id: deployment.id };
+    const once = (what: string, write: () => void) => {
+      const key = `${deployment.id}:${what}`;
+      if (recordedCycle.has(key)) return;
+      recordedCycle.add(key);
+      write();
+    };
+
+    once('started', () => {
+      if (deployment.created_by_type === 'user') deployment.created_by_id = human.id;
+      appendAudit({
+        time: deployment.created_at,
+        operation: 'POST /api/v1/apps/{app_id}/redeploy',
+        scope: 'app:redeploy',
+        target_type: 'app',
+        target_id: appId,
+        project_id: projectId,
+        params: { app_id: appId },
+      });
+      emitEvent(
+        'deployment.started',
+        subject,
+        { deployment_id: deployment.id, app_id: appId, image: deployment.image, trigger: deployment.trigger },
+        { project_id: projectId ?? null, time: deployment.created_at, actor: { type: 'user', id: human.id } },
+      );
+    });
+    const ended = deployment.finished_at ?? deployment.created_at;
+    if (deployment.status === 'succeeded') {
+      once('succeeded', () =>
+        emitEvent(
+          'deployment.succeeded',
+          subject,
+          {
+            deployment_id: deployment.id,
+            app_id: appId,
+            ...(deployment.image_digest ? { image_digest: deployment.image_digest } : {}),
+          },
+          { project_id: projectId ?? null, time: ended, actor: { type: 'system', id: 'system' } },
+        ),
+      );
+    } else if (deployment.status === 'failed') {
+      once('failed', () =>
+        emitEvent(
+          'deployment.failed',
+          subject,
+          { deployment_id: deployment.id, app_id: appId, phase: deployment.phase ?? 'pull', error: deployment.error ?? '' },
+          { project_id: projectId ?? null, time: ended, actor: { type: 'system', id: 'system' } },
+        ),
+      );
+    }
+  }
+};
+
+/**
+ * Bring the deploy cycle up to `nowMs` and record what it did. Every mock
+ * request passes through here before its handler answers.
+ */
+export const tickDeployCycle = (nowMs: number = Date.now()): void => {
+  advanceDeployCycle(nowMs);
+  if (!db.owner) return;
+  agency();
+  recordCycle(db.owner);
 };
 
 // ---------------------------------------------------------------- seed
@@ -763,4 +845,7 @@ const seedAgency = (): void => {
     justification: pending.justification,
     grant_id: incidentGrant.id,
   });
+
+  // The deploy cycle mock mode keeps running, after everything above.
+  recordCycle(human);
 };

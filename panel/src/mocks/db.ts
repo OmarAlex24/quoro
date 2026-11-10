@@ -22,6 +22,7 @@ import type {
   Volume,
   WarmCopy,
 } from '../api/generated/model';
+import { isBuildLive } from '../lib/build-status';
 import { warmCopyAt } from './warm-clock';
 
 /** Crockford base32, the alphabet the contract allows after the id prefix. */
@@ -91,6 +92,21 @@ export interface MockDb {
    * answers `conflict`, as the server's `put_new` probe does.
    */
   repositoryObjects: string[];
+  /** The redeploy mock mode keeps in progress (`advanceDeployCycle`); null when none. */
+  deployCycle: DeployCycle | null;
+}
+
+/**
+ * A deploy that mock mode keeps in progress, so the deploying states show in
+ * demos: one redeploy of an app after another, each walking its phases over
+ * about two minutes, the next starting a few seconds after the last succeeded.
+ */
+export interface DeployCycle {
+  appId: string;
+  /** Every deployment the cycle started, oldest first. */
+  deploymentIds: string[];
+  /** True once something else took the app over: a newer deploy or build, a stop, a delete. */
+  stopped: boolean;
 }
 
 export const db: MockDb = {
@@ -145,6 +161,7 @@ export const db: MockDb = {
   auditExports: [],
   providers: [],
   repositoryObjects: [],
+  deployCycle: null,
 };
 
 /** Where a repository's config object sits: the provider's endpoint and bucket, and the prefix. */
@@ -474,6 +491,198 @@ export const runDeployment = (
   return deployment;
 };
 
+/** Who the seeded records name before setup creates the owner; setup hands them to the owner. */
+export const SEED_OWNER_ID = 'usr_01JC9Z6Q5W7X8Y9Z0A1B2C3D4E';
+
+/** Seconds a cycle's deployment stays `pending` before it pulls. */
+const CYCLE_QUEUE_S = 2;
+
+/**
+ * A cycle's phases: their status, how long each takes and what the
+ * deployment's log says when it begins. Slower than the seeded history's
+ * rollouts, so a demo can watch each phase: about two minutes in all.
+ */
+export const CYCLE_PHASES: ReadonlyArray<{
+  phase: NonNullable<Deployment['phase']>;
+  status: Deployment['status'];
+  seconds: number;
+  message: (image: string, port: number) => string;
+}> = [
+  { phase: 'pull', status: 'preparing', seconds: 18, message: (image) => `Pulling ${image}` },
+  { phase: 'rootfs', status: 'preparing', seconds: 28, message: () => 'Preparing the root filesystem' },
+  { phase: 'boot', status: 'starting', seconds: 42, message: () => 'Booting the microVM' },
+  {
+    phase: 'health',
+    status: 'starting',
+    seconds: 30,
+    message: (_image, port) => `Waiting for the health check on port ${port}`,
+  },
+];
+
+/** Seconds from a cycle's deployment being created to it succeeding. */
+export const CYCLE_SECONDS =
+  CYCLE_QUEUE_S + CYCLE_PHASES.reduce((total, step) => total + step.seconds, 0);
+
+/** Seconds between one cycle's success and the next redeploy. */
+export const CYCLE_GAP_S = 8;
+
+const isDeploymentLive = (status: Deployment['status']): boolean =>
+  status === 'pending' || status === 'preparing' || status === 'starting';
+
+const setIfChanged = <T extends object, K extends keyof T>(item: T, key: K, value: T[K]): boolean => {
+  if (item[key] === value) return false;
+  item[key] = value;
+  return true;
+};
+
+/**
+ * Write what a cycle's deployment, its app and the app's instances look like
+ * at `nowMs`, from the deployment's `created_at` alone: the same moment
+ * always gives the same records, and phases only move forward. The old
+ * instances keep serving while the image is pulled and the root filesystem
+ * prepared; they boot during `boot` and run from `health` on.
+ */
+const applyCycleAt = (deployment: Deployment, app: App, nowMs: number): void => {
+  const start = Date.parse(deployment.created_at);
+  const elapsed = (nowMs - start) / 1_000;
+  const at = (seconds: number): string => iso(start + seconds * 1_000);
+
+  let status: Deployment['status'] = 'pending';
+  let phase: Deployment['phase'] = null;
+  const logs: DeploymentLogEntry[] = [];
+  let clock = CYCLE_QUEUE_S;
+  for (const step of CYCLE_PHASES) {
+    if (elapsed < clock) break;
+    logs.push({ time: at(clock), phase: step.phase, message: step.message(deployment.image, app.port) });
+    status = step.status;
+    phase = step.phase;
+    clock += step.seconds;
+  }
+  const done = elapsed >= CYCLE_SECONDS;
+  if (done) {
+    logs.push({ time: at(CYCLE_SECONDS), phase: 'health', message: 'Health check passed; the app is running' });
+    status = 'succeeded';
+    // A redeploy runs the image the app already runs, so its digest is the current one's.
+    if (deployment.image_digest === null && app.current_deployment_id !== deployment.id) {
+      deployment.image_digest =
+        (app.current_deployment_id ? findDeployment(app.current_deployment_id)?.image_digest : null) ?? null;
+    }
+  }
+
+  deployment.status = status;
+  deployment.phase = phase;
+  deployment.finished_at = done ? at(CYCLE_SECONDS) : null;
+  if ((db.deploymentLogs[deployment.id]?.length ?? -1) !== logs.length) {
+    db.deploymentLogs[deployment.id] = logs;
+  }
+
+  const appChanged = [
+    setIfChanged(app, 'status', done ? 'running' : 'deploying'),
+    // The server makes it the app's current deployment in the write that marks it succeeded.
+    done ? setIfChanged(app, 'current_deployment_id', deployment.id) : false,
+  ].some(Boolean);
+  if (appChanged) app.updated_at = now();
+
+  const observed: Vm['observed_status'] = phase === 'boot' && !done ? 'starting' : 'running';
+  for (const vm of appInstances(app.id)) {
+    const booted = phase === 'boot' || phase === 'health';
+    const changed = [
+      setIfChanged(vm, 'observed_status', observed),
+      booted ? setIfChanged(vm, 'restart_generation', app.restart_generation) : false,
+      booted ? setIfChanged(vm, 'image', deployment.image) : false,
+    ].some(Boolean);
+    if (changed) vm.updated_at = now();
+  }
+};
+
+/** Start the cycle's next redeploy at `startMs`: `pending`, by the owner, of the image the app runs. */
+const startCycleDeployment = (cycle: DeployCycle, app: App, startMs: number): Deployment => {
+  const deployment: Deployment = {
+    id: mockId('dep'),
+    app_id: app.id,
+    image: app.image,
+    image_digest: null,
+    status: 'pending',
+    phase: null,
+    error: null,
+    trigger: 'redeploy',
+    created_by_type: 'user',
+    created_by_id: db.owner?.id ?? SEED_OWNER_ID,
+    created_at: iso(startMs),
+    finished_at: null,
+  };
+  db.deployments.push(deployment);
+  db.deploymentLogs[deployment.id] = [];
+  cycle.deploymentIds.push(deployment.id);
+  // A redeploy bumps the counter (openapi.yaml, `App.restart_generation`).
+  app.restart_generation += 1;
+  app.updated_at = iso(startMs);
+  applyCycleAt(deployment, app, startMs);
+  return deployment;
+};
+
+/**
+ * Bring the deploy cycle up to `nowMs`. The mock handlers call it before
+ * they answer, so every read sees the cycle where the clock says it is,
+ * without timers. Once the newest deployment succeeded and the gap passed,
+ * the next redeploy starts; after a long pause only the current one is
+ * started, never every one that was missed. The cycle lets go for good when
+ * someone else acts on the app: a deploy or build of theirs, a stop, a delete.
+ */
+export const advanceDeployCycle = (nowMs: number = Date.now()): void => {
+  const cycle = db.deployCycle;
+  if (!cycle || cycle.stopped) return;
+  // Two passes at most: finish the current deployment, then start the next.
+  for (let pass = 0; pass < 2; pass += 1) {
+    const app = findApp(cycle.appId);
+    const lastId = cycle.deploymentIds[cycle.deploymentIds.length - 1];
+    const deployment = lastId ? findDeployment(lastId) : undefined;
+    if (!app || !deployment || deployment.status === 'superseded' || deployment.status === 'failed') {
+      cycle.stopped = true;
+      return;
+    }
+    if (app.status === 'stopped') {
+      if (isDeploymentLive(deployment.status)) {
+        deployment.status = 'failed';
+        deployment.error = 'The app was stopped before the deployment finished.';
+        deployment.finished_at = iso(nowMs);
+      }
+      cycle.stopped = true;
+      return;
+    }
+
+    applyCycleAt(deployment, app, nowMs);
+    if (deployment.status !== 'succeeded') return;
+
+    const nextAt = Date.parse(deployment.created_at) + (CYCLE_SECONDS + CYCLE_GAP_S) * 1_000;
+    if (nowMs < nextAt) return;
+    const newest = newestFirst(db.deployments.filter((item) => item.app_id === app.id))[0];
+    const building = db.builds.some((build) => build.app_id === app.id && isBuildLive(build.status));
+    if (newest?.id !== deployment.id || building) {
+      cycle.stopped = true;
+      return;
+    }
+    const periodMs = (CYCLE_SECONDS + CYCLE_GAP_S) * 1_000;
+    const startMs = nowMs - nextAt >= periodMs ? nowMs - ((nowMs - nextAt) % periodMs) : nextAt;
+    startCycleDeployment(cycle, app, startMs);
+  }
+};
+
+/**
+ * Atlas's web, mid-redeploy: the cycle's first deployment started 14 s
+ * before the seed, so the panel opens on it pulling. Seeded last, so every id
+ * seeded before keeps its value.
+ */
+const seedDeployCycle = (seededAt: number): void => {
+  const atlas = db.projects.find((project) => project.slug === 'atlas');
+  const web = db.apps.find((app) => app.project_id === atlas?.id && app.name === 'web');
+  if (!web) return;
+  const cycle: DeployCycle = { appId: web.id, deploymentIds: [], stopped: false };
+  db.deployCycle = cycle;
+  startCycleDeployment(cycle, web, seededAt - 14_000);
+  advanceDeployCycle(seededAt);
+};
+
 /** One project, one running app and its deployment, domain and variables. */
 const seed = (): void => {
   const createdAt = now();
@@ -540,9 +749,11 @@ const seed = (): void => {
     health_check: { path: '/', interval_s: 10, timeout_s: 2, failures: 3 },
     resources: { vcpus: 1, memory_mb: 512, disk_gb: 2 },
     placement: { node_ids: [db.node.id, replicaNode.id] },
-    status: 'running',
+    // Down, as its open incident says ("blog is down"): no instance is left in
+    // the edge's rotation, and the restart 12 minutes ago did not bring it back.
+    status: 'down',
     current_deployment_id: deploymentId,
-    restart_generation: 0,
+    restart_generation: 1,
     created_at: createdAt,
     updated_at: createdAt,
   };
@@ -581,11 +792,12 @@ const seed = (): void => {
     disk_gb: 2,
     image: app.image,
     desired_status: 'running',
-    observed_status: 'running',
+    // Restarted with the app, then its process exited again.
+    observed_status: 'crashed',
     ip: '10.0.0.21',
-    restart_generation: 0,
-    restart_count: 0,
-    last_exit_code: null,
+    restart_generation: 1,
+    restart_count: 1,
+    last_exit_code: 1,
     created_at: createdAt,
     updated_at: createdAt,
   });
@@ -601,31 +813,34 @@ const seed = (): void => {
     disk_gb: 2,
     image: app.image,
     desired_status: 'running',
+    // Its VM runs, but its health check times out, so the edge keeps it out.
     observed_status: 'running',
     ip: '10.0.0.31',
-    restart_generation: 0,
-    restart_count: 0,
+    restart_generation: 1,
+    restart_count: 1,
     last_exit_code: null,
     created_at: createdAt,
     updated_at: createdAt,
   });
 
+  // blog-2 left the rotation first (degraded), then blog-1 (down, the
+  // `app.down` that opened the incident 15 minutes ago).
   db.edgeBackends[appId] = [
     {
       edge_node_id: replicaNode.id,
       vm_id: instanceId,
       node_id: db.node.id,
-      in_rotation: true,
-      since: createdAt,
-      reason: null,
-      last_error: null,
+      in_rotation: false,
+      since: hoursAgo(15 / 60),
+      reason: 'health_check',
+      last_error: 'GET http://10.0.0.21:80/: request canceled after 2s',
     },
     {
       edge_node_id: replicaNode.id,
       vm_id: replicaInstanceId,
       node_id: replicaNode.id,
       in_rotation: false,
-      since: createdAt,
+      since: hoursAgo(19 / 60),
       reason: 'health_check',
       last_error: 'GET http://10.0.0.31:80/: request canceled after 2s',
     },
@@ -675,7 +890,7 @@ const seed = (): void => {
     recovery_key_rotated_at: null,
     repository_key_present: true,
     control_plane_schedule: { interval_h: 6, keep: 7 },
-    created_by: 'usr_01JC9Z6Q5W7X8Y9Z0A1B2C3D4E',
+    created_by: SEED_OWNER_ID,
     created_at: createdAt,
   };
   db.backupRepositories.push(repository);
@@ -764,6 +979,7 @@ const seed = (): void => {
   seedEdge(createdAt);
   seedWarm(createdAt);
   applyRepositoryStart();
+  seedDeployCycle(Date.parse(createdAt));
 };
 
 /**
@@ -1746,7 +1962,7 @@ const seedWarm = (createdAt: string): void => {
 const seedSettings = (): void => {
   const hoursAgo = (hours: number): string =>
     new Date(Date.now() - hours * 3_600_000).toISOString();
-  const createdBy = db.backupRepositories[0]?.created_by ?? 'usr_01JC9Z6Q5W7X8Y9Z0A1B2C3D4E';
+  const createdBy = db.backupRepositories[0]?.created_by ?? SEED_OWNER_ID;
   const repository = db.backupRepositories[0];
   const auditExport = db.auditExports[0];
 
