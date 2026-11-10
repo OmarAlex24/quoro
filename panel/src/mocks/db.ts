@@ -20,7 +20,9 @@ import type {
   User,
   Vm,
   Volume,
+  WarmCopy,
 } from '../api/generated/model';
+import { warmCopyAt } from './warm-clock';
 
 /** Crockford base32, the alphabet the contract allows after the id prefix. */
 const ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
@@ -107,7 +109,9 @@ export const db: MockDb = {
     address: '10.0.0.3',
     behind_nat: false,
     labels: { room: 'lab', rack: 'r1' },
-    capacity: { cpus: 12, memory_mb: 24_576, disk_gb: 200 },
+    // 16 CPUs: the Harbor project's warm apps run here too, and lab-3 is
+    // not overcommitted.
+    capacity: { cpus: 16, memory_mb: 24_576, disk_gb: 200 },
     // The nodes handler reports what the VMs placed here add up to.
     allocated: { cpus: 0, memory_mb: 0, disk_gb: 0 },
     kvm: { available: true, kernel: '6.12.0-lab', nested: false },
@@ -201,6 +205,20 @@ export const converge = (
 export const findApp = (appId: string): App | undefined =>
   db.apps.find((candidate) => candidate.id === appId);
 
+/** When each seeded warm copy's progress was measured, by app id (`warmCopyAt`). */
+const warmMeasuredAt = new Map<string, number>();
+
+/**
+ * An app as a read answers it at `now`: its warm copy's progress moved on
+ * with the clock, as the primary would report it (`warmCopyAt`, a
+ * simulation). The stored app is left as seeded.
+ */
+export const appAt = <T extends App>(app: T, now: number = Date.now()): T => {
+  const measuredAt = warmMeasuredAt.get(app.id);
+  if (app.warm === null || app.warm === undefined || measuredAt === undefined) return app;
+  return { ...app, warm: warmCopyAt(app.warm, measuredAt, now) };
+};
+
 export const findDeployment = (deploymentId: string): Deployment | undefined =>
   db.deployments.find((candidate) => candidate.id === deploymentId);
 
@@ -262,8 +280,8 @@ export const mockHaCost = (app: App): AppHaCost => {
     restore_estimate_s: volume === undefined ? null : coldRestore,
     pause_estimate_ms: coldPause,
   };
-  const warm: HaPolicyCost = {
-    policy: 'warm',
+  const hot: HaPolicyCost = {
+    policy: 'hot',
     available: false,
     unavailable_reason: 'not_in_this_release',
     reserved: {
@@ -275,7 +293,22 @@ export const mockHaCost = (app: App): AppHaCost => {
     restore_estimate_s: null,
     pause_estimate_ms: null,
   };
-  const hot: HaPolicyCost = { ...warm, policy: 'hot' };
+  // The mock's `updateApp` refuses `warm`, so only the seeded warm apps price
+  // it as the M5b primary does: disk only on the warm node, the copy's bytes,
+  // the 10 s start estimate before one was observed, and no pause (reflink).
+  // With no eligible node it is `no_warm_node`.
+  const warm: HaPolicyCost =
+    app.warm === null || app.warm === undefined
+      ? { ...hot, policy: 'warm' }
+      : {
+          policy: 'warm',
+          available: app.warm.node_id !== null,
+          unavailable_reason: app.warm.node_id === null ? 'no_warm_node' : null,
+          reserved: { vcpus: 0, memory_mb: 0, disk_gb: app.resources.disk_gb + (volume?.size_gb ?? 0) },
+          storage_bytes: volume?.allocated_bytes ?? null,
+          restore_estimate_s: app.warm.node_id === null ? null : 10,
+          pause_estimate_ms: 0,
+        };
 
   return {
     snapshot_method: volume === undefined ? null : 'reflink',
@@ -473,7 +506,9 @@ const seed = (): void => {
     address: '10.0.0.4',
     behind_nat: false,
     labels: { room: 'lab', rack: 'r2' },
-    capacity: { cpus: 8, memory_mb: 8_192, disk_gb: 60 },
+    // 12 CPUs: losing lab-3 still fits, the Harbor apps with a complete
+    // warm copy included (their copies are here).
+    capacity: { cpus: 12, memory_mb: 8_192, disk_gb: 60 },
     allocated: { cpus: 0, memory_mb: 0, disk_gb: 0 },
     kvm: { available: true, kernel: '6.12.0-lab', nested: false },
     engine_version: '0.1.0',
@@ -497,6 +532,7 @@ const seed = (): void => {
     name: 'blog',
     stateful: true,
     ha_policy: 'none',
+    warm: null,
     backup_schedule: { interval_h: 24, keep: 7 },
     replicas: 2,
     image: 'docker.io/library/nginx:alpine',
@@ -726,6 +762,7 @@ const seed = (): void => {
   seedAtlas(createdAt, repository.id);
   seedSettings();
   seedEdge(createdAt);
+  seedWarm(createdAt);
   applyRepositoryStart();
 };
 
@@ -1021,6 +1058,7 @@ const seedGitApp = (createdAt: string): void => {
     name: 'docs-site',
     stateful: false,
     ha_policy: 'none',
+    warm: null,
     backup_schedule: { interval_h: 24, keep: 7 },
     replicas: 1,
     image: builtImage,
@@ -1227,6 +1265,7 @@ const seedAtlas = (createdAt: string, repositoryId: string): void => {
       name: input.name,
       stateful: input.stateful ?? false,
       ha_policy: input.cold ? 'cold' : 'none',
+      warm: null,
       backup_schedule: { interval_h: 6, keep: 7 },
       replicas,
       image: input.image,
@@ -1463,6 +1502,238 @@ const seedAtlas = (createdAt: string, repositoryId: string): void => {
     last_exit_code: null,
     created_at: createdAt,
     updated_at: createdAt,
+  });
+};
+
+/**
+ * Harbor: one `warm` app in each state the Storage tab and the canvas card
+ * show (openapi.yaml `WarmCopy`), in a project of its own so Atlas, the
+ * canvas reference, stays as it is. Each app is stateful with a ready volume
+ * on lab-3 and, but for one, its warm copy on lab-4. The progress and the
+ * errors are what the primary answers (`warm.rs`, `derive`): a copy with no
+ * snapshot has no shipped time and no lag, a failed copy keeps the progress
+ * the nodes last reported, and the extent count is the source's, with or
+ * without a copy. Seeded last, so every id seeded before keeps its value.
+ */
+const seedWarm = (createdAt: string): void => {
+  const seededAt = Date.parse(createdAt);
+  const secondsAgo = (seconds: number): string => iso(seededAt - seconds * 1_000);
+  const lab3 = db.node.id;
+  const lab4 = db.extraNodes.find((node) => node.name === 'lab-4')?.id ?? db.node.id;
+  const project: Project = {
+    id: mockId('prj'),
+    slug: 'harbor',
+    name: 'Harbor',
+    created_at: createdAt,
+    updated_at: createdAt,
+  };
+  db.projects.push(project);
+
+  const addWarmApp = (input: {
+    name: string;
+    image: string;
+    port: number;
+    sizeGb: number;
+    allocatedGib: number;
+    mountPath: string;
+    warm: (volumeId: string) => WarmCopy;
+  }): App => {
+    const appId = mockId('app');
+    const volumeId = mockId('vol');
+    const resources = { vcpus: 1, memory_mb: 512, disk_gb: 2 };
+    const app: App = {
+      id: appId,
+      project_id: project.id,
+      name: input.name,
+      stateful: true,
+      ha_policy: 'warm',
+      warm: input.warm(volumeId),
+      backup_schedule: { interval_h: 24, keep: 7 },
+      replicas: 1,
+      image: input.image,
+      port: input.port,
+      health_check: { path: '/', interval_s: 10, timeout_s: 2, failures: 3 },
+      resources,
+      placement: { node_ids: [lab3] },
+      status: 'running',
+      current_deployment_id: null,
+      restart_generation: 0,
+      created_at: createdAt,
+      updated_at: createdAt,
+    };
+    db.apps.push(app);
+    warmMeasuredAt.set(appId, seededAt);
+    seedRuns(app, [{ ago: 7_200, deploy: [4, 8, 12, 6] }], seededAt);
+    db.volumes.push({
+      id: volumeId,
+      app_id: appId,
+      node_id: lab3,
+      size_gb: input.sizeGb,
+      mount_path: input.mountPath,
+      state: 'ready',
+      allocated_bytes: Math.round(input.allocatedGib * GIB),
+      restored_from_backup_id: null,
+      error: null,
+      quarantines: [],
+      created_at: createdAt,
+      updated_at: createdAt,
+    });
+    db.vms.push({
+      id: mockId('vm'),
+      project_id: project.id,
+      app_id: appId,
+      node_id: lab3,
+      name: `${input.name}-1`,
+      ...resources,
+      image: app.image,
+      desired_status: 'running',
+      observed_status: 'running',
+      ip: `10.0.1.${db.vms.length + 10}`,
+      restart_generation: 0,
+      restart_count: 0,
+      last_exit_code: null,
+      created_at: createdAt,
+      updated_at: createdAt,
+    });
+    db.appEnv[appId] = [];
+    return app;
+  };
+
+  const postgres = 'docker.io/library/postgres:17';
+
+  // A first full copy to lab-4: no snapshot is complete there yet, but the
+  // source already reported its newest snapshot's extents.
+  addWarmApp({
+    name: 'inventory',
+    image: postgres,
+    port: 5432,
+    sizeGb: 40,
+    allocatedGib: 11.6,
+    mountPath: '/var/lib/postgresql',
+    warm: () => ({
+      node_id: lab4,
+      node_pinned: false,
+      interval_s: 30,
+      state: 'syncing',
+      last_snapshot_seq: null,
+      last_shipped_at: null,
+      lag_s: null,
+      extent_count: 640,
+      error: null,
+    }),
+  });
+
+  // In sync: the copy is at most twice the interval behind.
+  addWarmApp({
+    name: 'orders',
+    image: postgres,
+    port: 5432,
+    sizeGb: 20,
+    allocatedGib: 4.8,
+    mountPath: '/var/lib/postgresql',
+    warm: () => ({
+      node_id: lab4,
+      node_pinned: true,
+      interval_s: 30,
+      state: 'in_sync',
+      last_snapshot_seq: 4182,
+      last_shipped_at: secondsAgo(7),
+      lag_s: 12,
+      extent_count: 312,
+      error: null,
+    }),
+  });
+
+  // Lagging: a fragmented volume ships slowly, and the lag is far above
+  // twice the 60 s interval.
+  addWarmApp({
+    name: 'analytics',
+    image: 'docker.io/clickhouse/clickhouse-server:24.8',
+    port: 8123,
+    sizeGb: 120,
+    allocatedGib: 63,
+    mountPath: '/var/lib/clickhouse',
+    warm: () => ({
+      node_id: lab4,
+      node_pinned: false,
+      interval_s: 60,
+      state: 'lagging',
+      last_snapshot_seq: 977,
+      last_shipped_at: secondsAgo(381),
+      lag_s: 412,
+      extent_count: 18_940,
+      error: null,
+    }),
+  });
+
+  // Failed on the warm node's own error, over several lines, after copies
+  // that went through: the progress the nodes last reported stays.
+  addWarmApp({
+    name: 'media',
+    image: 'docker.io/minio/minio:latest',
+    port: 9000,
+    sizeGb: 200,
+    allocatedGib: 148,
+    mountPath: '/data',
+    warm: (volumeId) => ({
+      node_id: lab4,
+      node_pinned: false,
+      interval_s: 5,
+      state: 'failed',
+      last_snapshot_seq: 2210,
+      last_shipped_at: secondsAgo(1_836),
+      lag_s: 1_840,
+      extent_count: 2_048,
+      error: [
+        'warm node: receiving snapshot 2211 failed: no space left on device (os error 28)',
+        `while writing warm/${volumeId}/snapshots/2211.partial`,
+        'the copy resumes from snapshot 2210 once the disk has room',
+      ].join('\n'),
+    }),
+  });
+
+  // Failed with no warm node, in the primary's words. The mock does not
+  // model why no node is eligible; its `ha_cost` says `no_warm_node`.
+  addWarmApp({
+    name: 'search',
+    image: 'docker.io/getmeili/meilisearch:v1.11',
+    port: 7700,
+    sizeGb: 30,
+    allocatedGib: 6.2,
+    mountPath: '/meili_data',
+    warm: () => ({
+      node_id: null,
+      node_pinned: false,
+      interval_s: 30,
+      state: 'failed',
+      last_snapshot_seq: null,
+      last_shipped_at: null,
+      lag_s: null,
+      extent_count: null,
+      error: 'no node is eligible as the warm node',
+    }),
+  });
+
+  // After a primary restart, before either node reports again: every
+  // progress field is null and, with both nodes connected, it is syncing.
+  addWarmApp({
+    name: 'billing',
+    image: postgres,
+    port: 5432,
+    sizeGb: 20,
+    allocatedGib: 2.4,
+    mountPath: '/var/lib/postgresql',
+    warm: () => ({
+      node_id: lab4,
+      node_pinned: false,
+      interval_s: 30,
+      state: 'syncing',
+      last_snapshot_seq: null,
+      last_shipped_at: null,
+      lag_s: null,
+      extent_count: null,
+      error: null,
+    }),
   });
 };
 

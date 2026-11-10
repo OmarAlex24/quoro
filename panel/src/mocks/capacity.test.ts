@@ -32,14 +32,28 @@ describe('the mock N+1 answer', () => {
     expect(lab3.allocated.memory_mb).toBeGreaterThan(0);
   });
 
-  it('losing lab-3 fits: the apps with another replica keep running, the rest move to lab-4', () => {
+  it('losing lab-3 fits: replicas keep running, five apps move to lab-4 and three have no complete warm copy', () => {
     const answer = lose('lab-3');
     const lab4 = db.extraNodes[0]!.id;
     expect(answer.fits).toBe(true);
     expect(answer.missing).toEqual({ cpus: 0, memory_mb: 0, disk_gb: 0 });
-    const moved = answer.apps.filter((app) => app.action !== 'keep');
-    expect(moved.map((app) => nameOf(app.app_id)).sort()).toEqual(['blog', 'docs-site']);
+    const moved = answer.apps.filter((app) => app.action !== 'keep' && app.reason === null);
+    expect(moved.map((app) => nameOf(app.app_id)).sort()).toEqual([
+      'analytics',
+      'blog',
+      'docs-site',
+      'media',
+      'orders',
+    ]);
     expect(moved.every((app) => app.node_id === lab4)).toBe(true);
+    // The Harbor warm apps whose copy is complete fail over to it on lab-4.
+    expect(
+      moved.filter((app) => app.action === 'failover').map((app) => nameOf(app.app_id)).sort(),
+    ).toEqual(['analytics', 'media', 'orders']);
+    // The ones with no complete copy yet have nowhere to start.
+    const stuck = answer.apps.filter((app) => app.reason === 'no_warm_copy');
+    expect(stuck.map((app) => nameOf(app.app_id)).sort()).toEqual(['billing', 'inventory', 'search']);
+    expect(stuck.every((app) => app.action === 'failover' && app.node_id === null)).toBe(true);
     expect(answer.apps.filter((app) => app.action === 'keep').map((app) => nameOf(app.app_id)).sort()).toEqual([
       'api',
       'web',

@@ -14,6 +14,8 @@ import {
   servingWords,
   stationTone,
   tlsWords,
+  warmListInterval,
+  warmReadInterval,
 } from './app-status';
 
 describe('appLampState', () => {
@@ -50,6 +52,48 @@ describe('appsPollingInterval', () => {
       10_000,
     );
     expect(appsPollingInterval([])).toBe(10_000);
+  });
+});
+
+describe('warmReadInterval', () => {
+  const warm = (interval_s: number): Pick<App, 'warm'> => ({
+    warm: {
+      node_id: null,
+      node_pinned: false,
+      interval_s,
+      state: 'failed',
+      last_snapshot_seq: null,
+      last_shipped_at: null,
+      lag_s: null,
+      extent_count: null,
+      error: 'no node is eligible as the warm node',
+    },
+  });
+
+  it('keeps the base for an app without a warm copy', () => {
+    expect(warmReadInterval(10_000, { warm: null })).toBe(10_000);
+    expect(warmReadInterval(10_000, {})).toBe(10_000);
+    expect(warmReadInterval(10_000, undefined)).toBe(10_000);
+  });
+
+  it('reads a warm app at its snapshot interval when that is sooner than the base', () => {
+    expect(warmReadInterval(10_000, warm(8))).toBe(8_000);
+    expect(warmReadInterval(60_000, warm(30))).toBe(30_000);
+  });
+
+  it('never reads more often than every 5 s for the copy', () => {
+    expect(warmReadInterval(10_000, warm(5))).toBe(5_000);
+    expect(warmReadInterval(10_000, warm(1))).toBe(5_000);
+  });
+
+  it('keeps a faster base, such as the 2 s poll while deploying', () => {
+    expect(warmReadInterval(2_000, warm(5))).toBe(2_000);
+    expect(warmReadInterval(10_000, warm(30))).toBe(10_000);
+  });
+
+  it('takes the fastest app of a list', () => {
+    expect(warmListInterval(10_000, [{ warm: null }, warm(30), warm(6)])).toBe(6_000);
+    expect(warmListInterval(10_000, [])).toBe(10_000);
   });
 });
 

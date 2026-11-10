@@ -14,7 +14,7 @@ import { useGetApp, useListApps } from '../api/generated/apps/apps';
 import type { Project } from '../api/generated/model';
 import { useListNodes } from '../api/generated/nodes/nodes';
 import { useListVms } from '../api/generated/vms/vms';
-import { appsPollingInterval, serviceLampState, withOpenApp } from '../lib/app-status';
+import { appsPollingInterval, serviceLampState, warmListInterval, withOpenApp } from '../lib/app-status';
 import { appFailed, chooseAuras, vmFailed, waitsOnApproval } from '../lib/canvas-aura';
 import {
   autoLayout,
@@ -97,11 +97,17 @@ export function ProjectCanvas({
     { project_id: projectId, ...SERVICE_LIST_PARAMS },
     {
       query: {
+        // A warm app's copy moves every `interval_s`, so the list is read at
+        // least that often (never under 5 s). `refetchIntervalInBackground`
+        // stays unset (false): nothing is read while the browser tab is hidden.
         refetchInterval: (query) => {
           const items = query.state.data?.items ?? [];
-          return appsPollingInterval(
+          return warmListInterval(
+            appsPollingInterval(
+              items,
+              items.some((app) => app.source != null && cachedBuildLive(queryClient, app.id)),
+            ),
             items,
-            items.some((app) => app.source != null && cachedBuildLive(queryClient, app.id)),
           );
         },
       },

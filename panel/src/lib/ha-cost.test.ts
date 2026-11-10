@@ -81,6 +81,7 @@ describe('unavailableReasonWords', () => {
     expect(unavailableReasonWords('stateless')).toBe('needs a volume');
     expect(unavailableReasonWords('no_repository')).toBe('needs a backup repository');
     expect(unavailableReasonWords('not_in_this_release')).toBe('not in this release');
+    expect(unavailableReasonWords('no_warm_node')).toBe('needs another eligible node');
     expect(unavailableReasonWords(null)).toBeNull();
     expect(unavailableReasonWords(undefined)).toBeNull();
   });
