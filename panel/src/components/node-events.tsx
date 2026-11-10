@@ -3,9 +3,9 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link } from '@tanstack/react-router';
 import { useRef } from 'react';
 import { listEvents } from '../api/generated/events/events';
-import type { Event, Node } from '../api/generated/model';
+import type { Node } from '../api/generated/model';
 import { relativeTime } from '../lib/app-status';
-import { mergeEvents, NODE_EVENT_ROWS, NODE_EVENT_TYPES, nodeEventRow } from '../lib/nodes-page';
+import { NODE_EVENT_TYPES, nodeEventRow, readNodeEvents, type NodeEventsRead } from '../lib/nodes-page';
 import { problemView } from '../lib/problem';
 import { useNow } from '../lib/use-now';
 import { cn } from '../lib/utils';
@@ -16,13 +16,12 @@ import { SkelBar, Skeleton } from './skeleton';
 import { ProblemBanner } from './ui/problem-banner';
 
 const QUERY_KEY = ['nodes-page', 'node-events'] as const;
-/** Pages of 500 one read walks at most; a longer backlog is caught up on the next reads. */
-const MAX_PAGES = 4;
 
 /**
  * The node events, newest first. The log is served in ascending `seq` only,
- * so the first read walks it to its end and every later read asks only for
- * what came after the newest event held (`after_seq`).
+ * so the first read of the session walks it to its end once; every later read,
+ * and every later visit to the page, asks only for what came after the last
+ * `seq` read (`readNodeEvents`). The read is kept for the session.
  */
 function useNodeEvents() {
   const { user } = useSession();
@@ -31,30 +30,24 @@ function useNodeEvents() {
     queryKey: QUERY_KEY,
     enabled: user !== undefined,
     refetchInterval: 10_000,
+    gcTime: Infinity,
     retry: false,
-    queryFn: async ({ signal }): Promise<Event[]> => {
-      const held = queryClient.getQueryData<Event[]>(QUERY_KEY) ?? [];
-      let after = held.reduce((top, event) => Math.max(top, event.seq), 0);
-      let read: Event[] = [];
-      for (let page = 0; page < MAX_PAGES; page += 1) {
-        const list = await listEvents({ type: NODE_EVENT_TYPES, after_seq: after, limit: 500 }, { signal });
-        read = mergeEvents(read, list.items, NODE_EVENT_ROWS);
-        const last = list.items[list.items.length - 1];
-        if (!list.next_cursor || !last) break;
-        after = last.seq;
-      }
-      return mergeEvents(held, read, NODE_EVENT_ROWS);
-    },
+    queryFn: ({ signal }): Promise<NodeEventsRead> =>
+      readNodeEvents(queryClient.getQueryData<NodeEventsRead>(QUERY_KEY), (after) =>
+        listEvents({ type: NODE_EVENT_TYPES, after_seq: after, limit: 500 }, { signal }),
+      ),
   });
 }
 
 /** Node events under the cards: each a lamp, a sentence and when; a new one slides in at the top. */
 export function NodeEvents({ nodes }: { nodes: readonly Node[] }) {
-  const events = useNodeEvents();
+  const query = useNodeEvents();
+  const events = { data: query.data?.events, error: query.error };
   const now = useNow(true, 30_000);
-  // The events on screen when the card first loaded; any other row is new and slides in.
-  const first = useRef<Set<number> | null>(null);
-  if (first.current === null && events.data) first.current = new Set(events.data.map((event) => event.seq));
+  // Only a row that arrives after the card first showed its events slides in: the newest seq on
+  // screen at that first render is the line, so nothing already in the log animates.
+  const shownUpTo = useRef<number | null>(null);
+  if (shownUpTo.current === null && query.data) shownUpTo.current = query.data.after;
 
   if (!events.data && !events.error) return <NodeEventsSkeleton />;
 
@@ -78,7 +71,7 @@ export function NodeEvents({ nodes }: { nodes: readonly Node[] }) {
         <ol className="pfeed">
           {(events.data ?? []).map((event) => {
             const row = nodeEventRow(event, nodes);
-            const fresh = first.current !== null && !first.current.has(event.seq);
+            const fresh = shownUpTo.current !== null && event.seq > shownUpTo.current;
             return (
               <li key={event.seq} className={cn('pev', fresh && 'pev-new')}>
                 <div className="pev-a nev">

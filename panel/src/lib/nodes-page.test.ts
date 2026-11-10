@@ -8,6 +8,7 @@ import {
   groupedCount,
   mergeEvents,
   nodeEventRow,
+  readNodeEvents,
   seenWords,
   simulateOnCards,
   simulationSentence,
@@ -247,6 +248,53 @@ describe('node events', () => {
     const read = [event(5, 'node.connected', {}), event(6, 'node.disconnected', {}), event(7, 'node.connected', {})];
     expect(mergeEvents(held, read, 3).map((item) => item.seq)).toEqual([7, 6, 5]);
     expect(mergeEvents([], [], 3)).toEqual([]);
+  });
+
+  /** A log of `count` node events served 500 a page in ascending seq, recording each `after_seq` asked. */
+  const servedLog = (count: number) => {
+    const log = Array.from({ length: count }, (_, index) => event(index + 1, 'node.connected', {}));
+    const asked: number[] = [];
+    const page = async (after: number) => {
+      asked.push(after);
+      const items = log.filter((item) => item.seq > after).slice(0, 500);
+      const last = items[items.length - 1];
+      return { items, next_cursor: last && last.seq < log.length ? `c${last.seq}` : null };
+    };
+    return { log, asked, page };
+  };
+
+  it('walks the whole log on the first read, so it shows the newest events and not the oldest', async () => {
+    const { asked, page } = servedLog(2_600);
+    const read = await readNodeEvents(undefined, page);
+    expect(read.events.map((item) => item.seq)).toEqual([2_600, 2_599, 2_598, 2_597, 2_596]);
+    expect(read.after).toBe(2_600);
+    expect(asked).toEqual([0, 500, 1_000, 1_500, 2_000, 2_500]);
+  });
+
+  it('reads only what came after the last seq read on every later read, even with no events', async () => {
+    const { log, asked, page } = servedLog(3);
+    const first = await readNodeEvents(undefined, page);
+    log.push(event(4, 'node.disconnected', {}));
+    const next = await readNodeEvents(first, page);
+    expect(next.events.map((item) => item.seq)).toEqual([4, 3, 2, 1]);
+    expect(asked).toEqual([0, 3]);
+
+    const empty = servedLog(0);
+    const none = await readNodeEvents(undefined, empty.page);
+    expect(none).toEqual({ events: [], after: 0 });
+    await readNodeEvents(none, empty.page);
+    expect(empty.asked).toEqual([0, 0]);
+  });
+
+  it('stops when a page does not move past the last seq read', async () => {
+    let calls = 0;
+    const stuck = async () => {
+      calls += 1;
+      return { items: [event(7, 'node.connected', {})], next_cursor: 'again' };
+    };
+    const read = await readNodeEvents(undefined, stuck);
+    expect(read.after).toBe(7);
+    expect(calls).toBe(2);
   });
 
   it('reads each node event type as a sentence with a lamp', () => {

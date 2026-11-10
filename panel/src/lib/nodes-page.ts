@@ -339,6 +339,38 @@ export const mergeEvents = (held: readonly Event[], read: readonly Event[], keep
   return [...bySeq.values()].sort((left, right) => right.seq - left.seq).slice(0, keep);
 };
 
+/** What the node events card holds: the newest rows and how far the log has been read. */
+export interface NodeEventsRead {
+  events: Event[];
+  /** The last `seq` read, so the next read asks only for what came after (`after_seq`). */
+  after: number;
+}
+
+/**
+ * Read the node events on from where the last read stopped. The log is served
+ * in ascending `seq` only (`GET /events`), so the first read walks it to its
+ * end and keeps the newest `keep`; every later read is one page after the
+ * last `seq` read, even when no node event was found. It stops when a page
+ * says there is no more, or does not move on.
+ */
+export const readNodeEvents = async (
+  held: NodeEventsRead | undefined,
+  page: (after: number) => Promise<{ items: Event[]; next_cursor?: string | null }>,
+  keep: number = NODE_EVENT_ROWS,
+): Promise<NodeEventsRead> => {
+  let after = held?.after ?? 0;
+  let events = held?.events ?? [];
+  for (;;) {
+    const list = await page(after);
+    const last = list.items[list.items.length - 1];
+    if (!last || last.seq <= after) break;
+    events = mergeEvents(events, list.items, keep);
+    after = last.seq;
+    if (!list.next_cursor) break;
+  }
+  return { events, after };
+};
+
 export interface NodeEventRow {
   seq: number;
   time: string;
