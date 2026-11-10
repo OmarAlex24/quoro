@@ -13,6 +13,7 @@ use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, put};
 use axum::{Json, Router};
+use common::replay;
 use common::{Server, problem, start_with_cloudflare};
 use futures_util::{SinkExt, StreamExt};
 use quoro_proto::sign;
@@ -2173,4 +2174,85 @@ async fn a_moved_hostname_drains_on_the_machine_it_left_for_one_window() {
         dns_writes(&mock)
     );
     assert!(tunnel_routes(&mock, &node_tunnel, hostname));
+}
+
+/// Waits until the tunnel manager stored the tunnel and run token of
+/// `node_id` under `provider_id`. It writes the row only once, while its
+/// `tunnel_id` is NULL, so the row is settled after this.
+async fn wait_for_stored_tunnel(server: &Server, node_id: &str, provider_id: &str) {
+    for _ in 0..200 {
+        let stored: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM node_tunnels \
+             WHERE node_id = ? AND provider_id = ? AND tunnel_id IS NOT NULL",
+        )
+        .bind(node_id)
+        .bind(provider_id)
+        .fetch_optional(server.state.store.pool())
+        .await
+        .unwrap();
+        if stored.is_some() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the tunnel of {node_id} under {provider_id} was never stored");
+}
+
+async fn put_tunnel(
+    server: &Server,
+    owner: &reqwest::Client,
+    node_id: &str,
+    provider_id: &str,
+    origin_port: u16,
+) {
+    let res = owner
+        .put(server.url(&format!("/api/v1/nodes/{node_id}/tunnel")))
+        .json(&json!({ "provider_id": provider_id, "origin_port": origin_port }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+}
+
+/// Section 7.3 step 4 (ADR 0297): the `node_tunnel` entries of a mapping
+/// that is created, given another port and moved to another provider
+/// rebuild every column of their rows when replayed in `seq` order into an
+/// empty database, `created_at` included, which a `create` must carry
+/// since the column is NOT NULL.
+#[tokio::test]
+async fn node_tunnel_entries_rebuild_their_rows() {
+    let mock = start_mock().await;
+    let server = start_with_cloudflare(&mock.base, &format!("{}/dns-query", mock.base)).await;
+    let owner = server.owner().await;
+    insert_machine(&server, NODE_A, "alpha", &["node"]).await;
+    insert_machine(&server, NODE_B, "beta", &["node"]).await;
+    let config = json!({ "account_id": ACCOUNT_ID, "zone_id": ZONE_ID });
+    let first = create_provider(&server, &owner, "tunnel", "Tunnel", config.clone()).await;
+    let first = first["id"].as_str().unwrap().to_string();
+    let second = create_provider(&server, &owner, "tunnel", "Other tunnel", config).await;
+    let second = second["id"].as_str().unwrap().to_string();
+
+    // A: created, then the same provider with another port.
+    put_tunnel(&server, &owner, NODE_A, &first, 8081).await;
+    wait_for_stored_tunnel(&server, NODE_A, &first).await;
+    put_tunnel(&server, &owner, NODE_A, &first, 9090).await;
+    // B: created, then moved to another provider, which keeps the row's
+    // `created_at` and clears its tunnel until the manager makes a new one.
+    put_tunnel(&server, &owner, NODE_B, &first, 8081).await;
+    wait_for_stored_tunnel(&server, NODE_B, &first).await;
+    put_tunnel(&server, &owner, NODE_B, &second, 8082).await;
+    wait_for_stored_tunnel(&server, NODE_B, &second).await;
+
+    let (port,): (i64,) = sqlx::query_as("SELECT origin_port FROM node_tunnels WHERE node_id = ?")
+        .bind(NODE_A)
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(port, 9090);
+
+    let rebuilt = replay::rebuild(&server, &["node_tunnel"], &[]).await;
+    let columns = replay::column_names(&server.state.store, "node_tunnels").await;
+    assert!(columns.iter().any(|c| c == "created_at"), "{columns:?}");
+    let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
+    replay::assert_rebuilt(&server, &rebuilt, "node_tunnels", &columns, 2).await;
 }
