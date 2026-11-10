@@ -1,12 +1,12 @@
 # ADR 0244: A converted lease's row keeps mode local until the primary answers its first renewal, and is written expiring then
 
-- **Status:** Accepted; refined by [ADR 0257](0257-a-primary-answers-as-a-converted-lease-s-first-renewal-only.md)
+- **Status:** Accepted; refined by [ADR 0257](0257-a-primary-answers-as-a-converted-lease-s-first-renewal-only.md), [ADR 0323](0323-a-policy-change-off-warm-ends-a-lease-conversion-in-flight.md)
 - **Date:** 2026-11-06
 - **Ledger id:** D-0244
 - **Tags:** m5b, leases, contracts
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** [ADR 0241](0241-a-lease-converted-from-local-to-expiring-opens-no-failover.md), [ADR 0257](0257-a-primary-answers-as-a-converted-lease-s-first-renewal-only.md)
+- **Related:** [ADR 0241](0241-a-lease-converted-from-local-to-expiring-opens-no-failover.md), [ADR 0257](0257-a-primary-answers-as-a-converted-lease-s-first-renewal-only.md), [ADR 0323](0323-a-policy-change-off-warm-ends-a-lease-conversion-in-flight.md)
 
 ## Context
 
@@ -24,6 +24,7 @@ _Some wording was changed for the public repository._
 
 - Refines [ADR 0241](0241-a-lease-converted-from-local-to-expiring-opens-no-failover.md): what the lease row records during a conversion: mode stays local until the primary answers the first renewal. The rest of [ADR 0241](0241-a-lease-converted-from-local-to-expiring-opens-no-failover.md) stands.
 - [ADR 0257](0257-a-primary-answers-as-a-converted-lease-s-first-renewal-only.md) refines which renewal the primary answers as a converted lease's first one. The rest of this decision stands.
+- [ADR 0323](0323-a-policy-change-off-warm-ends-a-lease-conversion-in-flight.md) refines what a policy change off warm does to a lease conversion in flight: the conversion ends, and no `expiring` lease is written for it. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---

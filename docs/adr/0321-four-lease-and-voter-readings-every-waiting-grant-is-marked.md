@@ -1,12 +1,12 @@
 # ADR 0321: Four lease and voter readings: every waiting grant is marked, the token cap answers 409, the vote-removal guard counts only live expiring leases, and a stuck voter gate is repaired by removing the machine
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0325](0325-the-fencing-token-ceiling-applies-to-every-operation-that.md)
 - **Date:** 2026-11-10
 - **Ledger id:** D-0321
 - **Tags:** m5b, leases, voters, contracts
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** [ADR 0170](0170-witness-role-any-enrolled-machine-can-add-the-witness-role.md), [ADR 0280](0280-every-grant-of-a-marked-lease-waits-until-every-node-holds.md), [ADR 0285](0285-a-volume-restore-that-turns-an-expiring-lease-row-local-at.md)
+- **Related:** [ADR 0170](0170-witness-role-any-enrolled-machine-can-add-the-witness-role.md), [ADR 0280](0280-every-grant-of-a-marked-lease-waits-until-every-node-holds.md), [ADR 0285](0285-a-volume-restore-that-turns-an-expiring-lease-row-local-at.md), [ADR 0325](0325-the-fencing-token-ceiling-applies-to-every-operation-that.md)
 
 ## Context
 
@@ -33,6 +33,7 @@ _Some wording was changed for the public repository._
 - Refines [ADR 0170](0170-witness-role-any-enrolled-machine-can-add-the-witness-role.md): which `expiring` leases the vote-removal guard counts: a row that is not revoked, or revoked with its gate not yet passed. The rest of [ADR 0170](0170-witness-role-any-enrolled-machine-can-add-the-witness-role.md) stands.
 - Refines [ADR 0280](0280-every-grant-of-a-marked-lease-waits-until-every-node-holds.md): which grants are written marked: every grant that must wait, whoever makes it. The rest of [ADR 0280](0280-every-grant-of-a-marked-lease-waits-until-every-node-holds.md) stands.
 - Refines [ADR 0285](0285-a-volume-restore-that-turns-an-expiring-lease-row-local-at.md): what happens at the token cap: the row stays revoked, and a fence acknowledgement that would raise it answers `409` and writes nothing. The rest of [ADR 0285](0285-a-volume-restore-that-turns-an-expiring-lease-row-local-at.md) stands.
+- [ADR 0325](0325-the-fencing-token-ceiling-applies-to-every-operation-that.md) refines which operations the token cap refuses: every operation that would raise a token past it, not only a fence acknowledgement. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---

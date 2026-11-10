@@ -1,12 +1,12 @@
 # ADR 0320: Say that every node-role machine can read the provider credentials and tunnel tokens in the change log, add a rotation procedure, and harden custody after M5b
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0326](0326-the-rotation-procedure-for-a-removed-or-possibly.md)
 - **Date:** 2026-11-10
 - **Ledger id:** D-0320
 - **Tags:** m5b, security, custody, contracts
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** [ADR 0094](0094-non-primary-nodes-get-only-a-per-node-tunnel-run-token-from.md)
+- **Related:** [ADR 0094](0094-non-primary-nodes-get-only-a-per-node-tunnel-run-token-from.md), [ADR 0326](0326-the-rotation-procedure-for-a-removed-or-possibly.md)
 
 ## Context
 
@@ -92,6 +92,7 @@ _Some wording was changed for the public repository._
 ## Consequences
 
 - Refines [ADR 0094](0094-non-primary-nodes-get-only-a-per-node-tunnel-run-token-from.md): where a provider's account credential lives: on every machine with the `node` role, each of which can read it from the change log, not only on the primary. The rest of [ADR 0094](0094-non-primary-nodes-get-only-a-per-node-tunnel-run-token-from.md) stands.
+- [ADR 0326](0326-the-rotation-procedure-for-a-removed-or-possibly.md) refines what the rotation procedure covers: users change their passwords too. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---

@@ -1,12 +1,12 @@
 # ADR 0322: How a promoted primary gets the backup repository key back, and what the API shows until then
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0324](0324-a-lost-backup-recovery-key-after-a-failover-m5b-says-that.md)
 - **Date:** 2026-11-10
 - **Ledger id:** D-0322
 - **Tags:** m5b, backups, promotion, contracts
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** [ADR 0147](0147-backup-repository-format-and-keys-fastcdc-2020-chunks-256k.md)
+- **Related:** [ADR 0147](0147-backup-repository-format-and-keys-fastcdc-2020-chunks-256k.md), [ADR 0324](0324-a-lost-backup-recovery-key-after-a-failover-m5b-says-that.md)
 
 ## Context
 
@@ -35,6 +35,7 @@ _Some wording was changed for the public repository._
 ## Consequences
 
 - Refines [ADR 0147](0147-backup-repository-format-and-keys-fastcdc-2020-chunks-256k.md): where the repository key lives after a promotion: never in the change log, and restored on a promoted primary from the recovery key. The rest of [ADR 0147](0147-backup-repository-format-and-keys-fastcdc-2020-chunks-256k.md) stands.
+- [ADR 0324](0324-a-lost-backup-recovery-key-after-a-failover-m5b-says-that.md) refines what an owner who has lost the recovery key can do after a promotion: re-keying the repository is not served yet, and replacing the repository is planned after M5b. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---
