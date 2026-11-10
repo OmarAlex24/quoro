@@ -16,7 +16,8 @@ use quoro_engine::{
     ByteRange, Engine as _, EngineError, FakeEngine, FakeOp, FakeRanges, SnapshotMethod, VolumeId,
 };
 use quoro_proto::wire::{
-    DesiredState, Spec, SpecMesh, SpecVolumeFile, SpecVolumeState, SpecWarm, WarmRole, WarmStatus,
+    DesiredState, Spec, SpecMesh, SpecVolumeFile, SpecVolumeState, SpecWarm, VolumeState, WarmRole,
+    WarmStatus,
 };
 use quoro_proto::{LeaseGrant, LeaseId, LeaseMode, ResourceType};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -28,7 +29,7 @@ use super::{CycleOutcome, SenderOptions, WarmSender, produce};
 use crate::kept::{self, KeepPurpose};
 use crate::lease::{LeaseTable, LeaseView};
 use crate::reconcile::Snapshot;
-use crate::store::{KeptSnapshotRecord, NodeStore};
+use crate::store::{KeptSnapshotRecord, NodeStore, VolumeRecord};
 use crate::warm::frame::{Decoder, Frame, RefuseReason, Sequence, StreamHeader};
 use crate::warm::frame::{Manifest, encode};
 use crate::warm::receiver::{ReceiverOptions, WarmReceiver};
@@ -1334,6 +1335,75 @@ async fn a_volume_that_stops_being_warm_keeps_nothing_and_a_new_target_keeps_all
         .await
         .expect("the sender stops")
         .expect("the sender task");
+}
+
+/// Section 9: a volume the node holds as its own and was named the warm
+/// target of as a returning source keeps its warm snapshots on a retired
+/// entry: they are the base a later hand-over compares its file against. An
+/// own volume without the returning flag releases them, as before.
+#[tokio::test]
+async fn a_returning_source_keeps_its_snapshots_on_a_deleted_entry() {
+    let source = Source::new("returning-kept", 1, lease_view(TOKEN)).await;
+    let id = VolumeId(VOL.to_owned());
+    for (purpose, seq) in [(KeepPurpose::WarmBase, 1), (KeepPurpose::WarmShipping, 2)] {
+        let snapshot = source.engine.snapshot_volume(&id).await.expect("snapshot");
+        kept::keep(&source.store, APP, &snapshot, purpose, Some(seq), None)
+            .await
+            .expect("keep");
+    }
+    source
+        .store
+        .save_volume(&VolumeRecord {
+            volume_id: VOL.to_owned(),
+            app_id: APP.to_owned(),
+            size_gb: 1,
+            state: VolumeState::Ready,
+            error: None,
+            allocated_bytes: None,
+        })
+        .await
+        .expect("own row");
+    assert!(
+        source
+            .store
+            .add_return_pending_target(VOL, APP, 1, 1)
+            .await
+            .expect("flag")
+    );
+    let both = vec![
+        base_entry(KeepPurpose::WarmBase, 1),
+        base_entry(KeepPurpose::WarmShipping, 2),
+    ];
+
+    // The stale-copy rule's `deleted` entry, without `warm`: both stay.
+    set_entry(&source.desired, |entry| {
+        entry.state = SpecVolumeState::Deleted;
+        entry.warm = None;
+    });
+    source.sender.pass_once().await;
+    assert_eq!(source.kept().await, both);
+    assert_eq!(source.snapshot_count(), 2);
+
+    // A `present` entry without `warm` while the flag still stands: kept
+    // too, until the reconciler clears the flag.
+    set_entry(&source.desired, |entry| {
+        entry.state = SpecVolumeState::Present
+    });
+    source.sender.pass_once().await;
+    assert_eq!(source.kept().await, both);
+
+    // Without the flag, an own volume releases them on a `deleted` entry.
+    source
+        .store
+        .clear_volume_return_pending(VOL)
+        .await
+        .expect("clear");
+    set_entry(&source.desired, |entry| {
+        entry.state = SpecVolumeState::Deleted;
+    });
+    source.sender.pass_once().await;
+    assert!(source.kept().await.is_empty());
+    assert_eq!(source.snapshot_count(), 0);
 }
 
 async fn wait_for<F, Fut>(what: &str, mut check: F)

@@ -425,6 +425,17 @@ impl<E: Engine + 'static> WarmSender<E> {
         self.inner.publish();
     }
 
+    /// One pass, with no cycle loop left running; for the tests.
+    #[cfg(test)]
+    pub(crate) async fn pass_once(&self) {
+        let (_stop, stopped) = watch::channel(false);
+        let mut loops = HashMap::new();
+        self.pass(&mut loops, &stopped).await;
+        for (_, task) in loops {
+            task.abort();
+        }
+    }
+
     /// Cycles one volume every interval while it is a source here.
     async fn volume_loop(&self, volume_id: String, mut stopped: watch::Receiver<bool>) {
         while let Some(interval) = self.inner.interval_of(&volume_id) {
@@ -517,9 +528,29 @@ impl<E: Engine + 'static> Inner<E> {
         }
     }
 
-    /// Deletes every kept snapshot of a volume that is no longer warm here.
+    /// Deletes every kept snapshot of a volume that is no longer warm here,
+    /// unless the node's own row of it carries the returning flag (section
+    /// 9): it was named the volume's warm target as a returning source, and
+    /// a later hand-over compares its file against these snapshots. The flag
+    /// is read under the volume's lock; the reconciler clears it under the
+    /// same lock once the node runs the volume again, and a later pass
+    /// releases them then.
     async fn release_volume(&self, volume_id: &str) {
         let _guard = self.locks.lock(volume_id).await;
+        match self.store.volume_return_pending(volume_id).await {
+            Ok(false) => {}
+            Ok(true) => {
+                debug!(
+                    volume_id,
+                    "kept the warm snapshots of a volume of the node's own that it returns to as the target"
+                );
+                return;
+            }
+            Err(e) => {
+                warn!(volume_id, error = %e, "could not read the volume row");
+                return;
+            }
+        }
         let records = match self.warm_records(volume_id).await {
             Ok(records) => records,
             Err(e) => {

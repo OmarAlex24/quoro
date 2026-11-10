@@ -1831,6 +1831,19 @@ async fn the_nodes_own_volume_never_takes_a_stream() {
     assert!(h.engine.staged_volumes().is_empty());
     assert_eq!(h.row().await.complete_seq, None);
     assert!(h.row().await.error.is_none());
+    // No pass has flagged the own row as returning yet, so the target is not
+    // reported: a stale-copy `deleted` entry could otherwise arrive before
+    // the flag that keeps the file (section 9).
+    assert!(h.statuses.borrow().is_empty(), "{:?}", h.statuses.borrow());
+    // Once flagged, as a pass flags it, the target is reported without an
+    // error.
+    assert!(
+        h.store
+            .add_return_pending_target(VOL, APP, 1, 1)
+            .await
+            .expect("flag")
+    );
+    h.receiver.inner.publish().await;
     assert!(h.status().error.is_none(), "{:?}", h.status());
 
     // Handed over: the next full copy lands over it.

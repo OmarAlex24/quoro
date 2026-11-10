@@ -2911,3 +2911,366 @@ async fn running_the_volume_again_clears_an_unfinished_hand_over() {
     assert_eq!(store.applied_rev().await.unwrap(), 3);
     drop(cycle);
 }
+
+/// A `deleted` entry for `vol_w` without `warm`, and no VM.
+fn deleted_snapshot(rev: u64) -> Snapshot {
+    snapshot_full(
+        rev,
+        Vec::new(),
+        Vec::new(),
+        vec![spec_volume("vol_w", "app_w", 1, SpecVolumeState::Deleted)],
+    )
+}
+
+/// The node's own ready row of `vol_w`.
+async fn own_vol_w(store: &NodeStore) {
+    store
+        .save_volume(&VolumeRecord {
+            volume_id: "vol_w".to_owned(),
+            app_id: "app_w".to_owned(),
+            size_gb: 1,
+            state: VolumeState::Ready,
+            error: None,
+            allocated_bytes: None,
+        })
+        .await
+        .unwrap();
+}
+
+/// Keeps a warm snapshot of `vol_w`, as its source does.
+async fn keep_warm(
+    engine: &RecordingEngine,
+    store: &NodeStore,
+    purpose: quoro_node_agent::kept::KeepPurpose,
+    seq: u64,
+) {
+    let snapshot = engine
+        .inner()
+        .snapshot_volume(&VolumeId("vol_w".to_owned()))
+        .await
+        .expect("snapshot");
+    quoro_node_agent::kept::keep(store, "app_w", &snapshot, purpose, Some(seq), None)
+        .await
+        .expect("keep");
+}
+
+/// Section 6.7: every `deleted` entry for an own volume without the
+/// returning flag removes the file and reports `deleted`, as before: a
+/// source that never failed over, with its kept warm snapshots, and a warm
+/// node made the source, whose copy became its own volume.
+#[tokio::test]
+async fn a_deleted_entry_still_removes_an_own_volume_without_the_returning_flag() {
+    // A source that never failed over.
+    let dir = TargetDir::new("deleted-source");
+    let engine = Arc::new(RecordingEngine::new());
+    engine.inner().set_volume_dir(dir.path());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let (reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let mut reconciler = reconciler.with_warm_locks(VolumeLocks::new());
+    engine
+        .inner()
+        .ensure_volume(&VolumeId("vol_w".to_owned()), 1)
+        .await
+        .unwrap();
+    own_vol_w(&store).await;
+    keep_warm(
+        &engine,
+        &store,
+        quoro_node_agent::kept::KeepPurpose::WarmBase,
+        1,
+    )
+    .await;
+    keep_warm(
+        &engine,
+        &store,
+        quoro_node_agent::kept::KeepPurpose::WarmShipping,
+        2,
+    )
+    .await;
+    reconciler.reconcile_once(Some(&deleted_snapshot(1))).await;
+    assert!(!dir.path().join("vol_w").exists(), "the file is removed");
+    let volumes = reconciler.volume_statuses().borrow().clone();
+    assert_eq!(
+        volume_in(&volumes, "vol_w").map(|status| status.state),
+        Some(VolumeState::Deleted)
+    );
+    assert_eq!(store.applied_rev().await.unwrap(), 1);
+
+    // A warm node made the source: its copy is kept as the base and becomes
+    // its own volume; a later `deleted` entry removes it.
+    let (dir, _engine, store, mut reconciler) =
+        warm_node_with_a_copy("deleted-turned-source", b"data").await;
+    reconciler
+        .reconcile_once(Some(&failover_snapshot(1, 5)))
+        .await;
+    assert!(store.warm_target("vol_w").await.unwrap().is_none());
+    assert_eq!(
+        store.volume("vol_w").await.unwrap().map(|row| row.state),
+        Some(VolumeState::Ready)
+    );
+    assert!(!store.volume_return_pending("vol_w").await.unwrap());
+    reconciler.reconcile_once(Some(&deleted_snapshot(2))).await;
+    assert!(!dir.path().join("vol_w").exists(), "the file is removed");
+    let volumes = reconciler.volume_statuses().borrow().clone();
+    assert_eq!(
+        volume_in(&volumes, "vol_w").map(|status| status.state),
+        Some(VolumeState::Deleted)
+    );
+    assert_eq!(store.applied_rev().await.unwrap(), 2);
+}
+
+/// Section 9: a returning source that runs its volume again (a `present`
+/// entry that is not a target, in a revision newer than the one that named
+/// it the target) is no longer returning. The flag is cleared under the
+/// volume's lock, which the pass takes for a flagged row even without a mark
+/// or a warm row, before the volume is ready, and the warm row beside the
+/// own row goes with it, so the sender ships the volume; a later `deleted`
+/// entry then removes the file.
+#[tokio::test]
+async fn running_the_volume_again_clears_the_returning_flag() {
+    let dir = TargetDir::new("returning-runs-again");
+    let engine = Arc::new(RecordingEngine::new());
+    engine.inner().set_volume_dir(dir.path());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let locks = VolumeLocks::new();
+    let (reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let mut reconciler = reconciler.with_warm_locks(locks.clone());
+    for volume_id in ["vol_w", "vol_x"] {
+        engine
+            .inner()
+            .ensure_volume(&VolumeId(volume_id.to_owned()), 1)
+            .await
+            .unwrap();
+        store
+            .save_volume(&VolumeRecord {
+                volume_id: volume_id.to_owned(),
+                app_id: "app_w".to_owned(),
+                size_gb: 1,
+                state: VolumeState::Ready,
+                error: None,
+                allocated_bytes: None,
+            })
+            .await
+            .unwrap();
+        // Named the target at rev 1: the warm receiver records the warm row
+        // and flags the own row.
+        assert!(
+            store
+                .add_return_pending_target(volume_id, "app_w", 1, 1)
+                .await
+                .unwrap()
+        );
+    }
+    // The warm row of `vol_x` is gone already, as after a `deleted` entry
+    // the receiver forgot: its flag alone takes the lock.
+    store.forget_warm_target("vol_x").await.unwrap();
+
+    let own = snapshot_full(
+        2,
+        Vec::new(),
+        Vec::new(),
+        vec![
+            spec_volume("vol_w", "app_w", 1, SpecVolumeState::Present),
+            spec_volume("vol_x", "app_w", 1, SpecVolumeState::Present),
+        ],
+    );
+    // A hand-over or a sender cycle holds the lock: the flag waits, and the
+    // revision is not applied.
+    let held = locks.try_lock("vol_x").expect("free");
+    reconciler.reconcile_once(Some(&own)).await;
+    assert!(store.volume_return_pending("vol_x").await.unwrap());
+    assert_eq!(store.applied_rev().await.unwrap(), 0, "not applied yet");
+    drop(held);
+
+    reconciler.reconcile_once(Some(&own)).await;
+    for volume_id in ["vol_w", "vol_x"] {
+        assert!(
+            !store.volume_return_pending(volume_id).await.unwrap(),
+            "{volume_id}"
+        );
+        assert!(
+            store.warm_target(volume_id).await.unwrap().is_none(),
+            "{volume_id}: the warm row is forgotten, so the sender ships it"
+        );
+        assert!(dir.path().join(volume_id).exists(), "{volume_id}");
+    }
+    assert_eq!(store.applied_rev().await.unwrap(), 2);
+    let volumes = reconciler.volume_statuses().borrow().clone();
+    assert_eq!(
+        volume_in(&volumes, "vol_w").map(|status| status.state),
+        Some(VolumeState::Ready)
+    );
+
+    reconciler.reconcile_once(Some(&deleted_snapshot(3))).await;
+    assert!(!dir.path().join("vol_w").exists(), "the file is removed");
+    let volumes = reconciler.volume_statuses().borrow().clone();
+    assert_eq!(
+        volume_in(&volumes, "vol_w").map(|status| status.state),
+        Some(VolumeState::Deleted)
+    );
+    assert_eq!(store.applied_rev().await.unwrap(), 3);
+}
+
+/// Section 5.11 (ADR 0267): a flagged own volume keeps its file on a
+/// `deleted` entry, reported with its state, and the revision is applied;
+/// once the entry leaves the spec, the file is an orphan the node keeps.
+#[tokio::test]
+async fn a_deleted_entry_keeps_a_flagged_own_volume_and_it_is_orphaned_after() {
+    let dir = TargetDir::new("returning-kept-file");
+    let engine = Arc::new(RecordingEngine::new());
+    engine.inner().set_volume_dir(dir.path());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let (reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let mut reconciler = reconciler.with_warm_locks(VolumeLocks::new());
+    engine
+        .inner()
+        .ensure_volume(&VolumeId("vol_w".to_owned()), 1)
+        .await
+        .unwrap();
+    std::fs::write(dir.path().join("vol_w"), b"divergent writes").unwrap();
+    own_vol_w(&store).await;
+    assert!(
+        store
+            .add_return_pending_target("vol_w", "app_w", 1, 1)
+            .await
+            .unwrap()
+    );
+    let (created, stops) = (engine.create_count(), engine.stops().len());
+
+    reconciler.reconcile_once(Some(&deleted_snapshot(1))).await;
+    reconciler.reconcile_once(Some(&deleted_snapshot(1))).await;
+    assert_eq!(
+        std::fs::read(dir.path().join("vol_w")).unwrap(),
+        b"divergent writes"
+    );
+    let volumes = reconciler.volume_statuses().borrow().clone();
+    assert_eq!(
+        volume_in(&volumes, "vol_w").map(|status| status.state),
+        Some(VolumeState::Ready)
+    );
+    assert_eq!(store.applied_rev().await.unwrap(), 1);
+
+    let gone = snapshot_full(2, Vec::new(), Vec::new(), Vec::new());
+    reconciler.reconcile_once(Some(&gone)).await;
+    let volumes = reconciler.volume_statuses().borrow().clone();
+    assert_eq!(
+        volume_in(&volumes, "vol_w").map(|status| status.state),
+        Some(VolumeState::Orphaned)
+    );
+    assert!(dir.path().join("vol_w").exists());
+    assert!(store.volume("vol_w").await.unwrap().is_some());
+    assert_eq!(engine.create_count(), created, "no VM call");
+    assert_eq!(engine.stops().len(), stops, "no VM call");
+}
+
+/// A warm row without a copy beside an own volume, and no returning flag (a
+/// stale stream's record, or a target row written while the warm node was
+/// made the source), would keep the sender from shipping it for good: one
+/// pass that runs the volume forgets it. A row that holds a copy stays.
+#[tokio::test]
+async fn a_warm_row_without_a_copy_beside_an_own_volume_is_forgotten() {
+    let dir = TargetDir::new("stray-warm-row");
+    let engine = Arc::new(RecordingEngine::new());
+    engine.inner().set_volume_dir(dir.path());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let (reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let mut reconciler = reconciler.with_warm_locks(VolumeLocks::new());
+    for volume_id in ["vol_w", "vol_c"] {
+        engine
+            .inner()
+            .ensure_volume(&VolumeId(volume_id.to_owned()), 1)
+            .await
+            .unwrap();
+        store
+            .save_volume(&VolumeRecord {
+                volume_id: volume_id.to_owned(),
+                app_id: "app_w".to_owned(),
+                size_gb: 1,
+                state: VolumeState::Ready,
+                error: None,
+                allocated_bytes: None,
+            })
+            .await
+            .unwrap();
+    }
+    store.add_warm_target("vol_w", "app_w", 1).await.unwrap();
+    store
+        .record_warm_rejection("vol_w", 2, "2026-11-10T10:00:00Z")
+        .await
+        .unwrap();
+    store
+        .save_warm_target(&complete_copy("vol_c", "app_w", 3))
+        .await
+        .unwrap();
+
+    let own = snapshot_full(
+        1,
+        Vec::new(),
+        Vec::new(),
+        vec![
+            spec_volume("vol_w", "app_w", 1, SpecVolumeState::Present),
+            spec_volume("vol_c", "app_w", 1, SpecVolumeState::Present),
+        ],
+    );
+    reconciler.reconcile_once(Some(&own)).await;
+    assert!(store.warm_target("vol_w").await.unwrap().is_none());
+    assert!(dir.path().join("vol_w").exists(), "the file stays");
+    let volumes = reconciler.volume_statuses().borrow().clone();
+    assert_eq!(
+        volume_in(&volumes, "vol_w").map(|status| status.state),
+        Some(VolumeState::Ready)
+    );
+    assert!(
+        store.warm_target("vol_c").await.unwrap().is_some(),
+        "a row that holds a copy stays"
+    );
+    assert_eq!(store.applied_rev().await.unwrap(), 1);
+}
+
+/// A warm row without a copy beside an own row that is `deleted` (its file
+/// is gone) stays when the node is made the volume's source: it is what keeps
+/// the app from starting on an empty volume, so the volume is reported
+/// without a complete copy and no file is created.
+#[tokio::test]
+async fn a_warm_row_without_a_copy_beside_a_deleted_own_row_stays() {
+    let dir = TargetDir::new("stray-warm-row-deleted");
+    let engine = Arc::new(RecordingEngine::new());
+    engine.inner().set_volume_dir(dir.path());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let (reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let mut reconciler = reconciler.with_warm_locks(VolumeLocks::new());
+    store
+        .save_volume(&VolumeRecord {
+            volume_id: "vol_d".to_owned(),
+            app_id: "app_w".to_owned(),
+            size_gb: 1,
+            state: VolumeState::Deleted,
+            error: None,
+            allocated_bytes: None,
+        })
+        .await
+        .unwrap();
+    store.add_warm_target("vol_d", "app_w", 1).await.unwrap();
+
+    let source = snapshot_full(
+        1,
+        Vec::new(),
+        Vec::new(),
+        vec![spec_volume("vol_d", "app_w", 1, SpecVolumeState::Present)],
+    );
+    reconciler.reconcile_once(Some(&source)).await;
+    assert!(
+        store.warm_target("vol_d").await.unwrap().is_some(),
+        "the row stays"
+    );
+    assert!(
+        !dir.path().join("vol_d").exists(),
+        "no empty file is created"
+    );
+    let volumes = reconciler.volume_statuses().borrow().clone();
+    assert_eq!(
+        volume_in(&volumes, "vol_d").map(|status| status.state),
+        Some(VolumeState::Failed)
+    );
+    assert_ne!(store.applied_rev().await.unwrap(), 1);
+}
