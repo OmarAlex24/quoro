@@ -1,12 +1,12 @@
 # ADR 0176: Returning source after a failover: it keeps its divergent volume as a quarantined reflink snapshot on its own disk, reported to the primary and recorded in the audit log, then resyncs from the last common snapshot as the new warm copy
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0316](0316-a-quarantined-copy-of-a-volume-that-is-gone-gets-an-audit.md)
 - **Date:** 2026-11-06
 - **Ledger id:** D-0176
 - **Tags:** m5b, sync, reliability, contracts
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** none
+- **Related:** [ADR 0316](0316-a-quarantined-copy-of-a-volume-that-is-gone-gets-an-audit.md)
 
 ## Context
 
@@ -22,6 +22,7 @@ _Some wording was changed for the public repository._
 
 ## Consequences
 
+- [ADR 0316](0316-a-quarantined-copy-of-a-volume-that-is-gone-gets-an-audit.md) refines what a quarantined copy of a volume that is already gone gets: its audit record and its event, without a row. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---

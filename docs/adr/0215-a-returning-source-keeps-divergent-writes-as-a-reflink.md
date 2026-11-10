@@ -1,12 +1,12 @@
 # ADR 0215: A returning source keeps divergent writes as a reflink quarantine with a qrn_ id, deleted only by a human
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0314](0314-a-returning-source-deletes-its-file-only-when-it-matches.md)
 - **Date:** 2026-11-06
 - **Ledger id:** D-0215
 - **Tags:** m5b, contracts, warm
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** none
+- **Related:** [ADR 0314](0314-a-returning-source-deletes-its-file-only-when-it-matches.md)
 
 ## Context
 
@@ -20,6 +20,7 @@ The returning source compares its live volume file with its kept base and in-fli
 
 ## Consequences
 
+- [ADR 0314](0314-a-returning-source-deletes-its-file-only-when-it-matches.md) refines when a returning source deletes its file: only when it shows no change against the base the target acknowledged, and otherwise it quarantines it. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---

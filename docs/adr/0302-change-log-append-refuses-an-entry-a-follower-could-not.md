@@ -1,12 +1,12 @@
 # ADR 0302: Change log: append refuses an entry a follower could not receive (one that alone exceeds a log_entries frame, or whose stored payload has no RFC 8785 form)
 
-- **Status:** Accepted; refined by [ADR 0306](0306-an-audited-api-call-is-always-audited-bound-what-reaches.md)
+- **Status:** Accepted; refined by [ADR 0306](0306-an-audited-api-call-is-always-audited-bound-what-reaches.md), [ADR 0315](0315-parse-json-floats-exactly-serde-json-float-roundtrip-so.md)
 - **Date:** 2026-11-09
 - **Ledger id:** D-0302
 - **Tags:** m5b, contracts, changelog, follow
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** [ADR 0227](0227-change-log-follow-sends-one-log-entries-batch-at-a-time-and.md), [ADR 0306](0306-an-audited-api-call-is-always-audited-bound-what-reaches.md)
+- **Related:** [ADR 0227](0227-change-log-follow-sends-one-log-entries-batch-at-a-time-and.md), [ADR 0306](0306-an-audited-api-call-is-always-audited-bound-what-reaches.md), [ADR 0315](0315-parse-json-floats-exactly-serde-json-float-roundtrip-so.md)
 
 ## Context
 
@@ -28,6 +28,7 @@ _Some wording was changed for the public repository._
 
 - Refines [ADR 0227](0227-change-log-follow-sends-one-log-entries-batch-at-a-time-and.md): which entries the primary may write: only one that can be sent alone in one log_entries message and verified by a node. The rest of [ADR 0227](0227-change-log-follow-sends-one-log-entries-batch-at-a-time-and.md) stands.
 - [ADR 0306](0306-an-audited-api-call-is-always-audited-bound-what-reaches.md) refines what the primary writes when an audit record's params would make its entry one it may not write: the record keeps their digest and size instead, so the audit write does not fail. The rest of this decision stands.
+- [ADR 0315](0315-parse-json-floats-exactly-serde-json-float-roundtrip-so.md) refines the parser the primary checks entries with: floats are parsed exactly, and nodes run the same parser. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---

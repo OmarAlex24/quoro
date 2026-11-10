@@ -309,6 +309,15 @@
   - [0305: Section 8.8 Restarts: after a reboot a voter restarts its promise and horizon from the longest window it may have granted, not only the last S and L](adr/0305-section-8-8-restarts-after-a-reboot-a-voter-restarts-its.md)
   - [0306: An audited API call is always audited: bound what reaches the audit change-log entry](adr/0306-an-audited-api-call-is-always-audited-bound-what-reaches.md)
   - [0308: Custody seals use the hpke crate (rust-hpke) for RFC 9180, added only if it passes cargo-deny under the dependency license policy](adr/0308-custody-seals-use-the-hpke-crate-rust-hpke-for-rfc-9180.md)
+  - [0314: A returning source deletes its file only when it matches its base, not the snapshot it was shipping](adr/0314-a-returning-source-deletes-its-file-only-when-it-matches.md)
+  - [0315: Parse JSON floats exactly (serde_json float_roundtrip) so audit and change-log hashes re-hash from their stored text](adr/0315-parse-json-floats-exactly-serde-json-float-roundtrip-so.md)
+  - [0316: A quarantined copy of a volume that is gone gets an audit record and an event, without a row](adr/0316-a-quarantined-copy-of-a-volume-that-is-gone-gets-an-audit.md)
+  - [0317: Promotion rebuild: credential hashes travel in the change log, entries fold per entity, and a row with no create stops the rebuild](adr/0317-promotion-rebuild-credential-hashes-travel-in-the-change.md)
+  - [0318: Panel motion: allow short state-change motion across the panel, superseding the motion rule of the panel redesign decision](adr/0318-panel-motion-allow-short-state-change-motion-across-the.md)
+  - [0319: Sandboxes: the baseline choices for the first sandbox milestone (S1)](adr/0319-sandboxes-the-baseline-choices-for-the-first-sandbox.md)
+  - [0320: Say that every node-role machine can read the provider credentials and tunnel tokens in the change log, add a rotation procedure, and harden custody after M5b](adr/0320-say-that-every-node-role-machine-can-read-the-provider.md)
+  - [0321: Four lease and voter readings: every waiting grant is marked, the token cap answers 409, the vote-removal guard counts only live expiring leases, and a stuck voter gate is repaired by removing the machine](adr/0321-four-lease-and-voter-readings-every-waiting-grant-is-marked.md)
+  - [0322: How a promoted primary gets the backup repository key back, and what the API shows until then](adr/0322-how-a-promoted-primary-gets-the-backup-repository-key-back.md)
 
 # Background research
 

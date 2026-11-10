@@ -1,12 +1,12 @@
 # ADR 0226: Node credential hashes travel in the change log from schema 13, so a promoted primary accepts every node's session
 
-- **Status:** Accepted
+- **Status:** Accepted; refined by [ADR 0317](0317-promotion-rebuild-credential-hashes-travel-in-the-change.md)
 - **Date:** 2026-11-06
 - **Ledger id:** D-0226
 - **Tags:** m5b, contracts, promotion
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** none
+- **Related:** [ADR 0317](0317-promotion-rebuild-credential-hashes-travel-in-the-change.md)
 
 ## Context
 
@@ -20,6 +20,7 @@ node_credentials becomes a replicated table: every insert and update is a change
 
 ## Consequences
 
+- [ADR 0317](0317-promotion-rebuild-credential-hashes-travel-in-the-change.md) refines which credential hashes travel in the change log: also those of API tokens, agent keys and join tokens. The rest of this decision stands.
 - This decision is binding for all contributors and agents. Changing it requires a new ADR approved by the maintainer (see ADR 0036).
 
 ---
