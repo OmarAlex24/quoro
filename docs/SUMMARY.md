@@ -318,6 +318,10 @@
   - [0320: Say that every node-role machine can read the provider credentials and tunnel tokens in the change log, add a rotation procedure, and harden custody after M5b](adr/0320-say-that-every-node-role-machine-can-read-the-provider.md)
   - [0321: Four lease and voter readings: every waiting grant is marked, the token cap answers 409, the vote-removal guard counts only live expiring leases, and a stuck voter gate is repaired by removing the machine](adr/0321-four-lease-and-voter-readings-every-waiting-grant-is-marked.md)
   - [0322: How a promoted primary gets the backup repository key back, and what the API shows until then](adr/0322-how-a-promoted-primary-gets-the-backup-repository-key-back.md)
+  - [0323: A policy change off warm ends a lease conversion in flight](adr/0323-a-policy-change-off-warm-ends-a-lease-conversion-in-flight.md)
+  - [0324: A lost backup recovery key after a failover: M5b says that re-keying is not served yet, and replacing the backup repository comes after M5b](adr/0324-a-lost-backup-recovery-key-after-a-failover-m5b-says-that.md)
+  - [0325: The fencing-token ceiling applies to every operation that raises a token: a raise at the ceiling writes nothing and answers 409](adr/0325-the-fencing-token-ceiling-applies-to-every-operation-that.md)
+  - [0326: The rotation procedure for a removed or possibly compromised node-role machine includes user passwords](adr/0326-the-rotation-procedure-for-a-removed-or-possibly.md)
 
 # Background research
 
