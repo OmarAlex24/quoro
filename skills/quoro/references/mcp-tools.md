@@ -7,6 +7,7 @@ The quoro MCP server exposes exactly these tools. Each calls the same operation 
 | Tool | Endpoint | Scope |
 | --- | --- | --- |
 | `get_cluster` | `GET /api/v1/cluster` | `cluster:read` |
+| `get_capacity` | `GET /api/v1/cluster/capacity` | `cluster:read` |
 | `list_nodes` | `GET /api/v1/nodes` | `node:read` |
 | `get_node` | `GET /api/v1/nodes/{node_id}` | `node:read` |
 | `list_projects` | `GET /api/v1/projects` | `project:read` |
