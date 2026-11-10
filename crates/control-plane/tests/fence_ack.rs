@@ -1650,12 +1650,13 @@ async fn a_returning_lost_node_that_lists_some_of_its_leases_gets_all_revoked() 
 }
 
 /// Audit-log-format.md section 3.7: the `lease.revoke` record of a
-/// `declared_lost` revoke takes its app from the lease row only. A node
-/// declared lost that lists a lease with no row, under an id that is no
-/// app's, gets it revoked, and the record has no target rather than what
-/// the node sent.
+/// `declared_lost` revoke takes its app from the lease row. A node declared
+/// lost lists three leases with no row: one under an app that exists, which
+/// becomes the record's target; one under a well-formed `app_` id with no
+/// app; and one under an id that is no app's, oversized. Each is revoked,
+/// and the last two records have no target rather than what the node sent.
 #[tokio::test]
-async fn a_declared_lost_revoke_of_a_lease_with_no_row_records_no_target() {
+async fn a_declared_lost_revoke_of_a_lease_with_no_row_records_only_an_app_that_exists() {
     let server = start_with_patient_node_session().await;
     let owner = server.owner().await;
     let (node, app_id, lease_id) = declared_lost(&server, &owner).await;
@@ -1665,15 +1666,30 @@ async fn a_declared_lost_revoke_of_a_lease_with_no_row_records_no_target() {
         &mut socket,
         hello(
             &node.node_id,
-            vec![hello_lease(UNKNOWN_LEASE, &bogus, 1, "held")],
+            vec![
+                hello_lease(OTHER_LEASE, &app_id, 1, "held"),
+                hello_lease(SECOND_LEASE, SECOND_APP, 1, "held"),
+                hello_lease(UNKNOWN_LEASE, &bogus, 1, "held"),
+            ],
         ),
     )
     .await;
     let mut frames = recv_until(&mut socket, &["welcome", "lease_revoke"]).await;
-    frames.push(recv_frame(&mut socket).await);
+    while of_type(&frames, "lease_revoke").len() < 4 {
+        frames.push(recv_frame(&mut socket).await);
+    }
     let revokes: Vec<&Value> = of_type(&frames, "lease_revoke");
     let ids: Vec<&Value> = revokes.iter().map(|r| &r["body"]["lease_id"]).collect();
-    assert_eq!(ids, [&json!(UNKNOWN_LEASE), &json!(lease_id)], "{frames:?}");
+    assert_eq!(
+        ids,
+        [
+            &json!(OTHER_LEASE),
+            &json!(SECOND_LEASE),
+            &json!(UNKNOWN_LEASE),
+            &json!(lease_id)
+        ],
+        "{frames:?}"
+    );
     assert!(
         revokes
             .iter()
@@ -1686,12 +1702,24 @@ async fn a_declared_lost_revoke_of_a_lease_with_no_row_records_no_target() {
     .fetch_all(server.state.store.pool())
     .await
     .unwrap();
-    assert_eq!(rows.len(), 2, "{rows:?}");
-    assert_eq!((rows[0].0.as_deref(), rows[0].1.as_deref()), (None, None));
-    assert!(!rows[0].2.contains("not-an-app"), "{}", rows[0].2);
+    let targets: Vec<(Option<&str>, Option<&str>)> = rows
+        .iter()
+        .map(|(kind, id, _)| (kind.as_deref(), id.as_deref()))
+        .collect();
     assert_eq!(
-        (rows[1].0.as_deref(), rows[1].1.as_deref()),
-        (Some("app"), Some(app_id.as_str()))
+        targets,
+        [
+            (Some("app"), Some(app_id.as_str())),
+            (None, None),
+            (None, None),
+            (Some("app"), Some(app_id.as_str())),
+        ],
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .all(|(_, _, params)| !params.contains("not-an-app") && !params.contains(SECOND_APP)),
+        "{rows:?}"
     );
 }
 

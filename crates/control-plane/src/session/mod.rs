@@ -338,6 +338,25 @@ fn lease_app(lease: &leases::Lease) -> Option<String> {
     (lease.resource_type == "app").then(|| lease.resource_id.clone())
 }
 
+/// The app a listed lease with no row names, for its `lease.revoke` record:
+/// its `resource_id` when the listing says `app`, the id is a valid `app_`
+/// id, and that app exists. Anything else the node sent is not recorded.
+async fn listed_app(
+    conn: &mut sqlx::SqliteConnection,
+    listed: &wire::HelloLease,
+) -> Result<Option<String>, ApiError> {
+    if listed.resource_type != quoro_proto::ResourceType::App
+        || !crate::deploy::is_id_with_prefix("app", &listed.resource_id)
+    {
+        return Ok(None);
+    }
+    let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM apps WHERE id = ?")
+        .bind(&listed.resource_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    Ok(exists.map(|_| listed.resource_id.clone()))
+}
+
 /// The `params` of a `declared_lost` revoke's `lease.revoke` system record
 /// (audit-log-format.md section 3.7).
 fn lost_revoke_params(node_id: &str, fencing_token: u64) -> Value {
@@ -3588,12 +3607,24 @@ impl Session {
             ) {
                 if lost_at.is_some() {
                     revoke.reason = quoro_proto::RevokeReason::DeclaredLost;
-                    // The record's app comes from the row only: what the
-                    // node lists is not checked, so a lease with no row is
-                    // recorded with no target (audit-log-format.md section
-                    // 2, where the target is optional).
+                    // The record's app (audit-log-format.md section 3.7)
+                    // comes from the row; for a lease with no row, from the
+                    // listing only when it names an app that exists, and
+                    // otherwise the record has no target (section 2, where
+                    // the target is optional).
+                    let app_id = match &row {
+                        Some(row) => lease_app(row),
+                        None => match listed_app(&mut conn, claimed).await {
+                            Ok(app_id) => app_id,
+                            Err(e) => {
+                                tracing::warn!(code = %e.code.as_str(), lease_id = %claimed.lease_id, "cannot read the app a listed lease names");
+                                complete = false;
+                                continue;
+                            }
+                        },
+                    };
                     lost_records.push((
-                        row.as_ref().and_then(lease_app),
+                        app_id,
                         lost_revoke_params(&self.node_id, revoke.fencing_token),
                     ));
                     lost_revoked.insert(claimed.lease_id.clone());
