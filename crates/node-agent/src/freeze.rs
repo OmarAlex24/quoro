@@ -19,9 +19,18 @@
 //!   ([`NodeStore::store_log_batch`]), so a batch is either in the log the
 //!   command reads after its freeze or never stored, and a batch never stored
 //!   is never acknowledged;
-//! - **keeps its log as it stands.** No quarantine moves it aside
-//!   ([`NodeStore::quarantine_log`]), and the mark and the refollowing state
-//!   are left alone;
+//! - **keeps its log as it stands.** After the freeze commits, the agent
+//!   stores no entry and changes neither its log nor its refollowing state:
+//!   every write to them reads the flag in its own transaction, under the
+//!   write lock ([`NodeStore::store_log_batch`],
+//!   [`NodeStore::set_refollowing`], [`NodeStore::mark_quarantine`],
+//!   [`NodeStore::quarantine_log`]). The only later writes are two writes
+//!   of the mark, and neither turns a refusal of the promotion into a pass:
+//!   the mark lowered to the head a refollowing agent recorded before the
+//!   freeze, which the promotion refuses anyway (a lower mark only adds the
+//!   below-the-mark refusal, and comes down from [`follow::MAX_SEQ`] only
+//!   over an empty log); and the mark raised to a `seq` the frozen log
+//!   holds, for a batch that committed before the freeze or by `hello`;
 //! - **ends its session.** The session checks the flag every
 //!   [`SESSION_FREEZE_CHECK`], even when no `log_entries` arrives, and sends
 //!   no `hello` while it is set;
@@ -184,8 +193,10 @@ pub async fn abort(data_dir: &Path) -> Result<(), AgentError> {
 
 /// What `quoro cluster promote` reads from the agent's store for its
 /// refusals and its step 1 (section 7.3), before the freeze and again after
-/// it. Each value is read on its own; once a freeze holds, the agent changes
-/// none of them.
+/// it. Each value is read on its own. After the freeze commits, the agent
+/// stores no entry and changes neither its log nor its refollowing state;
+/// the only later writes are the two mark writes of the module
+/// documentation, and neither turns a refusal into a pass.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PromotionReads {
     /// The last verified `seq` of the followed log, 0 when it is empty.
@@ -198,6 +209,9 @@ pub struct PromotionReads {
     /// The change-log mark ([`follow::read_mark`]), `None` without a mark
     /// file.
     pub mark: Option<u64>,
+    /// Whether the followed log is below the mark (section 7.1 "The node's
+    /// mark", [`NodeStore::log_below_mark`]); no log is below a missing mark.
+    pub below_mark: bool,
     /// The refollowing state ([`NodeStore::refollowing`]).
     pub refollowing: Option<Refollowing>,
     /// Whether the log is quarantined: the node holds a copy the primary
@@ -222,13 +236,6 @@ impl PromotionReads {
     pub fn is_empty(&self) -> bool {
         self.log_seq == 0
     }
-
-    /// Whether the followed log is below the mark (section 7.1 "The node's
-    /// mark"); no log is below a missing mark.
-    #[must_use]
-    pub fn below_mark(&self) -> bool {
-        self.log_seq < self.mark.unwrap_or(0)
-    }
 }
 
 /// Reads [`PromotionReads`] from the agent's store.
@@ -248,6 +255,7 @@ pub async fn promotion_reads(store: &NodeStore) -> Result<PromotionReads, AgentE
         log_hash,
         head,
         mark,
+        below_mark: store.log_below_mark().await?,
         refollowing,
         quarantined,
         welcome_schema_version: store.welcome_schema_version().await?,
@@ -260,7 +268,7 @@ mod tests {
     use super::*;
     use crate::follow::{ZERO_HASH, verify_batch};
     use crate::identity::LOG_MARK_FILE;
-    use crate::store::BatchStored;
+    use crate::store::{BatchStored, FreezeChecked};
 
     struct TempDir(std::path::PathBuf);
 
@@ -335,7 +343,10 @@ mod tests {
             store.store_log_batch(&first, Some(5)).await.unwrap(),
             BatchStored::Stored
         );
-        store.set_refollowing(Refollowing::Head(5)).await.unwrap();
+        assert_eq!(
+            store.set_refollowing(Refollowing::Head(5)).await.unwrap(),
+            FreezeChecked::Written
+        );
 
         freeze(&dir.0).await.unwrap();
         let second = verified(4, &first[2].hash, 2, "a");
@@ -422,6 +433,7 @@ mod tests {
                 log_hash: ZERO_HASH.to_owned(),
                 head: None,
                 mark: None,
+                below_mark: false,
                 refollowing: None,
                 quarantined: false,
                 welcome_schema_version: None,
@@ -429,13 +441,15 @@ mod tests {
             }
         );
         assert!(fresh.is_empty());
-        assert!(!fresh.below_mark());
 
         let entries = verified(1, ZERO_HASH, 3, "a");
         store.store_log_batch(&entries, Some(7)).await.unwrap();
         store.raise_welcome_schema_version(14).await.unwrap();
         std::fs::write(dir.0.join(LOG_MARK_FILE), "5").unwrap();
-        store.set_refollowing(Refollowing::Head(7)).await.unwrap();
+        assert_eq!(
+            store.set_refollowing(Refollowing::Head(7)).await.unwrap(),
+            FreezeChecked::Written
+        );
         freeze(&dir.0).await.unwrap();
 
         let reads = promotion_reads(&store).await.unwrap();
@@ -445,7 +459,7 @@ mod tests {
         assert_eq!(head, 7);
         assert!(util::parse_rfc3339_nanos(&at).is_some(), "{at}");
         assert_eq!(reads.mark, Some(5));
-        assert!(reads.below_mark());
+        assert!(reads.below_mark);
         assert!(!reads.is_empty());
         assert_eq!(reads.refollowing, Some(Refollowing::Head(7)));
         assert!(!reads.quarantined, "a known head is refollowing only");
@@ -465,14 +479,185 @@ mod tests {
         assert!(reads.quarantined);
 
         // The same mark over a recorded head, and "head unknown" alone.
-        store.set_refollowing(Refollowing::Head(7)).await.unwrap();
+        assert_eq!(
+            store.set_refollowing(Refollowing::Head(7)).await.unwrap(),
+            FreezeChecked::Written
+        );
         assert!(promotion_reads(&store).await.unwrap().quarantined);
         std::fs::write(dir.0.join(LOG_MARK_FILE), "7").unwrap();
         assert!(!promotion_reads(&store).await.unwrap().quarantined);
-        store
-            .set_refollowing(Refollowing::HeadUnknown)
-            .await
-            .unwrap();
+        assert_eq!(
+            store
+                .set_refollowing(Refollowing::HeadUnknown)
+                .await
+                .unwrap(),
+            FreezeChecked::Written
+        );
         assert!(promotion_reads(&store).await.unwrap().quarantined);
+    }
+
+    /// The mark file's text, `None` when there is none.
+    fn mark_text(dir: &TempDir) -> Option<String> {
+        std::fs::read_to_string(dir.0.join(LOG_MARK_FILE)).ok()
+    }
+
+    /// How many copies the store recorded as quarantined.
+    async fn quarantined_copies(store: &NodeStore) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM quarantine")
+            .fetch_one(store.pool())
+            .await
+            .unwrap()
+    }
+
+    /// Section 7.3 "The freeze", section 7.1 "Refollowing": once a freeze
+    /// set over another connection committed, recording the refollowing
+    /// state returns frozen and writes nothing, over no state and over a
+    /// recorded one. Without the freeze it writes.
+    #[tokio::test]
+    async fn the_refollowing_state_is_not_written_once_a_freeze_committed() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        freeze(&dir.0).await.unwrap();
+        for state in [Refollowing::HeadUnknown, Refollowing::Head(5)] {
+            assert_eq!(
+                store.set_refollowing(state).await.unwrap(),
+                FreezeChecked::Frozen
+            );
+            assert_eq!(store.refollowing().await.unwrap(), None, "{state:?}");
+        }
+
+        unfreeze(&dir.0).await.unwrap();
+        assert_eq!(
+            store.set_refollowing(Refollowing::Head(5)).await.unwrap(),
+            FreezeChecked::Written
+        );
+        assert_eq!(
+            store.refollowing().await.unwrap(),
+            Some(Refollowing::Head(5))
+        );
+
+        freeze(&dir.0).await.unwrap();
+        assert_eq!(
+            store
+                .set_refollowing(Refollowing::HeadUnknown)
+                .await
+                .unwrap(),
+            FreezeChecked::Frozen
+        );
+        assert_eq!(
+            store.refollowing().await.unwrap(),
+            Some(Refollowing::Head(5))
+        );
+    }
+
+    /// Section 7.1 "Refollowing", section 7.3 "The freeze" (ADR 0261): once
+    /// a freeze set over another connection committed, the quarantine's
+    /// first writes return frozen and leave the mark file, there or missing,
+    /// and the refollowing state as they were. Without the freeze they write
+    /// the mark as 2^53 - 1 and record "head unknown", and move nothing.
+    #[tokio::test]
+    async fn the_quarantine_s_mark_and_state_are_not_written_once_a_freeze_committed() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let entries = verified(1, ZERO_HASH, 3, "a");
+        store.store_log_batch(&entries, Some(3)).await.unwrap();
+        freeze(&dir.0).await.unwrap();
+
+        std::fs::write(dir.0.join(LOG_MARK_FILE), "3").unwrap();
+        assert_eq!(
+            store.mark_quarantine().await.unwrap(),
+            FreezeChecked::Frozen
+        );
+        assert_eq!(mark_text(&dir).as_deref(), Some("3"));
+        assert_eq!(store.refollowing().await.unwrap(), None);
+
+        std::fs::remove_file(dir.0.join(LOG_MARK_FILE)).unwrap();
+        assert_eq!(
+            store.mark_quarantine().await.unwrap(),
+            FreezeChecked::Frozen
+        );
+        assert_eq!(mark_text(&dir), None);
+        assert_eq!(store.refollowing().await.unwrap(), None);
+
+        unfreeze(&dir.0).await.unwrap();
+        std::fs::write(dir.0.join(LOG_MARK_FILE), "3").unwrap();
+        assert_eq!(
+            store.mark_quarantine().await.unwrap(),
+            FreezeChecked::Written
+        );
+        assert_eq!(mark_text(&dir), Some(follow::MAX_SEQ.to_string()));
+        assert_eq!(
+            store.refollowing().await.unwrap(),
+            Some(Refollowing::HeadUnknown)
+        );
+        assert_eq!(store.log_entries().await.unwrap(), entries);
+    }
+
+    /// Section 7.1 "Refollowing", section 7.3 "The freeze" (ADR 0261, ADR
+    /// 0285): a freeze that commits between a quarantine's first writes and
+    /// the move leaves the log in place, read as quarantined, and the move
+    /// is finished by `recover` once the freeze ends, not before. A mark at
+    /// 2^53 - 1 with no state recorded is not finished while frozen either:
+    /// `recover` returns frozen and records nothing.
+    #[tokio::test]
+    async fn a_quarantine_a_freeze_stopped_reads_as_quarantined_and_finishes_after_it() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        let entries = verified(1, ZERO_HASH, 3, "a");
+        store.store_log_batch(&entries, Some(3)).await.unwrap();
+        assert_eq!(
+            store.mark_quarantine().await.unwrap(),
+            FreezeChecked::Written
+        );
+        freeze(&dir.0).await.unwrap();
+
+        assert!(store.quarantine_log("log_diverged: test").await.is_err());
+        assert!(follow::recover(&store).await.is_err());
+        assert_eq!(store.log_entries().await.unwrap(), entries);
+        assert_eq!(quarantined_copies(&store).await, 0);
+        let reads = promotion_reads(&store).await.unwrap();
+        assert_eq!(reads.log_seq, 3);
+        assert!(reads.quarantined);
+        assert_eq!(reads.refollowing, Some(Refollowing::HeadUnknown));
+        assert_eq!(reads.mark, Some(follow::MAX_SEQ));
+
+        unfreeze(&dir.0).await.unwrap();
+        assert_eq!(
+            follow::recover(&store).await.unwrap(),
+            FreezeChecked::Written
+        );
+        assert!(store.log_entries().await.unwrap().is_empty());
+        assert_eq!(quarantined_copies(&store).await, 1);
+        assert_eq!(
+            store.refollowing().await.unwrap(),
+            Some(Refollowing::HeadUnknown)
+        );
+
+        // The mark of a quarantine with no state recorded (ADR 0285).
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        store.store_log_batch(&entries, Some(3)).await.unwrap();
+        std::fs::write(dir.0.join(LOG_MARK_FILE), follow::MAX_SEQ.to_string()).unwrap();
+        freeze(&dir.0).await.unwrap();
+        assert_eq!(
+            follow::recover(&store).await.unwrap(),
+            FreezeChecked::Frozen
+        );
+        assert_eq!(store.refollowing().await.unwrap(), None);
+        assert_eq!(store.log_entries().await.unwrap(), entries);
+        assert_eq!(quarantined_copies(&store).await, 0);
+        assert!(promotion_reads(&store).await.unwrap().quarantined);
+
+        unfreeze(&dir.0).await.unwrap();
+        assert_eq!(
+            follow::recover(&store).await.unwrap(),
+            FreezeChecked::Written
+        );
+        assert_eq!(
+            store.refollowing().await.unwrap(),
+            Some(Refollowing::HeadUnknown)
+        );
+        assert!(store.log_entries().await.unwrap().is_empty());
+        assert_eq!(quarantined_copies(&store).await, 1);
     }
 }

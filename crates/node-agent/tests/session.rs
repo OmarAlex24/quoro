@@ -24,7 +24,7 @@ use quoro_node_agent::identity::{CUSTODY_KEY_FILE, LOG_MARK_FILE};
 use quoro_node_agent::ingress::{CertificateEvents, DnsBridge, IngressConfig, IngressSupervisor};
 use quoro_node_agent::reconcile::Snapshot;
 use quoro_node_agent::session::{Session, SessionEnd, SessionSetup};
-use quoro_node_agent::store::{NodeStore, Refollowing, VOTE};
+use quoro_node_agent::store::{FreezeChecked, NodeStore, PROMOTION_FREEZE, Refollowing, VOTE};
 use quoro_node_agent::tls;
 use quoro_node_agent::{FenceTimers, LeaseConfig, LeaseState, ManualHostClock, start_local_leases};
 use quoro_proto::custody::CustodyKey;
@@ -2088,10 +2088,13 @@ async fn a_copy_under_head_unknown_is_quarantined_before_hello() {
         let (setup, _observed) = follow_node(&dir).await;
         let store = setup.store.clone();
         seed_log(&store, &log_chain(1, ZEROS, 3, "old")).await;
-        store
-            .set_refollowing(Refollowing::HeadUnknown)
-            .await
-            .unwrap();
+        assert_eq!(
+            store
+                .set_refollowing(Refollowing::HeadUnknown)
+                .await
+                .unwrap(),
+            FreezeChecked::Written
+        );
         if let Some(mark) = mark {
             seed_mark(&dir, mark);
         }
@@ -2125,7 +2128,10 @@ async fn a_quarantine_mark_over_a_recorded_head_finishes_the_quarantine_before_h
     let store = setup.store.clone();
     let old = log_chain(1, ZEROS, 3, "old");
     seed_log(&store, &old).await;
-    store.set_refollowing(Refollowing::Head(5)).await.unwrap();
+    assert_eq!(
+        store.set_refollowing(Refollowing::Head(5)).await.unwrap(),
+        FreezeChecked::Written
+    );
     seed_mark(&dir, MAX_SEQ_TEXT);
 
     let (mut ws, hello, serving) = open_session(Session::new(setup)).await;
@@ -2166,7 +2172,10 @@ async fn a_mark_above_the_recorded_head_is_lowered_to_it_before_the_next_batch()
     let dir = TempDir::new();
     let (setup, _observed) = follow_node(&dir).await;
     let store = setup.store.clone();
-    store.set_refollowing(Refollowing::Head(5)).await.unwrap();
+    assert_eq!(
+        store.set_refollowing(Refollowing::Head(5)).await.unwrap(),
+        FreezeChecked::Written
+    );
 
     let (mut ws, hello, serving) = open_session(Session::new(setup)).await;
     assert_eq!(hello["body"]["log_seq"], 0);
@@ -2465,7 +2474,10 @@ async fn the_batch_that_reaches_the_head_ends_refollowing_and_raises_the_mark() 
     let store = setup.store.clone();
     let new = log_chain(1, ZEROS, 2, "new");
     seed_log(&store, &new).await;
-    store.set_refollowing(Refollowing::Head(5)).await.unwrap();
+    assert_eq!(
+        store.set_refollowing(Refollowing::Head(5)).await.unwrap(),
+        FreezeChecked::Written
+    );
     seed_mark(&dir, "5");
 
     let (mut ws, hello, serving) = open_session(Session::new(setup)).await;
@@ -3785,9 +3797,9 @@ async fn an_agent_started_frozen_never_dials_until_the_freeze_ends() {
 /// Section 7.3 "The freeze" and section 4.4: a dial attempt under way when
 /// the freeze commits ends. Here `primary_url` refuses, as a primary that is
 /// down does, so the attempt redials it for 2 s and would then try the
-/// advertised address, which accepts and never answers. Frozen at 0.5 s, the
-/// agent never reaches that address while the freeze lasts, and does once it
-/// ends.
+/// advertised address, which accepts and never answers. Frozen at 0.1 s,
+/// well before the dial loop's first check of the flag at 1 s, the agent
+/// never reaches that address while the freeze lasts, and does once it ends.
 #[tokio::test]
 async fn a_freeze_ends_a_dial_attempt_under_way() {
     let dir = TempDir::new();
@@ -3808,7 +3820,7 @@ async fn a_freeze_ends_a_dial_attempt_under_way() {
     let (_store, stop, running) =
         dialing_agent(&dir, &closed, &"0".repeat(64), &[silent_url]).await;
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     freeze::freeze(dir.path()).await.unwrap();
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(
@@ -3830,4 +3842,97 @@ async fn a_freeze_ends_a_dial_attempt_under_way() {
     let _ = stop.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
     listener.abort();
+}
+
+/// Section 7.3 "The freeze" (ADR 0261): a `log_diverged` handled after a
+/// freeze committed changes nothing. The freeze is set over another
+/// connection between `hello` and `welcome`, and the error follows
+/// `welcome` at once, so the session handles it before its own timer would
+/// see the flag. The session ends with no `hello` or `log_ack`, and the
+/// mark, the refollowing state and the log's newest `seq` and hash stay as
+/// they were, with no quarantined copy.
+#[tokio::test]
+async fn log_diverged_after_the_freeze_changes_nothing_and_ends_the_session() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    let entries = log_chain(1, ZEROS, 3, "a");
+    seed_log(&store, &entries).await;
+    seed_mark(&dir, "3");
+    let (mut ws, hello, serving) = open_session(Session::new(setup)).await;
+    assert_eq!(hello["body"]["log_seq"], 3);
+
+    freeze::freeze(dir.path()).await.unwrap();
+    send(&mut ws, welcome_frame(1, hello["id"].as_str().unwrap())).await;
+    send(&mut ws, diverged_frame("msg_diverged")).await;
+    let frames = frames_until_closed_within(&mut ws, Duration::from_secs(2)).await;
+    assert_no_hello_or_ack(&frames);
+    let (_session, end) = ended_with(serving).await;
+    assert_eq!(end, SessionEnd::Frozen);
+    assert_eq!(mark_text(&dir).as_deref(), Some("3"));
+    assert_eq!(store.refollowing().await.unwrap(), None);
+    assert_eq!(
+        store.log_position().await.unwrap(),
+        (3, entries[2]["hash"].as_str().unwrap().to_owned())
+    );
+    assert_eq!(stored_log(&store).await, entries);
+    assert_eq!(quarantined(&store).await, 0);
+    assert!(!dir.path().join("quarantine").exists());
+}
+
+/// Section 7.3 "The freeze", section 7.1 "Refollowing" (ADR 0261, ADR
+/// 0280): a frozen agent refollowing with the head unknown that receives
+/// `log_entries` records no head, leaves the mark at 2^53 - 1, stores
+/// nothing and answers nothing. The test holds SQLite's write lock with the
+/// freeze written but not committed, so the session passes its first read
+/// of the flag and waits in the transaction that would record the head;
+/// the freeze then commits, and that transaction reads it.
+#[tokio::test]
+async fn a_frozen_agent_refollowing_with_the_head_unknown_records_no_head() {
+    let dir = TempDir::new();
+    let (setup, _observed) = follow_node(&dir).await;
+    let store = setup.store.clone();
+    assert_eq!(
+        store
+            .set_refollowing(Refollowing::HeadUnknown)
+            .await
+            .unwrap(),
+        FreezeChecked::Written
+    );
+    seed_mark(&dir, MAX_SEQ_TEXT);
+    let (mut ws, hello, serving) = follow_session(Session::new(setup)).await;
+    assert_eq!(hello["body"]["log_seq"], 0);
+
+    let mut freezing = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+    sqlx::query("INSERT INTO node_meta (key, value) VALUES (?, ?)")
+        .bind(PROMOTION_FREEZE)
+        .bind("2026-11-10T00:00:00Z")
+        .execute(&mut *freezing)
+        .await
+        .unwrap();
+    send(
+        &mut ws,
+        log_entries_frame(log_chain(1, ZEROS, 2, "new"), Some(5), "msg_log_1"),
+    )
+    .await;
+    // Well inside the store's 5 s busy timeout, which the session's own
+    // transaction waits on.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    freezing.commit().await.unwrap();
+
+    let frames = frames_until_closed_within(&mut ws, Duration::from_secs(2)).await;
+    assert_no_hello_or_ack(&frames);
+    assert!(
+        frames.iter().all(|frame| frame["re"] != "msg_log_1"),
+        "no answer: {frames:?}"
+    );
+    let (_session, end) = ended_with(serving).await;
+    assert_eq!(end, SessionEnd::Frozen);
+    assert_eq!(
+        store.refollowing().await.unwrap(),
+        Some(Refollowing::HeadUnknown)
+    );
+    assert_eq!(mark_text(&dir).as_deref(), Some(MAX_SEQ_TEXT));
+    assert!(stored_log(&store).await.is_empty());
+    assert_eq!(store.log_head().await.unwrap(), None);
 }

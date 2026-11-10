@@ -53,7 +53,7 @@ use crate::lease::{HostClock, LeaseLink, SystemHostClock};
 use crate::logs::{LogFilter, StoredLogLine};
 use crate::metrics::{MetricsRing, Tick, parse_metrics_params, tick_report};
 use crate::reconcile::Snapshot;
-use crate::store::{BatchStored, NodeStore, Refollowing};
+use crate::store::{BatchStored, FreezeChecked, NodeStore, Refollowing};
 use crate::tls::{self, Endpoint};
 use crate::vote::{self, Received, SupportAnswer, TermCheck};
 use crate::{AgentError, FatalReason, NodeFacts, util};
@@ -842,8 +842,14 @@ impl Session {
         //    A frozen agent sends no `hello` at all, and neither finishes a
         //    quarantine nor raises its mark, so its log stays as it stands
         //    (section 7.3 "The freeze"). A freeze that commits after this
-        //    check and before `hello` leaves is harmless: that `hello`
-        //    reports the frozen log, which is what the promotion reads.
+        //    check is harmless. `follow::recover` records a refollowing
+        //    state and moves a copy aside only in transactions that read
+        //    the freeze, and stops without `hello` when one refuses. What
+        //    may still land after the freeze is a mark lowered to the head
+        //    the agent refollows to, or raised by `hello` to the newest
+        //    `seq` of the frozen log, the two mark writes `freeze` allows.
+        //    That `hello` then reports the frozen log, which is what the
+        //    promotion reads.
         match freeze::is_frozen(&self.store).await {
             Ok(false) => {}
             Ok(true) => {
@@ -855,9 +861,16 @@ impl Session {
                 return Ok(SessionEnd::Reconnect);
             }
         }
-        if let Err(e) = follow::recover(&self.store).await {
-            warn!(error = %e, "could not finish the change-log quarantine or refollowing before hello; reconnecting");
-            return Ok(SessionEnd::Reconnect);
+        match follow::recover(&self.store).await {
+            Ok(FreezeChecked::Written) => {}
+            Ok(FreezeChecked::Frozen) => {
+                info!("a promotion on this host froze the agent; no hello");
+                return Ok(SessionEnd::Frozen);
+            }
+            Err(e) => {
+                warn!(error = %e, "could not finish the change-log quarantine or refollowing before hello; reconnecting");
+                return Ok(SessionEnd::Reconnect);
+            }
         }
         let hello = match self.hello().await {
             Ok(hello) => hello,
@@ -1643,17 +1656,12 @@ impl Session {
                 }
                 if error.code == ErrorCode::LogDiverged {
                     // Section 7.3 "The freeze": a frozen agent keeps its log
-                    // as it stands, mark and refollowing state included. The
-                    // primary declares it diverged again at the `hello`
-                    // after the freeze ends.
-                    if freeze::is_frozen(&self.store).await? {
-                        info!(
-                            "a promotion on this host froze the agent; log_diverged waits for the freeze to end"
-                        );
-                        return Ok(Some(SessionEnd::Frozen));
-                    }
-                    self.on_log_diverged(&error.message).await?;
-                    return Ok(None);
+                    // as it stands, mark and refollowing state included.
+                    // `on_log_diverged` reads the freeze under the write lock
+                    // its first writes hold, and ends the session when it is
+                    // set. The primary declares the log diverged again at the
+                    // `hello` after the freeze ends.
+                    return self.on_log_diverged(&error.message).await;
                 }
                 warn!(
                     code = ?error.code,
@@ -1865,11 +1873,14 @@ impl Session {
     /// in its own transaction ([`NodeStore::store_log_batch`]).
     ///
     /// While a promotion on this host froze the agent (section 7.3 "The
-    /// freeze", ADR 0261), nothing is stored, the refollowing state and the
-    /// mark stay as they are, nothing is answered, and the session ends with
+    /// freeze", ADR 0261), nothing is stored, the refollowing state stays as
+    /// it is, nothing is answered, and the session ends with
     /// [`SessionEnd::Frozen`]. The flag is read first, and again inside the
-    /// transaction that would store the batch, which settles a freeze that
-    /// commits in between.
+    /// transactions that would record the head ([`NodeStore::set_refollowing`])
+    /// and store the batch ([`NodeStore::store_log_batch`]), which settles a
+    /// freeze that commits in between. The only writes that may still follow
+    /// a freeze are the mark's, and neither turns a refusal of the promotion
+    /// into a pass (see the comment in the body).
     async fn on_log_entries<S>(
         &mut self,
         raw: &RawFrame,
@@ -1904,6 +1915,26 @@ impl Session {
             }
         };
         let data_dir = self.store.data_dir();
+        // Section 7.3 "The freeze" (ADR 0261, ADR 0280): a freeze may commit
+        // between the check above and the transactions below. Then no entry
+        // is stored and the refollowing state is not written, but two writes
+        // of the mark may still land after the freeze, and neither turns a
+        // refusal of the promotion into a pass:
+        //
+        // - `lower_mark` runs only while the agent refollows to a head it
+        //   recorded before the freeze, and the promotion refuses a
+        //   refollowing agent anyway. A lower mark can only add the
+        //   below-the-mark refusal, which `--accept-loss` lifts together
+        //   with the refollowing one. The mark comes down from
+        //   `follow::MAX_SEQ`, which reads as quarantined, only in the
+        //   "head unknown" arm, and there the log is empty: nothing is
+        //   stored in that state, and a session reaches it only once the
+        //   copy was moved aside, by `follow::recover` before `hello` or by
+        //   `on_log_diverged`, whose failure ends the session. An empty log
+        //   is refused without a lift.
+        // - `raise_mark` runs below for a batch whose transaction committed
+        //   before the freeze, so the raised mark is a `seq` the frozen log
+        //   holds, and that log is not below it.
         match self.store.refollowing().await? {
             Some(Refollowing::HeadUnknown) => {
                 let Some(head_seq) = body.head_seq else {
@@ -1944,9 +1975,18 @@ impl Session {
                     write_message(sink, NodeMessage::Error(error), Some(&raw.id)).await?;
                     return Ok(None);
                 }
-                self.store
+                if self
+                    .store
                     .set_refollowing(Refollowing::Head(head_seq))
-                    .await?;
+                    .await?
+                    == FreezeChecked::Frozen
+                {
+                    // The freeze committed after the check above: no head
+                    // is recorded, the mark is not lowered, and nothing is
+                    // stored or answered.
+                    info!("a promotion on this host froze the agent; log_entries not stored");
+                    return Ok(Some(SessionEnd::Frozen));
+                }
                 follow::lower_mark(data_dir, head_seq).await?;
                 info!(
                     head_seq,
@@ -1989,7 +2029,8 @@ impl Session {
             // promotion reads the log after its freeze, so the log it builds
             // from holds every entry this ack reports, and the old primary
             // counts nothing replicated that the new database lacks (section
-            // 7.3 "The freeze", ADR 0261).
+            // 7.3 "The freeze", ADR 0261). The mark raised for it is the one
+            // the comment above the refollowing arms allows.
             follow::raise_mark(data_dir, last.seq).await?;
             let ack = LogAck {
                 seq: last.seq,
@@ -2010,9 +2051,29 @@ impl Session {
     /// so the session ends. When the mark write itself failed nothing
     /// changed, and the next `hello` draws `log_diverged` again; after it,
     /// [`follow::recover`] finishes the quarantine before the next `hello`.
-    async fn on_log_diverged(&self, message: &str) -> Result<(), AgentError> {
-        follow::write_mark(self.store.data_dir(), follow::MAX_SEQ).await?;
-        self.store.set_refollowing(Refollowing::HeadUnknown).await?;
+    /// `None` goes on with the session.
+    ///
+    /// The mark and the state are written by [`NodeStore::mark_quarantine`],
+    /// which reads the promotion freeze (section 7.3 "The freeze") under the
+    /// write lock it holds for both. When a promotion froze the agent first,
+    /// nothing is written and the session ends with [`SessionEnd::Frozen`]
+    /// and no further frame.
+    ///
+    /// A freeze that commits after the two and before the copy moves stops
+    /// the move: [`NodeStore::quarantine_log`] reads the freeze in its own
+    /// transaction, refuses, and the session ends. The log then stays as the
+    /// promotion reads it, with the mark at [`follow::MAX_SEQ`] and "head
+    /// unknown", which reads as quarantined
+    /// ([`crate::freeze::PromotionReads::quarantined`]), so the promotion
+    /// refuses it. Once the freeze ends, [`follow::recover`] finds "head
+    /// unknown" and moves the copy aside before the next `hello`.
+    async fn on_log_diverged(&self, message: &str) -> Result<Option<SessionEnd>, AgentError> {
+        if self.store.mark_quarantine().await? == FreezeChecked::Frozen {
+            info!(
+                "a promotion on this host froze the agent; log_diverged waits for the freeze to end"
+            );
+            return Ok(Some(SessionEnd::Frozen));
+        }
         let reason = format!("log_diverged: {message}");
         match self.store.quarantine_log(&reason).await? {
             Some(path) => warn!(
@@ -2025,7 +2086,7 @@ impl Session {
                 "the primary reported a diverged change log, but the local copy is empty"
             ),
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Verifies and persists one `signing_key_rotate` (section 5.21).

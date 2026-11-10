@@ -636,6 +636,20 @@ pub enum BatchStored {
     Frozen,
 }
 
+/// What a write that the promotion freeze refuses did
+/// ([`NodeStore::set_refollowing`], [`NodeStore::mark_quarantine`], section
+/// 7.3 "The freeze", ADR 0261). Each such write reads the freeze inside its
+/// own `BEGIN IMMEDIATE` transaction, as [`NodeStore::store_log_batch`] does,
+/// so it either commits before a freeze or writes nothing.
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FreezeChecked {
+    /// The agent was not frozen, and the write committed.
+    Written,
+    /// A promotion on this host froze the agent: nothing was written.
+    Frozen,
+}
+
 /// The connection settings of `<data_dir>/node.db`, shared by every
 /// connection to it: the agent's pool and the single connection a promotion
 /// opens from its own process to freeze the agent ([`crate::freeze`]).
@@ -2485,15 +2499,66 @@ impl NodeStore {
     /// Records the refollowing state and commits it (section 7.1
     /// "Refollowing"). Only [`Self::store_log_batch`] ends it.
     ///
+    /// The transaction starts with `BEGIN IMMEDIATE` and first reads the
+    /// promotion freeze ([`PROMOTION_FREEZE`], section 7.3 "The freeze"), as
+    /// [`Self::store_log_batch`] does. When it is set, nothing is written and
+    /// the result is [`FreezeChecked::Frozen`], so once a freeze has
+    /// committed the refollowing state stays as the promotion read it.
+    ///
     /// # Errors
     ///
-    /// [`AgentError::Store`] on a SQLite failure.
-    pub async fn set_refollowing(&self, state: Refollowing) -> Result<(), AgentError> {
-        let value = match state {
-            Refollowing::HeadUnknown => REFOLLOWING_HEAD_UNKNOWN.to_owned(),
-            Refollowing::Head(head) => head.to_string(),
-        };
-        self.set_meta(LOG_REFOLLOWING, &value).await
+    /// [`AgentError::Store`] on a SQLite failure; nothing is written then.
+    pub async fn set_refollowing(&self, state: Refollowing) -> Result<FreezeChecked, AgentError> {
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(store_error)?;
+        if meta_on(&mut tx, PROMOTION_FREEZE).await?.is_some() {
+            tx.rollback().await.map_err(store_error)?;
+            return Ok(FreezeChecked::Frozen);
+        }
+        set_refollowing_on(&mut tx, state).await?;
+        tx.commit().await.map_err(store_error)?;
+        Ok(FreezeChecked::Written)
+    }
+
+    /// The first two steps of a quarantine on `log_diverged` (section 7.1
+    /// "Refollowing", ADR 0261), unless a promotion froze the agent: the
+    /// change-log mark is written as [`crate::follow::MAX_SEQ`] and synced,
+    /// then "refollowing, head unknown" is recorded. Moving the copy aside,
+    /// the third step, is [`Self::quarantine_log`].
+    ///
+    /// Both happen while one `BEGIN IMMEDIATE` transaction holds SQLite's
+    /// write lock, after its first read, the promotion freeze
+    /// ([`PROMOTION_FREEZE`], section 7.3 "The freeze"). When that is set,
+    /// the transaction rolls back, the mark file is not touched and the
+    /// result is [`FreezeChecked::Frozen`]. Otherwise a freeze from another
+    /// process waits on its busy timeout until this commits, so it never
+    /// commits between the flag read and the mark: a quarantine either
+    /// writes both before the freeze or neither.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Io`] when the mark cannot be written and synced, and
+    /// [`AgentError::Store`] on a SQLite failure. A failure after the mark
+    /// was written leaves the mark at [`crate::follow::MAX_SEQ`] with no
+    /// state recorded, which [`crate::follow::recover`] finishes before the
+    /// next `hello` (ADR 0285).
+    pub async fn mark_quarantine(&self) -> Result<FreezeChecked, AgentError> {
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(store_error)?;
+        if meta_on(&mut tx, PROMOTION_FREEZE).await?.is_some() {
+            tx.rollback().await.map_err(store_error)?;
+            return Ok(FreezeChecked::Frozen);
+        }
+        crate::follow::write_mark(&self.data_dir, crate::follow::MAX_SEQ).await?;
+        set_refollowing_on(&mut tx, Refollowing::HeadUnknown).await?;
+        tx.commit().await.map_err(store_error)?;
+        Ok(FreezeChecked::Written)
     }
 
     /// Whether the stored copy of the change log is below the change-log
@@ -2501,8 +2566,8 @@ impl NodeStore {
     /// lower than the mark. No log is below a missing mark. Such a log lost
     /// entries the node once acknowledged, or is refollowing toward the
     /// mark, and `quoro cluster promote` refuses on it without
-    /// `--accept-loss` (section 7.3). The agent itself does not read it yet;
-    /// the promotion will.
+    /// `--accept-loss` (section 7.3). The agent itself does not read it; the
+    /// promotion does, through [`crate::freeze::promotion_reads`].
     ///
     /// # Errors
     ///
@@ -2583,8 +2648,10 @@ impl NodeStore {
     /// While a promotion froze the agent the copy stays as it stands (section
     /// 7.3 "The freeze"): the transaction holds the write lock before it
     /// reads the freeze, as [`Self::store_log_batch`] does, and when it is
-    /// set the file is removed and nothing changes. Whoever asked for the
-    /// quarantine finishes it after the freeze ([`crate::follow::recover`]).
+    /// set the file is removed and nothing changes. [`Self::mark_quarantine`]
+    /// committed the mark and "head unknown" before, so the copy reads as
+    /// quarantined meanwhile, and [`crate::follow::recover`] moves it aside
+    /// before the first `hello` after the freeze.
     ///
     /// # Errors
     ///
@@ -2690,6 +2757,27 @@ async fn meta_on(
         .fetch_optional(conn)
         .await
         .map_err(store_error)
+}
+
+/// Records the refollowing state on `conn`, inside the caller's transaction.
+async fn set_refollowing_on(
+    conn: &mut sqlx::SqliteConnection,
+    state: Refollowing,
+) -> Result<(), AgentError> {
+    let value = match state {
+        Refollowing::HeadUnknown => REFOLLOWING_HEAD_UNKNOWN.to_owned(),
+        Refollowing::Head(head) => head.to_string(),
+    };
+    sqlx::query(
+        "INSERT INTO node_meta (key, value) VALUES (?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(LOG_REFOLLOWING)
+    .bind(value)
+    .execute(conn)
+    .await
+    .map_err(store_error)?;
+    Ok(())
 }
 
 /// Stores `term` as the highest term seen when it is above the stored one,
@@ -4291,10 +4379,13 @@ mod tests {
         let store = NodeStore::open(&dir.0).await.unwrap();
         assert_eq!(store.refollowing().await.unwrap(), None);
 
-        store
-            .set_refollowing(Refollowing::HeadUnknown)
-            .await
-            .unwrap();
+        assert_eq!(
+            store
+                .set_refollowing(Refollowing::HeadUnknown)
+                .await
+                .unwrap(),
+            FreezeChecked::Written
+        );
         assert_eq!(
             store.refollowing().await.unwrap(),
             Some(Refollowing::HeadUnknown)
@@ -4304,16 +4395,22 @@ mod tests {
             Some("head unknown")
         );
         for head in [0, 42, crate::follow::MAX_SEQ, u64::MAX] {
-            store
-                .set_refollowing(Refollowing::Head(head))
-                .await
-                .unwrap();
+            assert_eq!(
+                store
+                    .set_refollowing(Refollowing::Head(head))
+                    .await
+                    .unwrap(),
+                FreezeChecked::Written
+            );
             assert_eq!(
                 store.refollowing().await.unwrap(),
                 Some(Refollowing::Head(head))
             );
         }
-        store.set_refollowing(Refollowing::Head(42)).await.unwrap();
+        assert_eq!(
+            store.set_refollowing(Refollowing::Head(42)).await.unwrap(),
+            FreezeChecked::Written
+        );
         assert_eq!(refollowing_value(&store).await.as_deref(), Some("42"));
         drop(store);
 
@@ -4336,7 +4433,10 @@ mod tests {
             let store = NodeStore::open(&dir.0).await.unwrap();
             let entries = verified(1, ZERO_HASH, 3, "a");
             store.store_log_batch(&entries, Some(3)).await.unwrap();
-            store.set_refollowing(state).await.unwrap();
+            assert_eq!(
+                store.set_refollowing(state).await.unwrap(),
+                FreezeChecked::Written
+            );
 
             assert!(store.quarantine_log("test").await.unwrap().is_some());
             assert!(store.log_entries().await.unwrap().is_empty());
@@ -4353,7 +4453,10 @@ mod tests {
     async fn the_batch_that_reaches_the_head_ends_refollowing_with_it() {
         let dir = TempDir::new();
         let store = NodeStore::open(&dir.0).await.unwrap();
-        store.set_refollowing(Refollowing::Head(5)).await.unwrap();
+        assert_eq!(
+            store.set_refollowing(Refollowing::Head(5)).await.unwrap(),
+            FreezeChecked::Written
+        );
         let first = verified(1, ZERO_HASH, 3, "a");
         assert_eq!(
             store.store_log_batch(&first, Some(5)).await.unwrap(),
@@ -4388,10 +4491,13 @@ mod tests {
         // does.
         let dir = TempDir::new();
         let store = NodeStore::open(&dir.0).await.unwrap();
-        store
-            .set_refollowing(Refollowing::HeadUnknown)
-            .await
-            .unwrap();
+        assert_eq!(
+            store
+                .set_refollowing(Refollowing::HeadUnknown)
+                .await
+                .unwrap(),
+            FreezeChecked::Written
+        );
         assert_eq!(
             store.store_log_batch(&first, Some(2)).await.unwrap(),
             BatchStored::Stored
@@ -4400,7 +4506,10 @@ mod tests {
             store.refollowing().await.unwrap(),
             Some(Refollowing::HeadUnknown)
         );
-        store.set_refollowing(Refollowing::Head(2)).await.unwrap();
+        assert_eq!(
+            store.set_refollowing(Refollowing::Head(2)).await.unwrap(),
+            FreezeChecked::Written
+        );
         let more = verified(4, &first[2].hash, 1, "a");
         assert_eq!(
             store.store_log_batch(&more, None).await.unwrap(),

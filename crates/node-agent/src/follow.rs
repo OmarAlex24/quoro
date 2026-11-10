@@ -33,7 +33,7 @@ use tracing::warn;
 
 use crate::AgentError;
 use crate::identity;
-use crate::store::{NodeStore, Refollowing};
+use crate::store::{FreezeChecked, NodeStore, Refollowing};
 use crate::util;
 
 /// The highest `seq` the change log carries, 2^53 - 1 (section 7.1
@@ -77,7 +77,8 @@ pub fn read_mark(data_dir: &Path) -> Result<Option<u64>, AgentError> {
 /// [`identity::write_private`], which syncs the file and the directory, so
 /// the mark is durable before the `log_ack` or `hello` it covers goes out
 /// (section 7.1). The write runs off the async runtime. Only a quarantine
-/// writes it directly, as [`MAX_SEQ`]; every other write goes through
+/// writes it directly, as [`MAX_SEQ`], under the write lock of
+/// [`NodeStore::mark_quarantine`]; every other write goes through
 /// [`raise_mark`] or [`lower_mark`].
 ///
 /// # Errors
@@ -149,12 +150,20 @@ pub(crate) async fn lower_mark(data_dir: &Path, seq: u64) -> Result<bool, AgentE
 /// - **The state is [`Refollowing::Head`] `h` and the mark is above `h` or
 ///   missing:** the mark is lowered to `h` ([`lower_mark`]).
 ///
+/// While a promotion froze the agent (section 7.3 "The freeze"), the
+/// refollowing state is not written: [`NodeStore::set_refollowing`] reads
+/// the freeze in its own transaction, and when it refuses, this stops there
+/// and returns [`FreezeChecked::Frozen`], so the session sends no `hello`.
+/// A copy is not moved aside either: [`NodeStore::quarantine_log`] refuses
+/// with an error. Otherwise it returns [`FreezeChecked::Written`], also when
+/// there was nothing to write.
+///
 /// # Errors
 ///
 /// The errors of the store, of [`read_mark`] and of the writes. The session
 /// then sends no `hello`: it would report a copy that must first be moved
 /// aside, or a mark it could not keep.
-pub(crate) async fn recover(store: &NodeStore) -> Result<(), AgentError> {
+pub(crate) async fn recover(store: &NodeStore) -> Result<FreezeChecked, AgentError> {
     let data_dir = store.data_dir();
     let mut state = store.refollowing().await?;
     if read_mark(data_dir)? == Some(MAX_SEQ) && state != Some(Refollowing::HeadUnknown) {
@@ -162,7 +171,9 @@ pub(crate) async fn recover(store: &NodeStore) -> Result<(), AgentError> {
             state = ?state,
             "the change-log mark is at its quarantine value with the head not unknown; finishing the quarantine"
         );
-        store.set_refollowing(Refollowing::HeadUnknown).await?;
+        if store.set_refollowing(Refollowing::HeadUnknown).await? == FreezeChecked::Frozen {
+            return Ok(FreezeChecked::Frozen);
+        }
         state = Some(Refollowing::HeadUnknown);
     }
     match state {
@@ -176,6 +187,10 @@ pub(crate) async fn recover(store: &NodeStore) -> Result<(), AgentError> {
             }
         }
         Some(Refollowing::Head(head)) => {
+            // A freeze that committed meanwhile does not hold this back: it
+            // is the lowered mark of a refollowing agent, one of the two mark
+            // writes `crate::freeze` allows after a freeze. The mark here is
+            // never `MAX_SEQ`, which the arm above turned into "head unknown".
             let lowered = lower_mark(data_dir, head).await?;
             if lowered {
                 warn!(
@@ -186,7 +201,7 @@ pub(crate) async fn recover(store: &NodeStore) -> Result<(), AgentError> {
         }
         None => {}
     }
-    Ok(())
+    Ok(FreezeChecked::Written)
 }
 
 /// `prev_hash` of `seq` 1, and `log_hash` while `log_seq` is 0 (sections 5.1
