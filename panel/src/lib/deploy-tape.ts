@@ -656,6 +656,12 @@ export function nodeLineSpans(
 
 /* ---------- words and numbers ---------- */
 
+/** The last path segment of an image reference, `atlas-worker:1.9`. */
+export const imageLabel = (image: string): string => {
+  if (image.startsWith('build.quoro.invalid/')) return 'a built image';
+  return image.split('/').pop() ?? image;
+};
+
 const pad2 = (value: number): string => String(value).padStart(2, '0');
 
 /** A span as the stepper writes it: `0.4s`, `6s`, `1m 08s`, `1h 02m`. */
