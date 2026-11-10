@@ -37,6 +37,47 @@
   --k-vm: #e68ccf;
   --scrim: rgb(6 8 13 / 0.55);
   --shadow: 0 18px 40px -18px rgb(0 0 0 / 0.7);
+  /* Surfaces: a lit top edge, a short gradient and two shadow levels (resting, lifted). */
+  --hi: rgb(255 255 255 / 0.05);
+  --lift-1: 0 1px 0 rgb(0 0 0 / 0.35), 0 12px 24px -16px rgb(0 0 0 / 0.75);
+  --lift-2: 0 1px 0 rgb(0 0 0 / 0.4), 0 28px 56px -24px rgb(0 0 0 / 0.9);
+  --glow: color-mix(in oklab, var(--accent-solid) 9%, transparent);
+  --btn-edge: rgb(0 0 0 / 0.3);
+  /* Amber behind text: a tint in dark; in light a neutral fill with amber on the edge. */
+  --shift-fill: color-mix(in oklab, var(--shift) 15%, transparent);
+  --shift-edge: transparent;
+  /*
+   * Tag text: nearly the tone itself in dark (10 % ink keeps red at 4.5:1 on a
+   * card's lit top); in light mixed further with ink, for the same reason.
+   */
+  --tag-ink: 90%;
+  /* The fill behind a danger button's red text on hover. */
+  --fault-wash: color-mix(in oklab, var(--fault) 10%, var(--surface));
+  /* The lit top of a primary button: lighter in light, less so in dark to keep white words at 4.5:1. */
+  --primary-top: color-mix(in oklab, var(--accent-solid) 94%, white);
+  /*
+   * Motion (ADR 0318): one curve for the whole panel, one duration for
+   * feedback (hover, press, focus) and one for what enters, leaves or changes
+   * state. Loops that show work in progress keep their own rhythm. All of it
+   * is off under prefers-reduced-motion.
+   */
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --motion-feedback: 160ms;
+  --motion-change: 280ms;
+  /*
+   * A surface's face (a short gradient down to the surface), the shadow a card
+   * rests on, the one it lifts to, and the one under what floats over the page.
+   */
+  --face: linear-gradient(180deg, var(--surface-hi), var(--surface) 72%);
+  --card-rest: inset 0 1px 0 var(--hi), var(--lift-1);
+  --card-up: inset 0 1px 0 var(--hi), var(--lift-2);
+  --overlay-rest: inset 0 1px 0 var(--hi), var(--lift-2), 0 0 0 1px rgb(0 0 0 / 0.2);
+  /* Type scale: page titles, card titles, body, secondary, the smallest text. */
+  --type-title: 22px;
+  --type-card: 15px;
+  --type-body: 13.5px;
+  --type-small: 12.5px;
+  --type-min: 11.5px;
 }
 
 @media (prefers-color-scheme: light) {
@@ -69,6 +110,16 @@
     --k-vm: #b03a95;
     --scrim: rgb(20 26 40 / 0.22);
     --shadow: 0 18px 40px -20px rgb(20 30 60 / 0.35);
+    --hi: rgb(255 255 255 / 0.9);
+    --lift-1: 0 1px 1px rgb(20 30 60 / 0.05), 0 10px 22px -16px rgb(20 30 60 / 0.28);
+    --lift-2: 0 1px 2px rgb(20 30 60 / 0.06), 0 24px 44px -22px rgb(20 30 60 / 0.38);
+    --glow: color-mix(in oklab, var(--accent-solid) 6%, transparent);
+    --btn-edge: rgb(20 30 60 / 0.08);
+    --shift-fill: var(--sunk);
+    --shift-edge: color-mix(in oklab, var(--shift) 50%, var(--line));
+    --tag-ink: 62%;
+    --fault-wash: color-mix(in oklab, var(--fault) 6%, var(--surface));
+    --primary-top: color-mix(in oklab, var(--accent-solid) 86%, white);
   }
 }
 
@@ -101,6 +152,16 @@
   --k-vm: #b03a95;
   --scrim: rgb(20 26 40 / 0.22);
   --shadow: 0 18px 40px -20px rgb(20 30 60 / 0.35);
+  --hi: rgb(255 255 255 / 0.9);
+  --lift-1: 0 1px 1px rgb(20 30 60 / 0.05), 0 10px 22px -16px rgb(20 30 60 / 0.28);
+  --lift-2: 0 1px 2px rgb(20 30 60 / 0.06), 0 24px 44px -22px rgb(20 30 60 / 0.38);
+  --glow: color-mix(in oklab, var(--accent-solid) 6%, transparent);
+  --btn-edge: rgb(20 30 60 / 0.08);
+  --shift-fill: var(--sunk);
+  --shift-edge: color-mix(in oklab, var(--shift) 50%, var(--line));
+  --tag-ink: 62%;
+  --fault-wash: color-mix(in oklab, var(--fault) 6%, var(--surface));
+  --primary-top: color-mix(in oklab, var(--accent-solid) 86%, white);
 }
 
 :root[data-theme='dark'] {
@@ -132,6 +193,24 @@
   --k-vm: #e68ccf;
   --scrim: rgb(6 8 13 / 0.55);
   --shadow: 0 18px 40px -18px rgb(0 0 0 / 0.7);
+  /* Surfaces: a lit top edge, a short gradient and two shadow levels (resting, lifted). */
+  --hi: rgb(255 255 255 / 0.05);
+  --lift-1: 0 1px 0 rgb(0 0 0 / 0.35), 0 12px 24px -16px rgb(0 0 0 / 0.75);
+  --lift-2: 0 1px 0 rgb(0 0 0 / 0.4), 0 28px 56px -24px rgb(0 0 0 / 0.9);
+  --glow: color-mix(in oklab, var(--accent-solid) 9%, transparent);
+  --btn-edge: rgb(0 0 0 / 0.3);
+  /* Amber behind text: a tint in dark; in light a neutral fill with amber on the edge. */
+  --shift-fill: color-mix(in oklab, var(--shift) 15%, transparent);
+  --shift-edge: transparent;
+  /*
+   * Tag text: nearly the tone itself in dark (10 % ink keeps red at 4.5:1 on a
+   * card's lit top); in light mixed further with ink, for the same reason.
+   */
+  --tag-ink: 90%;
+  /* The fill behind a danger button's red text on hover. */
+  --fault-wash: color-mix(in oklab, var(--fault) 10%, var(--surface));
+  /* The lit top of a primary button: lighter in light, less so in dark to keep white words at 4.5:1. */
+  --primary-top: color-mix(in oklab, var(--accent-solid) 94%, white);
 }
 
 /*
@@ -172,6 +251,9 @@
   --color-k-tpl: var(--k-tpl);
   --color-k-vm: var(--k-vm);
   --color-scrim: var(--scrim);
+  /* Tailwind's transition utilities use the panel's feedback duration and curve. */
+  --default-transition-duration: var(--motion-feedback);
+  --default-transition-timing-function: var(--ease);
 }
 
 @layer base {
@@ -193,7 +275,7 @@
     margin: 0;
     min-height: 100dvh;
     background-color: var(--ground);
-    font-size: 13.5px;
+    font-size: var(--type-body);
     line-height: 1.45;
   }
 
@@ -225,6 +307,15 @@
 
 @layer components {
   /* Titles: Archivo widened, never shouted. Sentence case everywhere. */
+  /* A page title: 22 px in the wide Archivo, the only text set this wide. */
+  .type-title {
+    font-size: var(--type-title);
+    font-stretch: 118%;
+    font-weight: 620;
+    letter-spacing: -0.012em;
+    line-height: 1;
+  }
+
   .type-display {
     font-stretch: 118%;
     font-weight: 620;
@@ -269,6 +360,180 @@
     background-image: linear-gradient(180deg, var(--surface-hi), var(--surface) 70%);
   }
 
+  /*
+   * A card: a lit top edge, a short gradient down to the surface and a soft
+   * shadow under it. Tiles, service, node, agent and grant cards share it.
+   */
+  .card {
+    background-color: var(--surface);
+    background-image: var(--face);
+    border: 1px solid var(--line);
+    border-radius: 11px;
+    box-shadow: var(--card-rest);
+  }
+
+  /* A card that opens something: it lifts 2 px onto the larger shadow on hover and focus. */
+  .card-lift {
+    transition:
+      transform var(--motion-feedback) var(--ease),
+      border-color var(--motion-feedback) var(--ease),
+      box-shadow var(--motion-feedback) var(--ease);
+  }
+
+  .card-lift:hover,
+  .card-lift:focus-visible {
+    transform: translateY(-2px);
+    border-color: var(--line-2);
+    box-shadow: var(--card-up);
+  }
+
+  /* A card that opens nothing still answers the pointer, without moving. */
+  .card-hover {
+    transition:
+      border-color var(--motion-feedback) var(--ease),
+      box-shadow var(--motion-feedback) var(--ease);
+  }
+
+  .card-hover:hover {
+    border-color: var(--line-2);
+    box-shadow: var(--card-up);
+  }
+
+  /* On a touch screen a hover is a tap on the way somewhere else: no lift. */
+  @media (hover: none) {
+    .card-lift:hover {
+      transform: none;
+      box-shadow: var(--card-rest);
+    }
+  }
+
+  /*
+   * Buttons: a 7 px corner, a lit top edge over a short gradient, a 1 px edge
+   * under it, and a press that sinks 1 px. Sizes and the focus ring live in
+   * components/ui/button.tsx.
+   */
+  .btn {
+    --busy-dot: color-mix(in oklab, var(--ink) 34%, transparent);
+    position: relative;
+    border-radius: 7px;
+    border: 1px solid var(--line-2);
+    background-image: linear-gradient(180deg, var(--raised), var(--surface));
+    color: var(--ink);
+    box-shadow:
+      inset 0 1px 0 var(--hi),
+      0 1px 0 var(--btn-edge);
+    font-weight: 570;
+    cursor: pointer;
+    transition:
+      transform var(--motion-feedback) var(--ease),
+      box-shadow var(--motion-feedback) var(--ease),
+      border-color var(--motion-feedback) var(--ease),
+      background-color var(--motion-feedback) var(--ease),
+      color var(--motion-feedback) var(--ease),
+      filter var(--motion-feedback) var(--ease);
+  }
+
+  .btn:hover {
+    border-color: var(--ink-3);
+    filter: brightness(1.06);
+  }
+
+  .btn:active {
+    transform: translateY(1px);
+    box-shadow: inset 0 1px 2px rgb(0 0 0 / 0.25);
+  }
+
+  .btn:disabled {
+    opacity: 0.45;
+    pointer-events: none;
+  }
+
+  /* The one action a screen is for. */
+  .btn-primary {
+    --busy-dot: rgb(255 255 255 / 0.5);
+    color: var(--on-accent);
+    border-color: color-mix(in oklab, var(--accent-solid) 72%, black);
+    background-image: linear-gradient(180deg, var(--primary-top), var(--accent-solid) 62%);
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 0.24),
+      0 1px 0 var(--btn-edge),
+      0 8px 18px -10px var(--accent-solid);
+  }
+
+  .btn-primary:hover {
+    border-color: color-mix(in oklab, var(--accent-solid) 72%, black);
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 0.3),
+      0 1px 0 var(--btn-edge),
+      0 10px 22px -8px var(--accent-solid);
+  }
+
+  /* Quiet: no face until the pointer is on it. */
+  .btn-ghost {
+    border-color: transparent;
+    background-image: none;
+    box-shadow: none;
+    color: var(--ink-2);
+  }
+
+  .btn-ghost:hover {
+    background-color: var(--surface);
+    border-color: var(--line);
+    color: var(--ink);
+    filter: none;
+  }
+
+  /* Offers a destructive action: red words on the ordinary face. */
+  .btn-danger {
+    color: var(--fault);
+    border-color: color-mix(in oklab, var(--fault) 55%, var(--line));
+  }
+
+  .btn-danger:hover {
+    border-color: var(--fault);
+    background-image: none;
+    background-color: var(--fault-wash);
+  }
+
+  /* Confirms a destructive action already asked about. */
+  .btn-danger-solid {
+    --busy-dot: rgb(255 255 255 / 0.5);
+    color: var(--on-accent);
+    border-color: color-mix(in oklab, var(--fault) 72%, black);
+    background-image: linear-gradient(180deg, var(--fault), color-mix(in oklab, var(--fault) 86%, black));
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 0.2),
+      0 1px 0 var(--btn-edge);
+  }
+
+  .btn-danger-solid:hover {
+    border-color: color-mix(in oklab, var(--fault) 72%, black);
+  }
+
+  /*
+   * Busy: the request is on its way. The button keeps its colour (it is
+   * waiting, not unavailable) and a dither band sweeps across it until the
+   * answer comes back.
+   */
+  .btn[data-busy] {
+    overflow: hidden;
+    opacity: 1;
+  }
+
+  .btn[data-busy]::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background-image: repeating-conic-gradient(var(--busy-dot) 0 25%, transparent 0 50%);
+    background-size: 4px 4px;
+    -webkit-mask: linear-gradient(90deg, transparent, var(--ink) 45%, var(--ink) 55%, transparent) no-repeat;
+    mask: linear-gradient(90deg, transparent, var(--ink) 45%, var(--ink) 55%, transparent) no-repeat;
+    -webkit-mask-size: 42% 100%;
+    mask-size: 42% 100%;
+    animation: sweep 1.3s linear infinite;
+  }
+
   .field {
     height: 32px;
     width: 100%;
@@ -278,7 +543,7 @@
     color: var(--ink);
     padding: 0 10px;
     font-size: 13px;
-    transition: border-color 120ms ease;
+    transition: border-color var(--motion-feedback) var(--ease);
   }
 
   .field::placeholder {
@@ -313,9 +578,20 @@
     height: var(--lamp-size);
     border-radius: 50%;
     background-color: var(--lamp-core);
+    box-shadow: 0 0 7px color-mix(in oklab, var(--lamp-core) 70%, transparent);
     outline: max(1.5px, calc(var(--lamp-size) * 0.1875)) solid
-      color-mix(in oklab, var(--lamp-ring) 55%, transparent);
+      color-mix(in oklab, var(--lamp-ring) 60%, transparent);
     outline-offset: calc(var(--lamp-size) / 4);
+    /* A state change is shown: the colours cross-fade instead of jumping. */
+    transition:
+      background-color var(--motion-change) var(--ease),
+      box-shadow var(--motion-change) var(--ease),
+      outline-color var(--motion-change) var(--ease);
+  }
+
+  /* A stopped or idle core does not glow. */
+  .lamp.lamp-still {
+    box-shadow: none;
   }
 
   /* Unknown: nobody can say, so the core is hollow rather than a colour. */
@@ -334,6 +610,10 @@
     animation: lamp-pulse 1.8s ease-in-out infinite;
   }
 
+  /*
+   * A tag: 4 px corners, a tint of its tone behind words in the tone. In light
+   * the tone's words mix with ink (--tag-ink) so they keep 4.5:1 on the tint.
+   */
   .tag {
     --tag: var(--idle);
     display: inline-flex;
@@ -341,36 +621,53 @@
     gap: 5px;
     height: 20px;
     padding: 0 6px;
+    border: 1px solid transparent;
     border-radius: 4px;
-    font-size: 11.5px;
-    font-weight: 580;
+    font-size: var(--type-min);
+    font-weight: 560;
     line-height: 1;
     white-space: nowrap;
     background-color: color-mix(in oklab, var(--tag) 15%, transparent);
+    /* Idle grey is too faint alone, so an idle tag always mixes with ink. */
     color: color-mix(in oklab, var(--tag) 62%, var(--ink));
+    transition:
+      background-color var(--motion-change) var(--ease),
+      color var(--motion-change) var(--ease);
   }
 
   .tag-run {
     --tag: var(--run);
+    background-color: color-mix(in oklab, var(--run) 14%, transparent);
   }
 
+  /* Amber never fills behind text in light: neutral fill, amber on the edge. */
   .tag-shift {
     --tag: var(--shift);
+    background-color: var(--shift-fill);
+    border-color: var(--shift-edge);
   }
 
   .tag-fault {
     --tag: var(--fault);
   }
 
+  .tag-run,
+  .tag-shift,
+  .tag-fault,
+  .tag-accent {
+    color: color-mix(in oklab, var(--tag) var(--tag-ink), var(--ink));
+  }
+
   .tag-accent {
     --tag: var(--accent);
+    background-color: color-mix(in oklab, var(--accent-solid) 16%, transparent);
   }
 
   .tag-plain,
   .tag-code {
     background-color: var(--sunk);
+    border-color: var(--line-2);
     color: var(--ink-2);
-    box-shadow: inset 0 0 0 1px var(--line);
   }
 
   .tag-code {
@@ -589,14 +886,14 @@
   .ws b {
     display: block;
     font-weight: 600;
-    font-size: 13.5px;
+    font-size: var(--type-body);
     line-height: 1.2;
   }
 
   .ws small {
     display: block;
     color: var(--ink-3);
-    font-size: 11.5px;
+    font-size: var(--type-min);
   }
 
   .logo {
@@ -620,10 +917,10 @@
     border-radius: 7px;
     color: var(--ink-2);
     text-decoration: none;
-    font-size: 13.5px;
+    font-size: var(--type-body);
     transition:
-      background-color 120ms ease,
-      color 120ms ease;
+      background-color var(--motion-feedback) var(--ease),
+      color var(--motion-feedback) var(--ease);
   }
 
   .nav a svg {
@@ -733,7 +1030,7 @@
     padding: 4px 6px;
     border-radius: 6px;
     font-weight: 560;
-    transition: background-color 120ms ease;
+    transition: background-color var(--motion-feedback) var(--ease);
   }
 
   .sw-btn > span {
@@ -765,8 +1062,8 @@
     border-radius: 7px;
     color: var(--ink-2);
     transition:
-      background-color 120ms ease,
-      color 120ms ease;
+      background-color var(--motion-feedback) var(--ease),
+      color var(--motion-feedback) var(--ease);
   }
 
   .iconbtn svg {
@@ -834,8 +1131,8 @@
     place-items: center;
     color: var(--ink-3);
     transition:
-      background-color 120ms ease,
-      color 120ms ease;
+      background-color var(--motion-feedback) var(--ease),
+      color var(--motion-feedback) var(--ease);
   }
 
   .rail a svg {
@@ -871,7 +1168,7 @@
     padding: 9px 0 10px;
     color: var(--ink-2);
     text-decoration: none;
-    font-size: 13.5px;
+    font-size: var(--type-body);
     border-bottom: 2px solid transparent;
     margin-bottom: -1px;
     display: inline-flex;
@@ -899,7 +1196,7 @@
     border-radius: 7px;
     color: var(--ink-2);
     text-decoration: none;
-    font-size: 13.5px;
+    font-size: var(--type-body);
   }
 
   .subnav a:hover {
@@ -923,7 +1220,7 @@
     border: 1px solid var(--line-2);
     border-radius: 12px;
     box-shadow: var(--shadow);
-    animation: menu-in 120ms ease-out;
+    animation: menu-in var(--motion-feedback) var(--ease);
   }
 
   @keyframes menu-in {
@@ -942,7 +1239,7 @@
     padding: 6px 10px;
     border-radius: 7px;
     color: var(--ink);
-    font-size: 13.5px;
+    font-size: var(--type-body);
     text-align: left;
     text-decoration: none;
     cursor: pointer;
@@ -1019,7 +1316,7 @@
   }
 
   .drawer[data-state='open'] {
-    animation: drawer-in 160ms ease-out;
+    animation: drawer-in var(--motion-change) var(--ease);
   }
 
   @keyframes drawer-in {
@@ -1071,21 +1368,14 @@
     gap: 14px;
   }
 
+  /* The face, edge and lift come from .card and .card-lift. */
   .ptile {
     display: flex;
     flex-direction: column;
     min-width: 0;
-    background-color: var(--surface);
-    border: 1px solid var(--line);
-    border-radius: 12px;
     overflow: hidden;
     color: var(--ink);
     text-decoration: none;
-    transition: border-color 120ms ease;
-  }
-
-  .ptile:hover {
-    border-color: var(--line-2);
   }
 
   .ptile-ghost {
@@ -1108,7 +1398,7 @@
     white-space: nowrap;
     font-stretch: 106%;
     font-weight: 620;
-    font-size: 15px;
+    font-size: var(--type-card);
     letter-spacing: -0.003em;
   }
 
@@ -1173,20 +1463,23 @@
     gap: 9px;
     min-width: 0;
     padding: 12px 16px;
-    font-size: 12.5px;
+    font-size: var(--type-small);
     color: var(--ink-2);
   }
 
-  /* A request that waits on a person, at the top of the page it concerns. */
+  /*
+   * A request that waits on a person, at the top of the page it concerns. No
+   * warm tint behind the words: amber stays on the edge, the lamp and the tags.
+   */
   .callout {
     display: flex;
     align-items: center;
     gap: 12px;
     padding: 12px 14px;
-    border: 1px solid color-mix(in oklab, var(--shift) 40%, var(--line));
+    border: 1px solid color-mix(in oklab, var(--shift) 45%, var(--line));
     border-radius: 10px;
-    background-color: color-mix(in oklab, var(--shift) 7%, var(--surface));
-    font-size: 13.5px;
+    background-color: var(--sunk);
+    font-size: var(--type-body);
     color: var(--ink);
   }
 
@@ -1244,9 +1537,11 @@
     cursor: grabbing;
   }
 
+  /* A card in the hand holds the lifted shadow but does not slide under the pointer. */
   .canvas-slot[data-dragging] .svc {
+    transform: none;
     border-color: var(--line-2);
-    box-shadow: var(--shadow);
+    box-shadow: var(--card-up);
   }
 
   .canvas-empty {
@@ -1293,20 +1588,11 @@
     position: relative;
     display: block;
     width: 264px;
-    background-color: var(--surface);
-    background-image: linear-gradient(180deg, var(--surface-hi), var(--surface) 70%);
-    border: 1px solid var(--line);
-    border-radius: 11px;
     overflow: hidden;
     color: var(--ink);
     text-decoration: none;
     user-select: none;
     -webkit-user-drag: none;
-    transition: border-color 120ms ease;
-  }
-
-  .svc:hover {
-    border-color: var(--line-2);
   }
 
   .svc:focus-visible {
@@ -1335,7 +1621,7 @@
     white-space: nowrap;
     font-stretch: 106%;
     font-weight: 620;
-    font-size: 15px;
+    font-size: var(--type-card);
     letter-spacing: -0.003em;
   }
 
@@ -1351,7 +1637,7 @@
     display: block;
     margin-top: -6px;
     padding-left: 38px;
-    font-size: 12.5px;
+    font-size: var(--type-small);
     color: var(--ink-2);
     white-space: nowrap;
     overflow: hidden;
@@ -1374,7 +1660,7 @@
     min-width: 0;
     padding: 9px 16px;
     border-top: 1px solid var(--line);
-    font-size: 12.5px;
+    font-size: var(--type-small);
     color: var(--ink-2);
     background-color: color-mix(in oklab, var(--surface) 60%, var(--sunk));
   }
@@ -1529,7 +1815,15 @@
   }
 
   .cmd[data-state='open'] {
-    animation: menu-in 120ms ease-out;
+    animation: cmd-in var(--motion-feedback) var(--ease);
+  }
+
+  /* The menu is centred with a transform, so its entry keeps the centring. */
+  @keyframes cmd-in {
+    from {
+      opacity: 0;
+      transform: translate(-50%, -3px);
+    }
   }
 
   .cmd-input {
@@ -1592,7 +1886,7 @@
 
   .mi-t b {
     font-weight: 560;
-    font-size: 13.5px;
+    font-size: var(--type-body);
     color: var(--ink);
   }
 
@@ -1618,15 +1912,16 @@
     display: flex;
     flex-direction: column;
     background-color: var(--surface);
+    background-image: var(--face);
     border: 1px solid var(--line-2);
     border-bottom: 0;
-    border-radius: 12px 12px 0 0;
-    box-shadow: var(--shadow);
+    border-radius: 14px 14px 0 0;
+    box-shadow: var(--overlay-rest);
     overflow: hidden;
   }
 
   .sheet[data-state='open'] {
-    animation: sheet-in 160ms ease-out;
+    animation: sheet-in var(--motion-change) var(--ease);
   }
 
   @keyframes sheet-in {
@@ -1741,7 +2036,7 @@
     align-items: center;
     gap: 6px 14px;
     min-width: 0;
-    font-size: 12.5px;
+    font-size: var(--type-small);
     color: var(--ink-2);
   }
 
@@ -1792,7 +2087,7 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     font-weight: 580;
-    font-size: 13.5px;
+    font-size: var(--type-body);
   }
 
   .box-t small {
@@ -1879,7 +2174,7 @@
   .hist-h svg {
     width: 12px;
     height: 12px;
-    transition: transform 120ms ease;
+    transition: transform var(--motion-feedback) var(--ease);
   }
 
   details:not([open]) > .hist-h svg {
@@ -1927,7 +2222,7 @@
   .elapsed small {
     display: block;
     margin-top: 4px;
-    font-size: 11.5px;
+    font-size: var(--type-min);
   }
 
   /* The steps, equal widths: done, the one running, the ones to come. */
@@ -1962,7 +2257,7 @@
     align-items: center;
     gap: 5px;
     min-width: 0;
-    font-size: 11.5px;
+    font-size: var(--type-min);
     color: var(--ink-2);
     white-space: nowrap;
   }
@@ -2062,7 +2357,7 @@
 
   .bsteps-h {
     grid-column: 1 / -1;
-    font-size: 11.5px;
+    font-size: var(--type-min);
     font-weight: 560;
     color: var(--ink-2);
   }
@@ -2147,7 +2442,7 @@
   .progress-lines > summary {
     width: fit-content;
     cursor: pointer;
-    font-size: 12.5px;
+    font-size: var(--type-small);
     color: var(--ink-2);
     user-select: none;
   }
@@ -2165,7 +2460,7 @@
     border-radius: 8px;
     background-color: var(--sunk);
     border: 1px solid var(--line);
-    font-size: 12.5px;
+    font-size: var(--type-small);
     color: var(--ink-2);
   }
 
@@ -2236,7 +2531,7 @@
   .logs-empty {
     font-family: var(--font-sans);
     font-stretch: 100%;
-    font-size: 12.5px;
+    font-size: var(--type-small);
     white-space: normal;
   }
 
@@ -2254,7 +2549,7 @@
 
   .set-lede {
     margin-top: -4px;
-    font-size: 12.5px;
+    font-size: var(--type-small);
     color: var(--ink-2);
   }
 
@@ -2428,7 +2723,7 @@
   .seg.seg-wrap button {
     flex: none;
     padding: 4px 10px;
-    font-size: 12.5px;
+    font-size: var(--type-small);
     white-space: nowrap;
   }
 
@@ -2485,7 +2780,7 @@
   }
 
   .stats dt {
-    font-size: 11.5px;
+    font-size: var(--type-min);
     color: var(--ink-2);
   }
 
@@ -2505,7 +2800,7 @@
     margin-left: 3px;
     font-style: normal;
     font-weight: 500;
-    font-size: 12.5px;
+    font-size: var(--type-small);
     color: var(--ink-2);
   }
 
@@ -2561,7 +2856,7 @@
     display: grid;
     place-items: center;
     text-align: center;
-    font-size: 12.5px;
+    font-size: var(--type-small);
     color: var(--ink-3);
     pointer-events: none;
   }
@@ -2620,7 +2915,7 @@
     display: flex;
     align-items: baseline;
     gap: 8px;
-    font-size: 12.5px;
+    font-size: var(--type-small);
   }
 
   .meter-h b {
@@ -2672,7 +2967,7 @@
     background-color: var(--surface);
     font-size: 13px;
     color: var(--ink);
-    transition: opacity 120ms ease;
+    transition: opacity var(--motion-change) var(--ease);
   }
 
   .n1[aria-busy='true'] {
@@ -2724,7 +3019,7 @@
     height: 28px;
     gap: 6px;
     padding: 0 8px 0 10px;
-    font-size: 12.5px;
+    font-size: var(--type-small);
   }
 
   /*
@@ -2869,7 +3164,7 @@
   }
 
   .ha-way-t {
-    font-size: 13.5px;
+    font-size: var(--type-body);
     font-weight: 600;
     color: var(--ink);
   }
@@ -2877,7 +3172,7 @@
   .ha-way-p,
   .ha-hint,
   .ha-note {
-    font-size: 12.5px;
+    font-size: var(--type-small);
     line-height: 1.45;
     color: var(--ink-2);
   }
@@ -2900,7 +3195,7 @@
 
   .ha-cand b {
     font-weight: 600;
-    font-size: 13.5px;
+    font-size: var(--type-body);
   }
 
   .ha-span {
@@ -2920,7 +3215,7 @@
     display: flex;
     flex-wrap: wrap;
     gap: 4px 14px;
-    font-size: 12.5px;
+    font-size: var(--type-small);
     color: var(--ink-2);
   }
 
@@ -2969,10 +3264,6 @@
     display: flex;
     flex-direction: column;
     min-width: 0;
-    border: 1px solid var(--line);
-    border-radius: 11px;
-    background-color: var(--surface);
-    background-image: linear-gradient(180deg, var(--surface-hi), var(--surface) 70%);
     overflow: hidden;
   }
 
@@ -2991,13 +3282,13 @@
     white-space: nowrap;
     font-stretch: 106%;
     font-weight: 620;
-    font-size: 15px;
+    font-size: var(--type-card);
     letter-spacing: -0.003em;
   }
 
   .node-word {
     margin-left: auto;
-    font-size: 12.5px;
+    font-size: var(--type-small);
     color: var(--ink-2);
   }
 
@@ -3010,7 +3301,7 @@
   }
 
   .node-note {
-    font-size: 12.5px;
+    font-size: var(--type-small);
     line-height: 1.45;
     color: var(--ink-2);
   }
@@ -3228,19 +3519,19 @@
     .vmt td.vmt-project {
       grid-area: project;
       padding-left: 38px;
-      font-size: 12.5px;
+      font-size: var(--type-small);
     }
 
     .vmt td.vmt-node {
       grid-area: node;
       padding-left: 38px;
-      font-size: 12.5px;
+      font-size: var(--type-small);
       color: var(--ink-2);
     }
 
     .vmt td.vmt-size {
       grid-area: size;
-      font-size: 12.5px;
+      font-size: var(--type-small);
       color: var(--ink-2);
     }
   }
@@ -3292,7 +3583,7 @@
   .cmp {
     width: 100%;
     border-collapse: collapse;
-    font-size: 12.5px;
+    font-size: var(--type-small);
     font-variant-numeric: tabular-nums;
   }
 
@@ -3344,7 +3635,7 @@
 
   .box-t b.sec-title {
     font-weight: 600;
-    font-size: 15px;
+    font-size: var(--type-card);
   }
 
   .sec-filters {
@@ -3358,14 +3649,14 @@
     width: auto;
     height: 30px;
     min-width: 152px;
-    font-size: 12.5px;
+    font-size: var(--type-small);
   }
 
   .sec-check {
     display: inline-flex;
     align-items: center;
     gap: 7px;
-    font-size: 12.5px;
+    font-size: var(--type-small);
     color: var(--ink-2);
     cursor: pointer;
   }
@@ -3385,7 +3676,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 12.5px;
+    font-size: var(--type-small);
     font-weight: 580;
     color: var(--ink);
   }
@@ -3424,13 +3715,18 @@
     display: grid;
     gap: 4px;
     padding: 12px 14px;
-    font-size: 12.5px;
+    font-size: var(--type-small);
   }
 
   /* The card open in the service sheet. */
-  .svc[data-selected] {
+  .svc[data-selected],
+  .svc[data-selected]:hover,
+  .svc[data-selected]:focus-visible {
     border-color: var(--accent);
-    box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent) 22%, transparent);
+    box-shadow:
+      inset 0 1px 0 var(--hi),
+      0 0 0 1px var(--accent),
+      var(--lift-2);
   }
 
   @media (max-width: 767.98px) {
@@ -3485,7 +3781,7 @@
     }
 
     .elapsed b {
-      font-size: 22px;
+      font-size: var(--type-title);
     }
 
     .bsteps {
@@ -3532,23 +3828,27 @@
     }
   }
 
+  /* Tailwind centres the dialog with `translate`; the rise is a transform on top of it. */
   @keyframes dialog-rise {
     from {
       opacity: 0;
-      transform: translate(-50%, -47%) scale(0.985);
-    }
-    to {
-      opacity: 1;
-      transform: translate(-50%, -50%) scale(1);
+      transform: translateY(6px) scale(0.985);
     }
   }
 
   .dialog-overlay[data-state='open'] {
-    animation: dialog-fade 120ms ease-out;
+    animation: dialog-fade var(--motion-change) var(--ease);
+  }
+
+  /* A dialog floats like the sheet: the face, a 14 px corner and the lifted shadow. */
+  .dialog-content {
+    background-image: var(--face);
+    border-radius: 14px;
+    box-shadow: var(--overlay-rest);
   }
 
   .dialog-content[data-state='open'] {
-    animation: dialog-rise 140ms ease-out;
+    animation: dialog-rise var(--motion-change) var(--ease);
   }
 
   /*
@@ -3573,19 +3873,8 @@
     gap: 12px;
     min-width: 0;
     padding: 14px;
-    border: 1px solid var(--line);
-    border-radius: 12px;
-    background-color: var(--surface);
-    background-image: linear-gradient(180deg, var(--surface-hi), var(--surface) 70%);
     color: var(--ink);
     text-decoration: none;
-    transition:
-      border-color 120ms ease,
-      box-shadow 120ms ease;
-  }
-
-  .acard:hover {
-    border-color: var(--line-2);
   }
 
   .acard:focus-visible {
@@ -3594,9 +3883,13 @@
   }
 
   .acard-on,
-  .acard-on:hover {
+  .acard-on:hover,
+  .acard-on:focus-visible {
     border-color: color-mix(in oklab, var(--accent) 55%, var(--line));
-    box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent) 16%, transparent);
+    box-shadow:
+      inset 0 1px 0 var(--hi),
+      0 0 0 3px color-mix(in oklab, var(--accent) 16%, transparent),
+      var(--lift-1);
   }
 
   .acard-off {
@@ -3628,7 +3921,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-size: 11.5px;
+    font-size: var(--type-min);
     color: var(--ink-2);
   }
 
@@ -3759,7 +4052,7 @@
     display: flex;
     align-items: baseline;
     gap: 8px;
-    font-size: 13.5px;
+    font-size: var(--type-body);
     font-weight: 560;
     color: var(--ink);
   }
@@ -3932,7 +4225,7 @@
   .st time {
     padding-top: 2px;
     text-align: right;
-    font-size: 11.5px;
+    font-size: var(--type-min);
     color: var(--ink-3);
     font-variant-numeric: tabular-nums;
   }
@@ -4006,7 +4299,7 @@
   }
 
   .st-s {
-    font-size: 13.5px;
+    font-size: var(--type-body);
     line-height: 1.5;
     overflow-wrap: anywhere;
   }
@@ -4029,7 +4322,7 @@
     border: 1px solid var(--line);
     border-radius: 7px;
     background-color: var(--sunk);
-    font-size: 12.5px;
+    font-size: var(--type-small);
     line-height: 1.5;
     color: var(--ink-2);
     overflow-wrap: anywhere;
@@ -4067,7 +4360,7 @@
     background-color: var(--sunk);
     font-family: var(--font-mono);
     font-stretch: 87.5%;
-    font-size: 12.5px;
+    font-size: var(--type-small);
     line-height: 1.55;
     color: var(--ink);
     white-space: pre-wrap;
@@ -4084,11 +4377,11 @@
   }
 
   .page-h h1 {
-    font-stretch: 112%;
+    font-stretch: 118%;
     font-weight: 620;
-    font-size: 22px;
+    font-size: var(--type-title);
     line-height: 1.2;
-    letter-spacing: -0.005em;
+    letter-spacing: -0.012em;
   }
 
   .split {
@@ -4177,7 +4470,7 @@
 
   .li-t b {
     font-weight: 560;
-    font-size: 13.5px;
+    font-size: var(--type-body);
   }
 
   .li-t small {
@@ -4212,7 +4505,7 @@
   .apr-h h2 {
     font-stretch: 110%;
     font-weight: 640;
-    font-size: 22px;
+    font-size: var(--type-title);
     line-height: 1.25;
     letter-spacing: -0.006em;
     overflow-wrap: anywhere;
@@ -4241,7 +4534,7 @@
 
   .apr-sub {
     margin-top: 6px;
-    font-size: 12.5px;
+    font-size: var(--type-small);
     color: var(--ink-2);
   }
 
@@ -4251,7 +4544,7 @@
   }
 
   .apr-sec h3 {
-    font-size: 13.5px;
+    font-size: var(--type-body);
     font-weight: 560;
     color: var(--ink);
   }
@@ -4261,7 +4554,7 @@
     border: 1px solid var(--line);
     border-radius: 8px;
     background-color: var(--sunk);
-    font-size: 13.5px;
+    font-size: var(--type-body);
     line-height: 1.55;
     color: var(--ink);
     overflow-wrap: anywhere;
@@ -4292,7 +4585,7 @@
     align-items: center;
     gap: 4px;
     margin-left: auto;
-    font-size: 11.5px;
+    font-size: var(--type-min);
     color: var(--ink-3);
   }
 
@@ -4488,7 +4781,7 @@
     margin-left: 6px;
     vertical-align: -2px;
     color: var(--ink-3);
-    transition: transform 120ms ease;
+    transition: transform var(--motion-feedback) var(--ease);
   }
 
   .fr-group-open .fr-caret {
@@ -4554,7 +4847,7 @@
     border: 0;
     border-radius: 6px;
     background: none;
-    font-size: 12.5px;
+    font-size: var(--type-small);
     color: var(--ink-2);
     text-align: left;
     cursor: pointer;
@@ -4586,7 +4879,7 @@
   }
 
   .chain-details h3 {
-    font-size: 13.5px;
+    font-size: var(--type-body);
     font-weight: 560;
     color: var(--ink);
   }
@@ -4603,7 +4896,7 @@
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
     gap: 6px 16px;
-    font-size: 12.5px;
+    font-size: var(--type-small);
   }
 
   .chain-facts dt {
@@ -4659,6 +4952,8 @@
 
   .gcard-past {
     background-color: color-mix(in oklab, var(--surface) 55%, var(--ground));
+    background-image: none;
+    box-shadow: none;
   }
 
   .gcard-h {
@@ -4682,7 +4977,7 @@
   }
 
   .gcard-kind {
-    font-size: 13.5px;
+    font-size: var(--type-body);
     font-weight: 560;
   }
 
@@ -4697,12 +4992,12 @@
     display: flex;
     flex-wrap: wrap;
     gap: 2px 14px;
-    font-size: 12.5px;
+    font-size: var(--type-small);
     color: var(--ink-2);
   }
 
   .gcard-reason {
-    font-size: 13.5px;
+    font-size: var(--type-body);
     line-height: 1.5;
     color: var(--ink);
     overflow-wrap: anywhere;
@@ -4758,14 +5053,14 @@
     gap: 8px;
     min-width: 0;
     font-weight: 600;
-    font-size: 15px;
+    font-size: var(--type-card);
     line-height: 1.3;
   }
 
   .set-page-h p {
     margin-top: 3px;
     max-width: 62ch;
-    font-size: 12.5px;
+    font-size: var(--type-small);
     line-height: 1.45;
     color: var(--ink-2);
   }
@@ -4780,7 +5075,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-size: 11.5px;
+    font-size: var(--type-min);
   }
 
   .set-back {
@@ -4791,7 +5086,7 @@
     margin-left: -4px;
     padding: 2px 4px;
     border-radius: 6px;
-    font-size: 12.5px;
+    font-size: var(--type-small);
     color: var(--ink-2);
     text-decoration: none;
   }
@@ -4826,7 +5121,7 @@
 
   .set-note {
     margin-top: -6px;
-    font-size: 12.5px;
+    font-size: var(--type-small);
     color: var(--ink-2);
   }
 
@@ -4851,14 +5146,14 @@
   }
 
   .set-empty-t {
-    font-size: 13.5px;
+    font-size: var(--type-body);
     font-weight: 540;
     color: var(--ink);
   }
 
   .set-empty-x {
     margin-top: 4px;
-    font-size: 12.5px;
+    font-size: var(--type-small);
     color: var(--ink-2);
   }
 
@@ -4936,7 +5231,7 @@
     gap: 6px;
     min-width: 0;
     font-weight: 540;
-    font-size: 13.5px;
+    font-size: var(--type-body);
     line-height: 1.3;
   }
 
@@ -4957,7 +5252,7 @@
   }
 
   .srow-sub {
-    font-size: 12.5px;
+    font-size: var(--type-small);
     color: var(--ink-2);
     min-width: 0;
   }
@@ -4987,7 +5282,7 @@
     align-items: center;
     gap: 4px;
     font-weight: 500;
-    font-size: 12.5px;
+    font-size: var(--type-small);
     color: var(--ink-2);
   }
 
@@ -5085,7 +5380,7 @@
 
   .auth-lede {
     margin-top: 2px;
-    font-size: 12.5px;
+    font-size: var(--type-small);
     line-height: 1.45;
     color: var(--ink-2);
   }
@@ -5106,7 +5401,7 @@
   }
 
   .auth-foot {
-    font-size: 12.5px;
+    font-size: var(--type-small);
     color: var(--ink-2);
   }
 
@@ -5140,14 +5435,32 @@
   @media (prefers-reduced-motion: reduce) {
     .lamp-pulse,
     .sweep,
-    .aura-breathe {
+    .aura-breathe,
+    .btn[data-busy]::after {
       animation: none;
     }
 
     /* A still sweep sits in the middle instead of vanishing off one edge. */
-    .sweep {
+    .sweep,
+    .btn[data-busy]::after {
       -webkit-mask-position: 50% 0;
       mask-position: 50% 0;
+    }
+
+    /* Nothing moves: a card answers with its border only, a button does not sink. */
+    .card-lift:hover,
+    .card-lift:focus-visible,
+    .canvas-slot[data-dragging] .svc {
+      transform: none;
+      box-shadow: var(--card-rest);
+    }
+
+    .card-hover:hover {
+      box-shadow: var(--card-rest);
+    }
+
+    .btn:active {
+      transform: none;
     }
 
     *,

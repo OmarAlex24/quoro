@@ -31,7 +31,7 @@ export function ProjectTile({
   const shown = overflow ? tile.services.slice(0, PREVIEW_TILES - 1) : tile.services;
 
   return (
-    <Link to="/projects/$projectId" params={{ projectId: tile.projectId }} className="ptile">
+    <Link to="/projects/$projectId" params={{ projectId: tile.projectId }} className="card card-lift ptile">
       <span className="ptile-h">
         <b>{tile.project?.name ?? shortId(tile.projectId)}</b>
         <span className="ptile-count">{servicesCount(count)}</span>

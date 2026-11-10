@@ -73,7 +73,7 @@ function CardFace({
       to="/projects/$projectId"
       params={{ projectId: link.projectId }}
       search={link.search}
-      className="svc"
+      className="card card-lift svc"
       draggable={false}
       data-service={'app' in link.search ? appKey(link.search.app) : vmKey(link.search.vm)}
       data-selected={selected ? '' : undefined}
