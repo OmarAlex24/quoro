@@ -36,11 +36,13 @@
 //!
 //! The settle clears the mark once the holder renews while the policy is
 //! `warm` ([`super::conversion`]), and so does the holder's `local` report
-//! at its next session start ([`super::local_report`]). Out of scope (issue
-//! #555, ADR 0261): the `pong` after a same-token `local` grant, R and the
-//! conversion grant, and the resend of the same-token `local` grant. Until
-//! the holder reports or renews, a row marked here stays marked after its
-//! grant is taken, and moves only as a `local` lease does, which is safe. `failoverApp` ([`crate::failover`]) holds its
+//! at its next session start ([`super::local_report`]). The same-token
+//! `local` grant that ends the renewals after R, and its resend, are held
+//! here too, as [`Kind::LocalEnd`]; its send and the `pong` after it are
+//! [`super::local_end`]. Out of scope (issue #555): the conversion grant.
+//! Until the holder reports or renews, a row marked here stays marked after
+//! its grant is taken, and moves only as a `local` lease does, which is
+//! safe. `failoverApp` ([`crate::failover`]) holds its
 //! waiting grant with [`NodeHub::hold_grant`] and answers `in_progress` while
 //! [`NodeHub::grant_pending`] (ADR 0292).
 
@@ -58,30 +60,42 @@ pub(super) const TICK: Duration = Duration::from_secs(1);
 /// The grants the hub holds, by lease id.
 #[derive(Debug, Default)]
 pub(super) struct Registry {
-    entries: HashMap<String, HeldGrant>,
+    pub(super) entries: HashMap<String, HeldGrant>,
+}
+
+/// What a held grant sends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Kind {
+    /// The row's grant at a new token ("Grants of a marked row").
+    NewToken,
+    /// The same-token `local` grant that ends an `expiring` lease's
+    /// renewals after R, and its resend ("Ending the renewals" steps 2 and
+    /// 3; [`super::local_end`]).
+    LocalEnd,
 }
 
 /// One held grant.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct HeldGrant {
+pub(super) struct HeldGrant {
+    pub(super) kind: Kind,
     /// The row's token and holder when it was held.
-    token: i64,
-    holder: String,
+    pub(super) token: i64,
+    pub(super) holder: String,
     /// The grant length the support check counts: the row's `duration_ms`
     /// for an `expiring` row, `D` for a `local` one ("Grants of a marked
     /// row", section 8.8: `D` is what every `support_request` carries).
-    support_ms: u64,
+    pub(super) support_ms: u64,
     /// The holder's session generation the grant may go out on: set by a
     /// session start that finds the row a step-4 row the node does not hold,
     /// or by a registration while that session is live after its `hello`.
     /// `None` while it waits for the holder's next session start.
-    eligible_on: Option<u64>,
+    pub(super) eligible_on: Option<u64>,
     /// The generation it went out on.
-    sent_on: Option<u64>,
+    pub(super) sent_on: Option<u64>,
     /// A revoke of the lease at this token, in the mode the node lists it,
     /// held back until support returns; the grant follows its answer ("The
     /// holder fenced first" step 4).
-    revoke_first: Option<u64>,
+    pub(super) revoke_first: Option<u64>,
 }
 
 /// The grant length a held grant of `lease` needs majority support for:
@@ -99,8 +113,9 @@ pub(super) fn support_ms(lease: &leases::Lease) -> u64 {
 }
 
 impl HeldGrant {
-    fn of(lease: &leases::Lease, eligible_on: Option<u64>) -> Self {
+    pub(super) fn of(lease: &leases::Lease, eligible_on: Option<u64>) -> Self {
         Self {
+            kind: Kind::NewToken,
             token: lease.fencing_token,
             holder: lease.holder_node_id.clone(),
             support_ms: support_ms(lease),
@@ -110,7 +125,7 @@ impl HeldGrant {
         }
     }
 
-    fn names(&self, lease: &leases::Lease) -> bool {
+    pub(super) fn names(&self, lease: &leases::Lease) -> bool {
         self.token == lease.fencing_token && self.holder == lease.holder_node_id
     }
 
@@ -120,7 +135,7 @@ impl HeldGrant {
 }
 
 /// What one attempt at a held grant found.
-enum Attempt {
+pub(super) enum Attempt {
     /// It went out.
     Sent,
     /// It waits; the entry stays.
@@ -589,7 +604,7 @@ impl NodeHub {
 
     /// Forgets the held-back revoke of an entry that goes, so its session's
     /// `hello` position may count again.
-    fn release_held_revoke(&self, held: &HeldGrant) {
+    pub(super) fn release_held_revoke(&self, held: &HeldGrant) {
         let (Some(generation), Some(_)) = (held.eligible_on, held.revoke_first) else {
             return;
         };
@@ -628,7 +643,7 @@ impl NodeHub {
     /// grant goes out only then: the node holds a grant back until it has
     /// answered the revokes before it (section 4.2 rule 3), and waiting for
     /// every one of them is the side that grants less.
-    fn session_ready(&self, node_id: &str, generation: u64) -> bool {
+    pub(super) fn session_ready(&self, node_id: &str, generation: u64) -> bool {
         let sessions = self.0.sessions.lock().expect("session lock");
         sessions
             .get(node_id)
@@ -702,7 +717,11 @@ impl NodeHub {
             if !self.session_ready(&held.holder, generation) {
                 continue;
             }
-            match self.try_send_held(&lease_id, &held, generation).await {
+            let attempt = match held.kind {
+                Kind::NewToken => self.try_send_held(&lease_id, &held, generation).await,
+                Kind::LocalEnd => self.try_send_local_end(&lease_id, &held, generation).await,
+            };
+            match attempt {
                 Ok(Attempt::Sent | Attempt::Wait) => {}
                 Ok(Attempt::Drop) => {
                     let mut registry = self.0.held.lock().expect("held grant lock");

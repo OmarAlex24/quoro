@@ -89,6 +89,14 @@ impl Settles {
     pub(super) fn report(&mut self, lease_id: &str, token: u64) {
         self.reported.insert(lease_id.to_string(), token);
     }
+
+    /// Drops what this session knows of settling `lease_id`: the same-token
+    /// `local` grant went out, so no settle `ping` from before it may settle
+    /// the lease ([`super::local_end`]).
+    pub(super) fn forget(&mut self, lease_id: &str) {
+        self.reported.remove(lease_id);
+        self.pings.retain(|_, pinged| pinged.lease_id != lease_id);
+    }
 }
 
 /// How a renewal is answered, decided from the row as read in the answer's
@@ -250,8 +258,10 @@ impl NodeHub {
     /// Records that `generation` sent `node_id` the conversion grant of
     /// `lease_id` at `token` for `duration_ms`, so the next renewal of it on
     /// that session is answered as the first one. Called when the grant is
-    /// queued, which follows the barrier `pong` (ADR 0257). Returns whether
-    /// `generation` is still the node's session.
+    /// queued. Refused (`false`) unless ADR 0257's barrier passed for the
+    /// lease at `token` on `generation`: the `pong` after its same-token
+    /// `local` grant, or the session's `hello` listing the lease `local`
+    /// ([`NodeHub::barrier_passed`]). Returns whether it was recorded.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "nothing sends a conversion grant yet (#555)")
@@ -264,6 +274,14 @@ impl NodeHub {
         token: u64,
         duration_ms: u64,
     ) -> bool {
+        if !self.barrier_passed(node_id, generation, lease_id, token) {
+            tracing::warn!(
+                lease_id,
+                node_id,
+                "no conversion grant before the barrier's pong (ADR 0257)"
+            );
+            return false;
+        }
         let mut sessions = self.0.sessions.lock().expect("session lock");
         let Some(handle) = sessions
             .get_mut(node_id)
@@ -285,13 +303,6 @@ impl NodeHub {
     /// token or below is answered on that session (section 8.4, "From R until
     /// the holder has taken the grant", ADR 0256). Returns whether
     /// `generation` is still the node's session.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the local grant that ends the renewals is the next layer (#555)"
-        )
-    )]
     pub(super) fn note_local_grant_sent(
         &self,
         node_id: &str,
@@ -444,6 +455,11 @@ impl Session {
     /// it.
     pub(super) async fn on_pong(&mut self, re: Option<&str>) {
         let Some(pinged) = re.and_then(|re| self.settles.pings.remove(re)) else {
+            // Not a settle's: the `pong` after a same-token `local` grant
+            // ([`super::local_end`]).
+            if let Some(re) = re {
+                self.on_barrier_pong(re).await;
+            }
             return;
         };
         let Pinged {
@@ -484,6 +500,17 @@ impl Session {
     ) -> Result<Option<Lease>, crate::error::ApiError> {
         let mut w = self.hub.0.store.begin_write().await?;
         if !self.hub.is_current(&self.node_id, self.generation) {
+            return Ok(None);
+        }
+        // The session sent the same-token `local` grant since: the holder may
+        // hold the lease `local` now, so no settle `ping` from before it
+        // settles the lease, the `pong` arriving after the holder took
+        // `local` ([`super::local_end`]).
+        if self
+            .hub
+            .local_grant_sent(&self.node_id, self.generation, lease_id)
+            .is_some_and(|sent| token <= sent)
+        {
             return Ok(None);
         }
         let Some(row) = leases::by_id(&mut w.tx, lease_id).await? else {
@@ -561,7 +588,7 @@ pub(super) mod tests {
     const D: u64 = 15_000;
 
     #[derive(Debug)]
-    struct EverySupport;
+    pub(in crate::session) struct EverySupport;
 
     impl VoterSupport for EverySupport {
         fn supports(&self, _duration_ms: u64) -> bool {
@@ -757,7 +784,11 @@ pub(super) mod tests {
 
     /// The node renews the lease at `token` on `session`; the frames the
     /// session queued in answer.
-    async fn renew(session: &mut Session, id: &str, token: u64) -> Vec<Value> {
+    pub(in crate::session) async fn renew(
+        session: &mut Session,
+        id: &str,
+        token: u64,
+    ) -> Vec<Value> {
         let mut outbox = Vec::new();
         let renew = NodeMessage::LeaseRenew(LeaseRenew {
             lease_id: LeaseId(LEASE.to_string()),
@@ -769,7 +800,7 @@ pub(super) mod tests {
         frames(outbox)
     }
 
-    async fn pong(session: &mut Session, re: &str) {
+    pub(in crate::session) async fn pong(session: &mut Session, re: &str) {
         let mut outbox = Vec::new();
         let pong = NodeMessage::Pong.to_frame("msg_pong", Some(re)).to_text();
         session.handle_text(&pong, &mut outbox).await;
@@ -778,7 +809,12 @@ pub(super) mod tests {
 
     /// The one `lease_grant` among `frames`, which answers `re`, `expiring`
     /// at `token` for `duration_ms`.
-    fn assert_answer(frames: &[Value], re: &str, token: u64, duration_ms: u64) {
+    pub(in crate::session) fn assert_answer(
+        frames: &[Value],
+        re: &str,
+        token: u64,
+        duration_ms: u64,
+    ) {
         let grants = of_type(frames, "lease_grant");
         assert_eq!(grants.len(), 1, "{frames:?}");
         let grant = grants[0];
@@ -1493,7 +1529,7 @@ pub(super) mod tests {
         w.commit().await.unwrap();
     }
 
-    async fn set_policy(f: &Fixture, policy: &str) {
+    pub(in crate::session) async fn set_policy(f: &Fixture, policy: &str) {
         sqlx::query("UPDATE apps SET ha_policy = ? WHERE id = ?")
             .bind(policy)
             .bind(APP)
@@ -1869,7 +1905,7 @@ pub(super) mod tests {
     }
 
     /// The one settling `ping` among `frames`: its message id.
-    fn ping_of(frames: &[Value]) -> String {
+    pub(in crate::session) fn ping_of(frames: &[Value]) -> String {
         let pings = of_type(frames, "ping");
         assert_eq!(pings.len(), 1, "{frames:?}");
         pings[0]["id"].as_str().unwrap().to_string()

@@ -1728,7 +1728,12 @@ pub async fn update_app(
         .await?;
 
     match update_app_tx(&state, &ctx, &app_id, &body, &params).await {
-        Ok((mut app, vm_ids, warm_wake)) => {
+        Ok((mut app, vm_ids, warm_wake, ended)) => {
+            // Section 8.4, "Ending the renewals" step 2: the `local` grant that
+            // ends the renewals goes out once R is replicated and supported.
+            if let Some(lease) = ended {
+                state.hub.hold_local_end(&lease);
+            }
             for vm_id in vm_ids {
                 state.notify_driver(&vm_id);
             }
@@ -1770,7 +1775,7 @@ async fn update_app_tx(
     app_id: &str,
     body: &UpdateAppRequest,
     params: &Value,
-) -> Result<(App, Vec<String>, Option<Vec<String>>), ApiError> {
+) -> Result<UpdatedApp, ApiError> {
     validate_update(body)?;
     if !deploy::is_id_with_prefix("app", app_id) {
         return Err(ApiError::not_found("app"));
@@ -1784,6 +1789,8 @@ async fn update_app_tx(
     let mut app = app_from_row(&row)?;
     let was_warm = app.ha_policy == HaPolicy::Warm;
     let mut changed = Vec::new();
+    // The lease row R left `local` and marked, when the policy leaves `warm`.
+    let mut ended = None;
 
     // A new replica count is checked against the app as it is now, and against
     // the placement this request sets when it sets one (ADR 0142).
@@ -1856,7 +1863,7 @@ async fn update_app_tx(
         // sent here.
         let warmish = |policy: HaPolicy| matches!(policy, HaPolicy::Warm | HaPolicy::Hot);
         if warmish(app.ha_policy) && !warmish(policy) {
-            crate::leases::end_renewals(&mut w.tx, app_id, &ctx.identity.actor()).await?;
+            ended = crate::leases::end_renewals(&mut w.tx, app_id, &ctx.identity.actor()).await?;
         }
         app.ha_policy = policy;
         changed.push("ha_policy");
@@ -1983,8 +1990,18 @@ async fn update_app_tx(
         .await?;
     }
     w.commit().await?;
-    Ok((app, vm_ids, warm_wake))
+    Ok((app, vm_ids, warm_wake, ended))
 }
+
+/// What [`update_app_tx`] committed: the app, the VMs to wake, the nodes
+/// whose warm settings changed, and the lease row R wrote or found `local`
+/// and marked when the policy left `warm`.
+type UpdatedApp = (
+    App,
+    Vec<String>,
+    Option<Vec<String>>,
+    Option<crate::leases::Lease>,
+);
 
 /// Why `updateApp` refuses `ha_policy` `warm` for an app (`openapi.yaml`
 /// `UpdateAppRequest.ha_policy`).

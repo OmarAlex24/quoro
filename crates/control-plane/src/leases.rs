@@ -1205,6 +1205,34 @@ pub(crate) async fn end_renewals(
     Ok(Some(lease))
 }
 
+/// The write that precedes the resend of the same-token `local` grant when
+/// the holder reports a token above the row's (section 8.4, "The holder's
+/// next `hello`", third bullet): the row takes `mode` `local` and the
+/// holder's `token`, and keeps the mark. The caller has checked, in the same
+/// single-writer transaction, that the holder may be recorded so. Returns
+/// the row as written.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn write_marked_local(
+    conn: &mut SqliteConnection,
+    mut lease: Lease,
+    token: i64,
+    actor: &Actor,
+) -> Result<Lease, ApiError> {
+    sqlx::query("UPDATE leases SET mode = 'local', fencing_token = ?, unsettled = 1 WHERE id = ?")
+        .bind(token)
+        .bind(&lease.id)
+        .execute(&mut *conn)
+        .await?;
+    lease.mode = "local".to_string();
+    lease.fencing_token = token;
+    lease.unsettled = true;
+    changelog::append(conn, actor, "lease", &lease.id, Op::Update, lease.payload()).await?;
+    Ok(lease)
+}
+
 /// Revokes the app's lease and writes its change-log entry; the caller builds
 /// the `lease_revoke` with a [`RevokeReason`]. Returns `None` when the app has
 /// no lease or it was already revoked.
