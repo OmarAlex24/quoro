@@ -3,6 +3,7 @@
 
 mod common;
 
+use common::replay;
 use common::{Server, problem, start};
 use serde_json::{Value, json};
 
@@ -581,6 +582,86 @@ async fn changing_a_password_ends_the_target_sessions() {
     server
         .login(&fresh, "viewer@example.com", new_password)
         .await;
+}
+
+/// Section 7.3 step 4 (ADR 0297): deleting a user removes its API tokens
+/// by cascade, and each one gets its own `delete` entry. Replayed in `seq`
+/// order into an empty database with foreign keys off, so no cascade runs,
+/// the log drops the user's tokens, a revoked one included, and keeps the
+/// owner's.
+#[tokio::test]
+async fn a_deleted_users_tokens_leave_the_log_with_it() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let res = owner
+        .post(server.url("/api/v1/tokens"))
+        .json(&json!({ "name": "owner token" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201, "create the owner's token");
+
+    let operator = create_user(
+        &owner,
+        &server,
+        "operator@example.com",
+        "Operator",
+        "operator",
+        OPERATOR_PASSWORD,
+    )
+    .await;
+    let operator_id = operator["id"].as_str().unwrap().to_string();
+    let client = server.client();
+    server
+        .login(&client, "operator@example.com", OPERATOR_PASSWORD)
+        .await;
+    let mut token_ids = Vec::new();
+    for name in ["kept", "revoked"] {
+        let res = client
+            .post(server.url("/api/v1/tokens"))
+            .json(&json!({ "name": name }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 201, "create the operator's token");
+        let body: Value = res.json().await.unwrap();
+        token_ids.push(body["id"].as_str().unwrap().to_string());
+    }
+    let res = client
+        .delete(server.url(&format!("/api/v1/tokens/{}", token_ids[1])))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 204, "revoke: {}", res.text().await.unwrap());
+
+    let res = delete_user(&owner, &server, &operator_id).await;
+    assert_eq!(res.status(), 204, "delete: {}", res.text().await.unwrap());
+
+    let rebuilt = replay::rebuild(&server, &["user", "api_token"], replay::TOKEN_HASHES).await;
+    replay::assert_rebuilt(
+        &server,
+        &rebuilt,
+        "users",
+        &["id", "email", "name", "role", "disabled", "created_at"],
+        1,
+    )
+    .await;
+    replay::assert_rebuilt(
+        &server,
+        &rebuilt,
+        "api_tokens",
+        &[
+            "id",
+            "user_id",
+            "name",
+            "expires_at",
+            "last_used_at",
+            "created_at",
+            "revoked_at",
+        ],
+        1,
+    )
+    .await;
 }
 
 #[tokio::test]

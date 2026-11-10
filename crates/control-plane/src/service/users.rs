@@ -574,6 +574,30 @@ async fn delete_user_tx(
     if referenced != 0 {
         return Err(ApiError::conflict(USER_REFERENCED));
     }
+    // The user's API tokens go with it (ON DELETE CASCADE). Each one gets its
+    // own `delete` entry before the user's, so a rebuild from the log
+    // (`node-agent-protocol.md` section 7.3 step 4) drops them too, revoked
+    // ones included.
+    let tokens: Vec<(String,)> =
+        sqlx::query_as("SELECT id FROM api_tokens WHERE user_id = ? ORDER BY id")
+            .bind(user_id)
+            .fetch_all(&mut *w.tx)
+            .await?;
+    sqlx::query("DELETE FROM api_tokens WHERE user_id = ?")
+        .bind(user_id)
+        .execute(&mut *w.tx)
+        .await?;
+    for (token_id,) in &tokens {
+        changelog::append(
+            &mut w.tx,
+            &ctx.identity.actor(),
+            "api_token",
+            token_id,
+            Op::Delete,
+            json!({ "id": token_id }),
+        )
+        .await?;
+    }
     match sqlx::query("DELETE FROM users WHERE id = ?")
         .bind(user_id)
         .execute(&mut *w.tx)
