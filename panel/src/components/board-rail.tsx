@@ -63,7 +63,7 @@ export function NeedsYou({
 
   return (
     <section className="card pneed" aria-label="Needs you">
-      {first ? <Aura tone="shift" breathe margin={10} /> : null}
+      {first ? <Aura tone="shift" margin={10} /> : null}
       <div className="psec-h">
         <LampDot ring="shift" core="shift" size={11} />
         <h2 ref={heading} tabIndex={-1}>
