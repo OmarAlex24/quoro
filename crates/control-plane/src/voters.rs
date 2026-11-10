@@ -418,6 +418,13 @@ impl VoterLog {
     /// could still roll back. Nodes are never deleted (a removal is a
     /// status), so a `delete` entry, which the replay drops, never occurs.
     ///
+    /// A machine whose replayed roles lack `node` is left out. That is right
+    /// today: only a removal takes a machine out of the set, and it writes
+    /// `status` alone, keeping the roles, so `removed_at` holds it in until
+    /// the others acknowledge the removal. A role change that clears `node`
+    /// (the roles operation, #687) must likewise keep the machine in the set
+    /// until that change is replicated; #687 has to add that before it ships.
+    ///
     /// # Errors
     ///
     /// A database error, or a `roles` column that is not a list of roles.
@@ -451,6 +458,8 @@ impl VoterLog {
             }
         }
         for (node_id, facts) in &replay.nodes {
+            // Without the `node` role: not in the set (see the doc comment
+            // for what #687 must add).
             if !facts.has_node_role() {
                 continue;
             }
