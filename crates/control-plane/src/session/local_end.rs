@@ -1388,7 +1388,10 @@ mod tests {
 
         set_policy(&f, "warm").await;
         hub.attempt_held().await;
-        assert!(!hub.grant_pending(LEASE), "dropped back on warm");
+        assert!(
+            !hub.0.held.lock().unwrap().entries.contains_key(LEASE),
+            "dropped back on warm"
+        );
         assert!(!hub.row_grant_pending(&f.row().await));
         let answer = renew(&mut on.session, "msg_r1", 3).await;
         assert_answer(&answer, "msg_r1", 3, D);
@@ -1588,6 +1591,37 @@ mod tests {
             state(&f).await,
             ("local".to_string(), 4, Some(D as i64), true, false)
         );
+        f.done();
+    }
+
+    /// R over a row whose grant with a new token already went out on the
+    /// holder's session (a failover's or a regrant's grant, `expiring` at
+    /// token 4), and which the holder renewed there: R writes the row, and
+    /// the sent grant's entry, which stands for nothing any more, gives way
+    /// to the `local` grant that ends the renewals. It goes out on that
+    /// session, then its `ping`.
+    #[tokio::test]
+    async fn r_after_a_sent_new_token_grant_sends_the_local_grant() {
+        let f = fixture("warm", "expiring", Some(D as i64), true).await;
+        created(&f).await;
+        write_row(&f, "UPDATE leases SET fencing_token = 4 WHERE id = ?").await;
+        let mut on = live(&f.state, &f, None).await;
+        let hub = &f.state.hub;
+        hub.hold_grant(&f.row().await);
+        ack(&f.state, &f, &on).await;
+        hub.attempt_held().await;
+        let sent = queued(&mut on);
+        assert!(!sent.is_empty(), "the new-token grant went out");
+        for frame in &sent {
+            assert_eq!(frame["body"]["mode"], "expiring", "{sent:?}");
+            assert_eq!(frame["body"]["fencing_token"], 4, "{sent:?}");
+        }
+        let answer = renew(&mut on.session, "msg_r1", 4).await;
+        assert_answer(&answer, "msg_r1", 4, D);
+        r(&f).await;
+        ack(&f.state, &f, &on).await;
+        hub.attempt_held().await;
+        grant_then_ping(&queued(&mut on), 4);
         f.done();
     }
 }
