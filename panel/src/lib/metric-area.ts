@@ -20,11 +20,16 @@ export interface PlotBox {
 
 export const PLOT_PAD = { left: 44, right: 10, top: 8, bottom: 20 } as const;
 
-export const plotBox = (width: number, height: number): PlotBox => ({
-  left: PLOT_PAD.left,
-  right: Math.max(PLOT_PAD.left + 1, width - PLOT_PAD.right),
-  top: PLOT_PAD.top,
-  bottom: Math.max(PLOT_PAD.top + 1, height - PLOT_PAD.bottom),
+export type PlotPad = { left: number; right: number; top: number; bottom: number };
+
+/** No room for labels: the plot is the whole canvas but a little headroom, for a bare chart. */
+export const BARE_PAD: PlotPad = { left: 0, right: 0, top: 6, bottom: 0 };
+
+export const plotBox = (width: number, height: number, pad: PlotPad = PLOT_PAD): PlotBox => ({
+  left: pad.left,
+  right: Math.max(pad.left + 1, width - pad.right),
+  top: pad.top,
+  bottom: Math.max(pad.top + 1, height - pad.bottom),
 });
 
 /** A y axis from 0 to `max`, with its grid lines. Values are in the axis unit (percent, MiB). */
@@ -225,6 +230,7 @@ export const areaPlot = ({
   intervalMs,
   limit = null,
   windowMs = METRICS_WINDOW_MS,
+  pad = PLOT_PAD,
 }: {
   series: Series;
   end: number;
@@ -235,8 +241,10 @@ export const areaPlot = ({
   intervalMs: number;
   limit?: { value: number; label: string } | null;
   windowMs?: number;
+  /** Room around the plot for its labels; `BARE_PAD` for a chart without them. */
+  pad?: PlotPad;
 }): AreaPlot => {
-  const box = plotBox(width, height);
+  const box = plotBox(width, height, pad);
   const point = (index: number) => ({
     x: xForTime(series.times[index]!, end, box, windowMs),
     y: yForValue(series.values[index]!, axis.max, box),
