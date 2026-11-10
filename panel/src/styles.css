@@ -4987,8 +4987,10 @@
     border-radius: 50%;
   }
 
+  /* The card already frames it: no second, dashed edge against the card's own. */
   .nevents-empty {
     padding: 8px 16px 18px;
+    border: 0;
   }
 
   .pghost.ninvite:focus-visible {
