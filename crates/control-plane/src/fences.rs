@@ -15,6 +15,7 @@
 //! in the caller's transaction.
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::{Mutex, PoisonError};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -292,6 +293,82 @@ pub(crate) async fn listed_leases(
     Ok(listed)
 }
 
+/// Each `(node, lease)` whose failed fence the node reported in a
+/// `lease_revoke` answered `fence_failed` while this primary could not record
+/// it in `fence_failure` (section 8.5 step 1, issue #392). In memory only: an
+/// entry is added when that record fails, removed only when a later
+/// `fence_failed` answer of the same node for the same lease is recorded, and
+/// lost when the primary restarts.
+#[derive(Debug, Default)]
+pub(crate) struct UnrecordedFailures(Mutex<HashSet<(String, String)>>);
+
+impl UnrecordedFailures {
+    /// Notes whether the failed fence of `lease_id` that `node_id` reported
+    /// is recorded.
+    pub(crate) fn note(&self, node_id: &str, lease_id: &str, recorded: bool) {
+        let mut unrecorded = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let key = (node_id.to_string(), lease_id.to_string());
+        if recorded {
+            unrecorded.remove(&key);
+        } else {
+            unrecorded.insert(key);
+        }
+    }
+
+    /// Whether `node_id` reported a failed fence of `lease_id` that is not
+    /// recorded.
+    pub(crate) fn of_node(&self, node_id: &str, lease_id: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&(node_id.to_string(), lease_id.to_string()))
+    }
+
+    /// Every lease some node reported a failed fence of that is not
+    /// recorded.
+    fn leases(&self) -> HashSet<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|(_, failed)| failed.clone())
+            .collect()
+    }
+}
+
+/// Whether `lease_id` has a failed fence that no operator acknowledged,
+/// recorded or not: listed in a node's `fence_failure` ([`listed_leases`]),
+/// or reported while this primary could not record it
+/// ([`UnrecordedFailures`]). Either way its VMs may still run, so no grant of
+/// it goes out and no new token of it is written (section 8.5 step 1). The
+/// one test of it for the grant paths, so they agree; [`failed_leases`]
+/// gives the same answer for every lease at once.
+///
+/// # Errors
+///
+/// A database error, or a stored value that does not parse.
+pub(crate) async fn has_failed_fence(
+    conn: &mut SqliteConnection,
+    unrecorded: &UnrecordedFailures,
+    lease_id: &str,
+) -> Result<bool, ApiError> {
+    Ok(failed_leases(conn, unrecorded).await?.contains(lease_id))
+}
+
+/// Every lease [`has_failed_fence`] answers `true` for.
+///
+/// # Errors
+///
+/// A database error, or a stored value that does not parse.
+pub(crate) async fn failed_leases(
+    conn: &mut SqliteConnection,
+    unrecorded: &UnrecordedFailures,
+) -> Result<HashSet<String>, ApiError> {
+    let mut failed = listed_leases(conn).await?;
+    failed.extend(unrecorded.leases());
+    Ok(failed)
+}
+
 /// Clears what `delivered` carried from the node's `fence_ack_pending` once
 /// the node answered the `fence_ack` with `ok` (section 8.5 step 4): each
 /// delivered lease still pending with the token stored when it went out, or
@@ -393,8 +470,16 @@ mod tests {
         let authority = crate::authority::Authority::new(std::sync::Arc::new(
             crate::authority::SystemMonotonic::default(),
         ));
-        match crate::leases::grant_app_lease(&mut w.tx, &authority, "app_x", node_id, actor, false)
-            .await?
+        match crate::leases::grant_app_lease(
+            &mut w.tx,
+            &authority,
+            &UnrecordedFailures::default(),
+            "app_x",
+            node_id,
+            actor,
+            false,
+        )
+        .await?
         {
             crate::leases::NewGrant::Granted(lease) | crate::leases::NewGrant::Waiting(lease) => {
                 Ok(*lease)

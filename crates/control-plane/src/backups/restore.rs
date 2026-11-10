@@ -410,6 +410,7 @@ async fn restore_ready(
     let (lease, waiting) = match leases::grant_app_lease(
         &mut w.tx,
         hub.authority(),
+        hub.unrecorded_failures(),
         &current.app_id,
         node_id,
         &actor,

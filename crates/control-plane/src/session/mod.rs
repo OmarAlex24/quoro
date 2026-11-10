@@ -496,13 +496,19 @@ struct HubInner {
     /// restore grants the lease to its target only once its holder did
     /// (section 5.13, issue #392).
     releases: leases::Releases,
-    /// Each `(node, lease)` whose failed fence the node reported, by a revoke
-    /// answered `fence_failed`, while the primary could not record it: its
-    /// VMs may still run, so no restore takes the lease until a later report
-    /// of that failure is recorded (section 8.5 step 1, issue #392). In
-    /// memory only; the node reports the failure again in its buffered
-    /// `node.fence_failed` and when the next session's revoke fences again.
-    unrecorded_failures: Mutex<HashSet<(String, String)>>,
+    /// The failed fences nodes reported in a revoke's `fence_failed` answer
+    /// that this primary could not record ([`fences::UnrecordedFailures`]).
+    /// [`NodeHub::revoke_unanswered`] reads the reporting node's entries, so
+    /// a restore and a failover do not take the lease from that node; and
+    /// [`fences::has_failed_fence`] reads every node's, so no grant of the
+    /// lease goes out from `grant_app_lease` (a regrant, a restore, a
+    /// failover, `createVolume`), a first grant's resend, a renewal's answer,
+    /// the session start's grants or step 4 and the held grants, as for a
+    /// failure `fence_failure` lists (section 8.5 step 1, issue #392).
+    ///
+    /// [`fences::UnrecordedFailures`]: crate::fences::UnrecordedFailures
+    /// [`fences::has_failed_fence`]: crate::fences::has_failed_fence
+    unrecorded_failures: crate::fences::UnrecordedFailures,
     /// The gates of `expiring` leases and the voters' support (section 8.4,
     /// "What the authority must enforce"; section 8.8).
     authority: crate::authority::Authority,
@@ -635,7 +641,7 @@ impl NodeHub {
             warm_named: Mutex::new(HashMap::new()),
             disk_free_gb: Mutex::new(HashMap::new()),
             releases: leases::Releases::default(),
-            unrecorded_failures: Mutex::new(HashSet::new()),
+            unrecorded_failures: crate::fences::UnrecordedFailures::default(),
             authority,
             voters,
             support,
@@ -828,13 +834,7 @@ impl NodeHub {
     /// live session of `node_id`, or `node_id` answered one `fence_failed`
     /// that the primary could not record.
     pub(crate) fn revoke_unanswered(&self, node_id: &str, lease_id: &str) -> bool {
-        if self
-            .0
-            .unrecorded_failures
-            .lock()
-            .expect("unrecorded failures lock")
-            .contains(&(node_id.to_string(), lease_id.to_string()))
-        {
+        if self.0.unrecorded_failures.of_node(node_id, lease_id) {
             return true;
         }
         let sessions = self.0.sessions.lock().expect("session lock");
@@ -852,30 +852,14 @@ impl NodeHub {
     /// Notes whether the failed fence of `lease_id` that `node_id` reported
     /// is recorded ([`HubInner::unrecorded_failures`]).
     fn note_failure_recorded(&self, node_id: &str, lease_id: &str, recorded: bool) {
-        let mut unrecorded = self
-            .0
-            .unrecorded_failures
-            .lock()
-            .expect("unrecorded failures lock");
-        let key = (node_id.to_string(), lease_id.to_string());
-        if recorded {
-            unrecorded.remove(&key);
-        } else {
-            unrecorded.insert(key);
-        }
+        self.0.unrecorded_failures.note(node_id, lease_id, recorded);
     }
 
-    /// Whether any node reported a failed fence of `lease_id` that this
-    /// primary could not record ([`HubInner::unrecorded_failures`]): its VMs
-    /// may still run, so no grant of the lease goes out and none is minted
-    /// (section 8.5 step 1), as for a failure `fence_failure` lists.
-    pub(crate) fn unrecorded_failure(&self, lease_id: &str) -> bool {
-        self.0
-            .unrecorded_failures
-            .lock()
-            .expect("unrecorded failures lock")
-            .iter()
-            .any(|(_, failed)| failed == lease_id)
+    /// The failed fences this primary could not record
+    /// ([`HubInner::unrecorded_failures`]), for
+    /// [`crate::fences::has_failed_fence`].
+    pub(crate) fn unrecorded_failures(&self) -> &crate::fences::UnrecordedFailures {
+        &self.0.unrecorded_failures
     }
 
     /// Tells the live session of `node_id` to rebuild and resend its desired
@@ -1018,13 +1002,10 @@ impl NodeHub {
         {
             return Ok(Regrant::No);
         }
-        if crate::fences::listed_leases(&mut w.tx)
-            .await?
-            .contains(lease_id)
+        if crate::fences::has_failed_fence(&mut w.tx, &self.0.unrecorded_failures, lease_id).await?
             || crate::fences::pending_of(&mut w.tx, node_id)
                 .await?
                 .is_some_and(|pending| pending.lease_ids.iter().any(|id| id == lease_id))
-            || self.unrecorded_failure(lease_id)
         {
             tracing::info!(
                 node_id,
@@ -1035,7 +1016,9 @@ impl NodeHub {
         }
         // Re-entry: a grant of the lease already waiting for this node is
         // reused, so no second token is written while one waits (ADR 0295).
-        if self.grant_pending(lease_id) && leases::is_step4(&mut w.tx, &row).await? {
+        if self.grant_pending(lease_id)
+            && leases::is_step4(&mut w.tx, &self.0.unrecorded_failures, &row).await?
+        {
             drop(w);
             self.hold_grant(&row);
             return Ok(Regrant::Held);
@@ -1049,6 +1032,7 @@ impl NodeHub {
         let lease = match leases::grant_app_lease(
             &mut w.tx,
             &self.0.authority,
+            &self.0.unrecorded_failures,
             &row.resource_id,
             node_id,
             &actor,
@@ -1186,9 +1170,8 @@ impl NodeHub {
                 return Ok::<_, ApiError>(None);
             };
             if leases::is_marked(&mut w.tx, lease_id).await?
-                || crate::fences::listed_leases(&mut w.tx)
+                || crate::fences::has_failed_fence(&mut w.tx, &self.0.unrecorded_failures, lease_id)
                     .await?
-                    .contains(lease_id)
             {
                 return Ok(None);
             }
@@ -3350,21 +3333,18 @@ impl Session {
             tracing::warn!(code = %e.code.as_str(), node_id = %self.node_id, "cannot check the held grants of the node");
             complete = false;
         }
+        // Section 8.5 step 1: a failed fence this primary could not record
+        // takes the row out of step 4 as a recorded one does
+        // ([`leases::is_step4`]), so a listing below the row's token gets the
+        // revoke of section 5.1, and no grant goes out for it.
         let step4: HashMap<String, leases::Lease> = match leases::step4_rows(
             &mut conn,
+            &self.hub.0.unrecorded_failures,
             Some(&self.node_id),
         )
         .await
         {
-            // Section 8.5 step 1: a failed fence this primary could not
-            // record takes the row out of step 4 as a recorded one does
-            // ([`leases::is_step4`]), so a listing below the row's token gets
-            // the revoke of section 5.1, and no grant goes out for it.
-            Ok(rows) => rows
-                .into_iter()
-                .filter(|row| !self.hub.unrecorded_failure(&row.id))
-                .map(|row| (row.id.clone(), row))
-                .collect(),
+            Ok(rows) => rows.into_iter().map(|row| (row.id.clone(), row)).collect(),
             Err(e) => {
                 tracing::warn!(code = %e.code.as_str(), node_id = %self.node_id, "cannot read the step-4 rows of the node");
                 complete = false;
@@ -3602,15 +3582,19 @@ impl Session {
             );
             return;
         }
-        match crate::fences::listed_leases(&mut w.tx).await {
-            Ok(listed) if listed.contains(lease_id) => {
+        // A failed fence this primary could not record refuses the answer
+        // as a recorded one does (section 8.5 step 1).
+        match crate::fences::has_failed_fence(&mut w.tx, &self.hub.0.unrecorded_failures, lease_id)
+            .await
+        {
+            Ok(true) => {
                 tracing::warn!(
                     lease_id,
                     "a renewal of a lease with a failed fence gets no answer"
                 );
                 return;
             }
-            Ok(_) => {}
+            Ok(false) => {}
             Err(e) => {
                 tracing::warn!(code = %e.code.as_str(), lease_id, "cannot read the failed fences");
                 return;
@@ -3903,8 +3887,9 @@ impl Session {
     }
 
     /// Sends a `lease_grant` for every unrevoked lease this node holds
-    /// (section 5.12), except a lease listed in a node's `fence_failure`
-    /// (section 8.5). A `local` lease carries no `duration_ms`.
+    /// (section 5.12), except a lease with a failed fence, recorded in a
+    /// node's `fence_failure` or not (section 8.5 step 1). A `local` lease
+    /// carries no `duration_ms`.
     ///
     /// A lease the `hello` listed `expired` gets no grant at the row's token,
     /// which the node refuses (section 5.12): the primary gives it back at a
@@ -3931,17 +3916,18 @@ impl Session {
                 return;
             }
         };
-        let listed = match crate::fences::listed_leases(&mut conn).await {
-            Ok(listed) => listed,
-            Err(e) => {
-                tracing::warn!(
-                    code = %e.code.as_str(),
-                    node_id = %self.node_id,
-                    "cannot read the failed fences; no lease is granted"
-                );
-                return;
-            }
-        };
+        let listed =
+            match crate::fences::failed_leases(&mut conn, &self.hub.0.unrecorded_failures).await {
+                Ok(listed) => listed,
+                Err(e) => {
+                    tracing::warn!(
+                        code = %e.code.as_str(),
+                        node_id = %self.node_id,
+                        "cannot read the failed fences; no lease is granted"
+                    );
+                    return;
+                }
+            };
         let held = leases::held_by_node(&mut conn, &self.node_id).await;
         // A regrant takes the writer gate; this read connection is not held
         // across it.

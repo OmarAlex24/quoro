@@ -268,9 +268,8 @@ async fn refuse(state: &AppState, app: &App, node_id: &str) -> Result<Plan, ApiE
 
     let lease = leases::app_lease(&mut conn, &app.id).await?;
     if let Some(lease) = &lease
-        && crate::fences::listed_leases(&mut conn)
+        && crate::fences::has_failed_fence(&mut conn, state.hub.unrecorded_failures(), &lease.id)
             .await?
-            .contains(&lease.id)
     {
         return Err(conflict(
             Reason::FenceFailed,
@@ -701,10 +700,7 @@ async fn change(
                 "the app's lease changed while the failover waited",
             ));
         }
-        if crate::fences::listed_leases(&mut w.tx)
-            .await?
-            .contains(&lease.id)
-        {
+        if crate::fences::has_failed_fence(&mut w.tx, hub.unrecorded_failures(), &lease.id).await? {
             return Err(conflict(
                 Reason::FenceFailed,
                 "the app's lease has a failed fence that no operator acknowledged",
@@ -766,6 +762,7 @@ async fn change(
         let lease = match leases::grant_app_lease(
             &mut w.tx,
             hub.authority(),
+            hub.unrecorded_failures(),
             &plan.app_id,
             &plan.warm,
             &actor,
@@ -1036,10 +1033,17 @@ mod tests {
             // A fresh authority, so no gate of an earlier case is open.
             let authority = Authority::new(Arc::new(SystemMonotonic::default()));
             authority.set_support(Arc::new(EverySupport));
-            let granted =
-                leases::grant_app_lease(&mut w.tx, &authority, "app_f", &node_id, &actor, false)
-                    .await
-                    .unwrap();
+            let granted = leases::grant_app_lease(
+                &mut w.tx,
+                &authority,
+                &crate::fences::UnrecordedFailures::default(),
+                "app_f",
+                &node_id,
+                &actor,
+                false,
+            )
+            .await
+            .unwrap();
             match (&granted, guess) {
                 (NewGrant::Waiting(_), Some(_)) => {}
                 (NewGrant::Granted(lease), None) => {

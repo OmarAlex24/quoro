@@ -8,11 +8,12 @@ mod common;
 use common::{Server, start_with_patient_node_session};
 use futures_util::{SinkExt, StreamExt};
 use quoro_control_plane::authority::VoterSupport;
+use quoro_control_plane::session::Fault;
 use quoro_proto::wire::{
     self, Capacity as WireCapacity, Heartbeat, Kvm as WireKvm, NodeMessage, StatusReport,
     VolumeState as WireVolumeState, VolumeStatus,
 };
-use quoro_proto::{CommandResult, CommandStatus, LeaseId, LeaseRenew};
+use quoro_proto::{CommandResult, CommandStatus, ErrorBody, ErrorCode, LeaseId, LeaseRenew};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
@@ -831,5 +832,55 @@ async fn a_new_token_to_a_node_that_still_holds_the_lease_stays_local() {
     assert_eq!(
         grant_pending(&server, &owner, &app_id).await,
         (true, json!([node.node_id]))
+    );
+}
+
+/// Section 8.5 step 1. The node answers the revoke of its deleted volume's
+/// lease `fence_failed`, and the primary cannot record the failure, which
+/// it then keeps in memory only. A new volume of the app is refused as for a
+/// recorded failure, and no token is written: the app's VMs may still run.
+#[tokio::test]
+async fn a_new_volume_is_refused_while_a_failed_fence_is_unrecorded() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let (node, mut socket, project_id) = connected_node(&server, &owner).await;
+    let app_id = app_with_policy(&server, &owner, &project_id, "web", "none").await;
+    let (volume_id, first) = volume_and_grant(&server, &owner, &mut socket, &app_id).await;
+    assert_eq!(first["body"]["fencing_token"], 1);
+    server.state.hub.inject_fault(Fault::FailureRecord {
+        node_id: node.node_id.clone(),
+    });
+    let revoke_id = delete_volume(&server, &owner, &mut socket, &volume_id).await;
+    send(
+        &mut socket,
+        NodeMessage::CommandResult(CommandResult {
+            status: CommandStatus::Error,
+            detail: Some("the VM may still run".to_string()),
+            error: Some(ErrorBody {
+                code: ErrorCode::FenceFailed,
+                message: "the forced stop could not be confirmed".to_string(),
+            }),
+            lines: None,
+            metrics: None,
+        }),
+        Some(&revoke_id),
+    )
+    .await;
+    frames_until_settled(&mut socket).await;
+    let failure: Option<String> =
+        sqlx::query_scalar("SELECT fence_failure FROM nodes WHERE id = ?")
+            .bind(&node.node_id)
+            .fetch_one(server.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(failure, None, "not recorded");
+
+    let detail = conflict_detail(create_volume(&server, &owner, &app_id).await).await;
+    assert!(detail.contains("failed fence"), "{detail}");
+    assert_eq!(lease_row(&server, &app_id).await.0, 1, "no token written");
+    let frames = frames_after_a_tick(&mut socket).await;
+    assert!(
+        !frames.iter().any(|frame| frame["type"] == "lease_grant"),
+        "{frames:?}"
     );
 }

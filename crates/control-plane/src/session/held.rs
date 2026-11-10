@@ -411,7 +411,7 @@ impl NodeHub {
     pub(crate) async fn rebuild_held_grants(&self) -> Result<(), String> {
         let rows = async {
             let mut conn = self.0.store.pool().acquire().await?;
-            leases::step4_rows(&mut conn, None).await
+            leases::step4_rows(&mut conn, &self.0.unrecorded_failures, None).await
         }
         .await
         .map_err(|e| format!("cannot read the held grants: {}", e.code.as_str()))?;
@@ -508,13 +508,13 @@ impl NodeHub {
         };
         for (lease_id, held) in entries {
             let row = leases::by_id(conn, &lease_id).await?;
-            let unrecorded = self.unrecorded_failure(&lease_id);
+            let unrecorded = &self.0.unrecorded_failures;
             let fenced = match row
                 .as_ref()
                 .filter(|row| held.names(row) && row.unsettled && !row.is_revoked())
             {
-                Some(row) if !unrecorded && leases::is_step4(conn, row).await? => continue,
-                Some(row) => unrecorded || leases::fenced(conn, row).await?,
+                Some(row) if leases::is_step4(conn, unrecorded, row).await? => continue,
+                Some(row) => leases::fenced(conn, unrecorded, row).await?,
                 None => false,
             };
             // What the entry was when it changed, so a revoke it held back
@@ -767,7 +767,6 @@ impl NodeHub {
             }
             if !self.0.authority.supports(held.support_ms)
                 || self.0.authority.gate_remaining(lease_id).is_some()
-                || self.unrecorded_failure(lease_id)
             {
                 return Ok(Attempt::Wait);
             }
@@ -791,11 +790,10 @@ impl NodeHub {
         if !held.names(&row) || row.is_revoked() || !row.unsettled {
             return Ok(Attempt::Drop);
         }
-        // Section 8.5: a failed fence or an acknowledgement pending delivery
-        // holds the grant; the acknowledgement's increment changes the token.
-        // A failed fence this primary could not record holds it the same
-        // way (section 8.5 step 1).
-        if leases::fenced(&mut w.tx, &row).await? || self.unrecorded_failure(lease_id) {
+        // Section 8.5: a failed fence, recorded or not (step 1), or an
+        // acknowledgement pending delivery holds the grant; the
+        // acknowledgement's increment changes the token.
+        if leases::fenced(&mut w.tx, &self.0.unrecorded_failures, &row).await? {
             return Ok(Attempt::Wait);
         }
         // Step 4: the row's newest write gave the lease its token.

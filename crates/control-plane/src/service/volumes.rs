@@ -375,7 +375,8 @@ pub(crate) async fn create_volume(
         Some(previous)
             if previous.holder_node_id == node_id
                 && state.hub.grant_pending(&previous.id)
-                && leases::is_step4(&mut w.tx, &previous).await? =>
+                && leases::is_step4(&mut w.tx, state.hub.unrecorded_failures(), &previous)
+                    .await? =>
         {
             Some(previous)
         }
@@ -386,6 +387,7 @@ pub(crate) async fn create_volume(
         None => match leases::grant_app_lease(
             &mut w.tx,
             state.hub.authority(),
+            state.hub.unrecorded_failures(),
             app_id,
             &node_id,
             &actor,

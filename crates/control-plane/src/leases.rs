@@ -13,6 +13,7 @@
 use crate::changelog::{self, Actor, Op};
 use crate::deploy;
 use crate::error::ApiError;
+use crate::fences::UnrecordedFailures;
 use crate::store::now_rfc3339;
 use quoro_proto::{LeaseGrant, LeaseId, LeaseMode, LeaseRevoke, ResourceType, RevokeReason};
 use serde_json::{Value, json};
@@ -250,37 +251,43 @@ pub(crate) async fn newest_write_gave_new_token(
 
 /// Whether `lease` is a step-4 row for the node it names ("The holder fenced
 /// first" step 4; ADR 0295, ADR 0299): an app lease that carries the mark,
-/// is not revoked, is in no node's `fence_failure` and not in its holder's
-/// `fence_ack_pending`, and whose newest write gave it a new token
-/// ([`newest_write_gave_new_token`]). The rows decide, read live at every
-/// call: an operator's acknowledgement can change any of them.
+/// is not revoked, has no failed fence, recorded or not, is not in its
+/// holder's `fence_ack_pending` ([`fenced`]), and whose newest write gave it
+/// a new token ([`newest_write_gave_new_token`]). The rows decide, read live
+/// at every call: an operator's acknowledgement can change any of them.
 ///
 /// # Errors
 ///
 /// A database error.
-pub(crate) async fn is_step4(conn: &mut SqliteConnection, lease: &Lease) -> Result<bool, ApiError> {
+pub(crate) async fn is_step4(
+    conn: &mut SqliteConnection,
+    unrecorded: &UnrecordedFailures,
+    lease: &Lease,
+) -> Result<bool, ApiError> {
     if lease.resource_type != "app" || !lease.unsettled || lease.is_revoked() {
         return Ok(false);
     }
-    if fenced(conn, lease).await? {
+    if fenced(conn, unrecorded, lease).await? {
         return Ok(false);
     }
     newest_write_gave_new_token(conn, &lease.id).await
 }
 
-/// Whether `lease` is listed in any node's `fence_failure` or in its
-/// holder's `fence_ack_pending` (section 8.5): no grant of it goes out until
-/// that clears. The one test of it for step 4 ([`is_step4`]), a held grant's
-/// send and the session start's check of the held grants, so they agree.
+/// Whether `lease` has a failed fence, recorded or not
+/// ([`crate::fences::has_failed_fence`]), or is in its holder's
+/// `fence_ack_pending` (section 8.5): no grant of it goes out until that
+/// clears. The one test of it for step 4 ([`is_step4`]), a held grant's send
+/// and the session start's check of the held grants, so they agree.
 ///
 /// # Errors
 ///
 /// A database error.
-pub(crate) async fn fenced(conn: &mut SqliteConnection, lease: &Lease) -> Result<bool, ApiError> {
-    if crate::fences::listed_leases(conn)
-        .await?
-        .contains(&lease.id)
-    {
+pub(crate) async fn fenced(
+    conn: &mut SqliteConnection,
+    unrecorded: &UnrecordedFailures,
+    lease: &Lease,
+) -> Result<bool, ApiError> {
+    if crate::fences::has_failed_fence(conn, unrecorded, &lease.id).await? {
         return Ok(true);
     }
     Ok(crate::fences::pending_of(conn, &lease.holder_node_id)
@@ -296,6 +303,7 @@ pub(crate) async fn fenced(conn: &mut SqliteConnection, lease: &Lease) -> Result
 /// A database error.
 pub(crate) async fn step4_rows(
     conn: &mut SqliteConnection,
+    unrecorded: &UnrecordedFailures,
     node_id: Option<&str>,
 ) -> Result<Vec<Lease>, ApiError> {
     let rows = sqlx::query(&format!(
@@ -309,7 +317,7 @@ pub(crate) async fn step4_rows(
     let mut step4 = Vec::new();
     for row in &rows {
         let lease = lease_from_row(row)?;
-        if is_step4(conn, &lease).await? {
+        if is_step4(conn, unrecorded, &lease).await? {
             step4.push(lease);
         }
     }
@@ -819,11 +827,12 @@ pub(crate) fn grant_must_wait(facts: GrantFacts) -> bool {
 ///
 /// # Errors
 ///
-/// `conflict` while the lease is listed in a node's `fence_failure`, or a
-/// database error.
+/// `conflict` while the lease has a failed fence, recorded or not
+/// ([`crate::fences::has_failed_fence`]), or a database error.
 pub(crate) async fn grant_app_lease(
     conn: &mut SqliteConnection,
     authority: &crate::authority::Authority,
+    unrecorded: &UnrecordedFailures,
     app_id: &str,
     node_id: &str,
     actor: &Actor,
@@ -831,12 +840,11 @@ pub(crate) async fn grant_app_lease(
 ) -> Result<NewGrant, ApiError> {
     use crate::authority::{DEFAULT_DURATION_MS, Grant, GrantKind, Refused};
     let previous = app_lease(conn, app_id).await?;
-    // Section 8.5: a lease listed in a node's `fence_failure` is granted to
-    // no node until an operator acknowledges the failed fence.
+    // Section 8.5: a lease with a failed fence, recorded in a node's
+    // `fence_failure` or not, is granted to no node until an operator
+    // acknowledges it (step 1).
     if let Some(previous) = &previous
-        && crate::fences::listed_leases(conn)
-            .await?
-            .contains(&previous.id)
+        && crate::fences::has_failed_fence(conn, unrecorded, &previous.id).await?
     {
         return Err(ApiError::conflict(format!(
             "lease {} has a failed fence that no operator has acknowledged",
@@ -1046,11 +1054,17 @@ mod tests {
         };
         let mut w = store.begin_write().await.unwrap();
         let authority = Authority::new(Arc::new(crate::authority::SystemMonotonic::default()));
-        let super::NewGrant::Granted(lease) =
-            super::grant_app_lease(&mut w.tx, &authority, "app_x", &node_id, &actor, false)
-                .await
-                .unwrap()
-        else {
+        let super::NewGrant::Granted(lease) = super::grant_app_lease(
+            &mut w.tx,
+            &authority,
+            &super::UnrecordedFailures::default(),
+            "app_x",
+            &node_id,
+            &actor,
+            false,
+        )
+        .await
+        .unwrap() else {
             panic!("a first lease has no gate");
         };
         let lease = *lease;
@@ -1149,6 +1163,7 @@ mod tests {
             let granted = super::grant_app_lease(
                 &mut w.tx,
                 &authority,
+                &super::UnrecordedFailures::default(),
                 "app_x",
                 &lease.holder_node_id,
                 &actor,
@@ -1264,9 +1279,17 @@ mod tests {
         // waits (#703).
         authority.seed(&lease.id, holder, Some(15_000));
         let mut w = store.begin_write().await.unwrap();
-        let open = super::grant_app_lease(&mut w.tx, &authority, "app_x", holder, &actor, false)
-            .await
-            .unwrap();
+        let open = super::grant_app_lease(
+            &mut w.tx,
+            &authority,
+            &super::UnrecordedFailures::default(),
+            "app_x",
+            holder,
+            &actor,
+            false,
+        )
+        .await
+        .unwrap();
         assert!(
             matches!(open, super::NewGrant::GateOpen(_)),
             "before the gate: {open:?}"
@@ -1274,11 +1297,17 @@ mod tests {
         let row = super::by_id(&mut w.tx, &lease.id).await.unwrap().unwrap();
         assert_eq!(row.fencing_token, lease.fencing_token, "before the gate");
         clock.advance(Duration::from_millis(18_000));
-        let super::NewGrant::Waiting(waiting) =
-            super::grant_app_lease(&mut w.tx, &authority, "app_x", holder, &actor, false)
-                .await
-                .unwrap()
-        else {
+        let super::NewGrant::Waiting(waiting) = super::grant_app_lease(
+            &mut w.tx,
+            &authority,
+            &super::UnrecordedFailures::default(),
+            "app_x",
+            holder,
+            &actor,
+            false,
+        )
+        .await
+        .unwrap() else {
             panic!("after the gate, a local token over an expiring row waits");
         };
         assert_eq!(waiting.fencing_token, lease.fencing_token + 1);
@@ -1298,9 +1327,17 @@ mod tests {
         .await
         .unwrap();
         authority.seed(&lease.id, holder, Some(15_000));
-        let open = super::grant_app_lease(&mut w.tx, &authority, "app_x", holder, &actor, false)
-            .await
-            .unwrap();
+        let open = super::grant_app_lease(
+            &mut w.tx,
+            &authority,
+            &super::UnrecordedFailures::default(),
+            "app_x",
+            holder,
+            &actor,
+            false,
+        )
+        .await
+        .unwrap();
         assert!(
             matches!(open, super::NewGrant::GateOpen(remaining) if remaining == Duration::from_millis(18_000)),
             "{open:?}"
@@ -1308,11 +1345,17 @@ mod tests {
         let row = super::by_id(&mut w.tx, &lease.id).await.unwrap().unwrap();
         assert_eq!(row.fencing_token, lease.fencing_token + 1);
         clock.advance(Duration::from_millis(18_000));
-        let super::NewGrant::Granted(granted) =
-            super::grant_app_lease(&mut w.tx, &authority, "app_x", holder, &actor, false)
-                .await
-                .unwrap()
-        else {
+        let super::NewGrant::Granted(granted) = super::grant_app_lease(
+            &mut w.tx,
+            &authority,
+            &super::UnrecordedFailures::default(),
+            "app_x",
+            holder,
+            &actor,
+            false,
+        )
+        .await
+        .unwrap() else {
             panic!("the gate has passed");
         };
         assert_eq!(granted.fencing_token, lease.fencing_token + 2);
@@ -1328,9 +1371,17 @@ mod tests {
             .execute(&mut *w.tx)
             .await
             .unwrap();
-        let waiting = super::grant_app_lease(&mut w.tx, &authority, "app_x", holder, &actor, false)
-            .await
-            .unwrap();
+        let waiting = super::grant_app_lease(
+            &mut w.tx,
+            &authority,
+            &super::UnrecordedFailures::default(),
+            "app_x",
+            holder,
+            &actor,
+            false,
+        )
+        .await
+        .unwrap();
         assert!(
             matches!(&waiting, super::NewGrant::Waiting(row) if row.unsettled),
             "{waiting:?}"
@@ -1479,11 +1530,17 @@ mod tests {
                 .unwrap()
                 .unwrap();
             let mut w = store.begin_write().await.unwrap();
-            let super::NewGrant::Waiting(waiting) =
-                super::grant_app_lease(&mut w.tx, &authority, "app_x", &holder, &actor, keep_local)
-                    .await
-                    .unwrap()
-            else {
+            let super::NewGrant::Waiting(waiting) = super::grant_app_lease(
+                &mut w.tx,
+                &authority,
+                &super::UnrecordedFailures::default(),
+                "app_x",
+                &holder,
+                &actor,
+                keep_local,
+            )
+            .await
+            .unwrap() else {
                 panic!("{case}: the grant must wait");
             };
             w.commit().await.unwrap();
@@ -1527,9 +1584,17 @@ mod tests {
         let authority = Authority::new(Arc::new(crate::authority::SystemMonotonic::default()));
         authority.set_support(Arc::new(EverySupport));
         let mut w = store.begin_write().await.unwrap();
-        let first = super::grant_app_lease(&mut w.tx, &authority, "app_x", &holder, &actor, false)
-            .await
-            .unwrap();
+        let first = super::grant_app_lease(
+            &mut w.tx,
+            &authority,
+            &super::UnrecordedFailures::default(),
+            "app_x",
+            &holder,
+            &actor,
+            false,
+        )
+        .await
+        .unwrap();
         w.commit().await.unwrap();
         let super::NewGrant::Waiting(first) = first else {
             panic!("a warm app's first lease waits: {first:?}");
@@ -1559,10 +1624,17 @@ mod tests {
                 .unwrap();
             let entries = log_len(&store).await;
             let mut w = store.begin_write().await.unwrap();
-            let open =
-                super::grant_app_lease(&mut w.tx, &authority, "app_x", &holder, &actor, false)
-                    .await
-                    .unwrap();
+            let open = super::grant_app_lease(
+                &mut w.tx,
+                &authority,
+                &super::UnrecordedFailures::default(),
+                "app_x",
+                &holder,
+                &actor,
+                false,
+            )
+            .await
+            .unwrap();
             w.commit().await.unwrap();
             assert!(
                 matches!(open, super::NewGrant::GateOpen(remaining) if remaining == Duration::from_millis(18_000)),
@@ -1604,10 +1676,17 @@ mod tests {
         let authority = Authority::new(Arc::new(crate::authority::SystemMonotonic::default()));
         authority.set_support(Arc::new(EverySupport));
         let mut w = store.begin_write().await.unwrap();
-        let granted =
-            super::grant_app_lease(&mut w.tx, &authority, "app_x", &holder, &actor, false)
-                .await
-                .unwrap();
+        let granted = super::grant_app_lease(
+            &mut w.tx,
+            &authority,
+            &super::UnrecordedFailures::default(),
+            "app_x",
+            &holder,
+            &actor,
+            false,
+        )
+        .await
+        .unwrap();
         w.commit().await.unwrap();
         let super::NewGrant::Granted(granted) = granted else {
             panic!("an expiring token over an expiring row is granted: {granted:?}");
@@ -1622,10 +1701,17 @@ mod tests {
         set_row(&store, &lease.id, "local", None, false).await;
         let authority = Authority::new(Arc::new(crate::authority::SystemMonotonic::default()));
         let mut w = store.begin_write().await.unwrap();
-        let granted =
-            super::grant_app_lease(&mut w.tx, &authority, "app_x", &holder, &actor, false)
-                .await
-                .unwrap();
+        let granted = super::grant_app_lease(
+            &mut w.tx,
+            &authority,
+            &super::UnrecordedFailures::default(),
+            "app_x",
+            &holder,
+            &actor,
+            false,
+        )
+        .await
+        .unwrap();
         w.commit().await.unwrap();
         let super::NewGrant::Granted(granted) = granted else {
             panic!("a local token over a local row is granted: {granted:?}");
