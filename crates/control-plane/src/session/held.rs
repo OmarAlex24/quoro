@@ -46,7 +46,7 @@ use super::{ControlMessage, NodeHub, new_msg_id};
 use crate::authority::{DEFAULT_DURATION_MS, Grant, GrantKind};
 use crate::error::ApiError;
 use crate::leases;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 /// The longest wait between two attempts, which covers support coming and
@@ -376,7 +376,7 @@ impl NodeHub {
                 .filter(|held| held.names(lease) && held.pending())
                 .cloned()
         };
-        let Some(held) = held.filter(|_| !lease.is_revoked()) else {
+        let Some(held) = held.filter(|_| lease.unsettled && !lease.is_revoked()) else {
             return Ok((false, Vec::new()));
         };
         let mut waiting = BTreeSet::new();
@@ -453,6 +453,27 @@ impl NodeHub {
             self.release_held_revoke(&replaced);
         }
         self.wake_held();
+    }
+
+    /// A session start of `node_id` read its step-4 rows (`step4`): an entry
+    /// held for that node whose row is no longer one goes, so the registry
+    /// never keeps what the rows no longer say (ADR 0295).
+    pub(super) fn held_session_start(&self, node_id: &str, step4: &HashSet<String>) {
+        let gone: Vec<HeldGrant> = {
+            let mut registry = self.0.held.lock().expect("held grant lock");
+            let ids: Vec<String> = registry
+                .entries
+                .iter()
+                .filter(|(id, held)| held.holder == node_id && !step4.contains(*id))
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.iter()
+                .filter_map(|id| registry.entries.remove(id))
+                .collect()
+        };
+        for held in gone {
+            self.release_held_revoke(&held);
+        }
     }
 
     /// A session start found the step-4 row `lease_id` listed at the row's

@@ -3263,7 +3263,13 @@ impl Session {
         )
         .await
         {
-            Ok(rows) => rows.into_iter().map(|row| (row.id.clone(), row)).collect(),
+            Ok(rows) => {
+                let step4: HashMap<String, leases::Lease> =
+                    rows.into_iter().map(|row| (row.id.clone(), row)).collect();
+                let ids: HashSet<String> = step4.keys().cloned().collect();
+                self.hub.held_session_start(&self.node_id, &ids);
+                step4
+            }
             Err(e) => {
                 tracing::warn!(code = %e.code.as_str(), node_id = %self.node_id, "cannot read the step-4 rows of the node");
                 complete = false;
