@@ -506,7 +506,7 @@ async fn insert_provider(
         "id": provider.id,
         "kind": provider.kind.as_str(),
         "name": provider.name,
-        "config": provider.config,
+        "config_json": provider.config,
         "secret_enc": hex(&secret_enc),
         "created_by": provider.created_by,
         "created_at": provider.created_at,

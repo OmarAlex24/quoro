@@ -30,6 +30,7 @@ Each entry links the pull request that made the change and, where one exists, th
 ### Fixed
 
 - **An enrollment's change-log entries rebuild the node and its credential.** The node's own entry now comes before the entries that name it, its subnet and its join token, so a promotion that replays the log in order no longer meets an update of a node that does not exist yet. Every insert and update of a node's credential row is now a `node_credential` entry carrying the whole row, as migration 0012 requires; the row holds only the SHA-256 of the credential. Without it a promoted primary would refuse every node's session. Credentials written before this release get no entry yet ([#751], [ADR 0297]).
+- **A provider's settings and the audit export's target travel under their column names in the change log.** A provider's entry now carries its settings as `config_json` and the audit export's as `target`, the names of their columns, instead of `config` and `prefix`, so a promotion that replays the log fills both. Nothing read the old names. Entries written before this release keep them. A backup repository's encrypted key, `repo_key_enc`, is still left out of the log, pending a maintainer decision, because every node can open the cluster data-encryption key that protects it ([#751], [ADR 0297]).
 
 ## [v0.3.0] - 2026-11-09
 

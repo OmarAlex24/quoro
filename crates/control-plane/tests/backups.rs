@@ -4,6 +4,7 @@
 
 mod common;
 
+use common::replay;
 use common::{Server, problem, start_with_patient_node_session};
 use futures_util::{SinkExt, StreamExt};
 use quoro_backup::{
@@ -1046,6 +1047,42 @@ async fn rotating_the_recovery_key_writes_config_2() {
     );
     let old_key = RecoveryKey::parse(&old_text).unwrap();
     assert!(unwrap_repo_key(&config.wrapped_repo_key, &old_key, &repo_id).is_err());
+}
+
+/// Section 7.3 step 4 (ADR 0297): the change-log entry of a provider created
+/// over the API rebuilds its row when replayed into an empty database, its
+/// settings included as `config_json`. The backup repository the provider
+/// serves is not replayed: `repo_key_enc` stays out of the log until the
+/// maintainer decides how a promoted primary gets the repository key.
+#[tokio::test]
+async fn a_provider_entry_rebuilds_its_row() {
+    let server = start_with_patient_node_session().await;
+    let memory = Arc::new(MemoryStore::new());
+    server
+        .state
+        .backups
+        .set_factory(Arc::new(MemoryBuckets(Arc::clone(&memory))));
+    let owner = server.owner().await;
+    create_repository(&owner, &server).await;
+
+    let rebuilt = replay::rebuild(&server, &["provider"], &[]).await;
+    replay::assert_rebuilt(
+        &server,
+        &rebuilt,
+        "providers",
+        &[
+            "id",
+            "kind",
+            "name",
+            "config_json",
+            "secret_enc",
+            "created_by",
+            "created_at",
+            "rotated_at",
+        ],
+        1,
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------
