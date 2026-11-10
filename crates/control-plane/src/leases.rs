@@ -262,19 +262,30 @@ pub(crate) async fn is_step4(conn: &mut SqliteConnection, lease: &Lease) -> Resu
     if lease.resource_type != "app" || !lease.unsettled || lease.is_revoked() {
         return Ok(false);
     }
+    if fenced(conn, lease).await? {
+        return Ok(false);
+    }
+    newest_write_gave_new_token(conn, &lease.id).await
+}
+
+/// Whether `lease` is listed in any node's `fence_failure` or in its
+/// holder's `fence_ack_pending` (section 8.5): no grant of it goes out until
+/// that clears. The one test of it for step 4 ([`is_step4`]), a held grant's
+/// send and the session start's check of the held grants, so they agree.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn fenced(conn: &mut SqliteConnection, lease: &Lease) -> Result<bool, ApiError> {
     if crate::fences::listed_leases(conn)
         .await?
         .contains(&lease.id)
     {
-        return Ok(false);
+        return Ok(true);
     }
-    if crate::fences::pending_of(conn, &lease.holder_node_id)
+    Ok(crate::fences::pending_of(conn, &lease.holder_node_id)
         .await?
-        .is_some_and(|pending| pending.lease_ids.contains(&lease.id))
-    {
-        return Ok(false);
-    }
-    newest_write_gave_new_token(conn, &lease.id).await
+        .is_some_and(|pending| pending.lease_ids.contains(&lease.id)))
 }
 
 /// Every step-4 row ([`is_step4`]) naming `node_id`, or naming any node

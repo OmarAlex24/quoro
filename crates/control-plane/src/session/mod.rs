@@ -3256,20 +3256,19 @@ impl Session {
         }
         // "The holder fenced first" step 4 (ADR 0295, ADR 0299): decided
         // again from the rows at every session start, never from what the
-        // held-grant registry still holds.
+        // held-grant registry still holds. The registry's entries for this
+        // node are checked against their rows first.
+        if let Err(e) = self.hub.held_session_start(&mut conn, &self.node_id).await {
+            tracing::warn!(code = %e.code.as_str(), node_id = %self.node_id, "cannot check the held grants of the node");
+            complete = false;
+        }
         let step4: HashMap<String, leases::Lease> = match leases::step4_rows(
             &mut conn,
             Some(&self.node_id),
         )
         .await
         {
-            Ok(rows) => {
-                let step4: HashMap<String, leases::Lease> =
-                    rows.into_iter().map(|row| (row.id.clone(), row)).collect();
-                let ids: HashSet<String> = step4.keys().cloned().collect();
-                self.hub.held_session_start(&self.node_id, &ids);
-                step4
-            }
+            Ok(rows) => rows.into_iter().map(|row| (row.id.clone(), row)).collect(),
             Err(e) => {
                 tracing::warn!(code = %e.code.as_str(), node_id = %self.node_id, "cannot read the step-4 rows of the node");
                 complete = false;
@@ -3279,14 +3278,14 @@ impl Session {
         self.step4_eligible.clear();
         let mut raises: Vec<(String, u64)> = Vec::new();
         let mut eligible: Vec<(leases::Lease, Option<u64>)> = Vec::new();
-        let mut held_by_node: Vec<String> = Vec::new();
+        let mut held_by_node: Vec<leases::Lease> = Vec::new();
         for claimed in reported {
             if let Some(row) = step4.get(&claimed.lease_id) {
                 if claimed.fencing_token >= lease_token(row) {
                     // Listed at the row's token or above: the node holds it,
                     // or this primary lacks writes. Nothing goes out for it
                     // on this session; today's classification stays.
-                    held_by_node.push(row.id.clone());
+                    held_by_node.push(row.clone());
                 } else {
                     // Listed at a lower token: no revoke of section 5.1, the
                     // held grant instead. One the node lists `held` or
@@ -3410,8 +3409,8 @@ impl Session {
             self.step4_eligible.insert(row.id.clone());
             self.hub.held_eligible(&row, self.generation, revoke_first);
         }
-        for lease_id in held_by_node {
-            self.hub.held_listed(&lease_id);
+        for row in &held_by_node {
+            self.hub.held_listed(row);
         }
         complete
     }

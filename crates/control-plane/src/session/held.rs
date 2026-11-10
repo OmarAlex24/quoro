@@ -9,7 +9,7 @@
 //!   knows is derivable from the database: at its start the hub holds every
 //!   step-4 row ([`leases::step4_rows`]) as pending until its holder's next
 //!   session start, and each session start decides step 4 again from the
-//!   rows ([`NodeHub::held_at_session_start`]). The rows decide; the
+//!   rows ([`NodeHub::held_session_start`]). The rows decide; the
 //!   registry is a cache.
 //! - **The send.** A held grant goes out only on the holder's current
 //!   session, after its start, and only when one single-writer transaction
@@ -46,7 +46,7 @@ use super::{ControlMessage, NodeHub, new_msg_id};
 use crate::authority::{DEFAULT_DURATION_MS, Grant, GrantKind};
 use crate::error::ApiError;
 use crate::leases;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
 /// The longest wait between two attempts, which covers support coming and
@@ -442,51 +442,112 @@ impl NodeHub {
         }
         let mut held = HeldGrant::of(lease, Some(generation));
         held.revoke_first = revoke_first;
-        let replaced = self
-            .0
-            .held
-            .lock()
-            .expect("held grant lock")
-            .entries
-            .insert(lease.id.clone(), held);
-        if let Some(replaced) = replaced {
-            self.release_held_revoke(&replaced);
+        let replaced = {
+            let mut registry = self.0.held.lock().expect("held grant lock");
+            // A grant held since the rows were read, for a newer token,
+            // stays: the row this start read is already behind it.
+            if registry
+                .entries
+                .get(&lease.id)
+                .is_some_and(|entry| entry.token > lease.fencing_token)
+            {
+                Err(held)
+            } else {
+                Ok(registry.entries.insert(lease.id.clone(), held))
+            }
+        };
+        match replaced {
+            Ok(Some(replaced)) => self.release_held_revoke(&replaced),
+            Ok(None) => {}
+            // Its held-back revoke was counted above and never goes out.
+            Err(held) => self.release_held_revoke(&held),
         }
         self.wake_held();
     }
 
-    /// A session start of `node_id` read its step-4 rows (`step4`): an entry
-    /// held for that node whose row is no longer one goes, so the registry
-    /// never keeps what the rows no longer say (ADR 0295).
-    pub(super) fn held_session_start(&self, node_id: &str, step4: &HashSet<String>) {
-        let gone: Vec<HeldGrant> = {
-            let mut registry = self.0.held.lock().expect("held grant lock");
-            let ids: Vec<String> = registry
+    /// A session start of `node_id`, before it reads its step-4 rows: each
+    /// entry held for that node is checked against its row, read now on
+    /// `conn`, so the registry never keeps what the rows no longer say (ADR
+    /// 0295).
+    ///
+    /// - A row that is a step-4 row stays: the session start registers it
+    ///   ([`NodeHub::held_eligible`]).
+    /// - A row that names the entry, marked and unrevoked, whose lease a
+    ///   failed fence lists or the holder's `fence_ack_pending` holds (section
+    ///   8.5), keeps its entry, waiting for the holder's next session start,
+    ///   as an attempt at send keeps it ([`NodeHub::attempt_held`]): the
+    ///   fence may be acknowledged without the row moving.
+    /// - Any other entry goes: the row moved, was revoked, lost its mark, or
+    ///   its newest write did not give it its token.
+    ///
+    /// Each entry is changed only while it is still the one that was
+    /// checked, so a grant held while this runs is never lost.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub(super) async fn held_session_start(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+        node_id: &str,
+    ) -> Result<(), ApiError> {
+        let entries: Vec<(String, HeldGrant)> = {
+            let registry = self.0.held.lock().expect("held grant lock");
+            registry
                 .entries
                 .iter()
-                .filter(|(id, held)| held.holder == node_id && !step4.contains(*id))
-                .map(|(id, _)| id.clone())
-                .collect();
-            ids.iter()
-                .filter_map(|id| registry.entries.remove(id))
+                .filter(|(_, held)| held.holder == node_id)
+                .map(|(id, held)| (id.clone(), held.clone()))
                 .collect()
         };
-        for held in gone {
-            self.release_held_revoke(&held);
+        for (lease_id, held) in entries {
+            let row = leases::by_id(conn, &lease_id).await?;
+            let fenced = match row
+                .as_ref()
+                .filter(|row| held.names(row) && row.unsettled && !row.is_revoked())
+            {
+                Some(row) if leases::is_step4(conn, row).await? => continue,
+                Some(row) => leases::fenced(conn, row).await?,
+                None => false,
+            };
+            // What the entry was when it changed, so a revoke it held back
+            // goes with the session it was eligible on.
+            let changed = {
+                let mut registry = self.0.held.lock().expect("held grant lock");
+                match registry.entries.get_mut(&lease_id) {
+                    Some(entry) if *entry == held && fenced => {
+                        entry.eligible_on = None;
+                        entry.revoke_first = None;
+                        Some(held)
+                    }
+                    Some(entry) if *entry == held => registry.entries.remove(&lease_id),
+                    _ => None,
+                }
+            };
+            if let Some(changed) = changed {
+                self.release_held_revoke(&changed);
+            }
         }
+        Ok(())
     }
 
-    /// A session start found the step-4 row `lease_id` listed at the row's
+    /// A session start found the step-4 row `lease` listed at the row's
     /// token or above: the node holds it, or this primary lacks writes.
-    /// Nothing goes out for it on this session, and no grant is pending.
-    pub(super) fn held_listed(&self, lease_id: &str) {
-        let removed = self
-            .0
-            .held
-            .lock()
-            .expect("held grant lock")
-            .entries
-            .remove(lease_id);
+    /// Nothing goes out for it on this session, and no grant is pending. A
+    /// grant held since the rows were read, for a newer token, stays.
+    pub(super) fn held_listed(&self, lease: &leases::Lease) {
+        let removed = {
+            let mut registry = self.0.held.lock().expect("held grant lock");
+            if registry
+                .entries
+                .get(&lease.id)
+                .is_some_and(|entry| entry.token <= lease.fencing_token)
+            {
+                registry.entries.remove(&lease.id)
+            } else {
+                None
+            }
+        };
         if let Some(removed) = removed {
             self.release_held_revoke(&removed);
         }
@@ -716,13 +777,7 @@ impl NodeHub {
         }
         // Section 8.5: a failed fence or an acknowledgement pending delivery
         // holds the grant; the acknowledgement's increment changes the token.
-        if crate::fences::listed_leases(&mut w.tx)
-            .await?
-            .contains(lease_id)
-            || crate::fences::pending_of(&mut w.tx, &row.holder_node_id)
-                .await?
-                .is_some_and(|pending| pending.lease_ids.iter().any(|id| id == lease_id))
-        {
+        if leases::fenced(&mut w.tx, &row).await? {
             return Ok(Attempt::Wait);
         }
         // Step 4: the row's newest write gave the lease its token.
