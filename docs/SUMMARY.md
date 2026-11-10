@@ -306,6 +306,7 @@
   - [0302: Change log: append refuses an entry a follower could not receive (one that alone exceeds a log_entries frame, or whose stored payload has no RFC 8785 form)](adr/0302-change-log-append-refuses-an-entry-a-follower-could-not.md)
   - [0303: failoverApp before the primary can send a held grant: what a failover answers when its grant must wait for replication](adr/0303-failoverapp-before-the-primary-can-send-a-held-grant-what-a.md)
   - [0305: Section 8.8 Restarts: after a reboot a voter restarts its promise and horizon from the longest window it may have granted, not only the last S and L](adr/0305-section-8-8-restarts-after-a-reboot-a-voter-restarts-its.md)
+  - [0306: An audited API call is always audited: bound what reaches the audit change-log entry](adr/0306-an-audited-api-call-is-always-audited-bound-what-reaches.md)
 
 # Background research
 
