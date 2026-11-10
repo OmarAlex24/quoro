@@ -319,6 +319,8 @@ fn hello(node_id: &str) -> NodeMessage {
 }
 
 async fn enrolled_node(server: &Server, owner: &reqwest::Client, name: &str) -> Enrolled {
+    // Section 8.10 rule 2: these tests enroll voters back to back.
+    common::settle_voters(server).await;
     let token: Value = owner
         .post(server.url("/api/v1/nodes/join-tokens"))
         .json(&json!({}))

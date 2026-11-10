@@ -356,8 +356,10 @@ fn expiry(body: &NodeJoinTokenRequest) -> Result<String, ApiError> {
 /// # Errors
 ///
 /// `validation_failed` for a bad body, an unknown or expired token or a bad
-/// public key; `conflict` for a used token or a duplicate node name; or a
-/// database error.
+/// public key; `conflict` for a used token, a duplicate node name, or a
+/// voter's enrollment while the previous voter-set change has not reached a
+/// majority of voters (section 8.10 rule 2), which leaves the token unused;
+/// or a database error.
 #[utoipa::path(
     post,
     path = "/api/v1/nodes/enroll",
@@ -557,6 +559,33 @@ async fn enroll(
         && Some(id) != adopted_id.as_ref()
     {
         return Err(ApiError::conflict("a node with this name already exists"));
+    }
+
+    // Section 8.10 rule 2 (section 2.3): an enrollment that makes this
+    // machine a voter changes the voter set, so it waits, without consuming
+    // the token, until a majority of the current voters holds the current
+    // version. Nothing is written before this check, and the refusal drops
+    // the transaction. An edge-only machine, or the primary's own row
+    // adopted with the vote it already has, changes nothing.
+    let votes_before = match &adopted_id {
+        Some(id) => {
+            let (roles, status): (String, String) =
+                sqlx::query_as("SELECT roles, status FROM nodes WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(&mut *w.tx)
+                    .await?;
+            let roles: Vec<String> =
+                serde_json::from_str(&roles).map_err(|e| ApiError::internal(&e))?;
+            status != "removed" && crate::voters::is_voter_roles(&roles)
+        }
+        None => false,
+    };
+    let votes_after = body
+        .roles
+        .iter()
+        .any(|role| matches!(role, NodeRole::Node | NodeRole::Witness));
+    if votes_before != votes_after {
+        state.hub.voter_change_gate(&mut w.tx).await?;
     }
 
     let (node_id, op) = if let Some(id) = adopted_id {

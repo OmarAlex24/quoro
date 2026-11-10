@@ -290,6 +290,42 @@ fn disagreement(listed: &BTreeSet<&str>, logged: &BTreeSet<&str>) -> Option<Disa
     })
 }
 
+/// The voters among the non-removed `nodes` rows `(id, roles, mesh_address)`,
+/// in the rows' order.
+fn voters_of(rows: Vec<(String, String, Option<String>)>) -> Result<Vec<Voter>, String> {
+    let mut voters = Vec::new();
+    for (node_id, roles, mesh_address) in rows {
+        let roles: Vec<String> = serde_json::from_str(&roles)
+            .map_err(|e| format!("cannot read the roles of {node_id}: {e}"))?;
+        if is_voter_roles(&roles) {
+            voters.push(Voter {
+                node_id,
+                roles,
+                mesh_address,
+            });
+        }
+    }
+    Ok(voters)
+}
+
+/// Rule 2 of section 8.10: whether the voter set at `version`, whose voters
+/// are `voters`, may change now. It may once more than half of `voters`,
+/// connected or not, has acknowledged with `command_result` `ok` a
+/// `desired_state` that carries exactly `version`; `acked` gives each
+/// machine's newest such version. Only the current voters count. An empty
+/// set may always change: the first voter needs nobody's acknowledgement.
+#[must_use]
+pub fn change_allowed(version: u64, voters: &[Voter], acked: impl Fn(&str) -> Option<u64>) -> bool {
+    if voters.is_empty() {
+        return true;
+    }
+    let holding = voters
+        .iter()
+        .filter(|voter| acked(&voter.node_id) == Some(version))
+        .count();
+    holding * 2 > voters.len()
+}
+
 #[derive(Debug, Default)]
 struct Cache {
     replay: Replay,
@@ -354,18 +390,7 @@ impl VoterLog {
             let payload: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
             replay.apply(seq, &op, &node_id, &payload);
         }
-        let mut voters = Vec::new();
-        for (node_id, roles, mesh_address) in rows {
-            let roles: Vec<String> = serde_json::from_str(&roles)
-                .map_err(|e| format!("cannot read the roles of {node_id}: {e}"))?;
-            if is_voter_roles(&roles) {
-                voters.push(Voter {
-                    node_id,
-                    roles,
-                    mesh_address,
-                });
-            }
-        }
+        let voters = voters_of(rows)?;
         let version = replay.version;
         let listed: BTreeSet<&str> = voters.iter().map(|voter| voter.node_id.as_str()).collect();
         let disagreement = disagreement(&listed, &replay.members());
@@ -477,6 +502,43 @@ impl VoterLog {
         Ok(set)
     }
 
+    /// The voter-set version and the voters as `conn` sees them: the replay
+    /// kept in memory, the `node` entries after it and the `nodes` rows. The
+    /// kept replay is not advanced, because `conn` may be a write transaction
+    /// whose entries could still roll back (as [`VoterLog::required_set`]).
+    /// A change of the voter set reads it here, in its own write
+    /// transaction, so rule 2 of section 8.10 counts against the version that
+    /// transaction sees ([`change_allowed`]).
+    ///
+    /// # Errors
+    ///
+    /// A database error, or a `roles` column that is not a list of roles.
+    pub async fn read_on(&self, conn: &mut SqliteConnection) -> Result<(u64, Vec<Voter>), String> {
+        let mut replay = self.cache().replay.clone();
+        let read = |e: sqlx::Error| format!("cannot read the voter set: {e}");
+        let entries: Vec<(i64, String, String, String)> = sqlx::query_as(
+            "SELECT seq, op, entity_id, payload FROM change_log \
+             WHERE entity_type = 'node' AND seq > ? ORDER BY seq",
+        )
+        .bind(i64::try_from(replay.applied).unwrap_or(i64::MAX))
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(read)?;
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, roles, mesh_address FROM nodes WHERE status <> 'removed' \
+             ORDER BY created_at, id",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(read)?;
+        for (seq, op, node_id, payload) in entries {
+            let seq = u64::try_from(seq).unwrap_or(0);
+            let payload: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
+            replay.apply(seq, &op, &node_id, &payload);
+        }
+        Ok((replay.version, voters_of(rows)?))
+    }
+
     /// The newest set [`VoterLog::current`] read, `None` before the first.
     #[must_use]
     pub fn latest(&self) -> Option<Arc<VoterSet>> {
@@ -561,6 +623,71 @@ mod tests {
         replay.apply(15, "delete", "nod_w", &json!({}));
         assert_eq!(replay.version, 15);
         assert_eq!(replay.applied, 15);
+    }
+
+    /// Sections 6.12 and 8.10: one machine has one vote, so a node that
+    /// gains or loses the `witness` role neither joins nor leaves the set
+    /// and the version stays; only its roles in `spec.votes.voters` change.
+    #[test]
+    fn a_node_that_gains_the_witness_role_keeps_the_version() {
+        let mut replay = Replay::default();
+        replay.apply(4, "create", "nod_a", &node(&["node"], "pending"));
+        assert_eq!(replay.version, 4);
+        replay.apply(
+            9,
+            "update",
+            "nod_a",
+            &json!({ "id": "nod_a", "roles": ["node", "witness"] }),
+        );
+        assert_eq!(replay.version, 4, "still one vote");
+        assert_eq!(replay.nodes["nod_a"].roles, ["node", "witness"]);
+        replay.apply(
+            11,
+            "update",
+            "nod_a",
+            &json!({ "id": "nod_a", "roles": ["node"] }),
+        );
+        assert_eq!(replay.version, 4);
+        assert_eq!(replay.members(), BTreeSet::from(["nod_a"]));
+    }
+
+    /// Section 8.10 rule 2: a majority of the current voters, connected or
+    /// not, must hold exactly the current version; an empty set passes.
+    #[test]
+    fn a_change_waits_for_a_majority_at_the_current_version() {
+        let voter = |id: &str| Voter {
+            node_id: id.to_string(),
+            roles: vec!["node".to_string()],
+            mesh_address: None,
+        };
+        let voters = [voter("nod_a"), voter("nod_b"), voter("nod_c")];
+        let acks = |acks: &'static [(&'static str, u64)]| {
+            move |id: &str| {
+                acks.iter()
+                    .find(|(node, _)| *node == id)
+                    .map(|(_, version)| *version)
+            }
+        };
+        assert!(change_allowed(7, &[], acks(&[])), "the first voter");
+        assert!(!change_allowed(7, &voters, acks(&[("nod_a", 7)])), "1 of 3");
+        assert!(change_allowed(
+            7,
+            &voters,
+            acks(&[("nod_a", 7), ("nod_c", 7)])
+        ));
+        // An older version, or a machine outside the set, does not count.
+        assert!(!change_allowed(
+            7,
+            &voters,
+            acks(&[("nod_a", 7), ("nod_b", 6), ("nod_x", 7)])
+        ));
+        // Two voters: both.
+        assert!(!change_allowed(7, &voters[..2], acks(&[("nod_a", 7)])));
+        assert!(change_allowed(
+            7,
+            &voters[..2],
+            acks(&[("nod_a", 7), ("nod_b", 7)])
+        ));
     }
 
     /// Section 8.4, "A removed machine": the replay keeps each removal

@@ -18,11 +18,81 @@
 //!   `stale_term`, whatever it answers, stops all support (section 8.8,
 //!   "Terms").
 
-use super::{Session, cluster_term, new_msg_id};
+use super::{NodeHub, Session, cluster_term, new_msg_id};
 use crate::authority::DEFAULT_DURATION_MS;
+use crate::error::ApiError;
 use crate::support::{Answer, REQUEST_INTERVAL, SUPPORT_MS};
 use quoro_proto::wire::{self, ControlMessage};
+use sqlx::SqliteConnection;
 use tokio::time::Instant;
+
+/// The `detail` of rule 2's refusal (section 8.10).
+pub const VOTERS_CHANGING: &str = "the previous voter-set change has not reached a majority of voters yet; try again once they have acknowledged it";
+
+impl NodeHub {
+    /// Records that `node_id` acknowledged, with `command_result` `ok`, a
+    /// `desired_state` carrying voter-set version `version`. The version
+    /// only grows, so an older acknowledgement arriving late lowers nothing.
+    pub(crate) fn record_votes_ack(&self, node_id: &str, version: u64) {
+        let mut acks = self.0.votes_acks.lock().expect("votes acks lock");
+        let held = acks.entry(node_id.to_string()).or_insert(version);
+        *held = (*held).max(version);
+    }
+
+    /// Rule 2 of section 8.10, for every change of the voter set: the
+    /// enrollment of a voter, `updateNodeRoles` adding or removing a vote,
+    /// and (once it exists) the removal of a voter. It reads the version and
+    /// the voters on `conn`, which must be the change's own write
+    /// transaction, so the acknowledgements are counted against the version
+    /// that transaction sees and two changes never pass on the same
+    /// acknowledgements: the second reads the version the first wrote, which
+    /// nobody has acknowledged yet. Returns that version and the number of
+    /// current voters.
+    ///
+    /// When the rows and the change log disagree on the voters, the gate
+    /// still counts the rows' voters at the log's version: refusing there
+    /// would keep the version from ever moving on, and no support counts at a
+    /// disagreeing version anyway (rule 4, [`crate::voters`]).
+    ///
+    /// # Errors
+    ///
+    /// `conflict` while a majority of the current voters has not
+    /// acknowledged the current version; `internal` when the set cannot be
+    /// read.
+    pub(crate) async fn voter_change_gate(
+        &self,
+        conn: &mut SqliteConnection,
+    ) -> Result<(u64, usize), ApiError> {
+        let (version, voters) = self
+            .0
+            .voters
+            .read_on(conn)
+            .await
+            .map_err(|e| ApiError::internal(&e))?;
+        let acks = self.0.votes_acks.lock().expect("votes acks lock");
+        if crate::voters::change_allowed(version, &voters, |id| acks.get(id).copied()) {
+            Ok((version, voters.len()))
+        } else {
+            Err(ApiError::conflict(VOTERS_CHANGING))
+        }
+    }
+
+    /// Test seam: records that every current voter acknowledged the current
+    /// voter-set version, as if each had a session that did, so a test that
+    /// enrolls voters back to back without sessions passes rule 2 of section
+    /// 8.10. The tests of rule 2 itself never call it.
+    ///
+    /// # Panics
+    ///
+    /// When the voter set cannot be read.
+    #[doc(hidden)]
+    pub async fn ack_voter_set(&self) {
+        let set = self.voter_set().await.expect("the voter set");
+        for voter in &set.voters {
+            self.record_votes_ack(&voter.node_id, set.version);
+        }
+    }
+}
 
 impl Session {
     /// Takes the `command_result` that answers `re`, when `re` is a
@@ -44,6 +114,7 @@ impl Session {
         if result.status != quoro_proto::CommandStatus::Ok {
             return true;
         }
+        self.hub.record_votes_ack(&self.node_id, version);
         let first = self.acked_votes_version.is_none() || self.support_due.is_none();
         let moved = self.acked_votes_version != Some(version);
         self.acked_votes_version = Some(version);

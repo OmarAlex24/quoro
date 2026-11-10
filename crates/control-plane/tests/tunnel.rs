@@ -459,6 +459,8 @@ async fn create_token(server: &Server, owner: &reqwest::Client) -> String {
 }
 
 async fn enrolled(server: &Server, owner: &reqwest::Client, name: &str) -> Enrolled {
+    // Section 8.10 rule 2: these tests enroll voters back to back.
+    common::settle_voters(server).await;
     let token = create_token(server, owner).await;
     let res = server
         .client()

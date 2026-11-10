@@ -802,6 +802,8 @@ async fn enrolled_with_roles(
     name: &str,
     roles: &[&str],
 ) -> Enrolled {
+    // Section 8.10 rule 2: these tests enroll voters back to back.
+    common::settle_voters(server).await;
     let token = create_token(server, owner).await;
     let mut body = enroll_body(token["token"].as_str().unwrap(), name);
     body["roles"] = json!(roles);

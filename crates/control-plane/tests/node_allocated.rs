@@ -9,6 +9,8 @@ use serde_json::{Value, json};
 
 /// Issues a join token and enrolls a non-local node with it.
 async fn enrolled(server: &Server, owner: &reqwest::Client, name: &str, seed: u8) -> String {
+    // Section 8.10 rule 2: these tests enroll voters back to back.
+    common::settle_voters(server).await;
     let key = sign::signing_key_from_seed(&[seed; 32]);
     let res = owner
         .post(server.url("/api/v1/nodes/join-tokens"))

@@ -323,3 +323,12 @@ pub async fn problem(res: reqwest::Response) -> (u16, String, Option<String>) {
         body["reason"].as_str().map(str::to_string),
     )
 }
+
+/// Records that every current voter acknowledged the current voter-set
+/// version, as a session of each would (`node-agent-protocol.md` section
+/// 8.10 rule 2), so the next enrollment of a voter is not refused while the
+/// earlier voters have no session. Called by the enroll helpers of tests
+/// that are not about rule 2; the tests of rule 2 never call it.
+pub async fn settle_voters(server: &Server) {
+    server.state.hub.ack_voter_set().await;
+}

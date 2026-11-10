@@ -521,6 +521,13 @@ struct HubInner {
     /// The voters' support of this primary (section 8.8), which the
     /// authority answers from unless a test replaced it.
     support: Arc<crate::support::SupportTracker>,
+    /// The newest voter-set version each machine acknowledged with
+    /// `command_result` `ok` on a `desired_state` that carried it, for rule 2
+    /// of section 8.10 ([`NodeHub::voter_change_gate`]). It outlives the
+    /// session that brought it. In memory only: after a restart every voter
+    /// acknowledges again on its next session, whose first `desired_state`
+    /// carries `spec.votes`.
+    votes_acks: Mutex<HashMap<String, u64>>,
     generation: AtomicU64,
     /// Test seam: snapshots to hold between their build and their send.
     snapshot_holds: Mutex<HashMap<String, Arc<SnapshotHold>>>,
@@ -652,6 +659,7 @@ impl NodeHub {
             authority,
             voters,
             support,
+            votes_acks: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
             snapshot_holds: Mutex::new(HashMap::new()),
             faults: Mutex::new(Vec::new()),
