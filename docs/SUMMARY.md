@@ -307,6 +307,7 @@
   - [0303: failoverApp before the primary can send a held grant: what a failover answers when its grant must wait for replication](adr/0303-failoverapp-before-the-primary-can-send-a-held-grant-what-a.md)
   - [0305: Section 8.8 Restarts: after a reboot a voter restarts its promise and horizon from the longest window it may have granted, not only the last S and L](adr/0305-section-8-8-restarts-after-a-reboot-a-voter-restarts-its.md)
   - [0306: An audited API call is always audited: bound what reaches the audit change-log entry](adr/0306-an-audited-api-call-is-always-audited-bound-what-reaches.md)
+  - [0308: Custody seals use the hpke crate (rust-hpke) for RFC 9180, added only if it passes cargo-deny under the dependency license policy](adr/0308-custody-seals-use-the-hpke-crate-rust-hpke-for-rfc-9180.md)
 
 # Background research
 
