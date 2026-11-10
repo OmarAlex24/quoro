@@ -138,3 +138,55 @@ async fn run_refuses_a_node_that_is_not_enrolled() {
     .unwrap_err();
     assert!(matches!(error, AgentError::Identity(_)), "{error:?}");
 }
+
+/// Section 7.2: a machine with the `node` role upgraded to M5b generates its
+/// custody key when the agent starts, `0600`, even while no session can
+/// reach the primary; an edge-only machine never writes one.
+#[tokio::test]
+async fn an_agent_start_keeps_a_custody_key_only_with_the_node_role() {
+    for (roles, keeps) in [(vec!["node"], true), (vec!["edge"], false)] {
+        let dir = TempDir::new();
+        let key = sign::signing_key_from_seed(&[4; 32]);
+        // Port 1 refuses immediately: no session ever sends a `hello`, so
+        // only the start can write the key.
+        identity_files_with_url(dir.path(), &key, "https://127.0.0.1:1");
+        let path = dir
+            .path()
+            .join(quoro_node_agent::identity::CUSTODY_KEY_FILE);
+        let mut config = config(&dir);
+        config.roles = roles.iter().map(|role| (*role).to_owned()).collect();
+        let (shutdown, stop) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(run(config, RecordingEngine::new(), facts(), async move {
+            let _ = stop.await;
+        }));
+
+        // The mesh key is written just before the custody key, and the
+        // reconciler and the session start only after both.
+        let mesh = dir.path().join(quoro_node_agent::mesh::KEY_FILE);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !mesh.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the agent started");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(path.exists(), keeps, "{roles:?}");
+        if keeps {
+            assert_eq!(std::fs::read(&path).unwrap().len(), 32);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "custody.key is root-only");
+            }
+        }
+
+        shutdown.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the agent stops on shutdown")
+            .expect("the agent task did not panic");
+        assert!(result.is_ok(), "{result:?}");
+    }
+}

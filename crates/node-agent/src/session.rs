@@ -43,7 +43,7 @@ use tracing::{debug, info, warn};
 use crate::build::manager::{BuildStart, BuildsError, BuildsHandle};
 use crate::edge::EdgeManager;
 use crate::follow;
-use crate::identity::{Identity, IdentityHandle};
+use crate::identity::{self, Identity, IdentityHandle};
 use crate::ingress::{DnsBridge, DnsRequest, IngressSupervisor};
 use crate::interactive::{Door, Interactive, OpenError, StreamKind};
 use crate::inventory::InventoryHub;
@@ -274,6 +274,10 @@ pub struct Session {
     metrics: Option<MetricsRing>,
     /// The machine's WireGuard public key, reported in `hello` (section 6.9).
     mesh_public_key: Option<String>,
+    /// Whether this machine has the `node` role, so that it keeps a custody
+    /// key in its data directory and reports it in every `hello` (section
+    /// 7.2). Set by [`Session::with_roles`]; off by default.
+    custody: bool,
     /// The engine handles behind `terminal` and `console` streams (M4), when
     /// the agent runs one.
     interactive: Option<Interactive>,
@@ -364,6 +368,22 @@ fn revoked_lease(text: &str) -> Option<String> {
     }
 }
 
+/// The standard base64 public half of the custody key in `data_dir`, which
+/// is generated and written first when there is none (section 7.2). The
+/// file work runs off the async runtime, since a new key is synced to disk.
+///
+/// # Errors
+///
+/// The errors of [`identity::load_or_create_custody_key`].
+async fn custody_public_key(data_dir: &std::path::Path) -> Result<String, AgentError> {
+    let dir = data_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        identity::load_or_create_custody_key(&dir).map(|key| key.public_key().to_base64())
+    })
+    .await
+    .map_err(|e| AgentError::Identity(format!("the custody key reader stopped: {e}")))?
+}
+
 /// What the session does after [`Session::handle`]: `None` goes on, `Some`
 /// ends the session.
 fn session_end(handled: Result<Option<SessionEnd>, AgentError>) -> Option<SessionEnd> {
@@ -430,6 +450,7 @@ impl Session {
             dns: None,
             metrics: None,
             mesh_public_key: None,
+            custody: false,
             interactive: None,
             builds,
             edge: None,
@@ -555,6 +576,18 @@ impl Session {
     #[must_use]
     pub fn with_mesh_key(mut self, public_key: String) -> Self {
         self.mesh_public_key = Some(public_key);
+        self
+    }
+
+    /// Sets the roles this machine enrolled with. With the `node` role
+    /// ([`crate::has_node_role`]) every `hello` carries the custody key's
+    /// public half, and the key is generated before the first `hello` when
+    /// the data directory has none: a machine upgraded to M5b gets it then
+    /// (section 7.2). An edge-only or witness-only machine keeps no custody
+    /// key and reports none.
+    #[must_use]
+    pub fn with_roles(mut self, roles: &[String]) -> Self {
+        self.custody = crate::has_node_role(roles);
         self
     }
 
@@ -715,6 +748,10 @@ impl Session {
         //    the mark: a `log_seq` of 0 would skip the primary's divergence
         //    check, and neither a copy that must first be moved aside nor a
         //    position the mark does not cover may be reported (section 7.1).
+        //    Nor is it sent on a machine with the `node` role whose custody
+        //    key cannot be read: the primary binds the first key it sees,
+        //    so the file is left for the operator, never replaced (section
+        //    7.2, ADR 0231).
         if let Err(e) = follow::recover(&self.store).await {
             warn!(error = %e, "could not finish the change-log quarantine or refollowing before hello; reconnecting");
             return Ok(SessionEnd::Reconnect);
@@ -722,7 +759,7 @@ impl Session {
         let hello = match self.hello().await {
             Ok(hello) => hello,
             Err(e) => {
-                warn!(error = %e, "could not read the change-log position or keep the mark for hello; reconnecting");
+                warn!(error = %e, "could not read the change-log position, keep the mark or read the custody key for hello; reconnecting");
                 return Ok(SessionEnd::Reconnect);
             }
         };
@@ -2205,14 +2242,23 @@ impl Session {
     /// change-log mark is raised to the `log_seq` it reports when that is
     /// above the mark (section 7.1 "The node's mark", ADR 0261). That gives a
     /// node that followed before the mark existed its mark, and covers an
-    /// agent that stopped between a batch's commit and its mark write.
+    /// agent that stopped between a batch's commit and its mark write. On a
+    /// machine with the `node` role it carries the custody key's public
+    /// half, which is generated first when the data directory has none
+    /// (section 7.2).
     ///
     /// # Errors
     ///
     /// [`AgentError::Store`] when the change-log position cannot be read or
     /// the mark holds no `seq`, [`AgentError::Io`] when the mark cannot be
-    /// read or written.
+    /// read or written, [`AgentError::Identity`] when `custody.key` cannot
+    /// be read or is malformed, which leaves it as it is.
     async fn hello(&self) -> Result<NodeMessage, AgentError> {
+        let custody_public_key = if self.custody {
+            Some(custody_public_key(self.store.data_dir()).await?)
+        } else {
+            None
+        };
         let stored_rev = self
             .store
             .latest_desired()
@@ -2241,6 +2287,7 @@ impl Session {
             dropped_events,
             mesh_public_key: self.mesh_public_key.clone(),
             volume_snapshot: self.volume_snapshot,
+            custody_public_key,
         }))
     }
 

@@ -9,17 +9,25 @@
 mod agent_common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use agent_common::{TempDir, facts};
+use futures_util::StreamExt as _;
+use quoro_node_agent::identity::{CUSTODY_KEY_FILE, IdentityHandle};
+use quoro_node_agent::session::{Session, SessionSetup};
+use quoro_node_agent::store::NodeStore;
 use quoro_node_agent::tls::cert_fingerprint;
 use quoro_node_agent::{AgentConfig, AgentError, Identity, JoinTarget, join};
+use quoro_proto::custody::CustodyKey;
 use rcgen::{CertificateParams, KeyPair};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
+use tokio_tungstenite::tungstenite::Message;
 
 fn self_signed() -> (rustls::pki_types::CertificateDer<'static>, Vec<u8>) {
     let key = KeyPair::generate().expect("generate a key");
@@ -214,4 +222,132 @@ async fn a_refused_join_carries_the_problem_detail() {
         other => panic!("expected an enroll refusal, got {other:?}"),
     }
     assert!(!quoro_node_agent::is_enrolled(dir.path()));
+}
+
+/// Enrolls a machine with `roles` in `dir` against a fake primary that
+/// answers 201, and returns the enroll request body the primary received.
+async fn enroll_with_roles(dir: &TempDir, roles: &[&str]) -> Value {
+    let (cert, key) = self_signed();
+    let pin = cert_fingerprint(cert.as_ref());
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let acceptor = TlsAcceptor::from(server_config(cert, key));
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut stream = acceptor.accept(tcp).await.unwrap();
+        let (_headers, body) = read_request(&mut stream).await;
+        let cluster = quoro_proto::sign::signing_key_from_seed(&[21; 32]);
+        let response = serde_json::json!({
+            "node_id": "nod_1",
+            "cluster_id": "cls_1",
+            "primary_url": "https://primary.test",
+            "credential": "the-credential",
+            "cluster_public_key": quoro_proto::sign::public_key_to_base64(&cluster.verifying_key()),
+        })
+        .to_string();
+        respond(&mut stream, "201 Created", &response).await;
+        serde_json::from_slice::<Value>(&body).unwrap()
+    });
+    let target = JoinTarget {
+        url: format!("https://127.0.0.1:{}", address.port()),
+        token: "join-secret".to_owned(),
+        fingerprint: format!("sha256:{pin}"),
+    };
+    let mut config = config(dir);
+    config.roles = roles.iter().map(|role| (*role).to_owned()).collect();
+    join(&config, &target, &facts())
+        .await
+        .expect("enrollment succeeds");
+    server.await.unwrap()
+}
+
+/// The first `hello` a session over the enrolled `dir` sends, as the agent's
+/// next start would.
+async fn first_hello(dir: &TempDir, roles: &[&str]) -> Value {
+    let roles: Vec<String> = roles.iter().map(|role| (*role).to_owned()).collect();
+    let (desired, _desired_rx) = watch::channel(None);
+    let (_observed_tx, observed_rx) = watch::channel(Vec::new());
+    let mut session = Session::new(SessionSetup {
+        identity: IdentityHandle::load(dir.path()).unwrap(),
+        store: NodeStore::open(dir.path()).await.unwrap(),
+        facts: facts(),
+        desired,
+        observed: observed_rx,
+        current: None,
+        builds: None,
+    })
+    .with_roles(&roles);
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let accept = tokio::spawn(tokio_tungstenite::accept_async(server));
+    let (client_ws, _response) =
+        tokio_tungstenite::client_async("ws://primary.test/api/v1/nodes/session", client)
+            .await
+            .unwrap();
+    let mut ws = accept.await.unwrap().unwrap();
+    let serving =
+        tokio::spawn(async move { session.serve(client_ws, std::future::pending::<()>()).await });
+    let frame = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("the node sent a frame in time")
+        .expect("the socket is open")
+        .expect("a valid WebSocket frame");
+    serving.abort();
+    let Message::Text(text) = frame else {
+        panic!("the first frame is not text: {frame:?}");
+    };
+    let hello: Value = serde_json::from_str(text.as_str()).unwrap();
+    assert_eq!(hello["type"], "hello");
+    hello
+}
+
+/// Sections 2.3 and 7.2: a machine that enrolls with the `node` role keeps
+/// its custody key `0600` before it asks, sends the key's public half as
+/// standard base64 of 32 bytes, and its next `hello` reports the same key.
+#[tokio::test]
+async fn a_node_join_sends_its_custody_key_and_the_next_hello_the_same() {
+    use base64::Engine as _;
+
+    let dir = TempDir::new();
+    let request = enroll_with_roles(&dir, &["node"]).await;
+    let sent = request["custody_public_key"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a node's enroll request carries a custody key: {request}"))
+        .to_owned();
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(&sent)
+        .expect("standard base64");
+    assert_eq!(raw.len(), 32);
+    let path = dir.path().join(CUSTODY_KEY_FILE);
+    let kept = CustodyKey::from_bytes(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(kept.public_key().to_base64(), sent, "the key sent is kept");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "custody.key is root-only");
+    }
+
+    let hello = first_hello(&dir, &["node"]).await;
+    assert_eq!(hello["body"]["custody_public_key"], sent.as_str());
+}
+
+/// Section 7.2: a machine that enrolls without the `node` role sends no
+/// custody key, keeps none, and its `hello` reports none.
+#[tokio::test]
+async fn an_edge_or_witness_join_sends_no_custody_key_and_keeps_none() {
+    for roles in [&["edge"][..], &["witness"][..], &["edge", "witness"][..]] {
+        let dir = TempDir::new();
+        let request = enroll_with_roles(&dir, roles).await;
+        assert!(
+            request.get("custody_public_key").is_none(),
+            "{roles:?}: {request}"
+        );
+        assert!(!dir.path().join(CUSTODY_KEY_FILE).exists(), "{roles:?}");
+        let hello = first_hello(&dir, roles).await;
+        assert!(
+            hello["body"].get("custody_public_key").is_none(),
+            "{roles:?}: {hello}"
+        );
+        assert!(!dir.path().join(CUSTODY_KEY_FILE).exists(), "{roles:?}");
+    }
 }

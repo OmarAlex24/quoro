@@ -13,6 +13,10 @@
 //! - `log-mark` — on a machine with the `node` role, the change-log mark: the
 //!   highest `seq` the node has acknowledged (section 7.1, section 12, ADR
 //!   0261), read and written by [`crate::follow`].
+//! - `custody.key` — on a machine with the `node` role, the X25519 custody
+//!   private key the primary seals the cluster keys to (section 7.2, ADR
+//!   0180). It never leaves the machine; `hello` and the enroll request carry
+//!   its public half. See [`load_or_create_custody_key`].
 //!
 //! [`IdentityHandle`] is the in-process view the session keeps: it answers with
 //! the current pin and can persist a `signing_key_rotate` atomically.
@@ -22,6 +26,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use quoro_proto::custody::{self, CustodyKey, Zeroizing};
 use quoro_proto::sign::{self, VerifyingKey};
 use sha2::{Digest as _, Sha256};
 
@@ -40,6 +45,12 @@ pub const IDENTITY_FILE: &str = "identity.json";
 /// [`CREDENTIAL_FILE`], where `custody.key` joins them (section 7.2), so it
 /// survives a lost `node.db`. [`crate::follow::read_mark`] reads it.
 pub const LOG_MARK_FILE: &str = "log-mark";
+/// File name of the custody private key on a machine with the `node` role:
+/// the 32 raw bytes of an X25519 private key, in the format of
+/// [`SEED_FILE`], mode `0600` (section 7.2, section 12, ADR 0180). It sits
+/// next to the credential. [`load_or_create_custody_key`] reads it and
+/// writes it once.
+pub const CUSTODY_KEY_FILE: &str = "custody.key";
 
 /// The identity the node received at enrollment (section 2.4), as
 /// `identity.json` holds it.
@@ -134,6 +145,41 @@ pub fn read_seed(data_dir: &Path) -> Result<[u8; 32], AgentError> {
 /// [`AgentError::Io`] when the file cannot be written.
 pub fn write_seed(data_dir: &Path, seed: &[u8; 32]) -> Result<(), AgentError> {
     write_private(data_dir, SEED_FILE, seed)
+}
+
+/// Loads the custody key from [`CUSTODY_KEY_FILE`], or generates one and
+/// writes it `0600` when the file is missing (section 7.2). The machine
+/// calls it when it enrolls with the `node` role and before every `hello`
+/// it sends with that role, so a machine upgraded to M5b gets its key
+/// before its first `hello` reports it.
+///
+/// A key that exists is never replaced: the primary binds the first key a
+/// machine reports and refuses another (ADR 0231). A file that exists but
+/// cannot be read or is not exactly 32 bytes is therefore an error, and the
+/// file is left as it is.
+///
+/// # Errors
+///
+/// [`AgentError::Identity`] when the file cannot be read or is not 32
+/// bytes; [`AgentError::Io`] when a new key cannot be written.
+pub fn load_or_create_custody_key(data_dir: &Path) -> Result<CustodyKey, AgentError> {
+    let path = data_dir.join(CUSTODY_KEY_FILE);
+    match fs::read(&path) {
+        Ok(bytes) => {
+            let bytes = Zeroizing::new(bytes);
+            CustodyKey::from_bytes(&bytes)
+                .map_err(|_| AgentError::Identity(format!("{} is not 32 bytes", path.display())))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let key = CustodyKey::generate(&mut custody::os_rng());
+            write_private(data_dir, CUSTODY_KEY_FILE, &key.to_bytes()[..])?;
+            Ok(key)
+        }
+        Err(error) => Err(AgentError::Identity(format!(
+            "could not read {}: {error}",
+            path.display()
+        ))),
+    }
 }
 
 /// Reads the session credential.
