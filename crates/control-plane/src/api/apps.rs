@@ -2781,6 +2781,152 @@ pub async fn stop_app(
     .await
 }
 
+/// The audit operation and idempotency scope of `failoverApp`.
+const FAILOVER_APP: &str = "POST /api/v1/apps/{app_id}/failover";
+
+/// Body of `failoverApp` (`openapi.yaml` `FailoverAppRequest`).
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+#[schema(
+    title = "FailoverAppRequest",
+    description = "The node to start the warm copy on."
+)]
+pub struct FailoverAppRequest {
+    /// The app's warm node, `App.warm.node_id`.
+    #[schema(pattern = "^nod_[0-9A-HJKMNP-TV-Z]{26}$")]
+    pub node_id: String,
+}
+
+/// Starts a `warm` app's copy on its warm node: the lease moves there with a
+/// higher fencing token, after the source, when connected, answered its
+/// revoke ([`crate::failover`], ADR 0175).
+///
+/// # Errors
+///
+/// `forbidden` without `app:failover` or with `approval_required` for an
+/// agent, `not_found` for an unknown app, `validation_failed` for a `node_id`
+/// that is not the app's warm node, `conflict` with the contract's reasons,
+/// or a database error.
+#[utoipa::path(
+    post,
+    path = "/api/v1/apps/{app_id}/failover",
+    tag = "apps",
+    operation_id = "failoverApp",
+    extensions(("x-quoro-scope" = json!("app:failover"))),
+    params(
+        ("app_id" = String, Path, description = "App id (`app_...`).",
+            pattern = "^app_[0-9A-HJKMNP-TV-Z]{26}$"),
+        ("Idempotency-Key" = Option<String>, Header,
+            description = "Client-chosen key. A repeated call with the same key and the same body returns the original answer instead of starting a second failover.",
+            nullable = false, min_length = 1, max_length = 128),
+        ("Quoro-Justification" = Option<String>, Header,
+            description = "The agent's stated reason for the call. Required when the caller is an agent; it is recorded in the audit log (D-0031). Human callers may omit it.",
+            nullable = false, min_length = 1, max_length = 2000),
+        ("Quoro-Incident" = Option<String>, Header,
+            description = "The incident (`inc_...`) the call belongs to, when an agent acts on an incident (D-0032).",
+            nullable = false, pattern = "^inc_[0-9A-HJKMNP-TV-Z]{26}$"),
+    ),
+    request_body(content = FailoverAppRequest, content_type = "application/json",
+        description = "The warm node to start the app on."),
+    responses(
+        (status = 202, description = "The lease moved to the warm node in the primary's state.", body = App,
+            headers(("Quoro-Request-Id" = String, description = "Correlation id of this call."))),
+        (status = 401, response = crate::openapi::Unauthenticated),
+        (status = 403, response = crate::openapi::ApprovalRequired),
+        (status = 404, response = crate::openapi::NotFound),
+        (status = 409, response = crate::openapi::Conflict),
+        (status = 422, response = crate::openapi::ValidationFailed),
+        (status = 429, response = crate::openapi::RateLimited),
+        (status = 503, response = crate::openapi::NotPrimary),
+    )
+)]
+pub async fn failover_app(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    identity: crate::auth::Identity,
+    headers: HeaderMap,
+    Path(app_id): Path<String>,
+    ApiJson(body): ApiJson<FailoverAppRequest>,
+) -> Result<Response, ApiError> {
+    let ctx = CallCtx::new(identity, request_id.0, FAILOVER_APP, &headers);
+    let params = json!({ "node_id": body.node_id });
+    let target = app_target(&app_id);
+    let project_id = crate::api::volumes::app_project(&state, &app_id).await;
+    ctx.authorize(
+        &state,
+        Scope::AppFailover,
+        Some(&target),
+        project_id.as_deref(),
+        &params,
+    )
+    .await?;
+
+    let key = idempotency_key(&headers)?;
+    if let Some(key) = &key {
+        match state
+            .idempotency
+            .begin(ctx.identity.id(), FAILOVER_APP, key, &params)
+        {
+            Begin::Proceed => {}
+            Begin::Replay(status, stored) => {
+                ctx.audit_replay(
+                    &state,
+                    Scope::AppFailover,
+                    &target,
+                    project_id.as_deref(),
+                    &params,
+                )
+                .await?;
+                return Ok((status, Json(stored)).into_response());
+            }
+            Begin::Conflict => return Err(ApiError::conflict("Idempotency-Key reused")),
+        }
+    }
+
+    // The call may wait minutes for the source's answer and the lease's
+    // gate. A client that gives up meanwhile must not drop the failover
+    // halfway, between the revoke and the change or between the change's
+    // commit and the grant, nor leave its Idempotency-Key in flight: the rest
+    // runs in its own task, which the handler only awaits.
+    let node_id = body.node_id;
+    let task = tokio::spawn(async move {
+        match crate::failover::run(&state, &ctx, &app_id, &node_id, &params).await {
+            Ok(app) => {
+                if let Some(key) = &key {
+                    state.idempotency.finish(
+                        ctx.identity.id(),
+                        FAILOVER_APP,
+                        key,
+                        StatusCode::ACCEPTED,
+                        serde_json::to_value(&app).unwrap_or(Value::Null),
+                    );
+                }
+                Ok(app)
+            }
+            Err(error) => {
+                if let Some(key) = &key {
+                    state
+                        .idempotency
+                        .abandon(ctx.identity.id(), FAILOVER_APP, key);
+                }
+                ctx.audit_error(
+                    &state,
+                    Some(Scope::AppFailover),
+                    Some(&target),
+                    project_id.as_deref(),
+                    &params,
+                    &error,
+                )
+                .await?;
+                Err(error)
+            }
+        }
+    });
+    let app = task
+        .await
+        .map_err(|error| ApiError::internal(&format!("the failover task failed: {error}")))??;
+    Ok((StatusCode::ACCEPTED, Json(app)).into_response())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn set_desired_status(
     state: AppState,
@@ -3241,6 +3387,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/apps/{app_id}/redeploy", post(redeploy_app))
         .route("/api/v1/apps/{app_id}/start", post(start_app))
         .route("/api/v1/apps/{app_id}/stop", post(stop_app))
+        .route("/api/v1/apps/{app_id}/failover", post(failover_app))
         .route(
             "/api/v1/apps/{app_id}/env",
             get(get_app_env).put(replace_app_env),
@@ -3277,6 +3424,7 @@ pub fn routes() -> Router<AppState> {
         redeploy_app,
         start_app,
         stop_app,
+        failover_app,
         get_app_env,
         replace_app_env,
         super::deployments::list_app_deployments,
@@ -3306,6 +3454,7 @@ pub fn routes() -> Router<AppState> {
             AppEnvVarInput,
             AppEnvList,
             AppEnvReplaceRequest,
+            FailoverAppRequest,
             Deployment,
             super::deployments::DeploymentList,
             super::deployments::CreateDeploymentRequest,

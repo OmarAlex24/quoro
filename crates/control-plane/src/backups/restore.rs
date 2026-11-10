@@ -138,6 +138,22 @@ pub(crate) async fn accept(
 
     let now = now_rfc3339();
     let mut w = state.store.begin_write().await?;
+    // The old volume was read outside the writer: a write in between, such
+    // as a failover that moved it, makes this restore start over.
+    if let Some(volume) = &old {
+        let current: Option<(String, String)> =
+            sqlx::query_as("SELECT node_id, state FROM volumes WHERE id = ?")
+                .bind(&volume.id)
+                .fetch_optional(&mut *w.tx)
+                .await?;
+        if current.is_none_or(|(node_id, current_state)| {
+            node_id != volume.node_id || current_state != volume.state.as_str()
+        }) {
+            return Err(ApiError::conflict(
+                "the app's volume changed while the restore started; try again",
+            ));
+        }
+    }
     // 1. The unique index allows one attached volume per app, so the old one
     //    leaves `creating`/`ready` first (`migration 0006`).
     let old_node_id = match &old {
@@ -651,7 +667,7 @@ async fn replaced_volume_shape(
 
 /// Stops every instance of `app_id` and its status, as `stopApp` does, and
 /// returns the nodes that hold the instances, each once.
-async fn stop_app(
+pub(crate) async fn stop_app(
     conn: &mut SqliteConnection,
     app_id: &str,
     actor: &Actor,
@@ -717,7 +733,7 @@ async fn stop_app(
 /// Moves the app's instances to `node_id` and asks them to run there. Returns
 /// the other nodes the instances left, each once: their desired state no
 /// longer names the instances, and they must hear it.
-async fn move_vms(
+pub(crate) async fn move_vms(
     conn: &mut SqliteConnection,
     app_id: &str,
     node_id: &str,
@@ -761,7 +777,7 @@ async fn move_vms(
 }
 
 /// An `audit-log-format.md` section 3.5 system record of the `leases` actor.
-fn system_record(
+pub(crate) fn system_record(
     operation: &str,
     app_id: &str,
     params: Value,

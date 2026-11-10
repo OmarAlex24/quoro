@@ -483,6 +483,10 @@ struct HubInner {
     /// Woken by every change notification, so the domains' serving status
     /// is recomputed after the desired states it follows (ADR 0167).
     serving_inputs: Notify,
+    /// Woken when a `lease_revoke` is answered and when a session ends, so a
+    /// failover waiting on its revoke checks again (`openapi.yaml`
+    /// `failoverApp`).
+    revoke_answers: Notify,
 }
 
 /// A test seam that holds one node's next snapshot after it is built and
@@ -580,7 +584,13 @@ impl NodeHub {
             generation: AtomicU64::new(0),
             snapshot_holds: Mutex::new(HashMap::new()),
             serving_inputs: Notify::new(),
+            revoke_answers: Notify::new(),
         }))
+    }
+
+    /// Woken by every answered `lease_revoke` and every session that ends.
+    pub(crate) fn revoke_answers(&self) -> &Notify {
+        &self.0.revoke_answers
     }
 
     /// Test seam: holds `node_id`'s next snapshot that differs from the last
@@ -2627,6 +2637,7 @@ async fn end_session(
     let log_seq = hub.end_log_seq(node_id, generation);
     if let Some(pending) = hub.detach(node_id, generation) {
         pending.lock().expect("pending lock").fail_all();
+        hub.0.revoke_answers.notify_waiters();
     }
     // Nothing can answer this session's support requests any more; the
     // support the node already granted lasts its window (section 8.8).
@@ -2891,6 +2902,7 @@ impl Session {
                         {
                             self.revoke_answered(outbox).await;
                         }
+                        self.hub.0.revoke_answers.notify_waiters();
                         return false;
                     }
                     if self.snapshot_answered(re, &result, outbox).await {
