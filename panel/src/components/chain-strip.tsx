@@ -12,6 +12,7 @@ import { shortHash, shortId } from '../lib/agency-format';
 import { relativeTime } from '../lib/app-status';
 import { brokenReasonWords, buildVerifyBody, LOCK_VIEW } from '../lib/audit';
 import { canManageUsers } from '../lib/capabilities';
+import { SkeletonLines } from './skeleton';
 import { problemView, type ProblemView } from '../lib/problem';
 import { useNow } from '../lib/use-now';
 import { cn } from '../lib/utils';
@@ -209,7 +210,7 @@ export function ChainStrip({
             ) : null}
             {probeProblem ? <ProblemBanner view={probeProblem} /> : null}
             {exportsQuery.isPending ? (
-              <p>Reading the off-site copy…</p>
+              <SkeletonLines label="Loading the off-site copy" lines={2} />
             ) : !copy ? (
               <p>
                 No off-site copy is configured. <span className="type-code">POST /api/v1/audit-exports</span> creates

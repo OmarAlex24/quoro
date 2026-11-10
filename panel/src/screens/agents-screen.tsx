@@ -41,7 +41,7 @@ export function AgentsScreen() {
       <div className="flex flex-wrap items-center gap-3">
         <p className="min-w-0 flex-1 text-[13px] leading-snug text-ink-2">
           {query.isPending
-            ? 'Reading the agents…'
+            ? 'AI identities that act on the cluster through grants; each has a human owner.'
             : `${agents.length === 1 ? '1 agent' : `${agents.length} agents`}. AI identities that act on the cluster through grants; each has a human owner.`}
         </p>
         {canManage ? (

@@ -197,7 +197,7 @@ export function AgentKeys({
         <SkeletonRows label="Loading keys" rows={2} glyph={false} className="mt-3" />
       ) : items.length === 0 ? (
         <EmptyState title="No keys yet" className="mt-3">
-          The agent signs in with a key to get its tokens. Create one to let it act.
+          The agent signs in with a key to get its tokens.{canWrite ? ' Create one to let it act.' : ''}
         </EmptyState>
       ) : (
         <ul className="mt-3 flex flex-col divide-y divide-line border-y border-line">

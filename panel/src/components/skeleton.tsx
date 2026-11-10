@@ -40,7 +40,7 @@ export function Skeleton({
   children: ReactNode;
 }) {
   return (
-    <div role="status" aria-busy="true" className={cn('skel-field', className)} style={style}>
+    <div role="status" className={cn('skel-field', className)} style={style}>
       <span className="sr-only">{label}</span>
       <div aria-hidden="true" className="contents">
         {children}
