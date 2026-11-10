@@ -701,6 +701,22 @@ impl NodeHub {
         })
         .to_frame(&id, None)
         .to_text();
+        // Only the entry this attempt read sends its revoke, once: one that
+        // was replaced or dropped since had its held-back revoke released
+        // then ([`NodeHub::release_held_revoke`]), so neither the count of
+        // held-back revokes nor the node may see it a second time. The
+        // registry lock is taken alone, before the sessions lock.
+        {
+            let mut registry = self.0.held.lock().expect("held grant lock");
+            let Some(entry) = registry
+                .entries
+                .get_mut(lease_id)
+                .filter(|entry| **entry == *held)
+            else {
+                return;
+            };
+            entry.revoke_first = None;
+        }
         {
             let mut sessions = self.0.sessions.lock().expect("session lock");
             let Some(handle) = sessions
@@ -719,14 +735,6 @@ impl NodeHub {
             }
             handle.held_revokes = handle.held_revokes.saturating_sub(1);
             let _ = handle.tx.send(text);
-        }
-        let mut registry = self.0.held.lock().expect("held grant lock");
-        if let Some(entry) = registry
-            .entries
-            .get_mut(lease_id)
-            .filter(|entry| **entry == *held)
-        {
-            entry.revoke_first = None;
         }
         tracing::info!(
             lease_id,
@@ -870,5 +878,105 @@ impl NodeHub {
         // Section 6.4: the desired state carries the token.
         self.node_changed(&row.holder_node_id);
         Ok(Attempt::Sent)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::hub_with_node;
+    use super::{HeldGrant, NodeHub};
+    use crate::leases;
+
+    /// A marked `expiring` row naming `holder` at token 2.
+    fn marked(id: &str, holder: &str) -> leases::Lease {
+        leases::Lease {
+            id: id.to_string(),
+            resource_type: "app".to_string(),
+            resource_id: format!("app_{id}"),
+            holder_node_id: holder.to_string(),
+            mode: "expiring".to_string(),
+            fencing_token: 2,
+            duration_ms: Some(15_000),
+            granted_at: "2026-11-09T10:00:00Z".to_string(),
+            renewed_at: None,
+            expires_at: None,
+            revoked_at: None,
+            unsettled: true,
+        }
+    }
+
+    fn held_revokes(hub: &NodeHub, node_id: &str) -> u32 {
+        hub.0.sessions.lock().unwrap()[node_id].held_revokes
+    }
+
+    fn entry(hub: &NodeHub, lease_id: &str) -> HeldGrant {
+        hub.0.held.lock().unwrap().entries[lease_id].clone()
+    }
+
+    /// ADR 0299 and review finding m2: two step-4 revokes are held back on
+    /// a session whose `hello` position waits to count. An attempt reads the
+    /// first entry, and a write replaces it before the attempt sends its
+    /// revoke: the replacement released that revoke, so the attempt sends
+    /// nothing and leaves the count alone. The position does not count while
+    /// the second revoke is held back, nor once it is sent and unanswered;
+    /// it counts once that revoke is answered. (The replaced entry's revoke
+    /// never goes out, so the second is the last to be sent and answered.)
+    #[tokio::test]
+    async fn a_replaced_entry_sends_no_held_revoke_and_the_hello_waits_for_the_other() {
+        let (state, node_id, data_dir) = hub_with_node().await;
+        let hub = &state.hub;
+        let (generation, mut rx, _closed, _changed) = hub.attach(&node_id);
+        let one = marked("lse_one", &node_id);
+        let two = marked("lse_two", &node_id);
+        hub.held_eligible(&one, generation, Some(1));
+        hub.held_eligible(&two, generation, Some(1));
+        assert_eq!(held_revokes(hub, &node_id), 2);
+        hub.stale_leases_revoked(&node_id, generation);
+        hub.hello_checked(&node_id, generation, 7);
+        assert_eq!(hub.countable_ack(&node_id), 0);
+
+        let read = entry(hub, "lse_one");
+        let mut moved = one.clone();
+        moved.fencing_token = 3;
+        hub.hold_grant(&moved);
+        assert_eq!(
+            held_revokes(hub, &node_id),
+            1,
+            "the replacement released it"
+        );
+        hub.send_held_revoke("lse_one", &read, generation, 1);
+        assert!(rx.try_recv().is_err(), "the replaced entry sends no revoke");
+        assert_eq!(held_revokes(hub, &node_id), 1);
+        assert_eq!(hub.countable_ack(&node_id), 0, "the other is held back");
+
+        let read = entry(hub, "lse_two");
+        hub.send_held_revoke("lse_two", &read, generation, 1);
+        let frame: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(frame["type"], "lease_revoke");
+        assert_eq!(frame["body"]["lease_id"], "lse_two");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(held_revokes(hub, &node_id), 0);
+        assert_eq!(hub.countable_ack(&node_id), 0, "sent, not answered");
+
+        let id = frame["id"].as_str().unwrap();
+        assert!(hub.0.take_revoke(&node_id, generation, id).is_some());
+        hub.latch_hello(&node_id, generation);
+        assert_eq!(hub.countable_ack(&node_id), 7);
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    /// ADR 0299 and review finding B1: a `log_ack` counts only on a session
+    /// whose start pass ran to its end.
+    #[tokio::test]
+    async fn a_log_ack_counts_only_once_the_start_pass_is_complete() {
+        let (state, node_id, data_dir) = hub_with_node().await;
+        let hub = &state.hub;
+        let (generation, _rx, _closed, _changed) = hub.attach(&node_id);
+        hub.count_log_ack(&node_id, generation, 5);
+        assert_eq!(hub.countable_ack(&node_id), 0);
+        hub.stale_leases_revoked(&node_id, generation);
+        hub.count_log_ack(&node_id, generation, 5);
+        assert_eq!(hub.countable_ack(&node_id), 5);
+        std::fs::remove_dir_all(&data_dir).unwrap();
     }
 }

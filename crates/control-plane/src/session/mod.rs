@@ -5325,7 +5325,7 @@ mod tests {
     }
 
     /// A primary with one node whose row says `connected`.
-    async fn hub_with_node() -> (AppState, String, std::path::PathBuf) {
+    pub(super) async fn hub_with_node() -> (AppState, String, std::path::PathBuf) {
         // The tunnel manager builds a reqwest client on the no-provider
         // rustls feature.
         let _ = rustls::crypto::ring::default_provider().install_default();
