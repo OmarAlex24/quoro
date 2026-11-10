@@ -10,9 +10,11 @@
 -- row, so a field the payload lacks keeps its value, and a column's default
 -- applies only to a create that lacks it. It ignores a delete's payload,
 -- which is {} or the deleted object (node-agent-protocol.md section 7.3,
--- ADR 0297). A column with no field of its own in the API object travels in
--- the object's change-log payload under the column's name, beside the
--- object's fields, so a database rebuilt from the log keeps it (ADR 0286).
+-- ADR 0297). It folds the entries per entity before it inserts any row, and
+-- an entity that never received a create stops it (ADR 0317). A column with
+-- no field of its own in the API object travels in the object's change-log
+-- payload under the column's name, beside the object's fields, so a database
+-- rebuilt from the log keeps it (ADR 0286).
 -- An app's warm settings are the case: apps.warm_node_id,
 -- apps.warm_node_pinned and apps.warm_interval_s (migration 0011) appear in
 -- the API only inside `App.warm`. A whole-App payload carries them, and a
