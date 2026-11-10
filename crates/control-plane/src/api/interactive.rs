@@ -413,14 +413,14 @@ pub async fn get_session_transcript(
     headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let ctx = CallCtx::new(
-        identity,
-        request_id.0,
-        "GET /api/v1/interactive-sessions/{session_id}/transcript",
-        &headers,
-    );
+    let ctx = CallCtx::new(identity, request_id.0, TRANSCRIPT_OPERATION, &headers);
     crate::service::interactive::transcript(&state, &ctx, &session_id).await
 }
+
+/// The operation of [`get_session_transcript`], the one read the audit log
+/// records for a human too (`audit-log-format.md` section 3.3). The request
+/// body limit decides from it whether a 413 of the call is recorded.
+pub const TRANSCRIPT_OPERATION: &str = "GET /api/v1/interactive-sessions/{session_id}/transcript";
 
 fn normalise_origin(origin: &str) -> String {
     origin.trim_end_matches('/').to_ascii_lowercase()

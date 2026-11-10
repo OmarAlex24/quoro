@@ -294,6 +294,18 @@ pub struct AgentKeyHolder {
     pub agent: AgentIdentity,
 }
 
+impl AgentKeyHolder {
+    /// The agent as the identity of its `createAgentToken` call, whose
+    /// credential names `token_id`, the access token the call mints.
+    #[must_use]
+    pub fn identity(&self, token_id: String) -> Identity {
+        Identity {
+            principal: Principal::Agent(self.agent.clone()),
+            credential: Credential::AccessToken { token_id },
+        }
+    }
+}
+
 /// Resolves `Authorization: Bearer akey_...` for the token-minting endpoint.
 /// An unknown or revoked key is `unauthenticated`. A disabled agent still
 /// resolves, with `disabled` set, so the endpoint can refuse it with

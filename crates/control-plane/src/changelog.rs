@@ -166,6 +166,32 @@ pub async fn append(
     op: Op,
     payload: Value,
 ) -> Result<i64, AppendError> {
+    let entry = prepare(conn, actor, entity_type, entity_id, op, payload).await?;
+    insert(conn, &entry).await
+}
+
+/// The entry [`append`] would write next, built and checked exactly as it
+/// checks it, without writing anything: at the `seq` after the newest entry,
+/// hashed over its payload as read back, and refused when a node could not
+/// receive it alone and verify it (`node-agent-protocol.md` section 7.1,
+/// "Entries a node can receive", ADR 0302). [`insert`] writes it.
+///
+/// This is the one place the rules of [`append`] live. `audit::append` asks
+/// it whether an audit record's entry may be written with the record's
+/// parameters, before it writes anything (`audit-log-format.md` section 4.1,
+/// ADR 0306).
+///
+/// # Errors
+///
+/// As [`append`].
+pub(crate) async fn prepare(
+    conn: &mut SqliteConnection,
+    actor: &Actor,
+    entity_type: &str,
+    entity_id: &str,
+    op: Op,
+    payload: Value,
+) -> Result<StoredEntry, AppendError> {
     if !payload.is_object() {
         return Err(AppendError::PayloadNotAnObject);
     }
@@ -191,6 +217,20 @@ pub async fn append(
         hash: String::new(),
     };
     entry.hash = entry.receivable_hash()?;
+    Ok(entry)
+}
+
+/// Writes an entry [`prepare`] built and returns its `seq`. Nothing may be
+/// appended to the change log in between, or the schema's triggers refuse
+/// its `seq` and `prev_hash`.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn insert(
+    conn: &mut SqliteConnection,
+    entry: &StoredEntry,
+) -> Result<i64, AppendError> {
     sqlx::query(&format!(
         "INSERT INTO change_log ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     ))
@@ -207,7 +247,7 @@ pub async fn append(
     .bind(&entry.hash)
     .execute(&mut *conn)
     .await?;
-    Ok(seq)
+    Ok(entry.seq)
 }
 
 /// The `log_entries` frame (`node-agent-protocol.md` section 5.14), as

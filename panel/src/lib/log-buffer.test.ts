@@ -114,6 +114,14 @@ describe('SSE problems', () => {
     expect(isTransientProblem(view)).toBe(false);
   });
 
+  it('knows a body above the limit', () => {
+    const view = problemViewFromEvent(
+      JSON.stringify({ status: 413, code: 'payload_too_large' }),
+    );
+    expect(view.code).toBe('payload_too_large');
+    expect(view.message).toBe('That request is too large to send. Send less at once.');
+  });
+
   it('falls back to plain words when the data is not JSON', () => {
     expect(problemViewFromEvent('boom').message).toContain('log stream stopped');
   });

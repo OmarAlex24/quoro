@@ -106,6 +106,7 @@ const KNOWN_CODES: ReadonlySet<string> = new Set([
   'approval_required',
   'not_found',
   'conflict',
+  'payload_too_large',
   'validation_failed',
   'rate_limited',
   'not_primary',

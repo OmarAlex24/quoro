@@ -31,7 +31,9 @@ quoro-providers = { path = "../providers" }
 # and the layout (backup-format.md sections 2 to 6).
 quoro-backup = { path = "../backup" }
 # `ws` serves the node-agent session (GET /api/v1/nodes/session).
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
+# `matched-path` names the operation a request body above the limit was sent
+# to, for its audit record (README "Request body limit").
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "matched-path", "query", "tokio", "ws"] }
 # Node public keys and credentials are base64 (node-agent-protocol.md section 2).
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 tokio = { version = "1", default-features = false, features = ["sync", "time", "rt", "macros"] }

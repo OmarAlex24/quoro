@@ -346,10 +346,22 @@ impl AppState {
     }
 }
 
-/// The API router with the request-id layer. The panel's static assets are
+/// The API router with the request-id layer and the request body limit
+/// (README "Request body limit", ADR 0306). The panel's static assets are
 /// mounted by the binary beside it.
+///
+/// The limit runs after routing, on every route of [`api::routes`], so it
+/// knows the operation it refuses; the `DefaultBodyLimit` keeps the
+/// extractors behind it to the same limit.
 pub fn router(state: AppState) -> axum::Router {
     api::routes()
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            request::limit_body,
+        ))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            request::MAX_BODY_BYTES,
+        ))
         .with_state(state)
         .layer(axum::middleware::from_fn(request::request_id))
 }

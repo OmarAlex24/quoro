@@ -45,6 +45,7 @@ const isProblemCode = (value: unknown): value is Problem['code'] =>
   value === 'approval_required' ||
   value === 'not_found' ||
   value === 'conflict' ||
+  value === 'payload_too_large' ||
   value === 'validation_failed' ||
   value === 'rate_limited' ||
   value === 'not_primary' ||

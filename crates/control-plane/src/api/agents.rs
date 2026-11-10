@@ -11,7 +11,7 @@
 //! delete, so the operation is deliberately not implemented yet.
 
 use crate::AppState;
-use crate::auth::{AgentIdentity, Credential, Identity, Principal, authenticate_agent_key};
+use crate::auth::{Identity, authenticate_agent_key};
 use crate::error::{ApiError, Target};
 use crate::request::{ApiJson, CallCtx, RequestId};
 use axum::Json;
@@ -598,18 +598,7 @@ pub async fn create_agent_token(
     let holder = authenticate_agent_key(&state, &headers).await?;
     // The credential names the access-token row the mint is about to create.
     let token_id = new_id(Prefix::AccessToken);
-    let identity = Identity {
-        principal: Principal::Agent(AgentIdentity {
-            agent_id: holder.agent.agent_id.clone(),
-            name: holder.agent.name.clone(),
-            model: holder.agent.model.clone(),
-            owner_user_id: holder.agent.owner_user_id.clone(),
-            disabled: holder.agent.disabled,
-        }),
-        credential: Credential::AccessToken {
-            token_id: token_id.clone(),
-        },
-    };
+    let identity = holder.identity(token_id.clone());
     let ctx = CallCtx::new(identity, request_id, TOKEN_OPERATION, &headers);
     // `Idempotency-Key` is accepted by the contract but deliberately ignored:
     // each call mints a fresh token and is audited, so a replay would otherwise

@@ -11,6 +11,10 @@
 //! shortest round-trip decimal without an exponent (a CVSS score `9.8` stays
 //! `9.8`, `10.0` becomes `10`, `-0.0` becomes `0`). Any other number has an
 //! exponent form in ECMAScript and is refused.
+//!
+//! [`canonicalize_lenient`] writes every value, for the text an audit record's
+//! parameters digest covers (`audit-log-format.md` section 4.1): the same
+//! form, plus the numbers [`canonicalize`] refuses.
 
 use serde_json::Value;
 use std::fmt::Write as _;
@@ -27,11 +31,38 @@ pub struct NotCanonical(pub String);
 /// or whose magnitude is outside `[1e-6, 1e21)` (other than 0), is refused.
 pub fn canonicalize(value: &Value) -> Result<String, NotCanonical> {
     let mut out = String::new();
-    write_value(&mut out, value)?;
+    write_value(&mut out, value, Numbers::Strict)?;
     Ok(out)
 }
 
-fn write_value(out: &mut String, value: &Value) -> Result<(), NotCanonical> {
+/// The text of `value` that an audit record's `params_sha256` covers
+/// (`audit-log-format.md` section 4.1): its RFC 8785 form, written for every
+/// value, so it never fails.
+///
+/// It is [`canonicalize`] wherever that succeeds. The numbers that one
+/// refuses are written as well: an integer beyond ±(2^53 − 1) that was read
+/// exactly (`serde_json` holds it as an `i64` or a `u64`) as its exact decimal
+/// integer, and a float whose magnitude is outside `[1e-6, 1e21)` in
+/// ECMAScript's exponent form (`1e+21`, `1.5e-7`), as RFC 8785 section
+/// 3.2.2.3 writes it. A `serde_json` value holds no float that is not finite.
+#[must_use]
+pub fn canonicalize_lenient(value: &Value) -> String {
+    let mut out = String::new();
+    // Lenient writing refuses no value.
+    let _ = write_value(&mut out, value, Numbers::Lenient);
+    out
+}
+
+/// Which numbers [`write_value`] writes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Numbers {
+    /// Only those [`canonicalize`] accepts.
+    Strict,
+    /// Every number, as [`canonicalize_lenient`] says.
+    Lenient,
+}
+
+fn write_value(out: &mut String, value: &Value, numbers: Numbers) -> Result<(), NotCanonical> {
     match value {
         Value::Null => out.push_str("null"),
         Value::Bool(true) => out.push_str("true"),
@@ -54,6 +85,8 @@ fn write_value(out: &mut String, value: &Value) -> Result<(), NotCanonical> {
                 } else {
                     let _ = write!(out, "{f}");
                 }
+            } else if numbers == Numbers::Lenient {
+                write_lenient_number(out, number);
             } else {
                 return Err(NotCanonical(format!(
                     "number {number} has no canonical form in Quoro's records"
@@ -67,7 +100,7 @@ fn write_value(out: &mut String, value: &Value) -> Result<(), NotCanonical> {
                 if i > 0 {
                     out.push(',');
                 }
-                write_value(out, item)?;
+                write_value(out, item, numbers)?;
             }
             out.push(']');
         }
@@ -81,12 +114,34 @@ fn write_value(out: &mut String, value: &Value) -> Result<(), NotCanonical> {
                 }
                 write_string(out, key);
                 out.push(':');
-                write_value(out, &map[key.as_str()])?;
+                write_value(out, &map[key.as_str()], numbers)?;
             }
             out.push('}');
         }
     }
     Ok(())
+}
+
+/// A number [`canonicalize`] refuses, as [`canonicalize_lenient`] writes it:
+/// an exact integer beyond ±(2^53 − 1) as its decimal integer, and any other
+/// (a float outside `[1e-6, 1e21)`) in ECMAScript's exponent form.
+fn write_lenient_number(out: &mut String, number: &serde_json::Number) {
+    if let Some(i) = number.as_i64().filter(|_| !number.is_f64()) {
+        let _ = write!(out, "{i}");
+    } else if let Some(u) = number.as_u64().filter(|_| !number.is_f64()) {
+        let _ = write!(out, "{u}");
+    } else if let Some(f) = number.as_f64() {
+        // Rust's `LowerExp` writes the shortest round-trip digits, `d[.ddd]`,
+        // then `e` and the exponent; ECMAScript writes the same digits with a
+        // sign on the exponent (`1e+21`, `1.5e-7`).
+        let exp = format!("{f:e}");
+        match exp.split_once('e') {
+            Some((digits, exponent)) if !exponent.starts_with('-') => {
+                let _ = write!(out, "{digits}e+{exponent}");
+            }
+            _ => out.push_str(&exp),
+        }
+    }
 }
 
 /// Whether ECMAScript prints `f` without an exponent: finite, and 0 or with a
@@ -174,5 +229,94 @@ mod tests {
         assert!(canonicalize(&json!(1e21)).is_err());
         assert!(canonicalize(&json!(1e-7)).is_err());
         assert!(canonicalize(&json!(u64::MAX)).is_err());
+    }
+
+    fn parse(text: &str) -> Value {
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[test]
+    fn the_lenient_form_writes_the_three_cases_of_section_4_1() {
+        // `audit-log-format.md` section 4.1, as the primary reads each
+        // request's parameters.
+        let whole_float = parse(r#"{"n": 1e16}"#);
+        assert!(whole_float["n"].is_f64());
+        assert_eq!(
+            canonicalize_lenient(&whole_float),
+            r#"{"n":10000000000000000}"#
+        );
+        assert_eq!(canonicalize_lenient(&whole_float).len(), 23);
+
+        let exact = parse(r#"{"n": 18446744073709551615}"#);
+        assert!(canonicalize(&exact).is_err());
+        assert_eq!(
+            canonicalize_lenient(&exact),
+            r#"{"n":18446744073709551615}"#
+        );
+        assert_eq!(canonicalize_lenient(&exact).len(), 26);
+
+        let float = parse(r#"{"x": 18983552425072.563}"#);
+        assert_eq!(canonicalize_lenient(&float), canonicalize(&float).unwrap());
+        assert_eq!(canonicalize_lenient(&float), r#"{"x":18983552425072.563}"#);
+    }
+
+    #[test]
+    fn the_lenient_form_writes_exact_integers_beyond_2_53() {
+        for (text, written) in [
+            ("9007199254740992", "9007199254740992"),
+            ("-9007199254740992", "-9007199254740992"),
+            ("9223372036854775807", "9223372036854775807"),
+            ("-9223372036854775808", "-9223372036854775808"),
+            ("18446744073709551615", "18446744073709551615"),
+        ] {
+            let value = parse(text);
+            assert!(!value.is_f64(), "{text} is read exactly");
+            assert_eq!(canonicalize_lenient(&value), written);
+        }
+        // An integer beyond u64 is not read exactly: it is read as a float,
+        // and written as one.
+        let beyond = parse("100000000000000000000000000000");
+        assert!(beyond.is_f64());
+        assert!(canonicalize_lenient(&beyond).contains("e+2"), "{beyond}");
+    }
+
+    #[test]
+    fn the_lenient_form_writes_floats_like_ecmascript() {
+        for (value, text) in [
+            (1e21, "1e+21"),
+            (1.5e300, "1.5e+300"),
+            (-1.5e300, "-1.5e+300"),
+            (1e-7, "1e-7"),
+            (1.2345e-7, "1.2345e-7"),
+            (-2.5e-10, "-2.5e-10"),
+            (5e-324, "5e-324"),
+            (f64::MAX, "1.7976931348623157e+308"),
+            (123e20, "1.23e+22"),
+        ] {
+            assert_eq!(canonicalize_lenient(&json!(value)), text, "{value}");
+        }
+        // Inside an object, members still sort, and floats in the plain range
+        // keep their plain form.
+        assert_eq!(
+            canonicalize_lenient(&json!({ "b": 1e21, "a": [9.8, 10.0, -0.0] })),
+            r#"{"a":[9.8,10,0],"b":1e+21}"#
+        );
+    }
+
+    #[test]
+    fn the_lenient_form_is_the_strict_form_wherever_that_exists() {
+        for value in [
+            json!({ "b": 1, "a": [true, null, "x"], "c": { "z": 0, "y": -3 } }),
+            json!({ "\u{E000}": 2, "\u{1F600}": 1 }),
+            json!("a\"b\\c\nd\u{1f}e/\u{7f}é"),
+            json!([9.8, 10.0, 0.1, -0.0, 0.000_001, 123_456.789]),
+            json!({ "big": 9_007_199_254_740_991_i64, "neg": -9_007_199_254_740_991_i64 }),
+        ] {
+            assert_eq!(
+                canonicalize_lenient(&value),
+                canonicalize(&value).unwrap(),
+                "{value}"
+            );
+        }
     }
 }
