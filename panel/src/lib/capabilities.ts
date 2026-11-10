@@ -31,6 +31,9 @@ export const canDecideApprovals = humanWriter;
  */
 export const canChangeVoters = humanWriter;
 
+/** Create a join token for a new machine (`node:enroll`): an owner or an operator, never an agent. */
+export const canEnrollNodes = humanWriter;
+
 /** Create, change, disable or delete agents and their keys (`agent:write`). */
 export const canManageAgents = humanWriter;
 

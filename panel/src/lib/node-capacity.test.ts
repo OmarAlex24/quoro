@@ -112,7 +112,7 @@ describe('node meters', () => {
       allocated: { cpus: 8, memory_mb: 10_240, disk_gb: 48 },
     });
     expect(meters.map((meter) => meter.words)).toEqual([
-      '8 of 12 CPUs reserved',
+      '8 of 12 reserved',
       '10 of 24 GiB reserved',
       '48 of 200 GiB reserved',
     ]);
@@ -144,7 +144,7 @@ describe('node meters', () => {
       spoken: 'Disk: 2 GiB reserved, no capacity reported',
     });
     expect(disk!.words).not.toMatch(/of 0/);
-    expect(cpu).toMatchObject({ share: 1, words: '2 of 2 CPUs reserved', unknown: null });
+    expect(cpu).toMatchObject({ share: 1, words: '2 of 2 reserved', unknown: null });
     expect(memory!.unknown).toBeNull();
     expect(memory!.words).toBe('0.5 of 3.8 GiB reserved');
   });

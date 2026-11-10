@@ -50,7 +50,7 @@ export interface NodeMeter {
   label: string;
   /** Reserved over capacity; null when the node reports no capacity. */
   share: number | null;
-  /** The reading beside the label: `8 of 12 CPUs reserved`, or `2 GiB reserved` without a capacity. */
+  /** The reading beside the label: `8 of 12 reserved`, or `2 CPUs reserved` without a capacity. */
   words: string;
   /**
    * Said in place of the meter when the node reports no capacity (a missing
@@ -99,7 +99,7 @@ export const nodeMeters = (node: Pick<Node, 'capacity' | 'allocated'>): NodeMete
   };
   return [
     meter('cpu', 'CPU', 'CPU', allocated.cpus, capacity.cpus, {
-      of: `${allocated.cpus} of ${plural(capacity.cpus, 'CPU')} reserved`,
+      of: `${allocated.cpus} of ${capacity.cpus} reserved`,
       alone: `${plural(allocated.cpus, 'CPU')} reserved`,
     }),
     meter('memory', 'Memory', 'memory', allocated.memory_mb, capacity.memory_mb, {
