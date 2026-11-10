@@ -18,6 +18,12 @@
 //!   the row naming the node, unrevoked (a declaration of the node lost
 //!   revokes it, section 8.3), at a token no higher than the holder's; and
 //!   no failed fence of the lease, recorded or not (section 8.5).
+//! - **A failed write.** A write that fails on a database error ends the
+//!   session before its first desired state and its grants, as an
+//!   incomplete pass over the leases does: the row may read `expiring`,
+//!   unmarked, while the holder runs the lease `local`. The node dials
+//!   again, and its next session writes the row
+//!   ([`Session::record_local_reports`]).
 //! - **The order.** It runs once the session start's pass over the leases
 //!   ran to its end (`revoke_stale_leases`, with the `declared_lost`
 //!   revokes and the step-4 decision, which drops any held grant of a row
@@ -30,8 +36,16 @@
 //!
 //! The policy is not read: the report is what the holder holds, under any
 //! policy.
+//!
+//! Reading: refusing the write while the lease has a failed fence is
+//! stricter than "The mark"'s `local` report bullet, which names no such
+//! check. It is harmless: while the fence stands, the row stays as it was,
+//! marked or `expiring`, but no failover can move the lease on it:
+//! `failoverApp` refuses with `fence_failed` until an operator acknowledges
+//! the fence (section 8.5), and the holder's next report after that writes
+//! the row.
 
-use super::{Session, lease_token};
+use super::{Fault, Session, lease_token};
 use crate::changelog::{Actor, ActorType};
 use crate::error::ApiError;
 use crate::leases::{self, Lease};
@@ -39,10 +53,19 @@ use crate::leases::{self, Lease};
 impl Session {
     /// Records every `local` report of this session's `hello`
     /// ([`Session::write_local_report`]), then rebuilds the node's desired
-    /// state when a row was written. A failed write is logged and leaves the
-    /// row as it was: it keeps the mark, and the lease moves only as a
-    /// `local` lease does until the holder reports again.
-    pub(super) async fn record_local_reports(&mut self) {
+    /// state when a row was written. Returns whether the session start may
+    /// go on.
+    ///
+    /// A report whose checks refuse it (`None`) leaves the row as it was,
+    /// and the start goes on. A write that fails on a database error leaves
+    /// the row as it was too, which may be a row that reads `expiring`,
+    /// unmarked, while the holder runs the lease `local`: the start's
+    /// grants send nothing for it, and once its gate passed a failover could
+    /// move the lease while the holder still runs. So the start stops there,
+    /// sends nothing the write would have unlocked, and the session ends
+    /// ([`Session::finish_start`]); the node dials again, and its next
+    /// session's `hello` reports the lease again.
+    pub(super) async fn record_local_reports(&mut self) -> bool {
         let mut reports: Vec<(String, u64)> = self
             .hello_leases
             .iter()
@@ -66,7 +89,13 @@ impl Session {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    tracing::warn!(code = %e.code.as_str(), lease_id, "cannot record a holder's local report");
+                    tracing::warn!(
+                        code = %e.code.as_str(),
+                        lease_id,
+                        node_id = %self.node_id,
+                        "cannot record a holder's local report; the session ends, and the node dials again"
+                    );
+                    return false;
                 }
             }
         }
@@ -74,6 +103,7 @@ impl Session {
             // Section 6.4: the desired state carries the lease's token.
             self.hub.node_changed(&self.node_id);
         }
+        true
     }
 
     /// The write of one `local` report of `lease_id` at the holder's
@@ -117,6 +147,11 @@ impl Session {
         else {
             return Ok(None);
         };
+        if self.hub.take_fault(&Fault::LocalReport {
+            node_id: self.node_id.clone(),
+        }) {
+            return Err(ApiError::internal(&"a test seam failed the write"));
+        }
         let actor = Actor {
             kind: ActorType::Node,
             id: self.node_id.clone(),
@@ -145,6 +180,14 @@ mod tests {
         LeaseView::from_row(f.row().await, false, Vec::new())
             .unwrap()
             .local_pending
+    }
+
+    /// `Lease.duration_ms` of the row as the API shows it: `expiring`
+    /// leases only (`openapi.yaml`), whatever the row stores.
+    async fn shown_duration(f: &Fixture) -> Option<i64> {
+        LeaseView::from_row(f.row().await, false, Vec::new())
+            .unwrap()
+            .duration_ms
     }
 
     /// The row as (mode, token, `duration_ms`, unsettled, revoked).
@@ -215,6 +258,7 @@ mod tests {
                 assert_eq!(payload["unsettled"], false, "{case}: {payload}");
                 assert_eq!(payload["fencing_token"], 3, "{case}: {payload}");
                 assert!(!local_pending(&f).await, "{case}");
+                assert_eq!(shown_duration(&f).await, None, "{case}");
                 assert_local_repeat(&start, 3);
                 f.done();
             }
@@ -433,6 +477,8 @@ mod tests {
                 } else {
                     assert_eq!(after, before, "{case}");
                     assert_eq!(f.writes().await, writes, "{case}");
+                    // Still `expiring`: the view shows the duration.
+                    assert_eq!(shown_duration(&f).await, Some(15_000), "{case}");
                 }
                 f.done();
             }
@@ -461,7 +507,8 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        session.record_local_reports().await;
+        // A refused report lets the session start go on.
+        assert!(session.record_local_reports().await);
         assert_eq!(state(&f).await, before);
         assert_eq!(f.writes().await, writes);
         f.done();

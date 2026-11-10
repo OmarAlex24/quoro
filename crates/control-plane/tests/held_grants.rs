@@ -676,6 +676,90 @@ async fn a_holders_local_report_clears_the_mark_and_drops_the_held_grant() {
     assert!(revokes_of(&frames, &lease_id).is_empty(), "{frames:?}");
 }
 
+/// #555, a `local` report whose write fails. The row reads `expiring`,
+/// unmarked, at token 1 with a stored `duration_ms`, and its holder lists
+/// the lease `local` `held` at that token. The write fails on a database
+/// error, so the session ends with a non-fatal error, "dial again", before
+/// its first desired state and its grants: the holder must not go on
+/// `local` over a row that reads `expiring`, unmarked. The next session
+/// writes the row `local`, unmarked, at token 1, and keeps the stored
+/// `duration_ms`, which `getApp`'s lease view does not show for a `local`
+/// lease (`openapi.yaml` `Lease.duration_ms`, "expiring leases only"). Its
+/// session start sends the same-token `local` repeat, with no
+/// `duration_ms`.
+#[tokio::test]
+async fn a_failed_local_report_write_ends_the_session_and_the_next_one_writes_it() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    manual_clock(&server);
+    let a = enroll(&server, &owner, "node-a", &["node"]).await;
+    let (mut on_a, _) = session(&server, &a, None, Vec::new(), true).await;
+    heartbeat(&mut on_a).await;
+    let project_id = project(&server, &owner).await;
+    let (app_id, lease_id) = app_with_lease(&server, &owner, &mut on_a, &project_id, "web").await;
+    run(
+        &server,
+        "UPDATE leases SET mode = 'expiring', duration_ms = 15000 WHERE id = ?",
+        &lease_id,
+    )
+    .await;
+    drop(on_a);
+    wait_disconnected(&server, &a).await;
+    let unwritten = (1, "expiring".to_string(), Some(15_000), 0, false);
+    assert_eq!(row(&server, &lease_id).await, unwritten);
+    let before = newest_write(&server, &lease_id).await;
+    let listing = vec![listed(&lease_id, &app_id, LeaseMode::Local, 1, "held")];
+
+    server.state.hub.inject_fault(Fault::LocalReport {
+        node_id: a.node_id.clone(),
+    });
+    let hello = hello_at_head(&server, &a, listing.clone()).await;
+    let (frames, closed) = serve_until_closed(&server, &a, hello, Duration::from_secs(3)).await;
+    assert!(closed, "the session ends: {frames:?}");
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| frame["type"] == "desired_state" || frame["type"] == "lease_grant"),
+        "{frames:?}"
+    );
+    let error = frames
+        .iter()
+        .find(|frame| frame["type"] == "error")
+        .unwrap_or_else(|| panic!("{frames:?}"));
+    assert_eq!(error["body"]["code"], "bad_message", "{error}");
+    assert_eq!(error["body"]["fatal"], false, "{error}");
+    assert!(
+        error["body"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("dial again")),
+        "{error}"
+    );
+    wait_disconnected(&server, &a).await;
+    assert_eq!(row(&server, &lease_id).await, unwritten);
+    assert_eq!(newest_write(&server, &lease_id).await, before, "no entry");
+
+    let hello = hello_at_head(&server, &a, listing).await;
+    let mut on_a = Machine::connect_with(&server, &a, hello, true, false).await;
+    let mut frames = on_a.start.clone();
+    frames.extend(on_a.settle().await);
+    assert_eq!(
+        row(&server, &lease_id).await,
+        (1, "local".to_string(), Some(15_000), 0, false),
+        "written local, the stored duration kept"
+    );
+    assert!(newest_write(&server, &lease_id).await > before);
+    let grants = grants_of(&frames, &lease_id);
+    assert_eq!(grants.len(), 1, "{frames:?}");
+    assert_eq!(grants[0]["body"]["mode"], "local");
+    assert_eq!(grants[0]["body"]["fencing_token"], 1);
+    assert!(grants[0]["body"].get("duration_ms").is_none(), "{frames:?}");
+    assert!(grants[0]["re"].is_null(), "{frames:?}");
+    let view = lease_view(&server, &owner, &app_id).await;
+    assert_eq!(view["mode"], "local", "{view}");
+    assert!(view["duration_ms"].is_null(), "{view}");
+    assert_eq!(view["local_pending"], false, "{view}");
+}
+
 /// Case 3, ADR 0299. A `hello.log_seq` that covers the write counts only
 /// once every `lease_revoke` sent on that session is answered, and is
 /// latched on the live session: C's counts once it answers its revoke; D's
@@ -1765,6 +1849,91 @@ async fn a_marked_row_listed_held_at_its_token_gets_no_grant_at_the_session_star
     let frames = after_a_tick(&mut on_a).await;
     assert!(grants_of(&frames, &lease_id).is_empty(), "{frames:?}");
     assert_eq!(row(&server, &lease_id).await, marked);
+}
+
+/// #555, the holder's `local` report over the row of
+/// `a_marked_row_listed_held_at_its_token_gets_no_grant_at_the_session_start`:
+/// A's regrant over a row that reads `expiring` is written marked, `local`
+/// at token 2, on a session that does not follow the log, so A, the one
+/// voter, never acknowledges the write and supports nothing. A's next
+/// session lists the lease `local` `held` at token 2: that is the holder's
+/// `local` report, so one change-log entry writes the row `local`,
+/// unmarked, at token 2 ("The mark", the `local` report bullet), with no
+/// replication and no support. The session start sends exactly one grant,
+/// the same-token `local` repeat with no `duration_ms` and no `re`, the
+/// held grant is gone (`grant_pending` false), and nothing else goes out
+/// after a tick.
+#[tokio::test]
+async fn a_marked_row_listed_local_held_at_its_token_is_written_unmarked_with_no_support() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    manual_clock(&server);
+    let a = enroll(&server, &owner, "node-a", &["node"]).await;
+    let (mut on_a, _) = session(&server, &a, None, Vec::new(), true).await;
+    heartbeat(&mut on_a).await;
+    let project_id = project(&server, &owner).await;
+    let (app_id, lease_id) = app_with_lease(&server, &owner, &mut on_a, &project_id, "web").await;
+    run(
+        &server,
+        "UPDATE leases SET mode = 'expiring', duration_ms = 15000 WHERE id = ?",
+        &lease_id,
+    )
+    .await;
+    let a_log = on_a.log.clone();
+    drop(on_a);
+    wait_disconnected(&server, &a).await;
+
+    let lease = listed(&lease_id, &app_id, LeaseMode::Local, 1, "expired");
+    let (on_a, frames) = session(&server, &a, Some(a_log.clone()), vec![lease], false).await;
+    assert!(grants_of(&frames, &lease_id).is_empty(), "{frames:?}");
+    assert_eq!(
+        row(&server, &lease_id).await,
+        (2, "local".to_string(), None, 1, false)
+    );
+    assert!(a_log.0 < newest_write(&server, &lease_id).await);
+    assert_eq!(
+        pending(&server, &owner, &app_id).await,
+        (true, vec![a.node_id.clone()]),
+        "not replicated"
+    );
+    assert!(!server.state.hub.authority().supports(D));
+    drop(on_a);
+    wait_disconnected(&server, &a).await;
+    let entries = |server: &Server| {
+        let pool = server.state.store.pool().clone();
+        let lease_id = lease_id.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM change_log WHERE entity_type = 'lease' AND entity_id = ?",
+            )
+            .bind(lease_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let before = entries(&server).await;
+
+    let lease = listed(&lease_id, &app_id, LeaseMode::Local, 2, "held");
+    let (mut on_a, frames) = session(&server, &a, Some(a_log), vec![lease], false).await;
+    assert_eq!(
+        row(&server, &lease_id).await,
+        (2, "local".to_string(), None, 0, false)
+    );
+    assert_eq!(entries(&server).await, before + 1, "one change-log entry");
+    assert!(!server.state.hub.authority().supports(D));
+    let view = lease_view(&server, &owner, &app_id).await;
+    assert_eq!(view["grant_pending"], false, "{view}");
+    assert_eq!(view["local_pending"], false, "{view}");
+    let grants = grants_of(&frames, &lease_id);
+    assert_eq!(grants.len(), 1, "{frames:?}");
+    assert_eq!(grants[0]["body"]["mode"], "local");
+    assert_eq!(grants[0]["body"]["fencing_token"], 2);
+    assert!(grants[0]["body"].get("duration_ms").is_none(), "{frames:?}");
+    assert!(grants[0]["re"].is_null(), "{frames:?}");
+    let frames = after_a_tick(&mut on_a).await;
+    assert!(grants_of(&frames, &lease_id).is_empty(), "{frames:?}");
+    assert!(revokes_of(&frames, &lease_id).is_empty(), "{frames:?}");
 }
 
 /// The highest token any primary issues (section 8.5): 2^53 − 1.
