@@ -133,33 +133,62 @@ pub(crate) async fn store_hello(
         _ => stored_key,
     };
     if key.is_some() && stored_address.is_none() {
-        let taken: Vec<(String,)> =
-            sqlx::query_as("SELECT mesh_address FROM nodes WHERE mesh_address IS NOT NULL")
-                .fetch_all(&mut *conn)
-                .await
-                .map_err(|e| format!("cannot read the taken mesh addresses: {e}"))?;
-        let taken: Vec<String> = taken.into_iter().map(|(address,)| address).collect();
-        let address = allocate(&taken)?;
-        sqlx::query("UPDATE nodes SET mesh_address = ? WHERE id = ?")
-            .bind(&address)
-            .bind(node_id)
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| format!("cannot store the mesh address of {node_id}: {e}"))?;
-        changelog::append(
-            conn,
-            actor,
-            "node",
-            node_id,
-            Op::Update,
-            json!({ "id": node_id, "mesh_address": address }),
-        )
-        .await
-        .map_err(|e| format!("cannot record the mesh address of {node_id}: {e:?}"))?;
-        tracing::info!(node_id, mesh_address = %address, "assigned a mesh address");
+        assign_address(conn, actor, node_id).await?;
         changed = true;
     }
     Ok(changed)
+}
+
+/// Assigns `node_id` the lowest free mesh address ([`allocate`]) when its
+/// row has none, in the caller's write transaction, and appends the `node`
+/// change-log entry that carries it. A machine that already has an address
+/// keeps it. Returns the address assigned now, `None` when it had one.
+///
+/// Called at a machine's first `hello` with a mesh key, and when a machine
+/// enrolls with or gains the `witness` role (section 6.12).
+///
+/// # Errors
+///
+/// A message when the row cannot be read or written, or the `/16` is
+/// exhausted.
+pub(crate) async fn assign_address(
+    conn: &mut SqliteConnection,
+    actor: &Actor,
+    node_id: &str,
+) -> Result<Option<String>, String> {
+    let stored: Option<String> = sqlx::query_scalar("SELECT mesh_address FROM nodes WHERE id = ?")
+        .bind(node_id)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| format!("cannot read the mesh address of {node_id}: {e}"))?;
+    if stored.is_some() {
+        return Ok(None);
+    }
+    let taken: Vec<(String,)> =
+        sqlx::query_as("SELECT mesh_address FROM nodes WHERE mesh_address IS NOT NULL")
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| format!("cannot read the taken mesh addresses: {e}"))?;
+    let taken: Vec<String> = taken.into_iter().map(|(address,)| address).collect();
+    let address = allocate(&taken)?;
+    sqlx::query("UPDATE nodes SET mesh_address = ? WHERE id = ?")
+        .bind(&address)
+        .bind(node_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| format!("cannot store the mesh address of {node_id}: {e}"))?;
+    changelog::append(
+        conn,
+        actor,
+        "node",
+        node_id,
+        Op::Update,
+        json!({ "id": node_id, "mesh_address": address }),
+    )
+    .await
+    .map_err(|e| format!("cannot record the mesh address of {node_id}: {e:?}"))?;
+    tracing::info!(node_id, mesh_address = %address, "assigned a mesh address");
+    Ok(Some(address))
 }
 
 /// What a mesh build needs from the hub's memory (ADR 0144).

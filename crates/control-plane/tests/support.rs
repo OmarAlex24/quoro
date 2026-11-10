@@ -84,6 +84,13 @@ async fn spec_votes_name_every_voter_and_move_only_with_the_voter_set() {
     // A witness-only machine joins: every voter's desired state names it.
     let w = enroll(&server, &owner, "witness-w", &["witness"]).await;
     let joined = create_seq(&server, &w.node_id).await;
+    // A witness gets its mesh address when it enrolls (section 6.12).
+    let w_mesh: Option<String> = sqlx::query_scalar("SELECT mesh_address FROM nodes WHERE id = ?")
+        .bind(&w.node_id)
+        .fetch_one(server.state.store.pool())
+        .await
+        .unwrap();
+    assert!(w_mesh.is_some());
     while on_a.spec["votes"]["voters"].as_array().unwrap().len() < 2 {
         on_a.until("desired_state").await;
     }
@@ -92,7 +99,7 @@ async fn spec_votes_name_every_voter_and_move_only_with_the_voter_set() {
         "port": 51821,
         "voters": [
             { "node_id": a.node_id, "roles": ["node"], "mesh_address": null },
-            { "node_id": w.node_id, "roles": ["witness"], "mesh_address": null },
+            { "node_id": w.node_id, "roles": ["witness"], "mesh_address": w_mesh },
         ],
     });
     assert_eq!(on_a.spec["votes"], votes);

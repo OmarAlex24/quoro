@@ -723,6 +723,14 @@ async fn enroll(
         .map_err(|e| ApiError::internal(&format!("{e:?}")))?;
     changelog::append(&mut w.tx, &actor, "node", &node_id, op, payload).await?;
 
+    // A machine with the `witness` role gets its mesh address when it
+    // enrolls (section 6.12); any other gets it at its first `hello`.
+    if body.roles.contains(&NodeRole::Witness) {
+        crate::session::mesh::assign_address(&mut w.tx, &actor, &node_id)
+            .await
+            .map_err(|e| ApiError::internal(&e))?;
+    }
+
     let name: String = sqlx::query_scalar("SELECT name FROM nodes WHERE id = ?")
         .bind(&node_id)
         .fetch_one(&mut *w.tx)

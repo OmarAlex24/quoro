@@ -501,6 +501,111 @@ async fn the_roles_refusals_come_in_order_and_a_no_op_changes_nothing() {
     );
 }
 
+/// Section 8.10 rule 2 for the roles operation: a vote is added only once a
+/// majority of the current voters holds the current version. Adding the
+/// witness role to a machine that already votes changes no vote, so it is
+/// not held back. After the change the machine's next `desired_state`
+/// carries `spec.witness`, every voter's `spec.votes` the new version, which
+/// is the `change_seq` of the audit record, and the new witness gets a mesh
+/// address (section 6.12).
+#[tokio::test]
+async fn an_edge_gains_the_witness_role_on_its_next_desired_state() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let a = enrolled(&server, &owner, "node-a", &["node"]).await;
+    let mut machine_a = connected(&server, &a).await;
+    let b = enrolled(&server, &owner, "node-b", &["node"]).await;
+    let edge = enrolled(&server, &owner, "edge", &["edge"]).await;
+    let mut machine_edge = connected(&server, &edge).await;
+    assert!(
+        machine_edge.spec.get("votes").is_none_or(Value::is_null),
+        "not a voter"
+    );
+    assert!(machine_edge.spec.get("witness").is_none_or(Value::is_null));
+
+    // A holds the version of B's enrollment, B does not: 1 of 2.
+    holds_voters(&mut machine_a, 2).await;
+    assert_eq!(
+        roles_refused(
+            &owner,
+            &server,
+            &edge.node_id,
+            json!({ "add": ["witness"] })
+        )
+        .await,
+        (409, "conflict".to_string())
+    );
+    // A node gaining the witness role keeps its one vote: no rule 2.
+    let node = roles_ok(&owner, &server, &a.node_id, json!({ "add": ["witness"] })).await;
+    assert_eq!(node["roles"], json!(["node", "witness"]));
+    let version = machine_a.version();
+    let (_, _, change_seq) = last_roles_audit(&server).await;
+    assert!(change_seq.is_some());
+    roles_ok(
+        &owner,
+        &server,
+        &a.node_id,
+        json!({ "remove": ["witness"] }),
+    )
+    .await;
+
+    // B's session: 2 of 2.
+    let _machine_b = connected(&server, &b).await;
+    let mesh_before: Option<String> =
+        sqlx::query_scalar("SELECT mesh_address FROM nodes WHERE id = ?")
+            .bind(&edge.node_id)
+            .fetch_one(server.state.store.pool())
+            .await
+            .unwrap();
+    let node = roles_ok(
+        &owner,
+        &server,
+        &edge.node_id,
+        json!({ "add": ["witness"] }),
+    )
+    .await;
+    assert_eq!(node["roles"], json!(["edge", "witness"]));
+    let (result, params, change_seq) = last_roles_audit(&server).await;
+    assert_eq!(result, "ok");
+    assert_eq!(params, json!({ "add": ["witness"] }));
+    let change_seq = u64::try_from(change_seq.expect("a change_seq")).unwrap();
+    assert!(change_seq > version);
+    let mesh_after: Option<String> =
+        sqlx::query_scalar("SELECT mesh_address FROM nodes WHERE id = ?")
+            .bind(&edge.node_id)
+            .fetch_one(server.state.store.pool())
+            .await
+            .unwrap();
+    assert!(mesh_after.is_some(), "a new witness has a mesh address");
+    if let Some(before) = mesh_before {
+        assert_eq!(mesh_after.as_deref(), Some(before.as_str()), "kept");
+    }
+
+    // The edge's next desired state: `spec.witness` and `spec.votes` at the
+    // version of the roles entry, naming the edge with both roles.
+    while machine_edge.spec["witness"].is_null() {
+        machine_edge.until("desired_state").await;
+    }
+    assert_eq!(machine_edge.spec["witness"], json!({}));
+    assert_eq!(machine_edge.version(), change_seq);
+    let voters = machine_edge.spec["votes"]["voters"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(voters.len(), 3);
+    let listed = voters
+        .iter()
+        .find(|voter| voter["node_id"] == edge.node_id.as_str())
+        .expect("the edge votes");
+    assert_eq!(listed["roles"], json!(["edge", "witness"]));
+    assert_eq!(listed["mesh_address"].as_str(), mesh_after.as_deref());
+    assert!(machine_edge.spec["network"].is_null(), "no guest network");
+    // Every voter carries the new version.
+    holds_voters(&mut machine_a, 3).await;
+    assert_eq!(machine_a.version(), change_seq);
+    assert!(machine_a.spec["witness"].is_null(), "A has no witness role");
+}
+
 /// D-0170's guard: removing a vote that would leave fewer than three voters
 /// is refused with `conflict` while any `expiring` lease exists, unless the
 /// request sets `force`; `force` never bypasses rule 2. The machine's next
@@ -618,4 +723,51 @@ async fn two_vote_changes_never_pass_on_the_same_acknowledgements() {
         roles_refused(&owner, &server, &e2.node_id, json!({ "add": ["witness"] })).await,
         (409, "conflict".to_string())
     );
+}
+
+/// Section 6.12: the primary assigns a witness its mesh address when it
+/// enrolls or gains the role, before any `hello`; an edge or a node gets one
+/// only at its first `hello` that carries a mesh key.
+#[tokio::test]
+async fn a_witness_gets_a_mesh_address_when_it_enrolls_or_gains_the_role() {
+    async fn mesh_address(server: &Server, node_id: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT mesh_address FROM nodes WHERE id = ?")
+            .bind(node_id)
+            .fetch_one(server.state.store.pool())
+            .await
+            .unwrap()
+    }
+
+    // An edge that never connected has none, until it gains the role (as
+    // the first voter, which rule 2 lets through).
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let edge = enrolled(&server, &owner, "edge", &["edge"]).await;
+    assert_eq!(mesh_address(&server, &edge.node_id).await, None);
+    roles_ok(
+        &owner,
+        &server,
+        &edge.node_id,
+        json!({ "add": ["witness"] }),
+    )
+    .await;
+    let assigned = mesh_address(&server, &edge.node_id).await;
+    assert!(assigned.is_some(), "assigned when it gains the role");
+    // Losing the role keeps the address, which is never reused (ADR 0144).
+    // That is a vote change too: the edge's session acknowledges first.
+    let _machine = connected(&server, &edge).await;
+    roles_ok(
+        &owner,
+        &server,
+        &edge.node_id,
+        json!({ "remove": ["witness"] }),
+    )
+    .await;
+    assert_eq!(mesh_address(&server, &edge.node_id).await, assigned);
+
+    // A witness-only machine has one as soon as it enrolls.
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let witness = enrolled(&server, &owner, "witness", &["witness"]).await;
+    assert!(mesh_address(&server, &witness.node_id).await.is_some());
 }

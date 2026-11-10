@@ -17,7 +17,7 @@ pub mod desired;
 pub mod drain;
 mod follow;
 mod held;
-mod mesh;
+pub(crate) mod mesh;
 pub mod serving;
 mod votes;
 

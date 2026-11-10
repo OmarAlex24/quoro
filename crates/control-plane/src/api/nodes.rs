@@ -1488,6 +1488,14 @@ async fn roles_tx(
     }
 
     let actor = ctx.identity.actor();
+    // A machine that gains the witness role gets a mesh address if it has
+    // none (section 6.12), before the entry that changes its roles, so that
+    // entry is the one that moves the voter-set version.
+    if change == RolesChange::AddWitness {
+        crate::session::mesh::assign_address(&mut w.tx, &actor, node_id)
+            .await
+            .map_err(|e| ApiError::internal(&e))?;
+    }
     let roles_json = serde_json::to_string(&new_roles).map_err(|e| ApiError::internal(&e))?;
     sqlx::query("UPDATE nodes SET roles = ? WHERE id = ?")
         .bind(&roles_json)
