@@ -2071,9 +2071,14 @@ async fn a_pending_acknowledgement_releases_only_the_grant_it_covered() {
 }
 
 /// Section 8.3, ADR 0183: a holder declared lost releases a `local` lease
-/// revoked by then. The API call is not there yet, so the test sets
-/// `nodes.lost_at` itself. A declaration older than the revoke says nothing
-/// about it. An `expiring` lease also waits for its gate (section 8.4): see
+/// revoked by then, while it has not reported since. The test sets
+/// `nodes.lost_at` and `last_seen_at` itself, to place the declaration
+/// before and after the revoke, and the node's last report after and at the
+/// declaration; `declaring_the_old_node_lost_lets_the_restore_finish` uses
+/// the API. A declaration older than the revoke says nothing about it. One
+/// the node reported after may have met a failed fence the primary lost, so
+/// it releases nothing either (section 8.5). An `expiring` lease also waits
+/// for its gate (section 8.4): see
 /// `a_lost_holders_expiring_lease_is_released_by_its_gate`.
 #[tokio::test]
 async fn a_holder_declared_lost_releases_the_lease() {
@@ -2090,14 +2095,113 @@ async fn a_holder_declared_lost_releases_the_lease() {
         .unwrap();
     ready_waits(&mut setup, &moving).await;
 
+    // Reported since the declaration.
     sqlx::query(
-        "UPDATE nodes SET lost_at = (SELECT revoked_at FROM leases WHERE id = ?) WHERE id = ?",
+        "UPDATE nodes SET lost_at = (SELECT revoked_at FROM leases WHERE id = ?), \
+         last_seen_at = '2999-01-01T00:00:00.000Z' WHERE id = ?",
     )
     .bind(&moving.lease_id)
     .bind(&setup.state.node.node_id)
     .execute(&pool)
     .await
     .unwrap();
+    ready_waits(&mut setup, &moving).await;
+
+    sqlx::query(
+        "UPDATE nodes SET lost_at = (SELECT revoked_at FROM leases WHERE id = ?), \
+         last_seen_at = (SELECT revoked_at FROM leases WHERE id = ?) WHERE id = ?",
+    )
+    .bind(&moving.lease_id)
+    .bind(&moving.lease_id)
+    .bind(&setup.state.node.node_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    ready_grants(&mut setup, &moving, moving.old_token).await;
+}
+
+/// `declareNodeLost` of the old node (section 8.3, ADR 0183): returns the
+/// node it answers.
+async fn declare_old_node_lost(setup: &Setup) -> Value {
+    let res = setup
+        .state
+        .owner
+        .post(setup.state.server.url(&format!(
+            "/api/v1/nodes/{}/declare-lost",
+            setup.state.node.node_id
+        )))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        200,
+        "declare-lost: {}",
+        res.text().await.unwrap()
+    );
+    res.json().await.unwrap()
+}
+
+/// Section 8.3 through the API: the restore's revoke of the old node is
+/// unanswered and the node is gone, so the restore waits; once the node is
+/// declared lost, the next `ready` report moves the lease. The row was
+/// already revoked, so the declaration leaves its token as it is.
+#[tokio::test]
+async fn declaring_the_old_node_lost_lets_the_restore_finish() {
+    let mut setup = setup().await;
+    let moving = start_moving(&mut setup, 18).await;
+    drop_old_session(&mut setup).await;
+    ready_waits(&mut setup, &moving).await;
+
+    declare_old_node_lost(&setup).await;
+    let token: i64 = sqlx::query_scalar("SELECT fencing_token FROM leases WHERE id = ?")
+        .bind(&moving.lease_id)
+        .fetch_one(setup.state.server.state.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(token, moving.old_token, "a revoked row is not held");
+    ready_grants(&mut setup, &moving, moving.old_token).await;
+}
+
+/// Section 8.3, ADR 0202: declaring a node lost changes nothing in its
+/// `fence_failure`, so a lease listed there stays ungrantable until an
+/// operator acknowledges the fence (section 8.5); then the restore finishes.
+#[tokio::test]
+async fn a_lost_nodes_failed_fence_waits_for_its_acknowledgement() {
+    let mut setup = setup().await;
+    let moving = start_moving(&mut setup, 19).await;
+    fail_fence(&mut setup, &moving).await;
+    drop_old_session(&mut setup).await;
+
+    let node = declare_old_node_lost(&setup).await;
+    assert_eq!(
+        node["fence_failure"]["lease_ids"],
+        json!([moving.lease_id]),
+        "{node}"
+    );
+    assert!(node["lost_at"].is_string(), "{node}");
+    ready_waits(&mut setup, &moving).await;
+
+    acknowledge(&mut setup, &moving).await;
+    ready_grants(&mut setup, &moving, moving.old_token + 1).await;
+}
+
+/// Section 8.4 through the API: a revoked `expiring` lease of a holder
+/// declared lost is released only once its gate has passed.
+#[tokio::test]
+async fn a_lease_of_a_node_declared_lost_through_the_api_waits_for_its_gate() {
+    let mut setup = setup().await;
+    let moving = start_moving(&mut setup, 20).await;
+    drop_old_session(&mut setup).await;
+    let passes = expiring_with_gate(&setup, &moving).await;
+    declare_old_node_lost(&setup).await;
+    ready_waits(&mut setup, &moving).await;
+    assert!(
+        tokio::time::Instant::now() < passes,
+        "the test ran too slowly"
+    );
+
+    tokio::time::sleep_until(passes).await;
     ready_grants(&mut setup, &moving, moving.old_token).await;
 }
 
@@ -2139,8 +2243,10 @@ async fn a_lost_holders_expiring_lease_is_released_by_its_gate() {
     drop_old_session(&mut setup).await;
     let passes = expiring_with_gate(&setup, &moving).await;
     sqlx::query(
-        "UPDATE nodes SET lost_at = (SELECT revoked_at FROM leases WHERE id = ?) WHERE id = ?",
+        "UPDATE nodes SET lost_at = (SELECT revoked_at FROM leases WHERE id = ?), \
+         last_seen_at = (SELECT revoked_at FROM leases WHERE id = ?) WHERE id = ?",
     )
+    .bind(&moving.lease_id)
     .bind(&moving.lease_id)
     .bind(&setup.state.node.node_id)
     .execute(setup.state.server.state.store.pool())

@@ -362,6 +362,30 @@ pub(crate) async fn awaited_by_restores(
     rows.iter().map(lease_from_row).collect()
 }
 
+/// Every lease row the declaration that set `node_id`'s `lost_at` covers
+/// ([`declaration_covers`]): it names the node and was revoked by
+/// `lost_at`, oldest first.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn covered_by_declaration(
+    conn: &mut SqliteConnection,
+    node_id: &str,
+    lost_at: &str,
+) -> Result<Vec<Lease>, ApiError> {
+    let rows = sqlx::query(&format!(
+        "SELECT {LEASE_COLUMNS} FROM leases \
+         WHERE holder_node_id = ? AND revoked_at IS NOT NULL AND revoked_at <= ? \
+         ORDER BY id"
+    ))
+    .bind(node_id)
+    .bind(lost_at)
+    .fetch_all(&mut *conn)
+    .await?;
+    rows.iter().map(lease_from_row).collect()
+}
+
 /// What this primary has learned, in memory, about revoked leases whose last
 /// holder no longer runs anything under them (`node-agent-protocol.md`
 /// sections 5.13 and 8.5, ADR 0047): for each lease and holder, the highest
@@ -425,7 +449,8 @@ impl Releases {
 /// after its grant, so that the acknowledgement's increment produced that
 /// token; or,
 /// for a lease revoked by then, have been declared lost (`nodes.lost_at`,
-/// ADR 0183) or removed (section 10). Such an `expiring` lease is released
+/// ADR 0183) and not reported since ([`declaration_releases`]), or removed
+/// (section 10). Such an `expiring` lease is released
 /// only once its gate has passed on the authority's clock (section 8.4, ADR
 /// 0202): until then its holder may still run the app. A lease listed in a
 /// node's `fence_failure` is refused by [`grant_app_lease`] whatever this
@@ -444,35 +469,99 @@ pub(crate) async fn is_released(
     if !lease.is_revoked() || unanswered {
         return Ok(false);
     }
+    if released_by_holder(conn, releases, lease).await? {
+        return Ok(true);
+    }
+    let holder: Option<(Option<String>, Option<String>, String)> =
+        sqlx::query_as("SELECT lost_at, last_seen_at, status FROM nodes WHERE id = ?")
+            .bind(&lease.holder_node_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let gone = holder.is_some_and(|(lost_at, last_seen_at, status)| {
+        status == "removed"
+            || lost_at.is_some_and(|lost_at| {
+                declaration_releases(lease, &lost_at, last_seen_at.as_deref())
+            })
+    });
+    Ok(gone && (lease.mode == "local" || authority.passed(&lease.id)))
+}
+
+/// Whether the declaration that set its holder's `lost_at` covers `lease`:
+/// the row was revoked by then (section 8.3, ADR 0183). A row granted or
+/// regranted after it, and not revoked since, is not covered, even while a
+/// `lost_at` that was never cleared stays set.
+pub(crate) fn declaration_covers(lease: &Lease, lost_at: &str) -> bool {
+    lease
+        .revoked_at
+        .as_deref()
+        .is_some_and(|revoked_at| revoked_at <= lost_at)
+}
+
+/// Whether the declaration that set its holder's `lost_at` still releases
+/// `lease`: it covers the row ([`declaration_covers`]), and the holder has
+/// not reported since (`last_seen_at` is unset or not past `lost_at`).
+///
+/// Sections 8.3 and 8.5: "declaring a node lost never covers a failed fence
+/// the operator has not seen". Once the node said `hello` after the
+/// declaration ([`crate::session`]'s `connect_node` stamps `last_seen_at`
+/// under the writer gate, before any revoke of its return goes out), it may
+/// answer a `declared_lost` revoke `fence_failed`, and a failure the primary
+/// could not record lives only in memory. From then on only these release
+/// its leases: its own `ok` answers ([`Releases`]), an operator's fence
+/// acknowledgement, or its removal.
+///
+/// The cost: a primary that restarts while the node returns forgets those
+/// answers, and a `lost_at` that was not cleared then frees nothing. The
+/// leases stay held until the node returns again, when its next session
+/// revokes again every lease the declaration covered, listed or not, and
+/// its answers release them; or until the node is removed.
+///
+/// All three timestamps are written by [`crate::store::now_rfc3339`], fixed
+/// width, so they compare as strings.
+pub(crate) fn declaration_releases(
+    lease: &Lease,
+    lost_at: &str,
+    last_seen_at: Option<&str>,
+) -> bool {
+    declaration_covers(lease, lost_at) && last_seen_at.is_none_or(|seen| seen <= lost_at)
+}
+
+/// Whether `lease`'s last holder has released it in a way that does not
+/// rest on a declaration or a removal: an `ok` answer to a revoke at its
+/// token ([`Releases`]), or an operator's acknowledgement of it pending
+/// delivery at its token, made once the lease was revoked. The first two
+/// ways of [`is_released`], which a declared lease still lacks until its
+/// holder returns and answers its `declared_lost` revoke.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn released_by_holder(
+    conn: &mut SqliteConnection,
+    releases: &Releases,
+    lease: &Lease,
+) -> Result<bool, ApiError> {
     if releases.covers(lease) {
         return Ok(true);
     }
     // The acknowledgement's time is that of the latest one added to it, so
     // a lease granted to its holder again after an earlier acknowledgement
     // at that token (ADR 0247) is told apart only while no later one came.
-    if let Some(pending) = crate::fences::pending_of(conn, &lease.holder_node_id).await?
-        && pending.lease_ids.contains(&lease.id)
-        && pending
-            .fencing_tokens
-            .get(&lease.id)
-            .is_some_and(|token| i64::try_from(*token).ok() == Some(lease.fencing_token))
-        && lease
-            .revoked_at
-            .as_deref()
-            .is_some_and(|revoked_at| revoked_at <= pending.acked_at.as_str())
-    {
-        return Ok(true);
-    }
-    let holder: Option<(Option<String>, String)> =
-        sqlx::query_as("SELECT lost_at, status FROM nodes WHERE id = ?")
-            .bind(&lease.holder_node_id)
-            .fetch_optional(&mut *conn)
-            .await?;
-    let revoked_at = lease.revoked_at.as_deref().unwrap_or_default();
-    let gone = holder.is_some_and(|(lost_at, status)| {
-        status == "removed" || lost_at.is_some_and(|lost_at| revoked_at <= lost_at.as_str())
-    });
-    Ok(gone && (lease.mode == "local" || authority.passed(&lease.id)))
+    Ok(
+        if let Some(pending) = crate::fences::pending_of(conn, &lease.holder_node_id).await? {
+            pending.lease_ids.contains(&lease.id)
+                && pending
+                    .fencing_tokens
+                    .get(&lease.id)
+                    .is_some_and(|token| i64::try_from(*token).ok() == Some(lease.fencing_token))
+                && lease
+                    .revoked_at
+                    .as_deref()
+                    .is_some_and(|revoked_at| revoked_at <= pending.acked_at.as_str())
+        } else {
+            false
+        },
+    )
 }
 
 /// Every unrevoked lease `node_id` holds, oldest first.
@@ -1209,6 +1298,71 @@ mod tests {
         }
     }
 
+    /// Sections 8.3 and 8.5: a declaration releases a `local` lease it
+    /// revoked only while the holder has not reported since. Once the node
+    /// said `hello` after it (`last_seen_at` past `lost_at`), it may have
+    /// answered the revoke `fence_failed` and the primary may have lost that
+    /// failure, so the declaration releases nothing more; removal still does.
+    #[tokio::test]
+    async fn a_declaration_releases_nothing_once_the_holder_reported_since() {
+        let (store, lease, _actor, data_dir) = store_with_lease().await;
+        let authority = Authority::new(Arc::new(crate::authority::SystemMonotonic::default()));
+        let releases = Releases::default();
+        let pool = store.pool();
+        sqlx::query("UPDATE leases SET revoked_at = '2026-11-09T10:00:00.000Z' WHERE id = ?")
+            .bind(&lease.id)
+            .execute(pool)
+            .await
+            .unwrap();
+        let revoked = super::by_id(&mut pool.acquire().await.unwrap(), &lease.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let cases = [
+            ("never seen", None, true),
+            ("seen before", Some("2026-11-09T10:59:59.999Z"), true),
+            (
+                "seen at the declaration",
+                Some("2026-11-09T11:00:00.000Z"),
+                true,
+            ),
+            ("seen since", Some("2026-11-09T11:00:00.001Z"), false),
+        ];
+        for (case, last_seen_at, released) in cases {
+            sqlx::query(
+                "UPDATE nodes SET lost_at = '2026-11-09T11:00:00.000Z', last_seen_at = ? \
+                 WHERE id = ?",
+            )
+            .bind(last_seen_at)
+            .bind(&lease.holder_node_id)
+            .execute(pool)
+            .await
+            .unwrap();
+            let mut conn = pool.acquire().await.unwrap();
+            assert_eq!(
+                super::is_released(&mut conn, &releases, &authority, false, &revoked)
+                    .await
+                    .unwrap(),
+                released,
+                "{case}"
+            );
+        }
+        sqlx::query("UPDATE nodes SET status = 'removed' WHERE id = ?")
+            .bind(&lease.holder_node_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(
+            super::is_released(&mut conn, &releases, &authority, false, &revoked)
+                .await
+                .unwrap(),
+            "removed"
+        );
+        drop(conn);
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
     /// Section 8.4 and ADR 0202: a revoked `expiring` lease of a holder
     /// declared lost or removed is released only once its gate has passed. A
     /// new token waits for the gate, writing nothing meanwhile; once it has
@@ -1237,7 +1391,8 @@ mod tests {
         let gone = [
             (
                 "declared lost",
-                "UPDATE nodes SET lost_at = '2026-11-09T10:00:00.000Z' WHERE id = ?",
+                "UPDATE nodes SET lost_at = '2026-11-09T10:00:00.000Z', \
+                 last_seen_at = '2026-11-09T09:00:00.000Z' WHERE id = ?",
             ),
             (
                 "removed",

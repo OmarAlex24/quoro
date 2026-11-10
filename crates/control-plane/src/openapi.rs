@@ -112,6 +112,7 @@ pub struct RateLimited(Problem);
         crate::api::nodes::delete_node_tunnel,
         crate::api::nodes::ack_node_fence,
         crate::api::nodes::update_node_roles,
+        crate::api::nodes::declare_node_lost,
         crate::api::enroll::create_join_token,
         crate::api::enroll::enroll_node,
         crate::session::open_node_session,

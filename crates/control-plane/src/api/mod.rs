@@ -137,6 +137,10 @@ pub fn routes() -> Router<AppState> {
             post(nodes::update_node_roles),
         )
         .route(
+            "/api/v1/nodes/{node_id}/declare-lost",
+            post(nodes::declare_node_lost),
+        )
+        .route(
             "/api/v1/projects",
             get(projects::list_projects).post(projects::create_project),
         )
