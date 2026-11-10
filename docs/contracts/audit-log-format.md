@@ -416,13 +416,13 @@ An audited call is always audited (ADR 0306). A record reaches the nodes as a ch
 | `{"n": 1e16}` | RFC 8785 writes `10000000000000000`, which reads back as an integer above 2^53 | `{"n":10000000000000000}`, so `params_bytes` is 23 |
 | `{"n": 18446744073709551615}` | an integer beyond 2^53 that the primary read exactly has no RFC 8785 form | `{"n":18446744073709551615}`, so `params_bytes` is 26 |
 
-**Floats (ADR 0315).** The primary parses JSON numbers exactly: each float reads as the IEEE 754 double nearest to its text. Its RFC 8785 text then reads back as the same double, so a float makes the parameters a digest only when that text is an integer above 2^53, as `1e16` does above. A worked case, kept in `params`:
+**Floats (ADR 0315).** The primary parses JSON floats exactly: each reads as the IEEE 754 double nearest to its text. Its RFC 8785 text then reads back as the same double, so a float makes the parameters a digest only when that text is an integer above 2^53, as `1e16` does above. A worked case, kept in `params`:
 
 - the request carries `{"x": 18983552425072.563}`;
 - the nearest double is exactly 18983552425072.5625, and RFC 8785 writes it as `18983552425072.562`;
 - `params` is stored as `{"x":18983552425072.562}`, 24 bytes, and that text reads back as the same double, so the record re-hashes from its stored text.
 
-A parser that rounds floats only approximately can read such text back as a neighbouring double, whose RFC 8785 text differs, and the record then no longer hashes to its `hash`. **Nodes verify with the same parser as the primary:** the change-log entries that carry these records are parsed with numbers read exactly, and so must any verifier of the chain (section 5). A node still on an approximate parser can fail to verify an entry that holds such a float. It answers `bad_message` and stays at its last acknowledgement until it is upgraded (node-agent-protocol.md section 7.1), so nodes are upgraded promptly after the primary.
+A parser that rounds floats only approximately can read such text back as a neighbouring double, whose RFC 8785 text differs, and the record then no longer hashes to its `hash`. **Nodes verify with the same parser as the primary:** the change-log entries that carry these records are parsed with floats read exactly, and so must any verifier of the chain (section 5). A node still on an approximate parser can fail to verify an entry that holds such a float. It answers `bad_message` and stays at its last acknowledgement until it is upgraded (node-agent-protocol.md section 7.1), so nodes are upgraded promptly after the primary.
 
 The two fields are part of the hashed record (section 5). A record that keeps its parameters has neither, so it hashes as before. The record of a refusal, of an error and of a success all follow this rule, and the audit write never fails because of its parameters. A request body above the API's limit is refused before it is read, and its record has `params` `{}` with neither field (README.md, "Request body limit").
 
@@ -440,7 +440,7 @@ where `JCS` is the JSON Canonicalization Scheme (RFC 8785) and `record_object_wi
 - For `seq` > 1, `prev_hash` equals the `hash` of `seq - 1`.
 - `seq` is gap-free from 1; there is no hole and no duplicate (D-0031).
 
-Because the serialization is canonical, a record can be re-hashed by any implementation that has the record's JSON: field order, whitespace and number formatting do not affect the result (RFC 8785, cited by the shared entity model). The implementation must parse numbers exactly, each as the IEEE 754 double nearest to its text, as the primary does (section 4.1, ADR 0315).
+Because the serialization is canonical, a record can be re-hashed by any implementation that has the record's JSON: field order, whitespace and number formatting do not affect the result (RFC 8785, cited by the shared entity model). The implementation must parse floats exactly, each as the IEEE 754 double nearest to its text, as the primary does (section 4.1, ADR 0315).
 
 ### 5.1 Worked chain (illustrative)
 
@@ -556,7 +556,7 @@ Three further honest limits:
 
 - The chain proves internal consistency, not that the recorded parameters and results are true; a lying service writes a consistent lie.
 - It proves nothing about calls that never reached the audit gate. Authentication failures are not recorded (section 3), so a burst of failed logins is not visible in the chain.
-- A record that keeps a digest instead of its parameters (section 4.1) proves that the call carried parameters of that size and digest, not what they were. A caller that kept its request matches the digest only if it reads each number exactly, as the primary does (section 4.1).
+- A record that keeps a digest instead of its parameters (section 4.1) proves that the call carried parameters of that size and digest, not what they were. A caller that kept its request matches the digest only if it reads each number as the primary does: floats exactly, and integers beyond 2^53 exactly (section 4.1).
 
 ## 8. Off-site copy
 
