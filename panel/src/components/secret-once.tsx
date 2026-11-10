@@ -10,10 +10,12 @@ export function SecretOnce({
   label,
   secret,
   note,
+  copyLabel = 'Copy secret',
 }: {
   label: string;
   secret: string;
   note: string;
+  copyLabel?: string;
 }) {
   return (
     <div className="rounded-[10px] border border-line border-l-4 border-l-shift bg-surface px-3.5 py-3">
@@ -22,7 +24,7 @@ export function SecretOnce({
         <code className="min-w-0 flex-1 break-all rounded-[7px] border border-line-2 bg-sunk px-2.5 py-1.5 type-code text-[12.5px] text-ink select-all">
           {secret}
         </code>
-        <CopyButton value={secret} label="Copy secret" />
+        <CopyButton value={secret} label={copyLabel} />
       </div>
       <p className="mt-2 text-[13px] leading-snug text-ink-2">{note}</p>
     </div>

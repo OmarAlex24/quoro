@@ -724,7 +724,44 @@ const seed = (): void => {
   seedGitApp(createdAt);
   seedAtlas(createdAt, repository.id);
   seedSettings();
+  seedEdge(createdAt);
   applyRepositoryStart();
+};
+
+/**
+ * The demo's starting state for the HA view (ADR 0170): `lab-3` and `lab-4`
+ * vote, and `lab-edge` is an enrolled edge-only machine without a vote, the
+ * one that can become the third voter (ADR 0018). Seeded after everything
+ * else, so every id seeded before keeps its value and `extraNodes[0]` stays
+ * `lab-4`.
+ */
+const seedEdge = (createdAt: string): void => {
+  db.extraNodes.push({
+    id: mockId('nod'),
+    name: 'lab-edge',
+    roles: ['edge'],
+    cp_status: null,
+    status: 'connected',
+    public_key: 'c2VlZC1sYWItZWRnZS1wdWJsaWMta2V5',
+    address: '10.0.0.5',
+    behind_nat: false,
+    labels: { room: 'lab', rack: 'r3' },
+    capacity: { cpus: 2, memory_mb: 2_048, disk_gb: 20 },
+    allocated: { cpus: 0, memory_mb: 0, disk_gb: 0 },
+    // An edge needs no KVM: it runs the node agent and the proxy, no engine.
+    kvm: { available: false, kernel: '6.12.0-lab', nested: false },
+    agent_version: '0.1.0',
+    desired_rev: 1,
+    applied_rev: 1,
+    log_seq: 1,
+    // No `node` role, so it follows no change log.
+    log_lag: null,
+    fence_failure: null,
+    tunnel: null,
+    last_seen_at: createdAt,
+    lost_at: null,
+    created_at: createdAt,
+  });
 };
 
 /**
