@@ -35,7 +35,8 @@ pub(crate) struct Lease {
     /// The `app_` or `nod_` id the lease protects.
     pub resource_id: String,
     pub holder_node_id: String,
-    /// `local` or `expiring`; M5a writes `local` only.
+    /// `local` or `expiring`. A converted lease's row stays `local` until
+    /// the primary answers its first renewal (ADR 0244).
     pub mode: String,
     pub fencing_token: i64,
     pub duration_ms: Option<i64>,
@@ -46,8 +47,9 @@ pub(crate) struct Lease {
     /// The unsettled mark (`leases.unsettled`, migration 0013; section 8.4,
     /// "The mark"): the row may disagree with its holder's mode, so the lease
     /// moves only as a `local` lease does. No write with a new token clears
-    /// it; only the writes that record what the holder holds do (issue #555,
-    /// not built yet).
+    /// it; only the writes that record what the holder holds do: the settle
+    /// ([`settle`]) and, not built yet, the holder's `local` report and the
+    /// `pong` after a same-token `local` grant (issue #555).
     pub unsettled: bool,
 }
 
@@ -907,10 +909,11 @@ pub(crate) fn grant_must_wait(facts: GrantFacts) -> bool {
 /// commits. A failed commit leaves it ahead of the row, so a later gate ends
 /// later than it must, never earlier.
 ///
-/// The writes that clear the mark (the holder's `local` report, the `pong`
-/// after a same-token `local` grant, the settle at the first renewal) are
-/// issue #555 and not built here: a row marked here stays marked after its
-/// grant is taken, and moves only as a `local` lease does, which is safe.
+/// A row marked here keeps the mark after its grant is taken until a write
+/// that records what the holder holds clears it: the settle at the holder's
+/// first renewal while the policy is `warm` ([`settle`]), or, not built yet,
+/// the holder's `local` report (issue #555). Until then it moves only as a
+/// `local` lease does, which is safe.
 ///
 /// [`Authority::gate_remaining`]: crate::authority::Authority::gate_remaining
 ///
@@ -1057,6 +1060,67 @@ pub(crate) async fn grant_app_lease(
     } else {
         Ok(NewGrant::Granted(Box::new(lease)))
     }
+}
+
+/// The answer to a converted lease's first renewal writes the row's `mode`
+/// `expiring`, in the single-writer transaction it commits before the answer
+/// is sent (section 8.4, "Changing the mode", ADR 0244). Nothing else
+/// changes: the token stays (ADR 0258), the stored duration was raised
+/// before the conversion grant went out (ADR 0254), and the mark, which a
+/// converted row does not carry, is kept as any other write keeps it
+/// ("The mark"). Returns the row as written.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn write_converted(
+    conn: &mut SqliteConnection,
+    mut lease: Lease,
+    actor: &Actor,
+) -> Result<Lease, ApiError> {
+    sqlx::query("UPDATE leases SET mode = 'expiring' WHERE id = ?")
+        .bind(&lease.id)
+        .execute(&mut *conn)
+        .await?;
+    lease.mode = "expiring".to_string();
+    changelog::append(conn, actor, "lease", &lease.id, Op::Update, lease.payload()).await?;
+    Ok(lease)
+}
+
+/// The settle's row write (section 8.4, "Settling a lease"; ADR 0261): once
+/// the `pong` that follows the settling answer arrives, the row takes the
+/// holder's `token`, `mode` `expiring` and `duration_ms`, and loses the
+/// unsettled mark. The caller passes the longest duration granted on the
+/// session, and never less than the stored one: a lowering waits for the
+/// gates of longer grants ([`lower_duration`], ADR 0203), so the settle never
+/// lowers. Returns the row as written.
+///
+/// # Errors
+///
+/// A duration outside 3 000 to 600 000 ms, or a database error.
+pub(crate) async fn settle(
+    conn: &mut SqliteConnection,
+    mut lease: Lease,
+    token: i64,
+    duration_ms: i64,
+    actor: &Actor,
+) -> Result<Lease, ApiError> {
+    check_duration(duration_ms)?;
+    sqlx::query(
+        "UPDATE leases SET mode = 'expiring', fencing_token = ?, duration_ms = ?, unsettled = 0 \
+         WHERE id = ?",
+    )
+    .bind(token)
+    .bind(duration_ms)
+    .bind(&lease.id)
+    .execute(&mut *conn)
+    .await?;
+    lease.mode = "expiring".to_string();
+    lease.fencing_token = token;
+    lease.duration_ms = Some(duration_ms);
+    lease.unsettled = false;
+    changelog::append(conn, actor, "lease", &lease.id, Op::Update, lease.payload()).await?;
+    Ok(lease)
 }
 
 /// Revokes the app's lease and writes its change-log entry; the caller builds

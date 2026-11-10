@@ -430,7 +430,7 @@ fn unrecorded_fence_failure() -> ApiError {
 ///   may have been a failed fence the primary lost (section 8.5);
 /// - a row that reads `expiring` moves once its gate has passed on the
 ///   authority's clock.
-async fn held_while_away(
+pub(crate) async fn held_while_away(
     conn: &mut SqliteConnection,
     authority: &Authority,
     lease: &Lease,

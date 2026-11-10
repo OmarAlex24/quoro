@@ -13,6 +13,7 @@
 //! first snapshot ([`follow`], sections 5.14 and 7.1), and every voter is
 //! asked for its support ([`votes`], sections 5.27 and 8.8).
 
+mod conversion;
 pub mod desired;
 pub mod drain;
 mod follow;
@@ -449,6 +450,9 @@ struct SessionHandle {
     /// out after the revokes and the fence acknowledgement it waited for
     /// (section 4.2 rules 3 to 5). A held grant goes out only from then on.
     start_done: bool,
+    /// The conversion grants this session sent whose first renewal is not
+    /// answered yet (section 8.4, "Changing the mode"; [`conversion`]).
+    conversions: HashMap<String, conversion::InFlight>,
 }
 
 /// A follower's position in the change log, kept in memory for its live
@@ -1800,6 +1804,7 @@ impl NodeHub {
                 pending_hello: None,
                 held_revokes: 0,
                 start_done: false,
+                conversions: HashMap::new(),
             },
         );
         (generation, rx, closed_rx, changed)
@@ -2593,8 +2598,9 @@ struct Session {
     /// reported could not be recorded: no `fence_ack` goes out again on this
     /// session, and the next session sends the pending one.
     fence_ack_stopped: bool,
-    /// What the `hello` reported of each lease: its state and token.
-    hello_leases: HashMap<String, (String, u64)>,
+    /// What the `hello` reported of each lease: its state, its token and
+    /// whether its mode is `expiring`.
+    hello_leases: HashMap<String, (String, u64, bool)>,
     /// The step-4 rows this session's start found the node not holding
     /// ("The holder fenced first" step 4): their held grants go out on this
     /// session, and [`Session::send_grants`] sends nothing for them.
@@ -2629,6 +2635,9 @@ struct Session {
     /// When the next `support_request` is due, every `S / 3` (section 5.27);
     /// `None` while none goes out.
     support_due: Option<Instant>,
+    /// The leases this session settles (section 8.4, "Settling a lease";
+    /// [`conversion`]).
+    settles: conversion::Settles,
 }
 
 impl Session {
@@ -2659,6 +2668,7 @@ impl Session {
             voter_snapshots: VecDeque::new(),
             acked_votes_version: None,
             support_due: None,
+            settles: conversion::Settles::default(),
         }
     }
 }
@@ -2982,7 +2992,11 @@ impl Session {
                 .map(|lease| {
                     (
                         lease.lease_id.clone(),
-                        (lease.state.clone(), lease.fencing_token),
+                        (
+                            lease.state.clone(),
+                            lease.fencing_token,
+                            matches!(lease.mode, quoro_proto::LeaseMode::Expiring),
+                        ),
                     )
                 })
                 .collect();
@@ -3036,7 +3050,8 @@ impl Session {
             Err(error) => return decode_failure(&error, outbox),
         };
         match message {
-            NodeMessage::Heartbeat(_) | NodeMessage::Pong => {}
+            NodeMessage::Heartbeat(_) => {}
+            NodeMessage::Pong => self.on_pong(raw.re.as_deref()).await,
             NodeMessage::Ping => outbox.push(
                 ControlMessage::Pong
                     .to_frame(&new_msg_id(), Some(&raw.id))
@@ -3814,32 +3829,47 @@ impl Session {
     ///   nothing: the renewal may have crossed this node's grant at the row's
     ///   token, and a node that holds that grant refuses the revoke (section
     ///   5.13) instead of fencing the lease it was just given.
-    /// - A `local` row gets no answer (D-0256 part 2), and the node's
-    ///   validity runs out. So would the first renewal after a conversion,
-    ///   whose row stays `local` until it is answered (ADR 0244); conversions
-    ///   wait for D-0261.
-    /// - An `expiring` row at the renewal's token is answered with a
-    ///   `lease_grant` at that token, `mode` `expiring`, for `D`, with `re`
-    ///   set. Only while a majority of voters supports it (section 8.8): no
-    ///   build counts support yet, so in every build none is answered.
+    /// - Otherwise [`conversion::plan`] decides:
+    ///   - the first renewal after a conversion this session sent, over a row
+    ///     that still reads `local`, is answered as the first one: the row is
+    ///     written `expiring` before the answer, and the gate counts the
+    ///     longer of the conversion's and the answer's duration (ADR 0244,
+    ///     ADR 0254, ADR 0257);
+    ///   - a settle this session's `hello` registered is answered, with no
+    ///     write, and a `ping` follows; its `pong` writes the row if the
+    ///     row's newest write is still the one this answer read (section
+    ///     8.4, "Settling a lease");
+    ///   - an `expiring` row at the renewal's token is answered with a
+    ///     `lease_grant` at that token, `mode` `expiring`, for `D`, with `re`
+    ///     set; a marked one while the policy is `warm` is settled too;
+    ///   - a conversion in flight over a marked row, or while the policy is
+    ///     off `warm`, was ended by the policy change: the renewal is
+    ///     answered as for an `expiring` lease, with no write, and the
+    ///     conversion is no longer in flight (section 8.4, "Changing the
+    ///     mode", #555);
+    ///   - a `local` row otherwise gets no answer (ADR 0256 part 2), and the
+    ///     node's validity runs out.
     /// - Anything else gets no answer, and the lease runs out on the node: a
     ///   node token above the row's, a lease listed in a failed fence (section
-    ///   8.5), or a grant the authority refuses.
+    ///   8.5), a session no longer the node's, or a grant the authority
+    ///   refuses. Every answer needs majority support for the duration it
+    ///   carries (section 8.8).
     ///
-    /// The row is read, the stored duration raised and the grant recorded in
-    /// one single-writer transaction, committed before the grant is queued
-    /// (section 8.4, "What the authority must enforce"). A revoke that
-    /// commits after it reaches the node after the grant. The answer writes
-    /// nothing else: renewals change no state.
+    /// The row is read, the stored duration raised or the row written, and
+    /// the grant recorded in one single-writer transaction, committed before
+    /// the grant is queued (section 8.4, "What the authority must enforce").
+    /// A revoke that commits after it reaches the node after the grant.
+    /// Besides the first answer's `mode`, the answer writes nothing: renewals
+    /// change no state.
     async fn answer_renewal(
-        &self,
+        &mut self,
         re: &str,
         renew: &quoro_proto::LeaseRenew,
         outbox: &mut Vec<String>,
     ) {
         use crate::authority::{DEFAULT_DURATION_MS, Grant, GrantKind};
+        use conversion::Plan;
         let lease_id = renew.lease_id.0.as_str();
-        let duration_ms = DEFAULT_DURATION_MS;
         let mut w = match self.hub.0.store.begin_write().await {
             Ok(w) => w,
             Err(e) => {
@@ -3864,17 +3894,50 @@ impl Session {
         let Some(lease) = row else {
             return;
         };
-        if lease.mode != "expiring" {
-            tracing::debug!(lease_id, "a renewal of a local lease gets no answer");
+        // A session a newer one replaced may still run a message it had
+        // read: nothing it answers or writes may follow the newer session's
+        // start, which decided the lease from its own `hello`.
+        if !self.hub.is_current(&self.node_id, self.generation) {
             return;
         }
-        if lease_token(&lease) != renew.fencing_token.max(1) {
-            tracing::warn!(
-                lease_id,
-                node_token = renew.fencing_token,
-                "a renewal above the lease's token gets no answer"
-            );
-            return;
+        let warm = match conversion::app_is_warm(&mut w.tx, &lease.resource_id).await {
+            Ok(warm) => warm,
+            Err(e) => {
+                tracing::warn!(code = %e.code.as_str(), lease_id, "cannot read the app's policy");
+                return;
+            }
+        };
+        let token = renew.fencing_token.max(1);
+        let in_flight = self
+            .hub
+            .conversion_in_flight(&self.node_id, self.generation, lease_id);
+        let plan = conversion::plan(
+            &lease,
+            token,
+            in_flight,
+            self.reported_settle(lease_id),
+            warm,
+        );
+        match plan {
+            Plan::Unanswered(why) => {
+                tracing::debug!(lease_id, node_token = token, why);
+                return;
+            }
+            Plan::Ended(in_flight) => {
+                // Section 8.4 "Changing the mode" (#555): the policy change
+                // ended the conversion, whether or not this renewal is
+                // answered.
+                self.hub
+                    .conversion_answered(&self.node_id, self.generation, lease_id, in_flight);
+                tracing::info!(
+                    lease_id,
+                    marked = lease.unsettled,
+                    warm,
+                    "the policy left warm while a conversion was in flight; its renewal is \
+                     answered with no write"
+                );
+            }
+            Plan::Converted(_) | Plan::Settle | Plan::Ordinary { .. } => {}
         }
         // A failed fence this primary could not record refuses the answer
         // as a recorded one does (section 8.5 step 1).
@@ -3898,18 +3961,68 @@ impl Session {
             kind: ActorType::Node,
             id: self.node_id.clone(),
         };
-        let stored = i64::try_from(duration_ms).unwrap_or(i64::MAX);
-        if let Err(e) = leases::raise_duration(&mut w, lease_id, stored, &actor).await {
-            tracing::warn!(code = %e.code.as_str(), lease_id, "cannot raise a lease's duration");
+        let Some(kind) = conversion::counted(plan, &lease) else {
+            tracing::error!(
+                lease_id,
+                ?plan,
+                duration_ms = ?lease.duration_ms,
+                "the stored duration does not cover the grant this answer must count; no answer"
+            );
             return;
-        }
-        // Refused, the transaction rolls back, raise and all.
+        };
+        let (duration_ms, lease) = if kind == GrantKind::Renewal {
+            let duration_ms = DEFAULT_DURATION_MS;
+            let stored = i64::try_from(duration_ms).unwrap_or(i64::MAX);
+            if let Err(e) = leases::raise_duration(&mut w, lease_id, stored, &actor).await {
+                tracing::warn!(code = %e.code.as_str(), lease_id, "cannot raise a lease's duration");
+                return;
+            }
+            (duration_ms, lease)
+        } else {
+            // The first answer, a settle's answer and the answer after a
+            // policy change ended a conversion carry the stored duration
+            // when it is shorter than `D` (ADR 0268), and need no raise.
+            let Some(duration_ms) = conversion::answer_ms(&lease) else {
+                tracing::error!(lease_id, "the lease stores no valid duration; no answer");
+                return;
+            };
+            let lease = if let Plan::Converted(_) = plan {
+                // ADR 0244: the row reads `expiring` from the first answer
+                // on, committed before the answer is sent.
+                match leases::write_converted(&mut w.tx, lease, &actor).await {
+                    Ok(lease) => lease,
+                    Err(e) => {
+                        tracing::warn!(code = %e.code.as_str(), lease_id, "cannot write a converted lease");
+                        return;
+                    }
+                }
+            } else {
+                lease
+            };
+            (duration_ms, lease)
+        };
+        // A settling answer: the row's newest write as this transaction
+        // leaves it, after its own raise, for the `pong` to find again
+        // ([`Session::ping_to_settle`]).
+        let settle = matches!(plan, Plan::Settle | Plan::Ordinary { settle: true });
+        let settle_seq = if settle {
+            match leases::newest_write_seq(&mut w.tx, lease_id).await {
+                Ok(seq) => seq,
+                Err(e) => {
+                    tracing::warn!(code = %e.code.as_str(), lease_id, "cannot read a lease's newest write");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        // Refused, the transaction rolls back, raise or write and all.
         let sent_wall = time::OffsetDateTime::now_utc();
         if let Err(refused) = self.hub.0.authority.record_grant(&Grant {
             lease_id,
             holder: &self.node_id,
             duration_ms,
-            kind: GrantKind::Renewal,
+            kind,
             sent_wall,
         }) {
             if refused == crate::authority::Refused::NoSupport {
@@ -3928,8 +4041,16 @@ impl Session {
             tracing::warn!(%e, lease_id, "cannot answer a renewal");
             return;
         }
-        // The row is `expiring`, so the grant is too.
+        if let Plan::Converted(in_flight) = plan {
+            self.hub
+                .conversion_answered(&self.node_id, self.generation, lease_id, in_flight);
+        }
+        self.note_granted(lease_id, duration_ms);
+        // The answer is `expiring` at the renewal's token, whatever the row
+        // reads: a settle's row may still read `local`, or a lower token.
         let mut grant = lease.grant();
+        grant.mode = quoro_proto::LeaseMode::Expiring;
+        grant.fencing_token = token;
         grant.duration_ms = Some(duration_ms);
         grant.granted_at = crate::store::format_rfc3339(sent_wall);
         outbox.push(
@@ -3937,6 +4058,9 @@ impl Session {
                 .to_frame(&new_msg_id(), Some(re))
                 .to_text(),
         );
+        if settle {
+            self.ping_to_settle(lease_id, token, settle_seq, outbox);
+        }
     }
 
     /// Queues a `lease_revoke` on this session, after `welcome` at its start,
@@ -4298,6 +4422,19 @@ impl Session {
                 }
             };
         let held = leases::held_by_node(&mut conn, &self.node_id).await;
+        // The apps whose policy is `warm`, for the settle from `hello`.
+        let warm: HashSet<String> = match sqlx::query_scalar(
+            "SELECT id FROM apps WHERE ha_policy IN ('warm', 'hot')",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        {
+            Ok(warm) => warm.into_iter().collect(),
+            Err(e) => {
+                tracing::warn!(%e, node_id = %self.node_id, "cannot read the warm apps; no lease is granted");
+                return;
+            }
+        };
         // A regrant takes the writer gate; this read connection is not held
         // across it.
         drop(conn);
@@ -4317,7 +4454,7 @@ impl Session {
                     }
                     match reported
                         .as_ref()
-                        .map(|(state, claimed)| (state.as_str(), *claimed))
+                        .map(|(state, claimed, _)| (state.as_str(), *claimed))
                     {
                         Some(("expired", claimed)) => {
                             if claimed <= token {
@@ -4340,12 +4477,30 @@ impl Session {
                         Some(("revoked", _)) => continue,
                         _ => {}
                     }
+                    // Section 8.4, "Changing the mode", "The holder's next
+                    // `hello`" and "Settling a lease": a holder that lists the
+                    // lease `expiring`, `held` or `uncertain`, while the policy
+                    // is `warm`, over a marked row at its token or above, or
+                    // over a `local` row at its token (a conversion whose first
+                    // renewal this primary never answered), is settled: its
+                    // next renewal is answered, and the `pong` after it writes
+                    // the row. Nothing is granted here, and no same-token
+                    // `local` grant ends its renewals.
+                    if let Some((state, claimed, true)) = &reported
+                        && (state == "held" || state == "uncertain")
+                        && *claimed >= token
+                        && (lease.unsettled || (lease.mode == "local" && *claimed == token))
+                        && warm.contains(&lease.resource_id)
+                    {
+                        self.settles.report(&lease.id, *claimed);
+                        continue;
+                    }
                     // "Grants of a marked row": every grant of a marked row
                     // other than a renewal's answer goes through the
                     // held-grant path; the regrant above does (its write
                     // waits). One the node lists `held` or `uncertain` at the
-                    // row's token gets nothing here: the same-token `local`
-                    // resend and the writes that clear the mark are #555.
+                    // row's token gets nothing here otherwise: the same-token
+                    // `local` resend and the holder's `local` report are #555.
                     if lease.unsettled {
                         continue;
                     }
@@ -4380,7 +4535,7 @@ impl Session {
                     }
                     let id = new_msg_id();
                     if lease.mode == "local"
-                        && reported.is_some_and(|(state, claimed)| {
+                        && reported.is_some_and(|(state, claimed, _)| {
                             claimed == token && (state == "held" || state == "uncertain")
                         })
                     {
