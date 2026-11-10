@@ -4,9 +4,10 @@
 //! A human with `node:enroll` creates a one-time join token; the node proves
 //! possession of it and presents its Ed25519 public key, and receives a node
 //! credential (32 random bytes, base64) plus the cluster public key. The
-//! primary stores only the SHA-256 of the credential, in the local
-//! `node_credentials` table (migration 0002), so the hash never enters the
-//! change log.
+//! primary stores only the SHA-256 of the credential, in `node_credentials`
+//! (migration 0002). From schema 13 that row travels in the change log as a
+//! `node_credential` entry, so a promoted primary accepts the node's session
+//! (migration 0012, `node-agent-protocol.md` section 7.1).
 //!
 //! The primary's own node agent enrolls through the same endpoint with the
 //! token in `<data_dir>/local-node-join.json` ([`ensure_local_join`]): at first
@@ -626,6 +627,18 @@ async fn enroll(
         (id, Op::Create)
     };
 
+    // The row's own entry comes first: every later entry of this enrollment
+    // names the node, and a rebuild from the log applies them in order
+    // (section 7.3 step 4).
+    let actor = Actor {
+        kind: ActorType::Node,
+        id: node_id.clone(),
+    };
+    let payload = crate::driver::node_payload(&mut w.tx, &node_id)
+        .await
+        .map_err(|e| ApiError::internal(&format!("{e:?}")))?;
+    let seq = changelog::append(&mut w.tx, &actor, "node", &node_id, op, payload).await?;
+
     // Every machine with the `node` role owns a guest subnet (ADR 0144). An
     // adopted row that already has one keeps it.
     if body.roles.contains(&NodeRole::Node) {
@@ -648,10 +661,7 @@ async fn enroll(
                 .await?;
             changelog::append(
                 &mut w.tx,
-                &Actor {
-                    kind: ActorType::Node,
-                    id: node_id.clone(),
-                },
+                &actor,
                 "node",
                 &node_id,
                 Op::Update,
@@ -684,10 +694,7 @@ async fn enroll(
         // Same rule as the insert: the token row travels without its hash.
         changelog::append(
             &mut w.tx,
-            &Actor {
-                kind: ActorType::Node,
-                id: node_id.clone(),
-            },
+            &actor,
             "node_join_token",
             &token_id,
             Op::Update,
@@ -702,7 +709,14 @@ async fn enroll(
         .await?;
     }
 
-    // LOCAL table: the credential hash is never a change-log payload.
+    // Replicated from schema 13 (migration 0012): every insert and update of
+    // the row is a `node_credential` entry carrying the whole row. The row
+    // holds only the SHA-256 of the credential.
+    let had_credential: Option<(String,)> =
+        sqlx::query_as("SELECT node_id FROM node_credentials WHERE node_id = ?")
+            .bind(&node_id)
+            .fetch_optional(&mut *w.tx)
+            .await?;
     sqlx::query(
         "INSERT INTO node_credentials (node_id, credential_hash, created_at, revoked_at) \
          VALUES (?, ?, ?, NULL) \
@@ -714,15 +728,21 @@ async fn enroll(
     .bind(&now)
     .execute(&mut *w.tx)
     .await?;
-
-    let actor = Actor {
-        kind: ActorType::Node,
-        id: node_id.clone(),
+    let credential_op = if had_credential.is_some() {
+        Op::Update
+    } else {
+        Op::Create
     };
-    let payload = crate::driver::node_payload(&mut w.tx, &node_id)
-        .await
-        .map_err(|e| ApiError::internal(&format!("{e:?}")))?;
-    let seq = changelog::append(&mut w.tx, &actor, "node", &node_id, op, payload).await?;
+    let credential_row = credential_payload(&mut w.tx, &node_id).await?;
+    changelog::append(
+        &mut w.tx,
+        &actor,
+        "node_credential",
+        &node_id,
+        credential_op,
+        credential_row,
+    )
+    .await?;
 
     // A machine with the `witness` role gets its mesh address when it
     // enrolls (section 6.12); any other gets it at its first `hello`.
@@ -798,6 +818,32 @@ async fn enroll(
         credential,
         local,
     })
+}
+
+/// The whole `node_credentials` row of `node_id`, as its change-log entry
+/// carries it (migration 0012).
+async fn credential_payload(
+    conn: &mut sqlx::SqliteConnection,
+    node_id: &str,
+) -> Result<Value, ApiError> {
+    let (node_id, credential_hash, created_at, revoked_at): (
+        String,
+        String,
+        String,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT node_id, credential_hash, created_at, revoked_at FROM node_credentials \
+             WHERE node_id = ?",
+    )
+    .bind(node_id)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(json!({
+        "node_id": node_id,
+        "credential_hash": credential_hash,
+        "created_at": created_at,
+        "revoked_at": revoked_at,
+    }))
 }
 
 // ---------------------------------------------------------------------------

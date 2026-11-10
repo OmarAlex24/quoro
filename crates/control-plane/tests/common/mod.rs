@@ -6,6 +6,7 @@
 
 pub mod log;
 pub mod machine;
+pub mod replay;
 
 use quoro_control_plane::auth::setup_token;
 use quoro_control_plane::crypto::DataKey;
