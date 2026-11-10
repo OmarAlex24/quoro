@@ -140,6 +140,14 @@ hash chain, recomputed by verify. Three console helpers exist in mock mode only:
 - `quoroMock.setRole('viewer')` (or `operator`, `owner`) changes the owner's
   role; log out and in again to see the panel as that role.
 
+Nodes opens with the HA view. The mock cluster starts with two voters,
+`lab-3` and `lab-4`, and `lab-edge`, an edge without a vote, so it says that HA
+needs a third vote. **Add the witness role** on `lab-edge` makes it the third
+voter, and the view folds into one line that says HA is ready; **Create a join
+token** shows a witness's join command instead. The tests can make the next
+voter change answer `409 conflict` with `failNextRolesCall()` from
+`src/mocks/handlers-nodes.ts`.
+
 Settings › Providers and Settings › Backups are seeded too: a DNS, a tunnel and
 two object storage providers, and the backup repository `lab-backups` on
 `lab-r2-backups` with its control-plane backups. **Add provider**,
