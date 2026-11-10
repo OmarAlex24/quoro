@@ -309,6 +309,9 @@ impl Session {
             }
             self.hub
                 .set_log_position(&self.node_id, self.generation, 0, false);
+            // Section 8.4, "Acknowledgements": no acknowledgement counts once
+            // the primary answers `log_diverged`.
+            self.hub.drop_countable(&self.node_id, self.generation);
             let text = ControlMessage::Error(quoro_proto::ProtocolError {
                 code: quoro_proto::ErrorCode::LogDiverged,
                 message,
@@ -324,6 +327,10 @@ impl Session {
         } else {
             self.hub
                 .set_log_position(&self.node_id, self.generation, log_seq, false);
+            // ADR 0299: the matched `hello` position counts only once every
+            // revoke sent on this session is answered (held.rs).
+            self.hub
+                .hello_checked(&self.node_id, self.generation, log_seq);
             log_seq
         };
         self.follow = Follow::Active {
@@ -434,6 +441,8 @@ impl Session {
         *outstanding = None;
         self.hub
             .set_log_position(&self.node_id, self.generation, ack.seq, true);
+        self.hub
+            .count_log_ack(&self.node_id, self.generation, ack.seq);
         self.send_log_entries().await;
     }
 

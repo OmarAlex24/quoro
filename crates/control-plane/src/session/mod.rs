@@ -16,6 +16,7 @@
 pub mod desired;
 pub mod drain;
 mod follow;
+mod held;
 mod mesh;
 pub mod serving;
 mod votes;
@@ -379,6 +380,22 @@ struct SessionHandle {
     /// when a session starts and ends, and when the primary answers
     /// `log_diverged` (ADR 0261).
     log_position: Option<LogPosition>,
+    /// Whether [`Session::revoke_stale_leases`] ran to its end for this
+    /// session, its token raises committed (section 8.4,
+    /// "Acknowledgements"; ADR 0299).
+    stale_revoked: bool,
+    /// The `hello.log_seq` the section 7.1 check matched, not countable yet:
+    /// it waits until every `lease_revoke` sent on this session is answered
+    /// ([`NodeHub::latch_hello`]).
+    pending_hello: Option<u64>,
+    /// How many step-4 revokes are held back on this session until support
+    /// returns ("The holder fenced first" step 4): while any is, the `hello`
+    /// position does not count.
+    held_revokes: u32,
+    /// Whether the session finished its start: its first desired state went
+    /// out after the revokes and the fence acknowledgement it waited for
+    /// (section 4.2 rules 3 to 5). A held grant goes out only from then on.
+    start_done: bool,
 }
 
 /// A follower's position in the change log, kept in memory for its live
@@ -418,6 +435,18 @@ struct HubInner {
     /// the `sessions` lock held and taken after it. In memory only: lost when
     /// the primary restarts (section 7.1, "What neither check catches").
     log_acks: Mutex<HashMap<String, u64>>,
+    /// Each node's countable acknowledgement for the grants of a marked row
+    /// (section 8.4, "Acknowledgements"; ADR 0299), apart from `log_acks`:
+    /// the newest `log_ack` a current session accepted, or a `hello`
+    /// position latched by [`NodeHub::latch_hello`], and 0 once the primary
+    /// answered `log_diverged`. Never seeded from `nodes.log_seq` or
+    /// `log_acks`. Written with the `sessions` lock held and taken after it.
+    countable_acks: Mutex<HashMap<String, u64>>,
+    /// The grants of marked rows the primary holds until they may go out
+    /// (section 8.4, "Grants of a marked row"; [`held`]).
+    held: Mutex<held::Registry>,
+    /// Wakes the held-grant task ([`NodeHub::spawn_held_grants`]).
+    held_wake: Notify,
     digests: desired::DigestCache,
     /// `vm_` id to node, kept for VMs whose row is already deleted.
     vm_nodes: Mutex<HashMap<String, String>>,
@@ -564,6 +593,9 @@ impl NodeHub {
             backups,
             sessions: Mutex::new(HashMap::new()),
             log_acks: Mutex::new(HashMap::new()),
+            countable_acks: Mutex::new(HashMap::new()),
+            held: Mutex::new(held::Registry::default()),
+            held_wake: Notify::new(),
             digests: desired::DigestCache::default(),
             vm_nodes: Mutex::new(HashMap::new()),
             tunnels: Mutex::new(None),
@@ -1625,6 +1657,10 @@ impl NodeHub {
                 hello_recorded: false,
                 revokes: 0,
                 log_position: None,
+                stale_revoked: false,
+                pending_hello: None,
+                held_revokes: 0,
+                start_done: false,
             },
         );
         (generation, rx, closed_rx, changed)
@@ -2783,7 +2819,10 @@ impl Session {
                     )
                 })
                 .collect();
-            self.revoke_stale_leases(&hello.leases, outbox).await;
+            if self.revoke_stale_leases(&hello.leases, outbox).await {
+                self.hub
+                    .stale_leases_revoked(&self.node_id, self.generation);
+            }
             if self.has_pending_fence_ack().await {
                 self.start_wait = Some(hello.stored_rev);
                 self.advance_start(outbox).await;
@@ -3117,13 +3156,20 @@ impl Session {
 
     /// Revokes every lease `hello.leases` reports that this primary does not
     /// know, already revoked, holds on another node, or holds with a lower
-    /// token than the node's (sections 5.1 and 4.2 rule 3).
-    async fn revoke_stale_leases(&self, reported: &[wire::HelloLease], outbox: &mut Vec<String>) {
+    /// token than the node's (sections 5.1 and 4.2 rule 3). Returns whether
+    /// it ran to its end without a failed read or write: only then may the
+    /// session's `hello` position count (section 8.4, "Acknowledgements").
+    async fn revoke_stale_leases(
+        &mut self,
+        reported: &[wire::HelloLease],
+        outbox: &mut Vec<String>,
+    ) -> bool {
+        let mut complete = true;
         let mut conn = match self.hub.0.store.pool().acquire().await {
             Ok(conn) => conn,
             Err(e) => {
                 tracing::warn!(%e, node_id = %self.node_id, "cannot read the leases of hello");
-                return;
+                return false;
             }
         };
         // A restore grants its lease again only once the old holder answered
@@ -3152,6 +3198,7 @@ impl Session {
                         Ok(true) => continue,
                         Err(e) => {
                             tracing::warn!(code = %e.code.as_str(), lease_id = %lease.id, "cannot read a lease's release");
+                            complete = false;
                             continue;
                         }
                     }
@@ -3167,20 +3214,21 @@ impl Session {
                     );
                 }
             }
-            Err(e) => tracing::warn!(
-                code = %e.code.as_str(),
-                node_id = %self.node_id,
-                "cannot read the leases restores wait for"
-            ),
-        }
-        if reported.is_empty() {
-            return;
+            Err(e) => {
+                tracing::warn!(
+                    code = %e.code.as_str(),
+                    node_id = %self.node_id,
+                    "cannot read the leases restores wait for"
+                );
+                complete = false;
+            }
         }
         for claimed in reported {
             let row = match leases::by_id(&mut conn, &claimed.lease_id).await {
                 Ok(row) => row,
                 Err(e) => {
                     tracing::warn!(error = %e.code.as_str(), lease_id = %claimed.lease_id, "cannot read a lease");
+                    complete = false;
                     continue;
                 }
             };
@@ -3193,6 +3241,7 @@ impl Session {
                 self.queue_revoke(revoke, released, outbox);
             }
         }
+        complete
     }
 
     /// Answers a `lease_renew` (section 5.5):
@@ -3434,6 +3483,10 @@ impl Session {
     /// A `lease_revoke` this session sent was answered: the session start
     /// may go on, and a pending acknowledgement may go out.
     async fn revoke_answered(&mut self, outbox: &mut Vec<String>) {
+        // ADR 0299: the answer may be the last one the `hello` position
+        // waits for, and a held grant waits for every revoke's answer.
+        self.hub.latch_hello(&self.node_id, self.generation);
+        self.hub.wake_held();
         if self.start_wait.is_some() {
             self.advance_start(outbox).await;
         } else {

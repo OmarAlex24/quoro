@@ -32,8 +32,8 @@
 
 use quoro_proto::wire::{SpecVoter, SpecVotes, SpecWitness};
 use serde_json::Value;
-use sqlx::SqlitePool;
-use std::collections::{BTreeSet, HashMap};
+use sqlx::{SqliteConnection, SqlitePool};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 /// `spec.votes.port`: the TCP port of the vote listener on a voter's mesh
@@ -142,11 +142,18 @@ impl VoterSet {
 struct NodeFacts {
     roles: Vec<String>,
     removed: bool,
+    /// The `seq` of the entry that turned the node `removed`, its removal
+    /// entry (sections 8.4 and 10), while it is.
+    removed_at: Option<u64>,
 }
 
 impl NodeFacts {
     fn votes(&self) -> bool {
         !self.removed && is_voter_roles(&self.roles)
+    }
+
+    fn has_node_role(&self) -> bool {
+        self.roles.iter().any(|role| role == "node")
     }
 
     /// Merges the fields an entry's payload writes (ADR 0297): `roles` and
@@ -194,6 +201,13 @@ impl Replay {
                 .or_default()
                 .merge(payload),
         }
+        if let Some(facts) = self.nodes.get_mut(node_id) {
+            if facts.removed {
+                facts.removed_at.get_or_insert(seq);
+            } else {
+                facts.removed_at = None;
+            }
+        }
         let after = self.nodes.get(node_id).is_some_and(NodeFacts::votes);
         if before != after {
             self.version = seq;
@@ -208,6 +222,56 @@ impl Replay {
             .filter(|(_, facts)| facts.votes())
             .map(|(node_id, _)| node_id.as_str())
             .collect()
+    }
+}
+
+/// The machines whose acknowledgement a write must have before it is
+/// replicated (`node-agent-protocol.md` section 8.4, "When R is
+/// replicated"): every machine with the `node` role, from its enrollment
+/// entry on, and a removed one until its removal entry is itself replicated
+/// over the others. A primary host without the `node` role is not in it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RequiredSet {
+    /// Every machine with the `node` role that is not removed, in the
+    /// `nodes` rows or in the change-log replay: where the two disagree, the
+    /// machine counts, which waits longer, never shorter.
+    pub members: BTreeSet<String>,
+    /// Every removed machine with the `node` role, with the `seq` of its
+    /// removal entry as the change log carries it.
+    pub removed: BTreeMap<String, u64>,
+}
+
+impl RequiredSet {
+    /// Whether `seq` is replicated over the set, given each machine's
+    /// countable acknowledgement (`acked`): `Err` lists the machines that
+    /// have not acknowledged it, oldest id first (`Lease.grant_waiting_on`).
+    ///
+    /// A removed machine is still in the set while some member that is not
+    /// removed has not acknowledged its removal entry. Two removals pending
+    /// at once do not hold each other in, because only members count for a
+    /// removal entry ("A removed machine", ADR 0280).
+    ///
+    /// # Errors
+    ///
+    /// The machines that have not acknowledged `seq`.
+    pub fn replicated(&self, seq: u64, acked: impl Fn(&str) -> u64) -> Result<(), Vec<String>> {
+        let mut waiting: BTreeSet<&str> = self
+            .members
+            .iter()
+            .map(String::as_str)
+            .filter(|id| acked(id) < seq)
+            .collect();
+        for (id, removal) in &self.removed {
+            let still_in = self.members.iter().any(|member| acked(member) < *removal);
+            if still_in && acked(id) < seq {
+                waiting.insert(id);
+            }
+        }
+        if waiting.is_empty() {
+            Ok(())
+        } else {
+            Err(waiting.into_iter().map(str::to_string).collect())
+        }
     }
 }
 
@@ -345,6 +409,65 @@ impl VoterLog {
         Ok(set)
     }
 
+    /// The required set of section 8.4 ("When R is replicated",
+    /// [`RequiredSet`]), read on `conn`: the replay kept in memory, the
+    /// `node` entries after it and the `nodes` rows. The removal entries come
+    /// from the same replay that gives the voter-set version, so a promoted
+    /// primary with the same log gets the same set. The kept replay is not
+    /// advanced, because `conn` may be a write transaction whose entries
+    /// could still roll back. Nodes are never deleted (a removal is a
+    /// status), so a `delete` entry, which the replay drops, never occurs.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or a `roles` column that is not a list of roles.
+    pub async fn required_set(&self, conn: &mut SqliteConnection) -> Result<RequiredSet, String> {
+        let mut replay = self.cache().replay.clone();
+        let read = |e: sqlx::Error| format!("cannot read the required set: {e}");
+        let entries: Vec<(i64, String, String, String)> = sqlx::query_as(
+            "SELECT seq, op, entity_id, payload FROM change_log \
+             WHERE entity_type = 'node' AND seq > ? ORDER BY seq",
+        )
+        .bind(i64::try_from(replay.applied).unwrap_or(i64::MAX))
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(read)?;
+        let rows: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT id, roles, status FROM nodes")
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(read)?;
+        for (seq, op, node_id, payload) in entries {
+            let seq = u64::try_from(seq).unwrap_or(0);
+            let payload: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
+            replay.apply(seq, &op, &node_id, &payload);
+        }
+        let mut set = RequiredSet::default();
+        for (node_id, roles, status) in rows {
+            let roles: Vec<String> = serde_json::from_str(&roles)
+                .map_err(|e| format!("cannot read the roles of {node_id}: {e}"))?;
+            if status != "removed" && roles.iter().any(|role| role == "node") {
+                set.members.insert(node_id);
+            }
+        }
+        for (node_id, facts) in &replay.nodes {
+            if !facts.has_node_role() {
+                continue;
+            }
+            match facts.removed_at {
+                Some(removal) if facts.removed => {
+                    if !set.members.contains(node_id) {
+                        set.removed.insert(node_id.clone(), removal);
+                    }
+                }
+                _ => {
+                    set.members.insert(node_id.clone());
+                }
+            }
+        }
+        Ok(set)
+    }
+
     /// The newest set [`VoterLog::current`] read, `None` before the first.
     #[must_use]
     pub fn latest(&self) -> Option<Arc<VoterSet>> {
@@ -429,6 +552,65 @@ mod tests {
         replay.apply(15, "delete", "nod_w", &json!({}));
         assert_eq!(replay.version, 15);
         assert_eq!(replay.applied, 15);
+    }
+
+    /// Section 8.4, "A removed machine": the replay keeps each removal
+    /// entry's `seq`; a removed machine stays in the required set until
+    /// every member has acknowledged its removal entry, and two removals
+    /// pending at once do not hold each other in.
+    #[test]
+    fn a_removed_machine_leaves_the_set_once_the_others_acknowledged_its_removal() {
+        let mut replay = Replay::default();
+        replay.apply(1, "create", "nod_a", &node(&["node"], "pending"));
+        replay.apply(2, "create", "nod_b", &node(&["node"], "pending"));
+        replay.apply(3, "create", "nod_c", &node(&["node"], "pending"));
+        replay.apply(4, "create", "nod_d", &node(&["node"], "pending"));
+        replay.apply(5, "create", "nod_w", &node(&["witness"], "pending"));
+        replay.apply(6, "update", "nod_c", &json!({ "status": "removed" }));
+        replay.apply(
+            7,
+            "update",
+            "nod_c",
+            &json!({ "status": "removed", "name": "c" }),
+        );
+        replay.apply(8, "update", "nod_d", &json!({ "status": "removed" }));
+        assert_eq!(
+            replay.nodes["nod_c"].removed_at,
+            Some(6),
+            "the first removal entry"
+        );
+        assert_eq!(replay.nodes["nod_d"].removed_at, Some(8));
+        let set = RequiredSet {
+            members: ["nod_a", "nod_b"].map(str::to_string).into(),
+            removed: [("nod_c".to_string(), 6), ("nod_d".to_string(), 8)].into(),
+        };
+        let acks = |acks: &'static [(&'static str, u64)]| {
+            move |id: &str| {
+                acks.iter()
+                    .find(|(node, _)| *node == id)
+                    .map_or(0, |(_, seq)| *seq)
+            }
+        };
+        // Neither removal is acknowledged by B: C and D still count.
+        assert_eq!(
+            set.replicated(9, acks(&[("nod_a", 9), ("nod_b", 5)])),
+            Err(["nod_b", "nod_c", "nod_d"].map(str::to_string).to_vec())
+        );
+        // B acknowledged C's removal but not D's: D still counts. C does not,
+        // and D's own acknowledgement never counts for C.
+        assert_eq!(
+            set.replicated(9, acks(&[("nod_a", 9), ("nod_b", 9), ("nod_d", 0)])),
+            Ok(()),
+            "both removals acknowledged by every member"
+        );
+        assert_eq!(
+            set.replicated(9, acks(&[("nod_a", 9), ("nod_b", 7)])),
+            Err(["nod_b", "nod_d"].map(str::to_string).to_vec())
+        );
+        assert_eq!(
+            set.replicated(7, acks(&[("nod_a", 9), ("nod_b", 7), ("nod_d", 7)])),
+            Ok(())
+        );
     }
 
     /// Section 6.12: `spec.votes` on every voter, `spec.witness` on one with
