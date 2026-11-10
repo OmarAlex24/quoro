@@ -3836,7 +3836,8 @@ impl Session {
     ///     longer of the conversion's and the answer's duration (ADR 0244,
     ///     ADR 0254, ADR 0257);
     ///   - a settle this session's `hello` registered is answered, with no
-    ///     write, and a `ping` follows; its `pong` writes the row (section
+    ///     write, and a `ping` follows; its `pong` writes the row if the
+    ///     row's newest write is still the one this answer read (section
     ///     8.4, "Settling a lease");
     ///   - an `expiring` row at the renewal's token is answered with a
     ///     `lease_grant` at that token, `mode` `expiring`, for `D`, with `re`
@@ -4000,6 +4001,21 @@ impl Session {
             };
             (duration_ms, lease)
         };
+        // A settling answer: the row's newest write as this transaction
+        // leaves it, after its own raise, for the `pong` to find again
+        // ([`Session::ping_to_settle`]).
+        let settle = matches!(plan, Plan::Settle | Plan::Ordinary { settle: true });
+        let settle_seq = if settle {
+            match leases::newest_write_seq(&mut w.tx, lease_id).await {
+                Ok(seq) => seq,
+                Err(e) => {
+                    tracing::warn!(code = %e.code.as_str(), lease_id, "cannot read a lease's newest write");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         // Refused, the transaction rolls back, raise or write and all.
         let sent_wall = time::OffsetDateTime::now_utc();
         if let Err(refused) = self.hub.0.authority.record_grant(&Grant {
@@ -4042,8 +4058,8 @@ impl Session {
                 .to_frame(&new_msg_id(), Some(re))
                 .to_text(),
         );
-        if matches!(plan, Plan::Settle | Plan::Ordinary { settle: true }) {
-            self.ping_to_settle(lease_id, token, outbox);
+        if settle {
+            self.ping_to_settle(lease_id, token, settle_seq, outbox);
         }
     }
 

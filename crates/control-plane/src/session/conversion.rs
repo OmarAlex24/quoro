@@ -22,13 +22,16 @@
 //! - **The settle.** A renewal of the holder answered on this session, then
 //!   a `ping`; once its `pong` arrives, one write gives the row the holder's
 //!   token, `mode` `expiring`, the longest duration granted on the session,
-//!   and clears the unsettled mark. It starts in two ways: the holder's
-//!   `hello` lists the lease `expiring` (`held` or `uncertain`) while the
-//!   policy is `warm`, over a marked row or over a `local` row at its token
-//!   (a conversion whose first renewal this primary never answered); or a
-//!   renewal of a marked `expiring` row at its token while the policy is
-//!   `warm`, the first renewal after an `expiring` grant with a new token,
-//!   such as a failover's or a regrant's ("The mark").
+//!   and clears the unsettled mark. The `ping` records the row's newest
+//!   change-log write as the answer's transaction left it, and the `pong`
+//!   settles only a row still at that write: any write in between refuses
+//!   it, and the holder's next renewal pings again. It starts in two ways:
+//!   the holder's `hello` lists the lease `expiring` (`held` or
+//!   `uncertain`) while the policy is `warm`, over a marked row or over a
+//!   `local` row at its token (a conversion whose first renewal this primary
+//!   never answered); or a renewal of a marked `expiring` row at its token
+//!   while the policy is `warm`, the first renewal after an `expiring` grant
+//!   with a new token, such as a failover's or a regrant's ("The mark").
 //!
 //! Not built here: sending the conversion grant, the holder's `local` report,
 //! R and the same-token `local` grant with its `ping` (issue #555).
@@ -55,9 +58,19 @@ pub(super) struct Settles {
     reported: HashMap<String, u64>,
     /// The longest `duration_ms` this session granted for each lease.
     granted: HashMap<String, u64>,
-    /// Each settling `ping` not answered yet: its message id, the lease and
-    /// the holder's token.
-    pings: HashMap<String, (String, u64)>,
+    /// Each settling `ping` not answered yet, by its message id.
+    pings: HashMap<String, Pinged>,
+}
+
+/// What a settling `ping` stands for: the lease, the holder's token, and the
+/// `seq` of the row's newest change-log write as the settling answer's
+/// transaction left it ([`leases::newest_write_seq`]), `None` for a row the
+/// log has no entry of.
+#[derive(Debug)]
+struct Pinged {
+    lease_id: String,
+    token: u64,
+    seq: Option<u64>,
 }
 
 impl Settles {
@@ -101,7 +114,12 @@ pub(super) fn plan(
 ) -> Plan {
     let row_token = lease_token(row);
     let local = row.mode != "expiring";
-    if let Some(in_flight) = in_flight.filter(|in_flight| in_flight.token == token) {
+    // A conversion keeps the row's token (ADR 0258): one in flight at a token
+    // the row does not hold is answered neither as the first renewal nor as
+    // ended, and the renewal falls through to the arms below.
+    if let Some(in_flight) =
+        in_flight.filter(|in_flight| in_flight.token == token && row_token == token)
+    {
         // Section 8.4 "Changing the mode" (#555): a policy change off
         // `warm` (R) ends a conversion in flight; the primary answers the
         // holder's renewals as "From R until the holder has taken the grant"
@@ -111,7 +129,7 @@ pub(super) fn plan(
         if row.unsettled || !warm {
             return Plan::Ended(in_flight);
         }
-        if local && row_token == token {
+        if local {
             return Plan::Converted(in_flight);
         }
     }
@@ -258,19 +276,36 @@ impl Session {
     /// unless one is already unanswered for it on this session: its `pong`
     /// proves the node received every answer sent before it (section 4.2),
     /// and the row write takes the longest duration granted on the session,
-    /// which covers any answer sent after it.
-    pub(super) fn ping_to_settle(&mut self, lease_id: &str, token: u64, outbox: &mut Vec<String>) {
+    /// which covers any answer sent after it. `seq` is the row's newest
+    /// change-log write as the settling answer's transaction left it, read
+    /// after any write that transaction made and before its commit: the
+    /// `pong` settles only a row still at that write ([`Session::on_pong`]).
+    /// An unanswered `ping` keeps the `seq` of the answer it followed.
+    pub(super) fn ping_to_settle(
+        &mut self,
+        lease_id: &str,
+        token: u64,
+        seq: Option<u64>,
+        outbox: &mut Vec<String>,
+    ) {
         if self
             .settles
             .pings
             .values()
-            .any(|(pinged, _)| pinged == lease_id)
+            .any(|pinged| pinged.lease_id == lease_id)
         {
             return;
         }
         let id = new_msg_id();
         outbox.push(ControlMessage::Ping.to_frame(&id, None).to_text());
-        self.settles.pings.insert(id, (lease_id.to_string(), token));
+        self.settles.pings.insert(
+            id,
+            Pinged {
+                lease_id: lease_id.to_string(),
+                token,
+                seq,
+            },
+        );
     }
 
     /// A `pong` (section 5.20): when it answers a settling `ping`, the row is
@@ -278,6 +313,11 @@ impl Session {
     /// transaction that finds, again:
     ///
     /// - this session still the node's;
+    /// - the row as the settling answer read it: its newest change-log
+    ///   write is still the one the `ping` recorded. The `pong` proves the
+    ///   node received that answer, not that nothing written since changed
+    ///   what the node holds, so any write of the row in between refuses the
+    ///   settle;
     /// - the row naming the node, unrevoked, at a token no higher than the
     ///   holder's, and still to settle (marked, or reading `local`);
     /// - no failed fence of the lease, recorded or not (section 8.5);
@@ -286,13 +326,21 @@ impl Session {
     /// The write takes the holder's token, `mode` `expiring`, the longest
     /// duration granted on this session but never less than the stored one,
     /// and clears the mark ([`leases::settle`]). Anything else writes nothing:
-    /// the row keeps the mark and moves only as a `local` lease does.
+    /// the row keeps the mark and moves only as a `local` lease does. The
+    /// `ping` is spent either way, so the holder's next renewal that plans a
+    /// settle sends a new one, recorded against the row as that answer reads
+    /// it.
     pub(super) async fn on_pong(&mut self, re: Option<&str>) {
-        let Some((lease_id, token)) = re.and_then(|re| self.settles.pings.remove(re)) else {
+        let Some(pinged) = re.and_then(|re| self.settles.pings.remove(re)) else {
             return;
         };
+        let Pinged {
+            lease_id,
+            token,
+            seq,
+        } = pinged;
         let granted = self.settles.granted.get(&lease_id).copied().unwrap_or(0);
-        match self.settle_row(&lease_id, token, granted).await {
+        match self.settle_row(&lease_id, token, seq, granted).await {
             Ok(Some(lease)) => {
                 self.settles.reported.remove(&lease_id);
                 tracing::info!(
@@ -312,10 +360,14 @@ impl Session {
         }
     }
 
+    /// The settle's write ([`Session::on_pong`]), at the holder's `token`,
+    /// if the row's newest change-log write is still `seq`, the one the
+    /// settling answer read, and every other check holds again.
     async fn settle_row(
         &self,
         lease_id: &str,
         token: u64,
+        seq: Option<u64>,
         granted: u64,
     ) -> Result<Option<Lease>, crate::error::ApiError> {
         let mut w = self.hub.0.store.begin_write().await?;
@@ -326,7 +378,8 @@ impl Session {
             return Ok(None);
         };
         let to_settle = row.unsettled || row.mode != "expiring";
-        if row.holder_node_id != self.node_id
+        if leases::newest_write_seq(&mut w.tx, lease_id).await? != seq
+            || row.holder_node_id != self.node_id
             || row.is_revoked()
             || lease_token(&row) > token
             || !to_settle
@@ -382,6 +435,7 @@ mod tests {
     use super::{InFlight, Plan, plan};
     use crate::AppState;
     use crate::authority::{ManualClock, MonotonicClock, VoterSupport};
+    use crate::changelog::{self, Actor, ActorType, Op};
     use crate::leases::{self, Lease};
     use crate::session::Session;
     use quoro_proto::wire::{self, NodeMessage};
@@ -1054,6 +1108,141 @@ mod tests {
         f.done();
     }
 
+    /// Section 8.4, "Settling a lease": a write of the row between the
+    /// settle's answer and its `pong` refuses the settle, even when every
+    /// other check passes again by the `pong`. Here the row is written
+    /// `local`, marked, at the same token, while the policy is still `warm`,
+    /// as R would write it if the policy left `warm` and came back. The
+    /// `pong` writes nothing. The next renewal is answered and pings again,
+    /// and its `pong` settles the row as it then reads.
+    #[tokio::test]
+    async fn a_row_written_after_the_settles_answer_is_not_settled_at_its_pong() {
+        let f = fixture("warm", "expiring", Some(D as i64), true).await;
+        let (mut session, _) = f.session(Some(("held", LeaseMode::Expiring, 3))).await;
+        let answer = renew(&mut session, "msg_r1", 3).await;
+        assert_answer(&answer, "msg_r1", 3, D);
+        let ping = ping_of(&answer);
+
+        write_row(&f, "UPDATE leases SET mode = 'local' WHERE id = ?").await;
+        let writes = f.writes().await;
+        pong(&mut session, &ping).await;
+        let row = f.row().await;
+        assert_eq!(
+            (row.mode.as_str(), row.unsettled),
+            ("local", true),
+            "the row changed since the answer: no settle"
+        );
+        assert_eq!(f.writes().await, writes);
+
+        let again = renew(&mut session, "msg_r2", 3).await;
+        assert_answer(&again, "msg_r2", 3, D);
+        let ping = ping_of(&again);
+        pong(&mut session, &ping).await;
+        let row = f.row().await;
+        assert_eq!(
+            (row.mode.as_str(), row.fencing_token, row.unsettled),
+            ("expiring", 3, false)
+        );
+        assert_eq!(f.writes().await, writes + 1);
+        f.done();
+    }
+
+    /// The same refusal on the ordinary path, with a duration raise between
+    /// the answer and the `pong`; the settle's answer reads the row after
+    /// its own raise, so that raise does not refuse it. The first answer
+    /// raises the stored 10 s to `D`; a raise to 30 s then refuses its
+    /// `pong`. The next renewal pings again, and its `pong` settles at 30 s.
+    #[tokio::test]
+    async fn a_duration_raise_after_the_settles_answer_waits_for_the_next_renewal() {
+        let f = fixture("warm", "expiring", Some(10_000), true).await;
+        let (mut session, _) = f.session(None).await;
+        let writes = f.writes().await;
+        let answer = renew(&mut session, "msg_r1", 3).await;
+        assert_answer(&answer, "msg_r1", 3, D);
+        assert_eq!(f.writes().await, writes + 1, "the answer's own raise");
+        let ping = ping_of(&answer);
+
+        let mut w = f.state.store.begin_write().await.unwrap();
+        leases::raise_duration(&mut w, LEASE, 30_000, &actor())
+            .await
+            .unwrap()
+            .unwrap();
+        w.commit().await.unwrap();
+        pong(&mut session, &ping).await;
+        assert!(f.row().await.unsettled, "raised since the answer");
+        assert_eq!(f.writes().await, writes + 2);
+
+        let again = renew(&mut session, "msg_r2", 3).await;
+        assert_answer(&again, "msg_r2", 3, D);
+        pong(&mut session, &ping_of(&again)).await;
+        let row = f.row().await;
+        assert_eq!(
+            (row.mode.as_str(), row.duration_ms, row.unsettled),
+            ("expiring", Some(30_000), false)
+        );
+        assert_eq!(f.writes().await, writes + 3);
+        f.done();
+    }
+
+    /// A settling answer that raises the stored duration reads the row's
+    /// newest write after its own raise: the raise is the answer's, and its
+    /// `pong` settles the row at `D`.
+    #[tokio::test]
+    async fn a_settles_own_raise_does_not_refuse_its_pong() {
+        let f = fixture("warm", "expiring", Some(10_000), true).await;
+        let (mut session, _) = f.session(None).await;
+        let writes = f.writes().await;
+        let answer = renew(&mut session, "msg_r1", 3).await;
+        assert_answer(&answer, "msg_r1", 3, D);
+        assert_eq!(f.writes().await, writes + 1, "the answer's own raise");
+        pong(&mut session, &ping_of(&answer)).await;
+        let row = f.row().await;
+        assert_eq!(
+            (row.mode.as_str(), row.duration_ms, row.unsettled),
+            ("expiring", Some(D as i64), false)
+        );
+        assert_eq!(f.writes().await, writes + 2);
+        f.done();
+    }
+
+    /// The one settling `ping` among `frames`: its message id.
+    fn ping_of(frames: &[Value]) -> String {
+        let pings = of_type(frames, "ping");
+        assert_eq!(pings.len(), 1, "{frames:?}");
+        pings[0]["id"].as_str().unwrap().to_string()
+    }
+
+    fn actor() -> Actor {
+        Actor {
+            kind: ActorType::System,
+            id: "test".to_string(),
+        }
+    }
+
+    /// Runs `update` (bound to the lease's id) on the row and appends its
+    /// change-log entry, in one single-writer transaction, as any write of
+    /// the row does.
+    async fn write_row(f: &Fixture, update: &str) {
+        let mut w = f.state.store.begin_write().await.unwrap();
+        sqlx::query(update)
+            .bind(LEASE)
+            .execute(&mut *w.tx)
+            .await
+            .unwrap();
+        let lease = leases::by_id(&mut w.tx, LEASE).await.unwrap().unwrap();
+        changelog::append(
+            &mut w.tx,
+            &actor(),
+            "lease",
+            LEASE,
+            Op::Update,
+            lease.payload(),
+        )
+        .await
+        .unwrap();
+        w.commit().await.unwrap();
+    }
+
     fn row(mode: &str, token: i64, unsettled: bool) -> Lease {
         Lease {
             id: LEASE.to_string(),
@@ -1099,6 +1288,16 @@ mod tests {
             Plan::Ended(conv)
         );
         assert_eq!(plan(&local, 3, Some(conv), None, false), Plan::Ended(conv));
+        // Neither ends a conversion at a token the row does not hold: the
+        // plan falls through to the later arms.
+        let below = row("local", 2, false);
+        let marked_below = row("local", 2, true);
+        assert!(unanswered(plan(&marked_below, 3, Some(conv), None, true)));
+        assert!(unanswered(plan(&below, 3, Some(conv), None, false)));
+        assert_eq!(
+            plan(&marked_below, 3, Some(conv), Some(3), true),
+            Plan::Settle
+        );
         // The settle from `hello`, at the holder's token.
         assert_eq!(plan(&local, 3, None, Some(3), true), Plan::Settle);
         assert_eq!(plan(&marked, 5, None, Some(5), true), Plan::Settle);
