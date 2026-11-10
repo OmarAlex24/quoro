@@ -3356,7 +3356,15 @@ impl Session {
         )
         .await
         {
-            Ok(rows) => rows.into_iter().map(|row| (row.id.clone(), row)).collect(),
+            // Section 8.5 step 1: a failed fence this primary could not
+            // record takes the row out of step 4 as a recorded one does
+            // ([`leases::is_step4`]), so a listing below the row's token gets
+            // the revoke of section 5.1, and no grant goes out for it.
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|row| !self.hub.unrecorded_failure(&row.id))
+                .map(|row| (row.id.clone(), row))
+                .collect(),
             Err(e) => {
                 tracing::warn!(code = %e.code.as_str(), node_id = %self.node_id, "cannot read the step-4 rows of the node");
                 complete = false;
@@ -3381,12 +3389,6 @@ impl Session {
                     // revoke at the token it reports comes first (section
                     // 4.2 rule 3, ADR 0258, ADR 0299), and without majority
                     // support neither goes out until support returns.
-                    if self.hub.unrecorded_failure(&row.id) {
-                        // No grant follows on this session, so no revoke
-                        // goes before it.
-                        eligible.push((row.clone(), None));
-                        continue;
-                    }
                     let same_mode = matches!(claimed.mode, quoro_proto::LeaseMode::Expiring)
                         == (row.mode == "expiring");
                     let other_mode_held =
@@ -3521,13 +3523,6 @@ impl Session {
         }
         for (row, revoke_first) in eligible {
             self.step4_eligible.insert(row.id.clone());
-            // Section 8.5 step 1: a failed fence this primary could not
-            // record holds the grant like a recorded one, so the row is a
-            // step-4 row that nothing goes out for on this session, and no
-            // regrant mints a token over it.
-            if self.hub.unrecorded_failure(&row.id) {
-                continue;
-            }
             self.hub.held_eligible(&row, self.generation, revoke_first);
         }
         for row in &held_by_node {
