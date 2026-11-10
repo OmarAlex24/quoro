@@ -510,7 +510,7 @@ pub(crate) async fn bump_tokens(
         if lease.holder_node_id != holder {
             continue;
         }
-        lease.fencing_token = lease.fencing_token.max(0) + 1;
+        lease.fencing_token = lease.fencing_token.max(0).saturating_add(1);
         if lease.revoked_at.is_none() {
             lease.revoked_at = Some(now.clone());
         }
@@ -526,15 +526,27 @@ pub(crate) async fn bump_tokens(
     Ok(bumped)
 }
 
+/// The highest token any primary issues (section 8.5): 2^53 − 1, the highest
+/// integer canonical JSON carries (`quoro_proto::jcs`), since every lease
+/// write puts its token in the change log.
+pub(crate) const MAX_TOKEN: i64 = (1 << 53) - 1;
+
 /// The marked-row raise of ADR 0285 ("The mark"): `lister`, a node the
 /// row of `lease_id` does not name, lists the lease `held` or `uncertain` at
 /// `reported`. When the row carries the mark and its token is not already
-/// above `reported`, one write raises the token to `reported + 1` and
-/// records the row revoked in the primary's view (`revoked_at`), as declaring
-/// a node lost does, with its change-log entry. It keeps the mark, sets no
-/// `lost_at` and emits no event, so the holder the row still names is not
-/// declared lost. An unmarked row is never raised this way (section 9 step
-/// 2). Returns the row when it changed.
+/// above `reported`, one write raises the token to `reported + 1`, at most
+/// [`MAX_TOKEN`], and records the row revoked in the primary's view
+/// (`revoked_at`), as declaring a node lost does, with its change-log entry.
+/// It keeps the mark, sets no `lost_at` and emits no event, so the holder the
+/// row still names is not declared lost. An unmarked row is never raised this
+/// way (section 9 step 2). Returns the row when it changed.
+///
+/// The token caps at [`MAX_TOKEN`] because the change log refuses a higher
+/// one, and a node that reports `2^53 − 1` or more (a corrupted or forged
+/// store, section 8.5) would otherwise fail the raise, and so its session
+/// start, on every session. A row already at or above the capped token and
+/// already revoked is not written again, so a redial does not move the row's
+/// newest write.
 ///
 /// # Errors
 ///
@@ -553,7 +565,11 @@ pub(crate) async fn raise_for_other_lister(
     if !lease.unsettled || lease.holder_node_id == lister || lease.fencing_token > reported {
         return Ok(None);
     }
-    lease.fencing_token = reported.saturating_add(1);
+    let raised = reported.saturating_add(1).min(MAX_TOKEN);
+    if lease.fencing_token >= raised && lease.is_revoked() {
+        return Ok(None);
+    }
+    lease.fencing_token = lease.fencing_token.max(raised);
     if lease.revoked_at.is_none() {
         lease.revoked_at = Some(now_rfc3339());
     }
@@ -829,7 +845,7 @@ pub(crate) async fn grant_app_lease(
     }
     let token = previous
         .as_ref()
-        .map_or(1, |lease| lease.fencing_token.max(0) + 1);
+        .map_or(1, |lease| lease.fencing_token.max(0).saturating_add(1));
     let op = if previous.is_some() {
         Op::Update
     } else {
@@ -1107,6 +1123,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stored, Some(15_000));
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    /// Section 8.5: no primary issues a token above 2^53 − 1. A new token
+    /// over a row at that token, or at a corrupted one above it, is an error
+    /// answer, never a panic, and writes nothing: a regrant, a restore, a
+    /// failover and `createVolume` mint through `grant_app_lease`, and
+    /// declaring a node lost or acknowledging a failed fence through
+    /// `bump_tokens`.
+    #[tokio::test]
+    async fn a_new_token_above_the_highest_is_an_error_not_a_panic() {
+        let (store, lease, actor, data_dir) = store_with_lease().await;
+        let authority = Authority::new(Arc::new(crate::authority::SystemMonotonic::default()));
+        authority.set_support(Arc::new(EverySupport));
+        for token in [super::MAX_TOKEN, i64::MAX] {
+            sqlx::query("UPDATE leases SET fencing_token = ?, revoked_at = ? WHERE id = ?")
+                .bind(token)
+                .bind("2026-11-07T11:00:00Z")
+                .bind(&lease.id)
+                .execute(store.pool())
+                .await
+                .unwrap();
+            let mut w = store.begin_write().await.unwrap();
+            let granted = super::grant_app_lease(
+                &mut w.tx,
+                &authority,
+                "app_x",
+                &lease.holder_node_id,
+                &actor,
+                false,
+            )
+            .await;
+            assert!(granted.is_err(), "{token}: {granted:?}");
+            drop(w);
+            let mut w = store.begin_write().await.unwrap();
+            let bumped = super::bump_tokens(
+                &mut w.tx,
+                std::slice::from_ref(&lease.id),
+                &lease.holder_node_id,
+                &actor,
+            )
+            .await;
+            assert!(bumped.is_err(), "{token}: {bumped:?}");
+            drop(w);
+            let stored: i64 = sqlx::query_scalar("SELECT fencing_token FROM leases WHERE id = ?")
+                .bind(&lease.id)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+            assert_eq!(stored, token);
+        }
         std::fs::remove_dir_all(&data_dir).unwrap();
     }
 

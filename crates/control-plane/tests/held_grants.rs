@@ -1677,3 +1677,86 @@ async fn a_marked_row_listed_held_at_its_token_gets_no_grant_at_the_session_star
     assert!(grants_of(&frames, &lease_id).is_empty(), "{frames:?}");
     assert_eq!(row(&server, &lease_id).await, marked);
 }
+
+/// The highest token any primary issues (section 8.5): 2^53 − 1.
+const MAX_TOKEN: u64 = (1 << 53) - 1;
+
+/// "The mark" (ADR 0285) at the highest token. B, which the marked row does
+/// not name, lists the lease `held` at 2^53 − 1. No write can raise the row
+/// above it (section 8.5), so the raise stops there and records the row
+/// revoked: B gets its `welcome` and the revoke at the token it reports, the
+/// row keeps the mark, and A's next session gets no grant with every write
+/// replicated and supported. B's next session lists the same, and the row
+/// is not written again.
+#[tokio::test]
+async fn a_marked_row_listed_at_the_highest_token_is_revoked_at_that_token() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    manual_clock(&server);
+    let a = enroll(&server, &owner, "node-a", &["node"]).await;
+    let b = enroll(&server, &owner, "node-b", &["node"]).await;
+    let (mut on_a, _) = session(&server, &a, None, Vec::new(), true).await;
+    heartbeat(&mut on_a).await;
+    let project_id = project(&server, &owner).await;
+    let (app_id, lease_id) = warm_volume(&server, &owner, &project_id, "web", &a).await;
+    let listing = vec![listed(
+        &lease_id,
+        &app_id,
+        LeaseMode::Local,
+        MAX_TOKEN,
+        "held",
+    )];
+    let capped = (
+        i64::try_from(MAX_TOKEN).unwrap(),
+        "expiring".to_string(),
+        Some(15_000),
+        1,
+        true,
+    );
+
+    let mut hello = hello_body(&b.node_id);
+    hello.leases = listing.clone();
+    let (frames, closed) = serve_until_closed(&server, &b, hello, Duration::from_secs(3)).await;
+    assert!(!closed, "the session goes on: {frames:?}");
+    assert!(
+        frames.iter().any(|frame| frame["type"] == "welcome"),
+        "{frames:?}"
+    );
+    let revokes = revokes_of(&frames, &lease_id);
+    assert_eq!(revokes.len(), 1, "{frames:?}");
+    assert_eq!(revokes[0]["body"]["fencing_token"], MAX_TOKEN);
+    assert_eq!(
+        row(&server, &lease_id).await,
+        capped,
+        "capped, revoked, the mark kept"
+    );
+    wait_disconnected(&server, &b).await;
+
+    // B's next session: the revoke again, and no second write.
+    let written = newest_write(&server, &lease_id).await;
+    let (mut on_b, frames) = session(&server, &b, None, listing, true).await;
+    let revokes = revokes_of(&frames, &lease_id);
+    assert_eq!(revokes.len(), 1, "{frames:?}");
+    assert_eq!(revokes[0]["body"]["fencing_token"], MAX_TOKEN);
+    assert_eq!(row(&server, &lease_id).await, capped);
+    assert_eq!(
+        newest_write(&server, &lease_id).await,
+        written,
+        "no new entry"
+    );
+    on_b.send(ok_result(None), revokes[0]["id"].as_str()).await;
+    on_b.settle().await;
+
+    // A's next session: replicated and supported, and nothing goes out.
+    let (mut on_a, frames) = session(&server, &a, Some(on_a.log.clone()), Vec::new(), true).await;
+    let head = log_head(&server).await;
+    let mut seen = frames;
+    seen.extend(follow_to(&mut on_a, head).await);
+    follow_to(&mut on_b, head).await;
+    seen.extend(support_keeping_frames(&mut on_a).await);
+    on_b.support().await;
+    assert!(server.state.hub.authority().supports(D));
+    seen.extend(after_a_tick(&mut on_a).await);
+    assert!(grants_of(&seen, &lease_id).is_empty(), "{seen:?}");
+    assert_eq!(pending(&server, &owner, &app_id).await, (false, Vec::new()));
+}
