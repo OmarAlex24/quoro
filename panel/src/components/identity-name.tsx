@@ -47,9 +47,9 @@ const useUserLabel = (id: string): { name: string | null; self: boolean } => {
   return { name: named?.name ?? null, self: false };
 };
 
-export function UserName({ id }: { id: string }) {
+export function UserName({ id, plain = false }: { id: string; plain?: boolean }) {
   const { name, self } = useUserLabel(id);
-  return <span title={id}>{personLabel(id, name, self)}</span>;
+  return <span title={id}>{personLabel(id, name, self && !plain)}</span>;
 }
 
 /** The round initials avatar for a user id; a neutral mark until the name is known. */

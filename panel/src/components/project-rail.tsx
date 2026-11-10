@@ -256,7 +256,7 @@ function DeployList({ rows, now, projectId }: { rows: readonly DeployRow[]; now:
                 {row.actor ? (
                   <>
                     {' · '}
-                    {row.actor.type === 'user' ? <UserName id={row.actor.id} /> : <AgentName id={row.actor.id} link={false} />}
+                    {row.actor.type === 'user' ? <UserName id={row.actor.id} plain /> : <AgentName id={row.actor.id} link={false} />}
                   </>
                 ) : null}
                 {' · '}
