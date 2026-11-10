@@ -23,7 +23,7 @@ import type {
   Webhook,
   WebhookDelivery,
 } from '../api/generated/model';
-import { db, mockId, now } from './db';
+import { advanceDeployCycle, db, findApp, findDeployment, mockId, now } from './db';
 
 // ---------------------------------------------------------------- SHA-256
 
@@ -264,7 +264,7 @@ export const emitEvent = (
   type: EventType,
   subject: Subject,
   data: Record<string, unknown> = {},
-  extra: Partial<Pick<Event, 'project_id' | 'incident_id' | 'request_id' | 'actor' | 'time'>> = {},
+  extra: Partial<Pick<Event, 'project_id' | 'incident_id' | 'request_id' | 'actor' | 'time' | 'source'>> = {},
 ): Event => {
   const previous = state.events[state.events.length - 1];
   const event: Event = {
@@ -294,6 +294,102 @@ export const tamperAudit = (seq: number): boolean => {
 /** Switch the signed-in owner's role, to see the panel as an operator or viewer. */
 export const setRole = (role: User['role']): void => {
   if (db.owner) db.owner.role = role;
+};
+
+// ---------------------------------------------------------------- the deploy cycle
+
+/** What of the deploy cycle is already in the audit log and the events, `<deployment id>:<what>`. */
+const recordedCycle = new Set<string>();
+
+/** `time`, or the newest event's time when that is later: `seq` and `time` rise together. */
+const notBeforeNewestEvent = (time: string): string => {
+  const newest = state.events[state.events.length - 1]?.time;
+  return newest !== undefined && newest > time ? newest : time;
+};
+
+/**
+ * Put the deploy cycle's deployments in the logs, oldest first, each once:
+ * the owner's redeploy call in the audit log, stamped when it is appended,
+ * with `deployment.started`; then `deployment.succeeded` from the node the
+ * rollout ended on, or `deployment.failed`, once it ends.
+ */
+const recordCycle = (): void => {
+  for (const deploymentId of db.deployCycle?.deploymentIds ?? []) {
+    const deployment = findDeployment(deploymentId);
+    if (!deployment) continue;
+    const appId = deployment.app_id;
+    const projectId = findApp(appId)?.project_id;
+    const subject = { type: 'deployment', id: deployment.id };
+    const once = (what: string, write: () => void) => {
+      const key = `${deployment.id}:${what}`;
+      if (recordedCycle.has(key)) return;
+      recordedCycle.add(key);
+      write();
+    };
+
+    once('started', () => {
+      appendAudit({
+        actor_id: deployment.created_by_id,
+        operation: 'POST /api/v1/apps/{app_id}/redeploy',
+        scope: 'app:redeploy',
+        target_type: 'app',
+        target_id: appId,
+        project_id: projectId,
+        params: { app_id: appId },
+      });
+      emitEvent(
+        'deployment.started',
+        subject,
+        { deployment_id: deployment.id, app_id: appId, image: deployment.image, trigger: deployment.trigger },
+        {
+          project_id: projectId ?? null,
+          time: notBeforeNewestEvent(deployment.created_at),
+          actor: { type: 'user', id: deployment.created_by_id },
+        },
+      );
+    });
+    const ended = notBeforeNewestEvent(deployment.finished_at ?? deployment.created_at);
+    if (deployment.status === 'succeeded') {
+      // The last instance the rollout took reports the deployment healthy.
+      const lastNode = db.vms.filter((vm) => vm.app_id === appId).at(-1)?.node_id;
+      once('succeeded', () =>
+        emitEvent(
+          'deployment.succeeded',
+          subject,
+          {
+            deployment_id: deployment.id,
+            app_id: appId,
+            ...(deployment.image_digest ? { image_digest: deployment.image_digest } : {}),
+          },
+          {
+            project_id: projectId ?? null,
+            time: ended,
+            ...(lastNode ? { source: { kind: 'node' as const, node_id: lastNode } } : {}),
+          },
+        ),
+      );
+    } else if (deployment.status === 'failed') {
+      once('failed', () =>
+        emitEvent(
+          'deployment.failed',
+          subject,
+          { deployment_id: deployment.id, app_id: appId, phase: deployment.phase ?? 'pull', error: deployment.error ?? '' },
+          { project_id: projectId ?? null, time: ended, actor: { type: 'system', id: 'system' } },
+        ),
+      );
+    }
+  }
+};
+
+/**
+ * Bring the deploy cycle up to `nowMs` and record what it did. Every mock
+ * request passes through here before its handler answers.
+ */
+export const tickDeployCycle = (nowMs: number = Date.now()): void => {
+  advanceDeployCycle(nowMs);
+  if (!db.owner) return;
+  agency();
+  recordCycle();
 };
 
 // ---------------------------------------------------------------- seed
@@ -358,17 +454,20 @@ const seedAgency = (): void => {
 
   // The incident the demo restart belongs to. The event data is the
   // documented `app.down` payload (events.schema.json, data_app_down).
+  // blog has two replicas, so the primary emits it when the edge has every
+  // instance out of rotation: `edge_health`, with the edge's node.
+  const edgeId = db.edgeBackends[appId]?.[0]?.edge_node_id ?? db.node.id;
   const appDown = emitEvent(
     'app.down',
     { type: 'app', id: appId },
     {
       app_id: appId,
-      node_id: db.node.id,
-      check: 'health_check',
+      node_id: edgeId,
+      check: 'edge_health',
       failures: 3,
-      last_error: 'GET /healthz timed out after 5 s',
+      last_error: 'GET http://10.0.0.21:80/: request canceled after 2s',
     },
-    { project_id: projectId, time: minutesAgo(15), actor: { type: 'node', id: db.node.id } },
+    { project_id: projectId, time: minutesAgo(15), actor: { type: 'node', id: edgeId } },
   );
   const incident: Incident = {
     id: mockId('inc'),
@@ -763,4 +862,5 @@ const seedAgency = (): void => {
     justification: pending.justification,
     grant_id: incidentGrant.id,
   });
+
 };
