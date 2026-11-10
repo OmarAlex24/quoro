@@ -639,6 +639,19 @@ async fn the_change_log_rebuilds_every_agent_key_column_and_the_hash_of_its_secr
         .await
         .unwrap();
     assert_eq!(res.status(), 204, "revoke");
+    // Only a create carries the hash: the mint and the revoke updates leave
+    // it out and merge over it.
+    let updates: Vec<(String,)> = sqlx::query_as(
+        "SELECT payload FROM change_log WHERE entity_type = 'agent_key' AND op = 'update'",
+    )
+    .fetch_all(server.state.store.pool())
+    .await
+    .unwrap();
+    assert!(updates.len() >= 2, "{updates:?}");
+    for (payload,) in &updates {
+        let payload: Value = serde_json::from_str(payload).unwrap();
+        assert!(payload.get("key_hash").is_none(), "{payload}");
+    }
 
     let rebuilt = common::replay::rebuild(&server, &["agent_key"]).await;
     let columns = common::replay::column_names(&server.state.store, "agent_keys").await;

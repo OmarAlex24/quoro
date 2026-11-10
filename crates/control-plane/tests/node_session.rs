@@ -692,6 +692,19 @@ async fn the_change_log_rebuilds_every_join_token_column_and_the_hash_of_its_sec
     let unused = create_token(&server, &owner).await;
     let (status, body) = enroll(&server, used["token"].as_str().unwrap(), NODE_NAME).await;
     assert_eq!(status, 201, "enroll: {body}");
+    // Only a create carries the hash: the enrollment's update leaves it out
+    // and merges over it.
+    let updates: Vec<(String,)> = sqlx::query_as(
+        "SELECT payload FROM change_log WHERE entity_type = 'node_join_token' AND op = 'update'",
+    )
+    .fetch_all(server.state.store.pool())
+    .await
+    .unwrap();
+    assert!(!updates.is_empty(), "the enrollment writes an update");
+    for (payload,) in &updates {
+        let payload: Value = serde_json::from_str(payload).unwrap();
+        assert!(payload.get("token_hash").is_none(), "{payload}");
+    }
 
     let rebuilt = replay::rebuild(&server, &["node_join_token"]).await;
     let columns = replay::column_names(&server.state.store, "node_join_tokens").await;

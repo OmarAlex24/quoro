@@ -4,9 +4,9 @@
 //! The security-critical parts: the secret is shown once and only its hash is
 //! stored, the hash travels in the change log only in the token's `create`
 //! entry (`node-agent-protocol.md` section 7.1, ADR 0317), a token
-//! authenticates as its human until it expires or
-//! is revoked, a human only ever sees and revokes their own tokens, and an
-//! agent can never manage tokens (`human_only`).
+//! authenticates as its human until it expires or is revoked, a human only
+//! ever sees and revokes their own tokens, and an agent can never manage
+//! tokens (`human_only`).
 
 mod common;
 
