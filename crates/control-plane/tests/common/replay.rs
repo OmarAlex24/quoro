@@ -101,6 +101,18 @@ async fn columns(store: &Store, table: &str) -> Vec<Column> {
         .collect()
 }
 
+/// Every column of `table` in `store`'s schema, in table order, as
+/// `PRAGMA table_info` lists them: a test that compares whole rows takes
+/// its column list from here, so a column added by a later migration is
+/// compared too.
+pub async fn column_names(store: &Store, table: &str) -> Vec<String> {
+    columns(store, table)
+        .await
+        .into_iter()
+        .map(|column| column.name)
+        .collect()
+}
+
 /// The key columns in key order.
 fn key_columns(columns: &[Column]) -> Vec<&str> {
     let mut key: Vec<&Column> = columns.iter().filter(|c| c.pk > 0).collect();

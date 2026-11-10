@@ -1168,18 +1168,24 @@ async fn set_tunnel_tx(
         }
     };
     // The change log is the replicated state: it carries the ciphertext as
-    // hex and never the plaintext run token.
-    let (tunnel_id, token_enc): (Option<String>, Option<Vec<u8>>) =
-        sqlx::query_as("SELECT tunnel_id, token_enc FROM node_tunnels WHERE node_id = ?")
-            .bind(node_id)
-            .fetch_one(&mut *w.tx)
-            .await?;
+    // hex and never the plaintext run token. Every entry carries the whole
+    // row, `created_at` included: a rebuild inserts a `create` as it stands
+    // (section 7.3 step 4), and a change of provider keeps the row's
+    // `created_at`.
+    let (tunnel_id, token_enc, created_at): (Option<String>, Option<Vec<u8>>, String) =
+        sqlx::query_as(
+            "SELECT tunnel_id, token_enc, created_at FROM node_tunnels WHERE node_id = ?",
+        )
+        .bind(node_id)
+        .fetch_one(&mut *w.tx)
+        .await?;
     let payload = json!({
         "node_id": node_id,
         "provider_id": provider_id,
         "tunnel_id": tunnel_id,
         "token_enc": token_enc.map(|blob| crate::tunnel::hex(&blob)),
         "origin_port": origin_port,
+        "created_at": created_at,
         "updated_at": now,
     });
     let seq = changelog::append(
