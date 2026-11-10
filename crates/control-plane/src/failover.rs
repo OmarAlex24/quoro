@@ -56,6 +56,7 @@ use crate::error::{ApiError, Reason};
 use crate::events::{self, NewEvent, Source};
 use crate::leases::{self, Lease, NewGrant};
 use crate::request::CallCtx;
+use crate::session::Fault;
 use crate::store::now_rfc3339;
 use quoro_proto::RevokeReason;
 use quoro_proto::wire::{ControlMessage, WarmRole};
@@ -639,7 +640,8 @@ async fn released(state: &AppState, plan: &Plan) -> Result<bool, ApiError> {
 /// audit records. An open gate rolls it back and tries again once it passed,
 /// at most [`GATE_TRIES`] times. A grant that must wait is written with the
 /// mark set and moves everything else the same way; the caller holds it
-/// (ADR 0292).
+/// (ADR 0292). One that waits because support lapsed meanwhile moves
+/// nothing and answers `no_support` (ADR 0303 Q3).
 async fn change(
     state: &AppState,
     ctx: &CallCtx,
@@ -748,6 +750,12 @@ async fn change(
                  grant the warm node an expiring lease",
             ));
         }
+        // Test seam: support lapses between the check above and the write.
+        if hub.take_fault(&Fault::FailoverSupportLapse {
+            app_id: plan.app_id.clone(),
+        }) {
+            hub.set_voter_support(Arc::new(crate::authority::NoVoterSupport));
+        }
         let (lease, waiting) = match leases::grant_app_lease(
             &mut w.tx,
             hub.authority(),
@@ -764,6 +772,21 @@ async fn change(
                 drop(w);
                 tokio::time::sleep(remaining).await;
                 continue;
+            }
+            // ADR 0303 Q3, `openapi.yaml` `failoverApp`: a call that lost
+            // majority support since the check above answers `no_support`
+            // with nothing moved. Support is read again here, for the same
+            // duration, and the transaction is dropped uncommitted; the
+            // write recorded nothing in the authority. Only failover does
+            // this: a restore, a regrant and `createVolume` keep their
+            // waiting grant.
+            NewGrant::Waiting(_) if !hub.authority().supports(DEFAULT_DURATION_MS) => {
+                drop(w);
+                return Err(conflict(
+                    Reason::NoSupport,
+                    "the primary lost the support of a majority of voters, so it cannot grant \
+                     the warm node an expiring lease",
+                ));
             }
             // ADR 0292, ADR 0303 Q2: written with the mark set; the move
             // commits and the hub holds the grant.

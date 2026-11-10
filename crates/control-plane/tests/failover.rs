@@ -1471,6 +1471,40 @@ async fn support_lost_after_the_revoke_answers_no_support_and_a_retry_grants() {
     assert_eq!(revokes, 1);
 }
 
+/// ADR 0303 Q3, `openapi.yaml` `failoverApp`: support lapses after the
+/// change's support check and before its write, so the grant would wait
+/// for it. The call answers `no_support` and moves nothing: the lease stays
+/// revoked at the source's token, unmarked, no grant goes out and none is
+/// held.
+#[tokio::test]
+async fn support_lost_at_the_write_answers_no_support_and_moves_nothing() {
+    let mut s = Setup::new().await;
+    s.ready().await;
+    s.server
+        .state
+        .hub
+        .inject_fault(Fault::FailoverSupportLapse {
+            app_id: s.app_id.clone(),
+        });
+
+    let res = s.connected_failover().await;
+    let body = refused(res, 409, "conflict", Some("no_support")).await;
+    let detail = body["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("stays revoked and its app stopped"),
+        "{detail}"
+    );
+    s.unmoved(true, "support lost at the write").await;
+    let unsettled: i64 = sqlx::query_scalar("SELECT unsettled FROM leases")
+        .fetch_one(s.server.state.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(unsettled, 0);
+    let lease = s.lease_view().await;
+    assert_eq!(lease["grant_pending"], false, "{lease}");
+    none_of(s.on_warm(), "lease_grant", "support lost at the write").await;
+}
+
 /// A client that gives up while the source holds its revoke unanswered does
 /// not drop the failover: once the source answers, the lease moves, and a
 /// retry with the same `Idempotency-Key` answers the stored `202`.

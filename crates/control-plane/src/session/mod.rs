@@ -550,6 +550,10 @@ pub enum Fault {
     /// The next failed fence `node_id` reports by a revoke's answer cannot
     /// be recorded.
     FailureRecord { node_id: String },
+    /// The next failover of `app_id` loses the voters' support after its
+    /// last support check and before it writes the grant: the hub's support
+    /// turns to none from then on.
+    FailoverSupportLapse { app_id: String },
 }
 
 /// A test seam that holds one node's next snapshot after it is built and
@@ -682,7 +686,7 @@ impl NodeHub {
     }
 
     /// Whether `fault` was injected, consuming it.
-    fn take_fault(&self, fault: &Fault) -> bool {
+    pub(crate) fn take_fault(&self, fault: &Fault) -> bool {
         let mut faults = self.0.faults.lock().expect("fault lock");
         match faults.iter().position(|injected| injected == fault) {
             Some(index) => {
