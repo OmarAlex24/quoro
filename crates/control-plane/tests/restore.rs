@@ -513,6 +513,7 @@ fn status_report(applied_rev: u64, volumes: Vec<VolumeStatus>) -> NodeMessage {
         images: Vec::new(),
         warm: Vec::new(),
         volumes,
+        quarantines: Vec::new(),
     })
 }
 
@@ -844,6 +845,7 @@ async fn run_backup(setup: &mut Setup, data: &[u8]) -> String {
             volumes: Vec::new(),
             images: Vec::new(),
             warm: Vec::new(),
+            quarantines: Vec::new(),
         }),
     )
     .await;

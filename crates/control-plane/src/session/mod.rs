@@ -447,6 +447,9 @@ struct HubInner {
     /// The newest `status_report.warm` of each node, in memory only (section
     /// 5.3, migration 0011): `App.warm` is derived from it on every read.
     warm_reports: Mutex<HashMap<String, Vec<wire::WarmStatus>>>,
+    /// The quarantined copies each node last listed, hashed or not, in
+    /// memory only ([`crate::quarantines::ListedCopies`]).
+    listed_copies: crate::quarantines::ListedCopies,
     /// The warm facts of the newest snapshot sent to each node, in memory
     /// only ([`NodeHub::swap_warm_facts`]).
     warm_facts: Mutex<HashMap<String, crate::warm::WarmFacts>>,
@@ -573,6 +576,7 @@ impl NodeHub {
             edge_reports: Mutex::new(HashMap::new()),
             edge_health: Mutex::new(BTreeMap::new()),
             warm_reports: Mutex::new(HashMap::new()),
+            listed_copies: crate::quarantines::ListedCopies::default(),
             warm_facts: Mutex::new(HashMap::new()),
             warm_named: Mutex::new(HashMap::new()),
             disk_free_gb: Mutex::new(HashMap::new()),
@@ -1238,6 +1242,12 @@ impl NodeHub {
             .lock()
             .expect("warm report lock")
             .clone()
+    }
+
+    /// The quarantined copies each node last listed in
+    /// `status_report.quarantines`, hashed or not (section 5.3).
+    pub(crate) fn listed_copies(&self) -> &crate::quarantines::ListedCopies {
+        &self.0.listed_copies
     }
 
     /// The copies `node_id` last reported holding as a warm node, as
@@ -4363,6 +4373,7 @@ async fn apply_status_report(
 ) -> Result<(), String> {
     // First, so a database error on a VM below never loses it.
     let kept = hub.apply_warm_report(node_id, &report.warm);
+    hub.listed_copies().replace(node_id, &report.quarantines);
     if !kept.is_empty() {
         hub.recheck_kept_copies(node_id, &kept).await;
     }
@@ -4495,6 +4506,7 @@ async fn apply_status_report(
             "cannot apply the reported volume statuses"
         ),
     }
+    crate::quarantines::apply_report(&hub.0.store, hub, node_id, &report.quarantines).await;
     match crate::backups::apply_status(
         &hub.0.store,
         &hub.0.data_key,

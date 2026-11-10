@@ -37,6 +37,9 @@ pub use quoro_proto::jcs;
 pub mod leases;
 pub mod openapi;
 pub mod primary_status;
+/// Quarantined copies of a volume: recording, refusals and deletion (ADR
+/// 0176).
+pub(crate) mod quarantines;
 pub mod request;
 pub(crate) mod scheduler;
 pub mod service;

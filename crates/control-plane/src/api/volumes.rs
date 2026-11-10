@@ -5,8 +5,9 @@
 //! A volume is a sparse file on one node's data disk, attached to the app's
 //! microVM and mounted by the guest at `mount_path` (ADR 0145). The row is
 //! replicated state, written through the change log like a deployment; the
-//! file itself never leaves its node. [`routes`] mounts the four volume
-//! operations and [`VolumesDoc`] carries their OpenAPI paths and schemas.
+//! file itself never leaves its node. [`routes`] mounts the volume operations,
+//! `deleteVolumeQuarantine` included, and [`VolumesDoc`] carries their
+//! OpenAPI paths and schemas.
 
 use crate::AppState;
 use crate::api::apps::{app_target, idempotency_key};
@@ -18,7 +19,7 @@ use axum::Router;
 use axum::extract::{Extension, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{delete, get};
 use quoro_proto::wire::ControlMessage;
 use quoro_types::Scope;
 use serde::{Deserialize, Serialize};
@@ -30,9 +31,16 @@ use utoipa::ToSchema;
 /// The audit and idempotency name of `createVolume`.
 pub(crate) const CREATE_VOLUME: &str = "POST /api/v1/apps/{app_id}/volumes";
 
-/// Columns of [`Volume`], in the order [`volume_from_row`] expects them.
+/// Columns of [`Volume`], in the order [`volume_from_row`] expects them. The
+/// last one, `quarantines`, is the JSON array of the volume's
+/// `volume_quarantines` rows ([`crate::quarantines::from_column`]), so the
+/// columns are selected `FROM volumes` without an alias.
 pub(crate) const VOLUME_COLUMNS: &str = "id, app_id, node_id, size_gb, mount_path, state, \
-     allocated_bytes, restored_from_backup_id, error, created_at, updated_at";
+     allocated_bytes, restored_from_backup_id, error, created_at, updated_at, \
+     (SELECT json_group_array(json_object('id', q.id, 'node_id', q.node_id, \
+     'size_bytes', q.size_bytes, 'sha256', q.sha256, 'created_at', q.created_at, \
+     'deleting_at', q.deleting_at)) \
+     FROM volume_quarantines q WHERE q.volume_id = volumes.id) AS quarantines";
 
 /// `volumes.state` (`Volume.state`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -118,8 +126,8 @@ pub struct Volume {
     /// One-line reason, in `failed`.
     #[schema(max_length = 2000)]
     pub error: Option<String>,
-    /// From M5b: the quarantined copies of this volume, oldest first (ADR
-    /// 0176). Always empty until warm volumes ship.
+    /// From M5b: the quarantined copies of this volume, oldest first; empty
+    /// when there is none (ADR 0176).
     #[serde(default)]
     #[schema(required = true)]
     pub quarantines: Vec<VolumeQuarantine>,
@@ -229,7 +237,7 @@ pub(crate) fn volume_from_row(row: &SqliteRow) -> Result<Volume, ApiError> {
         allocated_bytes: row.try_get("allocated_bytes")?,
         restored_from_backup_id: row.try_get("restored_from_backup_id")?,
         error: row.try_get("error")?,
-        quarantines: Vec::new(),
+        quarantines: crate::quarantines::from_column(&row.try_get::<String, _>("quarantines")?)?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -588,6 +596,94 @@ pub async fn delete_volume(
     }
 }
 
+/// The audit name of `deleteVolumeQuarantine`.
+const DELETE_VOLUME_QUARANTINE: &str =
+    "DELETE /api/v1/volumes/{volume_id}/quarantines/{quarantine_id}";
+
+/// Deletes a quarantined copy of a volume (ADR 0176, node-agent-protocol.md
+/// section 9). Destructive and human-only: an agent is refused with
+/// `human_only`, even with an approval. The copy turns `deleting` and its
+/// node removes the file once `spec.quarantine_deletes` names it; a copy
+/// already `deleting` answers `202` again.
+///
+/// # Errors
+///
+/// `forbidden` for an agent (`reason: human_only`) or without
+/// `app:delete_quarantine`, `not_found` for an unknown or malformed volume
+/// or copy, or a copy of another volume, or a database error.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/volumes/{volume_id}/quarantines/{quarantine_id}",
+    tag = "volumes",
+    operation_id = "deleteVolumeQuarantine",
+    extensions(("x-quoro-scope" = json!("app:delete_quarantine"))),
+    params(
+        ("volume_id" = String, Path, description = "Volume id (`vol_...`).",
+            pattern = "^vol_[0-9A-HJKMNP-TV-Z]{26}$"),
+        ("quarantine_id" = String, Path, description = "Quarantined copy id (`qrn_...`).",
+            pattern = "^qrn_[0-9A-HJKMNP-TV-Z]{26}$"),
+    ),
+    responses(
+        (status = 202, description = "The copy is `deleting`; the answer is its volume.", body = Volume,
+            headers(("Quoro-Request-Id" = String, description = "Correlation id of this call."))),
+        (status = 401, response = crate::openapi::Unauthenticated),
+        (status = 403, response = crate::openapi::Forbidden),
+        (status = 404, response = crate::openapi::NotFound),
+        (status = 429, response = crate::openapi::RateLimited),
+        (status = 503, response = crate::openapi::NotPrimary),
+    )
+)]
+pub async fn delete_volume_quarantine(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    identity: crate::auth::Identity,
+    headers: HeaderMap,
+    Path((volume_id, quarantine_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let ctx = CallCtx::new(identity, request_id.0, DELETE_VOLUME_QUARANTINE, &headers);
+    // `audit-log-format.md` section 3.8: `params` is `{quarantine_id}`.
+    let params = json!({ "quarantine_id": quarantine_id });
+    let target = volume_target(&volume_id);
+    let project_id = volume_project(&state, &volume_id).await;
+    ctx.authorize_human(
+        &state,
+        Scope::AppDeleteQuarantine,
+        Some(&target),
+        project_id.as_deref(),
+        &params,
+    )
+    .await?;
+
+    match crate::quarantines::delete_copy(
+        &state,
+        &ctx,
+        &volume_id,
+        &quarantine_id,
+        project_id.as_deref(),
+        &params,
+    )
+    .await
+    {
+        Ok(deleted) => {
+            // The copy's node gets `spec.quarantine_deletes` with it.
+            state.hub.node_changed(&deleted.node_id);
+            Ok((StatusCode::ACCEPTED, Json(deleted.volume)).into_response())
+        }
+        Err(error) => {
+            ctx.audit_error(
+                &state,
+                Some(Scope::AppDeleteQuarantine),
+                Some(&target),
+                project_id.as_deref(),
+                &params,
+                &error,
+            )
+            .await?;
+            Err(error)
+        }
+    }
+}
+
 /// Routes of the volume operations.
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -599,12 +695,22 @@ pub fn routes() -> Router<AppState> {
             "/api/v1/volumes/{volume_id}",
             get(get_volume).delete(delete_volume),
         )
+        .route(
+            "/api/v1/volumes/{volume_id}/quarantines/{quarantine_id}",
+            delete(delete_volume_quarantine),
+        )
 }
 
 /// OpenAPI paths and schemas of the volume operations.
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    paths(list_app_volumes, create_volume, get_volume, delete_volume),
+    paths(
+        list_app_volumes,
+        create_volume,
+        get_volume,
+        delete_volume,
+        delete_volume_quarantine
+    ),
     components(
         schemas(Volume, VolumeQuarantine, VolumeList, CreateVolumeRequest),
         responses(

@@ -408,6 +408,7 @@ async fn vm_changes_push_snapshots_and_observations_land() {
             images: Vec::new(),
             warm: Vec::new(),
             volumes: Vec::new(),
+            quarantines: Vec::new(),
         }),
     )
     .await;
@@ -914,6 +915,7 @@ async fn an_edge_reports_backend_health_and_a_replicated_app_gets_degraded() {
                     last_error: Some("connection refused".to_string()),
                 },
             ],
+            quarantines: Vec::new(),
         }),
     )
     .await;
@@ -1021,6 +1023,7 @@ async fn an_edge_reports_backend_health_and_a_replicated_app_gets_degraded() {
                     last_error: Some("connection refused".to_string()),
                 },
             ],
+            quarantines: Vec::new(),
         }),
     )
     .await;
@@ -1086,6 +1089,7 @@ fn report_one(applied_rev: u64, vm_id: &str, status: ObservedStatus) -> NodeMess
         images: Vec::new(),
         warm: Vec::new(),
         volumes: Vec::new(),
+        quarantines: Vec::new(),
     })
 }
 

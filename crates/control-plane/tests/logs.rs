@@ -887,6 +887,7 @@ async fn a_status_report_for_an_app_vm_is_accepted() {
             images: Vec::new(),
             warm: Vec::new(),
             volumes: Vec::new(),
+            quarantines: Vec::new(),
         }),
     )
     .await;
