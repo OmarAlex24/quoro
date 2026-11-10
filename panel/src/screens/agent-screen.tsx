@@ -26,6 +26,7 @@ import { problemView, type ProblemView } from '../lib/problem';
 import { agentTab, type AgentTab } from '../lib/routes';
 import { useAgentCalls } from '../lib/use-agent-calls';
 import { useNow } from '../lib/use-now';
+import { usePaneEnter, useTabInk } from '../lib/use-tab-motion';
 import { useKeptNames } from '../lib/use-record-context';
 import { cn } from '../lib/utils';
 import { useSession } from '../session';
@@ -163,6 +164,8 @@ function AgentPane({
     incident: facts.incident,
   });
   const activeCount = facts.grants.filter((grant) => grant.status === 'active').length;
+  const { navRef, inkRef } = useTabInk(tab);
+  const bodyRef = usePaneEnter<HTMLDivElement>(tab);
 
   const tabLink = (value: AgentTab | undefined, words: string, count?: number) => {
     const on = (value ?? 'activity') === tab;
@@ -207,14 +210,15 @@ function AgentPane({
         </p>
       </div>
 
-      <nav className="tabs agent-tabs" aria-label={`${agent.name}`}>
+      <nav ref={navRef} className="tabs agent-tabs" aria-label={`${agent.name}`}>
         {tabLink(undefined, 'Activity')}
         {tabLink('grants', 'Grants', activeCount)}
         {tabLink('keys', 'Keys')}
         {tabLink('settings', 'Settings')}
+        <span ref={inkRef} className="tab-ink" aria-hidden="true" />
       </nav>
 
-      <div className="agent-body">
+      <div ref={bodyRef} className="agent-body">
         {tab === 'grants' ? (
           <AgentGrants agent={agent} canManage={canManageGrants(me)} />
         ) : tab === 'keys' ? (

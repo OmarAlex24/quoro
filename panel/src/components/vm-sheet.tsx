@@ -15,6 +15,7 @@ import { problemView, type ProblemView } from '../lib/problem';
 import { PROJECT_LIST_PARAMS } from '../lib/projects';
 import { VM_TABS, type VmTab } from '../lib/routes';
 import { memoryWords, vmSize } from '../lib/services';
+import { usePaneEnter } from '../lib/use-tab-motion';
 import { useSession } from '../session';
 import { GlyphTile } from './glyph-tile';
 import { ImageRef } from './image-ref';
@@ -112,6 +113,7 @@ function VmSheetBody({ vm, projectId, tab }: { vm: Vm; projectId: string; tab: V
   const [problem, setProblem] = useState<ProblemView | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
+  const bodyRef = usePaneEnter<HTMLDivElement>(tab);
 
   const nodesQuery = useListNodes(undefined, { query: { staleTime: 10_000 } });
   const projectsQuery = useListProjects(PROJECT_LIST_PARAMS);
@@ -195,7 +197,7 @@ function VmSheetBody({ vm, projectId, tab }: { vm: Vm; projectId: string; tab: V
         ))}
       </SheetTabs>
 
-      <div className="sh-body">
+      <div ref={bodyRef} className="sh-body">
         {notice ? <NoticeLine>{notice}</NoticeLine> : null}
         {problem ? <ProblemBanner view={problem} /> : null}
 

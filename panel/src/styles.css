@@ -1172,32 +1172,72 @@
     background-size: 22px 22px;
   }
 
+  /*
+   * A tab row: links (the tab is in the URL) over a 1 px rule, and one 2 px
+   * bar under the active tab's words. The bar slides to a new tab on the
+   * panel's curve only when the tab changes (`data-glide`, set by
+   * useTabInk); the rule is an inset shadow so the bar covers it even where
+   * the row scrolls sideways and clips what hangs below it.
+   */
   .tabs {
+    position: relative;
     display: flex;
-    flex-wrap: wrap;
-    gap: 0 20px;
-    border-bottom: 1px solid var(--line);
+    gap: 2px;
+    overflow-x: auto;
+    scrollbar-width: none;
+    box-shadow: inset 0 -1px 0 var(--line);
+  }
+
+  .tabs::-webkit-scrollbar {
+    display: none;
   }
 
   .tabs a {
-    padding: 9px 0 10px;
+    flex: none;
+    height: 34px;
+    padding: 0 8px;
+    border-radius: 6px 6px 0 0;
     color: var(--ink-2);
     text-decoration: none;
     font-size: var(--type-body);
-    border-bottom: 2px solid transparent;
-    margin-bottom: -1px;
+    white-space: nowrap;
     display: inline-flex;
     align-items: center;
     gap: 6px;
+    transition:
+      color var(--motion-feedback) var(--ease),
+      background-color var(--motion-feedback) var(--ease);
   }
 
   .tabs a:hover {
     color: var(--ink);
+    background-color: color-mix(in oklab, var(--raised) 60%, transparent);
   }
 
   .tabs a.on {
     color: var(--ink);
-    border-color: var(--ink);
+    font-weight: 560;
+  }
+
+  .tabs a:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+
+  .tab-ink {
+    position: absolute;
+    left: 0;
+    bottom: 0;
+    width: 0;
+    height: 2px;
+    background-color: var(--ink);
+    pointer-events: none;
+  }
+
+  .tab-ink[data-glide] {
+    transition:
+      transform var(--motion-change) var(--ease),
+      width var(--motion-change) var(--ease);
   }
 
   .subnav {
@@ -2023,15 +2063,9 @@
     color: var(--ink);
   }
 
+  /* The words line up with the body under it: 18 px here and 8 px in each tab. */
   .tabs.sh-tabs {
-    flex-wrap: nowrap;
-    padding: 0 26px;
-    overflow-x: auto;
-    scrollbar-width: none;
-  }
-
-  .tabs.sh-tabs a {
-    flex: none;
+    padding: 0 18px;
   }
 
   .sh-body {
@@ -3763,8 +3797,7 @@
     }
 
     .tabs.sh-tabs {
-      padding: 0 16px;
-      gap: 0 18px;
+      padding: 0 8px;
     }
 
     .sh-body {

@@ -29,6 +29,7 @@ import { appAddress, appKind, keepInView } from '../lib/services';
 import { securityParams, securityTabCount } from '../lib/vulnerabilities';
 import { appReadInterval, RUN_PAGE, useAppRuns } from '../lib/use-app-runs';
 import { useRecentBuilds } from '../lib/use-builds';
+import { usePaneEnter, useTabInk } from '../lib/use-tab-motion';
 import { useSession } from '../session';
 import { AppEnvDialog } from './app-env-dialog';
 import { GlyphTile } from './glyph-tile';
@@ -242,6 +243,7 @@ function SheetBody({
     query: { refetchInterval: 30_000 },
   });
   const openFindings = securityTabCount(vulnerabilities.data);
+  const bodyRef = usePaneEnter<HTMLDivElement>(tab);
 
   return (
     <>
@@ -297,7 +299,7 @@ function SheetBody({
         ))}
       </SheetTabs>
 
-      <div className="sh-body">
+      <div ref={bodyRef} className="sh-body">
         {notice ? <NoticeLine>{notice}</NoticeLine> : null}
         {problem ? <ProblemBanner view={problem} /> : null}
 
@@ -344,7 +346,7 @@ function SheetBody({
  * view whenever it changes.
  */
 export function SheetTabs({ label, tab, children }: { label: string; tab: string; children: ReactNode }) {
-  const ref = useRef<HTMLElement>(null);
+  const { navRef: ref, inkRef } = useTabInk(tab);
   const [edges, setEdges] = useState<'none' | 'start' | 'end' | 'both'>('none');
 
   useLayoutEffect(() => {
@@ -395,6 +397,7 @@ export function SheetTabs({ label, tab, children }: { label: string; tab: string
   return (
     <nav ref={ref} className="tabs sh-tabs" aria-label={label} data-fade={edges}>
       {children}
+      <span ref={inkRef} className="tab-ink" aria-hidden="true" />
     </nav>
   );
 }
