@@ -743,14 +743,14 @@ async fn a_disconnected_source_holds_the_lease_until_its_gate_passed() {
 }
 
 /// Section 8.4: a source that is not connected holds a `local` lease until
-/// it answers a revoke or is declared lost, so the lease does not move.
-/// Once it is declared lost it no longer holds it: the grant raises the
-/// stored duration of a `local` row, so the change writes the row marked,
-/// answers `202`, and holds the grant (ADR 0292, ADR 0303 Q2). The source,
-/// declared lost but not removed, stays in the required set, so the grant
-/// waits on it.
+/// it answers a revoke or is declared lost, so the lease does not move. A
+/// `lost_at` alone does not free it: only a declaration that revoked the
+/// row does (section 8.3), and this row was never revoked, so a `lost_at`
+/// set without one changes nothing. Moving the lease once the source is
+/// declared lost through the API is
+/// `a_failover_goes_on_once_the_source_is_declared_lost_through_the_api`.
 #[tokio::test]
-async fn a_disconnected_sources_local_lease_is_held_until_it_is_declared_lost() {
+async fn a_disconnected_sources_local_lease_is_held_until_a_declaration_revokes_it() {
     let mut s = Setup::new().await;
     s.report_copy().await;
     set_support(&s.server, true);
@@ -768,11 +768,8 @@ async fn a_disconnected_sources_local_lease_is_held_until_it_is_declared_lost() 
         .execute(s.server.state.store.pool())
         .await
         .unwrap();
-    let res = s.failover().await;
-    assert_eq!(res.status(), 202, "{}", res.text().await.unwrap());
-    let app: Value = res.json().await.unwrap();
-    s.waiting(&app["lease"]).await;
-    s.moved_marked().await;
+    refused(s.failover().await, 409, "conflict", Some("lease_held")).await;
+    s.unmoved(false, "lost_at set, row never revoked").await;
     none_of(s.on_warm(), "lease_grant", "local row").await;
 }
 
@@ -844,6 +841,104 @@ async fn a_failover_goes_on_once_the_source_is_declared_lost_through_the_api() {
     );
     assert_eq!(lease_now(&s).await, (s.warm.node_id.clone(), 6, false));
     none_of(s.on_warm(), "lease_grant", "held grant").await;
+}
+
+/// Section 8.3: a declaration covers only the leases it revoked. The source
+/// is declared lost, returns, and its `lost_at` is never cleared (the write
+/// failed); it then holds the lease again at a new token, unrevoked, and is
+/// cut off. The stale `lost_at` does not free that lease: the failover
+/// answers `lease_held` and nothing moves.
+#[tokio::test]
+async fn a_stale_lost_at_does_not_free_a_lease_taken_after_the_declaration() {
+    let mut s = Setup::new().await;
+    s.report_copy().await;
+    set_support(&s.server, true);
+    s.disconnect_source().await;
+    let node = declare_source_lost(&s).await;
+    let declared = node["lost_at"].as_str().unwrap().to_string();
+    assert_eq!(lease_now(&s).await, (s.source.node_id.clone(), 5, true));
+
+    // Taken again after the declaration, while `lost_at` stayed set.
+    sqlx::query(
+        "UPDATE leases SET fencing_token = 6, revoked_at = NULL, granted_at = ? WHERE id = ?",
+    )
+    .bind(quoro_control_plane::store::now_rfc3339())
+    .bind(LEASE_ID)
+    .execute(s.server.state.store.pool())
+    .await
+    .unwrap();
+    let lost_at: Option<String> = sqlx::query_scalar("SELECT lost_at FROM nodes WHERE id = ?")
+        .bind(&s.source.node_id)
+        .fetch_one(s.server.state.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(lost_at.as_deref(), Some(declared.as_str()), "stale");
+
+    let body = refused(s.failover().await, 409, "conflict", Some("lease_held")).await;
+    let detail = body["detail"].as_str().unwrap();
+    assert!(detail.contains("local"), "{detail}");
+    assert_eq!(lease_now(&s).await, (s.source.node_id.clone(), 6, false));
+    none_of(
+        s.on_warm(),
+        "lease_grant",
+        "a lease the declaration never covered",
+    )
+    .await;
+}
+
+/// Sections 8.3 and 9 step 2, read with `Node.lost_at`: a source declared
+/// lost that returns listing none of its leases still gets the declared
+/// lease revoked with reason `declared_lost`, and its `lost_at` stays until
+/// it answered. Its `ok` releases the lease at the declaration's token, so
+/// once it is cut off again, with `lost_at` cleared, the failover goes on:
+/// the lease moved through a revoke its holder answered (section 8.4,
+/// "Moving the lease").
+#[tokio::test]
+async fn a_returning_lost_source_that_lists_nothing_releases_the_lease_for_a_failover() {
+    let mut s = Setup::new().await;
+    s.report_copy().await;
+    set_support(&s.server, true);
+    s.disconnect_source().await;
+    declare_source_lost(&s).await;
+    assert_eq!(lease_now(&s).await, (s.source.node_id.clone(), 5, true));
+    let lost_at = |s: &Setup| {
+        let pool = s.server.state.store.pool().clone();
+        let node_id = s.source.node_id.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>("SELECT lost_at FROM nodes WHERE id = ?")
+                .bind(node_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+
+    let mut on_source = connect(&s.server, &s.source.credential).await;
+    send(&mut on_source, hello(&s.source.node_id, 1), None).await;
+    let revoke = recv_type(&mut on_source, "lease_revoke").await;
+    assert_eq!(revoke["body"]["lease_id"], LEASE_ID, "{revoke}");
+    assert_eq!(revoke["body"]["fencing_token"], 5, "{revoke}");
+    assert_eq!(revoke["body"]["reason"], "declared_lost", "{revoke}");
+    frames_until_settled(&mut on_source).await;
+    assert!(lost_at(&s).await.is_some(), "not answered yet");
+
+    send(
+        &mut on_source,
+        ok_result(),
+        Some(revoke["id"].as_str().unwrap()),
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while lost_at(&s).await.is_some() {
+        assert!(tokio::time::Instant::now() < deadline, "never cleared");
+        frames_until_settled(&mut on_source).await;
+    }
+    s.on_source = Some(on_source);
+    s.disconnect_source().await;
+
+    let res = s.failover().await;
+    assert_eq!(res.status(), 202, "{}", res.text().await.unwrap());
+    assert_eq!(lease_now(&s).await, (s.warm.node_id.clone(), 6, false));
 }
 
 /// Sections 8.3 and 8.4 through the API: declaring the source lost leaves an

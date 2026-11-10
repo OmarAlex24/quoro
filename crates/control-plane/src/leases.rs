@@ -362,6 +362,30 @@ pub(crate) async fn awaited_by_restores(
     rows.iter().map(lease_from_row).collect()
 }
 
+/// Every lease row the declaration that set `node_id`'s `lost_at` covers
+/// ([`declaration_covers`]): it names the node and was revoked by
+/// `lost_at`, oldest first.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn covered_by_declaration(
+    conn: &mut SqliteConnection,
+    node_id: &str,
+    lost_at: &str,
+) -> Result<Vec<Lease>, ApiError> {
+    let rows = sqlx::query(&format!(
+        "SELECT {LEASE_COLUMNS} FROM leases \
+         WHERE holder_node_id = ? AND revoked_at IS NOT NULL AND revoked_at <= ? \
+         ORDER BY id"
+    ))
+    .bind(node_id)
+    .bind(lost_at)
+    .fetch_all(&mut *conn)
+    .await?;
+    rows.iter().map(lease_from_row).collect()
+}
+
 /// What this primary has learned, in memory, about revoked leases whose last
 /// holder no longer runs anything under them (`node-agent-protocol.md`
 /// sections 5.13 and 8.5, ADR 0047): for each lease and holder, the highest
@@ -444,23 +468,7 @@ pub(crate) async fn is_released(
     if !lease.is_revoked() || unanswered {
         return Ok(false);
     }
-    if releases.covers(lease) {
-        return Ok(true);
-    }
-    // The acknowledgement's time is that of the latest one added to it, so
-    // a lease granted to its holder again after an earlier acknowledgement
-    // at that token (ADR 0247) is told apart only while no later one came.
-    if let Some(pending) = crate::fences::pending_of(conn, &lease.holder_node_id).await?
-        && pending.lease_ids.contains(&lease.id)
-        && pending
-            .fencing_tokens
-            .get(&lease.id)
-            .is_some_and(|token| i64::try_from(*token).ok() == Some(lease.fencing_token))
-        && lease
-            .revoked_at
-            .as_deref()
-            .is_some_and(|revoked_at| revoked_at <= pending.acked_at.as_str())
-    {
+    if released_by_holder(conn, releases, lease).await? {
         return Ok(true);
     }
     let holder: Option<(Option<String>, String)> =
@@ -468,11 +476,59 @@ pub(crate) async fn is_released(
             .bind(&lease.holder_node_id)
             .fetch_optional(&mut *conn)
             .await?;
-    let revoked_at = lease.revoked_at.as_deref().unwrap_or_default();
     let gone = holder.is_some_and(|(lost_at, status)| {
-        status == "removed" || lost_at.is_some_and(|lost_at| revoked_at <= lost_at.as_str())
+        status == "removed" || lost_at.is_some_and(|lost_at| declaration_covers(lease, &lost_at))
     });
     Ok(gone && (lease.mode == "local" || authority.passed(&lease.id)))
+}
+
+/// Whether the declaration that set its holder's `lost_at` covers `lease`:
+/// the row was revoked by then (section 8.3, ADR 0183). A row granted or
+/// regranted after it, and not revoked since, is not covered, even while a
+/// `lost_at` that was never cleared stays set.
+pub(crate) fn declaration_covers(lease: &Lease, lost_at: &str) -> bool {
+    lease
+        .revoked_at
+        .as_deref()
+        .is_some_and(|revoked_at| revoked_at <= lost_at)
+}
+
+/// Whether `lease`'s last holder has released it in a way that does not
+/// rest on a declaration or a removal: an `ok` answer to a revoke at its
+/// token ([`Releases`]), or an operator's acknowledgement of it pending
+/// delivery at its token, made once the lease was revoked. The first two
+/// ways of [`is_released`], which a declared lease still lacks until its
+/// holder returns and answers its `declared_lost` revoke.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn released_by_holder(
+    conn: &mut SqliteConnection,
+    releases: &Releases,
+    lease: &Lease,
+) -> Result<bool, ApiError> {
+    if releases.covers(lease) {
+        return Ok(true);
+    }
+    // The acknowledgement's time is that of the latest one added to it, so
+    // a lease granted to its holder again after an earlier acknowledgement
+    // at that token (ADR 0247) is told apart only while no later one came.
+    Ok(
+        if let Some(pending) = crate::fences::pending_of(conn, &lease.holder_node_id).await? {
+            pending.lease_ids.contains(&lease.id)
+                && pending
+                    .fencing_tokens
+                    .get(&lease.id)
+                    .is_some_and(|token| i64::try_from(*token).ok() == Some(lease.fencing_token))
+                && lease
+                    .revoked_at
+                    .as_deref()
+                    .is_some_and(|revoked_at| revoked_at <= pending.acked_at.as_str())
+        } else {
+            false
+        },
+    )
 }
 
 /// Every unrevoked lease `node_id` holds, oldest first.

@@ -327,8 +327,20 @@ async fn refuse(state: &AppState, app: &App, node_id: &str) -> Result<Plan, ApiE
         ));
     }
 
+    // A lease its holder released by answering a revoke moves (section 8.4,
+    // "Moving the lease"), as [`released`] finds once the failover waits:
+    // a node declared lost that returned and answered its `declared_lost`
+    // revoke has its `lost_at` cleared, and its lease moves all the same.
     if let Some(lease) = &lease
         && !state.hub.is_connected(&source)
+        && !leases::is_released(
+            &mut conn,
+            state.hub.releases(),
+            authority,
+            state.hub.revoke_unanswered(&source, &lease.id),
+            lease,
+        )
+        .await?
         && let Some(why) = held_while_away(&mut conn, authority, lease).await?
     {
         return Err(conflict(Reason::LeaseHeld, why));
@@ -411,7 +423,9 @@ fn unrecorded_fence_failure() -> ApiError {
 ///
 /// - a row that carries the unsettled mark, or reads `local`, moves only
 ///   through a revoke its holder answered or once its holder is declared
-///   lost;
+///   lost, and only if that declaration revoked it ([`leases::declaration_covers`]):
+///   a `lost_at` left set while the holder took the lease again covers
+///   nothing it took since;
 /// - a row that reads `expiring` moves once its gate has passed on the
 ///   authority's clock.
 async fn held_while_away(
@@ -426,7 +440,10 @@ async fn held_while_away(
                 .bind(&lease.holder_node_id)
                 .fetch_optional(&mut *conn)
                 .await?;
-        if lost_at.flatten().is_none() {
+        let declared = lost_at
+            .flatten()
+            .is_some_and(|lost_at| leases::declaration_covers(lease, &lost_at));
+        if !declared {
             return Ok(Some(if marked {
                 "the source is not connected and the lease row carries the unsettled mark: it \
                  moves only once its holder answers a revoke or is declared lost"

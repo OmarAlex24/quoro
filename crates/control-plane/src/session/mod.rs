@@ -333,6 +333,34 @@ fn stale_lease_revoke(
     ))
 }
 
+/// The app a lease row protects, for its `lease.revoke` record's target.
+fn lease_app(lease: &leases::Lease) -> Option<String> {
+    (lease.resource_type == "app").then(|| lease.resource_id.clone())
+}
+
+/// The `params` of a `declared_lost` revoke's `lease.revoke` system record
+/// (audit-log-format.md section 3.7).
+fn lost_revoke_params(node_id: &str, fencing_token: u64) -> Value {
+    json!({
+        "node_id": node_id,
+        "fencing_token": fencing_token,
+        "reason": "declared_lost",
+    })
+}
+
+/// The non-fatal error that ends a session whose node answered its last
+/// `declared_lost` revoke while the primary could not clear its `lost_at`:
+/// the node dials again, and its next session revokes and clears again
+/// (section 8.3).
+fn lost_at_not_cleared(re: &str) -> String {
+    protocol_error(
+        quoro_proto::ErrorCode::BadMessage,
+        "the primary could not record this node's return; dial again",
+        false,
+        Some(re),
+    )
+}
+
 /// The frame that answers a failed decode (section 5.18).
 fn protocol_error(
     code: quoro_proto::ErrorCode,
@@ -560,6 +588,9 @@ pub enum Fault {
     /// The next failed fence `node_id` reports by a revoke's answer cannot
     /// be recorded.
     FailureRecord { node_id: String },
+    /// The next write that clears the `lost_at` of `node_id`, a node
+    /// declared lost that returned (section 8.3), fails.
+    ClearLostAt { node_id: String },
     /// The next failover of `app_id` loses the voters' support after its
     /// last support check and before it writes the grant: the hub's support
     /// turns to none from then on.
@@ -3083,16 +3114,21 @@ impl Session {
                         // the hub (issue #392), so none grants the lease in
                         // between.
                         self.note_revoke_answer(&lease_id, &result).await;
+                        let mut goes_on = true;
                         if self
                             .hub
                             .0
                             .take_revoke(&self.node_id, self.generation, re)
                             .is_some()
                         {
-                            self.lost_revoke_answered(re).await;
+                            goes_on = self.lost_revoke_answered(re).await;
                             self.revoke_answered(outbox).await;
                         }
                         self.hub.0.revoke_answers.notify_waiters();
+                        if !goes_on {
+                            outbox.push(lost_at_not_cleared(&raw.id));
+                            return true;
+                        }
                         return false;
                     }
                     if self.snapshot_answered(re, &result, outbox).await {
@@ -3171,8 +3207,12 @@ impl Session {
                         .take_revoke(&self.node_id, self.generation, re)
                         .is_some()
                     {
-                        self.lost_revoke_answered(re).await;
+                        let goes_on = self.lost_revoke_answered(re).await;
                         self.revoke_answered(outbox).await;
+                        if !goes_on {
+                            outbox.push(lost_at_not_cleared(&raw.id));
+                            return true;
+                        }
                     } else if let Some((lease_id, token)) = self.same_token_grants.remove(re)
                         && error.code == quoro_proto::ErrorCode::BadMessage
                         && !self
@@ -3335,8 +3375,11 @@ impl Session {
     /// pass incomplete fails only on a database error or on a stored value
     /// that does not decode: the read of the node's `lost_at`, the reads of
     /// the leases restores wait for and of their release, the check of the
-    /// held grants, the step-4 rows, the per-lease read, the `lease.revoke`
-    /// records of a node declared lost (section 8.3), and the
+    /// held grants, the step-4 rows, the per-lease read, the read of the
+    /// leases a node's declaration revoked and of their release, the
+    /// `lease.revoke` records of a node declared lost (section 8.3), the
+    /// write that clears its `lost_at` when no revoke is to be answered, and
+    /// the
     /// `fence_failure` and `fence_ack_pending` columns they parse, which this
     /// primary writes from typed values. A
     /// listed lease id is only ever bound as a parameter, and a listed token
@@ -3356,8 +3399,9 @@ impl Session {
             }
         };
         // Sections 8.3 and 9 step 2: a node declared lost gets every lease
-        // its `hello` names revoked with reason `declared_lost`, and its
-        // `lost_at` is cleared once those revokes are answered.
+        // its `hello` names revoked with reason `declared_lost`, then every
+        // other lease its declaration revoked that it has not released, and
+        // its `lost_at` is cleared once all those revokes are answered.
         self.lost_at = None;
         self.lost_revokes.clear();
         let lost_at: Option<String> = match sqlx::query_scalar::<_, Option<String>>(
@@ -3375,8 +3419,11 @@ impl Session {
             }
         };
         // The `lease.revoke` system record of each `declared_lost` revoke
-        // (audit-log-format.md section 3.7): the app and the params.
-        let mut lost_records: Vec<(String, Value)> = Vec::new();
+        // (audit-log-format.md section 3.7): the app, taken from the lease
+        // row only, and the params.
+        let mut lost_records: Vec<(Option<String>, Value)> = Vec::new();
+        // The leases that got a `declared_lost` revoke from the listing.
+        let mut lost_revoked: HashSet<String> = HashSet::new();
         // A restore grants its lease again only once the old holder answered
         // the revoke `ok` (section 5.13, issue #392). That answer is lost with
         // the session that carried the revoke, and what this primary learned
@@ -3388,6 +3435,14 @@ impl Session {
             Ok(awaited) => {
                 for lease in awaited {
                     if reported.iter().any(|claimed| claimed.lease_id == lease.id) {
+                        continue;
+                    }
+                    // Revoked by the declaration: the `declared_lost` pass
+                    // below revokes it, once.
+                    if lost_at
+                        .as_deref()
+                        .is_some_and(|lost_at| leases::declaration_covers(&lease, lost_at))
+                    {
                         continue;
                     }
                     match leases::is_released(
@@ -3526,25 +3581,15 @@ impl Session {
             ) {
                 if lost_at.is_some() {
                     revoke.reason = quoro_proto::RevokeReason::DeclaredLost;
-                    // The record's app is the row's; the node's listing
-                    // names it only for a lease with no row.
-                    let app_id = match &row {
-                        Some(lease) => {
-                            (lease.resource_type == "app").then(|| lease.resource_id.clone())
-                        }
-                        None => (claimed.resource_type == quoro_proto::ResourceType::App)
-                            .then(|| claimed.resource_id.clone()),
-                    };
-                    if let Some(app_id) = app_id {
-                        lost_records.push((
-                            app_id,
-                            json!({
-                                "node_id": self.node_id,
-                                "fencing_token": revoke.fencing_token,
-                                "reason": "declared_lost",
-                            }),
-                        ));
-                    }
+                    // The record's app comes from the row only: what the
+                    // node lists is not checked, so a lease with no row is
+                    // recorded with no target (audit-log-format.md section
+                    // 2, where the target is optional).
+                    lost_records.push((
+                        row.as_ref().and_then(lease_app),
+                        lost_revoke_params(&self.node_id, revoke.fencing_token),
+                    ));
+                    lost_revoked.insert(claimed.lease_id.clone());
                     let id = self.queue_revoke(revoke, released, outbox);
                     self.lost_revokes.insert(id);
                 } else {
@@ -3562,6 +3607,51 @@ impl Session {
                 && lease_token(row) <= claimed.fencing_token
             {
                 raises.push((row.id.clone(), claimed.fencing_token));
+            }
+        }
+        // Sections 8.3 and 9 step 2, read with `Node.lost_at`: `lost_at` is
+        // cleared once the node answered the revokes of the leases the
+        // declaration revoked, so each of them that the `hello` does not
+        // list is revoked too, right after the listed ones, unless the node
+        // released it already. A revoke of a lease the node does not hold
+        // makes it fence again, which stops nothing more (section 8.5).
+        if let Some(lost_at) = &lost_at {
+            match leases::covered_by_declaration(&mut conn, &self.node_id, lost_at).await {
+                Ok(covered) => {
+                    for lease in covered {
+                        if lost_revoked.contains(&lease.id) {
+                            continue;
+                        }
+                        match leases::released_by_holder(&mut conn, &self.hub.0.releases, &lease)
+                            .await
+                        {
+                            Ok(false) => {}
+                            Ok(true) => continue,
+                            Err(e) => {
+                                tracing::warn!(code = %e.code.as_str(), lease_id = %lease.id, "cannot read a lease's release");
+                                complete = false;
+                                continue;
+                            }
+                        }
+                        let token = lease_token(&lease);
+                        lost_records
+                            .push((lease_app(&lease), lost_revoke_params(&self.node_id, token)));
+                        let id = self.queue_revoke(
+                            quoro_proto::LeaseRevoke {
+                                lease_id: quoro_proto::LeaseId(lease.id.clone()),
+                                fencing_token: token.max(1),
+                                reason: quoro_proto::RevokeReason::DeclaredLost,
+                            },
+                            token,
+                            outbox,
+                        );
+                        self.lost_revokes.insert(id);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(code = %e.code.as_str(), node_id = %self.node_id, "cannot read the leases the node's declaration revoked");
+                    complete = false;
+                }
             }
         }
         // The raises commit before the `hello` position can count (section
@@ -3625,16 +3715,17 @@ impl Session {
             let recorded: Result<(), ApiError> = async {
                 let mut w = self.hub.0.store.begin_write().await?;
                 for (app_id, params) in &lost_records {
-                    crate::audit::append(
-                        &mut w.tx,
-                        &crate::backups::restore::system_record(
-                            "lease.revoke",
-                            app_id,
-                            params.clone(),
-                            None,
-                        ),
-                    )
-                    .await?;
+                    let mut record = crate::backups::restore::system_record(
+                        "lease.revoke",
+                        app_id.as_deref().unwrap_or_default(),
+                        params.clone(),
+                        None,
+                    );
+                    if app_id.is_none() {
+                        record.target_type = None;
+                        record.target_id = None;
+                    }
+                    crate::audit::append(&mut w.tx, &record).await?;
                 }
                 w.commit().await?;
                 Ok(())
@@ -3652,9 +3743,13 @@ impl Session {
             return false;
         }
         self.lost_at = lost_at;
-        if self.lost_revokes.is_empty() {
-            // Nothing to answer: the node lists none of the leases.
-            self.clear_lost_at().await;
+        // Nothing to answer: no lease of the declaration waits for one. A
+        // failed clear ends the session as an incomplete pass does, before
+        // its `welcome` goes out and before anything below registers, so
+        // the next session revokes and clears again (see
+        // [`Session::clear_lost_at`]).
+        if self.lost_revokes.is_empty() && !self.clear_lost_at().await {
+            return false;
         }
         // Not listed: the held grant (ADR 0295).
         for row in step4.values() {
@@ -3918,19 +4013,36 @@ impl Session {
     /// `lost_at` is cleared (sections 8.3 and 9 step 2). A `fence_failed`
     /// answer lists the lease in `fence_failure` first, which keeps it
     /// ungrantable until an operator acknowledges it (section 8.5).
-    async fn lost_revoke_answered(&mut self, re: &str) {
+    ///
+    /// Returns whether the session may go on: `false` when the clear failed,
+    /// and the session must then end (see [`Session::clear_lost_at`]).
+    async fn lost_revoke_answered(&mut self, re: &str) -> bool {
         if self.lost_revokes.remove(re) && self.lost_revokes.is_empty() {
-            self.clear_lost_at().await;
+            return self.clear_lost_at().await;
         }
+        true
     }
 
     /// Clears the `lost_at` this session's start read, with its change-log
-    /// entry, unless the row holds another value by now. A failed write
-    /// leaves it set, and the node's next session tries again.
-    async fn clear_lost_at(&mut self) {
+    /// entry, unless the row holds another value by now. Returns whether
+    /// the write held, or there was nothing to clear.
+    ///
+    /// A failed write leaves `lost_at` set, and the session must then end
+    /// so that the node's next session revokes and clears again. A session
+    /// that went on would let the node take new leases while the stale
+    /// `lost_at` stays; [`leases::declaration_covers`] keeps such a lease
+    /// from being freed by it, but nothing would clear it until the node
+    /// next reconnects.
+    async fn clear_lost_at(&mut self) -> bool {
         let Some(lost_at) = self.lost_at.take() else {
-            return;
+            return true;
         };
+        if self.hub.take_fault(&Fault::ClearLostAt {
+            node_id: self.node_id.clone(),
+        }) {
+            tracing::warn!(node_id = %self.node_id, "cannot clear the node's lost_at: a test seam failed the write");
+            return false;
+        }
         let actor = Actor {
             kind: ActorType::Node,
             id: self.node_id.clone(),
@@ -3958,8 +4070,12 @@ impl Session {
             Ok(())
         }
         .await;
-        if let Err(e) = cleared {
-            tracing::warn!(code = %e.code.as_str(), node_id = %self.node_id, "cannot clear the node's lost_at");
+        match cleared {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(code = %e.code.as_str(), node_id = %self.node_id, "cannot clear the node's lost_at");
+                false
+            }
         }
     }
 
