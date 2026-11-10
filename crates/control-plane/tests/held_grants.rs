@@ -1590,3 +1590,90 @@ async fn an_unrecorded_failed_fence_holds_the_grant() {
         on_a = on_a_again;
     }
 }
+
+/// Section 9 step 2, ADR 0285 ("The mark"): only a marked row is raised for
+/// a node it does not name. B lists `held`, at the row's token, a lease
+/// whose unmarked row names A: B gets the revoke at the token it reports,
+/// and the row is left as it was, with no new change-log entry.
+#[tokio::test]
+async fn an_unmarked_row_listed_by_a_node_it_does_not_name_is_revoked_not_raised() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    manual_clock(&server);
+    let a = enroll(&server, &owner, "node-a", &["node"]).await;
+    let (mut on_a, _) = session(&server, &a, None, Vec::new(), true).await;
+    heartbeat(&mut on_a).await;
+    let project_id = project(&server, &owner).await;
+    let (app_id, lease_id) = app_with_lease(&server, &owner, &mut on_a, &project_id, "web").await;
+    let b = enroll(&server, &owner, "node-b", &["node"]).await;
+    let unchanged = (1, "local".to_string(), None, 0, false);
+    assert_eq!(row(&server, &lease_id).await, unchanged);
+    let before = newest_write(&server, &lease_id).await;
+
+    let (_on_b, frames) = session(
+        &server,
+        &b,
+        None,
+        vec![listed(&lease_id, &app_id, LeaseMode::Local, 1, "held")],
+        true,
+    )
+    .await;
+    let revokes = revokes_of(&frames, &lease_id);
+    assert_eq!(revokes.len(), 1, "{frames:?}");
+    assert_eq!(revokes[0]["body"]["fencing_token"], 1);
+    assert_eq!(row(&server, &lease_id).await, unchanged, "not raised");
+    assert_eq!(
+        newest_write(&server, &lease_id).await,
+        before,
+        "no new entry"
+    );
+}
+
+/// "Grants of a marked row": the session start never sends a marked row's
+/// grant itself. A's regrant over a row that reads `expiring` is written
+/// marked, `local` at token 2, on a session that does not follow the log:
+/// A, the one voter, never acknowledges the write and supports nothing, so
+/// a grant would be wrong. A's next session lists the lease `held` `local`
+/// at token 2, and no `lease_grant` of it goes out.
+#[tokio::test]
+async fn a_marked_row_listed_held_at_its_token_gets_no_grant_at_the_session_start() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    manual_clock(&server);
+    let a = enroll(&server, &owner, "node-a", &["node"]).await;
+    let (mut on_a, _) = session(&server, &a, None, Vec::new(), true).await;
+    heartbeat(&mut on_a).await;
+    let project_id = project(&server, &owner).await;
+    let (app_id, lease_id) = app_with_lease(&server, &owner, &mut on_a, &project_id, "web").await;
+    run(
+        &server,
+        "UPDATE leases SET mode = 'expiring', duration_ms = 15000 WHERE id = ?",
+        &lease_id,
+    )
+    .await;
+    let a_log = on_a.log.clone();
+    drop(on_a);
+    wait_disconnected(&server, &a).await;
+
+    let lease = listed(&lease_id, &app_id, LeaseMode::Local, 1, "expired");
+    let (on_a, frames) = session(&server, &a, Some(a_log.clone()), vec![lease], false).await;
+    assert!(grants_of(&frames, &lease_id).is_empty(), "{frames:?}");
+    let marked = (2, "local".to_string(), None, 1, false);
+    assert_eq!(row(&server, &lease_id).await, marked);
+    assert!(a_log.0 < newest_write(&server, &lease_id).await);
+    assert_eq!(
+        pending(&server, &owner, &app_id).await,
+        (true, vec![a.node_id.clone()]),
+        "not replicated"
+    );
+    assert!(!server.state.hub.authority().supports(D));
+    drop(on_a);
+    wait_disconnected(&server, &a).await;
+
+    let lease = listed(&lease_id, &app_id, LeaseMode::Local, 2, "held");
+    let (mut on_a, frames) = session(&server, &a, Some(a_log), vec![lease], false).await;
+    assert!(grants_of(&frames, &lease_id).is_empty(), "{frames:?}");
+    let frames = after_a_tick(&mut on_a).await;
+    assert!(grants_of(&frames, &lease_id).is_empty(), "{frames:?}");
+    assert_eq!(row(&server, &lease_id).await, marked);
+}

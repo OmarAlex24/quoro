@@ -965,6 +965,44 @@ mod tests {
         std::fs::remove_dir_all(&data_dir).unwrap();
     }
 
+    /// Section 4.2 rule 3: a held grant goes out only once the revokes
+    /// before it are answered, and a held-back step-4 revoke of another
+    /// lease is one of them. On a live session past its start with no
+    /// revoke unanswered, one held-back revoke keeps the session from being
+    /// ready; with none it is ready.
+    #[tokio::test]
+    async fn a_held_back_revoke_keeps_the_session_from_being_ready() {
+        let (state, node_id, data_dir) = hub_with_node().await;
+        let hub = &state.hub;
+        let (generation, _rx, _closed, _changed) = hub.attach(&node_id);
+        assert!(!hub.session_ready(&node_id, generation), "start not done");
+        hub.mark_start_done(&node_id, generation);
+        {
+            let sessions = hub.0.sessions.lock().unwrap();
+            let handle = &sessions[&node_id];
+            assert!(handle.start_done);
+            assert!(handle.pending.lock().unwrap().revoke_leases.is_empty());
+            assert_eq!(handle.held_revokes, 0);
+        }
+        hub.0
+            .sessions
+            .lock()
+            .unwrap()
+            .get_mut(&node_id)
+            .unwrap()
+            .held_revokes = 1;
+        assert!(!hub.session_ready(&node_id, generation), "one held back");
+        hub.0
+            .sessions
+            .lock()
+            .unwrap()
+            .get_mut(&node_id)
+            .unwrap()
+            .held_revokes = 0;
+        assert!(hub.session_ready(&node_id, generation));
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
     /// ADR 0299 and review finding B1: a `log_ack` counts only on a session
     /// whose start pass ran to its end.
     #[tokio::test]

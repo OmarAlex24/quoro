@@ -1568,6 +1568,51 @@ mod tests {
         std::fs::remove_dir_all(&data_dir).unwrap();
     }
 
+    /// ADR 0285 ("The mark"), section 9 step 2: a node the row does not
+    /// name lists the lease at the row's token. An unmarked row is not
+    /// raised for it: no write, no change-log entry. The same row once
+    /// marked is raised above the token the node reports.
+    #[tokio::test]
+    async fn only_a_marked_row_is_raised_for_another_lister() {
+        let (store, lease, actor, data_dir) = store_with_lease().await;
+        assert!(!lease.unsettled);
+        assert_eq!(lease.fencing_token, 1);
+        let entries = log_len(&store).await;
+
+        let mut w = store.begin_write().await.unwrap();
+        let raised = super::raise_for_other_lister(&mut w.tx, &lease.id, "nod_other", 1, &actor)
+            .await
+            .unwrap();
+        w.commit().await.unwrap();
+        assert!(
+            raised.is_none(),
+            "an unmarked row is not raised: {raised:?}"
+        );
+        let mut conn = store.pool().acquire().await.unwrap();
+        let row = super::by_id(&mut conn, &lease.id).await.unwrap().unwrap();
+        drop(conn);
+        assert_eq!(row.fencing_token, 1);
+        assert!(row.revoked_at.is_none());
+        assert!(!row.unsettled);
+        assert_eq!(log_len(&store).await, entries, "no change-log entry");
+
+        sqlx::query("UPDATE leases SET unsettled = 1 WHERE id = ?")
+            .bind(&lease.id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let mut w = store.begin_write().await.unwrap();
+        let raised = super::raise_for_other_lister(&mut w.tx, &lease.id, "nod_other", 1, &actor)
+            .await
+            .unwrap();
+        w.commit().await.unwrap();
+        let raised = raised.expect("a marked row is raised");
+        assert_eq!(raised.fencing_token, 2);
+        assert!(raised.revoked_at.is_some());
+        assert_eq!(log_len(&store).await, entries + 1);
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
     /// Issue #392: a release covers the lease only at its token or a lower
     /// one, and only for the holder that released it.
     #[test]
