@@ -278,6 +278,34 @@ pub async fn restart_with_resolver(server: &Server, resolver: Arc<dyn DigestReso
     }
 }
 
+/// [`restart_with_resolver`] with [`ReferenceAsDigest`], except that the TLS
+/// pair is read again from `<data_dir>/tls/` with [`tls_identity`], as
+/// `quoro serve` reads it at every start: a test that replaced the files
+/// restarts on the new pair. Stop the first process's node sessions first.
+pub async fn restart_reloading_tls(server: &Server) -> Server {
+    let mut config = (*server.state.config).clone();
+    config.tls = tls_identity(&server.data_dir);
+    let state = AppState::open(
+        server.state.store.clone(),
+        config,
+        Arc::new(ReferenceAsDigest),
+        Arc::clone(&server.state.data_key),
+    )
+    .await
+    .unwrap();
+    let app = router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    Server {
+        base,
+        data_dir: server.data_dir.clone(),
+        state,
+    }
+}
+
 /// The problem body's `code` and `reason`.
 pub async fn problem(res: reqwest::Response) -> (u16, String, Option<String>) {
     let status = res.status().as_u16();

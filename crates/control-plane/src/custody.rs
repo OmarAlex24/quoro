@@ -199,16 +199,28 @@ impl Keyring<'_> {
 }
 
 /// The `tls` plaintext: `{"cert_pem": ..., "key_pem": ...}` in its RFC 8785
-/// form. The copy of the private key the JSON value holds is wiped.
+/// form. It is written into one buffer sized up front for the longest form
+/// the pair can take ([`tls_plaintext_capacity`]), so the buffer never grows
+/// and leaves no unwiped fragment of the private key behind. The copy of the
+/// private key the JSON value holds is wiped too.
 fn tls_plaintext(tls: &TlsIdentity) -> Result<Zeroizing<Vec<u8>>, String> {
+    let mut out = Zeroizing::new(String::with_capacity(tls_plaintext_capacity(tls)));
     let mut value = json!({ "cert_pem": tls.cert_pem(), "key_pem": tls.key_pem() });
-    let canonical = jcs::canonicalize(&value);
+    let written = jcs::canonicalize_into(&mut out, &value);
     if let Some(Value::String(key)) = value.get_mut("key_pem") {
         key.zeroize();
     }
-    canonical
-        .map(|text| Zeroizing::new(text.into_bytes()))
-        .map_err(|e| format!("the TLS pair has no RFC 8785 form: {}", e.0))
+    written.map_err(|e| format!("the TLS pair has no RFC 8785 form: {}", e.0))?;
+    // Moves the buffer out, without copying it.
+    Ok(Zeroizing::new(std::mem::take(&mut *out).into_bytes()))
+}
+
+/// The most bytes the `tls` plaintext of `tls` can take: RFC 8785 writes each
+/// byte of a string as at most six (`\u001f`), and the object adds its braces
+/// and member names.
+fn tls_plaintext_capacity(tls: &TlsIdentity) -> usize {
+    const FRAME: &str = r#"{"cert_pem":"","key_pem":""}"#;
+    FRAME.len() + 6 * (tls.cert_pem().len() + tls.key_pem().len())
 }
 
 /// `sealed` as a `node_key_custody` change-log payload carries it: standard
@@ -358,11 +370,64 @@ pub(crate) enum Binding {
     KeyChanged,
 }
 
+/// A node's `roles`, `status`, `custody_public_key` and
+/// `custody_key_changed_at`, as [`bind_from_hello`] reads them.
+type BindRow = (String, String, Option<String>, Option<String>);
+
+/// Reads the node row [`bind_from_hello`] decides on, through `executor`.
+async fn read_bind_row<'e, E>(executor: E, node_id: &str) -> Result<Option<BindRow>, String>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query_as(
+        "SELECT roles, status, custody_public_key, custody_key_changed_at FROM nodes WHERE id = ?",
+    )
+    .bind(node_id)
+    .fetch_optional(executor)
+    .await
+    .map_err(|e| format!("cannot read the custody key of {node_id}: {e}"))
+}
+
+/// Whether a node row can bind a custody key: it has the `node` role and is
+/// not removed. Edge-only and witness-only machines get no seal (section
+/// 7.2).
+fn can_bind((roles, status, _, _): &BindRow) -> bool {
+    status != "removed" && has_node_role(roles)
+}
+
+/// What a usable reported key does to a node row that can bind one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    /// The bound key again: nothing to write.
+    Same,
+    /// No key is bound yet: store it and seal every key in use to it.
+    Bind,
+    /// A different key, refused before: nothing to write.
+    Refused,
+    /// A different key, refused for the first time: record the change.
+    Refuse,
+}
+
+fn step((_, _, stored, changed_at): &BindRow, reported: &CustodyPublicKey) -> Step {
+    match stored {
+        None => Step::Bind,
+        Some(stored)
+            if CustodyPublicKey::from_base64(stored)
+                .is_ok_and(|stored| stored.to_bytes() == reported.to_bytes()) =>
+        {
+            Step::Same
+        }
+        Some(_) if changed_at.is_some() => Step::Refused,
+        Some(_) => Step::Refuse,
+    }
+}
+
 /// Binds the custody key a `hello` reported (section 7.2, "Binding", ADR
-/// 0231), in one write:
+/// 0231):
 ///
 /// - for a machine with the `node` role and no bound key, the key is stored,
-///   re-encoded from its 32 bytes, and every key in use is sealed to it;
+///   re-encoded from its 32 bytes, and every key in use is sealed to it, in
+///   one write;
 /// - the same key changes nothing;
 /// - a different key sets `nodes.custody_key_changed_at` and writes the audit
 ///   record `node.custody_key_changed` the first time only, seals nothing,
@@ -370,11 +435,17 @@ pub(crate) enum Binding {
 /// - a key that is not base64 of 32 bytes is ignored as if absent, with a
 ///   warning, and a machine without the `node` role binds nothing.
 ///
+/// The node row is read first through the read pool, so a `hello` that
+/// changes nothing, which is almost every `hello`, never waits for the
+/// writer. Only a first key or a first refusal opens the write, which reads
+/// the row again and decides again: another session or the reconcile may have
+/// written in between.
+///
 /// # Errors
 ///
-/// A message when the first key cannot be stored or sealed; nothing is then
-/// written. A failed write for a changed key is only logged, and the key is
-/// still reported changed.
+/// A message when the node row cannot be read, or the first key cannot be
+/// stored or sealed; nothing is then written. A failed write for a changed key
+/// is only logged, and the key is still reported changed.
 pub(crate) async fn bind_from_hello(
     store: &Store,
     keyring: Keyring<'_>,
@@ -384,19 +455,10 @@ pub(crate) async fn bind_from_hello(
     let Some(reported) = reported else {
         return Ok(Binding::Unchanged);
     };
-    let mut w = store.begin_write().await.map_err(|e| e.to_string())?;
-    let row: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT roles, status, custody_public_key, custody_key_changed_at FROM nodes WHERE id = ?",
-    )
-    .bind(node_id)
-    .fetch_optional(&mut *w.tx)
-    .await
-    .map_err(|e| format!("cannot read the custody key of {node_id}: {e}"))?;
-    let Some((roles, status, stored, changed_at)) = row else {
+    let Some(row) = read_bind_row(store.pool(), node_id).await? else {
         return Ok(Binding::Unchanged);
     };
-    // Edge-only and witness-only machines get no seal (section 7.2).
-    if status == "removed" || !has_node_role(&roles) {
+    if !can_bind(&row) {
         return Ok(Binding::Unchanged);
     }
     let Ok(reported) = CustodyPublicKey::from_base64(reported) else {
@@ -406,8 +468,23 @@ pub(crate) async fn bind_from_hello(
         );
         return Ok(Binding::Unchanged);
     };
-    match stored {
-        None => {
+    match step(&row, &reported) {
+        Step::Same => return Ok(Binding::Unchanged),
+        Step::Refused => return Ok(Binding::KeyChanged),
+        Step::Bind | Step::Refuse => {}
+    }
+
+    let mut w = store.begin_write().await.map_err(|e| e.to_string())?;
+    let Some(row) = read_bind_row(&mut *w.tx, node_id).await? else {
+        return Ok(Binding::Unchanged);
+    };
+    if !can_bind(&row) {
+        return Ok(Binding::Unchanged);
+    }
+    match step(&row, &reported) {
+        Step::Same => Ok(Binding::Unchanged),
+        Step::Refused => Ok(Binding::KeyChanged),
+        Step::Bind => {
             sqlx::query(
                 "UPDATE nodes SET custody_public_key = ? WHERE id = ? AND custody_public_key IS NULL",
             )
@@ -434,21 +511,13 @@ pub(crate) async fn bind_from_hello(
                 .map_err(|e| format!("cannot bind the custody key of {node_id}: {e}"))?;
             Ok(Binding::Bound)
         }
-        Some(stored)
-            if CustodyPublicKey::from_base64(&stored)
-                .is_ok_and(|stored| stored.to_bytes() == reported.to_bytes()) =>
-        {
-            Ok(Binding::Unchanged)
-        }
-        Some(_) => {
-            if changed_at.is_none() {
-                let recorded = match record_key_changed(&mut w.tx, node_id).await {
-                    Ok(()) => w.commit().await.map_err(|e| e.to_string()),
-                    Err(e) => Err(e),
-                };
-                if let Err(e) = recorded {
-                    tracing::warn!(%e, node_id, "cannot record a changed custody key");
-                }
+        Step::Refuse => {
+            let recorded = match record_key_changed(&mut w.tx, node_id).await {
+                Ok(()) => w.commit().await.map_err(|e| e.to_string()),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = recorded {
+                tracing::warn!(%e, node_id, "cannot record a changed custody key");
             }
             Ok(Binding::KeyChanged)
         }
@@ -673,6 +742,95 @@ mod tests {
         let pair: Value = serde_json::from_slice(&held[2].plaintext).unwrap();
         assert_eq!(pair["cert_pem"], tls.cert_pem());
         assert_eq!(pair["key_pem"], tls.key_pem());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The `tls` plaintext of a fixed tiny pair, written out by hand rather
+    /// than with `jcs`: `cert_pem` before `key_pem` (RFC 8785 member order),
+    /// no whitespace, and each line feed escaped as `\n`.
+    #[test]
+    fn the_tls_plaintext_of_a_fixed_pair_is_its_rfc_8785_form() {
+        let tls = TlsIdentity::from_pem(
+            "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n".to_string(),
+            "-----BEGIN PRIVATE KEY-----\nBAUG\n-----END PRIVATE KEY-----\n".to_string(),
+        )
+        .unwrap();
+        let expected: &[u8] = br#"{"cert_pem":"-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n","key_pem":"-----BEGIN PRIVATE KEY-----\nBAUG\n-----END PRIVATE KEY-----\n"}"#;
+        assert_eq!(&tls_plaintext(&tls).unwrap()[..], expected);
+    }
+
+    /// The `tls` plaintext equals `jcs::canonicalize` byte for byte, and is
+    /// written into the buffer sized for it without growing it, so no
+    /// reallocation leaves a copy of the key behind. The second key is made
+    /// of the characters RFC 8785 escapes, which make the longest form.
+    #[test]
+    fn the_tls_plaintext_is_its_jcs_form_in_one_buffer() {
+        let generated = test_tls();
+        let escaped: String = (0u8..0x20)
+            .map(char::from)
+            .chain(['"', '\\', '/', 'é'])
+            .cycle()
+            .take(512)
+            .collect();
+        let worst = TlsIdentity::from_pem(generated.cert_pem().to_string(), escaped).unwrap();
+        for tls in [&generated, &worst] {
+            let plaintext = tls_plaintext(tls).unwrap();
+            let expected =
+                jcs::canonicalize(&json!({ "cert_pem": tls.cert_pem(), "key_pem": tls.key_pem() }))
+                    .unwrap();
+            assert_eq!(&plaintext[..], expected.as_bytes());
+            assert_eq!(
+                plaintext.capacity(),
+                tls_plaintext_capacity(tls),
+                "the buffer never grew"
+            );
+        }
+    }
+
+    /// A `hello` that would change nothing reads the node row through the
+    /// read pool and answers without the writer: with a write transaction
+    /// held open, the bound key again and a refused key both answer at once.
+    #[tokio::test]
+    async fn a_hello_that_changes_nothing_does_not_take_the_writer() {
+        let dir = temp_dir();
+        // A file database: the in-memory one has a single connection, which
+        // the held write would take from the read pool too.
+        let store = Store::open(&dir.join("quoro.db")).await.unwrap();
+        let node_id = local_node(&store).await;
+        let keys = ClusterKeys::load_or_generate(&dir).unwrap();
+        let data_key = DataKey::ephemeral();
+        let tls = test_tls();
+        let keyring = Keyring {
+            cluster_id: "cls_01JC9Y0000000000000000000A",
+            keys: &keys,
+            data_key: &data_key,
+            tls: &tls,
+        };
+        let bound = CustodyKey::generate(&mut seals::os_rng())
+            .public_key()
+            .to_base64();
+        let changed = CustodyKey::generate(&mut seals::os_rng())
+            .public_key()
+            .to_base64();
+        for (reported, expected) in [(&bound, Binding::Bound), (&changed, Binding::KeyChanged)] {
+            let answer = bind_from_hello(&store, keyring, &node_id, Some(reported.as_str())).await;
+            assert_eq!(answer.unwrap(), expected);
+        }
+
+        let held = store.begin_write().await.unwrap();
+        for (reported, expected) in [
+            (&bound, Binding::Unchanged),
+            (&changed, Binding::KeyChanged),
+        ] {
+            let answer = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                bind_from_hello(&store, keyring, &node_id, Some(reported.as_str())),
+            )
+            .await
+            .expect("the hello does not wait for the writer");
+            assert_eq!(answer.unwrap(), expected);
+        }
+        drop(held);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

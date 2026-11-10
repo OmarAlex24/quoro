@@ -31,8 +31,19 @@ pub struct NotCanonical(pub String);
 /// or whose magnitude is outside `[1e-6, 1e21)` (other than 0), is refused.
 pub fn canonicalize(value: &Value) -> Result<String, NotCanonical> {
     let mut out = String::new();
-    write_value(&mut out, value, Numbers::Strict)?;
+    canonicalize_into(&mut out, value)?;
     Ok(out)
+}
+
+/// Appends the canonical JSON text of `value` to `out`: exactly what
+/// [`canonicalize`] returns, into a buffer the caller owns, such as one sized
+/// up front and wiped after use.
+///
+/// # Errors
+///
+/// As [`canonicalize`]; `out` may then hold part of the text.
+pub fn canonicalize_into(out: &mut String, value: &Value) -> Result<(), NotCanonical> {
+    write_value(out, value, Numbers::Strict)
 }
 
 /// The text of `value` that an audit record's `params_sha256` covers

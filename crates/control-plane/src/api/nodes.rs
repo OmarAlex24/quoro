@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use sqlx::Row;
 use sqlx::SqliteConnection;
 use sqlx::sqlite::SqliteRow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use utoipa::{IntoParams, ToSchema};
 
 /// The operation string recorded in the audit log.
@@ -424,8 +424,9 @@ type CustodyRow = (String, bool, bool, Option<String>, Option<String>);
 /// - `pending` otherwise.
 ///
 /// It is never absent. The keys in use are the primary's own
-/// ([`crate::custody::Keyring::key_ids_in_use`]); the bound key, the refused
-/// change and the seal rows are read once, through `executor`.
+/// ([`crate::custody::Keyring::key_ids_in_use`]), computed once per call; the
+/// bound key, the refused change and the seal rows of `nodes` alone are read
+/// in one query, through `executor`.
 ///
 /// # Errors
 ///
@@ -438,37 +439,58 @@ pub(crate) async fn attach_custody<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
-    let rows: Vec<CustodyRow> = sqlx::query_as(
+    if nodes.is_empty() {
+        return Ok(());
+    }
+    let placeholders = vec!["?"; nodes.len()].join(", ");
+    let sql = format!(
         "SELECT n.id, n.custody_public_key IS NOT NULL, n.custody_key_changed_at IS NOT NULL, \
          k.key_kind, k.key_id \
-         FROM nodes n LEFT JOIN node_key_custody k ON k.node_id = n.id",
-    )
-    .fetch_all(executor)
-    .await?;
+         FROM nodes n LEFT JOIN node_key_custody k ON k.node_id = n.id \
+         WHERE n.id IN ({placeholders})"
+    );
+    let mut query = sqlx::query_as::<_, CustodyRow>(&sql);
+    for node in nodes.iter() {
+        query = query.bind(&node.id);
+    }
+    let rows = query.fetch_all(executor).await?;
+    let mut read: HashMap<&str, CustodyRead<'_>> = HashMap::new();
+    for (id, has_key, has_changed, key_kind, key_id) in &rows {
+        let entry = read.entry(id.as_str()).or_insert_with(|| CustodyRead {
+            bound: *has_key,
+            changed: *has_changed,
+            sealed: Vec::new(),
+        });
+        if let (Some(key_kind), Some(key_id)) = (key_kind, key_id) {
+            entry.sealed.push((key_kind.as_str(), key_id.as_str()));
+        }
+    }
     let in_use = keyring.key_ids_in_use();
     for node in nodes {
-        let mut bound = false;
-        let mut changed = false;
-        let mut sealed: Vec<(&str, &str)> = Vec::new();
-        for (id, has_key, has_changed, key_kind, key_id) in &rows {
-            if *id != node.id {
-                continue;
-            }
-            bound = *has_key;
-            changed = *has_changed;
-            if let (Some(key_kind), Some(key_id)) = (key_kind, key_id) {
-                sealed.push((key_kind.as_str(), key_id.as_str()));
-            }
-        }
+        let (bound, changed, sealed) = read
+            .get(node.id.as_str())
+            .map_or((false, false, &[][..]), |read| {
+                (read.bound, read.changed, read.sealed.as_slice())
+            });
         node.custody = Some(custody_status(
             node.roles.contains(&NodeRole::Node),
             bound,
             changed,
-            &sealed,
+            sealed,
             &in_use,
         ));
     }
     Ok(())
+}
+
+/// What [`attach_custody`] read for one node.
+struct CustodyRead<'a> {
+    /// Whether a custody key is bound.
+    bound: bool,
+    /// Whether a changed key was refused.
+    changed: bool,
+    /// The `(key_kind, key_id)` of each of its seals.
+    sealed: Vec<(&'a str, &'a str)>,
 }
 
 /// `Node.custody` from what [`attach_custody`] read (section 7.2, "Status").

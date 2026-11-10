@@ -674,6 +674,40 @@ async fn an_unusable_key_binds_nothing() {
     );
 }
 
+/// A key of 32 zero bytes parses, but HPKE seals nothing to it (a low-order
+/// point), so binding it fails as a whole: the session goes on, and no key,
+/// no seal and no change-log entry are written; `Node.custody` reads `none`.
+/// A later good key then binds as the first key.
+#[tokio::test]
+async fn a_zero_key_binds_nothing_and_the_session_goes_on() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let node = enrolled(&server, &owner, "node-a", &["node"]).await;
+
+    let (mut socket, frames) = session(&server, &node, Some(STANDARD.encode([0u8; 32]))).await;
+    assert_eq!(frames[0]["type"], "welcome", "{frames:?}");
+    assert!(of_type(&frames, "error").is_empty(), "{frames:?}");
+    assert!(of_type(&ping(&mut socket, 1).await, "error").is_empty());
+    assert_eq!(
+        node_json(&server, &owner, &node.node_id).await["status"],
+        "connected"
+    );
+    assert_eq!(bound_key(&server, &node.node_id).await, None);
+    assert!(seal_rows(&server, &node.node_id).await.is_empty());
+    assert_eq!(custody_writes(&server).await, 0);
+    assert_eq!(custody_of(&server, &owner, &node.node_id).await, "none");
+    drop(socket);
+
+    let key = new_key();
+    let _socket = bind(&server, &node, &key).await;
+    assert_eq!(
+        bound_key(&server, &node.node_id).await,
+        Some(key.public_key().to_base64())
+    );
+    assert_eq!(custody_writes(&server).await, 4, "the key and three seals");
+    assert_eq!(custody_of(&server, &owner, &node.node_id).await, "sealed");
+}
+
 /// A client signed in as the owner on `server`, whose owner already exists.
 async fn owner_of(server: &Server) -> reqwest::Client {
     let client = server.client();
@@ -757,6 +791,125 @@ async fn a_restart_reconciles_the_seals() {
     let owner = owner_of(&restarted).await;
     assert_eq!(
         custody_of(&restarted, &owner, &node.node_id).await,
+        "sealed"
+    );
+}
+
+/// Section 7.2: a machine whose changed key was refused gets no seal at a
+/// restart, not even one it lacks, and keeps the seals made to its bound key,
+/// since only a removal or a key's retirement deletes seals ("When"). A
+/// healthy machine lacking the same seal is sealed again, so the reconcile
+/// did run.
+#[tokio::test]
+async fn a_restart_seals_nothing_to_a_key_changed_machine_and_keeps_its_seals() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let refused = enrolled(&server, &owner, "node-refused", &["node"]).await;
+    let healthy = enrolled(&server, &owner, "node-healthy", &["node"]).await;
+    drop(bind(&server, &refused, &new_key()).await);
+    drop(bind(&server, &healthy, &new_key()).await);
+    let (socket, frames) =
+        session(&server, &refused, Some(new_key().public_key().to_base64())).await;
+    let errors = of_type(&frames, "error");
+    assert_eq!(errors.len(), 1, "{frames:?}");
+    assert_eq!(errors[0]["body"]["code"], "custody_key_changed");
+    drop(socket);
+    assert!(changed_at(&server, &refused.node_id).await.is_some());
+
+    let pool = server.state.store.pool();
+    for node in [&refused, &healthy] {
+        sqlx::query("DELETE FROM node_key_custody WHERE node_id = ? AND key_kind = 'tls'")
+            .bind(&node.node_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+    let kept = seal_rows(&server, &refused.node_id).await;
+    assert_eq!(kept.len(), 2, "{kept:?}");
+    let logged = seal_entries(&server, &refused.node_id).await.len();
+
+    let restarted = restart_with_resolver(&server, Arc::new(ReferenceAsDigest)).await;
+
+    assert_eq!(
+        seal_rows(&restarted, &healthy.node_id).await.len(),
+        3,
+        "the reconcile ran and sealed the healthy machine again"
+    );
+    assert_eq!(
+        seal_rows(&restarted, &refused.node_id).await,
+        kept,
+        "no seal is made to the refused machine, and its seals are kept"
+    );
+    let entries = seal_entries(&restarted, &refused.node_id).await;
+    assert_eq!(entries.len(), logged, "nothing written for it");
+    assert!(entries.iter().all(|entry| entry.op == "create"));
+    let owner = owner_of(&restarted).await;
+    assert_eq!(
+        custody_of(&restarted, &owner, &refused.node_id).await,
+        "key_changed"
+    );
+}
+
+/// Section 7.2, "When": a primary restarted on a new TLS certificate and key,
+/// read from `<data_dir>/tls/` as at every start, seals the new pair to every
+/// bound machine under the new `key_id`, and deletes the old `tls` seals
+/// through the change log, as a retired key's.
+#[tokio::test]
+async fn a_replaced_tls_certificate_is_sealed_and_the_old_seal_deleted() {
+    let server = start().await;
+    let owner = server.owner().await;
+    let first = enrolled(&server, &owner, "node-a", &["node"]).await;
+    let second = enrolled(&server, &owner, "node-b", &["node"]).await;
+    let first_key = new_key();
+    let second_key = new_key();
+    drop(bind(&server, &first, &first_key).await);
+    drop(bind(&server, &second, &second_key).await);
+    let (_, old_id, _) = expected_keys(&server.data_dir).remove(2);
+
+    let replaced = rcgen::generate_simple_self_signed(vec!["primary.example".to_string()]).unwrap();
+    let tls_dir = server.data_dir.join("tls");
+    std::fs::write(tls_dir.join("key.pem"), replaced.key_pair.serialize_pem()).unwrap();
+    std::fs::write(tls_dir.join("cert.pem"), replaced.cert.pem()).unwrap();
+    let (kind, new_id, new_plaintext) = expected_keys(&server.data_dir).remove(2);
+    assert_eq!(kind, "tls");
+    assert_ne!(new_id, old_id);
+
+    let restarted = common::restart_reloading_tls(&server).await;
+    assert_eq!(restarted.state.config.tls.key_id(), new_id);
+
+    for (node, key) in [(&first, &first_key), (&second, &second_key)] {
+        let rows = seal_rows(&restarted, &node.node_id).await;
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(
+            rows.contains(&("tls".to_string(), new_id.clone())),
+            "{rows:?}"
+        );
+        let entries = seal_entries(&restarted, &node.node_id).await;
+        let sealed = entries
+            .iter()
+            .find(|entry| {
+                entry.op == "create" && entry.entity_id == format!("{}/tls/{new_id}", node.node_id)
+            })
+            .expect("a tls seal under the new key id");
+        let opened = open_seal(
+            key,
+            &restarted.state.cluster_id,
+            &node.node_id,
+            &sealed.payload,
+        )
+        .unwrap();
+        assert_eq!(opened, new_plaintext, "the seal opens to the new PEM");
+        let pair: Value = serde_json::from_slice(&opened).unwrap();
+        assert_eq!(pair["cert_pem"], replaced.cert.pem());
+        assert!(
+            entries.iter().any(|entry| entry.op == "delete"
+                && entry.entity_id == format!("{}/tls/{old_id}", node.node_id)),
+            "the old tls seal is deleted through the change log"
+        );
+    }
+    let owner = owner_of(&restarted).await;
+    assert_eq!(
+        custody_of(&restarted, &owner, &first.node_id).await,
         "sealed"
     );
 }
