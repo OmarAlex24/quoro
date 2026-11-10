@@ -2071,8 +2071,9 @@ async fn a_pending_acknowledgement_releases_only_the_grant_it_covered() {
 }
 
 /// Section 8.3, ADR 0183: a holder declared lost releases a `local` lease
-/// revoked by then. The API call is not there yet, so the test sets
-/// `nodes.lost_at` itself. A declaration older than the revoke says nothing
+/// revoked by then. The test sets `nodes.lost_at` itself, to place the
+/// declaration before and after the revoke; `declaring_the_old_node_lost_lets
+/// _the_restore_finish` uses the API. A declaration older than the revoke says nothing
 /// about it. An `expiring` lease also waits for its gate (section 8.4): see
 /// `a_lost_holders_expiring_lease_is_released_by_its_gate`.
 #[tokio::test]

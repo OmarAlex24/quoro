@@ -1219,6 +1219,20 @@ async fn declaring_a_node_lost_revokes_its_leases_and_answers_each_case() {
 
     drop(socket);
     wait_disconnected(&server, &node_id).await;
+    // A lease another node holds: declaring this node lost leaves it alone
+    // (section 8.3 touches the leases the node holds; ADR 0246).
+    let other = enrolled_node(&server, &owner, "node-beta").await;
+    sqlx::query(
+        "INSERT INTO leases (id, resource_type, resource_id, holder_node_id, mode, \
+         fencing_token, granted_at) \
+         VALUES (?, 'app', 'app_01JC9Z6Q5W8N3K4T7R2M1XHB0E', ?, 'local', 7, ?)",
+    )
+    .bind(OTHER_LEASE)
+    .bind(&other.node_id)
+    .bind(quoro_control_plane::store::now_rfc3339())
+    .execute(server.state.store.pool())
+    .await
+    .unwrap();
 
     // Human-only, before anything else is checked.
     let token = agent_token(&server, &owner).await;
@@ -1268,6 +1282,11 @@ async fn declaring_a_node_lost_revokes_its_leases_and_answers_each_case() {
     let revoked_at = revoked_at.expect("recorded revoked in the primary's view");
     assert!(revoked_at <= declared, "{revoked_at} <= {declared}");
     assert_eq!(holder, node_id, "the node stays named as the last holder");
+    assert_eq!(
+        lease_row(&server, OTHER_LEASE).await,
+        (7, None, other.node_id.clone()),
+        "a lease another node holds is left as it is"
+    );
 
     let entries = entries_after(&server, before).await;
     assert_eq!(entries.len(), 2, "{entries:?}");
