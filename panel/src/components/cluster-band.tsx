@@ -7,6 +7,7 @@ import { areaPlot, BARE_PAD, seriesSummary, toSeries } from '../lib/metric-area'
 import { formatPercent } from '../lib/metrics';
 import { DitherCanvas } from './dither-canvas';
 import { LampDot } from './lamp';
+import { SkelBar, Skeleton } from './skeleton';
 import { useLiveNodes } from './live-nodes';
 
 /** Room at the right for the newest sample's dot. */
@@ -19,15 +20,19 @@ const LOOK = { labels: false, dot: true, lineWidth: 1.5 } as const;
  * minutes, summed from each node's own samples, behind the apps running, the
  * VMs and the memory in use. Each new sample redraws the area at once. It says
  * Live only while every listed node is in the sums, and how many are otherwise.
+ * Until the lists and the first samples arrive, it is a skeleton of itself.
  */
 export function ClusterBand({
   apps,
   vms,
   nodes,
+  loading,
 }: {
   apps: readonly App[];
   vms: readonly Vm[];
   nodes: readonly Node[];
+  /** The node, app or VM list has not come back yet. */
+  loading: boolean;
 }) {
   const feeds = useLiveNodes();
   const states = useMemo(() => Object.values(feeds), [feeds]);
@@ -63,6 +68,11 @@ export function ClusterBand({
       ),
     [series, end, max],
   );
+  // A connected node whose stream has not reported, or still opens, means the first samples are on their way.
+  const connected = nodes.filter((node) => node.status === 'connected').length;
+  const opening = states.length < connected || states.some((feed) => feed.status === 'connecting');
+  if (loading || (!newest && opening)) return <BandSkeleton />;
+
   const summary = seriesSummary({
     label: 'Cluster CPU busy',
     values: series.values,
@@ -102,6 +112,30 @@ export function ClusterBand({
           </span>
         ) : null}
       </div>
+    </section>
+  );
+}
+
+/** The band while its data loads: the number, the facts line and the area as dither bars, at the band's own height. */
+function BandSkeleton() {
+  return (
+    <section className="card band band-skel" aria-label="Cluster load">
+      <Skeleton label="Loading the cluster’s load">
+        <div className="band-in">
+          <div className="band-l">
+            <div>
+              <p className="band-k">Cluster load, last 10 minutes</p>
+              <span className="band-skel-big">
+                <SkelBar width="128px" height={22} />
+              </span>
+            </div>
+            <span className="band-skel-facts">
+              <SkelBar width="min(300px, 100%)" />
+            </span>
+          </div>
+        </div>
+        <SkelBar className="band-skel-chart" />
+      </Skeleton>
     </section>
   );
 }

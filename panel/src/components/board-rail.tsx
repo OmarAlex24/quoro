@@ -25,6 +25,7 @@ import { AgentName } from './identity-name';
 import { LampDot } from './lamp';
 import { useLiveNodes } from './live-nodes';
 import { N1Strip } from './n1-strip';
+import { SkelBar, Skeleton } from './skeleton';
 import { Button } from './ui/button';
 import { Tag } from './ui/tag';
 
@@ -42,18 +43,22 @@ export function NeedsYou({
   incidents,
   targetName,
   canDecide,
+  loading = false,
 }: {
   /** Pending requests, the one that expires first first. */
   approvals: readonly Approval[];
   incidents: readonly Incident[];
   targetName: (approval: Approval) => string | undefined;
   canDecide: boolean;
+  /** The requests or the incidents have not come back yet. */
+  loading?: boolean;
 }) {
   const now = useNow(approvals.length > 0 || incidents.length > 0, 30_000);
   const [notice, setNotice] = useState<string | null>(null);
   // After a Deny the request and its buttons leave, so focus goes to this section's heading.
   const heading = useRef<HTMLHeadingElement>(null);
   const [first, ...more] = approvals;
+  if (loading && !first && incidents.length === 0) return <NeedsYouSkeleton />;
   if (!first && incidents.length === 0 && notice === null) return null;
 
   return (
@@ -203,9 +208,19 @@ function RailMeter({ share, mark, spoken }: { share: number | null; mark: number
  * and memory reserved against capacity with a mark at what is in use; then
  * the N+1 sentence.
  */
-export function RailNodes({ nodes, apps }: { nodes: readonly Node[]; apps: readonly App[] }) {
+export function RailNodes({
+  nodes,
+  apps,
+  loading = false,
+}: {
+  nodes: readonly Node[];
+  apps: readonly App[];
+  /** The node list has not come back yet. */
+  loading?: boolean;
+}) {
   const feeds = useLiveNodes();
   const shown = nodes.filter((node) => node.status !== 'removed');
+  if (loading) return <RailNodesSkeleton />;
   if (shown.length === 0) return null;
   return (
     <section className="card pnodes" aria-label="Nodes">
@@ -288,6 +303,8 @@ export function RecentActivity() {
   const first = useRef<Set<number> | null>(null);
   if (first.current === null && audit.data) first.current = new Set(audit.data.items.map((record) => record.seq));
   if (audit.isError || (audit.data && items.length === 0)) return null;
+  // Until the records and the names they mention are in, the rows are bars: never ids.
+  if (!audit.data || ctx.loading) return <RecentActivitySkeleton />;
 
   return (
     <section className="card pacts" aria-label="Recent activity">
@@ -335,5 +352,87 @@ function FeedRow({
         <time dateTime={record.time}>{clockTime(record.time)}</time>
       </Link>
     </li>
+  );
+}
+
+/* ---------- skeletons ---------- */
+
+/** A section head: its title as words, the link as a bar. */
+function SkeletonHead({ title }: { title: string }) {
+  return (
+    <div className="psec-h">
+      <h2>{title}</h2>
+      <SkelBar width="72px" className="psec-skel-link" />
+    </div>
+  );
+}
+
+/** Needs you while the requests load: who, the reason and the two buttons as bars. */
+function NeedsYouSkeleton() {
+  return (
+    <section className="card pneed" aria-label="Needs you">
+      <Skeleton label="Loading what needs you">
+        <SkeletonHead title="Needs you" />
+        <div className="pneed-b">
+          <div className="pneed-who">
+            <SkelBar className="rail-skel-avatar" />
+            <SkelBar width="70%" />
+          </div>
+          <SkelBar height={52} className="rail-skel-box" />
+          <div className="pneed-acts">
+            <SkelBar height={28} className="rail-skel-button" />
+            <SkelBar height={28} className="rail-skel-button" />
+          </div>
+        </div>
+      </Skeleton>
+    </section>
+  );
+}
+
+const NODE_SKELETON = ['38%', '30%', '44%'] as const;
+
+/** Nodes while the list loads: each row its name, tag and busy share, and the two meters as bars. */
+function RailNodesSkeleton() {
+  return (
+    <section className="card pnodes" aria-label="Nodes">
+      <Skeleton label="Loading nodes">
+        <SkeletonHead title="Nodes" />
+        {NODE_SKELETON.map((width, index) => (
+          <div key={index} className="pnd">
+            <SkelBar className="rail-skel-dot" />
+            <div className="pnd-n">
+              <SkelBar width={width} />
+              <SkelBar width="44px" className="ml-auto" />
+            </div>
+            <div className="pnd-ms">
+              <SkelBar height={6} />
+              <SkelBar height={6} />
+            </div>
+          </div>
+        ))}
+      </Skeleton>
+    </section>
+  );
+}
+
+const ACTIVITY_SKELETON = ['82%', '64%', '90%', '58%', '74%'] as const;
+
+/** Recent activity while it loads: an avatar, a sentence and its time per row. */
+function RecentActivitySkeleton() {
+  return (
+    <section className="card pacts" aria-label="Recent activity">
+      <Skeleton label="Loading recent activity">
+        <SkeletonHead title="Recent activity" />
+        <div className="pfeed">
+          {ACTIVITY_SKELETON.map((width, index) => (
+            <div key={index} className="pev-a">
+              <SkelBar className="rail-skel-avatar" />
+              <SkelBar width={width} />
+              <SkelBar width="34px" />
+            </div>
+          ))}
+        </div>
+      </Skeleton>
+    </section>
   );
 }

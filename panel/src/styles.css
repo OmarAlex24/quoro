@@ -2518,6 +2518,149 @@
   }
 
   /*
+   * The board while it loads: each part a skeleton in its own shape and at
+   * its own height, so nothing jumps when the data comes in. Bars sit on a
+   * card, so they mix in the rule colour as they do in a box.
+   */
+  .card > .skel-field {
+    display: block;
+    --skel-bar: color-mix(in oklab, var(--line) 45%, var(--raised));
+  }
+
+  .card.ptile-skel {
+    --skel-bar: color-mix(in oklab, var(--line) 45%, var(--raised));
+  }
+
+  /* A name inside a sentence, on its text line. */
+  .skel-name {
+    display: inline-block;
+    vertical-align: -0.12em;
+    --skel-bar: color-mix(in oklab, var(--line) 60%, var(--raised));
+  }
+
+  .skel-name .skel {
+    display: inline-block;
+    height: 0.9em;
+    border-radius: 4px;
+  }
+
+  .band-skel-big {
+    display: flex;
+    align-items: center;
+    height: 29px;
+  }
+
+  .band-skel-facts {
+    display: flex;
+    align-items: center;
+    height: 18px;
+  }
+
+  .band-skel .skel.band-skel-chart {
+    position: absolute;
+    top: 14px;
+    right: 16px;
+    bottom: 14px;
+    width: 48%;
+    height: auto;
+    border-radius: 7px;
+  }
+
+  .ptile-skel .ptile-h {
+    min-height: 47px;
+  }
+
+  .ptile-skel .ptile-h .skel {
+    flex: none;
+  }
+
+  .skel.ptile-skel-st {
+    margin-left: auto;
+  }
+
+  .ptile-skel .pprev {
+    display: block;
+  }
+
+  .ptile-skel .skel.ptile-skel-field {
+    position: absolute;
+    inset: 14px 24%;
+    height: auto;
+    border-radius: 6px;
+  }
+
+  .skel.ptile-skel-glyph {
+    width: 20px;
+    height: 20px;
+    border-radius: 6px;
+  }
+
+  .ptile-skel-tags {
+    display: flex;
+    gap: 4px;
+    margin-left: auto;
+  }
+
+  .skel.ptile-skel-lamp,
+  .skel.rail-skel-dot {
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+  }
+
+  .skel.psec-skel-link {
+    margin-left: auto;
+  }
+
+  .skel.rail-skel-avatar {
+    flex: none;
+    width: 22px;
+    height: 22px;
+    border-radius: 6px;
+  }
+
+  .pneed .skel-field .pneed-who {
+    align-items: center;
+  }
+
+  .skel.rail-skel-box {
+    border-radius: 8px;
+  }
+
+  .skel.rail-skel-button {
+    border-radius: 7px;
+  }
+
+  .pnodes .skel-field .pnd-n {
+    min-height: 20px;
+  }
+
+  .pacts .skel-field .pev-a {
+    align-items: center;
+  }
+
+  @media (max-width: 767.98px) {
+    .band-skel > .skel-field {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+    }
+
+    .band-skel-big {
+      height: 24px;
+    }
+
+    .band-skel .skel.band-skel-chart {
+      position: relative;
+      inset: auto;
+      order: 1;
+      width: auto;
+      height: 76px;
+      margin: 0 16px 16px;
+    }
+  }
+
+  /*
    * A project's canvas. The stage fills the space under the top bar; the
    * scroller pans; the world is scaled by the zoom and holds one slot per
    * card. An aura sits in its card's slot, behind every card.

@@ -7,11 +7,17 @@ import { shortId } from '../lib/agency-format';
 import { personLabel } from '../lib/users';
 import { useSession } from '../session';
 import { Avatar } from './avatar';
+import { SkelName } from './skeleton';
 
-/** An agent id shown as its name, linked to the agent; the id while loading or unknown. */
+/**
+ * An agent id shown as its name, linked to the agent: a short skeleton bar
+ * while the agents list loads, and the id only when the list has come back
+ * without it (or could not be read).
+ */
 export function AgentName({ id, link = true }: { id: string; link?: boolean }) {
   const agents = useListAgents({ limit: 200 }, { query: { staleTime: 30_000 } });
   const agent = agents.data?.items.find((candidate) => candidate.id === id);
+  if (!agent && agents.isPending) return <SkelName label="Loading the agent’s name" />;
   const label = agent?.name ?? shortId(id);
   if (!link) return <span title={id}>{label}</span>;
   return (

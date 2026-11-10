@@ -27,6 +27,20 @@ export function SkelBar({
   return <span className={cn('skel', className)} style={style} />;
 }
 
+/**
+ * A name inside a sentence that has not arrived yet: a short bar on the text
+ * line, and words for screen readers. Once the list has loaded and the name
+ * is still unknown, the caller shows the id instead.
+ */
+export function SkelName({ label = 'Loading the name', width = '9ch' }: { label?: string; width?: string }) {
+  return (
+    <span className="skel-name">
+      <span className="skel" style={{ width }} aria-hidden="true" />
+      <span className="sr-only">{label}</span>
+    </span>
+  );
+}
+
 /** The status region a skeleton sits in: `label` is what screen readers hear. */
 export function Skeleton({
   label,

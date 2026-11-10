@@ -26,12 +26,11 @@ import { CommandMenu, type JumpItem } from '../components/command-menu';
 import { EmptyState } from '../components/empty-state';
 import { LiveNodesProvider } from '../components/live-nodes';
 import { NewProjectDialog } from '../components/new-project-dialog';
-import { ProjectTile, type TileContext } from '../components/project-tile';
-import { usePendingApprovals } from '../components/shell/shell-data';
+import { ProjectTile, ProjectTilesSkeleton, type TileContext } from '../components/project-tile';
+import { usePendingApprovalsQuery } from '../components/shell/shell-data';
 import { Button } from '../components/ui/button';
 import { ProblemBanner } from '../components/ui/problem-banner';
 import { DeployScreen } from './deploy-screen';
-import { SkeletonCards } from '../components/skeleton';
 
 const projectsRoute = getRouteApi('/shell/projects');
 
@@ -109,8 +108,8 @@ function ProjectsBoard() {
   const deployments = Object.fromEntries(
     apps.map((app, index) => [app.id, deploymentResults[index]?.data?.items]),
   );
-  const pending = usePendingApprovals();
-  const approvals = useMemo(() => pendingByExpiry(pending), [pending]);
+  const pendingQuery = usePendingApprovalsQuery();
+  const approvals = useMemo(() => pendingByExpiry(pendingQuery.data?.items ?? []), [pendingQuery.data]);
   const now = useNow(true, 60_000);
 
   const tiles = useMemo(() => projectTiles(projects, apps, vms), [projects, apps, vms]);
@@ -243,9 +242,14 @@ function ProjectsBoard() {
 
         <div className="board">
           <div className="board-main">
-            <ClusterBand apps={apps} vms={vms} nodes={nodes} />
+            <ClusterBand
+              apps={apps}
+              vms={vms}
+              nodes={nodes}
+              loading={nodesQuery.isPending || appsQuery.isPending || vmsQuery.isPending}
+            />
             {loading ? (
-              <SkeletonCards label="Loading projects" height={222} lines={4} count={2} className="ptiles-grid" />
+              <ProjectTilesSkeleton />
             ) : tiles.length === 0 ? (
               listError ? null : (
                 <EmptyState title="No projects yet" className="mt-6" action={newProject}>
@@ -291,12 +295,13 @@ function ProjectsBoard() {
 
           <div className="board-rail">
             <NeedsYou
+              loading={pendingQuery.isLoading || incidentsQuery.isPending}
               approvals={approvals}
               incidents={incidents}
               targetName={nameOf}
               canDecide={canDecideApprovals(me)}
             />
-            <RailNodes nodes={nodes} apps={apps} />
+            <RailNodes nodes={nodes} apps={apps} loading={nodesQuery.isPending} />
             <RecentActivity />
           </div>
         </div>

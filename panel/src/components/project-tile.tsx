@@ -17,6 +17,7 @@ import { ApprovalCallout } from './approval-callout';
 import { DitherCanvas } from './dither-canvas';
 import { GlyphTile } from './glyph-tile';
 import { Lamp, LampDot } from './lamp';
+import { SkelBar, Skeleton } from './skeleton';
 import { Tag } from './ui/tag';
 
 /** The field shows this many service tiles; beyond it, the last place says how many more. */
@@ -215,5 +216,54 @@ function TileFootLine({ foot, when }: { foot: TileFoot; when: string }) {
         {when}
       </time>
     </p>
+  );
+}
+
+/** Name widths of the skeleton rows, so the field does not read as a table of equal bars. */
+const SKELETON_ROWS = [
+  [34, 2],
+  [26, 2],
+  [42, 1],
+] as const;
+
+/**
+ * Project tiles on their way: each in a tile's shape, with the name and its
+ * state, the glyph field as a dither field, three service rows and the foot.
+ */
+export function ProjectTilesSkeleton({ count = 2 }: { count?: number }) {
+  return (
+    <Skeleton label="Loading projects" className="ptiles-grid">
+      {Array.from({ length: count }, (_, tile) => (
+        <div key={tile} className="ptiles-col">
+          <div className="card ptile ptile-skel">
+            <div className="ptile-h">
+              <SkelBar width={tile === 0 ? '30%' : '24%'} height={16} />
+              <SkelBar width="22%" className="ptile-skel-st" />
+            </div>
+            <div className="pprev">
+              <SkelBar className="ptile-skel-field" />
+            </div>
+            <div className="prows">
+              {SKELETON_ROWS.slice(0, 3 - tile).map(([name, tags], row) => (
+                <div key={row} className="prow">
+                  <SkelBar className="ptile-skel-glyph" />
+                  <SkelBar width={`${name}%`} />
+                  <span className="ptile-skel-tags">
+                    {Array.from({ length: tags }, (_, index) => (
+                      <SkelBar key={index} width="38px" height={18} />
+                    ))}
+                  </span>
+                  <SkelBar width="56px" height={8} />
+                  <SkelBar className="ptile-skel-lamp" />
+                </div>
+              ))}
+            </div>
+            <div className="pfoot">
+              <SkelBar width="52%" />
+            </div>
+          </div>
+        </div>
+      ))}
+    </Skeleton>
   );
 }
