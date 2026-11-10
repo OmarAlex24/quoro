@@ -3260,6 +3260,7 @@ impl Session {
             }
         };
         self.step4_eligible.clear();
+        let mut raises: Vec<(String, u64)> = Vec::new();
         let mut eligible: Vec<(leases::Lease, Option<u64>)> = Vec::new();
         let mut held_by_node: Vec<String> = Vec::new();
         for claimed in reported {
@@ -3320,6 +3321,66 @@ impl Session {
                 claimed.fencing_token,
             ) {
                 self.queue_revoke(revoke, released, outbox);
+            }
+            // ADR 0285 ("The mark"): a node that a marked row does not name
+            // lists the lease `held` or `uncertain`. The revoke above goes
+            // at the token it reports or the row's; when the row's token is
+            // not above the reported one, the row is raised above it below.
+            if let Some(row) = &row
+                && row.unsettled
+                && row.holder_node_id != self.node_id
+                && (claimed.state == "held" || claimed.state == "uncertain")
+                && lease_token(row) <= claimed.fencing_token
+            {
+                raises.push((row.id.clone(), claimed.fencing_token));
+            }
+        }
+        // The raises commit before the `hello` position can count (section
+        // 8.4, "Acknowledgements"; ADR 0299). The read connection is not
+        // held across the writer gate.
+        drop(conn);
+        if !raises.is_empty() {
+            let actor = Actor {
+                kind: ActorType::Node,
+                id: self.node_id.clone(),
+            };
+            let raised: Result<Vec<leases::Lease>, ApiError> = async {
+                let mut w = self.hub.0.store.begin_write().await?;
+                let mut raised = Vec::new();
+                for (lease_id, reported) in &raises {
+                    if let Some(lease) = leases::raise_for_other_lister(
+                        &mut w.tx,
+                        lease_id,
+                        &self.node_id,
+                        *reported,
+                        &actor,
+                    )
+                    .await?
+                    {
+                        raised.push(lease);
+                    }
+                }
+                w.commit().await?;
+                Ok(raised)
+            }
+            .await;
+            match raised {
+                Ok(raised) => {
+                    for lease in raised {
+                        tracing::warn!(
+                            lease_id = %lease.id,
+                            lister = %self.node_id,
+                            holder = %lease.holder_node_id,
+                            token = lease.fencing_token,
+                            "a marked row listed by a node it does not name is raised above it and recorded revoked (ADR 0285)"
+                        );
+                    }
+                    self.hub.wake_held();
+                }
+                Err(e) => {
+                    tracing::warn!(code = %e.code.as_str(), node_id = %self.node_id, "cannot raise a marked row above a node's listing");
+                    complete = false;
+                }
             }
         }
         // Not listed: the held grant (ADR 0295).

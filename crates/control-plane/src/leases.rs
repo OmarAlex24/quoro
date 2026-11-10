@@ -515,6 +515,47 @@ pub(crate) async fn bump_tokens(
     Ok(bumped)
 }
 
+/// The marked-row raise of ADR 0285 ("The mark"): `lister`, a node the
+/// row of `lease_id` does not name, lists the lease `held` or `uncertain` at
+/// `reported`. When the row carries the mark and its token is not already
+/// above `reported`, one write raises the token to `reported + 1` and
+/// records the row revoked in the primary's view (`revoked_at`), as declaring
+/// a node lost does, with its change-log entry. It keeps the mark, sets no
+/// `lost_at` and emits no event, so the holder the row still names is not
+/// declared lost. An unmarked row is never raised this way (section 9 step
+/// 2). Returns the row when it changed.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn raise_for_other_lister(
+    conn: &mut SqliteConnection,
+    lease_id: &str,
+    lister: &str,
+    reported: u64,
+    actor: &Actor,
+) -> Result<Option<Lease>, ApiError> {
+    let Some(mut lease) = by_id(conn, lease_id).await? else {
+        return Ok(None);
+    };
+    let reported = i64::try_from(reported).unwrap_or(i64::MAX);
+    if !lease.unsettled || lease.holder_node_id == lister || lease.fencing_token > reported {
+        return Ok(None);
+    }
+    lease.fencing_token = reported.saturating_add(1);
+    if lease.revoked_at.is_none() {
+        lease.revoked_at = Some(now_rfc3339());
+    }
+    sqlx::query("UPDATE leases SET fencing_token = ?, revoked_at = ? WHERE id = ?")
+        .bind(lease.fencing_token)
+        .bind(&lease.revoked_at)
+        .bind(&lease.id)
+        .execute(&mut *conn)
+        .await?;
+    changelog::append(conn, actor, "lease", &lease.id, Op::Update, lease.payload()).await?;
+    Ok(Some(lease))
+}
+
 /// Raises the stored `duration_ms` of `lease_id` to `duration_ms`, before a
 /// grant that long goes out, and writes its change-log entry. The stored
 /// value is the longest duration the primary may have granted, which a
