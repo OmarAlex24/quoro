@@ -943,6 +943,75 @@ mod tests {
         f.done();
     }
 
+    /// A first answer the authority refuses (no majority support, section
+    /// 8.8) rolls back with its write: no grant, the row still `local`, no
+    /// change-log entry, no gate, and the conversion still in flight. Never
+    /// a row that reads `expiring` with no gate behind it. Once support
+    /// returns, the next renewal is answered as the first one.
+    #[tokio::test]
+    async fn a_refused_first_answer_writes_nothing_and_keeps_the_conversion() {
+        #[derive(Debug)]
+        struct NoSupport;
+        impl VoterSupport for NoSupport {
+            fn supports(&self, _duration_ms: u64) -> bool {
+                false
+            }
+        }
+        let f = fixture("warm", "local", Some(30_000), false).await;
+        let (mut session, _) = f.session(Some(("held", LeaseMode::Local, 3))).await;
+        f.state
+            .hub
+            .note_conversion_sent(&f.node_id, session.generation, LEASE, 3, 30_000);
+        let writes = f.writes().await;
+        f.state.hub.set_voter_support(Arc::new(NoSupport));
+        assert!(of_type(&renew(&mut session, "msg_r1", 3).await, "lease_grant").is_empty());
+        assert_eq!(f.row().await.mode, "local");
+        assert_eq!(f.writes().await, writes);
+        assert!(f.passed());
+        assert!(f.held_while_away().await.is_some());
+        assert!(
+            f.state
+                .hub
+                .conversion_in_flight(&f.node_id, session.generation, LEASE)
+                .is_some()
+        );
+
+        f.state.hub.set_voter_support(Arc::new(EverySupport));
+        assert_answer(&renew(&mut session, "msg_r2", 3).await, "msg_r2", 3, D);
+        assert_eq!(f.row().await.mode, "expiring");
+        assert_eq!(f.writes().await, writes + 1);
+        assert_eq!(
+            f.state.hub.authority().gate_remaining(LEASE),
+            Some(Duration::from_secs(36))
+        );
+        f.done();
+    }
+
+    /// "The holder's next `hello`" at a token above a marked row's, while the
+    /// row names that holder: the settle answers the renewal at the holder's
+    /// token, and the `pong` writes the row at that token (section 8.4).
+    #[tokio::test]
+    async fn a_holder_above_a_marked_rows_token_is_settled_at_its_own_token() {
+        let f = fixture("warm", "expiring", Some(D as i64), true).await;
+        let (mut session, start) = f.session(Some(("held", LeaseMode::Expiring, 5))).await;
+        assert!(of_type(&start, "lease_revoke").is_empty(), "{start:?}");
+        assert!(of_type(&start, "lease_grant").is_empty(), "{start:?}");
+        let answer = renew(&mut session, "msg_r1", 5).await;
+        assert_answer(&answer, "msg_r1", 5, D);
+        let ping = of_type(&answer, "ping")[0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(f.row().await.fencing_token, 3, "not before the pong");
+        pong(&mut session, &ping).await;
+        let row = f.row().await;
+        assert_eq!(
+            (row.mode.as_str(), row.fencing_token, row.unsettled),
+            ("expiring", 5, false)
+        );
+        f.done();
+    }
+
     /// No settle while the policy is off `warm`, nor once the session is
     /// replaced before the `pong`: the mark stays, and the lease moves only
     /// as a `local` lease does. A replaced session that still reads a
