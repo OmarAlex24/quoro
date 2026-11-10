@@ -708,19 +708,34 @@ impl NodeHub {
 
     /// The restart rule of section 8.4: no gate survives a restart, so every
     /// `expiring` lease, revoked or not, counts as granted now for its stored
-    /// `duration_ms` (ADR 0203). Runs once, before any session.
+    /// `duration_ms` (ADR 0203). So does every row that carries the
+    /// unsettled mark, whatever its mode: its start gate is `start +
+    /// duration_ms + 2M` ("The mark", "The holder fenced first" step 1). A
+    /// marked `local` row stores no duration and counts the longest, 600 s,
+    /// as [`crate::authority::Authority::seed`] counts a missing one. That
+    /// costs a wait of 720 s after a restart before any new token of the
+    /// lease, its held grant included, goes out: the safe side. Runs once,
+    /// before any session.
     ///
     /// # Errors
     ///
     /// The database error, as text.
     pub(crate) async fn seed_lease_gates(&self) -> Result<(), String> {
-        let rows: Vec<(String, String, Option<i64>)> = sqlx::query_as(
-            "SELECT id, holder_node_id, duration_ms FROM leases WHERE mode = 'expiring'",
+        let rows: Vec<(String, String, String, Option<i64>)> = sqlx::query_as(
+            "SELECT id, holder_node_id, mode, duration_ms FROM leases \
+             WHERE mode = 'expiring' OR unsettled = 1",
         )
         .fetch_all(self.0.store.pool())
         .await
-        .map_err(|e| format!("cannot read the expiring leases: {e}"))?;
-        for (lease_id, holder, duration_ms) in rows {
+        .map_err(|e| format!("cannot read the expiring and marked leases: {e}"))?;
+        for (lease_id, holder, mode, duration_ms) in rows {
+            let duration_ms = if mode == "expiring" {
+                duration_ms
+            } else {
+                duration_ms.or(Some(
+                    i64::try_from(crate::authority::MAX_DURATION_MS).unwrap_or(i64::MAX),
+                ))
+            };
             self.0.authority.seed(&lease_id, &holder, duration_ms);
         }
         Ok(())
@@ -2456,6 +2471,10 @@ struct Session {
     fence_ack_stopped: bool,
     /// What the `hello` reported of each lease: its state and token.
     hello_leases: HashMap<String, (String, u64)>,
+    /// The step-4 rows this session's start found the node not holding
+    /// ("The holder fenced first" step 4): their held grants go out on this
+    /// session, and [`Session::send_grants`] sends nothing for them.
+    step4_eligible: HashSet<String>,
     /// The same-token `local` grants this session sent of leases its `hello`
     /// listed `held` or `uncertain` at that token, by message id: a refusal
     /// with `bad_message` means the lease expired on the way (section 8.5,
@@ -2500,6 +2519,7 @@ impl Session {
             fence_ack: None,
             fence_ack_stopped: false,
             hello_leases: HashMap::new(),
+            step4_eligible: HashSet::new(),
             same_token_grants: HashMap::new(),
             follow: follow::Follow::Off,
             follow_retry: None,
@@ -3223,7 +3243,68 @@ impl Session {
                 complete = false;
             }
         }
+        // "The holder fenced first" step 4 (ADR 0295, ADR 0299): decided
+        // again from the rows at every session start, never from what the
+        // held-grant registry still holds.
+        let step4: HashMap<String, leases::Lease> = match leases::step4_rows(
+            &mut conn,
+            Some(&self.node_id),
+        )
+        .await
+        {
+            Ok(rows) => rows.into_iter().map(|row| (row.id.clone(), row)).collect(),
+            Err(e) => {
+                tracing::warn!(code = %e.code.as_str(), node_id = %self.node_id, "cannot read the step-4 rows of the node");
+                complete = false;
+                HashMap::new()
+            }
+        };
+        self.step4_eligible.clear();
+        let mut eligible: Vec<(leases::Lease, Option<u64>)> = Vec::new();
+        let mut held_by_node: Vec<String> = Vec::new();
         for claimed in reported {
+            if let Some(row) = step4.get(&claimed.lease_id) {
+                if claimed.fencing_token >= lease_token(row) {
+                    // Listed at the row's token or above: the node holds it,
+                    // or this primary lacks writes. Nothing goes out for it
+                    // on this session; today's classification stays.
+                    held_by_node.push(row.id.clone());
+                } else {
+                    // Listed at a lower token: no revoke of section 5.1, the
+                    // held grant instead. One the node lists `held` or
+                    // `uncertain` in the other mode would be refused, so the
+                    // revoke at the token it reports comes first (section
+                    // 4.2 rule 3, ADR 0258, ADR 0299), and without majority
+                    // support neither goes out until support returns.
+                    let same_mode = matches!(claimed.mode, quoro_proto::LeaseMode::Expiring)
+                        == (row.mode == "expiring");
+                    let other_mode_held =
+                        claimed.state != "expired" && claimed.state != "revoked" && !same_mode;
+                    let revoke_first = if other_mode_held {
+                        let token = claimed.fencing_token.max(1);
+                        if self.hub.0.authority.supports(held::support_ms(row)) {
+                            self.queue_revoke(
+                                quoro_proto::LeaseRevoke {
+                                    lease_id: quoro_proto::LeaseId(row.id.clone()),
+                                    fencing_token: token,
+                                    reason: quoro_proto::RevokeReason::Superseded,
+                                },
+                                // Releases nothing: the row names this node at
+                                // a token it never held.
+                                0,
+                                outbox,
+                            );
+                            None
+                        } else {
+                            Some(token)
+                        }
+                    } else {
+                        None
+                    };
+                    eligible.push((row.clone(), revoke_first));
+                    continue;
+                }
+            }
             let row = match leases::by_id(&mut conn, &claimed.lease_id).await {
                 Ok(row) => row,
                 Err(e) => {
@@ -3240,6 +3321,19 @@ impl Session {
             ) {
                 self.queue_revoke(revoke, released, outbox);
             }
+        }
+        // Not listed: the held grant (ADR 0295).
+        for row in step4.values() {
+            if !reported.iter().any(|claimed| claimed.lease_id == row.id) {
+                eligible.push((row.clone(), None));
+            }
+        }
+        for (row, revoke_first) in eligible {
+            self.step4_eligible.insert(row.id.clone());
+            self.hub.held_eligible(&row, self.generation, revoke_first);
+        }
+        for lease_id in held_by_node {
+            self.hub.held_listed(&lease_id);
         }
         complete
     }
@@ -3661,6 +3755,12 @@ impl Session {
                 {
                     let token = lease_token(&lease);
                     let reported = self.hello_leases.remove(&lease.id);
+                    // Step 4: a step-4 row the node does not hold gets its
+                    // held grant (held.rs), never a regrant or a grant from
+                    // here, so no second token is minted (ADR 0295).
+                    if self.step4_eligible.contains(&lease.id) {
+                        continue;
+                    }
                     match reported
                         .as_ref()
                         .map(|(state, claimed)| (state.as_str(), *claimed))
@@ -3685,6 +3785,15 @@ impl Session {
                         // 5.1), so a grant at that token is refused too.
                         Some(("revoked", _)) => continue,
                         _ => {}
+                    }
+                    // "Grants of a marked row": every grant of a marked row
+                    // other than a renewal's answer goes through the
+                    // held-grant path; the regrant above does (its write
+                    // waits). One the node lists `held` or `uncertain` at the
+                    // row's token gets nothing here: the same-token `local`
+                    // resend and the writes that clear the mark are #555.
+                    if lease.unsettled {
+                        continue;
                     }
                     if lease.mode == "expiring" {
                         if reported.is_none() {

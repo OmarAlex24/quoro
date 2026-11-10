@@ -82,20 +82,26 @@ struct HeldGrant {
     revoke_first: Option<u64>,
 }
 
+/// The grant length a held grant of `lease` needs majority support for:
+/// the row's `duration_ms` for an `expiring` row, `D` for a `local` one
+/// (section 8.8; `D` is what every `support_request` carries).
+pub(super) fn support_ms(lease: &leases::Lease) -> u64 {
+    if lease.mode == "expiring" {
+        lease
+            .duration_ms
+            .and_then(|ms| u64::try_from(ms).ok())
+            .unwrap_or(DEFAULT_DURATION_MS)
+    } else {
+        DEFAULT_DURATION_MS
+    }
+}
+
 impl HeldGrant {
     fn of(lease: &leases::Lease, eligible_on: Option<u64>) -> Self {
-        let support_ms = if lease.mode == "expiring" {
-            lease
-                .duration_ms
-                .and_then(|ms| u64::try_from(ms).ok())
-                .unwrap_or(DEFAULT_DURATION_MS)
-        } else {
-            DEFAULT_DURATION_MS
-        };
         Self {
             token: lease.fencing_token,
             holder: lease.holder_node_id.clone(),
-            support_ms,
+            support_ms: support_ms(lease),
             eligible_on,
             sent_on: None,
             revoke_first: None,
