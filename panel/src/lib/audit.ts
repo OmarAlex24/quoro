@@ -56,6 +56,7 @@ export type AuditDetailFieldKey =
   | 'target'
   | 'project'
   | 'params'
+  | 'params_digest'
   | 'justification'
   | 'trigger_event'
   | 'incident'
@@ -93,6 +94,7 @@ export const AUDIT_DETAIL_FIELDS = [
   { key: 'target', label: 'Target', fields: ['target_type', 'target_id'] },
   { key: 'project', label: 'Project', fields: ['project_id'] },
   { key: 'params', label: 'Parameters', fields: ['params'] },
+  { key: 'params_digest', label: 'Parameters digest', fields: ['params_sha256', 'params_bytes'] },
   { key: 'justification', label: 'Justification', fields: ['justification'] },
   { key: 'trigger_event', label: 'Triggering event', fields: ['trigger_event_id'] },
   { key: 'incident', label: 'Incident', fields: ['incident_id'] },

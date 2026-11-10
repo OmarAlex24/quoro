@@ -42,6 +42,11 @@ export const problemView = (error: unknown, action: string): ProblemView => {
         ...codes,
         message: error.detail ?? 'The form needs a fix before it can be sent.',
       };
+    case 'payload_too_large':
+      return {
+        ...codes,
+        message: error.detail ?? 'That request is too large to send. Send less at once.',
+      };
     case 'conflict':
       return {
         ...codes,

@@ -564,6 +564,7 @@ A human's read calls are not recorded; an agent's reads are (D-0031). That asymm
 - Exceeding a limit answers `rate_limited` (429) in `application/problem+json`.
 - **The values are implementation defaults, not contract.** This contract fixes only that the limit is per identity and that the answer is `rate_limited`; an implementation may choose the numbers and change them without a contract change (D-0030).
 - A rate-limited call is audited as `refused` with `result_detail` `rate_limited` when the identity is known, so a burst that an agent produced is visible in the log (D-0031).
+- A request body is at most 256 KiB. A larger one answers `payload_too_large` (413) and is audited as `refused` with `result_detail` `payload_too_large` and `params` `{}` when the identity is known (README.md, "Request body limit", ADR 0306).
 - `POST /api/v1/auth/password` is limited per user, counting attempts with a wrong current password, so a stolen session cannot be used to guess the password (ADR 0135).
 
 ## 13. Worked examples

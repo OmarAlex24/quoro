@@ -34,12 +34,14 @@ An audit record has no prefixed id; it is identified by its `seq`, which is gap-
 | `agent_model` | string | no | the agent's `model`, on agent records only |
 | `on_behalf_of` | `usr_` id | no | the human whose authority was lent |
 | `channel` | `api` \| `panel` \| `mcp` \| `cli` \| `system` | yes | how the action arrived |
-| `operation` | string | yes | the endpoint (`DELETE /api/v1/apps/{app_id}`), the MCP tool name (`delete_app`), or `session.end` for the close of an interactive session (section 3.3) |
+| `operation` | string | yes | the endpoint (`DELETE /api/v1/apps/{app_id}`), the MCP tool name (`delete_app`), `session.end` for the close of an interactive session (section 3.3), or `POST /mcp` for an MCP call whose body was above the limit (README.md, "Request body limit") |
 | `scope` | scope string | no | the scope the call was authorized under; absent when the call needed none |
 | `target_type` | string | no | `app`, `vm`, `deployment`, `build`, `domain`, `volume`, `backup`, `backup_repository`, `audit_export`, `project`, `node`, `incident`, `approval`, `grant`, `webhook`, `user`, `cluster` |
 | `target_id` | string | no | id of that target |
 | `project_id` | `prj_` id | no | project the target belongs to, when it has one |
-| `params` | JSON object | yes | the request parameters, secrets redacted (section 4) |
+| `params` | JSON object | yes | the request parameters, secrets redacted (section 4); `{}` when the record keeps their digest instead (section 4.1) |
+| `params_sha256` | 64 lowercase hex chars | no | the digest of the redacted parameters, only when `params` is `{}` in their place (section 4.1) |
+| `params_bytes` | integer | no | the size in bytes of the text `params_sha256` covers, present exactly when `params_sha256` is (section 4.1) |
 | `justification` | string | no | the agent's stated reason; required on mutating agent calls, omitted for humans |
 | `trigger_event_id` | `evt_` id | no | the event that woke the agent |
 | `incident_id` | `inc_` id | no | the incident the call belongs to |
@@ -168,6 +170,7 @@ Each call or action in the rows marked "yes" below produces exactly one record (
 | every mutating call that is authorized and then fails | yes | `error`, `result_detail` = error code |
 | every call by an agent, including reads (`get_app`, `list_audit`, `get_app_logs`) | yes | `ok` / `refused` / `error` |
 | reads by humans (panel browsing, API reads) | no | — |
+| a call whose request body is above the limit (README.md, "Request body limit"), when the caller has an identity and the call is one this table records | yes, with `params` `{}` | `refused`, `result_detail` = `payload_too_large` |
 | approval requests filed, approved, denied, expired | yes | `ok` |
 | system actions: incident opened and resolved, incident grant issued and revoked, fencing-related lease revocations, node enrollment and removal | yes | `ok` / `error` |
 | storage system actions (M5a): a scheduled backup dispatched, a backup sealed or failed, retention pruning, a garbage-collection sweep, a control-plane backup, a `local` lease granted or moved, an audit-export probe (section 3.5) | yes | `ok` / `error` |
@@ -396,6 +399,26 @@ Redaction happens before serialization and therefore before hashing: the hash co
 
 A parameter that is a secret but whose key is not on the list is an implementation bug to fix in the redaction list, not a reason to hash the unredacted value (D-0031).
 
+### 4.1 Parameters kept as a digest
+
+An audited call is always audited (ADR 0306). A record reaches the nodes as a change-log entry (section 3.2), and the primary writes no entry that a node could not receive alone and verify (node-agent-protocol.md section 7.1, "Entries a node can receive", ADR 0302). `params` come from the request body, so a call's parameters can make its record's entry one of those. When they would, the record keeps a digest of them instead:
+
+- `params` is `{}`;
+- `params_sha256` is the SHA-256, in lowercase hex, of the parameters' text defined below;
+- `params_bytes` is the length in bytes of that text.
+
+**When.** Exactly when the record's entry, built with its `params`, is one the primary may not write: alone in a `log_entries` message it exceeds the 1 MiB message limit; its payload, read back from the text the primary stores, has no RFC 8785 form; or a node that parses that message does not find the entry hashing to its `hash`. Parameters that have no RFC 8785 form at all, so that the record could not be hashed (section 5), are kept as a digest too. There is no other threshold: parameters that fit and verify are kept whatever their size.
+
+**The text.** The redacted parameters as the primary read them from the request, in their RFC 8785 form. An integer RFC 8785 cannot write, one beyond ±(2^53 − 1) that the primary read exactly, is written as its exact decimal integer. The text therefore exists for every request, and it holds no secret, because redaction (section 4) comes first. Three cases:
+
+| The request's parameters | Why `params` would not do | The text the digest covers |
+| --- | --- | --- |
+| `{"n": 1e16}` | RFC 8785 writes `10000000000000000`, which reads back as an integer above 2^53 | `{"n":10000000000000000}`, so `params_bytes` is 23 |
+| `{"n": 18446744073709551615}` | an integer beyond 2^53 that the primary read exactly has no RFC 8785 form | `{"n":18446744073709551615}`, so `params_bytes` is 26 |
+| `{"x": 18983552425072.563}` | a node that parses the entry can read the number back as another one, so the entry does not hash to its `hash` | the RFC 8785 form of the number the primary read |
+
+The two fields are part of the hashed record (section 5). A record that keeps its parameters has neither, so it hashes as before. The record of a refusal, of an error and of a success all follow this rule, and the audit write never fails because of its parameters. A request body above the API's limit is refused before it is read, and its record has `params` `{}` with neither field (README.md, "Request body limit").
+
 ## 5. The hash chain
 
 Each record's `hash` is:
@@ -522,10 +545,11 @@ It does **not** detect:
 
 The only defence against both is that the head is known outside the server that produced it: the off-site copy (section 8) plus anchoring the head hash somewhere the operator does not control (D-0031). This is precisely why D-0031 asks for a copy out of reach of whoever operates the server, and why the design does not claim that the local chain alone is enough. Section 8.3 says how the copy is used to detect both, and section 8.2 how far the copy itself is out of reach on each provider.
 
-Two further honest limits:
+Three further honest limits:
 
 - The chain proves internal consistency, not that the recorded parameters and results are true; a lying service writes a consistent lie.
 - It proves nothing about calls that never reached the audit gate. Authentication failures are not recorded (section 3), so a burst of failed logins is not visible in the chain.
+- A record that keeps a digest instead of its parameters (section 4.1) proves that the call carried parameters of that size and digest, not what they were. A caller that kept its request can match the digest only if it reads each number as the primary did; a float written with more digits than a double holds may read differently.
 
 ## 8. Off-site copy
 
