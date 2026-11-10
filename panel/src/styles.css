@@ -55,6 +55,7 @@
   --fault-wash: color-mix(in oklab, var(--fault) 10%, var(--surface));
   /* The lit top of a primary button: lighter in light, less so in dark to keep white words at 4.5:1. */
   --primary-top: color-mix(in oklab, var(--accent-solid) 94%, white);
+  --danger-top: color-mix(in oklab, var(--fault) 80%, black);
   /*
    * Motion (ADR 0318): one curve for the whole panel, one duration for
    * feedback (hover, press, focus) and one for what enters, leaves or changes
@@ -120,6 +121,7 @@
     --tag-ink: 62%;
     --fault-wash: color-mix(in oklab, var(--fault) 6%, var(--surface));
     --primary-top: color-mix(in oklab, var(--accent-solid) 86%, white);
+    --danger-top: var(--fault);
   }
 }
 
@@ -162,6 +164,7 @@
   --tag-ink: 62%;
   --fault-wash: color-mix(in oklab, var(--fault) 6%, var(--surface));
   --primary-top: color-mix(in oklab, var(--accent-solid) 86%, white);
+  --danger-top: var(--fault);
 }
 
 :root[data-theme='dark'] {
@@ -211,6 +214,7 @@
   --fault-wash: color-mix(in oklab, var(--fault) 10%, var(--surface));
   /* The lit top of a primary button: lighter in light, less so in dark to keep white words at 4.5:1. */
   --primary-top: color-mix(in oklab, var(--accent-solid) 94%, white);
+  --danger-top: color-mix(in oklab, var(--fault) 80%, black);
 }
 
 /*
@@ -462,6 +466,8 @@
 
   .btn-primary:hover {
     border-color: color-mix(in oklab, var(--accent-solid) 72%, black);
+    /* No brightening: the white words keep 4.5:1 on hover too. */
+    filter: none;
     box-shadow:
       inset 0 1px 0 rgb(255 255 255 / 0.3),
       0 1px 0 var(--btn-edge),
@@ -500,7 +506,7 @@
     --busy-dot: rgb(255 255 255 / 0.5);
     color: var(--on-accent);
     border-color: color-mix(in oklab, var(--fault) 72%, black);
-    background-image: linear-gradient(180deg, var(--fault), color-mix(in oklab, var(--fault) 86%, black));
+    background-image: linear-gradient(180deg, var(--danger-top), color-mix(in oklab, var(--danger-top) 86%, black));
     box-shadow:
       inset 0 1px 0 rgb(255 255 255 / 0.2),
       0 1px 0 var(--btn-edge);
@@ -508,6 +514,7 @@
 
   .btn-danger-solid:hover {
     border-color: color-mix(in oklab, var(--fault) 72%, black);
+    filter: none;
   }
 
   /*
@@ -627,9 +634,10 @@
     font-weight: 560;
     line-height: 1;
     white-space: nowrap;
-    background-color: color-mix(in oklab, var(--tag) 15%, transparent);
-    /* Idle grey is too faint alone, so an idle tag always mixes with ink. */
-    color: color-mix(in oklab, var(--tag) 62%, var(--ink));
+    /* A tag without a tone is the proposal's neutral tag; tones tint it below. */
+    background-color: var(--sunk);
+    border-color: var(--line-2);
+    color: var(--ink-2);
     transition:
       background-color var(--motion-change) var(--ease),
       color var(--motion-change) var(--ease);
@@ -649,6 +657,13 @@
 
   .tag-fault {
     --tag: var(--fault);
+    background-color: color-mix(in oklab, var(--fault) 15%, transparent);
+  }
+
+  .tag-run,
+  .tag-fault,
+  .tag-accent {
+    border-color: transparent;
   }
 
   .tag-run,

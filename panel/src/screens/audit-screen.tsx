@@ -174,7 +174,7 @@ export function AuditScreen() {
       <div className="page-h">
         <h1>Activity</h1>
         <span className="flex-1" />
-        <Button busy={auditQuery.isFetching} variant="ghost" onClick={() => void auditQuery.refetch()} disabled={auditQuery.isFetching}>
+        <Button busy={auditQuery.isRefetching && !auditQuery.isFetchingNextPage} variant="ghost" onClick={() => void auditQuery.refetch()} disabled={auditQuery.isFetching}>
           {auditQuery.isFetching ? 'Refreshing…' : 'Refresh'}
         </Button>
         <Button busy={verify.isPending} variant="default" onClick={() => runVerify({})} disabled={verify.isPending}>
