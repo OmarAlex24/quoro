@@ -323,7 +323,9 @@ impl<E: Engine + 'static> WarmSender<E> {
     /// in flight numbered above the base, which the target may hold. A crash
     /// between a `complete` answer and the base's move leaves exactly that:
     /// two bases, or a snapshot in flight the target holds, which the next
-    /// answer names.
+    /// answer names. A volume this node is now the target of is left as it
+    /// is: a returning source keeps its snapshots until the warm receiver
+    /// releases them (section 9).
     pub async fn restore(&self) {
         let volumes = match self.inner.warm_volumes().await {
             Ok(volumes) => volumes,
@@ -333,6 +335,9 @@ impl<E: Engine + 'static> WarmSender<E> {
             }
         };
         for volume_id in volumes {
+            if self.inner.is_target(&volume_id) {
+                continue;
+            }
             let _guard = self.inner.locks.lock(&volume_id).await;
             let set = match self.inner.warm_records(&volume_id).await {
                 Ok(records) => KeptSet::from_records(records),
@@ -389,9 +394,10 @@ impl<E: Engine + 'static> WarmSender<E> {
             );
         }
         // A volume that is deleted, or no longer warm, keeps nothing. A
-        // source that became the target keeps its snapshots, and so does a
-        // volume the spec no longer names: the return path decides about
-        // them (section 9).
+        // source that became the target keeps its snapshots through the
+        // hand-over, and the warm receiver releases them once the first
+        // complete stream lands (section 9); so does a volume the spec no
+        // longer names.
         let sourced: BTreeSet<String> = sources(&spec)
             .into_iter()
             .map(|(file, _)| file.volume_id.clone())
@@ -451,6 +457,17 @@ impl<E: Engine + 'static> Inner<E> {
             .into_iter()
             .find(|(file, _)| file.volume_id == volume_id)
             .map(|(file, warm)| (file.clone(), warm.clone(), mesh))
+    }
+
+    /// Whether the desired state names this node as the target of
+    /// `volume_id` in a `present` entry.
+    fn is_target(&self, volume_id: &str) -> bool {
+        let desired = self.desired.borrow();
+        desired.as_ref().is_some_and(|snapshot| {
+            super::receiver::targets(&snapshot.state.spec)
+                .iter()
+                .any(|(file, _)| file.volume_id == volume_id)
+        })
     }
 
     fn interval_of(&self, volume_id: &str) -> Option<Duration> {
@@ -1140,9 +1157,10 @@ impl<E: Engine + 'static> Inner<E> {
     }
 }
 
-/// Whether a kept snapshot's purpose is one of the warm sender's.
+/// Whether a kept snapshot's purpose is one of the warm sender's; a
+/// quarantined copy never is.
 fn is_warm(purpose: &str) -> bool {
-    purpose == KeepPurpose::WarmBase.as_str() || purpose == KeepPurpose::WarmShipping.as_str()
+    KeepPurpose::is_warm(purpose)
 }
 
 /// The `present` entries of `spec.volumes` this node is the source of.

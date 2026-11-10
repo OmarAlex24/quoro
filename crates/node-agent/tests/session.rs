@@ -31,8 +31,8 @@ use quoro_proto::custody::CustodyKey;
 use quoro_proto::sign::{self, SigningKey};
 use quoro_proto::wire::{
     Command, ControlMessage, DesiredState, DesiredStatus, EdgeBackend, EdgeRoute, HealthCheck,
-    LogEntries, Spec, SpecEdge, SpecNetwork, SpecVoter, SpecVotes, SpecWitness, SupportRequest,
-    Welcome,
+    LogEntries, QuarantineStatus, Spec, SpecEdge, SpecNetwork, SpecVoter, SpecVotes, SpecWitness,
+    SupportRequest, Welcome,
 };
 use quoro_proto::{
     ErrorCode, LeaseGrant, LeaseId, LeaseMode, LeaseRevoke, ProtocolError, ResourceType,
@@ -839,6 +839,90 @@ async fn a_newly_applied_revision_is_reported_without_waiting_for_the_periodic_r
         "a second report for revisions already reported"
     );
     run.finish().await;
+}
+
+/// Sections 5.3 and 9: every status report lists the quarantined copies,
+/// with `sha256` only once it is known, and a change of the list is reported
+/// at once: a copy added, hashed or deleted.
+#[tokio::test]
+async fn the_quarantined_copies_are_reported_and_a_change_goes_out_at_once() {
+    let dir = TempDir::new();
+    let key = sign::signing_key_from_seed(&[11; 32]);
+    let identity = identity_files(dir.path(), &key);
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let (desired, _desired_rx) = watch::channel(None);
+    let (_observed_tx, observed_rx) = watch::channel(Vec::new());
+    let copy = QuarantineStatus {
+        quarantine_id: "qrn_01JD0QRN000000000000000001".to_owned(),
+        volume_id: "vol_01JD0QRN000000000000000001".to_owned(),
+        app_id: "app_01JD0QRN000000000000000001".to_owned(),
+        created_at: "2026-11-10T10:00:00Z".to_owned(),
+        size_bytes: 4096,
+        sha256: None,
+    };
+    let (quarantines, quarantines_rx) = watch::channel(vec![copy.clone()]);
+    let session = Session::new(SessionSetup {
+        identity,
+        store,
+        facts: facts(),
+        desired,
+        observed: observed_rx,
+        current: None,
+        builds: None,
+    })
+    .with_quarantines(quarantines_rx);
+    let (mut ws, hello, serving) = open_session(session).await;
+    send(
+        &mut ws,
+        ControlMessage::Welcome(Welcome {
+            cluster_id: "cls_test".to_owned(),
+            term: 1,
+            server_time: "2026-11-02T10:15:30Z".to_owned(),
+            heartbeat_interval_ms: 500,
+            session_timeout_ms: 15_000,
+            primary_node_id: "nod_primary".to_owned(),
+            primary_urls: Vec::new(),
+            schema_version: None,
+        })
+        .to_frame("msg_welcome", Some(hello["id"].as_str().unwrap()))
+        .to_text(),
+    )
+    .await;
+    let first = read_until(&mut ws, "status_report").await;
+    assert_eq!(
+        first["body"]["quarantines"],
+        json!([{
+            "quarantine_id": copy.quarantine_id,
+            "volume_id": copy.volume_id,
+            "app_id": copy.app_id,
+            "created_at": copy.created_at,
+            "size_bytes": 4096,
+        }])
+    );
+
+    // The hash is known.
+    let sha256 = "ab".repeat(32);
+    quarantines.send_replace(vec![QuarantineStatus {
+        sha256: Some(sha256.clone()),
+        ..copy.clone()
+    }]);
+    let report = status_within(&mut ws, Duration::from_secs(2))
+        .await
+        .expect("a status report within 2 s of the hash");
+    assert_eq!(report["body"]["quarantines"][0]["sha256"], sha256);
+
+    // The copy is deleted.
+    quarantines.send_replace(Vec::new());
+    let report = status_within(&mut ws, Duration::from_secs(2))
+        .await
+        .expect("a status report within 2 s of the delete");
+    assert!(
+        report["body"].get("quarantines").is_none(),
+        "{}",
+        report["body"]
+    );
+    assert!(!serving.is_finished(), "the session stayed up");
+    serving.abort();
 }
 
 /// Waits (real time, bounded) until `ready` holds.

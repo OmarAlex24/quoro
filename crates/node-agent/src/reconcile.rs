@@ -947,11 +947,29 @@ impl<E: Engine + 'static> Reconciler<E> {
 
         for entry in spec.volumes.iter().filter(|entry| !is_warm_copy(entry)) {
             let row = rows.get(&entry.volume_id);
+            // The node runs its own volume again: a hand-over to the warm
+            // receiver that marked the row and did not finish (section 9) is
+            // cleared under the volume's lock, which the hand-over holds from
+            // its comparison to its end. Almost always unmarked.
+            let own_present = entry.state == SpecVolumeState::Present && row.is_some();
+            let marked = if own_present {
+                match self.store.volume_handing_over(&entry.volume_id).await {
+                    Ok(marked) => marked,
+                    Err(e) => {
+                        warn!(volume_id = %entry.volume_id, error = %e, "could not read the volume row");
+                        reached = false;
+                        continue;
+                    }
+                }
+            } else {
+                false
+            };
             // A volume this node holds a warm copy of (it turns from target
-            // into source): its file is adopted or removed only while no
-            // stream holds it; a busy one is retried on the next pass.
-            let _warm_lock = match &self.warm_locks {
-                Some(locks) if warm_copies.contains(&entry.volume_id) => {
+            // into source), or a marked one: its file is adopted, removed or
+            // cleared only while no stream or hand-over holds it; a busy one
+            // is retried on the next pass.
+            let warm_lock = match &self.warm_locks {
+                Some(locks) if marked || warm_copies.contains(&entry.volume_id) => {
                     match locks.try_lock(&entry.volume_id) {
                         Some(guard) => Some(guard),
                         None => {
@@ -968,6 +986,35 @@ impl<E: Engine + 'static> Reconciler<E> {
             };
             match entry.state {
                 SpecVolumeState::Present => {
+                    // The node runs the volume again before its hand-over
+                    // finished: the mark goes before the volume is ready, so
+                    // before any VM may write to the file, and a later
+                    // hand-over compares the file again (section 9). Read
+                    // again under the lock: a hand-over may have marked the
+                    // row since the read above.
+                    if own_present && (marked || warm_lock.is_some()) {
+                        let cleared = match self.store.volume_handing_over(&entry.volume_id).await {
+                            Ok(false) => Ok(false),
+                            Ok(true) => self
+                                .store
+                                .clear_volume_handing_over(&entry.volume_id)
+                                .await
+                                .map(|()| true),
+                            Err(e) => Err(e),
+                        };
+                        match cleared {
+                            Ok(false) => {}
+                            Ok(true) => info!(
+                                volume_id = %entry.volume_id,
+                                "the node runs its volume again; its unfinished hand-over is cleared"
+                            ),
+                            Err(e) => {
+                                warn!(volume_id = %entry.volume_id, error = %e, "could not clear an unfinished hand-over");
+                                reached = false;
+                                continue;
+                            }
+                        }
+                    }
                     if entry.restore.is_some() {
                         // The backup manager writes the file and records its
                         // state (`backup-format.md` section 8.1); this pass only
@@ -1753,27 +1800,71 @@ impl<E: Engine + 'static> Reconciler<E> {
     }
 
     /// Whether the engine holds no VM under a `standby` id. A VM it does hold
-    /// is the app's earlier source, which section 5.11 deletes while keeping
-    /// its volume (section 9). That deletion comes with the return path; until
-    /// then the VM is left as it is and holds the revision back.
+    /// is this node's old VM of the app, from when the node was its source:
+    /// section 5.11 deletes it while keeping its volume, which the warm
+    /// receiver then hands over (section 9). It is deleted once the engine
+    /// reports it `Stopped` or `Crashed`. In any other state it holds the
+    /// revision back: one that runs, starts or stops (a paused VM reads
+    /// `Running`), one being created, and one whose state the engine cannot
+    /// read, whose VMM may still run a guest. The revoke or the fence stops
+    /// it, and nothing here stops a VM.
     async fn standby_absent(&mut self, vm_id: &str) -> bool {
-        match self.engine.inspect(&VmId(vm_id.to_owned())).await {
+        let id = VmId(vm_id.to_owned());
+        let info = match self.engine.inspect(&id).await {
             Err(EngineError::NotFound) => {
                 self.standby_held.remove(vm_id);
-                true
+                return true;
             }
-            Ok(info) => {
-                if self.standby_held.insert(vm_id.to_owned()) {
-                    warn!(
-                        vm_id,
-                        state = ?info.state,
-                        "the engine holds a VM under a standby id; it is left as it is and the revision is not applied"
-                    );
-                }
-                false
-            }
+            Ok(info) => info,
             Err(e) => {
                 debug!(vm_id, error = ?e, "could not inspect a standby VM");
+                return false;
+            }
+        };
+        if !matches!(info.state, VmState::Stopped | VmState::Crashed) {
+            if self.standby_held.insert(vm_id.to_owned()) {
+                warn!(
+                    vm_id,
+                    state = ?info.state,
+                    "the engine holds the node's old VM under a standby id and it is not stopped; it is deleted once stopped, and the revision is not applied until then"
+                );
+            }
+            return false;
+        }
+        match self.engine.delete(&id).await {
+            // Gone only once the engine no longer knows it: until then it
+            // may still hold the volume.
+            Ok(()) => match self.engine.inspect(&id).await {
+                Err(EngineError::NotFound) => {
+                    self.forget_deleted_vm(vm_id).await;
+                    self.standby_held.remove(vm_id);
+                    info!(
+                        vm_id,
+                        state = ?info.state,
+                        "deleted the node's old VM under a standby id; its volume stays"
+                    );
+                    true
+                }
+                still => {
+                    let state = still.as_ref().ok().map(|info| info.state);
+                    if self.standby_held.insert(vm_id.to_owned()) {
+                        warn!(vm_id, ?state, error = ?still.err(), "the engine still holds the node's old VM under a standby id after its delete; the revision is not applied");
+                    } else {
+                        debug!(
+                            vm_id,
+                            ?state,
+                            "the engine still holds the node's old VM under a standby id"
+                        );
+                    }
+                    false
+                }
+            },
+            Err(e) => {
+                if self.standby_held.insert(vm_id.to_owned()) {
+                    warn!(vm_id, state = ?info.state, error = ?e, "could not delete the node's old VM under a standby id; the revision is not applied");
+                } else {
+                    debug!(vm_id, error = ?e, "still cannot delete the node's old VM under a standby id");
+                }
                 false
             }
         }
@@ -2481,19 +2572,7 @@ impl<E: Engine + 'static> Reconciler<E> {
             }
             match self.engine.delete(&info.id).await {
                 Ok(()) => {
-                    if let Err(e) = self.store.forget_vm(&vm_id).await {
-                        warn!(vm_id, error = %e, "could not forget the removed VM");
-                    }
-                    self.last_states.remove(&vm_id);
-                    if let Err(e) = self.store.set_meta(&digest_key(&vm_id), "").await {
-                        warn!(vm_id, error = %e, "could not forget the removed VM's digest");
-                    }
-                    self.timings.remove(&vm_id);
-                    self.health.remove(&vm_id);
-                    self.health_restarts.remove(&vm_id);
-                    self.restarts_due.remove(&vm_id);
-                    self.refused_digests.remove(&vm_id);
-                    self.collector.detach(&vm_id);
+                    self.forget_deleted_vm(&vm_id).await;
                     self.once_only.push(VmStatus {
                         vm_id: vm_id.clone(),
                         observed_status: ObservedStatus::Deleted,
@@ -2511,6 +2590,24 @@ impl<E: Engine + 'static> Reconciler<E> {
             }
         }
         reached
+    }
+
+    /// Forgets what the node kept about a VM the engine deleted: its row,
+    /// its digest, and its timers, health and log reader.
+    async fn forget_deleted_vm(&mut self, vm_id: &str) {
+        if let Err(e) = self.store.forget_vm(vm_id).await {
+            warn!(vm_id, error = %e, "could not forget the removed VM");
+        }
+        self.last_states.remove(vm_id);
+        if let Err(e) = self.store.set_meta(&digest_key(vm_id), "").await {
+            warn!(vm_id, error = %e, "could not forget the removed VM's digest");
+        }
+        self.timings.remove(vm_id);
+        self.health.remove(vm_id);
+        self.health_restarts.remove(vm_id);
+        self.restarts_due.remove(vm_id);
+        self.refused_digests.remove(vm_id);
+        self.collector.detach(vm_id);
     }
 
     /// Reads the engine's world and publishes it when it changed.

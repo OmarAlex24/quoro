@@ -26,6 +26,8 @@ use crate::store::{NodeStore, PendingCommit, VolumeRecord};
 use crate::warm::frame::{Frame, Manifest, StreamHeader, encode};
 use crate::warm::{StatusBoard, VolumeLocks};
 
+mod handover;
+
 const VOL: &str = "vol_01JD0WARM0000000000000001";
 const APP: &str = "app_01JD0WARM0000000000000001";
 const LEASE: &str = "lse_01JD0WARM0000000000000001";
@@ -1812,15 +1814,14 @@ async fn the_nodes_own_volume_never_takes_a_stream() {
         .await
         .expect("row");
     let model = first_model();
-    let reply = h
-        .post(
-            stream(&header(5, 1, None), &model, &model.allocated()),
-            End::Complete,
-        )
-        .await
-        .expect("a reply");
-    assert_eq!(reply.status, 500, "{reply:?}");
-    assert!(reply.body.contains("as its own"), "{reply:?}");
+    // Not now, not an error: the source keeps its base and sends again.
+    h.post(
+        stream(&header(5, 1, None), &model, &model.allocated()),
+        End::Complete,
+    )
+    .await
+    .expect("a reply")
+    .assert_refused("busy", None);
     let mut live = Model::default();
     live.write(CELL, &[0xAB_u8; 4096]);
     let file = std::fs::File::open(&h.volume_path).expect("the live file");
@@ -1829,7 +1830,8 @@ async fn the_nodes_own_volume_never_takes_a_stream() {
     assert!(buf == live.cell(1), "the live data is untouched");
     assert!(h.engine.staged_volumes().is_empty());
     assert_eq!(h.row().await.complete_seq, None);
-    assert!(h.status().error.is_some_and(|e| e.contains("as its own")));
+    assert!(h.row().await.error.is_none());
+    assert!(h.status().error.is_none(), "{:?}", h.status());
 
     // Handed over: the next full copy lands over it.
     h.store

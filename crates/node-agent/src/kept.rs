@@ -3,8 +3,9 @@
 //! 3.16, `node-agent-protocol.md` sections 6.13, 9 and 12).
 //!
 //! From M5b some volume snapshots must outlive the agent process that took
-//! them: a warm source's base and the snapshot it is shipping, and later a
-//! returning source's candidate copies and its quarantined copies. The engine
+//! them: a warm source's base and the snapshot it is shipping, which a
+//! returning source keeps as its candidate copies, and a returning source's
+//! quarantined copies (section 9, [`KeepPurpose::Quarantine`]). The engine
 //! removes the snapshots left in its volume directory when it starts, so the
 //! node agent records the ones it keeps in its store and hands their file
 //! names to the engine before the engine starts ([`sweep_rule`]).
@@ -62,6 +63,11 @@ pub enum KeepPurpose {
     WarmBase,
     /// The snapshot a warm source is shipping (section 6.13).
     WarmShipping,
+    /// A returning source's quarantined copy of its live volume (section 9,
+    /// ADR 0176). It is never a warm snapshot: no warm cycle reads, moves or
+    /// releases it, and only an operator's `spec.quarantine_deletes` removes
+    /// it.
+    Quarantine,
 }
 
 impl KeepPurpose {
@@ -71,7 +77,15 @@ impl KeepPurpose {
         match self {
             Self::WarmBase => "warm_base",
             Self::WarmShipping => "warm_shipping",
+            Self::Quarantine => "quarantine",
         }
+    }
+
+    /// Whether `purpose` is one of the warm sender's: the base or the
+    /// snapshot being shipped, never a quarantined copy.
+    #[must_use]
+    pub fn is_warm(purpose: &str) -> bool {
+        purpose == Self::WarmBase.as_str() || purpose == Self::WarmShipping.as_str()
     }
 }
 
@@ -539,6 +553,39 @@ mod tests {
             "the live volume still holds the data"
         );
         assert_eq!(store.kept_snapshots().await.expect("records").len(), 1);
+    }
+
+    /// Section 9: a returning source's quarantined copy is a kept snapshot
+    /// with its own purpose, so every start-up sweep keeps it; a clone a
+    /// crash left before its record is swept like any other.
+    #[tokio::test]
+    async fn the_sweep_keeps_a_quarantined_copy_and_removes_an_unrecorded_clone() {
+        let scratch = Scratch::new("quarantine");
+        let (engine, volume) = engine_with_volume(&scratch, b"divergent writes").await;
+        let (_, store, tracked) = agent_start(&scratch, &engine).await;
+        assert!(tracked);
+        let copy = engine.snapshot_volume(&volume).await.expect("snapshot");
+        keep(&store, "app_01", &copy, KeepPurpose::Quarantine, None, None)
+            .await
+            .expect("keep");
+        let unrecorded = engine.snapshot_volume(&volume).await.expect("snapshot");
+        drop(store);
+
+        let (rule, store, tracked) = agent_start(&scratch, &engine).await;
+        assert_eq!(rule, SnapshotSweep::Keep(names([&copy])));
+        assert!(tracked);
+        assert!(copy.location.exists(), "the quarantined copy is kept");
+        assert_eq!(head(&copy.location, 16), b"divergent writes");
+        assert!(
+            !unrecorded.location.exists(),
+            "the unrecorded clone is swept"
+        );
+        let records = store.kept_snapshots().await.expect("records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].purpose, "quarantine");
+        assert!(!KeepPurpose::is_warm(&records[0].purpose));
+        assert!(KeepPurpose::is_warm(KeepPurpose::WarmBase.as_str()));
+        assert!(KeepPurpose::is_warm(KeepPurpose::WarmShipping.as_str()));
     }
 
     /// Crash window B: the engine deleted a kept snapshot and the agent

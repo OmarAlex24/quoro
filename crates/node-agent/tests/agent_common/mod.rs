@@ -390,6 +390,8 @@ pub struct RecordingEngine {
     stops: Arc<Mutex<Vec<(VmId, StopMode)>>>,
     starts: Arc<Mutex<Vec<(VmId, Duration)>>>,
     prepares: Arc<Mutex<Vec<ImageRef>>>,
+    /// How many of the next `delete` calls answer `Ok` and keep the VM.
+    kept_deletes: Arc<Mutex<u32>>,
 }
 
 impl RecordingEngine {
@@ -402,7 +404,14 @@ impl RecordingEngine {
             stops: Arc::new(Mutex::new(Vec::new())),
             starts: Arc::new(Mutex::new(Vec::new())),
             prepares: Arc::new(Mutex::new(Vec::new())),
+            kept_deletes: Arc::new(Mutex::new(0)),
         }
+    }
+
+    /// The next `n` `delete` calls answer `Ok` and leave the VM where it is,
+    /// as an engine whose delete did not take.
+    pub fn keep_next_deletes(&self, n: u32) {
+        *Self::lock(&self.kept_deletes) = n;
     }
 
     /// The underlying fake, for its injection hooks (`crash`, `fail_next`).
@@ -539,6 +548,13 @@ impl Engine for RecordingEngine {
     }
 
     async fn delete(&self, id: &VmId) -> Result<(), EngineError> {
+        {
+            let mut kept = Self::lock(&self.kept_deletes);
+            if *kept > 0 {
+                *kept -= 1;
+                return Ok(());
+            }
+        }
         self.inner.delete(id).await
     }
 

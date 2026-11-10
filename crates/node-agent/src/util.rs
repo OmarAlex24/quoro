@@ -217,6 +217,13 @@ pub fn event_id() -> String {
     id_with_prefix("evt_", random_bytes::<16>())
 }
 
+/// A fresh `qrn_` id for a quarantined copy of a volume (section 9): 26
+/// characters of upper-case Crockford base32, as the primary checks it.
+#[must_use]
+pub fn quarantine_id() -> String {
+    id_with_prefix("qrn_", random_bytes::<16>())
+}
+
 /// A fresh `msg_` id with an arbitrary prefix, in the same 26-character
 /// Crockford base32 form as [`quoro_proto::wire::msg_id`].
 fn id_with_prefix(prefix: &str, random: [u8; 16]) -> String {

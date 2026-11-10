@@ -6,14 +6,16 @@
 //! verified copy of the change log (`change_log`, section 7.1), the records of
 //! quarantined copies (`quarantine`) and a small metadata table. Nothing here
 //! is replicated; the tables are local and may evolve. A quarantined copy of
-//! the change log itself is a file under `<data_dir>/quarantine/`.
+//! the change log itself is a file under `<data_dir>/quarantine/`; one of a
+//! volume (section 9) is a reflink clone in the engine's volume directory,
+//! kept through the start-up sweep by its `kept_snapshots` row.
 //!
 //! The whole point of the store is that the node keeps running without the
 //! control plane (D-0011): the newest verified snapshot is the source of truth
 //! after a restart, and the signature is verified again before it is used, so a
 //! tampered store cannot drive the engine.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -28,6 +30,7 @@ use sqlx::Row as _;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use tokio::sync::{broadcast, watch};
+use tracing::warn;
 
 use crate::AgentError;
 use crate::follow::{LogEntry, ZERO_HASH};
@@ -157,7 +160,9 @@ CREATE TABLE IF NOT EXISTS volumes (
     size_gb         INTEGER NOT NULL,
     state           TEXT NOT NULL,
     error           TEXT,
-    allocated_bytes INTEGER
+    allocated_bytes INTEGER,
+    handing_over    INTEGER NOT NULL DEFAULT 0,
+    hand_over_basis TEXT
 );
 CREATE TABLE IF NOT EXISTS backups (
     backup_id       TEXT PRIMARY KEY,
@@ -255,9 +260,19 @@ CREATE TABLE IF NOT EXISTS quarantine (
     quarantined_at TEXT NOT NULL,
     reason         TEXT NOT NULL,
     last_seq       INTEGER,
-    last_hash      TEXT
+    last_hash      TEXT,
+    quarantine_id  TEXT,
+    volume_id      TEXT,
+    app_id         TEXT,
+    size_bytes     INTEGER,
+    sha256         TEXT,
+    snapshot_id    TEXT
 );
 ";
+
+/// The `kind` of a `quarantine` row that records a quarantined copy of a
+/// volume (section 9); a change-log copy's is `change_log` (section 7.1).
+const VOLUME_KIND: &str = "volume";
 
 /// Capacity of the live log fan-out channel. A stream that falls further
 /// behind loses lines and carries on, so a slow reader never blocks capture.
@@ -443,6 +458,67 @@ pub struct KeptSnapshotRecord {
     pub seq: Option<u64>,
     /// The copy's cell hashes, when the node keeps them (section 6.13).
     pub cells: Option<Vec<u8>>,
+}
+
+/// A quarantined copy of a volume the node keeps (`quarantine`,
+/// `node-agent-protocol.md` sections 9 and 12, ADR 0176, ADR 0215): a
+/// reflink clone of a returning source's live volume file, recorded beside
+/// the kept snapshot that keeps the clone through the start-up sweep.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VolumeQuarantineRecord {
+    /// `qrn_` id the node generated.
+    pub quarantine_id: String,
+    /// The volume it is a copy of.
+    pub volume_id: String,
+    /// The volume's app.
+    pub app_id: String,
+    /// When the node took the copy, RFC 3339.
+    pub created_at: String,
+    /// Bytes the clone uses on disk: its allocated blocks.
+    pub size_bytes: u64,
+    /// Where the clone is.
+    pub path: PathBuf,
+    /// The clone's `snapshot_id`, the key of its kept snapshot.
+    pub snapshot_id: String,
+    /// Why the live file was not proved unchanged.
+    pub reason: String,
+    /// Lowercase hex SHA-256 of the clone's bytes, once computed.
+    pub sha256: Option<String>,
+}
+
+/// What the mark on the node's own volume row stands for while the volume is
+/// handed over to the warm receiver (section 9): why the live file may go.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HandOverMark {
+    /// The live file's writes are kept in this quarantined copy, by its
+    /// `qrn_` id.
+    Copy(String),
+    /// The live file showed no change against the base.
+    Unchanged,
+    /// The live file is missing from a volume directory that another file
+    /// the node records for the volume shows to be the real one.
+    Gone,
+}
+
+impl HandOverMark {
+    /// How the mark is stored.
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Copy(quarantine_id) => quarantine_id,
+            Self::Unchanged => "unchanged",
+            Self::Gone => "gone",
+        }
+    }
+
+    /// A stored mark; `None` for anything else.
+    fn parse(stored: &str) -> Option<Self> {
+        match stored {
+            "unchanged" => Some(Self::Unchanged),
+            "gone" => Some(Self::Gone),
+            id if id.starts_with("qrn_") => Some(Self::Copy(id.to_owned())),
+            _ => None,
+        }
+    }
 }
 
 /// The warm copy this node holds as the target of a warm volume
@@ -1658,6 +1734,140 @@ impl NodeStore {
             .map(|_| ())
     }
 
+    /// Whether the node's own row of `volume_id` is marked as being handed
+    /// over to the warm receiver (section 9); `false` without a row.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn volume_handing_over(&self, volume_id: &str) -> Result<bool, AgentError> {
+        let mark: Option<i64> =
+            sqlx::query_scalar("SELECT handing_over FROM volumes WHERE volume_id = ?")
+                .bind(volume_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(store_error)?;
+        Ok(mark.is_some_and(|mark| mark != 0))
+    }
+
+    /// What the mark on the node's own row of `volume_id` stands for
+    /// (section 9); `None` without a mark or a row. A mark whose basis
+    /// cannot be read stands for nothing: the hand-over compares the file
+    /// again.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn volume_hand_over_mark(
+        &self,
+        volume_id: &str,
+    ) -> Result<Option<HandOverMark>, AgentError> {
+        let row: Option<(i64, Option<String>)> =
+            sqlx::query_as("SELECT handing_over, hand_over_basis FROM volumes WHERE volume_id = ?")
+                .bind(volume_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(store_error)?;
+        Ok(match row {
+            Some((mark, basis)) if mark != 0 => {
+                let parsed = basis.as_deref().and_then(HandOverMark::parse);
+                if parsed.is_none() {
+                    warn!(volume_id, basis = ?basis, "a hand-over mark has no basis that can be read; the volume is compared again");
+                }
+                parsed
+            }
+            _ => None,
+        })
+    }
+
+    /// Marks the node's own row of `volume_id` as being handed over (section
+    /// 9), with what the mark stands for: the live file showed no change
+    /// against the base, or it is gone from a volume directory shown to be
+    /// the real one. A quarantined copy's mark is written with its records
+    /// ([`Self::record_volume_quarantine`]). From the mark on, the hand-over
+    /// only removes the file and the row.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn mark_volume_handing_over(
+        &self,
+        volume_id: &str,
+        mark: &HandOverMark,
+    ) -> Result<(), AgentError> {
+        sqlx::query("UPDATE volumes SET handing_over = 1, hand_over_basis = ? WHERE volume_id = ?")
+            .bind(mark.as_str())
+            .bind(volume_id)
+            .execute(&self.pool)
+            .await
+            .map_err(store_error)
+            .map(|_| ())
+    }
+
+    /// The volumes whose own row is marked as being handed over (section 9).
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn volumes_handing_over(&self) -> Result<BTreeSet<String>, AgentError> {
+        let ids: Vec<String> =
+            sqlx::query_scalar("SELECT volume_id FROM volumes WHERE handing_over = 1")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(store_error)?;
+        Ok(ids.into_iter().collect())
+    }
+
+    /// Clears the mark of a hand-over that did not finish on the node's own
+    /// row of `volume_id`, and what it stood for (section 9): the node runs
+    /// the volume again, so its file may take writes the mark did not see,
+    /// or the copy the mark stands for no longer keeps them. A later
+    /// hand-over compares the file again.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn clear_volume_handing_over(&self, volume_id: &str) -> Result<(), AgentError> {
+        sqlx::query(
+            "UPDATE volumes SET handing_over = 0, hand_over_basis = NULL WHERE volume_id = ?",
+        )
+        .bind(volume_id)
+        .execute(&self.pool)
+        .await
+        .map_err(store_error)
+        .map(|_| ())
+    }
+
+    /// Ends a hand-over (section 9) in one transaction: drops the node's own
+    /// row of `volume_id` when it is marked as being handed over, and leaves
+    /// the warm target row with no complete copy, nothing pending and no
+    /// error, so the next stream is a full copy. The caller removed the
+    /// live file first. Returns whether a marked row was dropped.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure; nothing changes then.
+    pub async fn finish_hand_over(&self, volume_id: &str) -> Result<bool, AgentError> {
+        let mut tx = self.pool.begin().await.map_err(store_error)?;
+        let dropped = sqlx::query("DELETE FROM volumes WHERE volume_id = ? AND handing_over = 1")
+            .bind(volume_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(store_error)?
+            .rows_affected();
+        sqlx::query(
+            "UPDATE warm_targets SET complete_seq = NULL, taken_at = NULL, completed_at = NULL, \
+             allocated_bytes = NULL, cells = NULL, pending_seq = NULL, pending_taken_at = NULL, \
+             pending_root = NULL, pending_cells = NULL, error = NULL WHERE volume_id = ?",
+        )
+        .bind(volume_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(store_error)?;
+        tx.commit().await.map_err(store_error)?;
+        Ok(dropped > 0)
+    }
+
     /// Records a snapshot the node keeps, or updates its purpose, `seq` and
     /// cell hashes. A record never moves to another file: saving the same
     /// `snapshot_id` with another location or volume is an error.
@@ -1671,45 +1881,8 @@ impl NodeStore {
     /// [`AgentError::Store`] on a SQLite failure, or when the id is recorded
     /// with another location or volume.
     pub async fn save_kept_snapshot(&self, record: &KeptSnapshotRecord) -> Result<(), AgentError> {
-        let snapshot = &record.snapshot;
-        let created_at_ms = snapshot
-            .created_at
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |since| {
-                i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
-            });
-        let done = sqlx::query(
-            "INSERT INTO kept_snapshots (snapshot_id, volume_id, app_id, purpose, seq, location, \
-             size_bytes, created_at_ms, method, pause_ms, cells) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(snapshot_id) DO UPDATE SET app_id = excluded.app_id, \
-             purpose = excluded.purpose, seq = excluded.seq, cells = excluded.cells \
-             WHERE kept_snapshots.location = excluded.location \
-             AND kept_snapshots.volume_id = excluded.volume_id",
-        )
-        .bind(&snapshot.snapshot_id)
-        .bind(&snapshot.volume_id.0)
-        .bind(&record.app_id)
-        .bind(&record.purpose)
-        .bind(record.seq.map(|seq| i64::try_from(seq).unwrap_or(i64::MAX)))
-        .bind(snapshot.location.display().to_string())
-        .bind(i64::try_from(snapshot.size_bytes).unwrap_or(i64::MAX))
-        .bind(created_at_ms)
-        .bind(engine_method_str(snapshot.method))
-        .bind(i64::try_from(snapshot.pause.as_millis()).unwrap_or(i64::MAX))
-        .bind(record.cells.as_deref())
-        .execute(&self.pool)
-        .await
-        .map_err(store_error)?;
-        if done.rows_affected() == 0 {
-            // The sweep keeps a snapshot by its file name, so a record must
-            // never move to another file.
-            return Err(AgentError::Store(format!(
-                "kept snapshot {} is recorded with another file or volume",
-                snapshot.snapshot_id
-            )));
-        }
-        Ok(())
+        let mut conn = self.pool.acquire().await.map_err(store_error)?;
+        upsert_kept_snapshot(&mut conn, record).await
     }
 
     /// Every snapshot the node keeps, ordered by volume and id.
@@ -1771,6 +1944,193 @@ impl NodeStore {
             .await
             .map_err(store_error)
             .map(|_| ())
+    }
+
+    /// One kept snapshot, by its id.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure or a row it cannot read back.
+    pub async fn kept_snapshot(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Option<KeptSnapshotRecord>, AgentError> {
+        let row = sqlx::query("SELECT * FROM kept_snapshots WHERE snapshot_id = ?")
+            .bind(snapshot_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(store_error)?;
+        row.map(kept_snapshot_record).transpose()
+    }
+
+    /// Records a quarantined copy of a volume (section 9) in one transaction:
+    /// the clone's kept snapshot, so the start-up sweep keeps the file, the
+    /// `quarantine` row, and the mark on the node's own volume row that it
+    /// is being handed over, standing for this copy. A crash before the commit leaves none of the
+    /// three, and the sweep removes the unrecorded clone at the next start.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure, or when the kept snapshot
+    /// is recorded with another file or volume; nothing is written then.
+    pub async fn record_volume_quarantine(
+        &self,
+        kept: &KeptSnapshotRecord,
+        record: &VolumeQuarantineRecord,
+    ) -> Result<(), AgentError> {
+        let mut tx = self.pool.begin().await.map_err(store_error)?;
+        upsert_kept_snapshot(&mut tx, kept).await?;
+        sqlx::query(
+            "INSERT INTO quarantine (kind, path, quarantined_at, reason, quarantine_id, \
+             volume_id, app_id, size_bytes, sha256, snapshot_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(VOLUME_KIND)
+        .bind(record.path.display().to_string())
+        .bind(&record.created_at)
+        .bind(&record.reason)
+        .bind(&record.quarantine_id)
+        .bind(&record.volume_id)
+        .bind(&record.app_id)
+        .bind(i64::try_from(record.size_bytes).unwrap_or(i64::MAX))
+        .bind(record.sha256.as_deref())
+        .bind(&record.snapshot_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(store_error)?;
+        sqlx::query("UPDATE volumes SET handing_over = 1, hand_over_basis = ? WHERE volume_id = ?")
+            .bind(&record.quarantine_id)
+            .bind(&record.volume_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(store_error)?;
+        tx.commit().await.map_err(store_error)
+    }
+
+    /// Every quarantined copy of a volume the node keeps, oldest first. A
+    /// row that cannot be read back is left out with a warning, so one bad
+    /// row never empties the list `status_report.quarantines` carries.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn volume_quarantines(&self) -> Result<Vec<VolumeQuarantineRecord>, AgentError> {
+        let rows = sqlx::query("SELECT * FROM quarantine WHERE kind = ? ORDER BY id ASC")
+            .bind(VOLUME_KIND)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(store_error)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let id: Option<i64> = row.try_get("id").ok();
+                match volume_quarantine_record(row) {
+                    Ok(record) => Some(record),
+                    Err(e) => {
+                        warn!(row = ?id, error = %e, "a volume quarantine row cannot be read; it is left out");
+                        None
+                    }
+                }
+            })
+            .collect())
+    }
+
+    /// One quarantined copy of a volume, by its `qrn_` id.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure or a row it cannot read back.
+    pub async fn volume_quarantine(
+        &self,
+        quarantine_id: &str,
+    ) -> Result<Option<VolumeQuarantineRecord>, AgentError> {
+        let row = sqlx::query("SELECT * FROM quarantine WHERE kind = ? AND quarantine_id = ?")
+            .bind(VOLUME_KIND)
+            .bind(quarantine_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(store_error)?;
+        row.map(volume_quarantine_record).transpose()
+    }
+
+    /// The `snapshot_id` of the quarantined copy `quarantine_id`, read alone,
+    /// so a row that cannot be read whole can still be deleted; `None`
+    /// without such a row.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure, or for a row without a
+    /// `snapshot_id`.
+    pub async fn volume_quarantine_snapshot_id(
+        &self,
+        quarantine_id: &str,
+    ) -> Result<Option<String>, AgentError> {
+        let snapshot_id: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT snapshot_id FROM quarantine WHERE kind = ? AND quarantine_id = ?",
+        )
+        .bind(VOLUME_KIND)
+        .bind(quarantine_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_error)?;
+        match snapshot_id {
+            None => Ok(None),
+            Some(Some(snapshot_id)) => Ok(Some(snapshot_id)),
+            Some(None) => Err(AgentError::Store(format!(
+                "the quarantined copy {quarantine_id} has no snapshot_id"
+            ))),
+        }
+    }
+
+    /// Records the SHA-256 of a quarantined copy that has none yet. Returns
+    /// whether a record took it: `false` once the copy was deleted.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure.
+    pub async fn set_quarantine_sha256(
+        &self,
+        quarantine_id: &str,
+        sha256: &str,
+    ) -> Result<bool, AgentError> {
+        let done = sqlx::query(
+            "UPDATE quarantine SET sha256 = ? \
+             WHERE kind = ? AND quarantine_id = ? AND sha256 IS NULL",
+        )
+        .bind(sha256)
+        .bind(VOLUME_KIND)
+        .bind(quarantine_id)
+        .execute(&self.pool)
+        .await
+        .map_err(store_error)?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// Forgets a quarantined copy an operator deleted, in one transaction:
+    /// its kept snapshot and its `quarantine` row. The caller deleted the
+    /// clone first.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Store`] on a SQLite failure; both records stay then.
+    pub async fn forget_volume_quarantine(
+        &self,
+        quarantine_id: &str,
+        snapshot_id: &str,
+    ) -> Result<(), AgentError> {
+        let mut tx = self.pool.begin().await.map_err(store_error)?;
+        sqlx::query("DELETE FROM kept_snapshots WHERE snapshot_id = ?")
+            .bind(snapshot_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(store_error)?;
+        sqlx::query("DELETE FROM quarantine WHERE kind = ? AND quarantine_id = ?")
+            .bind(VOLUME_KIND)
+            .bind(quarantine_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(store_error)?;
+        tx.commit().await.map_err(store_error)
     }
 
     /// The warm copy of one volume this node holds as a target.
@@ -3126,6 +3486,79 @@ fn volume_record(row: sqlx::sqlite::SqliteRow) -> Result<VolumeRecord, AgentErro
     })
 }
 
+/// Inserts or updates one kept snapshot on `conn`, for
+/// [`NodeStore::save_kept_snapshot`] and the transactions that record one
+/// with other rows. A record never moves to another file.
+async fn upsert_kept_snapshot(
+    conn: &mut sqlx::SqliteConnection,
+    record: &KeptSnapshotRecord,
+) -> Result<(), AgentError> {
+    let snapshot = &record.snapshot;
+    let created_at_ms = snapshot
+        .created_at
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
+        });
+    let done = sqlx::query(
+        "INSERT INTO kept_snapshots (snapshot_id, volume_id, app_id, purpose, seq, location, \
+         size_bytes, created_at_ms, method, pause_ms, cells) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(snapshot_id) DO UPDATE SET app_id = excluded.app_id, \
+         purpose = excluded.purpose, seq = excluded.seq, cells = excluded.cells \
+         WHERE kept_snapshots.location = excluded.location \
+         AND kept_snapshots.volume_id = excluded.volume_id",
+    )
+    .bind(&snapshot.snapshot_id)
+    .bind(&snapshot.volume_id.0)
+    .bind(&record.app_id)
+    .bind(&record.purpose)
+    .bind(record.seq.map(|seq| i64::try_from(seq).unwrap_or(i64::MAX)))
+    .bind(snapshot.location.display().to_string())
+    .bind(i64::try_from(snapshot.size_bytes).unwrap_or(i64::MAX))
+    .bind(created_at_ms)
+    .bind(engine_method_str(snapshot.method))
+    .bind(i64::try_from(snapshot.pause.as_millis()).unwrap_or(i64::MAX))
+    .bind(record.cells.as_deref())
+    .execute(conn)
+    .await
+    .map_err(store_error)?;
+    if done.rows_affected() == 0 {
+        // The sweep keeps a snapshot by its file name, so a record must
+        // never move to another file.
+        return Err(AgentError::Store(format!(
+            "kept snapshot {} is recorded with another file or volume",
+            snapshot.snapshot_id
+        )));
+    }
+    Ok(())
+}
+
+/// Reads one volume `quarantine` row back into a [`VolumeQuarantineRecord`].
+fn volume_quarantine_record(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<VolumeQuarantineRecord, AgentError> {
+    let text = |name: &str| -> Result<String, AgentError> {
+        row.try_get::<Option<String>, _>(name)
+            .map_err(store_error)?
+            .ok_or_else(|| AgentError::Store(format!("a volume quarantine row has no {name}")))
+    };
+    let size_bytes: Option<i64> = row.try_get("size_bytes").map_err(store_error)?;
+    Ok(VolumeQuarantineRecord {
+        quarantine_id: text("quarantine_id")?,
+        volume_id: text("volume_id")?,
+        app_id: text("app_id")?,
+        created_at: text("quarantined_at")?,
+        size_bytes: size_bytes
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .unwrap_or(0),
+        path: PathBuf::from(text("path")?),
+        snapshot_id: text("snapshot_id")?,
+        reason: text("reason")?,
+        sha256: row.try_get("sha256").map_err(store_error)?,
+    })
+}
+
 /// Reads one `kept_snapshots` row back into a [`KeptSnapshotRecord`].
 fn kept_snapshot_record(row: sqlx::sqlite::SqliteRow) -> Result<KeptSnapshotRecord, AgentError> {
     let seq: Option<i64> = row.try_get("seq").map_err(store_error)?;
@@ -3639,9 +4072,10 @@ async fn buffer_event(
 
 /// Adds the columns newer agents need to a database an older agent created:
 /// `desired_state.body_enc` (bodies encrypted), the two validity columns of
-/// `leases` and `backups.guest_flush` (M5b, ADR 0282). New databases get them
-/// from [`SCHEMA`]; existing ones are altered once, and the old rows keep
-/// loading.
+/// `leases`, `backups.guest_flush` (M5b, ADR 0282), `volumes.handing_over`
+/// and `volumes.hand_over_basis`, and the volume columns of `quarantine` with
+/// their unique `qrn_` index (M5b, section 9). New databases get the columns from [`SCHEMA`]; existing ones
+/// are altered once, and the old rows keep loading.
 async fn migrate(pool: &SqlitePool) -> Result<(), AgentError> {
     let columns = sqlx::query("PRAGMA table_info(desired_state)")
         .fetch_all(pool)
@@ -3696,6 +4130,41 @@ async fn migrate(pool: &SqlitePool) -> Result<(), AgentError> {
             .await
             .map_err(store_error)?;
     }
+
+    // A returning source's hand-over (section 9): the mark on its own volume
+    // row and what it stands for, and the quarantined copies of a volume beside those of the change
+    // log (section 12 `quarantine`). Rows written before read as not handed
+    // over, and as change-log copies.
+    add_missing_columns(
+        pool,
+        "volumes",
+        &[
+            ("handing_over", "INTEGER NOT NULL DEFAULT 0"),
+            ("hand_over_basis", "TEXT"),
+        ],
+    )
+    .await?;
+    add_missing_columns(
+        pool,
+        "quarantine",
+        &[
+            ("quarantine_id", "TEXT"),
+            ("volume_id", "TEXT"),
+            ("app_id", "TEXT"),
+            ("size_bytes", "INTEGER"),
+            ("sha256", "TEXT"),
+            ("snapshot_id", "TEXT"),
+        ],
+    )
+    .await?;
+    // After the columns: an older database gains `quarantine_id` only above.
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS quarantine_by_id ON quarantine (quarantine_id) \
+         WHERE quarantine_id IS NOT NULL",
+    )
+    .execute(pool)
+    .await
+    .map_err(store_error)?;
 
     // A node an older agent marked failed has no list of the failed fences
     // the mark covers: they are the incomplete fence records (section 12
@@ -3784,6 +4253,30 @@ async fn migrate(pool: &SqlitePool) -> Result<(), AgentError> {
                 .map_err(store_error)?;
         }
         tx.commit().await.map_err(store_error)?;
+    }
+    Ok(())
+}
+
+/// Adds each of `columns` (name and declaration) that `table` lacks.
+async fn add_missing_columns(
+    pool: &SqlitePool,
+    table: &str,
+    columns: &[(&str, &str)],
+) -> Result<(), AgentError> {
+    let present: Vec<String> = sqlx::query(&format!("PRAGMA table_info({table})"))
+        .fetch_all(pool)
+        .await
+        .map_err(store_error)?
+        .iter()
+        .filter_map(|row| row.try_get::<String, _>("name").ok())
+        .collect();
+    for (column, kind) in columns {
+        if !present.iter().any(|name| name == column) {
+            sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))
+                .execute(pool)
+                .await
+                .map_err(store_error)?;
+        }
     }
     Ok(())
 }
@@ -4387,6 +4880,308 @@ mod tests {
         drop(store);
         let store = NodeStore::open(&dir.0).await.expect("the store reopens");
         assert_eq!(quarantine_rows(&store).await.len(), 1);
+    }
+
+    /// Section 9: a database from before the hand-over gains the mark on
+    /// the volume rows and the volume columns of `quarantine`. Its rows read
+    /// as before: a volume not handed over, a change-log copy that is no
+    /// volume's.
+    #[tokio::test]
+    async fn an_older_database_gains_the_hand_over_mark_and_volume_quarantines() {
+        let dir = TempDir::new();
+        {
+            let options = SqliteConnectOptions::new()
+                .filename(dir.0.join("node.db"))
+                .create_if_missing(true);
+            let pool = SqlitePool::connect_with(options).await.unwrap();
+            sqlx::raw_sql(
+                "CREATE TABLE node_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); \
+                 CREATE TABLE volumes (volume_id TEXT PRIMARY KEY, app_id TEXT NOT NULL, \
+                 size_gb INTEGER NOT NULL, state TEXT NOT NULL, error TEXT, \
+                 allocated_bytes INTEGER); \
+                 CREATE TABLE quarantine (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 kind TEXT NOT NULL, path TEXT NOT NULL, quarantined_at TEXT NOT NULL, \
+                 reason TEXT NOT NULL, last_seq INTEGER, last_hash TEXT); \
+                 INSERT INTO volumes (volume_id, app_id, size_gb, state) \
+                 VALUES ('vol_a', 'app_a', 1, 'ready'); \
+                 INSERT INTO quarantine (kind, path, quarantined_at, reason, last_seq) \
+                 VALUES ('change_log', '/q/log', '2026-11-01T00:00:00Z', 'fork', 3);",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+        }
+        let store = NodeStore::open(&dir.0).await.expect("the store opens");
+        assert!(!store.volume_handing_over("vol_a").await.unwrap());
+        assert_eq!(
+            store.volume("vol_a").await.unwrap().unwrap().state,
+            VolumeState::Ready
+        );
+        assert!(store.volume_quarantines().await.unwrap().is_empty());
+        assert_eq!(quarantine_rows(&store).await.len(), 1);
+
+        let (kept, record) = volume_copy("vol_a", "snap-1");
+        store
+            .record_volume_quarantine(&kept, &record)
+            .await
+            .unwrap();
+        assert!(store.volume_handing_over("vol_a").await.unwrap());
+        assert_eq!(store.volume_quarantines().await.unwrap(), vec![record]);
+        assert_eq!(quarantine_rows(&store).await.len(), 2);
+
+        // A second start finds the columns and keeps both.
+        drop(store);
+        let store = NodeStore::open(&dir.0).await.expect("the store reopens");
+        assert!(store.volume_handing_over("vol_a").await.unwrap());
+        assert_eq!(store.volume_quarantines().await.unwrap().len(), 1);
+        assert_eq!(quarantine_rows(&store).await.len(), 2);
+    }
+
+    /// A quarantined copy of `volume_id` and its kept snapshot.
+    fn volume_copy(
+        volume_id: &str,
+        snapshot_id: &str,
+    ) -> (KeptSnapshotRecord, VolumeQuarantineRecord) {
+        let location = PathBuf::from(format!("/volumes/{volume_id}.{snapshot_id}"));
+        let kept = KeptSnapshotRecord {
+            app_id: "app_a".to_owned(),
+            snapshot: quoro_engine::VolumeSnapshot {
+                volume_id: quoro_engine::VolumeId(volume_id.to_owned()),
+                snapshot_id: snapshot_id.to_owned(),
+                created_at: std::time::UNIX_EPOCH + Duration::from_millis(1_000),
+                size_bytes: 1 << 30,
+                location: location.clone(),
+                method: quoro_engine::SnapshotMethod::Reflink,
+                pause: Duration::ZERO,
+                guest_flush: quoro_engine::GuestFlush::Unsupported,
+            },
+            purpose: "quarantine".to_owned(),
+            seq: None,
+            cells: None,
+        };
+        let record = VolumeQuarantineRecord {
+            quarantine_id: crate::util::quarantine_id(),
+            volume_id: volume_id.to_owned(),
+            app_id: "app_a".to_owned(),
+            created_at: "2026-11-10T10:00:00Z".to_owned(),
+            size_bytes: 8192,
+            path: location,
+            snapshot_id: snapshot_id.to_owned(),
+            reason: "changed since the base".to_owned(),
+            sha256: None,
+        };
+        (kept, record)
+    }
+
+    /// Section 9: a quarantined copy is recorded with its kept snapshot and
+    /// the mark in one transaction, gets its hash once, and is forgotten
+    /// with its kept snapshot; the end of a hand-over drops a marked row only
+    /// and leaves the warm row with no copy.
+    #[tokio::test]
+    async fn a_volume_quarantine_and_a_hand_over_round_trip() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        store
+            .save_volume(&VolumeRecord {
+                volume_id: "vol_a".to_owned(),
+                app_id: "app_a".to_owned(),
+                size_gb: 1,
+                state: VolumeState::Ready,
+                error: None,
+                allocated_bytes: Some(4096),
+            })
+            .await
+            .unwrap();
+        store.add_warm_target("vol_a", "app_a", 1).await.unwrap();
+        let mut row = store.warm_target("vol_a").await.unwrap().unwrap();
+        row.complete_seq = Some(4);
+        row.taken_at = Some("2026-11-10T09:00:00Z".to_owned());
+        row.error = Some("this node holds the volume as its own".to_owned());
+        store.save_warm_target(&row).await.unwrap();
+
+        // Not marked: the end drops nothing.
+        assert!(!store.finish_hand_over("vol_a").await.unwrap());
+        assert!(store.volume("vol_a").await.unwrap().is_some());
+
+        let (kept, record) = volume_copy("vol_a", "snap-1");
+        store
+            .record_volume_quarantine(&kept, &record)
+            .await
+            .unwrap();
+        assert!(store.volume_handing_over("vol_a").await.unwrap());
+        assert_eq!(
+            store.volume_hand_over_mark("vol_a").await.unwrap(),
+            Some(HandOverMark::Copy(record.quarantine_id.clone())),
+            "the mark stands for the copy"
+        );
+        assert_eq!(
+            store.volumes_handing_over().await.unwrap(),
+            BTreeSet::from(["vol_a".to_owned()])
+        );
+        assert_eq!(
+            store
+                .volume_quarantine(&record.quarantine_id)
+                .await
+                .unwrap(),
+            Some(record.clone())
+        );
+        assert_eq!(
+            store.kept_snapshot("snap-1").await.unwrap(),
+            Some(kept.clone())
+        );
+        // A second record under the same id is refused, and changes nothing.
+        let (other_kept, mut other) = volume_copy("vol_a", "snap-2");
+        other.quarantine_id = record.quarantine_id.clone();
+        assert!(
+            store
+                .record_volume_quarantine(&other_kept, &other)
+                .await
+                .is_err()
+        );
+        assert_eq!(store.kept_snapshot("snap-2").await.unwrap(), None);
+
+        // The hash is recorded once.
+        let sha256 = "ab".repeat(32);
+        assert!(
+            store
+                .set_quarantine_sha256(&record.quarantine_id, &sha256)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .set_quarantine_sha256(&record.quarantine_id, &"cd".repeat(32))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .volume_quarantine(&record.quarantine_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .sha256,
+            Some(sha256)
+        );
+
+        // The end: the marked row goes, the warm row has no copy and no error.
+        assert!(store.finish_hand_over("vol_a").await.unwrap());
+        assert!(store.volume("vol_a").await.unwrap().is_none());
+        let row = store.warm_target("vol_a").await.unwrap().unwrap();
+        assert_eq!(row.complete_seq, None);
+        assert_eq!(row.taken_at, None);
+        assert_eq!(row.error, None);
+        assert!(store.volumes_handing_over().await.unwrap().is_empty());
+
+        // The operator's delete forgets both records; once more is a no-op.
+        store
+            .forget_volume_quarantine(&record.quarantine_id, "snap-1")
+            .await
+            .unwrap();
+        assert!(store.volume_quarantines().await.unwrap().is_empty());
+        assert_eq!(store.kept_snapshot("snap-1").await.unwrap(), None);
+        store
+            .forget_volume_quarantine(&record.quarantine_id, "snap-1")
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .set_quarantine_sha256(&record.quarantine_id, &"ef".repeat(32))
+                .await
+                .unwrap()
+        );
+
+        // A mark on a row the node runs again is cleared.
+        store
+            .save_volume(&VolumeRecord {
+                volume_id: "vol_b".to_owned(),
+                app_id: "app_a".to_owned(),
+                size_gb: 1,
+                state: VolumeState::Ready,
+                error: None,
+                allocated_bytes: None,
+            })
+            .await
+            .unwrap();
+        store
+            .mark_volume_handing_over("vol_b", &HandOverMark::Unchanged)
+            .await
+            .unwrap();
+        // Saving the row again keeps the mark.
+        store
+            .save_volume(&VolumeRecord {
+                volume_id: "vol_b".to_owned(),
+                app_id: "app_a".to_owned(),
+                size_gb: 1,
+                state: VolumeState::Ready,
+                error: None,
+                allocated_bytes: Some(1),
+            })
+            .await
+            .unwrap();
+        assert!(store.volume_handing_over("vol_b").await.unwrap());
+        assert_eq!(
+            store.volume_hand_over_mark("vol_b").await.unwrap(),
+            Some(HandOverMark::Unchanged)
+        );
+        store.clear_volume_handing_over("vol_b").await.unwrap();
+        assert!(!store.volume_handing_over("vol_b").await.unwrap());
+        assert_eq!(store.volume_hand_over_mark("vol_b").await.unwrap(), None);
+        store
+            .mark_volume_handing_over("vol_b", &HandOverMark::Gone)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.volume_hand_over_mark("vol_b").await.unwrap(),
+            Some(HandOverMark::Gone)
+        );
+        // A mark whose basis cannot be read stands for nothing.
+        sqlx::query("UPDATE volumes SET hand_over_basis = NULL WHERE volume_id = 'vol_b'")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(store.volume_handing_over("vol_b").await.unwrap());
+        assert_eq!(store.volume_hand_over_mark("vol_b").await.unwrap(), None);
+    }
+
+    /// One unreadable quarantine row leaves the others listed.
+    #[tokio::test]
+    async fn an_unreadable_volume_quarantine_row_is_left_out_of_the_list() {
+        let dir = TempDir::new();
+        let store = NodeStore::open(&dir.0).await.unwrap();
+        sqlx::query(
+            "INSERT INTO quarantine (kind, path, quarantined_at, reason) \
+             VALUES (?, '/gone', '2026-11-10T09:00:00Z', 'no id')",
+        )
+        .bind(VOLUME_KIND)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let (kept, record) = volume_copy("vol_a", "snap-1");
+        store
+            .record_volume_quarantine(&kept, &record)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.volume_quarantines().await.unwrap(),
+            vec![record.clone()]
+        );
+        // Its id and snapshot read alone, for a delete.
+        assert_eq!(
+            store
+                .volume_quarantine_snapshot_id(&record.quarantine_id)
+                .await
+                .unwrap(),
+            Some("snap-1".to_owned())
+        );
+        assert_eq!(
+            store
+                .volume_quarantine_snapshot_id("qrn_01JD0WARM0000000000000000Z")
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     /// The stored refollowing value, as it is in `node_meta`.

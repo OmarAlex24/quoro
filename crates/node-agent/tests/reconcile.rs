@@ -23,7 +23,9 @@ use quoro_ingress::cloudflared::CloudflaredConfig;
 use quoro_node_agent::edge::EdgeManager;
 use quoro_node_agent::ingress::{CertificateEvents, DnsBridge, IngressConfig, IngressSupervisor};
 use quoro_node_agent::reconcile::{ReconcileOptions, Reconciler, Snapshot};
-use quoro_node_agent::store::{NodeStore, PendingCommit, VolumeRecord, WarmTargetRecord};
+use quoro_node_agent::store::{
+    HandOverMark, NodeStore, PendingCommit, VolumeRecord, WarmTargetRecord,
+};
 use quoro_node_agent::warm::VolumeLocks;
 use quoro_node_agent::{EXPIRING_START_WITHIN, LeaseTable, LeaseView, START_WITHIN};
 use quoro_proto::wire::VolumeStatus;
@@ -2649,9 +2651,10 @@ async fn a_standby_vm_is_never_created_even_when_it_could_start() {
     assert_eq!(engine.starts().len(), 1);
 }
 
-/// A VM the engine already holds under a `standby` id is left as it is: not
-/// started, stopped or removed here. It holds the revision back until it is
-/// gone.
+/// A VM the engine holds under a `standby` id is this node's old VM of the
+/// app (section 9). While it runs it is left as it is: not started, stopped
+/// or deleted here, and it holds the revision back. Once the engine reports
+/// it stopped, the pass deletes it and the revision is applied.
 #[tokio::test]
 async fn a_vm_the_engine_holds_under_a_standby_id_holds_the_revision() {
     let dir = TargetDir::new("standby-existing");
@@ -2682,12 +2685,229 @@ async fn a_vm_the_engine_holds_under_a_standby_id_holds_the_revision() {
     assert_eq!(engine.starts().len(), started);
     assert_eq!(engine.create_count(), created);
     assert_eq!(engine.prepare_count("sha256:standby"), 1);
-    assert!(engine.inspect(&id).await.is_ok(), "not deleted here");
+    assert!(
+        engine.inspect(&id).await.is_ok(),
+        "not deleted while it runs"
+    );
 
-    engine.inner().crash(&id, "gone");
-    engine.inner().delete(&id).await.unwrap();
-    reconciler.reconcile_once(Some(&snap)).await;
+    // The fence stops it, here as a crash would.
+    engine.inner().crash(&id, "fenced");
+    let statuses = reconciler.reconcile_once(Some(&snap)).await;
+    assert!(
+        matches!(engine.inspect(&id).await, Err(EngineError::NotFound)),
+        "deleted once stopped"
+    );
     assert_eq!(store.applied_rev().await.unwrap(), 1);
+    assert!(engine.stops().is_empty());
     assert_eq!(engine.create_count(), created);
     assert_eq!(engine.starts().len(), started);
+    assert!(
+        statuses
+            .iter()
+            .any(|status| status.vm_id == "vm_w"
+                && status.observed_status == ObservedStatus::Stopped),
+        "a standby VM is reported stopped: {statuses:?}"
+    );
+}
+
+/// Section 9: the node's old VM, stopped by the revoke or the fence, is
+/// deleted with `Engine::delete`, which keeps its volume; nothing is stopped
+/// or started, and the revision is applied in the same pass.
+#[tokio::test]
+async fn the_old_vm_under_a_standby_id_is_deleted_once_stopped_and_its_volume_stays() {
+    let dir = TargetDir::new("standby-old-vm");
+    let engine = Arc::new(RecordingEngine::new());
+    engine.inner().set_volume_dir(dir.path());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let (mut reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let volume = engine
+        .inner()
+        .ensure_volume(&VolumeId("vol_w".to_owned()), 1)
+        .await
+        .unwrap();
+    std::fs::write(&volume.path, b"the source's data").unwrap();
+    let id = engine.raw_running_vm("vm_w").await;
+    engine
+        .inner()
+        .stop(
+            &id,
+            StopMode::Force {
+                within: Duration::from_secs(5),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(engine.inspect(&id).await.unwrap().state, VmState::Stopped);
+    let (created, started) = (engine.create_count(), engine.starts().len());
+
+    let snap = snapshot_full(
+        1,
+        vec![standby_vm("vm_w", "lse_w", 3, "sha256:standby")],
+        Vec::new(),
+        vec![warm_target_volume(3)],
+    );
+    let statuses = reconciler.reconcile_once(Some(&snap)).await;
+    assert!(matches!(
+        engine.inspect(&id).await,
+        Err(EngineError::NotFound)
+    ));
+    assert_eq!(
+        std::fs::read(&volume.path).unwrap(),
+        b"the source's data",
+        "the volume stays"
+    );
+    assert_eq!(engine.inner().volumes().len(), 1);
+    assert_eq!(store.applied_rev().await.unwrap(), 1);
+    assert!(engine.stops().is_empty(), "no stop call");
+    assert_eq!(engine.starts().len(), started);
+    assert_eq!(engine.create_count(), created);
+    assert!(
+        statuses
+            .iter()
+            .any(|status| status.vm_id == "vm_w"
+                && status.observed_status == ObservedStatus::Stopped),
+        "{statuses:?}"
+    );
+    assert!(
+        !statuses
+            .iter()
+            .any(|status| status.observed_status == ObservedStatus::Deleted),
+        "a standby VM is never reported deleted: {statuses:?}"
+    );
+
+    // The next pass finds nothing to delete.
+    reconciler.reconcile_once(Some(&snap)).await;
+    assert!(engine.stops().is_empty());
+    assert_eq!(engine.inner().volumes().len(), 1);
+}
+
+/// The engine answers the delete of the old standby VM but still holds it:
+/// the revision waits until an inspect no longer finds it.
+#[tokio::test]
+async fn a_standby_vm_the_engine_still_holds_after_its_delete_holds_the_revision() {
+    let dir = TargetDir::new("standby-delete-kept");
+    let engine = Arc::new(RecordingEngine::new());
+    engine.inner().set_volume_dir(dir.path());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let (mut reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let id = engine.raw_running_vm("vm_w").await;
+    engine.inner().crash(&id, "fenced");
+    let snap = snapshot_full(
+        1,
+        vec![standby_vm("vm_w", "lse_w", 3, "sha256:standby")],
+        Vec::new(),
+        vec![warm_target_volume(3)],
+    );
+
+    engine.keep_next_deletes(1);
+    reconciler.reconcile_once(Some(&snap)).await;
+    assert!(
+        engine.inspect(&id).await.is_ok(),
+        "the engine still holds it"
+    );
+    assert_eq!(store.applied_rev().await.unwrap(), 0, "not applied");
+
+    reconciler.reconcile_once(Some(&snap)).await;
+    assert!(matches!(
+        engine.inspect(&id).await,
+        Err(EngineError::NotFound)
+    ));
+    assert_eq!(store.applied_rev().await.unwrap(), 1);
+    assert!(engine.stops().is_empty(), "no stop call");
+}
+
+/// Section 9: a hand-over that did not finish leaves its mark on the node's
+/// own row. While the node is the volume's target the mark stays; once it
+/// runs the volume again, the pass clears it under the volume's lock before
+/// any VM may write to the file, so a later hand-over compares the file
+/// again.
+#[tokio::test]
+async fn running_the_volume_again_clears_an_unfinished_hand_over() {
+    let dir = TargetDir::new("handover-mark");
+    let engine = Arc::new(RecordingEngine::new());
+    engine.inner().set_volume_dir(dir.path());
+    let store = NodeStore::open(dir.path()).await.unwrap();
+    let locks = VolumeLocks::new();
+    let (reconciler, _observed) = reconciler(engine.clone(), store.clone());
+    let mut reconciler = reconciler.with_warm_locks(locks.clone());
+    engine
+        .inner()
+        .ensure_volume(&VolumeId("vol_w".to_owned()), 1)
+        .await
+        .unwrap();
+    store
+        .save_volume(&VolumeRecord {
+            volume_id: "vol_w".to_owned(),
+            app_id: "app_w".to_owned(),
+            size_gb: 1,
+            state: VolumeState::Ready,
+            error: None,
+            allocated_bytes: None,
+        })
+        .await
+        .unwrap();
+    store
+        .mark_volume_handing_over("vol_w", &HandOverMark::Unchanged)
+        .await
+        .unwrap();
+    // A row that is not ready takes the create path, which clears it too.
+    store
+        .save_volume(&VolumeRecord {
+            volume_id: "vol_x".to_owned(),
+            app_id: "app_w".to_owned(),
+            size_gb: 1,
+            state: VolumeState::Failed,
+            error: Some("injected".to_owned()),
+            allocated_bytes: None,
+        })
+        .await
+        .unwrap();
+    store
+        .mark_volume_handing_over("vol_x", &HandOverMark::Unchanged)
+        .await
+        .unwrap();
+
+    let target = snapshot_full(1, Vec::new(), Vec::new(), vec![warm_target_volume(3)]);
+    reconciler.reconcile_once(Some(&target)).await;
+    assert!(store.volume_handing_over("vol_w").await.unwrap());
+
+    let own = snapshot_full(
+        2,
+        Vec::new(),
+        Vec::new(),
+        vec![
+            spec_volume("vol_w", "app_w", 1, SpecVolumeState::Present),
+            spec_volume("vol_x", "app_w", 1, SpecVolumeState::Present),
+        ],
+    );
+    // A hand-over still holds the lock of `vol_w`: its mark waits, and the
+    // revision is not applied.
+    let hand_over = locks.try_lock("vol_w").expect("free");
+    reconciler.reconcile_once(Some(&own)).await;
+    assert!(store.volume_handing_over("vol_w").await.unwrap());
+    assert!(!store.volume_handing_over("vol_x").await.unwrap());
+    assert!(store.applied_rev().await.unwrap() < 2, "not applied yet");
+    drop(hand_over);
+
+    reconciler.reconcile_once(Some(&own)).await;
+    assert!(store.volumes_handing_over().await.unwrap().is_empty());
+    for volume_id in ["vol_w", "vol_x"] {
+        let row = store
+            .volume(volume_id)
+            .await
+            .unwrap()
+            .expect("the row stays");
+        assert_eq!(row.state, VolumeState::Ready, "{volume_id}");
+    }
+    assert_eq!(store.applied_rev().await.unwrap(), 2);
+
+    // An unmarked own volume is not held back by its lock, which a warm
+    // cycle of the source may hold.
+    let cycle = locks.try_lock("vol_w").expect("free");
+    let mut again = own.clone();
+    again.rev = 3;
+    again.state.rev = 3;
+    reconciler.reconcile_once(Some(&again)).await;
+    assert_eq!(store.applied_rev().await.unwrap(), 3);
+    drop(cycle);
 }

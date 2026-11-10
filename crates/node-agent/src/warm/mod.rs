@@ -6,7 +6,9 @@
 //! volume every interval and ships what changed. The warm node is the
 //! **target**: it holds the last complete copy. [`sender`] is the source
 //! side, [`receiver`] the target side; [`frame`] is the stream both sides
-//! speak.
+//! speak. A source that comes back as the target hands its volume over to
+//! the receiver first, keeping a live file it cannot prove unchanged as a
+//! quarantined copy ([`quarantine`], section 9).
 //!
 //! Each volume has one lock ([`VolumeLocks`]): a stream holds it from its
 //! checks to its answer, and anything else that replaces or removes the warm
@@ -15,6 +17,7 @@
 //! middle of a stream.
 
 pub mod frame;
+pub mod quarantine;
 pub mod receiver;
 pub mod sender;
 
