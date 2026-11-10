@@ -4,6 +4,7 @@
 mod common;
 
 use common::log::{check_entries, genesis, log_hash_at, log_head};
+use common::replay;
 use common::{
     Server, TLS_FINGERPRINT, problem, restart_with_resolver, start, start_with_patient_node_session,
 };
@@ -589,6 +590,90 @@ async fn the_local_bootstrap_token_enrolls_the_primary() {
     .unwrap();
     assert_eq!((primaries, credentials), (1, 1));
     assert!(!server.data_dir.join("local-node-join.json").exists());
+}
+
+/// Section 7.3 step 4 and migration 0012: the entries an enrollment writes
+/// rebuild its rows when replayed in `seq` order into an empty database.
+/// The node's own entry comes before the subnet and join-token updates that
+/// name it, and every credential row travels as a `node_credential` entry.
+/// Covers both a new node (join token) and the primary's adopted row (local
+/// token).
+#[tokio::test]
+async fn enrollment_entries_rebuild_the_node_token_and_credential_rows() {
+    let server = start().await;
+    driver::register_local_node(
+        &server.state.store,
+        &LocalNode {
+            name: "primary".to_string(),
+            capacity: Capacity {
+                cpus: 4,
+                memory_mb: 8_192,
+                disk_gb: 50,
+            },
+            kvm: Kvm {
+                available: true,
+                kernel: "6.8.0".to_string(),
+                nested: None,
+            },
+            engine_version: "engine".to_string(),
+            agent_version: "agent".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    ensure_local_join(
+        &server.data_dir,
+        "https://primary.local:8443",
+        TLS_FINGERPRINT,
+    )
+    .unwrap();
+    let token = local_join_token(&server.data_dir).unwrap();
+    let (status, body) = enroll(&server, &token, "primary").await;
+    assert_eq!(status, 201, "{body}");
+
+    let owner = server.owner().await;
+    common::settle_voters(&server).await;
+    enrolled(&server, &owner, NODE_NAME).await;
+
+    let rebuilt = replay::rebuild(
+        &server,
+        &["node", "node_join_token", "node_credential"],
+        replay::TOKEN_HASHES,
+    )
+    .await;
+    replay::assert_rebuilt(
+        &server,
+        &rebuilt,
+        "nodes",
+        &[
+            "id",
+            "name",
+            "roles",
+            "cp_status",
+            "status",
+            "public_key",
+            "subnet",
+            "created_at",
+        ],
+        2,
+    )
+    .await;
+    replay::assert_rebuilt(
+        &server,
+        &rebuilt,
+        "node_join_tokens",
+        &["id", "created_by", "expires_at", "used_at", "node_id"],
+        1,
+    )
+    .await;
+    replay::assert_rebuilt(
+        &server,
+        &rebuilt,
+        "node_credentials",
+        &["node_id", "credential_hash", "created_at", "revoked_at"],
+        2,
+    )
+    .await;
 }
 
 #[tokio::test]
