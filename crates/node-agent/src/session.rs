@@ -16,6 +16,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures_util::stream::{SplitSink, SplitStream};
@@ -38,7 +39,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{WebSocketStream, client_async_with_config};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::build::manager::{BuildStart, BuildsError, BuildsHandle};
 use crate::edge::EdgeManager;
@@ -275,8 +276,9 @@ pub struct Session {
     /// The machine's WireGuard public key, reported in `hello` (section 6.9).
     mesh_public_key: Option<String>,
     /// Whether this machine has the `node` role, so that it keeps a custody
-    /// key in its data directory and reports it in every `hello` (section
-    /// 7.2). Set by [`Session::with_roles`]; off by default.
+    /// key in its data directory and reports it in every `hello` while the
+    /// key can be read (section 7.2). Set by [`Session::with_roles`]; off by
+    /// default.
     custody: bool,
     /// The engine handles behind `terminal` and `console` streams (M4), when
     /// the agent runs one.
@@ -368,20 +370,44 @@ fn revoked_lease(text: &str) -> Option<String> {
     }
 }
 
+/// Whether this process has logged, at error level, that its custody key
+/// cannot be used; later sessions log it at debug level only.
+static CUSTODY_KEY_ERROR_LOGGED: AtomicBool = AtomicBool::new(false);
+
 /// The standard base64 public half of the custody key in `data_dir`, which
 /// is generated and written first when there is none (section 7.2). The
 /// file work runs off the async runtime, since a new key is synced to disk.
 ///
-/// # Errors
-///
-/// The errors of [`identity::load_or_create_custody_key`].
-async fn custody_public_key(data_dir: &std::path::Path) -> Result<String, AgentError> {
+/// `None` when the key can be neither read nor created. The file is then
+/// left as it is, never replaced, because the primary binds the first key a
+/// machine reports (ADR 0231), and `hello` goes without the key: the
+/// custody key guards no lease or fence, so the node stays connected, but
+/// seals open only with it, so promotion from this machine is refused until
+/// the key can be read (section 7.2). The first failure in a process is
+/// logged as an error naming the file, later ones at debug level.
+async fn custody_public_key(data_dir: &std::path::Path) -> Option<String> {
     let dir = data_dir.to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    let read = tokio::task::spawn_blocking(move || {
         identity::load_or_create_custody_key(&dir).map(|key| key.public_key().to_base64())
     })
     .await
-    .map_err(|e| AgentError::Identity(format!("the custody key reader stopped: {e}")))?
+    .unwrap_or_else(|e| {
+        Err(AgentError::Identity(format!(
+            "the custody key reader stopped: {e}"
+        )))
+    });
+    match read {
+        Ok(key) => Some(key),
+        Err(e) => {
+            let file = data_dir.join(identity::CUSTODY_KEY_FILE);
+            if CUSTODY_KEY_ERROR_LOGGED.swap(true, Ordering::Relaxed) {
+                debug!(error = %e, file = %file.display(), "the custody key still cannot be read or created; hello goes without it");
+            } else {
+                error!(error = %e, file = %file.display(), "could not read or create the custody key; the file is left as it is, hello goes without custody_public_key, and promotion from this machine will be refused until the key can be read");
+            }
+            None
+        }
+    }
 }
 
 /// What the session does after [`Session::handle`]: `None` goes on, `Some`
@@ -583,8 +609,9 @@ impl Session {
     /// ([`crate::has_node_role`]) every `hello` carries the custody key's
     /// public half, and the key is generated before the first `hello` when
     /// the data directory has none: a machine upgraded to M5b gets it then
-    /// (section 7.2). An edge-only or witness-only machine keeps no custody
-    /// key and reports none.
+    /// (section 7.2). While `custody.key` cannot be read, `hello` goes
+    /// without it. An edge-only or witness-only machine keeps no custody key
+    /// and reports none.
     #[must_use]
     pub fn with_roles(mut self, roles: &[String]) -> Self {
         self.custody = crate::has_node_role(roles);
@@ -748,10 +775,8 @@ impl Session {
         //    the mark: a `log_seq` of 0 would skip the primary's divergence
         //    check, and neither a copy that must first be moved aside nor a
         //    position the mark does not cover may be reported (section 7.1).
-        //    Nor is it sent on a machine with the `node` role whose custody
-        //    key cannot be read: the primary binds the first key it sees,
-        //    so the file is left for the operator, never replaced (section
-        //    7.2, ADR 0231).
+        //    A custody key that cannot be read does not hold `hello` back;
+        //    it goes without the key (section 7.2).
         if let Err(e) = follow::recover(&self.store).await {
             warn!(error = %e, "could not finish the change-log quarantine or refollowing before hello; reconnecting");
             return Ok(SessionEnd::Reconnect);
@@ -759,7 +784,7 @@ impl Session {
         let hello = match self.hello().await {
             Ok(hello) => hello,
             Err(e) => {
-                warn!(error = %e, "could not read the change-log position, keep the mark or read the custody key for hello; reconnecting");
+                warn!(error = %e, "could not read the change-log position or keep the mark for hello; reconnecting");
                 return Ok(SessionEnd::Reconnect);
             }
         };
@@ -2244,18 +2269,18 @@ impl Session {
     /// node that followed before the mark existed its mark, and covers an
     /// agent that stopped between a batch's commit and its mark write. On a
     /// machine with the `node` role it carries the custody key's public
-    /// half, which is generated first when the data directory has none
-    /// (section 7.2).
+    /// half, which is generated first when the data directory has none,
+    /// and leaves it out while `custody.key` cannot be read, which leaves
+    /// the file as it is (section 7.2, [`custody_public_key`]).
     ///
     /// # Errors
     ///
     /// [`AgentError::Store`] when the change-log position cannot be read or
     /// the mark holds no `seq`, [`AgentError::Io`] when the mark cannot be
-    /// read or written, [`AgentError::Identity`] when `custody.key` cannot
-    /// be read or is malformed, which leaves it as it is.
+    /// read or written.
     async fn hello(&self) -> Result<NodeMessage, AgentError> {
         let custody_public_key = if self.custody {
-            Some(custody_public_key(self.store.data_dir()).await?)
+            custody_public_key(self.store.data_dir()).await
         } else {
             None
         };

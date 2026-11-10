@@ -16,7 +16,8 @@
 //! - `custody.key` — on a machine with the `node` role, the X25519 custody
 //!   private key the primary seals the cluster keys to (section 7.2, ADR
 //!   0180). It never leaves the machine; `hello` and the enroll request carry
-//!   its public half. See [`load_or_create_custody_key`].
+//!   its public half. It is written once and linked into place rather than
+//!   renamed, so it never replaces a file. See [`load_or_create_custody_key`].
 //!
 //! [`IdentityHandle`] is the in-process view the session keeps: it answers with
 //! the current pin and can persist a `signing_key_rotate` atomically.
@@ -156,7 +157,9 @@ pub fn write_seed(data_dir: &Path, seed: &[u8; 32]) -> Result<(), AgentError> {
 /// A key that exists is never replaced: the primary binds the first key a
 /// machine reports and refuses another (ADR 0231). A file that exists but
 /// cannot be read or is not exactly 32 bytes is therefore an error, and the
-/// file is left as it is.
+/// file is left as it is. A new key never replaces a file either, even one
+/// that appears while it is written: it is linked into place, which fails
+/// when the file exists, and the file that won is read and used.
 ///
 /// # Errors
 ///
@@ -165,21 +168,40 @@ pub fn write_seed(data_dir: &Path, seed: &[u8; 32]) -> Result<(), AgentError> {
 pub fn load_or_create_custody_key(data_dir: &Path) -> Result<CustodyKey, AgentError> {
     let path = data_dir.join(CUSTODY_KEY_FILE);
     match fs::read(&path) {
-        Ok(bytes) => {
-            let bytes = Zeroizing::new(bytes);
-            CustodyKey::from_bytes(&bytes)
-                .map_err(|_| AgentError::Identity(format!("{} is not 32 bytes", path.display())))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let key = CustodyKey::generate(&mut custody::os_rng());
-            write_private(data_dir, CUSTODY_KEY_FILE, &key.to_bytes()[..])?;
-            Ok(key)
-        }
-        Err(error) => Err(AgentError::Identity(format!(
-            "could not read {}: {error}",
-            path.display()
-        ))),
+        Ok(bytes) => parse_custody_key(&path, bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => create_custody_key(data_dir),
+        Err(error) => Err(unreadable_custody_key(&path, &error)),
     }
+}
+
+/// Generates a custody key and writes it to [`CUSTODY_KEY_FILE`] only if no
+/// file is there ([`write_private_new`]). When one is, it was created after
+/// [`load_or_create_custody_key`] found none: it is read once and used, and
+/// the generated key is dropped.
+///
+/// # Errors
+///
+/// As [`load_or_create_custody_key`].
+fn create_custody_key(data_dir: &Path) -> Result<CustodyKey, AgentError> {
+    let key = CustodyKey::generate(&mut custody::os_rng());
+    if write_private_new(data_dir, CUSTODY_KEY_FILE, &key.to_bytes()[..])? {
+        return Ok(key);
+    }
+    let path = data_dir.join(CUSTODY_KEY_FILE);
+    let bytes = fs::read(&path).map_err(|error| unreadable_custody_key(&path, &error))?;
+    parse_custody_key(&path, bytes)
+}
+
+/// Parses the bytes of `custody.key`, naming the file when they are not a
+/// key.
+fn parse_custody_key(path: &Path, bytes: Vec<u8>) -> Result<CustodyKey, AgentError> {
+    let bytes = Zeroizing::new(bytes);
+    CustodyKey::from_bytes(&bytes)
+        .map_err(|_| AgentError::Identity(format!("{} is not 32 bytes", path.display())))
+}
+
+fn unreadable_custody_key(path: &Path, error: &std::io::Error) -> AgentError {
+    AgentError::Identity(format!("could not read {}: {error}", path.display()))
 }
 
 /// Reads the session credential.
@@ -282,6 +304,54 @@ pub fn write_private(data_dir: &Path, name: &str, bytes: &[u8]) -> Result<(), Ag
     if result.is_err() {
         let _ = fs::remove_file(&temp);
     }
+    result.map_err(|e| AgentError::io("write identity file", e))
+}
+
+/// Writes `bytes` to `data_dir/name`, `0600`, only when no file of that name
+/// exists, so it never replaces one, even one created while it runs. Like
+/// [`write_private`] it writes and syncs a temporary file first, but it
+/// hard-links it to `name`, which fails when `name` exists, instead of
+/// renaming it over `name`. The temporary file is then removed and the
+/// directory synced, so a new file survives a crash.
+///
+/// Returns `false`, having written nothing, when `name` already exists.
+///
+/// # Errors
+///
+/// [`AgentError::Io`] when the temporary file, its mode, the write, the
+/// link, the removal or the directory sync fails.
+fn write_private_new(data_dir: &Path, name: &str, bytes: &[u8]) -> Result<bool, AgentError> {
+    ensure_data_dir(data_dir)?;
+    let temp = data_dir.join(format!(
+        ".{name}.{}.tmp",
+        util::hex(&util::random_bytes::<8>())
+    ));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let write = || -> std::io::Result<bool> {
+        let mut file = options.open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        match fs::hard_link(&temp, data_dir.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        fs::remove_file(&temp)?;
+        // The link and the removal change the directory: without this sync
+        // a crash can lose the new file.
+        fs::File::open(data_dir)?.sync_all()?;
+        Ok(true)
+    };
+    let result = write();
+    // Gone already after a link; removed here on every other path.
+    let _ = fs::remove_file(&temp);
     result.map_err(|e| AgentError::io("write identity file", e))
 }
 
@@ -489,6 +559,62 @@ mod tests {
             let mode = fs::metadata(dir.join("file")).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Section 7.2, ADR 0231: creating the custody key never replaces a
+    /// `custody.key` that is already there, as when one appears after the
+    /// loader found none. The file is left byte for byte and the key it holds
+    /// is returned; a malformed one is left too and refused with the file
+    /// named. With no file the new key is written `0600`, and no temporary
+    /// file is ever left.
+    #[test]
+    fn creating_the_custody_key_never_replaces_an_existing_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "quoro-identity-unit-{}",
+            util::hex(&util::random_bytes::<8>())
+        ));
+        ensure_data_dir(&dir).unwrap();
+        let path = dir.join(CUSTODY_KEY_FILE);
+        let names = || -> Vec<String> {
+            fs::read_dir(&dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        };
+
+        let existing = CustodyKey::generate(&mut custody::os_rng());
+        fs::write(&path, &existing.to_bytes()[..]).unwrap();
+        let created = create_custody_key(&dir);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            &existing.to_bytes()[..],
+            "custody.key is left byte for byte"
+        );
+        assert_eq!(
+            created.unwrap().public_key(),
+            existing.public_key(),
+            "the key in the file is the one returned"
+        );
+        assert_eq!(names(), [CUSTODY_KEY_FILE]);
+
+        fs::write(&path, [7u8; 33]).unwrap();
+        let error = create_custody_key(&dir).unwrap_err().to_string();
+        assert_eq!(fs::read(&path).unwrap(), [7u8; 33]);
+        assert!(error.contains(CUSTODY_KEY_FILE), "{error}");
+        assert_eq!(names(), [CUSTODY_KEY_FILE]);
+
+        fs::remove_file(&path).unwrap();
+        let new = create_custody_key(&dir).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), &new.to_bytes()[..]);
+        assert_ne!(new.public_key(), existing.public_key());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "custody.key is root-only");
+        }
+        assert_eq!(names(), [CUSTODY_KEY_FILE]);
         let _ = fs::remove_dir_all(&dir);
     }
 

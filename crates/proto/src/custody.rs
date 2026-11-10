@@ -440,6 +440,60 @@ mod tests {
         assert_eq!(sealed, expected);
     }
 
+    /// Section 7.2: the public [`seal`] and [`open`] pass the context's
+    /// `info` as HPKE `info` and an empty AAD. A seal made by [`seal`] with
+    /// the RFC 9180 A.2.1 ephemeral key (from `ikmE`) to `pkRm` starts with
+    /// the vector's `enc` and opens through [`open_with_aad`] under
+    /// `ctx.info()` and an empty AAD, and under nothing else; a seal made by
+    /// [`seal_with_aad`] that way opens through [`open`]. Swapping `info`
+    /// and the AAD, or passing any AAD, in either public function fails it.
+    #[test]
+    fn the_public_seal_and_open_use_the_context_as_info_and_an_empty_aad() {
+        let key = CustodyKey::from_bytes(&hex(RFC_SK_RM)).unwrap();
+        let ctx = context();
+        let info = ctx.info().unwrap();
+        let plaintext = hex(RFC_PT);
+        let rfc_aad = hex(RFC_AAD);
+
+        let mut rng = OnceRng(Some(hex(RFC_IKM_E)));
+        let sealed = seal(key.public_key(), &ctx, &plaintext, &mut rng).unwrap();
+        assert_eq!(sealed[..ENC_LEN].to_vec(), hex(RFC_ENC));
+        assert_eq!(sealed.len(), ENC_LEN + plaintext.len() + TAG_LEN);
+        assert_eq!(
+            open_with_aad(&key, &info, &[], &sealed).unwrap().to_vec(),
+            plaintext,
+            "a public seal opens under info and an empty AAD"
+        );
+        for (what, other_info, aad) in [
+            ("info and the AAD swapped", &[][..], &info[..]),
+            ("the context as AAD too", &info[..], &info[..]),
+            ("the vector's AAD", &info[..], &rfc_aad[..]),
+            ("no info", &[][..], &[][..]),
+        ] {
+            assert_eq!(
+                open_with_aad(&key, other_info, aad, &sealed),
+                Err(CustodyError::Open),
+                "a public seal must not open with {what}"
+            );
+        }
+
+        let mut rng = OnceRng(Some(hex(RFC_IKM_E)));
+        let made = seal_with_aad(key.public_key(), &info, &[], &plaintext, &mut rng).unwrap();
+        assert_eq!(made, sealed, "the public seal is seal_with_aad(info, [])");
+        assert_eq!(
+            open(&key, &ctx, &made).unwrap().to_vec(),
+            plaintext,
+            "the public open takes info and an empty AAD"
+        );
+        let mut rng = OnceRng(Some(hex(RFC_IKM_E)));
+        let swapped = seal_with_aad(key.public_key(), &[], &info, &plaintext, &mut rng).unwrap();
+        assert_eq!(
+            open(&key, &ctx, &swapped),
+            Err(CustodyError::Open),
+            "the public open must not take info as the AAD"
+        );
+    }
+
     /// Section 7.2: `info` is the label, `cluster_id`, `node_id`, `key_kind`
     /// and `key_id`, each followed by one zero byte.
     #[test]

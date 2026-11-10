@@ -170,9 +170,16 @@ async fn an_agent_start_keeps_a_custody_key_only_with_the_node_role() {
         })
         .await
         .expect("the agent started");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(path.exists(), keeps, "{roles:?}");
         if keeps {
+            // The key is linked into place whole, so it is complete once
+            // it exists.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !path.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the agent wrote custody.key");
             assert_eq!(std::fs::read(&path).unwrap().len(), 32);
             #[cfg(unix)]
             {
@@ -188,5 +195,8 @@ async fn an_agent_start_keeps_a_custody_key_only_with_the_node_role() {
             .expect("the agent stops on shutdown")
             .expect("the agent task did not panic");
         assert!(result.is_ok(), "{result:?}");
+        // `run` passes the custody key step before it can return, so a
+        // machine without the `node` role that has stopped wrote none.
+        assert_eq!(path.exists(), keeps, "{roles:?}");
     }
 }

@@ -3231,10 +3231,11 @@ async fn only_a_machine_with_the_node_role_keeps_and_reports_a_custody_key() {
 
 /// Section 7.2, ADR 0231: the primary binds the first custody key it sees,
 /// so a `custody.key` that cannot be read or is not 32 bytes is never
-/// replaced or overwritten. No `hello` goes out while it stays so, as with
-/// a mark that holds no `seq`, and the next session refuses again.
+/// replaced or overwritten: it is kept byte for byte. The custody key guards
+/// no lease, so the node still connects: `hello` goes out without
+/// `custody_public_key` and the session runs, on this session and the next.
 #[tokio::test]
-async fn a_malformed_custody_key_is_kept_and_no_hello_goes_out() {
+async fn a_malformed_custody_key_is_kept_and_hello_goes_out_without_it() {
     for contents in [
         Some(vec![0x42; 31]),
         Some(vec![0x42; 33]),
@@ -3251,13 +3252,19 @@ async fn a_malformed_custody_key_is_kept_and_no_hello_goes_out() {
         }
         let mut session = Session::new(setup).with_roles(&node_roles());
         for _ in 0..2 {
-            let (again, frames) = no_hello(session).await;
-            session = again;
-            assert!(frames.is_empty(), "no hello ({contents:?}): {frames:?}");
+            let (mut ws, hello, serving) = open_session(session).await;
+            assert_eq!(hello["body"]["node_id"], "nod_test", "{hello}");
+            assert!(
+                hello["body"].get("custody_public_key").is_none(),
+                "no custody key ({contents:?}): {hello}"
+            );
             match &contents {
                 Some(bytes) => assert_eq!(&std::fs::read(&path).unwrap(), bytes),
                 None => assert!(path.is_dir()),
             }
+            // The session goes on past `hello`.
+            welcome(&mut ws, &hello).await;
+            session = end_session(ws, serving).await;
         }
         drop(session);
         let names: Vec<String> = std::fs::read_dir(dir.path())
