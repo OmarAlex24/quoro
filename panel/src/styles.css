@@ -4837,7 +4837,6 @@
 
   /* What the node runs: a strip of cells, each as wide as its VM's vCPUs. */
   .ncard-r {
-    container: vstrip / inline-size;
     display: grid;
     gap: 7px;
     padding: 11px 16px 13px;
@@ -4873,8 +4872,9 @@
     align-items: center;
     justify-content: center;
     gap: 4px;
-    flex: var(--u, 1) 0 0;
-    min-width: 22px;
+    /* At least as wide as its name, so every name reads; the strip wraps, and the room left over is shared by vCPU. */
+    flex: var(--u, 1) 0 auto;
+    min-width: fit-content;
     max-width: calc(var(--u, 1) * 74px);
     height: 26px;
     padding: 0 4px;
@@ -4903,17 +4903,6 @@
     text-overflow: ellipsis;
   }
 
-  /*
-   * A strip too narrow to give every VM its share and its name (a phone, a card
-   * in a narrow column): each cell is at least as wide as its name and the strip
-   * wraps; the room left over is still shared by vCPU.
-   */
-  @container vstrip (max-width: 519.98px) {
-    .vcell {
-      flex: var(--u, 1) 0 auto;
-      max-width: 100%;
-    }
-  }
 
   .vcell[data-k='image'] {
     --kind: var(--k-image);
