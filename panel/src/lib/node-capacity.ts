@@ -4,11 +4,9 @@ import type {
   ClusterCapacity,
   ClusterCapacityApp,
   Node,
-  NodeMetricSample,
   Vm,
 } from '../api/generated/model';
 import type { MeterTone } from './dither-draw';
-import { formatPercent } from './metrics';
 
 /*
  * The node cards and the N+1 strip, as pure data from the contract: a node's
@@ -111,17 +109,6 @@ export const nodeMeters = (node: Pick<Node, 'capacity' | 'allocated'>): NodeMete
       alone: `${allocated.disk_gb} GiB reserved`,
     }),
   ];
-};
-
-/**
- * The node's own reading of its host, from its newest metrics sample:
- * `27.4% busy · 9.8 of 24 GiB in use`. Null before the first sample.
- */
-export const liveWords = (sample: NodeMetricSample | undefined): string | null => {
-  if (!sample) return null;
-  const used = sample.memory_used_bytes / 1024 ** 2;
-  const total = sample.memory_total_bytes / 1024 ** 2;
-  return `${formatPercent(sample.cpu_usage)} busy · ${gibWords(used)} of ${gibWords(total)} GiB in use`;
 };
 
 /* ---------- what a node runs ---------- */

@@ -258,11 +258,24 @@ export const simulationSentence = ({
     else if (entry.action === 'failover') clauses.push([name, `’s warm copy starts ${where}`]);
     else clauses.push([name, ` is restored ${where} from its latest backup`]);
   }
-  for (const entry of answer.apps.filter((app) => app.node_id === null)) {
-    const name = { strong: appName(entry.app_id) };
-    if (entry.reason === 'no_backup') clauses.push([name, ' has no backup to restore']);
-    else if (entry.reason === 'no_warm_copy') clauses.push([name, ' has no complete warm copy']);
-    else clauses.push([name, ' finds no node with room']);
+  // The apps that get no node, grouped by why: `postgres and worker find no node with room`.
+  const stranded = answer.apps.filter((app) => app.node_id === null);
+  const reasons = [
+    { reason: 'no_capacity', one: ' finds no node with room', many: ' find no node with room' },
+    { reason: 'no_backup', one: ' has no backup to restore', many: ' have no backup to restore' },
+    { reason: 'no_warm_copy', one: ' has no complete warm copy', many: ' have no complete warm copy' },
+  ] as const;
+  for (const { reason, one, many } of reasons) {
+    const names = stranded
+      .filter((app) => (app.reason ?? 'no_capacity') === reason)
+      .map((app) => appName(app.app_id));
+    if (names.length === 0) continue;
+    const named: Segment[] = [];
+    names.forEach((item, index) => {
+      if (index > 0) named.push(index === names.length - 1 ? ' and ' : ', ');
+      named.push({ strong: item });
+    });
+    clauses.push([...named, names.length === 1 ? one : many]);
   }
 
   const segments: Segment[] = ['Without ', { strong: lost.name }, ': '];

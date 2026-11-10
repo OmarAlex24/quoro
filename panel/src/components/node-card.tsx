@@ -7,13 +7,12 @@ import { formatPercent } from '../lib/metrics';
 import { capacityShare, loadWords, meterTone, nodeMeters, nodeTags, type NodeLoad } from '../lib/node-capacity';
 import { nodeReadout } from '../lib/nodes';
 import { changeLogWords, groupedCount, seenWords, type VmCell } from '../lib/nodes-page';
-import { useNow } from '../lib/use-now';
 import { cn } from '../lib/utils';
 import { DitherArea } from './dither-area';
 import { DitherMeter } from './dither-meter';
 import { LampDot } from './lamp';
 import { useLiveNodes } from './live-nodes';
-import { SkelBar, Skeleton } from './skeleton';
+import { SkelBar } from './skeleton';
 import { ToneLamp } from './tone-lamp';
 import { Tag } from './ui/tag';
 
@@ -33,6 +32,7 @@ const CPU_AXIS = { max: 100, ticks: [] };
 export function NodeCard({
   node,
   load,
+  readAt,
   cells,
   lost = false,
   ghosts = [],
@@ -40,6 +40,8 @@ export function NodeCard({
 }: {
   node: Node;
   load: NodeLoad;
+  /** When the node list was read: `last_seen_at` is said against it. */
+  readAt: number;
   cells: readonly VmCell[];
   /** The simulation's lost node. */
   lost?: boolean;
@@ -54,8 +56,7 @@ export function NodeCard({
   const readout = nodeReadout(node.status);
   const connected = node.status === 'connected';
   const runsVms = node.roles.includes('node');
-  const now = useNow(connected);
-  const seen = seenWords(node.last_seen_at, now);
+  const seen = seenWords(node.last_seen_at, readAt);
   const state = lost ? 'Simulated: lost' : seen ? `${readout.words} · ${seen}` : readout.words;
   const log = changeLogWords(node.log_lag);
   const address = node.address ?? (node.behind_nat ? 'Behind NAT' : null);
@@ -273,7 +274,7 @@ function Cell({ cell }: { cell: VmCell }) {
   );
 }
 
-/** A card while the nodes load: the header, the meters and charts, the strip and the foot, as bars. */
+/** A card's shape while the nodes load: the header, the meters and charts, the strip and the foot, as bars. Inside a `Skeleton`. */
 export function NodeCardSkeleton() {
   return (
     <div className="card ncard">
@@ -307,17 +308,6 @@ export function NodeCardSkeleton() {
         <SkelBar width="60%" />
       </div>
     </div>
-  );
-}
-
-/** The cards while the nodes load, in the page's grid. */
-export function NodeCardsSkeleton({ count = 2 }: { count?: number }) {
-  return (
-    <Skeleton label="Loading nodes" className="ncards">
-      {Array.from({ length: count }, (_, index) => (
-        <NodeCardSkeleton key={index} />
-      ))}
-    </Skeleton>
   );
 }
 

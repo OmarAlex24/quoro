@@ -6,7 +6,6 @@ import { useGetClusterCapacity } from '../api/generated/cluster/cluster';
 import type { App, Node } from '../api/generated/model';
 import { biggestNode, lossCandidates, n1Readout } from '../lib/node-capacity';
 import { cn } from '../lib/utils';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 
 /**
  * The question the N+1 strip asks the primary (`getClusterCapacity`, ADR
@@ -34,25 +33,21 @@ export function useLossSimulation(nodes: readonly Node[]) {
 }
 
 /**
- * The N+1 strip: one sentence on whether the cluster can lose its biggest
- * node, from the primary's own simulation of that loss (`getClusterCapacity`,
- * ADR 0178). "Simulate losing" asks the same question about another node; it
- * is a read, and nothing is reserved. With no answer, the strip is not shown.
- * Without the picker (`picker={false}`, the Projects rail) it is the sentence
- * about the biggest node alone.
+ * The N+1 strip in the Projects rail: one sentence on whether the cluster can
+ * lose its biggest node, from the primary's own simulation of that loss
+ * (`getClusterCapacity`, ADR 0178). With no answer, the strip is not shown.
+ * The Nodes band asks the same question about any node and draws the answer.
  */
 export function N1Strip({
   nodes,
   apps,
-  picker = true,
   className,
 }: {
   nodes: readonly Node[];
   apps: readonly App[];
-  picker?: boolean;
   className?: string;
 }) {
-  const { candidates, chosen, setPicked, answer, lost, loading } = useLossSimulation(nodes);
+  const { answer, lost, loading } = useLossSimulation(nodes);
   if (!lost) return null;
   const readout = n1Readout({ lost, nodes, answer, apps });
   if (!readout) return null;
@@ -72,20 +67,6 @@ export function N1Strip({
           typeof segment === 'string' ? segment : <b key={index}>{segment.strong}</b>,
         )}
       </p>
-      {picker && candidates.length > 1 && chosen ? (
-        <Select value={chosen.id} onValueChange={setPicked}>
-          <SelectTrigger className="n1-pick" aria-label="Node to simulate losing">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent align="end">
-            {candidates.map((node) => (
-              <SelectItem key={node.id} value={node.id}>
-                Simulate losing {node.name}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      ) : null}
     </section>
   );
 }

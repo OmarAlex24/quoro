@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Node } from '../api/generated/model';
-import { clusterSummary, connectedLine, logLagLine, nodeReadout, primaryLine } from './nodes';
+import { clusterSummary, connectedLine, nodeReadout, primaryLine } from './nodes';
 
 const node = (name: string, fields: Partial<Node>): Node =>
   ({ id: `nod_${name}`, name, status: 'connected', cp_status: null, ...fields }) as Node;
@@ -46,19 +46,3 @@ describe('nodeReadout', () => {
   });
 });
 
-describe('logLagLine', () => {
-  it('says the node is in sync at no lag', () => {
-    expect(logLagLine(0)).toBe('Change log: in sync');
-  });
-
-  it('counts the entries the node is behind', () => {
-    expect(logLagLine(1)).toBe('Change log: 1 entry behind');
-    expect(logLagLine(2)).toBe('Change log: 2 entries behind');
-    expect(logLagLine(742)).toBe('Change log: 742 entries behind');
-  });
-
-  it('says nothing without a lag', () => {
-    expect(logLagLine(null)).toBeNull();
-    expect(logLagLine(undefined)).toBeNull();
-  });
-});

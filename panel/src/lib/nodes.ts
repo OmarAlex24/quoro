@@ -23,18 +23,6 @@ export const nodeReadout = (status: NodeStatus): NodeReadout => {
   }
 };
 
-/**
- * What a node card says about the change log (ADR 0227): `Change log: in
- * sync` when the node holds the primary's newest entry, else how many entries
- * it is behind.
- * Null when there is no lag to tell, as for a machine without the `node` role.
- */
-export const logLagLine = (lag: Node['log_lag']): string | null => {
-  if (lag === null || lag === undefined) return null;
-  if (lag === 0) return 'Change log: in sync';
-  return `Change log: ${lag} ${lag === 1 ? 'entry' : 'entries'} behind`;
-};
-
 export interface ClusterSummary {
   /** The node holding the primary status, or the first one when none says so. */
   primary?: Node;

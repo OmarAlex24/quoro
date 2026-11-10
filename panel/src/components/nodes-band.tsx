@@ -45,7 +45,8 @@ export function NodesBand({
     simulated && simulatedLost
       ? simulationSentence({ lost: simulatedLost, answer: simulated, nodes, apps })
       : (readout?.segments ?? null);
-  const tone = simulated ? 'shift' : (readout?.tone ?? 'run');
+  // A loss that leaves an app without room stays red while it is drawn; one that fits is amber, a what-if.
+  const tone = simulated ? (simulated.fits ? 'shift' : 'fault') : (readout?.tone ?? 'run');
   const Icon = tone === 'run' ? ShieldCheck : ShieldAlert;
   // The button acts on the answer for the node it names, never on one still loading.
   const ready = chosen !== undefined && answer?.lost_node_id === chosen.id && !loading;
@@ -63,9 +64,8 @@ export function NodesBand({
               typeof segment === 'string' ? segment : <b key={index}>{segment.strong}</b>,
             )
           ) : candidates.length > 1 ? (
-            <Skeleton label="Asking the primary what a lost node would mean">
-              <SkelBar width="min(420px, 100%)" />
-            </Skeleton>
+            // The band is busy while the answer comes; the facts beside it say loading for both.
+            <SkelBar width="min(420px, 100%)" />
           ) : (
             'Enroll a second node with the node role, and the cluster can lose one.'
           )}
@@ -93,45 +93,43 @@ export function NodesBand({
           </div>
         ) : null}
       </div>
-      {cluster.error ? null : (
+      {cluster.error ? null : !facts ? (
+        <Skeleton label="Loading the cluster" className="nband-cl">
+          {['Primary', 'Term', 'Voters', 'Version'].map((label) => (
+            <div key={label}>
+              <span className="nband-skel-k">{label}</span>
+              <SkelBar width="40px" />
+            </div>
+          ))}
+        </Skeleton>
+      ) : (
         <dl className="nband-cl">
-          {facts
-            ? facts.map((fact) => (
-                <div key={fact.label}>
-                  <dt>{fact.label}</dt>
-                  <dd>
-                    {fact.spoken ? (
-                      <>
-                        <span aria-hidden="true">{fact.value}</span>
-                        <span className="sr-only">{fact.spoken}</span>
-                      </>
-                    ) : (
-                      fact.value
-                    )}
-                  </dd>
-                </div>
-              ))
-            : ['Primary', 'Term', 'Voters', 'Version'].map((label) => (
-                <div key={label}>
-                  <dt>{label}</dt>
-                  <dd>
-                    <Skeleton label={`Loading the ${label.toLowerCase()}`}>
-                      <SkelBar width="40px" />
-                    </Skeleton>
-                  </dd>
-                </div>
-              ))}
+          {facts.map((fact) => (
+            <div key={fact.label}>
+              <dt>{fact.label}</dt>
+              <dd>
+                {fact.spoken ? (
+                  <>
+                    <span aria-hidden="true">{fact.value}</span>
+                    <span className="sr-only">{fact.spoken}</span>
+                  </>
+                ) : (
+                  fact.value
+                )}
+              </dd>
+            </div>
+          ))}
         </dl>
       )}
     </section>
   );
 }
 
-/** The band while the nodes load: the shield, a sentence bar and the four facts. */
+/** The band's shape while the nodes load: the shield, a sentence bar and the four facts. Inside a `Skeleton`. */
 export function NodesBandSkeleton() {
   return (
-    <section className="card nband" aria-label="Cluster">
-      <Skeleton label="Loading the cluster" className="contents">
+    <div className="card nband">
+      <div className="contents">
         <div className="nband-ha">
           <SkelBar className="nband-skel-sh" />
           <span className="nband-t">
@@ -146,7 +144,7 @@ export function NodesBandSkeleton() {
             </div>
           ))}
         </div>
-      </Skeleton>
-    </section>
+      </div>
+    </div>
   );
 }

@@ -6,7 +6,6 @@ import {
   biggestNode,
   capacityShare,
   gibWords,
-  liveWords,
   loadWords,
   lossCandidates,
   meterTone,
@@ -156,18 +155,6 @@ describe('node meters', () => {
     expect(gibWords(65_536)).toBe('64');
   });
 
-  it('reads the live line from the newest sample', () => {
-    expect(liveWords(undefined)).toBeNull();
-    expect(
-      liveWords({
-        time: '2026-11-07T00:00:00Z',
-        cpu_usage: 0.274,
-        cpu_count: 4,
-        memory_total_bytes: 24 * 1024 ** 3,
-        memory_used_bytes: 9.8 * 1024 ** 3,
-      }),
-    ).toBe('27.4% busy · 9.8 of 24 GiB in use');
-  });
 
   it('counts the VMs on a node and the apps they belong to', () => {
     const vms = [

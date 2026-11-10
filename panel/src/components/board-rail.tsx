@@ -280,7 +280,7 @@ export function RailNodes({
           </Link>
         );
       })}
-      <N1Strip nodes={nodes} apps={apps} picker={false} className="pfit" />
+      <N1Strip nodes={nodes} apps={apps} className="pfit" />
     </section>
   );
 }

@@ -201,6 +201,16 @@ describe('the simulated loss of a node', () => {
     expect(n1Text({ segments: simulationSentence({ lost: lab4, answer: short, nodes, apps }) })).toBe(
       'Without lab-4: postgres finds no node with room and docs-site has no backup to restore. web and blog keep running on their other replicas.',
     );
+    const crowded: ClusterCapacity = {
+      ...short,
+      apps: [
+        { app_id: 'app_pg', policy: 'none', action: 'restore', node_id: null, reason: 'no_capacity' },
+        { app_id: 'app_web', policy: 'none', action: 'start', node_id: null, reason: 'no_capacity' },
+      ],
+    };
+    expect(n1Text({ segments: simulationSentence({ lost: lab4, answer: crowded, nodes, apps }) })).toBe(
+      'Without lab-4: postgres and web find no node with room.',
+    );
     expect(n1Text({ segments: simulationSentence({ lost: lab4, answer: { ...answer, apps: [] }, nodes, apps }) })).toBe(
       'Without lab-4: no app has to move.',
     );
