@@ -6784,7 +6784,7 @@ paths:
         is already at the highest token, 2^53 - 1, nothing is written and the
         call answers `conflict` with `reason: token_exhausted`
         (node-agent-protocol.md section 8.6, ADR 0321). The call is audited
-        (D-0031).
+        (ADR 0031).
       x-quoro-scope: node:fence_ack
       parameters:
         - $ref: '#/components/parameters/NodeId'
