@@ -430,6 +430,18 @@ impl Authority {
             .is_none_or(|gate| gate.gate() <= now)
     }
 
+    /// How long until `lease_id`'s gate passes, `None` once it has passed or
+    /// for a lease with none. Records nothing: the write of a grant that
+    /// waits checks the previous holder's gate with it, and the grant is
+    /// recorded only when it is sent, so the new holder's gate is measured
+    /// from the send (section 8.4, "Grants of a marked row"; issue #703).
+    #[must_use]
+    pub fn gate_remaining(&self, lease_id: &str) -> Option<Duration> {
+        let now = self.now();
+        let open = self.gates().get(lease_id).map(Gate::gate)?;
+        (now < open).then(|| open - now)
+    }
+
     /// Whether the stored `duration_ms` of `lease_id` may be lowered to
     /// `to_ms`: the gate of every grant longer than that has passed (ADR
     /// 0203). A lease with no gate had no `expiring` grant in this process

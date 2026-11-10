@@ -12,6 +12,7 @@ use base64::Engine as _;
 use common::{Server, start_with_patient_node_session};
 use futures_util::{SinkExt, StreamExt};
 use quoro_control_plane::authority::VoterSupport;
+use quoro_control_plane::session::Fault;
 use quoro_proto::wire::{
     self, Capacity as WireCapacity, Kvm as WireKvm, NodeMessage, StatusReport, WarmRole, WarmStatus,
 };
@@ -498,6 +499,80 @@ impl Setup {
         assert_eq!(events, 0, "{case}: app.failed_over");
     }
 
+    /// A failover with the source connected: the source answers its revoke
+    /// `ok`, and the call's answer.
+    async fn connected_failover(&mut self) -> reqwest::Response {
+        let call = self.call(&self.warm.node_id);
+        let revoke = recv_type(self.on_source(), "lease_revoke").await;
+        let revoke_id = revoke["id"].as_str().unwrap().to_string();
+        send(self.on_source(), ok_result(), Some(&revoke_id)).await;
+        call.await.unwrap()
+    }
+
+    /// The app's `lease` as `getApp` shows it.
+    async fn lease_view(&self) -> Value {
+        let app: Value = self
+            .owner
+            .get(self.server.url(&format!("/api/v1/apps/{}", self.app_id)))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        app["lease"].clone()
+    }
+
+    /// `lease`, a 202's `App.lease`, and `getApp`'s, show the grant to the
+    /// warm node waiting at token 5 with the mark set, on both nodes, which
+    /// follow no log (ADR 0292).
+    async fn waiting(&self, lease: &Value) {
+        let mut both = vec![self.source.node_id.clone(), self.warm.node_id.clone()];
+        both.sort();
+        for lease in [lease.clone(), self.lease_view().await] {
+            assert_eq!(
+                lease["holder_node_id"],
+                self.warm.node_id.as_str(),
+                "{lease}"
+            );
+            assert_eq!(lease["fencing_token"], 5, "{lease}");
+            assert_eq!(lease["unsettled"], true, "{lease}");
+            assert_eq!(lease["grant_pending"], true, "{lease}");
+            let mut waiting_on: Vec<String> = lease["grant_waiting_on"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{lease}"))
+                .iter()
+                .map(|id| id.as_str().unwrap().to_string())
+                .collect();
+            waiting_on.sort();
+            assert_eq!(waiting_on, both, "{lease}");
+        }
+    }
+
+    /// A new session of `node` that follows the change log from its start,
+    /// with the mesh key of `mesh_seed`, listing no lease.
+    async fn follower(&self, node: &Enrolled, mesh_seed: u8) -> common::machine::Machine {
+        let mut hello = common::machine::hello_body(&node.node_id);
+        hello.mesh_public_key =
+            Some(base64::engine::general_purpose::STANDARD.encode([mesh_seed; 32]));
+        let node = common::machine::Node {
+            node_id: node.node_id.clone(),
+            credential: node.credential.clone(),
+        };
+        common::machine::Machine::connect_with(&self.server, &node, hello, true, true).await
+    }
+
+    /// The lease names the warm node at token 5, `expiring` for `D`, with
+    /// the unsettled mark set: its grant waits (ADR 0292, ADR 0303 Q2).
+    async fn moved_marked(&self) {
+        self.moved().await;
+        let unsettled: i64 = sqlx::query_scalar("SELECT unsettled FROM leases")
+            .fetch_one(self.server.state.store.pool())
+            .await
+            .unwrap();
+        assert_eq!(unsettled, 1);
+    }
+
     /// The lease names the warm node at token 5, `expiring` for `D`.
     async fn moved(&self) {
         let (holder, token, mode, duration, revoked_at): (
@@ -667,8 +742,11 @@ async fn a_disconnected_source_holds_the_lease_until_its_gate_passed() {
 
 /// Section 8.4: a source that is not connected holds a `local` lease until
 /// it answers a revoke or is declared lost, so the lease does not move.
-/// Once it is declared lost it no longer holds it, and the interim refuses
-/// the grant, which raises the stored duration of a `local` row.
+/// Once it is declared lost it no longer holds it: the grant raises the
+/// stored duration of a `local` row, so the change writes the row marked,
+/// answers `202`, and holds the grant (ADR 0292, ADR 0303 Q2). The source,
+/// declared lost but not removed, stays in the required set, so the grant
+/// waits on it.
 #[tokio::test]
 async fn a_disconnected_sources_local_lease_is_held_until_it_is_declared_lost() {
     let mut s = Setup::new().await;
@@ -688,39 +766,167 @@ async fn a_disconnected_sources_local_lease_is_held_until_it_is_declared_lost() 
         .execute(s.server.state.store.pool())
         .await
         .unwrap();
-    let body = refused(s.failover().await, 409, "conflict", Some("no_support")).await;
-    let detail = body["detail"].as_str().unwrap();
-    assert!(detail.contains("raises the stored duration"), "{detail}");
-    s.unmoved(false, "local row, source lost").await;
+    let res = s.failover().await;
+    assert_eq!(res.status(), 202, "{}", res.text().await.unwrap());
+    let app: Value = res.json().await.unwrap();
+    s.waiting(&app["lease"]).await;
+    s.moved_marked().await;
     none_of(s.on_warm(), "lease_grant", "local row").await;
 }
 
-/// The interim for held grants: with support, a grant that would wait for
-/// its write to be replicated is refused with `no_support` before any
-/// revoke: a row that reads `local` (the raise of the stored duration), and
-/// a marked row (the unsettled mark).
+/// ADR 0292, ADR 0303. With support, a failover whose grant must wait for
+/// its write to be replicated over the machines with the `node` role goes
+/// on: the connected source gets its revoke, and once it answered, the
+/// change writes the row naming the warm node at token 5 with the mark set,
+/// moves the volume and turns the standby VM `running` in the warm node's
+/// desired state, and the call answers `202` with `grant_pending` true and
+/// `grant_waiting_on` naming both nodes, which follow no log. No grant goes
+/// out, and `app.failed_over` carries `grant_pending: true`. Each case is a
+/// grant that must wait: a row that reads `local` (a raise of the stored
+/// duration) and a marked row that reads `expiring` for `D`.
 #[tokio::test]
-async fn a_grant_that_would_be_held_is_refused_before_the_revoke() {
+async fn a_failover_whose_grant_waits_answers_202_and_holds_the_grant() {
+    for marked in [false, true] {
+        let case = if marked { "marked row" } else { "local row" };
+        let mut s = Setup::new().await;
+        s.report_copy().await;
+        set_support(&s.server, true);
+        if marked {
+            s.expiring().await;
+            s.sql("UPDATE leases SET unsettled = 1 WHERE id = ?").await;
+        }
+        let res = s.connected_failover().await;
+        assert_eq!(res.status(), 202, "{case}: {}", res.text().await.unwrap());
+        let app: Value = res.json().await.unwrap();
+        assert_eq!(
+            app["placement"]["node_ids"],
+            json!([s.warm.node_id]),
+            "{case}"
+        );
+        s.waiting(&app["lease"]).await;
+        s.moved_marked().await;
+        let warm_id = s.warm.node_id.clone();
+        assert_eq!(
+            vm_and_app(&s).await,
+            (warm_id, "running".to_string(), "deploying".to_string()),
+            "{case}"
+        );
+        let (data,): (String,) =
+            sqlx::query_as("SELECT data FROM events WHERE type = 'app.failed_over'")
+                .fetch_one(s.server.state.store.pool())
+                .await
+                .unwrap();
+        let data: Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(data["grant_pending"], true, "{case}: {data}");
+        assert_eq!(data["fencing_token"], 5, "{case}: {data}");
+
+        // The standby VM is `running` in the warm node's desired state under
+        // the new token, and no grant reached the warm node.
+        let mut frames = Vec::new();
+        loop {
+            let frame = recv_frame(s.on_warm()).await;
+            let runs = frame["type"] == "desired_state"
+                && frame["body"]["spec"]["vms"].as_array().is_some_and(|vms| {
+                    vms.iter().any(|vm| {
+                        vm["vm_id"] == VM_ID
+                            && vm["desired_status"] == "running"
+                            && vm["fencing_token"] == 5
+                    })
+                });
+            frames.push(frame);
+            if runs {
+                break;
+            }
+        }
+        assert!(
+            !frames.iter().any(|frame| frame["type"] == "lease_grant"),
+            "{case}: {frames:?}"
+        );
+        none_of(s.on_warm(), "lease_grant", case).await;
+    }
+}
+
+/// ADR 0292: while the grant to the warm node waits, a second failover of
+/// the app answers `in_progress`, checked before `node_id`: the first call
+/// made the old source the app's warm node, so the same `node_id` would
+/// otherwise be `validation_failed`. Nothing moves again. Then both nodes
+/// follow the change log and the primary holds support, and the held grant
+/// goes out to the warm node, once, at token 5 for `D`; `grant_pending`
+/// turns false and the row stays marked. A failover then no longer answers
+/// `in_progress`.
+#[tokio::test]
+async fn a_held_failover_grant_answers_in_progress_then_goes_out_once_replicated() {
     let mut s = Setup::new().await;
     s.report_copy().await;
     set_support(&s.server, true);
+    let res = s.connected_failover().await;
+    assert_eq!(res.status(), 202, "{}", res.text().await.unwrap());
 
-    let body = refused(s.failover().await, 409, "conflict", Some("no_support")).await;
-    let detail = body["detail"].as_str().unwrap();
-    assert!(detail.contains("raises the stored duration"), "{detail}");
-    assert!(detail.contains("node role"), "{detail}");
-    s.unmoved(false, "local row").await;
-    none_of(s.on_source(), "lease_revoke", "local row").await;
+    for node_id in [s.warm.node_id.clone(), s.source.node_id.clone()] {
+        let body = refused(
+            s.call(&node_id).await.unwrap(),
+            409,
+            "conflict",
+            Some("in_progress"),
+        )
+        .await;
+        assert!(
+            body["detail"].as_str().unwrap().contains("grant_pending"),
+            "{body}"
+        );
+    }
+    s.moved_marked().await;
+    let revokes: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE operation = 'lease.revoke'")
+            .fetch_one(s.server.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(revokes, 1, "no second revoke");
 
-    s.expiring().await;
-    s.sql("UPDATE leases SET unsettled = 1 WHERE id = ?").await;
-    let body = refused(s.failover().await, 409, "conflict", Some("no_support")).await;
-    let detail = body["detail"].as_str().unwrap();
-    assert!(detail.contains("unsettled mark"), "{detail}");
-    assert!(detail.contains("replicated"), "{detail}");
-    s.unmoved(false, "marked row").await;
-    none_of(s.on_source(), "lease_revoke", "marked row").await;
-    none_of(s.on_warm(), "lease_grant", "marked row").await;
+    // Both nodes come back following the change log.
+    drop(s.on_source.take());
+    drop(s.on_warm.take());
+    disconnected(&s.server, &s.source.node_id).await;
+    disconnected(&s.server, &s.warm.node_id).await;
+    let mut on_source = s.follower(&s.source, 1).await;
+    let mut on_warm = s.follower(&s.warm, 2).await;
+    let head = common::log::log_head(&s.server).await;
+    let mut seen = on_warm.start.clone();
+    for _ in 0..50 {
+        if on_warm.log.0 >= head && on_source.log.0 >= head {
+            break;
+        }
+        seen.extend(on_warm.settle().await);
+        on_source.settle().await;
+    }
+    assert!(on_warm.log.0 >= head && on_source.log.0 >= head);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !seen.iter().any(|frame| frame["type"] == "lease_grant") {
+        assert!(tokio::time::Instant::now() < deadline, "{seen:?}");
+        seen.extend(on_warm.settle().await);
+    }
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    seen.extend(on_warm.settle().await);
+    let grants: Vec<&Value> = seen
+        .iter()
+        .filter(|frame| frame["type"] == "lease_grant")
+        .collect();
+    assert_eq!(grants.len(), 1, "{seen:?}");
+    assert_eq!(grants[0]["body"]["lease_id"], LEASE_ID);
+    assert_eq!(grants[0]["body"]["fencing_token"], 5);
+    assert_eq!(grants[0]["body"]["mode"], "expiring");
+    assert_eq!(grants[0]["body"]["duration_ms"], 15_000);
+
+    let lease = s.lease_view().await;
+    assert_eq!(lease["grant_pending"], false, "{lease}");
+    assert_eq!(lease["grant_waiting_on"], json!([]), "{lease}");
+    assert_eq!(lease["unsettled"], true, "{lease}");
+    let res = s.call(&s.source.node_id).await.unwrap();
+    assert_ne!(
+        res.json::<Value>().await.unwrap()["reason"],
+        "in_progress",
+        "the grant went out"
+    );
 }
 
 /// A source that is not connected, with an unmarked `expiring` row for `D`
@@ -998,6 +1204,57 @@ async fn a_revoke_answered_fence_failed_moves_nothing() {
     none_of(s.on_warm(), "lease_grant", "fence_failed").await;
 }
 
+/// `openapi.yaml` `failoverApp`: `fence_failed` when "the warm node has a
+/// failed fence that no operator acknowledged", recorded or not (section
+/// 8.5 step 1). The warm node answers the revoke of a lease no row knows
+/// `fence_failed`, and the primary cannot record it. The call refuses with
+/// `fence_failed` naming the warm node, before `no_support`, and nothing
+/// moves.
+#[tokio::test]
+async fn an_unrecorded_failed_fence_on_the_warm_node_refuses() {
+    let mut s = Setup::new().await;
+    s.expiring().await;
+    drop(s.on_warm.take());
+    disconnected(&s.server, &s.warm.node_id).await;
+
+    s.server.state.hub.inject_fault(Fault::FailureRecord {
+        node_id: s.warm.node_id.clone(),
+    });
+    let NodeMessage::Hello(mut body) = hello(&s.warm.node_id, 2) else {
+        unreachable!("hello builds a hello");
+    };
+    body.leases = vec![wire::HelloLease {
+        lease_id: "lse_0000000000000000000000000Z".to_string(),
+        resource_type: quoro_proto::ResourceType::App,
+        resource_id: "app_0000000000000000000000000Z".to_string(),
+        mode: quoro_proto::LeaseMode::Local,
+        fencing_token: 1,
+        state: "held".to_string(),
+    }];
+    let mut on_warm = connect(&s.server, &s.warm.credential).await;
+    send(&mut on_warm, NodeMessage::Hello(body), None).await;
+    let revoke = recv_type(&mut on_warm, "lease_revoke").await;
+    let revoke_id = revoke["id"].as_str().unwrap().to_string();
+    send(&mut on_warm, fence_failed_result(), Some(&revoke_id)).await;
+    frames_until_settled(&mut on_warm).await;
+    s.on_warm = Some(on_warm);
+    let failure: Option<String> =
+        sqlx::query_scalar("SELECT fence_failure FROM nodes WHERE id = ?")
+            .bind(&s.warm.node_id)
+            .fetch_one(s.server.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(failure, None, "the failed fence was not recorded");
+    s.report_copy().await;
+
+    let body = refused(s.failover().await, 409, "conflict", Some("fence_failed")).await;
+    let detail = body["detail"].as_str().unwrap();
+    assert!(detail.contains("warm node"), "{detail}");
+    s.unmoved(false, "unrecorded failed fence on the warm node")
+        .await;
+    none_of(s.on_source(), "lease_revoke", "fence_failed").await;
+}
+
 /// Section 8.5, issue #392: a revoke answered `fence_failed` that the
 /// primary could not record stays unanswered. Once the source's session
 /// ends, the lease still does not move, though its gate has passed: the
@@ -1212,6 +1469,40 @@ async fn support_lost_after_the_revoke_answers_no_support_and_a_retry_grants() {
             .await
             .unwrap();
     assert_eq!(revokes, 1);
+}
+
+/// ADR 0303 Q3, `openapi.yaml` `failoverApp`: support lapses after the
+/// change's support check and before its write, so the grant would wait
+/// for it. The call answers `no_support` and moves nothing: the lease stays
+/// revoked at the source's token, unmarked, no grant goes out and none is
+/// held.
+#[tokio::test]
+async fn support_lost_at_the_write_answers_no_support_and_moves_nothing() {
+    let mut s = Setup::new().await;
+    s.ready().await;
+    s.server
+        .state
+        .hub
+        .inject_fault(Fault::FailoverSupportLapse {
+            app_id: s.app_id.clone(),
+        });
+
+    let res = s.connected_failover().await;
+    let body = refused(res, 409, "conflict", Some("no_support")).await;
+    let detail = body["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("stays revoked and its app stopped"),
+        "{detail}"
+    );
+    s.unmoved(true, "support lost at the write").await;
+    let unsettled: i64 = sqlx::query_scalar("SELECT unsettled FROM leases")
+        .fetch_one(s.server.state.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(unsettled, 0);
+    let lease = s.lease_view().await;
+    assert_eq!(lease["grant_pending"], false, "{lease}");
+    none_of(s.on_warm(), "lease_grant", "support lost at the write").await;
 }
 
 /// A client that gives up while the source holds its revoke unanswered does

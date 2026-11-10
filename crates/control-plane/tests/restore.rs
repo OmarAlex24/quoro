@@ -2272,20 +2272,28 @@ async fn a_warm_apps_restore_target_gets_an_expiring_lease_while_voters_support_
     assert_eq!(answers[0]["body"]["fencing_token"], json!(token));
 }
 
-/// Sections 8.3 and 8.4: a `warm` app's restore target gets its new token
-/// only once the grant can go out. Without voter support it would be
-/// `local`, a write that sets the row's unsettled mark ("The mark",
-/// ADR 0285). With support, over the old `local` row that stores no
-/// duration, it would be `expiring` for `D`, a raise (ADR 0268). Either goes
-/// out only once its write is replicated, which this build cannot count.
-/// The restore is not refused: the volume stays `restoring` and the lease
-/// stays revoked on the old node, at its token, unmarked, with nothing
-/// written. Over a row that stores `D`, the target's next report gets the
-/// lease `expiring`.
+/// Sections 8.3 and 8.4: a `warm` app's restore target gets a new token
+/// that must wait. Over the old `local` row that stores no duration it is
+/// `expiring` for `D`, a raise (ADR 0268), written with the mark, and its
+/// grant goes out only once that write is replicated over the machines with
+/// the `node` role and a majority supports `D` (section 8.4, "Grants of a
+/// marked row"; issue #703). The restore completes with that write: the
+/// volume turns `ready` and the row names the target at the next token,
+/// marked, while the grant is held. Voters support the primary here, and
+/// neither node follows the log, so nothing goes out, and the target's next
+/// report mints no second token. Without support the write is the same
+/// (`grant_must_wait`, case 5; the `leases` unit tests). Before #703 the
+/// restore stayed `restoring` with nothing written.
 #[tokio::test]
-async fn a_warm_apps_restore_waits_until_its_grant_can_go_out() {
+async fn a_warm_apps_restore_completes_with_its_grant_held() {
     let mut setup = setup().await;
     set_warm(&setup).await;
+    setup
+        .state
+        .server
+        .state
+        .hub
+        .set_voter_support(Arc::new(EverySupport));
     let moving = start_moving(&mut setup, 19).await;
     reply(
         &mut setup.state.socket,
@@ -2294,46 +2302,49 @@ async fn a_warm_apps_restore_waits_until_its_grant_can_go_out() {
     )
     .await;
     round_trip(&mut setup.state.socket).await;
-    for supported in [false, true] {
-        if supported {
-            setup
-                .state
-                .server
-                .state
-                .hub
-                .set_voter_support(Arc::new(EverySupport));
-        }
-        ready_waits(&mut setup, &moving).await;
-        let (token, mode, unsettled): (i64, String, i64) =
-            sqlx::query_as("SELECT fencing_token, mode, unsettled FROM leases WHERE id = ?")
-                .bind(&moving.lease_id)
-                .fetch_one(setup.state.server.state.store.pool())
-                .await
-                .unwrap();
-        assert_eq!(
-            (token, mode.as_str(), unsettled),
-            (moving.old_token, "local", 0),
-            "supported: {supported}"
-        );
-    }
-
-    // A row that reads `local` with `D` stored, as the raise before a
-    // conversion grant leaves it (ADR 0254): a successor counts no gate for
-    // a row that reads `local`, so the grant still waits.
-    sqlx::query("UPDATE leases SET duration_ms = 15000 WHERE id = ?")
+    send(&mut setup.socket_b, restored(&moving)).await;
+    wait_for_volume(
+        &setup.state.owner,
+        &setup.state.server,
+        &mut setup.socket_b,
+        &moving.volume_id,
+        "ready",
+    )
+    .await;
+    let row = || {
+        sqlx::query_as::<_, (String, i64, String, Option<i64>, i64, Option<String>)>(
+            "SELECT holder_node_id, fencing_token, mode, duration_ms, unsettled, revoked_at \
+             FROM leases WHERE id = ?",
+        )
         .bind(&moving.lease_id)
-        .execute(setup.state.server.state.store.pool())
-        .await
-        .unwrap();
-    ready_waits(&mut setup, &moving).await;
+        .fetch_one(setup.state.server.state.store.pool())
+    };
+    let written = (
+        setup.node_b.node_id.clone(),
+        moving.old_token + 1,
+        "expiring".to_string(),
+        Some(15_000),
+        1,
+        None,
+    );
+    assert_eq!(row().await.unwrap(), written, "written with the mark");
 
-    sqlx::query("UPDATE leases SET mode = 'expiring', duration_ms = 15000 WHERE id = ?")
-        .bind(&moving.lease_id)
-        .execute(setup.state.server.state.store.pool())
-        .await
-        .unwrap();
-    let grant = ready_grants(&mut setup, &moving, moving.old_token).await;
-    assert_eq!(grant["body"]["mode"], "expiring");
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let frames = frames_until_settled(&mut setup.socket_b).await;
+    assert!(
+        !frames.iter().any(|frame| frame["type"] == "lease_grant"),
+        "{frames:?}"
+    );
+    let app = get_app(&setup.state.owner, &setup.state.server, &setup.state.app_id).await;
+    assert_eq!(app["lease"]["grant_pending"], true, "{app}");
+    let waiting = app["lease"]["grant_waiting_on"].as_array().unwrap();
+    assert!(waiting.contains(&json!(setup.node_b.node_id)), "{app}");
+    assert!(waiting.contains(&json!(setup.state.node.node_id)), "{app}");
+
+    // The next report mints no second token.
+    send(&mut setup.socket_b, restored(&moving)).await;
+    round_trip(&mut setup.socket_b).await;
+    assert_eq!(row().await.unwrap(), written);
 }
 
 // ---------------------------------------------------------------------------

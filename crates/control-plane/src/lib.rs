@@ -278,7 +278,12 @@ impl AppState {
         );
         hub.reset_stale_connections().await?;
         hub.seed_lease_gates().await?;
+        // Section 8.4, "Grants of a marked row": every step-4 row's grant is
+        // pending from the start until its holder's next session start (ADR
+        // 0295), and the held grants go out once replicated and supported.
+        hub.rebuild_held_grants().await?;
         hub.spawn_voter_watch();
+        hub.spawn_held_grants();
         let vulns = vulns::Vulns::open(&config.data_dir, store.clone()).await?;
         hub.set_vulns(&vulns);
         let tunnel = tunnel::TunnelManager::new(store.clone(), Arc::clone(&data_key), hub.clone());

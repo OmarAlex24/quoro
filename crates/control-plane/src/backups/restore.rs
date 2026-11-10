@@ -73,8 +73,13 @@ pub(crate) struct AcceptedRestore {
 pub(crate) struct AppliedRestores {
     /// Whether a node's desired state changed.
     pub desired_changed: bool,
-    /// New `local` leases, one per restore that became `ready`.
+    /// New leases to send, one per restore that became `ready` with a
+    /// grant that needs no wait.
     pub grants: Vec<Lease>,
+    /// New leases whose grant waits ([`leases::NewGrant::Waiting`]), one per
+    /// restore that became `ready` with one: the caller holds them on the
+    /// hub (section 8.4, "Grants of a marked row").
+    pub held: Vec<Lease>,
     /// Other nodes whose desired state changed: the nodes the app's instances
     /// moved away from (a `ready` restore), so they delete them, and the
     /// nodes the instances stayed on (a `failed` restore), so they get them
@@ -86,6 +91,7 @@ impl AppliedRestores {
     fn merge(&mut self, other: Self) {
         self.desired_changed |= other.desired_changed;
         self.grants.extend(other.grants);
+        self.held.extend(other.held);
         self.other_node_ids.extend(other.other_node_ids);
     }
 }
@@ -394,14 +400,17 @@ async fn restore_ready(
     // `grant_app_lease` takes the app's last token, revoked or not, and adds
     // one, so the target node's token is strictly higher than the old one
     // (section 8.6). The old holder released the lease, so the grant's mode
-    // is free (ADR 0258). A gate that is open after all, or a grant held
-    // until its write is replicated (`NewGrant::Held`: the unsettled mark or
-    // a raise of the stored duration, section 8.4), leaves everything
-    // unwritten, and the node's next report, at most 30 s away (section 5.3),
-    // tries again.
-    let lease = match leases::grant_app_lease(
+    // is free (ADR 0258). A gate that is open after all leaves everything
+    // unwritten, and the node's next report, at most 30 s away (section
+    // 5.3), tries again. A grant that must wait (`NewGrant::Waiting`: the
+    // unsettled mark or a raise of the stored duration, section 8.4)
+    // completes the restore like any other; only its grant is held on the
+    // hub instead of sent. The volume is then `ready`, so a later report
+    // finds nothing to apply and grants nothing again.
+    let (lease, waiting) = match leases::grant_app_lease(
         &mut w.tx,
         hub.authority(),
+        hub.unrecorded_failures(),
         &current.app_id,
         node_id,
         &actor,
@@ -409,8 +418,9 @@ async fn restore_ready(
     )
     .await?
     {
-        leases::NewGrant::Granted(lease) => *lease,
-        leases::NewGrant::GateOpen(_) | leases::NewGrant::Held => {
+        leases::NewGrant::Granted(lease) => (*lease, false),
+        leases::NewGrant::Waiting(lease) => (*lease, true),
+        leases::NewGrant::GateOpen(_) => {
             return Ok(AppliedRestores::default());
         }
     };
@@ -476,9 +486,15 @@ async fn restore_ready(
     )
     .await?;
     w.commit().await?;
+    let (grants, held) = if waiting {
+        (Vec::new(), vec![lease])
+    } else {
+        (vec![lease], Vec::new())
+    };
     Ok(AppliedRestores {
         desired_changed: true,
-        grants: vec![lease],
+        grants,
+        held,
         other_node_ids,
     })
 }

@@ -4,6 +4,9 @@
 
 #![allow(dead_code)]
 
+pub mod log;
+pub mod machine;
+
 use quoro_control_plane::auth::setup_token;
 use quoro_control_plane::crypto::DataKey;
 use quoro_control_plane::store::{Store, random_secret};

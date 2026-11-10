@@ -8,26 +8,18 @@
 
 mod common;
 
+use common::machine::{Machine, echo, enroll, manual_clock, ok_result};
 use common::{Server, start_with_patient_node_session};
-use futures_util::{SinkExt, StreamExt};
 use quoro_control_plane::changelog::{self, Actor, Op};
-use quoro_control_plane::support::{BootClock, ManualBootClock};
 use quoro_proto::wire::{
-    self, Capacity as WireCapacity, Heartbeat, Kvm as WireKvm, NodeMessage, StatusReport,
-    VolumeState as WireVolumeState, VolumeStatus,
+    Capacity as WireCapacity, Heartbeat, NodeMessage, StatusReport, VolumeState as WireVolumeState,
+    VolumeStatus,
 };
-use quoro_proto::{CommandResult, CommandStatus, ErrorCode, LeaseId, LeaseRenew, ProtocolError};
+use quoro_proto::{ErrorCode, LeaseId, LeaseRenew, ProtocolError};
 use serde_json::{Value, json};
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpStream;
-use tokio::time::{Instant, timeout};
-use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::Message as WsMessage;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-
-type Socket = WebSocketStream<TcpStream>;
+use tokio::time::Instant;
 
 const IMAGE: &str =
     "ghcr.io/example/web@sha256:0000000000000000000000000000000000000000000000000000000000000000";
@@ -37,55 +29,6 @@ const D: u64 = 15_000;
 
 /// `S - M_S`: how long after `p_send` a support counts.
 const WINDOW: Duration = Duration::from_millis(13_500);
-
-struct Node {
-    node_id: String,
-    credential: String,
-}
-
-async fn enroll(server: &Server, owner: &reqwest::Client, name: &str, roles: &[&str]) -> Node {
-    let token: Value = owner
-        .post(server.url("/api/v1/nodes/join-tokens"))
-        .json(&json!({}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let res = server
-        .client()
-        .post(server.url("/api/v1/nodes/enroll"))
-        .json(&json!({
-            "join_token": token["token"].as_str().unwrap(),
-            "name": name,
-            "public_key": quoro_proto::sign::public_key_to_base64(
-                &quoro_proto::sign::signing_key_from_seed(&[3u8; 32]).verifying_key()
-            ),
-            "roles": roles,
-            "capacity": { "cpus": 8, "memory_mb": 16_384, "disk_gb": 200 },
-            "kvm": { "available": true, "kernel": "6.9.0", "nested": true }
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 201, "enroll: {}", res.text().await.unwrap());
-    let body: Value = res.json().await.unwrap();
-    Node {
-        node_id: body["node_id"].as_str().unwrap().to_string(),
-        credential: body["credential"].as_str().unwrap().to_string(),
-    }
-}
-
-/// A manual `CLOCK_BOOTTIME` for `server`'s support, set before any session.
-fn manual_clock(server: &Server) -> Arc<ManualBootClock> {
-    let clock = Arc::new(ManualBootClock::default());
-    server
-        .state
-        .hub
-        .set_support_clock(Arc::clone(&clock) as Arc<dyn BootClock>);
-    clock
-}
 
 fn supports(server: &Server, duration_ms: u64) -> bool {
     server.state.hub.authority().supports(duration_ms)
@@ -101,245 +44,6 @@ async fn create_seq(server: &Server, node_id: &str) -> u64 {
     .await
     .unwrap();
     u64::try_from(seq).unwrap()
-}
-
-/// A fresh 26-character suffix, so every frame of a fake machine has its own
-/// id.
-fn ulid_like() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    format!(
-        "01JC9Z6Q5W8N3K4T7R2M{:06}",
-        NEXT.fetch_add(1, Ordering::SeqCst)
-    )
-}
-
-fn hello(node_id: &str) -> NodeMessage {
-    NodeMessage::Hello(wire::Hello {
-        node_id: node_id.to_string(),
-        agent_version: "test-agent".to_string(),
-        engine_version: "test-engine".to_string(),
-        boot_id: "boot-1".to_string(),
-        stored_rev: 0,
-        applied_rev: 0,
-        log_seq: 0,
-        log_hash: "0".repeat(64),
-        leases: Vec::new(),
-        mesh_public_key: None,
-        capacity: WireCapacity {
-            cpus: 8,
-            memory_mb: 16_384,
-            disk_gb: 200,
-        },
-        allocated: WireCapacity::default(),
-        kvm: WireKvm {
-            available: true,
-            kernel: "6.9.0".to_string(),
-            nested: Some(true),
-        },
-        dropped_events: 0,
-        volume_snapshot: Some(wire::SnapshotMethod::Reflink),
-        custody_public_key: None,
-    })
-}
-
-fn ok_result(detail: Option<String>) -> NodeMessage {
-    NodeMessage::CommandResult(CommandResult {
-        status: CommandStatus::Ok,
-        detail,
-        error: None,
-        lines: None,
-        metrics: None,
-    })
-}
-
-/// The `support_grant` that echoes `request` at `version`.
-fn echo(request: &Value, version: u64) -> wire::SupportGrant {
-    let body = &request["body"];
-    wire::SupportGrant {
-        term: body["term"].as_u64().unwrap(),
-        support_ms: body["support_ms"].as_u64().unwrap(),
-        max_lease_ms: body["max_lease_ms"].as_u64().unwrap(),
-        voters_version: version,
-    }
-}
-
-/// A fake machine on a live session.
-struct Machine {
-    socket: Socket,
-    /// `primary_node_id` of the session's `welcome`.
-    primary: String,
-    /// `spec` of the newest `desired_state`.
-    spec: Value,
-    /// Whether it acknowledges each `desired_state`, as the agent does.
-    acks: bool,
-    /// The `desired_state` frames it has not acknowledged, while it does
-    /// not.
-    unacked: Vec<Value>,
-    /// The `support_request` frames received and not taken yet, oldest
-    /// first.
-    requests: VecDeque<(Instant, Value)>,
-}
-
-impl Machine {
-    /// Dials, sends `hello`, and reads up to the first `desired_state`.
-    async fn connect(server: &Server, node: &Node) -> Self {
-        Self::connect_acking(server, node, true).await
-    }
-
-    async fn connect_acking(server: &Server, node: &Node, acks: bool) -> Self {
-        let url = format!("ws://{}/api/v1/nodes/session", server.address());
-        let mut request = url.into_client_request().unwrap();
-        request.headers_mut().insert(
-            "Authorization",
-            format!("Bearer {}", node.credential).parse().unwrap(),
-        );
-        let stream = TcpStream::connect(server.address()).await.unwrap();
-        let (socket, response) = tokio_tungstenite::client_async(request, stream)
-            .await
-            .expect("websocket upgrade");
-        assert_eq!(response.status(), 101);
-        let mut machine = Self {
-            socket,
-            primary: String::new(),
-            spec: Value::Null,
-            acks,
-            unacked: Vec::new(),
-            requests: VecDeque::new(),
-        };
-        machine.send(hello(&node.node_id), None).await;
-        let welcome = machine.until("welcome").await;
-        machine.primary = welcome["body"]["primary_node_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        machine.until("desired_state").await;
-        machine
-    }
-
-    async fn send(&mut self, message: NodeMessage, re: Option<&str>) -> String {
-        let id = format!("msg_{}", ulid_like());
-        let text = message.to_frame(&id, re).to_text();
-        self.socket
-            .send(WsMessage::Text(text.into()))
-            .await
-            .unwrap();
-        id
-    }
-
-    /// Reads one frame and handles it as the agent would: a `desired_state`
-    /// is acknowledged and its spec kept, a `support_request` is kept for
-    /// the test.
-    async fn next(&mut self) -> Value {
-        let frame = loop {
-            let message = timeout(Duration::from_secs(30), self.socket.next())
-                .await
-                .expect("a frame within 30 s")
-                .expect("the socket is open")
-                .expect("a valid websocket frame");
-            match message {
-                WsMessage::Text(text) => {
-                    break serde_json::from_str::<Value>(text.as_str()).unwrap();
-                }
-                WsMessage::Close(_) => panic!("the socket closed"),
-                _ => {}
-            }
-        };
-        match frame["type"].as_str() {
-            Some("desired_state") => {
-                self.spec = frame["body"]["spec"].clone();
-                if self.acks {
-                    self.ack(&frame).await;
-                } else {
-                    self.unacked.push(frame.clone());
-                }
-            }
-            Some("support_request") => self.requests.push_back((Instant::now(), frame.clone())),
-            _ => {}
-        }
-        frame
-    }
-
-    async fn ack(&mut self, desired_state: &Value) {
-        let rev = desired_state["body"]["rev"].as_u64().unwrap();
-        self.send(
-            ok_result(Some(format!("stored rev {rev}"))),
-            desired_state["id"].as_str(),
-        )
-        .await;
-    }
-
-    /// Acknowledges every `desired_state` held back, and acknowledges the
-    /// next ones as they come.
-    async fn start_acking(&mut self) {
-        self.acks = true;
-        for frame in std::mem::take(&mut self.unacked) {
-            self.ack(&frame).await;
-        }
-    }
-
-    /// Reads frames until one of `kind`, and returns it.
-    async fn until(&mut self, kind: &str) -> Value {
-        loop {
-            let frame = self.next().await;
-            if frame["type"] == kind {
-                return frame;
-            }
-        }
-    }
-
-    /// Every frame up to the `pong`s of two pings in a row: the session
-    /// handles frames in order, so whatever the frames sent before them
-    /// caused is in the result.
-    async fn settle(&mut self) -> Vec<Value> {
-        let mut frames = Vec::new();
-        for _ in 0..2 {
-            let id = self.send(NodeMessage::Ping, None).await;
-            loop {
-                let frame = self.next().await;
-                if frame["type"] == "pong" && frame["re"] == id.as_str() {
-                    break;
-                }
-                frames.push(frame);
-            }
-        }
-        frames
-    }
-
-    /// The oldest `support_request` not taken yet, waiting for one.
-    async fn request(&mut self) -> (Instant, Value) {
-        loop {
-            if let Some(request) = self.requests.pop_front() {
-                return request;
-            }
-            self.next().await;
-        }
-    }
-
-    /// The `spec.votes.version` of the newest `desired_state`.
-    fn version(&self) -> u64 {
-        self.spec["votes"]["version"].as_u64().expect("spec.votes")
-    }
-
-    /// Answers `request` as the agent does: the request's term, `S` and `L`,
-    /// with the version of the newest `desired_state`. Waits until the
-    /// primary has handled it.
-    async fn grant(&mut self, request: &Value) {
-        let grant = echo(request, self.version());
-        self.answer(grant, request["id"].as_str()).await;
-    }
-
-    /// Sends `grant` with `re`, and waits until the primary has handled it.
-    async fn answer(&mut self, grant: wire::SupportGrant, re: Option<&str>) {
-        self.send(NodeMessage::SupportGrant(grant), re).await;
-        self.settle().await;
-    }
-
-    /// Takes the next `support_request` and answers it.
-    async fn support(&mut self) {
-        let (_, request) = self.request().await;
-        self.grant(&request).await;
-    }
 }
 
 async fn cluster_votes(server: &Server, owner: &reqwest::Client) -> Value {
@@ -886,29 +590,18 @@ async fn a_renewal_is_answered_while_two_of_three_voters_support_and_not_after()
     );
 }
 
-/// #604 under real support: a `warm` app's new token over a released lease
-/// row that already reads `expiring` for `D` and carries no unsettled mark
-/// goes out `expiring` for `D` while two of three voters support the
-/// primary, and is held, writing nothing, while none does.
-#[tokio::test]
-async fn a_warm_apps_new_token_goes_out_expiring_under_real_support() {
-    let server = start_with_patient_node_session().await;
-    let owner = server.owner().await;
-    manual_clock(&server);
-    let a = enroll(&server, &owner, "node-a", &["node"]).await;
-    let b = enroll(&server, &owner, "node-b", &["node"]).await;
-    enroll(&server, &owner, "node-c", &["node"]).await;
-    let mut on_a = Machine::connect(&server, &a).await;
-    let mut on_b = Machine::connect(&server, &b).await;
-    heartbeat(&mut on_a).await;
-    let project_id = project(&server, &owner).await;
-    let app_id = app(&server, &owner, &project_id, "web").await;
-
-    // A first volume while the policy is `none`, deleted and its revoke
-    // answered; then the row reads as an `expiring` lease's whose gate has
-    // passed, and the policy becomes `warm`.
-    set_policy(&server, &app_id, "none").await;
-    let res = create_volume(&server, &owner, &app_id).await;
+/// Gives `app_id` a released lease whose row reads `expiring` for `D`, as
+/// one whose gate has passed: a first volume on A while the policy is
+/// `none`, deleted and its revoke answered; then the row reads as an
+/// `expiring` lease's, and the policy becomes `warm`. Returns the lease id.
+async fn released_expiring_lease(
+    server: &Server,
+    owner: &reqwest::Client,
+    on_a: &mut Machine,
+    app_id: &str,
+) -> String {
+    set_policy(server, app_id, "none").await;
+    let res = create_volume(server, owner, app_id).await;
     assert_eq!(res.status(), 201, "{}", res.text().await.unwrap());
     let volume_id = res.json::<Value>().await.unwrap()["id"]
         .as_str()
@@ -930,32 +623,46 @@ async fn a_warm_apps_new_token_goes_out_expiring_under_real_support() {
         .execute(server.state.store.pool())
         .await
         .unwrap();
-    set_policy(&server, &app_id, "warm").await;
-    let row = || {
+    set_policy(server, app_id, "warm").await;
+    lease_id
+}
+
+/// #604 under real support: a `warm` app's new token over a released lease
+/// row that already reads `expiring` for `D` and carries no unsettled mark
+/// goes out `expiring` for `D` while two of three voters support the
+/// primary, and the row stays unmarked. Once their support has run out, a
+/// second app's new token over such a row is written `expiring` for `D`
+/// with the mark, and its grant is held (section 8.4, "Grants of a marked
+/// row"; issue #703): it goes out only once a majority supports `D` and the
+/// write is replicated over the machines with the `node` role, and C never
+/// connects. Before #703 that write was not made and `createVolume`
+/// answered `conflict`.
+#[tokio::test]
+async fn a_warm_apps_new_token_goes_out_expiring_under_real_support() {
+    let server = start_with_patient_node_session().await;
+    let owner = server.owner().await;
+    let clock = manual_clock(&server);
+    let a = enroll(&server, &owner, "node-a", &["node"]).await;
+    let b = enroll(&server, &owner, "node-b", &["node"]).await;
+    let c = enroll(&server, &owner, "node-c", &["node"]).await;
+    let mut on_a = Machine::connect(&server, &a).await;
+    let mut on_b = Machine::connect(&server, &b).await;
+    heartbeat(&mut on_a).await;
+    let project_id = project(&server, &owner).await;
+    let row = |lease_id: &str| {
         sqlx::query_as::<_, (String, Option<i64>, i64, i64)>(
             "SELECT mode, duration_ms, unsettled, fencing_token FROM leases WHERE id = ?",
         )
-        .bind(&lease_id)
+        .bind(lease_id.to_string())
         .fetch_one(server.state.store.pool())
     };
+
+    let app_id = app(&server, &owner, &project_id, "web").await;
+    let lease_id = released_expiring_lease(&server, &owner, &mut on_a, &app_id).await;
     assert_eq!(
-        row().await.unwrap(),
+        row(&lease_id).await.unwrap(),
         ("expiring".to_string(), Some(15_000), 0, 1)
     );
-
-    // No voter answered yet: the grant is held and nothing is written.
-    let res = create_volume(&server, &owner, &app_id).await;
-    assert_eq!(res.status(), 409);
-    let body: Value = res.json().await.unwrap();
-    assert!(
-        body["detail"]
-            .as_str()
-            .unwrap()
-            .contains("cannot be granted yet"),
-        "{body}"
-    );
-    assert_eq!(row().await.unwrap().3, 1, "nothing was written");
-
     on_a.support().await;
     on_b.support().await;
     assert!(supports(&server, D));
@@ -967,7 +674,37 @@ async fn a_warm_apps_new_token_goes_out_expiring_under_real_support() {
     assert_eq!(grant["body"]["mode"], "expiring");
     assert_eq!(grant["body"]["duration_ms"], 15_000);
     assert_eq!(
-        row().await.unwrap(),
+        row(&lease_id).await.unwrap(),
         ("expiring".to_string(), Some(15_000), 0, 2)
     );
+
+    // The voters answer nothing more, and their support runs out.
+    let web2 = app(&server, &owner, &project_id, "web-2").await;
+    let lease_2 = released_expiring_lease(&server, &owner, &mut on_a, &web2).await;
+    clock.advance(WINDOW);
+    assert!(!supports(&server, D));
+    let res = create_volume(&server, &owner, &web2).await;
+    assert_eq!(res.status(), 201, "{}", res.text().await.unwrap());
+    assert_eq!(
+        row(&lease_2).await.unwrap(),
+        ("expiring".to_string(), Some(15_000), 1, 2),
+        "written with the mark"
+    );
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let frames = on_a.settle().await;
+    assert!(
+        !frames.iter().any(|frame| frame["type"] == "lease_grant"),
+        "{frames:?}"
+    );
+    let app: Value = owner
+        .get(server.url(&format!("/api/v1/apps/{web2}")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(app["lease"]["grant_pending"], true, "{app}");
+    let waiting = app["lease"]["grant_waiting_on"].as_array().unwrap();
+    assert!(waiting.contains(&json!(c.node_id)), "{app}");
 }
