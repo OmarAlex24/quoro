@@ -330,6 +330,11 @@ impl NodeHub {
                     }
                     None
                 }
+                // A grant held since this row was written, for a newer
+                // token, stays: this row is already behind it, and its
+                // attempt would only drop the entry ([`Self::held_eligible`]
+                // keeps the same guard).
+                Some(held) if held.token > lease.fencing_token => None,
                 _ => registry
                     .entries
                     .insert(lease.id.clone(), HeldGrant::of(lease, live)),
@@ -999,6 +1004,26 @@ mod tests {
             .unwrap()
             .held_revokes = 0;
         assert!(hub.session_ready(&node_id, generation));
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    /// A late registration of an older token never replaces a newer one: a
+    /// regrant wrote and held token 3 before a failover holds the token 2 it
+    /// wrote earlier. The entry for token 3 stays, and so does its session.
+    #[tokio::test]
+    async fn an_older_token_does_not_replace_a_newer_held_grant() {
+        let (state, node_id, data_dir) = hub_with_node().await;
+        let hub = &state.hub;
+        let (generation, _rx, _closed, _changed) = hub.attach(&node_id);
+        let older = marked("lse_one", &node_id);
+        let mut newer = older.clone();
+        newer.fencing_token = 3;
+        hub.held_eligible(&newer, generation, None);
+
+        hub.hold_grant(&older);
+        let held = entry(hub, "lse_one");
+        assert_eq!(held.token, 3, "the newer entry stays");
+        assert_eq!(held.eligible_on, Some(generation));
         std::fs::remove_dir_all(&data_dir).unwrap();
     }
 
