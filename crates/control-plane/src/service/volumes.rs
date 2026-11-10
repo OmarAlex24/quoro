@@ -386,7 +386,7 @@ pub(crate) async fn create_volume(
         // voter support. Support is counted, and so is replication (the
         // follow positions of section 7.1), but this build cannot hold a
         // grant and send it later (#703), so nothing is created.
-        leases::NewGrant::Held => {
+        leases::NewGrant::Waiting(_) => {
             return Err(ApiError::conflict(
                 "the app's lease cannot be granted yet: this grant goes out only once its lease \
                  row is on every machine with the node role, and while a majority of voters \

@@ -410,7 +410,9 @@ async fn restore_ready(
     .await?
     {
         leases::NewGrant::Granted(lease) => *lease,
-        leases::NewGrant::GateOpen(_) | leases::NewGrant::Held => {
+        // Until the hub holds grants, a grant that waits leaves everything
+        // unwritten (the transaction rolls back).
+        leases::NewGrant::GateOpen(_) | leases::NewGrant::Waiting(_) => {
             return Ok(AppliedRestores::default());
         }
     };

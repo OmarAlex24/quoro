@@ -382,7 +382,9 @@ mod tests {
         (store, node_id, data_dir)
     }
 
-    /// The lease of a new-token grant that no gate held back.
+    /// The lease row of a new-token grant that no gate held back. A grant
+    /// that waits ([`crate::leases::NewGrant::Waiting`]) writes its row too,
+    /// which is all these tests read.
     async fn grant(
         w: &mut crate::store::WriteTx,
         node_id: &str,
@@ -394,9 +396,10 @@ mod tests {
         match crate::leases::grant_app_lease(&mut w.tx, &authority, "app_x", node_id, actor, false)
             .await?
         {
-            crate::leases::NewGrant::Granted(lease) => Ok(*lease),
+            crate::leases::NewGrant::Granted(lease) | crate::leases::NewGrant::Waiting(lease) => {
+                Ok(*lease)
+            }
             crate::leases::NewGrant::GateOpen(remaining) => panic!("a gate open for {remaining:?}"),
-            crate::leases::NewGrant::Held => panic!("a grant held for the unsettled mark"),
         }
     }
 

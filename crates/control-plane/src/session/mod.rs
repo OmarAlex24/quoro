@@ -954,7 +954,7 @@ impl NodeHub {
             // sent, as "The holder fenced first" step 4 says for a session
             // start without majority support. The row is unchanged, so the
             // node's next `hello` reports the expiry again and tries again.
-            leases::NewGrant::Held => {
+            leases::NewGrant::Waiting(_) => {
                 tracing::info!(
                     node_id,
                     lease_id,
