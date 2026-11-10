@@ -24,8 +24,10 @@
 -- tunnel with the provider's account credential, stores its id here, and
 -- sends the node only the tunnel id and the tunnel's run token in
 -- desired_state (spec.ingress.tunnel, node-agent-protocol.md section 5.11).
--- The account credential never leaves the primary. tunnel_id and token_enc
--- are NULL until the tunnel exists at the provider. token_enc is the run token
+-- Only the primary uses the account credential and no desired state carries
+-- it, but every machine with the `node` role can read it from the change log
+-- (node-agent-protocol.md sections 7.1 and 11, ADR 0320). tunnel_id and
+-- token_enc are NULL until the tunnel exists at the provider. token_enc is the run token
 -- encrypted with the cluster DEK (key id || nonce || ciphertext, like the
 -- other *_enc columns listed at the top of db-schema.sql); it is never
 -- returned by the API. origin_port is the loopback port on the node where the

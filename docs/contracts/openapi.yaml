@@ -1142,12 +1142,14 @@ components:
       type: object
       title: NodeTunnel
       description: |
-        Which `tunnel` provider runs this node's tunnel (D-0094, D-0095). One
-        tunnel per node. The primary creates or looks up the tunnel with the
+        Which `tunnel` provider runs this node's tunnel (ADR 0094, ADR 0095).
+        One tunnel per node. The primary creates or looks up the tunnel with the
         provider's account credential and sends the node only the tunnel id and
-        its run token (node-agent-protocol.md section 5.11); the account
-        credential never leaves the primary and the run token is never returned
-        by the API.
+        its run token (node-agent-protocol.md section 5.11). Only the primary
+        uses the account credential and no desired state carries it, but every
+        machine with the `node` role can read it, and every node's run token,
+        from the change log (node-agent-protocol.md sections 7.1 and 11,
+        ADR 0320). The run token is never returned by the API.
       required:
         - provider_id
         - tunnel_id
