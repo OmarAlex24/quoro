@@ -436,12 +436,18 @@ pub async fn create_volume(
                     serde_json::to_value(&created.volume).unwrap_or(Value::Null),
                 );
             }
-            // The lease reaches the node before the next snapshot, so a
-            // stateful VM in it finds the lease held (section 6.4).
-            state.hub.send_control(
-                &created.node_id,
-                &ControlMessage::LeaseGrant(created.lease.grant()),
-            );
+            if created.waiting {
+                // Section 8.4, "Grants of a marked row": the grant waits on
+                // the hub until its write is replicated and supported.
+                state.hub.hold_grant(&created.lease);
+            } else {
+                // The lease reaches the node before the next snapshot, so a
+                // stateful VM in it finds the lease held (section 6.4).
+                state.hub.send_control(
+                    &created.node_id,
+                    &ControlMessage::LeaseGrant(created.lease.grant()),
+                );
+            }
             state.hub.node_changed(&created.node_id);
             Ok((StatusCode::CREATED, Json(created.volume)).into_response())
         }

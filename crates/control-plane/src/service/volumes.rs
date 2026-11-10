@@ -37,8 +37,12 @@ pub(crate) struct CreatedVolume {
     pub volume: Volume,
     /// Node that holds the file.
     pub node_id: String,
-    /// The app's `local` lease, granted to that node.
+    /// The app's lease, granted to that node.
     pub lease: Lease,
+    /// Whether the grant waits on the hub ([`leases::NewGrant::Waiting`]):
+    /// the caller holds it ([`crate::session::NodeHub::hold_grant`]) instead
+    /// of sending it.
+    pub waiting: bool,
 }
 
 /// The volume a delete was accepted for, with the lease it released.
@@ -211,10 +215,12 @@ pub(crate) async fn get_volume(
 /// # Errors
 ///
 /// `not_found` for an unknown app, `conflict` when the app already has an
-/// attached volume, its node is not connected, the previous holder's gate
-/// is still open (section 8.4), or the grant would carry the lease row's
-/// unsettled mark ([`leases::NewGrant::Held`]), `validation_failed` for a
-/// bad body or a size larger than the node's free disk, or a database error.
+/// attached volume, its node is not connected, or the previous holder's gate
+/// is still open (section 8.4), `validation_failed` for a bad body or a size
+/// larger than the node's free disk, or a database error. A grant that must
+/// wait ([`leases::NewGrant::Waiting`]) succeeds: the row is written and the
+/// grant is held on the hub (section 8.4, "Grants of a marked row": "No
+/// operation is refused for it: the grant waits").
 pub(crate) async fn create_volume(
     state: &AppState,
     ctx: &CallCtx,
@@ -358,42 +364,48 @@ pub(crate) async fn create_volume(
     // that revoke before this grant and its mode is free (ADR 0258). A
     // volume that failed leaves the lease unrevoked: the node still holds it,
     // so a new token keeps the mode it holds, `local` (section 8.4).
-    let keep_local = leases::app_lease(&mut w.tx, app_id)
+    let previous = leases::app_lease(&mut w.tx, app_id).await?;
+    let keep_local = previous.as_ref().is_some_and(|previous| {
+        !previous.is_revoked() && previous.mode == "local" && previous.holder_node_id == node_id
+    });
+    // Re-entry: a grant of the lease already waiting for this node is
+    // reused, so no second token is written while one waits (section 8.4,
+    // "Grants of a marked row"; ADR 0295).
+    let waiting_for_node = match previous {
+        Some(previous)
+            if previous.holder_node_id == node_id
+                && state.hub.grant_pending(&previous.id)
+                && leases::is_step4(&mut w.tx, &previous).await? =>
+        {
+            Some(previous)
+        }
+        _ => None,
+    };
+    let (lease, waiting) = match waiting_for_node {
+        Some(previous) => (previous, true),
+        None => match leases::grant_app_lease(
+            &mut w.tx,
+            state.hub.authority(),
+            app_id,
+            &node_id,
+            &actor,
+            keep_local,
+        )
         .await?
-        .is_some_and(|previous| {
-            !previous.is_revoked() && previous.mode == "local" && previous.holder_node_id == node_id
-        });
-    let lease = match leases::grant_app_lease(
-        &mut w.tx,
-        state.hub.authority(),
-        app_id,
-        &node_id,
-        &actor,
-        keep_local,
-    )
-    .await?
-    {
-        leases::NewGrant::Granted(lease) => *lease,
-        leases::NewGrant::GateOpen(remaining) => {
-            return Err(ApiError::conflict(format!(
-                "the app's previous lease holder may still run it for {} s more (its gate is \
-                 open); retry then",
-                remaining.as_secs() + 1
-            )));
-        }
-        // Section 8.4 ("Grants of a marked row", ADR 0268) says the grant
-        // waits until its write is replicated, and goes out with majority
-        // voter support. Support is counted, and so is replication (the
-        // follow positions of section 7.1), but this build cannot hold a
-        // grant and send it later (#703), so nothing is created.
-        leases::NewGrant::Waiting(_) => {
-            return Err(ApiError::conflict(
-                "the app's lease cannot be granted yet: this grant goes out only once its lease \
-                 row is on every machine with the node role, and while a majority of voters \
-                 supports this primary; this build does not yet hold such a grant to send it \
-                 later, so nothing was created; retry later",
-            ));
-        }
+        {
+            leases::NewGrant::Granted(lease) => (*lease, false),
+            // The row is written with the mark; the caller holds the grant
+            // after the commit, and it goes out once the write is replicated
+            // and a majority of voters supports it.
+            leases::NewGrant::Waiting(lease) => (*lease, true),
+            leases::NewGrant::GateOpen(remaining) => {
+                return Err(ApiError::conflict(format!(
+                    "the app's previous lease holder may still run it for {} s more (its gate is \
+                     open); retry then",
+                    remaining.as_secs() + 1
+                )));
+            }
+        },
     };
     ctx.append_ok(
         &mut w.tx,
@@ -409,6 +421,7 @@ pub(crate) async fn create_volume(
         volume,
         node_id,
         lease,
+        waiting,
     })
 }
 

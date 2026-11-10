@@ -128,9 +128,11 @@ enum Attempt {
 }
 
 impl NodeHub {
-    /// The node's countable acknowledgement ([module docs](self)), 0 when it
-    /// has none in this process.
-    pub(super) fn countable_ack(&self, node_id: &str) -> u64 {
+    /// Test seam: the node's countable acknowledgement ([module
+    /// docs](self)), 0 when it has none in this process.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn countable_ack(&self, node_id: &str) -> u64 {
         self.0
             .countable_acks
             .lock()

@@ -268,6 +268,9 @@ pub(crate) enum Regrant {
     Grant(quoro_proto::LeaseGrant),
     /// An `expiring` row's gate is still open for this long.
     Wait(Duration),
+    /// The row is written and its grant waits on the hub (section 8.4,
+    /// "Grants of a marked row"); nothing is sent on this session.
+    Held,
     /// Nothing is given back.
     No,
 }
@@ -920,11 +923,10 @@ impl NodeHub {
     ///   Until then it answers [`Regrant::Wait`].
     ///
     /// The grant has the mode the app's HA policy wants: `expiring` for a
-    /// `warm` or `hot` app while voters support it, `local` for any other
-    /// app ([`leases::grant_app_lease`]). A grant held until its write is
-    /// replicated, a `warm` app's without support among them, gives nothing
-    /// back on this session ([`leases::NewGrant::Held`]); the node's next
-    /// `hello` tries again.
+    /// `warm` or `hot` app, `local` for any other app
+    /// ([`leases::grant_app_lease`]). A grant that must wait, a `warm` app's
+    /// without support among them, is written with the mark and held on the
+    /// hub ([`Regrant::Held`]); `regrant_later` stays for an open gate.
     pub(crate) async fn regrant_lease(
         &self,
         node_id: &str,
@@ -979,6 +981,13 @@ impl NodeHub {
             );
             return Ok(Regrant::No);
         }
+        // Re-entry: a grant of the lease already waiting for this node is
+        // reused, so no second token is written while one waits (ADR 0295).
+        if self.grant_pending(lease_id) && leases::is_step4(&mut w.tx, &row).await? {
+            drop(w);
+            self.hold_grant(&row);
+            return Ok(Regrant::Held);
+        }
         let actor = Actor {
             kind: ActorType::Node,
             id: node_id.to_string(),
@@ -997,17 +1006,19 @@ impl NodeHub {
         {
             leases::NewGrant::Granted(lease) => *lease,
             leases::NewGrant::GateOpen(remaining) => return Ok(Regrant::Wait(remaining)),
-            // Held until its write is replicated (section 8.4): nothing is
-            // sent, as "The holder fenced first" step 4 says for a session
-            // start without majority support. The row is unchanged, so the
-            // node's next `hello` reports the expiry again and tries again.
-            leases::NewGrant::Waiting(_) => {
+            // The regrant of "The holder fenced first": its write keeps or
+            // sets the mark, and the grant goes out from the hub once the
+            // write is replicated and supported (steps 2 and 3).
+            leases::NewGrant::Waiting(lease) => {
+                w.commit().await?;
                 tracing::info!(
                     node_id,
                     lease_id,
-                    "a held regrant waits for the node's next session"
+                    token = lease.fencing_token,
+                    "a regrant waits until its write is replicated and supported"
                 );
-                return Ok(Regrant::No);
+                self.hold_grant(&lease);
+                return Ok(Regrant::Held);
             }
         };
         w.commit().await?;
@@ -1055,7 +1066,7 @@ impl NodeHub {
                     }
                     // Never a busy loop on the writer gate.
                     Regrant::Wait(remaining) => wait = remaining.max(Duration::from_millis(10)),
-                    Regrant::No => return,
+                    Regrant::Held | Regrant::No => return,
                 }
             }
         });
@@ -3939,7 +3950,7 @@ impl Session {
                 token,
                 remaining,
             ),
-            Regrant::No => {}
+            Regrant::Held | Regrant::No => {}
         }
     }
 
@@ -4707,6 +4718,11 @@ async fn apply_status_report(
                     node_id,
                     &quoro_proto::wire::ControlMessage::LeaseGrant(lease.grant()),
                 );
+            }
+            // Section 8.4, "Grants of a marked row": a restore's grant that
+            // must wait goes out from the hub once replicated and supported.
+            for lease in &applied.held {
+                hub.hold_grant(lease);
             }
             if applied.desired_changed {
                 hub.node_changed(node_id);

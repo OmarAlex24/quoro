@@ -87,13 +87,19 @@ pub struct Lease {
 }
 
 impl Lease {
-    /// The API view of a `leases` row.
+    /// The API view of a `leases` row, with `grant_pending` and
+    /// `grant_waiting_on` from the hub's held grants
+    /// ([`crate::session::NodeHub::grant_view`]).
     ///
     /// # Errors
     ///
     /// `internal` for a row whose `resource_type` or `mode` the schema does
     /// not allow.
-    pub(crate) fn from_row(row: crate::leases::Lease) -> Result<Self, ApiError> {
+    pub(crate) fn from_row(
+        row: crate::leases::Lease,
+        grant_pending: bool,
+        grant_waiting_on: Vec<String>,
+    ) -> Result<Self, ApiError> {
         let resource_type = match row.resource_type.as_str() {
             "app" => LeaseResourceType::App,
             "primary" => LeaseResourceType::Primary,
@@ -132,15 +138,17 @@ impl Lease {
             local_pending: mode == LeaseModeView::Local && row.unsettled,
             // `leases.unsettled` (migration 0013).
             unsettled: row.unsettled,
-            // Derived from the grants the primary holds back (section 8.4),
-            // which the M5b lease work adds; until then no grant waits.
-            grant_pending: false,
-            grant_waiting_on: Vec::new(),
+            // Derived from the grants the hub holds back (section 8.4,
+            // "Grants of a marked row"; ADR 0292).
+            grant_pending,
+            grant_waiting_on,
         })
     }
 }
 
-/// Fills `lease` on every app of `apps` (`openapi.yaml` `App.lease`).
+/// Fills `lease` on every app of `apps` (`openapi.yaml` `App.lease`). A
+/// read with no write: the held grants come from the hub, the required set
+/// and the newest write from the same connection.
 ///
 /// # Errors
 ///
@@ -151,10 +159,13 @@ pub(crate) async fn attach(state: &AppState, apps: &mut [App]) -> Result<(), Api
     }
     let mut conn = state.store.pool().acquire().await?;
     for app in apps {
-        app.lease = crate::leases::app_lease(&mut conn, &app.id)
-            .await?
-            .map(Lease::from_row)
-            .transpose()?;
+        app.lease = match crate::leases::app_lease(&mut conn, &app.id).await? {
+            Some(row) => {
+                let (pending, waiting_on) = state.hub.grant_view(&mut conn, &row).await?;
+                Some(Lease::from_row(row, pending, waiting_on)?)
+            }
+            None => None,
+        };
     }
     Ok(())
 }
