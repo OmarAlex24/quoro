@@ -28,6 +28,10 @@
 -- wrapped under the owner's recovery key lives only in the repository's config
 -- object in the bucket (backup-format.md section 4). The recovery key itself is
 -- never stored: recovery_key_fingerprint identifies it without revealing it.
+-- repo_key_enc is the one column of the table that never enters the change log
+-- (node-agent-protocol.md section 7.1): a promotion rebuilds the row with an
+-- empty BLOB there, which means that primary does not hold the repository key
+-- until it is recovered (node-agent-protocol.md section 7.3, step 4).
 -- control_plane_schedule is the schedule of the control-plane database backups
 -- (ADR 0148), same JSON shape as apps.backup_schedule.
 --
