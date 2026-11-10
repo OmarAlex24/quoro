@@ -19,6 +19,11 @@ info:
     agent carry a justification header that is recorded in the append-only audit
     log (D-0031).
 
+    A request body is at most 256 KiB. A larger one is answered 413 with `code`
+    `payload_too_large` and is not parsed; the refusal is audited without its
+    parameters. Operations do not list this answer, as they do not list
+    `internal` (README.md, "Request body limit", ADR 0306).
+
     Vocabulary, identifiers, statuses, scopes, event types, error codes and
     headers are fixed by `docs/contracts/README.md`; the entity fields are fixed
     by the shared entity model used by every contract file. Timestamps are
@@ -556,6 +561,7 @@ components:
             - approval_required
             - not_found
             - conflict
+            - payload_too_large
             - validation_failed
             - rate_limited
             - not_primary
@@ -5668,7 +5674,11 @@ components:
       description: |
         One record of the append-only audit log; the format is fixed by
         `docs/contracts/audit-log-format.md`. It has no prefixed id: it is
-        identified by `seq`. Secrets in `params` are redacted (D-0031).
+        identified by `seq`. Secrets in `params` are redacted (D-0031). When
+        the parameters would make the record's change-log entry one a node
+        could not receive alone and verify, `params` is `{}` and
+        `params_sha256` and `params_bytes` stand for them (audit-log-format.md
+        section 4.1, ADR 0306).
       required:
         - seq
         - time
@@ -5736,7 +5746,22 @@ components:
         params:
           type: object
           additionalProperties: true
-          description: Call parameters, with secrets redacted.
+          description: |
+            Call parameters, with secrets redacted; `{}` when the record keeps
+            their digest instead, or when the request body was above the
+            limit (README.md, "Request body limit").
+        params_sha256:
+          type: [string, 'null']
+          pattern: '^[0-9a-f]{64}$'
+          description: |
+            SHA-256 of the redacted parameters' text (audit-log-format.md
+            section 4.1), present only when `params` is `{}` in their place.
+        params_bytes:
+          type: [integer, 'null']
+          minimum: 0
+          description: |
+            Size in bytes of the text `params_sha256` covers; present exactly
+            when `params_sha256` is.
         justification:
           type: [string, 'null']
           description: The agent's stated reason, from `Quoro-Justification`.

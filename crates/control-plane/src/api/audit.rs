@@ -84,9 +84,18 @@ pub struct AuditRecord {
     /// Project of the target, when it has one.
     #[schema(pattern = "^prj_[0-9A-HJKMNP-TV-Z]{26}$")]
     pub project_id: Option<String>,
-    /// Call parameters, with secrets redacted.
+    /// Call parameters, with secrets redacted; `{}` when the record keeps
+    /// their digest instead, or when the request body was above the limit.
     #[schema(value_type = Object)]
     pub params: Value,
+    /// SHA-256 of the redacted parameters' text (`audit-log-format.md`
+    /// section 4.1), present only when `params` is `{}` in their place.
+    #[schema(pattern = "^[0-9a-f]{64}$")]
+    pub params_sha256: Option<String>,
+    /// Size in bytes of the text `params_sha256` covers; present exactly when
+    /// `params_sha256` is.
+    #[schema(minimum = 0)]
+    pub params_bytes: Option<i64>,
     /// The agent's stated reason, from `Quoro-Justification`.
     pub justification: Option<String>,
     /// Event that triggered the call.
