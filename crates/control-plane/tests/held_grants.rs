@@ -10,11 +10,11 @@
 //! Case 11 of #703 (a `warm` restore completes with its grant held, and
 //! `createVolume` of a `warm` app succeeds with its grant held) lives with
 //! their other tests, in `restore.rs`, `new_token_grants.rs` and
-//! `support.rs`.
+//! `support.rs`; `failoverApp`'s held grant (ADR 0292) lives in
+//! `failover.rs`.
 //!
 //! Out of scope here, as in the code: the writes that clear the mark (#555),
-//! R, the conversion grant and the same-token resend, and `failoverApp`
-//! (#720).
+//! R, the conversion grant and the same-token resend.
 
 mod common;
 

@@ -18,27 +18,32 @@
 //!    checked again, the warm node holds the lease `expiring` with a higher
 //!    token, the volume and the instances move there, the old source becomes
 //!    the warm node, `app.failed_over` is emitted. After the commit the warm
-//!    node gets its grant, then every node concerned its new desired state,
-//!    and nothing after the commit fails the call.
+//!    node gets its grant, or the hub holds it (below), then every node
+//!    concerned its new desired state, and nothing after the commit fails
+//!    the call.
 //!
 //! A refusal after this call revoked the source says that the source's lease
 //! stays revoked and its app stopped: a retry goes on from there.
 //!
-//! **Held grants.** This build sends a failover's grant only when
-//! [`leases::grant_app_lease`] can grant at once: the row carries no unsettled
-//! mark and already reads `expiring` for at least `D`, and the primary holds
-//! majority support. A grant that would wait for its write to be replicated
-//! over the machines with the `node` role ([`leases::NewGrant::Waiting`]) is
-//! refused with `no_support` before anything is written ([`held_grant`]),
-//! where ADR 0292 would answer `202` and send the grant later. The shared
-//! machinery that holds such a grant is not built yet. Support that lapses
-//! after the source answered its revoke is found only by the grant, so that
-//! call also answers `no_support`, with the source's lease revoked; a retry
-//! goes straight to the grant.
+//! **Held grants** (ADR 0292, ADR 0303). A grant that must wait for its
+//! write to be replicated over the machines with the `node` role
+//! ([`leases::grant_must_wait`]: the row carries the unsettled mark, or does
+//! not read `expiring` for at least `D`, a raise) is written by the change
+//! with the mark set ([`leases::NewGrant::Waiting`]). The change commits,
+//! the hub holds the grant ([`crate::session::NodeHub::hold_grant`]) and
+//! sends it under "Grants of a marked row" (section 8.4), and the call
+//! answers `202`: `App.lease.grant_pending` and `App.lease.grant_waiting_on`
+//! show the wait, and `app.failed_over` carries `grant_pending: true`.
+//! Majority support is checked under the writer right before the grant, so
+//! support that lapsed after the source answered its revoke answers
+//! `no_support` with nothing moved, as the contract gives it (ADR 0303 Q3);
+//! a retry goes straight to the grant.
 //!
 //! **One at a time.** A failover of an app holds [`Running`] from its
 //! `in_progress` check until it answers, so a second call of the same app
-//! answers `in_progress`. The set is in memory only, as the call is.
+//! answers `in_progress`. The set is in memory only, as the call is. A call
+//! while the hub holds a grant of the app's lease that it has not sent
+//! answers `in_progress` too (`App.lease.grant_pending`, ADR 0292).
 
 use crate::AppState;
 use crate::api::apps::{
@@ -126,6 +131,9 @@ struct Plan {
 /// What the change moved, for what follows its commit.
 struct Moved {
     lease: Lease,
+    /// The grant to the warm node waits ([`leases::NewGrant::Waiting`]): the
+    /// hub holds it instead of sending it.
+    waiting: bool,
     /// The nodes the app's instances left.
     vm_nodes: Vec<String>,
     /// The app as the change wrote it, without its cost, lease and warm
@@ -170,6 +178,22 @@ pub(crate) async fn run(
             "a failover of the app is already running",
         ));
     };
+    // ADR 0292: while a grant of the app's lease waits, a failover answers
+    // `in_progress`, checked before `node_id` as the contract orders it: a
+    // failover whose grant waits already made the old source the app's warm
+    // node. Read once this call holds `Running`, so no failover of the app
+    // commits between the check and the refusals. A grant held for another
+    // operation (a regrant, a restore, `createVolume`) counts too, the side
+    // that moves less.
+    let mut conn = state.store.pool().acquire().await?;
+    let lease = leases::app_lease(&mut conn, app_id).await?;
+    drop(conn);
+    if lease.is_some_and(|lease| state.hub.grant_pending(&lease.id)) {
+        return Err(conflict(
+            Reason::InProgress,
+            "the grant of the app's lease to its holder still waits (App.lease.grant_pending)",
+        ));
+    }
     let plan = refuse(state, &app, node_id).await?;
 
     let revoked = state.hub.is_connected(&plan.source)
@@ -182,11 +206,18 @@ pub(crate) async fn run(
     };
 
     // The move is committed: nothing below fails the call.
-    // The grant reaches the warm node before the snapshot that starts the
-    // app there (section 6.13), as a restore's does (section 8.3).
-    state
-        .hub
-        .send_control(&plan.warm, &ControlMessage::LeaseGrant(moved.lease.grant()));
+    if moved.waiting {
+        // ADR 0292: the hub holds the grant and sends it once the write is
+        // replicated and supported; the 202 below shows the wait, so the
+        // grant is held before the answer reads it.
+        state.hub.hold_grant(&moved.lease);
+    } else {
+        // The grant reaches the warm node before the snapshot that starts
+        // the app there (section 6.13), as a restore's does (section 8.3).
+        state
+            .hub
+            .send_control(&plan.warm, &ControlMessage::LeaseGrant(moved.lease.grant()));
+    }
     let mut wake = vec![plan.warm.clone(), plan.source.clone()];
     wake.extend(moved.vm_nodes);
     for node_id in crate::warm::with_copy_holders(state, app_id, wake) {
@@ -302,12 +333,6 @@ async fn refuse(state: &AppState, app: &App, node_id: &str) -> Result<Plan, ApiE
         return Err(conflict(Reason::LeaseHeld, why));
     }
 
-    if let Some(lease) = &lease
-        && let Some(held) = held_grant(lease, leases::is_marked(&mut conn, &lease.id).await?)
-    {
-        return Err(conflict(Reason::NoSupport, held.detail()));
-    }
-
     let Some(lease) = lease else {
         return Err(ApiError::conflict("the app has no lease to move"));
     };
@@ -419,50 +444,6 @@ async fn held_while_away(
     Ok(None)
 }
 
-/// Why the warm node's grant would wait for its write to be replicated over
-/// the machines with the `node` role ([`leases::NewGrant::Waiting`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Held {
-    /// The row carries the unsettled mark (section 8.4, "Grants of a marked
-    /// row", ADR 0280).
-    Mark,
-    /// The row does not read `expiring` for at least `D`, so the grant raises
-    /// the stored duration (section 8.4, ADR 0268).
-    Raise,
-}
-
-impl Held {
-    fn detail(self) -> String {
-        match self {
-            Self::Mark => "the lease row carries the unsettled mark, so the grant to the warm \
-                           node waits until the row's newest write is replicated over every \
-                           machine with the node role, which the primary does not do for a \
-                           failover yet"
-                .to_string(),
-            Self::Raise => format!(
-                "the lease row does not read expiring for at least {DEFAULT_DURATION_MS} ms, so \
-                 the grant to the warm node raises the stored duration and waits until that \
-                 write is replicated over every machine with the node role, which the primary \
-                 does not do for a failover yet"
-            ),
-        }
-    }
-}
-
-/// Whether [`leases::grant_app_lease`] would hold the warm node's grant
-/// with majority support, from the same conditions it reads: the mark, and
-/// a raise of the stored duration. A `warm` app's new token is always
-/// `expiring`, so these are the only two. A guess that misses is still
-/// caught by the grant itself, which answers `no_support` then.
-fn held_grant(lease: &Lease, marked: bool) -> Option<Held> {
-    if marked {
-        return Some(Held::Mark);
-    }
-    let d = i64::try_from(DEFAULT_DURATION_MS).unwrap_or(i64::MAX);
-    let stores_d = lease.mode == "expiring" && lease.duration_ms.is_some_and(|stored| stored >= d);
-    (!stores_d).then_some(Held::Raise)
-}
-
 /// The app's `ready` volume, first by id.
 async fn ready_volume(
     conn: &mut SqliteConnection,
@@ -500,8 +481,7 @@ async fn newest_seq(conn: &mut SqliteConnection) -> Result<Option<i64>, ApiError
 /// instances `running` on the warm node.
 ///
 /// The refusals that read the database are checked again under the writer
-/// first, with their reasons, so a held grant is still refused before any
-/// revoke. Returns whether this call revoked the lease.
+/// first, with their reasons. Returns whether this call revoked the lease.
 async fn revoke(state: &AppState, ctx: &CallCtx, plan: &Plan) -> Result<bool, ApiError> {
     let mut w = state.store.begin_write().await?;
     let (app, warm_node_id) = app_and_warm(&mut w.tx, &plan.app_id).await?;
@@ -519,19 +499,17 @@ async fn revoke(state: &AppState, ctx: &CallCtx, plan: &Plan) -> Result<bool, Ap
             "the app's volume changed while the failover started; try again",
         ));
     }
-    let Some(current) = leases::app_lease(&mut w.tx, &plan.app_id)
+    if leases::app_lease(&mut w.tx, &plan.app_id)
         .await?
         .filter(|lease| {
             lease.holder_node_id == plan.source && lease.fencing_token == plan.lease.fencing_token
         })
-    else {
+        .is_none()
+    {
         return Err(ApiError::conflict(
             "the app's lease changed while the failover started; try again",
         ));
     };
-    if let Some(held) = held_grant(&current, leases::is_marked(&mut w.tx, &current.id).await?) {
-        return Err(conflict(Reason::NoSupport, held.detail()));
-    }
     let Some(lease) =
         leases::revoke_app_lease(&mut w.tx, &plan.app_id, &ctx.identity.actor()).await?
     else {
@@ -660,7 +638,9 @@ async fn released(state: &AppState, plan: &Plan) -> Result<bool, ApiError> {
 /// The change that moves the lease, in one transaction: the grant to the
 /// warm node, the volume, the instances, the app, `app.failed_over` and the
 /// audit records. An open gate rolls it back and tries again once it passed,
-/// at most [`GATE_TRIES`] times.
+/// at most [`GATE_TRIES`] times. A grant that must wait is written with the
+/// mark set and moves everything else the same way; the caller holds it
+/// (ADR 0292).
 async fn change(
     state: &AppState,
     ctx: &CallCtx,
@@ -759,7 +739,18 @@ async fn change(
             ));
         }
 
-        let lease = match leases::grant_app_lease(
+        // Section 8.8: no `expiring` grant without majority support, checked
+        // under the writer. The contract answers `no_support` for support
+        // that lapsed after the revoke was answered (ADR 0303 Q3), with
+        // nothing moved, rather than a move whose grant waits for it.
+        if !hub.authority().supports(DEFAULT_DURATION_MS) {
+            return Err(conflict(
+                Reason::NoSupport,
+                "the primary does not hold the support of a majority of voters, so it cannot \
+                 grant the warm node an expiring lease",
+            ));
+        }
+        let (lease, waiting) = match leases::grant_app_lease(
             &mut w.tx,
             hub.authority(),
             hub.unrecorded_failures(),
@@ -770,21 +761,15 @@ async fn change(
         )
         .await?
         {
-            NewGrant::Granted(lease) => *lease,
+            NewGrant::Granted(lease) => (*lease, false),
             NewGrant::GateOpen(remaining) => {
                 drop(w);
                 tokio::time::sleep(remaining).await;
                 continue;
             }
-            // The interim rule of ADR 0303 Q1: a grant that must wait is
-            // refused, and dropping `w` rolls its write back.
-            NewGrant::Waiting(_) => {
-                return Err(conflict(
-                    Reason::NoSupport,
-                    "the primary does not hold the support of a majority of voters, so it \
-                     cannot grant the warm node an expiring lease",
-                ));
-            }
+            // ADR 0292, ADR 0303 Q2: written with the mark set; the move
+            // commits and the hub holds the grant.
+            NewGrant::Waiting(lease) => (*lease, true),
         };
         let lease_seq = newest_seq(&mut w.tx).await?;
 
@@ -842,7 +827,9 @@ async fn change(
             "to_node_id": plan.warm,
             "fencing_token": lease.fencing_token,
             "snapshot_seq": snapshot_seq,
-            "grant_pending": false,
+            // ADR 0292: whether the grant to the warm node waits, so the app
+            // starts later.
+            "grant_pending": waiting,
         });
         if let Some(taken_at) = &snapshot_taken_at {
             data["snapshot_taken_at"] = json!(taken_at);
@@ -891,6 +878,7 @@ async fn change(
         w.commit().await?;
         return Ok(Moved {
             lease,
+            waiting,
             vm_nodes,
             app,
         });
@@ -916,144 +904,4 @@ async fn answer(state: &AppState, mut app: App) -> App {
         tracing::warn!(app_id = %apps[0].id, code = %error.code.as_str(), "failoverApp answers without the app's warm copy");
     }
     app
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Held, held_grant};
-    use crate::authority::{Authority, SystemMonotonic, VoterSupport};
-    use crate::changelog::{Actor, ActorType};
-    use crate::driver::{Capacity, Kvm};
-    use crate::leases::{self, NewGrant};
-    use crate::store::Store;
-    use std::sync::Arc;
-
-    #[derive(Debug)]
-    struct EverySupport;
-
-    impl VoterSupport for EverySupport {
-        fn supports(&self, _duration_ms: u64) -> bool {
-            true
-        }
-    }
-
-    /// The held-grant guess of `failoverApp` agrees with what
-    /// `grant_app_lease` does with majority support, for each row state:
-    /// marked, `local`, `expiring` below `D`, and `expiring` at `D`
-    /// unmarked. Each case runs in a transaction that is rolled back.
-    #[tokio::test]
-    async fn the_held_grant_guess_agrees_with_the_grant() {
-        let data_dir = std::env::temp_dir().join(format!(
-            "quoro-failover-{}",
-            &crate::store::random_secret()[..16]
-        ));
-        std::fs::create_dir_all(&data_dir).unwrap();
-        let store = Store::open(&data_dir.join("quoro.db")).await.unwrap();
-        let node_id = crate::driver::register_local_node(
-            &store,
-            &crate::driver::LocalNode {
-                name: "node-a".to_string(),
-                capacity: Capacity {
-                    cpus: 2,
-                    memory_mb: 2048,
-                    disk_gb: 20,
-                },
-                kvm: Kvm {
-                    available: true,
-                    kernel: "6.8.0".to_string(),
-                    nested: None,
-                },
-                engine_version: "test".to_string(),
-                agent_version: "test".to_string(),
-            },
-        )
-        .await
-        .unwrap();
-        let now = crate::store::now_rfc3339();
-        sqlx::query(
-            "INSERT INTO projects (id, slug, name, created_at, updated_at) \
-             VALUES ('prj_f', 'f', 'f', ?, ?)",
-        )
-        .bind(&now)
-        .bind(&now)
-        .execute(store.pool())
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO apps (id, project_id, name, stateful, ha_policy, image, port, \
-             health_check, resources, placement, status, created_at, updated_at) \
-             VALUES ('app_f', 'prj_f', 'db', 1, 'warm', 'img', 8080, '{}', '{}', \
-             '{\"node_ids\":[]}', 'running', ?, ?)",
-        )
-        .bind(&now)
-        .bind(&now)
-        .execute(store.pool())
-        .await
-        .unwrap();
-        let actor = Actor {
-            kind: ActorType::Node,
-            id: node_id.clone(),
-        };
-
-        for (case, mode, duration_ms, unsettled, expected) in [
-            ("marked", "expiring", Some(15_000), 1, Some(Held::Mark)),
-            ("local", "local", None, 0, Some(Held::Raise)),
-            (
-                "expiring below D",
-                "expiring",
-                Some(3_000),
-                0,
-                Some(Held::Raise),
-            ),
-            ("expiring at D", "expiring", Some(15_000), 0, None),
-        ] {
-            let mut w = store.begin_write().await.unwrap();
-            sqlx::query(
-                "INSERT INTO leases (id, resource_type, resource_id, holder_node_id, mode, \
-                 fencing_token, duration_ms, granted_at, revoked_at, unsettled) \
-                 VALUES ('lse_f', 'app', 'app_f', ?, ?, 4, ?, ?, ?, ?)",
-            )
-            .bind(&node_id)
-            .bind(mode)
-            .bind(duration_ms)
-            .bind(&now)
-            .bind(&now)
-            .bind(unsettled)
-            .execute(&mut *w.tx)
-            .await
-            .unwrap();
-            let lease = leases::app_lease(&mut w.tx, "app_f")
-                .await
-                .unwrap()
-                .unwrap();
-            let marked = leases::is_marked(&mut w.tx, &lease.id).await.unwrap();
-            let guess = held_grant(&lease, marked);
-            assert_eq!(guess, expected, "{case}");
-
-            // A fresh authority, so no gate of an earlier case is open.
-            let authority = Authority::new(Arc::new(SystemMonotonic::default()));
-            authority.set_support(Arc::new(EverySupport));
-            let granted = leases::grant_app_lease(
-                &mut w.tx,
-                &authority,
-                &crate::fences::UnrecordedFailures::default(),
-                "app_f",
-                &node_id,
-                &actor,
-                false,
-            )
-            .await
-            .unwrap();
-            match (&granted, guess) {
-                (NewGrant::Waiting(_), Some(_)) => {}
-                (NewGrant::Granted(lease), None) => {
-                    assert_eq!(lease.fencing_token, 5, "{case}");
-                    assert_eq!(lease.mode, "expiring", "{case}");
-                }
-                _ => panic!("{case}: guessed {guess:?}, the grant answered {granted:?}"),
-            }
-            drop(w);
-        }
-        std::fs::remove_dir_all(&data_dir).unwrap();
-    }
 }

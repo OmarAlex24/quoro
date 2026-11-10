@@ -39,8 +39,9 @@
 //! grant, the settle at the first renewal), R and the conversion grant, and
 //! the resend of the same-token `local` grant. Until they land, a row marked
 //! here stays marked after its grant is taken, and moves only as a `local`
-//! lease does, which is safe. `failoverApp` (#720) uses
-//! [`NodeHub::hold_grant`] and [`NodeHub::grant_pending`].
+//! lease does, which is safe. `failoverApp` ([`crate::failover`]) holds its
+//! waiting grant with [`NodeHub::hold_grant`] and answers `in_progress` while
+//! [`NodeHub::grant_pending`] (ADR 0292).
 
 use super::{ControlMessage, NodeHub, new_msg_id};
 use crate::authority::{DEFAULT_DURATION_MS, Grant, GrantKind};
