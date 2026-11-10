@@ -339,10 +339,19 @@ pub(crate) const fn creator_type(actor: &Actor) -> CreatedByType {
     }
 }
 
-/// The change-log payload of one deployment.
+/// The change-log payload of one deployment: the whole row. The API object
+/// leaves out a `phase`, `error` or `finished_at` that is `None`; the payload
+/// writes it as `null`, because an update is merged over the row and an
+/// absent field would keep a stale value (ADR 0297).
 fn deployment_payload(deployment: &Deployment) -> Result<Value, ApiError> {
-    serde_json::to_value(deployment)
-        .map_err(|error| ApiError::internal(&format!("deployment payload: {error}")))
+    let mut payload = serde_json::to_value(deployment)
+        .map_err(|error| ApiError::internal(&format!("deployment payload: {error}")))?;
+    if let Some(fields) = payload.as_object_mut() {
+        for column in ["phase", "error", "finished_at"] {
+            fields.entry(column).or_insert(Value::Null);
+        }
+    }
+    Ok(payload)
 }
 
 /// Appends the change-log entry of a deployment change.

@@ -618,7 +618,7 @@ pub(crate) async fn cancel_build(
                 "build",
                 &build.id,
                 Op::Update,
-                json!({ "id": build.id, "cancel_requested": true }),
+                json!({ "id": build.id, "error": CANCEL_REQUESTED }),
             )
             .await?;
             Ok(CancelledBuild {
@@ -981,6 +981,15 @@ async fn succeed_build(
         .bind(&before.id)
         .execute(&mut *conn)
         .await?;
+    changelog::append(
+        conn,
+        &build_actor(),
+        "build",
+        &before.id,
+        Op::Update,
+        json!({ "id": before.id, "deployment_id": created.deployment.id }),
+    )
+    .await?;
 
     events::emit(
         conn,
