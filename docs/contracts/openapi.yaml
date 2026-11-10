@@ -10809,8 +10809,10 @@ paths:
         (ADR 0146), chunks and encrypts it and uploads the new chunks; the
         primary then writes the backup's seal. Emits `backup.succeeded` or
         `backup.failed`. `conflict` (409) when the app has no volume in
-        `ready`, the cluster has no backup repository, or the volume already
-        has a backup that is not terminal. `Quoro-Justification` is required
+        `ready`, the cluster has no backup repository, this primary does not
+        hold the repository key after a promotion (node-agent-protocol.md
+        section 7.3), or the volume already has a backup that is not
+        terminal. `Quoro-Justification` is required
         when the caller is an agent (ADR 0031).
       x-quoro-scope: backup:write
       parameters:
@@ -10951,8 +10953,10 @@ paths:
         not succeed or was pruned, belongs to the control-plane database
         (restored only offline with `quoro restore`, ADR 0148), the volume's
         current node is not connected (remove it first, which bumps the
-        lease's fencing token), the app has a restore in progress, or the
-        target node has a fence failure. `Quoro-Justification` is required
+        lease's fencing token), the app has a restore in progress, the
+        target node has a fence failure, or this primary does not hold the
+        repository key after a promotion (node-agent-protocol.md section
+        7.3). `Quoro-Justification` is required
         when the caller is an agent (ADR 0031).
       x-quoro-scope: backup:restore
       parameters:
